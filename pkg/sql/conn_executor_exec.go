@@ -357,13 +357,17 @@ func (ex *connExecutor) execStmtInOpenState(
 		case tree.ExplainPlan:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeUseCounter)
 			flags := explain.MakeFlags(&e.ExplainOptions)
-			flags.MakeDeterministic = ex.server.cfg.TestingKnobs.DeterministicExplainAnalyze
+			if ex.server.cfg.TestingKnobs.DeterministicExplain {
+				flags.Redact = explain.RedactAll
+			}
 			ih.SetOutputMode(explainAnalyzePlanOutput, flags)
 
 		case tree.ExplainDistSQL:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeDistSQLUseCounter)
 			flags := explain.MakeFlags(&e.ExplainOptions)
-			flags.MakeDeterministic = ex.server.cfg.TestingKnobs.DeterministicExplainAnalyze
+			if ex.server.cfg.TestingKnobs.DeterministicExplain {
+				flags.Redact = explain.RedactAll
+			}
 			ih.SetOutputMode(explainAnalyzeDistSQLOutput, flags)
 
 		default:
@@ -645,7 +649,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	alreadyRecording := ex.transitionCtx.sessionTracing.Enabled()
 	stmtTraceThreshold := traceStmtThreshold.Get(&ex.planner.execCfg.Settings.SV)
 	if !alreadyRecording && stmtTraceThreshold > 0 {
-		ctx, stmtThresholdSpan = createRootOrChildSpan(ctx, "trace-stmt-threshold", ex.transitionCtx.tracer)
+		ctx, stmtThresholdSpan = createRootOrChildSpan(ctx, "trace-stmt-threshold", ex.transitionCtx.tracer, tracing.WithForceRealSpan())
 		stmtThresholdSpan.SetVerbose(true)
 	}
 
@@ -1544,9 +1548,6 @@ func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart t
 func createRootOrChildSpan(
 	parentCtx context.Context, opName string, tr *tracing.Tracer, os ...tracing.SpanOption,
 ) (context.Context, *tracing.Span) {
-	// WithForceRealSpan is used to support the use of session tracing, which
-	// may start recording on this span.
-	os = append(os, tracing.WithForceRealSpan())
 	return tracing.EnsureChildSpan(parentCtx, tr, opName, os...)
 }
 

@@ -1712,7 +1712,7 @@ func TestImportCSVStmt(t *testing.T) {
 	blockGC := make(chan struct{})
 
 	ctx := context.Background()
-	baseDir := testutils.TestDataPath("testdata", "csv")
+	baseDir := testutils.TestDataPath(t, "csv")
 	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
 		SQLMemoryPoolSize: 256 << 20,
 		ExternalIODir:     baseDir,
@@ -2611,7 +2611,7 @@ func TestImportIntoCSV(t *testing.T) {
 	rowsPerRaceFile := 16
 
 	ctx := context.Background()
-	baseDir := testutils.TestDataPath("testdata", "csv")
+	baseDir := testutils.TestDataPath(t, "csv")
 	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: baseDir}})
 	defer tc.Stopper().Stop(ctx)
 	conn := tc.Conns[0]
@@ -5668,7 +5668,7 @@ func TestImportPgDump(t *testing.T) {
 			if c.expected == expectAll {
 				sqlDB.CheckQueryResults(t, `SHOW CREATE TABLE seqtable`, [][]string{{
 					"seqtable", `CREATE TABLE public.seqtable (
-	a INT8 NULL DEFAULT nextval('foo.public.a_seq':::STRING::REGCLASS),
+	a INT8 NULL DEFAULT nextval('public.a_seq':::STRING::REGCLASS),
 	b INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),

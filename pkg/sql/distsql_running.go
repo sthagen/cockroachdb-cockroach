@@ -118,7 +118,7 @@ func (dsp *DistSQLPlanner) initRunners(ctx context.Context) {
 // It will first attempt to set up all remote flows using the dsp workers if
 // available or sequentially if not, and then finally set up the gateway flow,
 // whose output is the DistSQLReceiver provided. This flow is then returned to
-// be run. It also returns a boolean indicating whether the flow is vectorized.
+// be run.
 func (dsp *DistSQLPlanner) setupFlows(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
@@ -198,7 +198,6 @@ func (dsp *DistSQLPlanner) setupFlows(
 			nodeID:     nodeID,
 			resultChan: resultChan,
 		}
-		defer physicalplan.ReleaseSetupFlowRequest(&req)
 
 		// Send out a request to the workers; if no worker is available, run
 		// directly.
@@ -227,7 +226,6 @@ func (dsp *DistSQLPlanner) setupFlows(
 	// Set up the flow on this node.
 	localReq := setupReq
 	localReq.Flow = *flows[thisNodeID]
-	defer physicalplan.ReleaseSetupFlowRequest(&localReq)
 	return dsp.distSQLSrv.SetupLocalSyncFlow(ctx, evalCtx.Mon, &localReq, recv, localState)
 }
 
@@ -295,16 +293,14 @@ func (dsp *DistSQLPlanner) Run(
 	}
 
 	flows := plan.GenerateFlowSpecs()
+	defer func() {
+		for _, flowSpec := range flows {
+			physicalplan.ReleaseFlowSpec(flowSpec)
+		}
+	}()
 	if _, ok := flows[dsp.gatewayNodeID]; !ok {
 		recv.SetError(errors.Errorf("expected to find gateway flow"))
 		return func() {}
-	}
-
-	if planCtx.saveFlows != nil {
-		if err := planCtx.saveFlows(flows); err != nil {
-			recv.SetError(err)
-			return func() {}
-		}
 	}
 
 	if logPlanDiagram {
@@ -351,6 +347,13 @@ func (dsp *DistSQLPlanner) Run(
 
 	if planCtx.planner != nil && flow.IsVectorized() {
 		planCtx.planner.curPlan.flags.Set(planFlagVectorized)
+	}
+
+	if planCtx.saveFlows != nil {
+		if err := planCtx.saveFlows(flows); err != nil {
+			recv.SetError(err)
+			return func() {}
+		}
 	}
 
 	// Check that flows that were forced to be planned locally also have no concurrency.
@@ -651,11 +654,8 @@ func (r *DistSQLReceiver) Push(
 			r.rangeCache.Insert(r.ctx, meta.Ranges...)
 		}
 		if len(meta.TraceData) > 0 {
-			span := tracing.SpanFromContext(r.ctx)
-			if span == nil {
-				// Nothing to do.
-			} else if err := span.ImportRemoteSpans(meta.TraceData); err != nil {
-				r.resultWriter.SetError(errors.Errorf("error ingesting remote spans: %s", err))
+			if span := tracing.SpanFromContext(r.ctx); span != nil {
+				span.ImportRemoteSpans(meta.TraceData)
 			}
 			var ev roachpb.ContentionEvent
 			for i := range meta.TraceData {

@@ -63,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -131,6 +132,8 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalZonesTableID:                     crdbInternalZonesTable,
 		catconstants.CrdbInternalInvalidDescriptorsTableID:        crdbInternalInvalidDescriptorsTable,
 		catconstants.CrdbInternalClusterDatabasePrivilegesTableID: crdbInternalClusterDatabasePrivilegesTable,
+		catconstants.CrdbInternalInterleaved:                      crdbInternalInterleaved,
+		catconstants.CrdbInternalCrossDbRefrences:                 crdbInternalCrossDbReferences,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -296,7 +299,7 @@ CREATE TABLE crdb_internal.tables (
   parent_schema_id         INT NOT NULL,
   locality                 TEXT
 )`,
-	generator: func(ctx context.Context, p *planner, dbDesc *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error) {
+	generator: func(ctx context.Context, p *planner, dbDesc *dbdesc.Immutable, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		row := make(tree.Datums, 14)
 		worker := func(pusher rowPusher) error {
 			descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
@@ -406,8 +409,7 @@ CREATE TABLE crdb_internal.tables (
 			}
 			return nil
 		}
-		next, cleanup := setupGenerator(ctx, worker)
-		return next, cleanup, nil
+		return setupGenerator(ctx, worker, stopper)
 	},
 }
 
@@ -515,7 +517,7 @@ CREATE TABLE crdb_internal.schema_changes (
 			tableID := tree.NewDInt(tree.DInt(int64(table.GetID())))
 			parentID := tree.NewDInt(tree.DInt(int64(table.GetParentID())))
 			tableName := tree.NewDString(table.GetName())
-			for _, mut := range table.GetMutations() {
+			for _, mut := range table.TableDesc().Mutations {
 				mutType := "UNKNOWN"
 				targetID := tree.DNull
 				targetName := tree.DNull
@@ -616,7 +618,7 @@ CREATE TABLE crdb_internal.jobs (
 	coordinator_id     		INT
 )`,
 	comment: `decoded job metadata from system.jobs (KV scan)`,
-	generator: func(ctx context.Context, p *planner, _ *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error) {
+	generator: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, _ *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		currentUser := p.SessionData().User()
 		isAdmin, err := p.HasAdminRole(ctx)
 		if err != nil {
@@ -2071,7 +2073,7 @@ func showAlterStatementWithInterleave(
 					return err
 				}
 			} else {
-				parentName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as parent]", parentTableID)))
+				parentName = tree.MakeTableNameWithSchema(tree.Name(""), tree.PublicSchemaName, tree.Name(fmt.Sprintf("[%d as parent]", parentTableID)))
 				parentName.ExplicitCatalog = false
 				parentName.ExplicitSchema = false
 			}
@@ -2083,7 +2085,7 @@ func showAlterStatementWithInterleave(
 					return err
 				}
 			} else {
-				tableName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as parent]", table.GetID())))
+				tableName = tree.MakeTableNameWithSchema(tree.Name(""), tree.PublicSchemaName, tree.Name(fmt.Sprintf("[%d as parent]", table.GetID())))
 				tableName.ExplicitCatalog = false
 				tableName.ExplicitSchema = false
 			}
@@ -2152,7 +2154,7 @@ CREATE TABLE crdb_internal.table_columns (
   hidden           BOOL NOT NULL
 )
 `,
-	generator: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error) {
+	generator: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		row := make(tree.Datums, 8)
 		worker := func(pusher rowPusher) error {
 			return forEachTableDescAll(ctx, p, dbContext, hideVirtual,
@@ -2188,8 +2190,7 @@ CREATE TABLE crdb_internal.table_columns (
 				},
 			)
 		}
-		next, cleanup := setupGenerator(ctx, worker)
-		return next, cleanup, nil
+		return setupGenerator(ctx, worker, stopper)
 	},
 }
 
@@ -2209,7 +2210,7 @@ CREATE TABLE crdb_internal.table_indexes (
   is_inverted      BOOL NOT NULL
 )
 `,
-	generator: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error) {
+	generator: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		primary := tree.NewDString("primary")
 		secondary := tree.NewDString("secondary")
 		row := make(tree.Datums, 7)
@@ -2242,8 +2243,7 @@ CREATE TABLE crdb_internal.table_indexes (
 				},
 			)
 		}
-		next, cleanup := setupGenerator(ctx, worker)
-		return next, cleanup, nil
+		return setupGenerator(ctx, worker, stopper)
 	},
 }
 
@@ -2619,6 +2619,8 @@ CREATE VIEW crdb_internal.ranges AS SELECT
 	index_name,
 	replicas,
 	replica_localities,
+	voting_replicas,
+	non_voting_replicas,
 	learner_replicas,
 	split_enforced_until,
 	crdb_internal.lease_holder(start_key) AS lease_holder,
@@ -2639,6 +2641,8 @@ FROM crdb_internal.ranges_no_leases
 		{Name: "index_name", Typ: types.String},
 		{Name: "replicas", Typ: types.Int2Vector},
 		{Name: "replica_localities", Typ: types.StringArray},
+		{Name: "voting_replicas", Typ: types.Int2Vector},
+		{Name: "non_voting_replicas", Typ: types.Int2Vector},
 		{Name: "learner_replicas", Typ: types.Int2Vector},
 		{Name: "split_enforced_until", Typ: types.Timestamp},
 		{Name: "lease_holder", Typ: types.Int},
@@ -2652,6 +2656,9 @@ FROM crdb_internal.ranges_no_leases
 // TODO(tbg): prefix with kv_.
 var crdbInternalRangesNoLeasesTable = virtualSchemaTable{
 	comment: `range metadata without leaseholder details (KV join; expensive!)`,
+	// NB 1: The `replicas` column is the union of `voting_replicas` and
+	// `non_voting_replicas` and does not include `learner_replicas`.
+	// NB 2: All the values in the `*replicas` columns correspond to store IDs.
 	schema: `
 CREATE TABLE crdb_internal.ranges_no_leases (
   range_id             INT NOT NULL,
@@ -2666,11 +2673,13 @@ CREATE TABLE crdb_internal.ranges_no_leases (
   index_name           STRING NOT NULL,
   replicas             INT[] NOT NULL,
   replica_localities   STRING[] NOT NULL,
-	learner_replicas     INT[] NOT NULL,
-	split_enforced_until TIMESTAMP
+  voting_replicas      INT[] NOT NULL,
+  non_voting_replicas  INT[] NOT NULL,
+  learner_replicas     INT[] NOT NULL,
+  split_enforced_until TIMESTAMP
 )
 `,
-	generator: func(ctx context.Context, p *planner, _ *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error) {
+	generator: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, _ *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		if err := p.RequireAdminRole(ctx, "read crdb_internal.ranges_no_leases"); err != nil {
 			return nil, nil, err
 		}
@@ -2736,18 +2745,31 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				return nil, err
 			}
 
-			voterReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().VoterDescriptors()...)
+			votersAndNonVoters := append([]roachpb.ReplicaDescriptor(nil),
+				desc.Replicas().VoterAndNonVoterDescriptors()...)
 			var learnerReplicaStoreIDs []int
 			for _, rd := range desc.Replicas().LearnerDescriptors() {
 				learnerReplicaStoreIDs = append(learnerReplicaStoreIDs, int(rd.StoreID))
 			}
-			sort.Slice(voterReplicas, func(i, j int) bool {
-				return voterReplicas[i].StoreID < voterReplicas[j].StoreID
+			sort.Slice(votersAndNonVoters, func(i, j int) bool {
+				return votersAndNonVoters[i].StoreID < votersAndNonVoters[j].StoreID
 			})
 			sort.Ints(learnerReplicaStoreIDs)
+			votersAndNonVotersArr := tree.NewDArray(types.Int)
+			for _, replica := range votersAndNonVoters {
+				if err := votersAndNonVotersArr.Append(tree.NewDInt(tree.DInt(replica.StoreID))); err != nil {
+					return nil, err
+				}
+			}
 			votersArr := tree.NewDArray(types.Int)
-			for _, replica := range voterReplicas {
+			for _, replica := range desc.Replicas().VoterDescriptors() {
 				if err := votersArr.Append(tree.NewDInt(tree.DInt(replica.StoreID))); err != nil {
+					return nil, err
+				}
+			}
+			nonVotersArr := tree.NewDArray(types.Int)
+			for _, replica := range desc.Replicas().NonVoterDescriptors() {
+				if err := nonVotersArr.Append(tree.NewDInt(tree.DInt(replica.StoreID))); err != nil {
 					return nil, err
 				}
 			}
@@ -2759,7 +2781,7 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 			}
 
 			replicaLocalityArr := tree.NewDArray(types.String)
-			for _, replica := range voterReplicas {
+			for _, replica := range votersAndNonVoters {
 				replicaLocality := nodeIDToLocality[replica.NodeID].String()
 				if err := replicaLocalityArr.Append(tree.NewDString(replicaLocality)); err != nil {
 					return nil, err
@@ -2806,8 +2828,10 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				tree.NewDString(schemaName),
 				tree.NewDString(tableName),
 				tree.NewDString(indexName),
-				votersArr,
+				votersAndNonVotersArr,
 				replicaLocalityArr,
+				votersArr,
+				nonVotersArr,
 				learnersArr,
 				splitEnforcedUntil,
 			}, nil
@@ -3613,7 +3637,7 @@ CREATE TABLE crdb_internal.partitions (
 	subzone_id INT -- references a subzone id in the crdb_internal.zones table
 )
 	`,
-	generator: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error) {
+	generator: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		dbName := ""
 		if dbContext != nil {
 			dbName = dbContext.GetName()
@@ -3629,8 +3653,7 @@ CREATE TABLE crdb_internal.partitions (
 					})
 				})
 		}
-		next, cleanup := setupGenerator(ctx, worker)
-		return next, cleanup, nil
+		return setupGenerator(ctx, worker, stopper)
 	},
 }
 
@@ -4020,6 +4043,207 @@ CREATE TABLE crdb_internal.cluster_database_privileges (
 							tree.NewDString(priv), // privilege_type
 						); err != nil {
 							return err
+						}
+					}
+				}
+				return nil
+			})
+	},
+}
+
+var crdbInternalInterleaved = virtualSchemaTable{
+	comment: `virtual table with interleaved table information`,
+	schema: `
+CREATE TABLE crdb_internal.interleaved (
+	database_name
+		STRING NOT NULL,
+	schema_name
+		STRING NOT NULL,
+	table_name
+		STRING NOT NULL,
+	index_name
+		STRING NOT NULL,
+	parent_index
+		STRING NOT NULL
+);`,
+	populate: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		return forEachTableDescAllWithTableLookup(ctx, p, dbContext, hideVirtual,
+			func(db *dbdesc.Immutable, schemaName string, table catalog.TableDescriptor, lookupFn tableLookupFn) error {
+				if !table.IsInterleaved() {
+					return nil
+				}
+				indexes := table.NonDropIndexes()
+				for _, index := range indexes {
+					if index.NumInterleaveAncestors() == 0 {
+						continue
+					}
+
+					ancestor := index.GetInterleaveAncestor(index.NumInterleaveAncestors() - 1)
+					parentTable, err := lookupFn.getTableByID(ancestor.TableID)
+					if err != nil {
+						return err
+					}
+					parentIndex, err := parentTable.FindIndexWithID(ancestor.IndexID)
+					if err != nil {
+						return err
+					}
+					parentSchemaName, err := lookupFn.getSchemaNameByID(parentTable.GetParentSchemaID())
+					if err != nil {
+						return err
+					}
+					database, err := lookupFn.getDatabaseByID(parentTable.GetParentID())
+					if err != nil {
+						return err
+					}
+
+					if err := addRow(tree.NewDString(database.GetName()),
+						tree.NewDString(parentSchemaName),
+						tree.NewDString(table.GetName()),
+						tree.NewDString(index.GetName()),
+						tree.NewDString(parentIndex.GetName())); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+	},
+}
+
+var crdbInternalCrossDbReferences = virtualSchemaTable{
+	comment: `virtual table with cross db references`,
+	schema: `
+CREATE TABLE crdb_internal.cross_db_references (
+	object_database
+		STRING NOT NULL,
+	object_schema
+		STRING NOT NULL,
+	object_name
+		STRING NOT NULL,
+	referenced_object_database
+		STRING NOT NULL,
+	referenced_object_schema
+		STRING NOT NULL,
+	referenced_object_name
+		STRING NOT NULL,
+	cross_database_reference_description
+		STRING NOT NULL
+);`,
+	populate: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		return forEachTableDescAllWithTableLookup(ctx, p, dbContext, hideVirtual,
+			func(db *dbdesc.Immutable, schemaName string, table catalog.TableDescriptor, lookupFn tableLookupFn) error {
+				// For tables detect if foreign key references point at a different
+				// database. Additionally, check if any of the columns have sequence
+				// references to a different database.
+				if table.IsTable() {
+					objectDatabaseName := lookupFn.getDatabaseName(table)
+					err := table.ForeachOutboundFK(
+						func(fk *descpb.ForeignKeyConstraint) error {
+							referencedTable, err := lookupFn.getTableByID(fk.ReferencedTableID)
+							if err != nil {
+								return err
+							}
+							if referencedTable.GetParentID() != table.GetParentID() {
+								refSchemaName, err := lookupFn.getSchemaNameByID(referencedTable.GetParentSchemaID())
+								if err != nil {
+									return err
+								}
+								refDatabaseName := lookupFn.getDatabaseName(referencedTable)
+
+								if err := addRow(tree.NewDString(objectDatabaseName),
+									tree.NewDString(schemaName),
+									tree.NewDString(table.GetName()),
+									tree.NewDString(refDatabaseName),
+									tree.NewDString(refSchemaName),
+									tree.NewDString(referencedTable.GetName()),
+									tree.NewDString("table foreign key reference")); err != nil {
+									return err
+								}
+							}
+							return nil
+						})
+					if err != nil {
+						return err
+					}
+
+					// Check for sequence dependencies
+					for _, col := range table.PublicColumns() {
+						for i := 0; i < col.NumUsesSequences(); i++ {
+							sequenceID := col.GetUsesSequenceID(i)
+							seqDesc, err := lookupFn.getTableByID(sequenceID)
+							if err != nil {
+								return err
+							}
+							if seqDesc.GetParentID() != table.GetParentID() {
+								seqSchemaName, err := lookupFn.getSchemaNameByID(seqDesc.GetParentSchemaID())
+								if err != nil {
+									return err
+								}
+								refDatabaseName := lookupFn.getDatabaseName(seqDesc)
+								if err := addRow(tree.NewDString(objectDatabaseName),
+									tree.NewDString(schemaName),
+									tree.NewDString(table.GetName()),
+									tree.NewDString(refDatabaseName),
+									tree.NewDString(seqSchemaName),
+									tree.NewDString(seqDesc.GetName()),
+									tree.NewDString("table column refers to sequence")); err != nil {
+									return err
+								}
+							}
+						}
+					}
+				} else if table.IsView() {
+					// For views check if we depend on tables in a different database.
+					dependsOn := table.GetDependsOn()
+					for _, dependency := range dependsOn {
+						dependentTable, err := lookupFn.getTableByID(dependency)
+						if err != nil {
+							return err
+						}
+						if dependentTable.GetParentID() != table.GetParentID() {
+							objectDatabaseName := lookupFn.getDatabaseName(table)
+							refSchemaName, err := lookupFn.getSchemaNameByID(dependentTable.GetParentSchemaID())
+							if err != nil {
+								return err
+							}
+							refDatabaseName := lookupFn.getDatabaseName(dependentTable)
+
+							if err := addRow(tree.NewDString(objectDatabaseName),
+								tree.NewDString(schemaName),
+								tree.NewDString(table.GetName()),
+								tree.NewDString(refDatabaseName),
+								tree.NewDString(refSchemaName),
+								tree.NewDString(dependentTable.GetName()),
+								tree.NewDString("view references table")); err != nil {
+								return err
+							}
+						}
+					}
+				} else if table.IsSequence() {
+					// For sequences check if the sequence is owned by
+					// a different database.
+					sequenceOpts := table.GetSequenceOpts()
+					if sequenceOpts.SequenceOwner.OwnerTableID != descpb.InvalidID {
+						ownerTable, err := lookupFn.getTableByID(sequenceOpts.SequenceOwner.OwnerTableID)
+						if err != nil {
+							return err
+						}
+						if ownerTable.GetParentID() != table.GetParentID() {
+							objectDatabaseName := lookupFn.getDatabaseName(table)
+							refSchemaName, err := lookupFn.getSchemaNameByID(ownerTable.GetParentSchemaID())
+							if err != nil {
+								return err
+							}
+							refDatabaseName := lookupFn.getDatabaseName(ownerTable)
+
+							if err := addRow(tree.NewDString(objectDatabaseName),
+								tree.NewDString(schemaName),
+								tree.NewDString(table.GetName()),
+								tree.NewDString(refDatabaseName),
+								tree.NewDString(refSchemaName),
+								tree.NewDString(ownerTable.GetName()),
+								tree.NewDString("sequences owning table")); err != nil {
+								return err
+							}
 						}
 					}
 				}

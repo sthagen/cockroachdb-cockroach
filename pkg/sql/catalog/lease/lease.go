@@ -185,24 +185,6 @@ func (s storage) jitteredLeaseDuration() time.Duration {
 		2*s.leaseJitterFraction*rand.Float64()))
 }
 
-// nonPublicDescriptorError is returned from the attempt to acquire a lease
-// when the descriptor is found to be in a non-public state. This means that
-// it cannot be leased, however, the Manager can utilize this to update
-// the descriptorState and to also guide calls to Acquire with a timestamp
-// preceding the drop.
-type nonPublicDescriptorError struct {
-	cause error
-	desc  catalog.Descriptor
-}
-
-func (e *nonPublicDescriptorError) Error() string {
-	return e.cause.Error()
-}
-
-func (e *nonPublicDescriptorError) Cause() error {
-	return e.cause
-}
-
 // acquire a lease on the most recent version of a descriptor. If the lease
 // cannot be obtained because the descriptor is in the process of being dropped
 // or offline (currently only applicable to tables), the error will be of type
@@ -232,15 +214,14 @@ func (s storage) acquire(
 		// to ValidateSelf() instead of Validate(), to avoid the cross-table
 		// checks. Does this actually matter? We already potentially do cross-table
 		// checks when populating pre-19.2 foreign keys.
-		desc, err := catalogkv.GetDescriptorByID(ctx, txn, s.codec, id, catalogkv.Immutable,
-			catalogkv.AnyDescriptorKind, true /* required */)
+		desc, err := catalogkv.MustGetDescriptorByID(ctx, txn, s.codec, id)
 		if err != nil {
 			return err
 		}
 		if err := catalog.FilterDescriptorState(
 			desc, tree.CommonLookupFlags{}, // filter all non-public state
 		); err != nil {
-			return &nonPublicDescriptorError{cause: err, desc: desc}
+			return err
 		}
 		// Once the descriptor is set it is immutable and care must be taken
 		// to not modify it.
@@ -345,8 +326,7 @@ func (m *Manager) WaitForOneVersion(
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
 		var desc catalog.Descriptor
 		if err := m.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			desc, err = catalogkv.GetDescriptorByID(ctx, txn, m.Codec(), id, catalogkv.Immutable,
-				catalogkv.AnyDescriptorKind, true /* required */)
+			desc, err = catalogkv.MustGetDescriptorByID(ctx, txn, m.Codec(), id)
 			return err
 		}); err != nil {
 			return 0, err
@@ -433,8 +413,7 @@ func (s storage) getForExpiration(
 	err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		prevTimestamp := expiration.Prev()
 		txn.SetFixedTimestamp(ctx, prevTimestamp)
-		desc, err := catalogkv.GetDescriptorByID(ctx, txn, s.codec, id, catalogkv.Immutable,
-			catalogkv.AnyDescriptorKind, true /* required */)
+		desc, err := catalogkv.MustGetDescriptorByID(ctx, txn, s.codec, id)
 		if err != nil {
 			return err
 		}
@@ -575,6 +554,11 @@ type descriptorState struct {
 		// happen after the table came back online again after having been taken
 		// offline temporarily (as opposed to dropped).
 		takenOffline bool
+
+		// maxVersionSeen is used to prevent a race where a concurrent lease
+		// acquisition might miss an event indicating that there is a new version
+		// of a descriptor.
+		maxVersionSeen descpb.DescriptorVersion
 
 		// acquisitionsInProgress indicates that at least one caller is currently
 		// in the process of performing an acquisition. This tracking is critical
@@ -806,6 +790,9 @@ func (m *Manager) AcquireFreshestFromStore(ctx context.Context, id descpb.ID) er
 func (t *descriptorState) upsertLocked(
 	ctx context.Context, desc *descriptorVersionState,
 ) (_ *storedLease, _ error) {
+	if t.mu.maxVersionSeen < desc.GetVersion() {
+		t.mu.maxVersionSeen = desc.GetVersion()
+	}
 	s := t.mu.active.find(desc.GetVersion())
 	if s == nil {
 		if t.mu.active.findNewest() != nil {
@@ -871,21 +858,7 @@ func (t *descriptorState) removeInactiveVersions() []*storedLease {
 // The boolean returned is true if this call was actually responsible for the
 // lease acquisition.
 func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, error) {
-	upsertDescriptorAndMaybeDropLease := func(ctx context.Context, desc *descriptorVersionState, takenOffline bool) error {
-		t := m.findDescriptorState(id, false /* create */)
-		t.mu.Lock()
-		t.mu.takenOffline = takenOffline
-		defer t.mu.Unlock()
-		toRelease, err := t.upsertLocked(ctx, desc)
-		if err != nil {
-			return err
-		}
-		m.names.insert(desc)
-		if toRelease != nil {
-			releaseLease(toRelease, m)
-		}
-		return nil
-	}
+	var toRelease *storedLease
 	resultChan, didAcquire := m.storage.group.DoChan(fmt.Sprintf("acquire%d", id), func() (interface{}, error) {
 		// Note that we use a new `context` here to avoid a situation where a cancellation
 		// of the first context cancels other callers to the `acquireNodeLease()` method,
@@ -902,27 +875,20 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 			minExpiration = newest.expiration
 		}
 		desc, err := m.storage.acquire(newCtx, minExpiration, id)
-		// Deal with the case where the descriptor has been taken offline.
-		// Queries attempting to use this descriptor at a historical timestamp
-		// prior to its having been dropped would not be able to if we just surfaced
-		// this error alone.
-		if e := new(nonPublicDescriptorError); errors.As(err, &e) {
-			if err := upsertDescriptorAndMaybeDropLease(ctx, &descriptorVersionState{
-				Descriptor: e.desc,
-				expiration: e.desc.GetModificationTime(),
-			}, true /* takenOffline */); err != nil {
-				return nil, errors.CombineErrors(e,
-					errors.Wrapf(err, "upserting non-public descriptor"))
-			}
-			return nil, err
-		}
 		if err != nil {
 			return nil, err
 		}
-		if err := upsertDescriptorAndMaybeDropLease(
-			ctx, desc, false, /* takenOffline */
-		); err != nil {
+		t := m.findDescriptorState(id, false /* create */)
+		t.mu.Lock()
+		t.mu.takenOffline = false
+		defer t.mu.Unlock()
+		toRelease, err = t.upsertLocked(newCtx, desc)
+		if err != nil {
 			return nil, err
+		}
+		m.names.insert(desc)
+		if toRelease != nil {
+			releaseLease(toRelease, m)
 		}
 		return leaseToken(desc), nil
 	})
@@ -961,7 +927,8 @@ func (t *descriptorState) release(
 			t.mu.takenOffline ||
 			// Release from the store if the lease is not for the latest
 			// version; only leases for the latest version can be acquired.
-			s != t.mu.active.findNewest()
+			s != t.mu.active.findNewest() ||
+			s.GetVersion() < t.mu.maxVersionSeen
 
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -1026,9 +993,12 @@ func purgeOldVersions(
 		return nil
 	}
 	t.mu.Lock()
+	if t.mu.maxVersionSeen < minVersion {
+		t.mu.maxVersionSeen = minVersion
+	}
 	empty := len(t.mu.active.data) == 0 && t.mu.acquisitionsInProgress == 0
 	t.mu.Unlock()
-	if empty {
+	if empty && !takenOffline {
 		// We don't currently have a version on this descriptor, so no need to refresh
 		// anything.
 		return nil
@@ -1417,6 +1387,17 @@ func (m *Manager) findNewest(id descpb.ID) *descriptorVersionState {
 // the returned descriptor. Renewal of a lease may begin in the
 // background. Renewal is done in order to prevent blocking on future
 // acquisitions.
+//
+// Known limitation: AcquireByName() calls Acquire() and therefore suffers
+// from the same limitation as Acquire (See Acquire). AcquireByName() is
+// unable to function correctly on a timestamp less than the timestamp
+// of a transaction with a DROP/TRUNCATE on the descriptor. The limitation in
+// the face of a DROP follows directly from the limitation on Acquire().
+// A TRUNCATE is implemented by changing the name -> id mapping
+// and by dropping the descriptor with the old id. While AcquireByName
+// can use the timestamp and get the correct name->id  mapping at a
+// timestamp, it uses Acquire() to get a descriptor with the corresponding
+// id and fails because the id has been dropped by the TRUNCATE.
 func (m *Manager) AcquireByName(
 	ctx context.Context,
 	timestamp hlc.Timestamp,
@@ -1565,6 +1546,12 @@ func (m *Manager) resolveName(
 // A transaction using this descriptor must ensure that its
 // commit-timestamp < expiration-time. Care must be taken to not modify
 // the returned descriptor.
+//
+// Known limitation: Acquire() can return an error after the descriptor with
+// the ID has been dropped. This is true even when using a timestamp
+// less than the timestamp of the DROP command. This is because Acquire
+// can only return an older version of a descriptor if the latest version
+// can be leased; as it stands a dropped descriptor cannot be leased.
 func (m *Manager) Acquire(
 	ctx context.Context, timestamp hlc.Timestamp, id descpb.ID,
 ) (catalog.Descriptor, hlc.Timestamp, error) {
@@ -1592,11 +1579,6 @@ func (m *Manager) Acquire(
 				_, errLease := acquireNodeLease(ctx, m, id)
 				return errLease
 			}(); err != nil {
-				// Go back around because now we know about a dropped descriptor.
-				if e := new(nonPublicDescriptorError); errors.As(err, &e) &&
-					timestamp.Less(e.desc.GetModificationTime()) {
-					continue
-				}
 				return nil, hlc.Timestamp{}, err
 			}
 
@@ -1726,6 +1708,7 @@ func (m *Manager) refreshLeases(
 					if err := evFunc(desc); err != nil {
 						log.Infof(ctx, "skipping update of %v due to knob: %v",
 							desc, err)
+						continue
 					}
 				}
 
@@ -1734,8 +1717,7 @@ func (m *Manager) refreshLeases(
 				// Try to refresh the lease to one >= this version.
 				log.VEventf(ctx, 2, "purging old version of descriptor %d@%d (offline %v)",
 					id, version, goingOffline)
-				if err := purgeOldVersions(
-					ctx, db, id, goingOffline, version, m); err != nil {
+				if err := purgeOldVersions(ctx, db, id, goingOffline, version, m); err != nil {
 					log.Warningf(ctx, "error purging leases for descriptor %d(%s): %s",
 						id, name, err)
 				}
@@ -1859,7 +1841,7 @@ func (m *Manager) watchForRangefeedUpdates(
 		if descriptor.Union == nil {
 			return
 		}
-		descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(ctx, &descriptor, ev.Value.Timestamp)
+		descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(&descriptor, ev.Value.Timestamp)
 		id, version, name, _ := descpb.GetDescriptorMetadata(&descriptor)
 		if log.V(2) {
 			log.Infof(ctx, "%s: refreshing lease on descriptor: %d (%s), version: %d",
@@ -1901,7 +1883,7 @@ func (m *Manager) handleUpdatedSystemCfg(
 		if descriptor.Union == nil {
 			return
 		}
-		descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(ctx, &descriptor, kv.Value.Timestamp)
+		descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(&descriptor, kv.Value.Timestamp)
 		id, version, name, _ := descpb.GetDescriptorMetadata(&descriptor)
 		if log.V(2) {
 			log.Infof(ctx, "%s: refreshing lease on descriptor: %d (%s), version: %d",

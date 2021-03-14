@@ -190,16 +190,22 @@ func changefeedPlanHook(
 		targetDescs, _, err := backupbase.ResolveTargetsToDescriptors(
 			ctx, p, statementTime, &changefeedStmt.Targets)
 		if err != nil {
-			return errors.Wrap(err, "failed to resolve targets in the CHANGEFEED stmt")
-		}
-		for _, desc := range targetDescs {
-			if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
-				return err
+			err = errors.Wrap(err, "failed to resolve targets in the CHANGEFEED stmt")
+			if !initialHighWater.IsEmpty() {
+				// We specified cursor -- it is possible the targets do not exist at that time.
+				// Give a bit more context in the error message.
+				err = errors.WithHintf(err,
+					"do the targets exist at the specified cursor time %s?", initialHighWater)
 			}
+			return err
 		}
+
 		targets := make(jobspb.ChangefeedTargets, len(targetDescs))
 		for _, desc := range targetDescs {
 			if table, isTable := desc.(catalog.TableDescriptor); isTable {
+				if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
+					return err
+				}
 				_, qualified := opts[changefeedbase.OptFullTableName]
 				name, err := getChangefeedTargetName(ctx, table, *p.ExecCfg(), p.Txn(), qualified)
 				if err != nil {

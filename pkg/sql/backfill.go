@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -70,22 +71,19 @@ const (
 	// over many ranges.
 	indexTxnBackfillChunkSize = 100
 
-	// indexBackfillBatchSize is the maximum number of index entries we attempt to
-	// fill in a single index batch before queueing it up for ingestion and
-	// progress reporting in the index backfiller processor.
-	//
-	// TODO(adityamaru): This should live with the index backfiller processor
-	// logic once the column backfiller is reworked. The only reason this variable
-	// is initialized here is to maintain a single testing knob
-	// `BackfillChunkSize` to control both the index and column backfill chunking
-	// behavior, and minimize test complexity. Should this be a cluster setting? I
-	// would hope we can do a dynamic memory based adjustment of this number in
-	// the processor.
-	indexBackfillBatchSize = 5000
-
 	// checkpointInterval is the interval after which a checkpoint of the
 	// schema change is posted.
 	checkpointInterval = 2 * time.Minute
+)
+
+// indexBackfillBatchSize is the maximum number of rows we construct index
+// entries for before we attempt to fill in a single index batch before queueing
+// it up for ingestion and progress reporting in the index backfiller processor.
+var indexBackfillBatchSize = settings.RegisterIntSetting(
+	"bulkio.index_backfill.batch_size",
+	"the number of rows for which we construct index entries in a single batch",
+	50000,
+	settings.NonNegativeInt, /* validateFn */
 )
 
 var _ sort.Interface = columnsByID{}
@@ -802,7 +800,11 @@ func TruncateInterleavedIndexes(
 		// All the data chunks have been removed. Now also removed the
 		// zone configs for the dropped indexes, if any.
 		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return RemoveIndexZoneConfigs(ctx, txn, execCfg, table.GetParentID(), indexes)
+			freshTableDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, execCfg.Codec, table.GetID())
+			if err != nil {
+				return err
+			}
+			return RemoveIndexZoneConfigs(ctx, txn, execCfg, freshTableDesc, indexes)
 		}); err != nil {
 			return err
 		}
@@ -878,7 +880,11 @@ func (sc *SchemaChanger) truncateIndexes(
 		// All the data chunks have been removed. Now also removed the
 		// zone configs for the dropped indexes, if any.
 		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return RemoveIndexZoneConfigs(ctx, txn, sc.execCfg, sc.descID, dropped)
+			table, err := catalogkv.MustGetTableDescByID(ctx, txn, sc.execCfg.Codec, sc.descID)
+			if err != nil {
+				return err
+			}
+			return RemoveIndexZoneConfigs(ctx, txn, sc.execCfg, table, dropped)
 		}); err != nil {
 			return err
 		}
@@ -949,7 +955,6 @@ func (sc *SchemaChanger) distIndexBackfill(
 	targetSpans []roachpb.Span,
 	addedIndexes []descpb.IndexID,
 	filter backfill.MutationFilter,
-	indexBackfillBatchSize int64,
 ) error {
 	readAsOf := sc.clock.Now()
 
@@ -1025,7 +1030,8 @@ func (sc *SchemaChanger) distIndexBackfill(
 		evalCtx = createSchemaChangeEvalCtx(ctx, sc.execCfg, txn.ReadTimestamp(), sc.ieFactory)
 		planCtx = sc.distSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn,
 			true /* distribute */)
-		chunkSize := sc.getChunkSize(indexBackfillBatchSize)
+		indexBatchSize := indexBackfillBatchSize.Get(&sc.execCfg.Settings.SV)
+		chunkSize := sc.getChunkSize(indexBatchSize)
 		spec, err := initIndexBackfillerSpec(*tableDesc.TableDesc(), readAsOf, chunkSize, addedIndexes)
 		if err != nil {
 			return err
@@ -1345,13 +1351,11 @@ func (sc *SchemaChanger) updateJobRunningStatus(
 	ctx context.Context, status jobs.RunningStatus,
 ) (*tabledesc.Mutable, error) {
 	var tableDesc *tabledesc.Mutable
-	err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		desc, err := catalogkv.GetDescriptorByID(ctx, txn, sc.execCfg.Codec, sc.descID, catalogkv.Mutable,
-			catalogkv.TableDescriptorKind, true /* required */)
+	err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		tableDesc, err = catalogkv.MustGetMutableTableDescByID(ctx, txn, sc.execCfg.Codec, sc.descID)
 		if err != nil {
 			return err
 		}
-		tableDesc = desc.(*tabledesc.Mutable)
 
 		// Update running status of job.
 		updateJobRunningProgress := false
@@ -1422,19 +1426,19 @@ func (sc *SchemaChanger) validateIndexes(ctx context.Context) error {
 	var forwardIndexes []*descpb.IndexDescriptor
 	var invertedIndexes []*descpb.IndexDescriptor
 
-	for _, m := range tableDesc.GetMutations() {
-		if sc.mutationID != m.MutationID {
+	for _, m := range tableDesc.AllMutations() {
+		if sc.mutationID != m.MutationID() {
 			break
 		}
-		idx := m.GetIndex()
-		if idx == nil || m.Direction == descpb.DescriptorMutation_DROP {
+		idx := m.AsIndex()
+		if idx == nil || idx.Dropped() {
 			continue
 		}
-		switch idx.Type {
+		switch idx.GetType() {
 		case descpb.IndexDescriptor_FORWARD:
-			forwardIndexes = append(forwardIndexes, idx)
+			forwardIndexes = append(forwardIndexes, idx.IndexDesc())
 		case descpb.IndexDescriptor_INVERTED:
-			invertedIndexes = append(invertedIndexes, idx)
+			invertedIndexes = append(invertedIndexes, idx.IndexDesc())
 		}
 	}
 	if len(forwardIndexes) == 0 && len(invertedIndexes) == 0 {
@@ -1778,7 +1782,7 @@ func (sc *SchemaChanger) backfillIndexes(
 	}
 
 	if err := sc.distIndexBackfill(
-		ctx, version, addingSpans, addedIndexes, backfill.IndexMutationFilter, indexBackfillBatchSize,
+		ctx, version, addingSpans, addedIndexes, backfill.IndexMutationFilter,
 	); err != nil {
 		return err
 	}
@@ -1861,7 +1865,7 @@ func runSchemaChangesInTxn(
 	// mutations that need to be processed.
 	for i := 0; i < len(tableDesc.Mutations); i++ {
 		m := tableDesc.Mutations[i]
-		immutDesc := tabledesc.NewImmutable(*tableDesc.TableDesc())
+		immutDesc := tabledesc.NewBuilder(tableDesc.TableDesc()).BuildImmutableTable()
 		switch m.Direction {
 		case descpb.DescriptorMutation_ADD:
 			switch m.Descriptor_.(type) {
@@ -2330,5 +2334,5 @@ func indexTruncateInTxn(
 		}
 	}
 	// Remove index zone configs.
-	return RemoveIndexZoneConfigs(ctx, txn, execCfg, tableDesc.GetID(), []descpb.IndexDescriptor{*idx})
+	return RemoveIndexZoneConfigs(ctx, txn, execCfg, tableDesc, []descpb.IndexDescriptor{*idx})
 }

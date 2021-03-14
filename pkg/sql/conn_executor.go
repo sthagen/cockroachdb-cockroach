@@ -822,6 +822,22 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		if err := ex.machine.ApplyWithPayload(ctx, ev, payload); err != nil {
 			log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
 		}
+		switch t := ex.machine.CurState().(type) {
+		case stateNoTxn:
+			// No txn to finish.
+		case stateAborted:
+			// A non-retriable error with IsCommit set to true causes the transaction
+			// to be cleaned up.
+		case stateCommitWait:
+			ex.state.finishSQLTxn()
+		default:
+			if util.CrdbTestBuild {
+				panic(errors.AssertionFailedf("unexpected state in conn executor after ApplyWithPayload %T", t))
+			}
+		}
+		if util.CrdbTestBuild && ex.state.Ctx != nil {
+			panic(errors.AssertionFailedf("txn span not closed in state %s", ex.machine.CurState()))
+		}
 	} else if closeType == externalTxnClose {
 		ex.state.finishExternalTxn()
 	}
@@ -1447,12 +1463,16 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		return err // err could be io.EOF
 	}
 
+	// Ensure that every statement has a tracing span set up.
 	ctx, sp := tracing.EnsureChildSpan(
 		ctx, ex.server.cfg.AmbientCtx.Tracer,
 		// We print the type of command, not the String() which includes long
 		// statements.
 		cmd.command())
 	defer sp.Finish()
+	// We expect that the span is not used directly, so we'll overwrite the
+	// local variable.
+	sp = nil
 
 	if log.ExpensiveLogEnabled(ctx, 2) || ex.eventLog != nil {
 		ex.sessionEventf(ctx, "[%s pos:%d] executing %s",

@@ -353,9 +353,15 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 			Cost:                float64(e.Cost()),
 		}
 		if scan, ok := e.(*memo.ScanExpr); ok {
-			tableStats, ok := b.mem.GetCachedTableStatistics(scan.Table)
-			if ok {
-				val.TableRowCount = tableStats.RowCount
+			tab := b.mem.Metadata().Table(scan.Table)
+			if tab.StatisticCount() > 0 {
+				// The first stat is the most recent one.
+				stat := tab.Statistic(0)
+				val.TableStatsRowCount = stat.RowCount()
+				if val.TableStatsRowCount == 0 {
+					val.TableStatsRowCount = 1
+				}
+				val.TableStatsCreatedAt = stat.CreatedAt()
 			}
 		}
 		ef.AnnotateNode(ep.root, exec.EstimatedStatsID, &val)
@@ -2207,7 +2213,7 @@ func (b *Builder) buildSequenceSelect(seqSel *memo.SequenceSelectExpr) (execPlan
 func (b *Builder) applySaveTable(
 	input execPlan, e memo.RelExpr, saveTableName string,
 ) (execPlan, error) {
-	name := tree.NewTableName(tree.Name(opt.SaveTablesDatabase), tree.Name(saveTableName))
+	name := tree.NewTableNameWithSchema(tree.Name(opt.SaveTablesDatabase), tree.PublicSchemaName, tree.Name(saveTableName))
 
 	// Ensure that the column names are unique and match the names used by the
 	// opttester.

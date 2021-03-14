@@ -5,10 +5,12 @@ go_library(
     srcs = [
         "column.go",
         "index.go",
+        "mutation.go",
         "safe_format.go",
         "structured.go",
         "table.go",
         "table_desc.go",
+        "table_desc_builder.go",
         "validate.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc",

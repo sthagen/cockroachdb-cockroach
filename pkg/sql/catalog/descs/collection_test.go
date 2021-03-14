@@ -66,7 +66,7 @@ func TestCollectionWriteDescToBatch(t *testing.T) {
 		require.NotNil(t, mut)
 		// We want to create some descriptors and then ensure that writing them to a
 		// batch works as expected.
-		newTable := tabledesc.NewCreatedMutable(descpb.TableDescriptor{
+		newTable := tabledesc.NewBuilder(&descpb.TableDescriptor{
 			ID:                      142,
 			Name:                    "table2",
 			Version:                 1,
@@ -97,7 +97,7 @@ func TestCollectionWriteDescToBatch(t *testing.T) {
 			NextIndexID:    2,
 			NextMutationID: 1,
 			FormatVersion:  descpb.FamilyFormatVersion,
-		})
+		}).BuildCreatedMutableTable()
 		b := txn.NewBatch()
 
 		// Ensure that there are no errors and that the version is incremented.
@@ -373,7 +373,7 @@ func TestSyntheticDescriptorResolution(t *testing.T) {
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) error {
 		// Resolve the descriptor so we can mutate it.
-		tn := tree.MakeTableName("db", "tbl")
+		tn := tree.MakeTableNameWithSchema("db", tree.PublicSchemaName, "tbl")
 		found, desc, err := descriptors.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{})
 		require.True(t, found)
 		require.NoError(t, err)

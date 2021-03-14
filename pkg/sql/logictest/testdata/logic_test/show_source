@@ -41,6 +41,7 @@ default_transaction_use_follower_reads                off
 disable_partially_distributed_plans                   off
 disallow_full_table_scans                             off
 distsql                                               off
+enable_drop_enum_value                                off
 enable_experimental_alter_column_type_general         off
 enable_experimental_stream_replication                off
 enable_implicit_select_for_update                     on
@@ -62,7 +63,7 @@ idle_in_transaction_session_timeout                   0
 integer_datetimes                                     on
 intervalstyle                                         postgres
 locality                                              region=test,dc=dc1
-locality_optimized_partitioned_index_scan             off
+locality_optimized_partitioned_index_scan             on
 lock_timeout                                          0
 max_identifier_length                                 128
 max_index_keys                                        32

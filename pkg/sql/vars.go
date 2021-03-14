@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -239,27 +238,6 @@ var varGen = map[string]sessionVar{
 		},
 		SetWithPlanner: func(
 			_ context.Context, p *planner, dbName string) error {
-			// Check if the user has connect privilege on the database.
-			// If the dbName is empty string, skip the privilege check.
-			if dbName != "" {
-				_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(
-					p.EvalContext().Context, p.Txn(), dbName, tree.DatabaseLookupFlags{Required: true},
-				)
-				if err != nil {
-					return err
-				}
-				// Give a warning if the user does not have CONNECT privilege on the database.
-				connectPrivilegeMissingWarning := errors.WithIssueLink(
-					pgnotice.Newf("CONNECT privilege will be required to connect to databases in a future release"),
-					errors.IssueLink{IssueURL: build.MakeIssueURL(59875)},
-				)
-				if err := p.CheckPrivilege(p.EvalContext().Context, dbDesc, privilege.CONNECT); err != nil {
-					p.BufferClientNotice(
-						p.EvalContext().Context,
-						connectPrivilegeMissingWarning,
-					)
-				}
-			}
 			p.sessionDataMutator.SetDatabase(dbName)
 			return nil
 		},
@@ -1004,7 +982,7 @@ var varGen = map[string]sessionVar{
 		GetStringVal: makeTimeoutVarGetter(`idle_in_session_timeout`),
 		Set:          idleInSessionTimeoutVarSet,
 		Get: func(evalCtx *extendedEvalContext) string {
-			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
+			ms := evalCtx.SessionData.IdleInSessionTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
 		GlobalDefault: func(sv *settings.Values) string {
@@ -1016,7 +994,7 @@ var varGen = map[string]sessionVar{
 		GetStringVal: makeTimeoutVarGetter(`idle_in_transaction_session_timeout`),
 		Set:          idleInTransactionSessionTimeoutVarSet,
 		Get: func(evalCtx *extendedEvalContext) string {
-			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
+			ms := evalCtx.SessionData.IdleInTransactionSessionTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
 		GlobalDefault: func(sv *settings.Values) string { return "0" },
@@ -1160,6 +1138,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(implicitColumnPartitioningEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`enable_drop_enum_value`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_drop_enum_value`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_drop_enum_value", s)
+			if err != nil {
+				return err
+			}
+			m.SetDropEnumValueEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.DropEnumValueEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(dropEnumValueEnabledClusterMode.Get(sv))
 		},
 	},
 

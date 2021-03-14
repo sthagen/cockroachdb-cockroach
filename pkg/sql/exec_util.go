@@ -24,7 +24,6 @@ import (
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -231,6 +230,12 @@ var implicitColumnPartitioningEnabledClusterMode = settings.RegisterBoolSetting(
 	false,
 )
 
+var dropEnumValueEnabledClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.drop_enum_value.enabled",
+	"default value for enable_drop_enum_value; allows for dropping enum values",
+	false,
+)
+
 var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_hash_sharded_indexes.enabled",
 	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
@@ -297,7 +302,7 @@ var localityOptimizedSearchMode = settings.RegisterBoolSetting(
 	"sql.defaults.locality_optimized_partitioned_index_scan.enabled",
 	"default value for locality_optimized_partitioned_index_scan session setting; "+
 		"enables searching for rows in the current region before searching remote regions",
-	false,
+	true,
 )
 
 var implicitSelectForUpdateClusterMode = settings.RegisterBoolSetting(
@@ -936,15 +941,16 @@ type ExecutorTestingKnobs struct {
 	// unsupported and will lead to a panic.
 	TestingSaveFlows func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec) error
 
-	// DeterministicExplainAnalyze, if set, will result in overriding fields in
-	// EXPLAIN ANALYZE (PLAN) that can vary between runs (like elapsed times).
-	DeterministicExplainAnalyze bool
-
-	// Pretend59315IsFixed pretends that this issue is fixed:
-	// https://github.com/cockroachdb/cockroach/issues/59315
-	// which means that we don't need the WithBypassRegistry option
-	// in resetForNewSQLTxn.
-	Pretend59315IsFixed bool
+	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
+	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
+	//
+	// TODO(radu): this flag affects EXPLAIN and EXPLAIN ANALYZE differently. It
+	// hides the vectorization, distribution, and cluster nodes in EXPLAIN ANALYZE
+	// but not in EXPLAIN. This is just a consequence of how the tests we have are
+	// written. We should replace this knob with a session setting that allows
+	// exact control of the redaction flags (and have each test set it as
+	// necessary).
+	DeterministicExplain bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -1010,16 +1016,6 @@ var _ base.ModuleTestingKnobs = &BackupRestoreTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*BackupRestoreTestingKnobs) ModuleTestingKnobs() {}
-
-// StreamIngestionTestingKnobs contains knobs for stream ingestion behavior.
-type StreamIngestionTestingKnobs struct {
-	Interceptors []func(event streamingccl.Event, pa streamingccl.PartitionAddress)
-}
-
-var _ base.ModuleTestingKnobs = &StreamIngestionTestingKnobs{}
-
-// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
-func (*StreamIngestionTestingKnobs) ModuleTestingKnobs() {}
 
 func shouldDistributeGivenRecAndMode(
 	rec distRecommendation, mode sessiondata.DistSQLExecMode,
@@ -1653,16 +1649,18 @@ func (st *SessionTracing) StartTracing(
 		return nil
 	}
 
-	// If we're inside a transaction, start recording on the txn span.
+	// If we're inside a transaction, hijack the txn's ctx with one that has a
+	// recording span.
 	if _, ok := st.ex.machine.CurState().(stateNoTxn); !ok {
-		sp := tracing.SpanFromContext(st.ex.state.Ctx)
-		if sp == nil {
+		txnCtx := st.ex.state.Ctx
+		if sp := tracing.SpanFromContext(txnCtx); sp == nil {
 			return errors.Errorf("no txn span for SessionTracing")
 		}
-		// We want to clear out any existing recordings so they don't show up in
-		// future traces.
-		sp.ResetRecording()
+
+		newTxnCtx, sp := tracing.EnsureChildSpan(txnCtx, st.ex.server.cfg.AmbientCtx.Tracer,
+			"session tracing", tracing.WithForceRealSpan())
 		sp.SetVerbose(true)
+		st.ex.state.Ctx = newTxnCtx
 		st.firstTxnSpan = sp
 	}
 
@@ -2314,6 +2312,10 @@ func (m *sessionDataMutator) SetTempTablesEnabled(val bool) {
 
 func (m *sessionDataMutator) SetImplicitColumnPartitioningEnabled(val bool) {
 	m.data.ImplicitColumnPartitioningEnabled = val
+}
+
+func (m *sessionDataMutator) SetDropEnumValueEnabled(val bool) {
+	m.data.DropEnumValueEnabled = val
 }
 
 func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {

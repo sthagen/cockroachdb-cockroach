@@ -290,9 +290,7 @@ func TestTracerInjectExtract(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s1.ImportRemoteSpans(rec); err != nil {
-		t.Fatal(err)
-	}
+	s1.ImportRemoteSpans(rec)
 	s1.Finish()
 
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), `
@@ -333,6 +331,8 @@ func TestShadowTracer(t *testing.T) {
 	zipTr, err := zipkin.NewTracer(zipRec)
 	require.NoError(t, err)
 
+	ddMgr, ddTr := createDataDogTracer("dummyaddr", "dummyproject")
+
 	for _, tc := range []struct {
 		mgr   shadowTracerManager
 		str   opentracing.Tracer
@@ -365,6 +365,10 @@ func TestShadowTracer(t *testing.T) {
 				require.Equal(t, log.String("event", "hello"), rs[0].Logs[0].Fields[0])
 			},
 		},
+		{
+			mgr: ddMgr,
+			str: ddTr,
+		},
 	} {
 		t.Run(tc.mgr.Name(), func(t *testing.T) {
 			tr := NewTracer()
@@ -393,7 +397,7 @@ func TestShadowTracer(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// ExtractMetaFrom also extracts the embedded lightstep context.
+			// ExtractMetaFrom also extracts the embedded shadow context.
 			wireSpanMeta, err := tr.ExtractMetaFrom(carrier)
 			if err != nil {
 				t.Fatal(err)
@@ -403,7 +407,7 @@ func TestShadowTracer(t *testing.T) {
 			s2Ctx := s2.i.ot.shadowSpan.Context()
 
 			// Verify that the baggage is correct in both the tracer context and in the
-			// lightstep context.
+			// shadow's context.
 			shadowBaggage := make(map[string]string)
 			s2Ctx.ForeachBaggageItem(func(k, v string) bool {
 				shadowBaggage[k] = v
@@ -517,7 +521,7 @@ func TestTracer_VisitSpans(t *testing.T) {
 	childChildFinished := tr2.StartSpan("root.child.remotechilddone", WithParentAndManualCollection(child.Meta()))
 	require.Len(t, tr2.activeSpans.m, 2)
 
-	require.NoError(t, child.ImportRemoteSpans(childChildFinished.GetRecording()))
+	child.ImportRemoteSpans(childChildFinished.GetRecording())
 
 	childChildFinished.Finish()
 	require.Len(t, tr2.activeSpans.m, 1)
@@ -551,7 +555,7 @@ func TestSpanRecordingFinished(t *testing.T) {
 
 	tr2 := NewTracer()
 	remoteChildChild := tr2.StartSpan("root.child.remotechild", WithParentAndManualCollection(child.Meta()))
-	require.NoError(t, child.ImportRemoteSpans(remoteChildChild.GetRecording()))
+	child.ImportRemoteSpans(remoteChildChild.GetRecording())
 
 	// All spans are un-finished.
 	sortedSpanOps := getSortedSpanOps(t, tr1)
@@ -582,7 +586,7 @@ func TestSpanRecordingFinished(t *testing.T) {
 	remoteChildChild.Finish()
 	// NB: importing a span twice is essentially a bad idea. It's ok in
 	// this test though.
-	require.NoError(t, child.ImportRemoteSpans(remoteChildChild.GetRecording()))
+	child.ImportRemoteSpans(remoteChildChild.GetRecording())
 	child.Finish()
 	spanOpsWithFinished = getSpanOpsWithFinished(t, tr1)
 

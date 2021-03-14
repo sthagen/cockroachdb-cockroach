@@ -186,6 +186,7 @@ func queryPairs(t *testing.T, sqlDB *gosql.DB, query string) []pair {
 // and ensures that the data was backfilled properly.
 func TestIndexBackfillerComputedAndGeneratedColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// A test case exists to exercise the behavior of an index backfill.
 	// The case gets to do arbitrary things to the table (which is created with
@@ -522,9 +523,8 @@ INSERT INTO foo VALUES (1), (10), (100);
 			tableID, 1, execCfg.NodeID.SQLInstanceID(), s0.DB(), lm, jr, &execCfg, settings)
 		changer.SetJob(j)
 		spans := []roachpb.Span{table.IndexSpan(keys.SystemSQLCodec, test.indexToBackfill)}
-		require.NoError(t, changer.TestingDistIndexBackfill(
-			ctx, table.GetVersion(), spans, []descpb.IndexID{test.indexToBackfill}, backfill.IndexMutationFilter, 10,
-		))
+		require.NoError(t, changer.TestingDistIndexBackfill(ctx, table.GetVersion(), spans,
+			[]descpb.IndexID{test.indexToBackfill}, backfill.IndexMutationFilter))
 
 		// Make the mutation complete, then read the index and validate that it
 		// has the expected contents.

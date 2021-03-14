@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 )
 
@@ -109,7 +110,7 @@ type virtualSchemaTable struct {
 	// generator, if non-nil, is a function that is used when creating a
 	// virtualTableNode. This function returns a virtualTableGenerator function
 	// which generates the next row of the virtual table when called.
-	generator func(ctx context.Context, p *planner, db *dbdesc.Immutable) (virtualTableGenerator, cleanupFunc, error)
+	generator func(ctx context.Context, p *planner, db *dbdesc.Immutable, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error)
 }
 
 // virtualSchemaView represents a view within a virtualSchema
@@ -176,6 +177,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		tree.PersistencePermanent,
 	)
 	if err != nil {
+		err = errors.Wrapf(err, "initVirtualDesc problem with schema: \n%s", t.schema)
 		return descpb.TableDescriptor{}, err
 	}
 	for _, index := range mutDesc.PublicNonPrimaryIndexes() {
@@ -333,7 +335,7 @@ func (v *virtualSchemaEntry) GetObjectByName(
 		if def, ok := v.defs[name]; ok {
 			if flags.RequireMutable {
 				return &mutableVirtualDefEntry{
-					desc: tabledesc.NewExistingMutable(*def.desc.TableDesc()),
+					desc: tabledesc.NewBuilder(def.desc.TableDesc()).BuildExistingMutableTable(),
 				}, nil
 			}
 			return def, nil
@@ -448,6 +450,7 @@ func (e *virtualDefEntry) getPlanInfo(
 	table catalog.TableDescriptor,
 	index *descpb.IndexDescriptor,
 	idxConstraint *constraint.Constraint,
+	stopper *stop.Stopper,
 ) (colinfo.ResultColumns, virtualTableConstructor) {
 	var columns colinfo.ResultColumns
 	for _, col := range e.desc.PublicColumns() {
@@ -483,7 +486,7 @@ func (e *virtualDefEntry) getPlanInfo(
 			}
 
 			if def.generator != nil {
-				next, cleanup, err := def.generator(ctx, p, dbDesc)
+				next, cleanup, err := def.generator(ctx, p, dbDesc, stopper)
 				if err != nil {
 					return nil, err
 				}
@@ -492,14 +495,17 @@ func (e *virtualDefEntry) getPlanInfo(
 
 			constrainedScan := idxConstraint != nil && !idxConstraint.IsUnconstrained()
 			if !constrainedScan {
-				generator, cleanup := setupGenerator(ctx, func(pusher rowPusher) error {
+				generator, cleanup, setupError := setupGenerator(ctx, func(pusher rowPusher) error {
 					return def.populate(ctx, p, dbDesc, func(row ...tree.Datum) error {
 						if err := e.validateRow(row, columns); err != nil {
 							return err
 						}
 						return pusher.pushRow(row...)
 					})
-				})
+				}, stopper)
+				if setupError != nil {
+					return nil, setupError
+				}
 				return p.newVirtualTableNode(columns, generator, cleanup), nil
 			}
 
@@ -514,8 +520,11 @@ func (e *virtualDefEntry) getPlanInfo(
 			columnIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
 			indexKeyDatums := make([]tree.Datum, len(index.ColumnIDs))
 
-			generator, cleanup := setupGenerator(ctx, e.makeConstrainedRowsGenerator(
-				ctx, p, dbDesc, index, indexKeyDatums, columnIdxMap, idxConstraint, columns))
+			generator, cleanup, setupError := setupGenerator(ctx, e.makeConstrainedRowsGenerator(
+				ctx, p, dbDesc, index, indexKeyDatums, columnIdxMap, idxConstraint, columns), stopper)
+			if setupError != nil {
+				return nil, setupError
+			}
 			return p.newVirtualTableNode(columns, generator, cleanup), nil
 
 		default:
@@ -644,7 +653,7 @@ func NewVirtualSchemaHolder(
 					return nil, errors.NewAssertionErrorWithWrappedErrf(err, "programmer error")
 				}
 			}
-			td := tabledesc.NewImmutable(tableDesc)
+			td := tabledesc.NewBuilder(&tableDesc).BuildImmutableTable()
 			if err := catalog.ValidateSelf(td); err != nil {
 				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to validate virtual table %s: programmer error", errors.Safe(td.GetName()))
@@ -686,12 +695,12 @@ var publicSelectPrivileges = descpb.NewPrivilegeDescriptor(
 )
 
 func initVirtualDatabaseDesc(id descpb.ID, name string) *dbdesc.Immutable {
-	return dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+	return dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
 		Name:       name,
 		ID:         id,
 		Version:    1,
 		Privileges: publicSelectPrivileges,
-	})
+	}).BuildImmutableDatabase()
 }
 
 // getEntries is part of the VirtualTabler interface.

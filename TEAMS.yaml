@@ -70,10 +70,6 @@ cockroachdb/security:
   email: security@cockroachlabs.com
   slack: security
   triage_column_id: 0 # TODO
-cockroachdb/admin-ui-prs:
-  email: observability@cockroachlabs.com
-  slack: product-observability
-  triage_column_id: 6598672
 cockroachdb/bulk-prs: # TODO: remove
   email: bulk-io@cockroachlabs.com
   slack: bulk-io
@@ -82,6 +78,14 @@ cockroachdb/bulk-io:
   email: bulk-io@cockroachlabs.com
   slack: bulk-io
   triage_column_id: 3097123
+cockroachdb/cdc-prs: # TODO: remove
+  email: cdc@cockroachlabs.com
+  slack: cdc
+  triage_column_id: 3570120
+cockroachdb/cdc-io:
+  email: cdc@cockroachlabs.com
+  slack: cdc
+  triage_column_id: 3570120
 cockroachdb/cli-prs:
   email: TODO@cockroachlabs.com
   slack: cli
@@ -98,3 +102,7 @@ cockroachdb/sqlproxy-prs:
   email: TODO@cockroachlabs.com
   slack: cc-intrusion-team
   triage_column_id: 0 # TODO
+cockroachdb/cluster-ui-prs:
+  email: observability@cockroachlabs.com
+  slack: _cc-observability
+  triage_column_id: 6598672

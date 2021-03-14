@@ -38,31 +38,22 @@ import (
 )
 
 // MutationFilter is the type of a simple predicate on a mutation.
-type MutationFilter func(descpb.DescriptorMutation) bool
+type MutationFilter func(catalog.Mutation) bool
 
 // ColumnMutationFilter is a filter that allows mutations that add or drop
 // columns.
-func ColumnMutationFilter(m descpb.DescriptorMutation) bool {
-	return m.GetColumn() != nil &&
-		(m.Direction == descpb.DescriptorMutation_ADD || m.Direction == descpb.DescriptorMutation_DROP)
+func ColumnMutationFilter(m catalog.Mutation) bool {
+	return m.AsColumn() != nil && (m.Adding() || m.Dropped())
 }
 
 // IndexMutationFilter is a filter that allows mutations that add indexes.
-func IndexMutationFilter(m descpb.DescriptorMutation) bool {
-	return m.GetIndex() != nil && m.Direction == descpb.DescriptorMutation_ADD
-}
-
-// backfiller is common to a ColumnBackfiller or an IndexBackfiller.
-type backfiller struct {
-	fetcher row.Fetcher
-	alloc   rowenc.DatumAlloc
+func IndexMutationFilter(m catalog.Mutation) bool {
+	return m.AsIndex() != nil && m.Adding()
 }
 
 // ColumnBackfiller is capable of running a column backfill for all
 // updateCols.
 type ColumnBackfiller struct {
-	backfiller
-
 	added   []descpb.ColumnDescriptor
 	dropped []descpb.ColumnDescriptor
 
@@ -71,20 +62,22 @@ type ColumnBackfiller struct {
 	updateExprs []tree.TypedExpr
 	evalCtx     *tree.EvalContext
 
+	fetcher row.Fetcher
+	alloc   rowenc.DatumAlloc
+
 	// mon is a memory monitor linked with the ColumnBackfiller on creation.
 	mon *mon.BytesMonitor
 }
 
 // initCols is a helper to populate some column metadata on a ColumnBackfiller.
 func (cb *ColumnBackfiller) initCols(desc catalog.TableDescriptor) {
-	for _, m := range desc.GetMutations() {
+	for _, m := range desc.AllMutations() {
 		if ColumnMutationFilter(m) {
-			desc := *m.GetColumn()
-			switch m.Direction {
-			case descpb.DescriptorMutation_ADD:
-				cb.added = append(cb.added, desc)
-			case descpb.DescriptorMutation_DROP:
-				cb.dropped = append(cb.dropped, desc)
+			col := *m.AsColumn().ColumnDesc()
+			if m.Adding() {
+				cb.added = append(cb.added, col)
+			} else if m.Dropped() {
+				cb.dropped = append(cb.dropped, col)
 			}
 		}
 	}
@@ -409,8 +402,6 @@ type muBoundAccount struct {
 
 // IndexBackfiller is capable of backfilling all the added index.
 type IndexBackfiller struct {
-	backfiller
-
 	added []*descpb.IndexDescriptor
 	// colIdxMap maps ColumnIDs to indices into desc.Columns and desc.Mutations.
 	colIdxMap catalog.TableColMap
@@ -444,6 +435,10 @@ type IndexBackfiller struct {
 	// backfilled.
 	indexesToEncode []*descpb.IndexDescriptor
 
+	valNeededForCol util.FastIntSet
+
+	alloc rowenc.DatumAlloc
+
 	// mon is a memory monitor linked with the IndexBackfiller on creation.
 	mon            *mon.BytesMonitor
 	muBoundAccount muBoundAccount
@@ -473,7 +468,7 @@ func (ib *IndexBackfiller) InitForLocalUse(
 	ib.initCols(desc)
 
 	// Initialize ib.added.
-	valNeededForCol := ib.initIndexes(desc)
+	ib.valNeededForCol = ib.initIndexes(desc)
 
 	predicates, colExprs, referencedColumns, err := constructExprs(
 		ctx, desc, ib.added, ib.cols, ib.addedCols, ib.computedCols, evalCtx, semaCtx,
@@ -485,10 +480,10 @@ func (ib *IndexBackfiller) InitForLocalUse(
 	// Add the columns referenced in the predicate to valNeededForCol so that
 	// columns necessary to evaluate the predicate expression are fetched.
 	referencedColumns.ForEach(func(col descpb.ColumnID) {
-		valNeededForCol.Add(ib.colIdxMap.GetDefault(col))
+		ib.valNeededForCol.Add(ib.colIdxMap.GetDefault(col))
 	})
 
-	return ib.init(evalCtx, predicates, colExprs, valNeededForCol, desc, mon)
+	return ib.init(evalCtx, predicates, colExprs, mon)
 }
 
 // constructExprs is a helper to construct the index and column expressions
@@ -594,7 +589,7 @@ func (ib *IndexBackfiller) InitForDistributedUse(
 	ib.initCols(desc)
 
 	// Initialize ib.added.
-	valNeededForCol := ib.initIndexes(desc)
+	ib.valNeededForCol = ib.initIndexes(desc)
 
 	evalCtx := flowCtx.NewEvalCtx()
 	var predicates map[descpb.IndexID]tree.TypedExpr
@@ -630,15 +625,14 @@ func (ib *IndexBackfiller) InitForDistributedUse(
 	// Add the columns referenced in the predicate to valNeededForCol so that
 	// columns necessary to evaluate the predicate expression are fetched.
 	referencedColumns.ForEach(func(col descpb.ColumnID) {
-		valNeededForCol.Add(ib.colIdxMap.GetDefault(col))
+		ib.valNeededForCol.Add(ib.colIdxMap.GetDefault(col))
 	})
 
-	return ib.init(evalCtx, predicates, colExprs, valNeededForCol, desc, mon)
+	return ib.init(evalCtx, predicates, colExprs, mon)
 }
 
 // Close releases the resources used by the IndexBackfiller.
 func (ib *IndexBackfiller) Close(ctx context.Context) {
-	ib.fetcher.Close(ctx)
 	if ib.mon != nil {
 		ib.muBoundAccount.Lock()
 		ib.muBoundAccount.boundAccount.Close(ctx)
@@ -696,16 +690,17 @@ func (ib *IndexBackfiller) initCols(desc catalog.TableDescriptor) {
 // fetched in order to backfill the added indexes.
 func (ib *IndexBackfiller) initIndexes(desc catalog.TableDescriptor) util.FastIntSet {
 	var valNeededForCol util.FastIntSet
-	mutationID := desc.GetMutations()[0].MutationID
+	mutations := desc.AllMutations()
+	mutationID := mutations[0].MutationID()
 
 	// Mutations in the same transaction have the same ID. Loop through the
 	// mutations and collect all index mutations.
-	for _, m := range desc.GetMutations() {
-		if m.MutationID != mutationID {
+	for _, m := range mutations {
+		if m.MutationID() != mutationID {
 			break
 		}
 		if IndexMutationFilter(m) {
-			idx := m.GetIndex()
+			idx := m.AsIndex().IndexDesc()
 			ib.added = append(ib.added, idx)
 			for i := range ib.cols {
 				id := ib.cols[i].ID
@@ -728,8 +723,6 @@ func (ib *IndexBackfiller) init(
 	evalCtx *tree.EvalContext,
 	predicateExprs map[descpb.IndexID]tree.TypedExpr,
 	colExprs map[descpb.ColumnID]tree.TypedExpr,
-	valNeededForCol util.FastIntSet,
-	desc catalog.TableDescriptor,
 	mon *mon.BytesMonitor,
 ) error {
 	ib.evalCtx = evalCtx
@@ -750,32 +743,13 @@ func (ib *IndexBackfiller) init(
 		ib.types[i] = ib.cols[i].Type
 	}
 
-	tableArgs := row.FetcherTableArgs{
-		Desc:            desc,
-		Index:           desc.GetPrimaryIndex().IndexDesc(),
-		ColIdxMap:       ib.colIdxMap,
-		Cols:            ib.cols,
-		ValNeededForCol: valNeededForCol,
-	}
-
 	// Create a bound account associated with the index backfiller monitor.
 	if mon == nil {
 		return errors.AssertionFailedf("no memory monitor linked to IndexBackfiller during init")
 	}
 	ib.mon = mon
 	ib.muBoundAccount.boundAccount = mon.MakeBoundAccount()
-
-	return ib.fetcher.Init(
-		evalCtx.Context,
-		evalCtx.Codec,
-		false, /* reverse */
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		false, /* isCheck */
-		&ib.alloc,
-		mon,
-		tableArgs,
-	)
+	return nil
 }
 
 // BuildIndexEntriesChunk reads a chunk of rows from a table using the span sp
@@ -816,7 +790,29 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	// during the scan. Index entries in the new index are being
 	// populated and deleted by the OLTP commands but not otherwise
 	// read or used
-	if err := ib.fetcher.StartScan(
+	tableArgs := row.FetcherTableArgs{
+		Desc:            tableDesc,
+		Index:           tableDesc.GetPrimaryIndex().IndexDesc(),
+		ColIdxMap:       ib.colIdxMap,
+		Cols:            ib.cols,
+		ValNeededForCol: ib.valNeededForCol,
+	}
+	var fetcher row.Fetcher
+	if err := fetcher.Init(
+		ib.evalCtx.Context,
+		ib.evalCtx.Codec,
+		false, /* reverse */
+		descpb.ScanLockingStrength_FOR_NONE,
+		descpb.ScanLockingWaitPolicy_BLOCK,
+		false, /* isCheck */
+		&ib.alloc,
+		ib.mon,
+		tableArgs,
+	); err != nil {
+		return nil, nil, 0, err
+	}
+	defer fetcher.Close(ctx)
+	if err := fetcher.StartScan(
 		ctx, txn, []roachpb.Span{sp}, true /* limitBatches */, initBufferSize,
 		traceKV, false, /* forceProductionKVBatchSize */
 	); err != nil {
@@ -860,7 +856,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 		return nil
 	}
 	for i := int64(0); i < chunkSize; i++ {
-		encRow, _, _, err := ib.fetcher.NextRow(ctx)
+		encRow, _, _, err := fetcher.NextRow(ctx)
 		if err != nil {
 			return nil, nil, 0, err
 		}
@@ -962,7 +958,12 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	ib.ShrinkBoundAccount(ctx, shrinkSize)
 	memUsedPerChunk -= shrinkSize
 
-	return entries, ib.fetcher.Key(), memUsedPerChunk, nil
+	var resumeKey roachpb.Key
+	if fetcher.Key() != nil {
+		resumeKey = make(roachpb.Key, len(fetcher.Key()))
+		copy(resumeKey, fetcher.Key())
+	}
+	return entries, resumeKey, memUsedPerChunk, nil
 }
 
 // RunIndexBackfillChunk runs an index backfill over a chunk of the table

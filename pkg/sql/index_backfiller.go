@@ -123,15 +123,15 @@ func (ib *IndexBackfillPlanner) plan(
 	var p *PhysicalPlan
 	var evalCtx extendedEvalContext
 	var planCtx *PlanningCtx
-	td := tabledesc.NewExistingMutable(*tableDesc.TableDesc())
+	td := tabledesc.NewBuilder(tableDesc.TableDesc()).BuildExistingMutableTable()
 	if err := ib.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		evalCtx = createSchemaChangeEvalCtx(ctx, ib.execCfg, nowTimestamp, ib.ieFactory)
 		planCtx = ib.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn,
 			true /* distribute */)
 		// TODO(ajwerner): Adopt util.ConstantWithMetamorphicTestRange for the
 		// batch size. Also plumb in a testing knob.
-		spec, err := initIndexBackfillerSpec(
-			*td.TableDesc(), readAsOf, indexBackfillBatchSize, indexesToBackfill)
+		chunkSize := indexBackfillBatchSize.Get(&ib.execCfg.Settings.SV)
+		spec, err := initIndexBackfillerSpec(*td.TableDesc(), readAsOf, chunkSize, indexesToBackfill)
 		if err != nil {
 			return err
 		}

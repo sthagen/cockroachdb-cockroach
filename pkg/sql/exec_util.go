@@ -236,6 +236,13 @@ var dropEnumValueEnabledClusterMode = settings.RegisterBoolSetting(
 	false,
 )
 
+var overrideMultiRegionZoneConfigClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.override_multi_region_zone_config.enabled",
+	"default value for override_multi_region_zone_config; "+
+		"allows for overriding the zone configs of a multi-region table or database",
+	false,
+)
+
 var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_hash_sharded_indexes.enabled",
 	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
@@ -324,14 +331,34 @@ var experimentalAlterColumnTypeGeneralMode = settings.RegisterBoolSetting(
 	false,
 )
 
+var clusterStatementTimeout = settings.RegisterDurationSetting(
+	"sql.defaults.statement_timeout",
+	"default value for the statement_timeout; "+
+		"default value for the statement_timeout session setting; controls the "+
+		"duration a query is permitted to run before it is canceled; if set to 0, "+
+		"there is no timeout",
+	0,
+	settings.NonNegativeDuration,
+).WithPublic()
+
 var clusterIdleInSessionTimeout = settings.RegisterDurationSetting(
 	"sql.defaults.idle_in_session_timeout",
 	"default value for the idle_in_session_timeout; "+
-		"enables automatically killing sessions that exceed the "+
-		"idle_in_session_timeout threshold",
+		"default value for the idle_in_session_timeout session setting; controls the "+
+		"duration a session is permitted to idle before the session is terminated; "+
+		"if set to 0, there is no timeout",
 	0,
 	settings.NonNegativeDuration,
-)
+).WithPublic()
+
+var clusterIdleInTransactionSessionTimeout = settings.RegisterDurationSetting(
+	"sql.defaults.idle_in_transaction_session_timeout",
+	"default value for the idle_in_transaction_session_timeout; controls the "+
+		"duration a session is permitted to idle in a transaction before the "+
+		"session is terminated; if set to 0, there is no timeout",
+	0,
+	settings.NonNegativeDuration,
+).WithPublic()
 
 // TODO(rytaft): remove this once unique without index constraints are fully
 // supported.
@@ -2316,6 +2343,10 @@ func (m *sessionDataMutator) SetImplicitColumnPartitioningEnabled(val bool) {
 
 func (m *sessionDataMutator) SetDropEnumValueEnabled(val bool) {
 	m.data.DropEnumValueEnabled = val
+}
+
+func (m *sessionDataMutator) SetOverrideMultiRegionZoneConfigEnabled(val bool) {
+	m.data.OverrideMultiRegionZoneConfigEnabled = val
 }
 
 func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {

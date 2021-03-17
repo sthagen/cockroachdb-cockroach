@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -342,7 +341,6 @@ GRANT admin TO has_admin2;
 
 func TestCancelQueryPermissions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 53791, "data race")
 	defer log.Scope(t).Close(t)
 
 	// getQueryIDs retrieves the IDs of any currently running queries for the
@@ -408,7 +406,7 @@ GRANT admin TO has_admin2;
 		{"non-admins with CANCELQUERY can cancel non-admins", "has_cancelquery", "no_perms", true,
 			""},
 		{"non-admins cannot cancel admins", "has_cancelquery", "has_admin", false,
-			"permission denied to cancel admin query"},
+			"permission denied to cancel admin session"},
 		{"unpermissioned users cannot cancel other users", "no_perms", "has_cancelquery", false,
 			"this operation requires CANCELQUERY privilege"},
 	}
@@ -630,10 +628,8 @@ func TestCancelIfExists(t *testing.T) {
 
 	conn := tc.ServerConn(0)
 
-	var err error
-
 	// Try to cancel a query that doesn't exist.
-	_, err = conn.Exec("CANCEL QUERY IF EXISTS '00000000000000000000000000000001'")
+	_, err := conn.Exec("CANCEL QUERY IF EXISTS '00000000000000000000000000000001'")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -664,10 +660,23 @@ func TestIdleInSessionTimeout(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(ctx)
 
+	clusterSettingConn := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	clusterSettingConn.Exec(t, `SET CLUSTER SETTING sql.defaults.idle_in_session_timeout = '100s'`)
+	defer tc.ServerConn(0).Close()
+
 	conn, err := tc.ServerConn(0).Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
+	testutils.SucceedsSoon(t, func() error {
+		var idleInSessionTimeoutSetting string
+		err = conn.QueryRowContext(ctx, `SHOW idle_in_session_timeout`).Scan(&idleInSessionTimeoutSetting)
+		require.NoError(t, err)
+		if idleInSessionTimeoutSetting == "100000" {
+			return nil
+		}
+		conn, err = tc.ServerConn(0).Conn(ctx)
+		return errors.Errorf("expected idle_in_session_timeout %s, got %s", "100000", idleInSessionTimeoutSetting)
+	})
 
 	_, err = conn.ExecContext(ctx, `SET idle_in_session_timeout = '2s'`)
 	if err != nil {
@@ -725,17 +734,27 @@ func TestIdleInTransactionSessionTimeout(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(ctx)
 
-	var err error
-	conn, err := tc.ServerConn(0).Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	clusterSettingConn := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	clusterSettingConn.Exec(t, `SET CLUSTER SETTING sql.defaults.idle_in_transaction_session_timeout = '123s'`)
+	defer tc.ServerConn(0).Close()
 
-	_, err = conn.ExecContext(ctx,
-		`SET idle_in_transaction_session_timeout = '2s'`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn, err := tc.ServerConn(0).Conn(ctx)
+	require.NoError(t, err)
+
+	testutils.SucceedsSoon(t, func() error {
+		var idleInTransactionSessionTimeoutSetting string
+		err = conn.QueryRowContext(ctx, `SHOW idle_in_transaction_session_timeout`).Scan(&idleInTransactionSessionTimeoutSetting)
+		require.NoError(t, err)
+		if idleInTransactionSessionTimeoutSetting == "123000" {
+			return nil
+		}
+		conn, err = tc.ServerConn(0).Conn(ctx)
+		require.NoError(t, err)
+		return errors.Errorf("expected idle_in_transaction_session_timeout %s, got %s", "123000", idleInTransactionSessionTimeoutSetting)
+	})
+
+	_, err = conn.ExecContext(ctx, `SET idle_in_transaction_session_timeout = '2s'`)
+	require.NoError(t, err)
 
 	time.Sleep(3 * time.Second)
 	// idle_in_transaction_session_timeout should only timeout if a transaction
@@ -786,14 +805,8 @@ func TestIdleInTransactionSessionTimeoutAbortedState(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(ctx)
 
-	var err error
-	conn, err := tc.ServerConn(0).Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = conn.ExecContext(ctx,
-		`SET idle_in_transaction_session_timeout = '2s'`)
+	conn := tc.ServerConn(0)
+	_, err := conn.ExecContext(ctx, `SET idle_in_transaction_session_timeout = '2s'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,14 +864,8 @@ func TestIdleInTransactionSessionTimeoutCommitWaitState(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(ctx)
 
-	var err error
-	conn, err := tc.ServerConn(0).Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = conn.ExecContext(ctx,
-		`SET idle_in_transaction_session_timeout = '2s'`)
+	conn := tc.ServerConn(0)
+	_, err := conn.ExecContext(ctx, `SET idle_in_transaction_session_timeout = '2s'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -919,11 +926,26 @@ func TestStatementTimeoutRetryableErrors(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(ctx)
 
+	clusterSettingConn := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	clusterSettingConn.Exec(t, `SET CLUSTER SETTING sql.defaults.statement_timeout = '123s'`)
+	defer tc.ServerConn(0).Close()
+
 	conn, err := tc.ServerConn(0).Conn(ctx)
 	require.NoError(t, err)
 
-	_, err = conn.QueryContext(ctx,
-		`SET statement_timeout = '0.1s'`)
+	testutils.SucceedsSoon(t, func() error {
+		var statementTimeoutSetting string
+		err = conn.QueryRowContext(ctx, `SHOW statement_timeout`).Scan(&statementTimeoutSetting)
+		require.NoError(t, err)
+		if statementTimeoutSetting == "123000" {
+			return nil
+		}
+		conn, err = tc.ServerConn(0).Conn(ctx)
+		require.NoError(t, err)
+		return errors.Errorf("expected statement_timeout %s, got %s", "123000", statementTimeoutSetting)
+	})
+
+	_, err = conn.QueryContext(ctx, `SET statement_timeout = '0.1s'`)
 	require.NoError(t, err)
 
 	testutils.RunTrueAndFalse(t, "test statement timeout with explicit txn",

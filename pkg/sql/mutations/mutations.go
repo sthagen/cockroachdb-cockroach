@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
@@ -209,6 +210,10 @@ func statisticsMutator(
 			n := rng.Intn(10)
 			seen := map[string]bool{}
 			colType := tree.MustBeStaticallyKnownType(col.Type)
+			// The JSON family does not have a key encoding.
+			if colType.Family() == types.JsonFamily {
+				return
+			}
 			h := stats.HistogramData{
 				ColumnType: colType,
 			}
@@ -585,6 +590,11 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 						def.Unique.WithoutIndex = false
 						changed = true
 					}
+					if def.IsVirtual() {
+						def.Computed.Virtual = false
+						def.Computed.Computed = true
+						changed = true
+					}
 				case *tree.UniqueConstraintTableDef:
 					if def.Interleave != nil {
 						def.Interleave = nil
@@ -653,7 +663,7 @@ func postgresCreateTableMutator(
 						}
 						if def.Name != "" {
 							// Unset Name here because
-							// constaint names cannot
+							// constraint names cannot
 							// be shared among tables,
 							// so multiple PK constraints
 							// named "primary" is an error.
@@ -672,6 +682,25 @@ func postgresCreateTableMutator(
 						Storing:  def.Storing,
 					})
 					changed = true
+				case *tree.ColumnTableDef:
+					colType := tree.MustBeStaticallyKnownType(def.Type)
+					switch colType.Family() {
+					case types.GeometryFamily, types.GeographyFamily, types.Box2DFamily:
+						// PostgreSQL does not have any spatial types. Turn them into
+						// String types.
+						def.Type = types.String
+						mutated = append(mutated, &tree.AlterTable{
+							Table: stmt.Table.ToUnresolvedObjectName(),
+							Cmds: tree.AlterTableCmds{
+								&tree.AlterTableAlterColumnType{
+									Column: def.Name,
+									ToType: types.String,
+								},
+							},
+						})
+						changed = true
+					}
+					newdefs = append(newdefs, def)
 				default:
 					newdefs = append(newdefs, def)
 				}

@@ -256,10 +256,11 @@ var varGen = map[string]sessionVar{
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			s = strings.ToLower(s)
 			parts := strings.Split(s, ",")
-			if strings.TrimSpace(parts[0]) != "iso" ||
-				(len(parts) == 2 && strings.TrimSpace(parts[1]) != "mdy") ||
-				len(parts) > 2 {
-				err := newVarValueError("DateStyle", s, "ISO", "ISO, MDY")
+			isOnlyISO := len(parts) == 1 && strings.TrimSpace(parts[0]) == "iso"
+			isISOMDY := len(parts) == 2 && strings.TrimSpace(parts[0]) == "iso" && strings.TrimSpace(parts[1]) == "mdy"
+			isMDYISO := len(parts) == 2 && strings.TrimSpace(parts[0]) == "mdy" && strings.TrimSpace(parts[1]) == "iso"
+			if !(isOnlyISO || isISOMDY || isMDYISO) {
+				err := newVarValueError("DateStyle", s, "ISO", "ISO, MDY", "MDY, ISO")
 				err = errors.WithDetail(err, compatErrMsg)
 				return err
 			}
@@ -975,7 +976,9 @@ var varGen = map[string]sessionVar{
 			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
-		GlobalDefault: func(sv *settings.Values) string { return "0" },
+		GlobalDefault: func(sv *settings.Values) string {
+			return clusterStatementTimeout.String(sv)
+		},
 	},
 
 	`idle_in_session_timeout`: {
@@ -997,7 +1000,9 @@ var varGen = map[string]sessionVar{
 			ms := evalCtx.SessionData.IdleInTransactionSessionTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
-		GlobalDefault: func(sv *settings.Values) string { return "0" },
+		GlobalDefault: func(sv *settings.Values) string {
+			return clusterIdleInTransactionSessionTimeout.String(sv)
+		},
 	},
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-TIMEZONE
@@ -1157,6 +1162,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(dropEnumValueEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`override_multi_region_zone_config`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`override_multi_region_zone_config`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("override_multi_region_zone_config", s)
+			if err != nil {
+				return err
+			}
+			m.SetOverrideMultiRegionZoneConfigEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.OverrideMultiRegionZoneConfigEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(overrideMultiRegionZoneConfigClusterMode.Get(sv))
 		},
 	},
 

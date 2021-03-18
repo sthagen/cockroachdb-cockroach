@@ -164,7 +164,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		nil, /* vs */
 		st,
 		create,
-		0, /* parentID */
+		descpb.InvalidID, /* parentID */
 		parentSchemaID,
 		id,
 		nil,       /* regionConfig */
@@ -253,6 +253,7 @@ func (v virtualSchemaView) initVirtualTableDesc(
 		nil, /* semaCtx */
 		nil, /* evalCtx */
 		tree.PersistencePermanent,
+		false, /* isMultiRegion */
 	)
 	return mutDesc.TableDescriptor, err
 }

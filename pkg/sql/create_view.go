@@ -150,6 +150,7 @@ func (n *createViewNode) startExec(params runParams) error {
 	privs := CreateInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User())
 
 	var newDesc *tabledesc.Mutable
+	applyGlobalMultiRegionZoneConfig := false
 
 	// If replacingDesc != nil, we found an existing view while resolving
 	// the name for our view. So instead of creating a new view, replace
@@ -184,6 +185,7 @@ func (n *createViewNode) startExec(params runParams) error {
 			&params.p.semaCtx,
 			params.p.EvalContext(),
 			n.persistence,
+			n.dbDesc.IsMultiRegion(),
 		)
 		if err != nil {
 			return err
@@ -206,6 +208,11 @@ func (n *createViewNode) startExec(params runParams) error {
 			desc.CreateAsOfTime = params.p.Txn().ReadTimestamp()
 			if err := desc.AllocateIDs(params.ctx); err != nil {
 				return err
+			}
+			// For multi-region databases, we want this descriptor to be GLOBAL instead.
+			if n.dbDesc.IsMultiRegion() {
+				desc.SetTableLocalityGlobal()
+				applyGlobalMultiRegionZoneConfig = true
 			}
 		}
 
@@ -265,6 +272,25 @@ func (n *createViewNode) startExec(params runParams) error {
 		return err
 	}
 
+	if applyGlobalMultiRegionZoneConfig {
+		regionConfig, err := SynthesizeRegionConfig(params.ctx, params.p.txn, n.dbDesc.ID, params.p.Descriptors())
+		if err != nil {
+			return err
+		}
+		if err := ApplyZoneConfigForMultiRegionTable(
+			params.ctx,
+			params.p.txn,
+			params.p.ExecCfg(),
+			regionConfig,
+			newDesc,
+			applyZoneConfigForMultiRegionTableOptionTableNewConfig(
+				tabledesc.LocalityConfigGlobal(),
+			),
+		); err != nil {
+			return err
+		}
+	}
+
 	// Log Create View event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
 	return params.p.logEvent(params.ctx,
@@ -299,6 +325,7 @@ func makeViewTableDesc(
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
 	persistence tree.Persistence,
+	isMultiRegion bool,
 ) (tabledesc.Mutable, error) {
 	desc := tabledesc.InitTableDescriptor(
 		id,
@@ -310,6 +337,9 @@ func makeViewTableDesc(
 		persistence,
 	)
 	desc.ViewQuery = viewQuery
+	if isMultiRegion {
+		desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
+	}
 	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
 		return tabledesc.Mutable{}, err
 	}

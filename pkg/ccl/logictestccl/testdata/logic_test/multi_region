@@ -28,7 +28,7 @@ CREATE DATABASE region_test_db PRIMARY REGION "ap-southeast-2" SURVIVE ZONE FAIL
 statement ok
 CREATE DATABASE multi_region_test_db PRIMARY REGION "ca-central-1" REGIONS "ap-southeast-2", "us-east-1" SURVIVE REGION FAILURE
 
-statement error cannot DROP REGION on database multi_region_test_db as databases with SURVIVE REGION FAILURE must have at least 3 regions\nHINT: you must first add another region, or configure the database to SURVIVE ZONE FAILURE using ALTER DATABASE multi_region_test_db SURVIVE ZONE FAILURE
+statement error at least 3 regions are required for surviving a region failure\nHINT: you must add additional regions to the database or change the survivability goal
 ALTER DATABASE multi_region_test_db DROP REGION "ap-southeast-2"
 
 statement ok
@@ -1307,3 +1307,76 @@ DATABASE zone_config_drop_region  ALTER DATABASE zone_config_drop_region CONFIGU
                           constraints = '{+region=ap-southeast-2: 1, +region=ca-central-1: 1}',
                           voter_constraints = '[+region=ca-central-1]',
                           lease_preferences = '[[+region=ca-central-1]]'
+
+#
+# Tests with views and sequences.
+#
+
+statement ok
+CREATE DATABASE db_with_views_and_sequences;
+USE db_with_views_and_sequences
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);
+INSERT INTO t VALUES (1, 2, 3), (4, 5, 6);
+CREATE SEQUENCE s;
+CREATE VIEW v AS SELECT id, a, b FROM t;
+CREATE MATERIALIZED VIEW mat_view AS SELECT id, a, b FROM t
+
+statement ok
+ALTER DATABASE db_with_views_and_sequences SET PRIMARY REGION "ap-southeast-2"
+
+query TT colnames
+SELECT table_name, locality FROM [SHOW TABLES]
+----
+table_name  locality
+t           REGIONAL BY TABLE IN PRIMARY REGION
+s           REGIONAL BY TABLE IN PRIMARY REGION
+v           REGIONAL BY TABLE IN PRIMARY REGION
+mat_view    GLOBAL
+
+statement ok
+CREATE SEQUENCE s2;
+CREATE VIEW v2 AS SELECT id, a, b FROM t;
+CREATE MATERIALIZED VIEW mat_view2 AS SELECT id, a, b FROM t
+
+query TT colnames
+SELECT table_name, locality FROM [SHOW TABLES]
+----
+table_name  locality
+t           REGIONAL BY TABLE IN PRIMARY REGION
+s           REGIONAL BY TABLE IN PRIMARY REGION
+v           REGIONAL BY TABLE IN PRIMARY REGION
+mat_view    GLOBAL
+s2          REGIONAL BY TABLE IN PRIMARY REGION
+v2          REGIONAL BY TABLE IN PRIMARY REGION
+mat_view2   GLOBAL
+
+query TT
+SHOW ZONE CONFIGURATION FROM TABLE mat_view2
+----
+TABLE mat_view2  ALTER TABLE mat_view2 CONFIGURE ZONE USING
+                 range_min_bytes = 134217728,
+                 range_max_bytes = 536870912,
+                 gc.ttlseconds = 90000,
+                 global_reads = true,
+                 num_replicas = 3,
+                 num_voters = 3,
+                 constraints = '{+region=ap-southeast-2: 1}',
+                 voter_constraints = '[+region=ap-southeast-2]',
+                 lease_preferences = '[[+region=ap-southeast-2]]'
+
+statement ok
+ALTER DATABASE db_with_views_and_sequences DROP REGION "ap-southeast-2"
+
+query TT colnames
+SELECT table_name, locality FROM [SHOW TABLES]
+----
+table_name  locality
+t           NULL
+s           NULL
+v           NULL
+mat_view    NULL
+s2          NULL
+v2          NULL
+mat_view2   NULL

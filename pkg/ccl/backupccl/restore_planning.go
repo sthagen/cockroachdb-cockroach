@@ -872,14 +872,14 @@ func resolveTargetDB(
 func maybeUpgradeTableDescsInBackupManifests(
 	ctx context.Context, backupManifests []BackupManifest, skipFKsWithNoMatchingTable bool,
 ) error {
-	descGetter := catalog.MapDescGetter{}
+	descGetter := catalog.MakeMapDescGetter()
 
 	// Populate the descGetter with all table descriptors in all backup
 	// descriptors so that they can be looked up.
 	for _, backupManifest := range backupManifests {
 		for _, desc := range backupManifest.Descriptors {
 			if table, _, _, _ := descpb.FromDescriptor(&desc); table != nil {
-				descGetter[table.ID] = tabledesc.NewBuilder(table).BuildImmutable()
+				descGetter.Descriptors[table.ID] = tabledesc.NewBuilder(table).BuildImmutable()
 			}
 		}
 	}
@@ -1587,6 +1587,18 @@ func doRestorePlan(
 	)
 	if err != nil {
 		return err
+	}
+
+	currentVersion := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
+	for i := range mainBackupManifests {
+		if v := mainBackupManifests[i].ClusterVersion; v.Major != 0 {
+			// This is the "cluster" version that does not change between patches but
+			// rather just tracks migrations run. If the backup is more migrated than
+			// this cluster, then this cluster isn't ready to restore this backup.
+			if currentVersion.Less(v) {
+				return errors.Errorf("backup from version %s is newer than current version %s", v, currentVersion)
+			}
+		}
 	}
 
 	// Validate that the table coverage of the backup matches that of the restore.

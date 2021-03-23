@@ -84,7 +84,7 @@ func Example_demo() {
 
 	testData := [][]string{
 		{`demo`, `-e`, `show database`},
-		{`demo`, `-e`, `show database`, `--empty`},
+		{`demo`, `-e`, `show database`, `--no-example-database`},
 		{`demo`, `-e`, `show application_name`},
 		{`demo`, `--format=table`, `-e`, `show database`},
 		{`demo`, `-e`, `select 1 as "1"`, `-e`, `select 3 as "3"`},
@@ -115,7 +115,7 @@ func Example_demo() {
 	// demo -e show database
 	// database
 	// movr
-	// demo -e show database --empty
+	// demo -e show database --no-example-database
 	// database
 	// defaultdb
 	// demo -e show application_name
@@ -286,16 +286,32 @@ func Example_sql_format() {
 
 	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.times (bare timestamp, withtz timestamptz)"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.times values ('2016-01-25 10:10:10', '2016-01-25 10:10:10-05:00')"})
-	c.RunWithArgs([]string{"sql", "-e", "select * from t.times"})
+	c.RunWithArgs([]string{"sql", "-e", "select bare from t.times; select withtz from t.times"})
+	c.RunWithArgs([]string{"sql", "-e", "select '2021-03-20'::date; select '01:01'::time; select '01:01'::timetz"})
+	c.RunWithArgs([]string{"sql", "-e", "select (1/3.0)::real; select (1/3.0)::double precision"})
 
 	// Output:
 	// sql -e create database t; create table t.times (bare timestamp, withtz timestamptz)
 	// CREATE TABLE
 	// sql -e insert into t.times values ('2016-01-25 10:10:10', '2016-01-25 10:10:10-05:00')
 	// INSERT 1
-	// sql -e select * from t.times
-	// bare	withtz
-	// 2016-01-25 10:10:10+00:00:00	2016-01-25 15:10:10+00:00:00
+	// sql -e select bare from t.times; select withtz from t.times
+	// bare
+	// 2016-01-25 10:10:10
+	// withtz
+	// 2016-01-25 15:10:10+00:00:00
+	// sql -e select '2021-03-20'::date; select '01:01'::time; select '01:01'::timetz
+	// date
+	// 2021-03-20
+	// time
+	// 01:01:00
+	// timetz
+	// 01:01:00+00:00:00
+	// sql -e select (1/3.0)::real; select (1/3.0)::double precision
+	// float4
+	// 0.33333334
+	// float8
+	// 0.3333333333333333
 }
 
 func Example_sql_column_labels() {
@@ -1092,19 +1108,17 @@ Available Commands:
   debug             debugging commands
   sqlfmt            format SQL statements
   workload          generators for data and query loads
-  systembench       Run systembench
   help              Help about any command
 
 Flags:
   -h, --help                 help for cockroach
       --log <string>         
-                                     Logging configuration, expressed using YAML syntax. For example, you
-                                     can change the default logging directory with: --log='file-defaults:
-                                     {dir: ...}'. See the documentation for more options and details.  To
-                                     preview how the log configuration is applied, or preview the default
-                                     configuration, you can use the 'cockroach debug check-log-config'
-                                     sub-command.
-                                    
+                              Logging configuration, expressed using YAML syntax. For example, you can
+                              change the default logging directory with: --log='file-defaults: {dir: ...}'.
+                              See the documentation for more options and details.  To preview how the log
+                              configuration is applied, or preview the default configuration, you can use
+                              the 'cockroach debug check-log-config' sub-command.
+                             
       --version              version for cockroach
 
 Use "cockroach [command] --help" for more information about a command.

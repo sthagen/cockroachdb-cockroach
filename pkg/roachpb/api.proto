@@ -1518,8 +1518,7 @@ message AdminScatterResponse {
     Span span = 1 [(gogoproto.nullable) = false];
     reserved 2;
   }
-  // This field is deprecated in 20.2 in favor of RangeInfos.
-  repeated Range deprecated_ranges = 2 [(gogoproto.nullable) = false];
+  reserved 2;
   repeated RangeInfo range_infos = 3 [(gogoproto.nullable) = false];
 }
 
@@ -1555,7 +1554,15 @@ message AdminVerifyProtectedTimestampResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   bool verified = 2;
 
-  repeated RangeDescriptor failed_ranges = 3 [(gogoproto.nullable) = false];
+  // TODO(adityamaru): Remove in 21.2.
+  repeated RangeDescriptor deprecated_failed_ranges = 3 [(gogoproto.nullable) = false];
+  message FailedRange {
+    int64 range_id = 1 [(gogoproto.customname) = "RangeID"];
+    bytes start_key = 2 [(gogoproto.casttype) = "RKey"];
+    bytes end_key = 3 [(gogoproto.casttype) = "RKey"];
+    string reason = 4;
+  }
+  repeated FailedRange verification_failed_ranges = 4 [(gogoproto.nullable) = false];
 }
 
 // AddSSTableRequest is arguments to the AddSSTable() method, to link a file

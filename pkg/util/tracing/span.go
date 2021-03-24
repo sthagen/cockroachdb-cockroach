@@ -76,7 +76,7 @@ func (sp *Span) SetOperationName(operationName string) {
 // Finish idempotently marks the Span as completed (at which point it will
 // silently drop any new data added to it). Finishing a nil *Span is a noop.
 func (sp *Span) Finish() {
-	if sp == nil || atomic.AddInt32(&sp.numFinishCalled, 1) != 1 {
+	if sp == nil || sp.i.isNoop() || atomic.AddInt32(&sp.numFinishCalled, 1) != 1 {
 		return
 	}
 	sp.i.Finish()
@@ -255,8 +255,7 @@ func (sm *SpanMeta) String() string {
 }
 
 // Structured is an opaque protobuf that can be attached to a trace via
-// `Span.RecordStructured`. This is the only kind of data a Span carries when
-// `trace.mode = background`.
+// `Span.RecordStructured`.
 type Structured interface {
 	protoutil.Message
 }

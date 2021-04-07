@@ -182,6 +182,22 @@ CREATE TABLE regional_by_row_table (
   FAMILY (pk, pk2, a, b)
 ) LOCALITY REGIONAL BY ROW
 
+query TTB
+SELECT index_name, column_name, implicit FROM [SHOW INDEXES FROM regional_by_row_table]
+ORDER BY index_name, seq_in_index
+----
+primary                      crdb_region  true
+primary                      pk           false
+regional_by_row_table_a_idx  crdb_region  true
+regional_by_row_table_a_idx  a            false
+regional_by_row_table_a_idx  pk           true
+regional_by_row_table_b_key  crdb_region  true
+regional_by_row_table_b_key  b            false
+regional_by_row_table_b_key  pk           true
+regional_by_row_table_j_idx  crdb_region  true
+regional_by_row_table_j_idx  j            false
+regional_by_row_table_j_idx  pk           true
+
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table]
 ----
@@ -512,6 +528,33 @@ ALTER TABLE regional_by_row_table ALTER PRIMARY KEY USING COLUMNS(pk2) USING HAS
 
 statement error interleaved tables are not compatible with REGIONAL BY ROW tables
 CREATE INDEX bad_idx ON regional_by_row_table(pk) INTERLEAVE IN PARENT parent_table(pk)
+
+# Try add a new unique column.
+statement ok
+ALTER TABLE regional_by_row_table ADD COLUMN unique_col INT8 NOT NULL UNIQUE
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE regional_by_row_table]
+----
+CREATE TABLE public.regional_by_row_table (
+  pk INT8 NOT NULL,
+  pk2 INT8 NOT NULL,
+  a INT8 NOT NULL,
+  b INT8 NOT NULL,
+  j JSONB NULL,
+  crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region,
+  unique_col INT8 NOT NULL,
+  CONSTRAINT "primary" PRIMARY KEY (pk ASC),
+  INDEX regional_by_row_table_a_idx (a ASC),
+  UNIQUE INDEX regional_by_row_table_b_key (b ASC),
+  INVERTED INDEX regional_by_row_table_j_idx (j),
+  UNIQUE INDEX regional_by_row_table_unique_col_key (unique_col ASC),
+  FAMILY fam_0_pk_pk2_a_b_j_crdb_region (pk, pk2, a, b, j, crdb_region, unique_col)
+) LOCALITY REGIONAL BY ROW;
+ALTER PARTITION "us-east-1" OF INDEX multi_region_test_db.public.regional_by_row_table@regional_by_row_table_a_idx CONFIGURE ZONE USING "gc.ttlseconds" = 10
+
+statement ok
+ALTER TABLE regional_by_row_table DROP COLUMN unique_col
 
 # Insert some rows into the regional_by_row_table.
 query TI

@@ -1152,7 +1152,7 @@ func TestBackupRestoreSystemJobs(t *testing.T) {
 	if err := jobutils.VerifySystemJob(t, sqlDB, 0, jobspb.TypeRestore, jobs.StatusSucceeded, jobs.Record{
 		Username: security.RootUserName(),
 		Description: fmt.Sprintf(
-			`RESTORE TABLE bank FROM '%s', '%s' WITH into_db='restoredb'`,
+			`RESTORE TABLE bank FROM '%s', '%s' WITH into_db = 'restoredb'`,
 			sanitizedFullDir+"redacted", sanitizedIncDir+"redacted",
 		),
 		DescriptorIDs: descpb.IDs{
@@ -1207,16 +1207,19 @@ func TestEncryptedBackupRestoreSystemJobs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var encryptionOption string
-			var sanitizedEncryptionOption string
+			var sanitizedEncryptionOption1 string
+			var sanitizedEncryptionOption2 string
 			if tc.useKMS {
 				correctKMSURI, _ := getAWSKMSURI(t, regionEnvVariable, keyIDEnvVariable)
-				encryptionOption = fmt.Sprintf("kms='%s'", correctKMSURI)
+				encryptionOption = fmt.Sprintf("kms = '%s'", correctKMSURI)
 				sanitizedURI, err := redactTestKMSURI(correctKMSURI)
 				require.NoError(t, err)
-				sanitizedEncryptionOption = fmt.Sprintf("kms='%s'", sanitizedURI)
+				sanitizedEncryptionOption1 = fmt.Sprintf("kms = '%s'", sanitizedURI)
+				sanitizedEncryptionOption2 = sanitizedEncryptionOption1
 			} else {
-				encryptionOption = "encryption_passphrase='abcdefg'"
-				sanitizedEncryptionOption = "encryption_passphrase='redacted'"
+				encryptionOption = "encryption_passphrase = 'abcdefg'"
+				sanitizedEncryptionOption1 = "encryption_passphrase = '*****'"
+				sanitizedEncryptionOption2 = "encryption_passphrase = 'redacted'"
 			}
 			_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, MultiNode, 3, InitManualReplication)
 			conn := sqlDB.DB.(*gosql.DB)
@@ -1238,7 +1241,7 @@ func TestEncryptedBackupRestoreSystemJobs(t *testing.T) {
 					Username: security.RootUserName(),
 					Description: fmt.Sprintf(
 						`BACKUP DATABASE data TO '%s' WITH %s`,
-						backupLoc1, sanitizedEncryptionOption),
+						backupLoc1, sanitizedEncryptionOption1),
 					DescriptorIDs: descpb.IDs{
 						descpb.ID(backupDatabaseID),
 						descpb.ID(backupTableID),
@@ -1255,8 +1258,8 @@ into_db='restoredb', %s)`, encryptionOption), backupLoc1)
 			if err := jobutils.VerifySystemJob(t, sqlDB, 0, jobspb.TypeRestore, jobs.StatusSucceeded, jobs.Record{
 				Username: security.RootUserName(),
 				Description: fmt.Sprintf(
-					`RESTORE TABLE data.bank FROM '%s' WITH %s, into_db='restoredb'`,
-					backupLoc1, sanitizedEncryptionOption,
+					`RESTORE TABLE data.bank FROM '%s' WITH %s, into_db = 'restoredb'`,
+					backupLoc1, sanitizedEncryptionOption2,
 				),
 				DescriptorIDs: descpb.IDs{
 					descpb.ID(restoreDatabaseID + 1),
@@ -4278,8 +4281,8 @@ func TestEncryptedBackup(t *testing.T) {
 				encryptionOption = fmt.Sprintf("kms='%s'", correctKMSURI)
 				incorrectEncryptionOption = fmt.Sprintf("kms='%s'", incorrectKeyARNURI)
 			} else {
-				encryptionOption = "encryption_passphrase='abcdefg'"
-				incorrectEncryptionOption = "encryption_passphrase='wrongpassphrase'"
+				encryptionOption = "encryption_passphrase = 'abcdefg'"
+				incorrectEncryptionOption = "encryption_passphrase = 'wrongpassphrase'"
 			}
 			ctx, _, sqlDB, rawDir, cleanupFn := BackupRestoreTestSetup(t, MultiNode, 3, InitManualReplication)
 			defer cleanupFn()
@@ -5642,7 +5645,7 @@ func TestBackupRestoreShowJob(t *testing.T) {
 		t, "SELECT description FROM [SHOW JOBS] WHERE description != 'updating privileges' ORDER BY description",
 		[][]string{
 			{"BACKUP DATABASE data TO 'nodelocal://0/foo' WITH revision_history"},
-			{"RESTORE TABLE data.bank FROM 'nodelocal://0/foo' WITH into_db='data 2', skip_missing_foreign_keys"},
+			{"RESTORE TABLE data.bank FROM 'nodelocal://0/foo' WITH into_db = 'data 2', skip_missing_foreign_keys"},
 		},
 	)
 }
@@ -6525,6 +6528,130 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	// TODO(adityamaru): Add a RESTORE inside tenant once it is supported.
 }
 
+func TestBackupRestoreInsideTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	makeTenant := func(srv serverutils.TestServerInterface, tenant uint64) (*sqlutils.SQLRunner, func()) {
+		// Prevent a logging assertion that the server ID is initialized multiple times.
+		log.TestingClearServerIdentifiers()
+
+		_, conn := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(tenant)})
+		cleanup := func() { conn.Close() }
+		return sqlutils.MakeSQLRunner(conn), cleanup
+	}
+
+	const numAccounts = 1
+	_, tc, systemDB, dir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _ = tc, systemDB
+	defer cleanupFn()
+	srv := tc.Server(0)
+
+	// NB: tenant certs for 10, 11, and 20 are embedded. See:
+	_ = security.EmbeddedTenantIDs()
+
+	tenant10, cleanupT10 := makeTenant(srv, 10)
+	defer cleanupT10()
+	tenant10.Exec(t, `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`)
+
+	tenant11, cleanupT11 := makeTenant(srv, 11)
+	defer cleanupT11()
+
+	// Create another server.
+	_, tc2, systemDB2, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, dir, InitManualReplication, base.TestClusterArgs{})
+	srv2 := tc2.Server(0)
+	defer cleanupEmptyCluster()
+
+	tenant10C2, cleanupT10C2 := makeTenant(srv2, 10)
+	defer cleanupT10C2()
+
+	tenant11C2, cleanupT11C2 := makeTenant(srv2, 11)
+	defer cleanupT11C2()
+
+	t.Run("tenant-backup", func(t *testing.T) {
+		// This test uses this mock HTTP server to pass the backup files between tenants.
+		httpAddr, httpServerCleanup := makeInsecureHTTPServer(t)
+		defer httpServerCleanup()
+
+		tenant10.Exec(t, `BACKUP TO $1`, httpAddr)
+
+		t.Run("cluster-restore", func(t *testing.T) {
+			t.Run("into-same-tenant-id", func(t *testing.T) {
+				tenant10C2.Exec(t, `RESTORE FROM $1`, httpAddr)
+				tenant10C2.CheckQueryResults(t, `SELECT * FROM foo.bar`, tenant10.QueryStr(t, `SELECT * FROM foo.bar`))
+			})
+			t.Run("into-different-tenant-id", func(t *testing.T) {
+				tenant11C2.ExpectErr(t, `cannot cluster RESTORE backups taken from different tenant: 10`,
+					`RESTORE FROM $1`, httpAddr)
+			})
+			t.Run("into-system-tenant-id", func(t *testing.T) {
+				systemDB2.ExpectErr(t, `cannot cluster RESTORE backups taken from different tenant: 10`,
+					`RESTORE FROM $1`, httpAddr)
+			})
+		})
+
+		t.Run("database-restore", func(t *testing.T) {
+			t.Run("into-same-tenant-id", func(t *testing.T) {
+				tenant10.Exec(t, `CREATE DATABASE foo2`)
+				tenant10.Exec(t, `RESTORE foo.bar FROM $1 WITH into_db='foo2'`, httpAddr)
+				tenant10.CheckQueryResults(t, `SELECT * FROM foo2.bar`, tenant10.QueryStr(t, `SELECT * FROM foo.bar`))
+			})
+			t.Run("into-different-tenant-id", func(t *testing.T) {
+				tenant11.Exec(t, `CREATE DATABASE foo`)
+				tenant11.Exec(t, `RESTORE foo.bar FROM $1`, httpAddr)
+				tenant11.CheckQueryResults(t, `SELECT * FROM foo.bar`, tenant10.QueryStr(t, `SELECT * FROM foo.bar`))
+			})
+			t.Run("into-system-tenant-id", func(t *testing.T) {
+				systemDB.Exec(t, `CREATE DATABASE foo2`)
+				systemDB.ExpectErr(t, `cannot restore tenant backups into system tenant`,
+					`RESTORE foo.bar FROM $1 WITH into_db='foo2'`, httpAddr)
+			})
+		})
+	})
+
+	t.Run("system-backup", func(t *testing.T) {
+		// This test uses this mock HTTP server to pass the backup files between tenants.
+		httpAddr, httpServerCleanup := makeInsecureHTTPServer(t)
+		defer httpServerCleanup()
+
+		systemDB.Exec(t, `BACKUP TO $1`, httpAddr)
+
+		tenant20C2, cleanupT20C2 := makeTenant(srv2, 20)
+		defer cleanupT20C2()
+
+		t.Run("cluster-restore", func(t *testing.T) {
+			t.Run("with-tenant", func(t *testing.T) {
+				// This is disallowed because the cluster restore includes other
+				// tenants, which can't be restored inside a tenant.
+				tenant20C2.ExpectErr(t, `only the system tenant can restore other tenants`,
+					`RESTORE FROM $1`, httpAddr)
+			})
+
+			t.Run("with-no-tenant", func(t *testing.T) {
+				// Now restore a cluster backup taken from a system tenant that
+				// hasn't created any tenants.
+				httpAddrEmpty, cleanupEmptyHTTPServer := makeInsecureHTTPServer(t)
+				defer cleanupEmptyHTTPServer()
+
+				_, _, emptySystemDB, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode,
+					dir, InitManualReplication, base.TestClusterArgs{})
+				defer cleanupEmptyCluster()
+
+				emptySystemDB.Exec(t, `BACKUP TO $1`, httpAddrEmpty)
+				tenant20C2.ExpectErr(t, `cannot cluster RESTORE backups taken from different tenant: system`,
+					`RESTORE FROM $1`, httpAddrEmpty)
+			})
+		})
+
+		t.Run("database-restore-into-tenant", func(t *testing.T) {
+			tenant10.Exec(t, `CREATE DATABASE data`)
+			tenant10.Exec(t, `RESTORE data.bank FROM $1`, httpAddr)
+			systemDB.CheckQueryResults(t, `SELECT * FROM data.bank`, tenant10.QueryStr(t, `SELECT * FROM data.bank`))
+		})
+
+	})
+}
+
 // Ensure that backing up and restoring tenants succeeds.
 func TestBackupRestoreTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -6580,29 +6707,6 @@ func TestBackupRestoreTenant(t *testing.T) {
 
 	systemDB.Exec(t, `BACKUP TENANT 11 TO 'nodelocal://1/t11'`)
 	systemDB.Exec(t, `BACKUP TENANT 20 TO 'nodelocal://1/t20'`)
-
-	t.Run("inside-tenant", func(t *testing.T) {
-		// This test uses this mock HTTP server to pass the backup files between tenants.
-		httpServer, httpServerCleanup := makeInsecureHTTPServer(t)
-		defer httpServerCleanup()
-		httpAddr := httpServer.String() + "/test"
-
-		tenant10.Exec(t, `BACKUP DATABASE foo TO $1`, httpAddr)
-		t.Run("same-tenant", func(t *testing.T) {
-			tenant10.Exec(t, `CREATE DATABASE foo2`)
-			tenant10.Exec(t, `RESTORE foo.bar FROM $1 WITH into_db='foo2'`, httpAddr)
-			tenant10.CheckQueryResults(t, `SELECT * FROM foo2.bar`, tenant10.QueryStr(t, `SELECT * FROM foo.bar`))
-		})
-		t.Run("another-tenant", func(t *testing.T) {
-			tenant11.Exec(t, `RESTORE foo.bar FROM $1`, httpAddr)
-			tenant11.CheckQueryResults(t, `SELECT * FROM foo.bar`, tenant10.QueryStr(t, `SELECT * FROM foo.bar`))
-		})
-		t.Run("system-tenant", func(t *testing.T) {
-			systemDB.Exec(t, `CREATE DATABASE foo2`)
-			systemDB.ExpectErr(t, `cannot restore tenant backups into system tenant`,
-				`RESTORE foo.bar FROM $1 WITH into_db='foo2'`, httpAddr)
-		})
-	})
 
 	t.Run("non-existent", func(t *testing.T) {
 		systemDB.ExpectErr(t, "tenant 123 does not exist", `BACKUP TENANT 123 TO 'nodelocal://1/t1'`)
@@ -7607,10 +7711,10 @@ func TestManifestBitFlip(t *testing.T) {
 	})
 
 	t.Run("encrypted", func(t *testing.T) {
-		sqlDB.Exec(t, `BACKUP DATABASE data TO 'nodelocal://0/bit_flip_encrypted' WITH encryption_passphrase='abc'`)
+		sqlDB.Exec(t, `BACKUP DATABASE data TO 'nodelocal://0/bit_flip_encrypted' WITH encryption_passphrase = 'abc'`)
 		flipBitInManifests(t, rawDir)
 		sqlDB.ExpectErr(t, checksumError,
-			`RESTORE data.* FROM 'nodelocal://0/bit_flip_encrypted' WITH encryption_passphrase='abc', into_db='r3'`)
+			`RESTORE data.* FROM 'nodelocal://0/bit_flip_encrypted' WITH encryption_passphrase = 'abc', into_db = 'r3'`)
 	})
 }
 

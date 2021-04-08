@@ -163,7 +163,7 @@ func (p *planner) AlterDatabaseAddRegion(
 	// privileges.
 	if err := p.checkPrivilegesForRepartitioningRegionalByRowTables(
 		ctx,
-		&dbDesc.Immutable,
+		dbDesc,
 	); err != nil {
 		return nil, err
 	}
@@ -185,7 +185,7 @@ var GetMultiRegionEnumAddValuePlacementCCL = func(
 func (n *alterDatabaseAddRegionNode) startExec(params runParams) error {
 	if err := params.p.validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
 		params.ctx,
-		&n.desc.Immutable,
+		n.desc,
 	); err != nil {
 		return err
 	}
@@ -295,14 +295,14 @@ func (p *planner) AlterDatabaseDropRegion(
 	// privileges.
 	if err := p.checkPrivilegesForRepartitioningRegionalByRowTables(
 		ctx,
-		&dbDesc.Immutable,
+		dbDesc,
 	); err != nil {
 		return nil, err
 	}
 
 	if err := p.validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
 		ctx,
-		&dbDesc.Immutable,
+		dbDesc,
 	); err != nil {
 		return nil, err
 	}
@@ -332,7 +332,11 @@ func (p *planner) AlterDatabaseDropRegion(
 		}
 		if len(regions) != 1 {
 			return nil, errors.WithHintf(
-				errors.Newf("cannot drop region %q", dbDesc.RegionConfig.PrimaryRegion),
+				pgerror.Newf(
+					pgcode.InvalidDatabaseDefinition,
+					"cannot drop region %q",
+					dbDesc.RegionConfig.PrimaryRegion,
+				),
 				"You must designate another region as the primary region using "+
 					"ALTER DATABASE %s PRIMARY REGION <region name> or remove all other regions before "+
 					"attempting to drop region %q", dbDesc.GetName(), n.Region,
@@ -423,9 +427,9 @@ func (p *planner) checkPrivilegesForMultiRegionOp(
 // user does not have sufficient privileges to repartition any of the region by
 // row tables inside the given database.
 func (p *planner) checkPrivilegesForRepartitioningRegionalByRowTables(
-	ctx context.Context, dbDesc *dbdesc.Immutable,
+	ctx context.Context, dbDesc catalog.DatabaseDescriptor,
 ) error {
-	return p.forEachTableInMultiRegionDatabase(ctx, dbDesc,
+	return p.forEachMutableTableInDatabase(ctx, dbDesc,
 		func(ctx context.Context, tbDesc *tabledesc.Mutable) error {
 			if tbDesc.IsLocalityRegionalByRow() {
 				err := p.checkPrivilegesForMultiRegionOp(ctx, tbDesc)
@@ -446,7 +450,7 @@ func (p *planner) checkPrivilegesForRepartitioningRegionalByRowTables(
 // removeLocalityConfigFromAllTablesInDB removes the locality config from all
 // tables under the supplied database.
 func removeLocalityConfigFromAllTablesInDB(
-	ctx context.Context, p *planner, desc *dbdesc.Immutable,
+	ctx context.Context, p *planner, desc catalog.DatabaseDescriptor,
 ) error {
 	if !desc.IsMultiRegion() {
 		return errors.AssertionFailedf(
@@ -455,7 +459,7 @@ func removeLocalityConfigFromAllTablesInDB(
 		)
 	}
 	b := p.Txn().NewBatch()
-	if err := p.forEachTableInMultiRegionDatabase(ctx, desc, func(ctx context.Context, tbDesc *tabledesc.Mutable) error {
+	if err := p.forEachMutableTableInDatabase(ctx, desc, func(ctx context.Context, tbDesc *tabledesc.Mutable) error {
 		// The user must either be an admin or have the requisite privileges.
 		if err := p.checkPrivilegesForMultiRegionOp(ctx, tbDesc); err != nil {
 			return err
@@ -522,7 +526,7 @@ func (n *alterDatabaseDropRegionNode) startExec(params runParams) error {
 			}
 		}
 
-		err = removeLocalityConfigFromAllTablesInDB(params.ctx, params.p, &n.desc.Immutable)
+		err = removeLocalityConfigFromAllTablesInDB(params.ctx, params.p, n.desc)
 		if err != nil {
 			return errors.Wrap(err, "error removing locality configs from tables")
 		}
@@ -685,7 +689,7 @@ func (n *alterDatabasePrimaryRegionNode) switchPrimaryRegion(params runParams) e
 // that the table is a REGIONAL BY TABLE table homed in the primary region of
 // the database.
 func addDefaultLocalityConfigToAllTables(
-	ctx context.Context, p *planner, dbDesc *dbdesc.Immutable, regionEnumID descpb.ID,
+	ctx context.Context, p *planner, dbDesc catalog.DatabaseDescriptor, regionEnumID descpb.ID,
 ) error {
 	if !dbDesc.IsMultiRegion() {
 		return errors.AssertionFailedf(
@@ -694,7 +698,7 @@ func addDefaultLocalityConfigToAllTables(
 		)
 	}
 	b := p.Txn().NewBatch()
-	if err := p.forEachTableInMultiRegionDatabase(ctx, dbDesc, func(ctx context.Context, tbDesc *tabledesc.Mutable) error {
+	if err := p.forEachMutableTableInDatabase(ctx, dbDesc, func(ctx context.Context, tbDesc *tabledesc.Mutable) error {
 		if err := p.checkPrivilegesForMultiRegionOp(ctx, tbDesc); err != nil {
 			return err
 		}
@@ -756,7 +760,6 @@ func checkCanConvertTableToMultiRegion(
 			)
 		}
 	}
-	// TODO(#57668): check zone configurations are not set here
 	return nil
 }
 
@@ -775,6 +778,15 @@ func (n *alterDatabasePrimaryRegionNode) setInitialPrimaryRegion(params runParam
 		return err
 	}
 
+	// Check we are writing valid zone configurations.
+	if err := params.p.validateAllMultiRegionZoneConfigsInDatabase(
+		params.ctx,
+		n.desc,
+		&zoneConfigForMultiRegionValidatorSetInitialRegion{},
+	); err != nil {
+		return err
+	}
+
 	// Set the region config on the database descriptor.
 	if err := n.desc.SetInitialMultiRegionConfig(regionConfig); err != nil {
 		return err
@@ -783,7 +795,7 @@ func (n *alterDatabasePrimaryRegionNode) setInitialPrimaryRegion(params runParam
 	if err := addDefaultLocalityConfigToAllTables(
 		params.ctx,
 		params.p,
-		&n.desc.Immutable,
+		n.desc,
 		regionConfig.RegionEnumID(),
 	); err != nil {
 		return err
@@ -833,7 +845,7 @@ func (n *alterDatabasePrimaryRegionNode) startExec(params runParams) error {
 	} else {
 		if err := params.p.validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
 			params.ctx,
-			&n.desc.Immutable,
+			n.desc,
 		); err != nil {
 			return err
 		}
@@ -905,7 +917,7 @@ func (n *alterDatabaseSurvivalGoalNode) startExec(params runParams) error {
 
 	if err := params.p.validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
 		params.ctx,
-		&n.desc.Immutable,
+		n.desc,
 	); err != nil {
 		return err
 	}

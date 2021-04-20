@@ -604,6 +604,14 @@ func restore(
 		return emptyRowCount, nil
 	}
 
+	// If we've already migrated some of the system tables we're about to
+	// restore, this implies that a previous attempt restored all of this data.
+	// We want to avoid restoring again since we'll be shadowing migrated keys.
+	details := job.Details().(jobspb.RestoreDetails)
+	if alreadyMigrated := checkForMigratedData(details, dataToRestore); alreadyMigrated {
+		return emptyRowCount, nil
+	}
+
 	mu := struct {
 		syncutil.Mutex
 		highWaterMark     int
@@ -1670,8 +1678,7 @@ func (r *restoreResumer) Resume(ctx context.Context, execCtx interface{}) error 
 		}
 		// Reload the details as we may have updated the job.
 		details = r.job.Details().(jobspb.RestoreDetails)
-	}
-	if details.DescriptorCoverage == tree.AllDescriptors {
+
 		if err := r.cleanupTempSystemTables(ctx); err != nil {
 			return err
 		}
@@ -1755,14 +1762,14 @@ func revalidateIndexes(
 		}
 		tableDesc := tabledesc.NewBuilder(tbl).BuildExistingMutableTable()
 
-		var forward, inverted []*descpb.IndexDescriptor
+		var forward, inverted []catalog.Index
 		for _, idx := range tableDesc.AllIndexes() {
 			if _, ok := indexes[idx.GetID()]; ok {
 				switch idx.GetType() {
 				case descpb.IndexDescriptor_FORWARD:
-					forward = append(forward, idx.IndexDesc())
+					forward = append(forward, idx)
 				case descpb.IndexDescriptor_INVERTED:
-					inverted = append(inverted, idx.IndexDesc())
+					inverted = append(inverted, idx)
 				}
 			}
 		}
@@ -1901,9 +1908,9 @@ func (r *restoreResumer) publishDescriptors(
 			if err != nil {
 				return err
 			}
-			newIdx := protoutil.Clone(found.IndexDesc()).(*descpb.IndexDescriptor)
+			newIdx := found.IndexDescDeepCopy()
 			mutTable.RemovePublicNonPrimaryIndex(found.Ordinal())
-			if err := mutTable.AddIndexMutation(newIdx, descpb.DescriptorMutation_ADD); err != nil {
+			if err := mutTable.AddIndexMutation(&newIdx, descpb.DescriptorMutation_ADD); err != nil {
 				return err
 			}
 		}
@@ -2426,8 +2433,8 @@ func (r *restoreResumer) restoreSystemTables(
 ) error {
 	tempSystemDBID := getTempSystemDBID(restoreDetails)
 	details := r.job.Details().(jobspb.RestoreDetails)
-	if details.SystemTablesRestored == nil {
-		details.SystemTablesRestored = make(map[string]bool)
+	if details.SystemTablesMigrated == nil {
+		details.SystemTablesMigrated = make(map[string]bool)
 	}
 
 	// Iterate through all the tables that we're restoring, and if it was restored
@@ -2438,18 +2445,36 @@ func (r *restoreResumer) restoreSystemTables(
 			continue
 		}
 		systemTableName := table.GetName()
-		if details.SystemTablesRestored[systemTableName] {
-			// We've already restored this table.
-			continue
+		stagingTableName := restoreTempSystemDB + "." + systemTableName
+
+		config, ok := systemTableBackupConfiguration[systemTableName]
+		if !ok {
+			log.Warningf(ctx, "no configuration specified for table %s... skipping restoration",
+				systemTableName)
+		}
+
+		if config.migrationFunc != nil {
+			if details.SystemTablesMigrated[systemTableName] {
+				continue
+			}
+
+			if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				if err := config.migrationFunc(ctx, r.execCfg, txn, stagingTableName); err != nil {
+					return err
+				}
+
+				// Keep track of which system tables we've migrated so that future job
+				// restarts don't try to import data over our migrated data. This would
+				// fail since the restored data would shadow the migrated keys.
+				details.SystemTablesMigrated[systemTableName] = true
+				return r.job.SetDetails(ctx, txn, details)
+			}); err != nil {
+				return err
+			}
 		}
 
 		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			txn.SetDebugName("system-restore-txn")
-			config, ok := systemTableBackupConfiguration[systemTableName]
-			if !ok {
-				log.Warningf(ctx, "no configuration specified for table %s... skipping restoration",
-					systemTableName)
-			}
 
 			restoreFunc := defaultSystemTableRestoreFunc
 			if config.customRestoreFunc != nil {
@@ -2458,15 +2483,11 @@ func (r *restoreResumer) restoreSystemTables(
 			}
 
 			log.Eventf(ctx, "restoring system table %s", systemTableName)
-			err := restoreFunc(ctx, r.execCfg, txn, systemTableName, restoreTempSystemDB+"."+systemTableName)
+			err := restoreFunc(ctx, r.execCfg, txn, systemTableName, stagingTableName)
 			if err != nil {
 				return errors.Wrapf(err, "restoring system table %s", systemTableName)
 			}
-
-			// System table restoration may not be idempotent, so we need to keep
-			// track of what we've restored.
-			details.SystemTablesRestored[systemTableName] = true
-			return r.job.SetDetails(ctx, txn, details)
+			return nil
 		}); err != nil {
 			return err
 		}

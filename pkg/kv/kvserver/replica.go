@@ -568,6 +568,9 @@ type Replica struct {
 		failureToGossipSystemConfig bool
 
 		tenantID roachpb.TenantID // Set when first initialized, not modified after
+
+		// Historical information about the command that set the closed timestamp.
+		closedTimestampSetter closedTimestampSetterInfo
 	}
 
 	rangefeedMu struct {
@@ -1114,7 +1117,7 @@ func (r *Replica) raftBasicStatusRLocked() raft.BasicStatus {
 
 // State returns a copy of the internal state of the Replica, along with some
 // auxiliary information.
-func (r *Replica) State() kvserverpb.RangeInfo {
+func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	var ri kvserverpb.RangeInfo
 
 	// NB: this acquires an RLock(). Reentrant RLocks are deadlock prone, so do
@@ -1173,6 +1176,16 @@ func (r *Replica) State() kvserverpb.RangeInfo {
 			ri.TenantID = r.mu.tenantID.ToUint64()
 		}
 	}
+	ri.ClosedTimestampPolicy = r.closedTimestampPolicyRLocked()
+	r.sideTransportClosedTimestamp.mu.Lock()
+	ri.ClosedTimestampSideTransportInfo.ReplicaClosed = r.sideTransportClosedTimestamp.mu.closedTimestamp
+	ri.ClosedTimestampSideTransportInfo.ReplicaLAI = r.sideTransportClosedTimestamp.mu.lai
+	r.sideTransportClosedTimestamp.mu.Unlock()
+	centralClosed, centralLAI := r.store.cfg.ClosedTimestampReceiver.GetClosedTimestamp(
+		ctx, r.RangeID, r.mu.state.Lease.Replica.NodeID)
+	ri.ClosedTimestampSideTransportInfo.CentralClosed = centralClosed
+	ri.ClosedTimestampSideTransportInfo.CentralLAI = centralLAI
+
 	return ri
 }
 
@@ -1348,8 +1361,8 @@ func (r *Replica) checkSpanInRangeRLocked(ctx context.Context, rspan roachpb.RSp
 	)
 }
 
-// checkTSAboveGCThresholdRLocked returns an error if a request (identified
-// by its MVCC timestamp) can be run on the replica.
+// checkTSAboveGCThresholdRLocked returns an error if a request (identified by
+// its read timestamp) wants to read below the range's GC threshold.
 func (r *Replica) checkTSAboveGCThresholdRLocked(
 	ts hlc.Timestamp, st kvserverpb.LeaseStatus, isAdmin bool,
 ) error {

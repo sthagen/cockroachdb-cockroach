@@ -3342,7 +3342,7 @@ func TestProposalOverhead(t *testing.T) {
 		}
 		// Sometime the logical portion of the timestamp can be non-zero which makes
 		// the overhead non-deterministic.
-		args.Cmd.ReplicatedEvalResult.Timestamp.Logical = 0
+		args.Cmd.ReplicatedEvalResult.WriteTimestamp.Logical = 0
 		atomic.StoreUint32(&overhead, uint32(args.Cmd.Size()-args.Cmd.WriteBatch.Size()))
 		// We don't want to print the WriteBatch because it's explicitly
 		// excluded from the size computation. Nil'ing it out does not
@@ -3605,14 +3605,14 @@ func TestTenantID(t *testing.T) {
 		// Ensure that a normal range has the system tenant.
 		{
 			_, repl := getFirstStoreReplica(t, tc.Server(0), keys.UserTableDataMin)
-			ri := repl.State()
+			ri := repl.State(ctx)
 			require.Equal(t, roachpb.SystemTenantID.ToUint64(), ri.TenantID, "%v", repl)
 		}
 		// Ensure that a range with a tenant prefix has the proper tenant ID.
 		tc.SplitRangeOrFatal(t, tenant2Prefix)
 		{
 			_, repl := getFirstStoreReplica(t, tc.Server(0), tenant2Prefix)
-			ri := repl.State()
+			ri := repl.State(ctx)
 			require.Equal(t, tenant2.ToUint64(), ri.TenantID, "%v", repl)
 		}
 	})
@@ -3666,18 +3666,18 @@ func TestTenantID(t *testing.T) {
 
 		uninitializedRepl, _, err := tc.Server(1).GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, repl.RangeID)
 		require.NoError(t, err)
-		ri := uninitializedRepl.State()
+		ri := uninitializedRepl.State(ctx)
 		require.Equal(t, uint64(0), ri.TenantID)
 		close(blockSnapshot)
 		require.NoError(t, <-addReplicaErr)
-		ri = uninitializedRepl.State() // now initialized
+		ri = uninitializedRepl.State(ctx) // now initialized
 		require.Equal(t, tenant2.ToUint64(), ri.TenantID)
 	})
 	t.Run("(3) upon restart", func(t *testing.T) {
 		tc.StopServer(0)
 		tc.AddAndStartServer(t, stickySpecTestServerArgs)
 		_, repl := getFirstStoreReplica(t, tc.Server(2), tenant2Prefix)
-		ri := repl.State()
+		ri := repl.State(ctx)
 		require.Equal(t, tenant2.ToUint64(), ri.TenantID, "%v", repl)
 	})
 

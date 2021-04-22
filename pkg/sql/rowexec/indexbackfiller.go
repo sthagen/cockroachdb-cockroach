@@ -133,8 +133,12 @@ func (ib *indexBackfiller) constructIndexEntries(
 		todo := ib.spec.Spans[i].Span
 		for todo.Key != nil {
 			startKey := todo.Key
+			readAsOf := ib.spec.ReadAsOf
+			if readAsOf.IsEmpty() { // old gateway
+				readAsOf = ib.spec.WriteAsOf
+			}
 			todo.Key, entries, memUsedBuildingBatch, err = ib.buildIndexEntryBatch(ctx, todo,
-				ib.spec.ReadAsOf)
+				readAsOf)
 			if err != nil {
 				return err
 			}
@@ -190,8 +194,9 @@ func (ib *indexBackfiller) ingestIndexEntries(
 		MaxBufferSize:  maxBufferSize,
 		StepBufferSize: stepSize,
 		SkipDuplicates: ib.ContainsInvertedIndex(),
+		BatchTimestamp: ib.spec.ReadAsOf,
 	}
-	adder, err := ib.flowCtx.Cfg.BulkAdder(ctx, ib.flowCtx.Cfg.DB, ib.spec.ReadAsOf, opts)
+	adder, err := ib.flowCtx.Cfg.BulkAdder(ctx, ib.flowCtx.Cfg.DB, ib.spec.WriteAsOf, opts)
 	if err != nil {
 		return err
 	}

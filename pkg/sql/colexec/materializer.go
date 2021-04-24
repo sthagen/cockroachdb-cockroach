@@ -262,7 +262,9 @@ func (m *Materializer) Start(ctx context.Context) {
 	// We can encounter an expected error during Init (e.g. an operator
 	// attempts to allocate a batch, but the memory budget limit has been
 	// reached), so we need to wrap it with a catcher.
-	if err := colexecerror.CatchVectorizedRuntimeError(m.input.Init); err != nil {
+	if err := colexecerror.CatchVectorizedRuntimeError(func() {
+		m.input.Init(ctx)
+	}); err != nil {
 		m.MoveToDraining(err)
 	} else {
 		// Note that we intentionally only start the drain helper if
@@ -279,7 +281,7 @@ func (m *Materializer) Start(ctx context.Context) {
 func (m *Materializer) next() rowenc.EncDatumRow {
 	if m.batch == nil || m.curIdx >= m.batch.Length() {
 		// Get a fresh batch.
-		m.batch = m.input.Next(m.Ctx)
+		m.batch = m.input.Next()
 		if m.batch.Length() == 0 {
 			return nil
 		}
@@ -329,6 +331,14 @@ func (m *Materializer) close() {
 	if m.ProcessorBase.InternalClose() {
 		if m.cancelFlow != nil {
 			m.cancelFlow()()
+		}
+		if m.Ctx == nil {
+			// In some edge cases (like when Init of an operator above this
+			// materializer encounters a panic), the materializer might never be
+			// started, yet it still will attempt to close its Closers. This
+			// context is only used for logging purposes, so it is ok to grab
+			// the background context in order to prevent a NPE below.
+			m.Ctx = context.Background()
 		}
 		m.closers.CloseAndLogOnErr(m.Ctx, "materializer")
 	}

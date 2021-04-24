@@ -395,6 +395,14 @@ var stubCatalogTablesEnabledClusterValue = settings.RegisterBoolSetting(
 	true,
 )
 
+// settingWorkMemBytes is a cluster setting that determines the maximum amount
+// of RAM that a processor can use.
+var settingWorkMemBytes = settings.RegisterByteSizeSetting(
+	"sql.distsql.temp_storage.workmem",
+	"maximum amount of memory in bytes a processor can use before falling back to temp storage",
+	execinfra.DefaultMemoryLimit, /* 64MiB */
+).WithPublic()
+
 // ExperimentalDistSQLPlanningClusterSettingName is the name for the cluster
 // setting that controls experimentalDistSQLPlanningClusterMode below.
 const ExperimentalDistSQLPlanningClusterSettingName = "sql.defaults.experimental_distsql_planning"
@@ -423,8 +431,9 @@ var VectorizeClusterMode = settings.RegisterEnumSetting(
 	"default vectorize mode",
 	"on",
 	map[int64]string{
-		int64(sessiondatapb.VectorizeOff): "off",
-		int64(sessiondatapb.VectorizeOn):  "on",
+		int64(sessiondatapb.VectorizeOff):                "off",
+		int64(sessiondatapb.VectorizeOn):                 "on",
+		int64(sessiondatapb.VectorizeExperimentalAlways): "experimental_always",
 	},
 )
 
@@ -2218,6 +2227,10 @@ func (m *sessionDataMutator) SetDistSQLMode(val sessiondata.DistSQLExecMode) {
 	m.data.DistSQLMode = val
 }
 
+func (m *sessionDataMutator) SetDistSQLWorkMem(val int64) {
+	m.data.WorkMemLimit = val
+}
+
 func (m *sessionDataMutator) SetForceSavepointRestart(val bool) {
 	m.data.ForceSavepointRestart = val
 }
@@ -2433,11 +2446,12 @@ func (s *sqlStatsCollector) recordStatement(
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
 	stats topLevelQueryStats,
+	planner *planner,
 ) roachpb.StmtID {
 	return s.appStats.recordStatement(
 		stmt, samplePlanDescription, distSQLUsed, vectorized, implicitTxn, fullScan,
 		automaticRetryCount, numRows, err, parseLat, planLat, runLat, svcLat,
-		ovhLat, stats,
+		ovhLat, stats, planner,
 	)
 }
 

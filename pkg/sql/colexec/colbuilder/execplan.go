@@ -129,11 +129,11 @@ func wrapRowSources(
 	var c *colexec.Columnarizer
 	if proc.MustBeStreaming() {
 		c, err = colexec.NewStreamingColumnarizer(
-			ctx, colmem.NewAllocator(ctx, streamingMemAccount, factory), flowCtx, processorID, toWrap,
+			colmem.NewAllocator(ctx, streamingMemAccount, factory), flowCtx, processorID, toWrap,
 		)
 	} else {
 		c, err = colexec.NewBufferingColumnarizer(
-			ctx, colmem.NewAllocator(ctx, streamingMemAccount, factory), flowCtx, processorID, toWrap,
+			colmem.NewAllocator(ctx, streamingMemAccount, factory), flowCtx, processorID, toWrap,
 		)
 	}
 	return c, releasables, err
@@ -498,7 +498,7 @@ func (r opResult) createDiskBackedSort(
 				mergeUnlimitedAllocator,
 				outputUnlimitedAllocator,
 				input, inputTypes, ordering,
-				execinfra.GetWorkMemLimit(flowCtx.Cfg),
+				execinfra.GetWorkMemLimit(flowCtx),
 				maxNumberPartitions,
 				args.TestingKnobs.NumForcedRepartitions,
 				args.TestingKnobs.DelegateFDAcquisitions,
@@ -710,7 +710,9 @@ func NewColOperator(
 	resultPreSpecPlanningStateShallowCopy := *r
 
 	if err = supportedNatively(spec); err != nil {
-		if err := canWrap(flowCtx.EvalCtx.SessionData.VectorizeMode, spec); err != nil {
+		if wrapErr := canWrap(flowCtx.EvalCtx.SessionData.VectorizeMode, spec); wrapErr != nil {
+			// Return the original error for why we don't support this spec
+			// natively since it is more interesting.
 			return r, err
 		}
 		if log.V(1) {
@@ -880,7 +882,7 @@ func NewColOperator(
 					// We will divide the available memory equally between the
 					// two usages - the hash aggregation itself and the input
 					// tuples tracking.
-					totalMemLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+					totalMemLimit := execinfra.GetWorkMemLimit(flowCtx)
 					hashAggregatorMemAccount, hashAggregatorMemMonitorName := result.createMemAccountForSpillStrategyWithLimit(
 						ctx, flowCtx, totalMemLimit/2, opName, spec.ProcessorID,
 					)
@@ -1017,7 +1019,7 @@ func NewColOperator(
 			rightTypes := make([]*types.T, len(spec.Input[1].ColumnTypes))
 			copy(rightTypes, spec.Input[1].ColumnTypes)
 
-			memoryLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+			memoryLimit := execinfra.GetWorkMemLimit(flowCtx)
 			if len(core.HashJoiner.LeftEqColumns) == 0 {
 				// We are performing a cross-join, so we need to plan a
 				// specialized operator.
@@ -1140,7 +1142,7 @@ func NewColOperator(
 				), factory)
 			diskAccount := result.createDiskAccount(ctx, flowCtx, opName, spec.ProcessorID)
 			mj, err := colexecjoin.NewMergeJoinOp(
-				unlimitedAllocator, execinfra.GetWorkMemLimit(flowCtx.Cfg),
+				unlimitedAllocator, execinfra.GetWorkMemLimit(flowCtx),
 				args.DiskQueueCfg, args.FDSemaphore,
 				joinType, inputs[0].Root, inputs[1].Root, leftTypes, rightTypes,
 				core.MergeJoiner.LeftOrdering.Columns, core.MergeJoiner.RightOrdering.Columns,
@@ -1257,7 +1259,7 @@ func NewColOperator(
 					)
 					diskAcc := result.createDiskAccount(ctx, flowCtx, opName, spec.ProcessorID)
 					result.Root, err = colexecwindow.NewRelativeRankOperator(
-						unlimitedAllocator, execinfra.GetWorkMemLimit(flowCtx.Cfg), args.DiskQueueCfg,
+						unlimitedAllocator, execinfra.GetWorkMemLimit(flowCtx), args.DiskQueueCfg,
 						args.FDSemaphore, input, typs, windowFn, wf.Ordering.Columns,
 						outputIdx, partitionColIdx, peersColIdx, diskAcc,
 					)
@@ -1552,7 +1554,7 @@ func (r opResult) createMemAccountForSpillStrategy(
 ) (*mon.BoundAccount, string) {
 	monitorName := r.getMemMonitorName(opName, processorID, "limited" /* suffix */)
 	bufferingOpMemMonitor := execinfra.NewLimitedMonitor(
-		ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, monitorName,
+		ctx, flowCtx.EvalCtx.Mon, flowCtx, monitorName,
 	)
 	r.OpMonitors = append(r.OpMonitors, bufferingOpMemMonitor)
 	bufferingMemAccount := bufferingOpMemMonitor.MakeBoundAccount()

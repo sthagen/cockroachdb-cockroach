@@ -1306,6 +1306,14 @@ The zip command will block for the duration specified. Zero disables this featur
 `,
 	}
 
+	ZipConcurrency = FlagInfo{
+		Name: "concurrency",
+		Description: `
+The maximum number of nodes to request data from simultaneously.
+Can be set to 1 to ensure only one node is polled for data at a time.
+`,
+	}
+
 	StmtDiagDeleteAll = FlagInfo{
 		Name:        "all",
 		Description: `Delete all bundles.`,
@@ -1434,12 +1442,17 @@ exist. The interval is specified with a suffix of 's' for seconds,
 `,
 	}
 
+	ExportTableTarget = FlagInfo{
+		Name:        "table",
+		Description: `Select the table to export data from.`,
+	}
+
 	ExportDestination = FlagInfo{
 		Name: "destination",
 		Description: `
 The destination to export data. 
-If the export format is readable and this flag left specified,
-defaults to displays the exported data in the terminal output.
+If the export format is readable and this flag left unspecified,
+defaults to display the exported data in the terminal output.
 `,
 	}
 

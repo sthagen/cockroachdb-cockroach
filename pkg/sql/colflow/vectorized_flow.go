@@ -401,7 +401,7 @@ func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 	}
 }
 
-type runFn func(context.Context, context.CancelFunc)
+type runFn func(_ context.Context, flowCtxCancel context.CancelFunc)
 
 // flowCreatorHelper contains all the logic needed to add the vectorized
 // infrastructure to be run asynchronously as well as to perform some sanity
@@ -434,7 +434,7 @@ type remoteComponentCreator interface {
 		metadataSources []colexecop.MetadataSource,
 		toClose []colexecop.Closer,
 	) (*colrpc.Outbox, error)
-	newInbox(ctx context.Context, allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
+	newInbox(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
 }
 
 type vectorizedRemoteComponentCreator struct{}
@@ -451,9 +451,9 @@ func (vectorizedRemoteComponentCreator) newOutbox(
 }
 
 func (vectorizedRemoteComponentCreator) newInbox(
-	ctx context.Context, allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
+	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*colrpc.Inbox, error) {
-	return colrpc.NewInbox(ctx, allocator, typs, streamID)
+	return colrpc.NewInbox(allocator, typs, streamID)
 }
 
 // vectorizedFlowCreator performs all the setup of vectorized flows. Depending
@@ -665,19 +665,14 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	}
 
 	atomic.AddInt32(&s.numOutboxes, 1)
-	run := func(ctx context.Context, cancelFn context.CancelFunc) {
-		// cancelFn is the cancellation function of the context of the whole
-		// flow, and we want to call it only when the last outbox exits, so we
-		// derive a separate child context for each outbox.
-		var outboxCancelFn context.CancelFunc
-		ctx, outboxCancelFn = context.WithCancel(ctx)
+	run := func(ctx context.Context, flowCtxCancel context.CancelFunc) {
 		outbox.Run(
 			ctx,
 			s.nodeDialer,
 			stream.TargetNodeID,
 			s.flowID,
 			stream.StreamID,
-			outboxCancelFn,
+			flowCtxCancel,
 			flowinfra.SettingFlowStreamTimeout.Get(&flowCtx.Cfg.Settings.SV),
 		)
 		// When the last Outbox on this node exits, we want to make sure that
@@ -688,8 +683,8 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 		// - cancelFn is non-nil (it can be nil in tests).
 		// Calling cancelFn will cancel the context that all infrastructure on this
 		// node is listening on, so it will shut everything down.
-		if atomic.AddInt32(&s.numOutboxesExited, 1) == atomic.LoadInt32(&s.numOutboxes) && !s.isGatewayNode && cancelFn != nil {
-			cancelFn()
+		if atomic.AddInt32(&s.numOutboxesExited, 1) == atomic.LoadInt32(&s.numOutboxes) && !s.isGatewayNode && flowCtxCancel != nil {
+			flowCtxCancel()
 		}
 	}
 	s.accumulateAsyncComponent(run)
@@ -733,8 +728,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 	}
 	diskMon, diskAccounts := s.createDiskAccounts(ctx, flowCtx, mmName, len(output.Streams))
 	router, outputs := NewHashRouter(
-		allocators, input, outputTyps, output.HashColumns,
-		execinfra.GetWorkMemLimit(flowCtx.Cfg),
+		allocators, input, outputTyps, output.HashColumns, execinfra.GetWorkMemLimit(flowCtx),
 		s.diskQueueCfg, s.fdSemaphore, diskAccounts,
 	)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
@@ -840,9 +834,7 @@ func (s *vectorizedFlowCreator) setupInput(
 				}
 			}
 
-			inbox, err := s.remoteComponentCreator.newInbox(
-				ctx, colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory), input.ColumnTypes, inputStream.StreamID,
-			)
+			inbox, err := s.remoteComponentCreator.newInbox(colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory), input.ColumnTypes, inputStream.StreamID)
 
 			if err != nil {
 				return colexecargs.OpWithMetaInfo{}, err
@@ -877,7 +869,7 @@ func (s *vectorizedFlowCreator) setupInput(
 		if input.Type == execinfrapb.InputSyncSpec_ORDERED {
 			os := colexec.NewOrderedSynchronizer(
 				colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory),
-				execinfra.GetWorkMemLimit(flowCtx.Cfg), inputStreamOps,
+				execinfra.GetWorkMemLimit(flowCtx), inputStreamOps,
 				input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering),
 			)
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
@@ -1227,12 +1219,12 @@ func (r *vectorizedFlowCreatorHelper) checkInboundStreamID(sid execinfrapb.Strea
 
 func (r *vectorizedFlowCreatorHelper) accumulateAsyncComponent(run runFn) {
 	r.f.AddStartable(
-		flowinfra.StartableFn(func(ctx context.Context, wg *sync.WaitGroup, cancelFn context.CancelFunc) {
+		flowinfra.StartableFn(func(ctx context.Context, wg *sync.WaitGroup, flowCtxCancel context.CancelFunc) {
 			if wg != nil {
 				wg.Add(1)
 			}
 			go func() {
-				run(ctx, cancelFn)
+				run(ctx, flowCtxCancel)
 				if wg != nil {
 					wg.Done()
 				}

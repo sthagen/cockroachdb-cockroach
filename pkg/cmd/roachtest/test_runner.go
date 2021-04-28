@@ -1091,17 +1091,21 @@ func (r *testRunner) serveHTTP(wr http.ResponseWriter, req *http.Request) {
 				clusterReused = "no"
 			}
 		}
-		var clusterName string
+		var clusterName, clusterAdminUIAddr string
 		if w.Cluster() != nil {
 			clusterName = w.Cluster().name
+			clusterAdminUIAddr = w.Cluster().ExternalAdminUIAddr(
+				req.Context(),
+				w.Cluster().Node(1),
+			)[0]
 		}
 		t := w.Test()
 		testStatus := "N/A"
 		if t != nil {
 			testStatus = t.GetStatus()
 		}
-		fmt.Fprintf(wr, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
-			w.name, w.Status(), testName, clusterName, clusterReused, testStatus)
+		fmt.Fprintf(wr, "<tr><td>%s</td><td>%s</td><td>%s</td><td><a href='//%s'>%s</a></td><td>%s</td><td>%s</td></tr>\n",
+			w.name, w.Status(), testName, clusterAdminUIAddr, clusterName, clusterReused, testStatus)
 	}
 	fmt.Fprintf(wr, "</table>")
 
@@ -1194,7 +1198,7 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// map.
 	verMap := map[string]string{
 		"21.1": "20.2.6",
-		"20.2": "20.1.13",
+		"20.2": "20.1.15",
 		"20.1": "19.2.11",
 		"19.2": "19.1.11",
 		"19.1": "2.1.9",

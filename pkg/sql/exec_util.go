@@ -45,9 +45,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/accessors"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
@@ -77,6 +74,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -870,6 +868,11 @@ type ExecutorConfig struct {
 	// ContentionRegistry is a node-level registry of contention events used for
 	// contention observability.
 	ContentionRegistry *contention.Registry
+
+	// RootMemoryMonitor is the root memory monitor of the entire server. Do not
+	// use this for normal purposes. It is to be used to establish any new
+	// root-level memory accounts that are not related to a user sessions.
+	RootMemoryMonitor *mon.BytesMonitor
 }
 
 // Organization returns the value of cluster.organization.
@@ -965,7 +968,7 @@ type ExecutorTestingKnobs struct {
 	// query (i.e. no subqueries). The physical plan is only safe for use for the
 	// lifetime of this function. Note that returning a nil function is
 	// unsupported and will lead to a panic.
-	TestingSaveFlows func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec) error
+	TestingSaveFlows func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error
 
 	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
 	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
@@ -1506,10 +1509,6 @@ func (r *SessionRegistry) SerializeAll() []serverpb.Session {
 	}
 
 	return response
-}
-
-func newSchemaInterface(descsCol *descs.Collection, vs catalog.VirtualSchemas) *schemaInterface {
-	return &schemaInterface{logical: accessors.NewLogicalAccessor(descsCol, vs)}
 }
 
 // MaxSQLBytes is the maximum length in bytes of SQL statements serialized

@@ -626,11 +626,15 @@ func init() {
 		durationFlag(f, &zipCtx.cpuProfDuration, cliflags.ZipCPUProfileDuration)
 		intFlag(f, &zipCtx.concurrency, cliflags.ZipConcurrency)
 	}
-	// List-nodes + Zip commands.
+	// List-files + Zip commands.
 	for _, cmd := range []*cobra.Command{debugZipCmd, debugListFilesCmd} {
 		f := cmd.Flags()
 		varFlag(f, &zipCtx.nodes.inclusive, cliflags.ZipNodes)
 		varFlag(f, &zipCtx.nodes.exclusive, cliflags.ZipExcludeNodes)
+		stringSliceFlag(f, &zipCtx.files.includePatterns, cliflags.ZipIncludedFiles)
+		stringSliceFlag(f, &zipCtx.files.excludePatterns, cliflags.ZipExcludedFiles)
+		varFlag(f, &zipCtx.files.startTimestamp, cliflags.ZipFilesFrom)
+		varFlag(f, &zipCtx.files.endTimestamp, cliflags.ZipFilesUntil)
 	}
 
 	// Decommission command.
@@ -762,9 +766,7 @@ func init() {
 				"For details, see: "+build.MakeIssueURL(53404))
 
 		boolFlag(f, &demoCtx.disableLicenseAcquisition, cliflags.DemoNoLicense)
-		// Mark the --global flag as hidden until we investigate it more.
 		boolFlag(f, &demoCtx.simulateLatency, cliflags.Global)
-		_ = f.MarkHidden(cliflags.Global.Name)
 		// The --empty flag is only valid for the top level demo command,
 		// so we use the regular flag set.
 		boolFlag(demoCmd.Flags(), &demoCtx.noExampleDatabase, cliflags.UseEmptyDatabase)

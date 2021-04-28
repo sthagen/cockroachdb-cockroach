@@ -94,8 +94,6 @@ type extendedEvalContext struct {
 	// SchemaChangeJobCache refers to schemaChangeJobsCache in extraTxnState.
 	SchemaChangeJobCache map[descpb.ID]*jobs.Job
 
-	schemaAccessors *schemaInterface
-
 	sqlStatsCollector *sqlStatsCollector
 
 	SchemaChangerState *SchemaChangerState
@@ -125,12 +123,6 @@ func (evalCtx *extendedEvalContext) QueueJob(
 	}
 	*evalCtx.Jobs = append(*evalCtx.Jobs, jobID)
 	return job, nil
-}
-
-// schemaInterface provides access to the database and table descriptors.
-// See schema_accessors.go.
-type schemaInterface struct {
-	logical catalog.Accessor
 }
 
 // planner is the centerpiece of SQL statement execution combining session
@@ -293,7 +285,12 @@ func newInternalPlanner(
 		// deprecatedDatabaseCache, so we can leave it uninitialized.
 		// Furthermore, we're not concerned about the efficiency of querying tables
 		// with user-defined types, hence the nil hydratedTables.
-		collection: descs.NewCollection(execCfg.Settings, execCfg.LeaseManager, nil /* hydratedTables */),
+		collection: descs.NewCollection(
+			execCfg.Settings,
+			execCfg.LeaseManager,
+			nil, // hydratedTables
+			execCfg.VirtualSchemas,
+		),
 	}
 	for _, opt := range opts {
 		opt(params)
@@ -347,11 +344,12 @@ func newInternalPlanner(
 	p.semaCtx.SearchPath = sd.SearchPath
 	p.semaCtx.TypeResolver = p
 
-	plannerMon := mon.NewUnlimitedMonitor(ctx,
-		fmt.Sprintf("internal-planner.%s.%s", user, opName),
+	plannerMon := mon.NewMonitor(fmt.Sprintf("internal-planner.%s.%s", user, opName),
 		mon.MemoryResource,
 		memMetrics.CurBytesCount, memMetrics.MaxBytesHist,
+		-1, /* increment */
 		noteworthyInternalMemoryUsageBytes, execCfg.Settings)
+	plannerMon.Start(ctx, execCfg.RootMemoryMonitor, mon.BoundAccount{})
 
 	p.extendedEvalCtx = internalExtendedEvalCtx(
 		ctx, sd, dataMutator, params.collection, txn, ts, ts, execCfg, plannerMon,
@@ -442,14 +440,13 @@ func internalExtendedEvalCtx(
 		NodesStatusServer: execCfg.NodesStatusServer,
 		Descs:             tables,
 		ExecCfg:           execCfg,
-		schemaAccessors:   newSchemaInterface(tables, execCfg.VirtualSchemas),
 		DistSQLPlanner:    execCfg.DistSQLPlanner,
 	}
 }
 
 // LogicalSchemaAccessor is part of the resolver.SchemaResolver interface.
-func (p *planner) LogicalSchemaAccessor() catalog.Accessor {
-	return p.extendedEvalCtx.schemaAccessors.logical
+func (p *planner) Accessor() catalog.Accessor {
+	return p.Descriptors()
 }
 
 // SemaCtx provides access to the planner's SemaCtx.

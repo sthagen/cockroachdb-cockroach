@@ -861,6 +861,31 @@ func (v Value) PrettyPrint() string {
 	return buf.String()
 }
 
+// Kind returns the kind of commit trigger as a string.
+func (ct InternalCommitTrigger) Kind() string {
+	switch {
+	case ct.SplitTrigger != nil:
+		return "split"
+	case ct.MergeTrigger != nil:
+		return "merge"
+	case ct.ChangeReplicasTrigger != nil:
+		return "change-replicas"
+	case ct.ModifiedSpanTrigger != nil:
+		switch {
+		case ct.ModifiedSpanTrigger.SystemConfigSpan:
+			return "modified-span (system-config)"
+		case ct.ModifiedSpanTrigger.NodeLivenessSpan != nil:
+			return "modified-span (node-liveness)"
+		default:
+			panic("unknown modified-span commit trigger kind")
+		}
+	case ct.StickyBitTrigger != nil:
+		return "sticky-bit"
+	default:
+		panic("unknown commit trigger kind")
+	}
+}
+
 // IsFinalized determines whether the transaction status is in a finalized
 // state. A finalized state is terminal, meaning that once a transaction
 // enters one of these states, it will never leave it.
@@ -1935,6 +1960,10 @@ func (l Lease) Equivalent(newL Lease) bool {
 	// Ignore sequence numbers, they are simply a reflection of
 	// the equivalency of other fields.
 	l.Sequence, newL.Sequence = 0, 0
+	// Ignore the acquisition type, as leases will always be extended via
+	// RequestLease requests regardless of how a leaseholder first acquired its
+	// lease.
+	l.AcquisitionType, newL.AcquisitionType = 0, 0
 	// Ignore the ReplicaDescriptor's type. This shouldn't affect lease
 	// equivalency because Raft state shouldn't be factored into the state of a
 	// Replica's lease. We don't expect a leaseholder to ever become a LEARNER

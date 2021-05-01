@@ -65,6 +65,7 @@ func registerTests(r *testRegistry) {
 	registerLargeRange(r)
 	registerLedger(r)
 	registerLibPQ(r)
+	registerLiquibase(r)
 	registerNamespaceUpgradeMigration(r)
 	registerNetwork(r)
 	registerPebble(r)
@@ -111,6 +112,7 @@ func registerTests(r *testRegistry) {
 	registerYCSB(r)
 	registerTPCHBench(r)
 	registerOverload(r)
+	registerMultiTenantUpgrade(r)
 }
 
 func registerBenchmarks(r *testRegistry) {

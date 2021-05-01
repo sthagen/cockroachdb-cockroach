@@ -818,6 +818,7 @@ func TestLint(t *testing.T) {
 			":!util/grpcutil/grpc_util_test.go",
 			":!server/testserver.go",
 			":!util/tracing/*_test.go",
+			":!ccl/sqlproxyccl/tenant/test_directory_svr.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1664,6 +1665,9 @@ func TestLint(t *testing.T) {
 				stream.GrepNot(`pkg/rpc/stats_handler.go:.*v.WireLength is deprecated: This field is never set.*`),
 				// rpc/codec.go imports the same proto package that grpc-go imports (as of crdb@dd87d1145 and grpc-go@7b167fd6).
 				stream.GrepNot(`pkg/rpc/codec.go:.*package github.com/golang/protobuf/proto is deprecated: Use the "google.golang.org/protobuf/proto" package instead.`),
+				// goschedstats contains partial copies of go runtime structures, with
+				// many fields that we're not using.
+				stream.GrepNot(`pkg/util/goschedstats/runtime.*\.go:.*is unused`),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {

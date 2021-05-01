@@ -35,9 +35,6 @@ type TestServerArgs struct {
 	*cluster.Settings
 	RaftConfig
 
-	// LeaseManagerConfig holds configuration values specific to the LeaseManager.
-	LeaseManagerConfig *LeaseManagerConfig
-
 	// PartOfCluster must be set if the TestServer is joining others in a cluster.
 	// If not set (and hence the server is the only one in the cluster), the
 	// default zone config will be overridden to disable all replication - so that
@@ -232,6 +229,10 @@ type TestTenantArgs struct {
 	// IdleExitAfter, if set will cause the tenant process to exit if idle.
 	IdleExitAfter time.Duration
 
+	// Settings allows the caller to control the settings object used for the
+	// tenant cluster.
+	Settings *cluster.Settings
+
 	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
 	// cluster settings.
 	AllowSettingClusterSettings bool
@@ -242,4 +243,8 @@ type TestTenantArgs struct {
 
 	// TestingKnobs for the test server.
 	TestingKnobs TestingKnobs
+
+	// Test server starts with secure mode by default. When this is set to true
+	// it will switch to insecure
+	ForceInsecure bool
 }

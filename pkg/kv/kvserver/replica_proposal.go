@@ -427,11 +427,12 @@ func (r *Replica) leasePostApplyLocked(
 		}
 		applyReadSummaryToTimestampCache(r.store.tsCache, r.descRLocked(), sum)
 
-		// Reset the request counts used to make lease placement decisions whenever
-		// starting a new lease.
+		// Reset the request counts used to make lease placement decisions and
+		// load-based splitting/merging decisions whenever starting a new lease.
 		if r.leaseholderStats != nil {
 			r.leaseholderStats.resetRequestCounts()
 		}
+		r.loadBasedSplitter.Reset(r.Clock().PhysicalTime())
 	}
 
 	// Inform the concurrency manager that the lease holder has been updated.
@@ -771,8 +772,9 @@ func (r *Replica) evaluateProposal(
 	}
 
 	// Evaluate the commands. If this returns without an error, the batch should
-	// be committed. Note that we don't hold any locks at this point. This is
-	// important since evaluating a proposal is expensive.
+	// be committed. Note that we don't hold any locks at this point, except a
+	// shared RLock on raftMuReadOnlyMu. This is important since evaluating a
+	// proposal is expensive.
 	//
 	// Note that, during evaluation, ba's read and write timestamps might get
 	// bumped (see evaluateWriteBatchWithServersideRefreshes).
@@ -789,7 +791,9 @@ func (r *Replica) evaluateProposal(
 	}
 
 	if pErr != nil {
-		pErr = r.maybeSetCorrupt(ctx, pErr)
+		if _, ok := pErr.GetDetail().(*roachpb.ReplicaCorruptionError); ok {
+			return &res, false /* needConsensus */, pErr
+		}
 
 		txn := pErr.GetTxn()
 		if txn != nil && ba.Txn == nil {

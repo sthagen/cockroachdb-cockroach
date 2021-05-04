@@ -114,14 +114,6 @@ var redactedQueryParams = map[string]struct{}{
 	CredentialsParam:     {},
 }
 
-// ErrListingUnsupported is a marker for indicating listing is unsupported.
-var ErrListingUnsupported = errors.New("listing is not supported")
-
-// ErrFileDoesNotExist is a sentinel error for indicating that a specified
-// bucket/object/key/file (depending on storage terminology) does not exist.
-// This error is raised by the ReadFile method.
-var ErrFileDoesNotExist = errors.New("external_storage: file doesn't exist")
-
 var confParsers = map[string]ExternalStorageURIParser{}
 var implementations = map[roachpb.ExternalStorageProvider]ExternalStorageConstructor{}
 
@@ -154,7 +146,6 @@ func init() {
 	RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_NullSink, parseNullURL, makeNullSinkStorage, "null")
 	RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_S3, parseS3URL, MakeS3Storage, "s3")
 	RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_FileTable, parseUserfileURL, makeFileTableStorage, "userfile")
-	RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_Workload, ParseWorkloadConfig, makeWorkloadStorage, "workload")
 }
 
 // ExternalStorageURIContext contains arguments needed to parse external storage

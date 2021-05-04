@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package physical
+package props
 
 import (
 	"bytes"
@@ -19,7 +19,6 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/errors"
 )
 
@@ -271,6 +270,7 @@ func (oc *OrderingChoice) ColSet() opt.ColSet {
 //   +(1|2)            implies +(1|2|3)       (subset of choice)
 //   +(1|2),-4         implies +(1|2|3),-(4|5)
 //   +(1|2) opt(4)     implies +(1|2|3) opt(4)
+//   +1,+2,+3          implies +(1|2),+3      (unused group columns become optional)
 //
 //   <empty>           !implies +1
 //   +1                !implies -1            (direction mismatch)
@@ -288,6 +288,10 @@ func (oc *OrderingChoice) Implies(other *OrderingChoice) bool {
 		return false
 	}
 
+	// Copy the optional columns so we can add to the set. All group columns
+	// become optional after one column in the group is used.
+	optional := other.Optional.Copy()
+
 	for left, right := 0, 0; right < len(other.Columns); {
 		if left >= len(oc.Columns) {
 			return false
@@ -298,9 +302,10 @@ func (oc *OrderingChoice) Implies(other *OrderingChoice) bool {
 		switch {
 		case leftCol.Descending == rightCol.Descending && leftCol.Group.SubsetOf(rightCol.Group):
 			// The columns match.
+			optional.UnionWith(rightCol.Group)
 			left, right = left+1, right+1
 
-		case leftCol.Group.Intersects(other.Optional):
+		case leftCol.Group.Intersects(optional):
 			// Left column is optional in the right set.
 			left++
 
@@ -314,19 +319,28 @@ func (oc *OrderingChoice) Implies(other *OrderingChoice) bool {
 // Intersects returns true if there are orderings that satisfy both
 // OrderingChoices. See Intersection for more information.
 func (oc *OrderingChoice) Intersects(other *OrderingChoice) bool {
+	// Copy the optional columns so we can add to the sets. All group columns
+	// become optional after one column in the group is used.
+	leftOptional := oc.Optional.Copy()
+	rightOptional := other.Optional.Copy()
+
 	for left, right := 0, 0; left < len(oc.Columns) && right < len(other.Columns); {
 		leftCol, rightCol := &oc.Columns[left], &other.Columns[right]
 		switch {
 		case leftCol.Descending == rightCol.Descending && leftCol.Group.Intersects(rightCol.Group):
 			// The columns match.
+			leftOptional.UnionWith(leftCol.Group)
+			rightOptional.UnionWith(rightCol.Group)
 			left, right = left+1, right+1
 
-		case leftCol.Group.Intersects(other.Optional):
+		case leftCol.Group.Intersects(rightOptional):
 			// Left column is optional in the right set.
+			leftOptional.UnionWith(leftCol.Group)
 			left++
 
-		case rightCol.Group.Intersects(oc.Optional):
+		case rightCol.Group.Intersects(leftOptional):
 			// Right column is optional in the left set.
+			rightOptional.UnionWith(rightCol.Group)
 			right++
 
 		default:
@@ -366,6 +380,11 @@ func (oc *OrderingChoice) Intersection(other *OrderingChoice) OrderingChoice {
 
 	result := make([]OrderingColumnChoice, 0, len(oc.Columns)+len(other.Columns))
 
+	// Copy the optional columns so we can add to the sets. All group columns
+	// become optional after one column in the group is used.
+	leftOptional := oc.Optional.Copy()
+	rightOptional := other.Optional.Copy()
+
 	left, right := 0, 0
 	for left < len(oc.Columns) && right < len(other.Columns) {
 		leftCol, rightCol := &oc.Columns[left], &other.Columns[right]
@@ -377,22 +396,26 @@ func (oc *OrderingChoice) Intersection(other *OrderingChoice) OrderingChoice {
 				Group:      leftCol.Group.Intersection(rightCol.Group),
 				Descending: leftCol.Descending,
 			})
+			leftOptional.UnionWith(leftCol.Group)
+			rightOptional.UnionWith(rightCol.Group)
 			left, right = left+1, right+1
 
-		case leftCol.Group.Intersects(other.Optional):
+		case leftCol.Group.Intersects(rightOptional):
 			// Left column is optional in the right set.
 			result = append(result, OrderingColumnChoice{
-				Group:      leftCol.Group.Intersection(other.Optional),
+				Group:      leftCol.Group.Intersection(rightOptional),
 				Descending: leftCol.Descending,
 			})
+			leftOptional.UnionWith(leftCol.Group)
 			left++
 
-		case rightCol.Group.Intersects(oc.Optional):
+		case rightCol.Group.Intersects(leftOptional):
 			// Right column is optional in the left set.
 			result = append(result, OrderingColumnChoice{
-				Group:      rightCol.Group.Intersection(oc.Optional),
+				Group:      rightCol.Group.Intersection(leftOptional),
 				Descending: rightCol.Descending,
 			})
+			rightOptional.UnionWith(rightCol.Group)
 			right++
 
 		default:
@@ -406,6 +429,90 @@ func (oc *OrderingChoice) Intersection(other *OrderingChoice) OrderingChoice {
 	}
 	for ; right < len(other.Columns); right++ {
 		result = append(result, other.Columns[right])
+	}
+	return OrderingChoice{
+		Optional: oc.Optional.Intersection(other.Optional),
+		Columns:  result,
+	}
+}
+
+// CommonPrefix is similar to Intersection, but it does not panic if the orderings
+// are non-intersecting. Instead, it returns the longest prefix of intersecting
+// columns. Some examples:
+//
+//  +1           common prefix <empty> = <empty>
+//  +1           common prefix +1,+2   = +1
+//  +1,+2 opt(3) common prefix +1,+3   = +1,+3
+//
+// Note that CommonPrefix is asymmetric: optional columns of oc will be used to
+// match trailing columns of other, but the reverse is not true. For example:
+//
+//  +1 opt(2) common prefix +1,+2     = +1,+2
+//  +1,+2     common prefix +1 opt(2) = +1
+//
+func (oc *OrderingChoice) CommonPrefix(other *OrderingChoice) OrderingChoice {
+	if oc.Any() || other.Any() {
+		return OrderingChoice{}
+	}
+
+	result := make([]OrderingColumnChoice, 0, len(oc.Columns))
+
+	// Copy the optional columns so we can add to the sets. All group columns
+	// become optional after one column in the group is used.
+	leftOptional := oc.Optional.Copy()
+	rightOptional := other.Optional.Copy()
+
+	left, right := 0, 0
+	for left < len(oc.Columns) && right < len(other.Columns) {
+		leftCol, rightCol := &oc.Columns[left], &other.Columns[right]
+
+		switch {
+		case leftCol.Descending == rightCol.Descending && leftCol.Group.Intersects(rightCol.Group):
+			// The columns match.
+			result = append(result, OrderingColumnChoice{
+				Group:      leftCol.Group.Intersection(rightCol.Group),
+				Descending: leftCol.Descending,
+			})
+			leftOptional.UnionWith(leftCol.Group)
+			rightOptional.UnionWith(rightCol.Group)
+			left, right = left+1, right+1
+
+		case leftCol.Group.Intersects(rightOptional):
+			// Left column is optional in the right set.
+			result = append(result, OrderingColumnChoice{
+				Group:      leftCol.Group.Intersection(rightOptional),
+				Descending: leftCol.Descending,
+			})
+			leftOptional.UnionWith(leftCol.Group)
+			left++
+
+		case rightCol.Group.Intersects(leftOptional):
+			// Right column is optional in the left set.
+			result = append(result, OrderingColumnChoice{
+				Group:      rightCol.Group.Intersection(leftOptional),
+				Descending: rightCol.Descending,
+			})
+			rightOptional.UnionWith(rightCol.Group)
+			right++
+
+		default:
+			return OrderingChoice{
+				Optional: oc.Optional.Intersection(other.Optional),
+				Columns:  result,
+			}
+		}
+	}
+	// oc matched a prefix of other. Append the tail of the other ordering that is
+	// included in the optional columns of oc.
+	for ; right < len(other.Columns); right++ {
+		rightCol := &other.Columns[right]
+		if !rightCol.Group.Intersects(leftOptional) {
+			break
+		}
+		result = append(result, OrderingColumnChoice{
+			Group:      rightCol.Group.Intersection(leftOptional),
+			Descending: rightCol.Descending,
+		})
 	}
 	return OrderingChoice{
 		Optional: oc.Optional.Intersection(other.Optional),
@@ -492,7 +599,7 @@ func (oc *OrderingChoice) Copy() OrderingChoice {
 // This is used to quickly check whether Simplify needs to be called without
 // requiring allocations in the common case. This logic should be changed in
 // concert with the Simplify logic.
-func (oc *OrderingChoice) CanSimplify(fdset *props.FuncDepSet) bool {
+func (oc *OrderingChoice) CanSimplify(fdset *FuncDepSet) bool {
 	if oc.Any() {
 		// Any ordering allowed, so can't simplify further.
 		return false
@@ -554,7 +661,7 @@ func (oc *OrderingChoice) CanSimplify(fdset *props.FuncDepSet) bool {
 //        https://cs.uwaterloo.ca/~gweddell/cs798/p57-simmen.pdf
 //
 // This logic should be changed in concert with the CanSimplify logic.
-func (oc *OrderingChoice) Simplify(fdset *props.FuncDepSet) {
+func (oc *OrderingChoice) Simplify(fdset *FuncDepSet) {
 	oc.Optional = fdset.ComputeClosure(oc.Optional)
 
 	closure := oc.Optional
@@ -621,6 +728,17 @@ func (oc *OrderingChoice) Truncate(prefix int) {
 // set. This method can only be used when the OrderingChoice can be expressed
 // with the given columns; i.e. all groups have at least one column in the set.
 func (oc *OrderingChoice) ProjectCols(cols opt.ColSet) {
+	startLen := len(oc.Columns)
+	oc.RestrictToCols(cols)
+	if startLen != len(oc.Columns) {
+		panic(errors.AssertionFailedf("no columns left from group"))
+	}
+}
+
+// RestrictToCols removes any references to columns that are not in the given
+// set. If a group does not contain any columns in the given set, it removes
+// that group and all following groups.
+func (oc *OrderingChoice) RestrictToCols(cols opt.ColSet) {
 	if !oc.Optional.SubsetOf(cols) {
 		oc.Optional = oc.Optional.Intersection(cols)
 	}
@@ -628,7 +746,8 @@ func (oc *OrderingChoice) ProjectCols(cols opt.ColSet) {
 		if !oc.Columns[i].Group.SubsetOf(cols) {
 			oc.Columns[i].Group = oc.Columns[i].Group.Intersection(cols)
 			if oc.Columns[i].Group.Empty() {
-				panic(errors.AssertionFailedf("no columns left from group"))
+				oc.Columns = oc.Columns[:i]
+				break
 			}
 		}
 	}
@@ -805,4 +924,104 @@ func (oc *OrderingColumnChoice) AnyID() opt.ColumnID {
 		panic(errors.AssertionFailedf("column choice group should have at least one column id"))
 	}
 	return id
+}
+
+// OrderingSet is a set of orderings, with the restriction that no ordering
+// is a prefix of another ordering in the set.
+type OrderingSet []OrderingChoice
+
+// Copy returns a copy of the set which can be independently modified.
+func (os OrderingSet) Copy() OrderingSet {
+	res := make(OrderingSet, len(os))
+	copy(res, os)
+	return res
+}
+
+// Add an ordering to the list, checking whether it intersects another
+// ordering (or vice-versa).
+func (os *OrderingSet) Add(other *OrderingChoice) {
+	if other.Any() {
+		panic(errors.AssertionFailedf("empty ordering choice"))
+	}
+	for i := range *os {
+		if (*os)[i].Intersects(other) {
+			// Replace with an ordering that implies both.
+			(*os)[i] = (*os)[i].Intersection(other)
+			return
+		}
+	}
+	*os = append(*os, *other)
+}
+
+// Simplify simplifies all the orderings based on the FDs.
+func (os *OrderingSet) Simplify(fds *FuncDepSet) {
+	old := *os
+	*os = old[:0]
+	for _, o := range old {
+		newOrd := o
+		if o.CanSimplify(fds) {
+			newOrd = o.Copy()
+			newOrd.Simplify(fds)
+		}
+		if !newOrd.Any() {
+			// This function appends at most one element; it is ok to operate on
+			// the same slice.
+			os.Add(&newOrd)
+		}
+	}
+}
+
+// RestrictToImplies keeps only the orderings that imply the required ordering.
+func (os *OrderingSet) RestrictToImplies(required *OrderingChoice) {
+	res := (*os)[:0]
+	for _, o := range *os {
+		if o.Implies(required) {
+			res = append(res, o)
+		}
+	}
+	*os = res
+}
+
+// RestrictToCols keeps only the orderings (or prefixes of them) that refer to
+// columns in the given set. The fds argument allows ordering columns that
+// are not in the given set to be remapped to equivalent columns that are in the
+// given set by calling Simplify.
+func (os *OrderingSet) RestrictToCols(cols opt.ColSet, fds *FuncDepSet) {
+	old := *os
+	*os = old[:0]
+	for _, o := range old {
+		newOrd := o.Copy()
+		if o.CanSimplify(fds) {
+			newOrd.Simplify(fds)
+		}
+		newOrd.RestrictToCols(cols)
+		if !newOrd.Any() {
+			// This function appends at most one element; it is ok to operate on
+			// the same slice.
+			os.Add(&newOrd)
+		}
+	}
+}
+
+func (os OrderingSet) String() string {
+	var buf bytes.Buffer
+	for i, o := range os {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteByte('(')
+		buf.WriteString(o.String())
+		buf.WriteByte(')')
+	}
+	return buf.String()
+}
+
+// RemapColumns returns a copy of os with all columns in from mapped to columns
+// in to.
+func (os OrderingSet) RemapColumns(from, to opt.ColList) OrderingSet {
+	res := make(OrderingSet, len(os))
+	for i := range os {
+		res[i] = os[i].RemapColumns(from, to)
+	}
+	return res
 }

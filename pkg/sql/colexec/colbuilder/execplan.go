@@ -72,37 +72,20 @@ func wrapRowSources(
 	var toWrapInputs []execinfra.RowSource
 	var releasables []execinfra.Releasable
 	for i := range inputs {
-		inputInfo := &inputs[i]
 		// Optimization: if the input is a Columnarizer, its input is
 		// necessarily a execinfra.RowSource, so remove the unnecessary
 		// conversion.
-		if c, ok := inputInfo.Root.(*colexec.Columnarizer); ok {
+		if c, ok := inputs[i].Root.(*colexec.Columnarizer); ok {
 			// Since this Columnarizer has been previously added to Closers and
 			// MetadataSources, this call ensures that all future calls are noops.
 			// Modifying the slices at this stage is difficult.
 			c.MarkAsRemovedFromFlow()
 			toWrapInputs = append(toWrapInputs, c.Input())
 		} else {
-			inputInfoCopy := *inputInfo
-			// We pass on the ownership over the meta components to the
-			// materializer.
-			// TODO(yuzefovich): possibly set the length to 0 in order to be
-			// able to pool the underlying slices.
-			inputInfo.StatsCollectors = nil
-			inputInfo.MetadataSources = nil
-			inputInfo.ToClose = nil
-			// Note that this materializer is *not* added to the set of
-			// releasables because in some cases it could be released before
-			// being closed. Namely, this would occur if we have a subquery
-			// with LocalPlanNode core and a materializer is added in order to
-			// wrap that core - what will happen is that all releasables are put
-			// back into their pools upon the subquery's flow cleanup, yet the
-			// subquery planNode tree isn't closed yet since its closure is down
-			// when the main planNode tree is being closed.
 			toWrapInput, err := colexec.NewMaterializer(
 				flowCtx,
 				processorID,
-				inputInfoCopy,
+				inputs[i],
 				inputTypes[i],
 				nil, /* output */
 				nil, /* cancelFlow */
@@ -110,6 +93,13 @@ func wrapRowSources(
 			if err != nil {
 				return nil, releasables, err
 			}
+			// We passed the ownership over the meta components to the
+			// materializer.
+			// TODO(yuzefovich): possibly set the length to 0 in order to be
+			// able to pool the underlying slices.
+			inputs[i].StatsCollectors = nil
+			inputs[i].MetadataSources = nil
+			inputs[i].ToClose = nil
 			toWrapInputs = append(toWrapInputs, toWrapInput)
 			if materializerSafeToRelease {
 				releasables = append(releasables, toWrapInput)
@@ -141,38 +131,6 @@ func wrapRowSources(
 
 type opResult struct {
 	*colexecargs.NewColOperatorResult
-}
-
-// resetToState resets r to the state specified in arg. arg may be a shallow
-// copy made at a given point in time.
-func (r *opResult) resetToState(ctx context.Context, arg colexecargs.NewColOperatorResult) {
-	// MetadataSources are left untouched since there is no need to do any
-	// cleaning there.
-
-	// Close BoundAccounts that are not present in arg.OpAccounts.
-	accs := make(map[*mon.BoundAccount]struct{})
-	for _, a := range arg.OpAccounts {
-		accs[a] = struct{}{}
-	}
-	for _, a := range r.OpAccounts {
-		if _, ok := accs[a]; !ok {
-			a.Close(ctx)
-		}
-	}
-	// Stop BytesMonitors that are not present in arg.OpMonitors.
-	mons := make(map[*mon.BytesMonitor]struct{})
-	for _, m := range arg.OpMonitors {
-		mons[m] = struct{}{}
-	}
-
-	for _, m := range r.OpMonitors {
-		if _, ok := mons[m]; !ok {
-			m.Stop(ctx)
-		}
-	}
-
-	// Shallow copy over the rest.
-	*r.NewColOperatorResult = arg
 }
 
 func needHashAggregator(aggSpec *execinfrapb.AggregatorSpec) (bool, error) {
@@ -719,10 +677,6 @@ func NewColOperator(
 
 	core := &spec.Core
 	post := &spec.Post
-
-	// resultPreSpecPlanningStateShallowCopy is a shallow copy of the result
-	// before any specs are planned. Used if there is a need to backtrack.
-	resultPreSpecPlanningStateShallowCopy := *r
 
 	if err = supportedNatively(spec); err != nil {
 		if wrapErr := canWrap(flowCtx.EvalCtx.SessionData.VectorizeMode, spec); wrapErr != nil {
@@ -1328,7 +1282,7 @@ func NewColOperator(
 		Op:          result.Root,
 		ColumnTypes: result.ColumnTypes,
 	}
-	err = ppr.planPostProcessSpec(ctx, flowCtx, evalCtx, args, post, factory)
+	err = ppr.planPostProcessSpec(ctx, flowCtx, evalCtx, args, post, factory, &r.Releasables)
 	if err != nil {
 		if log.V(2) {
 			log.Infof(
@@ -1337,22 +1291,7 @@ func NewColOperator(
 				err, post,
 			)
 		}
-		if core.TableReader != nil {
-			// We cannot naively wrap a TableReader's post-processing spec since
-			// it might project out unneeded columns with unset values. These
-			// columns are still returned, and if we were to wrap an unsupported
-			// post-processing spec, a Materializer would naively decode these
-			// columns, which would return errors (e.g. UUIDs require 16 bytes).
-			inputTypes := make([][]*types.T, len(spec.Input))
-			for inputIdx, input := range spec.Input {
-				inputTypes[inputIdx] = make([]*types.T, len(input.ColumnTypes))
-				copy(inputTypes[inputIdx], input.ColumnTypes)
-			}
-			result.resetToState(ctx, resultPreSpecPlanningStateShallowCopy)
-			err = result.createAndWrapRowSource(ctx, flowCtx, args, inputs, inputTypes, spec, factory, err)
-		} else {
-			err = result.wrapPostProcessSpec(ctx, flowCtx, args, post, args.Spec.ResultTypes, factory, err)
-		}
+		err = result.wrapPostProcessSpec(ctx, flowCtx, args, post, args.Spec.ResultTypes, factory, err)
 	} else {
 		// The result can be updated with the post process result.
 		result.updateWithPostProcessResult(ppr)
@@ -1438,7 +1377,7 @@ func (r opResult) planAndMaybeWrapFilter(
 	factory coldata.ColumnFactory,
 ) error {
 	op, err := planFilterExpr(
-		ctx, flowCtx, evalCtx, r.Root, r.ColumnTypes, filter, args.StreamingMemAccount, factory, args.ExprHelper,
+		ctx, flowCtx, evalCtx, r.Root, r.ColumnTypes, filter, args.StreamingMemAccount, factory, args.ExprHelper, &r.Releasables,
 	)
 	if err != nil {
 		// Filter expression planning failed. Fall back to planning the filter
@@ -1509,6 +1448,7 @@ func (r *postProcessResult) planPostProcessSpec(
 	args *colexecargs.NewColOperatorArgs,
 	post *execinfrapb.PostProcessSpec,
 	factory coldata.ColumnFactory,
+	releasables *[]execinfra.Releasable,
 ) error {
 	if post.Projection {
 		r.Op, r.ColumnTypes = addProjection(r.Op, r.ColumnTypes, post.OutputColumns)
@@ -1525,7 +1465,7 @@ func (r *postProcessResult) planPostProcessSpec(
 			}
 			var outputIdx int
 			r.Op, outputIdx, r.ColumnTypes, err = planProjectionOperators(
-				ctx, evalCtx, expr, r.ColumnTypes, r.Op, args.StreamingMemAccount, factory,
+				ctx, evalCtx, expr, r.ColumnTypes, r.Op, args.StreamingMemAccount, factory, releasables,
 			)
 			if err != nil {
 				return errors.Wrapf(err, "unable to columnarize render expression %q", expr)
@@ -1654,6 +1594,7 @@ func planFilterExpr(
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
 	helper *colexecargs.ExprHelper,
+	releasables *[]execinfra.Releasable,
 ) (colexecop.Operator, error) {
 	semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(evalCtx.Txn)
 	expr, err := helper.ProcessExpr(filter, semaCtx, evalCtx, columnTypes)
@@ -1666,7 +1607,7 @@ func planFilterExpr(
 		return colexecutils.NewZeroOp(input), nil
 	}
 	op, _, filterColumnTypes, err := planSelectionOperators(
-		ctx, evalCtx, expr, columnTypes, input, acc, factory,
+		ctx, evalCtx, expr, columnTypes, input, acc, factory, releasables,
 	)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to columnarize filter expression %q", filter)
@@ -1703,6 +1644,7 @@ func planSelectionOperators(
 	input colexecop.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
+	releasables *[]execinfra.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	switch t := expr.(type) {
 	case *tree.IndexedVar:
@@ -1715,13 +1657,13 @@ func planSelectionOperators(
 		// tuples that are true on the right side.
 		var leftOp, rightOp colexecop.Operator
 		leftOp, _, typs, err = planSelectionOperators(
-			ctx, evalCtx, t.TypedLeft(), columnTypes, input, acc, factory,
+			ctx, evalCtx, t.TypedLeft(), columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, typs, err
 		}
 		rightOp, resultIdx, typs, err = planSelectionOperators(
-			ctx, evalCtx, t.TypedRight(), typs, leftOp, acc, factory,
+			ctx, evalCtx, t.TypedRight(), typs, leftOp, acc, factory, releasables,
 		)
 		return rightOp, resultIdx, typs, err
 	case *tree.OrExpr:
@@ -1746,7 +1688,7 @@ func planSelectionOperators(
 			return nil, resultIdx, typs, err
 		}
 		op, resultIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, caseExpr, columnTypes, input, acc, factory,
+			ctx, evalCtx, caseExpr, columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, typs, err
@@ -1755,7 +1697,7 @@ func planSelectionOperators(
 		return op, resultIdx, typs, err
 	case *tree.CaseExpr:
 		op, resultIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, expr, columnTypes, input, acc, factory,
+			ctx, evalCtx, expr, columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return op, resultIdx, typs, err
@@ -1764,7 +1706,7 @@ func planSelectionOperators(
 		return op, resultIdx, typs, err
 	case *tree.IsNullExpr:
 		op, resultIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, t.TypedInnerExpr(), columnTypes, input, acc, factory,
+			ctx, evalCtx, t.TypedInnerExpr(), columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return op, resultIdx, typs, err
@@ -1775,7 +1717,7 @@ func planSelectionOperators(
 		return op, resultIdx, typs, err
 	case *tree.IsNotNullExpr:
 		op, resultIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, t.TypedInnerExpr(), columnTypes, input, acc, factory,
+			ctx, evalCtx, t.TypedInnerExpr(), columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return op, resultIdx, typs, err
@@ -1787,7 +1729,7 @@ func planSelectionOperators(
 	case *tree.ComparisonExpr:
 		cmpOp := t.Operator
 		leftOp, leftIdx, ct, err := planProjectionOperators(
-			ctx, evalCtx, t.TypedLeft(), columnTypes, input, acc, factory,
+			ctx, evalCtx, t.TypedLeft(), columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, ct, err
@@ -1831,11 +1773,14 @@ func planSelectionOperators(
 				op, err = colexecsel.GetSelectionConstOperator(
 					cmpOp, leftOp, ct, leftIdx, constArg, evalCtx, t,
 				)
+				if r, ok := op.(execinfra.Releasable); ok {
+					*releasables = append(*releasables, r)
+				}
 			}
 			return op, resultIdx, ct, err
 		}
 		rightOp, rightIdx, ct, err := planProjectionOperators(
-			ctx, evalCtx, t.TypedRight(), ct, leftOp, acc, factory,
+			ctx, evalCtx, t.TypedRight(), ct, leftOp, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, ct, err
@@ -1843,6 +1788,9 @@ func planSelectionOperators(
 		op, err = colexecsel.GetSelectionOperator(
 			cmpOp, rightOp, ct, leftIdx, rightIdx, evalCtx, t,
 		)
+		if r, ok := op.(execinfra.Releasable); ok {
+			*releasables = append(*releasables, r)
+		}
 		return op, resultIdx, ct, err
 	default:
 		return nil, resultIdx, nil, errors.Errorf("unhandled selection expression type: %s", reflect.TypeOf(t))
@@ -1880,6 +1828,7 @@ func planProjectionOperators(
 	input colexecop.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
+	releasables *[]execinfra.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	// projectDatum is a helper function that adds a new constant projection
 	// operator for the given datum. typs are updated accordingly.
@@ -1902,7 +1851,7 @@ func planProjectionOperators(
 	case *tree.ComparisonExpr:
 		return planProjectionExpr(
 			ctx, evalCtx, t.Operator, t.ResolvedType(), t.TypedLeft(), t.TypedRight(),
-			columnTypes, input, acc, factory, nil /* binFn */, t,
+			columnTypes, input, acc, factory, nil /* binFn */, t, releasables,
 		)
 	case *tree.BinaryExpr:
 		if err = checkSupportedBinaryExpr(t.TypedLeft(), t.TypedRight(), t.ResolvedType()); err != nil {
@@ -1910,16 +1859,16 @@ func planProjectionOperators(
 		}
 		return planProjectionExpr(
 			ctx, evalCtx, t.Operator, t.ResolvedType(), t.TypedLeft(), t.TypedRight(),
-			columnTypes, input, acc, factory, t.Fn.Fn, nil, /* cmpExpr */
+			columnTypes, input, acc, factory, t.Fn.Fn, nil /* cmpExpr */, releasables,
 		)
 	case *tree.IsNullExpr:
-		return planIsNullProjectionOp(ctx, evalCtx, t.ResolvedType(), t.TypedInnerExpr(), columnTypes, input, acc, false /* negate */, factory)
+		return planIsNullProjectionOp(ctx, evalCtx, t.ResolvedType(), t.TypedInnerExpr(), columnTypes, input, acc, false /* negate */, factory, releasables)
 	case *tree.IsNotNullExpr:
-		return planIsNullProjectionOp(ctx, evalCtx, t.ResolvedType(), t.TypedInnerExpr(), columnTypes, input, acc, true /* negate */, factory)
+		return planIsNullProjectionOp(ctx, evalCtx, t.ResolvedType(), t.TypedInnerExpr(), columnTypes, input, acc, true /* negate */, factory, releasables)
 	case *tree.CastExpr:
 		expr := t.Expr.(tree.TypedExpr)
 		op, resultIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, expr, columnTypes, input, acc, factory,
+			ctx, evalCtx, expr, columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, 0, nil, err
@@ -1937,7 +1886,7 @@ func planProjectionOperators(
 			// of constant arguments, because the vectorized engine right now
 			// creates a new column full of the constant value.
 			op, resultIdx, typs, err = planProjectionOperators(
-				ctx, evalCtx, e.(tree.TypedExpr), typs, op, acc, factory,
+				ctx, evalCtx, e.(tree.TypedExpr), typs, op, acc, factory, releasables,
 			)
 			if err != nil {
 				return nil, resultIdx, nil, err
@@ -1948,6 +1897,9 @@ func planProjectionOperators(
 		op, err = colexec.NewBuiltinFunctionOperator(
 			colmem.NewAllocator(ctx, acc, factory), evalCtx, t, typs, inputCols, resultIdx, op,
 		)
+		if r, ok := op.(execinfra.Releasable); ok {
+			*releasables = append(*releasables, r)
+		}
 		typs = appendOneType(typs, t.ResolvedType())
 		return op, resultIdx, typs, err
 	case tree.Datum:
@@ -1977,7 +1929,7 @@ func planProjectionOperators(
 		tupleContentsIdxs := make([]int, len(t.Exprs))
 		for i, expr := range t.Exprs {
 			input, tupleContentsIdxs[i], typs, err = planProjectionOperators(
-				ctx, evalCtx, expr.(tree.TypedExpr), typs, input, acc, factory,
+				ctx, evalCtx, expr.(tree.TypedExpr), typs, input, acc, factory, releasables,
 			)
 			if err != nil {
 				return nil, resultIdx, typs, err
@@ -1987,6 +1939,7 @@ func planProjectionOperators(
 		op = colexec.NewTupleProjOp(
 			colmem.NewAllocator(ctx, acc, factory), typs, tupleContentsIdxs, outputType, input, resultIdx,
 		)
+		*releasables = append(*releasables, op.(execinfra.Releasable))
 		typs = appendOneType(typs, outputType)
 		return op, resultIdx, typs, err
 	case *tree.CaseExpr:
@@ -2029,7 +1982,7 @@ func planProjectionOperators(
 			// final result of the case projection.
 			whenTyped := when.Cond.(tree.TypedExpr)
 			caseOps[i], resultIdx, typs, err = planProjectionOperators(
-				ctx, evalCtx, whenTyped, typs, buffer, acc, factory,
+				ctx, evalCtx, whenTyped, typs, buffer, acc, factory, releasables,
 			)
 			if err != nil {
 				return nil, resultIdx, typs, err
@@ -2047,7 +2000,7 @@ func planProjectionOperators(
 				right := tree.NewTypedOrdinalReference(resultIdx, whenTyped.ResolvedType())
 				cmpExpr := tree.NewTypedComparisonExpr(tree.EQ, left, right)
 				caseOps[i], resultIdx, typs, err = planProjectionOperators(
-					ctx, evalCtx, cmpExpr, typs, caseOps[i], acc, factory,
+					ctx, evalCtx, cmpExpr, typs, caseOps[i], acc, factory, releasables,
 				)
 				if err != nil {
 					return nil, resultIdx, typs, err
@@ -2060,7 +2013,7 @@ func planProjectionOperators(
 
 			// Run the "then" clause on those tuples that were selected.
 			caseOps[i], thenIdxs[i], typs, err = planProjectionOperators(
-				ctx, evalCtx, when.Val.(tree.TypedExpr), typs, caseOps[i], acc, factory,
+				ctx, evalCtx, when.Val.(tree.TypedExpr), typs, caseOps[i], acc, factory, releasables,
 			)
 			if err != nil {
 				return nil, resultIdx, typs, err
@@ -2085,7 +2038,7 @@ func planProjectionOperators(
 			elseExpr = tree.DNull
 		}
 		elseOp, thenIdxs[len(t.Whens)], typs, err = planProjectionOperators(
-			ctx, evalCtx, elseExpr.(tree.TypedExpr), typs, buffer, acc, factory,
+			ctx, evalCtx, elseExpr.(tree.TypedExpr), typs, buffer, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, typs, err
@@ -2108,7 +2061,7 @@ func planProjectionOperators(
 		op := colexec.NewCaseOp(allocator, buffer, caseOps, elseOp, thenIdxs, caseOutputIdx, caseOutputType)
 		return op, caseOutputIdx, typs, err
 	case *tree.AndExpr, *tree.OrExpr:
-		return planLogicalProjectionOp(ctx, evalCtx, expr, columnTypes, input, acc, factory)
+		return planLogicalProjectionOp(ctx, evalCtx, expr, columnTypes, input, acc, factory, releasables)
 	default:
 		return nil, resultIdx, nil, errors.Errorf("unhandled projection expression type: %s", reflect.TypeOf(t))
 	}
@@ -2155,6 +2108,7 @@ func planProjectionExpr(
 	factory coldata.ColumnFactory,
 	binFn tree.TwoArgFn,
 	cmpExpr *tree.ComparisonExpr,
+	releasables *[]execinfra.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	if err := checkSupportedProjectionExpr(left, right); err != nil {
 		return nil, resultIdx, typs, err
@@ -2171,7 +2125,7 @@ func planProjectionExpr(
 		// this case.
 		var rightIdx int
 		input, rightIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, right, columnTypes, input, acc, factory,
+			ctx, evalCtx, right, columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, typs, err
@@ -2186,7 +2140,7 @@ func planProjectionExpr(
 	} else {
 		var leftIdx int
 		input, leftIdx, typs, err = planProjectionOperators(
-			ctx, evalCtx, left, columnTypes, input, acc, factory,
+			ctx, evalCtx, left, columnTypes, input, acc, factory, releasables,
 		)
 		if err != nil {
 			return nil, resultIdx, typs, err
@@ -2269,7 +2223,7 @@ func planProjectionExpr(
 			// Case 3: neither are constant.
 			var rightIdx int
 			input, rightIdx, typs, err = planProjectionOperators(
-				ctx, evalCtx, right, typs, input, acc, factory,
+				ctx, evalCtx, right, typs, input, acc, factory, releasables,
 			)
 			if err != nil {
 				return nil, resultIdx, nil, err
@@ -2283,6 +2237,9 @@ func planProjectionExpr(
 	}
 	if err != nil {
 		return op, resultIdx, typs, err
+	}
+	if r, ok := op.(execinfra.Releasable); ok {
+		*releasables = append(*releasables, r)
 	}
 	typs = appendOneType(typs, outputType)
 	return op, resultIdx, typs, err
@@ -2298,6 +2255,7 @@ func planLogicalProjectionOp(
 	input colexecop.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
+	releasables *[]execinfra.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	// Add a new boolean column that will store the result of the projection.
 	resultIdx = len(columnTypes)
@@ -2320,13 +2278,13 @@ func planLogicalProjectionOp(
 		colexecerror.InternalError(errors.AssertionFailedf("unexpected logical expression type %s", t.String()))
 	}
 	leftProjOpChain, leftIdx, typs, err = planProjectionOperators(
-		ctx, evalCtx, typedLeft, typs, leftFeedOp, acc, factory,
+		ctx, evalCtx, typedLeft, typs, leftFeedOp, acc, factory, releasables,
 	)
 	if err != nil {
 		return nil, resultIdx, typs, err
 	}
 	rightProjOpChain, rightIdx, typs, err = planProjectionOperators(
-		ctx, evalCtx, typedRight, typs, rightFeedOp, acc, factory,
+		ctx, evalCtx, typedRight, typs, rightFeedOp, acc, factory, releasables,
 	)
 	if err != nil {
 		return nil, resultIdx, typs, err
@@ -2366,9 +2324,10 @@ func planIsNullProjectionOp(
 	acc *mon.BoundAccount,
 	negate bool,
 	factory coldata.ColumnFactory,
+	releasables *[]execinfra.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	op, resultIdx, typs, err = planProjectionOperators(
-		ctx, evalCtx, expr, columnTypes, input, acc, factory,
+		ctx, evalCtx, expr, columnTypes, input, acc, factory, releasables,
 	)
 	if err != nil {
 		return op, resultIdx, typs, err

@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package cloudimpl
+package userfile
 
 import (
 	"context"
@@ -42,7 +42,7 @@ const (
 )
 
 func parseUserfileURL(
-	args ExternalStorageURIContext, uri *url.URL,
+	args cloud.ExternalStorageURIContext, uri *url.URL,
 ) (roachpb.ExternalStorage, error) {
 	conf := roachpb.ExternalStorage{}
 	qualifiedTableName := uri.Host
@@ -61,7 +61,7 @@ func parseUserfileURL(
 			composedTableName.SQLIdentifier()
 	}
 
-	conf.Provider = roachpb.ExternalStorageProvider_FileTable
+	conf.Provider = roachpb.ExternalStorageProvider_userfile
 	conf.FileTableConfig.User = normUser
 	conf.FileTableConfig.QualifiedTableName = qualifiedTableName
 	conf.FileTableConfig.Path = uri.Path
@@ -81,7 +81,7 @@ type fileTableStorage struct {
 var _ cloud.ExternalStorage = &fileTableStorage{}
 
 func makeFileTableStorage(
-	ctx context.Context, args ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.filetable")
 
@@ -183,7 +183,7 @@ func (f *fileTableStorage) Close() error {
 // configuration.
 func (f *fileTableStorage) Conf() roachpb.ExternalStorage {
 	return roachpb.ExternalStorage{
-		Provider:        roachpb.ExternalStorageProvider_FileTable,
+		Provider:        roachpb.ExternalStorageProvider_userfile,
 		FileTableConfig: f.cfg,
 	}
 }
@@ -396,4 +396,9 @@ func (f *fileTableStorage) Size(ctx context.Context, basename string) (int64, er
 		return 0, err
 	}
 	return f.fs.FileSize(ctx, filepath)
+}
+
+func init() {
+	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_userfile,
+		parseUserfileURL, makeFileTableStorage, cloud.RedactedParams(), "userfile")
 }

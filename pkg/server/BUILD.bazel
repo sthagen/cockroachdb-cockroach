@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "server",
     srcs = [
+        "addjoin.go",
         "admin.go",
         "api_v2.go",
         "api_v2_auth.go",
@@ -95,7 +96,7 @@ go_library(
         "//pkg/security",
         "//pkg/server/debug",
         "//pkg/server/diagnostics",
-        "//pkg/server/diagnostics/diagnosticspb",
+        "//pkg/server/diagnostics/diagnosticspb:diagnosticspb_go_proto",
         "//pkg/server/goroutinedumper",
         "//pkg/server/heapprofiler",
         "//pkg/server/serverpb",
@@ -141,7 +142,6 @@ go_library(
         "//pkg/sqlmigrations",
         "//pkg/storage",
         "//pkg/storage/cloud",
-        "//pkg/storage/cloudimpl",
         "//pkg/storage/enginepb",
         "//pkg/testutils/serverutils",
         "//pkg/ts",
@@ -240,6 +240,7 @@ go_library(
 go_test(
     name = "server_test",
     srcs = [
+        "addjoin_test.go",
         "admin_cluster_test.go",
         "admin_test.go",
         "api_v2_ranges_test.go",
@@ -261,6 +262,7 @@ go_test(
         "node_tombstone_storage_test.go",
         "pagination_test.go",
         "servemode_test.go",
+        "server_import_ts_test.go",
         "server_systemlog_gc_test.go",
         "server_test.go",
         "settings_cache_test.go",
@@ -299,7 +301,7 @@ go_test(
         "//pkg/security/securitytest",
         "//pkg/server/debug",
         "//pkg/server/diagnostics",
-        "//pkg/server/diagnostics/diagnosticspb",
+        "//pkg/server/diagnostics/diagnosticspb:diagnosticspb_go_proto",
         "//pkg/server/serverpb",
         "//pkg/server/status/statuspb:statuspb_go_proto",
         "//pkg/server/telemetry",
@@ -330,6 +332,7 @@ go_test(
         "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/httputil",
+        "//pkg/util/humanizeutil",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/log/logpb",

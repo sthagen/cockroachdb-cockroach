@@ -30,7 +30,7 @@ func registerSQLSmith(r *testRegistry) {
 		"seed":        sqlsmith.Setups["seed"],
 		"rand-tables": sqlsmith.Setups["rand-tables"],
 		"tpch-sf1": func(r *rand.Rand) string {
-			return `RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup' WITH into_db = 'defaultdb';`
+			return `RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`
 		},
 		"tpcc": func(r *rand.Rand) string {
 			const version = "version=2.1.0,fks=true,interleaved=false,seed=1,warehouses=1"
@@ -46,7 +46,7 @@ func registerSQLSmith(r *testRegistry) {
 				"stock",
 				"warehouse",
 			} {
-				fmt.Fprintf(&sb, "RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s' WITH into_db = 'defaultdb';\n", t, version)
+				fmt.Fprintf(&sb, "RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';\n", t, version)
 			}
 			return sb.String()
 		},
@@ -154,6 +154,10 @@ func registerSQLSmith(r *testRegistry) {
 			err := func() error {
 				done := make(chan error, 1)
 				go func(context.Context) {
+					// Generate can potentially panic in bad cases, so
+					// to avoid Go routines from dying we are going
+					// catch that here, and only pass the error into
+					// the channel.
 					defer func() {
 						if r := recover(); r != nil {
 							done <- errors.Newf("Caught error %s", r)
@@ -161,10 +165,6 @@ func registerSQLSmith(r *testRegistry) {
 						}
 					}()
 
-					// Generate can potentially panic in bad cases, so
-					// to avoid Go routines from dying we are going
-					// catch that here, and only pass the error into
-					// the channel.
 					stmt = smither.Generate()
 					if stmt == "" {
 						// If an empty statement is generated, then ignore it.
@@ -205,7 +205,7 @@ func registerSQLSmith(r *testRegistry) {
 					// that are because of #39433 and #40929.
 					var expectedError bool
 					for _, exp := range []string{
-						"internal error: invalid index",
+						"internal error: subquery eval: invalid index",
 						"could not parse \"0E-2019\" as type decimal",
 					} {
 						expectedError = expectedError || strings.Contains(es, exp)

@@ -53,11 +53,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	_ "github.com/cockroachdb/cockroach/pkg/storage/cloudimpl" // registers cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -549,6 +549,54 @@ func TestChangefeedUserDefinedTypes(t *testing.T) {
 	t.Run(`sinkless`, sinklessTest(testFn))
 	t.Run(`enterprise`, enterpriseTest(testFn))
 	t.Run(`kafka`, kafkaTest(testFn))
+}
+
+func TestChangefeedExternalIODisabled(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	t.Run("sinkful changefeeds not allowed with disabled external io", func(t *testing.T) {
+		disallowedSinkProtos := []string{
+			changefeedbase.SinkSchemeExperimentalSQL,
+			changefeedbase.SinkSchemeKafka,
+			changefeedbase.SinkSchemeNull, // Doesn't work because all sinkful changefeeds are disallowed
+			// Cloud sink schemes
+			"experimental-s3",
+			"experimental-gs",
+			"experimental-nodelocal",
+			"experimental-http",
+			"experimental-https",
+			"experimental-azure",
+		}
+		ctx := context.Background()
+		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+			ExternalIODirConfig: base.ExternalIODirConfig{
+				DisableOutbound: true,
+			},
+		})
+		defer s.Stopper().Stop(ctx)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, "CREATE TABLE target_table (pk INT PRIMARY KEY)")
+		for _, proto := range disallowedSinkProtos {
+			sqlDB.ExpectErr(t, "Outbound IO is disabled by configuration, cannot create changefeed",
+				"CREATE CHANGEFEED FOR target_table INTO $1",
+				fmt.Sprintf("%s://does-not-matter", proto),
+			)
+		}
+	})
+
+	withDisabledOutbound := func(args *base.TestServerArgs) { args.ExternalIODirConfig.DisableOutbound = true }
+	t.Run("sinkless changfeeds are allowed with disabled external io",
+		sinklessTestWithServerArgs(withDisabledOutbound,
+			func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+				sqlDB := sqlutils.MakeSQLRunner(db)
+				sqlDB.Exec(t, "CREATE TABLE target_table (pk INT PRIMARY KEY)")
+				sqlDB.Exec(t, "INSERT INTO target_table VALUES (1)")
+				feed := feed(t, f, "CREATE CHANGEFEED FOR target_table")
+				defer closeFeed(t, feed)
+				assertPayloads(t, feed, []string{
+					`target_table: [1]->{"after": {"pk": 1}}`,
+				})
+			}))
 }
 
 // Test how Changefeeds react to schema changes that do not require a backfill
@@ -3081,7 +3129,7 @@ func TestChangefeedTelemetry(t *testing.T) {
 	t.Run(`enterprise`, enterpriseTest(testFn))
 }
 
-func TestChangefeedMemBufferCapacity(t *testing.T) {
+func TestChangefeedMemBufferCapacityErrorRetryable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -3145,6 +3193,15 @@ func TestChangefeedMemBufferCapacity(t *testing.T) {
 				return nil
 			}
 
+			distErrCh := make(chan error, numFeeds)
+			knobs.HandleDistChangefeedError = func(err error) error {
+				// NB: do not use t.Fatal (or anything that can call that) here.
+				// This function is invoked form a different go routine -- and calling
+				// t.Fatal will likely deadlock the test.
+				distErrCh <- err
+				return MaybeStripRetryableErrorMarker(err)
+			}
+
 			sqlDB := sqlutils.MakeSQLRunner(db)
 			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 
@@ -3188,33 +3245,12 @@ func TestChangefeedMemBufferCapacity(t *testing.T) {
 				`INSERT INTO foo SELECT i, 'foofoofoo' FROM generate_series(1, $1) AS g(i)`,
 				numRows)
 
-			// We don't quite know which feed will error out first, so, just call Next on all of
-			// them and record the first error encountered.
-			firstErr := make(chan error, 1)
-			_ = ctxgroup.GroupWorkers(context.Background(), len(feeds),
-				func(ctx context.Context, i int) error {
-					_, err := feeds[i].Next()
-					if err != nil {
-						select {
-						case firstErr <- err:
-							// As soon as we get an error, close beforeEmitRowCh to unblock
-							// any other changfeeds that maybe blocked emitting rows.
-							close(beforeEmitRowCh)
-						default:
-						}
-					}
-					return err
-				})
-
-			err := <-firstErr
+			err := <-distErrCh
 			require.Regexp(t, `memory budget exceeded`, err)
+			require.True(t, IsRetryableError(err))
 		}
 	}
 
-	// The mem buffer is only used with RangeFeed.
-	t.Run(`sinkless-one-feed`, sinklessTest(memLimitTest(1)))
-	t.Run(`sinkless-two-feeds`, sinklessTest(memLimitTest(2)))
-	t.Run(`sinkless-many-feeds`, sinklessTest(memLimitTest(3)))
 	t.Run(`enterprise-one-feed`, enterpriseTest(memLimitTest(1)))
 	t.Run(`enterprise-two-feeds`, enterpriseTest(memLimitTest(2)))
 	t.Run(`enterprise-many-feeds`, enterpriseTest(memLimitTest(3)))

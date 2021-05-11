@@ -44,7 +44,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -481,7 +480,7 @@ func resolveOptionsForBackupJobDescription(
 	}
 
 	for _, uri := range kmsURIs {
-		redactedURI, err := cloudimpl.RedactKMSURI(uri)
+		redactedURI, err := cloud.RedactKMSURI(uri)
 		if err != nil {
 			return tree.BackupOptions{}, err
 		}
@@ -520,7 +519,7 @@ func GetRedactedBackupNode(
 	}
 
 	for _, t := range to {
-		sanitizedTo, err := cloudimpl.SanitizeExternalStorageURI(t, nil /* extraParams */)
+		sanitizedTo, err := cloud.SanitizeExternalStorageURI(t, nil /* extraParams */)
 		if err != nil {
 			return nil, err
 		}
@@ -528,7 +527,7 @@ func GetRedactedBackupNode(
 	}
 
 	for _, from := range incrementalFrom {
-		sanitizedFrom, err := cloudimpl.SanitizeExternalStorageURI(from, nil /* extraParams */)
+		sanitizedFrom, err := cloud.SanitizeExternalStorageURI(from, nil /* extraParams */)
 		if err != nil {
 			return nil, err
 		}
@@ -681,15 +680,15 @@ func checkPrivilegesForBackup(
 	}
 	// Check that none of the destinations require an admin role.
 	for _, uri := range to {
-		hasExplicitAuth, uriScheme, err := cloud.AccessIsWithExplicitAuth(uri)
+		conf, err := cloud.ExternalStorageConfFromURI(uri, p.User())
 		if err != nil {
 			return err
 		}
-		if !hasExplicitAuth {
+		if !conf.AccessIsWithExplicitAuth() {
 			return pgerror.Newf(
 				pgcode.InsufficientPrivilege,
 				"only users with the admin role are allowed to BACKUP to the specified %s URI",
-				uriScheme)
+				conf.Provider.String())
 		}
 	}
 

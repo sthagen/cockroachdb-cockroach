@@ -19,7 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/nullsink"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -29,20 +30,20 @@ func TestNullSinkReadAndWrite(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	dest := cloudimpl.MakeNullSinkStorageURI("foo")
+	dest := nullsink.MakeNullSinkStorageURI("foo")
 
-	conf, err := cloudimpl.ExternalStorageConfFromURI(dest, security.RootUserName())
+	conf, err := cloud.ExternalStorageConfFromURI(dest, security.RootUserName())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	s, err := cloudimpl.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, nil, nil, nil, nil)
+	s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 
-	require.Equal(t, roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_NullSink}, s.Conf())
+	require.Equal(t, roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_null}, s.Conf())
 	require.NoError(t, s.WriteFile(ctx, "", bytes.NewReader([]byte("abc"))))
 	sz, err := s.Size(ctx, "")
 	require.NoError(t, err)

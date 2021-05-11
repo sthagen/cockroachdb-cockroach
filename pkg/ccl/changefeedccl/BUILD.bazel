@@ -74,7 +74,6 @@ go_library(
         "//pkg/sql/sessiondata",
         "//pkg/sql/types",
         "//pkg/storage/cloud",
-        "//pkg/storage/cloudimpl",
         "//pkg/util",
         "//pkg/util/bufalloc",
         "//pkg/util/encoding",
@@ -195,5 +194,6 @@ go_test(
         "@com_github_shopify_sarama//:sarama",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_x_text//collate",
     ],
 )

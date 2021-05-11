@@ -138,6 +138,10 @@ func (c clustersOpt) validate() error {
 	return nil
 }
 
+type testOpts struct {
+	versionsBinaryOverride map[string]string
+}
+
 // Run runs tests.
 //
 // Args:
@@ -155,7 +159,7 @@ func (r *testRunner) Run(
 	count int,
 	parallelism int,
 	clustersOpt clustersOpt,
-	artifactsDir string,
+	topt testOpts,
 	lopt loggingOpt,
 ) error {
 	// Validate options.
@@ -288,6 +292,7 @@ func (r *testRunner) Run(
 				clustersOpt.keepClustersOnTestFailure,
 				lopt.artifactsDir, lopt.runnerLogPath, lopt.tee, lopt.stdout,
 				allocateCluster,
+				topt,
 				l,
 			); err != nil {
 				// A worker returned an error. Let's shut down.
@@ -369,6 +374,7 @@ func (r *testRunner) runWorker(
 	teeOpt teeOptType,
 	stdout io.Writer,
 	allocateCluster clusterAllocatorFn,
+	topt testOpts,
 	l *logger,
 ) error {
 	ctx = logtags.AddTag(ctx, name, nil /* value */)
@@ -463,11 +469,12 @@ func (r *testRunner) runWorker(
 			return err
 		}
 		t := &test{
-			spec:          &testToRun.spec,
-			buildVersion:  r.buildVersion,
-			artifactsDir:  artifactsDir,
-			artifactsSpec: artifactsSpec,
-			l:             testL,
+			spec:                   &testToRun.spec,
+			buildVersion:           r.buildVersion,
+			artifactsDir:           artifactsDir,
+			artifactsSpec:          artifactsSpec,
+			l:                      testL,
+			versionsBinaryOverride: topt.versionsBinaryOverride,
 		}
 		// Tell the cluster that, from now on, it will be run "on behalf of this
 		// test".
@@ -1094,10 +1101,15 @@ func (r *testRunner) serveHTTP(wr http.ResponseWriter, req *http.Request) {
 		var clusterName, clusterAdminUIAddr string
 		if w.Cluster() != nil {
 			clusterName = w.Cluster().name
-			clusterAdminUIAddr = w.Cluster().ExternalAdminUIAddr(
+			addrs, err := w.Cluster().ExternalAdminUIAddrE(
 				req.Context(),
 				w.Cluster().Node(1),
-			)[0]
+			)
+			// We drop the error on the floor; it's unclear what to do with it and we
+			// don't have a logger handy.
+			if err == nil {
+				clusterAdminUIAddr = addrs[0]
+			}
 		}
 		t := w.Test()
 		testStatus := "N/A"
@@ -1198,8 +1210,8 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// map.
 	verMap := map[string]string{
 		"21.2": "21.1.0-beta.5",
-		"21.1": "20.2.8",
-		"20.2": "20.1.15",
+		"21.1": "20.2.9",
+		"20.2": "20.1.16",
 		"20.1": "19.2.11",
 		"19.2": "19.1.11",
 		"19.1": "2.1.9",

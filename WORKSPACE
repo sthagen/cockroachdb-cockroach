@@ -122,7 +122,7 @@ yarn_install(
 # NB: @bazel_skylib comes from go_rules_dependencies().
 load("@bazel_skylib//lib:versions.bzl", "versions")
 
-versions.check(minimum_bazel_version = "3.5.0")
+versions.check(minimum_bazel_version = "4.0.0")
 
 # Load gazelle dependencies.
 load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies")
@@ -135,7 +135,7 @@ gazelle_dependencies()
 #      https://github.com/bazelbuild/bazel-gazelle/issues/591
 git_repository(
     name = "com_google_protobuf",
-    commit = "9b23a34c7275aa0ceb2fc69ed1ae6737b34656a3",
+    commit = "e809d75ecb5770fdc531081eef306b3e672bcdd2",
     remote = "https://github.com/cockroachdb/protobuf",
 )
 
@@ -166,11 +166,11 @@ c_deps()
 # aforementioned PRs.
 git_repository(
     name = "rules_foreign_cc",
-    commit = "6127817283221408069d4ae6765f2d8144f09b9f",
+    commit = "a3b0e5eaa723259458f5c85285f58e46ae7f25a2",
     remote = "https://github.com/cockroachdb/rules_foreign_cc",
 )
 
-load("@rules_foreign_cc//:workspace_definitions.bzl", "rules_foreign_cc_dependencies")
+load("@rules_foreign_cc//foreign_cc:repositories.bzl", "rules_foreign_cc_dependencies")
 
 rules_foreign_cc_dependencies()
 

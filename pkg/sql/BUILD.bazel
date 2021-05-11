@@ -1,5 +1,6 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
+load("//pkg/util/fsm/gen:REPORTS.bzl", "gen_reports")
 
 go_library(
     name = "sql",
@@ -252,7 +253,7 @@ go_library(
         "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvclient/rangecache",
         "//pkg/kv/kvclient/rangefeed",
-        "//pkg/kv/kvserver",
+        "//pkg/kv/kvserver/kvserverbase",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/protectedts",
         "//pkg/migration",
@@ -497,10 +498,13 @@ go_test(
     ],
     data = glob(["testdata/**"]) + [
         "@cockroach//c-deps:libgeos",
+        "//pkg/sql:pg_catalog.go",
+        "//pkg/sql/vtable:pg_catalog.go",
     ],
     embed = [":sql"],
     deps = [
         "//pkg/base",
+        "//pkg/build/bazel",
         "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/clusterversion",
         "//pkg/config",
@@ -571,6 +575,7 @@ go_test(
         "//pkg/sql/types",
         "//pkg/sqlmigrations",
         "//pkg/storage",
+        "//pkg/storage/cloudimpl",
         "//pkg/testutils",
         "//pkg/testutils/buildutil",
         "//pkg/testutils/jobutils",
@@ -650,4 +655,11 @@ stringer(
     name = "gen-nodestatus-stringer",
     src = "distsql_physical_planner.go",
     typ = "NodeStatus",
+)
+
+gen_reports(
+    name = "txnstatetransitions_report",
+    dep = "//pkg/sql",
+    starting_state_name = "stateNoTxn",
+    transitions_variable = "TxnStateTransitions",
 )

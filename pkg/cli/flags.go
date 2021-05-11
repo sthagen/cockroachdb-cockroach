@@ -251,7 +251,7 @@ func init() {
 	// multi-tenancy related commands that start long-running servers.
 	// Also for `connect` which does not really start a server but uses
 	// all the networking flags.
-	for _, cmd := range append(serverCmds, connectCmd) {
+	for _, cmd := range append(serverCmds, connectInitCmd, connectJoinCmd) {
 		AddPersistentPreRunE(cmd, func(cmd *cobra.Command, _ []string) error {
 			// Finalize the configuration of network settings.
 			return extraServerFlagInit(cmd)
@@ -296,7 +296,8 @@ func init() {
 	// Logging flags common to all commands.
 	{
 		// Logging configuration.
-		varFlag(pf, &cliCtx.logConfigInput, cliflags.Log)
+		varFlag(pf, &stringValue{settableString: &cliCtx.logConfigInput}, cliflags.Log)
+		varFlag(pf, &fileContentsValue{settableString: &cliCtx.logConfigInput, fileName: "<unset>"}, cliflags.LogConfigFile)
 
 		// Pre-v21.1 overrides. Deprecated.
 		// TODO(knz): Remove this.
@@ -310,7 +311,7 @@ func init() {
 		_ = pf.MarkDeprecated(cliflags.DeprecatedStderrNoColor.Name,
 			"use --"+cliflags.Log.Name+" instead to specify 'sinks: {stderr: {no-color: true}}'")
 
-		varFlag(pf, &cliCtx.deprecatedLogOverrides.logDir, cliflags.DeprecatedLogDir)
+		varFlag(pf, &stringValue{&cliCtx.deprecatedLogOverrides.logDir}, cliflags.DeprecatedLogDir)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedLogDir.Name,
 			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {dir: ...}'")
 
@@ -330,7 +331,7 @@ func init() {
 		_ = pf.MarkDeprecated(cliflags.DeprecatedRedactableLogs.Name,
 			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {redactable: ...}")
 
-		varFlag(pf, &cliCtx.deprecatedLogOverrides.sqlAuditLogDir, cliflags.DeprecatedSQLAuditLogDir)
+		varFlag(pf, &stringValue{&cliCtx.deprecatedLogOverrides.sqlAuditLogDir}, cliflags.DeprecatedSQLAuditLogDir)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedSQLAuditLogDir.Name,
 			"use --"+cliflags.Log.Name+" instead to specify 'sinks: {file-groups: {sql-audit: {channels: SENSITIVE_ACCESS, dir: ...}}}")
 	}
@@ -339,8 +340,9 @@ func init() {
 	// avoid printing some messages to standard output in that case.
 	_, startCtx.inBackground = envutil.EnvString(backgroundEnvVar, 1)
 
-	// Flags common to the start commands and the connect command.
-	for _, cmd := range append(StartCmds, connectCmd) {
+	// Flags common to the start commands, the connect command, and the node join
+	// command.
+	for _, cmd := range append(StartCmds, connectInitCmd, connectJoinCmd) {
 		f := cmd.Flags()
 
 		varFlag(f, addrSetter{&startCtx.serverListenAddr, &serverListenPort}, cliflags.ListenAddr)
@@ -359,6 +361,11 @@ func init() {
 		// 'start' will check that the flag is properly defined.
 		varFlag(f, &serverCfg.JoinList, cliflags.Join)
 		boolFlag(f, &serverCfg.JoinPreferSRVRecords, cliflags.JoinPreferSRVRecords)
+	}
+
+	// Flags common to the start commands and the connect command.
+	for _, cmd := range append(StartCmds, connectInitCmd) {
+		f := cmd.Flags()
 
 		// The initialization token and expected peers. For 'start' commands this is optional.
 		stringFlag(f, &startCtx.initToken, cliflags.InitToken)

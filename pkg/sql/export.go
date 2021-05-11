@@ -136,11 +136,11 @@ func (ef *execFactory) ConstructExport(
 		panic(err)
 	}
 	if !admin {
-		hasExplicitAuth, _, err := cloud.AccessIsWithExplicitAuth(string(*destination))
+		conf, err := cloud.ExternalStorageConfFromURI(string(*destination), ef.planner.User())
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		if !hasExplicitAuth {
+		if !conf.AccessIsWithExplicitAuth() {
 			panic(pgerror.Newf(
 				pgcode.InsufficientPrivilege,
 				"only users with the admin role are allowed to EXPORT to the specified URI"))

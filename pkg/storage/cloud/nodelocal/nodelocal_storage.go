@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package cloudimpl
+package nodelocal
 
 import (
 	"context"
@@ -31,7 +31,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func parseNodelocalURL(_ ExternalStorageURIContext, uri *url.URL) (roachpb.ExternalStorage, error) {
+func parseNodelocalURL(
+	_ cloud.ExternalStorageURIContext, uri *url.URL,
+) (roachpb.ExternalStorage, error) {
 	conf := roachpb.ExternalStorage{}
 	if uri.Host == "" {
 		return conf, errors.Errorf(
@@ -47,7 +49,7 @@ func parseNodelocalURL(_ ExternalStorageURIContext, uri *url.URL) (roachpb.Exter
 	if err != nil {
 		return conf, errors.Errorf("host component of nodelocal URI must be a node ID: %s", uri.String())
 	}
-	conf.Provider = roachpb.ExternalStorageProvider_LocalFile
+	conf.Provider = roachpb.ExternalStorageProvider_nodelocal
 	conf.LocalFile.Path = uri.Path
 	conf.LocalFile.NodeID = roachpb.NodeID(nodeID)
 	return conf, nil
@@ -82,12 +84,12 @@ func TestingMakeLocalStorage(
 	blobClientFactory blobs.BlobClientFactory,
 	ioConf base.ExternalIODirConfig,
 ) (cloud.ExternalStorage, error) {
-	args := ExternalStorageContext{IOConf: ioConf, BlobClientFactory: blobClientFactory, Settings: settings}
+	args := cloud.ExternalStorageContext{IOConf: ioConf, BlobClientFactory: blobClientFactory, Settings: settings}
 	return makeLocalStorage(ctx, args, roachpb.ExternalStorage{LocalFile: cfg})
 }
 
 func makeLocalStorage(
-	ctx context.Context, args ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.nodelocal")
 	if args.BlobClientFactory == nil {
@@ -107,7 +109,7 @@ func makeLocalStorage(
 
 func (l *localFileStorage) Conf() roachpb.ExternalStorage {
 	return roachpb.ExternalStorage{
-		Provider:  roachpb.ExternalStorageProvider_LocalFile,
+		Provider:  roachpb.ExternalStorageProvider_nodelocal,
 		LocalFile: l.cfg,
 	}
 }
@@ -159,7 +161,7 @@ func (l *localFileStorage) ListFiles(ctx context.Context, patternSuffix string) 
 
 	pattern := l.base
 	if patternSuffix != "" {
-		if containsGlob(l.base) {
+		if cloud.ContainsGlob(l.base) {
 			return nil, errors.New("prefix cannot contain globs pattern when passing an explicit pattern")
 		}
 		pattern = joinRelativePath(pattern, patternSuffix)
@@ -200,4 +202,9 @@ func (l *localFileStorage) Size(ctx context.Context, basename string) (int64, er
 
 func (*localFileStorage) Close() error {
 	return nil
+}
+
+func init() {
+	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_nodelocal,
+		parseNodelocalURL, makeLocalStorage, cloud.RedactedParams(), "nodelocal")
 }

@@ -32,7 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/httpsink"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -86,7 +87,7 @@ func TestPutHttp(t *testing.T) {
 
 		u := testSettings.MakeUpdater()
 		if err := u.Set(
-			cloudimpl.CloudstorageHTTPCASetting,
+			"cloudstorage.http.custom_ca",
 			string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})),
 			"s",
 		); err != nil {
@@ -95,7 +96,7 @@ func TestPutHttp(t *testing.T) {
 
 		cleanup := func() {
 			srv.Close()
-			if err := u.Set(cloudimpl.CloudstorageHTTPCASetting, "", "s"); err != nil {
+			if err := u.Set("cloudstorage.http.custom_ca", "", "s"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -149,11 +150,11 @@ func TestPutHttp(t *testing.T) {
 		srv, _, cleanup := makeServer()
 		defer cleanup()
 
-		conf, err := cloudimpl.ExternalStorageConfFromURI(srv.String(), user)
+		conf, err := cloud.ExternalStorageConfFromURI(srv.String(), user)
 		if err != nil {
 			t.Fatal(err)
 		}
-		s, err := cloudimpl.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{},
+		s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{},
 			testSettings, blobs.TestEmptyBlobClientFactory, nil, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -195,12 +196,12 @@ func TestHttpGet(t *testing.T) {
 	data := []byte("to serve, or not to serve.  c'est la question")
 
 	defer func(opts retry.Options) {
-		cloudimpl.HTTPRetryOptions = opts
-	}(cloudimpl.HTTPRetryOptions)
+		cloud.HTTPRetryOptions = opts
+	}(cloud.HTTPRetryOptions)
 
-	cloudimpl.HTTPRetryOptions.InitialBackoff = 1 * time.Microsecond
-	cloudimpl.HTTPRetryOptions.MaxBackoff = 10 * time.Millisecond
-	cloudimpl.HTTPRetryOptions.MaxRetries = 25
+	cloud.HTTPRetryOptions.InitialBackoff = 1 * time.Microsecond
+	cloud.HTTPRetryOptions.MaxBackoff = 10 * time.Millisecond
+	cloud.HTTPRetryOptions.MaxRetries = 25
 
 	for _, tc := range []int{1, 2, 5, 16, 32, len(data) - 1, len(data)} {
 		t.Run(fmt.Sprintf("read-%d", tc), func(t *testing.T) {
@@ -248,7 +249,7 @@ func TestHttpGet(t *testing.T) {
 			})
 
 			conf := roachpb.ExternalStorage{HttpPath: roachpb.ExternalStorage_Http{BaseUri: s.URL}}
-			store, err := cloudimpl.MakeHTTPStorage(ctx, cloudimpl.ExternalStorageContext{Settings: testSettings}, conf)
+			store, err := httpsink.MakeHTTPStorage(ctx, cloud.ExternalStorageContext{Settings: testSettings}, conf)
 			require.NoError(t, err)
 
 			var file io.ReadCloser
@@ -284,7 +285,7 @@ func TestHttpGetWithCancelledContext(t *testing.T) {
 	defer s.Close()
 
 	conf := roachpb.ExternalStorage{HttpPath: roachpb.ExternalStorage_Http{BaseUri: s.URL}}
-	store, err := cloudimpl.MakeHTTPStorage(context.Background(), cloudimpl.ExternalStorageContext{Settings: testSettings}, conf)
+	store, err := httpsink.MakeHTTPStorage(context.Background(), cloud.ExternalStorageContext{Settings: testSettings}, conf)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, store.Close())
@@ -302,9 +303,9 @@ func TestCanDisableHttp(t *testing.T) {
 	conf := base.ExternalIODirConfig{
 		DisableHTTP: true,
 	}
-	s, err := cloudimpl.MakeExternalStorage(
+	s, err := cloud.MakeExternalStorage(
 		context.Background(),
-		roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_Http},
+		roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_http},
 		conf, testSettings, blobs.TestEmptyBlobClientFactory, nil, nil)
 	require.Nil(t, s)
 	require.Error(t, err)
@@ -316,12 +317,12 @@ func TestCanDisableOutbound(t *testing.T) {
 		DisableOutbound: true,
 	}
 	for _, provider := range []roachpb.ExternalStorageProvider{
-		roachpb.ExternalStorageProvider_Http,
-		roachpb.ExternalStorageProvider_S3,
-		roachpb.ExternalStorageProvider_GoogleCloud,
-		roachpb.ExternalStorageProvider_LocalFile,
+		roachpb.ExternalStorageProvider_http,
+		roachpb.ExternalStorageProvider_s3,
+		roachpb.ExternalStorageProvider_gs,
+		roachpb.ExternalStorageProvider_nodelocal,
 	} {
-		s, err := cloudimpl.MakeExternalStorage(
+		s, err := cloud.MakeExternalStorage(
 			context.Background(),
 			roachpb.ExternalStorage{Provider: provider},
 			conf, testSettings, blobs.TestEmptyBlobClientFactory, nil, nil)
@@ -348,9 +349,9 @@ func TestExternalStorageCanUseHTTPProxy(t *testing.T) {
 		http.DefaultTransport.(*http.Transport).Proxy = nil
 	}()
 
-	conf, err := cloudimpl.ExternalStorageConfFromURI("http://my-server", security.RootUserName())
+	conf, err := cloud.ExternalStorageConfFromURI("http://my-server", security.RootUserName())
 	require.NoError(t, err)
-	s, err := cloudimpl.MakeExternalStorage(
+	s, err := cloud.MakeExternalStorage(
 		context.Background(), conf, base.ExternalIODirConfig{}, testSettings, nil,
 		nil, nil)
 	require.NoError(t, err)
@@ -392,15 +393,15 @@ func TestExhaustRetries(t *testing.T) {
 
 	// Override retry options to retry faster.
 	defer func(opts retry.Options) {
-		cloudimpl.HTTPRetryOptions = opts
-	}(cloudimpl.HTTPRetryOptions)
+		cloud.HTTPRetryOptions = opts
+	}(cloud.HTTPRetryOptions)
 
-	cloudimpl.HTTPRetryOptions.InitialBackoff = 1 * time.Microsecond
-	cloudimpl.HTTPRetryOptions.MaxBackoff = 10 * time.Millisecond
-	cloudimpl.HTTPRetryOptions.MaxRetries = 10
+	cloud.HTTPRetryOptions.InitialBackoff = 1 * time.Microsecond
+	cloud.HTTPRetryOptions.MaxBackoff = 10 * time.Millisecond
+	cloud.HTTPRetryOptions.MaxRetries = 10
 
 	conf := roachpb.ExternalStorage{HttpPath: roachpb.ExternalStorage_Http{BaseUri: "http://does.not.matter"}}
-	store, err := cloudimpl.MakeHTTPStorage(context.Background(), cloudimpl.ExternalStorageContext{Settings: testSettings}, conf)
+	store, err := httpsink.MakeHTTPStorage(context.Background(), cloud.ExternalStorageContext{Settings: testSettings}, conf)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, store.Close())

@@ -54,7 +54,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -238,7 +237,7 @@ func importJobDescription(
 	stmt.CreateDefs = defs
 	stmt.Files = nil
 	for _, file := range files {
-		clean, err := cloudimpl.SanitizeExternalStorageURI(file, nil /* extraParams */)
+		clean, err := cloud.SanitizeExternalStorageURI(file, nil /* extraParams */)
 		if err != nil {
 			return "", err
 		}
@@ -355,13 +354,18 @@ func importPlanHook(
 		// Certain ExternalStorage URIs require super-user access. Check all the
 		// URIs passed to the IMPORT command.
 		for _, file := range filenamePatterns {
-			hasExplicitAuth, uriScheme, err := cloud.AccessIsWithExplicitAuth(file)
+			conf, err := cloud.ExternalStorageConfFromURI(file, p.User())
 			if err != nil {
+				// If it is a workload URI, it won't parse as a storage config, but it
+				// also doesn't have any auth concerns so just continue.
+				if _, workloadErr := parseWorkloadConfig(file); workloadErr == nil {
+					continue
+				}
 				return err
 			}
-			if !hasExplicitAuth {
+			if !conf.AccessIsWithExplicitAuth() {
 				err := p.RequireAdminRole(ctx,
-					fmt.Sprintf("IMPORT from the specified %s URI", uriScheme))
+					fmt.Sprintf("IMPORT from the specified %s URI", conf.Provider.String()))
 				if err != nil {
 					return err
 				}
@@ -373,7 +377,7 @@ func importPlanHook(
 			files = filenamePatterns
 		} else {
 			for _, file := range filenamePatterns {
-				if cloudimpl.URINeedsGlobExpansion(file) {
+				if cloud.URINeedsGlobExpansion(file) {
 					s, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, file, p.User())
 					if err != nil {
 						return err
@@ -1673,7 +1677,7 @@ func (u *unsupportedStmtLogger) flush() error {
 		return nil
 	}
 
-	conf, err := cloudimpl.ExternalStorageConfFromURI(u.ignoreUnsupportedLogDest, u.user)
+	conf, err := cloud.ExternalStorageConfFromURI(u.ignoreUnsupportedLogDest, u.user)
 	if err != nil {
 		return errors.Wrap(err, "failed to log unsupported stmts during IMPORT PGDUMP")
 	}

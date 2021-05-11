@@ -56,7 +56,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/userfile"
+	_ "github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -1533,8 +1534,8 @@ func TestImportRowLimit(t *testing.T) {
 		{
 			name: "pgdump single table with insert",
 			typ:  "PGDUMP",
-			data: `CREATE TABLE t (a INT, b INT);		
-				INSERT INTO t (a, b) VALUES (1, 2), (3, 4);		
+			data: `CREATE TABLE t (a INT, b INT);
+				INSERT INTO t (a, b) VALUES (1, 2), (3, 4);
 				`,
 			with:        `WITH row_limit = '1'`,
 			verifyQuery: `SELECT * from t`,
@@ -1543,11 +1544,11 @@ func TestImportRowLimit(t *testing.T) {
 		{
 			name: "pgdump multiple inserts same table",
 			typ:  "PGDUMP",
-			data: `CREATE TABLE t (a INT, b INT);		
-				INSERT INTO t (a, b) VALUES (1, 2);		
-				INSERT INTO t (a, b) VALUES (3, 4);		
-				INSERT INTO t (a, b) VALUES (5, 6);		
-				INSERT INTO t (a, b) VALUES (7, 8);		
+			data: `CREATE TABLE t (a INT, b INT);
+				INSERT INTO t (a, b) VALUES (1, 2);
+				INSERT INTO t (a, b) VALUES (3, 4);
+				INSERT INTO t (a, b) VALUES (5, 6);
+				INSERT INTO t (a, b) VALUES (7, 8);
 				`,
 			with:        `WITH row_limit = '2'`,
 			verifyQuery: `SELECT * from t`,
@@ -1557,8 +1558,8 @@ func TestImportRowLimit(t *testing.T) {
 		{
 			name: "mysqldump single table",
 			typ:  "MYSQLDUMP",
-			data: `CREATE TABLE t (a INT, b INT);		
-				INSERT INTO t (a, b) VALUES (5, 6), (7, 8);		
+			data: `CREATE TABLE t (a INT, b INT);
+				INSERT INTO t (a, b) VALUES (5, 6), (7, 8);
 				`,
 			with:        `WITH row_limit = '1'`,
 			verifyQuery: `SELECT * from t`,
@@ -1567,11 +1568,11 @@ func TestImportRowLimit(t *testing.T) {
 		{
 			name: "mysqldump multiple inserts same table",
 			typ:  "MYSQLDUMP",
-			data: `CREATE TABLE t (a INT, b INT);		
-				INSERT INTO t (a, b) VALUES (1, 2);		
-				INSERT INTO t (a, b) VALUES (3, 4);		
-				INSERT INTO t (a, b) VALUES (5, 6);		
-				INSERT INTO t (a, b) VALUES (7, 8);		
+			data: `CREATE TABLE t (a INT, b INT);
+				INSERT INTO t (a, b) VALUES (1, 2);
+				INSERT INTO t (a, b) VALUES (3, 4);
+				INSERT INTO t (a, b) VALUES (5, 6);
+				INSERT INTO t (a, b) VALUES (7, 8);
 				`,
 			with:        `WITH row_limit = '2'`,
 			verifyQuery: `SELECT * from t`,
@@ -1656,11 +1657,11 @@ func TestImportRowLimit(t *testing.T) {
 
 		var numRows int
 		expectedRowLimit := 1
-		data = `CREATE TABLE t (a INT, b INT);	
-				CREATE TABLE u (a INT);	
-				INSERT INTO t (a, b) VALUES (1, 2);		
-				INSERT INTO u (a) VALUES (100);		
-				INSERT INTO t (a, b) VALUES (7, 8);		
+		data = `CREATE TABLE t (a INT, b INT);
+				CREATE TABLE u (a INT);
+				INSERT INTO t (a, b) VALUES (1, 2);
+				INSERT INTO u (a) VALUES (100);
+				INSERT INTO t (a, b) VALUES (7, 8);
 				INSERT INTO u (a) VALUES (600);`
 
 		importDumpQuery := fmt.Sprintf(`IMPORT PGDUMP ($1) WITH row_limit="%d"`, expectedRowLimit)
@@ -2403,12 +2404,12 @@ func TestImportObjectLevelRBAC(t *testing.T) {
 
 	qualifiedTableName := "defaultdb.public.user_file_table_test"
 	filename := "path/to/file"
-	dest := cloudimpl.MakeUserFileStorageURI(qualifiedTableName, filename)
+	dest := userfile.MakeUserFileStorageURI(qualifiedTableName, filename)
 
 	writeToUserfile := func(filename string) {
 		// Write to userfile storage now that testuser has CREATE privileges.
 		ie := tc.Server(0).InternalExecutor().(*sql.InternalExecutor)
-		fileTableSystem1, err := cloudimpl.ExternalStorageFromURI(ctx, dest, base.ExternalIODirConfig{},
+		fileTableSystem1, err := cloud.ExternalStorageFromURI(ctx, dest, base.ExternalIODirConfig{},
 			cluster.NoSettings, blobs.TestEmptyBlobClientFactory, security.TestUserName(), ie, tc.Server(0).DB())
 		require.NoError(t, err)
 		require.NoError(t, fileTableSystem1.WriteFile(ctx, filename, bytes.NewReader([]byte("1,aaa"))))
@@ -2566,13 +2567,9 @@ func TestURIRequiresAdminRole(t *testing.T) {
 		})
 
 		t.Run(tc.name+"-direct", func(t *testing.T) {
-			requires, scheme, err := cloud.AccessIsWithExplicitAuth(tc.uri)
+			conf, err := cloud.ExternalStorageConfFromURI(tc.uri, security.RootUserName())
 			require.NoError(t, err)
-			require.Equal(t, requires, !tc.requiresAdmin)
-
-			url, err := url.Parse(tc.uri)
-			require.NoError(t, err)
-			require.Equal(t, scheme, url.Scheme)
+			require.Equal(t, conf.AccessIsWithExplicitAuth(), !tc.requiresAdmin)
 		})
 	}
 }
@@ -5869,7 +5866,7 @@ func TestImportPgDumpIgnoredStmts(t *testing.T) {
 		sqlDB.CheckQueryResults(t, "SELECT * FROM foo", [][]string{{"1"}, {"2"}, {"3"}})
 
 		// Read the unsupported log and verify its contents.
-		store, err := cloudimpl.ExternalStorageFromURI(ctx, ignoredLog,
+		store, err := cloud.ExternalStorageFromURI(ctx, ignoredLog,
 			base.ExternalIODirConfig{},
 			tc.Servers[0].ClusterSettings(),
 			blobs.TestEmptyBlobClientFactory,
@@ -6123,7 +6120,7 @@ func TestImportPgDumpSchemas(t *testing.T) {
 		expectedTableName := "test"
 		expectedTableName2 := "test2"
 		expectedSeqName := "testseq"
-		sqlDB.CheckQueryResults(t, `SELECT schema_name, 
+		sqlDB.CheckQueryResults(t, `SELECT schema_name,
 table_name FROM [SHOW TABLES] ORDER BY (schema_name, table_name)`,
 			[][]string{{"bar", expectedTableName}, {"bar", expectedTableName2}, {"bar", expectedSeqName},
 				{"baz", expectedTableName}, {"foo", expectedTableName}, {"public", expectedTableName}})
@@ -6178,7 +6175,7 @@ table_name FROM [SHOW TABLES] ORDER BY (schema_name, table_name)`,
 			// Check that we have a test table in each schema with the expected content.
 			expectedContent := [][]string{{"1", "abc"}, {"2", "def"}}
 			expectedTableName := "test"
-			sqlDB.CheckQueryResults(t, `SELECT schema_name, 
+			sqlDB.CheckQueryResults(t, `SELECT schema_name,
 table_name FROM [SHOW TABLES] ORDER BY (schema_name, table_name)`,
 				[][]string{{"public", expectedTableName}})
 
@@ -6546,7 +6543,7 @@ func TestImportMultiRegion(t *testing.T) {
 
 	baseDir := filepath.Join("testdata")
 	_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
-		t, 1 /* numServers */, base.TestingKnobs{}, &baseDir,
+		t, 1 /* numServers */, base.TestingKnobs{}, multiregionccltestutils.WithBaseDirectory(baseDir),
 	)
 	defer cleanup()
 
@@ -6736,7 +6733,7 @@ func TestMultiRegionExportImportRoundTrip(t *testing.T) {
 	defer dirCleanup()
 
 	_, sqlDB, clusterCleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
-		t, 3 /* numServers */, base.TestingKnobs{}, &baseDir)
+		t, 3 /* numServers */, base.TestingKnobs{}, multiregionccltestutils.WithBaseDirectory(baseDir))
 	defer clusterCleanup()
 
 	_, err := sqlDB.Exec(`SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
@@ -6762,7 +6759,7 @@ CREATE TABLE destination_fake_rbr (crdb_region public.crdb_internal_region NOT N
  FROM SELECT crdb_region, i from original_rbr;`)
 	require.NoError(t, err)
 
-	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://0/original_rbr_default' 
+	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://0/original_rbr_default'
 FROM TABLE original_rbr;`)
 	require.NoError(t, err)
 
@@ -6787,7 +6784,7 @@ FROM TABLE original_rbr;`)
  crdb_region SET DEFAULT default_to_database_primary_region(gateway_region())::public.crdb_internal_region;`)
 	require.NoError(t, err)
 
-	_, err = sqlDB.Exec(`ALTER TABLE destination_fake_rbr SET LOCALITY 
+	_, err = sqlDB.Exec(`ALTER TABLE destination_fake_rbr SET LOCALITY
  REGIONAL BY ROW AS crdb_region;`)
 	require.NoError(t, err)
 

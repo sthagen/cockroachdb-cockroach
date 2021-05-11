@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -58,7 +59,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/amazon"
+	_ "github.com/cockroachdb/cockroach/pkg/storage/cloudimpl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -102,6 +104,33 @@ type datadrivenTestState struct {
 	cleanupFns []func()
 }
 
+var localityCfgs = map[string]roachpb.Locality{
+	"us-east-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-east-1"},
+			{Key: "availability-zone", Value: "us-east1"},
+		},
+	},
+	"us-west-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-west-1"},
+			{Key: "availability-zone", Value: "us-west1"},
+		},
+	},
+	"eu-central-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-central-1"},
+			{Key: "availability-zone", Value: "eu-central-1"},
+		},
+	},
+	"eu-north-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-north-1"},
+			{Key: "availability-zone", Value: "eu-north-1"},
+		},
+	},
+}
+
 func (d *datadrivenTestState) cleanup(ctx context.Context) {
 	for _, db := range d.sqlDBs {
 		db.Close()
@@ -115,7 +144,10 @@ func (d *datadrivenTestState) cleanup(ctx context.Context) {
 }
 
 func (d *datadrivenTestState) addServer(
-	t *testing.T, name, iodir, tempCleanupFrequency string, allowImplicitAccess bool,
+	t *testing.T,
+	name, iodir, tempCleanupFrequency string,
+	allowImplicitAccess bool,
+	localities string,
 ) error {
 	var tc serverutils.TestClusterInterface
 	var cleanup func()
@@ -134,10 +166,24 @@ func (d *datadrivenTestState) addServer(
 		sql.TempObjectCleanupInterval.Override(&settings.SV, duration)
 		params.ServerArgs.Settings = settings
 	}
+
+	clusterSize := singleNode
+
+	if localities != "" {
+		cfgs := strings.Split(localities, ",")
+		clusterSize = len(cfgs)
+		serverArgsPerNode := make(map[int]base.TestServerArgs)
+		for i, cfg := range cfgs {
+			param := params.ServerArgs
+			param.Locality = localityCfgs[cfg]
+			serverArgsPerNode[i] = param
+		}
+		params.ServerArgsPerNode = serverArgsPerNode
+	}
 	if iodir == "" {
-		_, tc, _, iodir, cleanup = backupRestoreTestSetupWithParams(t, singleNode, 0, InitManualReplication, params)
+		_, tc, _, iodir, cleanup = backupRestoreTestSetupWithParams(t, clusterSize, 0, InitManualReplication, params)
 	} else {
-		_, tc, _, cleanup = backupRestoreTestSetupEmptyWithParams(t, singleNode, iodir, InitManualReplication, params)
+		_, tc, _, cleanup = backupRestoreTestSetupEmptyWithParams(t, clusterSize, iodir, InitManualReplication, params)
 	}
 	d.servers[name] = tc.Server(0)
 	d.dataDirs[name] = iodir
@@ -219,7 +265,7 @@ func TestBackupRestoreDataDriven(t *testing.T) {
 				ds = newDatadrivenTestState()
 				return ""
 			case "new-server":
-				var name, shareDirWith, iodir, tempCleanupFrequency string
+				var name, shareDirWith, iodir, tempCleanupFrequency, localities string
 				var allowImplicitAccess bool
 				d.ScanArgs(t, "name", &name)
 				if d.HasArg("share-io-dir") {
@@ -234,8 +280,11 @@ func TestBackupRestoreDataDriven(t *testing.T) {
 				if d.HasArg("temp-cleanup-freq") {
 					d.ScanArgs(t, "temp-cleanup-freq", &tempCleanupFrequency)
 				}
+				if d.HasArg("localities") {
+					d.ScanArgs(t, "localities", &localities)
+				}
 				lastCreatedServer = name
-				err := ds.addServer(t, name, iodir, tempCleanupFrequency, allowImplicitAccess)
+				err := ds.addServer(t, name, iodir, tempCleanupFrequency, allowImplicitAccess, localities)
 				if err != nil {
 					return err.Error()
 				}
@@ -401,42 +450,49 @@ func TestBackupRestorePartitioned(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 1000
-	ctx, tc, sqlDB, dir, cleanupFn := BackupRestoreTestSetup(t, MultiNode, numAccounts, InitManualReplication)
+
+	args := base.TestClusterArgs{
+		ServerArgsPerNode: map[int]base.TestServerArgs{
+			0: {
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
+					{Key: "region", Value: "west"},
+					// NB: This has the same value as an az in the east region
+					// on purpose.
+					{Key: "az", Value: "az1"},
+					{Key: "dc", Value: "dc1"},
+				}},
+			},
+			1: {
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
+					{Key: "region", Value: "east"},
+					// NB: This has the same value as an az in the west region
+					// on purpose.
+					{Key: "az", Value: "az1"},
+					{Key: "dc", Value: "dc2"},
+				}},
+			},
+			2: {
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
+					{Key: "region", Value: "east"},
+					{Key: "az", Value: "az2"},
+					{Key: "dc", Value: "dc3"},
+				}},
+			},
+		},
+	}
+
+	ctx, _, sqlDB, dir, cleanupFn := backupRestoreTestSetupWithParams(t, 3 /* nodes */, numAccounts, InitManualReplication, args)
 	defer cleanupFn()
 
-	// Ensure that each node has at least one leaseholder. (These splits were
-	// made in BackupRestoreTestSetup.) These are wrapped with SucceedsSoon()
-	// because EXPERIMENTAL_RELOCATE can fail if there are other replication
-	// changes happening.
-	for _, stmt := range []string{
-		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 0)`,
-		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 100)`,
-		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[3], 200)`,
-	} {
-		testutils.SucceedsSoon(t, func() error {
-			_, err := sqlDB.DB.ExecContext(ctx, stmt)
-			return err
-		})
+	// locationToDir converts backup URIs based on LocalFoo to the temporary
+	// file it represents on disk.
+	locationToDir := func(location string) string {
+		return strings.Replace(location, LocalFoo, filepath.Join(dir, "foo"), 1)
 	}
-	const localFoo1 = LocalFoo + "/1"
-	const localFoo2 = LocalFoo + "/2"
-	const localFoo3 = LocalFoo + "/3"
-	backupURIs := []string{
-		fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", localFoo1, url.QueryEscape("default")),
-		fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", localFoo2, url.QueryEscape("dc=dc1")),
-		fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", localFoo3, url.QueryEscape("dc=dc2")),
-	}
-	restoreURIs := []string{
-		localFoo1,
-		localFoo2,
-		localFoo3,
-	}
-	backupAndRestore(ctx, t, tc, backupURIs, restoreURIs, numAccounts)
 
-	// Verify that at least one SST exists in each backup destination.
-	sstMatcher := regexp.MustCompile(`\d+\.sst`)
-	for i := 1; i <= 3; i++ {
-		subDir := fmt.Sprintf("%s/foo/%d", dir, i)
+	hasSSTs := func(location string) bool {
+		sstMatcher := regexp.MustCompile(`\d+\.sst`)
+		subDir := locationToDir(location)
 		files, err := ioutil.ReadDir(subDir)
 		if err != nil {
 			t.Fatal(err)
@@ -448,16 +504,25 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				break
 			}
 		}
-		if !found {
-			t.Fatalf("no SSTs found in %s", subDir)
+		return found
+	}
+
+	requireHasSSTs := func(t *testing.T, locations ...string) {
+		for _, location := range locations {
+			require.True(t, hasSSTs(location))
 		}
 	}
-	// The PartitionGZip subtest is to verify that partition descriptor files
-	// are in the GZip compressed format.
-	t.Run("PartitionGZip", func(t *testing.T) {
+
+	requireHasNoSSTs := func(t *testing.T, locations ...string) {
+		for _, location := range locations {
+			require.False(t, hasSSTs(location))
+		}
+	}
+
+	requireCompressedManifest := func(t *testing.T, locations ...string) {
 		partitionMatcher := regexp.MustCompile(`^BACKUP_PART_`)
-		for i := 1; i <= 3; i++ {
-			subDir := fmt.Sprintf("%s/foo/%d", dir, i)
+		for _, location := range locations {
+			subDir := locationToDir(location)
 			files, err := ioutil.ReadDir(subDir)
 			if err != nil {
 				t.Fatal(err)
@@ -474,6 +539,99 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				}
 			}
 		}
+	}
+
+	runBackupRestore := func(t *testing.T, sqlDB *sqlutils.SQLRunner, backupURIs []string) {
+		locationFmtString, locationURIArgs := uriFmtStringAndArgs(backupURIs)
+		backupQuery := fmt.Sprintf("BACKUP DATABASE data TO %s", locationFmtString)
+		sqlDB.Exec(t, backupQuery, locationURIArgs...)
+
+		sqlDB.Exec(t, `DROP DATABASE data;`)
+		restoreQuery := fmt.Sprintf("RESTORE DATABASE data FROM %s", locationFmtString)
+		sqlDB.Exec(t, restoreQuery, locationURIArgs...)
+	}
+
+	// Ensure that each node has at least one leaseholder. (These splits were
+	// made in BackupRestoreTestSetup.) These are wrapped with SucceedsSoon()
+	// because EXPERIMENTAL_RELOCATE can fail if there are other replication
+	// changes happening.
+	for _, stmt := range []string{
+		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 0)`,
+		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 100)`,
+		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[3], 200)`,
+	} {
+		testutils.SucceedsSoon(t, func() error {
+			_, err := sqlDB.DB.ExecContext(ctx, stmt)
+			return err
+		})
+	}
+
+	t.Run("partition-by-unique-key", func(t *testing.T) {
+		testSubDir := t.Name()
+		locations := []string{
+			LocalFoo + "/" + testSubDir + "/1",
+			LocalFoo + "/" + testSubDir + "/2",
+			LocalFoo + "/" + testSubDir + "/3",
+		}
+		backupURIs := []string{
+			// The first location will contain data from node 3 with config
+			// dc=dc3.
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[0], url.QueryEscape("default")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[1], url.QueryEscape("dc=dc1")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[2], url.QueryEscape("dc=dc2")),
+		}
+		runBackupRestore(t, sqlDB, backupURIs)
+
+		// Verify that at least one SST exists in each backup destination.
+		requireHasSSTs(t, locations...)
+
+		// Verify that all of the partition manifests are compressed.
+		requireCompressedManifest(t, locations...)
+	})
+
+	// Test that we're selecting the most specific locality tier for a location.
+	t.Run("partition-by-different-tiers", func(t *testing.T) {
+		testSubDir := t.Name()
+		locations := []string{
+			LocalFoo + "/" + testSubDir + "/1",
+			LocalFoo + "/" + testSubDir + "/2",
+			LocalFoo + "/" + testSubDir + "/3",
+			LocalFoo + "/" + testSubDir + "/4",
+		}
+		backupURIs := []string{
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[0], url.QueryEscape("default")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[1], url.QueryEscape("region=east")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[2], url.QueryEscape("az=az1")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[3], url.QueryEscape("az=az2")),
+		}
+
+		runBackupRestore(t, sqlDB, backupURIs)
+
+		// All data should be covered by az=az1 or az=az2, so expect all the
+		// data on those locations.
+		requireHasNoSSTs(t, locations[0], locations[1])
+		requireHasSSTs(t, locations[2], locations[3])
+	})
+
+	t.Run("partition-by-several-keys", func(t *testing.T) {
+		testSubDir := t.Name()
+		locations := []string{
+			LocalFoo + "/" + testSubDir + "/1",
+			LocalFoo + "/" + testSubDir + "/2",
+			LocalFoo + "/" + testSubDir + "/3",
+			LocalFoo + "/" + testSubDir + "/4",
+		}
+		backupURIs := []string{
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[0], url.QueryEscape("default")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[1], url.QueryEscape("region=east,az=az1")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[2], url.QueryEscape("region=east,az=az2")),
+			fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", locations[3], url.QueryEscape("region=west,az=az1")),
+		}
+
+		// Specifying multiple tiers is not supported.
+		locationFmtString, locationURIArgs := uriFmtStringAndArgs(backupURIs)
+		backupQuery := fmt.Sprintf("BACKUP DATABASE data TO %s", locationFmtString)
+		sqlDB.ExpectErr(t, `tier must be in the form "key=value" not "region=east,az=az1"`, backupQuery, locationURIArgs...)
 	})
 }
 
@@ -639,7 +797,7 @@ func TestBackupRestoreAppend(t *testing.T) {
 			// Find the backup times in the collection and try RESTORE'ing to each, and
 			// within each also check if we can restore to individual times captured with
 			// incremental backups that were appended to that backup.
-			store, err := cloudimpl.ExternalStorageFromURI(ctx, "userfile:///0",
+			store, err := cloud.ExternalStorageFromURI(ctx, "userfile:///0",
 				base.ExternalIODirConfig{},
 				tc.Servers[0].ClusterSettings(),
 				blobs.TestEmptyBlobClientFactory,
@@ -856,27 +1014,6 @@ func backupAndRestore(
 	restoreURIs []string,
 	numAccounts int,
 ) {
-	// uriFmtStringAndArgs returns format strings like "$1" or "($1, $2, $3)" and
-	// an []interface{} of URIs for the BACKUP/RESTORE queries.
-	uriFmtStringAndArgs := func(uris []string) (string, []interface{}) {
-		urisForFormat := make([]interface{}, len(uris))
-		var fmtString strings.Builder
-		if len(uris) > 1 {
-			fmtString.WriteString("(")
-		}
-		for i, uri := range uris {
-			if i > 0 {
-				fmtString.WriteString(", ")
-			}
-			fmtString.WriteString(fmt.Sprintf("$%d", i+1))
-			urisForFormat[i] = uri
-		}
-		if len(uris) > 1 {
-			fmtString.WriteString(")")
-		}
-		return fmtString.String(), urisForFormat
-	}
-
 	conn := tc.Conns[0]
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 	{
@@ -1172,7 +1309,7 @@ func TestBackupRestoreSystemJobs(t *testing.T) {
 
 func redactTestKMSURI(path string) (string, error) {
 	var redactedQueryParams = map[string]struct{}{
-		cloudimpl.AWSSecretParam: {},
+		amazon.AWSSecretParam: {},
 	}
 
 	uri, err := url.Parse(path)
@@ -4233,9 +4370,9 @@ func getAWSKMSURI(t *testing.T, regionEnvVariable, keyIDEnvVariable string) (str
 
 	q := make(url.Values)
 	expect := map[string]string{
-		"AWS_ACCESS_KEY_ID":     cloudimpl.AWSAccessKeyParam,
-		"AWS_SECRET_ACCESS_KEY": cloudimpl.AWSSecretParam,
-		regionEnvVariable:       cloudimpl.KMSRegionParam,
+		"AWS_ACCESS_KEY_ID":     amazon.AWSAccessKeyParam,
+		"AWS_SECRET_ACCESS_KEY": amazon.AWSSecretParam,
+		regionEnvVariable:       amazon.KMSRegionParam,
 	}
 	for env, param := range expect {
 		v := os.Getenv(env)
@@ -4254,7 +4391,7 @@ func getAWSKMSURI(t *testing.T, regionEnvVariable, keyIDEnvVariable string) (str
 	}
 
 	// Set AUTH to implicit
-	q.Set(cloudimpl.AuthParam, cloudimpl.AuthParamSpecified)
+	q.Set(cloud.AuthParam, cloud.AuthParamSpecified)
 	correctURI := fmt.Sprintf("aws:///%s?%s", keyARN, q.Encode())
 	incorrectURI := fmt.Sprintf("aws:///%s?%s", "gibberish", q.Encode())
 
@@ -4477,8 +4614,8 @@ func MakeTestKMS(uri string, _ cloud.KMSEnv) (cloud.KMS, error) {
 
 func constructMockKMSURIsWithKeyID(keyIDs []string) []string {
 	q := make(url.Values)
-	q.Add(cloudimpl.AuthParam, cloudimpl.AuthParamImplicit)
-	q.Add(cloudimpl.KMSRegionParam, "blah")
+	q.Add(cloud.AuthParam, cloud.AuthParamImplicit)
+	q.Add(amazon.KMSRegionParam, "blah")
 
 	var uris []string
 	for _, keyID := range keyIDs {
@@ -7062,6 +7199,46 @@ func TestClientDisconnect(t *testing.T) {
 	}
 }
 
+func TestBackupExportRequestTimeout(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	allowRequest := make(chan struct{})
+	defer close(allowRequest)
+	params := base.TestClusterArgs{}
+	dir, dirCleanupFn := testutils.TempDir(t)
+	defer dirCleanupFn()
+	params.ServerArgs.ExternalIODir = dir
+	const numAccounts = 10
+	ctx, tc, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, 2 /* nodes */, numAccounts,
+		InitManualReplication, params)
+	defer cleanupFn()
+
+	sqlSessions := []*sqlutils.SQLRunner{}
+	for i := 0; i < 2; i++ {
+		newConn, err := tc.ServerConn(i).Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sqlSessions = append(sqlSessions, sqlutils.MakeSQLRunner(newConn))
+	}
+
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.backup.read_timeout = '3s'")
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.backup.read_with_priority_after = '100ms'")
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.backup.read_retry_delay = '10ms'")
+
+	// Start a high priority txn that lays down an intent.
+	sqlSessions[0].Exec(t, `BEGIN PRIORITY HIGH; UPDATE data.bank SET balance = 0 WHERE id = 5 OR id = 8;`)
+
+	// Backup should go through the motions of attempting to run a high priority
+	// export request but since the intent was laid by a high priority txn it
+	// should hang. The timeout should save us in this case.
+	_, err := sqlSessions[1].DB.ExecContext(ctx, "BACKUP data.bank TO 'nodelocal://0/timeout'")
+	require.True(t, testutils.IsError(err,
+		"timeout: operation \"ExportRequest for span /Table/53/{1-2}\" timed out after 3s: context"+
+			" deadline exceeded"))
+}
+
 func TestBackupDoesNotHangOnIntent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -8153,6 +8330,7 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 
 func TestBackupWorkerFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 64773, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	skip.UnderStress(t, "under stress the test unexpectedly surfaces non-retryable errors on"+

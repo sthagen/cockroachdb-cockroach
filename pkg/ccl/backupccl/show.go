@@ -41,13 +41,11 @@ import (
 )
 
 func checkShowBackupURIPrivileges(ctx context.Context, p sql.PlanHookState, uri string) error {
-	// Check if the user issuing the SHOW BACKUP needs to be of the admin role
-	// depending on the URI destination.
-	hasExplicitAuth, uriScheme, err := cloud.AccessIsWithExplicitAuth(uri)
+	conf, err := cloud.ExternalStorageConfFromURI(uri, p.User())
 	if err != nil {
 		return err
 	}
-	if hasExplicitAuth {
+	if conf.AccessIsWithExplicitAuth() {
 		return nil
 	}
 	hasAdmin, err := p.HasAdminRole(ctx)
@@ -58,7 +56,7 @@ func checkShowBackupURIPrivileges(ctx context.Context, p sql.PlanHookState, uri 
 		return pgerror.Newf(
 			pgcode.InsufficientPrivilege,
 			"only users with the admin role are allowed to SHOW BACKUP from the specified %s URI",
-			uriScheme)
+			conf.Provider.String())
 	}
 	return nil
 }
@@ -130,10 +128,6 @@ func showBackupPlanHook(
 			return err
 		}
 
-		if err := checkShowBackupURIPrivileges(ctx, p, str); err != nil {
-			return err
-		}
-
 		if inColFn != nil {
 			collection, err := inColFn()
 			if err != nil {
@@ -145,6 +139,10 @@ func showBackupPlanHook(
 			}
 			parsed.Path = path.Join(parsed.Path, str)
 			str = parsed.String()
+		}
+
+		if err := checkShowBackupURIPrivileges(ctx, p, str); err != nil {
+			return err
 		}
 
 		store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, str, p.User())

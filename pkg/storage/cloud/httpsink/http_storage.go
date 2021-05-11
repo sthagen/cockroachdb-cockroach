@@ -8,12 +8,10 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package cloudimpl
+package httpsink
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -21,9 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -36,9 +32,11 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func parseHTTPURL(_ ExternalStorageURIContext, uri *url.URL) (roachpb.ExternalStorage, error) {
+func parseHTTPURL(
+	_ cloud.ExternalStorageURIContext, uri *url.URL,
+) (roachpb.ExternalStorage, error) {
 	conf := roachpb.ExternalStorage{}
-	conf.Provider = roachpb.ExternalStorageProvider_Http
+	conf.Provider = roachpb.ExternalStorageProvider_http
 	conf.HttpPath.BaseUri = uri.String()
 	return conf, nil
 }
@@ -61,48 +59,9 @@ func (e *retryableHTTPError) Error() string {
 	return fmt.Sprintf("retryable http error: %s", e.cause)
 }
 
-// HTTPRetryOptions defines the tunable settings which control the retry of HTTP
-// operations.
-var HTTPRetryOptions = retry.Options{
-	InitialBackoff: 100 * time.Millisecond,
-	MaxBackoff:     2 * time.Second,
-	MaxRetries:     32,
-	Multiplier:     4,
-}
-
-func makeHTTPClient(settings *cluster.Settings) (*http.Client, error) {
-	var tlsConf *tls.Config
-	if pem := httpCustomCA.Get(&settings.SV); pem != "" {
-		roots, err := x509.SystemCertPool()
-		if err != nil {
-			return nil, errors.Wrap(err, "could not load system root CA pool")
-		}
-		if !roots.AppendCertsFromPEM([]byte(pem)) {
-			return nil, errors.Errorf("failed to parse root CA certificate from %q", pem)
-		}
-		tlsConf = &tls.Config{RootCAs: roots}
-	}
-	// Copy the defaults from http.DefaultTransport. We cannot just copy the
-	// entire struct because it has a sync Mutex. This has the unfortunate problem
-	// that if Go adds fields to DefaultTransport they won't be copied here,
-	// but this is ok for now.
-	t := http.DefaultTransport.(*http.Transport)
-	return &http.Client{Transport: &http.Transport{
-		Proxy:                 t.Proxy,
-		DialContext:           t.DialContext,
-		MaxIdleConns:          t.MaxIdleConns,
-		IdleConnTimeout:       t.IdleConnTimeout,
-		TLSHandshakeTimeout:   t.TLSHandshakeTimeout,
-		ExpectContinueTimeout: t.ExpectContinueTimeout,
-
-		// Add our custom CA.
-		TLSClientConfig: tlsConf,
-	}}, nil
-}
-
 // MakeHTTPStorage returns an instance of HTTPStorage ExternalStorage.
 func MakeHTTPStorage(
-	ctx context.Context, args ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.http")
 	if args.IOConf.DisableHTTP {
@@ -113,7 +72,7 @@ func MakeHTTPStorage(
 		return nil, errors.Errorf("HTTP storage requested but prefix path not provided")
 	}
 
-	client, err := makeHTTPClient(args.Settings)
+	client, err := cloud.MakeHTTPClient(args.Settings)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +91,7 @@ func MakeHTTPStorage(
 
 func (h *httpStorage) Conf() roachpb.ExternalStorage {
 	return roachpb.ExternalStorage{
-		Provider: roachpb.ExternalStorageProvider_Http,
+		Provider: roachpb.ExternalStorageProvider_http,
 		HttpPath: roachpb.ExternalStorage_Http{
 			BaseUri: h.base.String(),
 		},
@@ -145,44 +104,6 @@ func (h *httpStorage) ExternalIOConf() base.ExternalIODirConfig {
 
 func (h *httpStorage) Settings() *cluster.Settings {
 	return h.settings
-}
-
-// checkHTTPContentRangeHeader parses Content-Range header and ensures that
-// range start offset is the same as the expected 'pos'. It returns the total
-// size of the remote object as extracted from the header.
-// See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Range
-func checkHTTPContentRangeHeader(h string, pos int64) (int64, error) {
-	if len(h) == 0 {
-		return 0, errors.New("http server does not honor download resume")
-	}
-
-	h = strings.TrimPrefix(h, "bytes ")
-	dash := strings.IndexByte(h, '-')
-	if dash <= 0 {
-		return 0, errors.Errorf("malformed Content-Range header: %s", h)
-	}
-
-	resume, err := strconv.ParseInt(h[:dash], 10, 64)
-	if err != nil {
-		return 0, errors.Errorf("malformed start offset in Content-Range header: %s", h)
-	}
-
-	if resume != pos {
-		return 0, errors.Errorf(
-			"expected resume position %d, found %d instead in Content-Range header: %s",
-			pos, resume, h)
-	}
-
-	slash := strings.IndexByte(h, '/')
-	if slash <= 0 {
-		return 0, errors.Errorf("malformed Content-Range header: %s", h)
-	}
-	size, err := strconv.ParseInt(h[slash+1:], 10, 64)
-	if err != nil {
-		return 0, errors.Errorf("malformed slash offset in Content-Range header: %s", h)
-	}
-
-	return size, nil
 }
 
 func (h *httpStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
@@ -199,7 +120,7 @@ func (h *httpStorage) openStreamAt(
 		headers = map[string]string{"Range": fmt.Sprintf("bytes=%d-", pos)}
 	}
 
-	for attempt, retries := 0, retry.StartWithCtx(ctx, HTTPRetryOptions); retries.Next(); attempt++ {
+	for attempt, retries := 0, retry.StartWithCtx(ctx, cloud.HTTPRetryOptions); retries.Next(); attempt++ {
 		resp, err := h.req(ctx, "GET", url, nil, headers)
 		if err == nil {
 			return resp, err
@@ -230,7 +151,7 @@ func (h *httpStorage) ReadFileAt(
 	if offset == 0 {
 		size = stream.ContentLength
 	} else {
-		size, err = checkHTTPContentRangeHeader(stream.Header.Get("Content-Range"), offset)
+		size, err = cloud.CheckHTTPContentRangeHeader(stream.Header.Get("Content-Range"), offset)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -238,17 +159,17 @@ func (h *httpStorage) ReadFileAt(
 
 	canResume := stream.Header.Get("Accept-Ranges") == "bytes"
 	if canResume {
-		return &resumingReader{
-			ctx: ctx,
-			opener: func(ctx context.Context, pos int64) (io.ReadCloser, error) {
+		return &cloud.ResumingReader{
+			Ctx: ctx,
+			Opener: func(ctx context.Context, pos int64) (io.ReadCloser, error) {
 				s, err := h.openStreamAt(ctx, basename, pos)
 				if err != nil {
 					return nil, err
 				}
 				return s.Body, err
 			},
-			reader: stream.Body,
-			pos:    offset,
+			Reader: stream.Body,
+			Pos:    offset,
 		}, size, nil
 	}
 	return stream.Body, size, nil
@@ -256,7 +177,7 @@ func (h *httpStorage) ReadFileAt(
 
 func (h *httpStorage) WriteFile(ctx context.Context, basename string, content io.ReadSeeker) error {
 	return contextutil.RunWithTimeout(ctx, fmt.Sprintf("PUT %s", basename),
-		timeoutSetting.Get(&h.settings.SV), func(ctx context.Context) error {
+		cloud.Timeout.Get(&h.settings.SV), func(ctx context.Context) error {
 			_, err := h.reqNoBody(ctx, "PUT", basename, content)
 			return err
 		})
@@ -268,7 +189,7 @@ func (h *httpStorage) ListFiles(_ context.Context, _ string) ([]string, error) {
 
 func (h *httpStorage) Delete(ctx context.Context, basename string) error {
 	return contextutil.RunWithTimeout(ctx, fmt.Sprintf("DELETE %s", basename),
-		timeoutSetting.Get(&h.settings.SV), func(ctx context.Context) error {
+		cloud.Timeout.Get(&h.settings.SV), func(ctx context.Context) error {
 			_, err := h.reqNoBody(ctx, "DELETE", basename, nil)
 			return err
 		})
@@ -277,7 +198,7 @@ func (h *httpStorage) Delete(ctx context.Context, basename string) error {
 func (h *httpStorage) Size(ctx context.Context, basename string) (int64, error) {
 	var resp *http.Response
 	if err := contextutil.RunWithTimeout(ctx, fmt.Sprintf("HEAD %s", basename),
-		timeoutSetting.Get(&h.settings.SV), func(ctx context.Context) error {
+		cloud.Timeout.Get(&h.settings.SV), func(ctx context.Context) error {
 			var err error
 			resp, err = h.reqNoBody(ctx, "HEAD", basename, nil)
 			return err
@@ -354,4 +275,9 @@ func (h *httpStorage) req(
 		return nil, err
 	}
 	return resp, nil
+}
+
+func init() {
+	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_http,
+		parseHTTPURL, MakeHTTPStorage, cloud.RedactedParams(), "http", "https")
 }

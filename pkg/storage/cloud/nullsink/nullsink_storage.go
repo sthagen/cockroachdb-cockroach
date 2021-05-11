@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package cloudimpl
+package nullsink
 
 import (
 	"context"
@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 )
 
-func parseNullURL(_ ExternalStorageURIContext, _ *url.URL) (roachpb.ExternalStorage, error) {
-	return roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_NullSink}, nil
+func parseNullURL(_ cloud.ExternalStorageURIContext, _ *url.URL) (roachpb.ExternalStorage, error) {
+	return roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_null}, nil
 }
 
 // MakeNullSinkStorageURI returns a valid null sink URI.
@@ -37,7 +37,7 @@ type nullSinkStorage struct {
 }
 
 func makeNullSinkStorage(
-	_ context.Context, _ ExternalStorageContext, _ roachpb.ExternalStorage,
+	_ context.Context, _ cloud.ExternalStorageContext, _ roachpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.nullsink")
 	return &nullSinkStorage{}, nil
@@ -48,7 +48,7 @@ func (n *nullSinkStorage) Close() error {
 }
 
 func (n *nullSinkStorage) Conf() roachpb.ExternalStorage {
-	return roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_NullSink}
+	return roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_null}
 }
 
 func (n *nullSinkStorage) ExternalIOConf() base.ExternalIODirConfig {
@@ -88,3 +88,8 @@ func (n *nullSinkStorage) Size(_ context.Context, _ string) (int64, error) {
 }
 
 var _ cloud.ExternalStorage = &nullSinkStorage{}
+
+func init() {
+	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_null,
+		parseNullURL, makeNullSinkStorage, cloud.RedactedParams(), "null")
+}

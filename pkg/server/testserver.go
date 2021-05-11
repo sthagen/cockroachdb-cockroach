@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -119,11 +120,7 @@ func makeTestKVConfig() KVConfig {
 }
 
 func makeTestSQLConfig(st *cluster.Settings, tenID roachpb.TenantID) SQLConfig {
-	sqlCfg := MakeSQLConfig(tenID, base.DefaultTestTempStorageConfig(st))
-	// Configure the default in-memory temp storage for all tests unless
-	// otherwise configured.
-	sqlCfg.TempStorageConfig = base.DefaultTestTempStorageConfig(st)
-	return sqlCfg
+	return MakeSQLConfig(tenID, base.DefaultTestTempStorageConfig(st))
 }
 
 // makeTestConfigFromParams creates a Config from a TestServerParams.
@@ -131,12 +128,10 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	st := params.Settings
 	if params.Settings == nil {
 		st = cluster.MakeClusterSettings()
-		// TODO(sumeer): re-introduce this randomization.
-		// enabledSeparated := rand.Intn(2) == 0
-		// log.Infof(context.Background(),
-		//	"test Config is randomly setting enabledSeparated: %t",
-		//	enabledSeparated)
-		// storage.SeparatedIntentsEnabled.Override(&st.SV, enabledSeparated)
+		enabledSeparated := rand.Intn(2) == 0
+		log.Infof(context.Background(),
+			"test Config is randomly setting enabledSeparated: %t", enabledSeparated)
+		storage.SeparatedIntentsEnabled.Override(&st.SV, enabledSeparated)
 	}
 	st.ExternalIODir = params.ExternalIODir
 	cfg := makeTestConfig(st)
@@ -147,6 +142,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.JoinList = []string{params.JoinAddr}
 	}
 	cfg.ClusterName = params.ClusterName
+	cfg.ExternalIODirConfig = params.ExternalIODirConfig
 	cfg.Insecure = params.Insecure
 	cfg.AutoInitializeCluster = !params.NoAutoInitializeCluster
 	cfg.SocketFile = params.SocketFile
@@ -738,6 +734,12 @@ func (ts *TestServer) StartTenant(
 	}
 	sqlCfg := makeTestSQLConfig(st, params.TenantID)
 	sqlCfg.TenantKVAddrs = []string{ts.ServingRPCAddr()}
+	if params.MemoryPoolSize != 0 {
+		sqlCfg.MemoryPoolSize = params.MemoryPoolSize
+	}
+	if params.TempStorageConfig != nil {
+		sqlCfg.TempStorageConfig = *params.TempStorageConfig
+	}
 	baseCfg := makeTestBaseConfig(st)
 	baseCfg.TestingKnobs = params.TestingKnobs
 	baseCfg.IdleExitAfter = params.IdleExitAfter
@@ -1052,6 +1054,11 @@ func (ts *TestServer) MustGetSQLNetworkCounter(name string) int64 {
 		panic(fmt.Sprintf("couldn't find metric %s", name))
 	}
 	return c
+}
+
+// Locality returns the Locality used by the TestServer.
+func (ts *TestServer) Locality() *roachpb.Locality {
+	return &ts.cfg.Locality
 }
 
 // LeaseManager is part of TestServerInterface.

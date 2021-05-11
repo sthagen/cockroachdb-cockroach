@@ -38,7 +38,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/gcp"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/userfile"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -77,7 +78,7 @@ func (d *antagonisticDialer) DialContext(
 ) (net.Conn, error) {
 	if network == "tcp" {
 		// The maximum number of injected errors should always be less than the maximum retry attempts in delayedRetry.
-		if *d.numRepeatFailures < cloudimpl.MaxDelayedRetryAttempts-1 && d.rnd.Int()%2 == 0 {
+		if *d.numRepeatFailures < cloud.MaxDelayedRetryAttempts-1 && d.rnd.Int()%2 == 0 {
 			*(d.numRepeatFailures)++
 			return nil, econnrefused
 		}
@@ -94,7 +95,7 @@ func (d *antagonisticDialer) DialContext(
 func (c *antagonisticConn) Read(b []byte) (int, error) {
 	// The maximum number of injected errors should always be less
 	// than the maximum retry attempts in delayedRetry.
-	if *c.numRepeatFailures < cloudimpl.MaxDelayedRetryAttempts-1 && c.rnd.Int()%2 == 0 {
+	if *c.numRepeatFailures < cloud.MaxDelayedRetryAttempts-1 && c.rnd.Int()%2 == 0 {
 		*(c.numRepeatFailures)++
 		return 0, econnreset
 	}
@@ -110,15 +111,7 @@ func appendPath(t *testing.T, s, add string) string {
 	return u.String()
 }
 
-var testSettings *cluster.Settings
-
-func init() {
-	testSettings = cluster.MakeTestingClusterSettings()
-	up := testSettings.MakeUpdater()
-	if err := up.Set(cloudimpl.CloudstorageGSDefaultKey, os.Getenv("GS_JSONKEY"), cloudimpl.GcsDefault.Typ()); err != nil {
-		panic(err)
-	}
-}
+var testSettings *cluster.Settings = cluster.MakeTestingClusterSettings()
 
 func storeFromURI(
 	ctx context.Context,
@@ -129,12 +122,12 @@ func storeFromURI(
 	ie sqlutil.InternalExecutor,
 	kvDB *kv.DB,
 ) cloud.ExternalStorage {
-	conf, err := cloudimpl.ExternalStorageConfFromURI(uri, user)
+	conf, err := cloud.ExternalStorageConfFromURI(uri, user)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Setup a sink for the given args.
-	s, err := cloudimpl.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings,
+	s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings,
 		clientFactory, ie, kvDB)
 	if err != nil {
 		t.Fatal(err)
@@ -165,14 +158,14 @@ func testExportStoreWithExternalIOConfig(
 ) {
 	ctx := context.Background()
 
-	conf, err := cloudimpl.ExternalStorageConfFromURI(storeURI, user)
+	conf, err := cloud.ExternalStorageConfFromURI(storeURI, user)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Setup a sink for the given args.
 	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
-	s, err := cloudimpl.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory, ie, kvDB)
+	s, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory, ie, kvDB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,8 +384,8 @@ func testListFiles(
 		for i := range in {
 			u := *uri
 			if u.Scheme == "userfile" && u.Host == "" {
-				composedTableName := tree.Name(cloudimpl.DefaultQualifiedNamePrefix + user.Normalized())
-				u.Host = cloudimpl.DefaultQualifiedNamespace +
+				composedTableName := tree.Name(userfile.DefaultQualifiedNamePrefix + user.Normalized())
+				u.Host = userfile.DefaultQualifiedNamespace +
 					// Escape special identifiers as needed.
 					composedTableName.String()
 			}
@@ -538,36 +531,31 @@ func TestPutGoogleCloud(t *testing.T) {
 
 	user := security.RootUserName()
 
-	t.Run("empty", func(t *testing.T) {
-		testExportStore(t, fmt.Sprintf("gs://%s/%s", bucket, "backup-test-empty"),
-			false, user, nil, nil)
-	})
-	t.Run("default", func(t *testing.T) {
-		testExportStore(t, fmt.Sprintf("gs://%s/%s?%s=%s", bucket, "backup-test-default", cloudimpl.AuthParam,
-			cloudimpl.AuthParamDefault), false, user, nil, nil)
-	})
-	t.Run("specified", func(t *testing.T) {
+	testutils.RunTrueAndFalse(t, "specified", func(t *testing.T, specified bool) {
 		credentials := os.Getenv("GS_JSONKEY")
 		if credentials == "" {
 			skip.IgnoreLint(t, "GS_JSONKEY env var must be set")
 		}
 		encoded := base64.StdEncoding.EncodeToString([]byte(credentials))
-		testExportStore(t, fmt.Sprintf("gs://%s/%s?%s=%s&%s=%s",
+		uri := fmt.Sprintf("gs://%s/%s?%s=%s",
 			bucket,
 			"backup-test-specified",
-			cloudimpl.AuthParam,
-			cloudimpl.AuthParamSpecified,
-			cloudimpl.CredentialsParam,
+			gcp.CredentialsParam,
 			url.QueryEscape(encoded),
-		), false, user, nil, nil)
+		)
+		if specified {
+			uri += fmt.Sprintf("&%s=%s", cloud.AuthParam, cloud.AuthParamSpecified)
+		}
+		t.Log(uri)
+		testExportStore(t, uri, false, user, nil, nil)
 		testListFiles(t,
 			fmt.Sprintf("gs://%s/%s/%s?%s=%s&%s=%s",
 				bucket,
 				"backup-test-specified",
 				"listing-test",
-				cloudimpl.AuthParam,
-				cloudimpl.AuthParamSpecified,
-				cloudimpl.CredentialsParam,
+				cloud.AuthParam,
+				cloud.AuthParamSpecified,
+				gcp.CredentialsParam,
 				url.QueryEscape(encoded),
 			),
 			security.RootUserName(), nil, nil,
@@ -579,7 +567,7 @@ func TestPutGoogleCloud(t *testing.T) {
 			skip.IgnoreLint(t, err)
 		}
 		testExportStore(t, fmt.Sprintf("gs://%s/%s?%s=%s", bucket, "backup-test-implicit",
-			cloudimpl.AuthParam, cloudimpl.AuthParamImplicit), false, user, nil, nil)
+			cloud.AuthParam, cloud.AuthParamImplicit), false, user, nil, nil)
 	})
 }
 
@@ -589,7 +577,7 @@ func uploadData(
 	data := randutil.RandBytes(rnd, 16<<20)
 	ctx := context.Background()
 
-	s, err := cloudimpl.MakeExternalStorage(
+	s, err := cloud.MakeExternalStorage(
 		ctx, dest, base.ExternalIODirConfig{}, testSettings,
 		nil, nil, nil)
 	require.NoError(t, err)
@@ -626,7 +614,7 @@ func testAntagonisticRead(t *testing.T, conf roachpb.ExternalStorage) {
 	}()
 
 	ctx := context.Background()
-	s, err := cloudimpl.MakeExternalStorage(
+	s, err := cloud.MakeExternalStorage(
 		ctx, conf, base.ExternalIODirConfig{}, testSettings,
 		nil, nil, nil)
 	require.NoError(t, err)
@@ -649,7 +637,7 @@ func makeUserfile(
 ) cloud.ExternalStorage {
 	qualifiedTableName := "defaultdb.public.user_file_table_test"
 
-	dest := cloudimpl.MakeUserFileStorageURI(qualifiedTableName, "")
+	dest := userfile.MakeUserFileStorageURI(qualifiedTableName, "")
 	ie := s.InternalExecutor().(sqlutil.InternalExecutor)
 
 	// Create a user and grant them privileges on defaultdb.
@@ -657,7 +645,7 @@ func makeUserfile(
 	require.NoError(t, createUserGrantAllPrivieleges(user1, "defaultdb", sqlDB))
 
 	// Create a userfile connection as user1.
-	fileTableSystem, err := cloudimpl.ExternalStorageFromURI(ctx, dest, base.ExternalIODirConfig{},
+	fileTableSystem, err := cloud.ExternalStorageFromURI(ctx, dest, base.ExternalIODirConfig{},
 		cluster.NoSettings, blobs.TestEmptyBlobClientFactory, user1, ie, kvDB)
 	require.NoError(t, err)
 

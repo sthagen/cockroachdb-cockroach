@@ -1467,6 +1467,13 @@ default configuration, you can use the 'cockroach debug check-log-config' sub-co
 `,
 	}
 
+	LogConfigFile = FlagInfo{
+		Name: "log-config-file",
+		Description: `File name to read the logging configuration from.
+This has the same effect as passing the content of the file via
+the --log flag.`,
+	}
+
 	DeprecatedStderrThreshold = FlagInfo{
 		Name:        "logtostderr",
 		Description: `Write log messages beyond the specified severity to stderr.`,
@@ -1571,5 +1578,15 @@ The bytekey format does not require table-key prefix.`,
 	MaxRows = FlagInfo{
 		Name:        "max-rows",
 		Description: `Maximum number of rows to return (Default 0 is unlimited).`,
+	}
+
+	ExportRevisions = FlagInfo{
+		Name:        "with-revisions",
+		Description: `Export revisions of data from a backup table since the last schema change.`,
+	}
+
+	ExportRevisionsUpTo = FlagInfo{
+		Name:        "up-to",
+		Description: `Export revisions of data from a backup table up to a specific timestamp.`,
 	}
 )

@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -43,7 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -52,6 +53,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
+)
+
+const (
+	backupOptRevisionHistory = "revision_history"
 )
 
 type key struct {
@@ -115,6 +120,7 @@ var debugBackupArgs struct {
 	nullas          string
 	maxRows         int
 	startKey        key
+	withRevisions   bool
 
 	rowCount int
 }
@@ -132,6 +138,7 @@ func setDebugContextDefault() {
 	debugBackupArgs.maxRows = 0
 	debugBackupArgs.startKey = key{}
 	debugBackupArgs.rowCount = 0
+	debugBackupArgs.withRevisions = false
 }
 
 func init() {
@@ -232,7 +239,18 @@ func init() {
 		cliflags.StartKey.Name,
 		cliflags.StartKey.Usage())
 
-	cli.DebugCmd.AddCommand(backupCmds)
+	exportDataCmd.Flags().BoolVar(
+		&debugBackupArgs.withRevisions,
+		cliflags.ExportRevisions.Name,
+		false, /*value*/
+		cliflags.ExportRevisions.Usage())
+
+	exportDataCmd.Flags().StringVarP(
+		&debugBackupArgs.readTime,
+		cliflags.ExportRevisionsUpTo.Name,
+		cliflags.ExportRevisionsUpTo.Shorthand,
+		"", /*value*/
+		cliflags.ExportRevisionsUpTo.Usage())
 
 	backupSubCmds := []*cobra.Command{
 		showCmd,
@@ -245,6 +263,7 @@ func init() {
 		backupCmds.AddCommand(cmd)
 		cmd.Flags().AddFlagSet(backupFlags)
 	}
+	cli.DebugCmd.AddCommand(backupCmds)
 }
 
 func newBlobFactory(ctx context.Context, dialing roachpb.NodeID) (blobs.BlobClient, error) {
@@ -260,14 +279,14 @@ func newBlobFactory(ctx context.Context, dialing roachpb.NodeID) (blobs.BlobClie
 func externalStorageFromURIFactory(
 	ctx context.Context, uri string, user security.SQLUsername,
 ) (cloud.ExternalStorage, error) {
-	return cloudimpl.ExternalStorageFromURI(ctx, uri, base.ExternalIODirConfig{},
+	return cloud.ExternalStorageFromURI(ctx, uri, base.ExternalIODirConfig{},
 		cluster.NoSettings, newBlobFactory, user, nil /*Internal Executor*/, nil /*kvDB*/)
 }
 
 func getManifestFromURI(ctx context.Context, path string) (backupccl.BackupManifest, error) {
 
 	if !strings.Contains(path, "://") {
-		path = cloudimpl.MakeLocalStorageURI(path)
+		path = nodelocal.MakeLocalStorageURI(path)
 	}
 	// This reads the raw backup descriptor (with table descriptors possibly not
 	// upgraded from the old FK representation, or even older formats). If more
@@ -304,7 +323,7 @@ func runListBackupsCmd(cmd *cobra.Command, args []string) error {
 
 	path := args[0]
 	if !strings.Contains(path, "://") {
-		path = cloudimpl.MakeLocalStorageURI(path)
+		path = nodelocal.MakeLocalStorageURI(path)
 	}
 	ctx := context.Background()
 	store, err := externalStorageFromURIFactory(ctx, path, security.RootUserName())
@@ -332,7 +351,7 @@ func runListIncrementalCmd(cmd *cobra.Command, args []string) error {
 
 	path := args[0]
 	if !strings.Contains(path, "://") {
-		path = cloudimpl.MakeLocalStorageURI(path)
+		path = nodelocal.MakeLocalStorageURI(path)
 	}
 
 	uri, err := url.Parse(path)
@@ -403,7 +422,14 @@ func runExportDataCmd(cmd *cobra.Command, args []string) error {
 		manifests = append(manifests, manifest)
 	}
 
-	endTime, err := evalAsOfTimestamp(debugBackupArgs.readTime)
+	if debugBackupArgs.withRevisions && manifests[0].MVCCFilter != backupccl.MVCCFilter_All {
+		return errors.WithHintf(
+			errors.Newf("invalid flag: %s", cliflags.ExportRevisions.Name),
+			"requires backup created with %q", backupOptRevisionHistory,
+		)
+	}
+
+	endTime, err := evalAsOfTimestamp(debugBackupArgs.readTime, manifests)
 	if err != nil {
 		return errors.Wrapf(err, "eval as of timestamp %s", debugBackupArgs.readTime)
 	}
@@ -427,9 +453,11 @@ func runExportDataCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func evalAsOfTimestamp(readTime string) (hlc.Timestamp, error) {
+func evalAsOfTimestamp(
+	readTime string, manifests []backupccl.BackupManifest,
+) (hlc.Timestamp, error) {
 	if readTime == "" {
-		return hlc.Timestamp{}, nil
+		return manifests[len(manifests)-1].EndTime, nil
 	}
 	var err error
 	// Attempt to parse as timestamp.
@@ -468,8 +496,14 @@ func showData(
 	}
 	defer rf.Close(ctx)
 
+	if debugBackupArgs.withRevisions {
+		startT := entry.LastSchemaChangeTime.GoTime().UTC()
+		endT := endTime.GoTime().UTC()
+		fmt.Fprintf(os.Stderr, "DETECTED SCHEMA CHANGE AT %s, ONLY SHOWING UPDATES IN RANGE [%s, %s]\n", startT, startT, endT)
+	}
+
 	for _, files := range entry.Files {
-		if err := processEntryFiles(ctx, rf, files, entry.Span, endTime, writer); err != nil {
+		if err := processEntryFiles(ctx, rf, files, entry.Span, entry.LastSchemaChangeTime, endTime, writer); err != nil {
 			return err
 		}
 		if debugBackupArgs.maxRows != 0 && debugBackupArgs.rowCount >= debugBackupArgs.maxRows {
@@ -500,7 +534,7 @@ func makeIters(
 	for i, file := range files {
 		var err error
 		clusterSettings := cluster.MakeClusterSettings()
-		dirStorage[i], err = cloudimpl.MakeExternalStorage(ctx, file.Dir, base.ExternalIODirConfig{},
+		dirStorage[i], err = cloud.MakeExternalStorage(ctx, file.Dir, base.ExternalIODirConfig{},
 			clusterSettings, newBlobFactory, nil /*internal executor*/, nil /*kvDB*/)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "making external storage")
@@ -531,17 +565,31 @@ func makeRowFetcher(
 ) (row.Fetcher, error) {
 	var colIdxMap catalog.TableColMap
 	var valNeededForCol util.FastIntSet
+	colDescs := make([]catalog.Column, len(entry.Desc.PublicColumns()))
 	for i, col := range entry.Desc.PublicColumns() {
 		colIdxMap.Set(col.GetID(), i)
 		valNeededForCol.Add(i)
+		colDescs[i] = col
 	}
+
+	if debugBackupArgs.withRevisions {
+		newIndex := len(entry.Desc.PublicColumns())
+		newCol, err := entry.Desc.FindColumnWithName(colinfo.MVCCTimestampColumnName)
+		if err != nil {
+			return row.Fetcher{}, errors.Wrapf(err, "get mvcc timestamp column")
+		}
+		colIdxMap.Set(newCol.GetID(), newIndex)
+		valNeededForCol.Add(newIndex)
+		colDescs = append(colDescs, newCol)
+	}
+
 	table := row.FetcherTableArgs{
 		Spans:            []roachpb.Span{entry.Span},
 		Desc:             entry.Desc,
 		Index:            entry.Desc.GetPrimaryIndex(),
 		ColIdxMap:        colIdxMap,
 		IsSecondaryIndex: false,
-		Cols:             entry.Desc.PublicColumns(),
+		Cols:             colDescs,
 		ValNeededForCol:  valNeededForCol,
 	}
 
@@ -567,6 +615,7 @@ func processEntryFiles(
 	rf row.Fetcher,
 	files backupccl.EntryFiles,
 	span roachpb.Span,
+	startTime hlc.Timestamp,
 	endTime hlc.Timestamp,
 	writer *csv.Writer,
 ) (err error) {
@@ -592,7 +641,7 @@ func processEntryFiles(
 			startKeyMVCC.Key = roachpb.Key(debugBackupArgs.startKey.rawByte)
 		}
 	}
-	kvFetcher := row.MakeBackupSSTKVFetcher(startKeyMVCC, endKeyMVCC, iter, endTime)
+	kvFetcher := row.MakeBackupSSTKVFetcher(startKeyMVCC, endKeyMVCC, iter, startTime, endTime, debugBackupArgs.withRevisions)
 
 	if err := rf.StartScanFrom(ctx, &kvFetcher); err != nil {
 		return errors.Wrapf(err, "row fetcher starts scan")
@@ -608,6 +657,16 @@ func processEntryFiles(
 		}
 		rowDisplay := make([]string, datums.Len())
 		for i, datum := range datums {
+
+			if debugBackupArgs.withRevisions && i == datums.Len()-1 {
+				approx, err := tree.DecimalToInexactDTimestamp(datum.(*tree.DDecimal))
+				if err != nil {
+					return errors.Wrapf(err, "convert datum %s to mvcc timestamp", datum)
+				}
+				rowDisplay[i] = approx.UTC().String()
+				break
+			}
+
 			if datum == tree.DNull {
 				rowDisplay[i] = debugBackupArgs.nullas
 			} else {

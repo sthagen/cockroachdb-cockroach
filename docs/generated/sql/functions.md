@@ -1934,6 +1934,16 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 <p>Note ST_Length is only valid for LineString - use ST_Perimeter for Polygon.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
+<tr><td><a name="st_linecrossingdirection"></a><code>st_linecrossingdirection(linestring_a: geometry, linestring_b: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns an interger value defining behavior of crossing of lines:
+0: lines do not cross,
+-1: linestring_b crosses linestring_a from right to left,
+1: linestring_b crosses linestring_a from left to right,
+-2: linestring_b crosses linestring_a multiple times from right to left,
+2: linestring_b crosses linestring_a multiple times from left to right,
+-3: linestring_b crosses linestring_a multiple times from left to left,
+3: linestring_b crosses linestring_a multiple times from right to right.</p>
+<p>Note that the top vertex of the segment touching another line does not count as a crossing, but the bottom vertex of segment touching another line is considered a crossing.</p>
+</span></td></tr>
 <tr><td><a name="st_linefromencodedpolyline"></a><code>st_linefromencodedpolyline(encoded_polyline: <a href="string.html">string</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Creates a LineString from an Encoded Polyline string.</p>
 <p>Returns valid results only if the polyline was encoded with 5 decimal places.</p>
 <p>See <a href="http://developers.google.com/maps/documentation/utilities/polylinealgorithm" rel="nofollow">http://developers.google.com/maps/documentation/utilities/polylinealgorithm</a></p>
@@ -2250,10 +2260,12 @@ The paths themselves are given in the direction of the first geometry.</p>
 <p>Note if geometries are the same, it will return the LineString with the minimum distance between the geometry’s vertexes. The function will return the shortest line that was discovered first when comparing minimum distances if more than one is found.</p>
 </span></td></tr>
 <tr><td><a name="st_simplify"></a><code>st_simplify(geometry: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Simplifies the given geometry using the Douglas-Peucker algorithm.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_simplify"></a><code>st_simplify(geometry: geometry, tolerance: <a href="float.html">float</a>, preserve_collapsed: <a href="bool.html">bool</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Simplifies the given geometry using the Douglas-Peucker algorithm, retaining objects that would be too small given the tolerance if preserve_collapsed is set to true.</p>
 </span></td></tr>
 <tr><td><a name="st_simplifypreservetopology"></a><code>st_simplifypreservetopology(geometry: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Simplifies the given geometry using the Douglas-Peucker algorithm, avoiding the creation of invalid geometries.</p>
+<p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_snap"></a><code>st_snap(input: geometry, target: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Snaps the vertices and segments of input geometry the target geometry’s vertices.
 Tolerance is used to control where snapping is performed. The result geometry is the input geometry with the vertices snapped.
@@ -2992,7 +3004,11 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="oid"></a><code>oid(int: <a href="int.html">int</a>) &rarr; oid</code></td><td><span class="funcdesc"><p>Converts an integer to an OID.</p>
 </span></td></tr>
+<tr><td><a name="pg_column_is_updatable"></a><code>pg_column_is_updatable(reloid: oid, attnum: int2, include_triggers: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the given column can be updated.</p>
+</span></td></tr>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
+</span></td></tr>
+<tr><td><a name="pg_relation_is_updatable"></a><code>pg_relation_is_updatable(reloid: oid, include_triggers: <a href="bool.html">bool</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the update events the relation supports.</p>
 </span></td></tr>
 <tr><td><a name="pg_sleep"></a><code>pg_sleep(seconds: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>pg_sleep makes the current session’s process sleep until seconds seconds have elapsed. seconds is a value of type double precision, so fractional-second delays can be specified.</p>
 </span></td></tr>

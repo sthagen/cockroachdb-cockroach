@@ -905,7 +905,7 @@ func ResolveFK(
 	referencedColNames := d.ToCols
 	// If no columns are specified, attempt to default to PK, ignoring implicit columns.
 	if len(referencedColNames) == 0 {
-		numImplicitCols := int(target.GetPrimaryIndex().GetPartitioning().NumImplicitColumns)
+		numImplicitCols := target.GetPrimaryIndex().GetPartitioning().NumImplicitColumns()
 		referencedColNames = make(
 			tree.NameList,
 			0,
@@ -1291,8 +1291,9 @@ func (p *planner) finalizeInterleave(
 	return nil
 }
 
-// CreatePartitioning returns a new index descriptor with partitioning fields
-// populated to align with the tree.PartitionBy clause.
+// CreatePartitioning returns a set of implicit columns and a new partitioning
+// descriptor to build an index with partitioning fields populated to align with
+// the tree.PartitionBy clause.
 func CreatePartitioning(
 	ctx context.Context,
 	st *cluster.Settings,
@@ -1302,18 +1303,17 @@ func CreatePartitioning(
 	partBy *tree.PartitionBy,
 	allowedNewColumnNames []tree.Name,
 	allowImplicitPartitioning bool,
-) (descpb.IndexDescriptor, error) {
+) (newImplicitCols []catalog.Column, newPartitioning descpb.PartitioningDescriptor, err error) {
 	if partBy == nil {
 		if indexDesc.Partitioning.NumImplicitColumns > 0 {
-			return indexDesc, unimplemented.Newf(
+			return nil, newPartitioning, unimplemented.Newf(
 				"ALTER ... PARTITION BY NOTHING",
 				"cannot alter to PARTITION BY NOTHING if the object has implicit column partitioning",
 			)
 		}
 		// No CCL necessary if we're looking at PARTITION BY NOTHING - we can
 		// set the partitioning to nothing.
-		indexDesc.Partitioning = descpb.PartitioningDescriptor{}
-		return indexDesc, nil
+		return nil, newPartitioning, nil
 	}
 	return CreatePartitioningCCL(
 		ctx, st, evalCtx, tableDesc, indexDesc, partBy, allowedNewColumnNames, allowImplicitPartitioning,
@@ -1331,8 +1331,8 @@ var CreatePartitioningCCL = func(
 	partBy *tree.PartitionBy,
 	allowedNewColumnNames []tree.Name,
 	allowImplicitPartitioning bool,
-) (descpb.IndexDescriptor, error) {
-	return descpb.IndexDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
+) (newImplicitCols []catalog.Column, newPartitioning descpb.PartitioningDescriptor, err error) {
+	return nil, descpb.PartitioningDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
 		"creating or manipulating partitions requires a CCL binary"))
 }
 
@@ -1802,7 +1802,7 @@ func NewTableDesc(
 		// partitioning for PARTITION ALL BY.
 		if desc.PartitionAllBy && !implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey {
 			var err error
-			*implicitColumnDefIdx.idx, err = CreatePartitioning(
+			newImplicitCols, newPartitioning, err := CreatePartitioning(
 				ctx,
 				st,
 				evalCtx,
@@ -1815,6 +1815,7 @@ func NewTableDesc(
 			if err != nil {
 				return nil, err
 			}
+			tabledesc.UpdateIndexPartitioning(implicitColumnDefIdx.idx, newImplicitCols, newPartitioning)
 		}
 
 		if err := desc.AddIndex(*implicitColumnDefIdx.idx, implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey); err != nil {
@@ -1878,7 +1879,6 @@ func NewTableDesc(
 		return newColumns, nil
 	}
 
-	idxValidator := schemaexpr.MakeIndexPredicateValidator(ctx, n.Table, &desc, semaCtx)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
 		case *tree.ColumnTableDef, *tree.LikeTableDef:
@@ -1946,7 +1946,7 @@ func NewTableDesc(
 
 				if partitionBy != nil {
 					var err error
-					idx, err = CreatePartitioning(
+					newImplicitCols, newPartitioning, err := CreatePartitioning(
 						ctx,
 						st,
 						evalCtx,
@@ -1959,10 +1959,13 @@ func NewTableDesc(
 					if err != nil {
 						return nil, err
 					}
+					tabledesc.UpdateIndexPartitioning(&idx, newImplicitCols, newPartitioning)
 				}
 			}
 			if d.Predicate != nil {
-				expr, err := idxValidator.Validate(d.Predicate)
+				expr, err := schemaexpr.ValidatePartialIndexPredicate(
+					ctx, &desc, d.Predicate, &n.Table, semaCtx,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -2042,7 +2045,7 @@ func NewTableDesc(
 
 				if partitionBy != nil {
 					var err error
-					idx, err = CreatePartitioning(
+					newImplicitCols, newPartitioning, err := CreatePartitioning(
 						ctx,
 						st,
 						evalCtx,
@@ -2055,10 +2058,13 @@ func NewTableDesc(
 					if err != nil {
 						return nil, err
 					}
+					tabledesc.UpdateIndexPartitioning(&idx, newImplicitCols, newPartitioning)
 				}
 			}
 			if d.Predicate != nil {
-				expr, err := idxValidator.Validate(d.Predicate)
+				expr, err := schemaexpr.ValidatePartialIndexPredicate(
+					ctx, &desc, d.Predicate, &n.Table, semaCtx,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -2159,12 +2165,13 @@ func NewTableDesc(
 		}
 		// At this point, we could have PARTITION ALL BY NOTHING, so check it is != nil.
 		if partitionBy != nil {
-			newPrimaryIndex, err := CreatePartitioning(
+			newPrimaryIndex := desc.GetPrimaryIndex().IndexDescDeepCopy()
+			newImplicitCols, newPartitioning, err := CreatePartitioning(
 				ctx,
 				st,
 				evalCtx,
 				&desc,
-				*desc.GetPrimaryIndex().IndexDesc(),
+				newPrimaryIndex,
 				partitionBy,
 				nil, /* allowedNewColumnNames */
 				allowImplicitPartitioning,
@@ -2172,29 +2179,35 @@ func NewTableDesc(
 			if err != nil {
 				return nil, err
 			}
-			// During CreatePartitioning, implicitly partitioned columns may be
-			// created. AllocateIDs which allocates column IDs to each index
-			// needs to be called before CreatePartitioning as CreatePartitioning
-			// requires IDs to be allocated.
-			//
-			// As such, do a post check for implicitly partitioned columns, and
-			// if they are detected, ensure each index contains the implicitly
-			// partitioned column.
-			if numImplicitCols := newPrimaryIndex.Partitioning.NumImplicitColumns; numImplicitCols > 0 {
-				for _, idx := range desc.AllIndexes() {
-					if idx.GetEncodingType() == descpb.SecondaryIndexEncoding {
+			isIndexAltered := tabledesc.UpdateIndexPartitioning(&newPrimaryIndex, newImplicitCols, newPartitioning)
+			if isIndexAltered {
+				// During CreatePartitioning, implicitly partitioned columns may be
+				// created. AllocateIDs which allocates column IDs to each index
+				// needs to be called before CreatePartitioning as CreatePartitioning
+				// requires IDs to be allocated.
+				//
+				// As such, do a post check for implicitly partitioned columns, and
+				// if they are detected, ensure each index contains the implicitly
+				// partitioned column.
+				if numImplicitCols := newPrimaryIndex.Partitioning.NumImplicitColumns; numImplicitCols > 0 {
+					for _, idx := range desc.PublicNonPrimaryIndexes() {
+						missingExtraColumnIDs := make([]descpb.ColumnID, 0, numImplicitCols)
 						for _, implicitPrimaryColID := range newPrimaryIndex.ColumnIDs[:numImplicitCols] {
 							if !idx.ContainsColumnID(implicitPrimaryColID) {
-								idx.IndexDesc().ExtraColumnIDs = append(
-									idx.IndexDesc().ExtraColumnIDs,
-									implicitPrimaryColID,
-								)
+								missingExtraColumnIDs = append(missingExtraColumnIDs, implicitPrimaryColID)
+								idx.IndexDesc().ExtraColumnIDs = append(idx.IndexDesc().ExtraColumnIDs, implicitPrimaryColID)
 							}
 						}
+						if len(missingExtraColumnIDs) == 0 {
+							continue
+						}
+						newIdxDesc := idx.IndexDescDeepCopy()
+						newIdxDesc.ExtraColumnIDs = append(newIdxDesc.ExtraColumnIDs, missingExtraColumnIDs...)
+						desc.SetPublicNonPrimaryIndex(idx.Ordinal(), newIdxDesc)
 					}
 				}
+				desc.SetPrimaryIndex(newPrimaryIndex)
 			}
-			desc.SetPrimaryIndex(newPrimaryIndex)
 		}
 	}
 
@@ -2280,17 +2293,13 @@ func NewTableDesc(
 
 	// Now that we have all the other columns set up, we can validate
 	// any computed columns.
-	computedColValidator := schemaexpr.MakeComputedColumnValidator(
-		ctx,
-		&desc,
-		semaCtx,
-		&n.Table,
-	)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
 		case *tree.ColumnTableDef:
 			if d.IsComputed() {
-				serializedExpr, err := computedColValidator.Validate(d)
+				serializedExpr, err := schemaexpr.ValidateComputedColumnExpression(
+					ctx, &desc, d, &n.Table, semaCtx,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -2332,7 +2341,7 @@ func NewTableDesc(
 			if idx.NumColumns() > 1 {
 				telemetry.Inc(sqltelemetry.MultiColumnInvertedIndexCounter)
 			}
-			if idx.GetPartitioning().NumColumns != 0 {
+			if idx.GetPartitioning().NumColumns() != 0 {
 				telemetry.Inc(sqltelemetry.PartitionedInvertedIndexCounter)
 			}
 		}

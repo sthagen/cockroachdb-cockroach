@@ -11,7 +11,6 @@ package storageccl
 import (
 	"bytes"
 	"context"
-	"crypto/sha512"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -178,15 +177,6 @@ func evalExport(
 			break
 		}
 
-		var checksum []byte
-		if !args.OmitChecksum {
-			// Compute the checksum before we upload and remove the local file.
-			checksum, err = SHA512ChecksumData(data)
-			if err != nil {
-				return result.Result{}, err
-			}
-		}
-
 		if args.Encryption != nil {
 			data, err = EncryptFile(data, args.Encryption.Key)
 			if err != nil {
@@ -203,7 +193,6 @@ func evalExport(
 		exported := roachpb.ExportResponse_File{
 			Span:       span,
 			Exported:   summary,
-			Sha512:     checksum,
 			LocalityKV: localityKV,
 		}
 
@@ -215,7 +204,7 @@ func evalExport(
 			if err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxUploadRetries, func() error {
 				// We blindly retry any error here because we expect the caller to have
 				// verified the target is writable before sending ExportRequests for it.
-				if err := exportStore.WriteFile(ctx, exported.Path, bytes.NewReader(data)); err != nil {
+				if err := cloud.WriteFile(ctx, exportStore, exported.Path, bytes.NewReader(data)); err != nil {
 					log.VEventf(ctx, 1, "failed to put file: %+v", err)
 					return err
 				}
@@ -275,15 +264,6 @@ func evalExport(
 	}
 
 	return result.Result{}, nil
-}
-
-// SHA512ChecksumData returns the SHA512 checksum of data.
-func SHA512ChecksumData(data []byte) ([]byte, error) {
-	h := sha512.New()
-	if _, err := h.Write(data); err != nil {
-		panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
-	}
-	return h.Sum(nil), nil
 }
 
 func getMatchingStore(

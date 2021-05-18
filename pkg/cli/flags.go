@@ -229,6 +229,46 @@ var clusterNameRe = regexp.MustCompile(`^[a-zA-Z](?:[-a-zA-Z0-9]*[a-zA-Z0-9]|)$`
 
 const maxClusterNameLength = 256
 
+type keyTypeFilter int8
+
+const (
+	showAll keyTypeFilter = iota
+	showValues
+	showIntents
+	showTxns
+)
+
+// String implements the pflag.Value interface.
+func (f *keyTypeFilter) String() string {
+	switch *f {
+	case showValues:
+		return "values"
+	case showIntents:
+		return "intents"
+	case showTxns:
+		return "txns"
+	}
+	return "all"
+}
+
+// Type implements the pflag.Value interface.
+func (f *keyTypeFilter) Type() string { return "<key type>" }
+
+// Set implements the pflag.Value interface.
+func (f *keyTypeFilter) Set(v string) error {
+	switch v {
+	case "values":
+		*f = showValues
+	case "intents":
+		*f = showIntents
+	case "txns":
+		*f = showTxns
+	default:
+		return errors.Newf("invalid key filter type '%s'", v)
+	}
+	return nil
+}
+
 const backgroundEnvVar = "COCKROACH_BACKGROUND_RESTART"
 
 // flagSetForCmd is a replacement for cmd.Flag() that properly merges
@@ -838,6 +878,7 @@ func init() {
 		boolFlag(f, &debugCtx.values, cliflags.Values)
 		boolFlag(f, &debugCtx.sizes, cliflags.Sizes)
 		stringFlag(f, &debugCtx.decodeAsTableDesc, cliflags.DecodeAsTable)
+		varFlag(f, &debugCtx.keyTypes, cliflags.FilterKeys)
 	}
 	{
 		f := debugCheckLogConfigCmd.Flags()
@@ -856,6 +897,11 @@ func init() {
 	{
 		f := debugBallastCmd.Flags()
 		varFlag(f, &debugCtx.ballastSize, cliflags.Size)
+	}
+	{
+		// TODO(ayang): clean up so dir isn't passed to both pebble and --store
+		f := DebugPebbleCmd.PersistentFlags()
+		varFlag(f, &serverCfg.Stores, cliflags.Store)
 	}
 	{
 		for _, c := range []*cobra.Command{
@@ -958,7 +1004,7 @@ const (
 // registerEnvVarDefault registers a deferred initialization of a flag
 // from an environment variable.
 // The caller is responsible for ensuring that the flagInfo has been
-// efined in the FlagSet already.
+// defined in the FlagSet already.
 func registerEnvVarDefault(f *pflag.FlagSet, flagInfo cliflags.FlagInfo) {
 	if flagInfo.EnvVar == "" {
 		return

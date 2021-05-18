@@ -664,7 +664,7 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="radians"></a><code>radians(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Converts <code>val</code> as a degree value to a radians value.</p>
 </span></td></tr>
-<tr><td><a name="random"></a><code>random() &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns a random float between 0 and 1.</p>
+<tr><td><a name="random"></a><code>random() &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns a random floating-point number between 0 (inclusive) and 1 (exclusive). Note that the value contains at most 53 bits of randomness.</p>
 </span></td></tr>
 <tr><td><a name="round"></a><code>round(input: <a href="decimal.html">decimal</a>, decimal_accuracy: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Keeps <code>decimal_accuracy</code> number of figures to the right of the zero position in <code>input</code> using half away from zero rounding. If <code>decimal_accuracy</code> is not in the range -2^31…(2^31-1), the results are undefined.</p>
 </span></td></tr>
@@ -2436,7 +2436,9 @@ The output can be used to recreate a database.’</p>
 </span></td></tr>
 <tr><td><a name="get_bit"></a><code>get_bit(bit_string: varbit, index: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Extracts a bit at given index in the bit array.</p>
 </span></td></tr>
-<tr><td><a name="get_bit"></a><code>get_bit(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Extracts a bit at given index in the byte array.</p>
+<tr><td><a name="get_bit"></a><code>get_bit(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Extracts a bit at the given index in the byte array.</p>
+</span></td></tr>
+<tr><td><a name="get_byte"></a><code>get_byte(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Extracts a byte at the given index in the byte array.</p>
 </span></td></tr>
 <tr><td><a name="initcap"></a><code>initcap(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Capitalizes the first letter of <code>val</code>.</p>
 </span></td></tr>
@@ -2588,7 +2590,9 @@ The output can be used to recreate a database.’</p>
 </span></td></tr>
 <tr><td><a name="set_bit"></a><code>set_bit(bit_string: varbit, index: <a href="int.html">int</a>, to_set: <a href="int.html">int</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Updates a bit at given index in the bit array.</p>
 </span></td></tr>
-<tr><td><a name="set_bit"></a><code>set_bit(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>, to_set: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Updates a bit at given index in the byte array.</p>
+<tr><td><a name="set_bit"></a><code>set_bit(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>, to_set: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Updates a bit at the given index in the byte array.</p>
+</span></td></tr>
+<tr><td><a name="set_byte"></a><code>set_byte(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>, to_set: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Updates a byte at the given index in the byte array.</p>
 </span></td></tr>
 <tr><td><a name="sha1"></a><code>sha1(<a href="bytes.html">bytes</a>...) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Calculates the SHA1 hash value of a set of values.</p>
 </span></td></tr>

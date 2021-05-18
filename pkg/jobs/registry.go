@@ -41,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/logtags"
@@ -316,7 +315,7 @@ func (r *Registry) WaitForJobs(
 	// populate the crdb_internal.jobs vtable.
 	query := fmt.Sprintf(
 		`SELECT count(*) FROM system.jobs WHERE id IN (%s)
-       AND (status != 'succeeded' AND status != 'failed' AND status != 'canceled')`,
+       AND (status != $1 AND status != $2 AND status != $3 AND status != $4)`,
 		buf.String())
 	for r := retry.StartWithCtx(ctx, retry.Options{
 		InitialBackoff: 5 * time.Millisecond,
@@ -332,6 +331,10 @@ func (r *Registry) WaitForJobs(
 			nil, /* txn */
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			query,
+			StatusSucceeded,
+			StatusFailed,
+			StatusCanceled,
+			StatusRevertFailed,
 		)
 		if err != nil {
 			return errors.Wrap(err, "polling for queued jobs to complete")
@@ -527,18 +530,10 @@ func (r *Registry) CreateStartableJobWithTxn(
 
 	var resumerCtx context.Context
 	var cancel func()
-	var span *tracing.Span
 	var execDone chan struct{}
 	if !alreadyInitialized {
-		// Construct a context which contains a tracing span that follows from the
-		// span in the parent context. We don't directly use the parent span because
-		// we want independent lifetimes and cancellation. For the same reason, we
-		// don't use the Context returned by ForkSpan.
+		// Using a new context allows for independent lifetimes and cancellation.
 		resumerCtx, cancel = r.makeCtx()
-		_, span = tracing.ForkSpan(ctx, "job")
-		if span != nil {
-			resumerCtx = tracing.ContextWithSpan(resumerCtx, span)
-		}
 
 		if r.startUsingSQLLivenessAdoption(ctx) {
 			r.mu.Lock()
@@ -562,7 +557,6 @@ func (r *Registry) CreateStartableJobWithTxn(
 		*sj = &StartableJob{}
 		(*sj).resumerCtx = resumerCtx
 		(*sj).cancel = cancel
-		(*sj).span = span
 		(*sj).execDone = execDone
 	}
 	(*sj).Job = j
@@ -1249,7 +1243,7 @@ func (r *Registry) stepThroughStateMachine(
 			}
 			return sErr
 		}
-		return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusFailed,
+		return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusRevertFailed,
 			errors.Wrapf(err, "job %d: cannot be reverted, manual cleanup may be required", job.ID()))
 	case StatusFailed:
 		if jobErr == nil {
@@ -1261,6 +1255,17 @@ func (r *Registry) stepThroughStateMachine(
 			return errors.Wrapf(err, "job %d: could not mark as failed: %s", job.ID(), jobErr)
 		}
 		telemetry.Inc(TelemetryMetrics[jobType].Failed)
+		return jobErr
+	case StatusRevertFailed:
+		if jobErr == nil {
+			return errors.AssertionFailedf("job %d: has StatusRevertFailed but no error was provided",
+				job.ID())
+		}
+		if err := job.revertFailed(ctx, nil /* txn */, jobErr, nil /* fn */); err != nil {
+			// If we can't transactionally mark the job as failed then it will be
+			// restarted during the next adopt loop and reverting will be retried.
+			return errors.Wrapf(err, "job %d: could not mark as revert field: %s", job.ID(), jobErr)
+		}
 		return jobErr
 	default:
 		return errors.NewAssertionErrorWithWrappedErrf(jobErr,

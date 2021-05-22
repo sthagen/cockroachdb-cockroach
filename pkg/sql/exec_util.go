@@ -359,6 +359,13 @@ var clusterIdleInTransactionSessionTimeout = settings.RegisterDurationSetting(
 	settings.NonNegativeDuration,
 ).WithPublic()
 
+var experimentalExpressionBasedIndexesMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_expression_based_indexes.enabled",
+	"default value for experimental_enable_expression_based_indexes session setting;"+
+		"disables expression-based indexes by default",
+	false,
+)
+
 // TODO(rytaft): remove this once unique without index constraints are fully
 // supported.
 var experimentalUniqueWithoutIndexConstraintsMode = settings.RegisterBoolSetting(
@@ -747,6 +754,36 @@ var (
 		Name:        "sql.misc.count",
 		Help:        "Number of other SQL statements successfully executed",
 		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaSQLStatsMemMaxBytes = metric.Metadata{
+		Name:        "sql.stats.mem.max",
+		Help:        "Memory usage for fingerprint storage",
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
+	MetaSQLStatsMemCurBytes = metric.Metadata{
+		Name:        "sql.stats.mem.current",
+		Help:        "Current memory usage for fingerprint storage",
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
+	MetaReportedSQLStatsMemMaxBytes = metric.Metadata{
+		Name:        "sql.stats.reported.mem.max",
+		Help:        "Memory usage for reported fingerprint storage",
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
+	MetaReportedSQLStatsMemCurBytes = metric.Metadata{
+		Name:        "sql.stats.reported.mem.current",
+		Help:        "Current memory usage for reported fingerprint storage",
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
+	MetaDiscardedSQLStats = metric.Metadata{
+		Name:        "sql.stats.discarded.current",
+		Help:        "Number of fingerprint statistics being discarded",
+		Measurement: "Discarded SQL Stats",
 		Unit:        metric.Unit_COUNT,
 	}
 )
@@ -2374,6 +2411,12 @@ func (m *sessionDataMutator) SetAlterColumnTypeGeneral(val bool) {
 	m.data.AlterColumnTypeGeneralEnabled = val
 }
 
+// TODO(mgartner): remove this once expression-based indexes are fully
+// supported.
+func (m *sessionDataMutator) SetExpressionBasedIndexes(val bool) {
+	m.data.EnableExpressionBasedIndexes = val
+}
+
 // TODO(rytaft): remove this once unique without index constraints are fully
 // supported.
 func (m *sessionDataMutator) SetUniqueWithoutIndexConstraints(val bool) {
@@ -2439,6 +2482,7 @@ func newSQLStatsCollector(
 // be nil, as these are only sampled periodically per unique fingerprint. It
 // returns the statement ID of the recorded statement.
 func (s *sqlStatsCollector) recordStatement(
+	ctx context.Context,
 	stmt *Statement,
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
@@ -2451,9 +2495,9 @@ func (s *sqlStatsCollector) recordStatement(
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
 	stats topLevelQueryStats,
 	planner *planner,
-) roachpb.StmtID {
+) (roachpb.StmtID, error) {
 	return s.appStats.recordStatement(
-		stmt, samplePlanDescription, distSQLUsed, vectorized, implicitTxn, fullScan,
+		ctx, stmt, samplePlanDescription, distSQLUsed, vectorized, implicitTxn, fullScan,
 		automaticRetryCount, numRows, err, parseLat, planLat, runLat, svcLat,
 		ovhLat, stats, planner,
 	)
@@ -2461,6 +2505,7 @@ func (s *sqlStatsCollector) recordStatement(
 
 // recordTransaction records statistics for one transaction.
 func (s *sqlStatsCollector) recordTransaction(
+	ctx context.Context,
 	key txnKey,
 	txnTimeSec float64,
 	ev txnEvent,
@@ -2475,10 +2520,10 @@ func (s *sqlStatsCollector) recordTransaction(
 	execStats execstats.QueryLevelStats,
 	rowsRead int64,
 	bytesRead int64,
-) {
+) error {
 	s.appStats.recordTransactionCounts(txnTimeSec, ev, implicit)
-	s.appStats.recordTransaction(
-		key, int64(retryCount), statementIDs, serviceLat, retryLat, commitLat,
+	return s.appStats.recordTransaction(
+		ctx, key, int64(retryCount), statementIDs, serviceLat, retryLat, commitLat,
 		numRows, collectedExecStats, execStats, rowsRead, bytesRead,
 	)
 }

@@ -732,7 +732,7 @@ UPDATE system.jobs
 	if err := stopper.RunAsyncTask(context.Background(), "jobs/gc", func(ctx context.Context) {
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
 		settingChanged := make(chan struct{}, 1)
-		gcSetting.SetOnChange(&r.settings.SV, func() {
+		gcSetting.SetOnChange(&r.settings.SV, func(ctx context.Context) {
 			select {
 			case settingChanged <- struct{}{}:
 			default:
@@ -923,7 +923,7 @@ func (r *Registry) cleanupOldJobsPage(
 
 	log.VEventf(ctx, 2, "read potentially expired jobs: %d", numRows)
 	if len(toDelete.Array) > 0 {
-		log.Infof(ctx, "cleaning up expired job records: %d", len(toDelete.Array))
+		log.Infof(ctx, "attempting to clean up %d expired job records", len(toDelete.Array))
 		const stmt = `DELETE FROM system.jobs WHERE id = ANY($1)`
 		var nDeleted int
 		if nDeleted, err = r.ex.Exec(
@@ -931,10 +931,7 @@ func (r *Registry) cleanupOldJobsPage(
 		); err != nil {
 			return false, 0, errors.Wrap(err, "deleting old jobs")
 		}
-		if nDeleted != len(toDelete.Array) {
-			return false, 0, errors.AssertionFailedf("asked to delete %d rows but %d were actually deleted",
-				len(toDelete.Array), nDeleted)
-		}
+		log.Infof(ctx, "cleaned up %d expired job records", nDeleted)
 	}
 	// If we got as many rows as we asked for, there might be more.
 	morePages := numRows == pageSize

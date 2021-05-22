@@ -74,6 +74,10 @@ type PostDeserializationTableDescriptorChanges struct {
 	// UpgradedFormatVersion indicates that the FormatVersion was upgraded.
 	UpgradedFormatVersion bool
 
+	// UpgradedIndexFormatVersion indicates that the format version of at least
+	// one index descriptor was upgraded
+	UpgradedIndexFormatVersion bool
+
 	// FixedPrivileges indicates that the privileges were fixed.
 	//
 	// TODO(ajwerner): Determine whether this still needs to exist of can be
@@ -604,7 +608,7 @@ func (desc *Mutable) ensurePrimaryKey() error {
 		}
 		s := "unique_rowid()"
 		col := &descpb.ColumnDescriptor{
-			Name:        GenerateUniqueConstraintName("rowid", nameExists),
+			Name:        GenerateUniqueName("rowid", nameExists),
 			Type:        types.Int,
 			DefaultExpr: &s,
 			Hidden:      true,
@@ -646,6 +650,7 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 
 	// Populate IDs.
 	for _, idx := range desc.AllIndexes() {
+		maybeUpgradeIndexFormatVersion(idx.IndexDesc())
 		if idx.GetID() != 0 {
 			// This index has already been populated. Nothing to do.
 			continue
@@ -1714,7 +1719,7 @@ func (desc *Mutable) performComputedColumnSwap(swap *descpb.ComputedColumnSwap) 
 		return err == nil
 	}
 
-	uniqueName := GenerateUniqueConstraintName(newCol.GetName(), nameExists)
+	uniqueName := GenerateUniqueName(newCol.GetName(), nameExists)
 
 	// Remember the name of oldCol, because newCol will take it.
 	oldColName := oldCol.GetName()
@@ -2259,11 +2264,10 @@ func (desc *wrapper) TableDesc() *descpb.TableDescriptor {
 	return &desc.TableDescriptor
 }
 
-// GenerateUniqueConstraintName attempts to generate a unique constraint name
-// with the given prefix.
-// It will first try prefix by itself, then it will subsequently try
-// adding numeric digits at the end, starting from 1.
-func GenerateUniqueConstraintName(prefix string, nameExistsFunc func(name string) bool) string {
+// GenerateUniqueName attempts to generate a unique name with the given prefix.
+// It will first try prefix by itself, then it will subsequently try adding
+// numeric digits at the end, starting from 1.
+func GenerateUniqueName(prefix string, nameExistsFunc func(name string) bool) string {
 	name := prefix
 	for i := 1; nameExistsFunc(name); i++ {
 		name = fmt.Sprintf("%s_%d", prefix, i)

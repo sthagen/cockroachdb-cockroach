@@ -728,7 +728,6 @@ CREATE TABLE crdb_internal.jobs (
 						leaseNode = tree.NewDInt(tree.DInt(payload.Lease.NodeID))
 					}
 					errorStr = tree.NewDString(payload.Error)
-					traceID = tree.NewDInt(tree.DInt(payload.TraceID))
 				}
 
 				// Extract data from the progress field.
@@ -763,6 +762,7 @@ CREATE TABLE crdb_internal.jobs (
 								}
 							}
 						}
+						traceID = tree.NewDInt(tree.DInt(progress.TraceID))
 					}
 				}
 
@@ -836,6 +836,16 @@ func execStatVar(count int64, n roachpb.NumericStat) tree.Datum {
 	return tree.NewDFloat(tree.DFloat(n.GetVariance(count)))
 }
 
+// getSQLStats retrieves a sqlStats object from the planner or returns an error
+// if not available. virtualTableName specifies the virtual table for which this
+// sqlStats object is needed.
+func getSQLStats(p *planner, virtualTableName string) (*sqlStats, error) {
+	if p.extendedEvalCtx.sqlStatsCollector == nil || p.extendedEvalCtx.sqlStatsCollector.sqlStats == nil {
+		return nil, errors.Newf("%s cannot be used in this context", virtualTableName)
+	}
+	return p.extendedEvalCtx.sqlStatsCollector.sqlStats, nil
+}
+
 var crdbInternalStmtStatsTable = virtualSchemaTable{
 	comment: `statement statistics (in-memory, not durable; local node only). ` +
 		`This table is wiped periodically (by default, at least every two hours)`,
@@ -890,10 +900,9 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				"user %s does not have %s privilege", p.User(), roleoption.VIEWACTIVITY)
 		}
 
-		sqlStats := p.extendedEvalCtx.sqlStatsCollector.sqlStats
-		if sqlStats == nil {
-			return errors.AssertionFailedf(
-				"cannot access sql statistics from this context")
+		sqlStats, err := getSQLStats(p, "crdb_internal.node_statement_statistics")
+		if err != nil {
+			return err
 		}
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
@@ -901,11 +910,11 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 		// Retrieve the application names and sort them to ensure the
 		// output is deterministic.
 		var appNames []string
-		sqlStats.Lock()
-		for n := range sqlStats.apps {
+		sqlStats.mu.Lock()
+		for n := range sqlStats.mu.apps {
 			appNames = append(appNames, n)
 		}
-		sqlStats.Unlock()
+		sqlStats.mu.Unlock()
 		sort.Strings(appNames)
 
 		// Now retrieve the application stats proper.
@@ -931,7 +940,14 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				}
 
 				stmtID := constructStatementIDFromStmtKey(stmtKey)
-				s := appStats.getStatsForStmtWithKey(stmtKey, stmtID, true /* createIfNonexistent */)
+				s, _, _ := appStats.getStatsForStmtWithKey(stmtKey, stmtID, false /* createIfNonexistent */)
+
+				// If the key is not found (and we expected to find it), the table must
+				// have been cleared between now and the time we read all the keys. In
+				// that case we simply skip this key as there are no metrics to report.
+				if s == nil {
+					continue
+				}
 
 				s.mu.Lock()
 				errString := tree.DNull
@@ -1038,10 +1054,9 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			return pgerror.Newf(pgcode.InsufficientPrivilege,
 				"user %s does not have %s privilege", p.User(), roleoption.VIEWACTIVITY)
 		}
-		sqlStats := p.extendedEvalCtx.sqlStatsCollector.sqlStats
-		if sqlStats == nil {
-			return errors.AssertionFailedf(
-				"cannot access sql statistics from this context")
+		sqlStats, err := getSQLStats(p, "crdb_internal.node_transaction_statistics")
+		if err != nil {
+			return err
 		}
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
@@ -1049,12 +1064,12 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 		// Retrieve the application names and sort them to ensure the
 		// output is deterministic.
 		var appNames []string
-		sqlStats.Lock()
+		sqlStats.mu.Lock()
 
-		for n := range sqlStats.apps {
+		for n := range sqlStats.mu.apps {
 			appNames = append(appNames, n)
 		}
-		sqlStats.Unlock()
+		sqlStats.mu.Unlock()
 		sort.Strings(appNames)
 
 		for _, appName := range appNames {
@@ -1075,7 +1090,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 				// We don't want to create the key if it doesn't exist, so it's okay to
 				// pass nil for the statementIDs, as they are only set when a key is
 				// constructed.
-				s := appStats.getStatsForTxnWithKey(txnKey, nil, false /* createIfNonexistent */)
+				s, _, _ := appStats.getStatsForTxnWithKey(txnKey, nil, false /* createIfNonexistent */)
 				// If the key is not found (and we expected to find it), the table must
 				// have been cleared between now and the time we read all the keys. In
 				// that case we simply skip this key as there are no metrics to report.
@@ -1147,10 +1162,9 @@ CREATE TABLE crdb_internal.node_txn_stats (
 			return err
 		}
 
-		sqlStats := p.extendedEvalCtx.sqlStatsCollector.sqlStats
-		if sqlStats == nil {
-			return errors.AssertionFailedf(
-				"cannot access sql statistics from this context")
+		sqlStats, err := getSQLStats(p, "crdb_internal.node_txn_stats")
+		if err != nil {
+			return err
 		}
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
@@ -1158,11 +1172,11 @@ CREATE TABLE crdb_internal.node_txn_stats (
 		// Retrieve the application names and sort them to ensure the
 		// output is deterministic.
 		var appNames []string
-		sqlStats.Lock()
-		for n := range sqlStats.apps {
+		sqlStats.mu.Lock()
+		for n := range sqlStats.mu.apps {
 			appNames = append(appNames, n)
 		}
-		sqlStats.Unlock()
+		sqlStats.mu.Unlock()
 		sort.Strings(appNames)
 
 		for _, appName := range appNames {

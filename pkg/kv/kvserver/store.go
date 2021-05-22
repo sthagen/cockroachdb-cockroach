@@ -604,12 +604,16 @@ type Store struct {
 	}
 
 	counts struct {
-		// Number of placeholders removed due to error.
-		removedPlaceholders int32
-		// Number of placeholders successfully filled by a snapshot.
+		// Number of placeholders removed due to error. Not a good fit for meaningful
+		// metrics, as snapshots to initialized ranges don't get a placeholder.
+		failedPlaceholders int32
+		// Number of placeholders successfully filled by a snapshot. Not a good fit
+		// for meaningful metrics, as snapshots to initialized ranges don't get a
+		// placeholder.
 		filledPlaceholders int32
 		// Number of placeholders removed due to a snapshot that was dropped by
-		// raft.
+		// raft. Not a good fit for meaningful metrics, as snapshots to initialized
+		// ranges don't get a placeholder.
 		droppedPlaceholders int32
 	}
 
@@ -844,7 +848,7 @@ func NewStore(
 	s.renewableLeasesSignal = make(chan struct{})
 
 	s.limiters.BulkIOWriteRate = rate.NewLimiter(rate.Limit(bulkIOWriteLimit.Get(&cfg.Settings.SV)), bulkIOWriteBurst)
-	bulkIOWriteLimit.SetOnChange(&cfg.Settings.SV, func() {
+	bulkIOWriteLimit.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
 		s.limiters.BulkIOWriteRate.SetLimit(rate.Limit(bulkIOWriteLimit.Get(&cfg.Settings.SV)))
 	})
 	s.limiters.ConcurrentExportRequests = limit.MakeConcurrentRequestLimiter(
@@ -867,7 +871,7 @@ func NewStore(
 	if exportCores < 1 {
 		exportCores = 1
 	}
-	ExportRequestsLimit.SetOnChange(&cfg.Settings.SV, func() {
+	ExportRequestsLimit.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
 		limit := int(ExportRequestsLimit.Get(&cfg.Settings.SV))
 		if limit > exportCores {
 			limit = exportCores
@@ -877,13 +881,13 @@ func NewStore(
 	s.limiters.ConcurrentAddSSTableRequests = limit.MakeConcurrentRequestLimiter(
 		"addSSTableRequestLimiter", int(addSSTableRequestLimit.Get(&cfg.Settings.SV)),
 	)
-	addSSTableRequestLimit.SetOnChange(&cfg.Settings.SV, func() {
+	addSSTableRequestLimit.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
 		s.limiters.ConcurrentAddSSTableRequests.SetLimit(int(addSSTableRequestLimit.Get(&cfg.Settings.SV)))
 	})
 	s.limiters.ConcurrentRangefeedIters = limit.MakeConcurrentRequestLimiter(
 		"rangefeedIterLimiter", int(concurrentRangefeedItersLimit.Get(&cfg.Settings.SV)),
 	)
-	concurrentRangefeedItersLimit.SetOnChange(&cfg.Settings.SV, func() {
+	concurrentRangefeedItersLimit.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
 		s.limiters.ConcurrentRangefeedIters.SetLimit(
 			int(concurrentRangefeedItersLimit.Get(&cfg.Settings.SV)))
 	})
@@ -895,7 +899,7 @@ func NewStore(
 		"SystemConfigUpdateQueue",
 		quotapool.Limit(queueAdditionOnSystemConfigUpdateRate.Get(&cfg.Settings.SV)),
 		queueAdditionOnSystemConfigUpdateBurst.Get(&cfg.Settings.SV))
-	updateSystemConfigUpdateQueueLimits := func() {
+	updateSystemConfigUpdateQueueLimits := func(ctx context.Context) {
 		s.systemConfigUpdateQueueRateLimiter.UpdateLimit(
 			quotapool.Limit(queueAdditionOnSystemConfigUpdateRate.Get(&cfg.Settings.SV)),
 			queueAdditionOnSystemConfigUpdateBurst.Get(&cfg.Settings.SV))
@@ -1580,7 +1584,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		consistencyCheckRate.Get(&s.ClusterSettings().SV)*consistencyCheckRateBurstFactor,
 		quotapool.WithMinimumWait(consistencyCheckRateMinWait))
 
-	consistencyCheckRate.SetOnChange(&s.ClusterSettings().SV, func() {
+	consistencyCheckRate.SetOnChange(&s.ClusterSettings().SV, func(ctx context.Context) {
 		rate := consistencyCheckRate.Get(&s.ClusterSettings().SV)
 		s.consistencyLimiter.UpdateLimit(quotapool.Limit(rate), rate*consistencyCheckRateBurstFactor)
 	})
@@ -1822,7 +1826,7 @@ func (s *Store) startRangefeedUpdater(ctx context.Context) {
 		st := s.cfg.Settings
 
 		confCh := make(chan struct{}, 1)
-		confChanged := func() {
+		confChanged := func(ctx context.Context) {
 			select {
 			case confCh <- struct{}{}:
 			default:

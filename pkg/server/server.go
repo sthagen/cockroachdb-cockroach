@@ -898,7 +898,7 @@ func (s *Server) startMonitoringForwardClockJumps(ctx context.Context) error {
 	forwardJumpCheckEnabled := make(chan bool, 1)
 	s.stopper.AddCloser(stop.CloserFn(func() { close(forwardJumpCheckEnabled) }))
 
-	forwardClockJumpCheckEnabled.SetOnChange(&s.st.SV, func() {
+	forwardClockJumpCheckEnabled.SetOnChange(&s.st.SV, func(context.Context) {
 		forwardJumpCheckEnabled <- forwardClockJumpCheckEnabled.Get(&s.st.SV)
 	})
 
@@ -1062,7 +1062,7 @@ func (s *Server) startPersistingHLCUpperBound(
 	tickerFn func(d time.Duration) *time.Ticker,
 ) error {
 	persistHLCUpperBoundIntervalCh := make(chan time.Duration, 1)
-	persistHLCUpperBoundInterval.SetOnChange(&s.st.SV, func() {
+	persistHLCUpperBoundInterval.SetOnChange(&s.st.SV, func(context.Context) {
 		persistHLCUpperBoundIntervalCh <- persistHLCUpperBoundInterval.Get(&s.st.SV)
 	})
 
@@ -1654,7 +1654,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	}
 
 	var graphiteOnce sync.Once
-	graphiteEndpoint.SetOnChange(&s.st.SV, func() {
+	graphiteEndpoint.SetOnChange(&s.st.SV, func(context.Context) {
 		if graphiteEndpoint.Get(&s.st.SV) != "" {
 			graphiteOnce.Do(func() {
 				s.node.startGraphiteStatsExporter(s.st)
@@ -2346,10 +2346,10 @@ func (s *Server) Decommission(
 					ctx,
 					s.sqlServer.execCfg.InternalExecutor,
 					txn,
-					int32(nodeID), int32(s.NodeID()),
-					true, /* skipExternalLog - we already call log.StructuredEvent above */
+					int32(s.NodeID()), /* reporting ID: the node where the event is logged */
+					sql.LogToSystemTable|sql.LogToDevChannelIfVerbose, /* we already call log.StructuredEvent above */
+					int32(nodeID), /* target ID: the node that we wee a membership change for */
 					event,
-					false, /* onlyLog */
 				)
 			}); err != nil {
 				log.Ops.Errorf(ctx, "unable to record event: %+v: %+v", event, err)

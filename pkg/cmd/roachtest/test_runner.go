@@ -299,7 +299,7 @@ func (r *testRunner) Run(
 				l,
 			); err != nil {
 				// A worker returned an error. Let's shut down.
-				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %+v", i, err)
+				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %v", i, err)
 				shout(ctx, l, lopt.stdout, msg)
 				errs.AddErr(err)
 				// Stop the stopper. This will cause all workers to not pick up more
@@ -681,7 +681,7 @@ func (r *testRunner) runTest(
 
 				req := issues.PostRequest{
 					AuthorEmail:     "", // intentionally unset - we add to the board and cc the team
-					Mention:         []string{string(alias)},
+					Mention:         []string{"@" + string(alias)},
 					ProjectColumnID: owner.TriageColumnID,
 					PackageName:     "roachtest",
 					TestName:        t.Name(),
@@ -922,6 +922,9 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	if err := c.FetchDiskUsage(ctx); err != nil {
 		l.Printf("failed to fetch disk uage summary: %s", err)
 	}
+	if err := c.FetchTimeseriesData(ctx); err != nil {
+		l.Printf("failed to fetch timeseries data: %s", err)
+	}
 	if err := c.FetchDebugZip(ctx); err != nil {
 		l.Printf("failed to collect zip: %s", err)
 	}
@@ -1109,14 +1112,10 @@ func (r *testRunner) serveHTTP(wr http.ResponseWriter, req *http.Request) {
 		var clusterName, clusterAdminUIAddr string
 		if w.Cluster() != nil {
 			clusterName = w.Cluster().name
-			adminUIAddrs, err := w.Cluster().ExternalAdminUIAddr(
-				req.Context(),
-				w.Cluster().Node(1),
-			)
-			if err != nil {
-				w.Cluster().t.Fatal(err)
+			adminUIAddrs, err := w.Cluster().ExternalAdminUIAddr(req.Context(), w.Cluster().Node(1))
+			if err == nil {
+				clusterAdminUIAddr = adminUIAddrs[0]
 			}
-			clusterAdminUIAddr = adminUIAddrs[0]
 		}
 		t := w.Test()
 		testStatus := "N/A"
@@ -1216,7 +1215,7 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// (see runVersionUpgrade). The same is true for adding a new key to this
 	// map.
 	verMap := map[string]string{
-		"21.2": "21.1.0",
+		"21.2": "21.1.1",
 		"21.1": "20.2.10",
 		"20.2": "20.1.16",
 		"20.1": "19.2.11",

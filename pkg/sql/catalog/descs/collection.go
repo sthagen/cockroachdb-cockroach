@@ -230,6 +230,10 @@ type Collection struct {
 	// skipValidationOnWrite should only be set to true during forced descriptor
 	// repairs.
 	skipValidationOnWrite bool
+
+	// droppedDescriptors that will not need to wait for new
+	// lease versions.
+	deletedDescs []catalog.Descriptor
 }
 
 var _ catalog.Accessor = (*Collection)(nil)
@@ -1469,6 +1473,7 @@ func (tc *Collection) ReleaseAll(ctx context.Context) {
 	tc.ReleaseLeases(ctx)
 	tc.uncommittedDescriptors = nil
 	tc.syntheticDescriptors = nil
+	tc.deletedDescs = nil
 	tc.releaseAllDescriptors()
 }
 
@@ -2122,6 +2127,17 @@ func (tc *Collection) codec() keys.SQLCodec {
 	return tc.leaseMgr.Codec()
 }
 
+// AddDeletedDescriptor is temporarily tracking descriptors that have been,
+// deleted which from an add state without any intermediate steps
+// Any descriptors marked as deleted will be skipped for the
+// wait for one version logic inside descs.Txn, since they will no longer
+// be inside storage.
+// Note: that this happens, at time of writing, only when reverting an
+// IMPORT or RESTORE.
+func (tc *Collection) AddDeletedDescriptor(desc catalog.Descriptor) {
+	tc.deletedDescs = append(tc.deletedDescs, desc)
+}
+
 // LeaseManager returns the lease.Manager.
 func (tc *Collection) LeaseManager() *lease.Manager {
 	return tc.leaseMgr
@@ -2180,7 +2196,11 @@ func (dt DistSQLTypeResolver) ResolveType(
 
 // ResolveTypeByOID implements the tree.TypeReferenceResolver interface.
 func (dt DistSQLTypeResolver) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
-	name, desc, err := dt.GetTypeDescriptor(ctx, typedesc.UserDefinedTypeOIDToID(oid))
+	id, err := typedesc.UserDefinedTypeOIDToID(oid)
+	if err != nil {
+		return nil, err
+	}
+	name, desc, err := dt.GetTypeDescriptor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -2213,7 +2233,11 @@ func (dt DistSQLTypeResolver) GetTypeDescriptor(
 func (dt DistSQLTypeResolver) HydrateTypeSlice(ctx context.Context, typs []*types.T) error {
 	for _, t := range typs {
 		if t.UserDefined() {
-			name, desc, err := dt.GetTypeDescriptor(ctx, typedesc.GetTypeDescID(t))
+			id, err := typedesc.GetUserDefinedTypeDescID(t)
+			if err != nil {
+				return err
+			}
+			name, desc, err := dt.GetTypeDescriptor(ctx, id)
 			if err != nil {
 				return err
 			}

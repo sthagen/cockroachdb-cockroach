@@ -140,7 +140,7 @@ type Descriptor interface {
 
 	// GetReferencedDescIDs returns the IDs of all descriptors directly referenced
 	// by this descriptor, including itself.
-	GetReferencedDescIDs() DescriptorIDSet
+	GetReferencedDescIDs() (DescriptorIDSet, error)
 
 	// ValidateSelf checks the internal consistency of the descriptor.
 	ValidateSelf(vea ValidationErrorAccumulator)
@@ -234,7 +234,7 @@ type TableDescriptor interface {
 	// See also Index.Ordinal().
 	NonDropIndexes() []Index
 
-	// NonDropIndexes returns a slice of all partial indexes in the underlying
+	// PartialIndexes returns a slice of all partial indexes in the underlying
 	// proto, in their canonical order. This is equivalent to taking the slice
 	// produced by AllIndexes and removing indexes with empty expressions.
 	PartialIndexes() []Index
@@ -358,7 +358,7 @@ type TypeDescriptor interface {
 	HydrateTypeInfoWithName(ctx context.Context, typ *types.T, name *tree.TypeName, res TypeDescriptorResolver) error
 	MakeTypesT(ctx context.Context, name *tree.TypeName, res TypeDescriptorResolver) (*types.T, error)
 	HasPendingSchemaChanges() bool
-	GetIDClosure() map[descpb.ID]struct{}
+	GetIDClosure() (map[descpb.ID]struct{}, error)
 	IsCompatibleWith(other TypeDescriptor) error
 
 	PrimaryRegionName() (descpb.RegionName, error)

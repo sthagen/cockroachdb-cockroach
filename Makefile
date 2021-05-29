@@ -44,6 +44,8 @@ endif
 	@echo "NCPUS = $$({ getconf _NPROCESSORS_ONLN || sysctl -n hw.ncpu || nproc; } 2>/dev/null)" >> $@.tmp
 	@echo "UNAME = $$(uname)" >> $@.tmp
 	@echo "HOST_TRIPLE = $$($$($(GO) env CC) -dumpmachine)" >> $@.tmp
+	@echo "GO_ENV_CC = $$(which $$($(GO) env CC))" >> $@.tmp
+	@echo "GO_ENV_CXX = $$(which $$($(GO) env CXX))" >> $@.tmp
 	@echo "GIT_DIR = $$(git rev-parse --git-dir 2>/dev/null)" >> $@.tmp
 	@echo "GITHOOKSDIR = $$(test -d .git && echo '.git/hooks' || git rev-parse --git-path hooks)" >> $@.tmp
 	@echo "have-defs = 1" >> $@.tmp
@@ -457,6 +459,7 @@ xconfigure-flags := $(configure-flags) $(EXTRA_XCONFIGURE_FLAGS)
 # If we're cross-compiling, inform Autotools and CMake.
 ifdef is-cross-compile
 xconfigure-flags += --host=$(TARGET_TRIPLE) CC=$(XCC) CXX=$(XCXX)
+cmake-flags += -DCMAKE_C_COMPILER=$(GO_ENV_CC) -DCMAKE_CXX_COMPILER=$(GO_ENV_CXX)
 xcmake-flags += -DCMAKE_SYSTEM_NAME=$(XCMAKE_SYSTEM_NAME) -DCMAKE_C_COMPILER=$(XCC) -DCMAKE_CXX_COMPILER=$(XCXX)
 override xgo := GOFLAGS= GOOS=$(XGOOS) GOARCH=$(XGOARCH) CC=$(XCC) CXX=$(XCXX) $(xgo)
 endif
@@ -652,7 +655,7 @@ $(PROTOC_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | bin/.submodules-initial
 	mkdir -p $(PROTOC_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/protobuf-rebuild. See above for rationale.
-	cd $(PROTOC_DIR) && cmake $(CMAKE_FLAGS) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
+	cd $(PROTOC_DIR) && cmake $(cmake-flags) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
 	  -DCMAKE_BUILD_TYPE=Release
 endif
 
@@ -906,6 +909,8 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/colexecsel/default_cmp_sel_ops.eg.go \
   pkg/sql/colexec/colexecsel/selection_ops.eg.go \
   pkg/sql/colexec/colexecsel/sel_like_ops.eg.go \
+  pkg/sql/colexec/colexecwindow/lag.eg.go \
+  pkg/sql/colexec/colexecwindow/lead.eg.go \
   pkg/sql/colexec/colexecwindow/ntile.eg.go \
   pkg/sql/colexec/colexecwindow/rank.eg.go \
   pkg/sql/colexec/colexecwindow/relative_rank.eg.go \
@@ -1538,6 +1543,7 @@ pkg/sql/parser/help_messages.go: pkg/sql/parser/sql.y pkg/sql/parser/help.awk | 
 	gofmt -s -w $@
 
 bin/.docgen_bnfs: bin/docgen
+	rm -f docs/generated/sql/bnf/*.bnf
 	docgen grammar bnf docs/generated/sql/bnf --quiet
 	touch $@
 

@@ -13,6 +13,7 @@ package builtins
 import (
 	"bytes"
 	"crypto/md5"
+	cryptorand "crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -500,7 +501,7 @@ var builtins = map[string]builtinDefinition{
 				// To extract a bit at the given index, we have to determine the
 				// position within byte array, i.e. index/8 after that checked
 				// the bit at residual index.
-				if byteString[index/8]&(byte(1)<<(8-1-byte(index)%8)) != 0 {
+				if byteString[index/8]&(byte(1)<<(byte(index)%8)) != 0 {
 					return tree.NewDInt(tree.DInt(1)), nil
 				}
 				return tree.NewDInt(tree.DInt(0)), nil
@@ -581,9 +582,9 @@ var builtins = map[string]builtinDefinition{
 				// position within byte array, i.e. index/8 after that checked
 				// the bit at residual index.
 				// Forcefully making bit at the index to 0.
-				byteString[index/8] &= ^(byte(1) << (8 - 1 - byte(index)%8))
+				byteString[index/8] &= ^(byte(1) << (byte(index) % 8))
 				// Updating value at the index to toSet.
-				byteString[index/8] |= byte(toSet) << (8 - 1 - byte(index)%8)
+				byteString[index/8] |= byte(toSet) << (byte(index) % 8)
 				return tree.NewDBytes(tree.DBytes(byteString)), nil
 			},
 			Info:       "Updates a bit at the given index in the byte array.",
@@ -662,7 +663,7 @@ var builtins = map[string]builtinDefinition{
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Uuid),
 			Fn: func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
-				entropy := ulid.Monotonic(rand.New(rand.NewSource(timeutil.Now().UnixNano())), 0)
+				entropy := ulid.Monotonic(cryptorand.Reader, 0)
 				uv := ulid.MustNew(ulid.Now(), entropy)
 				return tree.NewDUuid(tree.DUuid{UUID: uuid.UUID(uv)}), nil
 			},
@@ -4001,13 +4002,13 @@ may increase either contention or retry errors, or both.`,
 				}
 				// Collect the index columns. If the index is a non-unique secondary
 				// index, it might have some extra key columns.
-				indexColIDs := make([]descpb.ColumnID, index.NumColumns(), index.NumColumns()+index.NumExtraColumns())
-				for i := 0; i < index.NumColumns(); i++ {
-					indexColIDs[i] = index.GetColumnID(i)
+				indexColIDs := make([]descpb.ColumnID, index.NumKeyColumns(), index.NumKeyColumns()+index.NumKeySuffixColumns())
+				for i := 0; i < index.NumKeyColumns(); i++ {
+					indexColIDs[i] = index.GetKeyColumnID(i)
 				}
 				if index.GetID() != tableDesc.GetPrimaryIndexID() && !index.IsUnique() {
-					for i := 0; i < index.NumExtraColumns(); i++ {
-						indexColIDs = append(indexColIDs, index.GetExtraColumnID(i))
+					for i := 0; i < index.NumKeySuffixColumns(); i++ {
+						indexColIDs = append(indexColIDs, index.GetKeySuffixColumnID(i))
 					}
 				}
 
@@ -4019,10 +4020,10 @@ may increase either contention or retry errors, or both.`,
 					)
 					// If the index has some extra key columns, then output an error
 					// message with some extra information to explain the subtlety.
-					if index.GetID() != tableDesc.GetPrimaryIndexID() && !index.IsUnique() && index.NumExtraColumns() > 0 {
+					if index.GetID() != tableDesc.GetPrimaryIndexID() && !index.IsUnique() && index.NumKeySuffixColumns() > 0 {
 						var extraColNames []string
-						for i := 0; i < index.NumExtraColumns(); i++ {
-							id := index.GetExtraColumnID(i)
+						for i := 0; i < index.NumKeySuffixColumns(); i++ {
+							id := index.GetKeySuffixColumnID(i)
 							col, colErr := tableDesc.FindColumnWithID(id)
 							if colErr != nil {
 								return nil, errors.CombineErrors(err, colErr)

@@ -716,18 +716,20 @@ func (ts *TestServer) StartTenant(
 		}
 	}
 
-	rowCount, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
-		ctx, "testserver-check-tenant-active", nil,
-		"SELECT 1 FROM system.tenants WHERE id=$1 AND active=true",
-		params.TenantID.ToUint64(),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if rowCount == 0 {
-		return nil, errors.New("not found")
-	}
+	if !params.SkipTenantCheck {
+		rowCount, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
+			ctx, "testserver-check-tenant-active", nil,
+			"SELECT 1 FROM system.tenants WHERE id=$1 AND active=true",
+			params.TenantID.ToUint64(),
+		)
 
+		if err != nil {
+			return nil, err
+		}
+		if rowCount == 0 {
+			return nil, errors.New("not found")
+		}
+	}
 	st := params.Settings
 	if st == nil {
 		st = cluster.MakeTestingClusterSettings()
@@ -1301,7 +1303,7 @@ func (ts *TestServer) GetRangeLease(
 	resp := leaseResp.(*roachpb.LeaseInfoResponse)
 	if queryPolicy == QueryLocalNodeOnly && resp.EvaluatedBy != ts.GetFirstStoreID() {
 		// TODO(andrei): Figure out how to deal with nodes with multiple stores.
-		// This API API should permit addressing the query to a particular store.
+		// This API should permit addressing the query to a particular store.
 		return LeaseInfo{}, hlc.ClockTimestamp{}, errors.Errorf(
 			"request not evaluated locally; evaluated by s%d instead of local s%d",
 			resp.EvaluatedBy, ts.GetFirstStoreID())

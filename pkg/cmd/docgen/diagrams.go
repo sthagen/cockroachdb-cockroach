@@ -373,6 +373,15 @@ var specs = []stmtSpec{
 		unlink:  []string{"table_name"},
 	},
 	{
+		name:   "alter_database_primary_region",
+		stmt:   "alter_database_primary_region_stmt",
+		inline: []string{"primary_region_clause", "opt_equal"},
+	},
+	{
+		name: "alter_database_drop_region",
+		stmt: "alter_database_drop_region_stmt",
+	},
+	{
 		name:   "alter_primary_key",
 		stmt:   "alter_onetable_stmt",
 		inline: []string{"alter_table_cmds", "alter_table_cmd", "opt_hash_sharded"},
@@ -576,10 +585,13 @@ var specs = []stmtSpec{
 		unlink:  []string{"session_id"},
 	},
 	{
-		name:    "create_database_stmt",
-		inline:  []string{"opt_encoding_clause", "opt_connection_limit", "opt_equal"},
-		replace: map[string]string{"'SCONST'": "encoding"},
-		unlink:  []string{"name", "encoding"},
+		name:   "create_database_stmt",
+		inline: []string{"opt_with", "opt_encoding_clause", "opt_connection_limit", "opt_equal", "opt_primary_region_clause", "primary_region_clause", "opt_regions_list", "region_or_regions", "opt_survival_goal_clause", "survival_goal_clause", "opt_equal"},
+		replace: map[string]string{
+			"non_reserved_word_or_sconst": "encoding",
+			"signed_iconst":               "limit"},
+		unlink:  []string{"non_reserved_word_or_sconst", "signed_iconst", "encoding", "limit"},
+		nosplit: true,
 	},
 	{
 		name:   "create_changefeed_stmt",
@@ -672,6 +684,12 @@ var specs = []stmtSpec{
 		name:    "create_table_stmt",
 		inline:  []string{"opt_table_elem_list", "table_elem_list", "table_elem", "opt_table_with", "opt_create_table_on_commit"},
 		nosplit: true,
+	},
+	{
+		name:    "opt_locality",
+		inline:  []string{"locality"},
+		replace: map[string]string{" name": "column_name"},
+		unlink:  []string{"column_name"},
 	},
 	{
 		name: "create_type",
@@ -869,31 +887,13 @@ var specs = []stmtSpec{
 		inline: []string{"name_list"},
 	},
 	{
-		name:   "grant_privileges",
-		stmt:   "grant_stmt",
-		inline: []string{"privileges", "privilege_list", "privilege", "table_pattern_list", "name_list"},
-		replace: map[string]string{
-			"( name | 'CREATE' | 'GRANT' | 'SELECT' )": "( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' )",
-			"table_pattern":                     "table_name",
-			"'TO' ( ( name ) ( ( ',' name ) )*": "'TO' ( ( user_name ) ( ( ',' user_name ) )*",
-			"| 'GRANT' ( ( ( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' ) ) ( ( ',' ( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' ) ) )* ) 'TO' ( ( user_name ) ( ( ',' user_name ) )* )": "",
-			"'WITH' 'ADMIN' 'OPTION'": "",
-			"targets":                 "( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )",
-		},
-		unlink:  []string{"table_name", "database_name", "user_name"},
-		nosplit: true,
-	},
-	{
-		name: "grant_roles",
-		stmt: "grant_stmt",
+		name:   "grant_stmt",
+		inline: []string{"privileges", "opt_privileges_clause"},
 		exclude: []*regexp.Regexp{
-			// Ignore other grant statements that are granting privileges.
-			regexp.MustCompile("'GRANT' privileges"),
-		}, replace: map[string]string{
-			"'GRANT' privilege_list 'TO' name_list 'WITH' 'ADMIN' 'OPTION'": "'GRANT' ( role_name ) ( ( ',' role_name ) )* 'TO' ( user_name ) ( ( ',' user_name ) )* 'WITH' 'ADMIN' 'OPTION'",
-			"| 'GRANT' privilege_list 'TO' name_list":                       "'GRANT' ( role_name ) ( ( ',' role_name ) )* 'TO' ( user_name ) ( ( ',' user_name ) )*",
+			regexp.MustCompile("'TYPE' target_types"),
+			regexp.MustCompile("'SCHEMA' schema_name_list"),
 		},
-		unlink: []string{"role_name", "user_name"},
+		unlink: []string{"targets"},
 	},
 	{
 		name: "foreign_key_column_level",
@@ -1100,33 +1100,13 @@ var specs = []stmtSpec{
 		unlink:  []string{"schedule_id"},
 	},
 	{
-		name:   "revoke_privileges",
-		stmt:   "revoke_stmt",
-		inline: []string{"privileges", "privilege_list", "privilege", "name_list"},
-		replace: map[string]string{
-			"( name | 'CREATE' | 'GRANT' | 'SELECT' )": "( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' )",
-			"targets":                             "( ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )",
-			"'FROM' ( ( name ) ( ( ',' name ) )*": "'FROM' ( ( user_name ) ( ( ',' user_name ) )*",
-			"| 'REVOKE' ( ( ( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' ) ) ( ( ',' ( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' ) ) )* ) 'FROM' ( ( user_name ) ( ( ',' user_name ) )* )":  "",
-			"| 'REVOKE'  ( ( ( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' ) ) ( ( ',' ( 'CREATE' | 'GRANT' | 'SELECT' | 'DROP' | 'INSERT' | 'DELETE' | 'UPDATE' ) ) )* ) 'FROM' ( ( user_name ) ( ( ',' user_name ) )* )": "",
-			"'ADMIN' 'OPTION' 'FOR'": "",
-		},
-		unlink:  []string{"table_name", "database_name", "user_name"},
-		nosplit: true,
-	},
-	{
-		name: "revoke_roles",
-		stmt: "revoke_stmt",
+		name:   "revoke_stmt",
+		inline: []string{"privileges", "opt_privileges_clause"},
 		exclude: []*regexp.Regexp{
-			// Ignore other grant statements that are granting privileges.
-			regexp.MustCompile("'REVOKE' privileges"),
+			regexp.MustCompile("'TYPE' target_types"),
+			regexp.MustCompile("'SCHEMA' schema_name_list"),
 		},
-		replace: map[string]string{
-			"'REVOKE' privileges 'ON' targets 'FROM' name_list":               "",
-			"'REVOKE' 'ADMIN' 'OPTION' 'FOR' privilege_list 'FROM' name_list": "'REVOKE' 'ADMIN' 'OPTION' 'FOR' ( role_name ) ( ( ',' role_name ) )* 'FROM' ( user_name ) ( ( ',' user_name ) )*",
-			"| 'REVOKE' privilege_list 'FROM' name_list":                      "'REVOKE' ( role_name ) ( ( ',' role_name ) )* 'FROM' ( user_name ) ( ( ',' user_name ) )*",
-		},
-		unlink: []string{"role_name", "user_name"},
+		unlink: []string{"targets"},
 	},
 	{
 		name:    "rollback_transaction",

@@ -141,17 +141,14 @@ func newProxyHandler(
 		certManager:  certmgr.NewCertManager(ctx),
 	}
 
-	var err error
-	err = handler.setupIncomingCert()
+	err := handler.setupIncomingCert()
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, _ = stopper.WithCancelOnQuiesce(ctx)
-	handler.denyListService, err = denylist.NewViperDenyListFromFile(ctx, options.Denylist, options.PollConfigInterval)
-	if err != nil {
-		return nil, err
-	}
+	handler.denyListService = denylist.NewDenylistWithFile(ctx, options.Denylist,
+		denylist.WithPollingInterval(options.PollConfigInterval))
 
 	handler.throttleService = throttler.NewLocalService(throttler.WithBaseDelay(options.RatelimitBaseDelay))
 	handler.connCache = cache.NewCappedConnCache(maxKnownConnCacheSize)
@@ -346,7 +343,7 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 
 	select {
 	case err := <-errConnectionCopy:
-		updateMetricsAndSendErrToClient(err, conn, handler.metrics)
+		handler.metrics.updateForError(err)
 		return err
 	case err := <-errExpired:
 		if err != nil {
@@ -354,7 +351,7 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 			codeErr := newErrorf(
 				codeExpiredClientConnection, "expired client conn: %v", err,
 			)
-			updateMetricsAndSendErrToClient(codeErr, conn, handler.metrics)
+			handler.metrics.updateForError(codeErr)
 			return codeErr
 		}
 		return nil

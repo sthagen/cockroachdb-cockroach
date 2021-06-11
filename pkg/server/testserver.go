@@ -51,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -376,6 +377,14 @@ func (ts *TestServer) NodeLiveness() interface{} {
 	return nil
 }
 
+// NodeDialer returns the NodeDialer used by the TestServer.
+func (ts *TestServer) NodeDialer() interface{} {
+	if ts != nil {
+		return ts.nodeDialer
+	}
+	return nil
+}
+
 // HeartbeatNodeLiveness heartbeats the server's NodeLiveness record.
 func (ts *TestServer) HeartbeatNodeLiveness() error {
 	if ts == nil {
@@ -433,14 +442,6 @@ func (ts *TestServer) PGServer() *pgwire.Server {
 func (ts *TestServer) RaftTransport() *kvserver.RaftTransport {
 	if ts != nil {
 		return ts.raftTransport
-	}
-	return nil
-}
-
-// NodeDialer returns the NodeDialer used by the TestServer.
-func (ts *TestServer) NodeDialer() *nodedialer.Dialer {
-	if ts != nil {
-		return ts.nodeDialer
 	}
 	return nil
 }
@@ -594,6 +595,7 @@ func makeSQLServerArgs(
 	dummyRPCServer := grpc.NewServer()
 	sessionRegistry := sql.NewSessionRegistry()
 	contentionRegistry := contention.NewRegistry()
+	flowScheduler := flowinfra.NewFlowScheduler(baseCfg.AmbientCtx, stopper, st)
 	return sqlServerArgs{
 		sqlServerOptionalKVArgs: sqlServerOptionalKVArgs{
 			nodesStatusServer: serverpb.MakeOptionalNodesStatusServer(nil),
@@ -625,6 +627,7 @@ func makeSQLServerArgs(
 		recorder:                 recorder,
 		sessionRegistry:          sessionRegistry,
 		contentionRegistry:       contentionRegistry,
+		flowScheduler:            flowScheduler,
 		circularInternalExecutor: circularInternalExecutor,
 		circularJobRegistry:      &jobs.Registry{},
 		protectedtsProvider:      protectedTSProvider,

@@ -124,7 +124,8 @@ func TestFlowScheduler(t *testing.T) {
 	)
 	defer stopper.Stop(ctx)
 
-	scheduler := NewFlowScheduler(log.AmbientContext{}, stopper, settings, &metrics)
+	scheduler := NewFlowScheduler(log.AmbientContext{}, stopper, settings)
+	scheduler.Init(&metrics)
 	scheduler.Start()
 	getNumRunning := func() int {
 		return int(atomic.LoadInt32(&scheduler.atomics.numRunning))
@@ -206,5 +207,23 @@ func TestFlowScheduler(t *testing.T) {
 			}
 			return nil
 		})
+	})
+
+	t.Run("attempt to cancel non-existent dead flows", func(t *testing.T) {
+		scheduler.atomics.maxRunningFlows = 0
+
+		actualFlowID := uuid.FastMakeV4()
+		flow := newMockFlow(actualFlowID, nil /* waitCb*/)
+		require.NoError(t, scheduler.ScheduleFlow(ctx, flow))
+
+		// Attempt to cancel a non-existent flow.
+		req := &execinfrapb.CancelDeadFlowsRequest{
+			FlowIDs: []execinfrapb.FlowID{{UUID: uuid.FastMakeV4()}},
+		}
+		scheduler.CancelDeadFlows(req)
+
+		// Cancel the actual flow.
+		req.FlowIDs[0].UUID = actualFlowID
+		scheduler.CancelDeadFlows(req)
 	})
 }

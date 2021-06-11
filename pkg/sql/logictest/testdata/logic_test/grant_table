@@ -30,6 +30,7 @@ test           crdb_internal       backward_dependencies                  public
 test           crdb_internal       builtin_functions                      public   SELECT
 test           crdb_internal       cluster_contention_events              public   SELECT
 test           crdb_internal       cluster_database_privileges            public   SELECT
+test           crdb_internal       cluster_distsql_flows                  public   SELECT
 test           crdb_internal       cluster_queries                        public   SELECT
 test           crdb_internal       cluster_sessions                       public   SELECT
 test           crdb_internal       cluster_settings                       public   SELECT
@@ -55,6 +56,7 @@ test           crdb_internal       leases                                 public
 test           crdb_internal       lost_descriptors_with_data             public   SELECT
 test           crdb_internal       node_build_info                        public   SELECT
 test           crdb_internal       node_contention_events                 public   SELECT
+test           crdb_internal       node_distsql_flows                     public   SELECT
 test           crdb_internal       node_inflight_trace_spans              public   SELECT
 test           crdb_internal       node_metrics                           public   SELECT
 test           crdb_internal       node_queries                           public   SELECT
@@ -540,10 +542,6 @@ test           pg_extension  spatial_ref_sys                  public     SELECT
 a              pg_extension  geography_columns                public     SELECT
 a              pg_extension  geometry_columns                 public     SELECT
 a              pg_extension  spatial_ref_sys                  public     SELECT
-system         public        namespace                        admin      GRANT
-system         public        namespace                        admin      SELECT
-system         public        namespace                        root       GRANT
-system         public        namespace                        root       SELECT
 system         public        descriptor                       admin      GRANT
 system         public        descriptor                       admin      SELECT
 system         public        descriptor                       root       GRANT
@@ -723,10 +721,10 @@ system         public        reports_meta                     root       GRANT
 system         public        reports_meta                     root       INSERT
 system         public        reports_meta                     root       SELECT
 system         public        reports_meta                     root       UPDATE
-system         public        namespace2                       admin      GRANT
-system         public        namespace2                       admin      SELECT
-system         public        namespace2                       root       GRANT
-system         public        namespace2                       root       SELECT
+system         public        namespace                        admin      GRANT
+system         public        namespace                        admin      SELECT
+system         public        namespace                        root       GRANT
+system         public        namespace                        root       SELECT
 system         public        protected_ts_meta                admin      GRANT
 system         public        protected_ts_meta                admin      SELECT
 system         public        protected_ts_meta                root       GRANT
@@ -1215,8 +1213,6 @@ system         public              migrations                       root     SEL
 system         public              migrations                       root     UPDATE
 system         public              namespace                        root     GRANT
 system         public              namespace                        root     SELECT
-system         public              namespace2                       root     GRANT
-system         public              namespace2                       root     SELECT
 system         public              protected_ts_meta                root     GRANT
 system         public              protected_ts_meta                root     SELECT
 system         public              protected_ts_records             root     GRANT

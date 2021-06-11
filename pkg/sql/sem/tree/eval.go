@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -3047,9 +3048,9 @@ type EvalDatabase interface {
 	// It returns the ID of the resolved table, and an error if the table doesn't exist.
 	ResolveTableName(ctx context.Context, tn *TableName) (ID, error)
 
-	// LookupSchema looks up the schema with the given name in the given
-	// database.
-	LookupSchema(ctx context.Context, dbName, scName string) (found bool, scMeta SchemaMeta, err error)
+	// SchemaExists looks up the schema with the given name and determines
+	// whether it exists.
+	SchemaExists(ctx context.Context, dbName, scName string) (found bool, err error)
 
 	// IsTableVisible checks if the table with the given ID belongs to a schema
 	// on the given sessiondata.SearchPath.
@@ -3062,6 +3063,28 @@ type EvalDatabase interface {
 	IsTypeVisible(
 		ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
 	) (isVisible bool, exists bool, err error)
+
+	// HasPrivilege returns whether the current user has privilege to access
+	// the given object.
+	HasPrivilege(
+		ctx context.Context,
+		specifier HasPrivilegeSpecifier,
+		user security.SQLUsername,
+		kind privilege.Kind,
+		withGrantOpt bool,
+	) (bool, error)
+}
+
+// HasPrivilegeSpecifier specifies an object to lookup privilege for.
+type HasPrivilegeSpecifier struct {
+	// Only one of these is filled.
+	TableName *string
+	TableOID  *oid.Oid
+
+	// Only one of these is filled.
+	// Only used if TableName or TableOID is specified.
+	ColumnName   *Name
+	ColumnAttNum *uint32
 }
 
 // TypeResolver is an interface for resolving types and type OIDs.

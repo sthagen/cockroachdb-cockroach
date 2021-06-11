@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -65,14 +64,7 @@ func (p *planner) createDatabase(
 ) (*dbdesc.Mutable, bool, error) {
 
 	dbName := string(database.Name)
-	shouldCreatePublicSchema := true
-	dKey := catalogkv.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, dbName)
-	// TODO(solon): This conditional can be removed in 20.2. Every database
-	// is created with a public schema for cluster version >= 20.1, so we can remove
-	// the `shouldCreatePublicSchema` logic as well.
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.NamespaceTableWithSchemas) {
-		shouldCreatePublicSchema = false
-	}
+	dKey := catalogkeys.MakeDatabaseNameKey(p.ExecCfg().Codec, dbName)
 
 	if exists, databaseID, err := catalogkv.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, dbName); err == nil && exists {
 		if database.IfNotExists {
@@ -125,7 +117,7 @@ func (p *planner) createDatabase(
 		dbdesc.MaybeWithDatabaseRegionConfig(regionConfig),
 	)
 
-	if err := p.createDescriptorWithID(ctx, dKey.Key(p.ExecCfg().Codec), id, desc, nil, jobDesc); err != nil {
+	if err := p.createDescriptorWithID(ctx, dKey, id, desc, nil, jobDesc); err != nil {
 		return nil, true, err
 	}
 
@@ -136,14 +128,10 @@ func (p *planner) createDatabase(
 		return nil, true, err
 	}
 
-	// TODO(solon): This check should be removed and a public schema should
-	// be created in every database in >= 20.2.
-	if shouldCreatePublicSchema {
-		// Every database must be initialized with the public schema.
-		if err := p.CreateSchemaNamespaceEntry(ctx,
-			catalogkeys.NewPublicSchemaKey(id).Key(p.ExecCfg().Codec), keys.PublicSchemaID); err != nil {
-			return nil, true, err
-		}
+	// Every database must be initialized with the public schema.
+	key := catalogkeys.MakePublicSchemaNameKey(p.ExecCfg().Codec, id)
+	if err := p.CreateSchemaNamespaceEntry(ctx, key, keys.PublicSchemaID); err != nil {
+		return nil, true, err
 	}
 
 	return desc, true, nil

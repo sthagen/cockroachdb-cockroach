@@ -560,7 +560,7 @@ func TestCreateSystemTable(t *testing.T) {
 	descpb.SystemAllowedPrivileges[table.ID] = descpb.SystemAllowedPrivileges[keys.NamespaceTableID]
 
 	table.Name = "dummy"
-	nameKey := catalogkeys.NewPublicTableKey(table.ParentID, table.Name).Key(keys.SystemSQLCodec)
+	nameKey := catalogkeys.MakePublicObjectNameKey(keys.SystemSQLCodec, table.ParentID, table.Name)
 	descKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, table.ID)
 	descVal := table.DescriptorProto()
 
@@ -765,54 +765,6 @@ func TestUpdateSystemLocationData(t *testing.T) {
 	if count != len(roachpb.DefaultLocationInformation) {
 		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
 	}
-}
-
-func TestMigrateNamespaceTableDescriptors(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	mt := makeMigrationTest(ctx, t)
-	defer mt.close(ctx)
-
-	migration := mt.pop(t, "create new system.namespace table")
-	mt.start(t, base.TestServerArgs{})
-
-	// Since we're already on 20.1, mimic the beginning state by deleting the
-	// new namespace descriptor.
-	key := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.NamespaceTableID)
-	require.NoError(t, mt.kvDB.Del(ctx, key))
-
-	deprecatedKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.DeprecatedNamespaceTableID)
-	desc := &descpb.Descriptor{}
-	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		_, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
-		return err
-	}))
-
-	// Run the migration.
-	require.NoError(t, mt.runMigration(ctx, migration))
-
-	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		// Check that the persisted descriptors now match our in-memory versions,
-		// ignoring create and modification times.
-		{
-			ts, err := txn.GetProtoTs(ctx, key, desc)
-			require.NoError(t, err)
-			table, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(desc, ts)
-			table.CreateAsOfTime = systemschema.NamespaceTable.GetCreateAsOfTime()
-			table.ModificationTime = systemschema.NamespaceTable.GetModificationTime()
-			require.True(t, table.Equal(systemschema.NamespaceTable.TableDesc()))
-		}
-		{
-			ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
-			require.NoError(t, err)
-			table, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(desc, ts)
-			table.CreateAsOfTime = systemschema.DeprecatedNamespaceTable.GetCreateAsOfTime()
-			table.ModificationTime = systemschema.DeprecatedNamespaceTable.GetModificationTime()
-			require.True(t, table.Equal(systemschema.DeprecatedNamespaceTable.TableDesc()))
-		}
-		return nil
-	}))
 }
 
 func TestAlterSystemJobsTable(t *testing.T) {

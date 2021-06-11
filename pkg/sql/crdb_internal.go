@@ -23,7 +23,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -55,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
@@ -89,6 +89,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalBuildInfoTableID:                 crdbInternalBuildInfoTable,
 		catconstants.CrdbInternalBuiltinFunctionsTableID:          crdbInternalBuiltinFunctionsTable,
 		catconstants.CrdbInternalClusterContentionEventsTableID:   crdbInternalClusterContentionEventsTable,
+		catconstants.CrdbInternalClusterDistSQLFlowsTableID:       crdbInternalClusterDistSQLFlowsTable,
 		catconstants.CrdbInternalClusterQueriesTableID:            crdbInternalClusterQueriesTable,
 		catconstants.CrdbInternalClusterTransactionsTableID:       crdbInternalClusterTxnsTable,
 		catconstants.CrdbInternalClusterSessionsTableID:           crdbInternalClusterSessionsTable,
@@ -110,6 +111,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalKVStoreStatusTableID:             crdbInternalKVStoreStatusTable,
 		catconstants.CrdbInternalLeasesTableID:                    crdbInternalLeasesTable,
 		catconstants.CrdbInternalLocalContentionEventsTableID:     crdbInternalLocalContentionEventsTable,
+		catconstants.CrdbInternalLocalDistSQLFlowsTableID:         crdbInternalLocalDistSQLFlowsTable,
 		catconstants.CrdbInternalLocalQueriesTableID:              crdbInternalLocalQueriesTable,
 		catconstants.CrdbInternalLocalTransactionsTableID:         crdbInternalLocalTxnsTable,
 		catconstants.CrdbInternalLocalSessionsTableID:             crdbInternalLocalSessionsTable,
@@ -198,7 +200,7 @@ CREATE TABLE crdb_internal.node_runtime_info (
 			component string
 			url       *url.URL
 		}{
-			{"DB", dbURL}, {"UI", node.AdminURL()},
+			{"DB", dbURL.ToPQ()}, {"UI", node.AdminURL()},
 		} {
 			var user string
 			if item.url.User != nil {
@@ -240,7 +242,8 @@ CREATE TABLE crdb_internal.databases (
 	owner NAME NOT NULL,
 	primary_region STRING,
 	regions STRING[],
-	survival_goal STRING
+	survival_goal STRING,
+	create_statement STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
@@ -248,25 +251,38 @@ CREATE TABLE crdb_internal.databases (
 				var survivalGoal tree.Datum = tree.DNull
 				var primaryRegion tree.Datum = tree.DNull
 				regions := tree.NewDArray(types.String)
+
+				createNode := tree.CreateDatabase{}
+				createNode.ConnectionLimit = -1
+				createNode.Name = tree.Name(db.GetName())
 				if db.IsMultiRegion() {
-					switch db.GetRegionConfig().SurvivalGoal {
-					case descpb.SurvivalGoal_ZONE_FAILURE:
-						survivalGoal = tree.NewDString("zone")
-					case descpb.SurvivalGoal_REGION_FAILURE:
-						survivalGoal = tree.NewDString("region")
-					default:
-						return errors.Newf("unknown survival goal: %d", db.GetRegionConfig().SurvivalGoal)
-					}
 					primaryRegion = tree.NewDString(string(db.GetRegionConfig().PrimaryRegion))
+
+					createNode.PrimaryRegion = tree.Name(db.GetRegionConfig().PrimaryRegion)
 
 					regionConfig, err := SynthesizeRegionConfig(ctx, p.txn, db.GetID(), p.Descriptors())
 					if err != nil {
 						return err
 					}
-					for _, region := range regionConfig.Regions() {
+
+					createNode.Regions = make(tree.NameList, len(regionConfig.Regions()))
+					for i, region := range regionConfig.Regions() {
 						if err := regions.Append(tree.NewDString(string(region))); err != nil {
 							return err
 						}
+						createNode.Regions[i] = tree.Name(region)
+					}
+
+					createNode.SurvivalGoal = tree.SurvivalGoalDefault
+					switch db.GetRegionConfig().SurvivalGoal {
+					case descpb.SurvivalGoal_ZONE_FAILURE:
+						survivalGoal = tree.NewDString("zone")
+						createNode.SurvivalGoal = tree.SurvivalGoalZoneFailure
+					case descpb.SurvivalGoal_REGION_FAILURE:
+						survivalGoal = tree.NewDString("region")
+						createNode.SurvivalGoal = tree.SurvivalGoalRegionFailure
+					default:
+						return errors.Newf("unknown survival goal: %d", db.GetRegionConfig().SurvivalGoal)
 					}
 				}
 
@@ -274,9 +290,10 @@ CREATE TABLE crdb_internal.databases (
 					tree.NewDInt(tree.DInt(db.GetID())),            // id
 					tree.NewDString(db.GetName()),                  // name
 					tree.NewDName(getOwnerOfDesc(db).Normalized()), // owner
-					primaryRegion, // primary_region
-					regions,       // regions
-					survivalGoal,  // survival_goal
+					primaryRegion,                        // primary_region
+					regions,                              // regions
+					survivalGoal,                         // survival_goal
+					tree.NewDString(createNode.String()), // create_statement
 				)
 			})
 	},
@@ -793,32 +810,6 @@ CREATE TABLE crdb_internal.jobs (
 	},
 }
 
-type stmtList []stmtKey
-
-func (s stmtList) Len() int {
-	return len(s)
-}
-func (s stmtList) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-func (s stmtList) Less(i, j int) bool {
-	return s[i].anonymizedStmt < s[j].anonymizedStmt
-}
-
-type txnList []txnKey
-
-func (t txnList) Len() int {
-	return len(t)
-}
-
-func (t txnList) Swap(i, j int) {
-	t[i], t[j] = t[j], t[i]
-}
-
-func (t txnList) Less(i, j int) bool {
-	return t[i] < t[j]
-}
-
 // execStatAvg is a helper for execution stats shown in virtual tables. Returns
 // NULL when the count is 0, or the mean of the given NumericStat.
 func execStatAvg(count int64, n roachpb.NumericStat) tree.Datum {
@@ -837,14 +828,36 @@ func execStatVar(count int64, n roachpb.NumericStat) tree.Datum {
 	return tree.NewDFloat(tree.DFloat(n.GetVariance(count)))
 }
 
-// getSQLStats retrieves a sqlStats object from the planner or returns an error
-// if not available. virtualTableName specifies the virtual table for which this
-// sqlStats object is needed.
-func getSQLStats(p *planner, virtualTableName string) (*sqlStats, error) {
-	if p.extendedEvalCtx.sqlStatsCollector == nil || p.extendedEvalCtx.sqlStatsCollector.sqlStats == nil {
+// getSQLStats retrieves a sqlStats storage subsystem from the planner or
+// returns an error if not available. virtualTableName specifies the virtual
+// table for which this sqlStats object is needed.
+func getSQLStats(p *planner, virtualTableName string) (sqlstats.Storage, error) {
+	if p.extendedEvalCtx.statsStorage == nil {
 		return nil, errors.Newf("%s cannot be used in this context", virtualTableName)
 	}
-	return p.extendedEvalCtx.sqlStatsCollector.sqlStats, nil
+	return p.extendedEvalCtx.statsStorage, nil
+}
+
+// ExplainTreePlanNodeToJSON builds a formatted JSON object from the explain tree nodes.
+func ExplainTreePlanNodeToJSON(node *roachpb.ExplainTreePlanNode) json.JSON {
+
+	// Create a new json.ObjectBuilder with key-value pairs for the node's name (1),
+	// node's attributes (len(node.Attrs)), and the node's children (1).
+	nodePlan := json.NewObjectBuilder(len(node.Attrs) + 2 /* numAddsHint */)
+	nodeChildren := json.NewArrayBuilder(len(node.Children))
+
+	nodePlan.Add("Name", json.FromString(node.Name))
+
+	for _, attr := range node.Attrs {
+		nodePlan.Add(strings.Title(attr.Key), json.FromString(attr.Value))
+	}
+
+	for _, childNode := range node.Children {
+		nodeChildren.Add(ExplainTreePlanNodeToJSON(childNode))
+	}
+
+	nodePlan.Add("Children", nodeChildren.Build())
+	return nodePlan.Build()
 }
 
 var crdbInternalStmtStatsTable = virtualSchemaTable{
@@ -889,7 +902,10 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   contention_time_avg FLOAT,
   contention_time_var FLOAT,
   implicit_txn        BOOL NOT NULL,
-  full_scan           BOOL NOT NULL
+  full_scan           BOOL NOT NULL,
+  sample_plan         JSONB,
+  database_name       STRING NOT NULL,
+  exec_node_ids       INT[] NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		hasViewActivity, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITY)
@@ -908,113 +924,94 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
-		// Retrieve the application names and sort them to ensure the
-		// output is deterministic.
-		var appNames []string
-		sqlStats.mu.Lock()
-		for n := range sqlStats.mu.apps {
-			appNames = append(appNames, n)
-		}
-		sqlStats.mu.Unlock()
-		sort.Strings(appNames)
-
-		// Now retrieve the application stats proper.
-		for _, appName := range appNames {
-			appStats := sqlStats.getStatsForApplication(appName)
-
-			// Retrieve the statement keys and sort them to ensure the
-			// output is deterministic.
-			var stmtKeys stmtList
-			appStats.Lock()
-			for k := range appStats.stmts {
-				stmtKeys = append(stmtKeys, k)
+		statementVisitor := func(stats *roachpb.CollectedStatementStatistics) error {
+			anonymized := tree.DNull
+			anonStr, ok := scrubStmtStatKey(p.getVirtualTabler(), stats.Key.Query)
+			if ok {
+				anonymized = tree.NewDString(anonStr)
 			}
-			appStats.Unlock()
-			sort.Sort(stmtKeys)
 
-			// Now retrieve the per-stmt stats proper.
-			for _, stmtKey := range stmtKeys {
-				anonymized := tree.DNull
-				anonStr, ok := scrubStmtStatKey(p.getVirtualTabler(), stmtKey.anonymizedStmt)
-				if ok {
-					anonymized = tree.NewDString(anonStr)
-				}
+			errString := tree.DNull
+			if stats.Stats.SensitiveInfo.LastErr != "" {
+				errString = tree.NewDString(stats.Stats.SensitiveInfo.LastErr)
+			}
+			var flags string
+			if stats.Key.DistSQL {
+				flags = "+"
+			}
+			if stats.Key.Failed {
+				flags = "!" + flags
+			}
 
-				stmtID := constructStatementIDFromStmtKey(stmtKey)
-				s, _, _ := appStats.getStatsForStmtWithKey(stmtKey, stmtID, false /* createIfNonexistent */)
+			samplePlan := ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription)
 
-				// If the key is not found (and we expected to find it), the table must
-				// have been cleared between now and the time we read all the keys. In
-				// that case we simply skip this key as there are no metrics to report.
-				if s == nil {
-					continue
-				}
-
-				s.mu.Lock()
-				errString := tree.DNull
-				if s.mu.data.SensitiveInfo.LastErr != "" {
-					errString = tree.NewDString(s.mu.data.SensitiveInfo.LastErr)
-				}
-				var flags string
-				if s.mu.distSQLUsed {
-					flags = "+"
-				}
-				if stmtKey.failed {
-					flags = "!" + flags
-				}
-				err := addRow(
-					tree.NewDInt(tree.DInt(nodeID)),                         // node_id
-					tree.NewDString(appName),                                // application_name
-					tree.NewDString(flags),                                  // flags
-					tree.NewDString(strconv.FormatUint(uint64(stmtID), 10)), // statement_id
-					tree.NewDString(stmtKey.anonymizedStmt),                 // key
-					anonymized,                                              // anonymized
-					tree.NewDInt(tree.DInt(s.mu.data.Count)),                // count
-					tree.NewDInt(tree.DInt(s.mu.data.FirstAttemptCount)),    // first_attempt_count
-					tree.NewDInt(tree.DInt(s.mu.data.MaxRetries)),           // max_retries
-					errString, // last_error
-					tree.NewDFloat(tree.DFloat(s.mu.data.NumRows.Mean)),                             // rows_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.NumRows.GetVariance(s.mu.data.Count))),     // rows_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.ParseLat.Mean)),                            // parse_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.ParseLat.GetVariance(s.mu.data.Count))),    // parse_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.PlanLat.Mean)),                             // plan_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.PlanLat.GetVariance(s.mu.data.Count))),     // plan_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.RunLat.Mean)),                              // run_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.RunLat.GetVariance(s.mu.data.Count))),      // run_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.ServiceLat.Mean)),                          // service_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.ServiceLat.GetVariance(s.mu.data.Count))),  // service_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.OverheadLat.Mean)),                         // overhead_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.OverheadLat.GetVariance(s.mu.data.Count))), // overhead_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.BytesRead.Mean)),                           // bytes_read_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.BytesRead.GetVariance(s.mu.data.Count))),   // bytes_read_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.RowsRead.Mean)),                            // rows_read_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.RowsRead.GetVariance(s.mu.data.Count))),    // rows_read_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkBytes),        // network_bytes_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkBytes),        // network_bytes_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkMessages),     // network_msgs_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkMessages),     // network_msgs_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxMemUsage),         // max_mem_usage_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxMemUsage),         // max_mem_usage_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxDiskUsage),        // max_disk_usage_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxDiskUsage),        // max_disk_usage_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.ContentionTime),      // contention_time_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.ContentionTime),      // contention_time_var
-					tree.MakeDBool(tree.DBool(stmtKey.implicitTxn)),                                 // implicit_txn
-					tree.MakeDBool(tree.DBool(s.mu.fullScan)),                                       // full_scan
-				)
-				s.mu.Unlock()
-				if err != nil {
+			execNodeIDs := tree.NewDArray(types.Int)
+			for _, nodeID := range stats.Stats.Nodes {
+				if err := execNodeIDs.Append(tree.NewDInt(tree.DInt(nodeID))); err != nil {
 					return err
 				}
 			}
+
+			err := addRow(
+				tree.NewDInt(tree.DInt(nodeID)),                           // node_id
+				tree.NewDString(stats.Key.App),                            // application_name
+				tree.NewDString(flags),                                    // flags
+				tree.NewDString(strconv.FormatUint(uint64(stats.ID), 10)), // statement_id
+				tree.NewDString(stats.Key.Query),                          // key
+				anonymized,                                                // anonymized
+				tree.NewDInt(tree.DInt(stats.Stats.Count)),                // count
+				tree.NewDInt(tree.DInt(stats.Stats.FirstAttemptCount)),    // first_attempt_count
+				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),           // max_retries
+				errString, // last_error
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                               // rows_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),     // rows_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.Mean)),                              // parse_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.GetVariance(stats.Stats.Count))),    // parse_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.Mean)),                               // plan_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.GetVariance(stats.Stats.Count))),     // plan_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RunLat.Mean)),                                // run_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RunLat.GetVariance(stats.Stats.Count))),      // run_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.Mean)),                            // service_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.GetVariance(stats.Stats.Count))),  // service_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.OverheadLat.Mean)),                           // overhead_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.OverheadLat.GetVariance(stats.Stats.Count))), // overhead_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.Mean)),                             // bytes_read_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.GetVariance(stats.Stats.Count))),   // bytes_read_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.Mean)),                              // rows_read_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.GetVariance(stats.Stats.Count))),    // rows_read_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),        // network_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),        // network_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),     // network_msgs_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),     // network_msgs_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),         // max_mem_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),         // max_mem_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),        // max_disk_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),        // max_disk_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_var
+				tree.MakeDBool(tree.DBool(stats.Key.ImplicitTxn)),                                   // implicit_txn
+				tree.MakeDBool(tree.DBool(stats.Key.FullScan)),                                      // full_scan
+				tree.NewDJSON(samplePlan),           // sample_plan
+				tree.NewDString(stats.Key.Database), // database_name
+				execNodeIDs,                         // exec_node_ids
+			)
+			if err != nil {
+				return err
+			}
+
+			return nil
 		}
-		return nil
+
+		return sqlStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{
+			SortedAppNames: true,
+			SortedKey:      true,
+		}, statementVisitor)
 	},
 }
 
 // TODO(arul): Explore updating the schema below to have key be an INT and
 // statement_ids be INT[] now that we've moved to having uint64 as the type of
-// StmtID and TxnKey. Issue #55284
+// StmtFingerprintID and TxnKey. Issue #55284
 var crdbInternalTransactionStatisticsTable = virtualSchemaTable{
 	comment: `finer-grained transaction statistics (in-memory, not durable; local node only). ` +
 		`This table is wiped periodically (by default, at least every two hours)`,
@@ -1062,86 +1059,52 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
-		// Retrieve the application names and sort them to ensure the
-		// output is deterministic.
-		var appNames []string
-		sqlStats.mu.Lock()
-
-		for n := range sqlStats.mu.apps {
-			appNames = append(appNames, n)
-		}
-		sqlStats.mu.Unlock()
-		sort.Strings(appNames)
-
-		for _, appName := range appNames {
-			appStats := sqlStats.getStatsForApplication(appName)
-
-			// Retrieve the statement keys and sort them to ensure the
-			// output is deterministic.
-			var txnKeys txnList
-			appStats.Lock()
-			for k := range appStats.txns {
-				txnKeys = append(txnKeys, k)
-			}
-			appStats.Unlock()
-			sort.Sort(txnKeys)
-
-			// Now retrieve the per-txn stats proper.
-			for _, txnKey := range txnKeys {
-				// We don't want to create the key if it doesn't exist, so it's okay to
-				// pass nil for the statementIDs, as they are only set when a key is
-				// constructed.
-				s, _, _ := appStats.getStatsForTxnWithKey(txnKey, nil, false /* createIfNonexistent */)
-				// If the key is not found (and we expected to find it), the table must
-				// have been cleared between now and the time we read all the keys. In
-				// that case we simply skip this key as there are no metrics to report.
-				if s == nil {
-					continue
-				}
-				stmtIDsDatum := tree.NewDArray(types.String)
-				for _, stmtID := range s.statementIDs {
-					if err := stmtIDsDatum.Append(tree.NewDString(strconv.FormatUint(uint64(stmtID), 10))); err != nil {
-						return err
-					}
-				}
-
-				s.mu.Lock()
-
-				err := addRow(
-					tree.NewDInt(tree.DInt(nodeID)),                         // node_id
-					tree.NewDString(appName),                                // application_name
-					tree.NewDString(strconv.FormatUint(uint64(txnKey), 10)), // key
-					stmtIDsDatum,                                                                   // statement_ids
-					tree.NewDInt(tree.DInt(s.mu.data.Count)),                                       // count
-					tree.NewDInt(tree.DInt(s.mu.data.MaxRetries)),                                  // max_retries
-					tree.NewDFloat(tree.DFloat(s.mu.data.ServiceLat.Mean)),                         // service_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.ServiceLat.GetVariance(s.mu.data.Count))), // service_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.RetryLat.Mean)),                           // retry_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.RetryLat.GetVariance(s.mu.data.Count))),   // retry_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.CommitLat.Mean)),                          // commit_lat_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.CommitLat.GetVariance(s.mu.data.Count))),  // commit_lat_var
-					tree.NewDFloat(tree.DFloat(s.mu.data.NumRows.Mean)),                            // rows_read_avg
-					tree.NewDFloat(tree.DFloat(s.mu.data.NumRows.GetVariance(s.mu.data.Count))),    // rows_read_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkBytes),       // network_bytes_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkBytes),       // network_bytes_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkMessages),    // network_msgs_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.NetworkMessages),    // network_msgs_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxMemUsage),        // max_mem_usage_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxMemUsage),        // max_mem_usage_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxDiskUsage),       // max_disk_usage_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.MaxDiskUsage),       // max_disk_usage_var
-					execStatAvg(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.ContentionTime),     // contention_time_avg
-					execStatVar(s.mu.data.ExecStats.Count, s.mu.data.ExecStats.ContentionTime),     // contention_time_var
-				)
-
-				s.mu.Unlock()
-				if err != nil {
+		transactionVisitor := func(txnID sqlstats.TransactionFingerprintID, stats *roachpb.CollectedTransactionStatistics) error {
+			stmtFingerprintIDsDatum := tree.NewDArray(types.String)
+			for _, stmtFingerprintID := range stats.StatementFingerprintIDs {
+				if err := stmtFingerprintIDsDatum.Append(tree.NewDString(strconv.FormatUint(uint64(stmtFingerprintID), 10))); err != nil {
 					return err
 				}
 			}
 
+			err := addRow(
+				tree.NewDInt(tree.DInt(nodeID)),                                                    // node_id
+				tree.NewDString(stats.App),                                                         // application_name
+				tree.NewDString(strconv.FormatUint(uint64(txnID), 10)),                             // key
+				stmtFingerprintIDsDatum,                                                            // statement_ids
+				tree.NewDInt(tree.DInt(stats.Stats.Count)),                                         // count
+				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),                                    // max_retries
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.Mean)),                           // service_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.GetVariance(stats.Stats.Count))), // service_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.Mean)),                             // retry_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.GetVariance(stats.Stats.Count))),   // retry_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.Mean)),                            // commit_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.GetVariance(stats.Stats.Count))),  // commit_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                              // rows_read_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),    // rows_read_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),       // network_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),       // network_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),    // network_msgs_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),    // network_msgs_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),        // max_mem_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),        // max_mem_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),       // max_disk_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),       // max_disk_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_var
+			)
+
+			if err != nil {
+				return err
+			}
+
+			return nil
 		}
-		return nil
+
+		return sqlStats.IterateTransactionStats(ctx, &sqlstats.IteratorOptions{
+			SortedAppNames: true,
+			SortedKey:      true,
+		}, transactionVisitor)
 	},
 }
 
@@ -1170,33 +1133,21 @@ CREATE TABLE crdb_internal.node_txn_stats (
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
-		// Retrieve the application names and sort them to ensure the
-		// output is deterministic.
-		var appNames []string
-		sqlStats.mu.Lock()
-		for n := range sqlStats.mu.apps {
-			appNames = append(appNames, n)
-		}
-		sqlStats.mu.Unlock()
-		sort.Strings(appNames)
-
-		for _, appName := range appNames {
-			appStats := sqlStats.getStatsForApplication(appName)
-			txnCount, txnTimeAvg, txnTimeVar, committedCount, implicitCount := appStats.txnCounts.getStats()
-			err := addRow(
+		appTxnStatsVisitor := func(appName string, stats *roachpb.TxnStats) error {
+			return addRow(
 				tree.NewDInt(tree.DInt(nodeID)),
 				tree.NewDString(appName),
-				tree.NewDInt(tree.DInt(txnCount)),
-				tree.NewDFloat(tree.DFloat(txnTimeAvg)),
-				tree.NewDFloat(tree.DFloat(txnTimeVar)),
-				tree.NewDInt(tree.DInt(committedCount)),
-				tree.NewDInt(tree.DInt(implicitCount)),
+				tree.NewDInt(tree.DInt(stats.TxnCount)),
+				tree.NewDFloat(tree.DFloat(stats.TxnTimeSec.Mean)),
+				tree.NewDFloat(tree.DFloat(stats.TxnTimeSec.GetVariance(stats.TxnCount))),
+				tree.NewDInt(tree.DInt(stats.CommittedCount)),
+				tree.NewDInt(tree.DInt(stats.ImplicitCount)),
 			)
-			if err != nil {
-				return err
-			}
 		}
-		return nil
+
+		return sqlStats.IterateAggregatedTransactionStats(ctx, &sqlstats.IteratorOptions{
+			SortedAppNames: true,
+		}, appTxnStatsVisitor)
 	},
 }
 
@@ -1876,6 +1827,72 @@ func populateContentionEventsTable(
 				tree.NewDUuid(tree.DUuid{UUID: stc.TxnID}),       // txn_id
 				tree.NewDInt(tree.DInt(stc.Count)),               // count
 			); err != nil {
+				return err
+			}
+		}
+	}
+	for _, rpcErr := range response.Errors {
+		log.Warningf(ctx, "%v", rpcErr.Message)
+	}
+	return nil
+}
+
+const distSQLFlowsSchemaPattern = `
+CREATE TABLE crdb_internal.%s (
+  flow_id UUID NOT NULL,
+  node_id INT NOT NULL,
+  since   TIMESTAMPTZ NOT NULL,
+  status  STRING NOT NULL
+)
+`
+
+const distSQLFlowsCommentPattern = `DistSQL remote flows information %s
+
+This virtual table contains all of the remote flows of the DistSQL execution
+that are currently running or queued on %s. The local
+flows (those that are running on the same node as the query originated on)
+are not included.
+`
+
+var crdbInternalLocalDistSQLFlowsTable = virtualSchemaTable{
+	schema:  fmt.Sprintf(distSQLFlowsSchemaPattern, "node_distsql_flows"),
+	comment: fmt.Sprintf(distSQLFlowsCommentPattern, "(RAM; local node only)", "this node"),
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		response, err := p.extendedEvalCtx.SQLStatusServer.ListLocalDistSQLFlows(ctx, &serverpb.ListDistSQLFlowsRequest{})
+		if err != nil {
+			return err
+		}
+		return populateDistSQLFlowsTable(ctx, addRow, response)
+	},
+}
+
+var crdbInternalClusterDistSQLFlowsTable = virtualSchemaTable{
+	schema:  fmt.Sprintf(distSQLFlowsSchemaPattern, "cluster_distsql_flows"),
+	comment: fmt.Sprintf(distSQLFlowsCommentPattern, "(cluster RPC; expensive!)", "any node in the cluster"),
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		response, err := p.extendedEvalCtx.SQLStatusServer.ListDistSQLFlows(ctx, &serverpb.ListDistSQLFlowsRequest{})
+		if err != nil {
+			return err
+		}
+		return populateDistSQLFlowsTable(ctx, addRow, response)
+	},
+}
+
+func populateDistSQLFlowsTable(
+	ctx context.Context,
+	addRow func(...tree.Datum) error,
+	response *serverpb.ListDistSQLFlowsResponse,
+) error {
+	for _, f := range response.Flows {
+		flowID := tree.NewDUuid(tree.DUuid{UUID: f.FlowID.UUID})
+		for _, info := range f.Infos {
+			nodeID := tree.NewDInt(tree.DInt(info.NodeID))
+			since, err := tree.MakeDTimestampTZ(info.Timestamp, time.Millisecond)
+			if err != nil {
+				return err
+			}
+			status := tree.NewDString(strings.ToLower(info.Status.String()))
+			if err = addRow(flowID, nodeID, since, status); err != nil {
 				return err
 			}
 		}
@@ -2961,25 +2978,18 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 	},
 }
 
-// NamespaceKey represents a key from the namespace table.
-type NamespaceKey struct {
-	ParentID descpb.ID
-	// ParentSchemaID is not populated for rows under system.deprecated_namespace.
-	// This table will no longer exist on 20.2 or later.
-	ParentSchemaID descpb.ID
-	Name           string
-}
-
 // getAllNames returns a map from ID to namespaceKey for every entry in
 // system.namespace.
-func (p *planner) getAllNames(ctx context.Context) (map[descpb.ID]NamespaceKey, error) {
+func (p *planner) getAllNames(
+	ctx context.Context,
+) (map[descpb.ID]catalog.NameKeyComponents, error) {
 	return getAllNames(ctx, p.txn, p.ExtendedEvalContext().ExecCfg.InternalExecutor)
 }
 
 // TestingGetAllNames is a wrapper for getAllNames.
 func TestingGetAllNames(
 	ctx context.Context, txn *kv.Txn, executor *InternalExecutor,
-) (map[descpb.ID]NamespaceKey, error) {
+) (map[descpb.ID]catalog.NameKeyComponents, error) {
 	return getAllNames(ctx, txn, executor)
 }
 
@@ -2987,38 +2997,11 @@ func TestingGetAllNames(
 // It is public so that it can be tested outside the sql package.
 func getAllNames(
 	ctx context.Context, txn *kv.Txn, executor *InternalExecutor,
-) (map[descpb.ID]NamespaceKey, error) {
-	namespace := map[descpb.ID]NamespaceKey{}
-	if executor.s.cfg.Settings.Version.IsActive(ctx, clusterversion.NamespaceTableWithSchemas) {
-		it, err := executor.QueryIterator(
-			ctx, "get-all-names", txn,
-			`SELECT id, "parentID", "parentSchemaID", name FROM system.namespace`,
-		)
-		if err != nil {
-			return nil, err
-		}
-		var ok bool
-		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-			r := it.Cur()
-			id, parentID, parentSchemaID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDInt(r[2]), tree.MustBeDString(r[3])
-			namespace[descpb.ID(id)] = NamespaceKey{
-				ParentID:       descpb.ID(parentID),
-				ParentSchemaID: descpb.ID(parentSchemaID),
-				Name:           string(name),
-			}
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Also get all rows from namespace_deprecated, and add to the namespace map
-	// if it is not already there yet.
-	// If a row exists in both here and namespace, only use the one from namespace.
-	// TODO(sqlexec): In 20.2, this can be removed.
+) (map[descpb.ID]catalog.NameKeyComponents, error) {
+	namespace := map[descpb.ID]catalog.NameKeyComponents{}
 	it, err := executor.QueryIterator(
-		ctx, "get-all-names-deprecated-namespace", txn,
-		fmt.Sprintf(`SELECT id, "parentID", name FROM [%d as namespace]`, keys.DeprecatedNamespaceTableID),
+		ctx, "get-all-names", txn,
+		`SELECT id, "parentID", "parentSchemaID", name FROM system.namespace`,
 	)
 	if err != nil {
 		return nil, err
@@ -3026,12 +3009,11 @@ func getAllNames(
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		r := it.Cur()
-		id, parentID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDString(r[2])
-		if _, ok := namespace[descpb.ID(id)]; !ok {
-			namespace[descpb.ID(id)] = NamespaceKey{
-				ParentID: descpb.ID(parentID),
-				Name:     string(name),
-			}
+		id, parentID, parentSchemaID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDInt(r[2]), tree.MustBeDString(r[3])
+		namespace[descpb.ID(id)] = descpb.NameInfo{
+			ParentID:       descpb.ID(parentID),
+			ParentSchemaID: descpb.ID(parentSchemaID),
+			Name:           string(name),
 		}
 	}
 	if err != nil {
@@ -3082,7 +3064,7 @@ CREATE TABLE crdb_internal.zones (
 				return 0, 0, string(tree.PublicSchemaName), nil
 			}
 			if entry, ok := namespace[descpb.ID(id)]; ok {
-				return uint32(entry.ParentID), uint32(entry.ParentSchemaID), entry.Name, nil
+				return uint32(entry.GetParentID()), uint32(entry.GetParentSchemaID()), entry.GetName(), nil
 			}
 			return 0, 0, "", errors.AssertionFailedf(
 				"object with ID %d does not exist", errors.Safe(id))
@@ -3134,7 +3116,10 @@ CREATE TABLE crdb_internal.zones (
 
 			var table catalog.TableDescriptor
 			if zs.Database != "" {
-				database, err := catalogkv.MustGetDatabaseDescByID(ctx, p.txn, p.ExecCfg().Codec, descpb.ID(id))
+				_, database, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, descpb.ID(id), tree.DatabaseLookupFlags{
+					Required:    true,
+					AvoidCached: true,
+				})
 				if err != nil {
 					return err
 				}

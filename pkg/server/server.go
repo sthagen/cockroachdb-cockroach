@@ -69,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/gcjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
@@ -174,6 +175,8 @@ type Server struct {
 
 	// Created in NewServer but initialized (made usable) in `(*Server).Start`.
 	externalStorageBuilder *externalStorageBuilder
+
+	gcoord *admission.GrantCoordinator
 
 	// The following fields are populated at start time, i.e. in `(*Server).Start`.
 	startTime time.Time
@@ -644,6 +647,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	sAdmin := newAdminServer(lateBoundServer, internalExecutor)
 	sessionRegistry := sql.NewSessionRegistry()
 	contentionRegistry := contention.NewRegistry()
+	flowScheduler := flowinfra.NewFlowScheduler(cfg.AmbientCtx, stopper, st)
 
 	sStatus := newStatusServer(
 		cfg.AmbientCtx,
@@ -660,6 +664,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		stopper,
 		sessionRegistry,
 		contentionRegistry,
+		flowScheduler,
 		internalExecutor,
 	)
 	// TODO(tbg): don't pass all of Server into this to avoid this hack.
@@ -713,6 +718,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		recorder:                 recorder,
 		sessionRegistry:          sessionRegistry,
 		contentionRegistry:       contentionRegistry,
+		flowScheduler:            flowScheduler,
 		circularInternalExecutor: internalExecutor,
 		circularJobRegistry:      jobRegistry,
 		jobAdoptionStopFile:      jobAdoptionStopFile,
@@ -724,6 +730,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		return nil, err
 	}
 	sStatus.setStmtDiagnosticsRequester(sqlServer.execCfg.StmtDiagnosticsRecorder)
+	sStatus.baseStatusServer.sqlServer = sqlServer
 	debugServer := debug.NewServer(st, sqlServer.pgServer.HBADebugFn())
 	node.InitLogger(sqlServer.execCfg)
 
@@ -762,6 +769,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		protectedtsReconciler:  protectedtsReconciler,
 		sqlServer:              sqlServer,
 		externalStorageBuilder: externalStorageBuilder,
+		gcoord:                 gcoord,
 	}
 	return lateBoundServer, err
 }
@@ -1629,6 +1637,8 @@ func (s *Server) PreStart(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	// Stores have been initialized, so Node can now provide Pebble metrics.
+	s.gcoord.SetPebbleMetricsProvider(s.node)
 
 	log.Event(ctx, "started node")
 	if err := s.startPersistingHLCUpperBound(

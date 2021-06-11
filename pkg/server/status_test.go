@@ -46,6 +46,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -61,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
@@ -1501,10 +1504,10 @@ func TestStatusAPITransactions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Construct a map of all the statement IDs.
-	statementIDs := make(map[roachpb.StmtID]bool, len(resp.Statements))
+	// Construct a map of all the statement fingerprint IDs.
+	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
-		statementIDs[respStatement.ID] = true
+		statementFingerprintIDs[respStatement.ID] = true
 	}
 
 	respAppNames := make(map[string]bool)
@@ -1516,11 +1519,11 @@ func TestStatusAPITransactions(t *testing.T) {
 			continue
 		}
 		respAppNames[appName] = true
-		// Ensure all statementIDs comprised by the Transaction Response can be
-		// linked to StatementIDs for statements in the response.
-		for _, stmtID := range respTransaction.StatsData.StatementIDs {
-			if _, found := statementIDs[stmtID]; !found {
-				t.Fatalf("app: %s, expected stmtID: %d not found in StatementResponse.", appName, stmtID)
+		// Ensure all statementFingerprintIDs comprised by the Transaction Response can be
+		// linked to StatementFingerprintIDs for statements in the response.
+		for _, stmtFingerprintID := range respTransaction.StatsData.StatementFingerprintIDs {
+			if _, found := statementFingerprintIDs[stmtFingerprintID]; !found {
+				t.Fatalf("app: %s, expected stmtFingerprintID: %d not found in StatementResponse.", appName, stmtFingerprintID)
 			}
 		}
 		stats := respTransaction.StatsData.Stats
@@ -1555,7 +1558,7 @@ func TestStatusAPITransactions(t *testing.T) {
 	}
 }
 
-func TestStatusAPITransactionStatementIDsTruncation(t *testing.T) {
+func TestStatusAPITransactionStatementFingerprintIDsTruncation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -1569,15 +1572,16 @@ func TestStatusAPITransactionStatementIDsTruncation(t *testing.T) {
 	thirdServerSQL.Exec(t, `CREATE DATABASE db; CREATE TABLE db.t();`)
 	thirdServerSQL.Exec(t, fmt.Sprintf(`SET application_name = "%s"`, testingApp))
 
-	maxStmtIDsLen := int(sql.TxnStatsNumStmtIDsToRecord.Get(
+	maxStmtFingerprintIDsLen := int(sqlstats.TxnStatsNumStmtFingerprintIDsToRecord.Get(
 		&firstServerProto.ExecutorConfig().(sql.ExecutorConfig).Settings.SV))
 
 	// Construct 2 transaction queries that include an absurd number of statements.
 	// These two queries have the same first 1000 statements, but should still have
-	// different fingerprints, as fingerprints take into account all statementIDs
-	// (unlike the statementIDs stored on the proto response, which are capped).
+	// different fingerprints, as fingerprints take into account all
+	// statementFingerprintIDs (unlike the statementFingerprintIDs stored on the
+	// proto response, which are capped).
 	testQuery1 := "BEGIN;"
-	for i := 0; i < maxStmtIDsLen+1; i++ {
+	for i := 0; i < maxStmtFingerprintIDsLen+1; i++ {
 		testQuery1 += "SELECT * FROM db.t;"
 	}
 	testQuery2 := testQuery1 + "SELECT * FROM db.t; COMMIT;"
@@ -1601,9 +1605,9 @@ func TestStatusAPITransactionStatementIDsTruncation(t *testing.T) {
 		}
 
 		txnsFound++
-		if len(respTransaction.StatsData.StatementIDs) != maxStmtIDsLen {
-			t.Fatalf("unexpected length of StatementIDs. expected:%d, got:%d",
-				maxStmtIDsLen, len(respTransaction.StatsData.StatementIDs))
+		if len(respTransaction.StatsData.StatementFingerprintIDs) != maxStmtFingerprintIDsLen {
+			t.Fatalf("unexpected length of StatementFingerprintIDs. expected:%d, got:%d",
+				maxStmtFingerprintIDsLen, len(respTransaction.StatsData.StatementFingerprintIDs))
 		}
 	}
 	if txnsFound != 2 {
@@ -1770,7 +1774,7 @@ func TestListSessionsSecurity(t *testing.T) {
 	}
 }
 
-func TestListContentionEventsSecurity(t *testing.T) {
+func TestListActivitySecurity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -1779,7 +1783,20 @@ func TestListContentionEventsSecurity(t *testing.T) {
 	ts := s.(*TestServer)
 	defer ts.Stopper().Stop(ctx)
 
-	expectedErrNoPermission := "does not have permission to view contention events"
+	expectedErrNoPermission := "does not have permission to view the activity"
+	contentionMsg := &serverpb.ListContentionEventsResponse{}
+	flowsMsg := &serverpb.ListDistSQLFlowsResponse{}
+	getErrors := func(msg protoutil.Message) []serverpb.ListActivityError {
+		switch r := msg.(type) {
+		case *serverpb.ListContentionEventsResponse:
+			return r.Errors
+		case *serverpb.ListDistSQLFlowsResponse:
+			return r.Errors
+		default:
+			t.Fatal("unexpected message type")
+			return nil
+		}
+	}
 
 	// HTTP requests respect the authenticated username from the HTTP session.
 	testCases := []struct {
@@ -1787,13 +1804,20 @@ func TestListContentionEventsSecurity(t *testing.T) {
 		expectedErr                    string
 		requestWithAdmin               bool
 		requestWithViewActivityGranted bool
+		response                       protoutil.Message
 	}{
-		{"local_contention_events", expectedErrNoPermission, false, false},
-		{"contention_events", expectedErrNoPermission, false, false},
-		{"local_contention_events", "", true, false},
-		{"contention_events", "", true, false},
-		{"local_contention_events", "", false, true},
-		{"contention_events", "", false, true},
+		{"local_contention_events", expectedErrNoPermission, false, false, contentionMsg},
+		{"contention_events", expectedErrNoPermission, false, false, contentionMsg},
+		{"local_contention_events", "", true, false, contentionMsg},
+		{"contention_events", "", true, false, contentionMsg},
+		{"local_contention_events", "", false, true, contentionMsg},
+		{"contention_events", "", false, true, contentionMsg},
+		{"local_distsql_flows", expectedErrNoPermission, false, false, flowsMsg},
+		{"distsql_flows", expectedErrNoPermission, false, false, flowsMsg},
+		{"local_distsql_flows", "", true, false, flowsMsg},
+		{"distsql_flows", "", true, false, flowsMsg},
+		{"local_distsql_flows", "", false, true, flowsMsg},
+		{"distsql_flows", "", false, true, flowsMsg},
 	}
 	myUser := authenticatedUserNameNoAdmin().Normalized()
 	for _, tc := range testCases {
@@ -1804,21 +1828,21 @@ func TestListContentionEventsSecurity(t *testing.T) {
 			_, err := db.Exec("ALTER USER $1 VIEWACTIVITY", myUser)
 			require.NoError(t, err)
 		}
-		var response serverpb.ListContentionEventsResponse
-		err := getStatusJSONProtoWithAdminOption(s, tc.endpoint, &response, tc.requestWithAdmin)
+		err := getStatusJSONProtoWithAdminOption(s, tc.endpoint, tc.response, tc.requestWithAdmin)
+		responseErrors := getErrors(tc.response)
 		if tc.expectedErr == "" {
-			if err != nil || len(response.Errors) > 0 {
-				t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
-					err, response.Errors)
+			if err != nil || len(responseErrors) > 0 {
+				t.Errorf("unexpected failure listing the activity; error: %v; response errors: %v",
+					err, responseErrors)
 			}
 		} else {
 			respErr := "<no error>"
-			if len(response.Errors) > 0 {
-				respErr = response.Errors[0].Message
+			if len(responseErrors) > 0 {
+				respErr = responseErrors[0].Message
 			}
 			if !testutils.IsError(err, tc.expectedErr) &&
 				!strings.Contains(respErr, tc.expectedErr) {
-				t.Errorf("did not get expected error %q when listing contention events from %s: %v",
+				t.Errorf("did not get expected error %q when listing the activity from %s: %v",
 					tc.expectedErr, tc.endpoint, err)
 			}
 		}
@@ -1838,14 +1862,206 @@ func TestListContentionEventsSecurity(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := serverpb.NewStatusClient(conn)
-	request := &serverpb.ListContentionEventsRequest{}
-	if resp, err := client.ListLocalContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
-		t.Errorf("unexpected failure listing local contention events; error: %v; response errors: %v",
-			err, resp.Errors)
+	{
+		request := &serverpb.ListContentionEventsRequest{}
+		if resp, err := client.ListLocalContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
+			t.Errorf("unexpected failure listing local contention events; error: %v; response errors: %v",
+				err, resp.Errors)
+		}
+		if resp, err := client.ListContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
+			t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
+				err, resp.Errors)
+		}
 	}
-	if resp, err := client.ListContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
-		t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
-			err, resp.Errors)
+	{
+		request := &serverpb.ListDistSQLFlowsRequest{}
+		if resp, err := client.ListLocalDistSQLFlows(ctx, request); err != nil || len(resp.Errors) > 0 {
+			t.Errorf("unexpected failure listing local distsql flows; error: %v; response errors: %v",
+				err, resp.Errors)
+		}
+		if resp, err := client.ListDistSQLFlows(ctx, request); err != nil || len(resp.Errors) > 0 {
+			t.Errorf("unexpected failure listing distsql flows; error: %v; response errors: %v",
+				err, resp.Errors)
+		}
+	}
+}
+
+func TestMergeDistSQLRemoteFlows(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	flowIDs := make([]execinfrapb.FlowID, 4)
+	for i := range flowIDs {
+		flowIDs[i].UUID = uuid.FastMakeV4()
+	}
+	sort.Slice(flowIDs, func(i, j int) bool {
+		return bytes.Compare(flowIDs[i].GetBytes(), flowIDs[j].GetBytes()) < 0
+	})
+	ts := make([]time.Time, 4)
+	for i := range ts {
+		ts[i] = timeutil.Now()
+	}
+
+	for _, tc := range []struct {
+		a        []serverpb.DistSQLRemoteFlows
+		b        []serverpb.DistSQLRemoteFlows
+		expected []serverpb.DistSQLRemoteFlows
+	}{
+		// a is empty
+		{
+			a: []serverpb.DistSQLRemoteFlows{},
+			b: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[1],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+			},
+			expected: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[1],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+			},
+		},
+		// b is empty
+		{
+			a: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[1],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+			},
+			b: []serverpb.DistSQLRemoteFlows{},
+			expected: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[1],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+			},
+		},
+		// both non-empty with some intersections
+		{
+			a: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[2],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[3],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+					},
+				},
+			},
+			b: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+					},
+				},
+				{
+					FlowID: flowIDs[1],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+					},
+				},
+				{
+					FlowID: flowIDs[3],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+					},
+				},
+			},
+			expected: []serverpb.DistSQLRemoteFlows{
+				{
+					FlowID: flowIDs[0],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[1],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+					},
+				},
+				{
+					FlowID: flowIDs[2],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+					},
+				},
+				{
+					FlowID: flowIDs[3],
+					Infos: []serverpb.DistSQLRemoteFlows_Info{
+						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+					},
+				},
+			},
+		},
+	} {
+		require.Equal(t, tc.expected, mergeDistSQLRemoteFlows(tc.a, tc.b))
 	}
 }
 

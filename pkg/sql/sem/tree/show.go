@@ -294,12 +294,10 @@ type ShowChangefeedJobs struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShowChangefeedJobs) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW CHANGEFEED")
+	ctx.WriteString("SHOW CHANGEFEED JOBS")
 	if node.Jobs != nil {
-		ctx.WriteString(" JOB")
+		ctx.WriteString(" ")
 		ctx.FormatNode(node.Jobs)
-	} else {
-		ctx.WriteString(" JOBS")
 	}
 }
 
@@ -492,14 +490,34 @@ func (node *ShowRoleGrants) Format(ctx *FmtCtx) {
 	}
 }
 
+// ShowCreateMode denotes what kind of SHOW CREATE should be used
+type ShowCreateMode int
+
+const (
+	// ShowCreateModeTable represents SHOW CREATE TABLE
+	ShowCreateModeTable ShowCreateMode = iota
+	// ShowCreateModeView represents SHOW CREATE VIEW
+	ShowCreateModeView
+	// ShowCreateModeSequence represents SHOW CREATE SEQUENCE
+	ShowCreateModeSequence
+	// ShowCreateModeDatabase represents SHOW CREATE DATABASE
+	ShowCreateModeDatabase
+)
+
 // ShowCreate represents a SHOW CREATE statement.
 type ShowCreate struct {
+	Mode ShowCreateMode
 	Name *UnresolvedObjectName
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowCreate) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW CREATE ")
+
+	switch node.Mode {
+	case ShowCreateModeDatabase:
+		ctx.WriteString("DATABASE ")
+	}
 	ctx.FormatNode(node.Name)
 }
 

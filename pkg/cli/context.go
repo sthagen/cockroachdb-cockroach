@@ -12,7 +12,6 @@ package cli
 
 import (
 	"context"
-	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -20,14 +19,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/mattn/go-isatty"
+	isatty "github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -49,6 +50,7 @@ func initCLIDefaults() {
 	setQuitContextDefaults()
 	setNodeContextDefaults()
 	setSqlfmtContextDefaults()
+	setConvContextDefaults()
 	setDemoContextDefaults()
 	setStmtDiagContextDefaults()
 	setAuthContextDefaults()
@@ -143,6 +145,11 @@ type cliContext struct {
 	// tableDisplayFormat indicates how to format result tables.
 	tableDisplayFormat tableDisplayFormat
 
+	// tableBorderMode indicates how to format tables when the display
+	// format is 'table'. This exists for compatibility
+	// with psql: https://www.postgresql.org/docs/12/app-psql.html
+	tableBorderMode int
+
 	// cmdTimeout sets the maximum run time for the command.
 	// Commands that wish to use this must use cmdTimeoutContext().
 	cmdTimeout time.Duration
@@ -158,14 +165,11 @@ type cliContext struct {
 
 	// for CLI commands that use the SQL interface, these parameters
 	// determine how to connect to the server.
-	sqlConnURL, sqlConnUser, sqlConnDBName string
+	sqlConnUser, sqlConnDBName string
 
-	// The client password to use. This can be set via the --url flag.
-	sqlConnPasswd string
-
-	// extraConnURLOptions contains any additional query URL options
+	// sqlConnURL contains any additional query URL options
 	// specified in --url that do not have discrete equivalents.
-	extraConnURLOptions url.Values
+	sqlConnURL *pgurl.URL
 
 	// allowUnencryptedClientPassword enables the CLI commands to use
 	// password authentication over non-TLS TCP connections. This is
@@ -212,6 +216,7 @@ func setCliContextDefaults() {
 	// See also setCLIDefaultForTests() in cli_test.go.
 	cliCtx.terminalOutput = isatty.IsTerminal(os.Stdout.Fd())
 	cliCtx.tableDisplayFormat = tableDisplayTSV
+	cliCtx.tableBorderMode = 0 /* no outer lines + no inside row lines */
 	if cliCtx.terminalOutput {
 		// See also setCLIDefaultForTests() in cli_test.go.
 		cliCtx.tableDisplayFormat = tableDisplayTable
@@ -220,11 +225,9 @@ func setCliContextDefaults() {
 	cliCtx.clientConnHost = ""
 	cliCtx.clientConnPort = base.DefaultPort
 	cliCtx.certPrincipalMap = nil
-	cliCtx.sqlConnURL = ""
-	cliCtx.sqlConnUser = ""
-	cliCtx.sqlConnPasswd = ""
+	cliCtx.sqlConnURL = nil
+	cliCtx.sqlConnUser = security.RootUser
 	cliCtx.sqlConnDBName = ""
-	cliCtx.extraConnURLOptions = nil
 	cliCtx.allowUnencryptedClientPassword = false
 	cliCtx.logConfigInput = settableString{s: ""}
 	cliCtx.logConfig = logconfig.Config{}
@@ -245,6 +248,10 @@ var sqlCtx = struct {
 	// execStmts is a list of statements to execute.
 	// Only valid if inputFile is empty.
 	execStmts statementsValue
+
+	// quitAfterExecStmts tells the shell whether to quit
+	// after processing the execStmts.
+	quitAfterExecStmts bool
 
 	// inputFile is the file to read from.
 	// If empty, os.Stdin is used.
@@ -303,6 +310,7 @@ var sqlCtx = struct {
 func setSQLContextDefaults() {
 	sqlCtx.setStmts = nil
 	sqlCtx.execStmts = nil
+	sqlCtx.quitAfterExecStmts = false
 	sqlCtx.inputFile = ""
 	sqlCtx.repeatDelay = 0
 	sqlCtx.safeUpdates = false
@@ -550,6 +558,17 @@ func setSqlfmtContextDefaults() {
 	sqlfmtCtx.noSimplify = !cfg.Simplify
 	sqlfmtCtx.align = (cfg.Align != tree.PrettyNoAlign)
 	sqlfmtCtx.execStmts = nil
+}
+
+var convertCtx struct {
+	url string
+}
+
+// setConvContextDefaults set the default values in convertCtx.  This
+// function is called by initCLIDefaults() and thus re-called in every
+// test that exercises command-line parsing.
+func setConvContextDefaults() {
+	convertCtx.url = ""
 }
 
 // demoCtx captures the command-line parameters of the `demo` command.

@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/denylist"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -574,7 +575,19 @@ func TestDenylistUpdate(t *testing.T) {
 	backendDial := backendDial
 	defer hookBackendDial(func(msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config) (net.Conn, error) {
 		time.AfterFunc(100*time.Millisecond, func() {
-			_, err := denyList.WriteString("127.0.0.1: test-denied")
+			dlf := denylist.File{
+				Denylist: []*denylist.DenyEntry{
+					{
+						Entity:     denylist.DenyEntity{Type: denylist.IPAddrType, Item: "127.0.0.1"},
+						Expiration: timeutil.Now().Add(time.Minute),
+						Reason:     "test-denied",
+					},
+				},
+			}
+
+			bytes, err := dlf.Serialize()
+			require.NoError(t, err)
+			_, err = denyList.Write(bytes)
 			require.NoError(t, err)
 		})
 		return backendDial(msg, sql.ServingSQLAddr(), proxyOutgoingTLSConfig)
@@ -597,11 +610,12 @@ func TestDenylistUpdate(t *testing.T) {
 		t,
 		func() bool {
 			_, err = conn.Exec(context.Background(), "SELECT 1")
-			return err != nil && strings.Contains(err.Error(), "expired")
+			return err != nil
 		},
 		time.Second, 5*time.Millisecond,
-		"unexpected error received: %v", err,
+		"Expected the connection to eventually fail",
 	)
+	require.EqualError(t, err, "unexpected EOF")
 }
 
 func TestProxyAgainstSecureCRDBWithIdleTimeout(t *testing.T) {
@@ -655,7 +669,8 @@ func TestProxyAgainstSecureCRDBWithIdleTimeout(t *testing.T) {
 
 	time.Sleep(idleTimeout * 2)
 	err = conn.QueryRow(context.Background(), "SELECT $1::int", 1).Scan(&n)
-	require.EqualError(t, err, "FATAL: terminating connection due to idle timeout (SQLSTATE 57P01)")
+	require.EqualError(t, err, "unexpected EOF")
+	require.Equal(t, int64(1), s.metrics.IdleDisconnectCount.Count())
 }
 
 func newDirectoryServer(

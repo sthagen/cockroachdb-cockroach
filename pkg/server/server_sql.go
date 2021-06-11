@@ -56,6 +56,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob/gcjobnotifier"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
@@ -82,6 +83,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/service"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingservicepb"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 	"google.golang.org/grpc"
@@ -101,6 +104,7 @@ type SQLServer struct {
 	internalExecutor *sql.InternalExecutor
 	leaseMgr         *lease.Manager
 	blobService      *blobs.Service
+	tracingService   *service.Service
 	tenantConnect    kvtenant.Connector
 	// sessionRegistry can be queried for info on running SQL sessions. It is
 	// shared between the sql.Server and the statusServer.
@@ -216,6 +220,10 @@ type sqlServerArgs struct {
 	// Used to track the contention events on this node.
 	contentionRegistry *contention.Registry
 
+	// Used to track the DistSQL flows scheduled on this node but initiated on
+	// behalf of other nodes.
+	flowScheduler *flowinfra.FlowScheduler
+
 	// KV depends on the internal executor, so we pass a pointer to an empty
 	// struct in this configuration, which newSQLServer fills.
 	//
@@ -234,7 +242,8 @@ type sqlServerArgs struct {
 	// The executorConfig uses the provider.
 	protectedtsProvider protectedts.Provider
 
-	// Used to list sessions and contention events and cancel sessions/queries.
+	// Used to list activity (sessions, queries, contention, DistSQL flows) on
+	// the node/cluster and cancel sessions/queries.
 	sqlStatusServer serverpb.SQLStatusServer
 
 	// Used to watch settings and descriptor changes.
@@ -261,6 +270,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	blobspb.RegisterBlobServer(cfg.grpcServer, blobService)
 
+	// Create trace service for inter-node sharing of inflight trace spans.
+	tracingService := service.New(cfg.Settings.Tracer)
+	tracingservicepb.RegisterTracingServer(cfg.grpcServer, tracingService)
+
 	jobRegistry := cfg.circularJobRegistry
 	{
 		regLiveness := cfg.nodeLiveness
@@ -269,7 +282,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		}
 
 		cfg.sqlLivenessProvider = slprovider.New(
-			cfg.stopper, cfg.clock, cfg.db, cfg.circularInternalExecutor, cfg.Settings,
+			cfg.stopper, cfg.clock, cfg.db, codec, cfg.Settings,
 		)
 		cfg.registry.AddMetricStruct(cfg.sqlLivenessProvider.Metrics())
 
@@ -381,6 +394,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		}
 	}))
 
+	virtualSchemas, err := sql.NewVirtualSchemaHolder(ctx, cfg.Settings)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating virtual schema holder")
+	}
+
 	hydratedTablesCache := hydratedtables.NewCache(cfg.Settings)
 	cfg.registry.AddMetricStruct(hydratedTablesCache.Metrics())
 
@@ -450,6 +468,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 
 		RangeCache:     cfg.distSender.RangeDescriptorCache(),
 		HydratedTables: hydratedTablesCache,
+		VirtualSchemas: virtualSchemas,
 	}
 	cfg.TempStorageConfig.Mon.SetMetrics(distSQLMetrics.CurDiskBytesCount, distSQLMetrics.MaxDiskBytesHist)
 	if distSQLTestingKnobs := cfg.TestingKnobs.DistSQL; distSQLTestingKnobs != nil {
@@ -458,13 +477,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	if cfg.TestingKnobs.JobsTestingKnobs != nil {
 		distSQLCfg.TestingKnobs.JobsTestingKnobs = cfg.TestingKnobs.JobsTestingKnobs
 	}
-	distSQLServer := distsql.NewServer(ctx, distSQLCfg)
+	distSQLServer := distsql.NewServer(ctx, distSQLCfg, cfg.flowScheduler)
 	execinfrapb.RegisterDistSQLServer(cfg.grpcServer, distSQLServer)
-
-	virtualSchemas, err := sql.NewVirtualSchemaHolder(ctx, cfg.Settings)
-	if err != nil {
-		return nil, errors.Wrap(err, "creating virtual schema holder")
-	}
 
 	// Set up Executor
 
@@ -732,6 +746,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		internalExecutor:        cfg.circularInternalExecutor,
 		leaseMgr:                leaseMgr,
 		blobService:             blobService,
+		tracingService:          tracingService,
 		tenantConnect:           cfg.tenantConnect,
 		sessionRegistry:         cfg.sessionRegistry,
 		jobRegistry:             jobRegistry,
@@ -755,7 +770,7 @@ func maybeCheckTenantExists(ctx context.Context, codec keys.SQLCodec, db *kv.DB)
 		// Skip check for system tenant and return early.
 		return nil
 	}
-	key := catalogkeys.NewDatabaseKey(systemschema.SystemDatabaseName).Key(codec)
+	key := catalogkeys.MakeDatabaseNameKey(codec, systemschema.SystemDatabaseName)
 	result, err := db.Get(ctx, key)
 	if err != nil {
 		return err

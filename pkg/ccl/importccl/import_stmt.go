@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -409,7 +410,7 @@ func importPlanHook(
 			//  UnresolvedObjectNames here, rather than TableNames.
 			// We have a target table, so it might specify a DB in its name.
 			un := table.ToUnresolvedObjectName()
-			found, prefix, resPrefixI, err := tree.ResolveTarget(ctx,
+			found, prefix, resPrefix, err := resolver.ResolveTarget(ctx,
 				un, p, p.SessionData().Database, p.SessionData().SearchPath)
 			if err != nil {
 				return pgerror.Wrap(err, pgcode.UndefinedTable,
@@ -422,7 +423,6 @@ func importPlanHook(
 				return pgerror.Newf(pgcode.UndefinedObject,
 					"database does not exist: %q", table)
 			}
-			resPrefix := resPrefixI.(*catalog.ResolvedObjectPrefix)
 			dbDesc := resPrefix.Database
 			schema := resPrefix.Schema
 			// If this is a non-INTO import that will thus be making a new table, we
@@ -443,7 +443,10 @@ func importPlanHook(
 		} else {
 			// No target table means we're importing whatever we find into the session
 			// database, so it must exist.
-			dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, p.SessionData().Database, true /*required*/)
+			dbDesc, err := p.Accessor().GetDatabaseDesc(ctx, p.Txn(), p.SessionData().Database, tree.DatabaseLookupFlags{
+				AvoidCached: true,
+				Required:    true,
+			})
 			if err != nil {
 				return pgerror.Wrap(err, pgcode.UndefinedObject,
 					"could not resolve current database")
@@ -1460,8 +1463,8 @@ func (r *importResumer) prepareSchemasForIngestion(
 
 	// Finally create the schemas on disk.
 	for i, mutDesc := range mutableSchemaDescs {
-		err = createSchemaDescriptorWithID(ctx, catalogkeys.NewSchemaKey(dbDesc.ID,
-			mutDesc.GetName()).Key(p.ExecCfg().Codec), mutDesc.ID, mutDesc, p, descsCol, txn)
+		nameKey := catalogkeys.MakeSchemaNameKey(p.ExecCfg().Codec, dbDesc.ID, mutDesc.GetName())
+		err = createSchemaDescriptorWithID(ctx, nameKey, mutDesc.ID, mutDesc, p, descsCol, txn)
 		if err != nil {
 			return nil, err
 		}
@@ -2532,15 +2535,7 @@ func (r *importResumer) dropTables(
 			// possible. This is safe since the table data was never visible to users,
 			// and so we don't need to preserve MVCC semantics.
 			newTableDesc.DropTime = dropTime
-			catalogkv.WriteObjectNamespaceEntryRemovalToBatch(
-				ctx,
-				b,
-				execCfg.Codec,
-				newTableDesc.ParentID,
-				newTableDesc.GetParentSchemaID(),
-				newTableDesc.Name,
-				false, /* kvTrace */
-			)
+			b.Del(catalogkeys.EncodeNameKey(execCfg.Codec, newTableDesc))
 			tablesToGC = append(tablesToGC, newTableDesc.ID)
 			descsCol.AddDeletedDescriptor(newTableDesc)
 		} else {

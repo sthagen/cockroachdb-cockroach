@@ -51,9 +51,9 @@ func GenerateUniqueDescID(ctx context.Context, db *kv.DB, codec keys.SQLCodec) (
 // GetDescriptorID looks up the ID for plainKey.
 // InvalidID is returned if the name cannot be resolved.
 func GetDescriptorID(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, plainKey catalogkeys.DescriptorKey,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, plainKey catalog.NameKeyComponents,
 ) (descpb.ID, error) {
-	key := plainKey.Key(codec)
+	key := catalogkeys.EncodeNameKey(codec, plainKey)
 	log.Eventf(ctx, "looking up descriptor ID for name key %q", key)
 	gr, err := txn.Get(ctx, key)
 	if err != nil {
@@ -75,7 +75,7 @@ func ResolveSchemaID(
 		return true, keys.PublicSchemaID, nil
 	}
 
-	sKey := catalogkeys.NewSchemaKey(dbID, scName)
+	sKey := catalogkeys.NewNameKeyComponents(dbID, keys.RootNamespaceID, scName)
 	schemaID, err := GetDescriptorID(ctx, txn, codec, sKey)
 	if err != nil || schemaID == descpb.InvalidID {
 		return false, descpb.InvalidID, err
@@ -266,11 +266,6 @@ func getAllDescriptorsAndMaybeNamespaceEntriesUnvalidated(
 	}
 	if withNamespace {
 		// Batch results index 1.
-		prefixDeprecated := codec.IndexPrefix(
-			uint32(systemschema.DeprecatedNamespaceTable.GetID()),
-			uint32(systemschema.DeprecatedNamespaceTable.GetPrimaryIndexID()))
-		b.Scan(prefixDeprecated, prefixDeprecated.PrefixEnd())
-		// Batch results index 2.
 		prefix := codec.IndexPrefix(
 			uint32(systemschema.NamespaceTable.GetID()),
 			uint32(systemschema.NamespaceTable.GetPrimaryIndexID()))
@@ -282,7 +277,7 @@ func getAllDescriptorsAndMaybeNamespaceEntriesUnvalidated(
 	}
 	m.Descriptors = make(map[descpb.ID]catalog.Descriptor, len(b.Results[0].Rows))
 	if withNamespace {
-		m.Namespace = make(map[descpb.NameInfo]descpb.ID, len(b.Results[1].Rows)+len(b.Results[2].Rows))
+		m.Namespace = make(map[descpb.NameInfo]descpb.ID, len(b.Results[1].Rows))
 	}
 	dg := NewOneLevelUncachedDescGetter(txn, codec)
 	for queryIndex, results := range b.Results {
@@ -302,10 +297,7 @@ func getAllDescriptorsAndMaybeNamespaceEntriesUnvalidated(
 					m.Descriptors[desc.GetID()] = desc
 				}
 			case 1:
-				k.ParentID, k.Name, err = catalogkeys.DecodeDeprecatedNameMetadataKey(codec, row.Key)
-				m.Namespace[k] = descpb.ID(row.ValueInt())
-			case 2:
-				k.ParentID, k.ParentSchemaID, k.Name, err = catalogkeys.DecodeNameMetadataKey(codec, row.Key)
+				k, err = catalogkeys.DecodeNameMetadataKey(codec, row.Key)
 				m.Namespace[k] = descpb.ID(row.ValueInt())
 			default:
 				panic("missing switch case")
@@ -349,21 +341,11 @@ func GetAllDatabaseDescriptorIDs(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
 ) ([]descpb.ID, error) {
 	log.Eventf(ctx, "fetching all database descriptor IDs")
-	nameKey := catalogkeys.NewDatabaseKey("" /* name */).Key(codec)
+	nameKey := catalogkeys.MakeDatabaseNameKey(codec, "")
 	kvs, err := txn.Scan(ctx, nameKey, nameKey.PrefixEnd(), 0 /*maxRows */)
 	if err != nil {
 		return nil, err
 	}
-	// See the comment in physical_schema_accessors.go,
-	// func (a UncachedPhysicalAccessor) GetObjectNamesAndIDs. Same concept
-	// applies here.
-	// TODO(solon): This complexity can be removed in 20.2.
-	nameKey = catalogkeys.NewDeprecatedDatabaseKey("" /* name */).Key(codec)
-	dkvs, err := txn.Scan(ctx, nameKey, nameKey.PrefixEnd(), 0 /* maxRows */)
-	if err != nil {
-		return nil, err
-	}
-	kvs = append(kvs, dkvs...)
 
 	descIDs := make([]descpb.ID, 0, len(kvs))
 	alreadySeen := make(map[descpb.ID]bool)

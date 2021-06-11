@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -90,7 +91,7 @@ type extendedEvalContext struct {
 	// SchemaChangeJobCache refers to schemaChangeJobsCache in extraTxnState.
 	SchemaChangeJobCache map[descpb.ID]*jobs.Job
 
-	sqlStatsCollector *sqlStatsCollector
+	statsStorage sqlstats.Storage
 
 	SchemaChangerState *SchemaChangerState
 }
@@ -549,18 +550,13 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 }
 
 // LookupTableByID looks up a table, by the given descriptor ID. Based on the
-// CommonLookupFlags, it could use or skip the Collection cache. See
-// Collection.getTableVersionByID for how it's used.
-// TODO (SQLSchema): This should call into the set of SchemaAccessors instead
-//  of having its own logic for lookups.
+// CommonLookupFlags, it could use or skip the Collection cache.
 func (p *planner) LookupTableByID(
 	ctx context.Context, tableID descpb.ID,
 ) (catalog.TableDescriptor, error) {
-	if entry, err := p.getVirtualTabler().getVirtualTableEntryByID(tableID); err == nil {
-		return entry.desc, nil
-	}
-	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidCached: p.avoidCachedDescriptors}}
-	table, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, tableID, flags)
+	const required = true // lookups by ID are always "required"
+	table, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, tableID, p.ObjectLookupFlags(
+		required, false /* requireMutable */))
 	if err != nil {
 		return nil, err
 	}

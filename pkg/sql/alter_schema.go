@@ -58,7 +58,11 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 	if err != nil {
 		return nil, err
 	}
-	schema, err := p.ResolveMutableSchemaDescriptor(ctx, db.ID, string(n.Schema.SchemaName), true /* required */)
+	schema, err := p.Descriptors().GetSchemaByName(ctx, p.txn, db.ID,
+		string(n.Schema.SchemaName), tree.SchemaLookupFlags{
+			Required:       true,
+			RequireMutable: true,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +204,7 @@ func (p *planner) renameSchema(
 	desc.SetName(newName)
 
 	// Write a new namespace entry for the new name.
-	nameKey := catalogkeys.NewSchemaKey(desc.ParentID, newName).Key(p.execCfg.Codec)
+	nameKey := catalogkeys.MakeSchemaNameKey(p.execCfg.Codec, desc.ParentID, newName)
 	b := p.txn.NewBatch()
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", nameKey, desc.ID)

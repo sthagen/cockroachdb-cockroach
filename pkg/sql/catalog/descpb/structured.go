@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
@@ -149,6 +150,22 @@ func (c ColumnIDs) Equals(input ColumnIDs) bool {
 		}
 	}
 	return true
+}
+
+// PermutationOf returns true if this list and the input list contain the same
+// set of column IDs in any order. Duplicate ColumnIDs have no effect.
+func (c ColumnIDs) PermutationOf(input ColumnIDs) bool {
+	ourColsSet := util.MakeFastIntSet()
+	for _, col := range c {
+		ourColsSet.Add(int(col))
+	}
+
+	inputColsSet := util.MakeFastIntSet()
+	for _, inputCol := range input {
+		inputColsSet.Add(int(inputCol))
+	}
+
+	return inputColsSet.Equals(ourColsSet)
 }
 
 // Contains returns whether this list contains the input ID.
@@ -355,4 +372,19 @@ func (u *UniqueWithoutIndexConstraint) GetName() string {
 // IsPartial returns true if the constraint is a partial unique constraint.
 func (u *UniqueWithoutIndexConstraint) IsPartial() bool {
 	return u.Predicate != ""
+}
+
+// GetParentID implements the catalog.NameKeyHaver interface.
+func (ni NameInfo) GetParentID() ID {
+	return ni.ParentID
+}
+
+// GetParentSchemaID implements the catalog.NameKeyHaver interface.
+func (ni NameInfo) GetParentSchemaID() ID {
+	return ni.ParentSchemaID
+}
+
+// GetName implements the catalog.NameKeyHaver interface.
+func (ni NameInfo) GetName() string {
+	return ni.Name
 }

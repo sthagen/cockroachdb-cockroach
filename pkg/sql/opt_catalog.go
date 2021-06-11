@@ -164,11 +164,9 @@ func (oc *optCatalog) ResolveSchema(
 	}
 
 	oc.tn.ObjectNamePrefix = *name
-	found, prefixI, err := oc.tn.ObjectNamePrefix.Resolve(
-		ctx,
-		oc.planner,
-		oc.planner.CurrentDatabase(),
-		oc.planner.CurrentSearchPath(),
+	found, prefix, err := resolver.ResolveObjectNamePrefix(
+		ctx, oc.planner, oc.planner.CurrentDatabase(),
+		oc.planner.CurrentSearchPath(), &oc.tn.ObjectNamePrefix,
 	)
 	if err != nil {
 		return nil, cat.SchemaName{}, err
@@ -184,7 +182,6 @@ func (oc *optCatalog) ResolveSchema(
 		)
 	}
 
-	prefix := prefixI.(*catalog.ResolvedObjectPrefix)
 	return &optSchema{
 		planner:  oc.planner,
 		database: prefix.Database,
@@ -1146,6 +1143,9 @@ type optIndex struct {
 	idx  catalog.Index
 	zone *zonepb.ZoneConfig
 
+	// columnOrds maps the index columns to table column ordinals.
+	columnOrds []int
+
 	// storedCols is the set of non-PK columns if this is the primary index,
 	// otherwise it is desc.StoreColumnIDs.
 	storedCols []descpb.ColumnID
@@ -1271,6 +1271,26 @@ func (oi *optIndex) init(
 		oi.numLaxKeyCols = idx.NumKeyColumns() + idx.NumKeySuffixColumns()
 		oi.numKeyCols = oi.numLaxKeyCols
 	}
+
+	// Populate columnOrds.
+	inverted := oi.IsInverted()
+	numKeyCols := idx.NumKeyColumns()
+	numKeySuffixCols := idx.NumKeySuffixColumns()
+	oi.columnOrds = make([]int, oi.numCols)
+	for i := 0; i < oi.numCols; i++ {
+		var ord int
+		switch {
+		case inverted && i == numKeyCols-1:
+			ord = oi.invertedVirtualColOrd
+		case i < numKeyCols:
+			ord, _ = oi.tab.lookupColumnOrdinal(oi.idx.GetKeyColumnID(i))
+		case i < numKeyCols+numKeySuffixCols:
+			ord, _ = oi.tab.lookupColumnOrdinal(oi.idx.GetKeySuffixColumnID(i - numKeyCols))
+		default:
+			ord, _ = oi.tab.lookupColumnOrdinal(oi.storedCols[i-numKeyCols-numKeySuffixCols])
+		}
+		oi.columnOrds[i] = ord
+	}
 }
 
 // ID is part of the cat.Index interface.
@@ -1318,30 +1338,13 @@ func (oi *optIndex) NonInvertedPrefixColumnCount() int {
 
 // Column is part of the cat.Index interface.
 func (oi *optIndex) Column(i int) cat.IndexColumn {
-	length := oi.idx.NumKeyColumns()
-	if i < length {
-		ord := 0
-		if oi.IsInverted() && i == length-1 {
-			ord = oi.invertedVirtualColOrd
-		} else {
-			ord, _ = oi.tab.lookupColumnOrdinal(oi.idx.GetKeyColumnID(i))
-		}
-		return cat.IndexColumn{
-			Column:     oi.tab.Column(ord),
-			Descending: oi.idx.GetKeyColumnDirection(i) == descpb.IndexDescriptor_DESC,
-		}
+	ord := oi.columnOrds[i]
+	// Only key columns have a direction.
+	descending := i < oi.idx.NumKeyColumns() && oi.idx.GetKeyColumnDirection(i) == descpb.IndexDescriptor_DESC
+	return cat.IndexColumn{
+		Column:     oi.tab.Column(ord),
+		Descending: descending,
 	}
-
-	i -= length
-	length = oi.idx.NumKeySuffixColumns()
-	if i < length {
-		ord, _ := oi.tab.lookupColumnOrdinal(oi.idx.GetKeySuffixColumnID(i))
-		return cat.IndexColumn{Column: oi.tab.Column(ord), Descending: false}
-	}
-
-	i -= length
-	ord, _ := oi.tab.lookupColumnOrdinal(oi.storedCols[i])
-	return cat.IndexColumn{Column: oi.tab.Column(ord), Descending: false}
 }
 
 // VirtualInvertedColumn is part of the cat.Index interface.
@@ -1765,11 +1768,11 @@ func newOptVirtualTable(
 	id := cat.StableID(desc.GetID())
 	if name.Catalog() != "" {
 		// TODO(radu): it's unfortunate that we have to lookup the schema again.
-		_, prefixI, err := oc.planner.LookupSchema(ctx, name.Catalog(), name.Schema())
+		found, prefix, err := oc.planner.LookupSchema(ctx, name.Catalog(), name.Schema())
 		if err != nil {
 			return nil, err
 		}
-		if prefixI == nil {
+		if !found {
 			// The database was not found. This can happen e.g. when
 			// accessing a virtual schema over a non-existent
 			// database. This is a common scenario when the current db
@@ -1782,7 +1785,6 @@ func newOptVirtualTable(
 			// both cases.
 			id |= cat.StableID(math.MaxUint32) << 32
 		} else {
-			prefix := prefixI.(*catalog.ResolvedObjectPrefix)
 			id |= cat.StableID(prefix.Database.GetID()) << 32
 		}
 	}

@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/armon/circbuf"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -323,7 +324,7 @@ func (r *clusterRegistry) savedClusters() []clusterWithMsg {
 // blocks until they're destroyed. It responds to context cancelation by
 // interrupting the waiting; the cluster destruction itself does not inherit the
 // cancelation.
-func (r *clusterRegistry) destroyAllClusters(ctx context.Context, l *logger) {
+func (r *clusterRegistry) destroyAllClusters(ctx context.Context, l *logger.Logger) {
 	// Fire off a goroutine to destroy all of the clusters.
 	done := make(chan struct{})
 	go func() {
@@ -363,7 +364,7 @@ func (r *clusterRegistry) destroyAllClusters(ctx context.Context, l *logger) {
 }
 
 // execCmd is like execCmdEx, but doesn't return the command's output.
-func execCmd(ctx context.Context, l *logger, args ...string) error {
+func execCmd(ctx context.Context, l *logger.Logger, args ...string) error {
 	return execCmdEx(ctx, l, args...).err
 }
 
@@ -379,7 +380,7 @@ type cmdRes struct {
 // Note that the output is truncated; only a tail is returned.
 // Also note that if the command exits with an error code, its output is also
 // included in cmdRes.err.
-func execCmdEx(ctx context.Context, l *logger, args ...string) cmdRes {
+func execCmdEx(ctx context.Context, l *logger.Logger, args ...string) cmdRes {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -462,11 +463,11 @@ func execCmdEx(ctx context.Context, l *logger, args ...string) cmdRes {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(l.stdout, io.TeeReader(rOut, debugStdoutBuffer))
+			_, _ = io.Copy(l.Stdout, io.TeeReader(rOut, debugStdoutBuffer))
 		}()
 
-		if l.stderr == l.stdout {
-			// If l.stderr == l.stdout, we use only one pipe to avoid
+		if l.Stderr == l.Stdout {
+			// If l.Stderr == l.Stdout, we use only one pipe to avoid
 			// duplicating everything.
 			cmd.Stderr = wOut
 		} else {
@@ -474,7 +475,7 @@ func execCmdEx(ctx context.Context, l *logger, args ...string) cmdRes {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, _ = io.Copy(l.stderr, io.TeeReader(rErr, debugStderrBuffer))
+				_, _ = io.Copy(l.Stderr, io.TeeReader(rErr, debugStderrBuffer))
 			}()
 		}
 	}
@@ -557,7 +558,7 @@ func GetStderr(err error) string {
 // execCmdWithBuffer executes the given command and returns its stdout/stderr
 // output. If the return code is not 0, an error is also returned.
 // l is used to log the command before running it. No output is logged.
-func execCmdWithBuffer(ctx context.Context, l *logger, args ...string) ([]byte, error) {
+func execCmdWithBuffer(ctx context.Context, l *logger.Logger, args ...string) ([]byte, error) {
 	l.Printf("> %s\n", strings.Join(args, " "))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 
@@ -749,7 +750,7 @@ type testI interface {
 	// Path to a directory where the test is supposed to store its log and other
 	// artifacts.
 	ArtifactsDir() string
-	logger() *logger
+	logger() *logger.Logger
 	Status(args ...interface{})
 }
 
@@ -1144,7 +1145,7 @@ type cluster struct {
 	// l is the logger used to log various cluster operations.
 	// DEPRECATED for use outside of cluster methods: Use a test's t.l instead.
 	// This is generally set to the current test's logger.
-	l          *logger
+	l          *logger.Logger
 	expiration time.Time
 	// encryptDefault is true if the cluster should default to having encryption
 	// at rest enabled. The default only applies if encryption is not explicitly
@@ -1158,6 +1159,28 @@ type cluster struct {
 
 	// destroyState contains state related to the cluster's destruction.
 	destroyState destroyState
+}
+
+// Name returns the cluster name, i.e. something like `teamcity-....`
+func (c *cluster) Name() string {
+	return c.name
+}
+
+// EncryptAtRandom sets whether the cluster will start new nodes with
+// encryption enabled.
+func (c *cluster) EncryptAtRandom(b bool) {
+	c.encryptAtRandom = true
+}
+
+// EncryptDefault sets the default for encryption-at-rest. This can be overridden
+// by options passed to `c.Start`.
+func (c *cluster) EncryptDefault(b bool) {
+	c.encryptDefault = b
+}
+
+// Spec returns the spec underlying the cluster.
+func (c *cluster) Spec() clusterSpec {
+	return c.spec
 }
 
 // status is used to communicate the test's status. It's a no-op until the
@@ -1176,7 +1199,7 @@ func (c *cluster) workerStatus(args ...interface{}) {
 }
 
 func (c *cluster) String() string {
-	return fmt.Sprintf("%s [tag:%s] (%d nodes)", c.name, c.tag, c.spec.NodeCount)
+	return fmt.Sprintf("%s [tag:%s] (%d nodes)", c.name, c.tag, c.Spec().NodeCount)
 }
 
 type destroyState struct {
@@ -1215,7 +1238,7 @@ func (c *cluster) closeLogger() {
 		return
 	}
 	c.destroyState.mu.loggerClosed = true
-	c.l.close()
+	c.l.Close()
 }
 
 type clusterConfig struct {
@@ -1279,7 +1302,7 @@ func (f *clusterFactory) releaseSem() {
 //
 // NOTE: setTest() needs to be called before a test can use this cluster.
 func (f *clusterFactory) newCluster(
-	ctx context.Context, cfg clusterConfig, setStatus func(string), teeOpt teeOptType,
+	ctx context.Context, cfg clusterConfig, setStatus func(string), teeOpt logger.TeeOptType,
 ) (*cluster, error) {
 	if ctx.Err() != nil {
 		return nil, errors.Wrap(ctx.Err(), "newCluster")
@@ -1338,7 +1361,7 @@ func (f *clusterFactory) newCluster(
 
 	// Logs for creating a new cluster go to a dedicated log file.
 	logPath := filepath.Join(f.artifactsDir, runnerLogsDir, "cluster-create", name+".log")
-	l, err := rootLogger(logPath, teeOpt)
+	l, err := logger.RootLogger(logPath, teeOpt)
 	if err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
@@ -1387,7 +1410,12 @@ type attachOpt struct {
 //
 // NOTE: setTest() needs to be called before a test can use this cluster.
 func attachToExistingCluster(
-	ctx context.Context, name string, l *logger, spec clusterSpec, opt attachOpt, r *clusterRegistry,
+	ctx context.Context,
+	name string,
+	l *logger.Logger,
+	spec clusterSpec,
+	opt attachOpt,
+	r *clusterRegistry,
 ) (*cluster, error) {
 	exp := spec.expiration()
 	if name == "local" {
@@ -1468,7 +1496,7 @@ func (c *cluster) StopCockroachGracefullyOnNode(ctx context.Context, node int) e
 }
 
 // Save marks the cluster as "saved" so that it doesn't get destroyed.
-func (c *cluster) Save(ctx context.Context, msg string, l *logger) {
+func (c *cluster) Save(ctx context.Context, msg string, l *logger.Logger) {
 	l.PrintfCtx(ctx, "saving cluster %s for debugging (--debug specified)", c)
 	// TODO(andrei): should we extend the cluster here? For how long?
 	if c.destroyState.owned { // we won't have an alloc for an unowned cluster
@@ -1485,7 +1513,7 @@ func (c *cluster) Save(ctx context.Context, msg string, l *logger) {
 // the cluster's spec. It's intended to be used with clusters created by
 // attachToExistingCluster(); otherwise, clusters create with newCluster() are
 // know to be up to spec.
-func (c *cluster) validate(ctx context.Context, nodes clusterSpec, l *logger) error {
+func (c *cluster) validate(ctx context.Context, nodes clusterSpec, l *logger.Logger) error {
 	// Perform validation on the existing cluster.
 	c.status("checking that existing cluster matches spec")
 	sargs := []string{roachprod, "list", c.name, "--json", "--quiet"}
@@ -1558,20 +1586,20 @@ func (c *cluster) Nodes(ns ...int) nodeListOption {
 	return r
 }
 
-// All returns a node list containing only the node i.
+// All returns a node list containing only the node with id i. IDs are 1-based.
 func (c *cluster) Node(i int) nodeListOption {
 	return c.Range(i, i)
 }
 
 // FetchLogs downloads the logs from the cluster using `roachprod get`.
 // The logs will be placed in the test's artifacts dir.
-func (c *cluster) FetchLogs(ctx context.Context) error {
+func (c *cluster) FetchLogs(ctx context.Context, t *test) error {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
 		return nil
 	}
 
-	c.l.Printf("fetching logs\n")
+	t.l.Printf("fetching logs\n")
 	c.status("fetching logs")
 
 	// Don't hang forever if we can't fetch the logs.
@@ -1582,14 +1610,14 @@ func (c *cluster) FetchLogs(ctx context.Context) error {
 		}
 
 		if err := execCmd(ctx, c.l, roachprod, "get", c.name, "logs" /* src */, path /* dest */); err != nil {
-			c.l.Printf("failed to fetch logs: %v", err)
+			t.l.Printf("failed to fetch logs: %v", err)
 			if ctx.Err() != nil {
 				return err
 			}
 		}
 
 		if err := c.RunE(ctx, c.All(), "mkdir -p logs/redacted && ./cockroach debug merge-logs --redact logs/*.log > logs/redacted/combined.log"); err != nil {
-			c.l.Printf("failed to redact logs: %v", err)
+			t.l.Printf("failed to redact logs: %v", err)
 			if ctx.Err() != nil {
 				return err
 			}
@@ -1602,7 +1630,7 @@ func (c *cluster) FetchLogs(ctx context.Context) error {
 }
 
 // FetchDiskUsage collects a summary of the disk usage on nodes.
-func (c *cluster) FetchDiskUsage(ctx context.Context) error {
+func (c *cluster) FetchDiskUsage(ctx context.Context, t *test) error {
 	// TODO(jackson): This is temporary for debugging out-of-disk-space
 	// failures like #44845.
 	if c.spec.NodeCount == 0 || c.isLocal() {
@@ -1611,7 +1639,7 @@ func (c *cluster) FetchDiskUsage(ctx context.Context) error {
 		return nil
 	}
 
-	c.l.Printf("fetching disk usage\n")
+	t.l.Printf("fetching disk usage\n")
 	c.status("fetching disk usage")
 
 	// Don't hang forever.
@@ -1627,7 +1655,7 @@ func (c *cluster) FetchDiskUsage(ctx context.Context) error {
 		); err != nil {
 			// Don't error out because it might've worked on some nodes. Fetching will
 			// error out below but will get everything it can first.
-			c.l.Printf("during disk usage fetching: %s", err)
+			t.l.Printf("during disk usage fetching: %s", err)
 		}
 		return execCmd(ctx, c.l, roachprod, "get", c.name, name /* src */, path /* dest */)
 	})
@@ -1658,7 +1686,7 @@ func (c *cluster) CopyRoachprodState(ctx context.Context) error {
 // the first available node. They can be visualized via:
 //
 // `COCKROACH_DEBUG_TS_IMPORT_FILE=tsdump.gob ./cockroach start-single-node --insecure --store=$(mktemp -d)`
-func (c *cluster) FetchTimeseriesData(ctx context.Context) error {
+func (c *cluster) FetchTimeseriesData(ctx context.Context, t *test) error {
 	return contextutil.RunWithTimeout(ctx, "debug zip", 5*time.Minute, func(ctx context.Context) error {
 		var err error
 		for i := 1; i <= c.spec.NodeCount; i++ {
@@ -1669,7 +1697,7 @@ func (c *cluster) FetchTimeseriesData(ctx context.Context) error {
 			if err == nil {
 				return nil
 			}
-			c.l.Printf("while fetching timeseries: %s", err)
+			t.l.Printf("while fetching timeseries: %s", err)
 		}
 		return err
 	})
@@ -1677,13 +1705,13 @@ func (c *cluster) FetchTimeseriesData(ctx context.Context) error {
 
 // FetchDebugZip downloads the debug zip from the cluster using `roachprod ssh`.
 // The logs will be placed in the test's artifacts dir.
-func (c *cluster) FetchDebugZip(ctx context.Context) error {
+func (c *cluster) FetchDebugZip(ctx context.Context, t *test) error {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
 		return nil
 	}
 
-	c.l.Printf("fetching debug zip\n")
+	t.l.Printf("fetching debug zip\n")
 	c.status("fetching debug zip")
 
 	// Don't hang forever if we can't fetch the debug zip.
@@ -1705,7 +1733,7 @@ func (c *cluster) FetchDebugZip(ctx context.Context) error {
 			output, err := execCmdWithBuffer(ctx, c.l, roachprod, "ssh", c.name+":"+si, "--",
 				"./cockroach", "debug", "zip", "--exclude-files='*.log,*.txt,*.pprof'", "--url", "{pgurl:"+si+"}", zipName)
 			if err != nil {
-				c.l.Printf("./cockroach debug zip failed: %s", output)
+				t.l.Printf("./cockroach debug zip failed: %s", output)
 				if i < c.spec.NodeCount {
 					continue
 				}
@@ -1748,7 +1776,7 @@ func (c *cluster) FailOnDeadNodes(ctx context.Context, t *test) {
 // error. Note that this will swallow errors returned directly from the consistency
 // check since we know that such spurious errors are possibly without any relation
 // to the check having failed.
-func (c *cluster) CheckReplicaDivergenceOnDB(ctx context.Context, db *gosql.DB) error {
+func (c *cluster) CheckReplicaDivergenceOnDB(ctx context.Context, t *test, db *gosql.DB) error {
 	// NB: we set a statement_timeout since context cancellation won't work here,
 	// see:
 	// https://github.com/cockroachdb/cockroach/pull/34520
@@ -1764,7 +1792,7 @@ WHERE t.status NOT IN ('RANGE_CONSISTENT', 'RANGE_INDETERMINATE')`)
 		// TODO(tbg): the checks can fail for silly reasons like missing gossiped
 		// descriptors, etc. -- not worth failing the test for. Ideally this would
 		// be rock solid.
-		c.l.Printf("consistency check failed with %v; ignoring", err)
+		t.l.Printf("consistency check failed with %v; ignoring", err)
 		return nil
 	}
 	var finalErr error
@@ -1809,11 +1837,11 @@ func (c *cluster) FailOnReplicaDivergence(ctx context.Context, t *test) {
 			db = nil
 			continue
 		}
-		c.l.Printf("running (fast) consistency checks on node %d", i)
+		t.l.Printf("running (fast) consistency checks on node %d", i)
 		break
 	}
 	if db == nil {
-		c.l.Printf("no live node found, skipping consistency check")
+		t.l.Printf("no live node found, skipping consistency check")
 		return
 	}
 	defer db.Close()
@@ -1821,7 +1849,7 @@ func (c *cluster) FailOnReplicaDivergence(ctx context.Context, t *test) {
 	if err := contextutil.RunWithTimeout(
 		ctx, "consistency check", time.Minute,
 		func(ctx context.Context) error {
-			return c.CheckReplicaDivergenceOnDB(ctx, db)
+			return c.CheckReplicaDivergenceOnDB(ctx, t, db)
 		},
 	); err != nil {
 		// NB: we don't call t.Fatal() here because this method is
@@ -1833,14 +1861,14 @@ func (c *cluster) FailOnReplicaDivergence(ctx context.Context, t *test) {
 
 // FetchDmesg grabs the dmesg logs if possible. This requires being able to run
 // `sudo dmesg` on the remote nodes.
-func (c *cluster) FetchDmesg(ctx context.Context) error {
+func (c *cluster) FetchDmesg(ctx context.Context, t *test) error {
 	if c.spec.NodeCount == 0 || c.isLocal() {
 		// No nodes can happen during unit tests and implies nothing to do.
 		// Also, don't grab dmesg on local runs.
 		return nil
 	}
 
-	c.l.Printf("fetching dmesg\n")
+	t.l.Printf("fetching dmesg\n")
 	c.status("fetching dmesg")
 
 	// Don't hang forever.
@@ -1856,7 +1884,7 @@ func (c *cluster) FetchDmesg(ctx context.Context) error {
 		); err != nil {
 			// Don't error out because it might've worked on some nodes. Fetching will
 			// error out below but will get everything it can first.
-			c.l.Printf("during dmesg fetching: %s", err)
+			t.l.Printf("during dmesg fetching: %s", err)
 		}
 		return execCmd(ctx, c.l, roachprod, "get", c.name, name /* src */, path /* dest */)
 	})
@@ -1864,14 +1892,14 @@ func (c *cluster) FetchDmesg(ctx context.Context) error {
 
 // FetchJournalctl grabs the journalctl logs if possible. This requires being
 // able to run `sudo journalctl` on the remote nodes.
-func (c *cluster) FetchJournalctl(ctx context.Context) error {
+func (c *cluster) FetchJournalctl(ctx context.Context, t *test) error {
 	if c.spec.NodeCount == 0 || c.isLocal() {
 		// No nodes can happen during unit tests and implies nothing to do.
 		// Also, don't grab journalctl on local runs.
 		return nil
 	}
 
-	c.l.Printf("fetching journalctl\n")
+	t.l.Printf("fetching journalctl\n")
 	c.status("fetching journalctl")
 
 	// Don't hang forever.
@@ -1887,14 +1915,14 @@ func (c *cluster) FetchJournalctl(ctx context.Context) error {
 		); err != nil {
 			// Don't error out because it might've worked on some nodes. Fetching will
 			// error out below but will get everything it can first.
-			c.l.Printf("during journalctl fetching: %s", err)
+			t.l.Printf("during journalctl fetching: %s", err)
 		}
 		return execCmd(ctx, c.l, roachprod, "get", c.name, name /* src */, path /* dest */)
 	})
 }
 
 // FetchCores fetches any core files on the cluster.
-func (c *cluster) FetchCores(ctx context.Context) error {
+func (c *cluster) FetchCores(ctx context.Context, t *test) error {
 	if c.spec.NodeCount == 0 || c.isLocal() {
 		// No nodes can happen during unit tests and implies nothing to do.
 		// Also, don't grab dmesg on local runs.
@@ -1906,11 +1934,11 @@ func (c *cluster) FetchCores(ctx context.Context) error {
 		// from having the cores, but we should push them straight into a temp
 		// bucket on S3 instead. OTOH, the ROI of this may be low; I don't know
 		// of a recent example where we've wanted the Core dumps.
-		c.l.Printf("skipped fetching cores\n")
+		t.l.Printf("skipped fetching cores\n")
 		return nil
 	}
 
-	c.l.Printf("fetching cores\n")
+	t.l.Printf("fetching cores\n")
 	c.status("fetching cores")
 
 	// Don't hang forever. The core files can be large, so we give a generous
@@ -1943,7 +1971,7 @@ const (
 // l is the logger that will log this destroy operation.
 //
 // This method generally does not react to ctx cancelation.
-func (c *cluster) Destroy(ctx context.Context, lo closeLoggerOpt, l *logger) {
+func (c *cluster) Destroy(ctx context.Context, lo closeLoggerOpt, l *logger.Logger) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -1963,7 +1991,7 @@ func (c *cluster) Destroy(ctx context.Context, lo closeLoggerOpt, l *logger) {
 	}
 }
 
-func (c *cluster) doDestroy(ctx context.Context, l *logger) <-chan struct{} {
+func (c *cluster) doDestroy(ctx context.Context, l *logger.Logger) <-chan struct{} {
 	var inFlight <-chan struct{}
 	c.destroyState.mu.Lock()
 	if c.destroyState.mu.saved {
@@ -2014,13 +2042,13 @@ func (c *cluster) doDestroy(ctx context.Context, l *logger) <-chan struct{} {
 	return ch
 }
 
-// Run a command with output redirected to the logs instead of to os.Stdout
+// loggedCommand runs a command with output redirected to the logs instead of to os.Stdout
 // (which doesn't go anywhere I've been able to find) Don't use this if you're
 // going to call cmd.CombinedOutput or cmd.Output.
-func (c *cluster) LoggedCommand(ctx context.Context, arg0 string, args ...string) *exec.Cmd {
+func loggedCommand(ctx context.Context, l *logger.Logger, arg0 string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, arg0, args...)
-	cmd.Stdout = c.l.stdout
-	cmd.Stderr = c.l.stderr
+	cmd.Stdout = l.Stdout
+	cmd.Stderr = l.Stderr
 	return cmd
 }
 
@@ -2033,7 +2061,9 @@ func (c *cluster) Put(ctx context.Context, src, dest string, opts ...option) {
 }
 
 // PutE puts a local file to all of the machines in a cluster.
-func (c *cluster) PutE(ctx context.Context, l *logger, src, dest string, opts ...option) error {
+func (c *cluster) PutE(
+	ctx context.Context, l *logger.Logger, src, dest string, opts ...option,
+) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.Put")
 	}
@@ -2077,7 +2107,7 @@ func (c *cluster) PutLibraries(ctx context.Context, libraryDir string) error {
 
 // Stage stages a binary to the cluster.
 func (c *cluster) Stage(
-	ctx context.Context, l *logger, application, versionOrSHA, dir string, opts ...option,
+	ctx context.Context, l *logger.Logger, application, versionOrSHA, dir string, opts ...option,
 ) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.Stage")
@@ -2098,7 +2128,9 @@ func (c *cluster) Stage(
 }
 
 // Get gets files from remote hosts.
-func (c *cluster) Get(ctx context.Context, l *logger, src, dest string, opts ...option) error {
+func (c *cluster) Get(
+	ctx context.Context, l *logger.Logger, src, dest string, opts ...option,
+) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.Get error")
 	}
@@ -2146,7 +2178,7 @@ func (c *cluster) PutString(
 // version of the given branch. The src, dest, and branch arguments must not
 // contain shell special characters.
 func (c *cluster) GitClone(
-	ctx context.Context, l *logger, src, dest, branch string, node nodeListOption,
+	ctx context.Context, l *logger.Logger, src, dest, branch string, node nodeListOption,
 ) error {
 	return c.RunL(ctx, l, node, "bash", "-e", "-c", fmt.Sprintf(`'
 if ! test -d %s; then
@@ -2261,7 +2293,6 @@ func (c *cluster) StartE(ctx context.Context, opts ...option) error {
 		} else if c.encryptAtRandom {
 			rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 			if rng.Intn(2) == 1 {
-				c.l.Printf("starting with encryption at rest enabled")
 				args = append(args, "--encrypt")
 				// Force encryption in future calls of Start with the same cluster.
 				c.encryptDefault = true
@@ -2333,7 +2364,7 @@ func (c *cluster) Reset(ctx context.Context) error {
 
 // WipeE wipes a subset of the nodes in a cluster. See cluster.Start() for a
 // description of the nodes parameter.
-func (c *cluster) WipeE(ctx context.Context, l *logger, opts ...option) error {
+func (c *cluster) WipeE(ctx context.Context, l *logger.Logger, opts ...option) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.WipeE")
 	}
@@ -2379,7 +2410,7 @@ var _ = (&cluster{}).Reformat
 
 // Install a package in a node
 func (c *cluster) Install(
-	ctx context.Context, l *logger, node nodeListOption, args ...string,
+	ctx context.Context, l *logger.Logger, node nodeListOption, args ...string,
 ) error {
 	return execCmd(ctx, l,
 		append([]string{roachprod, "install", c.makeNodes(node), "--"}, args...)...)
@@ -2417,22 +2448,20 @@ func cmdLogFileName(t time.Time, nodes nodeListOption, args ...string) string {
 // case of an error. Logs will sort chronologically. Failing invocations will
 // have an additional marker file with a `.failed` extension instead of `.log`.
 func (c *cluster) RunE(ctx context.Context, node nodeListOption, args ...string) error {
-	cmdString := strings.Join(args, " ")
 	logFile := cmdLogFileName(timeutil.Now(), node, args...)
 
 	// NB: we set no prefix because it's only going to a file anyway.
-	l, err := c.l.ChildLogger(logFile, quietStderr, quietStdout)
+	l, err := c.l.ChildLogger(logFile, logger.QuietStderr, logger.QuietStdout)
 	if err != nil {
 		return err
 	}
-	c.l.PrintfCtx(ctx, "> %s", cmdString)
 	err = c.RunL(ctx, l, node, args...)
 	l.Printf("> result: %+v", err)
 	if err := ctx.Err(); err != nil {
 		l.Printf("(note: incoming context was canceled: %s", err)
 	}
-	physicalFileName := l.file.Name()
-	l.close()
+	physicalFileName := l.File.Name()
+	l.Close()
 	if err != nil {
 		failedPhysicalFileName := strings.TrimSuffix(physicalFileName, ".log") + ".failed"
 		if failedFile, err2 := os.Create(failedPhysicalFileName); err2 != nil {
@@ -2444,7 +2473,9 @@ func (c *cluster) RunE(ctx context.Context, node nodeListOption, args ...string)
 }
 
 // RunL runs a command on the specified node, returning an error.
-func (c *cluster) RunL(ctx context.Context, l *logger, node nodeListOption, args ...string) error {
+func (c *cluster) RunL(
+	ctx context.Context, l *logger.Logger, node nodeListOption, args ...string,
+) error {
 	if err := errors.Wrap(ctx.Err(), "cluster.RunL"); err != nil {
 		return err
 	}
@@ -2455,7 +2486,7 @@ func (c *cluster) RunL(ctx context.Context, l *logger, node nodeListOption, args
 // RunWithBuffer runs a command on the specified node, returning the resulting combined stderr
 // and stdout or an error.
 func (c *cluster) RunWithBuffer(
-	ctx context.Context, l *logger, node nodeListOption, args ...string,
+	ctx context.Context, l *logger.Logger, node nodeListOption, args ...string,
 ) ([]byte, error) {
 	if err := errors.Wrap(ctx.Err(), "cluster.RunWithBuffer"); err != nil {
 		return nil, err
@@ -2543,7 +2574,7 @@ func addrToAdminUIAddr(c *cluster, addr string) (string, error) {
 	return fmt.Sprintf("%s:%d", host, webPort+1), nil
 }
 
-func urlToAddr(c *cluster, pgURL string) (string, error) {
+func urlToAddr(pgURL string) (string, error) {
 	u, err := url.Parse(pgURL)
 	if err != nil {
 		return "", err
@@ -2551,15 +2582,15 @@ func urlToAddr(c *cluster, pgURL string) (string, error) {
 	return u.Host, nil
 }
 
-func addrToHost(c *cluster, addr string) (string, error) {
-	host, _, err := addrToHostPort(c, addr)
+func addrToHost(addr string) (string, error) {
+	host, _, err := addrToHostPort(addr)
 	if err != nil {
 		return "", err
 	}
 	return host, nil
 }
 
-func addrToHostPort(c *cluster, addr string) (string, int, error) {
+func addrToHostPort(addr string) (string, int, error) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "", 0, err
@@ -2616,7 +2647,7 @@ func (c *cluster) InternalAddr(ctx context.Context, node nodeListOption) ([]stri
 		return nil, err
 	}
 	for _, u := range urls {
-		addr, err := urlToAddr(c, u)
+		addr, err := urlToAddr(u)
 		if err != nil {
 			return nil, err
 		}
@@ -2633,7 +2664,7 @@ func (c *cluster) InternalIP(ctx context.Context, node nodeListOption) ([]string
 		return nil, err
 	}
 	for _, addr := range addrs {
-		host, err := addrToHost(c, addr)
+		host, err := addrToHost(addr)
 		if err != nil {
 			return nil, err
 		}
@@ -2651,7 +2682,7 @@ func (c *cluster) ExternalAddr(ctx context.Context, node nodeListOption) ([]stri
 		return nil, err
 	}
 	for _, u := range urls {
-		addr, err := urlToAddr(c, u)
+		addr, err := urlToAddr(u)
 		if err != nil {
 			return nil, err
 		}
@@ -2668,7 +2699,7 @@ func (c *cluster) ExternalIP(ctx context.Context, node nodeListOption) ([]string
 		return nil, err
 	}
 	for _, addr := range addrs {
-		host, err := addrToHost(c, addr)
+		host, err := addrToHost(addr)
 		if err != nil {
 			return nil, err
 		}
@@ -2737,7 +2768,7 @@ func (c *cluster) isLocal() bool {
 
 // Extend extends the cluster's expiration by d, after truncating d to minute
 // granularity.
-func (c *cluster) Extend(ctx context.Context, d time.Duration, l *logger) error {
+func (c *cluster) Extend(ctx context.Context, d time.Duration, l *logger.Logger) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.Extend")
 	}
@@ -2756,13 +2787,10 @@ func (c *cluster) Extend(ctx context.Context, d time.Duration, l *logger) error 
 
 // getDiskUsageInBytes does what's on the tin. nodeIdx starts at one.
 func getDiskUsageInBytes(
-	ctx context.Context, c *cluster, logger *logger, nodeIdx int,
+	ctx context.Context, c Cluster, logger *logger.Logger, nodeIdx int,
 ) (int, error) {
 	var out []byte
 	for {
-		if c.t.Failed() {
-			return 0, errors.New("already failed")
-		}
 		var err error
 		// `du` can warn if files get removed out from under it (which
 		// happens during RocksDB compactions, for example). Discard its
@@ -2808,7 +2836,7 @@ func getDiskUsageInBytes(
 
 type monitor struct {
 	t         testI
-	l         *logger
+	l         *logger.Logger
 	nodes     string
 	ctx       context.Context
 	cancel    func()
@@ -2816,7 +2844,8 @@ type monitor struct {
 	expDeaths int32 // atomically
 }
 
-func newMonitor(ctx context.Context, c *cluster, opts ...option) *monitor {
+func newMonitor(ctx context.Context, ci Cluster, opts ...option) *monitor {
+	c := ci.(*cluster) // TODO(tbg): pass `t` to `newMonitor` and avoid need for `makeNodes`
 	m := &monitor{
 		t:     c.t,
 		l:     c.l,
@@ -2953,11 +2982,11 @@ func (m *monitor) wait(args ...string) error {
 			setMonitorCmdErr(err)
 			return
 		}
-		defer monL.close()
+		defer monL.Close()
 
 		cmd := exec.CommandContext(m.ctx, args[0], args[1:]...)
-		cmd.Stdout = io.MultiWriter(pipeW, monL.stdout)
-		cmd.Stderr = monL.stderr
+		cmd.Stdout = io.MultiWriter(pipeW, monL.Stdout)
+		cmd.Stderr = monL.Stderr
 		if err := cmd.Run(); err != nil {
 			if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "killed") {
 				// The expected reason for an error is that the monitor was killed due
@@ -3080,7 +3109,7 @@ func (lg loadGroupList) loadNodes() nodeListOption {
 // makeLoadGroups create a loadGroupList that has an equal number of cockroach
 // nodes per zone. It assumes that numLoadNodes <= numZones and that numZones is
 // divisible by numLoadNodes.
-func makeLoadGroups(c *cluster, numZones, numRoachNodes, numLoadNodes int) loadGroupList {
+func makeLoadGroups(c Cluster, numZones, numRoachNodes, numLoadNodes int) loadGroupList {
 	if numLoadNodes > numZones {
 		panic("cannot have more than one load node per zone")
 	} else if numZones%numLoadNodes != 0 {

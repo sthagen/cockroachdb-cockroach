@@ -24,7 +24,7 @@ import (
 // runDecommissionMixedVersions runs through randomized
 // decommission/recommission processes in mixed-version clusters.
 func runDecommissionMixedVersions(
-	ctx context.Context, t *test, c *cluster, buildVersion version.Version,
+	ctx context.Context, t *test, c Cluster, buildVersion version.Version,
 ) {
 	predecessorVersion, err := PredecessorVersion(buildVersion)
 	if err != nil {
@@ -251,7 +251,7 @@ func checkAllMembership(from int, membership string) versionStep {
 func uploadVersionStep(nodes nodeListOption, version string) versionStep {
 	return func(ctx context.Context, t *test, u *versionUpgradeTest) {
 		// Put the binary.
-		u.uploadVersion(ctx, t, nodes, version)
+		uploadVersion(ctx, t, u.c, nodes, version)
 	}
 }
 

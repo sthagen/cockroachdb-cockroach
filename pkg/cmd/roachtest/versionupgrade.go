@@ -77,13 +77,13 @@ DROP TABLE test.t;
 	`),
 }
 
-func runVersionUpgrade(ctx context.Context, t *test, c *cluster, buildVersion version.Version) {
+func runVersionUpgrade(ctx context.Context, t *test, c Cluster, buildVersion version.Version) {
 	predecessorVersion, err := PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// This test uses fixtures and we do not have encrypted fixtures right now.
-	c.encryptDefault = false
+	c.EncryptDefault(false)
 
 	// Set the bool within to true to create a new fixture for this test. This
 	// is necessary after every release. For example, the day `master` becomes
@@ -215,7 +215,7 @@ func (u *versionUpgradeTest) run(ctx context.Context, t *test) {
 
 type versionUpgradeTest struct {
 	goOS  string
-	c     *cluster
+	c     Cluster
 	steps []versionStep
 
 	// Cache conns because opening one takes hundreds of ms, and we do it quite
@@ -223,7 +223,7 @@ type versionUpgradeTest struct {
 	conns []*gosql.DB
 }
 
-func newVersionUpgradeTest(c *cluster, steps ...versionStep) *versionUpgradeTest {
+func newVersionUpgradeTest(c Cluster, steps ...versionStep) *versionUpgradeTest {
 	return &versionUpgradeTest{
 		goOS:  ifLocal(runtime.GOOS, "linux"),
 		c:     c,
@@ -252,7 +252,7 @@ func (u *versionUpgradeTest) conn(ctx context.Context, t *test, i int) *gosql.DB
 // path of the uploaded binaries on the nodes, suitable to be used with
 // `roachdprod start --binary=<path>`.
 func uploadVersion(
-	ctx context.Context, t *test, c *cluster, nodes nodeListOption, newVersion string,
+	ctx context.Context, t *test, c Cluster, nodes nodeListOption, newVersion string,
 ) (binaryName string) {
 	binaryName = "./cockroach"
 	if newVersion == "" {
@@ -275,7 +275,7 @@ func uploadVersion(
 			if err := c.RunE(ctx, nodes, "mkdir", "-p", dir); err != nil {
 				t.Fatal(err)
 			}
-			if err := c.Stage(ctx, c.l, "release", v, dir, nodes); err != nil {
+			if err := c.Stage(ctx, t.l, "release", v, dir, nodes); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -373,29 +373,39 @@ func uploadAndStartFromCheckpointFixture(nodes nodeListOption, v string) version
 // Use a waitForUpgradeStep() for that.
 func binaryUpgradeStep(nodes nodeListOption, newVersion string) versionStep {
 	return func(ctx context.Context, t *test, u *versionUpgradeTest) {
-		c := u.c
+		upgradeNodes(ctx, nodes, newVersion, t, u.c)
+		// TODO(nvanbenschoten): add upgrade qualification step. What should we
+		// test? We could run logictests. We could add custom logic here. Maybe
+		// this should all be pushed to nightly migration tests instead.
+	}
+}
 
-		// NB: We could technically stage the binary on all nodes before
-		// restarting each one, but on Unix it's invalid to write to an
-		// executable file while it is currently running. So we do the
-		// simple thing and upload it serially instead.
+func upgradeNodes(
+	ctx context.Context, nodes nodeListOption, newVersion string, t *test, c Cluster,
+) {
+	// NB: We could technically stage the binary on all nodes before
+	// restarting each one, but on Unix it's invalid to write to an
+	// executable file while it is currently running. So we do the
+	// simple thing and upload it serially instead.
 
-		// Restart nodes in a random order; otherwise node 1 would be running all
-		// the migrations and it probably also has all the leases.
-		rand.Shuffle(len(nodes), func(i, j int) {
-			nodes[i], nodes[j] = nodes[j], nodes[i]
-		})
-		for _, node := range nodes {
-			t.l.Printf("restarting node %d", node)
-			c.Stop(ctx, c.Node(node))
-			args := u.uploadVersion(ctx, t, c.Node(node), newVersion)
-			c.Start(ctx, t, c.Node(node), args, startArgsDontEncrypt)
-			t.l.Printf("node %d now running binary version %s", node, u.binaryVersion(ctx, t, node))
-
-			// TODO(nvanbenschoten): add upgrade qualification step. What should we
-			// test? We could run logictests. We could add custom logic here. Maybe
-			// this should all be pushed to nightly migration tests instead.
+	// Restart nodes in a random order; otherwise node 1 would be running all
+	// the migrations and it probably also has all the leases.
+	rand.Shuffle(len(nodes), func(i, j int) {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	})
+	for _, node := range nodes {
+		v := newVersion
+		if v == "" {
+			v = "<latest>"
 		}
+		newVersionMsg := newVersion
+		if newVersion == "" {
+			newVersionMsg = "<current>"
+		}
+		t.l.Printf("restarting node %d into version %s", node, newVersionMsg)
+		c.Stop(ctx, c.Node(node))
+		args := startArgs("--binary=" + uploadVersion(ctx, t, c, c.Node(node), newVersion))
+		c.Start(ctx, t, c.Node(node), args, startArgsDontEncrypt)
 	}
 }
 
@@ -464,7 +474,7 @@ func waitForUpgradeStep(nodes nodeListOption) versionStep {
 
 func setClusterSettingVersionStep(ctx context.Context, t *test, u *versionUpgradeTest) {
 	db := u.conn(ctx, t, 1)
-	u.c.l.Printf("bumping cluster version")
+	t.l.Printf("bumping cluster version")
 	// TODO(tbg): once this is using a job, poll and periodically print the job status
 	// instead of blocking.
 	if _, err := db.ExecContext(
@@ -472,7 +482,7 @@ func setClusterSettingVersionStep(ctx context.Context, t *test, u *versionUpgrad
 	); err != nil {
 		t.Fatal(err)
 	}
-	u.c.l.Printf("cluster version bumped")
+	t.l.Printf("cluster version bumped")
 }
 
 type versionFeatureTest struct {
@@ -531,7 +541,7 @@ func stmtFeatureTest(
 // test will then fail on purpose when it's done with instructions on where to
 // move the files.
 func makeVersionFixtureAndFatal(
-	ctx context.Context, t *test, c *cluster, makeFixtureVersion string,
+	ctx context.Context, t *test, c Cluster, makeFixtureVersion string,
 ) {
 	var useLocalBinary bool
 	if makeFixtureVersion == "" {
@@ -549,7 +559,7 @@ func makeVersionFixtureAndFatal(
 		t.Fatal(err)
 	}
 
-	c.l.Printf("making fixture for %s (starting at %s)", makeFixtureVersion, predecessorVersion)
+	t.l.Printf("making fixture for %s (starting at %s)", makeFixtureVersion, predecessorVersion)
 
 	if useLocalBinary {
 		// Make steps below use the main cockroach binary (in particular, don't try
@@ -558,7 +568,7 @@ func makeVersionFixtureAndFatal(
 		makeFixtureVersion = ""
 	}
 
-	c.encryptDefault = false
+	c.EncryptDefault(false)
 	newVersionUpgradeTest(c,
 		// Start the cluster from a fixture. That fixture's cluster version may
 		// be at the predecessor version (though in practice it's fully up to

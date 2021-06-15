@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/internal/issues"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -239,11 +240,11 @@ func (r *testRunner) Run(
 		if existingClusterName != "" {
 			// Logs for attaching to a cluster go to a dedicated log file.
 			logPath := filepath.Join(artifactsDir, runnerLogsDir, "cluster-create", existingClusterName+".log")
-			clusterL, err := rootLogger(logPath, lopt.tee)
-			defer clusterL.close()
+			clusterL, err := logger.RootLogger(logPath, lopt.tee)
 			if err != nil {
 				return nil, err
 			}
+			defer clusterL.Close()
 			opt := attachOpt{
 				skipValidation: r.config.skipClusterValidationOnAttach,
 				skipStop:       r.config.skipClusterStopOnAttach,
@@ -375,11 +376,11 @@ func (r *testRunner) runWorker(
 	debug bool,
 	artifactsRootDir string,
 	testRunnerLogPath string,
-	teeOpt teeOptType,
+	teeOpt logger.TeeOptType,
 	stdout io.Writer,
 	allocateCluster clusterAllocatorFn,
 	topt testOpts,
-	l *logger,
+	l *logger.Logger,
 ) error {
 	ctx = logtags.AddTag(ctx, name, nil /* value */)
 	wStatus := r.addWorker(ctx, name)
@@ -468,7 +469,7 @@ func (r *testRunner) runWorker(
 			// comes).
 			artifactsSpec = fmt.Sprintf("%s/** => %s", base, escapedTestName)
 		}
-		testL, err := rootLogger(logPath, teeOpt)
+		testL, err := logger.RootLogger(logPath, teeOpt)
 		if err != nil {
 			return err
 		}
@@ -504,7 +505,7 @@ func (r *testRunner) runWorker(
 			}
 			l.PrintfCtx(ctx, msg)
 		}
-		testL.close()
+		testL.Close()
 		if err != nil || t.Failed() {
 			failureMsg := fmt.Sprintf("%s (%d) - ", testToRun.spec.Name, testToRun.runNum)
 			if err != nil {
@@ -540,7 +541,7 @@ func (r *testRunner) runWorker(
 // getPerfArtifacts retrieves the perf artifacts for the test.
 // If there's an error, oh well, don't do anything rash like fail a test
 // which already passed.
-func getPerfArtifacts(ctx context.Context, l *logger, c *cluster, t *test) {
+func getPerfArtifacts(ctx context.Context, l *logger.Logger, c *cluster, t *test) {
 	g := ctxgroup.WithContext(ctx)
 	fetchNode := func(node int) func(context.Context) error {
 		return func(ctx context.Context) error {
@@ -600,7 +601,7 @@ func (r *testRunner) runTest(
 	c *cluster,
 	testRunnerLogPath string,
 	stdout io.Writer,
-	l *logger,
+	l *logger.Logger,
 ) (bool, error) {
 	if t.spec.Skip != "" {
 		return false, fmt.Errorf("can't run skipped test: %s: %s", t.Name(), t.spec.Skip)
@@ -755,7 +756,7 @@ func (r *testRunner) runTest(
 		t.spec.Run(runCtx, t, c)
 	}()
 
-	teardownL, err := c.l.ChildLogger("teardown", quietStderr, quietStdout)
+	teardownL, err := c.l.ChildLogger("teardown", logger.QuietStderr, logger.QuietStdout)
 	if err != nil {
 		return false, err
 	}
@@ -765,10 +766,10 @@ func (r *testRunner) runTest(
 		if t.Failed() {
 			s = "failure"
 		}
-		c.l.Printf("tearing down after %s; see teardown.log", s)
+		t.l.Printf("tearing down after %s; see teardown.log", s)
 		l, c.l, t.l = teardownL, teardownL, teardownL
 	case <-time.After(timeout):
-		c.l.Printf("tearing down after timeout; see teardown.log")
+		t.l.Printf("tearing down after timeout; see teardown.log")
 		l, c.l, t.l = teardownL, teardownL, teardownL
 		// Timeouts are often opaque. Improve our changes by dumping the stack
 		// so that at least we can piece together what the test is trying to
@@ -782,7 +783,7 @@ func (r *testRunner) runTest(
 		// Do this before we cancel the context, which might (hopefully) unblock
 		// the test. We want to see where it got stuck.
 		const stacksFile = "__stacks"
-		if cl, err := t.l.ChildLogger(stacksFile, quietStderr, quietStdout); err == nil {
+		if cl, err := t.l.ChildLogger(stacksFile, logger.QuietStderr, logger.QuietStdout); err == nil {
 			cl.PrintfCtx(ctx, "all stacks:\n\n%s\n", allStacks())
 			t.l.PrintfCtx(ctx, "dumped stacks to %s", stacksFile)
 		}
@@ -823,7 +824,7 @@ func (r *testRunner) runTest(
 			// everything.
 			const msg = "test timed out and afterwards failed to respond to cancelation"
 			t.l.PrintfCtx(ctx, msg)
-			r.collectClusterLogs(ctx, c, t.l)
+			r.collectClusterLogs(ctx, c, t)
 			// We return an error here because the test goroutine is still running, so
 			// we want to alert the caller of this unusual situation.
 			return false, errors.New(msg)
@@ -851,7 +852,7 @@ func (r *testRunner) runTest(
 	}
 
 	if t.Failed() {
-		r.collectClusterLogs(ctx, c, t.l)
+		r.collectClusterLogs(ctx, c, t)
 		return false, nil
 	}
 	return true, nil
@@ -864,7 +865,7 @@ func (r *testRunner) shouldPostGithubIssue(t *test) bool {
 }
 
 func (r *testRunner) maybePostGithubIssue(
-	ctx context.Context, l *logger, t *test, stdout io.Writer, output string,
+	ctx context.Context, l *logger.Logger, t *test, stdout io.Writer, output string,
 ) {
 	if !r.shouldPostGithubIssue(t) {
 		return
@@ -916,7 +917,7 @@ caffeinate ./roachstress.sh %s
 	}
 }
 
-func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logger) {
+func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, t *test) {
 	// NB: fetch the logs even when we have a debug zip because
 	// debug zip can't ever get the logs for down nodes.
 	// We only save artifacts for failed tests in CI, so this
@@ -925,30 +926,30 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	// below has problems. For example, `debug zip` is known to
 	// hang sometimes at the time of writing, see:
 	// https://github.com/cockroachdb/cockroach/issues/39620
-	l.PrintfCtx(ctx, "collecting cluster logs")
-	if err := c.FetchLogs(ctx); err != nil {
-		l.Printf("failed to download logs: %s", err)
+	t.l.PrintfCtx(ctx, "collecting cluster logs")
+	if err := c.FetchLogs(ctx, t); err != nil {
+		t.l.Printf("failed to download logs: %s", err)
 	}
-	if err := c.FetchDmesg(ctx); err != nil {
-		l.Printf("failed to fetch dmesg: %s", err)
+	if err := c.FetchDmesg(ctx, t); err != nil {
+		t.l.Printf("failed to fetch dmesg: %s", err)
 	}
-	if err := c.FetchJournalctl(ctx); err != nil {
-		l.Printf("failed to fetch journalctl: %s", err)
+	if err := c.FetchJournalctl(ctx, t); err != nil {
+		t.l.Printf("failed to fetch journalctl: %s", err)
 	}
-	if err := c.FetchCores(ctx); err != nil {
-		l.Printf("failed to fetch cores: %s", err)
+	if err := c.FetchCores(ctx, t); err != nil {
+		t.l.Printf("failed to fetch cores: %s", err)
 	}
 	if err := c.CopyRoachprodState(ctx); err != nil {
-		l.Printf("failed to copy roachprod state: %s", err)
+		t.l.Printf("failed to copy roachprod state: %s", err)
 	}
-	if err := c.FetchDiskUsage(ctx); err != nil {
-		l.Printf("failed to fetch disk uage summary: %s", err)
+	if err := c.FetchDiskUsage(ctx, t); err != nil {
+		t.l.Printf("failed to fetch disk uage summary: %s", err)
 	}
-	if err := c.FetchTimeseriesData(ctx); err != nil {
-		l.Printf("failed to fetch timeseries data: %s", err)
+	if err := c.FetchTimeseriesData(ctx, t); err != nil {
+		t.l.Printf("failed to fetch timeseries data: %s", err)
 	}
-	if err := c.FetchDebugZip(ctx); err != nil {
-		l.Printf("failed to collect zip: %s", err)
+	if err := c.FetchDebugZip(ctx, t); err != nil {
+		t.l.Printf("failed to collect zip: %s", err)
 	}
 }
 
@@ -1000,7 +1001,7 @@ func (r *testRunner) getWork(
 	qp *quotapool.IntPool,
 	c *cluster,
 	interrupt <-chan struct{},
-	l *logger,
+	l *logger.Logger,
 	callbacks getWorkCallbacks,
 ) (testToRunRes, *cluster, error) {
 

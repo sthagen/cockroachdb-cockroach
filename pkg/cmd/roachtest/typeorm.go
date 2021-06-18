@@ -55,7 +55,7 @@ func registerTypeORM(r *testRegistry) {
 		t.l.Printf("Supported TypeORM release is %s.", supportedTypeORMRelease)
 
 		if err := repeatRunE(
-			ctx, t, c, node, "update apt-get", `sudo apt-get -qq update`,
+			ctx, t, c, node, "update apt-get", `sudo apt-get update`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +66,7 @@ func registerTypeORM(r *testRegistry) {
 			c,
 			node,
 			"install dependencies",
-			`sudo apt-get -qq install make python3 libpq-dev python-dev gcc g++ `+
+			`sudo apt-get install make python3 libpq-dev python-dev gcc g++ `+
 				`software-properties-common build-essential`,
 		); err != nil {
 			t.Fatal(err)
@@ -84,7 +84,7 @@ func registerTypeORM(r *testRegistry) {
 		}
 
 		if err := repeatRunE(
-			ctx, t, c, node, "install nodejs and npm", `sudo apt-get -qq install nodejs`,
+			ctx, t, c, node, "install nodejs and npm", `sudo apt-get install nodejs`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +172,7 @@ func registerTypeORM(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "typeorm",
 		Owner:      OwnerSQLExperience,
-		Cluster:    makeClusterSpec(1),
+		Cluster:    r.makeClusterSpec(1),
 		MinVersion: "v20.2.0",
 		Tags:       []string{`default`, `orm`},
 		Run: func(ctx context.Context, t *test, c Cluster) {

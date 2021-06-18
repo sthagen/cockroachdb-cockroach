@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -88,6 +89,9 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalBackwardDependenciesTableID:      crdbInternalBackwardDependenciesTable,
 		catconstants.CrdbInternalBuildInfoTableID:                 crdbInternalBuildInfoTable,
 		catconstants.CrdbInternalBuiltinFunctionsTableID:          crdbInternalBuiltinFunctionsTable,
+		catconstants.CrdbInternalClusterContendedIndexesViewID:    crdbInternalClusterContendedIndexesView,
+		catconstants.CrdbInternalClusterContendedKeysViewID:       crdbInternalClusterContendedKeysView,
+		catconstants.CrdbInternalClusterContendedTablesViewID:     crdbInternalClusterContendedTablesView,
 		catconstants.CrdbInternalClusterContentionEventsTableID:   crdbInternalClusterContentionEventsTable,
 		catconstants.CrdbInternalClusterDistSQLFlowsTableID:       crdbInternalClusterDistSQLFlowsTable,
 		catconstants.CrdbInternalClusterQueriesTableID:            crdbInternalClusterQueriesTable,
@@ -655,7 +659,7 @@ CREATE TABLE crdb_internal.jobs (
 
 		// Beware: we're querying system.jobs as root; we need to be careful to filter
 		// out results that the current user is not able to see.
-		query := `SELECT id, status, created, payload, progress FROM system.jobs`
+		query := `SELECT id, status, created, payload, progress, claim_session_id, claim_instance_id FROM system.jobs`
 		it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 			ctx, "crdb-internal-jobs-table", p.txn,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
@@ -687,10 +691,11 @@ CREATE TABLE crdb_internal.jobs (
 					return nil, err
 				}
 				r := it.Cur()
-				id, status, created, payloadBytes, progressBytes := r[0], r[1], r[2], r[3], r[4]
+				id, status, created, payloadBytes, progressBytes, sessionIDBytes, instanceID :=
+					r[0], r[1], r[2], r[3], r[4], r[5], r[6]
 
 				var jobType, description, statement, username, descriptorIDs, started, runningStatus,
-					finished, modified, fractionCompleted, highWaterTimestamp, errorStr, leaseNode,
+					finished, modified, fractionCompleted, highWaterTimestamp, errorStr, coordinatorID,
 					traceID = tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
 					tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
 					tree.DNull
@@ -707,6 +712,15 @@ CREATE TABLE crdb_internal.jobs (
 					ownedByAdmin, err = p.UserHasAdminRole(ctx, sqlUsername)
 					if err != nil {
 						errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
+					}
+				}
+				if sessionID, ok := sessionIDBytes.(*tree.DBytes); ok {
+					if isAlive, err := p.EvalContext().SQLLivenessReader.IsAlive(
+						ctx, sqlliveness.SessionID(*sessionID),
+					); err != nil {
+						// Silently swallow the error for checking for liveness.
+					} else if instanceID, ok := instanceID.(*tree.DInt); ok && isAlive {
+						coordinatorID = instanceID
 					}
 				}
 
@@ -741,9 +755,6 @@ CREATE TABLE crdb_internal.jobs (
 					finished, err = tsOrNull(payload.FinishedMicros)
 					if err != nil {
 						return nil, err
-					}
-					if payload.Lease != nil {
-						leaseNode = tree.NewDInt(tree.DInt(payload.Lease.NodeID))
 					}
 					errorStr = tree.NewDString(payload.Error)
 				}
@@ -801,7 +812,7 @@ CREATE TABLE crdb_internal.jobs (
 					fractionCompleted,
 					highWaterTimestamp,
 					errorStr,
-					leaseNode,
+					coordinatorID,
 					traceID,
 				)
 				return container, nil
@@ -1059,7 +1070,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
-		transactionVisitor := func(txnID sqlstats.TransactionFingerprintID, stats *roachpb.CollectedTransactionStatistics) error {
+		transactionVisitor := func(txnFingerprintID roachpb.TransactionFingerprintID, stats *roachpb.CollectedTransactionStatistics) error {
 			stmtFingerprintIDsDatum := tree.NewDArray(types.String)
 			for _, stmtFingerprintID := range stats.StatementFingerprintIDs {
 				if err := stmtFingerprintIDsDatum.Append(tree.NewDString(strconv.FormatUint(uint64(stmtFingerprintID), 10))); err != nil {
@@ -1070,7 +1081,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			err := addRow(
 				tree.NewDInt(tree.DInt(nodeID)),                                                    // node_id
 				tree.NewDString(stats.App),                                                         // application_name
-				tree.NewDString(strconv.FormatUint(uint64(txnID), 10)),                             // key
+				tree.NewDString(strconv.FormatUint(uint64(txnFingerprintID), 10)),                  // key
 				stmtFingerprintIDsDatum,                                                            // statement_ids
 				tree.NewDInt(tree.DInt(stats.Stats.Count)),                                         // count
 				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),                                    // max_retries
@@ -1734,6 +1745,116 @@ func populateSessionsTable(
 	}
 
 	return nil
+}
+
+var crdbInternalClusterContendedTablesView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.cluster_contended_tables (
+  database_name,
+  schema_name,
+  table_name,
+  num_contention_events
+) AS
+  SELECT
+    database_name, schema_name, name, sum(num_contention_events)
+  FROM
+    (
+      SELECT
+        DISTINCT
+        database_name,
+        schema_name,
+        name,
+        index_id,
+        num_contention_events
+      FROM
+        crdb_internal.cluster_contention_events
+        JOIN crdb_internal.tables ON
+            crdb_internal.cluster_contention_events.table_id
+            = crdb_internal.tables.table_id
+    )
+  GROUP BY
+    database_name, schema_name, name
+`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "database_name", Typ: types.String},
+		{Name: "schema_name", Typ: types.String},
+		{Name: "table_name", Typ: types.String},
+		{Name: "num_contention_events", Typ: types.Int},
+	},
+}
+
+var crdbInternalClusterContendedIndexesView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.cluster_contended_indexes (
+  database_name,
+  schema_name,
+  table_name,
+  index_name,
+  num_contention_events
+) AS
+  SELECT
+    DISTINCT
+    database_name,
+    schema_name,
+    name,
+    index_name,
+    num_contention_events
+  FROM
+    crdb_internal.cluster_contention_events,
+    crdb_internal.tables,
+    crdb_internal.table_indexes
+  WHERE
+    crdb_internal.cluster_contention_events.index_id
+    = crdb_internal.table_indexes.index_id
+    AND crdb_internal.cluster_contention_events.table_id
+      = crdb_internal.tables.table_id
+`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "database_name", Typ: types.String},
+		{Name: "schema_name", Typ: types.String},
+		{Name: "table_name", Typ: types.String},
+		{Name: "index_name", Typ: types.String},
+		{Name: "num_contention_events", Typ: types.Int},
+	},
+}
+
+var crdbInternalClusterContendedKeysView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.cluster_contended_keys (
+  database_name,
+  schema_name,
+  table_name,
+  index_name,
+  key,
+  num_contention_events
+) AS
+  SELECT
+    database_name,
+    schema_name,
+    name,
+    index_name,
+    crdb_internal.pretty_key(key, 0),
+    sum(count)
+  FROM
+    crdb_internal.cluster_contention_events,
+    crdb_internal.tables,
+    crdb_internal.table_indexes
+  WHERE
+    crdb_internal.cluster_contention_events.index_id
+    = crdb_internal.table_indexes.index_id
+    AND crdb_internal.cluster_contention_events.table_id
+      = crdb_internal.tables.table_id
+  GROUP BY
+    database_name, schema_name, name, index_name, key
+`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "database_name", Typ: types.String},
+		{Name: "schema_name", Typ: types.String},
+		{Name: "table_name", Typ: types.String},
+		{Name: "index_name", Typ: types.String},
+		{Name: "key", Typ: types.Bytes},
+		{Name: "num_contention_events", Typ: types.Int},
+	},
 }
 
 const contentionEventsSchemaPattern = `

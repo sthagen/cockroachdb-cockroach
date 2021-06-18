@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -416,26 +415,47 @@ func (expr *CaseExpr) TypeCheck(
 	return expr, nil
 }
 
-func isCastDeepValid(castFrom, castTo *types.T) (bool, telemetry.Counter, Volatility) {
+// resolveCast checks that the cast from the two types is valid. If allowStable
+// is false, it also checks that the cast has VolatilityImmutable.
+//
+// On success, any relevant telemetry counters are incremented.
+func resolveCast(context string, castFrom, castTo *types.T, allowStable bool) error {
 	toFamily := castTo.Family()
 	fromFamily := castFrom.Family()
 	switch {
 	case toFamily == types.ArrayFamily && fromFamily == types.ArrayFamily:
-		ok, c, v := isCastDeepValid(castFrom.ArrayContents(), castTo.ArrayContents())
-		if ok {
-			telemetry.Inc(sqltelemetry.ArrayCastCounter)
+		err := resolveCast(context, castFrom.ArrayContents(), castTo.ArrayContents(), allowStable)
+		if err != nil {
+			return err
 		}
-		return ok, c, v
-	case toFamily == types.EnumFamily && fromFamily == types.EnumFamily:
-		// Casts from ENUM to ENUM type can only succeed if the two enums
-		return castFrom.Equivalent(castTo), sqltelemetry.EnumCastCounter, VolatilityImmutable
-	}
+		telemetry.Inc(sqltelemetry.ArrayCastCounter)
+		return nil
 
-	cast := lookupCast(fromFamily, toFamily)
-	if cast == nil {
-		return false, nil, 0
+	case toFamily == types.EnumFamily && fromFamily == types.EnumFamily:
+		// Casts from ENUM to ENUM type can only succeed if the two types are the
+		// same.
+		if !castFrom.Equivalent(castTo) {
+			return pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, castTo)
+		}
+		telemetry.Inc(sqltelemetry.EnumCastCounter)
+		return nil
+
+	default:
+		cast := lookupCast(fromFamily, toFamily)
+		if cast == nil {
+			return pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, castTo)
+		}
+		if !allowStable && cast.volatility >= VolatilityStable {
+			err := NewContextDependentOpsNotAllowedError(context)
+			err = pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s::%s", castFrom, castTo)
+			if cast.volatilityHint != "" {
+				err = errors.WithHint(err, cast.volatilityHint)
+			}
+			return err
+		}
+		telemetry.Inc(cast.counter)
+		return nil
 	}
-	return true, cast.counter, cast.volatility
 }
 
 func isEmptyArray(expr Expr) bool {
@@ -495,22 +515,16 @@ func (expr *CastExpr) TypeCheck(
 	}
 
 	castFrom := typedSubExpr.ResolvedType()
-
-	ok, c, volatility := isCastDeepValid(castFrom, exprType)
-	if !ok {
-		return nil, pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, exprType)
+	allowStable := true
+	context := ""
+	if semaCtx != nil && semaCtx.Properties.required.rejectFlags&RejectStableOperators != 0 {
+		allowStable = false
+		context = semaCtx.Properties.required.context
 	}
-	if err := semaCtx.checkVolatility(volatility); err != nil {
-		err = pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s::%s", castFrom, exprType)
-		// Special cases where we can provide useful hints.
-		if castFrom.Family() == types.StringFamily && exprType.Family() == types.TimestampFamily {
-			err = errors.WithHint(err, "string to timestamp casts are context-dependent because "+
-				"of relative timestamp strings like 'now'; use parse_timestamp() instead.")
-		}
+	err = resolveCast(context, castFrom, exprType, allowStable)
+	if err != nil {
 		return nil, err
 	}
-
-	telemetry.Inc(c)
 	expr.Expr = typedSubExpr
 	expr.Type = exprType
 	expr.typ = exprType
@@ -1445,9 +1459,7 @@ func (expr *Tuple) TypeCheck(
 	// Copy the labels if there are any.
 	if len(expr.Labels) > 0 {
 		labels = make([]string, len(expr.Labels))
-		for i := range expr.Labels {
-			labels[i] = lexbase.NormalizeName(expr.Labels[i])
-		}
+		copy(labels, expr.Labels)
 	}
 	expr.typ = types.MakeLabeledTuple(contents, labels)
 	return expr, nil
@@ -1738,6 +1750,25 @@ func typeCheckAndRequireTupleElems(
 		}
 		tuple.Exprs[i] = rightTyped
 		tuple.typ.TupleContents()[i] = rightTyped.ResolvedType()
+	}
+	if len(tuple.typ.TupleContents()) > 0 && tuple.typ.TupleContents()[0].Family() == types.CollatedStringFamily {
+		// Make sure that all elements of the tuple have the correct locale set
+		// for collated strings. Note that if the locales were different, an
+		// error would have been already emitted, so here we are only upgrading
+		// an empty locale (which might be set for NULLs) to a non-empty (if
+		// such is found).
+		var typWithLocale *types.T
+		for _, typ := range tuple.typ.TupleContents() {
+			if typ.Locale() != "" {
+				typWithLocale = typ
+				break
+			}
+		}
+		if typWithLocale != nil {
+			for i := range tuple.typ.TupleContents() {
+				tuple.typ.TupleContents()[i] = typWithLocale
+			}
+		}
 	}
 	return tuple, nil
 }

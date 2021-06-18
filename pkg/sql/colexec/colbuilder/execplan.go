@@ -189,12 +189,6 @@ func supportedNatively(spec *execinfrapb.ProcessorSpec) error {
 		return nil
 
 	case spec.Core.Distinct != nil:
-		if spec.Core.Distinct.NullsAreDistinct {
-			return errors.Newf("distinct with unique nulls not supported")
-		}
-		if spec.Core.Distinct.ErrorOnDup != "" {
-			return errors.Newf("distinct with error on duplicates not supported")
-		}
 		return nil
 
 	case spec.Core.Ordinality != nil:
@@ -362,6 +356,7 @@ func (r opResult) createDiskBackedSort(
 		sorterMemMonitorName string
 		inMemorySorter       colexecop.Operator
 		err                  error
+		topK                 uint64
 	)
 	if len(ordering.Columns) == int(matchLen) {
 		// The input is already fully ordered, so there is nothing to sort.
@@ -400,10 +395,10 @@ func (r opResult) createDiskBackedSort(
 				ctx, flowCtx, opNamePrefix+"topk-sort", processorID,
 			)
 		}
-		k := post.Limit + post.Offset
+		topK = post.Limit + post.Offset
 		inMemorySorter = colexec.NewTopKSorter(
 			colmem.NewAllocator(ctx, topKSorterMemAccount, factory), input, inputTypes,
-			ordering.Columns, k,
+			ordering.Columns, topK,
 		)
 	} else {
 		// No optimizations possible. Default to the standard sort operator.
@@ -459,7 +454,7 @@ func (r opResult) createDiskBackedSort(
 				sortUnlimitedAllocator,
 				mergeUnlimitedAllocator,
 				outputUnlimitedAllocator,
-				input, inputTypes, ordering,
+				input, inputTypes, ordering, topK,
 				execinfra.GetWorkMemLimit(flowCtx),
 				maxNumberPartitions,
 				args.TestingKnobs.NumForcedRepartitions,
@@ -532,12 +527,8 @@ func takeOverMetaInfo(target *colexecargs.OpWithMetaInfo, inputs []colexecargs.O
 // createAndWrapRowSource takes a processor spec, creating the row source and
 // wrapping it using wrapRowSources. Note that the post process spec is included
 // in the processor creation, so make sure to clear it if it will be inspected
-// again. NewColOperatorResult is updated with the new OutputTypes and the
-// resulting Columnarizer if there is no error. The result is also annotated as
-// streaming because the resulting operator is not a buffering operator (even if
-// it is a buffering processor). This is not a problem for memory accounting
-// because each processor does that on its own, so the used memory will be
-// accounted for.
+// again. opResult is updated with the new ColumnTypes and the resulting
+// Columnarizer if there is no error.
 // - causeToWrap is an error that prompted us to wrap a processor core into the
 // vectorized plan (for example, it could be an unsupported processor core, an
 // unsupported function, etc).
@@ -568,7 +559,11 @@ func (r opResult) createAndWrapRowSource(
 	// releasables are put back into their pools upon the subquery's flow
 	// cleanup, yet the subquery planNode tree isn't closed yet since its
 	// closure is done when the main planNode tree is being closed.
-	materializerSafeToRelease := spec.Core.LocalPlanNode == nil
+	// TODO(yuzefovich): currently there are some other cases as well, figure
+	// those out. I believe all those cases can occur **only** if we have
+	// LocalPlanNode cores which is the case when we have non-empty
+	// LocalProcessors.
+	materializerSafeToRelease := len(args.LocalProcessors) == 0
 	c, releasables, err := wrapRowSources(
 		ctx,
 		flowCtx,
@@ -954,7 +949,10 @@ func NewColOperator(
 			result.ColumnTypes = make([]*types.T, len(spec.Input[0].ColumnTypes))
 			copy(result.ColumnTypes, spec.Input[0].ColumnTypes)
 			if len(core.Distinct.OrderedColumns) == len(core.Distinct.DistinctColumns) {
-				result.Root, err = colexecbase.NewOrderedDistinct(inputs[0].Root, core.Distinct.OrderedColumns, result.ColumnTypes)
+				result.Root, err = colexecbase.NewOrderedDistinct(
+					inputs[0].Root, core.Distinct.OrderedColumns, result.ColumnTypes,
+					core.Distinct.NullsAreDistinct, core.Distinct.ErrorOnDup,
+				)
 			} else {
 				// We have separate unit tests that instantiate in-memory
 				// distinct operators, so we don't need to look at
@@ -970,6 +968,7 @@ func NewColOperator(
 				allocator := colmem.NewAllocator(ctx, distinctMemAccount, factory)
 				inMemoryUnorderedDistinct := colexec.NewUnorderedDistinct(
 					allocator, inputs[0].Root, core.Distinct.DistinctColumns, result.ColumnTypes,
+					core.Distinct.NullsAreDistinct, core.Distinct.ErrorOnDup,
 				)
 				edOpName := "external-distinct"
 				diskAccount := result.createDiskAccount(ctx, flowCtx, edOpName, spec.ProcessorID)
@@ -1520,14 +1519,11 @@ func (r opResult) wrapPostProcessSpec(
 	}
 	inputToMaterializer := colexecargs.OpWithMetaInfo{Root: r.Root}
 	takeOverMetaInfo(&inputToMaterializer, args.Inputs)
-	if err := r.createAndWrapRowSource(
+	// createAndWrapRowSource updates r.ColumnTypes accordingly.
+	return r.createAndWrapRowSource(
 		ctx, flowCtx, args, []colexecargs.OpWithMetaInfo{inputToMaterializer},
 		[][]*types.T{r.ColumnTypes}, noopSpec, factory, causeToWrap,
-	); err != nil {
-		return err
-	}
-	r.ColumnTypes = resultTypes
-	return nil
+	)
 }
 
 // planPostProcessSpec plans the post processing stage specified in post on top

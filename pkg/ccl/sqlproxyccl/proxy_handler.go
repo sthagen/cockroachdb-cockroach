@@ -181,8 +181,8 @@ func newProxyHandler(
 
 // handle is called by the proxy server to handle a single incoming client
 // connection.
-func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error {
-	conn, msg, err := frontendAdmit(proxyConn, handler.incomingTLSConfig())
+func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn) error {
+	conn, msg, err := frontendAdmit(incomingConn, handler.incomingTLSConfig())
 	defer func() { _ = conn.Close() }()
 	if err != nil {
 		sendErrToClient(conn, err)
@@ -195,12 +195,12 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 		return nil
 	}
 
-	// Note that the errors returned from this function are user-facing errors so
-	// we should be careful with the details that we want to expose.
-	backendStartupMsg, clusterName, tenID, err := clusterNameAndTenantFromParams(msg)
+	// NOTE: Errors returned from this function are user-facing errors so we
+	// should be careful with the details that we want to expose.
+	backendStartupMsg, clusterName, tenID, err := clusterNameAndTenantFromParams(ctx, msg)
 	if err != nil {
 		clientErr := &codeError{codeParamsRoutingFailed, err}
-		log.Errorf(ctx, "unable to extract cluster name and tenant id: %s", clientErr.Error())
+		log.Errorf(ctx, "unable to extract cluster name and tenant id: %s", err.Error())
 		updateMetricsAndSendErrToClient(clientErr, conn, handler.metrics)
 		return clientErr
 	}
@@ -212,8 +212,8 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 
 	ipAddr, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
-		clientErr := &codeError{codeParamsRoutingFailed, err}
-		log.Errorf(ctx, "could not parse address: %v", clientErr.Error())
+		clientErr := newErrorf(codeParamsRoutingFailed, "unexpected connection address")
+		log.Errorf(ctx, "could not parse address: %v", err.Error())
 		updateMetricsAndSendErrToClient(clientErr, conn, handler.metrics)
 		return clientErr
 	}
@@ -267,6 +267,7 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 			}
 
 			// Remap error for external consumption.
+			log.Errorf(ctx, "could not retrieve outgoing address: %v", err.Error())
 			err = newErrorf(
 				codeParamsRoutingFailed, "cluster %s-%d not found", clusterName, tenID.ToUint64())
 			break
@@ -278,11 +279,6 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 		// If we get a backend down error, retry the connection.
 		var codeErr *codeError
 		if err != nil && errors.As(err, &codeErr) && codeErr.code == codeBackendDown {
-			if handler.directory == nil {
-				// Don't retry unless directory is enabled (for now).
-				break
-			}
-
 			codeBackendDownErrs++
 			if backendDialErr.ShouldLog() {
 				log.Ops.Errorf(ctx,
@@ -293,18 +289,20 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 				codeBackendDownErrs = 0
 			}
 
-			// Report the failure to the directory so that it can refresh any
-			// stale information that may have caused the problem.
-			err = handler.directory.ReportFailure(ctx, tenID, outgoingAddress)
-			if err != nil {
-				reportFailureErrs++
-				if reportFailureErr.ShouldLog() {
-					log.Ops.Errorf(ctx,
-						"report failure (%d errors skipped): %v",
-						reportFailureErrs,
-						err,
-					)
-					reportFailureErrs = 0
+			if handler.directory != nil {
+				// Report the failure to the directory so that it can refresh any
+				// stale information that may have caused the problem.
+				err = reportFailureToDirectory(ctx, tenID, outgoingAddress, handler.directory)
+				if err != nil {
+					reportFailureErrs++
+					if reportFailureErr.ShouldLog() {
+						log.Ops.Errorf(ctx,
+							"report failure (%d errors skipped): %v",
+							reportFailureErrs,
+							err,
+						)
+						reportFailureErrs = 0
+					}
 				}
 			}
 			continue
@@ -394,26 +392,35 @@ func (handler *proxyHandler) handle(ctx context.Context, proxyConn *conn) error 
 	case <-handler.stopper.ShouldQuiesce():
 		return nil
 	}
-
 }
 
-// outgoingAddress resolves a tenant ID and a tenant cluster name to an IP of
-// the backend.
+// outgoingAddress resolves a tenant ID and a tenant cluster name to the address
+// of a backend pod.
 func (handler *proxyHandler) outgoingAddress(
 	ctx context.Context, name string, tenID roachpb.TenantID,
 ) (string, error) {
-	if handler.directory == nil {
-		addr := strings.ReplaceAll(
-			handler.RoutingRule, "{{clusterName}}", fmt.Sprintf("%s-%d", name, tenID.ToUint64()),
-		)
-		log.Infof(ctx, "backend %s resolved to '%s'", name, addr)
-		return addr, nil
+	// First try to lookup tenant in the directory (if available).
+	if handler.directory != nil {
+		addr, err := handler.directory.EnsureTenantAddr(ctx, tenID, name)
+		if err != nil {
+			if status.Code(err) != codes.NotFound {
+				return "", err
+			}
+			// Fallback to old resolution rule.
+		} else {
+			return addr, nil
+		}
 	}
 
-	// Lookup tenant in directory.
-	addr, err := handler.directory.EnsureTenantIP(ctx, tenID, name)
+	// Derive DNS address and then try to resolve it. If it does not exist, then
+	// map to a GRPC NotFound error.
+	// TODO(andyk): Remove this once we've fully switched over to the directory.
+	addr := strings.ReplaceAll(
+		handler.RoutingRule, "{{clusterName}}", fmt.Sprintf("%s-%d", name, tenID.ToUint64()),
+	)
+	_, err := backendLookupAddr(ctx, addr)
 	if err != nil {
-		return "", err
+		return "", status.Error(codes.NotFound, err.Error())
 	}
 	return addr, nil
 }
@@ -432,7 +439,7 @@ func (handler *proxyHandler) validateAccessAndThrottle(
 		// Hence we need to rate limit.
 		if err := handler.throttleService.LoginCheck(ipAddr, timeutil.Now()); err != nil {
 			log.Errorf(ctx, "throttler refused connection: %v", err.Error())
-			return newErrorf(codeProxyRefusedConnection, "Connection attempt throttled")
+			return newErrorf(codeProxyRefusedConnection, "connection attempt throttled")
 		}
 	}
 
@@ -467,6 +474,64 @@ func (handler *proxyHandler) validateAccess(
 	return nil
 }
 
+// incomingTLSConfig gets back the current TLS config for the incoming client
+// connection endpoint.
+func (handler *proxyHandler) incomingTLSConfig() *tls.Config {
+	if handler.incomingCert == nil {
+		return nil
+	}
+
+	cert := handler.incomingCert.TLSCert()
+	if cert == nil {
+		return nil
+	}
+
+	return &tls.Config{Certificates: []tls.Certificate{*cert}}
+}
+
+// setupIncomingCert will setup a managed cert for the incoming connections.
+// They can either be unencrypted (in case a cert and key names are empty),
+// using self-signed, runtime generated cert (if cert is set to *) or
+// using file based cert where the cert/key values refer to file names
+// containing the information.
+func (handler *proxyHandler) setupIncomingCert() error {
+	if (handler.ListenKey == "") != (handler.ListenCert == "") {
+		return errors.New("must specify either both or neither of cert and key")
+	}
+
+	if handler.ListenCert == "" {
+		return nil
+	}
+
+	// TODO(darin): change the cert manager so it uses the stopper.
+	ctx, _ := handler.stopper.WithCancelOnQuiesce(context.Background())
+	certMgr := certmgr.NewCertManager(ctx)
+	var cert certmgr.Cert
+	if handler.ListenCert == "*" {
+		cert = certmgr.NewSelfSignedCert(0, 3, 0, 0)
+	} else if handler.ListenCert != "" {
+		cert = certmgr.NewFileCert(handler.ListenCert, handler.ListenKey)
+	}
+	cert.Reload(ctx)
+	err := cert.Err()
+	if err != nil {
+		return err
+	}
+	certMgr.ManageCert("client", cert)
+	handler.certManager = certMgr
+	handler.incomingCert = cert
+
+	return nil
+}
+
+// reportFailureToDirectory is a hookable function that calls the given tenant
+// directory's ReportFailure method.
+var reportFailureToDirectory = func(
+	ctx context.Context, tenantID roachpb.TenantID, addr string, directory *tenant.Directory,
+) error {
+	return directory.ReportFailure(ctx, tenantID, addr)
+}
+
 // clusterNameAndTenantFromParams extracts the cluster name from the connection
 // parameters, and rewrites the database param, if necessary. We currently
 // support embedding the cluster name in two ways:
@@ -477,7 +542,7 @@ func (handler *proxyHandler) validateAccess(
 //   through its command-line options, i.e. "-c NAME=VALUE", "-cNAME=VALUE", and
 //   "--NAME=VALUE".
 func clusterNameAndTenantFromParams(
-	msg *pgproto3.StartupMessage,
+	ctx context.Context, msg *pgproto3.StartupMessage,
 ) (*pgproto3.StartupMessage, string, roachpb.TenantID, error) {
 	clusterNameFromDB, databaseName, err := parseDatabaseParam(msg.Parameters["database"])
 	if err != nil {
@@ -502,19 +567,28 @@ func clusterNameAndTenantFromParams(
 	}
 
 	sepIdx := strings.LastIndex(clusterNameFromDB, clusterTenantSep)
+
 	// Cluster name provided without a tenant ID in the end.
 	if sepIdx == -1 || sepIdx == len(clusterNameFromDB)-1 {
-		return msg, "", roachpb.MaxTenantID, errors.Errorf("invalid cluster name %s", clusterNameFromDB)
+		return msg, "", roachpb.MaxTenantID, errors.Errorf("invalid cluster name '%s'", clusterNameFromDB)
 	}
-	clusterNameSansTenant, tenantIDStr := clusterNameFromDB[:sepIdx], clusterNameFromDB[sepIdx+1:]
 
+	clusterNameSansTenant, tenantIDStr := clusterNameFromDB[:sepIdx], clusterNameFromDB[sepIdx+1:]
 	if !clusterNameRegex.MatchString(clusterNameSansTenant) {
 		return msg, "", roachpb.MaxTenantID, errors.Errorf("invalid cluster name '%s'", clusterNameFromDB)
 	}
 
 	tenID, err := strconv.ParseUint(tenantIDStr, 10, 64)
 	if err != nil {
-		return msg, "", roachpb.MaxTenantID, errors.Wrapf(err, "cannot parse %s as uint64", tenantIDStr)
+		// Log these non user-facing errors.
+		log.Errorf(ctx, "cannot parse tenant ID in %s: %v", clusterNameFromDB, err)
+		return msg, "", roachpb.MaxTenantID, errors.Errorf("invalid cluster name '%s'", clusterNameFromDB)
+	}
+
+	if tenID < roachpb.MinTenantID.ToUint64() {
+		// Log these non user-facing errors.
+		log.Errorf(ctx, "%s contains an invalid tenant ID", clusterNameFromDB)
+		return msg, "", roachpb.MaxTenantID, errors.Errorf("invalid cluster name '%s'", clusterNameFromDB)
 	}
 
 	// Make and return a copy of the startup msg so the original is not modified.
@@ -545,7 +619,7 @@ func parseDatabaseParam(databaseParam string) (clusterName, databaseName string,
 		return "", "", nil
 	}
 
-	parts := strings.SplitN(databaseParam, ".", 2)
+	parts := strings.Split(databaseParam, ".")
 
 	// Database param provided without cluster name.
 	if len(parts) <= 1 {
@@ -606,54 +680,4 @@ func parseOptionsParam(optionsParam string) (string, error) {
 	}
 
 	return matches[0][1], nil
-}
-
-// incomingTLSConfig gets back the current TLS config for the incoiming client
-// connection endpoint.
-func (handler *proxyHandler) incomingTLSConfig() *tls.Config {
-	if handler.incomingCert == nil {
-		return nil
-	}
-
-	cert := handler.incomingCert.TLSCert()
-	if cert == nil {
-		return nil
-	}
-
-	return &tls.Config{Certificates: []tls.Certificate{*cert}}
-}
-
-// setupIncomingCert will setup a managed cert for the incoming connections.
-// They can either be unencrypted (in case a cert and key names are empty),
-// using self-signed, runtime generated cert (if cert is set to *) or
-// using file based cert where the cert/key values refer to file names
-// containing the information.
-func (handler *proxyHandler) setupIncomingCert() error {
-	if (handler.ListenKey == "") != (handler.ListenCert == "") {
-		return errors.New("must specify either both or neither of cert and key")
-	}
-
-	if handler.ListenCert == "" {
-		return nil
-	}
-
-	// TODO(darin): change the cert manager so it uses the stopper.
-	ctx, _ := handler.stopper.WithCancelOnQuiesce(context.Background())
-	certMgr := certmgr.NewCertManager(ctx)
-	var cert certmgr.Cert
-	if handler.ListenCert == "*" {
-		cert = certmgr.NewSelfSignedCert(0, 3, 0, 0)
-	} else if handler.ListenCert != "" {
-		cert = certmgr.NewFileCert(handler.ListenCert, handler.ListenKey)
-	}
-	cert.Reload(ctx)
-	err := cert.Err()
-	if err != nil {
-		return err
-	}
-	certMgr.ManageCert("client", cert)
-	handler.certManager = certMgr
-	handler.incomingCert = cert
-
-	return nil
 }

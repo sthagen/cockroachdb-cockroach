@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
@@ -2831,8 +2832,8 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 			if err != nil {
 				return nil, err
 			}
-			job := n.p.ExecCfg().JobRegistry.NewJob(*record, 0)
-			plan, err = dsp.createPlanForCreateStats(planCtx, job)
+			plan, err = dsp.createPlanForCreateStats(planCtx, 0, /* jobID */
+				record.Details.(jobspb.CreateStatsDetails))
 		}
 
 	default:
@@ -3381,7 +3382,7 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 	}
 
 	// Set the merge ordering.
-	mergeOrdering := dsp.convertOrdering(n.reqOrdering, p.PlanToStreamColMap)
+	mergeOrdering := dsp.convertOrdering(n.streamingOrdering, p.PlanToStreamColMap)
 
 	// Merge processors, streams, result routers, and stage counter.
 	leftRouters := leftPlan.ResultRouters
@@ -3487,13 +3488,16 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 
 		// Create the Core spec.
 		var core execinfrapb.ProcessorCoreUnion
-		if len(mergeOrdering.Columns) < len(streamCols) {
+		if len(mergeOrdering.Columns) == 0 {
 			core.HashJoiner = &execinfrapb.HashJoinerSpec{
 				LeftEqColumns:  eqCols,
 				RightEqColumns: eqCols,
 				Type:           joinType,
 			}
 		} else {
+			if len(mergeOrdering.Columns) < len(streamCols) {
+				return nil, errors.AssertionFailedf("the merge ordering must include all stream columns")
+			}
 			core.MergeJoiner = &execinfrapb.MergeJoinerSpec{
 				LeftOrdering:  mergeOrdering,
 				RightOrdering: mergeOrdering,

@@ -439,7 +439,7 @@ func (s *Server) GetUnscrubbedStmtStats(
 		s.sqlStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{}, stmtStatsVisitor)
 
 	if err != nil {
-		return nil, errors.Errorf("failed to fetch statement stats: %s", err)
+		return nil, errors.Wrap(err, "failed to fetch statement stats")
 	}
 
 	return stmtStats, nil
@@ -451,7 +451,7 @@ func (s *Server) GetUnscrubbedTxnStats(
 	ctx context.Context,
 ) ([]roachpb.CollectedTransactionStatistics, error) {
 	var txnStats []roachpb.CollectedTransactionStatistics
-	txnStatsVisitor := func(_ sqlstats.TransactionFingerprintID, stat *roachpb.CollectedTransactionStatistics) error {
+	txnStatsVisitor := func(_ roachpb.TransactionFingerprintID, stat *roachpb.CollectedTransactionStatistics) error {
 		txnStats = append(txnStats, *stat)
 		return nil
 	}
@@ -459,7 +459,7 @@ func (s *Server) GetUnscrubbedTxnStats(
 		s.sqlStats.IterateTransactionStats(ctx, &sqlstats.IteratorOptions{}, txnStatsVisitor)
 
 	if err != nil {
-		return nil, errors.Errorf("failed to fetch statement stats: %s", err)
+		return nil, errors.Wrap(err, "failed to fetch statement stats")
 	}
 
 	return txnStats, nil
@@ -509,7 +509,7 @@ func (s *Server) getScrubbedStmtStats(
 		statsProvider.IterateStatementStats(ctx, &sqlstats.IteratorOptions{}, stmtStatsVisitor)
 
 	if err != nil {
-		return nil, errors.Errorf("failed to fetch scrubbed statement stats: %s", err)
+		return nil, errors.Wrap(err, "failed to fetch scrubbed statement stats")
 	}
 
 	return scrubbedStats, nil
@@ -2732,8 +2732,8 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 		states[i] = scs.nodes[i].State
 		// Depending on the element type either a single descriptor ID
 		// will exist or multiple (i.e. foreign keys).
-		if scs.nodes[i].Element().DescriptorID() != descpb.InvalidID {
-			descIDSet.Add(scs.nodes[i].Element().DescriptorID())
+		if id := scpb.GetDescID(scs.nodes[i].Element()); id != descpb.InvalidID {
+			descIDSet.Add(id)
 		}
 	}
 	descIDs := descIDSet.Ordered()

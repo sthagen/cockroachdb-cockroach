@@ -8,6 +8,7 @@ set -euo pipefail
 google_credentials="$GOOGLE_EPHEMERAL_CREDENTIALS"
 source "$(dirname "${0}")/teamcity-support.sh"
 log_into_gcloud
+export ROACHPROD_USER=teamcity
 
 set -x
 
@@ -44,7 +45,7 @@ chmod o+rwx "${artifacts}"
 # by default. This reserves us-east1-b (the roachprod default zone) for use
 # by manually created clusters.
 exit_status=0
-if ! timeout -s INT $((7800*60)) bin/roachtest run \
+timeout -s INT $((7800*60)) bin/roachtest run \
   tag:weekly \
   --build-tag "${build_tag}" \
   --cluster-id "${TC_BUILD_ID}" \
@@ -55,9 +56,7 @@ if ! timeout -s INT $((7800*60)) bin/roachtest run \
   --artifacts "$artifacts" \
   --parallelism 5 \
   --encrypt=random \
-  --teamcity; then
-  exit_status=$?
-fi
+  --teamcity || exit_status=$?
 
 # Upload any stats.json files to the cockroach-nightly bucket.
 for file in $(find ${artifacts#${PWD}/} -name stats.json); do

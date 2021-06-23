@@ -155,6 +155,7 @@ func (desc *Mutable) SetPublicNonPrimaryIndex(indexOrdinal int, index descpb.Ind
 // for the specified index descriptor. Returns false iff this was a no-op.
 func UpdateIndexPartitioning(
 	idx *descpb.IndexDescriptor,
+	isIndexPrimary bool,
 	newImplicitCols []catalog.Column,
 	newPartitioning descpb.PartitioningDescriptor,
 ) bool {
@@ -183,6 +184,33 @@ func UpdateIndexPartitioning(
 	idx.KeyColumnNames = append(newColumnNames, idx.KeyColumnNames[oldNumImplicitCols:]...)
 	idx.KeyColumnDirections = append(newColumnDirections, idx.KeyColumnDirections[oldNumImplicitCols:]...)
 	idx.Partitioning = newPartitioning
+	if !isIndexPrimary {
+		return true
+	}
+
+	newStoreColumnIDs := make([]descpb.ColumnID, 0, len(idx.StoreColumnIDs))
+	newStoreColumnNames := make([]string, 0, len(idx.StoreColumnNames))
+	for i := range idx.StoreColumnIDs {
+		id := idx.StoreColumnIDs[i]
+		name := idx.StoreColumnNames[i]
+		found := false
+		for _, newColumnName := range newColumnNames {
+			if newColumnName == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			newStoreColumnIDs = append(newStoreColumnIDs, id)
+			newStoreColumnNames = append(newStoreColumnNames, name)
+		}
+	}
+	idx.StoreColumnIDs = newStoreColumnIDs
+	idx.StoreColumnNames = newStoreColumnNames
+	if len(idx.StoreColumnNames) == 0 {
+		idx.StoreColumnIDs = nil
+		idx.StoreColumnNames = nil
+	}
 	return true
 }
 
@@ -357,10 +385,20 @@ func (desc *wrapper) NonDropColumns() []catalog.Column {
 	return desc.getExistingOrNewColumnCache().nonDrop
 }
 
-// VisibleColumns returns a slice of Column interfaces containing the
-// table's visible columns , in the canonical order.
+// VisibleColumns returns a slice of Column interfaces containing the table's
+// visible columns, in the canonical order. Visible columns are public columns
+// with Hidden=false and Inaccessible=false. See ColumnDescriptor.Hidden and
+// ColumnDescriptor.Inaccessible for more details.
 func (desc *wrapper) VisibleColumns() []catalog.Column {
 	return desc.getExistingOrNewColumnCache().visible
+}
+
+// AccessibleColumns returns a slice of Column interfaces containing the table's
+// accessible columns, in the canonical order. Accessible columns are public
+// columns with Inaccessible=false. See ColumnDescriptor.Inaccessible for more
+// details.
+func (desc *wrapper) AccessibleColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().accessible
 }
 
 // UserDefinedTypeColumns returns a slice of Column interfaces
@@ -408,18 +446,6 @@ func (desc *wrapper) FindColumnWithName(name tree.Name) (catalog.Column, error) 
 		}
 	}
 	return nil, colinfo.NewUndefinedColumnError(string(name))
-}
-
-// FindVirtualColumnWithExpr returns the first virtual computed column whose
-// expression matches the provided target expression, in the canonical order. If
-// no column is found then ok=false is returned.
-func (desc *wrapper) FindVirtualColumnWithExpr(expr string) (_ catalog.Column, ok bool) {
-	for _, col := range desc.AllColumns() {
-		if col.IsVirtual() && col.GetComputeExpr() == expr {
-			return col, true
-		}
-	}
-	return nil, false
 }
 
 // getExistingOrNewMutationCache should be the only place where the

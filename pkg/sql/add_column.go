@@ -155,13 +155,42 @@ func (p *planner) addColumnImpl(
 	}
 
 	if d.IsComputed() {
-		serializedExpr, err := schemaexpr.ValidateComputedColumnExpression(
-			params.ctx, n.tableDesc, d, tn, params.p.SemaCtx(),
+		serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
+			params.ctx, n.tableDesc, d, tn, "computed column", params.p.SemaCtx(),
 		)
 		if err != nil {
 			return err
 		}
 		col.ComputeExpr = &serializedExpr
+	}
+
+	if !col.Virtual {
+		// Add non-virtual column name and ID to primary index.
+		primaryIndex := n.tableDesc.GetPrimaryIndex().IndexDescDeepCopy()
+		primaryIndex.StoreColumnNames = append(primaryIndex.StoreColumnNames, col.Name)
+		primaryIndex.StoreColumnIDs = append(primaryIndex.StoreColumnIDs, col.ID)
+		n.tableDesc.SetPrimaryIndex(primaryIndex)
+	}
+
+	// Zone configuration logic is only required for REGIONAL BY ROW tables
+	// with newly created indexes.
+	if n.tableDesc.IsLocalityRegionalByRow() && idx != nil {
+		// We need to allocate new IDs for the created columns and indexes
+		// in case we need to configure their zone partitioning.
+		// This must be done after every object is created.
+		if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+			return err
+		}
+
+		// Configure zone configuration if required. This must happen after
+		// all the IDs have been allocated.
+		if err := p.configureZoneConfigForNewIndexPartitioning(
+			params.ctx,
+			n.tableDesc,
+			*idx,
+		); err != nil {
+			return err
+		}
 	}
 
 	return nil

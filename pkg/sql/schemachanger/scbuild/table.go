@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -28,9 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // alterTable builds targets and transforms the provided schema change nodes
@@ -140,13 +141,41 @@ func (b *buildContext) alterTableAddColumn(
 	if d.IsComputed() {
 		// TODO (lucy): This is not going to work when the computed column
 		// references columns created in the same transaction.
-		serializedExpr, err := schemaexpr.ValidateComputedColumnExpression(
-			ctx, table, d, tn, b.SemaCtx,
+		serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
+			ctx, table, d, tn, "computed column", b.SemaCtx,
 		)
 		if err != nil {
 			panic(err)
 		}
 		col.ComputeExpr = &serializedExpr
+	}
+
+	if toType.UserDefined() {
+		typeID, err := typedesc.UserDefinedTypeOIDToID(toType.Oid())
+		if err != nil {
+			panic(err)
+		}
+		typeDesc, err := b.Descs.GetMutableTypeByID(ctx, b.EvalCtx.Txn, typeID, tree.ObjectLookupFlagsWithRequired())
+		if err != nil {
+			panic(err)
+		}
+		// Only add a type reference node only if there isn't
+		// any existing reference inside this table. This makes
+		// it easier to handle drop columns and other operations,
+		// since those can for example only remove nodes.
+		found := false
+		for _, refID := range typeDesc.GetReferencingDescriptorIDs() {
+			if refID == table.GetID() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			b.addNode(scpb.Target_ADD, &scpb.TypeReference{
+				TypeID: typeDesc.GetID(),
+				DescID: table.GetID(),
+			})
+		}
 	}
 
 	b.addNode(scpb.Target_ADD, &scpb.Column{
@@ -290,6 +319,34 @@ func (b *buildContext) alterTableDropColumn(
 	// remove comments
 	// drop foreign keys
 
+	// Clean up type backreferences if no other column
+	// refers to the same type.
+	if colToDrop.HasType() && colToDrop.GetType().UserDefined() {
+		colType := colToDrop.GetType()
+		needsDrop := true
+		for _, column := range table.AllColumns() {
+			if column.HasType() && column.GetID() != colToDrop.GetID() &&
+				column.GetType().Oid() == colType.Oid() {
+				needsDrop = false
+				break
+			}
+		}
+		if needsDrop {
+			typeID, err := typedesc.UserDefinedTypeOIDToID(colType.Oid())
+			if err != nil {
+				panic(err)
+			}
+			typeDesc, err := b.Descs.GetMutableTypeByID(ctx, b.EvalCtx.Txn, typeID, tree.ObjectLookupFlagsWithRequired())
+			if err != nil {
+				panic(err)
+			}
+			b.addNode(scpb.Target_DROP, &scpb.TypeReference{
+				TypeID: typeDesc.GetID(),
+				DescID: table.GetID(),
+			})
+		}
+	}
+
 	// TODO(ajwerner): Add family information to the column.
 	b.addNode(scpb.Target_DROP, &scpb.Column{
 		TableID: table.GetID(),
@@ -370,8 +427,8 @@ func (b *buildContext) addOrUpdatePrimaryIndexTargetsForAddColumn(
 		if t, ok := n.Element().(*scpb.PrimaryIndex); ok &&
 			b.outputNodes[i].Target.Direction == scpb.Target_ADD &&
 			t.TableID == table.GetID() {
-			t.StoreColumnIDs = append(t.StoreColumnIDs, colID)
-			t.StoreColumnNames = append(t.StoreColumnNames, colName)
+			t.Index.StoreColumnIDs = append(t.Index.StoreColumnIDs, colID)
+			t.Index.StoreColumnNames = append(t.Index.StoreColumnNames, colName)
 			return t.Index.ID
 		}
 	}
@@ -390,28 +447,16 @@ func (b *buildContext) addOrUpdatePrimaryIndexTargetsForAddColumn(
 	)
 	newIdx.ID = idxID
 
-	var storeColIDs []descpb.ColumnID
-	var storeColNames []string
-	for _, col := range table.PublicColumns() {
-		containsCol := false
-		for _, id := range newIdx.KeyColumnIDs {
-			if id == col.GetID() {
-				containsCol = true
-				break
-			}
-		}
-		if !containsCol {
-			storeColIDs = append(storeColIDs, col.GetID())
-			storeColNames = append(storeColNames, col.GetName())
-		}
+	if !table.GetPrimaryIndex().CollectKeyColumnIDs().Contains(colID) &&
+		!table.GetPrimaryIndex().CollectPrimaryStoredColumnIDs().Contains(colID) {
+		newIdx.StoreColumnIDs = append(newIdx.StoreColumnIDs, colID)
+		newIdx.StoreColumnNames = append(newIdx.StoreColumnNames, colName)
 	}
 
 	b.addNode(scpb.Target_ADD, &scpb.PrimaryIndex{
 		TableID:             table.GetID(),
 		Index:               newIdx,
 		OtherPrimaryIndexID: table.GetPrimaryIndexID(),
-		StoreColumnIDs:      append(storeColIDs, colID),
-		StoreColumnNames:    append(storeColNames, colName),
 	})
 
 	// Drop the existing primary index.
@@ -419,8 +464,6 @@ func (b *buildContext) addOrUpdatePrimaryIndexTargetsForAddColumn(
 		TableID:             table.GetID(),
 		Index:               table.GetPrimaryIndex().IndexDescDeepCopy(),
 		OtherPrimaryIndexID: newIdx.ID,
-		StoreColumnIDs:      storeColIDs,
-		StoreColumnNames:    storeColNames,
 	})
 
 	return idxID
@@ -436,10 +479,10 @@ func (b *buildContext) addOrUpdatePrimaryIndexTargetsForDropColumn(
 		if t, ok := n.Element().(*scpb.PrimaryIndex); ok &&
 			n.Target.Direction == scpb.Target_ADD &&
 			t.TableID == table.GetID() {
-			for j := range t.StoreColumnIDs {
-				if t.StoreColumnIDs[j] == colID {
-					t.StoreColumnIDs = append(t.StoreColumnIDs[:j], t.StoreColumnIDs[j+1:]...)
-					t.StoreColumnNames = append(t.StoreColumnNames[:j], t.StoreColumnNames[j+1:]...)
+			for j := range t.Index.StoreColumnIDs {
+				if t.Index.StoreColumnIDs[j] == colID {
+					t.Index.StoreColumnIDs = append(t.Index.StoreColumnIDs[:j], t.Index.StoreColumnIDs[j+1:]...)
+					t.Index.StoreColumnNames = append(t.Index.StoreColumnNames[:j], t.Index.StoreColumnNames[j+1:]...)
 					return t.Index.ID
 				}
 
@@ -451,7 +494,7 @@ func (b *buildContext) addOrUpdatePrimaryIndexTargetsForDropColumn(
 	// Create a new primary index, identical to the existing one except for its
 	// ID and name.
 	idxID = b.nextIndexID(table)
-	newIdx := protoutil.Clone(table.GetPrimaryIndex().IndexDesc()).(*descpb.IndexDescriptor)
+	newIdx := table.GetPrimaryIndex().IndexDescDeepCopy()
 	newIdx.Name = tabledesc.GenerateUniqueName(
 		"new_primary_key",
 		func(name string) bool {
@@ -461,44 +504,32 @@ func (b *buildContext) addOrUpdatePrimaryIndexTargetsForDropColumn(
 		},
 	)
 	newIdx.ID = idxID
-
-	var addStoreColIDs []descpb.ColumnID
-	var addStoreColNames []string
-	var dropStoreColIDs []descpb.ColumnID
-	var dropStoreColNames []string
-	for _, col := range table.PublicColumns() {
-		containsCol := false
-		for _, id := range newIdx.KeyColumnIDs {
-			if id == col.GetID() {
-				containsCol = true
-				break
-			}
+	for j, id := range newIdx.KeyColumnIDs {
+		if id == colID {
+			newIdx.KeyColumnIDs = append(newIdx.KeyColumnIDs[:j], newIdx.KeyColumnIDs[j+1:]...)
+			newIdx.KeyColumnNames = append(newIdx.KeyColumnNames[:j], newIdx.KeyColumnNames[j+1:]...)
+			break
 		}
-		if !containsCol {
-			if colID != col.GetID() {
-				addStoreColIDs = append(addStoreColIDs, col.GetID())
-				addStoreColNames = append(addStoreColNames, col.GetName())
-			}
-			dropStoreColIDs = append(dropStoreColIDs, col.GetID())
-			dropStoreColNames = append(dropStoreColNames, col.GetName())
+	}
+	for j, id := range newIdx.StoreColumnIDs {
+		if id == colID {
+			newIdx.StoreColumnIDs = append(newIdx.StoreColumnIDs[:j], newIdx.StoreColumnIDs[j+1:]...)
+			newIdx.StoreColumnNames = append(newIdx.StoreColumnNames[:j], newIdx.StoreColumnNames[j+1:]...)
+			break
 		}
 	}
 
 	b.addNode(scpb.Target_ADD, &scpb.PrimaryIndex{
 		TableID:             table.GetID(),
-		Index:               *newIdx,
+		Index:               newIdx,
 		OtherPrimaryIndexID: table.GetPrimaryIndexID(),
-		StoreColumnIDs:      addStoreColIDs,
-		StoreColumnNames:    addStoreColNames,
 	})
 
 	// Drop the existing primary index.
 	b.addNode(scpb.Target_DROP, &scpb.PrimaryIndex{
 		TableID:             table.GetID(),
-		Index:               *(protoutil.Clone(table.GetPrimaryIndex().IndexDesc()).(*descpb.IndexDescriptor)),
+		Index:               table.GetPrimaryIndex().IndexDescDeepCopy(),
 		OtherPrimaryIndexID: idxID,
-		StoreColumnIDs:      dropStoreColIDs,
-		StoreColumnNames:    dropStoreColNames,
 	})
 	return idxID
 }
@@ -600,15 +631,43 @@ func (b *buildContext) maybeCleanTableSequenceRefs(
 			}
 			b.dropSequenceDesc(ctx, table, tree.DropCascade)
 		}
-		// Setup logic to clean up the default expression,
-		// only if sequences are depending on it.
+		// Setup logic to clean up the default expression always.
+		defaultExpr := &scpb.DefaultExpression{
+			DefaultExpr:     col.GetDefaultExpr(),
+			TableID:         table.GetID(),
+			UsesSequenceIDs: col.ColumnDesc().UsesSequenceIds,
+			ColumnID:        col.GetID()}
+		if exists, _ := b.checkIfNodeExists(scpb.Target_DROP, defaultExpr); !exists {
+			b.addNode(scpb.Target_DROP, defaultExpr)
+		}
+		// Get all available type references and create nodes
+		// for dropping these type references.
+		visitor := &tree.TypeCollectorVisitor{
+			OIDs: make(map[oid.Oid]struct{}),
+		}
+		if col.HasDefault() && !col.ColumnDesc().HasNullDefault() {
+			expr, err := parser.ParseExpr(col.GetDefaultExpr())
+			if err != nil {
+				panic(err)
+			}
+			tree.WalkExpr(visitor, expr)
+			for oid := range visitor.OIDs {
+				typeID, err := typedesc.UserDefinedTypeOIDToID(oid)
+				if err != nil {
+					panic(err)
+				}
+				typeRef := &scpb.TypeReference{
+					TypeID: typeID,
+					DescID: table.GetID(),
+				}
+				if exists, _ := b.checkIfNodeExists(scpb.Target_DROP, typeRef); !exists {
+					b.addNode(scpb.Target_DROP, typeRef)
+				}
+			}
+		}
+
+		// If there was a sequence dependency clean that up next.
 		if col.NumUsesSequences() > 0 {
-			b.addNode(scpb.Target_DROP,
-				&scpb.DefaultExpression{
-					DefaultExpr:     col.GetDefaultExpr(),
-					TableID:         table.GetID(),
-					UsesSequenceIDs: col.ColumnDesc().UsesSequenceIds,
-					ColumnID:        col.GetID()})
 			// Drop the depends on within the sequence side.
 			for seqOrd := 0; seqOrd < col.NumUsesSequences(); seqOrd++ {
 				seqID := col.GetUsesSequenceID(seqOrd)
@@ -625,8 +684,7 @@ func (b *buildContext) maybeCleanTableSequenceRefs(
 
 func (b *buildContext) maybeCleanTableFKs(
 	ctx context.Context, table catalog.TableDescriptor, behavior tree.DropBehavior,
-) {
-	// Loop through and update inbound and outbound
+) { // Loop through and update inbound and outbound
 	// foreign key references.
 	for _, fk := range table.GetInboundFKs() {
 		dependentTable, err := b.Descs.GetImmutableTableByID(ctx, b.EvalCtx.Txn, fk.OriginTableID, tree.ObjectLookupFlagsWithRequired())
@@ -740,7 +798,6 @@ func (b *buildContext) dropTableDesc(
 	b.addNode(scpb.Target_DROP,
 		&scpb.Table{TableID: table.GetID()})
 }
-
 func (b *buildContext) dropTable(ctx context.Context, n *tree.DropTable) {
 	// Find the table first.
 	for _, name := range n.Names {

@@ -1070,7 +1070,7 @@ func addIndexForFK(
 	}
 
 	if ts == NewTable {
-		if err := tbl.AddIndex(idx, false); err != nil {
+		if err := tbl.AddSecondaryIndex(idx); err != nil {
 			return 0, err
 		}
 		if err := tbl.AllocateIDs(ctx); err != nil {
@@ -1766,28 +1766,34 @@ func NewTableDesc(
 	}
 
 	for _, implicitColumnDefIdx := range implicitColumnDefIdxs {
-		// If it is a non-primary index that is implicitly created, ensure
-		// partitioning for PARTITION ALL BY.
-		if desc.PartitionAllBy && !implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey {
-			var err error
-			newImplicitCols, newPartitioning, err := CreatePartitioning(
-				ctx,
-				st,
-				evalCtx,
-				&desc,
-				*implicitColumnDefIdx.idx,
-				partitionAllBy,
-				nil, /* allowedNewColumnNames */
-				allowImplicitPartitioning,
-			)
-			if err != nil {
+		if implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey {
+			if err := desc.AddPrimaryIndex(*implicitColumnDefIdx.idx); err != nil {
 				return nil, err
 			}
-			tabledesc.UpdateIndexPartitioning(implicitColumnDefIdx.idx, newImplicitCols, newPartitioning)
-		}
+		} else {
+			// If it is a non-primary index that is implicitly created, ensure
+			// partitioning for PARTITION ALL BY.
+			if desc.PartitionAllBy {
+				var err error
+				newImplicitCols, newPartitioning, err := CreatePartitioning(
+					ctx,
+					st,
+					evalCtx,
+					&desc,
+					*implicitColumnDefIdx.idx,
+					partitionAllBy,
+					nil, /* allowedNewColumnNames */
+					allowImplicitPartitioning,
+				)
+				if err != nil {
+					return nil, err
+				}
+				tabledesc.UpdateIndexPartitioning(implicitColumnDefIdx.idx, false /* isIndexPrimary */, newImplicitCols, newPartitioning)
+			}
 
-		if err := desc.AddIndex(*implicitColumnDefIdx.idx, implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey); err != nil {
-			return nil, err
+			if err := desc.AddSecondaryIndex(*implicitColumnDefIdx.idx); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1928,7 +1934,7 @@ func NewTableDesc(
 					if err != nil {
 						return nil, err
 					}
-					tabledesc.UpdateIndexPartitioning(&idx, newImplicitCols, newPartitioning)
+					tabledesc.UpdateIndexPartitioning(&idx, false /* isIndexPrimary */, newImplicitCols, newPartitioning)
 				}
 			}
 			if d.Predicate != nil {
@@ -1950,7 +1956,7 @@ func NewTableDesc(
 				return nil, err
 			}
 
-			if err := desc.AddIndex(idx, false); err != nil {
+			if err := desc.AddSecondaryIndex(idx); err != nil {
 				return nil, err
 			}
 			if d.Interleave != nil {
@@ -2028,7 +2034,7 @@ func NewTableDesc(
 					if err != nil {
 						return nil, err
 					}
-					tabledesc.UpdateIndexPartitioning(&idx, newImplicitCols, newPartitioning)
+					tabledesc.UpdateIndexPartitioning(&idx, false /* isIndexPrimary */, newImplicitCols, newPartitioning)
 				}
 			}
 			if d.Predicate != nil {
@@ -2040,10 +2046,10 @@ func NewTableDesc(
 				}
 				idx.Predicate = expr
 			}
-			if err := desc.AddIndex(idx, d.PrimaryKey); err != nil {
-				return nil, err
-			}
 			if d.PrimaryKey {
+				if err := desc.AddPrimaryIndex(idx); err != nil {
+					return nil, err
+				}
 				if d.Interleave != nil {
 					return nil, unimplemented.NewWithIssue(
 						45710,
@@ -2052,6 +2058,10 @@ func NewTableDesc(
 				}
 				for _, c := range columns {
 					primaryIndexColumnSet[string(c.Column)] = struct{}{}
+				}
+			} else {
+				if err := desc.AddSecondaryIndex(idx); err != nil {
+					return nil, err
 				}
 			}
 			if d.Interleave != nil {
@@ -2149,7 +2159,7 @@ func NewTableDesc(
 			if err != nil {
 				return nil, err
 			}
-			isIndexAltered := tabledesc.UpdateIndexPartitioning(&newPrimaryIndex, newImplicitCols, newPartitioning)
+			isIndexAltered := tabledesc.UpdateIndexPartitioning(&newPrimaryIndex, true /* isIndexPrimary */, newImplicitCols, newPartitioning)
 			if isIndexAltered {
 				// During CreatePartitioning, implicitly partitioned columns may be
 				// created. AllocateIDs which allocates column IDs to each index
@@ -2272,8 +2282,8 @@ func NewTableDesc(
 		switch d := def.(type) {
 		case *tree.ColumnTableDef:
 			if d.IsComputed() {
-				serializedExpr, err := schemaexpr.ValidateComputedColumnExpression(
-					ctx, &desc, d, &n.Table, semaCtx,
+				serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
+					ctx, &desc, d, &n.Table, "computed column", semaCtx,
 				)
 				if err != nil {
 					return nil, err
@@ -2724,26 +2734,6 @@ func makeShardCheckConstraintDef(
 		},
 		Hidden: true,
 	}, nil
-}
-
-func makeExpressionBasedIndexVirtualColumn(
-	colName string, typ *types.T, expr tree.Expr,
-) *tree.ColumnTableDef {
-	c := &tree.ColumnTableDef{
-		Name:   tree.Name(colName),
-		Type:   typ,
-		Hidden: true,
-	}
-	c.Computed.Computed = true
-	c.Computed.Expr = expr
-	c.Computed.Virtual = true
-
-	// TODO(mgartner): If we can determine the expression will never evaluate to
-	// NULL, the optimizer might be able to better optimize queries using the
-	// expression-based index.
-	c.Nullable.Nullability = tree.Null
-
-	return c
 }
 
 // incTelemetryForNewColumn increments relevant telemetry every time a new column

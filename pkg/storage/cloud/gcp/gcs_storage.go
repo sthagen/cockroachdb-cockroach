@@ -13,6 +13,7 @@ package gcp
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/url"
 	"path"
@@ -22,10 +23,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/gogo/protobuf/types"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -38,6 +42,14 @@ const (
 	// CredentialsParam is the query parameter for the base64-encoded contents of
 	// the Google Application Credentials JSON file.
 	CredentialsParam = "CREDENTIALS"
+)
+
+// gcsChunkingEnabled is used to enable and disable chunking of file upload to
+// Google Cloud Storage.
+var gcsChunkingEnabled = settings.RegisterBoolSetting(
+	"cloudstorage.gs.chunking.enabled",
+	"enable chunking of file upload to Google Cloud Storage",
+	true, /* default */
 )
 
 func parseGSURL(_ cloud.ExternalStorageURIContext, uri *url.URL) (roachpb.ExternalStorage, error) {
@@ -157,7 +169,14 @@ func makeGCSStorage(
 }
 
 func (g *gcsStorage) Writer(ctx context.Context, basename string) (io.WriteCloser, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "gcs.Writer")
+	defer sp.Finish()
+	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.Writer: %s",
+		path.Join(g.prefix, basename))})
 	w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(ctx)
+	if !gcsChunkingEnabled.Get(&g.settings.SV) {
+		w.ChunkSize = 0
+	}
 	return w, nil
 }
 
@@ -171,6 +190,12 @@ func (g *gcsStorage) ReadFileAt(
 	ctx context.Context, basename string, offset int64,
 ) (io.ReadCloser, int64, error) {
 	object := path.Join(g.prefix, basename)
+
+	ctx, sp := tracing.ChildSpan(ctx, "gcs.ReadFileAt")
+	defer sp.Finish()
+	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.ReadFileAt: %s",
+		path.Join(g.prefix, basename))})
+
 	r := &cloud.ResumingReader{
 		Ctx: ctx,
 		Opener: func(ctx context.Context, pos int64) (io.ReadCloser, error) {
@@ -206,6 +231,11 @@ func (g *gcsStorage) ListFiles(ctx context.Context, patternSuffix string) ([]str
 		}
 		pattern = path.Join(pattern, patternSuffix)
 	}
+
+	ctx, sp := tracing.ChildSpan(ctx, "gcs.ListFiles")
+	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
+	defer sp.Finish()
+	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.ListFiles: %s", pattern)})
 
 	for {
 		attrs, err := it.Next()

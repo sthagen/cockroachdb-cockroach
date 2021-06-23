@@ -4,6 +4,7 @@ go_library(
     name = "jobs",
     srcs = [
         "adopt.go",
+        "config.go",
         "executor_impl.go",
         "helpers.go",
         "job_scheduler.go",
@@ -22,7 +23,6 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/clusterversion",
         "//pkg/jobs/jobspb",
         "//pkg/kv",
         "//pkg/roachpb",

@@ -153,16 +153,15 @@ type counters struct {
 }
 
 type registryTestSuite struct {
-	ctx             context.Context
-	cleanupSettings func()
-	s               serverutils.TestServerInterface
-	outerDB         *gosql.DB
-	sqlDB           *sqlutils.SQLRunner
-	registry        *jobs.Registry
-	done            chan struct{}
-	mockJob         jobs.Record
-	job             *jobs.StartableJob
-	mu              struct {
+	ctx      context.Context
+	s        serverutils.TestServerInterface
+	outerDB  *gosql.DB
+	sqlDB    *sqlutils.SQLRunner
+	registry *jobs.Registry
+	done     chan struct{}
+	mockJob  jobs.Record
+	job      *jobs.StartableJob
+	mu       struct {
 		syncutil.Mutex
 		a counters
 		e counters
@@ -173,6 +172,10 @@ type registryTestSuite struct {
 	resumeCheckCh       chan struct{}
 	failOrCancelCheckCh chan struct{}
 	onPauseRequest      jobs.OnPauseRequestFunc
+
+	// beforeUpdate is invoked in the BeforeUpdate testing knob if non-nil.
+	beforeUpdate func(orig, updated jobs.JobMetadata) error
+
 	// Instead of a ch for success, use a variable because it can retry since it
 	// is in a transaction.
 	successErr error
@@ -185,9 +188,21 @@ func noopPauseRequestFunc(
 }
 
 func (rts *registryTestSuite) setUp(t *testing.T) {
-	rts.cleanupSettings = jobs.TestingSetAdoptAndCancelIntervals(time.Millisecond, 2*time.Millisecond)
 	rts.ctx = context.Background()
-	rts.s, rts.outerDB, _ = serverutils.StartServer(t, base.TestServerArgs{})
+
+	var args base.TestServerArgs
+	{
+		knobs := jobs.NewTestingKnobsWithShortIntervals()
+		knobs.BeforeUpdate = func(orig, updated jobs.JobMetadata) error {
+			if rts.beforeUpdate != nil {
+				return rts.beforeUpdate(orig, updated)
+			}
+			return nil
+		}
+		args.Knobs.JobsTestingKnobs = knobs
+	}
+
+	rts.s, rts.outerDB, _ = serverutils.StartServer(t, args)
 	rts.sqlDB = sqlutils.MakeSQLRunner(rts.outerDB)
 	rts.registry = rts.s.JobRegistry().(*jobs.Registry)
 	rts.done = make(chan struct{})
@@ -275,7 +290,6 @@ func (rts *registryTestSuite) tearDown() {
 	close(rts.resumeCheckCh)
 	close(rts.done)
 	rts.s.Stopper().Stop(rts.ctx)
-	rts.cleanupSettings()
 	jobs.ResetConstructors()()
 }
 
@@ -684,6 +698,10 @@ func TestRegistryLifecycle(t *testing.T) {
 	})
 
 	// Attempt to mark success, but fail, but fail that also.
+	// TODO(ajwerner): This test seems a bit stale in that it really
+	// fails the resume rather than succeeding but failing to mark success.
+	// I think this is due to changes in responsibilities of the jobs
+	// lifecycle.
 	t.Run("fail marking success and fail OnFailOrCancel", func(t *testing.T) {
 		rts := registryTestSuite{}
 		rts.setUp(t)
@@ -714,6 +732,51 @@ func TestRegistryLifecycle(t *testing.T) {
 		close(rts.failOrCancelCheckCh)
 		rts.failOrCancelCh <- errors.New("injected failure while blocked in reverting")
 		rts.check(t, jobs.StatusRevertFailed)
+	})
+	// Succeed the job but inject an error actually marking the jobs successful.
+	// This could happen due to a transient network error or something like that.
+	// It would not make sense to revert a job in this scenario.
+	t.Run("fail marking success", func(t *testing.T) {
+		rts := registryTestSuite{}
+		rts.setUp(t)
+		defer rts.tearDown()
+
+		// Inject an error in the update to move the job to "succeeeded" one time.
+		var failed atomic.Value
+		failed.Store(false)
+		rts.beforeUpdate = func(orig, updated jobs.JobMetadata) error {
+			if updated.Status == jobs.StatusSucceeded && !failed.Load().(bool) {
+				failed.Store(true)
+				return errors.New("boom")
+			}
+			return nil
+		}
+
+		j, err := jobs.TestingCreateAndStartJob(rts.ctx, rts.registry, rts.s.DB(), rts.mockJob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rts.job = j
+
+		// Make sure the job hits the error when it attempts to succeed.
+		rts.mu.e.ResumeStart = true
+		rts.resumeCheckCh <- struct{}{}
+		rts.check(t, jobs.StatusRunning)
+		rts.resumeCh <- nil
+		testutils.SucceedsSoon(t, func() error {
+			if !failed.Load().(bool) {
+				return errors.New("not yet failed")
+			}
+			return nil
+		})
+		rts.mu.e.ResumeExit++
+
+		// Make sure the job retries and then succeeds.
+		rts.resumeCheckCh <- struct{}{}
+		rts.resumeCh <- nil
+		rts.mu.e.ResumeExit++
+		rts.mu.e.Success = true
+		rts.check(t, jobs.StatusSucceeded)
 	})
 
 	// Fail the job, but also fail to mark it failed.
@@ -1411,8 +1474,8 @@ func TestShowJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
 	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}
 	s, rawSQLDB, _ := serverutils.StartServer(t, params)
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
 	ctx := context.Background()
@@ -1804,12 +1867,13 @@ func TestShowJobsWithError(t *testing.T) {
 func TestShowJobWhenComplete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	// Canceling a job relies on adopt daemon to move the job to state
-	// reverting.
-	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
+	// Canceling a job relies on adopt daemon to move the job to state reverting.
+	args := base.TestServerArgs{Knobs: base.TestingKnobs{
+		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+	}}
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 	mockJob := jobs.Record{
@@ -1944,10 +2008,11 @@ func TestJobInTxn(t *testing.T) {
 	defer jobs.ResetConstructors()()
 
 	// Set the adoption interval to be very long to test the adoption channel.
-	defer jobs.TestingSetAdoptAndCancelIntervals(time.Hour, time.Hour)()
-
+	args := base.TestServerArgs{Knobs: base.TestingKnobs{
+		JobsTestingKnobs: jobs.NewTestingKnobsWithIntervals(time.Hour, time.Hour)},
+	}
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 
 	// Accessed atomically.
@@ -2377,11 +2442,10 @@ func TestUnmigratedSchemaChangeJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	defer jobs.ResetConstructors()()
-	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
 
 	ctx := context.Background()
-
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	args := base.TestServerArgs{Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}}
+	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 
 	registry := s.JobRegistry().(*jobs.Registry)
@@ -2496,7 +2560,6 @@ func TestStatusSafeFormatter(t *testing.T) {
 
 func TestMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer jobs.TestingSetAdoptAndCancelIntervals(time.Millisecond, time.Millisecond)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -2542,7 +2605,10 @@ func TestMetrics(t *testing.T) {
 		s serverutils.TestServerInterface, db *gosql.DB, r *jobs.Registry, cleanup func(),
 	) {
 		jobConstructorCleanup := jobs.ResetConstructors()
-		s, db, _ = serverutils.StartServer(t, base.TestServerArgs{})
+		args := base.TestServerArgs{Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithIntervals(time.Millisecond, time.Millisecond)},
+		}
+		s, db, _ = serverutils.StartServer(t, args)
 		r = s.JobRegistry().(*jobs.Registry)
 		return s, db, r, func() {
 			jobConstructorCleanup()
@@ -2709,11 +2775,11 @@ func TestLoseLeaseDuringExecution(t *testing.T) {
 	defer jobs.ResetConstructors()()
 
 	// Disable the loops from messing with the job execution.
-	defer jobs.TestingSetAdoptAndCancelIntervals(time.Hour, time.Hour)()
+	knobs := base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithIntervals(time.Hour, time.Hour)}
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Knobs: knobs})
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 

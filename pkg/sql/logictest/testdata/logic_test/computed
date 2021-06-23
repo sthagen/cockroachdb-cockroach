@@ -101,10 +101,10 @@ query TTBTTTB colnames
 SHOW COLUMNS FROM x
 ----
 column_name  data_type  is_nullable  column_default  generation_expression  indices    is_hidden
-a            INT8       true         3:::INT8        ·                      {}         false
-b            INT8       true         7:::INT8        ·                      {}         false
-c            INT8       true         NULL            a                      {}         false
-d            INT8       true         NULL            a + b                  {}         false
+a            INT8       true         3:::INT8        ·                      {primary}  false
+b            INT8       true         7:::INT8        ·                      {primary}  false
+c            INT8       true         NULL            a                      {primary}  false
+d            INT8       true         NULL            a + b                  {primary}  false
 rowid        INT8       false        unique_rowid()  ·                      {primary}  true
 
 statement error cannot write directly to computed column "c"
@@ -343,7 +343,7 @@ CREATE TABLE y (
   a STRING AS (concat('foo', uuid_v4()::STRING)) STORED
 )
 
-statement error computed columns cannot reference other computed columns
+statement error computed column expression cannot reference computed columns
 CREATE TABLE y (
   a INT AS (3) STORED,
   b INT AS (a) STORED
@@ -359,7 +359,7 @@ CREATE TABLE y (
   b INT AS (count(1)) STORED
 )
 
-statement error computed columns cannot have default values
+statement error computed column cannot have default values
 CREATE TABLE y (
   a INT AS (3) STORED DEFAULT 4
 )
@@ -456,7 +456,7 @@ CREATE TABLE tt (i INT8 AS (1) STORED)
 statement error variable sub-expressions are not allowed in computed column
 ALTER TABLE tt ADD COLUMN c STRING AS ((SELECT NULL)) STORED
 
-statement error computed columns cannot reference other computed columns
+statement error computed column expression cannot reference computed columns
 ALTER TABLE tt ADD COLUMN c INT8 AS (i) STORED
 
 # Composite FK.

@@ -154,12 +154,14 @@ type Index interface {
 
 	CollectKeyColumnIDs() TableColSet
 	CollectKeySuffixColumnIDs() TableColSet
+	CollectPrimaryStoredColumnIDs() TableColSet
 	CollectSecondaryStoredColumnIDs() TableColSet
 	CollectCompositeColumnIDs() TableColSet
 
 	InvertedColumnID() descpb.ColumnID
 	InvertedColumnName() string
 
+	NumPrimaryStoredColumns() int
 	NumSecondaryStoredColumns() int
 	GetStoredColumnID(storedColumnOrdinal int) descpb.ColumnID
 	GetStoredColumnName(storedColumnOrdinal int) string
@@ -235,6 +237,9 @@ type Column interface {
 
 	// IsHidden returns true iff the column is not visible.
 	IsHidden() bool
+
+	// IsInaccessible returns true iff the column is inaccessible.
+	IsInaccessible() bool
 
 	// NumUsesSequences returns the number of sequences used by this column.
 	NumUsesSequences() int

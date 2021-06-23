@@ -4258,11 +4258,11 @@ func TestImportDefaultWithResume(t *testing.T) {
 	const batchSize = 5
 	defer TestingSetParallelImporterReaderBatchSize(batchSize)()
 	defer row.TestingSetDatumRowConverterBatchSize(2 * batchSize)()
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
 
 	s, db, _ := serverutils.StartServer(t,
 		base.TestServerArgs{
 			Knobs: base.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				DistSQL: &execinfra.TestingKnobs{
 					BulkAdderFlushesEveryBatch: true,
 				},
@@ -4499,12 +4499,28 @@ INSERT INTO users (a, b) VALUES (1, 2), (3, 4);
 			expectedError: "to use computed columns, use IMPORT INTO",
 		},
 		{
+			into:          false,
+			name:          "import-table-csv-virtual",
+			data:          "35,23\n67,10",
+			create:        "a INT, c INT AS (a + b) VIRTUAL, b INT",
+			format:        "CSV",
+			expectedError: "to import into a table with virtual computed columns, use IMPORT INTO",
+		},
+		{
 			into:            false,
 			name:            "import-table-avro",
 			data:            avroData,
 			create:          "a INT, c INT AS (a + b) STORED, b INT",
 			format:          "AVRO",
 			expectedResults: [][]string{{"1", "3", "2"}, {"3", "7", "4"}},
+		},
+		{
+			into:          false,
+			name:          "import-table-avro-virtual",
+			data:          avroData,
+			create:        "a INT, c INT AS (a + b) VIRTUAL, b INT",
+			format:        "AVRO",
+			expectedError: "to import into a table with virtual computed columns, use IMPORT INTO",
 		},
 		{
 			into:            false,
@@ -4887,10 +4903,9 @@ func TestImportWorkerFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
-
 	allowResponse := make(chan struct{})
 	params := base.TestClusterArgs{}
+	params.ServerArgs.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingResponseFilter: jobutils.BulkOpResponseFilter(&allowResponse),
 	}
@@ -6880,7 +6895,6 @@ func TestImportJobEventLogging(t *testing.T) {
 	defer log.ScopeWithoutShowLogs(t).Close(t)
 
 	defer jobs.TestingSetProgressThresholds()()
-	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	const (
 		nodes = 3
@@ -6888,6 +6902,7 @@ func TestImportJobEventLogging(t *testing.T) {
 	ctx := context.Background()
 	baseDir := filepath.Join("testdata", "avro")
 	args := base.TestServerArgs{ExternalIODir: baseDir}
+	args.Knobs = base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}
 	params := base.TestClusterArgs{ServerArgs: args}
 	tc := testcluster.StartTestCluster(t, nodes, params)
 	defer tc.Stopper().Stop(ctx)

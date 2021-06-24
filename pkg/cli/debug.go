@@ -60,9 +60,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/dustin/go-humanize"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/kr/pretty"
 	"github.com/spf13/cobra"
@@ -334,15 +336,17 @@ func runDebugBallast(cmd *cobra.Command, args []string) error {
 	ballastFile := args[0] // we use cobra.ExactArgs(1)
 	dataDirectory := filepath.Dir(ballastFile)
 
-	fs, err := sysutil.StatFS(dataDirectory)
+	du, err := vfs.Default.GetDiskUsage(dataDirectory)
 	if err != nil {
 		return errors.Wrapf(err, "failed to stat filesystem %s", dataDirectory)
 	}
-	total := fs.TotalBlocks * fs.BlockSize
-	free := fs.AvailBlocks * fs.BlockSize
 
-	used := total - free
-	var targetUsage int64
+	// Use a 'usedBytes' calculation that counts disk space reserved for the
+	// root user as used. The UsedBytes value returned by GetDiskUsage is
+	// the true count of currently allocated bytes.
+	usedBytes := du.TotalBytes - du.AvailBytes
+
+	var targetUsage uint64
 	p := debugCtx.ballastSize.Percent
 	if math.Abs(p) > 100 {
 		return errors.Errorf("absolute percentage value %f greater than 100", p)
@@ -354,36 +358,41 @@ func runDebugBallast(cmd *cobra.Command, args []string) error {
 	switch {
 	case p > 0:
 		fillRatio := p / float64(100)
-		targetUsage = used + int64((fillRatio)*float64(total))
+		targetUsage = usedBytes + uint64((fillRatio)*float64(du.TotalBytes))
 	case p < 0:
 		// Negative means leave the absolute %age of disk space.
 		fillRatio := 1.0 + (p / float64(100))
-		targetUsage = int64((fillRatio) * float64(total))
+		targetUsage = uint64((fillRatio) * float64(du.TotalBytes))
 	case b > 0:
-		targetUsage = used + b
+		targetUsage = usedBytes + uint64(b)
 	case b < 0:
 		// Negative means leave that many bytes of disk space.
-		targetUsage = total + b
+		targetUsage = du.TotalBytes - uint64(-b)
 	default:
 		return errors.New("expected exactly one of percentage or bytes non-zero, found none")
 	}
-	if used > targetUsage {
+	if usedBytes > targetUsage {
 		return errors.Errorf(
 			"Used space %s already more than needed to be filled %s\n",
-			humanizeutil.IBytes(used),
-			humanizeutil.IBytes(targetUsage),
+			humanize.IBytes(usedBytes),
+			humanize.IBytes(targetUsage),
 		)
 	}
-	if used == targetUsage {
+	if usedBytes == targetUsage {
 		return nil
 	}
-	ballastSize := targetUsage - used
+	ballastSize := targetUsage - usedBytes
 
-	// Note: CreateLargeFile fails if the target file already
-	// exists. This is a feature; we have seen users mistakenly applying
-	// the `ballast` command directly to block devices, thereby trashing
-	// their filesystem.
-	if err := sysutil.CreateLargeFile(ballastFile, ballastSize); err != nil {
+	// Note: We intentionally fail if the target file already exists. This is
+	// a feature; we have seen users mistakenly applying the `ballast` command
+	// directly to block devices, thereby trashing their filesystem.
+	if _, err := os.Stat(ballastFile); err == nil {
+		return os.ErrExist
+	} else if !oserror.IsNotExist(err) {
+		return errors.Wrap(err, "stating ballast file")
+	}
+
+	if err := sysutil.ResizeLargeFile(ballastFile, int64(ballastSize)); err != nil {
 		return errors.Wrap(err, "error allocating ballast file")
 	}
 	return nil
@@ -802,9 +811,27 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 		fmt.Printf("approximate reported database size before compaction: %s\n", humanizeutil.IBytes(int64(approxBytesBefore)))
 	}
 
-	if err := db.Compact(); err != nil {
-		return errors.Wrap(err, "while compacting")
+	// Begin compacting the store in a separate goroutine.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- errors.Wrap(db.Compact(), "while compacting")
+	}()
+
+	// Print the current LSM every minute.
+	ticker := time.NewTicker(time.Minute)
+	for done := false; !done; {
+		select {
+		case <-ticker.C:
+			fmt.Printf("%s\n", db.GetMetrics())
+		case err := <-errCh:
+			ticker.Stop()
+			if err != nil {
+				return err
+			}
+			done = true
+		}
 	}
+	fmt.Printf("%s\n", db.GetMetrics())
 
 	{
 		approxBytesAfter, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)

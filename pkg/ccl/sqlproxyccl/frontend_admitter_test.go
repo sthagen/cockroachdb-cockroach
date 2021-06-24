@@ -90,6 +90,7 @@ func TestFrontendAdmitWithClientSSLRequire(t *testing.T) {
 	require.NoError(t, err)
 	frontendCon, msg, err := frontendAdmit(srv, tlsConfig)
 	require.NoError(t, err)
+	defer func() { _ = frontendCon.Close() }()
 	require.NotEqual(t, srv, frontendCon) // The connection was replaced by SSL
 	require.NotNil(t, msg)
 }

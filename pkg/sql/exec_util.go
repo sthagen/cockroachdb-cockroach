@@ -84,6 +84,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/collector"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -918,6 +919,10 @@ type ExecutorConfig struct {
 	// CompactEngineSpanFunc is used to inform a storage engine of the need to
 	// perform compaction over a key span.
 	CompactEngineSpanFunc tree.CompactEngineSpanFunc
+
+	// TraceCollector is used to contact all live nodes in the cluster, and
+	// collect trace spans from their inflight node registries.
+	TraceCollector *collector.TraceCollector
 }
 
 // VersionUpgradeHook is used to run migrations starting in v21.1.
@@ -1609,9 +1614,15 @@ func hideNonVirtualTableNameFunc(vt VirtualTabler) func(ctx *tree.FmtCtx, name *
 
 func anonymizeStmtAndConstants(stmt tree.Statement, vt VirtualTabler) string {
 	// Re-format to remove most names.
-	f := tree.NewFmtCtx(tree.FmtAnonymize | tree.FmtHideConstants)
+	fmtFlags := tree.FmtAnonymize | tree.FmtHideConstants
+	var f *tree.FmtCtx
 	if vt != nil {
-		f.SetReformatTableNames(hideNonVirtualTableNameFunc(vt))
+		f = tree.NewFmtCtx(
+			fmtFlags,
+			tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt)),
+		)
+	} else {
+		f = tree.NewFmtCtx(fmtFlags)
 	}
 	f.FormatNode(stmt)
 	return f.CloseAndGetString()
@@ -2504,8 +2515,10 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 	}
 
 	// Re-format to remove most names.
-	f := tree.NewFmtCtx(tree.FmtAnonymize)
-	f.SetReformatTableNames(hideNonVirtualTableNameFunc(vt))
+	f := tree.NewFmtCtx(
+		tree.FmtAnonymize,
+		tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt)),
+	)
 	f.FormatNode(stmt.AST)
 	return f.CloseAndGetString(), true
 }

@@ -596,6 +596,9 @@ func allStacks() []byte {
 // testRunnerLogPath: The path to the test runner's log. It will be copied to
 //  	the test's artifacts dir if the test fails and we're running under
 //  	TeamCity.
+//
+// TODO(test-eng): the `bool` should go away, instead `t.Failed()` can be consulted
+// by the caller to determine whether the test passed.
 func (r *testRunner) runTest(
 	ctx context.Context,
 	t *testImpl,
@@ -826,12 +829,18 @@ func (r *testRunner) runTest(
 			// We really shouldn't get here unless the test code somehow managed
 			// to deadlock without blocking on anything remote - since we killed
 			// everything.
-			const msg = "test timed out and afterwards failed to respond to cancelation"
+			const msg = "test timed out and afterwards failed to respond to cancellation"
 			t.L().PrintfCtx(ctx, msg)
+
+			const stacksFile = "__stacks_after_cancellation"
+			if cl, err := t.L().ChildLogger(stacksFile, logger.QuietStderr, logger.QuietStdout); err == nil {
+				cl.PrintfCtx(ctx, "all stacks:\n\n%s\n", allStacks())
+				t.L().PrintfCtx(ctx, "dumped stacks (after cancellation) to %s", stacksFile)
+			}
 			r.collectClusterLogs(ctx, c, t)
-			// We return an error here because the test goroutine is still running, so
-			// we want to alert the caller of this unusual situation.
-			return false, errors.New(msg)
+			// We already marked the test as failing, so don't return an error here.
+			// Doing so would shut down the entire roachtest run.
+			return false, nil
 		}
 	}
 
@@ -879,7 +888,15 @@ func (r *testRunner) maybePostGithubIssue(
 	if err != nil {
 		t.Fatalf("could not load teams: %v", err)
 	}
-	team := teams[ownerToAlias(t.Spec().(*TestSpec).Owner)]
+
+	var mention []string
+	var projColID int
+	if sl, ok := teams.GetAliasesForPurpose(ownerToAlias(t.Spec().(*TestSpec).Owner), team.PurposeRoachtest); ok {
+		for _, alias := range sl {
+			mention = append(mention, "@"+string(alias))
+		}
+		projColID = teams[sl[0]].TriageColumnID
+	}
 
 	branch := "<unknown branch>"
 	if b := os.Getenv("TC_BUILD_BRANCH"); b != "" {
@@ -899,8 +916,8 @@ func (r *testRunner) maybePostGithubIssue(
 
 	req := issues.PostRequest{
 		AuthorEmail:     "", // intentionally unset - we add to the board and cc the team
-		Mention:         []string{"@" + string(team.Name())},
-		ProjectColumnID: team.TriageColumnID,
+		Mention:         mention,
+		ProjectColumnID: projColID,
 		PackageName:     "roachtest",
 		TestName:        t.Name(),
 		Message:         msg,
@@ -1243,7 +1260,7 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// (see runVersionUpgrade). The same is true for adding a new key to this
 	// map.
 	verMap := map[string]string{
-		"21.2": "21.1.3",
+		"21.2": "21.1.4",
 		"21.1": "20.2.12",
 		"20.2": "20.1.16",
 		"20.1": "19.2.11",

@@ -42,6 +42,7 @@ import (
 
 type alterTableNode struct {
 	n         *tree.AlterTable
+	prefix    catalog.ResolvedObjectPrefix
 	tableDesc *tabledesc.Mutable
 	// statsData is populated with data for "alter table inject statistics"
 	// commands - the JSON stats expressions.
@@ -62,12 +63,12 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 		return nil, err
 	}
 
-	tableDesc, err := p.ResolveMutableTableDescriptorEx(
+	prefix, tableDesc, err := p.ResolveMutableTableDescriptorEx(
 		ctx, n.Table, !n.IfExists, tree.ResolveRequireTableDesc,
 	)
 	if errors.Is(err, resolver.ErrNoPrimaryKey) {
 		if len(n.Cmds) > 0 && isAlterCmdValidWithoutPrimaryKey(n.Cmds[0]) {
-			tableDesc, err = p.ResolveMutableTableDescriptorExAllowNoPrimaryKey(
+			prefix, tableDesc, err = p.ResolveMutableTableDescriptorExAllowNoPrimaryKey(
 				ctx, n.Table, !n.IfExists, tree.ResolveRequireTableDesc,
 			)
 		}
@@ -111,6 +112,7 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 
 	return &alterTableNode{
 		n:         n,
+		prefix:    prefix,
 		tableDesc: tableDesc,
 		statsData: statsData,
 	}, nil
@@ -230,8 +232,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 				// Check if the columns exist on the table.
 				for _, column := range d.Columns {
-					if _, err := n.tableDesc.FindColumnWithName(column.Column); err != nil {
+					col, err := n.tableDesc.FindColumnWithName(column.Column)
+					if err != nil {
 						return err
+					}
+					if col.IsInaccessible() {
+						return pgerror.Newf(
+							pgcode.UndefinedColumn,
+							"column %q is inaccessible and cannot be referenced by a unique constraint",
+							column.Column,
+						)
 					}
 				}
 				// If the index is named, ensure that the name is unique.
@@ -348,6 +358,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 						params.ctx,
 						params.p.txn,
 						params.p,
+						n.prefix.Database,
+						n.prefix.Schema,
 						n.tableDesc,
 						d,
 						affected,

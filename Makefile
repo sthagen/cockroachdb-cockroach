@@ -421,7 +421,8 @@ bin/.bootstrap: $(GITHOOKS) vendor/modules.txt | bin/.submodules-initialized
 		golang.org/x/tools/cmd/goyacc \
 		golang.org/x/tools/cmd/stringer \
 		golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow \
-		honnef.co/go/tools/cmd/staticcheck
+		honnef.co/go/tools/cmd/staticcheck \
+		github.com/bufbuild/buf/cmd/buf
 	touch $@
 
 IGNORE_GOVERS :=
@@ -486,7 +487,6 @@ endif
 
 C_DEPS_DIR := $(abspath c-deps)
 JEMALLOC_SRC_DIR := $(C_DEPS_DIR)/jemalloc
-PROTOBUF_SRC_DIR := $(C_DEPS_DIR)/protobuf
 GEOS_SRC_DIR     := $(C_DEPS_DIR)/geos
 PROJ_SRC_DIR     := $(C_DEPS_DIR)/proj
 LIBEDIT_SRC_DIR  := $(C_DEPS_DIR)/libedit
@@ -511,22 +511,17 @@ BUILD_DIR := $(shell cygpath -m $(BUILD_DIR))
 endif
 
 JEMALLOC_DIR := $(BUILD_DIR)/jemalloc
-PROTOBUF_DIR := $(BUILD_DIR)/protobuf
 GEOS_DIR     := $(BUILD_DIR)/geos
 PROJ_DIR     := $(BUILD_DIR)/proj
 LIBEDIT_DIR  := $(BUILD_DIR)/libedit
 LIBROACH_DIR := $(BUILD_DIR)/libroach$(if $(ENABLE_LIBROACH_ASSERTIONS),_assert)
 KRB5_DIR     := $(BUILD_DIR)/krb5
-# Can't share with protobuf because protoc is always built for the host.
-PROTOC_DIR := $(GOPATH)/native/$(HOST_TRIPLE)/protobuf
 
 LIBJEMALLOC := $(JEMALLOC_DIR)/lib/libjemalloc.a
-LIBPROTOBUF := $(PROTOBUF_DIR)/libprotobuf.a
 LIBEDIT     := $(LIBEDIT_DIR)/src/.libs/libedit.a
 LIBROACH    := $(LIBROACH_DIR)/libroach.a
 LIBPROJ     := $(PROJ_DIR)/lib/libproj$(if $(target-is-windows),_4_9).a
 LIBKRB5     := $(KRB5_DIR)/lib/libgssapi_krb5.a
-PROTOC      := $(PROTOC_DIR)/protoc
 
 DYN_LIB_DIR := lib
 DYN_EXT     := so
@@ -544,8 +539,8 @@ C_LIBS_COMMON = \
 	$(if $(target-is-windows),,$(LIBEDIT)) \
 	$(LIBPROJ) $(LIBROACH)
 C_LIBS_SHORT = $(C_LIBS_COMMON)
-C_LIBS_OSS = $(C_LIBS_COMMON) $(LIBPROTOBUF)
-C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBPROTOBUF)
+C_LIBS_OSS = $(C_LIBS_COMMON)
+C_LIBS_CCL = $(C_LIBS_COMMON)
 C_LIBS_DYNAMIC = $(LIBGEOS)
 
 # We only include krb5 on linux, non-musl builds.
@@ -583,7 +578,6 @@ CGO_PKGS := \
 	pkg/cli \
 	pkg/server/status \
 	pkg/storage \
-	pkg/ccl/storageccl/engineccl \
 	pkg/ccl/gssapiccl \
 	pkg/geo/geoproj \
 	vendor/github.com/knz/go-libedit/unix
@@ -602,7 +596,7 @@ $(BASE_CGO_FLAGS_FILES): Makefile build/defs.mk.sig | bin/.submodules-initialize
 	@echo 'package $(if $($(@D)-package),$($(@D)-package),$(notdir $(@D)))' >> $@
 	@echo >> $@
 	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS))' >> $@
-	@echo '// #cgo LDFLAGS: $(addprefix -L,$(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(LIBEDIT_DIR)/src/.libs $(LIBROACH_DIR) $(KRB_DIR) $(PROJ_DIR)/lib)' >> $@
+	@echo '// #cgo LDFLAGS: $(addprefix -L,$(JEMALLOC_DIR)/lib $(LIBEDIT_DIR)/src/.libs $(LIBROACH_DIR) $(KRB_DIR) $(PROJ_DIR)/lib)' >> $@
 	@echo 'import "C"' >> $@
 
 vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go: Makefile | bin/.submodules-initialized
@@ -659,24 +653,6 @@ $(KRB5_DIR)/Makefile: $(C_DEPS_DIR)/krb5-rebuild $(KRB5_SRC_DIR)/src/configure
 	@# If CFLAGS is set to -g1 then make will fail.
 	@# We specify -fcommon to get around duplicate definition errors in recent gcc.
 	cd $(KRB5_DIR) && env -u CXXFLAGS CFLAGS="-fcommon"  $(KRB5_SRC_DIR)/src/configure $(xconfigure-flags) --enable-static --disable-shared
-
-$(PROTOBUF_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | bin/.submodules-initialized
-	rm -rf $(PROTOBUF_DIR)
-	mkdir -p $(PROTOBUF_DIR)
-	@# NOTE: If you change the CMake flags below, bump the version in
-	@# $(C_DEPS_DIR)/protobuf-rebuild. See above for rationale.
-	cd $(PROTOBUF_DIR) && cmake $(xcmake-flags) -Dprotobuf_WITH_ZLIB=OFF -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
-	  -DCMAKE_BUILD_TYPE=Release
-
-ifneq ($(PROTOC_DIR),$(PROTOBUF_DIR))
-$(PROTOC_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | bin/.submodules-initialized
-	rm -rf $(PROTOC_DIR)
-	mkdir -p $(PROTOC_DIR)
-	@# NOTE: If you change the CMake flags below, bump the version in
-	@# $(C_DEPS_DIR)/protobuf-rebuild. See above for rationale.
-	cd $(PROTOC_DIR) && cmake $(cmake-flags) -Dprotobuf_BUILD_TESTS=OFF $(PROTOBUF_SRC_DIR)/cmake \
-	  -DCMAKE_BUILD_TYPE=Release
-endif
 
 $(GEOS_DIR)/Makefile: $(C_DEPS_DIR)/geos-rebuild | bin/.submodules-initialized
 	rm -rf $(GEOS_DIR)
@@ -744,14 +720,8 @@ $(LIBEDIT_DIR)/Makefile: $(C_DEPS_DIR)/libedit-rebuild $(LIBEDIT_SRC_DIR)/config
 # stats the directory tree in parallel, and can make the up-to-date
 # determination in under 20ms.
 
-$(PROTOC): $(PROTOC_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD | $(LIBPROTOBUF)
-	@uptodate $@ $(PROTOBUF_SRC_DIR) || $(MAKE) --no-print-directory -C $(PROTOC_DIR) protoc
-
 $(LIBJEMALLOC): $(JEMALLOC_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(JEMALLOC_SRC_DIR) || $(MAKE) --no-print-directory -C $(JEMALLOC_DIR) build_lib_static
-
-$(LIBPROTOBUF): $(PROTOBUF_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
-	@uptodate $@ $(PROTOBUF_SRC_DIR) || $(MAKE) --no-print-directory -C $(PROTOBUF_DIR) libprotobuf
 
 ifdef is-cross-compile
 ifdef target-is-macos
@@ -803,11 +773,9 @@ $(LIBKRB5): $(KRB5_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(KRB5_SRC_DIR)/src || $(MAKE) --no-print-directory -C $(KRB5_DIR)
 
 # Convenient names for maintainers. Not used by other targets in the Makefile.
-.PHONY: protoc libjemalloc libprotobuf libgeos libproj libroach libkrb5
-protoc:      $(PROTOC)
+.PHONY:  libjemalloc libgeos libproj libroach libkrb5
 libedit:     $(LIBEDIT)
 libjemalloc: $(LIBJEMALLOC)
-libprotobuf: $(LIBPROTOBUF)
 libgeos:     $(LIBGEOS)
 libproj:     $(LIBPROJ)
 libroach:    $(LIBROACH)
@@ -1272,9 +1240,10 @@ CPP_PROTO_ROOT := $(LIBROACH_SRC_DIR)/protos
 CPP_PROTO_CCL_ROOT := $(LIBROACH_SRC_DIR)/protosccl
 
 GOGO_PROTOBUF_PATH := ./vendor/github.com/gogo/protobuf
-PROTOBUF_PATH  := $(GOGO_PROTOBUF_PATH)/protobuf
 
 GOGOPROTO_PROTO := $(GOGO_PROTOBUF_PATH)/gogoproto/gogo.proto
+
+PROMETHEUS_PATH := ./vendor/github.com/prometheus/client_model
 
 ERRORS_PATH := ./vendor/github.com/cockroachdb/errors
 ERRORS_PROTO := $(ERRORS_PATH)/errorspb/errors.proto
@@ -1318,18 +1287,18 @@ UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 $(GOGOPROTO_PROTO): bin/.submodules-initialized
 $(ERRORS_PROTO): bin/.submodules-initialized
 
-bin/.go_protobuf_sources: $(PROTOC) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach
+bin/.go_protobuf_sources: $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach
 	$(FIND_RELEVANT) -type f -name '*.pb.go' -exec rm {} +
 	set -e; for dir in $(sort $(dir $(GO_PROTOS))); do \
-	  build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS),plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
+	  buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS)plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
 	done
 	gofmt -s -w $(GO_SOURCES)
 	touch $@
 
-bin/.gw_protobuf_sources: $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap
+bin/.gw_protobuf_sources: $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap
 	$(FIND_RELEVANT) -type f -name '*.pb.gw.go' -exec rm {} +
-	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(ERRORS_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
-	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(ERRORS_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
+		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
+		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
 	gofmt -s -w $(GW_SOURCES)
 	@# TODO(jordan,benesch) This can be removed along with the above TODO.
 	goimports -w $(GW_SOURCES)
@@ -1344,13 +1313,13 @@ bin/.gw_protobuf_sources: $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PRO
 $(UI_JS_CCL): $(GW_PROTOS) $(GO_PROTOS) $(JS_PROTOS_CCL) pkg/ui/yarn.protobuf.installed | bin/.submodules-initialized
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
-	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS) $(JS_PROTOS_CCL)) >> $@
+	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(PROMETHEUS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS) $(JS_PROTOS_CCL)) >> $@
 
 .SECONDARY: $(UI_JS_OSS)
 $(UI_JS_OSS): $(GW_PROTOS) $(GO_PROTOS) pkg/ui/yarn.protobuf.installed | bin/.submodules-initialized
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
-	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS)) >> $@
+	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(PROMETHEUS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS)) >> $@
 
 # End of PBJS-generated files.
 
@@ -1581,12 +1550,11 @@ bin/.docgen_logformats: bin/docgen
 	docgen logformats docs/generated/logformats.md
 	touch $@
 
-bin/.docgen_http: bin/docgen $(PROTOC)
+bin/.docgen_http: bin/docgen bin/.bootstrap
 	docgen http \
-	--protoc $(PROTOC) \
 	--gendoc ./bin/protoc-gen-doc \
 	--out docs/generated/http \
-	--protobuf pkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH)
+	--protobuf "-Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) -I$(PROMETHEUS_PATH)"
 	touch $@
 
 .PHONY: docs/generated/redact_safe.md
@@ -1700,7 +1668,6 @@ c-deps-fmt:
 .PHONY: clean-c-deps
 clean-c-deps:
 	rm -rf $(JEMALLOC_DIR)
-	rm -rf $(PROTOBUF_DIR)
 	rm -rf $(GEOS_DIR)
 	rm -rf $(PROJ_DIR)
 	rm -rf $(LIBROACH_DIR)
@@ -1709,7 +1676,6 @@ clean-c-deps:
 .PHONY: unsafe-clean-c-deps
 unsafe-clean-c-deps:
 	git -C $(JEMALLOC_SRC_DIR) clean -dxf
-	git -C $(PROTOBUF_SRC_DIR) clean -dxf
 	git -C $(GEOS_SRC_DIR)     clean -dxf
 	git -C $(PROJ_SRC_DIR)     clean -dxf
 	git -C $(LIBROACH_SRC_DIR) clean -dxf

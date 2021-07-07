@@ -213,7 +213,7 @@ func (c *ArrowBatchConverter) BatchToArrow(batch coldata.Batch) ([]*array.Data, 
 
 		case typeconv.DatumVecCanonicalTypeFamily:
 			offsets := make([]int32, 0, n+1)
-			datums := vec.Datum().Slice(0 /* start */, n)
+			datums := vec.Datum().Window(0 /* start */, n)
 			// Make a very very rough estimate of the number of bytes we'll have to
 			// allocate for the datums in this vector. This will likely be an
 			// undercount, but the estimate is better than nothing.
@@ -329,6 +329,11 @@ func (c *ArrowBatchConverter) ArrowToBatch(
 	for i, typ := range c.typs {
 		vec := b.ColVec(i)
 		d := data[i]
+
+		// Eagerly release our data references to make sure they can be collected
+		// as quickly as possible as we copy each (or simply reference each) by
+		// coldata.Vecs below.
+		data[i] = nil
 
 		switch typeconv.TypeFamilyToCanonicalTypeFamily(typ.Family()) {
 		case types.BoolFamily:

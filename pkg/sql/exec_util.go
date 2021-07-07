@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -407,6 +408,17 @@ var stubCatalogTablesEnabledClusterValue = settings.RegisterBoolSetting(
 	true,
 ).WithPublic()
 
+var experimentalComputedColumnRewrites = settings.RegisterValidatedStringSetting(
+	"sql.defaults.experimental_computed_column_rewrites",
+	"allows rewriting computed column expressions in CREATE TABLE and ALTER TABLE statements; "+
+		"the format is: '(before expression) -> (after expression) [, (before expression) -> (after expression) ...]'",
+	"", /* defaultValue */
+	func(_ *settings.Values, val string) error {
+		_, err := schemaexpr.ParseComputedColumnRewrites(val)
+		return err
+	},
+)
+
 // settingWorkMemBytes is a cluster setting that determines the maximum amount
 // of RAM that a processor can use.
 var settingWorkMemBytes = settings.RegisterByteSizeSetting(
@@ -480,6 +492,20 @@ var disallowFullTableScans = settings.RegisterBoolSetting(
 	`sql.defaults.disallow_full_table_scans.enabled`,
 	"setting to true rejects queries that have planned a full table scan",
 	false,
+).WithPublic()
+
+// intervalStyle controls intervals representation.
+var intervalStyle = settings.RegisterEnumSetting(
+	"sql.defaults.intervalstyle",
+	"default value for IntervalStyle session setting",
+	strings.ToLower(duration.IntervalStyle_POSTGRES.String()),
+	func() map[int64]string {
+		ret := make(map[int64]string, len(duration.IntervalStyle_name))
+		for k, v := range duration.IntervalStyle_name {
+			ret[int64(k)] = strings.ToLower(v)
+		}
+		return ret
+	}(),
 ).WithPublic()
 
 var errNoTransactionInProgress = errors.New("there is no transaction in progress")
@@ -2475,9 +2501,18 @@ func (m *sessionDataMutator) initSequenceCache() {
 	m.data.SequenceCache = sessiondata.SequenceCache{}
 }
 
+// SetIntervalStyle sets the IntervalStyle for the given session.
+func (m *sessionDataMutator) SetIntervalStyle(style duration.IntervalStyle) {
+	m.data.DataConversionConfig.IntervalStyle = style
+}
+
 // SetStubCatalogTableEnabled sets default value for stub_catalog_tables.
 func (m *sessionDataMutator) SetStubCatalogTablesEnabled(enabled bool) {
 	m.data.StubCatalogTablesEnabled = enabled
+}
+
+func (m *sessionDataMutator) SetExperimentalComputedColumnRewrites(val string) {
+	m.data.ExperimentalComputedColumnRewrites = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

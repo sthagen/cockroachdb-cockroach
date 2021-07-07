@@ -65,11 +65,6 @@ func (i *MVCCIterator) Close() {
 	i.i.Close()
 }
 
-// Iterator returns the underlying storage.MVCCIterator.
-func (i *MVCCIterator) Iterator() storage.MVCCIterator {
-	return i.i
-}
-
 // Valid is part of the storage.MVCCIterator interface.
 func (i *MVCCIterator) Valid() (bool, error) {
 	if i.err != nil {
@@ -489,28 +484,6 @@ func (s spanSetReader) PinEngineStateForIterators() error {
 	return s.r.PinEngineStateForIterators()
 }
 
-// GetDBEngine recursively searches for the underlying rocksDB engine.
-func GetDBEngine(reader storage.Reader, span roachpb.Span) storage.Reader {
-	switch v := reader.(type) {
-	case ReadWriter:
-		return GetDBEngine(getSpanReader(v, span), span)
-	case *spanSetBatch:
-		return GetDBEngine(getSpanReader(v.ReadWriter, span), span)
-	default:
-		return reader
-	}
-}
-
-// getSpanReader is a getter to access the storage.Reader field of the
-// spansetReader.
-func getSpanReader(r ReadWriter, span roachpb.Span) storage.Reader {
-	if err := r.spanSetReader.spans.CheckAllowed(SpanReadOnly, span); err != nil {
-		panic("Not in the span")
-	}
-
-	return r.spanSetReader.r
-}
-
 type spanSetWriter struct {
 	w     storage.Writer
 	spans *SpanSet
@@ -761,5 +734,18 @@ func NewBatchAt(b storage.Batch, spans *SpanSet, ts hlc.Timestamp) storage.Batch
 		b:          b,
 		spans:      spans,
 		ts:         ts,
+	}
+}
+
+// DisableReaderAssertions unwraps any storage.Reader implementations that may
+// assert access against a given SpanSet.
+func DisableReaderAssertions(reader storage.Reader) storage.Reader {
+	switch v := reader.(type) {
+	case ReadWriter:
+		return DisableReaderAssertions(v.r)
+	case *spanSetBatch:
+		return DisableReaderAssertions(v.r)
+	default:
+		return reader
 	}
 }

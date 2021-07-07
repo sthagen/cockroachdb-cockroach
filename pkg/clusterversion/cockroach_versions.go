@@ -304,6 +304,11 @@ const (
 	ExpressionIndexes
 	// DeleteDeprecatedNamespaceTableDescriptorMigration deletes the descriptor at ID=2.
 	DeleteDeprecatedNamespaceTableDescriptorMigration
+	// FixDescriptors is for the migration to fix all descriptors.
+	FixDescriptors
+	// SQLStatsTable adds the system tables for storing persisted SQL statistics
+	// for statements and transactions.
+	SQLStatsTable
 
 	// Step (1): Add new versions here.
 )
@@ -517,7 +522,14 @@ var versionsSingleton = keyedVersions{
 		Key:     DeleteDeprecatedNamespaceTableDescriptorMigration,
 		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 112},
 	},
-
+	{
+		Key:     FixDescriptors,
+		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 114},
+	},
+	{
+		Key:     SQLStatsTable,
+		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 116},
+	},
 	// Step (2): Add new versions here.
 }
 

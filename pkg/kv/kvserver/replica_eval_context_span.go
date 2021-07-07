@@ -14,7 +14,6 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
@@ -25,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -72,11 +70,6 @@ func (rec *SpanSetReplicaEvalContext) Clock() *hlc.Clock {
 	return rec.i.Clock()
 }
 
-// DB returns the Replica's client DB.
-func (rec *SpanSetReplicaEvalContext) DB() *kv.DB {
-	return rec.i.DB()
-}
-
 // GetConcurrencyManager returns the concurrency.Manager.
 func (rec *SpanSetReplicaEvalContext) GetConcurrencyManager() concurrency.Manager {
 	return rec.i.GetConcurrencyManager()
@@ -90,11 +83,6 @@ func (rec *SpanSetReplicaEvalContext) NodeID() roachpb.NodeID {
 // GetNodeLocality returns the node locality.
 func (rec *SpanSetReplicaEvalContext) GetNodeLocality() roachpb.Locality {
 	return rec.i.GetNodeLocality()
-}
-
-// Engine returns the engine.
-func (rec *SpanSetReplicaEvalContext) Engine() storage.Engine {
-	return rec.i.Engine()
 }
 
 // GetFirstIndex returns the first index.

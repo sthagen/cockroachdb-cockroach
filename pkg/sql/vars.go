@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -798,7 +800,26 @@ var varGen = map[string]sessionVar{
 	`integer_datetimes`: makeReadOnlyVar("on"),
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-INTERVALSTYLE
-	`intervalstyle`: makeCompatStringVar(`IntervalStyle`, "postgres"),
+	`intervalstyle`: {
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			style, ok := duration.IntervalStyle_value[strings.ToUpper(s)]
+			if !ok {
+				validIntervalStyles := make([]string, 0, len(duration.IntervalStyle_value))
+				for k := range duration.IntervalStyle_value {
+					validIntervalStyles = append(validIntervalStyles, strings.ToLower(k))
+				}
+				return newVarValueError(`IntervalStyle`, s, validIntervalStyles...)
+			}
+			m.SetIntervalStyle(duration.IntervalStyle(style))
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return strings.ToLower(evalCtx.SessionData.DataConversionConfig.IntervalStyle.String())
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strings.ToLower(duration.IntervalStyle_name[int32(intervalStyle.Get(sv))])
+		},
+	},
 
 	// CockroachDB extension.
 	`locality`: {
@@ -1332,6 +1353,27 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(experimentalStreamReplicationEnabled.Get(sv))
+		},
+	},
+
+	// CockroachDB extension. See experimentalComputedColumnRewrites or
+	// ParseComputedColumnRewrites for a description of the format.
+	`experimental_computed_column_rewrites`: {
+		Hidden:       true,
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_computed_column_rewrites`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			_, err := schemaexpr.ParseComputedColumnRewrites(s)
+			if err != nil {
+				return err
+			}
+			m.SetExperimentalComputedColumnRewrites(s)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return evalCtx.SessionData.ExperimentalComputedColumnRewrites
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return experimentalComputedColumnRewrites.Get(sv)
 		},
 	},
 }

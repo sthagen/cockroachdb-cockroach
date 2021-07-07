@@ -548,22 +548,18 @@ func (n *createTableNode) Close(ctx context.Context) {
 }
 
 func qualifyFKColErrorWithDB(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, tbl *tabledesc.Mutable, col string,
+	ctx context.Context,
+	db catalog.DatabaseDescriptor,
+	sc catalog.SchemaDescriptor,
+	tbl catalog.TableDescriptor,
+	col string,
 ) string {
-	if txn == nil {
-		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
-	}
-
-	// TODO(solon): this ought to use a database cache.
-	db, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, codec, tbl.ParentID)
-	if err != nil {
-		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
-	}
-	schema, err := resolver.ResolveSchemaNameByID(ctx, txn, codec, db.GetID(), tbl.GetParentSchemaID())
-	if err != nil {
-		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
-	}
-	return tree.ErrString(tree.NewUnresolvedName(db.GetName(), schema, tbl.Name, col))
+	return tree.ErrString(tree.NewUnresolvedName(
+		db.GetName(),
+		sc.GetName(),
+		tbl.GetName(),
+		col,
+	))
 }
 
 // TableState is the state of the referencing table ResolveFK() or
@@ -793,6 +789,8 @@ func ResolveFK(
 	ctx context.Context,
 	txn *kv.Txn,
 	sc resolver.SchemaResolver,
+	parentDB catalog.DatabaseDescriptor,
+	parentSchema catalog.SchemaDescriptor,
 	tbl *tabledesc.Mutable,
 	d *tree.ForeignKeyConstraintTableDef,
 	backrefs map[descpb.ID]*tabledesc.Mutable,
@@ -948,7 +946,7 @@ func ResolveFK(
 	if d.Actions.Delete == tree.SetNull || d.Actions.Update == tree.SetNull {
 		for _, originColumn := range originCols {
 			if !originColumn.IsNullable() {
-				col := qualifyFKColErrorWithDB(ctx, txn, evalCtx.Codec, tbl, originColumn.GetName())
+				col := qualifyFKColErrorWithDB(ctx, parentDB, parentSchema, tbl, originColumn.GetName())
 				return pgerror.Newf(pgcode.InvalidForeignKey,
 					"cannot add a SET NULL cascading action on column %q which has a NOT NULL constraint", col,
 				)
@@ -963,7 +961,7 @@ func ResolveFK(
 			// Having a default expression of NULL, and a constraint of NOT NULL is a
 			// contradiction and should never be allowed.
 			if !originColumn.HasDefault() && !originColumn.IsNullable() {
-				col := qualifyFKColErrorWithDB(ctx, txn, evalCtx.Codec, tbl, originColumn.GetName())
+				col := qualifyFKColErrorWithDB(ctx, parentDB, parentSchema, tbl, originColumn.GetName())
 				return pgerror.Newf(pgcode.InvalidForeignKey,
 					"cannot add a SET DEFAULT cascading action on column %q which has a "+
 						"NOT NULL constraint and a NULL default expression", col,
@@ -1311,7 +1309,7 @@ func getFinalSourceQuery(source *tree.Select, evalCtx *tree.EvalContext) string 
 	// We use tree.FormatNode merely as a traversal method; its output buffer is
 	// discarded immediately after the traversal because it is not needed
 	// further.
-	f := tree.NewFmtCtx(
+	f := evalCtx.FmtCtx(
 		tree.FmtSerializable,
 		tree.FmtReformatTableNames(
 			func(_ *tree.FmtCtx, tn *tree.TableName) {
@@ -1328,7 +1326,7 @@ func getFinalSourceQuery(source *tree.Select, evalCtx *tree.EvalContext) string 
 	f.Close()
 
 	// Substitute placeholders with their values.
-	ctx := tree.NewFmtCtx(
+	ctx := evalCtx.FmtCtx(
 		tree.FmtSerializable,
 		tree.FmtPlaceholderFormat(func(ctx *tree.FmtCtx, placeholder *tree.Placeholder) {
 			d, err := placeholder.Eval(evalCtx)
@@ -1672,6 +1670,9 @@ func NewTableDesc(
 
 	for i, def := range n.Defs {
 		if d, ok := def.(*tree.ColumnTableDef); ok {
+			if d.IsComputed() {
+				d.Computed.Expr = schemaexpr.MaybeRewriteComputedColumn(d.Computed.Expr, evalCtx.SessionData)
+			}
 			// NewTableDesc is called sometimes with a nil SemaCtx (for example
 			// during bootstrapping). In order to not panic, pass a nil TypeResolver
 			// when attempting to resolve the columns type.
@@ -2281,7 +2282,8 @@ func NewTableDesc(
 
 		case *tree.ForeignKeyConstraintTableDef:
 			if err := ResolveFK(
-				ctx, txn, fkResolver, &desc, d, affected, NewTable, tree.ValidationDefault, evalCtx,
+				ctx, txn, fkResolver, db, sc, &desc, d, affected, NewTable,
+				tree.ValidationDefault, evalCtx,
 			); err != nil {
 				return nil, err
 			}

@@ -57,6 +57,7 @@ func initCLIDefaults() {
 	setImportContextDefaults()
 	setProxyContextDefaults()
 	setTestDirectorySvrContextDefaults()
+	setUserfileContextDefaults()
 
 	initPreFlagsDefaults()
 
@@ -653,7 +654,7 @@ func setProxyContextDefaults() {
 	proxyContext.RatelimitBaseDelay = 50 * time.Millisecond
 	proxyContext.ValidateAccessInterval = 30 * time.Second
 	proxyContext.PollConfigInterval = 30 * time.Second
-	proxyContext.IdleTimeout = 0
+	proxyContext.DrainTimeout = 0
 }
 
 var testDirectorySvrContext struct {
@@ -662,6 +663,22 @@ var testDirectorySvrContext struct {
 
 func setTestDirectorySvrContextDefaults() {
 	testDirectorySvrContext.port = 36257
+}
+
+// userfileCtx captures the command-line parameters of the
+// `userfile` command.
+// See below for defaults.
+var userfileCtx struct {
+	// When set, the entire subtree rooted at the source directory will be
+	// uploaded to the destination.
+	recursive bool
+}
+
+// setUserfileContextDefaults sets the default values in userfileCtx.
+// This function is called by initCLIDefaults() and thus re-called in
+// every test that exercises command-line parsing.
+func setUserfileContextDefaults() {
+	userfileCtx.recursive = false
 }
 
 // GetServerCfgStores provides direct public access to the StoreSpecList inside

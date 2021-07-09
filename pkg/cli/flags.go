@@ -961,6 +961,7 @@ func init() {
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableImplicitCredentials, cliflags.ExternalIODisableImplicitCredentials)
 
 	}
+
 	// Multi-tenancy proxy command flags.
 	{
 		f := mtStartSQLProxyCmd.Flags()
@@ -976,12 +977,17 @@ func init() {
 		durationFlag(f, &proxyContext.RatelimitBaseDelay, cliflags.RatelimitBaseDelay)
 		durationFlag(f, &proxyContext.ValidateAccessInterval, cliflags.ValidateAccessInterval)
 		durationFlag(f, &proxyContext.PollConfigInterval, cliflags.PollConfigInterval)
-		durationFlag(f, &proxyContext.IdleTimeout, cliflags.IdleTimeout)
+		durationFlag(f, &proxyContext.DrainTimeout, cliflags.DrainTimeout)
 	}
 	// Multi-tenancy test directory command flags.
 	{
 		f := mtTestDirectorySvr.Flags()
 		intFlag(f, &testDirectorySvrContext.port, cliflags.TestDirectoryListenPort)
+	}
+
+	// userfile upload command.
+	{
+		boolFlag(userFileUploadCmd.Flags(), &userfileCtx.recursive, cliflags.Recursive)
 	}
 }
 

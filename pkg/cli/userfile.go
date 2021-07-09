@@ -15,6 +15,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path"
@@ -45,7 +46,8 @@ var userFileUploadCmd = &cobra.Command{
 	Use:   "upload <source> <destination>",
 	Short: "upload file from source to destination",
 	Long: `
-Uploads a file to the user scoped file storage using a SQL connection.
+Uploads a single file, or, with the -r flag, all the files in the subtree rooted
+at a directory, to the user-scoped file storage using a SQL connection.
 `,
 	Args: cobra.MinimumNArgs(1),
 	RunE: maybeShoutError(runUserFileUpload),
@@ -136,6 +138,52 @@ func runUserFileList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func uploadUserFileRecursive(conn *sqlConn, srcDir, dstDir string) error {
+	srcHasTrailingSlash := strings.HasSuffix(srcDir, "/")
+	var err error
+	srcDir, err = filepath.Abs(srcDir)
+	if err != nil {
+		return err
+	}
+	dstDir = strings.TrimSuffix(dstDir, "/")
+	// We append the last element of the (absolute) source path, i.e. the source
+	// directory name, to the destination path in the following two cases:
+	//   1. The user has not specified a destination, i.e. it is empty.
+	//   2. The source has no trailing slash (à la rsync).
+	srcDirBase := filepath.Base(srcDir)
+	if dstDir == "" {
+		dstDir = srcDirBase
+	} else if !srcHasTrailingSlash {
+		dstDir = dstDir + "/" + srcDirBase
+	}
+
+	ctx := context.Background()
+
+	err = filepath.WalkDir(srcDir,
+		func(path string, info fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				relativePath := strings.TrimPrefix(path, srcDir+"/")
+				fmt.Printf("uploading: %s\n", relativePath)
+
+				uploadedFile, err := uploadUserFile(ctx, conn, path, dstDir+"/"+relativePath)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("successfully uploaded to %s\n", uploadedFile)
+			}
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("successfully uploaded all files in the subtree rooted at %s\n", filepath.Base(srcDir))
+	return nil
+}
+
 func runUserFileUpload(cmd *cobra.Command, args []string) error {
 	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
 	if err != nil {
@@ -150,20 +198,20 @@ func runUserFileUpload(cmd *cobra.Command, args []string) error {
 		destination = args[1]
 	}
 
-	reader, err := openUserFile(source)
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
-	var uploadedFile string
-	if uploadedFile, err = uploadUserFile(context.Background(), conn, reader, source,
-		destination); err != nil {
-		return err
+	if userfileCtx.recursive {
+		if err := uploadUserFileRecursive(conn, source, destination); err != nil {
+			return err
+		}
+	} else {
+		uploadedFile, err := uploadUserFile(context.Background(), conn, source,
+			destination)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("successfully uploaded to %s\n", uploadedFile)
 	}
 
 	telemetry.Count("userfile.command.upload")
-	fmt.Printf("successfully uploaded to %s\n", uploadedFile)
 	return nil
 }
 
@@ -184,16 +232,28 @@ func runUserFileGet(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	glob := conf.Path
-	conf.Path = "/"
+
+	fullPath := conf.Path
+	conf.Path = cloud.GetPrefixBeforeWildcard(fullPath)
+	pattern := fullPath[len(conf.Path):]
+	displayPath := strings.TrimPrefix(conf.Path, "/")
+
 	f, err := userfile.MakeSQLConnFileTableStorage(ctx, conf, conn.conn.(cloud.SQLConnI))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	files, err := f.ListFiles(ctx, glob)
-	if err != nil {
+	var files []string
+	if err := f.List(ctx, "", "", func(s string) error {
+		if pattern != "" {
+			if ok, err := path.Match(pattern, s); err != nil || !ok {
+				return err
+			}
+		}
+		files = append(files, s)
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -201,17 +261,14 @@ func runUserFileGet(cmd *cobra.Command, args []string) error {
 		return errors.New("no files matched requested path or path pattern")
 	}
 
-	for _, file := range files {
-		u, err := url.Parse(file)
-		if err != nil {
-			return err
-		}
+	for _, src := range files {
+		file := displayPath + src
 		var fileDest string
 		if len(files) > 1 {
 			// If we matched multiple files, write their name in to dest or cwd.
-			fileDest = filepath.Join(dest, filepath.FromSlash(u.Path))
+			fileDest = filepath.Join(dest, filepath.FromSlash(file))
 		} else {
-			filename := path.Base(u.Path)
+			filename := path.Base(file)
 			// If we matched just one file and do not have explicit dest, write it to
 			// its file name in cwd.
 			if dest == "" {
@@ -231,7 +288,7 @@ func runUserFileGet(cmd *cobra.Command, args []string) error {
 			}
 		}
 		fmt.Printf("downloading %s... ", file)
-		sz, err := downloadUserfile(ctx, f, u.Path, fileDest)
+		sz, err := downloadUserfile(ctx, f, src, fileDest)
 		if err != nil {
 			return err
 		}
@@ -316,17 +373,6 @@ func constructUserfileDestinationURI(source, destination string, user security.S
 }
 
 func constructUserfileListURI(glob string, user security.SQLUsername) string {
-	// User has not specified a glob pattern and so we construct a URI which will
-	// list all the files stored in the UserFileTableStorage.
-	if glob == "" || glob == "*" {
-		userFileURL := url.URL{
-			Scheme: defaultUserfileScheme,
-			Host:   getDefaultQualifiedTableName(user),
-			Path:   "",
-		}
-		return userFileURL.String()
-	}
-
 	// If the destination is a well-formed userfile URI of the form
 	// userfile://db.schema.tablename_prefix/glob/pattern, then we
 	// use that as the final URI.
@@ -380,15 +426,32 @@ func listUserFile(ctx context.Context, conn *sqlConn, glob string) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	prefix := conf.Path
-	conf.Path = ""
+
+	fullPath := conf.Path
+	conf.Path = cloud.GetPrefixBeforeWildcard(fullPath)
+	pattern := fullPath[len(conf.Path):]
+
 	f, err := userfile.MakeSQLConnFileTableStorage(ctx, conf, conn.conn.(cloud.SQLConnI))
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	return f.ListFiles(ctx, prefix)
+	displayPrefix := strings.TrimPrefix(conf.Path, "/")
+	var res []string
+	if err := f.List(ctx, "", "", func(s string) error {
+		if pattern != "" {
+			ok, err := path.Match(pattern, s)
+			if err != nil || !ok {
+				return err
+			}
+		}
+		res = append(res, displayPrefix+s)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func downloadUserfile(
@@ -438,32 +501,39 @@ func deleteUserFile(ctx context.Context, conn *sqlConn, glob string) ([]string, 
 		return nil, err
 	}
 
-	// We zero out the path so that we can provide explicit glob patterns to the
-	// ListFiles call below. Explicit glob patterns allows us to use the same
-	// ExternalStorage for both the ListFiles() and Delete() methods.
-	userFileTableConf.FileTableConfig.Path = ""
+	// We truncate the path so that we can open one store to first do a listing
+	// with our actual pattern, then pass the found names to delete them using the
+	// same store.
+	fullPath := userFileTableConf.FileTableConfig.Path
+	userFileTableConf.FileTableConfig.Path = cloud.GetPrefixBeforeWildcard(fullPath)
+	pattern := fullPath[len(userFileTableConf.FileTableConfig.Path):]
+
 	f, err := userfile.MakeSQLConnFileTableStorage(ctx, userFileTableConf.FileTableConfig,
 		conn.conn.(cloud.SQLConnI))
 	if err != nil {
 		return nil, err
 	}
 
-	userfileParsedURL, err := url.ParseRequestURI(unescapedUserfileListURI)
-	if err != nil {
-		return nil, err
-	}
+	displayRoot := strings.TrimPrefix(userFileTableConf.FileTableConfig.Path, "/")
+	var deleted []string
 
-	files, err := f.ListFiles(ctx, userfileParsedURL.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	for i := range files {
-		if err = f.Delete(ctx, files[i]); err != nil {
-			return files[:i], errors.WithDetailf(err, "deletion failed at %s", files[i])
+	if err := f.List(ctx, "", "", func(s string) error {
+		if pattern != "" {
+			ok, err := path.Match(pattern, s)
+			if err != nil || !ok {
+				return err
+			}
 		}
+		if err := errors.WithDetailf(f.Delete(ctx, s), "deleting %s failed", s); err != nil {
+			return err
+		}
+		deleted = append(deleted, displayRoot+s)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	return files, nil
+
+	return deleted, nil
 }
 
 func renameUserFile(
@@ -514,8 +584,14 @@ func renameUserFile(
 // This method returns the complete userfile URI representation to which the
 // file is uploaded to.
 func uploadUserFile(
-	ctx context.Context, conn *sqlConn, reader io.Reader, source, destination string,
+	ctx context.Context, conn *sqlConn, source, destination string,
 ) (string, error) {
+	reader, err := openUserFile(source)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+
 	if err := conn.ensureConn(); err != nil {
 		return "", err
 	}

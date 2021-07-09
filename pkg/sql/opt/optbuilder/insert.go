@@ -653,7 +653,7 @@ func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
 	mb.disambiguateColumns()
 
 	// Add any check constraint boolean columns to the input.
-	mb.addCheckConstraintCols()
+	mb.addCheckConstraintCols(false /* isUpdate */)
 
 	// Project partial index PUT boolean columns.
 	mb.projectPartialIndexPutCols()
@@ -789,7 +789,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 			Type: whereClause.Type,
 			Expr: &tree.OrExpr{
 				Left: &tree.ComparisonExpr{
-					Operator: tree.IsNotDistinctFrom,
+					Operator: tree.MakeComparisonOperator(tree.IsNotDistinctFrom),
 					Left:     canaryCol,
 					Right:    tree.DNull,
 				},
@@ -865,7 +865,7 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 	mb.disambiguateColumns()
 
 	// Add any check constraint boolean columns to the input.
-	mb.addCheckConstraintCols()
+	mb.addCheckConstraintCols(false /* isUpdate */)
 
 	// Add the partial index predicate expressions to the table metadata.
 	// These expressions are used to prune fetch columns during

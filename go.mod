@@ -5,9 +5,8 @@ go 1.16
 require (
 	cloud.google.com/go/storage v1.10.0
 	github.com/Azure/azure-sdk-for-go v33.4.0+incompatible
-	github.com/Azure/azure-storage-blob-go v0.12.0
+	github.com/Azure/azure-storage-blob-go v0.14.0
 	github.com/Azure/go-autorest/autorest v0.11.1
-	github.com/Azure/go-autorest/autorest/adal v0.9.5 // indirect
 	github.com/Azure/go-autorest/autorest/azure/auth v0.4.2
 	github.com/Azure/go-autorest/autorest/to v0.3.0
 	github.com/Azure/go-autorest/autorest/validation v0.2.0 // indirect
@@ -26,7 +25,7 @@ require (
 	github.com/apache/arrow/go/arrow v0.0.0-20200610220642-670890229854
 	github.com/apache/thrift v0.0.0-20181211084444-2b7365c54f82 // indirect
 	github.com/armon/circbuf v0.0.0-20150827004946-bbbad097214e
-	github.com/aws/aws-sdk-go v1.36.33
+	github.com/aws/aws-sdk-go v1.38.69
 	github.com/axiomhq/hyperloglog v0.0.0-20181223111420-4b99d0c2c99e
 	github.com/bazelbuild/rules_go v0.26.0
 	github.com/biogo/store v0.0.0-20160505134755-913427a1d5e8
@@ -83,7 +82,6 @@ require (
 	github.com/google/go-cmp v0.5.5
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/google/pprof v0.0.0-20200708004538-1a94d8640e99
-	github.com/google/uuid v1.2.0 // indirect
 	github.com/gorhill/cronexpr v0.0.0-20140423231348-a557574d6c02
 	github.com/gorilla/mux v1.8.0
 	github.com/goware/modvendor v0.3.0

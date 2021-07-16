@@ -43,17 +43,17 @@ apt-get install --yes \
   pass \
   unzip
 
-curl -fsSL https://dl.google.com/go/go1.16.5.linux-amd64.tar.gz > /tmp/go.tgz
+curl -fsSL https://dl.google.com/go/go1.16.6.linux-amd64.tar.gz > /tmp/go.tgz
 sha256sum -c - <<EOF
-b12c23023b68de22f74c0524f10b753e7b08b1504cb7e417eccebdd3fae49061 /tmp/go.tgz
+be333ef18b3016e9d7cb7b1ff1fdb0cac800ca0be4cf2290fe613b3d069dfe0d /tmp/go.tgz
 EOF
 tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
 
 # Install the older version in parallel in order to run the acceptance test on older branches
 # TODO: Remove this when 21.1 is EOL
-curl -fsSL https://dl.google.com/go/go1.15.11.linux-amd64.tar.gz > /tmp/go_old.tgz
+curl -fsSL https://dl.google.com/go/go1.15.14.linux-amd64.tar.gz > /tmp/go_old.tgz
 sha256sum -c - <<EOF
-8825b72d74b14e82b54ba3697813772eb94add3abf70f021b6bdebe193ed01ec /tmp/go_old.tgz
+6f5410c113b803f437d7a1ee6f8f124100e536cc7361920f7e640fedf7add72d /tmp/go_old.tgz
 EOF
 mkdir -p /usr/local/go1.15
 tar -C /usr/local/go1.15 --strip-components=1 -zxf /tmp/go_old.tgz && rm /tmp/go_old.tgz

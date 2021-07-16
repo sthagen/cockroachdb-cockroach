@@ -79,55 +79,8 @@ func (l *localityList) Set(value string) error {
 	return nil
 }
 
-// type used to implement parsing a list of localities for the cockroach demo command.
-type demoLocalityList []roachpb.Locality
-
-// Type implements the pflag.Value interface.
-func (l *demoLocalityList) Type() string { return "demoLocalityList" }
-
-// String implements the pflag.Value interface.
-func (l *demoLocalityList) String() string {
-	s := ""
-	for _, loc := range []roachpb.Locality(*l) {
-		s += loc.String()
-	}
-	return s
-}
-
-// Set implements the pflag.Value interface.
-func (l *demoLocalityList) Set(value string) error {
-	*l = []roachpb.Locality{}
-	locs := strings.Split(value, ":")
-	for _, value := range locs {
-		parsedLoc := &roachpb.Locality{}
-		if err := parsedLoc.Set(value); err != nil {
-			return err
-		}
-		*l = append(*l, *parsedLoc)
-	}
-	return nil
-}
-
 // This file contains definitions for data types suitable for use by
 // the flag+pflag packages.
-
-// statementsValue is an implementation of pflag.Value that appends any
-// argument to a slice.
-type statementsValue []string
-
-// Type implements the pflag.Value interface.
-func (s *statementsValue) Type() string { return "statementsValue" }
-
-// String implements the pflag.Value interface.
-func (s *statementsValue) String() string {
-	return strings.Join(*s, ";")
-}
-
-// Set implements the pflag.Value interface.
-func (s *statementsValue) Set(value string) error {
-	*s = append(*s, value)
-	return nil
-}
 
 type dumpMode int
 
@@ -310,67 +263,6 @@ func (s *nodeDecommissionWaitType) Set(value string) error {
 	default:
 		return fmt.Errorf("invalid node decommission parameter: %s "+
 			"(possible values: all, none)", value)
-	}
-	return nil
-}
-
-type tableDisplayFormat int
-
-const (
-	tableDisplayTSV tableDisplayFormat = iota
-	tableDisplayCSV
-	tableDisplayTable
-	tableDisplayRecords
-	tableDisplaySQL
-	tableDisplayHTML
-	tableDisplayRaw
-	tableDisplayLastFormat
-)
-
-// Type implements the pflag.Value interface.
-func (f *tableDisplayFormat) Type() string { return "string" }
-
-// String implements the pflag.Value interface.
-func (f *tableDisplayFormat) String() string {
-	switch *f {
-	case tableDisplayTSV:
-		return "tsv"
-	case tableDisplayCSV:
-		return "csv"
-	case tableDisplayTable:
-		return "table"
-	case tableDisplayRecords:
-		return "records"
-	case tableDisplaySQL:
-		return "sql"
-	case tableDisplayHTML:
-		return "html"
-	case tableDisplayRaw:
-		return "raw"
-	}
-	return ""
-}
-
-// Set implements the pflag.Value interface.
-func (f *tableDisplayFormat) Set(s string) error {
-	switch s {
-	case "tsv":
-		*f = tableDisplayTSV
-	case "csv":
-		*f = tableDisplayCSV
-	case "table":
-		*f = tableDisplayTable
-	case "records":
-		*f = tableDisplayRecords
-	case "sql":
-		*f = tableDisplaySQL
-	case "html":
-		*f = tableDisplayHTML
-	case "raw":
-		*f = tableDisplayRaw
-	default:
-		return fmt.Errorf("invalid table display format: %s "+
-			"(possible values: tsv, csv, table, records, sql, html, raw)", s)
 	}
 	return nil
 }

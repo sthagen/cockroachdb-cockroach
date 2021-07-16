@@ -17,6 +17,7 @@ go_library(
         "server_config.go",
         "stats.go",
         "testutils.go",
+        "utils.go",
         "version.go",
         ":gen-consumerstatus-stringer",  # keep
         ":gen-procstate-stringer",  # keep
@@ -52,6 +53,7 @@ go_library(
         "//pkg/storage/cloud",
         "//pkg/storage/fs",
         "//pkg/util",
+        "//pkg/util/admission",
         "//pkg/util/log",
         "//pkg/util/log/logcrash",
         "//pkg/util/metric",

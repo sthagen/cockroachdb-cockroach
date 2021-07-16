@@ -64,6 +64,7 @@ go_library(
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
+        "//pkg/sql/memsize",
         "//pkg/sql/rowenc",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sqlerrors",
@@ -86,7 +87,7 @@ go_library(
 
 go_test(
     name = "colexec_test",
-    size = "medium",
+    size = "large",
     srcs = [
         "aggregators_test.go",
         "and_or_projection_test.go",
@@ -155,6 +156,7 @@ go_test(
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
+        "//pkg/sql/memsize",
         "//pkg/sql/parser",
         "//pkg/sql/randgen",
         "//pkg/sql/rowenc",

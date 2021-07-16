@@ -46,6 +46,7 @@ var buildTargetMapping = map[string]string{
 	"cockroach":        "//pkg/cmd/cockroach",
 	"cockroach-oss":    "//pkg/cmd/cockroach-oss",
 	"cockroach-short":  "//pkg/cmd/cockroach-short",
+	"dev":              "//pkg/cmd/dev",
 	"docgen":           "//pkg/cmd/docgen",
 	"execgen":          "//pkg/sql/colexec/execgen/cmd/execgen",
 	"optgen":           "//pkg/sql/opt/optgen/cmd/optgen",
@@ -53,6 +54,7 @@ var buildTargetMapping = map[string]string{
 	"langgen":          "//pkg/sql/opt/optgen/cmd/langgen",
 	"roachprod":        "//pkg/cmd/roachprod",
 	"roachprod-stress": "//pkg/cmd/roachprod-stress",
+	"short":            "//pkg/cmd/cockroach-short",
 	"workload":         "//pkg/cmd/workload",
 	"roachtest":        "//pkg/cmd/roachtest",
 }
@@ -71,17 +73,27 @@ func (d *dev) build(cmd *cobra.Command, targets []string) (err error) {
 	// Don't let bazel generate any convenience symlinks, we'll create them
 	// ourself.
 	args = append(args, "--experimental_convenience_symlinks=ignore")
+	args = append(args, getConfigFlags()...)
 	args = append(args, mustGetRemoteCacheArgs(remoteCacheAddr)...)
 	if numCPUs != 0 {
 		args = append(args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
 	}
 
+	var fullTargets []string
 	for _, target := range targets {
+		// Assume that targets beginning with `//` or containing `/`
+		// don't need to be munged.
+		if strings.HasPrefix(target, "//") || strings.Contains(target, "/") {
+			args = append(args, target)
+			fullTargets = append(fullTargets, target)
+			continue
+		}
 		buildTarget, ok := buildTargetMapping[target]
 		if !ok {
 			return errors.Newf("unrecognized target: %s", target)
 		}
 
+		fullTargets = append(fullTargets, buildTarget)
 		args = append(args, buildTarget)
 	}
 
@@ -89,7 +101,7 @@ func (d *dev) build(cmd *cobra.Command, targets []string) (err error) {
 		return err
 	}
 
-	return d.symlinkBinaries(ctx, targets)
+	return d.symlinkBinaries(ctx, fullTargets)
 }
 
 func (d *dev) symlinkBinaries(ctx context.Context, targets []string) error {
@@ -103,19 +115,19 @@ func (d *dev) symlinkBinaries(ctx context.Context, targets []string) error {
 	}
 
 	for _, target := range targets {
-		buildTarget := buildTargetMapping[target]
-		binaryPath, err := d.getPathToBin(ctx, buildTarget)
+		binaryPath, err := d.getPathToBin(ctx, target)
 		if err != nil {
 			return err
 		}
+		base := filepath.Base(strings.TrimPrefix(target, "//"))
 
 		var symlinkPath string
 		// Binaries beginning with the string "cockroach" go right at
 		// the top of the workspace; others go in the `bin` directory.
-		if strings.HasPrefix(target, "cockroach") {
-			symlinkPath = path.Join(workspace, target)
+		if strings.HasPrefix(base, "cockroach") {
+			symlinkPath = path.Join(workspace, base)
 		} else {
-			symlinkPath = path.Join(workspace, "bin", target)
+			symlinkPath = path.Join(workspace, "bin", base)
 		}
 
 		// Symlink from binaryPath -> symlinkPath
@@ -131,12 +143,26 @@ func (d *dev) symlinkBinaries(ctx context.Context, targets []string) error {
 }
 
 func (d *dev) getPathToBin(ctx context.Context, target string) (string, error) {
-	out, err := d.exec.CommandContextSilent(ctx, "bazel", "info", "bazel-bin", "--color=no")
+	args := []string{"info", "bazel-bin", "--color=no"}
+	args = append(args, getConfigFlags()...)
+	out, err := d.exec.CommandContextSilent(ctx, "bazel", args...)
 	if err != nil {
 		return "", err
 	}
 	bazelBin := strings.TrimSpace(string(out))
-	target = strings.TrimPrefix(target, "//")
-	_, filename := filepath.Split(target)
-	return filepath.Join(bazelBin, target, filename+"_", filename), nil
+	var head string
+	if strings.HasPrefix(target, "@") {
+		doubleSlash := strings.Index(target, "//")
+		head = filepath.Join("external", target[1:doubleSlash])
+	} else {
+		head = strings.TrimPrefix(target, "//")
+	}
+	var bin string
+	colon := strings.Index(target, ":")
+	if colon >= 0 {
+		bin = target[colon+1:]
+	} else {
+		bin = target[strings.LastIndex(target, "/")+1:]
+	}
+	return filepath.Join(bazelBin, head, bin+"_", bin), nil
 }

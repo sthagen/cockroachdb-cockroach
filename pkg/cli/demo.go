@@ -16,11 +16,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
+	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/errors"
@@ -51,7 +52,7 @@ environment variable "COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING" to true.
 }
 
 func init() {
-	demoCmd.RunE = MaybeDecorateGRPCError(func(cmd *cobra.Command, _ []string) error {
+	demoCmd.RunE = clierrorplus.MaybeDecorateError(func(cmd *cobra.Command, _ []string) error {
 		return runDemo(cmd, nil /* gen */)
 	})
 }
@@ -88,7 +89,7 @@ func init() {
 			Use:   meta.Name,
 			Short: meta.Description,
 			Args:  cobra.ArbitraryArgs,
-			RunE: MaybeDecorateGRPCError(func(cmd *cobra.Command, _ []string) error {
+			RunE: clierrorplus.MaybeDecorateError(func(cmd *cobra.Command, _ []string) error {
 				return runDemo(cmd, gen)
 			}),
 		}
@@ -215,6 +216,9 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	demoCtx.WorkloadGenerator = gen
 
 	c, err := democluster.NewDemoCluster(ctx, &demoCtx,
+		log.Infof,
+		log.Warningf,
+		log.Ops.Shoutf,
 		func(ctx context.Context) (*stop.Stopper, error) {
 			// Override the default server store spec.
 			//
@@ -235,7 +239,7 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	initGEOS(ctx)
 
 	if err := c.Start(ctx, runInitialSQL); err != nil {
-		return clierror.CheckAndMaybeShout(err)
+		return clierrorplus.CheckAndMaybeShout(err)
 	}
 	sqlCtx.ShellCtx.DemoCluster = c
 
@@ -273,12 +277,12 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	// Start license acquisition in the background.
 	licenseDone, err := c.AcquireDemoLicense(ctx)
 	if err != nil {
-		return clierror.CheckAndMaybeShout(err)
+		return clierrorplus.CheckAndMaybeShout(err)
 	}
 
 	// Initialize the workload, if requested.
 	if err := c.SetupWorkload(ctx, licenseDone); err != nil {
-		return clierror.CheckAndMaybeShout(err)
+		return clierrorplus.CheckAndMaybeShout(err)
 	}
 
 	if cliCtx.IsInteractive {
@@ -321,7 +325,7 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 		// then the error return is guaranteed to be nil.
 		go func() {
 			if err := waitForLicense(licenseDone); err != nil {
-				_ = clierror.CheckAndMaybeShout(err)
+				_ = clierrorplus.CheckAndMaybeShout(err)
 			}
 		}()
 	} else {
@@ -329,7 +333,7 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 		// that license acquisition is successful. If license acquisition is
 		// disabled, then a read on this channel will return immediately.
 		if err := waitForLicense(licenseDone); err != nil {
-			return clierror.CheckAndMaybeShout(err)
+			return clierrorplus.CheckAndMaybeShout(err)
 		}
 	}
 
@@ -339,6 +343,7 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
+	sqlCtx.ShellCtx.ParseURL = makeURLParser(cmd)
 	return sqlCtx.Run(conn)
 }
 

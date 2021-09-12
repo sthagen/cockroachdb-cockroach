@@ -73,24 +73,23 @@ func newUnloadedReplica(
 		store:          store,
 		abortSpan:      abortspan.New(desc.RangeID),
 		concMgr: concurrency.NewManager(concurrency.Config{
-			NodeDesc:                           store.nodeDesc,
-			RangeDesc:                          desc,
-			Settings:                           store.ClusterSettings(),
-			DB:                                 store.DB(),
-			Clock:                              store.Clock(),
-			Stopper:                            store.Stopper(),
-			IntentResolver:                     store.intentResolver,
-			TxnWaitMetrics:                     store.txnWaitMetrics,
-			SlowLatchGauge:                     store.metrics.SlowLatchRequests,
-			ConflictingIntentCleanupRejections: store.metrics.ConflictingIntentsResolveRejected,
-			DisableTxnPushing:                  store.TestingKnobs().DontPushOnWriteIntentError,
-			TxnWaitKnobs:                       store.TestingKnobs().TxnWaitKnobs,
+			NodeDesc:          store.nodeDesc,
+			RangeDesc:         desc,
+			Settings:          store.ClusterSettings(),
+			DB:                store.DB(),
+			Clock:             store.Clock(),
+			Stopper:           store.Stopper(),
+			IntentResolver:    store.intentResolver,
+			TxnWaitMetrics:    store.txnWaitMetrics,
+			SlowLatchGauge:    store.metrics.SlowLatchRequests,
+			DisableTxnPushing: store.TestingKnobs().DontPushOnWriteIntentError,
+			TxnWaitKnobs:      store.TestingKnobs().TxnWaitKnobs,
 		}),
 	}
 	r.mu.pendingLeaseRequest = makePendingLeaseRequest(r)
 	r.mu.stateLoader = stateloader.Make(desc.RangeID)
 	r.mu.quiescent = true
-	r.mu.zone = store.cfg.DefaultZoneConfig
+	r.mu.conf = store.cfg.DefaultSpanConfig
 	r.mu.replicaID = replicaID
 	split.Init(&r.loadBasedSplitter, rand.Intn, func() float64 {
 		return float64(SplitByLoadQPSThreshold.Get(&store.cfg.Settings.SV))

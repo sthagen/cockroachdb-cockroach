@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -46,9 +46,9 @@ func TestDeleteOldStatsForColumns(t *testing.T) {
 		db,
 		ex,
 		keys.SystemSQLCodec,
-		s.LeaseManager().(*lease.Manager),
 		s.ClusterSettings(),
 		s.RangeFeedFactory().(*rangefeed.Factory),
+		s.CollectionFactory().(*descs.CollectionFactory),
 	)
 
 	// The test data must be ordered by CreatedAt DESC so the calculated set of
@@ -273,7 +273,7 @@ func TestDeleteOldStatsForColumns(t *testing.T) {
 		}
 
 		return testutils.SucceedsSoonError(func() error {
-			tableStats, err := cache.GetTableStats(ctx, tableID)
+			tableStats, err := cache.getTableStatsFromCache(ctx, tableID)
 			if err != nil {
 				return err
 			}
@@ -281,7 +281,7 @@ func TestDeleteOldStatsForColumns(t *testing.T) {
 			for i := range testData {
 				stat := &testData[i]
 				if stat.TableID != tableID {
-					stats, err := cache.GetTableStats(ctx, stat.TableID)
+					stats, err := cache.getTableStatsFromCache(ctx, stat.TableID)
 					if err != nil {
 						return err
 					}

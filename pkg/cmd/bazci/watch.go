@@ -12,7 +12,9 @@ package main
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"os"
@@ -20,6 +22,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	bazelutil "github.com/cockroachdb/cockroach/pkg/build/util"
+	"github.com/cockroachdb/errors"
 )
 
 // SourceDir is an enumeration of possible output locations.
@@ -99,8 +104,9 @@ func (w watcher) Watch() error {
 			// Note that even if the build failed, we still want to
 			// try to stage test artifacts.
 			testErr := w.stageTestArtifacts(finalizePhase)
-			// Also stage binary artifacts this time.
+			// Also stage binary and tmpdir artifacts this time.
 			binErr := w.stageBinaryArtifacts()
+			tmpErr := w.stageTmpDir()
 			// Only check errors after we're done staging all
 			// artifacts -- we don't want to miss anything because
 			// the build failed.
@@ -112,6 +118,9 @@ func (w watcher) Watch() error {
 			}
 			if binErr != nil {
 				return binErr
+			}
+			if tmpErr != nil {
+				return tmpErr
 			}
 			return nil
 		case <-time.After(10 * time.Second):
@@ -142,7 +151,7 @@ func (w watcher) stageTestArtifacts(phase Phase) error {
 			{path.Join(relDir, "test.xml"), mungeTestXML},
 			{path.Join(relDir, "*", "test.xml"), mungeTestXML},
 		} {
-			err := w.maybeStageArtifact(testlogsSourceDir, tup.relPath, 0666, phase,
+			err := w.maybeStageArtifact(testlogsSourceDir, tup.relPath, 0644, phase,
 				tup.stagefn)
 			if err != nil {
 				return err
@@ -200,10 +209,53 @@ func (w watcher) stageBinaryArtifacts() error {
 		if usingCrossWindowsConfig() {
 			relBinPath = relBinPath + ".exe"
 		}
-		err := w.maybeStageArtifact(binSourceDir, relBinPath, 0777, finalizePhase,
+		err := w.maybeStageArtifact(binSourceDir, relBinPath, 0755, finalizePhase,
 			copyContentTo)
 		if err != nil {
 			return err
+		}
+	}
+	for _, bin := range w.info.genruleTargets {
+		// Ask Bazel to list all the outputs of the genrule.
+		query, err := runBazelReturningStdout("query", "--output=xml", bin)
+		if err != nil {
+			return err
+		}
+		outs, err := bazelutil.OutputsOfGenrule(bin, query)
+		if err != nil {
+			return err
+		}
+		for _, relBinPath := range outs {
+			err := w.maybeStageArtifact(binSourceDir, relBinPath, 0644, finalizePhase, copyContentTo)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	for _, bin := range w.info.cmakeTargets {
+		// These targets don't have stable, predictable locations, so
+		// they have to be hardcoded.
+		var ext string
+		if usingCrossWindowsConfig() {
+			ext = "dll"
+		} else if usingCrossDarwinConfig() {
+			ext = "dylib"
+		} else {
+			ext = "so"
+		}
+		switch bin {
+		case "//c-deps:libgeos":
+			for _, relBinPath := range []string{
+				fmt.Sprintf("c-deps/libgeos/lib/libgeos_c.%s", ext),
+				fmt.Sprintf("c-deps/libgeos/lib/libgeos.%s", ext),
+			} {
+				err := w.maybeStageArtifact(binSourceDir, relBinPath, 0644, finalizePhase, copyContentTo)
+				if err != nil {
+					return err
+				}
+			}
+		default:
+			return errors.Newf("Unrecognized cmake target %s", bin)
 		}
 	}
 	return nil
@@ -217,8 +269,10 @@ func copyContentTo(srcContent []byte, outFile io.Writer) error {
 }
 
 // mungeTestXML parses and slightly munges the XML in the source file and writes
-// it to the output file. Helper function meant to be used with
-// maybeStageArtifact.
+// it to the output file. TeamCity kind of knows how to interpret the schema,
+// but the schema isn't *exactly* what it's expecting. By munging the XML's
+// here we ensure that the TC test view is as useful as possible.
+// Helper function meant to be used with maybeStageArtifact.
 func mungeTestXML(srcContent []byte, outFile io.Writer) error {
 	// Parse the XML into a testSuites struct.
 	suites := testSuites{}
@@ -272,7 +326,7 @@ func (w *cancelableWriter) Write(p []byte) (n int, err error) {
 
 func (w *cancelableWriter) Close() error {
 	if !w.Canceled {
-		err := os.MkdirAll(path.Dir(w.filename), 0777)
+		err := os.MkdirAll(path.Dir(w.filename), 0755)
 		if err != nil {
 			return err
 		}
@@ -318,7 +372,7 @@ func (w *cancelableWriter) Close() error {
 //
 // For example, one might stage a set of log files with a call like:
 // w.maybeStageArtifact(testlogsSourceDir, "pkg/server/server_test/*/test.log",
-//                      0666, incrementalUpdatePhase, copycontentTo)
+//                      0644, incrementalUpdatePhase, copycontentTo)
 func (w watcher) maybeStageArtifact(
 	root SourceDir,
 	pattern string,
@@ -418,4 +472,45 @@ func (w watcher) maybeStageArtifact(
 		}
 	}
 	return nil
+}
+
+// stageTmpDir stages the contents of the tmpDir to $artifactsDir/tmp. As with
+// binary artifacts, we only ever stage them during the finalize phase.
+func (w watcher) stageTmpDir() error {
+	if len(w.info.tests) == 0 {
+		return nil
+	}
+	return filepath.WalkDir(tmpDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("WARNING: failing to stage tmpdir artifact at %s due to error %v", path, err)
+			return nil
+		}
+		if d.IsDir() {
+			if filepath.Base(path) == ".gocache" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		src, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		relPath, err := filepath.Rel(tmpDir, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(artifactsDir, "tmp", relPath)
+		err = os.MkdirAll(filepath.Dir(dstPath), 0755)
+		if err != nil {
+			return err
+		}
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			return err
+		}
+		defer dst.Close()
+		_, err = io.Copy(dst, src)
+		return err
+	})
 }

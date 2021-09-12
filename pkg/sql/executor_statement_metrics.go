@@ -48,6 +48,10 @@ type EngineMetrics struct {
 
 	// FullTableOrIndexScanCount counts the number of full table or index scans.
 	FullTableOrIndexScanCount *metric.Counter
+
+	// FullTableOrIndexScanRejectedCount counts the number of queries that were
+	// rejected because of the `disallow_full_table_scans` guardrail.
+	FullTableOrIndexScanRejectedCount *metric.Counter
 }
 
 // EngineMetrics implements the metric.Struct interface.
@@ -65,6 +69,11 @@ type StatsMetrics struct {
 	ReportedSQLStatsMemoryCurBytesCount *metric.Gauge
 
 	DiscardedStatsCount *metric.Counter
+
+	SQLStatsFlushStarted  *metric.Counter
+	SQLStatsFlushFailure  *metric.Counter
+	SQLStatsFlushDuration *metric.Histogram
+	SQLStatsRemovedRows   *metric.Counter
 }
 
 // StatsMetrics is part of the metric.Struct interface.
@@ -72,6 +81,20 @@ var _ metric.Struct = StatsMetrics{}
 
 // MetricStruct is part of the metric.Struct interface.
 func (StatsMetrics) MetricStruct() {}
+
+// GuardrailMetrics groups metrics related to different guardrails in the SQL
+// layer.
+type GuardrailMetrics struct {
+	TxnRowsWrittenLogCount *metric.Counter
+	TxnRowsWrittenErrCount *metric.Counter
+	TxnRowsReadLogCount    *metric.Counter
+	TxnRowsReadErrCount    *metric.Counter
+}
+
+var _ metric.Struct = GuardrailMetrics{}
+
+// MetricStruct is part of the metric.Struct interface.
+func (GuardrailMetrics) MetricStruct() {}
 
 // recordStatementSummery gathers various details pertaining to the
 // last executed statement/query and performs the associated
@@ -128,7 +151,7 @@ func (ex *connExecutor) recordStatementSummary(
 	}
 
 	recordedStmtStatsKey := roachpb.StatementStatisticsKey{
-		Query:       stmt.AnonymizedStr,
+		Query:       stmt.StmtNoConstants,
 		DistSQL:     flags.IsDistributed(),
 		Vec:         flags.IsSet(planFlagVectorized),
 		ImplicitTxn: flags.IsSet(planFlagImplicitTxn),

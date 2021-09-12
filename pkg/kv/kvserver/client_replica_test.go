@@ -1534,7 +1534,13 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 func getLeaseInfo(
 	ctx context.Context, db *kv.DB, key roachpb.Key,
 ) (*roachpb.LeaseInfoResponse, error) {
-	header := roachpb.Header{ReadConsistency: roachpb.INCONSISTENT}
+	header := roachpb.Header{
+		// INCONSISTENT read with a NEAREST routing policy, since we want to make
+		// sure that the node used to send this is the one that processes the
+		// command, regardless of whether it is the leaseholder.
+		ReadConsistency: roachpb.INCONSISTENT,
+		RoutingPolicy:   roachpb.RoutingPolicy_NEAREST,
+	}
 	leaseInfoReq := &roachpb.LeaseInfoRequest{RequestHeader: roachpb.RequestHeader{Key: key}}
 	reply, pErr := kv.SendWrappedWith(ctx, db.NonTransactionalSender(), header, leaseInfoReq)
 	if pErr != nil {
@@ -3174,7 +3180,7 @@ func TestStrictGCEnforcement(t *testing.T) {
 		}
 		mkStaleTxn = func() *kv.Txn {
 			txn := db.NewTxn(ctx, "foo")
-			txn.SetFixedTimestamp(ctx, tenSecondsAgo)
+			require.NoError(t, txn.SetFixedTimestamp(ctx, tenSecondsAgo))
 			return txn
 		}
 		getRejectedMsg = func() string {
@@ -3217,12 +3223,12 @@ func TestStrictGCEnforcement(t *testing.T) {
 				for i := 0; i < tc.NumServers(); i++ {
 					s := tc.Server(i)
 					_, r := getFirstStoreReplica(t, s, tableKey)
-					if _, z := r.DescAndZone(); z.GC.TTLSeconds != int32(exp) {
+					if c := r.SpanConfig(); c.TTL().Seconds() != (time.Duration(exp) * time.Second).Seconds() {
 						_, sysCfg := getFirstStoreReplica(t, tc.Server(i), keys.SystemConfigSpan.Key)
 						sysCfg.RaftLock()
 						require.NoError(t, sysCfg.MaybeGossipSystemConfigRaftMuLocked(ctx))
 						sysCfg.RaftUnlock()
-						return errors.Errorf("expected %d, got %d", exp, z.GC.TTLSeconds)
+						return errors.Errorf("expected %d, got %d", exp, c.TTL().Seconds())
 					}
 				}
 				return nil

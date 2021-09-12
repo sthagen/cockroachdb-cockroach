@@ -129,7 +129,9 @@ func fetchSpansForTargets(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) error {
 		spans = nil
-		txn.SetFixedTimestamp(ctx, ts)
+		if err := txn.SetFixedTimestamp(ctx, ts); err != nil {
+			return err
+		}
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range targets {
 			flags := tree.ObjectLookupFlagsWithRequired()
@@ -142,9 +144,8 @@ func fetchSpansForTargets(
 		}
 		return nil
 	}
-	err := descs.Txn(
-		ctx, execCfg.Settings, execCfg.LeaseManager, execCfg.InternalExecutor,
-		execCfg.DB, fetchSpans,
-	)
-	return spans, err
+	if err := sql.DescsTxn(ctx, execCfg, fetchSpans); err != nil {
+		return nil, err
+	}
+	return spans, nil
 }

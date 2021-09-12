@@ -164,9 +164,11 @@ func (ts *txnState) resetForNewSQLTxn(
 
 	var txnCtx context.Context
 	var sp *tracing.Span
-	if alreadyRecording || ts.testingForceRealTracingSpans {
+	duration := traceTxnThreshold.Get(&tranCtx.settings.SV)
+	if alreadyRecording || ts.testingForceRealTracingSpans || duration > 0 {
 		// WithForceRealSpan is used to support the use of session tracing,
-		// which will start recording on this span.
+		// which will start recording on this span. Similarly, it enables the
+		// tracing of the txns that exceed the duration threshold.
 		txnCtx, sp = createRootOrChildSpan(connCtx, opName, tranCtx.tracer, tracing.WithForceRealSpan())
 	} else {
 		txnCtx, sp = createRootOrChildSpan(connCtx, opName, tranCtx.tracer)
@@ -175,7 +177,6 @@ func (ts *txnState) resetForNewSQLTxn(
 		sp.SetTag("implicit", "true")
 	}
 
-	duration := traceTxnThreshold.Get(&tranCtx.settings.SV)
 	if !alreadyRecording && (duration > 0) {
 		sp.SetVerbose(true)
 		ts.recordingThreshold = duration
@@ -201,7 +202,9 @@ func (ts *txnState) resetForNewSQLTxn(
 	ts.mu.txnStart = timeutil.Now()
 	ts.mu.Unlock()
 	if historicalTimestamp != nil {
-		ts.setHistoricalTimestamp(ts.Ctx, *historicalTimestamp)
+		if err := ts.setHistoricalTimestamp(ts.Ctx, *historicalTimestamp); err != nil {
+			panic(err)
+		}
 	}
 	if err := ts.setReadOnlyMode(readOnly); err != nil {
 		panic(err)
@@ -261,11 +264,16 @@ func (ts *txnState) finishExternalTxn() {
 	ts.mu.Unlock()
 }
 
-func (ts *txnState) setHistoricalTimestamp(ctx context.Context, historicalTimestamp hlc.Timestamp) {
+func (ts *txnState) setHistoricalTimestamp(
+	ctx context.Context, historicalTimestamp hlc.Timestamp,
+) error {
 	ts.mu.Lock()
-	ts.mu.txn.SetFixedTimestamp(ctx, historicalTimestamp)
-	ts.mu.Unlock()
+	defer ts.mu.Unlock()
+	if err := ts.mu.txn.SetFixedTimestamp(ctx, historicalTimestamp); err != nil {
+		return err
+	}
 	ts.isHistorical = true
+	return nil
 }
 
 // getReadTimestamp returns the transaction's current read timestamp.

@@ -59,7 +59,7 @@ regions: <hidden>
   table: a@primary
   spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyMkMFO8zAQhO__U1hz9i8SDhx8qkBFqgoUtRUXlIMbr4ql1A7ejaCK8li8AE-GErcHhJA4zjfeWe_04NcGBpv53fxmq6y6Xa_ulYVGiI4e7IEY5hklKo02xZqYYxpRPz1YuHeYQsOHtpMRVxp1TATTQ7w0BIOt3TW0JusoXRTQcCTWN1OsnbXJH2w6QmPT2sBG_YfGqhOjZiU0lk9K_IGMKj4_OOs6BqEgPoYfVopvrBJZZ9SlLopTwO4odMbllVr6a2jsrNQvxCp20o7bxo9N42eQA6pBI5PTcSx2TzDloP9ewJq4jYHp2-2_JRdDpUFuT7lkjl2q6THFelqT5Wqam4AjluyWWSxCtoZq-PcVAAD__yPumVo=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyMkcFqKjEUhvf3KQ5ndS_kYqaLLrKSigWx1qLipswiJgcbOpNMkzNUkXmsvkCfrMxEF6UIXZ7v_Pnz588J01uFCtfTh-lkAxruV8sFaBTog6VHXVNC9YwFlgKbGAylFGKPToNgZg-opEDnm5Z7XAo0IRKqE7LjilDhRu8qWpG2FEcSBVpi7arBVo-b6Godjyhw3WifFPxHgcuWFYwLFDjfAruaFMjPj5RnEzyTZxf8j1UM7wkiaavgRkh5NtgdmS64uIW5u0OBi-1kAompARNaz_CXDjxynv8pkEPKLCB6vSao9QFqqkM8gq6qYDSTVSChd99pNi-UILTc9G_p9UO4C8jxyk5gJufqEus9oSo68ft6V5Sa4BN9a_aas-xKgWT3lL8whTYaeorBDNfkcTmcG4ClxHlb5GHm86oruz9fAQAA__-9SrYw
 
 query T
 EXPLAIN ANALYZE (DISTSQL) SELECT c.a FROM c JOIN d ON d.b = c.b
@@ -96,7 +96,7 @@ regions: <hidden>
       table: c@sec
       spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJykkl-L00AUxd_9FJfzPNamDyIDQlFW6Lo20l18kTxMZi5rNJ0bZya4S-nH8gv4ySQzWbAWxT-P59ycufd3yAHxcw-N64uri5c3ZBeGXu3qN2Tpst5syVG9Jbdo6TnZRQsFL463Zs8R-j0qNApDEMsxSpisQ_5g4-6glwqdH8Y02Y2ClcDQB6Qu9QyNG9P2vGPjODxZQsFxMl2fn7XryBYK14PxUdNjKNRj0rSu1HoFhdfvKHV71rT89jUWbcUn9qkTfzYK8iVSYOM0zeH2PvGDVT2lF1BoTbIfOJKMaZhWTRfl4IOxQnNUKGomisncMnR1VH9OfSmdn6GrU2i3HkK3N-EeClcin8aBPkrnSbymTD1XgHlB5ipIRcdk-v6M_t-Kqs6LepZ74ju243n6P-pb_U19O46D-Mgn1f3q5eWxUWB3y-XHjDIGy2-D2LymyDrnsuE4pjKtitj4MpoO_DFc_Ta8-incHB99DwAA__8TeBlu
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysk99q20wQxe-_pxjm6itsHckXpSwUTE0KThO7OCE3RRer3SFVI-2ouyNqY_xYfYE-WdGuAk1NSv9dztk5M6PfQQeMn1rUeH1-eb68ATsz8Ga7uQILF5vVGhxs1uBmNbwCO6tRoWdHa9NRRP0eS6wU9oEtxchhlA6pYeV2qAuFje8HGeVKoeVAqA8ojbSEGm9M3dKWjKNwVqBCR2KaNo21i0gWFV73xkcNz1HhZhANi1It5qjw7S1I05GG4uuXmGvLXshLw_7kKfDnCIGM0zCZ673Qg1S-gNeo8Op2uYQo1IPlwQv8Tzs5a7w801Ck83ID0f1TDZ3ZQUcdhz2YtmVrhJyGIk2vjdgPFIEH6ccPGfvTWQ_CHKujwlxNvKKYO0JdHtWvM73gxk9Iy8dI3aIPTWfCHhVeMt8PPXzkxgN7DYnpBBinBYlaBpbrKKZtT9j-WQzlaQwv_1EKtCM7nO7_iwDmvxPAlmLPPtIj-E9NLo6VQnJ3lH-cyEOw9C6wTWtyuUm-JDiKkl_LXKx8fhoP_N5c_tQ8_8FcHf_7FgAA__-oKkn2
 
 query T
 EXPLAIN (OPT, VERBOSE) SELECT c.a FROM c INNER MERGE JOIN d ON c.a = d.b
@@ -104,7 +104,7 @@ EXPLAIN (OPT, VERBOSE) SELECT c.a FROM c INNER MERGE JOIN d ON c.a = d.b
 project
  ├── columns: a:1
  ├── stats: [rows=10]
- ├── cost: 1122.17
+ ├── cost: 1120.82
  ├── prune: (1)
  └── inner-join (merge)
       ├── columns: c.a:1 d.b:8
@@ -112,12 +112,12 @@ project
       ├── left ordering: +1
       ├── right ordering: +8
       ├── stats: [rows=10, distinct(1)=1, null(1)=0, distinct(8)=1, null(8)=0]
-      ├── cost: 1122.06
+      ├── cost: 1120.7
       ├── fd: (1)==(8), (8)==(1)
       ├── sort
       │    ├── columns: c.a:1
       │    ├── stats: [rows=1, distinct(1)=1, null(1)=0]
-      │    ├── cost: 26.73
+      │    ├── cost: 25.95
       │    ├── ordering: +1
       │    ├── prune: (1)
       │    ├── interesting orderings: (+1)
@@ -125,14 +125,14 @@ project
       │    └── scan c@sec
       │         ├── columns: c.a:1
       │         ├── stats: [rows=1, distinct(1)=1, null(1)=0]
-      │         ├── cost: 26.69
+      │         ├── cost: 25.9
       │         ├── prune: (1)
       │         ├── interesting orderings: (+1)
       │         └── unfiltered-cols: (1-6)
       ├── scan d
       │    ├── columns: d.b:8
       │    ├── stats: [rows=1000, distinct(8)=100, null(8)=0]
-      │    ├── cost: 1085.21
+      │    ├── cost: 1084.62
       │    ├── ordering: +8
       │    ├── prune: (8)
       │    ├── interesting orderings: (+8)
@@ -188,7 +188,7 @@ regions: <hidden>
       table: d@primary
       spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMk8GO0zAQhu88xWhOoDW7dbriYGmlChRQF5qgdMUF5eDaQzYisbO2I1pVfSxegCdDSajYdMtCxWVvmX_mt-ebcbbo7yoUuIw_xG9uQJ1LeJulC1AwT5I4g0WcvYvhOp0noCFN-oIr0OcrZGispkTW5FF8Ro45w8ZZRd5b10nbvmCu1ygmDEvTtKGTc4bKOkKxxVCGilDgjVxVlJHU5C4myFBTkGXVH6tmnhQyXDbSeAEvkWHaBgEzjgzff4JQ1iRg8uO7H2JlTSATSmsepJz95sGR1AKiQVltAu0l_gpeI8OVDOqWPNg2NN09XTu9cS9EmO8YDtEvHB9kQSj4jv078tK6QO6Cj2ln_AwZ0ppU-xChlmuoqbZuA7KqrJKBtIBJ33aX83cVBKob0KX_Cq2XBe3T_0EVnUJ1f5HRGE3PGlfW0m2OLTN6csuc_hH7N21rrNPkSI9I8875t5Ijs1uQK-jalobcxXQ8u4q-hOczfvbiypXF7fA5-hGe1Iu5POXFZOQbazwdjvDoyZNubqQLGvbgbesUfXRW9dcMYdr7ekGTD0OWD8HcDKmuwftm_qh5OjLzQ3N0gjk6NE8fNV8etJ3vnv0MAAD__xmY2Xc=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzkU8Fq20AQvfcrhjklZBtLcuhhIWAa3OK0tosdcik-rHenioi0q-yOqI3xZ_UH-mVFUkMjx3Fr6KHQm-bNe6OZN7MbDA85SpwPPw6vbkCfK3g3m45Bw2gyGc5gPJy9H8L1dDQBA9NJQ7gEc75EgdYZmqiCAsrPGONCYOmdphCcr6FNQxiZFcpIYGbLimt4IVA7Tyg3yBnnhBJv1DKnGSlDvhehQEOssrwpqweBNAqcl8oGCa9R4LRiCYMYBX64Bc4KkhB9_xbaWDvLZDlz9lnKu68BPCkjIWmR5ZrpEYrfwFsUOL69uoLAVIJ2lWU4oRX3MsunEqKmt5ZAdP8SoVArKKhwfg0qz51WTEZC1FRfKtZ3FMBVXNZT1PymrUcgwcVWYBv9NCuwSgllvBV_bujceSbfi7teDuIzFEgr0tVzgw61XefCQw5MRQkmC_dQBZXSX5gqOWaqp2eSdEczg9JnhfLrfaeS_Gen0n_R1F9eVtZ5Q55Mx8dFrfwdZc9mxuRTunaZJd_rdzeT0xc-GcRnp5c-S-_az84j_qfu8eKYe5xRKJ0NtGvh3spR7RuZlNo9BFd5TZ-8081v2nDa6BrAUOA2G7fByLapusGn4viguN8Rx7vi5AhxsivuHxRf7LS92L76EQAA__8gyhMy
 
 statement ok
 RESET vectorize; RESET distsql
@@ -215,13 +215,20 @@ SELECT * FROM tpar
 statement ok
 SET tracing = on; SELECT * FROM tpar WHERE a = 0 OR a = 10; SET tracing = off
 
-# The span "sending partial batch" means that the scan was parallelized.
-# Note that table ID here is hardcoded, so if a new table is created before
-# tpar, this query will need an adjustment.
+# The span "sending partial batch" means that the scan was parallelized. We're
+# seeing duplicate "querying next range" entries because we first use the range
+# cache to try to partition the spans in order to have parallel TableReaders (we
+# end up with a single partition though), and then we have a single TableReader
+# performing the scan of two spans in parallel.
 query T
-SELECT message FROM [SHOW TRACE FOR SESSION] WHERE message LIKE 'querying next range at %'
+SELECT message FROM [SHOW TRACE FOR SESSION]
+WHERE message LIKE 'querying next range at %' OR
+      message = '=== SPAN START: kv.DistSender: sending partial batch ==='
 ----
 querying next range at /Table/56/1/0/0
+querying next range at /Table/56/1/10/0
+querying next range at /Table/56/1/0/0
+=== SPAN START: kv.DistSender: sending partial batch ===
 querying next range at /Table/56/1/10/0
 
 # Regression test for #46123 (rowexec.TableReader not implementing
@@ -261,7 +268,7 @@ EXPLAIN (VEC) SELECT stddev((t46404_1.c0 > ANY (0, 0))::INT) FROM t46404_0, t464
 │
 └ Node 1
   └ *colexec.hashAggregator
-    └ *colexecbase.castBoolInt64Op
+    └ *colexecbase.castBoolIntOp
       └ *colexecproj.defaultCmpRConstProjOp
         └ *colexecjoin.crossJoiner
           ├ *colfetcher.ColBatchScan
@@ -311,13 +318,13 @@ EXPLAIN (VEC) SELECT _int2 * _int2 FROM ints WHERE _int4 + _int4 = _int8 + 2
 │
 └ Node 1
   └ *colexecproj.projMultInt64Int64Op
-    └ *colexecbase.castInt16Int64Op
-      └ *colexecbase.castInt16Int64Op
+    └ *colexecbase.castInt2IntOp
+      └ *colexecbase.castInt2IntOp
         └ *colexecsel.selEQInt64Int64Op
           └ *colexecproj.projPlusInt64Int64ConstOp
             └ *colexecproj.projPlusInt64Int64Op
-              └ *colexecbase.castInt32Int64Op
-                └ *colexecbase.castInt32Int64Op
+              └ *colexecbase.castInt4IntOp
+                └ *colexecbase.castInt4IntOp
                   └ *colfetcher.ColBatchScan
 
 query I
@@ -403,3 +410,21 @@ EXPLAIN (VEC) INSERT INTO t66568 VALUES (1) ON CONFLICT DO NOTHING
     └ *colexecjoin.crossJoiner
       ├ *sql.planNodeToRowSource
       └ *colfetcher.ColBatchScan
+
+statement ok
+CREATE TABLE t_string (a STRING);
+INSERT INTO t_string VALUES (NULL)
+
+# Check that IN expression with non-constant right-hand side is handled via the
+# default comparison operator.
+query T
+EXPLAIN (VEC) SELECT 'b' IN ('b', a, 'a') FROM t_string
+----
+│
+└ Node 1
+  └ *colexecproj.defaultCmpProjOp
+    └ *colexec.tupleProjOp
+      └ *colexecbase.constBytesOp
+        └ *colexecbase.constBytesOp
+          └ *colexecbase.constBytesOp
+            └ *colfetcher.ColBatchScan

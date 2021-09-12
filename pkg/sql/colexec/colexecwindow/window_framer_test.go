@@ -13,7 +13,6 @@ package colexecwindow
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/rand"
 	"sort"
 	"testing"
@@ -29,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
@@ -64,12 +62,15 @@ func TestWindowFramer(t *testing.T) {
 	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
 	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
 
+	var memLimits = []int64{1, 1 << 10, 1 << 20}
+
 	testCfg := &testConfig{
 		rng:       rng,
 		evalCtx:   evalCtx,
 		factory:   factory,
 		allocator: allocator,
 		queueCfg:  queueCfg,
+		memLimit:  memLimits[rng.Intn(len(memLimits))],
 	}
 
 	const randTypeProbability = 0.5
@@ -152,6 +153,7 @@ type testConfig struct {
 	startBound tree.WindowFrameBoundType
 	endBound   tree.WindowFrameBoundType
 	exclusion  tree.WindowFrameExclusion
+	memLimit   int64
 }
 
 func testWindowFramer(t *testing.T, testCfg *testConfig) {
@@ -283,7 +285,7 @@ func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.Spilli
 	sort.Sort(datums)
 
 	partition := colexecutils.NewSpillingBuffer(
-		testCfg.allocator, math.MaxInt64, testCfg.queueCfg,
+		testCfg.allocator, testCfg.memLimit, testCfg.queueCfg,
 		colexecop.NewTestingSemaphore(2), []*types.T{testCfg.typ, types.Bool}, testDiskAcc,
 	)
 	insertBatch := testCfg.allocator.NewMemBatchWithFixedCapacity(
@@ -333,10 +335,10 @@ func initWindowFramers(
 ) (windowFramer, *tree.WindowFrameRun, *colexecutils.SpillingBuffer) {
 	offsetType := types.Int
 	if testCfg.mode == tree.RANGE {
-		offsetType = getOffsetType(testCfg.typ)
+		offsetType = GetOffsetTypeFromOrderColType(t, testCfg.typ)
 	}
-	startOffset := makeRandOffset(t, testCfg.rng, offsetType)
-	endOffset := makeRandOffset(t, testCfg.rng, offsetType)
+	startOffset := MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
+	endOffset := MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
 
 	peersCol, orderCol := tree.NoColumnIdx, tree.NoColumnIdx
 	if testCfg.ordered {
@@ -354,7 +356,7 @@ func initWindowFramers(
 		Bounds: execinfrapb.WindowerSpec_Frame_Bounds{
 			Start: execinfrapb.WindowerSpec_Frame_Bound{
 				BoundType:   boundToExecinfrapb(testCfg.startBound),
-				TypedOffset: encodeOffset(t, startOffset),
+				TypedOffset: EncodeWindowFrameOffset(t, startOffset),
 				OffsetType: execinfrapb.DatumInfo{
 					Type:     testCfg.typ,
 					Encoding: datumEncoding,
@@ -362,7 +364,7 @@ func initWindowFramers(
 			},
 			End: &execinfrapb.WindowerSpec_Frame_Bound{
 				BoundType:   boundToExecinfrapb(testCfg.endBound),
-				TypedOffset: encodeOffset(t, endOffset),
+				TypedOffset: EncodeWindowFrameOffset(t, endOffset),
 				OffsetType: execinfrapb.DatumInfo{
 					Type:     testCfg.typ,
 					Encoding: datumEncoding,
@@ -520,37 +522,93 @@ func exclusionToExecinfrapb(
 	return 0
 }
 
-func encodeOffset(t *testing.T, offset tree.Datum) []byte {
-	var encoded, scratch []byte
-	encoded, err := rowenc.EncodeTableValue(
-		encoded, descpb.ColumnID(encoding.NoColumnID), offset, scratch)
-	require.NoError(t, err)
-	return encoded
-}
-
-func makeRandOffset(t *testing.T, rng *rand.Rand, typ *types.T) tree.Datum {
-	isNegative := func(val tree.Datum) bool {
-		switch datumTyp := val.(type) {
-		case *tree.DInt:
-			return int64(*datumTyp) < 0
-		case *tree.DFloat:
-			return float64(*datumTyp) < 0
-		case *tree.DDecimal:
-			return datumTyp.Negative
-		case *tree.DInterval, *tree.DTimestampTZ, *tree.DDate, *tree.DTimeTZ:
-			return false
-		default:
-			t.Errorf("unexpected error: %v", errors.AssertionFailedf("unsupported datum: %v", datumTyp))
-			return false
-		}
+func TestGetSlidingWindowIntervals(t *testing.T) {
+	testCases := []struct {
+		prevIntervals []windowInterval
+		currIntervals []windowInterval
+		expectedToAdd []windowInterval
+		expectedToRem []windowInterval
+	}{
+		{
+			prevIntervals: []windowInterval{
+				{0, 2},
+				{4, 5},
+			},
+			currIntervals: []windowInterval{
+				{0, 6},
+			},
+			expectedToAdd: []windowInterval{
+				{2, 4},
+				{5, 6},
+			},
+			expectedToRem: nil,
+		},
+		{
+			prevIntervals: []windowInterval{
+				{1, 2},
+			},
+			currIntervals: []windowInterval{
+				{0, 4},
+			},
+			expectedToAdd: []windowInterval{
+				{0, 1},
+				{2, 4},
+			},
+			expectedToRem: nil,
+		},
+		{
+			prevIntervals: []windowInterval{
+				{0, 6},
+			},
+			currIntervals: []windowInterval{
+				{1, 2},
+				{5, 7},
+			},
+			expectedToAdd: []windowInterval{
+				{6, 7},
+			},
+			expectedToRem: []windowInterval{
+				{0, 1},
+				{2, 5},
+			},
+		},
+		{
+			prevIntervals: []windowInterval{
+				{0, 2},
+				{4, 5},
+				{6, 8},
+			},
+			currIntervals: []windowInterval{
+				{0, 2},
+				{4, 5},
+				{6, 8},
+			},
+			expectedToAdd: nil,
+			expectedToRem: nil,
+		},
+		{
+			prevIntervals: []windowInterval{
+				{0, 2},
+				{4, 5},
+				{6, 8},
+			},
+			currIntervals: []windowInterval{
+				{0, 2},
+				{4, 5},
+				{6, 8},
+				{9, 10},
+			},
+			expectedToAdd: []windowInterval{
+				{9, 10},
+			},
+			expectedToRem: nil,
+		},
 	}
 
-	for {
-		val := randgen.RandDatumSimple(rng, typ)
-		if isNegative(val) {
-			// Offsets must be non-null and non-negative.
-			continue
-		}
-		return val
+	for i := range testCases {
+		tc := &testCases[i]
+		toAdd, toRemove := getSlidingWindowIntervals(tc.currIntervals, tc.prevIntervals, nil, nil)
+		require.Equalf(t, tc.expectedToAdd, toAdd, "toAdd")
+		require.Equalf(t, tc.expectedToRem, toRemove, "toRemove")
 	}
 }

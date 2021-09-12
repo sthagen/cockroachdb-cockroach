@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -32,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -61,6 +61,7 @@ var _ inputConverter = &mysqldumpReader{}
 
 func newMysqldumpReader(
 	ctx context.Context,
+	semaCtx *tree.SemaContext,
 	kvCh chan row.KVBatch,
 	walltime int64,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
@@ -75,8 +76,9 @@ func newMysqldumpReader(
 			converters[name] = nil
 			continue
 		}
-		conv, err := row.NewDatumRowConverter(ctx, tabledesc.NewBuilder(table.Desc).BuildImmutableTable(),
-			nil /* targetColNames */, evalCtx, kvCh, nil /* seqChunkProvider */)
+		conv, err := row.NewDatumRowConverter(ctx, semaCtx, tabledesc.NewBuilder(table.Desc).
+			BuildImmutableTable(), nil /* targetColNames */, evalCtx, kvCh,
+			nil /* seqChunkProvider */, nil /* metrics */)
 		if err != nil {
 			return nil, err
 		}
@@ -480,6 +482,13 @@ func mysqlTableToCockroach(
 			}
 			def.DefaultExpr.Expr = expr
 		}
+		// If the target table columns have data type INT or INTEGER, they need to
+		// be updated to conform to the session variable `default_int_size`.
+		if dType, ok := def.Type.(*types.T); ok {
+			if dType.Equivalent(types.Int) && p != nil {
+				def.Type = parser.NakedIntTypeFromDefaultIntSize(p.SessionData().DefaultIntSize)
+			}
+		}
 		stmt.Defs = append(stmt.Defs, def)
 	}
 
@@ -508,6 +517,10 @@ func mysqlTableToCockroach(
 	if p != nil {
 		semaCtxPtr = p.SemaCtx()
 	}
+
+	// Bundle imports do not support user defined types, and so we nil out the
+	// type resolver to protect against unexpected behavior on UDT resolution.
+	semaCtxPtr = makeSemaCtxWithoutTypeResolver(semaCtxPtr)
 	desc, err := MakeSimpleTableDescriptor(
 		ctx, semaCtxPtr, evalCtx.Settings, stmt, parentDB,
 		schemadesc.GetPublicSchema(), id, fks, time.WallTime,

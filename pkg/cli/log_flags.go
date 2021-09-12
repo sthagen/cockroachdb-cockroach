@@ -212,6 +212,7 @@ func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyCon
 	serverCfg.GoroutineDumpDirName = filepath.Join(outputDirectory, base.GoroutineDumpDir)
 	serverCfg.HeapProfileDirName = filepath.Join(outputDirectory, base.HeapProfileDir)
 	serverCfg.CPUProfileDirName = filepath.Join(outputDirectory, base.CPUProfileDir)
+	serverCfg.InflightTraceDirName = filepath.Join(outputDirectory, base.InflightTraceDir)
 
 	return nil
 }
@@ -434,7 +435,8 @@ func addPredefinedLogFiles(c *logconfig.Config) {
 		if prefix == "sql-audit" && cliCtx.deprecatedLogOverrides.sqlAuditLogDir.isSet {
 			dir = &cliCtx.deprecatedLogOverrides.sqlAuditLogDir.s
 		}
-		m[prefix] = &logconfig.FileSinkConfig{
+
+		sinkConfig := &logconfig.FileSinkConfig{
 			Channels: logconfig.ChannelList{Channels: []logpb.Channel{ch}},
 			FileDefaults: logconfig.FileDefaults{
 				Dir: dir,
@@ -443,6 +445,20 @@ func addPredefinedLogFiles(c *logconfig.Config) {
 				},
 			},
 		}
+
+		if ch == channel.TELEMETRY {
+			// Keep less data for telemetry.
+			//
+			// This is the default configuration; as usual, this can be
+			// customized by adding an explicit file-group specification in
+			// the logging configuration.
+			sz := logconfig.ByteSize(100 * 1024)             // 100KiB
+			groupSize := logconfig.ByteSize(1 * 1024 * 1024) // 1MiB
+			sinkConfig.MaxFileSize = &sz
+			sinkConfig.MaxGroupSize = &groupSize
+		}
+
+		m[prefix] = sinkConfig
 	}
 }
 
@@ -455,6 +471,7 @@ var predefinedLogFiles = map[logpb.Channel]string{
 	channel.SQL_EXEC:          "sql-exec",
 	channel.SQL_PERF:          "sql-slow",
 	channel.SQL_INTERNAL_PERF: "sql-slow-internal-only",
+	channel.TELEMETRY:         "telemetry",
 }
 
 // predefinedAuditFiles indicate which channel-specific files are

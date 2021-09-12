@@ -16,8 +16,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+)
+
+type fileSystemType int
+
+const (
+	// Since ext4 is the default of 0, it isn't being
+	// used anywhere in the code. Therefore, it isn't
+	// added as a const here since it is unused, and
+	// leads to a lint error.
+
+	// Zfs file system.
+	Zfs fileSystemType = 1
 )
 
 // ClusterSpec represents a test's description of what its cluster needs to
@@ -35,6 +48,12 @@ type ClusterSpec struct {
 	Geo            bool
 	Lifetime       time.Duration
 	ReusePolicy    clusterReusePolicy
+
+	// FileSystem determines the underlying FileSystem
+	// to be used. The default is ext4.
+	FileSystem fileSystemType
+
+	RandomlyUseZfs bool
 }
 
 // MakeClusterSpec makes a ClusterSpec.
@@ -175,6 +194,20 @@ func (s *ClusterSpec) Args(extra ...string) ([]string, error) {
 			// Do nothing.
 		default:
 			return nil, errors.Errorf("specifying Zones is not yet supported on %s", s.Cloud)
+		}
+	}
+
+	if s.FileSystem == Zfs {
+		if s.Cloud != GCE {
+			return nil, errors.Errorf(
+				"node creation with zfs file system not yet supported on %s", s.Cloud,
+			)
+		}
+		args = append(args, "--filesystem=zfs")
+	} else if s.RandomlyUseZfs && s.Cloud == GCE {
+		rng, _ := randutil.NewPseudoRand()
+		if rng.Float64() <= 0.2 {
+			args = append(args, "--filesystem=zfs")
 		}
 	}
 

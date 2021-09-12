@@ -279,6 +279,8 @@
 </span></td></tr>
 <tr><td><a name="array_upper"></a><code>array_upper(input: anyelement[], array_dimension: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the maximum value of <code>input</code> on the provided <code>array_dimension</code>. However, because CockroachDB doesn’t yet support multi-dimensional arrays, the only supported <code>array_dimension</code> is <strong>1</strong>.</p>
 </span></td></tr>
+<tr><td><a name="cardinality"></a><code>cardinality(input: anyelement[]) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the number of elements contained in <code>input</code></p>
+</span></td></tr>
 <tr><td><a name="string_to_array"></a><code>string_to_array(str: <a href="string.html">string</a>, delimiter: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Split a string into components on a delimiter.</p>
 </span></td></tr>
 <tr><td><a name="string_to_array"></a><code>string_to_array(str: <a href="string.html">string</a>, delimiter: <a href="string.html">string</a>, null: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Split a string into components on a delimiter with a specified string to consider NULL.</p>
@@ -320,6 +322,18 @@
 <tr><td><a name="num_nonnulls"></a><code>num_nonnulls(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of nonnull arguments.</p>
 </span></td></tr>
 <tr><td><a name="num_nulls"></a><code>num_nulls(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of null arguments.</p>
+</span></td></tr></tbody>
+</table>
+
+### DECIMAL functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="hlc_to_timestamp"></a><code>hlc_to_timestamp(hlc: <a href="decimal.html">decimal</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Returns a TimestampTZ representation of a CockroachDB HLC in decimal form.</p>
+<p>Note that a TimestampTZ has less precision than a CockroachDB HLC. It is intended as
+a convenience function to display HLCs in a print-friendly form. Use the decimal
+value if you rely on the HLC for accuracy.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -514,6 +528,12 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="timezone"></a><code>timezone(timezone: <a href="string.html">string</a>, timetz: timetz) &rarr; timetz</code></td><td><span class="funcdesc"><p>Convert given time with time zone to the new time zone.</p>
 </span></td></tr>
+<tr><td><a name="to_char"></a><code>to_char(date: <a href="date.html">date</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an date to a string assuming the ISO, MDY DateStyle.</p>
+</span></td></tr>
+<tr><td><a name="to_char"></a><code>to_char(interval: <a href="interval.html">interval</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string assuming the Postgres IntervalStyle.</p>
+</span></td></tr>
+<tr><td><a name="to_char"></a><code>to_char(timestamp: <a href="timestamp.html">timestamp</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string assuming the ISO, MDY DateStyle.</p>
+</span></td></tr>
 <tr><td><a name="transaction_timestamp"></a><code>transaction_timestamp() &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Returns the time of the current transaction.</p>
 <p>The value is based on a timestamp picked when the transaction starts
 and which stays constant throughout the transaction. This timestamp
@@ -529,6 +549,30 @@ has no relationship with the commit order of concurrent transactions.</p>
 and which stays constant throughout the transaction. This timestamp
 has no relationship with the commit order of concurrent transactions.</p>
 <p>This function is the preferred overload and will be evaluated by default.</p>
+</span></td></tr>
+<tr><td><a name="with_max_staleness"></a><code>with_max_staleness(max_staleness: <a href="interval.html">interval</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>When used in the AS OF SYSTEM TIME clause of an single-statement,
+read-only transaction, CockroachDB chooses the newest timestamp within the staleness
+bound that allows execution of the reads at the nearest available replica without blocking.</p>
+<p>Note this function requires an enterprise license on a CCL distribution.</p>
+</span></td></tr>
+<tr><td><a name="with_max_staleness"></a><code>with_max_staleness(max_staleness: <a href="interval.html">interval</a>, nearest_only: <a href="bool.html">bool</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>When used in the AS OF SYSTEM TIME clause of an single-statement,
+read-only transaction, CockroachDB chooses the newest timestamp within the staleness
+bound that allows execution of the reads at the nearest available replica without blocking.</p>
+<p>If nearest_only is set to true, reads that cannot be served using the nearest
+available replica will error.</p>
+<p>Note this function requires an enterprise license on a CCL distribution.</p>
+</span></td></tr>
+<tr><td><a name="with_min_timestamp"></a><code>with_min_timestamp(min_timestamp: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>When used in the AS OF SYSTEM TIME clause of an single-statement,
+read-only transaction, CockroachDB chooses the newest timestamp before the min_timestamp
+that allows execution of the reads at the nearest available replica without blocking.</p>
+<p>Note this function requires an enterprise license on a CCL distribution.</p>
+</span></td></tr>
+<tr><td><a name="with_min_timestamp"></a><code>with_min_timestamp(min_timestamp: <a href="timestamp.html">timestamptz</a>, nearest_only: <a href="bool.html">bool</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>When used in the AS OF SYSTEM TIME clause of an single-statement,
+read-only transaction, CockroachDB chooses the newest timestamp before the min_timestamp
+that allows execution of the reads at the nearest available replica without blocking.</p>
+<p>If nearest_only is set to true, reads that cannot be served using the nearest
+available replica will error.</p>
+<p>Note this function requires an enterprise license on a CCL distribution.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -808,6 +852,10 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>, emit_defaults: <a href="bool.html">bool</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.read_file"></a><code>crdb_internal.read_file(uri: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Read the content of the file at the supplied external storage URI</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.write_file"></a><code>crdb_internal.write_file(data: <a href="bytes.html">bytes</a>, uri: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Write the content passed to a file at the supplied external storage URI</p>
+</span></td></tr>
 <tr><td><a name="json_array_length"></a><code>json_array_length(json: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of elements in the outermost JSON or JSONB array.</p>
 </span></td></tr>
 <tr><td><a name="json_build_array"></a><code>json_build_array(anyelement...) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Builds a possibly-heterogeneously-typed JSON or JSONB array out of a variadic argument list.</p>
@@ -878,6 +926,14 @@ SQL statement omitting multi-region related zone configuration fields.
 If the CONFIGURE ZONE statement can be inferred by the database’s or
 table’s zone configuration this will return NULL.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.reset_multi_region_zone_configs_for_database"></a><code>crdb_internal.reset_multi_region_zone_configs_for_database(id: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Resets the zone configuration for a multi-region database to
+match its original state. No-ops if the given database ID is not multi-region
+enabled.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.reset_multi_region_zone_configs_for_table"></a><code>crdb_internal.reset_multi_region_zone_configs_for_table(id: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Resets the zone configuration for a multi-region table to
+match its original state. No-ops if the given table ID is not a multi-region
+table.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.validate_multi_region_zone_configs"></a><code>crdb_internal.validate_multi_region_zone_configs() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Validates all multi-region zone configurations are correctly setup
 for the current database, including all tables, indexes and partitions underneath.
 Returns an error if validation fails. This builtin uses un-leased versions of the
@@ -888,6 +944,9 @@ Otherwise, this will return the primary region of the current database.
 This will error if the current database is not a multi-region database.</p>
 </span></td></tr>
 <tr><td><a name="gateway_region"></a><code>gateway_region() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the region of the connection’s current node as defined by
+the locality flag on node startup. Returns an error if no region is set.</p>
+</span></td></tr>
+<tr><td><a name="rehome_row"></a><code>rehome_row() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the region of the connection’s current node as defined by
 the locality flag on node startup. Returns an error if no region is set.</p>
 </span></td></tr></tbody>
 </table>
@@ -2336,6 +2395,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="st_translate"></a><code>st_translate(g: geometry, delta_x: <a href="float.html">float</a>, delta_y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry translated by the given deltas.</p>
 </span></td></tr>
+<tr><td><a name="st_translate"></a><code>st_translate(g: geometry, delta_x: <a href="float.html">float</a>, delta_y: <a href="float.html">float</a>, delta_z: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified Geometry translated by the given deltas.</p>
+</span></td></tr>
 <tr><td><a name="st_transscale"></a><code>st_transscale(geometry: geometry, delta_x: <a href="float.html">float</a>, delta_y: <a href="float.html">float</a>, x_factor: <a href="float.html">float</a>, y_factor: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Translates the geometry using the deltaX and deltaY args, then scales it using the XFactor, YFactor args, working in 2D only.</p>
 </span></td></tr>
 <tr><td><a name="st_unaryunion"></a><code>st_unaryunion(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a union of the components for any geometry or geometry collection provided. Dissolves boundaries of a multipolygon.</p>
@@ -2482,7 +2543,25 @@ The output can be used to recreate a database.’</p>
 </span></td></tr>
 <tr><td><a name="overlay"></a><code>overlay(input: <a href="string.html">string</a>, overlay_val: <a href="string.html">string</a>, start_pos: <a href="int.html">int</a>, end_pos: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Deletes the characters in <code>input</code> between <code>start_pos</code> and <code>end_pos</code> (count starts at 1), and then insert <code>overlay_val</code> at <code>start_pos</code>.</p>
 </span></td></tr>
-<tr><td><a name="parse_timestamp"></a><code>parse_timestamp(string: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Convert a string containing an absolute timestamp to the corresponding timestamp.</p>
+<tr><td><a name="parse_date"></a><code>parse_date(string: <a href="string.html">string</a>, datestyle: <a href="string.html">string</a>) &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Parses a date assuming it is in format specified by DateStyle.</p>
+</span></td></tr>
+<tr><td><a name="parse_date"></a><code>parse_date(val: <a href="string.html">string</a>) &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Parses a date assuming it is in MDY format.</p>
+</span></td></tr>
+<tr><td><a name="parse_interval"></a><code>parse_interval(string: <a href="string.html">string</a>, style: <a href="string.html">string</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Convert a string to an interval using the given IntervalStyle.</p>
+</span></td></tr>
+<tr><td><a name="parse_interval"></a><code>parse_interval(val: <a href="string.html">string</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Convert a string to an interval assuming the Postgres IntervalStyle.</p>
+</span></td></tr>
+<tr><td><a name="parse_time"></a><code>parse_time(string: <a href="string.html">string</a>, timestyle: <a href="string.html">string</a>) &rarr; <a href="time.html">time</a></code></td><td><span class="funcdesc"><p>Parses a time assuming the date (if any) is in format specified by DateStyle.</p>
+</span></td></tr>
+<tr><td><a name="parse_time"></a><code>parse_time(val: <a href="string.html">string</a>) &rarr; <a href="time.html">time</a></code></td><td><span class="funcdesc"><p>Parses a time assuming the date (if any) is in MDY format.</p>
+</span></td></tr>
+<tr><td><a name="parse_timestamp"></a><code>parse_timestamp(string: <a href="string.html">string</a>, datestyle: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Convert a string containing an absolute timestamp to the corresponding timestamp assuming dates formatted using the given DateStyle.</p>
+</span></td></tr>
+<tr><td><a name="parse_timestamp"></a><code>parse_timestamp(val: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Convert a string containing an absolute timestamp to the corresponding timestamp assuming dates are in MDY format.</p>
+</span></td></tr>
+<tr><td><a name="parse_timetz"></a><code>parse_timetz(string: <a href="string.html">string</a>, timestyle: <a href="string.html">string</a>) &rarr; timetz</code></td><td><span class="funcdesc"><p>Parses a timetz assuming the date (if any) is in format specified by DateStyle.</p>
+</span></td></tr>
+<tr><td><a name="parse_timetz"></a><code>parse_timetz(val: <a href="string.html">string</a>) &rarr; timetz</code></td><td><span class="funcdesc"><p>Parses a timetz assuming the date (if any) is in MDY format.</p>
 </span></td></tr>
 <tr><td><a name="pg_collation_for"></a><code>pg_collation_for(str: anyelement) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the collation of the argument</p>
 </span></td></tr>
@@ -2672,6 +2751,12 @@ The output can be used to recreate a database.’</p>
 </span></td></tr>
 <tr><td><a name="substring"></a><code>substring(input: varbit, start_pos: <a href="int.html">int</a>, length: <a href="int.html">int</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Returns a bit subarray of <code>input</code> starting at <code>start_pos</code> (count starts at 1) and including up to <code>length</code> characters.</p>
 </span></td></tr>
+<tr><td><a name="to_char_with_style"></a><code>to_char_with_style(date: <a href="date.html">date</a>, datestyle: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an date to a string assuming the string is formatted using the given DateStyle.</p>
+</span></td></tr>
+<tr><td><a name="to_char_with_style"></a><code>to_char_with_style(interval: <a href="interval.html">interval</a>, style: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string using the given IntervalStyle.</p>
+</span></td></tr>
+<tr><td><a name="to_char_with_style"></a><code>to_char_with_style(timestamp: <a href="timestamp.html">timestamp</a>, datestyle: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string assuming the string is formatted using the given DateStyle.</p>
+</span></td></tr>
 <tr><td><a name="to_english"></a><code>to_english(val: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function enunciates the value of its argument using English cardinals.</p>
 </span></td></tr>
 <tr><td><a name="to_hex"></a><code>to_hex(val: <a href="bytes.html">bytes</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts <code>val</code> to its hexadecimal representation.</p>
@@ -2700,9 +2785,8 @@ The output can be used to recreate a database.’</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><a name="cluster_logical_timestamp"></a><code>cluster_logical_timestamp() &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Returns the logical time of the current transaction.</p>
-<p>This function is reserved for testing purposes by CockroachDB
-developers and its definition may change without prior notice.</p>
+<tr><td><a name="cluster_logical_timestamp"></a><code>cluster_logical_timestamp() &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Returns the logical time of the current transaction as
+a CockroachDB HLC in decimal form.</p>
 <p>Note that uses of this function disable server-side optimizations and
 may increase either contention or retry errors, or both.</p>
 </span></td></tr>
@@ -2719,6 +2803,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.completed_migrations"></a><code>crdb_internal.completed_migrations() &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.create_join_token"></a><code>crdb_internal.create_join_token() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Creates a join token for use when adding a new node to a secure cluster.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.deserialize_session"></a><code>crdb_internal.deserialize_session(session: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function deserializes the serialized variables into the current session.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.encode_key"></a><code>crdb_internal.encode_key(table_id: <a href="int.html">int</a>, index_id: <a href="int.html">int</a>, row_tuple: anyelement) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Generate the key for a row on a particular table and index.</p>
 </span></td></tr>
@@ -2775,6 +2861,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.pretty_key"></a><code>crdb_internal.pretty_key(raw_key: <a href="bytes.html">bytes</a>, skip_fields: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.pretty_span"></a><code>crdb_internal.pretty_span(raw_key_start: <a href="bytes.html">bytes</a>, raw_key_end: <a href="bytes.html">bytes</a>, skip_fields: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.range_stats"></a><code>crdb_internal.range_stats(key: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>This function is used to retrieve range statistics information as a JSON object.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.reset_sql_stats"></a><code>crdb_internal.reset_sql_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected SQL statistics.</p>
@@ -2782,6 +2870,10 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.round_decimal_values"></a><code>crdb_internal.round_decimal_values(val: <a href="decimal.html">decimal</a>, scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>This function is used internally to round decimal values during mutations.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.round_decimal_values"></a><code>crdb_internal.round_decimal_values(val: <a href="decimal.html">decimal</a>[], scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a>[]</code></td><td><span class="funcdesc"><p>This function is used internally to round decimal array values during mutations.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.schedule_sql_stats_compaction"></a><code>crdb_internal.schedule_sql_stats_compaction(session: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to start a SQL stats compaction job.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.serialize_session"></a><code>crdb_internal.serialize_session() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function serializes the variables in the current session.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.set_trace_verbose"></a><code>crdb_internal.set_trace_verbose(trace_id: <a href="int.html">int</a>, verbosity: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if root span was found and verbosity was set, false otherwise.</p>
 </span></td></tr>
@@ -2796,6 +2888,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="current_schemas"></a><code>current_schemas(include_pg_catalog: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Returns the valid schemas in the search path.</p>
 </span></td></tr>
 <tr><td><a name="current_user"></a><code>current_user() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current user. This function is provided for compatibility with PostgreSQL.</p>
+</span></td></tr>
+<tr><td><a name="session_user"></a><code>session_user() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the session user. This function is provided for compatibility with PostgreSQL.</p>
 </span></td></tr>
 <tr><td><a name="version"></a><code>version() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the node’s version of CockroachDB.</p>
 </span></td></tr></tbody>
@@ -2860,6 +2954,10 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
+<tr><td><a name="current_setting"></a><code>current_setting(setting_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>System info</p>
+</span></td></tr>
+<tr><td><a name="current_setting"></a><code>current_setting(setting_name: <a href="string.html">string</a>, missing_ok: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>System info</p>
+</span></td></tr>
 <tr><td><a name="format_type"></a><code>format_type(type_oid: oid, typemod: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the SQL name of a data type that is identified by its type OID and possibly a type modifier. Currently, the type modifier is ignored.</p>
 </span></td></tr>
 <tr><td><a name="getdatabaseencoding"></a><code>getdatabaseencoding() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current encoding name used by the database.</p>
@@ -3033,6 +3131,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID belongs to one of the schemas on the search path.</p>
 </span></td></tr>
 <tr><td><a name="pg_type_is_visible"></a><code>pg_type_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the type with the given OID belongs to one of the schemas on the search path.</p>
+</span></td></tr>
+<tr><td><a name="set_config"></a><code>set_config(setting_name: <a href="string.html">string</a>, new_value: <a href="string.html">string</a>, is_local: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>System info</p>
 </span></td></tr></tbody>
 </table>
 

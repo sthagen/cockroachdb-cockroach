@@ -70,11 +70,6 @@ CREATE TABLE d (
 statement ok
 CREATE TABLE t1 (id1 INT PRIMARY KEY, id2 INT, id3 INT);
 
-statement error pq: inverted indexes don't support interleaved tables
-CREATE INDEX c on t1 USING GIN (id2)
-   STORING (id1,id3)
-   INTERLEAVE in PARENT t1 (id2);
-
 statement error pq: inverted indexes don't support stored columns
 CREATE INDEX c on t1 USING GIN (id2) STORING (id1,id3);
 
@@ -1237,13 +1232,13 @@ SELECT numbers FROM cb@n WHERE numbers <@ ARRAY[]::INT[]
 ----
 {}
 
-query T
+query T rowsort
 SELECT numbers FROM cb@n WHERE numbers <@ ARRAY[1]
 ----
 {}
 {1}
 
-query T
+query T rowsort
 SELECT numbers FROM cb@n WHERE numbers <@ ARRAY[0,1,2]
 ----
 {}
@@ -1253,14 +1248,14 @@ SELECT numbers FROM cb@n WHERE numbers <@ ARRAY[0,1,2]
 {0,1,2}
 {1,2,1}
 
-query T
+query T rowsort
 SELECT numbers FROM cb@n WHERE numbers <@ ARRAY[1,2,3]
 ----
 {}
 {1}
 {1,2,1}
 
-query T
+query T rowsort
 SELECT numbers FROM cb@n WHERE numbers <@ ARRAY[0,1,NULL]
 ----
 {}
@@ -1278,7 +1273,7 @@ SELECT words FROM cb@w WHERE words <@ ARRAY[]::STRING[]
 ----
 {}
 
-query T
+query T rowsort
 SELECT words FROM cb@w WHERE words <@ ARRAY['']::STRING[]
 ----
 {}
@@ -1290,14 +1285,14 @@ SELECT words FROM cb@w WHERE words <@ ARRAY[NULL]::STRING[]
 {}
 
 
-query T
+query T rowsort
 SELECT words FROM cb@w WHERE words <@ ARRAY['cat']
 ----
 {}
 {cat}
 
 
-query T
+query T rowsort
 SELECT words FROM cb@w WHERE words <@ ARRAY['cat', 'mouse']
 ----
 {}
@@ -1305,7 +1300,7 @@ SELECT words FROM cb@w WHERE words <@ ARRAY['cat', 'mouse']
 {mouse}
 {cat,mouse}
 
-query T
+query T rowsort
 SELECT words FROM cb@w WHERE words <@ ARRAY['cat', 'mouse', NULL]
 ----
 {}
@@ -1313,7 +1308,7 @@ SELECT words FROM cb@w WHERE words <@ ARRAY['cat', 'mouse', NULL]
 {mouse}
 {cat,mouse}
 
-query T
+query T rowsort
 SELECT words FROM cb@w WHERE words <@ ARRAY[NULL, 'rat']
 ----
 {}

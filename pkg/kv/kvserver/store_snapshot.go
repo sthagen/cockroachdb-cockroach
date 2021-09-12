@@ -16,7 +16,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -906,13 +905,14 @@ func SendEmptySnapshot(
 	to roachpb.ReplicaDescriptor,
 ) error {
 	// Create an engine to use as a buffer for the empty snapshot.
-	eng := storage.NewInMem(
+	eng, err := storage.Open(
 		context.Background(),
-		roachpb.Attributes{},
-		1<<20,   /* cacheSize 1MiB */
-		512<<20, /* storeSize 512 MiB */
-		nil,     /* settings */
-	)
+		storage.InMemory(),
+		storage.CacheSize(1<<20 /* 1 MiB */),
+		storage.MaxSize(512<<20 /* 512 MiB */))
+	if err != nil {
+		return err
+	}
 	defer eng.Close()
 
 	var ms enginepb.MVCCStats
@@ -923,11 +923,7 @@ func SendEmptySnapshot(
 		return err
 	}
 
-	var replicaVersion roachpb.Version
-	if st.Version.IsActive(ctx, clusterversion.ReplicaVersions) {
-		replicaVersion = st.Version.ActiveVersionOrEmpty(ctx).Version
-	}
-	ms, err := stateloader.WriteInitialReplicaState(
+	ms, err = stateloader.WriteInitialReplicaState(
 		ctx,
 		eng,
 		ms,
@@ -935,7 +931,7 @@ func SendEmptySnapshot(
 		roachpb.Lease{},
 		hlc.Timestamp{}, // gcThreshold
 		stateloader.TruncatedStateUnreplicated,
-		replicaVersion,
+		st.Version.ActiveVersionOrEmpty(ctx).Version,
 	)
 	if err != nil {
 		return err
@@ -1154,7 +1150,10 @@ func sendSnapshot(
 	// completed (such as defers that might be run after the previous message was
 	// received).
 	if unexpectedResp, err := stream.Recv(); err != io.EOF {
-		return errors.Errorf("%s: expected EOF, got resp=%v err=%v", to, unexpectedResp, err)
+		if err != nil {
+			return errors.Wrapf(err, "%s: expected EOF, got resp=%v with error", to, unexpectedResp)
+		}
+		return errors.Newf("%s: expected EOF, got resp=%v", to, unexpectedResp)
 	}
 	switch resp.Status {
 	case SnapshotResponse_ERROR:

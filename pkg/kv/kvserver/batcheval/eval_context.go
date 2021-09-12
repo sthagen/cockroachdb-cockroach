@@ -14,18 +14,18 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"golang.org/x/time/rate"
 )
@@ -39,7 +39,8 @@ type Limiters struct {
 	// rangefeeds in the "catch-up" state across the store. The "catch-up" state
 	// is a temporary state at the beginning of a rangefeed which is expensive
 	// because it uses an engine iterator.
-	ConcurrentRangefeedIters limit.ConcurrentRequestLimiter
+	ConcurrentRangefeedIters         limit.ConcurrentRequestLimiter
+	ConcurrentScanInterleavedIntents limit.ConcurrentRequestLimiter
 }
 
 // EvalContext is the interface through which command evaluation accesses the
@@ -62,7 +63,6 @@ type EvalContext interface {
 	GetFirstIndex() (uint64, error)
 	GetTerm(uint64) (uint64, error)
 	GetLeaseAppliedIndex() uint64
-	GetTracker() closedts.TrackerI
 
 	Desc() *roachpb.RangeDescriptor
 	ContainsKey(key roachpb.Key) bool
@@ -106,14 +106,13 @@ type EvalContext interface {
 	// across all keys in the range (see declareAllKeys), because it will only
 	// return a meaningful summary if the caller has serialized with all other
 	// requests on the range.
-	//
-	// The method also returns the current closed timestamp on the range. This
-	// closed timestamp is already incorporated into the read summary, but some
-	// callers also need is separated out. It is expected that a caller will
-	// have performed some action (either calling RevokeLease or WatchForMerge)
-	// to freeze further progression of the closed timestamp before calling this
-	// method.
-	GetCurrentReadSummary(ctx context.Context) (rspb.ReadSummary, hlc.Timestamp)
+	GetCurrentReadSummary(ctx context.Context) rspb.ReadSummary
+
+	// GetClosedTimestamp returns the current closed timestamp on the range.
+	// It is expected that a caller will have performed some action (either
+	// calling RevokeLease or WatchForMerge) to freeze further progression of
+	// the closed timestamp before calling this method.
+	GetClosedTimestamp(ctx context.Context) hlc.Timestamp
 
 	GetExternalStorage(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error)
 	GetExternalStorageFromURI(ctx context.Context, uri string, user security.SQLUsername) (cloud.ExternalStorage,
@@ -127,6 +126,12 @@ type EvalContext interface {
 	// WatchForMerge arranges to block all requests until the in-progress merge
 	// completes. Returns an error if no in-progress merge is detected.
 	WatchForMerge(ctx context.Context) error
+
+	// GetResponseMemoryAccount returns a memory account to be used when
+	// generating BatchResponses. Currently only used for MVCC scans, and only
+	// non-nil on those paths (a nil account is safe to use since it functions
+	// as an unlimited account).
+	GetResponseMemoryAccount() *mon.BoundAccount
 }
 
 // MockEvalCtx is a dummy implementation of EvalContext for testing purposes.
@@ -144,13 +149,14 @@ type MockEvalCtx struct {
 	CanCreateTxn       func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason)
 	Lease              roachpb.Lease
 	CurrentReadSummary rspb.ReadSummary
+	ClosedTimestamp    hlc.Timestamp
 	RevokedLeaseSeq    roachpb.LeaseSequence
 }
 
 // EvalContext returns the MockEvalCtx as an EvalContext. It will reflect future
 // modifications to the underlying MockEvalContext.
 func (m *MockEvalCtx) EvalContext() EvalContext {
-	return &mockEvalCtxImpl{m}
+	return &mockEvalCtxImpl{MockEvalCtx: m}
 }
 
 type mockEvalCtxImpl struct {
@@ -201,9 +207,6 @@ func (m *mockEvalCtxImpl) GetTerm(uint64) (uint64, error) {
 func (m *mockEvalCtxImpl) GetLeaseAppliedIndex() uint64 {
 	panic("unimplemented")
 }
-func (m *mockEvalCtxImpl) GetTracker() closedts.TrackerI {
-	panic("unimplemented")
-}
 func (m *mockEvalCtxImpl) Desc() *roachpb.RangeDescriptor {
 	return m.MockEvalCtx.Desc
 }
@@ -236,10 +239,11 @@ func (m *mockEvalCtxImpl) GetLease() (roachpb.Lease, roachpb.Lease) {
 func (m *mockEvalCtxImpl) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 	return roachpb.RangeInfo{Desc: *m.Desc(), Lease: m.Lease}
 }
-func (m *mockEvalCtxImpl) GetCurrentReadSummary(
-	ctx context.Context,
-) (rspb.ReadSummary, hlc.Timestamp) {
-	return m.CurrentReadSummary, hlc.Timestamp{}
+func (m *mockEvalCtxImpl) GetCurrentReadSummary(ctx context.Context) rspb.ReadSummary {
+	return m.CurrentReadSummary
+}
+func (m *mockEvalCtxImpl) GetClosedTimestamp(ctx context.Context) hlc.Timestamp {
+	return m.ClosedTimestamp
 }
 func (m *mockEvalCtxImpl) GetExternalStorage(
 	ctx context.Context, dest roachpb.ExternalStorage,
@@ -256,4 +260,8 @@ func (m *mockEvalCtxImpl) RevokeLease(_ context.Context, seq roachpb.LeaseSequen
 }
 func (m *mockEvalCtxImpl) WatchForMerge(ctx context.Context) error {
 	panic("unimplemented")
+}
+func (m *mockEvalCtxImpl) GetResponseMemoryAccount() *mon.BoundAccount {
+	// No limits.
+	return nil
 }

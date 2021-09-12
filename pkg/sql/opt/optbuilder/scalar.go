@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -30,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -83,21 +83,23 @@ func (b *Builder) buildScalar(
 			// effectively constant) or it is part of a table and we are already
 			// grouping on the entire PK of that table.
 			g := inScope.groupby
-			if !inScope.isOuterColumn(t.id) && !b.allowImplicitGroupingColumn(t.id, g) {
-				panic(newGroupingError(t.name.ReferenceName()))
+			if !inScope.isOuterColumn(t.id) {
+				if !b.allowImplicitGroupingColumn(t.id, g) {
+					panic(newGroupingError(t.name.ReferenceName()))
+				}
+				// We add a new grouping column; these show up both in aggInScope and
+				// aggOutScope. We only do this when the column is not an outer column;
+				// otherwise, we may inadvertently convert a ScalarGroupBy to a GroupBy.
+				//
+				// Note that normalization rules will trim down the list of grouping
+				// columns based on FDs, so this is only for the purposes of building a
+				// valid operator.
+				aggInCol := g.aggInScope.addColumn(scopeColName(""), t)
+				b.finishBuildScalarRef(t, inScope, g.aggInScope, aggInCol, nil)
+				g.groupStrs[symbolicExprStr(t)] = aggInCol
+
+				g.aggOutScope.appendColumn(aggInCol)
 			}
-
-			// We add a new grouping column; these show up both in aggInScope and
-			// aggOutScope.
-			//
-			// Note that normalization rules will trim down the list of grouping
-			// columns based on FDs, so this is only for the purposes of building a
-			// valid operator.
-			aggInCol := g.aggInScope.addColumn(scopeColName(""), t)
-			b.finishBuildScalarRef(t, inScope, g.aggInScope, aggInCol, nil)
-			g.groupStrs[symbolicExprStr(t)] = aggInCol
-
-			g.aggOutScope.appendColumn(aggInCol)
 
 			return b.finishBuildScalarRef(t, g.aggOutScope, outScope, outCol, colRefs)
 		}
@@ -519,7 +521,7 @@ func (b *Builder) buildFunction(
 
 	// Add a dependency on sequences that are used as a string argument.
 	if b.trackViewDeps {
-		seqIdentifier, err := sequence.GetSequenceFromFunc(f)
+		seqIdentifier, err := seqexpr.GetSequenceFromFunc(f)
 		if err != nil {
 			panic(err)
 		}
@@ -768,6 +770,8 @@ func (b *Builder) constructUnary(
 	un tree.UnaryOperator, input opt.ScalarExpr, typ *types.T,
 ) opt.ScalarExpr {
 	switch un.Symbol {
+	case tree.UnaryPlus:
+		return b.factory.ConstructUnaryPlus(input)
 	case tree.UnaryMinus:
 		return b.factory.ConstructUnaryMinus(input)
 	case tree.UnaryComplement:

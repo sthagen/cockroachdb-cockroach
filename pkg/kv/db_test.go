@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -169,9 +170,9 @@ func TestDB_CPut(t *testing.T) {
 func TestDB_CPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
-	ctx := kv.CtxForCPutInline(context.Background())
+	defer s.Stopper().Stop(ctx)
 
 	if err := db.PutInline(ctx, "aa", "1"); err != nil {
 		t.Fatal(err)
@@ -291,6 +292,15 @@ func TestBatch(t *testing.T) {
 		"bb": []byte("2"),
 	}
 	checkResults(t, expected, b.Results)
+
+	b2 := &kv.Batch{}
+	b2.Put(42, "the answer")
+	if err := db.Run(context.Background(), b2); !testutils.IsError(err, "unable to marshal key") {
+		t.Fatal("expected marshaling error from running bad put")
+	}
+	if err := b2.MustPErr(); !testutils.IsPError(err, "unable to marshal key") {
+		t.Fatal("expected marshaling error from MustPErr")
+	}
 }
 
 func TestDB_Scan(t *testing.T) {
@@ -515,6 +525,24 @@ func TestDB_Put_insecure(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkResult(t, []byte("1"), result.ValueBytes())
+}
+
+func TestDB_QueryResolvedTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	// Perform a write to ensure that the range sets a non-zero closed timestamp.
+	err := db.Put(context.Background(), "a", "val")
+	require.NoError(t, err)
+
+	// One node cluster, so "nearest" should not make a difference. Test both.
+	testutils.RunTrueAndFalse(t, "nearest", func(t *testing.T, nearest bool) {
+		resTS, err := db.QueryResolvedTimestamp(context.Background(), "a", "c", nearest)
+		require.NoError(t, err)
+		require.NotEmpty(t, resTS)
+	})
 }
 
 // Test that all operations on a decommissioned node will return a

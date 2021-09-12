@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
@@ -383,12 +382,6 @@ func (r *Replica) GetLeaseAppliedIndex() uint64 {
 	return r.mu.state.LeaseAppliedIndex
 }
 
-// GetTracker returns the min prop tracker that keeps tabs over ongoing command
-// evaluations for the closed timestamp subsystem.
-func (r *Replica) GetTracker() closedts.TrackerI {
-	return r.store.cfg.ClosedTimestamp.Tracker
-}
-
 // Snapshot implements the raft.Storage interface. Snapshot requires that
 // r.mu is held. Note that the returned snapshot is a placeholder and
 // does not contain any of the replica data. The snapshot is actually generated
@@ -575,21 +568,14 @@ func snapshot(
 		return OutgoingSnapshot{}, errors.Mark(errors.Errorf("couldn't find range descriptor"), errMarkSnapshotError)
 	}
 
-	// Read the range metadata from the snapshot instead of the members
-	// of the Range struct because they might be changed concurrently.
-	appliedIndex, _, err := rsl.LoadAppliedIndex(ctx, snap)
-	if err != nil {
-		return OutgoingSnapshot{}, err
-	}
-
-	term, err := term(ctx, rsl, snap, rangeID, eCache, appliedIndex)
-	if err != nil {
-		return OutgoingSnapshot{}, errors.Errorf("failed to fetch term of %d: %s", appliedIndex, err)
-	}
-
 	state, err := rsl.Load(ctx, snap, &desc)
 	if err != nil {
 		return OutgoingSnapshot{}, err
+	}
+
+	term, err := term(ctx, rsl, snap, rangeID, eCache, state.RaftAppliedIndex)
+	if err != nil {
+		return OutgoingSnapshot{}, errors.Errorf("failed to fetch term of %d: %s", state.RaftAppliedIndex, err)
 	}
 
 	// Intentionally let this iterator and the snapshot escape so that the
@@ -606,7 +592,7 @@ func snapshot(
 		RaftSnap: raftpb.Snapshot{
 			Data: snapUUID.GetBytes(),
 			Metadata: raftpb.SnapshotMetadata{
-				Index: appliedIndex,
+				Index: state.RaftAppliedIndex,
 				Term:  term,
 				// Synthesize our raftpb.ConfState from desc.
 				ConfState: desc.Replicas().ConfState(),
@@ -696,7 +682,7 @@ func (r *Replica) append(
 // updateRangeInfo is called whenever a range is updated by ApplySnapshot
 // or is created by range splitting to setup the fields which are
 // uninitialized or need updating.
-func (r *Replica) updateRangeInfo(desc *roachpb.RangeDescriptor) error {
+func (r *Replica) updateRangeInfo(ctx context.Context, desc *roachpb.RangeDescriptor) error {
 	// RangeMaxBytes should be updated by looking up Zone Config in two cases:
 	// 1. After applying a snapshot, if the zone config was not updated for
 	// this key range, then maxBytes of this range will not be updated either.
@@ -704,22 +690,24 @@ func (r *Replica) updateRangeInfo(desc *roachpb.RangeDescriptor) error {
 	// the original range wont work as the original and new ranges might belong
 	// to different zones.
 	// Load the system config.
-	cfg := r.store.Gossip().GetSystemConfig()
-	if cfg == nil {
-		// This could be before the system config was ever gossiped,
-		// or it expired. Let the gossip callback set the info.
-		ctx := r.AnnotateCtx(context.TODO())
-		log.Warningf(ctx, "no system config available, cannot determine range MaxBytes")
+	confReader, err := r.store.GetConfReader()
+	if errors.Is(err, errSysCfgUnavailable) {
+		// This could be before the system config was ever gossiped, or it
+		// expired. Let the gossip callback set the info.
+		log.Warningf(ctx, "unable to retrieve conf reader, cannot determine range MaxBytes")
 		return nil
 	}
-
-	// Find zone config for this range.
-	zone, err := cfg.GetZoneConfigForKey(desc.StartKey)
 	if err != nil {
-		return errors.Errorf("%s: failed to lookup zone config: %s", r, err)
+		return err
 	}
 
-	r.SetZoneConfig(zone)
+	// Find span config for this range.
+	conf, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
+	if err != nil {
+		return errors.Errorf("%s: failed to lookup span config: %s", r, err)
+	}
+
+	r.SetSpanConfig(conf)
 	return nil
 }
 
@@ -1065,7 +1053,7 @@ func (r *Replica) applySnapshot(
 	// Update the replica's cached byte thresholds. This is a no-op if the system
 	// config is not available, in which case we rely on the next gossip update
 	// to perform the update.
-	if err := r.updateRangeInfo(s.Desc); err != nil {
+	if err := r.updateRangeInfo(ctx, s.Desc); err != nil {
 		log.Fatalf(ctx, "unable to update range info while applying snapshot: %+v", err)
 	}
 

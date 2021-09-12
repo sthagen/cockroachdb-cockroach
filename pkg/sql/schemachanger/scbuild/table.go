@@ -13,12 +13,11 @@ package scbuild
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -28,8 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -78,21 +75,12 @@ func (b *buildContext) alterTableAddColumn(
 	d := t.ColumnDef
 
 	if d.IsComputed() {
-		d.Computed.Expr = schemaexpr.MaybeRewriteComputedColumn(d.Computed.Expr, b.EvalCtx.SessionData)
+		d.Computed.Expr = schemaexpr.MaybeRewriteComputedColumn(d.Computed.Expr, b.EvalCtx.SessionData())
 	}
 
-	version := b.EvalCtx.Settings.Version.ActiveVersionOrEmpty(ctx)
 	toType, err := tree.ResolveType(ctx, d.Type, b.SemaCtx.GetTypeResolver())
 	if err != nil {
 		panic(err)
-	}
-	supported := isTypeSupportedInVersion(version, toType)
-	if !supported {
-		panic(pgerror.Newf(
-			pgcode.FeatureNotSupported,
-			"type %s is not supported until version upgrade is finalized",
-			toType.SQLString(),
-		))
 	}
 
 	// User defined columns are not supported, since we don't
@@ -119,9 +107,7 @@ func (b *buildContext) alterTableAddColumn(
 	// If the new column has a DEFAULT expression that uses a sequence, add
 	// references between its descriptor and this column descriptor.
 	if d.HasDefaultExpr() {
-		b.maybeAddSequenceReferenceDependencies(
-			ctx, b.EvalCtx.Settings, table.GetID(), col, defaultExpr,
-		)
+		b.maybeAddSequenceReferenceDependencies(ctx, table.GetID(), col, defaultExpr)
 	}
 
 	b.validateColumnName(table, d, col, t.IfNotExists)
@@ -281,7 +267,7 @@ func (b *buildContext) findOrAddColumnFamily(
 func (b *buildContext) alterTableDropColumn(
 	ctx context.Context, table catalog.TableDescriptor, t *tree.AlterTableDropColumn,
 ) {
-	if b.EvalCtx.SessionData.SafeUpdates {
+	if b.EvalCtx.SessionData().SafeUpdates {
 		panic(pgerror.DangerousStatementf("ALTER TABLE DROP COLUMN will " +
 			"remove all data in that column"))
 	}
@@ -365,19 +351,12 @@ func (b *buildContext) alterTableDropColumn(
 var _ = (*buildContext)(nil).alterTableDropColumn
 
 func (b *buildContext) maybeAddSequenceReferenceDependencies(
-	ctx context.Context,
-	st *cluster.Settings,
-	tableID descpb.ID,
-	col *descpb.ColumnDescriptor,
-	defaultExpr tree.TypedExpr,
+	ctx context.Context, tableID descpb.ID, col *descpb.ColumnDescriptor, defaultExpr tree.TypedExpr,
 ) {
-	seqIdentifiers, err := sequence.GetUsedSequences(defaultExpr)
+	seqIdentifiers, err := seqexpr.GetUsedSequences(defaultExpr)
 	if err != nil {
 		panic(err)
 	}
-	version := st.Version.ActiveVersionOrEmpty(ctx)
-	byID := version != (clusterversion.ClusterVersion{}) &&
-		version.IsActive(clusterversion.SequencesRegclass)
 
 	var tn tree.TableName
 	seqNameToID := make(map[string]int64)
@@ -408,12 +387,11 @@ func (b *buildContext) maybeAddSequenceReferenceDependencies(
 			SequenceID: seqDesc.GetID(),
 			TableID:    tableID,
 			ColumnID:   col.ID,
-			ByID:       byID,
 		})
 	}
 
-	if len(seqIdentifiers) > 0 && byID {
-		newExpr, err := sequence.ReplaceSequenceNamesWithIDs(defaultExpr, seqNameToID)
+	if len(seqIdentifiers) > 0 {
+		newExpr, err := seqexpr.ReplaceSequenceNamesWithIDs(defaultExpr, seqNameToID)
 		if err != nil {
 			panic(err)
 		}
@@ -583,30 +561,6 @@ func (b *buildContext) nextIndexID(table catalog.TableDescriptor) descpb.IndexID
 		nextMaxID = maxIdxID + 1
 	}
 	return nextMaxID
-}
-
-// minimumTypeUsageVersions defines the minimum version needed for a new
-// data type.
-var minimumTypeUsageVersions = map[types.Family]clusterversion.Key{
-	types.GeographyFamily: clusterversion.GeospatialType,
-	types.GeometryFamily:  clusterversion.GeospatialType,
-	types.Box2DFamily:     clusterversion.Box2DType,
-}
-
-// isTypeSupportedInVersion returns whether a given type is supported in the given version.
-// This is copied straight from the sql package.
-func isTypeSupportedInVersion(v clusterversion.ClusterVersion, t *types.T) bool {
-	// For these checks, if we have an array, we only want to find whether
-	// we support the array contents.
-	if t.Family() == types.ArrayFamily {
-		t = t.ArrayContents()
-	}
-
-	minVersion, ok := minimumTypeUsageVersions[t.Family()]
-	if !ok {
-		return true
-	}
-	return v.IsActive(minVersion)
 }
 
 func (b *buildContext) maybeCleanTableSequenceRefs(

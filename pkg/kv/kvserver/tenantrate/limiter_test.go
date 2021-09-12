@@ -11,8 +11,6 @@
 package tenantrate_test
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"regexp"
@@ -22,12 +20,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/metrictestutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
@@ -50,9 +49,9 @@ func TestCloser(t *testing.T) {
 	limiter := factory.GetTenant(tenant, closer)
 	ctx := context.Background()
 	// First Wait call will not block.
-	require.NoError(t, limiter.Wait(ctx, true, 1))
+	require.NoError(t, limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(true, 1)))
 	errCh := make(chan error, 1)
-	go func() { errCh <- limiter.Wait(ctx, true, 1<<30) }()
+	go func() { errCh <- limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(true, 1<<30)) }()
 	testutils.SucceedsSoon(t, func() error {
 		if timers := timeSource.Timers(); len(timers) != 1 {
 			return errors.Errorf("expected 1 timer, found %d", len(timers))
@@ -229,7 +228,9 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 		}
 		go func() {
 			// We'll not worry about ever releasing tenant Limiters.
-			s.reserveCh <- lims[0].Wait(s.ctx, s.isWrite, s.writeBytes)
+			s.reserveCh <- lims[0].Wait(
+				s.ctx, tenantcostmodel.TestingRequestInfo(s.isWrite, s.writeBytes),
+			)
 		}()
 	}
 	return ts.FormatRunning()
@@ -325,7 +326,7 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 		if len(lims) == 0 {
 			d.Fatalf(t, "no outstanding limiters for %v", tid)
 		}
-		lims[0].RecordRead(context.Background(), r.ReadBytes)
+		lims[0].RecordRead(context.Background(), tenantcostmodel.TestingResponseInfo(r.ReadBytes))
 	}
 	return ts.FormatRunning()
 }
@@ -364,9 +365,18 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 //  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
 //
 func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
+	// Compile the input into a regular expression.
+	re, err := regexp.Compile(d.Input)
+	if err != nil {
+		d.Fatalf(t, "failed to compile pattern: %v", err)
+	}
+
 	exp := strings.TrimSpace(d.Expected)
 	if err := testutils.SucceedsSoonError(func() error {
-		got := ts.getMetricsText(t, d)
+		got, err := metrictestutils.GetMetricsText(ts.m, re)
+		if err != nil {
+			d.Fatalf(t, "failed to scrape metrics: %v", err)
+		}
 		if got != exp {
 			return errors.Errorf("got:\n%s\nexp:\n%s\n", got, exp)
 		}
@@ -375,34 +385,6 @@ func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
 		d.Fatalf(t, "failed to find expected metrics: %v", err)
 	}
 	return d.Expected
-}
-
-func (ts *testState) getMetricsText(t *testing.T, d *datadriven.TestData) string {
-	ex := metric.MakePrometheusExporter()
-	ex.ScrapeRegistry(ts.m, true /* includeChildMetrics */)
-	var in bytes.Buffer
-	if err := ex.PrintAsText(&in); err != nil {
-		d.Fatalf(t, "failed to print prometheus data: %v", err)
-	}
-	// We want to compile the input into a regular expression.
-	re, err := regexp.Compile(d.Input)
-	if err != nil {
-		d.Fatalf(t, "failed to compile pattern: %v", err)
-	}
-	sc := bufio.NewScanner(&in)
-	var outLines []string
-	for sc.Scan() {
-		if bytes.HasPrefix(sc.Bytes(), []byte{'#'}) || !re.Match(sc.Bytes()) {
-			continue
-		}
-		outLines = append(outLines, sc.Text())
-	}
-	if err := sc.Err(); err != nil {
-		d.Fatalf(t, "failed to process metrics: %v", err)
-	}
-	sort.Strings(outLines)
-	metricsText := strings.Join(outLines, "\n")
-	return metricsText
 }
 
 // timers waits for the set of open timers to match the expected output.

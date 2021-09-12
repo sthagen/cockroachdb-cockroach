@@ -21,8 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -94,12 +92,6 @@ func NewServer(
 	// current method returns. See #66330.
 	ds.flowScheduler.Init(ds.Metrics)
 
-	colexec.HashAggregationDiskSpillingEnabled.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
-		if !colexec.HashAggregationDiskSpillingEnabled.Get(&cfg.Settings.SV) {
-			telemetry.Inc(sqltelemetry.HashAggregationDiskSpillingDisabled)
-		}
-	})
-
 	return ds
 }
 
@@ -160,7 +152,7 @@ func (ds *ServerImpl) Drain(
 	ctx context.Context, flowDrainWait time.Duration, reporter func(int, redact.SafeString),
 ) {
 	if err := ds.setDraining(true); err != nil {
-		log.Warningf(ctx, "unable to gossip distsql draining state: %s", err)
+		log.Warningf(ctx, "unable to gossip distsql draining state: %v", err)
 	}
 
 	flowWait := flowDrainWait
@@ -222,7 +214,7 @@ func (ds *ServerImpl) setupFlow(
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localState LocalState,
-) (context.Context, flowinfra.Flow, execinfra.OpChains, error) {
+) (retCtx context.Context, _ flowinfra.Flow, _ execinfra.OpChains, retErr error) {
 	if !FlowVerIsCompatible(req.Version, execinfra.MinAcceptedVersion, execinfra.Version) {
 		err := errors.Errorf(
 			"version mismatch in flow request: %d; this node accepts %d through %d",
@@ -232,8 +224,27 @@ func (ds *ServerImpl) setupFlow(
 		return ctx, nil, nil, err
 	}
 
+	var sp *tracing.Span          // will be Finish()ed by Flow.Cleanup()
+	var monitor *mon.BytesMonitor // will be closed in Flow.Cleanup()
+	var onFlowCleanup func()
+	// Make sure that we clean up all resources (which in the happy case are
+	// cleaned up in Flow.Cleanup()) if an error is encountered.
+	defer func() {
+		if retErr != nil {
+			if sp != nil {
+				sp.Finish()
+			}
+			if monitor != nil {
+				monitor.Stop(ctx)
+			}
+			if onFlowCleanup != nil {
+				onFlowCleanup()
+			}
+			retCtx = tracing.ContextWithSpan(ctx, nil)
+		}
+	}()
+
 	const opName = "flow"
-	var sp *tracing.Span // will be Finish()ed by Flow.Cleanup()
 	if parentSpan == nil {
 		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName)
 	} else if localState.IsLocal {
@@ -253,8 +264,7 @@ func (ds *ServerImpl) setupFlow(
 		)
 	}
 
-	// The monitor opened here is closed in Flow.Cleanup().
-	monitor := mon.NewMonitor(
+	monitor = mon.NewMonitor(
 		"flow",
 		mon.MemoryResource,
 		ds.Metrics.CurBytesCount,
@@ -285,7 +295,22 @@ func (ds *ServerImpl) setupFlow(
 	var leafTxn *kv.Txn
 	if localState.EvalContext != nil {
 		evalCtx = localState.EvalContext
+		// We're about to mutate the evalCtx and we want to restore its original
+		// state once the flow cleans up. Note that we could have made a copy of
+		// the whole evalContext, but that isn't free, so we choose to restore
+		// the original state in order to avoid performance regressions.
+		origMon := evalCtx.Mon
+		onFlowCleanup = func() {
+			evalCtx.Mon = origMon
+		}
 		evalCtx.Mon = monitor
+		if localState.HasConcurrency {
+			var err error
+			leafTxn, err = makeLeaf(req)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
 	} else {
 		if localState.IsLocal {
 			return nil, nil, nil, errors.AssertionFailedf(
@@ -294,7 +319,6 @@ func (ds *ServerImpl) setupFlow(
 
 		sd, err := sessiondata.UnmarshalNonLocal(req.EvalContext.SessionData)
 		if err != nil {
-			sp.Finish()
 			return ctx, nil, nil, err
 		}
 		ie := &lazyInternalExecutor{
@@ -311,14 +335,15 @@ func (ds *ServerImpl) setupFlow(
 			return nil, nil, nil, err
 		}
 		evalCtx = &tree.EvalContext{
-			Settings:    ds.ServerConfig.Settings,
-			SessionData: sd,
-			ClusterID:   ds.ServerConfig.ClusterID.Get(),
-			ClusterName: ds.ServerConfig.ClusterName,
-			NodeID:      ds.ServerConfig.NodeID,
-			Codec:       ds.ServerConfig.Codec,
-			ReCache:     ds.regexpCache,
-			Mon:         monitor,
+			Settings:         ds.ServerConfig.Settings,
+			SessionDataStack: sessiondata.NewStack(sd),
+			ClusterID:        ds.ServerConfig.ClusterID.Get(),
+			ClusterName:      ds.ServerConfig.ClusterName,
+			NodeID:           ds.ServerConfig.NodeID,
+			Codec:            ds.ServerConfig.Codec,
+			ReCache:          ds.regexpCache,
+			Mon:              monitor,
+			Locality:         ds.ServerConfig.Locality,
 			// Most processors will override this Context with their own context in
 			// ProcessorBase. StartInternal().
 			Context:            ctx,
@@ -328,10 +353,11 @@ func (ds *ServerImpl) setupFlow(
 			ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
 			Sequence:           &faketreeeval.DummySequenceOperators{},
 			Tenant:             &faketreeeval.DummyTenantOperator{},
+			Regions:            &faketreeeval.DummyRegionOperator{},
 			InternalExecutor:   ie,
 			Txn:                leafTxn,
 			SQLLivenessReader:  ds.ServerConfig.SQLLivenessReader,
-			SQLStatsResetter:   ds.ServerConfig.SQLStatsResetter,
+			SQLStatsController: ds.ServerConfig.SQLStatsController,
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 		evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
@@ -349,14 +375,15 @@ func (ds *ServerImpl) setupFlow(
 	isVectorized := req.EvalContext.SessionData.VectorizeMode != sessiondatapb.VectorizeOff
 	f := newFlow(
 		flowCtx, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
-		localState.LocalProcs, isVectorized,
+		localState.LocalProcs, isVectorized, onFlowCleanup,
 	)
 	opt := flowinfra.FuseNormally
-	if localState.IsLocal {
-		// If there's no remote flows, fuse everything. This is needed in order for
-		// us to be able to use the RootTxn for the flow 's execution; the RootTxn
-		// doesn't allow for concurrent operations. Local flows with mutations need
-		// to use the RootTxn.
+	if !localState.MustUseLeafTxn() {
+		// If there are no remote flows and the local flow doesn't have any
+		// concurrency, fuse everything. This is needed in order for us to be
+		// able to use the RootTxn for the flow 's execution; the RootTxn
+		// doesn't allow for concurrent operations. Local flows with mutations
+		// need to use the RootTxn.
 		opt = flowinfra.FuseAggressively
 	}
 
@@ -365,11 +392,6 @@ func (ds *ServerImpl) setupFlow(
 	ctx, opChains, err = f.Setup(ctx, &req.Flow, opt)
 	if err != nil {
 		log.Errorf(ctx, "error setting up flow: %s", err)
-		// Flow.Cleanup will not be called, so we have to close the memory monitor
-		// and finish the span manually.
-		monitor.Stop(ctx)
-		sp.Finish()
-		ctx = tracing.ContextWithSpan(ctx, nil)
 		return ctx, nil, nil, err
 	}
 	if !f.IsLocal() {
@@ -391,7 +413,6 @@ func (ds *ServerImpl) setupFlow(
 	} else {
 		// If I haven't created the leaf already, do it now.
 		if leafTxn == nil {
-			var err error
 			leafTxn, err = makeLeaf(req)
 			if err != nil {
 				return nil, nil, nil, err
@@ -452,12 +473,7 @@ func (ds *ServerImpl) newFlowContext(
 		// If we weren't passed a descs.Collection, then make a new one. We are
 		// responsible for cleaning it up and releasing any accessed descriptors
 		// on flow cleanup.
-		collection := descs.NewCollection(
-			ds.ServerConfig.Settings,
-			ds.ServerConfig.LeaseManager.(*lease.Manager),
-			ds.ServerConfig.HydratedTables,
-			ds.ServerConfig.VirtualSchemas,
-		)
+		collection := ds.CollectionFactory.NewCollection(descs.NewTemporarySchemaProvider(evalCtx.SessionDataStack))
 		flowCtx.TypeResolverFactory = &descs.DistSQLTypeResolverFactory{
 			Descriptors: collection,
 			CleanupFunc: func(ctx context.Context) {
@@ -475,8 +491,9 @@ func newFlow(
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
 	isVectorized bool,
+	onFlowCleanup func(),
 ) flowinfra.Flow {
-	base := flowinfra.NewFlowBase(flowCtx, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors)
+	base := flowinfra.NewFlowBase(flowCtx, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup)
 	if isVectorized {
 		return colflow.NewVectorizedFlow(base)
 	}
@@ -497,6 +514,10 @@ type LocalState struct {
 	// remote flows.
 	IsLocal bool
 
+	// HasConcurrency indicates whether the local flow uses multiple goroutines.
+	// It is set only if IsLocal is true.
+	HasConcurrency bool
+
 	// Txn is filled in on the gateway only. It is the RootTxn that the query is running in.
 	// This will be used directly by the flow if the flow has no concurrency and IsLocal is set.
 	// If there is concurrency, a LeafTxn will be created.
@@ -505,6 +526,12 @@ type LocalState struct {
 	// LocalProcs is an array of planNodeToRowSource processors. It's in order and
 	// will be indexed into by the RowSourceIdx field in LocalPlanNodeSpec.
 	LocalProcs []execinfra.LocalProcessor
+}
+
+// MustUseLeafTxn returns true if a LeafTxn must be used. It is valid to call
+// this method only after IsLocal and HasConcurrency have been set correctly.
+func (l LocalState) MustUseLeafTxn() bool {
+	return !l.IsLocal || l.HasConcurrency
 }
 
 // SetupLocalSyncFlow sets up a synchronous flow on the current (planning) node,

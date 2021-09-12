@@ -247,11 +247,18 @@ func runTPCC(ctx context.Context, t test.Test, c cluster.Cluster, opts tpccOptio
 		// Make a copy of i for the goroutine.
 		i := i
 		m.Go(func(ctx context.Context) error {
+			// Only prefix stats.json with workload_i_ if we have multiple workloads,
+			// in case other processes relied on previous behavior.
+			var statsPrefix string
+			if len(workloadInstances) > 1 {
+				statsPrefix = fmt.Sprintf("workload_%d.", i)
+			}
 			t.WorkerStatus(fmt.Sprintf("running tpcc idx %d on %s", i, pgURLs[i]))
 			cmd := fmt.Sprintf(
-				"./cockroach workload run tpcc --warehouses=%d --histograms="+t.PerfArtifactsDir()+"/stats.json "+
+				"./cockroach workload run tpcc --warehouses=%d --histograms="+t.PerfArtifactsDir()+"/%sstats.json "+
 					opts.ExtraRunArgs+" --ramp=%s --duration=%s --prometheus-port=%d --pprofport=%d %s %s",
 				opts.Warehouses,
+				statsPrefix,
 				rampDuration,
 				opts.Duration,
 				workloadInstances[i].prometheusPort,
@@ -259,8 +266,7 @@ func runTPCC(ctx context.Context, t test.Test, c cluster.Cluster, opts tpccOptio
 				workloadInstances[i].extraRunArgs,
 				pgURLs[i],
 			)
-			c.Run(ctx, workloadNode, cmd)
-			return nil
+			return c.RunE(ctx, workloadNode, cmd)
 		})
 	}
 	if opts.Chaos != nil {
@@ -330,7 +336,7 @@ func maxSupportedTPCCWarehouses(
 
 func registerTPCC(r registry.Registry) {
 	cloud := r.MakeClusterSpec(1).Cloud
-	headroomSpec := r.MakeClusterSpec(4, spec.CPU(16))
+	headroomSpec := r.MakeClusterSpec(4, spec.CPU(16), spec.RandomlyUseZfs())
 	r.Add(registry.TestSpec{
 		// w=headroom runs tpcc for a semi-extended period with some amount of
 		// headroom, more closely mirroring a real production deployment than
@@ -350,7 +356,7 @@ func registerTPCC(r registry.Registry) {
 			})
 		},
 	})
-	mixedHeadroomSpec := r.MakeClusterSpec(5, spec.CPU(16))
+	mixedHeadroomSpec := r.MakeClusterSpec(5, spec.CPU(16), spec.RandomlyUseZfs())
 
 	r.Add(registry.TestSpec{
 		// mixed-headroom is similar to w=headroom, but with an additional
@@ -487,11 +493,13 @@ func registerTPCC(r registry.Registry) {
 			zs = append(zs, s.zones)
 		}
 		const nodesPerRegion = 3
+		const warehousesPerRegion = 20
 
 		multiRegionTests := []struct {
-			desc              string
-			name              string
-			survivalGoal      string
+			desc         string
+			name         string
+			survivalGoal string
+
 			chaosTarget       func(iter int) option.NodeListOption
 			workloadInstances []workloadInstance
 		}{
@@ -595,7 +603,7 @@ func registerTPCC(r registry.Registry) {
 					iter := 0
 					chaosEventCh := make(chan ChaosEvent)
 					runTPCC(ctx, t, c, tpccOptions{
-						Warehouses:     len(regions) * 20,
+						Warehouses:     len(regions) * warehousesPerRegion,
 						Duration:       duration,
 						ExtraSetupArgs: partitionArgs,
 						ExtraRunArgs:   `--method=simple --wait=false --tolerate-errors ` + partitionArgs,
@@ -641,10 +649,15 @@ func registerTPCC(r registry.Registry) {
 								},
 								ch:         chaosEventCh,
 								promClient: promv1.NewAPI(client),
-								// We see a slow trickle of errors after a server has been
-								// force shutdown due to queries before the shutdown not
-								// fully completing.
-								maxErrorsDuringUptime: 10,
+								// We see a slow trickle of errors after a server has been force shutdown due
+								// to queries before the shutdown not fully completing. You can inspect this
+								// by looking at the workload logs and corresponding the errors with the
+								// prometheus graphs.
+								// The errors seen can be be of the form:
+								// * ERROR: inbox communication error: rpc error: code = Canceled
+								//   desc = context canceled (SQLSTATE 58C01)
+								// Setting this allows some errors to occur.
+								maxErrorsDuringUptime: warehousesPerRegion * 5,
 								// "delivery" does not trigger often.
 								allowZeroSuccessDuringUptime: true,
 							}, nil
@@ -726,8 +739,16 @@ func registerTPCC(r registry.Registry) {
 		Nodes: 3,
 		CPUs:  16,
 
-		LoadWarehouses: gceOrAws(cloud, 2500, 3000),
-		EstimatedMax:   gceOrAws(cloud, 2100, 2500),
+		LoadWarehouses: gceOrAws(cloud, 3000, 3500),
+		EstimatedMax:   gceOrAws(cloud, 2400, 3000),
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes:                   3,
+		CPUs:                    16,
+		AdmissionControlEnabled: true,
+
+		LoadWarehouses: gceOrAws(cloud, 3000, 3500),
+		EstimatedMax:   gceOrAws(cloud, 2400, 3000),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes: 12,
@@ -830,11 +851,12 @@ func (l tpccBenchLoadConfig) numLoadNodes(d tpccBenchDistribution) int {
 }
 
 type tpccBenchSpec struct {
-	Nodes        int
-	CPUs         int
-	Chaos        bool
-	Distribution tpccBenchDistribution
-	LoadConfig   tpccBenchLoadConfig
+	Nodes                   int
+	CPUs                    int
+	Chaos                   bool
+	AdmissionControlEnabled bool
+	Distribution            tpccBenchDistribution
+	LoadConfig              tpccBenchLoadConfig
 
 	// The number of warehouses to load into the cluster before beginning
 	// benchmarking. Should be larger than EstimatedMax and should be a
@@ -884,6 +906,9 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 	}
 	if b.Chaos {
 		nameParts = append(nameParts, "chaos")
+	}
+	if b.AdmissionControlEnabled {
+		nameParts = append(nameParts, "admission")
 	}
 
 	opts := []spec.Option{spec.CPU(b.CPUs)}
@@ -1059,7 +1084,9 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 	c.EncryptDefault(false)
 	c.EncryptAtRandom(false)
 	c.Start(ctx, append(b.startOpts(), roachNodes)...)
-
+	if b.AdmissionControlEnabled {
+		EnableAdmissionControl(ctx, t, c)
+	}
 	useHAProxy := b.Chaos
 	const restartWait = 15 * time.Second
 	{
@@ -1148,6 +1175,9 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 		}
 
 		c.Start(ctx, append(b.startOpts(), roachNodes)...)
+		if b.AdmissionControlEnabled {
+			EnableAdmissionControl(ctx, t, c)
+		}
 	}
 
 	s := search.NewLineSearcher(1, b.LoadWarehouses, b.EstimatedMax, initStepSize, precision)

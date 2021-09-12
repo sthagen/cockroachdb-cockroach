@@ -8,6 +8,7 @@ go_library(
     srcs = [
         "column.go",
         "constraint.go",
+        "default_privilege.go",
         "descriptor.go",
         "index.go",
         "join_type.go",
@@ -37,7 +38,6 @@ go_library(
         "//pkg/util/hlc",
         "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -86,7 +86,7 @@ go_proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/geo/geoindex",
-        "//pkg/roachpb",  # keep
+        "//pkg/roachpb:with-mocks",  # keep
         "//pkg/sql/types",
         "//pkg/util/hlc",
         "@com_github_gogo_protobuf//gogoproto",

@@ -64,6 +64,12 @@ const (
 	// without pushing anyone.
 	waitSelf
 
+	// waitQueueMaxLengthExceeded indicates that the request attempted to enter a
+	// lock wait-queue as a writer and found that the queue's length was already
+	// equal to or exceeding the request's configured maximum. As a result, the
+	// request was rejected.
+	waitQueueMaxLengthExceeded
+
 	// doneWaiting indicates that the request is done waiting on this pass
 	// through the lockTable and should make another call to ScanAndEnqueue.
 	doneWaiting
@@ -112,6 +118,9 @@ func (s waitingState) String() string {
 			return "wait elsewhere by proceeding to evaluation"
 		}
 		return fmt.Sprintf("wait elsewhere for txn %s @ key %s", s.txn.ID.Short(), s.key)
+	case waitQueueMaxLengthExceeded:
+		return fmt.Sprintf("wait-queue maximum length exceeded @ key %s with length %d",
+			s.key, s.queuedWriters)
 	case doneWaiting:
 		return "done waiting"
 	default:
@@ -316,6 +325,11 @@ func newLockTable(maxLocks int64) *lockTableImpl {
 //   transaction has a reservation. See the comment about "Reservations" in
 //   lockState.
 //
+// - The waitQueueMaxLengthExceeded state is used to indicate that the request
+//   was rejected because it attempted to enter a lock wait-queue as a writer
+//   and found that the queue's length was already equal to or exceeding the
+//   request's configured maximum.
+//
 // - The doneWaiting state is used to indicate that the request should make
 //   another call to ScanAndEnqueue() (that next call is more likely to return a
 //   lockTableGuard that returns false from StartWaiting()).
@@ -324,9 +338,10 @@ type lockTableGuardImpl struct {
 	lt     *lockTableImpl
 
 	// Information about this request.
-	txn   *enginepb.TxnMeta
-	ts    hlc.Timestamp
-	spans *spanset.SpanSet
+	txn                *enginepb.TxnMeta
+	ts                 hlc.Timestamp
+	spans              *spanset.SpanSet
+	maxWaitQueueLength int
 
 	// Snapshots of the trees for which this request has some spans. Note that
 	// the lockStates in these snapshots may have been removed from
@@ -344,6 +359,9 @@ type lockTableGuardImpl struct {
 	// TODO(sbhola): experimentally evaluate the lazy queueing of the current
 	// implementation, in comparison with eager queueing. If eager queueing
 	// is comparable in system throughput, one can eliminate the above anomalies.
+	//
+	// TODO(nvanbenschoten): should we be Reset-ing these btree snapshots when we
+	// Dequeue a lockTableGuardImpl? In releaseLockTableGuardImpl?
 	//
 	tableSnapshot [spanset.NumSpanScope]btree
 
@@ -1018,6 +1036,23 @@ func (l *lockState) safeFormat(sb *redact.StringBuilder, finalizedTxnCache *txnC
 	}
 }
 
+// addToMetrics adds the receiver's state to the provided metrics struct.
+func (l *lockState) addToMetrics(m *LockTableMetrics) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.isEmptyLock() {
+		return
+	}
+	lm := LockMetrics{
+		Key:            l.key,
+		Held:           l.holder.locked,
+		WaitingReaders: int64(l.waitingReaders.Len()),
+		WaitingWriters: int64(l.queuedWriters.Len()),
+	}
+	lm.Waiters = lm.WaitingReaders + lm.WaitingWriters
+	m.addLockMetrics(lm)
+}
+
 // Called for a write request when there is a reservation. Returns true iff it
 // succeeds.
 // REQUIRES: l.mu is locked.
@@ -1348,7 +1383,13 @@ func (l *lockState) tryActiveWait(
 		}
 	}
 
-	waitForState := waitingState{kind: waitFor, key: l.key}
+	waitForState := waitingState{
+		kind:          waitFor,
+		key:           l.key,
+		queuedWriters: l.queuedWriters.Len(),
+		queuedReaders: l.waitingReaders.Len(),
+		guardAccess:   sa,
+	}
 	if lockHolderTxn != nil {
 		waitForState.txn = lockHolderTxn
 		waitForState.held = true
@@ -1411,8 +1452,25 @@ func (l *lockState) tryActiveWait(
 				guard:  g,
 				active: true,
 			}
-			if l.queuedWriters.Len() == 0 {
+			if curLen := l.queuedWriters.Len(); curLen == 0 {
 				l.queuedWriters.PushFront(qg)
+			} else if g.maxWaitQueueLength > 0 && curLen >= g.maxWaitQueueLength {
+				// The wait-queue is longer than the request is willing to wait for.
+				// Instead of entering the queue, immediately reject the request. For
+				// simplicity, we are not finding the position of this writer in the
+				// queue and rejecting the tail of the queue above the max length. That
+				// would be more fair, but more complicated, and we expect that the
+				// common case is that this waiter will be at the end of the queue.
+				g.mu.startWait = true
+				state := waitForState
+				state.kind = waitQueueMaxLengthExceeded
+				g.mu.state = state
+				if notify {
+					g.notify()
+				}
+				// NOTE: we return wait=true not because the request is waiting, but
+				// because it should not continue scanning for conflicting locks.
+				return true, false
 			} else {
 				var e *list.Element
 				for e = l.queuedWriters.Back(); e != nil; e = e.Prev() {
@@ -1428,6 +1486,7 @@ func (l *lockState) tryActiveWait(
 				}
 			}
 			g.mu.locks[l] = struct{}{}
+			waitForState.queuedWriters = l.queuedWriters.Len() // update field
 		}
 		if replicatedLockFinalizedTxn != nil && l.queuedWriters.Front().Value.(*queuedGuard) == qg {
 			// First waiter, so should not wait. NB: this inactive waiter can be
@@ -1443,6 +1502,7 @@ func (l *lockState) tryActiveWait(
 		} else {
 			l.waitingReaders.PushFront(g)
 			g.mu.locks[l] = struct{}{}
+			waitForState.queuedReaders = l.waitingReaders.Len() // update field
 		}
 	}
 	if !wait {
@@ -1453,15 +1513,12 @@ func (l *lockState) tryActiveWait(
 	// Make it an active waiter.
 	g.key = l.key
 	g.mu.startWait = true
-	waitForState.queuedWriters = l.queuedWriters.Len()
-	waitForState.queuedReaders = l.waitingReaders.Len()
 	if g.isSameTxnAsReservation(waitForState) {
 		state := waitForState
 		state.kind = waitSelf
 		g.mu.state = state
 	} else {
 		state := waitForState
-		state.guardAccess = sa
 		if l.distinguishedWaiter == nil {
 			l.distinguishedWaiter = g
 			state.kind = waitForDistinguished
@@ -2180,6 +2237,7 @@ func (t *lockTableImpl) newGuardForReq(req Request) *lockTableGuardImpl {
 	g.txn = req.txnMeta()
 	g.ts = req.Timestamp
 	g.spans = req.LockSpans
+	g.maxWaitQueueLength = req.MaxLockWaitQueueLength
 	g.sa = spanset.NumSpanAccess - 1
 	g.index = -1
 	return g
@@ -2616,7 +2674,32 @@ func (t *lockTableImpl) Clear(disable bool) {
 	t.finalizedTxnCache.clear()
 }
 
-// For tests.
+// Metrics implements the lockTable interface.
+func (t *lockTableImpl) Metrics() LockTableMetrics {
+	var m LockTableMetrics
+	for i := 0; i < len(t.locks); i++ {
+		// Grab tree snapshot to avoid holding read lock during iteration.
+		var snap btree
+		{
+			tree := &t.locks[i]
+			tree.mu.RLock()
+			snap = tree.Clone()
+			tree.mu.RUnlock()
+		}
+
+		// Iterate and compute metrics.
+		iter := snap.MakeIter()
+		for iter.First(); iter.Valid(); iter.Next() {
+			iter.Cur().addToMetrics(&m)
+		}
+
+		// Reset snapshot to free resources.
+		snap.Reset()
+	}
+	return m
+}
+
+// String implements the lockTable interface.
 func (t *lockTableImpl) String() string {
 	var sb redact.StringBuilder
 	for i := 0; i < len(t.locks); i++ {

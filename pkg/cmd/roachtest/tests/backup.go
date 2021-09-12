@@ -21,12 +21,12 @@ import (
 	"strings"
 	"time"
 
+	cloudstorage "github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/amazon"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	cloudstorage "github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud/amazon"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -197,7 +197,10 @@ func registerBackup(r registry.Registry) {
 				// Upload the perf artifacts to any one of the nodes so that the test
 				// runner copies it into an appropriate directory path.
 				dest := filepath.Join(t.PerfArtifactsDir(), "stats.json")
-				if err := c.PutString(ctx, perfBuf.String(), dest, 755, c.Node(1)); err != nil {
+				if err := c.RunE(ctx, c.Node(1), "mkdir -p "+filepath.Dir(dest)); err != nil {
+					log.Errorf(ctx, "failed to create perf dir: %+v", err)
+				}
+				if err := c.PutString(ctx, perfBuf.String(), dest, 0755, c.Node(1)); err != nil {
 					log.Errorf(ctx, "failed to upload perf artifacts to node: %s", err.Error())
 				}
 				return nil

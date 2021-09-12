@@ -25,6 +25,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/ttycolor"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -38,7 +40,12 @@ type logStream interface {
 // writeLogStream pops messages off of s and writes them to out prepending
 // prefix per message and filtering messages which match filter.
 func writeLogStream(
-	s logStream, out io.Writer, filter *regexp.Regexp, prefix string, keepRedactable bool,
+	s logStream,
+	out io.Writer,
+	filter *regexp.Regexp,
+	prefix string,
+	keepRedactable bool,
+	cp ttycolor.Profile,
 ) error {
 	const chanSize = 1 << 16        // 64k
 	const maxWriteBufSize = 1 << 18 // 256kB
@@ -57,14 +64,19 @@ func writeLogStream(
 		*fileInfo
 	}
 	render := func(ei entryInfo, w io.Writer) (err error) {
+		// TODO(postamar): add support for other output formats
+		// Currently, `render` applies the `crdb-v1-tty` format regardless of the
+		// output logging format defined for the stderr sink. It should instead
+		// apply the selected output format.
 		var prefixBytes []byte
 		if prefixBytes, err = getPrefix(ei.fileInfo); err != nil {
 			return err
 		}
-		if _, err = w.Write(prefixBytes); err != nil {
+		err = log.FormatLegacyEntryPrefix(prefixBytes, w, cp)
+		if err != nil {
 			return err
 		}
-		return log.FormatLegacyEntry(ei.Entry, w)
+		return log.FormatLegacyEntryWithOptionalColors(ei.Entry, w, cp)
 	}
 
 	g, ctx := errgroup.WithContext(context.Background())
@@ -493,9 +505,8 @@ func (s *fileLogStream) open() bool {
 	if s.err = seekToFirstAfterFrom(s.f, s.from, s.editMode, s.format); s.err != nil {
 		return false
 	}
-	var err error
-	if s.d, err = log.NewEntryDecoderWithFormat(bufio.NewReaderSize(s.f, readBufSize), s.editMode, s.format); err != nil {
-		panic(err)
+	if s.d, s.err = log.NewEntryDecoderWithFormat(bufio.NewReaderSize(s.f, readBufSize), s.editMode, s.format); s.err != nil {
+		return false
 	}
 	return true
 }
@@ -574,13 +585,13 @@ func seekToFirstAfterFrom(
 		var e logpb.Entry
 		d, err := log.NewEntryDecoderWithFormat(f, editMode, format)
 		if err != nil {
-			panic(err)
+			panic(errors.WithMessagef(err, "error while processing file %s", f.Name()))
 		}
 		if err := d.Decode(&e); err != nil {
 			if err == io.EOF {
 				return true
 			}
-			panic(err)
+			panic(errors.WithMessagef(err, "error while processing file %s", f.Name()))
 		}
 		return e.Time >= from.UnixNano()
 	})
@@ -597,4 +608,44 @@ func seekToFirstAfterFrom(
 	}
 	_, err = f.Seek(int64(offset), io.SeekStart)
 	return err
+}
+
+type forceColor int
+
+const (
+	forceColorAuto forceColor = iota
+	forceColorOn
+	forceColorOff
+)
+
+// Type implements the pflag.Value interface.
+func (c *forceColor) Type() string { return "<true/false/auto>" }
+
+// String implements the pflag.Value interface.
+func (c *forceColor) String() string {
+	switch *c {
+	case forceColorAuto:
+		return "auto"
+	case forceColorOn:
+		return "true"
+	case forceColorOff:
+		return "false"
+	default:
+		panic(errors.AssertionFailedf("unknown value: %v", int(*c)))
+	}
+}
+
+// Set implements the pflag.Value interface.
+func (c *forceColor) Set(v string) error {
+	switch v {
+	case "on", "true":
+		*c = forceColorOn
+	case "off", "false":
+		*c = forceColorOff
+	case "auto":
+		*c = forceColorAuto
+	default:
+		return errors.Newf("unknown value: %v (supported: true/false/auto)", v)
+	}
+	return nil
 }

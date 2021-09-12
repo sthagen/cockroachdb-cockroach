@@ -39,7 +39,7 @@ import (
 var (
 	_ = typeconv.DatumVecCanonicalTypeFamily
 	_ apd.Context
-	_ coldataext.Datum
+	_ = coldataext.CompareDatum
 	_ duration.Duration
 	_ tree.AggType
 	_ json.JSON
@@ -873,14 +873,12 @@ func _RIGHT_SWITCH(_JOIN_TYPE joinTypeInfo, _HAS_SELECTION bool) { // */}}
 							}
 						} else {
 							out.Copy(
-								coldata.CopySliceArgs{
-									SliceArgs: coldata.SliceArgs{
-										Src:         src,
-										Sel:         sel,
-										DestIdx:     outStartIdx,
-										SrcStartIdx: o.builderState.right.curSrcStartIdx,
-										SrcEndIdx:   o.builderState.right.curSrcStartIdx + toAppend,
-									},
+								coldata.SliceArgs{
+									Src:         src,
+									Sel:         sel,
+									DestIdx:     outStartIdx,
+									SrcStartIdx: o.builderState.right.curSrcStartIdx,
+									SrcEndIdx:   o.builderState.right.curSrcStartIdx + toAppend,
 								},
 							)
 						}
@@ -1213,7 +1211,7 @@ func _SOURCE_FINISHED_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) Next() coldata.Batch {
 	o.output, _ = o.unlimitedAllocator.ResetMaybeReallocate(
-		o.outputTypes, o.output, 1 /* minCapacity */, o.memoryLimit,
+		o.outputTypes, o.output, 1 /* minDesiredCapacity */, o.memoryLimit,
 	)
 	o.bufferedGroup.helper.output = o.output
 	for {

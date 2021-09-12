@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -23,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -45,7 +46,13 @@ type Sink interface {
 	Dial() error
 	// EmitRow enqueues a row message for asynchronous delivery on the sink. An
 	// error may be returned if a previously enqueued message has failed.
-	EmitRow(ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp) error
+	EmitRow(
+		ctx context.Context,
+		topic TopicDescriptor,
+		key, value []byte,
+		updated hlc.Timestamp,
+		alloc kvevent.Alloc,
+	) error
 	// EmitResolvedTimestamp enqueues a resolved timestamp message for
 	// asynchronous delivery on every topic that has been seen by EmitRow. An
 	// error may be returned if a previously enqueued message has failed.
@@ -65,34 +72,54 @@ func getSink(
 	feedCfg jobspb.ChangefeedDetails,
 	timestampOracle timestampLowerBoundOracle,
 	user security.SQLUsername,
-	acc mon.BoundAccount,
 	jobID jobspb.JobID,
 ) (Sink, error) {
 	u, err := url.Parse(feedCfg.SinkURI)
 	if err != nil {
 		return nil, err
 	}
+	if scheme, ok := changefeedbase.NoLongerExperimental[u.Scheme]; ok {
+		u.Scheme = scheme
+	}
+
+	// check that options are compatible with the given sink
+	validateOptionsAndMakeSink := func(sinkSpecificOpts map[string]struct{}, makeSink func() (Sink, error)) (Sink, error) {
+		err := validateSinkOptions(feedCfg.Opts, sinkSpecificOpts)
+		if err != nil {
+			return nil, err
+		}
+		return makeSink()
+	}
 
 	newSink := func() (Sink, error) {
-		switch {
-		case u.Scheme == changefeedbase.SinkSchemeBuffer:
+		if feedCfg.SinkURI == "" {
 			return &bufferSink{}, nil
+		}
+
+		switch {
 		case u.Scheme == changefeedbase.SinkSchemeNull:
 			return makeNullSink(sinkURL{URL: u})
 		case u.Scheme == changefeedbase.SinkSchemeKafka:
-			return makeKafkaSink(ctx, sinkURL{URL: u}, feedCfg.Targets, feedCfg.Opts, acc)
+			return validateOptionsAndMakeSink(changefeedbase.KafkaValidOptions, func() (Sink, error) {
+				return makeKafkaSink(ctx, sinkURL{URL: u}, feedCfg.Targets, feedCfg.Opts)
+			})
 		case isWebhookSink(u):
-			return makeWebhookSink(ctx, sinkURL{URL: u}, feedCfg.Opts)
+			return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
+				return makeWebhookSink(ctx, sinkURL{URL: u}, feedCfg.Opts, defaultWorkerCount(), timeutil.DefaultTimeSource{})
+			})
 		case isCloudStorageSink(u):
-			return makeCloudStorageSink(
-				ctx, sinkURL{URL: u}, serverCfg.NodeID.SQLInstanceID(), serverCfg.Settings,
-				feedCfg.Opts, timestampOracle, serverCfg.ExternalStorageFromURI, user, acc,
-			)
+			return validateOptionsAndMakeSink(changefeedbase.CloudStorageValidOptions, func() (Sink, error) {
+				return makeCloudStorageSink(
+					ctx, sinkURL{URL: u}, serverCfg.NodeID.SQLInstanceID(), serverCfg.Settings,
+					feedCfg.Opts, timestampOracle, serverCfg.ExternalStorageFromURI, user,
+				)
+			})
 		case u.Scheme == changefeedbase.SinkSchemeExperimentalSQL:
-			return makeSQLSink(sinkURL{URL: u}, sqlSinkTableName, feedCfg.Targets)
-		case u.Scheme == changefeedbase.SinkSchemeHTTP || u.Scheme == changefeedbase.SinkSchemeHTTPS:
-			return nil, errors.Errorf(`unsupported sink: %s. HTTP endpoints can be used with %s and %s`,
-				u.Scheme, changefeedbase.SinkSchemeWebhookHTTPS, changefeedbase.SinkSchemeCloudStorageHTTPS)
+			return validateOptionsAndMakeSink(changefeedbase.SQLValidOptions, func() (Sink, error) {
+				return makeSQLSink(sinkURL{URL: u}, sqlSinkTableName, feedCfg.Targets)
+			})
+		case u.Scheme == "":
+			return nil, errors.Errorf(`no scheme found for sink URL %q`, feedCfg.SinkURI)
 		default:
 			return nil, errors.Errorf(`unsupported sink: %s`, u.Scheme)
 		}
@@ -112,6 +139,21 @@ func getSink(
 	}
 
 	return sink, nil
+}
+
+func validateSinkOptions(opts map[string]string, sinkSpecificOpts map[string]struct{}) error {
+	for opt := range opts {
+		if _, ok := changefeedbase.CommonOptions[opt]; ok {
+			continue
+		}
+		if sinkSpecificOpts != nil {
+			if _, ok := sinkSpecificOpts[opt]; ok {
+				continue
+			}
+		}
+		return errors.Errorf("this sink is incompatible with option %s", opt)
+	}
+	return nil
 }
 
 // sinkURL is a helper struct which for "consuming" URL query
@@ -181,9 +223,13 @@ type errorWrapperSink struct {
 
 // EmitRow implements Sink interface.
 func (s errorWrapperSink) EmitRow(
-	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context,
+	topicDescr TopicDescriptor,
+	key, value []byte,
+	updated hlc.Timestamp,
+	r kvevent.Alloc,
 ) error {
-	if err := s.wrapped.EmitRow(ctx, topicDescr, key, value, updated); err != nil {
+	if err := s.wrapped.EmitRow(ctx, topicDescr, key, value, updated, r); err != nil {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
@@ -247,8 +293,14 @@ type bufferSink struct {
 
 // EmitRow implements the Sink interface.
 func (s *bufferSink) EmitRow(
-	ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context,
+	topic TopicDescriptor,
+	key, value []byte,
+	updated hlc.Timestamp,
+	r kvevent.Alloc,
 ) error {
+	defer r.Release(ctx)
+
 	if s.closed {
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
@@ -331,8 +383,14 @@ func (n *nullSink) pace(ctx context.Context) error {
 
 // EmitRow implements Sink interface.
 func (n *nullSink) EmitRow(
-	ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context,
+	topic TopicDescriptor,
+	key, value []byte,
+	updated hlc.Timestamp,
+	r kvevent.Alloc,
 ) error {
+	defer r.Release(ctx)
+
 	if err := n.pace(ctx); err != nil {
 		return err
 	}

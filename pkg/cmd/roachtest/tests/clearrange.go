@@ -38,6 +38,21 @@ func registerClearRange(r registry.Registry) {
 				runClearRange(ctx, t, c, checks)
 			},
 		})
+
+		// Using a separate clearrange test on zfs instead of randomly
+		// using the same test, cause the Timeout might be different,
+		// and may need to be tweaked.
+		r.Add(registry.TestSpec{
+			Name:  fmt.Sprintf(`clearrange/zfs/checks=%t`, checks),
+			Owner: registry.OwnerStorage,
+			// 5h for import, 120 for the test. The import should take closer
+			// to <3:30h but it varies.
+			Timeout: 5*time.Hour + 120*time.Minute,
+			Cluster: r.MakeClusterSpec(10, spec.CPU(16), spec.SetFileSystem(spec.Zfs)),
+			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				runClearRange(ctx, t, c, checks)
+			},
+		})
 	}
 }
 
@@ -64,7 +79,8 @@ func runClearRange(ctx context.Context, t test.Test, c cluster.Cluster, aggressi
 		//
 		// NB: the below invocation was found to actually make it to the server at the time of writing.
 		opts = append(opts, option.StartArgs(
-			"--env", "COCKROACH_CONSISTENCY_AGGRESSIVE=true COCKROACH_ENFORCE_CONSISTENT_STATS=true",
+			"--env", "COCKROACH_CONSISTENCY_AGGRESSIVE=true",
+			"--env", "COCKROACH_ENFORCE_CONSISTENT_STATS=true",
 		))
 	}
 	c.Start(ctx, opts...)

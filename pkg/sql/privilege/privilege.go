@@ -71,9 +71,28 @@ var (
 	TypePrivileges   = List{ALL, GRANT, USAGE}
 )
 
+// PGIncompatibleDBPrivileges represents the privileges CockroachDB
+// supports on the database that are not supported in Postgres.
+// In 21.2, these privileges will be translated to ALTER DEFAULT PRIVILEGES FOR
+// ALL ROLES on the database instead of being granted as privileges on the
+// database itself.
+// We will also hint that the GRANT syntax for these privileges are being
+// deprecated and instead run the equivalent ALTER DEFAULT PRIVILEGES FOR ALL
+// ROLES.
+// TODO(richardcai): Remove this and the syntax for granting these privileges
+//    to databases in 22.1. In 22.1, we should have a long-running migration
+//    to convert incompatible privileges into default privileges.
+//    See: https://github.com/cockroachdb/cockroach/issues/68731
+var PGIncompatibleDBPrivileges = List{SELECT, INSERT, UPDATE, DELETE}
+
 // Mask returns the bitmask for a given privilege.
 func (k Kind) Mask() uint32 {
 	return 1 << k
+}
+
+// IsSetIn returns true if this privilege kind is set in the supplied bitfield.
+func (k Kind) IsSetIn(bits uint32) bool {
+	return bits&k.Mask() != 0
 }
 
 // ByValue is just an array of privilege kinds sorted by value.
@@ -113,7 +132,7 @@ func (pl List) Less(i, j int) bool {
 }
 
 // names returns a list of privilege names in the same
-// order as 'pl'.
+// order as "pl".
 func (pl List) names() []string {
 	ret := make([]string, len(pl))
 	for i, p := range pl {
@@ -235,4 +254,37 @@ func GetValidPrivilegesForObject(objectType ObjectType) List {
 	default:
 		panic(errors.AssertionFailedf("unknown object type %s", objectType))
 	}
+}
+
+// ListToACL converts a list of privileges to a list of Postgres
+// ACL items.
+// See: https://www.postgresql.org/docs/13/ddl-priv.html#PRIVILEGE-ABBREVS-TABLE
+//     for privileges and their ACL abbreviations.
+func (pl List) ListToACL(objectType ObjectType) string {
+	privileges := pl
+	// If ALL is present, explode ALL into the underlying privileges.
+	if pl.Contains(ALL) {
+		privileges = GetValidPrivilegesForObject(objectType)
+	}
+	chars := make([]string, len(privileges))
+	for _, privilege := range privileges {
+		switch privilege {
+		case CREATE:
+			chars = append(chars, "C")
+		case SELECT:
+			chars = append(chars, "r")
+		case INSERT:
+			chars = append(chars, "a")
+		case DELETE:
+			chars = append(chars, "d")
+		case UPDATE:
+			chars = append(chars, "w")
+		case USAGE:
+			chars = append(chars, "U")
+		case CONNECT:
+			chars = append(chars, "c")
+		}
+	}
+	sort.Strings(chars)
+	return strings.Join(chars, "")
 }

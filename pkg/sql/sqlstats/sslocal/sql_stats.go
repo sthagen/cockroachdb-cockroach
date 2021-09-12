@@ -13,6 +13,7 @@ package sslocal
 import (
 	"context"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -100,6 +101,21 @@ func newSQLStats(
 	return s
 }
 
+// GetTotalFingerprintCount returns total number of unique statement and
+// transaction fingerprints stored in the currnet SQLStats.
+func (s *SQLStats) GetTotalFingerprintCount() int64 {
+	return atomic.LoadInt64(&s.atomic.uniqueStmtFingerprintCount) + atomic.LoadInt64(&s.atomic.uniqueTxnFingerprintCount)
+}
+
+// GetTotalFingerprintBytes returns the total amount of bytes currently
+// allocated for storing statistics for both statement and transaction
+// fingerprints.
+func (s *SQLStats) GetTotalFingerprintBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mu.mon.AllocBytes()
+}
+
 func (s *SQLStats) getStatsForApplication(appName string) *ssmemstorage.Container {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,6 +129,7 @@ func (s *SQLStats) getStatsForApplication(appName string) *ssmemstorage.Containe
 		&s.atomic.uniqueStmtFingerprintCount,
 		&s.atomic.uniqueTxnFingerprintCount,
 		s.mu.mon,
+		appName,
 	)
 	s.mu.apps[appName] = a
 	return a

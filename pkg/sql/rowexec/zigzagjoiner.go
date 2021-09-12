@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
@@ -246,13 +247,15 @@ type zigzagJoiner struct {
 
 	rowAlloc           rowenc.EncDatumRowAlloc
 	fetchedInititalRow bool
+
+	scanStats execinfra.ScanStats
 }
 
 // zigzagJoinerBatchSize is a parameter which determines how many rows should
 // be fetched at a time. Increasing this will improve performance for when
 // matched rows are grouped together, but increasing this too much will result
 // in fetching too many rows and therefore skipping less rows.
-var zigzagJoinerBatchSize = int64(util.ConstantWithMetamorphicTestValue(
+var zigzagJoinerBatchSize = rowinfra.RowLimit(util.ConstantWithMetamorphicTestValue(
 	"zig-zag-joiner-batch-size",
 	5, /* defaultValue */
 	1, /* metamorphicValue */
@@ -793,7 +796,7 @@ func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatu
 			ctx,
 			txn,
 			roachpb.Spans{roachpb.Span{Key: curInfo.key, EndKey: curInfo.endKey}},
-			true, /* batch limit */
+			rowinfra.DefaultBatchBytesLimit,
 			zigzagJoinerBatchSize,
 			z.FlowCtx.TraceKV,
 			z.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
@@ -938,7 +941,7 @@ func (z *zigzagJoiner) maybeFetchInitialRow() error {
 			z.Ctx,
 			z.FlowCtx.Txn,
 			roachpb.Spans{roachpb.Span{Key: curInfo.key, EndKey: curInfo.endKey}},
-			true, /* batch limit */
+			rowinfra.DefaultBatchBytesLimit,
 			zigzagJoinerBatchSize,
 			z.FlowCtx.TraceKV,
 			z.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
@@ -990,10 +993,13 @@ func (z *zigzagJoiner) ConsumerClosed() {
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
 func (z *zigzagJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
+	z.scanStats = execinfra.GetScanStats(z.Ctx)
+
 	kvStats := execinfrapb.KVStats{
 		BytesRead:      optional.MakeUint(uint64(z.getBytesRead())),
 		ContentionTime: optional.MakeTimeValue(execinfra.GetCumulativeContentionTime(z.Ctx)),
 	}
+	execinfra.PopulateKVMVCCStats(&kvStats, &z.scanStats)
 	for i := range z.infos {
 		fis, ok := getFetcherInputStats(z.infos[i].fetcher)
 		if !ok {

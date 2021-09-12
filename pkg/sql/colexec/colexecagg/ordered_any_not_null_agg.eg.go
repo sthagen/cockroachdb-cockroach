@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -34,7 +33,6 @@ var (
 	_ duration.Duration
 	_ json.JSON
 	_ colexecerror.StorageError
-	_ coldataext.Datum
 )
 
 func newAnyNotNullOrderedAggAlloc(
@@ -121,7 +119,7 @@ func (a *anyNotNullBoolOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullBoolOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -133,10 +131,10 @@ func (a *anyNotNullBoolOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -165,7 +163,7 @@ func (a *anyNotNullBoolOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -195,7 +193,7 @@ func (a *anyNotNullBoolOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -319,7 +317,7 @@ func (a *anyNotNullBytesOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullBytesOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	oldCurAggSize := len(a.curAgg)
@@ -331,10 +329,10 @@ func (a *anyNotNullBytesOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -363,7 +361,7 @@ func (a *anyNotNullBytesOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -393,7 +391,7 @@ func (a *anyNotNullBytesOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -521,7 +519,7 @@ func (a *anyNotNullDecimalOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullDecimalOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	oldCurAggSize := tree.SizeOfDecimal(&a.curAgg)
@@ -533,10 +531,10 @@ func (a *anyNotNullDecimalOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -565,7 +563,7 @@ func (a *anyNotNullDecimalOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -595,7 +593,7 @@ func (a *anyNotNullDecimalOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -719,7 +717,7 @@ func (a *anyNotNullInt16OrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullInt16OrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -731,10 +729,10 @@ func (a *anyNotNullInt16OrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -763,7 +761,7 @@ func (a *anyNotNullInt16OrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -793,7 +791,7 @@ func (a *anyNotNullInt16OrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -917,7 +915,7 @@ func (a *anyNotNullInt32OrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullInt32OrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -929,10 +927,10 @@ func (a *anyNotNullInt32OrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -961,7 +959,7 @@ func (a *anyNotNullInt32OrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -991,7 +989,7 @@ func (a *anyNotNullInt32OrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -1115,7 +1113,7 @@ func (a *anyNotNullInt64OrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullInt64OrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -1127,10 +1125,10 @@ func (a *anyNotNullInt64OrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1159,7 +1157,7 @@ func (a *anyNotNullInt64OrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1189,7 +1187,7 @@ func (a *anyNotNullInt64OrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -1313,7 +1311,7 @@ func (a *anyNotNullFloat64OrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullFloat64OrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -1325,10 +1323,10 @@ func (a *anyNotNullFloat64OrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1357,7 +1355,7 @@ func (a *anyNotNullFloat64OrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1387,7 +1385,7 @@ func (a *anyNotNullFloat64OrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -1511,7 +1509,7 @@ func (a *anyNotNullTimestampOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullTimestampOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -1523,10 +1521,10 @@ func (a *anyNotNullTimestampOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1555,7 +1553,7 @@ func (a *anyNotNullTimestampOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1585,7 +1583,7 @@ func (a *anyNotNullTimestampOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -1709,7 +1707,7 @@ func (a *anyNotNullIntervalOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullIntervalOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -1721,10 +1719,10 @@ func (a *anyNotNullIntervalOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1753,7 +1751,7 @@ func (a *anyNotNullIntervalOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1783,7 +1781,7 @@ func (a *anyNotNullIntervalOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -1907,7 +1905,7 @@ func (a *anyNotNullJSONOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullJSONOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
@@ -1922,10 +1920,10 @@ func (a *anyNotNullJSONOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -1965,7 +1963,7 @@ func (a *anyNotNullJSONOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -2006,7 +2004,7 @@ func (a *anyNotNullJSONOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -2162,12 +2160,12 @@ func (a *anyNotNullDatumOrderedAgg) SetOutput(vec coldata.Vec) {
 }
 
 func (a *anyNotNullDatumOrderedAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
+	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 
 	var oldCurAggSize uintptr
 	if a.curAgg != nil {
-		oldCurAggSize = a.curAgg.(*coldataext.Datum).Size()
+		oldCurAggSize = a.curAgg.(tree.Datum).Size()
 	}
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Datum(), vec.Nulls()
@@ -2177,10 +2175,10 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 		groups := a.groups
 		col := col
 		if sel == nil {
-			_ = groups[inputLen-1]
-			_ = col.Get(inputLen - 1)
+			_, _ = groups[endIdx-1], groups[startIdx]
+			_, _ = col.Get(endIdx-1), col.Get(startIdx)
 			if nulls.MaybeHasNulls() {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -2209,7 +2207,7 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 					}
 				}
 			} else {
-				for i := 0; i < inputLen; i++ {
+				for i := startIdx; i < endIdx; i++ {
 					//gcassert:bce
 					if groups[i] {
 						if !a.isFirstGroup {
@@ -2239,7 +2237,7 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 				}
 			}
 		} else {
-			sel = sel[:inputLen]
+			sel = sel[startIdx:endIdx]
 			if nulls.MaybeHasNulls() {
 				for _, i := range sel {
 					if groups[i] {
@@ -2303,7 +2301,7 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 
 	var newCurAggSize uintptr
 	if a.curAgg != nil {
-		newCurAggSize = a.curAgg.(*coldataext.Datum).Size()
+		newCurAggSize = a.curAgg.(tree.Datum).Size()
 	}
 	if newCurAggSize != oldCurAggSize {
 		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
@@ -2326,7 +2324,7 @@ func (a *anyNotNullDatumOrderedAgg) Flush(outputIdx int) {
 
 	var oldCurAggSize uintptr
 	if a.curAgg != nil {
-		oldCurAggSize = a.curAgg.(*coldataext.Datum).Size()
+		oldCurAggSize = a.curAgg.(tree.Datum).Size()
 	}
 	a.allocator.AdjustMemoryUsage(-int64(oldCurAggSize))
 	a.curAgg = nil

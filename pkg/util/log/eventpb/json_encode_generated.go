@@ -129,6 +129,40 @@ func (m *AlterDatabaseOwner) AppendJSONFields(printComma bool, b redact.Redactab
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *AlterDatabasePlacement) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	if m.DatabaseName != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"DatabaseName\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.DatabaseName)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	if m.Placement != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"Placement\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.Placement)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *AlterDatabasePrimaryRegion) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
@@ -191,6 +225,50 @@ func (m *AlterDatabaseSurvivalGoal) AppendJSONFields(printComma bool, b redact.R
 		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.SurvivalGoal)))))
 		b = append(b, redact.EndMarker()...)
 		b = append(b, '"')
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *AlterDefaultPrivileges) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLPrivilegeEventDetails.AppendJSONFields(printComma, b)
+
+	if m.DatabaseName != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"DatabaseName\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.DatabaseName)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	if m.RoleName != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"RoleName\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.RoleName)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	if m.ForAllRoles {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"ForAllRoles\":true"...)
 	}
 
 	return printComma, b
@@ -1076,6 +1154,59 @@ func (m *CommonJobEventDetails) AppendJSONFields(printComma bool, b redact.Redac
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *CommonLargeRowDetails) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	if m.RowSize != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"RowSize\":"...)
+		b = strconv.AppendUint(b, uint64(m.RowSize), 10)
+	}
+
+	if m.TableID != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"TableID\":"...)
+		b = strconv.AppendUint(b, uint64(m.TableID), 10)
+	}
+
+	if m.FamilyID != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"FamilyID\":"...)
+		b = strconv.AppendUint(b, uint64(m.FamilyID), 10)
+	}
+
+	if m.PrimaryKey != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"PrimaryKey\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.PrimaryKey)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	if m.ViolatesMaxRowSizeErr {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"ViolatesMaxRowSizeErr\":true"...)
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *CommonNodeDecommissionDetails) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	if m.RequestingNodeID != 0 {
@@ -1418,6 +1549,41 @@ func (m *CommonSessionDetails) AppendJSONFields(printComma bool, b redact.Redact
 		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.User)))))
 		b = append(b, redact.EndMarker()...)
 		b = append(b, '"')
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *CommonTxnRowsLimitDetails) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	if m.TxnID != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"TxnID\":\""...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.TxnID)))
+		b = append(b, '"')
+	}
+
+	if m.SessionID != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"SessionID\":\""...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.SessionID)))
+		b = append(b, '"')
+	}
+
+	if m.NumRows != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"NumRows\":"...)
+		b = strconv.AppendInt(b, int64(m.NumRows), 10)
 	}
 
 	return printComma, b
@@ -2120,6 +2286,26 @@ func (m *Import) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bo
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *LargeRow) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonLargeRowDetails.AppendJSONFields(printComma, b)
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *LargeRowInternal) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonLargeRowDetails.AppendJSONFields(printComma, b)
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *NodeDecommissioned) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
@@ -2542,6 +2728,18 @@ func (m *RuntimeStats) AppendJSONFields(printComma bool, b redact.RedactableByte
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *SampledQuery) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLExecDetails.AppendJSONFields(printComma, b)
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *SensitiveTableAccess) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
@@ -2707,6 +2905,54 @@ func (m *TruncateTable) AppendJSONFields(printComma bool, b redact.RedactableByt
 		b = append(b, redact.EndMarker()...)
 		b = append(b, '"')
 	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *TxnRowsReadLimit) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonTxnRowsLimitDetails.AppendJSONFields(printComma, b)
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *TxnRowsReadLimitInternal) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonTxnRowsLimitDetails.AppendJSONFields(printComma, b)
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *TxnRowsWrittenLimit) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonTxnRowsLimitDetails.AppendJSONFields(printComma, b)
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
+func (m *TxnRowsWrittenLimitInternal) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonTxnRowsLimitDetails.AppendJSONFields(printComma, b)
 
 	return printComma, b
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -34,8 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
@@ -74,6 +77,30 @@ type RewriteEvTypes string
 
 const evTypeSelect RewriteEvTypes = "1"
 
+//PGShDependType is an enumeration that lists pg_shdepend deptype column values
+type PGShDependType string
+
+const (
+	// sharedDependencyOwner is a deptype used to reference an object with the
+	// owner of the dependent object.
+	sharedDependencyOwner PGShDependType = "o"
+
+	// sharedDependencyACL in postgres The referenced object is mentioned in the
+	// ACL (access control list, i.e., privileges list) of the dependent object.
+	// (A SHARED_DEPENDENCY_ACL entry is not made for the owner of the object,
+	// since the owner will have a SHARED_DEPENDENCY_OWNER entry anyway.)
+	// For cockroachDB deptype is sharedDependencyACL if the role is not the
+	// owner neither a pinned role.
+	sharedDependencyACL PGShDependType = "a"
+
+	// sharedDependencyPin in postgres for this deptype there is no dependent
+	// object; this type of entry is a signal that the system itself depends on
+	// the referenced object, and so that object must never be deleted. Entries
+	// of this type are created only by initdb.
+	// In cockroachDB the similar roles are root and admin.
+	sharedDependencyPin PGShDependType = "p"
+)
+
 var forwardIndexOid = stringOid(indexTypeForwardIndex)
 var invertedIndexOid = stringOid(indexTypeInvertedIndex)
 
@@ -87,33 +114,6 @@ var pgCatalog = virtualSchema{
 		// select distinct '"'||table_name||'",' from information_schema.tables
 		//    where table_schema='pg_catalog' order by table_name;
 		"pg_pltemplate",
-		"pg_stat_all_indexes",
-		"pg_stat_all_tables",
-		"pg_stat_archiver",
-		"pg_stat_bgwriter",
-		"pg_stat_progress_vacuum",
-		"pg_stat_replication",
-		"pg_stat_ssl",
-		"pg_stat_subscription",
-		"pg_stat_sys_indexes",
-		"pg_stat_sys_tables",
-		"pg_stat_user_functions",
-		"pg_stat_user_indexes",
-		"pg_stat_user_tables",
-		"pg_stat_wal_receiver",
-		"pg_stat_xact_all_tables",
-		"pg_stat_xact_sys_tables",
-		"pg_stat_xact_user_functions",
-		"pg_stat_xact_user_tables",
-		"pg_statio_all_indexes",
-		"pg_statio_all_sequences",
-		"pg_statio_all_tables",
-		"pg_statio_sys_indexes",
-		"pg_statio_sys_sequences",
-		"pg_statio_sys_tables",
-		"pg_statio_user_indexes",
-		"pg_statio_user_sequences",
-		"pg_statio_user_tables",
 		"pg_statistic",
 		"pg_stats",
 	),
@@ -189,8 +189,41 @@ var pgCatalog = virtualSchema{
 		catconstants.PgCatalogShdependTableID:                   pgCatalogShdependTable,
 		catconstants.PgCatalogShmemAllocationsTableID:           pgCatalogShmemAllocationsTable,
 		catconstants.PgCatalogStatActivityTableID:               pgCatalogStatActivityTable,
+		catconstants.PgCatalogStatAllIndexesTableID:             pgCatalogStatAllIndexesTable,
+		catconstants.PgCatalogStatAllTablesTableID:              pgCatalogStatAllTablesTable,
+		catconstants.PgCatalogStatArchiverTableID:               pgCatalogStatArchiverTable,
+		catconstants.PgCatalogStatBgwriterTableID:               pgCatalogStatBgwriterTable,
 		catconstants.PgCatalogStatDatabaseConflictsTableID:      pgCatalogStatDatabaseConflictsTable,
 		catconstants.PgCatalogStatDatabaseTableID:               pgCatalogStatDatabaseTable,
+		catconstants.PgCatalogStatGssapiTableID:                 pgCatalogStatGssapiTable,
+		catconstants.PgCatalogStatProgressAnalyzeTableID:        pgCatalogStatProgressAnalyzeTable,
+		catconstants.PgCatalogStatProgressBasebackupTableID:     pgCatalogStatProgressBasebackupTable,
+		catconstants.PgCatalogStatProgressClusterTableID:        pgCatalogStatProgressClusterTable,
+		catconstants.PgCatalogStatProgressCreateIndexTableID:    pgCatalogStatProgressCreateIndexTable,
+		catconstants.PgCatalogStatProgressVacuumTableID:         pgCatalogStatProgressVacuumTable,
+		catconstants.PgCatalogStatReplicationTableID:            pgCatalogStatReplicationTable,
+		catconstants.PgCatalogStatSlruTableID:                   pgCatalogStatSlruTable,
+		catconstants.PgCatalogStatSslTableID:                    pgCatalogStatSslTable,
+		catconstants.PgCatalogStatSubscriptionTableID:           pgCatalogStatSubscriptionTable,
+		catconstants.PgCatalogStatSysIndexesTableID:             pgCatalogStatSysIndexesTable,
+		catconstants.PgCatalogStatSysTablesTableID:              pgCatalogStatSysTablesTable,
+		catconstants.PgCatalogStatUserFunctionsTableID:          pgCatalogStatUserFunctionsTable,
+		catconstants.PgCatalogStatUserIndexesTableID:            pgCatalogStatUserIndexesTable,
+		catconstants.PgCatalogStatUserTablesTableID:             pgCatalogStatUserTablesTable,
+		catconstants.PgCatalogStatWalReceiverTableID:            pgCatalogStatWalReceiverTable,
+		catconstants.PgCatalogStatXactAllTablesTableID:          pgCatalogStatXactAllTablesTable,
+		catconstants.PgCatalogStatXactSysTablesTableID:          pgCatalogStatXactSysTablesTable,
+		catconstants.PgCatalogStatXactUserFunctionsTableID:      pgCatalogStatXactUserFunctionsTable,
+		catconstants.PgCatalogStatXactUserTablesTableID:         pgCatalogStatXactUserTablesTable,
+		catconstants.PgCatalogStatioAllIndexesTableID:           pgCatalogStatioAllIndexesTable,
+		catconstants.PgCatalogStatioAllSequencesTableID:         pgCatalogStatioAllSequencesTable,
+		catconstants.PgCatalogStatioAllTablesTableID:            pgCatalogStatioAllTablesTable,
+		catconstants.PgCatalogStatioSysIndexesTableID:           pgCatalogStatioSysIndexesTable,
+		catconstants.PgCatalogStatioSysSequencesTableID:         pgCatalogStatioSysSequencesTable,
+		catconstants.PgCatalogStatioSysTablesTableID:            pgCatalogStatioSysTablesTable,
+		catconstants.PgCatalogStatioUserIndexesTableID:          pgCatalogStatioUserIndexesTable,
+		catconstants.PgCatalogStatioUserSequencesTableID:        pgCatalogStatioUserSequencesTable,
+		catconstants.PgCatalogStatioUserTablesTableID:           pgCatalogStatioUserTablesTable,
 		catconstants.PgCatalogStatisticExtTableID:               pgCatalogStatisticExtTable,
 		catconstants.PgCatalogSubscriptionRelTableID:            pgCatalogSubscriptionRelTable,
 		catconstants.PgCatalogSubscriptionTableID:               pgCatalogSubscriptionTable,
@@ -363,6 +396,26 @@ https://www.postgresql.org/docs/12/catalog-pg-attribute.html`,
 			} else {
 				isColumnComputed = ""
 			}
+
+			// Sets the attidentity column to 'a' if the column is generated
+			// always as identity, "b" if generated by default as identity,
+			// zero byte otherwise.
+			var generatedAsIdentityType string
+			if column.IsGeneratedAsIdentity() {
+				if column.IsGeneratedAlwaysAsIdentity() {
+					generatedAsIdentityType = "a"
+				} else if column.IsGeneratedByDefaultAsIdentity() {
+					generatedAsIdentityType = "b"
+				} else {
+					return errors.AssertionFailedf(
+						"column %s is of wrong generated as identity type (neither ALWAYS nor BY DEFAULT)",
+						column.GetName(),
+					)
+				}
+			} else {
+				generatedAsIdentityType = ""
+			}
+
 			return addRow(
 				attRelID,                        // attrelid
 				tree.NewDName(column.GetName()), // attname
@@ -378,7 +431,7 @@ https://www.postgresql.org/docs/12/catalog-pg-attribute.html`,
 				tree.DNull, // attalign
 				tree.MakeDBool(tree.DBool(!column.IsNullable())), // attnotnull
 				tree.MakeDBool(tree.DBool(column.HasDefault())),  // atthasdef
-				tree.NewDString(""),                              // attidentity
+				tree.NewDString(generatedAsIdentityType),         // attidentity
 				tree.NewDString(isColumnComputed),                // attgenerated
 				tree.DBoolFalse,                                  // attisdropped
 				tree.DBoolTrue,                                   // attislocal
@@ -801,7 +854,7 @@ func populateTableConstraints(
 				&buf, db.GetName(),
 				table, con.FK,
 				tableLookup,
-				p.extendedEvalCtx.SessionData.SearchPath,
+				p.extendedEvalCtx.SessionData().SearchPath,
 			); err != nil {
 				return err
 			}
@@ -1103,13 +1156,148 @@ https://www.postgresql.org/docs/9.5/catalog-pg-database.html`,
 }
 
 var pgCatalogDefaultACLTable = virtualSchemaTable{
-	comment: `default ACLs (empty - unimplemented)
-https://www.postgresql.org/docs/9.6/catalog-pg-default-acl.html`,
+	comment: `default ACLs; these are the privileges that will be assigned to newly created objects
+https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 	schema: vtable.PGCatalogDefaultACL,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
+		h := makeOidHasher()
+		f := func(defaultPrivilegesForRole descpb.DefaultPrivilegesForRole) error {
+			objectTypes := tree.GetAlterDefaultPrivilegesTargetObjects()
+			for _, objectType := range objectTypes {
+				privs, ok := defaultPrivilegesForRole.DefaultPrivilegesPerObject[objectType]
+				if !ok || len(privs.Users) == 0 {
+					// If the default privileges default state has been altered,
+					// we use an empty entry to signify that the user has no privileges.
+					// We only omit the row entirely if the default privileges are
+					// in its default state. This is PG's behavior.
+					// Note that if ForAllRoles is true, we can skip adding an entry
+					// since ForAllRoles cannot be a grantee - therefore we can ignore
+					// the RoleHasAllPrivilegesOnX flag and skip. We still have to take
+					// into consideration the PublicHasUsageOnTypes flag.
+					if objectType == tree.Types {
+						// if the objectType is tree.Types, we only omit the entry
+						// if both the role has ALL privileges AND public has USAGE.
+						// This is the "default" state for default privileges on types
+						// in Postgres.
+						if (!defaultPrivilegesForRole.IsExplicitRole() ||
+							catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, tree.Types)) &&
+							catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) {
+							continue
+						}
+					} else if !defaultPrivilegesForRole.IsExplicitRole() ||
+						catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, objectType) {
+						continue
+					}
+				}
+
+				// Type of object this entry is for:
+				// r = relation (table, view), S = sequence, f = function, T = type, n = schema.
+				var c string
+				switch objectType {
+				case tree.Tables:
+					c = "r"
+				case tree.Sequences:
+					c = "S"
+				case tree.Types:
+					c = "T"
+				case tree.Schemas:
+					c = "n"
+				}
+				privilegeObjectType := targetObjectToPrivilegeObject[objectType]
+				arr := tree.NewDArray(types.String)
+				for _, userPrivs := range privs.Users {
+					var user string
+					if userPrivs.UserProto.Decode().IsPublicRole() {
+						// Postgres represents Public in defacl as an empty string.
+						user = ""
+					} else {
+						user = userPrivs.UserProto.Decode().Normalized()
+					}
+
+					privileges := privilege.ListFromBitField(
+						userPrivs.Privileges, privilegeObjectType,
+					)
+					defaclItem := createDefACLItem(user, privileges, privilegeObjectType)
+					if err := arr.Append(
+						tree.NewDString(defaclItem)); err != nil {
+						return err
+					}
+				}
+
+				// Special cases to handle for types.
+				// If one of RoleHasAllPrivilegesOnTypes or PublicHasUsageOnTypes is false
+				// and the other is true, we do not omit the entry since the default
+				// state has changed. We have to produce an entry by expanding the
+				// privileges.
+				if defaultPrivilegesForRole.IsExplicitRole() {
+					if objectType == tree.Types {
+						if !catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, tree.Types) &&
+							catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) {
+							defaclItem := createDefACLItem(
+								"" /* public role */, privilege.List{privilege.USAGE}, privilegeObjectType,
+							)
+							if err := arr.Append(tree.NewDString(defaclItem)); err != nil {
+								return err
+							}
+						}
+						if !catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) &&
+							defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes {
+							defaclItem := createDefACLItem(
+								defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized(),
+								privilege.List{privilege.ALL}, privilegeObjectType,
+							)
+							if err := arr.Append(tree.NewDString(defaclItem)); err != nil {
+								return err
+							}
+						}
+					}
+				}
+
+				// TODO(richardjcai): Update this logic once default privileges on
+				//    schemas are supported.
+				//    See: https://github.com/cockroachdb/cockroach/issues/67376.
+				schemaName := ""
+				// If ForAllRoles is specified, we use an empty string as the normalized
+				// role name to create the row hash.
+				normalizedName := ""
+				roleOid := oidZero
+				if defaultPrivilegesForRole.IsExplicitRole() {
+					roleOid = h.UserOid(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode())
+					normalizedName = defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized()
+				}
+				rowOid := h.DBSchemaRoleOid(
+					dbContext.GetID(),
+					schemaName,
+					normalizedName,
+				)
+				if err := addRow(
+					rowOid,             // row identifier oid
+					roleOid,            // defaclrole oid
+					oidZero,            // defaclnamespace oid
+					tree.NewDString(c), // defaclobjtype char
+					arr,                // defaclacl aclitem[]
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return dbContext.GetDefaultPrivilegeDescriptor().ForEachDefaultPrivilegeForRole(f)
 	},
-	unimplemented: true,
+}
+
+func createDefACLItem(
+	user string, privileges privilege.List, privilegeObjectType privilege.ObjectType,
+) string {
+	return fmt.Sprintf(`%s=%s/%s`,
+		user,
+		privileges.ListToACL(
+			privilegeObjectType,
+		),
+		// TODO(richardjcai): CockroachDB currently does not track grantors
+		//    See: https://github.com/cockroachdb/cockroach/issues/67442.
+		"", /* grantor */
+	)
 }
 
 var (
@@ -1127,8 +1315,10 @@ var (
 	_ = depTypeAutoExtension
 	_ = depTypePin
 
+	pgAuthIDTableName      = tree.MakeTableNameWithSchema("", tree.Name(pgCatalogName), tree.Name("pg_authid"))
 	pgConstraintsTableName = tree.MakeTableNameWithSchema("", tree.Name(pgCatalogName), tree.Name("pg_constraint"))
 	pgClassTableName       = tree.MakeTableNameWithSchema("", tree.Name(pgCatalogName), tree.Name("pg_class"))
+	pgDatabaseTableName    = tree.MakeTableNameWithSchema("", tree.Name(pgCatalogName), tree.Name("pg_database"))
 	pgRewriteTableName     = tree.MakeTableNameWithSchema("", tree.Name(pgCatalogName), tree.Name("pg_rewrite"))
 )
 
@@ -1302,6 +1492,9 @@ https://www.postgresql.org/docs/9.5/catalog-pg-description.html`,
 			case keys.DatabaseCommentType:
 				// Database comments are exported in pg_shdescription.
 				continue
+			case keys.SchemaCommentType:
+				objID = tree.NewDOid(tree.MustBeDInt(objID))
+				classOid = tree.NewDOid(catconstants.PgCatalogNamespaceTableID)
 			case keys.ColumnCommentType, keys.TableCommentType:
 				objID = tree.NewDOid(tree.MustBeDInt(objID))
 				classOid = tree.NewDOid(catconstants.PgCatalogClassTableID)
@@ -2225,7 +2418,11 @@ https://www.postgresql.org/docs/9.5/catalog-pg-settings.html`,
 					globalDefVal := gen.GlobalDefault(&p.EvalContext().Settings.SV)
 					bootDatum = tree.NewDString(globalDefVal)
 				}
-				if hasDefault, defVal := getSessionVarDefaultString(vName, gen, p.sessionDataMutator); hasDefault {
+				if hasDefault, defVal := getSessionVarDefaultString(
+					vName,
+					gen,
+					p.sessionDataMutatorIterator.sessionDataMutatorBase,
+				); hasDefault {
 					resetDatum = tree.NewDString(defVal)
 				}
 			}
@@ -2256,13 +2453,127 @@ https://www.postgresql.org/docs/9.5/catalog-pg-settings.html`,
 }
 
 var pgCatalogShdependTable = virtualSchemaTable{
-	comment: `shared dependencies (empty - not implemented)
+	comment: `Shared Dependencies (Roles depending on objects). 
 https://www.postgresql.org/docs/9.6/catalog-pg-shdepend.html`,
 	schema: vtable.PGCatalogShdepend,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		vt := p.getVirtualTabler()
+		h := makeOidHasher()
+
+		pgClassDesc, err := vt.getVirtualTableDesc(&pgClassTableName)
+		if err != nil {
+			return errors.New("could not find pg_catalog.pg_class")
+		}
+		pgClassOid := tableOid(pgClassDesc.GetID())
+
+		pgAuthIDDesc, err := vt.getVirtualTableDesc(&pgAuthIDTableName)
+		if err != nil {
+			return errors.New("could not find pg_catalog.pg_authid")
+		}
+		pgAuthIDOid := tableOid(pgAuthIDDesc.GetID())
+
+		pgDatabaseDesc, err := vt.getVirtualTableDesc(&pgDatabaseTableName)
+		if err != nil {
+			return errors.New("could not find pg_catalog.pg_database")
+		}
+		pgDatabaseOid := tableOid(pgDatabaseDesc.GetID())
+
+		// There is no dependent object for pinned roles; In postgres this type of
+		// entry is a signal that the system itself depends on the referenced
+		// object, and so that object must never be deleted. The columns for the
+		// dependent object contain zeroes.
+		pinnedRoles := map[string]security.SQLUsername{
+			security.RootUser:  security.RootUserName(),
+			security.AdminRole: security.AdminRoleName(),
+		}
+
+		// Function commonly used to add table and database dependencies.
+		addSharedDependency := func(
+			dbID *tree.DOid, classID *tree.DOid, objID *tree.DOid, refClassID *tree.DOid, user, owner security.SQLUsername,
+		) error {
+			// As stated above, where pinned roles is declared: pinned roles
+			// does not have dependent objects.
+			if _, ok := pinnedRoles[user.Normalized()]; ok {
+				return nil
+			}
+
+			depType := sharedDependencyACL
+			if owner.Normalized() == user.Normalized() {
+				depType = sharedDependencyOwner
+			}
+
+			return addRow(
+				dbID,                             // dbid
+				classID,                          // classid
+				objID,                            // objid
+				zeroVal,                          // objsubid
+				refClassID,                       // refclassid
+				h.UserOid(user),                  // refobjid
+				tree.NewDString(string(depType)), // deptype
+			)
+		}
+
+		// Populating table descriptor dependencies with roles
+		if err = forEachTableDesc(ctx, p, dbContext, virtualMany,
+			func(db catalog.DatabaseDescriptor, scName string, table catalog.TableDescriptor) error {
+				owner := table.GetPrivileges().Owner()
+				for _, u := range table.GetPrivileges().Show(privilege.Table) {
+					if err := addSharedDependency(
+						dbOid(db.GetID()),       // dbid
+						pgClassOid,              // classid
+						tableOid(table.GetID()), // objid
+						pgAuthIDOid,             // refclassid
+						u.User,                  // refobjid
+						owner,
+					); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		); err != nil {
+			return err
+		}
+
+		// Databases dependencies with roles
+		if err = forEachDatabaseDesc(ctx, p, nil /*all databases*/, false, /* requiresPrivileges */
+			func(db catalog.DatabaseDescriptor) error {
+				owner := db.GetPrivileges().Owner()
+				for _, u := range db.GetPrivileges().Show(privilege.Database) {
+					if err := addSharedDependency(
+						tree.NewDOid(0),   // dbid
+						pgDatabaseOid,     // classid
+						dbOid(db.GetID()), // objid
+						pgAuthIDOid,       // refclassid
+						u.User,            // refobjid
+						owner,
+					); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		); err != nil {
+			return err
+		}
+
+		// Pinned roles, as stated above, pinned roles only have rows with zeros.
+		for _, role := range pinnedRoles {
+			if err := addRow(
+				tree.NewDOid(0), // dbid
+				tree.NewDOid(0), // classid
+				tree.NewDOid(0), // objid
+				zeroVal,         // objsubid
+				pgAuthIDOid,     // refclassid
+				h.UserOid(role), // refobjid
+				tree.NewDString(string(sharedDependencyPin)), // deptype
+			); err != nil {
+				return err
+			}
+		}
+
 		return nil
 	},
-	unimplemented: true,
 }
 
 var pgCatalogTablesTable = virtualSchemaTable{
@@ -2753,12 +3064,39 @@ var pgCatalogShmemAllocationsTable = virtualSchemaTable{
 }
 
 var pgCatalogDbRoleSettingTable = virtualSchemaTable{
-	comment: "pg_db_role_setting was created for compatibility and is currently unimplemented",
-	schema:  vtable.PgCatalogDbRoleSetting,
+	comment: `contains the default values that have been configured for session variables
+https://www.postgresql.org/docs/13/catalog-pg-db-role-setting.html`,
+	schema: vtable.PgCatalogDbRoleSetting,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		rows, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBufferedEx(
+			ctx,
+			"select-db-role-settings",
+			p.EvalContext().Txn,
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			`SELECT database_id, role_name, settings FROM system.public.database_role_settings`,
+		)
+		if err != nil {
+			return err
+		}
+		h := makeOidHasher()
+		for _, row := range rows {
+			databaseID := tree.MustBeDOid(row[0])
+			roleName := tree.MustBeDString(row[1])
+			roleID := oidZero
+			if roleName != "" {
+				roleID = h.UserOid(security.MakeSQLUsernameFromPreNormalizedString(string(roleName)))
+			}
+			settings := tree.MustBeDArray(row[2])
+			if err := addRow(
+				settings,
+				databaseID,
+				roleID,
+			); err != nil {
+				return err
+			}
+		}
 		return nil
 	},
-	unimplemented: true,
 }
 
 var pgCatalogTimezoneNamesTable = virtualSchemaTable{
@@ -3106,6 +3444,303 @@ var pgCatalogStatDatabaseConflictsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
+var pgCatalogStatioUserSequencesTable = virtualSchemaTable{
+	comment: "pg_statio_user_sequences was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioUserSequences,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatReplicationTable = virtualSchemaTable{
+	comment: "pg_stat_replication was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatReplication,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatSysIndexesTable = virtualSchemaTable{
+	comment: "pg_stat_sys_indexes was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatSysIndexes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatXactUserTablesTable = virtualSchemaTable{
+	comment: "pg_stat_xact_user_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatXactUserTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatUserTablesTable = virtualSchemaTable{
+	comment: "pg_stat_user_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatUserTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatAllTablesTable = virtualSchemaTable{
+	comment: "pg_stat_all_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatAllTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioUserTablesTable = virtualSchemaTable{
+	comment: "pg_statio_user_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioUserTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatUserIndexesTable = virtualSchemaTable{
+	comment: "pg_stat_user_indexes was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatUserIndexes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatXactSysTablesTable = virtualSchemaTable{
+	comment: "pg_stat_xact_sys_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatXactSysTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioSysTablesTable = virtualSchemaTable{
+	comment: "pg_statio_sys_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioSysTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatGssapiTable = virtualSchemaTable{
+	comment: "pg_stat_gssapi was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatGssapi,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatSlruTable = virtualSchemaTable{
+	comment: "pg_stat_slru was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatSlru,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatXactAllTablesTable = virtualSchemaTable{
+	comment: "pg_stat_xact_all_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatXactAllTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioUserIndexesTable = virtualSchemaTable{
+	comment: "pg_statio_user_indexes was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioUserIndexes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioSysSequencesTable = virtualSchemaTable{
+	comment: "pg_statio_sys_sequences was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioSysSequences,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatSubscriptionTable = virtualSchemaTable{
+	comment: "pg_stat_subscription was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatSubscription,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatProgressBasebackupTable = virtualSchemaTable{
+	comment: "pg_stat_progress_basebackup was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatProgressBasebackup,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatWalReceiverTable = virtualSchemaTable{
+	comment: "pg_stat_wal_receiver was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatWalReceiver,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatSysTablesTable = virtualSchemaTable{
+	comment: "pg_stat_sys_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatSysTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatSslTable = virtualSchemaTable{
+	comment: "pg_stat_ssl was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatSsl,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioAllSequencesTable = virtualSchemaTable{
+	comment: "pg_statio_all_sequences was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioAllSequences,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatProgressVacuumTable = virtualSchemaTable{
+	comment: "pg_stat_progress_vacuum was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatProgressVacuum,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatAllIndexesTable = virtualSchemaTable{
+	comment: "pg_stat_all_indexes was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatAllIndexes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioSysIndexesTable = virtualSchemaTable{
+	comment: "pg_statio_sys_indexes was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioSysIndexes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatUserFunctionsTable = virtualSchemaTable{
+	comment: "pg_stat_user_functions was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatUserFunctions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatArchiverTable = virtualSchemaTable{
+	comment: "pg_stat_archiver was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatArchiver,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatProgressClusterTable = virtualSchemaTable{
+	comment: "pg_stat_progress_cluster was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatProgressCluster,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatBgwriterTable = virtualSchemaTable{
+	comment: "pg_stat_bgwriter was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatBgwriter,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatProgressAnalyzeTable = virtualSchemaTable{
+	comment: "pg_stat_progress_analyze was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatProgressAnalyze,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioAllIndexesTable = virtualSchemaTable{
+	comment: "pg_statio_all_indexes was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioAllIndexes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatXactUserFunctionsTable = virtualSchemaTable{
+	comment: "pg_stat_xact_user_functions was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatXactUserFunctions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatioAllTablesTable = virtualSchemaTable{
+	comment: "pg_statio_all_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatioAllTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var pgCatalogStatProgressCreateIndexTable = virtualSchemaTable{
+	comment: "pg_stat_progress_create_index was created for compatibility and is currently unimplemented",
+	schema:  vtable.PgCatalogStatProgressCreateIndex,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
 // typOid is the only OID generation approach that does not use oidHasher, because
 // object identifiers for types are not arbitrary, but instead need to be kept in
 // sync with Postgres.
@@ -3389,6 +4024,7 @@ const (
 	operatorTypeTag
 	enumEntryTypeTag
 	rewriteTypeTag
+	dbSchemaRoleTypeTag
 )
 
 func (h oidHasher) writeTypeTag(tag oidTypeTag) {
@@ -3556,6 +4192,18 @@ func (h oidHasher) rewriteOid(source descpb.ID, depended descpb.ID) *tree.DOid {
 	h.writeTypeTag(rewriteTypeTag)
 	h.writeUInt32(uint32(source))
 	h.writeUInt32(uint32(depended))
+	return h.getOid()
+}
+
+// DBSchemaRoleOid creates an OID based on the combination of a db/schema/role.
+// This is used to generate a unique row identifier for pg_default_acl.
+func (h oidHasher) DBSchemaRoleOid(
+	dbID descpb.ID, scName string, normalizedRole string,
+) *tree.DOid {
+	h.writeTypeTag(dbSchemaRoleTypeTag)
+	h.writeDB(dbID)
+	h.writeSchema(scName)
+	h.writeStr(normalizedRole)
 	return h.getOid()
 }
 

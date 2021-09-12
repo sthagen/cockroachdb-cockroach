@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	gohex "encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -24,12 +25,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -61,9 +64,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/ttycolor"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/kr/pretty"
@@ -77,7 +80,7 @@ var debugKeysCmd = &cobra.Command{
 Pretty-prints all keys in a store.
 `,
 	Args: cobra.ExactArgs(1),
-	RunE: MaybeDecorateGRPCError(runDebugKeys),
+	RunE: clierrorplus.MaybeDecorateError(runDebugKeys),
 }
 
 var debugBallastCmd = &cobra.Command{
@@ -131,6 +134,17 @@ type OpenEngineOptions struct {
 	MustExist bool
 }
 
+func (opts OpenEngineOptions) configOptions() []storage.ConfigOption {
+	var cfgOpts []storage.ConfigOption
+	if opts.ReadOnly {
+		cfgOpts = append(cfgOpts, storage.ReadOnly)
+	}
+	if opts.MustExist {
+		cfgOpts = append(cfgOpts, storage.MustExist)
+	}
+	return cfgOpts
+}
+
 // OpenExistingStore opens the rocksdb engine rooted at 'dir'.
 // If 'readOnly' is true, opens the store in read-only mode.
 func OpenExistingStore(dir string, stopper *stop.Stopper, readOnly bool) (storage.Engine, error) {
@@ -144,32 +158,13 @@ func OpenEngine(dir string, stopper *stop.Stopper, opts OpenEngineOptions) (stor
 	if err != nil {
 		return nil, err
 	}
-
-	storageConfig := base.StorageConfig{
-		Settings:  serverCfg.Settings,
-		Dir:       dir,
-		MustExist: opts.MustExist,
-	}
-	if PopulateRocksDBConfigHook != nil {
-		if err := PopulateRocksDBConfigHook(&storageConfig); err != nil {
-			return nil, err
-		}
-	}
-
-	var db storage.Engine
-
-	cfg := storage.PebbleConfig{
-		StorageConfig: storageConfig,
-		Opts:          storage.DefaultPebbleOptions(),
-	}
-	cfg.Opts.Cache = pebble.NewCache(server.DefaultCacheSize)
-	defer cfg.Opts.Cache.Unref()
-
-	cfg.Opts.MaxOpenFiles = int(maxOpenFiles)
-	cfg.Opts.ReadOnly = opts.ReadOnly
-
-	db, err = storage.NewPebble(context.Background(), cfg)
-
+	db, err := storage.Open(context.Background(),
+		storage.Filesystem(dir),
+		storage.MaxOpenFiles(int(maxOpenFiles)),
+		storage.CacheSize(server.DefaultCacheSize),
+		storage.Settings(serverCfg.Settings),
+		storage.Hook(PopulateRocksDBConfigHook),
+		storage.CombineOptions(opts.configOptions()...))
 	if err != nil {
 		return nil, err
 	}
@@ -274,12 +269,12 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 			}
 			return strings.Join(pairs, ", "), nil
 		}
-		kvserver.DebugSprintKeyValueDecoders = append(kvserver.DebugSprintKeyValueDecoders, fn)
+		kvserver.DebugSprintMVCCKeyValueDecoders = append(kvserver.DebugSprintMVCCKeyValueDecoders, fn)
 	}
 	printer := printKey
 	if debugCtx.values {
 		printer = func(kv storage.MVCCKeyValue) (bool, error) {
-			kvserver.PrintKeyValue(kv)
+			kvserver.PrintMVCCKeyValue(kv)
 			return false, nil
 		}
 	}
@@ -407,7 +402,7 @@ state like the raft HardState. With --replicated, only includes data covered by
  the consistency checker.
 `,
 	Args: cobra.ExactArgs(2),
-	RunE: MaybeDecorateGRPCError(runDebugRangeData),
+	RunE: clierrorplus.MaybeDecorateError(runDebugRangeData),
 }
 
 func runDebugRangeData(cmd *cobra.Command, args []string) error {
@@ -454,7 +449,7 @@ var debugRangeDescriptorsCmd = &cobra.Command{
 Prints all range descriptors in a store with a history of changes.
 `,
 	Args: cobra.ExactArgs(1),
-	RunE: MaybeDecorateGRPCError(runDebugRangeDescriptors),
+	RunE: clierrorplus.MaybeDecorateError(runDebugRangeDescriptors),
 }
 
 func loadRangeDescriptor(
@@ -517,7 +512,7 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 		if kvserver.IsRangeDescriptorKey(kv.Key) != nil {
 			return nil
 		}
-		kvserver.PrintKeyValue(kv)
+		kvserver.PrintMVCCKeyValue(kv)
 		return nil
 	})
 }
@@ -588,7 +583,7 @@ Decode and print a hexadecimal-encoded key-value pair.
 			}
 		}
 
-		kvserver.PrintKeyValue(storage.MVCCKeyValue{
+		kvserver.PrintMVCCKeyValue(storage.MVCCKeyValue{
 			Key:   k,
 			Value: bs[1],
 		})
@@ -625,7 +620,7 @@ var debugRaftLogCmd = &cobra.Command{
 Prints all log entries in a store for the given range.
 `,
 	Args: cobra.ExactArgs(2),
-	RunE: MaybeDecorateGRPCError(runDebugRaftLog),
+	RunE: clierrorplus.MaybeDecorateError(runDebugRaftLog),
 }
 
 func runDebugRaftLog(cmd *cobra.Command, args []string) error {
@@ -651,7 +646,7 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 
 	// NB: raft log does not have intents.
 	return db.MVCCIterate(start, end, storage.MVCCKeyIterKind, func(kv storage.MVCCKeyValue) error {
-		kvserver.PrintKeyValue(kv)
+		kvserver.PrintMVCCKeyValue(kv)
 		return nil
 	})
 }
@@ -670,7 +665,7 @@ Uses a configurable GC policy, with a default 24 hour TTL, for old versions and
 2 hour intent resolution threshold.
 `,
 	Args: cobra.RangeArgs(1, 4),
-	RunE: MaybeDecorateGRPCError(runDebugGCCmd),
+	RunE: clierrorplus.MaybeDecorateError(runDebugGCCmd),
 }
 
 func runDebugGCCmd(cmd *cobra.Command, args []string) error {
@@ -678,7 +673,7 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	defer stopper.Stop(context.Background())
 
 	var rangeID roachpb.RangeID
-	gcTTLInSeconds := int64((24 * time.Hour).Seconds())
+	gcTTL := 24 * time.Hour
 	intentAgeThreshold := gc.IntentAgeThreshold.Default()
 	intentBatchSize := gc.MaxIntentsPerCleanupBatch.Default()
 
@@ -689,10 +684,11 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if len(args) > 2 {
-		var err error
-		if gcTTLInSeconds, err = parsePositiveInt(args[2]); err != nil {
+		gcTTLInSeconds, err := parsePositiveInt(args[2])
+		if err != nil {
 			return errors.Wrapf(err, "unable to parse %v as TTL", args[2])
 		}
+		gcTTL = time.Duration(gcTTLInSeconds) * time.Second
 	}
 	if len(args) > 1 {
 		var err error
@@ -742,14 +738,14 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	for _, desc := range descs {
 		snap := db.NewSnapshot()
 		defer snap.Close()
-		policy := zonepb.GCPolicy{TTLSeconds: int32(gcTTLInSeconds)}
 		now := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		thresh := gc.CalculateThreshold(now, policy)
+		thresh := gc.CalculateThreshold(now, gcTTL)
 		info, err := gc.Run(
 			context.Background(),
 			&desc, snap,
-			now, thresh, gc.RunOptions{IntentAgeThreshold: intentAgeThreshold, MaxIntentsPerIntentCleanupBatch: intentBatchSize}, policy,
-			gc.NoopGCer{},
+			now, thresh,
+			gc.RunOptions{IntentAgeThreshold: intentAgeThreshold, MaxIntentsPerIntentCleanupBatch: intentBatchSize},
+			gcTTL, gc.NoopGCer{},
 			func(_ context.Context, _ []roachpb.Intent) error { return nil },
 			func(_ context.Context, _ *roachpb.Transaction) error { return nil },
 		)
@@ -792,7 +788,7 @@ var debugCompactCmd = &cobra.Command{
 Compact the sstables in a store.
 `,
 	Args: cobra.ExactArgs(1),
-	RunE: MaybeDecorateGRPCError(runDebugCompact),
+	RunE: clierrorplus.MaybeDecorateError(runDebugCompact),
 }
 
 func runDebugCompact(cmd *cobra.Command, args []string) error {
@@ -854,7 +850,7 @@ Can connect to a running server to get the values or can be provided with
 a JSON file captured from a node's /_status/gossip/ debug endpoint.
 `,
 	Args: cobra.NoArgs,
-	RunE: MaybeDecorateGRPCError(runDebugGossipValues),
+	RunE: clierrorplus.MaybeDecorateError(runDebugGossipValues),
 }
 
 func runDebugGossipValues(cmd *cobra.Command, args []string) error {
@@ -978,7 +974,7 @@ var debugSyncBenchCmd = &cobra.Command{
 `,
 	Args:   cobra.MaximumNArgs(1),
 	Hidden: true,
-	RunE:   MaybeDecorateGRPCError(runDebugSyncBench),
+	RunE:   clierrorplus.MaybeDecorateError(runDebugSyncBench),
 }
 
 var syncBenchOpts = syncbench.Options{
@@ -1047,7 +1043,7 @@ early may lead to things getting stuck (if it happens, it can be fixed
 by restarting a second time).
 `,
 	Args: cobra.ExactArgs(1),
-	RunE: MaybeDecorateGRPCError(runDebugUnsafeRemoveDeadReplicas),
+	RunE: clierrorplus.MaybeDecorateError(runDebugUnsafeRemoveDeadReplicas),
 }
 
 var removeDeadReplicasOpts struct {
@@ -1296,6 +1292,7 @@ var debugMergeLogsOpts = struct {
 	keepRedactable bool
 	redactInput    bool
 	format         string
+	useColor       forceColor
 }{
 	program:        nil, // match everything
 	file:           regexp.MustCompile(log.FilePattern),
@@ -1313,7 +1310,134 @@ func runDebugMergeLogs(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return writeLogStream(s, cmd.OutOrStdout(), o.filter, o.prefix, o.keepRedactable)
+
+	// Only auto-detect if auto-detection is needed, as it may fail with an error.
+	autoDetect := func(outStream io.Writer) (ttycolor.Profile, error) {
+		if f, ok := outStream.(*os.File); ok {
+			// If the output is a terminal, auto-detect the color scheme based
+			// on that.
+			return ttycolor.DetectProfile(f)
+		}
+		return nil, nil
+	}
+	outStream := cmd.OutOrStdout()
+	var cp ttycolor.Profile
+	// Now choose the color profile depending on the user option.
+	switch o.useColor {
+	case forceColorOff:
+		// Nothing to do, cp stays nil.
+	case forceColorOn:
+		// If there was a color profile auto-detected, we want
+		// to use that as it will be tailored to the output terminal.
+		var err error
+		cp, err = autoDetect(outStream)
+		if err != nil || cp == nil {
+			// The user requested "forcing" the color mode but
+			// auto-detection failed. Ignore the error and use a best guess.
+			cp = ttycolor.Profile8
+		}
+	case forceColorAuto:
+		var err error
+		cp, err = autoDetect(outStream)
+		if err != nil {
+			return err
+		}
+	}
+
+	return writeLogStream(s, outStream, o.filter, o.prefix, o.keepRedactable, cp)
+}
+
+var debugIntentCount = &cobra.Command{
+	Use:   "intent-count <store directory>",
+	Short: "return a count of intents in directory",
+	Long: `
+Returns a count of interleaved and separated intents in the store directory.
+Used to investigate stores with lots of unresolved intents, or to confirm
+if the migration away from interleaved intents was successful.
+`,
+	Args: cobra.MinimumNArgs(1),
+	RunE: runDebugIntentCount,
+}
+
+func runDebugIntentCount(cmd *cobra.Command, args []string) error {
+	stopper := stop.NewStopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var interleavedIntentCount, separatedIntentCount int
+	var keysCount uint64
+	var wg sync.WaitGroup
+	closer := make(chan bool)
+
+	wg.Add(1)
+	_ = stopper.RunAsyncTask(ctx, "intent-count-progress-indicator", func(ctx context.Context) {
+		defer wg.Done()
+		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		select {
+		case <-ticker.C:
+			fmt.Printf("scanned %d keys\n", atomic.LoadUint64(&keysCount))
+		case <-ctx.Done():
+			return
+		case <-closer:
+			return
+		}
+	})
+
+	iter := db.NewEngineIterator(storage.IterOptions{
+		LowerBound: roachpb.KeyMin,
+		UpperBound: roachpb.KeyMax,
+	})
+	defer iter.Close()
+	valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
+	var meta enginepb.MVCCMetadata
+	for ; valid && err == nil; valid, err = iter.NextEngineKey() {
+		key, err := iter.EngineKey()
+		if err != nil {
+			return err
+		}
+		atomic.AddUint64(&keysCount, 1)
+		if key.IsLockTableKey() {
+			separatedIntentCount++
+			continue
+		}
+		if !key.IsMVCCKey() {
+			continue
+		}
+		mvccKey, err := key.ToMVCCKey()
+		if err != nil {
+			return err
+		}
+		if !mvccKey.Timestamp.IsEmpty() {
+			continue
+		}
+		val := iter.UnsafeValue()
+		if err := protoutil.Unmarshal(val, &meta); err != nil {
+			return err
+		}
+		if meta.IsInline() {
+			continue
+		}
+		interleavedIntentCount++
+	}
+	if err != nil {
+		return err
+	}
+	close(closer)
+	wg.Wait()
+	fmt.Printf("interleaved intents: %d\nseparated intents: %d\n",
+		interleavedIntentCount, separatedIntentCount)
+	return nil
 }
 
 // DebugCmdsForRocksDB lists debug commands that access rocksdb through the engine
@@ -1323,10 +1447,12 @@ var DebugCmdsForRocksDB = []*cobra.Command{
 	debugCheckStoreCmd,
 	debugCompactCmd,
 	debugGCCmd,
+	debugIntentCount,
 	debugKeysCmd,
 	debugRaftLogCmd,
 	debugRangeDataCmd,
 	debugRangeDescriptorsCmd,
+	debugUnsafeRemoveDeadReplicasCmd,
 }
 
 // All other debug commands go here.
@@ -1340,7 +1466,6 @@ var debugCmds = append(DebugCmdsForRocksDB,
 	debugTimeSeriesDumpCmd,
 	debugSyncBenchCmd,
 	debugSyncTestCmd,
-	debugUnsafeRemoveDeadReplicasCmd,
 	debugEnvCmd,
 	debugZipCmd,
 	debugMergeLogsCmd,
@@ -1372,7 +1497,7 @@ func (m mvccValueFormatter) Format(f fmt.State, c rune) {
 		errors.FormatError(m.err, f, c)
 		return
 	}
-	fmt.Fprint(f, kvserver.SprintKeyValue(m.kv, false /* printKey */))
+	fmt.Fprint(f, kvserver.SprintMVCCKeyValue(m.kv, false /* printKey */))
 }
 
 // lockValueFormatter is a fmt.Formatter for lock values.
@@ -1427,6 +1552,9 @@ func init() {
 	debugDoctorCmd.AddCommand(doctorExamineCmd, doctorRecreateCmd, doctorExamineFallbackClusterCmd, doctorExamineFallbackZipDirCmd)
 	DebugCmd.AddCommand(debugDoctorCmd)
 
+	debugStatementBundleCmd.AddCommand(statementBundleRecreateCmd)
+	DebugCmd.AddCommand(debugStatementBundleCmd)
+
 	DebugCmd.AddCommand(debugJobTraceFromClusterCmd)
 
 	f := debugSyncBenchCmd.Flags()
@@ -1462,11 +1590,13 @@ func init() {
 		"redact the input files to remove sensitive information")
 	f.StringVar(&debugMergeLogsOpts.format, "format", "",
 		"log format of the input files")
+	f.Var(&debugMergeLogsOpts.useColor, "color",
+		"force use of TTY escape codes to colorize the output")
 
 	f = debugDecodeProtoCmd.Flags()
 	f.StringVar(&debugDecodeProtoName, "schema", "cockroach.sql.sqlbase.Descriptor",
 		"fully qualified name of the proto to decode")
-	f.BoolVar(&debugDecodeProtoEmitDefaults, "emit-defaults", true,
+	f.BoolVar(&debugDecodeProtoEmitDefaults, "emit-defaults", false,
 		"encode default values for every field")
 
 	f = debugCheckLogConfigCmd.Flags()
@@ -1474,6 +1604,8 @@ func init() {
 
 	f = debugTimeSeriesDumpCmd.Flags()
 	f.Var(&debugTimeSeriesDumpOpts.format, "format", "output format (text, csv, tsv, raw)")
+	f.Var(&debugTimeSeriesDumpOpts.from, "from", "oldest timestamp to include (inclusive)")
+	f.Var(&debugTimeSeriesDumpOpts.to, "to", "newest timestamp to include (inclusive)")
 }
 
 func initPebbleCmds(cmd *cobra.Command) {

@@ -106,32 +106,30 @@ func (m *Manager) WaitForNoVersion(
 }
 
 // WaitForOneVersion returns once there are no unexpired leases on the
-// previous version of the descriptor. It returns the current version.
+// previous version of the descriptor. It returns the descriptor with the
+// current version.
 // After returning there can only be versions of the descriptor >= to the
 // returned version. Lease acquisition (see acquire()) maintains the
 // invariant that no new leases for desc.Version-1 will be granted once
 // desc.Version exists.
 func (m *Manager) WaitForOneVersion(
 	ctx context.Context, id descpb.ID, retryOpts retry.Options,
-) (descpb.DescriptorVersion, error) {
-	var version descpb.DescriptorVersion
+) (desc catalog.Descriptor, _ error) {
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
-		var desc catalog.Descriptor
 		if err := m.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
 			desc, err = catalogkv.MustGetDescriptorByID(ctx, txn, m.Codec(), id)
 			return err
 		}); err != nil {
-			return 0, err
+			return nil, err
 		}
 
 		// Check to see if there are any leases that still exist on the previous
 		// version of the descriptor.
 		now := m.storage.clock.Now()
 		descs := []IDVersion{NewIDVersionPrev(desc.GetName(), desc.GetID(), desc.GetVersion())}
-		version = desc.GetVersion()
 		count, err := CountLeases(ctx, m.storage.internalExecutor, descs, now)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if count == 0 {
 			break
@@ -141,7 +139,7 @@ func (m *Manager) WaitForOneVersion(
 			log.Infof(ctx, "waiting for %d leases to expire: desc=%v", count, descs)
 		}
 	}
-	return version, nil
+	return desc, nil
 }
 
 // IDVersion represents a descriptor ID, version pair that are
@@ -733,7 +731,9 @@ func (m *Manager) resolveName(
 		if err := txn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
 		}
-		txn.SetFixedTimestamp(ctx, timestamp)
+		if err := txn.SetFixedTimestamp(ctx, timestamp); err != nil {
+			return err
+		}
 		var found bool
 		var err error
 		found, id, err = catalogkv.LookupObjectID(ctx, txn, m.storage.codec, parentID, parentSchemaID, name)
@@ -1043,8 +1043,14 @@ func (m *Manager) refreshSomeLeases(ctx context.Context) {
 	for i := range ids {
 		id := ids[i]
 		wg.Add(1)
-		if err := m.stopper.RunLimitedAsyncTask(
-			ctx, fmt.Sprintf("refresh descriptor: %d lease", id), m.sem, true /*wait*/, func(ctx context.Context) {
+		if err := m.stopper.RunAsyncTaskEx(
+			ctx,
+			stop.TaskOpts{
+				TaskName:   fmt.Sprintf("refresh descriptor: %d lease", id),
+				Sem:        m.sem,
+				WaitForSem: true,
+			},
+			func(ctx context.Context) {
 				defer wg.Done()
 				if _, err := acquireNodeLease(ctx, m, id); err != nil {
 					log.Infof(ctx, "refreshing descriptor: %d lease failed: %s", id, err)
@@ -1107,8 +1113,14 @@ SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME 
 				version:    int(tree.MustBeDInt(row[1])),
 				expiration: tree.MustBeDTimestamp(row[2]),
 			}
-			if err := m.stopper.RunLimitedAsyncTask(
-				ctx, fmt.Sprintf("release lease %+v", lease), m.sem, true /*wait*/, func(ctx context.Context) {
+			if err := m.stopper.RunAsyncTaskEx(
+				ctx,
+				stop.TaskOpts{
+					TaskName:   fmt.Sprintf("release lease %+v", lease),
+					Sem:        m.sem,
+					WaitForSem: true,
+				},
+				func(ctx context.Context) {
 					m.storage.release(ctx, m.stopper, &lease)
 					log.Infof(ctx, "released orphaned lease: %+v", lease)
 					wg.Done()

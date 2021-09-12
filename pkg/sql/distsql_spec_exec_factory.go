@@ -76,7 +76,7 @@ func (e *distSQLSpecExecFactory) getPlanCtx(recommendation distRecommendation) *
 	distribute := false
 	if e.singleTenant && e.planningMode != distSQLLocalOnlyPlanning {
 		distribute = shouldDistributeGivenRecAndMode(
-			recommendation, e.planner.extendedEvalCtx.SessionData.DistSQLMode,
+			recommendation, e.planner.extendedEvalCtx.SessionData().DistSQLMode,
 		)
 	}
 	e.planCtx.isLocal = !distribute
@@ -787,8 +787,11 @@ func (e *distSQLSpecExecFactory) ConstructExplain(
 
 	// We cannot create the explained plan in the same PlanInfrastructure with the
 	// "outer" plan. Create a separate factory.
-	explainFactory := explain.NewFactory(newDistSQLSpecExecFactory(e.planner, e.planningMode))
+	newFactory := newDistSQLSpecExecFactory(e.planner, e.planningMode)
+	explainFactory := explain.NewFactory(newFactory)
 	plan, err := buildFn(explainFactory)
+	// Release the resources acquired during the physical planning right away.
+	newFactory.(*distSQLSpecExecFactory).planCtx.getCleanupFunc()()
 	if err != nil {
 		return nil, err
 	}
@@ -1001,7 +1004,7 @@ func (e *distSQLSpecExecFactory) ConstructRecursiveCTE(
 }
 
 func (e *distSQLSpecExecFactory) ConstructControlJobs(
-	command tree.JobCommand, input exec.Node,
+	command tree.JobCommand, input exec.Node, reason tree.TypedExpr,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: control jobs")
 }

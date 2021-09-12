@@ -12,7 +12,9 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -28,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -131,6 +134,11 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	ctx := params.ctx
 	p := params.p
 
+	// Drop all of the collected objects.
+	if err := n.d.dropAllCollectedObjects(ctx, p); err != nil {
+		return err
+	}
+
 	var schemasIDsToDelete []descpb.ID
 	for _, schemaWithDbDesc := range n.d.schemasToDelete {
 		schemaToDelete := schemaWithDbDesc.schema
@@ -166,11 +174,6 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Drop all of the collected objects.
-	if err := n.d.dropAllCollectedObjects(ctx, p); err != nil {
-		return err
-	}
-
 	n.dbDesc.AddDrainingName(descpb.NameInfo{
 		ParentID:       keys.RootNamespaceID,
 		ParentSchemaID: keys.RootNamespaceID,
@@ -188,6 +191,9 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	}
 
 	if err := p.removeDbComment(ctx, n.dbDesc.GetID()); err != nil {
+		return err
+	}
+	if err := p.removeDbRoleSettings(ctx, n.dbDesc.GetID()); err != nil {
 		return err
 	}
 
@@ -313,6 +319,34 @@ func (p *planner) removeDbComment(ctx context.Context, dbID descpb.ID) error {
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 		keys.DatabaseCommentType,
 		dbID)
+
+	return err
+}
+
+func (p *planner) removeDbRoleSettings(ctx context.Context, dbID descpb.ID) error {
+	// TODO(rafi): Remove this condition in 21.2.
+	if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.DatabaseRoleSettings) {
+		return nil
+	}
+	rowsDeleted, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
+		ctx,
+		"delete-db-role-settings",
+		p.txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		fmt.Sprintf(
+			`DELETE FROM %s WHERE database_id = $1`,
+			sessioninit.DatabaseRoleSettingsTableName,
+		),
+		dbID,
+	)
+	if err != nil {
+		return err
+	}
+	if rowsDeleted > 0 && sessioninit.CacheEnabled.Get(&p.ExecCfg().Settings.SV) {
+		if err := p.bumpDatabaseRoleSettingsTableVersion(ctx); err != nil {
+			return err
+		}
+	}
 
 	return err
 }

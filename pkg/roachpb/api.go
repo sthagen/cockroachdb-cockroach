@@ -51,22 +51,6 @@ const (
 	MaxUserPriority UserPriority = 1000
 )
 
-// RequiresReadLease returns whether the ReadConsistencyType requires
-// that a read-only request be performed on an active valid leaseholder.
-// TODO(aayush): Rename the method since we no longer require a replica to be a
-// leaseholder to serve a consistent read.
-func (rc ReadConsistencyType) RequiresReadLease() bool {
-	switch rc {
-	case CONSISTENT:
-		return true
-	case READ_UNCOMMITTED:
-		return true
-	case INCONSISTENT:
-		return false
-	}
-	panic("unreachable")
-}
-
 // SupportsBatch determines whether the methods in the provided batch
 // are supported by the ReadConsistencyType, returning an error if not.
 func (rc ReadConsistencyType) SupportsBatch(ba BatchRequest) error {
@@ -77,7 +61,7 @@ func (rc ReadConsistencyType) SupportsBatch(ba BatchRequest) error {
 		for _, ru := range ba.Requests {
 			m := ru.GetInner().Method()
 			switch m {
-			case Get, Scan, ReverseScan:
+			case Get, Scan, ReverseScan, QueryResolvedTimestamp:
 			default:
 				return errors.Errorf("method %s not allowed with %s batch", m, rc)
 			}
@@ -340,22 +324,6 @@ func (sr *ScanResponse) combine(c combinable) error {
 
 var _ combinable = &ScanResponse{}
 
-func (avptr *AdminVerifyProtectedTimestampResponse) combine(c combinable) error {
-	other := c.(*AdminVerifyProtectedTimestampResponse)
-	if avptr != nil {
-		avptr.DeprecatedFailedRanges = append(avptr.DeprecatedFailedRanges,
-			other.DeprecatedFailedRanges...)
-		avptr.VerificationFailedRanges = append(avptr.VerificationFailedRanges,
-			other.VerificationFailedRanges...)
-		if err := avptr.ResponseHeader.combine(other.Header()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-var _ combinable = &AdminVerifyProtectedTimestampResponse{}
-
 // combine implements the combinable interface.
 func (sr *ReverseScanResponse) combine(c combinable) error {
 	otherSR := c.(*ReverseScanResponse)
@@ -412,7 +380,7 @@ func (rr *ResolveIntentRangeResponse) combine(c combinable) error {
 
 var _ combinable = &ResolveIntentRangeResponse{}
 
-// Combine implements the combinable interface.
+// combine implements the combinable interface.
 func (cc *CheckConsistencyResponse) combine(c combinable) error {
 	if cc != nil {
 		otherCC := c.(*CheckConsistencyResponse)
@@ -426,7 +394,7 @@ func (cc *CheckConsistencyResponse) combine(c combinable) error {
 
 var _ combinable = &CheckConsistencyResponse{}
 
-// Combine implements the combinable interface.
+// combine implements the combinable interface.
 func (er *ExportResponse) combine(c combinable) error {
 	if er != nil {
 		otherER := c.(*ExportResponse)
@@ -440,7 +408,7 @@ func (er *ExportResponse) combine(c combinable) error {
 
 var _ combinable = &ExportResponse{}
 
-// Combine implements the combinable interface.
+// combine implements the combinable interface.
 func (r *AdminScatterResponse) combine(c combinable) error {
 	if r != nil {
 		otherR := c.(*AdminScatterResponse)
@@ -454,6 +422,65 @@ func (r *AdminScatterResponse) combine(c combinable) error {
 }
 
 var _ combinable = &AdminScatterResponse{}
+
+func (avptr *AdminVerifyProtectedTimestampResponse) combine(c combinable) error {
+	other := c.(*AdminVerifyProtectedTimestampResponse)
+	if avptr != nil {
+		avptr.DeprecatedFailedRanges = append(avptr.DeprecatedFailedRanges,
+			other.DeprecatedFailedRanges...)
+		avptr.VerificationFailedRanges = append(avptr.VerificationFailedRanges,
+			other.VerificationFailedRanges...)
+		if err := avptr.ResponseHeader.combine(other.Header()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var _ combinable = &AdminVerifyProtectedTimestampResponse{}
+
+// combine implements the combinable interface.
+func (r *QueryResolvedTimestampResponse) combine(c combinable) error {
+	if r != nil {
+		otherR := c.(*QueryResolvedTimestampResponse)
+		if err := r.ResponseHeader.combine(otherR.Header()); err != nil {
+			return err
+		}
+
+		r.ResolvedTS.Backward(otherR.ResolvedTS)
+	}
+	return nil
+}
+
+var _ combinable = &QueryResolvedTimestampResponse{}
+
+// combine implements the combinable interface.
+func (r *BarrierResponse) combine(c combinable) error {
+	otherR := c.(*BarrierResponse)
+	if r != nil {
+		if err := r.ResponseHeader.combine(otherR.Header()); err != nil {
+			return err
+		}
+		r.Timestamp.Forward(otherR.Timestamp)
+	}
+	return nil
+}
+
+var _ combinable = &BarrierResponse{}
+
+// combine implements the combinable interface.
+func (r *ScanInterleavedIntentsResponse) combine(c combinable) error {
+	otherR := c.(*ScanInterleavedIntentsResponse)
+	if r != nil {
+		if err := r.ResponseHeader.combine(otherR.Header()); err != nil {
+			return err
+		}
+		r.Intents = append(r.Intents, otherR.Intents...)
+	}
+	return nil
+}
+
+var _ combinable = &ScanInterleavedIntentsResponse{}
 
 // Header implements the Request interface.
 func (rh RequestHeader) Header() RequestHeader {
@@ -675,6 +702,15 @@ func (*RangeStatsRequest) Method() Method { return RangeStats }
 
 // Method implements the Request interface.
 func (*AdminVerifyProtectedTimestampRequest) Method() Method { return AdminVerifyProtectedTimestamp }
+
+// Method implements the Request interface.
+func (*QueryResolvedTimestampRequest) Method() Method { return QueryResolvedTimestamp }
+
+// Method implements the Request interface.
+func (*ScanInterleavedIntentsRequest) Method() Method { return ScanInterleavedIntents }
+
+// Method implements the Request interface.
+func (*BarrierRequest) Method() Method { return Barrier }
 
 // ShallowCopy implements the Request interface.
 func (gr *GetRequest) ShallowCopy() Request {
@@ -930,6 +966,24 @@ func (r *RangeStatsRequest) ShallowCopy() Request {
 
 // ShallowCopy implements the Request interface.
 func (r *AdminVerifyProtectedTimestampRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (r *QueryResolvedTimestampRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (r *ScanInterleavedIntentsRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (r *BarrierRequest) ShallowCopy() Request {
 	shallowCopy := *r
 	return &shallowCopy
 }
@@ -1211,8 +1265,11 @@ func (*AdminMergeRequest) flags() int          { return isAdmin | isAlone }
 func (*AdminTransferLeaseRequest) flags() int  { return isAdmin | isAlone }
 func (*AdminChangeReplicasRequest) flags() int { return isAdmin | isAlone }
 func (*AdminRelocateRangeRequest) flags() int  { return isAdmin | isAlone }
-func (*HeartbeatTxnRequest) flags() int        { return isWrite | isTxn }
 func (*GCRequest) flags() int                  { return isWrite | isRange }
+
+// HeartbeatTxn updates the timestamp cache with transaction records,
+// to avoid checking for them on disk when considering 1PC evaluation.
+func (*HeartbeatTxnRequest) flags() int { return isWrite | isTxn | updatesTSCache }
 
 // PushTxnRequest updates different marker keys in the timestamp cache when
 // pushing a transaction's timestamp and when aborting a transaction.
@@ -1272,8 +1329,11 @@ func (r *RefreshRangeRequest) flags() int {
 	return isRead | isTxn | isRange | updatesTSCache
 }
 
-func (*SubsumeRequest) flags() int    { return isRead | isAlone | updatesTSCache }
-func (*RangeStatsRequest) flags() int { return isRead }
+func (*SubsumeRequest) flags() int                { return isRead | isAlone | updatesTSCache }
+func (*RangeStatsRequest) flags() int             { return isRead }
+func (*QueryResolvedTimestampRequest) flags() int { return isRead | isRange }
+func (*ScanInterleavedIntentsRequest) flags() int { return isRead | isRange }
+func (*BarrierRequest) flags() int                { return isWrite | isRange }
 
 // IsParallelCommit returns whether the EndTxn request is attempting to perform
 // a parallel commit. See txn_interceptor_committer.go for a discussion about
@@ -1518,4 +1578,64 @@ func (c *ContentionEvent) SafeFormat(w redact.SafePrinter, _ rune) {
 // String implements fmt.Stringer.
 func (c *ContentionEvent) String() string {
 	return redact.StringWithoutMarkers(c)
+}
+
+// Add consumption from the given structure.
+func (c *TenantConsumption) Add(other *TenantConsumption) {
+	c.RU += other.RU
+	c.ReadRequests += other.ReadRequests
+	c.ReadBytes += other.ReadBytes
+	c.WriteRequests += other.WriteRequests
+	c.WriteBytes += other.WriteBytes
+	c.SQLPodsCPUSeconds += other.SQLPodsCPUSeconds
+}
+
+// Sub subtracts consumption, making sure no fields become negative.
+func (c *TenantConsumption) Sub(other *TenantConsumption) {
+	if c.RU < other.RU {
+		c.RU = 0
+	} else {
+		c.RU -= other.RU
+	}
+
+	if c.ReadRequests < other.ReadRequests {
+		c.ReadRequests = 0
+	} else {
+		c.ReadRequests -= other.ReadRequests
+	}
+
+	if c.ReadBytes < other.ReadBytes {
+		c.ReadBytes = 0
+	} else {
+		c.ReadBytes -= other.ReadBytes
+	}
+
+	if c.WriteRequests < other.WriteRequests {
+		c.WriteRequests = 0
+	} else {
+		c.WriteRequests -= other.WriteRequests
+	}
+
+	if c.WriteBytes < other.WriteBytes {
+		c.WriteBytes = 0
+	} else {
+		c.WriteBytes -= other.WriteBytes
+	}
+
+	if c.SQLPodsCPUSeconds < other.SQLPodsCPUSeconds {
+		c.SQLPodsCPUSeconds = 0
+	} else {
+		c.SQLPodsCPUSeconds -= other.SQLPodsCPUSeconds
+	}
+}
+
+// SafeFormat implements redact.SafeFormatter.
+func (s *ScanStats) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("scan stats: stepped %d times (%d internal); seeked %d times (%d internal)",
+		s.NumInterfaceSteps, s.NumInternalSteps, s.NumInterfaceSeeks, s.NumInternalSeeks)
+}
+
+// String implements fmt.Stringer.
+func (s *ScanStats) String() string {
+	return redact.StringWithoutMarkers(s)
 }

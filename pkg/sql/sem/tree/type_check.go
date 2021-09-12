@@ -21,9 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
 )
@@ -48,20 +49,21 @@ type SemaContext struct {
 	// TypeResolver manages resolving type names into *types.T's.
 	TypeResolver TypeReferenceResolver
 
-	// AsOfTimestamp denotes the explicit AS OF SYSTEM TIME timestamp for the
-	// query, if any. If the query is not an AS OF SYSTEM TIME query,
-	// AsOfTimestamp is nil.
-	// TODO(knz): we may want to support table readers at arbitrary
-	// timestamps, so that each FROM clause can have its own
-	// timestamp. In that case, the timestamp would not be set
-	// globally for the entire txn and this field would not be needed.
-	AsOfTimestamp *hlc.Timestamp
-
 	// TableNameResolver is used to resolve the fully qualified
 	// name of a table given its ID.
 	TableNameResolver QualifiedNameResolver
 
+	// IntervalStyleEnabled determines whether IntervalStyle is enabled.
+	IntervalStyleEnabled bool
+	// DateStyleEnabled determines whether DateStyle is enabled.
+	DateStyleEnabled bool
+
 	Properties SemaProperties
+
+	// DateStyle refers to the DateStyle to parse as.
+	DateStyle pgdate.DateStyle
+	// IntervalStyle refers to the IntervalStyle to parse as.
+	IntervalStyle duration.IntervalStyle
 }
 
 // SemaProperties is a holder for required and derived properties
@@ -419,12 +421,25 @@ func (expr *CaseExpr) TypeCheck(
 // is false, it also checks that the cast has VolatilityImmutable.
 //
 // On success, any relevant telemetry counters are incremented.
-func resolveCast(context string, castFrom, castTo *types.T, allowStable bool) error {
+func resolveCast(
+	context string,
+	castFrom, castTo *types.T,
+	allowStable bool,
+	intervalStyleEnabled bool,
+	dateStyleEnabled bool,
+) error {
 	toFamily := castTo.Family()
 	fromFamily := castFrom.Family()
 	switch {
 	case toFamily == types.ArrayFamily && fromFamily == types.ArrayFamily:
-		err := resolveCast(context, castFrom.ArrayContents(), castTo.ArrayContents(), allowStable)
+		err := resolveCast(
+			context,
+			castFrom.ArrayContents(),
+			castTo.ArrayContents(),
+			allowStable,
+			intervalStyleEnabled,
+			dateStyleEnabled,
+		)
 		if err != nil {
 			return err
 		}
@@ -441,7 +456,7 @@ func resolveCast(context string, castFrom, castTo *types.T, allowStable bool) er
 		return nil
 
 	default:
-		cast := lookupCast(fromFamily, toFamily)
+		cast := lookupCast(fromFamily, toFamily, intervalStyleEnabled, dateStyleEnabled)
 		if cast == nil {
 			return pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, castTo)
 		}
@@ -521,7 +536,14 @@ func (expr *CastExpr) TypeCheck(
 		allowStable = false
 		context = semaCtx.Properties.required.context
 	}
-	err = resolveCast(context, castFrom, exprType, allowStable)
+	err = resolveCast(
+		context,
+		castFrom,
+		exprType,
+		allowStable,
+		semaCtx != nil && semaCtx.IntervalStyleEnabled,
+		semaCtx != nil && semaCtx.DateStyleEnabled,
+	)
 	if err != nil {
 		return nil, err
 	}

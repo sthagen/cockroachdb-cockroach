@@ -64,6 +64,8 @@ type testRunner struct {
 		// the registry uses for running tests. It implies skipClusterWipeOnAttach.
 		skipClusterStopOnAttach bool
 		skipClusterWipeOnAttach bool
+		// disableIssue disables posting GitHub issues for test failures.
+		disableIssue bool
 	}
 
 	status struct {
@@ -105,6 +107,7 @@ func newTestRunner(cr *clusterRegistry, buildVersion version.Version) *testRunne
 		buildVersion: buildVersion,
 	}
 	r.config.skipClusterWipeOnAttach = !clusterWipe
+	r.config.disableIssue = disableIssue
 	r.workersMu.workers = make(map[string]*workerStatus)
 	return r
 }
@@ -468,10 +471,10 @@ func (r *testRunner) runWorker(
 			artifactsDir = filepath.Join(base, runSuffix)
 			logPath = filepath.Join(artifactsDir, "test.log")
 
-			// Map artifacts/TestFoo/** => TestFoo/**, i.e. collect the artifacts
+			// Map artifacts/TestFoo/run_?/** => TestFoo/run_?/**, i.e. collect the artifacts
 			// for this test exactly as they are laid out on disk (when the time
 			// comes).
-			artifactsSpec = fmt.Sprintf("%s/** => %s", base, escapedTestName)
+			artifactsSpec = fmt.Sprintf("%s/%s/** => %s/%s", base, runSuffix, escapedTestName, runSuffix)
 		}
 		testL, err := logger.RootLogger(logPath, teeOpt)
 		if err != nil {
@@ -497,7 +500,7 @@ func (r *testRunner) runWorker(
 		// Now run the test.
 		l.PrintfCtx(ctx, "starting test: %s:%d", testToRun.spec.Name, testToRun.runNum)
 		var success bool
-		success, err = r.runTest(ctx, t, testToRun.runNum, c, testRunnerLogPath, stdout, testL)
+		success, err = r.runTest(ctx, t, testToRun.runNum, testToRun.runCount, c, testRunnerLogPath, stdout, testL)
 		if err != nil {
 			shout(ctx, l, stdout, "test returned error: %s: %s", t.Name(), err)
 			// Mark the test as failed if it isn't already.
@@ -607,6 +610,7 @@ func (r *testRunner) runTest(
 	ctx context.Context,
 	t *testImpl,
 	runNum int,
+	runCount int,
 	c *clusterImpl,
 	testRunnerLogPath string,
 	stdout io.Writer,
@@ -616,10 +620,14 @@ func (r *testRunner) runTest(
 		return false, fmt.Errorf("can't run skipped test: %s: %s", t.Name(), t.Spec().(*registry.TestSpec).Skip)
 	}
 
+	runID := t.Name()
+	if runCount > 1 {
+		runID += fmt.Sprintf("#%d", runNum)
+	}
 	if teamCity {
-		shout(ctx, l, stdout, "##teamcity[testStarted name='%s' flowId='%s']", t.Name(), t.Name())
+		shout(ctx, l, stdout, "##teamcity[testStarted name='%s' flowId='%s']", t.Name(), runID)
 	} else {
-		shout(ctx, l, stdout, "=== RUN   %s", t.Name())
+		shout(ctx, l, stdout, "=== RUN   %s", runID)
 	}
 
 	r.status.Lock()
@@ -653,8 +661,7 @@ func (r *testRunner) runTest(
 
 			if teamCity {
 				shout(ctx, l, stdout, "##teamcity[testFailed name='%s' details='%s' flowId='%s']",
-					t.Name(), teamCityEscape(output), t.Name(),
-				)
+					t.Name(), teamCityEscape(output), runID)
 
 				// Copy a snapshot of the testrunner's log to the test's artifacts dir
 				// so that we collect it below.
@@ -664,16 +671,21 @@ func (r *testRunner) runTest(
 				}
 			}
 
-			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", t.Name(), durationStr, output)
-			r.maybePostGithubIssue(ctx, l, t, stdout, output)
+			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", runID, durationStr, output)
+
+			issueOutput := output
+			if t.timedOut() {
+				issueOutput = "test timed out (see artifacts for details)"
+			}
+			r.maybePostGithubIssue(ctx, l, t, stdout, issueOutput)
 		} else {
-			shout(ctx, l, stdout, "--- PASS: %s (%s)", t.Name(), durationStr)
+			shout(ctx, l, stdout, "--- PASS: %s (%s)", runID, durationStr)
 			// If `##teamcity[testFailed ...]` is not present before `##teamCity[testFinished ...]`,
 			// TeamCity regards the test as successful.
 		}
 
 		if teamCity {
-			shout(ctx, l, stdout, "##teamcity[testFinished name='%s' flowId='%s']", t.Name(), t.Name())
+			shout(ctx, l, stdout, "##teamcity[testFinished name='%s' flowId='%s']", t.Name(), runID)
 
 			// Zip the artifacts. This improves the TeamCity UX where we can navigate
 			// through zip files just fine, but we can't download subtrees of the
@@ -801,15 +813,14 @@ func (r *testRunner) runTest(
 		// Now kill anything going on in this cluster while collecting stacks
 		// to the logs, to get the server side of the hang.
 		//
-		// TODO(tbg): send --sig=3 followed by a hard kill after we've fixed
-		// https://github.com/cockroachdb/cockroach/issues/45875.
-		// Signal 11 will dump stacks, but it might be confusing to folks
-		// who debug from the artifacts only.
-		//
 		// Don't use surrounding context, which are likely already canceled.
 		if nodes := c.All(); len(nodes) > 0 { // avoid tests
 			innerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = c.StopE(innerCtx, c.All(), option.StopArgs("--sig=11"))
+			// SIGABRT causes the go runtime to dump stacks and terminate.
+			// We also need --wait because roachprod does not think signals other than SIGKILL will terminate
+			// the process, and that is mistaken.
+			_ = c.StopE(innerCtx, c.All(), option.StopArgs("--sig=ABRT", "--wait=true"))
+			t.L().PrintfCtx(ctx, "CockroachDB nodes aborted; check the stderr log for goroutine stack traces")
 			cancel()
 		}
 
@@ -824,6 +835,7 @@ func (r *testRunner) runTest(
 		// reused since we have a runaway test goroutine that's presumably going
 		// to continue using the cluster.
 		t.printfAndFail(0 /* skip */, "test timed out (%s)", timeout)
+		t.setTimedOut()
 		select {
 		case <-done:
 			if success {
@@ -876,9 +888,13 @@ func (r *testRunner) runTest(
 }
 
 func (r *testRunner) shouldPostGithubIssue(t test.Test) bool {
-	// NB: check NodeCount > 0 to avoid posting issues from this pkg's unit tests.
 	opts := issues.DefaultOptionsFromEnv()
-	return opts.CanPost() && opts.IsReleaseBranch() && t.Spec().(*registry.TestSpec).Run != nil && t.Spec().(*registry.TestSpec).Cluster.NodeCount > 0
+	return !r.config.disableIssue &&
+		opts.CanPost() &&
+		opts.IsReleaseBranch() &&
+		t.Spec().(*registry.TestSpec).Run != nil &&
+		// NB: check NodeCount > 0 to avoid posting issues from this pkg's unit tests.
+		t.Spec().(*registry.TestSpec).Cluster.NodeCount > 0
 }
 
 func (r *testRunner) maybePostGithubIssue(
@@ -927,10 +943,12 @@ func (r *testRunner) maybePostGithubIssue(
 		Message:         msg,
 		Artifacts:       artifacts,
 		ExtraLabels:     labels,
-		ReproductionCommand: fmt.Sprintf(
-			`# From https://go.crdb.dev/p/roachstress, perhaps edited lightly.
-caffeinate ./roachstress.sh %s
-`, t.Name()),
+		ReproductionCommand: func(renderer *issues.Renderer) {
+			issues.ReproductionAsLink(
+				"roachtest README",
+				"https://github.com/cockroachdb/cockroach/blob/master/pkg/cmd/roachtest/README.md",
+			)(renderer)
+		},
 	}
 	if err := issues.Post(
 		context.Background(),
@@ -1057,6 +1075,13 @@ func (r *testRunner) getWork(
 		}
 		if err := c.RunL(ctx, l, c.All(), "rm -rf "+perfArtifactsDir); err != nil {
 			return testToRunRes{}, nil, errors.Wrapf(err, "failed to remove perf artifacts dir")
+		}
+		if c.localCertsDir != "" {
+			if err := os.RemoveAll(c.localCertsDir); err != nil {
+				return testToRunRes{}, nil, errors.Wrapf(err,
+					"failed to remove local certs in %s", c.localCertsDir)
+			}
+			c.localCertsDir = ""
 		}
 		// Overwrite the spec of the cluster with the one coming from the test. In
 		// particular, this overwrites the reuse policy to reflect what the test

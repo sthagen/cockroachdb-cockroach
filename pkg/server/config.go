@@ -133,9 +133,13 @@ type BaseConfig struct {
 	// CPUProfileDirName is the directory name for CPU profile dumps.
 	CPUProfileDirName string
 
+	// InflightTraceDirName is the directory name for job traces.
+	InflightTraceDirName string
+
 	// DefaultZoneConfig is used to set the default zone config inside the server.
 	// It can be overridden during tests by setting the DefaultZoneConfigOverride
-	// server testing knob.
+	// server testing knob. Whatever is installed here is in turn used to
+	// initialize stores, which need a default span config.
 	DefaultZoneConfig zonepb.ZoneConfig
 
 	// Locality is a description of the topography of the server.
@@ -476,6 +480,8 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 	skipSizeCheck := cfg.TestingKnobs.Store != nil &&
 		cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).SkipMinSizeCheck
+	disableSeparatedIntents := cfg.TestingKnobs.Store != nil &&
+		cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).StorageKnobs.DisableSeparatedIntents
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 		var sizeInBytes = spec.Size.InBytes
@@ -511,14 +517,28 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				}
 				engines = append(engines, e)
 			} else {
-				engines = append(engines, storage.NewInMem(ctx, spec.Attributes, cfg.CacheSize, sizeInBytes, cfg.Settings))
-			}
-		} else {
-			if spec.Size.Percent > 0 {
-				du, err := vfs.Default.GetDiskUsage(spec.Path)
+				e, err := storage.Open(ctx,
+					storage.InMemory(),
+					storage.Attributes(spec.Attributes),
+					storage.CacheSize(cfg.CacheSize),
+					storage.MaxSize(sizeInBytes),
+					storage.EncryptionAtRest(spec.EncryptionOptions),
+					storage.Settings(cfg.Settings),
+					storage.SetSeparatedIntents(disableSeparatedIntents))
 				if err != nil {
 					return Engines{}, err
 				}
+				engines = append(engines, e)
+			}
+		} else {
+			if err := vfs.Default.MkdirAll(spec.Path, 0755); err != nil {
+				return Engines{}, errors.Wrap(err, "creating store directory")
+			}
+			du, err := vfs.Default.GetDiskUsage(spec.Path)
+			if err != nil {
+				return Engines{}, errors.Wrap(err, "retrieving disk usage")
+			}
+			if spec.Size.Percent > 0 {
 				sizeInBytes = int64(float64(du.TotalBytes) * spec.Size.Percent / 100)
 			}
 			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
@@ -530,12 +550,14 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
 
 			storageConfig := base.StorageConfig{
-				Attrs:             spec.Attributes,
-				Dir:               spec.Path,
-				MaxSize:           sizeInBytes,
-				Settings:          cfg.Settings,
-				UseFileRegistry:   spec.UseFileRegistry,
-				EncryptionOptions: spec.EncryptionOptions,
+				Attrs:                   spec.Attributes,
+				Dir:                     spec.Path,
+				MaxSize:                 sizeInBytes,
+				BallastSize:             storage.BallastSizeBytes(spec, du),
+				Settings:                cfg.Settings,
+				UseFileRegistry:         spec.UseFileRegistry,
+				DisableSeparatedIntents: disableSeparatedIntents,
+				EncryptionOptions:       spec.EncryptionOptions,
 			}
 			pebbleConfig := storage.PebbleConfig{
 				StorageConfig: storageConfig,

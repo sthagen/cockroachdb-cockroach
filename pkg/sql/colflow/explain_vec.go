@@ -48,7 +48,7 @@ func convertToVecTree(
 		return nil, func() {}, errors.AssertionFailedf("unexpectedly non-empty LocalProcessors when plan is not local")
 	}
 	fuseOpt := flowinfra.FuseNormally
-	if isPlanLocal {
+	if isPlanLocal && !execinfra.HasParallelProcessors(flow) {
 		fuseOpt = flowinfra.FuseAggressively
 	}
 	// We optimistically assume that sql.DistSQLReceiver can be used as an
@@ -56,7 +56,7 @@ func convertToVecTree(
 	// creator.
 	creator := newVectorizedFlowCreator(
 		newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false, false,
-		nil, &execinfra.RowChannel{}, &fakeBatchReceiver{}, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
+		nil, &execinfra.RowChannel{}, &fakeBatchReceiver{}, flowCtx.Cfg.NodeDialer, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
 		flowCtx.Cfg.VecFDSemaphore, flowCtx.TypeResolverFactory.NewTypeResolver(flowCtx.EvalCtx.Txn),
 		admission.WorkInfo{},
 	)

@@ -17,7 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -303,7 +303,7 @@ var (
 		Unit:        metric.Unit_COUNT,
 	}
 
-	// RocksDB metrics.
+	// RocksDB/Pebble metrics.
 	metaRdbBlockCacheHits = metric.Metadata{
 		Name:        "rocksdb.block.cache.hits",
 		Help:        "Count of block cache hits",
@@ -416,6 +416,12 @@ var (
 		Name:        "storage.l0-num-files",
 		Help:        "Number of Level 0 files",
 		Measurement: "Storage",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRdbWriteStalls = metric.Metadata{
+		Name:        "storage.write-stalls",
+		Help:        "Number of instances of intentional write stalls to backpressure incoming writes",
+		Measurement: "Events",
 		Unit:        metric.Unit_COUNT,
 	}
 
@@ -1063,9 +1069,35 @@ var (
 	// TODO(mberhault): metrics for key age, per-key file/bytes counts.
 	metaEncryptionAlgorithm = metric.Metadata{
 		Name:        "rocksdb.encryption.algorithm",
-		Help:        "algorithm in use for encryption-at-rest, see ccl/storageccl/engineccl/enginepbccl/key_registry.proto",
+		Help:        "Algorithm in use for encryption-at-rest, see ccl/storageccl/engineccl/enginepbccl/key_registry.proto",
 		Measurement: "Encryption At Rest",
 		Unit:        metric.Unit_CONST,
+	}
+
+	// Concurrency control metrics.
+	metaConcurrencyLocks = metric.Metadata{
+		Name:        "kv.concurrency.locks",
+		Help:        "Number of active locks held in lock tables. Does not include replicated locks (intents) that are not held in memory",
+		Measurement: "Locks",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConcurrencyLocksWithWaitQueues = metric.Metadata{
+		Name:        "kv.concurrency.locks_with_wait_queues",
+		Help:        "Number of active locks held in lock tables with active wait-queues",
+		Measurement: "Locks",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConcurrencyLockWaitQueueWaiters = metric.Metadata{
+		Name:        "kv.concurrency.lock_wait_queue_waiters",
+		Help:        "Number of requests actively waiting in a lock wait-queue",
+		Measurement: "Lock-Queue Waiters",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConcurrencyMaxLockWaitQueueWaitersForLock = metric.Metadata{
+		Name:        "kv.concurrency.max_lock_wait_queue_waiters_for_lock",
+		Help:        "Maximum number of requests actively waiting in any single lock wait-queue",
+		Measurement: "Lock-Queue Waiters",
+		Unit:        metric.Unit_COUNT,
 	}
 
 	// Closed timestamp metrics.
@@ -1079,19 +1111,6 @@ var (
 		Name:        "kv.closed_timestamp.failures_to_close",
 		Help:        "Number of times the min prop tracker failed to close timestamps due to epoch mismatch or pending evaluations",
 		Measurement: "Attempts",
-		Unit:        metric.Unit_COUNT,
-	}
-
-	metaConflictingIntentsResolveRejected = metric.Metadata{
-		Name:        "intents.resolve_conflicting.rejected",
-		Help:        "Number of conflicting intents resolutions rejected",
-		Measurement: "Intent Resolutions",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaFinalizedTxnCleanupTimedOut = metric.Metadata{
-		Name:        "intents.finalized_txns.timed_out",
-		Help:        "Number of finalized transaction resolution timeouts",
-		Measurement: "Intent Resolutions",
 		Unit:        metric.Unit_COUNT,
 	}
 )
@@ -1167,6 +1186,7 @@ type StoreMetrics struct {
 	RdbPendingCompaction        *metric.Gauge
 	RdbL0Sublevels              *metric.Gauge
 	RdbL0NumFiles               *metric.Gauge
+	RdbWriteStalls              *metric.Gauge
 
 	// Disk health metrics.
 	DiskSlow    *metric.Gauge
@@ -1300,13 +1320,14 @@ type StoreMetrics struct {
 	// RangeFeed counts.
 	RangeFeedMetrics *rangefeed.Metrics
 
-	// Closed timestamp metrics.
-	ClosedTimestampMaxBehindNanos  *metric.Gauge
-	ClosedTimestampFailuresToClose *metric.Gauge
+	// Concurrency control metrics.
+	Locks                          *metric.Gauge
+	LocksWithWaitQueues            *metric.Gauge
+	LockWaitQueueWaiters           *metric.Gauge
+	MaxLockWaitQueueWaitersForLock *metric.Gauge
 
-	// Intent cleanup failures
-	ConflictingIntentsResolveRejected *metric.Counter
-	FinalizedTxnCleanupTimedOut       *metric.Counter
+	// Closed timestamp metrics.
+	ClosedTimestampMaxBehindNanos *metric.Gauge
 }
 
 // TenantsStorageMetrics are metrics which are aggregated over all tenants
@@ -1467,7 +1488,7 @@ type tenantStorageMetrics struct {
 }
 
 func newTenantsStorageMetrics() *TenantsStorageMetrics {
-	b := aggmetric.MakeBuilder(tenantrate.TenantIDLabel)
+	b := aggmetric.MakeBuilder(multitenant.TenantIDLabel)
 	sm := &TenantsStorageMetrics{
 		LiveBytes:      b.Gauge(metaLiveBytes),
 		KeyBytes:       b.Gauge(metaKeyBytes),
@@ -1555,6 +1576,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbPendingCompaction:        metric.NewGauge(metaRdbPendingCompaction),
 		RdbL0Sublevels:              metric.NewGauge(metaRdbL0Sublevels),
 		RdbL0NumFiles:               metric.NewGauge(metaRdbL0NumFiles),
+		RdbWriteStalls:              metric.NewGauge(metaRdbWriteStalls),
 
 		// Disk health metrics.
 		DiskSlow:    metric.NewGauge(metaDiskSlow),
@@ -1666,6 +1688,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		GCPushTxn:                    metric.NewCounter(metaGCPushTxn),
 		GCResolveTotal:               metric.NewCounter(metaGCResolveTotal),
 		GCResolveSuccess:             metric.NewCounter(metaGCResolveSuccess),
+		GCResolveFailed:              metric.NewCounter(metaGCResolveFailed),
 		GCTxnIntentsResolveFailed:    metric.NewCounter(metaGCTxnIntentsResolveFailed),
 
 		// Wedge request counters.
@@ -1692,14 +1715,14 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		// RangeFeed counters.
 		RangeFeedMetrics: rangefeed.NewMetrics(),
 
-		// Closed timestamp metrics.
-		ClosedTimestampMaxBehindNanos:  metric.NewGauge(metaClosedTimestampMaxBehindNanos),
-		ClosedTimestampFailuresToClose: metric.NewGauge(metaClosedTimestampFailuresToClose),
+		// Concurrency control metrics.
+		Locks:                          metric.NewGauge(metaConcurrencyLocks),
+		LocksWithWaitQueues:            metric.NewGauge(metaConcurrencyLocksWithWaitQueues),
+		LockWaitQueueWaiters:           metric.NewGauge(metaConcurrencyLockWaitQueueWaiters),
+		MaxLockWaitQueueWaitersForLock: metric.NewGauge(metaConcurrencyMaxLockWaitQueueWaitersForLock),
 
-		// Intent leak metrics
-		ConflictingIntentsResolveRejected: metric.NewCounter(metaConflictingIntentsResolveRejected),
-		FinalizedTxnCleanupTimedOut:       metric.NewCounter(metaFinalizedTxnCleanupTimedOut),
-		GCResolveFailed:                   metric.NewCounter(metaGCResolveFailed),
+		// Closed timestamp metrics.
+		ClosedTimestampMaxBehindNanos: metric.NewGauge(metaClosedTimestampMaxBehindNanos),
 	}
 	storeRegistry.AddMetricStruct(sm)
 
@@ -1768,6 +1791,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbL0Sublevels.Update(int64(m.Levels[0].Sublevels))
 	sm.RdbL0NumFiles.Update(m.Levels[0].NumFiles)
 	sm.RdbNumSSTables.Update(m.NumSSTables())
+	sm.RdbWriteStalls.Update(m.WriteStallCount)
 	sm.DiskSlow.Update(m.DiskSlowCount)
 	sm.DiskStalled.Update(m.DiskStallCount)
 }

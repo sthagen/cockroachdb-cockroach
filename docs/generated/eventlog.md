@@ -454,6 +454,30 @@ AlterDatabaseAddRegion is recorded when a region is added to a database.
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
 | `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
+### `alter_database_placement`
+
+An event of type `alter_database_placement` is recorded when the database placement is modified.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DatabaseName` | The name of the database. | yes |
+| `Placement` | The new placement policy. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
 ### `alter_database_primary_region`
 
 An event of type `alter_database_primary_region` is recorded when a primary region is added/modified.
@@ -1470,6 +1494,34 @@ An event of type `alter_database_owner` is recorded when a database's owner is c
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
 | `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
+### `alter_default_privileges`
+
+An event of type `alter_default_privileges` is recorded when default privileges are changed.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DatabaseName` | The name of the affected database. | yes |
+| `RoleName` | Either role_name should be populated or for_all_roles should be true. The role having its default privileges altered. | yes |
+| `ForAllRoles` | Identifies if FOR ALL ROLES is used. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `Grantee` | The user/role affected by the grant or revoke operation. | yes |
+| `GrantedPrivileges` | The privileges being granted to the grantee. | no |
+| `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
+
 ### `alter_schema_owner`
 
 An event of type `alter_schema_owner` is recorded when a schema's owner is changed.
@@ -1827,6 +1879,29 @@ are only emitted via external logging.
 Events in this category are logged to the `SQL_PERF` channel.
 
 
+### `large_row`
+
+An event of type `large_row` is recorded when a statement tries to write a row larger than
+cluster setting `sql.mutations.max_row_size.log` to the database. Multiple
+LargeRow events will be recorded for statements writing multiple large rows.
+LargeRow events are recorded before the transaction commits, so in the case
+of transaction abort there will not be a corresponding row in the database.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `RowSize` |  | no |
+| `TableID` |  | no |
+| `FamilyID` |  | no |
+| `PrimaryKey` |  | yes |
+| `ViolatesMaxRowSizeErr` |  | no |
+
 ### `slow_query`
 
 An event of type `slow_query` is recorded when a query triggers the "slow query" condition.
@@ -1864,6 +1939,59 @@ set to a non-zero value, AND
 | `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 
+### `txn_rows_read_limit`
+
+An event of type `txn_rows_read_limit` is recorded when a transaction tries to read more rows than
+cluster setting `sql.defaults.transaction_rows_read_log`. There will only be
+a single record for a single transaction (unless it is retried) even if there
+are more statement within the transaction that haven't been executed yet.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `TxnID` | TxnID is the ID of the transaction that hit the row count limit. | no |
+| `SessionID` | SessionID is the ID of the session that initiated the transaction. | no |
+| `NumRows` | NumRows is the number of rows written/read (depending on the event type) by the transaction that reached the corresponding guardrail. | no |
+
+### `txn_rows_written_limit`
+
+An event of type `txn_rows_written_limit` is recorded when a transaction tries to write more rows
+than cluster setting `sql.defaults.transaction_rows_written_log`. There will
+only be a single record for a single transaction (unless it is retried) even
+if there are more mutation statements within the transaction that haven't
+been executed yet.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `TxnID` | TxnID is the ID of the transaction that hit the row count limit. | no |
+| `SessionID` | SessionID is the ID of the session that initiated the transaction. | no |
+| `NumRows` | NumRows is the number of rows written/read (depending on the event type) by the transaction that reached the corresponding guardrail. | no |
+
 ## SQL Slow Query Log (Internal)
 
 Events in this category report slow query execution by
@@ -1876,6 +2004,27 @@ are only emitted via external logging.
 
 Events in this category are logged to the `SQL_INTERNAL_PERF` channel.
 
+
+### `large_row_internal`
+
+An event of type `large_row_internal` is recorded when an internal query tries to write a row
+larger than cluster settings `sql.mutations.max_row_size.log` or
+`sql.mutations.max_row_size.err` to the database.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `RowSize` |  | no |
+| `TableID` |  | no |
+| `FamilyID` |  | no |
+| `PrimaryKey` |  | yes |
+| `ViolatesMaxRowSizeErr` |  | no |
 
 ### `slow_query_internal`
 
@@ -1909,6 +2058,61 @@ the "slow query" condition.
 | `FullTableScan` | Whether the query contains a full table scan. | no |
 | `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
+
+### `txn_rows_read_limit_internal`
+
+An event of type `txn_rows_read_limit_internal` is recorded when an internal transaction tries to
+read more rows than cluster setting `sql.defaults.transaction_rows_read_log`
+or `sql.defaults.transaction_rows_read_err`. There will only be a single
+record for a single transaction (unless it is retried) even if there are more
+mutation statements within the transaction that haven't been executed yet.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `TxnID` | TxnID is the ID of the transaction that hit the row count limit. | no |
+| `SessionID` | SessionID is the ID of the session that initiated the transaction. | no |
+| `NumRows` | NumRows is the number of rows written/read (depending on the event type) by the transaction that reached the corresponding guardrail. | no |
+
+### `txn_rows_written_limit_internal`
+
+An event of type `txn_rows_written_limit_internal` is recorded when an internal transaction tries to
+write more rows than cluster setting
+`sql.defaults.transaction_rows_written_log` or
+`sql.defaults.transaction_rows_written_err`. There will only be a single
+record for a single transaction (unless it is retried) even if there are more
+mutation statements within the transaction that haven't been executed yet.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `TxnID` | TxnID is the ID of the transaction that hit the row count limit. | no |
+| `SessionID` | SessionID is the ID of the session that initiated the transaction. | no |
+| `NumRows` | NumRows is the number of rows written/read (depending on the event type) by the transaction that reached the corresponding guardrail. | no |
 
 ## SQL User and Role operations
 
@@ -1991,6 +2195,43 @@ An event of type `drop_role` is recorded when a role is dropped.
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
 | `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
+## Telemetry events
+
+
+
+Events in this category are logged to the `TELEMETRY` channel.
+
+
+### `sampled_query`
+
+An event of type `sampled_query` is the SQL query event logged to the telemetry channel. It
+contains common SQL event/execution details.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | yes |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 
 ## Zone config events
 

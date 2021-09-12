@@ -4237,65 +4237,6 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	}
 }
 
-func TestTruncateInterleavedTables(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	defer gcjob.SetSmallMaxGCIntervalForTest()()
-
-	params, _ := tests.CreateTestServerParams()
-	// Decrease the adopt loop interval so that retries happen quickly.
-	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
-
-	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-	sqlDB := sqlutils.SQLRunner{DB: sqlDBRaw}
-
-	// Disable strict GC TTL enforcement because we're going to shove a zero-value
-	// TTL into the system with AddImmediateGCZoneConfig.
-	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDBRaw)()
-
-	sqlDB.Exec(t, `
-CREATE DATABASE t;
-CREATE TABLE t.parent (x INT PRIMARY KEY);
-CREATE TABLE t.child (x INT, y INT, PRIMARY KEY (x, y)) INTERLEAVE IN PARENT t.parent (x);
-INSERT INTO t.parent VALUES (1), (2), (3);
-INSERT INTO t.child VALUES (1, 2), (2, 3), (3, 4);
-`)
-
-	// Get the table descriptors before truncation.
-	parent := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "parent")
-	child := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "child")
-
-	// Add zone configs for the parent and child tables.
-	_, err := sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, parent.GetID())
-	require.NoError(t, err)
-	_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, child.GetID())
-	require.NoError(t, err)
-
-	// Truncate the parent now, which should cascade truncate the child.
-	sqlDB.Exec(t, `TRUNCATE TABLE t.parent CASCADE`)
-
-	// SQL should think that both the parent and child tables are empty.
-	sqlDB.CheckQueryResults(t, `SELECT count(*) FROM t.parent`, [][]string{{"0"}})
-	sqlDB.CheckQueryResults(t, `SELECT count(*) FROM t.child`, [][]string{{"0"}})
-
-	// The GC should kick in and actually delete all of the data in each table.
-	testutils.SucceedsSoon(t, func() error {
-		// We only need to scan the parent's table span to verify that
-		// the index data is deleted, since child is interleaved in it.
-		start := keys.SystemSQLCodec.TablePrefix(uint32(parent.GetID()))
-		end := start.PrefixEnd()
-		kvs, err := kvDB.Scan(ctx, start, end, 0)
-		require.NoError(t, err)
-		if len(kvs) != 0 {
-			return errors.Newf("expected 0 kvs, found %d", len(kvs))
-		}
-		return nil
-	})
-}
-
 // Test TRUNCATE during a column backfill.
 func TestTruncateWhileColumnBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -6195,7 +6136,7 @@ func TestMultipleRevert(t *testing.T) {
 					ranCancelCommand = true
 				}
 				// Keep returning a retryable error until the job was actually canceled.
-				return jobs.NewRetryJobError("retry until cancel")
+				return jobs.MarkAsRetryJobError(errors.New("retry until cancel"))
 			},
 			RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 				// Allow the backfill to proceed normally once the job was actually
@@ -6211,7 +6152,7 @@ func TestMultipleRevert(t *testing.T) {
 				}
 				shouldRetryAfterReversingMutations = false
 				// After cancelation, the job should get one more retryable error.
-				return jobs.NewRetryJobError("retry once after cancel")
+				return jobs.MarkAsRetryJobError(errors.New("retry once after cancel"))
 			},
 		},
 	}
@@ -6297,6 +6238,13 @@ SELECT value
  WHERE name = 'sql.schema_changer.permanent_errors';
 `).Scan(&permanentErrors))
 		require.Equal(t, 1, permanentErrors)
+		var userErrors int
+		require.NoError(t, sqlDB.QueryRow(`
+SELECT usage_count
+  FROM crdb_internal.feature_usage
+ WHERE feature_name = 'sql.schema_changer.errors.constraint_violation';
+`).Scan(&userErrors))
+		require.GreaterOrEqual(t, userErrors, 1)
 	}
 
 	t.Run("error-before-backfill", func(t *testing.T) {
@@ -6375,7 +6323,7 @@ func TestDropTableWhileSchemaChangeReverting(t *testing.T) {
 				// Return a retry error, so that we can be sure to test the path where
 				// the job is marked as failed by the DROP TABLE instead of running to
 				// completion and ending up in the failed state on its own.
-				return jobs.NewRetryJobError("injected retry error")
+				return jobs.MarkAsRetryJobError(errors.New("injected retry error"))
 			},
 		},
 		// Decrease the adopt loop interval so that retries happen quickly.
@@ -6649,6 +6597,7 @@ func TestAddingTableResolution(t *testing.T) {
 // descriptor.
 func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	canProceed := make(chan struct{})
@@ -6664,7 +6613,16 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 		defer jobCancellationsToFail.Unlock()
 		f(jobCancellationsToFail.jobs)
 	}
-	jobInterval := 100 * time.Millisecond
+	jobKnobs := jobs.NewTestingKnobsWithShortIntervals()
+	jobKnobs.BeforeUpdate = func(orig, updated jobs.JobMetadata) (err error) {
+		withJobsToFail(func(m map[jobspb.JobID]struct{}) {
+			if _, ok := m[orig.ID]; ok && updated.Status == jobs.StatusCanceled {
+				delete(m, orig.ID)
+				err = errors.Errorf("boom")
+			}
+		})
+		return err
+	}
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforeBackfill: func() error {
@@ -6672,22 +6630,7 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 				return nil
 			},
 		},
-		JobsTestingKnobs: &jobs.TestingKnobs{
-			BeforeUpdate: func(orig, updated jobs.JobMetadata) (err error) {
-				withJobsToFail(func(m map[jobspb.JobID]struct{}) {
-					if _, ok := m[orig.ID]; ok && updated.Status == jobs.StatusCanceled {
-						delete(m, orig.ID)
-						err = errors.Errorf("boom")
-					}
-				})
-				return err
-			},
-			// Decrease the adopt loop interval so that retries happen quickly.
-			IntervalOverrides: jobs.TestingIntervalOverrides{
-				Adopt:  &jobInterval,
-				Cancel: &jobInterval,
-			},
-		},
+		JobsTestingKnobs: jobKnobs,
 	}
 
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -6757,6 +6700,7 @@ SELECT job_id FROM crdb_internal.jobs
 // multiple queued schema changes works as expected.
 func TestCancelMultipleQueued(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	canProceed := make(chan struct{})
@@ -6853,6 +6797,7 @@ SELECT job_id FROM crdb_internal.jobs
 // works correctly (#57596).
 func TestRollbackForeignKeyAddition(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	// Track whether we've attempted the backfill already, since there's a second
@@ -6922,6 +6867,7 @@ AND descriptor_ids[1] = 'db.t2'::regclass::int`,
 // tests that such jobs are not cancelable. Regression test for #59415.
 func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
 		name       string
@@ -7103,6 +7049,7 @@ func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
 // after an existing a mutation on the column
 func TestDropColumnAfterMutations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	var jobControlMu syncutil.Mutex
 	var delayJobList []string
@@ -7375,6 +7322,7 @@ COMMIT;
 // if they weren't fully validated.
 func TestCheckConstraintDropAndColumn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	var jobControlMu syncutil.Mutex
 	var delayJobList []string
@@ -7476,6 +7424,7 @@ COMMIT;
 // treated as permanent failures.
 func TestClockSyncErrorsAreNotPermanent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var tc serverutils.TestClusterInterface
 	ctx := context.Background()

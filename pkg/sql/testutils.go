@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
@@ -62,7 +63,7 @@ func CreateTestTableDescriptor(
 			&semaCtx,
 			&evalCtx,
 			&sessiondata.SessionData{
-				LocalOnlySessionData: sessiondata.LocalOnlySessionData{
+				LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
 					EnableUniqueWithoutIndexConstraints: true,
 					HashShardedIndexesEnabled:           true,
 				},
@@ -109,11 +110,6 @@ func (r StmtBufReader) CurCmd() (Command, error) {
 // AdvanceOne moves the cursor one position over.
 func (r *StmtBufReader) AdvanceOne() {
 	r.buf.AdvanceOne()
-}
-
-// SeekToNextBatch skips to the beginning of the next batch of commands.
-func (r *StmtBufReader) SeekToNextBatch() error {
-	return r.buf.seekToNextBatch()
 }
 
 // Exec is a test utility function that takes a localPlanner (of type

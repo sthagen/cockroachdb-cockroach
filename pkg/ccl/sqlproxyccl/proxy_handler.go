@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/cache"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/denylist"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/idle"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
@@ -56,8 +55,6 @@ const (
 	// For example:
 	// "foo-7-10" -> cluster name is "foo-7" and tenant id is 10.
 	clusterTenantSep = "-"
-	// TODO(spaskob): add ballpark estimate.
-	maxKnownConnCacheSize = 5e6 // 5 million.
 )
 
 // ProxyOptions is the information needed to construct a new proxyHandler.
@@ -100,6 +97,10 @@ type ProxyOptions struct {
 	// DrainTimeout if set, will close DRAINING connections that have been idle
 	// for this duration.
 	DrainTimeout time.Duration
+
+	// Token bucket policy used to throttle (IP, TenantID) connection pairs that
+	// have no history of successful authentication.
+	ThrottlePolicy throttler.BucketPolicy
 }
 
 // proxyHandler is the default implementation of a proxy handler.
@@ -131,9 +132,6 @@ type proxyHandler struct {
 
 	// CertManger keeps up to date the certificates used.
 	certManager *certmgr.CertManager
-
-	//connCache is used to keep track of all current connections.
-	connCache cache.ConnCache
 }
 
 // newProxyHandler will create a new proxy handler with configuration based on
@@ -163,8 +161,9 @@ func newProxyHandler(
 		handler.denyListWatcher = denylist.NilWatcher()
 	}
 
-	handler.throttleService = throttler.NewLocalService(throttler.WithBaseDelay(options.RatelimitBaseDelay))
-	handler.connCache = cache.NewCappedConnCache(maxKnownConnCacheSize)
+	handler.throttleService = throttler.NewLocalService(
+		throttler.WithPolicy(handler.ThrottlePolicy),
+	)
 
 	if handler.DirectoryAddr != "" {
 		conn, err := grpc.Dial(handler.DirectoryAddr, grpc.WithInsecure())
@@ -208,7 +207,8 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	}
 
 	// This currently only happens for CancelRequest type of startup messages
-	// that we don't support.
+	// that we don't support. Return nil to the server, which simply closes the
+	// connection.
 	if msg == nil {
 		return nil
 	}
@@ -256,7 +256,10 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	}
 	defer removeListener()
 
-	if err = handler.throttle(ctx, tenID, ipAddr); err != nil {
+	throttleTags := throttler.ConnectionTags{IP: ipAddr, TenantID: tenID.String()}
+	if err := handler.throttleService.LoginCheck(throttleTags); err != nil {
+		log.Errorf(ctx, "throttler refused connection: %v", err.Error())
+		err = newErrorf(codeProxyRefusedConnection, "connection attempt throttled")
 		updateMetricsAndSendErrToClient(err, conn, handler.metrics)
 		return err
 	}
@@ -374,10 +377,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	}
 
 	handler.metrics.SuccessfulConnCount.Inc(1)
-
-	handler.connCache.Insert(
-		&cache.ConnKey{IPAddress: ipAddr, TenantID: tenID},
-	)
+	handler.throttleService.ReportSuccess(throttleTags)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -473,23 +473,6 @@ func (handler *proxyHandler) outgoingAddress(
 	return addr, nil
 }
 
-func (handler *proxyHandler) throttle(
-	ctx context.Context, tenID roachpb.TenantID, ipAddr string,
-) error {
-	// Admit the connection
-	connKey := cache.ConnKey{IPAddress: ipAddr, TenantID: tenID}
-	if !handler.connCache.Exists(&connKey) {
-		// Unknown previous successful connections from this IP and tenant.
-		// Hence we need to rate limit.
-		if err := handler.throttleService.LoginCheck(ipAddr, timeutil.Now()); err != nil {
-			log.Errorf(ctx, "throttler refused connection: %v", err.Error())
-			return newErrorf(codeProxyRefusedConnection, "connection attempt throttled")
-		}
-	}
-
-	return nil
-}
-
 // incomingTLSConfig gets back the current TLS config for the incoming client
 // connection endpoint.
 func (handler *proxyHandler) incomingTLSConfig() *tls.Config {
@@ -565,7 +548,7 @@ func clusterNameAndTenantFromParams(
 		return msg, "", roachpb.MaxTenantID, err
 	}
 
-	clusterNameFromOpt, err := parseOptionsParam(msg.Parameters["options"])
+	clusterNameFromOpt, newOptionsParam, err := parseOptionsParam(msg.Parameters["options"])
 	if err != nil {
 		return msg, "", roachpb.MaxTenantID, err
 	}
@@ -612,7 +595,11 @@ func clusterNameAndTenantFromParams(
 	for key, value := range msg.Parameters {
 		if key == "database" {
 			paramsOut[key] = databaseName
-		} else if key != "options" {
+		} else if key == "options" {
+			if newOptionsParam != "" {
+				paramsOut[key] = newOptionsParam
+			}
+		} else {
 			paramsOut[key] = value
 		}
 	}
@@ -653,47 +640,45 @@ func parseDatabaseParam(databaseParam string) (clusterName, databaseName string,
 }
 
 // parseOptionsParam parses the options parameter from the PG connection string,
-// and tries to return the cluster name if present. Just like PostgreSQL, the
+// and tries to return the cluster name if present. It also returns the options
+// parameter with the cluster name stripped out. Just like PostgreSQL, the
 // sqlproxy supports three different ways to set a run-time parameter through
 // its command-line options:
 //     -c NAME=VALUE (commonly used throughout documentation around PGOPTIONS)
 //     -cNAME=VALUE
 //     --NAME=VALUE
 //
-// CockroachDB currently does not support the options parameter, so the parsing
-// logic is built on that assumption. If we do start supporting options in
-// CockroachDB itself, then we should revisit this.
-//
 // Note that this parsing approach is not perfect as it allows a negative case
 // like options="-c --cluster=happy-koala -c -c -c" to go through. To properly
 // parse this, we need to traverse the string from left to right, and look at
 // every single argument, but that involves quite a bit of work, so we'll punt
 // for now.
-func parseOptionsParam(optionsParam string) (string, error) {
+func parseOptionsParam(optionsParam string) (clusterName, newOptionsParam string, err error) {
 	// Only search up to 2 in case of large inputs.
 	matches := clusterNameLongOptionRE.FindAllStringSubmatch(optionsParam, 2 /* n */)
 	if len(matches) == 0 {
-		return "", nil
+		return "", optionsParam, nil
 	}
 
 	if len(matches) > 1 {
 		// Technically we could still allow requests to go through if all
 		// cluster names match, but we don't want to parse the entire string, so
 		// we will just error out if at least two cluster flags are provided.
-		return "", errors.New("multiple cluster flags provided")
+		return "", "", errors.New("multiple cluster flags provided")
 	}
 
 	// Length of each match should always be 2 with the given regex, one for
 	// the full string, and the other for the cluster name.
 	if len(matches[0]) != 2 {
 		// We don't want to panic here.
-		return "", errors.New("internal server error")
+		return "", "", errors.New("internal server error")
 	}
 
 	// Flag was provided, but value is NULL.
 	if len(matches[0][1]) == 0 {
-		return "", errors.New("invalid cluster flag")
+		return "", "", errors.New("invalid cluster flag")
 	}
-
-	return matches[0][1], nil
+	newOptionsParam = strings.ReplaceAll(optionsParam, matches[0][0], "")
+	newOptionsParam = strings.TrimSpace(newOptionsParam)
+	return matches[0][1], newOptionsParam, nil
 }

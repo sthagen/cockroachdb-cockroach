@@ -182,42 +182,42 @@ is_updatable       b                    66          2       28                  
 is_updatable       c                    66          3       28                        false
 is_updatable_view  a                    67          1       0                         false
 is_updatable_view  b                    67          2       0                         false
-pg_class           oid                  4294967138  1       0                         false
-pg_class           relname              4294967138  2       0                         false
-pg_class           relnamespace         4294967138  3       0                         false
-pg_class           reltype              4294967138  4       0                         false
-pg_class           reloftype            4294967138  5       0                         false
-pg_class           relowner             4294967138  6       0                         false
-pg_class           relam                4294967138  7       0                         false
-pg_class           relfilenode          4294967138  8       0                         false
-pg_class           reltablespace        4294967138  9       0                         false
-pg_class           relpages             4294967138  10      0                         false
-pg_class           reltuples            4294967138  11      0                         false
-pg_class           relallvisible        4294967138  12      0                         false
-pg_class           reltoastrelid        4294967138  13      0                         false
-pg_class           relhasindex          4294967138  14      0                         false
-pg_class           relisshared          4294967138  15      0                         false
-pg_class           relpersistence       4294967138  16      0                         false
-pg_class           relistemp            4294967138  17      0                         false
-pg_class           relkind              4294967138  18      0                         false
-pg_class           relnatts             4294967138  19      0                         false
-pg_class           relchecks            4294967138  20      0                         false
-pg_class           relhasoids           4294967138  21      0                         false
-pg_class           relhaspkey           4294967138  22      0                         false
-pg_class           relhasrules          4294967138  23      0                         false
-pg_class           relhastriggers       4294967138  24      0                         false
-pg_class           relhassubclass       4294967138  25      0                         false
-pg_class           relfrozenxid         4294967138  26      0                         false
-pg_class           relacl               4294967138  27      0                         false
-pg_class           reloptions           4294967138  28      0                         false
-pg_class           relforcerowsecurity  4294967138  29      0                         false
-pg_class           relispartition       4294967138  30      0                         false
-pg_class           relispopulated       4294967138  31      0                         false
-pg_class           relreplident         4294967138  32      0                         false
-pg_class           relrewrite           4294967138  33      0                         false
-pg_class           relrowsecurity       4294967138  34      0                         false
-pg_class           relpartbound         4294967138  35      0                         false
-pg_class           relminmxid           4294967138  36      0                         false
+pg_class           oid                  4294967133  1       0                         false
+pg_class           relname              4294967133  2       0                         false
+pg_class           relnamespace         4294967133  3       0                         false
+pg_class           reltype              4294967133  4       0                         false
+pg_class           reloftype            4294967133  5       0                         false
+pg_class           relowner             4294967133  6       0                         false
+pg_class           relam                4294967133  7       0                         false
+pg_class           relfilenode          4294967133  8       0                         false
+pg_class           reltablespace        4294967133  9       0                         false
+pg_class           relpages             4294967133  10      0                         false
+pg_class           reltuples            4294967133  11      0                         false
+pg_class           relallvisible        4294967133  12      0                         false
+pg_class           reltoastrelid        4294967133  13      0                         false
+pg_class           relhasindex          4294967133  14      0                         false
+pg_class           relisshared          4294967133  15      0                         false
+pg_class           relpersistence       4294967133  16      0                         false
+pg_class           relistemp            4294967133  17      0                         false
+pg_class           relkind              4294967133  18      0                         false
+pg_class           relnatts             4294967133  19      0                         false
+pg_class           relchecks            4294967133  20      0                         false
+pg_class           relhasoids           4294967133  21      0                         false
+pg_class           relhaspkey           4294967133  22      0                         false
+pg_class           relhasrules          4294967133  23      0                         false
+pg_class           relhastriggers       4294967133  24      0                         false
+pg_class           relhassubclass       4294967133  25      0                         false
+pg_class           relfrozenxid         4294967133  26      0                         false
+pg_class           relacl               4294967133  27      0                         false
+pg_class           reloptions           4294967133  28      0                         false
+pg_class           relforcerowsecurity  4294967133  29      0                         false
+pg_class           relispartition       4294967133  30      0                         false
+pg_class           relispopulated       4294967133  31      0                         false
+pg_class           relreplident         4294967133  32      0                         false
+pg_class           relrewrite           4294967133  33      0                         false
+pg_class           relrowsecurity       4294967133  34      0                         false
+pg_class           relpartbound         4294967133  35      0                         false
+pg_class           relminmxid           4294967133  36      0                         false
 
 # Check that the oid does not exist. If this test fail, change the oid here and in
 # the next test at 'relation does not exist' value.
@@ -239,3 +239,104 @@ relation does not exist               0
 relation does not exist               false
 relation exists, but column does not  true
 system column                         false
+
+query T
+SELECT current_setting('statement_timeout')
+----
+0
+
+query T
+SELECT current_setting('statement_timeout', false)
+----
+0
+
+# check returns null on unsupported session var.
+query T
+SELECT IFNULL(current_setting('woo', true), 'OK')
+----
+OK
+
+# check that current_setting handles null.
+query T
+SELECT current_setting(NULL, false)
+----
+NULL
+
+# check that multiple settings can be queried at once.
+query TT
+SELECT current_setting('statement_timeout'), current_setting('search_path')
+----
+0  "$user", public
+
+# check error on nonexistent session var.
+query error unrecognized configuration parameter
+SELECT pg_catalog.current_setting('woo', false)
+
+# check error on unsupported session var.
+query error configuration setting.*not supported
+SELECT current_setting('vacuum_cost_delay', false)
+
+query T
+SHOW application_name
+----
+·
+
+query T
+SELECT set_config('application_name', 'woo', false)
+----
+woo
+
+query T
+SHOW application_name
+----
+woo
+
+# check that multiple settings can be set at once
+query TTT
+SELECT
+  set_config('application_name', 'foo', false),
+  set_config('statement_timeout', '60s', false),
+  set_config(NULL, 'foo', false)
+----
+foo  60000  NULL
+
+# check that the value doesn't change with isLocal=true outside of a
+# transaction. Note: in Postgres, set_config returns 'woo' here even though
+# the value doesn't change. This difference doesn't seem too important.
+query T
+SELECT set_config('application_name', 'woo', true)
+----
+foo
+
+query T
+SELECT current_setting('application_name')
+----
+foo
+
+# verify that the setting change is scoped to the transaction with isLocal=true.
+statement ok
+BEGIN
+
+query T
+SELECT set_config('application_name', 'woo', true)
+----
+woo
+
+query TT
+SELECT current_setting('application_name'), current_setting('statement_timeout')
+----
+woo  60000
+
+statement ok
+COMMIT
+
+query T
+SELECT current_setting('application_name')
+----
+foo
+
+query error unrecognized configuration parameter
+SELECT pg_catalog.set_config('woo', 'woo', false)
+
+query error configuration setting.*not supported
+SELECT set_config('vacuum_cost_delay', '0', false)

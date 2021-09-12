@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -178,6 +179,7 @@ type DatabaseDescriptor interface {
 	ForEachSchemaInfo(func(id descpb.ID, name string, isDropped bool) error) error
 	GetSchemaID(name string) descpb.ID
 	GetNonDroppedSchemaName(schemaID descpb.ID) string
+	GetDefaultPrivilegeDescriptor() DefaultPrivilegeDescriptor
 }
 
 // TableDescriptor is an interface around the table descriptor types.
@@ -324,7 +326,7 @@ type TableDescriptor interface {
 	GetReplacementOf() descpb.TableDescriptor_Replacement
 	GetAllReferencedTypeIDs(
 		databaseDesc DatabaseDescriptor, getType func(descpb.ID) (TypeDescriptor, error),
-	) (descpb.IDs, error)
+	) (referencedAnywhere, referencedInColumns descpb.IDs, _ error)
 
 	ForeachDependedOnBy(f func(dep *descpb.TableDescriptor_Reference) error) error
 	GetDependedOnBy() []descpb.TableDescriptor_Reference
@@ -388,6 +390,20 @@ type TypeDescriptor interface {
 type TypeDescriptorResolver interface {
 	// GetTypeDescriptor returns the type descriptor for the input ID.
 	GetTypeDescriptor(ctx context.Context, id descpb.ID) (tree.TypeName, TypeDescriptor, error)
+}
+
+// DefaultPrivilegeDescriptor is an interface for default privileges to ensure
+// DefaultPrivilegeDescriptor protos are not accessed and interacted
+// with directly.
+type DefaultPrivilegeDescriptor interface {
+	CreatePrivilegesFromDefaultPrivileges(
+		dbID descpb.ID,
+		user security.SQLUsername,
+		targetObject tree.AlterDefaultPrivilegesTargetObject,
+		databasePrivileges *descpb.PrivilegeDescriptor,
+	) *descpb.PrivilegeDescriptor
+	GetDefaultPrivilegesForRole(descpb.DefaultPrivilegesRole) (*descpb.DefaultPrivilegesForRole, bool)
+	ForEachDefaultPrivilegeForRole(func(descpb.DefaultPrivilegesForRole) error) error
 }
 
 // FilterDescriptorState inspects the state of a given descriptor and returns an
@@ -460,4 +476,13 @@ func FormatSafeDescriptorProperties(w *redact.StringBuilder, desc Descriptor) {
 	if drainingNames := desc.GetDrainingNames(); len(drainingNames) > 0 {
 		w.Printf(", NumDrainingNames: %d", len(drainingNames))
 	}
+}
+
+// IsSystemDescriptor returns true iff the descriptor is a system or a reserved
+// descriptor.
+func IsSystemDescriptor(desc Descriptor) bool {
+	if desc.GetID() <= keys.MaxReservedDescID {
+		return true
+	}
+	return desc.GetParentID() == keys.SystemDatabaseID
 }

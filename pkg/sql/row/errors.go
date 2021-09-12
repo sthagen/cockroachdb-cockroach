@@ -45,20 +45,34 @@ func (f *singleKVFetcher) nextBatch(
 	return true, f.kvs[:], nil, nil
 }
 
-// ConvertBatchError returns a user friendly constraint violation error.
+// ConvertBatchError attempts to map a key-value error generated during a
+// key-value batch operating over the specified table to a user friendly SQL
+// error.
 func ConvertBatchError(ctx context.Context, tableDesc catalog.TableDescriptor, b *kv.Batch) error {
 	origPErr := b.MustPErr()
-	if origPErr.Index == nil {
-		return origPErr.GoError()
-	}
-	j := origPErr.Index.Index
-	if j >= int32(len(b.Results)) {
-		return errors.AssertionFailedf("index %d outside of results: %+v", j, b.Results)
-	}
-	result := b.Results[j]
-	if cErr, ok := origPErr.GetDetail().(*roachpb.ConditionFailedError); ok && len(result.Rows) > 0 {
+	switch v := origPErr.GetDetail().(type) {
+	case *roachpb.MinTimestampBoundUnsatisfiableError:
+		return pgerror.WithCandidateCode(
+			origPErr.GoError(),
+			pgcode.UnsatisfiableBoundedStaleness,
+		)
+	case *roachpb.ConditionFailedError:
+		if origPErr.Index == nil {
+			break
+		}
+		j := origPErr.Index.Index
+		if j >= int32(len(b.Results)) {
+			return errors.AssertionFailedf("index %d outside of results: %+v", j, b.Results)
+		}
+		result := b.Results[j]
+		if len(result.Rows) == 0 {
+			break
+		}
 		key := result.Rows[0].Key
-		return NewUniquenessConstraintViolationError(ctx, tableDesc, key, cErr.ActualValue)
+		return NewUniquenessConstraintViolationError(ctx, tableDesc, key, v.ActualValue)
+	case *roachpb.WriteIntentError:
+		key := v.Intents[0].Key
+		return NewLockNotAvailableError(ctx, tableDesc, key, v.Reason)
 	}
 	return origPErr.GoError()
 }
@@ -73,14 +87,23 @@ type KeyToDescTranslator interface {
 	KeyToDesc(roachpb.Key) (catalog.TableDescriptor, bool)
 }
 
-// ConvertFetchError attempts to a map key-value error generated during a
+// ConvertFetchError attempts to map a key-value error generated during a
 // key-value fetch to a user friendly SQL error.
 func ConvertFetchError(ctx context.Context, descForKey KeyToDescTranslator, err error) error {
-	var wiErr *roachpb.WriteIntentError
-	if errors.As(err, &wiErr) {
-		key := wiErr.Intents[0].Key
+	var errs struct {
+		wi *roachpb.WriteIntentError
+		bs *roachpb.MinTimestampBoundUnsatisfiableError
+	}
+	switch {
+	case errors.As(err, &errs.wi):
+		key := errs.wi.Intents[0].Key
 		desc, _ := descForKey.KeyToDesc(key)
-		return NewLockNotAvailableError(ctx, desc, key)
+		return NewLockNotAvailableError(ctx, desc, key, errs.wi.Reason)
+	case errors.As(err, &errs.bs):
+		return pgerror.WithCandidateCode(
+			err,
+			pgcode.UnsatisfiableBoundedStaleness,
+		)
 	}
 	return err
 }
@@ -116,21 +139,30 @@ func NewUniquenessConstraintViolationError(
 // table descriptor corresponding to the key is unknown due to a table
 // interleaving.
 func NewLockNotAvailableError(
-	ctx context.Context, tableDesc catalog.TableDescriptor, key roachpb.Key,
+	ctx context.Context,
+	tableDesc catalog.TableDescriptor,
+	key roachpb.Key,
+	reason roachpb.WriteIntentError_Reason,
 ) error {
+	baseMsg := "could not obtain lock on row"
+	if reason == roachpb.WriteIntentError_REASON_LOCK_TIMEOUT {
+		baseMsg = "canceling statement due to lock timeout on row"
+	}
+
 	if tableDesc == nil {
 		return pgerror.Newf(pgcode.LockNotAvailable,
-			"could not obtain lock on row in interleaved table")
+			"%s in interleaved table", baseMsg)
 	}
 
 	index, colNames, values, err := DecodeRowInfo(ctx, tableDesc, key, nil, false)
 	if err != nil {
 		return pgerror.Newf(pgcode.LockNotAvailable,
-			"could not obtain lock on row: decoding err=%s", err)
+			"%s: decoding err=%s", baseMsg, err)
 	}
 
 	return pgerror.Newf(pgcode.LockNotAvailable,
-		"could not obtain lock on row (%s)=(%s) in %s@%s",
+		"%s (%s)=(%s) in %s@%s",
+		baseMsg,
 		strings.Join(colNames, ","),
 		strings.Join(values, ","),
 		tableDesc.GetName(),
@@ -219,6 +251,7 @@ func DecodeRowInfo(
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		0,     /* lockTimeout */
 		false, /* isCheck */
 		&rowenc.DatumAlloc{},
 		nil, /* memMonitor */
@@ -243,7 +276,11 @@ func DecodeRowInfo(
 	names := make([]string, len(cols))
 	values := make([]string, len(cols))
 	for i := range cols {
-		names[i] = cols[i].GetName()
+		if cols[i].IsExpressionIndexColumn() {
+			names[i] = cols[i].GetComputeExpr()
+		} else {
+			names[i] = cols[i].GetName()
+		}
 		if datums[i] == tree.DNull {
 			continue
 		}

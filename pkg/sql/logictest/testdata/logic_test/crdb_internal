@@ -14,6 +14,7 @@ DROP DATABASE crdb_internal
 query TTTTIT
 SHOW TABLES FROM crdb_internal
 ----
+crdb_internal  active_range_feeds           table  NULL  NULL  NULL
 crdb_internal  backward_dependencies        table  NULL  NULL  NULL
 crdb_internal  builtin_functions            table  NULL  NULL  NULL
 crdb_internal  cluster_contended_indexes    view   NULL  NULL  NULL
@@ -31,6 +32,7 @@ crdb_internal  create_statements            table  NULL  NULL  NULL
 crdb_internal  create_type_statements       table  NULL  NULL  NULL
 crdb_internal  cross_db_references          table  NULL  NULL  NULL
 crdb_internal  databases                    table  NULL  NULL  NULL
+crdb_internal  default_privileges           table  NULL  NULL  NULL
 crdb_internal  feature_usage                table  NULL  NULL  NULL
 crdb_internal  forward_dependencies         table  NULL  NULL  NULL
 crdb_internal  gossip_alerts                table  NULL  NULL  NULL
@@ -38,6 +40,7 @@ crdb_internal  gossip_liveness              table  NULL  NULL  NULL
 crdb_internal  gossip_network               table  NULL  NULL  NULL
 crdb_internal  gossip_nodes                 table  NULL  NULL  NULL
 crdb_internal  index_columns                table  NULL  NULL  NULL
+crdb_internal  index_usage_statistics       table  NULL  NULL  NULL
 crdb_internal  interleaved                  table  NULL  NULL  NULL
 crdb_internal  invalid_objects              table  NULL  NULL  NULL
 crdb_internal  jobs                         table  NULL  NULL  NULL
@@ -66,10 +69,12 @@ crdb_internal  regions                      table  NULL  NULL  NULL
 crdb_internal  schema_changes               table  NULL  NULL  NULL
 crdb_internal  session_trace                table  NULL  NULL  NULL
 crdb_internal  session_variables            table  NULL  NULL  NULL
+crdb_internal  statement_statistics         table  NULL  NULL  NULL
 crdb_internal  table_columns                table  NULL  NULL  NULL
 crdb_internal  table_indexes                table  NULL  NULL  NULL
 crdb_internal  table_row_statistics         table  NULL  NULL  NULL
 crdb_internal  tables                       table  NULL  NULL  NULL
+crdb_internal  transaction_statistics       table  NULL  NULL  NULL
 crdb_internal  zones                        table  NULL  NULL  NULL
 
 statement ok
@@ -147,10 +152,10 @@ Channel
 
 
 # The validity of the rows in this table are tested elsewhere; we merely assert the columns.
-query ITTTTTTTTTTTRTTII colnames
+query ITTTTTTTTTTTRTTIITTIT colnames
 SELECT * FROM crdb_internal.jobs WHERE false
 ----
-job_id  job_type  description  statement  user_name  descriptor_ids  status  running_status  created  started  finished  modified  fraction_completed  high_water_timestamp  error  coordinator_id  trace_id
+job_id  job_type  description  statement  user_name  descriptor_ids  status  running_status  created  started  finished  modified  fraction_completed  high_water_timestamp  error  coordinator_id  trace_id  last_run  next_run  num_runs  execution_errors
 
 query IITTITTT colnames
 SELECT * FROM crdb_internal.schema_changes WHERE table_id < 0
@@ -579,12 +584,12 @@ SELECT key, max_retries, flags LIKE '!%' AS f
  WHERE application_name = 'test_max_retry'
 ORDER BY key, f
 ----
-CREATE SEQUENCE s                                                     0  false
-DROP SEQUENCE s                                                       0  false
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)            2  false
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)            1  true
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_::INTERVAL), _)  0  true
-SET application_name = DEFAULT                                        0  false
+CREATE SEQUENCE s                                                         0  false
+DROP SEQUENCE s                                                           0  false
+RESET application_name                                                    0  false
+SELECT IF(nextval('_') < _, crdb_internal.force_retry('_'::INTERVAL), _)  0  true
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)                2  false
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)                1  true
 
 query T
 SELECT database_name FROM crdb_internal.node_statement_statistics limit 1
@@ -812,7 +817,6 @@ database_name  grantee   privilege_type
 other_db       admin     ALL
 other_db       root      ALL
 other_db       testuser  DROP
-other_db       testuser  SELECT
 
 statement ok
 SET DATABASE = test
@@ -830,7 +834,6 @@ defaultdb      root      ALL
 other_db       admin     ALL
 other_db       root      ALL
 other_db       testuser  DROP
-other_db       testuser  SELECT
 postgres       admin     ALL
 postgres       root      ALL
 system         admin     GRANT
@@ -854,7 +857,6 @@ defaultdb      root      ALL
 other_db       admin     ALL
 other_db       root      ALL
 other_db       testuser  DROP
-other_db       testuser  SELECT
 postgres       admin     ALL
 postgres       root      ALL
 system         admin     GRANT
@@ -902,3 +904,10 @@ query TT
 SELECT * FROM crdb_internal.regions ORDER BY 1
 ----
 test  {}
+
+# Regression test for incorrectly handling tree.DOidWrappers by some builtins
+# (#69684).
+statement ok
+CREATE TABLE t69684(a NAME);
+INSERT INTO t69684 VALUES ('foo');
+SELECT * FROM t69684 WHERE crdb_internal.increment_feature_counter(a)

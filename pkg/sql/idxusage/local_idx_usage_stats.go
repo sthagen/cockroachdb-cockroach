@@ -102,11 +102,19 @@ type Config struct {
 	Knobs *TestingKnobs
 }
 
+// IteratorOptions provides knobs to change the iterating behavior when
+// calling ForEach.
+type IteratorOptions struct {
+	SortedTableID bool
+	SortedIndexID bool
+	Max           *uint64
+}
+
+// StatsVisitor is the callback invoked when calling ForEach.
+type StatsVisitor func(key *roachpb.IndexUsageKey, value *roachpb.IndexUsageStatistics) error
+
 // DefaultChannelSize is the default size of the statsChan.
 const DefaultChannelSize = uint64(128)
-
-var _ Reader = &LocalIndexUsageStats{}
-var _ Writer = &LocalIndexUsageStats{}
 
 var emptyIndexUsageStats roachpb.IndexUsageStatistics
 
@@ -122,13 +130,27 @@ func NewLocalIndexUsageStats(cfg *Config) *LocalIndexUsageStats {
 	return is
 }
 
+// NewLocalIndexUsageStatsFromExistingStats returns a new instance of
+// LocalIndexUsageStats that is populated using given
+// []roachpb.CollectedIndexUsageStatistics. This constructor can be used to
+// quickly aggregate the index usage statistics received from the RPC fanout
+// and it is more efficient than the regular insert path because it performs
+// insert without taking the RWMutex lock.
+func NewLocalIndexUsageStatsFromExistingStats(
+	cfg *Config, stats []roachpb.CollectedIndexUsageStatistics,
+) *LocalIndexUsageStats {
+	s := NewLocalIndexUsageStats(cfg)
+	s.batchInsertUnsafe(stats)
+	return s
+}
+
 // Start starts the background goroutine that is responsible for collecting
 // index usage statistics.
 func (s *LocalIndexUsageStats) Start(ctx context.Context, stopper *stop.Stopper) {
 	s.startStatsIngestionLoop(ctx, stopper)
 }
 
-// RecordRead implements the idxusage.Writer interface.
+// RecordRead records a read operation on the specified index.
 func (s *LocalIndexUsageStats) RecordRead(ctx context.Context, key roachpb.IndexUsageKey) {
 	s.record(ctx, indexUse{
 		key:      key,
@@ -150,12 +172,14 @@ func (s *LocalIndexUsageStats) record(ctx context.Context, payload indexUse) {
 	}
 }
 
-// Get implements the idxusage.Reader interface.
-func (s *LocalIndexUsageStats) Get(key roachpb.IndexUsageKey) roachpb.IndexUsageStatistics {
+// Get returns the index usage statistics for a given key.
+func (s *LocalIndexUsageStats) Get(
+	tableID roachpb.TableID, indexID roachpb.IndexID,
+) roachpb.IndexUsageStatistics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	table, ok := s.mu.usageStats[key.TableID]
+	table, ok := s.mu.usageStats[tableID]
 	if !ok {
 		// We return a copy of the empty stats.
 		emptyStats := emptyIndexUsageStats
@@ -165,7 +189,7 @@ func (s *LocalIndexUsageStats) Get(key roachpb.IndexUsageKey) roachpb.IndexUsage
 	table.RLock()
 	defer table.RUnlock()
 
-	indexStats, ok := table.stats[key.IndexID]
+	indexStats, ok := table.stats[indexID]
 	if !ok {
 		emptyStats := emptyIndexUsageStats
 		return emptyStats
@@ -177,7 +201,9 @@ func (s *LocalIndexUsageStats) Get(key roachpb.IndexUsageKey) roachpb.IndexUsage
 	return indexStats.IndexUsageStatistics
 }
 
-// ForEach the idxusage.Reader interface.
+// ForEach iterates through all stored index usage statistics
+// based on the options specified in IteratorOptions. If an error is
+// encountered when calling StatsVisitor, the iteration is aborted.
 func (s *LocalIndexUsageStats) ForEach(options IteratorOptions, visitor StatsVisitor) error {
 	maxIterationLimit := uint64(math.MaxUint64)
 	if options.Max != nil {
@@ -199,7 +225,7 @@ func (s *LocalIndexUsageStats) ForEach(options IteratorOptions, visitor StatsVis
 	s.mu.RUnlock()
 
 	for _, tableID := range tableIDLists {
-		tableIdxStats := s.getStatsForTableID(tableID, false /* createIfNotExists */)
+		tableIdxStats := s.getStatsForTableID(tableID, false /* createIfNotExists */, false /* unsafe */)
 
 		// This means the data s being cleared before we can fetch it. It's not an
 		// error, so we simply just skip over it.
@@ -221,6 +247,20 @@ func (s *LocalIndexUsageStats) ForEach(options IteratorOptions, visitor StatsVis
 	return nil
 }
 
+// batchInsertUnsafe inserts otherStats into s without taking on write lock.
+// This should only be called during initialization when we can be sure there's
+// no other users of s. This avoids the locking overhead when it's not
+// necessary.
+func (s *LocalIndexUsageStats) batchInsertUnsafe(
+	otherStats []roachpb.CollectedIndexUsageStatistics,
+) {
+	for _, newStats := range otherStats {
+		tableIndexStats := s.getStatsForTableID(newStats.Key.TableID, true /* createIfNotExists */, true /* unsafe */)
+		stats := tableIndexStats.getStatsForIndexID(newStats.Key.IndexID, true /* createIfNotExists */, true /* unsafe */)
+		stats.Add(&newStats.Stats)
+	}
+}
+
 func (s *LocalIndexUsageStats) clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,8 +271,8 @@ func (s *LocalIndexUsageStats) clear() {
 }
 
 func (s *LocalIndexUsageStats) insertIndexUsage(idxUse *indexUse) {
-	tableStats := s.getStatsForTableID(idxUse.key.TableID, true /* createIfNotExists */)
-	indexStats := tableStats.getStatsForIndexID(idxUse.key.IndexID, true /* createIfNotExists */)
+	tableStats := s.getStatsForTableID(idxUse.key.TableID, true /* createIfNotExists */, false /* unsafe */)
+	indexStats := tableStats.getStatsForIndexID(idxUse.key.IndexID, true /* createIfNotExists */, false /* unsafe */)
 	indexStats.Lock()
 	defer indexStats.Unlock()
 	switch idxUse.usageTyp {
@@ -249,15 +289,21 @@ func (s *LocalIndexUsageStats) insertIndexUsage(idxUse *indexUse) {
 	}
 }
 
+// getStatsForTableID returns the tableIndexStats for the given roachpb.TableID.
+// If unsafe is set to true, then the lookup is performed without locking to the
+// internal RWMutex lock. This can be used when LocalIndexUsageStats is not
+// being concurrently accessed.
 func (s *LocalIndexUsageStats) getStatsForTableID(
-	id roachpb.TableID, createIfNotExists bool,
+	id roachpb.TableID, createIfNotExists bool, unsafe bool,
 ) *tableIndexStats {
-	if createIfNotExists {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-	} else {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
+	if !unsafe {
+		if createIfNotExists {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+		} else {
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+		}
 	}
 
 	if tableIndexStats, ok := s.mu.usageStats[id]; ok {
@@ -276,15 +322,22 @@ func (s *LocalIndexUsageStats) getStatsForTableID(
 	return nil
 }
 
+// getStatsForIndexID returns the indexStats for the given roachpb.IndexID.
+// If unsafe is set to true, then the lookup is performed without locking to the
+// internal RWMutex lock. This can be used when tableIndexStats is not being
+// concurrently accessed.
 func (t *tableIndexStats) getStatsForIndexID(
-	id roachpb.IndexID, createIfNotExists bool,
+	id roachpb.IndexID, createIfNotExists bool, unsafe bool,
 ) *indexStats {
-	if createIfNotExists {
-		t.Lock()
-		defer t.Unlock()
-	} else {
-		t.RLock()
-		defer t.RUnlock()
+	if !unsafe {
+		if createIfNotExists {
+			t.Lock()
+			defer t.Unlock()
+		} else {
+			t.RLock()
+			defer t.RUnlock()
+		}
+
 	}
 
 	if stats, ok := t.stats[id]; ok {
@@ -319,7 +372,7 @@ func (t *tableIndexStats) iterateIndexStats(
 	}
 
 	for _, indexID := range indexIDs {
-		indexStats := t.getStatsForIndexID(indexID, false /* createIfNotExists */)
+		indexStats := t.getStatsForIndexID(indexID, false /* createIfNotExists */, false /* unsafe */)
 
 		// This means the data is being cleared  before we can fetch it. It's not an
 		// error, so we simply just skip over it.
@@ -356,7 +409,7 @@ func (s *LocalIndexUsageStats) startStatsIngestionLoop(ctx context.Context, stop
 			case payload := <-s.statsChan:
 				s.insertIndexUsage(&payload)
 				if s.testingKnobs != nil && s.testingKnobs.OnIndexUsageStatsProcessedCallback != nil {
-					s.testingKnobs.OnIndexUsageStatsProcessedCallback()
+					s.testingKnobs.OnIndexUsageStatsProcessedCallback(payload.key)
 				}
 			case <-stopper.ShouldQuiesce():
 				return

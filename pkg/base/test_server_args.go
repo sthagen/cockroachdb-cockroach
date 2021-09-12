@@ -129,6 +129,9 @@ type TestServerArgs struct {
 
 	// IF set, the demo login endpoint will be enabled.
 	EnableDemoLoginEndpoint bool
+
+	// If set, a TraceDir is initialized at the provided path.
+	TraceDir string
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -230,9 +233,6 @@ type TestTenantArgs struct {
 	// to be created by StartTenant.
 	Existing bool
 
-	// IdleExitAfter, if set will cause the tenant process to exit if idle.
-	IdleExitAfter time.Duration
-
 	// Settings allows the caller to control the settings object used for the
 	// tenant cluster.
 	Settings *cluster.Settings
@@ -275,4 +275,8 @@ type TestTenantArgs struct {
 
 	// Skip check for tenant existence when running the test.
 	SkipTenantCheck bool
+
+	// Locality is used to initialize the same-named field on the server.Config
+	// struct.
+	Locality roachpb.Locality
 }

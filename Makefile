@@ -319,12 +319,8 @@ $(info $(yellow)Warning: 'ccache' not found, consider installing it for faster b
 endif
 
 # Warn maintainers if bazel is not found.
-#
-# TODO(irfansharif): Assert here instead, on a fixed version of bazel (3.7.0). Something like:
-#
-#   $(error $(yellow)'bazel' not found (`brew install bazel` for macs)$(term-reset))
 ifeq (, $(shell which bazel))
-$(info $(yellow)Warning: 'bazel' not found (`brew install bazel` for macs)$(term-reset))
+$(info $(yellow)Warning: 'bazel' not found (`brew install bazelisk` for macs)$(term-reset))
 endif
 
 # Force vendor directory to rebuild.
@@ -359,35 +355,20 @@ $(GITHOOKSDIR)/%: githooks/%
 	@ln -s ../../$(basename $<) $(dir $@)
 endif
 
-.SECONDARY: protobufjs-cli-fix-deps
-protobufjs-cli-fix-deps:
-	# Prevent ProtobufJS from trying to install its own packages because a) the
-	# the feature is buggy, and b) it introduces an unnecessary dependency on NPM.
-	# See: https://github.com/dcodeIO/protobuf.js/issues/716.
-	# We additionally pin the dependencies by linking in a lock file for
-	# reproducable builds.
-	$(NODE_RUN) pkg/ui/bin/gen-protobuf-cli-deps.js > pkg/ui/node_modules/protobufjs/cli/package.json
-	ln -sf ../../../yarn.protobufjs-cli.lock pkg/ui/node_modules/protobufjs/cli/yarn.lock
-	$(NODE_RUN) -C pkg/ui/node_modules/protobufjs/cli yarn install --offline
 
-.SECONDARY: pkg/ui/yarn.cluster-ui.installed
-pkg/ui/yarn.cluster-ui.installed: pkg/ui/cluster-ui/package.json pkg/ui/cluster-ui/yarn.lock pkg/ui/src/js/protos.js pkg/ui/src/js/protos.d.ts | bin/.submodules-initialized
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn install --offline
-	# This ensures that any update to the protobuf will be picked up by cluster-ui.
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn upgrade file:pkg/ui/src/js
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn build
-	touch $@
+CLUSTER_UI_JS := pkg/ui/cluster-ui/dist/main.js
 
-.SECONDARY: pkg/ui/yarn.protobuf.installed
-pkg/ui/yarn.protobuf.installed: pkg/ui/src/js/package.json pkg/ui/src/js/yarn.lock pkg/ui/yarn.protobufjs-cli.lock | bin/.submodules-initialized
-	$(NODE_RUN) -C pkg/ui/src/js yarn install --offline
-	$(MAKE) protobufjs-cli-fix-deps
-	touch $@
+.SECONDARY: $(CLUSTER_UI_JS)
+$(CLUSTER_UI_JS): $(shell find pkg/ui/workspaces/cluster-ui/src -type f | sed 's/ /\\ /g') pkg/ui/yarn.installed pkg/ui/workspaces/db-console/src/js/protos.d.ts | bin/.submodules-initialized
+	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn build
 
 .SECONDARY: pkg/ui/yarn.installed
-pkg/ui/yarn.installed: pkg/ui/package.json pkg/ui/yarn.lock pkg/ui/yarn.cluster-ui.installed | bin/.submodules-initialized
-	$(NODE_RUN) -C pkg/ui yarn install --offline
-	$(MAKE) protobufjs-cli-fix-deps
+pkg/ui/yarn.installed: pkg/ui/package.json pkg/ui/yarn.lock | bin/.submodules-initialized
+	@# Do not install optional dependencies as far as they are required for UI development only
+	@# and should not be installed for production builds.
+	@# Also some of linux distributives (that are used as development env) don't support some of
+	@# optional dependencies (i.e. cypress) so it is important to make these deps optional.
+	$(NODE_RUN) -C pkg/ui yarn install --ignore-optional
 	@# We remove this broken dependency again in pkg/ui/webpack.config.js.
 	@# See the comment there for details.
 	rm -rf pkg/ui/node_modules/@types/node
@@ -850,6 +831,13 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/colexecagg/ordered_min_max_agg.eg.go \
   pkg/sql/colexec/colexecagg/ordered_sum_agg.eg.go \
   pkg/sql/colexec/colexecagg/ordered_sum_int_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_avg_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_bool_and_or_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_concat_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_count_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_min_max_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_sum_agg.eg.go \
+  pkg/sql/colexec/colexecagg/window_sum_int_agg.eg.go \
   pkg/sql/colexec/colexecbase/cast.eg.go \
   pkg/sql/colexec/colexecbase/const.eg.go \
   pkg/sql/colexec/colexecbase/distinct.eg.go \
@@ -879,13 +867,20 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/colexecsel/default_cmp_sel_ops.eg.go \
   pkg/sql/colexec/colexecsel/selection_ops.eg.go \
   pkg/sql/colexec/colexecsel/sel_like_ops.eg.go \
+  pkg/sql/colexec/colexecspan/span_assembler.eg.go \
+  pkg/sql/colexec/colexecspan/span_encoder.eg.go \
+  pkg/sql/colexec/colexecwindow/first_value.eg.go \
   pkg/sql/colexec/colexecwindow/lag.eg.go \
+  pkg/sql/colexec/colexecwindow/last_value.eg.go \
   pkg/sql/colexec/colexecwindow/lead.eg.go \
+  pkg/sql/colexec/colexecwindow/min_max_removable_agg.eg.go \
   pkg/sql/colexec/colexecwindow/ntile.eg.go \
+  pkg/sql/colexec/colexecwindow/nth_value.eg.go \
   pkg/sql/colexec/colexecwindow/range_offset_handler.eg.go \
   pkg/sql/colexec/colexecwindow/rank.eg.go \
   pkg/sql/colexec/colexecwindow/relative_rank.eg.go \
   pkg/sql/colexec/colexecwindow/row_number.eg.go \
+  pkg/sql/colexec/colexecwindow/window_aggregator.eg.go \
   pkg/sql/colexec/colexecwindow/window_framer.eg.go \
   pkg/sql/colexec/colexecwindow/window_peer_grouper.eg.go
 
@@ -928,10 +923,10 @@ build-mode = build -o $@
 
 go-install: build-mode = install
 
-$(COCKROACH) go-install generate: pkg/ui/distccl/bindata.go
+$(COCKROACH) go-install generate: pkg/ui/assets.ccl.installed
 
 $(COCKROACHOSS): BUILDTARGET = ./pkg/cmd/cockroach-oss
-$(COCKROACHOSS): $(C_LIBS_OSS) pkg/ui/distoss/bindata.go | $(C_LIBS_DYNAMIC)
+$(COCKROACHOSS): $(C_LIBS_OSS) pkg/ui/assets.oss.installed | $(C_LIBS_DYNAMIC)
 
 $(COCKROACHSHORT): BUILDTARGET = ./pkg/cmd/cockroach-short
 $(COCKROACHSHORT): TAGS += short
@@ -1125,13 +1120,12 @@ compose: ## Run compose tests.
 dupl: bin/.bootstrap
 	$(FIND_RELEVANT) \
 	       -name '*.go'             \
-	       -not -name '*.pb.go'     \
-	       -not -name '*.pb.gw.go'  \
-	       -not -name 'bindata.go' \
-	       -not -name '*_string.go' \
-	       -not -name 'sql.go'      \
-	       -not -name 'irgen.go'    \
-	       -not -name '*.ir.go'     \
+	       -not -name '*.pb.go'    	\
+	       -not -name '*.pb.gw.go' 	\
+	       -not -name '*_string.go'	\
+	       -not -name 'sql.go'     	\
+	       -not -name 'irgen.go'   	\
+	       -not -name '*.ir.go'    	\
 	| dupl -files $(DUPLFLAGS)
 
 .PHONY: generate
@@ -1189,7 +1183,7 @@ ARCHIVE_EXTRAS = \
 	$(BUILDINFO) \
 	$(SQLPARSER_TARGETS) \
 	$(OPTGEN_TARGETS) \
-	pkg/ui/distccl/bindata.go pkg/ui/distoss/bindata.go
+	pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
 
 # TODO(benesch): Make this recipe use `git ls-files --recurse-submodules`
 # instead of scripts/ls-files.sh once Git v2.11 is widely deployed.
@@ -1261,12 +1255,12 @@ PBTS := $(NODE_RUN) pkg/ui/node_modules/.bin/pbts
 # JavaScript only needs the entrypoint protobufs to be listed. It automatically
 # compiles any protobufs the entrypoints depend upon.
 JS_PROTOS_CCL := $(filter %/ccl/storageccl/engineccl/enginepbccl/stats.proto,$(GO_PROTOS))
-UI_JS_CCL := pkg/ui/ccl/src/js/protos.js
-UI_TS_CCL := pkg/ui/ccl/src/js/protos.d.ts
+UI_JS_CCL := pkg/ui/workspaces/db-console/ccl/src/js/protos.js
+UI_TS_CCL := pkg/ui/workspaces/db-console/ccl/src/js/protos.d.ts
 UI_PROTOS_CCL := $(UI_JS_CCL) $(UI_TS_CCL)
 
-UI_JS_OSS := pkg/ui/src/js/protos.js
-UI_TS_OSS := pkg/ui/src/js/protos.d.ts
+UI_JS_OSS := pkg/ui/workspaces/db-console/src/js/protos.js
+UI_TS_OSS := pkg/ui/workspaces/db-console/src/js/protos.d.ts
 UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 
 $(GOGOPROTO_PROTO): bin/.submodules-initialized
@@ -1295,13 +1289,13 @@ bin/.gw_protobuf_sources: $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOG
 # typescript definitions for the proto files afterwards.
 
 .SECONDARY: $(UI_JS_CCL)
-$(UI_JS_CCL): $(GW_PROTOS) $(GO_PROTOS) $(JS_PROTOS_CCL) pkg/ui/yarn.protobuf.installed | bin/.submodules-initialized
+$(UI_JS_CCL): $(GW_PROTOS) $(GO_PROTOS) $(JS_PROTOS_CCL) pkg/ui/yarn.installed | bin/.submodules-initialized
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
 	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(PROMETHEUS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS) $(JS_PROTOS_CCL)) >> $@
 
 .SECONDARY: $(UI_JS_OSS)
-$(UI_JS_OSS): $(GW_PROTOS) $(GO_PROTOS) pkg/ui/yarn.protobuf.installed | bin/.submodules-initialized
+$(UI_JS_OSS): $(GW_PROTOS) $(GO_PROTOS) pkg/ui/yarn.installed | bin/.submodules-initialized
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
 	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(PROMETHEUS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS)) >> $@
@@ -1309,8 +1303,8 @@ $(UI_JS_OSS): $(GW_PROTOS) $(GO_PROTOS) pkg/ui/yarn.protobuf.installed | bin/.su
 # End of PBJS-generated files.
 
 .SECONDARY: $(UI_TS_CCL) $(UI_TS_OSS)
-$(UI_TS_CCL): $(UI_JS_CCL) pkg/ui/yarn.protobuf.installed
-$(UI_TS_OSS): $(UI_JS_OSS) pkg/ui/yarn.protobuf.installed
+$(UI_TS_CCL): $(UI_JS_CCL) pkg/ui/yarn.installed
+$(UI_TS_OSS): $(UI_JS_OSS) pkg/ui/yarn.installed
 $(UI_TS_CCL) $(UI_TS_OSS):
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
@@ -1324,28 +1318,28 @@ WEBPACK_DEV_SERVER := ./node_modules/.bin/webpack-dev-server
 WEBPACK_DASHBOARD  := ./opt/node_modules/.bin/webpack-dashboard
 
 .PHONY: ui-generate
-ui-generate: pkg/ui/distccl/bindata.go
+ui-generate: pkg/ui/assets.ccl.installed
 
 .PHONY: ui-fonts
 ui-fonts:
-	pkg/ui/scripts/font-gen
+	pkg/ui/workspaces/db-console/scripts/font-gen
 
 .PHONY: ui-topo
 ui-topo: pkg/ui/yarn.installed
-	pkg/ui/scripts/topo.js
+	pkg/ui/workspaces/db-console/scripts/topo.js
 
 .PHONY: ui-lint
 ui-lint: pkg/ui/yarn.installed $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
-	$(NODE_RUN) -C pkg/ui $(STYLINT) -c .stylintrc styl
-	$(NODE_RUN) -C pkg/ui $(TSC)
-	$(NODE_RUN) -C pkg/ui yarn lint
-	@if $(NODE_RUN) -C pkg/ui yarn list | grep phantomjs; then echo ^ forbidden UI dependency >&2; exit 1; fi
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn --cwd pkg/ui/cluster-ui lint
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(STYLINT) -c .stylintrc styl
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(TSC)
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console yarn lint
+	@if $(NODE_RUN) -C pkg/ui/workspaces/db-console yarn list | grep phantomjs; then echo ^ forbidden UI dependency >&2; exit 1; fi
+	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn --cwd pkg/ui/workspaces/cluster-ui lint
 
 # DLLs are Webpack bundles, not Windows shared libraries. See "DLLs for speedy
 # builds" in the UI README for details.
-UI_CCL_DLLS := pkg/ui/dist/protos.ccl.dll.js pkg/ui/dist/vendor.oss.dll.js
-UI_CCL_MANIFESTS := pkg/ui/protos.ccl.manifest.json pkg/ui/vendor.oss.manifest.json
+UI_CCL_DLLS := pkg/ui/workspaces/db-console/dist/protos.ccl.dll.js pkg/ui/workspaces/db-console/dist/vendor.oss.dll.js
+UI_CCL_MANIFESTS := pkg/ui/workspaces/db-console/protos.ccl.manifest.json pkg/ui/workspaces/db-console/vendor.oss.manifest.json
 UI_OSS_DLLS := $(subst .ccl,.oss,$(UI_CCL_DLLS))
 UI_OSS_MANIFESTS := $(subst .ccl,.oss,$(UI_CCL_MANIFESTS))
 
@@ -1365,42 +1359,39 @@ UI_OSS_MANIFESTS := $(subst .ccl,.oss,$(UI_CCL_MANIFESTS))
 # [1]: http://savannah.gnu.org/bugs/?19108
 .SECONDARY: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS)
 
-pkg/ui/dist/%.oss.dll.js pkg/ui/%.oss.manifest.json: pkg/ui/webpack.%.js pkg/ui/yarn.installed $(UI_PROTOS_OSS)
-	$(NODE_RUN) -C pkg/ui $(WEBPACK) -p --config webpack.$*.js --env.dist=oss
+pkg/ui/workspaces/db-console/dist/%.oss.dll.js pkg/ui/workspaces/db-console/%.oss.manifest.json: pkg/ui/workspaces/db-console/webpack.%.js pkg/ui/yarn.installed $(CLUSTER_UI_JS) $(UI_PROTOS_OSS)
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) -p --config webpack.$*.js --env.dist=oss
 
-pkg/ui/dist/%.ccl.dll.js pkg/ui/%.ccl.manifest.json: pkg/ui/webpack.%.js pkg/ui/yarn.installed $(UI_PROTOS_CCL)
-	$(NODE_RUN) -C pkg/ui $(WEBPACK) -p --config webpack.$*.js --env.dist=ccl
+pkg/ui/workspaces/db-console/dist/%.ccl.dll.js pkg/ui/workspaces/db-console/%.ccl.manifest.json: pkg/ui/workspaces/db-console/webpack.%.js pkg/ui/yarn.installed $(CLUSTER_UI_JS) $(UI_PROTOS_CCL)
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) -p --config webpack.$*.js --env.dist=ccl
 
 .PHONY: ui-test
 ui-test: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
-	$(NODE_RUN) -C pkg/ui $(KARMA) start
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn ci
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start
+	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn ci
 
 .PHONY: ui-test-watch
 ui-test-watch: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
-	$(NODE_RUN) -C pkg/ui $(KARMA) start --no-single-run --auto-watch & \
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn test
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start --no-single-run --auto-watch & \
+	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn test
 
 .PHONY: ui-test-debug
 ui-test-debug: $(UI_DLLS) $(UI_MANIFESTS)
-	$(NODE_RUN) -C pkg/ui $(KARMA) start --browsers Chrome --no-single-run --debug --auto-watch
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start --browsers Chrome --no-single-run --debug --auto-watch
 
-pkg/ui/distccl/bindata.go: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_JS_CCL) $(shell find pkg/ui/ccl -type f)
-pkg/ui/distoss/bindata.go: $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS) $(UI_JS_OSS)
-pkg/ui/dist%/bindata.go: pkg/ui/webpack.app.js $(shell find pkg/ui/src pkg/ui/styl -type f) | bin/.bootstrap
-	find pkg/ui/dist$* -mindepth 1 -not -name dist$*.go -delete
-	set -e; shopt -s extglob; for dll in $(notdir $(filter %.dll.js,$^)); do \
-	  ln -s ../dist/$$dll pkg/ui/dist$*/$${dll/@(.ccl|.oss)}; \
+.SECONDARY: pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
+pkg/ui/assets.ccl.installed: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_JS_CCL) $(shell find pkg/ui/workspaces/db-console/ccl -type f)
+pkg/ui/assets.oss.installed: $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS) $(UI_JS_OSS)
+pkg/ui/assets.%.installed: pkg/ui/workspaces/db-console/webpack.app.js $(shell find pkg/ui/workspaces/db-console/src pkg/ui/workspaces/db-console/styl -type f) | bin/.bootstrap
+	find pkg/ui/dist$*/assets -mindepth 1 -not -name index.html -delete
+	for dll in $(shell find pkg/ui/workspaces/db-console/dist -name '*.dll.js' -type f); do \
+		echo $$dll | sed -E "s/.oss.dll.js|.ccl.dll.js/.dll.js/" | sed -E "s|^.*\/|pkg/ui/dist$*/assets/|" | xargs -I{} cp $$dll {};\
 	done
-	$(NODE_RUN) -C pkg/ui/cluster-ui yarn build
-	$(NODE_RUN) -C pkg/ui $(WEBPACK) --config webpack.app.js --env.dist=$*
-	go-bindata -pkg dist$* -o $@ -prefix pkg/ui/dist$* pkg/ui/dist$*/...
-	echo 'func init() { ui.Asset = Asset; ui.AssetDir = AssetDir; ui.AssetInfo = AssetInfo }' >> $@
-	gofmt -s -w $@
-	goimports -w $@
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) --config webpack.app.js --env.dist=$*
+	touch $@
 
 pkg/ui/yarn.opt.installed:
-	$(NODE_RUN) -C pkg/ui/opt yarn install
+	$(NODE_RUN) -C pkg/ui yarn install --check-files
 	touch $@
 
 .PHONY: ui-watch-secure
@@ -1416,20 +1407,22 @@ ui-watch ui-watch-secure: $(UI_CCL_DLLS) pkg/ui/yarn.opt.installed
   #
   # `node-run.sh` wrapper is removed because this command is supposed to be run in dev environment (not in docker of CI)
   # so it is safe to run yarn commands directly to preserve formatting and colors for outputs
-	yarn --cwd pkg/ui/cluster-ui build:watch & \
-	yarn --cwd pkg/ui webpack-dev-server --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
+	yarn --cwd pkg/ui/workspaces/cluster-ui build:watch & \
+	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
 
 .PHONY: ui-clean
 ui-clean: ## Remove build artifacts.
-	find pkg/ui/dist* -mindepth 1 -not -name dist*.go -delete
+	find pkg/ui/distccl/assets pkg/ui/distoss/assets -mindepth 1 -not -name index.html -delete
+	rm -rf pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
+	rm -rf pkg/ui/dist/*
 	rm -f $(UI_PROTOS_CCL) $(UI_PROTOS_OSS)
-	rm -f pkg/ui/*manifest.json
-	rm -rf pkg/ui/cluster-ui/dist
+	rm -f pkg/ui/workspaces/db-console/*manifest.json
+	rm -rf pkg/ui/workspaces/cluster-ui/dist
 
 .PHONY: ui-maintainer-clean
 ui-maintainer-clean: ## Like clean, but also remove installed dependencies
 ui-maintainer-clean: ui-clean
-	rm -rf pkg/ui/node_modules pkg/ui/yarn.installed pkg/ui/cluster-ui/node_modules pkg/ui/yarn.cluster-ui.installed pkg/ui/src/js/node_modules pkg/ui/yarn.protobuf.installed
+	rm -rf pkg/ui/node_modules pkg/ui/workspaces/db-console/node_modules pkg/ui/yarn.installed pkg/ui/workspaces/cluster-ui/node_modules
 
 .SECONDARY: pkg/sql/parser/gen/sql.go.tmp
 pkg/sql/parser/gen/sql.go.tmp: pkg/sql/parser/gen/sql-gen.y bin/.bootstrap
@@ -1539,22 +1532,18 @@ bin/.docgen_http: bin/docgen bin/.bootstrap
 	docgen http \
 	--gendoc ./bin/protoc-gen-doc \
 	--out docs/generated/http \
-	--protobuf "-Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) -I$(PROMETHEUS_PATH)"
+	--protoc-flags "-Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) -I$(PROMETHEUS_PATH) ./pkg/server/serverpb/status.proto ./pkg/server/serverpb/admin.proto ./pkg/server/status/statuspb/status.proto"
 	touch $@
 
 .PHONY: docs/generated/redact_safe.md
 
 docs/generated/redact_safe.md:
-	@(echo "The following types are considered always safe for reporting:"; echo; \
-	  echo "File | Type"; echo "--|--") >$@.tmp || { rm -f $@.tmp; exit 1; }
-	@git grep -n '^func \(.*\) SafeValue\(\)' | \
-	  grep -v '^vendor/github.com/cockroachdb/redact' | \
-	  sed -E -e 's/^([^:]*):[0-9]+:func \(([^ ]* )?(.*)\) SafeValue.*$$/\1 | \`\3\`/g' >>$@.tmp || { rm -f $@.tmp; exit 1; }
-	@git grep -n 'redact\.RegisterSafeType' | \
-	  grep -v '^vendor/github.com/cockroachdb/redact' | \
-	  sed -E -e 's/^([^:]*):[0-9]+:.*redact\.RegisterSafeType\((.*)\).*/\1 | \`\2\`/g' >>$@.tmp || { rm -f $@.tmp; exit 1; }
+	./build/bazelutil/generate_redact_safe.sh >$@.tmp || { rm -f $@.tmp; exit 1; }
 	@mv -f $@.tmp $@
 
+#### WARNING ####
+# You must keep this list in sync with the list in `pkg/util/log/eventpb/PROTOS.bzl`.
+# Order matters!!
 EVENTLOG_PROTOS = \
 	pkg/util/log/eventpb/events.proto \
 	pkg/util/log/eventpb/ddl_events.proto \
@@ -1566,7 +1555,8 @@ EVENTLOG_PROTOS = \
 	pkg/util/log/eventpb/sql_audit_events.proto \
 	pkg/util/log/eventpb/cluster_events.proto \
 	pkg/util/log/eventpb/job_events.proto \
-	pkg/util/log/eventpb/health_events.proto
+	pkg/util/log/eventpb/health_events.proto \
+	pkg/util/log/eventpb/telemetry.proto
 
 LOGSINKDOC_DEP = pkg/util/log/logconfig/config.go
 
@@ -1757,11 +1747,22 @@ bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES) $(OPTGEN_TARGE
 
 PREREQS := GOFLAGS= bin/prereqs
 
+has-build-info = \
+  bin/roachprod \
+  bin/roachtest \
+  bin/workload
+
+$(has-build-info): override LINKFLAGS += \
+	-X "github.com/cockroachdb/cockroach/pkg/build.tag=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))" \
+	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
+	-X "github.com/cockroachdb/cockroach/pkg/build.cgoTargetTriple=$(TARGET_TRIPLE)" \
+	$(if $(BUILDCHANNEL),-X "github.com/cockroachdb/cockroach/pkg/build.channel=$(BUILDCHANNEL)")
+
 $(bins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	@echo go install -v $*
 	$(PREREQS) $(if $($*-package),$($*-package),./pkg/cmd/$*) > $@.d.tmp
 	mv -f $@.d.tmp $@.d
-	@$(GO_INSTALL) -v $(if $($*-package),$($*-package),./pkg/cmd/$*)
+	$(GO_INSTALL) -ldflags '$(LINKFLAGS)' -v $(if $($*-package),$($*-package),./pkg/cmd/$*)
 
 $(xbins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	@echo go build -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -o $@ $*
@@ -1784,14 +1785,10 @@ fuzz: ## Run fuzz tests.
 fuzz: bin/fuzz
 	bin/fuzz $(TESTFLAGS) -tests $(TESTS) -timeout $(TESTTIMEOUT) $(PKG)
 
-# Short hand to re-generate all bazel BUILD files.
-#
-# Even with --symlink_prefix, some sub-command somewhere hardcodes the
-# creation of a "bazel-out" symlink. This bazel-out symlink can only
-# be blocked by the existence of a file before the bazel command is
-# invoked. For now, this is left as an exercise for the user.
-#
-bazel-generate: ## Generate all bazel BUILD files.
+# Short hand to re-generate all bazel BUILD files. (Does the same thing as
+# `./dev generate bazel`.)
+.PHONY: bazel-generate
+bazel-generate:
 	@echo 'Generating DEPS.bzl and BUILD files using gazelle'
 	./build/bazelutil/bazel-generate.sh
 
@@ -1848,4 +1845,4 @@ $(foreach v,$(filter-out $(strip $(VALID_VARS)),$(.VARIABLES)),\
 # Cypress e2e tests
 .PHONY: db-console-e2e-test
 db-console-e2e-test: pkg/ui/yarn.opt.installed
-	cd pkg/ui && yarn cypress:run
+	cd pkg/ui/workspaces/db-console && yarn cypress:run

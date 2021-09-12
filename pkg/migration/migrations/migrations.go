@@ -15,6 +15,8 @@
 package migrations
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/migration"
 )
@@ -24,6 +26,11 @@ import (
 func GetMigration(key clusterversion.ClusterVersion) (migration.Migration, bool) {
 	m, ok := registry[key]
 	return m, ok
+}
+
+// NoPrecondition is a PreconditionFunc that doesn't check anything.
+func NoPrecondition(context.Context, clusterversion.ClusterVersion, migration.TenantDeps) error {
+	return nil
 }
 
 // registry defines the global mapping between a cluster version and the
@@ -42,40 +49,95 @@ var migrations = []migration.Migration{
 		toCV(clusterversion.PostTruncatedAndRangeAppliedStateMigration),
 		postTruncatedStateMigration,
 	),
-	migration.NewTenantMigration(
-		"upgrade old foreign key representation",
-		toCV(clusterversion.ForeignKeyRepresentationMigration),
-		foreignKeyRepresentationUpgrade,
-	),
-	migration.NewTenantMigration(
-		"fix system.protected_ts_meta privileges",
-		toCV(clusterversion.ProtectedTsMetaPrivilegesMigration),
-		protectedTsMetaPrivilegesMigration,
+	migration.NewSystemMigration(
+		"stop using monolithic encryption-at-rest registry for all stores",
+		toCV(clusterversion.RecordsBasedRegistry),
+		recordsBasedRegistryMigration,
 	),
 	migration.NewTenantMigration(
 		"add the systems.join_tokens table",
 		toCV(clusterversion.JoinTokensTable),
+		NoPrecondition,
 		joinTokensTableMigration,
 	),
 	migration.NewTenantMigration(
 		"delete the deprecated namespace table descriptor at ID=2",
 		toCV(clusterversion.DeleteDeprecatedNamespaceTableDescriptorMigration),
+		NoPrecondition,
 		deleteDeprecatedNamespaceTableDescriptorMigration,
 	),
 	migration.NewTenantMigration(
 		"fix all descriptors",
 		toCV(clusterversion.FixDescriptors),
+		NoPrecondition,
 		fixDescriptorMigration,
 	),
 	migration.NewTenantMigration(
 		"add the system.sql_statement_stats table",
 		toCV(clusterversion.SQLStatsTable),
+		NoPrecondition,
 		sqlStatementStatsTableMigration,
 	),
 	migration.NewTenantMigration(
 		"add the system.sql_transaction_stats table",
 		toCV(clusterversion.SQLStatsTable),
+		NoPrecondition,
 		sqlTransactionStatsTableMigration,
+	),
+	migration.NewTenantMigration(
+		"add the system.database_role_settings table",
+		toCV(clusterversion.DatabaseRoleSettings),
+		NoPrecondition,
+		databaseRoleSettingsTableMigration,
+	),
+	migration.NewTenantMigration(
+		"add the systems.tenant_usage table",
+		toCV(clusterversion.TenantUsageTable),
+		NoPrecondition,
+		tenantUsageTableMigration,
+	),
+	migration.NewTenantMigration(
+		"add the system.sql_instances table",
+		toCV(clusterversion.SQLInstancesTable),
+		NoPrecondition,
+		sqlInstancesTableMigration,
+	),
+	migration.NewSystemMigration(
+		"move over all intents to separate lock table",
+		toCV(clusterversion.SeparatedIntentsMigration),
+		separatedIntentsMigration),
+	migration.NewSystemMigration(
+		"run no-op migrate command on all ranges after lock table migration",
+		toCV(clusterversion.PostSeparatedIntentsMigration),
+		postSeparatedIntentsMigration),
+	migration.NewTenantMigration(
+		"add last_run and num_runs columns to system.jobs",
+		toCV(clusterversion.RetryJobsWithExponentialBackoff),
+		NoPrecondition,
+		retryJobsWithExponentialBackoff),
+	migration.NewTenantMigration(
+		"validates no interleaved tables exist",
+		toCV(clusterversion.EnsureNoInterleavedTables),
+		interleavedTablesRemovedCheck,
+		interleavedTablesRemovedMigration,
+	),
+	migration.NewTenantMigration(
+		"add system.zones table for secondary tenants",
+		toCV(clusterversion.ZonesTableForSecondaryTenants),
+		NoPrecondition,
+		zonesTableForSecondaryTenants,
+	),
+	migration.NewTenantMigration(
+		"add the system.span_configurations table to system tenant",
+		toCV(clusterversion.SpanConfigurationsTable),
+		NoPrecondition,
+		spanConfigurationsTableMigration,
+	),
+	migration.NewTenantMigration(
+		"create indexes on revokedAt and lastUsedAt columns from system.web_sessions",
+		toCV(clusterversion.AlterSystemWebSessionsCreateIndexes),
+		NoPrecondition,
+		alterSystemWebSessionsCreateIndexes,
 	),
 }
 

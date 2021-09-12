@@ -235,33 +235,6 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
-		// Check that INTERLEAVE dependencies inside the current database
-		// have their db name omitted.
-		{
-			CreateStatement: `CREATE TABLE %s (
-	a INT8,
-	b INT8,
-	PRIMARY KEY (a, b)
-) INTERLEAVE IN PARENT items (a, b)`,
-			Expect: `CREATE TABLE public.%s (
-	a INT8 NOT NULL,
-	b INT8 NOT NULL,
-	CONSTRAINT "primary" PRIMARY KEY (a ASC, b ASC),
-	FAMILY "primary" (a, b)
-) INTERLEAVE IN PARENT public.items (a, b)`,
-		},
-		// Check that INTERLEAVE dependencies outside of the current
-		// database are prefixed by their db name.
-		{
-			CreateStatement: `CREATE TABLE %s (
-	x INT8 PRIMARY KEY
-) INTERLEAVE IN PARENT o.foo (x)`,
-			Expect: `CREATE TABLE public.%s (
-	x INT8 NOT NULL,
-	CONSTRAINT "primary" PRIMARY KEY (x ASC),
-	FAMILY "primary" (x)
-) INTERLEAVE IN PARENT o.public.foo (x)`,
-		},
 		// Check that FK dependencies using MATCH FULL and MATCH SIMPLE are both
 		// pretty-printed properly.
 		{
@@ -293,11 +266,12 @@ func TestShowCreateTable(t *testing.T) {
 			)`,
 			Expect: `CREATE TABLE public.%s (
 	a INT8 NULL,
-	crdb_internal_a_shard_8 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(a AS STRING), '':::STRING)), 8:::INT8)) STORED,
+	crdb_internal_a_shard_8 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 8:::INT8)) STORED,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
-	INDEX t14_a_idx (a ASC) USING HASH WITH BUCKET_COUNT = 8,
-	FAMILY "primary" (a, crdb_internal_a_shard_8, rowid)
+	INDEX t12_a_idx (a ASC) USING HASH WITH BUCKET_COUNT = 8,
+	FAMILY "primary" (a, crdb_internal_a_shard_8, rowid),
+	CONSTRAINT check_crdb_internal_a_shard_8 CHECK (crdb_internal_a_shard_8 IN (0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8))
 )`,
 		},
 	}
@@ -1030,6 +1004,7 @@ func TestLintClusterSettingNames(t *testing.T) {
 				// These use the _timeout suffix to stay consistent with the
 				// corresponding session variables.
 				"sql.defaults.statement_timeout":                   `sql.defaults.statement_timeout: use ".timeout" instead of "_timeout"`,
+				"sql.defaults.lock_timeout":                        `sql.defaults.lock_timeout: use ".timeout" instead of "_timeout"`,
 				"sql.defaults.idle_in_session_timeout":             `sql.defaults.idle_in_session_timeout: use ".timeout" instead of "_timeout"`,
 				"sql.defaults.idle_in_transaction_session_timeout": `sql.defaults.idle_in_transaction_session_timeout: use ".timeout" instead of "_timeout"`,
 			}
@@ -1051,9 +1026,9 @@ func TestLintClusterSettingNames(t *testing.T) {
 			if strings.ToLower(desc[0:1]) != desc[0:1] {
 				t.Errorf("%s: description %q must not start with capital", varName, desc)
 			}
-			if sType != "e" && strings.Contains(desc, ". ") != (desc[len(desc)-1] == '.') {
+			if sType != "e" && (desc[len(desc)-1] == '.') && !strings.Contains(desc, ". ") {
 				// TODO(knz): this check doesn't work with the way enum values are added to their descriptions.
-				t.Errorf("%s: description %q must end with period if and only if it contains a secondary sentence", varName, desc)
+				t.Errorf("%s: description %q must end with period only if it contains a secondary sentence", varName, desc)
 			}
 		}
 	}

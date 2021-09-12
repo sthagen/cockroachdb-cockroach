@@ -12,15 +12,17 @@ package row
 
 import (
 	"context"
+	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -35,8 +37,8 @@ type KVFetcher struct {
 	newSpan       bool
 
 	// Observability fields.
-	mu struct {
-		syncutil.Mutex
+	// Note: these need to be read via an atomic op.
+	atomics struct {
 		bytesRead int64
 	}
 }
@@ -46,17 +48,55 @@ type KVFetcher struct {
 func NewKVFetcher(
 	txn *kv.Txn,
 	spans roachpb.Spans,
+	bsHeader *roachpb.BoundedStalenessHeader,
 	reverse bool,
-	useBatchLimit bool,
-	firstBatchLimit int64,
+	batchBytesLimit rowinfra.BytesLimit,
+	firstBatchLimit rowinfra.KeyLimit,
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
+	lockTimeout time.Duration,
 	mon *mon.BytesMonitor,
 	forceProductionKVBatchSize bool,
 ) (*KVFetcher, error) {
+	var sendFn sendFunc
+	// Avoid the heap allocation by allocating sendFn specifically in the if.
+	if bsHeader == nil {
+		sendFn = makeKVBatchFetcherDefaultSendFunc(txn)
+	} else {
+		negotiated := false
+		sendFn = func(ctx context.Context, ba roachpb.BatchRequest) (br *roachpb.BatchResponse, _ error) {
+			ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
+			var pErr *roachpb.Error
+			// Only use NegotiateAndSend if we have not yet negotiated a timestamp.
+			// If we have, fallback to Send which will already have the timestamp
+			// fixed.
+			if !negotiated {
+				ba.BoundedStaleness = bsHeader
+				br, pErr = txn.NegotiateAndSend(ctx, ba)
+				negotiated = true
+			} else {
+				br, pErr = txn.Send(ctx, ba)
+			}
+			if pErr != nil {
+				return nil, pErr.GoError()
+			}
+			return br, nil
+		}
+	}
+
 	kvBatchFetcher, err := makeKVBatchFetcher(
-		txn, spans, reverse, useBatchLimit, firstBatchLimit, lockStrength,
-		lockWaitPolicy, mon, forceProductionKVBatchSize,
+		sendFn,
+		spans,
+		reverse,
+		batchBytesLimit,
+		firstBatchLimit,
+		lockStrength,
+		lockWaitPolicy,
+		lockTimeout,
+		mon,
+		forceProductionKVBatchSize,
+		txn.AdmissionHeader(),
+		txn.DB().SQLKVResponseAdmissionQ,
 	)
 	return newKVFetcher(&kvBatchFetcher), err
 }
@@ -74,9 +114,7 @@ func (f *KVFetcher) GetBytesRead() int64 {
 	if f == nil {
 		return 0
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.mu.bytesRead
+	return atomic.LoadInt64(&f.atomics.bytesRead)
 }
 
 // MVCCDecodingStrategy controls if and how the fetcher should decode MVCC
@@ -152,9 +190,12 @@ func (f *KVFetcher) NextKV(
 			return false, kv, false, nil
 		}
 		f.newSpan = true
-		f.mu.Lock()
-		f.mu.bytesRead += int64(len(f.batchResponse))
-		f.mu.Unlock()
+		nBytes := len(f.batchResponse)
+		for i := range f.kvs {
+			nBytes += len(f.kvs[i].Key)
+			nBytes += len(f.kvs[i].Value.RawBytes)
+		}
+		atomic.AddInt64(&f.atomics.bytesRead, int64(nBytes))
 	}
 }
 

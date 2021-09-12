@@ -321,6 +321,7 @@ const (
 	IndeterminateCommitErrType              ErrorDetailType = 39
 	InvalidLeaseErrType                     ErrorDetailType = 40
 	OptimisticEvalConflictsErrType          ErrorDetailType = 41
+	MinTimestampBoundUnsatisfiableErrType   ErrorDetailType = 42
 	// When adding new error types, don't forget to update NumErrors below.
 
 	// CommunicationErrType indicates a gRPC error; this is not an ErrorDetail.
@@ -330,7 +331,7 @@ const (
 	// detail. The value 25 is chosen because it's reserved in the errors proto.
 	InternalErrType ErrorDetailType = 25
 
-	NumErrors int = 42
+	NumErrors int = 43
 )
 
 // GoError returns a Go error converted from Error. If the error is a transaction
@@ -871,6 +872,19 @@ func (e *WriteIntentError) message(_ *Error) string {
 			buf.WriteString(end[i].Key.String())
 		}
 	}
+
+	switch e.Reason {
+	case WriteIntentError_REASON_UNSPECIFIED:
+		// Nothing to say.
+	case WriteIntentError_REASON_WAIT_POLICY:
+		buf.WriteString(" [reason=wait_policy]")
+	case WriteIntentError_REASON_LOCK_TIMEOUT:
+		buf.WriteString(" [reason=lock_timeout]")
+	case WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED:
+		buf.WriteString(" [reason=lock_wait_queue_max_length_exceeded]")
+	default:
+		// Could panic, better to silently ignore in case new reasons are added.
+	}
 	return buf.String()
 }
 
@@ -1280,3 +1294,31 @@ func (e *OptimisticEvalConflictsError) Type() ErrorDetailType {
 }
 
 var _ ErrorDetailInterface = &OptimisticEvalConflictsError{}
+
+// NewMinTimestampBoundUnsatisfiableError initializes a new
+// MinTimestampBoundUnsatisfiableError.
+func NewMinTimestampBoundUnsatisfiableError(
+	minTimestampBound, resolvedTimestamp hlc.Timestamp,
+) *MinTimestampBoundUnsatisfiableError {
+	return &MinTimestampBoundUnsatisfiableError{
+		MinTimestampBound: minTimestampBound,
+		ResolvedTimestamp: resolvedTimestamp,
+	}
+}
+
+func (e *MinTimestampBoundUnsatisfiableError) Error() string {
+	return e.message(nil)
+}
+
+func (e *MinTimestampBoundUnsatisfiableError) message(pErr *Error) string {
+	return fmt.Sprintf("bounded staleness read with minimum timestamp "+
+		"bound of %s could not be satisfied by a local resolved timestamp of %s",
+		e.MinTimestampBound, e.ResolvedTimestamp)
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *MinTimestampBoundUnsatisfiableError) Type() ErrorDetailType {
+	return MinTimestampBoundUnsatisfiableErrType
+}
+
+var _ ErrorDetailInterface = &MinTimestampBoundUnsatisfiableError{}

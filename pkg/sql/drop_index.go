@@ -15,8 +15,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -322,11 +320,12 @@ func (p *planner) dropIndexByName(
 		)
 	}
 
-	// Check if requires CCL binary for eventual zone config removal. Only
-	// necessary for the system tenant, because secondary tenants do not have
-	// zone configs for individual objects.
-	if p.ExecCfg().Codec.ForSystemTenant() {
-		_, zone, _, err := GetZoneConfigInTxn(ctx, p.txn, config.SystemTenantObjectID(tableDesc.ID), nil /* index */, "", false)
+	// Check if requires CCL binary for eventual zone config removal. This is only
+	// required if `system.zones` exists.
+	if ZonesTableExists(ctx, p.ExecCfg().Codec, p.ExecCfg().Settings.Version) {
+		_, zone, _, err := GetZoneConfigInTxn(
+			ctx, p.txn, p.ExecCfg().Codec, tableDesc.ID, nil /* index */, "", false,
+		)
 		if err != nil {
 			return err
 		}
@@ -404,32 +403,6 @@ func (p *planner) dropIndexByName(
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				"referencing constraint %q in the middle of being added, try again later", c.ForeignKey.Name)
 		}
-	}
-
-	// If the we aren't at a high enough version to drop indexes on the origin
-	// side then we have to attempt to delete them.
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.NoOriginFKIndexes) {
-		// Index for updating the FK slices in place when removing FKs.
-		sliceIdx := 0
-		for i := range tableDesc.OutboundFKs {
-			tableDesc.OutboundFKs[sliceIdx] = tableDesc.OutboundFKs[i]
-			sliceIdx++
-			fk := &tableDesc.OutboundFKs[i]
-			canReplace := func(idx catalog.Index) bool {
-				return idx.IsValidOriginIndex(fk.OriginColumnIDs)
-			}
-			// The index being deleted could be used as the origin index for this foreign key.
-			if idx.IsValidOriginIndex(fk.OriginColumnIDs) && !indexHasReplacementCandidate(canReplace) {
-				if behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint {
-					return errors.Errorf("index %q is in use as a foreign key constraint", idx.GetName())
-				}
-				sliceIdx--
-				if err := p.removeFKBackReference(ctx, tableDesc, fk); err != nil {
-					return err
-				}
-			}
-		}
-		tableDesc.OutboundFKs = tableDesc.OutboundFKs[:sliceIdx]
 	}
 
 	// If this index is used on the referencing side of any FK constraints, try

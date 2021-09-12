@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"google.golang.org/protobuf/proto"
 )
 
 type validateStatus int
@@ -175,8 +176,10 @@ var validationMap = []struct {
 			"DefaultExpr": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
-			"Hidden":       {status: iSolemnlySwearThisFieldIsValidated},
-			"Inaccessible": {status: iSolemnlySwearThisFieldIsValidated},
+			"Hidden":                            {status: iSolemnlySwearThisFieldIsValidated},
+			"Inaccessible":                      {status: iSolemnlySwearThisFieldIsValidated},
+			"GeneratedAsIdentityType":           {status: iSolemnlySwearThisFieldIsValidated},
+			"GeneratedAsIdentitySequenceOption": {status: iSolemnlySwearThisFieldIsValidated},
 			"UsesSequenceIds": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
@@ -190,6 +193,7 @@ var validationMap = []struct {
 				reason: "initial import: TODO(features): add validation"},
 			"AlterColumnTypeInProgress": {status: thisFieldReferencesNoObjects},
 			"SystemColumnKind":          {status: thisFieldReferencesNoObjects},
+			"OnUpdateExpr":              {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 	{
@@ -244,16 +248,17 @@ var validationMap = []struct {
 	{
 		obj: descpb.DatabaseDescriptor{},
 		fieldMap: map[string]validationStatusInfo{
-			"Name":             {status: iSolemnlySwearThisFieldIsValidated},
-			"ID":               {status: iSolemnlySwearThisFieldIsValidated},
-			"Version":          {status: thisFieldReferencesNoObjects},
-			"ModificationTime": {status: thisFieldReferencesNoObjects},
-			"DrainingNames":    {status: thisFieldReferencesNoObjects},
-			"Privileges":       {status: iSolemnlySwearThisFieldIsValidated},
-			"Schemas":          {status: iSolemnlySwearThisFieldIsValidated},
-			"State":            {status: thisFieldReferencesNoObjects},
-			"OfflineReason":    {status: thisFieldReferencesNoObjects},
-			"RegionConfig":     {status: iSolemnlySwearThisFieldIsValidated},
+			"Name":              {status: iSolemnlySwearThisFieldIsValidated},
+			"ID":                {status: iSolemnlySwearThisFieldIsValidated},
+			"Version":           {status: thisFieldReferencesNoObjects},
+			"ModificationTime":  {status: thisFieldReferencesNoObjects},
+			"DrainingNames":     {status: thisFieldReferencesNoObjects},
+			"Privileges":        {status: iSolemnlySwearThisFieldIsValidated},
+			"Schemas":           {status: iSolemnlySwearThisFieldIsValidated},
+			"State":             {status: thisFieldReferencesNoObjects},
+			"OfflineReason":     {status: thisFieldReferencesNoObjects},
+			"RegionConfig":      {status: iSolemnlySwearThisFieldIsValidated},
+			"DefaultPrivileges": {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 	{
@@ -312,6 +317,7 @@ func TestValidateTableDesc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	computedExpr := "1 + 1"
+	generatedAsIdentitySequenceOptionExpr := " START 2 INCREMENT 3 CACHE 10"
 
 	testData := []struct {
 		err  string
@@ -1106,6 +1112,170 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  3,
 			}},
+		{`computed column "bar" cannot also have an ON UPDATE expression`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{
+						ID:           1,
+						Name:         "bar",
+						ComputeExpr:  proto.String("'blah'"),
+						OnUpdateExpr: proto.String("'blah'"),
+					},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+			}},
+		{`both generated identity and on update expression specified for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{
+						ID:                      1,
+						Name:                    "bar",
+						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						OnUpdateExpr:            proto.String("'blah'"),
+					},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+			}},
+		{`both generated identity and on update expression specified for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{
+						ID:                      1,
+						Name:                    "bar",
+						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						OnUpdateExpr:            proto.String("'blah'"),
+					},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+			}},
+		{`conflicting NULL/NOT NULL declarations for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", Nullable: true,
+						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+					},
+				},
+				NextColumnID: 3,
+			}},
+		{`conflicting NULL/NOT NULL declarations for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", Nullable: true,
+						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+					},
+				},
+				NextColumnID: 3,
+			}},
+		{`both generated identity and computed expression specified for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						ComputeExpr: &computedExpr},
+				},
+				NextColumnID: 3,
+			}},
+		{`both generated identity and computed expression specified for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						ComputeExpr: &computedExpr},
+				},
+				NextColumnID: 3,
+			}},
+		{`conflicting NULL/NOT NULL declarations for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", Nullable: true,
+						GeneratedAsIdentityType:           descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
+					},
+				},
+				NextColumnID: 3,
+			}},
+		{`conflicting NULL/NOT NULL declarations for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", Nullable: true,
+						GeneratedAsIdentityType:           descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
+					},
+				},
+				NextColumnID: 3,
+			}},
+		{`both generated identity and computed expression specified for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
+						ComputeExpr:                       &computedExpr},
+				},
+				NextColumnID: 3,
+			}},
+		{`both generated identity and computed expression specified for column "bar"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
+						ComputeExpr:                       &computedExpr},
+				},
+				NextColumnID: 3,
+			}},
 	}
 	for i, d := range testData {
 		t.Run(d.err, func(t *testing.T) {
@@ -1519,8 +1689,31 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				},
 			},
 		},
-		// Temporary tables.
 		{ // 16
+			err: `referenced type ID 500: descriptor not found`,
+			desc: descpb.TableDescriptor{
+				Name:                    "foo",
+				ID:                      51,
+				ParentID:                1,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:             1,
+					Name:           "bar",
+					KeyColumnIDs:   []descpb.ColumnID{1},
+					KeyColumnNames: []string{"a"},
+				},
+				Columns: []descpb.ColumnDescriptor{
+					{
+						Name:         "a",
+						ID:           1,
+						Type:         types.Int,
+						OnUpdateExpr: pointer("a::@100500"),
+					},
+				},
+			},
+		},
+		// Temporary tables.
+		{ // 17
 			err: "",
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",

@@ -511,22 +511,20 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 
 	tab := sb.md.Table(tabID)
 
-	// Create a mapping from table column ordinals to inverted index virtual column
-	// ordinals. This allows us to do a fast lookup while iterating over all stats
-	// from a statistic's column to any associated virtual columns. We don't merely
-	// loop over all table columns looking for virtual columns here because other
-	// things may one day use virtual columns and we want these to be explicitly
-	// tied to inverted indexes.
-	invIndexVirtualCols := make(map[int][]int)
+	// Create a mapping from table column ordinals to inverted index column
+	// ordinals. This allows us to do a fast lookup while iterating over all
+	// stats from a statistic's column to any associated inverted columns.
+	// TODO(mgartner): It might be simpler to iterate over all the table columns
+	// looking for inverted columns.
+	invertedIndexCols := make(map[int][]int)
 	for indexI, indexN := 0, tab.IndexCount(); indexI < indexN; indexI++ {
 		index := tab.Index(indexI)
 		if !index.IsInverted() {
 			continue
 		}
-		// The inverted column of an inverted index is virtual.
-		col := index.VirtualInvertedColumn()
+		col := index.InvertedColumn()
 		srcOrd := col.InvertedSourceColumnOrdinal()
-		invIndexVirtualCols[srcOrd] = append(invIndexVirtualCols[srcOrd], col.Ordinal())
+		invertedIndexCols[srcOrd] = append(invertedIndexCols[srcOrd], col.Ordinal())
 	}
 
 	// Make now and annotate the metadata table with it for next time.
@@ -549,7 +547,7 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 		// column set. Stats are ordered with most recent first.
 		for i := 0; i < tab.StatisticCount(); i++ {
 			stat := tab.Statistic(i)
-			if stat.ColumnCount() > 1 && !sb.evalCtx.SessionData.OptimizerUseMultiColStats {
+			if stat.ColumnCount() > 1 && !sb.evalCtx.SessionData().OptimizerUseMultiColStats {
 				continue
 			}
 
@@ -562,19 +560,19 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 				colStat.DistinctCount = float64(stat.DistinctCount())
 				colStat.NullCount = float64(stat.NullCount())
 				if cols.Len() == 1 && stat.Histogram() != nil &&
-					sb.evalCtx.SessionData.OptimizerUseHistograms {
+					sb.evalCtx.SessionData().OptimizerUseHistograms {
 					col, _ := cols.Next(0)
 
 					// If this column is invertable, the histogram describes the inverted index
 					// entries, and we need to create a new stat for it, and not apply a histogram
 					// to the source column.
-					virtualColOrds := invIndexVirtualCols[stat.ColumnOrdinal(0)]
-					if len(virtualColOrds) == 0 {
+					invertedColOrds := invertedIndexCols[stat.ColumnOrdinal(0)]
+					if len(invertedColOrds) == 0 {
 						colStat.Histogram = &props.Histogram{}
 						colStat.Histogram.Init(sb.evalCtx, col, stat.Histogram())
 					} else {
-						for _, virtualColOrd := range virtualColOrds {
-							invCol := tabID.ColumnID(virtualColOrd)
+						for _, invertedColOrd := range invertedColOrds {
+							invCol := tabID.ColumnID(invertedColOrd)
 							invCols := opt.MakeColSet(invCol)
 							if invColStat, ok := stats.ColStats.Add(invCols); ok {
 								invColStat.Histogram = &props.Histogram{}
@@ -735,10 +733,9 @@ func (sb *statisticsBuilder) constrainScan(
 	// Calculate distinct counts and histograms for inverted constrained columns
 	// -------------------------------------------------------------------------
 	if scan.InvertedConstraint != nil {
-		// The constrained column is the virtual inverted column in the inverted
-		// index. Using scan.Cols here would also include the PK, which we don't
-		// want.
-		invertedConstrainedCol := scan.Table.ColumnID(idx.VirtualInvertedColumn().Ordinal())
+		// The constrained column is the inverted column in the inverted index.
+		// Using scan.Cols here would also include the PK, which we don't want.
+		invertedConstrainedCol := scan.Table.ColumnID(idx.InvertedColumn().Ordinal())
 		constrainedCols.Add(invertedConstrainedCol)
 		if sb.shouldUseHistogram(relProps) {
 			// TODO(mjibson): set distinctCount to something correct. Max is
@@ -807,13 +804,20 @@ func (sb *statisticsBuilder) constrainScan(
 
 	// Calculate row count and selectivity
 	// -----------------------------------
-	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, scan, s))
-	s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(constrainedCols, scan, s))
+	histSelectivity, selectivityUpperBound := sb.selectivityFromHistograms(histCols, scan, s)
+	s.ApplySelectivity(histSelectivity)
 	s.ApplySelectivity(sb.selectivityFromUnappliedConjuncts(numUnappliedConjuncts))
 	s.ApplySelectivity(sb.selectivityFromNullsRemoved(scan, notNullCols, constrainedCols))
 
-	// Adjust the selectivity so we don't double-count the histogram columns.
-	s.UnapplySelectivity(sb.selectivityFromSingleColDistinctCounts(histCols, scan, s))
+	// Apply selectivity from multi-col distinct counts, adjusting so that we
+	// don't double-count the histogram columns. This adjustment may cause the
+	// selectivity to increase, so apply a limit to ensure it does not exceed the
+	// upper bound based on the histograms.
+	s.ApplySelectivityRatio(
+		sb.selectivityFromMultiColDistinctCounts(constrainedCols, scan, s),
+		sb.selectivityFromSingleColDistinctCounts(histCols, scan, s),
+	)
+	s.LimitSelectivity(selectivityUpperBound)
 }
 
 func (sb *statisticsBuilder) colStatScan(colSet opt.ColSet, scan *ScanExpr) *props.ColumnStatistic {
@@ -994,12 +998,19 @@ func (sb *statisticsBuilder) buildInvertedFilter(
 	// -----------------------------------
 	inputStats := &invFilter.Input.Relational().Stats
 	s.RowCount = inputStats.RowCount
-	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, invFilter, s))
-	s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(constrainedCols, invFilter, s))
+	histSelectivity, selectivityUpperBound := sb.selectivityFromHistograms(histCols, invFilter, s)
+	s.ApplySelectivity(histSelectivity)
 	s.ApplySelectivity(sb.selectivityFromNullsRemoved(invFilter, relProps.NotNullCols, constrainedCols))
 
-	// Adjust the selectivity so we don't double-count the histogram columns.
-	s.UnapplySelectivity(sb.selectivityFromSingleColDistinctCounts(histCols, invFilter, s))
+	// Apply selectivity from multi-col distinct counts, adjusting so that we
+	// don't double-count the histogram columns. This adjustment may cause the
+	// selectivity to increase, so apply a limit to ensure it does not exceed the
+	// upper bound based on the histograms.
+	s.ApplySelectivityRatio(
+		sb.selectivityFromMultiColDistinctCounts(constrainedCols, invFilter, s),
+		sb.selectivityFromSingleColDistinctCounts(histCols, invFilter, s),
+	)
+	s.LimitSelectivity(selectivityUpperBound)
 
 	sb.finalizeFromCardinality(relProps)
 }
@@ -1160,18 +1171,26 @@ func (sb *statisticsBuilder) buildJoin(
 	if join.Op() == opt.InvertedJoinOp || hasInvertedJoinCond(h.filters) {
 		s.ApplySelectivity(sb.selectivityFromInvertedJoinCondition(join, s))
 	}
-	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, join, s))
-	s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(
-		constrainedCols.Intersection(leftCols), join, s,
-	))
-	s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(
-		constrainedCols.Intersection(rightCols), join, s,
-	))
+	histSelectivity, selectivityUpperBound := sb.selectivityFromHistograms(histCols, join, s)
+	s.ApplySelectivity(histSelectivity)
 	s.ApplySelectivity(sb.selectivityFromUnappliedConjuncts(numUnappliedConjuncts))
 	s.ApplySelectivity(sb.selectivityFromNullsRemoved(join, relProps.NotNullCols, constrainedCols))
 
-	// Adjust the selectivity so we don't double-count the histogram columns.
-	s.UnapplySelectivity(sb.selectivityFromSingleColDistinctCounts(histCols, join, s))
+	// Apply selectivity from multi-col distinct counts, adjusting so that we
+	// don't double-count the histogram columns. This adjustment may cause the
+	// selectivity to increase, so apply a limit to ensure it does not exceed the
+	// upper bound based on the histograms.
+	multiColSelectivity := sb.selectivityFromMultiColDistinctCounts(
+		constrainedCols.Intersection(leftCols), join, s,
+	)
+	multiColSelectivity.Multiply(sb.selectivityFromMultiColDistinctCounts(
+		constrainedCols.Intersection(rightCols), join, s),
+	)
+	s.ApplySelectivityRatio(
+		multiColSelectivity,
+		sb.selectivityFromSingleColDistinctCounts(histCols, join, s),
+	)
+	s.LimitSelectivity(selectivityUpperBound)
 
 	// Update distinct counts based on equivalencies; this should happen after
 	// selectivityFromMultiColDistinctCounts and selectivityFromEquivalencies.
@@ -2857,14 +2876,21 @@ func (sb *statisticsBuilder) filterRelExpr(
 
 	// Calculate row count and selectivity
 	// -----------------------------------
-	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, e, s))
-	s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(constrainedCols, e, s))
+	histSelectivity, selectivityUpperBound := sb.selectivityFromHistograms(histCols, e, s)
+	s.ApplySelectivity(histSelectivity)
 	s.ApplySelectivity(sb.selectivityFromEquivalencies(equivReps, &relProps.FuncDeps, e, s))
 	s.ApplySelectivity(sb.selectivityFromUnappliedConjuncts(numUnappliedConjuncts))
 	s.ApplySelectivity(sb.selectivityFromNullsRemoved(e, notNullCols, constrainedCols))
 
-	// Adjust the selectivity so we don't double-count the histogram columns.
-	s.UnapplySelectivity(sb.selectivityFromSingleColDistinctCounts(histCols, e, s))
+	// Apply selectivity from multi-col distinct counts, adjusting so that we
+	// don't double-count the histogram columns. This adjustment may cause the
+	// selectivity to increase, so apply a limit to ensure it does not exceed the
+	// upper bound based on the histograms.
+	s.ApplySelectivityRatio(
+		sb.selectivityFromMultiColDistinctCounts(constrainedCols, e, s),
+		sb.selectivityFromSingleColDistinctCounts(histCols, e, s),
+	)
+	s.LimitSelectivity(selectivityUpperBound)
 
 	// Update distinct and null counts based on equivalencies; this should
 	// happen after selectivityFromMultiColDistinctCounts and
@@ -3093,12 +3119,19 @@ func (sb *statisticsBuilder) constrainExpr(
 
 	// Calculate row count and selectivity
 	// -----------------------------------
-	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, e, s))
-	s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(constrainedCols, e, s))
+	histSelectivity, selectivityUpperBound := sb.selectivityFromHistograms(histCols, e, s)
+	s.ApplySelectivity(histSelectivity)
 	s.ApplySelectivity(sb.selectivityFromNullsRemoved(e, notNullCols, constrainedCols))
 
-	// Adjust the selectivity so we don't double-count the histogram columns.
-	s.UnapplySelectivity(sb.selectivityFromSingleColDistinctCounts(histCols, e, s))
+	// Apply selectivity from multi-col distinct counts, adjusting so that we
+	// don't double-count the histogram columns. This adjustment may cause the
+	// selectivity to increase, so apply a limit to ensure it does not exceed the
+	// upper bound based on the histograms.
+	s.ApplySelectivityRatio(
+		sb.selectivityFromMultiColDistinctCounts(constrainedCols, e, s),
+		sb.selectivityFromSingleColDistinctCounts(histCols, e, s),
+	)
+	s.LimitSelectivity(selectivityUpperBound)
 }
 
 // applyIndexConstraint is used to update the distinct counts and histograms
@@ -3560,7 +3593,7 @@ func (sb *statisticsBuilder) selectivityFromMultiColDistinctCounts(
 	cols opt.ColSet, e RelExpr, s *props.Statistics,
 ) (selectivity props.Selectivity) {
 	// Respect the session setting OptimizerUseMultiColStats.
-	if !sb.evalCtx.SessionData.OptimizerUseMultiColStats {
+	if !sb.evalCtx.SessionData().OptimizerUseMultiColStats {
 		return sb.selectivityFromSingleColDistinctCounts(cols, e, s)
 	}
 
@@ -3730,17 +3763,24 @@ func (sb *statisticsBuilder) selectivityFromDistinctCount(
 //
 // For histograms, the selectivity of a constrained column is calculated as
 // (# values in histogram after filter) / (# values in histogram before filter).
+//
+// In addition to returning the product of selectivities,
+// selectivityFromHistograms returns the selectivity of the most selective
+// predicate (i.e., the predicate with minimum selectivity) as
+// selectivityUpperBound, since it is an upper bound on the selectivity of the
+// entire expression.
 func (sb *statisticsBuilder) selectivityFromHistograms(
 	cols opt.ColSet, e RelExpr, s *props.Statistics,
-) (selectivity props.Selectivity) {
+) (selectivity props.Selectivity, selectivityUpperBound props.Selectivity) {
 	selectivity = props.OneSelectivity
+	selectivityUpperBound = props.OneSelectivity
 	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col + 1) {
 		colStat, ok := s.ColStats.Lookup(opt.MakeColSet(col))
 		if !ok {
 			continue
 		}
 
-		inputColStat, inputStats := sb.colStatFromInput(colStat.Cols, e)
+		inputColStat, _ := sb.colStatFromInput(colStat.Cols, e)
 		newHist := colStat.Histogram
 		oldHist := inputColStat.Histogram
 		if newHist == nil || oldHist == nil {
@@ -3750,15 +3790,18 @@ func (sb *statisticsBuilder) selectivityFromHistograms(
 		newCount := newHist.ValuesCount()
 		oldCount := oldHist.ValuesCount()
 
-		// Calculate the selectivity of the predicate.
-		nonNullSelectivity := props.MakeSelectivityFromFraction(newCount, oldCount)
-		nullSelectivity := props.MakeSelectivityFromFraction(colStat.NullCount, inputColStat.NullCount)
-		selectivity.Multiply(sb.predicateSelectivity(
-			nonNullSelectivity, nullSelectivity, inputColStat.NullCount, inputStats.RowCount,
-		))
+		// Calculate the selectivity of the predicate. Nulls are already included
+		// in the histogram, so we do not need to account for them separately.
+		predicateSelectivity := props.MakeSelectivityFromFraction(newCount, oldCount)
+
+		// The maximum possible selectivity of the entire expression is the minimum
+		// selectivity of all individual predicates.
+		selectivityUpperBound = props.MinSelectivity(selectivityUpperBound, predicateSelectivity)
+
+		selectivity.Multiply(predicateSelectivity)
 	}
 
-	return selectivity
+	return selectivity, selectivityUpperBound
 }
 
 // selectivityFromNullsRemoved calculates the selectivity from null-rejecting

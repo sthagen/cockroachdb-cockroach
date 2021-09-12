@@ -15,14 +15,21 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -43,8 +50,7 @@ import (
 // It offers the following commands:
 //
 // "new-cluster localities=<localities>": creates a new cluster with
-// len(localities) number of nodes. The set of available localities is
-// hard-coded in the localityCfgs map below. A locality entry may be repeated to
+// len(localities) number of nodes. A locality entry may be repeated to
 // create more than one node in a region. The order in which the localities are
 // provided may later be used to index into a particular node to run a query.
 //
@@ -64,12 +70,19 @@ import (
 // leaseholder.
 //
 // "wait-for-zone-config-changes idx=server_number table-name=tbName
-// [num-voters=num] [num-non-voters=num] [lease-holder-node=idx]": finds the
+// [num-voters=num] [num-non-voters=num] [leaseholder=idx] [voter=idx_list]
+// [non-voter=idx_list] [not-present=idx_list]": finds the
 // range belonging to the given tbName's prefix key and runs it through the
-// split, replicate, and raftsnapshot queues. If the num-voters, num-non-voters,
-// or lease-holder-node arguments are provided, it then makes sure that the
-// range conforms to those.
-// If the lease-holder-node does not match the argument provided, a lease
+// split, replicate, and raftsnapshot queues. If the num-voters or
+// num-non-voters arguments are provided, it then makes sure that the range
+// conforms to those.
+// It also takes the arguments leaseholder, voter, nonvoter, and not-present,
+// each of which take a comma-separated list of server indexes to check against
+// the provided table.
+// Note that if a server idx is not listed, it is unconstrained. This is
+// necessary for cases where we know how many replicas of a type we want but
+// we can't deterministically know their placement.
+// If the leaseholder does not match the argument provided, a lease
 // transfer is attempted.
 // All this is done in a succeeds soon as any of these steps may error out for
 // completely legitimate reasons.
@@ -88,6 +101,9 @@ import (
 // the given query to refresh the range descriptor cache. Then, using the
 // table-name argument, the closed timestamp policy is returned.
 //
+// "sleep-for-follower-read": sleeps for 4,4 seconds, the target duration for
+// follower reads according to our cluster settings.
+//
 // "cleanup-cluster": destroys the cluster. Must be done before creating a new
 // cluster.
 func TestMultiRegionDataDriven(t *testing.T) {
@@ -105,6 +121,8 @@ func TestMultiRegionDataDriven(t *testing.T) {
 		var recCh chan tracing.Recording
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
+			case "sleep-for-follower-read":
+				time.Sleep(time.Second)
 			case "new-cluster":
 				if ds.tc != nil {
 					t.Fatal("cluster already exists, cleanup cluster first")
@@ -119,9 +137,11 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				localityNames := strings.Split(localities, ",")
 				recCh = make(chan tracing.Recording, 1)
 				for i, localityName := range localityNames {
-					localityCfg, found := localityCfgs[localityName]
-					if !found {
-						t.Fatalf("cannot create a server in locality %s", localityName)
+					localityCfg := roachpb.Locality{
+						Tiers: []roachpb.Tier{
+							{Key: "region", Value: localityName},
+							{Key: "zone", Value: localityName + "a"},
+						},
 					}
 					serverArgs[i] = base.TestServerArgs{
 						Locality: localityCfg,
@@ -144,6 +164,21 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				})
 				ds.tc = tc
 
+				sqlConn, err := ds.getSQLConn(0)
+				if err != nil {
+					return err.Error()
+				}
+				// Speed up closing of timestamps, in order to sleep less below before
+				// we can use follower_read_timestamp(). follower_read_timestamp() uses
+				// sum of the following settings.
+				_, err = sqlConn.Exec(
+					"SET CLUSTER SETTING kv.closed_timestamp.target_duration = '0.4s';" +
+						"SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '0.1s';" +
+						"SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'")
+				if err != nil {
+					return err.Error()
+				}
+
 			case "cleanup-cluster":
 				ds.cleanup(ctx)
 
@@ -156,6 +191,7 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				if err != nil {
 					return err.Error()
 				}
+
 				_, err = sqlDB.Exec(d.Input)
 				if err != nil {
 					return err.Error()
@@ -197,10 +233,12 @@ func TestMultiRegionDataDriven(t *testing.T) {
 					return err.Error()
 				}
 				var output strings.Builder
-				output.WriteString(fmt.Sprintf("served locally: %s\n", strconv.FormatBool(localRead)))
+				output.WriteString(
+					fmt.Sprintf("served locally: %s\n", strconv.FormatBool(localRead)))
 				// Only print follower read information if the query was served locally.
 				if localRead {
-					output.WriteString(fmt.Sprintf("served via follower read: %s\n", strconv.FormatBool(followerRead)))
+					output.WriteString(
+						fmt.Sprintf("served via follower read: %s\n", strconv.FormatBool(followerRead)))
 				}
 				return output.String()
 
@@ -224,7 +262,8 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				}
 				// Ensure the range descriptor cache was indeed populated.
 				var tableID uint32
-				err = sqlDB.QueryRow(`SELECT id from system.namespace WHERE name=$1`, tbName).Scan(&tableID)
+				err = sqlDB.QueryRow(`SELECT id from system.namespace WHERE name=$1`,
+					tbName).Scan(&tableID)
 				if err != nil {
 					return err.Error()
 				}
@@ -237,58 +276,43 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				return entry.ClosedTimestampPolicy().String()
 
 			case "wait-for-zone-config-changes":
-				mustHaveArgOrFatal(t, d, tableName)
-				mustHaveArgOrFatal(t, d, serverIdx)
+				lookupKey, err := getRangeKeyForInput(t, d, ds.tc)
+				if err != nil {
+					return err.Error()
+				}
+				lookupRKey := keys.MustAddr(lookupKey)
 
-				var idx int
-				d.ScanArgs(t, serverIdx, &idx)
-				sqlDB, err := ds.getSQLConn(idx)
-				if err != nil {
-					return err.Error()
-				}
-				var tbName string
-				d.ScanArgs(t, tableName, &tbName)
-				var tableID uint32
-				err = sqlDB.QueryRow(`SELECT id from system.namespace WHERE name=$1`, tbName).Scan(&tableID)
-				if err != nil {
-					return err.Error()
-				}
-				tablePrefix := keys.MustAddr(keys.SystemSQLCodec.TablePrefix(tableID))
 				// There's a lot going on here and things can fail at various steps, for
 				// completely legitimate reasons, which is why this thing needs to be
 				// wrapped in a succeeds soon.
 				if err := testutils.SucceedsSoonError(func() error {
-					leaseHolderNode := ds.tc.Server(0)
-					desc, err := ds.tc.LookupRange(tablePrefix.AsRawKey())
+					desc, err := ds.tc.LookupRange(lookupKey)
 					if err != nil {
 						return err
-					}
-					leaseHolderInfo, err := ds.tc.FindRangeLeaseHolder(desc, nil)
-					if err != nil {
-						return err
-					}
-					found := false
-					for i := 0; i < ds.tc.NumServers(); i++ {
-						if ds.tc.Server(i).NodeID() == leaseHolderInfo.NodeID {
-							leaseHolderNode = ds.tc.Server(i)
-							found = true
-							break
-						}
-					}
-					if !found {
-						return errors.Newf("could not find lease holder for %s", tbName)
 					}
 
-					store, err := leaseHolderNode.GetStores().(*kvserver.Stores).GetStore(leaseHolderNode.GetFirstStoreID())
+					// Parse user-supplied expected replica types from input.
+					expectedPlacement := parseReplicasFromInput(t, ds.tc, d)
+					// Get current replica type info from range and validate against
+					// user-specified replica types
+					actualPlacement, err := parseReplicasFromRange(t, ds.tc, desc)
 					if err != nil {
 						return err
 					}
-					repl := store.LookupReplica(tablePrefix)
+
+					leaseHolderNode := ds.tc.Server(actualPlacement.getLeaseholder())
+					store, err := leaseHolderNode.GetStores().(*kvserver.Stores).GetStore(
+						leaseHolderNode.GetFirstStoreID())
+					if err != nil {
+						return err
+					}
+					repl := store.LookupReplica(lookupRKey)
 					if repl == nil {
 						return errors.New(`could not find replica`)
 					}
 					for _, queueName := range []string{"split", "replicate", "raftsnapshot"} {
-						_, processErr, err := store.ManuallyEnqueue(ctx, queueName, repl, true /* skipShouldQueue */)
+						_, processErr, err := store.ManuallyEnqueue(ctx, queueName, repl,
+							true /* skipShouldQueue */)
 						if processErr != nil {
 							return processErr
 						}
@@ -296,10 +320,45 @@ func TestMultiRegionDataDriven(t *testing.T) {
 							return err
 						}
 					}
-					desc, err = ds.tc.LookupRange(tablePrefix.AsRawKey())
+
+					// If the user specified a leaseholder, transfer range lease to the
+					// leaseholder.
+					if expectedPlacement.hasLeaseholderInfo() {
+						expectedLeaseIdx := expectedPlacement.getLeaseholder()
+						actualLeaseIdx := actualPlacement.getLeaseholder()
+						if expectedLeaseIdx != actualLeaseIdx {
+							leaseErr := errors.Newf("expected leaseholder %d but got %d",
+								expectedLeaseIdx, actualLeaseIdx)
+
+							// We want to only initiate a lease transfer if our target replica
+							// is a voter. Otherwise, TransferRangeLease will silently fail.
+							newLeaseholderType := actualPlacement.getReplicaType(expectedLeaseIdx)
+							if newLeaseholderType != replicaTypeVoter {
+								return errors.CombineErrors(
+									leaseErr,
+									errors.Newf(
+										"expected node %s to be a voter but was %s",
+										expectedLeaseIdx,
+										newLeaseholderType.String()))
+							}
+
+							log.VEventf(
+								ctx,
+								2,
+								"transferring lease from node %d to %d", actualLeaseIdx, expectedLeaseIdx)
+							err = ds.tc.TransferRangeLease(desc, ds.tc.Target(expectedLeaseIdx))
+							return errors.CombineErrors(
+								leaseErr,
+								err,
+							)
+						}
+					}
+
+					err = actualPlacement.satisfiesExpectedPlacement(expectedPlacement)
 					if err != nil {
 						return err
 					}
+
 					if d.HasArg(numVoters) {
 						var voters int
 						d.ScanArgs(t, numVoters, &voters)
@@ -316,17 +375,7 @@ func TestMultiRegionDataDriven(t *testing.T) {
 								len(desc.Replicas().NonVoterDescriptors()), nonVoters)
 						}
 					}
-					if d.HasArg(expectedLeaseHolderNode) {
-						var leaseHolderIdx int
-						d.ScanArgs(t, expectedLeaseHolderNode, &leaseHolderIdx)
-						if ds.tc.Server(leaseHolderIdx).NodeID() != leaseHolderInfo.NodeID {
-							err = ds.tc.TransferRangeLease(desc, ds.tc.Target(leaseHolderIdx))
-							return errors.CombineErrors(
-								errors.New("unexpected leaseholder"),
-								err,
-							)
-						}
-					}
+
 					return nil
 				}); err != nil {
 					return err.Error()
@@ -342,56 +391,43 @@ func TestMultiRegionDataDriven(t *testing.T) {
 
 // Constants corresponding to command-options accepted by the data-driven test.
 const (
-	serverIdx               = "idx"
-	serverLocalities        = "localities"
-	tableName               = "table-name"
-	numVoters               = "num-voters"
-	numNonVoters            = "num-non-voters"
-	expectedLeaseHolderNode = "lease-holder-node"
+	serverIdx        = "idx"
+	serverLocalities = "localities"
+	tableName        = "table-name"
+	dbName           = "db-name"
+	partitionName    = "partition-name"
+	numVoters        = "num-voters"
+	numNonVoters     = "num-non-voters"
+)
+
+type replicaType int
+
+const (
+	replicaTypeLeaseholder replicaType = iota
+	replicaTypeVoter
+	replicaTypeNonVoter
+	replicaTypeNotPresent
 )
 
 type datadrivenTestState struct {
 	tc serverutils.TestClusterInterface
 }
 
-// Set of localities to choose from for the data-driven test.
-var localityCfgs = map[string]roachpb.Locality{
-	"us-east-1": {
-		Tiers: []roachpb.Tier{
-			{Key: "region", Value: "us-east-1"},
-			{Key: "availability-zone", Value: "us-east-1a"},
-		},
-	},
-	"us-central-1": {
-		Tiers: []roachpb.Tier{
-			{Key: "region", Value: "us-central-1"},
-			{Key: "availability-zone", Value: "us-central-1a"},
-		},
-	},
-	"us-west-1": {
-		Tiers: []roachpb.Tier{
-			{Key: "region", Value: "us-west-1"},
-			{Key: "availability-zone", Value: "us-west-1a"},
-		},
-	},
-	"eu-east-1": {
-		Tiers: []roachpb.Tier{
-			{Key: "region", Value: "eu-east-1"},
-			{Key: "availability-zone", Value: "eu-east-1a"},
-		},
-	},
-	"eu-central-1": {
-		Tiers: []roachpb.Tier{
-			{Key: "region", Value: "eu-central-1"},
-			{Key: "availability-zone", Value: "eu-central-1a"},
-		},
-	},
-	"eu-west-1": {
-		Tiers: []roachpb.Tier{
-			{Key: "region", Value: "eu-west-1"},
-			{Key: "availability-zone", Value: "eu-west-1a"},
-		},
-	},
+var replicaTypes = map[string]replicaType{
+	"leaseholder": replicaTypeLeaseholder,
+	"voter":       replicaTypeVoter,
+	"non-voter":   replicaTypeNonVoter,
+	"not-present": replicaTypeNotPresent,
+}
+var replicaTypeString = map[replicaType]string{
+	replicaTypeLeaseholder: "leaseholder",
+	replicaTypeVoter:       "voter",
+	replicaTypeNonVoter:    "non-voter",
+	replicaTypeNotPresent:  "not-present",
+}
+
+func (r replicaType) String() string {
+	return replicaTypeString[r]
 }
 
 func (d *datadrivenTestState) cleanup(ctx context.Context) {
@@ -417,6 +453,18 @@ func mustHaveArgOrFatal(t *testing.T, d *datadriven.TestData, arg string) {
 	}
 }
 
+func nodeIdToIdx(t *testing.T, tc serverutils.TestClusterInterface, id roachpb.NodeID) int {
+	for i := 0; i < tc.NumServers(); i++ {
+		if tc.Server(i).NodeID() == id {
+			return i
+		}
+	}
+
+	t.Fatalf("could not find idx for node id %d", id)
+
+	return -1
+}
+
 // checkReadServedLocallyInSimpleRecording looks at a "simple" trace and returns
 // if the query for served locally and if it was served via a follower read.
 // A "simple" trace is defined as one that contains a single "dist sender send"
@@ -429,7 +477,9 @@ func checkReadServedLocallyInSimpleRecording(
 	for _, sp := range rec {
 		if sp.Operation == "dist sender send" {
 			if foundDistSenderSend {
-				return false, false, errors.New("recording contains > 1 dist sender send messages")
+				return false,
+					false,
+					errors.New("recording contains > 1 dist sender send messages")
 			}
 			foundDistSenderSend = true
 			servedLocally = tracing.LogsContainMsg(sp, kvbase.RoutingRequestLocallyMsg)
@@ -445,7 +495,262 @@ func checkReadServedLocallyInSimpleRecording(
 		}
 	}
 	if !foundDistSenderSend {
-		return false, false, errors.New("recording contains no dist sender send messages")
+		return false,
+			false,
+			errors.New("recording contains no dist sender send messages")
 	}
 	return servedLocally, servedUsingFollowerReads, nil
+}
+
+// replicaPlacement keeps track of which nodes have what replica types for a
+// given range.
+type replicaPlacement struct {
+	nodeToReplicaType  map[int]replicaType
+	replicaTypeToNodes map[replicaType][]int
+	leaseholder        int
+}
+
+// parseReplicasFromInput constructs a replicaPlacement from user input.
+func parseReplicasFromInput(
+	t *testing.T, tc serverutils.TestClusterInterface, d *datadriven.TestData,
+) *replicaPlacement {
+	ret := replicaPlacement{}
+	ret.leaseholder = -1
+
+	userReplicas := make(map[replicaType][]int)
+	for replicaTypeName := range replicaTypes {
+		if !d.HasArg(replicaTypeName) {
+			continue
+		}
+
+		var rawReplicas string
+		d.ScanArgs(t, replicaTypeName, &rawReplicas)
+
+		rawReplicaList := strings.Split(rawReplicas, ",")
+		newReplicas := make([]int, 0, len(rawReplicaList))
+		for _, rawIndex := range rawReplicaList {
+			ind, err := strconv.Atoi(rawIndex)
+			if err != nil {
+				t.Fatalf("could not parse replica type for index: %v", err)
+			}
+			if ind >= tc.NumServers() || ind < 0 {
+				t.Fatalf("got server index %d but have %d servers", ind, tc.NumServers())
+			}
+			newReplicas = append(newReplicas, ind)
+		}
+
+		userReplicas[replicaTypes[replicaTypeName]] = newReplicas
+	}
+
+	if leaseholders := userReplicas[replicaTypeLeaseholder]; len(leaseholders) == 1 {
+		ret.leaseholder = leaseholders[0]
+	} else if len(leaseholders) > 1 {
+		t.Fatalf("got more than one leaseholder: %d", len(leaseholders))
+	}
+
+	ret.replicaTypeToNodes = userReplicas
+
+	reversed := make(map[int]replicaType)
+	for rt, replicas := range userReplicas {
+		for _, replica := range replicas {
+			reversed[replica] = rt
+		}
+	}
+	ret.nodeToReplicaType = reversed
+
+	return &ret
+}
+
+// parseReplicasFromInput constructs a replicaPlacement from a range descriptor.
+func parseReplicasFromRange(
+	t *testing.T, tc serverutils.TestClusterInterface, desc roachpb.RangeDescriptor,
+) (*replicaPlacement, error) {
+	ret := replicaPlacement{}
+
+	replicaMap := make(map[int]replicaType)
+
+	leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
+	if err != nil {
+		return nil, errors.Newf("could not get leaseholder: %v", err)
+	}
+	leaseHolderIdx := nodeIdToIdx(t, tc, leaseHolder.NodeID)
+	replicaMap[leaseHolderIdx] = replicaTypeLeaseholder
+	ret.leaseholder = leaseHolderIdx
+
+	for _, replica := range desc.Replicas().VoterDescriptors() {
+		idx := nodeIdToIdx(t, tc, replica.NodeID)
+		if _, found := replicaMap[idx]; !found {
+			replicaMap[idx] = replicaTypeVoter
+		}
+	}
+
+	for _, replica := range desc.Replicas().NonVoterDescriptors() {
+		idx := nodeIdToIdx(t, tc, replica.NodeID)
+		if rt, found := replicaMap[idx]; !found {
+			replicaMap[idx] = replicaTypeNonVoter
+		} else {
+			return nil,
+				errors.Errorf("expected not to find non-voter %d in replica map but found %s",
+					idx, rt.String())
+		}
+	}
+
+	ret.nodeToReplicaType = replicaMap
+
+	reversed := make(map[replicaType][]int)
+	for replica, rt := range replicaMap {
+		if val, found := reversed[rt]; !found {
+			reversed[rt] = []int{replica}
+		} else {
+			reversed[rt] = append(val, replica)
+		}
+	}
+	ret.replicaTypeToNodes = reversed
+
+	return &ret, nil
+}
+
+// satisfiesExpectedPlacement returns nil if the expected replicaPlacement is a
+// subset of the provided replicaPlacement, error otherwise.
+func (r *replicaPlacement) satisfiesExpectedPlacement(expected *replicaPlacement) error {
+	for node, expectedRt := range expected.nodeToReplicaType {
+		actualRt, found := r.nodeToReplicaType[node]
+		if expectedRt == replicaTypeNotPresent {
+			// We hope to not be able to find replicas marked as not present, so
+			// continue to the next replica if that's the case.
+			if !found || actualRt == replicaTypeNotPresent {
+				continue
+			} else {
+				return errors.Newf(
+					"expected node %s to not be present but had replica type %s",
+					node,
+					actualRt.String())
+			}
+		}
+
+		if !found {
+			return errors.Newf(
+				"expected node %s to have replica type %s but was not found",
+				node,
+				expectedRt.String())
+		}
+
+		if expectedRt != actualRt {
+			return errors.Newf(
+				"expected node %s to have replica type %s but was %s",
+				node,
+				expectedRt.String(),
+				actualRt.String())
+		}
+	}
+
+	return nil
+}
+
+func (r *replicaPlacement) hasLeaseholderInfo() bool {
+	return r.leaseholder != -1
+}
+
+func (r *replicaPlacement) getLeaseholder() int {
+	return r.leaseholder
+}
+
+func (r *replicaPlacement) getReplicaType(nodeIdx int) replicaType {
+	return r.nodeToReplicaType[nodeIdx]
+}
+
+func getRangeKeyForInput(
+	t *testing.T, d *datadriven.TestData, tc serverutils.TestClusterInterface,
+) (roachpb.Key, error) {
+	mustHaveArgOrFatal(t, d, dbName)
+	mustHaveArgOrFatal(t, d, tableName)
+
+	var tbName string
+	d.ScanArgs(t, tableName, &tbName)
+	var db string
+	d.ScanArgs(t, dbName, &db)
+
+	execCfg := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig)
+
+	tableDesc, err := lookupTable(&execCfg, db, tbName)
+	if err != nil {
+		return nil, err
+	}
+
+	if !d.HasArg(partitionName) {
+		return tableDesc.TableSpan(keys.SystemSQLCodec).Key, nil
+	}
+
+	var partition string
+	d.ScanArgs(t, partitionName, &partition)
+
+	primaryInd := tableDesc.GetPrimaryIndex()
+
+	part := primaryInd.GetPartitioning()
+	if part == nil {
+		return []byte{},
+			errors.Newf("could not get partitioning for primary index on table %s", tbName)
+	}
+
+	var listVal []byte
+	for _, val := range part.PartitioningDesc().List {
+		if val.Name == partition && len(val.Values) > 0 {
+			listVal = val.Values[0]
+		}
+	}
+	if listVal == nil {
+		return nil, errors.Newf(
+			"could not find list tuple for partition %s on table %s",
+			partition,
+			tbName,
+		)
+	}
+
+	_, keyPrefix, err := rowenc.DecodePartitionTuple(
+		&rowenc.DatumAlloc{},
+		keys.SystemSQLCodec,
+		tableDesc,
+		primaryInd,
+		part,
+		listVal,
+		tree.Datums{},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return keyPrefix, nil
+}
+
+func lookupTable(ec *sql.ExecutorConfig, database, table string) (catalog.TableDescriptor, error) {
+	tbName, err := parser.ParseQualifiedTableName(database + ".public." + table)
+	if err != nil {
+		return nil, err
+	}
+
+	var tableDesc catalog.TableDescriptor
+
+	err = sql.DescsTxn(
+		context.Background(),
+		ec,
+		func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+			_, desc, err := col.GetImmutableTableByName(ctx, txn, tbName, tree.ObjectLookupFlags{
+				DesiredObjectKind: tree.TableObject,
+			})
+			if err != nil {
+				return err
+			}
+			tableDesc = desc
+			return nil
+		})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if tableDesc == nil {
+		return nil, errors.Newf("could not find table %s", table)
+	}
+
+	return tableDesc, nil
 }

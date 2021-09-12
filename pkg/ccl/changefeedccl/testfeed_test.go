@@ -25,7 +25,7 @@ import (
 	"sync"
 
 	"github.com/Shopify/sarama"
-	"github.com/cockroachdb/cockroach-go/crdb"
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -46,7 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx"
+	"github.com/jackc/pgx/v4"
 )
 
 type sinklessFeedFactory struct {
@@ -69,7 +69,7 @@ func (f *sinklessFeedFactory) Feed(create string, args ...interface{}) (cdctest.
 	sink.Path = `d`
 	// Use pgx directly instead of database/sql so we can close the conn
 	// (instead of returning it to the pool).
-	pgxConfig, err := pgx.ParseConnectionString(sink.String())
+	pgxConfig, err := pgx.ParseConfig(sink.String())
 	if err != nil {
 		return nil, err
 	}
@@ -119,12 +119,14 @@ type sinklessFeed struct {
 	seenTrackerMap
 	create  string
 	args    []interface{}
-	connCfg pgx.ConnConfig
+	connCfg *pgx.ConnConfig
 
 	conn           *pgx.Conn
-	rows           *pgx.Rows
+	rows           pgx.Rows
 	latestResolved hlc.Timestamp
 }
+
+var _ cdctest.TestFeed = (*sinklessFeed)(nil)
 
 // Partitions implements the TestFeed interface.
 func (c *sinklessFeed) Partitions() []string { return []string{`sinkless`} }
@@ -162,8 +164,9 @@ func (c *sinklessFeed) Next() (*cdctest.TestFeedMessage, error) {
 
 // Resume implements the TestFeed interface.
 func (c *sinklessFeed) start() error {
+	ctx := context.Background()
 	var err error
-	c.conn, err = pgx.Connect(c.connCfg)
+	c.conn, err = pgx.ConnectConfig(ctx, c.connCfg)
 	if err != nil {
 		return err
 	}
@@ -183,14 +186,14 @@ func (c *sinklessFeed) start() error {
 			create += fmt.Sprintf(` WITH cursor='%s'`, c.latestResolved.AsOfSystemTime())
 		}
 	}
-	c.rows, err = c.conn.Query(create, c.args...)
+	c.rows, err = c.conn.Query(ctx, create, c.args...)
 	return err
 }
 
 // Close implements the TestFeed interface.
 func (c *sinklessFeed) Close() error {
 	c.rows = nil
-	return c.conn.Close()
+	return c.conn.Close(context.Background())
 }
 
 // reportErrorResumer is a job resumer which reports OnFailOrCancel events.
@@ -259,7 +262,7 @@ func (f *jobFeed) jobFailed() {
 		// Already failed/done.
 		return
 	}
-	f.mu.terminalErr = f.fetchTerminalJobErr()
+	f.mu.terminalErr = f.FetchTerminalJobErr()
 	close(f.shutdown)
 }
 
@@ -274,7 +277,13 @@ func (f *jobFeed) JobID() jobspb.JobID {
 	return f.jobID
 }
 
-func (f *jobFeed) waitForStatus(statusPred func(status jobs.Status) bool) error {
+func (f *jobFeed) status() (status string, err error) {
+	err = f.db.QueryRowContext(context.Background(),
+		`SELECT status FROM system.jobs WHERE id = $1`, f.jobID).Scan(&status)
+	return
+}
+
+func (f *jobFeed) WaitForStatus(statusPred func(status jobs.Status) bool) error {
 	if f.jobID == jobspb.InvalidJobID {
 		// Job may not have been started.
 		return nil
@@ -282,8 +291,8 @@ func (f *jobFeed) waitForStatus(statusPred func(status jobs.Status) bool) error 
 	// Wait for the job status predicate to become true.
 	return testutils.SucceedsSoonError(func() error {
 		var status string
-		if err := f.db.QueryRowContext(context.Background(),
-			`SELECT status FROM system.jobs WHERE id = $1`, f.jobID).Scan(&status); err != nil {
+		var err error
+		if status, err = f.status(); err != nil {
 			return err
 		}
 		if statusPred(jobs.Status(status)) {
@@ -300,13 +309,16 @@ func (f *jobFeed) Pause() error {
 	if err != nil {
 		return err
 	}
-	return f.waitForStatus(func(s jobs.Status) bool { return s == jobs.StatusPaused })
+	return f.WaitForStatus(func(s jobs.Status) bool { return s == jobs.StatusPaused })
 }
 
 // Resume implements the TestFeed interface.
 func (f *jobFeed) Resume() error {
 	_, err := f.db.Exec(`RESUME JOB $1`, f.jobID)
-	return err
+	if err != nil {
+		return err
+	}
+	return f.WaitForStatus(func(s jobs.Status) bool { return s == jobs.StatusRunning })
 }
 
 // Details implements FeedJob interface.
@@ -324,8 +336,8 @@ func (f *jobFeed) Details() (*jobspb.ChangefeedDetails, error) {
 	return payload.GetChangefeed(), nil
 }
 
-// fetchTerminalJobErr retrieves the error message from changefeed job.
-func (f *jobFeed) fetchTerminalJobErr() error {
+// FetchTerminalJobErr retrieves the error message from changefeed job.
+func (f *jobFeed) FetchTerminalJobErr() error {
 	var errStr string
 	if err := f.db.QueryRow(
 		`SELECT error FROM [SHOW JOBS] WHERE job_id=$1`, f.jobID,
@@ -337,6 +349,16 @@ func (f *jobFeed) fetchTerminalJobErr() error {
 		return errors.Newf("%s", errStr)
 	}
 	return nil
+}
+
+// FetchRunningStatus retrieves running status from changefeed job.
+func (f *jobFeed) FetchRunningStatus() (runningStatusStr string, err error) {
+	if err = f.db.QueryRow(
+		`SELECT running_status FROM [SHOW JOBS] WHERE job_id=$1`, f.jobID,
+	).Scan(&runningStatusStr); err != nil {
+		return "", err
+	}
+	return runningStatusStr, err
 }
 
 // Close closes job feed.
@@ -428,27 +450,29 @@ type depInjector struct {
 }
 
 // newDepInjector configures specified server with necessary hooks and knobs.
-func newDepInjector(s feedInjectable) *depInjector {
+func newDepInjector(srvs ...feedInjectable) *depInjector {
 	di := &depInjector{
 		startedJobs: make(map[jobspb.JobID]*jobFeed),
 	}
 	di.cond = sync.NewCond(di)
 
-	// Arrange for our wrapped sink to be instantiated.
-	s.DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).WrapSink =
-		func(s Sink, jobID jobspb.JobID) Sink {
-			f := di.getJobFeed(jobID)
-			return f.makeSink(s)
-		}
+	for _, s := range srvs {
+		// Arrange for our wrapped sink to be instantiated.
+		s.DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).WrapSink =
+			func(s Sink, jobID jobspb.JobID) Sink {
+				f := di.getJobFeed(jobID)
+				return f.makeSink(s)
+			}
 
-	// Arrange for error reporting resumer to be used.
-	s.JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs =
-		map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-			jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
-				f := di.getJobFeed(raw.(*changefeedResumer).job.ID())
-				return &reportErrorResumer{wrapped: raw, jobFailed: f.jobFailed}
-			},
-		}
+		// Arrange for error reporting resumer to be used.
+		s.JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs =
+			map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+				jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
+					f := di.getJobFeed(raw.(*changefeedResumer).job.ID())
+					return &reportErrorResumer{wrapped: raw, jobFailed: f.jobFailed}
+				},
+			}
+	}
 
 	return di
 }
@@ -598,6 +622,8 @@ type tableFeed struct {
 	sinkDB *gosql.DB // Changefeed emits messages into table in this DB.
 	toSend []*cdctest.TestFeedMessage
 }
+
+var _ cdctest.TestFeed = (*tableFeed)(nil)
 
 // Partitions implements the TestFeed interface.
 func (c *tableFeed) Partitions() []string {
@@ -776,6 +802,8 @@ type cloudFeed struct {
 	resolved string
 	rows     []cloudFeedEntry
 }
+
+var _ cdctest.TestFeed = (*cloudFeed)(nil)
 
 const cloudFeedPartition = ``
 
@@ -1044,6 +1072,24 @@ func makeKafkaFeedFactory(
 	}
 }
 
+// makeKafkaFeedFactoryForCluster returns a TestFeedFactory
+// implementation using the `kafka` uri.
+func makeKafkaFeedFactoryForCluster(
+	c serverutils.TestClusterInterface, db *gosql.DB,
+) cdctest.TestFeedFactory {
+	servers := make([]feedInjectable, c.NumServers())
+	for i := 0; i < c.NumServers(); i++ {
+		servers[i] = c.Server(i)
+	}
+	return &kafkaFeedFactory{
+		enterpriseFeedFactory: enterpriseFeedFactory{
+			s:  c.Server(0),
+			db: db,
+			di: newDepInjector(servers...),
+		},
+	}
+}
+
 func exprAsString(expr tree.Expr) (string, error) {
 	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	semaCtx := tree.MakeSemaContext()
@@ -1095,7 +1141,11 @@ func (k *kafkaFeedFactory) Feed(create string, args ...interface{}) (cdctest.Tes
 	}
 
 	tg := newTeeGroup()
-	feedCh := make(chan *sarama.ProducerMessage)
+	// feedCh must have some buffer to hold the messages.
+	// basically, sarama is fully async, so we have to be async as well; otherwise, tests deadlock.
+	// Fixed sized buffer is probably okay at this point, but we should probably
+	// have  a proper fix.
+	feedCh := make(chan *sarama.ProducerMessage, 1024)
 	wrapSink := func(s Sink) Sink {
 		return &fakeKafkaSink{
 			Sink:   s,
@@ -1312,14 +1362,19 @@ func extractTopicFromJSONValue(wrapped []byte) (topic string, value []byte, _ er
 	return topic, value, nil
 }
 
+type webhookSinkTestfeedPayload struct {
+	Payload []interface{} `json:"payload"`
+	Length  int           `json:"length"`
+}
+
 // extractValueFromJSONMessage extracts the value of the first element of
 // the payload array from an webhook sink JSON message.
 func extractValueFromJSONMessage(message []byte) ([]byte, error) {
-	parsed := make(map[string][]interface{})
+	var parsed webhookSinkTestfeedPayload
 	if err := gojson.Unmarshal(message, &parsed); err != nil {
 		return nil, err
 	}
-	keyParsed := parsed[`payload`]
+	keyParsed := parsed.Payload
 	if len(keyParsed) <= 0 {
 		return nil, fmt.Errorf("payload value in json message contains no elements")
 	}
@@ -1352,7 +1407,7 @@ func (f *webhookFeed) Next() (*cdctest.TestFeedMessage, error) {
 					if err != nil {
 						return nil, err
 					}
-					if m.Key, m.Value, err = extractKeyFromJSONValue([]byte(wrappedValue)); err != nil {
+					if m.Key, m.Value, err = extractKeyFromJSONValue(wrappedValue); err != nil {
 						return nil, err
 					}
 					if m.Topic, m.Value, err = extractTopicFromJSONValue(m.Value); err != nil {

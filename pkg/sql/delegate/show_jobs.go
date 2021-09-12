@@ -12,6 +12,7 @@ package delegate
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -39,13 +40,26 @@ SHOW JOBS SELECT id FROM system.jobs WHERE created_by_type='%s' and created_by_i
 	var typePredicate, whereClause, orderbyClause string
 	if n.Jobs == nil {
 		// Display all [only automatic] jobs without selecting specific jobs.
-		if n.Automatic {
-			typePredicate = fmt.Sprintf("job_type = '%s'", jobspb.TypeAutoCreateStats)
-		} else {
-			typePredicate = fmt.Sprintf(
-				"(job_type IS NULL OR job_type != '%s')", jobspb.TypeAutoCreateStats,
-			)
+		{
+			// Build the typePredicate.
+			var predicate strings.Builder
+			if n.Automatic {
+				predicate.WriteString("job_type IN (")
+			} else {
+				predicate.WriteString("job_type IS NULL OR job_type NOT IN (")
+			}
+			for i, jobType := range jobspb.AutomaticJobTypes {
+				if i != 0 {
+					predicate.WriteString(", ")
+				}
+				predicate.WriteByte('\'')
+				predicate.WriteString(jobType.String())
+				predicate.WriteByte('\'')
+			}
+			predicate.WriteByte(')')
+			typePredicate = predicate.String()
 		}
+
 		// The query intends to present:
 		// - first all the running jobs sorted in order of start time,
 		// - then all completed jobs sorted in order of completion time.
@@ -62,12 +76,21 @@ SHOW JOBS SELECT id FROM system.jobs WHERE created_by_type='%s' and created_by_i
 	sqlStmt := fmt.Sprintf("%s %s %s", selectClause, whereClause, orderbyClause)
 	if n.Block {
 		sqlStmt = fmt.Sprintf(
-			`SELECT * FROM [%s]
-			 WHERE
-			    IF(finished IS NULL,
-			      IF(pg_sleep(1), crdb_internal.force_retry('24h'), 0),
-			      0
-			    ) = 0`, sqlStmt)
+			`
+    WITH jobs AS (SELECT * FROM [%s]),
+       sleep_and_restart_if_unfinished AS (
+              SELECT IF(pg_sleep(1), crdb_internal.force_retry('24h'), 1)
+                     = 0 AS timed_out
+                FROM (SELECT job_id FROM jobs WHERE finished IS NULL LIMIT 1)
+             ),
+       fail_if_slept_too_long AS (
+                SELECT crdb_internal.force_error('55000', 'timed out waiting for jobs')
+                  FROM sleep_and_restart_if_unfinished
+                 WHERE timed_out
+              )
+SELECT *
+  FROM jobs
+ WHERE NOT EXISTS(SELECT * FROM fail_if_slept_too_long)`, sqlStmt)
 	}
 	return parse(sqlStmt)
 }

@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
@@ -409,18 +408,6 @@ func (db *DB) CPut(ctx context.Context, key, value interface{}, expValue []byte)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// CtxForCPutInline is a gate to make sure the caller is aware that CPutInline
-// is only available with clusterversion.CPutInline, and must check this before
-// using the method.
-func CtxForCPutInline(ctx context.Context) context.Context {
-	// TODO(erikgrinaker): This code and all of its uses can be removed when the
-	// version below is removed:
-	_ = clusterversion.CPutInline
-	return context.WithValue(ctx, canUseCPutInline{}, canUseCPutInline{})
-}
-
-type canUseCPutInline struct{}
-
 // CPutInline conditionally sets the value for a key if the existing value is
 // equal to expValue, but does not maintain multi-version values. To
 // conditionally set a value only if the key doesn't currently exist, pass an
@@ -436,17 +423,9 @@ type canUseCPutInline struct{}
 // An empty expValue means that the key is expected to not exist. If not empty,
 // expValue needs to correspond to a Value.TagAndDataBytes() - i.e. a key's
 // value without the checksum (as the checksum includes the key too).
-//
-// Callers should check the version gate clusterversion.CPutInline to make sure
-// this is supported, and must wrap the context using CtxForCPutInline(ctx) to
-// enable the call.
 func (db *DB) CPutInline(ctx context.Context, key, value interface{}, expValue []byte) error {
-	if ctx.Value(canUseCPutInline{}) == nil {
-		return errors.New("CPutInline is new in 21.1, you must check the CPutInline cluster version " +
-			"and use CtxForCPutInline to enable it")
-	}
 	b := &Batch{}
-	b.cPutInline(key, value, expValue)
+	b.CPutInline(key, value, expValue)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -703,6 +682,73 @@ func (db *DB) Migrate(ctx context.Context, begin, end interface{}, version roach
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+// QueryResolvedTimestamp requests the resolved timestamp of the key span it is
+// issued over. See documentation on QueryResolvedTimestampRequest for details
+// about the meaning and semantics of this resolved timestamp.
+//
+// If nearest is false, the request will always be routed to the leaseholder(s) of
+// the range(s) that it targets. If nearest is true, the request will be routed to
+// the nearest replica(s) of the range(s) that it targets.
+func (db *DB) QueryResolvedTimestamp(
+	ctx context.Context, begin, end interface{}, nearest bool,
+) (hlc.Timestamp, error) {
+	b := &Batch{}
+	b.queryResolvedTimestamp(begin, end)
+	if nearest {
+		b.Header.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
+	}
+	if err := getOneErr(db.Run(ctx, b), b); err != nil {
+		return hlc.Timestamp{}, err
+	}
+	r := b.RawResponse().Responses[0].GetQueryResolvedTimestamp()
+	return r.ResolvedTS, nil
+}
+
+// ScanInterleavedIntents is a command that returns all interleaved intents
+// encountered in the request span. A resume span is returned if the entirety
+// of the request span was not scanned.
+func (db *DB) ScanInterleavedIntents(
+	ctx context.Context, begin, end interface{}, ts hlc.Timestamp,
+) ([]roachpb.Intent, *roachpb.Span, error) {
+	b := &Batch{Header: roachpb.Header{Timestamp: ts}}
+	b.scanInterleavedIntents(begin, end)
+	result, err := getOneResult(db.Run(ctx, b), b)
+	if err != nil {
+		return nil, nil, err
+	}
+	responses := b.response.Responses
+	if len(responses) == 0 {
+		return nil, nil, errors.Errorf("unexpected empty response for ScanInterleavedIntents")
+	}
+	resp, ok := responses[0].GetInner().(*roachpb.ScanInterleavedIntentsResponse)
+	if !ok {
+		return nil, nil, errors.Errorf("unexpected response of type %T for ScanInterleavedIntents",
+			responses[0].GetInner())
+	}
+	return resp.Intents, result.ResumeSpan, nil
+}
+
+// Barrier is a command that waits for conflicting operations such as earlier
+// writes on the specified key range to finish.
+func (db *DB) Barrier(ctx context.Context, begin, end interface{}) (hlc.Timestamp, error) {
+	b := &Batch{}
+	b.barrier(begin, end)
+	err := getOneErr(db.Run(ctx, b), b)
+	if err != nil {
+		return hlc.Timestamp{}, err
+	}
+	responses := b.response.Responses
+	if len(responses) == 0 {
+		return hlc.Timestamp{}, errors.Errorf("unexpected empty response for Barrier")
+	}
+	resp, ok := responses[0].GetInner().(*roachpb.BarrierResponse)
+	if !ok {
+		return hlc.Timestamp{}, errors.Errorf("unexpected response of type %T for Barrier",
+			responses[0].GetInner())
+	}
+	return resp.Timestamp, nil
+}
+
 // sendAndFill is a helper which sends the given batch and fills its results,
 // returning the appropriate error which is either from the first failing call,
 // or an "internal" error.
@@ -736,7 +782,7 @@ func sendAndFill(ctx context.Context, send SenderFunc, b *Batch) error {
 // operation. The order of the results matches the order the operations were
 // added to the batch.
 func (db *DB) Run(ctx context.Context, b *Batch) error {
-	if err := b.prepare(); err != nil {
+	if err := b.validate(); err != nil {
 		return err
 	}
 	return sendAndFill(ctx, db.send, b)

@@ -419,13 +419,15 @@ func (ir *IntentResolver) runAsyncTask(
 	if ir.testingKnobs.DisableAsyncIntentResolution {
 		return errors.New("intents not processed as async resolution is disabled")
 	}
-	err := ir.stopper.RunLimitedAsyncTask(
+	err := ir.stopper.RunAsyncTaskEx(
 		// If we've successfully launched a background task, dissociate
 		// this work from our caller's context and timeout.
 		ir.ambientCtx.AnnotateCtx(context.Background()),
-		"storage.IntentResolver: processing intents",
-		ir.sem,
-		false, /* wait */
+		stop.TaskOpts{
+			TaskName:   "storage.IntentResolver: processing intents",
+			Sem:        ir.sem,
+			WaitForSem: false,
+		},
 		taskFn,
 	)
 	if err != nil {
@@ -619,20 +621,22 @@ func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 	now hlc.Timestamp,
 	onComplete func(pushed, succeeded bool),
 ) error {
-	return ir.stopper.RunLimitedAsyncTask(
+	return ir.stopper.RunAsyncTaskEx(
 		// If we've successfully launched a background task,
 		// dissociate this work from our caller's context and
 		// timeout.
 		ir.ambientCtx.AnnotateCtx(context.Background()),
-		"processing txn intents",
-		ir.sem,
-		// We really do not want to hang up the GC queue on this kind of
-		// processing, so it's better to just skip txns which we can't
-		// pass to the async processor (wait=false). Their intents will
-		// get cleaned up on demand, and we'll eventually get back to
-		// them. Not much harm in having old txn records lying around in
-		// the meantime.
-		false, /* wait */
+		stop.TaskOpts{
+			TaskName: "processing txn intents",
+			Sem:      ir.sem,
+			// We really do not want to hang up the GC queue on this kind of
+			// processing, so it's better to just skip txns which we can't
+			// pass to the async processor (wait=false). Their intents will
+			// get cleaned up on demand, and we'll eventually get back to
+			// them. Not much harm in having old txn records lying around in
+			// the meantime.
+			WaitForSem: false,
+		},
 		func(ctx context.Context) {
 			var pushed, succeeded bool
 			defer func() {
@@ -837,10 +841,15 @@ func (ir *IntentResolver) ResolveIntent(
 // ResolveIntents synchronously resolves intents according to opts.
 func (ir *IntentResolver) ResolveIntents(
 	ctx context.Context, intents []roachpb.LockUpdate, opts ResolveOptions,
-) *roachpb.Error {
+) (pErr *roachpb.Error) {
 	if len(intents) == 0 {
 		return nil
 	}
+	defer func() {
+		if pErr != nil {
+			ir.Metrics.IntentResolutionFailed.Inc(int64(len(intents)))
+		}
+	}()
 	// Avoid doing any work on behalf of expired contexts. See
 	// https://github.com/cockroachdb/cockroach/issues/15997.
 	if err := ctx.Err(); err != nil {

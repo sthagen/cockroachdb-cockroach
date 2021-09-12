@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -24,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -35,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -265,6 +269,11 @@ type DistSender struct {
 	// testing.
 	clusterID *base.ClusterIDContainer
 
+	// batchInterceptor is set for tenants; when set, information about all
+	// BatchRequests and BatchResponses are passed through this interceptor, which
+	// can potentially throttle requests.
+	kvInterceptor multitenant.TenantSideKVInterceptor
+
 	// disableFirstRangeUpdates disables updates of the first range via
 	// gossip. Used by tests which want finer control of the contents of the
 	// range cache.
@@ -278,8 +287,17 @@ type DistSender struct {
 	latencyFunc LatencyFunc
 
 	// If set, the DistSender will try the replicas in the order they appear in
-	// the descriptor, instead of trying to reorder them by latency.
+	// the descriptor, instead of trying to reorder them by latency. The knob
+	// only applies to requests sent with the LEASEHOLDER routing policy.
 	dontReorderReplicas bool
+	// dontConsiderConnHealth, if set, makes the GRPCTransport not take into
+	// consideration the connection health when deciding the ordering for
+	// replicas. When not set, replicas on nodes with unhealthy connections are
+	// deprioritized.
+	dontConsiderConnHealth bool
+
+	// Currently executing range feeds.
+	activeRangeFeeds sync.Map // // map[*rangeFeedRegistry]nil
 }
 
 var _ kv.Sender = &DistSender{}
@@ -317,6 +335,11 @@ type DistSenderConfig struct {
 	FirstRangeProvider FirstRangeProvider
 	RangeDescriptorDB  rangecache.RangeDescriptorDB
 
+	// KVInterceptor is set for tenants; when set, information about all
+	// BatchRequests and BatchResponses are passed through this interceptor, which
+	// can potentially throttle requests.
+	KVInterceptor multitenant.TenantSideKVInterceptor
+
 	TestingKnobs ClientTestingKnobs
 }
 
@@ -326,10 +349,11 @@ type DistSenderConfig struct {
 // defaults will be used.
 func NewDistSender(cfg DistSenderConfig) *DistSender {
 	ds := &DistSender{
-		st:        cfg.Settings,
-		clock:     cfg.Clock,
-		nodeDescs: cfg.NodeDescs,
-		metrics:   makeDistSenderMetrics(),
+		st:            cfg.Settings,
+		clock:         cfg.Clock,
+		nodeDescs:     cfg.NodeDescs,
+		metrics:       makeDistSenderMetrics(),
+		kvInterceptor: cfg.KVInterceptor,
 	}
 	if ds.st == nil {
 		ds.st = cluster.MakeTestingClusterSettings()
@@ -364,6 +388,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 		ds.transportFactory = GRPCTransportFactory
 	}
 	ds.dontReorderReplicas = cfg.TestingKnobs.DontReorderReplicas
+	ds.dontConsiderConnHealth = cfg.TestingKnobs.DontConsiderConnHealth
 	ds.rpcRetryOptions = base.DefaultRetryOptions()
 	if cfg.RPCRetryOptions != nil {
 		ds.rpcRetryOptions = *cfg.RPCRetryOptions
@@ -704,6 +729,14 @@ func (ds *DistSender) Send(
 	ctx, sp := tracing.EnsureChildSpan(ctx, ds.AmbientContext.Tracer, "dist sender send")
 	defer sp.Finish()
 
+	var reqInfo tenantcostmodel.RequestInfo
+	if ds.kvInterceptor != nil {
+		reqInfo = tenantcostmodel.MakeRequestInfo(&ba)
+		if err := ds.kvInterceptor.OnRequestWait(ctx, reqInfo); err != nil {
+			return nil, roachpb.NewError(err)
+		}
+	}
+
 	splitET := false
 	var require1PC bool
 	lastReq := ba.Requests[len(ba.Requests)-1].GetInner()
@@ -795,6 +828,11 @@ func (ds *DistSender) Send(
 		lastHeader := rplChunks[len(rplChunks)-1].BatchResponse_Header
 		lastHeader.CollectedSpans = reply.CollectedSpans
 		reply.BatchResponse_Header = lastHeader
+
+		if ds.kvInterceptor != nil {
+			respInfo := tenantcostmodel.MakeResponseInfo(reply)
+			ds.kvInterceptor.OnResponse(ctx, reqInfo, respInfo)
+		}
 	}
 
 	return reply, nil
@@ -1358,9 +1396,14 @@ func (ds *DistSender) sendPartialBatchAsync(
 	batchIdx int,
 	responseCh chan response,
 ) bool {
-	if err := ds.rpcContext.Stopper.RunLimitedAsyncTask(
-		ctx, "kv.DistSender: sending partial batch",
-		ds.asyncSenderSem, false, /* wait */
+	if err := ds.rpcContext.Stopper.RunAsyncTaskEx(
+		ctx,
+		stop.TaskOpts{
+			TaskName:   "kv.DistSender: sending partial batch",
+			ChildSpan:  true,
+			Sem:        ds.asyncSenderSem,
+			WaitForSem: false,
+		},
 		func(ctx context.Context) {
 			ds.metrics.AsyncSentCount.Inc(1)
 			responseCh <- ds.sendPartialBatch(
@@ -1761,43 +1804,67 @@ func (ds *DistSender) sendToReplicas(
 ) (*roachpb.BatchResponse, error) {
 	desc := routing.Desc()
 	ba.RangeID = desc.RangeID
-	leaseholder := routing.Leaseholder()
-	canFollowerRead := CanSendToFollower(ds.clusterID.Get(), ds.st, ds.clock, routing.ClosedTimestampPolicy(), ba)
-	var replicas ReplicaSlice
-	var err error
-	if canFollowerRead {
-		replicas, err = NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder, AllExtantReplicas)
-	} else {
-		replicas, err = NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder, OnlyPotentialLeaseholders)
+
+	// If this request can be sent to a follower to perform a consistent follower
+	// read under the closed timestamp, promote its routing policy to NEAREST.
+	if ba.RoutingPolicy == roachpb.RoutingPolicy_LEASEHOLDER &&
+		CanSendToFollower(ds.clusterID.Get(), ds.st, ds.clock, routing.ClosedTimestampPolicy(), ba) {
+		ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
 	}
+
+	// Filter the replicas to only those that are relevant to the routing policy.
+	var replicaFilter ReplicaSliceFilter
+	switch ba.RoutingPolicy {
+	case roachpb.RoutingPolicy_LEASEHOLDER:
+		replicaFilter = OnlyPotentialLeaseholders
+	case roachpb.RoutingPolicy_NEAREST:
+		replicaFilter = AllExtantReplicas
+	default:
+		log.Fatalf(ctx, "unknown routing policy: %s", ba.RoutingPolicy)
+	}
+	leaseholder := routing.Leaseholder()
+	replicas, err := NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder, replicaFilter)
 	if err != nil {
 		return nil, err
 	}
 
-	// Rearrange the replicas so that they're ordered in expectation of
-	// request latency. Leaseholder considerations come below.
-	if !ds.dontReorderReplicas {
-		replicas.OptimizeReplicaOrder(ds.getNodeDescriptor(), ds.latencyFunc)
-	}
+	// Rearrange the replicas so that they're ordered according to the routing
+	// policy.
+	var leaseholderFirst bool
+	switch ba.RoutingPolicy {
+	case roachpb.RoutingPolicy_LEASEHOLDER:
+		// First order by latency, then move the leaseholder to the front of the
+		// list, if it is known.
+		if !ds.dontReorderReplicas {
+			replicas.OptimizeReplicaOrder(ds.getNodeDescriptor(), ds.latencyFunc)
+		}
 
-	// Try the leaseholder first, if the request wants it.
-	sendToLeaseholder := (leaseholder != nil) && !canFollowerRead && ba.RequiresLeaseHolder()
-	if sendToLeaseholder {
-		idx := replicas.Find(leaseholder.ReplicaID)
+		idx := -1
+		if leaseholder != nil {
+			idx = replicas.Find(leaseholder.ReplicaID)
+		}
 		if idx != -1 {
 			replicas.MoveToFront(idx)
+			leaseholderFirst = true
 		} else {
-			// The leaseholder node's info must have been missing from gossip when
-			// we created replicas.
-			log.Eventf(ctx, "leaseholder %s missing from replicas", leaseholder)
+			// The leaseholder node's info must have been missing from gossip when we
+			// created replicas.
+			log.VEvent(ctx, 2, "routing to nearest replica; leaseholder not known")
 		}
-	} else {
+
+	case roachpb.RoutingPolicy_NEAREST:
+		// Order by latency.
 		log.VEvent(ctx, 2, "routing to nearest replica; leaseholder not required")
+		replicas.OptimizeReplicaOrder(ds.getNodeDescriptor(), ds.latencyFunc)
+
+	default:
+		log.Fatalf(ctx, "unknown routing policy: %s", ba.RoutingPolicy)
 	}
 
 	opts := SendOptions{
-		class:   rpc.ConnectionClassForKey(desc.RSpan().Key),
-		metrics: &ds.metrics,
+		class:                  rpc.ConnectionClassForKey(desc.RSpan().Key),
+		metrics:                &ds.metrics,
+		dontConsiderConnHealth: ds.dontConsiderConnHealth,
 	}
 	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas)
 	if err != nil {
@@ -2028,7 +2095,7 @@ func (ds *DistSender) sendToReplicas(
 					// have a sufficient closed timestamp. In response, we should
 					// immediately redirect to the leaseholder, without a backoff
 					// period.
-					intentionallySentToFollower := first && !sendToLeaseholder
+					intentionallySentToFollower := first && !leaseholderFirst
 					// See if we want to backoff a little before the next attempt. If
 					// the lease info we got is stale and we were intending to send to
 					// the leaseholder, we backoff because it might be the case that

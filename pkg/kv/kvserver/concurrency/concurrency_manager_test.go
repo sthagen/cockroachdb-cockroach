@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -54,7 +53,7 @@ import (
 // The input files use the following DSL:
 //
 // new-txn      name=<txn-name> ts=<int>[,<int>] epoch=<int> [uncertainty-limit=<int>[,<int>]]
-// new-request  name=<req-name> txn=<txn-name>|none ts=<int>[,<int>] [priority] [inconsistent] [wait-policy=<policy>]
+// new-request  name=<req-name> txn=<txn-name>|none ts=<int>[,<int>] [priority] [inconsistent] [wait-policy=<policy>] [lock-timeout] [max-lock-wait-queue-length=<int>]
 //   <proto-name> [<field-name>=<field-value>...] (hint: see scanSingleRequest)
 // sequence     req=<req-name> [eval-kind=<pess|opt|pess-after-opt]
 // finish       req=<req-name>
@@ -155,6 +154,20 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 
 				waitPolicy := scanWaitPolicy(t, d, false /* required */)
 
+				var lockTimeout time.Duration
+				if d.HasArg("lock-timeout") {
+					// A lock timeout of 1ns will be considered immediately expired
+					// without a delay by the lockTableWaiter, ensuring that the lock
+					// timeout logic deterministically fires.
+					// See (*lockTableWaiterImpl).timeUntilDeadline.
+					lockTimeout = 1 * time.Nanosecond
+				}
+
+				var maxLockWaitQueueLength int
+				if d.HasArg("max-lock-wait-queue-length") {
+					d.ScanArgs(t, "max-lock-wait-queue-length", &maxLockWaitQueueLength)
+				}
+
 				// Each roachpb.Request is provided on an indented line.
 				reqs, reqUnions := scanRequests(t, d, c)
 				latchSpans, lockSpans := c.collectSpans(t, txn, ts, reqs)
@@ -163,11 +176,13 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					Txn:       txn,
 					Timestamp: ts,
 					// TODO(nvanbenschoten): test Priority
-					ReadConsistency: readConsistency,
-					WaitPolicy:      waitPolicy,
-					Requests:        reqUnions,
-					LatchSpans:      latchSpans,
-					LockSpans:       lockSpans,
+					ReadConsistency:        readConsistency,
+					WaitPolicy:             waitPolicy,
+					LockTimeout:            lockTimeout,
+					MaxLockWaitQueueLength: maxLockWaitQueueLength,
+					Requests:               reqUnions,
+					LatchSpans:             latchSpans,
+					LockSpans:              lockSpans,
 				}
 				return ""
 
@@ -469,15 +484,15 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				return c.waitAndCollect(t, mon)
 
 			case "debug-latch-manager":
-				global, local := m.LatchMetrics()
+				metrics := m.LatchMetrics()
 				output := []string{
-					fmt.Sprintf("write count: %d", global.WriteCount+local.WriteCount),
-					fmt.Sprintf(" read count: %d", global.ReadCount+local.ReadCount),
+					fmt.Sprintf("write count: %d", metrics.WriteCount),
+					fmt.Sprintf(" read count: %d", metrics.ReadCount),
 				}
 				return strings.Join(output, "\n")
 
 			case "debug-lock-table":
-				return m.LockTableDebug()
+				return m.TestingLockTableString()
 
 			case "debug-disable-txn-pushes":
 				c.disableTxnPushes()
@@ -604,8 +619,7 @@ func (c *cluster) makeConfig() concurrency.Config {
 		OnContentionEvent: func(ev *roachpb.ContentionEvent) {
 			ev.Duration = 1234 * time.Millisecond // for determinism
 		},
-		TxnWaitMetrics:                     txnwait.NewMetrics(time.Minute),
-		ConflictingIntentCleanupRejections: metric.NewCounter(metric.Metadata{}),
+		TxnWaitMetrics: txnwait.NewMetrics(time.Minute),
 	}
 }
 
@@ -867,9 +881,8 @@ func (c *cluster) reset() error {
 		return errors.Errorf("unfinished guard for request: %s", name)
 	}
 	// There should be no outstanding latches.
-	global, local := c.m.LatchMetrics()
-	if global.ReadCount > 0 || global.WriteCount > 0 ||
-		local.ReadCount > 0 || local.WriteCount > 0 {
+	metrics := c.m.LatchMetrics()
+	if metrics.ReadCount+metrics.WriteCount > 0 {
 		return errors.Errorf("outstanding latches")
 	}
 	// Clear the lock table by transferring the lease away and reacquiring it.

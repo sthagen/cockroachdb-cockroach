@@ -962,7 +962,7 @@ func NewLimitedMonitorNoFlowCtx(
 	flowCtx := &FlowCtx{
 		Cfg: config,
 		EvalCtx: &tree.EvalContext{
-			SessionData: sd,
+			SessionDataStack: sessiondata.NewStack(sd),
 		},
 	}
 	return NewLimitedMonitor(ctx, parent, flowCtx, name)
@@ -979,4 +979,17 @@ type LocalProcessor interface {
 	// LocalProcessors need inputs, but this needs to be called if a
 	// LocalProcessor expects to get its data from another RowSource.
 	SetInput(ctx context.Context, input RowSource) error
+}
+
+// HasParallelProcessors returns whether flow contains multiple processors in
+// the same stage.
+func HasParallelProcessors(flow *execinfrapb.FlowSpec) bool {
+	var seen util.FastIntSet
+	for _, p := range flow.Processors {
+		if seen.Contains(int(p.StageID)) {
+			return true
+		}
+		seen.Add(int(p.StageID))
+	}
+	return false
 }

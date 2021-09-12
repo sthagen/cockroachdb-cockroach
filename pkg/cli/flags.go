@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -57,8 +57,6 @@ var startBackground bool
 // initPreFlagsDefaults initializes the values of the global variables
 // defined above.
 func initPreFlagsDefaults() {
-	initPreFlagsCertDefaults()
-
 	serverListenPort = base.DefaultPort
 	serverSocketDir = ""
 	serverAdvertiseAddr = ""
@@ -184,7 +182,7 @@ func (a addrSetter) Type() string { return "<addr/host>[:<port>]" }
 
 // Set implements the pflag.Value interface.
 func (a addrSetter) Set(v string) error {
-	addr, port, err := netutil.SplitHostPort(v, *a.port)
+	addr, port, err := addr.SplitHostPort(v, *a.port)
 	if err != nil {
 		return err
 	}
@@ -545,57 +543,38 @@ func init() {
 	for _, cmd := range certCmds {
 		f := cmd.Flags()
 		// All certs commands need the certificate directory.
-		stringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir)
-		// All certs commands get the certificate principal map.
-		stringSliceFlag(f, &cliCtx.certPrincipalMap, cliflags.CertPrincipalMap)
-	}
+		stringFlag(f, &certCtx.certsDir, cliflags.CertsDir)
 
-	for _, cmd := range []*cobra.Command{
-		createCACertCmd,
-		createClientCACertCmd,
-		mtCreateTenantClientCACertCmd,
-	} {
-		f := cmd.Flags()
-		// CA certificates have a longer expiration time.
-		durationFlag(f, &caCertificateLifetime, cliflags.CertificateLifetime)
-		// The CA key can be re-used if it exists.
-		boolFlag(f, &allowCAKeyReuse, cliflags.AllowCAKeyReuse)
-	}
+		// All certs command want to map CNs to SQL principals.
+		stringSliceFlag(f, &certCtx.certPrincipalMap, cliflags.CertPrincipalMap)
 
-	for _, cmd := range []*cobra.Command{
-		createNodeCertCmd,
-		createClientCertCmd,
-		mtCreateTenantClientCertCmd,
-	} {
-		f := cmd.Flags()
-		durationFlag(f, &certificateLifetime, cliflags.CertificateLifetime)
-	}
+		if cmd == listCertsCmd {
+			// The 'list' subcommand does not write to files and thus does
+			// not need the arguments below.
+			continue
+		}
 
-	// The remaining flags are shared between all cert-generating functions.
-	for _, cmd := range []*cobra.Command{
-		createCACertCmd,
-		createClientCACertCmd,
-		createNodeCertCmd,
-		createClientCertCmd,
-		mtCreateTenantClientCACertCmd,
-		mtCreateTenantClientCertCmd,
-	} {
-		f := cmd.Flags()
-		stringFlag(f, &baseCfg.SSLCAKey, cliflags.CAKey)
-		intFlag(f, &keySize, cliflags.KeySize)
-		boolFlag(f, &overwriteFiles, cliflags.OverwriteFiles)
-	}
-	// PKCS8 key format is only available for the client cert command.
-	boolFlag(createClientCertCmd.Flags(), &generatePKCS8Key, cliflags.GeneratePKCS8Key)
+		stringFlag(f, &certCtx.caKey, cliflags.CAKey)
+		intFlag(f, &certCtx.keySize, cliflags.KeySize)
+		boolFlag(f, &certCtx.overwriteFiles, cliflags.OverwriteFiles)
 
-	// The certs dir is given to all clientCmds below, but the following are not clientCmds.
-	for _, cmd := range []*cobra.Command{
-		mtCreateTenantClientCACertCmd,
-		mtCreateTenantClientCertCmd,
-	} {
-		f := cmd.Flags()
-		// Certificate flags.
-		stringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir)
+		if strings.HasSuffix(cmd.Name(), "-ca") {
+			// CA-only commands.
+
+			// CA certificates have a longer expiration time.
+			durationFlag(f, &certCtx.caCertificateLifetime, cliflags.CertificateLifetime)
+			// The CA key can be re-used if it exists.
+			boolFlag(f, &certCtx.allowCAKeyReuse, cliflags.AllowCAKeyReuse)
+		} else {
+			// Non-CA commands.
+
+			durationFlag(f, &certCtx.certificateLifetime, cliflags.CertificateLifetime)
+		}
+
+		// PKCS8 key format is only available for the client cert command.
+		if cmd == createClientCertCmd {
+			boolFlag(f, &certCtx.generatePKCS8Key, cliflags.GeneratePKCS8Key)
+		}
 	}
 
 	clientCmds := []*cobra.Command{
@@ -732,6 +711,7 @@ func init() {
 		doctorExamineClusterCmd,
 		doctorExamineFallbackClusterCmd,
 		doctorRecreateClusterCmd,
+		statementBundleRecreateCmd,
 		lsNodesCmd,
 		statusNodeCmd,
 	}
@@ -748,26 +728,37 @@ func init() {
 		// commands, ensure the isSQLCommand() predicate is updated accordingly.
 		boolFlag(f, &sqlConnCtx.Echo, cliflags.EchoSQL)
 
-		if cmd != demoCmd {
-			varFlag(f, urlParser{cmd, &cliCtx, false /* strictSSL */}, cliflags.URL)
-			stringFlag(f, &cliCtx.sqlConnUser, cliflags.User)
-
-			// Even though SQL commands take their connection parameters via
-			// --url / --user (see above), the urlParser{} struct internally
-			// needs the ClientHost and ClientPort flags to be defined -
-			// even if they are invisible - due to the way initialization from
-			// env vars is implemented.
-			//
-			// TODO(knz): if/when env var option initialization is deferred
-			// to parse time, this can be removed.
-			varFlag(f, addrSetter{&cliCtx.clientConnHost, &cliCtx.clientConnPort}, cliflags.ClientHost)
-			_ = f.MarkHidden(cliflags.ClientHost.Name)
-			stringFlag(f, &cliCtx.clientConnPort, cliflags.ClientPort)
-			_ = f.MarkHidden(cliflags.ClientPort.Name)
+		varFlag(f, urlParser{cmd, &cliCtx, false /* strictSSL */}, cliflags.URL)
+		stringFlag(f, &cliCtx.sqlConnUser, cliflags.User)
+		if cmd == demoCmd {
+			// The 'demo' command does not really support --url or --user.
+			// However, we create the pflag instance so that the user
+			// can use \connect inside the shell session.
+			_ = f.MarkHidden(cliflags.URL.Name)
+			_ = f.MarkHidden(cliflags.User.Name)
 		}
 
-		if cmd == sqlShellCmd {
+		// Even though SQL commands take their connection parameters via
+		// --url / --user (see above), the urlParser{} struct internally
+		// needs the ClientHost and ClientPort flags to be defined -
+		// even if they are invisible - due to the way initialization from
+		// env vars is implemented.
+		//
+		// TODO(knz): if/when env var option initialization is deferred
+		// to parse time, this can be removed.
+		varFlag(f, addrSetter{&cliCtx.clientConnHost, &cliCtx.clientConnPort}, cliflags.ClientHost)
+		_ = f.MarkHidden(cliflags.ClientHost.Name)
+		stringFlag(f, &cliCtx.clientConnPort, cliflags.ClientPort)
+		_ = f.MarkHidden(cliflags.ClientPort.Name)
+
+		if cmd == sqlShellCmd || cmd == demoCmd {
 			stringFlag(f, &cliCtx.sqlConnDBName, cliflags.Database)
+			if cmd == demoCmd {
+				// As above, 'demo' does not really support --database.
+				// However, we create the pflag instance so that
+				// the user can use \connect inside the shell.
+				_ = f.MarkHidden(cliflags.Database.Name)
+			}
 		}
 	}
 
@@ -793,6 +784,7 @@ func init() {
 			sqlShellCmd,
 			genSettingsListCmd,
 			demoCmd,
+			statementBundleRecreateCmd,
 			debugListFilesCmd,
 			debugJobTraceFromClusterCmd,
 		},
@@ -844,6 +836,7 @@ func init() {
 
 		intFlag(f, &demoCtx.SQLPort, cliflags.DemoSQLPort)
 		intFlag(f, &demoCtx.HTTPPort, cliflags.DemoHTTPPort)
+		stringFlag(f, &demoCtx.ListeningURLFile, cliflags.ListeningURLFile)
 	}
 
 	// statement-diag command.
@@ -953,12 +946,11 @@ func init() {
 		// NB: this also gets PreRun treatment via extraServerFlagInit to populate BaseCfg.SQLAddr.
 		varFlag(f, addrSetter{&serverSQLAddr, &serverSQLPort}, cliflags.ListenSQLAddr)
 		varFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
+		varFlag(f, addrSetter{&serverAdvertiseAddr, &serverAdvertisePort}, cliflags.AdvertiseAddr)
 
 		stringFlag(f, &startCtx.geoLibsDir, cliflags.GeoLibsDir)
 
 		stringSliceFlag(f, &serverCfg.SQLConfig.TenantKVAddrs, cliflags.KVAddrs)
-
-		durationFlag(f, &serverCfg.IdleExitAfter, cliflags.IdleExitAfter)
 
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableHTTP, cliflags.ExternalIODisableHTTP)
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableOutbound, cliflags.ExternalIODisabled)
@@ -978,10 +970,11 @@ func init() {
 		stringFlag(f, &proxyContext.DirectoryAddr, cliflags.DirectoryAddr)
 		boolFlag(f, &proxyContext.SkipVerify, cliflags.SkipVerify)
 		boolFlag(f, &proxyContext.Insecure, cliflags.InsecureBackend)
-		durationFlag(f, &proxyContext.RatelimitBaseDelay, cliflags.RatelimitBaseDelay)
 		durationFlag(f, &proxyContext.ValidateAccessInterval, cliflags.ValidateAccessInterval)
 		durationFlag(f, &proxyContext.PollConfigInterval, cliflags.PollConfigInterval)
 		durationFlag(f, &proxyContext.DrainTimeout, cliflags.DrainTimeout)
+		intFlag(f, &proxyContext.ThrottlePolicy.Capacity, cliflags.TokenBucketPeriod)
+		durationFlag(f, &proxyContext.ThrottlePolicy.FillPeriod, cliflags.TokenBucketSize)
 	}
 	// Multi-tenancy test directory command flags.
 	{
@@ -1177,8 +1170,8 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 	serverCfg.HTTPAddr = net.JoinHostPort(serverHTTPAddr, serverHTTPPort)
 
 	// Fill the advertise port into the locality advertise addresses.
-	for i, addr := range localityAdvertiseHosts {
-		host, port, err := netutil.SplitHostPort(addr.Address.AddressField, serverAdvertisePort)
+	for i, a := range localityAdvertiseHosts {
+		host, port, err := addr.SplitHostPort(a.Address.AddressField, serverAdvertisePort)
 		if err != nil {
 			return err
 		}
@@ -1190,7 +1183,14 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 }
 
 func extraClientFlagInit() error {
-	if err := security.SetCertPrincipalMap(cliCtx.certPrincipalMap); err != nil {
+	// A command can be either a 'cert' command or an actual client command.
+	// TODO(knz): Clean this up to not use a global variable for the
+	// principal map.
+	principalMap := certCtx.certPrincipalMap
+	if principalMap == nil {
+		principalMap = cliCtx.certPrincipalMap
+	}
+	if err := security.SetCertPrincipalMap(principalMap); err != nil {
 		return err
 	}
 	serverCfg.Addr = net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort)

@@ -156,3 +156,31 @@ func (*preferSSDOption) apply(spec *ClusterSpec) {
 func PreferSSD() Option {
 	return &preferSSDOption{}
 }
+
+type setFileSystem struct {
+	fs fileSystemType
+}
+
+func (s *setFileSystem) apply(spec *ClusterSpec) {
+	spec.FileSystem = s.fs
+}
+
+// SetFileSystem is an Option which can be used to set
+// the underlying file system to be used.
+func SetFileSystem(fs fileSystemType) Option {
+	return &setFileSystem{fs}
+}
+
+type randomlyUseZfs struct{}
+
+func (r *randomlyUseZfs) apply(spec *ClusterSpec) {
+	spec.RandomlyUseZfs = true
+}
+
+// RandomlyUseZfs is an Option which randomly picks
+// the file system to be used, and sets it to zfs,
+// about 20% of the time.
+// Zfs is only picked if the cloud is gce.
+func RandomlyUseZfs() Option {
+	return &randomlyUseZfs{}
+}

@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -24,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -131,7 +130,11 @@ func incrementSequenceHelper(
 		return 0, err
 	}
 
-	p.ExtendedEvalContext().SessionMutator.RecordLatestSequenceVal(uint32(descriptor.GetID()), val)
+	p.ExtendedEvalContext().SessionMutatorIterator.applyForEachMutator(
+		func(m sessionDataMutator) {
+			m.RecordLatestSequenceVal(uint32(descriptor.GetID()), val)
+		},
+	)
 
 	return val, nil
 }
@@ -638,13 +641,10 @@ func maybeAddSequenceDependencies(
 	expr tree.TypedExpr,
 	backrefs map[descpb.ID]*tabledesc.Mutable,
 ) ([]*tabledesc.Mutable, error) {
-	seqIdentifiers, err := sequence.GetUsedSequences(expr)
+	seqIdentifiers, err := seqexpr.GetUsedSequences(expr)
 	if err != nil {
 		return nil, err
 	}
-	version := st.Version.ActiveVersionOrEmpty(ctx)
-	byID := version != (clusterversion.ClusterVersion{}) &&
-		version.IsActive(clusterversion.SequencesRegclass)
 
 	var seqDescs []*tabledesc.Mutable
 	seqNameToID := make(map[string]int64)
@@ -673,7 +673,7 @@ func maybeAddSequenceDependencies(
 			seqDesc.DependedOnBy = append(seqDesc.DependedOnBy, descpb.TableDescriptor_Reference{
 				ID:        tableDesc.ID,
 				ColumnIDs: []descpb.ColumnID{col.ID},
-				ByID:      byID,
+				ByID:      true,
 			})
 		} else {
 			seqDesc.DependedOnBy[refIdx].ColumnIDs = append(seqDesc.DependedOnBy[refIdx].ColumnIDs, col.ID)
@@ -683,8 +683,8 @@ func maybeAddSequenceDependencies(
 
 	// If sequences are present in the expr (and the cluster is the right version),
 	// walk the expr tree and replace any sequences names with their IDs.
-	if len(seqIdentifiers) > 0 && byID {
-		newExpr, err := sequence.ReplaceSequenceNamesWithIDs(expr, seqNameToID)
+	if len(seqIdentifiers) > 0 {
+		newExpr, err := seqexpr.ReplaceSequenceNamesWithIDs(expr, seqNameToID)
 		if err != nil {
 			return nil, err
 		}
@@ -698,7 +698,7 @@ func maybeAddSequenceDependencies(
 // GetSequenceDescFromIdentifier resolves the sequence descriptor for the given
 // sequence identifier.
 func GetSequenceDescFromIdentifier(
-	ctx context.Context, sc resolver.SchemaResolver, seqIdentifier sequence.SeqIdentifier,
+	ctx context.Context, sc resolver.SchemaResolver, seqIdentifier seqexpr.SeqIdentifier,
 ) (*tabledesc.Mutable, error) {
 	var tn tree.TableName
 	if seqIdentifier.IsByID() {

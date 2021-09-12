@@ -25,7 +25,7 @@ import (
 var activerecordResultRegex = regexp.MustCompile(`^(?P<test>[^\s]+#[^\s]+) = (?P<timing>\d+\.\d+ s) = (?P<result>.)$`)
 var railsReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)\.?(?P<subpoint>\d*)$`)
 var supportedRailsVersion = "6.1"
-var activerecordAdapterVersion = "v6.1.2"
+var activerecordAdapterVersion = "v6.1.3"
 
 // This test runs activerecord's full test suite against a single cockroach node.
 
@@ -46,14 +46,12 @@ func registerActiveRecord(r registry.Registry) {
 		}
 		c.Start(ctx, c.All())
 
-		version, err := fetchCockroachVersion(ctx, c, node[0], nil)
+		version, err := fetchCockroachVersion(ctx, c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := alterZoneConfigAndClusterSettings(
-			ctx, version, c, node[0], nil,
-		); err != nil {
+		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0]); err != nil {
 			t.Fatal(err)
 		}
 

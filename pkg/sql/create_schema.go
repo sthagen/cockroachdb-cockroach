@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -31,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 type createSchemaNode struct {
@@ -97,13 +95,6 @@ func CreateUserDefinedSchemaDescriptor(
 		return nil, nil, err
 	}
 
-	// Ensure that the cluster version is high enough to create the schema.
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.UserDefinedSchemas) {
-		return nil, nil, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-			`creating schemas requires all nodes to be upgraded to %s`,
-			clusterversion.ByKey(clusterversion.UserDefinedSchemas))
-	}
-
 	// Create the ID.
 	var id descpb.ID
 	if allocateID {
@@ -113,12 +104,9 @@ func CreateUserDefinedSchemaDescriptor(
 		}
 	}
 
-	// Inherit the parent privileges and filter out those which are not valid for
-	// schemas.
-	privs := protoutil.Clone(db.GetPrivileges()).(*descpb.PrivilegeDescriptor)
-	for i := range privs.Users {
-		privs.Users[i].Privileges &= privilege.SchemaPrivileges.ToBitField()
-	}
+	privs := db.GetDefaultPrivilegeDescriptor().CreatePrivilegesFromDefaultPrivileges(
+		db.GetID(), user, tree.Schemas, db.GetPrivileges(),
+	)
 
 	if !n.AuthRole.Undefined() {
 		exists, err := RoleExists(ctx, execCfg, txn, n.AuthRole)

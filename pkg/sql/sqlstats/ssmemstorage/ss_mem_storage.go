@@ -18,11 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
@@ -60,7 +60,8 @@ const invalidStmtFingerprintID = 0
 
 // Container holds per-application statement and transaction statistics.
 type Container struct {
-	st *cluster.Settings
+	st      *cluster.Settings
+	appName string
 
 	// uniqueStmtFingerprintLimit is the limit on number of unique statement
 	// fingerprints we can store in memory.
@@ -108,14 +109,19 @@ func New(
 	uniqueStmtFingerprintCount *int64,
 	uniqueTxnFingerprintCount *int64,
 	mon *mon.BytesMonitor,
+	appName string,
 ) *Container {
 	s := &Container{
 		st:                         st,
+		appName:                    appName,
 		uniqueStmtFingerprintLimit: uniqueStmtFingerprintLimit,
 		uniqueTxnFingerprintLimit:  uniqueTxnFingerprintLimit,
 	}
 
-	s.mu.acc = mon.MakeBoundAccount()
+	if mon != nil {
+		s.mu.acc = mon.MakeBoundAccount()
+	}
+
 	s.mu.stmts = make(map[stmtKey]*stmtStats)
 	s.mu.txns = make(map[roachpb.TransactionFingerprintID]*txnStats)
 
@@ -123,110 +129,6 @@ func New(
 	s.atomic.uniqueTxnFingerprintCount = uniqueTxnFingerprintCount
 
 	return s
-}
-
-// IterateStatementStats iterates through the stored statement statistics
-// stored in this Container.
-func (s *Container) IterateStatementStats(
-	appName string, orderedKey bool, visitor sqlstats.StatementVisitor,
-) error {
-	var stmtKeys stmtList
-	s.mu.Lock()
-	for k := range s.mu.stmts {
-		stmtKeys = append(stmtKeys, k)
-	}
-	s.mu.Unlock()
-	if orderedKey {
-		sort.Sort(stmtKeys)
-	}
-
-	for _, stmtKey := range stmtKeys {
-		stmtFingerprintID := constructStatementFingerprintIDFromStmtKey(stmtKey)
-		statementStats, _, _ :=
-			s.getStatsForStmtWithKey(stmtKey, invalidStmtFingerprintID, false /* createIfNonexistent */)
-
-		// If the key is not found (and we expected to find it), the table must
-		// have been cleared between now and the time we read all the keys. In
-		// that case we simply skip this key as there are no metrics to report.
-		if statementStats == nil {
-			continue
-		}
-
-		statementStats.mu.Lock()
-		data := statementStats.mu.data
-		distSQLUsed := statementStats.mu.distSQLUsed
-		vectorized := statementStats.mu.vectorized
-		fullScan := statementStats.mu.fullScan
-		database := statementStats.mu.database
-		statementStats.mu.Unlock()
-
-		collectedStats := roachpb.CollectedStatementStatistics{
-			Key: roachpb.StatementStatisticsKey{
-				Query:       stmtKey.anonymizedStmt,
-				DistSQL:     distSQLUsed,
-				Opt:         true,
-				Vec:         vectorized,
-				ImplicitTxn: stmtKey.implicitTxn,
-				FullScan:    fullScan,
-				Failed:      stmtKey.failed,
-				App:         appName,
-				Database:    database,
-			},
-			ID:    stmtFingerprintID,
-			Stats: data,
-		}
-
-		err := visitor(&collectedStats)
-		if err != nil {
-			return fmt.Errorf("sql stats iteration abort: %s", err)
-		}
-	}
-	return nil
-}
-
-// IterateTransactionStats iterates through the stored transaction statistics
-// stored in this Container.
-func (s *Container) IterateTransactionStats(
-	appName string, orderedKey bool, visitor sqlstats.TransactionVisitor,
-) error {
-	// Retrieve the transaction keys and optionally sort them.
-	var txnKeys txnList
-	s.mu.Lock()
-	for k := range s.mu.txns {
-		txnKeys = append(txnKeys, k)
-	}
-	s.mu.Unlock()
-	if orderedKey {
-		sort.Sort(txnKeys)
-	}
-
-	// Now retrieve the per-stmt stats proper.
-	for _, txnKey := range txnKeys {
-		// We don't want to create the key if it doesn't exist, so it's okay to
-		// pass nil for the statementFingerprintIDs, as they are only set when a key is
-		// constructed.
-		txnStats, _, _ := s.getStatsForTxnWithKey(txnKey, nil /* stmtFingerprintIDs */, false /* createIfNonexistent */)
-		// If the key is not found (and we expected to find it), the table must
-		// have been cleared between now and the time we read all the keys. In
-		// that case we simply skip this key as there are no metrics to report.
-		if txnStats == nil {
-			continue
-		}
-
-		txnStats.mu.Lock()
-		collectedStats := roachpb.CollectedTransactionStatistics{
-			StatementFingerprintIDs: txnStats.statementFingerprintIDs,
-			App:                     appName,
-			Stats:                   txnStats.mu.data,
-		}
-		txnStats.mu.Unlock()
-
-		err := visitor(txnKey, &collectedStats)
-		if err != nil {
-			return fmt.Errorf("sql stats iteration abort: %s", err)
-		}
-	}
-	return nil
 }
 
 // IterateAggregatedTransactionStats iterates through the stored aggregated
@@ -293,6 +195,130 @@ func (s *Container) GetTransactionStats(
 	}
 
 	return collectedStats, nil
+}
+
+// StmtStatsIterator returns an instance of StmtStatsIterator.
+func (s *Container) StmtStatsIterator(options *sqlstats.IteratorOptions) *StmtStatsIterator {
+	return NewStmtStatsIterator(s, options)
+}
+
+// TxnStatsIterator returns an instance of TxnStatsIterator.
+func (s *Container) TxnStatsIterator(options *sqlstats.IteratorOptions) *TxnStatsIterator {
+	return NewTxnStatsIterator(s, options)
+}
+
+// NewTempContainerFromExistingStmtStats creates a new Container by ingesting a slice
+// of serverpb.StatementsResponse_CollectedStatementStatistics sorted by
+// Key.KeyData.App field.
+// It consumes the first chunk of the slice where
+// all entries in the chunk contains the identical appName. The remaining
+// slice is returned as the result.
+// It returns a nil slice once all entries in statistics are consumed.
+func NewTempContainerFromExistingStmtStats(
+	statistics []serverpb.StatementsResponse_CollectedStatementStatistics,
+) (
+	container *Container,
+	remaining []serverpb.StatementsResponse_CollectedStatementStatistics,
+	err error,
+) {
+	if len(statistics) == 0 {
+		return nil, statistics, nil
+	}
+
+	appName := statistics[0].Key.KeyData.App
+
+	container = New(
+		nil, /* st */
+		nil, /* uniqueStmtFingerprintLimit */
+		nil, /* uniqueTxnFingerprintLimit */
+		nil, /* uniqueStmtFingerprintCount */
+		nil, /* uniqueTxnFingerprintCount */
+		nil, /* mon */
+		appName,
+	)
+
+	for i := range statistics {
+		if currentAppName := statistics[i].Key.KeyData.App; currentAppName != appName {
+			return container, statistics[i:], nil
+		}
+		key := stmtKey{
+			anonymizedStmt: statistics[i].Key.KeyData.Query,
+			failed:         statistics[i].Key.KeyData.Failed,
+			implicitTxn:    statistics[i].Key.KeyData.ImplicitTxn,
+			database:       statistics[i].Key.KeyData.Database,
+		}
+		stmtStats, _, throttled :=
+			container.getStatsForStmtWithKeyLocked(key, statistics[i].ID, true /* createIfNonexistent */)
+		if throttled {
+			return nil /* container */, nil /* remaining */, ErrFingerprintLimitReached
+		}
+
+		// This handles all the statistics fields.
+		stmtStats.mu.data.Add(&statistics[i].Stats)
+
+		// Setting all metadata fields.
+		if stmtStats.mu.data.SensitiveInfo.LastErr == "" && key.failed {
+			stmtStats.mu.data.SensitiveInfo.LastErr = statistics[i].Stats.SensitiveInfo.LastErr
+		}
+
+		if stmtStats.mu.data.SensitiveInfo.MostRecentPlanTimestamp.Before(statistics[i].Stats.SensitiveInfo.MostRecentPlanTimestamp) {
+			stmtStats.mu.data.SensitiveInfo.MostRecentPlanDescription = statistics[i].Stats.SensitiveInfo.MostRecentPlanDescription
+			stmtStats.mu.data.SensitiveInfo.MostRecentPlanTimestamp = statistics[i].Stats.SensitiveInfo.MostRecentPlanTimestamp
+		}
+
+		stmtStats.mu.vectorized = statistics[i].Key.KeyData.Vec
+		stmtStats.mu.distSQLUsed = statistics[i].Key.KeyData.DistSQL
+		stmtStats.mu.fullScan = statistics[i].Key.KeyData.FullScan
+		stmtStats.mu.database = statistics[i].Key.KeyData.Database
+	}
+
+	return container, nil /* remaining */, nil /* err */
+}
+
+// NewTempContainerFromExistingTxnStats creates a new Container by ingesting a slice
+// of CollectedTransactionStatistics sorted by .StatsData.App field.
+// It consumes the first chunk of the slice where all entries in the chunk
+// contains the identical appName. The remaining slice is returned as the result.
+// It returns a nil slice once all entries in statistics are consumed.
+func NewTempContainerFromExistingTxnStats(
+	statistics []serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics,
+) (
+	container *Container,
+	remaining []serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics,
+	err error,
+) {
+	if len(statistics) == 0 {
+		return nil, statistics, nil
+	}
+
+	appName := statistics[0].StatsData.App
+
+	container = New(
+		nil, /* st */
+		nil, /* uniqueStmtFingerprintLimit */
+		nil, /* uniqueTxnFingerprintLimit */
+		nil, /* uniqueStmtFingerprintCount */
+		nil, /* uniqueTxnFingerprintCount */
+		nil, /* mon */
+		appName,
+	)
+
+	for i := range statistics {
+		if currentAppName := statistics[i].StatsData.App; currentAppName != appName {
+			return container, statistics[i:], nil
+		}
+		txnStats, _, throttled :=
+			container.getStatsForTxnWithKeyLocked(
+				statistics[i].StatsData.TransactionFingerprintID,
+				statistics[i].StatsData.StatementFingerprintIDs,
+				true /* createIfNonexistent */)
+		if throttled {
+			return nil /* container */, nil /* remaining */, ErrFingerprintLimitReached
+		}
+		txnStats.mu.data.Add(&statistics[i].StatsData.Stats)
+	}
+
+	return container, nil /* remaining */, nil /* err */
 }
 
 type txnStats struct {
@@ -406,28 +432,39 @@ func (s *Container) getStatsForStmt(
 	return stats, key, stats.ID, false /* created */, false /* throttled */
 }
 
+// getStatsForStmtWithKey returns an instance of stmtStats.
+// If createIfNonexistent flag is set to true, then a new entry is created in
+// the Container if it does not yet exist.
 func (s *Container) getStatsForStmtWithKey(
 	key stmtKey, stmtFingerprintID roachpb.StmtFingerprintID, createIfNonexistent bool,
 ) (stats *stmtStats, created, throttled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.getStatsForStmtWithKeyLocked(key, stmtFingerprintID, createIfNonexistent)
+}
 
+func (s *Container) getStatsForStmtWithKeyLocked(
+	key stmtKey, stmtFingerprintID roachpb.StmtFingerprintID, createIfNonexistent bool,
+) (stats *stmtStats, created, throttled bool) {
 	// Retrieve the per-statement statistic object, and create it if it
 	// doesn't exist yet.
 	stats, ok := s.mu.stmts[key]
 	if !ok && createIfNonexistent {
-		// We check if we have reached the limit of unique fingerprints we can
-		// store.
-		limit := s.uniqueStmtFingerprintLimit.Get(&s.st.SV)
-		incrementedFingerprintCount :=
-			atomic.AddInt64(s.atomic.uniqueStmtFingerprintCount, int64(1) /* delts */)
+		// If the uniqueStmtFingerprintCount is nil, then we don't check for
+		// fingerprint limit.
+		if s.atomic.uniqueStmtFingerprintCount != nil {
+			// We check if we have reached the limit of unique fingerprints we can
+			// store.
+			limit := s.uniqueStmtFingerprintLimit.Get(&s.st.SV)
+			incrementedFingerprintCount :=
+				atomic.AddInt64(s.atomic.uniqueStmtFingerprintCount, int64(1) /* delts */)
 
-		// Abort if we have exceeded limit of unique statement fingerprints.
-		if incrementedFingerprintCount > limit {
-			atomic.AddInt64(s.atomic.uniqueStmtFingerprintCount, -int64(1) /* delts */)
-			return stats, false /* created */, true /* throttled */
+			// Abort if we have exceeded limit of unique statement fingerprints.
+			if incrementedFingerprintCount > limit {
+				atomic.AddInt64(s.atomic.uniqueStmtFingerprintCount, -int64(1) /* delts */)
+				return stats, false /* created */, true /* throttled */
+			}
 		}
-
 		stats = &stmtStats{}
 		stats.ID = stmtFingerprintID
 		s.mu.stmts[key] = stats
@@ -443,19 +480,32 @@ func (s *Container) getStatsForTxnWithKey(
 ) (stats *txnStats, created, throttled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	return s.getStatsForTxnWithKeyLocked(key, stmtFingerprintIDs, createIfNonexistent)
+}
+
+func (s *Container) getStatsForTxnWithKeyLocked(
+	key roachpb.TransactionFingerprintID,
+	stmtFingerprintIDs []roachpb.StmtFingerprintID,
+	createIfNonexistent bool,
+) (stats *txnStats, created, throttled bool) {
 	// Retrieve the per-transaction statistic object, and create it if it doesn't
 	// exist yet.
 	stats, ok := s.mu.txns[key]
 	if !ok && createIfNonexistent {
-		limit := s.uniqueTxnFingerprintLimit.Get(&s.st.SV)
-		incrementedFingerprintCount :=
-			atomic.AddInt64(s.atomic.uniqueTxnFingerprintCount, int64(1) /* delts */)
+		// If the uniqueTxnFingerprintCount is nil, then we don't check for
+		// fingerprint limit.
+		if s.atomic.uniqueTxnFingerprintCount != nil {
+			limit := s.uniqueTxnFingerprintLimit.Get(&s.st.SV)
+			incrementedFingerprintCount :=
+				atomic.AddInt64(s.atomic.uniqueTxnFingerprintCount, int64(1) /* delts */)
 
-		// If we have exceeded limit of fingerprint count, decrement the counter
-		// and abort.
-		if incrementedFingerprintCount > limit {
-			atomic.AddInt64(s.atomic.uniqueTxnFingerprintCount, -int64(1) /* delts */)
-			return nil /* stats */, false /* created */, true /* throttled */
+			// If we have exceeded limit of fingerprint count, decrement the counter
+			// and abort.
+			if incrementedFingerprintCount > limit {
+				atomic.AddInt64(s.atomic.uniqueTxnFingerprintCount, -int64(1) /* delts */)
+				return nil /* stats */, false /* created */, true /* throttled */
+			}
 		}
 		stats = &txnStats{}
 		stats.statementFingerprintIDs = stmtFingerprintIDs

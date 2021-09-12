@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -31,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
@@ -122,6 +122,12 @@ func MakeTestingSimpleTableDescriptor(
 	return MakeSimpleTableDescriptor(ctx, semaCtx, st, create, db, sc, tableID, fks, walltime)
 }
 
+func makeSemaCtxWithoutTypeResolver(semaCtx *tree.SemaContext) *tree.SemaContext {
+	semaCtxCopy := *semaCtx
+	semaCtxCopy.TypeResolver = nil
+	return &semaCtxCopy
+}
+
 // MakeSimpleTableDescriptor creates a tabledesc.Mutable from a CreateTable
 // parse node without the full machinery. Many parts of the syntax are
 // unsupported (see the implementation and TestMakeSimpleTableDescriptorErrors
@@ -157,9 +163,16 @@ func MakeSimpleTableDescriptor(
 		switch def := create.Defs[i].(type) {
 		case *tree.CheckConstraintTableDef,
 			*tree.FamilyTableDef,
-			*tree.IndexTableDef,
 			*tree.UniqueConstraintTableDef:
 			// ignore
+		case *tree.IndexTableDef:
+			for i := range def.Columns {
+				if def.Columns[i].Expr != nil {
+					return nil, unimplemented.NewWithIssueDetail(56002, "import.expression-index",
+						"to import into a table with expression indexes, use IMPORT INTO")
+				}
+			}
+
 		case *tree.ColumnTableDef:
 			if def.IsComputed() && def.IsVirtual() {
 				return nil, unimplemented.NewWithIssueDetail(56002, "import.computed",
@@ -192,8 +205,10 @@ func MakeSimpleTableDescriptor(
 	evalCtx := tree.EvalContext{
 		Context:            ctx,
 		Sequence:           &importSequenceOperators{},
-		SessionData:        &sessiondata.SessionData{},
+		Regions:            &importRegionOperator{},
+		SessionDataStack:   sessiondata.NewStack(&sessiondata.SessionData{}),
 		ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
+		Settings:           st,
 	}
 	affected := make(map[descpb.ID]*tabledesc.Mutable)
 
@@ -212,7 +227,7 @@ func MakeSimpleTableDescriptor(
 		affected,
 		semaCtx,
 		&evalCtx,
-		&sessiondata.SessionData{}, /* sessionData */
+		evalCtx.SessionData(), /* sessionData */
 		tree.PersistencePermanent,
 		// We need to bypass the LOCALITY on non multi-region check here because
 		// we cannot access the database region config at import level.
@@ -244,32 +259,51 @@ func fixDescriptorFKState(tableDesc *tabledesc.Mutable) error {
 
 var (
 	errSequenceOperators = errors.New("sequence operations unsupported")
+	errRegionOperator    = errors.New("region operations unsupported")
 	errSchemaResolver    = errors.New("schema resolver unsupported")
 )
 
-// Implements the tree.SequenceOperators interface.
-type importSequenceOperators struct {
+// Implements the tree.RegionOperator interface.
+type importRegionOperator struct{}
+
+// CurrentDatabaseRegionConfig is part of the tree.EvalDatabase interface.
+func (so *importRegionOperator) CurrentDatabaseRegionConfig(
+	_ context.Context,
+) (tree.DatabaseRegionConfig, error) {
+	return nil, errors.WithStack(errRegionOperator)
 }
+
+// ValidateAllMultiRegionZoneConfigsInCurrentDatabase is part of the tree.EvalDatabase interface.
+func (so *importRegionOperator) ValidateAllMultiRegionZoneConfigsInCurrentDatabase(
+	_ context.Context,
+) error {
+	return errors.WithStack(errRegionOperator)
+}
+
+// ResetMultiRegionZoneConfigsForTable is part of the tree.EvalDatabase
+// interface.
+func (so *importRegionOperator) ResetMultiRegionZoneConfigsForTable(
+	_ context.Context, _ int64,
+) error {
+	return errors.WithStack(errRegionOperator)
+}
+
+// ResetMultiRegionZoneConfigsForDatabase is part of the tree.EvalDatabase
+// interface.
+func (so *importRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
+	_ context.Context, _ int64,
+) error {
+	return errors.WithStack(errRegionOperator)
+}
+
+// Implements the tree.SequenceOperators interface.
+type importSequenceOperators struct{}
 
 // GetSerialSequenceNameFromColumn is part of the tree.SequenceOperators interface.
 func (so *importSequenceOperators) GetSerialSequenceNameFromColumn(
 	ctx context.Context, tn *tree.TableName, columnName tree.Name,
 ) (*tree.TableName, error) {
 	return nil, errors.WithStack(errSequenceOperators)
-}
-
-// CurrentDatabaseRegionConfig is part of the tree.EvalDatabase interface.
-func (so *importSequenceOperators) CurrentDatabaseRegionConfig(
-	_ context.Context,
-) (tree.DatabaseRegionConfig, error) {
-	return nil, errors.WithStack(errSequenceOperators)
-}
-
-// ValidateAllMultiRegionZoneConfigsInCurrentDatabase is part of the tree.EvalDatabase interface.
-func (so *importSequenceOperators) ValidateAllMultiRegionZoneConfigsInCurrentDatabase(
-	_ context.Context,
-) error {
-	return errors.WithStack(errSequenceOperators)
 }
 
 // ParseQualifiedTableName implements the tree.EvalDatabase interface.

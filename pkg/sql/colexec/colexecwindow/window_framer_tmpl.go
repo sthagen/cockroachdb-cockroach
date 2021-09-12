@@ -83,6 +83,21 @@ type windowFramer interface {
 	// no such row exists, frameNthIdx returns -1.
 	frameNthIdx(n int) int
 
+	// frameIntervals returns a series of intervals that describes the set of all
+	// rows that are part of the frame for the current row. Note that there are at
+	// most three intervals - this case can occur when EXCLUDE TIES is used.
+	// frameIntervals is used to compute aggregate functions over a window. The
+	// returned intervals cannot be modified.
+	frameIntervals() []windowInterval
+
+	// slidingWindowIntervals returns a pair of interval sets that describes the
+	// rows that should be added to the current aggregation, and those which
+	// should be removed from the current aggregation. It is used to implement the
+	// sliding window optimization for aggregate window functions. toAdd specifies
+	// the rows that should be accumulated in the current aggregation, and
+	// toRemove specifies those which should be removed.
+	slidingWindowIntervals() (toAdd, toRemove []windowInterval)
+
 	// close should always be called upon closing of the parent operator. It
 	// releases all references to enable garbage collection.
 	close()
@@ -182,6 +197,16 @@ type windowFramerBase struct {
 	datumAlloc *rowenc.DatumAlloc
 
 	exclusion execinfrapb.WindowerSpec_Frame_Exclusion
+
+	// intervals is a small (at most length 3) slice that is used during
+	// aggregation computation.
+	intervals       []windowInterval
+	intervalsAreSet bool
+
+	// prevIntervals, toAdd, and toRemove are used to calculate the intervals
+	// for calculating aggregate window functions using the sliding window
+	// optimization.
+	prevIntervals, toAdd, toRemove []windowInterval
 }
 
 // frameFirstIdx returns the index of the first row in the window frame for
@@ -220,6 +245,23 @@ func (b *windowFramerBase) frameNthIdx(n int) (idx int) {
 		return -1
 	}
 	return idx
+}
+
+// frameIntervals returns a series of intervals that describes the set of all
+// rows that are part of the frame for the current row. Note that there are at
+// most three intervals - this case can occur when EXCLUDE TIES is used.
+// frameIntervals is used to compute aggregate functions over a window.
+func (b *windowFramerBase) frameIntervals() []windowInterval {
+	if b.intervalsAreSet {
+		return b.intervals
+	}
+	b.intervalsAreSet = true
+	b.intervals = b.intervals[:0]
+	if b.startIdx >= b.endIdx {
+		return b.intervals
+	}
+	b.intervals = append(b.intervals, windowInterval{start: b.startIdx, end: b.endIdx})
+	return b.intervals
 }
 
 // getColsToStore appends to the given slice of column indices whatever columns
@@ -261,6 +303,10 @@ func (b *windowFramerBase) startPartition(
 	b.storedCols = storedCols
 	b.startIdx = 0
 	b.endIdx = 0
+	b.intervals = b.intervals[:0]
+	b.prevIntervals = b.prevIntervals[:0]
+	b.toAdd = b.toAdd[:0]
+	b.toRemove = b.toRemove[:0]
 }
 
 // incrementPeerGroup increments the given index by 'groups' peer groups,
@@ -276,8 +322,8 @@ func (b *windowFramerBase) incrementPeerGroup(ctx context.Context, index, groups
 		return b.partitionSize
 	}
 	// We have to iterate to the beginning of the next peer group.
+	index++
 	for {
-		index++
 		if index >= b.partitionSize {
 			return b.partitionSize
 		}
@@ -473,6 +519,122 @@ func (b *windowFramerBase) excludeTies() bool {
 	return b.exclusion == execinfrapb.WindowerSpec_Frame_EXCLUDE_TIES
 }
 
+// getSlidingWindowIntervals is a helper function used to calculate the sets of
+// rows that are a part of the current window frame, but not the previous one,
+// and rows that were a part of the previous window frame, but not the current
+// one. getSlidingWindowIntervals expects the intervals stored in currIntervals
+// and prevIntervals to be non-overlapping and increasing, and guarantees the
+// same invariants for the output intervals.
+func getSlidingWindowIntervals(
+	currIntervals, prevIntervals, toAdd, toRemove []windowInterval,
+) ([]windowInterval, []windowInterval) {
+	toAdd, toRemove = toAdd[:0], toRemove[:0]
+	var prevIdx, currIdx int
+	var prev, curr windowInterval
+	setPrev, setCurr := true, true
+	for {
+		// We need to find the set difference currIntervals \ prevIntervals (toAdd)
+		// and the set difference prevIntervals \ currIntervals (toRemove). To do
+		// this, take advantage of the fact that both sets of intervals are in
+		// ascending order, similar to merging sorted lists. Maintain indices into
+		// each list, and iterate whichever index has the 'smaller' interval
+		// (e.g. whichever ends first). The portions of the intervals that overlap
+		// are ignored, while those that don't are added to one of the 'toAdd' and
+		// 'toRemove' sets.
+		if prevIdx >= len(prevIntervals) {
+			// None of the remaining intervals in the current frame were part of the
+			// previous frame.
+			if !setCurr {
+				// The remaining interval stored in curr still hasn't been handled.
+				toAdd = append(toAdd, curr)
+				currIdx++
+			}
+			if currIdx < len(currIntervals) {
+				toAdd = append(toAdd, currIntervals[currIdx:]...)
+			}
+			break
+		}
+		if currIdx >= len(currIntervals) {
+			// None of the remaining intervals in the previous frame are part of the
+			// current frame.
+			if !setPrev {
+				// The remaining interval stored in prev still hasn't been handled.
+				toRemove = append(toRemove, prev)
+				prevIdx++
+			}
+			if prevIdx < len(prevIntervals) {
+				toRemove = append(toRemove, prevIntervals[prevIdx:]...)
+			}
+			break
+		}
+		if setPrev {
+			prev = prevIntervals[prevIdx]
+			setPrev = false
+		}
+		if setCurr {
+			curr = currIntervals[currIdx]
+			setCurr = false
+		}
+		if prev == curr {
+			// This interval has not changed from the previous frame.
+			prevIdx++
+			currIdx++
+			setPrev, setCurr = true, true
+			continue
+		}
+		if prev.start >= curr.end {
+			// The intervals do not overlap, and the curr interval did not exist in
+			// the previous window frame.
+			toAdd = append(toAdd, curr)
+			currIdx++
+			setCurr = true
+			continue
+		}
+		if curr.start >= prev.end {
+			// The intervals do not overlap, and the prev interval existed in the
+			// previous window frame, but not the current one.
+			toRemove = append(toRemove, prev)
+			prevIdx++
+			setPrev = true
+			continue
+		}
+		// The intervals overlap but are not equal.
+		if curr.start < prev.start {
+			// curr starts before prev. Add the prefix of curr to 'toAdd'. Advance the
+			// start of curr to the start of prev to reflect that the prefix has
+			// already been processed.
+			toAdd = append(toAdd, windowInterval{start: curr.start, end: prev.start})
+			curr.start = prev.start
+		} else if prev.start < curr.start {
+			// prev starts before curr. Add the prefix of prev to 'toRemove'. Advance
+			// the start of prev to the start of curr to reflect that the prefix has
+			// already been processed.
+			toRemove = append(toRemove, windowInterval{start: prev.start, end: curr.start})
+			prev.start = curr.start
+		}
+		if curr.end > prev.end {
+			// prev ends before curr. Set the start of curr to the end of prev to
+			// indicate that prev has been processed.
+			curr.start = prev.end
+			prevIdx++
+			setPrev = true
+		} else if prev.end > curr.end {
+			// curr ends before prev. Set the start of prev to the end of curr to
+			// indicate that curr has been processed.
+			prev.start = curr.end
+			currIdx++
+			setCurr = true
+		} else {
+			// prev and curr end at the same index. The prefix of whichever one starts
+			// first has already been handled.
+			prevIdx++
+			currIdx++
+			setPrev, setCurr = true, true
+		}
+	}
+	return toAdd, toRemove
+}
+
 // {{range .}}
 // {{range .StartBoundTypes}}
 // {{range .EndBoundTypes}}
@@ -572,7 +734,9 @@ func (f *_OP_STRING) next(ctx context.Context) {
 	// {{if .StartOffsetFollowing}}
 	// {{if .RowsMode}}
 	f.startIdx = f.currentRow + f.startOffset
-	if f.startIdx > f.partitionSize {
+	if f.startIdx > f.partitionSize || f.startOffset >= f.partitionSize {
+		// The second part of the condition protects us from an integer
+		// overflow when offset is very large.
 		f.startIdx = f.partitionSize
 	}
 	// {{else if .GroupsMode}}
@@ -619,7 +783,9 @@ func (f *_OP_STRING) next(ctx context.Context) {
 	// {{if .EndOffsetFollowing}}
 	// {{if .RowsMode}}
 	f.endIdx = f.currentRow + f.endOffset + 1
-	if f.endIdx > f.partitionSize {
+	if f.endIdx > f.partitionSize || f.endOffset >= f.partitionSize {
+		// The second part of the condition protects us from an integer
+		// overflow when offset is very large.
 		f.endIdx = f.partitionSize
 	}
 	// {{else if .GroupsMode}}
@@ -647,6 +813,8 @@ func (f *_OP_STRING) next(ctx context.Context) {
 	// Handle exclusion clause.
 	f.handleExcludeForNext(ctx, currRowIsGroupStart)
 	// {{end}}
+	f.prevIntervals = append(f.prevIntervals[:0], f.intervals...)
+	f.intervalsAreSet = false
 }
 
 func (f *_OP_STRING) close() {
@@ -657,6 +825,17 @@ func (f *_OP_STRING) close() {
 	f.endHandler.close()
 	// {{end}}
 	*f = _OP_STRING{}
+}
+
+// slidingWindowIntervals returns a pair of interval sets that describes the
+// rows that should be added to the current aggregation, and those which
+// should be removed from the current aggregation. It is used to implement the
+// sliding window optimization for aggregate window functions.
+func (f *_OP_STRING) slidingWindowIntervals() (toAdd, toRemove []windowInterval) {
+	f.toAdd, f.toRemove = f.toAdd[:0], f.toRemove[:0]
+	f.frameIntervals()
+	f.toAdd, f.toRemove = getSlidingWindowIntervals(f.intervals, f.prevIntervals, f.toAdd, f.toRemove)
+	return f.toAdd, f.toRemove
 }
 
 // {{if .Exclude}}
@@ -681,6 +860,32 @@ func (f *_OP_STRING) frameLastIdx() (idx int) {
 func (f *_OP_STRING) frameNthIdx(n int) (idx int) {
 	idx = f.windowFramerBase.frameNthIdx(n)
 	return f.handleExcludeForNthIdx(idx)
+}
+
+// frameIntervals returns a series of intervals that describes the set of all
+// rows that are part of the frame for the current row. Note that there are at
+// most three intervals - this case can occur when EXCLUDE TIES is used.
+// frameIntervals is used to compute aggregate functions over a window.
+func (f *_OP_STRING) frameIntervals() []windowInterval {
+	if f.startIdx >= f.endIdx {
+		f.intervals = f.intervals[:0]
+		return f.intervals
+	}
+	if f.excludeStartIdx >= f.endIdx || f.excludeEndIdx <= f.startIdx {
+		// No rows excluded.
+		return f.windowFramerBase.frameIntervals()
+	}
+	f.intervals = f.intervals[:0]
+	if f.excludeStartIdx > f.startIdx {
+		f.intervals = append(f.intervals, windowInterval{start: f.startIdx, end: f.excludeStartIdx})
+	}
+	if f.excludeTies() && f.currentRow >= f.startIdx && f.currentRow < f.endIdx {
+		f.intervals = append(f.intervals, windowInterval{start: f.currentRow, end: f.currentRow + 1})
+	}
+	if f.excludeEndIdx < f.endIdx {
+		f.intervals = append(f.intervals, windowInterval{start: f.excludeEndIdx, end: f.endIdx})
+	}
+	return f.intervals
 }
 
 // {{end}}

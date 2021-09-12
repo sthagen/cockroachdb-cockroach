@@ -109,7 +109,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 
 	ltc.Manual = hlc.NewManualClock(123)
 	ltc.Clock = hlc.NewClock(ltc.Manual.UnixNano, 50*time.Millisecond)
-	cfg := kvserver.TestStoreConfig(ltc.Clock)
+	cfg := kvserver.TestStoreConfigWithRandomizedClusterSeparatedIntentsMigration(ltc.Clock)
 	ambient := log.AmbientContext{Tracer: cfg.Settings.Tracer}
 	nc := &base.NodeIDContainer{}
 	ambient.AddLogTag("n", nc)
@@ -133,13 +133,20 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	clusterID := &cfg.RPCContext.ClusterID
 	server := rpc.NewServer(cfg.RPCContext) // never started
 	ltc.Gossip = gossip.New(ambient, clusterID, nc, cfg.RPCContext, server, ltc.stopper, metric.NewRegistry(), roachpb.Locality{}, zonepb.DefaultZoneConfigRef())
-	ltc.Eng = storage.NewInMem(
+	disableSeparatedIntents := !cfg.Settings.Version.ActiveVersionOrEmpty(
+		context.Background()).IsActive(clusterversion.PostSeparatedIntentsMigration)
+	log.Infof(context.Background(), "engine creation is randomly setting disableSeparatedIntents: %t",
+		disableSeparatedIntents)
+	var err error
+	ltc.Eng, err = storage.Open(
 		ambient.AnnotateCtx(context.Background()),
-		roachpb.Attributes{},
-		0,      /* cacheSize */
-		50<<20, /* storeSize */
-		storage.MakeRandomSettingsForSeparatedIntents(),
-	)
+		storage.InMemory(),
+		storage.CacheSize(0),
+		storage.MaxSize(50<<20 /* 50 MiB */),
+		storage.SetSeparatedIntents(disableSeparatedIntents))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ltc.stopper.AddCloser(ltc.Eng)
 
 	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock)
@@ -207,7 +214,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	var splits []roachpb.RKey
 	if !ltc.DontCreateSystemRanges {
 		schema := bootstrap.MakeMetadataSchema(
-			keys.SystemSQLCodec, cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig,
+			keys.SystemSQLCodec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 		)
 		var tableSplits []roachpb.RKey
 		initialValues, tableSplits = schema.GetInitialValues()

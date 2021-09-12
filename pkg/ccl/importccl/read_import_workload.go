@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -26,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
@@ -217,8 +217,9 @@ func NewWorkloadKVConverter(
 //
 // This worker needs its own EvalContext and DatumAlloc.
 func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalContext) error {
-	conv, err := row.NewDatumRowConverter(ctx, w.tableDesc, nil /* targetColNames */, evalCtx,
-		w.kvCh, nil /* seqChunkProvider */)
+	semaCtx := tree.MakeSemaContext()
+	conv, err := row.NewDatumRowConverter(ctx, &semaCtx, w.tableDesc, nil, /* targetColNames */
+		evalCtx, w.kvCh, nil /* seqChunkProvider */, nil /* metrics */)
 	if err != nil {
 		return err
 	}

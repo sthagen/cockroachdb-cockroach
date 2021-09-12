@@ -173,6 +173,8 @@ type FlowBase struct {
 	//  - outboxes
 	waitGroup sync.WaitGroup
 
+	onFlowCleanup func()
+
 	doneFn func()
 
 	status flowStatus
@@ -218,6 +220,13 @@ func (f *FlowBase) ConcurrentTxnUse() bool {
 	return false
 }
 
+// SetStartedGoroutines sets FlowBase.startedGoroutines to the passed in value.
+// This allows notifying the FlowBase about the concurrent goroutines which are
+// started outside of the FlowBase.StartInternal machinery.
+func (f *FlowBase) SetStartedGoroutines(val bool) {
+	f.startedGoroutines = val
+}
+
 var _ Flow = &FlowBase{}
 
 // NewFlowBase creates a new FlowBase.
@@ -227,6 +236,7 @@ func NewFlowBase(
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
+	onFlowCleanup func(),
 ) *FlowBase {
 	// We are either in a single tenant cluster, or a SQL node in a multi-tenant
 	// cluster, where the SQL node is single tenant. The tenant below is used
@@ -248,6 +258,7 @@ func NewFlowBase(
 		batchSyncFlowConsumer: batchSyncFlowConsumer,
 		localProcessors:       localProcessors,
 		admissionInfo:         admissionInfo,
+		onFlowCleanup:         onFlowCleanup,
 	}
 	base.status = FlowNotStarted
 	return base
@@ -372,7 +383,11 @@ func (f *FlowBase) StartInternal(
 			f.waitGroup.Done()
 		}(i)
 	}
-	f.startedGoroutines = len(f.startables) > 0 || len(processors) > 0 || !f.IsLocal()
+	// Note that we might have already set f.startedGoroutines to true if it is
+	// a vectorized flow with a parallel unordered synchronizer. That component
+	// starts goroutines on its own, so we need to preserve that fact so that we
+	// correctly wait in Wait().
+	f.startedGoroutines = f.startedGoroutines || len(f.startables) > 0 || len(processors) > 0 || !f.IsLocal()
 	return nil
 }
 
@@ -499,6 +514,9 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 	}
 	f.status = FlowFinished
 	f.ctxCancel()
+	if f.onFlowCleanup != nil {
+		f.onFlowCleanup()
+	}
 	if f.doneFn != nil {
 		f.doneFn()
 	}

@@ -30,11 +30,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -53,8 +55,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/redact"
+	"github.com/opentracing/opentracing-go/ext"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -63,8 +65,6 @@ const (
 	// gossipStatusInterval is the interval for logging gossip status.
 	gossipStatusInterval = 1 * time.Minute
 
-	// FirstNodeID is the node ID of the first node in a new cluster.
-	FirstNodeID         = 1
 	graphiteIntervalKey = "external.graphite.interval"
 	maxGraphiteInterval = 15 * time.Minute
 )
@@ -165,7 +165,7 @@ type Node struct {
 	recorder     *status.MetricsRecorder
 	startedAt    int64
 	lastUp       int64
-	initialStart bool // True if this is the first time this node has started.
+	initialStart bool // true if this is the first time this node has started
 	txnMetrics   kvcoord.TxnMetrics
 
 	// Used to signal when additional stores, if any, have been initialized.
@@ -173,7 +173,17 @@ type Node struct {
 
 	perReplicaServer kvserver.Server
 
-	admissionQ *admission.WorkQueue
+	// Admission control queues and coordinators. Both should be nil or non-nil.
+	kvAdmissionQ     *admission.WorkQueue
+	storeGrantCoords *admission.StoreGrantCoordinators
+
+	tenantUsage multitenant.TenantUsageServer
+
+	spanConfigAccessor spanconfig.KVAccessor // powers the span configuration RPCs
+
+	// Turns `Node.writeNodeStatus` into a no-op. This is a hack to enable the
+	// COCKROACH_DEBUG_TS_IMPORT_FILE env var.
+	suppressNodeStatus syncutil.AtomicBool
 }
 
 var _ roachpb.InternalServer = &Node{}
@@ -224,7 +234,6 @@ func bootstrapCluster(
 	// TODO(andrei): It'd be cool if this method wouldn't do anything to engines
 	// other than the first one, and let regular node startup code deal with them.
 	var bootstrapVersion clusterversion.ClusterVersion
-	const firstStoreID = 1
 	for i, eng := range engines {
 		cv, err := kvserver.ReadClusterVersion(ctx, eng)
 		if err != nil {
@@ -242,8 +251,8 @@ func bootstrapCluster(
 
 		sIdent := roachpb.StoreIdent{
 			ClusterID: clusterID,
-			NodeID:    FirstNodeID,
-			StoreID:   roachpb.StoreID(i + firstStoreID),
+			NodeID:    kvserver.FirstNodeID,
+			StoreID:   kvserver.FirstStoreID + roachpb.StoreID(i),
 		}
 
 		// Initialize the engine backing the store with the store ident and cluster
@@ -294,20 +303,28 @@ func NewNode(
 	stores *kvserver.Stores,
 	execCfg *sql.ExecutorConfig,
 	clusterID *base.ClusterIDContainer,
+	kvAdmissionQ *admission.WorkQueue,
+	storeGrantCoords *admission.StoreGrantCoordinators,
+	tenantUsage multitenant.TenantUsageServer,
+	spanConfigAccessor spanconfig.KVAccessor,
 ) *Node {
 	var sqlExec *sql.InternalExecutor
 	if execCfg != nil {
 		sqlExec = execCfg.InternalExecutor
 	}
 	n := &Node{
-		storeCfg:   cfg,
-		stopper:    stopper,
-		recorder:   recorder,
-		metrics:    makeNodeMetrics(reg, cfg.HistogramWindowInterval),
-		stores:     stores,
-		txnMetrics: txnMetrics,
-		sqlExec:    sqlExec,
-		clusterID:  clusterID,
+		storeCfg:           cfg,
+		stopper:            stopper,
+		recorder:           recorder,
+		metrics:            makeNodeMetrics(reg, cfg.HistogramWindowInterval),
+		stores:             stores,
+		txnMetrics:         txnMetrics,
+		sqlExec:            sqlExec,
+		clusterID:          clusterID,
+		kvAdmissionQ:       kvAdmissionQ,
+		storeGrantCoords:   storeGrantCoords,
+		tenantUsage:        tenantUsage,
+		spanConfigAccessor: spanConfigAccessor,
 	}
 	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
 	return n
@@ -377,9 +394,6 @@ func (n *Node) start(
 	if err := n.storeCfg.Gossip.SetNodeDescriptor(&n.Descriptor); err != nil {
 		return errors.Errorf("couldn't gossip descriptor for node %d: %s", n.Descriptor.NodeID, err)
 	}
-
-	// Start the closed timestamp subsystem.
-	n.storeCfg.ClosedTimestamp.Start(n.Descriptor.NodeID)
 
 	// Create stores from the engines that were already initialized.
 	for _, e := range state.initializedEngines {
@@ -622,8 +636,12 @@ func (n *Node) startGossiping(ctx context.Context, stopper *stop.Stopper) {
 		statusTicker := time.NewTicker(gossipStatusInterval)
 		storesTicker := time.NewTicker(gossip.StoresInterval)
 		nodeTicker := time.NewTicker(gossip.NodeDescriptorInterval)
-		defer storesTicker.Stop()
-		defer nodeTicker.Stop()
+		defer func() {
+			nodeTicker.Stop()
+			storesTicker.Stop()
+			statusTicker.Stop()
+		}()
+
 		n.gossipStores(ctx) // one-off run before going to sleep
 		for {
 			select {
@@ -685,11 +703,12 @@ func (n *Node) computePeriodicMetrics(ctx context.Context, tick int) error {
 }
 
 // GetPebbleMetrics implements admission.PebbleMetricsProvider.
-func (n *Node) GetPebbleMetrics() []*pebble.Metrics {
-	var metrics []*pebble.Metrics
+func (n *Node) GetPebbleMetrics() []admission.StoreMetrics {
+	var metrics []admission.StoreMetrics
 	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
 		m := store.Engine().GetMetrics()
-		metrics = append(metrics, m.Metrics)
+		metrics = append(
+			metrics, admission.StoreMetrics{StoreID: int32(store.StoreID()), Metrics: m.Metrics})
 		return nil
 	})
 	return metrics
@@ -763,6 +782,9 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
 // If mustExist is true the status key must already exist and must
 // not change during writing -- if false, the status is always written.
 func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration, mustExist bool) error {
+	if n.suppressNodeStatus.Get() {
+		return nil
+	}
 	var err error
 	if runErr := n.stopper.RunTask(ctx, "node.Node: writing summary", func(ctx context.Context) {
 		nodeStatus := n.recorder.GenerateNodeStatus(ctx)
@@ -904,6 +926,14 @@ func (n *Node) batchInternal(
 	return br, nil
 }
 
+func isSingleHeartbeatTxnRequest(b *roachpb.BatchRequest) bool {
+	if len(b.Requests) != 1 {
+		return false
+	}
+	_, ok := b.Requests[0].GetInner().(*roachpb.HeartbeatTxnRequest)
+	return ok
+}
+
 // Batch implements the roachpb.InternalServer interface.
 func (n *Node) Batch(
 	ctx context.Context, args *roachpb.BatchRequest,
@@ -913,9 +943,10 @@ func (n *Node) Batch(
 	// log tags more expensive and makes local calls differ from remote calls.
 	ctx = n.storeCfg.AmbientCtx.ResetAndAnnotateCtx(ctx)
 
-	var callAdmittedWorkDone bool
+	var callAdmittedWorkDoneOnKVAdmissionQ bool
 	var tenantID roachpb.TenantID
-	if n.admissionQ != nil {
+	var storeAdmissionQ *admission.WorkQueue
+	if n.kvAdmissionQ != nil {
 		var ok bool
 		tenantID, ok = roachpb.TenantFromContext(ctx)
 		if !ok {
@@ -944,14 +975,41 @@ func (n *Node) Batch(
 			BypassAdmission: bypassAdmission,
 		}
 		var err error
-		callAdmittedWorkDone, err = n.admissionQ.Admit(ctx, admissionInfo)
-		if err != nil {
-			return nil, err
+		// Don't subject HeartbeatTxnRequest to the storeAdmissionQ. Even though
+		// it would bypass admission, it would consume a slot. When writes are
+		// throttled, we start generating more txn heartbeats, which then consume
+		// all the slots, causing no useful work to happen. We do want useful work
+		// to continue even when throttling since there are often significant
+		// number of tokens available.
+		if args.IsWrite() && !isSingleHeartbeatTxnRequest(args) {
+			storeAdmissionQ = n.storeGrantCoords.TryGetQueueForStore(int32(args.Replica.StoreID))
+		}
+		admissionEnabled := true
+		if storeAdmissionQ != nil {
+			if admissionEnabled, err = storeAdmissionQ.Admit(ctx, admissionInfo); err != nil {
+				return nil, err
+			}
+			if !admissionEnabled {
+				// Set storeAdmissionQ to nil so that we don't call AdmittedWorkDone
+				// on it. Additionally, the code below will not call
+				// kvAdmissionQ.Admit, and so callAdmittedWorkDoneOnKVAdmissionQ will
+				// stay false.
+				storeAdmissionQ = nil
+			}
+		}
+		if admissionEnabled {
+			callAdmittedWorkDoneOnKVAdmissionQ, err = n.kvAdmissionQ.Admit(ctx, admissionInfo)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	br, err := n.batchInternal(ctx, args)
-	if callAdmittedWorkDone {
-		n.admissionQ.AdmittedWorkDone(tenantID)
+	if callAdmittedWorkDoneOnKVAdmissionQ {
+		n.kvAdmissionQ.AdmittedWorkDone(tenantID)
+	}
+	if storeAdmissionQ != nil {
+		storeAdmissionQ.AdmittedWorkDone(tenantID)
 	}
 
 	// We always return errors via BatchResponse.Error so structure is
@@ -995,6 +1053,8 @@ func (n *Node) setupSpanForIncomingRPC(
 	if isLocalRequest {
 		// This is a local request which circumvented gRPC. Start a span now.
 		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, opName)
+		// Set the same span.kind tag as the gRPC interceptor.
+		newSpan.SetTag(ext.SpanKindRPCServer.Key, ext.SpanKindRPCServer.Value)
 	} else {
 		grpcSpan = tracing.SpanFromContext(ctx)
 		if grpcSpan == nil {
@@ -1201,13 +1261,13 @@ func (n *Node) GossipSubscription(
 				// or system tenant-specific information to leak.
 				var ents config.SystemConfigEntries
 				if err := content.GetProto(&ents); err != nil {
-					return roachpb.Value{}, errors.Errorf("could not unmarshal system config: %v", err)
+					return roachpb.Value{}, errors.Wrap(err, "could not unmarshal system config")
 				}
 
 				var newContent roachpb.Value
 				newEnts := kvtenant.GossipSubscriptionSystemConfigMask.Apply(ents)
 				if err := newContent.SetProto(&newEnts); err != nil {
-					return roachpb.Value{}, errors.Errorf("could not marshal system config: %v", err)
+					return roachpb.Value{}, errors.Wrap(err, "could not marshal system config")
 				}
 				return newContent, nil
 			default:
@@ -1324,4 +1384,91 @@ func (n *Node) Join(
 		StoreID:       int32(storeID),
 		ActiveVersion: &activeVersion.Version,
 	}, nil
+}
+
+// TokenBucket is part of the roachpb.InternalServer service.
+func (n *Node) TokenBucket(
+	ctx context.Context, in *roachpb.TokenBucketRequest,
+) (*roachpb.TokenBucketResponse, error) {
+	// Check tenant ID. Note that in production configuration, the tenant ID has
+	// already been checked in the RPC layer (see rpc.tenantAuthorizer).
+	if in.TenantID == 0 || in.TenantID == roachpb.SystemTenantID.ToUint64() {
+		return &roachpb.TokenBucketResponse{
+			Error: errors.EncodeError(ctx, errors.Errorf(
+				"token bucket request with invalid tenant ID %d", in.TenantID,
+			)),
+		}, nil
+	}
+	tenantID := roachpb.MakeTenantID(in.TenantID)
+	return n.tenantUsage.TokenBucketRequest(ctx, tenantID, in), nil
+}
+
+// NewTenantUsageServer is a hook for CCL code which implements the tenant usage
+// server.
+var NewTenantUsageServer = func(db *kv.DB, executor *sql.InternalExecutor) multitenant.TenantUsageServer {
+	return dummyTenantUsageServer{}
+}
+
+// dummyTenantUsageServer is a stub implementation of TenantUsageServer that
+// errors out on all APIs.
+type dummyTenantUsageServer struct{}
+
+// TokenBucketRequest is defined in the TenantUsageServer interface.
+func (dummyTenantUsageServer) TokenBucketRequest(
+	ctx context.Context, tenantID roachpb.TenantID, in *roachpb.TokenBucketRequest,
+) *roachpb.TokenBucketResponse {
+	return &roachpb.TokenBucketResponse{
+		Error: errors.EncodeError(ctx, errors.New("tenant usage requires a CCL binary")),
+	}
+}
+
+// ReconfigureTokenBucket is defined in the TenantUsageServer interface.
+func (dummyTenantUsageServer) ReconfigureTokenBucket(
+	ctx context.Context,
+	txn *kv.Txn,
+	tenantID roachpb.TenantID,
+	availableRU float64,
+	refillRate float64,
+	maxBurstRU float64,
+	asOf time.Time,
+	asOfConsumedRequestUnits float64,
+) error {
+	return errors.Errorf("tenant resource limits require a CCL binary")
+}
+
+// Metrics is defined in the TenantUsageServer interface.
+func (dummyTenantUsageServer) Metrics() metric.Struct {
+	return emptyMetricStruct{}
+}
+
+type emptyMetricStruct struct{}
+
+var _ metric.Struct = emptyMetricStruct{}
+
+func (emptyMetricStruct) MetricStruct() {}
+
+// GetSpanConfigs implements the roachpb.InternalServer interface.
+func (n *Node) GetSpanConfigs(
+	ctx context.Context, req *roachpb.GetSpanConfigsRequest,
+) (*roachpb.GetSpanConfigsResponse, error) {
+	entries, err := n.spanConfigAccessor.GetSpanConfigEntriesFor(ctx, req.Spans)
+	if err != nil {
+		return nil, err
+	}
+
+	return &roachpb.GetSpanConfigsResponse{SpanConfigEntries: entries}, nil
+}
+
+// UpdateSpanConfigs implements the roachpb.InternalServer interface.
+func (n *Node) UpdateSpanConfigs(
+	ctx context.Context, req *roachpb.UpdateSpanConfigsRequest,
+) (*roachpb.UpdateSpanConfigsResponse, error) {
+	// TODO(irfansharif): We want to protect ourselves from tenants creating
+	// outlandishly large string buffers here and OOM-ing the host cluster. Is
+	// the maximum protobuf message size enough of a safeguard?
+	err := n.spanConfigAccessor.UpdateSpanConfigEntries(ctx, req.ToDelete, req.ToUpsert)
+	if err != nil {
+		return nil, err
+	}
+	return &roachpb.UpdateSpanConfigsResponse{}, nil
 }

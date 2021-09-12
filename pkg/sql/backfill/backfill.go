@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -66,6 +67,8 @@ type ColumnBackfiller struct {
 
 	// mon is a memory monitor linked with the ColumnBackfiller on creation.
 	mon *mon.BytesMonitor
+
+	rowMetrics *row.Metrics
 }
 
 // initCols is a helper to populate some column metadata on a ColumnBackfiller.
@@ -90,6 +93,7 @@ func (cb *ColumnBackfiller) init(
 	computedExprs []tree.TypedExpr,
 	desc catalog.TableDescriptor,
 	mon *mon.BytesMonitor,
+	rowMetrics *row.Metrics,
 ) error {
 	cb.evalCtx = evalCtx
 	cb.updateCols = append(cb.added, cb.dropped...)
@@ -129,6 +133,7 @@ func (cb *ColumnBackfiller) init(
 		return errors.AssertionFailedf("no memory monitor linked to ColumnBackfiller during init")
 	}
 	cb.mon = mon
+	cb.rowMetrics = rowMetrics
 
 	return cb.fetcher.Init(
 		evalCtx.Context,
@@ -136,6 +141,7 @@ func (cb *ColumnBackfiller) init(
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		0,     /* lockTimeout */
 		false, /* isCheck */
 		&cb.alloc,
 		cb.mon,
@@ -152,6 +158,7 @@ func (cb *ColumnBackfiller) InitForLocalUse(
 	semaCtx *tree.SemaContext,
 	desc catalog.TableDescriptor,
 	mon *mon.BytesMonitor,
+	rowMetrics *row.Metrics,
 ) error {
 	cb.initCols(desc)
 	defaultExprs, err := schemaexpr.MakeDefaultExprs(
@@ -172,7 +179,7 @@ func (cb *ColumnBackfiller) InitForLocalUse(
 	if err != nil {
 		return err
 	}
-	return cb.init(evalCtx, defaultExprs, computedExprs, desc, mon)
+	return cb.init(evalCtx, defaultExprs, computedExprs, desc, mon, rowMetrics)
 }
 
 // InitForDistributedUse initializes a ColumnBackfiller for use as part of a
@@ -228,7 +235,8 @@ func (cb *ColumnBackfiller) InitForDistributedUse(
 	// entire backfill process.
 	flowCtx.TypeResolverFactory.Descriptors.ReleaseAll(ctx)
 
-	return cb.init(evalCtx, defaultExprs, computedExprs, desc, mon)
+	rowMetrics := flowCtx.GetRowMetrics()
+	return cb.init(evalCtx, defaultExprs, computedExprs, desc, mon, rowMetrics)
 }
 
 // Close frees the resources used by the ColumnBackfiller.
@@ -246,7 +254,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	txn *kv.Txn,
 	tableDesc catalog.TableDescriptor,
 	sp roachpb.Span,
-	chunkSize int64,
+	chunkSize rowinfra.RowLimit,
 	alsoCommit bool,
 	traceKV bool,
 ) (roachpb.Key, error) {
@@ -265,6 +273,9 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 		requestedCols,
 		row.UpdaterOnlyColumns,
 		&cb.alloc,
+		&cb.evalCtx.Settings.SV,
+		cb.evalCtx.SessionData().Internal,
+		cb.rowMetrics,
 	)
 	if err != nil {
 		return roachpb.Key{}, err
@@ -286,7 +297,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	// populated and deleted by the OLTP commands but not otherwise
 	// read or used
 	if err := cb.fetcher.StartScan(
-		ctx, txn, []roachpb.Span{sp}, true /* limitBatches */, chunkSize,
+		ctx, txn, []roachpb.Span{sp}, rowinfra.DefaultBatchBytesLimit, chunkSize,
 		traceKV, false, /* forceProductionKVBatchSize */
 	); err != nil {
 		log.Errorf(ctx, "scan error: %s", err)
@@ -304,7 +315,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	iv.Cols = append(iv.Cols, tableDesc.PublicColumns()...)
 	iv.Cols = append(iv.Cols, cb.added...)
 	cb.evalCtx.IVarContainer = iv
-	for i := int64(0); i < chunkSize; i++ {
+	for i := int64(0); i < int64(chunkSize); i++ {
 		datums, _, _, err := cb.fetcher.NextRowDecoded(ctx)
 		if err != nil {
 			return roachpb.Key{}, err
@@ -798,6 +809,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		0,     /* lockTimeout */
 		false, /* isCheck */
 		&ib.alloc,
 		ib.mon,
@@ -807,7 +819,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	}
 	defer fetcher.Close(ctx)
 	if err := fetcher.StartScan(
-		ctx, txn, []roachpb.Span{sp}, true /* limitBatches */, initBufferSize,
+		ctx, txn, []roachpb.Span{sp}, rowinfra.DefaultBatchBytesLimit, initBufferSize,
 		traceKV, false, /* forceProductionKVBatchSize */
 	); err != nil {
 		log.Errorf(ctx, "scan error: %s", err)

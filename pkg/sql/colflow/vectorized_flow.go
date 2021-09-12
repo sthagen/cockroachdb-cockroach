@@ -227,6 +227,7 @@ func (f *vectorizedFlow) Setup(
 	f.batchFlowCoordinator = batchFlowCoordinator
 	f.testingInfo.numClosers = f.creator.numClosers
 	f.testingInfo.numClosed = &f.creator.numClosed
+	f.SetStartedGoroutines(f.creator.operatorConcurrency)
 	log.VEventf(ctx, 2, "vectorized flow setup succeeded")
 	if !f.IsLocal() {
 		// For distributed flows set opChains to nil, per the contract of
@@ -275,7 +276,7 @@ func (f *vectorizedFlow) GetPath(ctx context.Context) string {
 	f.tempStorage.path = filepath.Join(f.Cfg.TempStoragePath, tempDirName)
 	log.VEventf(ctx, 1, "flow %s spilled to disk, stack trace: %s", f.ID, util.GetSmallTrace(2))
 	if err := f.Cfg.TempFS.MkdirAll(f.tempStorage.path); err != nil {
-		colexecerror.InternalError(errors.Errorf("unable to create temporary storage directory: %v", err))
+		colexecerror.InternalError(errors.Wrap(err, "unable to create temporary storage directory"))
 	}
 	return f.tempStorage.path
 }
@@ -461,11 +462,9 @@ type admissionOptions struct {
 type remoteComponentCreator interface {
 	newOutbox(
 		allocator *colmem.Allocator,
-		input colexecop.Operator,
+		input colexecargs.OpWithMetaInfo,
 		typs []*types.T,
 		getStats func() []*execinfrapb.ComponentStats,
-		metadataSources []colexecop.MetadataSource,
-		toClose []colexecop.Closer,
 	) (*colrpc.Outbox, error)
 	newInbox(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 		admissionOpts admissionOptions) (*colrpc.Inbox, error)
@@ -475,13 +474,11 @@ type vectorizedRemoteComponentCreator struct{}
 
 func (vectorizedRemoteComponentCreator) newOutbox(
 	allocator *colmem.Allocator,
-	input colexecop.Operator,
+	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
 	getStats func() []*execinfrapb.ComponentStats,
-	metadataSources []colexecop.MetadataSource,
-	toClose []colexecop.Closer,
 ) (*colrpc.Outbox, error) {
-	return colrpc.NewOutbox(allocator, input, typs, getStats, metadataSources, toClose)
+	return colrpc.NewOutbox(allocator, input, typs, getStats)
 }
 
 func (vectorizedRemoteComponentCreator) newInbox(
@@ -722,7 +719,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 ) (execinfra.OpNode, error) {
 	outbox, err := s.remoteComponentCreator.newOutbox(
 		colmem.NewAllocator(ctx, s.newStreamingMemAccount(flowCtx), factory),
-		op.Root, outputTyps, getStats, op.MetadataSources, op.ToClose,
+		op, outputTyps, getStats,
 	)
 	if err != nil {
 		return nil, err
@@ -958,6 +955,7 @@ func (s *vectorizedFlowCreator) setupInput(
 			// must use the serial unordered sync above in order to remove any
 			// concurrency.
 			sync := colexec.NewParallelUnorderedSynchronizer(inputStreamOps, s.waitGroup)
+			sync.LocalPlan = flowCtx.Local
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
 				Root:            sync,
 				MetadataSources: colexecop.MetadataSources{sync},
@@ -1180,7 +1178,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 				err = errors.Wrapf(err, "unable to vectorize execution plan")
 				return
 			}
-			if flowCtx.EvalCtx.SessionData.TestingVectorizeInjectPanics {
+			if flowCtx.EvalCtx.SessionData().TestingVectorizeInjectPanics {
 				result.Root = newPanicInjector(result.Root)
 			}
 			if util.CrdbTestBuild {

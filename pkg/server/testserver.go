@@ -15,11 +15,10 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"math/rand"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -56,9 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -115,15 +112,21 @@ func makeTestSQLConfig(st *cluster.Settings, tenID roachpb.TenantID) SQLConfig {
 	return MakeSQLConfig(tenID, base.DefaultTestTempStorageConfig(st))
 }
 
+func initTraceDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return errors.Wrap(err, "cannot create trace dir; traces will not be dumped")
+	}
+	return nil
+}
+
 // makeTestConfigFromParams creates a Config from a TestServerParams.
 func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	st := params.Settings
 	if params.Settings == nil {
 		st = cluster.MakeClusterSettings()
-		enabledSeparated := rand.Intn(2) == 0
-		log.Infof(context.Background(),
-			"test Config is randomly setting enabledSeparated: %t", enabledSeparated)
-		storage.SeparatedIntentsEnabled.Override(context.Background(), &st.SV, enabledSeparated)
 	}
 	st.ExternalIODir = params.ExternalIODir
 	cfg := makeTestConfig(st)
@@ -140,6 +143,11 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.SocketFile = params.SocketFile
 	cfg.RetryOptions = params.RetryOptions
 	cfg.Locality = params.Locality
+	if params.TraceDir != "" {
+		if err := initTraceDir(params.TraceDir); err == nil {
+			cfg.InflightTraceDirName = params.TraceDir
+		}
+	}
 	if knobs := params.Knobs.Store; knobs != nil {
 		if mo := knobs.(*kvserver.StoreTestingKnobs).MaxOffset; mo != 0 {
 			cfg.MaxOffset = MaxOffsetType(mo)
@@ -240,6 +248,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 			if cfg.GoroutineDumpDirName == "" {
 				cfg.GoroutineDumpDirName = filepath.Join(storeSpec.Path, "logs", base.GoroutineDumpDir)
 			}
+			if cfg.InflightTraceDirName == "" {
+				cfg.InflightTraceDirName = filepath.Join(storeSpec.Path, "logs", base.InflightTraceDir)
+			}
 		}
 	}
 	cfg.Stores = base.StoreSpecList{Specs: params.StoreSpecs}
@@ -338,7 +349,7 @@ func (ts *TestServer) Clock() *hlc.Clock {
 // SQLLivenessProvider returns the sqlliveness.Provider as an interface{}.
 func (ts *TestServer) SQLLivenessProvider() interface{} {
 	if ts != nil {
-		return ts.sqlServer.execCfg.SQLLivenessReader
+		return ts.sqlServer.execCfg.SQLLiveness
 	}
 	return nil
 }
@@ -505,6 +516,11 @@ func (t *TestTenant) DistSQLServer() interface{} {
 	return t.SQLServer.distSQLServer
 }
 
+// RPCContext is part of the TestTenantInterface interface
+func (t *TestTenant) RPCContext() *rpc.Context {
+	return t.execCfg.RPCContext
+}
+
 // JobRegistry is part of the TestTenantInterface interface.
 func (t *TestTenant) JobRegistry() interface{} {
 	return t.SQLServer.jobRegistry
@@ -513,42 +529,6 @@ func (t *TestTenant) JobRegistry() interface{} {
 // TestingKnobs is part of the TestTenantInterface interface.
 func (t *TestTenant) TestingKnobs() *base.TestingKnobs {
 	return &t.Cfg.TestingKnobs
-}
-
-// SetupIdleMonitor will monitor the active connections and if there are none,
-// will activate a `defaultCountdownDuration` countdown timer and terminate
-// the application. The monitoring will start after a warmup period
-// specified by warmupDuration. If the warmupDuration is zero, the idle
-// detection will be turned off.
-func SetupIdleMonitor(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	warmupDuration time.Duration,
-	server netutil.Server,
-	countdownDuration ...time.Duration,
-) *IdleMonitor {
-	if warmupDuration != 0 {
-		log.VEventf(ctx, 2, "idle exit will activate after warmup duration of %s", warmupDuration)
-		oldConnStateHandler := server.ConnState
-		idleMonitor := MakeIdleMonitor(ctx, warmupDuration,
-			func() {
-				log.VEventf(ctx, 2, "idle exiting")
-				stopper.Stop(ctx)
-			},
-			countdownDuration...,
-		)
-		server.ConnState = func(conn net.Conn, state http.ConnState) {
-			if state == http.StateNew {
-				defer oldConnStateHandler(conn, state)
-				idleMonitor.NewConnection(ctx)
-			} else if state == http.StateClosed {
-				defer idleMonitor.CloseConnection(ctx)
-				oldConnStateHandler(conn, state)
-			}
-		}
-		return idleMonitor
-	}
-	return nil
 }
 
 // StartTenant starts a SQL tenant communicating with this TestServer.
@@ -594,11 +574,16 @@ func (ts *TestServer) StartTenant(
 	}
 	baseCfg := makeTestBaseConfig(st)
 	baseCfg.TestingKnobs = params.TestingKnobs
-	baseCfg.IdleExitAfter = params.IdleExitAfter
 	baseCfg.Insecure = params.ForceInsecure
+	baseCfg.Locality = params.Locality
 	if params.AllowSettingClusterSettings {
-		baseCfg.TestingKnobs.TenantTestingKnobs = &sql.TenantTestingKnobs{
-			ClusterSettingsUpdater: st.MakeUpdater(),
+		tenantKnobs, ok := baseCfg.TestingKnobs.TenantTestingKnobs.(*sql.TenantTestingKnobs)
+		if !ok {
+			tenantKnobs = &sql.TenantTestingKnobs{}
+			baseCfg.TestingKnobs.TenantTestingKnobs = tenantKnobs
+		}
+		if tenantKnobs.ClusterSettingsUpdater == nil {
+			tenantKnobs.ClusterSettingsUpdater = st.MakeUpdater()
 		}
 	}
 	stopper := params.Stopper
@@ -944,6 +929,11 @@ func (ts *TestServer) MigrationServer() interface{} {
 	return ts.migrationServer
 }
 
+// SpanConfigAccessor is part of TestServerInterface.
+func (ts *TestServer) SpanConfigAccessor() interface{} {
+	return ts.Server.node.spanConfigAccessor
+}
+
 // SQLServer is part of TestServerInterface.
 func (ts *TestServer) SQLServer() interface{} {
 	return ts.PGServer().SQLServer
@@ -1138,10 +1128,12 @@ func (ts *TestServer) GetRangeLease(
 		ctx,
 		ts.DB().NonTransactionalSender(),
 		roachpb.Header{
-			// INCONSISTENT read, since we want to make sure that the node used to
-			// send this is the one that processes the command, for the hint to
+			// INCONSISTENT read with a NEAREST routing policy, since we want to make
+			// sure that the node used to send this is the one that processes the
+			// command, regardless of whether it is the leaseholder, for the hint to
 			// matter.
 			ReadConsistency: roachpb.INCONSISTENT,
+			RoutingPolicy:   roachpb.RoutingPolicy_NEAREST,
 		},
 		&leaseReq,
 	)
@@ -1239,7 +1231,7 @@ func (ts *TestServer) ScratchRange() (roachpb.Key, error) {
 // ScratchRangeEx splits off a range suitable to be used as KV scratch space.
 // (it doesn't overlap system spans or SQL tables).
 func (ts *TestServer) ScratchRangeEx() (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
-	scratchKey := keys.TableDataMax
+	scratchKey := keys.ScratchRangeMin
 	return ts.SplitRange(scratchKey)
 }
 
@@ -1268,6 +1260,11 @@ func (ts *TestServer) ScratchRangeWithExpirationLeaseEx() (
 // MetricsRecorder periodically records node-level and store-level metrics.
 func (ts *TestServer) MetricsRecorder() *status.MetricsRecorder {
 	return ts.node.recorder
+}
+
+// CollectionFactory is part of the TestServerInterface.
+func (ts *TestServer) CollectionFactory() interface{} {
+	return ts.sqlServer.execCfg.CollectionFactory
 }
 
 type testServerFactoryImpl struct{}

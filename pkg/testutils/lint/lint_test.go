@@ -449,7 +449,7 @@ func TestLint(t *testing.T) {
 					":!ccl/backupccl/backup_cloud_test.go",
 					// KMS requires AWS credentials from environment variables.
 					":!ccl/backupccl/backup_test.go",
-					":!storage/cloud",
+					":!cloud",
 					":!ccl/workloadccl/fixture_test.go",
 					":!internal/reporoot/reporoot.go",
 					":!cmd",
@@ -810,7 +810,10 @@ func TestLint(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(filter, func(s string) {
+		if err := stream.ForEach(stream.Sequence(
+			filter,
+			stream.GrepNot(`nolint:context`),
+		), func(s string) {
 			t.Errorf("\n%s <- forbidden; use 'contextutil.RunWithTimeout' instead", s)
 		}); err != nil {
 			t.Error(err)
@@ -1145,6 +1148,7 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!*.pb.go",
 			":!*.pb.gw.go",
+			":!kv/kvclient/kvcoord/lock_spans_over_budget_error.go",
 			":!sql/pgwire/pgerror/constraint_name.go",
 			":!sql/pgwire/pgerror/severity.go",
 			":!sql/pgwire/pgerror/with_candidate_code.go",
@@ -1548,6 +1552,7 @@ func TestLint(t *testing.T) {
 	// https://github.com/dominikh/go-tools/issues/57 is fixed.
 	t.Run("TestErrCheck", func(t *testing.T) {
 		skip.UnderShort(t)
+		skip.UnderBazelWithIssue(t, 68498, "Generated files not placed in the workspace via Bazel build")
 		excludesPath, err := filepath.Abs(filepath.Join("testdata", "errcheck_excludes.txt"))
 		if err != nil {
 			t.Fatal(err)
@@ -1625,6 +1630,7 @@ func TestLint(t *testing.T) {
 				stream.GrepNot("pkg/sql/types/types.go.* var Uuid should be UUID"),
 				stream.GrepNot("pkg/sql/oidext/oidext.go.*don't use underscores in Go names; const T_"),
 				stream.GrepNot("server/api_v2.go.*package comment should be of the form"),
+				stream.GrepNot("type name will be used as row.RowLimit by other packages, and that stutters; consider calling this Limit"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1641,6 +1647,7 @@ func TestLint(t *testing.T) {
 	t.Run("TestStaticCheck", func(t *testing.T) {
 		// staticcheck uses 2.4GB of ram (as of 2019-05-10), so don't parallelize it.
 		skip.UnderShort(t)
+		skip.UnderBazelWithIssue(t, 68496, "A TON of build errors")
 		var args []string
 		if pkgSpecified {
 			args = []string{pkgScope}
@@ -1724,6 +1731,7 @@ func TestLint(t *testing.T) {
 			// (see git help gitglossary) makes * behave like a normal, single dir
 			// glob, and exclude is the synonym of !.
 			":(glob,exclude)sql/colexec/execgen/*.go",
+			":!sql/colexec/execgen/testdata",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1949,9 +1957,11 @@ func TestLint(t *testing.T) {
 			"../../sql/colexec/colexecjoin",
 			"../../sql/colexec/colexecproj",
 			"../../sql/colexec/colexecsel",
+			"../../sql/colexec/colexecspan",
 			"../../sql/colexec/colexecwindow",
 			"../../sql/colfetcher",
 			"../../sql/row",
+			"../../kv/kvclient/rangecache",
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -2101,6 +2111,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`pkg/roachpb/errors\.go:.*invalid direct cast on error object`),
 			// Cast in decode handler.
 			stream.GrepNot(`pkg/sql/pgwire/pgerror/constraint_name\.go:.*invalid direct cast on error object`),
+			// Cast in decode handler.
+			stream.GrepNot(`pkg/kv/kvclient/kvcoord/lock_spans_over_budget_error\.go:.*invalid direct cast on error object`),
 			// pgerror's pgcode logic uses its own custom cause recursion
 			// algorithm and thus cannot use errors.If() which mandates a
 			// different recursion order.

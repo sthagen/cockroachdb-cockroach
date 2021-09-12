@@ -103,6 +103,12 @@ func (f *FloatSetting) setToDefault(ctx context.Context, sv *Values) {
 	}
 }
 
+// WithPublic sets public visibility and can be chained.
+func (f *FloatSetting) WithPublic() *FloatSetting {
+	f.SetVisibility(Public)
+	return f
+}
+
 // WithSystemOnly indicates system-usage only and can be chained.
 func (f *FloatSetting) WithSystemOnly() *FloatSetting {
 	f.common.systemOnly = true
@@ -153,6 +159,14 @@ func NonNegativeFloat(v float64) error {
 func PositiveFloat(v float64) error {
 	if v <= 0 {
 		return errors.Errorf("cannot set to a non-positive value: %f", v)
+	}
+	return nil
+}
+
+// FloatBetweenZeroAndOneInclusive can be passed to RegisterFloatSetting.
+func FloatBetweenZeroAndOneInclusive(v float64) error {
+	if math.Signbit(v) || v > 1 {
+		return errors.Errorf("must set to value between 0 and 1 inclusive: %f", v)
 	}
 	return nil
 }

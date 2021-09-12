@@ -87,7 +87,7 @@ func getEncoder(
 	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
 	case ``, changefeedbase.OptFormatJSON:
 		return makeJSONEncoder(opts, targets)
-	case changefeedbase.OptFormatAvro:
+	case changefeedbase.OptFormatAvro, changefeedbase.DeprecatedOptFormatAvro:
 		return newConfluentAvroEncoder(ctx, opts, targets)
 	case changefeedbase.OptFormatNative:
 		return &nativeEncoder{}, nil
@@ -573,11 +573,11 @@ func (e *confluentAvroEncoder) register(
 type nativeEncoder struct{}
 
 func (e *nativeEncoder) EncodeKey(ctx context.Context, row encodeRow) ([]byte, error) {
-	panic("EncodeKey should not be called on nativeEncoder")
+	return nil, errors.New("EncodeKey unexpectedly called on nativeEncoder")
 }
 
 func (e *nativeEncoder) EncodeValue(ctx context.Context, row encodeRow) ([]byte, error) {
-	panic("EncodeValue should not be called on nativeEncoder")
+	return nil, errors.New("EncodeValue unexpectedly called on nativeEncoder")
 }
 
 func (e *nativeEncoder) EncodeResolvedTimestamp(

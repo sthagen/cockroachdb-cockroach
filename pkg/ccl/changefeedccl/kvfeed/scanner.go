@@ -67,11 +67,21 @@ func (p *scanRequestScanner) Scan(
 
 	maxConcurrentExports := maxConcurrentExportRequests(p.gossip, &p.settings.SV)
 	exportLim := limit.MakeConcurrentRequestLimiter("changefeedExportRequestLimiter", maxConcurrentExports)
+
+	lastScanLimitUserSetting := changefeedbase.ScanRequestLimit.Get(&p.settings.SV)
+
 	g := ctxgroup.WithContext(ctx)
 	// atomicFinished is used only to enhance debugging messages.
 	var atomicFinished int64
 	for _, span := range spans {
 		span := span
+
+		// If the user defined scan request limit has changed, recalculate it
+		if currentUserScanLimit := changefeedbase.ScanRequestLimit.Get(&p.settings.SV); currentUserScanLimit != lastScanLimitUserSetting {
+			lastScanLimitUserSetting = currentUserScanLimit
+			exportLim.SetLimit(maxConcurrentExportRequests(p.gossip, &p.settings.SV))
+		}
+
 		limAlloc, err := exportLim.Begin(ctx)
 		if err != nil {
 			cancel()
@@ -103,7 +113,9 @@ func (p *scanRequestScanner) exportSpan(
 	if log.V(2) {
 		log.Infof(ctx, `sending ScanRequest %s at %s`, span, ts)
 	}
-	txn.SetFixedTimestamp(ctx, ts)
+	if err := txn.SetFixedTimestamp(ctx, ts); err != nil {
+		return err
+	}
 	stopwatchStart := timeutil.Now()
 	var scanDuration, bufferDuration time.Duration
 	const targetBytesPerScan = 16 << 20 // 16 MiB
@@ -134,14 +146,18 @@ func (p *scanRequestScanner) exportSpan(
 		bufferDuration += afterBuffer.Sub(afterScan)
 		if res.ResumeSpan != nil {
 			consumed := roachpb.Span{Key: remaining.Key, EndKey: res.ResumeSpan.Key}
-			if err := sink.AddResolved(ctx, consumed, ts, jobspb.ResolvedSpan_NONE); err != nil {
+			if err := sink.Add(
+				ctx, kvevent.MakeResolvedEvent(consumed, ts, jobspb.ResolvedSpan_NONE),
+			); err != nil {
 				return err
 			}
 		}
 		remaining = res.ResumeSpan
 	}
 	// p.metrics.PollRequestNanosHist.RecordValue(scanDuration.Nanoseconds())
-	if err := sink.AddResolved(ctx, span, ts, jobspb.ResolvedSpan_NONE); err != nil {
+	if err := sink.Add(
+		ctx, kvevent.MakeResolvedEvent(span, ts, jobspb.ResolvedSpan_NONE),
+	); err != nil {
 		return err
 	}
 	if log.V(2) {
@@ -220,7 +236,7 @@ func slurpScanResponse(
 				// change. This is handled in kvsToRows.
 				prevVal = kv.Value
 			}
-			if err = sink.AddKV(ctx, kv, prevVal, ts); err != nil {
+			if err = sink.Add(ctx, kvevent.MakeKVEvent(kv, prevVal, ts)); err != nil {
 				return errors.Wrapf(err, `buffering changes for %s`, span)
 			}
 		}

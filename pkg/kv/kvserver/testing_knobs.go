@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -35,6 +36,8 @@ type StoreTestingKnobs struct {
 	TxnWaitKnobs            txnwait.TestingKnobs
 	ConsistencyTestingKnobs ConsistencyTestingKnobs
 	TenantRateKnobs         tenantrate.TestingKnobs
+	StorageKnobs            storage.TestingKnobs
+	AllocatorKnobs          *AllocatorTestingKnobs
 
 	// TestingRequestFilter is called before evaluating each request on a
 	// replica. The filter is run before the request acquires latches, so
@@ -227,6 +230,8 @@ type StoreTestingKnobs struct {
 	// DontPushOnWriteIntentError will propagate a write intent error immediately
 	// instead of utilizing the intent resolver to try to push the corresponding
 	// transaction.
+	// TODO(nvanbenschoten): can we replace this knob with usage of the Error
+	// WaitPolicy on BatchRequests?
 	DontPushOnWriteIntentError bool
 	// DontRetryPushTxnFailures will propagate a push txn failure immediately
 	// instead of utilizing the txn wait queue to wait for the transaction to
@@ -350,6 +355,10 @@ type StoreTestingKnobs struct {
 	// LeaseRenewalDurationOverride replaces the timer duration for proactively
 	// renewing expiration based leases.
 	LeaseRenewalDurationOverride time.Duration
+
+	// MakeSystemConfigSpanUnavailableToQueues makes the system config span
+	// unavailable to queues that ask for it.
+	MakeSystemConfigSpanUnavailableToQueues bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -373,6 +382,14 @@ var _ base.ModuleTestingKnobs = NodeLivenessTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (NodeLivenessTestingKnobs) ModuleTestingKnobs() {}
+
+// AllocatorTestingKnobs allows tests to override the behavior of `Allocator`.
+type AllocatorTestingKnobs struct {
+	// AllowLeaseTransfersToReplicasNeedingSnapshots permits lease transfer
+	// targets produced by the Allocator to include replicas that may be waiting
+	// for snapshots.
+	AllowLeaseTransfersToReplicasNeedingSnapshots bool
+}
 
 // PinnedLeasesKnob is a testing know for controlling what store can acquire a
 // lease for specific ranges.

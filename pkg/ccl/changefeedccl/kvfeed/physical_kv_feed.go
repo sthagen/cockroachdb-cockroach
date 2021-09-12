@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // physicalFeedFactory constructs a physical feed which writes into sink and
@@ -92,7 +92,10 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 				if p.cfg.WithDiff {
 					prevVal = t.PrevValue
 				}
-				if err := p.memBuf.AddKV(ctx, kv, prevVal, backfillTimestamp); err != nil {
+				if err := p.memBuf.Add(
+					ctx,
+					kvevent.MakeKVEvent(kv, prevVal, backfillTimestamp),
+				); err != nil {
 					return err
 				}
 			case *roachpb.RangeFeedCheckpoint:
@@ -102,11 +105,14 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 					// Changefeeds don't care about these at all, so throw them out.
 					continue
 				}
-				if err := p.memBuf.AddResolved(ctx, t.Span, t.ResolvedTS, jobspb.ResolvedSpan_NONE); err != nil {
+				if err := p.memBuf.Add(
+					ctx,
+					kvevent.MakeResolvedEvent(t.Span, t.ResolvedTS, jobspb.ResolvedSpan_NONE),
+				); err != nil {
 					return err
 				}
 			default:
-				log.Fatalf(ctx, "unexpected RangeFeedEvent variant %v", t)
+				return errors.Errorf("unexpected RangeFeedEvent variant %v", t)
 			}
 		case <-ctx.Done():
 			return ctx.Err()

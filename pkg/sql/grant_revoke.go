@@ -14,9 +14,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -24,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -32,11 +35,8 @@ import (
 )
 
 // Grant adds privileges to users.
-// Current status:
-// - Target: single database, table, or view.
 // TODO(marc): open questions:
 // - should we have root always allowed and not present in the permissions list?
-// - should we make users case-insensitive?
 // Privileges: GRANT on database/table/view.
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
@@ -47,33 +47,26 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 		return nil, err
 	}
 
-	// TODO(solon): there are SQL identifiers (tree.Name) in n.Grantees,
-	// but we want SQL usernames. Do we normalize or not? For reference,
-	// REASSIGN / OWNER TO do normalize.
-	// Related: https://github.com/cockroachdb/cockroach/issues/54696
-	grantees := make([]security.SQLUsername, len(n.Grantees))
-	for i, grantee := range n.Grantees {
-		grantees[i] = security.MakeSQLUsernameFromPreNormalizedString(string(grantee))
+	grantees, err := n.Grantees.ToSQLUsernames()
+	if err != nil {
+		return nil, err
 	}
-
 	return &changePrivilegesNode{
 		isGrant:      true,
 		targets:      n.Targets,
 		grantees:     grantees,
 		desiredprivs: n.Privileges,
-		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, grantee security.SQLUsername) {
-			privDesc.Grant(grantee, n.Privileges)
+		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, privileges privilege.List, grantee security.SQLUsername) {
+			privDesc.Grant(grantee, privileges)
 		},
-		grantOn: grantOn,
+		grantOn:          grantOn,
+		granteesNameList: n.Grantees,
 	}, nil
 }
 
 // Revoke removes privileges from users.
-// Current status:
-// - Target: single database, table, or view.
 // TODO(marc): open questions:
 // - should we have root always allowed and not present in the permissions list?
-// - should we make users case-insensitive?
 // Privileges: GRANT on database/table/view.
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
@@ -84,24 +77,20 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 		return nil, err
 	}
 
-	// TODO(solon): there are SQL identifiers (tree.Name) in n.Grantees,
-	// but we want SQL usernames. Do we normalize or not? For reference,
-	// REASSIGN / OWNER TO do normalize.
-	// Related: https://github.com/cockroachdb/cockroach/issues/54696
-	grantees := make([]security.SQLUsername, len(n.Grantees))
-	for i, grantee := range n.Grantees {
-		grantees[i] = security.MakeSQLUsernameFromPreNormalizedString(string(grantee))
+	grantees, err := n.Grantees.ToSQLUsernames()
+	if err != nil {
+		return nil, err
 	}
-
 	return &changePrivilegesNode{
 		isGrant:      false,
 		targets:      n.Targets,
 		grantees:     grantees,
 		desiredprivs: n.Privileges,
-		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, grantee security.SQLUsername) {
-			privDesc.Revoke(grantee, n.Privileges, grantOn)
+		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, privileges privilege.List, grantee security.SQLUsername) {
+			privDesc.Revoke(grantee, privileges, grantOn)
 		},
-		grantOn: grantOn,
+		grantOn:          grantOn,
+		granteesNameList: n.Grantees,
 	}, nil
 }
 
@@ -110,8 +99,13 @@ type changePrivilegesNode struct {
 	targets         tree.TargetList
 	grantees        []security.SQLUsername
 	desiredprivs    privilege.List
-	changePrivilege func(*descpb.PrivilegeDescriptor, security.SQLUsername)
+	changePrivilege func(*descpb.PrivilegeDescriptor, privilege.List, security.SQLUsername)
 	grantOn         privilege.ObjectType
+
+	// granteesNameList is used for creating an AST node for alter default
+	// privileges inside changePrivilegesNode's startExec.
+	// This is required for getting the pre-normalized name to construct the AST.
+	granteesNameList tree.NameList
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -122,23 +116,12 @@ func (n *changePrivilegesNode) ReadingOwnWrites() {}
 func (n *changePrivilegesNode) startExec(params runParams) error {
 	ctx := params.ctx
 	p := params.p
-	// Check whether grantees exists
-	users, err := p.GetAllRoles(ctx)
-	if err != nil {
+
+	if err := p.validateRoles(ctx, n.grantees, true /* isPublicValid */); err != nil {
 		return err
 	}
 
-	// We're allowed to grant/revoke privileges to/from the "public" role even though
-	// it does not exist: add it to the list of all users and roles.
-	users[security.PublicRoleName()] = true // isRole
-
-	for i, grantee := range n.grantees {
-		if _, ok := users[grantee]; !ok {
-			sqlName := tree.Name(n.grantees[i].Normalized())
-			return errors.Errorf("user or role %s does not exist", &sqlName)
-		}
-	}
-
+	var err error
 	var descriptors []catalog.Descriptor
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
@@ -151,6 +134,21 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 
 	if len(descriptors) == 0 {
 		return nil
+	}
+
+	if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.DefaultPrivileges) {
+		if n.grantOn == privilege.Database {
+			compatiblePrivileges, err := convertPGIncompatibleDatabasePrivilegesToDefaultPrivileges(ctx, p, n, params)
+			if err != nil {
+				return err
+			}
+			// When granting, we exclude the incompatible privileges.
+			// Note: we can't do this when revoking in case the privilege was granted
+			// before 21.2 where this conversion does not happen.
+			if n.isGrant {
+				n.desiredprivs = compatiblePrivileges
+			}
+		}
 	}
 
 	var events []eventLogEntry
@@ -172,31 +170,35 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			return err
 		}
 
-		// Only allow granting/revoking privileges that the requesting
-		// user themselves have on the descriptor.
-		for _, priv := range n.desiredprivs {
-			if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
+		if len(n.desiredprivs) > 0 {
+			// Only allow granting/revoking privileges that the requesting
+			// user themselves have on the descriptor.
+			for _, priv := range n.desiredprivs {
+				if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
+					return err
+				}
+			}
+
+			privileges := descriptor.GetPrivileges()
+			for _, grantee := range n.grantees {
+				n.changePrivilege(privileges, n.desiredprivs, grantee)
+			}
+
+			// Ensure superusers have exactly the allowed privilege set.
+			// Postgres does not actually enforce this, instead of checking that
+			// superusers have all the privileges, Postgres allows superusers to
+			// bypass privilege checks.
+			err = catprivilege.ValidateSuperuserPrivileges(*privileges, descriptor, n.grantOn)
+			if err != nil {
 				return err
 			}
-		}
 
-		privileges := descriptor.GetPrivileges()
-		for _, grantee := range n.grantees {
-			n.changePrivilege(privileges, grantee)
-		}
-
-		// Ensure superusers have exactly the allowed privilege set.
-		// Postgres does not actually enforce this, instead of checking that
-		// superusers have all the privileges, Postgres allows superusers to
-		// bypass privilege checks.
-		if err := privileges.ValidateSuperuserPrivileges(descriptor.GetID(), n.grantOn); err != nil {
-			return err
-		}
-
-		// Validate privilege descriptors directly as the db/table level Validate
-		// may fix up the descriptor.
-		if err := privileges.Validate(descriptor.GetID(), n.grantOn); err != nil {
-			return err
+			// Validate privilege descriptors directly as the db/table level Validate
+			// may fix up the descriptor.
+			err = catprivilege.Validate(*privileges, descriptor, n.grantOn)
+			if err != nil {
+				return err
+			}
 		}
 
 		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -325,4 +327,99 @@ func getGrantOnObject(targets tree.TargetList, incIAMFunc func(on string)) privi
 		incIAMFunc(sqltelemetry.OnTable)
 		return privilege.Table
 	}
+}
+
+// validateRoles checks that all the roles are valid users.
+// isPublicValid determines whether or not Public is a valid role.
+func (p *planner) validateRoles(
+	ctx context.Context, roles []security.SQLUsername, isPublicValid bool,
+) error {
+	users, err := p.GetAllRoles(ctx)
+	if err != nil {
+		return err
+	}
+	if isPublicValid {
+		users[security.PublicRoleName()] = true // isRole
+	}
+	for i, grantee := range roles {
+		if _, ok := users[grantee]; !ok {
+			sqlName := tree.Name(roles[i].Normalized())
+			return errors.Errorf("user or role %s does not exist", &sqlName)
+		}
+	}
+
+	return nil
+}
+
+// convertPGIncompatibleDatabasePrivilegesToDefaultPrivileges takes the
+// incompatible database privileges in the grant statement and creates
+// a alter default privileges AST and plan node and executes the plan node.
+func convertPGIncompatibleDatabasePrivilegesToDefaultPrivileges(
+	ctx context.Context, p *planner, n *changePrivilegesNode, params runParams,
+) (compatiblePrivs privilege.List, err error) {
+	databaseTargets := n.targets.Databases
+
+	// Convert PGIncompatibleDatabase privileges to default privileges instead.
+	var incompatiblePrivs privilege.List
+	for _, priv := range n.desiredprivs {
+		if privilege.PGIncompatibleDBPrivileges.Contains(priv) {
+			incompatiblePrivs = append(incompatiblePrivs, priv)
+		} else {
+			compatiblePrivs = append(compatiblePrivs, priv)
+		}
+	}
+
+	// The incompatible privileges are added as default privileges for all roles
+	// on the databases.
+	for _, database := range databaseTargets {
+		// If n.targets.Database has elements, all descriptors must be database
+		// descriptors.
+		// The objectType is always Tables since the incompatible pg privileges
+		// are (SELECT, INSERT, UPDATE, DELETE) which were previously allowed
+		// for the sake of inheriting privileges from the DB to the table.
+		objectType := tree.Tables
+		var translatedStatement string
+		if len(incompatiblePrivs) > 0 {
+			alterDefaultPrivilegesASTNode := tree.AlterDefaultPrivileges{
+				ForAllRoles: true,
+				IsGrant:     n.isGrant,
+				Database:    &database,
+			}
+			if n.isGrant {
+				alterDefaultPrivilegesASTNode.Grant = tree.AbbreviatedGrant{
+					Grantees:   n.granteesNameList,
+					Privileges: incompatiblePrivs,
+					Target:     objectType,
+				}
+			} else if !n.isGrant {
+				// If revoke is specified, we need to revoke both existing privileges
+				// on the database and also default privileges.
+				alterDefaultPrivilegesASTNode.Revoke = tree.AbbreviatedRevoke{
+					Grantees:   n.granteesNameList,
+					Privileges: incompatiblePrivs,
+					Target:     objectType,
+				}
+			}
+			alterDefaultPrivilegesNode, err := p.alterDefaultPrivileges(
+				ctx, &alterDefaultPrivilegesASTNode,
+			)
+			if err != nil {
+				return nil, err
+			}
+			translatedStatement = fmt.Sprintf("USE %s; %s;", database.Normalize(),
+				alterDefaultPrivilegesASTNode.String())
+			if err := alterDefaultPrivilegesNode.startExec(params); err != nil {
+				return nil, err
+			}
+
+			p.BufferClientNotice(ctx, pgnotice.Newf(
+				"granting %s on databases is deprecated, "+
+					"please use ALTER DEFAULT PRIVILEGES FOR ALL ROLES.\n"+
+					"%s privileges were not granted, "+
+					"the statement was automatically translated to %s",
+				incompatiblePrivs, incompatiblePrivs, translatedStatement,
+			))
+		}
+	}
+	return compatiblePrivs, nil
 }

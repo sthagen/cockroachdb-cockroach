@@ -156,7 +156,7 @@ func TestStorePoolGossipUpdate(t *testing.T) {
 // verifyStoreList ensures that the returned list of stores is correct.
 func verifyStoreList(
 	sp *StorePool,
-	constraints []zonepb.ConstraintsConjunction,
+	constraints []roachpb.ConstraintsConjunction,
 	storeIDs roachpb.StoreIDSlice, // optional
 	filter storeFilter,
 	expected []int,
@@ -172,7 +172,7 @@ func verifyStoreList(
 		sl, aliveStoreCount, throttled = sp.getStoreListFromIDs(storeIDs, filter)
 	}
 	throttledStoreCount := len(throttled)
-	sl = sl.filter(constraints)
+	sl = sl.excludeInvalid(constraints)
 	if aliveStoreCount != expectedAliveStoreCount {
 		return errors.Errorf("expected AliveStoreCount %d does not match actual %d",
 			expectedAliveStoreCount, aliveStoreCount)
@@ -205,18 +205,18 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		livenesspb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.Background())
 	sg := gossiputil.NewStoreGossiper(g)
-	constraints := []zonepb.ConstraintsConjunction{
+	constraints := []roachpb.ConstraintsConjunction{
 		{
-			Constraints: []zonepb.Constraint{
-				{Type: zonepb.Constraint_REQUIRED, Value: "ssd"},
-				{Type: zonepb.Constraint_REQUIRED, Value: "dc"},
+			Constraints: []roachpb.Constraint{
+				{Type: roachpb.Constraint_REQUIRED, Value: "ssd"},
+				{Type: roachpb.Constraint_REQUIRED, Value: "dc"},
 			},
 		},
 	}
 	required := []string{"ssd", "dc"}
 	// Nothing yet.
 	sl, _, _ := sp.getStoreList(storeFilterNone)
-	sl = sl.filter(constraints)
+	sl = sl.excludeInvalid(constraints)
 	if len(sl.stores) != 0 {
 		t.Errorf("expected no stores, instead %+v", sl.stores)
 	}
@@ -403,13 +403,12 @@ func TestStoreListFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	constraints := []zonepb.ConstraintsConjunction{
+	constraints := []roachpb.ConstraintsConjunction{
 		{
-			Constraints: []zonepb.Constraint{
-				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: "us-west"},
-				{Type: zonepb.Constraint_REQUIRED, Value: "MustMatch"},
-				{Type: zonepb.Constraint_DEPRECATED_POSITIVE, Value: "MatchingOptional"},
-				{Type: zonepb.Constraint_PROHIBITED, Value: "MustNotMatch"},
+			Constraints: []roachpb.Constraint{
+				{Type: roachpb.Constraint_REQUIRED, Key: "region", Value: "us-west"},
+				{Type: roachpb.Constraint_REQUIRED, Value: "MustMatch"},
+				{Type: roachpb.Constraint_PROHIBITED, Value: "MustNotMatch"},
 			},
 		},
 	}
@@ -486,7 +485,7 @@ func TestStoreListFilter(t *testing.T) {
 		}
 	}
 
-	filtered := sl.filter(constraints)
+	filtered := sl.excludeInvalid(constraints)
 	if !reflect.DeepEqual(expected, filtered.stores) {
 		t.Errorf("did not get expected stores %s", pretty.Diff(expected, filtered.stores))
 	}
@@ -755,7 +754,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 		mnl.setNodeStatus(roachpb.NodeID(i), livenesspb.NodeLivenessStatus_LIVE)
 	}
 
-	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(replicas)
+	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(replicas, false /* includeSuspectAndDrainingStores */)
 	if len(liveReplicas) != 5 {
 		t.Fatalf("expected five live replicas, found %d (%v)", len(liveReplicas), liveReplicas)
 	}
@@ -766,7 +765,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	mnl.setNodeStatus(4, livenesspb.NodeLivenessStatus_DEAD)
 	mnl.setNodeStatus(5, livenesspb.NodeLivenessStatus_DEAD)
 
-	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas)
+	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas, false /* includeSuspectNodes */)
 	if a, e := liveReplicas, replicas[:3]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected live replicas %+v; got %+v", e, a)
 	}
@@ -777,7 +776,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	// Mark node 4 as merely unavailable.
 	mnl.setNodeStatus(4, livenesspb.NodeLivenessStatus_UNAVAILABLE)
 
-	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas)
+	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas, false /* includeSuspectAndDrainingStores */)
 	if a, e := liveReplicas, replicas[:3]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected live replicas %+v; got %+v", e, a)
 	}
@@ -802,7 +801,10 @@ func TestStorePoolDefaultState(t *testing.T) {
 		livenesspb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.Background())
 
-	liveReplicas, deadReplicas := sp.liveAndDeadReplicas([]roachpb.ReplicaDescriptor{{StoreID: 1}})
+	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(
+		[]roachpb.ReplicaDescriptor{{StoreID: 1}},
+		false, /* includeSuspectAndDrainingStores */
+	)
 	if len(liveReplicas) != 0 || len(deadReplicas) != 0 {
 		t.Errorf("expected 0 live and 0 dead replicas; got %v and %v", liveReplicas, deadReplicas)
 	}
@@ -875,6 +877,8 @@ func TestStorePoolSuspected(t *testing.T) {
 	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 	timeAfterStoreSuspect := TimeAfterStoreSuspect.Get(&sp.st.SV)
 
+	// See state transition diagram in storeDetail.status() for a visual
+	// representation of what this test asserts.
 	mnl.setNodeStatus(store.Node.NodeID, livenesspb.NodeLivenessStatus_LIVE)
 	sp.detailsMu.Lock()
 	detail := sp.getStoreDetailLocked(store.StoreID)
@@ -888,11 +892,16 @@ func TestStorePoolSuspected(t *testing.T) {
 	sp.detailsMu.Lock()
 	s = detail.status(now, timeUntilStoreDead, sp.nodeLivenessFn, timeAfterStoreSuspect)
 	sp.detailsMu.Unlock()
-	require.Equal(t, s, storeStatusSuspect)
+	require.Equal(t, s, storeStatusUnknown)
 	require.False(t, detail.lastAvailable.IsZero())
 	require.False(t, detail.lastUnavailable.IsZero())
 
 	mnl.setNodeStatus(store.Node.NodeID, livenesspb.NodeLivenessStatus_LIVE)
+	sp.detailsMu.Lock()
+	s = detail.status(now, timeUntilStoreDead, sp.nodeLivenessFn, timeAfterStoreSuspect)
+	sp.detailsMu.Unlock()
+	require.Equal(t, s, storeStatusSuspect)
+
 	sp.detailsMu.Lock()
 	s = detail.status(now.Add(timeAfterStoreSuspect).Add(time.Millisecond),
 		timeUntilStoreDead, sp.nodeLivenessFn, timeAfterStoreSuspect)
@@ -904,7 +913,7 @@ func TestStorePoolSuspected(t *testing.T) {
 	s = detail.status(now,
 		timeUntilStoreDead, sp.nodeLivenessFn, timeAfterStoreSuspect)
 	sp.detailsMu.Unlock()
-	require.Equal(t, s, storeStatusUnknown)
+	require.Equal(t, s, storeStatusDraining)
 	require.True(t, detail.lastAvailable.IsZero())
 
 	mnl.setNodeStatus(store.Node.NodeID, livenesspb.NodeLivenessStatus_LIVE)
@@ -1062,7 +1071,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 		mnl.setNodeStatus(roachpb.NodeID(i), livenesspb.NodeLivenessStatus_LIVE)
 	}
 
-	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(replicas)
+	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(replicas, false /* includeSuspectAndDrainingStores */)
 	if len(liveReplicas) != 5 {
 		t.Fatalf("expected five live replicas, found %d (%v)", len(liveReplicas), liveReplicas)
 	}
@@ -1074,7 +1083,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 	// Mark node 5 as dead.
 	mnl.setNodeStatus(5, livenesspb.NodeLivenessStatus_DEAD)
 
-	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas)
+	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas, false /* includeSuspectAndDrainingStores */)
 	// Decommissioning replicas are considered live.
 	if a, e := liveReplicas, replicas[:4]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected live replicas %+v; got %+v", e, a)
@@ -1227,7 +1236,7 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 			},
 			expected: livenesspb.NodeLivenessStatus_DECOMMISSIONED,
 		},
-		// Draining (reports as unavailable).
+		// Draining
 		{
 			liveness: livenesspb.Liveness{
 				NodeID: 1,
@@ -1238,6 +1247,31 @@ func TestNodeLivenessLivenessStatus(t *testing.T) {
 				Draining: true,
 			},
 			expected: livenesspb.NodeLivenessStatus_DRAINING,
+		},
+		// Decommissioning that is unavailable.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.UnixNano(),
+				},
+				Draining:   false,
+				Membership: livenesspb.MembershipStatus_DECOMMISSIONING,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Draining that is unavailable.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.UnixNano(),
+				},
+				Draining: true,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
 		},
 	} {
 		t.Run("", func(t *testing.T) {

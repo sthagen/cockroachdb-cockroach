@@ -55,7 +55,7 @@ func (e *explainPlanNode) startExec(params runParams) error {
 
 	distribution := getPlanDistribution(
 		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeID,
-		params.extendedEvalCtx.SessionData.DistSQLMode, plan.main,
+		params.extendedEvalCtx.SessionData().DistSQLMode, plan.main,
 	)
 	ob.AddDistribution(distribution.String())
 
@@ -82,9 +82,9 @@ func (e *explainPlanNode) startExec(params runParams) error {
 		// cause an error or panic, so swallow the error. See #40677 for example.
 		distSQLPlanner.FinalizePlan(planCtx, physicalPlan)
 		flows := physicalPlan.GenerateFlowSpecs()
-		flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p, &distSQLPlanner.rpcCtx.ClusterID)
+		flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
 
-		ctxSessionData := flowCtx.EvalCtx.SessionData
+		ctxSessionData := flowCtx.EvalCtx.SessionData()
 		var willVectorize bool
 		if ctxSessionData.VectorizeMode == sessiondatapb.VectorizeOff {
 			willVectorize = false
@@ -231,5 +231,8 @@ func newPhysPlanForExplainPurposes(
 	if plan.isPhysicalPlan() {
 		return plan.physPlan.PhysicalPlan, nil
 	}
-	return distSQLPlanner.createPhysPlanForPlanNode(planCtx, plan.planNode)
+	physPlan, err := distSQLPlanner.createPhysPlanForPlanNode(planCtx, plan.planNode)
+	// Release the resources right away since we won't be running the plan.
+	planCtx.getCleanupFunc()()
+	return physPlan, err
 }

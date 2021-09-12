@@ -10,8 +10,12 @@ SELECT node_id, name FROM crdb_internal.leases ORDER BY name
 ----
 0  eventlog
 0  jobs
+0  locations
 0  role_members
 0  role_options
+0  scheduled_jobs
+0  settings
+0  statement_diagnostics_requests
 0  test
 0  users
 
@@ -27,6 +31,7 @@ DROP DATABASE crdb_internal
 query TTTTIT
 SHOW TABLES FROM crdb_internal
 ----
+crdb_internal  active_range_feeds           table  NULL  NULL  NULL
 crdb_internal  backward_dependencies        table  NULL  NULL  NULL
 crdb_internal  builtin_functions            table  NULL  NULL  NULL
 crdb_internal  cluster_contended_indexes    view   NULL  NULL  NULL
@@ -44,6 +49,7 @@ crdb_internal  create_statements            table  NULL  NULL  NULL
 crdb_internal  create_type_statements       table  NULL  NULL  NULL
 crdb_internal  cross_db_references          table  NULL  NULL  NULL
 crdb_internal  databases                    table  NULL  NULL  NULL
+crdb_internal  default_privileges           table  NULL  NULL  NULL
 crdb_internal  feature_usage                table  NULL  NULL  NULL
 crdb_internal  forward_dependencies         table  NULL  NULL  NULL
 crdb_internal  gossip_alerts                table  NULL  NULL  NULL
@@ -51,6 +57,7 @@ crdb_internal  gossip_liveness              table  NULL  NULL  NULL
 crdb_internal  gossip_network               table  NULL  NULL  NULL
 crdb_internal  gossip_nodes                 table  NULL  NULL  NULL
 crdb_internal  index_columns                table  NULL  NULL  NULL
+crdb_internal  index_usage_statistics       table  NULL  NULL  NULL
 crdb_internal  interleaved                  table  NULL  NULL  NULL
 crdb_internal  invalid_objects              table  NULL  NULL  NULL
 crdb_internal  jobs                         table  NULL  NULL  NULL
@@ -79,10 +86,12 @@ crdb_internal  regions                      table  NULL  NULL  NULL
 crdb_internal  schema_changes               table  NULL  NULL  NULL
 crdb_internal  session_trace                table  NULL  NULL  NULL
 crdb_internal  session_variables            table  NULL  NULL  NULL
+crdb_internal  statement_statistics         table  NULL  NULL  NULL
 crdb_internal  table_columns                table  NULL  NULL  NULL
 crdb_internal  table_indexes                table  NULL  NULL  NULL
 crdb_internal  table_row_statistics         table  NULL  NULL  NULL
 crdb_internal  tables                       table  NULL  NULL  NULL
+crdb_internal  transaction_statistics       table  NULL  NULL  NULL
 crdb_internal  zones                        table  NULL  NULL  NULL
 
 statement ok
@@ -160,10 +169,10 @@ Channel
 
 
 # The validity of the rows in this table are tested elsewhere; we merely assert the columns.
-query ITTTTTTTTTTTRTTII colnames
+query ITTTTTTTTTTTRTTIITTIT colnames
 SELECT * FROM crdb_internal.jobs WHERE false
 ----
-job_id  job_type  description  statement  user_name  descriptor_ids  status  running_status  created  started  finished  modified  fraction_completed  high_water_timestamp  error  coordinator_id  trace_id
+job_id  job_type  description  statement  user_name  descriptor_ids  status  running_status  created  started  finished  modified  fraction_completed  high_water_timestamp  error  coordinator_id  trace_id  last_run  next_run  num_runs  execution_errors
 
 query IITTITTT colnames
 SELECT * FROM crdb_internal.schema_changes WHERE table_id < 0
@@ -297,10 +306,10 @@ SELECT * FROM crdb_internal.ranges WHERE range_id < 0
 statement error not fully contained in tenant keyspace
 SELECT * FROM crdb_internal.ranges_no_leases WHERE range_id < 0
 
-# crdb_internal.zones is not populated for tenants.
 query IT
 SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1
 ----
+0  RANGE default
 
 query error pq: foo
 SELECT crdb_internal.force_error('', 'foo')
@@ -481,12 +490,12 @@ SELECT key, max_retries, flags LIKE '!%' AS f
  WHERE application_name = 'test_max_retry'
 ORDER BY key, f
 ----
-CREATE SEQUENCE s                                                     0  false
-DROP SEQUENCE s                                                       0  false
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)            2  false
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)            1  true
-SELECT IF(nextval(_) < _, crdb_internal.force_retry(_::INTERVAL), _)  0  true
-SET application_name = DEFAULT                                        0  false
+CREATE SEQUENCE s                                                         0  false
+DROP SEQUENCE s                                                           0  false
+RESET application_name                                                    0  false
+SELECT IF(nextval('_') < _, crdb_internal.force_retry('_'::INTERVAL), _)  0  true
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)                2  false
+SELECT IF(nextval(_) < _, crdb_internal.force_retry(_), _)                1  true
 
 query T
 SELECT crdb_internal.cluster_name()

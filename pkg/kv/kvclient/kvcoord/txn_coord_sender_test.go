@@ -2216,6 +2216,9 @@ func TestTxnCoordSenderPipelining(t *testing.T) {
 		Settings:   s.Cfg.Settings,
 		Clock:      s.Clock,
 		Stopper:    s.Stopper(),
+		// Disable transaction heartbeats so that they don't disrupt our attempt to
+		// track the requests issued by the transactions.
+		HeartbeatInterval: -1,
 	}, senderFn)
 	db := kv.NewDB(ambientCtx, tsf, s.Clock, s.Stopper())
 
@@ -2669,6 +2672,94 @@ func TestTxnManualRefresh(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			run(t, tc)
+		})
+	}
+}
+
+// TestTxnCoordSenderSetFixedTimestamp tests that SetFixedTimestamp cannot be
+// called after a transaction has already been used in the current epoch to read
+// or write.
+func TestTxnCoordSenderSetFixedTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	for _, test := range []struct {
+		name   string
+		before func(*testing.T, *kv.Txn)
+		expErr string
+	}{
+		{
+			name:   "nothing before",
+			before: func(t *testing.T, txn *kv.Txn) {},
+		},
+		{
+			name: "read before",
+			before: func(t *testing.T, txn *kv.Txn) {
+				_, err := txn.Get(ctx, "k")
+				require.NoError(t, err)
+			},
+			expErr: "cannot set fixed timestamp, .* already performed reads",
+		},
+		{
+			name: "write before",
+			before: func(t *testing.T, txn *kv.Txn) {
+				require.NoError(t, txn.Put(ctx, "k", "v"))
+			},
+			expErr: "cannot set fixed timestamp, .* already performed writes",
+		},
+		{
+			name: "read and write before",
+			before: func(t *testing.T, txn *kv.Txn) {
+				_, err := txn.Get(ctx, "k")
+				require.NoError(t, err)
+				require.NoError(t, txn.Put(ctx, "k", "v"))
+			},
+			expErr: "cannot set fixed timestamp, .* already performed reads",
+		},
+		{
+			name: "read before, in prior epoch",
+			before: func(t *testing.T, txn *kv.Txn) {
+				_, err := txn.Get(ctx, "k")
+				require.NoError(t, err)
+				txn.ManualRestart(ctx, txn.ReadTimestamp().Next())
+			},
+		},
+		{
+			name: "write before, in prior epoch",
+			before: func(t *testing.T, txn *kv.Txn) {
+				require.NoError(t, txn.Put(ctx, "k", "v"))
+				txn.ManualRestart(ctx, txn.ReadTimestamp().Next())
+			},
+		},
+		{
+			name: "read and write before, in prior epoch",
+			before: func(t *testing.T, txn *kv.Txn) {
+				_, err := txn.Get(ctx, "k")
+				require.NoError(t, err)
+				require.NoError(t, txn.Put(ctx, "k", "v"))
+				txn.ManualRestart(ctx, txn.ReadTimestamp().Next())
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := createTestDB(t)
+			defer s.Stop()
+
+			txn := kv.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+			test.before(t, txn)
+
+			ts := s.Clock.Now()
+			err := txn.SetFixedTimestamp(ctx, ts)
+			if test.expErr != "" {
+				require.Error(t, err)
+				require.Regexp(t, test.expErr, err)
+				require.False(t, txn.CommitTimestampFixed())
+			} else {
+				require.NoError(t, err)
+				require.True(t, txn.CommitTimestampFixed())
+				require.Equal(t, ts, txn.CommitTimestamp())
+			}
 		})
 	}
 }

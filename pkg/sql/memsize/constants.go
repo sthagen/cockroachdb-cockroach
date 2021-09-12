@@ -34,8 +34,14 @@ const (
 	// Int32 is the in-memory size of an int32 in bytes.
 	Int32 = int64(unsafe.Sizeof(int32(0)))
 
+	// Uint32 is the in-memory size of a uint32 in bytes.
+	Uint32 = int64(unsafe.Sizeof(uint32(0)))
+
 	// Int64 is the in-memory size of an int64 in bytes.
 	Int64 = int64(unsafe.Sizeof(int64(0)))
+
+	// Uint64 is the in-memory size of a uint64 in bytes.
+	Uint64 = int64(unsafe.Sizeof(uint64(0)))
 
 	// Float64 is the in-memory size of a float64 in bytes.
 	Float64 = int64(unsafe.Sizeof(float64(0)))
@@ -48,6 +54,9 @@ const (
 
 	// Decimal is the in-memory size of an apd.Decimal in bytes.
 	Decimal = int64(unsafe.Sizeof(apd.Decimal{}))
+
+	// String is the in-memory size of an empty string in bytes.
+	String = int64(unsafe.Sizeof(""))
 
 	// BoolSliceOverhead is the in-memory overhead of a []bool in bytes.
 	BoolSliceOverhead = int64(unsafe.Sizeof([]bool{}))
@@ -67,4 +76,11 @@ const (
 	// RowsSliceOverhead is the in-memory overhead of a [][][]tree.Datum in
 	// bytes.
 	RowsSliceOverhead = int64(unsafe.Sizeof([][][]tree.Datum{}))
+
+	// MapEntryOverhead is an estimate of the size of each item in a map in
+	// addition to the space occupied by the key and value. This value was
+	// determined empirically using runtime.GC() and runtime.ReadMemStats() to
+	// analyze the memory used by a map. This overhead appears to be independent
+	// of the key and value data types.
+	MapEntryOverhead = 64
 )

@@ -390,8 +390,9 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 // ID into a constant value, by evaluating it with respect to a set of other
 // columns that are constant. If the computed column is constant, enter it into
 // the constCols map and return false. Otherwise, return false.
+//
 func (c *CustomFuncs) tryFoldComputedCol(
-	tabMeta *opt.TableMeta, computedColID opt.ColumnID, constCols map[opt.ColumnID]opt.ScalarExpr,
+	tabMeta *opt.TableMeta, computedColID opt.ColumnID, constCols constColsMap,
 ) bool {
 	// Check whether computed column has already been folded.
 	if _, ok := constCols[computedColID]; ok {
@@ -423,6 +424,11 @@ func (c *CustomFuncs) tryFoldComputedCol(
 	}
 
 	computedCol := tabMeta.ComputedCols[computedColID]
+	if memo.CanBeCompositeSensitive(c.e.mem.Metadata(), computedCol) {
+		// The computed column expression can return different values for logically
+		// equal outer columns (e.g. d::STRING where d is a DECIMAL).
+		return false
+	}
 	replaced := replace(computedCol).(opt.ScalarExpr)
 
 	// If the computed column is constant, enter it into the constCols map.
@@ -792,7 +798,7 @@ func (c *CustomFuncs) GenerateInvertedIndexScans(
 		newScanPrivate.Cols = pkCols.Copy()
 		var invertedCol opt.ColumnID
 		if needInvertedFilter {
-			invertedCol = scanPrivate.Table.ColumnID(index.VirtualInvertedColumn().Ordinal())
+			invertedCol = scanPrivate.Table.ColumnID(index.InvertedColumn().Ordinal())
 			newScanPrivate.Cols.Add(invertedCol)
 		}
 
@@ -907,19 +913,18 @@ func (c *CustomFuncs) canMaybeConstrainNonInvertedIndex(
 func (c *CustomFuncs) GenerateZigzagJoins(
 	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, filters memo.FiltersExpr,
 ) {
-	tab := c.e.mem.Metadata().Table(scanPrivate.Table)
-
 	// Short circuit unless zigzag joins are explicitly enabled.
-	if !c.e.evalCtx.SessionData.ZigzagJoinEnabled {
+	if !c.e.evalCtx.SessionData().ZigzagJoinEnabled || scanPrivate.Flags.NoZigzagJoin {
 		return
 	}
 
 	fixedCols := memo.ExtractConstColumns(filters, c.e.evalCtx)
-
 	if fixedCols.Len() < 2 {
 		// Zigzagging requires at least 2 columns to have fixed values.
 		return
 	}
+
+	tab := c.e.mem.Metadata().Table(scanPrivate.Table)
 
 	// Zigzag joins aren't currently equipped to produce system columns, so
 	// don't generate any if some system columns are requested.
@@ -1265,7 +1270,7 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, filters memo.FiltersExpr,
 ) {
 	// Short circuit unless zigzag joins are explicitly enabled.
-	if !c.e.evalCtx.SessionData.ZigzagJoinEnabled {
+	if !c.e.evalCtx.SessionData().ZigzagJoinEnabled || scanPrivate.Flags.NoZigzagJoin {
 		return
 	}
 
@@ -1386,7 +1391,7 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 		leftTypes[invertedColIdx] = leftVal.ResolvedType()
 		rightVals[invertedColIdx] = c.e.f.ConstructConstVal(&rightVal, rightVal.ResolvedType())
 		rightTypes[invertedColIdx] = rightVal.ResolvedType()
-		invertedCol := scanPrivate.Table.ColumnID(index.VirtualInvertedColumn().Ordinal())
+		invertedCol := scanPrivate.Table.ColumnID(index.InvertedColumn().Ordinal())
 		zigzagJoin.LeftFixedCols[invertedColIdx] = invertedCol
 		zigzagJoin.RightFixedCols[invertedColIdx] = invertedCol
 
@@ -1632,7 +1637,7 @@ func (c *CustomFuncs) canMaybeConstrainIndexWithCols(
 		for j, n := 0, index.KeyColumnCount(); j < n; j++ {
 			col := index.Column(j)
 			ord := col.Ordinal()
-			if col.Kind() == cat.VirtualInverted {
+			if col.Kind() == cat.Inverted {
 				ord = col.InvertedSourceColumnOrdinal()
 			}
 			if cols.Contains(tabMeta.MetaID.ColumnID(ord)) {

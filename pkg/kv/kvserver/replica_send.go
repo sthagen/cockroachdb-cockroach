@@ -55,7 +55,7 @@ func (r *Replica) Send(
 //
 // github.com/cockroachdb/cockroach/pkg/storage.(*Replica).sendWithRangeID(0xc420d1a000, 0x64bfb80, 0xc421564b10, 0x15, 0x153fd4634aeb0193, 0x0, 0x100000001, 0x1, 0x15, 0x0, ...)
 func (r *Replica) sendWithRangeID(
-	ctx context.Context, rangeID roachpb.RangeID, ba *roachpb.BatchRequest,
+	ctx context.Context, _forStacks roachpb.RangeID, ba *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	var br *roachpb.BatchResponse
 	if r.leaseholderStats != nil && ba.Header.GatewayNodeID != 0 {
@@ -360,6 +360,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 			Priority:        ba.UserPriority,
 			ReadConsistency: ba.ReadConsistency,
 			WaitPolicy:      ba.WaitPolicy,
+			LockTimeout:     ba.LockTimeout,
 			Requests:        ba.Requests,
 			LatchSpans:      latchSpans, // nil if g != nil
 			LockSpans:       lockSpans,  // nil if g != nil
@@ -425,7 +426,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 			// Then attempt to acquire the lease if not currently held by any
 			// replica or redirect to the current leaseholder if currently held
 			// by a different replica.
-			if pErr = r.handleInvalidLeaseError(ctx, ba, pErr, t); pErr != nil {
+			if pErr = r.handleInvalidLeaseError(ctx, ba); pErr != nil {
 				return nil, pErr
 			}
 		case *roachpb.MergeInProgressError:
@@ -575,28 +576,14 @@ func (r *Replica) handleIndeterminateCommitError(
 }
 
 func (r *Replica) handleInvalidLeaseError(
-	ctx context.Context, ba *roachpb.BatchRequest, _ *roachpb.Error, t *roachpb.InvalidLeaseError,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) *roachpb.Error {
 	// On an invalid lease error, attempt to acquire a new lease. If in the
 	// process of doing so, we determine that the lease now lives elsewhere,
 	// redirect.
 	_, pErr := r.redirectOnOrAcquireLeaseForRequest(ctx, ba.Timestamp)
-	if pErr == nil {
-		// Lease valid. Retry command.
-		return nil
-	}
-	// If we failed to acquire the lease, check to see whether the request can
-	// still be served as a follower read on this replica. Doing so here will
-	// not be necessary once we break the dependency between closed timestamps
-	// and leases and address the TODO in checkExecutionCanProceed to check the
-	// closed timestamp before consulting the lease.
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.canServeFollowerReadRLocked(ctx, ba, pErr.GoError()) {
-		// Follower read possible. Retry command.
-		return nil
-	}
+	// If we managed to get a lease (i.e. pErr == nil), the request evaluation
+	// will be retried.
 	return pErr
 }
 

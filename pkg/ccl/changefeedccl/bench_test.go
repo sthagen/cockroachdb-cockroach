@@ -132,8 +132,13 @@ func makeBenchSink() *benchSink {
 }
 
 func (s *benchSink) EmitRow(
-	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context,
+	topicDescr TopicDescriptor,
+	key, value []byte,
+	updated hlc.Timestamp,
+	alloc kvevent.Alloc,
 ) error {
+	defer alloc.Release(ctx)
 	return s.emit(int64(len(key) + len(value)))
 }
 func (s *benchSink) EmitResolvedTimestamp(ctx context.Context, e Encoder, ts hlc.Timestamp) error {
@@ -224,7 +229,7 @@ func createBenchmarkChangefeed(
 		Gossip:           gossip.MakeOptionalGossip(s.GossipI().(*gossip.Gossip)),
 		Spans:            spans,
 		Targets:          details.Targets,
-		Sink:             buf,
+		Writer:           buf,
 		Metrics:          &metrics.KVFeedMetrics,
 		MM:               mm,
 		InitialHighWater: initialHighWater,

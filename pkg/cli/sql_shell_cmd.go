@@ -14,6 +14,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/clisqlshell"
+	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -26,7 +30,7 @@ var sqlShellCmd = &cobra.Command{
 Open a sql shell running against a cockroach database.
 `,
 	Args: cobra.NoArgs,
-	RunE: MaybeDecorateGRPCError(runTerm),
+	RunE: clierrorplus.MaybeDecorateError(runTerm),
 }
 
 func runTerm(cmd *cobra.Command, args []string) (resErr error) {
@@ -49,11 +53,23 @@ func runTerm(cmd *cobra.Command, args []string) (resErr error) {
 		fmt.Print(welcomeMessage)
 	}
 
-	conn, err := makeSQLClient("cockroach sql", useDefaultDb)
+	conn, err := makeSQLClient(catconstants.InternalSQLAppName, useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
+	sqlCtx.ShellCtx.ParseURL = makeURLParser(cmd)
 	return sqlCtx.Run(conn)
+}
+
+func makeURLParser(cmd *cobra.Command) clisqlshell.URLParser {
+	return func(url string) (*pgurl.URL, error) {
+		// Parse it as if --url was specified.
+		up := urlParser{cmd: cmd, cliCtx: &cliCtx}
+		if err := up.setInternal(url, false /* warn */); err != nil {
+			return nil, err
+		}
+		return cliCtx.sqlConnURL, nil
+	}
 }

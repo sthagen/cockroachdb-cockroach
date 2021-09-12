@@ -231,18 +231,6 @@ type Config struct {
 	// The flag exists mostly for the benefit of tests, and for
 	// `cockroach start-single-node`.
 	AutoInitializeCluster bool
-
-	// IdleExistAfter, If nonzero, will cause the server to run normally for the
-	// indicated amount of time, wait for all SQL connections to terminate,
-	// start a `defaultCountdownDuration` countdown and exit upon countdown
-	// reaching zero if no new connections occur. New connections will be
-	// accepted at all times and will effectively delay the exit (indefinitely
-	// if there is always at least one connection or there are no connection
-	// for less than `defaultCountdownDuration`. A new `defaultCountdownDuration`
-	// countdown will start when no more SQL connections exist.
-	// The interval is specified with a suffix of 's' for seconds, 'm' for
-	// minutes, and 'h' for hours.
-	IdleExitAfter time.Duration
 }
 
 // HistogramWindowInterval is used to determine the approximate length of time
@@ -522,11 +510,17 @@ type StorageConfig struct {
 	// MaxSize is used for calculating free space and making rebalancing
 	// decisions. Zero indicates that there is no maximum size.
 	MaxSize int64
+	// BallastSize is the amount reserved by a ballast file for manual
+	// out-of-disk recovery.
+	BallastSize int64
 	// Settings instance for cluster-wide knobs.
 	Settings *cluster.Settings
 	// UseFileRegistry is true if the file registry is needed (eg: encryption-at-rest).
 	// This may force the store version to versionFileRegistry if currently lower.
 	UseFileRegistry bool
+	// DisableSeparatedIntents is true if separated intents should not be written
+	// by intent writers. Only true for tests.
+	DisableSeparatedIntents bool
 	// EncryptionOptions is a serialized protobuf set by Go CCL code and passed
 	// through to C CCL code to set up encryption-at-rest.  Must be set if and
 	// only if encryption is enabled, otherwise left empty.

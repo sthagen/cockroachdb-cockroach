@@ -503,11 +503,15 @@ func (node *ComparisonExpr) Format(ctx *FmtCtx) {
 	opStr := node.Operator.String()
 	// IS and IS NOT are equivalent to IS NOT DISTINCT FROM and IS DISTINCT
 	// FROM, respectively, when the RHS is true or false. We prefer the less
-	// verbose IS and IS NOT in those cases.
-	if node.Operator.Symbol == IsDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
-		opStr = "IS NOT"
-	} else if node.Operator.Symbol == IsNotDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
-		opStr = "IS"
+	// verbose IS and IS NOT in those cases, unless we are in FmtHideConstants
+	// mode. In that mode we need the more verbose form in order to be able
+	// to re-parse the statement when reporting telemetry.
+	if !ctx.HasFlags(FmtHideConstants) {
+		if node.Operator.Symbol == IsDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
+			opStr = "IS NOT"
+		} else if node.Operator.Symbol == IsNotDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
+			opStr = "IS"
+		}
 	}
 	if node.Operator.Symbol.HasSubOperator() {
 		binExprFmtWithParenAndSubOp(ctx, node.Left, node.SubOperator.String(), opStr, node.Right)
@@ -1322,6 +1326,7 @@ const (
 	UnaryComplement
 	UnarySqrt
 	UnaryCbrt
+	UnaryPlus
 
 	NumUnaryOperatorSymbols
 )
@@ -1330,6 +1335,7 @@ var _ = NumUnaryOperatorSymbols
 
 var unaryOpName = [...]string{
 	UnaryMinus:      "-",
+	UnaryPlus:       "+",
 	UnaryComplement: "~",
 	UnarySqrt:       "|/",
 	UnaryCbrt:       "||/",
@@ -1624,7 +1630,14 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 		if _, ok := node.Expr.(*StrVal); ok {
 			ctx.FormatTypeReference(node.Type)
 			ctx.WriteByte(' ')
-			ctx.FormatNode(node.Expr)
+			// We need to replace this with a quoted string constants in certain
+			// cases because the grammar requires a string constant rather than an
+			// expression for this form of casting in the typed_literal rule
+			if ctx.HasFlags(FmtHideConstants) {
+				ctx.WriteString("'_'")
+			} else {
+				ctx.FormatNode(node.Expr)
+			}
 			break
 		}
 		fallthrough

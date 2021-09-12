@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupresolver"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -43,7 +45,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -52,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	pbtypes "github.com/gogo/protobuf/types"
 )
 
 const (
@@ -61,6 +63,7 @@ const (
 	backupOptEncKMS             = "kms"
 	backupOptWithPrivileges     = "privileges"
 	backupOptAsJSON             = "as_json"
+	backupOptWithDebugIDs       = "debug_ids"
 	localityURLParam            = "COCKROACH_LOCALITY"
 	defaultLocalityValue        = "default"
 )
@@ -328,7 +331,9 @@ func spansForAllTableIndexes(
 	checkForKVInBounds := func(start, end roachpb.Key, endTime hlc.Timestamp) (bool, error) {
 		var foundKV bool
 		err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			txn.SetFixedTimestamp(ctx, endTime)
+			if err := txn.SetFixedTimestamp(ctx, endTime); err != nil {
+				return err
+			}
 			res, err := txn.Scan(ctx, start, end, 1 /* maxRows */)
 			if err != nil {
 				return err
@@ -671,7 +676,18 @@ func checkPrivilegesForBackup(
 	}
 	for _, desc := range targetDescs {
 		switch desc := desc.(type) {
-		case catalog.DatabaseDescriptor, catalog.TableDescriptor:
+		case catalog.DatabaseDescriptor:
+			if connectErr := p.CheckPrivilege(ctx, desc, privilege.CONNECT); connectErr != nil {
+				// SELECT is being deprecated as privilege on Databases in 22.1.
+				// In the meanwhile, we still allow backup if the user has SELECT.
+				// TODO(richardjcai): Remove this check for SELECT in 22.1.
+				if selectErr := p.CheckPrivilege(ctx, desc, privilege.SELECT); selectErr != nil {
+					// Return the connectErr as we want users to grant CONNECT to perform
+					// this backup and not select.
+					return connectErr
+				}
+			}
+		case catalog.TableDescriptor:
 			if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
 				return err
 			}
@@ -821,10 +837,11 @@ func backupPlanHook(
 
 		endTime := p.ExecCfg().Clock.Now()
 		if backupStmt.AsOf.Expr != nil {
-			var err error
-			if endTime, err = p.EvalAsOfTimestamp(ctx, backupStmt.AsOf); err != nil {
+			asOf, err := p.EvalAsOfTimestamp(ctx, backupStmt.AsOf)
+			if err != nil {
 				return err
 			}
+			endTime = asOf.Timestamp
 		}
 
 		defaultURI, urisByLocalityKV, err := getURIsByLocalityKV(to, "")
@@ -903,19 +920,7 @@ func backupPlanHook(
 			}
 		case tree.AllDescriptors:
 			// Cluster backups include all of the descriptors in the cluster.
-			var allDescs []catalog.Descriptor
-			var err error
-			switch mvccFilter {
-			case MVCCFilter_All:
-				// Usually, revision_history backups include all previous versions of the
-				// descriptors at exist as of end time since they have not been GC'ed yet.
-				// However, since database descriptors are deleted as soon as the database
-				// is deleted, cluster backups need to explicitly go looking for these
-				// dropped descriptors up front.
-				allDescs, err = loadAllDescsInInterval(ctx, p.ExecCfg().Codec, p.ExecCfg().DB, startTime, endTime)
-			case MVCCFilter_Latest:
-				allDescs, err = backupresolver.LoadAllDescs(ctx, p.ExecCfg().Codec, p.ExecCfg().DB, endTime)
-			}
+			allDescs, err := backupresolver.LoadAllDescs(ctx, p.ExecCfg().Codec, p.ExecCfg().DB, endTime)
 			if err != nil {
 				return err
 			}
@@ -1025,12 +1030,13 @@ func backupPlanHook(
 			}
 			spans = append(spans, tableSpans...)
 
-			// Include all tenants.
-			// TODO(tbg): make conditional on cluster setting.
-			tenantRows, err = p.ExecCfg().InternalExecutor.QueryBuffered(
-				ctx, "backup-lookup-tenant", p.ExtendedEvalContext().Txn,
-				`SELECT id, active, info FROM system.tenants`,
-			)
+			if p.ExecCfg().Codec.ForSystemTenant() {
+				// Include all tenants.
+				tenantRows, err = p.ExecCfg().InternalExecutor.QueryBuffered(
+					ctx, "backup-lookup-tenant", p.ExtendedEvalContext().Txn,
+					`SELECT id, active, info FROM system.tenants`,
+				)
+			}
 
 			if err != nil {
 				return err
@@ -1213,6 +1219,11 @@ func backupPlanHook(
 			EncryptionInfo:    encryptionInfo,
 			CollectionURI:     collectionURI,
 		}
+
+		if err := planSchedulePTSChaining(ctx, p, &backupDetails, backupStmt); err != nil {
+			return err
+		}
+
 		if len(spans) > 0 && p.ExecCfg().Codec.ForSystemTenant() {
 			protectedtsID := uuid.MakeV4()
 			backupDetails.ProtectedTimestampRecord = &protectedtsID
@@ -1376,6 +1387,108 @@ func backupPlanHook(
 	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
 }
 
+func getScheduledBackupExecutionArgsFromSchedule(
+	ctx context.Context,
+	env scheduledjobs.JobSchedulerEnv,
+	txn *kv.Txn,
+	ie *sql.InternalExecutor,
+	scheduleID int64,
+) (*jobs.ScheduledJob, *ScheduledBackupExecutionArgs, error) {
+	// Load the schedule that has spawned this job.
+	sj, err := jobs.LoadScheduledJob(ctx, env, scheduleID, ie, txn)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to load scheduled job %d", scheduleID)
+	}
+
+	args := &ScheduledBackupExecutionArgs{}
+	if err := pbtypes.UnmarshalAny(sj.ExecutionArgs().Args, args); err != nil {
+		return nil, nil, errors.Wrap(err, "un-marshaling args")
+	}
+
+	return sj, args, nil
+}
+
+// planSchedulePTSChaining populates backupDetails with information relevant to
+// the chaining of protected timestamp records between scheduled backups.
+// Depending on whether backupStmt is a full or incremental backup, we populate
+// relevant fields that are used to perform this chaining, on successful
+// completion of the backup job.
+func planSchedulePTSChaining(
+	ctx context.Context,
+	p sql.PlanHookState,
+	backupDetails *jobspb.BackupDetails,
+	backupStmt *annotatedBackupStatement,
+) error {
+	env := scheduledjobs.ProdJobSchedulerEnv
+	if knobs, ok := p.ExecCfg().DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
+		if knobs.JobSchedulerEnv != nil {
+			env = knobs.JobSchedulerEnv
+		}
+	}
+	// If this is not a scheduled backup, we do not chain pts records.
+	if backupStmt.CreatedByInfo == nil || backupStmt.CreatedByInfo.Name != jobs.CreatedByScheduledJobs {
+		return nil
+	}
+
+	_, args, err := getScheduledBackupExecutionArgsFromSchedule(ctx, env,
+		p.ExtendedEvalContext().Txn, p.ExecCfg().InternalExecutor, backupStmt.CreatedByInfo.ID)
+	if err != nil {
+		return err
+	}
+	if !args.ChainProtectedTimestampRecords {
+		return nil
+	}
+
+	if args.BackupType == ScheduledBackupExecutionArgs_FULL {
+		// Check if there is a dependent incremental schedule associated with the
+		// full schedule running the current backup.
+		// If present, the full backup on successful completion, will release the
+		// pts record found on the incremental schedule, and replace it with a new
+		// pts record protecting after the EndTime of the full backup.
+		if args.DependentScheduleID == 0 {
+			return nil
+		}
+
+		_, incArgs, err := getScheduledBackupExecutionArgsFromSchedule(ctx, env,
+			p.ExtendedEvalContext().Txn, p.ExecCfg().InternalExecutor, args.DependentScheduleID)
+		if err != nil {
+			// If we are unable to resolve the dependent incremental schedule (it
+			// could have been dropped) we do not need to perform any chaining.
+			//
+			// TODO(adityamaru): Update this comment when DROP SCHEDULE is taught
+			// to clear the dependent ID. Once that is done, we should not encounter
+			// this error.
+			if jobs.HasScheduledJobNotFoundError(err) {
+				log.Warningf(ctx, "could not find dependent schedule with id %d",
+					args.DependentScheduleID)
+				return nil
+			}
+			return err
+		}
+		backupDetails.SchedulePTSChainingRecord = &jobspb.SchedulePTSChainingRecord{
+			ProtectedTimestampRecord: incArgs.ProtectedTimestampRecord,
+			Action:                   jobspb.SchedulePTSChainingRecord_RELEASE,
+		}
+	} else {
+		// In the case of a scheduled incremental backup we save the pts record id
+		// that the job should update on successful completion, to protect data
+		// after the current backups' EndTime.
+		// We save this information on the job instead of reading it from the
+		// schedule on completion, so as to prevent an "overhang" incremental from
+		// incorrectly pulling forward a pts record that was written by a new full
+		// backup that completed while the incremental was still executing.
+		//
+		// NB: An overhang incremental is defined as a scheduled incremental backup
+		// that appends to the old full backup chain, and completes after a new full
+		// backup has started another chain.
+		backupDetails.SchedulePTSChainingRecord = &jobspb.SchedulePTSChainingRecord{
+			ProtectedTimestampRecord: args.ProtectedTimestampRecord,
+			Action:                   jobspb.SchedulePTSChainingRecord_UPDATE,
+		}
+	}
+	return nil
+}
+
 // getReintroducedSpans checks to see if any spans need to be re-backed up from
 // ts = 0. This may be the case if a span was OFFLINE in the previous backup and
 // has come back online since. The entire span needs to be re-backed up because
@@ -1509,8 +1622,8 @@ func protectTimestampForBackup(
 		if !startTime.IsEmpty() {
 			tsToProtect = startTime
 		}
-		rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, jobID,
-			tsToProtect, spans)
+		rec := jobsprotectedts.MakeRecord(*backupDetails.ProtectedTimestampRecord, int64(jobID),
+			tsToProtect, spans, jobsprotectedts.Jobs)
 		err := p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, rec)
 		if err != nil {
 			return err

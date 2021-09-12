@@ -36,12 +36,12 @@ func registerLiquibase(r registry.Registry) {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
 		c.Start(ctx, c.All())
 
-		version, err := fetchCockroachVersion(ctx, c, node[0], nil)
+		version, err := fetchCockroachVersion(ctx, c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0], nil); err != nil {
+		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0]); err != nil {
 			t.Fatal(err)
 		}
 
@@ -99,14 +99,34 @@ func registerLiquibase(r registry.Registry) {
 		}
 
 		t.Status("running liquibase test harness")
-		// All tests are expected to pass, so this should not error.
-		// The dbVersion is set to 20.2 since that causes all known passing tests
-		// to be run.
-		if err = c.RunE(ctx, node,
-			`cd /mnt/data1/liquibase-test-harness/ && mvn test -Dtest=LiquibaseHarnessSuiteTest -DdbName=cockroachdb -DdbVersion=20.2`,
-		); err != nil {
-			t.Fatal(err)
+		blocklistName, expectedFailures, _, ignoreList := liquibaseBlocklists.getLists(version)
+		if expectedFailures == nil {
+			t.Fatalf("No hibernate blocklist defined for cockroach version %s", version)
 		}
+
+		const (
+			repoDir     = "/mnt/data1/liquibase-test-harness"
+			resultsPath = repoDir + "/target/surefire-reports/TEST-liquibase.harness.LiquibaseHarnessSuiteTest.xml"
+		)
+
+		cmd := fmt.Sprintf("cd /mnt/data1/liquibase-test-harness/ && "+
+			"mvn surefire-report:report-only test -Dtest=LiquibaseHarnessSuiteTest "+
+			"-DdbName=cockroachdb -DdbVersion=20.2 -DoutputDirectory=%s", repoDir)
+
+		err = c.RunE(ctx, node, cmd)
+		if err != nil {
+			t.L().Printf("error whilst running tests (may be expected): %#v", err)
+		}
+
+		parseAndSummarizeJavaORMTestsResults(
+			ctx, t, c, node, "liquibase" /* ormName */, []byte(resultsPath),
+			blocklistName,
+			expectedFailures,
+			ignoreList,
+			version,
+			supportedLiquibaseHarnessCommit,
+		)
+
 	}
 
 	r.Add(registry.TestSpec{

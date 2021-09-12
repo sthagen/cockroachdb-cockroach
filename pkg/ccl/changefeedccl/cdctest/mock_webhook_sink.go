@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // MockWebhookSink is the Webhook sink used in tests.
@@ -23,19 +24,29 @@ type MockWebhookSink struct {
 	username, password string
 	server             *httptest.Server
 	mu                 struct {
-		statusCode int
-		rows       []string
 		syncutil.Mutex
+		numCalls         int
+		statusCodes      []int
+		statusCodesIndex int
+		rows             []string
 	}
+}
+
+// StartMockWebhookSinkInsecure starts a mock webhook sink without TLS.
+func StartMockWebhookSinkInsecure() (*MockWebhookSink, error) {
+	s := makeMockWebhookSink()
+	s.server.Start()
+	return s, nil
 }
 
 // StartMockWebhookSink creates and starts a mock webhook sink for tests.
 func StartMockWebhookSink(certificate *tls.Certificate) (*MockWebhookSink, error) {
 	s := makeMockWebhookSink()
-	if certificate != nil {
-		s.server.TLS = &tls.Config{
-			Certificates: []tls.Certificate{*certificate},
-		}
+	if certificate == nil {
+		return nil, errors.Errorf("Must pass a CA cert when creating a mock webhook sink.")
+	}
+	s.server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{*certificate},
 	}
 	s.server.StartTLS()
 	return s, nil
@@ -61,7 +72,7 @@ func StartMockWebhookSinkWithBasicAuth(
 
 func makeMockWebhookSink() *MockWebhookSink {
 	s := &MockWebhookSink{}
-	s.mu.statusCode = http.StatusOK
+	s.mu.statusCodes = []int{http.StatusOK}
 	s.server = httptest.NewUnstartedServer(http.HandlerFunc(s.requestHandler))
 	return s
 }
@@ -71,12 +82,20 @@ func (s *MockWebhookSink) URL() string {
 	return s.server.URL
 }
 
-// SetStatusCode sets the HTTP status code to use when responding to a request.
-// Useful for testing error handling behavior on client side.
-func (s *MockWebhookSink) SetStatusCode(statusCode int) {
+// GetNumCalls returns how many times the sink handler has been invoked.
+func (s *MockWebhookSink) GetNumCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.mu.statusCode = statusCode
+	return s.mu.numCalls
+}
+
+// SetStatusCodes sets the list of HTTP status codes (in order) to use when
+// responding to a request (wraps around after completion). Useful for testing
+// error handling behavior on client side.
+func (s *MockWebhookSink) SetStatusCodes(statusCodes []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.statusCodes = statusCodes
 }
 
 // Close closes the mock Webhook sink.
@@ -138,8 +157,12 @@ func (s *MockWebhookSink) publish(hw http.ResponseWriter, hr *http.Request) erro
 		return err
 	}
 	s.mu.Lock()
-	s.mu.rows = append(s.mu.rows, string(row))
+	s.mu.numCalls++
+	if s.mu.statusCodes[s.mu.statusCodesIndex] >= http.StatusOK && s.mu.statusCodes[s.mu.statusCodesIndex] < http.StatusMultipleChoices {
+		s.mu.rows = append(s.mu.rows, string(row))
+	}
+	hw.WriteHeader(s.mu.statusCodes[s.mu.statusCodesIndex])
+	s.mu.statusCodesIndex = (s.mu.statusCodesIndex + 1) % len(s.mu.statusCodes)
 	s.mu.Unlock()
-	hw.WriteHeader(s.mu.statusCode)
 	return nil
 }

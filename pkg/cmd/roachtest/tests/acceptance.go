@@ -33,7 +33,10 @@ func registerAcceptance(r registry.Registry) {
 			{name: "event-log", fn: runEventLog},
 			{name: "gossip/peerings", fn: runGossipPeerings},
 			{name: "gossip/restart", fn: runGossipRestart},
-			{name: "gossip/restart-node-one", fn: runGossipRestartNodeOne},
+			{
+				name: "gossip/restart-node-one",
+				fn:   runGossipRestartNodeOne,
+			},
 			{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
 			{
 				name:       "multitenant",

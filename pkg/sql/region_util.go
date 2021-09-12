@@ -141,12 +141,28 @@ func zoneConfigForMultiRegionDatabase(
 	regionConfig multiregion.RegionConfig,
 ) (zonepb.ZoneConfig, error) {
 	numVoters, numReplicas := getNumVotersAndNumReplicas(regionConfig)
-	constraints := make([]zonepb.ConstraintsConjunction, len(regionConfig.Regions()))
-	for i, region := range regionConfig.Regions() {
-		// Constrain at least 1 (voting or non-voting) replica per region.
-		constraints[i] = zonepb.ConstraintsConjunction{
-			NumReplicas: 1,
-			Constraints: []zonepb.Constraint{makeRequiredConstraintForRegion(region)},
+	var constraints []zonepb.ConstraintsConjunction
+	if regionConfig.IsPlacementRestricted() {
+		// In a RESTRICTED placement policy, the database zone config has no
+		// non-voters so that REGIONAL BY [TABLE | ROW] can inherit the RESTRICTED
+		// placement. Voter placement will be set at the table/partition level to
+		// the table/partition region.
+
+		// NB: When setting empty constraints, use nil as opposed to []. When
+		// constraints are deserialized from the database, empty constraints are
+		// always deserialized as nil. Therefore, if constraints are set as [] here,
+		// the database will have a difference in its expected constraints vs the
+		// actual constraints when comparing using the multi-region validation
+		// builtins.
+		constraints = nil
+	} else {
+		constraints = make([]zonepb.ConstraintsConjunction, len(regionConfig.Regions()))
+		for i, region := range regionConfig.Regions() {
+			// Constrain at least 1 (voting or non-voting) replica per region.
+			constraints[i] = zonepb.ConstraintsConjunction{
+				NumReplicas: 1,
+				Constraints: []zonepb.Constraint{makeRequiredConstraintForRegion(region)},
+			}
 		}
 	}
 
@@ -229,8 +245,12 @@ func getNumVotersAndNumReplicas(
 	// are set the way they are.
 	case descpb.SurvivalGoal_ZONE_FAILURE:
 		numVoters = numVotersForZoneSurvival
-		// <numVoters in the home region> + <1 replica for every other region>
-		numReplicas = (numVotersForZoneSurvival) + (numRegions - 1)
+		if regionConfig.IsPlacementRestricted() {
+			numReplicas = numVoters
+		} else {
+			// <numVoters in the home region> + <1 replica for every other region>
+			numReplicas = (numVotersForZoneSurvival) + (numRegions - 1)
+		}
 	case descpb.SurvivalGoal_REGION_FAILURE:
 		// <(quorum - 1) voters in the home region> + <1 replica for every other
 		// region>
@@ -371,15 +391,49 @@ func zoneConfigForMultiRegionTable(
 	case *descpb.TableDescriptor_LocalityConfig_Global_:
 		// Enable non-blocking transactions.
 		ret.GlobalReads = proto.Bool(true)
-		// Inherit voter_constraints and lease preferences from the database. We do
-		// nothing here because `NewZoneConfig()` already marks those fields as
+
+		// For GLOBAL tables, we want non-voters in all regions
+		// for fast reads, so we have to manually build a zone config with the
+		// nonvoters as opposed to REGIONAL BY [TABLE | ROW] which can inherit the
+		// RESTRICTED placement from the database.
+		if regionConfig.IsPlacementRestricted() {
+			ret.NumVoters = &numVoters
+			vc, err := synthesizeVoterConstraints(regionConfig.PrimaryRegion(), regionConfig)
+			if err != nil {
+				return nil, err
+			}
+			ret.VoterConstraints = vc
+
+			ret.InheritedConstraints = false
+			ret.NullVoterConstraintsIsEmpty = true
+
+			numNonPrimaryRegions := len(regionConfig.Regions()) - 1
+			// Placement only applies in zone survivability in which case voters are
+			// only in the primary region. This means the total number of replicas is
+			// numVotersForZoneSurvival voting replicas + 1 for each non-primary
+			// region.
+			ret.NumReplicas = proto.Int32(numVoters + int32(numNonPrimaryRegions))
+			ret.Constraints = make([]zonepb.ConstraintsConjunction, len(regionConfig.Regions()))
+			for i, region := range regionConfig.Regions() {
+				ret.Constraints[i] = zonepb.ConstraintsConjunction{
+					NumReplicas: 1,
+					Constraints: []zonepb.Constraint{makeRequiredConstraintForRegion(region)},
+				}
+			}
+		}
+		// Inherit lease preference from the database. We do
+		// nothing here because `NewZoneConfig()` already marks the field as
 		// 'inherited'.
 	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
-		// Use the same configuration as the database and return nil here.
 		if l.RegionalByTable.Region == nil {
+			// If we don't have an explicit primary
+			// region, use the same configuration as the database and return a blank
+			// zcfg here.
 			return ret, nil
 		}
+		// If the table has a user-specified primary region, use it.
 		preferredRegion := *l.RegionalByTable.Region
+
 		voterConstraints, err := synthesizeVoterConstraints(preferredRegion, regionConfig)
 		if err != nil {
 			return nil, err
@@ -556,20 +610,18 @@ var applyZoneConfigForMultiRegionTableOptionRemoveGlobalZoneConfig = func(
 	return false, zc, nil
 }
 
-// ApplyZoneConfigForMultiRegionTable applies zone config settings based
-// on the options provided.
-func ApplyZoneConfigForMultiRegionTable(
+func prepareZoneConfigForMultiRegionTable(
 	ctx context.Context,
 	txn *kv.Txn,
 	execCfg *ExecutorConfig,
 	regionConfig multiregion.RegionConfig,
 	table catalog.TableDescriptor,
 	opts ...applyZoneConfigForMultiRegionTableOption,
-) error {
+) (*zoneConfigUpdate, error) {
 	tableID := table.GetID()
-	currentZoneConfig, err := getZoneConfigRaw(ctx, txn, execCfg.Codec, tableID)
+	currentZoneConfig, err := getZoneConfigRaw(ctx, txn, execCfg.Codec, execCfg.Settings, tableID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	newZoneConfig := *zonepb.NewZoneConfig()
 	if currentZoneConfig != nil {
@@ -584,7 +636,7 @@ func ApplyZoneConfigForMultiRegionTable(
 			table,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		hasNewSubzones = newHasNewSubzones || hasNewSubzones
 		newZoneConfig = modifiedNewZoneConfig
@@ -604,49 +656,47 @@ func ApplyZoneConfigForMultiRegionTable(
 	rewriteZoneConfig := !newZoneConfigIsEmpty
 	deleteZoneConfig := newZoneConfigIsEmpty && !currentZoneConfigIsEmpty
 
-	if rewriteZoneConfig {
-		if err := newZoneConfig.Validate(); err != nil {
-			return pgerror.Newf(
-				pgcode.CheckViolation,
-				"could not validate zone config: %v",
-				err,
-			)
-		}
-		if err := newZoneConfig.ValidateTandemFields(); err != nil {
-			return pgerror.Newf(
-				pgcode.CheckViolation,
-				"could not validate zone config: %v",
-				err,
-			)
-		}
-
-		// If we have fields that are not the default value, write in a new zone configuration
-		// value.
-		if _, err = writeZoneConfig(
-			ctx,
-			txn,
-			tableID,
-			table,
-			&newZoneConfig,
-			execCfg,
-			hasNewSubzones,
-		); err != nil {
-			return err
-		}
-	} else if deleteZoneConfig {
-		// Delete the zone configuration if it exists but the new zone config is
-		// blank.
-		if _, err = execCfg.InternalExecutor.Exec(
-			ctx,
-			"delete-zone-multiregion-table",
-			txn,
-			"DELETE FROM system.zones WHERE id = $1",
-			tableID,
-		); err != nil {
-			return err
-		}
+	if deleteZoneConfig {
+		return &zoneConfigUpdate{id: tableID}, nil
 	}
-	return nil
+	if !rewriteZoneConfig {
+		return nil, nil
+	}
+	if err := newZoneConfig.Validate(); err != nil {
+		return nil, pgerror.Newf(
+			pgcode.CheckViolation,
+			"could not validate zone config: %v",
+			err,
+		)
+	}
+	if err := newZoneConfig.ValidateTandemFields(); err != nil {
+		return nil, pgerror.Newf(
+			pgcode.CheckViolation,
+			"could not validate zone config: %v",
+			err,
+		)
+	}
+	return prepareZoneConfigWrites(
+		ctx, execCfg, tableID, table, &newZoneConfig, hasNewSubzones,
+	)
+}
+
+// ApplyZoneConfigForMultiRegionTable applies zone config settings based
+// on the options provided.
+func ApplyZoneConfigForMultiRegionTable(
+	ctx context.Context,
+	txn *kv.Txn,
+	execCfg *ExecutorConfig,
+	regionConfig multiregion.RegionConfig,
+	table catalog.TableDescriptor,
+	opts ...applyZoneConfigForMultiRegionTableOption,
+) error {
+	update, err := prepareZoneConfigForMultiRegionTable(ctx, txn, execCfg, regionConfig, table, opts...)
+	if update == nil || err != nil {
+		return err
+	}
+	_, err = writeZoneConfigUpdate(ctx, txn, execCfg, update)
+	return err
 }
 
 // ApplyZoneConfigFromDatabaseRegionConfig applies a zone configuration to the
@@ -694,7 +744,7 @@ func applyZoneConfigForMultiRegionDatabase(
 	txn *kv.Txn,
 	execConfig *ExecutorConfig,
 ) error {
-	currentZoneConfig, err := getZoneConfigRaw(ctx, txn, execConfig.Codec, dbID)
+	currentZoneConfig, err := getZoneConfigRaw(ctx, txn, execConfig.Codec, execConfig.Settings, dbID)
 	if err != nil {
 		return err
 	}
@@ -731,27 +781,54 @@ func applyZoneConfigForMultiRegionDatabase(
 	return nil
 }
 
-// updateZoneConfigsForAllTables loops through all of the tables in the
+type updateZoneConfigOptions struct {
+	filterFunc func(tb *tabledesc.Mutable) bool
+}
+
+type updateZoneConfigOption func(options *updateZoneConfigOptions)
+
+// updateZoneConfigsForTables loops through all of the tables in the
 // specified database and refreshes the zone configs for all tables.
-func (p *planner) updateZoneConfigsForAllTables(ctx context.Context, desc *dbdesc.Mutable) error {
+func (p *planner) updateZoneConfigsForTables(
+	ctx context.Context, desc catalog.DatabaseDescriptor, updateOpts ...updateZoneConfigOption,
+) error {
+	opts := updateZoneConfigOptions{
+		filterFunc: func(_ *tabledesc.Mutable) bool { return true },
+	}
+	for _, f := range updateOpts {
+		f(&opts)
+	}
+
+	regionConfig, err := SynthesizeRegionConfig(ctx, p.txn, desc.GetID(), p.Descriptors())
+	if err != nil {
+		return err
+	}
+
 	return p.forEachMutableTableInDatabase(
 		ctx,
 		desc,
 		func(ctx context.Context, scName string, tbDesc *tabledesc.Mutable) error {
-			regionConfig, err := SynthesizeRegionConfig(ctx, p.txn, desc.ID, p.Descriptors())
-			if err != nil {
-				return err
+			if opts.filterFunc(tbDesc) {
+				return ApplyZoneConfigForMultiRegionTable(
+					ctx,
+					p.txn,
+					p.ExecCfg(),
+					regionConfig,
+					tbDesc,
+					ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
+				)
 			}
-			return ApplyZoneConfigForMultiRegionTable(
-				ctx,
-				p.txn,
-				p.ExecCfg(),
-				regionConfig,
-				tbDesc,
-				ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
-			)
+			return nil
 		},
 	)
+}
+
+// WithOnlyGlobalTables modifies an updateZoneConfigOptions to only apply to
+// global tables.
+func WithOnlyGlobalTables(opts *updateZoneConfigOptions) {
+	opts.filterFunc = func(tb *tabledesc.Mutable) bool {
+		return tb.IsLocalityGlobal()
+	}
 }
 
 // maybeInitializeMultiRegionDatabase initializes a multi-region database if
@@ -854,6 +931,72 @@ func (p *planner) ValidateAllMultiRegionZoneConfigsInCurrentDatabase(ctx context
 	)
 }
 
+// ResetMultiRegionZoneConfigsForTable takes a table ID and resets that table's
+// zone configurations to match what would have originally been set by the
+// multi-region syntax.
+func (p *planner) ResetMultiRegionZoneConfigsForTable(ctx context.Context, id int64) error {
+	desc, err := p.Descriptors().GetMutableTableVersionByID(ctx, descpb.ID(id), p.txn)
+	if err != nil {
+		return errors.Wrapf(err, "error resolving referenced table ID %d", id)
+	}
+	// If the table is not a multi-region table, there's no work to be done
+	// here.
+	if desc.LocalityConfig == nil {
+		return nil
+	}
+	regionConfig, err := SynthesizeRegionConfig(ctx, p.txn, desc.GetParentID(), p.Descriptors())
+	if err != nil {
+		return err
+	}
+
+	return ApplyZoneConfigForMultiRegionTable(
+		ctx,
+		p.txn,
+		p.ExecCfg(),
+		regionConfig,
+		desc,
+		ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
+	)
+}
+
+// ResetMultiRegionZoneConfigsForDatabase takes a database ID and resets that
+// database's zone configuration to match what would have originally been set by
+// the multi-region syntax.
+func (p *planner) ResetMultiRegionZoneConfigsForDatabase(ctx context.Context, id int64) error {
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+		p.EvalContext().Ctx(),
+		p.txn,
+		descpb.ID(id),
+		tree.DatabaseLookupFlags{
+			Required: true,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if !dbDesc.IsMultiRegion() {
+		// Nothing to do.
+		return nil
+	}
+
+	regionConfig, err := SynthesizeRegionConfig(ctx, p.txn, dbDesc.GetID(), p.Descriptors())
+	if err != nil {
+		return err
+	}
+
+	// Update the database's zone configuration.
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
+		ctx,
+		dbDesc.GetID(),
+		regionConfig,
+		p.txn,
+		p.execCfg,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *planner) validateAllMultiRegionZoneConfigsInDatabase(
 	ctx context.Context,
 	dbDesc catalog.DatabaseDescriptor,
@@ -876,6 +1019,7 @@ func (p *planner) validateAllMultiRegionZoneConfigsInDatabase(
 		ctx,
 		p.txn,
 		p.ExecCfg().Codec,
+		p.ExecCfg().Settings,
 		ids,
 	)
 	if err != nil {
@@ -1032,6 +1176,7 @@ func SynthesizeRegionConfig(
 		dbDesc.GetRegionConfig().PrimaryRegion,
 		dbDesc.GetRegionConfig().SurvivalGoal,
 		regionEnumID,
+		dbDesc.GetRegionConfig().Placement,
 		multiregion.WithTransitioningRegions(transitioningRegionNames),
 	)
 
@@ -1434,7 +1579,7 @@ func (p *planner) validateZoneConfigForMultiRegionDatabaseWasNotModifiedByUser(
 		telemetry.Inc(sqltelemetry.OverrideMultiRegionDatabaseZoneConfigurationSystem)
 		return nil
 	}
-	currentZoneConfig, err := getZoneConfigRaw(ctx, p.txn, p.ExecCfg().Codec, dbDesc.GetID())
+	currentZoneConfig, err := getZoneConfigRaw(ctx, p.txn, p.ExecCfg().Codec, p.ExecCfg().Settings, dbDesc.GetID())
 	if err != nil {
 		return err
 	}
@@ -1508,7 +1653,7 @@ func (p *planner) validateZoneConfigForMultiRegionTableWasNotModifiedByUser(
 		telemetry.Inc(sqltelemetry.OverrideMultiRegionTableZoneConfigurationSystem)
 		return nil
 	}
-	currentZoneConfig, err := getZoneConfigRaw(ctx, p.txn, p.ExecCfg().Codec, desc.GetID())
+	currentZoneConfig, err := getZoneConfigRaw(ctx, p.txn, p.ExecCfg().Codec, p.ExecCfg().Settings, desc.GetID())
 	if err != nil {
 		return err
 	}

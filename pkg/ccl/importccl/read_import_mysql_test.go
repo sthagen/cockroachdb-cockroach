@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -50,10 +51,12 @@ func TestMysqldumpDataReader(t *testing.T) {
 	opts := roachpb.MysqldumpOptions{}
 
 	kvCh := make(chan row.KVBatch, 50)
+	semaCtx := tree.MakeSemaContext()
 	// When creating a new dump reader, we need to pass in the walltime that will be used as
 	// a parameter used for generating unique rowid, random, and gen_random_uuid as default
 	// expressions. Here, the parameter doesn't matter so we pass in 0.
-	converter, err := newMysqldumpReader(ctx, kvCh, 0 /*walltime*/, tables, testEvalCtx, opts)
+	converter, err := newMysqldumpReader(ctx, &semaCtx, kvCh, 0 /*walltime*/, tables,
+		testEvalCtx, opts)
 
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +291,8 @@ func TestMysqlValueToDatum(t *testing.T) {
 		{raw: mysql.NewStrLiteral([]byte("0000-00-00 00:00:00")), typ: types.Timestamp, want: tree.DNull},
 		{raw: mysql.NewStrLiteral([]byte("2010-01-01 00:00:00")), typ: types.Timestamp, want: ts("2010-01-01 00:00:00")},
 	}
-	evalContext := tree.NewTestingEvalContext(nil)
+	st := cluster.MakeTestingClusterSettings()
+	evalContext := tree.NewTestingEvalContext(st)
 	for _, tc := range tests {
 		t.Run(fmt.Sprintf("%v", tc.raw), func(t *testing.T) {
 			got, err := mysqlValueToDatum(tc.raw, tc.typ, evalContext)

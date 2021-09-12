@@ -13,7 +13,6 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -31,18 +30,22 @@ func init() {
 
 func initializeMultiRegionMetadata(
 	ctx context.Context,
-	evalCtx *tree.EvalContext,
 	execCfg *sql.ExecutorConfig,
 	liveRegions sql.LiveClusterRegions,
 	goal tree.SurvivalGoal,
 	primaryRegion descpb.RegionName,
 	regions []tree.Name,
+	dataPlacement tree.DataPlacement,
 ) (*multiregion.RegionConfig, error) {
-	if err := CheckClusterSupportsMultiRegion(evalCtx, execCfg); err != nil {
+	if err := CheckClusterSupportsMultiRegion(execCfg); err != nil {
 		return nil, err
 	}
 
 	survivalGoal, err := sql.TranslateSurvivalGoal(goal)
+	if err != nil {
+		return nil, err
+	}
+	placement, err := sql.TranslateDataPlacement(dataPlacement)
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +101,7 @@ func initializeMultiRegionMetadata(
 		primaryRegion,
 		survivalGoal,
 		regionEnumID,
+		placement,
 	)
 	if err := multiregion.ValidateRegionConfig(regionConfig); err != nil {
 		return nil, err
@@ -108,14 +112,7 @@ func initializeMultiRegionMetadata(
 
 // CheckClusterSupportsMultiRegion returns whether the current cluster supports
 // multi-region features.
-func CheckClusterSupportsMultiRegion(evalCtx *tree.EvalContext, execCfg *sql.ExecutorConfig) error {
-	if !evalCtx.Settings.Version.IsActive(evalCtx.Context, clusterversion.MultiRegionFeatures) {
-		return pgerror.Newf(
-			pgcode.ObjectNotInPrerequisiteState,
-			`cannot add regions to a database until the cluster upgrade is finalized`,
-		)
-	}
-
+func CheckClusterSupportsMultiRegion(execCfg *sql.ExecutorConfig) error {
 	return utilccl.CheckEnterpriseEnabled(
 		execCfg.Settings,
 		execCfg.ClusterID(),

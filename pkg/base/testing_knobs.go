@@ -37,5 +37,11 @@ type TestingKnobs struct {
 	TenantTestingKnobs      ModuleTestingKnobs
 	JobsTestingKnobs        ModuleTestingKnobs
 	BackupRestore           ModuleTestingKnobs
+	Streaming               ModuleTestingKnobs
 	MigrationManager        ModuleTestingKnobs
+	IndexUsageStatsKnobs    ModuleTestingKnobs
+	SQLStatsKnobs           ModuleTestingKnobs
+	SpanConfig              ModuleTestingKnobs
+	SQLLivenessKnobs        ModuleTestingKnobs
+	TelemetryLoggingKnobs   ModuleTestingKnobs
 }

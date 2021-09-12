@@ -17,7 +17,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -387,8 +386,11 @@ type Reader interface {
 	// interval (startTS, endTS]. Passing exportAllRevisions exports
 	// every revision of a key for the interval, otherwise only the latest value
 	// within the interval is exported. Deletions are included if all revisions are
-	// requested or if the start.Timestamp is non-zero. Returns the bytes of an
-	// SSTable containing the exported keys, the size of exported data, or an error.
+	// requested or if the start.Timestamp is non-zero.
+	//
+	// firstKeyTS is either empty which represent starting from potential intent
+	// and continuing to versions or non-empty, which represents starting from
+	// particular version. firstKeyTS will always be empty when !stopMidKey
 	//
 	// If targetSize is positive, it indicates that the export should produce SSTs
 	// which are roughly target size. Specifically, it will return an SST such that
@@ -401,6 +403,11 @@ type Reader interface {
 	// to an SST that exceeds maxSize, an error will be returned. This parameter
 	// exists to prevent creating SSTs which are too large to be used.
 	//
+	// If stopMidKey is false, once function reaches targetSize it would continue
+	// adding all versions until it reaches next key or end of range. If true, it
+	// would stop immediately when targetSize is reached and return a next versions
+	// timestamp in resumeTs so that subsequent operation can pass it to firstKeyTs.
+	//
 	// If useTBI is true, the backing MVCCIncrementalIterator will initialize a
 	// time-bound iterator along with its regular iterator. The TBI will be used
 	// as an optimization to skip over swaths of uninteresting keys i.e. keys
@@ -408,12 +415,19 @@ type Reader interface {
 	//
 	// This function looks at MVCC versions and intents, and returns an error if an
 	// intent is found.
+	//
+	// Data is written to dest as it is collected. If error is returned content of
+	// dest is undefined.
+	//
+	// Returns summary containing number of exported bytes, resumeKey and resumeTS
+	// that allow resuming export if it was cut short because it reached limits or
+	// an error if export failed for some reason.
 	ExportMVCCToSst(
-		ctx context.Context, startKey, endKey roachpb.Key, startTS, endTS hlc.Timestamp,
-		exportAllRevisions bool, targetSize uint64, maxSize uint64, useTBI bool,
+		ctx context.Context, startKey, endKey roachpb.Key, startTS, endTS, firstKeyTS hlc.Timestamp,
+		exportAllRevisions bool, targetSize uint64, maxSize uint64, stopMidKey bool, useTBI bool,
 		dest io.Writer,
-	) (_ roachpb.BulkOpSummary, resumeKey roachpb.Key, _ error)
-	// Get returns the value for the given key, nil otherwise. Semantically, it
+	) (_ roachpb.BulkOpSummary, resumeKey roachpb.Key, resumeTS hlc.Timestamp, _ error)
+	// MVCCGet returns the value for the given key, nil otherwise. Semantically, it
 	// behaves as if an iterator with MVCCKeyAndIntentsIterKind was used.
 	//
 	// Deprecated: use storage.MVCCGet instead.
@@ -640,11 +654,6 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after Put returns.
 	PutEngineKey(key EngineKey, value []byte) error
-	// SafeToWriteSeparatedIntents is only for internal use in the storage
-	// package. Returns an error if the callee does not know whether it is safe.
-	// This method is temporary, to handle the transition from clusters where
-	// not all nodes understand separated intents.
-	SafeToWriteSeparatedIntents(ctx context.Context) (bool, error)
 
 	// LogData adds the specified data to the RocksDB WAL. The data is
 	// uninterpreted by RocksDB (i.e. not added to the memtable or sstables).
@@ -779,6 +788,18 @@ type Engine interface {
 	// that know that this enabled setting is not changing and need the value to
 	// adjust their expectations.
 	IsSeparatedIntentsEnabledForTesting(ctx context.Context) bool
+
+	// SetMinVersion is used to signal to the engine the current minimum
+	// version that it must maintain compatibility with.
+	SetMinVersion(version roachpb.Version) error
+
+	// UsingRecordsEncryptionRegistry returns whether the engine is using the
+	// Records version incremental encryption-at-rest registry.
+	UsingRecordsEncryptionRegistry() (bool, error)
+
+	// MinVersionIsAtLeastTargetVersion returns whether the engine's recorded
+	// storage min version is at least the target version.
+	MinVersionIsAtLeastTargetVersion(target roachpb.Version) (bool, error)
 }
 
 // Batch is the interface for batch specific operations.
@@ -808,10 +829,18 @@ type Batch interface {
 // *pebble.Metrics struct, which has its own documentation.
 type Metrics struct {
 	*pebble.Metrics
+	// WriteStallCount counts the number of times Pebble intentionally delayed
+	// incoming writes. Currently, the only two reasons for this to happen are:
+	// - "memtable count limit reached"
+	// - "L0 file count limit exceeded"
+	//
+	// We do not split this metric across these two reasons, but they can be
+	// distinguished in the pebble logs.
+	WriteStallCount int64
 	// DiskSlowCount counts the number of times Pebble records disk slowness.
 	DiskSlowCount int64
 	// DiskStallCount counts the number of times Pebble observes slow writes
-	// lasting longer than MaxSyncDuration (`storage.max_sync_duration`).
+	// on disk lasting longer than MaxSyncDuration (`storage.max_sync_duration`).
 	DiskStallCount int64
 }
 
@@ -871,24 +900,6 @@ type EncryptionRegistries struct {
 	// KeyRegistry is the list of keys, scrubbed of actual key data.
 	// serialized ccl/storageccl/engineccl/enginepbccl/key_registry.proto::DataKeysRegistry
 	KeyRegistry []byte
-}
-
-// NewEngine creates a new storage engine.
-func NewEngine(cacheSize int64, storageConfig base.StorageConfig) (Engine, error) {
-	pebbleConfig := PebbleConfig{
-		StorageConfig: storageConfig,
-		Opts:          DefaultPebbleOptions(),
-	}
-	pebbleConfig.Opts.Cache = pebble.NewCache(cacheSize)
-	defer pebbleConfig.Opts.Cache.Unref()
-
-	return NewPebble(context.Background(), pebbleConfig)
-}
-
-// NewDefaultEngine allocates and returns a new, opened engine with the default configuration.
-// The caller must call the engine's Close method when the engine is no longer needed.
-func NewDefaultEngine(cacheSize int64, storageConfig base.StorageConfig) (Engine, error) {
-	return NewEngine(cacheSize, storageConfig)
 }
 
 // PutProto sets the given key to the protobuf-serialized byte string

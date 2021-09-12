@@ -42,7 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/migration/migrationmanager"
+	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -53,9 +53,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/floatcmp"
@@ -265,10 +265,6 @@ import (
 //
 //  - traceoff
 //    Stops tracing.
-//
-//  - kv-batch-size <num>
-//    Limits the kvfetcher batch size; it can be used to trigger certain error
-//    conditions or corner cases around limited batches.
 //
 //  - subtest <testname>
 //    Defines the start of a subtest. The subtest is any number of statements
@@ -561,12 +557,12 @@ var logicTestConfigs = []testClusterConfig{
 		disableUpgrade:      true,
 	},
 	{
-		name:                "local-mixed-20.2-21.1",
+		name:                "local-mixed-21.1-21.2",
 		numNodes:            1,
 		overrideDistSQLMode: "off",
 		overrideAutoStats:   "false",
-		bootstrapVersion:    roachpb.Version{Major: 20, Minor: 2},
-		binaryVersion:       roachpb.Version{Major: 21, Minor: 1},
+		bootstrapVersion:    roachpb.Version{Major: 21, Minor: 1},
+		binaryVersion:       roachpb.Version{Major: 21, Minor: 2},
 		disableUpgrade:      true,
 	},
 	{
@@ -683,6 +679,28 @@ var logicTestConfigs = []testClusterConfig{
 				Tiers: []roachpb.Tier{
 					{Key: "region", Value: "test1"},
 					{Key: "availability-zone", Value: "test1-az3"},
+				},
+			},
+		},
+	},
+	{
+		name:              "multiregion-3node-3superlongregions",
+		numNodes:          3,
+		overrideAutoStats: "false",
+		localities: map[int]roachpb.Locality{
+			1: {
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "veryveryveryveryveryveryverylongregion1"},
+				},
+			},
+			2: {
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "veryveryveryveryveryveryverylongregion2"},
+				},
+			},
+			3: {
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "veryveryveryveryveryveryverylongregion3"},
 				},
 			},
 		},
@@ -1125,7 +1143,7 @@ type logicTest struct {
 	nodeIdx int
 	// If this test uses a SQL tenant server, this is its address. In this case,
 	// all clients are created against this tenant.
-	tenantAddr string
+	tenantAddrs []string
 	// map of built clients. Needs to be persisted so that we can
 	// re-use them and close them all on exit.
 	clients map[string]*gosql.DB
@@ -1274,9 +1292,9 @@ func (t *logicTest) setUser(user string) func() {
 		return func() {}
 	}
 
-	addr := t.tenantAddr
-	if addr == "" {
-		addr = t.cluster.Server(t.nodeIdx).ServingSQLAddr()
+	addr := t.cluster.Server(t.nodeIdx).ServingSQLAddr()
+	if len(t.tenantAddrs) > 0 {
+		addr = t.tenantAddrs[t.nodeIdx]
 	}
 	pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(user))
 	pgURL.Path = "test"
@@ -1356,6 +1374,9 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 				SQLExecutor: &sql.ExecutorTestingKnobs{
 					DeterministicExplain: true,
 				},
+				SQLStatsKnobs: &sqlstats.TestingKnobs{
+					AOSTClause: "AS OF SYSTEM TIME '-1us'",
+				},
 			},
 			ClusterName:   "testclustername",
 			ExternalIODir: t.sharedIODir,
@@ -1423,9 +1444,9 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 			from := clusterversion.ClusterVersion{Version: cfg.bootstrapVersion}
 			to := clusterversion.ClusterVersion{Version: cfg.binaryVersion}
 			if len(clusterversion.ListBetween(from, to)) == 0 {
-				mm, ok := nodeParams.Knobs.MigrationManager.(*migrationmanager.TestingKnobs)
+				mm, ok := nodeParams.Knobs.MigrationManager.(*migration.TestingKnobs)
 				if !ok {
-					mm = &migrationmanager.TestingKnobs{}
+					mm = &migration.TestingKnobs{}
 					nodeParams.Knobs.MigrationManager = mm
 				}
 				mm.ListBetweenOverride = func(
@@ -1454,31 +1475,38 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 
 	connsForClusterSettingChanges := []*gosql.DB{t.cluster.ServerConn(0)}
 	if cfg.useTenant {
-		var err error
-		tenantArgs := base.TestTenantArgs{
-			TenantID:                    serverutils.TestTenantID(),
-			AllowSettingClusterSettings: true,
-			TestingKnobs: base.TestingKnobs{
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					DeterministicExplain: true,
+		t.tenantAddrs = make([]string, cfg.numNodes)
+		for i := 0; i < cfg.numNodes; i++ {
+			tenantArgs := base.TestTenantArgs{
+				TenantID:                    serverutils.TestTenantID(),
+				AllowSettingClusterSettings: true,
+				TestingKnobs: base.TestingKnobs{
+					SQLExecutor: &sql.ExecutorTestingKnobs{
+						DeterministicExplain: true,
+					},
+					SQLStatsKnobs: &sqlstats.TestingKnobs{
+						AOSTClause: "AS OF SYSTEM TIME '-1us'",
+					},
 				},
-			},
-			MemoryPoolSize:    params.ServerArgs.SQLMemoryPoolSize,
-			TempStorageConfig: &params.ServerArgs.TempStorageConfig,
+				MemoryPoolSize:    params.ServerArgs.SQLMemoryPoolSize,
+				TempStorageConfig: &params.ServerArgs.TempStorageConfig,
+				Locality:          paramsPerNode[i].Locality,
+				Existing:          i > 0,
+			}
+
+			// Prevent a logging assertion that the server ID is initialized multiple times.
+			log.TestingClearServerIdentifiers()
+
+			tenant, err := t.cluster.Server(i).StartTenant(context.Background(), tenantArgs)
+			if err != nil {
+				t.rootT.Fatalf("%+v", err)
+			}
+			t.tenantAddrs[i] = tenant.SQLAddr()
 		}
 
-		// Prevent a logging assertion that the server ID is initialized multiple times.
-		log.TestingClearServerIdentifiers()
-
-		tenant, err := t.cluster.Server(t.nodeIdx).StartTenant(context.Background(), tenantArgs)
-		if err != nil {
-			t.rootT.Fatalf("%+v", err)
-		}
-		t.tenantAddr = tenant.SQLAddr()
-
-		// Open a connection to this tenant to set any cluster settings specified
+		// Open a connection to a tenant to set any cluster settings specified
 		// by the test config.
-		pgURL, cleanup := sqlutils.PGUrl(t.rootT, t.tenantAddr, "Tenant", url.User(security.RootUser))
+		pgURL, cleanup := sqlutils.PGUrl(t.rootT, t.tenantAddrs[0], "Tenant", url.User(security.RootUser))
 		defer cleanup()
 		if params.ServerArgs.Insecure {
 			pgURL.RawQuery = "sslmode=disable"
@@ -1571,7 +1599,7 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 	}
 
 	if cfg.overrideDistSQLMode != "" {
-		_, ok := sessiondata.DistSQLExecModeFromString(cfg.overrideDistSQLMode)
+		_, ok := sessiondatapb.DistSQLExecModeFromString(cfg.overrideDistSQLMode)
 		if !ok {
 			t.Fatalf("invalid distsql mode override: %s", cfg.overrideDistSQLMode)
 		}
@@ -2388,22 +2416,6 @@ func (t *logicTest) processSubtest(
 			}
 			t.traceStop()
 
-		case "kv-batch-size":
-			// kv-batch-size limits the kvfetcher batch size. It can be used to
-			// trigger certain error conditions around limited batches.
-			if len(fields) != 2 {
-				return errors.Errorf(
-					"kv-batch-size needs an integer argument, found: %v",
-					fields[1:],
-				)
-			}
-			batchSize, err := strconv.Atoi(fields[1])
-			if err != nil {
-				return errors.Errorf("kv-batch-size needs an integer argument; %s", err)
-			}
-			t.outf("Setting kv batch size %d", batchSize)
-			defer row.TestingSetKVBatchSize(int64(batchSize))()
-
 		default:
 			return errors.Errorf("%s:%d: unknown command: %s",
 				path, s.line+subtest.lineLineIndexIntoFile, cmd,
@@ -2613,6 +2625,9 @@ func (t *logicTest) execQuery(query logicQuery) error {
 	db := t.db
 	if query.nodeIdx != 0 {
 		addr := t.cluster.Server(query.nodeIdx).ServingSQLAddr()
+		if len(t.tenantAddrs) > 0 {
+			addr = t.tenantAddrs[query.nodeIdx]
+		}
 		pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(t.user))
 		defer cleanupFunc()
 		pgURL.Path = "test"
@@ -2678,82 +2693,87 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		if query.colNames {
 			actualResultsRaw = append(actualResultsRaw, cols...)
 		}
-		for rows.Next() {
-			if err := rows.Scan(vals...); err != nil {
-				return err
-			}
-			for i, v := range vals {
-				if val := *v.(*interface{}); val != nil {
-					valT := reflect.TypeOf(val).Kind()
-					colT := query.colTypes[i]
-					switch colT {
-					case 'T':
-						if valT != reflect.String && valT != reflect.Slice && valT != reflect.Struct {
-							return fmt.Errorf("%s: expected text value for column %d, but found %T: %#v",
-								query.pos, i, val, val,
-							)
-						}
-					case 'I':
-						if valT != reflect.Int64 {
-							if *flexTypes && (valT == reflect.Float64 || valT == reflect.Slice) {
-								t.signalIgnoredError(
-									fmt.Errorf("result type mismatch: expected I, got %T", val), query.pos, query.sql,
-								)
-								return nil
-							}
-							return fmt.Errorf("%s: expected int value for column %d, but found %T: %#v",
-								query.pos, i, val, val,
-							)
-						}
-					case 'F', 'R':
-						if valT != reflect.Float64 && valT != reflect.Slice {
-							if *flexTypes && (valT == reflect.Int64) {
-								t.signalIgnoredError(
-									fmt.Errorf("result type mismatch: expected F or R, got %T", val), query.pos, query.sql,
-								)
-								return nil
-							}
-							return fmt.Errorf("%s: expected float/decimal value for column %d, but found %T: %#v",
-								query.pos, i, val, val,
-							)
-						}
-					case 'B':
-						if valT != reflect.Bool {
-							return fmt.Errorf("%s: expected boolean value for column %d, but found %T: %#v",
-								query.pos, i, val, val,
-							)
-						}
-					case 'O':
-						if valT != reflect.Slice {
-							return fmt.Errorf("%s: expected oid value for column %d, but found %T: %#v",
-								query.pos, i, val, val,
-							)
-						}
-					default:
-						return fmt.Errorf("%s: unknown type in type string: %c in %s",
-							query.pos, colT, query.colTypes,
-						)
-					}
-
-					if byteArray, ok := val.([]byte); ok {
-						// The postgres wire protocol does not distinguish between
-						// strings and byte arrays, but our tests do. In order to do
-						// The Right Thing™, we replace byte arrays which are valid
-						// UTF-8 with strings. This allows byte arrays which are not
-						// valid UTF-8 to print as a list of bytes (e.g. `[124 107]`)
-						// while printing valid strings naturally.
-						if str := string(byteArray); utf8.ValidString(str) {
-							val = str
-						}
-					}
-					// Empty strings are rendered as "·" (middle dot)
-					if val == "" {
-						val = "·"
-					}
-					actualResultsRaw = append(actualResultsRaw, fmt.Sprint(val))
-				} else {
-					actualResultsRaw = append(actualResultsRaw, "NULL")
+		for nextResultSet := true; nextResultSet; nextResultSet = rows.NextResultSet() {
+			for rows.Next() {
+				if err := rows.Scan(vals...); err != nil {
+					return err
 				}
+				for i, v := range vals {
+					if val := *v.(*interface{}); val != nil {
+						valT := reflect.TypeOf(val).Kind()
+						colT := query.colTypes[i]
+						switch colT {
+						case 'T':
+							if valT != reflect.String && valT != reflect.Slice && valT != reflect.Struct {
+								return fmt.Errorf("%s: expected text value for column %d, but found %T: %#v",
+									query.pos, i, val, val,
+								)
+							}
+						case 'I':
+							if valT != reflect.Int64 {
+								if *flexTypes && (valT == reflect.Float64 || valT == reflect.Slice) {
+									t.signalIgnoredError(
+										fmt.Errorf("result type mismatch: expected I, got %T", val), query.pos, query.sql,
+									)
+									return nil
+								}
+								return fmt.Errorf("%s: expected int value for column %d, but found %T: %#v",
+									query.pos, i, val, val,
+								)
+							}
+						case 'F', 'R':
+							if valT != reflect.Float64 && valT != reflect.Slice {
+								if *flexTypes && (valT == reflect.Int64) {
+									t.signalIgnoredError(
+										fmt.Errorf("result type mismatch: expected F or R, got %T", val), query.pos, query.sql,
+									)
+									return nil
+								}
+								return fmt.Errorf("%s: expected float/decimal value for column %d, but found %T: %#v",
+									query.pos, i, val, val,
+								)
+							}
+						case 'B':
+							if valT != reflect.Bool {
+								return fmt.Errorf("%s: expected boolean value for column %d, but found %T: %#v",
+									query.pos, i, val, val,
+								)
+							}
+						case 'O':
+							if valT != reflect.Slice {
+								return fmt.Errorf("%s: expected oid value for column %d, but found %T: %#v",
+									query.pos, i, val, val,
+								)
+							}
+						default:
+							return fmt.Errorf("%s: unknown type in type string: %c in %s",
+								query.pos, colT, query.colTypes,
+							)
+						}
+
+						if byteArray, ok := val.([]byte); ok {
+							// The postgres wire protocol does not distinguish between
+							// strings and byte arrays, but our tests do. In order to do
+							// The Right Thing™, we replace byte arrays which are valid
+							// UTF-8 with strings. This allows byte arrays which are not
+							// valid UTF-8 to print as a list of bytes (e.g. `[124 107]`)
+							// while printing valid strings naturally.
+							if str := string(byteArray); utf8.ValidString(str) {
+								val = str
+							}
+						}
+						// Empty strings are rendered as "·" (middle dot)
+						if val == "" {
+							val = "·"
+						}
+						actualResultsRaw = append(actualResultsRaw, fmt.Sprint(val))
+					} else {
+						actualResultsRaw = append(actualResultsRaw, "NULL")
+					}
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 		}
 		if err := rows.Err(); err != nil {
@@ -3103,22 +3123,58 @@ SELECT encode(descriptor, 'hex') AS descriptor
 		}
 	}
 
-	// TODO(lucy): we should really drop all created databases in this test, not
-	// just the one we started with.
-	stmt := "SET sql_safe_updates=false; DROP DATABASE IF EXISTS test CASCADE"
-	if _, err := t.db.Exec(stmt); err != nil {
-		return errors.Wrap(err, "dropping test database failed")
+	var dbNames pq.StringArray
+	if err := t.db.QueryRow(
+		`SELECT array_agg(database_name) FROM [SHOW DATABASES] WHERE database_name NOT IN ('system', 'postgres')`,
+	).Scan(&dbNames); err != nil {
+		return errors.Wrap(err, "error getting database names")
 	}
 
+	for _, dbName := range dbNames {
+		if err := func() (retErr error) {
+			ctx := context.Background()
+			// Open a new connection, since we want to preserve the original DB
+			// that we were originally on in t.db.
+			conn, err := t.db.Conn(ctx)
+			if err != nil {
+				return errors.Wrap(err, "error grabbing new connection")
+			}
+			defer func() {
+				retErr = errors.CombineErrors(retErr, conn.Close())
+			}()
+			if _, err := conn.ExecContext(ctx, "SET database = $1", dbName); err != nil {
+				return errors.Wrapf(err, "error validating zone config for database %s", dbName)
+			}
+			// Ensure each database's zone configs are valid.
+			if _, err := conn.ExecContext(ctx, "SELECT crdb_internal.validate_multi_region_zone_configs()"); err != nil {
+				return errors.Wrapf(err, "error validating zone config for database %s", dbName)
+			}
+			// Drop the database.
+			dbTreeName := tree.Name(dbName)
+			dropDatabaseStmt := fmt.Sprintf(
+				"DROP DATABASE %s CASCADE",
+				dbTreeName.String(),
+			)
+			if _, err := t.db.Exec(dropDatabaseStmt); err != nil {
+				return errors.Wrapf(err, "dropping database %s failed", dbName)
+			}
+			return nil
+		}(); err != nil {
+			return err
+		}
+	}
+
+	// Ensure after dropping all databases state is still valid.
 	invalidObjects, err = validate()
 	if err != nil {
-		return errors.Wrap(err, "running object validation after failed")
+		return errors.Wrap(err, "running object validation after database drops failed")
 	}
 	if invalidObjects != "" {
 		return errors.Errorf(
-			"descriptor validation failed after dropping test database:\n%s", invalidObjects,
+			"descriptor validation failed after dropping databases:\n%s", invalidObjects,
 		)
 	}
+
 	return nil
 }
 
@@ -3307,7 +3363,13 @@ func RunLogicTestWithDefaultConfig(
 					//  - we're generating testfiles, or
 					//  - we are in race mode (where we can hit a limit on alive
 					//    goroutines).
-					if !*showSQL && !*rewriteResultsInTestfiles && !*rewriteSQL && !util.RaceEnabled && !cfg.useTenant {
+					//  - we have too many nodes (this can lead to general slowness)
+					if !*showSQL &&
+						!*rewriteResultsInTestfiles &&
+						!*rewriteSQL &&
+						!util.RaceEnabled &&
+						!cfg.useTenant &&
+						cfg.numNodes <= 3 {
 						// Skip parallelizing tests that use the kv-batch-size directive since
 						// the batch size is a global variable.
 						//

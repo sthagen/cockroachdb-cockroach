@@ -13,7 +13,6 @@ package concurrency
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanlatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -51,10 +50,18 @@ func (m *latchManagerImpl) WaitUntilAcquired(
 	return lg, nil
 }
 
+func (m *latchManagerImpl) WaitFor(ctx context.Context, ss *spanset.SpanSet) *Error {
+	err := m.m.WaitFor(ctx, ss)
+	if err != nil {
+		return roachpb.NewError(err)
+	}
+	return nil
+}
+
 func (m *latchManagerImpl) Release(lg latchGuard) {
 	m.m.Release(lg.(*spanlatch.Guard))
 }
 
-func (m *latchManagerImpl) Info() (global, local kvserverpb.LatchManagerInfo) {
-	return m.m.Info()
+func (m *latchManagerImpl) Metrics() LatchMetrics {
+	return m.m.Metrics()
 }

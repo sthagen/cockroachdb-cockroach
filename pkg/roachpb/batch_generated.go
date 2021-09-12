@@ -72,6 +72,8 @@ func (ru ErrorDetail) GetInner() error {
 		return t.InvalidLeaseError
 	case *ErrorDetail_OptimisticEvalConflicts:
 		return t.OptimisticEvalConflicts
+	case *ErrorDetail_MinTimestampBoundUnsatisfiable:
+		return t.MinTimestampBoundUnsatisfiable
 	default:
 		return nil
 	}
@@ -166,6 +168,12 @@ func (ru RequestUnion) GetInner() Request {
 		return t.AdminVerifyProtectedTimestamp
 	case *RequestUnion_Migrate:
 		return t.Migrate
+	case *RequestUnion_QueryResolvedTimestamp:
+		return t.QueryResolvedTimestamp
+	case *RequestUnion_ScanInterleavedIntents:
+		return t.ScanInterleavedIntents
+	case *RequestUnion_Barrier:
+		return t.Barrier
 	default:
 		return nil
 	}
@@ -258,6 +266,12 @@ func (ru ResponseUnion) GetInner() Response {
 		return t.AdminVerifyProtectedTimestamp
 	case *ResponseUnion_Migrate:
 		return t.Migrate
+	case *ResponseUnion_QueryResolvedTimestamp:
+		return t.QueryResolvedTimestamp
+	case *ResponseUnion_ScanInterleavedIntents:
+		return t.ScanInterleavedIntents
+	case *ResponseUnion_Barrier:
+		return t.Barrier
 	default:
 		return nil
 	}
@@ -328,6 +342,8 @@ func (ru *ErrorDetail) MustSetInner(r error) {
 		union = &ErrorDetail_InvalidLeaseError{t}
 	case *OptimisticEvalConflictsError:
 		union = &ErrorDetail_OptimisticEvalConflicts{t}
+	case *MinTimestampBoundUnsatisfiableError:
+		union = &ErrorDetail_MinTimestampBoundUnsatisfiable{t}
 	default:
 		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
@@ -425,6 +441,12 @@ func (ru *RequestUnion) MustSetInner(r Request) {
 		union = &RequestUnion_AdminVerifyProtectedTimestamp{t}
 	case *MigrateRequest:
 		union = &RequestUnion_Migrate{t}
+	case *QueryResolvedTimestampRequest:
+		union = &RequestUnion_QueryResolvedTimestamp{t}
+	case *ScanInterleavedIntentsRequest:
+		union = &RequestUnion_ScanInterleavedIntents{t}
+	case *BarrierRequest:
+		union = &RequestUnion_Barrier{t}
 	default:
 		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
@@ -520,13 +542,19 @@ func (ru *ResponseUnion) MustSetInner(r Response) {
 		union = &ResponseUnion_AdminVerifyProtectedTimestamp{t}
 	case *MigrateResponse:
 		union = &ResponseUnion_Migrate{t}
+	case *QueryResolvedTimestampResponse:
+		union = &ResponseUnion_QueryResolvedTimestamp{t}
+	case *ScanInterleavedIntentsResponse:
+		union = &ResponseUnion_ScanInterleavedIntents{t}
+	case *BarrierResponse:
+		union = &ResponseUnion_Barrier{t}
 	default:
 		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
 	ru.Value = union
 }
 
-type reqCounts [43]int32
+type reqCounts [46]int32
 
 // getReqCounts returns the number of times each
 // request type appears in the batch.
@@ -620,6 +648,12 @@ func (ba *BatchRequest) getReqCounts() reqCounts {
 			counts[41]++
 		case *RequestUnion_Migrate:
 			counts[42]++
+		case *RequestUnion_QueryResolvedTimestamp:
+			counts[43]++
+		case *RequestUnion_ScanInterleavedIntents:
+			counts[44]++
+		case *RequestUnion_Barrier:
+			counts[45]++
 		default:
 			panic(fmt.Sprintf("unsupported request: %+v", ru))
 		}
@@ -671,6 +705,9 @@ var requestNames = []string{
 	"RngStats",
 	"AdmVerifyProtectedTimestamp",
 	"Migrate",
+	"QueryResolvedTimestamp",
+	"ScanInterleavedIntents",
+	"Barrier",
 }
 
 // Summary prints a short summary of the requests in a batch.
@@ -874,6 +911,18 @@ type migrateResponseAlloc struct {
 	union ResponseUnion_Migrate
 	resp  MigrateResponse
 }
+type queryResolvedTimestampResponseAlloc struct {
+	union ResponseUnion_QueryResolvedTimestamp
+	resp  QueryResolvedTimestampResponse
+}
+type scanInterleavedIntentsResponseAlloc struct {
+	union ResponseUnion_ScanInterleavedIntents
+	resp  ScanInterleavedIntentsResponse
+}
+type barrierResponseAlloc struct {
+	union ResponseUnion_Barrier
+	resp  BarrierResponse
+}
 
 // CreateReply creates replies for each of the contained requests, wrapped in a
 // BatchResponse. The response objects are batch allocated to minimize
@@ -927,6 +976,9 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 	var buf40 []rangeStatsResponseAlloc
 	var buf41 []adminVerifyProtectedTimestampResponseAlloc
 	var buf42 []migrateResponseAlloc
+	var buf43 []queryResolvedTimestampResponseAlloc
+	var buf44 []scanInterleavedIntentsResponseAlloc
+	var buf45 []barrierResponseAlloc
 
 	for i, r := range ba.Requests {
 		switch r.GetValue().(type) {
@@ -1231,6 +1283,27 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 			buf42[0].union.Migrate = &buf42[0].resp
 			br.Responses[i].Value = &buf42[0].union
 			buf42 = buf42[1:]
+		case *RequestUnion_QueryResolvedTimestamp:
+			if buf43 == nil {
+				buf43 = make([]queryResolvedTimestampResponseAlloc, counts[43])
+			}
+			buf43[0].union.QueryResolvedTimestamp = &buf43[0].resp
+			br.Responses[i].Value = &buf43[0].union
+			buf43 = buf43[1:]
+		case *RequestUnion_ScanInterleavedIntents:
+			if buf44 == nil {
+				buf44 = make([]scanInterleavedIntentsResponseAlloc, counts[44])
+			}
+			buf44[0].union.ScanInterleavedIntents = &buf44[0].resp
+			br.Responses[i].Value = &buf44[0].union
+			buf44 = buf44[1:]
+		case *RequestUnion_Barrier:
+			if buf45 == nil {
+				buf45 = make([]barrierResponseAlloc, counts[45])
+			}
+			buf45[0].union.Barrier = &buf45[0].resp
+			br.Responses[i].Value = &buf45[0].union
+			buf45 = buf45[1:]
 		default:
 			panic(fmt.Sprintf("unsupported request: %+v", r))
 		}
@@ -1327,6 +1400,12 @@ func CreateRequest(method Method) Request {
 		return &AdminVerifyProtectedTimestampRequest{}
 	case Migrate:
 		return &MigrateRequest{}
+	case QueryResolvedTimestamp:
+		return &QueryResolvedTimestampRequest{}
+	case ScanInterleavedIntents:
+		return &ScanInterleavedIntentsRequest{}
+	case Barrier:
+		return &BarrierRequest{}
 	default:
 		panic(fmt.Sprintf("unsupported method: %+v", method))
 	}

@@ -1,0 +1,18 @@
+@import "src/core/index.module";
+
+.flex-display {
+  display: flex;
+}
+
+.tooltip-hover-area {
+  padding-top: 3px;
+  padding-right: 10px;
+}
+
+.action {
+  color: $colors--link;
+  &:hover {
+  color: $colors--link;
+    text-decoration: underline;
+  }
+}

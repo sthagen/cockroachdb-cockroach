@@ -36,10 +36,14 @@ func makeMetricsSink(metrics *Metrics, s Sink) *metricsSink {
 
 // EmitRow implements Sink interface.
 func (s *metricsSink) EmitRow(
-	ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context,
+	topic TopicDescriptor,
+	key, value []byte,
+	updated hlc.Timestamp,
+	r kvevent.Alloc,
 ) error {
 	start := timeutil.Now()
-	err := s.wrapped.EmitRow(ctx, topic, key, value, updated)
+	err := s.wrapped.EmitRow(ctx, topic, key, value, updated, r)
 	if err == nil {
 		emitNanos := timeutil.Since(start).Nanoseconds()
 		s.metrics.EmittedMessages.Inc(1)
@@ -102,6 +106,12 @@ var (
 	metaChangefeedEmittedMessages = metric.Metadata{
 		Name:        "changefeed.emitted_messages",
 		Help:        "Messages emitted by all feeds",
+		Measurement: "Messages",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaChangefeedForwardedResolvedMessages = metric.Metadata{
+		Name:        "changefeed.forwarded_resolved_messages",
+		Help:        "Resolved timestamps forwarded from the change aggregator to the change frontier",
 		Measurement: "Messages",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -205,11 +215,12 @@ type Metrics struct {
 	KVFeedMetrics     kvevent.Metrics
 	SchemaFeedMetrics schemafeed.Metrics
 
-	EmittedMessages *metric.Counter
-	EmittedBytes    *metric.Counter
-	Flushes         *metric.Counter
-	ErrorRetries    *metric.Counter
-	Failures        *metric.Counter
+	EmittedMessages  *metric.Counter
+	ResolvedMessages *metric.Counter
+	EmittedBytes     *metric.Counter
+	Flushes          *metric.Counter
+	ErrorRetries     *metric.Counter
+	Failures         *metric.Counter
 
 	ProcessingNanos *metric.Counter
 	EmitNanos       *metric.Counter
@@ -240,6 +251,7 @@ func MakeMetrics(histogramWindow time.Duration) metric.Struct {
 		KVFeedMetrics:     kvevent.MakeMetrics(histogramWindow),
 		SchemaFeedMetrics: schemafeed.MakeMetrics(histogramWindow),
 		EmittedMessages:   metric.NewCounter(metaChangefeedEmittedMessages),
+		ResolvedMessages:  metric.NewCounter(metaChangefeedForwardedResolvedMessages),
 		EmittedBytes:      metric.NewCounter(metaChangefeedEmittedBytes),
 		Flushes:           metric.NewCounter(metaChangefeedFlushes),
 		ErrorRetries:      metric.NewCounter(metaChangefeedErrorRetries),

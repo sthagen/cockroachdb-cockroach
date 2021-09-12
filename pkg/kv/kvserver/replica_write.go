@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -89,9 +88,6 @@ func (r *Replica) executeWriteBatch(
 	// timestamps, which can help avoid uncertainty restarts.
 	localUncertaintyLimit := observedts.ComputeLocalUncertaintyLimit(ba.Txn, st)
 
-	minTS, untrack := r.store.cfg.ClosedTimestamp.Tracker.Track(ctx)
-	defer untrack(ctx, 0, 0, 0) // covers all error returns below
-
 	// Start tracking this request if it is an MVCC write (i.e. if it's the kind
 	// of request that needs to obey the closed timestamp). The act of tracking
 	// also gives us a closed timestamp, which we must ensure to evaluate above
@@ -99,17 +95,15 @@ func (r *Replica) executeWriteBatch(
 	// accordingly if necessary. We need to start tracking this request before we
 	// know the final write timestamp at which this request will evaluate because
 	// we need to atomically read the closed timestamp and start to be tracked.
-	// TODO(andrei): The timestamp cache (and also the "old closed timestamp
-	// mechanism" in the form of minTS) might bump us above the timestamp at which
+	// TODO(andrei): The timestamp cache might bump us above the timestamp at which
 	// we're registering with the proposalBuf. In that case, this request will be
 	// tracked at an unnecessarily low timestamp which can block the closing of
 	// this low timestamp for no reason. We should refactor such that the request
 	// starts being tracked after we apply the timestamp cache.
+	var minTS hlc.Timestamp
 	var tok TrackedRequestToken
 	if ba.IsIntentWrite() {
-		var minTS2 hlc.Timestamp
-		minTS2, tok = r.mu.proposalBuf.TrackEvaluatingRequest(ctx, ba.WriteTimestamp())
-		minTS.Forward(minTS2)
+		minTS, tok = r.mu.proposalBuf.TrackEvaluatingRequest(ctx, ba.WriteTimestamp())
 	}
 	defer tok.DoneIfNotMoved(ctx)
 
@@ -146,7 +140,7 @@ func (r *Replica) executeWriteBatch(
 	// If the command is proposed to Raft, ownership of and responsibility for
 	// the concurrency guard will be assumed by Raft, so provide the guard to
 	// evalAndPropose.
-	ch, abandon, maxLeaseIndex, pErr := r.evalAndPropose(ctx, ba, g, st, localUncertaintyLimit, tok.Move(ctx))
+	ch, abandon, _, pErr := r.evalAndPropose(ctx, ba, g, st, localUncertaintyLimit, tok.Move(ctx))
 	if pErr != nil {
 		r.readOnlyCmdMu.RUnlock()
 		if cErr, ok := pErr.GetDetail().(*roachpb.ReplicaCorruptionError); ok {
@@ -155,24 +149,9 @@ func (r *Replica) executeWriteBatch(
 			// This exits with a fatal error, but returns in tests.
 			return nil, g, r.setCorruptRaftMuLocked(ctx, cErr)
 		}
-		if maxLeaseIndex != 0 {
-			log.Fatalf(
-				ctx, "unexpected max lease index %d assigned to failed proposal: %s, error %s",
-				maxLeaseIndex, ba, pErr,
-			)
-		}
 		return nil, g, pErr
 	}
 	g = nil // ownership passed to Raft, prevent misuse
-
-	// A max lease index of zero is returned when no proposal was made or a lease
-	// was proposed. In case no proposal was made or a lease was proposed, we
-	// don't need to communicate a MLAI. Furthermore, for lease proposals we
-	// cannot communicate under the lease's epoch. Instead the code calls EmitMLAI
-	// explicitly as a side effect of stepping up as leaseholder.
-	if maxLeaseIndex != 0 {
-		untrack(ctx, ctpb.Epoch(st.Lease.Epoch), r.RangeID, ctpb.LAI(maxLeaseIndex))
-	}
 
 	// We are done with pre-Raft evaluation at this point, and have to release the
 	// read-only command lock to avoid deadlocks during Raft evaluation.
@@ -222,8 +201,6 @@ func (r *Replica) executeWriteBatch(
 					ctx, propResult.EncounteredIntents, true, /* allowSync */
 				); err != nil {
 					log.Warningf(ctx, "intent cleanup failed: %v", err)
-					r.store.metrics.ConflictingIntentsResolveRejected.Inc(
-						int64(len(propResult.EncounteredIntents)))
 				}
 			}
 			if ba.Requests[0].GetMigrate() != nil && propResult.Err == nil {
@@ -321,7 +298,7 @@ func (r *Replica) executeWriteBatch(
 							})
 						if err != nil {
 							log.Warningf(ctx, "transaction cleanup failed: %v", err)
-							r.store.metrics.FinalizedTxnCleanupTimedOut.Inc(1)
+							r.store.intentResolver.Metrics.FinalizedTxnCleanupFailed.Inc(1)
 						}
 					})
 			}
@@ -393,9 +370,9 @@ support contract. Otherwise, please open an issue at:
 // executed as 1PC.
 func (r *Replica) canAttempt1PCEvaluation(
 	ctx context.Context, ba *roachpb.BatchRequest, latchSpans *spanset.SpanSet,
-) (bool, *roachpb.Error) {
+) bool {
 	if !isOnePhaseCommit(ba) {
-		return false, nil
+		return false
 	}
 
 	if ba.Timestamp != ba.Txn.WriteTimestamp {
@@ -403,42 +380,25 @@ func (r *Replica) canAttempt1PCEvaluation(
 			ba.Timestamp, ba.Txn.WriteTimestamp)
 	}
 
-	// Check whether the txn record has already been created. If so, we can't
-	// perform a 1PC evaluation because we need to clean up the record during
-	// evaluation.
-	//
-	// We only perform this check if the transaction's EndTxn indicates that it
-	// has started its heartbeat loop. If not, the transaction cannot have an
-	// existing record. However, we perform it unconditionally under race to
-	// catch bugs.
-	arg, _ := ba.GetArg(roachpb.EndTxn)
-	etArg := arg.(*roachpb.EndTxnRequest)
-	if etArg.TxnHeartbeating || util.RaceEnabled {
-		if ok, err := batcheval.HasTxnRecord(ctx, r.store.Engine(), ba.Txn); err != nil {
-			return false, roachpb.NewError(err)
-		} else if ok {
-			if !etArg.TxnHeartbeating {
-				log.Fatalf(ctx, "non-heartbeating txn with txn record before EndTxn: %v", ba.Txn)
-			}
-			return false, nil
-		}
-	}
-
 	// The EndTxn checks whether the txn record can be created, but we're
 	// eliding the EndTxn. So, we'll do the check instead.
-	ok, minCommitTS, reason := r.CanCreateTxnRecord(ctx, ba.Txn.ID, ba.Txn.Key, ba.Txn.MinTimestamp)
+	//
+	// Note that the returned reason does not distinguish between an existing
+	// record (which should fall back to non-1PC EndTxn evaluation) and a
+	// finalized record (which should return an error), so we ignore it here and
+	// let EndTxn return an error as appropriate. This lets us avoid a disk read
+	// to check for an existing record.
+	ok, minCommitTS, _ := r.CanCreateTxnRecord(ctx, ba.Txn.ID, ba.Txn.Key, ba.Txn.MinTimestamp)
 	if !ok {
-		newTxn := ba.Txn.Clone()
-		newTxn.Status = roachpb.ABORTED
-		return false, roachpb.NewErrorWithTxn(roachpb.NewTransactionAbortedError(reason), newTxn)
+		return false
 	}
 	if ba.Timestamp.Less(minCommitTS) {
 		ba.Txn.WriteTimestamp = minCommitTS
 		// We can only evaluate at the new timestamp if we manage to bump the read
 		// timestamp.
-		return maybeBumpReadTimestampToWriteTimestamp(ctx, ba, latchSpans), nil
+		return maybeBumpReadTimestampToWriteTimestamp(ctx, ba, latchSpans)
 	}
-	return true, nil
+	return true
 }
 
 // evaluateWriteBatch evaluates the supplied batch.
@@ -466,11 +426,7 @@ func (r *Replica) evaluateWriteBatch(
 
 	// Attempt 1PC execution, if applicable. If not transactional or there are
 	// indications that the batch's txn will require retry, execute as normal.
-	ok, pErr := r.canAttempt1PCEvaluation(ctx, ba, latchSpans)
-	if pErr != nil {
-		return nil, enginepb.MVCCStats{}, nil, result.Result{}, pErr
-	}
-	if ok {
+	if r.canAttempt1PCEvaluation(ctx, ba, latchSpans) {
 		res := r.evaluate1PC(ctx, idKey, ba, latchSpans, lockSpans)
 		switch res.success {
 		case onePCSucceeded:
@@ -615,11 +571,6 @@ func (r *Replica) evaluate1PC(
 	// have acquired unreplicated locks, so inform the concurrency manager that
 	// it is finalized and than any unreplicated locks that it has acquired can
 	// be released.
-	//
-	// TODO(nvanbenschoten): once we can rely on EndTxn.TxnHeartbeating being
-	// correct in v21.1, we can gate these notifications on TxnHeartbeating
-	// because we know that a transaction hasn't acquired any unreplicated
-	// locks if it hasn't started heartbeating.
 	res.Local.UpdatedTxns = []*roachpb.Transaction{clonedTxn}
 	res.Local.ResolvedLocks = make([]roachpb.LockUpdate, len(etArg.LockSpans))
 	for i, sp := range etArg.LockSpans {
@@ -703,7 +654,7 @@ func (r *Replica) evaluateWriteBatchWrapper(
 	lul hlc.Timestamp,
 	latchSpans, lockSpans *spanset.SpanSet,
 ) (storage.Batch, *roachpb.BatchResponse, result.Result, *roachpb.Error) {
-	batch, opLogger := r.newBatchedEngine(latchSpans, lockSpans)
+	batch, opLogger := r.newBatchedEngine(ba, latchSpans, lockSpans)
 	br, res, pErr := evaluateBatch(ctx, idKey, batch, rec, ms, ba, lul, false /* readOnly */)
 	if pErr == nil {
 		if opLogger != nil {
@@ -720,7 +671,7 @@ func (r *Replica) evaluateWriteBatchWrapper(
 // OpLogger is attached to the returned engine.Batch, recording all operations.
 // Its recording should be attached to the Result of request evaluation.
 func (r *Replica) newBatchedEngine(
-	latchSpans, lockSpans *spanset.SpanSet,
+	ba *roachpb.BatchRequest, latchSpans, lockSpans *spanset.SpanSet,
 ) (storage.Batch, *storage.OpLoggerBatch) {
 	batch := r.store.Engine().NewBatch()
 	if !batch.ConsistentIterators() {
@@ -769,14 +720,37 @@ func (r *Replica) newBatchedEngine(
 		// To account for separated intent accesses, we translate the lock spans
 		// to lock table spans.
 		spans := latchSpans.Copy()
-		lockSpans.Iterate(func(sa spanset.SpanAccess, _ spanset.SpanScope, span spanset.Span) {
+		addLockTableSpan := func(sa spanset.SpanAccess, span spanset.Span) {
 			ltKey, _ := keys.LockTableSingleKey(span.Key, nil)
 			var ltEndKey roachpb.Key
 			if span.EndKey != nil {
 				ltEndKey, _ = keys.LockTableSingleKey(span.EndKey, nil)
 			}
 			spans.AddNonMVCC(sa, roachpb.Span{Key: ltKey, EndKey: ltEndKey})
+		}
+		lockSpans.Iterate(func(sa spanset.SpanAccess, _ spanset.SpanScope, span spanset.Span) {
+			addLockTableSpan(sa, span)
 		})
+		// The lock spans are insufficient for ranged intent resolution, which
+		// does not declare lock spans and directly calls
+		// spanSetBatch.NewEngineIterator.
+		//
+		// TODO(sumeer): we can't keep adding additional cases here -- come up
+		// with something cleaner.
+		for _, union := range ba.Requests {
+			inner := union.GetInner()
+			switch req := inner.(type) {
+			case *roachpb.ResolveIntentRangeRequest:
+				span := req.Span()
+				addLockTableSpan(spanset.SpanReadWrite, spanset.Span{Span: span})
+			case *roachpb.EndTxnRequest:
+				// EndTxnRequest does local intent resolution. We don't know the
+				// spans up front so we just allow everything.
+				spans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{
+					Key: keys.LockTableSingleKeyStart, EndKey: keys.LockTableSingleKeyEnd})
+			}
+		}
+
 		// During writes we may encounter a versioned value newer than the request
 		// timestamp, and may have to retry at a higher timestamp. This is still
 		// safe as we're only ever writing at timestamps higher than the timestamp

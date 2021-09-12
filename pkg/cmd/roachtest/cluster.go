@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -67,6 +68,7 @@ var (
 	clusterWipe      bool
 	zonesF           string
 	teamCity         bool
+	disableIssue     bool
 )
 
 type encryptValue string
@@ -624,8 +626,11 @@ type clusterImpl struct {
 	// l is the logger used to log various cluster operations.
 	// DEPRECATED for use outside of cluster methods: Use a test's t.L() instead.
 	// This is generally set to the current test's logger.
-	l          *logger.Logger
-	expiration time.Time
+	l *logger.Logger
+	// localCertsDir is a local copy of the certs for this cluster. If this is empty,
+	// the cluster is running in insecure mode.
+	localCertsDir string
+	expiration    time.Time
 	// encryptDefault is true if the cluster should default to having encryption
 	// at rest enabled. The default only applies if encryption is not explicitly
 	// enabled or disabled by options passed to Start.
@@ -774,6 +779,15 @@ func (f *clusterFactory) releaseSem() {
 	<-f.sem
 }
 
+func (f *clusterFactory) genName(cfg clusterConfig) string {
+	if cfg.localCluster {
+		return "local" // The roachprod tool understands this magic name.
+	}
+	count := atomic.AddUint64(&f.counter, 1)
+	return makeClusterName(
+		fmt.Sprintf("%s-%02d-%s", f.namePrefix, count, cfg.spec.String()))
+}
+
 // newCluster creates a new roachprod cluster.
 //
 // setStatus is called with status messages indicating the stage of cluster
@@ -787,19 +801,10 @@ func (f *clusterFactory) newCluster(
 		return nil, errors.Wrap(ctx.Err(), "newCluster")
 	}
 
-	var name string
-	if cfg.localCluster {
-		name = "local" // The roachprod tool understands this magic name.
-	} else {
-		count := atomic.AddUint64(&f.counter, 1)
-		name = makeClusterName(
-			fmt.Sprintf("%s-%02d-%s", f.namePrefix, count, cfg.spec.String()))
-	}
-
 	if cfg.spec.NodeCount == 0 {
 		// For tests. Return the minimum that makes them happy.
 		c := &clusterImpl{
-			name:       name,
+			name:       f.genName(cfg),
 			expiration: timeutil.Now().Add(24 * time.Hour),
 			r:          f.r,
 		}
@@ -814,73 +819,87 @@ func (f *clusterFactory) newCluster(
 		// Local clusters never expire.
 		exp = timeutil.Now().Add(100000 * time.Hour)
 	}
-	c := &clusterImpl{
-		name:           name,
-		spec:           cfg.spec,
-		expiration:     exp,
-		encryptDefault: encrypt.asBool(),
-		r:              f.r,
-		destroyState: destroyState{
-			owned: true,
-			alloc: cfg.alloc,
-		},
-	}
 
-	sargs := []string{roachprod, "create", c.name, "-n", fmt.Sprint(c.spec.NodeCount)}
-	{
-		args, err := cfg.spec.Args(createArgs...)
-		if err != nil {
-			return nil, err
-		}
-		sargs = append(sargs, args...)
-	}
-	if !cfg.useIOBarrier && localSSDArg {
-		sargs = append(sargs, "--local-ssd-no-ext4-barrier")
-	}
-
-	setStatus("acquring cluster creation semaphore")
+	setStatus("acquiring cluster creation semaphore")
 	release := f.acquireSem()
 	defer release()
+
 	setStatus("roachprod create")
-	c.status("creating cluster")
+	defer setStatus("idle")
 
-	// Logs for creating a new cluster go to a dedicated log file.
-	logPath := filepath.Join(f.artifactsDir, runnerLogsDir, "cluster-create", name+".log")
-	l, err := logger.RootLogger(logPath, teeOpt)
-	if err != nil {
-		log.Fatalf(ctx, "%v", err)
-	}
-
-	success := false
-	// Attempt to create a cluster several times, cause them clouds be flaky that
-	// my phone says it's snowing.
-	for i := 0; i < 3; i++ {
-		if i > 0 {
-			l.PrintfCtx(ctx, "Retrying cluster creation (attempt #%d)", i+1)
+	// Attempt to create a cluster several times to be able to move past
+	// temporary flakiness in the cloud providers.
+	const maxAttempts = 3
+	for i := 0; ; i++ {
+		c := &clusterImpl{
+			// NB: this intentionally avoids re-using the name across iterations in
+			// the loop. See:
+			//
+			// https://github.com/cockroachdb/cockroach/issues/67906#issuecomment-887477675
+			name:           f.genName(cfg),
+			spec:           cfg.spec,
+			expiration:     exp,
+			encryptDefault: encrypt.asBool(),
+			r:              f.r,
+			destroyState: destroyState{
+				owned: true,
+				alloc: cfg.alloc,
+			},
 		}
+		c.status("creating cluster")
+
+		sargs := []string{roachprod, "create", c.name, "-n", fmt.Sprint(c.spec.NodeCount)}
+		{
+			args, err := cfg.spec.Args(createArgs...)
+			if err != nil {
+				return nil, err
+			}
+			sargs = append(sargs, args...)
+		}
+		if !cfg.useIOBarrier && localSSDArg {
+			sargs = append(sargs, "--local-ssd-no-ext4-barrier")
+		}
+
+		// Logs for creating a new cluster go to a dedicated log file.
+		var retryStr string
+		if i > 0 {
+			retryStr = "-retry" + strconv.Itoa(i)
+		}
+		logPath := filepath.Join(f.artifactsDir, runnerLogsDir, "cluster-create", c.name+retryStr+".log")
+		l, err := logger.RootLogger(logPath, teeOpt)
+		if err != nil {
+			log.Fatalf(ctx, "%v", err)
+		}
+
+		l.PrintfCtx(ctx, "Attempting cluster creation (attempt #%d/%d)", i+1, maxAttempts)
 		err = execCmd(ctx, l, sargs...)
 		if err == nil {
-			success = true
-			break
+			if err := f.r.registerCluster(c); err != nil {
+				return nil, err
+			}
+			c.status("idle")
+			l.Close()
+			return c, nil
 		}
-		l.PrintfCtx(ctx, "Failed to create cluster.")
-		if !strings.Contains(cluster.GetStderr(err), "already exists") {
-			l.PrintfCtx(ctx, "Cleaning up in case it was partially created.")
-			c.Destroy(ctx, closeLogger, l)
-		} else {
-			break
+		if strings.Contains(cluster.GetStderr(err), "already exists") {
+			// If the cluster couldn't be created because it existed already, bail.
+			// In reality when this is hit is when running with the `local` flag
+			// or a destroy from the previous iteration failed.
+			return nil, err
 		}
+		l.PrintfCtx(ctx, "cluster creation failed, cleaning up in case it was partially created: %s", err)
+		// Set the alloc to nil so that Destroy won't release it.
+		// This is ugly, but given that the alloc is created very far away from this code
+		// (when selecting the test) it's the best we can do for now.
+		c.destroyState.alloc = nil
+		c.Destroy(ctx, closeLogger, l)
+		if i > maxAttempts {
+			// Here we have to release the alloc, as we are giving up.
+			cfg.alloc.Release()
+			return nil, err
+		}
+		// Try again to create the cluster.
 	}
-	if !success {
-		return nil, err
-	}
-
-	if err := f.r.registerCluster(c); err != nil {
-		return nil, err
-	}
-
-	c.status("idle")
-	return c, nil
 }
 
 type attachOpt struct {
@@ -1247,7 +1266,7 @@ func (c *clusterImpl) CheckReplicaDivergenceOnDB(
 	//
 	// We've seen the consistency checks hang indefinitely in some cases.
 	rows, err := db.QueryContext(ctx, `
-SET statement_timeout = '3m';
+SET statement_timeout = '5m';
 SELECT t.range_id, t.start_key_pretty, t.status, t.detail
 FROM
 crdb_internal.check_consistency(true, '', '') as t
@@ -1259,20 +1278,22 @@ WHERE t.status NOT IN ('RANGE_CONSISTENT', 'RANGE_INDETERMINATE')`)
 		l.Printf("consistency check failed with %v; ignoring", err)
 		return nil
 	}
+	defer rows.Close()
 	var finalErr error
 	for rows.Next() {
 		var rangeID int32
 		var prettyKey, status, detail string
 		if scanErr := rows.Scan(&rangeID, &prettyKey, &status, &detail); scanErr != nil {
-			return scanErr
+			l.Printf("consistency check failed with %v; ignoring", scanErr)
+			return nil
 		}
 		finalErr = errors.CombineErrors(finalErr,
 			errors.Newf("r%d (%s) is inconsistent: %s %s\n", rangeID, prettyKey, status, detail))
 	}
 	if err := rows.Err(); err != nil {
-		finalErr = errors.CombineErrors(finalErr, err)
+		l.Printf("consistency check failed with %v; ignoring", err)
+		return nil
 	}
-
 	return finalErr
 }
 
@@ -1311,7 +1332,7 @@ func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t test.Test) 
 	defer db.Close()
 
 	if err := contextutil.RunWithTimeout(
-		ctx, "consistency check", time.Minute,
+		ctx, "consistency check", 5*time.Minute,
 		func(ctx context.Context) error {
 			return c.CheckReplicaDivergenceOnDB(ctx, t.L(), db)
 		},
@@ -1489,12 +1510,24 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 			} else {
 				l.PrintfCtx(ctx, "destroying cluster %s... done", c)
 			}
-			c.destroyState.alloc.Release()
+			if c.destroyState.alloc != nil {
+				// We should usually have an alloc here, but if we're getting into this
+				// code path while retrying cluster creation, we don't want the alloc
+				// to be released (as we're going to retry cluster creation) and it will
+				// be nil here.
+				c.destroyState.alloc.Release()
+			}
 		} else {
 			l.PrintfCtx(ctx, "wiping cluster %s", c)
 			c.status("wiping cluster")
 			if err := execCmd(ctx, l, roachprod, "wipe", c.name); err != nil {
 				l.Errorf("%s", err)
+			}
+			if c.localCertsDir != "" {
+				if err := os.RemoveAll(c.localCertsDir); err != nil {
+					l.Errorf("failed to remove local certs in %s: %s", c.localCertsDir, err)
+				}
+				c.localCertsDir = ""
 			}
 		}
 	} else {
@@ -1733,7 +1766,36 @@ func (c *clusterImpl) StartE(ctx context.Context, opts ...option.Option) error {
 			}
 		}
 	}
-	return execCmd(ctx, c.l, args...)
+	if err := execCmd(ctx, c.l, args...); err != nil {
+		return err
+	}
+	if argExists(args, "--secure") {
+		var err error
+		c.localCertsDir, err = ioutil.TempDir("", "roachtest-certs")
+		if err != nil {
+			return err
+		}
+		// `roachprod get` behaves differently with `--local` depending on whether
+		// the target dir exists. With `--local`, it'll put the files into the
+		// existing dir. Without `--local`, it'll create a new subdir to house the
+		// certs. Bypass that distinction (which should be fixed independently, but
+		// that might cause fallout) by using a non-existing dir here.
+		c.localCertsDir = filepath.Join(c.localCertsDir, "certs")
+		// Get the certs from the first node.
+		if err := c.Get(ctx, c.l, "./certs", c.localCertsDir, c.Node(1)); err != nil {
+			return err
+		}
+		// Need to prevent world readable files or lib/pq will complain.
+		if err := filepath.Walk(c.localCertsDir, func(path string, info fs.FileInfo, err error) error {
+			if info.IsDir() {
+				return nil
+			}
+			return os.Chmod(path, 0600)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Start is like StartE() except that it will fatal the test on error.
@@ -1875,7 +1937,7 @@ func cmdLogFileName(t time.Time, nodes option.NodeListOption, args ...string) st
 	}
 	logFile := fmt.Sprintf(
 		"run_%s_n%s_%s",
-		t.Format(`150405.000`),
+		t.Format(`150405.000000000`),
 		nodes.String()[1:],
 		s,
 	)
@@ -1963,6 +2025,9 @@ func (c *clusterImpl) pgURLErr(
 	if external {
 		args = append(args, `--external`)
 	}
+	if c.localCertsDir != "" {
+		args = append(args, "--secure", "--certs-dir", c.localCertsDir)
+	}
 	nodes := c.MakeNodes(node)
 	args = append(args, nodes)
 	cmd := execCmdEx(ctx, c.l, args...)
@@ -2002,23 +2067,6 @@ func (c *clusterImpl) ExternalPGUrl(
 	ctx context.Context, node option.NodeListOption,
 ) ([]string, error) {
 	return c.pgURLErr(ctx, node, true /* external */)
-}
-
-// ExternalPGUrlSecure returns the external Postgres endpoint for the specified
-// nodes.
-func (c *clusterImpl) ExternalPGUrlSecure(
-	ctx context.Context, node option.NodeListOption, user string, certsDir string, port int,
-) ([]string, error) {
-	urlTemplate := "postgres://%s@%s:%d?sslcert=%s/client.%s.crt&sslkey=%s/client.%s.key&sslrootcert=%s/ca.crt&sslmode=require"
-	ips, err := c.ExternalIP(ctx, node)
-	if err != nil {
-		return nil, err
-	}
-	var urls []string
-	for _, ip := range ips {
-		urls = append(urls, fmt.Sprintf(urlTemplate, user, ip, port, certsDir, user, certsDir, user, certsDir))
-	}
-	return urls, nil
 }
 
 func addrToAdminUIAddr(c *clusterImpl, addr string) (string, error) {
@@ -2199,21 +2247,6 @@ func (c *clusterImpl) Conn(ctx context.Context, node int) *gosql.DB {
 // ConnE returns a SQL connection to the specified node.
 func (c *clusterImpl) ConnE(ctx context.Context, node int) (*gosql.DB, error) {
 	urls, err := c.ExternalPGUrl(ctx, c.Node(node))
-	if err != nil {
-		return nil, err
-	}
-	db, err := gosql.Open("postgres", urls[0])
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
-// ConnSecure returns a secure SQL connection to the specified node.
-func (c *clusterImpl) ConnSecure(
-	ctx context.Context, node int, user string, certsDir string, port int,
-) (*gosql.DB, error) {
-	urls, err := c.ExternalPGUrlSecure(ctx, c.Node(node), user, certsDir, port)
 	if err != nil {
 		return nil, err
 	}

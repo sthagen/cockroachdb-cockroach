@@ -23,7 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -42,10 +43,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -56,6 +60,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
@@ -66,6 +73,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/collector"
 	"github.com/cockroachdb/errors"
 )
 
@@ -109,6 +117,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalGossipLivenessTableID:            crdbInternalGossipLivenessTable,
 		catconstants.CrdbInternalGossipNetworkTableID:             crdbInternalGossipNetworkTable,
 		catconstants.CrdbInternalIndexColumnsTableID:              crdbInternalIndexColumnsTable,
+		catconstants.CrdbInternalIndexUsageStatisticsTableID:      crdbInternalIndexUsageStatistics,
 		catconstants.CrdbInternalInflightTraceSpanTableID:         crdbInternalInflightTraceSpanTable,
 		catconstants.CrdbInternalJobsTableID:                      crdbInternalJobsTable,
 		catconstants.CrdbInternalKVNodeStatusTableID:              crdbInternalKVNodeStatusTable,
@@ -120,6 +129,8 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalLocalTransactionsTableID:         crdbInternalLocalTxnsTable,
 		catconstants.CrdbInternalLocalSessionsTableID:             crdbInternalLocalSessionsTable,
 		catconstants.CrdbInternalLocalMetricsTableID:              crdbInternalLocalMetricsTable,
+		catconstants.CrdbInternalNodeStmtStatsTableID:             crdbInternalNodeStmtStatsTable,
+		catconstants.CrdbInternalNodeTxnStatsTableID:              crdbInternalNodeTxnStatsTable,
 		catconstants.CrdbInternalPartitionsTableID:                crdbInternalPartitionsTable,
 		catconstants.CrdbInternalPredefinedCommentsTableID:        crdbInternalPredefinedCommentsTable,
 		catconstants.CrdbInternalRangesNoLeasesTableID:            crdbInternalRangesNoLeasesTable,
@@ -143,6 +154,8 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalLostTableDescriptors:             crdbLostTableDescriptors,
 		catconstants.CrdbInternalClusterInflightTracesTable:       crdbInternalClusterInflightTracesTable,
 		catconstants.CrdbInternalRegionsTable:                     crdbInternalRegionsTable,
+		catconstants.CrdbInternalDefaultPrivilegesTable:           crdbInternalDefaultPrivilegesTable,
+		catconstants.CrdbInternalActiveRangeFeedsTable:            crdbInternalActiveRangeFeedsTable,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -249,6 +262,7 @@ CREATE TABLE crdb_internal.databases (
 	primary_region STRING,
 	regions STRING[],
 	survival_goal STRING,
+	placement_policy STRING,
 	create_statement STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -256,6 +270,7 @@ CREATE TABLE crdb_internal.databases (
 			func(db catalog.DatabaseDescriptor) error {
 				var survivalGoal tree.Datum = tree.DNull
 				var primaryRegion tree.Datum = tree.DNull
+				var placement tree.Datum = tree.DNull
 				regions := tree.NewDArray(types.String)
 
 				createNode := tree.CreateDatabase{}
@@ -279,6 +294,19 @@ CREATE TABLE crdb_internal.databases (
 						createNode.Regions[i] = tree.Name(region)
 					}
 
+					if db.GetRegionConfig().Placement == descpb.DataPlacement_RESTRICTED {
+						placement = tree.NewDString("restricted")
+						createNode.Placement = tree.DataPlacementRestricted
+					} else {
+						placement = tree.NewDString("default")
+						// We can't differentiate between a database that was created with
+						// unspecified and default, and we don't want to expose PLACEMENT
+						// unless we know the user wants to use PLACEMENT. Therefore, we
+						// only add a PLACEMENT clause if the database was configured with
+						// restricted placement.
+						createNode.Placement = tree.DataPlacementUnspecified
+					}
+
 					createNode.SurvivalGoal = tree.SurvivalGoalDefault
 					switch db.GetRegionConfig().SurvivalGoal {
 					case descpb.SurvivalGoal_ZONE_FAILURE:
@@ -299,6 +327,7 @@ CREATE TABLE crdb_internal.databases (
 					primaryRegion,                        // primary_region
 					regions,                              // regions
 					survivalGoal,                         // survival_goal
+					placement,                            // data_placement
 					tree.NewDString(createNode.String()), // create_statement
 				)
 			})
@@ -371,7 +400,7 @@ CREATE TABLE crdb_internal.tables (
 				locality := tree.DNull
 				if c := table.GetLocalityConfig(); c != nil {
 					f := p.EvalContext().FmtCtx(tree.FmtSimple)
-					if err := tabledesc.FormatTableLocalityConfig(c, f); err != nil {
+					if err := multiregion.FormatTableLocalityConfig(c, f); err != nil {
 						return err
 					}
 					locality = tree.NewDString(f.String())
@@ -644,7 +673,11 @@ CREATE TABLE crdb_internal.jobs (
   high_water_timestamp  DECIMAL,
   error                 STRING,
   coordinator_id        INT,
-  trace_id              INT
+  trace_id              INT,
+  last_run              TIMESTAMP,
+  next_run              TIMESTAMP,
+  num_runs              INT,
+  execution_errors      STRING[]
 )`,
 	comment: `decoded job metadata from system.jobs (KV scan)`,
 	generator: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, _ *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
@@ -661,11 +694,26 @@ CREATE TABLE crdb_internal.jobs (
 
 		// Beware: we're querying system.jobs as root; we need to be careful to filter
 		// out results that the current user is not able to see.
-		query := `SELECT id, status, created, payload, progress, claim_session_id, claim_instance_id FROM system.jobs`
+		const (
+			qSelect             = `SELECT id, status, created, payload, progress, claim_session_id, claim_instance_id`
+			qFrom               = ` FROM system.jobs`
+			queryWithoutBackoff = qSelect + qFrom
+			backoffArgs         = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
+			queryWithBackoff    = qSelect + `, last_run, COALESCE(num_runs, 0), ` + jobs.NextRunClause + ` as next_run` + qFrom + ", " + backoffArgs
+		)
+		query := queryWithoutBackoff
+		var args []interface{}
+		settings := p.execCfg.Settings
+		backoffIsEnabled := settings.Version.IsActive(ctx, clusterversion.RetryJobsWithExponentialBackoff)
+		if backoffIsEnabled {
+			query = queryWithBackoff
+			args = append(args, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay())
+		}
+
 		it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 			ctx, "crdb-internal-jobs-table", p.txn,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			query)
+			query, args...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -684,7 +732,7 @@ CREATE TABLE crdb_internal.jobs (
 		}
 
 		// We'll reuse this container on each loop.
-		container := make(tree.Datums, 0, 16)
+		container := make(tree.Datums, 0, 21)
 		return func() (datums tree.Datums, e error) {
 			// Loop while we need to skip a row.
 			for {
@@ -698,7 +746,8 @@ CREATE TABLE crdb_internal.jobs (
 
 				var jobType, description, statement, username, descriptorIDs, started, runningStatus,
 					finished, modified, fractionCompleted, highWaterTimestamp, errorStr, coordinatorID,
-					traceID = tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
+					traceID, lastRun, nextRun, numRuns, executionErrors = tree.DNull, tree.DNull, tree.DNull,
+					tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
 					tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
 					tree.DNull
 
@@ -797,6 +846,14 @@ CREATE TABLE crdb_internal.jobs (
 					}
 				}
 
+				if backoffIsEnabled {
+					lastRun, numRuns, nextRun = r[7], r[8], r[9]
+					if payload != nil {
+						executionErrors = jobs.
+							FormatRetriableExecutionErrorLogToStringArray(ctx, payload)
+					}
+				}
+
 				container = container[:0]
 				container = append(container,
 					id,
@@ -816,6 +873,10 @@ CREATE TABLE crdb_internal.jobs (
 					errorStr,
 					coordinatorID,
 					traceID,
+					lastRun,
+					nextRun,
+					numRuns,
+					executionErrors,
 				)
 				return container, nil
 			}
@@ -841,39 +902,19 @@ func execStatVar(count int64, n roachpb.NumericStat) tree.Datum {
 	return tree.NewDFloat(tree.DFloat(n.GetVariance(count)))
 }
 
-// getSQLStats retrieves a sqlStats storage subsystem from the planner or
+// getSQLStats retrieves a sqlStats provider from the planner or
 // returns an error if not available. virtualTableName specifies the virtual
 // table for which this sqlStats object is needed.
-func getSQLStats(p *planner, virtualTableName string) (sqlstats.Storage, error) {
-	if p.extendedEvalCtx.statsStorage == nil {
+func getSQLStats(
+	p *planner, virtualTableName string,
+) (*persistedsqlstats.PersistedSQLStats, error) {
+	if p.extendedEvalCtx.statsProvider == nil {
 		return nil, errors.Newf("%s cannot be used in this context", virtualTableName)
 	}
-	return p.extendedEvalCtx.statsStorage, nil
+	return p.extendedEvalCtx.statsProvider, nil
 }
 
-// ExplainTreePlanNodeToJSON builds a formatted JSON object from the explain tree nodes.
-func ExplainTreePlanNodeToJSON(node *roachpb.ExplainTreePlanNode) json.JSON {
-
-	// Create a new json.ObjectBuilder with key-value pairs for the node's name (1),
-	// node's attributes (len(node.Attrs)), and the node's children (1).
-	nodePlan := json.NewObjectBuilder(len(node.Attrs) + 2 /* numAddsHint */)
-	nodeChildren := json.NewArrayBuilder(len(node.Children))
-
-	nodePlan.Add("Name", json.FromString(node.Name))
-
-	for _, attr := range node.Attrs {
-		nodePlan.Add(strings.Title(attr.Key), json.FromString(attr.Value))
-	}
-
-	for _, childNode := range node.Children {
-		nodeChildren.Add(ExplainTreePlanNodeToJSON(childNode))
-	}
-
-	nodePlan.Add("Children", nodeChildren.Build())
-	return nodePlan.Build()
-}
-
-var crdbInternalStmtStatsTable = virtualSchemaTable{
+var crdbInternalNodeStmtStatsTable = virtualSchemaTable{
 	comment: `statement statistics (in-memory, not durable; local node only). ` +
 		`This table is wiped periodically (by default, at least every two hours)`,
 	schema: `
@@ -937,7 +978,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
-		statementVisitor := func(stats *roachpb.CollectedStatementStatistics) error {
+		statementVisitor := func(_ context.Context, stats *roachpb.CollectedStatementStatistics) error {
 			anonymized := tree.DNull
 			anonStr, ok := scrubStmtStatKey(p.getVirtualTabler(), stats.Key.Query)
 			if ok {
@@ -956,7 +997,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				flags = "!" + flags
 			}
 
-			samplePlan := ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription)
+			samplePlan := sqlstatsutil.ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription)
 
 			execNodeIDs := tree.NewDArray(types.Int)
 			for _, nodeID := range stats.Stats.Nodes {
@@ -1015,7 +1056,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			return nil
 		}
 
-		return sqlStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{
+		return sqlStats.GetLocalMemProvider().IterateStatementStats(ctx, &sqlstats.IteratorOptions{
 			SortedAppNames: true,
 			SortedKey:      true,
 		}, statementVisitor)
@@ -1072,7 +1113,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 
 		nodeID, _ := p.execCfg.NodeID.OptionalNodeID() // zero if not available
 
-		transactionVisitor := func(txnFingerprintID roachpb.TransactionFingerprintID, stats *roachpb.CollectedTransactionStatistics) error {
+		transactionVisitor := func(_ context.Context, stats *roachpb.CollectedTransactionStatistics) error {
 			stmtFingerprintIDsDatum := tree.NewDArray(types.String)
 			for _, stmtFingerprintID := range stats.StatementFingerprintIDs {
 				if err := stmtFingerprintIDsDatum.Append(tree.NewDString(strconv.FormatUint(uint64(stmtFingerprintID), 10))); err != nil {
@@ -1081,9 +1122,9 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			}
 
 			err := addRow(
-				tree.NewDInt(tree.DInt(nodeID)),                                                    // node_id
-				tree.NewDString(stats.App),                                                         // application_name
-				tree.NewDString(strconv.FormatUint(uint64(txnFingerprintID), 10)),                  // key
+				tree.NewDInt(tree.DInt(nodeID)), // node_id
+				tree.NewDString(stats.App),      // application_name
+				tree.NewDString(strconv.FormatUint(uint64(stats.TransactionFingerprintID), 10)), // key
 				stmtFingerprintIDsDatum,                                                            // statement_ids
 				tree.NewDInt(tree.DInt(stats.Stats.Count)),                                         // count
 				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),                                    // max_retries
@@ -1114,14 +1155,14 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			return nil
 		}
 
-		return sqlStats.IterateTransactionStats(ctx, &sqlstats.IteratorOptions{
+		return sqlStats.GetLocalMemProvider().IterateTransactionStats(ctx, &sqlstats.IteratorOptions{
 			SortedAppNames: true,
 			SortedKey:      true,
 		}, transactionVisitor)
 	},
 }
 
-var crdbInternalTxnStatsTable = virtualSchemaTable{
+var crdbInternalNodeTxnStatsTable = virtualSchemaTable{
 	comment: `per-application transaction statistics (in-memory, not durable; local node only). ` +
 		`This table is wiped periodically (by default, at least every two hours)`,
 	schema: `
@@ -1246,7 +1287,8 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 		}
 
 		traceCollector := p.ExecCfg().TraceCollector
-		for iter := traceCollector.StartIter(ctx, traceID); iter.Valid(); iter.Next() {
+		var iter *collector.Iterator
+		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next() {
 			nodeID, recording := iter.Value()
 			traceString := recording.String()
 			traceJaegerJSON, err := recording.ToJaegerJSON("", "", fmt.Sprintf("node %d", nodeID))
@@ -1260,6 +1302,12 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 				tree.NewDString(traceJaegerJSON)); err != nil {
 				return false, err
 			}
+		}
+		if err != nil {
+			return false, err
+		}
+		if iter.Error() != nil {
+			return false, iter.Error()
 		}
 
 		return true, nil
@@ -3244,9 +3292,9 @@ CREATE TABLE crdb_internal.zones (
 )
 `,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if !p.ExecCfg().Codec.ForSystemTenant() {
-			// Don't try to populate crdb_internal.zones if running in a multitenant
-			// configuration.
+		if !ZonesTableExists(ctx, p.ExecCfg().Codec, p.ExecCfg().Settings.Version) {
+			// Don't try to populate crdb_internal.zones if `system.zones` doesn't
+			// exist.
 			return nil
 		}
 
@@ -3305,7 +3353,9 @@ CREATE TABLE crdb_internal.zones (
 
 			// Inherit full information about this zone.
 			fullZone := configProto
-			if err := completeZoneConfig(&fullZone, config.SystemTenantObjectID(tree.MustBeDInt(r[0])), getKey); err != nil {
+			if err := completeZoneConfig(
+				&fullZone, p.ExecCfg().Codec, descpb.ID(tree.MustBeDInt(r[0])), getKey,
+			); err != nil {
 				return err
 			}
 
@@ -3648,7 +3698,7 @@ CREATE TABLE crdb_internal.gossip_liveness (
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		// ATTENTION: The contents of this table should only access gossip data
 		// which is highly available. DO NOT CALL functions which require the
-		// cluster to be healthy, such as NodesStatusServer.Nodes().
+		// cluster to be healthy, such as NodesStatusServer.ListNodesInternal().
 
 		if err := p.RequireAdminRole(ctx, "read crdb_internal.gossip_liveness"); err != nil {
 			return err
@@ -3832,11 +3882,9 @@ func addPartitioningRows(
 	colOffset int,
 	addRow func(...tree.Datum) error,
 ) error {
-	// Secondary tenants cannot set zone configs on individual objects, so they
-	// have no ability to partition tables/indexes.
-	// NOTE: we assume the system tenant below by casting object IDs directly to
-	// config.SystemTenantObjectID.
-	if !p.ExecCfg().Codec.ForSystemTenant() {
+	if !ZonesTableExists(ctx, p.ExecCfg().Codec, p.ExecCfg().Settings.Version) {
+		// Zone configs can only be set on individual objects if `system.zones`
+		// exists.
 		return nil
 	}
 
@@ -3883,7 +3931,7 @@ func addPartitioningRows(
 
 		// Figure out which zone and subzone this partition should correspond to.
 		zoneID, zone, subzone, err := GetZoneConfigInTxn(
-			ctx, p.txn, config.SystemTenantObjectID(table.GetID()), index, name, false /* getInheritedDefault */)
+			ctx, p.txn, p.ExecCfg().Codec, table.GetID(), index, name, false /* getInheritedDefault */)
 		if err != nil {
 			return err
 		}
@@ -3939,7 +3987,7 @@ func addPartitioningRows(
 
 		// Figure out which zone and subzone this partition should correspond to.
 		zoneID, zone, subzone, err := GetZoneConfigInTxn(
-			ctx, p.txn, config.SystemTenantObjectID(table.GetID()), index, name, false /* getInheritedDefault */)
+			ctx, p.txn, p.ExecCfg().Codec, table.GetID(), index, name, false /* getInheritedDefault */)
 		if err != nil {
 			return err
 		}
@@ -4080,7 +4128,7 @@ CREATE TABLE crdb_internal.kv_node_status (
 		if err != nil {
 			return err
 		}
-		response, err := ss.Nodes(ctx, &serverpb.NodesRequest{})
+		response, err := ss.ListNodesInternal(ctx, &serverpb.NodesRequest{})
 		if err != nil {
 			return err
 		}
@@ -4195,7 +4243,7 @@ CREATE TABLE crdb_internal.kv_store_status (
 		if err != nil {
 			return err
 		}
-		response, err := ss.Nodes(ctx, &serverpb.NodesRequest{})
+		response, err := ss.ListNodesInternal(ctx, &serverpb.NodesRequest{})
 		if err != nil {
 			return err
 		}
@@ -4553,7 +4601,9 @@ CREATE TABLE crdb_internal.interleaved (
 				if !table.IsInterleaved() {
 					return nil
 				}
-				indexes := table.NonDropIndexes()
+				// We want to include dropped indexes for cases where
+				// a revert may end up adding them back.
+				indexes := table.AllIndexes()
 				for _, index := range indexes {
 					if index.NumInterleaveAncestors() == 0 {
 						continue
@@ -4857,5 +4907,397 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 			return err
 		}
 		return nil
+	},
+}
+
+var crdbInternalDefaultPrivilegesTable = virtualSchemaTable{
+	comment: `virtual table with default privileges`,
+	schema: `
+CREATE TABLE crdb_internal.default_privileges (
+	database_name   STRING NOT NULL,
+	schema_name     STRING,
+	role            STRING,
+	for_all_roles   BOOL,
+	object_type     STRING NOT NULL,
+	grantee         STRING NOT NULL,
+	privilege_type  STRING NOT NULL
+);`,
+	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
+			func(descriptor catalog.DatabaseDescriptor) error {
+				addRowHelper := func(defaultPrivilegesForRole descpb.DefaultPrivilegesForRole) error {
+					role := tree.DNull
+					forAllRoles := tree.DBoolTrue
+					if defaultPrivilegesForRole.IsExplicitRole() {
+						role = tree.NewDString(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized())
+						forAllRoles = tree.DBoolFalse
+					}
+					for objectType, privs := range defaultPrivilegesForRole.DefaultPrivilegesPerObject {
+						privilegeObjectType := targetObjectToPrivilegeObject[objectType]
+						for _, userPrivs := range privs.Users {
+							privList := privilege.ListFromBitField(userPrivs.Privileges, privilegeObjectType)
+							for _, priv := range privList {
+								if err := addRow(
+									tree.NewDString(descriptor.GetName()),
+									// When the schema_name is NULL, that means the default
+									// privileges are defined at the database level.
+									tree.DNull, /* schema is currently always nil. See: #67376 */
+									role,
+									forAllRoles,
+									tree.NewDString(objectType.String()),
+									tree.NewDString(userPrivs.User().Normalized()),
+									tree.NewDString(priv.String()),
+								); err != nil {
+									return err
+								}
+							}
+						}
+					}
+					for _, objectType := range tree.GetAlterDefaultPrivilegesTargetObjects() {
+						if catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, objectType) {
+							if err := addRow(
+								tree.NewDString(descriptor.GetName()),
+								// When the schema_name is NULL, that means the default
+								// privileges are defined at the database level.
+								tree.DNull, /* schema is currently always nil. See: #67376 */
+								role,
+								forAllRoles,
+								tree.NewDString(objectType.String()),
+								tree.NewDString(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized()),
+								tree.NewDString(privilege.ALL.String()),
+							); err != nil {
+								return err
+							}
+						}
+					}
+					if catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) {
+						if err := addRow(
+							tree.NewDString(descriptor.GetName()),
+							// When the schema_name is NULL, that means the default
+							// privileges are defined at the database level.
+							tree.DNull, /* schema is currently always nil. See: #67376 */
+							role,
+							forAllRoles,
+							tree.NewDString(tree.Types.String()),
+							tree.NewDString(security.PublicRoleName().Normalized()),
+							tree.NewDString(privilege.USAGE.String()),
+						); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				addRowForRole := func(role descpb.DefaultPrivilegesRole) error {
+					defaultPrivilegesForRole, found := dbContext.GetDefaultPrivilegeDescriptor().GetDefaultPrivilegesForRole(role)
+					if !found {
+						// If an entry is not found for the role, the role still has
+						// the default set of default privileges.
+						newDefaultPrivilegesForRole := descpb.InitDefaultPrivilegesForRole(role)
+						defaultPrivilegesForRole = &newDefaultPrivilegesForRole
+					}
+					if err := addRowHelper(*defaultPrivilegesForRole); err != nil {
+						return err
+					}
+					return nil
+				}
+				if err := forEachRole(ctx, p, func(username security.SQLUsername, isRole bool, noLogin bool, rolValidUntil *time.Time) error {
+					role := descpb.DefaultPrivilegesRole{
+						Role: username,
+					}
+					return addRowForRole(role)
+				}); err != nil {
+					return err
+				}
+
+				// Handle ForAllRoles outside of forEachRole since it is a pseudo role.
+				role := descpb.DefaultPrivilegesRole{
+					ForAllRoles: true,
+				}
+				return addRowForRole(role)
+			})
+	},
+}
+
+var crdbInternalIndexUsageStatistics = virtualSchemaTable{
+	comment: `cluster-wide index usage statistics (in-memory, not durable).` +
+		`Querying this table is an expensive operation since it creates a` +
+		`cluster-wide RPC fanout.`,
+	schema: `
+CREATE TABLE crdb_internal.index_usage_statistics (
+  table_id        INT NOT NULL,
+  index_id        INT NOT NULL,
+  total_reads     INT NOT NULL,
+  last_read       TIMESTAMPTZ
+);`,
+	generator: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
+		// Perform RPC Fanout.
+		stats, err :=
+			p.extendedEvalCtx.SQLStatusServer.IndexUsageStatistics(ctx, &serverpb.IndexUsageStatisticsRequest{})
+		if err != nil {
+			return nil, nil, err
+		}
+		indexStats := idxusage.NewLocalIndexUsageStatsFromExistingStats(&idxusage.Config{}, stats.Statistics)
+
+		row := make(tree.Datums, 4 /* number of columns for this virtual table */)
+		worker := func(pusher rowPusher) error {
+			return forEachTableDescAll(ctx, p, dbContext, hideVirtual,
+				func(db catalog.DatabaseDescriptor, _ string, table catalog.TableDescriptor) error {
+					tableID := table.GetID()
+					return catalog.ForEachIndex(table, catalog.IndexOpts{}, func(idx catalog.Index) error {
+						indexID := idx.GetID()
+						stats := indexStats.Get(roachpb.TableID(tableID), roachpb.IndexID(indexID))
+
+						lastScanTs := tree.DNull
+						if !stats.LastRead.IsZero() {
+							lastScanTs, err = tree.MakeDTimestampTZ(stats.LastRead, time.Nanosecond)
+							if err != nil {
+								return err
+							}
+						}
+
+						row = row[:0]
+
+						row = append(row,
+							tree.NewDInt(tree.DInt(tableID)),              // tableID
+							tree.NewDInt(tree.DInt(indexID)),              // indexID
+							tree.NewDInt(tree.DInt(stats.TotalReadCount)), // total_reads
+							lastScanTs, // last_scan
+						)
+
+						return pusher.pushRow(row...)
+					})
+				})
+		}
+		return setupGenerator(ctx, worker, stopper)
+	},
+}
+
+var crdbInternalStmtStatsTable = virtualSchemaTable{
+	comment: `statement statistics (cluster-wide).` +
+		`Querying this table is an expensive operation since it creates a ` +
+		`cluster-wide RPC-fanout.`,
+	schema: `
+CREATE TABLE crdb_internal.statement_statistics (
+    aggregated_ts  TIMESTAMPTZ NOT NULL,
+    fingerprint_id BYTES NOT NULL,
+    plan_hash      BYTES NOT NULL,
+    app_name       STRING NOT NULL,
+    metadata       JSONB NOT NULL,
+    statistics     JSONB NOT NULL,
+    sampled_plan   JSONB NOT NULL
+);`,
+	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
+		// TODO(azhng): we want to eventually implement memory accounting within the
+		//  RPC handlers. See #69032.
+		acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
+		defer acc.Close(ctx)
+
+		// Perform RPC fanout.
+		stats, err :=
+			p.extendedEvalCtx.SQLStatusServer.Statements(ctx, &serverpb.StatementsRequest{})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		statsMemSize := stats.Size()
+		if err = acc.Grow(ctx, int64(statsMemSize)); err != nil {
+			return nil, nil, err
+		}
+
+		memSQLStats, err := sslocal.NewTempSQLStatsFromExistingStmtStats(stats.Statements)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		execCfg := p.ExecCfg()
+		sqlStats := persistedsqlstats.New(&persistedsqlstats.Config{
+			Settings:         execCfg.Settings,
+			InternalExecutor: execCfg.InternalExecutor,
+			KvDB:             execCfg.DB,
+			SQLIDContainer:   execCfg.NodeID,
+			Knobs:            execCfg.SQLStatsTestingKnobs,
+		}, memSQLStats)
+
+		row := make(tree.Datums, 7 /* number of columns for this virtual table */)
+		worker := func(pusher rowPusher) error {
+			return sqlStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{
+				SortedAppNames: true,
+				SortedKey:      true,
+			}, func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+
+				aggregatedTs, err := tree.MakeDTimestampTZ(statistics.AggregatedTs, time.Microsecond)
+				if err != nil {
+					return err
+				}
+
+				fingerprintID := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(statistics.ID))))
+
+				// TODO(azhng): properly update plan_hash value once we can expose it
+				//  from the optimizer.
+				planHash := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(0)))
+
+				metadataJSON, err := sqlstatsutil.BuildStmtMetadataJSON(statistics)
+				if err != nil {
+					return err
+				}
+				statisticsJSON, err := sqlstatsutil.BuildStmtStatisticsJSON(&statistics.Stats)
+				if err != nil {
+					return err
+				}
+				plan := sqlstatsutil.ExplainTreePlanNodeToJSON(&statistics.Stats.SensitiveInfo.MostRecentPlanDescription)
+
+				row = row[:0]
+				row = append(row,
+					aggregatedTs,                        // aggregated_ts
+					fingerprintID,                       // fingerprint_id
+					planHash,                            // plan_hash
+					tree.NewDString(statistics.Key.App), // app_name
+					tree.NewDJSON(metadataJSON),         // metadata
+					tree.NewDJSON(statisticsJSON),       // statistics
+					tree.NewDJSON(plan),                 // plan
+				)
+
+				return pusher.pushRow(row...)
+			})
+		}
+		return setupGenerator(ctx, worker, stopper)
+	},
+}
+
+var crdbInternalActiveRangeFeedsTable = virtualSchemaTable{
+	comment: `node-level table listing all currently running range feeds`,
+	schema: `
+CREATE TABLE crdb_internal.active_range_feeds (
+  id INT,
+  tags STRING,
+  span_start STRING,
+  span_end STRING,
+  startTS STRING,
+  diff BOOL,
+  node_id INT,
+  range_id INT,
+  range_start STRING,
+  range_end STRING,
+  resolved STRING,
+  last_event_utc INT
+);`,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return p.execCfg.DistSender.ForEachActiveRangeFeed(
+			func(rfCtx kvcoord.RangeFeedContext, rf kvcoord.PartialRangeFeed) error {
+				var lastEvent tree.Datum
+				if rf.LastValueReceived.IsZero() {
+					lastEvent = tree.DNull
+				} else {
+					lastEvent = tree.NewDInt(tree.DInt(rf.LastValueReceived.UTC().UnixNano()))
+				}
+
+				return addRow(
+					tree.NewDInt(tree.DInt(rfCtx.ID)),
+					tree.NewDString(rfCtx.CtxTags),
+					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rfCtx.Span.Key)),
+					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rfCtx.Span.EndKey)),
+					tree.NewDString(rfCtx.TS.AsOfSystemTime()),
+					tree.MakeDBool(tree.DBool(rfCtx.WithDiff)),
+					tree.NewDInt(tree.DInt(rf.NodeID)),
+					tree.NewDInt(tree.DInt(rf.RangeID)),
+					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rf.Span.Key)),
+					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rf.Span.EndKey)),
+					tree.NewDString(rf.Resolved.AsOfSystemTime()),
+					lastEvent,
+				)
+			},
+		)
+	},
+}
+
+var crdbInternalTxnStatsTable = virtualSchemaTable{
+	comment: `transaction statistics (cluster-wide).` +
+		`Querying this table is an expensive operation since it creates a ` +
+		`cluster-wide RPC-fanout.`,
+	schema: `
+CREATE TABLE crdb_internal.transaction_statistics (
+    aggregated_ts  TIMESTAMPTZ NOT NULL,
+    fingerprint_id BYTES NOT NULL,
+    app_name       STRING NOT NULL,
+    metadata       JSONB NOT NULL,
+    statistics     JSONB NOT NULL
+);`,
+	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
+		// TODO(azhng): we want to eventually implement memory accounting within the
+		//  RPC handlers. See #69032.
+		acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
+		defer acc.Close(ctx)
+
+		// Perform RPC fanout.
+		stats, err :=
+			p.extendedEvalCtx.SQLStatusServer.Statements(ctx, &serverpb.StatementsRequest{})
+
+		if err != nil {
+			return nil, nil, err
+		}
+
+		statsMemSize := stats.Size()
+		if err = acc.Grow(ctx, int64(statsMemSize)); err != nil {
+			return nil, nil, err
+		}
+
+		stats.Size()
+
+		memSQLStats, err :=
+			sslocal.NewTempSQLStatsFromExistingTxnStats(stats.Transactions)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		execCfg := p.ExecCfg()
+		sqlStats := persistedsqlstats.New(&persistedsqlstats.Config{
+			Settings:         execCfg.Settings,
+			InternalExecutor: execCfg.InternalExecutor,
+			KvDB:             execCfg.DB,
+			SQLIDContainer:   execCfg.NodeID,
+			Knobs:            execCfg.SQLStatsTestingKnobs,
+		}, memSQLStats)
+
+		row := make(tree.Datums, 5 /* number of columns for this virtual table */)
+		worker := func(pusher rowPusher) error {
+			return sqlStats.IterateTransactionStats(ctx, &sqlstats.IteratorOptions{
+				SortedAppNames: true,
+				SortedKey:      true,
+			}, func(
+				ctx context.Context,
+				statistics *roachpb.CollectedTransactionStatistics) error {
+
+				aggregatedTs, err := tree.MakeDTimestampTZ(statistics.AggregatedTs, time.Microsecond)
+				if err != nil {
+					return err
+				}
+
+				fingerprintID := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(statistics.TransactionFingerprintID))))
+
+				metadataJSON, err := sqlstatsutil.BuildTxnMetadataJSON(statistics)
+				if err != nil {
+					return err
+				}
+				statisticsJSON, err := sqlstatsutil.BuildTxnStatisticsJSON(statistics)
+				if err != nil {
+					return err
+				}
+
+				row = row[:0]
+				row = append(row,
+					aggregatedTs,                    // aggregated_ts
+					fingerprintID,                   // fingerprint_id
+					tree.NewDString(statistics.App), // app_name
+					tree.NewDJSON(metadataJSON),     // metadata
+					tree.NewDJSON(statisticsJSON),   // statistics
+				)
+
+				return pusher.pushRow(row...)
+			})
+		}
+		return setupGenerator(ctx, worker, stopper)
 	},
 }

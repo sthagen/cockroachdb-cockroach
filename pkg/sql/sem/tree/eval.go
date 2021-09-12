@@ -47,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -127,6 +128,41 @@ type unaryOpOverload []overloadImpl
 
 // UnaryOps contains the unary operations indexed by operation type.
 var UnaryOps = unaryOpFixups(map[UnaryOperatorSymbol]unaryOpOverload{
+	UnaryPlus: {
+		&UnaryOp{
+			Typ:        types.Int,
+			ReturnType: types.Int,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return d, nil
+			},
+			Volatility: VolatilityImmutable,
+		},
+		&UnaryOp{
+			Typ:        types.Float,
+			ReturnType: types.Float,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return d, nil
+			},
+			Volatility: VolatilityImmutable,
+		},
+		&UnaryOp{
+			Typ:        types.Decimal,
+			ReturnType: types.Decimal,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return d, nil
+			},
+			Volatility: VolatilityImmutable,
+		},
+		&UnaryOp{
+			Typ:        types.Interval,
+			ReturnType: types.Interval,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return d, nil
+			},
+			Volatility: VolatilityImmutable,
+		},
+	},
+
 	UnaryMinus: {
 		&UnaryOp{
 			Typ:        types.Int,
@@ -2287,6 +2323,13 @@ var CmpOps = cmpOpFixups(map[ComparisonOperatorSymbol]cmpOpOverload{
 			isPreferred: true,
 			Volatility:  VolatilityLeakProof,
 		},
+		&CmpOp{
+			LeftType:     types.AnyArray,
+			RightType:    types.Unknown,
+			Fn:           cmpOpScalarIsFn,
+			NullableArgs: true,
+			Volatility:   VolatilityLeakProof,
+		},
 		// Single-type comparisons.
 		makeIsFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeIsFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -3029,14 +3072,6 @@ type DatabaseRegionConfig interface {
 // EvalDatabase consists of functions that reference the session database
 // and is to be used from EvalContext.
 type EvalDatabase interface {
-	// CurrentDatabaseRegionConfig returns the RegionConfig of the current
-	// session database.
-	CurrentDatabaseRegionConfig(ctx context.Context) (DatabaseRegionConfig, error)
-
-	// ValidateAllMultiRegionZoneConfigsInCurrentDatabase validates whether the current
-	// database's multi-region zone configs are correctly setup. This includes
-	// all tables within the database.
-	ValidateAllMultiRegionZoneConfigsInCurrentDatabase(ctx context.Context) error
 
 	// ParseQualifiedTableName parses a SQL string of the form
 	// `[ database_name . ] [ schema_name . ] table_name`.
@@ -3172,6 +3207,12 @@ type EvalPlanner interface {
 		ctx context.Context,
 		member security.SQLUsername,
 	) (map[security.SQLUsername]bool, error)
+
+	// ExternalReadFile reads the content from an external file URI.
+	ExternalReadFile(ctx context.Context, uri string) ([]byte, error)
+
+	// ExternalWriteFile writes the content to an external file URI.
+	ExternalWriteFile(ctx context.Context, uri string, content []byte) error
 }
 
 // CompactEngineSpanFunc is used to compact an engine key span at the given
@@ -3184,11 +3225,12 @@ type CompactEngineSpanFunc func(
 
 // EvalSessionAccessor is a limited interface to access session variables.
 type EvalSessionAccessor interface {
-	// SetConfig sets a session variable to a new value.
+	// SetSessionVar sets a session variable to a new value. If isLocal is true,
+	// the setting change is scoped to the current transaction (as in SET LOCAL).
 	//
 	// This interface only supports strings as this is sufficient for
 	// pg_catalog.set_config().
-	SetSessionVar(ctx context.Context, settingName, newValue string) error
+	SetSessionVar(ctx context.Context, settingName, newValue string, isLocal bool) error
 
 	// GetSessionVar retrieves the current value of a session variable.
 	GetSessionVar(ctx context.Context, settingName string, missingOk bool) (bool, string, error)
@@ -3196,9 +3238,15 @@ type EvalSessionAccessor interface {
 	// HasAdminRole returns true iff the current session user has the admin role.
 	HasAdminRole(ctx context.Context) (bool, error)
 
-	// HasAdminRole returns nil iff the current session user has the specified
+	// HasRoleOption returns nil iff the current session user has the specified
 	// role option.
 	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+}
+
+// PreparedStatementState is a limited interface that exposes metadata about
+// prepared statements.
+type PreparedStatementState interface {
+	HasPrepared() bool
 }
 
 // ClientNoticeSender is a limited interface to send notices to the
@@ -3251,10 +3299,32 @@ type PrivilegedAccessor interface {
 	LookupZoneConfigByNamespaceID(ctx context.Context, id int64) (DBytes, bool, error)
 }
 
+// RegionOperator gives access to the current region, validation for all
+// regions, and the ability to reset the zone configurations for tables
+// or databases.
+type RegionOperator interface {
+
+	// CurrentDatabaseRegionConfig returns the RegionConfig of the current
+	// session database.
+	CurrentDatabaseRegionConfig(ctx context.Context) (DatabaseRegionConfig, error)
+
+	// ValidateAllMultiRegionZoneConfigsInCurrentDatabase validates whether the current
+	// database's multi-region zone configs are correctly setup. This includes
+	// all tables within the database.
+	ValidateAllMultiRegionZoneConfigsInCurrentDatabase(ctx context.Context) error
+
+	// ResetMultiRegionZoneConfigsForTable resets the given table's zone
+	// configuration to its multi-region default.
+	ResetMultiRegionZoneConfigsForTable(ctx context.Context, id int64) error
+
+	// ResetMultiRegionZoneConfigsForDatabase resets the given database's zone
+	// configuration to its multi-region default.
+	ResetMultiRegionZoneConfigsForDatabase(ctx context.Context, id int64) error
+}
+
 // SequenceOperators is used for various sql related functions that can
 // be used from EvalContext.
 type SequenceOperators interface {
-	EvalDatabase
 
 	// GetSerialSequenceNameFromColumn returns the sequence name for a given table and column
 	// provided it is part of a SERIAL sequence.
@@ -3295,8 +3365,8 @@ type SequenceOperators interface {
 }
 
 // TenantOperator is capable of interacting with tenant state, allowing SQL
-// builtin functions to create and destroy tenants. The methods will return
-// errors when run by any tenant other than the system tenant.
+// builtin functions to create, configure, and destroy tenants. The methods will
+// return errors when run by any tenant other than the system tenant.
 type TenantOperator interface {
 	// CreateTenant attempts to install a new tenant in the system. It returns
 	// an error if the tenant already exists. The new tenant is created at the
@@ -3311,6 +3381,18 @@ type TenantOperator interface {
 	// success it also removes the tenant record.
 	// It returns an error if the tenant does not exist.
 	GCTenant(ctx context.Context, tenantID uint64) error
+
+	// UpdateTenantResourceLimits reconfigures the tenant resource limits.
+	// See multitenant.TenantUsageServer for more details on the arguments.
+	UpdateTenantResourceLimits(
+		ctx context.Context,
+		tenantID uint64,
+		availableRU float64,
+		refillRate float64,
+		maxBurstRU float64,
+		asOf time.Time,
+		asOfConsumedRequestUnits float64,
+	) error
 }
 
 // JoinTokenCreator is capable of creating and persisting join tokens, allowing
@@ -3356,11 +3438,12 @@ var _ base.ModuleTestingKnobs = &EvalContextTestingKnobs{}
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
 func (*EvalContextTestingKnobs) ModuleTestingKnobs() {}
 
-// SQLStatsResetter is an interface embedded in EvalCtx which can be used by
+// SQLStatsController is an interface embedded in EvalCtx which can be used by
 // the builtins to reset SQL stats in the cluster. This interface is introduced
 // to avoid circular dependency.
-type SQLStatsResetter interface {
+type SQLStatsController interface {
 	ResetClusterSQLStats(ctx context.Context) error
+	CreateSQLStatsCompactionSchedule(ctx context.Context) error
 }
 
 // EvalContext defines the context in which to evaluate an expression, allowing
@@ -3379,9 +3462,10 @@ type SQLStatsResetter interface {
 // more fields from the sql package. Through that extendedEvalContext, this
 // struct now generally used by planNodes.
 type EvalContext struct {
-	// Session variables. This is a read-only copy of the values owned by the
-	// Session.
-	SessionData *sessiondata.SessionData
+	// SessionDataStack stores the session variables accessible by the correct
+	// context. Each element on the stack represents the beginning of a new
+	// transaction or nested transaction (savepoints).
+	SessionDataStack *sessiondata.Stack
 	// TxnState is a string representation of the current transactional state.
 	TxnState string
 	// TxnReadOnly specifies if the current transaction is read-only.
@@ -3409,6 +3493,15 @@ type EvalContext struct {
 	// of a transaction. Used for now(), current_timestamp(),
 	// transaction_timestamp() and the like.
 	TxnTimestamp time.Time
+
+	// AsOfSystemTime denotes the explicit AS OF SYSTEM TIME timestamp for the
+	// query, if any. If the query is not an AS OF SYSTEM TIME query,
+	// AsOfSystemTime is nil.
+	// TODO(knz): we may want to support table readers at arbitrary
+	// timestamps, so that each FROM clause can have its own
+	// timestamp. In that case, the timestamp would not be set
+	// globally for the entire txn and this field would not be needed.
+	AsOfSystemTime *AsOfSystemTime
 
 	// Placeholders relates placeholder names to their type and, later, value.
 	// This pointer should always be set to the location of the PlaceholderInfo
@@ -3451,7 +3544,12 @@ type EvalContext struct {
 
 	Tenant TenantOperator
 
+	// Regions stores information about regions.
+	Regions RegionOperator
+
 	JoinTokenCreator JoinTokenCreator
+
+	PreparedStatementState PreparedStatementState
 
 	// The transaction in which the statement is executing.
 	Txn *kv.Txn
@@ -3488,7 +3586,7 @@ type EvalContext struct {
 
 	SQLLivenessReader sqlliveness.Reader
 
-	SQLStatsResetter SQLStatsResetter
+	SQLStatsController SQLStatsController
 
 	// CompactEngineSpan is used to force compaction of a span in a store.
 	CompactEngineSpan CompactEngineSpanFunc
@@ -3513,11 +3611,11 @@ func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 // EvalContext so do not start or close the memory monitor.
 func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonitor) EvalContext {
 	ctx := EvalContext{
-		Codec:       keys.SystemSQLCodec,
-		Txn:         &kv.Txn{},
-		SessionData: &sessiondata.SessionData{},
-		Settings:    st,
-		NodeID:      base.TestingIDContainer,
+		Codec:            keys.SystemSQLCodec,
+		Txn:              &kv.Txn{},
+		SessionDataStack: sessiondata.NewStack(&sessiondata.SessionData{}),
+		Settings:         st,
+		NodeID:           base.TestingIDContainer,
 	}
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	ctx.Mon = monitor
@@ -3526,6 +3624,14 @@ func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonit
 	ctx.SetTxnTimestamp(now)
 	ctx.SetStmtTimestamp(now)
 	return ctx
+}
+
+// SessionData returns the SessionData the current EvalCtx should use to eval.
+func (ctx *EvalContext) SessionData() *sessiondata.SessionData {
+	if ctx.SessionDataStack == nil {
+		return nil
+	}
+	return ctx.SessionDataStack.Top()
 }
 
 // Copy returns a deep copy of ctx.
@@ -3565,9 +3671,9 @@ func (ctx *EvalContext) Stop(c context.Context) {
 
 // FmtCtx creates a FmtCtx with the given options as well as the EvalContext's session data.
 func (ctx *EvalContext) FmtCtx(f FmtFlags, opts ...FmtCtxOption) *FmtCtx {
-	if ctx.SessionData != nil {
+	if ctx.SessionData() != nil {
 		opts = append(
-			[]FmtCtxOption{FmtDataConversionConfig(ctx.SessionData.DataConversionConfig)},
+			[]FmtCtxOption{FmtDataConversionConfig(ctx.SessionData().DataConversionConfig)},
 			opts...,
 		)
 	}
@@ -3628,19 +3734,41 @@ func TimestampToDecimal(ts hlc.Timestamp) apd.Decimal {
 	return res
 }
 
-// DecimalToInexactDTimestamp is the inverse of TimestampToDecimal. It converts
-// a decimal constructed from an hlc.Timestamp into an approximate DTimestamp
+// DecimalToInexactDTimestampTZ is the inverse of TimestampToDecimal. It converts
+// a decimal constructed from an hlc.Timestamp into an approximate DTimestampTZ
 // containing the walltime of the hlc.Timestamp.
-func DecimalToInexactDTimestamp(d *DDecimal) (*DTimestamp, error) {
+func DecimalToInexactDTimestampTZ(d *DDecimal) (*DTimestampTZ, error) {
+	ts, err := decimalToHLC(d)
+	if err != nil {
+		return nil, err
+	}
+	return MakeDTimestampTZ(timeutil.Unix(0, ts.WallTime), time.Microsecond)
+}
+
+func decimalToHLC(d *DDecimal) (hlc.Timestamp, error) {
 	var coef big.Int
 	coef.Set(&d.Decimal.Coeff)
 	// The physical portion of the HLC is stored shifted up by 10^10, so shift
 	// it down and clear out the logical component.
 	coef.Div(&coef, big10E10)
 	if !coef.IsInt64() {
-		return nil, pgerror.Newf(pgcode.DatetimeFieldOverflow, "timestamp value out of range: %s", d.String())
+		return hlc.Timestamp{}, pgerror.Newf(
+			pgcode.DatetimeFieldOverflow,
+			"timestamp value out of range: %s", d.String(),
+		)
 	}
-	return TimestampToInexactDTimestamp(hlc.Timestamp{WallTime: coef.Int64()}), nil
+	return hlc.Timestamp{WallTime: coef.Int64()}, nil
+}
+
+// DecimalToInexactDTimestamp is the inverse of TimestampToDecimal. It converts
+// a decimal constructed from an hlc.Timestamp into an approximate DTimestamp
+// containing the walltime of the hlc.Timestamp.
+func DecimalToInexactDTimestamp(d *DDecimal) (*DTimestamp, error) {
+	ts, err := decimalToHLC(d)
+	if err != nil {
+		return nil, err
+	}
+	return TimestampToInexactDTimestamp(ts), nil
 }
 
 // TimestampToDecimalDatum is the same as TimestampToDecimal, but
@@ -3727,12 +3855,23 @@ func (ctx *EvalContext) SetStmtTimestamp(ts time.Time) {
 
 // GetLocation returns the session timezone.
 func (ctx *EvalContext) GetLocation() *time.Location {
-	return ctx.SessionData.GetLocation()
+	return ctx.SessionData().GetLocation()
 }
 
 // GetIntervalStyle returns the session interval style.
 func (ctx *EvalContext) GetIntervalStyle() duration.IntervalStyle {
-	return ctx.SessionData.GetIntervalStyle()
+	if ctx.SessionData() == nil {
+		return duration.IntervalStyle_POSTGRES
+	}
+	return ctx.SessionData().GetIntervalStyle()
+}
+
+// GetDateStyle returns the session date style.
+func (ctx *EvalContext) GetDateStyle() pgdate.DateStyle {
+	if ctx.SessionData() == nil {
+		return pgdate.DefaultDateStyle()
+	}
+	return ctx.SessionData().GetDateStyle()
 }
 
 // Ctx returns the session's context.

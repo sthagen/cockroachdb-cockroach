@@ -2,14 +2,14 @@
 - Status: in-progress
 - Start Date: 2021-05-19
 - Authors: Nathan VanBenschoten, Rebecca Taft, Oliver Tan
-- RFC PR: #66020.
-- Cockroach Issue: #25405.
+- RFC PR: #66020
+- Cockroach Issue: #25405
 
 # Summary
 
 Bounded staleness reads are a form of historical read-only queries that use a
 dynamic, system-determined timestamp, subject to a user-provided staleness
-bound, to read from nearby replicas while minimizing data staleness. They
+bound, to read nearby replicas while minimizing data staleness. They
 provide a new way to perform follower reads off local replicas to minimize query
 latency in multi-region clusters.
 
@@ -30,8 +30,12 @@ Bounded staleness queries are limited in use to single-statement read-only
 queries, and only a subset of read-only queries at that. They will be accessed
 similarly to exact bounded staleness reads - through a pair of new functions
 that can be passed to an `AS OF SYSTEM TIME` clause:
-- `SELECT ... FROM ... AS OF SYSTEM TIME with_min_timestamp(TIMESTAMP)`
-- `SELECT ... FROM ... AS OF SYSTEM TIME with_max_staleness(INTERVAL)`
+- `SELECT ... FROM ... AS OF SYSTEM TIME with_min_timestamp(TIMESTAMPTZ[, nearest_only])`
+- `SELECT ... FROM ... AS OF SYSTEM TIME with_max_staleness(INTERVAL[, nearest_only])`
+
+The `nearest_only` is an optional bool that will error if the reads cannot be
+serviced from a nearby replica. "Nearby" is defined to be the closest available
+replica - it does not have to be local to the region.
 
 The approach discussed in this RFC has a prototype in
 https://github.com/cockroachdb/cockroach/pull/62239 which, while not identical
@@ -71,10 +75,10 @@ locally without blocking is used.
 
 Bounded staleness reads will be exposed through a pair of new functions that can
 be passed to an `AS OF SYSTEM TIME` clause:
-- `SELECT ... FROM ... AS OF SYSTEM TIME with_min_timestamp(TIMESTAMP)`
-- `SELECT ... FROM ... AS OF SYSTEM TIME with_max_staleness(INTERVAL)`
+- `SELECT ... FROM ... AS OF SYSTEM TIME with_min_timestamp(TIMESTAMPTZ[, nearest_only])`
+- `SELECT ... FROM ... AS OF SYSTEM TIME with_max_staleness(INTERVAL[, nearest_only])`
 
-`with_min_timestamp(TIMESTAMP)` defines a minimum timestamp to perform the
+`with_min_timestamp(TIMESTAMPTZ)` defines a minimum timestamp to perform the
 bounded staleness read at. The actual timestamp of the read may be equal to or
 later than the provided timestamp, but can not be before the provided timestamp.
 This is useful to request a read from nearby followers, if possible, while
@@ -87,6 +91,9 @@ but can be at most this stale with respect to the current time. This is useful
 to request a read from nearby followers, if possible, while placing some limit
 on how stale results can be. `with_max_staleness(INTERVAL)` is syntactic sugar
 on top of `with_min_timestamp(now() - INTERVAL)`.
+
+Both functions contain an optional `nearest_only` argument that will error if the
+reads cannot be serviced from a nearby replica.
 
 ## Semantics
 
@@ -165,7 +172,6 @@ served from the closest replica(s) without blocking.
 is_local_and_non_blocking(read) = local_resolved_timestamp(read) >= read.min_timestamp
 ```
 
-This guarantee is subject to a limitation discussed in [Schema Unavailability](#schema-unavailability).
 
 ### Non-Guarantees
 
@@ -250,29 +256,29 @@ called `min_timestamp_bound`. This field can only be set when the header's
 `ReadConsistency` is set to `BOUNDED_STALENESS` and when the `timestamp` field
 is not set.
 
-Third, we will introduce a new `GetResolvedTimestamp` request and response pair.
+Third, we will introduce a new `QueryResolvedTimestamp` request and response pair.
 The intention is for this request type to be sent in `BatchRequests` with an
 `INCONSISTENT` consistency level so that it routes to the nearest replica, skips
 leaseholder checks, and does not wait in the replica's concurrency manager for
 latches. During evaluation, it computes the resolved timestamp over its key span
 on the replica that it is evaluating on. This means taking the minimum of the
 replica's closed timestamp and the timestamp before any locks in its key span.
-The `GetResolvedTimestamp` response type will implement the `combinable`
+The `QueryResolvedTimestamp` response type will implement the `combinable`
 interface and will take the minimum of any two responses.
 
-#### GetResolvedTimestamp efficiency
+#### QueryResolvedTimestamp efficiency
 
-`GetResolvedTimestamp` will initially be fairly expensive due to its scan for
+`QueryResolvedTimestamp` will initially be fairly expensive due to its scan for
 intents/locks. This is because intents can currently be interleaved in a range's
 data, so scanning for the resolved timestamp of a range is an O(num_keys_in_range)
 operation. In the near future, we expect to write a migration to eliminate
 interleaved intents and pull all intents into the lock-table as part of
 addressing [#41720](https://github.com/cockroachdb/cockroach/issues/41720). When
-we do that, it will be possible to make `GetResolvedTimestamp` more efficient,
+we do that, it will be possible to make `QueryResolvedTimestamp` more efficient,
 reducing it to an O(num_locks_in_range) operation.
 
 Once this is possible, we will be able to be more aggressive with our use of
-`GetResolvedTimestamp`. This is a soft blocker for progressing beyond [step
+`QueryResolvedTimestamp`. This is a soft blocker for progressing beyond [step
 1](#limitations) in the implementation of bounded staleness reads, because we
 deem the cost of the O(num_keys_in_range) operation to be too expensive to
 expose to users.
@@ -287,14 +293,14 @@ rangefeed (which comes with other costs).
 
 #### Abandoned intents
 
-If we did nothing special, `GetResolvedTimestamp` would find that abandoned
+If we did nothing special, `QueryResolvedTimestamp` would find that abandoned
 intents in its keyspace result in indefinite resolved timestamp stalls because
-successive `GetResolvedTimestamp` requests would continue to find the same
+successive `QueryResolvedTimestamp` requests would continue to find the same
 abandoned intents. This is the reason why rangefeed's periodically push all
 intents on their range.
 
 We could do something similar here, but there is an easier solution to dealing
-with abandoned intents. `GetResolvedTimestamp` will attach any intents that it
+with abandoned intents. `QueryResolvedTimestamp` will attach any intents that it
 finds that are below the range's closed timestamp to its
 `LocalResult.EncounteredIntents` set. This will cause the range to
 asynchronously push and resolve the intents, which will eventually lead to the
@@ -308,7 +314,7 @@ reads, given a read-only `BatchRequest`. It does so by breaking `BatchRequests`
 apart into two phases - _negotiation_ and _execution_.
 
 The negotiation phase of a bounded-staleness read determines the timestamp to
-perform the read using the `GetResolvedTimestamp` requests. This is coordinated
+perform the read using the `QueryResolvedTimestamp` requests. This is coordinated
 by the `BoundedStalenessNegotiator`. If the negotiator finds that the local
 resolved timestamp across the read's spans is above its `min_timestamp_bound`,
 it chooses this timestamp to perform the scan. Otherwise, it chooses the
@@ -339,7 +345,7 @@ For single-range bounded-staleness reads, we introduce a fast-path to avoid two
 rounds of communication. If the entire batch lands on a single range, we
 negotiate its timestamp on the server. We do this by catching BatchRequests with
 `MinTimestampBound` fields set in `Store.Send` (before the call to
-`SetActiveTimestamp`) and issue a `GetResolvedTimestamp` to the targeted range.
+`SetActiveTimestamp`) and issue a `QueryResolvedTimestamp` to the targeted range.
 If this succeeds, we clear the batch's `MinTimestampBound` and set its
 `Timestamp` to the negotiated timestamp. We then evaluate the `BatchRequest`
 with the expectation that it cannot block.
@@ -372,18 +378,18 @@ For the remainder of this RFC, we will refer to this error as
 
 The `BoundedStalenessNegotiator` is responsible for determining the local
 resolved timestamp over a set of key spans, given some minimum timestamp bound.
-It does so using `GetResolvedTimestamp` requests. However, to avoid the cost of
-sending `GetResolvedTimestamp` requests on every cross-range bounded staleness
+It does so using `QueryResolvedTimestamp` requests. However, to avoid the cost of
+sending `QueryResolvedTimestamp` requests on every cross-range bounded staleness
 read, the `BoundedStalenessNegotiator` aggressively caches resolved timestamp
 spans in an LRU interval cache.
 
 Calls into the `BoundedStalenessNegotiator` provide a minimum timestamp bound
 and the spans the caller intends to read from. Any requested span that is
 contained by a cache entry's span which has a resolved timeststamp equal to or
-greater than the minimum timestamp bound skips the `GetResolvedTimestamp`
+greater than the minimum timestamp bound skips the `QueryResolvedTimestamp`
 request and uses the cached span directly. Otherwise, the negotiator issues a
-`GetResolvedTimestamp` request over the span and uses the result to update its
-cache. Identical, concurrent `GetResolvedTimestamp` requests are coalesced using
+`QueryResolvedTimestamp` request over the span and uses the result to update its
+cache. Identical, concurrent `QueryResolvedTimestamp` requests are coalesced using
 a `singleflight` group.
 
 Once a resolved timestamp has been established for each span, the minimum is
@@ -430,7 +436,7 @@ attempt to send immediately
 - else if errNoCrossRangeServerSideNegotiation, continue
 use BoundedStalenessNegotiator to negotiate timestamp
 - check cache for each span
-- any span not in cache or too stale, send GetResolvedTimestamp req
+- any span not in cache or too stale, send QueryResolvedTimestamp req
 -- populate cache with responses
 - compute local_resolved_timestamp 
 given local_resolved_timestamp from negotiator
@@ -452,8 +458,8 @@ read.
 ### SQL Parser
 
 The change will introduce two new SQL builtin functions: 
-- `with_min_timestamp(TIMESTAMP) -> TIMESTAMP`
-- `with_max_staleness(INTERVAL) -> INTERVAL`
+- `with_min_timestamp(TIMESTAMPTZ[, nearest_only]) -> TIMESTAMPTZ
+- `with_max_staleness(INTERVAL[, nearest_only]) -> TIMESTAMPTZ`
 
 These functions will need special casing in `tree.EvalAsOfTimestamp`.
 
@@ -464,6 +470,9 @@ explicit transaction form of AS OF SYSTEM TIME (`BEGIN AS OF SYSTEM TIME ...`,
 `SET TRANSACTION AS OF SYSTEM TIME`, etc.). These two functions will only be
 permitted in implicit transactions.
 
+Both functions contain an optional `nearest_only` argument that will error if the
+reads cannot be serviced from a nearby replica.
+
 When an implicit transaction is run with one of these two functions, the
 transaction's `min_timestamp_bound` will be computed and retained for planning
 and execution.
@@ -473,7 +482,7 @@ and execution.
 SQL execution is in charge of using the additions to the KV API to execute a
 bounded staleness read. It does so in one of two ways. Either it passes the
 entire statement's batch of KV gets/scans through `(*kv.Txn).NegotiateAndSend`
-all at once along with the `min_timestamp_bound`, or it uses the
+all at once along with the `min_timestamp_bound` and `nearest_only`, or it uses the
 `kv.BoundedStalenessNegotiator` returned from `(*kv.DB).Negotiator` and the
 `min_timestamp_bound` to negotiate a query timestamp ahead of time and then runs
 the statement's batches with this timestamp.
@@ -488,25 +497,44 @@ implementation.
 
 Once we reach step 3, we will add support for multi-scan queries and DistSQL.
 This requires SQL Execution to use the `BoundedStalenessNegotiator` and the
-`min_timestamp_bound` to negotiate the query timestamp ahead of evaluation. The
-query timestamp can then be fixed on the query's `kv.Txn` using
-`(*kv.Txn).SetFixedTimestamp` Since the query timestamp has already been
-negotiated, the BatchRequests passed to `(*kv.Txn).Send` will have an empty
-`min_timestamp_bound` field, but will still have its `ReadConsistency` set to
-`BOUNDED_STALENESS`.
+`min_timestamp_bound` to negotiate the query timestamp ahead of evaluation.
+It will return an error here if `nearest_only` is specified and the read
+cannot be serviced from a nearby replica. The query timestamp can then be
+fixed on the query's `kv.Txn` using `(*kv.Txn).SetFixedTimestamp`. Since
+the query timestamp has already been negotiated, the BatchRequests passed
+to `(*kv.Txn).Send` will have an empty `min_timestamp_bound` field, but
+will still have its `ReadConsistency` set to `BOUNDED_STALENESS`.
 
 #### Table Schemas 
 
-When a bounded staleness read is planned, it will use the most recent table
-descriptors it has available, like any other strongly consistent read. The
-validity window of these descriptors, `[modification_time, present)`, will act
-as additional constraints on the maximum staleness of the query. In practice,
-this means that the `min_timestamp_bound` of a query will be forwarded by the
-modification time of the most recent version of each of the table descriptors
-that it uses.
+When a bounded staleness read is planned, it will also need to attempt
+to use the latest table descriptor available on the closest replicas,
+falling back to the leaseholder if `nearest_only` is not set.
 
-There are downsides to this simple approach, which are discussed in the [Schema
-Unavailability](#schema-unavailability) section.
+We can apply the following pseudo-code for resolving this:
+```python
+max_timestamp = now
+min_timestamp = parse_args()
+while max_timestamp >= min_timestamp:
+    schema = get_schema_at(max_timestamp)
+    cur_min_timestamp = max(min_timestamp, schema.start_time)
+    cur_resolved_timestamp = get_resolved_timestamp(schema)
+    if cur_resolved_timestamp >= cur_min_timestamp:
+        return issue_query_to_follower(cur_min_timestamp)
+    else if min_timestamp == cur_min_timestamp and !nearest_only:
+        return issue_query_to_leaseholder(cur_min_timestamp)
+    else
+        max_timestamp = cur_min_timestamp - 1
+raise Error
+```
+
+We could apply a simpler strategy to resolve schemas by using the
+`max(min_timestamp, latest table descriptor modification time)`
+for the minimum bound on staleness. However, this does lead to
+a period of compromised availability after a schema change. This
+means that during periods of strong read unavailability (e.g. gateway
+partitioned from leaseholder), a schema change can lead to bounded staleness
+unavailability because it places a floor on staleness.
 
 #### Observability into query timestamp
 
@@ -620,21 +648,6 @@ In the context of this limitation and the next, "unavailability" means that
 statements will hang until either connectivity is restored or a statement
 timeout is reached.
 
-### Schema Unavailability
-
-The current proposal does not do anything particularly sophisticated around
-schema changes. Instead, it proposes that we forward a bounded staleness read's
-minimum timestamp to the maximum last modification time of all relevant table
-descriptors. While simple, this does lead to a period of compromised
-availability after a schema change. This means that during periods of strong
-read unavailability (e.g. gateway partitioned from leaseholder), a schema change
-can lead to bounded staleness unavailability because it places a floor on
-staleness.
-
-It is open for discussion whether we want to do anything more sophisticated here,
-like introduce a retry loop that steps back across schema versions until it finds
-a version whose implied key spans are all sufficiently resolved.
-
 ## Alternatives
 
 ### SQL-level Asynchronous Replication
@@ -661,9 +674,9 @@ query a consistent prefix of this data.
 
 ### Range-level Resolved Timestamp Tracking
 
-Much of the complexity around the `GetResolvedTimestamp` and the
+Much of the complexity around the `QueryResolvedTimestamp` and the
 `BoundedStalenessNegotiator` falls out of the cost of computing the resolved
-timestamp for a range. This is also why we [don't feel comfortable](#getresolvedtimestamp-efficiency)
+timestamp for a range. This is also why we [don't feel comfortable](#queryresolvedtimestamp-efficiency)
 exposing anything more than single-row bounded staleness reads until we remove
 interleaved intents and reduce the cost of computing a range's resolved timestamp
 from O(num_keys_in_range) to O(num_locks_in_range).
@@ -671,7 +684,7 @@ from O(num_keys_in_range) to O(num_locks_in_range).
 If we were to maintain a Range-level resolved timestamp in the similar way to
 how we maintain a Range-level closed timestamp then determining the resolved
 timestamp for a range would be a constant-time operation. So the evaluation of
-`GetResolvedTimestamp` on a single range would be a constant-time operation.
+`QueryResolvedTimestamp` on a single range would be a constant-time operation.
 This would make parts of this design easier. For instance, it would reduce the
 importance of aggressive caching in the `BoundedStalenessNegotiator`. However,
 it also wouldn't allow us to skip any of this design, so we do not consider
@@ -696,16 +709,16 @@ currently stores a set of Range's `RangeDescriptor`, `Lease`, and
 reasonable cache eviction policy that limits its memory footprint.
 
 The reason this is related to the previous option is because it would require
-`GetResolvedTimestamp` requests to grab an entire Range's resolved timestamp at
+`QueryResolvedTimestamp` requests to grab an entire Range's resolved timestamp at
 a time. These requests would not be able to update the cache if they only
 grabbed the resolved timestamp over a portion of the Range, because the minimum
 granularity of resolved timestamp tracking would be at the level of a Range's
-key bounds. So we would either need to make `GetResolvedTimestamp` constant-time
-(see above), or we would need to be ok with coalesced `GetResolvedTimestamp`
+key bounds. So we would either need to make `QueryResolvedTimestamp` constant-time
+(see above), or we would need to be ok with coalesced `QueryResolvedTimestamp`
 requests sent by the `BoundedStalenessNegotiator` potentially computing the
 resolved timestamp over a larger span than strictly necessary, which only
-seems feasible if we address the first part of [GetResolvedTimestamp
-efficiency](#getresolvedtimestamp-efficiency).
+seems feasible if we address the first part of [QueryResolvedTimestamp
+efficiency](#queryresolvedtimestamp-efficiency).
 
 # Unresolved questions
 

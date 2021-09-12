@@ -204,7 +204,7 @@ func (ex *connExecutor) prepare(
 			},
 		}
 		prepared.Statement = stmt.Statement
-		prepared.AnonymizedStr = stmt.AnonymizedStr
+		prepared.StatementNoConstants = stmt.StmtNoConstants
 
 		// Point to the prepared state, which can be further populated during query
 		// preparation.
@@ -262,13 +262,17 @@ func (ex *connExecutor) populatePrepared(
 	}
 	p.extendedEvalCtx.PrepareOnly = true
 
-	protoTS, err := p.isAsOf(ctx, stmt.AST)
+	asOf, err := p.isAsOf(ctx, stmt.AST)
 	if err != nil {
 		return 0, err
 	}
-	if protoTS != nil {
-		p.semaCtx.AsOfTimestamp = protoTS
-		txn.SetFixedTimestamp(ctx, *protoTS)
+	if asOf != nil {
+		p.extendedEvalCtx.AsOfSystemTime = asOf
+		if !asOf.BoundedStaleness {
+			if err := txn.SetFixedTimestamp(ctx, asOf.Timestamp); err != nil {
+				return 0, err
+			}
+		}
 	}
 
 	// PREPARE has a limited subset of statements it can be run with. Postgres
@@ -484,7 +488,7 @@ func (ex *connExecutor) deletePortal(ctx context.Context, name string) {
 	if !ok {
 		return
 	}
-	portal.decRef(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
+	portal.close(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
 	delete(ex.extraTxnState.prepStmtsNamespace.portals, name)
 }
 

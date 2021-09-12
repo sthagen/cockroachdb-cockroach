@@ -16,7 +16,6 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -67,7 +66,7 @@ var pebbleBatchPool = sync.Pool{
 
 // Instantiates a new pebbleBatch.
 func newPebbleBatch(
-	db *pebble.DB, batch *pebble.Batch, writeOnly bool, settings *cluster.Settings,
+	db *pebble.DB, batch *pebble.Batch, writeOnly bool, disableSeparatedIntents bool,
 ) *pebbleBatch {
 	pb := pebbleBatchPool.Get().(*pebbleBatch)
 	*pb = pebbleBatch{
@@ -96,8 +95,7 @@ func newPebbleBatch(
 		},
 		writeOnly: writeOnly,
 	}
-	pb.wrappedIntentWriter =
-		wrapIntentWriter(context.Background(), pb, settings, false /* isLongLived */)
+	pb.wrappedIntentWriter = wrapIntentWriter(context.Background(), pb, disableSeparatedIntents)
 	return pb
 }
 
@@ -133,11 +131,13 @@ func (p *pebbleBatch) ExportMVCCToSst(
 	ctx context.Context,
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
+	firstKeyTS hlc.Timestamp,
 	exportAllRevisions bool,
 	targetSize, maxSize uint64,
+	stopMidKey bool,
 	useTBI bool,
 	dest io.Writer,
-) (roachpb.BulkOpSummary, roachpb.Key, error) {
+) (roachpb.BulkOpSummary, roachpb.Key, hlc.Timestamp, error) {
 	panic("unimplemented")
 }
 
@@ -472,11 +472,6 @@ func (p *pebbleBatch) PutEngineKey(key EngineKey, value []byte) error {
 
 	p.buf = key.EncodeToBuf(p.buf[:0])
 	return p.batch.Set(p.buf, value, nil)
-}
-
-// SafeToWriteSeparatedIntents implements the Batch interface.
-func (p *pebbleBatch) SafeToWriteSeparatedIntents(ctx context.Context) (bool, error) {
-	return p.wrappedIntentWriter.safeToWriteSeparatedIntents(ctx)
 }
 
 func (p *pebbleBatch) put(key MVCCKey, value []byte) error {

@@ -610,6 +610,11 @@ define UnaryMinus {
     Input ScalarExpr
 }
 
+[Scalar, Unary, CompositeInsensitive]
+define UnaryPlus {
+    Input ScalarExpr
+}
+
 [Scalar, Unary]
 define UnaryComplement {
     Input ScalarExpr
@@ -1221,6 +1226,6 @@ define KVOptionsItem {
 #
 # TODO(andyk): Consider adding Optgen syntax like:
 #                define ScalarList []ScalarExpr
-[Scalar, List]
+[Scalar, List, CompositeInsensitive]
 define ScalarList {
 }

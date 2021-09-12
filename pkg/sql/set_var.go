@@ -29,10 +29,11 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// setVarNode represents a SET SESSION statement.
+// setVarNode represents a SET {SESSION | LOCAL} statement.
 type setVarNode struct {
-	name string
-	v    sessionVar
+	name  string
+	local bool
+	v     sessionVar
 	// typedValues == nil means RESET.
 	typedValues []tree.TypedExpr
 }
@@ -82,7 +83,7 @@ func (p *planner) SetVar(ctx context.Context, n *tree.SetVar) (planNode, error) 
 		}
 	}
 
-	if v.Set == nil && v.RuntimeSet == nil {
+	if v.Set == nil && v.RuntimeSet == nil && v.SetWithPlanner == nil {
 		return nil, newCannotChangeParameterError(name)
 	}
 
@@ -90,12 +91,12 @@ func (p *planner) SetVar(ctx context.Context, n *tree.SetVar) (planNode, error) 
 		// Statement is RESET. Do we have a default available?
 		// We do not use getDefaultString here because we need to delay
 		// the computation of the default to the execute phase.
-		if _, ok := p.sessionDataMutator.defaults[name]; !ok && v.GlobalDefault == nil {
+		if _, ok := p.sessionDataMutatorIterator.defaults[name]; !ok && v.GlobalDefault == nil {
 			return nil, newCannotChangeParameterError(name)
 		}
 	}
 
-	return &setVarNode{name: name, v: v, typedValues: typedValues}, nil
+	return &setVarNode{name: name, local: n.Local, v: v, typedValues: typedValues}, nil
 }
 
 func (n *setVarNode) startExec(params runParams) error {
@@ -128,23 +129,44 @@ func (n *setVarNode) startExec(params runParams) error {
 		}
 	} else {
 		// Statement is RESET and we already know we have a default. Find it.
-		_, strVal = getSessionVarDefaultString(n.name, n.v, params.p.sessionDataMutator)
+		_, strVal = getSessionVarDefaultString(
+			n.name,
+			n.v,
+			params.p.sessionDataMutatorIterator.sessionDataMutatorBase,
+		)
 	}
 
-	if n.v.RuntimeSet != nil {
-		return n.v.RuntimeSet(params.ctx, params.extendedEvalCtx, strVal)
+	return params.p.SetSessionVar(params.ctx, n.name, strVal, n.local)
+}
+
+// applyOnSessionDataMutators applies the given function on the relevant
+// sessionDataMutators.
+func (p *planner) applyOnSessionDataMutators(
+	ctx context.Context, local bool, applyFunc func(m sessionDataMutator) error,
+) error {
+	if local {
+		// We don't allocate a new SessionData object on implicit transactions.
+		// This no-ops in postgres with a warning, so copy accordingly.
+		if p.EvalContext().TxnImplicit {
+			p.BufferClientNotice(
+				ctx,
+				pgnotice.NewWithSeverityf(
+					"WARNING",
+					"SET LOCAL can only be used in transaction blocks",
+				),
+			)
+			return nil
+		}
+		return p.sessionDataMutatorIterator.applyOnTopMutator(applyFunc)
 	}
-	if n.v.SetWithPlanner != nil {
-		return n.v.SetWithPlanner(params.ctx, params.p, strVal)
-	}
-	return n.v.Set(params.ctx, params.p.sessionDataMutator, strVal)
+	return p.sessionDataMutatorIterator.applyOnEachMutatorError(applyFunc)
 }
 
 // getSessionVarDefaultString retrieves a string suitable to pass to a
 // session var's Set() method. First return value is false if there is
 // no default.
 func getSessionVarDefaultString(
-	varName string, v sessionVar, m *sessionDataMutator,
+	varName string, v sessionVar, m sessionDataMutatorBase,
 ) (bool, string) {
 	if defVal, ok := m.defaults[varName]; ok {
 		return true, defVal
@@ -171,6 +193,13 @@ func getIntVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExpr) 
 		return 0, newSingleArgVarError(name)
 	}
 	return paramparse.DatumAsInt(evalCtx, name, values[0])
+}
+
+func getFloatVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExpr) (float64, error) {
+	if len(values) != 1 {
+		return 0, newSingleArgVarError(name)
+	}
+	return paramparse.DatumAsFloat(evalCtx, name, values[0])
 }
 
 func timeZoneVarGetStringVal(
@@ -232,7 +261,7 @@ func timeZoneVarGetStringVal(
 	return loc.String(), nil
 }
 
-func timeZoneVarSet(_ context.Context, m *sessionDataMutator, s string) error {
+func timeZoneVarSet(_ context.Context, m sessionDataMutator, s string) error {
 	loc, err := timeutil.TimeZoneStringToLocation(
 		s,
 		timeutil.TimeZoneStringToLocationISO8601Standard,
@@ -304,7 +333,7 @@ func validateTimeoutVar(
 	return timeout, nil
 }
 
-func stmtTimeoutVarSet(ctx context.Context, m *sessionDataMutator, s string) error {
+func stmtTimeoutVarSet(ctx context.Context, m sessionDataMutator, s string) error {
 	timeout, err := validateTimeoutVar(
 		m.data.GetIntervalStyle(),
 		s,
@@ -318,7 +347,21 @@ func stmtTimeoutVarSet(ctx context.Context, m *sessionDataMutator, s string) err
 	return nil
 }
 
-func idleInSessionTimeoutVarSet(ctx context.Context, m *sessionDataMutator, s string) error {
+func lockTimeoutVarSet(ctx context.Context, m sessionDataMutator, s string) error {
+	timeout, err := validateTimeoutVar(
+		m.data.GetIntervalStyle(),
+		s,
+		"lock_timeout",
+	)
+	if err != nil {
+		return err
+	}
+
+	m.SetLockTimeout(timeout)
+	return nil
+}
+
+func idleInSessionTimeoutVarSet(ctx context.Context, m sessionDataMutator, s string) error {
 	timeout, err := validateTimeoutVar(
 		m.data.GetIntervalStyle(),
 		s,
@@ -333,7 +376,7 @@ func idleInSessionTimeoutVarSet(ctx context.Context, m *sessionDataMutator, s st
 }
 
 func idleInTransactionSessionTimeoutVarSet(
-	ctx context.Context, m *sessionDataMutator, s string,
+	ctx context.Context, m sessionDataMutator, s string,
 ) error {
 	timeout, err := validateTimeoutVar(
 		m.data.GetIntervalStyle(),

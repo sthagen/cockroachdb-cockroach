@@ -17,6 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -39,6 +41,25 @@ type leaseManager interface {
 type deadlineHolder interface {
 	ReadTimestamp() hlc.Timestamp
 	UpdateDeadline(ctx context.Context, deadline hlc.Timestamp) error
+}
+
+// maxTimestampBoundDeadlineHolder is an implementation of deadlineHolder
+// which is intended for use during bounded staleness reads.
+type maxTimestampBoundDeadlineHolder struct {
+	maxTimestampBound hlc.Timestamp
+}
+
+// ReadTimestamp implements the deadlineHolder interface.
+func (m maxTimestampBoundDeadlineHolder) ReadTimestamp() hlc.Timestamp {
+	// We return .Prev() because maxTimestampBound is an exclusive upper bound.
+	return m.maxTimestampBound.Prev()
+}
+
+// UpdateDeadline implements the deadlineHolder interface.
+func (m maxTimestampBoundDeadlineHolder) UpdateDeadline(
+	ctx context.Context, deadline hlc.Timestamp,
+) error {
+	return nil
 }
 
 func makeLeasedDescriptors(lm leaseManager) leasedDescriptors {
@@ -78,6 +99,14 @@ func (ld *leasedDescriptors) getByName(
 		return cached.(lease.LeasedDescriptor).Underlying(), false, nil
 	}
 
+	for _, d := range systemschema.UnleasableSystemDescriptors {
+		if parentID == d.GetParentID() &&
+			parentSchemaID == d.GetParentSchemaID() &&
+			name == d.GetName() {
+			return nil, true, nil
+		}
+	}
+
 	readTimestamp := txn.ReadTimestamp()
 	ldesc, err := ld.lm.AcquireByName(ctx, readTimestamp, parentID, parentSchemaID, name)
 	const setTxnDeadline = true
@@ -100,6 +129,10 @@ func (ld *leasedDescriptors) getByID(
 		return cached.(lease.LeasedDescriptor).Underlying(), false, nil
 	}
 
+	if _, isUnleasable := systemschema.UnleasableSystemDescriptors[id]; isUnleasable {
+		return nil, true, nil
+	}
+
 	readTimestamp := txn.ReadTimestamp()
 	desc, err := ld.lm.Acquire(ctx, readTimestamp, id)
 	return ld.getResult(ctx, txn, setTxnDeadline, desc, err)
@@ -115,13 +148,16 @@ func (ld *leasedDescriptors) getResult(
 	err error,
 ) (_ catalog.Descriptor, shouldReadFromStore bool, _ error) {
 	if err != nil {
+		_, isBoundedStalenessRead := txn.(*maxTimestampBoundDeadlineHolder)
 		// Read the descriptor from the store in the face of some specific errors
 		// because of a known limitation of AcquireByName. See the known
 		// limitations of AcquireByName for details.
+		// Note we never should read from store during a bounded staleness read,
+		// as it is safe to return the schema as non-existent.
 		if shouldReadFromStore =
-			(catalog.HasInactiveDescriptorError(err) &&
+			!isBoundedStalenessRead && ((catalog.HasInactiveDescriptorError(err) &&
 				errors.Is(err, catalog.ErrDescriptorDropped)) ||
-				errors.Is(err, catalog.ErrDescriptorNotFound); shouldReadFromStore {
+				errors.Is(err, catalog.ErrDescriptorNotFound)); shouldReadFromStore {
 			return nil, true, nil
 		}
 		// Lease acquisition failed with some other error. This we don't
@@ -145,15 +181,31 @@ func (ld *leasedDescriptors) getResult(
 	// timestamp, so we need to set a deadline on the transaction to prevent it
 	// from committing beyond the version's expiration time.
 	if setDeadline {
-		if err := ld.maybeUpdateDeadline(ctx, txn); err != nil {
+		if err := ld.maybeUpdateDeadline(ctx, txn, nil); err != nil {
 			return nil, false, err
 		}
 	}
 	return ldesc.Underlying(), false, nil
 }
 
-func (ld *leasedDescriptors) maybeUpdateDeadline(ctx context.Context, txn deadlineHolder) error {
-	if deadline, haveDeadline := ld.getDeadline(); haveDeadline {
+func (ld *leasedDescriptors) maybeUpdateDeadline(
+	ctx context.Context, txn deadlineHolder, session sqlliveness.Session,
+) error {
+	// Set the transaction deadline to the minimum of the leased descriptor deadline
+	// and session expiration. The sqlliveness.Session will only be set in the
+	// multi-tenant environment for controlling transactions associated with ephemeral
+	// SQL pods.
+	var deadline hlc.Timestamp
+	if session != nil {
+		deadline = session.Expiration()
+	}
+	if leaseDeadline, ok := ld.getDeadline(); ok && (deadline.IsEmpty() || leaseDeadline.Less(deadline)) {
+		// Set the deadline to the lease deadline if session expiration is empty
+		// or lease deadline is less than the session expiration.
+		deadline = leaseDeadline
+	}
+	// If the deadline has been set, update the transaction deadline.
+	if !deadline.IsEmpty() {
 		return txn.UpdateDeadline(ctx, deadline)
 	}
 	return nil

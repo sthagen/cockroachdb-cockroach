@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/logtags"
 )
@@ -103,16 +105,22 @@ func (c *callbackResultWriter) Err() error {
 	return c.err
 }
 
+func getLastImportSummary(job *jobs.Job) roachpb.BulkOpSummary {
+	progress := job.Progress()
+	importProgress := progress.GetImport()
+	return importProgress.Summary
+}
+
 func makeImportReaderSpecs(
 	job *jobs.Job,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
+	typeDescs []*descpb.TypeDescriptor,
 	from []string,
 	format roachpb.IOFileFormat,
 	nodes []roachpb.NodeID,
 	walltime int64,
 	user security.SQLUsername,
 ) []*execinfrapb.ReadImportDataSpec {
-
 	// For each input file, assign it to a node.
 	inputSpecs := make([]*execinfrapb.ReadImportDataSpec, 0, len(nodes))
 	progress := job.Progress()
@@ -123,6 +131,7 @@ func makeImportReaderSpecs(
 		if i < len(nodes) {
 			spec := &execinfrapb.ReadImportDataSpec{
 				Tables: tables,
+				Types:  typeDescs,
 				Format: format,
 				Progress: execinfrapb.JobProgress{
 					JobID: job.ID(),
@@ -188,6 +197,7 @@ func DistIngest(
 	execCtx JobExecContext,
 	job *jobs.Job,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
+	typeDescs []*descpb.TypeDescriptor,
 	from []string,
 	format roachpb.IOFileFormat,
 	walltime int64,
@@ -203,7 +213,19 @@ func DistIngest(
 		return roachpb.BulkOpSummary{}, err
 	}
 
-	inputSpecs := makeImportReaderSpecs(job, tables, from, format, nodes, walltime, execCtx.User())
+	// accumulatedBulkSummary accumulates the BulkOpSummary returned from each
+	// processor in their progress updates. It stores stats about the amount of
+	// data written since the last time we update the job progress.
+	accumulatedBulkSummary := struct {
+		syncutil.Mutex
+		roachpb.BulkOpSummary
+	}{}
+	accumulatedBulkSummary.Lock()
+	accumulatedBulkSummary.BulkOpSummary = getLastImportSummary(job)
+	accumulatedBulkSummary.Unlock()
+
+	inputSpecs := makeImportReaderSpecs(job, tables, typeDescs, from, format, nodes, walltime,
+		execCtx.User())
 
 	p := planCtx.NewPhysicalPlan()
 
@@ -225,22 +247,26 @@ func DistIngest(
 
 	dsp.FinalizePlan(planCtx, p)
 
-	if err := job.FractionProgressed(ctx, nil, /* txn */
-		func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-			prog := details.(*jobspb.Progress_Import).Import
-			prog.ReadProgress = make([]float32, len(from))
-			prog.ResumePos = make([]int64, len(from))
-			if prog.SequenceDetails == nil {
-				prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
-				for i := range prog.SequenceDetails {
-					prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
+	importDetails := job.Progress().Details.(*jobspb.Progress_Import).Import
+	if importDetails.ReadProgress == nil {
+		// Initialize the progress metrics on the first attempt.
+		if err := job.FractionProgressed(ctx, nil, /* txn */
+			func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+				prog := details.(*jobspb.Progress_Import).Import
+				prog.ReadProgress = make([]float32, len(from))
+				prog.ResumePos = make([]int64, len(from))
+				if prog.SequenceDetails == nil {
+					prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
+					for i := range prog.SequenceDetails {
+						prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
+					}
 				}
-			}
 
-			return 0.0
-		},
-	); err != nil {
-		return roachpb.BulkOpSummary{}, err
+				return 0.0
+			},
+		); err != nil {
+			return roachpb.BulkOpSummary{}, err
+		}
 	}
 
 	rowProgress := make([]int64, len(from))
@@ -259,6 +285,11 @@ func DistIngest(
 					prog.ReadProgress[i] = fileProgress
 					overall += fileProgress
 				}
+
+				accumulatedBulkSummary.Lock()
+				prog.Summary.Add(accumulatedBulkSummary.BulkOpSummary)
+				accumulatedBulkSummary.Reset()
+				accumulatedBulkSummary.Unlock()
 				return overall / float32(len(from))
 			},
 		)
@@ -272,6 +303,10 @@ func DistIngest(
 			for i, v := range meta.BulkProcessorProgress.CompletedFraction {
 				atomic.StoreUint32(&fractionProgress[i], math.Float32bits(v))
 			}
+
+			accumulatedBulkSummary.Lock()
+			accumulatedBulkSummary.Add(meta.BulkProcessorProgress.BulkSummary)
+			accumulatedBulkSummary.Unlock()
 
 			if alwaysFlushProgress {
 				return updateJobProgress()

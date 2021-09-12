@@ -11,14 +11,13 @@
 package tabledesc
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -138,7 +137,7 @@ func (desc *wrapper) ValidateCrossReferences(
 
 	if dbDesc != nil {
 		// Validate the all types present in the descriptor exist.
-		typeIDs, err := desc.GetAllReferencedTypeIDs(dbDesc, vdg.GetTypeDescriptor)
+		typeIDs, _, err := desc.GetAllReferencedTypeIDs(dbDesc, vdg.GetTypeDescriptor)
 		if err != nil {
 			vea.Report(err)
 		} else {
@@ -149,7 +148,7 @@ func (desc *wrapper) ValidateCrossReferences(
 		}
 
 		// Validate table locality.
-		if err := desc.validateTableLocalityConfig(dbDesc, vdg); err != nil {
+		if err := multiregion.ValidateTableLocalityConfig(desc, dbDesc, vdg); err != nil {
 			vea.Report(errors.Wrap(err, "invalid locality config"))
 			return
 		}
@@ -573,7 +572,7 @@ func (desc *wrapper) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	}
 
 	// Validate the privilege descriptor.
-	vea.Report(desc.Privileges.Validate(desc.GetID(), privilege.Table))
+	vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Table))
 
 	// Ensure that mutations cannot be queued if a primary key change or
 	// an alter column type schema change has either been started in
@@ -641,6 +640,48 @@ func (desc *wrapper) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 		vea.Report(err)
 		return nil
 	})
+
+	// Validate that there are no column with both a foreign key ON UPDATE and an
+	// ON UPDATE expression. This check is made to ensure that we know which ON
+	// UPDATE action to perform when a FK UPDATE happens.
+	if err := ValidateOnUpdate(desc.AllColumns(), desc.GetOutboundFKs()); err != nil {
+		vea.Report(err)
+	}
+}
+
+// ValidateOnUpdate returns an error if there is a column with both a foreign
+// key constraint and an ON UPDATE expression, nil otherwise.
+func ValidateOnUpdate(cols []catalog.Column, outboundFks []descpb.ForeignKeyConstraint) error {
+	var onUpdateCols catalog.TableColSet
+	for _, col := range cols {
+		if col.HasOnUpdate() {
+			onUpdateCols.Add(col.GetID())
+		}
+	}
+
+	var foundErrors []error
+	for _, fk := range outboundFks {
+		if fk.OnUpdate == descpb.ForeignKeyReference_NO_ACTION ||
+			fk.OnUpdate == descpb.ForeignKeyReference_RESTRICT {
+			continue
+		}
+		for _, fkCol := range fk.OriginColumnIDs {
+			if onUpdateCols.Contains(fkCol) {
+				foundErrors = append(foundErrors, pgerror.Newf(pgcode.InvalidTableDefinition,
+					"cannot specify both ON UPDATE expression and a foreign key"+
+						" ON UPDATE action for column with ID %d",
+					fkCol,
+				))
+			}
+		}
+	}
+
+	var combinedError error
+	for i := 0; i < len(foundErrors); i++ {
+		combinedError = errors.CombineErrors(combinedError, foundErrors[i])
+	}
+
+	return combinedError
 }
 
 func (desc *wrapper) validateColumns(
@@ -672,7 +713,7 @@ func (desc *wrapper) validateColumns(
 		columnNames[column.GetName()] = column.GetID()
 
 		if other, ok := columnIDs[column.GetID()]; ok {
-			return fmt.Errorf("column %q duplicate ID of column %q: %d",
+			return errors.Newf("column %q duplicate ID of column %q: %d",
 				column.GetName(), other.Name, column.GetID())
 		}
 		columnIDs[column.GetID()] = column.ColumnDesc()
@@ -693,15 +734,34 @@ func (desc *wrapper) validateColumns(
 				return err
 			}
 			if !valid {
-				return fmt.Errorf("computed column %q refers to unknown columns in expression: %s",
+				return errors.Newf("computed column %q refers to unknown columns in expression: %s",
 					column.GetName(), column.GetComputeExpr())
 			}
 		} else if column.IsVirtual() {
-			return fmt.Errorf("virtual column %q is not computed", column.GetName())
+			return errors.Newf("virtual column %q is not computed", column.GetName())
+		}
+
+		if column.HasOnUpdate() && column.IsComputed() {
+			return errors.Newf(
+				"computed column %q cannot also have an ON UPDATE expression",
+				column.GetName(),
+			)
 		}
 
 		if column.IsHidden() && column.IsInaccessible() {
-			return fmt.Errorf("column %q cannot be hidden and inaccessible", column.GetName())
+			return errors.Newf("column %q cannot be hidden and inaccessible", column.GetName())
+		}
+
+		if column.IsComputed() && column.IsGeneratedAsIdentity() {
+			return errors.Newf("both generated identity and computed expression specified for column %q", column.GetName())
+		}
+
+		if column.IsNullable() && column.IsGeneratedAsIdentity() {
+			return errors.Newf("conflicting NULL/NOT NULL declarations for column %q", column.GetName())
+		}
+
+		if column.HasOnUpdate() && column.IsGeneratedAsIdentity() {
+			return errors.Newf("both generated identity and on update expression specified for column %q", column.GetName())
 		}
 	}
 	return nil
@@ -711,10 +771,10 @@ func (desc *wrapper) validateColumnFamilies(
 	columnIDs map[descpb.ColumnID]*descpb.ColumnDescriptor,
 ) error {
 	if len(desc.Families) < 1 {
-		return fmt.Errorf("at least 1 column family must be specified")
+		return errors.Newf("at least 1 column family must be specified")
 	}
 	if desc.Families[0].ID != descpb.FamilyID(0) {
-		return fmt.Errorf("the 0th family must have ID 0")
+		return errors.Newf("the 0th family must have ID 0")
 	}
 
 	familyNames := map[string]struct{}{}
@@ -736,43 +796,43 @@ func (desc *wrapper) validateColumnFamilies(
 		}
 
 		if _, ok := familyNames[family.Name]; ok {
-			return fmt.Errorf("duplicate family name: %q", family.Name)
+			return errors.Newf("duplicate family name: %q", family.Name)
 		}
 		familyNames[family.Name] = struct{}{}
 
 		if other, ok := familyIDs[family.ID]; ok {
-			return fmt.Errorf("family %q duplicate ID of family %q: %d",
+			return errors.Newf("family %q duplicate ID of family %q: %d",
 				family.Name, other, family.ID)
 		}
 		familyIDs[family.ID] = family.Name
 
 		if family.ID >= desc.NextFamilyID {
-			return fmt.Errorf("family %q invalid family ID (%d) > next family ID (%d)",
+			return errors.Newf("family %q invalid family ID (%d) > next family ID (%d)",
 				family.Name, family.ID, desc.NextFamilyID)
 		}
 
 		if len(family.ColumnIDs) != len(family.ColumnNames) {
-			return fmt.Errorf("mismatched column ID size (%d) and name size (%d)",
+			return errors.Newf("mismatched column ID size (%d) and name size (%d)",
 				len(family.ColumnIDs), len(family.ColumnNames))
 		}
 
 		for i, colID := range family.ColumnIDs {
 			col, ok := columnIDs[colID]
 			if !ok {
-				return fmt.Errorf("family %q contains unknown column \"%d\"", family.Name, colID)
+				return errors.Newf("family %q contains unknown column \"%d\"", family.Name, colID)
 			}
 			if col.Name != family.ColumnNames[i] {
-				return fmt.Errorf("family %q column %d should have name %q, but found name %q",
+				return errors.Newf("family %q column %d should have name %q, but found name %q",
 					family.Name, colID, col.Name, family.ColumnNames[i])
 			}
 			if col.Virtual {
-				return fmt.Errorf("virtual computed column %q cannot be part of a family", col.Name)
+				return errors.Newf("virtual computed column %q cannot be part of a family", col.Name)
 			}
 		}
 
 		for _, colID := range family.ColumnIDs {
 			if famID, ok := colIDToFamilyID[colID]; ok {
-				return fmt.Errorf("column %d is in both family %d and %d", colID, famID, family.ID)
+				return errors.Newf("column %d is in both family %d and %d", colID, famID, family.ID)
 			}
 			colIDToFamilyID[colID] = family.ID
 		}
@@ -780,7 +840,7 @@ func (desc *wrapper) validateColumnFamilies(
 	for colID, colDesc := range columnIDs {
 		if !colDesc.Virtual {
 			if _, ok := colIDToFamilyID[colID]; !ok {
-				return fmt.Errorf("column %q is not in any column family", colDesc.Name)
+				return errors.Newf("column %q is not in any column family", colDesc.Name)
 			}
 		}
 	}
@@ -798,7 +858,7 @@ func (desc *wrapper) validateCheckConstraints(
 		for _, colID := range chk.ColumnIDs {
 			_, ok := columnIDs[colID]
 			if !ok {
-				return fmt.Errorf("check constraint %q contains unknown column \"%d\"", chk.Name, colID)
+				return errors.Newf("check constraint %q contains unknown column \"%d\"", chk.Name, colID)
 			}
 		}
 
@@ -812,7 +872,7 @@ func (desc *wrapper) validateCheckConstraints(
 			return err
 		}
 		if !valid {
-			return fmt.Errorf("check constraint %q refers to unknown columns in expression: %s",
+			return errors.Newf("check constraint %q refers to unknown columns in expression: %s",
 				chk.Name, chk.Expr)
 		}
 	}
@@ -832,7 +892,7 @@ func (desc *wrapper) validateUniqueWithoutIndexConstraints(
 
 		// Verify that the table ID is valid.
 		if c.TableID != desc.ID {
-			return fmt.Errorf(
+			return errors.Newf(
 				"TableID mismatch for unique without index constraint %q: \"%d\" doesn't match descriptor: \"%d\"",
 				c.Name, c.TableID, desc.ID,
 			)
@@ -843,12 +903,12 @@ func (desc *wrapper) validateUniqueWithoutIndexConstraints(
 		for _, colID := range c.ColumnIDs {
 			_, ok := columnIDs[colID]
 			if !ok {
-				return fmt.Errorf(
+				return errors.Newf(
 					"unique without index constraint %q contains unknown column \"%d\"", c.Name, colID,
 				)
 			}
 			if seen.Contains(int(colID)) {
-				return fmt.Errorf(
+				return errors.Newf(
 					"unique without index constraint %q contains duplicate column \"%d\"", c.Name, colID,
 				)
 			}
@@ -865,7 +925,7 @@ func (desc *wrapper) validateUniqueWithoutIndexConstraints(
 				return err
 			}
 			if !valid {
-				return fmt.Errorf(
+				return errors.Newf(
 					"partial unique without index constraint %q refers to unknown columns in predicate: %s",
 					c.Name,
 					c.Predicate,
@@ -895,7 +955,7 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 	// Verify that the primary index columns are not virtual.
 	for _, pkID := range desc.PrimaryIndex.KeyColumnIDs {
 		if col := columnsByID[pkID]; col != nil && col.IsVirtual() {
-			return fmt.Errorf("primary index column %q cannot be virtual", col.GetName())
+			return errors.Newf("primary index column %q cannot be virtual", col.GetName())
 		}
 	}
 
@@ -906,60 +966,60 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 			return err
 		}
 		if idx.GetID() == 0 {
-			return fmt.Errorf("invalid index ID %d", idx.GetID())
+			return errors.Newf("invalid index ID %d", idx.GetID())
 		}
 
 		if _, indexNameExists := indexNames[idx.GetName()]; indexNameExists {
 			for i := range desc.Indexes {
 				if desc.Indexes[i].Name == idx.GetName() {
 					// This error should be caught in MakeIndexDescriptor or NewTableDesc.
-					return errors.HandleAsAssertionFailure(fmt.Errorf("duplicate index name: %q", idx.GetName()))
+					return errors.HandleAsAssertionFailure(errors.Newf("duplicate index name: %q", idx.GetName()))
 				}
 			}
 			// This error should be caught in MakeIndexDescriptor.
-			return errors.HandleAsAssertionFailure(fmt.Errorf(
+			return errors.HandleAsAssertionFailure(errors.Newf(
 				"duplicate: index %q in the middle of being added, not yet public", idx.GetName()))
 		}
 		indexNames[idx.GetName()] = struct{}{}
 
 		if other, ok := indexIDs[idx.GetID()]; ok {
-			return fmt.Errorf("index %q duplicate ID of index %q: %d",
+			return errors.Newf("index %q duplicate ID of index %q: %d",
 				idx.GetName(), other, idx.GetID())
 		}
 		indexIDs[idx.GetID()] = idx.GetName()
 
 		if idx.GetID() >= desc.NextIndexID {
-			return fmt.Errorf("index %q invalid index ID (%d) > next index ID (%d)",
+			return errors.Newf("index %q invalid index ID (%d) > next index ID (%d)",
 				idx.GetName(), idx.GetID(), desc.NextIndexID)
 		}
 
 		if len(idx.IndexDesc().KeyColumnIDs) != len(idx.IndexDesc().KeyColumnNames) {
-			return fmt.Errorf("mismatched column IDs (%d) and names (%d)",
+			return errors.Newf("mismatched column IDs (%d) and names (%d)",
 				len(idx.IndexDesc().KeyColumnIDs), len(idx.IndexDesc().KeyColumnNames))
 		}
 		if len(idx.IndexDesc().KeyColumnIDs) != len(idx.IndexDesc().KeyColumnDirections) {
-			return fmt.Errorf("mismatched column IDs (%d) and directions (%d)",
+			return errors.Newf("mismatched column IDs (%d) and directions (%d)",
 				len(idx.IndexDesc().KeyColumnIDs), len(idx.IndexDesc().KeyColumnDirections))
 		}
 		// In the old STORING encoding, stored columns are in ExtraColumnIDs;
 		// tolerate a longer list of column names.
 		if len(idx.IndexDesc().StoreColumnIDs) > len(idx.IndexDesc().StoreColumnNames) {
-			return fmt.Errorf("mismatched STORING column IDs (%d) and names (%d)",
+			return errors.Newf("mismatched STORING column IDs (%d) and names (%d)",
 				len(idx.IndexDesc().StoreColumnIDs), len(idx.IndexDesc().StoreColumnNames))
 		}
 
 		if len(idx.IndexDesc().KeyColumnIDs) == 0 {
-			return fmt.Errorf("index %q must contain at least 1 column", idx.GetName())
+			return errors.Newf("index %q must contain at least 1 column", idx.GetName())
 		}
 
 		var validateIndexDup catalog.TableColSet
 		for i, name := range idx.IndexDesc().KeyColumnNames {
 			colID, ok := columnNames[name]
 			if !ok {
-				return fmt.Errorf("index %q contains unknown column %q", idx.GetName(), name)
+				return errors.Newf("index %q contains unknown column %q", idx.GetName(), name)
 			}
 			if colID != idx.IndexDesc().KeyColumnIDs[i] {
-				return fmt.Errorf("index %q column %q should have ID %d, but found ID %d",
+				return errors.Newf("index %q column %q should have ID %d, but found ID %d",
 					idx.GetName(), name, colID, idx.IndexDesc().KeyColumnIDs[i])
 			}
 			if validateIndexDup.Contains(colID) {
@@ -972,7 +1032,7 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 				return err
 			}
 			if _, exists := columnNames[idx.GetSharded().Name]; !exists {
-				return fmt.Errorf("index %q refers to non-existent shard column %q",
+				return errors.Newf("index %q refers to non-existent shard column %q",
 					idx.GetName(), idx.GetSharded().Name)
 			}
 		}
@@ -986,19 +1046,19 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 				return err
 			}
 			if !valid {
-				return fmt.Errorf("partial index %q refers to unknown columns in predicate: %s",
+				return errors.Newf("partial index %q refers to unknown columns in predicate: %s",
 					idx.GetName(), idx.GetPredicate())
 			}
 		}
 		// Ensure that indexes do not STORE virtual columns.
 		for _, colID := range idx.IndexDesc().KeySuffixColumnIDs {
 			if col := columnsByID[colID]; col != nil && col.IsVirtual() {
-				return fmt.Errorf("index %q cannot store virtual column %d", idx.GetName(), col)
+				return errors.Newf("index %q cannot store virtual column %d", idx.GetName(), col)
 			}
 		}
 		for i, colID := range idx.IndexDesc().StoreColumnIDs {
 			if col := columnsByID[colID]; col != nil && col.IsVirtual() {
-				return fmt.Errorf("index %q cannot store virtual column %q",
+				return errors.Newf("index %q cannot store virtual column %q",
 					idx.GetName(), idx.IndexDesc().StoreColumnNames[i])
 			}
 		}
@@ -1128,10 +1188,10 @@ func (desc *wrapper) validatePartitioningDescriptor(
 	}
 
 	if part.NumLists() == 0 && part.NumRanges() == 0 {
-		return fmt.Errorf("at least one of LIST or RANGE partitioning must be used")
+		return errors.Newf("at least one of LIST or RANGE partitioning must be used")
 	}
 	if part.NumLists() > 0 && part.NumRanges() > 0 {
-		return fmt.Errorf("only one LIST or RANGE partitioning may used")
+		return errors.Newf("only one LIST or RANGE partitioning may used")
 	}
 
 	// Do not validate partitions which use unhydrated user-defined types.
@@ -1157,11 +1217,11 @@ func (desc *wrapper) validatePartitioningDescriptor(
 
 	checkName := func(name string) error {
 		if len(name) == 0 {
-			return fmt.Errorf("PARTITION name must be non-empty")
+			return errors.Newf("PARTITION name must be non-empty")
 		}
 		if indexName, exists := partitionNames[name]; exists {
 			if indexName == idx.GetName() {
-				return fmt.Errorf("PARTITION %s: name must be unique (used twice in index %q)",
+				return errors.Newf("PARTITION %s: name must be unique (used twice in index %q)",
 					name, indexName)
 			}
 		}
@@ -1182,7 +1242,7 @@ func (desc *wrapper) validatePartitioningDescriptor(
 			}
 
 			if len(values) == 0 {
-				return fmt.Errorf("PARTITION %s: must contain values", name)
+				return errors.Newf("PARTITION %s: must contain values", name)
 			}
 			// NB: key encoding is used to check uniqueness because it has
 			// to match the behavior of the value when indexed.
@@ -1190,10 +1250,10 @@ func (desc *wrapper) validatePartitioningDescriptor(
 				tuple, keyPrefix, err := rowenc.DecodePartitionTuple(
 					a, codec, desc, idx, part, valueEncBuf, fakePrefixDatums)
 				if err != nil {
-					return fmt.Errorf("PARTITION %s: %v", name, err)
+					return errors.Wrapf(err, "PARTITION %s", name)
 				}
 				if _, exists := listValues[string(keyPrefix)]; exists {
-					return fmt.Errorf("%s cannot be present in more than one partition", tuple)
+					return errors.Newf("%s cannot be present in more than one partition", tuple)
 				}
 				listValues[string(keyPrefix)] = struct{}{}
 			}
@@ -1220,23 +1280,23 @@ func (desc *wrapper) validatePartitioningDescriptor(
 			fromDatums, fromKey, err := rowenc.DecodePartitionTuple(
 				a, codec, desc, idx, part, from, fakePrefixDatums)
 			if err != nil {
-				return fmt.Errorf("PARTITION %s: %v", name, err)
+				return errors.Wrapf(err, "PARTITION %s", name)
 			}
 			toDatums, toKey, err := rowenc.DecodePartitionTuple(
 				a, codec, desc, idx, part, to, fakePrefixDatums)
 			if err != nil {
-				return fmt.Errorf("PARTITION %s: %v", name, err)
+				return errors.Wrapf(err, "PARTITION %s", name)
 			}
 			pi := partitionInterval{name, fromKey, toKey}
 			if overlaps := tree.Get(pi.Range()); len(overlaps) > 0 {
-				return fmt.Errorf("partitions %s and %s overlap",
+				return errors.Newf("partitions %s and %s overlap",
 					overlaps[0].(partitionInterval).name, name)
 			}
 			if err := tree.Insert(pi, false /* fast */); errors.Is(err, interval.ErrEmptyRange) {
-				return fmt.Errorf("PARTITION %s: empty range: lower bound %s is equal to upper bound %s",
+				return errors.Newf("PARTITION %s: empty range: lower bound %s is equal to upper bound %s",
 					name, fromDatums, toDatums)
 			} else if errors.Is(err, interval.ErrInvertedRange) {
-				return fmt.Errorf("PARTITION %s: empty range: lower bound %s is greater than upper bound %s",
+				return errors.Newf("PARTITION %s: empty range: lower bound %s is greater than upper bound %s",
 					name, fromDatums, toDatums)
 			} else if err != nil {
 				return errors.Wrapf(err, "PARTITION %s", name)
@@ -1278,228 +1338,4 @@ func (desc *wrapper) validatePartitioning() error {
 			a, idx, idx.GetPartitioning(), 0 /* colOffset */, partitionNames,
 		)
 	})
-}
-
-// validateTableLocalityConfig validates whether the descriptor's locality
-// config is valid under the given database.
-func (desc *wrapper) validateTableLocalityConfig(
-	db catalog.DatabaseDescriptor, vdg catalog.ValidationDescGetter,
-) error {
-
-	if desc.LocalityConfig == nil {
-		if db.IsMultiRegion() {
-			return pgerror.Newf(
-				pgcode.InvalidTableDefinition,
-				"database %s is multi-region enabled, but table %s has no locality set",
-				db.GetName(),
-				desc.GetName(),
-			)
-		}
-		// Nothing to validate for non-multi-region databases.
-		return nil
-	}
-
-	if !db.IsMultiRegion() {
-		s := tree.NewFmtCtx(tree.FmtSimple)
-		var locality string
-		// Formatting the table locality config should never fail; if it does, the
-		// error message is more clear if we construct a dummy locality here.
-		if err := FormatTableLocalityConfig(desc.LocalityConfig, s); err != nil {
-			locality = "INVALID LOCALITY"
-		}
-		locality = s.String()
-		return pgerror.Newf(
-			pgcode.InvalidTableDefinition,
-			"database %s is not multi-region enabled, but table %s has locality %s set",
-			db.GetName(),
-			desc.GetName(),
-			locality,
-		)
-	}
-
-	regionsEnumID, err := db.MultiRegionEnumID()
-	if err != nil {
-		return err
-	}
-	regionsEnumDesc, err := vdg.GetTypeDescriptor(regionsEnumID)
-	if err != nil {
-		return errors.Wrapf(err, "multi-region enum with ID %d does not exist", regionsEnumID)
-	}
-
-	// Check non-table items have a correctly set locality.
-	if desc.IsSequence() {
-		if !desc.IsLocalityRegionalByTable() {
-			return errors.AssertionFailedf(
-				"expected sequence %s to have locality REGIONAL BY TABLE",
-				desc.Name,
-			)
-		}
-	}
-	if desc.IsView() {
-		if desc.MaterializedView() {
-			if !desc.IsLocalityGlobal() {
-				return errors.AssertionFailedf(
-					"expected materialized view %s to have locality GLOBAL",
-					desc.Name,
-				)
-			}
-		} else {
-			if !desc.IsLocalityRegionalByTable() {
-				return errors.AssertionFailedf(
-					"expected view %s to have locality REGIONAL BY TABLE",
-					desc.Name,
-				)
-			}
-		}
-	}
-
-	// REGIONAL BY TABLE tables homed in the primary region should include a
-	// reference to the multi-region type descriptor and a corresponding
-	// backreference. All other patterns should only contain a reference if there
-	// is an explicit column which uses the multi-region type descriptor as its
-	// *types.T. While the specific cases are validated below, we search for the
-	// region enum ID in the references list just once, up top here.
-	typeIDs, err := desc.GetAllReferencedTypeIDs(db, vdg.GetTypeDescriptor)
-	if err != nil {
-		return err
-	}
-	regionEnumIDReferenced := false
-	for _, typeID := range typeIDs {
-		if typeID == regionsEnumID {
-			regionEnumIDReferenced = true
-			break
-		}
-	}
-	columnTypesTypeIDs, err := desc.getAllReferencedTypesInTableColumns(vdg.GetTypeDescriptor)
-	if err != nil {
-		return err
-	}
-	switch lc := desc.LocalityConfig.Locality.(type) {
-	case *descpb.TableDescriptor_LocalityConfig_Global_:
-		if regionEnumIDReferenced {
-			if _, found := columnTypesTypeIDs[regionsEnumID]; !found {
-				return errors.AssertionFailedf(
-					"expected no region Enum ID to be referenced by a GLOBAL TABLE: %q"+
-						" but found: %d",
-					desc.GetName(),
-					regionsEnumDesc.GetID(),
-				)
-			}
-		}
-	case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
-		if !desc.IsPartitionAllBy() {
-			return errors.AssertionFailedf("expected REGIONAL BY ROW table to have PartitionAllBy set")
-		}
-		// For REGIONAL BY ROW tables, ensure partitions in the PRIMARY KEY match
-		// the database descriptor. Ensure each public region has a partition,
-		// and each transitioning region name to possibly have a partition.
-		// We do validation that ensures all index partitions are the same on
-		// PARTITION ALL BY.
-		regions, err := regionsEnumDesc.RegionNames()
-		if err != nil {
-			return err
-		}
-		regionNames := make(map[descpb.RegionName]struct{}, len(regions))
-		for _, region := range regions {
-			regionNames[region] = struct{}{}
-		}
-		transitioningRegions, err := regionsEnumDesc.TransitioningRegionNames()
-		if err != nil {
-			return err
-		}
-		transitioningRegionNames := make(map[descpb.RegionName]struct{}, len(regions))
-		for _, region := range transitioningRegions {
-			transitioningRegionNames[region] = struct{}{}
-		}
-
-		part := desc.GetPrimaryIndex().GetPartitioning()
-		err = part.ForEachList(func(name string, _ [][]byte, _ catalog.Partitioning) error {
-			regionName := descpb.RegionName(name)
-			// Any transitioning region names may exist.
-			if _, ok := transitioningRegionNames[regionName]; ok {
-				return nil
-			}
-			// If a region is not found in any of the region names, we have an unknown
-			// partition.
-			if _, ok := regionNames[regionName]; !ok {
-				return errors.AssertionFailedf(
-					"unknown partition %s on PRIMARY INDEX of table %s",
-					name,
-					desc.GetName(),
-				)
-			}
-			delete(regionNames, regionName)
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		// Any regions that are not deleted from the above loop is missing.
-		for regionName := range regionNames {
-			return errors.AssertionFailedf(
-				"missing partition %s on PRIMARY INDEX of table %s",
-				regionName,
-				desc.GetName(),
-			)
-		}
-
-	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
-
-		// Table is homed in an explicit (non-primary) region.
-		if lc.RegionalByTable.Region != nil {
-			foundRegion := false
-			regions, err := regionsEnumDesc.RegionNamesForValidation()
-			if err != nil {
-				return err
-			}
-			for _, r := range regions {
-				if *lc.RegionalByTable.Region == r {
-					foundRegion = true
-					break
-				}
-			}
-			if !foundRegion {
-				return errors.WithHintf(
-					pgerror.Newf(
-						pgcode.InvalidTableDefinition,
-						`region "%s" has not been added to database "%s"`,
-						*lc.RegionalByTable.Region,
-						db.DatabaseDesc().Name,
-					),
-					"available regions: %s",
-					strings.Join(regions.ToStrings(), ", "),
-				)
-			}
-			if !regionEnumIDReferenced {
-				return errors.AssertionFailedf(
-					"expected multi-region enum ID %d to be referenced on REGIONAL BY TABLE: %q locality "+
-						"config, but did not find it",
-					regionsEnumID,
-					desc.GetName(),
-				)
-			}
-		} else {
-			if regionEnumIDReferenced {
-				// It may be the case that the multi-region type descriptor is used
-				// as the type of the table column. Validations should only fail if
-				// that is not the case.
-				if _, found := columnTypesTypeIDs[regionsEnumID]; !found {
-					return errors.AssertionFailedf(
-						"expected no region Enum ID to be referenced by a REGIONAL BY TABLE: %q homed in the "+
-							"primary region, but found: %d",
-						desc.GetName(),
-						regionsEnumDesc.GetID(),
-					)
-				}
-			}
-		}
-	default:
-		return pgerror.Newf(
-			pgcode.InvalidTableDefinition,
-			"unknown locality level: %T",
-			lc,
-		)
-	}
-	return nil
 }

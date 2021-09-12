@@ -134,7 +134,7 @@ func (ef *execFactory) ConstructScan(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStatsWriter.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	return scan, nil
@@ -558,11 +558,6 @@ func (ef *execFactory) ConstructStreamingSetOp(
 func (ef *execFactory) ConstructUnionAll(
 	left, right exec.Node, reqOrdering exec.OutputOrdering, hardLimit uint64,
 ) (exec.Node, error) {
-	if hardLimit > 1 {
-		return nil, errors.AssertionFailedf(
-			"locality optimized search is not yet supported for more than one row at a time",
-		)
-	}
 	return ef.planner.newUnionNode(
 		tree.UnionOp,
 		true, /* all */
@@ -679,7 +674,7 @@ func (ef *execFactory) ConstructLookupJoin(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStatsWriter.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	n := &lookupJoinNode{
@@ -809,7 +804,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStatsWriter.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	n := &invertedJoinNode{
@@ -873,7 +868,7 @@ func (ef *execFactory) constructScanForZigzag(
 			TableID: roachpb.TableID(tableDesc.GetID()),
 			IndexID: roachpb.IndexID(index.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStatsWriter.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	scan.index = index
@@ -1278,8 +1273,17 @@ func (ef *execFactory) ConstructInsert(
 	}
 
 	// Create the table inserter, which does the bulk of the work.
+	internal := ef.planner.SessionData().Internal
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, cols, ef.planner.alloc,
+		ctx,
+		ef.planner.txn,
+		ef.planner.ExecCfg().Codec,
+		tabDesc,
+		cols,
+		ef.planner.alloc,
+		&ef.planner.ExecCfg().Settings.SV,
+		internal,
+		ef.planner.ExecCfg().GetRowMetrics(internal),
 	)
 	if err != nil {
 		return nil, err
@@ -1344,8 +1348,17 @@ func (ef *execFactory) ConstructInsertFastPath(
 	}
 
 	// Create the table inserter, which does the bulk of the work.
+	internal := ef.planner.SessionData().Internal
 	ri, err := row.MakeInserter(
-		ctx, ef.planner.txn, ef.planner.ExecCfg().Codec, tabDesc, cols, ef.planner.alloc,
+		ctx,
+		ef.planner.txn,
+		ef.planner.ExecCfg().Codec,
+		tabDesc,
+		cols,
+		ef.planner.alloc,
+		&ef.planner.ExecCfg().Settings.SV,
+		internal,
+		ef.planner.ExecCfg().GetRowMetrics(internal),
 	)
 	if err != nil {
 		return nil, err
@@ -1441,6 +1454,7 @@ func (ef *execFactory) ConstructUpdate(
 	}
 
 	// Create the table updater, which does the bulk of the work.
+	internal := ef.planner.SessionData().Internal
 	ru, err := row.MakeUpdater(
 		ctx,
 		ef.planner.txn,
@@ -1450,6 +1464,9 @@ func (ef *execFactory) ConstructUpdate(
 		fetchCols,
 		row.UpdaterDefault,
 		ef.planner.alloc,
+		&ef.planner.ExecCfg().Settings.SV,
+		internal,
+		ef.planner.ExecCfg().GetRowMetrics(internal),
 	)
 	if err != nil {
 		return nil, err
@@ -1543,6 +1560,7 @@ func (ef *execFactory) ConstructUpsert(
 	}
 
 	// Create the table inserter, which does the bulk of the insert-related work.
+	internal := ef.planner.SessionData().Internal
 	ri, err := row.MakeInserter(
 		ctx,
 		ef.planner.txn,
@@ -1550,6 +1568,9 @@ func (ef *execFactory) ConstructUpsert(
 		tabDesc,
 		insertCols,
 		ef.planner.alloc,
+		&ef.planner.ExecCfg().Settings.SV,
+		internal,
+		ef.planner.ExecCfg().GetRowMetrics(internal),
 	)
 	if err != nil {
 		return nil, err
@@ -1565,6 +1586,9 @@ func (ef *execFactory) ConstructUpsert(
 		fetchCols,
 		row.UpdaterDefault,
 		ef.planner.alloc,
+		&ef.planner.ExecCfg().Settings.SV,
+		internal,
+		ef.planner.ExecCfg().GetRowMetrics(internal),
 	)
 	if err != nil {
 		return nil, err
@@ -1636,7 +1660,15 @@ func (ef *execFactory) ConstructDelete(
 	// the deleter derives the columns that need to be fetched. By contrast, the
 	// CBO will have already determined the set of fetch columns, and passes
 	// those sets into the deleter (which will basically be a no-op).
-	rd := row.MakeDeleter(ef.planner.ExecCfg().Codec, tabDesc, fetchCols)
+	internal := ef.planner.SessionData().Internal
+	rd := row.MakeDeleter(
+		ef.planner.ExecCfg().Codec,
+		tabDesc,
+		fetchCols,
+		&ef.planner.ExecCfg().Settings.SV,
+		internal,
+		ef.planner.ExecCfg().GetRowMetrics(internal),
+	)
 
 	// Now make a delete node. We use a pool.
 	del := deleteNodePool.Get().(*deleteNode)
@@ -1931,11 +1963,26 @@ func (ef *execFactory) ConstructAlterTableRelocate(
 
 // ConstructControlJobs is part of the exec.Factory interface.
 func (ef *execFactory) ConstructControlJobs(
-	command tree.JobCommand, input exec.Node,
+	command tree.JobCommand, input exec.Node, reason tree.TypedExpr,
 ) (exec.Node, error) {
+	reasonDatum, err := reason.Eval(ef.planner.EvalContext())
+	if err != nil {
+		return nil, err
+	}
+
+	var reasonStr string
+	if reasonDatum != tree.DNull {
+		reasonStrDatum, ok := reasonDatum.(*tree.DString)
+		if !ok {
+			return nil, errors.Errorf("expected string value for the reason")
+		}
+		reasonStr = string(*reasonStrDatum)
+	}
+
 	return &controlJobsNode{
 		rows:          input.(planNode),
 		desiredStatus: jobCommandToDesiredStatus[command],
+		reason:        reasonStr,
 	}, nil
 }
 

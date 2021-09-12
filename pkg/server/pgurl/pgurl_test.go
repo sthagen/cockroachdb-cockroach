@@ -64,14 +64,60 @@ func TestURL(t *testing.T) {
 	})
 }
 
+func TestPassword(t *testing.T) {
+	u := New()
+
+	enabled, _, _ := u.GetAuthnPassword()
+	require.False(t, enabled)
+
+	u.WithAuthn(AuthnPassword(true, "abc"))
+
+	enabled, hasp, p := u.GetAuthnPassword()
+	require.True(t, enabled)
+	require.True(t, hasp)
+	require.Equal(t, p, "abc")
+
+	u.ClearPassword()
+	enabled, hasp, _ = u.GetAuthnPassword()
+	require.True(t, enabled)
+	require.False(t, hasp)
+}
+
+func TestCopyAuthn(t *testing.T) {
+	u := New()
+	v := New()
+
+	u.WithAuthn(AuthnPassword(true, "abc"))
+	opt, err := u.GetAuthnOption()
+	require.NoError(t, err)
+	v.WithAuthn(opt)
+	enabled, hasp, p := v.GetAuthnPassword()
+	require.True(t, enabled)
+	require.True(t, hasp)
+	require.Equal(t, p, "abc")
+
+	u.WithAuthn(AuthnClientCert("a", "b"))
+	opt, err = u.GetAuthnOption()
+	require.NoError(t, err)
+	v.WithAuthn(opt)
+
+	enabled, patha, pathb := v.GetAuthnCert()
+	require.True(t, enabled)
+	require.Equal(t, patha, "a")
+	require.Equal(t, pathb, "b")
+}
+
 func TestOptions(t *testing.T) {
 	u := New()
 
 	// Check that AddOptions processes the options as per Parse().
-	err := u.AddOptions(url.Values{"user": []string{"foo"}})
+	err := u.AddOptions(url.Values{"user": []string{"foo"}, "database": []string{"bar"}})
 	require.NoError(t, err)
 	require.Equal(t, u.GetUsername(), "foo")
+	require.Equal(t, u.GetDatabase(), "bar")
 	_, ok := u.extraOptions["user"]
+	require.Equal(t, ok, false)
+	_, ok = u.extraOptions["database"]
 	require.Equal(t, ok, false)
 
 	// Check that non-special options remain in extraOptions.

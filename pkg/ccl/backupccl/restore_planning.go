@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -52,7 +54,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -70,11 +71,16 @@ const (
 	restoreOptSkipMissingSequenceOwners = "skip_missing_sequence_owners"
 	restoreOptSkipMissingViews          = "skip_missing_views"
 	restoreOptSkipLocalitiesCheck       = "skip_localities_check"
+	restoreOptDebugPauseOn              = "debug_pause_on"
 
 	// The temporary database system tables will be restored into for full
 	// cluster backups.
 	restoreTempSystemDB = "crdb_temp_system"
 )
+
+var allowedDebugPauseOnValues = map[string]struct{}{
+	"error": {},
+}
 
 // featureRestoreEnabled is used to enable and disable the RESTORE feature.
 var featureRestoreEnabled = settings.RegisterBoolSetting(
@@ -1559,11 +1565,11 @@ func restorePlanHook(
 
 		var endTime hlc.Timestamp
 		if restoreStmt.AsOf.Expr != nil {
-			var err error
-			endTime, err = p.EvalAsOfTimestamp(ctx, restoreStmt.AsOf)
+			asOf, err := p.EvalAsOfTimestamp(ctx, restoreStmt.AsOf)
 			if err != nil {
 				return err
 			}
+			endTime = asOf.Timestamp
 		}
 
 		var passphrase string
@@ -1818,6 +1824,11 @@ func doRestorePlan(
 			if table == nil {
 				continue
 			}
+			index := table.GetPrimaryIndex()
+			if index.IsInterleaved() &&
+				currentVersion.IsActive(clusterversion.PreventNewInterleavedTables) {
+				return errors.Errorf("restoring interleaved tables is no longer allowed. table %s was found to be interleaved", table.Name)
+			}
 			if err := catalog.ForEachNonDropIndex(
 				tabledesc.NewBuilder(table).BuildImmutable().(catalog.TableDescriptor),
 				func(index catalog.Index) error {
@@ -1905,6 +1916,23 @@ func doRestorePlan(
 	if !restoreStmt.Options.SkipLocalitiesCheck {
 		if err := checkClusterRegions(ctx, p, typesByID); err != nil {
 			return err
+		}
+	}
+
+	var debugPauseOn string
+	if restoreStmt.Options.DebugPauseOn != nil {
+		pauseOnFn, err := p.TypeAsString(ctx, restoreStmt.Options.DebugPauseOn, "RESTORE")
+		if err != nil {
+			return err
+		}
+
+		debugPauseOn, err = pauseOnFn()
+		if err != nil {
+			return err
+		}
+
+		if _, ok := allowedDebugPauseOnValues[debugPauseOn]; len(debugPauseOn) > 0 && !ok {
+			return errors.Newf("%s cannot be set with the value %s", restoreOptDebugPauseOn, debugPauseOn)
 		}
 	}
 
@@ -2005,6 +2033,7 @@ func doRestorePlan(
 			Encryption:         encryption,
 			RevalidateIndexes:  revalidateIndexes,
 			DatabaseModifiers:  databaseModifiers,
+			DebugPauseOn:       debugPauseOn,
 		},
 		Progress: jobspb.RestoreProgress{},
 	}
@@ -2076,10 +2105,7 @@ func planDatabaseModifiersForRestore(
 	if defaultPrimaryRegion == "" {
 		return nil, nil, nil
 	}
-	if err := multiregionccl.CheckClusterSupportsMultiRegion(
-		&p.ExtendedEvalContext().EvalContext,
-		p.ExecCfg(),
-	); err != nil {
+	if err := multiregionccl.CheckClusterSupportsMultiRegion(p.ExecCfg()); err != nil {
 		return nil, nil, errors.WithHintf(
 			err,
 			"try disabling the default PRIMARY REGION by using RESET CLUSTER SETTING %s",
@@ -2158,6 +2184,7 @@ func planDatabaseModifiersForRestore(
 			defaultPrimaryRegion,
 			sg,
 			regionEnumID,
+			descpb.DataPlacement_DEFAULT,
 		)
 		if err := multiregion.ValidateRegionConfig(regionConfig); err != nil {
 			return nil, nil, err

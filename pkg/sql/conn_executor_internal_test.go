@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -298,6 +299,7 @@ func startConnExecutor(
 		TestingKnobs:            ExecutorTestingKnobs{},
 		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, nil, gw, st),
 		HistogramWindowInterval: base.DefaultHistogramWindowInterval(),
+		CollectionFactory:       descs.NewCollectionFactory(st, nil, nil, nil),
 	}
 	pool := mon.NewUnlimitedMonitor(
 		context.Background(), "test", mon.MemoryResource,
@@ -318,7 +320,8 @@ func startConnExecutor(
 	}
 	sqlMetrics := MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
 
-	conn, err := s.SetupConn(ctx, SessionArgs{}, buf, cc, sqlMetrics)
+	onDefaultIntSizeChange := func(int32) {}
+	conn, err := s.SetupConn(ctx, SessionArgs{}, buf, cc, sqlMetrics, onDefaultIntSizeChange)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -353,7 +356,8 @@ func TestSessionCloseWithPendingTempTableInTxn(t *testing.T) {
 			flushed <- res
 		},
 	}
-	connHandler, err := srv.SetupConn(ctx, SessionArgs{User: security.RootUserName()}, stmtBuf, clientComm, MemoryMetrics{})
+	onDefaultIntSizeChange := func(int32) {}
+	connHandler, err := srv.SetupConn(ctx, SessionArgs{User: security.RootUserName()}, stmtBuf, clientComm, MemoryMetrics{}, onDefaultIntSizeChange)
 	require.NoError(t, err)
 
 	stmts, err := parser.Parse(`

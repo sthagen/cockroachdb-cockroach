@@ -769,7 +769,7 @@ func (j jsonDatumCustomizer) getBinOpAssignFunc() assignFunc {
 		// JSON path (stored at "_path") is non-nil.
 		getJSONFetchPath := func(handleNonNilPath string) string {
 			return fmt.Sprintf(`
-_path, _err := tree.GetJSONPath(%[3]s, *tree.MustBeDArray(%[4]s.(*coldataext.Datum).Datum))
+_path, _err := tree.GetJSONPath(%[3]s, *tree.MustBeDArray(%[4]s.(tree.Datum)))
 if _err != nil {
     colexecerror.ExpectedError(_err)
 }
@@ -803,15 +803,25 @@ if _path == nil {
 	}
 }
 
+// timestampRangeCheck should be added at the end of operations that modify and
+// return timestamps in order to ensure that the vectorized engine returns the
+// same errors as the row engine. The range check expects the timestamp to be
+// stored in a local variable named 't_res'.
+const timestampRangeCheck = `	
+rounded_res := t_res.Round(time.Microsecond)
+if rounded_res.After(tree.MaxSupportedTime) || rounded_res.Before(tree.MinSupportedTime) {
+		colexecerror.ExpectedError(errors.Newf("timestamp %q exceeds supported timestamp bounds", t_res.Format(time.RFC3339)))
+}`
+
 func (c timestampIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 	return func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string {
 		switch op.overloadBase.BinOp {
 		case tree.Plus:
-			return fmt.Sprintf(`%[1]s = duration.Add(%[2]s, %[3]s)`,
-				targetElem, leftElem, rightElem)
+			return fmt.Sprintf(`t_res := duration.Add(%[1]s, %[2]s)`,
+				leftElem, rightElem) + timestampRangeCheck + fmt.Sprintf("\n%s = t_res", targetElem)
 		case tree.Minus:
-			return fmt.Sprintf(`%[1]s = duration.Add(%[2]s, %[3]s.Mul(-1))`,
-				targetElem, leftElem, rightElem)
+			return fmt.Sprintf(`t_res := duration.Add(%[1]s, %[2]s.Mul(-1))`,
+				leftElem, rightElem) + timestampRangeCheck + fmt.Sprintf("\n%s = t_res", targetElem)
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
@@ -824,8 +834,8 @@ func (c intervalTimestampCustomizer) getBinOpAssignFunc() assignFunc {
 	return func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string {
 		switch op.overloadBase.BinOp {
 		case tree.Plus:
-			return fmt.Sprintf(`%[1]s = duration.Add(%[3]s, %[2]s)`,
-				targetElem, leftElem, rightElem)
+			return fmt.Sprintf(`t_res := duration.Add(%[2]s, %[1]s)`,
+				leftElem, rightElem) + timestampRangeCheck + fmt.Sprintf("\n%s = t_res", targetElem)
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("unhandled binary operator %s", op.overloadBase.BinOp.String()))
 		}
@@ -942,17 +952,15 @@ func (c decimalIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 // be used to do any setup (like converting non-datum element to its datum
 // equivalent)
 // - targetElem - same as targetElem parameter in assignFunc signature
-// - leftColdataExtDatum - the variable name of the left datum element that
-// must be of *coldataext.Datum type
-// - rightDatumElem - the variable name of the right datum element which could
-// be *coldataext.Datum, tree.Datum, or nil.
-func executeBinOpOnDatums(prelude, targetElem, leftColdataExtDatum, rightDatumElem string) string {
+// - leftDatumElem and rightDatumElem - the variable names of the left and right
+// datum elements that must be convertable to tree.Datum type.
+func executeBinOpOnDatums(prelude, targetElem, leftDatumElem, rightDatumElem string) string {
 	codeBlock := fmt.Sprintf(`
 			%s
-			_res, err := %s.BinFn(_overloadHelper.BinFn, _overloadHelper.EvalCtx, %s)
+			_res, err := _overloadHelper.BinFn(_overloadHelper.EvalCtx, %s.(tree.Datum), %s.(tree.Datum))
 			if err != nil {
 				colexecerror.ExpectedError(err)
-			}`, prelude, leftColdataExtDatum, rightDatumElem,
+			}`, prelude, leftDatumElem, rightDatumElem,
 	)
 	if regexp.MustCompile(`.*\[.*]`).MatchString(targetElem) {
 		// targetElem is of the form 'vec[i]'.
@@ -980,8 +988,7 @@ func executeBinOpOnDatums(prelude, targetElem, leftColdataExtDatum, rightDatumEl
 func (c datumCustomizer) getBinOpAssignFunc() assignFunc {
 	return func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string {
 		return executeBinOpOnDatums(
-			"" /* prelude */, targetElem,
-			leftElem+".(*coldataext.Datum)", rightElem,
+			"" /* prelude */, targetElem, leftElem, rightElem,
 		)
 	}
 }
@@ -1041,26 +1048,16 @@ func (c datumNonDatumCustomizer) getBinOpAssignFunc() assignFunc {
 			op.BinOp, op.lastArgTypeOverload.CanonicalTypeFamily, rightElem, rightDatumElem,
 		)
 		return executeBinOpOnDatums(
-			prelude, targetElem,
-			leftElem+".(*coldataext.Datum)", rightDatumElem,
+			prelude, targetElem, leftElem, rightDatumElem,
 		)
 	}
 }
 
 func (c nonDatumDatumCustomizer) getBinOpAssignFunc() assignFunc {
 	return func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string {
-		const (
-			leftDatumElem       = "_nonDatumArgAsDatum"
-			leftColdataExtDatum = "_nonDatumArgAsColdataExtDatum"
-		)
-		prelude := fmt.Sprintf(`
-			%s
-			%s := &coldataext.Datum{Datum: %s}
-			`,
-			convertNativeToDatum(op.BinOp, c.leftCanonicalTypeFamily, leftElem, leftDatumElem),
-			leftColdataExtDatum, leftDatumElem,
-		)
-		return executeBinOpOnDatums(prelude, targetElem, leftColdataExtDatum, rightElem)
+		const leftDatumElem = "_nonDatumArgAsDatum"
+		prelude := convertNativeToDatum(op.BinOp, c.leftCanonicalTypeFamily, leftElem, leftDatumElem)
+		return executeBinOpOnDatums(prelude, targetElem, leftDatumElem, rightElem)
 	}
 }
 

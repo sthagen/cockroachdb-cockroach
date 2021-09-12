@@ -213,7 +213,7 @@ func (b *logicalPropsBuilder) buildSequenceSelectProps(
 }
 
 func (b *logicalPropsBuilder) buildSelectProps(sel *SelectExpr, rel *props.Relational) {
-	BuildSharedProps(sel, &rel.Shared)
+	BuildSharedProps(sel, &rel.Shared, b.evalCtx)
 
 	inputProps := sel.Input.Relational()
 
@@ -278,7 +278,7 @@ func (b *logicalPropsBuilder) buildSelectProps(sel *SelectExpr, rel *props.Relat
 }
 
 func (b *logicalPropsBuilder) buildProjectProps(prj *ProjectExpr, rel *props.Relational) {
-	BuildSharedProps(prj, &rel.Shared)
+	BuildSharedProps(prj, &rel.Shared, b.evalCtx)
 
 	inputProps := prj.Input.Relational()
 
@@ -324,7 +324,7 @@ func (b *logicalPropsBuilder) buildProjectProps(prj *ProjectExpr, rel *props.Rel
 func (b *logicalPropsBuilder) buildInvertedFilterProps(
 	invFilter *InvertedFilterExpr, rel *props.Relational,
 ) {
-	BuildSharedProps(invFilter, &rel.Shared)
+	BuildSharedProps(invFilter, &rel.Shared, b.evalCtx)
 
 	inputProps := invFilter.Input.Relational()
 
@@ -419,7 +419,7 @@ func (b *logicalPropsBuilder) buildAntiJoinApplyProps(
 }
 
 func (b *logicalPropsBuilder) buildJoinProps(join RelExpr, rel *props.Relational) {
-	BuildSharedProps(join, &rel.Shared)
+	BuildSharedProps(join, &rel.Shared, b.evalCtx)
 
 	var h joinPropsHelper
 	h.init(b, join)
@@ -460,7 +460,7 @@ func (b *logicalPropsBuilder) buildJoinProps(join RelExpr, rel *props.Relational
 }
 
 func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel *props.Relational) {
-	BuildSharedProps(indexJoin, &rel.Shared)
+	BuildSharedProps(indexJoin, &rel.Shared, b.evalCtx)
 
 	inputProps := indexJoin.Input.Relational()
 	md := b.mem.Metadata()
@@ -553,7 +553,7 @@ func (b *logicalPropsBuilder) buildEnsureUpsertDistinctOnProps(
 }
 
 func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *props.Relational) {
-	BuildSharedProps(groupExpr, &rel.Shared)
+	BuildSharedProps(groupExpr, &rel.Shared, b.evalCtx)
 
 	inputProps := groupExpr.Child(0).(RelExpr).Relational()
 	aggs := *groupExpr.Child(1).(*AggregationsExpr)
@@ -687,7 +687,7 @@ func (b *logicalPropsBuilder) buildLocalityOptimizedSearchProps(
 }
 
 func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relational) {
-	BuildSharedProps(setNode, &rel.Shared)
+	BuildSharedProps(setNode, &rel.Shared, b.evalCtx)
 
 	op := setNode.Op()
 	leftProps := setNode.Child(0).(RelExpr).Relational()
@@ -751,6 +751,18 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 			remapped.RemapFrom(&rightProps.FuncDeps, setPrivate.RightCols, setPrivate.OutCols)
 			rel.FuncDeps.AddFrom(&remapped)
 		}
+
+		// If columns at ordinals (i, j) are equivalent in the left input, then the
+		// output columns at ordinals at (i, j) are also equivalent. Although we
+		// have already copied the left FDs above, we also need to add equivalencies
+		// in case some left input columns were projected multiple times.
+		for i := range setPrivate.OutCols {
+			for j := i + 1; j < len(setPrivate.OutCols); j++ {
+				if leftProps.FuncDeps.AreColsEquiv(setPrivate.LeftCols[i], setPrivate.LeftCols[j]) {
+					rel.FuncDeps.AddEquivalency(setPrivate.OutCols[i], setPrivate.OutCols[j])
+				}
+			}
+		}
 	}
 
 	// Add a strict key for variants that eliminate duplicates.
@@ -777,7 +789,7 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 }
 
 func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Relational) {
-	BuildSharedProps(values, &rel.Shared)
+	BuildSharedProps(values, &rel.Shared, b.evalCtx)
 
 	card := uint32(len(values.Rows))
 
@@ -829,7 +841,7 @@ func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Re
 }
 
 func (b *logicalPropsBuilder) buildBasicProps(e opt.Expr, cols opt.ColList, rel *props.Relational) {
-	BuildSharedProps(e, &rel.Shared)
+	BuildSharedProps(e, &rel.Shared, b.evalCtx)
 
 	// Output Columns
 	// --------------
@@ -863,7 +875,7 @@ func (b *logicalPropsBuilder) buildWithProps(with *WithExpr, rel *props.Relation
 	// Copy over the props from the input.
 	inputProps := with.Main.Relational()
 
-	BuildSharedProps(with, &rel.Shared)
+	BuildSharedProps(with, &rel.Shared, b.evalCtx)
 
 	// Side Effects
 	// ------------
@@ -900,7 +912,7 @@ func (b *logicalPropsBuilder) buildWithProps(with *WithExpr, rel *props.Relation
 }
 
 func (b *logicalPropsBuilder) buildWithScanProps(withScan *WithScanExpr, rel *props.Relational) {
-	BuildSharedProps(withScan, &rel.Shared)
+	BuildSharedProps(withScan, &rel.Shared, b.evalCtx)
 	boundExpr := b.mem.Metadata().WithBinding(withScan.With).(RelExpr)
 	bindingProps := boundExpr.Relational()
 
@@ -943,7 +955,7 @@ func (b *logicalPropsBuilder) buildWithScanProps(withScan *WithScanExpr, rel *pr
 }
 
 func (b *logicalPropsBuilder) buildRecursiveCTEProps(rec *RecursiveCTEExpr, rel *props.Relational) {
-	BuildSharedProps(rec, &rel.Shared)
+	BuildSharedProps(rec, &rel.Shared, b.evalCtx)
 
 	// Output Columns
 	// --------------
@@ -1054,7 +1066,7 @@ func (b *logicalPropsBuilder) buildExportProps(export *ExportExpr, rel *props.Re
 }
 
 func (b *logicalPropsBuilder) buildLimitProps(limit *LimitExpr, rel *props.Relational) {
-	BuildSharedProps(limit, &rel.Shared)
+	BuildSharedProps(limit, &rel.Shared, b.evalCtx)
 
 	inputProps := limit.Input.Relational()
 
@@ -1113,7 +1125,7 @@ func (b *logicalPropsBuilder) buildLimitProps(limit *LimitExpr, rel *props.Relat
 }
 
 func (b *logicalPropsBuilder) buildOffsetProps(offset *OffsetExpr, rel *props.Relational) {
-	BuildSharedProps(offset, &rel.Shared)
+	BuildSharedProps(offset, &rel.Shared, b.evalCtx)
 
 	inputProps := offset.Input.Relational()
 
@@ -1158,7 +1170,7 @@ func (b *logicalPropsBuilder) buildOffsetProps(offset *OffsetExpr, rel *props.Re
 }
 
 func (b *logicalPropsBuilder) buildMax1RowProps(max1Row *Max1RowExpr, rel *props.Relational) {
-	BuildSharedProps(max1Row, &rel.Shared)
+	BuildSharedProps(max1Row, &rel.Shared, b.evalCtx)
 
 	inputProps := max1Row.Input.Relational()
 
@@ -1194,7 +1206,7 @@ func (b *logicalPropsBuilder) buildMax1RowProps(max1Row *Max1RowExpr, rel *props
 }
 
 func (b *logicalPropsBuilder) buildOrdinalityProps(ord *OrdinalityExpr, rel *props.Relational) {
-	BuildSharedProps(ord, &rel.Shared)
+	BuildSharedProps(ord, &rel.Shared, b.evalCtx)
 
 	inputProps := ord.Input.Relational()
 
@@ -1239,7 +1251,7 @@ func (b *logicalPropsBuilder) buildOrdinalityProps(ord *OrdinalityExpr, rel *pro
 }
 
 func (b *logicalPropsBuilder) buildWindowProps(window *WindowExpr, rel *props.Relational) {
-	BuildSharedProps(window, &rel.Shared)
+	BuildSharedProps(window, &rel.Shared, b.evalCtx)
 
 	inputProps := window.Input.Relational()
 
@@ -1289,7 +1301,7 @@ func (b *logicalPropsBuilder) buildWindowProps(window *WindowExpr, rel *props.Re
 func (b *logicalPropsBuilder) buildProjectSetProps(
 	projectSet *ProjectSetExpr, rel *props.Relational,
 ) {
-	BuildSharedProps(projectSet, &rel.Shared)
+	BuildSharedProps(projectSet, &rel.Shared, b.evalCtx)
 
 	inputProps := projectSet.Input.Relational()
 
@@ -1359,7 +1371,7 @@ func (b *logicalPropsBuilder) buildDeleteProps(del *DeleteExpr, rel *props.Relat
 }
 
 func (b *logicalPropsBuilder) buildMutationProps(mutation RelExpr, rel *props.Relational) {
-	BuildSharedProps(mutation, &rel.Shared)
+	BuildSharedProps(mutation, &rel.Shared, b.evalCtx)
 
 	private := mutation.Private().(*MutationPrivate)
 
@@ -1441,15 +1453,15 @@ func (b *logicalPropsBuilder) buildMutationProps(mutation RelExpr, rel *props.Re
 }
 
 func (b *logicalPropsBuilder) buildCreateTableProps(ct *CreateTableExpr, rel *props.Relational) {
-	BuildSharedProps(ct, &rel.Shared)
+	BuildSharedProps(ct, &rel.Shared, b.evalCtx)
 }
 
 func (b *logicalPropsBuilder) buildCreateViewProps(cv *CreateViewExpr, rel *props.Relational) {
-	BuildSharedProps(cv, &rel.Shared)
+	BuildSharedProps(cv, &rel.Shared, b.evalCtx)
 }
 
 func (b *logicalPropsBuilder) buildFiltersItemProps(item *FiltersItem, scalar *props.Scalar) {
-	BuildSharedProps(item.Condition, &scalar.Shared)
+	BuildSharedProps(item.Condition, &scalar.Shared, b.evalCtx)
 
 	// Constraints
 	// -----------
@@ -1494,24 +1506,24 @@ func (b *logicalPropsBuilder) buildProjectionsItemProps(
 	item *ProjectionsItem, scalar *props.Scalar,
 ) {
 	item.Typ = item.Element.DataType()
-	BuildSharedProps(item.Element, &scalar.Shared)
+	BuildSharedProps(item.Element, &scalar.Shared, b.evalCtx)
 }
 
 func (b *logicalPropsBuilder) buildAggregationsItemProps(
 	item *AggregationsItem, scalar *props.Scalar,
 ) {
 	item.Typ = item.Agg.DataType()
-	BuildSharedProps(item.Agg, &scalar.Shared)
+	BuildSharedProps(item.Agg, &scalar.Shared, b.evalCtx)
 }
 
 func (b *logicalPropsBuilder) buildWindowsItemProps(item *WindowsItem, scalar *props.Scalar) {
 	item.Typ = item.Function.DataType()
-	BuildSharedProps(item.Function, &scalar.Shared)
+	BuildSharedProps(item.Function, &scalar.Shared, b.evalCtx)
 }
 
 func (b *logicalPropsBuilder) buildZipItemProps(item *ZipItem, scalar *props.Scalar) {
 	item.Typ = item.Fn.DataType()
-	BuildSharedProps(item.Fn, &scalar.Shared)
+	BuildSharedProps(item.Fn, &scalar.Shared, b.evalCtx)
 }
 
 // BuildSharedProps fills in the shared properties derived from the given
@@ -1522,7 +1534,7 @@ func (b *logicalPropsBuilder) buildZipItemProps(item *ZipItem, scalar *props.Sca
 // to be partially filled in already. Boolean fields such as HasPlaceholder,
 // HasCorrelatedSubquery should never be reset to false once set to true;
 // VolatilitySet should never be re-initialized.
-func BuildSharedProps(e opt.Expr, shared *props.Shared) {
+func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *tree.EvalContext) {
 	switch t := e.(type) {
 	case *VariableExpr:
 		// Variable introduces outer column.
@@ -1568,7 +1580,7 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 
 	case *CastExpr:
 		from, to := t.Input.DataType(), t.Typ
-		volatility, ok := tree.LookupCastVolatility(from, to)
+		volatility, ok := tree.LookupCastVolatility(from, to, evalCtx.SessionData())
 		if !ok {
 			panic(errors.AssertionFailedf("no volatility for cast %s::%s", from, to))
 		}
@@ -1638,7 +1650,7 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 				shared.HasCorrelatedSubquery = true
 			}
 		} else {
-			BuildSharedProps(e.Child(i), shared)
+			BuildSharedProps(e.Child(i), shared, evalCtx)
 		}
 	}
 }
@@ -2602,55 +2614,80 @@ func deriveWithUses(r opt.Expr) props.WithUsesMap {
 // An example of a composite-sensitive expression is `d::string`, where d is a
 // DECIMAL.
 //
+// A formal definition:
+//   Let (c1,c2,...) be the outer columns of the scalar expression. Let
+//   f(x1,x2,..) be the result of the scalar expression for the given outer
+//   column values. The expression is composite insensitive if, for any two
+//   sets of values (x1,x2,...) and (y1,y2,...)
+//      (x1=y1 AND x2=y2 AND ...) => f(x1,x2,...) = f(y1,y2,...)
+//
+//   Note that this doesn't mean that the final results are always *identical*
+//   just that they are logically equal.
+//
 // This property is used to determine when a scalar expression can be copied,
 // with outer column variable references changed to refer to other columns that
 // are known to be equal to the original columns.
 func CanBeCompositeSensitive(md *opt.Metadata, e opt.Expr) bool {
-	outerCols := getOuterCols(e)
-	var compositeOuterCols opt.ColSet
-	outerCols.ForEach(func(col opt.ColumnID) {
-		if colinfo.HasCompositeKeyEncoding(md.ColumnMeta(col).Type) {
-			compositeOuterCols.Add(col)
-		}
-	})
-	if compositeOuterCols.Empty() {
-		// Fast path: none of the outer columns are composite.
-		return false
-	}
-
-	var canBeSensitive func(e opt.Expr) bool
-	canBeSensitive = func(e opt.Expr) bool {
-		if _, ok := e.(RelExpr); ok {
-			// Not a purely scalar expression.
+	// check is a recursive function which returns the following:
+	//  - isCompositeInsensitive as defined above.
+	//  - isCompositeIdentical is a stronger property, which says that for equal
+	//    outer column values, the expression results are always *identical* (not
+	//    just logically equal).
+	//
+	// A composite-insensitive expression with a non-composite result type is by
+	// definition also composite-identical.
+	//
+	// Any purely scalar expression which depends only on non-composite outer
+	// columns is composite-identical.
+	exprIsCompositeInsensitive := func(e opt.Expr) bool {
+		if opt.IsCompositeInsensitiveOp(e) {
 			return true
 		}
-		if !getOuterCols(e).Intersects(compositeOuterCols) {
-			// None of the outer columns of this sub-expression are composite.
-			return false
-		}
-		// Check the inputs to the operator. Together, the following conditions are
-		// sufficient to prove that this expression is not sensitive:
-		//  1. None of the inputs are sensitive to composite outer columns.
-		//     Otherwise, the operator can receive different inputs for logically
-		//     equal outer values and thus produce different outputs.
-		//  2. The operator is marked as being always insensitive, or none of the
-		//     input data types are composite.
-		checkTypes := !opt.IsCompositeInsensitiveOp(e)
-		for i, n := 0, e.ChildCount(); i < n; i++ {
-			if canBeSensitive(e.Child(i)) {
-				// Condition 1 not satisfied.
-				return true
-			}
-			if checkTypes {
-				// Note that the canBeSensitive() call above always returns true for
-				// relational expressions, so we are sure that the child is scalar.
-				if child := e.Child(i).(opt.ScalarExpr); colinfo.HasCompositeKeyEncoding(child.DataType()) {
-					// Condition 2 not satisfied.
-					return true
-				}
-			}
+		if funcExpr, ok := e.(*FunctionExpr); ok && funcExpr.Properties.CompositeInsensitive {
+			return true
 		}
 		return false
 	}
-	return canBeSensitive(e)
+	var check func(e opt.Expr) (isCompositeInsensitive, isCompositeIdentical bool)
+	check = func(e opt.Expr) (isCompositeInsensitive, isCompositeIdentical bool) {
+		if _, ok := e.(RelExpr); ok {
+			// Not a purely scalar expression.
+			return false, false
+		}
+		if v, ok := e.(*VariableExpr); ok {
+			// Outer column references are our base case. They are always
+			// composite-insensitive. If they are not of composite type, they are also
+			// composite-identical.
+			return true, !colinfo.CanHaveCompositeKeyEncoding(v.Typ)
+		}
+
+		allChildrenCompositeIdentical := true
+		for i, n := 0, e.ChildCount(); i < n; i++ {
+			childCompositeInsensitive, childCompositeIdentical := check(e.Child(i))
+			if !childCompositeInsensitive {
+				// One of our inputs is composite-sensitive; all bets are off.
+				return false, false
+			}
+			allChildrenCompositeIdentical = allChildrenCompositeIdentical && childCompositeIdentical
+		}
+
+		if allChildrenCompositeIdentical {
+			// It doesn't matter what this operator does - its inputs are always
+			// identical so the output will be the same.
+			return true, true
+		}
+
+		if exprIsCompositeInsensitive(e) {
+			// The operator is known to be composite-insensitive. If its result is a
+			// non-composite type, it is also composite-identical.
+			return true, !colinfo.CanHaveCompositeKeyEncoding(
+				e.(opt.ScalarExpr).DataType(),
+			)
+		}
+
+		return false, false
+	}
+
+	isCompositeInsensitive, _ := check(e)
+	return !isCompositeInsensitive
 }

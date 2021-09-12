@@ -253,13 +253,13 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 	}
 
 	// Evaluate the AS OF time, if any.
-	var asOf *hlc.Timestamp
+	var asOfTimestamp *hlc.Timestamp
 	if n.Options.AsOf.Expr != nil {
-		asOfTs, err := n.p.EvalAsOfTimestamp(ctx, n.Options.AsOf)
+		asOf, err := n.p.EvalAsOfTimestamp(ctx, n.Options.AsOf)
 		if err != nil {
 			return nil, err
 		}
-		asOf = &asOfTs
+		asOfTimestamp = &asOf.Timestamp
 	}
 
 	// Create a job to run statistics creation.
@@ -285,7 +285,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			Table:           *tableDesc.TableDesc(),
 			ColumnStats:     colStats,
 			Statement:       eventLogStatement,
-			AsOf:            asOf,
+			AsOf:            asOfTimestamp,
 			MaxFractionIdle: n.Options.Throttling,
 		},
 		Progress: jobspb.CreateStatsProgress{},
@@ -335,12 +335,25 @@ func createStatsDefaultColumns(
 	// addIndexColumnStatsIfNotExists appends column stats for the given column
 	// ID if they have not already been added. Histogram stats are collected for
 	// every indexed column.
-	addIndexColumnStatsIfNotExists := func(colID descpb.ColumnID, isInverted bool) {
+	addIndexColumnStatsIfNotExists := func(colID descpb.ColumnID, isInverted bool) error {
+		col, err := desc.FindColumnWithID(colID)
+		if err != nil {
+			return err
+		}
+
+		// Do not collect stats for virtual computed columns. DistSQLPlanner
+		// cannot currently collect stats for these columns because it plans
+		// table readers on the table's primary index which does not include
+		// virtual computed columns.
+		if col.IsVirtual() {
+			return nil
+		}
+
 		colList := []descpb.ColumnID{colID}
 
 		// Check for existing stats and remember the requested stats.
 		if !trackStatsIfNotExists(colList) {
-			return
+			return nil
 		}
 
 		colStat := jobspb.CreateStatsDetails_ColStat{
@@ -350,22 +363,27 @@ func createStatsDefaultColumns(
 		}
 		colStats = append(colStats, colStat)
 
-		// Generate histograms for inverted indexes. The above
-		// colStat append is still needed for a basic sketch of
-		// the column. The following colStat is needed for the
-		// sampling and sketch of the inverted index keys of
+		// Generate histograms for inverted indexes. The above colStat append is
+		// still needed for a basic sketch of the column. The following colStat
+		// is needed for the sampling and sketch of the inverted index keys of
 		// the column.
 		if isInverted {
 			colStat.Inverted = true
 			colStat.HasHistogram = true
 			colStats = append(colStats, colStat)
 		}
+
+		return nil
 	}
 
 	// Add column stats for the primary key.
-	for i := 0; i < desc.GetPrimaryIndex().NumKeyColumns(); i++ {
+	primaryIdx := desc.GetPrimaryIndex()
+	for i := 0; i < primaryIdx.NumKeyColumns(); i++ {
 		// Generate stats for each column in the primary key.
-		addIndexColumnStatsIfNotExists(desc.GetPrimaryIndex().GetKeyColumnID(i), false /* isInverted */)
+		err := addIndexColumnStatsIfNotExists(primaryIdx.GetKeyColumnID(i), false /* isInverted */)
+		if err != nil {
+			return nil, err
+		}
 
 		// Only collect multi-column stats if enabled.
 		if i == 0 || !multiColEnabled {
@@ -394,7 +412,9 @@ func createStatsDefaultColumns(
 			isInverted := idx.GetType() == descpb.IndexDescriptor_INVERTED && colID == idx.InvertedColumnID()
 
 			// Generate stats for each indexed column.
-			addIndexColumnStatsIfNotExists(colID, isInverted)
+			if err := addIndexColumnStatsIfNotExists(colID, isInverted); err != nil {
+				return nil, err
+			}
 
 			// Only collect multi-column stats if enabled.
 			if j == 0 || !multiColEnabled {
@@ -438,7 +458,9 @@ func createStatsDefaultColumns(
 					return nil, err
 				}
 				isInverted := colinfo.ColumnTypeIsInvertedIndexable(col.GetType())
-				addIndexColumnStatsIfNotExists(colID, isInverted)
+				if err := addIndexColumnStatsIfNotExists(colID, isInverted); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -447,6 +469,12 @@ func createStatsDefaultColumns(
 	nonIdxCols := 0
 	for i := 0; i < len(desc.PublicColumns()) && nonIdxCols < maxNonIndexCols; i++ {
 		col := desc.PublicColumns()[i]
+
+		// Do not collect stats for virtual computed columns.
+		if col.IsVirtual() {
+			continue
+		}
+
 		colList := []descpb.ColumnID{col.GetID()}
 
 		if !trackStatsIfNotExists(colList) {
@@ -513,9 +541,11 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 		evalCtx.Txn = txn
 
 		if details.AsOf != nil {
-			p.SemaCtx().AsOfTimestamp = details.AsOf
+			p.ExtendedEvalContext().AsOfSystemTime = &tree.AsOfSystemTime{Timestamp: *details.AsOf}
 			p.ExtendedEvalContext().SetTxnTimestamp(details.AsOf.GoTime())
-			txn.SetFixedTimestamp(ctx, *details.AsOf)
+			if err := txn.SetFixedTimestamp(ctx, *details.AsOf); err != nil {
+				return err
+			}
 		}
 
 		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, txn, true /* distribute */)
@@ -527,7 +557,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 		); err != nil {
 			// Check if this was a context canceled error and restart if it was.
 			if grpcutil.IsContextCanceled(err) {
-				return jobs.NewRetryJobError("node failure")
+				return jobs.MarkAsRetryJobError(err)
 			}
 
 			// We can't re-use the txn from above since it has a fixed timestamp set on
@@ -580,12 +610,12 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 			evalCtx.ExecCfg, txn,
 			0, /* depth: use event_log=2 for vmodule filtering */
 			eventLogOptions{dst: LogEverywhere},
-			sqlEventCommonExecPayload{
-				user:         evalCtx.SessionData.User(),
-				appName:      evalCtx.SessionData.ApplicationName,
-				stmt:         redact.Sprint(details.Statement),
-				stmtTag:      "CREATE STATISTICS",
-				placeholders: nil, /* no placeholders known at this point */
+			eventpb.CommonSQLEventDetails{
+				Statement:         redact.Sprint(details.Statement),
+				Tag:               "CREATE STATISTICS",
+				User:              evalCtx.SessionData().User().Normalized(),
+				ApplicationName:   evalCtx.SessionData().ApplicationName,
+				PlaceholderValues: []string{}, /* no placeholders known at this point */
 			},
 			eventLogEntry{
 				targetID: int32(details.Table.ID),
@@ -601,49 +631,24 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 // pending, running, or paused status that started earlier than this one. If
 // there are, checkRunningJobs returns an error. If job is nil, checkRunningJobs
 // just checks if there are any pending, running, or paused CreateStats jobs.
-func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) (retErr error) {
-	var jobID jobspb.JobID
+func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) error {
+	jobID := jobspb.InvalidJobID
 	if job != nil {
 		jobID = job.ID()
 	}
-	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2, $3) ORDER BY created`
+	exists, err := jobs.RunningJobExists(ctx, jobID, p.ExecCfg().InternalExecutor, nil /* txn */, func(payload *jobspb.Payload) bool {
+		return payload.Type() == jobspb.TypeCreateStats || payload.Type() == jobspb.TypeAutoCreateStats
+	})
 
-	it, err := p.ExecCfg().InternalExecutor.QueryIterator(
-		ctx,
-		"get-jobs",
-		nil, /* txn */
-		stmt,
-		jobs.StatusPending,
-		jobs.StatusRunning,
-		jobs.StatusPaused,
-	)
 	if err != nil {
 		return err
 	}
-	// We have to make sure to close the iterator since we might return from the
-	// for loop early (before Next() returns false).
-	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
 
-	var ok bool
-	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-		row := it.Cur()
-		payload, err := jobs.UnmarshalPayload(row[1])
-		if err != nil {
-			return err
-		}
-
-		if payload.Type() == jobspb.TypeCreateStats || payload.Type() == jobspb.TypeAutoCreateStats {
-			id := jobspb.JobID(*row[0].(*tree.DInt))
-			if id == jobID {
-				break
-			}
-
-			// This is not the first CreateStats job running. This job should fail
-			// so that the earlier job can succeed.
-			return stats.ConcurrentCreateStatsError
-		}
+	if exists {
+		return stats.ConcurrentCreateStatsError
 	}
-	return err
+
+	return nil
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.

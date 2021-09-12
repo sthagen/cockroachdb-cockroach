@@ -14,142 +14,108 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
-	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
-	"github.com/marusama/semaphore"
 )
 
 // NewLagOperator creates a new Operator that computes window
 // function lag. outputColIdx specifies in which coldata.Vec the operator
 // should put its output (if there is no such column, a new column is appended).
 func NewLagOperator(
-	unlimitedAllocator *colmem.Allocator,
-	bufferAllocator *colmem.Allocator,
-	memoryLimit int64,
-	diskQueueCfg colcontainer.DiskQueueCfg,
-	fdSemaphore semaphore.Semaphore,
-	diskAcc *mon.BoundAccount,
-	input colexecop.Operator,
-	inputTypes []*types.T,
-	outputColIdx int,
-	partitionColIdx int,
-	argIdx int,
-	offsetIdx int,
-	defaultIdx int,
+	args *WindowArgs, argIdx int, offsetIdx int, defaultIdx int,
 ) (colexecop.Operator, error) {
 	// Allow the direct-access buffer 10% of the available memory. The rest will
 	// be given to the bufferedWindowOp queue. While it is somewhat more important
 	// for the direct-access buffer tuples to be kept in-memory, it only has to
 	// store a single column. TODO(drewk): play around with benchmarks to find a
 	// good empirically-supported fraction to use.
-	bufferMemLimit := int64(float64(memoryLimit) * 0.10)
+	bufferMemLimit := int64(float64(args.MemoryLimit) * 0.10)
+	mainMemLimit := args.MemoryLimit - bufferMemLimit
 	buffer := colexecutils.NewSpillingBuffer(
-		bufferAllocator, bufferMemLimit, diskQueueCfg, fdSemaphore, inputTypes, diskAcc, argIdx)
+		args.BufferAllocator, bufferMemLimit, args.QueueCfg,
+		args.FdSemaphore, args.InputTypes, args.DiskAcc, argIdx)
 	base := lagBase{
-		buffer:          buffer,
-		outputColIdx:    outputColIdx,
-		partitionColIdx: partitionColIdx,
-		argIdx:          argIdx,
-		offsetIdx:       offsetIdx,
-		defaultIdx:      defaultIdx,
+		partitionSeekerBase: partitionSeekerBase{
+			buffer:          buffer,
+			partitionColIdx: args.PartitionColIdx,
+		},
+		outputColIdx: args.OutputColIdx,
+		argIdx:       argIdx,
+		offsetIdx:    offsetIdx,
+		defaultIdx:   defaultIdx,
 	}
-	argType := inputTypes[argIdx]
+	argType := args.InputTypes[argIdx]
 	switch typeconv.TypeFamilyToCanonicalTypeFamily(argType.Family()) {
 	case types.BoolFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagBoolWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagBoolWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.BytesFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagBytesWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagBytesWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.DecimalFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagDecimalWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagDecimalWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.IntFamily:
 		switch argType.Width() {
 		case 16:
 			return newBufferedWindowOperator(
-				&lagInt16Window{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagInt16Window{lagBase: base}, argType, mainMemLimit), nil
 		case 32:
 			return newBufferedWindowOperator(
-				&lagInt32Window{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagInt32Window{lagBase: base}, argType, mainMemLimit), nil
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagInt64Window{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagInt64Window{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.FloatFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagFloat64Window{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagFloat64Window{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.TimestampTZFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagTimestampWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagTimestampWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.IntervalFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagIntervalWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagIntervalWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case types.JsonFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagJSONWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagJSONWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	case typeconv.DatumVecCanonicalTypeFamily:
 		switch argType.Width() {
 		case -1:
 		default:
 			return newBufferedWindowOperator(
-				&lagDatumWindow{lagBase: base}, unlimitedAllocator, memoryLimit-bufferMemLimit,
-				diskQueueCfg, fdSemaphore, diskAcc, input, inputTypes, argType, outputColIdx,
-			), nil
+				args, &lagDatumWindow{lagBase: base}, argType, mainMemLimit), nil
 		}
 	}
 	return nil, errors.Errorf("unsupported lag window operator type %s", argType.Name())
@@ -158,11 +124,9 @@ func NewLagOperator(
 // lagBase extracts common fields and methods of the lag windower
 // variations.
 type lagBase struct {
-	colexecop.InitHelper
+	partitionSeekerBase
 	colexecop.CloserHelper
 	lagComputeFields
-
-	buffer *colexecutils.SpillingBuffer
 
 	outputColIdx    int
 	partitionColIdx int
@@ -174,8 +138,7 @@ type lagBase struct {
 // lagComputeFields extracts the fields that are used to calculate lag
 // output values.
 type lagComputeFields struct {
-	partitionSize int
-	idx           int
+	idx int
 }
 
 type lagBoolWindow struct {
@@ -183,42 +146,6 @@ type lagBoolWindow struct {
 }
 
 var _ bufferedWindower = &lagBoolWindow{}
-
-func (w *lagBoolWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
 
 func (w *lagBoolWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
@@ -352,42 +279,6 @@ type lagBytesWindow struct {
 
 var _ bufferedWindower = &lagBytesWindow{}
 
-func (w *lagBytesWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
-
 func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
 		// No processing needs to be done for this portion of the current partition.
@@ -424,7 +315,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 						leadLagNulls.SetNull(i)
 						continue
 					}
-					leadLagCol.CopySlice(defaultCol, i, i, i+1)
+					val := defaultCol.Get(i)
+					leadLagCol.Set(i, val)
 					continue
 				}
 				vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -433,9 +325,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 					continue
 				}
 				col := vec.Bytes()
-				// We have to use CopySlice here because the column already has a length of
-				// n elements, and Set cannot set values before the last one.
-				leadLagCol.CopySlice(col, i, idx, idx+1)
+				val := col.Get(idx)
+				leadLagCol.Set(i, val)
 			}
 			return
 		}
@@ -450,7 +341,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 			w.idx++
 			if requestedIdx < 0 || requestedIdx >= w.partitionSize {
 				// The offset is out of range, so set the output value to the default.
-				leadLagCol.CopySlice(defaultCol, i, i, i+1)
+				val := defaultCol.Get(i)
+				leadLagCol.Set(i, val)
 				continue
 			}
 			vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -459,9 +351,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 				continue
 			}
 			col := vec.Bytes()
-			// We have to use CopySlice here because the column already has a length of
-			// n elements, and Set cannot set values before the last one.
-			leadLagCol.CopySlice(col, i, idx, idx+1)
+			val := col.Get(idx)
+			leadLagCol.Set(i, val)
 		}
 		return
 	}
@@ -475,7 +366,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 					leadLagNulls.SetNull(i)
 					continue
 				}
-				leadLagCol.CopySlice(defaultCol, i, i, i+1)
+				val := defaultCol.Get(i)
+				leadLagCol.Set(i, val)
 				continue
 			}
 			vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -484,9 +376,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 				continue
 			}
 			col := vec.Bytes()
-			// We have to use CopySlice here because the column already has a length of
-			// n elements, and Set cannot set values before the last one.
-			leadLagCol.CopySlice(col, i, idx, idx+1)
+			val := col.Get(idx)
+			leadLagCol.Set(i, val)
 		}
 		return
 	}
@@ -495,7 +386,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 		w.idx++
 		if requestedIdx < 0 || requestedIdx >= w.partitionSize {
 			// The offset is out of range, so set the output value to the default.
-			leadLagCol.CopySlice(defaultCol, i, i, i+1)
+			val := defaultCol.Get(i)
+			leadLagCol.Set(i, val)
 			continue
 		}
 		vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -504,9 +396,8 @@ func (w *lagBytesWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 			continue
 		}
 		col := vec.Bytes()
-		// We have to use CopySlice here because the column already has a length of
-		// n elements, and Set cannot set values before the last one.
-		leadLagCol.CopySlice(col, i, idx, idx+1)
+		val := col.Get(idx)
+		leadLagCol.Set(i, val)
 	}
 }
 
@@ -515,42 +406,6 @@ type lagDecimalWindow struct {
 }
 
 var _ bufferedWindower = &lagDecimalWindow{}
-
-func (w *lagDecimalWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
 
 func (w *lagDecimalWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
@@ -684,42 +539,6 @@ type lagInt16Window struct {
 
 var _ bufferedWindower = &lagInt16Window{}
 
-func (w *lagInt16Window) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
-
 func (w *lagInt16Window) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
 		// No processing needs to be done for this portion of the current partition.
@@ -851,42 +670,6 @@ type lagInt32Window struct {
 }
 
 var _ bufferedWindower = &lagInt32Window{}
-
-func (w *lagInt32Window) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
 
 func (w *lagInt32Window) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
@@ -1020,42 +803,6 @@ type lagInt64Window struct {
 
 var _ bufferedWindower = &lagInt64Window{}
 
-func (w *lagInt64Window) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
-
 func (w *lagInt64Window) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
 		// No processing needs to be done for this portion of the current partition.
@@ -1187,42 +934,6 @@ type lagFloat64Window struct {
 }
 
 var _ bufferedWindower = &lagFloat64Window{}
-
-func (w *lagFloat64Window) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
 
 func (w *lagFloat64Window) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
@@ -1356,42 +1067,6 @@ type lagTimestampWindow struct {
 
 var _ bufferedWindower = &lagTimestampWindow{}
 
-func (w *lagTimestampWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
-
 func (w *lagTimestampWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
 		// No processing needs to be done for this portion of the current partition.
@@ -1523,42 +1198,6 @@ type lagIntervalWindow struct {
 }
 
 var _ bufferedWindower = &lagIntervalWindow{}
-
-func (w *lagIntervalWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
 
 func (w *lagIntervalWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
@@ -1692,42 +1331,6 @@ type lagJSONWindow struct {
 
 var _ bufferedWindower = &lagJSONWindow{}
 
-func (w *lagJSONWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
-
 func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
 		// No processing needs to be done for this portion of the current partition.
@@ -1764,7 +1367,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 						leadLagNulls.SetNull(i)
 						continue
 					}
-					leadLagCol.CopySlice(defaultCol, i, i, i+1)
+					val := defaultCol.Get(i)
+					leadLagCol.Set(i, val)
 					continue
 				}
 				vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -1773,9 +1377,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 					continue
 				}
 				col := vec.JSON()
-				// We have to use CopySlice here because the column already has a length of
-				// n elements, and Set cannot set values before the last one.
-				leadLagCol.CopySlice(col, i, idx, idx+1)
+				val := col.Get(idx)
+				leadLagCol.Set(i, val)
 			}
 			return
 		}
@@ -1790,7 +1393,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 			w.idx++
 			if requestedIdx < 0 || requestedIdx >= w.partitionSize {
 				// The offset is out of range, so set the output value to the default.
-				leadLagCol.CopySlice(defaultCol, i, i, i+1)
+				val := defaultCol.Get(i)
+				leadLagCol.Set(i, val)
 				continue
 			}
 			vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -1799,9 +1403,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 				continue
 			}
 			col := vec.JSON()
-			// We have to use CopySlice here because the column already has a length of
-			// n elements, and Set cannot set values before the last one.
-			leadLagCol.CopySlice(col, i, idx, idx+1)
+			val := col.Get(idx)
+			leadLagCol.Set(i, val)
 		}
 		return
 	}
@@ -1815,7 +1418,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 					leadLagNulls.SetNull(i)
 					continue
 				}
-				leadLagCol.CopySlice(defaultCol, i, i, i+1)
+				val := defaultCol.Get(i)
+				leadLagCol.Set(i, val)
 				continue
 			}
 			vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -1824,9 +1428,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 				continue
 			}
 			col := vec.JSON()
-			// We have to use CopySlice here because the column already has a length of
-			// n elements, and Set cannot set values before the last one.
-			leadLagCol.CopySlice(col, i, idx, idx+1)
+			val := col.Get(idx)
+			leadLagCol.Set(i, val)
 		}
 		return
 	}
@@ -1835,7 +1438,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 		w.idx++
 		if requestedIdx < 0 || requestedIdx >= w.partitionSize {
 			// The offset is out of range, so set the output value to the default.
-			leadLagCol.CopySlice(defaultCol, i, i, i+1)
+			val := defaultCol.Get(i)
+			leadLagCol.Set(i, val)
 			continue
 		}
 		vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -1844,9 +1448,8 @@ func (w *lagJSONWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) 
 			continue
 		}
 		col := vec.JSON()
-		// We have to use CopySlice here because the column already has a length of
-		// n elements, and Set cannot set values before the last one.
-		leadLagCol.CopySlice(col, i, idx, idx+1)
+		val := col.Get(idx)
+		leadLagCol.Set(i, val)
 	}
 }
 
@@ -1855,42 +1458,6 @@ type lagDatumWindow struct {
 }
 
 var _ bufferedWindower = &lagDatumWindow{}
-
-func (w *lagDatumWindow) seekNextPartition(
-	batch coldata.Batch, startIdx int, isPartitionStart bool,
-) (nextPartitionIdx int) {
-	n := batch.Length()
-	if w.partitionColIdx == -1 {
-		// There is only one partition, so it includes the entirety of this batch.
-		w.partitionSize += n
-		nextPartitionIdx = n
-	} else {
-		i := startIdx
-		partitionCol := batch.ColVec(w.partitionColIdx).Bool()
-		_ = partitionCol[n-1]
-		_ = partitionCol[i]
-		// Find the location of the start of the next partition (and the end of the
-		// current one).
-		for ; i < n; i++ {
-			//gcassert:bce
-			if partitionCol[i] {
-				// Don't break for the start of the current partition.
-				if !isPartitionStart || i != startIdx {
-					break
-				}
-			}
-		}
-		w.partitionSize += i - startIdx
-		nextPartitionIdx = i
-	}
-
-	// Add all tuples from the argument column that fall within the current
-	// partition to the buffer so that they can be accessed later.
-	if startIdx < nextPartitionIdx {
-		w.buffer.AppendTuples(w.Ctx, batch, startIdx, nextPartitionIdx)
-	}
-	return nextPartitionIdx
-}
 
 func (w *lagDatumWindow) processBatch(batch coldata.Batch, startIdx, endIdx int) {
 	if startIdx >= endIdx {
@@ -2014,9 +1581,7 @@ func (w *lagDatumWindow) processBatch(batch coldata.Batch, startIdx, endIdx int)
 	}
 }
 
-func (b *lagBase) transitionToProcessing() {
-
-}
+func (b *lagBase) transitionToProcessing() {}
 
 func (b *lagBase) startNewPartition() {
 	b.idx = 0

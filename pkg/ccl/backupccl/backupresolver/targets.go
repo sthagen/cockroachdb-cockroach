@@ -102,35 +102,39 @@ func (r *DescriptorResolver) LookupSchema(
 func (r *DescriptorResolver) LookupObject(
 	ctx context.Context, flags tree.ObjectLookupFlags, dbName, scName, obName string,
 ) (bool, catalog.ResolvedObjectPrefix, catalog.Descriptor, error) {
+	// LookupObject guarantees that the ResolvedObjectPrefix is always
+	// populated, even if the object itself cannot be found. This information
+	// is used to generate the appropriate error at higher level layers.
+	resolvedPrefix := catalog.ResolvedObjectPrefix{}
 	if flags.RequireMutable {
 		panic("did not expect request for mutable descriptor")
 	}
 	dbID, ok := r.DbsByName[dbName]
 	if !ok {
-		return false, catalog.ResolvedObjectPrefix{}, nil, nil
+		return false, resolvedPrefix, nil, nil
+	}
+	resolvedPrefix.Database, ok = r.DescByID[dbID].(catalog.DatabaseDescriptor)
+	if !ok {
+		return false, resolvedPrefix, nil, nil
 	}
 	scID, ok := r.SchemasByName[dbID][scName]
 	if !ok {
-		return false, catalog.ResolvedObjectPrefix{}, nil, nil
+		return false, resolvedPrefix, nil, nil
 	}
 	if scMap, ok := r.ObjsByName[dbID]; ok {
 		if objMap, ok := scMap[scName]; ok {
 			if objID, ok := objMap[obName]; ok {
-				var sc catalog.SchemaDescriptor
 				if scID == keys.PublicSchemaID {
-					sc = schemadesc.GetPublicSchema()
+					resolvedPrefix.Schema = schemadesc.GetPublicSchema()
 				} else {
-					sc, ok = r.DescByID[scID].(catalog.SchemaDescriptor)
+					resolvedPrefix.Schema, ok = r.DescByID[scID].(catalog.SchemaDescriptor)
 					if !ok {
-						return false, catalog.ResolvedObjectPrefix{}, nil, errors.AssertionFailedf(
+						return false, resolvedPrefix, nil, errors.AssertionFailedf(
 							"expected schema for ID %d, got %T", scID, r.DescByID[scID])
 					}
 				}
 
-				return true, catalog.ResolvedObjectPrefix{
-					Database: r.DescByID[dbID].(catalog.DatabaseDescriptor),
-					Schema:   sc,
-				}, r.DescByID[objID], nil
+				return true, resolvedPrefix, r.DescByID[objID], nil
 			}
 		}
 	}
@@ -367,6 +371,8 @@ func DescriptorsMatchingTargets(
 	// Process all the TABLE requests.
 	// Pulling in a table needs to pull in the underlying database too.
 	alreadyRequestedTables := make(map[descpb.ID]struct{})
+	// Process specific SCHEMAs requested for a database.
+	alreadyRequestedSchemasByDBs := make(map[descpb.ID]map[string]struct{})
 	for _, pattern := range targets.Tables {
 		var err error
 		pattern, err = pattern.NormalizeTablePattern()
@@ -428,7 +434,7 @@ func DescriptorsMatchingTargets(
 			// Get all the types used by this table.
 			desc := r.DescByID[tableDesc.GetParentID()]
 			dbDesc := desc.(catalog.DatabaseDescriptor)
-			typeIDs, err := tableDesc.GetAllReferencedTypeIDs(dbDesc, getTypeByID)
+			typeIDs, _, err := tableDesc.GetAllReferencedTypeIDs(dbDesc, getTypeByID)
 			if err != nil {
 				return ret, err
 			}
@@ -437,6 +443,10 @@ func DescriptorsMatchingTargets(
 			}
 
 		case *tree.AllTablesSelector:
+			// We should only back up targets in the scoped schema if the table
+			// pattern is fully qualified, i.e., `db.schema.*`, both the schema
+			// field and catalog field were set.
+			hasSchemaScope := p.ExplicitSchema && p.ExplicitCatalog
 			found, prefix, err := resolver.ResolveObjectNamePrefix(ctx, r, currentDatabase, searchPath, &p.ObjectNamePrefix)
 			if err != nil {
 				return ret, err
@@ -458,59 +468,98 @@ func DescriptorsMatchingTargets(
 				alreadyExpandedDBs[prefix.Database.GetID()] = struct{}{}
 			}
 
+			// If the target was fully qualified, i.e. `db.schema.*` then
+			// `hasSchemaScope` would be set to true above.
+			//
+			// After resolution if the target does not have ExplicitCatalog
+			// set to true, it means that the target was of the form `schema.*`.
+			// In this case, we want to only backup the object in the schema scope.
+			//
+			// If neither of the above cases apply, the target is of the form `db.*`.
+			// In this case we want to backup all objects in db and so `hasSchemaScope`
+			// should be set to false.
+			if !hasSchemaScope && !p.ExplicitCatalog {
+				hasSchemaScope = true
+			}
+
+			// If we are given a specified schema scope, i.e., `db.schema.*`
+			// or `schema.*`, add the schema to `alreadyRequestedSchemasByDBs`
+			if hasSchemaScope {
+				if _, ok := alreadyRequestedSchemasByDBs[dbID]; !ok {
+					scMap := make(map[string]struct{})
+					alreadyRequestedSchemasByDBs[dbID] = scMap
+				}
+				scMap := alreadyRequestedSchemasByDBs[dbID]
+				scMap[p.Schema()] = struct{}{}
+			}
 		default:
 			return ret, errors.Errorf("unknown pattern %T: %+v", pattern, pattern)
 		}
 	}
 
+	addTableDescsInSchema := func(schemas map[string]descpb.ID) error {
+		for _, id := range schemas {
+			desc := r.DescByID[id]
+			switch desc := desc.(type) {
+			case catalog.TableDescriptor:
+				if err := catalog.FilterDescriptorState(
+					desc, tree.CommonLookupFlags{},
+				); err != nil {
+					// Don't include this table in the expansion since it's not in a valid
+					// state. Silently fail since this table was not directly requested,
+					// but was just part of an expansion.
+					continue
+				}
+				if _, ok := alreadyRequestedTables[id]; !ok {
+					ret.Descs = append(ret.Descs, desc)
+				}
+				// If this table is a member of a user defined schema, then request the
+				// user defined schema.
+				if desc.GetParentSchemaID() != keys.PublicSchemaID {
+					// Note, that although we're processing the database expansions,
+					// since the table is in a PUBLIC state, we also expect the schema
+					// to be in a similar state.
+					if err := maybeAddSchemaDesc(desc.GetParentSchemaID(), true /* requirePublic */); err != nil {
+						return err
+					}
+				}
+				// Get all the types used by this table.
+				dbRaw := r.DescByID[desc.GetParentID()]
+				dbDesc := dbRaw.(catalog.DatabaseDescriptor)
+				typeIDs, _, err := desc.GetAllReferencedTypeIDs(dbDesc, getTypeByID)
+				if err != nil {
+					return err
+				}
+				for _, id := range typeIDs {
+					maybeAddTypeDesc(id)
+				}
+			case catalog.TypeDescriptor:
+				maybeAddTypeDesc(desc.GetID())
+			}
+		}
+		return nil
+	}
+
 	// Then process the database expansions.
 	for dbID := range alreadyExpandedDBs {
-		for schemaName, schemas := range r.ObjsByName[dbID] {
-			schemaID, err := getSchemaIDByName(schemaName, dbID)
-			if err != nil {
-				return ret, err
+		if requestedSchemas, ok := alreadyRequestedSchemasByDBs[dbID]; !ok {
+			for schemaName, schemas := range r.ObjsByName[dbID] {
+				schemaID, err := getSchemaIDByName(schemaName, dbID)
+				if err != nil {
+					return ret, err
+				}
+				if err := maybeAddSchemaDesc(schemaID, false /* requirePublic */); err != nil {
+					return ret, err
+				}
+				if err := addTableDescsInSchema(schemas); err != nil {
+					return ret, err
+				}
 			}
-			if err := maybeAddSchemaDesc(schemaID, false /* requirePublic */); err != nil {
-				return ret, err
-			}
-
-			for _, id := range schemas {
-				desc := r.DescByID[id]
-				switch desc := desc.(type) {
-				case catalog.TableDescriptor:
-					if err := catalog.FilterDescriptorState(
-						desc, tree.CommonLookupFlags{},
-					); err != nil {
-						// Don't include this table in the expansion since it's not in a valid
-						// state. Silently fail since this table was not directly requested,
-						// but was just part of an expansion.
-						continue
-					}
-					if _, ok := alreadyRequestedTables[id]; !ok {
-						ret.Descs = append(ret.Descs, desc)
-					}
-					// If this table is a member of a user defined schema, then request the
-					// user defined schema.
-					if desc.GetParentSchemaID() != keys.PublicSchemaID {
-						// Note, that although we're processing the database expansions,
-						// since the table is in a PUBLIC state, we also expect the schema
-						// to be in a similar state.
-						if err := maybeAddSchemaDesc(desc.GetParentSchemaID(), true /* requirePublic */); err != nil {
-							return ret, err
-						}
-					}
-					// Get all the types used by this table.
-					dbRaw := r.DescByID[desc.GetParentID()]
-					dbDesc := dbRaw.(catalog.DatabaseDescriptor)
-					typeIDs, err := desc.GetAllReferencedTypeIDs(dbDesc, getTypeByID)
-					if err != nil {
-						return ret, err
-					}
-					for _, id := range typeIDs {
-						maybeAddTypeDesc(id)
-					}
-				case catalog.TypeDescriptor:
-					maybeAddTypeDesc(desc.GetID())
+		} else {
+			for schemaName := range requestedSchemas {
+				schemas := r.ObjsByName[dbID][schemaName]
+				if err := addTableDescsInSchema(schemas); err != nil {
+					return ret, err
 				}
 			}
 		}
@@ -526,8 +575,11 @@ func LoadAllDescs(
 	var allDescs []catalog.Descriptor
 	if err := db.Txn(
 		ctx,
-		func(ctx context.Context, txn *kv.Txn) (err error) {
-			txn.SetFixedTimestamp(ctx, asOf)
+		func(ctx context.Context, txn *kv.Txn) error {
+			err := txn.SetFixedTimestamp(ctx, asOf)
+			if err != nil {
+				return err
+			}
 			allDescs, err = catalogkv.GetAllDescriptors(
 				ctx, txn, codec, true, /* shouldRunPostDeserializationChanges */
 			)

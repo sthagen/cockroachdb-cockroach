@@ -67,6 +67,7 @@ func initCLIDefaults() {
 	setProxyContextDefaults()
 	setTestDirectorySvrContextDefaults()
 	setUserfileContextDefaults()
+	setCertContextDefaults()
 
 	initPreFlagsDefaults()
 
@@ -106,6 +107,7 @@ func setServerContextDefaults() {
 	serverCfg.GoroutineDumpDirName = ""
 	serverCfg.HeapProfileDirName = ""
 	serverCfg.CPUProfileDirName = ""
+	serverCfg.InflightTraceDirName = ""
 
 	serverCfg.AutoInitializeCluster = false
 	serverCfg.KVConfig.ReadyFn = nil
@@ -149,6 +151,8 @@ type cliContext struct {
 	clientConnPort string
 
 	// certPrincipalMap is the cert-principal:db-principal map.
+	// This configuration flag is only used for client commands that establish
+	// a connection to a server.
 	certPrincipalMap []string
 
 	// for CLI commands that use the SQL interface, these parameters
@@ -232,6 +236,35 @@ func setSQLConnContextDefaults() {
 	sqlConnCtx.DebugMode = false
 	sqlConnCtx.Echo = false
 	sqlConnCtx.EnableServerExecutionTimings = false
+}
+
+// certCtx captures the command-line parameters of the various `cert` commands.
+// See below for defaults.
+var certCtx struct {
+	certsDir              string
+	caKey                 string
+	keySize               int
+	caCertificateLifetime time.Duration
+	certificateLifetime   time.Duration
+	allowCAKeyReuse       bool
+	overwriteFiles        bool
+	generatePKCS8Key      bool
+	// certPrincipalMap is the cert-principal:db-principal map.
+	// This configuration flag is only used for 'cert' commands
+	// that generate certificates.
+	certPrincipalMap []string
+}
+
+func setCertContextDefaults() {
+	certCtx.certsDir = base.DefaultCertsDirectory
+	certCtx.caKey = ""
+	certCtx.keySize = defaultKeySize
+	certCtx.caCertificateLifetime = defaultCALifetime
+	certCtx.certificateLifetime = defaultCertLifetime
+	certCtx.allowCAKeyReuse = false
+	certCtx.overwriteFiles = false
+	certCtx.generatePKCS8Key = false
+	certCtx.certPrincipalMap = nil
 }
 
 var sqlExecCtx = clisqlexec.Context{
@@ -597,6 +630,8 @@ func setProxyContextDefaults() {
 	proxyContext.ValidateAccessInterval = 30 * time.Second
 	proxyContext.PollConfigInterval = 30 * time.Second
 	proxyContext.DrainTimeout = 0
+	proxyContext.ThrottlePolicy.Capacity = 600
+	proxyContext.ThrottlePolicy.FillPeriod = time.Minute
 }
 
 var testDirectorySvrContext struct {

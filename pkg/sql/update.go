@@ -41,6 +41,8 @@ type updateNode struct {
 	run updateRun
 }
 
+var _ mutationPlanNode = &updateNode{}
+
 // updateRun contains the run-time state of updateNode during local execution.
 type updateRun struct {
 	tu         tableUpdater
@@ -173,7 +175,8 @@ func (u *updateNode) BatchedNext(params runParams) (bool, error) {
 		}
 
 		// Are we done yet with the current batch?
-		if u.run.tu.currentBatchSize >= u.run.tu.maxBatchSize {
+		if u.run.tu.currentBatchSize >= u.run.tu.maxBatchSize ||
+			u.run.tu.b.ApproximateMutationBytes() >= u.run.tu.maxBatchByteSize {
 			break
 		}
 	}
@@ -189,6 +192,7 @@ func (u *updateNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	if lastBatch {
+		u.run.tu.setRowsWrittenLimit(params.extendedEvalCtx.SessionData())
 		if err := u.run.tu.finalize(params.ctx); err != nil {
 			return false, err
 		}
@@ -197,10 +201,7 @@ func (u *updateNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	// Possibly initiate a run of CREATE STATISTICS.
-	params.ExecCfg().StatsRefresher.NotifyMutation(
-		u.run.tu.tableDesc().GetID(),
-		u.run.tu.lastBatchSize,
-	)
+	params.ExecCfg().StatsRefresher.NotifyMutation(u.run.tu.tableDesc(), u.run.tu.lastBatchSize)
 
 	return u.run.tu.lastBatchSize > 0, nil
 }
@@ -368,6 +369,10 @@ func (u *updateNode) Close(ctx context.Context) {
 	u.run.tu.close(ctx)
 	*u = updateNode{}
 	updateNodePool.Put(u)
+}
+
+func (u *updateNode) rowsWritten() int64 {
+	return u.run.tu.rowsWritten
 }
 
 func (u *updateNode) enableAutoCommit() {

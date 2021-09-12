@@ -28,10 +28,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
+	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -55,6 +57,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -70,8 +74,16 @@ import (
 // node throwaway clusters and consequently this variable is only used for
 // the start-single-node command.
 //
+// To be able to visualize the timeseries data properly, a mapping file must be
+// provided as well. This maps StoreIDs to the owning NodeID, i.e. the file
+// looks like this (if s1 is on n3 and s2 is on n4):
+// 1: 3
+// 2: 4
+// [...]
+//
 // See #64329 for details.
 var debugTSImportFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_FILE", "")
+var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", debugTSImportFile+".yaml")
 
 // startCmd starts a node by initializing the stores and joining
 // the cluster.
@@ -91,7 +103,7 @@ To initialize the cluster, use 'cockroach init'.
 `,
 	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 --join=host:port,[host:port]`,
 	Args:    cobra.NoArgs,
-	RunE:    maybeShoutError(MaybeDecorateGRPCError(runStartJoin)),
+	RunE:    clierrorplus.MaybeShoutError(clierrorplus.MaybeDecorateError(runStartJoin)),
 }
 
 // startSingleNodeCmd starts a node by initializing the stores.
@@ -106,7 +118,7 @@ replication disabled (replication factor = 1).
 `,
 	Example: `  cockroach start-single-node --insecure --store=attrs=ssd,path=/mnt/ssd1`,
 	Args:    cobra.NoArgs,
-	RunE:    maybeShoutError(MaybeDecorateGRPCError(runStartSingleNode)),
+	RunE:    clierrorplus.MaybeShoutError(clierrorplus.MaybeDecorateError(runStartSingleNode)),
 }
 
 // StartCmds lists the commands that start KV nodes as a server.
@@ -120,7 +132,7 @@ var serverCmds = append(StartCmds, mtStartSQLCmd)
 // customLoggingSetupCmds lists the commands that call setupLogging()
 // after other types of configuration.
 var customLoggingSetupCmds = append(
-	serverCmds, debugCheckLogConfigCmd, demoCmd, mtStartSQLProxyCmd, mtTestDirectorySvr,
+	serverCmds, debugCheckLogConfigCmd, demoCmd, mtStartSQLProxyCmd, mtTestDirectorySvr, statementBundleRecreateCmd,
 )
 
 func initBlockProfile() {
@@ -150,6 +162,21 @@ func initMutexProfile() {
 	d := envutil.EnvOrDefaultInt("COCKROACH_MUTEX_PROFILE_RATE",
 		1000 /* 1 sample per 1000 mutex contention events */)
 	runtime.SetMutexProfileFraction(d)
+}
+
+func initTraceDir(ctx context.Context, dir string) {
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		// This is possible when running with only in-memory stores;
+		// in that case the start-up code sets the output directory
+		// to the current directory (.). If running the process
+		// from a directory which is not writable, we won't
+		// be able to create a sub-directory here.
+		log.Warningf(ctx, "cannot create trace dir; traces will not be dumped: %+v", err)
+		return
+	}
 }
 
 var cacheSizeValue = newBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
@@ -269,7 +296,10 @@ func runStartSingleNode(cmd *cobra.Command, args []string) error {
 
 	// Allow passing in a timeseries file.
 	if debugTSImportFile != "" {
-		serverCfg.TestingKnobs.Server = &server.TestingKnobs{ImportTimeseriesFile: debugTSImportFile}
+		serverCfg.TestingKnobs.Server = &server.TestingKnobs{
+			ImportTimeseriesFile:        debugTSImportFile,
+			ImportTimeseriesMappingFile: debugTSImportMappingFile,
+		}
 	}
 
 	return runStart(cmd, args, true /*startSingleNode*/)
@@ -330,6 +360,16 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 				log.DumpStacks(context.Background())
 			}
 		}()
+	}
+
+	// Check for stores with full disks and exit with an informative exit
+	// code. This needs to happen early during start, before we perform any
+	// writes to the filesystem including log rotation. We need to guarantee
+	// that the process continues to exit with the Disk Full exit code. A
+	// flapping exit code can affect alerting, including the alerting
+	// performed within CockroachCloud.
+	if err := exitIfDiskFull(serverCfg.Stores.Specs); err != nil {
+		return err
 	}
 
 	// Set up a cancellable context for the entire start command.
@@ -688,7 +728,7 @@ If problems persist, please see %s.`
 			buf.Printf("storage engine: \t%s\n", &serverCfg.StorageEngine)
 			nodeID := s.NodeID()
 			if initialStart {
-				if nodeID == server.FirstNodeID {
+				if nodeID == kvserver.FirstNodeID {
 					buf.Printf("status:\tinitialized new cluster\n")
 				} else {
 					buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
@@ -963,7 +1003,7 @@ func clientFlagsRPC() string {
 func reportConfiguration(ctx context.Context) {
 	serverCfg.Report(ctx)
 	if envVarsUsed := envutil.GetEnvVarsUsed(); len(envVarsUsed) > 0 {
-		log.Ops.Infof(ctx, "using local environment variables: %s", strings.Join(envVarsUsed, ", "))
+		log.Ops.Infof(ctx, "using local environment variables:\n%s", redact.Join("\n", envVarsUsed))
 	}
 	// If a user ever reports "bad things have happened", any
 	// troubleshooting steps will want to rule out that the user was
@@ -998,6 +1038,46 @@ func maybeWarnMemorySizes(ctx context.Context) {
 				sqlSizeValue, cacheSizeValue, humanizeutil.IBytes(maxRecommendedMem))
 		}
 	}
+}
+
+func exitIfDiskFull(specs []base.StoreSpec) error {
+	var cause error
+	var ballastPaths []string
+	var ballastMissing bool
+	for _, spec := range specs {
+		isDiskFull, err := storage.IsDiskFull(vfs.Default, spec)
+		if err != nil {
+			return err
+		}
+		if !isDiskFull {
+			continue
+		}
+		path := base.EmergencyBallastFile(vfs.Default.PathJoin, spec.Path)
+		ballastPaths = append(ballastPaths, path)
+		if _, err := vfs.Default.Stat(path); oserror.IsNotExist(err) {
+			ballastMissing = true
+		}
+		cause = errors.CombineErrors(cause, errors.Newf(`store %s: out of disk space`, spec.Path))
+	}
+	if cause == nil {
+		return nil
+	}
+
+	// TODO(jackson): Link to documentation surrounding the ballast.
+
+	err := clierror.NewError(cause, exit.DiskFull())
+	if ballastMissing {
+		return errors.WithHint(err, `At least one ballast file is missing.
+You may need to replace this node because there is
+insufficient disk space to start.`)
+	}
+
+	ballastPathsStr := strings.Join(ballastPaths, "\n")
+	err = errors.WithHintf(err, `Deleting or truncating the ballast file(s) at
+%s
+may reclaim enough space to start. Proceed with caution. Complete
+disk space exhaustion may result in node loss.`, ballastPathsStr)
+	return err
 }
 
 // setupAndInitializeLoggingAndProfiling does what it says on the label.
@@ -1060,6 +1140,7 @@ func setupAndInitializeLoggingAndProfiling(
 	info := build.GetInfo()
 	log.Ops.Infof(ctx, "%s", info.Short())
 
+	initTraceDir(ctx, serverCfg.InflightTraceDirName)
 	initCPUProfile(ctx, serverCfg.CPUProfileDirName, serverCfg.Settings)
 	initBlockProfile()
 	initMutexProfile()

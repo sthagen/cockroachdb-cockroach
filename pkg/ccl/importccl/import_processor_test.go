@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -36,8 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -87,7 +87,7 @@ func TestConverterFlushesBatches(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	tests := []testSpec{
 		newTestSpec(ctx, t, csvFormat(), "testdata/csv/data-0"),
@@ -114,7 +114,9 @@ func TestConverterFlushesBatches(t *testing.T) {
 				}
 
 				kvCh := make(chan row.KVBatch, batchSize)
-				conv, err := makeInputConverter(ctx, converterSpec, &evalCtx, kvCh, nil /* seqChunkProvider */)
+				semaCtx := tree.MakeSemaContext()
+				conv, err := makeInputConverter(ctx, &semaCtx, converterSpec, &evalCtx, kvCh,
+					nil /* seqChunkProvider */)
 				if err != nil {
 					t.Fatalf("makeInputConverter() error = %v", err)
 				}
@@ -192,7 +194,7 @@ func (r *errorReportingRowReceiver) ProducerDone() {}
 // A do nothing bulk adder implementation.
 type doNothingKeyAdder struct {
 	onKeyAdd func(key roachpb.Key)
-	onFlush  func()
+	onFlush  func(summary roachpb.BulkOpSummary)
 }
 
 var _ kvserverbase.BulkAdder = &doNothingKeyAdder{}
@@ -205,16 +207,16 @@ func (a *doNothingKeyAdder) Add(_ context.Context, k roachpb.Key, _ []byte) erro
 }
 func (a *doNothingKeyAdder) Flush(_ context.Context) error {
 	if a.onFlush != nil {
-		a.onFlush()
+		a.onFlush(roachpb.BulkOpSummary{})
 	}
 	return nil
 }
 
-func (*doNothingKeyAdder) IsEmpty() bool                     { return true }
-func (*doNothingKeyAdder) CurrentBufferFill() float32        { return 0 }
-func (*doNothingKeyAdder) GetSummary() roachpb.BulkOpSummary { return roachpb.BulkOpSummary{} }
-func (*doNothingKeyAdder) Close(_ context.Context)           {}
-func (a *doNothingKeyAdder) SetOnFlush(f func())             { a.onFlush = f }
+func (*doNothingKeyAdder) IsEmpty() bool                                { return true }
+func (*doNothingKeyAdder) CurrentBufferFill() float32                   { return 0 }
+func (*doNothingKeyAdder) GetSummary() roachpb.BulkOpSummary            { return roachpb.BulkOpSummary{} }
+func (*doNothingKeyAdder) Close(_ context.Context)                      {}
+func (a *doNothingKeyAdder) SetOnFlush(f func(_ roachpb.BulkOpSummary)) { a.onFlush = f }
 
 var eofOffset int64 = math.MaxInt64
 
@@ -223,7 +225,7 @@ func TestImportIgnoresProcessedFiles(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
@@ -324,7 +326,7 @@ func TestImportHonorsResumePosition(t *testing.T) {
 	pkBulkAdder := &doNothingKeyAdder{}
 	ctx := context.Background()
 
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
@@ -452,7 +454,7 @@ func TestImportHandlesDuplicateKVs(t *testing.T) {
 
 	batchSize := 13
 	defer row.TestingSetDatumRowConverterBatchSize(batchSize)()
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
@@ -670,7 +672,6 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 		jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
 
 			resumer := raw.(*importResumer)
-			resumer.testingKnobs.ignoreProtectedTimestamps = true
 			resumer.testingKnobs.alwaysFlushJobProgress = true
 			resumer.testingKnobs.afterImport = func(summary backupccl.RowCount) error {
 				importSummary = summary
@@ -714,7 +715,7 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	js := queryJobUntil(t, sqlDB.DB, jobID, func(js jobState) bool { return js.prog.ResumePos[0] > 0 })
 
 	// Pause the job;
-	if err := registry.PauseRequested(ctx, nil, jobID); err != nil {
+	if err := registry.PauseRequested(ctx, nil, jobID, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Send cancellation and unblock breakpoint.
@@ -777,7 +778,6 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 		jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
 			resumer := raw.(*importResumer)
 			resumer.testingKnobs.alwaysFlushJobProgress = true
-			resumer.testingKnobs.ignoreProtectedTimestamps = true
 			resumer.testingKnobs.afterImport = func(summary backupccl.RowCount) error {
 				importSummary = summary
 				return nil
@@ -816,7 +816,7 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	proceedImport := controllerBarrier.Enter()
 
 	// Pause the job;
-	if err := registry.PauseRequested(ctx, nil, jobID); err != nil {
+	if err := registry.PauseRequested(ctx, nil, jobID, ""); err != nil {
 		t.Fatal(err)
 	}
 

@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
+	apd "github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -494,7 +494,102 @@ func (s *adminServer) databaseDetailsHelper(
 	if err != nil {
 		return nil, err
 	}
+
+	if req.IncludeStats {
+		tableSpans, err := s.getDatabaseTableSpans(ctx, userName, req.Database, resp.TableNames)
+		if err != nil {
+			return nil, err
+		}
+		resp.Stats, err = s.getDatabaseStats(ctx, tableSpans)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &resp, nil
+}
+
+func (s *adminServer) getDatabaseTableSpans(
+	ctx context.Context, userName security.SQLUsername, dbName string, tableNames []string,
+) (map[string]roachpb.Span, error) {
+	tableSpans := make(map[string]roachpb.Span, len(tableNames))
+
+	for _, tableName := range tableNames {
+		fullyQualifiedTableName, err := getFullyQualifiedTableName(dbName, tableName)
+		if err != nil {
+			return nil, err
+		}
+		tableID, err := s.queryTableID(ctx, userName, dbName, fullyQualifiedTableName)
+		if err != nil {
+			return nil, s.serverError(err)
+		}
+		tableSpans[tableName] = generateTableSpan(tableID)
+	}
+	return tableSpans, nil
+}
+
+func (s *adminServer) getDatabaseStats(
+	ctx context.Context, tableSpans map[string]roachpb.Span,
+) (*serverpb.DatabaseDetailsResponse_Stats, error) {
+	var stats serverpb.DatabaseDetailsResponse_Stats
+
+	type tableStatsResponse struct {
+		name string
+		resp *serverpb.TableStatsResponse
+		err  error
+	}
+
+	responses := make(chan tableStatsResponse, len(tableSpans))
+
+	for tableName, tableSpan := range tableSpans {
+		if err := s.server.stopper.RunAsyncTask(
+			ctx, "server.adminServer: requesting table stats",
+			func(ctx context.Context) {
+				statsResponse, err := s.statsForSpan(ctx, tableSpan)
+
+				responses <- tableStatsResponse{
+					name: tableName,
+					resp: statsResponse,
+					err:  err,
+				}
+			}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Track all nodes storing databases.
+	nodeIDs := make(map[roachpb.NodeID]struct{})
+	for i := 0; i < len(tableSpans); i++ {
+		select {
+		case response := <-responses:
+			if response.err != nil {
+				stats.MissingTables = append(
+					stats.MissingTables,
+					&serverpb.DatabaseDetailsResponse_Stats_MissingTable{
+						Name:         response.name,
+						ErrorMessage: response.err.Error(),
+					})
+			} else {
+				stats.RangeCount += response.resp.RangeCount
+				stats.ApproximateDiskBytes += response.resp.ApproximateDiskBytes
+				for _, id := range response.resp.NodeIDs {
+					nodeIDs[id] = struct{}{}
+				}
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	stats.NodeIDs = make([]roachpb.NodeID, 0, len(nodeIDs))
+	for id := range nodeIDs {
+		stats.NodeIDs = append(stats.NodeIDs, id)
+	}
+	sort.Slice(stats.NodeIDs, func(i, j int) bool {
+		return stats.NodeIDs[i] < stats.NodeIDs[j]
+	})
+
+	return &stats, nil
 }
 
 // getFullyQualifiedTableName, given a database name and a tableName that either
@@ -976,9 +1071,18 @@ func (s *adminServer) statsForSpan(
 		}
 	}
 
+	nodeIDList := make([]roachpb.NodeID, 0, len(nodeIDs))
+	for id := range nodeIDs {
+		nodeIDList = append(nodeIDList, id)
+	}
+	sort.Slice(nodeIDList, func(i, j int) bool {
+		return nodeIDList[i] < nodeIDList[j]
+	})
+
 	// Construct TableStatsResponse by sending an RPC to every node involved.
 	tableStatResponse := serverpb.TableStatsResponse{
 		NodeCount: int64(len(nodeIDs)),
+		NodeIDs:   nodeIDList,
 		// TODO(mrtracy): The "RangeCount" returned by TableStats is more
 		// accurate than the "RangeCount" returned by TableDetails, because this
 		// method always consistently queries the meta2 key range for the table;
@@ -1418,8 +1522,12 @@ func (s *adminServer) getUIData(
 		query.Append("$", tree.NewDString(makeUIKey(userName, key)))
 	}
 	query.Append(");")
-	if err := query.Errors(); err != nil {
-		return nil, errors.Errorf("error constructing query: %v", err)
+	if errs := query.Errors(); len(errs) > 0 {
+		var err error
+		for _, e := range errs {
+			err = errors.CombineErrors(err, e)
+		}
+		return nil, errors.Wrap(err, "error constructing query")
 	}
 	it, err := s.server.sqlServer.internalExecutor.QueryIteratorEx(
 		ctx, "admin-getUIData", nil, /* txn */
@@ -2070,7 +2178,7 @@ func (s *adminServer) DecommissionStatus(
 
 	// If no nodeIDs given, use all nodes.
 	if len(nodeIDs) == 0 {
-		ns, err := s.server.status.Nodes(ctx, &serverpb.NodesRequest{})
+		ns, err := s.server.status.ListNodesInternal(ctx, &serverpb.NodesRequest{})
 		if err != nil {
 			return nil, errors.Wrap(err, "loading node statuses")
 		}

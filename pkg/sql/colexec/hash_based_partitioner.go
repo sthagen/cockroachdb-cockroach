@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/marusama/semaphore"
 )
 
@@ -120,7 +121,7 @@ type hashBasedPartitioner struct {
 	colexecop.CloserHelper
 
 	unlimitedAllocator                 *colmem.Allocator
-	name                               string
+	name                               redact.SafeString
 	state                              hashBasedPartitionerState
 	inputs                             []colexecop.Operator
 	inputTypes                         [][]*types.T
@@ -209,7 +210,7 @@ func newHashBasedPartitioner(
 	unlimitedAllocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
 	args *colexecargs.NewColOperatorArgs,
-	name string,
+	name redact.SafeString,
 	inputs []colexecop.Operator,
 	inputTypes [][]*types.T,
 	hashCols [][]uint32,
@@ -370,12 +371,10 @@ func (op *hashBasedPartitioner) partitionBatch(
 			colVecs := scratchBatch.ColVecs()
 			op.unlimitedAllocator.PerformOperation(colVecs, func() {
 				for i, colvec := range colVecs {
-					colvec.Copy(coldata.CopySliceArgs{
-						SliceArgs: coldata.SliceArgs{
-							Src:       batch.ColVec(i),
-							Sel:       sel,
-							SrcEndIdx: len(sel),
-						},
+					colvec.Copy(coldata.SliceArgs{
+						Src:       batch.ColVec(i),
+						Sel:       sel,
+						SrcEndIdx: len(sel),
 					})
 				}
 				scratchBatch.SetLength(len(sel))
@@ -538,7 +537,7 @@ StateChanged:
 				if partitionInfo.memSize <= op.maxPartitionSizeToProcessUsingMain {
 					log.VEventf(op.Ctx, 2,
 						`%s processes partition with idx %d of size %s using the "main" strategy`,
-						op.name, partitionIdx, humanizeutil.IBytes(partitionInfo.memSize),
+						op.name, partitionIdx, redact.SafeString(humanizeutil.IBytes(partitionInfo.memSize)),
 					)
 					for i := range op.partitionedInputs {
 						op.partitionedInputs[i].partitionIdx = partitionIdx

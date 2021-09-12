@@ -1264,7 +1264,10 @@ func TestSelectPartitionExprs(t *testing.T) {
 		{`p33p44,p335p445,p33dp44d`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
 	}
 
-	evalCtx := &tree.EvalContext{Codec: keys.SystemSQLCodec}
+	evalCtx := &tree.EvalContext{
+		Codec:    keys.SystemSQLCodec,
+		Settings: cluster.MakeTestingClusterSettings(),
+	}
 	for _, test := range tests {
 		t.Run(test.partitions, func(t *testing.T) {
 			var partNames tree.NameList
@@ -1421,7 +1424,7 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
 
 	// Get the zone config corresponding to the table.
 	table := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
-	kv, err := kvDB.Get(ctx, config.MakeZoneKey(config.SystemTenantObjectID(table.GetID())))
+	kv, err := kvDB.Get(ctx, config.MakeZoneKey(keys.SystemSQLCodec, table.GetID()))
 	if err != nil {
 		t.Fatal(err)
 	}

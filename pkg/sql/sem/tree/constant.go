@@ -18,11 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -448,9 +447,9 @@ func (expr *StrVal) RawString() string {
 func (expr *StrVal) Format(ctx *FmtCtx) {
 	buf, f := &ctx.Buffer, ctx.flags
 	if expr.scannedAsBytes {
-		lex.EncodeSQLBytes(buf, expr.s)
+		lexbase.EncodeSQLBytes(buf, expr.s)
 	} else {
-		lex.EncodeSQLStringWithFlags(buf, expr.s, f.EncodeFlags())
+		lexbase.EncodeSQLStringWithFlags(buf, expr.s, f.EncodeFlags())
 	}
 }
 
@@ -575,7 +574,16 @@ func (expr *StrVal) ResolveAsType(
 		return ParseDByte(expr.s)
 
 	default:
-		val, dependsOnContext, err := ParseAndRequireString(typ, expr.s, dummyParseTimeContext{})
+		ptCtx := simpleParseTimeContext{
+			// We can return any time, but not the zero value - it causes an error when
+			// parsing "yesterday".
+			RelativeParseTime: time.Date(2000, time.January, 2, 3, 4, 5, 0, time.UTC),
+		}
+		if semaCtx != nil {
+			ptCtx.DateStyle = semaCtx.DateStyle
+			ptCtx.IntervalStyle = semaCtx.IntervalStyle
+		}
+		val, dependsOnContext, err := ParseAndRequireString(typ, expr.s, ptCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -591,23 +599,4 @@ func (expr *StrVal) ResolveAsType(
 		c := NewTypedCastExpr(&expr.resString, typ)
 		return c.TypeCheck(ctx, semaCtx, typ)
 	}
-}
-
-// dummyParseTimeContext is a ParseTimeContext when used for parsing timestamps
-// during type-checking. Note that results that depend on the context are not
-// retained in the AST.
-type dummyParseTimeContext struct{}
-
-var _ ParseTimeContext = dummyParseTimeContext{}
-
-// We can return any time, but not the zero value - it causes an error when
-// parsing "yesterday".
-var dummyTime = time.Date(2000, time.January, 2, 3, 4, 5, 0, time.UTC)
-
-func (dummyParseTimeContext) GetRelativeParseTime() time.Time {
-	return dummyTime
-}
-
-func (dummyParseTimeContext) GetIntervalStyle() duration.IntervalStyle {
-	return duration.IntervalStyle_POSTGRES
 }

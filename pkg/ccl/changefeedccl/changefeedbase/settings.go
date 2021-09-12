@@ -9,9 +9,11 @@
 package changefeedbase
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/errors"
 )
 
 // TableDescriptorPollInterval controls how fast table descriptors are polled. A
@@ -88,4 +90,71 @@ var ScanRequestLimit = settings.RegisterIntSetting(
 	"changefeed.backfill.concurrent_scan_requests",
 	"number of concurrent scan requests per node issued during a backfill",
 	0,
+)
+
+// SinkThrottleConfig describes throttling configuration for the sink.
+// 0 values for any of the settings disable that setting.
+type SinkThrottleConfig struct {
+	// MessageRate sets approximate messages/s limit.
+	MessageRate float64 `json:",omitempty"`
+	// MessageBurst sets burst budget for messages/s.
+	MessageBurst float64 `json:",omitempty"`
+	// ByteRate sets approximate bytes/second limit.
+	ByteRate float64 `json:",omitempty"`
+	// RateBurst sets burst budget in bytes/s.
+	ByteBurst float64 `json:",omitempty"`
+	// FlushRate sets approximate flushes/s limit.
+	FlushRate float64 `json:",omitempty"`
+	// FlushBurst sets burst budget for flushes/s.
+	FlushBurst float64 `json:",omitempty"`
+}
+
+// NodeSinkThrottleConfig is the node wide throttling configuration for changefeeds.
+var NodeSinkThrottleConfig = func() *settings.StringSetting {
+	s := settings.RegisterValidatedStringSetting(
+		"changefeed.node_throttle_config",
+		"specifies node level throttling configuration for all changefeeeds",
+		"",
+		validateSinkThrottleConfig,
+	)
+	s.SetVisibility(settings.Public)
+	s.SetReportable(true)
+	return s
+}()
+
+func validateSinkThrottleConfig(values *settings.Values, configStr string) error {
+	if configStr == "" {
+		return nil
+	}
+	var config = &SinkThrottleConfig{}
+	return json.Unmarshal([]byte(configStr), config)
+}
+
+// MinHighWaterMarkCheckpointAdvance specifies the minimum amount of time the
+// changefeed high water mark must advance for it to be eligible for checkpointing.
+var MinHighWaterMarkCheckpointAdvance = settings.RegisterDurationSetting(
+	"changefeed.min_highwater_advance",
+	"minimum amount of time the changefeed high water mark must advance "+
+		"for it to be eligible for checkpointing; Default of 0 will checkpoint every time frontier "+
+		"advances, as long as the rate of checkpointing keeps up with the rate of frontier changes",
+	0,
+	settings.NonNegativeDuration,
+)
+
+// EventMemoryMultiplier is the multiplier for the amount of memory needed to process an event.
+//
+// Memory accounting is hard.  Furthermore, during the lifetime of the event, the
+// amount of resources used to process such event varies. So, instead of coming up
+// with complex schemes to accurately measure and adjust current memory usage,
+// we'll request the amount of memory multiplied by this fudge factor.
+var EventMemoryMultiplier = settings.RegisterFloatSetting(
+	"changefeed.event_memory_multiplier",
+	"the amount of memory required to process an event is multiplied by this factor",
+	3,
+	func(v float64) error {
+		if v < 1 {
+			return errors.New("changefeed.event_memory_multiplier must be at least 1")
+		}
+		return nil
+	},
 )

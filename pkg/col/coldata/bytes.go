@@ -11,6 +11,7 @@
 package coldata
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"unsafe"
@@ -383,6 +384,9 @@ const FlatBytesOverhead = int64(unsafe.Sizeof(Bytes{}))
 
 // Size returns the total size of the receiver in bytes.
 func (b *Bytes) Size() int64 {
+	if b == nil {
+		return 0
+	}
 	return FlatBytesOverhead +
 		int64(cap(b.data)) +
 		int64(cap(b.offsets))*memsize.Int32
@@ -399,6 +403,61 @@ func (b *Bytes) ProportionalSize(n int64) int64 {
 	return FlatBytesOverhead + int64(len(b.data[b.offsets[0]:b.offsets[n]])) + n*memsize.Int32
 }
 
+// ElemSize returns the size in bytes of the []byte elem at the given index.
+// Panics if passed an invalid element.
+func (b *Bytes) ElemSize(idx int) int64 {
+	if idx < 0 || idx >= b.Len() {
+		colexecerror.InternalError(
+			errors.AssertionFailedf("called ElemSize with invalid index: %d", idx))
+	}
+	return int64(b.offsets[idx+1] - b.offsets[idx])
+}
+
+// Abbreviated returns a uint64 slice where each uint64 represents the first
+// eight bytes of each []byte. It is used for byte comparison fast paths.
+//
+// Given Bytes b, and abbr = b.Abbreviated():
+//
+//   - abbr[i] > abbr[j] iff b.Get(i) > b.Get(j)
+//   - abbr[i] < abbr[j] iff b.Get(i) < b.Get(j)
+//   - If abbr[i] == abbr[j], it is unknown if b.Get(i) is greater than, less
+//     than, or equal to b.Get(j). A full comparison of all bytes in each is
+//     required.
+//
+func (b *Bytes) Abbreviated() []uint64 {
+	r := make([]uint64, b.Len())
+	for i := range r {
+		bs := b.Get(i)
+		r[i] = abbreviate(bs)
+	}
+	return r
+}
+
+// abbreviate interprets up to the first 8 bytes of the slice as a big-endian
+// uint64. If the slice has less than 8 bytes, the value returned is the same as
+// if the slice was filled to 8 bytes with zero value bytes. For example:
+//
+//   abbreviate([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
+//     => 1
+//
+//   abbreviate([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00})
+//     => 256
+//
+//   abbreviate([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
+//     => 256
+//
+func abbreviate(bs []byte) uint64 {
+	if len(bs) >= 8 {
+		return binary.BigEndian.Uint64(bs)
+	}
+	var v uint64
+	for _, b := range bs {
+		v <<= 8
+		v |= uint64(b)
+	}
+	return v << uint(8*(8-len(bs)))
+}
+
 // Reset resets the underlying Bytes for reuse.
 // TODO(asubiotto): Move towards removing Set in favor of AppendVal. At that
 // point we can truncate the offsets slice.
@@ -408,6 +467,36 @@ func (b *Bytes) Reset() {
 	}
 	b.data = b.data[:0]
 	b.maxSetLength = 0
+}
+
+// ResetForAppend is similar to Reset, but it also resets the offsets slice so
+// that future calls to AppendSlice or AppendVal will append starting from index
+// zero. TODO(drewk): once Set is removed, this can just be Reset.
+func (b *Bytes) ResetForAppend() {
+	b.Reset()
+	// The first offset indicates where the first element will start.
+	b.offsets = b.offsets[:1]
+}
+
+// Truncate truncates the underlying bytes to the given length. This allows Set
+// to be called at or beyond the given length. If the length of the bytes is
+// already less than or equal to the given length, Truncate is a no-op.
+func (b *Bytes) Truncate(length int) {
+	if b.isWindow {
+		panic("Truncate is called on a window into Bytes")
+	}
+	if length < 0 {
+		panic(fmt.Sprintf("length out of range: %d", length))
+	}
+	if length > b.Len() {
+		// This is a no-op.
+		return
+	}
+	// Ensure that calling Truncate with a length greater than maxSetLength does
+	// not invalidate the non-decreasing invariant.
+	b.UpdateOffsetsToBeNonDecreasing(length)
+	b.data = b.data[:b.offsets[length]]
+	b.maxSetLength = length
 }
 
 // String is used for debugging purposes.

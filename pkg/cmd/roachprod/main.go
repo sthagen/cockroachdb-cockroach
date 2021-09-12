@@ -31,6 +31,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	cld "github.com/cockroachdb/cockroach/pkg/cmd/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
 	rperrors "github.com/cockroachdb/cockroach/pkg/cmd/roachprod/errors"
@@ -74,6 +75,7 @@ The above commands will create a "local" 3 node cluster, start a cockroach
 cluster on these nodes, run a sql command on the 2nd node, stop, wipe and
 destroy the cluster.
 `,
+	Version: "details:\n" + build.GetInfo().Long(),
 }
 
 var (
@@ -88,6 +90,7 @@ var (
 	listJSON          bool
 	listMine          bool
 	secure            = false
+	extraSSHOptions   = ""
 	nodeEnv           = []string{
 		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
 		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
@@ -95,6 +98,7 @@ var (
 	nodeArgs          []string
 	tag               string
 	external          = false
+	certsDir          string
 	adminurlOpen      = false
 	adminurlPath      = ""
 	adminurlIPs       = false
@@ -180,7 +184,8 @@ Available clusters:
 	}
 	c.Nodes = nodes
 	c.Secure = secure
-	c.Env = strings.Join(nodeEnv, " ")
+	c.CertsDir = certsDir
+	c.Env = nodeEnv
 	c.Args = nodeArgs
 	if tag != "" {
 		c.Tag = "/" + tag
@@ -335,6 +340,10 @@ Cloud Clusters
   the cloud provider's documentation for details on the machine types
   available.
 
+  The underlying filesystem can be provided using the --filesystem flag.
+  Use --filesystem=zfs, for zfs, and --filesystem=ext4, for ext4. The default
+  file system is ext4. The filesystem flag only works on gce currently.
+
 Local Clusters
 
   A local cluster stores the per-node data in ${HOME}/local on the machine
@@ -385,6 +394,16 @@ Local Clusters
 
 			// If the local cluster is being created, force the local Provider to be used
 			createVMOpts.VMProviders = []string{local.ProviderName}
+		}
+
+		if createVMOpts.SSDOpts.FileSystem == vm.Zfs {
+			for _, provider := range createVMOpts.VMProviders {
+				if provider != gce.ProviderName {
+					return fmt.Errorf(
+						"creating a node with --filesystem=zfs is currently only supported on gce",
+					)
+				}
+			}
 		}
 
 		fmt.Printf("Creating cluster %s with %d nodes\n", clusterName, numNodes)
@@ -1214,12 +1233,12 @@ the 'zfs rollback' command:
 
 		var fsCmd string
 		switch fs := args[1]; fs {
-		case "zfs":
-			if err := install.Install(c, []string{"zfs"}); err != nil {
+		case vm.Zfs:
+			if err := install.Install(c, []string{vm.Zfs}); err != nil {
 				return err
 			}
 			fsCmd = `sudo zpool create -f data1 -m /mnt/data1 /dev/sdb`
-		case "ext4":
+		case vm.Ext4:
 			fsCmd = `sudo mkfs.ext4 -F /dev/sdb && sudo mount -o defaults /dev/sdb /mnt/data1`
 		default:
 			return fmt.Errorf("unknown filesystem %q", fs)
@@ -1259,7 +1278,7 @@ var runCmd = &cobra.Command{
 		// Use "ssh" if an interactive session was requested (i.e. there is no
 		// remote command to run).
 		if len(args) == 1 {
-			return c.SSH(nil, args[1:])
+			return c.SSH(strings.Split(extraSSHOptions, " "), args[1:])
 		}
 
 		cmd := strings.TrimSpace(strings.Join(args[1:], " "))
@@ -1784,6 +1803,16 @@ var ipCmd = &cobra.Command{
 	}),
 }
 
+var versionCmd = &cobra.Command{
+	Use:   `version`,
+	Short: `print version information`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		info := build.GetInfo()
+		fmt.Println(info.Long())
+		return nil
+	},
+}
+
 func main() {
 	// The commands are displayed in the order they are added to rootCmd. Note
 	// that gcCmd and adminurlCmd contain a trailing \n in their Short help in
@@ -1820,6 +1849,7 @@ func main() {
 		logsCmd,
 		pprofCmd,
 		cachedHostsCmd,
+		versionCmd,
 	)
 	rootCmd.BashCompletionFunction = fmt.Sprintf(`__custom_func()
 	{
@@ -1871,6 +1901,8 @@ func main() {
 		"lifetime", "l", 12*time.Hour, "Lifetime of the cluster")
 	createCmd.Flags().BoolVar(&createVMOpts.SSDOpts.UseLocalSSD,
 		"local-ssd", true, "Use local SSD")
+	createCmd.Flags().StringVar(&createVMOpts.SSDOpts.FileSystem,
+		"filesystem", vm.Ext4, "The underlying file system(ext4/zfs). ext4 is used by default.")
 	createCmd.Flags().BoolVar(&createVMOpts.SSDOpts.NoExt4Barrier,
 		"local-ssd-no-ext4-barrier", true,
 		`Mount the local SSD with the "-o nobarrier" flag. `+
@@ -1926,6 +1958,8 @@ func main() {
 
 	pgurlCmd.Flags().BoolVar(
 		&external, "external", false, "return pgurls for external connections")
+	pgurlCmd.Flags().StringVar(
+		&certsDir, "certs-dir", "./certs", "cert dir to use for secure connections")
 
 	pprofCmd.Flags().DurationVar(
 		&pprofOptions.duration, "duration", 30*time.Second, "Duration of profile to capture")
@@ -1941,6 +1975,8 @@ func main() {
 
 	runCmd.Flags().BoolVar(
 		&secure, "secure", false, "use a secure cluster")
+	runCmd.Flags().StringVarP(
+		&extraSSHOptions, "ssh-options", "O", "", "extra args to pass to ssh")
 
 	startCmd.Flags().IntVarP(&numRacks,
 		"racks", "r", 0, "the number of racks to partition the nodes into")

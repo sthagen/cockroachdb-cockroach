@@ -137,6 +137,8 @@ var (
 	// key info, such as the txn ID in the case of a transaction record.
 	LocalRangePrefix = roachpb.Key(makeKey(LocalPrefix, roachpb.RKey("k")))
 	LocalRangeMax    = LocalRangePrefix.PrefixEnd()
+	// LocalRangeProbeSuffix is the suffix for keys for probing.
+	LocalRangeProbeSuffix = roachpb.RKey("prbe")
 	// LocalQueueLastProcessedSuffix is the suffix for replica queue state keys.
 	LocalQueueLastProcessedSuffix = roachpb.RKey("qlpt")
 	// LocalRangeDescriptorSuffix is the suffix for keys storing
@@ -250,7 +252,7 @@ var (
 	// NodeLivenessKeyMax is the maximum value for any node liveness key.
 	NodeLivenessKeyMax = NodeLivenessPrefix.PrefixEnd()
 	//
-	// BootstrapVersion is the key at which clusters bootstrapped with a version
+	// BootstrapVersionKey is the key at which clusters bootstrapped with a version
 	// > 1.0 persist the version at which they were bootstrapped.
 	BootstrapVersionKey = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("bootstrap-version")))
 	//
@@ -285,11 +287,14 @@ var (
 	//
 	// TODO(nvanbenschoten): Figure out what to do with all of these. At a
 	// minimum, prefix them all with "System".
-	//
+
 	// TableDataMin is the start of the range of table data keys.
 	TableDataMin = SystemSQLCodec.TablePrefix(0)
-	// TableDataMin is the end of the range of table data keys.
+	// TableDataMax is the end of the range of table data keys.
 	TableDataMax = SystemSQLCodec.TablePrefix(math.MaxUint32).PrefixEnd()
+	// ScratchRangeMin is a key used in tests to write arbitrary data without
+	// overlapping with meta, system or tenant ranges.
+	ScratchRangeMin = TableDataMax
 	//
 	// SystemConfigSplitKey is the key to split at immediately prior to the
 	// system config span. NB: Split keys need to be valid column keys.
@@ -404,12 +409,17 @@ const (
 	JoinTokensTableID                   = 41
 	StatementStatisticsTableID          = 42
 	TransactionStatisticsTableID        = 43
+	DatabaseRoleSettingsTableID         = 44
+	TenantUsageTableID                  = 45
+	SQLInstancesTableID                 = 46
+	SpanConfigurationsTableID           = 47
 
 	// CommentType is type for system.comments
 	DatabaseCommentType = 0
 	TableCommentType    = 1
 	ColumnCommentType   = 2
 	IndexCommentType    = 3
+	SchemaCommentType   = 4
 )
 
 const (

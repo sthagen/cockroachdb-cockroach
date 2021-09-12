@@ -38,6 +38,18 @@ func (h Header) WriteTimestamp() hlc.Timestamp {
 	return ts
 }
 
+// RequiredFrontier returns the largest timestamp at which the request may read
+// values when performing a read-only operation. For non-transactional requests,
+// this is the batch timestamp. For transactional requests, this is the maximum
+// of the transaction's read timestamp, its write timestamp, and its global
+// uncertainty limit.
+func (h Header) RequiredFrontier() hlc.Timestamp {
+	if h.Txn != nil {
+		return h.Txn.RequiredFrontier()
+	}
+	return h.Timestamp
+}
+
 // SetActiveTimestamp sets the correct timestamp at which the request is to be
 // carried out. For transactional requests, ba.Timestamp must be zero initially
 // and it will be set to txn.ReadTimestamp (note though this mostly impacts
@@ -62,6 +74,7 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 		// When not transactional, allow empty timestamp and use nowFn instead
 		if ba.Timestamp.IsEmpty() {
 			ba.Timestamp = nowFn()
+			ba.TimestampFromServerClock = true
 		}
 	}
 	return nil
@@ -135,12 +148,6 @@ func (ba *BatchRequest) IsReadOnly() bool {
 	return len(ba.Requests) > 0 && !ba.hasFlag(isWrite|isAdmin)
 }
 
-// RequiresLeaseHolder returns true if the request can only be served by the
-// leaseholders of the ranges it addresses.
-func (ba *BatchRequest) RequiresLeaseHolder() bool {
-	return ba.IsLocking() || ba.Header.ReadConsistency.RequiresReadLease()
-}
-
 // IsReverse returns true iff the BatchRequest contains a reverse request.
 func (ba *BatchRequest) IsReverse() bool {
 	return ba.hasFlag(isReverse)
@@ -194,6 +201,12 @@ func (ba *BatchRequest) IsSingleTransferLeaseRequest() bool {
 	return ba.isSingleRequestWithMethod(TransferLease)
 }
 
+// IsSingleLeaseInfoRequest returns true iff the batch contains a single
+// request, and that request is a LeaseInfoRequest.
+func (ba *BatchRequest) IsSingleLeaseInfoRequest() bool {
+	return ba.isSingleRequestWithMethod(LeaseInfo)
+}
+
 // IsSinglePushTxnRequest returns true iff the batch contains a single
 // request, and that request is a PushTxn.
 func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
@@ -221,6 +234,15 @@ func (ba *BatchRequest) IsSingleAbortTxnRequest() bool {
 	return false
 }
 
+// IsSingleCommitRequest returns true iff the batch contains a single request,
+// and that request is an EndTxnRequest(commit=true).
+func (ba *BatchRequest) IsSingleCommitRequest() bool {
+	if ba.isSingleRequestWithMethod(EndTxn) {
+		return ba.Requests[0].GetInner().(*EndTxnRequest).Commit
+	}
+	return false
+}
+
 // IsSingleRefreshRequest returns true iff the batch contains a single request,
 // and that request is a RefreshRequest.
 func (ba *BatchRequest) IsSingleRefreshRequest() bool {
@@ -243,6 +265,14 @@ func (ba *BatchRequest) IsSingleComputeChecksumRequest() bool {
 // request, and that request is a CheckConsistencyRequest.
 func (ba *BatchRequest) IsSingleCheckConsistencyRequest() bool {
 	return ba.isSingleRequestWithMethod(CheckConsistency)
+}
+
+// RequiresConsensus returns true iff the batch contains a request that should
+// always force replication and proposal through raft, even if evaluation is
+// a no-op. The Barrier request requires consensus even though its evaluation
+// is a no-op.
+func (ba *BatchRequest) RequiresConsensus() bool {
+	return ba.isSingleRequestWithMethod(Barrier)
 }
 
 // IsCompleteTransaction determines whether a batch contains every write in a
@@ -587,7 +617,16 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 		req := arg.GetInner()
 		if et, ok := req.(*EndTxnRequest); ok {
 			h := req.Header()
-			s.Printf("%s(commit:%t", req.Method(), et.Commit)
+			s.Printf("%s(", req.Method())
+			if et.Commit {
+				if et.IsParallelCommit() {
+					s.Printf("parallel commit")
+				} else {
+					s.Printf("commit")
+				}
+			} else {
+				s.Printf("abort")
+			}
 			if et.InternalCommitTrigger != nil {
 				s.Printf(" %s", et.InternalCommitTrigger.Kind())
 			}
@@ -613,6 +652,16 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 	}
 	if ba.CanForwardReadTimestamp {
 		s.Printf(", [can-forward-ts]")
+	}
+	if cfg := ba.BoundedStaleness; cfg != nil {
+		s.Printf(", [bounded-staleness, min_ts_bound: %s", cfg.MinTimestampBound)
+		if cfg.MinTimestampBoundStrict {
+			s.Printf(", min_ts_bound_strict")
+		}
+		if !cfg.MaxTimestampBound.IsEmpty() {
+			s.Printf(", max_ts_bound: %s", cfg.MaxTimestampBound)
+		}
+		s.Printf("]")
 	}
 }
 

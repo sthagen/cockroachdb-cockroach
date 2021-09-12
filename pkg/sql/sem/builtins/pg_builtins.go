@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -148,7 +147,14 @@ func initPGBuiltins() {
 	}
 
 	// Make crdb_internal.create_regfoo builtins.
-	for _, typ := range []*types.T{types.RegType, types.RegProc, types.RegProcedure, types.RegClass, types.RegNamespace} {
+	for _, typ := range []*types.T{
+		types.RegClass,
+		types.RegNamespace,
+		types.RegProc,
+		types.RegProcedure,
+		types.RegRole,
+		types.RegType,
+	} {
 		typName := typ.SQLStandardName()
 		builtins["crdb_internal.create_"+typName] = makeCreateRegDef(typ)
 	}
@@ -400,11 +406,11 @@ func makePGPrivilegeInquiryDef(
 					// Remove the first argument.
 					args = args[1:]
 				} else {
-					if ctx.SessionData.User().Undefined() {
+					if ctx.SessionData().User().Undefined() {
 						// Wut... is this possible?
 						return tree.DNull, nil
 					}
-					user = ctx.SessionData.User()
+					user = ctx.SessionData().User()
 				}
 				return fn(ctx, args, user)
 			},
@@ -453,7 +459,7 @@ func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName,
 		if _, err := ctx.Planner.ResolveTableName(ctx.Ctx(), tn); err != nil {
 			return nil, err
 		}
-		if ctx.SessionData.Database != "" && ctx.SessionData.Database != string(tn.CatalogName) {
+		if ctx.SessionData().Database != "" && ctx.SessionData().Database != string(tn.CatalogName) {
 			// Postgres does not allow cross-database references in these
 			// functions, so we don't either.
 			return nil, pgerror.Newf(pgcode.FeatureNotSupported,
@@ -469,7 +475,7 @@ func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName,
 		if err != nil || r == nil {
 			return nil, err
 		}
-		db := tree.Name(ctx.SessionData.Database)
+		db := tree.Name(ctx.SessionData().Database)
 		schema := tree.Name(tree.MustBeDString(r[0]))
 		table := tree.Name(tree.MustBeDString(r[1]))
 		tn := tree.MakeTableNameWithSchema(db, schema, table)
@@ -1117,7 +1123,7 @@ SELECT description
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				oidArg := tree.MustBeDOid(args[0])
 				isVisible, exists, err := ctx.Planner.IsTableVisible(
-					ctx.Context, ctx.SessionData.Database, ctx.SessionData.SearchPath, oid.Oid(oidArg.DInt),
+					ctx.Context, ctx.SessionData().Database, ctx.SessionData().SearchPath, oid.Oid(oidArg.DInt),
 				)
 				if err != nil {
 					return nil, err
@@ -1145,7 +1151,7 @@ SELECT description
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				oidArg := tree.MustBeDOid(args[0])
 				isVisible, exists, err := ctx.Planner.IsTypeVisible(
-					ctx.Context, ctx.SessionData.Database, ctx.SessionData.SearchPath, oid.Oid(oidArg.DInt),
+					ctx.Context, ctx.SessionData().Database, ctx.SessionData().SearchPath, oid.Oid(oidArg.DInt),
 				)
 				if err != nil {
 					return nil, err
@@ -1548,13 +1554,13 @@ SELECT description
 					retNull = true
 				}
 			}
-			if len(ctx.SessionData.Database) == 0 {
+			if len(ctx.SessionData().Database) == 0 {
 				// If no database is set, return NULL.
 				retNull = true
 			}
 
 			pred := fmt.Sprintf("table_catalog = '%s' AND table_schema = '%s'",
-				ctx.SessionData.Database, schema)
+				ctx.SessionData().Database, schema)
 			return parsePrivilegeStr(args[1], pgPrivList{
 				"CREATE": func(withGrantOpt bool) (tree.Datum, error) {
 					if retNull {
@@ -1787,7 +1793,7 @@ SELECT description
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return getSessionVar(ctx, string(tree.MustBeDString(args[0])), false /* missingOk */)
 			},
-			Info:       notUsableInfo,
+			Info:       categorySystemInfo,
 			Volatility: tree.VolatilityStable,
 		},
 		tree.Overload{
@@ -1796,7 +1802,7 @@ SELECT description
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return getSessionVar(ctx, string(tree.MustBeDString(args[0])), bool(tree.MustBeDBool(args[1])))
 			},
-			Info:       notUsableInfo,
+			Info:       categorySystemInfo,
 			Volatility: tree.VolatilityStable,
 		},
 	),
@@ -1812,13 +1818,14 @@ SELECT description
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				varName := string(tree.MustBeDString(args[0]))
-				err := setSessionVar(ctx, varName, string(tree.MustBeDString(args[1])), bool(tree.MustBeDBool(args[2])))
+				newValue := string(tree.MustBeDString(args[1]))
+				err := setSessionVar(ctx, varName, newValue, bool(tree.MustBeDBool(args[2])))
 				if err != nil {
 					return nil, err
 				}
 				return getSessionVar(ctx, varName, false /* missingOk */)
 			},
-			Info:       notUsableInfo,
+			Info:       categorySystemInfo,
 			Volatility: tree.VolatilityVolatile,
 		},
 	),
@@ -1926,10 +1933,7 @@ func setSessionVar(ctx *tree.EvalContext, settingName, newVal string, isLocal bo
 	if ctx.SessionAccessor == nil {
 		return errors.AssertionFailedf("session accessor not set")
 	}
-	if isLocal {
-		return unimplemented.NewWithIssuef(32562, "transaction-scoped settings are not supported")
-	}
-	return ctx.SessionAccessor.SetSessionVar(ctx.Context, settingName, newVal)
+	return ctx.SessionAccessor.SetSessionVar(ctx.Context, settingName, newVal, isLocal)
 }
 
 // getCatalogOidForComments returns the "catalog table oid" (the oid of a
@@ -1942,6 +1946,8 @@ func getCatalogOidForComments(catalogName string) (id int, ok bool) {
 		return catconstants.PgCatalogClassTableID, true
 	case "pg_database":
 		return catconstants.PgCatalogDatabaseTableID, true
+	case "pg_description":
+		return catconstants.PgCatalogDescriptionTableID, true
 	default:
 		// We currently only support comments on pg_class objects
 		// (columns, tables) in this context.

@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,7 +35,6 @@ import (
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
 
@@ -419,32 +419,32 @@ func TestPebbleSeparatorSuccessor(t *testing.T) {
 
 }
 
-func TestPebbleDiskSlowEmit(t *testing.T) {
+func TestPebbleMetricEventListener(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	settings := cluster.MakeTestingClusterSettings()
 	MaxSyncDurationFatalOnExceeded.Override(ctx, &settings.SV, false)
-	p := newPebbleInMem(
-		context.Background(),
-		roachpb.Attributes{},
-		1<<20,   /* cacheSize */
-		512<<20, /* storeSize */
-		vfs.NewMem(),
-		"",
-		settings,
-	)
+	p, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */), Settings(settings))
+	require.NoError(t, err)
 	defer p.Close()
 
-	require.Equal(t, uint64(0), p.diskSlowCount)
-	require.Equal(t, uint64(0), p.diskStallCount)
+	require.Equal(t, int64(0), p.writeStallCount)
+	require.Equal(t, int64(0), p.diskSlowCount)
+	require.Equal(t, int64(0), p.diskStallCount)
+	p.eventListener.WriteStallBegin(pebble.WriteStallBeginInfo{})
+	require.Equal(t, int64(1), p.writeStallCount)
+	require.Equal(t, int64(0), p.diskSlowCount)
+	require.Equal(t, int64(0), p.diskStallCount)
 	p.eventListener.DiskSlow(pebble.DiskSlowInfo{Duration: 1 * time.Second})
-	require.Equal(t, uint64(1), p.diskSlowCount)
-	require.Equal(t, uint64(0), p.diskStallCount)
+	require.Equal(t, int64(1), p.writeStallCount)
+	require.Equal(t, int64(1), p.diskSlowCount)
+	require.Equal(t, int64(0), p.diskStallCount)
 	p.eventListener.DiskSlow(pebble.DiskSlowInfo{Duration: 70 * time.Second})
-	require.Equal(t, uint64(1), p.diskSlowCount)
-	require.Equal(t, uint64(1), p.diskStallCount)
+	require.Equal(t, int64(1), p.writeStallCount)
+	require.Equal(t, int64(1), p.diskSlowCount)
+	require.Equal(t, int64(1), p.diskStallCount)
 }
 
 func TestPebbleIterConsistency(t *testing.T) {
@@ -634,8 +634,8 @@ func TestSstExportFailureIntentBatching(t *testing.T) {
 			require.NoError(t, fillInData(ctx, engine, data))
 
 			destination := &MemFile{}
-			_, _, err := engine.ExportMVCCToSst(ctx, key(10), key(20000), ts(999), ts(2000),
-				true, 0, 0, true, destination)
+			_, _, _, err := engine.ExportMVCCToSst(ctx, key(10), key(20000), ts(999), ts(2000), hlc.Timestamp{},
+				true, 0, 0, false, true, destination)
 			if len(expectedIntentIndices) == 0 {
 				require.NoError(t, err)
 			} else {
@@ -662,4 +662,123 @@ func TestSstExportFailureIntentBatching(t *testing.T) {
 		expectedErrors[i] = i*2 + 1
 	}
 	t.Run("Receive no more than limit intents", checkReportedErrors(testData, expectedErrors[:MaxIntentsPerWriteIntentError.Default()]))
+}
+
+// TestExportSplitMidKey verifies that split mid key in exports will omit
+// resume timestamps where they are unnecessary e.g. when we split at the
+// new key. In this case we can safely use the SST as is without the need
+// to merge with the remaining versions of the key.
+func TestExportSplitMidKey(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
+	engine := createTestPebbleEngine()
+	defer engine.Close()
+
+	const keyValueSize = 11
+
+	var testData = []testValue{
+		value(key(1), "value1", ts(1000)),
+		value(key(2), "value2", ts(1000)),
+		value(key(2), "value3", ts(2000)),
+		value(key(3), "value4", ts(2000)),
+	}
+	require.NoError(t, fillInData(ctx, engine, testData))
+
+	for _, test := range []struct {
+		exportAll    bool
+		useTBI       bool
+		stopMidKey   bool
+		useMaxSize   bool
+		resumeCount  int
+		resumeWithTs int
+	}{
+		{false, true, false, false, 3, 0},
+		{true, true, false, false, 3, 0},
+		{false, true, true, false, 3, 0},
+		// No resume timestamps since we fall under max size criteria
+		{true, true, true, false, 3, 0},
+		{true, true, true, true, 4, 1},
+		{false, false, false, false, 3, 0},
+		{true, false, false, false, 3, 0},
+		{false, false, true, false, 3, 0},
+		// No resume timestamps since we fall under max size criteria
+		{true, false, true, false, 3, 0},
+		{true, false, true, true, 4, 1},
+	} {
+		t.Run(
+			fmt.Sprintf(
+				"exportAll=%t,useTBI=%t,stopMidKey=%t,useMaxSize=%t",
+				test.exportAll, test.useTBI, test.stopMidKey, test.useMaxSize),
+			func(t *testing.T) {
+				firstKeyTS := hlc.Timestamp{}
+				resumeKey := key(1)
+				resumeWithTs := 0
+				resumeCount := 0
+				var maxSize uint64 = 0
+				if test.useMaxSize {
+					maxSize = keyValueSize * 2
+				}
+				for !resumeKey.Equal(roachpb.Key{}) {
+					dest := &MemFile{}
+					_, resumeKey, firstKeyTS, _ = engine.ExportMVCCToSst(
+						ctx, resumeKey, key(3).Next(), hlc.Timestamp{}, hlc.Timestamp{WallTime: 9999},
+						firstKeyTS, test.exportAll, 1, maxSize, test.stopMidKey, test.useTBI, dest)
+					if !firstKeyTS.IsEmpty() {
+						resumeWithTs++
+					}
+					resumeCount++
+				}
+				require.Equal(t, test.resumeCount, resumeCount)
+				require.Equal(t, test.resumeWithTs, resumeWithTs)
+			})
+	}
+}
+
+// nonFatalLogger implements pebble.Logger by recording that a fatal log event
+// was encountered at least once. Fatal log events are downgraded to Info level.
+type nonFatalLogger struct {
+	pebble.Logger
+	t      *testing.T
+	caught atomic.Value
+}
+
+func (l *nonFatalLogger) Fatalf(format string, args ...interface{}) {
+	l.caught.Store(true)
+	l.t.Logf(format, args...)
+}
+
+func TestPebbleKeyValidationFunc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Capture fatal errors by swapping out the logger.
+	l := &nonFatalLogger{t: t}
+	opt := func(cfg *engineConfig) error {
+		cfg.Opts.Logger = l
+		return nil
+	}
+	engine := createTestPebbleEngine(opt).(*Pebble)
+	defer engine.Close()
+
+	// Write a key with an invalid version length (=1) to simulate
+	// programmer-error.
+	ek := EngineKey{
+		Key:     roachpb.Key("foo"),
+		Version: make([]byte, 1),
+	}
+
+	// Sanity check: the key should fail validation.
+	err := ek.Validate()
+	require.Error(t, err)
+
+	err = engine.PutEngineKey(ek, []byte("bar"))
+	require.NoError(t, err)
+
+	// Force a flush to trigger the compaction error.
+	err = engine.Flush()
+	require.NoError(t, err)
+
+	// A fatal error was captured by the logger.
+	require.True(t, l.caught.Load().(bool))
 }

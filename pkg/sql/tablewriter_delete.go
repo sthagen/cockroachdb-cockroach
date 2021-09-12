@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -137,6 +138,7 @@ func (td *tableDeleter) deleteAllRowsScan(
 		// control whether we perform locking implicitly during DELETEs.
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		td.lockTimeout,
 		false, /* isCheck */
 		td.alloc,
 		// TODO(bulkio): this might need a memory monitor for the slow case of truncate.
@@ -146,7 +148,7 @@ func (td *tableDeleter) deleteAllRowsScan(
 		return resume, err
 	}
 	if err := rf.StartScan(
-		ctx, td.txn, roachpb.Spans{resume}, true /* limit batches */, 0, traceKV, td.forceProductionBatchSizes,
+		ctx, td.txn, roachpb.Spans{resume}, rowinfra.DefaultBatchBytesLimit, rowinfra.NoRowLimit, traceKV, td.forceProductionBatchSizes,
 	); err != nil {
 		return resume, err
 	}
@@ -273,6 +275,7 @@ func (td *tableDeleter) deleteIndexScan(
 		// control whether we perform locking implicitly during DELETEs.
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		td.lockTimeout,
 		false, /* isCheck */
 		td.alloc,
 		// TODO(bulkio): this might need a memory monitor.
@@ -282,7 +285,7 @@ func (td *tableDeleter) deleteIndexScan(
 		return resume, err
 	}
 	if err := rf.StartScan(
-		ctx, td.txn, roachpb.Spans{resume}, true /* limit batches */, 0, traceKV, td.forceProductionBatchSizes,
+		ctx, td.txn, roachpb.Spans{resume}, rowinfra.DefaultBatchBytesLimit, rowinfra.NoRowLimit, traceKV, td.forceProductionBatchSizes,
 	); err != nil {
 		return resume, err
 	}

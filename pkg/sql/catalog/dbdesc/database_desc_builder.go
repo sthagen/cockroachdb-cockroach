@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -58,8 +59,15 @@ func (ddb *databaseDescriptorBuilder) RunPostDeserializationChanges(
 	_ context.Context, _ catalog.DescGetter,
 ) error {
 	ddb.maybeModified = protoutil.Clone(ddb.original).(*descpb.DatabaseDescriptor)
-	ddb.changed = descpb.MaybeFixPrivileges(ddb.maybeModified.ID, ddb.maybeModified.ID,
-		&ddb.maybeModified.Privileges, privilege.Database)
+
+	privsChanged := catprivilege.MaybeFixPrivileges(
+		&ddb.maybeModified.Privileges,
+		descpb.InvalidID,
+		descpb.InvalidID,
+		privilege.Database,
+		ddb.maybeModified.GetName())
+	removedSelfEntryInSchemas := maybeRemoveDroppedSelfEntryFromSchemas(ddb.maybeModified)
+	ddb.changed = privsChanged || removedSelfEntryInSchemas
 	return nil
 }
 
@@ -128,6 +136,7 @@ func MaybeWithDatabaseRegionConfig(regionConfig *multiregion.RegionConfig) NewIn
 			SurvivalGoal:  regionConfig.SurvivalGoal(),
 			PrimaryRegion: regionConfig.PrimaryRegion(),
 			RegionEnumID:  regionConfig.RegionEnumID(),
+			Placement:     regionConfig.Placement(),
 		}
 	}
 }
@@ -141,6 +150,7 @@ func NewInitial(
 		id,
 		name,
 		descpb.NewDefaultPrivilegeDescriptor(owner),
+		catprivilege.MakeNewDefaultPrivilegeDescriptor(),
 		options...,
 	)
 }
@@ -148,13 +158,18 @@ func NewInitial(
 // NewInitialWithPrivileges constructs a new Mutable for an initial version
 // from an id and name and custom privileges.
 func NewInitialWithPrivileges(
-	id descpb.ID, name string, privileges *descpb.PrivilegeDescriptor, options ...NewInitialOption,
+	id descpb.ID,
+	name string,
+	privileges *descpb.PrivilegeDescriptor,
+	defaultPrivileges *descpb.DefaultPrivilegeDescriptor,
+	options ...NewInitialOption,
 ) *Mutable {
 	ret := descpb.DatabaseDescriptor{
-		Name:       name,
-		ID:         id,
-		Version:    1,
-		Privileges: privileges,
+		Name:              name,
+		ID:                id,
+		Version:           1,
+		Privileges:        privileges,
+		DefaultPrivileges: defaultPrivileges,
 	}
 	for _, option := range options {
 		option(&ret)

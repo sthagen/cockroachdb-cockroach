@@ -17,10 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/authentication"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -31,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -162,7 +164,7 @@ func getOwnerOfDesc(desc catalog.Descriptor) security.SQLUsername {
 	if owner.Undefined() {
 		// If the descriptor is ownerless and the descriptor is part of the system db,
 		// node is the owner.
-		if desc.GetID() == keys.SystemDatabaseID || desc.GetParentID() == keys.SystemDatabaseID {
+		if catalog.IsSystemDescriptor(desc) {
 			owner = security.NodeUserName()
 		} else {
 			// This check is redundant in this case since admin already has privilege
@@ -307,32 +309,53 @@ func (p *planner) RequireAdminRole(ctx context.Context, action string) error {
 	return nil
 }
 
+// MemberOfWithAdminOption is a wrapper around the MemberOfWithAdminOption
+// method.
+func (p *planner) MemberOfWithAdminOption(
+	ctx context.Context, member security.SQLUsername,
+) (map[security.SQLUsername]bool, error) {
+	return MemberOfWithAdminOption(
+		ctx,
+		p.execCfg,
+		p.ExecCfg().InternalExecutor,
+		p.Descriptors(),
+		p.Txn(),
+		member,
+	)
+}
+
 // MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct and indirect) and
 // returns a map of "role" -> "isAdmin".
 // The "isAdmin" flag applies to both direct and indirect members.
 // Requires a valid transaction to be open.
-func (p *planner) MemberOfWithAdminOption(
-	ctx context.Context, member security.SQLUsername,
+func MemberOfWithAdminOption(
+	ctx context.Context,
+	execCfg *ExecutorConfig,
+	ie sqlutil.InternalExecutor,
+	descsCol *descs.Collection,
+	txn *kv.Txn,
+	member security.SQLUsername,
 ) (map[security.SQLUsername]bool, error) {
-	if p.txn == nil || !p.txn.IsOpen() {
+	if txn == nil || !txn.IsOpen() {
 		return nil, errors.AssertionFailedf("cannot use MemberOfWithAdminoption without a txn")
 	}
 
-	roleMembersCache := p.execCfg.RoleMemberCache
+	roleMembersCache := execCfg.RoleMemberCache
 
 	// Lookup table version.
-	_, tableDesc, err := p.Descriptors().GetImmutableTableByName(
+	_, tableDesc, err := descsCol.GetImmutableTableByName(
 		ctx,
-		p.txn,
+		txn,
 		&roleMembersTableName,
-		p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/),
+		tree.ObjectLookupFlagsWithRequired(),
 	)
 	if err != nil {
 		return nil, err
 	}
+
 	tableVersion := tableDesc.GetVersion()
 	if tableDesc.IsUncommittedVersion() {
-		return p.resolveMemberOfWithAdminOption(ctx, member, p.txn)
+		return resolveMemberOfWithAdminOption(ctx, member, ie, txn)
 	}
 
 	// We loop in case the table version changes while we're looking up memberships.
@@ -359,7 +382,7 @@ func (p *planner) MemberOfWithAdminOption(
 		}
 
 		// Lookup memberships outside the lock.
-		memberships, err := p.resolveMemberOfWithAdminOption(ctx, member, p.txn)
+		memberships, err := resolveMemberOfWithAdminOption(ctx, member, ie, txn)
 		if err != nil {
 			return nil, err
 		}
@@ -399,8 +422,8 @@ func (p *planner) MemberOfWithAdminOption(
 // TODO(mberhault): this is the naive way and performs a full lookup for each user,
 // we could save detailed memberships (as opposed to fully expanded) and reuse them
 // across users. We may then want to lookup more than just this user.
-func (p *planner) resolveMemberOfWithAdminOption(
-	ctx context.Context, member security.SQLUsername, txn *kv.Txn,
+func resolveMemberOfWithAdminOption(
+	ctx context.Context, member security.SQLUsername, ie sqlutil.InternalExecutor, txn *kv.Txn,
 ) (map[security.SQLUsername]bool, error) {
 	ret := map[security.SQLUsername]bool{}
 
@@ -418,7 +441,7 @@ func (p *planner) resolveMemberOfWithAdminOption(
 		}
 		visited[m] = struct{}{}
 
-		it, err := p.ExecCfg().InternalExecutor.QueryIterator(
+		it, err := ie.QueryIterator(
 			ctx, "expand-roles", txn, lookupRolesStmt, m.Normalized(),
 		)
 		if err != nil {
@@ -474,7 +497,7 @@ func (p *planner) HasRoleOption(ctx context.Context, roleOption roleoption.Optio
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		fmt.Sprintf(
 			`SELECT 1 from %s WHERE option = '%s' AND username = $1 LIMIT 1`,
-			authentication.RoleOptionsTableName, roleOption.String()), user.Normalized())
+			sessioninit.RoleOptionsTableName, roleOption.String()), user.Normalized())
 	if err != nil {
 		return false, err
 	}

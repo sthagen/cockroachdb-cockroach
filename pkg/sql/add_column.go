@@ -37,7 +37,6 @@ func (p *planner) addColumnImpl(
 		d.Computed.Expr = schemaexpr.MaybeRewriteComputedColumn(d.Computed.Expr, params.SessionData())
 	}
 
-	version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
 	toType, err := tree.ResolveType(params.ctx, d.Type, params.p.semaCtx.GetTypeResolver())
 	if err != nil {
 		return err
@@ -49,17 +48,8 @@ func (p *planner) addColumnImpl(
 			"VECTOR column types are unsupported",
 		)
 	}
-	if supported, err := isTypeSupportedInVersion(version, toType); err != nil {
-		return err
-	} else if !supported {
-		return pgerror.Newf(
-			pgcode.FeatureNotSupported,
-			"type %s is not supported until version upgrade is finalized",
-			toType.SQLString(),
-		)
-	}
 
-	newDef, seqPrefix, seqName, seqOpts, err := params.p.processSerialInColumnDef(params.ctx, d, tn)
+	newDef, seqPrefix, seqName, seqOpts, err := params.p.processSerialLikeInColumnDef(params.ctx, d, tn)
 	if err != nil {
 		return err
 	}

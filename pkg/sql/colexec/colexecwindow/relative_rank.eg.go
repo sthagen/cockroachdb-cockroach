@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
-	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -34,43 +33,35 @@ import (
 // outputColIdx specifies in which coldata.Vec the operator should put its
 // output (if there is no such column, a new column is appended).
 func NewRelativeRankOperator(
-	unlimitedAllocator *colmem.Allocator,
-	memoryLimit int64,
-	diskQueueCfg colcontainer.DiskQueueCfg,
-	fdSemaphore semaphore.Semaphore,
-	input colexecop.Operator,
-	inputTypes []*types.T,
+	args *WindowArgs,
 	windowFn execinfrapb.WindowerSpec_WindowFunc,
 	orderingCols []execinfrapb.Ordering_Column,
-	outputColIdx int,
-	partitionColIdx int,
-	peersColIdx int,
-	diskAcc *mon.BoundAccount,
 ) (colexecop.Operator, error) {
 	if len(orderingCols) == 0 {
 		constValue := float64(0)
 		if windowFn == execinfrapb.WindowerSpec_CUME_DIST {
 			constValue = 1
 		}
-		return colexecbase.NewConstOp(unlimitedAllocator, input, types.Float, constValue, outputColIdx)
+		return colexecbase.NewConstOp(
+			args.MainAllocator, args.Input, types.Float, constValue, args.OutputColIdx)
 	}
 	rrInitFields := relativeRankInitFields{
 		rankInitFields: rankInitFields{
-			OneInputNode:    colexecop.NewOneInputNode(input),
-			allocator:       unlimitedAllocator,
-			outputColIdx:    outputColIdx,
-			partitionColIdx: partitionColIdx,
-			peersColIdx:     peersColIdx,
+			OneInputNode:    colexecop.NewOneInputNode(args.Input),
+			allocator:       args.MainAllocator,
+			outputColIdx:    args.OutputColIdx,
+			partitionColIdx: args.PartitionColIdx,
+			peersColIdx:     args.PeersColIdx,
 		},
-		memoryLimit:  memoryLimit,
-		diskQueueCfg: diskQueueCfg,
-		fdSemaphore:  fdSemaphore,
-		inputTypes:   inputTypes,
-		diskAcc:      diskAcc,
+		memoryLimit:  args.MemoryLimit,
+		diskQueueCfg: args.QueueCfg,
+		fdSemaphore:  args.FdSemaphore,
+		inputTypes:   args.InputTypes,
+		diskAcc:      args.DiskAcc,
 	}
 	switch windowFn {
 	case execinfrapb.WindowerSpec_PERCENT_RANK:
-		if partitionColIdx != tree.NoColumnIdx {
+		if args.PartitionColIdx != tree.NoColumnIdx {
 			return &percentRankWithPartitionOp{
 				relativeRankInitFields: rrInitFields,
 			}, nil
@@ -79,7 +70,7 @@ func NewRelativeRankOperator(
 			relativeRankInitFields: rrInitFields,
 		}, nil
 	case execinfrapb.WindowerSpec_CUME_DIST:
-		if partitionColIdx != tree.NoColumnIdx {
+		if args.PartitionColIdx != tree.NoColumnIdx {
 			return &cumeDistWithPartitionOp{
 				relativeRankInitFields: rrInitFields,
 			}, nil
@@ -199,7 +190,6 @@ func (r *percentRankNoPartitionOp) Init(ctx context.Context) {
 			DiskAcc:            r.diskAcc,
 		},
 	)
-	r.scratch = r.allocator.NewMemBatchWithFixedCapacity(r.inputTypes, coldata.BatchSize())
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
 	// All rank functions start counting from 1. Before we assign the rank to a
 	// tuple in the batch, we first increment r.rank, so setting this
@@ -251,24 +241,8 @@ func (r *percentRankNoPartitionOp) Next() coldata.Batch {
 			// All tuples belong to the same partition, so we need to fully consume
 			// the input before we can proceed.
 
-			sel := batch.Selection()
 			// First, we buffer up all of the tuples.
-			r.scratch.ResetInternalBatch()
-			r.allocator.PerformOperation(r.scratch.ColVecs(), func() {
-				for colIdx, vec := range r.scratch.ColVecs() {
-					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       batch.ColVec(colIdx),
-								Sel:       sel,
-								SrcEndIdx: n,
-							},
-						},
-					)
-				}
-				r.scratch.SetLength(n)
-			})
-			r.bufferedTuples.Enqueue(r.Ctx, r.scratch)
+			r.bufferedTuples.Enqueue(r.Ctx, batch)
 
 			// Then, we need to update the sizes of the partitions.
 			// There is a single partition in the whole input.
@@ -291,11 +265,9 @@ func (r *percentRankNoPartitionOp) Next() coldata.Batch {
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
 					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       r.scratch.ColVec(colIdx),
-								SrcEndIdx: n,
-							},
+						coldata.SliceArgs{
+							Src:       r.scratch.ColVec(colIdx),
+							SrcEndIdx: n,
 						},
 					)
 				}
@@ -414,7 +386,6 @@ func (r *percentRankWithPartitionOp) Init(ctx context.Context) {
 			DiskAcc:            r.diskAcc,
 		},
 	)
-	r.scratch = r.allocator.NewMemBatchWithFixedCapacity(r.inputTypes, coldata.BatchSize())
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
 	// All rank functions start counting from 1. Before we assign the rank to a
 	// tuple in the batch, we first increment r.rank, so setting this
@@ -476,24 +447,10 @@ func (r *percentRankWithPartitionOp) Next() coldata.Batch {
 			// TODO(yuzefovich): we could be emitting output once we see that a new
 			// partition has begun.
 
-			sel := batch.Selection()
 			// First, we buffer up all of the tuples.
-			r.scratch.ResetInternalBatch()
-			r.allocator.PerformOperation(r.scratch.ColVecs(), func() {
-				for colIdx, vec := range r.scratch.ColVecs() {
-					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       batch.ColVec(colIdx),
-								Sel:       sel,
-								SrcEndIdx: n,
-							},
-						},
-					)
-				}
-				r.scratch.SetLength(n)
-			})
-			r.bufferedTuples.Enqueue(r.Ctx, r.scratch)
+			r.bufferedTuples.Enqueue(r.Ctx, batch)
+
+			sel := batch.Selection()
 
 			// Then, we need to update the sizes of the partitions.
 			partitionCol := batch.ColVec(r.partitionColIdx).Bool()
@@ -572,11 +529,9 @@ func (r *percentRankWithPartitionOp) Next() coldata.Batch {
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
 					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       r.scratch.ColVec(colIdx),
-								SrcEndIdx: n,
-							},
+						coldata.SliceArgs{
+							Src:       r.scratch.ColVec(colIdx),
+							SrcEndIdx: n,
 						},
 					)
 				}
@@ -714,7 +669,6 @@ func (r *cumeDistNoPartitionOp) Init(ctx context.Context) {
 			DiskAcc:            r.diskAcc,
 		},
 	)
-	r.scratch = r.allocator.NewMemBatchWithFixedCapacity(r.inputTypes, coldata.BatchSize())
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
 }
 
@@ -769,24 +723,10 @@ func (r *cumeDistNoPartitionOp) Next() coldata.Batch {
 			// All tuples belong to the same partition, so we need to fully consume
 			// the input before we can proceed.
 
-			sel := batch.Selection()
 			// First, we buffer up all of the tuples.
-			r.scratch.ResetInternalBatch()
-			r.allocator.PerformOperation(r.scratch.ColVecs(), func() {
-				for colIdx, vec := range r.scratch.ColVecs() {
-					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       batch.ColVec(colIdx),
-								Sel:       sel,
-								SrcEndIdx: n,
-							},
-						},
-					)
-				}
-				r.scratch.SetLength(n)
-			})
-			r.bufferedTuples.Enqueue(r.Ctx, r.scratch)
+			r.bufferedTuples.Enqueue(r.Ctx, batch)
+
+			sel := batch.Selection()
 
 			// Then, we need to update the sizes of the partitions.
 			// There is a single partition in the whole input.
@@ -868,11 +808,9 @@ func (r *cumeDistNoPartitionOp) Next() coldata.Batch {
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
 					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       r.scratch.ColVec(colIdx),
-								SrcEndIdx: n,
-							},
+						coldata.SliceArgs{
+							Src:       r.scratch.ColVec(colIdx),
+							SrcEndIdx: n,
 						},
 					)
 				}
@@ -1011,7 +949,6 @@ func (r *cumeDistWithPartitionOp) Init(ctx context.Context) {
 			DiskAcc:            r.diskAcc,
 		},
 	)
-	r.scratch = r.allocator.NewMemBatchWithFixedCapacity(r.inputTypes, coldata.BatchSize())
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
 }
 
@@ -1076,24 +1013,10 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 			// TODO(yuzefovich): we could be emitting output once we see that a new
 			// partition has begun.
 
-			sel := batch.Selection()
 			// First, we buffer up all of the tuples.
-			r.scratch.ResetInternalBatch()
-			r.allocator.PerformOperation(r.scratch.ColVecs(), func() {
-				for colIdx, vec := range r.scratch.ColVecs() {
-					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       batch.ColVec(colIdx),
-								Sel:       sel,
-								SrcEndIdx: n,
-							},
-						},
-					)
-				}
-				r.scratch.SetLength(n)
-			})
-			r.bufferedTuples.Enqueue(r.Ctx, r.scratch)
+			r.bufferedTuples.Enqueue(r.Ctx, batch)
+
+			sel := batch.Selection()
 
 			// Then, we need to update the sizes of the partitions.
 			partitionCol := batch.ColVec(r.partitionColIdx).Bool()
@@ -1231,11 +1154,9 @@ func (r *cumeDistWithPartitionOp) Next() coldata.Batch {
 			r.allocator.PerformOperation(r.output.ColVecs()[:len(r.inputTypes)], func() {
 				for colIdx, vec := range r.output.ColVecs()[:len(r.inputTypes)] {
 					vec.Copy(
-						coldata.CopySliceArgs{
-							SliceArgs: coldata.SliceArgs{
-								Src:       r.scratch.ColVec(colIdx),
-								SrcEndIdx: n,
-							},
+						coldata.SliceArgs{
+							Src:       r.scratch.ColVec(colIdx),
+							SrcEndIdx: n,
 						},
 					)
 				}

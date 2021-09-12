@@ -81,6 +81,7 @@ var (
 		"funcdeps":    memo.ExprFmtHideFuncDeps,
 		"ruleprops":   memo.ExprFmtHideRuleProps,
 		"stats":       memo.ExprFmtHideStats,
+		"hist":        memo.ExprFmtHideHistograms,
 		"cost":        memo.ExprFmtHideCost,
 		"qual":        memo.ExprFmtHideQualifications,
 		"scalars":     memo.ExprFmtHideScalars,
@@ -173,6 +174,10 @@ type Flags struct {
 	// SessionData.PreferLookupJoinsForFKs.
 	PreferLookupJoinsForFKs bool
 
+	// PropagateInputOrdering is the default value for
+	// SessionData.PropagateInputOrdering
+	PropagateInputOrdering bool
+
 	// Locality specifies the location of the planning node as a set of user-
 	// defined key/value pairs, ordered from most inclusive to least inclusive.
 	// If there are no tiers, then the node's location is not known. Examples:
@@ -249,14 +254,14 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 
 	// Set any OptTester-wide session flags here.
 
-	ot.evalCtx.SessionData.UserProto = security.MakeSQLUsernameFromPreNormalizedString("opttester").EncodeProto()
-	ot.evalCtx.SessionData.Database = "defaultdb"
-	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
-	ot.evalCtx.SessionData.OptimizerUseHistograms = true
-	ot.evalCtx.SessionData.OptimizerUseMultiColStats = true
-	ot.evalCtx.SessionData.LocalityOptimizedSearch = true
-	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
-	ot.evalCtx.SessionData.InsertFastPath = true
+	ot.evalCtx.SessionData().UserProto = security.MakeSQLUsernameFromPreNormalizedString("opttester").EncodeProto()
+	ot.evalCtx.SessionData().Database = "defaultdb"
+	ot.evalCtx.SessionData().ZigzagJoinEnabled = true
+	ot.evalCtx.SessionData().OptimizerUseHistograms = true
+	ot.evalCtx.SessionData().OptimizerUseMultiColStats = true
+	ot.evalCtx.SessionData().LocalityOptimizedSearch = true
+	ot.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
+	ot.evalCtx.SessionData().InsertFastPath = true
 
 	return ot
 }
@@ -475,12 +480,13 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 
 	ot.semaCtx.Placeholders = tree.PlaceholderInfo{}
 
-	ot.evalCtx.SessionData.ReorderJoinsLimit = ot.Flags.JoinLimit
-	ot.evalCtx.SessionData.PreferLookupJoinsForFKs = ot.Flags.PreferLookupJoinsForFKs
+	ot.evalCtx.SessionData().ReorderJoinsLimit = int64(ot.Flags.JoinLimit)
+	ot.evalCtx.SessionData().PreferLookupJoinsForFKs = ot.Flags.PreferLookupJoinsForFKs
+	ot.evalCtx.SessionData().PropagateInputOrdering = ot.Flags.PropagateInputOrdering
 
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
 	ot.evalCtx.Locality = ot.Flags.Locality
-	ot.evalCtx.SessionData.SaveTablesPrefix = ot.Flags.SaveTablesPrefix
+	ot.evalCtx.SessionData().SaveTablesPrefix = ot.Flags.SaveTablesPrefix
 	ot.evalCtx.Placeholders = nil
 
 	switch d.Cmd {
@@ -987,6 +993,9 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 
 	case "query-args":
 		f.QueryArgs = arg.Vals
+
+	case "preserve-input-order":
+		f.PropagateInputOrdering = true
 
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
@@ -1832,7 +1841,7 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 		colMeta := rel.Memo().Metadata().ColumnMeta(col)
 		colName := colNameGen.GenerateName(col)
 
-		columns[i].InitNonVirtual(
+		columns[i].Init(
 			i,
 			cat.StableID(i+1),
 			tree.Name(colName),
@@ -1842,6 +1851,9 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 			cat.Visible,
 			nil, /* defaultExpr */
 			nil, /* computedExpr */
+			nil, /* onUpdateExpr */
+			cat.NotGeneratedAsIdentity,
+			nil, /* generatedAsIdentitySequenceOption */
 		)
 
 		// Make sure we have estimated stats for this column.
@@ -1943,6 +1955,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 		return err
 	}
 	ot.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
+	ot.semaCtx.TypeResolver = ot.catalog
 	b := optbuilder.New(ot.ctx, &ot.semaCtx, &ot.evalCtx, ot.catalog, factory, stmt.AST)
 	return b.Build()
 }

@@ -84,9 +84,9 @@ type Reader interface {
 
 // IteratorOptions provides the ability to the caller to change how it iterates
 // the statements and transactions.
-// TODO(azhng): we want to support pagination/continuation tokens as well as
-//  different error handling behaviors when error is encountered once we start
-//  to support cluster-wide implementation of the sqlstats.Reader interface.
+// TODO(azhng): introduce StartTime and EndTime field so we can implement
+//  virtual indexes on crdb_internal.{statement,transaction}_statistics
+//  using the iterators.
 type IteratorOptions struct {
 	// SortedAppNames determines whether or not the application names will be
 	// sorted when iterating through statistics.
@@ -100,12 +100,12 @@ type IteratorOptions struct {
 // StatementVisitor is the callback that is invoked when caller iterate through
 // all statement statistics using IterateStatementStats(). If an error is
 // encountered when calling the visitor, the iteration is aborted.
-type StatementVisitor func(*roachpb.CollectedStatementStatistics) error
+type StatementVisitor func(context.Context, *roachpb.CollectedStatementStatistics) error
 
 // TransactionVisitor is the callback that is invoked when caller iterate through
 // all transaction statistics using IterateTransactionStats(). If an error is
 // encountered when calling the visitor, the iteration is aborted.
-type TransactionVisitor func(roachpb.TransactionFingerprintID, *roachpb.CollectedTransactionStatistics) error
+type TransactionVisitor func(context.Context, *roachpb.CollectedTransactionStatistics) error
 
 // AggregatedTransactionVisitor is the callback invoked when iterate through
 // transaction statistics collected at the application level using

@@ -45,12 +45,12 @@ func registerRubyPG(r registry.Registry) {
 		}
 		c.Start(ctx, c.All())
 
-		version, err := fetchCockroachVersion(ctx, c, node[0], nil)
+		version, err := fetchCockroachVersion(ctx, c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0], nil); err != nil {
+		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0]); err != nil {
 			t.Fatal(err)
 		}
 
@@ -190,7 +190,7 @@ func registerRubyPG(r registry.Registry) {
 				results.failExpectedCount++
 				results.currentFailures = append(results.currentFailures, test)
 			case !expectedFailure:
-				results.results[test] = fmt.Sprintf("--- PASS: %s - %s (unexpected)",
+				results.results[test] = fmt.Sprintf("--- FAIL: %s - %s (unexpected)",
 					test, maybeAddGithubLink(issue),
 				)
 			}

@@ -1,6 +1,10 @@
 dev build cockroach-short
 ----
-bazel build --color=yes --experimental_convenience_symlinks=ignore --config=dev //pkg/cmd/cockroach-short
+getenv PATH
+which cc
+readlink /usr/local/opt/ccache/libexec/cc
+export PATH=/usr/local/opt/make/libexec/gnubin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/go/bin:/Library/Apple/usr/bin
+bazel build --color=yes --experimental_convenience_symlinks=ignore //pkg/cmd/cockroach-short --config=dev
 bazel info workspace --color=no --config=dev
 mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no --config=dev
@@ -9,7 +13,11 @@ ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroac
 
 dev build cockroach-short --cpus=12
 ----
-bazel build --color=yes --experimental_convenience_symlinks=ignore --config=dev --local_cpu_resources=12 //pkg/cmd/cockroach-short
+getenv PATH
+which cc
+readlink /usr/local/opt/ccache/libexec/cc
+export PATH=/usr/local/opt/make/libexec/gnubin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/go/bin:/Library/Apple/usr/bin
+bazel build --color=yes --experimental_convenience_symlinks=ignore --local_cpu_resources=12 //pkg/cmd/cockroach-short --config=dev
 bazel info workspace --color=no --config=dev
 mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no --config=dev
@@ -18,7 +26,11 @@ ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroac
 
 dev build --debug cockroach-short
 ----
-bazel build --color=yes --experimental_convenience_symlinks=ignore --config=dev //pkg/cmd/cockroach-short
+getenv PATH
+which cc
+readlink /usr/local/opt/ccache/libexec/cc
+export PATH=/usr/local/opt/make/libexec/gnubin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/go/bin:/Library/Apple/usr/bin
+bazel build --color=yes --experimental_convenience_symlinks=ignore //pkg/cmd/cockroach-short --config=dev
 bazel info workspace --color=no --config=dev
 mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no --config=dev
@@ -27,7 +39,11 @@ ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroac
 
 dev build cockroach-short --remote-cache 127.0.0.1:9090
 ----
-bazel build --color=yes --experimental_convenience_symlinks=ignore --config=dev --remote_local_fallback --remote_cache=grpc://127.0.0.1:9090 --experimental_remote_downloader=grpc://127.0.0.1:9090 //pkg/cmd/cockroach-short
+getenv PATH
+which cc
+readlink /usr/local/opt/ccache/libexec/cc
+export PATH=/usr/local/opt/make/libexec/gnubin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/go/bin:/Library/Apple/usr/bin
+bazel build --color=yes --experimental_convenience_symlinks=ignore --remote_local_fallback --remote_cache=grpc://127.0.0.1:9090 --experimental_remote_downloader=grpc://127.0.0.1:9090 //pkg/cmd/cockroach-short --config=dev
 bazel info workspace --color=no --config=dev
 mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no --config=dev
@@ -36,9 +52,32 @@ ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroac
 
 dev build --skip-dev-config cockroach-short
 ----
+getenv PATH
+which cc
+readlink /usr/local/opt/ccache/libexec/cc
+export PATH=/usr/local/opt/make/libexec/gnubin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/go/bin:/Library/Apple/usr/bin
 bazel build --color=yes --experimental_convenience_symlinks=ignore //pkg/cmd/cockroach-short
 bazel info workspace --color=no
 mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no
 rm go/src/github.com/cockroachdb/cockroach/cockroach-short
 ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/cmd/cockroach-short/cockroach-short_/cockroach-short go/src/github.com/cockroachdb/cockroach/cockroach-short
+
+dev build cockroach-short --hoist-generated-code
+----
+getenv PATH
+which cc
+readlink /usr/local/opt/ccache/libexec/cc
+export PATH=/usr/local/opt/make/libexec/gnubin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/go/bin:/Library/Apple/usr/bin
+bazel build --color=yes --experimental_convenience_symlinks=ignore //pkg/cmd/cockroach-short --config=dev
+bazel info workspace --color=no --config=dev
+mkdir go/src/github.com/cockroachdb/cockroach/bin
+bazel info bazel-bin --color=no --config=dev
+rm go/src/github.com/cockroachdb/cockroach/cockroach-short
+ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/cmd/cockroach-short/cockroach-short_/cockroach-short go/src/github.com/cockroachdb/cockroach/cockroach-short
+find /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg -name *.go
+cat go/src/github.com/cockroachdb/cockroach/build/bazelutil/checked_in_genfiles.txt
+cp /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/kv/kvserver/kvserver_go_proto_/github.com/cockroachdb/cockroach/pkg/kv/kvserver/storage_services.pb.go go/src/github.com/cockroachdb/cockroach/pkg/kv/kvserver/storage_services.pb.go
+cp /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/roachpb/batch_generated-gen.go go/src/github.com/cockroachdb/cockroach/pkg/roachpb/batch_generated.go
+cp /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/sql/opt/optgen/lang/expr-gen.og.go go/src/github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/lang/expr.og.go
+cp /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/sql/opt/optgen/lang/operator-gen.og.go go/src/github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/lang/operator.og.go

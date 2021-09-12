@@ -14,14 +14,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/authentication"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
@@ -110,9 +109,13 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
-	// Reject the "public" role. It does not have an entry in the users table but is reserved.
-	if normalizedUsername.IsPublicRole() {
-		return pgerror.Newf(pgcode.ReservedName, "role name %q is reserved", security.PublicRole)
+	// Reject the reserved roles.
+	if normalizedUsername.IsReserved() {
+		return pgerror.Newf(
+			pgcode.ReservedName,
+			"role name %q is reserved",
+			normalizedUsername.Normalized(),
+		)
 	}
 
 	var hashedPassword []byte
@@ -155,7 +158,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 		opName,
 		params.p.txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-		fmt.Sprintf(`select "isRole" from %s where username = $1`, authentication.UsersTableName),
+		fmt.Sprintf(`select "isRole" from %s where username = $1`, sessioninit.UsersTableName),
 		normalizedUsername,
 	)
 	if err != nil {
@@ -174,7 +177,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 		params.ctx,
 		opName,
 		params.p.txn,
-		fmt.Sprintf("insert into %s values ($1, $2, $3)", authentication.UsersTableName),
+		fmt.Sprintf("insert into %s values ($1, $2, $3)", sessioninit.UsersTableName),
 		normalizedUsername,
 		hashedPassword,
 		n.isRole,
@@ -225,7 +228,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 		}
 	}
 
-	if authentication.CacheEnabled.Get(&params.p.ExecCfg().Settings.SV) {
+	if sessioninit.CacheEnabled.Get(&params.p.ExecCfg().Settings.SV) {
 		// Bump role-related table versions to force a refresh of AuthInfo cache.
 		if err := params.p.bumpUsersTableVersion(params.ctx); err != nil {
 			return err
@@ -321,11 +324,9 @@ func (p *planner) checkPasswordAndGetHash(
 	}
 
 	st := p.ExecCfg().Settings
-	if st.Version.IsActive(ctx, clusterversion.MinPasswordLength) {
-		if minLength := security.MinPasswordLength.Get(&st.SV); minLength >= 1 && int64(len(password)) < minLength {
-			return hashedPassword, errors.WithHintf(security.ErrPasswordTooShort,
-				"Passwords must be %d characters or longer.", minLength)
-		}
+	if minLength := security.MinPasswordLength.Get(&st.SV); minLength >= 1 && int64(len(password)) < minLength {
+		return hashedPassword, errors.WithHintf(security.ErrPasswordTooShort,
+			"Passwords must be %d characters or longer.", minLength)
 	}
 
 	hashedPassword, err = security.HashPassword(ctx, password)

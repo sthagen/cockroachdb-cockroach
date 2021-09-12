@@ -11,6 +11,7 @@ query TTTTIT
 SHOW TABLES FROM system
 ----
 public  comments                         table  NULL  0  NULL
+public  database_role_settings           table  NULL  0  NULL
 public  descriptor                       table  NULL  0  NULL
 public  eventlog                         table  NULL  0  NULL
 public  jobs                             table  NULL  0  NULL
@@ -30,12 +31,15 @@ public  role_members                     table  NULL  0  NULL
 public  role_options                     table  NULL  0  NULL
 public  scheduled_jobs                   table  NULL  0  NULL
 public  settings                         table  NULL  0  NULL
+public  span_configurations              table  NULL  0  NULL
+public  sql_instances                    table  NULL  0  NULL
 public  sqlliveness                      table  NULL  0  NULL
 public  statement_bundle_chunks          table  NULL  0  NULL
 public  statement_diagnostics            table  NULL  0  NULL
 public  statement_diagnostics_requests   table  NULL  0  NULL
 public  statement_statistics             table  NULL  0  NULL
 public  table_statistics                 table  NULL  0  NULL
+public  tenant_usage                     table  NULL  0  NULL
 public  tenants                          table  NULL  0  NULL
 public  transaction_statistics           table  NULL  0  NULL
 public  ui                               table  NULL  0  NULL
@@ -79,6 +83,10 @@ SELECT id FROM system.descriptor
 41
 42
 43
+44
+45
+46
+47
 50
 51
 52
@@ -159,15 +167,17 @@ lastUpdated  TIMESTAMP  false  NULL  ·  {primary}  false
 query TTBTTTB
 SHOW COLUMNS FROM system.jobs
 ----
-id                 INT8       false  unique_rowid()     ·  {jobs_created_by_type_created_by_id_idx,jobs_status_created_idx,primary}  false
-status             STRING     false  NULL               ·  {jobs_created_by_type_created_by_id_idx,jobs_status_created_idx,primary}  false
-created            TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx,primary}                                         false
-payload            BYTES      false  NULL               ·  {primary}                                                                 false
-progress           BYTES      true   NULL               ·  {primary}                                                                 false
-created_by_type    STRING     true   NULL               ·  {jobs_created_by_type_created_by_id_idx,primary}                          false
-created_by_id      INT8       true   NULL               ·  {jobs_created_by_type_created_by_id_idx,primary}                          false
-claim_session_id   BYTES      true   NULL               ·  {primary}                                                                 false
-claim_instance_id  INT8       true   NULL               ·  {primary}                                                                 false
+id                 INT8       false  unique_rowid()     ·  {jobs_created_by_type_created_by_id_idx,jobs_run_stats_idx,jobs_status_created_idx,primary}  false
+status             STRING     false  NULL               ·  {jobs_created_by_type_created_by_id_idx,jobs_run_stats_idx,jobs_status_created_idx,primary}  false
+created            TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_run_stats_idx,jobs_status_created_idx,primary}                                         false
+payload            BYTES      false  NULL               ·  {primary}                                                                                    false
+progress           BYTES      true   NULL               ·  {primary}                                                                                    false
+created_by_type    STRING     true   NULL               ·  {jobs_created_by_type_created_by_id_idx,primary}                                             false
+created_by_id      INT8       true   NULL               ·  {jobs_created_by_type_created_by_id_idx,primary}                                             false
+claim_session_id   BYTES      true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
+claim_instance_id  INT8       true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
+num_runs           INT8       true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
+last_run           TIMESTAMP  true   NULL               ·  {jobs_run_stats_idx,primary}                                                                 false
 
 query TTBTTTB
 SHOW COLUMNS FROM system.settings
@@ -208,6 +218,16 @@ system  public  comments                         root    GRANT
 system  public  comments                         root    INSERT
 system  public  comments                         root    SELECT
 system  public  comments                         root    UPDATE
+system  public  database_role_settings           admin   DELETE
+system  public  database_role_settings           admin   GRANT
+system  public  database_role_settings           admin   INSERT
+system  public  database_role_settings           admin   SELECT
+system  public  database_role_settings           admin   UPDATE
+system  public  database_role_settings           root    DELETE
+system  public  database_role_settings           root    GRANT
+system  public  database_role_settings           root    INSERT
+system  public  database_role_settings           root    SELECT
+system  public  database_role_settings           root    UPDATE
 system  public  descriptor                       admin   GRANT
 system  public  descriptor                       admin   SELECT
 system  public  descriptor                       root    GRANT
@@ -374,6 +394,26 @@ system  public  settings                         root    GRANT
 system  public  settings                         root    INSERT
 system  public  settings                         root    SELECT
 system  public  settings                         root    UPDATE
+system  public  span_configurations              admin   DELETE
+system  public  span_configurations              admin   GRANT
+system  public  span_configurations              admin   INSERT
+system  public  span_configurations              admin   SELECT
+system  public  span_configurations              admin   UPDATE
+system  public  span_configurations              root    DELETE
+system  public  span_configurations              root    GRANT
+system  public  span_configurations              root    INSERT
+system  public  span_configurations              root    SELECT
+system  public  span_configurations              root    UPDATE
+system  public  sql_instances                    admin   DELETE
+system  public  sql_instances                    admin   GRANT
+system  public  sql_instances                    admin   INSERT
+system  public  sql_instances                    admin   SELECT
+system  public  sql_instances                    admin   UPDATE
+system  public  sql_instances                    root    DELETE
+system  public  sql_instances                    root    GRANT
+system  public  sql_instances                    root    INSERT
+system  public  sql_instances                    root    SELECT
+system  public  sql_instances                    root    UPDATE
 system  public  sqlliveness                      admin   DELETE
 system  public  sqlliveness                      admin   GRANT
 system  public  sqlliveness                      admin   INSERT
@@ -428,6 +468,16 @@ system  public  table_statistics                 root    GRANT
 system  public  table_statistics                 root    INSERT
 system  public  table_statistics                 root    SELECT
 system  public  table_statistics                 root    UPDATE
+system  public  tenant_usage                     admin   DELETE
+system  public  tenant_usage                     admin   GRANT
+system  public  tenant_usage                     admin   INSERT
+system  public  tenant_usage                     admin   SELECT
+system  public  tenant_usage                     admin   UPDATE
+system  public  tenant_usage                     root    DELETE
+system  public  tenant_usage                     root    GRANT
+system  public  tenant_usage                     root    INSERT
+system  public  tenant_usage                     root    SELECT
+system  public  tenant_usage                     root    UPDATE
 system  public  tenants                          admin   GRANT
 system  public  tenants                          admin   SELECT
 system  public  tenants                          root    GRANT

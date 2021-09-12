@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -418,16 +419,29 @@ func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
 	require.NotNil(t, leaseholderRepl)
 
 	time.Sleep(kvserver.RaftLogQueuePendingSnapshotGracePeriod)
-	// Manually enqueue the leaseholder replica into its store's raft snapshot
-	// queue. We expect it to pick up on the fact that the non-voter on its range
-	// needs a snapshot.
-	recording, pErr, err := leaseholderStore.ManuallyEnqueue(
-		ctx, "raftsnapshot", leaseholderRepl, false, /* skipShouldQueue */
-	)
-	require.NoError(t, pErr)
-	require.NoError(t, err)
-	trace := recording.String()
-	require.Regexp(t, "streamed VIA_SNAPSHOT_QUEUE snapshot.*to.*NON_VOTER", trace)
+
+	testutils.SucceedsSoon(t, func() error {
+		// Manually enqueue the leaseholder replica into its store's raft snapshot
+		// queue. We expect it to pick up on the fact that the non-voter on its range
+		// needs a snapshot.
+		recording, pErr, err := leaseholderStore.ManuallyEnqueue(
+			ctx, "raftsnapshot", leaseholderRepl, false, /* skipShouldQueue */
+		)
+		if pErr != nil {
+			return pErr
+		}
+		if err != nil {
+			return err
+		}
+		matched, err := regexp.MatchString("streamed VIA_SNAPSHOT_QUEUE snapshot.*to.*NON_VOTER", recording.String())
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return errors.Errorf("the raft snapshot queue did not send a snapshot to the non-voter")
+		}
+		return nil
+	})
 	require.NoError(t, g.Wait())
 }
 
@@ -873,7 +887,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	tr := tc.Server(0).Tracer().(*tracing.Tracer)
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`,
 		testingTargetDuration))
-	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.close_fraction = $1`, testingCloseFraction)
+	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s'`, testingSideTransportInterval))
 	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true`)
 
 	scratchStartKey := tc.ScratchRange(t)

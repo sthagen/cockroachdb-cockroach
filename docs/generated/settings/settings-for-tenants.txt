@@ -3,6 +3,7 @@ admission.kv.enabled	boolean	false	when true, work performed by the KV layer is 
 admission.sql_kv_response.enabled	boolean	false	when true, work performed by the SQL layer when receiving a KV response is subject to admission control
 admission.sql_sql_response.enabled	boolean	false	when true, work performed by the SQL layer when receiving a DistSQL response is subject to admission control
 bulkio.stream_ingestion.minimum_flush_interval	duration	5s	the minimum timestamp between flushes; flushes may still occur if internal buffers fill up
+changefeed.node_throttle_config	string		specifies node level throttling configuration for all changefeeeds
 cloudstorage.http.custom_ca	string		custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage
 cloudstorage.timeout	duration	10m0s	the timeout for import/export storage operations
 cluster.organization	string		organization name
@@ -27,6 +28,8 @@ kv.allocator.load_based_rebalancing	enumeration	leases and replicas	whether to r
 kv.allocator.qps_rebalance_threshold	float	0.25	minimum fraction away from the mean a store's QPS (such as queries per second) can be before it is considered overfull or underfull
 kv.allocator.range_rebalance_threshold	float	0.05	minimum fraction away from the mean a store's range count can be before it is considered overfull or underfull
 kv.bulk_io_write.max_rate	byte size	1.0 TiB	the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops
+kv.bulk_sst.max_allowed_overage	byte size	64 MiB	if positive, allowed size in excess of target size for SSTs from export requests; export requests (i.e. BACKUP) may buffer up to the sum of kv.bulk_sst.target_size and kv.bulk_sst.max_allowed_overage in memory
+kv.bulk_sst.target_size	byte size	16 MiB	target size for SSTs emitted from export requests; export requests (i.e. BACKUP) may buffer up to the sum of kv.bulk_sst.target_size and kv.bulk_sst.max_allowed_overage in memory
 kv.closed_timestamp.follower_reads_enabled	boolean	true	allow (all) replicas to serve consistent historical reads based on closed timestamp information
 kv.protectedts.reconciliation.interval	duration	5m0s	the frequency for reconciling jobs with protected timestamp records
 kv.range_split.by_load_enabled	boolean	true	allow automatic splits of ranges based on where load is concentrated
@@ -35,14 +38,13 @@ kv.rangefeed.enabled	boolean	false	if set, rangefeed registration is enabled
 kv.replication_reports.interval	duration	1m0s	the frequency for generating the replication_constraint_stats, replication_stats_report and replication_critical_localities reports (set to 0 to disable)
 kv.transaction.max_intents_bytes	integer	4194304	maximum number of bytes used to track locks in transactions
 kv.transaction.max_refresh_spans_bytes	integer	256000	maximum number of bytes used to track refresh spans in serializable transactions
-security.ocsp.mode	enumeration	off	"use OCSP to check whether TLS certificates are revoked. If the OCSP
-server is unreachable, in strict mode all certificates will be rejected
-and in lax mode all certificates will be accepted. [off = 0, lax = 1, strict = 2]"
+kv.transaction.reject_over_max_intents_budget.enabled	boolean	false	if set, transactions that exceed their lock tracking budget (kv.transaction.max_intents_bytes) are rejected instead of having their lock spans imprecisely compressed
+schedules.backup.gc_protection.enabled	boolean	false	enable chaining of GC protection across backups run as part of a schedule; default is false
+security.ocsp.mode	enumeration	off	use OCSP to check whether TLS certificates are revoked. If the OCSP server is unreachable, in strict mode all certificates will be rejected and in lax mode all certificates will be accepted. [off = 0, lax = 1, strict = 2]
 security.ocsp.timeout	duration	3s	timeout before considering the OCSP server unreachable
 server.auth_log.sql_connections.enabled	boolean	false	if set, log SQL client connect and disconnect events (note: may hinder performance on loaded nodes)
 server.auth_log.sql_sessions.enabled	boolean	false	if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)
-server.authentication_cache.enabled	boolean	true	"enables a cache used during authentication to avoid lookups to system tables
-when retrieving per-user authentication-related information"
+server.authentication_cache.enabled	boolean	true	enables a cache used during authentication to avoid lookups to system tables when retrieving per-user authentication-related information
 server.clock.forward_jump_check_enabled	boolean	false	if enabled, forward clock jumps > max_offset/2 will cause a panic
 server.clock.persist_upper_bound_interval	duration	0s	the interval between persisting the wall time upper bound of the clock. The clock does not generate a wall time greater than the persisted timestamp and will panic if it sees a wall time greater than this value. When cockroach starts, it waits for the wall time to catch-up till this persisted timestamp. This guarantees monotonic wall time across server restarts. Not setting this or setting a value of 0 disables this feature.
 server.consistency_check.max_rate	byte size	8.0 MiB	the rate limit (bytes/sec) to use for consistency checks; used in conjunction with server.consistency_check.interval to control the frequency of consistency checks. Note that setting this too high can negatively impact performance.
@@ -65,18 +67,25 @@ server.shutdown.lease_transfer_wait	duration	5s	the amount of time a server wait
 server.shutdown.query_wait	duration	10s	the server will wait for at least this amount of time for active queries to finish
 server.time_until_store_dead	duration	5m0s	the time after which if there is no new gossiped information about a store, it is considered dead
 server.user_login.timeout	duration	10s	timeout after which client authentication times out if some system range is unavailable (0 = no timeout)
+server.web_session.auto_logout.timeout	duration	168h0m0s	the duration that web sessions will survive before being periodically purged, since they were last used
+server.web_session.purge.max_deletions_per_cycle	integer	10	the maximum number of old sessions to delete for each purge
+server.web_session.purge.period	duration	1h0m0s	the time until old sessions are deleted
+server.web_session.purge.ttl	duration	1h0m0s	if nonzero, entries in system.web_sessions older than this duration are periodically purged
 server.web_session_timeout	duration	168h0m0s	the duration that a newly created web session will be valid
 sql.cross_db_fks.enabled	boolean	false	if true, creating foreign key references across databases is allowed
 sql.cross_db_sequence_owners.enabled	boolean	false	if true, creating sequences owned by tables from other databases is allowed
 sql.cross_db_views.enabled	boolean	false	if true, creating views that refer to other databases is allowed
+sql.defaults.copy_partitioning_when_deinterleaving_table.enabled	boolean	false	default value for enable_copying_partitioning_when_deinterleaving_table session variable
+sql.defaults.datestyle	enumeration	iso, mdy	default value for DateStyle session setting [iso, mdy = 0, iso, dmy = 1, iso, ymd = 2]
+sql.defaults.datestyle.enabled	boolean	false	default value for datestyle_enabled session setting
 sql.defaults.default_int_size	integer	8	the size, in bytes, of an INT type
 sql.defaults.disallow_full_table_scans.enabled	boolean	false	setting to true rejects queries that have planned a full table scan
 sql.defaults.distsql	enumeration	auto	default distributed SQL execution mode [off = 0, auto = 1, on = 2]
 sql.defaults.drop_enum_value.enabled	boolean	false	default value for enable_drop_enum_value; allows for dropping enum values
 sql.defaults.experimental_alter_column_type.enabled	boolean	false	default value for experimental_alter_column_type session setting; enables the use of ALTER COLUMN TYPE for general conversions
+sql.defaults.experimental_auto_rehoming.enabled	boolean	false	default value for experimental_enable_auto_rehoming; allows for rows in REGIONAL BY ROW tables to be auto-rehomed on UPDATE
 sql.defaults.experimental_distsql_planning	enumeration	off	default experimental_distsql_planning mode; enables experimental opt-driven DistSQL planning [off = 0, on = 1]
 sql.defaults.experimental_enable_unique_without_index_constraints.enabled	boolean	false	default value for experimental_enable_unique_without_index_constraints session setting;disables unique without index constraints by default
-sql.defaults.experimental_expression_indexes.enabled	boolean	false	default value for experimental_enable_expression_indexes session setting;disables expression indexes by default
 sql.defaults.experimental_hash_sharded_indexes.enabled	boolean	false	default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default
 sql.defaults.experimental_implicit_column_partitioning.enabled	boolean	false	default value for experimental_enable_temp_tables; allows for the use of implicit column partitioning
 sql.defaults.experimental_new_schema_changer.enabled	enumeration	off	default value for experimental_use_new_schema_changer session setting;disables new schema changer by default [off = 0, on = 1, unsafe_always = 2]
@@ -89,7 +98,11 @@ sql.defaults.implicit_select_for_update.enabled	boolean	true	default value for e
 sql.defaults.insert_fast_path.enabled	boolean	true	default value for enable_insert_fast_path session setting; enables a specialized insert path
 sql.defaults.interleaved_tables.enabled	boolean	false	allows creation of interleaved tables or indexes
 sql.defaults.intervalstyle	enumeration	postgres	default value for IntervalStyle session setting [postgres = 0, iso_8601 = 1, sql_standard = 2]
+sql.defaults.intervalstyle.enabled	boolean	false	default value for intervalstyle_enabled session setting
+sql.defaults.large_full_scan_rows	float	1000	default value for large_full_scan_rows session setting which determines the maximum table size allowed for a full scan when disallow_full_table_scans is set to true
 sql.defaults.locality_optimized_partitioned_index_scan.enabled	boolean	true	default value for locality_optimized_partitioned_index_scan session setting; enables searching for rows in the current region before searching remote regions
+sql.defaults.lock_timeout	duration	0s	default value for the lock_timeout; default value for the lock_timeout session setting; controls the duration a query is permitted to wait while attempting to acquire a lock on a key or while blocking on an existing lock in order to perform a non-locking read on a key; if set to 0, there is no timeout
+sql.defaults.on_update_rehome_row.enabled	boolean	true	default value for on_update_rehome_row; enables ON UPDATE rehome_row() expressions to trigger on updates
 sql.defaults.optimizer_use_histograms.enabled	boolean	true	default value for optimizer_use_histograms session setting; enables usage of histograms in the optimizer by default
 sql.defaults.optimizer_use_multicol_stats.enabled	boolean	true	default value for optimizer_use_multicol_stats session setting; enables usage of multi-column stats in the optimizer by default
 sql.defaults.override_multi_region_zone_config.enabled	boolean	false	default value for override_multi_region_zone_config; allows for overriding the zone configs of a multi-region table or database
@@ -100,10 +113,16 @@ sql.defaults.results_buffer.size	byte size	16 KiB	default size of the buffer tha
 sql.defaults.serial_normalization	enumeration	rowid	default handling of SERIAL in table definitions [rowid = 0, virtual_sequence = 1, sql_sequence = 2, sql_sequence_cached = 3]
 sql.defaults.statement_timeout	duration	0s	default value for the statement_timeout; default value for the statement_timeout session setting; controls the duration a query is permitted to run before it is canceled; if set to 0, there is no timeout
 sql.defaults.stub_catalog_tables.enabled	boolean	true	default value for stub_catalog_tables session setting
+sql.defaults.transaction_rows_read_err	integer	0	the limit for the number of rows read by a SQL transaction which - once exceeded - will fail the transaction (or will trigger a logging event to SQL_INTERNAL_PERF for internal transactions); use 0 to disable
+sql.defaults.transaction_rows_read_log	integer	0	the threshold for the number of rows read by a SQL transaction which - once exceeded - will trigger a logging event to SQL_PERF (or SQL_INTERNAL_PERF for internal transactions); use 0 to disable
+sql.defaults.transaction_rows_written_err	integer	0	the limit for the number of rows written by a SQL transaction which - once exceeded - will fail the transaction (or will trigger a logging event to SQL_INTERNAL_PERF for internal transactions); use 0 to disable
+sql.defaults.transaction_rows_written_log	integer	0	the threshold for the number of rows written by a SQL transaction which - once exceeded - will trigger a logging event to SQL_PERF (or SQL_INTERNAL_PERF for internal transactions); use 0 to disable
 sql.defaults.vectorize	enumeration	on	default vectorize mode [on = 0, on = 2, experimental_always = 3, off = 4]
 sql.defaults.zigzag_join.enabled	boolean	true	default value for enable_zigzag_join session setting; allows use of zig-zag join by default
 sql.distsql.max_running_flows	integer	500	maximum number of concurrent flows that can be run on a node
 sql.distsql.temp_storage.workmem	byte size	64 MiB	maximum amount of memory in bytes a processor can use before falling back to temp storage
+sql.guardrails.max_row_size_err	byte size	512 MiB	maximum size of row (or column family if multiple column families are in use) that SQL can write to the database, above which an error is returned; use 0 to disable
+sql.guardrails.max_row_size_log	byte size	64 MiB	maximum size of row (or column family if multiple column families are in use) that SQL can write to the database, above which an event is logged to SQL_PERF (or SQL_INTERNAL_PERF if the mutating statement was internal); use 0 to disable
 sql.log.slow_query.experimental_full_table_scans.enabled	boolean	false	when set to true, statements that perform a full table/index scan will be logged to the slow query log even if they do not meet the latency threshold. Must have the slow query log enabled for this setting to have any effect.
 sql.log.slow_query.internal_queries.enabled	boolean	false	when set to true, internal queries which exceed the slow query log threshold are logged to a separate log. Must have the slow query log enabled for this setting to have any effect.
 sql.log.slow_query.latency_threshold	duration	0s	when set to non-zero, log statements whose service latency exceeds the threshold to a secondary logger on each node
@@ -125,10 +144,16 @@ sql.spatial.experimental_box2d_comparison_operators.enabled	boolean	false	enable
 sql.stats.automatic_collection.enabled	boolean	true	automatic statistics collection mode
 sql.stats.automatic_collection.fraction_stale_rows	float	0.2	target fraction of stale rows per table that will trigger a statistics refresh
 sql.stats.automatic_collection.min_stale_rows	integer	500	target minimum number of stale rows per table that will trigger a statistics refresh
+sql.stats.cleanup.recurrence	string	@hourly	cron-tab recurrence for SQL Stats cleanup job
+sql.stats.flush.enabled	boolean	true	if set, SQL execution statistics are periodically flushed to disk
+sql.stats.flush.interval	duration	1h0m0s	the interval at which SQL execution statistics are flushed to disk
 sql.stats.histogram_collection.enabled	boolean	true	histogram collection mode
 sql.stats.multi_column_collection.enabled	boolean	true	multi-column statistics collection mode
+sql.stats.persisted_rows.max	integer	1000000	maximum number of rows of statement and transaction statistics that will be persisted in the system tables
 sql.stats.post_events.enabled	boolean	false	if set, an event is logged for every CREATE STATISTICS job
+sql.telemetry.query_sampling.enabled	boolean	false	when set to true, executed queries will emit an event on the telemetry logging channel
 sql.temp_object_cleaner.cleanup_interval	duration	30m0s	how often to clean up orphaned temporary objects
+sql.temp_object_cleaner.wait_interval	duration	30m0s	how long after creation a temporary object will be cleaned up
 sql.trace.log_statement_execute	boolean	false	set to true to enable logging of executed statements
 sql.trace.session_eventlog.enabled	boolean	false	set to true to enable session tracing. Note that enabling this may have a non-trivial negative performance impact.
 sql.trace.stmt.enable_threshold	duration	0s	duration beyond which all statements are traced (set to 0 to disable). This applies to individual statements within a transaction and is therefore finer-grained than sql.trace.txn.enable_threshold.
@@ -141,4 +166,4 @@ trace.datadog.project	string	CockroachDB	the project under which traces will be 
 trace.debug.enable	boolean	false	if set, traces for recent requests can be seen at https://<ui>/debug/requests
 trace.lightstep.token	string		if set, traces go to Lightstep using this token
 trace.zipkin.collector	string		if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'). Only one tracer can be configured at a time.
-version	version	21.1-116	set the active cluster version in the format '<major>.<minor>'
+version	version	21.1-1162	set the active cluster version in the format '<major>.<minor>'

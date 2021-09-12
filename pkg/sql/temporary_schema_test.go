@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -82,16 +83,16 @@ INSERT INTO perm_table VALUES (DEFAULT, 1);
 	}
 	for _, name := range selectableTempNames {
 		// Check tables are accessible.
-		_, err = conn.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s", tempSchemaName, name))
+		var rows *gosql.Rows
+		rows, err = conn.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s", tempSchemaName, name))
 		require.NoError(t, err)
+		require.NoError(t, rows.Close())
 	}
 
 	require.NoError(
 		t,
-		descs.Txn(
+		s.ExecutorConfig().(ExecutorConfig).CollectionFactory.Txn(
 			ctx,
-			s.ClusterSettings(),
-			s.LeaseManager().(*lease.Manager),
 			s.InternalExecutor().(*InternalExecutor),
 			kvDB,
 			func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
@@ -114,8 +115,10 @@ INSERT INTO perm_table VALUES (DEFAULT, 1);
 	ensureTemporaryObjectsAreDeleted(ctx, t, conn, tempSchemaName, tempNames)
 
 	// Check perm_table performs correctly, and has the right schema.
-	_, err = db.Query("SELECT * FROM perm_table")
+	var rows *gosql.Rows
+	rows, err = db.Query("SELECT * FROM perm_table")
 	require.NoError(t, err)
+	require.NoError(t, rows.Close())
 
 	var colDefault gosql.NullString
 	err = db.QueryRow(
@@ -142,6 +145,8 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 			},
 		},
 	}
+	settings := cluster.MakeTestingClusterSettings()
+	TempObjectWaitInterval.Override(context.Background(), &settings.SV, time.Microsecond)
 	tc := serverutils.StartNewTestCluster(
 		t,
 		numNodes,
@@ -149,6 +154,7 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "defaultdb",
 				Knobs:       knobs,
+				Settings:    settings,
 			},
 		},
 	)

@@ -16,7 +16,6 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -232,6 +231,22 @@ func (m *Manager) AcquireOptimistic(spans *spanset.SpanSet) *Guard {
 	lg, snap := m.sequence(spans)
 	lg.snap = &snap
 	return lg
+}
+
+// WaitFor waits for conflicting latches on the spans without adding
+// any latches itself. Fast path for operations that only require past latches
+// to be released without blocking new latches.
+func (m *Manager) WaitFor(ctx context.Context, spans *spanset.SpanSet) error {
+	// The guard is only used to store latches by this request. These latches
+	// are not actually inserted using insertLocked.
+	lg := newGuard(spans)
+
+	m.mu.Lock()
+	snap := m.snapshotLocked(spans)
+	defer snap.close()
+	m.mu.Unlock()
+
+	return m.wait(ctx, lg, snap)
 }
 
 // CheckOptimisticNoConflicts returns true iff the spans in the provided
@@ -559,18 +574,26 @@ func (m *Manager) removeLocked(lg *Guard) {
 	}
 }
 
-// Info returns information about the state of the Manager.
-func (m *Manager) Info() (global, local kvserverpb.LatchManagerInfo) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	global = m.scopes[spanset.SpanGlobal].infoLocked()
-	local = m.scopes[spanset.SpanLocal].infoLocked()
-	return global, local
+// Metrics holds information about the state of a Manager.
+type Metrics struct {
+	ReadCount  int64
+	WriteCount int64
 }
 
-func (sm *scopedManager) infoLocked() kvserverpb.LatchManagerInfo {
-	var info kvserverpb.LatchManagerInfo
-	info.ReadCount = int64(sm.trees[spanset.SpanReadOnly].Len() + sm.readSet.len)
-	info.WriteCount = int64(sm.trees[spanset.SpanReadWrite].Len())
-	return info
+// Metrics returns information about the state of the Manager.
+func (m *Manager) Metrics() Metrics {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	globalReadCount, globalWriteCount := m.scopes[spanset.SpanGlobal].metricsLocked()
+	localReadCount, localWriteCount := m.scopes[spanset.SpanLocal].metricsLocked()
+	return Metrics{
+		ReadCount:  globalReadCount + localReadCount,
+		WriteCount: globalWriteCount + localWriteCount,
+	}
+}
+
+func (sm *scopedManager) metricsLocked() (readCount, writeCount int64) {
+	readCount = int64(sm.trees[spanset.SpanReadOnly].Len() + sm.readSet.len)
+	writeCount = int64(sm.trees[spanset.SpanReadWrite].Len())
+	return readCount, writeCount
 }

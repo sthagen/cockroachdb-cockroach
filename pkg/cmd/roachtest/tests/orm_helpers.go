@@ -12,7 +12,6 @@ package tests
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -27,27 +26,11 @@ import (
 // cause thousands of table descriptors and schema change jobs to accumulate
 // rapidly, thereby decreasing performance.
 func alterZoneConfigAndClusterSettings(
-	ctx context.Context,
-	version string,
-	c cluster.Cluster,
-	nodeIdx int,
-	dbConnectionParams *SecureDBConnectionParams,
+	ctx context.Context, version string, c cluster.Cluster, nodeIdx int,
 ) error {
-	var db *gosql.DB
-	var err error
-	if dbConnectionParams != nil {
-		db, err = c.ConnSecure(
-			ctx, nodeIdx, dbConnectionParams.username,
-			dbConnectionParams.certsDir, dbConnectionParams.port,
-		)
-		if err != nil {
-			return err
-		}
-	} else {
-		db, err = c.ConnE(ctx, nodeIdx)
-		if err != nil {
-			return err
-		}
+	db, err := c.ConnE(ctx, nodeIdx)
+	if err != nil {
+		return err
 	}
 	defer db.Close()
 
@@ -108,13 +91,27 @@ func alterZoneConfigAndClusterSettings(
 		return err
 	}
 
-	// Enable temp tables for v20.1+
-	if strings.HasPrefix(version, "v20.") || strings.HasPrefix(version, "v21.") {
-		if _, err := db.ExecContext(
-			ctx, `SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
-		); err != nil {
-			return err
-		}
+	// Enable temp tables
+	if _, err := db.ExecContext(
+		ctx, `SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
+	); err != nil {
+		return err
+	}
+
+	// Enable datestyle.
+	if _, err := db.ExecContext(
+		ctx,
+		`SET CLUSTER SETTING sql.defaults.datestyle.enabled = true`,
+	); err != nil {
+		return err
+	}
+
+	// Enable intervalstyle.
+	if _, err := db.ExecContext(
+		ctx,
+		`SET CLUSTER SETTING sql.defaults.intervalstyle.enabled = true;`,
+	); err != nil {
+		return err
 	}
 
 	return nil

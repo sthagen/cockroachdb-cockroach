@@ -23,9 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -166,7 +166,7 @@ func (fta *FetcherTableArgs) InitCols(
 	virtualColumn catalog.Column,
 ) {
 	cols := make([]catalog.Column, 0, len(desc.AllColumns()))
-	if scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic {
+	if scanVisibility == execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC {
 		cols = append(cols, desc.ReadableColumns()...)
 	} else {
 		cols = append(cols, desc.PublicColumns()...)
@@ -246,6 +246,11 @@ type Fetcher struct {
 	// locks held by other active transactions.
 	lockWaitPolicy descpb.ScanLockingWaitPolicy
 
+	// lockTimeout specifies the maximum amount of time that the fetcher will
+	// wait while attempting to acquire a lock on a key or while blocking on an
+	// existing lock in order to perform a non-locking read on a key.
+	lockTimeout time.Duration
+
 	// traceKV indicates whether or not session tracing is enabled. It is set
 	// when beginning a new scan.
 	traceKV bool
@@ -317,6 +322,7 @@ func (rf *Fetcher) Init(
 	reverse bool,
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
+	lockTimeout time.Duration,
 	isCheck bool,
 	alloc *rowenc.DatumAlloc,
 	memMonitor *mon.BytesMonitor,
@@ -330,11 +336,13 @@ func (rf *Fetcher) Init(
 	rf.reverse = reverse
 	rf.lockStrength = lockStrength
 	rf.lockWaitPolicy = lockWaitPolicy
+	rf.lockTimeout = lockTimeout
 	rf.alloc = alloc
 	rf.isCheck = isCheck
 
 	if memMonitor != nil {
-		rf.mon = execinfra.NewMonitor(ctx, memMonitor, "fetcher-mem")
+		rf.mon = mon.NewMonitorInheritWithLimit("fetcher-mem", 0 /* limit */, memMonitor)
+		rf.mon.Start(ctx, memMonitor, mon.BoundAccount{})
 	}
 
 	// We must always decode the index key if we need to distinguish between
@@ -558,12 +566,27 @@ func (rf *Fetcher) GetTables() []catalog.Descriptor {
 
 // StartScan initializes and starts the key-value scan. Can be used multiple
 // times.
+//
+// batchBytesLimit controls whether bytes limits are placed on the batches. If
+// set, bytes limits will be used to protect against running out of memory (on
+// both this client node, and on the server).
+//
+// If batchBytesLimit is set, rowLimitHint can also be set to control the number of
+// rows that will be scanned by the first batch. If set, subsequent batches (if
+// any) will have progressively higher limits (up to a fixed max). The idea with
+// row limits is to make the execution of LIMIT queries efficient: if the caller
+// has some idea about how many rows need to be read to ultimately satisfy the
+// query, the Fetcher uses it. Even if this hint proves insufficient, the
+// Fetcher continues to set row limits (in addition to bytes limits) on the
+// argument that some number of rows will eventually satisfy the query and we
+// likely don't need to scan `spans` fully. The bytes limit, on the other hand,
+// is simply intended to protect against OOMs.
 func (rf *Fetcher) StartScan(
 	ctx context.Context,
 	txn *kv.Txn,
 	spans roachpb.Spans,
-	limitBatches bool,
-	limitHint int64,
+	batchBytesLimit rowinfra.BytesLimit,
+	rowLimitHint rowinfra.RowLimit,
 	traceKV bool,
 	forceProductionKVBatchSize bool,
 ) error {
@@ -573,15 +596,18 @@ func (rf *Fetcher) StartScan(
 
 	rf.traceKV = traceKV
 	f, err := makeKVBatchFetcher(
-		txn,
+		makeKVBatchFetcherDefaultSendFunc(txn),
 		spans,
 		rf.reverse,
-		limitBatches,
-		rf.firstBatchLimit(limitHint),
+		batchBytesLimit,
+		rf.rowLimitToKeyLimit(rowLimitHint),
 		rf.lockStrength,
 		rf.lockWaitPolicy,
+		rf.lockTimeout,
 		rf.mon,
 		forceProductionKVBatchSize,
+		txn.AdmissionHeader(),
+		txn.DB().SQLKVResponseAdmissionQ,
 	)
 	if err != nil {
 		return err
@@ -611,8 +637,8 @@ func (rf *Fetcher) StartInconsistentScan(
 	initialTimestamp hlc.Timestamp,
 	maxTimestampAge time.Duration,
 	spans roachpb.Spans,
-	limitBatches bool,
-	limitHint int64,
+	batchBytesLimit rowinfra.BytesLimit,
+	rowLimitHint rowinfra.RowLimit,
 	traceKV bool,
 	forceProductionKVBatchSize bool,
 ) error {
@@ -629,7 +655,9 @@ func (rf *Fetcher) StartInconsistentScan(
 		)
 	}
 	txn := kv.NewTxnWithSteppingEnabled(ctx, db, 0 /* gatewayNodeID */)
-	txn.SetFixedTimestamp(ctx, txnTimestamp)
+	if err := txn.SetFixedTimestamp(ctx, txnTimestamp); err != nil {
+		return err
+	}
 	if log.V(1) {
 		log.Infof(ctx, "starting inconsistent scan at timestamp %v", txnTimestamp)
 	}
@@ -644,7 +672,9 @@ func (rf *Fetcher) StartInconsistentScan(
 			txnTimestamp = txnTimestamp.Add(now.Sub(txnStartTime).Nanoseconds(), 0 /* logical */)
 			txnStartTime = now
 			txn = kv.NewTxnWithSteppingEnabled(ctx, db, 0 /* gatewayNodeID */)
-			txn.SetFixedTimestamp(ctx, txnTimestamp)
+			if err := txn.SetFixedTimestamp(ctx, txnTimestamp); err != nil {
+				return nil, err
+			}
 
 			if log.V(1) {
 				log.Infof(ctx, "bumped inconsistent scan timestamp to %v", txnTimestamp)
@@ -665,14 +695,15 @@ func (rf *Fetcher) StartInconsistentScan(
 	// on read transactions, but perhaps one day it will release some resources.
 
 	rf.traceKV = traceKV
-	f, err := makeKVBatchFetcherWithSendFunc(
+	f, err := makeKVBatchFetcher(
 		sendFunc(sendFn),
 		spans,
 		rf.reverse,
-		limitBatches,
-		rf.firstBatchLimit(limitHint),
+		batchBytesLimit,
+		rf.rowLimitToKeyLimit(rowLimitHint),
 		rf.lockStrength,
 		rf.lockWaitPolicy,
+		rf.lockTimeout,
 		rf.mon,
 		forceProductionKVBatchSize,
 		txn.AdmissionHeader(),
@@ -684,19 +715,19 @@ func (rf *Fetcher) StartInconsistentScan(
 	return rf.StartScanFrom(ctx, &f)
 }
 
-func (rf *Fetcher) firstBatchLimit(limitHint int64) int64 {
-	if limitHint == 0 {
+func (rf *Fetcher) rowLimitToKeyLimit(rowLimitHint rowinfra.RowLimit) rowinfra.KeyLimit {
+	if rowLimitHint == 0 {
 		return 0
 	}
 	// If we have a limit hint, we limit the first batch size. Subsequent
 	// batches get larger to avoid making things too slow (e.g. in case we have
 	// a very restrictive filter and actually have to retrieve a lot of rows).
-	// The limitHint is a row limit, but each row could be made up of more than
+	// The rowLimitHint is a row limit, but each row could be made up of more than
 	// one key. We take the maximum possible keys per row out of all the table
 	// rows we could potentially scan over.
 	//
 	// We add an extra key to make sure we form the last row.
-	return limitHint*int64(rf.maxKeysPerRow) + 1
+	return rowinfra.KeyLimit(int64(rowLimitHint)*int64(rf.maxKeysPerRow) + 1)
 }
 
 // StartScanFrom initializes and starts a scan from the given kvBatchFetcher. Can be

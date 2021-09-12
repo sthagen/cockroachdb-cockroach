@@ -12,11 +12,13 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -25,6 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -32,11 +36,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -54,23 +58,24 @@ func StartTenant(
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
 ) (sqlServer *SQLServer, pgAddr string, httpAddr string, _ error) {
+	err := ApplyTenantLicense()
+	if err != nil {
+		return nil, "", "", err
+	}
+
 	args, err := makeTenantSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
 	if err != nil {
 		return nil, "", "", err
 	}
-	s, err := newSQLServer(ctx, args)
+	err = args.ValidateAddrs(ctx)
 	if err != nil {
 		return nil, "", "", err
 	}
-
-	s.execCfg.SQLStatusServer = newTenantStatusServer(
-		baseCfg.AmbientCtx, &adminPrivilegeChecker{ie: args.circularInternalExecutor},
-		args.sessionRegistry, args.contentionRegistry, args.flowScheduler, baseCfg.Settings, s,
-	)
-
-	// TODO(asubiotto): remove this. Right now it is needed to initialize the
-	// SpanResolver.
-	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: 0})
+	args.monitorAndMetrics = newRootSQLMemoryMonitor(monitorAndMetricsOptions{
+		memoryPoolSize:          args.MemoryPoolSize,
+		histogramWindowInterval: args.HistogramWindowInterval(),
+		settings:                args.Settings,
+	})
 
 	connManager := netutil.MakeServer(
 		args.stopper,
@@ -79,14 +84,24 @@ func StartTenant(
 		nil, // tlsConfig
 		nil, // handler
 	)
-	knobs := baseCfg.TestingKnobs.TenantTestingKnobs
-	if tenantKnobs, ok := knobs.(*sql.TenantTestingKnobs); ok && tenantKnobs.IdleExitCountdownDuration != 0 {
-		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager, tenantKnobs.IdleExitCountdownDuration)
-	} else {
-		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager)
-	}
 
-	pgL, err := ListenAndUpdateAddrs(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
+	// Initialize gRPC server for use on shared port with pg
+	grpcMain := newGRPCServer(args.rpcContext)
+	grpcMain.setMode(modeOperational)
+
+	// TODO(davidh): Do we need to force this to be false?
+	baseCfg.SplitListenSQL = false
+
+	background := baseCfg.AmbientCtx.AnnotateCtx(context.Background())
+
+	// StartListenRPCAndSQL will replace the SQLAddr fields if we choose
+	// to share the SQL and gRPC port so here, since the tenant config
+	// expects to have port set on the SQL param we transfer those to
+	// the base Addr params in order for the RPC to be configured
+	// correctly.
+	baseCfg.Addr = baseCfg.SQLAddr
+	baseCfg.AdvertiseAddr = baseCfg.SQLAdvertiseAddr
+	pgL, startRPCServer, err := StartListenRPCAndSQL(ctx, background, baseCfg, stopper, grpcMain)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -106,9 +121,16 @@ func StartTenant(
 		}
 	}
 
+	serverTLSConfig, err := args.rpcContext.GetUIServerTLSConfig()
+	if err != nil {
+		return nil, "", "", err
+	}
 	httpL, err := ListenAndUpdateAddrs(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
 	if err != nil {
 		return nil, "", "", err
+	}
+	if serverTLSConfig != nil {
+		httpL = tls.NewListener(httpL, serverTLSConfig)
 	}
 
 	{
@@ -121,9 +143,55 @@ func StartTenant(
 			return nil, "", "", err
 		}
 	}
-
 	pgLAddr := pgL.Addr().String()
 	httpLAddr := httpL.Addr().String()
+	args.advertiseAddr = baseCfg.AdvertiseAddr
+	// The tenantStatusServer needs access to the sqlServer,
+	// but we also need the same object to set up the sqlServer.
+	// So construct the tenant status server with a nil sqlServer,
+	// and then assign it once an SQL server gets created. We are
+	// going to assume that the tenant status server won't require
+	// the SQL server object.
+	tenantStatusServer := newTenantStatusServer(
+		baseCfg.AmbientCtx, &adminPrivilegeChecker{ie: args.circularInternalExecutor},
+		args.sessionRegistry, args.contentionRegistry, args.flowScheduler, baseCfg.Settings, nil,
+		args.rpcContext, args.stopper,
+	)
+	args.sqlStatusServer = tenantStatusServer
+	s, err := newSQLServer(ctx, args)
+	tenantStatusServer.sqlServer = s
+
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	// TODO(asubiotto): remove this. Right now it is needed to initialize the
+	// SpanResolver.
+	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: 0})
+	workersCtx := tenantStatusServer.AnnotateCtx(context.Background())
+
+	// Register and start gRPC service on pod. This is separate from the
+	// gRPC + Gateway services configured below.
+	tenantStatusServer.RegisterService(grpcMain.Server)
+	startRPCServer(workersCtx)
+
+	// Begin configuration of GRPC Gateway
+	gwMux, gwCtx, conn, err := ConfigureGRPCGateway(
+		ctx,
+		workersCtx,
+		args.AmbientCtx,
+		tenantStatusServer.rpcCtx,
+		s.stopper,
+		grpcMain,
+		pgLAddr,
+	)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if err := tenantStatusServer.RegisterGateway(gwCtx, gwMux, conn); err != nil {
+		return nil, "", "", err
+	}
+
 	args.recorder.AddNode(
 		args.registry,
 		roachpb.NodeDescriptor{},
@@ -137,6 +205,7 @@ func StartTenant(
 		mux := http.NewServeMux()
 		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn())
 		mux.Handle("/", debugServer)
+		mux.Handle("/_status/", gwMux)
 		mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 			// Return Bad Request if called with arguments.
 			if err := req.ParseForm(); err != nil || len(req.Form) != 0 {
@@ -146,7 +215,14 @@ func StartTenant(
 		})
 		f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
 		mux.Handle(statusVars, http.HandlerFunc(f))
-		_ = http.Serve(httpL, mux)
+
+		tlsConnManager := netutil.MakeServer(
+			args.stopper,
+			serverTLSConfig, // tlsConfig
+			mux,             // handler
+		)
+
+		netutil.FatalIfUnexpected(tlsConnManager.Serve(httpL))
 	}); err != nil {
 		return nil, "", "", err
 	}
@@ -169,8 +245,6 @@ func StartTenant(
 		return nil, "", "", err
 	}
 
-	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(args.nodeIDContainer.SQLInstanceID())})
-
 	if err := s.preStart(ctx,
 		args.stopper,
 		args.TestingKnobs,
@@ -182,6 +256,13 @@ func StartTenant(
 		return nil, "", "", err
 	}
 
+	// This is necessary so the grpc server doesn't error out on heartbeat
+	// ping when we make pod-to-pod calls, we pass the InstanceID with the
+	// request to ensure we're dialing the pod we think we are.
+	//
+	// The InstanceID subsystem is not available until `preStart`.
+	args.rpcContext.NodeID.Set(ctx, roachpb.NodeID(s.SQLInstanceID()))
+
 	// Register the server's identifiers so that log events are
 	// decorated with the server's identity. This helps when gathering
 	// log events from multiple servers into the same log collector.
@@ -190,6 +271,10 @@ func StartTenant(
 	clusterID := args.rpcContext.ClusterID.Get().String()
 	log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
 	log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
+
+	if err := args.costController.Start(ctx, args.stopper, status.GetUserCPUSeconds); err != nil {
+		return nil, "", "", err
+	}
 
 	if err := s.startServeSQL(ctx,
 		args.stopper,
@@ -251,6 +336,16 @@ func makeTenantSQLServerArgs(
 	resolver := kvtenant.AddressResolver(tenantConnect)
 	nodeDialer := nodedialer.New(rpcContext, resolver)
 
+	provider := kvtenant.TokenBucketProvider(tenantConnect)
+	if tenantKnobs, ok := baseCfg.TestingKnobs.TenantTestingKnobs.(*sql.TenantTestingKnobs); ok &&
+		tenantKnobs.OverrideTokenBucketProvider != nil {
+		provider = tenantKnobs.OverrideTokenBucketProvider(provider)
+	}
+	costController, err := NewTenantSideCostController(st, sqlCfg.TenantID, provider)
+	if err != nil {
+		return sqlServerArgs{}, err
+	}
+
 	dsCfg := kvcoord.DistSenderConfig{
 		AmbientCtx:        baseCfg.AmbientCtx,
 		Settings:          st,
@@ -260,6 +355,7 @@ func makeTenantSQLServerArgs(
 		RPCContext:        rpcContext,
 		NodeDialer:        nodeDialer,
 		RangeDescriptorDB: tenantConnect,
+		KVInterceptor:     costController,
 		TestingKnobs:      dsKnobs,
 	}
 	ds := kvcoord.NewDistSender(dsCfg)
@@ -309,9 +405,6 @@ func makeTenantSQLServerArgs(
 
 	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st)
 
-	const sqlInstanceID = base.SQLInstanceID(10001)
-	idContainer := base.NewSQLIDContainer(sqlInstanceID, nil /* nodeID */)
-
 	runtime := status.NewRuntimeStatSampler(context.Background(), clock)
 	registry.AddMetricStruct(runtime)
 
@@ -347,9 +440,11 @@ func makeTenantSQLServerArgs(
 			isMeta1Leaseholder: func(_ context.Context, _ hlc.ClockTimestamp) (bool, error) {
 				return false, errors.New("isMeta1Leaseholder is not available to secondary tenants")
 			},
-			nodeIDContainer:        idContainer,
 			externalStorage:        externalStorage,
 			externalStorageFromURI: externalStorageFromURI,
+			// Set instance ID to 0 and node ID to nil to indicate
+			// that the instance ID will be bound later during preStart.
+			nodeIDContainer: base.NewSQLIDContainer(0, nil),
 		},
 		sqlServerOptionalTenantArgs: sqlServerOptionalTenantArgs{
 			tenantConnect: tenantConnect,
@@ -362,6 +457,7 @@ func makeTenantSQLServerArgs(
 		rpcContext:               rpcContext,
 		nodeDescs:                tenantConnect,
 		systemConfigProvider:     tenantConnect,
+		spanConfigAccessor:       tenantConnect,
 		nodeDialer:               nodeDialer,
 		distSender:               ds,
 		db:                       db,
@@ -375,5 +471,43 @@ func makeTenantSQLServerArgs(
 		protectedtsProvider:      protectedTSProvider,
 		rangeFeedFactory:         rangeFeedFactory,
 		regionsServer:            tenantConnect,
+		costController:           costController,
 	}, nil
+}
+
+// NewTenantSideCostController is a hook for CCL code which implements the
+// controller.
+var NewTenantSideCostController = func(
+	st *cluster.Settings, tenantID roachpb.TenantID, provider kvtenant.TokenBucketProvider,
+) (multitenant.TenantSideCostController, error) {
+	// Return a no-op implementation.
+	return noopTenantSideCostController{}, nil
+}
+
+// ApplyTenantLicense is a hook for CCL code which enables enterprise features
+// for the tenant process if the COCKROACH_TENANT_LICENSE environment variable
+// is set.
+var ApplyTenantLicense = func() error { return nil /* no-op */ }
+
+// noopTenantSideCostController is a no-op implementation of
+// TenantSideCostController.
+type noopTenantSideCostController struct{}
+
+var _ multitenant.TenantSideCostController = noopTenantSideCostController{}
+
+func (noopTenantSideCostController) Start(
+	ctx context.Context, stopper *stop.Stopper, cpuSecsFn multitenant.CPUSecsFn,
+) error {
+	return nil
+}
+
+func (noopTenantSideCostController) OnRequestWait(
+	ctx context.Context, info tenantcostmodel.RequestInfo,
+) error {
+	return nil
+}
+
+func (noopTenantSideCostController) OnResponse(
+	ctx context.Context, req tenantcostmodel.RequestInfo, resp tenantcostmodel.ResponseInfo,
+) {
 }

@@ -12,7 +12,7 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 # Load go bazel tools. This gives us access to the go bazel SDK/toolchains.
 git_repository(
     name = "io_bazel_rules_go",
-    commit = "91c4e2b0f233c7031b191b93587f562ffe21f86f",
+    commit = "4a7bcc9b9051eb6a12bcb03a9bf38138c4bbc2ea",
     remote = "https://github.com/cockroachdb/rules_go",
 )
 
@@ -32,77 +32,17 @@ git_repository(
     shallow_since = "1626107853 -0400",
 )
 
-# Override the location of some libraries; otherwise, rules_go will pull its own
-# versions. Note these declarations must occur BEFORE the call to
-# go_rules_dependencies().
+# Load up cockroachdb's go dependencies (the ones listed under go.mod). The
+# `DEPS.bzl` file is kept up to date using the `update-repos` Gazelle command
+# (see `build/bazelutil/bazel-generate.sh`).
 #
-# Ref: https://github.com/bazelbuild/rules_go/blob/master/go/dependencies.rst#overriding-dependencies
-load("@bazel_gazelle//:deps.bzl", "go_repository")
+# gazelle:repository_macro DEPS.bzl%go_deps
+load("//:DEPS.bzl", "go_deps")
 
-go_repository(
-    name = "org_golang_x_sys",
-    build_file_proto_mode = "disable_global",
-    importpath = "golang.org/x/sys",
-    sum = "h1:CA1DEQ4NdKphKeL70tvsWNdT5oFh1lOjihRcEDROi0I=",
-    version = "v0.0.0-20210603125802-9665404d3644",
-)
-
-go_repository(
-    name = "org_golang_x_tools",
-    build_file_proto_mode = "disable_global",
-    importpath = "golang.org/x/tools",
-    sum = "h1:kRBLX7v7Af8W7Gdbbc908OJcdgtK8bOz9Uaj8/F1ACA=",
-    version = "v0.1.2",
-)
-
-go_repository(
-    name = "org_golang_x_xerrors",
-    build_file_proto_mode = "disable_global",
-    importpath = "golang.org/x/xerrors",
-    sum = "h1:go1bK/D/BFZV2I8cIQd1NKEZ+0owSTG1fDTci4IqFcE=",
-    version = "v0.0.0-20200804184101-5ec99f83aff1",
-)
-
-go_repository(
-    name = "com_github_gogo_protobuf",
-    build_file_proto_mode = "disable_global",
-    importpath = "github.com/gogo/protobuf",
-    patch_args = ["-p1"],
-    patches = [
-        "@cockroach//build/patches:com_github_gogo_protobuf.patch",
-    ],
-    sum = "h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=",
-    version = "v1.3.2",
-)
-
-go_repository(
-    name = "com_github_golang_protobuf",
-    build_file_proto_mode = "disable_global",
-    importpath = "github.com/golang/protobuf",
-    patch_args = ["-p1"],
-    patches = [
-        "@cockroach//build/patches:com_github_golang_protobuf.patch",
-    ],
-    sum = "h1:ROPKBNFfQgOUMifHyP+KYbvpjbdoFNs+aK7DXlji0Tw=",
-    version = "v1.5.2",
-)
-
-go_repository(
-    name = "org_golang_google_genproto",
-    build_file_proto_mode = "disable_global",
-    importpath = "google.golang.org/genproto",
-    sum = "h1:3oVOonZQld/0ddUsMXCnkhem95RnnQEUMZQLJP1s3jQ=",
-    version = "v0.0.0-20210603172842-58e84a565dcf",
-)
-
-go_repository(
-    name = "in_gopkg_yaml_v2",
-    build_file_proto_mode = "disable_global",
-    importpath = "gopkg.in/yaml.v2",
-    replace = "github.com/cockroachdb/yaml",
-    sum = "h1:EqoCicA1pbWWDGniFxhTElh2hvui7E7tEvuBNJSDn3A=",
-    version = "v0.0.0-20180705215940-0e2822948641",
-)
+# VERY IMPORTANT that we call into this function to prefer our pinned versions
+# of the dependencies to any that might be pulled in via functions like
+# `go_rules_dependencies`, `gazelle_dependencies`, etc.
+go_deps()
 
 # Load the go dependencies and invoke them.
 load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains", "go_rules_dependencies")
@@ -119,11 +59,6 @@ yarn_install(
     package_json = "//pkg/ui:package.json",
     yarn_lock = "//pkg/ui:yarn.lock",
 )
-
-# NB: @bazel_skylib comes from go_rules_dependencies().
-load("@bazel_skylib//lib:versions.bzl", "versions")
-
-versions.check(minimum_bazel_version = "4.0.0")
 
 # Load gazelle dependencies.
 load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies")
@@ -144,15 +79,6 @@ load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
 
 protobuf_deps()
 
-# Load up cockroachdb's go dependencies (the ones listed under go.mod). The
-# `DEPS.bzl` file is kept up to date using the `update-repos` Gazelle command
-# (see `make bazel-generate`).
-#
-# gazelle:repository_macro DEPS.bzl%go_deps
-load("//:DEPS.bzl", "go_deps")
-
-go_deps()
-
 # Loading c-deps third party dependencies.
 load("//c-deps:REPOSITORIES.bzl", "c_deps")
 
@@ -167,7 +93,7 @@ c_deps()
 # aforementioned PRs.
 git_repository(
     name = "rules_foreign_cc",
-    commit = "a3b0e5eaa723259458f5c85285f58e46ae7f25a2",
+    commit = "67211f9083234f51ef1d9c21a791ee93bc538143",
     remote = "https://github.com/cockroachdb/rules_foreign_cc",
 )
 

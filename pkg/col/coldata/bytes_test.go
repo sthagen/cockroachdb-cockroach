@@ -438,6 +438,49 @@ func TestBytes(t *testing.T) {
 		other = b2.Window(0, 4)
 		other.AssertOffsetsAreNonDecreasing(4)
 	})
+
+	t.Run("Truncate", func(t *testing.T) {
+		b := NewBytes(8)
+		b.Set(4, []byte("foo"))
+		require.Equal(t, 5, b.maxSetLength)
+		require.Panics(t, func() { b.Set(1, []byte("bar")) })
+		b.Truncate(1)
+		require.Equal(t, 1, b.maxSetLength)
+		require.NotPanics(t, func() { b.Set(1, []byte("baz")) })
+		require.Equal(t, 2, b.maxSetLength)
+		b.Truncate(0)
+		require.Equal(t, 0, b.maxSetLength)
+		require.NotPanics(t, func() { b.Set(4, []byte("deadbeef")) })
+	})
+
+	t.Run("Abbreviated", func(t *testing.T) {
+		rng, _ := randutil.NewPseudoRand()
+
+		// Create a vector with random bytes values.
+		b := NewBytes(250)
+		for i := 0; i < b.Len(); i++ {
+			size := rng.Intn(32)
+			b.Set(i, randutil.RandBytes(rng, size))
+		}
+
+		// Ensure that for every i and j:
+		//
+		//  - abbr[i] < abbr[j] iff b.Get(i) < b.Get(j)
+		//  - abbr[i] > abbr[j] iff b.Get(i) > b.Get(j)
+		//
+		abbr := b.Abbreviated()
+		for i := 0; i < b.Len(); i++ {
+			for j := 0; j < b.Len(); j++ {
+				cmp := bytes.Compare(b.Get(i), b.Get(j))
+				if abbr[i] < abbr[j] && cmp >= 0 {
+					t.Errorf("abbr value of %v should not be less than %v", b.Get(i), b.Get(j))
+				}
+				if abbr[i] > abbr[j] && cmp <= 0 {
+					t.Errorf("abbr value of %v should not be greater than %v", b.Get(i), b.Get(j))
+				}
+			}
+		}
+	})
 }
 
 func TestProportionalSize(t *testing.T) {

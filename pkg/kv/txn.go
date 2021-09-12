@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -328,6 +329,14 @@ func (txn *Txn) CommitTimestamp() hlc.Timestamp {
 	return txn.mu.sender.CommitTimestamp()
 }
 
+// CommitTimestampFixed returns true if the commit timestamp has
+// been fixed to the start timestamp and cannot be pushed forward.
+func (txn *Txn) CommitTimestampFixed() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.CommitTimestampFixed()
+}
+
 // ProvisionalCommitTimestamp returns the transaction's provisional
 // commit timestamp. This can evolve throughout a txn's lifecycle. See
 // the comment on the WriteTimestamp field of TxnMeta for details.
@@ -386,7 +395,7 @@ func (txn *Txn) DisablePipelining() error {
 
 // NewBatch creates and returns a new empty batch object for use with the Txn.
 func (txn *Txn) NewBatch() *Batch {
-	return &Batch{txn: txn, AdmissionHeader: txn.admissionHeader}
+	return &Batch{txn: txn, AdmissionHeader: txn.AdmissionHeader()}
 }
 
 // Get retrieves the value for a key, returning the retrieved key/value or an
@@ -629,7 +638,7 @@ func (txn *Txn) DelRange(ctx context.Context, begin, end interface{}) error {
 // operation. The order of the results matches the order the operations were
 // added to the batch.
 func (txn *Txn) Run(ctx context.Context, b *Batch) error {
-	if err := b.prepare(); err != nil {
+	if err := b.validate(); err != nil {
 		return err
 	}
 	return sendAndFill(ctx, txn.Send, b)
@@ -971,9 +980,19 @@ func (txn *Txn) Send(
 		ba.Header.GatewayNodeID = txn.gatewayNodeID
 	}
 
+	// Requests with a bounded staleness header should use NegotiateAndSend.
+	if ba.BoundedStaleness != nil {
+		return nil, roachpb.NewError(errors.AssertionFailedf(
+			"bounded staleness header passed to Txn.Send: %s", ba.String()))
+	}
+
 	// Some callers have not initialized ba using a Batch constructed using
-	// Txn.NewBatch. So we fallback to initializing here.
-	ba.AdmissionHeader = txn.admissionHeader
+	// Txn.NewBatch. So we fallback to partially overwriting here.
+	if ba.AdmissionHeader.CreateTime == 0 {
+		noMem := ba.AdmissionHeader.NoMemoryReservedAtSource
+		ba.AdmissionHeader = txn.AdmissionHeader()
+		ba.AdmissionHeader.NoMemoryReservedAtSource = noMem
+	}
 
 	txn.mu.Lock()
 	requestTxnID := txn.mu.ID
@@ -1009,6 +1028,157 @@ func (txn *Txn) handleErrIfRetryableLocked(ctx context.Context, err error) {
 	}
 	txn.resetDeadlineLocked()
 	txn.replaceRootSenderIfTxnAbortedLocked(ctx, retryErr, retryErr.TxnID)
+}
+
+// NegotiateAndSend is a specialized version of Send that is capable of
+// orchestrating a bounded-staleness read through the transaction, given a
+// read-only BatchRequest with a min_timestamp_bound set in its Header.
+//
+// Bounded-staleness orchestration consists of two phases - negotiation and
+// execution. Negotiation determines the timestamp to run the query at in order
+// to ensure that the read will not block on replication or on conflicting
+// transactions. Execution then configures the transaction to use this timestamp
+// and runs the read request in the context of the transaction.
+//
+// The transaction must not have been used before. If the call returns
+// successfully, the transaction will have been given a fixed timestamp equal to
+// the timestamp that the read-only request was evaluated at.
+//
+// If the read-only request hits a key or byte limit and returns a resume span,
+// meaning that it was paginated and did not return all desired results, the
+// transaction's timestamp will have still been fixed to a timestamp that was
+// negotiated over the entire set of read spans in the provided batch. As such,
+// it is safe for callers to resume reading at the bounded-staleness timestamp
+// by using Send. Future calls to Send must not include a BoundedStaleness
+// header, but may still specify the same routing policy.
+//
+// The method accepts requests with min_timestamp_bound_strict set to either
+// true or false, which dictates whether a bounded staleness read whose
+// min_timestamp_bound cannot be satisfied by the first replica it visits
+// (subject to routing_policy) without blocking should be rejected with a
+// MinTimestampBoundUnsatisfiableError or will be redirected to the leaseholder
+// and permitted to block on conflicting transactions. If the flag is true,
+// blocking is never permitted and callers should be prepared to handle
+// MinTimestampBoundUnsatisfiableErrors. If the flag is false, blocking is
+// permitted and MinTimestampBoundUnsatisfiableErrors will never be returned.
+//
+// The method accepts requests with either a LEASEHOLDER or a NEAREST routing
+// policy, which dictates whether the request uses the leaseholder(s) of its
+// target range(s) to negotiate a timestamp and perform the read or whether it
+// uses the nearest replica(s) of its target range(s) to negotiate a timestamp
+// and perform the read. Callers can use this flexibility to trade off increased
+// staleness for reduced latency.
+func (txn *Txn) NegotiateAndSend(
+	ctx context.Context, ba roachpb.BatchRequest,
+) (*roachpb.BatchResponse, *roachpb.Error) {
+	if err := txn.checkNegotiateAndSendPreconditions(ctx, ba); err != nil {
+		return nil, roachpb.NewError(err)
+	}
+	if err := txn.applyDeadlineToBoundedStaleness(ctx, ba.BoundedStaleness); err != nil {
+		return nil, roachpb.NewError(err)
+	}
+
+	// Attempt to hit the server-side negotiation fast-path. This fast-path
+	// allows a bounded staleness read request that lands on a single range
+	// to perform its negotiation phase and execution phase in a single RPC.
+	//
+	// The server-side negotiation fast-path provides two benefits:
+	// 1. it avoids two network hops in the common-case where a bounded
+	//    staleness read is targeting a single range. This in an important
+	//    performance optimization for single-row point lookups.
+	// 2. it provides stronger guarantees around minimizing staleness during
+	//    bounded staleness reads. Bounded staleness reads that hit the
+	//    server-side fast-path use their target replica's most up-to-date
+	//    resolved timestamp, so they are as fresh as possible. Bounded
+	//    staleness reads that miss the fast-path and perform explicit
+	//    negotiation (see below) consult a cache, so they may use an
+	//    out-of-date, suboptimal resolved timestamp, as long as it is fresh
+	//    enough to satisfy the staleness bound of the request.
+	//
+	// To achieve this, we issue the batch as a non-transactional request
+	// with a MinTimestampBound field set (enforced above). We send the
+	// request through the TxnSenderFactory's wrapped non-transactional
+	// sender, so that we not only avoid passing through our TxnCoordSender,
+	// but also through the CrossRangeTxnWrapperSender. If the request spans
+	// ranges, we want to hear about it.
+	br, pErr := txn.DB().GetFactory().NonTransactionalSender().Send(ctx, ba)
+	if pErr == nil {
+		// Fix the transaction's timestamp at the result of the server-side
+		// timestamp negotiation.
+		if err := txn.SetFixedTimestamp(ctx, br.Timestamp); err != nil {
+			return nil, roachpb.NewError(err)
+		}
+		// Note that we do not need to inform the TxnCoordSender about the
+		// non-transactional reads that we issued on behalf of it. Now that the
+		// transaction's timestamp is fixed, it won't be able to refresh anyway.
+		return br, nil
+	}
+	if _, ok := pErr.GetDetail().(*roachpb.OpRequiresTxnError); !ok {
+		return nil, pErr
+	}
+
+	// The read spans ranges, so bounded-staleness orchestration will need to be
+	// performed in two distinct phases - negotiation and execution. First we'll
+	// use the BoundedStalenessNegotiator to determines the timestamp to perform
+	// the read at and fix the transaction's timestamp to this result. Then we'll
+	// issue the request through the transaction, which will use the negotiated
+	// read timestamp from the previous phase to execute the read.
+	//
+	// TODO(nvanbenschoten): implement this. #67554.
+
+	return nil, roachpb.NewError(unimplemented.NewWithIssue(67554,
+		"cross-range bounded staleness reads not yet implemented"))
+}
+
+// checks preconditions on BatchRequest and Txn for NegotiateAndSend.
+func (txn *Txn) checkNegotiateAndSendPreconditions(
+	ctx context.Context, ba roachpb.BatchRequest,
+) (err error) {
+	assert := func(b bool, s string) {
+		if !b {
+			err = errors.CombineErrors(err,
+				errors.WithContextTags(errors.AssertionFailedf(
+					"%s: ba=%s, txn=%s", s, ba.String(), txn.String()), ctx),
+			)
+		}
+	}
+	if cfg := ba.BoundedStaleness; cfg == nil {
+		assert(false, "bounded_staleness configuration must be set")
+	} else {
+		assert(!cfg.MinTimestampBound.IsEmpty(), "min_timestamp_bound must be set")
+		assert(cfg.MaxTimestampBound.IsEmpty() || cfg.MinTimestampBound.Less(cfg.MaxTimestampBound),
+			"max_timestamp_bound, if set, must be greater than min_timestamp_bound")
+	}
+	assert(ba.Timestamp.IsEmpty(), "timestamp must not be set")
+	assert(ba.Txn == nil, "txn must not be set")
+	assert(ba.ReadConsistency == roachpb.CONSISTENT, "read consistency must be set to CONSISTENT")
+	assert(ba.IsReadOnly(), "batch must be read-only")
+	assert(!ba.IsLocking(), "batch must not be locking")
+	assert(txn.typ == RootTxn, "txn must be root")
+	assert(!txn.CommitTimestampFixed(), "txn commit timestamp must not be fixed")
+	return err
+}
+
+// applyDeadlineToBoundedStaleness modifies the bounded staleness header to
+// ensure that the negotiated timestamp respects the transaction deadline.
+func (txn *Txn) applyDeadlineToBoundedStaleness(
+	ctx context.Context, bs *roachpb.BoundedStalenessHeader,
+) error {
+	d := txn.deadline()
+	if d == nil {
+		return nil
+	}
+	if d.LessEq(bs.MinTimestampBound) {
+		return errors.WithContextTags(errors.AssertionFailedf(
+			"transaction deadline %s equal to or below min_timestamp_bound %s",
+			*d, bs.MinTimestampBound), ctx)
+	}
+	if bs.MaxTimestampBound.IsEmpty() {
+		bs.MaxTimestampBound = *d
+	} else {
+		bs.MaxTimestampBound.Backward(*d)
+	}
+	return nil
 }
 
 // GetLeafTxnInputState returns the LeafTxnInputState information for this
@@ -1177,16 +1347,19 @@ func (txn *Txn) recordPreviousTxnIDLocked(prevTxnID uuid.UUID) {
 // This is used to support historical queries (AS OF SYSTEM TIME queries and
 // backups). This method must be called on every transaction retry (but note
 // that retries should be rare for read-only queries with no clock uncertainty).
-func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) {
+func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) error {
 	if txn.typ != RootTxn {
-		panic(errors.WithContextTags(
-			errors.AssertionFailedf("SetFixedTimestamp() called on leaf txn"), ctx))
+		return errors.WithContextTags(errors.AssertionFailedf(
+			"SetFixedTimestamp() called on leaf txn"), ctx)
 	}
 
 	if ts.IsEmpty() {
-		log.Fatalf(ctx, "empty timestamp is invalid for SetFixedTimestamp()")
+		return errors.WithContextTags(errors.AssertionFailedf(
+			"empty timestamp is invalid for SetFixedTimestamp()"), ctx)
 	}
-	txn.mu.sender.SetFixedTimestamp(ctx, ts)
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.SetFixedTimestamp(ctx, ts)
 }
 
 // GenerateForcedRetryableError returns a TransactionRetryWithProtoRefreshError that will
@@ -1383,5 +1556,20 @@ func (txn *Txn) DeferCommitWait(ctx context.Context) func(context.Context) error
 // AdmissionHeader returns the admission header for work done in the context
 // of this transaction.
 func (txn *Txn) AdmissionHeader() roachpb.AdmissionHeader {
-	return txn.admissionHeader
+	h := txn.admissionHeader
+	if txn.mu.sender.IsLocking() {
+		// Assign higher priority to requests by txns that are locking, so that
+		// they release locks earlier. Note that this is a crude approach, and is
+		// worse than priority inheritance used for locks in realtime systems. We
+		// do this because admission control does not have visibility into the
+		// exact locks held by waiters in the admission queue, and cannot compare
+		// that with priorities of waiting requests in the various lock table
+		// queues. This crude approach has shown some benefit in tpcc with 3000
+		// warehouses, where it halved the number of lock waiters, and increased
+		// the transaction throughput by 10+%. In that experiment 40% of the
+		// BatchRequests evaluated by KV had been assigned high priority due to
+		// locking.
+		h.Priority = int32(admission.HighPri)
+	}
+	return h
 }

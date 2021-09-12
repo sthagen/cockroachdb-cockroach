@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/cliccl/cliflagsccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
+	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -59,7 +60,7 @@ Specifying --active-store-key-id-only prints the key ID of the active store key
 and exits.
 `,
 		Args: cobra.ExactArgs(1),
-		RunE: cli.MaybeDecorateGRPCError(runEncryptionStatus),
+		RunE: clierrorplus.MaybeDecorateError(runEncryptionStatus),
 	}
 
 	encryptionActiveKeyCmd := &cobra.Command{
@@ -74,7 +75,7 @@ Plaintext:            # encryption not enabled
 AES128_CTR:be235...   # AES-128 encryption with store key ID
 `,
 		Args: cobra.ExactArgs(1),
-		RunE: cli.MaybeDecorateGRPCError(runEncryptionActiveKey),
+		RunE: clierrorplus.MaybeDecorateError(runEncryptionActiveKey),
 	}
 
 	// Add commands to the root debug command.
@@ -330,7 +331,7 @@ func getActiveEncryptionkey(dir string) (string, string, error) {
 
 	var setting enginepbccl.EncryptionSettings
 	if err := protoutil.Unmarshal(entry.EncryptionSettings, &setting); err != nil {
-		return "", "", fmt.Errorf("could not unmarshal encryption settings for %s: %v", keyRegistryFilename, err)
+		return "", "", errors.Wrapf(err, "could not unmarshal encryption settings for %s", keyRegistryFilename)
 	}
 
 	return setting.EncryptionType.String(), setting.KeyId, nil

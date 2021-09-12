@@ -23,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
+	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -35,8 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	_ "github.com/cockroachdb/cockroach/pkg/storage/cloudimpl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -388,7 +388,11 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			mockRestoreDataProcessor, err := newTestingRestoreDataProcessor(ctx, &evalCtx, &flowCtx,
 				mockRestoreDataSpec)
 			require.NoError(t, err)
-			_, err = mockRestoreDataProcessor.processRestoreSpanEntry(restoreSpanEntry)
+			ssts := make(chan mergedSST, 1)
+			require.NoError(t, mockRestoreDataProcessor.openSSTs(restoreSpanEntry, ssts))
+			close(ssts)
+			sst := <-ssts
+			_, err = mockRestoreDataProcessor.processRestoreSpanEntry(sst)
 			require.NoError(t, err)
 
 			clientKVs, err := kvDB.Scan(ctx, reqStartKey, reqEndKey, 0)

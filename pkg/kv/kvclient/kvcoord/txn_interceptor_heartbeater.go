@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -187,14 +188,9 @@ func (h *txnHeartbeater) SendLocked(
 			ba.Txn.Key = anchor
 		}
 
-		// Start the heartbeat loop if it has not already started and this batch
-		// is not intending to commit/abort the transaction.
+		// Start the heartbeat loop if it has not already started.
 		if !h.mu.loopStarted {
-			if !hasET {
-				if err := h.startHeartbeatLoopLocked(ctx); err != nil {
-					return nil, roachpb.NewError(err)
-				}
-			}
+			h.startHeartbeatLoopLocked(ctx)
 		}
 	}
 
@@ -204,6 +200,10 @@ func (h *txnHeartbeater) SendLocked(
 		// Set the EndTxn request's TxnHeartbeating flag. Set to true if
 		// a hearbeat loop was started which indicates that transaction has
 		// a transaction record.
+		//
+		// TODO(erikgrinaker): In v21.2 we always heartbeat the txn record, so
+		// this field is never used. However, we still need to set it when
+		// interacting with v21.1 nodes. We can remove this field in v22.1.
 		et.TxnHeartbeating = h.mu.loopStarted
 
 		// Preemptively stop the heartbeat loop in case of transaction abort.
@@ -282,26 +282,45 @@ func (h *txnHeartbeater) closeLocked() {
 }
 
 // startHeartbeatLoopLocked starts a heartbeat loop in a different goroutine.
-func (h *txnHeartbeater) startHeartbeatLoopLocked(ctx context.Context) error {
+func (h *txnHeartbeater) startHeartbeatLoopLocked(ctx context.Context) {
+	if h.loopInterval < 0 {
+		log.Infof(ctx, "coordinator heartbeat loop disabled")
+		return
+	}
 	if h.mu.loopStarted {
 		log.Fatal(ctx, "attempting to start a second heartbeat loop")
 	}
-	log.VEventf(ctx, 2, "coordinator spawns heartbeat loop")
+	log.VEventf(ctx, 2, kvbase.SpawningHeartbeatLoopMsg)
 	h.mu.loopStarted = true
 	// NB: we can't do this in init() because the txn isn't populated yet then
 	// (it's zero).
 	h.AmbientContext.AddLogTag("txn-hb", h.mu.txn.Short())
 
+	const taskName = "[async] kv.TxnCoordSender: heartbeat loop"
+
 	// Create a new context so that the heartbeat loop doesn't inherit the
 	// caller's cancelation.
-	// We want the loop to run in a span linked to the current one, though, so we
-	// put our span in the new context and expect RunAsyncTask to fork it
-	// immediately.
-	hbCtx := h.AnnotateCtx(context.Background())
-	hbCtx = tracing.ContextWithSpan(hbCtx, tracing.SpanFromContext(ctx))
-	hbCtx, h.mu.loopCancel = context.WithCancel(hbCtx)
+	hbCtx, hbCancel := context.WithCancel(h.AnnotateCtx(context.Background()))
 
-	return h.stopper.RunAsyncTask(hbCtx, "kv.TxnCoordSender: heartbeat loop", h.heartbeatLoop)
+	// Delay spawning the loop goroutine until the first loopInterval passes, to
+	// avoid the associated cost for small write transactions. In benchmarks,
+	// this gave a 3% throughput increase for point writes at high concurrency.
+	timer := time.AfterFunc(h.loopInterval, func() {
+		// We want the loop to run in a span linked to the current one, so we put
+		// our span in the context and fork it.
+		var span *tracing.Span
+		hbCtx = tracing.ContextWithSpan(hbCtx, tracing.SpanFromContext(ctx))
+		hbCtx, span = tracing.ForkSpan(hbCtx, taskName)
+		defer span.Finish()
+
+		// Only errors on quiesce, which is safe to ignore.
+		_ = h.stopper.RunTask(hbCtx, taskName, h.heartbeatLoop)
+	})
+
+	h.mu.loopCancel = func() {
+		timer.Stop()
+		hbCancel()
+	}
 }
 
 func (h *txnHeartbeater) cancelHeartbeatLoopLocked() {
@@ -331,6 +350,11 @@ func (h *txnHeartbeater) heartbeatLoop(ctx context.Context) {
 		ticker := time.NewTicker(h.loopInterval)
 		tickChan = ticker.C
 		defer ticker.Stop()
+	}
+
+	// Loop is only spawned after loopInterval, so heartbeat immediately.
+	if !h.heartbeat(ctx) {
+		return
 	}
 
 	// Loop with ticker for periodic heartbeats.
@@ -448,7 +472,7 @@ func (h *txnHeartbeater) heartbeat(ctx context.Context) bool {
 	return true
 }
 
-// abortTxnAsyncLocked sends an EndTxn(commmit=false) asynchronously.
+// abortTxnAsyncLocked sends an EndTxn(commit=false) asynchronously.
 // The purpose of the async cleanup is to resolve transaction intents as soon
 // as possible when a transaction coordinator observes an ABORTED transaction.
 func (h *txnHeartbeater) abortTxnAsyncLocked(ctx context.Context) {

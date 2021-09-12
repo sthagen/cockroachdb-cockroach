@@ -114,6 +114,10 @@ type TestServerInterface interface {
 	// MigrationServer returns the internal *migrationServer as in interface{}
 	MigrationServer() interface{}
 
+	// SpanConfigAccessor returns the underlying spanconfig.KVAccessor as an
+	// interface{}.
+	SpanConfigAccessor() interface{}
+
 	// SQLServer returns the *sql.Server as an interface{}.
 	SQLServer() interface{}
 
@@ -236,6 +240,9 @@ type TestServerInterface interface {
 
 	// MetricsRecorder periodically records node-level and store-level metrics.
 	MetricsRecorder() *status.MetricsRecorder
+
+	// CollectionFactory returns a *descs.CollectionFactory.
+	CollectionFactory() interface{}
 
 	// TestingKnobs returns the TestingKnobs in use by the test
 	// server.

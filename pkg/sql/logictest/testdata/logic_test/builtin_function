@@ -1777,6 +1777,21 @@ SELECT array_length(ARRAY['a'], 2)
 NULL
 
 query I
+SELECT cardinality(ARRAY['a', 'b'])
+----
+2
+
+query I
+SELECT cardinality(ARRAY[]:::int[])
+----
+0
+
+query I
+SELECT cardinality(NULL:::int[])
+----
+NULL
+
+query I
 SELECT array_lower(ARRAY['a', 'b'], 1)
 ----
 1
@@ -2039,6 +2054,7 @@ VALUES (format_type('anyelement'::regtype, -1)),
        (format_type('regnamespace'::regtype, -1)),
        (format_type('regproc'::regtype, -1)),
        (format_type('regprocedure'::regtype, -1)),
+       (format_type('regrole'::regtype, -1)),
        (format_type('regtype'::regtype, -1)),
        (format_type('string'::regtype, -1)),
        (format_type('time'::regtype, -1)),
@@ -2082,6 +2098,7 @@ regclass
 regnamespace
 regproc
 regprocedure
+regrole
 regtype
 text
 time without time zone

@@ -1,11 +1,11 @@
 {
   "pgVersion": "13.3",
   "diffSummary": {
-    "TotalTables": 90,
-    "TotalColumns": 753,
-    "MissingTables": 0,
+    "TotalTables": 129,
+    "TotalColumns": 1130,
+    "MissingTables": 4,
     "MissingColumns": 1,
-    "DatatypeMismatches": 18
+    "DatatypeMismatches": 20
   },
   "pgMetadata": {
     "pg_am": {
@@ -133,6 +133,24 @@
         "expectedDataType": "_text"
       }
     },
+    "pg_stat_activity": {
+      "client_port": {
+        "oid": 20,
+        "dataType": "int8",
+        "expectedOid": 23,
+        "expectedDataType": "int4"
+      },
+      "pid": {
+        "oid": 20,
+        "dataType": "int8",
+        "expectedOid": 23,
+        "expectedDataType": "int4"
+      }
+    },
+    "pg_statistic": {},
+    "pg_statistic_ext_data": {},
+    "pg_stats": {},
+    "pg_stats_ext": {},
     "pg_user": {
       "valuntil": {
         "oid": 1114,
@@ -143,6 +161,9 @@
     }
   },
   "unimplementedTypes": {
-    "2277": "anyarray"
+    "2277": "anyarray",
+    "3361": "pg_ndistinct",
+    "3402": "pg_dependencies",
+    "5017": "pg_mcv_list"
   }
 }

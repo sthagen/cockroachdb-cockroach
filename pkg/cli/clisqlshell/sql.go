@@ -31,14 +31,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/docs"
-	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/scanner"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlfsm"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	readline "github.com/knz/go-libedit"
 )
@@ -62,7 +61,9 @@ Query Buffer
   \| CMD            run an external command and run its output as SQL statements.
 
 Connection
-  \c, \connect [DB] connect to a new database
+  \c, \connect {[DB] [USER] [HOST] [PORT] | [URL]}
+                    connect to a server or print the current connection URL.
+                    (Omitted values reuse previous parameters. Use '-' to skip a field.)
 
 Input/Output
   \echo [STRING]    write the provided string to standard output.
@@ -259,8 +260,7 @@ func (c *cliState) addHistory(line string) {
 	// persist to disk (if ins's history file is set). err can
 	// be not nil only if it got a IO error while trying to persist.
 	if err := c.ins.AddHistory(line); err != nil {
-		log.Warningf(context.TODO(), "cannot save command-line history: %s", err)
-		log.Info(context.TODO(), "command-line history will not be saved in this session")
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot save command-line history: %v\n", err)
 		c.ins.SetAutoSaveHistory("", false)
 	}
 }
@@ -531,7 +531,7 @@ func (c *cliState) handleUnset(args []string, nextState, errState cliStateEnum) 
 }
 
 func isEndOfStatement(lastTok int) bool {
-	return lastTok == ';' || lastTok == parser.HELPTOKEN
+	return lastTok == ';' || lastTok == lexbase.HELPTOKEN
 }
 
 // handleDemo handles operations on \demo.
@@ -629,21 +629,15 @@ func (c *cliState) handleDemoNodeCommands(
 
 // handleHelp prints SQL help.
 func (c *cliState) handleHelp(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
-	cmdrest := strings.TrimSpace(strings.Join(cmd, " "))
-	command := strings.ToUpper(cmdrest)
-	if command == "" {
-		fmt.Print(parser.AllHelp)
+	command := strings.TrimSpace(strings.Join(cmd, " "))
+	helpText, _ := c.serverSideParse(command + " ??")
+	if helpText != "" {
+		fmt.Fprintln(c.iCtx.stdout, helpText)
 	} else {
-		if h, ok := parser.HelpMessages[command]; ok {
-			msg := parser.HelpMessage{Command: command, HelpMessageBody: h}
-			msg.Format(c.iCtx.stdout)
-			fmt.Fprintln(c.iCtx.stdout)
-		} else {
-			fmt.Fprintf(c.iCtx.stderr,
-				"no help available for %q.\nTry \\h with no argument to see available help.\n", cmdrest)
-			c.exitErr = errors.New("no help available")
-			return errState
-		}
+		fmt.Fprintf(c.iCtx.stderr,
+			"no help available for %q.\nTry \\h with no argument to see available help.\n", command)
+		c.exitErr = errors.New("no help available")
+		return errState
 	}
 	return nextState
 }
@@ -651,21 +645,14 @@ func (c *cliState) handleHelp(cmd []string, nextState, errState cliStateEnum) cl
 // handleFunctionHelp prints help about built-in functions.
 func (c *cliState) handleFunctionHelp(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
 	funcName := strings.TrimSpace(strings.Join(cmd, " "))
-	if funcName == "" {
-		for _, f := range builtins.AllBuiltinNames {
-			fmt.Fprintln(c.iCtx.stdout, f)
-		}
-		fmt.Fprintln(c.iCtx.stdout)
+	helpText, _ := c.serverSideParse(fmt.Sprintf("select %s(??", funcName))
+	if helpText != "" {
+		fmt.Fprintln(c.iCtx.stdout, helpText)
 	} else {
-		helpText, _ := c.serverSideParse(fmt.Sprintf("select %s(??", funcName))
-		if helpText != "" {
-			fmt.Fprintln(c.iCtx.stdout, helpText)
-		} else {
-			fmt.Fprintf(c.iCtx.stderr,
-				"no help available for %q.\nTry \\hf with no argument to see available help.\n", funcName)
-			c.exitErr = errors.New("no help available")
-			return errState
-		}
+		fmt.Fprintf(c.iCtx.stderr,
+			"no help available for %q.\nTry \\hf with no argument to see available help.\n", funcName)
+		c.exitErr = errors.New("no help available")
+		return errState
 	}
 	return nextState
 }
@@ -706,7 +693,7 @@ func (c *cliState) runSyscmd(line string, nextState, errState cliStateEnum) cliS
 		return errState
 	}
 
-	fmt.Print(cmdOut)
+	fmt.Fprint(c.iCtx.stdout, cmdOut)
 	return nextState
 }
 
@@ -844,13 +831,13 @@ func (c *cliState) refreshTransactionStatus() {
 
 	// Change the prompt based on the response from the server.
 	switch txnString {
-	case sql.NoTxnStateStr:
+	case sqlfsm.NoTxnStateStr:
 		c.lastKnownTxnStatus = ""
-	case sql.AbortedStateStr:
+	case sqlfsm.AbortedStateStr:
 		c.lastKnownTxnStatus = " ERROR"
-	case sql.CommitWaitStateStr:
+	case sqlfsm.CommitWaitStateStr:
 		c.lastKnownTxnStatus = "  DONE"
-	case sql.OpenStateStr:
+	case sqlfsm.OpenStateStr:
 		// The state AutoRetry is reported by the server as Open, so no need to
 		// handle it here.
 		c.lastKnownTxnStatus = "  OPEN"
@@ -883,6 +870,7 @@ func (c *cliState) refreshDatabaseName() string {
 
 	// Preserve the current database name in case of reconnects.
 	c.conn.SetCurrentDatabase(dbName)
+	c.iCtx.dbName = dbName
 
 	return dbName
 }
@@ -1140,6 +1128,10 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		return c.handleHelp(cmd[1:], loopState, errState)
 
 	case `\hf`:
+		if len(cmd) == 1 {
+			c.concatLines = `SELECT DISTINCT proname AS function FROM pg_proc ORDER BY 1`
+			return cliRunStatement
+		}
 		return c.handleFunctionHelp(cmd[1:], loopState, errState)
 
 	case `\l`:
@@ -1169,12 +1161,7 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
 
 	case `\connect`, `\c`:
-		if len(cmd) == 2 {
-			c.concatLines = `USE ` + cmd[1]
-			return cliRunStatement
-
-		}
-		return c.invalidSyntax(errState, `%s. Try \? for help`, c.lastInputLine)
+		return c.handleConnect(cmd[1:], loopState, errState)
 
 	case `\x`:
 		format := clisqlexec.TableDisplayRecords
@@ -1210,6 +1197,159 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	}
 
 	return loopState
+}
+
+func (c *cliState) handleConnect(
+	cmd []string, loopState, errState cliStateEnum,
+) (resState cliStateEnum) {
+	if err := c.handleConnectInternal(cmd); err != nil {
+		fmt.Fprintln(c.iCtx.stderr, err)
+		c.exitErr = err
+		return errState
+	}
+	return loopState
+}
+
+func (c *cliState) handleConnectInternal(cmd []string) error {
+	firstArgIsURL := len(cmd) > 0 &&
+		(strings.HasPrefix(cmd[0], "postgres://") ||
+			strings.HasPrefix(cmd[0], "postgresql://"))
+
+	if len(cmd) == 1 && firstArgIsURL {
+		// Note: we use a custom URL parser here to inherit the complex
+		// custom logic from crdb's own handling of --url in `cockroach
+		// sql`.
+		parseURL := c.sqlCtx.ParseURL
+		if parseURL == nil {
+			parseURL = pgurl.Parse
+		}
+		purl, err := parseURL(cmd[0])
+		if err != nil {
+			return err
+		}
+		return c.switchToURL(purl)
+	}
+
+	// currURL is the previous connection URL up to this point.
+	currURL, err := pgurl.Parse(c.conn.GetURL())
+	if err != nil {
+		return errors.Wrap(err, "parsing current connection URL")
+	}
+
+	// Reuse the current database from the session if known
+	// (debug mode disabled, database in prompt), otherwise
+	// from the current URL.
+	dbName := c.iCtx.dbName
+	if dbName == "" {
+		dbName = currURL.GetDatabase()
+	}
+
+	// Extract the current config.
+	prevproto, prevhost, prevport := currURL.GetNetworking()
+	tlsUsed, mode, caCertPath := currURL.GetTLSOptions()
+
+	// newURL will be our new connection URL past this point.
+	newURL := pgurl.New()
+	// Populate the main fields from the current URL.
+	newURL.
+		WithDefaultHost(prevhost).
+		WithDefaultPort(prevport).
+		WithDefaultDatabase(dbName).
+		WithDefaultUsername(currURL.GetUsername())
+	if tlsUsed {
+		newURL.WithTransport(pgurl.TransportTLS(mode, caCertPath))
+	} else {
+		newURL.WithTransport(pgurl.TransportNone())
+	}
+
+	// Parse the arguments to \connect:
+	// it accepts newdb, user, host, port in that order.
+	// Each field can be marked as "-" to reuse the current defaults.
+	switch len(cmd) {
+	case 4:
+		if cmd[3] != "-" {
+			if err := newURL.SetOption("port", cmd[3]); err != nil {
+				return err
+			}
+		}
+		fallthrough
+	case 3:
+		if cmd[2] != "-" {
+			if err := newURL.SetOption("host", cmd[2]); err != nil {
+				return err
+			}
+		}
+		fallthrough
+	case 2:
+		if cmd[1] != "-" {
+			if err := newURL.SetOption("user", cmd[1]); err != nil {
+				return err
+			}
+		}
+		fallthrough
+	case 1:
+		if cmd[0] != "-" {
+			if err := newURL.SetOption("database", cmd[0]); err != nil {
+				return err
+			}
+		}
+	case 0:
+		// Just print the current connection settings.
+		dbName := c.iCtx.dbName
+		if dbName == "" {
+			dbName = currURL.GetDatabase()
+		}
+		fmt.Fprintf(c.iCtx.stdout, "Connection string: %s\n", currURL.ToPQ())
+		fmt.Fprintf(c.iCtx.stdout, "You are connected to database %q as user %q.\n", dbName, currURL.GetUsername())
+		return nil
+
+	default:
+		return errors.Newf(`unknown syntax: \c %s`, strings.Join(cmd, " "))
+	}
+
+	// If we are reconnecting to the same server with the same user, reuse
+	// the authentication credentials present inside the URL, if any.
+	// We do take care to avoid reusing the password however, for two separate
+	// reasons:
+	// - if the connection has just failed because of an invalid password,
+	//   we don't want to fix the invalid password in the URL.
+	// - the transport may be insecure, in which case we want to give
+	//   the user the opportunity to think twice about entering their
+	//   password over an untrusted link.
+	if proto, host, port := newURL.GetNetworking(); proto == prevproto &&
+		host == prevhost && port == prevport &&
+		newURL.GetUsername() == currURL.GetUsername() {
+		// Remove the password from the current URL.
+		currURL.ClearPassword()
+
+		// Migrate the details from the previous URL to the new one.
+		prevAuthn, err := currURL.GetAuthnOption()
+		if err != nil {
+			return err
+		}
+		newURL.WithAuthn(prevAuthn)
+	}
+
+	if err := newURL.Validate(); err != nil {
+		return errors.Wrap(err, "validating the new URL")
+	}
+
+	return c.switchToURL(newURL)
+}
+
+func (c *cliState) switchToURL(newURL *pgurl.URL) error {
+	fmt.Fprintln(c.iCtx.stdout, "using new connection URL:", newURL)
+
+	// Ensure the new connection will prompt for a password if the
+	// server requires one.
+	usePw, pwSet, _ := newURL.GetAuthnPassword()
+
+	if err := c.conn.Close(); err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: error while closing connection: %v\n", err)
+	}
+	c.conn.SetURL(newURL.ToPQ().String())
+	c.conn.SetMissingPassword(!usePw || !pwSet)
+	return nil
 }
 
 const maxRecursionLevels = 10
@@ -1291,7 +1431,7 @@ func (c *cliState) doPrepareStatementLine(
 		return startState
 	}
 
-	lastTok, ok := parser.LastLexicalToken(c.concatLines)
+	lastTok, ok := scanner.LastLexicalToken(c.concatLines)
 	endOfStmt := isEndOfStatement(lastTok)
 	if c.partialStmtsLen == 0 && !ok {
 		// More whitespace, or comments. Still nothing to do. However
@@ -1452,6 +1592,11 @@ func (c *cliState) doDecidePath() cliStateEnum {
 }
 
 // NewShell instantiates a cliState.
+//
+// In simple uses of the SQL shell (e.g. in the standalone
+// cockroach-sql), the urlParser argument can be set to pgurl.Parse;
+// however CockroachDB's own CLI package has a more advanced URL
+// parser that is used instead.
 func NewShell(
 	cliCtx *clicfg.Context,
 	sqlConnCtx *clisqlclient.Context,
@@ -1588,7 +1733,7 @@ func (c *cliState) configurePreShellDefaults(
 			true, /* wideChars */
 			cmdIn, c.iCtx.stdout, c.iCtx.stderr)
 		if errors.Is(c.exitErr, readline.ErrWidecharNotSupported) {
-			log.Warning(context.TODO(), "wide character support disabled")
+			fmt.Fprintln(c.iCtx.stderr, "warning: wide character support disabled")
 			c.ins, c.exitErr = readline.InitFiles("cockroach",
 				false, cmdIn, c.iCtx.stdout, c.iCtx.stderr)
 		}
@@ -1626,18 +1771,17 @@ func (c *cliState) configurePreShellDefaults(
 
 		c.ins.SetCompleter(c)
 		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
-			log.Warningf(context.TODO(), "cannot enable history: %v", err)
+			fmt.Fprintf(c.iCtx.stderr, "warning: cannot enable history: %v\n ", err)
 		} else {
 			homeDir, err := envutil.HomeDir()
 			if err != nil {
-				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
-				log.Warning(context.TODO(), "history will not be saved")
+				fmt.Fprintf(c.iCtx.stderr, "warning: cannot retrieve user information: %v\nwarning: history will not be saved\n", err)
 			} else {
 				histFile := filepath.Join(homeDir, cmdHistFile)
 				err = c.ins.LoadHistory(histFile)
 				if err != nil {
-					log.Warningf(context.TODO(), "cannot load the command-line history (file corrupted?): %v", err)
-					log.Warning(context.TODO(), "the history file will be cleared upon first entry")
+					fmt.Fprintf(c.iCtx.stderr, "warning: cannot load the command-line history (file corrupted?): %v\n", err)
+					fmt.Fprintf(c.iCtx.stderr, "note: the history file will be cleared upon first entry\n")
 				}
 				c.ins.SetAutoSaveHistory(histFile, true)
 			}
@@ -1712,7 +1856,7 @@ func (c *cliState) runStatements(stmts []string) error {
 // extracts a help string if available.
 func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 	cols, rows, err := c.sqlExecCtx.RunQuery(c.conn,
-		clisqlclient.MakeQuery("SHOW SYNTAX "+lex.EscapeSQLString(sql)),
+		clisqlclient.MakeQuery("SHOW SYNTAX "+lexbase.EscapeSQLString(sql)),
 		true)
 	if err != nil {
 		// The query failed with some error. This is not a syntax error
@@ -1742,6 +1886,13 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 			}
 		}
 		// Is it a help text?
+		//
+		// The string here must match the constant string
+		// parser.specialHelpErrorPrefix. The second string must match
+		// the constant string parser.helpHintPrefix.
+		//
+		// However, we cannot include the 'parser' package here because it
+		// would incur a hughe dependency overhead.
 		if strings.HasPrefix(message, "help token in input") && strings.HasPrefix(hint, "help:") {
 			// Yes: return it.
 			helpText = hint[6:]

@@ -13,7 +13,7 @@ package delegate
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
@@ -44,7 +44,7 @@ ORDER BY database_name
 		sqltelemetry.IncrementShowCounter(sqltelemetry.RegionsFromDatabase)
 		dbName := string(n.DatabaseName)
 		if dbName == "" {
-			dbName = d.evalCtx.SessionData.Database
+			dbName = d.evalCtx.SessionData().Database
 		}
 		// Note the LEFT JOIN here -- in the case where regions no longer exist on the cluster
 		// but still exist on the database config, we want to still see this database region
@@ -70,7 +70,7 @@ FROM [
 LEFT JOIN zones_table ON (r.region = zones_table.region)
 ORDER BY "primary" DESC, "region"`,
 			zonesClause,
-			lex.EscapeSQLString(dbName),
+			lexbase.EscapeSQLString(dbName),
 		)
 		return parse(query)
 

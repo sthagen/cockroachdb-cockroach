@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -52,7 +53,9 @@ type SchemaResolver interface {
 // ObjectNameExistingResolver is the helper interface to resolve table
 // names when the object is expected to exist already. The boolean passed
 // is used to specify if a MutableTableDescriptor is to be returned in the
-// result.
+// result. ResolvedObjectPrefix should always be populated by implementors
+// to allows us to generate errors at higher level layers, since it allows
+// us to know if the schema and database were found.
 type ObjectNameExistingResolver interface {
 	LookupObject(
 		ctx context.Context, flags tree.ObjectLookupFlags,
@@ -295,16 +298,24 @@ func ResolveSchemaNameByID(
 		return "", err
 	}
 	if schema, ok := schemas[schemaID]; ok {
-		return schema, nil
+		return schema.Name, nil
 	}
 	return "", errors.Newf("unable to resolve schema id %d for db %d", schemaID, dbID)
 }
 
+// SchemaEntryForDB entry for an individual schema,
+// which includes the name and modification timestamp.
+type SchemaEntryForDB struct {
+	Name      string
+	Timestamp hlc.Timestamp
+}
+
 // GetForDatabase looks up and returns all available
-// schema ids to names for a given database.
+// schema ids to SchemaEntryForDB structures for a
+//given database.
 func GetForDatabase(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID descpb.ID,
-) (map[descpb.ID]string, error) {
+) (map[descpb.ID]SchemaEntryForDB, error) {
 	log.Eventf(ctx, "fetching all schema descriptor IDs for %d", dbID)
 
 	nameKey := catalogkeys.MakeSchemaNameKey(codec, dbID, "" /* name */)
@@ -316,9 +327,12 @@ func GetForDatabase(
 	// Always add public schema ID.
 	// TODO(solon): This can be removed in 20.2, when this is always written.
 	// In 20.1, in a migrating state, it may be not included yet.
-	ret := make(map[descpb.ID]string, len(kvs)+1)
-	ret[descpb.ID(keys.PublicSchemaID)] = tree.PublicSchema
-
+	ret := make(map[descpb.ID]SchemaEntryForDB, len(kvs)+1)
+	ret[descpb.ID(keys.PublicSchemaID)] =
+		SchemaEntryForDB{
+			Name:      tree.PublicSchema,
+			Timestamp: txn.ReadTimestamp(),
+		}
 	for _, kv := range kvs {
 		id := descpb.ID(kv.ValueInt())
 		if _, ok := ret[id]; ok {
@@ -328,7 +342,10 @@ func GetForDatabase(
 		if err != nil {
 			return nil, err
 		}
-		ret[id] = k.GetName()
+		ret[id] = SchemaEntryForDB{
+			Name:      k.GetName(),
+			Timestamp: kv.Value.Timestamp,
+		}
 	}
 	return ret, nil
 }
@@ -370,9 +387,21 @@ func ResolveExisting(
 		// schema name is for a virtual schema.
 		_, isVirtualSchema := catconstants.VirtualSchemaNames[u.Schema()]
 		if isVirtualSchema || curDb != "" {
-			if found, prefix, result, err = r.LookupObject(ctx, lookupFlags, curDb, u.Schema(), u.Object()); found || err != nil {
+			if found, prefix, result, err = r.LookupObject(ctx, lookupFlags, curDb, u.Schema(), u.Object()); found ||
+				err != nil || isVirtualSchema {
 				prefix.ExplicitDatabase = false
 				prefix.ExplicitSchema = true
+				if !found && err == nil && isVirtualSchema && prefix.Database == nil {
+					// If the database was not found during the lookup for a virtual schema
+					// we should return a database not found error. We will use the prefix
+					// information to confirm this, since its possible that someone might
+					// be selecting a non-existent table or type. While normally we generate
+					// errors above this layer, we have no way of flagging if the looked up object
+					// was virtual schema. The Required flag is never set above when doing
+					// the object look up, so no errors will be generated for missing objects
+					// or databases.
+					err = sqlerrors.NewUndefinedDatabaseError(curDb)
+				}
 				return found, prefix, result, err
 			}
 		}
@@ -487,7 +516,6 @@ func ResolveObjectNamePrefix(
 			if err == nil {
 				tp.CatalogName = tp.SchemaName
 				tp.SchemaName = tree.PublicSchemaName
-				tp.ExplicitCatalog = true
 				tp.ExplicitCatalog = true
 			}
 			return found, scMeta, err

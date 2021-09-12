@@ -28,8 +28,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
+	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -44,8 +47,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -149,7 +150,7 @@ func init() {
 		Short: "show backup summary",
 		Long:  "Shows summary of meta information about a SQL backup.",
 		Args:  cobra.ExactArgs(1),
-		RunE:  cli.MaybeDecorateGRPCError(runShowCmd),
+		RunE:  clierrorplus.MaybeDecorateError(runShowCmd),
 	}
 
 	listBackupsCmd := &cobra.Command{
@@ -157,7 +158,7 @@ func init() {
 		Short: "show backups in collection",
 		Long:  "Shows full backup paths in a backup collection.",
 		Args:  cobra.ExactArgs(1),
-		RunE:  cli.MaybeDecorateGRPCError(runListBackupsCmd),
+		RunE:  clierrorplus.MaybeDecorateError(runListBackupsCmd),
 	}
 
 	listIncrementalCmd := &cobra.Command{
@@ -165,7 +166,7 @@ func init() {
 		Short: "show incremental backups",
 		Long:  "Shows incremental chain of a SQL backup.",
 		Args:  cobra.ExactArgs(1),
-		RunE:  cli.MaybeDecorateGRPCError(runListIncrementalCmd),
+		RunE:  clierrorplus.MaybeDecorateError(runListIncrementalCmd),
 	}
 
 	exportDataCmd := &cobra.Command{
@@ -173,7 +174,7 @@ func init() {
 		Short: "export table data from a backup",
 		Long:  "export table data from a backup, requires specifying --table to export data from",
 		Args:  cobra.MinimumNArgs(1),
-		RunE:  cli.MaybeDecorateGRPCError(runExportDataCmd),
+		RunE:  clierrorplus.MaybeDecorateError(runExportDataCmd),
 	}
 
 	backupCmds := &cobra.Command{
@@ -280,8 +281,10 @@ func newBlobFactory(ctx context.Context, dialing roachpb.NodeID) (blobs.BlobClie
 func externalStorageFromURIFactory(
 	ctx context.Context, uri string, user security.SQLUsername,
 ) (cloud.ExternalStorage, error) {
+	defaultSettings := &cluster.Settings{}
+	defaultSettings.SV.Init(ctx, nil /* opaque */)
 	return cloud.ExternalStorageFromURI(ctx, uri, base.ExternalIODirConfig{},
-		cluster.NoSettings, newBlobFactory, user, nil /*Internal Executor*/, nil /*kvDB*/)
+		defaultSettings, newBlobFactory, user, nil /*Internal Executor*/, nil /*kvDB*/)
 }
 
 func getManifestFromURI(ctx context.Context, path string) (backupccl.BackupManifest, error) {
@@ -461,7 +464,7 @@ func evalAsOfTimestamp(
 	}
 	var err error
 	// Attempt to parse as timestamp.
-	if ts, _, err := pgdate.ParseTimestampWithoutTimezone(timeutil.Now(), pgdate.ParseModeYMD, readTime); err == nil {
+	if ts, _, err := pgdate.ParseTimestampWithoutTimezone(timeutil.Now(), pgdate.DateStyle{Order: pgdate.Order_MDY}, readTime); err == nil {
 		readTS := hlc.Timestamp{WallTime: ts.UnixNano()}
 		return readTS, nil
 	}
@@ -600,6 +603,7 @@ func makeRowFetcher(
 		false, /*reverse*/
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		0,     /* lockTimeout */
 		false, /*isCheck*/
 		&rowenc.DatumAlloc{},
 		nil, /*mon.BytesMonitor*/

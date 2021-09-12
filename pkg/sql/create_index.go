@@ -33,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -363,8 +362,8 @@ func validateIndexColumnsExist(desc *tabledesc.Mutable, columns tree.IndexElemLi
 	return nil
 }
 
-// replaceExpressionElemsWithVirtualCols replaces each IndexElem in n with a
-// non-nil Expr with an inaccessible virtual column with the same expression. If
+// replaceExpressionElemsWithVirtualCols replaces each non-nil expression in
+// elems with an inaccessible virtual column with the same expression. If
 // isNewTable is true, the column is added directly to desc. Otherwise, the
 // virtual column is added to desc as a mutation column.
 func replaceExpressionElemsWithVirtualCols(
@@ -382,10 +381,6 @@ func replaceExpressionElemsWithVirtualCols(
 	for i := range elems {
 		elem := &elems[i]
 		if elem.Expr != nil {
-			if !sessionData.EnableExpressionIndexes {
-				return unimplemented.NewWithIssuef(9682, "only simple columns are supported as index elements")
-			}
-
 			if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.ExpressionIndexes) {
 				return pgerror.Newf(pgcode.FeatureNotSupported,
 					"version %v must be finalized to use expression indexes",
@@ -486,6 +481,9 @@ func replaceExpressionElemsWithVirtualCols(
 			// Set the column name and unset the expression.
 			elem.Column = tree.Name(colName)
 			elem.Expr = nil
+
+			// Increment expression index telemetry.
+			telemetry.Inc(sqltelemetry.ExpressionIndexCounter)
 		}
 	}
 
@@ -528,7 +526,8 @@ func setupShardedIndex(
 		return nil, nil, false, err
 	}
 	shardCol, newColumn, err := maybeCreateAndAddShardCol(int(buckets), tableDesc,
-		colNames, isNewTable)
+		colNames, isNewTable,
+		evalCtx.Settings.Version.IsActive(ctx, clusterversion.UseKeyEncodeForHashShardedIndexes))
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -550,9 +549,9 @@ func setupShardedIndex(
 // `desc`, if one doesn't already exist for the given index column set and number of shard
 // buckets.
 func maybeCreateAndAddShardCol(
-	shardBuckets int, desc *tabledesc.Mutable, colNames []string, isNewTable bool,
+	shardBuckets int, desc *tabledesc.Mutable, colNames []string, isNewTable, useKeyEncodeInExpr bool,
 ) (col catalog.Column, created bool, err error) {
-	shardColDesc, err := makeShardColumnDesc(colNames, shardBuckets)
+	shardColDesc, err := makeShardColumnDesc(colNames, shardBuckets, useKeyEncodeInExpr)
 	if err != nil {
 		return nil, false, err
 	}
@@ -604,17 +603,34 @@ var interleavedTableDisabledError = errors.WithIssueLink(
 	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
 )
 
+var interleavedTableDisabledMigrationError = errors.WithIssueLink(
+	pgerror.New(pgcode.WarningDeprecatedFeature,
+		"creation of new interleaved tables or interleaved indexes is no longer supported and will be ignored."+
+			" For details, see https://www.cockroachlabs.com/docs/releases/v20.2.0#deprecations"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
 // interleavedTableDeprecationAction either returns an error, if interleaved
-// tables are disabled, or sends a notice, if they're not.
-func interleavedTableDeprecationAction(params runParams) error {
+// tables are disabled, or sends a notice, if they're not. Returns any error
+// and if the interleaved option should be ignored.
+func interleavedTableDeprecationAction(params runParams) (ignoreInterleave bool, err error) {
+	// Once interleave tables should be prevented, we should
+	// return a client notice and ignore opeartions.
+	if params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.PreventNewInterleavedTables) {
+		params.p.BufferClientNotice(
+			params.ctx,
+			interleavedTableDisabledMigrationError,
+		)
+		return true, nil
+	}
 	if !InterleavedTablesEnabled.Get(params.p.execCfg.SV()) {
-		return interleavedTableDisabledError
+		return false, interleavedTableDisabledError
 	}
 	params.p.BufferClientNotice(
 		params.ctx,
 		interleavedTableDeprecationError,
 	)
-	return nil
+	return false, nil
 }
 
 func (n *createIndexNode) startExec(params runParams) error {
@@ -658,8 +674,12 @@ func (n *createIndexNode) startExec(params runParams) error {
 			return pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot be partitioned")
 		}
 
-		if err := interleavedTableDeprecationAction(params); err != nil {
+		interleaveIgnored, err := interleavedTableDeprecationAction(params)
+		if err != nil {
 			return err
+		}
+		if interleaveIgnored {
+			n.n.Interleave = nil
 		}
 	}
 
@@ -673,14 +693,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.SecondaryIndexColumnFamiliesCounter)
 	}
 
-	encodingVersion := descpb.SecondaryIndexFamilyFormatVersion
-	if params.p.EvalContext().Settings.Version.IsActive(params.ctx, clusterversion.EmptyArraysInInvertedIndexes) {
-		// descpb.StrictIndexColumnIDGuaranteesVersion is like
-		// descpb.EmptyArraysInInvertedIndexesVersion but allows a stronger level of
-		// descriptor validation checks.
-		encodingVersion = descpb.StrictIndexColumnIDGuaranteesVersion
-	}
-	indexDesc.Version = encodingVersion
+	indexDesc.Version = descpb.StrictIndexColumnIDGuaranteesVersion
 
 	if n.n.PartitionByIndex != nil && n.tableDesc.GetLocalityConfig() != nil {
 		return pgerror.New(
@@ -786,7 +799,7 @@ func (p *planner) configureIndexDescForNewIndexPartitioning(
 				return indexDesc, err
 			}
 		}
-		allowImplicitPartitioning := p.EvalContext().SessionData.ImplicitColumnPartitioningEnabled ||
+		allowImplicitPartitioning := p.EvalContext().SessionData().ImplicitColumnPartitioningEnabled ||
 			tableDesc.IsLocalityRegionalByRow()
 		if partitionBy != nil {
 			newImplicitCols, newPartitioning, err := CreatePartitioning(

@@ -162,14 +162,15 @@ enum TransactionAbortedReason {
   // meantime because the transaction was aborted.
   ABORT_REASON_ABORT_SPAN = 5;
 
-  // A request attempting to create a transaction record encountered a write
-  // timestamp cache entry for the txn key, and the entry identifies this
-  // transaction. This means that the transaction definitely committed or rolled
-  // back before. So, this request is either a delayed replay of some sort, or
-  // it raced with an async abort and lost. If a client gets this
-  // TransactionAbortedError (without it being wrapped in an ambiguous error),
-  // it must be the latter case, and the transaction can be retried.
-  ABORT_REASON_ALREADY_COMMITTED_OR_ROLLED_BACK_POSSIBLE_REPLAY = 6;
+	// A request attempting to create a transaction record encountered a write
+	// timestamp cache entry for the txn key, and the entry identifies this
+	// transaction. This means that the transaction already wrote a transaction
+	// record previously, which may or may not have been removed since. So, this
+	// request is either a delayed replay of some sort, or it raced with an async
+	// abort and lost. If a client gets this TransactionAbortedError (without it
+	// being wrapped in an ambiguous error), it must be the latter case, and the
+	// transaction can be retried.
+	ABORT_REASON_RECORD_ALREADY_WRITTEN_POSSIBLE_REPLAY = 6;
 
   // A request attempting to create a transaction record is not allowed to
   // proceed by the timestamp cache because it cannot be verified that the
@@ -303,6 +304,24 @@ message WriteIntentError {
   // which were discovered under old leases to the lock table.
   optional int64 lease_sequence = 3 [(gogoproto.nullable) = false,
     (gogoproto.casttype) = "LeaseSequence"];
+  enum Reason {
+    // The reason for the WriteIntentError is unspecified. This will
+    // always be the case for errors returned from MVCC.
+    REASON_UNSPECIFIED = 0;
+    // The request used an Error wait policy because it did not want to
+    // wait on locks and it encountered a conflicting lock.
+    REASON_WAIT_POLICY = 1;
+    // The request used a Block wait policy and specified a lock timeout
+    // which expired while waiting for a conflicting lock.
+    REASON_LOCK_TIMEOUT = 2;
+    // The request attempted to wait in a lock wait-queue whose length was
+    // already equal to or exceeding the configured maximum.
+    REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED = 3;
+  }
+  // The reason for the error. Applies to WriteIntentErrors that are
+  // returned from the concurrency manager (the second use described
+  // above).
+  optional Reason reason = 4 [(gogoproto.nullable) = false];
 }
 
 // A WriteTooOldError indicates that a write encountered a versioned
@@ -490,6 +509,8 @@ message RangeFeedRetryError {
     // The consumer was processing events too slowly to keep up with live raft
     // events.
     REASON_SLOW_CONSUMER = 5;
+    // No leaseholder exists or could be created, so closed timestamps won't be emitted.
+    REASON_NO_LEASEHOLDER = 6;
   }
   optional Reason reason = 1 [(gogoproto.nullable) = false];
 }
@@ -519,6 +540,15 @@ message InvalidLeaseError {
 // is never sent over-the-wire, and is a proto only to fit the existing
 // plumbing that passes a roachpb.Error.
 message OptimisticEvalConflictsError {
+}
+
+// MinTimestampBoundUnsatisfiableError indicates that a bounded staleness read
+// could not be satisfied because the latest timestamp at which it could have
+// been evaluated (the resolved timestamp over its key span) was below the
+// read's minimum timestamp bound.
+message MinTimestampBoundUnsatisfiableError {
+  optional util.hlc.Timestamp min_timestamp_bound = 1 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp resolved_timestamp  = 2 [(gogoproto.nullable) = false];
 }
 
 // ErrorDetail is a union type containing all available errors.
@@ -560,6 +590,7 @@ message ErrorDetail {
     IndeterminateCommitError indeterminate_commit = 39;
     InvalidLeaseError invalid_lease_error = 40;
     OptimisticEvalConflictsError optimistic_eval_conflicts = 41;
+    MinTimestampBoundUnsatisfiableError min_timestamp_bound_unsatisfiable = 42;
   }
 }
 

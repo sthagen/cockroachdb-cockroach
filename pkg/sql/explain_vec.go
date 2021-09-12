@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -44,7 +43,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
 	distribution := getPlanDistribution(
 		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeID,
-		params.extendedEvalCtx.SessionData.DistSQLMode, n.plan.main,
+		params.extendedEvalCtx.SessionData().DistSQLMode, n.plan.main,
 	)
 	willDistribute := distribution.WillDistribute()
 	outerSubqueries := params.p.curPlan.subqueryPlans
@@ -63,7 +62,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 
 	distSQLPlanner.FinalizePlan(planCtx, physPlan)
 	flows := physPlan.GenerateFlowSpecs()
-	flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p, &distSQLPlanner.rpcCtx.ClusterID)
+	flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
 
 	// We want to get the vectorized plan which would be executed with the
 	// current 'vectorize' option. If 'vectorize' is set to 'off', then the
@@ -71,7 +70,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	// With all other options, we don't change the setting to the
 	// most-inclusive option as we used to because the plan can be different
 	// based on 'vectorize' setting.
-	if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondatapb.VectorizeOff {
+	if flowCtx.EvalCtx.SessionData().VectorizeMode == sessiondatapb.VectorizeOff {
 		return errors.New("vectorize is set to 'off'")
 	}
 	verbose := n.options.Flags[tree.ExplainFlagVerbose]
@@ -85,16 +84,15 @@ func (n *explainVecNode) startExec(params runParams) error {
 	return nil
 }
 
-func newFlowCtxForExplainPurposes(
-	planCtx *PlanningCtx, p *planner, clusterID *base.ClusterIDContainer,
-) *execinfra.FlowCtx {
+func newFlowCtxForExplainPurposes(planCtx *PlanningCtx, p *planner) *execinfra.FlowCtx {
 	return &execinfra.FlowCtx{
 		NodeID:  planCtx.EvalContext().NodeID,
 		EvalCtx: planCtx.EvalContext(),
 		Cfg: &execinfra.ServerConfig{
 			Settings:       p.execCfg.Settings,
-			ClusterID:      clusterID,
+			ClusterID:      &p.DistSQLPlanner().rpcCtx.ClusterID,
 			VecFDSemaphore: p.execCfg.DistSQLSrv.VecFDSemaphore,
+			NodeDialer:     p.DistSQLPlanner().nodeDialer,
 		},
 		TypeResolverFactory: &descs.DistSQLTypeResolverFactory{
 			Descriptors: p.Descriptors(),

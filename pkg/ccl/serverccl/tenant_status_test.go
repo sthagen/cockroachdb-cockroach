@@ -22,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -35,13 +37,21 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 
 	ctx := context.Background()
 
-	testCluster := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{})
+	serverParams, _ := tests.CreateTestServerParams()
+	testCluster := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{
+		ServerArgs: serverParams,
+	})
 	defer testCluster.Stopper().Stop(ctx)
 
 	server := testCluster.Server(0 /* idx */)
 
 	tenant, sqlDB := serverutils.StartTenant(t, server, base.TestTenantArgs{
 		TenantID: roachpb.MakeTenantID(10 /* id */),
+		TestingKnobs: base.TestingKnobs{
+			SQLStatsKnobs: &sqlstats.TestingKnobs{
+				AOSTClause: "AS OF SYSTEM TIME '-1us'",
+			},
+		},
 	})
 
 	nonTenant := testCluster.Server(1 /* idx */)
@@ -59,7 +69,7 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 		{stmt: `CREATE TABLE posts_t (id INT8 PRIMARY KEY, body STRING)`},
 		{
 			stmt:        `INSERT INTO posts_t VALUES (1, 'foo')`,
-			fingerprint: `INSERT INTO posts_t VALUES (_, _)`,
+			fingerprint: `INSERT INTO posts_t VALUES (_, '_')`,
 		},
 		{stmt: `SELECT * FROM posts_t`},
 	}
@@ -78,7 +88,7 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 		{stmt: `CREATE TABLE posts_nt (id INT8 PRIMARY KEY, body STRING)`},
 		{
 			stmt:        `INSERT INTO posts_nt VALUES (1, 'foo')`,
-			fingerprint: `INSERT INTO posts_nt VALUES (_, _)`,
+			fingerprint: `INSERT INTO posts_nt VALUES (_, '_')`,
 		},
 		{stmt: `SELECT * FROM posts_nt`},
 	}
@@ -101,9 +111,18 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 	tenantStats, err := tenantStatusServer.Statements(ctx, request)
 	require.NoError(t, err)
 
+	combinedStatsRequest := &serverpb.CombinedStatementsStatsRequest{}
+	tenantCombinedStats, err := tenantStatusServer.CombinedStatementStats(ctx, combinedStatsRequest)
+	require.NoError(t, err)
+
 	path := "/_status/statements"
 	var nonTenantStats serverpb.StatementsResponse
 	err = serverutils.GetJSONProto(nonTenant, path, &nonTenantStats)
+	require.NoError(t, err)
+
+	path = "/_status/combinedstmts"
+	var nonTenantCombinedStats serverpb.StatementsResponse
+	err = serverutils.GetJSONProto(nonTenant, path, &nonTenantCombinedStats)
 	require.NoError(t, err)
 
 	checkStatements := func(tc []testCase, actual *serverpb.StatementsResponse) {
@@ -139,9 +158,11 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 
 	// First we verify that we have expected stats from tenants
 	checkStatements(testCaseTenant, tenantStats)
+	checkStatements(testCaseTenant, tenantCombinedStats)
 
 	// Now we verify the non tenant stats are what we expected.
 	checkStatements(testCaseNonTenant, &nonTenantStats)
+	checkStatements(testCaseNonTenant, &nonTenantCombinedStats)
 
 	// Now we verify that tenant and non-tenant have no visibility into each other's stats.
 	for _, tenantStmt := range tenantStats.Statements {
@@ -152,6 +173,18 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 
 	for _, tenantTxn := range tenantStats.Transactions {
 		for _, nonTenantTxn := range nonTenantStats.Transactions {
+			require.NotEqual(t, tenantTxn, nonTenantTxn, "expected tenant to have no visibility to non-tenant's transaction stats, but found:", nonTenantTxn)
+		}
+	}
+
+	for _, tenantStmt := range tenantCombinedStats.Statements {
+		for _, nonTenantStmt := range nonTenantCombinedStats.Statements {
+			require.NotEqual(t, tenantStmt, nonTenantStmt, "expected tenant to have no visibility to non-tenant's statement stats, but found:", nonTenantStmt)
+		}
+	}
+
+	for _, tenantTxn := range tenantCombinedStats.Transactions {
+		for _, nonTenantTxn := range nonTenantCombinedStats.Transactions {
 			require.NotEqual(t, tenantTxn, nonTenantTxn, "expected tenant to have no visibility to non-tenant's transaction stats, but found:", nonTenantTxn)
 		}
 	}

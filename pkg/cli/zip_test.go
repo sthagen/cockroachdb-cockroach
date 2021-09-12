@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -71,8 +72,6 @@ table_name NOT IN (
 	'cluster_contended_indexes',
 	'cluster_contended_tables',
 	'cluster_inflight_traces',
-	'create_statements',
-	'create_type_statements',
 	'cross_db_references',
 	'databases',
 	'forward_dependencies',
@@ -87,7 +86,9 @@ table_name NOT IN (
 	'predefined_comments',
 	'session_trace',
 	'session_variables',
-	'tables'
+	'tables',
+	'statement_statistics',
+	'transaction_statistics'
 )
 ORDER BY name ASC`)
 	assert.NoError(t, err)
@@ -109,7 +110,10 @@ ORDER BY name ASC`)
 
 	var exp []string
 	exp = append(exp, debugZipTablesPerNode...)
-	exp = append(exp, debugZipTablesPerCluster...)
+	for _, t := range debugZipTablesPerCluster {
+		t = strings.TrimPrefix(t, `"".`)
+		exp = append(exp, t)
+	}
 	sort.Strings(exp)
 
 	assert.Equal(t, exp, tables)
@@ -118,6 +122,8 @@ ORDER BY name ASC`)
 // This tests the operation of zip over secure clusters.
 func TestZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	skip.UnderRace(t, "test too slow under race")
 
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
@@ -158,10 +164,10 @@ func TestConcurrentZip(t *testing.T) {
 	ctx := context.Background()
 
 	// Three nodes. We want to see what `zip` thinks when one of the nodes is down.
+	params, _ := tests.CreateTestServerParams()
+	params.Insecure = true
 	tc := testcluster.StartTestCluster(t, 3,
-		base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-			Insecure: true,
-		}})
+		base.TestClusterArgs{ServerArgs: params})
 	defer tc.Stopper().Stop(ctx)
 
 	// Zip it. We fake a CLI test context for this.
@@ -264,11 +270,14 @@ func TestUnavailableZip(t *testing.T) {
 	}
 
 	// Make a 2-node cluster, with an option to make the first node unavailable.
+	params, _ := tests.CreateTestServerParams()
+	params.Insecure = true
 	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {Insecure: true, Knobs: base.TestingKnobs{Store: knobs}},
 			1: {Insecure: true},
 		},
+		ServerArgs: params,
 	})
 	defer tc.Stopper().Stop(context.Background())
 
@@ -325,10 +334,14 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `rpc error: ...`)
 
 	// The number of memory profiles previously collected is not deterministic.
-	re = regexp.MustCompile(`(?m)requesting heap files for node 1\.\.\..*found$`)
-	out = re.ReplaceAllString(out, `requesting heap files for node 1... ? found`)
-	re = regexp.MustCompile(`(?m)\^writing.*memprof*$`)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ heap profiles found$`)
+	out = re.ReplaceAllString(out, `[node ?] ? heap profiles found`)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving (memprof|memstats).*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] writing profile.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+
+	//out = strings.ReplaceAll(out, "\n\n", "\n")
 	return out
 }
 
@@ -349,8 +362,10 @@ func TestPartialZip(t *testing.T) {
 	ctx := context.Background()
 
 	// Three nodes. We want to see what `zip` thinks when one of the nodes is down.
+	params, _ := tests.CreateTestServerParams()
+	params.Insecure = true
 	tc := testcluster.StartTestCluster(t, 3,
-		base.TestClusterArgs{ServerArgs: base.TestServerArgs{Insecure: true}})
+		base.TestClusterArgs{ServerArgs: params})
 	defer tc.Stopper().Stop(ctx)
 
 	// Switch off the second node.
@@ -440,7 +455,9 @@ func TestZipRetries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	params, _ := tests.CreateTestServerParams()
+	params.Insecure = true
+	s, _, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	dir, cleanupFn := testutils.TempDir(t)

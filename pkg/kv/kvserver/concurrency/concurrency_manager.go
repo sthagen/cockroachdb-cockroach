@@ -16,7 +16,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanlatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
@@ -30,6 +29,55 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+)
+
+// MaxLockWaitQueueLength sets the maximum length of a lock wait-queue that a
+// read-write request is willing to enter and wait in. Used to provide a release
+// valve and ensure some level of quality-of-service under severe per-key
+// contention. If set to a non-zero value and an existing lock wait-queue is
+// already equal to or exceeding this length, the request will be rejected
+// eagerly instead of entering the queue and waiting.
+//
+// This is a fairly blunt mechanism to place an upper bound on resource
+// utilization per lock wait-queue and ensure some reasonable level of
+// quality-of-service for transactions that enter a lock wait-queue. More
+// sophisticated queueing alternatives exist that account for queueing time and
+// detect sustained queue growth before rejecting:
+// - https://queue.acm.org/detail.cfm?id=2209336
+// - https://queue.acm.org/detail.cfm?id=2839461
+//
+// We could explore these algorithms if this setting is too coarse grained and
+// not serving its purpose well enough.
+//
+// Alternatively, we could implement the lock_timeout session variable that
+// exists in Postgres (#67513) and use that to ensure quality-of-service for
+// requests that wait for locks. With that configuration, this cluster setting
+// would be relegated to a guardrail that protects against unbounded resource
+// utilization and runaway queuing for misbehaving clients, a role it is well
+// positioned to serve.
+var MaxLockWaitQueueLength = settings.RegisterIntSetting(
+	"kv.lock_table.maximum_lock_wait_queue_length",
+	"the maximum length of a lock wait-queue that read-write requests are willing "+
+		"to enter and wait in. The setting can be used to ensure some level of quality-of-service "+
+		"under severe per-key contention. If set to a non-zero value and an existing lock "+
+		"wait-queue is already equal to or exceeding this length, requests will be rejected "+
+		"eagerly instead of entering the queue and waiting. Set to 0 to disable.",
+	0,
+	func(v int64) error {
+		if v < 0 {
+			return errors.Errorf("cannot be set to a negative value: %d", v)
+		}
+		if v == 0 {
+			return nil // disabled
+		}
+		// Don't let the setting be dropped below a reasonable value that we don't
+		// expect to impact internal transaction processing.
+		const minSafeMaxLength = 3
+		if v < minSafeMaxLength {
+			return errors.Errorf("cannot be set below %d: %d", minSafeMaxLength, v)
+		}
+		return nil
+	},
 )
 
 // DiscoveredLocksThresholdToConsultFinalizedTxnCache sets a threshold as
@@ -73,9 +121,8 @@ type Config struct {
 	Stopper        *stop.Stopper
 	IntentResolver IntentResolver
 	// Metrics.
-	TxnWaitMetrics                     *txnwait.Metrics
-	SlowLatchGauge                     *metric.Gauge
-	ConflictingIntentCleanupRejections *metric.Counter
+	TxnWaitMetrics *txnwait.Metrics
+	SlowLatchGauge *metric.Gauge
 	// Configs + Knobs.
 	MaxLockTableSize  int64
 	DisableTxnPushing bool
@@ -107,14 +154,13 @@ func NewManager(cfg Config) Manager {
 		},
 		lt: lt,
 		ltw: &lockTableWaiterImpl{
-			st:                                  cfg.Settings,
-			clock:                               cfg.Clock,
-			stopper:                             cfg.Stopper,
-			ir:                                  cfg.IntentResolver,
-			lt:                                  lt,
-			disableTxnPushing:                   cfg.DisableTxnPushing,
-			onContentionEvent:                   cfg.OnContentionEvent,
-			conflictingIntentsResolveRejections: cfg.ConflictingIntentCleanupRejections,
+			st:                cfg.Settings,
+			clock:             cfg.Clock,
+			stopper:           cfg.Stopper,
+			ir:                cfg.IntentResolver,
+			lt:                lt,
+			disableTxnPushing: cfg.DisableTxnPushing,
+			onContentionEvent: cfg.OnContentionEvent,
 		},
 		// TODO(nvanbenschoten): move pkg/storage/txnwait to a new
 		// pkg/storage/concurrency/txnwait package.
@@ -154,7 +200,7 @@ func (m *managerImpl) SequenceReq(
 		case OptimisticEval:
 			panic("optimistic eval cannot happen when re-sequencing")
 		case PessimisticAfterFailedOptimisticEval:
-			if shouldAcquireLatches(g.Req) {
+			if !shouldIgnoreLatches(g.Req) {
 				g.AssertLatches()
 			}
 			log.Event(ctx, "re-sequencing request after optimistic sequencing failed")
@@ -172,9 +218,16 @@ func (m *managerImpl) SequenceReq(
 
 func (m *managerImpl) sequenceReqWithGuard(ctx context.Context, g *Guard) (Response, *Error) {
 	// Some requests don't need to acquire latches at all.
-	if !shouldAcquireLatches(g.Req) {
+	if shouldIgnoreLatches(g.Req) {
 		log.Event(ctx, "not acquiring latches")
 		return nil, nil
+	}
+
+	// Check if this is a request that waits on latches, but does not acquire
+	// them.
+	if shouldWaitOnLatchesWithoutAcquiring(g.Req) {
+		log.Event(ctx, "waiting on latches without acquiring")
+		return nil, m.lm.WaitFor(ctx, g.Req.LatchSpans)
 	}
 
 	// Provide the manager with an opportunity to intercept the request. It
@@ -228,6 +281,12 @@ func (m *managerImpl) sequenceReqWithGuard(ctx context.Context, g *Guard) (Respo
 		// Some requests don't want the wait on locks.
 		if g.Req.LockSpans.Empty() {
 			return nil, nil
+		}
+
+		// Set the request's MaxWaitQueueLength based on the cluster setting, if not
+		// already set.
+		if g.Req.MaxLockWaitQueueLength == 0 {
+			g.Req.MaxLockWaitQueueLength = int(MaxLockWaitQueueLength.Get(&m.st.SV))
 		}
 
 		if g.EvalKind == OptimisticEval {
@@ -294,22 +353,30 @@ func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Respo
 	return nil, nil
 }
 
-// shouldAcquireLatches determines whether the request should acquire latches
+// shouldIgnoreLatches determines whether the request should ignore latches
 // before proceeding to evaluate. Latches are used to synchronize with other
 // conflicting requests, based on the Spans collected for the request. Most
-// request types will want to acquire latches.
-func shouldAcquireLatches(req Request) bool {
+// request types will want to acquire latches. Requests that return true for
+// shouldWaitOnLatchesWithoutAcquiring will not completely ignore latches as
+// they could wait on them, even if they don't acquire latches.
+func shouldIgnoreLatches(req Request) bool {
 	switch {
 	case req.ReadConsistency != roachpb.CONSISTENT:
 		// Only acquire latches for consistent operations.
-		return false
+		return true
 	case req.isSingle(roachpb.RequestLease):
-		// Do not acquire latches for lease requests. These requests are run on
-		// replicas that do not hold the lease, so acquiring latches wouldn't
-		// help synchronize with other requests.
-		return false
+		// Ignore latches for lease requests. These requests are run on replicas
+		// that do not hold the lease, so acquiring latches wouldn't help
+		// synchronize with other requests.
+		return true
 	}
-	return true
+	return false
+}
+
+// shouldWaitOnLatchesWithoutAcquiring determines if this is a request that
+// only waits on existing latches without acquiring any new ones.
+func shouldWaitOnLatchesWithoutAcquiring(req Request) bool {
+	return req.isSingle(roachpb.Barrier)
 }
 
 // FinishReq implements the RequestSequencer interface.
@@ -491,17 +558,22 @@ func (m *managerImpl) OnReplicaSnapshotApplied() {
 }
 
 // LatchMetrics implements the MetricExporter interface.
-func (m *managerImpl) LatchMetrics() (global, local kvserverpb.LatchManagerInfo) {
-	return m.lm.Info()
+func (m *managerImpl) LatchMetrics() LatchMetrics {
+	return m.lm.Metrics()
 }
 
-// LockTableDebug implements the MetricExporter interface.
-func (m *managerImpl) LockTableDebug() string {
+// LockTableMetrics implements the MetricExporter interface.
+func (m *managerImpl) LockTableMetrics() LockTableMetrics {
+	return m.lt.Metrics()
+}
+
+// TestingLockTableString implements the MetricExporter interface.
+func (m *managerImpl) TestingLockTableString() string {
 	return m.lt.String()
 }
 
-// TxnWaitQueue implements the MetricExporter interface.
-func (m *managerImpl) TxnWaitQueue() *txnwait.Queue {
+// TestingTxnWaitQueue implements the MetricExporter interface.
+func (m *managerImpl) TestingTxnWaitQueue() *txnwait.Queue {
 	return m.twq.(*txnwait.Queue)
 }
 
@@ -571,7 +643,7 @@ func (g *Guard) HoldingLatches() bool {
 // AssertLatches asserts that the guard is non-nil and holding latches, if the
 // request is supposed to hold latches while evaluating in the first place.
 func (g *Guard) AssertLatches() {
-	if shouldAcquireLatches(g.Req) && !g.HoldingLatches() {
+	if !shouldIgnoreLatches(g.Req) && !shouldWaitOnLatchesWithoutAcquiring(g.Req) && !g.HoldingLatches() {
 		panic("expected latches held, found none")
 	}
 }

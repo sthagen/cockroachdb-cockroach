@@ -13,13 +13,13 @@ package colrpc
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 // flowStreamClient is a utility interface used to mock out the RPC layer.
@@ -45,6 +46,11 @@ type flowStreamClient interface {
 // given remote endpoint.
 type Outbox struct {
 	colexecop.OneInputNode
+	// inputMetaInfo contains all of the meta components that the outbox is
+	// responsible for. OneInputNode.Input is the deselector operator with Root
+	// field as its input. Notably StatsCollectors are not accessed directly -
+	// instead, getStats is used for those.
+	inputMetaInfo    colexecargs.OpWithMetaInfo
 	inputInitialized bool
 
 	typs []*types.T
@@ -54,10 +60,7 @@ type Outbox struct {
 	serializer *colserde.RecordBatchSerializer
 
 	// draining is an atomic that represents whether the Outbox is draining.
-	draining        uint32
-	metadataSources colexecop.MetadataSources
-	// closers is a slice of Closers that need to be Closed on termination.
-	closers colexecop.Closers
+	draining uint32
 
 	scratch struct {
 		buf *bytes.Buffer
@@ -81,11 +84,9 @@ type Outbox struct {
 //   operators that are in the same tree as this Outbox.
 func NewOutbox(
 	allocator *colmem.Allocator,
-	input colexecop.Operator,
+	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
 	getStats func() []*execinfrapb.ComponentStats,
-	metadataSources []colexecop.MetadataSource,
-	toClose []colexecop.Closer,
 ) (*Outbox, error) {
 	c, err := colserde.NewArrowBatchConverter(typs)
 	if err != nil {
@@ -98,14 +99,13 @@ func NewOutbox(
 	o := &Outbox{
 		// Add a deselector as selection vectors are not serialized (nor should they
 		// be).
-		OneInputNode:    colexecop.NewOneInputNode(colexecutils.NewDeselectorOp(allocator, input, typs)),
-		typs:            typs,
-		allocator:       allocator,
-		converter:       c,
-		serializer:      s,
-		getStats:        getStats,
-		metadataSources: metadataSources,
-		closers:         toClose,
+		OneInputNode:  colexecop.NewOneInputNode(colexecutils.NewDeselectorOp(allocator, input.Root, typs)),
+		inputMetaInfo: input,
+		typs:          typs,
+		allocator:     allocator,
+		converter:     c,
+		serializer:    s,
+		getStats:      getStats,
 	}
 	o.scratch.buf = &bytes.Buffer{}
 	o.scratch.msg = &execinfrapb.ProducerMessage{}
@@ -121,7 +121,7 @@ func (o *Outbox) close(ctx context.Context) {
 	// the deselector).
 	o.Input = nil
 	o.allocator.ReleaseMemory(o.allocator.Used())
-	o.closers.CloseAndLogOnErr(ctx, "outbox")
+	o.inputMetaInfo.ToClose.CloseAndLogOnErr(ctx, "outbox")
 }
 
 // Run starts an outbox by connecting to the provided node and pushing
@@ -222,7 +222,10 @@ func (o *Outbox) Run(
 // called, for all other errors flowCtxCancel is. The given error is logged with
 // the associated opName.
 func handleStreamErr(
-	ctx context.Context, opName string, err error, flowCtxCancel, outboxCtxCancel context.CancelFunc,
+	ctx context.Context,
+	opName redact.SafeString,
+	err error,
+	flowCtxCancel, outboxCtxCancel context.CancelFunc,
 ) {
 	if err == io.EOF {
 		if log.V(1) {
@@ -235,7 +238,7 @@ func handleStreamErr(
 	}
 }
 
-func (o *Outbox) moveToDraining(ctx context.Context, reason string) {
+func (o *Outbox) moveToDraining(ctx context.Context, reason redact.RedactableString) {
 	if atomic.CompareAndSwapUint32(&o.draining, 0, 1) {
 		log.VEventf(ctx, 2, "Outbox moved to draining (%s)", reason)
 	}
@@ -339,7 +342,7 @@ func (o *Outbox) sendMetadata(ctx context.Context, stream flowStreamClient, errT
 				o.span.RecordStructured(s)
 			}
 		}
-		for _, meta := range o.metadataSources.DrainMeta() {
+		for _, meta := range o.inputMetaInfo.MetadataSources.DrainMeta() {
 			msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, meta))
 		}
 	}
@@ -406,9 +409,11 @@ func (o *Outbox) runWithStream(
 
 	terminatedGracefully, errToSend := o.sendBatches(ctx, stream, flowCtxCancel, outboxCtxCancel)
 	if terminatedGracefully || errToSend != nil {
-		reason := "terminated gracefully"
+		var reason redact.RedactableString
 		if errToSend != nil {
-			reason = fmt.Sprintf("encountered error when sending batches: %v", errToSend)
+			reason = redact.Sprintf("encountered error when sending batches: %v", errToSend)
+		} else {
+			reason = redact.Sprint(redact.SafeString("terminated gracefully"))
 		}
 		o.moveToDraining(ctx, reason)
 		if err := o.sendMetadata(ctx, stream, errToSend); err != nil {

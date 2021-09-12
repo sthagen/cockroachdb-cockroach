@@ -15,11 +15,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -53,15 +51,14 @@ type idVersion struct {
 func newRowFetcherCache(
 	ctx context.Context,
 	codec keys.SQLCodec,
-	settings *cluster.Settings,
 	leaseMgr *lease.Manager,
-	hydratedTables *hydratedtables.Cache,
+	cf *descs.CollectionFactory,
 	db *kv.DB,
 ) *rowFetcherCache {
 	return &rowFetcherCache{
 		codec:      codec,
 		leaseMgr:   leaseMgr,
-		collection: descs.NewCollection(settings, leaseMgr, hydratedTables, nil /* virtualSchemas */),
+		collection: cf.NewCollection(nil /* TemporarySchemaProvider */),
 		db:         db,
 		fetchers:   make(map[idVersion]*row.Fetcher),
 	}
@@ -104,8 +101,10 @@ func (c *rowFetcherCache) TableDescForKey(
 			// descs.Collection directly here.
 			// TODO (SQL Schema): #53751.
 			if err := c.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				txn.SetFixedTimestamp(ctx, ts)
-				var err error
+				err := txn.SetFixedTimestamp(ctx, ts)
+				if err != nil {
+					return err
+				}
 				tableDesc, err = c.collection.GetImmutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{})
 				return err
 			}); err != nil {
@@ -174,6 +173,7 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
+		0,     /* lockTimeout */
 		false, /* isCheck */
 		&c.a,
 		nil, /* memMonitor */

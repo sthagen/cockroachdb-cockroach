@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -174,14 +175,34 @@ var validCasts = []castInfo{
 	{from: types.Box2DFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.GeographyFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.BytesFamily, to: types.StringFamily, volatility: VolatilityStable},
-	{from: types.TimestampFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{
-		from: types.TimestampTZFamily, to: types.StringFamily, volatility: VolatilityStable,
-		volatilityHint: "TIMESTAMPTZ to STRING casts depend on the current timezone; consider using (t AT TIME ZONE 'UTC')::STRING instead.",
+		from:       types.TimestampFamily,
+		to:         types.StringFamily,
+		volatility: VolatilityImmutable,
+		volatilityHint: "TIMESTAMP to STRING casts are dependent on DateStyle; consider " +
+			"using to_char(timestamp) instead.",
 	},
-	{from: types.IntervalFamily, to: types.StringFamily, volatility: VolatilityImmutable},
+	{
+		from:       types.TimestampTZFamily,
+		to:         types.StringFamily,
+		volatility: VolatilityStable,
+		volatilityHint: "TIMESTAMPTZ to STRING casts depend on the current timezone; consider " +
+			"using to_char(t AT TIME ZONE 'UTC') instead.",
+	},
+	{
+		from:           types.IntervalFamily,
+		to:             types.StringFamily,
+		volatility:     VolatilityImmutable,
+		volatilityHint: "INTERVAL to STRING casts depends on IntervalStyle; consider using to_char(interval)",
+	},
 	{from: types.UuidFamily, to: types.StringFamily, volatility: VolatilityImmutable},
-	{from: types.DateFamily, to: types.StringFamily, volatility: VolatilityImmutable},
+	{
+		from:       types.DateFamily,
+		to:         types.StringFamily,
+		volatility: VolatilityImmutable,
+		volatilityHint: "DATE to STRING casts are dependent on DateStyle; consider " +
+			"using to_char(date) instead.",
+	},
 	{from: types.TimeFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.TimeTZFamily, to: types.StringFamily, volatility: VolatilityImmutable},
 	{from: types.OidFamily, to: types.StringFamily, volatility: VolatilityImmutable},
@@ -227,7 +248,12 @@ var validCasts = []castInfo{
 
 	// Casts to DateFamily.
 	{from: types.UnknownFamily, to: types.DateFamily, volatility: VolatilityImmutable},
-	{from: types.StringFamily, to: types.DateFamily, volatility: VolatilityStable},
+	{
+		from:           types.StringFamily,
+		to:             types.DateFamily,
+		volatility:     VolatilityStable,
+		volatilityHint: "STRING to DATE casts depend on session DateStyle; use parse_date(string) instead",
+	},
 	{from: types.CollatedStringFamily, to: types.DateFamily, volatility: VolatilityStable},
 	{from: types.DateFamily, to: types.DateFamily, volatility: VolatilityImmutable},
 	{from: types.TimestampFamily, to: types.DateFamily, volatility: VolatilityImmutable},
@@ -236,7 +262,12 @@ var validCasts = []castInfo{
 
 	// Casts to TimeFamily.
 	{from: types.UnknownFamily, to: types.TimeFamily, volatility: VolatilityImmutable},
-	{from: types.StringFamily, to: types.TimeFamily, volatility: VolatilityStable},
+	{
+		from:           types.StringFamily,
+		to:             types.TimeFamily,
+		volatility:     VolatilityStable,
+		volatilityHint: "STRING to TIME casts depend on session DateStyle; use parse_time(string) instead",
+	},
 	{from: types.CollatedStringFamily, to: types.TimeFamily, volatility: VolatilityStable},
 	{from: types.TimeFamily, to: types.TimeFamily, volatility: VolatilityImmutable},
 	{from: types.TimeTZFamily, to: types.TimeFamily, volatility: VolatilityImmutable},
@@ -246,7 +277,12 @@ var validCasts = []castInfo{
 
 	// Casts to TimeTZFamily.
 	{from: types.UnknownFamily, to: types.TimeTZFamily, volatility: VolatilityImmutable},
-	{from: types.StringFamily, to: types.TimeTZFamily, volatility: VolatilityStable},
+	{
+		from:           types.StringFamily,
+		to:             types.TimeTZFamily,
+		volatility:     VolatilityStable,
+		volatilityHint: "STRING to TIMETZ casts depend on session DateStyle; use parse_timetz(string) instead",
+	},
 	{from: types.CollatedStringFamily, to: types.TimeTZFamily, volatility: VolatilityStable},
 	{from: types.TimeFamily, to: types.TimeTZFamily, volatility: VolatilityStable},
 	{from: types.TimeTZFamily, to: types.TimeTZFamily, volatility: VolatilityImmutable},
@@ -256,7 +292,8 @@ var validCasts = []castInfo{
 	{from: types.UnknownFamily, to: types.TimestampFamily, volatility: VolatilityImmutable},
 	{
 		from: types.StringFamily, to: types.TimestampFamily, volatility: VolatilityStable,
-		volatilityHint: "STRING to TIMESTAMP casts are context-dependent because of relative timestamp strings like 'now'; use parse_timestamp() instead.",
+		volatilityHint: "STRING to TIMESTAMP casts are context-dependent because of relative timestamp strings " +
+			"like 'now' and session settings such as DateStyle; use parse_timestamp(string) instead.",
 	},
 	{from: types.CollatedStringFamily, to: types.TimestampFamily, volatility: VolatilityStable},
 	{from: types.DateFamily, to: types.TimestampFamily, volatility: VolatilityImmutable},
@@ -278,7 +315,12 @@ var validCasts = []castInfo{
 
 	// Casts to IntervalFamily.
 	{from: types.UnknownFamily, to: types.IntervalFamily, volatility: VolatilityImmutable},
-	{from: types.StringFamily, to: types.IntervalFamily, volatility: VolatilityImmutable},
+	{
+		from:           types.StringFamily,
+		to:             types.IntervalFamily,
+		volatility:     VolatilityImmutable,
+		volatilityHint: "STRING to INTERVAL casts depend on session IntervalStyle; use parse_interval(string) instead",
+	},
 	{from: types.CollatedStringFamily, to: types.IntervalFamily, volatility: VolatilityImmutable},
 	{from: types.IntFamily, to: types.IntervalFamily, volatility: VolatilityImmutable},
 	{from: types.TimeFamily, to: types.IntervalFamily, volatility: VolatilityImmutable},
@@ -292,6 +334,9 @@ var validCasts = []castInfo{
 	{from: types.CollatedStringFamily, to: types.OidFamily, volatility: VolatilityStable},
 	{from: types.IntFamily, to: types.OidFamily, volatility: VolatilityStable, ignoreVolatilityCheck: true},
 	{from: types.OidFamily, to: types.OidFamily, volatility: VolatilityStable},
+
+	// Casts to UnknownFamily.
+	{from: types.UnknownFamily, to: types.UnknownFamily, volatility: VolatilityImmutable},
 
 	// Casts to UuidFamily.
 	{from: types.UnknownFamily, to: types.UuidFamily, volatility: VolatilityImmutable},
@@ -333,8 +378,12 @@ type castsMapKey struct {
 
 var castsMap map[castsMapKey]*castInfo
 
+// styleCastsMap contains castInfos for casts affected by a style parameter.
+var styleCastsMap map[castsMapKey]*castInfo
+
 func init() {
 	castsMap = make(map[castsMapKey]*castInfo, len(validCasts))
+	styleCastsMap = make(map[castsMapKey]*castInfo)
 	for i := range validCasts {
 		c := &validCasts[i]
 
@@ -343,23 +392,72 @@ func init() {
 
 		key := castsMapKey{from: c.from, to: c.to}
 		castsMap[key] = c
+
+		if isDateStyleCastAffected(c.from, c.to) || isIntervalStyleCastAffected(c.from, c.to) {
+			cCopy := *c
+			cCopy.volatility = VolatilityStable
+			styleCastsMap[key] = &cCopy
+		}
 	}
+}
+
+func isIntervalStyleCastAffected(from, to types.Family) bool {
+	switch from {
+	case types.StringFamily, types.CollatedStringFamily:
+		switch to {
+		case types.IntervalFamily:
+			return true
+		}
+	case types.IntervalFamily:
+		switch to {
+		case types.StringFamily, types.CollatedStringFamily:
+			return true
+		}
+	}
+	return false
+}
+
+func isDateStyleCastAffected(from, to types.Family) bool {
+	switch from {
+	case types.StringFamily, types.CollatedStringFamily:
+		switch to {
+		case types.TimeFamily,
+			types.TimeTZFamily,
+			types.DateFamily,
+			types.TimestampFamily:
+			return true
+		}
+	case types.DateFamily,
+		types.TimestampFamily:
+		switch to {
+		case types.StringFamily, types.CollatedStringFamily:
+			return true
+		}
+	}
+	return false
 }
 
 // lookupCast returns the information for a valid cast.
 // Returns nil if this is not a valid cast.
 // Does not handle array and tuple casts.
-func lookupCast(from, to types.Family) *castInfo {
-	return castsMap[castsMapKey{from: from, to: to}]
+func lookupCast(from, to types.Family, intervalStyleEnabled bool, dateStyleEnabled bool) *castInfo {
+	k := castsMapKey{from: from, to: to}
+	if (intervalStyleEnabled && isIntervalStyleCastAffected(from, to)) ||
+		(dateStyleEnabled && isDateStyleCastAffected(from, to)) {
+		if r, ok := styleCastsMap[k]; ok {
+			return r
+		}
+	}
+	return castsMap[k]
 }
 
 // LookupCastVolatility returns the volatility of a valid cast.
-func LookupCastVolatility(from, to *types.T) (_ Volatility, ok bool) {
+func LookupCastVolatility(from, to *types.T, sd *sessiondata.SessionData) (_ Volatility, ok bool) {
 	fromFamily := from.Family()
 	toFamily := to.Family()
 	// Special case for casting between arrays.
 	if fromFamily == types.ArrayFamily && toFamily == types.ArrayFamily {
-		return LookupCastVolatility(from.ArrayContents(), to.ArrayContents())
+		return LookupCastVolatility(from.ArrayContents(), to.ArrayContents(), sd)
 	}
 	// Special case for casting between tuples.
 	if fromFamily == types.TupleFamily && toFamily == types.TupleFamily {
@@ -374,7 +472,7 @@ func LookupCastVolatility(from, to *types.T) (_ Volatility, ok bool) {
 		}
 		maxVolatility := VolatilityLeakProof
 		for i := range fromTypes {
-			v, ok := LookupCastVolatility(fromTypes[i], toTypes[i])
+			v, ok := LookupCastVolatility(fromTypes[i], toTypes[i], sd)
 			if !ok {
 				return 0, false
 			}
@@ -384,7 +482,13 @@ func LookupCastVolatility(from, to *types.T) (_ Volatility, ok bool) {
 		}
 		return maxVolatility, true
 	}
-	cast := lookupCast(fromFamily, toFamily)
+
+	cast := lookupCast(
+		fromFamily,
+		toFamily,
+		sd != nil && sd.IntervalStyleEnabled,
+		sd != nil && sd.DateStyleEnabled,
+	)
 	if cast == nil {
 		return 0, false
 	}
@@ -457,7 +561,7 @@ func AdjustValueToType(typ *types.T, inVal Datum) (outVal Datum, err error) {
 				// implementation of math.(Max|Min)(16|32) numbers that store
 				// the boundaries of the allowed range.
 				// NOTE: when updating the code below, make sure to update
-				// execgen/overloads_cast.go as well.
+				// execgen/cast_gen_util.go as well.
 				shifted := v >> width
 				if (v >= 0 && shifted > 0) || (v < 0 && shifted < -1) {
 					if typ.Width() == 16 {
@@ -873,7 +977,7 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			s = t.BitArray.String()
 		case *DFloat:
 			s = strconv.FormatFloat(float64(*t), 'g',
-				ctx.SessionData.DataConversionConfig.GetFloatPrec(), 64)
+				ctx.SessionData().DataConversionConfig.GetFloatPrec(), 64)
 		case *DBool, *DInt, *DDecimal:
 			s = d.String()
 		case *DTimestamp, *DDate, *DTime, *DTimeTZ, *DGeography, *DGeometry, *DBox2D:
@@ -892,13 +996,13 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			s = AsStringWithFlags(
 				d,
 				FmtPgwireText,
-				FmtDataConversionConfig(ctx.SessionData.DataConversionConfig),
+				FmtDataConversionConfig(ctx.SessionData().DataConversionConfig),
 			)
 		case *DArray:
 			s = AsStringWithFlags(
 				d,
 				FmtPgwireText,
-				FmtDataConversionConfig(ctx.SessionData.DataConversionConfig),
+				FmtDataConversionConfig(ctx.SessionData().DataConversionConfig),
 			)
 		case *DInterval:
 			// When converting an interval to string, we need a string representation
@@ -907,7 +1011,7 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			s = AsStringWithFlags(
 				d,
 				FmtPgwireText,
-				FmtDataConversionConfig(ctx.SessionData.DataConversionConfig),
+				FmtDataConversionConfig(ctx.SessionData().DataConversionConfig),
 			)
 		case *DUuid:
 			s = t.UUID.String()
@@ -920,7 +1024,7 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 		case *DBytes:
 			s = lex.EncodeByteArrayToRawBytes(
 				string(*t),
-				ctx.SessionData.DataConversionConfig.BytesEncodeFormat,
+				ctx.SessionData().DataConversionConfig.BytesEncodeFormat,
 				false, /* skipHexPrefix */
 			)
 		case *DOid:
@@ -1047,6 +1151,9 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			if err != nil {
 				return nil, err
 			}
+			if t == nil {
+				return DNull, nil
+			}
 			g, err := geo.ParseGeographyFromGeoJSON([]byte(*t))
 			if err != nil {
 				return nil, err
@@ -1091,6 +1198,9 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			t, err := d.AsText()
 			if err != nil {
 				return nil, err
+			}
+			if t == nil {
+				return DNull, nil
 			}
 			g, err := geo.ParseGeometryFromGeoJSON([]byte(*t))
 			if err != nil {

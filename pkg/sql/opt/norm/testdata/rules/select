@@ -423,6 +423,133 @@ DROP INDEX partial_idx
 ----
 
 # --------------------------------------------------
+# DeduplicateSelectFilters
+# --------------------------------------------------
+
+exprnorm expect=DeduplicateSelectFilters disable=(InlineConstVar,SimplifySelectFilters,ConsolidateSelectFilters)
+(Select
+    (Scan [ (Table "uv") (Cols "u,v") ])
+    [
+        (Eq (Var "u") (Const 10 "int"))
+        (Eq (Var "u") (Const 10 "int"))
+    ]
+)
+----
+select
+ ├── columns: u:1!null v:2
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1,2)
+ ├── scan uv
+ │    ├── columns: u:1!null v:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── filters
+      └── u:1 = 10 [outer=(1), constraints=(/1: [/10 - /10]; tight), fd=()-->(1)]
+
+exprnorm expect=DeduplicateSelectFilters disable=(InlineConstVar,SimplifySelectFilters,ConsolidateSelectFilters)
+(Select
+    (Scan [ (Table "uv") (Cols "u,v") ])
+    [
+        (Eq (Var "u") (Const 10 "int"))
+        (Eq (Var "u") (Const 20 "int"))
+        (Eq (Var "v") (Const 20 "int"))
+        (Eq (Var "v") (Const 30 "int"))
+        (Eq (Var "u") (Const 10 "int"))
+        (Eq (Var "v") (Const 30 "int"))
+        (Eq (Var "v") (Const 20 "int"))
+    ]
+)
+----
+select
+ ├── columns: u:1!null v:2!null
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1,2)
+ ├── scan uv
+ │    ├── columns: u:1!null v:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── filters
+      ├── u:1 = 10 [outer=(1), constraints=(/1: [/10 - /10]; tight), fd=()-->(1)]
+      ├── u:1 = 20 [outer=(1), constraints=(/1: [/20 - /20]; tight), fd=()-->(1)]
+      ├── v:2 = 20 [outer=(2), constraints=(/2: [/20 - /20]; tight), fd=()-->(2)]
+      └── v:2 = 30 [outer=(2), constraints=(/2: [/30 - /30]; tight), fd=()-->(2)]
+
+exprnorm expect=DeduplicateSelectFilters disable=(InlineConstVar,SimplifySelectFilters,ConsolidateSelectFilters)
+(Select
+    (Scan [ (Table "uv") (Cols "u,v") ])
+    [
+        (Or (Eq (Var "u") (Const 10 "int")) (Eq (Var "u") (Const 20 "int")))
+        (Eq (Plus (Var "u") (Var "v")) (Const 10 "int"))
+        (Or (Eq (Var "u") (Const 10 "int")) (Eq (Var "u") (Const 20 "int")))
+        (Eq (Plus (Var "u") (Var "v")) (Const 10 "int"))
+    ]
+)
+----
+select
+ ├── columns: u:1!null v:2
+ ├── cardinality: [0 - 2]
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── scan uv
+ │    ├── columns: u:1!null v:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── filters
+      ├── (u:1 = 10) OR (u:1 = 20) [outer=(1), constraints=(/1: [/10 - /10] [/20 - /20]; tight)]
+      └── (u:1 + v:2) = 10 [outer=(1,2), immutable]
+
+# Does not fire when there are no duplicates.
+exprnorm expect-not=DeduplicateSelectFilters disable=(InlineConstVar,SimplifySelectFilters,ConsolidateSelectFilters)
+(Select
+    (Scan [ (Table "uv") (Cols "u,v") ])
+    [
+        (Eq (Plus (Var "u") (Var "v")) (Const 10 "int"))
+        (Eq (Var "u") (Const 10 "int"))
+        (Or (Eq (Var "u") (Const 10 "int")) (Eq (Var "u") (Const 20 "int")))
+    ]
+)
+----
+select
+ ├── columns: u:1!null v:2
+ ├── cardinality: [0 - 1]
+ ├── immutable
+ ├── key: ()
+ ├── fd: ()-->(1,2)
+ ├── scan uv
+ │    ├── columns: u:1!null v:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── filters
+      ├── (u:1 + v:2) = 10 [outer=(1,2), immutable]
+      ├── u:1 = 10 [outer=(1), constraints=(/1: [/10 - /10]; tight), fd=()-->(1)]
+      └── (u:1 = 10) OR (u:1 = 20) [outer=(1), constraints=(/1: [/10 - /10] [/20 - /20]; tight)]
+
+# Does not deduplicate logically equivalent expressions with different orders.
+exprnorm expect-not=DeduplicateSelectFilters disable=(InlineConstVar,SimplifySelectFilters,ConsolidateSelectFilters)
+(Select
+    (Scan [ (Table "uv") (Cols "u,v") ])
+    [
+        (Or (Eq (Var "u") (Const 10 "int")) (Eq (Var "v") (Const 20 "int")))
+        (Or (Eq (Var "v") (Const 20 "int")) (Eq (Var "u") (Const 10 "int")))
+    ]
+)
+----
+select
+ ├── columns: u:1!null v:2
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── scan uv
+ │    ├── columns: u:1!null v:2
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2)
+ └── filters
+      ├── (u:1 = 10) OR (v:2 = 20) [outer=(1,2)]
+      └── (v:2 = 20) OR (u:1 = 10) [outer=(1,2)]
+
+# --------------------------------------------------
 # MergeSelects
 # --------------------------------------------------
 norm expect=MergeSelects
@@ -1664,162 +1791,79 @@ union
 
 norm expect=PushFilterIntoSetOp
 SELECT * FROM
-  (SELECT k FROM b
-    UNION ALL
-  SELECT k FROM b) t1
-  WHERE EXISTS(
-  SELECT * FROM a WHERE k=1)
-----
-union-all
- ├── columns: k:15!null
- ├── left columns: b.k:1
- ├── right columns: b.k:8
- ├── select
- │    ├── columns: b.k:1!null
- │    ├── key: (1)
- │    ├── scan b
- │    │    ├── columns: b.k:1!null
- │    │    └── key: (1)
- │    └── filters
- │         └── exists [subquery]
- │              └── select
- │                   ├── columns: a.k:16!null a.i:17 a.f:18 a.s:19 a.j:20
- │                   ├── cardinality: [0 - 1]
- │                   ├── key: ()
- │                   ├── fd: ()-->(16-20)
- │                   ├── scan a
- │                   │    ├── columns: a.k:16!null a.i:17 a.f:18 a.s:19 a.j:20
- │                   │    ├── key: (16)
- │                   │    └── fd: (16)-->(17-20)
- │                   └── filters
- │                        └── a.k:16 = 1 [outer=(16), constraints=(/16: [/1 - /1]; tight), fd=()-->(16)]
- └── select
-      ├── columns: b.k:8!null
-      ├── key: (8)
-      ├── scan b
-      │    ├── columns: b.k:8!null
-      │    └── key: (8)
-      └── filters
-           └── exists [subquery]
-                └── select
-                     ├── columns: a.k:16!null a.i:17 a.f:18 a.s:19 a.j:20
-                     ├── cardinality: [0 - 1]
-                     ├── key: ()
-                     ├── fd: ()-->(16-20)
-                     ├── scan a
-                     │    ├── columns: a.k:16!null a.i:17 a.f:18 a.s:19 a.j:20
-                     │    ├── key: (16)
-                     │    └── fd: (16)-->(17-20)
-                     └── filters
-                          └── a.k:16 = 1 [outer=(16), constraints=(/16: [/1 - /1]; tight), fd=()-->(16)]
-
-norm expect=PushFilterIntoSetOp
-SELECT * FROM
 (SELECT k FROM (SELECT k FROM b UNION ALL SELECT k FROM b)
   UNION ALL
   SELECT k FROM (SELECT k FROM b UNION ALL SELECT k FROM b)) t1
 WHERE EXISTS(
   SELECT * FROM a WHERE k=1) AND random() < 0.5
 ----
-union-all
+select
  ├── columns: k:31!null
- ├── left columns: k:15
- ├── right columns: k:30
  ├── volatile
  ├── union-all
- │    ├── columns: k:15!null
- │    ├── left columns: b.k:1
- │    ├── right columns: b.k:8
+ │    ├── columns: k:31!null
+ │    ├── left columns: k:15
+ │    ├── right columns: k:30
  │    ├── volatile
- │    ├── select
- │    │    ├── columns: b.k:1!null
+ │    ├── union-all
+ │    │    ├── columns: k:15!null
+ │    │    ├── left columns: b.k:1
+ │    │    ├── right columns: b.k:8
  │    │    ├── volatile
- │    │    ├── key: (1)
- │    │    ├── scan b
+ │    │    ├── select
  │    │    │    ├── columns: b.k:1!null
- │    │    │    └── key: (1)
- │    │    └── filters
- │    │         ├── exists [subquery]
- │    │         │    └── select
- │    │         │         ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
- │    │         │         ├── cardinality: [0 - 1]
- │    │         │         ├── key: ()
- │    │         │         ├── fd: ()-->(32-36)
- │    │         │         ├── scan a
- │    │         │         │    ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
- │    │         │         │    ├── key: (32)
- │    │         │         │    └── fd: (32)-->(33-36)
- │    │         │         └── filters
- │    │         │              └── a.k:32 = 1 [outer=(32), constraints=(/32: [/1 - /1]; tight), fd=()-->(32)]
- │    │         └── random() < 0.5 [volatile]
- │    └── select
- │         ├── columns: b.k:8!null
+ │    │    │    ├── volatile
+ │    │    │    ├── key: (1)
+ │    │    │    ├── scan b
+ │    │    │    │    ├── columns: b.k:1!null
+ │    │    │    │    └── key: (1)
+ │    │    │    └── filters
+ │    │    │         └── random() < 0.5 [volatile]
+ │    │    └── select
+ │    │         ├── columns: b.k:8!null
+ │    │         ├── volatile
+ │    │         ├── key: (8)
+ │    │         ├── scan b
+ │    │         │    ├── columns: b.k:8!null
+ │    │         │    └── key: (8)
+ │    │         └── filters
+ │    │              └── random() < 0.5 [volatile]
+ │    └── union-all
+ │         ├── columns: k:30!null
+ │         ├── left columns: b.k:16
+ │         ├── right columns: b.k:23
  │         ├── volatile
- │         ├── key: (8)
- │         ├── scan b
- │         │    ├── columns: b.k:8!null
- │         │    └── key: (8)
- │         └── filters
- │              ├── exists [subquery]
- │              │    └── select
- │              │         ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
- │              │         ├── cardinality: [0 - 1]
- │              │         ├── key: ()
- │              │         ├── fd: ()-->(32-36)
- │              │         ├── scan a
- │              │         │    ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
- │              │         │    ├── key: (32)
- │              │         │    └── fd: (32)-->(33-36)
- │              │         └── filters
- │              │              └── a.k:32 = 1 [outer=(32), constraints=(/32: [/1 - /1]; tight), fd=()-->(32)]
- │              └── random() < 0.5 [volatile]
- └── union-all
-      ├── columns: k:30!null
-      ├── left columns: b.k:16
-      ├── right columns: b.k:23
-      ├── volatile
-      ├── select
-      │    ├── columns: b.k:16!null
-      │    ├── volatile
-      │    ├── key: (16)
-      │    ├── scan b
-      │    │    ├── columns: b.k:16!null
-      │    │    └── key: (16)
-      │    └── filters
-      │         ├── exists [subquery]
-      │         │    └── select
-      │         │         ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
-      │         │         ├── cardinality: [0 - 1]
-      │         │         ├── key: ()
-      │         │         ├── fd: ()-->(32-36)
-      │         │         ├── scan a
-      │         │         │    ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
-      │         │         │    ├── key: (32)
-      │         │         │    └── fd: (32)-->(33-36)
-      │         │         └── filters
-      │         │              └── a.k:32 = 1 [outer=(32), constraints=(/32: [/1 - /1]; tight), fd=()-->(32)]
-      │         └── random() < 0.5 [volatile]
-      └── select
-           ├── columns: b.k:23!null
-           ├── volatile
-           ├── key: (23)
-           ├── scan b
-           │    ├── columns: b.k:23!null
-           │    └── key: (23)
-           └── filters
-                ├── exists [subquery]
-                │    └── select
-                │         ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
-                │         ├── cardinality: [0 - 1]
-                │         ├── key: ()
-                │         ├── fd: ()-->(32-36)
-                │         ├── scan a
-                │         │    ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
-                │         │    ├── key: (32)
-                │         │    └── fd: (32)-->(33-36)
-                │         └── filters
-                │              └── a.k:32 = 1 [outer=(32), constraints=(/32: [/1 - /1]; tight), fd=()-->(32)]
-                └── random() < 0.5 [volatile]
+ │         ├── select
+ │         │    ├── columns: b.k:16!null
+ │         │    ├── volatile
+ │         │    ├── key: (16)
+ │         │    ├── scan b
+ │         │    │    ├── columns: b.k:16!null
+ │         │    │    └── key: (16)
+ │         │    └── filters
+ │         │         └── random() < 0.5 [volatile]
+ │         └── select
+ │              ├── columns: b.k:23!null
+ │              ├── volatile
+ │              ├── key: (23)
+ │              ├── scan b
+ │              │    ├── columns: b.k:23!null
+ │              │    └── key: (23)
+ │              └── filters
+ │                   └── random() < 0.5 [volatile]
+ └── filters
+      └── exists [subquery]
+           └── select
+                ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(32-36)
+                ├── scan a
+                │    ├── columns: a.k:32!null a.i:33 a.f:34 a.s:35 a.j:36
+                │    ├── key: (32)
+                │    └── fd: (32)-->(33-36)
+                └── filters
+                     └── a.k:32 = 1 [outer=(32), constraints=(/32: [/1 - /1]; tight), fd=()-->(32)]
 
 # No-op case because the filter references outer columns.
 norm expect-not=PushFilterIntoSetOp

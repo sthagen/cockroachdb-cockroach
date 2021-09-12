@@ -100,13 +100,6 @@ func TestJoinReader(t *testing.T) {
 		0,
 		sqlutils.ToRowFn(aFn))
 
-	sqlutils.CreateTableInterleaved(t, sqlDB, "t3",
-		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), INDEX bs (b,s)",
-		"t3parent(a)",
-		99,
-		sqlutils.ToRowFn(aFn, bFn, sumFn, sqlutils.RowEnglishFn))
-	tdInterleaved := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t3")
-
 	testCases := []struct {
 		description string
 		indexIdx    uint32
@@ -843,7 +836,7 @@ func TestJoinReader(t *testing.T) {
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
-	for i, td := range []catalog.TableDescriptor{tdSecondary, tdFamily, tdInterleaved} {
+	for i, td := range []catalog.TableDescriptor{tdSecondary, tdFamily} {
 		for _, c := range testCases {
 			for _, reqOrdering := range []bool{true, false} {
 				// Small and large batches exercise different paths of interest for
@@ -1340,7 +1333,7 @@ func BenchmarkJoinReader(b *testing.B) {
 		lookupExprs:   []bool{false},
 		ordering:      []bool{false, true},
 		numLookupRows: []int{1, 1 << 4 /* 16 */, 1 << 8 /* 256 */, 1 << 10 /* 1024 */, 1 << 12 /* 4096 */, 1 << 13 /* 8192 */, 1 << 14 /* 16384 */, 1 << 15 /* 32768 */, 1 << 16 /* 65,536 */, 1 << 19 /* 524,288 */},
-		memoryLimits:  []int64{100 << 10, math.MaxInt64},
+		memoryLimits:  []int64{1000 << 10, math.MaxInt64},
 	}
 	benchmarkJoinReader(b, config)
 }
@@ -1564,11 +1557,13 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 										spilled = true
 									}
 
-									// RFC: are these metadata checks important?   they've been broken since 20.2 at least.
 									meta := output.bufferedMeta
-									if len(meta) == 0 || meta[0].Metrics == nil {
-										// Expect at least one metadata payload with Metrics set.
-										b.Fatalf("unexpected metadata(%d): %v", len(meta), meta[0].Metrics)
+									// Expect at least one metadata payload with Metrics set.
+									if len(meta) == 0 {
+										b.Fatal("expected metadata but none was found")
+									}
+									if meta[0].Metrics == nil {
+										b.Fatalf("expected metadata to contain Metrics but it did not. Err: %v", meta[0].Err)
 									}
 									if output.NumRowsDisposed() != expectedNumOutputRows {
 										b.Fatalf("got %d output rows, expected %d", output.NumRowsDisposed(), expectedNumOutputRows)

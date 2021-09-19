@@ -189,10 +189,9 @@ func EndTxn(
 	}
 	if args.Require1PC {
 		// If a 1PC txn was required and we're in EndTxn, we've failed to evaluate
-		// the batch as a 1PC. We're returning early instead of preferring a
-		// possible retriable error because we might want to leave locks behind in
-		// case of retriable errors - which Require1PC does not want.
-		return result.Result{}, roachpb.NewTransactionStatusError("could not commit in one phase as requested")
+		// the batch as a 1PC. We shouldn't have gotten here; if we couldn't
+		// evaluate as 1PC, evaluateWriteBatch() was supposed to short-circuit.
+		return result.Result{}, errors.AssertionFailedf("unexpectedly trying to evaluate EndTxn with the Require1PC flag set")
 	}
 	if args.Commit && args.Poison {
 		return result.Result{}, errors.AssertionFailedf("cannot poison during a committing EndTxn request")
@@ -983,34 +982,6 @@ func splitTriggerHelper(
 			log.VEventf(ctx, 1, "LHS's GCThreshold of split is not set")
 		}
 
-		// We're about to write the initial state for the replica. We migrated
-		// the formerly replicated truncated state into unreplicated keyspace
-		// in 19.1, but this range may still be using the replicated version
-		// and we need to make a decision about what to use for the RHS that
-		// is consistent across the followers: do for the RHS what the LHS
-		// does: if the LHS has the legacy key, initialize the RHS with a
-		// legacy key as well.
-		//
-		// See VersionUnreplicatedRaftTruncatedState.
-		truncStateType := stateloader.TruncatedStateUnreplicated
-		if found, err := storage.MVCCGetProto(
-			ctx,
-			batch,
-			keys.RaftTruncatedStateLegacyKey(rec.GetRangeID()),
-			hlc.Timestamp{},
-			nil,
-			storage.MVCCGetOptions{},
-		); err != nil {
-			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load legacy truncated state")
-		} else if found {
-			truncStateType = stateloader.TruncatedStateLegacyReplicated
-		}
-
-		replicaVersion, err := sl.LoadVersion(ctx, batch)
-		if err != nil {
-			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCThreshold")
-		}
-
 		// Writing the initial state is subtle since this also seeds the Raft
 		// group. It becomes more subtle due to proposer-evaluated Raft.
 		//
@@ -1040,10 +1011,13 @@ func splitTriggerHelper(
 		// HardState via a call to synthesizeRaftState. Here, we only call
 		// writeInitialReplicaState which essentially writes a ReplicaState
 		// only.
-
+		replicaVersion, err := sl.LoadVersion(ctx, batch)
+		if err != nil {
+			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load replica version")
+		}
 		*h.AbsPostSplitRight(), err = stateloader.WriteInitialReplicaState(
 			ctx, batch, *h.AbsPostSplitRight(), split.RightDesc, rightLease,
-			*gcThreshold, truncStateType, replicaVersion,
+			*gcThreshold, replicaVersion,
 		)
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")

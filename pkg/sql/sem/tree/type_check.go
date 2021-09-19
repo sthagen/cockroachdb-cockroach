@@ -123,7 +123,7 @@ const (
 	// (RejectAggregates notwithstanding).
 	RejectNestedAggregates
 
-	// RejectNestedWindows rejects any use of window functions inside the
+	// RejectNestedWindowFunctions rejects any use of window functions inside the
 	// argument list of another window function.
 	RejectNestedWindowFunctions
 
@@ -2398,8 +2398,8 @@ func typeCheckTupleComparison(
 		leftSubExprTyped, rightSubExprTyped, _, _, err := typeCheckComparisonOp(ctx, semaCtx, op, leftSubExpr, rightSubExpr)
 		if err != nil {
 			exps := Exprs([]Expr{left, right})
-			return nil, nil, pgerror.Newf(pgcode.DatatypeMismatch, "tuples %s are not comparable at index %d: %s",
-				&exps, elemIdx+1, err)
+			return nil, nil, pgerror.Wrapf(err, pgcode.DatatypeMismatch, "tuples %s are not comparable at index %d",
+				&exps, elemIdx+1)
 		}
 		left.Exprs[elemIdx] = leftSubExprTyped
 		left.typ.TupleContents()[elemIdx] = leftSubExprTyped.ResolvedType()
@@ -2457,7 +2457,7 @@ func typeCheckSameTypedTupleExprs(
 		}
 		typedSubExprs, resType, err := TypeCheckSameTypedExprs(ctx, semaCtx, desiredElem, sameTypeExprs...)
 		if err != nil {
-			return nil, nil, pgerror.Newf(pgcode.DatatypeMismatch, "tuples %s are not the same type: %v", Exprs(exprs), err)
+			return nil, nil, pgerror.Wrapf(err, pgcode.DatatypeMismatch, "tuples %s are not the same type", Exprs(exprs))
 		}
 		for j, typedExpr := range typedSubExprs {
 			tupleIdx := sameTypeExprsIndices[j]

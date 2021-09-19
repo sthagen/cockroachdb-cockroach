@@ -753,6 +753,10 @@ type StoreConfig struct {
 	// KV Memory Monitor. Must be non-nil for production, and can be nil in some
 	// tests.
 	KVMemoryMonitor *mon.BytesMonitor
+
+	// SpanConfigsEnabled determines whether we're able to use the span configs
+	// infrastructure.
+	SpanConfigsEnabled bool
 }
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
@@ -1649,22 +1653,6 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		rate := consistencyCheckRate.Get(&s.ClusterSettings().SV)
 		s.consistencyLimiter.UpdateLimit(quotapool.Limit(rate), rate*consistencyCheckRateBurstFactor)
 	})
-
-	// Storing suggested compactions in the store itself was deprecated with
-	// the removal of the Compactor in 21.1. See discussion in
-	// https://github.com/cockroachdb/cockroach/pull/55893
-	//
-	// TODO(bilal): Remove this code in versions after 21.1.
-	err = s.engine.MVCCIterate(
-		keys.StoreSuggestedCompactionKeyPrefix(),
-		keys.StoreSuggestedCompactionKeyPrefix().PrefixEnd(),
-		storage.MVCCKeyIterKind,
-		func(res storage.MVCCKeyValue) error {
-			return s.engine.ClearUnversioned(res.Key.Key)
-		})
-	if err != nil {
-		log.Warningf(ctx, "error when clearing compactor keys: %s", err)
-	}
 
 	// Set the started flag (for unittests).
 	atomic.StoreInt32(&s.started, 1)

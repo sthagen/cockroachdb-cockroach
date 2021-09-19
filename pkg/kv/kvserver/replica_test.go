@@ -248,7 +248,8 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 			storage.InMemory(),
 			storage.Attributes(roachpb.Attributes{Attrs: []string{"dc1", "mem"}}),
 			storage.MaxSize(1<<20),
-			storage.SetSeparatedIntents(disableSeparatedIntents))
+			storage.SetSeparatedIntents(disableSeparatedIntents),
+			storage.Settings(cfg.Settings))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -612,9 +613,6 @@ func TestReplicaContains(t *testing.T) {
 	r.mu.state.Desc = desc
 	r.rangeStr.store(0, desc)
 
-	if statsKey := keys.RangeStatsLegacyKey(desc.RangeID); !r.ContainsKey(statsKey) {
-		t.Errorf("expected range to contain range stats key %q", statsKey)
-	}
 	if !r.ContainsKey(roachpb.Key("aa")) {
 		t.Errorf("expected range to contain key \"aa\"")
 	}
@@ -6433,9 +6431,9 @@ func TestRangeStatsComputation(t *testing.T) {
 	}
 	expMS = baseStats
 	expMS.Add(enginepb.MVCCStats{
-		LiveBytes:   103,
+		LiveBytes:   101,
 		KeyBytes:    28,
-		ValBytes:    75,
+		ValBytes:    73,
 		IntentBytes: 23,
 		LiveCount:   2,
 		KeyCount:    2,
@@ -6444,6 +6442,10 @@ func TestRangeStatsComputation(t *testing.T) {
 	})
 	if tc.engine.IsSeparatedIntentsEnabledForTesting(ctx) {
 		expMS.SeparatedIntentCount++
+	}
+	if !tc.engine.OverrideTxnDidNotUpdateMetaToFalse(ctx) {
+		expMS.LiveBytes += 2
+		expMS.ValBytes += 2
 	}
 	if err := verifyRangeStats(tc.engine, tc.repl.RangeID, expMS); err != nil {
 		t.Fatal(err)
@@ -8456,8 +8458,8 @@ func TestReplicaReproposalWithNewLeaseIndexError(t *testing.T) {
 	tc.repl.mu.Lock()
 	tc.repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) (indexOverride uint64) {
 		if v := p.ctx.Value(magicKey{}); v != nil {
-			curFlushAttempt := atomic.AddInt32(&curFlushAttempt, 1)
-			switch curFlushAttempt {
+			flushAttempts := atomic.AddInt32(&curFlushAttempt, 1)
+			switch flushAttempts {
 			case 1:
 				// This is the first time the command is being given a max lease
 				// applied index. Set the index to that of the recently applied
@@ -12184,7 +12186,7 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 				et.Require1PC = true
 				return sendWrappedWithErr(etH, &et)
 			},
-			expError: "TransactionStatusError: could not commit in one phase as requested",
+			expError: "could not commit in one phase as requested",
 			expTxn:   txnWithoutChanges,
 		},
 		{

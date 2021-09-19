@@ -10,11 +10,6 @@ query T
 SELECT aclexplode(ARRAY['foo'])
 ----
 
-query O
-SELECT pg_my_temp_schema()
-----
-0
-
 # Regression test for #43166.
 statement ok
 SELECT has_table_privilege('root'::NAME, 0, 'select')
@@ -340,3 +335,205 @@ SELECT pg_catalog.set_config('woo', 'woo', false)
 
 query error configuration setting.*not supported
 SELECT set_config('vacuum_cost_delay', '0', false)
+
+# pg_my_temp_schema
+#
+# Before a temporary schema is created, it returns 0. Afterwards, it returns the
+# OID of session's temporary schema.
+
+query O
+SELECT pg_my_temp_schema()
+----
+0
+
+statement ok
+SET experimental_enable_temp_tables = true;
+
+statement ok
+CREATE TEMP TABLE temp1 (a int);
+
+query B
+SELECT pg_my_temp_schema()::TEXT LIKE 'pg_temp_%'
+----
+true
+
+# If the user changes databases, it no longer has access to its temp tables.
+# pg_my_temp_schema reverts to returning 0 again.
+
+statement ok
+SET DATABASE = db2;
+
+query O
+SELECT pg_my_temp_schema()
+----
+0
+
+statement ok
+CREATE TEMP TABLE temp2 (a int);
+
+query B
+SELECT pg_my_temp_schema()::TEXT LIKE 'pg_temp_%'
+----
+true
+
+statement ok
+SET DATABASE = test;
+
+# pg_is_other_temp_schema
+#
+# Returns true if the provided OID meets the following conditions:
+# - is a reference to a schema
+# - that is temporary
+# - and is owned by a different session
+
+query B
+SELECT pg_is_other_temp_schema((SELECT oid FROM pg_type LIMIT 1))
+----
+false
+
+query B
+SELECT pg_is_other_temp_schema((SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog'))
+----
+false
+
+query TB
+SELECT user, pg_is_other_temp_schema((SELECT oid FROM pg_namespace WHERE nspname LIKE 'pg_temp_%'))
+----
+root  false
+
+# Switch users as a means of switching sessions. GRANT to ensure visibility.
+
+statement ok
+GRANT root TO testuser
+
+user testuser
+
+query TB
+SELECT user, pg_is_other_temp_schema((SELECT oid FROM pg_namespace WHERE nspname LIKE 'pg_temp_%'))
+----
+testuser  true
+
+user root
+
+# information_schema._pg_truetypid and information_schema._pg_truetypmod
+#
+# We can't exhaustively test these until we support domain types.
+
+statement ok
+CREATE TABLE types (
+  a TEXT PRIMARY KEY,
+  b FLOAT,
+  c BPCHAR,
+  d VARCHAR(64),
+  e BIT,
+  f VARBIT(16),
+  g DECIMAL(12, 2)
+);
+
+query TOI
+SELECT typname,
+       information_schema._pg_truetypid(a.*, t.*),
+       information_schema._pg_truetypmod(a.*, t.*)
+FROM pg_attribute a
+JOIN pg_type t
+ON a.atttypid = t.oid
+WHERE attrelid = 'types'::regclass
+ORDER BY t.oid
+----
+text     25    -1
+float8   701   -1
+bpchar   1042  5
+varchar  1043  68
+bit      1560  1
+varbit   1562  16
+numeric  1700  786438
+
+# information_schema._pg_char_max_length
+
+query TI
+SELECT typname, information_schema._pg_char_max_length(a.atttypid, a.atttypmod)
+FROM pg_attribute a
+JOIN pg_type t
+ON a.atttypid = t.oid
+WHERE attrelid = 'types'::regclass
+ORDER BY t.oid
+----
+text     NULL
+float8   NULL
+bpchar   1
+varchar  64
+bit      1
+varbit   16
+numeric  NULL
+
+query TI
+SELECT typname, information_schema._pg_char_max_length(
+  information_schema._pg_truetypid(a.*, t.*),
+  information_schema._pg_truetypmod(a.*, t.*)
+)
+FROM pg_attribute a
+JOIN pg_type t
+ON a.atttypid = t.oid
+WHERE attrelid = 'types'::regclass
+ORDER BY t.oid
+----
+text     NULL
+float8   NULL
+bpchar   1
+varchar  64
+bit      1
+varbit   16
+numeric  NULL
+
+# information_schema._pg_index_position
+
+statement ok
+CREATE TABLE indexed (
+  a INT PRIMARY KEY,
+  b INT,
+  c INT,
+  d INT,
+  INDEX (b, d),
+  INDEX (c, a)
+);
+
+# NOTE, we cast indkey to an INT2[], because an INT2VECTOR's formatting appears
+# to be dependent on whether the result set spilled to disk or not. It was being
+# formatted differently with the "local" test config (and others) than with the
+# "fakedist-disk" test config.
+statement ok
+CREATE TEMPORARY VIEW indexes AS
+  SELECT i.relname, indkey::INT2[], indexrelid
+    FROM pg_catalog.pg_index
+    JOIN pg_catalog.pg_class AS t ON indrelid   = t.oid
+    JOIN pg_catalog.pg_class AS i ON indexrelid = i.oid
+   WHERE t.relname = 'indexed'
+ORDER BY i.relname
+
+query TT
+SELECT relname, indkey FROM indexes ORDER BY relname DESC
+----
+primary          {1}
+indexed_c_a_idx  {3,1}
+indexed_b_d_idx  {2,4}
+
+query TTII
+SELECT relname,
+       indkey,
+       generate_series(1, 4) input,
+       information_schema._pg_index_position(indexrelid, generate_series(1, 4))
+FROM indexes
+ORDER BY relname DESC, input
+----
+primary          {1}    1  1
+primary          {1}    2  NULL
+primary          {1}    3  NULL
+primary          {1}    4  NULL
+indexed_c_a_idx  {3,1}  1  2
+indexed_c_a_idx  {3,1}  2  NULL
+indexed_c_a_idx  {3,1}  3  1
+indexed_c_a_idx  {3,1}  4  NULL
+indexed_b_d_idx  {2,4}  1  NULL
+indexed_b_d_idx  {2,4}  2  1
+indexed_b_d_idx  {2,4}  3  NULL
+indexed_b_d_idx  {2,4}  4  2

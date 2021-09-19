@@ -318,12 +318,12 @@ func TestBackupRestoreDataDriven(t *testing.T) {
 				ret := ds.noticeBuffer
 				if err != nil {
 					ret = append(ds.noticeBuffer, err.Error())
-					if err, ok := err.(*pq.Error); ok {
-						if err.Detail != "" {
-							ret = append(ret, "DETAIL: "+err.Detail)
+					if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
+						if pqErr.Detail != "" {
+							ret = append(ret, "DETAIL: "+pqErr.Detail)
 						}
-						if err.Hint != "" {
-							ret = append(ret, "HINT: "+err.Hint)
+						if pqErr.Hint != "" {
+							ret = append(ret, "HINT: "+pqErr.Hint)
 						}
 					}
 				}
@@ -6632,7 +6632,7 @@ type exportResumePoint struct {
 	timestamp   hlc.Timestamp
 }
 
-var withTS = hlc.Timestamp{1, 0, false}
+var withTS = hlc.Timestamp{WallTime: 1}
 var withoutTS = hlc.Timestamp{}
 
 func TestPaginatedBackupTenant(t *testing.T) {
@@ -6734,7 +6734,7 @@ func TestPaginatedBackupTenant(t *testing.T) {
 		{[]byte("/Tenant/10/Table/53/1/410/0"), []byte("/Tenant/10/Table/53/2"), withoutTS},
 		{[]byte("/Tenant/10/Table/53/1/510/0"), []byte("/Tenant/10/Table/53/2"), withoutTS},
 	} {
-		expected = append(expected, requestSpanStr(roachpb.Span{resume.key, resume.endKey}, resume.timestamp))
+		expected = append(expected, requestSpanStr(roachpb.Span{Key: resume.key, EndKey: resume.endKey}, resume.timestamp))
 	}
 	require.Equal(t, expected, exportRequestSpans)
 	resetStateVars()
@@ -6761,7 +6761,7 @@ func TestPaginatedBackupTenant(t *testing.T) {
 		{[]byte("/Tenant/10/Table/57/1/410/0"), []byte("/Tenant/10/Table/57/2"), withoutTS},
 		{[]byte("/Tenant/10/Table/57/1/510/0"), []byte("/Tenant/10/Table/57/2"), withoutTS},
 	} {
-		expected = append(expected, requestSpanStr(roachpb.Span{resume.key, resume.endKey}, resume.timestamp))
+		expected = append(expected, requestSpanStr(roachpb.Span{Key: resume.key, EndKey: resume.endKey}, resume.timestamp))
 	}
 	require.Equal(t, expected, exportRequestSpans)
 	resetStateVars()
@@ -8662,4 +8662,44 @@ func TestRestorePauseOnError(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// TestDroppedDescriptorRevisionAndSystemDBIDClash is a regression test for a
+// discrepancy in the descriptor resolution logic during restore planning and
+// execution.
+//
+// While the resolution logic in restore planning filtered out descriptor
+// revisions in the dropped state, the logic in execution did not do this. As a
+// a result of this, the restore job would process additional descriptors (the
+// dropped revisions). In the case of full cluster restores, the planning phase
+// picks an id higher than all restored desc ids, for the tempSystemDB. The
+// additional dropped descriptor revisions during execution could have the same
+// id as the tempSystemDB. This id clash would cause issues when processing
+// descriptor rewrites which are keyed on the descriptor id.
+//
+// Table and database restores are not affected by this bug since we filter the
+// descriptors during execution based on the descriptor rewrites we allocated in
+// planning. Since no additional entries for system tables are added to the
+// rewrites, we expect to filter out all dropped revisions since there will be
+// no rewrites allocated for them in the first place.
+func TestDroppedDescriptorRevisionAndSystemDBIDClash(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, 1, InitManualReplication)
+	defer cleanupFn()
+
+	sqlDB.Exec(t, `
+CREATE TABLE foo (id INT);
+BACKUP TO 'nodelocal://0/foo' WITH revision_history;
+DROP TABLE foo;
+`)
+
+	var aost string
+	sqlDB.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&aost)
+	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, LocalFoo)
+
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir,
+		InitManualReplication, base.TestClusterArgs{})
+	defer cleanupEmptyCluster()
+	sqlDBRestore.Exec(t, "RESTORE FROM $1 AS OF SYSTEM TIME "+aost, LocalFoo)
 }

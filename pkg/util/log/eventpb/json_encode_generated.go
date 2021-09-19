@@ -1195,14 +1195,6 @@ func (m *CommonLargeRowDetails) AppendJSONFields(printComma bool, b redact.Redac
 		b = append(b, '"')
 	}
 
-	if m.ViolatesMaxRowSizeErr {
-		if printComma {
-			b = append(b, ',')
-		}
-		printComma = true
-		b = append(b, "\"ViolatesMaxRowSizeErr\":true"...)
-	}
-
 	return printComma, b
 }
 
@@ -2735,6 +2727,15 @@ func (m *SampledQuery) AppendJSONFields(printComma bool, b redact.RedactableByte
 	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
 
 	printComma, b = m.CommonSQLExecDetails.AppendJSONFields(printComma, b)
+
+	if m.SkippedQueries != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"SkippedQueries\":"...)
+		b = strconv.AppendUint(b, uint64(m.SkippedQueries), 10)
+	}
 
 	return printComma, b
 }

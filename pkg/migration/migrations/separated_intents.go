@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -51,6 +53,19 @@ const concurrentMigrateLockTableRequests = 4
 // The maximum number of times to retry a migrateLockTableRequest before failing
 // the migration.
 const migrateLockTableRetries = 3
+
+// defaultPageSize controls how many ranges are paged in by default when
+// iterating through all ranges in a cluster during any given migration. We
+// pulled this number out of thin air(-ish). Let's consider a cluster with 50k
+// ranges, with each range taking ~200ms. We're being somewhat conservative with
+// the duration, but in a wide-area cluster with large hops between the manager
+// and the replicas, it could be true. Here's how long it'll take for various
+// block sizes:
+//
+//   page size of 1   ~ 2h 46m
+//   page size of 50  ~ 3m 20s
+//   page size of 200 ~ 50s
+const defaultPageSize = 200
 
 // migrateLockTableRequest represents migration of one slice of the keyspace. As
 // part of this request, multiple non-transactional requests would need to be
@@ -538,7 +553,15 @@ func postSeparatedIntentsMigration(
 			if bytes.HasPrefix(start, keys.TimeseriesPrefix) && bytes.HasPrefix(end, keys.TimeseriesPrefix) {
 				continue
 			}
-			if err := deps.DB.Migrate(ctx, start, end, cv.Version); err != nil {
+			// Try running Migrate on each range 5 times before failing the migration.
+			err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), 5, func() error {
+				err := deps.DB.Migrate(ctx, start, end, cv.Version)
+				if err != nil {
+					log.Infof(ctx, "[batch %d/??] error when running no-op Migrate on range r%d: %s", batchIdx, desc.RangeID, err)
+				}
+				return err
+			})
+			if err != nil {
 				return err
 			}
 		}

@@ -35,6 +35,8 @@
 </span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: geometry[], elem: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
+<tr><td><a name="array_append"></a><code>array_append(array: jsonb[], elem: jsonb) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: oid[], elem: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: timetz[], elem: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -72,6 +74,8 @@
 <tr><td><a name="array_cat"></a><code>array_cat(left: geography[], right: geography[]) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: geometry[], right: geometry[]) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
+</span></td></tr>
+<tr><td><a name="array_cat"></a><code>array_cat(left: jsonb[], right: jsonb[]) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: oid[], right: oid[]) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
@@ -115,6 +119,8 @@
 </span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: geometry[], elem: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
+<tr><td><a name="array_position"></a><code>array_position(array: jsonb[], elem: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
+</span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: oid[], elem: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: timetz[], elem: timetz) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
@@ -152,6 +158,8 @@
 <tr><td><a name="array_positions"></a><code>array_positions(array: geography[], elem: geography) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: geometry[], elem: geometry) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
+</span></td></tr>
+<tr><td><a name="array_positions"></a><code>array_positions(array: jsonb[], elem: jsonb) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: oid[], elem: oid) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
@@ -191,6 +199,8 @@
 </span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: geometry, array: geometry[]) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
+<tr><td><a name="array_prepend"></a><code>array_prepend(elem: jsonb, array: jsonb[]) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: oid, array: oid[]) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: timetz, array: timetz[]) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -229,6 +239,8 @@
 </span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: geometry[], elem: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td></tr>
+<tr><td><a name="array_remove"></a><code>array_remove(array: jsonb[], elem: jsonb) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
+</span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: oid[], elem: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: timetz[], elem: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
@@ -266,6 +278,8 @@
 <tr><td><a name="array_replace"></a><code>array_replace(array: geography[], toreplace: geography, replacewith: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: geometry[], toreplace: geometry, replacewith: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
+</span></td></tr>
+<tr><td><a name="array_replace"></a><code>array_replace(array: jsonb[], toreplace: jsonb, replacewith: jsonb) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: oid[], toreplace: oid, replacewith: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
@@ -1055,8 +1069,6 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <tr><td><a name="nextval"></a><code>nextval(sequence_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Advances the given sequence and returns its new value.</p>
 </span></td></tr>
 <tr><td><a name="nextval"></a><code>nextval(sequence_name: regclass) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Advances the given sequence and returns its new value.</p>
-</span></td></tr>
-<tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
 </span></td></tr>
 <tr><td><a name="setval"></a><code>setval(sequence_name: <a href="string.html">string</a>, value: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the given sequence’s current value. The next call to nextval will return <code>value + Increment</code></p>
 </span></td></tr>
@@ -2563,8 +2575,6 @@ The output can be used to recreate a database.’</p>
 </span></td></tr>
 <tr><td><a name="parse_timetz"></a><code>parse_timetz(val: <a href="string.html">string</a>) &rarr; timetz</code></td><td><span class="funcdesc"><p>Parses a timetz assuming the date (if any) is in MDY format.</p>
 </span></td></tr>
-<tr><td><a name="pg_collation_for"></a><code>pg_collation_for(str: anyelement) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the collation of the argument</p>
-</span></td></tr>
 <tr><td><a name="quote_ident"></a><code>quote_ident(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Return <code>val</code> suitably quoted to serve as identifier in a SQL statement.</p>
 </span></td></tr>
 <tr><td><a name="quote_literal"></a><code>quote_literal(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Return <code>val</code> suitably quoted to serve as string literal in a SQL statement.</p>
@@ -3120,9 +3130,29 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="oid"></a><code>oid(int: <a href="int.html">int</a>) &rarr; oid</code></td><td><span class="funcdesc"><p>Converts an integer to an OID.</p>
 </span></td></tr>
+<tr><td><a name="pg_collation_for"></a><code>pg_collation_for(str: anyelement) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the collation of the argument</p>
+</span></td></tr>
 <tr><td><a name="pg_column_is_updatable"></a><code>pg_column_is_updatable(reloid: oid, attnum: int2, include_triggers: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the given column can be updated.</p>
 </span></td></tr>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
+</span></td></tr>
+<tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
+</span></td></tr>
+<tr><td><a name="pg_has_role"></a><code>pg_has_role(role: <a href="string.html">string</a>, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the current user has privileges for role.</p>
+</span></td></tr>
+<tr><td><a name="pg_has_role"></a><code>pg_has_role(role: oid, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the current user has privileges for role.</p>
+</span></td></tr>
+<tr><td><a name="pg_has_role"></a><code>pg_has_role(user: <a href="string.html">string</a>, role: <a href="string.html">string</a>, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the user has privileges for role.</p>
+</span></td></tr>
+<tr><td><a name="pg_has_role"></a><code>pg_has_role(user: <a href="string.html">string</a>, role: oid, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the user has privileges for role.</p>
+</span></td></tr>
+<tr><td><a name="pg_has_role"></a><code>pg_has_role(user: oid, role: <a href="string.html">string</a>, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the user has privileges for role.</p>
+</span></td></tr>
+<tr><td><a name="pg_has_role"></a><code>pg_has_role(user: oid, role: oid, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the user has privileges for role.</p>
+</span></td></tr>
+<tr><td><a name="pg_is_other_temp_schema"></a><code>pg_is_other_temp_schema(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the given OID is the OID of another session’s temporary schema. (This can be useful, for example, to exclude other sessions’ temporary tables from a catalog display.)</p>
+</span></td></tr>
+<tr><td><a name="pg_my_temp_schema"></a><code>pg_my_temp_schema() &rarr; oid</code></td><td><span class="funcdesc"><p>Returns the OID of the current session’s temporary schema, or zero if it has none (because it has not created any temporary tables).</p>
 </span></td></tr>
 <tr><td><a name="pg_relation_is_updatable"></a><code>pg_relation_is_updatable(reloid: oid, include_triggers: <a href="bool.html">bool</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the update events the relation supports.</p>
 </span></td></tr>

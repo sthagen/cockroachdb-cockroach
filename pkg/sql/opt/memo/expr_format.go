@@ -308,6 +308,12 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			tp.Childf("error: \"%s\"", private.ErrorOnDup)
 		}
 
+	case *TopKExpr:
+		if !f.HasFlags(ExprFmtHidePhysProps) && !t.Ordering.Any() {
+			tp.Childf("internal-ordering: %s", t.Ordering)
+		}
+		tp.Childf("k: %d", t.K)
+
 	case *LimitExpr:
 		if !f.HasFlags(ExprFmtHidePhysProps) && !t.Ordering.Any() {
 			tp.Childf("internal-ordering: %s", t.Ordering)
@@ -421,6 +427,23 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			}
 			if private.Flags.NoZigzagJoin {
 				b.WriteString(" no-zigzag-join")
+			}
+			if private.Flags.ForceZigzag {
+				if private.Flags.ZigzagIndexes.Empty() {
+					b.WriteString(" force-zigzag")
+				} else {
+					b.WriteString(" force-zigzag=")
+					s := private.Flags.ZigzagIndexes
+					needComma := false
+					for i, ok := s.Next(0); ok; i, ok = s.Next(i + 1) {
+						idx := md.Table(private.Table).Index(i)
+						if needComma {
+							b.WriteByte(',')
+						}
+						b.WriteString(string(idx.Name()))
+						needComma = true
+					}
+				}
 			}
 			tp.Child(b.String())
 		}

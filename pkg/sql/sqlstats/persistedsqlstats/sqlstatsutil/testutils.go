@@ -17,8 +17,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,9 +32,6 @@ func GetRandomizedCollectedStatementStatisticsForTest(
 	data := genRandomData()
 	fillObject(t, reflect.ValueOf(&result), &data)
 
-	// TODO(azhng): Gone after https://github.com/cockroachdb/cockroach/issues/68077.
-	result.Key.Opt = true
-
 	return result
 }
 
@@ -42,6 +41,7 @@ type randomData struct {
 	Int64    int64
 	Float    float64
 	IntArray []int64
+	Time     time.Time
 }
 
 var alphabet = []rune("abcdefghijklmkopqrstuvwxyz")
@@ -67,6 +67,7 @@ func genRandomData() randomData {
 		r.IntArray[i] = rand.Int63()
 	}
 
+	r.Time = timeutil.Now()
 	return r
 }
 
@@ -78,10 +79,16 @@ func fillTemplate(t *testing.T, tmplStr string, data randomData) string {
 		}
 		return strings.Join(strArr, ",")
 	}
+	stringifyTime := func(tm time.Time) string {
+		s, err := tm.MarshalText()
+		require.NoError(t, err)
+		return string(s)
+	}
 	tmpl, err := template.
 		New("").
 		Funcs(template.FuncMap{
-			"joinInts": joinInts,
+			"joinInts":      joinInts,
+			"stringifyTime": stringifyTime,
 		}).
 		Parse(tmplStr)
 	require.NoError(t, err)
@@ -101,7 +108,6 @@ var fieldBlacklist = map[string]struct{}{
 	"SensitiveInfo":           {},
 	"LegacyLastErr":           {},
 	"LegacyLastErrRedacted":   {},
-	"LastExecTimestamp":       {},
 	"StatementFingerprintIDs": {},
 	"AggregatedTs":            {},
 }
@@ -130,15 +136,22 @@ func fillObject(t *testing.T, val reflect.Value, data *randomData) {
 			val.Set(reflect.Append(val, reflect.ValueOf(randInt)))
 		}
 	case reflect.Struct:
-		numFields := val.NumField()
-		for i := 0; i < numFields; i++ {
-			fieldName := val.Type().Field(i).Name
-			fieldAddr := val.Field(i).Addr()
-			if _, ok := fieldBlacklist[fieldName]; ok {
-				continue
-			}
+		switch val.Type().Name() {
+		// Special handling time.Time.
+		case "Time":
+			val.Set(reflect.ValueOf(data.Time))
+			return
+		default:
+			numFields := val.NumField()
+			for i := 0; i < numFields; i++ {
+				fieldName := val.Type().Field(i).Name
+				fieldAddr := val.Field(i).Addr()
+				if _, ok := fieldBlacklist[fieldName]; ok {
+					continue
+				}
 
-			fillObject(t, fieldAddr, data)
+				fillObject(t, fieldAddr, data)
+			}
 		}
 	default:
 		t.Fatalf("unsupported type: %s", val.Kind().String())

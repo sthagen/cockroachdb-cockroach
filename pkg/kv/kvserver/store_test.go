@@ -313,8 +313,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 	rng := rand.New(rand.NewSource(seed))
 
 	ops := []func(rangeID roachpb.RangeID) roachpb.Key{
-		keys.RaftAppliedIndexLegacyKey, // replicated; sorts before tombstone
-		keys.RaftHardStateKey,          // unreplicated; sorts after tombstone
+		keys.RaftHardStateKey, // unreplicated; sorts after tombstone
 		// Replicated key-anchored local key (i.e. not one we should care about).
 		// Will be written at zero timestamp, but that's ok.
 		func(rangeID roachpb.RangeID) roachpb.Key {
@@ -2693,11 +2692,11 @@ func TestStoreRangePlaceholders(t *testing.T) {
 	checkRemoved(s.removePlaceholderLocked(ctx, placeholder1, removePlaceholderFilled))
 	checkNotRemoved(s.removePlaceholderLocked(ctx, placeholder1, removePlaceholderFailed))
 	checkNotRemoved(s.removePlaceholderLocked(ctx, placeholder1, removePlaceholderDropped))
-	checkErr(`attempt to remove already removed placeholder`)(s.removePlaceholderLocked(
+	checkErr(`attempting to fill tainted placeholder`)(s.removePlaceholderLocked(
 		ctx, placeholder1, removePlaceholderFilled,
 	))
 	placeholder1.tainted = 0 // pretend it wasn't already deleted
-	checkErr(`expected placeholder to exist: true but found in store: false`)(s.removePlaceholderLocked(
+	checkErr(`expected placeholder .* to exist`)(s.removePlaceholderLocked(
 		ctx, placeholder1, removePlaceholderDropped,
 	))
 
@@ -2723,7 +2722,7 @@ func TestStoreRangePlaceholders(t *testing.T) {
 
 	// Test that Placeholder deletion doesn't delete replicas.
 	placeholder1.tainted = 0
-	checkErr(`expected placeholder to exist: true`)(s.removePlaceholderLocked(ctx, placeholder1, removePlaceholderFilled))
+	checkErr(`expected placeholder .* to exist`)(s.removePlaceholderLocked(ctx, placeholder1, removePlaceholderFilled))
 	checkNotRemoved(s.removePlaceholderLocked(ctx, placeholder1, removePlaceholderFailed))
 	check(`
 [] - [99] (/Min - "c")

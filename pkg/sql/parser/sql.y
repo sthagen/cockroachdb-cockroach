@@ -780,7 +780,7 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 
 %token <str> FAILURE FALSE FAMILY FETCH FETCHVAL FETCHTEXT FETCHVAL_PATH FETCHTEXT_PATH
 %token <str> FILES FILTER
-%token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE FORCE_INDEX FOREIGN FROM FULL FUNCTION FUNCTIONS
+%token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE FORCE_INDEX FORCE_ZIGZAG FOREIGN FROM FULL FUNCTION FUNCTIONS
 
 %token <str> GENERATED GEOGRAPHY GEOMETRY GEOMETRYM GEOMETRYZ GEOMETRYZM
 %token <str> GEOMETRYCOLLECTION GEOMETRYCOLLECTIONM GEOMETRYCOLLECTIONZ GEOMETRYCOLLECTIONZM
@@ -1536,6 +1536,7 @@ alter_ddl_stmt:
 //   ALTER TABLE ... DROP [COLUMN] [IF EXISTS] <colname> [RESTRICT | CASCADE]
 //   ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] <constraintname> [RESTRICT | CASCADE]
 //   ALTER TABLE ... ALTER [COLUMN] <colname> {SET DEFAULT <expr> | DROP DEFAULT}
+//   ALTER TABLE ... ALTER [COLUMN] <colname> {SET ON UPDATE <expr> | DROP ON UPDATE}
 //   ALTER TABLE ... ALTER [COLUMN] <colname> DROP NOT NULL
 //   ALTER TABLE ... ALTER [COLUMN] <colname> DROP STORED
 //   ALTER TABLE ... ALTER [COLUMN] <colname> [SET DATA] TYPE <type> [COLLATE <collation>]
@@ -2148,7 +2149,7 @@ alter_table_cmd:
   {
     $$.val = &tree.AlterTableSetDefault{Column: tree.Name($3), Default: $4.expr()}
   }
-  // ALTER TABLE <name> ALTER [COLUMN] <colname> {ON UPDATE <expr>|DROP ON UPDATE}
+  // ALTER TABLE <name> ALTER [COLUMN] <colname> {SET ON UPDATE <expr>|DROP ON UPDATE}
 | ALTER opt_column column_name alter_column_on_update
   {
     $$.val = &tree.AlterTableSetOnUpdate{Column: tree.Name($3), Expr: $4.expr()}
@@ -6313,7 +6314,7 @@ alter_schema_stmt:
 //    CHECK ( <expr> )
 //
 // Column qualifiers:
-//   [CONSTRAINT <constraintname>] {NULL | NOT NULL | NOT VISIBLE | UNIQUE | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr> | GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( <opt_sequence_option_list> )]}
+//   [CONSTRAINT <constraintname>] {NULL | NOT NULL | NOT VISIBLE | UNIQUE | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr> | ON UPDATE <expr> | GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( <opt_sequence_option_list> )]}
 //   FAMILY <familyname>, CREATE [IF NOT EXISTS] FAMILY [<familyname>]
 //   REFERENCES <tablename> [( <colnames...> )] [ON DELETE {NO ACTION | RESTRICT}] [ON UPDATE {NO ACTION | RESTRICT}]
 //   COLLATE <collationname>
@@ -9767,6 +9768,22 @@ index_flags_param:
     /* SKIP DOC */
     $$.val = &tree.IndexFlags{IgnoreForeignKeys: true}
   }
+|
+  FORCE_ZIGZAG
+  {
+     $$.val = &tree.IndexFlags{ForceZigzag: true}
+  }
+|
+  FORCE_ZIGZAG '=' index_name
+  {
+     $$.val = &tree.IndexFlags{ZigzagIndexes: []tree.UnrestrictedName{tree.UnrestrictedName($3)}}
+  }
+|
+  FORCE_ZIGZAG '=' '[' iconst64 ']'
+  {
+    /* SKIP DOC */
+     $$.val = &tree.IndexFlags{ZigzagIndexIDs: []tree.IndexID{tree.IndexID($4.int64())}}
+  }
 
 index_flags_param_list:
   index_flags_param
@@ -9827,6 +9844,7 @@ opt_index_flags:
 //   '{' NO_INDEX_JOIN [, ...] '}'
 //   '{' NO_ZIGZAG_JOIN [, ...] '}'
 //   '{' IGNORE_FOREIGN_KEYS [, ...] '}'
+//   '{' FORCE_ZIGZAG = <idxname> [, ...]  '}'
 //
 // Join types:
 //   { INNER | { LEFT | RIGHT | FULL } [OUTER] } [ { HASH | MERGE | LOOKUP | INVERTED } ]
@@ -13187,6 +13205,7 @@ unreserved_keyword:
 | FOLLOWING
 | FORCE
 | FORCE_INDEX
+| FORCE_ZIGZAG
 | FUNCTION
 | FUNCTIONS
 | GENERATED

@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/migration"
+	"github.com/cockroachdb/errors"
 )
 
 // GetMigration returns the migration corresponding to this version if
@@ -39,6 +40,16 @@ func NoPrecondition(context.Context, clusterversion.ClusterVersion, migration.Te
 var registry = make(map[clusterversion.ClusterVersion]migration.Migration)
 
 var migrations = []migration.Migration{
+	migration.NewSystemMigration(
+		"use unreplicated TruncatedState and RangeAppliedState for all ranges",
+		toCV(clusterversion.TruncatedAndRangeAppliedStateMigration),
+		truncatedStateMigration,
+	),
+	migration.NewSystemMigration(
+		"purge all replicas using the replicated TruncatedState",
+		toCV(clusterversion.PostTruncatedAndRangeAppliedStateMigration),
+		postTruncatedStateMigration,
+	),
 	migration.NewSystemMigration(
 		"stop using monolithic encryption-at-rest registry for all stores",
 		toCV(clusterversion.RecordsBasedRegistry),
@@ -63,25 +74,13 @@ var migrations = []migration.Migration{
 		fixDescriptorMigration,
 	),
 	migration.NewTenantMigration(
-		"add the system.sql_statement_stats table",
-		toCV(clusterversion.SQLStatsTable),
-		NoPrecondition,
-		sqlStatementStatsTableMigration,
-	),
-	migration.NewTenantMigration(
-		"add the system.sql_transaction_stats table",
-		toCV(clusterversion.SQLStatsTable),
-		NoPrecondition,
-		sqlTransactionStatsTableMigration,
-	),
-	migration.NewTenantMigration(
 		"add the system.database_role_settings table",
 		toCV(clusterversion.DatabaseRoleSettings),
 		NoPrecondition,
 		databaseRoleSettingsTableMigration,
 	),
 	migration.NewTenantMigration(
-		"add the systems.tenant_usage table",
+		"add the system.tenant_usage table",
 		toCV(clusterversion.TenantUsageTable),
 		NoPrecondition,
 		tenantUsageTableMigration,
@@ -129,10 +128,25 @@ var migrations = []migration.Migration{
 		NoPrecondition,
 		alterSystemWebSessionsCreateIndexes,
 	),
+	migration.NewTenantMigration(
+		"change system.tenant_usage table to use a single column for consumption",
+		toCV(clusterversion.TenantUsageSingleConsumptionColumn),
+		NoPrecondition,
+		tenantUsageSingleConsumptionColumn,
+	),
+	migration.NewTenantMigration(
+		"add the system.statement_statistics and system.transaction_statistics tables",
+		toCV(clusterversion.SQLStatsTables),
+		NoPrecondition,
+		sqlStatsTablesMigration,
+	),
 }
 
 func init() {
 	for _, m := range migrations {
+		if _, exists := registry[m.ClusterVersion()]; exists {
+			panic(errors.AssertionFailedf("duplicate migration registration for %v", m.ClusterVersion()))
+		}
 		registry[m.ClusterVersion()] = m
 	}
 }

@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+//go:build lint
 // +build lint
 
 package lint
@@ -762,6 +763,7 @@ func TestLint(t *testing.T) {
 			`\bos\.Is(Exist|NotExist|Timeout|Permission)`,
 			"--",
 			"*.go",
+			":!cmd/dev/**",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1153,6 +1155,7 @@ func TestLint(t *testing.T) {
 			":!sql/pgwire/pgerror/severity.go",
 			":!sql/pgwire/pgerror/with_candidate_code.go",
 			":!sql/pgwire/pgwirebase/too_big_error.go",
+			":!sql/protoreflect/redact.go",
 			":!sql/colexecerror/error.go",
 			":!util/contextutil/timeout_error.go",
 			":!util/protoutil/jsonpb_marshal.go",
@@ -1631,6 +1634,7 @@ func TestLint(t *testing.T) {
 				stream.GrepNot("pkg/sql/oidext/oidext.go.*don't use underscores in Go names; const T_"),
 				stream.GrepNot("server/api_v2.go.*package comment should be of the form"),
 				stream.GrepNot("type name will be used as row.RowLimit by other packages, and that stutters; consider calling this Limit"),
+				stream.GrepNot("pkg/util/timeutil/time_zone_util.go.*error strings should not be capitalized or end with punctuation or a newline"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {

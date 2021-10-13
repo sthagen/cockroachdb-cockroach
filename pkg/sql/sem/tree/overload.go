@@ -67,8 +67,19 @@ type Overload struct {
 
 	AggregateFunc func([]*types.T, *EvalContext, Datums) AggregateFunc
 	WindowFunc    func([]*types.T, *EvalContext) WindowFunc
-	Fn            func(*EvalContext, Datums) (Datum, error)
-	Generator     GeneratorFactory
+
+	// Only one of the following three attributes can be set.
+
+	// Fn is the normal builtin implementation function. It's for functions that
+	// take in datums and return a datum.
+	Fn func(*EvalContext, Datums) (Datum, error)
+
+	// Generator is for SRFs. SRFs take datums and return multiple rows of datums.
+	Generator GeneratorFactory
+
+	// GeneratorWithExprs is for SRFs that need access to their arguments as Exprs
+	// and not pre-evaluated Datums, but is otherwise identical to Generator.
+	GeneratorWithExprs GeneratorWithExprsFactory
 
 	// SQLFn must be set for overloads of type SQLClass. It should return a SQL
 	// statement which will be executed as a common table expression in the query.
@@ -90,6 +101,11 @@ type Overload struct {
 	// Oid is the cached oidHasher.BuiltinOid result for this Overload. It's
 	// populated at init-time.
 	Oid oid.Oid
+
+	// DistsqlBlocklist is set to true when a function cannot be evaluated in
+	// DistSQL. One example is when the type information for function arguments
+	// cannot be recovered.
+	DistsqlBlocklist bool
 }
 
 // params implements the overloadImpl interface.
@@ -133,6 +149,11 @@ func (b Overload) InferReturnTypeFromInputArgTypes(inputTypes []*types.T) *types
 		retTyp = returnTypeToFixedType(b.ReturnType, args)
 	}
 	return retTyp
+}
+
+// IsGenerator returns true if the function is a set returning function (SRF).
+func (b Overload) IsGenerator() bool {
+	return b.Generator != nil || b.GeneratorWithExprs != nil
 }
 
 // Signature returns a human-readable signature.

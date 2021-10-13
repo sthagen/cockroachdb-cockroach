@@ -60,7 +60,6 @@ import (
 //
 func TestRestoreOldVersions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 70154, "flaky test")
 	defer log.Scope(t).Close(t)
 	const (
 		testdataBase                = "testdata/restore_old_versions"
@@ -130,6 +129,7 @@ func TestRestoreOldVersions(t *testing.T) {
 	})
 
 	t.Run("multi-region-restore", func(t *testing.T) {
+		skip.UnderRace(t, "very slow as it starts multiple servers")
 		dirs, err := ioutil.ReadDir(multiRegionDirs)
 		require.NoError(t, err)
 		for _, dir := range dirs {

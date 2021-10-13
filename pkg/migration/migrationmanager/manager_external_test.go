@@ -13,6 +13,7 @@ package migrationmanager_test
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -148,7 +149,7 @@ RETURNING id;`).Scan(&secondID))
 	// Launch a second migration which later we'll ensure does not kick off
 	// another job. We'll make sure this happens by polling the trace to see
 	// the log line indicating what we want.
-	tr := tc.Server(0).Tracer().(*tracing.Tracer)
+	tr := tc.Server(0).TracerI().(*tracing.Tracer)
 	recCtx, getRecording, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test")
 	defer cancel()
 	upgrade2Err := make(chan error, 1)
@@ -473,6 +474,12 @@ SELECT id
 		t.Fatalf("did not expect the job to run again")
 	case <-time.After(10 * time.Millisecond):
 	}
+	// Wait for the job to actually be paused as opposed to waiting in
+	// pause-requested. There's a separate issue to make PAUSE wait for
+	// the job to be paused, but that's a behavior change is better than nothing.
+	tdb.CheckQueryResultsRetry(t, fmt.Sprintf(
+		`SELECT status FROM crdb_internal.jobs WHERE job_id = %d`, id,
+	), [][]string{{"paused"}})
 	tdb.Exec(t, "RESUME JOB $1", id)
 	ev = <-ch
 	close(ev.unblock)

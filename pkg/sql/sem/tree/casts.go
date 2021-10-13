@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
@@ -89,6 +90,7 @@ var validCasts = []castInfo{
 	{from: types.DecimalFamily, to: types.BoolFamily, volatility: VolatilityImmutable},
 	{from: types.StringFamily, to: types.BoolFamily, volatility: VolatilityImmutable},
 	{from: types.CollatedStringFamily, to: types.BoolFamily, volatility: VolatilityImmutable},
+	{from: types.JsonFamily, to: types.BoolFamily, volatility: VolatilityImmutable},
 
 	// Casts to IntFamily.
 	{from: types.UnknownFamily, to: types.IntFamily, volatility: VolatilityImmutable},
@@ -535,9 +537,7 @@ func AdjustValueToType(typ *types.T, inVal Datum) (outVal Datum, err error) {
 		} else if v, ok := inVal.(*DCollatedString); ok {
 			sv = v.Contents
 		}
-
 		sv = adjustStringValueToType(typ, sv)
-
 		if typ.Width() > 0 && utf8.RuneCountInString(sv) > int(typ.Width()) {
 			return nil, pgerror.Newf(pgcode.StringDataRightTruncation,
 				"value too long for type %s",
@@ -765,6 +765,12 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			return ParseDBool(string(*v))
 		case *DCollatedString:
 			return ParseDBool(v.Contents)
+		case *DJSON:
+			b, ok := v.AsBool()
+			if !ok {
+				return nil, failedCastFromJSON(v, t)
+			}
+			return MakeDBool(DBool(b)), nil
 		}
 
 	case types.IntFamily:
@@ -796,14 +802,9 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			}
 			res = NewDInt(DInt(f))
 		case *DDecimal:
-			d := ctx.getTmpDec()
-			_, err := DecimalCtx.RoundToIntegralValue(d, &v.Decimal)
+			i, err := roundDecimalToInt(ctx, &v.Decimal)
 			if err != nil {
 				return nil, err
-			}
-			i, err := d.Int64()
-			if err != nil {
-				return nil, ErrIntOutOfRange
 			}
 			res = NewDInt(DInt(i))
 		case *DString:
@@ -835,12 +836,19 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 		case *DOid:
 			res = &v.DInt
 		case *DJSON:
-			if dec, ok := v.AsDecimal(); ok {
-				asInt, err := dec.Int64()
-				if err == nil {
-					res = NewDInt(DInt(asInt))
+			dec, ok := v.AsDecimal()
+			if !ok {
+				return nil, failedCastFromJSON(v, t)
+			}
+			i, err := dec.Int64()
+			if err != nil {
+				// Attempt to round the number to an integer.
+				i, err = roundDecimalToInt(ctx, dec)
+				if err != nil {
+					return nil, err
 				}
 			}
+			res = NewDInt(DInt(i))
 		}
 		if res != nil {
 			return res, nil
@@ -892,13 +900,15 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 		case *DInterval:
 			return NewDFloat(DFloat(v.AsFloat64())), nil
 		case *DJSON:
-			if dec, ok := v.AsDecimal(); ok {
-				fl, err := dec.Float64()
-				if err != nil {
-					return nil, ErrFloatOutOfRange
-				}
-				return NewDFloat(DFloat(fl)), nil
+			dec, ok := v.AsDecimal()
+			if !ok {
+				return nil, failedCastFromJSON(v, t)
 			}
+			fl, err := dec.Float64()
+			if err != nil {
+				return nil, ErrFloatOutOfRange
+			}
+			return NewDFloat(DFloat(fl)), nil
 		}
 
 	case types.DecimalFamily:
@@ -948,11 +958,11 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			v.AsBigInt(&dd.Coeff)
 			dd.Exponent = -9
 		case *DJSON:
-			if dec, ok := v.AsDecimal(); ok {
-				dd.Set(dec)
-			} else {
-				unset = false
+			dec, ok := v.AsDecimal()
+			if !ok {
+				return nil, failedCastFromJSON(v, t)
 			}
+			dd.Set(dec)
 		default:
 			unset = true
 		}
@@ -972,13 +982,27 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 
 	case types.StringFamily, types.CollatedStringFamily:
 		var s string
+		typ := t
 		switch t := d.(type) {
 		case *DBitArray:
 			s = t.BitArray.String()
 		case *DFloat:
 			s = strconv.FormatFloat(float64(*t), 'g',
 				ctx.SessionData().DataConversionConfig.GetFloatPrec(), 64)
-		case *DBool, *DInt, *DDecimal:
+		case *DInt:
+			if typ.Oid() == oid.T_char {
+				// int to "char" casts just return the correspondong ASCII byte.
+				if *t > math.MaxInt8 || *t < math.MinInt8 {
+					return nil, errCharOutOfRange
+				} else if *t == 0 {
+					s = ""
+				} else {
+					s = string([]byte{byte(*t)})
+				}
+			} else {
+				s = d.String()
+			}
+		case *DBool, *DDecimal:
 			s = d.String()
 		case *DTimestamp, *DDate, *DTime, *DTimeTZ, *DGeography, *DGeometry, *DBox2D:
 			s = AsStringWithFlags(d, FmtBareStrings)
@@ -1477,4 +1501,110 @@ func performIntToOidCast(ctx *EvalContext, t *types.T, v DInt) (Datum, error) {
 		}
 		return oid, nil
 	}
+}
+
+func roundDecimalToInt(ctx *EvalContext, d *apd.Decimal) (int64, error) {
+	newD := ctx.getTmpDec()
+	if _, err := DecimalCtx.RoundToIntegralValue(newD, d); err != nil {
+		return 0, err
+	}
+	i, err := newD.Int64()
+	if err != nil {
+		return 0, ErrIntOutOfRange
+	}
+	return i, nil
+}
+
+func failedCastFromJSON(j *DJSON, t *types.T) error {
+	return pgerror.Newf(
+		pgcode.InvalidParameterValue,
+		"cannot cast jsonb %s to type %s",
+		j.Type(), t,
+	)
+}
+
+// PopulateRecordWithJSON is used for the json to record function family, like
+// json_populate_record. Given a JSON object, a desired tuple type, and a tuple
+// of the same length as the desired type, this function will populate the tuple
+// by setting each named field in the tuple to the value of the key with the
+// same name in the input JSON object. Fields in the tuple that are not present
+// in the JSON will not be modified, and JSON keys that are not in the tuple
+// will be ignored.
+// Each field will be set by a best-effort coercion to its type from the JSON
+// field. The logic is more permissive than casts.
+func PopulateRecordWithJSON(
+	ctx *EvalContext, j json.JSON, desiredType *types.T, tup *DTuple,
+) error {
+	if j.Type() != json.ObjectJSONType {
+		return pgerror.Newf(pgcode.InvalidParameterValue, "expected JSON object")
+	}
+	tupleTypes := desiredType.TupleContents()
+	labels := desiredType.TupleLabels()
+	if labels == nil {
+		return pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"anonymous records cannot be used with json{b}_populate_record{set}",
+		)
+	}
+	for i := range tupleTypes {
+		val, err := j.FetchValKey(labels[i])
+		if err != nil || val == nil {
+			// No value? Use the value that was already in the tuple.
+			continue
+		}
+		tup.D[i], err = PopulateDatumWithJSON(ctx, val, tupleTypes[i])
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PopulateDatumWithJSON is used for the json to record function family, like
+// json_populate_record. It's less restrictive than the casting system, which
+// is why it's implemented separately.
+func PopulateDatumWithJSON(ctx *EvalContext, j json.JSON, desiredType *types.T) (Datum, error) {
+	if j == json.NullJSONValue {
+		return DNull, nil
+	}
+	switch desiredType.Family() {
+	case types.ArrayFamily:
+		if j.Type() != json.ArrayJSONType {
+			return nil, pgerror.Newf(pgcode.InvalidTextRepresentation, "expected JSON array")
+		}
+		n := j.Len()
+		elementTyp := desiredType.ArrayContents()
+		d := NewDArray(elementTyp)
+		d.Array = make(Datums, n)
+		for i := 0; i < n; i++ {
+			elt, err := j.FetchValIdx(i)
+			if err != nil {
+				return nil, err
+			}
+			d.Array[i], err = PopulateDatumWithJSON(ctx, elt, elementTyp)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return d, nil
+	case types.TupleFamily:
+		tup := NewDTupleWithLen(desiredType, len(desiredType.TupleContents()))
+		for i := range tup.D {
+			tup.D[i] = DNull
+		}
+		err := PopulateRecordWithJSON(ctx, j, desiredType, tup)
+		return tup, err
+	}
+	var s string
+	switch j.Type() {
+	case json.StringJSONType:
+		t, err := j.AsText()
+		if err != nil {
+			return nil, err
+		}
+		s = *t
+	default:
+		s = j.String()
+	}
+	return PerformCast(ctx, NewDString(s), desiredType)
 }

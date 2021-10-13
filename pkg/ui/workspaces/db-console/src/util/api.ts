@@ -17,6 +17,7 @@ import moment from "moment";
 
 import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
+import { propsToQueryString } from "src/util/query";
 
 export type DatabasesRequestMessage = protos.cockroach.server.serverpb.DatabasesRequest;
 export type DatabasesResponseMessage = protos.cockroach.server.serverpb.DatabasesResponse;
@@ -35,6 +36,7 @@ export type LocationsResponseMessage = protos.cockroach.server.serverpb.Location
 
 export type NodesRequestMessage = protos.cockroach.server.serverpb.NodesRequest;
 export type NodesResponseMessage = protos.cockroach.server.serverpb.NodesResponse;
+export type NodesResponseExternalMessage = protos.cockroach.server.serverpb.NodesResponseExternal;
 
 export type GetUIDataRequestMessage = protos.cockroach.server.serverpb.GetUIDataRequest;
 export type GetUIDataResponseMessage = protos.cockroach.server.serverpb.GetUIDataResponse;
@@ -254,19 +256,6 @@ export type APIRequestFn<TReq, TResponse> = (
   timeout?: moment.Duration,
 ) => Promise<TResponse>;
 
-// propsToQueryString is a helper function that converts a set of object
-// properties to a query string
-// - keys with null or undefined values will be skipped
-// - non-string values will be toString'd
-export function propsToQueryString(props: { [k: string]: any }) {
-  return _.compact(
-    _.map(props, (v: any, k: string) =>
-      !_.isNull(v) && !_.isUndefined(v)
-        ? `${encodeURIComponent(k)}=${encodeURIComponent(v.toString())}`
-        : null,
-    ),
-  ).join("&");
-}
 /**
  * ENDPOINTS
  */
@@ -372,13 +361,13 @@ export function getLocations(
 }
 
 // getNodes gets node data
-export function getNodes(
+export function getNodesUI(
   _req: NodesRequestMessage,
   timeout?: moment.Duration,
-): Promise<NodesResponseMessage> {
+): Promise<NodesResponseExternalMessage> {
   return timeoutFetch(
-    serverpb.NodesResponse,
-    `${STATUS_PREFIX}/nodes`,
+    serverpb.NodesResponseExternal,
+    `${STATUS_PREFIX}/nodes_ui`,
     null,
     timeout,
   );
@@ -676,7 +665,7 @@ export function getStatements(
   timeout?: moment.Duration,
 ): Promise<StatementsResponseMessage> {
   const queryStr = propsToQueryString({
-    combined: true,
+    combined: req.combined,
     start: req.start.toInt(),
     end: req.end.toInt(),
   });

@@ -163,7 +163,7 @@ func (fta *FetcherTableArgs) InitCols(
 	desc catalog.TableDescriptor,
 	scanVisibility execinfrapb.ScanVisibility,
 	withSystemColumns bool,
-	virtualColumn catalog.Column,
+	invertedColumn catalog.Column,
 ) {
 	cols := make([]catalog.Column, 0, len(desc.AllColumns()))
 	if scanVisibility == execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC {
@@ -171,10 +171,10 @@ func (fta *FetcherTableArgs) InitCols(
 	} else {
 		cols = append(cols, desc.PublicColumns()...)
 	}
-	if virtualColumn != nil {
+	if invertedColumn != nil {
 		for i, col := range cols {
-			if col.GetID() == virtualColumn.GetID() {
-				cols[i] = virtualColumn
+			if col.GetID() == invertedColumn.GetID() {
+				cols[i] = invertedColumn
 				break
 			}
 		}
@@ -596,6 +596,7 @@ func (rf *Fetcher) StartScan(
 
 	rf.traceKV = traceKV
 	f, err := makeKVBatchFetcher(
+		ctx,
 		makeKVBatchFetcherDefaultSendFunc(txn),
 		spans,
 		rf.reverse,
@@ -696,6 +697,7 @@ func (rf *Fetcher) StartInconsistentScan(
 
 	rf.traceKV = traceKV
 	f, err := makeKVBatchFetcher(
+		ctx,
 		sendFunc(sendFn),
 		spans,
 		rf.reverse,
@@ -1104,7 +1106,12 @@ func (rf *Fetcher) processKV(
 			// In this case, we don't need to decode the column family ID, because
 			// the ValueType_TUPLE encoding includes the column id with every encoded
 			// column value.
-			prettyKey, prettyValue, err = rf.processValueTuple(ctx, table, kv, prettyKey)
+			var tupleBytes []byte
+			tupleBytes, err = kv.Value.GetTuple()
+			if err != nil {
+				break
+			}
+			prettyKey, prettyValue, err = rf.processValueBytes(ctx, table, kv, tupleBytes, prettyKey)
 		default:
 			var familyID uint64
 			_, familyID, err = encoding.DecodeUvarintAscending(rf.keyRemainingBytes)
@@ -1317,18 +1324,6 @@ func (rf *Fetcher) processValueBytes(
 		prettyValue = rf.prettyValueBuf.String()
 	}
 	return prettyKey, prettyValue, nil
-}
-
-// processValueTuple processes the given values (of columns family.ColumnIDs),
-// setting values in the rf.row accordingly. The key is only used for logging.
-func (rf *Fetcher) processValueTuple(
-	ctx context.Context, table *tableInfo, kv roachpb.KeyValue, prettyKeyPrefix string,
-) (prettyKey string, prettyValue string, err error) {
-	tupleBytes, err := kv.Value.GetTuple()
-	if err != nil {
-		return "", "", err
-	}
-	return rf.processValueBytes(ctx, table, kv, tupleBytes, prettyKeyPrefix)
 }
 
 // NextRow processes keys until we complete one row, which is returned as an

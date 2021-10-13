@@ -12,13 +12,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -31,20 +31,22 @@ func makeBuilderCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.C
 		Short:   "Run the Bazel builder image.",
 		Long:    "Run the Bazel builder image.",
 		Example: `dev builder`,
-		Args:    cobra.ExactArgs(0),
+		Args:    cobra.MinimumNArgs(0),
 		RunE:    runE,
 	}
 	builderCmd.Flags().String(volumeFlag, "bzlhome", "the Docker volume to use as the container home directory")
 	return builderCmd
 }
 
-func (d *dev) builder(cmd *cobra.Command, _ []string) error {
+func (d *dev) builder(cmd *cobra.Command, extraArgs []string) error {
 	ctx := cmd.Context()
 	volume := mustGetFlagString(cmd, volumeFlag)
 	args, err := d.getDockerRunArgs(ctx, volume, true)
+	args = append(args, extraArgs...)
 	if err != nil {
 		return err
 	}
+	logCommand("docker", args...)
 	return d.exec.CommandContextInheritingStdStreams(ctx, "docker", args...)
 }
 
@@ -95,7 +97,7 @@ func (d *dev) getDockerRunArgs(
 		}
 	}
 	if bazelImage == "" {
-		err = errors.New("Could not find BAZEL_IMAGE in build/teamcity-bazel-support.sh")
+		err = errors.New("could not find BAZEL_IMAGE in build/teamcity-bazel-support.sh")
 		return
 	}
 

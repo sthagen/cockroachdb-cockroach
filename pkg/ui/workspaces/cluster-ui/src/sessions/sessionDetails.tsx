@@ -14,7 +14,7 @@ import { sessionAttr } from "src/util/constants";
 import { Helmet } from "react-helmet";
 import { Loading } from "../loading";
 import _ from "lodash";
-import { Link, RouteComponentProps, withRouter } from "react-router-dom";
+import { Link, RouteComponentProps } from "react-router-dom";
 
 import { SessionInfo } from "./sessionsTable";
 
@@ -64,6 +64,7 @@ export interface OwnProps {
   cancelQuery: (payload: ICancelQueryRequest) => void;
   uiConfig?: UIConfigState["pages"]["sessionDetails"];
   isTenant?: UIConfigState["isTenant"];
+  isCloud?: boolean;
   onBackButtonClick?: () => void;
   onTerminateSessionClick?: () => void;
   onTerminateStatementClick?: () => void;
@@ -136,11 +137,12 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
       sessionError,
       cancelSession,
       cancelQuery,
+      isCloud,
       onTerminateSessionClick,
       onTerminateStatementClick,
     } = this.props;
     const session = this.props.session?.session;
-    const showActionButtons = !!session && !sessionError;
+    const showActionButtons = !!session && !sessionError && !isCloud;
     return (
       <div className={cx("sessions-details")}>
         <Helmet title={`Details | ${sessionID} | Sessions`} />
@@ -151,6 +153,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
             size="small"
             icon={<ArrowLeft fontSize={"10px"} />}
             iconPosition="left"
+            className="small-margin"
           >
             Sessions
           </Button>
@@ -320,7 +323,6 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                     statementNoConstants: stmt.sql_no_constants,
                     implicitTxn: session.active_txn?.implicit,
                     app: "",
-                    search: "",
                   })}
                   onClick={() =>
                     this.props.onStatementClick && this.props.onStatementClick()

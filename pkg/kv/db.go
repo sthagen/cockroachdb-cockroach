@@ -142,7 +142,7 @@ type Result struct {
 	ResumeSpan *roachpb.Span
 	// When ResumeSpan is populated, this specifies the reason why the operation
 	// wasn't completed and needs to be resumed.
-	ResumeReason roachpb.ResponseHeader_ResumeReason
+	ResumeReason roachpb.ResumeReason
 }
 
 // ResumeSpanAsValue returns the resume span as a value if one is set,
@@ -531,13 +531,17 @@ func (db *DB) Del(ctx context.Context, keys ...interface{}) error {
 
 // DelRange deletes the rows between begin (inclusive) and end (exclusive).
 //
-// TODO(pmattis): Perhaps the result should return which rows were deleted.
+// The returned []roachpb.Key will contain the keys deleted if the returnKeys
+// parameter is true, or will be nil if the parameter is false.
 //
 // key can be either a byte slice or a string.
-func (db *DB) DelRange(ctx context.Context, begin, end interface{}) error {
+func (db *DB) DelRange(
+	ctx context.Context, begin, end interface{}, returnKeys bool,
+) ([]roachpb.Key, error) {
 	b := &Batch{}
-	b.DelRange(begin, end, false)
-	return getOneErr(db.Run(ctx, b), b)
+	b.DelRange(begin, end, returnKeys)
+	r, err := getOneResult(db.Run(ctx, b), b)
+	return r.Keys, err
 }
 
 // AdminMerge merges the range containing key and the subsequent range. After

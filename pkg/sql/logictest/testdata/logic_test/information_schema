@@ -410,6 +410,7 @@ crdb_internal       cluster_queries
 crdb_internal       cluster_sessions
 crdb_internal       cluster_settings
 crdb_internal       cluster_transactions
+crdb_internal       create_schema_statements
 crdb_internal       create_statements
 crdb_internal       create_type_statements
 crdb_internal       cross_db_references
@@ -456,6 +457,7 @@ crdb_internal       table_columns
 crdb_internal       table_indexes
 crdb_internal       table_row_statistics
 crdb_internal       tables
+crdb_internal       tenant_usage_details
 crdb_internal       transaction_statistics
 crdb_internal       zones
 information_schema  administrable_role_authorizations
@@ -650,7 +652,11 @@ pg_catalog          pg_statio_sys_tables
 pg_catalog          pg_statio_user_indexes
 pg_catalog          pg_statio_user_sequences
 pg_catalog          pg_statio_user_tables
+pg_catalog          pg_statistic
 pg_catalog          pg_statistic_ext
+pg_catalog          pg_statistic_ext_data
+pg_catalog          pg_stats
+pg_catalog          pg_stats_ext
 pg_catalog          pg_subscription
 pg_catalog          pg_subscription_rel
 pg_catalog          pg_tables
@@ -721,6 +727,7 @@ cluster_queries
 cluster_sessions
 cluster_settings
 cluster_transactions
+create_schema_statements
 create_statements
 create_type_statements
 cross_db_references
@@ -767,6 +774,7 @@ table_columns
 table_indexes
 table_row_statistics
 tables
+tenant_usage_details
 transaction_statistics
 zones
 administrable_role_authorizations
@@ -961,7 +969,11 @@ pg_statio_sys_tables
 pg_statio_user_indexes
 pg_statio_user_sequences
 pg_statio_user_tables
+pg_statistic
 pg_statistic_ext
+pg_statistic_ext_data
+pg_stats
+pg_stats_ext
 pg_subscription
 pg_subscription_rel
 pg_tables
@@ -1037,6 +1049,7 @@ triggers
 triggered_update_columns
 transforms
 transaction_statistics
+tenant_usage_details
 tablespaces_extensions
 tablespaces
 tables_extensions
@@ -1068,6 +1081,7 @@ system         crdb_internal       cluster_queries                        SYSTEM
 system         crdb_internal       cluster_sessions                       SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_settings                       SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_transactions                   SYSTEM VIEW  NO                  1
+system         crdb_internal       create_schema_statements               SYSTEM VIEW  NO                  1
 system         crdb_internal       create_statements                      SYSTEM VIEW  NO                  1
 system         crdb_internal       create_type_statements                 SYSTEM VIEW  NO                  1
 system         crdb_internal       cross_db_references                    SYSTEM VIEW  NO                  1
@@ -1114,6 +1128,7 @@ system         crdb_internal       table_columns                          SYSTEM
 system         crdb_internal       table_indexes                          SYSTEM VIEW  NO                  1
 system         crdb_internal       table_row_statistics                   SYSTEM VIEW  NO                  1
 system         crdb_internal       tables                                 SYSTEM VIEW  NO                  1
+system         crdb_internal       tenant_usage_details                   SYSTEM VIEW  NO                  1
 system         crdb_internal       transaction_statistics                 SYSTEM VIEW  NO                  1
 system         crdb_internal       zones                                  SYSTEM VIEW  NO                  1
 system         information_schema  administrable_role_authorizations      SYSTEM VIEW  NO                  1
@@ -1308,7 +1323,11 @@ system         pg_catalog          pg_statio_sys_tables                   SYSTEM
 system         pg_catalog          pg_statio_user_indexes                 SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_statio_user_sequences               SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_statio_user_tables                  SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_statistic                           SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_statistic_ext                       SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_statistic_ext_data                  SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_stats                               SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_stats_ext                           SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_subscription                        SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_subscription_rel                    SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_tables                              SYSTEM VIEW  NO                  1
@@ -2109,21 +2128,16 @@ system         public        table_statistics                 statisticID       
 system         public        table_statistics                 tableID                                                                                                   1
 system         public        tenant_usage                     current_share_sum                                                                                         8
 system         public        tenant_usage                     instance_id                                                                                               2
-system         public        tenant_usage                     instance_lease                                                                                            15
-system         public        tenant_usage                     instance_seq                                                                                              16
-system         public        tenant_usage                     instance_shares                                                                                           17
+system         public        tenant_usage                     instance_lease                                                                                            10
+system         public        tenant_usage                     instance_seq                                                                                              11
+system         public        tenant_usage                     instance_shares                                                                                           12
 system         public        tenant_usage                     last_update                                                                                               4
 system         public        tenant_usage                     next_instance_id                                                                                          3
 system         public        tenant_usage                     ru_burst_limit                                                                                            5
 system         public        tenant_usage                     ru_current                                                                                                7
 system         public        tenant_usage                     ru_refill_rate                                                                                            6
 system         public        tenant_usage                     tenant_id                                                                                                 1
-system         public        tenant_usage                     total_read_bytes                                                                                          11
-system         public        tenant_usage                     total_read_requests                                                                                       10
-system         public        tenant_usage                     total_ru_usage                                                                                            9
-system         public        tenant_usage                     total_sql_pod_cpu_seconds                                                                                 14
-system         public        tenant_usage                     total_write_bytes                                                                                         13
-system         public        tenant_usage                     total_write_requests                                                                                      12
+system         public        tenant_usage                     total_consumption                                                                                         9
 system         public        tenants                          active                                                                                                    2
 system         public        tenants                          id                                                                                                        1
 system         public        tenants                          info                                                                                                      3
@@ -2636,6 +2650,7 @@ NULL     public   system         crdb_internal       cluster_queries            
 NULL     public   system         crdb_internal       cluster_sessions                       SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_settings                       SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_transactions                   SELECT          NULL          YES
+NULL     public   system         crdb_internal       create_schema_statements               SELECT          NULL          YES
 NULL     public   system         crdb_internal       create_statements                      SELECT          NULL          YES
 NULL     public   system         crdb_internal       create_type_statements                 SELECT          NULL          YES
 NULL     public   system         crdb_internal       cross_db_references                    SELECT          NULL          YES
@@ -2682,6 +2697,7 @@ NULL     public   system         crdb_internal       table_columns              
 NULL     public   system         crdb_internal       table_indexes                          SELECT          NULL          YES
 NULL     public   system         crdb_internal       table_row_statistics                   SELECT          NULL          YES
 NULL     public   system         crdb_internal       tables                                 SELECT          NULL          YES
+NULL     public   system         crdb_internal       tenant_usage_details                   SELECT          NULL          YES
 NULL     public   system         crdb_internal       transaction_statistics                 SELECT          NULL          YES
 NULL     public   system         crdb_internal       zones                                  SELECT          NULL          YES
 NULL     public   system         information_schema  administrable_role_authorizations      SELECT          NULL          YES
@@ -2876,7 +2892,11 @@ NULL     public   system         pg_catalog          pg_statio_sys_tables       
 NULL     public   system         pg_catalog          pg_statio_user_indexes                 SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_statio_user_sequences               SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_statio_user_tables                  SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_statistic                           SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_statistic_ext                       SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_statistic_ext_data                  SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_stats                               SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_stats_ext                           SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_subscription                        SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_subscription_rel                    SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_tables                              SELECT          NULL          YES
@@ -3236,6 +3256,7 @@ NULL     public   system         crdb_internal       cluster_queries            
 NULL     public   system         crdb_internal       cluster_sessions                       SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_settings                       SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_transactions                   SELECT          NULL          YES
+NULL     public   system         crdb_internal       create_schema_statements               SELECT          NULL          YES
 NULL     public   system         crdb_internal       create_statements                      SELECT          NULL          YES
 NULL     public   system         crdb_internal       create_type_statements                 SELECT          NULL          YES
 NULL     public   system         crdb_internal       cross_db_references                    SELECT          NULL          YES
@@ -3282,6 +3303,7 @@ NULL     public   system         crdb_internal       table_columns              
 NULL     public   system         crdb_internal       table_indexes                          SELECT          NULL          YES
 NULL     public   system         crdb_internal       table_row_statistics                   SELECT          NULL          YES
 NULL     public   system         crdb_internal       tables                                 SELECT          NULL          YES
+NULL     public   system         crdb_internal       tenant_usage_details                   SELECT          NULL          YES
 NULL     public   system         crdb_internal       transaction_statistics                 SELECT          NULL          YES
 NULL     public   system         crdb_internal       zones                                  SELECT          NULL          YES
 NULL     public   system         information_schema  administrable_role_authorizations      SELECT          NULL          YES
@@ -3476,7 +3498,11 @@ NULL     public   system         pg_catalog          pg_statio_sys_tables       
 NULL     public   system         pg_catalog          pg_statio_user_indexes                 SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_statio_user_sequences               SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_statio_user_tables                  SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_statistic                           SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_statistic_ext                       SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_statistic_ext_data                  SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_stats                               SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_stats_ext                           SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_subscription                        SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_subscription_rel                    SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_tables                              SELECT          NULL          YES
@@ -4602,7 +4628,7 @@ disable_partially_distributed_plans                    off
 disallow_full_table_scans                              off
 distsql_workmem                                        64 MiB
 enable_copying_partitioning_when_deinterleaving_table  off
-enable_drop_enum_value                                 off
+enable_drop_enum_value                                 on
 enable_experimental_alter_column_type_general          off
 enable_experimental_stream_replication                 off
 enable_implicit_select_for_update                      on
@@ -4623,6 +4649,7 @@ force_savepoint_restart                                off
 foreign_key_cascades_limit                             10000
 idle_in_session_timeout                                0
 idle_in_transaction_session_timeout                    0
+inject_retry_errors_enabled                            off
 integer_datetimes                                      on
 intervalstyle                                          postgres
 intervalstyle_enabled                                  off
@@ -4634,6 +4661,7 @@ lock_timeout                                           0
 max_identifier_length                                  128
 max_index_keys                                         32
 node_id                                                1
+null_ordered_last                                      off
 on_update_rehome_row_enabled                           on
 optimizer                                              on
 optimizer_use_histograms                               on

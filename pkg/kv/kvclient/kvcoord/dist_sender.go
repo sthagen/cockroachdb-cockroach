@@ -395,7 +395,8 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	getRangeDescCacheSize := func() int64 {
 		return rangeDescriptorCacheSize.Get(&ds.st.SV)
 	}
-	ds.rangeCache = rangecache.NewRangeCache(ds.st, rdb, getRangeDescCacheSize, cfg.RPCContext.Stopper)
+	ds.rangeCache = rangecache.NewRangeCache(ds.st, rdb, getRangeDescCacheSize,
+		cfg.RPCContext.Stopper, cfg.AmbientCtx.Tracer)
 	if tf := cfg.TestingKnobs.TransportFactory; tf != nil {
 		ds.transportFactory = tf
 	} else {
@@ -1218,7 +1219,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	// If couldHaveSkippedResponses is set, resumeReason indicates the reason why
 	// the ResumeSpan is necessary. This reason is common to all individual
 	// responses that carry a ResumeSpan.
-	var resumeReason roachpb.ResponseHeader_ResumeReason
+	var resumeReason roachpb.ResumeReason
 	defer func() {
 		if r := recover(); r != nil {
 			// If we're in the middle of a panic, don't wait on responseChs.
@@ -1369,7 +1370,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 					ba.TargetBytes -= replyBytes
 					if ba.TargetBytes <= 0 {
 						couldHaveSkippedResponses = true
-						resumeReason = roachpb.RESUME_KEY_LIMIT
+						resumeReason = roachpb.RESUME_BYTE_LIMIT
 						return
 					}
 				}
@@ -1414,7 +1415,7 @@ func (ds *DistSender) sendPartialBatchAsync(
 		ctx,
 		stop.TaskOpts{
 			TaskName:   "kv.DistSender: sending partial batch",
-			ChildSpan:  true,
+			SpanOpt:    stop.ChildSpan,
 			Sem:        ds.asyncSenderSem,
 			WaitForSem: false,
 		},
@@ -1693,7 +1694,7 @@ func fillSkippedResponses(
 	ba roachpb.BatchRequest,
 	br *roachpb.BatchResponse,
 	nextKey roachpb.RKey,
-	resumeReason roachpb.ResponseHeader_ResumeReason,
+	resumeReason roachpb.ResumeReason,
 ) {
 	// Some requests might have no response at all if we used a batch-wide
 	// limit; simply create trivial responses for those. Note that any type
@@ -1726,7 +1727,6 @@ func fillSkippedResponses(
 			continue
 		}
 		hdr := resp.GetInner().Header()
-		hdr.ResumeReason = resumeReason
 		origSpan := req.Header().Span()
 		if isReverse {
 			if hdr.ResumeSpan != nil {
@@ -1764,6 +1764,9 @@ func fillSkippedResponses(
 					}
 				}
 			}
+		}
+		if hdr.ResumeSpan != nil {
+			hdr.ResumeReason = resumeReason
 		}
 		br.Responses[i].GetInner().SetHeader(hdr)
 	}

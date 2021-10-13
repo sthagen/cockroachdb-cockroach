@@ -198,8 +198,37 @@ func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, 
 }
 
 func initTempStorageConfig(
-	ctx context.Context, st *cluster.Settings, stopper *stop.Stopper, useStore base.StoreSpec,
+	ctx context.Context, st *cluster.Settings, stopper *stop.Stopper, stores base.StoreSpecList,
 ) (base.TempStorageConfig, error) {
+	// Initialize the target directory for temporary storage. If encryption at
+	// rest is enabled in any fashion, we'll want temp storage to be encrypted
+	// too. To achieve this, we use the first encrypted store as temp dir
+	// target, if any. If we can't find one, we use the first StoreSpec in the
+	// list.
+	//
+	// While we look, we also clean up any abandoned temporary directories. We
+	// don't know which store spec was used previously—and it may change if
+	// encryption gets enabled after the fact—so we check each store.
+	var specIdx = 0
+	for i, spec := range stores.Specs {
+		if spec.IsEncrypted() {
+			// TODO(jackson): One store's EncryptionOptions may say to encrypt
+			// with a real key, while another store's say to use key=plain.
+			// This provides no guarantee that we'll use the encrypted one's.
+			specIdx = i
+		}
+		if spec.InMemory {
+			continue
+		}
+		recordPath := filepath.Join(spec.Path, server.TempDirsRecordFilename)
+		if err := storage.CleanupTempDirs(recordPath); err != nil {
+			return base.TempStorageConfig{}, errors.Wrap(err,
+				"could not cleanup temporary directories from record file")
+		}
+	}
+
+	useStore := stores.Specs[specIdx]
+
 	var recordPath string
 	if !useStore.InMemory {
 		recordPath = filepath.Join(useStore.Path, server.TempDirsRecordFilename)
@@ -368,7 +397,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// that the process continues to exit with the Disk Full exit code. A
 	// flapping exit code can affect alerting, including the alerting
 	// performed within CockroachCloud.
-	if err := exitIfDiskFull(serverCfg.Stores.Specs); err != nil {
+	if err := exitIfDiskFull(vfs.Default, serverCfg.Stores.Specs); err != nil {
 		return err
 	}
 
@@ -384,7 +413,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// This span concludes when the startup goroutine started below
 	// has completed.
 	// TODO(andrei): we don't close the span on the early returns below.
-	tracer := serverCfg.Settings.Tracer
+	tracer := serverCfg.Tracer
 	startupSpan := tracer.StartSpan("server start")
 	ctx = tracing.ContextWithSpan(ctx, startupSpan)
 
@@ -439,34 +468,8 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 		return err
 	}
 
-	// Next we initialize the target directory for temporary storage.
-	// If encryption at rest is enabled in any fashion, we'll want temp
-	// storage to be encrypted too. To achieve this, we use
-	// the first encrypted store as temp dir target, if any.
-	// If we can't find one, we use the first StoreSpec in the list.
-	//
-	// While we look, we also clean up any abandoned temporary directories. We
-	// don't know which store spec was used previously—and it may change if
-	// encryption gets enabled after the fact—so we check each store.
-	var specIdx = 0
-	for i, spec := range serverCfg.Stores.Specs {
-		if spec.IsEncrypted() {
-			// TODO(jackson): One store's EncryptionOptions may say to encrypt
-			// with a real key, while another store's say to use key=plain.
-			// This provides no guarantee that we'll use the encrypted one's.
-			specIdx = i
-		}
-		if spec.InMemory {
-			continue
-		}
-		recordPath := filepath.Join(spec.Path, server.TempDirsRecordFilename)
-		if err := storage.CleanupTempDirs(recordPath); err != nil {
-			return errors.Wrap(err, "could not cleanup temporary directories from record file")
-		}
-	}
-
 	if serverCfg.TempStorageConfig, err = initTempStorageConfig(
-		ctx, serverCfg.Settings, stopper, serverCfg.Stores.Specs[specIdx],
+		ctx, serverCfg.Settings, stopper, serverCfg.Stores,
 	); err != nil {
 		return err
 	}
@@ -1040,21 +1043,21 @@ func maybeWarnMemorySizes(ctx context.Context) {
 	}
 }
 
-func exitIfDiskFull(specs []base.StoreSpec) error {
+func exitIfDiskFull(fs vfs.FS, specs []base.StoreSpec) error {
 	var cause error
 	var ballastPaths []string
 	var ballastMissing bool
 	for _, spec := range specs {
-		isDiskFull, err := storage.IsDiskFull(vfs.Default, spec)
+		isDiskFull, err := storage.IsDiskFull(fs, spec)
 		if err != nil {
 			return err
 		}
 		if !isDiskFull {
 			continue
 		}
-		path := base.EmergencyBallastFile(vfs.Default.PathJoin, spec.Path)
+		path := base.EmergencyBallastFile(fs.PathJoin, spec.Path)
 		ballastPaths = append(ballastPaths, path)
-		if _, err := vfs.Default.Stat(path); oserror.IsNotExist(err) {
+		if _, err := fs.Stat(path); oserror.IsNotExist(err) {
 			ballastMissing = true
 		}
 		cause = errors.CombineErrors(cause, errors.Newf(`store %s: out of disk space`, spec.Path))
@@ -1180,7 +1183,7 @@ func getClientGRPCConn(
 	stopper := stop.NewStopper()
 	rpcContext := rpc.NewContext(rpc.ContextOptions{
 		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: cfg.Settings.Tracer},
+		AmbientCtx: log.AmbientContext{Tracer: cfg.Tracer},
 		Config:     cfg.Config,
 		Clock:      clock,
 		Stopper:    stopper,

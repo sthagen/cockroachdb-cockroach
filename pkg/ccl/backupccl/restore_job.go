@@ -1142,8 +1142,21 @@ func createImportingDescriptors(
 		}
 	}
 
-	// Assign new IDs to all of the type descriptors that need to be written.
-	if err := rewriteTypeDescs(typesToWrite, details.DescriptorRewrites); err != nil {
+	// Perform rewrites on ALL type descriptors that are present in the rewrite
+	// mapping.
+	//
+	// `types` contains a mix of existing type descriptors in the restoring
+	// cluster, and new type descriptors we will write from the backup.
+	//
+	// New type descriptors need to be rewritten with their generated IDs before
+	// they are written out to disk.
+	//
+	// Existing type descriptors need to be rewritten to the type ID of the type
+	// they are referring to in the restoring cluster. This ID is different from
+	// the ID the descriptor had when it was backed up. Changes to existing type
+	// descriptors will not be written to disk, and is only for accurate,
+	// in-memory resolution hereon out.
+	if err := rewriteTypeDescs(types, details.DescriptorRewrites); err != nil {
 		return nil, nil, err
 	}
 
@@ -1316,7 +1329,11 @@ func createImportingDescriptors(
 					return err
 				}
 				typeIDs, _, err := table.GetAllReferencedTypeIDs(dbDesc, func(id descpb.ID) (catalog.TypeDescriptor, error) {
-					return typesByID[id], nil
+					t, ok := typesByID[id]
+					if !ok {
+						return nil, errors.AssertionFailedf("type with id %d was not found in rewritten type mapping", id)
+					}
+					return t, nil
 				})
 				if err != nil {
 					return err
@@ -1503,6 +1520,7 @@ func (r *restoreResumer) Resume(ctx context.Context, execCtx interface{}) error 
 func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) error {
 	details := r.job.Details().(jobspb.RestoreDetails)
 	p := execCtx.(sql.JobExecContext)
+	r.execCfg = p.ExecCfg()
 
 	backupManifests, latestBackupManifest, sqlDescs, err := loadBackupSQLDescs(
 		ctx, p, details, details.Encryption,
@@ -1514,7 +1532,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	// is the tenant in which the backup was taken.
 	backupCodec := keys.SystemSQLCodec
 	if len(sqlDescs) != 0 {
-		if len(latestBackupManifest.Spans) != 0 && len(latestBackupManifest.Tenants) == 0 {
+		if len(latestBackupManifest.Spans) != 0 && !latestBackupManifest.HasTenants() {
 			// If there are no tenant targets, then the entire keyspace covered by
 			// Spans must lie in 1 tenant.
 			_, backupTenantID, err := keys.DecodeTenantPrefix(latestBackupManifest.Spans[0].Key)
@@ -1565,7 +1583,6 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 			return err
 		}
 	}
-	r.execCfg = p.ExecCfg()
 	var remappedStats []*stats.TableStatisticProto
 	backupStats, err := getStatisticsFromBackup(ctx, defaultStore, details.Encryption,
 		latestBackupManifest)
@@ -1717,7 +1734,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		// Reload the details as we may have updated the job.
 		details = r.job.Details().(jobspb.RestoreDetails)
 
-		if err := r.cleanupTempSystemTables(ctx); err != nil {
+		if err := r.cleanupTempSystemTables(ctx, nil /* txn */); err != nil {
 			return err
 		}
 	}
@@ -2081,11 +2098,21 @@ func (r *restoreResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}
 			tenant.State = descpb.TenantInfo_DROP
 			// This is already a job so no need to spin up a gc job for the tenant;
 			// instead just GC the data eagerly.
-			if err := sql.GCTenantSync(ctx, execCfg, &tenant); err != nil {
+			if err := sql.GCTenantSync(ctx, execCfg, &tenant.TenantInfo); err != nil {
 				return err
 			}
 		}
-		return r.dropDescriptors(ctx, execCfg.JobRegistry, execCfg.Codec, txn, descsCol)
+
+		if err := r.dropDescriptors(ctx, execCfg.JobRegistry, execCfg.Codec, txn, descsCol); err != nil {
+			return err
+		}
+
+		if details.DescriptorCoverage == tree.AllDescriptors {
+			// The temporary system table descriptors should already have been dropped
+			// in `dropDescriptors` but we still need to drop the temporary system db.
+			return r.cleanupTempSystemTables(ctx, txn)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -2145,10 +2172,20 @@ func (r *restoreResumer) dropDescriptors(
 
 	// Drop the table descriptors that were created at the start of the restore.
 	tablesToGC := make([]descpb.ID, 0, len(details.TableDescs))
+	// Set the drop time as 1 (ns in Unix time), so that the table gets GC'd
+	// immediately.
+	dropTime := int64(1)
 	for i := range mutableTables {
 		tableToDrop := mutableTables[i]
 		tablesToGC = append(tablesToGC, tableToDrop.ID)
 		tableToDrop.SetDropped()
+		// If the DropTime is set, a table uses RangeClear for fast data removal. This
+		// operation starts at DropTime + the GC TTL. If we used now() here, it would
+		// not clean up data until the TTL from the time of the error. Instead, use 1
+		// (that is, 1ns past the epoch) to allow this to be cleaned up as soon as
+		// possible. This is safe since the table data was never visible to users,
+		// and so we don't need to preserve MVCC semantics.
+		tableToDrop.DropTime = dropTime
 		b.Del(catalogkeys.EncodeNameKey(codec, tableToDrop))
 		descsCol.AddDeletedDescriptor(tableToDrop)
 		if err := descsCol.WriteDescToBatch(ctx, false /* kvTrace */, tableToDrop, b); err != nil {
@@ -2182,9 +2219,6 @@ func (r *restoreResumer) dropDescriptors(
 	}
 
 	// Queue a GC job.
-	// Set the drop time as 1 (ns in Unix time), so that the table gets GC'd
-	// immediately.
-	dropTime := int64(1)
 	gcDetails := jobspb.SchemaChangeGCDetails{}
 	for _, tableID := range tablesToGC {
 		gcDetails.Tables = append(gcDetails.Tables, jobspb.SchemaChangeGCDetails_DroppedID{
@@ -2224,24 +2258,36 @@ func (r *restoreResumer) dropDescriptors(
 
 	// Delete any schema descriptors that this restore created. Also collect the
 	// descriptors so we can update their parent databases later.
-	dbsWithDeletedSchemas := make(map[descpb.ID][]catalog.SchemaDescriptor)
+	dbsWithDeletedSchemas := make(map[descpb.ID][]catalog.Descriptor)
 	for _, schemaDesc := range details.SchemaDescs {
-		sc := schemadesc.NewBuilder(schemaDesc).BuildImmutableSchema()
 		// We need to ignore descriptors we just added since we haven't committed the txn that deletes these.
-		isSchemaEmpty, err := isSchemaEmpty(ctx, txn, sc.GetID(), allDescs, ignoredChildDescIDs)
+		isSchemaEmpty, err := isSchemaEmpty(ctx, txn, schemaDesc.GetID(), allDescs, ignoredChildDescIDs)
 		if err != nil {
-			return errors.Wrapf(err, "checking if schema %s is empty during restore cleanup", sc.GetName())
+			return errors.Wrapf(err, "checking if schema %s is empty during restore cleanup", schemaDesc.GetName())
 		}
 
 		if !isSchemaEmpty {
-			log.Warningf(ctx, "preserving schema %s on restore failure because it contains new child objects", sc.GetName())
+			log.Warningf(ctx, "preserving schema %s on restore failure because it contains new child objects", schemaDesc.GetName())
 			continue
 		}
 
-		b.Del(catalogkeys.EncodeNameKey(codec, sc))
-		b.Del(catalogkeys.MakeDescMetadataKey(codec, sc.GetID()))
-		descsCol.AddDeletedDescriptor(sc)
-		dbsWithDeletedSchemas[sc.GetParentID()] = append(dbsWithDeletedSchemas[sc.GetParentID()], sc)
+		mutSchema, err := descsCol.GetMutableDescriptorByID(ctx, schemaDesc.GetID(), txn)
+		if err != nil {
+			return err
+		}
+
+		// Mark schema as dropped and add uncommitted version to pass pre-txn
+		// descriptor validation.
+		mutSchema.SetDropped()
+		mutSchema.MaybeIncrementVersion()
+		if err := descsCol.AddUncommittedDescriptor(mutSchema); err != nil {
+			return err
+		}
+
+		b.Del(catalogkeys.EncodeNameKey(codec, mutSchema))
+		b.Del(catalogkeys.MakeDescMetadataKey(codec, mutSchema.GetID()))
+		descsCol.AddDeletedDescriptor(mutSchema)
+		dbsWithDeletedSchemas[mutSchema.GetParentID()] = append(dbsWithDeletedSchemas[mutSchema.GetParentID()], mutSchema)
 	}
 
 	// Delete the database descriptors.
@@ -2535,16 +2581,26 @@ func (r *restoreResumer) restoreSystemTables(
 	return nil
 }
 
-func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context) error {
+func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context, txn *kv.Txn) error {
 	executor := r.execCfg.InternalExecutor
+	// Check if the temp system database has already been dropped. This can happen
+	// if the restore job fails after the system database has cleaned up.
+	checkIfDatabaseExists := "SELECT database_name FROM [SHOW DATABASES] WHERE database_name=$1"
+	if row, err := executor.QueryRow(ctx, "checking-for-temp-system-db" /* opName */, txn, checkIfDatabaseExists, restoreTempSystemDB); err != nil {
+		return errors.Wrap(err, "checking for temporary system db")
+	} else if row == nil {
+		// Temporary system DB might already have been dropped by the restore job.
+		return nil
+	}
+
 	// After restoring the system tables, drop the temporary database holding the
 	// system tables.
 	gcTTLQuery := fmt.Sprintf("ALTER DATABASE %s CONFIGURE ZONE USING gc.ttlseconds=1", restoreTempSystemDB)
-	if _, err := executor.Exec(ctx, "altering-gc-ttl-temp-system" /* opName */, nil /* txn */, gcTTLQuery); err != nil {
+	if _, err := executor.Exec(ctx, "altering-gc-ttl-temp-system" /* opName */, txn, gcTTLQuery); err != nil {
 		log.Errorf(ctx, "failed to update the GC TTL of %q: %+v", restoreTempSystemDB, err)
 	}
 	dropTableQuery := fmt.Sprintf("DROP DATABASE %s CASCADE", restoreTempSystemDB)
-	if _, err := executor.Exec(ctx, "drop-temp-system-db" /* opName */, nil /* txn */, dropTableQuery); err != nil {
+	if _, err := executor.Exec(ctx, "drop-temp-system-db" /* opName */, txn, dropTableQuery); err != nil {
 		return errors.Wrap(err, "dropping temporary system db")
 	}
 	return nil

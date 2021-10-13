@@ -691,7 +691,7 @@ func (nl *NodeLiveness) Start(ctx context.Context, opts NodeLivenessStartOptions
 	nl.mu.engines = opts.Engines
 	nl.mu.Unlock()
 
-	_ = opts.Stopper.RunAsyncTask(ctx, "liveness-hb", func(context.Context) {
+	_ = opts.Stopper.RunAsyncTaskEx(ctx, stop.TaskOpts{TaskName: "liveness-hb", SpanOpt: stop.SterileRootSpan}, func(context.Context) {
 		ambient := nl.ambientCtx
 		ambient.AddLogTag("liveness-hb", nil)
 		ctx, cancel := opts.Stopper.WithCancelOnQuiesce(context.Background())
@@ -1222,12 +1222,7 @@ func (nl *NodeLiveness) RegisterCallback(cb IsLiveCallback) {
 func (nl *NodeLiveness) updateLiveness(
 	ctx context.Context, update livenessUpdate, handleCondFailed func(actual Record) error,
 ) (Record, error) {
-	for {
-		// Before each attempt, ensure that the context has not expired.
-		if err := ctx.Err(); err != nil {
-			return Record{}, err
-		}
-
+	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		nl.mu.RLock()
 		engines := nl.mu.engines
 		nl.mu.RUnlock()
@@ -1250,6 +1245,10 @@ func (nl *NodeLiveness) updateLiveness(
 		}
 		return written, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return Record{}, err
+	}
+	panic("unreachable; should retry until ctx canceled")
 }
 
 func (nl *NodeLiveness) updateLivenessAttempt(
@@ -1320,6 +1319,13 @@ func (nl *NodeLiveness) updateLivenessAttempt(
 			}
 			return Record{}, handleCondFailed(Record{Liveness: actualLiveness, raw: tErr.ActualValue.TagAndDataBytes()})
 		} else if errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
+			// We generally want to retry ambiguous errors immediately, except if the
+			// ctx is canceled - in which case the ambiguous error is probably caused
+			// by the cancellation (and in any case it's pointless to retry with a
+			// canceled ctx).
+			if ctx.Err() != nil {
+				return Record{}, err
+			}
 			return Record{}, &errRetryLiveness{err}
 		} else if errors.HasType(err, (*roachpb.TransactionStatusError)(nil)) {
 			// 21.2 nodes can return a TransactionStatusError when they should have

@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	// Imported to allow multi-tenant tests
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	// Imported to allow locality-related table mutations
@@ -56,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -66,9 +68,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -269,6 +273,23 @@ func TestChangefeedTenants(t *testing.T) {
 		assertPayloads(t, feed, []string{
 			`foo_in_tenant: [1]->{"after": {"pk": 1}}`,
 		})
+	})
+}
+
+func TestMissingTableErr(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	_, kvSQLdb, cleanup := startTestServer(t, feedTestOptions{argsFn: func(args *base.TestServerArgs) {
+		args.ExternalIODirConfig.DisableOutbound = true
+	}})
+	defer cleanup()
+
+	t.Run("changefeed on non existing table fails", func(t *testing.T) {
+		kvSQL := sqlutils.MakeSQLRunner(kvSQLdb)
+		kvSQL.ExpectErr(t, `^pq: failed to resolve targets in the CHANGEFEED stmt: table "foo" does not exist$`,
+			`CREATE CHANGEFEED FOR foo`,
+		)
 	})
 }
 
@@ -727,6 +748,7 @@ func TestChangefeedExternalIODisabled(t *testing.T) {
 		})
 		defer s.Stopper().Stop(ctx)
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, serverSetupStatements)
 		sqlDB.Exec(t, "CREATE TABLE target_table (pk INT PRIMARY KEY)")
 		for _, proto := range disallowedSinkProtos {
 			sqlDB.ExpectErr(t, "Outbound IO is disabled by configuration, cannot create changefeed",
@@ -1294,6 +1316,7 @@ func TestChangefeedAfterSchemaChangeBackfill(t *testing.T) {
 func TestChangefeedColumnFamily(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDeadlock(t, "sometimes hangs")
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
@@ -2037,6 +2060,7 @@ func TestChangefeedUpdatePrimaryKey(t *testing.T) {
 func TestChangefeedTruncateOrDrop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDeadlock(t, "sometimes hangs")
 
 	assertFailuresCounter := func(t *testing.T, m *Metrics, exp int64) {
 		t.Helper()
@@ -2335,6 +2359,72 @@ func TestChangefeedRetryableError(t *testing.T) {
 	t.Run(`cloudstorage`, cloudStorageTest(testFn))
 	t.Run(`kafka`, kafkaTest(testFn))
 	t.Run(`webhook`, webhookTest(testFn))
+}
+
+type alwaysAliveSession string
+
+func (f alwaysAliveSession) ID() sqlliveness.SessionID                              { return sqlliveness.SessionID(f) }
+func (f alwaysAliveSession) Expiration() hlc.Timestamp                              { return hlc.MaxTimestamp }
+func (f alwaysAliveSession) RegisterCallbackForSessionExpiry(func(context.Context)) {}
+
+func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Set TestingKnobs to return a known session for easier
+	// comparison.
+	testSession := alwaysAliveSession("known-test-session")
+	adoptionInterval := 20 * time.Minute
+	sessionOverride := withKnobsFn(func(knobs *base.TestingKnobs) {
+		knobs.SQLLivenessKnobs = &sqlliveness.TestingKnobs{
+			SessionOverride: func(_ context.Context) (sqlliveness.Session, error) {
+				return testSession, nil
+			},
+		}
+		// This is a hack to avoid the job adoption loop from
+		// immediately re-adopting the job that is running. The job
+		// adoption loop basically just sets the claim ID, which will
+		// undo our deletion of the claim ID below.
+		knobs.JobsTestingKnobs.(*jobs.TestingKnobs).IntervalOverrides.Adopt = &adoptionInterval
+	})
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		knobs := f.Server().TestingKnobs().DistSQL.(*execinfra.TestingKnobs).Changefeed.(*TestingKnobs)
+		errChan := make(chan error, 1)
+		knobs.HandleDistChangefeedError = func(err error) error {
+			errChan <- err
+			return err
+		}
+
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b INT)`)
+		sqlDB.Exec(t, `INSERT INTO foo (a, b) VALUES (1, 1)`)
+
+		cf := feed(t, f, "CREATE CHANGEFEED FOR TABLE foo")
+		defer closeFeed(t, cf)
+
+		assertPayloads(t, cf, []string{
+			`foo: [1]->{"after": {"a": 1, "b": 1}}`,
+		})
+
+		// Mimic the claim dying and being cleaned up by
+		// another node.
+		jobID := cf.(cdctest.EnterpriseTestFeed).JobID()
+		sqlDB.Exec(t, `UPDATE system.jobs SET claim_session_id = NULL WHERE id = $1`, jobID)
+
+		// Expect that the distflow fails since it can't
+		// update the checkpoint.
+		select {
+		case err := <-errChan:
+			require.Error(t, err)
+			// TODO(ssd): Replace this error in the jobs system with
+			// an error type we can check against.
+			require.Contains(t, err.Error(), fmt.Sprintf("expected session '%s' but found NULL", testSession.ID().String()))
+		case <-time.After(5 * time.Second):
+			t.Fatal("expected distflow to fail but it hasn't after 5 seconds")
+		}
+
+	}
+	RunRandomSinkTest(t, "fails as expected", testFn, feedTestNoTenants, sessionOverride)
 }
 
 // TestChangefeedDataTTL ensures that changefeeds fail with an error in the case
@@ -4580,4 +4670,140 @@ func TestChangefeedCaseInsensitiveOpts(t *testing.T) {
 		})
 	}
 	t.Run(`sinkless`, sinklessTest(testFn))
+}
+
+func startMonitorWithBudget(budget int64) *mon.BytesMonitor {
+	mm := mon.NewMonitorWithLimit(
+		"test-mm", mon.MemoryResource, budget,
+		nil, nil,
+		128 /* small allocation increment */, 100,
+		cluster.MakeTestingClusterSettings())
+	mm.Start(context.Background(), nil, mon.MakeStandaloneBudget(budget))
+	return mm
+}
+
+type memoryHoggingSink struct {
+	allEmitted chan struct{}
+	mu         struct {
+		syncutil.Mutex
+		expectedRows int
+		seenRows     map[string]struct{}
+		numFlushes   int
+		alloc        kvevent.Alloc
+	}
+}
+
+var _ Sink = (*memoryHoggingSink)(nil)
+
+func (s *memoryHoggingSink) expectRows(n int) chan struct{} {
+	if n <= 0 {
+		panic("n<=0")
+	}
+	s.allEmitted = make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.expectedRows = n
+	s.mu.numFlushes = 0
+	s.mu.seenRows = make(map[string]struct{})
+	s.mu.alloc.Release(context.Background()) // Release leftover alloc
+	return s.allEmitted
+}
+
+func (s *memoryHoggingSink) Dial() error {
+	return nil
+}
+
+func (s *memoryHoggingSink) EmitRow(
+	ctx context.Context,
+	topic TopicDescriptor,
+	key, value []byte,
+	updated hlc.Timestamp,
+	alloc kvevent.Alloc,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.seenRows[string(key)] = struct{}{}
+	s.mu.alloc.Merge(&alloc)
+	if s.mu.expectedRows == len(s.mu.seenRows) && s.allEmitted != nil {
+		close(s.allEmitted)
+		s.allEmitted = nil
+	}
+	return nil
+}
+
+func (s *memoryHoggingSink) EmitResolvedTimestamp(
+	ctx context.Context, encoder Encoder, resolved hlc.Timestamp,
+) error {
+	panic("should not be called")
+}
+
+func (s *memoryHoggingSink) Flush(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.numFlushes++
+	s.mu.alloc.Release(ctx)
+	return nil
+}
+
+func (s *memoryHoggingSink) numFlushes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mu.numFlushes
+}
+func (s *memoryHoggingSink) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.alloc.Release(context.Background())
+	return nil
+}
+
+func TestChangefeedFlushesSinkToReleaseMemory(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDeadlockWithIssue(t, 71364)
+
+	s, db, stopServer := startTestServer(t, newTestOptions())
+	defer stopServer()
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	knobs := s.TestingKnobs().
+		DistSQL.(*execinfra.TestingKnobs).
+		Changefeed.(*TestingKnobs)
+
+	// Arrange for a small memory budget.
+	knobs.MemMonitor = startMonitorWithBudget(4096)
+
+	// Ignore resolved events delivered to this changefeed.  This has
+	// an effect of never advancing the frontier, and thus never flushing
+	// the sink due to frontier advancement.  The only time we flush the sink
+	// is if the memory pressure causes flush request to be delivered.
+	knobs.ShouldSkipResolved = func(_ *jobspb.ResolvedSpan) bool {
+		return true
+	}
+
+	// Arrange for custom sink to be used -- a sink that does not
+	// release its resources.
+	sink := &memoryHoggingSink{}
+	knobs.WrapSink = func(_ Sink, _ jobspb.JobID) Sink {
+		return sink
+	}
+
+	// Create table, and insert 123 rows in it -- this fills up
+	// our tiny memory buffer (~26 rows do)
+	sqlDB.Exec(t, `CREATE TABLE foo(key INT PRIMARY KEY DEFAULT unique_rowid(), val INT)`)
+	sqlDB.Exec(t, `INSERT INTO foo (val) SELECT * FROM generate_series(1, 123)`)
+
+	// Expect 123 rows from backfill.
+	allEmitted := sink.expectRows(123)
+
+	sqlDB.Exec(t, `CREATE CHANGEFEED FOR foo INTO 'http://host/does/not/matter'`)
+
+	<-allEmitted
+	require.Greater(t, sink.numFlushes(), 0)
+
+	// Insert another set of rows.  This now uses rangefeeds.
+	allEmitted = sink.expectRows(123)
+	sqlDB.Exec(t, `INSERT INTO foo (val) SELECT * FROM generate_series(1, 123)`)
+	<-allEmitted
+	require.Greater(t, sink.numFlushes(), 0)
 }

@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -63,6 +64,8 @@ var (
 	// ErrFloatOutOfRange is reported when float arithmetic overflows.
 	ErrFloatOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
 	errDecOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
+	// errCharOutOfRange is reported when int cast to ASCII byte overflows.
+	errCharOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "\"char\" out of range")
 
 	// ErrDivByZero is reported on a division by zero.
 	ErrDivByZero       = pgerror.New(pgcode.DivisionByZero, "division by zero")
@@ -2064,7 +2067,7 @@ func cmpOpFixups(
 	}
 
 	// Array equality comparisons.
-	for _, t := range types.Scalar {
+	for _, t := range append(types.Scalar, types.AnyEnum) {
 		cmpOps[EQ] = append(cmpOps[EQ], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
@@ -3340,21 +3343,6 @@ type SequenceOperators interface {
 	// Returns an empty string if the sequence name does not exist.
 	GetSerialSequenceNameFromColumn(ctx context.Context, tableName *TableName, columnName Name) (*TableName, error)
 
-	// IncrementSequence increments the given sequence and returns the result.
-	// It returns an error if the given name is not a sequence.
-	// The caller must ensure that seqName is fully qualified already.
-	IncrementSequence(ctx context.Context, seqName *TableName) (int64, error)
-
-	// GetLatestValueInSessionForSequence returns the value most recently obtained by
-	// nextval() for the given sequence in this session.
-	GetLatestValueInSessionForSequence(ctx context.Context, seqName *TableName) (int64, error)
-
-	// SetSequenceValue sets the sequence's value.
-	// If isCalled is false, the sequence is set such that the next time nextval() is called,
-	// `newVal` is returned. Otherwise, the next call to nextval will return
-	// `newVal + seqOpts.Increment`.
-	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
-
 	// IncrementSequenceByID increments the given sequence and returns the result.
 	// It returns an error if the given ID is not a sequence.
 	// Takes in a sequence ID rather than a name, unlike IncrementSequence.
@@ -3494,6 +3482,8 @@ type EvalContext struct {
 	//   [region=us,dc=east]
 	//
 	Locality roachpb.Locality
+
+	Tracer *tracing.Tracer
 
 	// The statement timestamp. May be different for every statement.
 	// Used for statement_timestamp().
@@ -4156,6 +4146,9 @@ func EvalComparisonExprWithSubOperator(
 func (expr *FuncExpr) EvalArgsAndGetGenerator(ctx *EvalContext) (ValueGenerator, error) {
 	if expr.fn == nil || expr.fnProps.Class != GeneratorClass {
 		return nil, errors.AssertionFailedf("cannot call EvalArgsAndGetGenerator() on non-aggregate function: %q", ErrString(expr))
+	}
+	if expr.fn.GeneratorWithExprs != nil {
+		return expr.fn.GeneratorWithExprs(ctx, expr.Exprs)
 	}
 	nullArg, args, err := expr.evalArgs(ctx)
 	if err != nil || nullArg {

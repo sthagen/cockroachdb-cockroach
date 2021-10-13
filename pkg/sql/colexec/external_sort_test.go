@@ -197,7 +197,7 @@ func TestExternalSortRandomized(t *testing.T) {
 					// TODO(asubiotto): Not implemented yet, currently we rely on the
 					//  flow tracking open FDs and releasing any leftovers.
 					var semsToCheck []semaphore.Semaphore
-					tups, expected, ordCols := generateRandomDataForTestSort(rng, nTups, nCols, nOrderingCols)
+					tups, expected, ordCols := generateRandomDataForTestSort(rng, nTups, nCols, nOrderingCols, 0 /* matchLen */)
 					if k > 0 {
 						expected = expected[:k]
 					}
@@ -321,7 +321,7 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	require.True(t, spilled)
 	require.Zero(t, sem.GetCount(), "sem still reports open FDs")
 
-	externalSorter := sorter.(*diskSpillerBase).diskBackedOp.(*externalSorter)
+	externalSorter := MaybeUnwrapInvariantsChecker(sorter).(*diskSpillerBase).diskBackedOp.(*externalSorter)
 	numPartitionsCreated := externalSorter.currentPartitionIdx
 	// This maximum can be achieved when we have minimum required number of FDs
 	// as follows: we expect that each newly created partition contains about

@@ -1450,7 +1450,7 @@ func (node *FuncExpr) ResolvedOverload() *Overload {
 
 // IsGeneratorApplication returns true iff the function applied is a generator (SRF).
 func (node *FuncExpr) IsGeneratorApplication() bool {
-	return node.fn != nil && node.fn.Generator != nil
+	return node.fn != nil && (node.fn.Generator != nil || node.fn.GeneratorWithExprs != nil)
 }
 
 // IsWindowFunctionApplication returns true iff the function is being applied as a window function.
@@ -1460,7 +1460,7 @@ func (node *FuncExpr) IsWindowFunctionApplication() bool {
 
 // IsDistSQLBlocklist returns whether the function is not supported by DistSQL.
 func (node *FuncExpr) IsDistSQLBlocklist() bool {
-	return node.fnProps != nil && node.fnProps.DistsqlBlocklist
+	return (node.fn != nil && node.fn.DistsqlBlocklist) || (node.fnProps != nil && node.fnProps.DistsqlBlocklist)
 }
 
 // CanHandleNulls returns whether or not the function can handle null

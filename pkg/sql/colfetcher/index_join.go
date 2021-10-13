@@ -168,13 +168,13 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 			// Index joins will always return exactly one output row per input row.
 			s.rf.setEstimatedRowCount(uint64(rowCount))
 			if err := s.rf.StartScan(
+				s.Ctx,
 				s.flowCtx.Txn,
 				spans,
 				nil,   /* bsHeader */
 				false, /* limitBatches */
 				rowinfra.NoBytesLimit,
 				rowinfra.NoRowLimit,
-				s.flowCtx.TraceKV,
 				s.flowCtx.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 			); err != nil {
 				colexecerror.InternalError(err)
@@ -210,7 +210,12 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 // result batches. TODO(drewk): once the Streamer work is finished, the fetcher
 // logic will be able to control result size without sacrificing parallelism, so
 // we can remove this limit.
-const inputBatchSizeLimit = 4 << 20 /* 4 MB */
+var inputBatchSizeLimit = int64(util.ConstantWithMetamorphicTestRange(
+	"ColIndexJoin-batch-size",
+	4<<20, /* 4 MB */
+	1,     /* min */
+	4<<20, /* max */
+))
 
 // findEndIndex returns an index endIdx into s.batch such that generating spans
 // for rows in the interval [s.startIdx, endIdx) will get as close to the memory
@@ -397,7 +402,7 @@ func NewColIndexJoin(
 		cols = table.DeletableColumns()
 	}
 	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
-	typs := catalog.ColumnTypesWithVirtualCol(cols, nil /* virtualCol */)
+	typs := catalog.ColumnTypes(cols)
 
 	// Add all requested system columns to the output.
 	if spec.HasSystemColumns {
@@ -437,7 +442,7 @@ func NewColIndexJoin(
 	}
 
 	fetcher, err := initCFetcher(
-		flowCtx, fetcherAllocator, table, index, neededColumns, columnIdxMap, nil, /* virtualColumn */
+		flowCtx, fetcherAllocator, table, index, neededColumns, columnIdxMap, nil, /* invertedColumn */
 		cFetcherArgs{
 			visibility:        spec.Visibility,
 			lockingStrength:   spec.LockingStrength,
@@ -528,11 +533,15 @@ func (s *ColIndexJoin) Release() {
 
 // Close implements the colexecop.Closer interface.
 func (s *ColIndexJoin) Close() error {
+	s.rf.Close(s.EnsureCtx())
 	if s.tracingSpan != nil {
 		s.tracingSpan.Finish()
 		s.tracingSpan = nil
 	}
-	s.spanAssembler.Close()
+	if s.spanAssembler != nil {
+		// spanAssembler can be nil if Release() has already been called.
+		s.spanAssembler.Close()
+	}
 	s.batch = nil
 	return nil
 }

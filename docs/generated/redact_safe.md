@@ -2,7 +2,10 @@ The following types are considered always safe for reporting:
 
 File | Type
 --|--
+pkg/base/node_id.go | `*NodeIDContainer`
+pkg/base/node_id.go | `*StoreIDContainer`
 pkg/cli/exit/exit.go | `Code`
+pkg/jobs/jobspb/wrap.go | `JobID`
 pkg/jobs/jobspb/wrap.go | `Type`
 pkg/kv/kvserver/closedts/ctpb/service.go | `LAI`
 pkg/kv/kvserver/closedts/ctpb/service.go | `SeqNum`
@@ -18,6 +21,7 @@ pkg/roachpb/metadata.go | `ReplicaID`
 pkg/roachpb/metadata.go | `ReplicaType`
 pkg/roachpb/metadata.go | `StoreID`
 pkg/roachpb/method.go | `Method`
+pkg/rpc/connection_class.go | `ConnectionClass`
 pkg/sql/catalog/descpb/structured.go | `ColumnID`
 pkg/sql/catalog/descpb/structured.go | `ConstraintType`
 pkg/sql/catalog/descpb/structured.go | `ConstraintValidity`
@@ -32,6 +36,7 @@ pkg/sql/catalog/descpb/structured.go | `IndexID`
 pkg/sql/catalog/descpb/structured.go | `MutationID`
 pkg/sql/sem/tree/table_ref.go | `ColumnID`
 pkg/sql/sem/tree/table_ref.go | `ID`
+pkg/sql/sqlliveness/sqlliveness.go | `SessionID`
 pkg/storage/enginepb/mvcc.go | `TxnEpoch`
 pkg/storage/enginepb/mvcc.go | `TxnSeq`
 pkg/storage/enginepb/mvcc3.go | `*MVCCStats`

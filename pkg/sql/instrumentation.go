@@ -278,6 +278,16 @@ func (ih *instrumentationHelper) Finish(
 			Database:    p.SessionData().Database,
 			Failed:      retErr != nil,
 		}
+		// We populate transaction fingerprint ID if this is an implicit transaction.
+		// See executor_statement_metrics.go:recordStatementSummary() for further
+		// explanation.
+		if ih.implicitTxn {
+			stmtFingerprintID := stmtStatsKey.FingerprintID()
+			txnFingerprintHash := util.MakeFNV64()
+			txnFingerprintHash.Add(uint64(stmtFingerprintID))
+			stmtStatsKey.TransactionFingerprintID =
+				roachpb.TransactionFingerprintID(txnFingerprintHash.Sum())
+		}
 		err = statsCollector.RecordStatementExecStats(stmtStatsKey, queryLevelStats)
 		if err != nil {
 			if log.V(2 /* level */) {
@@ -293,7 +303,7 @@ func (ih *instrumentationHelper) Finish(
 	if ih.collectBundle {
 		ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
 		placeholders := p.extendedEvalCtx.Placeholders
-		ob := ih.buildExplainAnalyzePlan(
+		ob := ih.emitExplainAnalyzePlanToOutputBuilder(
 			explain.Flags{Verbose: true, ShowTypes: true},
 			statsCollector.PhaseTimes(),
 			&queryLevelStats,
@@ -414,10 +424,10 @@ func (ih *instrumentationHelper) PlanForStats(ctx context.Context) *roachpb.Expl
 	return ob.BuildProtoTree()
 }
 
-// buildExplainAnalyzePlan creates an explain.OutputBuilder and populates it
-// with the EXPLAIN ANALYZE plan. BuildString/BuildStringRows can be used on the
-// result.
-func (ih *instrumentationHelper) buildExplainAnalyzePlan(
+// emitExplainAnalyzePlanToOutputBuilder creates an explain.OutputBuilder and
+// populates it with the EXPLAIN ANALYZE plan. BuildString/BuildStringRows can
+// be used on the result.
+func (ih *instrumentationHelper) emitExplainAnalyzePlanToOutputBuilder(
 	flags explain.Flags, phaseTimes *sessionphase.Times, queryStats *execstats.QueryLevelStats,
 ) *explain.OutputBuilder {
 	ob := explain.NewOutputBuilder(flags)
@@ -474,7 +484,7 @@ func (ih *instrumentationHelper) setExplainAnalyzeResult(
 		return nil //nolint:returnerrcheck
 	}
 
-	ob := ih.buildExplainAnalyzePlan(ih.explainFlags, phaseTimes, queryLevelStats)
+	ob := ih.emitExplainAnalyzePlanToOutputBuilder(ih.explainFlags, phaseTimes, queryLevelStats)
 	rows := ob.BuildStringRows()
 	if distSQLFlowInfos != nil {
 		rows = append(rows, "")

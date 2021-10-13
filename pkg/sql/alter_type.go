@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -112,23 +111,15 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		// See https://github.com/cockroachdb/cockroach/issues/57741
 		err = params.p.setTypeSchema(params.ctx, n, string(t.Schema))
 	case *tree.AlterTypeOwner:
-		if err = params.p.alterTypeOwner(params.ctx, n, t.Owner); err != nil {
+		owner, err := t.Owner.ToSQLUsername(params.SessionData())
+		if err != nil {
+			return err
+		}
+		if err = params.p.alterTypeOwner(params.ctx, n, owner); err != nil {
 			return err
 		}
 		eventLogDone = true // done inside alterTypeOwner().
 	case *tree.AlterTypeDropValue:
-		if !params.p.SessionData().DropEnumValueEnabled {
-			return pgerror.WithCandidateCode(
-				errors.WithHint(
-					errors.WithIssueLink(
-						errors.New("ALTER TYPE ... DROP VALUE ... is only supported as an alpha feature "+
-							"since view, default, or computed expressions will stop working if they reference the "+
-							"ENUM value"),
-						errors.IssueLink{IssueURL: build.MakeIssueURL(61594)}),
-					"you can enable alter type drop value by running "+
-						"`SET enable_drop_enum_value = true`"),
-				pgcode.FeatureNotSupported)
-		}
 		err = params.p.dropEnumValue(params.ctx, n.desc, t.Val)
 	default:
 		err = errors.AssertionFailedf("unknown alter type cmd %s", t)

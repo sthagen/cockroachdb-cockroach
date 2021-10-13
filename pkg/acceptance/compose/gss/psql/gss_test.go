@@ -12,6 +12,7 @@
 // within docker compose. We also can't use just "gss" here because that
 // tag is reserved for the toplevel Makefile's linux-gnu build.
 
+//go:build gss_compose
 // +build gss_compose
 
 package gss
@@ -35,7 +36,7 @@ func init() {
 }
 
 func TestGSS(t *testing.T) {
-	connector, err := pq.NewConnector("user=root sslmode=require")
+	connector, err := pq.NewConnector("user=root password=rootpw sslmode=require")
 	if err != nil {
 		t.Fatal(err)
 	}

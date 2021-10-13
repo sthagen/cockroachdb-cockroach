@@ -83,6 +83,10 @@ func AlterColumnType(
 		return err
 	}
 
+	if err := checkTypeIsSupported(ctx, params.ExecCfg().Settings, typ); err != nil {
+		return err
+	}
+
 	// Special handling for STRING COLLATE xy to verify that we recognize the language.
 	if t.Collation != "" {
 		if types.IsStringType(typ) {
@@ -199,9 +203,18 @@ func alterColumnTypeGeneral(
 	// Disallow ALTER COLUMN TYPE general for columns that have a foreign key
 	// constraint.
 	for _, fk := range tableDesc.AllActiveAndInactiveForeignKeys() {
-		for _, id := range append(fk.OriginColumnIDs, fk.ReferencedColumnIDs...) {
-			if col.GetID() == id {
-				return colWithConstraintNotSupportedErr
+		if fk.OriginTableID == tableDesc.GetID() {
+			for _, id := range fk.OriginColumnIDs {
+				if col.GetID() == id {
+					return colWithConstraintNotSupportedErr
+				}
+			}
+		}
+		if fk.ReferencedTableID == tableDesc.GetID() {
+			for _, id := range fk.ReferencedColumnIDs {
+				if col.GetID() == id {
+					return colWithConstraintNotSupportedErr
+				}
 			}
 		}
 	}

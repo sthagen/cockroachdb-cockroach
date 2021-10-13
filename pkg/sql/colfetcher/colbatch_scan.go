@@ -92,13 +92,13 @@ func (s *ColBatchScan) Init(ctx context.Context) {
 	s.Ctx, s.tracingSpan = execinfra.ProcessorSpan(s.Ctx, "colbatchscan")
 	limitBatches := !s.parallelize
 	if err := s.rf.StartScan(
+		s.Ctx,
 		s.flowCtx.Txn,
 		s.spans,
 		s.bsHeader,
 		limitBatches,
 		s.batchBytesLimit,
 		s.limitHint,
-		s.flowCtx.TraceKV,
 		s.flowCtx.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 	); err != nil {
 		colexecerror.InternalError(err)
@@ -205,9 +205,9 @@ func NewColBatchScan(
 	// just setting the ID and Version in the spec or something like that and
 	// retrieving the hydrated immutable from cache.
 	table := spec.BuildTableDescriptor()
-	virtualColumn := tabledesc.FindVirtualColumn(table, spec.VirtualColumn)
+	invertedColumn := tabledesc.FindInvertedColumn(table, spec.InvertedColumn)
 	typs, columnIdxMap, err := retrieveTypsAndColOrds(
-		ctx, flowCtx, evalCtx, table, virtualColumn, spec.Visibility, spec.HasSystemColumns)
+		ctx, flowCtx, evalCtx, table, invertedColumn, spec.Visibility, spec.HasSystemColumns)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +219,7 @@ func NewColBatchScan(
 
 	fetcher, err := initCFetcher(
 		flowCtx, allocator, table, table.ActiveIndexes()[spec.IndexIdx],
-		neededColumns, columnIdxMap, virtualColumn,
+		neededColumns, columnIdxMap, invertedColumn,
 		cFetcherArgs{
 			visibility:        spec.Visibility,
 			lockingStrength:   spec.LockingStrength,
@@ -293,7 +293,7 @@ func retrieveTypsAndColOrds(
 	flowCtx *execinfra.FlowCtx,
 	evalCtx *tree.EvalContext,
 	table catalog.TableDescriptor,
-	virtualCol catalog.Column,
+	invertedCol catalog.Column,
 	visibility execinfrapb.ScanVisibility,
 	hasSystemColumns bool,
 ) ([]*types.T, catalog.TableColMap, error) {
@@ -302,7 +302,7 @@ func retrieveTypsAndColOrds(
 		cols = table.DeletableColumns()
 	}
 	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
-	typs := catalog.ColumnTypesWithVirtualCol(cols, virtualCol)
+	typs := catalog.ColumnTypesWithInvertedCol(cols, invertedCol)
 
 	// Add all requested system columns to the output.
 	if hasSystemColumns {
@@ -339,6 +339,7 @@ func (s *ColBatchScan) Release() {
 
 // Close implements the colexecop.Closer interface.
 func (s *ColBatchScan) Close() error {
+	s.rf.Close(s.EnsureCtx())
 	if s.tracingSpan != nil {
 		s.tracingSpan.Finish()
 		s.tracingSpan = nil

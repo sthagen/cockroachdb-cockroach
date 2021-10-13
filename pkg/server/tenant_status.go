@@ -17,8 +17,10 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -185,6 +187,53 @@ func (t *tenantStatusServer) CancelQuery(
 func (t *tenantStatusServer) CancelSession(
 	ctx context.Context, request *serverpb.CancelSessionRequest,
 ) (*serverpb.CancelSessionResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	// Check permissions early to avoid fan-out to all nodes.
+	reqUsername := security.MakeSQLUsernameFromPreNormalizedString(request.Username)
+	if err := t.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(request.SessionID)); err != nil {
+		return nil, err
+	}
+
+	response := serverpb.CancelSessionResponse{}
+	distinctErrorMessages := map[string]struct{}{}
+
+	if err := t.iteratePods(
+		ctx,
+		fmt.Sprintf("cancel session ID %s", hex.EncodeToString(request.SessionID)),
+		t.dialCallback,
+		func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
+			return client.(serverpb.StatusClient).CancelLocalSession(ctx, request)
+		},
+		func(_ base.SQLInstanceID, nodeResp interface{}) {
+			nodeCancelSessionResp := nodeResp.(*serverpb.CancelSessionResponse)
+			if nodeCancelSessionResp.Canceled {
+				response.Canceled = true
+			}
+			distinctErrorMessages[nodeCancelSessionResp.Error] = struct{}{}
+		},
+		func(_ base.SQLInstanceID, err error) {
+			distinctErrorMessages[err.Error()] = struct{}{}
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	if !response.Canceled {
+		var errorMessages []string
+		for errorMessage := range distinctErrorMessages {
+			errorMessages = append(errorMessages, errorMessage)
+		}
+		response.Error = strings.Join(errorMessages, ", ")
+	}
+
+	return &response, nil
+}
+
+func (t *tenantStatusServer) CancelLocalSession(
+	ctx context.Context, request *serverpb.CancelSessionRequest,
+) (*serverpb.CancelSessionResponse, error) {
 	reqUsername := security.MakeSQLUsernameFromPreNormalizedString(request.Username)
 	if err := t.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(request.SessionID)); err != nil {
 		return nil, err
@@ -193,17 +242,134 @@ func (t *tenantStatusServer) CancelSession(
 }
 
 func (t *tenantStatusServer) ListContentionEvents(
-	ctx context.Context, request *serverpb.ListContentionEventsRequest,
+	ctx context.Context, req *serverpb.ListContentionEventsRequest,
 ) (*serverpb.ListContentionEventsResponse, error) {
-	return t.ListLocalContentionEvents(ctx, request)
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	// Check permissions early to avoid fan-out to all nodes.
+	if err := t.hasViewActivityPermissions(ctx); err != nil {
+		return nil, err
+	}
+
+	var response serverpb.ListContentionEventsResponse
+
+	podFn := func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
+		statusClient := client.(serverpb.StatusClient)
+		resp, err := statusClient.ListLocalContentionEvents(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.Errors) > 0 {
+			return nil, errors.Errorf("%s", resp.Errors[0].Message)
+		}
+		return resp, nil
+	}
+	responseFn := func(_ base.SQLInstanceID, nodeResp interface{}) {
+		if nodeResp == nil {
+			return
+		}
+		events := nodeResp.(*serverpb.ListContentionEventsResponse).Events
+		response.Events = contention.MergeSerializedRegistries(response.Events, events)
+	}
+	errorFn := func(instanceID base.SQLInstanceID, err error) {
+		errResponse := serverpb.ListActivityError{
+			NodeID:  roachpb.NodeID(instanceID),
+			Message: err.Error(),
+		}
+		response.Errors = append(response.Errors, errResponse)
+	}
+
+	if err := t.iteratePods(
+		ctx,
+		"contention events list",
+		t.dialCallback,
+		podFn,
+		responseFn,
+		errorFn,
+	); err != nil {
+		return nil, err
+	}
+	return &response, nil
 }
 
 func (t *tenantStatusServer) ResetSQLStats(
-	ctx context.Context, _ *serverpb.ResetSQLStatsRequest,
+	ctx context.Context, req *serverpb.ResetSQLStatsRequest,
 ) (*serverpb.ResetSQLStatsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	if _, err := t.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+		return nil, err
+	}
+
+	response := &serverpb.ResetSQLStatsResponse{}
 	controller := t.sqlServer.pgServer.SQLServer.GetSQLStatsController()
-	controller.ResetLocalSQLStats(ctx)
-	return &serverpb.ResetSQLStatsResponse{}, nil
+
+	// If we need to reset persisted stats, we delegate to SQLStatsController,
+	// which will trigger a system table truncation and RPC fanout under the hood.
+	if req.ResetPersistedStats {
+		if err := controller.ResetClusterSQLStats(ctx); err != nil {
+			return nil, err
+		}
+
+		return response, nil
+	}
+
+	localReq := &serverpb.ResetSQLStatsRequest{
+		NodeID: "local",
+		// Only the top level RPC handler handles the reset persisted stats.
+		ResetPersistedStats: false,
+	}
+
+	if len(req.NodeID) > 0 {
+		parsedInstanceID, local, err := t.parseInstanceID(req.NodeID)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, err.Error())
+		}
+		if local {
+			controller.ResetLocalSQLStats(ctx)
+			return response, nil
+		}
+
+		instance, err := t.sqlServer.sqlInstanceProvider.GetInstance(ctx, parsedInstanceID)
+		if err != nil {
+			return nil, err
+		}
+		statusClient, err := t.dialPod(ctx, parsedInstanceID, instance.InstanceAddr)
+		if err != nil {
+			return nil, err
+		}
+		return statusClient.ResetSQLStats(ctx, localReq)
+	}
+
+	nodeResetFn := func(
+		ctx context.Context,
+		client interface{},
+		instanceID base.SQLInstanceID,
+	) (interface{}, error) {
+		statusClient := client.(serverpb.StatusClient)
+		return statusClient.ResetSQLStats(ctx, localReq)
+	}
+
+	var fanoutError error
+
+	if err := t.iteratePods(ctx, fmt.Sprintf("reset SQL statistics for instance %s", req.NodeID),
+		t.dialCallback,
+		nodeResetFn,
+		func(instanceID base.SQLInstanceID, resp interface{}) {
+			// Nothing to do here.
+		},
+		func(instanceID base.SQLInstanceID, err error) {
+			if err != nil {
+				fanoutError = errors.CombineErrors(fanoutError, err)
+			}
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	return response, fanoutError
 }
 
 func (t *tenantStatusServer) CombinedStatementStats(
@@ -235,6 +401,14 @@ func (t *tenantStatusServer) CombinedStatementStats(
 func (t *tenantStatusServer) Statements(
 	ctx context.Context, req *serverpb.StatementsRequest,
 ) (*serverpb.StatementsResponse, error) {
+	if req.Combined {
+		combinedRequest := serverpb.CombinedStatementsStatsRequest{
+			Start: req.Start,
+			End:   req.End,
+		}
+		return t.CombinedStatementStats(ctx, &combinedRequest)
+	}
+
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = t.AnnotateCtx(ctx)
 
@@ -457,12 +631,68 @@ func (t *tenantStatusServer) Profile(
 }
 
 func (t *tenantStatusServer) IndexUsageStatistics(
-	ctx context.Context, request *serverpb.IndexUsageStatisticsRequest,
+	ctx context.Context, req *serverpb.IndexUsageStatisticsRequest,
 ) (*serverpb.IndexUsageStatisticsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
 	if _, err := t.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
 	}
 
-	idxUsageStats := t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics()
-	return indexUsageStatsLocal(idxUsageStats)
+	localReq := &serverpb.IndexUsageStatisticsRequest{
+		NodeID: "local",
+	}
+
+	if len(req.NodeID) > 0 {
+		parsedInstanceID, local, err := t.parseInstanceID(req.NodeID)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		if local {
+			statsReader := t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics()
+			return indexUsageStatsLocal(statsReader)
+		}
+
+		instance, err := t.sqlServer.sqlInstanceProvider.GetInstance(ctx, parsedInstanceID)
+		if err != nil {
+			return nil, err
+		}
+		statusClient, err := t.dialPod(ctx, parsedInstanceID, instance.InstanceAddr)
+		if err != nil {
+			return nil, err
+		}
+
+		// We issue a localReq instead of the incoming req to other nodes. This is
+		// to instruct other nodes to only return us their node-local stats and
+		// do not further propagates the RPC call.
+		return statusClient.IndexUsageStatistics(ctx, localReq)
+	}
+
+	fetchIndexUsageStats := func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
+		statusClient := client.(serverpb.StatusClient)
+		return statusClient.IndexUsageStatistics(ctx, localReq)
+	}
+
+	resp := &serverpb.IndexUsageStatisticsResponse{}
+	aggFn := func(_ base.SQLInstanceID, nodeResp interface{}) {
+		stats := nodeResp.(*serverpb.IndexUsageStatisticsResponse)
+		resp.Statistics = append(resp.Statistics, stats.Statistics...)
+	}
+
+	var combinedError error
+	errFn := func(_ base.SQLInstanceID, nodeFnError error) {
+		combinedError = errors.CombineErrors(combinedError, nodeFnError)
+	}
+
+	if err := t.iteratePods(ctx, fmt.Sprintf("requesting index usage stats for instance %s", req.NodeID),
+		t.dialCallback,
+		fetchIndexUsageStats,
+		aggFn,
+		errFn,
+	); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
 }

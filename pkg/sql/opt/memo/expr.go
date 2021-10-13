@@ -202,10 +202,10 @@ func (n FiltersExpr) OuterCols() opt.ColSet {
 	return colSet
 }
 
-// Sort sorts the FilterItems in n by the IDs of the expression.
+// Sort sorts the FilterItems in n by the ranks of the expressions.
 func (n *FiltersExpr) Sort() {
 	sort.Slice(*n, func(i, j int) bool {
-		return (*n)[i].Condition.(opt.ScalarExpr).ID() < (*n)[j].Condition.(opt.ScalarExpr).ID()
+		return (*n)[i].Condition.Rank() < (*n)[j].Condition.Rank()
 	})
 }
 
@@ -352,6 +352,9 @@ type ScanFlags struct {
 
 	// NoZigzagJoin disallows use of a zigzag join for scanning this table.
 	NoZigzagJoin bool
+
+	// NoFullScan disallows use of a full scan for scanning this table.
+	NoFullScan bool
 
 	// ForceIndex forces the use of a specific index (specified in Index).
 	// ForceIndex and NoIndexJoin cannot both be set at the same time.
@@ -654,6 +657,14 @@ func (s *ScanPrivate) IsUnfiltered(md *opt.Metadata) bool {
 		s.InvertedConstraint == nil &&
 		s.HardLimit == 0 &&
 		s.PartialIndexPredicate(md) == nil
+}
+
+// IsFullIndexScan returns true if the ScanPrivate will produce all rows in the
+// index.
+func (s *ScanPrivate) IsFullIndexScan(md *opt.Metadata) bool {
+	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
+		s.InvertedConstraint == nil &&
+		s.HardLimit == 0
 }
 
 // IsLocking returns true if the ScanPrivate is configured to use a row-level

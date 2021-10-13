@@ -44,11 +44,32 @@ type AddressResolver func(roachpb.NodeID) (net.Addr, error)
 // it maintains a circuit breaker that prevents rapid connection attempts and
 // provides hints to the callers on whether to log the outcome of the operation.
 type Dialer struct {
-	rpcContext *rpc.Context
-	resolver   AddressResolver
+	rpcContext   *rpc.Context
+	resolver     AddressResolver
+	testingKnobs DialerTestingKnobs
 
 	breakers [rpc.NumConnectionClasses]syncutil.IntMap // map[roachpb.NodeID]*wrappedBreaker
 }
+
+// DialerOpt contains ocnfiguration options for a Dialer.
+type DialerOpt struct {
+	// TestingKnobs contains testing utilities.
+	TestingKnobs DialerTestingKnobs
+}
+
+// DialerTestingKnobs contains dialer testing options.
+type DialerTestingKnobs struct {
+	// TestingNoLocalClientOptimization, if set, disables the optimization about
+	// using a direct client for the local node instead of going through gRPC. For
+	// one, the behavior on cancellation of the client RPC ctx is different: when
+	// going through gRPC, the framework watches for client ctx cancellation and
+	// interrupts the RPC. When bypassing gRPC, the client ctx is passed directly
+	// to the RPC handler.
+	TestingNoLocalClientOptimization bool
+}
+
+// ModuleTestingKnobs implements the ModuleTestingKnobs interface.
+func (DialerTestingKnobs) ModuleTestingKnobs() {}
 
 // New initializes a Dialer.
 func New(rpcContext *rpc.Context, resolver AddressResolver) *Dialer {
@@ -56,6 +77,13 @@ func New(rpcContext *rpc.Context, resolver AddressResolver) *Dialer {
 		rpcContext: rpcContext,
 		resolver:   resolver,
 	}
+}
+
+// NewWithOpt initializes a Dialer and allows passing in configuration options.
+func NewWithOpt(rpcContext *rpc.Context, resolver AddressResolver, opt DialerOpt) *Dialer {
+	d := New(rpcContext, resolver)
+	d.testingKnobs = opt.TestingKnobs
+	return d
 }
 
 // Stopper returns this node dialer's Stopper.
@@ -124,14 +152,19 @@ func (n *Dialer) DialInternalClient(
 	if err != nil {
 		return nil, nil, err
 	}
-	if localClient := n.rpcContext.GetLocalInternalClientForAddr(addr.String(), nodeID); localClient != nil {
-		log.VEvent(ctx, 2, kvbase.RoutingRequestLocallyMsg)
 
-		// Create a new context from the existing one with the "local request" field set.
-		// This tells the handler that this is an in-process request, bypassing ctx.Peer checks.
-		localCtx := grpcutil.NewLocalRequestContext(ctx)
+	{
+		// If we're dialing the local node, don't go through gRPC.
+		localClient := n.rpcContext.GetLocalInternalClientForAddr(addr.String(), nodeID)
+		if localClient != nil && !n.testingKnobs.TestingNoLocalClientOptimization {
+			log.VEvent(ctx, 2, kvbase.RoutingRequestLocallyMsg)
 
-		return localCtx, localClient, nil
+			// Create a new context from the existing one with the "local request" field set.
+			// This tells the handler that this is an in-process request, bypassing ctx.Peer checks.
+			localCtx := grpcutil.NewLocalRequestContext(ctx)
+
+			return localCtx, localClient, nil
+		}
 	}
 	log.VEventf(ctx, 2, "sending request to %s", addr)
 	conn, err := n.dial(ctx, nodeID, addr, n.getBreaker(nodeID, class), true /* checkBreaker */, class)
@@ -162,7 +195,7 @@ func (n *Dialer) dial(
 	defer func() {
 		// Enforce a minimum interval between warnings for failed connections.
 		if err != nil && ctx.Err() == nil && breaker != nil && breaker.ShouldLog() {
-			log.Health.Infof(ctx, "unable to connect to n%d: %s", nodeID, err)
+			log.Health.Warningf(ctx, "unable to connect to n%d: %s", nodeID, err)
 		}
 	}()
 	conn, err := n.rpcContext.GRPCDialNode(addr.String(), nodeID, class).Connect(ctx)
@@ -201,27 +234,45 @@ func (n *Dialer) dial(
 }
 
 // ConnHealth returns nil if we have an open connection of the request
-// class to the given node that succeeded on its most recent heartbeat. See the
-// method of the same name on rpc.Context for more details.
+// class to the given node that succeeded on its most recent heartbeat.
+// Returns circuit.ErrBreakerOpen if the breaker is tripped, otherwise
+// ErrNoConnection if no connection to the node currently exists.
 func (n *Dialer) ConnHealth(nodeID roachpb.NodeID, class rpc.ConnectionClass) error {
 	if n == nil || n.resolver == nil {
 		return errors.New("no node dialer configured")
 	}
-	if !n.getBreaker(nodeID, class).Ready() {
+	// NB: Don't call Ready(). The breaker protocol would require us to follow
+	// that up with a dial, which we won't do as this is called in hot paths.
+	if n.getBreaker(nodeID, class).Tripped() {
 		return circuit.ErrBreakerOpen
 	}
 	addr, err := n.resolver(nodeID)
 	if err != nil {
 		return err
 	}
-	// TODO(bdarnell): GRPCDialNode should detect local addresses and return
-	// a dummy connection instead of requiring callers to do this check.
-	if n.rpcContext.GetLocalInternalClientForAddr(addr.String(), nodeID) != nil {
-		// The local client is always considered healthy.
-		return nil
+	return n.rpcContext.ConnHealth(addr.String(), nodeID, class)
+}
+
+// ConnHealthTryDial returns nil if we have an open connection of the request
+// class to the given node that succeeded on its most recent heartbeat. If no
+// healthy connection is found, it will attempt to dial the node.
+//
+// This exists for components that do not themselves actively maintain RPC
+// connections to remote nodes, e.g. DistSQL. However, it can cause significant
+// latency if the remote node is unresponsive (e.g. if the server/VM is shut
+// down), and should be avoided in latency-sensitive code paths. Preferably,
+// this should be replaced by some other mechanism to maintain RPC connections.
+// See also: https://github.com/cockroachdb/cockroach/issues/70111
+func (n *Dialer) ConnHealthTryDial(nodeID roachpb.NodeID, class rpc.ConnectionClass) error {
+	err := n.ConnHealth(nodeID, class)
+	if err == nil || !n.getBreaker(nodeID, class).Ready() {
+		return err
 	}
-	conn := n.rpcContext.GRPCDialNode(addr.String(), nodeID, class)
-	return conn.Health()
+	addr, err := n.resolver(nodeID)
+	if err != nil {
+		return err
+	}
+	return n.rpcContext.GRPCDialNode(addr.String(), nodeID, class).Health()
 }
 
 // GetCircuitBreaker retrieves the circuit breaker for connections to the

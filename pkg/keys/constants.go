@@ -80,12 +80,17 @@ var (
 	// LocalRangeAppliedStateSuffix is the suffix for the range applied state
 	// key.
 	LocalRangeAppliedStateSuffix = []byte("rask")
-	// LocalRaftTruncatedStateSuffix is the suffix for the
-	// RaftTruncatedState.
+	// LocalRaftAppliedIndexLegacySuffix is the suffix for the raft applied index.
+	LocalRaftAppliedIndexLegacySuffix = []byte("rfta")
+	// LocalRaftTruncatedStateLegacySuffix is the suffix for the legacy
+	// RaftTruncatedState. See VersionUnreplicatedRaftTruncatedState.
 	// Note: This suffix is also used for unreplicated Range-ID keys.
-	LocalRaftTruncatedStateSuffix = []byte("rftt")
+	LocalRaftTruncatedStateLegacySuffix = []byte("rftt")
 	// LocalRangeLeaseSuffix is the suffix for a range lease.
 	LocalRangeLeaseSuffix = []byte("rll-")
+	// LocalLeaseAppliedIndexLegacySuffix is the suffix for the applied lease
+	// index.
+	LocalLeaseAppliedIndexLegacySuffix = []byte("rlla")
 	// LocalRangePriorReadSummarySuffix is the suffix for a range's prior read
 	// summary.
 	LocalRangePriorReadSummarySuffix = []byte("rprs")
@@ -407,11 +412,12 @@ const (
 	SpanConfigurationsTableID           = 47
 
 	// CommentType is type for system.comments
-	DatabaseCommentType = 0
-	TableCommentType    = 1
-	ColumnCommentType   = 2
-	IndexCommentType    = 3
-	SchemaCommentType   = 4
+	DatabaseCommentType   = 0
+	TableCommentType      = 1
+	ColumnCommentType     = 2
+	IndexCommentType      = 3
+	SchemaCommentType     = 4
+	ConstraintCommentType = 5
 )
 
 const (

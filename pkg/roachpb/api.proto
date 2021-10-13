@@ -59,6 +59,23 @@ enum RoutingPolicy {
   NEAREST = 1;
 }
 
+// ResumeReason specifies why a ResumeSpan was generated instead of a
+// complete result.
+enum ResumeReason {
+  option (gogoproto.goproto_enum_prefix) = false;
+  // Zero value; no resume, or an unknown reason from a future or past cockroachdb version.
+  RESUME_UNKNOWN = 0;
+  // A key limit was exceeded, i.e. MaxSpanRequestKeys.
+  RESUME_KEY_LIMIT = 1;
+  // A byte limit was exceeded, i.e. TargetBytes.
+  // NB: 21.2 and below will return RESUME_KEY_LIMIT instead.
+  RESUME_BYTE_LIMIT = 2;
+  // An intent limit was exceeded. This is currently never returned to clients,
+  // since MVCCScan converts the result into a WriteIntentError.
+  // NB: 21.2 and below will return RESUME_KEY_LIMIT instead.
+  RESUME_INTENT_LIMIT = 3;
+}
+
 // RequestHeader is supplied with every storage node request.
 message RequestHeader {
   reserved 1, 2;
@@ -78,15 +95,6 @@ message RequestHeader {
 // ResponseHeader is returned with every storage node response. Note that this is
 // different from a BatchResponse's header.
 message ResponseHeader {
-  enum ResumeReason {
-    option (gogoproto.goproto_enum_prefix) = false;
-    // Zero value; no resume.
-    RESUME_UNKNOWN = 0;
-    // The spanning operation didn't finish because the key limit was
-    // exceeded.
-    RESUME_KEY_LIMIT = 1;
-  }
-
   // txn is non-nil if the request specified a non-nil transaction.
   // The transaction timestamp and/or priority may have been updated,
   // depending on the outcome of the request.
@@ -96,9 +104,10 @@ message ResponseHeader {
   // network.
   Transaction txn = 3;
   // The next span to resume from when the response doesn't cover the full span
-  // requested. This can happen when a bound on the keys is set through
-  // max_span_request_keys in the batch header or when a scan has been stopped
-  // before covering the requested data because of scan_options.
+  // requested. This can happen when a bound on the result size is set through
+  // max_span_request_keys or target_bytes in the batch header or when a scan
+  // has been stopped before covering the requested data because of
+  // scan_options.
   //
   // ResumeSpan is unset when the entire span of keys have been
   // operated on. The span is set to the original span if the request
@@ -107,9 +116,6 @@ message ResponseHeader {
   Span resume_span = 4;
   // When resume_span is populated, this specifies the reason why the operation
   // wasn't completed and needs to be resumed.
-  // This field appeared in v2.0. Responses from storage coming from older
-  // servers will not contain it, but the conversion from a BatchResponse to a
-  // client.Result always fills it in.
   ResumeReason resume_reason = 7;
 
   // The number of keys operated on.
@@ -2463,6 +2469,9 @@ message TenantConsumption {
   uint64 write_requests = 4;
   uint64 write_bytes = 5;
   double sql_pods_cpu_seconds = 6 [(gogoproto.customname) = "SQLPodsCPUSeconds"];
+  uint64 pgwire_egress_bytes = 7 [(gogoproto.customname) = "PGWireEgressBytes"];
+
+  // Note: if any fields are changed, the Sub and Add methods must be updated.
 }
 
 // TokenBucketRequest is used by tenants to obtain Request Units and report
@@ -2477,9 +2486,33 @@ message TokenBucketRequest {
   // originates.
   uint32 instance_id = 3 [(gogoproto.customname) = "InstanceID"];
 
+  // NextLiveInstanceID is the ID of the next live SQL instance for this tenant,
+  // in circular order by ID.
+  //
+  // In other words:
+  //  - if this instance has the largest ID, NextLiveInstanceID is the smallest
+  //    ID of a live instance.
+  //  - otherwise, NextLiveInstanceID is the smallest ID of a live instance that
+  //    is greater than InstanceID.
+  //
+  // In particular, if this is the only live instance, then NextLiveInstanceID
+  // will equal InstanceID.
+  //
+  // The information in this field is used by the server to trigger checking for
+  // dead instances; it is acceptable for the information to be stale.
+  //
+  // Can be zero if this information is not currently available.
+  uint32 next_live_instance_id = 8 [(gogoproto.customname) = "NextLiveInstanceID"];
+
   // InstanceLease uniquely identifies the SQL pod instance from where the
   // request originates, in light of ID reuse.
   bytes instance_lease = 4;
+
+  // SeqNum is a strictly positive, monotonically increasing sequence number,
+  // used to detect duplicate requests on the server side (to avoid
+  // double-charging). The consumption reported in a request with a lower
+  // sequence number than the last request is ignored.
+  int64 seq_num = 7;
 
   // RequestedRU is the number of requested tokens (RUs).
   double requested_r_u = 5;
@@ -2488,8 +2521,6 @@ message TokenBucketRequest {
   // TrickleDuration in the response.
   google.protobuf.Duration target_request_period = 6 [(gogoproto.nullable) = false,
                                                       (gogoproto.stdduration) = true];
-
-  // TODO(radu): add remaining fields.
 }
 
 message TokenBucketResponse {

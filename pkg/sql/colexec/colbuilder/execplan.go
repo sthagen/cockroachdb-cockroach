@@ -369,7 +369,23 @@ func (r opResult) createDiskBackedSort(
 	totalMemLimit := execinfra.GetWorkMemLimit(flowCtx)
 	spoolMemLimit := totalMemLimit * 4 / 5
 	maxOutputBatchMemSize := totalMemLimit - spoolMemLimit
-	if matchLen > 0 {
+	if limit != 0 {
+		// There is a limit specified, so we know exactly how many rows the
+		// sorter should output. Use a top K sorter, which uses a heap to avoid
+		// storing more rows than necessary.
+		var topKSorterMemAccount *mon.BoundAccount
+		if useStreamingMemAccountForBuffering {
+			topKSorterMemAccount = streamingMemAccount
+		} else {
+			topKSorterMemAccount, sorterMemMonitorName = r.createMemAccountForSpillStrategyWithLimit(
+				ctx, flowCtx, spoolMemLimit, opNamePrefix+"topk-sort", processorID,
+			)
+		}
+		inMemorySorter, err = colexec.NewTopKSorter(
+			colmem.NewAllocator(ctx, topKSorterMemAccount, factory), input,
+			inputTypes, ordering.Columns, int(matchLen), uint64(limit), maxOutputBatchMemSize,
+		)
+	} else if matchLen > 0 {
 		// The input is already partially ordered. Use a chunks sorter to avoid
 		// loading all the rows into memory.
 		var sortChunksMemAccount *mon.BoundAccount
@@ -383,22 +399,6 @@ func (r opResult) createDiskBackedSort(
 		inMemorySorter, err = colexec.NewSortChunks(
 			colmem.NewAllocator(ctx, sortChunksMemAccount, factory), input, inputTypes,
 			ordering.Columns, int(matchLen), maxOutputBatchMemSize,
-		)
-	} else if limit != 0 {
-		// There is a limit specified, so we know exactly how many rows the
-		// sorter should output. Use a top K sorter, which uses a heap to avoid
-		// storing more rows than necessary.
-		var topKSorterMemAccount *mon.BoundAccount
-		if useStreamingMemAccountForBuffering {
-			topKSorterMemAccount = streamingMemAccount
-		} else {
-			topKSorterMemAccount, sorterMemMonitorName = r.createMemAccountForSpillStrategyWithLimit(
-				ctx, flowCtx, spoolMemLimit, opNamePrefix+"topk-sort", processorID,
-			)
-		}
-		inMemorySorter = colexec.NewTopKSorter(
-			colmem.NewAllocator(ctx, topKSorterMemAccount, factory), input,
-			inputTypes, ordering.Columns, uint64(limit), maxOutputBatchMemSize,
 		)
 	} else {
 		// No optimizations possible. Default to the standard sort operator.
@@ -456,6 +456,7 @@ func (r opResult) createDiskBackedSort(
 				mergeUnlimitedAllocator,
 				outputUnlimitedAllocator,
 				input, inputTypes, ordering, uint64(limit),
+				int(matchLen),
 				execinfra.GetWorkMemLimit(flowCtx),
 				maxNumberPartitions,
 				args.TestingKnobs.NumForcedRepartitions,
@@ -624,9 +625,7 @@ func MaybeRemoveRootColumnarizer(r colexecargs.OpWithMetaInfo) execinfra.RowSour
 	if util.CrdbTestBuild {
 		// We might have an invariants checker as the root right now, we gotta
 		// peek inside of it if so.
-		if i, ok := root.(*colexec.InvariantsChecker); ok {
-			root = i.Input
-		}
+		root = colexec.MaybeUnwrapInvariantsChecker(root)
 	}
 	c, isColumnarizer := root.(*colexec.Columnarizer)
 	if !isColumnarizer {
@@ -1541,13 +1540,10 @@ func NewColOperator(
 
 	takeOverMetaInfo(&result.OpWithMetaInfo, inputs)
 	if util.CrdbTestBuild {
-		// TODO(yuzefovich): remove the testing knob.
-		if args.TestingKnobs.PlanInvariantsCheckers {
-			// Plan an invariants checker if it isn't already the root of the
-			// tree.
-			if _, isInvariantsChecker := r.Root.(*colexec.InvariantsChecker); !isInvariantsChecker {
-				r.Root = colexec.NewInvariantsChecker(r.Root)
-			}
+		// Plan an invariants checker if it isn't already the root of the
+		// tree.
+		if i := colexec.MaybeUnwrapInvariantsChecker(r.Root); i == r.Root {
+			r.Root = colexec.NewInvariantsChecker(r.Root)
 		}
 		// Also verify planning assumptions.
 		r.AssertInvariants()

@@ -480,7 +480,7 @@ func backupShowerDefault(
 					}
 					rows = append(rows, row)
 				}
-				for _, t := range manifest.Tenants {
+				for _, t := range manifest.GetTenants() {
 					row := tree.Datums{
 						tree.DNull, // Database
 						tree.DNull, // Schema
@@ -642,7 +642,8 @@ var jsonShower = backupShower{
 	fn: func(manifests []BackupManifest) ([]tree.Datums, error) {
 		rows := make([]tree.Datums, len(manifests))
 		for i, manifest := range manifests {
-			j, err := protoreflect.MessageToJSON(&manifest, true)
+			j, err := protoreflect.MessageToJSON(
+				&manifest, protoreflect.FmtFlags{EmitDefaults: true, EmitRedacted: true})
 			if err != nil {
 				return nil, err
 			}

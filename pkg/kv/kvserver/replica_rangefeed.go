@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -717,7 +716,7 @@ func (r *Replica) ensureClosedTimestampStarted(ctx context.Context) *roachpb.Err
 		// In particular, r.redirectOnOrAcquireLease() doesn't work because, if the
 		// current lease is invalid and the current replica is not a leader, the
 		// current replica will not take a lease.
-		log.VEventf(ctx, 2, "ensuring lease for rangefeed range. current lease invalid: %s", lease.Lease)
+		log.VEventf(ctx, 2, "ensuring lease for rangefeed range. current lease invalid: %s", &lease.Lease)
 		err := contextutil.RunWithTimeout(ctx, "read forcing lease acquisition", 5*time.Second,
 			func(ctx context.Context) error {
 				var b kv.Batch
@@ -728,10 +727,8 @@ func (r *Replica) ensureClosedTimestampStarted(ctx context.Context) *roachpb.Err
 			})
 		if err != nil {
 			if errors.HasType(err, (*contextutil.TimeoutError)(nil)) {
-				if r.store.cfg.Settings.Version.IsActive(ctx, clusterversion.NewRetryableRangefeedErrors) {
-					err = &roachpb.RangeFeedRetryError{
-						Reason: roachpb.RangeFeedRetryError_REASON_NO_LEASEHOLDER,
-					}
+				err = &roachpb.RangeFeedRetryError{
+					Reason: roachpb.RangeFeedRetryError_REASON_NO_LEASEHOLDER,
 				}
 			}
 			return roachpb.NewError(err)

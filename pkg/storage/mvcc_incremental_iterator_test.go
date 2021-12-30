@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -193,6 +194,7 @@ func assertExportedErrs(
 		ExportAllRevisions: revisions,
 		TargetSize:         big,
 		MaxSize:            big,
+		MaxIntents:         uint64(MaxIntentsPerWriteIntentError.Default()),
 		StopMidKey:         false,
 		UseTBI:             useTBI,
 	}, sstFile)
@@ -1393,7 +1395,7 @@ func runIncrementalBenchmark(
 	eng, _ := setupMVCCData(context.Background(), b, emk, opts)
 	{
 		// Pull all of the sstables into the cache.  This
-		// probably defeates a lot of the benefits of the
+		// probably defeats a lot of the benefits of the
 		// time-based optimization.
 		iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: roachpb.KeyMax})
 		_, _ = iter.ComputeStats(keys.LocalMax, roachpb.KeyMax, 0)
@@ -1425,17 +1427,36 @@ func runIncrementalBenchmark(
 }
 
 func BenchmarkMVCCIncrementalIterator(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	numVersions := 100
 	numKeys := 1000
-	valueBytes := 64
+	// Mean of 50 versions * 1000 bytes results in more than one block per
+	// versioned key, so there is some chance of
+	// EnableTimeBoundIteratorOptimization=true being useful.
+	valueBytes := 1000
 
+	setupMVCCPebbleWithBlockProperties := func(b testing.TB, dir string) Engine {
+		peb, err := Open(
+			context.Background(),
+			Filesystem(dir),
+			CacheSize(testCacheSize),
+			func(cfg *engineConfig) error {
+				cfg.Opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
+				return nil
+			})
+
+		if err != nil {
+			b.Fatalf("could not create new pebble instance at %s: %+v", dir, err)
+		}
+		return peb
+	}
 	for _, useTBI := range []bool{true, false} {
 		b.Run(fmt.Sprintf("useTBI=%v", useTBI), func(b *testing.B) {
 			for _, tsExcludePercent := range []float64{0, 0.95} {
 				wallTime := int64((5 * (float64(numVersions)*tsExcludePercent + 1)))
 				ts := hlc.Timestamp{WallTime: wallTime}
 				b.Run(fmt.Sprintf("ts=%d", ts.WallTime), func(b *testing.B) {
-					runIncrementalBenchmark(b, setupMVCCPebble, useTBI, ts, benchDataOptions{
+					runIncrementalBenchmark(b, setupMVCCPebbleWithBlockProperties, useTBI, ts, benchDataOptions{
 						numVersions: numVersions,
 						numKeys:     numKeys,
 						valueBytes:  valueBytes,

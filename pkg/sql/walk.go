@@ -185,6 +185,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *relocateNode:
 		n.rows = v.visit(n.rows)
 
+	case *relocateRange:
+		n.rows = v.visit(n.rows)
+
 	case *insertNode, *insertFastPathNode:
 		if ins, ok := n.(*insertNode); ok {
 			ins.source = v.visit(ins.source)
@@ -406,6 +409,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&recursiveCTENode{}):               "recursive cte",
 	reflect.TypeOf(&refreshMaterializedViewNode{}):    "refresh materialized view",
 	reflect.TypeOf(&relocateNode{}):                   "relocate",
+	reflect.TypeOf(&relocateRange{}):                  "relocate range",
 	reflect.TypeOf(&renameColumnNode{}):               "rename column",
 	reflect.TypeOf(&renameDatabaseNode{}):             "rename database",
 	reflect.TypeOf(&renameIndexNode{}):                "rename index",
@@ -428,6 +432,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&showFingerprintsNode{}):           "show fingerprints",
 	reflect.TypeOf(&showTraceNode{}):                  "show trace for",
 	reflect.TypeOf(&showTraceReplicaNode{}):           "replica trace",
+	reflect.TypeOf(&showVarNode{}):                    "show",
 	reflect.TypeOf(&sortNode{}):                       "sort",
 	reflect.TypeOf(&splitNode{}):                      "split",
 	reflect.TypeOf(&topKNode{}):                       "top-k",

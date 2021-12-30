@@ -417,6 +417,10 @@ func (expr *CaseExpr) TypeCheck(
 	return expr, nil
 }
 
+func invalidCastError(castFrom, castTo *types.T) error {
+	return pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, castTo)
+}
+
 // resolveCast checks that the cast from the two types is valid. If allowStable
 // is false, it also checks that the cast has VolatilityImmutable.
 //
@@ -450,15 +454,46 @@ func resolveCast(
 		// Casts from ENUM to ENUM type can only succeed if the two types are the
 		// same.
 		if !castFrom.Equivalent(castTo) {
-			return pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, castTo)
+			return invalidCastError(castFrom, castTo)
 		}
 		telemetry.Inc(sqltelemetry.EnumCastCounter)
 		return nil
 
+	case toFamily == types.TupleFamily && fromFamily == types.TupleFamily:
+		// Casts from tuple to tuple type succeed if the lengths of the tuples are
+		// the same, and if there are casts resolvable across all of the elements
+		// pointwise. Casts to AnyTuple are always allowed since they are
+		// implemented as a no-op.
+		if castTo == types.AnyTuple {
+			return nil
+		}
+		fromTuple := castFrom.TupleContents()
+		toTuple := castTo.TupleContents()
+		if len(fromTuple) != len(toTuple) {
+			return invalidCastError(castFrom, castTo)
+		}
+		for i, from := range fromTuple {
+			to := toTuple[i]
+			err := resolveCast(
+				context,
+				from,
+				to,
+				allowStable,
+				intervalStyleEnabled,
+				dateStyleEnabled,
+			)
+			if err != nil {
+				return err
+			}
+		}
+		telemetry.Inc(sqltelemetry.TupleCastCounter)
+		return nil
+
 	default:
-		cast := lookupCast(fromFamily, toFamily, intervalStyleEnabled, dateStyleEnabled)
+		// TODO(mgartner): Use OID cast map.
+		cast := lookupCastInfo(fromFamily, toFamily, intervalStyleEnabled, dateStyleEnabled)
 		if cast == nil {
-			return pgerror.Newf(pgcode.CannotCoerce, "invalid cast: %s -> %s", castFrom, castTo)
+			return invalidCastError(castFrom, castTo)
 		}
 		if !allowStable && cast.volatility >= VolatilityStable {
 			err := NewContextDependentOpsNotAllowedError(context)
@@ -473,9 +508,9 @@ func resolveCast(
 	}
 }
 
-func isEmptyArray(expr Expr) bool {
-	a, ok := expr.(*Array)
-	return ok && len(a.Exprs) == 0
+func isArrayExpr(expr Expr) bool {
+	_, ok := expr.(*Array)
+	return ok
 }
 
 // TypeCheck implements the Expr interface.
@@ -491,6 +526,7 @@ func (expr *CastExpr) TypeCheck(
 		return nil, err
 	}
 	expr.Type = exprType
+	canElideCast := true
 	switch {
 	case isConstant(expr.Expr):
 		c := expr.Expr.(Constant)
@@ -509,12 +545,21 @@ func (expr *CastExpr) TypeCheck(
 		// type we gave it before is not compatible with the usage here, then
 		// type-checking will fail as desired.
 		desired = exprType
-	case isEmptyArray(expr.Expr):
-		// An empty array can't be type-checked with a desired parameter of
-		// types.Any. If we're going to cast to another array type, which is a
-		// common pattern in SQL (select array[]::int[]), use the cast type as the
-		// the desired type.
+	case isArrayExpr(expr.Expr):
+		// If we're going to cast to another array type, which is a common pattern
+		// in SQL (select array[]::int[], select array[$1]::int[]), use the cast
+		// type as the the desired type.
 		if exprType.Family() == types.ArrayFamily {
+			// We can't elide the cast for arrays if the underlying typmod information
+			// is changed from the base type (e.g. `'{"hello", "world"}'::char(2)[]`
+			// should not be elided or the char(2) is lost).
+			// This needs to be checked here; otherwise the expr.Expr.TypeCheck below
+			// will have the same resolved type as exprType, which forces an incorrect
+			// elision.
+			contents := exprType.ArrayContents()
+			if baseType, ok := types.OidToType[contents.Oid()]; ok && !baseType.Identical(contents) {
+				canElideCast = false
+			}
 			desired = exprType
 		}
 	}
@@ -525,7 +570,7 @@ func (expr *CastExpr) TypeCheck(
 	}
 
 	// Elide the cast if it is a no-op.
-	if typedSubExpr.ResolvedType().Identical(exprType) {
+	if canElideCast && typedSubExpr.ResolvedType().Identical(exprType) {
 		return typedSubExpr, nil
 	}
 
@@ -1554,9 +1599,15 @@ func (expr *Placeholder) TypeCheck(
 	// when there are no available values for the placeholders yet, because
 	// during Execute all placeholders are replaced from the AST before type
 	// checking.
+	//
+	// The width of a placeholder value is not known during Prepare, so we
+	// remove type modifiers from the desired type so that a value of any width
+	// will fit within the placeholder type.
+	desired = desired.WithoutTypeModifiers()
 	if typ, ok, err := semaCtx.Placeholders.Type(expr.Idx); err != nil {
 		return expr, err
 	} else if ok {
+		typ = typ.WithoutTypeModifiers()
 		if !desired.Equivalent(typ) {
 			// This indicates there's a conflict between what the type system thinks
 			// the type for this position should be, and the actual type of the
@@ -1719,6 +1770,12 @@ func (d *DJSON) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedE
 // TypeCheck implements the Expr interface. It is implemented as an idempotent
 // identity function for Datum.
 func (d *DTuple) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
+	return d, nil
+}
+
+// TypeCheck implements the Expr interface. It is implemented as an idempotent
+// identity function for Datum.
+func (d *DVoid) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
 	return d, nil
 }
 
@@ -2320,7 +2377,9 @@ func typeCheckSameTypedConsts(
 			}
 		}
 		if all {
-			return setTypeForConsts(typ)
+			// Constants do not have types with modifiers so clear the modifiers
+			// of typ before setting it.
+			return setTypeForConsts(typ.WithoutTypeModifiers())
 		}
 	}
 
@@ -2424,10 +2483,6 @@ func typeCheckTupleComparison(
 func typeCheckSameTypedTupleExprs(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T, exprs ...Expr,
 ) ([]TypedExpr, *types.T, error) {
-	// Hold the resolved type expressions of the provided exprs, in order.
-	// TODO(nvanbenschoten): Look into reducing allocations here.
-	typedExprs := make([]TypedExpr, len(exprs))
-
 	// All other exprs must be tuples.
 	first := exprs[0].(*Tuple)
 	if err := checkAllExprsAreTuplesOrNulls(ctx, semaCtx, exprs[1:]); err != nil {
@@ -2450,7 +2505,9 @@ func typeCheckSameTypedTupleExprs(
 		sameTypeExprs = sameTypeExprs[:0]
 		sameTypeExprsIndices = sameTypeExprsIndices[:0]
 		for exprIdx, expr := range exprs {
-			if expr == DNull {
+			// Skip expressions that are not Tuple expressions (e.g. NULLs or CastExpr).
+			// They are checked at the end of this function.
+			if _, isTuple := expr.(*Tuple); !isTuple {
 				continue
 			}
 			sameTypeExprs = append(sameTypeExprs, expr.(*Tuple).Exprs[elemIdx])
@@ -2470,11 +2527,24 @@ func typeCheckSameTypedTupleExprs(
 		}
 		resTypes.TupleContents()[elemIdx] = resType
 	}
+	// Hold the resolved type expressions of the provided exprs, in order.
+	// TODO(nvanbenschoten): Look into reducing allocations here.
+	typedExprs := make([]TypedExpr, len(exprs))
 	for tupleIdx, expr := range exprs {
-		if expr != DNull {
-			expr.(*Tuple).typ = resTypes
+		if t, isTuple := expr.(*Tuple); isTuple {
+			// For Tuple exprs we can update the type with what we've inferred.
+			t.typ = resTypes
+			typedExprs[tupleIdx] = t
+		} else {
+			typedExpr, err := expr.TypeCheck(ctx, semaCtx, resTypes)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !typedExpr.ResolvedType().EquivalentOrNull(resTypes, true /* allowNullTupleEquivalence */) {
+				return nil, nil, unexpectedTypeError(expr, resTypes, typedExpr.ResolvedType())
+			}
+			typedExprs[tupleIdx] = typedExpr
 		}
-		typedExprs[tupleIdx] = expr.(TypedExpr)
 	}
 	return typedExprs, resTypes, nil
 }
@@ -2486,25 +2556,29 @@ func checkAllExprsAreTuplesOrNulls(ctx context.Context, semaCtx *SemaContext, ex
 		_, isTuple := expr.(*Tuple)
 		isNull := expr == DNull
 		if !(isTuple || isNull) {
+			// We avoid calling TypeCheck on Tuple exprs since that causes the
+			// types to be resolved, which we only want to do later in type-checking.
 			typedExpr, err := expr.TypeCheck(ctx, semaCtx, types.Any)
 			if err != nil {
 				return err
 			}
-			return unexpectedTypeError(expr, types.AnyTuple, typedExpr.ResolvedType())
+			if typedExpr.ResolvedType().Family() != types.TupleFamily {
+				return unexpectedTypeError(expr, types.AnyTuple, typedExpr.ResolvedType())
+			}
 		}
 	}
 	return nil
 }
 
 // checkAllTuplesHaveLength checks that all tuples in exprs have the expected
-// length. Note that all nulls are skipped in this check.
+// length. We only need to check Tuple exprs, since other expressions like
+// CastExpr are handled later in type-checking
 func checkAllTuplesHaveLength(exprs []Expr, expectedLen int) error {
 	for _, expr := range exprs {
-		if expr == DNull {
-			continue
-		}
-		if err := checkTupleHasLength(expr.(*Tuple), expectedLen); err != nil {
-			return err
+		if t, isTuple := expr.(*Tuple); isTuple {
+			if err := checkTupleHasLength(t, expectedLen); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -33,64 +33,71 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/kr/pretty"
 )
 
 var backupOutputTypes = []*types.T{}
 
 var (
 	useTBI = settings.RegisterBoolSetting(
+		settings.TenantWritable,
 		"kv.bulk_io_write.experimental_incremental_export_enabled",
 		"use experimental time-bound file filter when exporting in BACKUP",
 		true,
 	)
 	priorityAfter = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"bulkio.backup.read_with_priority_after",
-		"age of read-as-of time above which a BACKUP should read with priority",
+		"amount of time since the read-as-of time above which a BACKUP should use priority when retrying reads",
 		time.Minute,
 		settings.NonNegativeDuration,
-	)
+	).WithPublic()
 	delayPerAttmpt = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"bulkio.backup.read_retry_delay",
 		"amount of time since the read-as-of time, per-prior attempt, to wait before making another attempt",
 		time.Second*5,
 		settings.NonNegativeDuration,
 	)
 	timeoutPerAttempt = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"bulkio.backup.read_timeout",
-		"amount of time after which a read attempt is considered timed out and is canceled. "+
-			"Hitting this timeout will cause the backup job to fail.",
+		"amount of time after which a read attempt is considered timed out, which causes the backup to fail",
 		time.Minute*5,
 		settings.NonNegativeDuration,
-	)
+	).WithPublic()
 	targetFileSize = settings.RegisterByteSizeSetting(
+		settings.TenantWritable,
 		"bulkio.backup.file_size",
-		"target file size",
+		"target size for individual data files produced during BACKUP",
 		128<<20,
-	)
+	).WithPublic()
+
 	smallFileBuffer = settings.RegisterByteSizeSetting(
+		settings.TenantWritable,
 		"bulkio.backup.merge_file_buffer_size",
 		"size limit used when buffering backup files before merging them",
 		16<<20,
 		settings.NonNegativeInt,
 	)
+
 	splitKeysOnTimestamps = settings.RegisterBoolSetting(
+		settings.TenantWritable,
 		"bulkio.backup.split_keys_on_timestamps",
 		"split backup data on timestamps when writing revision history",
 		false,
 	)
 )
-
-// maxSinkQueueFiles is how many replies we'll queue up before flushing to allow
-// some re-ordering, unless we hit smallFileBuffer size first.
-const maxSinkQueueFiles = 24
 
 const backupProcessorName = "backupDataProcessor"
 
@@ -110,8 +117,14 @@ type backupDataProcessor struct {
 	spec    execinfrapb.BackupDataSpec
 	output  execinfra.RowReceiver
 
-	progCh    chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
-	backupErr error
+	// cancelAndWaitForWorker cancels the producer goroutine and waits for it to
+	// finish. It can be called multiple times.
+	cancelAndWaitForWorker func()
+	progCh                 chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
+	backupErr              error
+
+	// Memory accumulator that reserves the memory usage of the backup processor.
+	backupMem *memoryAccumulator
 }
 
 var _ execinfra.Processor = &backupDataProcessor{}
@@ -124,16 +137,27 @@ func newBackupDataProcessor(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
+	memMonitor := flowCtx.Cfg.BackupMonitor
+	if knobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
+		if knobs.BackupMemMonitor != nil {
+			memMonitor = knobs.BackupMemMonitor
+		}
+	}
 	bp := &backupDataProcessor{
-		flowCtx: flowCtx,
-		spec:    spec,
-		output:  output,
-		progCh:  make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
+		flowCtx:   flowCtx,
+		spec:      spec,
+		output:    output,
+		progCh:    make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
+		backupMem: newMemoryAccumulator(memMonitor),
 	}
 	if err := bp.Init(bp, post, backupOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// This processor doesn't have any inputs to drain.
 			InputsToDrain: nil,
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				bp.close()
+				return nil
+			},
 		}); err != nil {
 		return nil, err
 	}
@@ -143,10 +167,25 @@ func newBackupDataProcessor(
 // Start is part of the RowSource interface.
 func (bp *backupDataProcessor) Start(ctx context.Context) {
 	ctx = bp.StartInternal(ctx, backupProcessorName)
-	go func() {
-		defer close(bp.progCh)
-		bp.backupErr = runBackupProcessor(ctx, bp.flowCtx, &bp.spec, bp.progCh)
-	}()
+	ctx, cancel := context.WithCancel(ctx)
+	bp.cancelAndWaitForWorker = func() {
+		cancel()
+		for range bp.progCh {
+		}
+	}
+	if err := bp.flowCtx.Stopper().RunAsyncTaskEx(ctx, stop.TaskOpts{
+		TaskName: "backup-worker",
+		SpanOpt:  stop.ChildSpan,
+	}, func(ctx context.Context) {
+		bp.backupErr = runBackupProcessor(ctx, bp.flowCtx, &bp.spec, bp.progCh, bp.backupMem)
+		cancel()
+		close(bp.progCh)
+	}); err != nil {
+		// The closure above hasn't run, so we have to do the cleanup.
+		bp.backupErr = err
+		cancel()
+		close(bp.progCh)
+	}
 }
 
 // Next is part of the RowSource interface.
@@ -169,6 +208,18 @@ func (bp *backupDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Producer
 
 	bp.MoveToDraining(nil /* error */)
 	return nil, bp.DrainHelper()
+}
+
+func (bp *backupDataProcessor) close() {
+	bp.cancelAndWaitForWorker()
+	bp.ProcessorBase.InternalClose()
+	bp.backupMem.close(bp.Ctx)
+}
+
+// ConsumerClosed is part of the RowSource interface. We have to override the
+// implementation provided by ProcessorBase.
+func (bp *backupDataProcessor) ConsumerClosed() {
+	bp.close()
 }
 
 type spanAndTime struct {
@@ -194,6 +245,7 @@ func runBackupProcessor(
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.BackupDataSpec,
 	progCh chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
+	backupMem *memoryAccumulator,
 ) error {
 	backupProcessorSpan := tracing.SpanFromContext(ctx)
 	clusterSettings := flowCtx.Cfg.Settings
@@ -335,7 +387,19 @@ func runBackupProcessor(
 					// value. The sentinel value of 1 forces the ExportRequest to paginate
 					// after creating a single SST.
 					header.TargetBytes = 1
-
+					admissionHeader := roachpb.AdmissionHeader{
+						// Export requests are currently assigned NormalPri.
+						//
+						// TODO(bulkio): the priority should vary based on the urgency of
+						// these background requests. These exports should get LowPri,
+						// unless they are being retried and need to be completed in a
+						// timely manner for compliance with RPO and data retention
+						// policies. Consider deriving this from the UserPriority field.
+						Priority:                 int32(admission.NormalPri),
+						CreateTime:               timeutil.Now().UnixNano(),
+						Source:                   roachpb.AdmissionHeader_ROOT_KV,
+						NoMemoryReservedAtSource: true,
+					}
 					log.Infof(ctx, "sending ExportRequest for span %s (attempt %d, priority %s)",
 						span.span, span.attempts+1, header.UserPriority.String())
 					var rawRes roachpb.Response
@@ -353,8 +417,8 @@ func runBackupProcessor(
 								ReqSentTime: reqSentTime.String(),
 							})
 
-							rawRes, pErr = kv.SendWrappedWith(ctx, flowCtx.Cfg.DB.NonTransactionalSender(),
-								header, req)
+							rawRes, pErr = kv.SendWrappedWithAdmission(
+								ctx, flowCtx.Cfg.DB.NonTransactionalSender(), header, admissionHeader, req)
 							respReceivedTime = timeutil.Now()
 							if pErr != nil {
 								return pErr.GoError()
@@ -375,7 +439,7 @@ func runBackupProcessor(
 						// TimeoutError improves the opaque `context deadline exceeded` error
 						// message so use that instead.
 						if errors.HasType(exportRequestErr, (*contextutil.TimeoutError)(nil)) {
-							return errors.Wrapf(exportRequestErr, "timeout: %s", exportRequestErr.Error())
+							return errors.Wrap(exportRequestErr, "export request timeout")
 						}
 						return errors.Wrapf(exportRequestErr, "exporting %s", span.span)
 					}
@@ -480,13 +544,16 @@ func runBackupProcessor(
 			return err
 		}
 
-		sink := &sstSink{conf: sinkConf, dest: storage}
+		sink, err := makeSSTSink(ctx, sinkConf, storage, backupMem)
+		if err != nil {
+			return err
+		}
 
 		defer func() {
 			err := sink.Close()
 			err = errors.CombineErrors(storage.Close(), err)
 			if err != nil {
-				log.Warningf(ctx, "failed to close backup sink(s): %+v", err)
+				log.Warningf(ctx, "failed to close backup sink(s): % #v", pretty.Formatter(err))
 			}
 		}()
 
@@ -534,6 +601,20 @@ type sstSink struct {
 		sizeFlushes int
 		spanGrows   int
 	}
+
+	backupMem *memoryAccumulator
+}
+
+func makeSSTSink(
+	ctx context.Context, conf sstSinkConf, dest cloud.ExternalStorage, backupMem *memoryAccumulator,
+) (*sstSink, error) {
+	s := &sstSink{conf: conf, dest: dest, backupMem: backupMem}
+
+	// Reserve memory for the file buffer.
+	if err := s.backupMem.request(ctx, smallFileBuffer.Get(s.conf.settings)); err != nil {
+		return nil, errors.Wrap(err, "failed to reserve memory for sstSink queue")
+	}
+	return s, nil
 }
 
 func (s *sstSink) Close() error {
@@ -544,6 +625,10 @@ func (s *sstSink) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	// Release the memory reserved for the file buffer back to the memory
+	// accumulator.
+	s.backupMem.release(smallFileBuffer.Get(s.conf.settings))
 	if s.out != nil {
 		return s.out.Close()
 	}
@@ -560,7 +645,7 @@ func (s *sstSink) push(ctx context.Context, resp returnedSST) error {
 	s.queue = append(s.queue, resp)
 	s.queueSize += len(resp.sst)
 
-	if len(s.queue) >= maxSinkQueueFiles || s.queueSize >= int(smallFileBuffer.Get(s.conf.settings)) {
+	if s.queueSize >= int(smallFileBuffer.Get(s.conf.settings)) {
 		sort.Slice(s.queue, func(i, j int) bool { return s.queue[i].f.Span.Key.Compare(s.queue[j].f.Span.Key) < 0 })
 
 		// Drain the first half.
@@ -602,6 +687,7 @@ func (s *sstSink) flushFile(ctx context.Context) error {
 		return err
 	}
 	if err := s.out.Close(); err != nil {
+		log.Warningf(ctx, "failed to close write in sstSink: % #v", pretty.Formatter(err))
 		return errors.Wrap(err, "writing SST")
 	}
 	s.outName = ""
@@ -650,6 +736,7 @@ func (s *sstSink) open(ctx context.Context) error {
 	}
 	s.out = w
 	s.sst = storage.MakeBackupSSTWriter(s.out)
+
 	return nil
 }
 

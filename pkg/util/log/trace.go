@@ -100,15 +100,20 @@ func getSpanOrEventLog(ctx context.Context) (*tracing.Span, *ctxEventLog, bool) 
 	return nil, nil, false
 }
 
-// eventInternal is the common code for logging an event to trace and/or event
-// logs. All entries passed to this method should be redactable.
+// eventInternal is the common code for logging an event to trace and/or
+// event logs. Entries passed to this method may or may not be
+// redactable (via the `logEntry.redactable` flag). However, if
+// sp.Redactable() is true then they will be printed as redactable by
+// `Recordf`. I the entry is not redactable, the entirety of the message
+// will be marked redactable, otherwise fine-grainer redaction will
+// remain in the result.
 func eventInternal(sp *tracing.Span, el *ctxEventLog, isErr bool, entry *logEntry) {
 	if sp != nil {
 		sp.Recordf("%s", entry)
 		// TODO(obs-inf): figure out a way to signal that this is an error. We could
 		// use a different "error" key (provided it shows up in LightStep). Things
 		// like NetTraceIntegrator would need to be modified to understand the
-		// difference. We could also set a special Tag or Baggage on the span. See
+		// difference. We could also set a special Tag on the span. See
 		// #8827 for more discussion.
 		_ = isErr
 		return
@@ -162,7 +167,7 @@ func Event(ctx context.Context, msg string) {
 		severity.INFO, /* unused for trace events */
 		channel.DEV,   /* unused for trace events */
 		1,             /* depth */
-		true,          /* redactable */
+		sp.Redactable(),
 		msg)
 	eventInternal(sp, el, false /* isErr */, &entry)
 }
@@ -182,7 +187,7 @@ func Eventf(ctx context.Context, format string, args ...interface{}) {
 		severity.INFO, /* unused for trace events */
 		channel.DEV,   /* unused for trace events */
 		1,             /* depth */
-		true,          /* redactable */
+		sp.Redactable(),
 		format, args...)
 	eventInternal(sp, el, false /* isErr */, &entry)
 }
@@ -207,7 +212,7 @@ func vEventf(
 			severity.INFO, /* unused for trace events */
 			channel.DEV,   /* unused for trace events */
 			depth+1,
-			true, /* redactable */
+			sp.Redactable(),
 			format, args...)
 		eventInternal(sp, el, isErr, &entry)
 	}

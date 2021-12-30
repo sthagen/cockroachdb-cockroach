@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -167,8 +166,8 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	ambient := s.AmbientCtx
 	// Make a db with a short heartbeat interval.
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
 	tsf := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
@@ -179,6 +178,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 			Stopper:           s.Stopper(),
 		},
 		NewDistSenderForLocalTestCluster(
+			ctx,
 			s.Cfg.Settings, &roachpb.NodeDescriptor{NodeID: 1},
 			ambient.Tracer, s.Clock, s.Latency, s.Stores, s.Stopper(), s.Gossip,
 		),
@@ -289,7 +289,7 @@ func verifyCleanup(key roachpb.Key, eng storage.Engine, t *testing.T, coords ...
 		//lint:ignore SA1019 historical usage of deprecated eng.MVCCGetProto is OK
 		ok, _, _, err := eng.MVCCGetProto(storage.MakeMVCCMetadataKey(key), meta)
 		if err != nil {
-			return fmt.Errorf("error getting MVCC metadata: %s", err)
+			return errors.Wrap(err, "error getting MVCC metadata")
 		}
 		if ok && meta.Txn != nil {
 			return fmt.Errorf("found unexpected write intent: %s", meta)
@@ -770,7 +770,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 				}
 				return reply, pErr
 			}
-			ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+			ambient := log.MakeTestingAmbientCtxWithNewTracer()
 			tsf := NewTxnCoordSenderFactory(
 				TxnCoordSenderFactoryConfig{
 					AmbientCtx: ambient,
@@ -788,6 +788,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 				roachpb.UserPriority(0),
 				now.ToTimestamp(),
 				clock.MaxOffset().Nanoseconds(),
+				0, /* coordinatorNodeID */
 			)
 			// TODO(andrei): I've monkeyed with the priorities on this initial
 			// Transaction to keep the test happy from a previous version in which the
@@ -906,7 +907,7 @@ func TestTxnCoordSenderNoDuplicateLockSpans(t *testing.T) {
 		}
 		return br, nil
 	}
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 
 	factory := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
@@ -1452,7 +1453,7 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 				}
 				return br, nil
 			}
-			ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+			ambient := log.MakeTestingAmbientCtxWithNewTracer()
 			factory := NewTxnCoordSenderFactory(
 				TxnCoordSenderFactoryConfig{
 					AmbientCtx: ambient,
@@ -1529,14 +1530,14 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
 	factory := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
-			AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+			AmbientCtx: log.MakeTestingAmbientCtxWithNewTracer(),
 			Clock:      clock,
 			Stopper:    stopper,
 			Settings:   cluster.MakeTestingClusterSettings(),
@@ -1597,14 +1598,14 @@ func TestOnePCErrorTracking(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
 	factory := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
-			AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+			AmbientCtx: log.MakeTestingAmbientCtxWithNewTracer(),
 			Clock:      clock,
 			Stopper:    stopper,
 			Settings:   cluster.MakeTestingClusterSettings(),
@@ -1682,7 +1683,7 @@ func TestCommitReadOnlyTransaction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -1705,7 +1706,7 @@ func TestCommitReadOnlyTransaction(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "explicit txn", func(t *testing.T, explicitTxn bool) {
 		testutils.RunTrueAndFalse(t, "with get", func(t *testing.T, withGet bool) {
 			calls = nil
-			db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+			db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 			if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				b := txn.NewBatch()
 				if withGet {
@@ -1737,7 +1738,7 @@ func TestCommitMutatingTransaction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -1814,7 +1815,7 @@ func TestCommitMutatingTransaction(t *testing.T) {
 	for i, test := range testArgs {
 		t.Run(test.expMethod.String(), func(t *testing.T) {
 			calls = nil
-			db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+			db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 			if err := db.Txn(ctx, test.f); err != nil {
 				t.Fatalf("%d: unexpected error on commit: %s", i, err)
 			}
@@ -1837,7 +1838,7 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -1857,7 +1858,7 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 		},
 		sender,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		return errors.New("foo")
 	}); err == nil {
@@ -1878,7 +1879,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -1914,7 +1915,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 		},
 		sender,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 	testutils.RunTrueAndFalse(t, "write", func(t *testing.T, write bool) {
 		testutils.RunTrueAndFalse(t, "success", func(t *testing.T, success bool) {
@@ -1962,7 +1963,7 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2006,7 +2007,7 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 		},
 		sender,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		defer func() { attempt++ }()
@@ -2029,7 +2030,7 @@ func TestSequenceNumbers(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2062,7 +2063,7 @@ func TestSequenceNumbers(t *testing.T) {
 		},
 		sender,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 	txn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 	for i := 0; i < 5; i++ {
@@ -2083,7 +2084,7 @@ func TestConcurrentTxnRequestsProhibited(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2140,7 +2141,7 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 	ctx := context.Background()
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2154,7 +2155,7 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 		},
 		sender,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 	curReq := 0
 	requests := []struct {
@@ -2205,7 +2206,7 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	ctx := context.Background()
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2230,7 +2231,7 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 		},
 		sender,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 	// We're going to run two tests: one where the EndTxn is by itself in a
 	// batch, one where it is not. As of June 2018, the EndTxn is elided in
@@ -2291,9 +2292,8 @@ func TestTxnCoordSenderPipelining(t *testing.T) {
 		return distSender.Send(ctx, ba)
 	}
 
-	ambientCtx := log.AmbientContext{Tracer: tracing.NewTracer()}
 	tsf := NewTxnCoordSenderFactory(TxnCoordSenderFactoryConfig{
-		AmbientCtx: ambientCtx,
+		AmbientCtx: s.AmbientCtx,
 		Settings:   s.Cfg.Settings,
 		Clock:      s.Clock,
 		Stopper:    s.Stopper(),
@@ -2301,7 +2301,7 @@ func TestTxnCoordSenderPipelining(t *testing.T) {
 		// track the requests issued by the transactions.
 		HeartbeatInterval: -1,
 	}, senderFn)
-	db := kv.NewDB(ambientCtx, tsf, s.Clock, s.Stopper())
+	db := kv.NewDB(s.AmbientCtx, tsf, s.Clock, s.Stopper())
 
 	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return txn.Put(ctx, "key", "val")
@@ -2350,7 +2350,7 @@ func TestAnchorKey(t *testing.T) {
 	ctx := context.Background()
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
@@ -2380,7 +2380,7 @@ func TestAnchorKey(t *testing.T) {
 		},
 		senderFn,
 	)
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		ba := txn.NewBatch()
@@ -2701,10 +2701,12 @@ func TestTxnManualRefresh(t *testing.T) {
 					_, ok := r.ba.GetArg(roachpb.Refresh)
 					require.True(t, ok)
 					// Rejects the refresh due to a conflicting write.
-					pErr := roachpb.NewErrorf("encountered recently written key")
+					pErr := roachpb.NewError(roachpb.NewRefreshFailedError(
+						roachpb.RefreshFailedError_REASON_COMMITTED_VALUE, roachpb.Key("a"), hlc.Timestamp{WallTime: 1}))
 					r.respCh <- resp{pErr: pErr}
 				}
-				require.Regexp(t, `TransactionRetryError: retry txn \(RETRY_SERIALIZABLE - failed preemptive refresh\)`, <-errCh)
+				require.Regexp(t, "TransactionRetryError: retry txn \\(RETRY_SERIALIZABLE - failed preemptive "+
+					"refresh due to a conflict: committed value on key \"a\"\\)", <-errCh)
 			},
 		},
 	}
@@ -2734,7 +2736,7 @@ func TestTxnManualRefresh(t *testing.T) {
 				return nil, roachpb.NewError(ctx.Err())
 			}
 		}
-		ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+		ambient := log.MakeTestingAmbientCtxWithNewTracer()
 		tsf := NewTxnCoordSenderFactory(
 			TxnCoordSenderFactoryConfig{
 				AmbientCtx:        ambient,

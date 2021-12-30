@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -45,6 +46,8 @@ func (p synthetic) GetVersion() descpb.DescriptorVersion {
 func (p synthetic) GetModificationTime() hlc.Timestamp {
 	return hlc.Timestamp{}
 }
+
+// Deprecated: Do not use.
 func (p synthetic) GetDrainingNames() []descpb.NameInfo {
 	return nil
 }
@@ -78,6 +81,14 @@ func (p synthetic) DescriptorProto() *descpb.Descriptor {
 		"%s schema cannot be encoded", p.kindName())
 	return nil // unreachable
 }
+func (p synthetic) ByteSize() int64 {
+	return 0
+}
+func (p synthetic) NewBuilder() catalog.DescriptorBuilder {
+	log.Fatalf(context.TODO(),
+		"%s schema cannot create a builder", p.kindName())
+	return nil // unreachable
+}
 func (p synthetic) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 	return catalog.DescriptorIDSet{}, nil
 }
@@ -95,4 +106,9 @@ func (p synthetic) SchemaDesc() *descpb.SchemaDescriptor {
 	log.Fatalf(context.TODO(),
 		"synthetic %s cannot be encoded", p.kindName())
 	return nil // unreachable
+}
+
+// GetDefaultPrivilegeDescriptor returns a DefaultPrivilegeDescriptor.
+func (p synthetic) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
+	return catprivilege.MakeDefaultPrivileges(catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_SCHEMA))
 }

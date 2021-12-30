@@ -19,7 +19,11 @@ RUN apt-get update \
     make \
     netbase \
     openjdk-8-jre \
+    openssh-client \
     patchelf \
+    python-is-python3 \
+    python3 \
+    python3.8-venv \
     unzip \
  && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-10 100 \
     --slave /usr/bin/clang++ clang++ /usr/bin/clang++-10 \
@@ -49,15 +53,31 @@ RUN apt-get update && \
     cd .. && \
     rm -rf git-2.29.2.zip git-2.29.2
 
+RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - \
+ && echo 'deb https://packages.cloud.google.com/apt cloud-sdk main' | tee /etc/apt/sources.list.d/gcloud.list \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    google-cloud-sdk
+
 RUN apt-get purge -y \
     apt-transport-https \
     flex \
     gettext \
  && apt-get autoremove -y
 
+# awscli - roachtests
+# NB: we don't use apt-get because we need an up to date version of awscli
+# If you update the below, you should probably also update build/builder/Dockerfile.
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.0.30.zip" -o "awscliv2.zip" && \
+ echo "7ee475f22c1b35cc9e53affbf96a9ffce91706e154a9441d0d39cbf8366b718e  awscliv2.zip" | sha256sum -c - && \
+ unzip awscliv2.zip && \
+ ./aws/install && \
+ rm -rf aws awscliv2.zip
+
 # Install Bazelisk as Bazel.
-# NOTE: you should keep this in sync with build/packer/teamcity-agent.sh -- if
-# an update is necessary here, it's probably necessary in the agent as well.
+# NOTE: you should keep this in sync with build/packer/teamcity-agent.sh and
+# build/bootstrap/bootstrap-debian.sh -- if an update is necessary here, it's probably
+# necessary in the agent as well.
 RUN curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.10.1/bazelisk-linux-amd64 > /tmp/bazelisk \
  && echo '4cb534c52cdd47a6223d4596d530e7c9c785438ab3b0a49ff347e991c210b2cd /tmp/bazelisk' | sha256sum -c - \
  && chmod +x /tmp/bazelisk \

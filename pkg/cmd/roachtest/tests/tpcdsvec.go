@@ -17,8 +17,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/cmpconn"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpcds"
 	"github.com/cockroachdb/errors"
@@ -56,9 +58,9 @@ func registerTPCDSVec(r registry.Registry) {
 
 	runTPCDSVec := func(ctx context.Context, t test.Test, c cluster.Cluster) {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx)
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-		clusterConn := c.Conn(ctx, 1)
+		clusterConn := c.Conn(ctx, t.L(), 1)
 		disableAutoStats(t, clusterConn)
 		t.Status("restoring TPCDS dataset for Scale Factor 1")
 		if _, err := clusterConn.Exec(
@@ -82,7 +84,7 @@ func registerTPCDSVec(r registry.Registry) {
 		// We additionally open fresh connections for each query.
 		setStmtTimeout := fmt.Sprintf("SET statement_timeout='%s';", timeout)
 		firstNode := c.Node(1)
-		urls, err := c.ExternalPGUrl(ctx, firstNode)
+		urls, err := c.ExternalPGUrl(ctx, t.L(), firstNode)
 		if err != nil {
 			t.Fatal(err)
 		}

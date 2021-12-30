@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -39,6 +40,7 @@ import (
 )
 
 var collectTxnStatsSampleRate = settings.RegisterFloatSetting(
+	settings.TenantWritable,
 	"sql.txn_stats.sample_rate",
 	"the probability that a given transaction will collect execution statistics (displayed in the DB Console)",
 	0.01,
@@ -91,9 +93,10 @@ type instrumentationHelper struct {
 	// See EXECUTE .. DISCARD ROWS.
 	discardRows bool
 
-	diagRequestID               stmtdiagnostics.RequestID
-	finishCollectionDiagnostics func()
-	withStatementTrace          func(trace tracing.Recording, stmt string)
+	diagRequestID           stmtdiagnostics.RequestID
+	diagRequest             stmtdiagnostics.Request
+	stmtDiagnosticsRecorder *stmtdiagnostics.Registry
+	withStatementTrace      func(trace tracing.Recording, stmt string)
 
 	sp *tracing.Span
 	// shouldFinishSpan determines whether sp needs to be finished in
@@ -114,6 +117,17 @@ type instrumentationHelper struct {
 
 	// regions used only on EXPLAIN ANALYZE to be displayed as top-level stat.
 	regions []string
+
+	// planGist is a compressed version of plan that can be converted (lossily)
+	// back into a logical plan or be used to get a plan hash.
+	planGist explain.PlanGist
+
+	// costEstimate is the cost of the query as estimated by the optimizer.
+	costEstimate float64
+
+	// indexRecommendations is a string slice containing index recommendations for
+	// the planned statement. This is only set for EXPLAIN statements.
+	indexRecommendations []string
 }
 
 // outputMode indicates how the statement output needs to be populated (for
@@ -166,10 +180,11 @@ func (ih *instrumentationHelper) Setup(
 		ih.discardRows = true
 
 	default:
-		ih.collectBundle, ih.diagRequestID, ih.finishCollectionDiagnostics =
+		ih.collectBundle, ih.diagRequestID, ih.diagRequest =
 			stmtDiagnosticsRecorder.ShouldCollectDiagnostics(ctx, fingerprint)
 	}
 
+	ih.stmtDiagnosticsRecorder = stmtDiagnosticsRecorder
 	ih.withStatementTrace = cfg.TestingKnobs.WithStatementTrace
 
 	ih.savePlanForStats =
@@ -188,7 +203,7 @@ func (ih *instrumentationHelper) Setup(
 			return ctx, ih.collectBundle
 		}
 	} else {
-		if util.CrdbTestBuild {
+		if buildutil.CrdbTestBuild {
 			panic(errors.AssertionFailedf("the context doesn't have a tracing span"))
 		}
 	}
@@ -206,9 +221,11 @@ func (ih *instrumentationHelper) Setup(
 
 	if !ih.collectBundle && ih.withStatementTrace == nil && ih.outputMode == unmodifiedOutput {
 		if ih.collectExecStats {
-			// If we need to collect stats, create a non-verbose child span. Stats
-			// will be added as structured metadata and processed in Finish.
-			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithForceRealSpan())
+			// If we need to collect stats, create a child span with structured
+			// recording. Stats will be added as structured metadata and processed in
+			// Finish.
+			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement",
+				tracing.WithRecording(tracing.RecordingStructured))
 			ih.shouldFinishSpan = true
 			return newCtx, true
 		}
@@ -238,13 +255,15 @@ func (ih *instrumentationHelper) Finish(
 	if ih.sp == nil {
 		return retErr
 	}
-	if ih.shouldFinishSpan {
-		ih.sp.Finish()
-	}
 
 	// Record the statement information that we've collected.
 	// Note that in case of implicit transactions, the trace contains the auto-commit too.
-	trace := ih.sp.GetRecording()
+	var trace tracing.Recording
+	if ih.shouldFinishSpan {
+		trace = ih.sp.FinishAndGetRecording(ih.sp.RecordingType())
+	} else {
+		trace = ih.sp.GetRecording(ih.sp.RecordingType())
+	}
 
 	if ih.withStatementTrace != nil {
 		ih.withStatementTrace(trace, stmtRawSQL)
@@ -267,7 +286,7 @@ func (ih *instrumentationHelper) Finish(
 	queryLevelStats, err := execstats.GetQueryLevelStats(trace, cfg.TestingKnobs.DeterministicExplain, flowsMetadata)
 	if err != nil {
 		const msg = "error getting query level stats for statement: %s: %+v"
-		if util.CrdbTestBuild {
+		if buildutil.CrdbTestBuild {
 			panic(fmt.Sprintf(msg, ih.fingerprint, err))
 		}
 		log.VInfof(ctx, 1, msg, ih.fingerprint, err)
@@ -301,19 +320,22 @@ func (ih *instrumentationHelper) Finish(
 
 	var bundle diagnosticsBundle
 	if ih.collectBundle {
-		ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
-		placeholders := p.extendedEvalCtx.Placeholders
-		ob := ih.emitExplainAnalyzePlanToOutputBuilder(
-			explain.Flags{Verbose: true, ShowTypes: true},
-			statsCollector.PhaseTimes(),
-			&queryLevelStats,
-		)
-		bundle = buildStatementBundle(
-			ih.origCtx, cfg.DB, ie, &p.curPlan, ob.BuildString(), trace, placeholders,
-		)
-		bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID)
-		if ih.finishCollectionDiagnostics != nil {
-			ih.finishCollectionDiagnostics()
+		ie := p.extendedEvalCtx.ExecCfg.InternalExecutor
+		phaseTimes := statsCollector.PhaseTimes()
+		if ih.stmtDiagnosticsRecorder.IsExecLatencyConditionMet(
+			ih.diagRequestID, ih.diagRequest, phaseTimes.GetServiceLatencyNoOverhead(),
+		) {
+			placeholders := p.extendedEvalCtx.Placeholders
+			ob := ih.emitExplainAnalyzePlanToOutputBuilder(
+				explain.Flags{Verbose: true, ShowTypes: true},
+				phaseTimes,
+				&queryLevelStats,
+			)
+			bundle = buildStatementBundle(
+				ih.origCtx, cfg.DB, ie, &p.curPlan, ob.BuildString(), trace, placeholders,
+			)
+			bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID)
+			ih.stmtDiagnosticsRecorder.RemoveOngoing(ih.diagRequestID, ih.diagRequest)
 			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
 		}
 	}
@@ -583,6 +605,8 @@ func (m execNodeTraceMetadata) annotateExplain(
 				nodeStats.SeekCount.MaybeAdd(stats.KV.NumInterfaceSeeks)
 				nodeStats.InternalSeekCount.MaybeAdd(stats.KV.NumInternalSeeks)
 				nodeStats.VectorizedBatchCount.MaybeAdd(stats.Output.NumBatches)
+				nodeStats.MaxAllocatedMem.MaybeAdd(stats.Exec.MaxAllocatedMem)
+				nodeStats.MaxAllocatedDisk.MaybeAdd(stats.Exec.MaxAllocatedDisk)
 			}
 			// If we didn't get statistics for all processors, we don't show the
 			// incomplete results. In the future, we may consider an incomplete flag

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -83,6 +84,9 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 
 	// Check Select permission as well, since existing values must be read.
 	b.checkPrivilege(depName, tab, privilege.SELECT)
+
+	// Check if this table has already been mutated in another subquery.
+	b.checkMultipleMutations(tab, false /* simpleInsert */)
 
 	var mb mutationBuilder
 	mb.init(b, "update", tab, alias)
@@ -190,56 +194,40 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	projectionsScope := mb.outScope.replace()
 	projectionsScope.appendColumnsFromScope(mb.outScope)
 
-	checkCol := func(sourceCol *scopeColumn, targetColID opt.ColumnID) {
-		// Type check the input expression against the corresponding table column.
+	addCol := func(expr tree.Expr, targetColID opt.ColumnID) {
 		ord := mb.tabID.ColumnOrdinal(targetColID)
 		targetCol := mb.tab.Column(ord)
-		checkDatumTypeFitsColumnType(targetCol, sourceCol.typ)
-
-		for _, expr := range exprs {
-			// Compatibility check the input expression against the corresponding
-			// table column.
-			if len(expr.Names) == 1 && expr.Names[0] == targetCol.ColName() {
-				checkUpdateExpression(targetCol, expr)
-			}
-		}
-
-		// Add source column ID to the list of columns to update.
-		mb.updateColIDs[ord] = sourceCol.id
-	}
-
-	addCol := func(expr tree.Expr, targetColID opt.ColumnID) {
-		// If the expression is already a scopeColumn, we can skip creating a
-		// new scopeColumn and proceed with type checking and adding the column
-		// to the list of source columns to update. The expression can be a
-		// scopeColumn when addUpdateCols is called from the
-		// onUpdateCascadeBuilder while building foreign key cascading updates.
-		//
-		// The input scopeColumn is a pointer to a column in mb.outScope. It was
-		// copied by value to projectionsScope. The checkCol function mutates
-		// the name of projected columns, so we must lookup the column in
-		// projectionsScope so that the correct scopeColumn is renamed.
-		if scopeCol, ok := expr.(*scopeColumn); ok {
-			checkCol(projectionsScope.getColumn(scopeCol.id), targetColID)
-			return
-		}
 
 		// Allow right side of SET to be DEFAULT.
 		if _, ok := expr.(tree.DefaultVal); ok {
 			expr = mb.parseDefaultExpr(targetColID)
+		} else {
+			// GENERATED ALWAYS AS IDENTITY columns are not allowed to be
+			// explicitly written to.
+			//
+			// TODO(janexing): Implement the OVERRIDING SYSTEM VALUE syntax for
+			// INSERT which allows a GENERATED ALWAYS AS IDENTITY column to be
+			// overwritten.
+			// See https://github.com/cockroachdb/cockroach/issues/68201.
+			if targetCol.IsGeneratedAlwaysAsIdentity() {
+				panic(sqlerrors.NewGeneratedAlwaysAsIdentityColumnUpdateError(string(targetCol.ColName())))
+			}
 		}
 
 		// Add new column to the projections scope.
-		targetColMeta := mb.md.ColumnMeta(targetColID)
-		desiredType := targetColMeta.Type
-		texpr := inScope.resolveType(expr, desiredType)
-		colName := scopeColName(tree.Name(targetColMeta.Alias)).WithMetadataName(
-			targetColMeta.Alias + "_new",
-		)
+		// TODO(mgartner): Perform an assignment cast if necessary.
+		texpr := inScope.resolveType(expr, targetCol.DatumType())
+		targetColName := targetCol.ColName()
+		colName := scopeColName(targetColName).WithMetadataName(string(targetColName) + "_new")
 		scopeCol := projectionsScope.addColumn(colName, texpr)
 		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, nil)
 
-		checkCol(scopeCol, targetColID)
+		// Type check the input expression against the corresponding table
+		// column.
+		checkDatumTypeFitsColumnType(targetCol, scopeCol.typ)
+
+		// Add the column ID to the list of columns to update.
+		mb.updateColIDs[ord] = scopeCol.id
 	}
 
 	n := 0
@@ -254,9 +242,15 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 				// Type check and rename columns.
 				for i := range subqueryScope.cols {
-					checkCol(&subqueryScope.cols[i], mb.targetColList[n])
 					ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
+					targetCol := mb.tab.Column(ord)
 					subqueryScope.cols[i].name = scopeColName(mb.tab.Column(ord).ColName())
+					// Type check the input expression against the corresponding table
+					// column.
+					checkDatumTypeFitsColumnType(targetCol, subqueryScope.cols[i].typ)
+
+					// Add the column ID to the list of columns to update.
+					mb.updateColIDs[ord] = subqueryScope.cols[i].id
 					n++
 				}
 

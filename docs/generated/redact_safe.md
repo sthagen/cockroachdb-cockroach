@@ -3,6 +3,7 @@ The following types are considered always safe for reporting:
 File | Type
 --|--
 pkg/base/node_id.go | `*NodeIDContainer`
+pkg/base/node_id.go | `*SQLIDContainer`
 pkg/base/node_id.go | `*StoreIDContainer`
 pkg/cli/exit/exit.go | `Code`
 pkg/jobs/jobspb/wrap.go | `JobID`
@@ -21,6 +22,7 @@ pkg/roachpb/metadata.go | `ReplicaID`
 pkg/roachpb/metadata.go | `ReplicaType`
 pkg/roachpb/metadata.go | `StoreID`
 pkg/roachpb/method.go | `Method`
+pkg/roachpb/tenant.go | `TenantID`
 pkg/rpc/connection_class.go | `ConnectionClass`
 pkg/sql/catalog/descpb/structured.go | `ColumnID`
 pkg/sql/catalog/descpb/structured.go | `ConstraintType`
@@ -41,6 +43,7 @@ pkg/storage/enginepb/mvcc.go | `TxnEpoch`
 pkg/storage/enginepb/mvcc.go | `TxnSeq`
 pkg/storage/enginepb/mvcc3.go | `*MVCCStats`
 pkg/storage/enginepb/mvcc3.go | `MVCCStatsDelta`
+pkg/streaming/api.go | `StreamID`
 pkg/util/hlc/timestamp.go | `ClockTimestamp`
 pkg/util/hlc/timestamp.go | `LegacyTimestamp`
 pkg/util/hlc/timestamp.go | `Timestamp`

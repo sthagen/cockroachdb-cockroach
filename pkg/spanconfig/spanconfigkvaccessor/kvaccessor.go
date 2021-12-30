@@ -19,12 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -32,44 +33,45 @@ import (
 // KVAccessor provides read/write access to all the span configurations for a
 // CRDB cluster. It's a concrete implementation of the KVAccessor interface.
 type KVAccessor struct {
-	db        *kv.DB
-	ie        sqlutil.InternalExecutor
-	settings  *cluster.Settings
-	tableName string // typically system.span_configurations, but overridable for testing purposes
+	db *kv.DB
+	ie sqlutil.InternalExecutor
+	// optionalTxn captures the transaction we're scoped to; it's allowed to be
+	// nil. If nil, it's unsafe to use multiple times as part of the same
+	// request with any expectation of transactionality -- we're responsible for
+	// opening a fresh txn.
+	optionalTxn *kv.Txn
+	settings    *cluster.Settings
+
+	// configurationsTableFQN is typically 'system.public.span_configurations',
+	// but left configurable ease-of-testing.
+	configurationsTableFQN string
 }
 
 var _ spanconfig.KVAccessor = &KVAccessor{}
 
-// New constructs a new Manager.
+// New constructs a new KVAccessor.
 func New(
-	db *kv.DB, ie sqlutil.InternalExecutor, settings *cluster.Settings, tableFQN string,
+	db *kv.DB, ie sqlutil.InternalExecutor, settings *cluster.Settings, configurationsTableFQN string,
 ) *KVAccessor {
-	return &KVAccessor{
-		db:        db,
-		ie:        ie,
-		settings:  settings,
-		tableName: tableFQN,
+	if _, err := parser.ParseQualifiedTableName(configurationsTableFQN); err != nil {
+		panic(fmt.Sprintf("unabled to parse configurations table FQN: %s", configurationsTableFQN))
 	}
+
+	return newKVAccessor(db, ie, settings, configurationsTableFQN, nil /* optionalTxn */)
 }
 
-// enabledSetting gates usage of the KVAccessor. It has no effect unless
-// COCKROACH_EXPERIMENTAL_SPAN_CONFIGS is also set.
-var enabledSetting = settings.RegisterBoolSetting(
-	"spanconfig.experimental_kvaccessor.enabled",
-	"enable the use of the kv accessor", false).WithSystemOnly()
-
-// errDisabled is returned if the setting gating usage of the KVAccessor is
-// disabled.
-var errDisabled = errors.New("span config kv accessor disabled")
+// WithTxn is part of the KVAccessor interface.
+func (k *KVAccessor) WithTxn(ctx context.Context, txn *kv.Txn) spanconfig.KVAccessor {
+	if k.optionalTxn != nil {
+		log.Fatalf(ctx, "KVAccessor already scoped to txn (was .WithTxn(...) chained multiple times?)")
+	}
+	return newKVAccessor(k.db, k.ie, k.settings, k.configurationsTableFQN, txn)
+}
 
 // GetSpanConfigEntriesFor is part of the KVAccessor interface.
 func (k *KVAccessor) GetSpanConfigEntriesFor(
 	ctx context.Context, spans []roachpb.Span,
 ) (resp []roachpb.SpanConfigEntry, retErr error) {
-	if !enabledSetting.Get(&k.settings.SV) {
-		return nil, errDisabled
-	}
-
 	if len(spans) == 0 {
 		return resp, nil
 	}
@@ -78,7 +80,7 @@ func (k *KVAccessor) GetSpanConfigEntriesFor(
 	}
 
 	getStmt, getQueryArgs := k.constructGetStmtAndArgs(spans)
-	it, err := k.ie.QueryIteratorEx(ctx, "get-span-cfgs", nil,
+	it, err := k.ie.QueryIteratorEx(ctx, "get-span-cfgs", k.optionalTxn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		getStmt, getQueryArgs...,
 	)
@@ -118,8 +120,36 @@ func (k *KVAccessor) GetSpanConfigEntriesFor(
 func (k *KVAccessor) UpdateSpanConfigEntries(
 	ctx context.Context, toDelete []roachpb.Span, toUpsert []roachpb.SpanConfigEntry,
 ) error {
-	if !enabledSetting.Get(&k.settings.SV) {
-		return errDisabled
+	if k.optionalTxn != nil {
+		return k.updateSpanConfigEntriesWithTxn(ctx, toDelete, toUpsert, k.optionalTxn)
+	}
+
+	return k.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		return k.updateSpanConfigEntriesWithTxn(ctx, toDelete, toUpsert, txn)
+	})
+}
+
+func newKVAccessor(
+	db *kv.DB,
+	ie sqlutil.InternalExecutor,
+	settings *cluster.Settings,
+	configurationsTableFQN string,
+	optionalTxn *kv.Txn,
+) *KVAccessor {
+	return &KVAccessor{
+		db:                     db,
+		ie:                     ie,
+		optionalTxn:            optionalTxn,
+		settings:               settings,
+		configurationsTableFQN: configurationsTableFQN,
+	}
+}
+
+func (k *KVAccessor) updateSpanConfigEntriesWithTxn(
+	ctx context.Context, toDelete []roachpb.Span, toUpsert []roachpb.SpanConfigEntry, txn *kv.Txn,
+) error {
+	if txn == nil {
+		log.Fatalf(ctx, "expected non-nil txn")
 	}
 
 	if err := validateUpdateArgs(toDelete, toUpsert); err != nil {
@@ -144,47 +174,42 @@ func (k *KVAccessor) UpdateSpanConfigEntries(
 		validationStmt, validationQueryArgs = k.constructValidationStmtAndArgs(toUpsert)
 	}
 
-	if err := k.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if len(toDelete) > 0 {
-			n, err := k.ie.ExecEx(ctx, "delete-span-cfgs", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-				deleteStmt, deleteQueryArgs...,
-			)
-			if err != nil {
-				return err
-			}
-			if n != len(toDelete) {
-				return errors.AssertionFailedf("expected to delete %d row(s), deleted %d", len(toDelete), n)
-			}
-		}
-
-		if len(toUpsert) == 0 {
-			// Nothing left to do
-			return nil
-		}
-
-		if n, err := k.ie.ExecEx(ctx, "upsert-span-cfgs", txn,
+	if len(toDelete) > 0 {
+		n, err := k.ie.ExecEx(ctx, "delete-span-cfgs", txn,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			upsertStmt, upsertQueryArgs...,
-		); err != nil {
+			deleteStmt, deleteQueryArgs...,
+		)
+		if err != nil {
 			return err
-		} else if n != len(toUpsert) {
-			return errors.AssertionFailedf("expected to upsert %d row(s), upserted %d", len(toUpsert), n)
 		}
-
-		if datums, err := k.ie.QueryRowEx(ctx, "validate-span-cfgs", txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			validationStmt, validationQueryArgs...,
-		); err != nil {
-			return err
-		} else if valid := bool(tree.MustBeDBool(datums[0])); !valid {
-			return errors.AssertionFailedf("expected to find single row containing upserted spans")
+		if n != len(toDelete) {
+			return errors.AssertionFailedf("expected to delete %d row(s), deleted %d", len(toDelete), n)
 		}
-
-		return nil
-	}); err != nil {
-		return err
 	}
+
+	if len(toUpsert) == 0 {
+		// Nothing left to do
+		return nil
+	}
+
+	if n, err := k.ie.ExecEx(ctx, "upsert-span-cfgs", txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		upsertStmt, upsertQueryArgs...,
+	); err != nil {
+		return err
+	} else if n != len(toUpsert) {
+		return errors.AssertionFailedf("expected to upsert %d row(s), upserted %d", len(toUpsert), n)
+	}
+
+	if datums, err := k.ie.QueryRowEx(ctx, "validate-span-cfgs", txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		validationStmt, validationQueryArgs...,
+	); err != nil {
+		return err
+	} else if valid := bool(tree.MustBeDBool(datums[0])); !valid {
+		return errors.AssertionFailedf("expected to find single row containing upserted spans")
+	}
+
 	return nil
 }
 
@@ -248,9 +273,9 @@ SELECT start_key, end_key, config FROM (
   WHERE start_key < $%[2]d ORDER BY start_key DESC LIMIT 1
 ) WHERE end_key > $%[2]d
 `,
-			k.tableName,   // [1]
-			startKeyIdx+1, // [2] -- prepared statement placeholder (1-indexed)
-			endKeyIdx+1,   // [3] -- prepared statement placeholder (1-indexed)
+			k.configurationsTableFQN, // [1]
+			startKeyIdx+1,            // [2] -- prepared statement placeholder (1-indexed)
+			endKeyIdx+1,              // [3] -- prepared statement placeholder (1-indexed)
 		)
 	}
 	return getStmtBuilder.String(), queryArgs
@@ -275,7 +300,7 @@ func (k *KVAccessor) constructDeleteStmtAndArgs(toDelete []roachpb.Span) (string
 			startKeyIdx+1, endKeyIdx+1) // prepared statement placeholders (1-indexed)
 	}
 	deleteStmt := fmt.Sprintf(`DELETE FROM %[1]s WHERE (start_key, end_key) IN (VALUES %[2]s)`,
-		k.tableName, strings.Join(values, ", "))
+		k.configurationsTableFQN, strings.Join(values, ", "))
 	return deleteStmt, deleteQueryArgs
 }
 
@@ -306,7 +331,7 @@ func (k *KVAccessor) constructUpsertStmtAndArgs(
 			startKeyIdx+1, endKeyIdx+1, configIdx+1) // prepared statement placeholders (1-indexed)
 	}
 	upsertStmt := fmt.Sprintf(`UPSERT INTO %[1]s (start_key, end_key, config) VALUES %[2]s`,
-		k.tableName, strings.Join(upsertValues, ", "))
+		k.configurationsTableFQN, strings.Join(upsertValues, ", "))
 	return upsertStmt, upsertQueryArgs, nil
 }
 
@@ -369,9 +394,9 @@ SELECT count(*) = 1 FROM (
   ) WHERE end_key > $%[2]d
 )
 `,
-			k.tableName,   // [1]
-			startKeyIdx+1, // [2] -- prepared statement placeholder (1-indexed)
-			endKeyIdx+1,   // [3] -- prepared statement placeholder (1-indexed)
+			k.configurationsTableFQN, // [1]
+			startKeyIdx+1,            // [2] -- prepared statement placeholder (1-indexed)
+			endKeyIdx+1,              // [3] -- prepared statement placeholder (1-indexed)
 		)
 	}
 	validationStmt := fmt.Sprintf("SELECT true = ALL(%s)", validationInnerStmtBuilder.String())

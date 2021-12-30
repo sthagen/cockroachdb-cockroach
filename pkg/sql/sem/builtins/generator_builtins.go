@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/arith"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -34,8 +33,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
-	pbtypes "github.com/gogo/protobuf/types"
 )
 
 // See the comments at the start of generators.go for details about
@@ -366,7 +365,7 @@ var generators = map[string]builtinDefinition{
 			},
 			payloadsForSpanGeneratorType,
 			makePayloadsForSpanGenerator,
-			"Returns the payload(s) of the requested span.",
+			"Returns the payload(s) of the requested span and all its children.",
 			tree.VolatilityVolatile,
 		),
 	),
@@ -382,6 +381,22 @@ var generators = map[string]builtinDefinition{
 			payloadsForTraceGeneratorType,
 			makePayloadsForTraceGenerator,
 			"Returns the payload(s) of the requested trace.",
+			tree.VolatilityVolatile,
+		),
+	),
+	"crdb_internal.show_create_all_schemas": makeBuiltin(
+		tree.FunctionProperties{
+			Class: tree.GeneratorClass,
+		},
+		makeGeneratorOverload(
+			tree.ArgTypes{
+				{"database_name", types.String},
+			},
+			showCreateAllSchemasGeneratorType,
+			makeShowCreateAllSchemasGenerator,
+			`Returns rows of CREATE schema statements. 
+The output can be used to recreate a database.'
+`,
 			tree.VolatilityVolatile,
 		),
 	),
@@ -406,7 +421,7 @@ The output can be used to recreate a database.'
 			tree.VolatilityVolatile,
 		),
 	),
-	"crdb_internal.show_create_all_schemas": makeBuiltin(
+	"crdb_internal.show_create_all_types": makeBuiltin(
 		tree.FunctionProperties{
 			Class: tree.GeneratorClass,
 		},
@@ -414,14 +429,73 @@ The output can be used to recreate a database.'
 			tree.ArgTypes{
 				{"database_name", types.String},
 			},
-			showCreateAllSchemasGeneratorType,
-			makeShowCreateAllSchemasGenerator,
-			`Returns rows of CREATE schema statements. 
+			showCreateAllTypesGeneratorType,
+			makeShowCreateAllTypesGenerator,
+			`Returns rows of CREATE type statements. 
 The output can be used to recreate a database.'
 `,
 			tree.VolatilityVolatile,
 		),
 	),
+	"crdb_internal.decode_plan_gist": makeBuiltin(
+		tree.FunctionProperties{
+			Class: tree.GeneratorClass,
+		},
+		makeGeneratorOverload(
+			tree.ArgTypes{
+				{"gist", types.String},
+			},
+			decodePlanGistGeneratorType,
+			makeDecodePlanGistGenerator,
+			`Returns rows of output similar to EXPLAIN from a gist created by EXPLAIN (GIST)
+`,
+			tree.VolatilityVolatile,
+		),
+	),
+}
+
+var decodePlanGistGeneratorType = types.String
+
+type gistPlanGenerator struct {
+	gist  string
+	index int
+	rows  []string
+	p     tree.EvalPlanner
+}
+
+var _ tree.ValueGenerator = &gistPlanGenerator{}
+
+func (g *gistPlanGenerator) ResolvedType() *types.T {
+	return types.String
+}
+
+func (g *gistPlanGenerator) Start(_ context.Context, _ *kv.Txn) error {
+	rows, err := g.p.DecodeGist(g.gist)
+	if err != nil {
+		return err
+	}
+	g.rows = rows
+	g.index = -1
+	return nil
+}
+
+func (g *gistPlanGenerator) Next(context.Context) (bool, error) {
+	g.index++
+	return g.index < len(g.rows), nil
+}
+
+func (g *gistPlanGenerator) Close(context.Context) {}
+
+// Values implements the tree.ValueGenerator interface.
+func (g *gistPlanGenerator) Values() (tree.Datums, error) {
+	return tree.Datums{tree.NewDString(g.rows[g.index])}, nil
+}
+
+func makeDecodePlanGistGenerator(
+	ctx *tree.EvalContext, args tree.Datums,
+) (tree.ValueGenerator, error) {
+	gist := string(tree.MustBeDString(args[0]))
+	return &gistPlanGenerator{gist: gist, p: ctx.Planner}, nil
 }
 
 func makeGeneratorOverload(
@@ -431,6 +505,10 @@ func makeGeneratorOverload(
 }
 
 var unsuitableUseOfGeneratorFn = func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
+	return nil, errors.AssertionFailedf("generator functions cannot be evaluated as scalars")
+}
+
+var unsuitableUseOfGeneratorFnWithExprs = func(_ *tree.EvalContext, _ tree.Exprs) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("generator functions cannot be evaluated as scalars")
 }
 
@@ -1437,6 +1515,9 @@ func (j *jsonPopulateRecordSetGenerator) Values() (tree.Datums, error) {
 	if err != nil {
 		return nil, err
 	}
+	if obj.Type() != json.ObjectJSONType {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "argument of json_populate_recordset must be an array of objects")
+	}
 	output := tree.NewDTupleWithLen(j.input.ResolvedType(), j.input.D.Len())
 	for i := range j.input.D {
 		output.D[i] = j.input.D[i]
@@ -1687,18 +1768,13 @@ var payloadsForSpanGeneratorType = types.MakeLabeledTuple(
 )
 
 // payloadsForSpanGenerator is a value generator that iterates over all payloads
-// over all recordings for a given Span.
+// in a Span's recording. The recording includes the span's children.
 type payloadsForSpanGenerator struct {
 	// The span to iterate over.
-	span *tracing.Span
+	span tracing.RegistrySpan
 
-	// recordingIndex maintains the current position of the index of the iterator
-	// in the list of recordings surfaced by a given span. The payloads of the
-	// recording that this iterator points to are buffered in `payloads`
-	recordingIndex int
-
-	// payloads represents all payloads for a given recording currently accessed
-	// by the iterator, and accesses more in a streaming fashion.
+	// payloads represents all of span's structured records. It's set at Start()
+	// time.
 	payloads []json.JSON
 
 	// payloadIndex maintains the current position of the index of the iterator
@@ -1720,9 +1796,9 @@ func makePayloadsForSpanGenerator(
 			"only users with the admin role are allowed to use crdb_internal.payloads_for_span",
 		)
 	}
-	spanID := uint64(*(args[0].(*tree.DInt)))
-	span, found := ctx.Tracer.GetActiveSpanFromID(spanID)
-	if !found {
+	spanID := tracingpb.SpanID(*(args[0].(*tree.DInt)))
+	span := ctx.Tracer.GetActiveSpanByID(spanID)
+	if span == nil {
 		return nil, nil
 	}
 
@@ -1738,8 +1814,21 @@ func (p *payloadsForSpanGenerator) ResolvedType() *types.T {
 func (p *payloadsForSpanGenerator) Start(_ context.Context, _ *kv.Txn) error {
 	// The user of the generator first calls Next(), then Values(), so the index
 	// managing the iterator's position needs to start at -1 instead of 0.
-	p.recordingIndex = -1
 	p.payloadIndex = -1
+
+	rec := p.span.GetFullRecording(tracing.RecordingStructured)
+	if rec == nil {
+		// No structured records.
+		return nil
+	}
+	p.payloads = make([]json.JSON, len(rec[0].StructuredRecords))
+	for i, sr := range rec[0].StructuredRecords {
+		var err error
+		p.payloads[i], err = protoreflect.MessageToJSON(sr.Payload, protoreflect.FmtFlags{EmitDefaults: true})
+		if err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -1747,39 +1836,7 @@ func (p *payloadsForSpanGenerator) Start(_ context.Context, _ *kv.Txn) error {
 // Next implements the tree.ValueGenerator interface.
 func (p *payloadsForSpanGenerator) Next(_ context.Context) (bool, error) {
 	p.payloadIndex++
-
-	// If payloadIndex is within payloads and there are some payloads, then we
-	// have more buffered payloads to return.
-	if p.payloads != nil && p.payloadIndex < len(p.payloads) {
-		return true, nil
-	}
-
-	// Otherwise either there are no payloads or we have exhausted the payloads in
-	// our current recording, and we need to access another set of payloads from
-	// another recording.
-	p.payloads = nil
-
-	// Keep searching recordings for one with a valid (non-nil) payload.
-	for p.payloads == nil {
-		p.recordingIndex++
-		// If there are no more recordings, then we cannot continue.
-		if !(p.recordingIndex < p.span.GetRecording().Len()) {
-			return false, nil
-		}
-		currRecording := p.span.GetRecording()[p.recordingIndex]
-		currRecording.Structured(func(item *pbtypes.Any, _ time.Time) {
-			payload, err := protoreflect.MessageToJSON(item, protoreflect.FmtFlags{EmitDefaults: true})
-			if err != nil {
-				return
-			}
-			if payload != nil {
-				p.payloads = append(p.payloads, payload)
-			}
-		})
-	}
-
-	p.payloadIndex = 0
-	return true, nil
+	return p.payloadIndex < len(p.payloads), nil
 }
 
 // Values implements the tree.ValueGenerator interface.
@@ -1823,7 +1880,7 @@ var payloadsForTraceGeneratorType = types.MakeLabeledTuple(
 type payloadsForTraceGenerator struct {
 	// Iterator over all internal rows of a query that retrieves all payloads
 	// of a trace.
-	it sqlutil.InternalRows
+	it tree.InternalRows
 }
 
 func makePayloadsForTraceGenerator(
@@ -1849,8 +1906,7 @@ func makePayloadsForTraceGenerator(
 									) SELECT * 
 										FROM spans, LATERAL crdb_internal.payloads_for_span(spans.span_id)`
 
-	ie := ctx.InternalExecutor.(sqlutil.InternalExecutor)
-	it, err := ie.QueryIteratorEx(
+	it, err := ctx.Planner.QueryIteratorEx(
 		ctx.Ctx(),
 		"crdb_internal.payloads_for_trace",
 		ctx.Txn,
@@ -1894,8 +1950,9 @@ func (p *payloadsForTraceGenerator) Close(_ context.Context) {
 	}
 }
 
-var showCreateAllTablesGeneratorType = types.String
 var showCreateAllSchemasGeneratorType = types.String
+var showCreateAllTypesGeneratorType = types.String
+var showCreateAllTablesGeneratorType = types.String
 
 // Phase is used to determine if CREATE statements or ALTER statements
 // are being generated for showCreateAllTables.
@@ -1910,11 +1967,11 @@ const (
 // showCreateAllSchemasGenerator supports the execution of
 // crdb_internal.show_create_all_schemas(dbName).
 type showCreateAllSchemasGenerator struct {
-	ie     sqlutil.InternalExecutor
-	txn    *kv.Txn
-	ids    []int64
-	dbName string
-	acc    mon.BoundAccount
+	evalPlanner tree.EvalPlanner
+	txn         *kv.Txn
+	ids         []int64
+	dbName      string
+	acc         mon.BoundAccount
 
 	// The following variables are updated during
 	// calls to Next() and change throughout the lifecycle of
@@ -1931,7 +1988,7 @@ func (s *showCreateAllSchemasGenerator) ResolvedType() *types.T {
 // Start implements the tree.ValueGenerator interface.
 func (s *showCreateAllSchemasGenerator) Start(ctx context.Context, txn *kv.Txn) error {
 	ids, err := getSchemaIDs(
-		ctx, s.ie, txn, s.dbName, &s.acc,
+		ctx, s.evalPlanner, txn, s.dbName, &s.acc,
 	)
 	if err != nil {
 		return err
@@ -1951,7 +2008,7 @@ func (s *showCreateAllSchemasGenerator) Next(ctx context.Context) (bool, error) 
 	}
 
 	createStmt, err := getSchemaCreateStatement(
-		ctx, s.ie, s.txn, s.ids[s.idx], s.dbName,
+		ctx, s.evalPlanner, s.txn, s.ids[s.idx], s.dbName,
 	)
 	if err != nil {
 		return false, err
@@ -1981,20 +2038,21 @@ func makeShowCreateAllSchemasGenerator(
 ) (tree.ValueGenerator, error) {
 	dbName := string(tree.MustBeDString(args[0]))
 	return &showCreateAllSchemasGenerator{
-		dbName: dbName,
-		ie:     ctx.InternalExecutor.(sqlutil.InternalExecutor),
-		acc:    ctx.Mon.MakeBoundAccount(),
+		evalPlanner: ctx.Planner,
+		dbName:      dbName,
+		acc:         ctx.Mon.MakeBoundAccount(),
 	}, nil
 }
 
 // showCreateAllTablesGenerator supports the execution of
 // crdb_internal.show_create_all_tables(dbName).
 type showCreateAllTablesGenerator struct {
-	ie     sqlutil.InternalExecutor
-	txn    *kv.Txn
-	ids    []int64
-	dbName string
-	acc    mon.BoundAccount
+	evalPlanner tree.EvalPlanner
+	txn         *kv.Txn
+	ids         []int64
+	dbName      string
+	acc         mon.BoundAccount
+	sessionData *sessiondata.SessionData
 
 	// The following variables are updated during
 	// calls to Next() and change throughout the lifecycle of
@@ -2026,7 +2084,7 @@ func (s *showCreateAllTablesGenerator) Start(ctx context.Context, txn *kv.Txn) e
 	// We also account for the memory in the BoundAccount memory monitor in
 	// showCreateAllTablesGenerator.
 	ids, err := getTopologicallySortedTableIDs(
-		ctx, s.ie, txn, s.dbName, &s.acc,
+		ctx, s.evalPlanner, txn, s.dbName, &s.acc,
 	)
 	if err != nil {
 		return err
@@ -2052,7 +2110,7 @@ func (s *showCreateAllTablesGenerator) Next(ctx context.Context) (bool, error) {
 		}
 
 		createStmt, err := getCreateStatement(
-			ctx, s.ie, s.txn, s.ids[s.idx], s.dbName,
+			ctx, s.evalPlanner, s.txn, s.ids[s.idx], s.dbName,
 		)
 		if err != nil {
 			return false, err
@@ -2098,7 +2156,7 @@ func (s *showCreateAllTablesGenerator) Next(ctx context.Context) (bool, error) {
 			statementReturnType = alterValidateFKStatements
 		}
 		alterStmt, err := getAlterStatements(
-			ctx, s.ie, s.txn, s.ids[s.idx], s.dbName, statementReturnType,
+			ctx, s.evalPlanner, s.txn, s.ids[s.idx], s.dbName, statementReturnType,
 		)
 		if err != nil {
 			return false, err
@@ -2136,8 +2194,89 @@ func makeShowCreateAllTablesGenerator(
 ) (tree.ValueGenerator, error) {
 	dbName := string(tree.MustBeDString(args[0]))
 	return &showCreateAllTablesGenerator{
-		dbName: dbName,
-		ie:     ctx.InternalExecutor.(sqlutil.InternalExecutor),
-		acc:    ctx.Mon.MakeBoundAccount(),
+		evalPlanner: ctx.Planner,
+		dbName:      dbName,
+		acc:         ctx.Mon.MakeBoundAccount(),
+		sessionData: ctx.SessionData(),
+	}, nil
+}
+
+// showCreateAllTypesGenerator supports the execution of
+// crdb_internal.show_create_all_types(dbName).
+type showCreateAllTypesGenerator struct {
+	evalPlanner tree.EvalPlanner
+	txn         *kv.Txn
+	ids         []int64
+	dbName      string
+	acc         mon.BoundAccount
+
+	// The following variables are updated during
+	// calls to Next() and change throughout the lifecycle of
+	// showCreateAllTypesGenerator.
+	curr tree.Datum
+	idx  int
+}
+
+// ResolvedType implements the tree.ValueGenerator interface.
+func (s *showCreateAllTypesGenerator) ResolvedType() *types.T {
+	return showCreateAllTypesGeneratorType
+}
+
+// Start implements the tree.ValueGenerator interface.
+func (s *showCreateAllTypesGenerator) Start(ctx context.Context, txn *kv.Txn) error {
+	ids, err := getTypeIDs(
+		ctx, s.evalPlanner, txn, s.dbName, &s.acc,
+	)
+	if err != nil {
+		return err
+	}
+
+	s.ids = ids
+
+	s.txn = txn
+	s.idx = -1
+	return nil
+}
+
+func (s *showCreateAllTypesGenerator) Next(ctx context.Context) (bool, error) {
+	s.idx++
+	if s.idx >= len(s.ids) {
+		return false, nil
+	}
+
+	createStmt, err := getTypeCreateStatement(
+		ctx, s.evalPlanner, s.txn, s.ids[s.idx], s.dbName,
+	)
+	if err != nil {
+		return false, err
+	}
+	createStmtStr := string(tree.MustBeDString(createStmt))
+	s.curr = tree.NewDString(createStmtStr + ";")
+
+	return true, nil
+}
+
+// Values implements the tree.ValueGenerator interface.
+func (s *showCreateAllTypesGenerator) Values() (tree.Datums, error) {
+	return tree.Datums{s.curr}, nil
+}
+
+// Close implements the tree.ValueGenerator interface.
+func (s *showCreateAllTypesGenerator) Close(ctx context.Context) {
+	s.acc.Close(ctx)
+}
+
+// makeShowCreateAllTypesGenerator creates a generator to support the
+// crdb_internal.show_create_all_types(dbName) builtin.
+// We use the timestamp of when the generator is created as the
+// timestamp to pass to AS OF SYSTEM TIME for looking up the create type
+func makeShowCreateAllTypesGenerator(
+	ctx *tree.EvalContext, args tree.Datums,
+) (tree.ValueGenerator, error) {
+	dbName := string(tree.MustBeDString(args[0]))
+	return &showCreateAllTypesGenerator{
+		evalPlanner: ctx.Planner,
+		dbName:      dbName,
+		acc:         ctx.Mon.MakeBoundAccount(),
 	}, nil
 }

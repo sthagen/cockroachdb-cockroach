@@ -15,10 +15,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -57,11 +57,19 @@ type StoreTestingKnobs struct {
 	// reproposed due to ticks.
 	TestingProposalSubmitFilter func(*ProposalData) (drop bool, err error)
 
-	// TestingApplyFilter is called before applying the results of a
-	// command on each replica. If it returns an error, the command will
-	// not be applied. If it returns an error on some replicas but not
-	// others, the behavior is poorly defined.
+	// TestingApplyFilter is called before applying the results of a command on
+	// each replica assuming the command was cleared for application (i.e. no
+	// forced error occurred; the supplied AppliedFilterArgs will have a nil
+	// ForcedError field). If this function returns an error, it is treated as
+	// a forced error and the command will not be applied. If it returns an error
+	// on some replicas but not others, the behavior is poorly defined. The
+	// returned int is interpreted as a proposalReevaluationReason.
 	TestingApplyFilter kvserverbase.ReplicaApplyFilter
+	// TestingApplyForcedErrFilter is like TestingApplyFilter, but it is only
+	// invoked when there is a pre-existing forced error. The returned int and
+	// *Error replace the existing proposalReevaluationReason (if initially zero
+	// only) and forced error.
+	TestingApplyForcedErrFilter kvserverbase.ReplicaApplyFilter
 
 	// TestingPostApplyFilter is called after a command is applied to
 	// rocksdb but before in-memory side effects have been processed.
@@ -328,9 +336,9 @@ type StoreTestingKnobs struct {
 	// PurgeOutdatedReplicasInterceptor intercepts attempts to purge outdated
 	// replicas in the store.
 	PurgeOutdatedReplicasInterceptor func()
-	// If set, use the given truncated state type when bootstrapping ranges.
-	// This is used for testing the truncated state migration.
-	TruncatedStateTypeOverride *stateloader.TruncatedStateType
+	// SpanConfigUpdateInterceptor is called after the store hears about a span
+	// config update.
+	SpanConfigUpdateInterceptor func(spanconfig.Update)
 	// If set, use the given version as the initial replica version when
 	// bootstrapping ranges. This is used for testing the migration
 	// infrastructure.

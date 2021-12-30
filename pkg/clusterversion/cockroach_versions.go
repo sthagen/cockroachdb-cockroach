@@ -104,7 +104,9 @@ type Key int
 // When introducing a version constant, you'll want to:
 //   (1) Add it at the end of this block. For versions introduced during and
 //       after the 21.1 release, Internal versions must be even-numbered. The
-//       odd versions are used for internal book-keeping.
+//       odd versions are used for internal book-keeping. The Internal version
+//       should be the previous Internal version for the same minor release plus
+//       two.
 //   (2) Add it at the end of the `versionsSingleton` block below.
 //
 // Migrations
@@ -156,36 +158,10 @@ const (
 
 	// v21.1 versions.
 	//
-	// replacedTruncatedAndRangeAppliedStateMigration stands in for
-	// TruncatedAndRangeAppliedStateMigration which was	re-introduced after the
-	// migration job was introduced. This is necessary because the jobs
-	// infrastructure used to run this migration in v21.1 and its later alphas
-	// was introduced after this version was first introduced. Later code in the
-	// release relies on the job to run the migration but the job relies on
-	// its startup migrations having been run. Versions associated with long
-	// running migrations must follow deletedLongRunningMigrations.
-	replacedTruncatedAndRangeAppliedStateMigration
-	// replacedPostTruncatedAndRangeAppliedStateMigration is like the above
-	// version. See its comment.
-	replacedPostTruncatedAndRangeAppliedStateMigration
-	// TruncatedAndRangeAppliedStateMigration is part of the migration to stop
-	// using the legacy truncated state within KV. After the migration, we'll be
-	// using the unreplicated truncated state and the RangeAppliedState on all
-	// ranges. Callers that wish to assert on there no longer being any legacy
-	// will be able to do so after PostTruncatedAndRangeAppliedStateMigration is
-	// active. This lets remove any holdover code handling the possibility of
-	// replicated truncated state in 21.2.
-	//
-	// TODO(irfansharif): Do the above in 21.2.
-	TruncatedAndRangeAppliedStateMigration
-	// PostTruncatedAndRangeAppliedStateMigration is used to purge all replicas
-	// using the replicated legacy TruncatedState. It's also used in asserting
-	// that no replicated truncated state representation is found.
-	PostTruncatedAndRangeAppliedStateMigration
 	// V21_1 is CockroachDB v21.1. It's used for all v21.1.x patch releases.
 	//
-	// TODO(irfansharif): This can be removed as part of #69828 (bumping the min
-	// cluster version).
+	// TODO(irfansharif): This can be removed as part of #71708 (bump
+	// min-supported version to 21.2).
 	V21_1
 
 	// v21.1PLUS release. This is a special v21.1.x release with extra changes,
@@ -239,12 +215,6 @@ const (
 	// AutoSpanConfigReconciliationJob adds the AutoSpanConfigReconciliationJob
 	// type.
 	AutoSpanConfigReconciliationJob
-	// PreventNewInterleavedTables interleaved table creation is completely
-	// blocked on this version.
-	PreventNewInterleavedTables
-	// EnsureNoInterleavedTables interleaved tables no longer exist in
-	// this version.
-	EnsureNoInterleavedTables
 	// DefaultPrivileges default privileges are supported in this version.
 	DefaultPrivileges
 	// ZonesTableForSecondaryTenants adds system.zones for all secondary tenants.
@@ -292,6 +262,73 @@ const (
 	// V21_2 is CockroachDB v21.2. It's used for all v21.2.x patch releases.
 	V21_2
 
+	// v22.1 versions.
+	//
+	// Start22_1 demarcates work towards CockroachDB v22.1.
+	Start22_1
+
+	// TargetBytesAvoidExcess prevents exceeding BatchRequest.Header.TargetBytes
+	// except when there is a single value in the response. 21.2 DistSender logic
+	// requires the limit to always be overshot in order to properly enforce
+	// limits when splitting requests.
+	TargetBytesAvoidExcess
+	// AvoidDrainingNames avoids using the draining_names field when renaming or
+	// dropping descriptors.
+	AvoidDrainingNames
+	// DrainingNamesMigration adds the migration which guarantees that no
+	// descriptors have draining names.
+	DrainingNamesMigration
+	// TraceIDDoesntImplyStructuredRecording changes the contract about the kind
+	// of span that RPCs get on the server depending on the tracing context.
+	TraceIDDoesntImplyStructuredRecording
+	// AlterSystemTableStatisticsAddAvgSizeCol adds the column avgSize to the
+	// table system.table_statistics that contains a new statistic.
+	AlterSystemTableStatisticsAddAvgSizeCol
+	// AlterSystemStmtDiagReqs adds the migration for
+	// system.statement_diagnostics_requests table to support collecting stmt
+	// bundles when the query latency exceeds the user provided threshold.
+	AlterSystemStmtDiagReqs
+	// MVCCAddSSTable supports MVCC-compliant AddSSTable requests via the new
+	// WriteAtRequestTimestamp and DisallowConflicts parameters.
+	MVCCAddSSTable
+	// InsertPublicSchemaNamespaceEntryOnRestore ensures all public schemas
+	// have an entry in system.namespace upon being restored.
+	InsertPublicSchemaNamespaceEntryOnRestore
+	// UnsplitRangesInAsyncGCJobs moves ranges unsplitting from transaction of
+	// "drop table"/"truncate table" to async gc jobs
+	UnsplitRangesInAsyncGCJobs
+	// ValidateGrantOption checks whether the current user granting privileges to
+	// another user holds the grant option for those privileges
+	ValidateGrantOption
+	// PebbleFormatBlockPropertyCollector switches to a backwards incompatible
+	// Pebble version that provides block property collectors that can be used
+	// for fine-grained time bound iteration. See
+	// https://github.com/cockroachdb/pebble/issues/1190 for details.
+	PebbleFormatBlockPropertyCollector
+	// ProbeRequest is the version at which roachpb.ProbeRequest was introduced.
+	// This version must be active before any ProbeRequest is issued on the
+	// cluster.
+	ProbeRequest
+	// SelectRPCsTakeTracingInfoInband switches the way tracing works for a couple
+	// of common RPCs. Tracing information for these select RPCs is no longer
+	// marshaled from the client to the server as gRPC metadata, and the gRPC
+	// server interceptor is no longer in charge of transparently creating server
+	// spans. Instead, trace information is carried by the respective request
+	// protos (the client is responsible for filling it in explicitly), and the
+	// server-side handler is responsible for opening a span manually.
+	SelectRPCsTakeTracingInfoInband
+	// PreSeedTenantSpanConfigs precedes SeedTenantSpanConfigs, and enables the
+	// creation of initial span config records for newly created tenants.
+	PreSeedTenantSpanConfigs
+	// SeedTenantSpanConfigs populates system.span_configurations with seed
+	// data for secondary tenants. This state is what ensures that we always
+	// split on tenant boundaries when using the span configs infrastructure.
+	// This version comes with a migration to populate the same seed data
+	// for existing tenants.
+	SeedTenantSpanConfigs
+	// Public schema is backed by a descriptor.
+	PublicSchemasWithDescriptors
+
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -317,22 +354,6 @@ const (
 // to be added (i.e., when cutting the final release candidate).
 var versionsSingleton = keyedVersions{
 	// v21.1 versions.
-	{
-		Key:     replacedTruncatedAndRangeAppliedStateMigration,
-		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 14},
-	},
-	{
-		Key:     replacedPostTruncatedAndRangeAppliedStateMigration,
-		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 16},
-	},
-	{
-		Key:     TruncatedAndRangeAppliedStateMigration,
-		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 22},
-	},
-	{
-		Key:     PostTruncatedAndRangeAppliedStateMigration,
-		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 24},
-	},
 	{
 		// V21_1 is CockroachDB v21.1. It's used for all v21.1.x patch releases.
 		Key:     V21_1,
@@ -422,14 +443,6 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 1136},
 	},
 	{
-		Key:     PreventNewInterleavedTables,
-		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 1138},
-	},
-	{
-		Key:     EnsureNoInterleavedTables,
-		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 1140},
-	},
-	{
 		Key:     DefaultPrivileges,
 		Version: roachpb.Version{Major: 21, Minor: 1, Internal: 1142},
 	},
@@ -494,6 +507,77 @@ var versionsSingleton = keyedVersions{
 		Key:     V21_2,
 		Version: roachpb.Version{Major: 21, Minor: 2},
 	},
+
+	// v22.1 versions. Internal versions must be even.
+	{
+		Key:     Start22_1,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 2},
+	},
+	{
+		Key:     TargetBytesAvoidExcess,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 4},
+	},
+	{
+		Key:     AvoidDrainingNames,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 6},
+	},
+	{
+		Key:     DrainingNamesMigration,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 8},
+	},
+	{
+		Key:     TraceIDDoesntImplyStructuredRecording,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 10},
+	},
+	{
+		Key:     AlterSystemTableStatisticsAddAvgSizeCol,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 12},
+	},
+	{
+		Key:     AlterSystemStmtDiagReqs,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 14},
+	},
+	{
+		Key:     MVCCAddSSTable,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 16},
+	},
+	{
+		Key:     InsertPublicSchemaNamespaceEntryOnRestore,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 18},
+	},
+	{
+		Key:     UnsplitRangesInAsyncGCJobs,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 20},
+	},
+	{
+		Key:     ValidateGrantOption,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 22},
+	},
+	{
+		Key:     PebbleFormatBlockPropertyCollector,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 24},
+	},
+	{
+		Key:     ProbeRequest,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 26},
+	},
+	{
+		Key:     SelectRPCsTakeTracingInfoInband,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 28},
+	},
+	{
+		Key:     PreSeedTenantSpanConfigs,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 30},
+	},
+	{
+		Key:     SeedTenantSpanConfigs,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 32},
+	},
+	{
+		Key:     PublicSchemasWithDescriptors,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 34},
+	},
+
 	// *************************************************
 	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -516,6 +600,15 @@ var (
 	// This is the version that a new cluster will use when created.
 	binaryVersion = versionsSingleton[len(versionsSingleton)-1].Version
 )
+
+func init() {
+	const isReleaseBranch = false
+	if isReleaseBranch {
+		if binaryVersion != ByKey(V21_2) {
+			panic("unexpected cluster version greater than release's binary version")
+		}
+	}
+}
 
 // ByKey returns the roachpb.Version for a given key.
 // It is a fatal error to use an invalid key.

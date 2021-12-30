@@ -111,6 +111,8 @@ func TestPGWireDrainClient(t *testing.T) {
 	// Ensure server is in draining mode and rejects new connections.
 	testutils.SucceedsSoon(t, func() error {
 		if err := trivialQuery(pgBaseURL); !testutils.IsError(err, pgwire.ErrDrainingNewConn) {
+			// NB: errors.Wrapf(nil, ...) returns nil.
+			// nolint:errwrap
 			return errors.Errorf("unexpected error: %v", err)
 		}
 		return nil
@@ -129,7 +131,7 @@ func TestPGWireDrainClient(t *testing.T) {
 		}
 	}
 
-	if !s.(*server.TestServer).PGServer().IsDraining() {
+	if !s.(*server.TestServer).PGServer().(*pgwire.Server).IsDraining() {
 		t.Fatal("server should be draining, but is not")
 	}
 }
@@ -162,7 +164,7 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 	}
 	defer db.Close()
 
-	pgServer := s.(*server.TestServer).PGServer()
+	pgServer := s.(*server.TestServer).PGServer().(*pgwire.Server)
 
 	// Make sure that the server reports correctly the case in which a
 	// connection did not respond to cancellation in time.
@@ -199,6 +201,8 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 		// connection registers the cancellation and closes itself.
 		testutils.SucceedsSoon(t, func() error {
 			if _, err := txn.Exec("SELECT 1"); !errors.Is(err, driver.ErrBadConn) {
+				// NB: errors.Wrapf(nil, ...) returns nil.
+				// nolint:errwrap
 				return errors.Errorf("unexpected error: %v", err)
 			}
 			return nil
@@ -572,13 +576,15 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SHOW TIME ZONE", []preparedQueryTest{
 			baseTest.Results("UTC"),
 		}},
-		{"CREATE USER IF NOT EXISTS $1 WITH PASSWORD $2", []preparedQueryTest{
-			baseTest.SetArgs("abc", "def"),
-			baseTest.SetArgs("woo", "waa"),
+		{"CREATE USER IF NOT EXISTS abc WITH PASSWORD $1", []preparedQueryTest{
+			baseTest.SetArgs("def"),
 		}},
-		{"ALTER USER IF EXISTS $1 WITH PASSWORD $2", []preparedQueryTest{
-			baseTest.SetArgs("abc", "def"),
-			baseTest.SetArgs("woo", "waa"),
+		{"CREATE USER IF NOT EXISTS woo WITH PASSWORD $1", []preparedQueryTest{
+			baseTest.SetArgs("waa"),
+		}},
+		{"ALTER USER IF EXISTS foo WITH PASSWORD $1", []preparedQueryTest{
+			baseTest.SetArgs("def"),
+			baseTest.SetArgs("waa"),
 		}},
 		{"SHOW USERS", []preparedQueryTest{
 			baseTest.Results("abc", "", "{}").
@@ -586,9 +592,8 @@ func TestPGPreparedQuery(t *testing.T) {
 				Results("root", "", "{admin}").
 				Results("woo", "", "{}"),
 		}},
-		{"DROP USER $1", []preparedQueryTest{
-			baseTest.SetArgs("abc"),
-			baseTest.SetArgs("woo"),
+		{"DROP USER abc, woo", []preparedQueryTest{
+			baseTest.SetArgs(),
 		}},
 		{"SELECT (SELECT 1+$1)", []preparedQueryTest{
 			baseTest.SetArgs(1).Results(2),
@@ -767,6 +772,9 @@ func TestPGPreparedQuery(t *testing.T) {
 		}},
 		{"SELECT $1::TIMETZ", []preparedQueryTest{
 			baseTest.SetArgs("12:00:00+0330").Results("0000-01-01T12:00:00+03:30"),
+		}},
+		{"SELECT $1::VOID", []preparedQueryTest{
+			baseTest.SetArgs("this will not be the result").Results(""),
 		}},
 		{"SELECT $1::BOX2D", []preparedQueryTest{
 			baseTest.SetArgs("BOX(1 2,3 4)").Results("BOX(1 2,3 4)"),
@@ -1692,7 +1700,11 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 	//
 	// macOS has a tendency to produce very long temporary directory names, so
 	// we are careful to keep all the constants involved short.
-	tempDir, err := ioutil.TempDir("", "PGSQL")
+	baseTmpDir := ""
+	if runtime.GOOS == "darwin" || strings.Contains(runtime.GOOS, "bsd") {
+		baseTmpDir = "/tmp"
+	}
+	tempDir, err := ioutil.TempDir(baseTmpDir, "PGSQL")
 	if err != nil {
 		t.Fatal(err)
 	}

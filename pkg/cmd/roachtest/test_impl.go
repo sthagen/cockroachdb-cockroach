@@ -21,8 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -188,7 +188,7 @@ func (t *testImpl) GetStatus() string {
 	defer t.mu.Unlock()
 	status, ok := t.mu.status[t.runnerID]
 	if ok {
-		return fmt.Sprintf("%s (set %s ago)", status.msg, timeutil.Now().Sub(status.time).Round(time.Second))
+		return fmt.Sprintf("%s (set %s ago)", status.msg, timeutil.Since(status.time).Round(time.Second))
 	}
 	return "N/A"
 }
@@ -213,7 +213,7 @@ func (t *testImpl) progress(id int64, frac float64) {
 }
 
 // Progress sets the progress (a fraction in the range [0,1]) associated with
-// the main test status messasge. When called from the main test goroutine
+// the main test status message. When called from the main test goroutine
 // (i.e. the goroutine on which TestSpec.Run is invoked), this is equivalent to
 // calling WorkerProgress.
 func (t *testImpl) Progress(frac float64) {
@@ -221,7 +221,7 @@ func (t *testImpl) Progress(frac float64) {
 }
 
 // WorkerProgress sets the progress (a fraction in the range [0,1]) associated
-// with the a worker status messasge.
+// with the a worker status message.
 func (t *testImpl) WorkerProgress(frac float64) {
 	t.progress(goid.Get(), frac)
 }
@@ -482,6 +482,10 @@ type loggingOpt struct {
 	// artifactsDir is that path to the dir that will contain the artifacts for
 	// all the tests.
 	artifactsDir string
+	// path to the literal on-agent directory where artifacts are stored. May
+	// be different from artifactsDir since the roachtest may be running in
+	// a container.
+	literalArtifactsDir string
 	// runnerLogPath is that path to the runner's log file.
 	runnerLogPath string
 }

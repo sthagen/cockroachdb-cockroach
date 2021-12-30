@@ -13,6 +13,7 @@ package sql_test
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -230,7 +231,7 @@ INSERT INTO t.test VALUES (1), (2), (3);
 		`CREATE TABLE public.test (
 	x INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	CONSTRAINT test_pkey PRIMARY KEY (rowid ASC),
 	FAMILY "primary" (x, rowid)
 )`}}
 
@@ -244,7 +245,7 @@ INSERT INTO t.test VALUES (1), (2), (3);
 		`CREATE TABLE public.test (
 	x STRING NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	CONSTRAINT test_pkey PRIMARY KEY (rowid ASC),
 	FAMILY "primary" (x, rowid)
 )`}}
 
@@ -332,7 +333,7 @@ func TestSchemaChangeBeforeAlterColumnType(t *testing.T) {
 			},
 		},
 	}
-
+	defer close(waitBeforeContinuing)
 	s, db, _ := serverutils.StartServer(t, params)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	defer s.Stopper().Stop(ctx)
@@ -353,7 +354,8 @@ ALTER TABLE t.test ALTER PRIMARY KEY USING COLUMNS (x);
 
 	<-swapNotification
 
-	expected := "pq: unimplemented: table test is currently undergoing a schema change"
+	expected := "pq: unimplemented: ALTER COLUMN TYPE requiring rewrite of on-disk data is currently not " +
+		"supported for columns that are part of an index"
 	sqlDB.ExpectErr(t, expected, `
 SET enable_experimental_alter_column_type_general = true;
 ALTER TABLE t.test ALTER COLUMN y TYPE STRING;`)
@@ -392,6 +394,8 @@ CREATE DATABASE t;
 CREATE TABLE t.test (x INT);
 `)
 
+	tableID := sqlutils.QueryTableID(t, db, "t", "public", "test")
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -404,7 +408,7 @@ ALTER TABLE t.test ALTER COLUMN x TYPE STRING;
 
 	<-childJobStartNotification
 
-	expected := `pq: relation "test" \(53\): unimplemented: cannot perform a schema change operation while an ALTER COLUMN TYPE schema change is in progress`
+	expected := fmt.Sprintf(`pq: relation "test" \(%d\): unimplemented: cannot perform a schema change operation while an ALTER COLUMN TYPE schema change is in progress`, tableID)
 	sqlDB.ExpectErr(t, expected, `
 ALTER TABLE t.test ADD COLUMN y INT;
 	`)

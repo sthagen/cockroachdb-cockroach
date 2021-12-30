@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -59,7 +60,8 @@ type restoreDataProcessor struct {
 	// 1) reading entries from the input
 	// 2) ingesting the data associated with those entries in the concurrent
 	// restore data workers.
-	phaseGroup ctxgroup.Group
+	phaseGroup           ctxgroup.Group
+	cancelWorkersAndWait func()
 
 	// sstCh is a channel that holds SSTs opened by the processor, but not yet
 	// ingested.
@@ -92,6 +94,7 @@ var defaultNumWorkers = util.ConstantWithMetamorphicTestRange(
 // The maximum is not enforced since if the maximum is reduced in the future that
 // may cause the cluster setting to fail.
 var numRestoreWorkers = settings.RegisterIntSetting(
+	settings.TenantWritable,
 	"kv.bulk_io_write.restore_node_concurrency",
 	fmt.Sprintf("the number of workers processing a restore per job per node; maximum %d",
 		maxConcurrentRestoreWorkers),
@@ -144,6 +147,11 @@ func (rd *restoreDataProcessor) Start(ctx context.Context) {
 	ctx = rd.StartInternal(ctx, restoreDataProcName)
 	rd.input.Start(ctx)
 
+	ctx, cancel := context.WithCancel(ctx)
+	rd.cancelWorkersAndWait = func() {
+		cancel()
+		_ = rd.phaseGroup.Wait()
+	}
 	rd.phaseGroup = ctxgroup.WithContext(ctx)
 
 	entries := make(chan execinfrapb.RestoreSpanEntry, rd.numWorkers)
@@ -369,8 +377,16 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 	iter := sst.iter
 	defer sst.cleanup()
 
+	// "disallowing" shadowing of anything older than logical=1 is i.e. allow all
+	// shadowing. We must allow shadowing in case the RESTORE has to retry any
+	// ingestions, but setting a (permissive) disallow like this serves to force
+	// evaluation of AddSSTable to check for overlapping keys. That in turn will
+	// result in it maintaining exact MVCC stats rather than estimates. Of course
+	// this comes at the cost of said overlap check, but in the common case of
+	// non-overlapping ingestion into empty spans, that is just one seek.
+	disallowShadowingBelow := hlc.Timestamp{Logical: 1}
 	batcher, err := bulk.MakeSSTBatcher(ctx, db, evalCtx.Settings,
-		func() int64 { return rd.flushBytes })
+		func() int64 { return rd.flushBytes }, disallowShadowingBelow)
 	if err != nil {
 		return summary, err
 	}
@@ -414,7 +430,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		value := roachpb.Value{RawBytes: valueScratch}
 		iter.NextKey()
 
-		key.Key, ok, err = rd.kr.RewriteKey(key.Key, false /* isFromSpan */)
+		key.Key, ok, err = rd.kr.RewriteKey(key.Key)
 		if err != nil {
 			return summary, err
 		}
@@ -496,17 +512,17 @@ func (rd *restoreDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Produce
 
 // ConsumerClosed is part of the RowSource interface.
 func (rd *restoreDataProcessor) ConsumerClosed() {
-	if rd.InternalClose() {
-		if rd.metaCh != nil {
-			close(rd.metaCh)
-		}
-		if rd.sstCh != nil {
-			// Cleanup all the remaining open SSTs that have not been consumed.
-			for sst := range rd.sstCh {
-				sst.cleanup()
-			}
+	if rd.Closed {
+		return
+	}
+	rd.cancelWorkersAndWait()
+	if rd.sstCh != nil {
+		// Cleanup all the remaining open SSTs that have not been consumed.
+		for sst := range rd.sstCh {
+			sst.cleanup()
 		}
 	}
+	rd.InternalClose()
 }
 
 func init() {

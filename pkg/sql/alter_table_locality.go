@@ -71,7 +71,7 @@ func (p *planner) AlterTableLocality(
 		p.txn,
 		tableDesc.GetParentID(),
 		tree.DatabaseLookupFlags{
-			AvoidCached: true,
+			AvoidLeased: true,
 			Required:    true,
 		},
 	)
@@ -235,10 +235,6 @@ func (n *alterTableSetLocalityNode) alterTableLocalityToRegionalByRow(
 		// Otherwise, signal that we have to omit the implicit partitioning columns
 		// when modifying the primary key.
 		primaryIndexColIdxStart = int(n.tableDesc.PrimaryIndex.Partitioning.NumImplicitColumns)
-	}
-
-	if n.tableDesc.IsInterleaved() {
-		return interleaveOnRegionalByRowError()
 	}
 
 	for _, idx := range n.tableDesc.AllIndexes() {

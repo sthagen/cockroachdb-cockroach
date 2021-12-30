@@ -35,7 +35,11 @@ import (
 )
 
 func descForTable(
-	ctx context.Context, t *testing.T, create string, parent, id descpb.ID, fks fkHandler,
+	ctx context.Context,
+	t *testing.T,
+	create string,
+	parent, parentSchemaID, id descpb.ID,
+	fks fkHandler,
 ) *tabledesc.Mutable {
 	t.Helper()
 	parsed, err := parser.Parse(create)
@@ -53,13 +57,13 @@ func descForTable(
 		name := parsed[0].AST.(*tree.CreateSequence).Name.String()
 
 		ts := hlc.Timestamp{WallTime: nanos}
-		priv := descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName())
+		priv := descpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
 		desc, err := sql.NewSequenceTableDesc(
 			ctx,
 			name,
 			tree.SequenceOptions{},
 			parent,
-			keys.PublicSchemaID,
+			keys.PublicSchemaIDForBackup,
 			id-1,
 			ts,
 			priv,
@@ -75,7 +79,7 @@ func descForTable(
 		stmt = parsed[0].AST.(*tree.CreateTable)
 	}
 	semaCtx := tree.MakeSemaContext()
-	table, err := MakeTestingSimpleTableDescriptor(context.Background(), &semaCtx, settings, stmt, parent, keys.PublicSchemaID, id, fks, nanos)
+	table, err := MakeTestingSimpleTableDescriptor(context.Background(), &semaCtx, settings, stmt, parent, parentSchemaID, id, fks, nanos)
 	if err != nil {
 		t.Fatalf("could not interpret %q: %v", create, err)
 	}

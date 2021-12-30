@@ -56,6 +56,8 @@ func (noopSyncCloser) Close() error {
 // are typically only ever iterated in their entirety.
 func MakeBackupSSTWriter(f io.Writer) SSTWriter {
 	opts := DefaultPebbleOptions().MakeWriterOptions(0)
+	// Don't need BlockPropertyCollectors for backups.
+	opts.BlockPropertyCollectors = nil
 	opts.TableFormat = sstable.TableFormatRocksDBv2
 
 	// Disable bloom filters since we only ever iterate backups.
@@ -75,6 +77,10 @@ func MakeBackupSSTWriter(f io.Writer) SSTWriter {
 // format set to RocksDBv2.
 func MakeIngestionSSTWriter(f writeCloseSyncer) SSTWriter {
 	opts := DefaultPebbleOptions().MakeWriterOptions(0)
+	// TODO(sumeer): we should use BlockPropertyCollectors here if the cluster
+	// version permits (which is also reflected in the store's roachpb.Version
+	// and pebble.FormatMajorVersion).
+	opts.BlockPropertyCollectors = nil
 	opts.TableFormat = sstable.TableFormatRocksDBv2
 	opts.MergerName = "nullptr"
 	sst := sstable.NewWriter(f, opts)
@@ -157,14 +163,9 @@ func (fw *SSTWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 // (according to the comparator configured during writer creation). `Close`
 // cannot have been called.
 func (fw *SSTWriter) PutIntent(
-	ctx context.Context,
-	key roachpb.Key,
-	value []byte,
-	state PrecedingIntentState,
-	txnDidNotUpdateMeta bool,
-	txnUUID uuid.UUID,
-) (int, error) {
-	return 0, fw.put(MVCCKey{Key: key}, value)
+	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
+) error {
+	return fw.put(MVCCKey{Key: key}, value)
 }
 
 // PutEngineKey implements the Writer interface.
@@ -221,8 +222,8 @@ func (fw *SSTWriter) ClearUnversioned(key roachpb.Key) error {
 // the comparator configured during writer creation). `Close` cannot have been
 // called.
 func (fw *SSTWriter) ClearIntent(
-	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) (int, error) {
+	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) error {
 	panic("ClearIntent is unsupported")
 }
 
@@ -237,11 +238,6 @@ func (fw *SSTWriter) ClearEngineKey(key EngineKey) error {
 	fw.scratch = key.EncodeToBuf(fw.scratch[:0])
 	fw.DataSize += int64(len(key.Key))
 	return fw.fw.Delete(fw.scratch)
-}
-
-// OverrideTxnDidNotUpdateMetaToFalse implements the Writer interface.
-func (fw *SSTWriter) OverrideTxnDidNotUpdateMetaToFalse(ctx context.Context) bool {
-	panic("OverrideTxnDidNotUpdateMetaToFalse is unsupported")
 }
 
 // An error is returned if it is not greater than any previous point key
@@ -310,6 +306,15 @@ type MemFile struct {
 
 // Close implements the writeCloseSyncer interface.
 func (*MemFile) Close() error {
+	return nil
+}
+
+// Flush implements the same interface as the standard library's *bufio.Writer's
+// Flush method. The Pebble sstable Writer tests whether files implement a Flush
+// method. If not, it wraps the file with a bufio.Writer to buffer writes to the
+// underlying file. This buffering is not necessary for an in-memory file. We
+// signal this by implementing Flush as a noop.
+func (*MemFile) Flush() error {
 	return nil
 }
 

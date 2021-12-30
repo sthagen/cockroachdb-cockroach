@@ -25,12 +25,12 @@ import (
 //
 // registry should never be mutated after creation (except in tests), as it is
 // read concurrently by different callers.
-var registry = make(map[string]extendedSetting)
+var registry = make(map[string]internalSetting)
 
 // TestingSaveRegistry can be used in tests to save/restore the current
 // contents of the registry.
 func TestingSaveRegistry() func() {
-	var origRegistry = make(map[string]extendedSetting)
+	var origRegistry = make(map[string]internalSetting)
 	for k, v := range registry {
 		origRegistry[k] = v
 	}
@@ -103,16 +103,21 @@ var retiredSettings = map[string]struct{}{
 	"kv.closed_timestamp.close_fraction":                             {},
 	"sql.telemetry.query_sampling.qps_threshold":                     {},
 	"sql.telemetry.query_sampling.sample_rate":                       {},
+	"diagnostics.sql_stat_reset.interval":                            {},
+	"changefeed.mem.pushback_enabled":                                {},
 
 	// removed as of 22.1.
-	"sql.defaults.drop_enum_value.enabled": {},
-	"trace.lightstep.token":                {},
-	"trace.datadog.agent":                  {},
-	"trace.datadog.project":                {},
+	"sql.defaults.drop_enum_value.enabled":                             {},
+	"trace.lightstep.token":                                            {},
+	"trace.datadog.agent":                                              {},
+	"trace.datadog.project":                                            {},
+	"sql.defaults.interleaved_tables.enabled":                          {},
+	"sql.defaults.copy_partitioning_when_deinterleaving_table.enabled": {},
+	"server.declined_reservation_timeout":                              {},
 }
 
 // register adds a setting to the registry.
-func register(key, desc string, s extendedSetting) {
+func register(class Class, key, desc string, s internalSetting) {
 	if _, ok := retiredSettings[key]; ok {
 		panic(fmt.Sprintf("cannot reuse previously defined setting name: %s", key))
 	}
@@ -137,9 +142,9 @@ func register(key, desc string, s extendedSetting) {
 			))
 		}
 	}
-	s.setDescription(desc)
 	registry[key] = s
-	s.setSlotIdx(len(registry))
+	slotIdx := len(registry)
+	s.init(class, slotIdx, key, desc)
 }
 
 // NumRegisteredSettings returns the number of registered settings.

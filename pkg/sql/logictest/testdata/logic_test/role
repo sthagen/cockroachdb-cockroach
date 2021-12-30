@@ -478,6 +478,12 @@ REVOKE ADMIN OPTION FOR admin FROM unknownuser
 statement error pq: role/user unknownrole does not exist
 REVOKE ADMIN OPTION FOR unknownrole FROM root
 
+statement error pgcode 42939 CURRENT_USER cannot be used as a role name here
+CREATE ROLE CURRENT_USER
+
+statement error pgcode 42939 SESSION_USER cannot be used as a role name here
+CREATE ROLE SESSION_USER
+
 statement ok
 CREATE ROLE rolea
 
@@ -664,13 +670,20 @@ user root
 statement ok
 REVOKE admin FROM newgroup
 
+statement ok
+CREATE SCHEMA db2.s1;
+
 user testuser
 
 statement error user testuser does not have SELECT privilege on relation role_members
 SELECT * FROM system.role_members
 
-statement error user testuser does not have CREATE privilege on database db2
+# This doesn't error because testuser has CREATE privilege on db2.public.
+statement ok
 CREATE TABLE db2.foo (k int);
+
+statement error pq: user testuser does not have CREATE privilege on schema s1
+CREATE TABLE db2.s1.foo (k int);
 
 user root
 
@@ -692,10 +705,8 @@ SHOW GRANTS ON DATABASE db2
 database_name  grantee   privilege_type
 db2            admin     ALL
 db2            newgroup  ALL
+db2            public    CONNECT
 db2            root      ALL
-
-statement ok
-CREATE TABLE db2.foo (k int);
 
 statement ok
 INSERT INTO db2.foo VALUES (1),(2),(3);
@@ -785,7 +796,7 @@ statement error role name "public" is reserved
 CREATE ROLE public
 
 statement error role name "none" is reserved
-CREATE ROLE none
+CREATE ROLE "none"
 
 statement error role name "pg_otan" is reserved
 CREATE ROLE pg_otan
@@ -793,10 +804,13 @@ CREATE ROLE pg_otan
 statement error role name "crdb_internal_otan" is reserved
 CREATE ROLE crdb_internal_otan
 
-statement error cannot drop role/user public: grants still exist on system.public.comments
+statement error "foo☂": username is invalid
+CREATE ROLE foo☂
+
+statement error role name "public" is reserved
 DROP USER public
 
-statement error cannot drop role/user public: grants still exist on system.public.comments
+statement error role name "public" is reserved
 DROP ROLE public
 
 statement error role/user public does not exist
@@ -1095,14 +1109,15 @@ role_name  member  is_admin
 statement error role name "public" is reserved
 CREATE USER public
 
-statement error cannot drop role/user public: grants still exist on system.public.comments
+statement error role name "public" is reserved
 DROP USER public
 
 statement ok
-CREATE DATABASE publicdb;
+CREATE DATABASE publicdb
 
 statement ok
 CREATE DATABASE privatedb;
+REVOKE CONNECT ON DATABASE privatedb FROM public
 
 statement ok
 CREATE TABLE publicdb.publictable (k int)
@@ -1130,12 +1145,17 @@ user testuser
 query TTTTT
 SHOW DATABASES
 ----
-publicdb  root  NULL  {}  NULL
+db2        root  NULL  {}  NULL
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+publicdb   root  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
 query TTTTIT
 SHOW TABLES FROM publicdb
 ----
-public  publictable  table  root  0  NULL
+public  privatetable  table  root  0  NULL
+public  publictable   table  root  0  NULL
 
 query TTTTIT
 SHOW TABLES FROM privatedb
@@ -1183,6 +1203,8 @@ INSERT INTO publicdb.publictable VALUES (1)
 query TTTTIT
 SHOW TABLES FROM publicdb
 ----
+public  privatetable  table  root  0  NULL
+public  publictable   table  root  0  NULL
 
 # Test that non-admin users cannot drop admins.
 user root
@@ -1388,3 +1410,52 @@ user testuser
 # because of a missing ADMIN power, not because of a missing CREATEROLE option.
 statement error only users with the admin role are allowed to ALTER ROLE admin
 ALTER ROLE other_admin NOCREATEDB
+
+subtest pw_hashes
+
+user root
+
+let $bcrypt_pw
+SELECT 'CRDB-BCRYPT$'||'2a$'||'10$'||'vcmoIBvgeHjgScVHWRMWI.Z3v03WMixAw2bBS6qZihljSUuwi88Yq'
+
+statement ok
+CREATE USER hash1 WITH PASSWORD '$bcrypt_pw'
+
+# We don't plan to support md5 ever.
+statement error pgcode 0A000 hash scheme "md5" is not supported
+CREATE USER hash2 WITH PASSWORD 'md5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+
+let $scram_pw
+SELECT 'SCRAM-SHA-256$'||'4096:B5VaTCvCLDzZxSYL829oVA==$'||'3Ako3mNxNtdsaSOJl0Av3i6vyV2OiSP9Ly7famdFSbw=:d7BfSmrtjwbF74mSoOhQiDSpoIvlakXKdpBNb3Meunc='
+
+# Refers to https://github.com/cockroachdb/cockroach/issues/42519
+statement error pgcode 0A000 hash scheme "scram-sha-256" is not supported
+CREATE USER hash3 WITH PASSWORD '$scram_pw'
+
+
+statement ok
+SET CLUSTER SETTING server.user_login.store_client_pre_hashed_passwords.enabled = false
+
+# Password hash not recognized: hash considered as password input.
+statement ok
+CREATE USER hash4 WITH PASSWORD '$bcrypt_pw'
+
+# Password hash not recognized: hash considered as password input.
+statement ok
+CREATE USER hash5 WITH PASSWORD 'md5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+
+# Password hash not recognized: hash considered as password input.
+statement ok
+CREATE USER hash6 WITH PASSWORD '$scram_pw'
+
+query TTB
+SELECT username, substr("hashedPassword", 1, 7), 'CRDB-BCRYPT'||"hashedPassword" = '$bcrypt_pw' FROM system.users WHERE username LIKE 'hash%' ORDER BY 1
+----
+hash1  $2a$10$  true
+hash4  $2a$10$  false
+hash5  $2a$10$  false
+hash6  $2a$10$  false
+
+# Reset cluster setting after test completion.
+statement ok
+SET CLUSTER SETTING server.user_login.store_client_pre_hashed_passwords.enabled = true

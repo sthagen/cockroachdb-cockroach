@@ -15,45 +15,57 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/errors"
 )
 
 // SchemaChange provides the planNode for the new schema changer.
 func (p *planner) SchemaChange(ctx context.Context, stmt tree.Statement) (planNode, bool, error) {
 	// TODO(ajwerner): Call featureflag.CheckEnabled appropriately.
 	mode := p.extendedEvalCtx.SchemaChangerState.mode
+	// When new schema changer is on we will not support it for explicit
+	// transaction, since we don't know if subsequent statements don't
+	// support it.
 	if mode == sessiondatapb.UseNewSchemaChangerOff ||
-		(mode == sessiondatapb.UseNewSchemaChangerOn && !p.extendedEvalCtx.TxnImplicit) {
+		((mode == sessiondatapb.UseNewSchemaChangerOn ||
+			mode == sessiondatapb.UseNewSchemaChangerUnsafe) && !p.extendedEvalCtx.TxnImplicit) {
 		return nil, false, nil
 	}
 	scs := p.extendedEvalCtx.SchemaChangerState
 	scs.stmts = append(scs.stmts, p.stmt.SQL)
-	buildDeps := scbuild.Dependencies{
-		Res:          p,
-		SemaCtx:      p.SemaCtx(),
-		EvalCtx:      p.EvalContext(),
-		Descs:        p.Descriptors(),
-		AuthAccessor: p,
-	}
-	outputNodes, err := scbuild.Build(ctx, buildDeps, p.extendedEvalCtx.SchemaChangerState.state, stmt)
-	if scbuild.HasNotImplemented(err) && mode == sessiondatapb.UseNewSchemaChangerOn {
+	deps := scdeps.NewBuilderDependencies(
+		p.ExecCfg().Codec,
+		p.Txn(),
+		p.Descriptors(),
+		p,
+		p,
+		p.SessionData(),
+		p.ExecCfg().Settings,
+		scs.stmts,
+	)
+	outputNodes, err := scbuild.Build(ctx, deps, scs.state, stmt)
+	if scerrors.HasNotImplemented(err) &&
+		mode != sessiondatapb.UseNewSchemaChangerUnsafeAlways {
 		return nil, false, nil
 	}
 	if err != nil {
 		// If we need to wait for a concurrent schema change to finish, release our
 		// leases, and then return the error to wait and retry.
-		if cscErr := (*scbuild.ConcurrentSchemaChangeError)(nil); errors.As(err, &cscErr) {
+		if scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID {
 			p.Descriptors().ReleaseLeases(ctx)
 		}
 		return nil, false, err
@@ -69,7 +81,7 @@ func (p *planner) WaitForDescriptorSchemaChanges(
 	ctx context.Context, descID descpb.ID, scs SchemaChangerState,
 ) error {
 
-	if knobs := p.ExecCfg().NewSchemaChangerTestingKnobs; knobs != nil &&
+	if knobs := p.ExecCfg().DeclarativeSchemaChangerTestingKnobs; knobs != nil &&
 		knobs.BeforeWaitingForConcurrentSchemaChanges != nil {
 		knobs.BeforeWaitingForConcurrentSchemaChanges(scs.stmts)
 	}
@@ -91,13 +103,13 @@ func (p *planner) WaitForDescriptorSchemaChanges(
 					tree.ObjectLookupFlags{
 						CommonLookupFlags: tree.CommonLookupFlags{
 							Required:    true,
-							AvoidCached: true,
+							AvoidLeased: true,
 						},
 					})
 				if err != nil {
 					return err
 				}
-				blocked = scbuild.HasConcurrentSchemaChanges(table)
+				blocked = catalog.HasConcurrentSchemaChanges(table)
 				return nil
 			}); err != nil {
 			return err
@@ -121,18 +133,48 @@ type schemaChangePlanNode struct {
 
 func (s *schemaChangePlanNode) startExec(params runParams) error {
 	p := params.p
-	scs := p.extendedEvalCtx.SchemaChangerState
-	executor := scexec.NewExecutor(p.txn, p.Descriptors(), p.EvalContext().Codec,
-		nil /* backfiller */, nil /* jobTracker */, p.ExecCfg().NewSchemaChangerTestingKnobs,
-		params.extendedEvalCtx.ExecCfg.JobRegistry, params.p.execCfg.InternalExecutor)
-	after, err := runNewSchemaChanger(
-		params.ctx, scplan.StatementPhase, s.plannedState, executor, scs.stmts,
+	scs := p.ExtendedEvalContext().SchemaChangerState
+	runDeps := newSchemaChangerTxnRunDependencies(
+		p.User(), p.ExecCfg(), p.Txn(), p.Descriptors(), p.EvalContext(), scs.jobID, scs.stmts,
+	)
+	after, jobID, err := scrun.RunStatementPhase(
+		params.ctx, p.ExecCfg().DeclarativeSchemaChangerTestingKnobs, runDeps, s.plannedState,
 	)
 	if err != nil {
 		return err
 	}
 	scs.state = after
+	scs.jobID = jobID
 	return nil
+}
+
+func newSchemaChangerTxnRunDependencies(
+	user security.SQLUsername,
+	execCfg *ExecutorConfig,
+	txn *kv.Txn,
+	descriptors *descs.Collection,
+	evalContext *tree.EvalContext,
+	schemaChangerJobID jobspb.JobID,
+	stmts []string,
+) scexec.Dependencies {
+	return scdeps.NewExecutorDependencies(
+		execCfg.Codec,
+		txn,
+		user,
+		descriptors,
+		execCfg.JobRegistry,
+		execCfg.IndexBackfiller,
+		// Use a no-op tracker and flusher because while backfilling in a
+		// transaction because we know there's no existing progress and there's
+		// nothing to save because nobody will ever try to resume.
+		scdeps.NewNoOpBackfillTracker(execCfg.Codec),
+		scdeps.NewNoopPeriodicProgressFlusher(),
+		execCfg.IndexValidator,
+		scdeps.NewPartitioner(execCfg.Settings, evalContext),
+		NewSchemaChangerEventLogger(txn, execCfg, 1),
+		schemaChangerJobID,
+		stmts,
+	)
 }
 
 func (s schemaChangePlanNode) Next(params runParams) (bool, error) { return false, nil }

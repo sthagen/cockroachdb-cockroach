@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -38,11 +39,13 @@ import (
 const (
 	// Outgoing messages are queued per-node on a channel of this size.
 	//
-	// TODO(peter): The normal send buffer size is larger than we would like. It
-	// is a temporary patch for the issue discussed in #8630 where
-	// Store.HandleRaftRequest can block applying a preemptive snapshot for a
-	// long enough period of time that grpc flow control kicks in and messages
-	// are dropped on the sending side.
+	// This buffer was sized many moons ago and is very large. If the
+	// buffer fills up, we drop raft messages, so we'd be in trouble.
+	// But as is, the buffer can hold to a lot of memory, especially
+	// during RESTORE/IMPORT where we're routinely sending out SSTs,
+	// which weigh in at a few mbs each; an individual raft instance
+	// will limit how many it has in-flight per-follower, but groups
+	// don't compete among each other for budget.
 	raftSendBufferSize = 10000
 
 	// When no message has been queued for this duration, the corresponding
@@ -53,10 +56,23 @@ const (
 	raftIdleTimeout = time.Minute
 )
 
+// targetRaftOutgoingBatchSize wraps "kv.raft.command.target_batch_size".
+var targetRaftOutgoingBatchSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
+	"kv.raft.command.target_batch_size",
+	"size of a batch of raft commands after which it will be sent without further batching",
+	64<<20, // 64 MB
+	func(size int64) error {
+		if size < 1 {
+			return errors.New("must be positive")
+		}
+		return nil
+	},
+)
+
 // RaftMessageResponseStream is the subset of the
 // MultiRaft_RaftMessageServer interface that is needed for sending responses.
 type RaftMessageResponseStream interface {
-	Context() context.Context
 	Send(*RaftMessageResponse) error
 }
 
@@ -67,10 +83,6 @@ type RaftMessageResponseStream interface {
 type lockedRaftMessageResponseStream struct {
 	wrapped MultiRaft_RaftMessageBatchServer
 	sendMu  syncutil.Mutex
-}
-
-func (s *lockedRaftMessageResponseStream) Context() context.Context {
-	return s.wrapped.Context()
 }
 
 func (s *lockedRaftMessageResponseStream) Send(resp *RaftMessageResponse) error {
@@ -87,7 +99,6 @@ func (s *lockedRaftMessageResponseStream) Recv() (*RaftMessageRequestBatch, erro
 // SnapshotResponseStream is the subset of the
 // MultiRaft_RaftSnapshotServer interface that is needed for sending responses.
 type SnapshotResponseStream interface {
-	Context() context.Context
 	Send(*SnapshotResponse) error
 	Recv() (*SnapshotRequest, error)
 }
@@ -109,7 +120,7 @@ type RaftMessageHandler interface {
 
 	// HandleSnapshot is called for each new incoming snapshot stream, after
 	// parsing the initial SnapshotRequest_Header on the stream.
-	HandleSnapshot(header *SnapshotRequest_Header, respStream SnapshotResponseStream) error
+	HandleSnapshot(ctx context.Context, header *SnapshotRequest_Header, respStream SnapshotResponseStream) error
 }
 
 type raftTransportStats struct {
@@ -159,7 +170,7 @@ func NewDummyRaftTransport(st *cluster.Settings, tracer *tracing.Tracer) *RaftTr
 	resolver := func(roachpb.NodeID) (net.Addr, error) {
 		return nil, errors.New("dummy resolver")
 	}
-	return NewRaftTransport(log.AmbientContext{Tracer: tracer}, st,
+	return NewRaftTransport(log.MakeTestingAmbientContext(tracer), st,
 		nodedialer.New(nil, resolver), nil, nil)
 }
 
@@ -331,9 +342,14 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 	errCh := make(chan error, 1)
 
 	// Node stopping error is caught below in the select.
-	if err := t.stopper.RunAsyncTask(
-		stream.Context(), "storage.RaftTransport: processing batch",
-		func(ctx context.Context) {
+	taskCtx, cancel := t.stopper.WithCancelOnQuiesce(stream.Context())
+	defer cancel()
+	if err := t.stopper.RunAsyncTaskEx(
+		taskCtx,
+		stop.TaskOpts{
+			TaskName: "storage.RaftTransport: processing batch",
+			SpanOpt:  stop.ChildSpan,
+		}, func(ctx context.Context) {
 			errCh <- func() error {
 				var stats *raftTransportStats
 				stream := &lockedRaftMessageResponseStream{wrapped: stream}
@@ -390,9 +406,14 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 // RaftSnapshot handles incoming streaming snapshot requests.
 func (t *RaftTransport) RaftSnapshot(stream MultiRaft_RaftSnapshotServer) error {
 	errCh := make(chan error, 1)
-	if err := t.stopper.RunAsyncTask(
-		stream.Context(), "storage.RaftTransport: processing snapshot",
-		func(ctx context.Context) {
+	taskCtx, cancel := t.stopper.WithCancelOnQuiesce(stream.Context())
+	defer cancel()
+	if err := t.stopper.RunAsyncTaskEx(
+		taskCtx,
+		stop.TaskOpts{
+			TaskName: "storage.RaftTransport: processing snapshot",
+			SpanOpt:  stop.ChildSpan,
+		}, func(ctx context.Context) {
 			errCh <- func() error {
 				req, err := stream.Recv()
 				if err != nil {
@@ -410,7 +431,7 @@ func (t *RaftTransport) RaftSnapshot(stream MultiRaft_RaftSnapshotServer) error 
 						rmr.FromReplica, rmr.ToReplica)
 					return roachpb.NewStoreNotFoundError(rmr.ToReplica.StoreID)
 				}
-				return handler.HandleSnapshot(req.Header, stream)
+				return handler.HandleSnapshot(ctx, req.Header, stream)
 			}()
 		}); err != nil {
 		return err
@@ -488,28 +509,34 @@ func (t *RaftTransport) processQueue(
 		case err := <-errCh:
 			return err
 		case req := <-ch:
+			budget := targetRaftOutgoingBatchSize.Get(&t.st.SV) - int64(req.Size())
 			batch.Requests = append(batch.Requests, *req)
 			req.release()
-			// Pull off as many queued requests as possible.
-			//
-			// TODO(peter): Think about limiting the size of the batch we send.
-			for done := false; !done; {
+			// Pull off as many queued requests as possible, within reason.
+			for budget > 0 {
 				select {
 				case req = <-ch:
+					budget -= int64(req.Size())
 					batch.Requests = append(batch.Requests, *req)
 					req.release()
 				default:
-					done = true
+					budget = -1
 				}
 			}
 
 			err := stream.Send(batch)
-			batch.Requests = batch.Requests[:0]
-
-			atomic.AddInt64(&stats.clientSent, 1)
 			if err != nil {
 				return err
 			}
+
+			// Reuse the Requests slice, but zero out the contents to avoid delaying
+			// GC of memory referenced from within.
+			for i := range batch.Requests {
+				batch.Requests[i] = RaftMessageRequest{}
+			}
+			batch.Requests = batch.Requests[:0]
+
+			atomic.AddInt64(&stats.clientSent, 1)
 		}
 	}
 }

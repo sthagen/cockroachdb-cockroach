@@ -12,6 +12,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -23,8 +25,10 @@ func makeLintCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Comm
 		Short: `Run the specified linters`,
 		Long:  `Run the specified linters.`,
 		Example: `
-	dev lint --filter=TestLowercaseFunctionNames --short --timeout=1m`,
-		Args: cobra.NoArgs,
+	dev lint --filter=TestLowercaseFunctionNames --short --timeout=1m
+	dev lint pkg/cmd/dev
+`,
+		Args: cobra.MinimumNArgs(0),
 		RunE: runE,
 	}
 	addCommonBuildFlags(lintCmd)
@@ -32,7 +36,8 @@ func makeLintCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Comm
 	return lintCmd
 }
 
-func (d *dev) lint(cmd *cobra.Command, _ []string) error {
+func (d *dev) lint(cmd *cobra.Command, commandLine []string) error {
+	pkgs, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
 	filter := mustGetFlagString(cmd, filterFlag)
 	timeout := mustGetFlagDuration(cmd, timeoutFlag)
@@ -46,6 +51,7 @@ func (d *dev) lint(cmd *cobra.Command, _ []string) error {
 	if numCPUs != 0 {
 		args = append(args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
 	}
+	args = append(args, additionalBazelArgs...)
 	args = append(args, "--", "-test.v")
 	if short {
 		args = append(args, "-test.short")
@@ -54,9 +60,17 @@ func (d *dev) lint(cmd *cobra.Command, _ []string) error {
 		args = append(args, "-test.timeout", timeout.String())
 	}
 	if filter != "" {
-		args = append(args, "-test.run", filter)
+		args = append(args, "-test.run", fmt.Sprintf("Lint/%s", filter))
 	}
-
 	logCommand("bazel", args...)
+	if len(pkgs) > 0 {
+		pkg := strings.TrimRight(pkgs[0], "/")
+		if !strings.HasPrefix(pkg, "./") {
+			pkg = "./" + pkg
+		}
+		env := os.Environ()
+		env = append(env, fmt.Sprintf("PKG=%s", pkg))
+		return d.exec.CommandContextWithEnv(ctx, env, "bazel", args...)
+	}
 	return d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...)
 }

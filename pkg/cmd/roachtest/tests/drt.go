@@ -17,14 +17,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/prometheus"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/errors"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 )
 
-type promClient interface {
+// PromClient is an interface allowing queries against Prometheus.
+type PromClient interface {
 	Query(ctx context.Context, query string, ts time.Time) (model.Value, promv1.Warnings, error)
 }
 
@@ -33,7 +34,7 @@ type tpccChaosEventProcessor struct {
 	workloadNodeIP    string
 	ops               []string
 	ch                chan ChaosEvent
-	promClient        promClient
+	promClient        PromClient
 	errs              []error
 
 	// allowZeroSuccessDuringUptime allows 0 successes during an uptime event.

@@ -232,10 +232,6 @@ func NewExternalSorter(
 	fdSemaphore semaphore.Semaphore,
 	diskAcc *mon.BoundAccount,
 ) colexecop.Operator {
-	// The cache mode is chosen to reuse the cache to have a smaller cache per
-	// partition without affecting performance.
-	diskQueueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-	diskQueueCfg.SetDefaultBufferSizeBytesForCacheMode()
 	if diskQueueCfg.BufferSizeBytes > 0 && maxNumberPartitions == 0 {
 		// With the default limit of 256 file descriptors, this results in 16
 		// partitions. This is a hard maximum of partitions that will be used by
@@ -272,17 +268,13 @@ func NewExternalSorter(
 	}
 	inputPartitioner := newInputPartitioningOperator(sortUnlimitedAllocator, input, inputTypes, inMemSortPartitionLimit)
 	var inMemSorter colexecop.ResettableOperator
-	var err error
 	if topK > 0 {
-		inMemSorter, err = NewTopKSorter(sortUnlimitedAllocator, inputPartitioner, inputTypes, ordering.Columns, matchLen, topK, inMemSortOutputLimit)
+		inMemSorter = NewTopKSorter(sortUnlimitedAllocator, inputPartitioner, inputTypes, ordering.Columns, matchLen, topK, inMemSortOutputLimit)
 	} else {
-		inMemSorter, err = newSorter(
+		inMemSorter = newSorter(
 			sortUnlimitedAllocator, newAllSpooler(sortUnlimitedAllocator, inputPartitioner, inputTypes),
 			inputTypes, ordering.Columns, inMemSortOutputLimit,
 		)
-	}
-	if err != nil {
-		colexecerror.InternalError(err)
 	}
 	partitionedDiskQueueSemaphore := fdSemaphore
 	if !delegateFDAcquisitions {
@@ -659,7 +651,7 @@ func (s *externalSorter) createMergerForPartitions(n int) colexecop.Operator {
 			}
 			partitionOrdinal := s.numPartitions - n + i
 			counts.WriteString(fmt.Sprintf("%d", s.partitionsInfo.tupleCount[partitionOrdinal]))
-			sizes.WriteString(humanizeutil.IBytes(s.partitionsInfo.totalSize[partitionOrdinal]))
+			sizes.WriteString(string(humanizeutil.IBytes(s.partitionsInfo.totalSize[partitionOrdinal])))
 		}
 		log.Infof(s.Ctx,
 			"external sorter is merging partitions with partition indices %v with counts [%s] and sizes [%s]",

@@ -387,7 +387,7 @@ const (
 	// DisallowHashJoinStoreLeft corresponds to a hash join where the left side is
 	// stored into the hashtable. Note that execution can override the stored side
 	// if it finds that the other side is smaller (up to a certain size).
-	DisallowHashJoinStoreLeft JoinFlags = (1 << iota)
+	DisallowHashJoinStoreLeft JoinFlags = 1 << iota
 
 	// DisallowHashJoinStoreRight corresponds to a hash join where the right side
 	// is stored into the hashtable. Note that execution can override the stored
@@ -423,28 +423,28 @@ const (
 )
 
 const (
-	disallowAll JoinFlags = (DisallowHashJoinStoreLeft |
+	disallowAll = DisallowHashJoinStoreLeft |
 		DisallowHashJoinStoreRight |
 		DisallowMergeJoin |
 		DisallowLookupJoinIntoLeft |
 		DisallowLookupJoinIntoRight |
 		DisallowInvertedJoinIntoLeft |
-		DisallowInvertedJoinIntoRight)
+		DisallowInvertedJoinIntoRight
 
 	// AllowOnlyHashJoinStoreRight has all "disallow" flags set except
 	// DisallowHashJoinStoreRight.
-	AllowOnlyHashJoinStoreRight JoinFlags = disallowAll ^ DisallowHashJoinStoreRight
+	AllowOnlyHashJoinStoreRight = disallowAll ^ DisallowHashJoinStoreRight
 
 	// AllowOnlyLookupJoinIntoRight has all "disallow" flags set except
 	// DisallowLookupJoinIntoRight.
-	AllowOnlyLookupJoinIntoRight JoinFlags = disallowAll ^ DisallowLookupJoinIntoRight
+	AllowOnlyLookupJoinIntoRight = disallowAll ^ DisallowLookupJoinIntoRight
 
 	// AllowOnlyInvertedJoinIntoRight has all "disallow" flags set except
 	// DisallowInvertedJoinIntoRight.
-	AllowOnlyInvertedJoinIntoRight JoinFlags = disallowAll ^ DisallowInvertedJoinIntoRight
+	AllowOnlyInvertedJoinIntoRight = disallowAll ^ DisallowInvertedJoinIntoRight
 
 	// AllowOnlyMergeJoin has all "disallow" flags set except DisallowMergeJoin.
-	AllowOnlyMergeJoin JoinFlags = disallowAll ^ DisallowMergeJoin
+	AllowOnlyMergeJoin = disallowAll ^ DisallowMergeJoin
 )
 
 var joinFlagStr = map[JoinFlags]string{
@@ -888,7 +888,7 @@ func ExprIsNeverNull(e opt.ScalarExpr, notNullCols opt.ColSet) bool {
 		}
 		return ExprIsNeverNull(t.Input, notNullCols) && ExprIsNeverNull(t.OrElse, notNullCols)
 
-	case *CastExpr, *NotExpr, *RangeExpr:
+	case *CastExpr, *AssignmentCastExpr, *NotExpr, *RangeExpr:
 		return ExprIsNeverNull(t.Child(0).(opt.ScalarExpr), notNullCols)
 
 	case *AndExpr, *OrExpr, *GeExpr, *GtExpr, *NeExpr, *EqExpr, *LeExpr, *LtExpr, *LikeExpr,
@@ -953,6 +953,23 @@ func OutputColumnIsAlwaysNull(e RelExpr, col opt.ColumnID) bool {
 	return false
 }
 
+// CollectContiguousOrExprs finds all OrExprs in 'e' that are connected via
+// a parent-child relationship, and returns them in an array of ScalarExprs.
+func CollectContiguousOrExprs(e opt.ScalarExpr) []opt.ScalarExpr {
+	var disjunctions = make([]opt.ScalarExpr, 0, 2)
+	var collectDisjunctions func(e opt.ScalarExpr)
+	collectDisjunctions = func(e opt.ScalarExpr) {
+		if or, ok := e.(*OrExpr); ok {
+			collectDisjunctions(or.Left)
+			collectDisjunctions(or.Right)
+		} else {
+			disjunctions = append(disjunctions, e)
+		}
+	}
+	collectDisjunctions(e)
+	return disjunctions
+}
+
 // FKCascades stores metadata necessary for building cascading queries.
 type FKCascades []FKCascade
 
@@ -1014,4 +1031,46 @@ type CascadeBuilder interface {
 		bindingProps *props.Relational,
 		oldValues, newValues opt.ColList,
 	) (RelExpr, error)
+}
+
+// GroupingOrderType is the grouping column order type for group by and distinct
+// operations in the memo.
+type GroupingOrderType int
+
+const (
+	// NoStreaming means that the grouping columns have no useful order, so a
+	// hash aggregator should be used.
+	NoStreaming GroupingOrderType = iota
+	// PartialStreaming means that the grouping columns are partially ordered, so
+	// some optimizations can be done during aggregation.
+	PartialStreaming
+	// Streaming means that the grouping columns are fully ordered.
+	Streaming
+)
+
+// GroupingOrderType calculates how many ordered columns that the grouping
+// and input columns have in common and returns NoStreaming if there are none, Streaming if
+// all columns match, and PartialStreaming if only some match. It is similar to
+// StreamingGroupingColOrdering, but does not build an ordering.
+func (g *GroupingPrivate) GroupingOrderType(required *props.OrderingChoice) GroupingOrderType {
+	inputOrdering := required.Intersection(&g.Ordering)
+	count := 0
+	for i := range inputOrdering.Columns {
+		// Get any grouping column from the set. Normally there would be at most one
+		// because we have rules that remove redundant grouping columns.
+		cols := inputOrdering.Group(i).Intersection(g.GroupingCols)
+		_, ok := cols.Next(0)
+		if !ok {
+			// This group refers to a column that is not a grouping column.
+			// The rest of the ordering is not useful.
+			break
+		}
+		count++
+	}
+	if count == g.GroupingCols.Len() || g.GroupingCols.Len() == 0 {
+		return Streaming
+	} else if count == 0 {
+		return NoStreaming
+	}
+	return PartialStreaming
 }

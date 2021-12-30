@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/cockroachdb/errors"
 )
 
 // This file defines wrappers for Reader and Writer, and functions to do the
@@ -29,17 +28,10 @@ import (
 // PutIntent, ClearIntent, ClearMVCCRangeAndIntents.
 type intentDemuxWriter struct {
 	w Writer
-
-	// Can only be set to true by testing knobs to disable writing of separated
-	// intents.
-	disableSeparatedIntents bool
 }
 
-func wrapIntentWriter(
-	ctx context.Context, w Writer, disableSeparatedIntents bool,
-) intentDemuxWriter {
+func wrapIntentWriter(ctx context.Context, w Writer) intentDemuxWriter {
 	idw := intentDemuxWriter{w: w}
-	idw.disableSeparatedIntents = disableSeparatedIntents
 	return idw
 }
 
@@ -47,81 +39,33 @@ func wrapIntentWriter(
 // scratch-space to avoid allocations -- its contents will be overwritten and
 // not appended to, and a possibly different buf returned.
 func (idw intentDemuxWriter) ClearIntent(
-	key roachpb.Key,
-	state PrecedingIntentState,
-	txnDidNotUpdateMeta bool,
-	txnUUID uuid.UUID,
-	buf []byte,
-) (_ []byte, separatedIntentCountDelta int, _ error) {
-	switch state {
-	case ExistingIntentInterleaved:
-		return buf, 0, idw.w.ClearUnversioned(key)
-	case ExistingIntentSeparated:
-		var engineKey EngineKey
-		engineKey, buf = LockTableKey{
-			Key:      key,
-			Strength: lock.Exclusive,
-			TxnUUID:  txnUUID[:],
-		}.ToEngineKey(buf)
-		if txnDidNotUpdateMeta {
-			return buf, -1, idw.w.SingleClearEngineKey(engineKey)
-		}
-		return buf, -1, idw.w.ClearEngineKey(engineKey)
-	default:
-		return buf, 0, errors.AssertionFailedf("ClearIntent: invalid preceding state %d", state)
+	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, buf []byte,
+) (_ []byte, _ error) {
+	var engineKey EngineKey
+	engineKey, buf = LockTableKey{
+		Key:      key,
+		Strength: lock.Exclusive,
+		TxnUUID:  txnUUID[:],
+	}.ToEngineKey(buf)
+	if txnDidNotUpdateMeta {
+		return buf, idw.w.SingleClearEngineKey(engineKey)
 	}
+	return buf, idw.w.ClearEngineKey(engineKey)
 }
 
 // PutIntent has the same behavior as Writer.PutIntent. buf is used as
 // scratch-space to avoid allocations -- its contents will be overwritten and
 // not appended to, and a possibly different buf returned.
 func (idw intentDemuxWriter) PutIntent(
-	ctx context.Context,
-	key roachpb.Key,
-	value []byte,
-	state PrecedingIntentState,
-	txnDidNotUpdateMeta bool,
-	txnUUID uuid.UUID,
-	buf []byte,
-) (_ []byte, separatedIntentCountDelta int, _ error) {
-	writeSeparatedIntents := !idw.disableSeparatedIntents
+	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID, buf []byte,
+) (_ []byte, _ error) {
 	var engineKey EngineKey
-	if state == ExistingIntentSeparated || writeSeparatedIntents {
-		engineKey, buf = LockTableKey{
-			Key:      key,
-			Strength: lock.Exclusive,
-			TxnUUID:  txnUUID[:],
-		}.ToEngineKey(buf)
-	}
-	if state == ExistingIntentSeparated && !writeSeparatedIntents {
-		// Switching this intent from separated to interleaved.
-		if txnDidNotUpdateMeta {
-			if err := idw.w.SingleClearEngineKey(engineKey); err != nil {
-				return buf, 0, err
-			}
-		} else {
-			if err := idw.w.ClearEngineKey(engineKey); err != nil {
-				return buf, 0, err
-			}
-		}
-	} else if state == ExistingIntentInterleaved && writeSeparatedIntents {
-		// Switching this intent from interleaved to separated.
-		if err := idw.w.ClearUnversioned(key); err != nil {
-			return buf, 0, err
-		}
-	}
-	// Else, staying separated or staying interleaved or there was no preceding
-	// intent, so don't need to explicitly clear.
-
-	if state == ExistingIntentSeparated {
-		separatedIntentCountDelta = -1
-	}
-	// Write intent
-	if writeSeparatedIntents {
-		separatedIntentCountDelta++
-		return buf, separatedIntentCountDelta, idw.w.PutEngineKey(engineKey, value)
-	}
-	return buf, separatedIntentCountDelta, idw.w.PutUnversioned(key, value)
+	engineKey, buf = LockTableKey{
+		Key:      key,
+		Strength: lock.Exclusive,
+		TxnUUID:  txnUUID[:],
+	}.ToEngineKey(buf)
+	return buf, idw.w.PutEngineKey(engineKey, value)
 }
 
 // ClearMVCCRangeAndIntents has the same behavior as

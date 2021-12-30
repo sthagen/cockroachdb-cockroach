@@ -106,7 +106,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 
 	// Make a db with a short heartbeat interval, so that the aborted txn finds
 	// out quickly.
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := s.AmbientCtx()
 	tsf := kvcoord.NewTxnCoordSenderFactory(
 		kvcoord.TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
@@ -123,8 +123,8 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	iter := 0
 	// We'll trace to make sure the test isn't fooling itself.
 	tr := s.TracerI().(*tracing.Tracer)
-	runningCtx, getRec, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test")
-	defer cancel()
+	runningCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test")
+	defer getRecAndFinish()
 	err = shortDB.Txn(runningCtx, func(ctx context.Context, txn *kv.Txn) error {
 		iter++
 		if iter == 1 {
@@ -148,7 +148,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 		}
 
 		// Create and run a DistSQL plan.
-		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+		rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
 			return nil
 		})
 		recv := MakeDistSQLReceiver(
@@ -189,7 +189,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	if iter != 2 {
 		t.Fatalf("expected two iterations, but txn took %d to succeed", iter)
 	}
-	if tracing.FindMsgInRecording(getRec(), clientRejectedMsg) == -1 {
+	if tracing.FindMsgInRecording(getRecAndFinish(), clientRejectedMsg) == -1 {
 		t.Fatalf("didn't find expected message in trace: %s", clientRejectedMsg)
 	}
 }
@@ -296,6 +296,9 @@ func TestDistSQLReceiverReportsContention(t *testing.T) {
 			t, db, "test", "x INT PRIMARY KEY", 1, sqlutils.ToRowFn(sqlutils.RowIdxFn),
 		)
 
+		tableID := sqlutils.QueryTableID(t, db, sqlutils.TestDB, "public", "test")
+		contentionEventSubstring := fmt.Sprintf("tableID=%d indexID=1", tableID)
+
 		if contention {
 			// Begin a contending transaction.
 			conn, err := db.Conn(ctx)
@@ -326,7 +329,6 @@ COMMIT;
 SET TRACING=off;
 `)
 		require.NoError(t, err)
-		const contentionEventSubstring = "tableID=53 indexID=1"
 		if contention {
 			// Soft check to protect against flakiness where an internal query
 			// causes the contention metric to increment.
@@ -462,7 +464,7 @@ func TestCancelFlowsCoordinator(t *testing.T) {
 
 	var c cancelFlowsCoordinator
 
-	globalRng, _ := randutil.NewPseudoRand()
+	globalRng, _ := randutil.NewTestRand()
 	numNodes := globalRng.Intn(16) + 2
 	gatewayNodeID := roachpb.NodeID(1)
 
@@ -511,7 +513,7 @@ func TestCancelFlowsCoordinator(t *testing.T) {
 	for i := 0; i < numQueryRunners; i++ {
 		go func() {
 			defer wg.Done()
-			rng, _ := randutil.NewPseudoRand()
+			rng, _ := randutil.NewTestRand()
 			for i := 0; i < numRunsPerRunner; i++ {
 				c.addFlowsToCancel(makeFlowsToCancel(rng))
 				time.Sleep(time.Duration(rng.Int63n(int64(maxSleepTime))))
@@ -525,7 +527,7 @@ func TestCancelFlowsCoordinator(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rng, _ := randutil.NewPseudoRand()
+		rng, _ := randutil.NewTestRand()
 		done := time.After(2 * time.Second)
 		for {
 			select {

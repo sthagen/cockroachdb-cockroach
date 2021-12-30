@@ -41,16 +41,6 @@ var registry = make(map[clusterversion.ClusterVersion]migration.Migration)
 
 var migrations = []migration.Migration{
 	migration.NewSystemMigration(
-		"use unreplicated TruncatedState and RangeAppliedState for all ranges",
-		toCV(clusterversion.TruncatedAndRangeAppliedStateMigration),
-		truncatedStateMigration,
-	),
-	migration.NewSystemMigration(
-		"purge all replicas using the replicated TruncatedState",
-		toCV(clusterversion.PostTruncatedAndRangeAppliedStateMigration),
-		postTruncatedStateMigration,
-	),
-	migration.NewSystemMigration(
 		"stop using monolithic encryption-at-rest registry for all stores",
 		toCV(clusterversion.RecordsBasedRegistry),
 		recordsBasedRegistryMigration,
@@ -105,12 +95,6 @@ var migrations = []migration.Migration{
 		NoPrecondition,
 		retryJobsWithExponentialBackoff),
 	migration.NewTenantMigration(
-		"validates no interleaved tables exist",
-		toCV(clusterversion.EnsureNoInterleavedTables),
-		interleavedTablesRemovedCheck,
-		interleavedTablesRemovedMigration,
-	),
-	migration.NewTenantMigration(
 		"add system.zones table for secondary tenants",
 		toCV(clusterversion.ZonesTableForSecondaryTenants),
 		NoPrecondition,
@@ -139,6 +123,35 @@ var migrations = []migration.Migration{
 		toCV(clusterversion.SQLStatsTables),
 		NoPrecondition,
 		sqlStatsTablesMigration,
+	),
+	migration.NewTenantMigration(
+		"ensure that draining names are no longer in use",
+		toCV(clusterversion.DrainingNamesMigration),
+		NoPrecondition,
+		ensureNoDrainingNames,
+	),
+	migration.NewTenantMigration(
+		"add column avgSize to table system.table_statistics",
+		toCV(clusterversion.AlterSystemTableStatisticsAddAvgSizeCol),
+		NoPrecondition,
+		alterSystemTableStatisticsAddAvgSize,
+	),
+	migration.NewTenantMigration(
+		"update system.statement_diagnostics_requests table to support conditional stmt diagnostics",
+		toCV(clusterversion.AlterSystemStmtDiagReqs),
+		NoPrecondition,
+		alterSystemStmtDiagReqs,
+	),
+	migration.NewTenantMigration(
+		"seed system.span_configurations with configs for existing for existing tenants",
+		toCV(clusterversion.SeedTenantSpanConfigs),
+		NoPrecondition,
+		seedTenantSpanConfigsMigration,
+	),
+	migration.NewTenantMigration("insert missing system.namespace entries for public schemas",
+		toCV(clusterversion.InsertPublicSchemaNamespaceEntryOnRestore),
+		NoPrecondition,
+		insertMissingPublicSchemaNamespaceEntry,
 	),
 }
 

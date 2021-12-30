@@ -113,6 +113,11 @@ type Flow interface {
 	// IsVectorized returns whether this flow will run with vectorized execution.
 	IsVectorized() bool
 
+	// StatementSQL is the SQL statement for which this flow is executing. It is
+	// populated on a best effort basis (only available for user-issued queries
+	// that are also not like BulkIO/CDC related).
+	StatementSQL() string
+
 	// GetFlowCtx returns the flow context of this flow.
 	GetFlowCtx() *execinfra.FlowCtx
 
@@ -165,7 +170,8 @@ type FlowBase struct {
 	startedGoroutines bool
 
 	// inboundStreams are streams that receive data from other hosts; this map
-	// is to be passed to FlowRegistry.RegisterFlow.
+	// is to be passed to FlowRegistry.RegisterFlow. This map is populated in
+	// Flow.Setup(), so it is safe to lookup into concurrently later.
 	inboundStreams map[execinfrapb.StreamID]*InboundStreamInfo
 
 	// waitGroup is used to wait for async components of the flow:
@@ -175,6 +181,8 @@ type FlowBase struct {
 	waitGroup sync.WaitGroup
 
 	onFlowCleanup func()
+
+	statementSQL string
 
 	doneFn func()
 
@@ -243,6 +251,7 @@ func NewFlowBase(
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
 	onFlowCleanup func(),
+	statementSQL string,
 ) *FlowBase {
 	// We are either in a single tenant cluster, or a SQL node in a multi-tenant
 	// cluster, where the SQL node is single tenant. The tenant below is used
@@ -266,7 +275,13 @@ func NewFlowBase(
 		admissionInfo:         admissionInfo,
 		onFlowCleanup:         onFlowCleanup,
 		status:                flowNotStarted,
+		statementSQL:          statementSQL,
 	}
+}
+
+// StatementSQL is part of the Flow interface.
+func (f *FlowBase) StatementSQL() string {
+	return f.statementSQL
 }
 
 // GetFlowCtx is part of the Flow interface.
@@ -527,9 +542,9 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 	}
 }
 
-// cancel iterates through all unconnected streams of this flow and marks them canceled.
-// This function is called in Wait() after the associated context has been canceled.
-// In order to cancel a flow, call f.ctxCancel() instead of this function.
+// cancel cancels all unconnected streams of this flow. This function is called
+// in Wait() after the associated context has been canceled. In order to cancel
+// a flow, call f.ctxCancel() instead of this function.
 //
 // For a detailed description of the distsql query cancellation mechanism,
 // read docs/RFCS/query_cancellation.md.
@@ -538,15 +553,7 @@ func (f *FlowBase) cancel() {
 	if f.IsLocal() {
 		return
 	}
-	f.flowRegistry.Lock()
-	timedOutReceivers := f.flowRegistry.cancelPendingStreamsLocked(f.ID)
-	f.flowRegistry.Unlock()
-
-	for _, receiver := range timedOutReceivers {
-		go func(receiver InboundStreamHandler) {
-			// Stream has yet to be started; send an error to its
-			// receiver and prevent it from being connected.
-			receiver.Timeout(cancelchecker.QueryCanceledError)
-		}(receiver)
-	}
+	// Pending streams have yet to be started; send an error to its receivers
+	// and prevent them from being connected.
+	f.flowRegistry.cancelPendingStreams(f.ID, cancelchecker.QueryCanceledError)
 }

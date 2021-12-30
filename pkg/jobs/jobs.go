@@ -49,6 +49,7 @@ const (
 )
 
 var traceableJobDumpTraceMode = settings.RegisterEnumSetting(
+	settings.TenantWritable,
 	"jobs.trace.force_dump_mode",
 	"determines the state in which all traceable jobs will dump their cluster wide, inflight, "+
 		"trace recordings. Traces may be dumped never, on fail, "+
@@ -76,6 +77,7 @@ type Job struct {
 		syncutil.Mutex
 		payload  jobspb.Payload
 		progress jobspb.Progress
+		status   Status
 		runStats *RunStats
 	}
 }
@@ -114,7 +116,7 @@ func (r *Record) AppendDescription(description string) {
 		r.Description = description
 		return
 	}
-	r.Description = r.Description + ";" + description
+	r.Description = r.Description + "; " + description
 }
 
 // SetNonCancelable sets NonCancelable of this Record to the value returned from
@@ -212,7 +214,7 @@ var (
 )
 
 // HasErrJobCanceled returns true if the error contains the error set as the
-// job's FinalResumError when it has been canceled.
+// job's FinalResumeError when it has been canceled.
 func HasErrJobCanceled(err error) bool {
 	return errors.Is(err, errJobCanceled)
 }
@@ -452,8 +454,8 @@ func (j *Job) cancelRequested(
 		}
 		if md.Status == StatusPaused && md.Payload.FinalResumeError != nil {
 			decodedErr := errors.DecodeError(ctx, *md.Payload.FinalResumeError)
-			return fmt.Errorf("job %d is paused and has non-nil FinalResumeError "+
-				"%s hence cannot be canceled and should be reverted", j.ID(), decodedErr.Error())
+			return errors.Wrapf(decodedErr, "job %d is paused and has non-nil FinalResumeError "+
+				"hence cannot be canceled and should be reverted", j.ID())
 		}
 		if fn != nil {
 			if err := fn(ctx, txn); err != nil {
@@ -712,6 +714,14 @@ func (j *Job) Details() jobspb.Details {
 	return j.mu.payload.UnwrapDetails()
 }
 
+// Status returns the status of the job. It will be "" if the status has
+// not been set or the job has never been loaded.
+func (j *Job) Status() Status {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.mu.status
+}
+
 // FractionCompleted returns completion according to the in-memory job state.
 func (j *Job) FractionCompleted() float32 {
 	progress := j.Progress()
@@ -762,10 +772,11 @@ func (j *Job) load(ctx context.Context, txn *kv.Txn) error {
 	var payload *jobspb.Payload
 	var progress *jobspb.Progress
 	var createdBy *CreatedByInfo
+	var status Status
 
 	if err := j.runInTxn(ctx, txn, func(ctx context.Context, txn *kv.Txn) error {
 		const (
-			queryNoSessionID   = "SELECT payload, progress, created_by_type, created_by_id FROM system.jobs WHERE id = $1"
+			queryNoSessionID   = "SELECT payload, progress, created_by_type, created_by_id, status FROM system.jobs WHERE id = $1"
 			queryWithSessionID = queryNoSessionID + " AND claim_session_id = $2"
 		)
 		sess := sessiondata.InternalExecutorOverride{User: security.RootUserName()}
@@ -794,12 +805,17 @@ func (j *Job) load(ctx context.Context, txn *kv.Txn) error {
 			return err
 		}
 		createdBy, err = unmarshalCreatedBy(row[2], row[3])
+		if err != nil {
+			return err
+		}
+		status, err = unmarshalStatus(row[4])
 		return err
 	}); err != nil {
 		return err
 	}
 	j.mu.payload = *payload
 	j.mu.progress = *progress
+	j.mu.status = status
 	j.createdBy = createdBy
 	return nil
 }
@@ -851,25 +867,12 @@ func unmarshalCreatedBy(createdByType, createdByID tree.Datum) (*CreatedByInfo, 
 		"job: failed to unmarshal created_by_type as DString (was %T)", createdByType)
 }
 
-// CurrentStatus returns the current job status from the jobs table or error.
-func (j *Job) CurrentStatus(ctx context.Context, txn *kv.Txn) (Status, error) {
-	var statusString tree.DString
-	if err := j.runInTxn(ctx, txn, func(ctx context.Context, txn *kv.Txn) error {
-		const selectStmt = "SELECT status FROM system.jobs WHERE id = $1"
-		row, err := j.registry.ex.QueryRow(ctx, "job-status", txn, selectStmt, j.ID())
-		if err != nil {
-			return errors.Wrapf(err, "job %d: can't query system.jobs", j.ID())
-		}
-		if row == nil {
-			return errors.Errorf("job %d: not found in system.jobs", j.ID())
-		}
-
-		statusString = tree.MustBeDString(row[0])
-		return nil
-	}); err != nil {
-		return "", err
+func unmarshalStatus(datum tree.Datum) (Status, error) {
+	statusString, ok := datum.(*tree.DString)
+	if !ok {
+		return "", errors.AssertionFailedf("expected string status, but got %T", datum)
 	}
-	return Status(statusString), nil
+	return Status(*statusString), nil
 }
 
 // getRunStats returns the RunStats for a job. If they are not set, it will

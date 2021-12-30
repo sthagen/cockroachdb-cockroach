@@ -45,13 +45,12 @@ func TestRedactRecordingForTenant(t *testing.T) {
 			Add("tag_sensitive", tagSensitive).
 			Add("tag_not_sensitive", log.Safe(tagNotSensitive))
 		ctx := logtags.WithTags(context.Background(), tags)
-		ctx, sp := tracing.NewTracer().StartSpanCtx(ctx, "foo", tracing.WithForceRealSpan())
-		sp.SetVerbose(true)
-
+		tracer := tracing.NewTracer()
+		tracer.SetRedactable(true)
+		ctx, sp := tracer.StartSpanCtx(ctx, "foo", tracing.WithRecording(tracing.RecordingVerbose))
 		log.Eventf(ctx, "%s %s", msgSensitive, log.Safe(msgNotSensitive))
 		sp.SetTag("all_span_tags_are_stripped", attribute.StringValue("because_no_redactability"))
-		sp.Finish()
-		rec := sp.GetRecording()
+		rec := sp.FinishAndGetRecording(tracing.RecordingVerbose)
 		require.Len(t, rec, 1)
 		return rec
 	}
@@ -94,16 +93,16 @@ func TestRedactRecordingForTenant(t *testing.T) {
 		// that may leak from the KV layer to tenants. If it does, update
 		// redactRecordingForTenant appropriately.
 		type calcifiedRecordedSpan struct {
-			TraceID           uint64
-			SpanID            uint64
-			ParentSpanID      uint64
+			TraceID           tracingpb.TraceID
+			SpanID            tracingpb.SpanID
+			ParentSpanID      tracingpb.SpanID
 			Operation         string
-			Baggage           map[string]string
 			Tags              map[string]string
 			StartTime         time.Time
 			Duration          time.Duration
 			RedactableLogs    bool
 			Logs              []tracingpb.LogRecord
+			Verbose           bool
 			GoroutineID       uint64
 			Finished          bool
 			StructuredRecords []tracingpb.StructuredRecord

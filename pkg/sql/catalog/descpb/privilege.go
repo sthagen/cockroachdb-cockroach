@@ -128,21 +128,25 @@ func NewCustomSuperuserPrivilegeDescriptor(
 // used for virtual tables.
 func NewPublicSelectPrivilegeDescriptor() *PrivilegeDescriptor {
 	return NewPrivilegeDescriptor(
-		security.PublicRoleName(), privilege.List{privilege.SELECT}, security.NodeUserName(),
+		security.PublicRoleName(), privilege.List{privilege.SELECT}, privilege.List{}, security.NodeUserName(),
 	)
 }
 
 // NewPrivilegeDescriptor returns a privilege descriptor for the given
 // user with the specified list of privileges.
 func NewPrivilegeDescriptor(
-	user security.SQLUsername, priv privilege.List, owner security.SQLUsername,
+	user security.SQLUsername,
+	priv privilege.List,
+	grantOption privilege.List,
+	owner security.SQLUsername,
 ) *PrivilegeDescriptor {
 	return &PrivilegeDescriptor{
 		OwnerProto: owner.EncodeProto(),
 		Users: []UserPrivileges{
 			{
-				UserProto:  user.EncodeProto(),
-				Privileges: priv.ToBitField(),
+				UserProto:       user.EncodeProto(),
+				Privileges:      priv.ToBitField(),
+				WithGrantOption: grantOption.ToBitField(),
 			},
 		},
 		Version: Version21_2,
@@ -153,17 +157,61 @@ func NewPrivilegeDescriptor(
 // on non-system objects.
 var DefaultSuperuserPrivileges = privilege.List{privilege.ALL}
 
-// NewDefaultPrivilegeDescriptor returns a privilege descriptor
+// NewBasePrivilegeDescriptor returns a privilege descriptor
 // with ALL privileges for the root user and admin role.
-func NewDefaultPrivilegeDescriptor(owner security.SQLUsername) *PrivilegeDescriptor {
+// NOTE: use NewBaseDatabasePrivilegeDescriptor for databases.
+func NewBasePrivilegeDescriptor(owner security.SQLUsername) *PrivilegeDescriptor {
 	return NewCustomSuperuserPrivilegeDescriptor(DefaultSuperuserPrivileges, owner)
 }
 
+// NewBaseDatabasePrivilegeDescriptor creates defaults privileges for a database.
+// Here we also add the CONNECT privilege for the database.
+func NewBaseDatabasePrivilegeDescriptor(owner security.SQLUsername) *PrivilegeDescriptor {
+	p := NewBasePrivilegeDescriptor(owner)
+	p.Grant(security.PublicRoleName(), privilege.List{privilege.CONNECT}, false /* withGrantOption */)
+	return p
+}
+
+// CheckGrantOptions returns false if the user tries to grant a privilege that
+// it does not possess grant options for
+func (p *PrivilegeDescriptor) CheckGrantOptions(
+	user security.SQLUsername, privList privilege.List,
+) bool {
+	userPriv, exists := p.FindUser(user)
+	if !exists {
+		return false
+	}
+
+	// User has ALL WITH GRANT OPTION so they can grant anything.
+	if privilege.ALL.IsSetIn(userPriv.WithGrantOption) {
+		return true
+	}
+
+	for _, priv := range privList {
+		if userPriv.WithGrantOption&priv.Mask() == 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
 // Grant adds new privileges to this descriptor for a given list of users.
-func (p *PrivilegeDescriptor) Grant(user security.SQLUsername, privList privilege.List) {
+func (p *PrivilegeDescriptor) Grant(
+	user security.SQLUsername, privList privilege.List, withGrantOption bool,
+) {
 	userPriv := p.FindOrCreateUser(user)
-	if privilege.ALL.IsSetIn(userPriv.Privileges) {
+	if privilege.ALL.IsSetIn(userPriv.WithGrantOption) && privilege.ALL.IsSetIn(userPriv.Privileges) {
 		// User already has 'ALL' privilege: no-op.
+		// If userPriv.WithGrantOption has ALL, then userPriv.Privileges must also have ALL.
+		// It is possible however for userPriv.Privileges to have ALL but userPriv.WithGrantOption to not have ALL
+		return
+	}
+
+	if privilege.ALL.IsSetIn(userPriv.Privileges) && !withGrantOption {
+		// A user can hold all privileges but not all grant options.
+		// If a user holds all privileges but withGrantOption is False,
+		// there is nothing left to be done
 		return
 	}
 
@@ -173,14 +221,26 @@ func (p *PrivilegeDescriptor) Grant(user security.SQLUsername, privList privileg
 		// TODO(marc): the grammar does not allow it, but we should
 		// check if other privileges are being specified and error out.
 		userPriv.Privileges = privilege.ALL.Mask()
+		if withGrantOption {
+			userPriv.WithGrantOption = privilege.ALL.Mask()
+		}
 		return
 	}
-	userPriv.Privileges |= bits
+
+	if withGrantOption {
+		userPriv.WithGrantOption |= bits
+	}
+	if !privilege.ALL.IsSetIn(userPriv.Privileges) {
+		userPriv.Privileges |= bits
+	}
 }
 
 // Revoke removes privileges from this descriptor for a given list of users.
 func (p *PrivilegeDescriptor) Revoke(
-	user security.SQLUsername, privList privilege.List, objectType privilege.ObjectType,
+	user security.SQLUsername,
+	privList privilege.List,
+	objectType privilege.ObjectType,
+	grantOptionFor bool,
 ) {
 	userPriv, ok := p.FindUser(user)
 	if !ok || userPriv.Privileges == 0 {
@@ -190,14 +250,17 @@ func (p *PrivilegeDescriptor) Revoke(
 
 	bits := privList.ToBitField()
 	if privilege.ALL.IsSetIn(bits) {
-		// Revoking 'ALL' privilege: remove user.
-		// TODO(marc): the grammar does not allow it, but we should
-		// check if other privileges are being specified and error out.
-		p.RemoveUser(user)
+		userPriv.WithGrantOption = 0
+		if !grantOptionFor {
+			// Revoking 'ALL' privilege: remove user.
+			// TODO(marc): the grammar does not allow it, but we should
+			// check if other privileges are being specified and error out.
+			p.RemoveUser(user)
+		}
 		return
 	}
 
-	if privilege.ALL.IsSetIn(userPriv.Privileges) {
+	if privilege.ALL.IsSetIn(userPriv.Privileges) && !grantOptionFor {
 		// User has 'ALL' privilege. Remove it and set
 		// all other privileges one.
 		validPrivs := privilege.GetValidPrivilegesForObject(objectType)
@@ -209,11 +272,50 @@ func (p *PrivilegeDescriptor) Revoke(
 		}
 	}
 
-	// One doesn't see "AND NOT" very often.
-	userPriv.Privileges &^= bits
+	// We will always revoke the grant options regardless of the flag.
+	if privilege.ALL.IsSetIn(userPriv.WithGrantOption) {
+		// User has 'ALL' grant option. Remove it and set
+		// all other grant options to one.
+		validPrivs := privilege.GetValidPrivilegesForObject(objectType)
+		userPriv.WithGrantOption = 0
+		for _, v := range validPrivs {
+			if v != privilege.ALL {
+				userPriv.WithGrantOption |= v.Mask()
+			}
+		}
+	}
 
-	if userPriv.Privileges == 0 {
-		p.RemoveUser(user)
+	// One doesn't see "AND NOT" very often.
+	// We will always revoke the grant options regardless of the flag.
+	userPriv.WithGrantOption &^= bits
+	if !grantOptionFor {
+		userPriv.Privileges &^= bits
+
+		if userPriv.Privileges == 0 {
+			p.RemoveUser(user)
+		}
+	}
+
+}
+
+// GrantPrivilegeToGrantOptions adjusts a user's grant option bits based on whether the GRANT or ALL
+// privilege was just granted or revoked. If GRANT/ALL was just granted, the user should obtain grant
+// options for each privilege it currently has. If GRANT/ALL was just revoked, the user should lose
+// grant options for each privilege it has
+// TODO(jackcwu): delete this function once the GRANT privilege is finally removed
+func (p *PrivilegeDescriptor) GrantPrivilegeToGrantOptions(
+	user security.SQLUsername, isGrant bool,
+) {
+	if isGrant {
+		userPriv := p.FindOrCreateUser(user)
+		userPriv.WithGrantOption = userPriv.Privileges
+	} else {
+		userPriv, ok := p.FindUser(user)
+		if !ok || userPriv.Privileges == 0 {
+			// Removing privileges from a user without privileges is a no-op.
+			return
+		}
+		userPriv.WithGrantOption = 0
 	}
 }
 

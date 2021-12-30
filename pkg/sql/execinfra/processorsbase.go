@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -665,12 +666,12 @@ func (pb *ProcessorBaseNoHelper) moveToTrailingMeta() {
 				pb.span.RecordStructured(stats)
 			}
 		}
-		if trace := pb.span.GetRecording(); trace != nil {
+		if trace := pb.span.GetRecording(pb.span.RecordingType()); trace != nil {
 			pb.trailingMeta = append(pb.trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
 		}
 	}
 
-	if util.CrdbTestBuild && pb.Ctx == nil {
+	if buildutil.CrdbTestBuild && pb.Ctx == nil {
 		panic(
 			errors.AssertionFailedf(
 				"unexpected nil ProcessorBase.Ctx when draining. Was StartInternal called?",
@@ -790,7 +791,7 @@ func (pb *ProcessorBase) InitWithEvalCtx(
 		return err
 	}
 	pb.SemaCtx = tree.MakeSemaContext()
-	pb.SemaCtx.TypeResolver = resolver
+	pb.SemaCtx.TypeResolver = &resolver
 
 	return pb.OutputHelper.Init(post, coreOutputTypes, &pb.SemaCtx, pb.EvalCtx)
 }
@@ -833,7 +834,12 @@ func (pb *ProcessorBase) AppendTrailingMeta(meta execinfrapb.ProducerMetadata) {
 // ProcessorSpan creates a child span for a processor (if we are doing any
 // tracing). The returned span needs to be finished using tracing.FinishSpan.
 func ProcessorSpan(ctx context.Context, name string) (context.Context, *tracing.Span) {
-	return tracing.ChildSpanRemote(ctx, name)
+	sp := tracing.SpanFromContext(ctx)
+	if sp == nil {
+		return ctx, nil
+	}
+	return sp.Tracer().StartSpanCtx(ctx, name,
+		tracing.WithParent(sp), tracing.WithDetachedRecording())
 }
 
 // StartInternal prepares the ProcessorBase for execution. It returns the

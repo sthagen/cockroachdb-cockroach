@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/types"
 	"github.com/gorhill/cronexpr"
@@ -214,20 +215,22 @@ func TestJobSchedulerDaemonGetWaitPeriod(t *testing.T) {
 	sv, cleanup := getScopedSettings()
 	defer cleanup()
 
+	noJitter := func(d time.Duration) time.Duration { return d }
+
 	schedulerEnabledSetting.Override(ctx, sv, false)
 
 	// When disabled, we wait 5 minutes before rechecking.
-	require.EqualValues(t, 5*time.Minute, getWaitPeriod(sv, nil))
+	require.EqualValues(t, 5*time.Minute, getWaitPeriod(ctx, sv, noJitter, nil))
 	schedulerEnabledSetting.Override(ctx, sv, true)
 
 	// When pace is too low, we use something more reasonable.
 	schedulerPaceSetting.Override(ctx, sv, time.Nanosecond)
-	require.EqualValues(t, minPacePeriod, getWaitPeriod(sv, nil))
+	require.EqualValues(t, minPacePeriod, getWaitPeriod(ctx, sv, noJitter, nil))
 
 	// Otherwise, we use user specified setting.
 	pace := 42 * time.Second
 	schedulerPaceSetting.Override(ctx, sv, pace)
-	require.EqualValues(t, pace, getWaitPeriod(sv, nil))
+	require.EqualValues(t, pace, getWaitPeriod(ctx, sv, noJitter, nil))
 }
 
 type recordScheduleExecutor struct {
@@ -294,7 +297,7 @@ func TestJobSchedulerCanBeDisabledWhileSleeping(t *testing.T) {
 	neverExecute := &recordScheduleExecutor{}
 	defer registerScopedScheduledJobExecutor(executorName, neverExecute)()
 
-	stopper := stop.NewStopper()
+	stopper := stop.NewStopper(stop.WithTracer(h.server.TracerI().(*tracing.Tracer)))
 	getWaitPeriodCalled := make(chan struct{})
 
 	knobs := fastDaemonKnobs(func() time.Duration {
@@ -391,7 +394,7 @@ func TestJobSchedulerDaemonProcessesJobs(t *testing.T) {
 	h.cfg.TestingKnobs = fastDaemonKnobs(overridePaceSetting(10 * time.Millisecond))
 
 	// Start daemon.
-	stopper := stop.NewStopper()
+	stopper := stop.NewStopper(stop.WithTracer(h.server.TracerI().(*tracing.Tracer)))
 	daemon := newJobScheduler(h.cfg, h.env, metric.NewRegistry())
 	daemon.runDaemon(ctx, stopper)
 
@@ -439,7 +442,7 @@ func TestJobSchedulerDaemonHonorsMaxJobsLimit(t *testing.T) {
 	h.cfg.TestingKnobs = fastDaemonKnobs(overridePaceSetting(time.Hour))
 
 	// Start daemon.
-	stopper := stop.NewStopper()
+	stopper := stop.NewStopper(stop.WithTracer(h.server.TracerI().(*tracing.Tracer)))
 	daemon := newJobScheduler(h.cfg, h.env, metric.NewRegistry())
 	daemon.runDaemon(ctx, stopper)
 
@@ -613,7 +616,7 @@ func TestJobSchedulerDaemonUsesSystemTables(t *testing.T) {
 		var count int
 		if err := db.QueryRow(
 			"SELECT count(*) FROM defaultdb.foo").Scan(&count); err != nil || count != 3 {
-			return errors.Newf("expected 3 rows, got %d (err=%+v)", count, err)
+			return errors.Newf("expected 3 rows, got %d (err=%+v)", count, err) // nolint:errwrap
 		}
 		return nil
 	})

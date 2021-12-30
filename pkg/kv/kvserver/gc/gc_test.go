@@ -119,7 +119,7 @@ func TestIntentAgeThresholdSetting(t *testing.T) {
 	intentHlc := hlc.Timestamp{
 		WallTime: intentTs.Nanoseconds(),
 	}
-	txn := roachpb.MakeTransaction("txn", key, roachpb.NormalUserPriority, intentHlc, 1000)
+	txn := roachpb.MakeTransaction("txn", key, roachpb.NormalUserPriority, intentHlc, 1000, 0)
 	require.NoError(t, storage.MVCCPut(ctx, eng, nil, key, intentHlc, value, &txn))
 	require.NoError(t, eng.Flush())
 
@@ -169,7 +169,7 @@ func TestIntentCleanupBatching(t *testing.T) {
 	}
 	for _, prefix := range txnPrefixes {
 		key := []byte{prefix, objectKeys[0]}
-		txn := roachpb.MakeTransaction("txn", key, roachpb.NormalUserPriority, intentHlc, 1000)
+		txn := roachpb.MakeTransaction("txn", key, roachpb.NormalUserPriority, intentHlc, 1000, 0)
 		for _, suffix := range objectKeys {
 			key := []byte{prefix, suffix}
 			require.NoError(t, storage.MVCCPut(ctx, eng, nil, key, intentHlc, value, &txn))
@@ -308,7 +308,7 @@ func TestGCIntentBatcher(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	rand, _ := randutil.NewTestPseudoRand()
+	rand, _ := randutil.NewTestRand()
 
 	for _, s := range []struct {
 		name    string

@@ -85,7 +85,7 @@ vectorized: true
         │
         └── • scan
               missing stats
-              table: unindexed@primary
+              table: unindexed@unindexed_pkey
               spans: FULL SCAN
 
 # Check DELETE with LIMIT clause (MySQL extension)
@@ -107,7 +107,7 @@ vectorized: true
         │
         └── • scan
               missing stats
-              table: unindexed@primary
+              table: unindexed@unindexed_pkey
               spans: FULL SCAN
 
 # Check fast DELETE.
@@ -138,7 +138,7 @@ vectorized: true
 │
 └── • scan
       missing stats
-      table: unindexed@primary
+      table: unindexed@unindexed_pkey
       spans: [/1 - ]
       limit: 1
 
@@ -230,9 +230,9 @@ query TT
 SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
 WHERE message LIKE '%DelRange%' OR message LIKE '%DelRng%'
 ----
-batch flow coordinator  DelRange /Table/57/1 - /Table/57/2
+batch flow coordinator  DelRange /Table/60/1 - /Table/60/2
 dist sender send        r43: sending batch 1 DelRng to (n1,s1):1
-batch flow coordinator  DelRange /Table/57/1/601/0 - /Table/57/2
+batch flow coordinator  DelRange /Table/60/1/601/0 - /Table/60/2
 dist sender send        r43: sending batch 1 DelRng to (n1,s1):1
 
 # Ensure that DelRange requests are autocommitted when DELETE FROM happens on a
@@ -248,7 +248,7 @@ query TT
 SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
 WHERE message LIKE '%DelRange%' OR message LIKE '%sending batch%'
 ----
-batch flow coordinator  DelRange /Table/57/1/5 - /Table/57/1/5/#
+batch flow coordinator  DelRange /Table/60/1/5 - /Table/60/1/6
 dist sender send        r43: sending batch 1 DelRng, 1 EndTxn to (n1,s1):1
 
 statement ok
@@ -286,7 +286,7 @@ vectorized: true
         └── • scan
               columns: (x, y, z)
               estimated row count: 1,000 (missing stats)
-              table: xyz@primary
+              table: xyz@xyz_pkey
               spans: FULL SCAN
 
 # With the hint, we use a constrained scan.
@@ -309,7 +309,7 @@ vectorized: true
     └── • index join
         │ columns: (x, y, z)
         │ estimated row count: 990 (missing stats)
-        │ table: xyz@primary
+        │ table: xyz@xyz_pkey
         │ key columns: x
         │
         └── • scan

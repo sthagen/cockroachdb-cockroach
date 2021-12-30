@@ -16,9 +16,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -51,7 +53,7 @@ func CreateUserDefinedSchemaDescriptor(
 	db catalog.DatabaseDescriptor,
 	allocateID bool,
 ) (*schemadesc.Mutable, *descpb.PrivilegeDescriptor, error) {
-	authRole, err := n.AuthRole.ToSQLUsername(sessionData)
+	authRole, err := n.AuthRole.ToSQLUsername(sessionData, security.UsernameValidation)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -77,7 +79,7 @@ func CreateUserDefinedSchemaDescriptor(
 				// Check if the object already exists in a dropped state
 				sc, err := descriptors.GetImmutableSchemaByID(ctx, txn, schemaID, tree.SchemaLookupFlags{
 					Required:       true,
-					AvoidCached:    true,
+					AvoidLeased:    true,
 					IncludeOffline: true,
 					IncludeDropped: true,
 				})
@@ -109,8 +111,13 @@ func CreateUserDefinedSchemaDescriptor(
 		}
 	}
 
-	privs := db.GetDefaultPrivilegeDescriptor().CreatePrivilegesFromDefaultPrivileges(
-		db.GetID(), user, tree.Schemas, db.GetPrivileges(),
+	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		db.GetDefaultPrivilegeDescriptor(),
+		nil, /* schemaDefaultPrivilegeDescriptor */
+		db.GetID(),
+		user,
+		tree.Schemas,
+		db.GetPrivileges(),
 	)
 
 	if !n.AuthRole.Undefined() {
@@ -188,13 +195,7 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 	}
 
 	// Update the parent database with this schema information.
-	if db.Schemas == nil {
-		db.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
-	}
-	db.Schemas[desc.Name] = descpb.DatabaseDescriptor_SchemaInfo{
-		ID:      desc.ID,
-		Dropped: false,
-	}
+	db.AddSchemaToDatabase(desc.Name, descpb.DatabaseDescriptor_SchemaInfo{ID: desc.ID})
 
 	if err := p.writeNonDropDatabaseChange(
 		params.ctx, db,

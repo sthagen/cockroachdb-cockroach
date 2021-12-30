@@ -67,6 +67,8 @@ func BuildChildPhysicalProps(
 		childProps.Presentation = parent.(*memo.AlterTableUnsplitExpr).Props.Presentation
 	case opt.AlterTableRelocateOp:
 		childProps.Presentation = parent.(*memo.AlterTableRelocateExpr).Props.Presentation
+	case opt.AlterRangeRelocateOp:
+		childProps.Presentation = parent.(*memo.AlterRangeRelocateExpr).Props.Presentation
 	case opt.ControlJobsOp:
 		childProps.Presentation = parent.(*memo.ControlJobsExpr).Props.Presentation
 	case opt.CancelQueriesOp:
@@ -109,7 +111,7 @@ func BuildChildPhysicalProps(
 		childProps.LimitHint = parentProps.LimitHint
 
 	case opt.DistinctOnOp:
-		distinctCount := parent.(memo.RelExpr).Relational().Stats.RowCount
+		distinctCount := parent.Relational().Stats.RowCount
 		if parentProps.LimitHint > 0 {
 			// TODO(mgartner): If the expression is a streaming DistinctOn, this
 			// estimated limit hint is much lower than it should be.
@@ -127,14 +129,15 @@ func BuildChildPhysicalProps(
 			break
 		}
 
-		outputRows := parent.(memo.RelExpr).Relational().Stats.RowCount
+		outputRows := parent.Relational().Stats.RowCount
 		if outputRows == 0 || outputRows < parentProps.LimitHint {
 			break
 		}
 
 		// For streaming GroupBy expressions we can estimate the number of input
 		// rows needed to produce LimitHint output rows.
-		if isStreamingAggregation(private, parentProps) {
+		streamingType := private.GroupingOrderType(&parentProps.Ordering)
+		if streamingType != memo.NoStreaming {
 			if input, ok := parent.Child(nth).(memo.RelExpr); ok {
 				inputRows := input.Relational().Stats.RowCount
 				childProps.LimitHint = streamingGroupByInputLimitHint(inputRows, outputRows, parentProps.LimitHint)
@@ -144,7 +147,7 @@ func BuildChildPhysicalProps(
 	case opt.SelectOp, opt.LookupJoinOp:
 		// These operations are assumed to produce a constant number of output rows
 		// for each input row, independent of already-processed rows.
-		outputRows := parent.(memo.RelExpr).Relational().Stats.RowCount
+		outputRows := parent.Relational().Stats.RowCount
 		if outputRows == 0 || outputRows < parentProps.LimitHint {
 			break
 		}
@@ -163,6 +166,24 @@ func BuildChildPhysicalProps(
 
 	case opt.OrdinalityOp, opt.ProjectOp, opt.ProjectSetOp:
 		childProps.LimitHint = parentProps.LimitHint
+
+	case opt.TopKOp:
+		if parentProps.Ordering.Any() {
+			break
+		}
+		outputRows := parent.Relational().Stats.RowCount
+		topk := parent.(*memo.TopKExpr)
+		k := float64(topk.K)
+		if outputRows == 0 || outputRows < k {
+			break
+		}
+		if input, ok := parent.Child(nth).(memo.RelExpr); ok {
+			inputRows := input.Relational().Stats.RowCount
+
+			if limitHint := topKInputLimitHint(mem, topk, inputRows, outputRows, k); limitHint < inputRows {
+				childProps.LimitHint = limitHint
+			}
+		}
 	}
 
 	if childProps.LimitHint < 0 {

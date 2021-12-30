@@ -582,7 +582,7 @@ apply. This flag is experimental.
 		Name: "locality-advertise-addr",
 		Description: `
 List of ports to advertise to other CockroachDB nodes for intra-cluster
-communication for some locality. This should be specified as a commma
+communication for some locality. This should be specified as a comma
 separated list of locality@address. Addresses can also include ports.
 For example:
 <PRE>
@@ -688,6 +688,13 @@ Instead, require the user to always specify access keys.`,
 		Name: "external-io-disabled",
 		Description: `
 Disable use of "external" IO, such as to S3, GCS, or the file system (nodelocal), or anything other than userfile.`,
+	}
+	ExternalIOEnableNonAdminImplicitAndArbitraryOutbound = FlagInfo{
+		Name: "external-io-enable-non-admin-implicit-access",
+		Description: `
+Allow non-admin users to specify arbitrary network addressses (e.g. https:// URIs or custom endpoints in s3:// URIs) and 
+implicit credentials (machine account/role providers) when running operations like IMPORT/EXPORT/BACKUP/etc. 
+Note: that --external-io-disable-http or --external-io-disable-implicit-credentials still apply, this only removes the admin-user requirement.`,
 	}
 
 	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
@@ -873,7 +880,11 @@ memory that the store may consume, for example:
 </PRE>
 Commas are forbidden in all values, since they are used to separate fields.
 Also, if you use equal signs in the file path to a store, you must use the
-"path" field label.`,
+"path" field label.
+
+(default is 'cockroach-data' in current directory except for mt commands
+which use 'cockroach-data-tenant-X' for tenant 'X')
+`,
 	}
 
 	StorageEngine = FlagInfo{
@@ -1106,6 +1117,12 @@ in the history of the cluster.`,
 as target of the decommissioning or recommissioning command.`,
 	}
 
+	NodeDrainSelf = FlagInfo{
+		Name: "self",
+		Description: `Use the node ID of the node connected to via --host
+as target of the drain or quit command.`,
+	}
+
 	SQLFmtLen = FlagInfo{
 		Name: "print-width",
 		Description: `
@@ -1136,14 +1153,16 @@ The line length where sqlfmt will try to wrap.`,
 		Name: "sql-port",
 		Description: `First port number for SQL servers.
 There should be as many TCP ports available as the value of --nodes
-starting at the specified value.`,
+starting at the specified value; for multitenant demo clusters, the
+number of required ports is twice the value of --nodes.`,
 	}
 
 	DemoHTTPPort = FlagInfo{
 		Name: "http-port",
 		Description: `First port number for HTTP servers.
 There should be as many TCP ports available as the value of --nodes
-starting at the specified value.`,
+starting at the specified value; for multitenant demo clusters, the
+number of required ports is twice the value of --nodes.`,
 	}
 
 	DemoNodes = FlagInfo{
@@ -1210,6 +1229,14 @@ More information about the geo-partitioned replicas topology can be found at:
 %s
 </PRE>
 		`, docs.URL("topology-geo-partitioned-replicas.html")),
+	}
+
+	DemoMultitenant = FlagInfo{
+		Name: "multitenant",
+		Description: `
+If set, cockroach demo will start separate in-memory KV and SQL servers in multi-tenancy mode.
+The SQL shell will be connected to the first tenant, and can be switched between tenants
+and the system tenant using the \connect command.`,
 	}
 
 	DemoNoLicense = FlagInfo{
@@ -1633,6 +1660,38 @@ If the destination is a full well-formed URI, such as
 'userfile://db.schema.tablename_prefix/path/to/dir', then it will be used
 verbatim.
 For example: 'userfile://foo.bar.baz_root/path/to/dir'
+`,
+	}
+
+	RecoverStore = FlagInfo{
+		Name:      "store",
+		Shorthand: "s",
+		Description: `
+The file path to a storage device. This flag must be specified separately for
+each storage device.
+<PRE>
+
+  --store=/mnt/ssd01 --store=/mnt/ssd02 --store=/mnt/hda1
+
+</PRE>
+Flag is syntactically identical to --store flag of start command, but only path
+part is used. This is done to make flags interoperable between start and recover
+commands.
+
+See start --help for more flag details and examples.
+`,
+	}
+
+	ConfirmActions = FlagInfo{
+		Name:      "confirm",
+		Shorthand: "p",
+		Description: `
+Confirm action:
+<PRE>
+y - assume yes to all prompts
+n - assume no/abort to all prompts
+p - prompt interactively for a confirmation
+</PRE>
 `,
 	}
 )

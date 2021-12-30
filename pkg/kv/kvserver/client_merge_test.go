@@ -573,8 +573,8 @@ func mergeCheckingTimestampCaches(
 	// Simulate a txn abort on the RHS from a node with a newer clock. Because
 	// the transaction record for the pushee was not yet written, this will bump
 	// the timestamp cache to record the abort.
-	pushee := roachpb.MakeTransaction("pushee", rhsKey, roachpb.MinUserPriority, readTS, 0)
-	pusher := roachpb.MakeTransaction("pusher", rhsKey, roachpb.MaxUserPriority, readTS, 0)
+	pushee := roachpb.MakeTransaction("pushee", rhsKey, roachpb.MinUserPriority, readTS, 0, 0)
+	pusher := roachpb.MakeTransaction("pusher", rhsKey, roachpb.MaxUserPriority, readTS, 0, 0)
 	ba = roachpb.BatchRequest{}
 	ba.Timestamp = readTS.Next()
 	ba.RangeID = rhsDesc.RangeID
@@ -694,7 +694,7 @@ func mergeCheckingTimestampCaches(
 			// Make sure the LHS range in uniquiesced so that it elects a new
 			// Raft leader after the partition is established.
 			for _, r := range lhsRepls {
-				r.UnquiesceAndWakeLeader()
+				r.MaybeUnquiesceAndWakeLeader()
 			}
 
 			// Issue an increment on the range. The leaseholder should evaluate
@@ -757,7 +757,7 @@ func mergeCheckingTimestampCaches(
 
 		// Install a filter to capture the Raft snapshot.
 		snapshotFilter = func(inSnap kvserver.IncomingSnapshot) {
-			if inSnap.State.Desc.RangeID == lhsDesc.RangeID {
+			if inSnap.Desc.RangeID == lhsDesc.RangeID {
 				snapChan <- inSnap
 			}
 		}
@@ -809,7 +809,7 @@ func mergeCheckingTimestampCaches(
 		case <-time.After(45 * time.Second):
 			t.Fatal("timed out waiting for snapChan")
 		}
-		inSnapDesc := inSnap.State.Desc
+		inSnapDesc := inSnap.Desc
 		require.Equal(t, lhsDesc.StartKey, inSnapDesc.StartKey)
 		require.Equal(t, rhsDesc.EndKey, inSnapDesc.EndKey)
 
@@ -2478,7 +2478,7 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 	}
 
 	transport := kvserver.NewRaftTransport(
-		log.AmbientContext{Tracer: tc.Servers[0].RaftTransport().Tracer},
+		tc.Servers[0].AmbientCtx(),
 		cluster.MakeTestingClusterSettings(),
 		nodedialer.New(tc.Servers[0].RPCContext(), gossip.AddressResolver(tc.Servers[0].Gossip())),
 		nil, /* grpcServer */
@@ -2670,6 +2670,8 @@ func TestStoreRangeMergeSlowUnabandonedFollower_NoSplit(t *testing.T) {
 	// Wait for store2 to hear about the split.
 	testutils.SucceedsSoon(t, func() error {
 		if rhsRepl2, err := store2.GetReplica(rhsDesc.RangeID); err != nil || !rhsRepl2.IsInitialized() {
+			// NB: errors.Wrapf(nil, ...) returns nil.
+			// nolint:errwrap
 			return errors.Errorf("store2 has not yet processed split. err: %v", err)
 		}
 		return nil
@@ -2754,7 +2756,7 @@ func TestStoreRangeMergeSlowUnabandonedFollower_WithSplit(t *testing.T) {
 		t.Fatal(pErr)
 	}
 
-	// Now split the newly merged range splits back out at exactly the same key.
+	// Now split the newly merged range back out at exactly the same key.
 	// When the replica GC queue looks in meta2 it will find the new RHS range, of
 	// which store2 is a member. Note that store2 does not yet have an initialized
 	// replica for this range, since it would intersect with the old RHS replica.
@@ -2767,7 +2769,7 @@ func TestStoreRangeMergeSlowUnabandonedFollower_WithSplit(t *testing.T) {
 	tc.RemoveVotersOrFatal(t, lhsDesc.StartKey.AsRawKey(), tc.Target(2))
 
 	// Transfer the lease on the new RHS to store2 and wait for it to apply. This
-	// will force its replica to of the new RHS to become up to date, which
+	// will force its replica of the new RHS to become up to date, which
 	// indirectly tests that the replica GC queue cleans up both the LHS replica
 	// and the old RHS replica.
 	tc.TransferRangeLeaseOrFatal(t, *newRHSDesc, tc.Target(2))
@@ -3229,7 +3231,9 @@ func (h *slowSnapRaftHandler) unblock() {
 }
 
 func (h *slowSnapRaftHandler) HandleSnapshot(
-	header *kvserver.SnapshotRequest_Header, respStream kvserver.SnapshotResponseStream,
+	ctx context.Context,
+	header *kvserver.SnapshotRequest_Header,
+	respStream kvserver.SnapshotResponseStream,
 ) error {
 	if header.RaftMessageRequest.RangeID == h.rangeID {
 		h.Lock()
@@ -3239,7 +3243,7 @@ func (h *slowSnapRaftHandler) HandleSnapshot(
 			<-waitCh
 		}
 	}
-	return h.RaftMessageHandler.HandleSnapshot(header, respStream)
+	return h.RaftMessageHandler.HandleSnapshot(ctx, header, respStream)
 }
 
 // TestStoreRangeMergeUninitializedLHSFollower reproduces a rare bug in which a
@@ -3731,7 +3735,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		// on in the test. This function verifies that the subsumed replicas have
 		// been handled properly.
 		if snapType != kvserver.SnapshotRequest_VIA_SNAPSHOT_QUEUE ||
-			inSnap.State.Desc.RangeID != rangeIds[string(keyA)] {
+			inSnap.Desc.RangeID != rangeIds[string(keyA)] {
 			return nil
 		}
 
@@ -3779,15 +3783,15 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 
 		// Construct SSTs for the the first 4 bullets as numbered above, but only
 		// ultimately keep the last one.
-		keyRanges := rditer.MakeReplicatedKeyRanges(inSnap.State.Desc)
-		it := rditer.NewReplicaEngineDataIterator(inSnap.State.Desc, sendingEng, true /* replicatedOnly */)
+		keyRanges := rditer.MakeReplicatedKeyRanges(inSnap.Desc)
+		it := rditer.NewReplicaEngineDataIterator(inSnap.Desc, sendingEng, true /* replicatedOnly */)
 		defer it.Close()
 		// Write a range deletion tombstone to each of the SSTs then put in the
 		// kv entries from the sender of the snapshot.
 		for _, r := range keyRanges {
 			sstFile := &storage.MemFile{}
 			sst := storage.MakeIngestionSSTWriter(sstFile)
-			if err := sst.ClearRawRange(r.Start.Key, r.End.Key); err != nil {
+			if err := sst.ClearRawRange(r.Start, r.End); err != nil {
 				return err
 			}
 
@@ -3798,7 +3802,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if !valid || r.End.Key.Compare(it.UnsafeKey().Key) <= 0 {
+				if !valid || r.End.Compare(it.UnsafeKey().Key) <= 0 {
 					if err := sst.Finish(); err != nil {
 						return err
 					}
@@ -3826,7 +3830,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			sst := storage.MakeIngestionSSTWriter(sstFile)
 			defer sst.Close()
 			r := rditer.MakeRangeIDLocalKeyRange(rangeID, false /* replicatedOnly */)
-			if err := sst.ClearRawRange(r.Start.Key, r.End.Key); err != nil {
+			if err := sst.ClearRawRange(r.Start, r.End); err != nil {
 				return err
 			}
 			tombstoneKey := keys.RangeTombstoneKey(rangeID)
@@ -3850,7 +3854,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			EndKey:   roachpb.RKey(keyEnd),
 		}
 		r := rditer.MakeUserKeyRange(&desc)
-		if err := storage.ClearRangeWithHeuristic(receivingEng, &sst, r.Start.Key, r.End.Key); err != nil {
+		if err := storage.ClearRangeWithHeuristic(receivingEng, &sst, r.Start, r.End); err != nil {
 			return err
 		}
 		err := sst.Finish()
@@ -4204,7 +4208,7 @@ func TestMergeQueue(t *testing.T) {
 			t.Fatal(pErr)
 		}
 	}
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	randBytes := randutil.RandBytes(rng, int(conf.RangeMinBytes))
 
 	lhsStartKey := roachpb.RKey(tc.ScratchRange(t))
@@ -4829,7 +4833,7 @@ func sendWithTxn(
 	args roachpb.Request,
 ) error {
 	txn := roachpb.MakeTransaction("test txn", desc.StartKey.AsRawKey(),
-		0, ts, maxOffset.Nanoseconds())
+		0, ts, maxOffset.Nanoseconds(), 0)
 	_, pErr := kv.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: &txn}, args)
 	return pErr.GoError()
 }
@@ -5017,7 +5021,7 @@ func setupClusterWithSubsumedRange(
 			newDesc, err = tc.AddVoters(desc.StartKey.AsRawKey(), tc.Target(1))
 			if kv.IsExpectedRelocateError(err) {
 				// Retry.
-				return errors.Newf("ChangeReplicas: received error %s", err)
+				return errors.Wrap(err, "ChangeReplicas received error")
 			}
 			return nil
 		})

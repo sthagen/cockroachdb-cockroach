@@ -513,6 +513,24 @@
         }
       }
     },
+    "/rules/": {
+      "get": {
+        "description": "Endpoint to export recommended metric recording and alerting rules.\nThese rules are intended to be used as a guideline for aggregating\nand using metrics for alerting purposes. All rules are in the\nYAML format compatible with Prometheus recording and alerting\nrules. All recording rules are grouped under 'rules/recording'\nlabel while alerting rules are grouped under 'rules/alerts'.",
+        "produces": [
+          "text/plain"
+        ],
+        "summary": "Get metric recording and alerting rule templates",
+        "operationId": "rules",
+        "responses": {
+          "200": {
+            "description": "Recording and Alert Rules",
+            "schema": {
+              "$ref": "#/definitions/PrometheusRuleGroup"
+            }
+          }
+        }
+      }
+    },
     "/sessions/": {
       "get": {
         "security": [
@@ -622,6 +640,11 @@
           "description": "The SQL statement fingerprint, compatible with StatementStatisticsKey.",
           "type": "string",
           "x-go-name": "SqlNoConstants"
+        },
+        "sql_summary": {
+          "description": "A summarized version of the sql query.",
+          "type": "string",
+          "x-go-name": "SqlSummary"
         },
         "start": {
           "description": "Start timestamp of this query.",
@@ -951,6 +974,50 @@
       },
       "x-go-package": "github.com/cockroachdb/cockroach/pkg/server/serverpb"
     },
+    "PrometheusRuleGroup": {
+      "type": "object",
+      "title": "PrometheusRuleGroup is a list of recording and alerting rules.",
+      "properties": {
+        "Rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PrometheusRuleNode"
+          }
+        }
+      },
+      "x-go-package": "github.com/cockroachdb/cockroach/pkg/util/metric"
+    },
+    "PrometheusRuleNode": {
+      "type": "object",
+      "title": "PrometheusRuleNode represents an individual rule node within the YAML output.",
+      "properties": {
+        "Alert": {
+          "type": "string"
+        },
+        "Annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "Expr": {
+          "type": "string"
+        },
+        "For": {
+          "type": "string"
+        },
+        "Labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "Record": {
+          "type": "string"
+        }
+      },
+      "x-go-package": "github.com/cockroachdb/cockroach/pkg/util/metric"
+    },
     "RangeProblems": {
       "type": "object",
       "title": "RangeProblems describes issues reported by a range. For internal use only.",
@@ -1202,7 +1269,7 @@
           "x-go-name": "Indexes"
         },
         "range_count": {
-          "description": "range_count is the size of the table in ranges. This provides a rough\nestimate of the storage requirements for the table.\nTODO(mrtracy): The TableStats method also returns a range_count field which\nis more accurate than this one; TableDetails calculates this number using\na potentially faster method that is subject to cache staleness. We should\nconsider removing or renaming this field to reflect that difference. See\nGithub issue #5435 for more information.",
+          "description": "range_count is the size of the table in ranges. This provides a rough\nestimate of the storage requirements for the table.\nTODO(mrtracy): The TableStats method also returns a range_count field which\nis more accurate than this one; TableDetails calculates this number using\na potentially faster method that is subject to cache staleness. We should\nconsider removing or renaming this field to reflect that difference. See\nGitHub issue #5435 for more information.",
           "type": "integer",
           "format": "int64",
           "x-go-name": "RangeCount"
@@ -1529,7 +1596,7 @@
           "x-go-name": "GlobalReads"
         },
         "inherited_constraints": {
-          "description": "InheritedContraints specifies if the value in the Constraints field was\ninherited from the zone's parent or specified explicitly by the user.\n\nNB: We need this extra field because the non-nullable nature of\n`constraints` means that there is no other way to disambiguate between an\nunset `constraints` attribute and an empty one.",
+          "description": "InheritedConstraints specifies if the value in the Constraints field was\ninherited from the zone's parent or specified explicitly by the user.\n\nNB: We need this extra field because the non-nullable nature of\n`constraints` means that there is no other way to disambiguate between an\nunset `constraints` attribute and an empty one.",
           "type": "boolean",
           "x-go-name": "InheritedConstraints"
         },
@@ -1775,7 +1842,7 @@
       "type": "object",
       "properties": {
         "logged_out": {
-          "description": "Indicates whether logout was succeessful.",
+          "description": "Indicates whether logout was successful.",
           "type": "boolean",
           "x-go-name": "LoggedOut"
         }

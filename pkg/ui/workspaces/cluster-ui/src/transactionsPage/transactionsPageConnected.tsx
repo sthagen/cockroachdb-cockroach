@@ -11,12 +11,9 @@
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import { Dispatch } from "redux";
-import { Moment } from "moment";
 
 import { AppState } from "src/store";
-import { actions as transactionsActions } from "src/store/transactions";
-import { actions as resetSQLStatsActions } from "src/store/sqlStats";
-import { actions as statementsActions } from "src/store/statements";
+import { actions as sqlStatsActions } from "src/store/sqlStats";
 import { TransactionsPage } from "./transactionsPage";
 import {
   TransactionsPageStateProps,
@@ -26,12 +23,18 @@ import {
   selectTransactionsData,
   selectTransactionsLastError,
   selectTxnColumns,
+  selectSortSetting,
+  selectFilters,
+  selectSearch,
 } from "./transactionsPage.selectors";
 import { selectIsTenant } from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
-import { selectDateRange } from "src/statementsPage/statementsPage.selectors";
+import { selectTimeScale } from "src/statementsPage/statementsPage.selectors";
 import { StatementsRequest } from "src/api/statementsApi";
 import { actions as localStorageActions } from "../store/localStorage";
+import { Filters } from "../queryFilter";
+import { actions as analyticsActions } from "../store/analytics";
+import { TimeScale } from "../timeScaleDropdown";
 
 export const TransactionsPageConnected = withRouter(
   connect<
@@ -40,22 +43,24 @@ export const TransactionsPageConnected = withRouter(
     RouteComponentProps
   >(
     (state: AppState) => ({
-      data: selectTransactionsData(state),
-      nodeRegions: nodeRegionsByIDSelector(state),
-      error: selectTransactionsLastError(state),
-      isTenant: selectIsTenant(state),
-      dateRange: selectDateRange(state),
       columns: selectTxnColumns(state),
+      data: selectTransactionsData(state),
+      timeScale: selectTimeScale(state),
+      error: selectTransactionsLastError(state),
+      filters: selectFilters(state),
+      isTenant: selectIsTenant(state),
+      nodeRegions: nodeRegionsByIDSelector(state),
+      search: selectSearch(state),
+      sortSetting: selectSortSetting(state),
     }),
     (dispatch: Dispatch) => ({
       refreshData: (req?: StatementsRequest) =>
-        dispatch(transactionsActions.refresh(req)),
-      resetSQLStats: () => dispatch(resetSQLStatsActions.request()),
-      onDateRangeChange: (start: Moment, end: Moment) => {
+        dispatch(sqlStatsActions.refresh(req)),
+      resetSQLStats: () => dispatch(sqlStatsActions.reset()),
+      onTimeScaleChange: (ts: TimeScale) => {
         dispatch(
-          statementsActions.updateDateRange({
-            start: start.unix(),
-            end: end.unix(),
+          sqlStatsActions.updateTimeScale({
+            ts: ts,
           }),
         );
       },
@@ -71,6 +76,48 @@ export const TransactionsPageConnected = withRouter(
               selectedColumns.length === 0 ? " " : selectedColumns.join(","),
           }),
         ),
+      onSortingChange: (
+        tableName: string,
+        columnName: string,
+        ascending: boolean,
+      ) => {
+        dispatch(
+          localStorageActions.update({
+            key: "sortSetting/TransactionsPage",
+            value: { columnTitle: columnName, ascending: ascending },
+          }),
+        );
+      },
+      onFilterChange: (value: Filters) => {
+        dispatch(
+          analyticsActions.track({
+            name: "Filter Clicked",
+            page: "Transactions",
+            filterName: "app",
+            value: value.toString(),
+          }),
+        );
+        dispatch(
+          localStorageActions.update({
+            key: "filters/TransactionsPage",
+            value: value,
+          }),
+        );
+      },
+      onSearchComplete: (query: string) => {
+        dispatch(
+          analyticsActions.track({
+            name: "Keyword Searched",
+            page: "Transactions",
+          }),
+        );
+        dispatch(
+          localStorageActions.update({
+            key: "search/TransactionsPage",
+            value: query,
+          }),
+        );
+      },
     }),
   )(TransactionsPage),
 );

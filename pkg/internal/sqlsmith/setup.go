@@ -24,16 +24,17 @@ import (
 // for smithing.
 type Setup func(*rand.Rand) string
 
+// RandTableSetupName is the name of the table setup that creates random tables.
+const RandTableSetupName = "rand-tables"
+
 // Setups is a collection of useful initial table states.
 var Setups = map[string]Setup{
 	"empty": wrapCommonSetup(stringSetup("")),
 	// seed is a SQL statement that creates a table with most data types
 	// and some sample rows.
-	"seed": wrapCommonSetup(stringSetup(seedTable)),
-	// seed-vec is like seed except only types supported by vectorized
-	// execution are used.
-	"seed-vec":    wrapCommonSetup(stringSetup(vecSeedTable)),
-	"rand-tables": wrapCommonSetup(randTables),
+	"seed":              wrapCommonSetup(stringSetup(seedTable)),
+	"seed-multi-region": wrapCommonSetup(stringSetup(multiregionSeed)),
+	RandTableSetupName:  wrapCommonSetup(randTables),
 }
 
 // wrapCommonSetup wraps setup steps common to all SQLSmith setups around the
@@ -80,7 +81,6 @@ func randTablesN(r *rand.Rand, n int) string {
 	sb.WriteString(`
 		SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
 		SET CLUSTER SETTING sql.stats.histogram_collection.enabled = false;
-		SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true;
 	`)
 
 	// Create the random tables.
@@ -139,8 +139,8 @@ CREATE INDEX on seed (_int8, _float8, _date);
 CREATE INVERTED INDEX on seed (_jsonb);
 `
 
-	vecSeedTable = `
-CREATE TABLE IF NOT EXISTS seed_vec AS
+	multiregionSeed = `
+CREATE TABLE IF NOT EXISTS seed_mr_table AS
 	SELECT
 		g::INT2 AS _int2,
 		g::INT4 AS _int4,
@@ -157,9 +157,6 @@ CREATE TABLE IF NOT EXISTS seed_vec AS
 		substring('00000000-0000-0000-0000-' || g::STRING || '00000000000', 1, 36)::UUID AS _uuid
 	FROM
 		generate_series(1, 5) AS g;
-
-INSERT INTO seed_vec DEFAULT VALUES;
-CREATE INDEX on seed_vec (_int8, _float8, _date);
 `
 )
 
@@ -193,13 +190,8 @@ var Settings = map[string]SettingFunc{
 	"no-mutations+rand": randSetting(Parallel, DisableMutations()),
 	"no-ddl+rand":       randSetting(NoParallel, DisableDDLs()),
 	"ddl-nodrop":        randSetting(NoParallel, OnlyNoDropDDLs()),
+	"multi-region":      randSetting(Parallel, MultiRegionDDLs()),
 }
-
-// SettingVectorize is the setting for vectorizable. It is not included in
-// Settings because it has type restrictions during CREATE TABLE, but Settings
-// is designed to be used with anything in Setups, which may violate that
-// restriction.
-var SettingVectorize = staticSetting(Parallel, Vectorizable())
 
 var settingNames = func() []string {
 	var ret []string
@@ -252,8 +244,4 @@ var randOptions = []SmitherOption{
 	DisableWith(),
 	PostgresMode(),
 	SimpleDatums(),
-
-	// Vectorizable() is not included here because it assumes certain
-	// types don't exist in table schemas. Since we don't yet have a way to
-	// verify that assumption, don't enable this.
 }

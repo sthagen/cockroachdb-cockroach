@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -245,7 +245,7 @@ func (f *Factory) CopyAndReplace(
 	// columns can keep the same ids they had in the "from" memo. Scalar
 	// expressions in the metadata cannot have placeholders, so we simply copy
 	// the expressions without replacement.
-	f.mem.Metadata().CopyFrom(from.Memo().Metadata(), f.CopyScalarWithoutPlaceholders)
+	f.mem.Metadata().CopyFrom(from.Memo().Metadata(), f.CopyWithoutAssigningPlaceholders)
 
 	// Perform copy and replacement, and store result as the root of this
 	// factory's memo.
@@ -253,10 +253,10 @@ func (f *Factory) CopyAndReplace(
 	f.Memo().SetRoot(to, fromProps)
 }
 
-// CopyScalarWithoutPlaceholders returns a copy of the given scalar expression.
+// CopyWithoutAssigningPlaceholders returns a copy of the given scalar expression.
 // It does not attempt to replace placeholders with values.
-func (f *Factory) CopyScalarWithoutPlaceholders(e opt.Expr) opt.Expr {
-	return f.CopyAndReplaceDefault(e, f.CopyScalarWithoutPlaceholders)
+func (f *Factory) CopyWithoutAssigningPlaceholders(e opt.Expr) opt.Expr {
+	return f.CopyAndReplaceDefault(e, f.CopyWithoutAssigningPlaceholders)
 }
 
 // AssignPlaceholders is used just before execution of a prepared Memo. It makes
@@ -302,7 +302,7 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 // function returns. It is used to verify that the stack depth is correctly
 // decremented for each constructor function.
 func (f *Factory) CheckConstructorStackDepth() {
-	if util.CrdbTestBuild && f.constructorStackDepth != 0 {
+	if buildutil.CrdbTestBuild && f.constructorStackDepth != 0 {
 		panic(errors.AssertionFailedf(
 			"expected constructor stack depth %v to be 0",
 			f.constructorStackDepth,
@@ -318,7 +318,7 @@ func (f *Factory) onMaxConstructorStackDepthExceeded() {
 		"optimizer factory constructor call stack exceeded max depth of %v",
 		maxConstructorStackDepth,
 	)
-	if util.CrdbTestBuild {
+	if buildutil.CrdbTestBuild {
 		panic(err)
 	}
 	errorutil.SendReport(f.evalCtx.Ctx(), &f.evalCtx.Settings.SV, err)

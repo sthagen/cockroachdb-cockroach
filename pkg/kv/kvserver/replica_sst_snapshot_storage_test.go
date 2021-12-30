@@ -34,7 +34,7 @@ func TestSSTSnapshotStorage(t *testing.T) {
 	testSnapUUID := uuid.Must(uuid.FromBytes([]byte("foobar1234567890")))
 	testLimiter := rate.NewLimiter(rate.Inf, 0)
 
-	cleanup, eng := newOnDiskEngine(t)
+	cleanup, eng := newOnDiskEngine(ctx, t)
 	defer cleanup()
 	defer eng.Close()
 
@@ -105,6 +105,42 @@ func TestSSTSnapshotStorage(t *testing.T) {
 	}
 }
 
+// TestSSTSnapshotStorageContextCancellation verifies that writing to an
+// SSTSnapshotStorage is reactive to context cancellation.
+func TestSSTSnapshotStorageContextCancellation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testRangeID := roachpb.RangeID(1)
+	testSnapUUID := uuid.Must(uuid.FromBytes([]byte("foobar1234567890")))
+	testLimiter := rate.NewLimiter(rate.Inf, 0)
+
+	ctx := context.Background()
+	cleanup, eng := newOnDiskEngine(ctx, t)
+	defer cleanup()
+	defer eng.Close()
+
+	sstSnapshotStorage := NewSSTSnapshotStorage(eng, testLimiter)
+	scratch := sstSnapshotStorage.NewScratchSpace(testRangeID, testSnapUUID)
+
+	var cancel func()
+	ctx, cancel = context.WithCancel(ctx)
+	f, err := scratch.NewFile(ctx, 0)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, f.Close())
+	}()
+
+	// Before context cancellation.
+	_, err = f.Write([]byte("foo"))
+	require.NoError(t, err)
+
+	// After context cancellation.
+	cancel()
+	_, err = f.Write([]byte("bar"))
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 // TestMultiSSTWriterInitSST tests that multiSSTWriter initializes each of the
 // SST files associated with the replicated key ranges by writing a range
 // deletion tombstone that spans the entire range of each respectively.
@@ -117,7 +153,7 @@ func TestMultiSSTWriterInitSST(t *testing.T) {
 	testSnapUUID := uuid.Must(uuid.FromBytes([]byte("foobar1234567890")))
 	testLimiter := rate.NewLimiter(rate.Inf, 0)
 
-	cleanup, eng := newOnDiskEngine(t)
+	cleanup, eng := newOnDiskEngine(ctx, t)
 	defer cleanup()
 	defer eng.Close()
 
@@ -131,7 +167,7 @@ func TestMultiSSTWriterInitSST(t *testing.T) {
 
 	msstw, err := newMultiSSTWriter(ctx, scratch, keyRanges, 0)
 	require.NoError(t, err)
-	err = msstw.Finish(ctx)
+	_, err = msstw.Finish(ctx)
 	require.NoError(t, err)
 
 	var actualSSTs [][]byte
@@ -150,7 +186,7 @@ func TestMultiSSTWriterInitSST(t *testing.T) {
 			sstFile := &storage.MemFile{}
 			sst := storage.MakeIngestionSSTWriter(sstFile)
 			defer sst.Close()
-			err := sst.ClearRawRange(r.Start.Key, r.End.Key)
+			err := sst.ClearRawRange(r.Start, r.End)
 			require.NoError(t, err)
 			err = sst.Finish()
 			require.NoError(t, err)

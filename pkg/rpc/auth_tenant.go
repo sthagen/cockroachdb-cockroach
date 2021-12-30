@@ -97,6 +97,12 @@ func (a tenantAuthorizer) authorize(
 	case "/cockroach.server.serverpb.Status/CancelLocalSession":
 		return a.authTenant(tenID)
 
+	case "/cockroach.server.serverpb.Status/CancelQuery":
+		return a.authTenant(tenID)
+
+	case "/cockroach.server.serverpb.Status/CancelLocalQuery":
+		return a.authTenant(tenID)
+
 	case "/cockroach.roachpb.Internal/GetSpanConfigs":
 		return a.authGetSpanConfigs(tenID, req.(*roachpb.GetSpanConfigsRequest))
 
@@ -139,6 +145,7 @@ var reqMethodAllowlist = [...]bool{
 	roachpb.Delete:         true,
 	roachpb.DeleteRange:    true,
 	roachpb.ClearRange:     true,
+	roachpb.RevertRange:    true,
 	roachpb.Scan:           true,
 	roachpb.ReverseScan:    true,
 	roachpb.EndTxn:         true,
@@ -304,7 +311,7 @@ func tenantPrefix(tenID roachpb.TenantID) roachpb.RSpan {
 
 // wrappedServerStream is a thin wrapper around grpc.ServerStream that allows
 // modifying its context and overriding its RecvMsg method. It can be used to
-// intercept each messsage and inject custom validation logic.
+// intercept each message and inject custom validation logic.
 type wrappedServerStream struct {
 	grpc.ServerStream
 	ctx  context.Context

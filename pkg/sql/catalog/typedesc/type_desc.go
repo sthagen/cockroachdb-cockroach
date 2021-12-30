@@ -177,6 +177,16 @@ func (desc *immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// ByteSize implements the Descriptor interface.
+func (desc *immutable) ByteSize() int64 {
+	return int64(desc.Size())
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
+	return NewBuilder(desc.TypeDesc())
+}
+
 // PrimaryRegionName implements the TypeDescriptor interface.
 func (desc *immutable) PrimaryRegionName() (descpb.RegionName, error) {
 	if desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
@@ -252,6 +262,8 @@ func (desc *immutable) RegionNamesIncludingTransitioning() (descpb.RegionNames, 
 }
 
 // SetDrainingNames implements the MutableDescriptor interface.
+//
+// Deprecated: Do not use.
 func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
 	desc.DrainingNames = names
 }
@@ -438,8 +450,15 @@ func (desc *Mutable) SetParentSchemaID(schemaID descpb.ID) {
 
 // AddDrainingName adds a draining name to the TypeDescriptor's slice of
 // draining names.
+//
+// Deprecated: Do not use.
 func (desc *Mutable) AddDrainingName(name descpb.NameInfo) {
 	desc.DrainingNames = append(desc.DrainingNames, name)
+}
+
+// SetName sets the TypeDescriptor's name.
+func (desc *Mutable) SetName(name string) {
+	desc.Name = name
 }
 
 // EnumMembers is a sortable list of TypeDescriptor_EnumMember, sorted by the
@@ -502,6 +521,8 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 		if desc.GetArrayTypeID() != descpb.InvalidID {
 			vea.Report(errors.AssertionFailedf("ALIAS type desc has array type ID %d", desc.GetArrayTypeID()))
 		}
+	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
+		vea.Report(errors.AssertionFailedf("invalid type descriptor: kind %s should never be serialized or validated", desc.Kind.String()))
 	default:
 		vea.Report(errors.AssertionFailedf("invalid type descriptor kind %s", desc.Kind.String()))
 	}
@@ -554,6 +575,7 @@ func (desc *immutable) validateEnumMembers(vea catalog.ValidationErrorAccumulato
 func (desc *immutable) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 	ids := catalog.MakeDescriptorIDSet(desc.GetReferencingDescriptorIDs()...)
 	ids.Add(desc.GetParentID())
+	// TODO(richardjcai): Remove logic for keys.PublicSchemaID in 22.2.
 	if desc.GetParentSchemaID() != keys.PublicSchemaID {
 		ids.Add(desc.GetParentSchemaID())
 	}
@@ -578,6 +600,7 @@ func (desc *immutable) ValidateCrossReferences(
 	}
 
 	// Check that the parent schema exists.
+	// TODO(richardjcai): Remove logic for keys.PublicSchemaID in 22.2.
 	if desc.GetParentSchemaID() != keys.PublicSchemaID {
 		schemaDesc, err := vdg.GetSchemaDescriptor(desc.GetParentSchemaID())
 		vea.Report(err)
@@ -719,39 +742,52 @@ func (desc *immutable) MakeTypesT(
 	}
 }
 
-// HydrateTypesInTableDescriptor uses typeLookup to install metadata in the
-// types present in a table descriptor. typeLookup retrieves the fully
-// qualified name and descriptor for a particular ID.
-func HydrateTypesInTableDescriptor(
-	ctx context.Context, desc *descpb.TableDescriptor, res catalog.TypeDescriptorResolver,
+// EnsureTypeIsHydrated makes sure that t is a fully-hydrated type.
+func EnsureTypeIsHydrated(
+	ctx context.Context, t *types.T, res catalog.TypeDescriptorResolver,
 ) error {
-	hydrateCol := func(col *descpb.ColumnDescriptor) error {
-		if col.Type.UserDefined() {
-			// Look up its type descriptor.
-			td, err := GetUserDefinedTypeDescID(col.Type)
-			if err != nil {
-				return err
-			}
-			name, typDesc, err := res.GetTypeDescriptor(ctx, td)
-			if err != nil {
-				return err
-			}
-			// Note that this will no-op if the type is already hydrated.
-			if err := typDesc.HydrateTypeInfoWithName(ctx, col.Type, &name, res); err != nil {
+	// maybeHydrateType checks if t is a user-defined type that hasn't been
+	// hydrated yet, and installs the metadata if so.
+	maybeHydrateType := func(ctx context.Context, t *types.T, res catalog.TypeDescriptorResolver) error {
+		if !t.UserDefined() || t.IsHydrated() {
+			return nil
+		}
+		id, err := GetUserDefinedTypeDescID(t)
+		if err != nil {
+			return err
+		}
+		elemTypName, elemTypDesc, err := res.GetTypeDescriptor(ctx, id)
+		if err != nil {
+			return err
+		}
+		return elemTypDesc.HydrateTypeInfoWithName(ctx, t, &elemTypName, res)
+	}
+	if t.Family() == types.TupleFamily {
+		for _, typ := range t.TupleContents() {
+			if err := maybeHydrateType(ctx, typ, res); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
+	return maybeHydrateType(ctx, t, res)
+}
+
+// HydrateTypesInTableDescriptor uses res to install metadata in the types
+// present in a table descriptor. res retrieves the fully qualified name and
+// descriptor for a particular ID.
+func HydrateTypesInTableDescriptor(
+	ctx context.Context, desc *descpb.TableDescriptor, res catalog.TypeDescriptorResolver,
+) error {
 	for i := range desc.Columns {
-		if err := hydrateCol(&desc.Columns[i]); err != nil {
+		if err := EnsureTypeIsHydrated(ctx, desc.Columns[i].Type, res); err != nil {
 			return err
 		}
 	}
 	for i := range desc.Mutations {
 		mut := &desc.Mutations[i]
 		if col := mut.GetColumn(); col != nil {
-			if err := hydrateCol(col); err != nil {
+			if err := EnsureTypeIsHydrated(ctx, col.Type, res); err != nil {
 				return err
 			}
 		}
@@ -790,20 +826,11 @@ func (desc *immutable) HydrateTypeInfoWithName(
 			case types.ArrayFamily:
 				// Hydrate the element type.
 				elemType := typ.ArrayContents()
-				id, err := GetUserDefinedTypeDescID(elemType)
-				if err != nil {
-					return err
-				}
-				elemTypName, elemTypDesc, err := res.GetTypeDescriptor(ctx, id)
-				if err != nil {
-					return err
-				}
-				if err := elemTypDesc.HydrateTypeInfoWithName(ctx, elemType, &elemTypName, res); err != nil {
-					return err
-				}
-				return nil
+				return EnsureTypeIsHydrated(ctx, elemType, res)
+			case types.TupleFamily:
+				return EnsureTypeIsHydrated(ctx, typ, res)
 			default:
-				return errors.AssertionFailedf("only array types aliases can be user defined")
+				return errors.AssertionFailedf("unhandled alias type family %s", typ.Family())
 			}
 		}
 		return nil
@@ -933,7 +960,8 @@ func GetTypeDescriptorClosure(typ *types.T) (map[descpb.ID]struct{}, error) {
 	ret := map[descpb.ID]struct{}{
 		id: {},
 	}
-	if typ.Family() == types.ArrayFamily {
+	switch typ.Family() {
+	case types.ArrayFamily:
 		// If we have an array type, then collect all types in the contents.
 		children, err := GetTypeDescriptorClosure(typ.ArrayContents())
 		if err != nil {
@@ -942,7 +970,18 @@ func GetTypeDescriptorClosure(typ *types.T) (map[descpb.ID]struct{}, error) {
 		for id := range children {
 			ret[id] = struct{}{}
 		}
-	} else {
+	case types.TupleFamily:
+		// If we have a tuple type, collect all types in the contents.
+		for _, elt := range typ.TupleContents() {
+			children, err := GetTypeDescriptorClosure(elt)
+			if err != nil {
+				return nil, err
+			}
+			for id := range children {
+				ret[id] = struct{}{}
+			}
+		}
+	default:
 		// Otherwise, take the array type ID.
 		id, err := GetUserDefinedArrayTypeDescID(typ)
 		if err != nil {

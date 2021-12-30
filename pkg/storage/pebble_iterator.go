@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/sstable"
 )
 
 // pebbleIterator is a wrapper around a pebble.Iterator that implements the
@@ -152,6 +153,14 @@ func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, o
 				p.timeBoundNumSSTables++
 			}
 			return used
+		}
+		// We are given an inclusive [MinTimestampHint, MaxTimestampHint]. The
+		// MVCCWAllTimeIntervalCollector has collected the WallTimes and we need
+		// [min, max), i.e., exclusive on the upper bound.
+		p.options.BlockPropertyFilters = []pebble.BlockPropertyFilter{
+			sstable.NewBlockIntervalFilter(mvccWallTimeIntervalCollector,
+				uint64(opts.MinTimestampHint.WallTime),
+				uint64(opts.MaxTimestampHint.WallTime)+1),
 		}
 	} else if !opts.MinTimestampHint.IsEmpty() {
 		panic("min timestamp hint set without max timestamp hint")
@@ -566,11 +575,6 @@ func (p *pebbleIterator) ValueProto(msg protoutil.Message) error {
 	return protoutil.Unmarshal(value, msg)
 }
 
-// IsCurIntentSeparated implements the MVCCIterator interface.
-func (p *pebbleIterator) IsCurIntentSeparated() bool {
-	return false
-}
-
 // ComputeStats implements the MVCCIterator interface.
 func (p *pebbleIterator) ComputeStats(
 	start, end roachpb.Key, nowNanos int64,
@@ -584,7 +588,7 @@ func isValidSplitKey(key roachpb.Key, noSplitSpans []roachpb.Span) bool {
 	if key.Equal(keys.Meta2KeyMax) {
 		// We do not allow splits at Meta2KeyMax. The reason for this is that range
 		// descriptors are stored at RangeMetaKey(range.EndKey), so the new range
-		// that ends at Meta2KeyMax would naturally store its decriptor at
+		// that ends at Meta2KeyMax would naturally store its descriptor at
 		// RangeMetaKey(Meta2KeyMax) = Meta1KeyMax. However, Meta1KeyMax already
 		// serves a different role of holding a second copy of the descriptor for
 		// the range that spans the meta2/userspace boundary (see case 3a in
@@ -773,14 +777,6 @@ func (p *pebbleIterator) Stats() IteratorStats {
 // SupportsPrev implements the MVCCIterator interface.
 func (p *pebbleIterator) SupportsPrev() bool {
 	return true
-}
-
-// CheckForKeyCollisions indicates if the provided SST data collides with this
-// iterator in the specified range.
-func (p *pebbleIterator) CheckForKeyCollisions(
-	sstData []byte, start, end roachpb.Key,
-) (enginepb.MVCCStats, error) {
-	return checkForKeyCollisionsGo(p, sstData, start, end)
 }
 
 // GetRawIter is part of the EngineIterator interface.

@@ -40,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -49,6 +48,7 @@ import (
 func TestClusterFlow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	const numNodes = 3
 	const numRows = 100
 
@@ -73,13 +73,13 @@ func TestClusterFlow(t *testing.T) {
 
 	kvDB := tc.Server(0).DB()
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-	makeIndexSpan := func(start, end int) execinfrapb.TableReaderSpan {
+	makeIndexSpan := func(start, end int) roachpb.Span {
 		var span roachpb.Span
 		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PublicNonPrimaryIndexes()[0].GetID()))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
-		return execinfrapb.TableReaderSpan{Span: span}
+		return span
 	}
 
 	// successful indicates whether the flow execution is successful.
@@ -91,18 +91,14 @@ func TestClusterFlow(t *testing.T) {
 		// Note that the ranges won't necessarily be local to the table readers, but
 		// that doesn't matter for the purposes of this test.
 
-		// Start a span (useful to look at spans using Lightstep).
-		sp := tc.ServerTyped(0).Tracer().StartSpan("cluster test")
-		ctx := tracing.ContextWithSpan(context.Background(), sp)
-		defer sp.Finish()
-
 		now := tc.Server(0).Clock().NowAsClockTimestamp()
 		txnProto := roachpb.MakeTransaction(
 			"cluster-test",
 			nil, // baseKey
 			roachpb.NormalUserPriority,
 			now.ToTimestamp(),
-			0, // maxOffset
+			0, // maxOffsetNs
+			int32(tc.Server(0).SQLInstanceID()),
 		)
 		txn := kv.NewTxnFromProto(ctx, kvDB, tc.Server(0).NodeID(), now, kv.RootTxn, &txnProto)
 		leafInputState := txn.GetLeafTxnInputState(ctx)
@@ -110,21 +106,21 @@ func TestClusterFlow(t *testing.T) {
 		tr1 := execinfrapb.TableReaderSpec{
 			Table:         *desc.TableDesc(),
 			IndexIdx:      1,
-			Spans:         []execinfrapb.TableReaderSpan{makeIndexSpan(0, 8)},
+			Spans:         []roachpb.Span{makeIndexSpan(0, 8)},
 			NeededColumns: []uint32{0, 1},
 		}
 
 		tr2 := execinfrapb.TableReaderSpec{
 			Table:         *desc.TableDesc(),
 			IndexIdx:      1,
-			Spans:         []execinfrapb.TableReaderSpan{makeIndexSpan(8, 12)},
+			Spans:         []roachpb.Span{makeIndexSpan(8, 12)},
 			NeededColumns: []uint32{0, 1},
 		}
 
 		tr3 := execinfrapb.TableReaderSpec{
 			Table:         *desc.TableDesc(),
 			IndexIdx:      1,
-			Spans:         []execinfrapb.TableReaderSpan{makeIndexSpan(12, 100)},
+			Spans:         []roachpb.Span{makeIndexSpan(12, 100)},
 			NeededColumns: []uint32{0, 1},
 		}
 
@@ -422,7 +418,8 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		nil, // baseKey
 		roachpb.NormalUserPriority,
 		now.ToTimestamp(),
-		0, // maxOffset
+		0, // maxOffsetNs
+		int32(tc.Server(0).SQLInstanceID()),
 	)
 	txn := kv.NewTxnFromProto(
 		context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
@@ -528,6 +525,12 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 	var foundReq int64 // written atomically
 	var expectedGateway roachpb.NodeID
 
+	// We can't get the tableID programmatically here.
+	// The table id can be retrieved by doing.
+	// CREATE DATABASE test;
+	// CREATE TABLE test.t();
+	// SELECT id FROM system.namespace WHERE name = 't' AND "parentID" != 1
+	const tableID = 56
 	tc := serverutils.StartNewTestCluster(t, 3, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
@@ -540,7 +543,7 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 							if !ok {
 								return nil
 							}
-							if !strings.HasPrefix(scanReq.Key.String(), "/Table/53/1") {
+							if !strings.HasPrefix(scanReq.Key.String(), fmt.Sprintf("/Table/%d/1", tableID)) {
 								return nil
 							}
 
@@ -654,7 +657,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 				b.Run(fmt.Sprintf("r%d", numRows), func(b *testing.B) {
 					// Generate some data sets, consisting of rows with three values; the
 					// first value is increasing.
-					rng, _ := randutil.NewPseudoRand()
+					rng, _ := randutil.NewTestRand()
 					lastVal := 1
 					valSpecs := make([]execinfrapb.ValuesCoreSpec, numNodes)
 					for i := range valSpecs {
@@ -707,7 +710,8 @@ func BenchmarkInfrastructure(b *testing.B) {
 						nil, // baseKey
 						roachpb.NormalUserPriority,
 						now.ToTimestamp(),
-						0, // maxOffset
+						0, // maxOffsetNs
+						int32(tc.Server(0).SQLInstanceID()),
 					)
 					txn := kv.NewTxnFromProto(
 						context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),

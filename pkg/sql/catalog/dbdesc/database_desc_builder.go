@@ -13,12 +13,14 @@ package dbdesc
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
@@ -141,23 +143,41 @@ func MaybeWithDatabaseRegionConfig(regionConfig *multiregion.RegionConfig) NewIn
 	}
 }
 
+// WithPublicSchemaID is used to create a DatabaseDescriptor with a
+// publicSchemaID.
+func WithPublicSchemaID(publicSchemaID descpb.ID) NewInitialOption {
+	return func(desc *descpb.DatabaseDescriptor) {
+		// TODO(richardjcai): Remove this in 22.2. If the public schema id is
+		// keys.PublicSchemaID, we do not add an entry as the public schema does
+		// not have a descriptor.
+		if publicSchemaID != keys.PublicSchemaID {
+			desc.Schemas = map[string]descpb.DatabaseDescriptor_SchemaInfo{
+				tree.PublicSchema: {
+					ID:      publicSchemaID,
+					Dropped: false,
+				},
+			}
+		}
+	}
+}
+
 // NewInitial constructs a new Mutable for an initial version from an id and
 // name with default privileges.
 func NewInitial(
 	id descpb.ID, name string, owner security.SQLUsername, options ...NewInitialOption,
 ) *Mutable {
-	return NewInitialWithPrivileges(
+	return newInitialWithPrivileges(
 		id,
 		name,
-		descpb.NewDefaultPrivilegeDescriptor(owner),
-		catprivilege.MakeNewDefaultPrivilegeDescriptor(),
+		descpb.NewBaseDatabasePrivilegeDescriptor(owner),
+		catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_DATABASE),
 		options...,
 	)
 }
 
-// NewInitialWithPrivileges constructs a new Mutable for an initial version
+// newInitialWithPrivileges constructs a new Mutable for an initial version
 // from an id and name and custom privileges.
-func NewInitialWithPrivileges(
+func newInitialWithPrivileges(
 	id descpb.ID,
 	name string,
 	privileges *descpb.PrivilegeDescriptor,

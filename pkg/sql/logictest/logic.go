@@ -70,6 +70,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/lib/pq"
@@ -111,6 +112,11 @@ import (
 // of the expected output. A test can also check for expected column
 // names for query results, or expected errors.
 //
+//
+// ###########################################
+//           TEST CONFIGURATION DIRECTIVES
+// ###########################################
+//
 // Logic tests can start with a directive as follows:
 //
 //   # LogicTest: local fakedist
@@ -142,6 +148,32 @@ import (
 // There is a special blocklist directive '!metamorphic' that skips the whole
 // test when TAGS=metamorphic is specified for the logic test invocation.
 // NOTE: metamorphic directive takes precedence over all other directives.
+//
+//
+// ###########################################
+//           CLUSTER OPTION DIRECTIVES
+// ###########################################
+//
+// Besides test configuration directives, test files can also contain cluster
+// option directives around the beginning of the file (these directive can
+// before or appear after the configuration ones). These directives affect the
+// settings of the cluster created for the test, across all the configurations
+// that the test will run under.
+//
+// The directives line looks like:
+// # cluster-opt: opt1 opt2
+//
+// The options are:
+// - enable-span-config: If specified, the span configs infrastructure will be
+//   enabled. This is equivalent to setting COCKROACH_EXPERIMENTAL_SPAN_CONFIGS.
+// - tracing-off: If specified, tracing defaults to being turned off. This is
+//   used to override the environment, which may ask for tracing to be on by
+//   default.
+//
+//
+// ###########################################
+//           LogicTest language
+// ###########################################
 //
 // The Test-Script language is extended here for use with CockroachDB. The
 // supported directives are:
@@ -250,16 +282,21 @@ import (
 //  - sleep <duration>
 //    Introduces a sleep period. Example: sleep 2s
 //
-//  - user <username>
+//  - user <username> [nodeidx=N]
 //    Changes the user for subsequent statements or queries.
+//    If nodeidx is specified, this user will connect to the node
+//    in the cluster with index N (note this is 0-indexed, while
+//    node IDs themselves are 1-indexed).
 //
-//  - skipif <mysql/mssql/postgresql/cockroachdb>
-//    Skips the following `statement` or `query` if the argument is postgresql
-//    or cockroachdb.
+//  - skipif <mysql/mssql/postgresql/cockroachdb/config CONFIG [ISSUE]>
+//    Skips the following `statement` or `query` if the argument is
+//    postgresql, cockroachdb, or a config matching the currently
+//    running configuration.
 //
-//  - onlyif <mysql/mssql/postgresql/cockroachdb>
-//    Skips the following `statement` or query if the argument is not postgresql
-//    or cockroachdb.
+//  - onlyif <mysql/mssql/postgresql/cockroachdb/config CONFIG [ISSUE]>
+//    Skips the following `statement` or `query` if the argument is not
+//    postgresql, cockroachdb, or a config matching the currently
+//    running configuration.
 //
 //  - traceon <file>
 //    Enables tracing to the given file.
@@ -461,9 +498,6 @@ type testClusterConfig struct {
 	// If true, a sql tenant server will be started and pointed at a node in the
 	// cluster. Connections on behalf of the logic test will go to that tenant.
 	useTenant bool
-	// If set, the span configs infrastructure will be enabled. This is
-	// equivalent to setting COCKROACH_EXPERIMENTAL_SPAN_CONFIGS.
-	enableSpanConfigs bool
 	// isCCLConfig should be true for any config that can only be run with a CCL
 	// binary.
 	isCCLConfig bool
@@ -729,11 +763,6 @@ var logicTestConfigs = []testClusterConfig{
 		localities:        multiregion9node3region3azsLocalities,
 		overrideVectorize: "off",
 	},
-	{
-		name:              "experimental-span-configs",
-		numNodes:          1,
-		enableSpanConfigs: true,
-	},
 }
 
 // An index in the above slice.
@@ -799,8 +828,22 @@ func findLogicTestConfig(name string) (logicTestConfigIdx, bool) {
 // lineScanner handles reading from input test files.
 type lineScanner struct {
 	*bufio.Scanner
-	line int
-	skip bool
+	line       int
+	skip       bool
+	skipReason string
+}
+
+func (l *lineScanner) SetSkip(reason string) {
+	l.skip = true
+	l.skipReason = reason
+}
+
+func (l *lineScanner) LogAndResetSkip(t *logicTest) {
+	if l.skipReason != "" {
+		t.t().Logf("statement/query skipped with reason: %s", l.skipReason)
+	}
+	l.skipReason = ""
+	l.skip = false
 }
 
 func newLineScanner(r io.Reader) *lineScanner {
@@ -1289,7 +1332,7 @@ func (t *logicTest) outf(format string, args ...interface{}) {
 // setUser sets the DB client to the specified user.
 // It returns a cleanup function to be run when the credentials
 // are no longer needed.
-func (t *logicTest) setUser(user string) func() {
+func (t *logicTest) setUser(user string, nodeIdxOverride int) func() {
 	if t.clients == nil {
 		t.clients = map[string]*gosql.DB{}
 	}
@@ -1301,9 +1344,14 @@ func (t *logicTest) setUser(user string) func() {
 		return func() {}
 	}
 
-	addr := t.cluster.Server(t.nodeIdx).ServingSQLAddr()
+	nodeIdx := t.nodeIdx
+	if nodeIdxOverride > 0 {
+		nodeIdx = nodeIdxOverride
+	}
+
+	addr := t.cluster.Server(nodeIdx).ServingSQLAddr()
 	if len(t.tenantAddrs) > 0 {
-		addr = t.tenantAddrs[t.nodeIdx]
+		addr = t.tenantAddrs[nodeIdx]
 	}
 	pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(user))
 	pgURL.Path = "test"
@@ -1314,6 +1362,12 @@ func (t *logicTest) setUser(user string) func() {
 	// connection initialization, so we need to set it back to 0 before
 	// we run anything.
 	if _, err := db.Exec("SET extra_float_digits = 0"); err != nil {
+		t.Fatal(err)
+	}
+	// The default setting for index_recommendations_enabled is true. We do not
+	// want to display index recommendations in logic tests, so we disable them
+	// here.
+	if _, err := db.Exec("SET index_recommendations_enabled = false"); err != nil {
 		t.Fatal(err)
 	}
 	t.clients[user] = db
@@ -1346,7 +1400,7 @@ func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
 // server args are configured. That is, either during setup() when creating the
 // initial cluster to be used in a test, or when creating additional test
 // clusters, after logicTest.setup() has been called.
-func (t *logicTest) newCluster(serverArgs TestServerArgs) {
+func (t *logicTest) newCluster(serverArgs TestServerArgs, opts []clusterOpt) {
 	// TODO(andrei): if createTestServerParams() is used here, the command filter
 	// it installs detects a transaction that doesn't have
 	// modifiedSystemConfigSpan set even though it should, for
@@ -1396,9 +1450,6 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 	}
 
 	cfg := t.cfg
-	if cfg.enableSpanConfigs {
-		params.ServerArgs.EnableSpanConfigs = true
-	}
 	distSQLKnobs := &execinfra.TestingKnobs{
 		MetadataTestLevel: execinfra.Off,
 	}
@@ -1420,6 +1471,9 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 			params.ServerArgs.Knobs.Server = &server.TestingKnobs{}
 		}
 		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).DisableAutomaticVersionUpgrade = 1
+	}
+	for _, opt := range opts {
+		opt.apply(&params.ServerArgs)
 	}
 
 	paramsPerNode := map[int]base.TestServerArgs{}
@@ -1504,10 +1558,8 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 				TempStorageConfig: &params.ServerArgs.TempStorageConfig,
 				Locality:          paramsPerNode[i].Locality,
 				Existing:          i > 0,
+				TracingDefault:    params.ServerArgs.TracingDefault,
 			}
-
-			// Prevent a logging assertion that the server ID is initialized multiple times.
-			log.TestingClearServerIdentifiers()
 
 			tenant, err := t.cluster.Server(i).StartTenant(context.Background(), tenantArgs)
 			if err != nil {
@@ -1597,10 +1649,6 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 			}
 		}
 
-		if _, err := conn.Exec("SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true"); err != nil {
-			t.Fatal(err)
-		}
-
 		// Update the default AS OF time for querying the system.table_statistics
 		// table to create the crdb_internal.table_row_statistics table.
 		if _, err := conn.Exec(
@@ -1637,7 +1685,7 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs) {
 
 	// db may change over the lifetime of this function, with intermediate
 	// values cached in t.clients and finally closed in t.close().
-	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, t.setUser(security.RootUser))
+	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, t.setUser(security.RootUser, 0 /* nodeIdxOverride */))
 }
 
 // shutdownCluster performs the necessary cleanup to shutdown the current test
@@ -1662,10 +1710,10 @@ func (t *logicTest) shutdownCluster() {
 }
 
 // setup creates the initial cluster for the logic test and populates the
-// relevant fields on logicTest. It is expected to be called only once, and
-// before processing any test files - unless a mock logicTest is created (see
-// parallelTest.processTestFile).
-func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
+// relevant fields on logicTest. It is expected to be called only once (per test
+// file), and before processing any test files - unless a mock logicTest is
+// created (see parallelTest.processTestFile).
+func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs, opts []clusterOpt) {
 	t.cfg = cfg
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
@@ -1673,7 +1721,7 @@ func (t *logicTest) setup(cfg testClusterConfig, serverArgs TestServerArgs) {
 	t.sharedIODir = tempExternalIODir
 	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
 
-	t.newCluster(serverArgs)
+	t.newCluster(serverArgs, opts)
 
 	// Only create the test database on the initial cluster, since cluster restore
 	// expects an empty cluster.
@@ -1829,6 +1877,81 @@ func readTestFileConfigs(
 	return defaults, false
 }
 
+// clusterOpt is implemented by options for configuring the test cluster under
+// which a test will run.
+type clusterOpt interface {
+	apply(args *base.TestServerArgs)
+}
+
+// clusterOptSpanConfigs corresponds to the enable-span-configs directive.
+type clusterOptSpanConfigs struct{}
+
+var _ clusterOpt = clusterOptSpanConfigs{}
+
+// apply implements the clusterOpt interface.
+func (c clusterOptSpanConfigs) apply(args *base.TestServerArgs) {
+	args.EnableSpanConfigs = true
+}
+
+// clusterOptTracingOff corresponds to the tracing-off directive.
+type clusterOptTracingOff struct{}
+
+var _ clusterOpt = clusterOptTracingOff{}
+
+// apply implements the clusterOpt interface.
+func (c clusterOptTracingOff) apply(args *base.TestServerArgs) {
+	args.TracingDefault = tracing.TracingModeOnDemand
+}
+
+// readClusterOptions looks around the beginning of the file for a line looking like:
+// # cluster-opt: opt1 opt2 ...
+// and parses that line into a set of clusterOpts that need to be applied to the
+// TestServerArgs before the cluster is started for the respective test file.
+func readClusterOptions(t *testing.T, path string) []clusterOpt {
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	defer file.Close()
+
+	var res []clusterOpt
+
+	beginningOfFile := true
+	directiveFound := false
+
+	s := newLineScanner(file)
+	for s.Scan() {
+		fields := strings.Fields(s.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		cmd := fields[0]
+		if !strings.HasPrefix(cmd, "#") {
+			// Further directives are not allowed.
+			beginningOfFile = false
+		}
+		// Cluster config directive lines are of the form:
+		// # cluster-opt: opt1 opt2 ...
+		if len(fields) > 1 && cmd == "#" && fields[1] == "cluster-opt:" {
+			require.True(t, beginningOfFile, "cluster-opt directive needs to be at the beginning of file")
+			require.False(t, directiveFound, "only one cluster-opt directive allowed per file; second one found: %s", s.Text())
+			directiveFound = true
+			if len(fields) == 2 {
+				t.Fatalf("%s: empty LogicTest directive", path)
+			}
+			for _, opt := range fields[2:] {
+				switch opt {
+				case "enable-span-configs":
+					res = append(res, clusterOptSpanConfigs{})
+				case "tracing-off":
+					res = append(res, clusterOptTracingOff{})
+				default:
+					t.Fatalf("unrecognized cluster option: %s", opt)
+				}
+			}
+		}
+	}
+	return res
+}
+
 type subtestDetails struct {
 	name                  string        // the subtest's name, empty if not a subtest
 	buffer                *bytes.Buffer // a chunk of the test file representing the subtest
@@ -1853,7 +1976,7 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 		// If subtest has no name, then it is not a subtest, so just run the lines
 		// in the overall test. Note that this can only happen in the first subtest.
 		if len(subtest.name) == 0 {
-			if err := t.processSubtest(subtest, path, config); err != nil {
+			if err := t.processSubtest(subtest, path); err != nil {
 				return err
 			}
 		} else {
@@ -1863,7 +1986,7 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 				defer func() {
 					t.subtestT = nil
 				}()
-				if err := t.processSubtest(subtest, path, config); err != nil {
+				if err := t.processSubtest(subtest, path); err != nil {
 					t.Error(err)
 				}
 			})
@@ -1937,9 +2060,7 @@ func fetchSubtests(path string) ([]subtestDetails, error) {
 	return subtests, nil
 }
 
-func (t *logicTest) processSubtest(
-	subtest subtestDetails, path string, config testClusterConfig,
-) error {
+func (t *logicTest) processSubtest(subtest subtestDetails, path string) error {
 	defer t.traceStop()
 
 	s := newLineScanner(subtest.buffer)
@@ -1980,8 +2101,8 @@ func (t *logicTest) processSubtest(
 				err = errors.New("invalid count")
 			}
 			if err != nil {
-				return errors.Errorf("%s:%d invalid repeat line: %s",
-					path, s.line+subtest.lineLineIndexIntoFile, err,
+				return errors.Wrapf(err, "%s:%d invalid repeat line",
+					path, s.line+subtest.lineLineIndexIntoFile,
 				)
 			}
 			repeat = count
@@ -1998,8 +2119,8 @@ func (t *logicTest) processSubtest(
 				err = errors.New("invalid duration")
 			}
 			if err != nil {
-				return errors.Errorf("%s:%d invalid sleep line: %s",
-					path, s.line+subtest.lineLineIndexIntoFile, err,
+				return errors.Wrapf(err, "%s:%d invalid sleep line",
+					path, s.line+subtest.lineLineIndexIntoFile,
 				)
 			}
 			time.Sleep(duration)
@@ -2036,7 +2157,7 @@ func (t *logicTest) processSubtest(
 					}
 				}
 			} else {
-				s.skip = false
+				s.LogAndResetSkip(t)
 			}
 			repeat = 1
 			t.success(path)
@@ -2325,7 +2446,7 @@ func (t *logicTest) processSubtest(
 					}
 				}
 			} else {
-				s.skip = false
+				s.LogAndResetSkip(t)
 			}
 			repeat = 1
 			t.success(path)
@@ -2367,13 +2488,23 @@ func (t *logicTest) processSubtest(
 		case "halt", "hash-threshold":
 
 		case "user":
+			var nodeIdx int
 			if len(fields) < 2 {
 				return errors.Errorf("user command requires one argument, found: %v", fields)
 			}
 			if len(fields[1]) == 0 {
 				return errors.Errorf("user command requires a non-blank argument")
 			}
-			cleanupUserFunc := t.setUser(fields[1])
+			if len(fields) >= 3 {
+				if strings.HasPrefix(fields[2], "nodeidx=") {
+					idx, err := strconv.ParseInt(strings.SplitN(fields[2], "=", 2)[1], 10, 64)
+					if err != nil {
+						return errors.Wrapf(err, "error parsing nodeidx")
+					}
+					nodeIdx = int(idx)
+				}
+			}
+			cleanupUserFunc := t.setUser(fields[1], nodeIdx)
 			defer cleanupUserFunc()
 
 		case "skip":
@@ -2392,7 +2523,20 @@ func (t *logicTest) processSubtest(
 				return errors.Errorf("skipif command requires a non-blank argument")
 			case "mysql", "mssql":
 			case "postgresql", "cockroachdb":
-				s.skip = true
+				s.SetSkip("")
+				continue
+			case "config":
+				if len(fields) < 3 {
+					return errors.New("skipif config CONFIG [ISSUE] command requires configuration parameter")
+				}
+				configName := fields[2]
+				if t.cfg.name == configName {
+					issue := "no issue given"
+					if len(fields) > 3 {
+						issue = fields[3]
+					}
+					s.SetSkip(fmt.Sprintf("unsupported configuration %s (%s)", configName, issue))
+				}
 				continue
 			default:
 				return errors.Errorf("unimplemented test statement: %s", s.Text())
@@ -2406,11 +2550,21 @@ func (t *logicTest) processSubtest(
 			case "":
 				return errors.New("onlyif command requires a non-blank argument")
 			case "cockroachdb":
-			case "mysql":
-				s.skip = true
+			case "mysql", "mssql":
+				s.SetSkip("")
 				continue
-			case "mssql":
-				s.skip = true
+			case "config":
+				if len(fields) < 3 {
+					return errors.New("onlyif config CONFIG [ISSUE] command requires configuration parameter")
+				}
+				configName := fields[2]
+				if t.cfg.name != configName {
+					issue := "no issue given"
+					if len(fields) > 3 {
+						issue = fields[3]
+					}
+					s.SetSkip(fmt.Sprintf("unsupported configuration %s, statement/query only supports %s (%s)", t.cfg.name, configName, issue))
+				}
 				continue
 			default:
 				return errors.Errorf("unimplemented test statement: %s", s.Text())
@@ -2484,7 +2638,7 @@ func (t *logicTest) verifyError(
 
 		errString := pgerror.FullError(err)
 		newErr := errors.Errorf("%s: %s\nexpected:\n%s\n\ngot:\n%s", pos, sql, expectErr, errString)
-		if err != nil && strings.Contains(errString, expectErr) {
+		if strings.Contains(errString, expectErr) {
 			t.t().Logf("The output string contained the input regexp. Perhaps you meant to write:\n"+
 				"query error %s", regexp.QuoteMeta(errString))
 		}
@@ -2495,7 +2649,7 @@ func (t *logicTest) verifyError(
 			r = strings.ReplaceAll(r, "\n", "\\n")
 			t.t().Logf("Error regexp: %s\n", r)
 		}
-		return (err == nil) == (expectErr == ""), newErr
+		return expectErr != "", newErr
 	}
 	if err != nil {
 		if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) &&
@@ -3061,7 +3215,7 @@ func (t *logicTest) validateAfterTestCompletion() error {
 			t.Fatalf("failed to close connection for user %s: %v", username, err)
 		}
 	}
-	t.setUser("root")
+	t.setUser("root", 0 /* nodeIdxOverride */)
 
 	// Some cleanup to make sure the following validation queries can run
 	// successfully. First we rollback in case the logic test had an uncommitted
@@ -3382,7 +3536,7 @@ func RunLogicTestWithDefaultConfig(
 						!*rewriteSQL &&
 						!util.RaceEnabled &&
 						!cfg.useTenant &&
-						cfg.numNodes <= 3 {
+						cfg.numNodes <= 5 {
 						// Skip parallelizing tests that use the kv-batch-size directive since
 						// the batch size is a global variable.
 						//
@@ -3395,7 +3549,7 @@ func RunLogicTestWithDefaultConfig(
 							t.Parallel() // SAFE FOR TESTING (this comments satisfies the linter)
 						}
 					}
-					rng, _ := randutil.NewPseudoRand()
+					rng, _ := randutil.NewTestRand()
 					lt := logicTest{
 						rootT:           t,
 						verbose:         verbose,
@@ -3405,8 +3559,10 @@ func RunLogicTestWithDefaultConfig(
 					if *printErrorSummary {
 						defer lt.printErrorSummary()
 					}
-					serverArgs.forceProductionBatchSizes = onlyNonMetamorphic
-					lt.setup(cfg, serverArgs)
+					// Each test needs a copy because of Parallel
+					serverArgsCopy := serverArgs
+					serverArgsCopy.forceProductionBatchSizes = onlyNonMetamorphic
+					lt.setup(cfg, serverArgsCopy, readClusterOptions(t, path))
 					lt.runFile(path, cfg)
 
 					progress.Lock()

@@ -55,7 +55,7 @@ func BenchmarkImportWorkload(b *testing.B) {
 	ts := timeutil.Now()
 	var tableSSTs []tableSSTable
 	for i, table := range g.Tables() {
-		tableID := descpb.ID(keys.MinUserDescID + 1 + i)
+		tableID := descpb.ID(keys.TestingUserDescID(1 + uint32(i)))
 		sst, err := format.ToSSTable(table, tableID, ts)
 		require.NoError(b, err)
 
@@ -135,8 +135,10 @@ func benchmarkAddSSTable(b *testing.B, dir string, tables []tableSSTable) {
 		b.StartTimer()
 		for _, t := range tables {
 			totalBytes += int64(len(t.sstData))
-			require.NoError(b, kvDB.AddSSTable(
-				ctx, t.span.Key, t.span.EndKey, t.sstData, true /* disallowShadowing */, nil /* stats */, false /*ingestAsWrites */, hlc.Timestamp{},
+			require.NoError(b, kvDB.AddSSTable(ctx, t.span.Key, t.span.EndKey, t.sstData,
+				false /* disallowConflicts */, true, /* disallowShadowing */
+				hlc.Timestamp{} /* disallowShadowingBelow */, nil, /* stats */
+				false /*ingestAsWrites */, hlc.Timestamp{}, false, /* writeAtBatchTS */
 			))
 		}
 		b.StopTimer()
@@ -158,7 +160,7 @@ func BenchmarkConvertToKVs(b *testing.B) {
 
 func benchmarkConvertToKVs(b *testing.B, g workload.Generator) {
 	ctx := context.Background()
-	const tableID = descpb.ID(keys.MinUserDescID)
+	tableID := descpb.ID(keys.TestingUserDescID(0))
 	ts := timeutil.Now()
 
 	var bytes int64

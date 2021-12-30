@@ -29,6 +29,7 @@ import (
 // QueryResolvedTimestampIntentCleanupAge configures the minimum intent age that
 // QueryResolvedTimestamp requests will consider for async intent cleanup.
 var QueryResolvedTimestampIntentCleanupAge = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"kv.query_resolved_timestamp.intent_cleanup_age",
 	"minimum intent age that QueryResolvedTimestamp requests will consider for async intent cleanup",
 	10*time.Second,
@@ -117,7 +118,7 @@ func computeMinIntentTimestamp(
 		}
 		engineKey, err := iter.EngineKey()
 		if err != nil {
-			continue
+			return hlc.Timestamp{}, nil, err
 		}
 		lockedKey, err := keys.DecodeLockTableSingleKey(engineKey.Key)
 		if err != nil {

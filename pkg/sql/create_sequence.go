@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -100,9 +101,13 @@ func doCreateSequence(
 		return err
 	}
 
-	privs := dbDesc.GetDefaultPrivilegeDescriptor().CreatePrivilegesFromDefaultPrivileges(
+	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		dbDesc.GetDefaultPrivilegeDescriptor(),
+		scDesc.GetDefaultPrivilegeDescriptor(),
 		dbDesc.GetID(),
-		params.SessionData().User(), tree.Sequences, dbDesc.GetPrivileges(),
+		params.SessionData().User(),
+		tree.Sequences,
+		dbDesc.GetPrivileges(),
 	)
 
 	if persistence.IsTemporary() {
@@ -201,12 +206,12 @@ func NewSequenceTableDesc(
 	}
 	desc.SetPrimaryIndex(descpb.IndexDescriptor{
 		ID:                  keys.SequenceIndexID,
-		Name:                tabledesc.PrimaryKeyIndexName,
+		Name:                tabledesc.LegacyPrimaryKeyIndexName,
 		KeyColumnIDs:        []descpb.ColumnID{tabledesc.SequenceColumnID},
 		KeyColumnNames:      []string{tabledesc.SequenceColumnName},
 		KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 		EncodingType:        descpb.PrimaryIndexEncoding,
-		Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+		Version:             descpb.LatestPrimaryIndexDescriptorVersion,
 	})
 	desc.Families = []descpb.ColumnFamilyDescriptor{
 		{
@@ -222,8 +227,15 @@ func NewSequenceTableDesc(
 	opts := &descpb.TableDescriptor_SequenceOpts{
 		Increment: 1,
 	}
-	err := assignSequenceOptions(opts, sequenceOptions, true /* setDefaults */, params, id, parentID)
-	if err != nil {
+	if err := assignSequenceOptions(
+		opts,
+		sequenceOptions,
+		true, /* setDefaults */
+		params,
+		id,
+		parentID,
+		nil, /* existingType */
+	); err != nil {
 		return nil, err
 	}
 	desc.SequenceOpts = opts

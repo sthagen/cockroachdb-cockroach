@@ -137,7 +137,11 @@ func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
 // processSourceRow processes one row from the source for upsertion.
 // The table writer is in charge of accumulating the result rows.
 func (n *upsertNode) processSourceRow(params runParams, rowVals tree.Datums) error {
-	if err := enforceLocalColumnConstraints(rowVals, n.run.insertCols); err != nil {
+	if err := enforceLocalColumnConstraints(
+		rowVals,
+		n.run.insertCols,
+		true, /* isUpdate */
+	); err != nil {
 		return err
 	}
 
@@ -170,7 +174,9 @@ func (n *upsertNode) processSourceRow(params runParams, rowVals tree.Datums) err
 			ord++
 		}
 		checkVals := rowVals[ord:]
-		if err := checkMutationInput(params.ctx, &params.p.semaCtx, n.run.tw.tableDesc(), n.run.checkOrds, checkVals); err != nil {
+		if err := checkMutationInput(
+			params.ctx, &params.p.semaCtx, params.p.SessionData(), n.run.tw.tableDesc(), n.run.checkOrds, checkVals,
+		); err != nil {
 			return err
 		}
 		rowVals = rowVals[:ord]

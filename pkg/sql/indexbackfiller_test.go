@@ -234,7 +234,7 @@ INSERT INTO foo VALUES (1, 2), (2, 3), (3, 4);
 					Name:    "virtual_column_backed_index",
 					ID:      mut.NextIndexID,
 					Unique:  true,
-					Version: descpb.StrictIndexColumnIDGuaranteesVersion,
+					Version: descpb.LatestNonPrimaryIndexDescriptorVersion,
 					KeyColumnNames: []string{
 						mut.Columns[2].Name,
 					},
@@ -311,7 +311,7 @@ INSERT INTO foo VALUES (1), (10), (100);
 					Name:    "new_primary_index",
 					ID:      mut.NextIndexID,
 					Unique:  true,
-					Version: descpb.StrictIndexColumnIDGuaranteesVersion,
+					Version: descpb.LatestNonPrimaryIndexDescriptorVersion,
 					KeyColumnNames: []string{
 						mut.Columns[0].Name,
 					},
@@ -390,7 +390,6 @@ INSERT INTO foo VALUES (1), (10), (100);
 			&alloc,
 			mm.Monitor(),
 			row.FetcherTableArgs{
-				Spans:            spans,
 				Desc:             table,
 				Index:            idx,
 				ColIdxMap:        colIdxMap,

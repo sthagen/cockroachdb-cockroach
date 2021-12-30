@@ -11,10 +11,9 @@ package importccl
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -37,48 +36,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
-
-const (
-	// We need to choose arbitrary database and table IDs. These aren't important,
-	// but they do match what would happen when creating a new database and
-	// table on an empty cluster.
-	defaultCSVParentID descpb.ID = keys.MinNonPredefinedUserDescID
-	defaultCSVTableID  descpb.ID = defaultCSVParentID + 1
-)
-
-func readCreateTableFromStore(
-	ctx context.Context,
-	filename string,
-	externalStorageFromURI cloud.ExternalStorageFromURIFactory,
-	user security.SQLUsername,
-) (*tree.CreateTable, error) {
-	store, err := externalStorageFromURI(ctx, filename, user)
-	if err != nil {
-		return nil, err
-	}
-	defer store.Close()
-	reader, err := store.ReadFile(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	tableDefStr, err := ioutil.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	stmts, err := parser.Parse(string(tableDefStr))
-	if err != nil {
-		return nil, err
-	}
-	if len(stmts) != 1 {
-		return nil, errors.Errorf("expected 1 create table statement, found %d", len(stmts))
-	}
-	create, ok := stmts[0].AST.(*tree.CreateTable)
-	if !ok {
-		return nil, errors.New("expected CREATE TABLE statement in table file")
-	}
-	return create, nil
-}
 
 type fkHandler struct {
 	allowed  bool
@@ -104,7 +61,11 @@ func MakeTestingSimpleTableDescriptor(
 ) (*tabledesc.Mutable, error) {
 	db := dbdesc.NewInitial(parentID, "foo", security.RootUserName())
 	var sc catalog.SchemaDescriptor
-	if parentSchemaID == keys.PublicSchemaID {
+	if !st.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) && parentSchemaID == keys.PublicSchemaIDForBackup {
+		// If we're not on version PublicSchemasWithDescriptors, continue to
+		// use a synthetic public schema, the migration when we update to
+		// PublicSchemasWithDescriptors will handle creating the explicit public
+		// schema.
 		sc = schemadesc.GetPublicSchema()
 	} else {
 		sc = schemadesc.NewBuilder(&descpb.SchemaDescriptor{
@@ -115,6 +76,7 @@ func MakeTestingSimpleTableDescriptor(
 			Privileges: descpb.NewPrivilegeDescriptor(
 				security.PublicRoleName(),
 				privilege.SchemaPrivileges,
+				privilege.List{},
 				security.RootUserName(),
 			),
 		}).BuildCreatedMutableSchema()
@@ -150,9 +112,6 @@ func MakeSimpleTableDescriptor(
 	create.HoistConstraints()
 	if create.IfNotExists {
 		return nil, unimplemented.NewWithIssueDetailf(42846, "import.if-no-exists", "unsupported IF NOT EXISTS")
-	}
-	if create.Interleave != nil {
-		return nil, unimplemented.NewWithIssueDetailf(42846, "import.interleave", "interleaved not supported")
 	}
 	if create.AsSource != nil {
 		return nil, unimplemented.NewWithIssueDetailf(42846, "import.create-as", "CREATE AS not supported")
@@ -223,7 +182,7 @@ func MakeSimpleTableDescriptor(
 		tableID,
 		nil, /* regionConfig */
 		hlc.Timestamp{WallTime: walltime},
-		descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
+		descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
 		affected,
 		semaCtx,
 		&evalCtx,
@@ -395,7 +354,7 @@ func (so *importSequenceOperators) GetLatestValueInSessionForSequenceByID(
 
 // SetSequenceValueByID implements the tree.SequenceOperators interface.
 func (so *importSequenceOperators) SetSequenceValueByID(
-	ctx context.Context, seqID int64, newVal int64, isCalled bool,
+	ctx context.Context, seqID uint32, newVal int64, isCalled bool,
 ) error {
 	return errSequenceOperators
 }

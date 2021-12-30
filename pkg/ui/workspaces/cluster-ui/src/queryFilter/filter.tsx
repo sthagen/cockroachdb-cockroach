@@ -13,6 +13,8 @@ import Select from "react-select";
 import { Button } from "../button";
 import { CaretDown } from "@cockroachlabs/icons";
 import { Input } from "antd";
+import { History } from "history";
+import { isEqual } from "lodash";
 import {
   dropdownButton,
   dropdownContentWrapper,
@@ -25,11 +27,12 @@ import {
   checkbox,
 } from "./filterClasses";
 import { MultiSelectCheckbox } from "../multiSelectCheckbox/multiSelectCheckbox";
+import { syncHistory } from "../util";
 
 interface QueryFilter {
   onSubmitFilters: (filters: Filters) => void;
   smth?: string;
-  appNames: SelectOptions[];
+  appNames: string[];
   activeFilters: number;
   filters: Filters;
   dbNames?: string[];
@@ -100,12 +103,110 @@ export const getFiltersFromQueryString = (
       const queryStringFilter = searchParams.get(filter);
       const filterValue =
         queryStringFilter == null
-          ? defaultValue
-          : defaultValue.constructor(searchParams.get(filter));
+          ? defaultValue // If this filter doesn't exist on query string, use default value.
+          : typeof defaultValue == "boolean"
+          ? searchParams.get(filter) === "true" // If it's a Boolean, convert from String to Boolean;
+          : defaultValue.constructor(searchParams.get(filter)); // Otherwise, use the constructor for that class.
+      // Boolean is converted without using its own constructor because the value from the query
+      // params is a string and Boolean('false') = true, which would be incorrect.
       return { [filter]: filterValue, ...filters };
     },
     {},
   );
+};
+
+/**
+ * Get Filters from Query String and if its value is different from the current
+ * filters value, it calls the onFilterChange function.
+ * @param history History
+ * @param filters the current active filters
+ * @param onFilterChange function to be called if the values from the search
+ * params are different from the current ones. This function can update
+ * the value stored on localStorage for example
+ * @returns Filters the active filters
+ */
+export const handleFiltersFromQueryString = (
+  history: History,
+  filters: Filters,
+  onFilterChange: (value: Filters) => void,
+): Filters => {
+  const filtersQueryString = getFiltersFromQueryString(history.location.search);
+  const searchParams = new URLSearchParams(history.location.search);
+  let hasFilter = false;
+
+  for (const key of Object.keys(defaultFilters)) {
+    if (searchParams.get(key)) {
+      hasFilter = true;
+      break;
+    }
+  }
+
+  if (onFilterChange && hasFilter && !isEqual(filtersQueryString, filters)) {
+    // If we have filters on query string and they're different
+    // from the current filter state on props (localStorage),
+    // we want to update the value on localStorage.
+    onFilterChange(filtersQueryString);
+  } else if (!isEqual(filters, defaultFilters)) {
+    // If the filters on props (localStorage) are different
+    // from the default values, we want to update the History,
+    // so the url can be easily shared with the filters selected.
+    syncHistory(
+      {
+        app: filters.app,
+        timeNumber: filters.timeNumber,
+        timeUnit: filters.timeUnit,
+        fullScan: filters.fullScan.toString(),
+        sqlType: filters.sqlType,
+        database: filters.database,
+        regions: filters.regions,
+        nodes: filters.nodes,
+      },
+      history,
+    );
+  }
+  // If we have a new filter selection on query params, they
+  // take precedent on what is stored on localStorage.
+  return hasFilter ? filtersQueryString : filters;
+};
+
+/**
+ * Update the query params to the current values of the Filter.
+ * When we change tabs inside the SQL Activity page for example,
+ * the constructor is called only on the first time.
+ * The component update event is called frequently and can be used to
+ * update the query params by using this function that only updates
+ * the query params if the values did change and we're on the correct tab.
+ * @param tab which the query params should update
+ * @param filters the current filters
+ * @param history
+ */
+export const updateFiltersQueryParamsOnTab = (
+  tab: string,
+  filters: Filters,
+  history: History,
+): void => {
+  const filtersQueryString = getFiltersFromQueryString(history.location.search);
+  const searchParams = new URLSearchParams(history.location.search);
+  const currentTab = searchParams.get("tab") || "";
+  if (
+    currentTab === tab &&
+    !isEqual(filters, defaultFilters) &&
+    !isEqual(filters, filtersQueryString)
+  ) {
+    syncHistory(
+      {
+        app: filters.app,
+        timeNumber: filters.timeNumber,
+        timeUnit: filters.timeUnit,
+        fullScan: filters.fullScan.toString(),
+        sqlType: filters.sqlType,
+        database: filters.database,
+        regions: filters.regions,
+        nodes: filters.nodes,
+      },
+      history,
+    );
+  }
 };
 
 /**
@@ -153,13 +254,13 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
 
   dropdownRef: React.RefObject<HTMLDivElement> = React.createRef();
 
-  componentDidMount() {
+  componentDidMount(): void {
     window.addEventListener("click", this.outsideClick, false);
   }
-  componentWillUnmount() {
+  componentWillUnmount(): void {
     window.removeEventListener("click", this.outsideClick, false);
   }
-  componentDidUpdate(prevProps: QueryFilter) {
+  componentDidUpdate(prevProps: QueryFilter): void {
     if (prevProps.filters !== this.props.filters) {
       this.setState({
         filters: {
@@ -168,21 +269,21 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
       });
     }
   }
-  outsideClick = (event: any) => {
+  outsideClick = (event: any): void => {
     this.setState({ hide: true });
   };
 
-  insideClick = (event: any) => {
+  insideClick = (event: any): void => {
     event.stopPropagation();
   };
 
-  toggleFilters = () => {
+  toggleFilters = (): void => {
     this.setState({
       hide: !this.state.hide,
     });
   };
 
-  handleSubmit = () => {
+  handleSubmit = (): void => {
     this.props.onSubmitFilters(this.state.filters);
     this.setState({ hide: true });
   };
@@ -220,14 +321,14 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
     });
   };
 
-  validateInput = (value: string) => {
+  validateInput = (value: string): string => {
     const isInteger = /^[0-9]+$/;
     return (value === "" || isInteger.test(value)) && value.length <= 3
       ? value
       : this.state.filters.timeNumber;
   };
 
-  clearInput = () => {
+  clearInput = (): void => {
     this.setState({
       filters: {
         ...this.state.filters,
@@ -236,13 +337,12 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
     });
   };
 
-  isOptionSelected = (option: string, field: string) => {
+  isOptionSelected = (option: string, field: string): boolean => {
     const selection = field.split(",");
-    if (selection.length > 0 && selection.includes(option)) return true;
-    return false;
+    return selection.length > 0 && selection.includes(option);
   };
 
-  render() {
+  render(): React.ReactElement {
     const { hide, filters } = this.state;
     const {
       appNames,
@@ -289,6 +389,27 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
       width: "141px",
       border: "none",
     });
+
+    const appsOptions = appNames.map(app => ({
+      label: app,
+      value: app,
+      isSelected: this.isOptionSelected(app, filters.app),
+    }));
+    const appValue = appsOptions.filter(option => {
+      return filters.app.split(",").includes(option.label);
+    });
+    const appFilter = (
+      <div>
+        <div className={filterLabel.margin}>App</div>
+        <MultiSelectCheckbox
+          options={appsOptions}
+          placeholder="All"
+          field="app"
+          parent={this}
+          value={appValue}
+        />
+      </div>
+    );
 
     const databasesOptions = showDB
       ? dbNames.map(db => ({
@@ -408,19 +529,11 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
           className={checkbox.input}
         />
         <label htmlFor="full-table-scan-toggle" className={checkbox.label}>
-          Only show statements that contain queries with full table scans
+          Only show statements with full table scans
         </label>
       </div>
     );
     // TODO replace all onChange actions in Selects and Checkboxes with one onSubmit in <form />
-
-    // Some app names could be empty strings, so we're adding " " to those names,
-    // this way it's easier for the user to recognize the blank name.
-    const apps = appNames.map(app => {
-      const label =
-        app.label.trim().length === 0 ? '"' + app.label + '"' : app.label;
-      return { label: label, value: app.value };
-    });
 
     return (
       <div onClick={this.insideClick} ref={this.dropdownRef}>
@@ -430,20 +543,13 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
         </div>
         <div className={dropdownArea}>
           <div className={dropdownContentWrapper}>
-            <div className={filterLabel.top}>App</div>
-            <Select
-              options={apps}
-              onChange={e => this.handleSelectChange(e, "app")}
-              value={apps.filter(app => app.value === filters.app)}
-              placeholder="All"
-              styles={customStyles}
-            />
+            {appFilter}
             {showDB ? dbFilter : ""}
             {showSqlType ? sqlTypeFilter : ""}
             {showRegions ? regionsFilter : ""}
             {showNodes ? nodesFilter : ""}
             <div className={filterLabel.margin}>
-              Query fingerprint runs longer than
+              Statement fingerprint runs longer than
             </div>
             <section className={timePair.wrapper}>
               <Input

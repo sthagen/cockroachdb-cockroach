@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"go.etcd.io/etcd/raft/v3"
 )
 
@@ -65,11 +66,12 @@ func newUnloadedReplica(
 	ctx context.Context, desc *roachpb.RangeDescriptor, store *Store, replicaID roachpb.ReplicaID,
 ) *Replica {
 	if replicaID == 0 {
-		log.Fatalf(context.TODO(), "cannot construct a replica for range %d with a 0 replica ID", desc.RangeID)
+		log.Fatalf(ctx, "cannot construct a replica for range %d with a 0 replica ID", desc.RangeID)
 	}
 	r := &Replica{
 		AmbientContext: store.cfg.AmbientCtx,
 		RangeID:        desc.RangeID,
+		creationTime:   timeutil.Now(),
 		store:          store,
 		abortSpan:      abortspan.New(desc.RangeID),
 		concMgr: concurrency.NewManager(concurrency.Config{
@@ -117,6 +119,7 @@ func newUnloadedReplica(
 	r.rangeStr.store(replicaID, &roachpb.RangeDescriptor{RangeID: desc.RangeID})
 	// Add replica log tag - the value is rangeStr.String().
 	r.AmbientContext.AddLogTag("r", &r.rangeStr)
+	r.raftCtx = logtags.AddTag(r.AnnotateCtx(context.Background()), "raft", nil /* value */)
 	// Add replica pointer value. NB: this was historically useful for debugging
 	// replica GC issues, but is a distraction at the moment.
 	// r.AmbientContext.AddLogTag("@", fmt.Sprintf("%x", unsafe.Pointer(r)))
@@ -339,7 +342,7 @@ func (r *Replica) setDescLockedRaftMuLocked(ctx context.Context, desc *roachpb.R
 				"replica %v: %v", r, err)
 		}
 		r.mu.tenantID = tenantID
-		r.store.metrics.acquireTenant(tenantID)
+		r.tenantMetricsRef = r.store.metrics.acquireTenant(tenantID)
 		if tenantID != roachpb.SystemTenantID {
 			r.tenantLimiter = r.store.tenantRateLimiters.GetTenant(ctx, tenantID, r.store.stopper.ShouldQuiesce())
 		}

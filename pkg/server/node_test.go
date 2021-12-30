@@ -426,7 +426,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	}
 
 	// Wait for full replication of initial ranges.
-	initialRanges, err := ExpectedInitialRangeCount(kvDB, &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig)
+	initialRanges, err := ExpectedInitialRangeCount(kvDB, &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig, ts.sqlServer.execCfg.SystemIDChecker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -648,4 +648,35 @@ func TestNodeSendUnknownBatchRequest(t *testing.T) {
 	if _, ok := br.Error.GetDetail().(*roachpb.UnsupportedRequestError); !ok {
 		t.Fatalf("expected unsupported request, not %v", br.Error)
 	}
+}
+
+func TestNodeBatchRequestMetricsInc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.(*TestServer)
+
+	n := ts.GetNode()
+	bCurr := n.metrics.BatchCount.Count()
+	getCurr := n.metrics.MethodCounts[roachpb.Get].Count()
+	putCurr := n.metrics.MethodCounts[roachpb.Put].Count()
+
+	var ba roachpb.BatchRequest
+	ba.RangeID = 1
+	ba.Replica.StoreID = 1
+
+	gr := roachpb.NewGet(roachpb.Key("a"), false)
+	pr := roachpb.NewPut(gr.Header().Key, roachpb.Value{})
+	ba.Add(gr, pr)
+
+	_, _ = n.Batch(context.Background(), &ba)
+	bCurr++
+	getCurr++
+	putCurr++
+
+	require.GreaterOrEqual(t, n.metrics.BatchCount.Count(), bCurr)
+	require.GreaterOrEqual(t, n.metrics.MethodCounts[roachpb.Get].Count(), getCurr)
+	require.GreaterOrEqual(t, n.metrics.MethodCounts[roachpb.Put].Count(), putCurr)
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -36,7 +37,7 @@ import (
 )
 
 var configID = descpb.ID(1)
-var configDescKey = catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
+var configDescKey = catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(keys.TestingUserDescID(0)))
 
 // forceNewConfig forces a system config update by writing a bogus descriptor with an
 // incremented value inside. It then repeatedly fetches the gossip config until the
@@ -86,9 +87,6 @@ func waitForConfigChange(t testing.TB, s *server.TestServer) *config.SystemConfi
 	return cfg
 }
 
-// TODO(benesch,ridwansharif): modernize these tests to avoid hardcoding
-// expectations about descriptor IDs and zone config encoding.
-// TestGetZoneConfig exercises config.getZoneConfig and the sql hook for it.
 func TestGetZoneConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -107,8 +105,6 @@ func TestGetZoneConfig(t *testing.T) {
 	srv, sqlDB, _ := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(context.Background())
 	s := srv.(*server.TestServer)
-
-	expectedCounter := uint32(keys.MinNonPredefinedUserDescID)
 
 	type testCase struct {
 		objectID uint32
@@ -172,51 +168,46 @@ func TestGetZoneConfig(t *testing.T) {
 	// db1 has tables tb11 and tb12
 	// db2 has tables tb21 and tb22
 
-	db1 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE DATABASE db1`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	db2 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE DATABASE db2`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb11 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db1.tb1 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb12 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db1.tb2 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb21 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db2.tb1 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
 	if _, err := sqlDB.Exec(`CREATE TABLE db2.tb2 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb22 := expectedCounter
 	if _, err := sqlDB.Exec(`TRUNCATE TABLE db2.tb2`); err != nil {
 		t.Fatal(err)
 	}
+
+	db1 := sqlutils.QueryDatabaseID(t, sqlDB, "db1")
+	db2 := sqlutils.QueryDatabaseID(t, sqlDB, "db2")
+	tb11 := sqlutils.QueryTableID(t, sqlDB, "db1", "public", "tb1")
+	tb12 := sqlutils.QueryTableID(t, sqlDB, "db1", "public", "tb2")
+	tb21 := sqlutils.QueryTableID(t, sqlDB, "db2", "public", "tb1")
+	tb22 := sqlutils.QueryTableID(t, sqlDB, "db2", "public", "tb2")
 
 	// We have no custom zone configs.
 	verifyZoneConfigs([]testCase{
 		{0, nil, "", defaultZoneConfig},
 		{1, nil, "", defaultZoneConfig},
-		{keys.MaxReservedDescID, nil, "", defaultZoneConfig},
+		{keys.MaxSystemConfigDescID + 1, nil, "", defaultZoneConfig},
 		{db1, nil, "", defaultZoneConfig},
 		{db2, nil, "", defaultZoneConfig},
 		{tb11, nil, "", defaultZoneConfig},
@@ -300,7 +291,7 @@ func TestGetZoneConfig(t *testing.T) {
 	verifyZoneConfigs([]testCase{
 		{0, nil, "", defaultZoneConfig},
 		{1, nil, "", defaultZoneConfig},
-		{keys.MaxReservedDescID, nil, "", defaultZoneConfig},
+		{keys.MaxSystemConfigDescID + 1, nil, "", defaultZoneConfig},
 		{db1, nil, "", db1Cfg},
 		{db2, nil, "", defaultZoneConfig},
 		{tb11, nil, "", tb11Cfg},
@@ -346,8 +337,6 @@ func TestCascadingZoneConfig(t *testing.T) {
 	srv, sqlDB, _ := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(context.Background())
 	s := srv.(*server.TestServer)
-
-	expectedCounter := uint32(keys.MinNonPredefinedUserDescID)
 
 	type testCase struct {
 		objectID uint32
@@ -411,51 +400,46 @@ func TestCascadingZoneConfig(t *testing.T) {
 	// db1 has tables tb11 and tb12
 	// db2 has tables tb21 and tb22
 
-	db1 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE DATABASE db1`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	db2 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE DATABASE db2`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb11 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db1.tb1 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb12 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db1.tb2 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb21 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db2.tb1 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
 	if _, err := sqlDB.Exec(`CREATE TABLE db2.tb2 (k INT PRIMARY KEY, v INT)`); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedCounter++
-	tb22 := expectedCounter
 	if _, err := sqlDB.Exec(`TRUNCATE TABLE db2.tb2`); err != nil {
 		t.Fatal(err)
 	}
+
+	db1 := sqlutils.QueryDatabaseID(t, sqlDB, "db1")
+	db2 := sqlutils.QueryDatabaseID(t, sqlDB, "db2")
+	tb11 := sqlutils.QueryTableID(t, sqlDB, "db1", "public", "tb1")
+	tb12 := sqlutils.QueryTableID(t, sqlDB, "db1", "public", "tb2")
+	tb21 := sqlutils.QueryTableID(t, sqlDB, "db2", "public", "tb1")
+	tb22 := sqlutils.QueryTableID(t, sqlDB, "db2", "public", "tb2")
 
 	// We have no custom zone configs.
 	verifyZoneConfigs([]testCase{
 		{0, nil, "", defaultZoneConfig},
 		{1, nil, "", defaultZoneConfig},
-		{keys.MaxReservedDescID, nil, "", defaultZoneConfig},
+		{keys.MaxSystemConfigDescID + 1, nil, "", defaultZoneConfig},
 		{db1, nil, "", defaultZoneConfig},
 		{db2, nil, "", defaultZoneConfig},
 		{tb11, nil, "", defaultZoneConfig},
@@ -584,7 +568,7 @@ func TestCascadingZoneConfig(t *testing.T) {
 	verifyZoneConfigs([]testCase{
 		{0, nil, "", defaultZoneConfig},
 		{1, nil, "", defaultZoneConfig},
-		{keys.MaxReservedDescID, nil, "", defaultZoneConfig},
+		{keys.MaxSystemConfigDescID + 1, nil, "", defaultZoneConfig},
 		{db1, nil, "", expectedDb1Cfg},
 		{db2, nil, "", defaultZoneConfig},
 		{tb11, nil, "", expectedTb11Cfg},
@@ -664,7 +648,7 @@ func BenchmarkGetZoneConfig(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := roachpb.RKey(keys.SystemSQLCodec.TablePrefix(keys.MinUserDescID))
+		key := roachpb.RKey(keys.SystemSQLCodec.TablePrefix(keys.TestingUserDescID(0)))
 		_, err := cfg.GetZoneConfigForKey(key)
 		if err != nil {
 			b.Fatal(err)

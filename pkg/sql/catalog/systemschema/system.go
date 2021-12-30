@@ -70,20 +70,22 @@ CREATE TABLE system.namespace (
   "parentSchemaID" INT8,
   name       STRING,
   id         INT8,
-  PRIMARY KEY ("parentID", "parentSchemaID", name)
+  CONSTRAINT "primary" PRIMARY KEY ("parentID", "parentSchemaID", name)
 );`
 
 	DescriptorTableSchema = `
 CREATE TABLE system.descriptor (
-  id         INT8 PRIMARY KEY,
-  descriptor BYTES
+  id         INT8,
+  descriptor BYTES,
+  CONSTRAINT "primary" PRIMARY KEY (id)
 );`
 
 	UsersTableSchema = `
 CREATE TABLE system.users (
-  username         STRING PRIMARY KEY,
+  username         STRING,
   "hashedPassword" BYTES,
-  "isRole"         BOOL NOT NULL DEFAULT false
+  "isRole"         BOOL NOT NULL DEFAULT false,
+  CONSTRAINT "primary" PRIMARY KEY (username)
 );`
 
 	RoleOptionsTableSchema = `
@@ -91,23 +93,25 @@ CREATE TABLE system.role_options (
 	username STRING NOT NULL,
 	option STRING NOT NULL,
 	value STRING,
-	PRIMARY KEY (username, option),
+	CONSTRAINT "primary" PRIMARY KEY (username, option),
 	FAMILY "primary" (username, option, value)
 )`
 
 	// Zone settings per DB/Table.
 	ZonesTableSchema = `
 CREATE TABLE system.zones (
-  id     INT8 PRIMARY KEY,
-  config BYTES
+  id     INT8,
+  config BYTES,
+  CONSTRAINT "primary" PRIMARY KEY (id)
 );`
 
 	SettingsTableSchema = `
 CREATE TABLE system.settings (
-	name              STRING    NOT NULL PRIMARY KEY,
+	name              STRING    NOT NULL,
 	value             STRING    NOT NULL,
 	"lastUpdated"     TIMESTAMP NOT NULL DEFAULT now(),
 	"valueType"       STRING,
+	CONSTRAINT "primary" PRIMARY KEY (name),
 	FAMILY (name, value, "lastUpdated", "valueType")
 );`
 
@@ -116,9 +120,10 @@ CREATE SEQUENCE system.descriptor_id_seq;`
 
 	TenantsTableSchema = `
 CREATE TABLE system.tenants (
-	id     INT8 NOT NULL PRIMARY KEY,
+	id     INT8 NOT NULL,
 	active BOOL NOT NULL DEFAULT true,
 	info   BYTES,
+	CONSTRAINT "primary" PRIMARY KEY (id),
 	FAMILY "primary" (id, active, info)
 );`
 )
@@ -131,7 +136,7 @@ CREATE TABLE system.lease (
   version    INT8,
   "nodeID"   INT8,
   expiration TIMESTAMP,
-  PRIMARY KEY ("descID", version, expiration, "nodeID")
+  CONSTRAINT "primary" PRIMARY KEY ("descID", version, expiration, "nodeID")
 );`
 
 	// TODO(knz): targetID and reportingID are deprecated and should
@@ -145,7 +150,7 @@ CREATE TABLE system.eventlog (
   "reportingID" INT8       NOT NULL,
   info          STRING,
   "uniqueID"    BYTES      DEFAULT uuid_v4(),
-  PRIMARY KEY (timestamp, "uniqueID")
+  CONSTRAINT "primary" PRIMARY KEY (timestamp, "uniqueID")
 );`
 
 	// rangelog is currently envisioned as a wide table; many different event
@@ -159,14 +164,15 @@ CREATE TABLE system.rangelog (
   "otherRangeID" INT8,
   info           STRING,
   "uniqueID"     INT8       DEFAULT unique_rowid(),
-  PRIMARY KEY (timestamp, "uniqueID")
+  CONSTRAINT "primary" PRIMARY KEY (timestamp, "uniqueID")
 );`
 
 	UITableSchema = `
 CREATE TABLE system.ui (
-	key           STRING PRIMARY KEY,
+	key           STRING,
 	value         BYTES,
-	"lastUpdated" TIMESTAMP NOT NULL
+	"lastUpdated" TIMESTAMP NOT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (key)
 );`
 
 	// JobsRunStatsIdxPredicate is the predicate in jobs_run_stats_idx in JobsTable.
@@ -178,7 +184,7 @@ CREATE TABLE system.ui (
 	// This is done to minimize migration work required.
 	JobsTableSchema = `
 CREATE TABLE system.jobs (
-	id                INT8      DEFAULT unique_rowid() PRIMARY KEY,
+	id                INT8      DEFAULT unique_rowid(),
 	status            STRING    NOT NULL,
 	created           TIMESTAMP NOT NULL DEFAULT now(),
 	payload           BYTES     NOT NULL,
@@ -189,6 +195,7 @@ CREATE TABLE system.jobs (
 	claim_instance_id INT8,
 	num_runs          INT8,
 	last_run          TIMESTAMP,
+	CONSTRAINT "primary" PRIMARY KEY (id),
 	INDEX (status, created),
 	INDEX (created_by_type, created_by_id) STORING (status),
 	INDEX jobs_run_stats_idx (
@@ -208,7 +215,7 @@ CREATE TABLE system.jobs (
 	// Design outlined in /docs/RFCS/web_session_login.rfc
 	WebSessionsTableSchema = `
 CREATE TABLE system.web_sessions (
-	id             INT8       NOT NULL DEFAULT unique_rowid() PRIMARY KEY,
+	id             INT8       NOT NULL DEFAULT unique_rowid(),
 	"hashedSecret" BYTES      NOT NULL,
 	username       STRING     NOT NULL,
 	"createdAt"    TIMESTAMP  NOT NULL DEFAULT now(),
@@ -216,6 +223,7 @@ CREATE TABLE system.web_sessions (
 	"revokedAt"    TIMESTAMP,
 	"lastUsedAt"   TIMESTAMP  NOT NULL DEFAULT now(),
 	"auditInfo"    STRING,
+	CONSTRAINT "primary" PRIMARY KEY (id),
 	INDEX ("expiresAt"),
 	INDEX ("createdAt"),
   INDEX ("revokedAt"),
@@ -223,12 +231,15 @@ CREATE TABLE system.web_sessions (
 	FAMILY (id, "hashedSecret", username, "createdAt", "expiresAt", "revokedAt", "lastUsedAt", "auditInfo")
 );`
 
-	// table_statistics is used to track statistics collected about individual columns
-	// or groups of columns from every table in the database. Each row contains the
-	// number of distinct values of the column group and (optionally) a histogram if there
-	// is only one column in columnIDs.
+	// table_statistics is used to track statistics collected about individual
+	// columns or groups of columns from every table in the database. Each row
+	// contains the number of distinct values of the column group, the number of
+	// null values, the average size of the column(s), and (optionally) a
+	// histogram if there is only one column in columnIDs.
 	//
 	// Design outlined in /docs/RFCS/20170908_sql_optimizer_statistics.md
+	// Note: avgSize is a newer statistic than the RFC above. It contains the
+	// average size of the column group in bytes.
 	TableStatisticsTableSchema = `
 CREATE TABLE system.table_statistics (
 	"tableID"       INT8       NOT NULL,
@@ -239,9 +250,10 @@ CREATE TABLE system.table_statistics (
 	"rowCount"      INT8       NOT NULL,
 	"distinctCount" INT8       NOT NULL,
 	"nullCount"     INT8       NOT NULL,
+	"avgSize"       INT8       NOT NULL DEFAULT 0,
 	histogram       BYTES,
-	PRIMARY KEY ("tableID", "statisticID"),
-	FAMILY ("tableID", "statisticID", name, "columnIDs", "createdAt", "rowCount", "distinctCount", "nullCount", histogram)
+	CONSTRAINT "primary" PRIMARY KEY ("tableID", "statisticID"),
+	FAMILY ("tableID", "statisticID", name, "columnIDs", "createdAt", "rowCount", "distinctCount", "nullCount", "avgSize", histogram)
 );`
 
 	// locations are used to map a locality specified by a node to geographic
@@ -252,7 +264,7 @@ CREATE TABLE system.locations (
   "localityValue" STRING,
   latitude        DECIMAL(18,15) NOT NULL,
   longitude       DECIMAL(18,15) NOT NULL,
-  PRIMARY KEY ("localityKey", "localityValue"),
+  CONSTRAINT "primary" PRIMARY KEY ("localityKey", "localityValue"),
   FAMILY ("localityKey", "localityValue", latitude, longitude)
 );`
 
@@ -262,7 +274,7 @@ CREATE TABLE system.role_members (
   "role"   STRING NOT NULL,
   "member" STRING NOT NULL,
   "isAdmin"  BOOL NOT NULL,
-  PRIMARY KEY  ("role", "member"),
+  CONSTRAINT "primary" PRIMARY KEY ("role", "member"),
   INDEX ("role"),
   INDEX ("member")
 );`
@@ -274,7 +286,7 @@ CREATE TABLE system.comments (
    object_id INT NOT NULL,    -- object ID, this will be usually db/table desc ID
    sub_id    INT NOT NULL,    -- sub ID for column or indexes inside table, 0 for pure table
    comment   STRING NOT NULL, -- the comment
-   PRIMARY KEY (type, object_id, sub_id)
+   CONSTRAINT "primary" PRIMARY KEY (type, object_id, sub_id)
 );`
 
 	// reports_meta stores reports metadata
@@ -340,7 +352,7 @@ CREATE TABLE system.replication_stats (
 		INT8 NOT NULL,
 	over_replicated_ranges
 		INT8 NOT NULL,
-	PRIMARY KEY (zone_id, subzone_id),
+	CONSTRAINT "primary" PRIMARY KEY (zone_id, subzone_id),
 	FAMILY "primary" (
 		zone_id,
 		subzone_id,
@@ -356,64 +368,70 @@ CREATE TABLE system.replication_stats (
 	// subsystem.
 	ProtectedTimestampsMetaTableSchema = `
 CREATE TABLE system.protected_ts_meta (
-   singleton   BOOL NOT NULL PRIMARY KEY DEFAULT (true),
+   singleton   BOOL NOT NULL DEFAULT (true),
    version     INT8 NOT NULL,
    num_records INT8 NOT NULL,
    num_spans   INT8 NOT NULL,
    total_bytes INT8 NOT NULL,
    CONSTRAINT check_singleton  CHECK (singleton),
-   FAMILY "primary" (singleton, version, num_records, num_spans, total_bytes)
+   CONSTRAINT "primary" PRIMARY KEY (singleton),
+	 FAMILY "primary" (singleton, version, num_records, num_spans, total_bytes)
 );`
 
 	ProtectedTimestampsRecordsTableSchema = `
 CREATE TABLE system.protected_ts_records (
-   id        UUID NOT NULL PRIMARY KEY,
+   id        UUID NOT NULL,
    ts        DECIMAL NOT NULL,
    meta_type STRING NOT NULL,
    meta      BYTES,
    num_spans INT8 NOT NULL, -- num spans is important to know how to decode spans
    spans     BYTES NOT NULL,
    verified  BOOL NOT NULL DEFAULT (false),
-   FAMILY "primary" (id, ts, meta_type, meta, num_spans, spans, verified)
+   CONSTRAINT "primary" PRIMARY KEY (id),
+	 FAMILY "primary" (id, ts, meta_type, meta, num_spans, spans, verified)
 );`
 
 	StatementBundleChunksTableSchema = `
 CREATE TABLE system.statement_bundle_chunks (
-   id          INT8 PRIMARY KEY DEFAULT unique_rowid(),
+   id          INT8 DEFAULT unique_rowid(),
 	 description STRING,
 	 data        BYTES NOT NULL,
-
-   FAMILY "primary" (id, description, data)
+	 CONSTRAINT "primary" PRIMARY KEY (id),
+	 FAMILY "primary" (id, description, data)
 );`
 
 	StatementDiagnosticsRequestsTableSchema = `
 CREATE TABLE system.statement_diagnostics_requests(
-	id INT8 DEFAULT unique_rowid() PRIMARY KEY NOT NULL,
+	id INT8 DEFAULT unique_rowid() NOT NULL,
 	completed BOOL NOT NULL DEFAULT FALSE,
 	statement_fingerprint STRING NOT NULL,
 	statement_diagnostics_id INT8,
 	requested_at TIMESTAMPTZ NOT NULL,
-	INDEX completed_idx (completed, id) STORING (statement_fingerprint),
+	min_execution_latency INTERVAL NULL,
+	expires_at TIMESTAMPTZ NULL,
+	CONSTRAINT "primary" PRIMARY KEY (id),
+	INDEX completed_idx_v2 (completed, id) STORING (statement_fingerprint, min_execution_latency, expires_at),
 
-	FAMILY "primary" (id, completed, statement_fingerprint, statement_diagnostics_id, requested_at)
+	FAMILY "primary" (id, completed, statement_fingerprint, statement_diagnostics_id, requested_at, min_execution_latency, expires_at)
 );`
 
 	StatementDiagnosticsTableSchema = `
 create table system.statement_diagnostics(
-  id INT8 DEFAULT unique_rowid() PRIMARY KEY NOT NULL,
+  id INT8 DEFAULT unique_rowid() NOT NULL,
   statement_fingerprint STRING NOT NULL,
   statement STRING NOT NULL,
   collected_at TIMESTAMPTZ NOT NULL,
   trace JSONB,
   bundle_chunks INT ARRAY,
 	error STRING,
+	CONSTRAINT "primary" PRIMARY KEY (id),
 
 	FAMILY "primary" (id, statement_fingerprint, statement, collected_at, trace, bundle_chunks, error)
 );`
 
 	ScheduledJobsTableSchema = `
 CREATE TABLE system.scheduled_jobs (
-    schedule_id      INT DEFAULT unique_rowid() PRIMARY KEY NOT NULL,
+    schedule_id      INT DEFAULT unique_rowid() NOT NULL,
     schedule_name    STRING NOT NULL,
     created          TIMESTAMPTZ NOT NULL DEFAULT now(),
     owner            STRING NOT NULL,
@@ -424,10 +442,11 @@ CREATE TABLE system.scheduled_jobs (
     executor_type    STRING NOT NULL,
     execution_args   BYTES NOT NULL,
 
+    CONSTRAINT "primary" PRIMARY KEY (schedule_id),
     INDEX "next_run_idx" (next_run),
 
-    FAMILY sched (schedule_id, next_run, schedule_state),
-    FAMILY other (
+ 	 FAMILY sched (schedule_id, next_run, schedule_state),
+ 	 FAMILY other (
        schedule_name, created, owner, schedule_expr, 
        schedule_details, executor_type, execution_args 
     )
@@ -435,8 +454,9 @@ CREATE TABLE system.scheduled_jobs (
 
 	SqllivenessTableSchema = `
 CREATE TABLE system.sqlliveness (
-    session_id       BYTES PRIMARY KEY NOT NULL,
+    session_id       BYTES NOT NULL,
     expiration       DECIMAL NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (session_id),
   	FAMILY fam0_session_id_expiration (session_id, expiration)
 )`
 
@@ -447,16 +467,17 @@ CREATE TABLE system.migrations (
     patch        INT8 NOT NULL,
     internal     INT8 NOT NULL,
     completed_at TIMESTAMPTZ NOT NULL,
-    FAMILY "primary" (major, minor, patch, internal, completed_at),
-    PRIMARY KEY (major, minor, patch, internal)
+ 	 FAMILY "primary" (major, minor, patch, internal, completed_at),
+    CONSTRAINT "primary" PRIMARY KEY (major, minor, patch, internal)
 )`
 
 	JoinTokensTableSchema = `
 CREATE TABLE system.join_tokens (
-    id           UUID NOT NULL PRIMARY KEY,
+    id           UUID NOT NULL,
     secret       BYTES NOT NULL,
     expiration   TIMESTAMPTZ NOT NULL,
-    FAMILY "primary" (id, secret, expiration)
+    CONSTRAINT "primary" PRIMARY KEY (id),
+ 	 FAMILY "primary" (id, secret, expiration)
 )`
 
 	// TODO(azhng): Currently we choose number of bucket for hash-sharding to be
@@ -477,7 +498,11 @@ CREATE TABLE system.statement_statistics (
     statistics JSONB NOT NULL,
     plan JSONB NOT NULL,
 
-    PRIMARY KEY (aggregated_ts, fingerprint_id, transaction_fingerprint_id, plan_hash, app_name, node_id)
+    crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8 INT4 NOT VISIBLE NOT NULL AS (
+      mod(fnv32(crdb_internal.datums_to_bytes(aggregated_ts, app_name, fingerprint_id, node_id, plan_hash, transaction_fingerprint_id)), 8:::INT8)
+    ) STORED,
+
+    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, transaction_fingerprint_id, plan_hash, app_name, node_id)
       USING HASH WITH BUCKET_COUNT = 8,
     INDEX "fingerprint_stats_idx" (fingerprint_id, transaction_fingerprint_id),
 		FAMILY "primary" (
@@ -492,6 +517,11 @@ CREATE TABLE system.statement_statistics (
 			metadata,
 			statistics,
 			plan
+		),
+		CONSTRAINT check_crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8 CHECK (
+			crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8 IN (
+				0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8
+			)
 		)
 )
 `
@@ -507,7 +537,11 @@ CREATE TABLE system.transaction_statistics (
     metadata   JSONB NOT NULL,
     statistics JSONB NOT NULL,
 
-    PRIMARY KEY (aggregated_ts, fingerprint_id, app_name, node_id)
+    crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8 INT4 NOT VISIBLE NOT NULL AS (
+      mod(fnv32("crdb_internal.datums_to_bytes"(aggregated_ts, app_name, fingerprint_id, node_id)), 8:::INT8
+    )) STORED,
+
+    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, app_name, node_id)
       USING HASH WITH BUCKET_COUNT = 8,
     INDEX "fingerprint_stats_idx" (fingerprint_id),
 		FAMILY "primary" (
@@ -519,6 +553,11 @@ CREATE TABLE system.transaction_statistics (
 			agg_interval,
 			metadata,
 			statistics
+		),
+		CONSTRAINT check_crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8 CHECK (
+			crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8 IN (
+				0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8
+			)
 		)
 );
 `
@@ -527,7 +566,7 @@ CREATE TABLE system.database_role_settings (
     database_id  OID NOT NULL,
     role_name    STRING NOT NULL,
     settings     STRING[] NOT NULL,
-    PRIMARY KEY (database_id, role_name),
+    CONSTRAINT "primary" PRIMARY KEY (database_id, role_name),
 		FAMILY "primary" (
 			database_id,
       role_name,
@@ -597,22 +636,24 @@ CREATE TABLE system.tenant_usage (
     instance_lease, instance_seq, instance_shares
   ),
 
-  PRIMARY KEY (tenant_id, instance_id)
+	CONSTRAINT "primary" PRIMARY KEY (tenant_id, instance_id)
 )`
 
 	SQLInstancesTableSchema = `
 CREATE TABLE system.sql_instances (
-    id           INT NOT NULL PRIMARY KEY,
+    id           INT NOT NULL,
     addr         STRING,
     session_id   BYTES,
+    CONSTRAINT "primary" PRIMARY KEY (id),
     FAMILY "primary" (id, addr, session_id)
 )`
 
 	SpanConfigurationsTableSchema = `
 CREATE TABLE system.span_configurations (
-    start_key    BYTES NOT NULL PRIMARY KEY,
+    start_key    BYTES NOT NULL,
     end_key      BYTES NOT NULL,
     config        BYTES NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (start_key),
     CONSTRAINT check_bounds CHECK (start_key < end_key),
     FAMILY "primary" (start_key, end_key, config)
 )`
@@ -620,7 +661,7 @@ CREATE TABLE system.span_configurations (
 
 func pk(name string) descpb.IndexDescriptor {
 	return descpb.IndexDescriptor{
-		Name:                tabledesc.PrimaryKeyIndexName,
+		Name:                tabledesc.LegacyPrimaryKeyIndexName,
 		ID:                  1,
 		Unique:              true,
 		KeyColumnNames:      []string{name},
@@ -638,8 +679,8 @@ var (
 	// TABLE statements for both statement and transaction tables in a SQL shell.
 	// If we are to change how we compute hash values in the future, we need to
 	// modify these two expressions as well.
-	sqlStmtHashComputeExpr = `mod(fnv32("crdb_internal.datums_to_bytes"(aggregated_ts, app_name, fingerprint_id, node_id, plan_hash, transaction_fingerprint_id)), 8:::INT8)`
-	sqlTxnHashComputeExpr  = `mod(fnv32("crdb_internal.datums_to_bytes"(aggregated_ts, app_name, fingerprint_id, node_id)), 8:::INT8)`
+	sqlStmtHashComputeExpr = `mod(fnv32(crdb_internal.datums_to_bytes(aggregated_ts, app_name, fingerprint_id, node_id, plan_hash, transaction_fingerprint_id)), 8:::INT8)`
+	sqlTxnHashComputeExpr  = `mod(fnv32(crdb_internal.datums_to_bytes(aggregated_ts, app_name, fingerprint_id, node_id)), 8:::INT8)`
 )
 
 const (
@@ -686,7 +727,7 @@ func systemTable(
 		Name:                    string(name),
 		ID:                      id,
 		ParentID:                keys.SystemDatabaseID,
-		UnexposedParentSchemaID: keys.PublicSchemaID,
+		UnexposedParentSchemaID: keys.SystemPublicSchemaID,
 		Version:                 1,
 		Columns:                 columns,
 		Families:                families,
@@ -816,6 +857,7 @@ var (
 
 	falseBoolString = "false"
 	trueBoolString  = "true"
+	zeroIntString   = "0:::INT8"
 
 	// UsersTable is the descriptor for the users table.
 	UsersTable = registerSystemTable(
@@ -903,7 +945,7 @@ var (
 			}},
 			descpb.IndexDescriptor{
 				ID:                  keys.SequenceIndexID,
-				Name:                tabledesc.PrimaryKeyIndexName,
+				Name:                tabledesc.LegacyPrimaryKeyIndexName,
 				KeyColumnIDs:        []descpb.ColumnID{tabledesc.SequenceColumnID},
 				KeyColumnNames:      []string{tabledesc.SequenceColumnName},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
@@ -1124,7 +1166,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{2, 3},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			descpb.IndexDescriptor{
 				Name:                "jobs_created_by_type_created_by_id_idx",
@@ -1136,7 +1178,7 @@ var (
 				StoreColumnIDs:      []descpb.ColumnID{2},
 				StoreColumnNames:    []string{"status"},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			descpb.IndexDescriptor{
 				Name:                "jobs_run_stats_idx",
@@ -1148,7 +1190,7 @@ var (
 				StoreColumnNames:    []string{"last_run", "num_runs", "claim_instance_id"},
 				StoreColumnIDs:      []descpb.ColumnID{11, 10, 9},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 				Predicate:           JobsRunStatsIdxPredicate,
 			},
 		))
@@ -1195,7 +1237,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{5},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			descpb.IndexDescriptor{
 				Name:                "web_sessions_createdAt_idx",
@@ -1205,7 +1247,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{4},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			descpb.IndexDescriptor{
 				Name:                "web_sessions_revokedAt_idx",
@@ -1215,7 +1257,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{6},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			descpb.IndexDescriptor{
 				Name:                "web_sessions_lastUsedAt_idx",
@@ -1225,7 +1267,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{7},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		))
 
@@ -1244,11 +1286,12 @@ var (
 				{Name: "rowCount", ID: 6, Type: types.Int},
 				{Name: "distinctCount", ID: 7, Type: types.Int},
 				{Name: "nullCount", ID: 8, Type: types.Int},
-				{Name: "histogram", ID: 9, Type: types.Bytes, Nullable: true},
+				{Name: "avgSize", ID: 9, Type: types.Int, DefaultExpr: &zeroIntString},
+				{Name: "histogram", ID: 10, Type: types.Bytes, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
-					Name: "fam_0_tableID_statisticID_name_columnIDs_createdAt_rowCount_distinctCount_nullCount_histogram",
+					Name: "fam_0_tableID_statisticID_name_columnIDs_createdAt_rowCount_distinctCount_nullCount_avgSize_histogram",
 					ID:   0,
 					ColumnNames: []string{
 						"tableID",
@@ -1259,9 +1302,10 @@ var (
 						"rowCount",
 						"distinctCount",
 						"nullCount",
+						"avgSize",
 						"histogram",
 					},
-					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9},
+					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -1348,7 +1392,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{1},
 				KeySuffixColumnIDs:  []descpb.ColumnID{2},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			descpb.IndexDescriptor{
 				Name:                "role_members_member_idx",
@@ -1358,7 +1402,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{2},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		))
 
@@ -1699,26 +1743,28 @@ var (
 				{Name: "statement_fingerprint", ID: 3, Type: types.String, Nullable: false},
 				{Name: "statement_diagnostics_id", ID: 4, Type: types.Int, Nullable: true},
 				{Name: "requested_at", ID: 5, Type: types.TimestampTZ, Nullable: false},
+				{Name: "min_execution_latency", ID: 6, Type: types.Interval, Nullable: true},
+				{Name: "expires_at", ID: 7, Type: types.TimestampTZ, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name:        "primary",
-					ColumnNames: []string{"id", "completed", "statement_fingerprint", "statement_diagnostics_id", "requested_at"},
-					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5},
+					ColumnNames: []string{"id", "completed", "statement_fingerprint", "statement_diagnostics_id", "requested_at", "min_execution_latency", "expires_at"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7},
 				},
 			},
 			pk("id"),
 			// Index for the polling query.
 			descpb.IndexDescriptor{
-				Name:                "completed_idx",
+				Name:                "completed_idx_v2",
 				ID:                  2,
 				Unique:              false,
 				KeyColumnNames:      []string{"completed", "id"},
-				StoreColumnNames:    []string{"statement_fingerprint"},
+				StoreColumnNames:    []string{"statement_fingerprint", "min_execution_latency", "expires_at"},
 				KeyColumnIDs:        []descpb.ColumnID{2, 1},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
-				StoreColumnIDs:      []descpb.ColumnID{3},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				StoreColumnIDs:      []descpb.ColumnID{3, 6, 7},
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		))
 
@@ -1794,7 +1840,7 @@ var (
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{5},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		))
 
@@ -1845,7 +1891,7 @@ var (
 				},
 			},
 			descpb.IndexDescriptor{
-				Name:           tabledesc.PrimaryKeyIndexName,
+				Name:           tabledesc.LegacyPrimaryKeyIndexName,
 				ID:             1,
 				Unique:         true,
 				KeyColumnNames: []string{"major", "minor", "patch", "internal"},
@@ -1880,7 +1926,7 @@ var (
 				},
 			},
 			descpb.IndexDescriptor{
-				Name:           tabledesc.PrimaryKeyIndexName,
+				Name:           tabledesc.LegacyPrimaryKeyIndexName,
 				ID:             1,
 				Unique:         true,
 				KeyColumnNames: []string{"id"},
@@ -1932,7 +1978,7 @@ var (
 				},
 			},
 			descpb.IndexDescriptor{
-				Name:   tabledesc.PrimaryKeyIndexName,
+				Name:   tabledesc.LegacyPrimaryKeyIndexName,
 				ID:     1,
 				Unique: true,
 				KeyColumnNames: []string{
@@ -1954,7 +2000,7 @@ var (
 					descpb.IndexDescriptor_ASC,
 				},
 				KeyColumnIDs: []descpb.ColumnID{11, 1, 2, 3, 4, 5, 6},
-				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:      descpb.LatestNonPrimaryIndexDescriptorVersion,
 				Sharded: descpb.ShardedDescriptor{
 					IsSharded:    true,
 					Name:         "crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8",
@@ -1983,7 +2029,7 @@ var (
 				},
 				KeyColumnIDs:       []descpb.ColumnID{2, 3},
 				KeySuffixColumnIDs: []descpb.ColumnID{11, 1, 4, 5, 6},
-				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:            descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		),
 		func(tbl *descpb.TableDescriptor) {
@@ -2036,7 +2082,7 @@ var (
 				},
 			},
 			descpb.IndexDescriptor{
-				Name:   tabledesc.PrimaryKeyIndexName,
+				Name:   tabledesc.LegacyPrimaryKeyIndexName,
 				ID:     1,
 				Unique: true,
 				KeyColumnNames: []string{
@@ -2054,7 +2100,7 @@ var (
 					descpb.IndexDescriptor_ASC,
 				},
 				KeyColumnIDs: []descpb.ColumnID{8, 1, 2, 3, 4},
-				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:      descpb.LatestNonPrimaryIndexDescriptorVersion,
 				Sharded: descpb.ShardedDescriptor{
 					IsSharded:    true,
 					Name:         "crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8",
@@ -2079,7 +2125,7 @@ var (
 				},
 				KeyColumnIDs:       []descpb.ColumnID{2},
 				KeySuffixColumnIDs: []descpb.ColumnID{8, 1, 3, 4},
-				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:            descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		),
 		func(tbl *descpb.TableDescriptor) {
@@ -2120,7 +2166,7 @@ var (
 				},
 			},
 			descpb.IndexDescriptor{
-				Name:           tabledesc.PrimaryKeyIndexName,
+				Name:           tabledesc.LegacyPrimaryKeyIndexName,
 				ID:             1,
 				Unique:         true,
 				KeyColumnNames: []string{"database_id", "role_name"},
@@ -2170,7 +2216,7 @@ var (
 				},
 			},
 			descpb.IndexDescriptor{
-				Name:           tabledesc.PrimaryKeyIndexName,
+				Name:           tabledesc.LegacyPrimaryKeyIndexName,
 				ID:             1,
 				Unique:         true,
 				KeyColumnNames: []string{"tenant_id", "instance_id"},
@@ -2179,7 +2225,7 @@ var (
 					descpb.IndexDescriptor_ASC,
 				},
 				KeyColumnIDs: []descpb.ColumnID{1, 2},
-				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:      descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		))
 
@@ -2228,7 +2274,14 @@ var (
 					ColumnIDs:   []descpb.ColumnID{1, 2, 3},
 				},
 			},
-			pk("start_key"),
+			descpb.IndexDescriptor{
+				Name:                "primary",
+				ID:                  keys.SpanConfigurationsTablePrimaryKeyIndexID,
+				Unique:              true,
+				KeyColumnNames:      []string{"start_key"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        singleID1,
+			},
 		),
 		func(tbl *descpb.TableDescriptor) {
 			tbl.Checks = []*descpb.TableDescriptor_CheckConstraint{{

@@ -40,6 +40,7 @@ import (
 // GCInterval specifies duration between attempts to delete extant
 // sessions that have expired.
 var GCInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"server.sqlliveness.gc_interval",
 	"duration between attempts to delete extant sessions that have expired",
 	20*time.Second,
@@ -51,6 +52,7 @@ var GCInterval = settings.RegisterDurationSetting(
 //
 // [(1-GCJitter) * GCInterval, (1+GCJitter) * GCInterval]
 var GCJitter = settings.RegisterFloatSetting(
+	settings.TenantWritable,
 	"server.sqlliveness.gc_jitter",
 	"jitter fraction on the duration between attempts to delete extant sessions that have expired",
 	.15,
@@ -69,12 +71,15 @@ var GCJitter = settings.RegisterFloatSetting(
 // increasing the cache size dynamically. The entries are just bytes each so
 // this should not be a big deal.
 var CacheSize = settings.RegisterIntSetting(
+	settings.TenantWritable,
 	"server.sqlliveness.storage_session_cache_size",
 	"number of session entries to store in the LRU",
 	1024)
 
 // Storage implements sqlliveness.Storage.
 type Storage struct {
+	log.AmbientContext
+
 	settings   *cluster.Settings
 	stopper    *stop.Stopper
 	clock      *hlc.Clock
@@ -103,6 +108,7 @@ type Storage struct {
 // NewTestingStorage constructs a new storage with control for the database
 // in which the `sqlliveness` table should exist.
 func NewTestingStorage(
+	ambientCtx log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
 	db *kv.DB,
@@ -112,6 +118,8 @@ func NewTestingStorage(
 	newTimer func() timeutil.TimerI,
 ) *Storage {
 	s := &Storage{
+		AmbientContext: ambientCtx,
+
 		settings: settings,
 		stopper:  stopper,
 		clock:    clock,
@@ -140,13 +148,14 @@ func NewTestingStorage(
 
 // NewStorage creates a new storage struct.
 func NewStorage(
+	ambientCtx log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
 	db *kv.DB,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
 ) *Storage {
-	return NewTestingStorage(stopper, clock, db, codec, settings, keys.SqllivenessID,
+	return NewTestingStorage(ambientCtx, stopper, clock, db, codec, settings, keys.SqllivenessID,
 		timeutil.DefaultTimeSource{}.NewTimer)
 }
 
@@ -222,9 +231,9 @@ func (s *Storage) isAlive(
 		// of the first context cancels other callers to the `acquireNodeLease()` method,
 		// because of its use of `singleflight.Group`. See issue #41780 for how this has
 		// happened.
-		newCtx, cancel := s.stopper.WithCancelOnQuiesce(
-			logtags.WithTags(context.Background(), logtags.FromContext(ctx)),
-		)
+		bgCtx := s.AnnotateCtx(context.Background())
+		bgCtx = logtags.AddTags(bgCtx, logtags.FromContext(ctx))
+		newCtx, cancel := s.stopper.WithCancelOnQuiesce(bgCtx)
 		defer cancel()
 
 		// store the result underneath the singleflight to avoid the need

@@ -181,9 +181,8 @@ func init() {
 		Use:   "backup [command]",
 		Short: "debug backups",
 		Long:  "Shows information about a SQL backup.",
-		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return cmd.Usage()
+			return cli.UsageAndErr(cmd, args)
 		},
 	}
 
@@ -587,7 +586,6 @@ func makeRowFetcher(
 	}
 
 	table := row.FetcherTableArgs{
-		Spans:            []roachpb.Span{entry.Span},
 		Desc:             entry.Desc,
 		Index:            entry.Desc.GetPrimaryIndex(),
 		ColIdxMap:        colIdxMap,
@@ -647,7 +645,7 @@ func processEntryFiles(
 	}
 	kvFetcher := row.MakeBackupSSTKVFetcher(startKeyMVCC, endKeyMVCC, iter, startTime, endTime, debugBackupArgs.withRevisions)
 
-	if err := rf.StartScanFrom(ctx, &kvFetcher); err != nil {
+	if err := rf.StartScanFrom(ctx, &kvFetcher, false /* traceKV */); err != nil {
 		return errors.Wrapf(err, "row fetcher starts scan")
 	}
 
@@ -705,7 +703,7 @@ func (f backupFileDisplayMsg) MarshalJSON() ([]byte, error) {
 	}{
 		Path:         f.Path,
 		Span:         fmt.Sprint(f.Span),
-		DataSize:     humanizeutil.IBytes(f.EntryCounts.DataSize),
+		DataSize:     string(humanizeutil.IBytes(f.EntryCounts.DataSize)),
 		IndexEntries: f.EntryCounts.IndexEntries,
 		Rows:         f.EntryCounts.Rows,
 	}
@@ -738,7 +736,7 @@ func (b backupMetaDisplayMsg) MarshalJSON() ([]byte, error) {
 	}{
 		StartTime:           timeutil.Unix(0, b.StartTime.WallTime).Format(time.RFC3339),
 		EndTime:             timeutil.Unix(0, b.EndTime.WallTime).Format(time.RFC3339),
-		DataSize:            humanizeutil.IBytes(b.EntryCounts.DataSize),
+		DataSize:            string(humanizeutil.IBytes(b.EntryCounts.DataSize)),
 		Rows:                b.EntryCounts.Rows,
 		IndexEntries:        b.EntryCounts.IndexEntries,
 		FormatVersion:       b.FormatVersion,
@@ -755,7 +753,7 @@ func (b backupMetaDisplayMsg) MarshalJSON() ([]byte, error) {
 
 	dbIDToName := make(map[descpb.ID]string)
 	schemaIDToFullyQualifiedName := make(map[descpb.ID]string)
-	schemaIDToFullyQualifiedName[keys.PublicSchemaID] = catconstants.PublicSchemaName
+	schemaIDToFullyQualifiedName[keys.PublicSchemaIDForBackup] = catconstants.PublicSchemaName
 	typeIDToFullyQualifiedName := make(map[descpb.ID]string)
 	tableIDToFullyQualifiedName := make(map[descpb.ID]string)
 

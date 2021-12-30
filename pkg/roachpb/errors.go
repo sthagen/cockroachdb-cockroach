@@ -322,6 +322,7 @@ const (
 	InvalidLeaseErrType                     ErrorDetailType = 40
 	OptimisticEvalConflictsErrType          ErrorDetailType = 41
 	MinTimestampBoundUnsatisfiableErrType   ErrorDetailType = 42
+	RefreshFailedErrType                    ErrorDetailType = 43
 	// When adding new error types, don't forget to update NumErrors below.
 
 	// CommunicationErrType indicates a gRPC error; this is not an ErrorDetail.
@@ -331,7 +332,7 @@ const (
 	// detail. The value 25 is chosen because it's reserved in the errors proto.
 	InternalErrType ErrorDetailType = 25
 
-	NumErrors int = 43
+	NumErrors int = 44
 )
 
 // GoError returns a Go error converted from Error. If the error is a transaction
@@ -574,9 +575,8 @@ func NewRangeKeyMismatchError(
 		}
 	}
 	e := &RangeKeyMismatchError{
-		RequestStartKey:           start,
-		RequestEndKey:             end,
-		DeprecatedMismatchedRange: *desc,
+		RequestStartKey: start,
+		RequestEndKey:   end,
 	}
 	// More ranges are sometimes added to rangesInternal later.
 	e.AppendRangeInfo(ctx, *desc, l)
@@ -588,9 +588,12 @@ func (e *RangeKeyMismatchError) Error() string {
 }
 
 func (e *RangeKeyMismatchError) message(_ *Error) string {
-	desc := &e.Ranges()[0].Desc
+	mr, err := e.MismatchedRange()
+	if err != nil {
+		return err.Error()
+	}
 	return fmt.Sprintf("key range %s-%s outside of bounds of range %s-%s; suggested ranges: %s",
-		e.RequestStartKey, e.RequestEndKey, desc.StartKey, desc.EndKey, e.Ranges())
+		e.RequestStartKey, e.RequestEndKey, mr.Desc.StartKey, mr.Desc.EndKey, e.Ranges)
 }
 
 // Type is part of the ErrorDetailInterface.
@@ -598,21 +601,15 @@ func (e *RangeKeyMismatchError) Type() ErrorDetailType {
 	return RangeKeyMismatchErrType
 }
 
-// Ranges returns the range info for the range that the request was erroneously
-// routed to. It deals with legacy errors coming from 20.1 nodes by returning
-// empty lease for the respective descriptors.
-//
-// At least one RangeInfo is returned.
-func (e *RangeKeyMismatchError) Ranges() []RangeInfo {
-	if len(e.rangesInternal) != 0 {
-		return e.rangesInternal
+// MismatchedRange returns the range info for the range that the request was
+// erroneously routed to, or an error if the Ranges slice is empty.
+func (e *RangeKeyMismatchError) MismatchedRange() (RangeInfo, error) {
+	if len(e.Ranges) == 0 {
+		return RangeInfo{}, errors.AssertionFailedf(
+			"RangeKeyMismatchError (key range %s-%s) with empty RangeInfo slice", e.RequestStartKey, e.RequestEndKey,
+		)
 	}
-	// Fallback for 20.1 errors. Remove in 21.1.
-	ranges := []RangeInfo{{Desc: e.DeprecatedMismatchedRange}}
-	if e.DeprecatedSuggestedRange != nil {
-		ranges = append(ranges, RangeInfo{Desc: *e.DeprecatedSuggestedRange})
-	}
-	return ranges
+	return e.Ranges[0], nil
 }
 
 // AppendRangeInfo appends info about one range to the set returned to the
@@ -628,7 +625,7 @@ func (e *RangeKeyMismatchError) AppendRangeInfo(
 			log.Fatalf(ctx, "lease names missing replica; lease: %s, desc: %s", l, desc)
 		}
 	}
-	e.rangesInternal = append(e.rangesInternal, RangeInfo{
+	e.Ranges = append(e.Ranges, RangeInfo{
 		Desc:  desc,
 		Lease: l,
 	})
@@ -1315,3 +1312,45 @@ func (e *MinTimestampBoundUnsatisfiableError) Type() ErrorDetailType {
 }
 
 var _ ErrorDetailInterface = &MinTimestampBoundUnsatisfiableError{}
+
+// NewRefreshFailedError initializes a new RefreshFailedError. reason can be 'committed value'
+// or 'intent' which caused the failed refresh, key is the key that we failed
+// refreshing, and ts is the timestamp of the committed value or intent that was written.
+func NewRefreshFailedError(
+	reason RefreshFailedError_Reason, key Key, ts hlc.Timestamp,
+) *RefreshFailedError {
+	return &RefreshFailedError{
+		Reason:    reason,
+		Key:       key,
+		Timestamp: ts,
+	}
+}
+
+func (e *RefreshFailedError) Error() string {
+	return e.message(nil)
+}
+
+// FailureReason returns the failure reason as a string.
+func (e *RefreshFailedError) FailureReason() string {
+	var r string
+	switch e.Reason {
+	case RefreshFailedError_REASON_COMMITTED_VALUE:
+		r = "committed value"
+	case RefreshFailedError_REASON_INTENT:
+		r = "intent"
+	default:
+		r = "UNKNOWN"
+	}
+	return r
+}
+
+func (e *RefreshFailedError) message(_ *Error) string {
+	return fmt.Sprintf("encountered recently written %s %s @%s", e.FailureReason(), e.Key, e.Timestamp)
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *RefreshFailedError) Type() ErrorDetailType {
+	return RefreshFailedErrType
+}
+
+var _ ErrorDetailInterface = &RefreshFailedError{}

@@ -7,17 +7,21 @@ go_library(
         "backfill.go",
         "mutation.go",
         "ops.go",
+        "phase.go",
         "validation.go",
         ":gen-backfill",  # keep
         ":gen-mutation",  # keep
+        ":gen-phase-stringer",  # keep
         ":gen-type-stringer",  # keep
         ":gen-validation",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/jobs/jobspb",
         "//pkg/sql/catalog/descpb",
-        "@com_github_cockroachdb_errors//:errors",
+        "//pkg/sql/schemachanger/scpb",
+        "//pkg/sql/types",
     ],
 )
 
@@ -72,4 +76,10 @@ stringer(
     name = "gen-type-stringer",
     src = "ops.go",
     typ = "Type",
+)
+
+stringer(
+    name = "gen-phase-stringer",
+    src = "phase.go",
+    typ = "Phase",
 )

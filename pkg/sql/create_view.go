@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -163,9 +164,13 @@ func (n *createViewNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.CreateTempViewCounter)
 	}
 
-	privs := n.dbDesc.GetDefaultPrivilegeDescriptor().CreatePrivilegesFromDefaultPrivileges(
+	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		n.dbDesc.GetDefaultPrivilegeDescriptor(),
+		schema.GetDefaultPrivilegeDescriptor(),
 		n.dbDesc.GetID(),
-		params.SessionData().User(), tree.Tables, n.dbDesc.GetPrivileges(),
+		params.SessionData().User(),
+		tree.Tables,
+		n.dbDesc.GetPrivileges(),
 	)
 
 	var newDesc *tabledesc.Mutable
@@ -239,14 +244,18 @@ func (n *createViewNode) startExec(params runParams) error {
 		}
 
 		// Collect all the tables/views this view depends on.
+		orderedDependsOn := catalog.DescriptorIDSet{}
 		for backrefID := range n.planDeps {
-			desc.DependsOn = append(desc.DependsOn, backrefID)
+			orderedDependsOn.Add(backrefID)
 		}
+		desc.DependsOn = append(desc.DependsOn, orderedDependsOn.Ordered()...)
 
 		// Collect all types this view depends on.
+		orderedTypeDeps := catalog.DescriptorIDSet{}
 		for backrefID := range n.typeDeps {
-			desc.DependsOnTypes = append(desc.DependsOnTypes, backrefID)
+			orderedTypeDeps.Add(backrefID)
 		}
+		desc.DependsOnTypes = append(desc.DependsOnTypes, orderedTypeDeps.Ordered()...)
 
 		// TODO (lucy): I think this needs a NodeFormatter implementation. For now,
 		// do some basic string formatting (not accurate in the general case).
@@ -600,11 +609,11 @@ func addResultColumns(
 		columnTableDef.Nullable.Nullability = tree.SilentNull
 		// The new types in the CREATE VIEW column specs never use
 		// SERIAL so we need not process SERIAL types here.
-		col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
+		cdd, err := tabledesc.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
 		if err != nil {
 			return err
 		}
-		desc.AddColumn(col)
+		desc.AddColumn(cdd.ColumnDescriptor)
 	}
 	if err := desc.AllocateIDs(ctx); err != nil {
 		return err

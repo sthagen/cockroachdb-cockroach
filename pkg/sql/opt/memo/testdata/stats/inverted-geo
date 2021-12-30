@@ -91,12 +91,12 @@ project
 memo
 SELECT i FROM t WHERE st_intersects('LINESTRING(0.5 0.5, 0.7 0.7)', g) ORDER BY i LIMIT 1
 ----
-memo (optimized, ~11KB, required=[presentation: i:1])
+memo (optimized, ~13KB, required=[presentation: i:1])
  ├── G1: (project G2 G3 i)
  │    └── [presentation: i:1]
  │         ├── best: (project G2 G3 i)
  │         └── cost: 2652.94
- ├── G2: (limit G4 G5 ordering=+1) (top-k G4 &{1 +1})
+ ├── G2: (limit G4 G5 ordering=+1) (top-k G4 &{1 +1 })
  │    └── []
  │         ├── best: (limit G4="[ordering: +1] [limit hint: 1.00]" G5 ordering=+1)
  │         └── cost: 2652.92
@@ -130,9 +130,9 @@ memo (optimized, ~11KB, required=[presentation: i:1])
  │         ├── best: (inverted-filter G12 g_inverted_key)
  │         └── cost: 1268.99
  ├── G11: (scalar-list G13 G14)
- ├── G12: (scan t@secondary,cols=(3,6),constrained inverted)
+ ├── G12: (scan t@t_g_idx,cols=(3,6),constrained inverted)
  │    └── []
- │         ├── best: (scan t@secondary,cols=(3,6),constrained inverted)
+ │         ├── best: (scan t@t_g_idx,cols=(3,6),constrained inverted)
  │         └── cost: 1257.09
  ├── G13: (const '010200000002000000000000000000E03F000000000000E03F666666666666E63F666666666666E63F')
  └── G14: (variable g)
@@ -180,7 +180,7 @@ project
       │    │              │    └── st_intersects('010200000002000000000000000000594000000000000059400000000000C062400000000000C06240', g:2) [type=bool]
       │    │              ├── stats: [rows=7e-07]
       │    │              ├── key: (3)
-      │    │              └── scan t@secondary
+      │    │              └── scan t@t_g_idx
       │    │                   ├── columns: rowid:3(int!null) g_inverted_key:6(geometry!null)
       │    │                   ├── inverted constraint: /6/3
       │    │                   │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
@@ -195,12 +195,12 @@ project
 memo
 SELECT i FROM t WHERE st_intersects('LINESTRING(100 100, 150 150)', g) ORDER BY i LIMIT 1
 ----
-memo (optimized, ~11KB, required=[presentation: i:1])
+memo (optimized, ~13KB, required=[presentation: i:1])
  ├── G1: (project G2 G3 i)
  │    └── [presentation: i:1]
  │         ├── best: (project G2 G3 i)
  │         └── cost: 14.15
- ├── G2: (limit G4 G5 ordering=+1) (top-k G4 &{1 +1})
+ ├── G2: (limit G4 G5 ordering=+1) (top-k G4 &{1 +1 })
  │    └── []
  │         ├── best: (limit G4="[ordering: +1] [limit hint: 1.00]" G5 ordering=+1)
  │         └── cost: 14.13
@@ -234,9 +234,9 @@ memo (optimized, ~11KB, required=[presentation: i:1])
  │         ├── best: (inverted-filter G12 g_inverted_key)
  │         └── cost: 14.04
  ├── G11: (scalar-list G13 G14)
- ├── G12: (scan t@secondary,cols=(3,6),constrained inverted)
+ ├── G12: (scan t@t_g_idx,cols=(3,6),constrained inverted)
  │    └── []
- │         ├── best: (scan t@secondary,cols=(3,6),constrained inverted)
+ │         ├── best: (scan t@t_g_idx,cols=(3,6),constrained inverted)
  │         └── cost: 14.02
  ├── G13: (const '010200000002000000000000000000594000000000000059400000000000C062400000000000C06240')
  └── G14: (variable g)
@@ -303,7 +303,7 @@ select
 memo
 SELECT * FROM t WHERE g IS NULL OR st_intersects('LINESTRING(100 100, 150 150)', g)
 ----
-memo (optimized, ~4KB, required=[presentation: i:1,g:2])
+memo (optimized, ~5KB, required=[presentation: i:1,g:2])
  ├── G1: (select G2 G3)
  │    └── [presentation: i:1,g:2]
  │         ├── best: (select G2 G3)
@@ -400,7 +400,7 @@ project
       │    │              │    └── st_intersects('010200000002000000000000000000594000000000000059400000000000C062400000000000C06240', g:2) [type=bool]
       │    │              ├── stats: [rows=7.1e-07]
       │    │              ├── key: (3)
-      │    │              └── scan t@secondary
+      │    │              └── scan t@t_g_idx
       │    │                   ├── columns: rowid:3(int!null) g_inverted_key:6(geometry!null)
       │    │                   ├── inverted constraint: /6/3
       │    │                   │    └── spans: ["B\xfd\xff\xff\xff\xff\xff\xff\xff\xff", "B\xfd\xff\xff\xff\xff\xff\xff\xff\xff"]
@@ -479,7 +479,7 @@ select
  │         │    └── st_intersects('010200000002000000000000000000E03F000000000000E03F666666666666E63F666666666666E63F', g:2) [type=bool]
  │         ├── stats: [rows=100]
  │         ├── key: (3)
- │         └── scan t@secondary
+ │         └── scan t@t_g_idx
  │              ├── columns: rowid:3(int!null) g_inverted_key:6(geometry!null)
  │              ├── inverted constraint: /6/3
  │              │    └── spans
@@ -496,7 +496,7 @@ select
 
 # Force a scan of the inverted index so we can see the filtered histogram.
 opt
-SELECT i FROM t@secondary WHERE st_intersects('LINESTRING(.5 .5, .7 .7)', g)
+SELECT i FROM t@t_g_idx WHERE st_intersects('LINESTRING(.5 .5, .7 .7)', g)
 ----
 project
  ├── columns: i:1(int)
@@ -521,14 +521,14 @@ project
       │         │    └── st_intersects('010200000002000000000000000000E03F000000000000E03F666666666666E63F666666666666E63F', g:2) [type=bool]
       │         ├── stats: [rows=100]
       │         ├── key: (3)
-      │         └── scan t@secondary
+      │         └── scan t@t_g_idx
       │              ├── columns: rowid:3(int!null) g_inverted_key:6(geometry!null)
       │              ├── inverted constraint: /6/3
       │              │    └── spans
       │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x10\x00\x00\x00\x00\x00\x00\x00"]
       │              │         ├── ["B\xfd\x10\x00\x00\x00\x00\x00\x00\x01", "B\xfd\x12\x00\x00\x00\x00\x00\x00\x00")
       │              │         └── ["B\xfd\x14\x00\x00\x00\x00\x00\x00\x00", "B\xfd\x14\x00\x00\x00\x00\x00\x00\x00"]
-      │              ├── flags: force-index=secondary
+      │              ├── flags: force-index=t_g_idx
       │              ├── stats: [rows=100, distinct(3)=76.9230769, null(3)=0, distinct(6)=1, null(6)=0]
       │              │   histogram(6)=  0            100             0             0
       │              │                <--- '\x42fd1000000100000000' --- '\x42fd1400000000000001'
@@ -756,7 +756,7 @@ project
  ├── columns: count:21(int!null)
  ├── immutable
  ├── stats: [rows=0.333333333]
- └── group-by
+ └── group-by (hash)
       ├── columns: b:2(geography!null) count_rows:21(int!null)
       ├── grouping columns: b:2(geography!null)
       ├── immutable

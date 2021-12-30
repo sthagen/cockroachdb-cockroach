@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -47,6 +48,22 @@ func NewTransactionCommittedError() error {
 // NewNonNullViolationError creates an error for a violation of a non-NULL constraint.
 func NewNonNullViolationError(columnName string) error {
 	return pgerror.Newf(pgcode.NotNullViolation, "null value in column %q violates not-null constraint", columnName)
+}
+
+// NewInvalidAssignmentCastError creates an error that is used when a mutation
+// cannot be performed because there is not a valid assignment cast from a
+// value's type to the type of the target column.
+func NewInvalidAssignmentCastError(
+	sourceType *types.T, targetType *types.T, targetColName string,
+) error {
+	return errors.WithHint(
+		pgerror.Newf(
+			pgcode.DatatypeMismatch,
+			"value type %s doesn't match type %s of column %q",
+			sourceType, targetType, tree.ErrNameString(targetColName),
+		),
+		"you will need to rewrite or cast the expression",
+	)
 }
 
 // NewGeneratedAlwaysAsIdentityColumnOverrideError creates an error for
@@ -217,11 +234,7 @@ func NewDependentObjectErrorf(format string, args ...interface{}) error {
 
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(rangeID roachpb.RangeID, origErr error) error {
-	// TODO(knz): This could should really use errors.Wrap or
-	// errors.WithSecondaryError.
-	return pgerror.Newf(pgcode.RangeUnavailable,
-		"key range id:%d is unavailable. Original error: %v",
-		rangeID, origErr)
+	return pgerror.Wrapf(origErr, pgcode.RangeUnavailable, "key range id:%d is unavailable", rangeID)
 }
 
 // NewWindowInAggError creates an error for the case when a window function is

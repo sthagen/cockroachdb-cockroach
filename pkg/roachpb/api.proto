@@ -23,6 +23,7 @@ import "storage/enginepb/mvcc.proto";
 import "storage/enginepb/mvcc3.proto";
 import "util/hlc/timestamp.proto";
 import "util/tracing/tracingpb/recorded_span.proto";
+import "util/tracing/tracingpb/tracing.proto";
 import "gogoproto/gogo.proto";
 import "google/protobuf/duration.proto";
 
@@ -74,6 +75,9 @@ enum ResumeReason {
   // since MVCCScan converts the result into a WriteIntentError.
   // NB: 21.2 and below will return RESUME_KEY_LIMIT instead.
   RESUME_INTENT_LIMIT = 3;
+  // The DistSender encountered a range boundary and returned a partial result,
+  // in response to return_on_range_boundary.
+  RESUME_RANGE_BOUNDARY = 4;
 }
 
 // RequestHeader is supplied with every storage node request.
@@ -117,6 +121,17 @@ message ResponseHeader {
   // When resume_span is populated, this specifies the reason why the operation
   // wasn't completed and needs to be resumed.
   ResumeReason resume_reason = 7;
+  // When resume_reason is RESUME_BYTE_LIMIT, this may contain the size of the
+  // next result entry which caused the limit to be exceeded, i.e. the size of
+  // the first entry when reading from the resume span. It is only supported by
+  // Get and Scan. In a batch, this will only be set on the first response that
+  // exceeds the limit.
+  //
+  // NB: This is best-effort, and may be 0 in some rare cases. Specifically, if
+  // TargetBytes is exactly satisfied by a result that exhausted a range scan,
+  // or by a response from a multi-request batch, we won't do additional work
+  // (e.g. send another RPC to the next range) only to obtain resume_next_bytes.
+  int64 resume_next_bytes = 9;
 
   // The number of keys operated on.
   int64 num_keys = 5;
@@ -154,6 +169,23 @@ message GetResponse {
   // value that is being deleted by a corresponding intent. We should revisit
   // this decision if this ever becomes a problem.
   Value intent_value = 3;
+}
+
+// A ProbeRequest is an internal request type used to send a replicated
+// no-op through a Range as a means of probing write availability. The
+// request will be serialized like a regular write, i.e. will acquire
+// latches, and declare key access, but it will not check locks (i.e.
+// if an intent exists on the key that is being probed, the probe will
+// not observe it). ProbeRequest can be served by any Replica including
+// followers, i.e. it can be used to verify that a given Replica is able
+// to access the replication layer.
+message ProbeRequest {
+  RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// A ProbeResponse is the response to a ProbeRequest.
+message ProbeResponse {
+  ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
 // A PutRequest is the argument to the Put() method.
@@ -674,25 +706,7 @@ message EndTxnRequest {
   // from the TxnCoordSender on a failed heartbeat. It should only be set to
   // true when commit=false.
   bool poison = 9;
-  // TxnHeartbeating indicates that the transaction's coordinator has launched
-  // its heartbeat loop and that it may have created its transaction record as
-  // PENDING through a HeartbeatTxn request by the time that this EndTxn request
-  // evaluates. If the flag is not set and the transaction has not yet issued a
-  // successful EndTxn requests, the transaction's record can not already exist
-  // (but see the WARNING below).
-  //
-  // For details about transaction record state transitions, see the diagram on
-  // CanCreateTxnRecord. This diagram demonstrates that only EndTxn requests and
-  // HeartbeatTxn requests can create new transaction records.
-  //
-  // WARNING: this flag was introduced in the v20.2 release. v20.1 nodes may not
-  // set this properly so it should not be relied upon for correctness.
-  //
-  // TODO(erikgrinaker): This flag is no longer used in v21.2 as we now always
-  // heartbeat the txn record, but we still need to set it when interacting with
-  // v21.1 nodes. It should be removed in v22.1.
-  bool txn_heartbeating = 10;
-  reserved 7, 8;
+  reserved 7, 8, 10;
 }
 
 // An EndTxnResponse is the return value from the EndTxn() method. The final
@@ -1047,7 +1061,7 @@ message QueryIntentRequest {
   // transaction could have performed overlapping writes, in which case only the
   // latest sequence number will remain. We assume that if a transaction has
   // successfully written an intent at a larger sequence number then it must
-  // have succeeeded in writing an intent at the smaller sequence number as
+  // have succeeded in writing an intent at the smaller sequence number as
   // well.
   //
   // QueryIntentRequests may be issued in non-transactional BatchRequests or in
@@ -1394,7 +1408,7 @@ message ExportRequest {
   // is used as a lower bound and header Timestamp as higher bound or exported
   // entries.
   MVCCFilter mvcc_filter = 4 [(gogoproto.customname) = "MVCCFilter"];
-  // StartTime is only used whe MVCCFilter is set to All.
+  // StartTime is only used when MVCCFilter is set to All.
   util.hlc.Timestamp start_time = 3 [(gogoproto.nullable) = false];
 
   // Split large rows in the middle of key sequence. This option will allow
@@ -1557,15 +1571,114 @@ message AdminVerifyProtectedTimestampResponse {
   repeated FailedRange verification_failed_ranges = 4 [(gogoproto.nullable) = false];
 }
 
-// AddSSTableRequest is arguments to the AddSSTable() method, to link a file
-// into the RocksDB log-structured merge-tree.
+// AddSSTableRequest contains arguments to the AddSSTable method, which links an
+// SST file into the Pebble log-structured merge-tree. The SST should only
+// contain committed versioned values with non-zero MVCC timestamps (no intents
+// or inline values) and no tombstones, but this is only fully enforced when
+// WriteAtRequestTimestamp is enabled, for performance. It cannot be used in a
+// transaction, cannot be split across ranges, and must be alone in a batch.
+// 
+// By default, AddSSTable will blindly write the SST contents into Pebble, with
+// fixed MVCC timestamps unaffected by pushes. This can violate many CRDB
+// guarantees, including ACID, serializability and single-key linearizability:
+// it mutates MVCC history (by replacing existing versions or writing below
+// their timestamp) and does not respect the timestamp cache (by writing at
+// timestamps that have already been read) nor the closed timestamp (by writing
+// at immutable timestamps).
+//
+// The following parameters can be used to make AddSSTable enforce these
+// guarantees, at a performance cost:
+//
+// * WriteAtRequestTimestamp: ensures compliance with the timestamp cache and
+//   closed timestamp, by rewriting SST timestamps to the request timestamp.
+//
+// * DisallowConflicts, DisallowShadowing, or DisallowShadowingBelow: ensures
+//   compliance with MVCC, by checking for conflicting keys in existing data
+//   instead of writing blindly.
+//
+// If the above parameters are not enabled, the caller must make sure these
+// guarantees are upheld via other mechanisms. These options are orthogonal,
+// providing different guarantees, and neither is sufficient by itself to
+// enforce ACID guarantees -- they must both be enabled. See comments on these
+// parameters for more details.
+//
+// AddSSTable always synchronizes with ongoing transactions, by taking out a
+// lock span, scanning for separated intents, and resolving them. This is done
+// even in the case of blind writes, since the caller is expected to make sure
+// there are no ongoing writes to the ingested key span, so there should be few
+// or no intents in the common case.
+//
+// If writing blindly (without e.g. DisallowConflicts), the range's MVCC stats
+// may be incorrect as the SST stats are not adjusted for existing keys, so they
+// will be marked with ContainsEstimates. The caller should recompute statistics
+// after ingestion.
 message AddSSTableRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   bytes data = 2;
-  // If set, indicates that AddSSTable will not allow ingestion of keys which
-  // shadow already existing key entries. This disallows any key slice overlap
-  // regardless of the timestamps.
+
+  // WriteAtRequestTimestamp updates all MVCC timestamps in the SST to the
+  // request timestamp, even if the request gets pushed. This ensures the writes
+  // comply with the timestamp cache and closed timestamp.
+  //
+  // Callers should always set this, except in very special circumstances when
+  // the timestamp cache and closed timestamp can safely be ignored (e.g.
+  // streaming replication into an offline tenant).
+  //
+  // Note that this alone is not sufficient to guarantee MVCC correctness, since
+  // it can write below or replace existing committed versions (the tscache is
+  // only bumped when the values are subsequently read). Use DisallowConflicts
+  // or DisallowShadowing in addition to guarantee MVCC correctness and
+  // serializability.
+  // 
+  // Added in 22.1, so check the MVCCAddSSTable version gate before using.
+  bool write_at_request_timestamp = 6;
+
+  // DisallowConflicts will check for MVCC conflicts with existing keys, i.e.
+  // scan for existing keys with a timestamp at or above the SST key and
+  // return WriteTooOldError (possibly retrying). It also ensures MVCC
+  // statistics are accurately updated.
+  //
+  // Note that this alone is not sufficient to guarantee serializability or
+  // single-key linearizability, since it can write to a timestamp that another
+  // reader has already observed, changing the value at that timestamp and above
+  // it. Use WriteAtRequestTimestamp in addition to guarantee serializability.
+  //
+  // Added in 22.1, so check the MVCCAddSSTable version gate before using.
+  //
+  // TODO(erikgrinaker): It might be possible to avoid this parameter if we
+  // could pick an MVCC timestamp that's guaranteed to not collide with
+  // existing keys, see: https://github.com/cockroachdb/cockroach/issues/73047.
+  // However, this would always lead to inaccurate MVCC stats.
+  bool disallow_conflicts = 7; 
+
+  // DisallowShadowing implies DisallowConflicts, and additionally rejects
+  // writing above keys that have an existing/visible value (but will write
+  // above tombstones).
+  //
+  // TODO(erikgrinaker): Consider removing this in 22.1 if all callers have
+  // been migrated to DisallowShadowingBelow.
   bool disallow_shadowing = 3;
+
+  // DisallowShadowingBelow implies DisallowConflicts, and additionally rejects
+  // writing above keys that have an existing/visible value (but will write
+  // above tombstones). Unlike DisallowShadowing, it allows shadowing keys
+  // that have a timestamp at or above the given timestamp as long as the
+  // value is identical to the existing value, and also allows idempotent writes
+  // (same key/timestamp/value) at or above the given timestamp.
+  //
+  // This is a specialized method for the IMPORT INTO use-case, where we do not
+  // want to shadow existing keys (which could cause them to be GCed before the
+  // import finalizes, preventing a rollback), but we need to allow shadowing
+  // keys that were previously written by the import itself in the case of a
+  // resumption or retry. The equal value requirement is to avoid unique
+  // constraint violations.
+  //
+  // If this parameter is used, the value of DisallowShadowing is ignored, so 
+  // callers may pass both for forward and backwards compatibility.
+  //
+  // Added in 22.1, so check the MVCCAddSSTable version gate before using.
+  util.hlc.Timestamp disallow_shadowing_below = 8 [(gogoproto.nullable) = false];
+
   // MVCCStats, if set, is the MVCCStats for the contents of this SSTable and is
   // used as-is during evaluation of the AddSSTable command to update the range
   // MVCCStats, instead of computing the stats for the SSTable by iterating it.
@@ -1910,6 +2023,7 @@ message RequestUnion {
     QueryResolvedTimestampRequest query_resolved_timestamp = 51;
     ScanInterleavedIntentsRequest scan_interleaved_intents = 52;
     BarrierRequest barrier = 53;
+    ProbeRequest probe = 54;
   }
   reserved 8, 15, 23, 25, 27, 31, 34;
 }
@@ -1963,6 +2077,7 @@ message ResponseUnion {
     QueryResolvedTimestampResponse query_resolved_timestamp = 51;
     ScanInterleavedIntentsResponse scan_interleaved_intents = 52;
     BarrierResponse barrier = 53;
+    ProbeResponse probe = 54;
   }
   reserved 8, 15, 23, 25, 27, 28, 31, 34;
 }
@@ -2126,14 +2241,43 @@ message Header {
   int64 max_span_request_keys = 8;
   // If set to a non-zero value, sets a target (in bytes) for how large the
   // response may grow. This is only supported for (forward and reverse) scans
-  // and limits the number of rows scanned (and returned). The target will be
-  // overshot; in particular, at least one row will always be returned (assuming
-  // one exists). A suitable resume span will be returned.
+  // and limits the number of rows scanned (and returned). For cluster versions
+  // 21.2 and below, the target will be overshot. For 22.1 and above, the
+  // target will only be overshot when the first result is larger than the
+  // target (see TargetBytesAvoidExcess cluster version), unless
+  // target_bytes_allow_empty is set. A suitable resume span will be returned.
   //
   // The semantics around overlapping requests, unordered requests, and
   // supported requests from max_span_request_keys apply to the target_bytes
   // option as well.
   int64 target_bytes = 15;
+  // If true, allow returning an empty result when the first result exceeds
+  // target_bytes. Only effective on 22.1 clusters with TargetBytesAvoidExcess
+  // cluster version enabled. Only supported by Get, Scan, and ReverseScan.
+  bool target_bytes_allow_empty = 23;
+  // If true, DistSender returns partial non-empty results when encountering a
+  // range boundary, with an appropriate resume span and reason
+  // RESUME_RANGE_BOUNDARY. This will disable parallelism of DistSender
+  // requests, similarly to to the other limits above.
+  //
+  // This is useful in particular to prevent the DistSender from sending
+  // requests with very small remaining limits (e.g. TargetBytes) to subsequent
+  // ranges. Normally, as the DistSender iterates across ranges, each request's
+  // limits will be reduced by the results returned from the previous range,
+  // which can end up sending e.g. a request with TargetBytes=1 to the next
+  // range in the worst case. Enabling this option would instead return the
+  // partial result to the client, who then sends a new request with a new, full
+  // limit. In aggregate, as the client keeps paginating, this can significantly
+  // reduce the overall number of RPC requests sent to ranges, and thus the
+  // overall latency of the operation.
+  //
+  // However, the benefit depends greatly on the limits, key spans, overlap with
+  // range boundaries, as well as MVCC garbage. In some cases, it can be
+  // detrimental due to the cost of additional client sender stack traversals,
+  // so it is more appropriate for expensive requests (e.g. Scan) than cheap
+  // requests (e.g. Get). Benchmarks have shown that this relative overhead
+  // approaches zero as range RPC request latency increases past 1 ms.
+  bool return_on_range_boundary = 24;
   // If set, all of the spans in the batch are distinct. Note that the
   // calculation of distinct spans does not include intents in an
   // EndTxnRequest. Currently set conservatively: a request might be
@@ -2145,6 +2289,8 @@ message Header {
   // RangeInfo with up-to-date information.
   ClientRangeInfo client_range_info = 17 [(gogoproto.nullable) = false];
   // gateway_node_id is the ID of the gateway node where the request originated.
+  // For requests from tenants, this is set to the NodeID of the KV node handling
+  // the BatchRequest.
   int32 gateway_node_id = 11 [(gogoproto.customname) = "GatewayNodeID", (gogoproto.casttype) = "NodeID"];
   // If set, the request will return to the client before proposing the
   // request into Raft. All consensus processing will be performed
@@ -2173,6 +2319,9 @@ message Header {
   //
   // Requests with a non-zero timestamp are not allowed to set this field.
   BoundedStalenessHeader bounded_staleness = 22;
+
+  util.tracing.tracingpb.TraceInfo trace_info = 25 [(gogoproto.nullable) = false];
+
   reserved 7, 10, 12, 14;
 }
 
@@ -2385,6 +2534,7 @@ message RangeFeedValue {
   // 1. with_diff was passed in the corresponding RangeFeedRequest.
   // 2. the key-value was present and not a deletion tombstone before
   //    this event.
+  // The timestamp on the previous value is empty.
   Value prev_value = 3 [(gogoproto.nullable) = false];
 }
 

@@ -30,14 +30,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/internal/issues"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -179,7 +179,7 @@ func (r *testRunner) Run(
 		return fmt.Errorf("no test matched filters")
 	}
 
-	hasDevLicense := envutil.EnvOrDefaultString("COCKROACH_DEV_LICENSE", "") != ""
+	hasDevLicense := config.CockroachDevLicense != ""
 	for _, t := range tests {
 		if t.RequiresLicense && !hasDevLicense {
 			return fmt.Errorf("test %q requires an enterprise license, set COCKROACH_DEV_LICENSE", t.Name)
@@ -263,6 +263,7 @@ func (r *testRunner) Run(
 		cfg := clusterConfig{
 			spec:         t.Cluster,
 			artifactsDir: artifactsDir,
+			username:     clustersOpt.user,
 			localCluster: clustersOpt.typ == localCluster,
 			alloc:        alloc,
 		}
@@ -302,7 +303,7 @@ func (r *testRunner) Run(
 				ctx, fmt.Sprintf("w%d", i) /* name */, r.work, qp,
 				stopper.ShouldQuiesce(),
 				clustersOpt.keepClustersOnTestFailure,
-				lopt.artifactsDir, lopt.runnerLogPath, lopt.tee, lopt.stdout,
+				lopt.artifactsDir, lopt.literalArtifactsDir, lopt.runnerLogPath, lopt.tee, lopt.stdout,
 				allocateCluster,
 				topt,
 				l,
@@ -368,6 +369,8 @@ type clusterAllocatorFn func(
 // name: The worker's name, to be used as a prefix for log messages.
 // artifactsRootDir: The artifacts dir. Each test's logs are going to be under a
 //   run_<n> dir. If empty, test log files will not be created.
+// literalArtifactsDir: The literal on-agent path where artifacts are stored.
+//      Only used for teamcity[publishArtifacts] messages.
 // testRunnerLogPath: The path to the test runner's log. It will be copied to
 //  	failing tests' artifacts dir if running under TeamCity.
 // stdout: The Writer to use for messages that need to go to stdout (e.g. the
@@ -382,6 +385,7 @@ func (r *testRunner) runWorker(
 	interrupt <-chan struct{},
 	debug bool,
 	artifactsRootDir string,
+	literalArtifactsDir string,
 	testRunnerLogPath string,
 	teeOpt logger.TeeOptType,
 	stdout io.Writer,
@@ -466,15 +470,13 @@ func (r *testRunner) runWorker(
 			escapedTestName := teamCityNameEscape(testToRun.spec.Name)
 			runSuffix := "run_" + strconv.Itoa(testToRun.runNum)
 
-			base := filepath.Join(artifactsRootDir, escapedTestName)
-
-			artifactsDir = filepath.Join(base, runSuffix)
+			artifactsDir = filepath.Join(filepath.Join(artifactsRootDir, escapedTestName), runSuffix)
 			logPath = filepath.Join(artifactsDir, "test.log")
 
 			// Map artifacts/TestFoo/run_?/** => TestFoo/run_?/**, i.e. collect the artifacts
 			// for this test exactly as they are laid out on disk (when the time
 			// comes).
-			artifactsSpec = fmt.Sprintf("%s/%s/** => %s/%s", base, runSuffix, escapedTestName, runSuffix)
+			artifactsSpec = fmt.Sprintf("%s/%s/** => %s/%s", filepath.Join(literalArtifactsDir, escapedTestName), runSuffix, escapedTestName, runSuffix)
 		}
 		testL, err := logger.RootLogger(logPath, teeOpt)
 		if err != nil {
@@ -563,11 +565,12 @@ elif [[ -e "${PERF_ARTIFACTS}" ]]; then
 else
     echo false
 fi'`
-			out, err := c.RunWithBuffer(ctx, l, c.Node(node), "bash", "-c", testCmd)
+			result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(node), "bash", "-c", testCmd)
 			if err != nil {
-				return errors.Wrapf(err, "failed to check for perf artifacts: %v", string(out))
+				return errors.Wrapf(err, "failed to check for perf artifacts")
 			}
-			switch out := strings.TrimSpace(string(out)); out {
+			out := strings.TrimSpace(result.Stdout)
+			switch out {
 			case "true":
 				dst := fmt.Sprintf("%s/%d.%s", t.ArtifactsDir(), node, perfArtifactsDir)
 				return c.Get(ctx, l, perfArtifactsDir, dst, c.Node(node))
@@ -816,10 +819,11 @@ func (r *testRunner) runTest(
 		// Don't use surrounding context, which are likely already canceled.
 		if nodes := c.All(); len(nodes) > 0 { // avoid tests
 			innerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			// SIGABRT causes the go runtime to dump stacks and terminate.
-			// We also need --wait because roachprod does not think signals other than SIGKILL will terminate
-			// the process, and that is mistaken.
-			_ = c.StopE(innerCtx, c.All(), option.StopArgs("--sig=ABRT", "--wait=true"))
+			// Send SIGQUIT to dump stacks (this is how CRDB handles it) followed by SIGKILL.
+			stopOpts := option.DefaultStopOpts()
+			stopOpts.RoachprodOpts.Sig = 3
+			_ = c.StopE(innerCtx, teardownL, stopOpts, c.All())
+			_ = c.StopE(innerCtx, teardownL, option.DefaultStopOpts(), c.All())
 			t.L().PrintfCtx(ctx, "CockroachDB nodes aborted; check the stderr log for goroutine stack traces")
 			cancel()
 		}
@@ -918,10 +922,11 @@ func (r *testRunner) maybePostGithubIssue(
 		projColID = teams[sl[0]].TriageColumnID
 	}
 
-	branch := "<unknown branch>"
-	if b := os.Getenv("TC_BUILD_BRANCH"); b != "" {
-		branch = b
+	branch := os.Getenv("TC_BUILD_BRANCH")
+	if branch == "" {
+		branch = "<unknown branch>"
 	}
+
 	msg := fmt.Sprintf("The test failed on branch=%s, cloud=%s:\n%s",
 		branch, t.Spec().(*registry.TestSpec).Cluster.Cloud, output)
 	artifacts := fmt.Sprintf("/%s", t.Name())
@@ -935,18 +940,21 @@ func (r *testRunner) maybePostGithubIssue(
 	}
 
 	req := issues.PostRequest{
-		AuthorEmail:     "", // intentionally unset - we add to the board and cc the team
-		Mention:         mention,
+		MentionOnCreate: mention,
 		ProjectColumnID: projColID,
 		PackageName:     "roachtest",
 		TestName:        t.Name(),
 		Message:         msg,
 		Artifacts:       artifacts,
 		ExtraLabels:     labels,
-		ReproductionCommand: func(renderer *issues.Renderer) {
-			issues.ReproductionAsLink(
+		HelpCommand: func(renderer *issues.Renderer) {
+			issues.HelpCommandAsLink(
 				"roachtest README",
 				"https://github.com/cockroachdb/cockroach/blob/master/pkg/cmd/roachtest/README.md",
+			)(renderer)
+			issues.HelpCommandAsLink(
+				"How To Investigate (internal)",
+				"https://cockroachlabs.atlassian.net/l/c/SSSBr8c7",
 			)(renderer)
 		},
 	}
@@ -1073,7 +1081,7 @@ func (r *testRunner) getWork(
 		if err := c.WipeE(ctx, l); err != nil {
 			return testToRunRes{}, nil, err
 		}
-		if err := c.RunL(ctx, l, c.All(), "rm -rf "+perfArtifactsDir); err != nil {
+		if err := c.RunE(ctx, c.All(), "rm -rf "+perfArtifactsDir); err != nil {
 			return testToRunRes{}, nil, errors.Wrapf(err, "failed to remove perf artifacts dir")
 		}
 		if c.localCertsDir != "" {
@@ -1109,7 +1117,7 @@ func (r *testRunner) addWorker(ctx context.Context, name string) *workerStatus {
 	return w
 }
 
-// removeWorker deletes the bookkepping for a worker that has finished running.
+// removeWorker deletes the bookkeeping for a worker that has finished running.
 func (r *testRunner) removeWorker(ctx context.Context, name string) {
 	r.workersMu.Lock()
 	delete(r.workersMu.workers, name)
@@ -1186,7 +1194,7 @@ func (r *testRunner) serveHTTP(wr http.ResponseWriter, req *http.Request) {
 		var clusterName, clusterAdminUIAddr string
 		if w.Cluster() != nil {
 			clusterName = w.Cluster().name
-			adminUIAddrs, err := w.Cluster().ExternalAdminUIAddr(req.Context(), w.Cluster().Node(1))
+			adminUIAddrs, err := w.Cluster().ExternalAdminUIAddr(req.Context(), w.Cluster().l, w.Cluster().Node(1))
 			if err == nil {
 				clusterAdminUIAddr = adminUIAddrs[0]
 			}

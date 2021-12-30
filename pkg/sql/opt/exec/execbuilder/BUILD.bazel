@@ -23,6 +23,7 @@ go_library(
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
         "//pkg/sql/opt/exec",
+        "//pkg/sql/opt/exec/explain",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/norm",
         "//pkg/sql/opt/ordering",
@@ -37,6 +38,7 @@ go_library(
         "//pkg/sql/sqltelemetry",
         "//pkg/sql/types",
         "//pkg/util",
+        "//pkg/util/buildutil",
         "//pkg/util/encoding",
         "//pkg/util/errorutil",
         "//pkg/util/errorutil/unimplemented",
@@ -48,7 +50,7 @@ go_library(
 
 go_test(
     name = "execbuilder_test",
-    size = "medium",
+    size = "large",
     srcs = [
         "builder_test.go",
         "main_test.go",
@@ -67,6 +69,7 @@ go_test(
         "//pkg/sql/opt",
         "//pkg/sql/sem/tree",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",

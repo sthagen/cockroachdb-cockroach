@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -48,10 +49,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 )
 
 // StartTenant starts a stand-alone SQL server against a KV backend.
@@ -67,7 +66,11 @@ func StartTenant(
 		return nil, "", "", err
 	}
 
-	args, err := makeTenantSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
+	// Inform the server identity provider that we're operating
+	// for a tenant server.
+	baseCfg.idProvider.SetTenant(sqlCfg.TenantID)
+
+	args, err := makeTenantSQLServerArgs(ctx, stopper, kvClusterName, baseCfg, sqlCfg)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -81,14 +84,6 @@ func StartTenant(
 		settings:                args.Settings,
 	})
 
-	connManager := netutil.MakeServer(
-		args.stopper,
-		// The SQL server only uses connManager.ServeWith. The both below
-		// are unused.
-		nil, // tlsConfig
-		nil, // handler
-	)
-
 	// Initialize gRPC server for use on shared port with pg
 	grpcMain := newGRPCServer(args.rpcContext)
 	grpcMain.setMode(modeOperational)
@@ -96,7 +91,18 @@ func StartTenant(
 	// TODO(davidh): Do we need to force this to be false?
 	baseCfg.SplitListenSQL = false
 
-	background := baseCfg.AmbientCtx.AnnotateCtx(context.Background())
+	// Add the server tags to the startup context.
+	//
+	// We use args.BaseConfig here instead of baseCfg directly because
+	// makeTenantSQLArgs defines its own AmbientCtx instance and it's
+	// defined by-value.
+	ctx = args.BaseConfig.AmbientCtx.AnnotateCtx(ctx)
+
+	// Add the server tags to a generic background context for use
+	// by async goroutines.
+	// We can only annotate the context after makeTenantSQLServerArgs
+	// has defined the instance ID container in the AmbientCtx.
+	background := args.BaseConfig.AmbientCtx.AnnotateCtx(context.Background())
 
 	// StartListenRPCAndSQL will replace the SQLAddr fields if we choose
 	// to share the SQL and gRPC port so here, since the tenant config
@@ -119,8 +125,8 @@ func StartTenant(
 			// quiescing starts to allow that worker to shut down.
 			_ = pgL.Close()
 		}
-		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-pgl", waitQuiesce); err != nil {
-			waitQuiesce(ctx)
+		if err := args.stopper.RunAsyncTask(background, "wait-quiesce-pgl", waitQuiesce); err != nil {
+			waitQuiesce(background)
 			return nil, "", "", err
 		}
 	}
@@ -142,8 +148,8 @@ func StartTenant(
 			<-args.stopper.ShouldQuiesce()
 			_ = httpL.Close()
 		}
-		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-http", waitQuiesce); err != nil {
-			waitQuiesce(ctx)
+		if err := args.stopper.RunAsyncTask(background, "wait-quiesce-http", waitQuiesce); err != nil {
+			waitQuiesce(background)
 			return nil, "", "", err
 		}
 	}
@@ -172,17 +178,16 @@ func StartTenant(
 	// TODO(asubiotto): remove this. Right now it is needed to initialize the
 	// SpanResolver.
 	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: 0})
-	workersCtx := tenantStatusServer.AnnotateCtx(context.Background())
 
 	// Register and start gRPC service on pod. This is separate from the
 	// gRPC + Gateway services configured below.
 	tenantStatusServer.RegisterService(grpcMain.Server)
-	startRPCServer(workersCtx)
+	startRPCServer(background)
 
 	// Begin configuration of GRPC Gateway
 	gwMux, gwCtx, conn, err := ConfigureGRPCGateway(
 		ctx,
-		workersCtx,
+		background,
 		args.AmbientCtx,
 		tenantStatusServer.rpcCtx,
 		s.stopper,
@@ -205,30 +210,29 @@ func StartTenant(
 		pgLAddr,   // sql addr
 	)
 
-	if err := args.stopper.RunAsyncTask(ctx, "serve-http", func(ctx context.Context) {
-		mux := http.NewServeMux()
-		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn(), s.execCfg.SQLStatusServer)
-		mux.Handle("/", debugServer)
-		mux.Handle("/_status/", gwMux)
-		mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
-			// Return Bad Request if called with arguments.
-			if err := req.ParseForm(); err != nil || len(req.Form) != 0 {
-				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-				return
-			}
-		})
-		f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
-		mux.Handle(statusVars, http.HandlerFunc(f))
-		ff := loadVarsHandler(ctx, args.runtime)
-		mux.Handle(loadStatusVars, http.HandlerFunc(ff))
+	mux := http.NewServeMux()
+	debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn(), s.execCfg.SQLStatusServer)
+	mux.Handle("/", debugServer)
+	mux.Handle("/_status/", gwMux)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		// Return Bad Request if called with arguments.
+		if err := req.ParseForm(); err != nil || len(req.Form) != 0 {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+	})
+	f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
+	mux.Handle(statusVars, http.HandlerFunc(f))
+	ff := loadVarsHandler(ctx, args.runtime)
+	mux.Handle(loadStatusVars, http.HandlerFunc(ff))
 
-		tlsConnManager := netutil.MakeServer(
-			args.stopper,
-			serverTLSConfig, // tlsConfig
-			mux,             // handler
-		)
-
-		netutil.FatalIfUnexpected(tlsConnManager.Serve(httpL))
+	connManager := netutil.MakeServer(
+		args.stopper,
+		serverTLSConfig, // tlsConfig
+		mux,             // handler
+	)
+	if err := args.stopper.RunAsyncTask(background, "serve-http", func(ctx context.Context) {
+		netutil.FatalIfUnexpected(connManager.Serve(httpL))
 	}); err != nil {
 		return nil, "", "", err
 	}
@@ -263,22 +267,6 @@ func StartTenant(
 		return nil, "", "", err
 	}
 
-	// This is necessary so the grpc server doesn't error out on heartbeat
-	// ping when we make pod-to-pod calls, we pass the InstanceID with the
-	// request to ensure we're dialing the pod we think we are.
-	//
-	// The InstanceID subsystem is not available until `preStart`.
-	args.rpcContext.NodeID.Set(ctx, roachpb.NodeID(s.SQLInstanceID()))
-
-	// Register the server's identifiers so that log events are
-	// decorated with the server's identity. This helps when gathering
-	// log events from multiple servers into the same log collector.
-	//
-	// We do this only here, as the identifiers may not be known before this point.
-	clusterID := args.rpcContext.ClusterID.Get().String()
-	log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
-	log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
-
 	externalUsageFn := func(ctx context.Context) multitenant.ExternalUsage {
 		userTimeMillis, _, err := status.GetCPUTime(ctx)
 		if err != nil {
@@ -290,12 +278,7 @@ func StartTenant(
 		}
 	}
 
-	nextLiveInstanceIDFn := makeNextLiveInstanceIDFn(
-		ctx,
-		args.stopper,
-		s.sqlInstanceProvider,
-		s.SQLInstanceID(),
-	)
+	nextLiveInstanceIDFn := makeNextLiveInstanceIDFn(s.sqlInstanceProvider, s.SQLInstanceID())
 
 	if err := args.costController.Start(
 		ctx, args.stopper, s.SQLInstanceID(), s.sqlLivenessSessionID,
@@ -322,9 +305,11 @@ func loadVarsHandler(
 ) func(http.ResponseWriter, *http.Request) {
 	cpuUserNanos := metric.NewGauge(rsr.CPUUserNS.GetMetadata())
 	cpuSysNanos := metric.NewGauge(rsr.CPUSysNS.GetMetadata())
+	cpuNowNanos := metric.NewGauge(rsr.CPUNowNS.GetMetadata())
 	registry := metric.NewRegistry()
 	registry.AddMetric(cpuUserNanos)
 	registry.AddMetric(cpuSysNanos)
+	registry.AddMetric(cpuNowNanos)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		userTimeMillis, sysTimeMillis, err := status.GetCPUTime(ctx)
@@ -332,11 +317,13 @@ func loadVarsHandler(
 			// Just log but don't return an error to match the _status/vars metrics handler.
 			log.Ops.Errorf(ctx, "unable to get cpu usage: %v", err)
 		}
+
 		// cpuTime.{User,Sys} are in milliseconds, convert to nanoseconds.
 		utime := userTimeMillis * 1e6
 		stime := sysTimeMillis * 1e6
 		cpuUserNanos.Update(utime)
 		cpuSysNanos.Update(stime)
+		cpuNowNanos.Update(timeutil.Now().UnixNano())
 
 		exporter := metric.MakePrometheusExporter()
 		exporter.ScrapeRegistry(registry, true)
@@ -349,10 +336,19 @@ func loadVarsHandler(
 }
 
 func makeTenantSQLServerArgs(
-	stopper *stop.Stopper, kvClusterName string, baseCfg BaseConfig, sqlCfg SQLConfig,
+	startupCtx context.Context,
+	stopper *stop.Stopper,
+	kvClusterName string,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
 ) (sqlServerArgs, error) {
 	st := baseCfg.Settings
-	baseCfg.AmbientCtx.AddLogTag("sql", nil)
+
+	// We want all log messages issued on behalf of this SQL instance to report
+	// the instance ID (once known) as a tag.
+	instanceIDContainer := baseCfg.IDContainer.SwitchToSQLIDContainer()
+	startupCtx = baseCfg.AmbientCtx.AnnotateCtx(startupCtx)
+
 	// TODO(tbg): this is needed so that the RPC heartbeats between the testcluster
 	// and this tenant work.
 	//
@@ -368,14 +364,15 @@ func makeTenantSQLServerArgs(
 	if p, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
 		rpcTestingKnobs = p.ContextTestingKnobs
 	}
-	rpcContext := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   sqlCfg.TenantID,
-		AmbientCtx: baseCfg.AmbientCtx,
-		Config:     baseCfg.Config,
-		Clock:      clock,
-		Stopper:    stopper,
-		Settings:   st,
-		Knobs:      rpcTestingKnobs,
+	rpcContext := rpc.NewContext(startupCtx, rpc.ContextOptions{
+		TenantID:  sqlCfg.TenantID,
+		NodeID:    baseCfg.IDContainer,
+		ClusterID: baseCfg.ClusterIDContainer,
+		Config:    baseCfg.Config,
+		Clock:     clock,
+		Stopper:   stopper,
+		Settings:  st,
+		Knobs:     rpcTestingKnobs,
 	})
 
 	var dsKnobs kvcoord.ClientTestingKnobs
@@ -443,7 +440,7 @@ func makeTenantSQLServerArgs(
 	)
 	db := kv.NewDB(baseCfg.AmbientCtx, tcsFactory, clock, stopper)
 	rangeFeedKnobs, _ := baseCfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs)
-	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, rangeFeedKnobs)
+	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, st, rangeFeedKnobs)
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
@@ -466,7 +463,7 @@ func makeTenantSQLServerArgs(
 
 	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st)
 
-	runtime := status.NewRuntimeStatSampler(context.Background(), clock)
+	runtime := status.NewRuntimeStatSampler(startupCtx, clock)
 	registry.AddMetricStruct(runtime)
 
 	esb := &externalStorageBuilder{}
@@ -505,7 +502,8 @@ func makeTenantSQLServerArgs(
 			externalStorageFromURI: externalStorageFromURI,
 			// Set instance ID to 0 and node ID to nil to indicate
 			// that the instance ID will be bound later during preStart.
-			nodeIDContainer: base.NewSQLIDContainer(0, nil),
+			nodeIDContainer:      instanceIDContainer,
+			spanConfigKVAccessor: spanconfigkvaccessor.IllegalKVAccessor,
 		},
 		sqlServerOptionalTenantArgs: sqlServerOptionalTenantArgs{
 			tenantConnect: tenantConnect,
@@ -537,16 +535,12 @@ func makeTenantSQLServerArgs(
 }
 
 func makeNextLiveInstanceIDFn(
-	serverCtx context.Context,
-	stopper *stop.Stopper,
-	sqlInstanceProvider sqlinstance.Provider,
-	instanceID base.SQLInstanceID,
+	sqlInstanceProvider sqlinstance.Provider, instanceID base.SQLInstanceID,
 ) multitenant.NextLiveInstanceIDFn {
-	retrieveNextLiveInstanceID := func(ctx context.Context) base.SQLInstanceID {
+	return func(ctx context.Context) base.SQLInstanceID {
 		instances, err := sqlInstanceProvider.GetAllInstances(ctx)
 		if err != nil {
 			log.Infof(ctx, "GetAllInstances failed: %v", err)
-			// We will try again.
 			return 0
 		}
 		if len(instances) == 0 {
@@ -567,49 +561,6 @@ func makeNextLiveInstanceIDFn(
 			return minID
 		}
 		return nextID
-	}
-
-	// We retrieve the value from the provider every minute.
-	//
-	// We report each retrieved value only once; for all other calls we return 0.
-	// We prefer to not provide a value rather than providing a stale value which
-	// might cause a bit of unnecessary work on the server side.
-	//
-	// TODO(radu): once the provider caches the information (see #69976), we can
-	// use it directly each time.
-	const interval = 1 * time.Minute
-	var mu syncutil.Mutex
-	var lastRefresh time.Time
-	var lastValue base.SQLInstanceID
-	var refreshInProgress bool
-
-	serverCtx = logtags.AddTag(serverCtx, "get-next-live-instance-id", nil)
-
-	return func(ctx context.Context) base.SQLInstanceID {
-		mu.Lock()
-		defer mu.Unlock()
-		if lastValue != 0 {
-			v := lastValue
-			lastValue = 0
-			return v
-		}
-
-		if now := timeutil.Now(); lastRefresh.Before(now.Add(-interval)) && !refreshInProgress {
-			lastRefresh = now
-			refreshInProgress = true
-
-			// An error here indicates that the server is shutting down, so we can
-			// ignore it.
-			_ = stopper.RunAsyncTask(serverCtx, "get-next-live-instance-id", func(ctx context.Context) {
-				newValue := retrieveNextLiveInstanceID(ctx)
-
-				mu.Lock()
-				defer mu.Unlock()
-				lastValue = newValue
-				refreshInProgress = false
-			})
-		}
-		return 0
 	}
 }
 

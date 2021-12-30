@@ -65,7 +65,7 @@ func TestCanServeFollowerRead(t *testing.T) {
 			tc := testContext{manualClock: manual}
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			tc.StartWithStoreConfig(t, stopper, tsc)
+			tc.StartWithStoreConfig(ctx, t, stopper, tsc)
 
 			key := roachpb.Key("a")
 
@@ -79,9 +79,12 @@ func TestCanServeFollowerRead(t *testing.T) {
 
 			gArgs := getArgs(key)
 			txn := roachpb.MakeTransaction(
-				"test", key, roachpb.NormalUserPriority,
+				"test",
+				key,
+				roachpb.NormalUserPriority,
 				test.readTimestamp,
 				clock.MaxOffset().Nanoseconds(),
+				0, // coordinatorNodeID
 			)
 
 			ba := &roachpb.BatchRequest{}
@@ -131,7 +134,7 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 	tc := testContext{manualClock: manual}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	tc.StartWithStoreConfig(t, stopper, tsc)
+	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
 
 	key := roachpb.Key("a")
 
@@ -155,9 +158,12 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 
 	gArgs := getArgs(key)
 	txn := roachpb.MakeTransaction(
-		"test", key, roachpb.NormalUserPriority,
+		"test",
+		key,
+		roachpb.NormalUserPriority,
 		tsBelowClosedTimestamp,
 		clock.MaxOffset().Nanoseconds(),
+		0, // coordinatorNodeID
 	)
 
 	ba := &roachpb.BatchRequest{}

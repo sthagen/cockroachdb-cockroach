@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -56,7 +57,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -114,18 +114,34 @@ This metric is thus not an indicator of KV health.`,
 		Measurement: "Disk stalls detected",
 		Unit:        metric.Unit_COUNT,
 	}
+
+	metaInternalBatchRPCMethodCount = metric.Metadata{
+		Name:        "rpc.method.%s.recv",
+		Help:        "Number of %s requests processed",
+		Measurement: "RPCs",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	metaInternalBatchRPCCount = metric.Metadata{
+		Name:        "rpc.batches.recv",
+		Help:        "Number of batches processed",
+		Measurement: "Batches",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // Cluster settings.
 var (
 	// graphiteEndpoint is host:port, if any, of Graphite metrics server.
 	graphiteEndpoint = settings.RegisterStringSetting(
+		settings.TenantWritable,
 		"external.graphite.endpoint",
 		"if nonempty, push server metrics to the Graphite or Carbon server at the specified host:port",
 		"",
 	).WithPublic()
 	// graphiteInterval is how often metrics are pushed to Graphite, if enabled.
 	graphiteInterval = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		graphiteIntervalKey,
 		"the interval at which metrics are pushed to Graphite (if enabled)",
 		10*time.Second,
@@ -138,6 +154,9 @@ type nodeMetrics struct {
 	Success    *metric.Counter
 	Err        *metric.Counter
 	DiskStalls *metric.Counter
+
+	BatchCount   *metric.Counter
+	MethodCounts [roachpb.NumMethods]*metric.Counter
 }
 
 func makeNodeMetrics(reg *metric.Registry, histogramWindow time.Duration) nodeMetrics {
@@ -146,7 +165,17 @@ func makeNodeMetrics(reg *metric.Registry, histogramWindow time.Duration) nodeMe
 		Success:    metric.NewCounter(metaExecSuccess),
 		Err:        metric.NewCounter(metaExecError),
 		DiskStalls: metric.NewCounter(metaDiskStalls),
+		BatchCount: metric.NewCounter(metaInternalBatchRPCCount),
 	}
+
+	for i := range nm.MethodCounts {
+		method := roachpb.Method(i).String()
+		meta := metaInternalBatchRPCMethodCount
+		meta.Name = fmt.Sprintf(meta.Name, strings.ToLower(method))
+		meta.Help = fmt.Sprintf(meta.Help, method)
+		nm.MethodCounts[i] = metric.NewCounter(meta)
+	}
+
 	reg.AddMetricStruct(nm)
 	return nm
 }
@@ -191,9 +220,7 @@ type Node struct {
 
 	perReplicaServer kvserver.Server
 
-	// Admission control queues and coordinators. Both should be nil or non-nil.
-	kvAdmissionQ     *admission.WorkQueue
-	storeGrantCoords *admission.StoreGrantCoordinators
+	admissionController kvserver.KVAdmissionController
 
 	tenantUsage multitenant.TenantUsageServer
 
@@ -331,19 +358,19 @@ func NewNode(
 		sqlExec = execCfg.InternalExecutor
 	}
 	n := &Node{
-		storeCfg:           cfg,
-		stopper:            stopper,
-		recorder:           recorder,
-		metrics:            makeNodeMetrics(reg, cfg.HistogramWindowInterval),
-		stores:             stores,
-		txnMetrics:         txnMetrics,
-		sqlExec:            sqlExec,
-		clusterID:          clusterID,
-		kvAdmissionQ:       kvAdmissionQ,
-		storeGrantCoords:   storeGrantCoords,
-		tenantUsage:        tenantUsage,
-		spanConfigAccessor: spanConfigAccessor,
+		storeCfg:            cfg,
+		stopper:             stopper,
+		recorder:            recorder,
+		metrics:             makeNodeMetrics(reg, cfg.HistogramWindowInterval),
+		stores:              stores,
+		txnMetrics:          txnMetrics,
+		sqlExec:             sqlExec,
+		clusterID:           clusterID,
+		admissionController: kvserver.MakeKVAdmissionController(kvAdmissionQ, storeGrantCoords),
+		tenantUsage:         tenantUsage,
+		spanConfigAccessor:  spanConfigAccessor,
 	}
+	n.storeCfg.KVAdmissionController = n.admissionController
 	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
 	return n
 }
@@ -410,14 +437,14 @@ func (n *Node) start(
 	// Gossip the node descriptor to make this node addressable by node ID.
 	n.storeCfg.Gossip.NodeID.Set(ctx, n.Descriptor.NodeID)
 	if err := n.storeCfg.Gossip.SetNodeDescriptor(&n.Descriptor); err != nil {
-		return errors.Errorf("couldn't gossip descriptor for node %d: %s", n.Descriptor.NodeID, err)
+		return errors.Wrapf(err, "couldn't gossip descriptor for node %d", n.Descriptor.NodeID)
 	}
 
 	// Create stores from the engines that were already initialized.
 	for _, e := range state.initializedEngines {
 		s := kvserver.NewStore(ctx, n.storeCfg, e, &n.Descriptor)
 		if err := s.Start(ctx, n.stopper); err != nil {
-			return errors.Errorf("failed to start store: %s", err)
+			return errors.Wrap(err, "failed to start store")
 		}
 
 		n.addStore(ctx, s)
@@ -451,7 +478,7 @@ func (n *Node) start(
 	// gossip can bootstrap using the most recently persisted set of
 	// node addresses.
 	if err := n.storeCfg.Gossip.SetStorage(n.stores); err != nil {
-		return fmt.Errorf("failed to initialize the gossip interface: %s", err)
+		return errors.Wrap(err, "failed to initialize the gossip interface")
 	}
 
 	// Initialize remaining stores/engines, if any.
@@ -592,7 +619,7 @@ func (n *Node) initializeAdditionalStores(
 		storeIDAlloc := int64(len(engines))
 		startID, err := allocateStoreIDs(ctx, n.Descriptor.NodeID, storeIDAlloc, n.storeCfg.DB)
 		if err != nil {
-			return errors.Errorf("error allocating store ids: %s", err)
+			return errors.Wrap(err, "error allocating store ids")
 		}
 
 		sIdent := roachpb.StoreIdent{
@@ -918,7 +945,7 @@ func (n *Node) batchInternal(
 	if err := n.stopper.RunTaskWithErr(ctx, "node.Node: batch", func(ctx context.Context) error {
 		var finishSpan func(context.Context, *roachpb.BatchResponse)
 		// Shadow ctx from the outer function. Written like this to pass the linter.
-		ctx, finishSpan = n.setupSpanForIncomingRPC(ctx, tenID)
+		ctx, finishSpan = n.setupSpanForIncomingRPC(ctx, tenID, args)
 		// NB: wrapped to delay br evaluation to its value when returning.
 		defer func() { finishSpan(ctx, br) }()
 		if log.HasSpanOrEvent(ctx) {
@@ -944,91 +971,48 @@ func (n *Node) batchInternal(
 	return br, nil
 }
 
-func isSingleHeartbeatTxnRequest(b *roachpb.BatchRequest) bool {
-	if len(b.Requests) != 1 {
-		return false
+// incrementBatchCounters increments counters to track the batch and composite
+// request methods.
+func (n *Node) incrementBatchCounters(ba *roachpb.BatchRequest) {
+	n.metrics.BatchCount.Inc(1)
+	for _, ru := range ba.Requests {
+		m := ru.GetInner().Method()
+		n.metrics.MethodCounts[m].Inc(1)
 	}
-	_, ok := b.Requests[0].GetInner().(*roachpb.HeartbeatTxnRequest)
-	return ok
 }
 
 // Batch implements the roachpb.InternalServer interface.
 func (n *Node) Batch(
 	ctx context.Context, args *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, error) {
+
+	n.incrementBatchCounters(args)
+
 	// NB: Node.Batch is called directly for "local" calls. We don't want to
 	// carry the associated log tags forward as doing so makes adding additional
 	// log tags more expensive and makes local calls differ from remote calls.
 	ctx = n.storeCfg.AmbientCtx.ResetAndAnnotateCtx(ctx)
 
-	var callAdmittedWorkDoneOnKVAdmissionQ bool
-	var tenantID roachpb.TenantID
-	var storeAdmissionQ *admission.WorkQueue
-	if n.kvAdmissionQ != nil {
-		var ok bool
-		tenantID, ok = roachpb.TenantFromContext(ctx)
-		if !ok {
-			tenantID = roachpb.SystemTenantID
-		}
-		bypassAdmission := args.IsAdmin()
-		source := args.AdmissionHeader.Source
-		if !roachpb.IsSystemTenantID(tenantID.ToUint64()) {
-			// Request is from a SQL node.
-			bypassAdmission = false
-			source = roachpb.AdmissionHeader_FROM_SQL
-		}
-		if source == roachpb.AdmissionHeader_OTHER {
-			bypassAdmission = true
-		}
-		createTime := args.AdmissionHeader.CreateTime
-		if !bypassAdmission && createTime == 0 {
-			// TODO(sumeer): revisit this for multi-tenant. Specifically, the SQL use
-			// of zero CreateTime needs to be revisited. It should use high priority.
-			createTime = timeutil.Now().UnixNano()
-		}
-		admissionInfo := admission.WorkInfo{
-			TenantID:        tenantID,
-			Priority:        admission.WorkPriority(args.AdmissionHeader.Priority),
-			CreateTime:      createTime,
-			BypassAdmission: bypassAdmission,
-		}
-		var err error
-		// Don't subject HeartbeatTxnRequest to the storeAdmissionQ. Even though
-		// it would bypass admission, it would consume a slot. When writes are
-		// throttled, we start generating more txn heartbeats, which then consume
-		// all the slots, causing no useful work to happen. We do want useful work
-		// to continue even when throttling since there are often significant
-		// number of tokens available.
-		if args.IsWrite() && !isSingleHeartbeatTxnRequest(args) {
-			storeAdmissionQ = n.storeGrantCoords.TryGetQueueForStore(int32(args.Replica.StoreID))
-		}
-		admissionEnabled := true
-		if storeAdmissionQ != nil {
-			if admissionEnabled, err = storeAdmissionQ.Admit(ctx, admissionInfo); err != nil {
-				return nil, err
-			}
-			if !admissionEnabled {
-				// Set storeAdmissionQ to nil so that we don't call AdmittedWorkDone
-				// on it. Additionally, the code below will not call
-				// kvAdmissionQ.Admit, and so callAdmittedWorkDoneOnKVAdmissionQ will
-				// stay false.
-				storeAdmissionQ = nil
-			}
-		}
-		if admissionEnabled {
-			callAdmittedWorkDoneOnKVAdmissionQ, err = n.kvAdmissionQ.Admit(ctx, admissionInfo)
-			if err != nil {
-				return nil, err
-			}
-		}
+	tenantID, ok := roachpb.TenantFromContext(ctx)
+	if !ok {
+		tenantID = roachpb.SystemTenantID
+	}
+
+	// Requests from tenants don't have gateway node id set but are required for
+	// the QPS based rebalancing to work. The GatewayNodeID is used as a proxy
+	// for the locality of the origin of the request. The replica stats aggregate
+	// all incoming BatchRequests and which localities they come from in order to
+	// compute per second stats used for the rebalancing decisions.
+	if args.GatewayNodeID == 0 && tenantID != roachpb.SystemTenantID {
+		args.GatewayNodeID = n.Descriptor.NodeID
+	}
+
+	handle, err := n.admissionController.AdmitKVWork(ctx, tenantID, args)
+	if err != nil {
+		return nil, err
 	}
 	br, err := n.batchInternal(ctx, tenantID, args)
-	if callAdmittedWorkDoneOnKVAdmissionQ {
-		n.kvAdmissionQ.AdmittedWorkDone(tenantID)
-	}
-	if storeAdmissionQ != nil {
-		storeAdmissionQ.AdmittedWorkDone(tenantID)
-	}
+	n.admissionController.AdmittedKVWorkDone(handle)
 
 	// We always return errors via BatchResponse.Error so structure is
 	// preserved; plain errors are presumed to be from the RPC
@@ -1061,50 +1045,75 @@ func (n *Node) Batch(
 // in which the response is to serialized. The BatchResponse can
 // be nil in case no response is to be returned to the rpc caller.
 func (n *Node) setupSpanForIncomingRPC(
-	ctx context.Context, tenID roachpb.TenantID,
+	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest,
 ) (context.Context, func(context.Context, *roachpb.BatchResponse)) {
-	// The operation name matches the one created by the interceptor in the
-	// remoteTrace case below.
-	const opName = "/cockroach.roachpb.Internal/Batch"
 	tr := n.storeCfg.AmbientCtx.Tracer
-	var newSpan, grpcSpan *tracing.Span
-	if isLocalRequest := grpcutil.IsLocalRequestContext(ctx) && tenID == roachpb.SystemTenantID; isLocalRequest {
+	var newSpan *tracing.Span
+	parentSpan := tracing.SpanFromContext(ctx)
+	localRequest := grpcutil.IsLocalRequestContext(ctx)
+	// For non-local requests, we'll need to attach the recording to the outgoing
+	// BatchResponse if the request is traced. We ignore whether the request is
+	// traced or not here; if it isn't, the recording will be empty.
+	needRecordingCollection := !localRequest
+	if localRequest {
 		// This is a local request which circumvented gRPC. Start a span now.
-		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, opName, tracing.WithServerSpanKind)
-	} else {
-		grpcSpan = tracing.SpanFromContext(ctx)
-		if grpcSpan == nil {
-			// If tracing information was passed via gRPC metadata, the gRPC interceptor
-			// should have opened a span for us. If not, open a span now (if tracing is
-			// disabled, this will be a noop span).
-			ctx, newSpan = tr.StartSpanCtx(ctx, opName)
+		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, tracing.BatchMethodName, tracing.WithServerSpanKind)
+	} else if parentSpan == nil {
+		var remoteParent tracing.SpanMeta
+		if !ba.TraceInfo.Empty() {
+			remoteParent = tracing.SpanMetaFromProto(ba.TraceInfo)
 		} else {
-			grpcSpan.SetTag("node", attribute.IntValue(int(n.Descriptor.NodeID)))
+			// For backwards compatibility with 21.2, if tracing info was passed as
+			// gRPC metadata, we use it.
+			var err error
+			remoteParent, err = tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
+			if err != nil {
+				log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
+			}
 		}
+
+		ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
+			tracing.WithRemoteParent(remoteParent),
+			tracing.WithServerSpanKind)
+	} else {
+		// It's unexpected to find a span in the context for a non-local request.
+		// Let's create a span for the RPC anyway.
+		ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
+			tracing.WithParent(parentSpan),
+			tracing.WithServerSpanKind)
 	}
 
 	finishSpan := func(ctx context.Context, br *roachpb.BatchResponse) {
-		if newSpan != nil {
+		var rec tracing.Recording
+		// If we don't have a response, there's nothing to attach a trace to.
+		// Nothing more for us to do.
+		needRecordingCollection = needRecordingCollection && br != nil
+
+		if !needRecordingCollection {
 			newSpan.Finish()
-		}
-		if br == nil {
 			return
 		}
-		if grpcSpan != nil {
-			// If our local span descends from a parent on the other
-			// end of the RPC (i.e. the !isLocalRequest) case,
-			// attach the span recording to the batch response.
+
+		rec = newSpan.FinishAndGetRecording(newSpan.RecordingType())
+		if rec != nil {
+			// Decide if the trace for this RPC, if any, will need to be redacted. It
+			// needs to be redacted if the response goes to a tenant. In case the request
+			// is local, then the trace might eventually go to a tenant (and tenID might
+			// be set), but it will go to the tenant only indirectly, through the response
+			// of a parent RPC. In that case, that parent RPC is responsible for the
+			// redaction.
+			//
 			// Tenants get a redacted recording, i.e. with anything
 			// sensitive stripped out of the verbose messages. However,
 			// structured payloads stay untouched.
-			if rec := grpcSpan.GetRecording(); rec != nil {
-				err := redactRecordingForTenant(tenID, rec)
-				if err == nil {
-					br.CollectedSpans = append(br.CollectedSpans, rec...)
-				} else {
+			needRedaction := tenID != roachpb.SystemTenantID
+			if needRedaction {
+				if err := redactRecordingForTenant(tenID, rec); err != nil {
 					log.Errorf(ctx, "error redacting trace recording: %s", err)
+					rec = nil
 				}
 			}
+			br.CollectedSpans = append(br.CollectedSpans, rec...)
 		}
 	}
 	return ctx, finishSpan
@@ -1360,6 +1369,8 @@ func (n *Node) GossipSubscription(
 			}
 		case <-ctxDone:
 			return ctx.Err()
+		case <-n.stopper.ShouldQuiesce():
+			return stop.ErrUnavailable
 		}
 	}
 }

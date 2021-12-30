@@ -11,6 +11,8 @@
 package sqlsmith
 
 import (
+	"strconv"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -73,6 +75,15 @@ func makeBoolExpr(s *Smither, refs colRefs) tree.TypedExpr {
 	return makeBoolExprContext(s, emptyCtx, refs)
 }
 
+func makeBoolExprWithPlaceholders(s *Smither, refs colRefs) (tree.Expr, []interface{}) {
+	expr := makeBoolExprContext(s, emptyCtx, refs)
+
+	// Replace constants with placeholders if the type is numeric or bool.
+	visitor := replaceDatumPlaceholderVisitor{}
+	exprFmt := expr.Walk(&visitor)
+	return exprFmt, visitor.Args
+}
+
 func makeBoolExprContext(s *Smither, ctx Context, refs colRefs) tree.TypedExpr {
 	return makeScalarSample(s.boolExprSampler, s, ctx, types.Bool, refs)
 }
@@ -124,9 +135,6 @@ func makeCaseExpr(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool)
 }
 
 func makeCoalesceExpr(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	if s.vectorizable {
-		return nil, false
-	}
 	typ = s.pickAnyType(typ)
 	firstExpr := makeScalar(s, typ, refs)
 	secondExpr := makeScalar(s, typ, refs)
@@ -166,11 +174,7 @@ func makeConstExpr(s *Smither, typ *types.T, refs colRefs) tree.TypedExpr {
 func makeConstDatum(s *Smither, typ *types.T) tree.Datum {
 	var datum tree.Datum
 	s.lock.Lock()
-	nullChance := 6
-	if s.vectorizable {
-		nullChance = 0
-	}
-	datum = randgen.RandDatumWithNullChance(s.rnd, typ, nullChance)
+	datum = randgen.RandDatumWithNullChance(s.rnd, typ, 6)
 	if f := datum.ResolvedType().Family(); f != types.UnknownFamily && s.simpleDatums {
 		datum = randgen.RandDatumSimple(s.rnd, typ)
 	}
@@ -241,9 +245,6 @@ func makeAnd(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 }
 
 func makeNot(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	if s.vectorizable {
-		return nil, false
-	}
 	switch typ.Family() {
 	case types.BoolFamily, types.AnyFamily:
 	default:
@@ -266,7 +267,7 @@ var compareOps = [...]tree.ComparisonOperatorSymbol{
 }
 
 func makeCompareOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	if f := typ.Family(); f != types.BoolFamily && f != types.AnyFamily {
+	if f := typ.Family(); f != types.BoolFamily && f != types.AnyFamily && f != types.VoidFamily {
 		return nil, false
 	}
 	typ = s.randScalarType()
@@ -274,19 +275,9 @@ func makeCompareOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool
 	if _, ok := tree.CmpOps[op].LookupImpl(typ, typ); !ok {
 		return nil, false
 	}
-	if s.vectorizable && (op == tree.IsDistinctFrom || op == tree.IsNotDistinctFrom) {
-		return nil, false
-	}
 	left := makeScalar(s, typ, refs)
 	right := makeScalar(s, typ, refs)
 	return typedParen(tree.NewTypedComparisonExpr(tree.MakeComparisonOperator(op), left, right), typ), true
-}
-
-var vecBinOps = map[tree.BinaryOperatorSymbol]bool{
-	tree.Plus:  true,
-	tree.Minus: true,
-	tree.Mult:  true,
-	tree.Div:   true,
 }
 
 func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
@@ -297,9 +288,6 @@ func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 	}
 	n := s.rnd.Intn(len(ops))
 	op := ops[n]
-	if s.vectorizable && !vecBinOps[op.Operator.Symbol] {
-		return nil, false
-	}
 	if s.postgres {
 		if ignorePostgresBinOps[binOpTriple{
 			op.LeftType.Family(),
@@ -371,9 +359,6 @@ var postgresBinOpTransformations = map[binOpTriple]binOpOperands{
 }
 
 func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	if s.vectorizable {
-		return nil, false
-	}
 	typ = s.pickAnyType(typ)
 
 	class := ctx.fnClass
@@ -569,9 +554,6 @@ func makeWindowFrame(s *Smither, refs colRefs, orderTypes []*types.T) *tree.Wind
 }
 
 func makeExists(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	if s.vectorizable {
-		return nil, false
-	}
 	switch typ.Family() {
 	case types.BoolFamily, types.AnyFamily:
 	default:
@@ -600,7 +582,7 @@ func makeIn(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 
 	t := s.randScalarType()
 	var rhs tree.TypedExpr
-	if s.vectorizable || s.coin() {
+	if s.coin() {
 		rhs = makeTuple(s, t, refs)
 	} else {
 		selectStmt, _, ok := s.makeSelect([]*types.T{t}, refs)
@@ -635,14 +617,6 @@ func makeIn(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 
 func makeStringComparison(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 	stringComparison := s.randStringComparison()
-	if s.vectorizable {
-		// Vectorized supports only tree.Like and tree.NotLike.
-		if s.coin() {
-			stringComparison = tree.MakeComparisonOperator(tree.Like)
-		} else {
-			stringComparison = tree.MakeComparisonOperator(tree.NotLike)
-		}
-	}
 	switch typ.Family() {
 	case types.BoolFamily, types.AnyFamily:
 	default:
@@ -658,12 +632,12 @@ func makeStringComparison(s *Smither, typ *types.T, refs colRefs) (tree.TypedExp
 func makeTuple(s *Smither, typ *types.T, refs colRefs) *tree.Tuple {
 	n := s.rnd.Intn(5)
 	// Don't allow empty tuples in simple/postgres mode.
-	if n == 0 && (s.simpleDatums || s.vectorizable) {
+	if n == 0 && s.simpleDatums {
 		n++
 	}
 	exprs := make(tree.Exprs, n)
 	for i := range exprs {
-		if s.vectorizable || s.d9() == 1 {
+		if s.d9() == 1 {
 			exprs[i] = makeConstDatum(s, typ)
 		} else {
 			exprs[i] = makeScalar(s, typ, refs)
@@ -673,9 +647,6 @@ func makeTuple(s *Smither, typ *types.T, refs colRefs) *tree.Tuple {
 }
 
 func makeScalarSubquery(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	if s.vectorizable {
-		return nil, false
-	}
 	if s.disableLimits {
 		// This query must use a LIMIT, so bail if they are disabled.
 		return nil, false
@@ -693,3 +664,31 @@ func makeScalarSubquery(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr,
 
 	return subq, true
 }
+
+// replaceDatumPlaceholderVisitor replaces occurrences of numeric and bool Datum
+// expressions with placeholders, and updates Args with the corresponding Datum
+// values. This is used to prepare and execute a statement with placeholders.
+type replaceDatumPlaceholderVisitor struct {
+	Args []interface{}
+}
+
+var _ tree.Visitor = &replaceDatumPlaceholderVisitor{}
+
+// VisitPre satisfies the tree.Visitor interface.
+func (v *replaceDatumPlaceholderVisitor) VisitPre(
+	expr tree.Expr,
+) (recurse bool, newExpr tree.Expr) {
+	switch t := expr.(type) {
+	case tree.Datum:
+		if t.ResolvedType().IsNumeric() || t.ResolvedType() == types.Bool {
+			v.Args = append(v.Args, expr)
+			placeholder, _ := tree.NewPlaceholder(strconv.Itoa(len(v.Args)))
+			return false, placeholder
+		}
+		return false, expr
+	}
+	return true, expr
+}
+
+// VisitPost satisfies the Visitor interface.
+func (*replaceDatumPlaceholderVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr }

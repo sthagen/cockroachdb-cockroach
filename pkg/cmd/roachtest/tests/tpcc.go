@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/search"
@@ -50,14 +51,17 @@ const (
 )
 
 type tpccOptions struct {
-	Warehouses       int
-	ExtraRunArgs     string
-	ExtraSetupArgs   string
-	Chaos            func() Chaos                // for late binding of stopper
-	During           func(context.Context) error // for running a function during the test
-	Duration         time.Duration               // if zero, TPCC is not invoked
-	SetupType        tpccSetupType
+	Warehouses     int
+	ExtraRunArgs   string
+	ExtraSetupArgs string
+	Chaos          func() Chaos                // for late binding of stopper
+	During         func(context.Context) error // for running a function during the test
+	Duration       time.Duration               // if zero, TPCC is not invoked
+	SetupType      tpccSetupType
+	// PrometheusConfig, if set, overwrites the default prometheus config settings.
 	PrometheusConfig *prometheus.Config
+	// DisablePrometheus will force prometheus to not start up.
+	DisablePrometheus bool
 	// WorkloadInstances contains a list of instances for
 	// workloads to run against.
 	// If unset, it will run one workload which talks to
@@ -129,15 +133,15 @@ func setupTPCC(
 			// We still use bare workload, though we could likely replace
 			// those with ./cockroach workload as well.
 			c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
-			c.Start(ctx, crdbNodes)
+			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
 		}
 	}
 
 	func() {
 		opts.Start(ctx, t, c)
-		db := c.Conn(ctx, 1)
+		db := c.Conn(ctx, t.L(), 1)
 		defer db.Close()
-		WaitFor3XReplication(t, c.Conn(ctx, crdbNodes[0]))
+		WaitFor3XReplication(t, c.Conn(ctx, t.L(), crdbNodes[0]))
 		switch opts.SetupType {
 		case usingExistingData:
 			// Do nothing.
@@ -584,7 +588,7 @@ func registerTPCC(r registry.Registry) {
 							prometheusNode option.NodeListOption,
 							workloadInstances []workloadInstance,
 						) (tpccChaosEventProcessor, error) {
-							prometheusNodeIP, err := c.ExternalIP(ctx, prometheusNode)
+							prometheusNodeIP, err := c.ExternalIP(ctx, t.L(), prometheusNode)
 							if err != nil {
 								return tpccChaosEventProcessor{}, err
 							}
@@ -614,7 +618,7 @@ func registerTPCC(r registry.Registry) {
 								// * ERROR: inbox communication error: rpc error: code = Canceled
 								//   desc = context canceled (SQLSTATE 58C01)
 								// Setting this allows some errors to occur.
-								maxErrorsDuringUptime: warehousesPerRegion * 5,
+								maxErrorsDuringUptime: warehousesPerRegion * tpcc.NumWorkersPerWarehouse,
 								// "delivery" does not trigger often.
 								allowZeroSuccessDuringUptime: true,
 							}, nil
@@ -690,9 +694,9 @@ func registerTPCC(r registry.Registry) {
 		EstimatedMax:   gceOrAws(cloud, 2400, 3000),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
-		Nodes:                   3,
-		CPUs:                    16,
-		AdmissionControlEnabled: true,
+		Nodes:                    3,
+		CPUs:                     16,
+		AdmissionControlDisabled: true,
 
 		LoadWarehouses: gceOrAws(cloud, 3000, 3500),
 		EstimatedMax:   gceOrAws(cloud, 2400, 3000),
@@ -798,12 +802,12 @@ func (l tpccBenchLoadConfig) numLoadNodes(d tpccBenchDistribution) int {
 }
 
 type tpccBenchSpec struct {
-	Nodes                   int
-	CPUs                    int
-	Chaos                   bool
-	AdmissionControlEnabled bool
-	Distribution            tpccBenchDistribution
-	LoadConfig              tpccBenchLoadConfig
+	Nodes                    int
+	CPUs                     int
+	Chaos                    bool
+	AdmissionControlDisabled bool
+	Distribution             tpccBenchDistribution
+	LoadConfig               tpccBenchLoadConfig
 
 	// The number of warehouses to load into the cluster before beginning
 	// benchmarking. Should be larger than EstimatedMax and should be a
@@ -837,12 +841,14 @@ func (s tpccBenchSpec) partitions() int {
 }
 
 // startOpts returns any extra start options that the spec requires.
-func (s tpccBenchSpec) startOpts() []option.Option {
-	opts := []option.Option{option.StartArgsDontEncrypt}
+func (s tpccBenchSpec) startOpts() (option.StartOpts, install.ClusterSettings) {
+	startOpts := option.DefaultStartOpts()
+	startOpts.RoachtestOpts.DontEncrypt = true
+	settings := install.MakeClusterSettings()
 	if s.LoadConfig == singlePartitionedLoadgen {
-		opts = append(opts, option.Racks(s.partitions()))
+		settings.NumRacks = s.partitions()
 	}
-	return opts
+	return startOpts, settings
 }
 
 func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
@@ -854,8 +860,8 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 	if b.Chaos {
 		nameParts = append(nameParts, "chaos")
 	}
-	if b.AdmissionControlEnabled {
-		nameParts = append(nameParts, "admission")
+	if b.AdmissionControlDisabled {
+		nameParts = append(nameParts, "no-admission")
 	}
 
 	opts := []spec.Option{spec.CPU(b.CPUs)}
@@ -914,7 +920,7 @@ func loadTPCCBench(
 	b tpccBenchSpec,
 	roachNodes, loadNode option.NodeListOption,
 ) error {
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 
 	// Check if the dataset already exists and is already large enough to
@@ -936,7 +942,8 @@ func loadTPCCBench(
 		// If the dataset exists but is not large enough, wipe the cluster
 		// before restoring.
 		c.Wipe(ctx, roachNodes)
-		c.Start(ctx, append(b.startOpts(), roachNodes)...)
+		startOpts, settings := b.startOpts()
+		c.Start(ctx, t.L(), startOpts, settings, roachNodes)
 	} else if pqErr := (*pq.Error)(nil); !(errors.As(err, &pqErr) &&
 		pgcode.MakeCode(string(pqErr.Code)) == pgcode.InvalidCatalogName) {
 		return err
@@ -988,8 +995,8 @@ func loadTPCCBench(
 	cmd = fmt.Sprintf("./cockroach workload run tpcc --warehouses=%d --workers=%d --max-rate=%d "+
 		"--wait=false --ramp=%s --duration=%s --scatter --tolerate-errors {pgurl%s}",
 		b.LoadWarehouses, b.LoadWarehouses, maxRate, rampTime, loadTime, roachNodes)
-	if out, err := c.RunWithBuffer(ctx, t.L(), loadNode, cmd); err != nil {
-		return errors.Wrapf(err, "failed with output %q", string(out))
+	if _, err := c.RunWithDetailsSingleNode(ctx, t.L(), loadNode, cmd); err != nil {
+		return err
 	}
 
 	_, err = db.ExecContext(ctx, `SET CLUSTER SETTING kv.snapshot_rebalance.max_rate='2MiB'`)
@@ -1030,10 +1037,9 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 	// Don't encrypt in tpccbench tests.
 	c.EncryptDefault(false)
 	c.EncryptAtRandom(false)
-	c.Start(ctx, append(b.startOpts(), roachNodes)...)
-	if b.AdmissionControlEnabled {
-		EnableAdmissionControl(ctx, t, c)
-	}
+	startOpts, settings := b.startOpts()
+	c.Start(ctx, t.L(), startOpts, settings, roachNodes)
+	SetAdmissionControl(ctx, t, c, !b.AdmissionControlDisabled)
 	useHAProxy := b.Chaos
 	const restartWait = 15 * time.Second
 	{
@@ -1045,7 +1051,7 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 				t.Fatal("distributed chaos benchmarking not supported")
 			}
 			t.Status("installing haproxy")
-			if err := c.Install(ctx, loadNodes, "haproxy"); err != nil {
+			if err := c.Install(ctx, t.L(), loadNodes, "haproxy"); err != nil {
 				t.Fatal(err)
 			}
 			c.Run(ctx, loadNodes, "./cockroach gen haproxy --insecure --url {pgurl:1}")
@@ -1088,7 +1094,7 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 		// passing warehouse count, making the line search sensitive to the choice
 		// of starting warehouses. Do a best-effort at waiting for the cloud VM(s)
 		// to recover without failing the line search.
-		if err := c.Reset(ctx); err != nil {
+		if err := c.Reset(ctx, t.L()); err != nil {
 			// Reset() can flake sometimes, see for example:
 			// https://github.com/cockroachdb/cockroach/issues/61981#issuecomment-826838740
 			t.L().Printf("failed to reset VMs, proceeding anyway: %s", err)
@@ -1100,7 +1106,7 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 				t.Fatal(err)
 			}
 			shortCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			if err := c.StopE(shortCtx, roachNodes); err != nil {
+			if err := c.StopE(shortCtx, t.L(), option.DefaultStopOpts(), roachNodes); err != nil {
 				cancel()
 				t.L().Printf("unable to stop cluster; retrying to allow vm to recover: %s", err)
 				// We usually spend a long time blocking in StopE anyway, but just in case
@@ -1121,10 +1127,9 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 			t.Fatalf("VM is hosed; giving up")
 		}
 
-		c.Start(ctx, append(b.startOpts(), roachNodes)...)
-		if b.AdmissionControlEnabled {
-			EnableAdmissionControl(ctx, t, c)
-		}
+		startOpts, settings := b.startOpts()
+		c.Start(ctx, t.L(), startOpts, settings, roachNodes)
+		SetAdmissionControl(ctx, t, c, !b.AdmissionControlDisabled)
 	}
 
 	s := search.NewLineSearcher(1, b.LoadWarehouses, b.EstimatedMax, initStepSize, precision)
@@ -1435,6 +1440,9 @@ func setupPrometheus(
 		if c.IsLocal() {
 			return nil, func() {}
 		}
+		if opts.DisablePrometheus {
+			return nil, func() {}
+		}
 		workloadNode := c.Node(c.Spec().NodeCount)
 		cfg = &prometheus.Config{
 			PrometheusNode: workloadNode,
@@ -1448,6 +1456,9 @@ func setupPrometheus(
 			},
 		}
 	}
+	if opts.DisablePrometheus {
+		t.Fatal("test has PrometheusConfig but DisablePrometheus was on")
+	}
 	if c.IsLocal() {
 		t.Skip("skipping test as prometheus is needed, but prometheus does not yet work locally")
 		return nil, func() {}
@@ -1456,6 +1467,7 @@ func setupPrometheus(
 		ctx,
 		*cfg,
 		c,
+		t.L(),
 		func(ctx context.Context, nodes option.NodeListOption, operation string, args ...string) error {
 			return repeatRunE(
 				ctx,

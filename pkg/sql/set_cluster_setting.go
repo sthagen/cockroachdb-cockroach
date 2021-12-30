@@ -50,7 +50,7 @@ import (
 type setClusterSettingNode struct {
 	name    string
 	st      *cluster.Settings
-	setting settings.WritableSetting
+	setting settings.NonMaskedSetting
 	// If value is nil, the setting should be reset.
 	value tree.TypedExpr
 	// versionUpgradeHook is called after validating a `SET CLUSTER SETTING
@@ -91,12 +91,12 @@ func (p *planner) SetClusterSetting(
 		return nil, err
 	}
 
-	setting, ok := v.(settings.WritableSetting)
+	setting, ok := v.(settings.NonMaskedSetting)
 	if !ok {
 		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
-	if setting.SystemOnly() && !p.execCfg.Codec.ForSystemTenant() {
+	if setting.Class() == settings.SystemOnly && !p.execCfg.Codec.ForSystemTenant() {
 		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
 			"setting %s is only settable in the system tenant", name)
 	}
@@ -286,7 +286,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 				}
 			}
 
-			if params.p.execCfg.TenantTestingKnobs != nil {
+			if knobs := params.p.execCfg.TenantTestingKnobs; knobs != nil && knobs.ClusterSettingsUpdater != nil {
 				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encoded, n.setting.Typ()); err != nil {
 					return err
 				}

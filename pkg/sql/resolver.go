@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -54,8 +55,8 @@ var _ resolver.SchemaResolver = &planner{}
 // use(someVar)
 func (p *planner) runWithOptions(flags resolveFlags, fn func()) {
 	if flags.skipCache {
-		defer func(prev bool) { p.avoidCachedDescriptors = prev }(p.avoidCachedDescriptors)
-		p.avoidCachedDescriptors = true
+		defer func(prev bool) { p.avoidLeasedDescriptors = prev }(p.avoidLeasedDescriptors)
+		p.avoidLeasedDescriptors = true
 	}
 	if flags.contextDatabaseID != descpb.InvalidID {
 		defer func(prev descpb.ID) { p.contextDatabaseID = prev }(p.contextDatabaseID)
@@ -139,7 +140,7 @@ func (p *planner) LookupSchema(
 	ctx context.Context, dbName, scName string,
 ) (found bool, scMeta catalog.ResolvedObjectPrefix, err error) {
 	dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn, dbName,
-		tree.DatabaseLookupFlags{AvoidCached: p.avoidCachedDescriptors})
+		tree.DatabaseLookupFlags{AvoidLeased: p.avoidLeasedDescriptors})
 	if err != nil || dbDesc == nil {
 		return false, catalog.ResolvedObjectPrefix{}, err
 	}
@@ -169,7 +170,7 @@ func (p *planner) LookupObject(
 ) (found bool, prefix catalog.ResolvedObjectPrefix, objMeta catalog.Descriptor, err error) {
 	sc := p.Accessor()
 	flags.CommonLookupFlags.Required = false
-	flags.CommonLookupFlags.AvoidCached = p.avoidCachedDescriptors
+	flags.CommonLookupFlags.AvoidLeased = p.avoidLeasedDescriptors
 
 	// Check if we are looking up a type which matches a built-in type in
 	// CockroachDB but is an extension type on the public schema in PostgreSQL.
@@ -183,6 +184,15 @@ func (p *planner) LookupObject(
 			if err != nil || !found {
 				return found, prefix, nil, err
 			}
+			dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn, dbName,
+				tree.DatabaseLookupFlags{AvoidLeased: p.avoidLeasedDescriptors})
+			if err != nil {
+				return found, prefix, nil, err
+			}
+			if dbDesc.HasPublicSchemaWithDescriptor() {
+				publicSchemaID := dbDesc.GetSchemaID(tree.PublicSchema)
+				return true, prefix, typedesc.MakeSimpleAlias(alias, publicSchemaID), nil
+			}
 			return true, prefix, typedesc.MakeSimpleAlias(alias, keys.PublicSchemaID), nil
 		}
 	}
@@ -195,7 +205,7 @@ func (p *planner) LookupObject(
 func (p *planner) CommonLookupFlags(required bool) tree.CommonLookupFlags {
 	return tree.CommonLookupFlags{
 		Required:    required,
-		AvoidCached: p.avoidCachedDescriptors,
+		AvoidLeased: p.avoidLeasedDescriptors,
 	}
 }
 
@@ -219,7 +229,7 @@ func (p *planner) IsTableVisible(
 	schemaDesc, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.Txn(), schemaID,
 		tree.SchemaLookupFlags{
 			Required:    true,
-			AvoidCached: p.avoidCachedDescriptors})
+			AvoidLeased: p.avoidLeasedDescriptors})
 	if err != nil {
 		return false, false, err
 	}
@@ -228,7 +238,7 @@ func (p *planner) IsTableVisible(
 		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.Txn(), dbID,
 			tree.DatabaseLookupFlags{
 				Required:    true,
-				AvoidCached: p.avoidCachedDescriptors})
+				AvoidLeased: p.avoidLeasedDescriptors})
 		if err != nil {
 			return false, false, err
 		}
@@ -316,6 +326,13 @@ func (p *planner) HasPrivilege(
 		return true, nil
 	}
 
+	if kind == privilege.RULE {
+		// RULE was only added for compatibility with Postgres, and Postgres
+		// never allows RULE to be granted, even if the user has ALL privileges.
+		// See https://www.postgresql.org/docs/8.1/sql-grant.html
+		// and https://www.postgresql.org/docs/release/8.2.0/.
+		return false, nil
+	}
 	hasPrivilege, err := hasPrivilegeFunc(privilege.ALL)
 	if err != nil {
 		return false, err
@@ -502,7 +519,7 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 	const required = true
 	flags := tree.CommonLookupFlags{
 		Required:       required,
-		AvoidCached:    p.avoidCachedDescriptors,
+		AvoidLeased:    p.avoidLeasedDescriptors,
 		RequireMutable: true,
 	}
 	if targets.Databases != nil {
@@ -651,7 +668,7 @@ func (p *planner) getFullyQualifiedTableNamesFromIDs(
 	for _, id := range ids {
 		desc, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, id, tree.ObjectLookupFlags{
 			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidCached:    true,
+				AvoidLeased:    true,
 				IncludeDropped: true,
 				IncludeOffline: true,
 			},
@@ -679,7 +696,7 @@ func (p *planner) getQualifiedTableName(
 			Required:       true,
 			IncludeOffline: true,
 			IncludeDropped: true,
-			AvoidCached:    true,
+			AvoidLeased:    true,
 		})
 	if err != nil {
 		return nil, err
@@ -698,7 +715,7 @@ func (p *planner) getQualifiedTableName(
 		tree.SchemaLookupFlags{
 			IncludeOffline: true,
 			IncludeDropped: true,
-			AvoidCached:    true,
+			AvoidLeased:    true,
 		})
 	switch {
 	case err == nil:
@@ -1044,6 +1061,34 @@ type internalLookupCtx struct {
 	fallback catalog.DescGetter
 }
 
+// GetSchemaName looks up a schema with the given id in the LookupContext.
+func (l *internalLookupCtx) GetSchemaName(
+	ctx context.Context, id, parentDBID descpb.ID, version clusterversion.Handle,
+) (string, bool, error) {
+	dbDesc, err := l.getDatabaseByID(parentDBID)
+	if err != nil {
+		return "", false, err
+	}
+
+	// If a db does not have a public schema backed by a descriptor, we can
+	// assume that its public schema ID is 29. This is valid since we cannot
+	// drop the public schema in v21.2 or v22.1.
+	if !dbDesc.HasPublicSchemaWithDescriptor() {
+		if id == keys.PublicSchemaID {
+			return tree.PublicSchema, true, nil
+		}
+	}
+
+	if parentDBID == keys.SystemDatabaseID {
+		if id == keys.SystemPublicSchemaID {
+			return tree.PublicSchema, true, nil
+		}
+	}
+
+	schemaName, found := l.schemaNames[id]
+	return schemaName, found, nil
+}
+
 // GetDesc implements the catalog.DescGetter interface.
 func (l *internalLookupCtx) GetDesc(ctx context.Context, id descpb.ID) (catalog.Descriptor, error) {
 	if desc, ok := l.dbDescs[id]; ok {
@@ -1107,12 +1152,12 @@ func newInternalLookupCtx(
 	dbNames := make(map[descpb.ID]string)
 	dbDescs := make(map[descpb.ID]catalog.DatabaseDescriptor)
 	schemaDescs := make(map[descpb.ID]catalog.SchemaDescriptor)
-	schemaNames := map[descpb.ID]string{
-		keys.PublicSchemaID: tree.PublicSchema,
-	}
+	schemaNames := make(map[descpb.ID]string)
+
 	tbDescs := make(map[descpb.ID]catalog.TableDescriptor)
 	typDescs := make(map[descpb.ID]catalog.TypeDescriptor)
 	var tbIDs, typIDs, dbIDs, schemaIDs []descpb.ID
+
 	// Record descriptors for name lookups.
 	for i := range descs {
 		switch desc := descs[i].(type) {
@@ -1198,6 +1243,8 @@ func (l *internalLookupCtx) getSchemaByID(id descpb.ID) (catalog.SchemaDescripto
 
 // getSchemaNameByID returns the schema name given an ID for a schema.
 func (l *internalLookupCtx) getSchemaNameByID(id descpb.ID) (string, error) {
+	// TODO(richardjcai): Remove this in 22.2, once it is guaranteed that
+	//    public schemas are regular UDS.
 	if id == keys.PublicSchemaID {
 		return tree.PublicSchema, nil
 	}
@@ -1232,37 +1279,6 @@ func (l *internalLookupCtx) getSchemaName(table catalog.TableDescriptor) string 
 	return schemaName
 }
 
-// getParentAsTableName returns a TreeTable object of the parent table for a
-// given table ID. Used to get the parent table of a table with interleaved
-// indexes.
-func getParentAsTableName(
-	l simpleSchemaResolver, parentTableID descpb.ID, dbPrefix string,
-) (tree.TableName, error) {
-	var parentName tree.TableName
-	parentTable, err := l.getTableByID(parentTableID)
-	if err != nil {
-		return tree.TableName{}, err
-	}
-	var parentSchemaName tree.Name
-	if parentTable.GetParentSchemaID() == keys.PublicSchemaID {
-		parentSchemaName = tree.PublicSchemaName
-	} else {
-		parentSchema, err := l.getSchemaByID(parentTable.GetParentSchemaID())
-		if err != nil {
-			return tree.TableName{}, err
-		}
-		parentSchemaName = tree.Name(parentSchema.GetName())
-	}
-	parentDbDesc, err := l.getDatabaseByID(parentTable.GetParentID())
-	if err != nil {
-		return tree.TableName{}, err
-	}
-	parentName = tree.MakeTableNameWithSchema(tree.Name(parentDbDesc.GetName()),
-		parentSchemaName, tree.Name(parentTable.GetName()))
-	parentName.ExplicitCatalog = parentDbDesc.GetName() != dbPrefix
-	return parentName, nil
-}
-
 // getTableNameFromTableDescriptor returns a TableName object for a given
 // TableDescriptor.
 func getTableNameFromTableDescriptor(
@@ -1274,6 +1290,7 @@ func getTableNameFromTableDescriptor(
 		return tree.TableName{}, err
 	}
 	var parentSchemaName tree.Name
+	// TODO(richardjcai): Remove this in 22.2.
 	if table.GetParentSchemaID() == keys.PublicSchemaID {
 		parentSchemaName = tree.PublicSchemaName
 	} else {
@@ -1300,6 +1317,7 @@ func getTypeNameFromTypeDescriptor(
 		return typeName, err
 	}
 	var parentSchemaName string
+	// TODO(richardjcai): Remove this in 22.2.
 	if typ.GetParentSchemaID() == keys.PublicSchemaID {
 		parentSchemaName = tree.PublicSchema
 	} else {

@@ -216,7 +216,10 @@ func (s *Store) Send(
 		// We'll return info on the range that the request ended up being routed to
 		// and, to the extent that we have the info, the ranges containing the keys
 		// that the client requested, and all the ranges in between.
-		ri := t.Ranges()[0]
+		ri, err := t.MismatchedRange()
+		if err != nil {
+			return nil, roachpb.NewError(err)
+		}
 		skipRID := ri.Desc.RangeID // We already have info on one range, so don't add it again below.
 		startKey := ri.Desc.StartKey
 		if rSpan.Key.Less(startKey) {
@@ -273,15 +276,12 @@ func (s *Store) maybeThrottleBatch(
 
 	switch t := ba.Requests[0].GetInner().(type) {
 	case *roachpb.AddSSTableRequest:
-		// Limit the number of concurrent AddSSTable requests, since they're
-		// expensive and block all other writes to the same span. However, don't
-		// limit AddSSTable requests that are going to ingest as a WriteBatch.
+		limiter := s.limiters.ConcurrentAddSSTableRequests
 		if t.IngestAsWrites {
-			return nil, nil
+			limiter = s.limiters.ConcurrentAddSSTableAsWritesRequests
 		}
-
 		before := timeutil.Now()
-		res, err := s.limiters.ConcurrentAddSSTableRequests.Begin(ctx)
+		res, err := limiter.Begin(ctx)
 		if err != nil {
 			return nil, err
 		}

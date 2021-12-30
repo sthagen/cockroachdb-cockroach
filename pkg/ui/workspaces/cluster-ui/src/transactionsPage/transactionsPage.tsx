@@ -12,40 +12,32 @@ import React from "react";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import classNames from "classnames/bind";
 import styles from "../statementsPage/statementsPage.module.scss";
-import moment, { Moment } from "moment";
 import { RouteComponentProps } from "react-router-dom";
 import {
   makeTransactionsColumns,
   TransactionInfo,
   TransactionsTable,
 } from "../transactionsTable";
-import { DateRange } from "src/dateRange";
-import { TransactionDetails } from "../transactionDetails";
 import {
   ColumnDescriptor,
+  handleSortSettingFromQueryString,
   ISortedTablePagination,
   SortSetting,
+  updateSortSettingQueryParamsOnTab,
 } from "../sortedtable";
 import { Pagination } from "../pagination";
 import { TableStatistics } from "../tableStatistics";
-import {
-  baseHeadingClasses,
-  statisticsClasses,
-} from "./transactionsPageClasses";
+import { statisticsClasses } from "./transactionsPageClasses";
 import {
   aggregateAcrossNodeIDs,
   generateRegionNode,
   getTrxAppFilterOptions,
-  statementFingerprintIdsToText,
-} from "./utils";
-import {
   searchTransactionsData,
   filterTransactions,
-  getStatementsByFingerprintIdAndTime,
 } from "./utils";
-import { forIn } from "lodash";
 import Long from "long";
-import { getSearchParams, unique } from "src/util";
+import { merge } from "lodash";
+import { unique, syncHistory } from "src/util";
 import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
 import { Loading } from "../loading";
 import { PageConfig, PageConfigItem } from "../pageConfig";
@@ -54,7 +46,8 @@ import {
   Filter,
   Filters,
   defaultFilters,
-  getFiltersFromQueryString,
+  handleFiltersFromQueryString,
+  updateFiltersQueryParamsOnTab,
 } from "../queryFilter";
 import { UIConfigState } from "../store";
 import { StatementsRequest } from "src/api/statementsApi";
@@ -64,38 +57,50 @@ import {
   getLabel,
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
+import ClearStats from "../sqlActivity/clearStats";
+import SQLActivityError from "../sqlActivity/errorComponent";
+import { commonStyles } from "../common";
+import {
+  TimeScaleDropdown,
+  defaultTimeScaleSelected,
+  TimeScale,
+  toDateRange,
+} from "../timeScaleDropdown";
 
 type IStatementsResponse = protos.cockroach.server.serverpb.IStatementsResponse;
-type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
-type Timestamp = protos.google.protobuf.ITimestamp;
 
 const cx = classNames.bind(styles);
 
 interface TState {
-  sortSetting: SortSetting;
-  pagination: ISortedTablePagination;
-  search?: string;
   filters?: Filters;
-  statementFingerprintIds: Long[] | null;
-  aggregatedTs: Timestamp | null;
-  transactionStats: TransactionStats | null;
+  pagination: ISortedTablePagination;
 }
 
 export interface TransactionsPageStateProps {
-  data: IStatementsResponse;
-  dateRange: [Moment, Moment];
-  nodeRegions: { [nodeId: string]: string };
-  error?: Error | null;
-  pageSize?: number;
-  isTenant?: UIConfigState["isTenant"];
   columns: string[];
+  data: IStatementsResponse;
+  timeScale: TimeScale;
+  error?: Error | null;
+  filters: Filters;
+  isTenant?: UIConfigState["isTenant"];
+  nodeRegions: { [nodeId: string]: string };
+  pageSize?: number;
+  search: string;
+  sortSetting: SortSetting;
 }
 
 export interface TransactionsPageDispatchProps {
   refreshData: (req?: StatementsRequest) => void;
   resetSQLStats: () => void;
-  onDateRangeChange?: (start: Moment, end: Moment) => void;
+  onTimeScaleChange?: (ts: TimeScale) => void;
   onColumnsChange?: (selectedColumns: string[]) => void;
+  onFilterChange?: (value: Filters) => void;
+  onSearchComplete?: (query: string) => void;
+  onSortingChange?: (
+    name: string,
+    columnTitle: string,
+    ascending: boolean,
+  ) => void;
 }
 
 export type TransactionsPageProps = TransactionsPageStateProps &
@@ -105,40 +110,65 @@ export type TransactionsPageProps = TransactionsPageStateProps &
 function statementsRequestFromProps(
   props: TransactionsPageProps,
 ): protos.cockroach.server.serverpb.StatementsRequest {
+  const [start, end] = toDateRange(props.timeScale);
   return new protos.cockroach.server.serverpb.StatementsRequest({
     combined: true,
-    start: Long.fromNumber(props.dateRange[0].unix()),
-    end: Long.fromNumber(props.dateRange[1].unix()),
+    start: Long.fromNumber(start.unix()),
+    end: Long.fromNumber(end.unix()),
   });
 }
 export class TransactionsPage extends React.Component<
   TransactionsPageProps,
   TState
 > {
-  static defaultProps: Partial<TransactionsPageProps> = {
-    isTenant: false,
-  };
+  constructor(props: TransactionsPageProps) {
+    super(props);
+    this.state = {
+      pagination: {
+        pageSize: this.props.pageSize || 20,
+        current: 1,
+      },
+    };
+    const stateFromHistory = this.getStateFromHistory();
+    this.state = merge(this.state, stateFromHistory);
+  }
 
-  trxSearchParams = getSearchParams(this.props.history.location.search);
-  filters = getFiltersFromQueryString(this.props.history.location.search);
-  state: TState = {
-    sortSetting: {
-      // Sort by Execution Count column as default option.
-      ascending: this.trxSearchParams("ascending", false).toString() === "true",
-      columnTitle: this.trxSearchParams(
-        "columnTitle",
-        "execution count",
-      ).toString(),
-    },
-    pagination: {
-      pageSize: this.props.pageSize || 20,
-      current: 1,
-    },
-    search: this.trxSearchParams("q", "").toString(),
-    filters: this.filters,
-    aggregatedTs: null,
-    statementFingerprintIds: null,
-    transactionStats: null,
+  getStateFromHistory = (): Partial<TState> => {
+    const {
+      history,
+      search,
+      sortSetting,
+      filters,
+      onSearchComplete,
+      onSortingChange,
+      onFilterChange,
+    } = this.props;
+    const searchParams = new URLSearchParams(history.location.search);
+
+    // Search query.
+    const searchQuery = searchParams.get("q") || undefined;
+    if (onSearchComplete && searchQuery && search != searchQuery) {
+      onSearchComplete(searchQuery);
+    }
+
+    // Sort Settings.
+    handleSortSettingFromQueryString(
+      "Transactions",
+      history.location.search,
+      sortSetting,
+      onSortingChange,
+    );
+
+    // Filters.
+    const latestFilter = handleFiltersFromQueryString(
+      history,
+      filters,
+      onFilterChange,
+    );
+
+    return {
+      filters: latestFilter,
+    };
   };
 
   refreshData = (): void => {
@@ -149,34 +179,55 @@ export class TransactionsPage extends React.Component<
   componentDidMount(): void {
     this.refreshData();
   }
+
+  updateQueryParams(): void {
+    const { history, search, sortSetting } = this.props;
+    const tab = "Transactions";
+
+    // Search.
+    const searchParams = new URLSearchParams(history.location.search);
+    const currentTab = searchParams.get("tab") || "";
+    const searchQueryString = searchParams.get("q") || "";
+    if (currentTab === tab && search && search != searchQueryString) {
+      syncHistory(
+        {
+          q: search,
+        },
+        history,
+      );
+    }
+
+    // Filters.
+    updateFiltersQueryParamsOnTab(tab, this.state.filters, history);
+
+    // Sort Setting.
+    updateSortSettingQueryParamsOnTab(
+      tab,
+      sortSetting,
+      {
+        ascending: false,
+        columnTitle: "executionCount",
+      },
+      history,
+    );
+  }
+
   componentDidUpdate(): void {
+    this.updateQueryParams();
     this.refreshData();
   }
 
-  syncHistory = (params: Record<string, string | undefined>) => {
-    const { history } = this.props;
-    const currentSearchParams = new URLSearchParams(history.location.search);
-
-    forIn(params, (value, key) => {
-      if (!value) {
-        currentSearchParams.delete(key);
-      } else {
-        currentSearchParams.set(key, value);
-      }
-    });
-
-    history.location.search = currentSearchParams.toString();
-    history.replace(history.location);
-  };
-
   onChangeSortSetting = (ss: SortSetting): void => {
-    this.setState({
-      sortSetting: ss,
-    });
-    this.syncHistory({
-      ascending: ss.ascending.toString(),
-      columnTitle: ss.columnTitle,
-    });
+    syncHistory(
+      {
+        ascending: ss.ascending.toString(),
+        columnTitle: ss.columnTitle,
+      },
+      this.props.history,
+    );
+    if (this.props.onSortingChange) {
+      this.props.onSortingChange("Transactions", ss.columnTitle, ss.ascending);
+    }
   };
 
   onChangePage = (current: number): void => {
@@ -196,84 +247,91 @@ export class TransactionsPage extends React.Component<
   };
 
   onClearSearchField = (): void => {
-    this.setState({ search: "" });
-    this.syncHistory({
-      q: undefined,
-    });
+    if (this.props.onSearchComplete) {
+      this.props.onSearchComplete("");
+    }
+    syncHistory(
+      {
+        q: undefined,
+      },
+      this.props.history,
+    );
   };
 
   onSubmitSearchField = (search: string): void => {
-    this.setState({ search });
+    if (this.props.onSearchComplete) {
+      this.props.onSearchComplete(search);
+    }
     this.resetPagination();
-    this.syncHistory({
-      q: search,
-    });
+    syncHistory(
+      {
+        q: search,
+      },
+      this.props.history,
+    );
   };
 
   onSubmitFilters = (filters: Filters): void => {
+    if (this.props.onFilterChange) {
+      this.props.onFilterChange(filters);
+    }
+
     this.setState({
-      filters: {
-        ...this.state.filters,
-        ...filters,
-      },
+      filters: filters,
     });
     this.resetPagination();
-    this.syncHistory({
-      app: filters.app,
-      timeNumber: filters.timeNumber,
-      timeUnit: filters.timeUnit,
-      regions: filters.regions,
-      nodes: filters.nodes,
-    });
+    syncHistory(
+      {
+        app: filters.app,
+        timeNumber: filters.timeNumber,
+        timeUnit: filters.timeUnit,
+        regions: filters.regions,
+        nodes: filters.nodes,
+      },
+      this.props.history,
+    );
   };
 
   onClearFilters = (): void => {
+    if (this.props.onFilterChange) {
+      this.props.onFilterChange(defaultFilters);
+    }
+
     this.setState({
       filters: {
         ...defaultFilters,
       },
     });
     this.resetPagination();
-    this.syncHistory({
-      app: undefined,
-      timeNumber: undefined,
-      timeUnit: undefined,
-      regions: undefined,
-      nodes: undefined,
-    });
-  };
-
-  handleDetails = (transaction?: TransactionInfo): void => {
-    this.setState({
-      statementFingerprintIds:
-        transaction?.stats_data?.statement_fingerprint_ids,
-      transactionStats: transaction?.stats_data?.stats,
-      aggregatedTs: transaction?.stats_data?.aggregated_ts,
-    });
+    syncHistory(
+      {
+        app: undefined,
+        timeNumber: undefined,
+        timeUnit: undefined,
+        regions: undefined,
+        nodes: undefined,
+      },
+      this.props.history,
+    );
   };
 
   lastReset = (): Date => {
     return new Date(Number(this.props.data?.last_reset.seconds) * 1000);
   };
 
-  changeDateRange = (start: Moment, end: Moment): void => {
-    if (this.props.onDateRangeChange) {
-      this.props.onDateRangeChange(start, end);
+  changeTimeScale = (ts: TimeScale): void => {
+    if (this.props.onTimeScaleChange) {
+      this.props.onTimeScaleChange(ts);
     }
   };
 
   resetTime = (): void => {
-    // Default range to reset to is one hour ago.
-    this.changeDateRange(
-      moment.utc().subtract(1, "hours"),
-      moment.utc().add(1, "minute"),
-    );
+    this.changeTimeScale(defaultTimeScaleSelected);
   };
 
-  renderTransactionsList() {
+  render(): React.ReactElement {
     return (
       <div className={cx("table-area")}>
-        <h3 className={baseHeadingClasses.tableName}>Transactions</h3>
         <Loading
           loading={!this.props?.data}
           error={this.props?.error}
@@ -285,8 +343,10 @@ export class TransactionsPage extends React.Component<
               isTenant,
               onColumnsChange,
               columns: userSelectedColumnsToShow,
+              sortSetting,
+              search,
             } = this.props;
-            const { pagination, search, filters } = this.state;
+            const { pagination, filters } = this.state;
             const { statements, internal_app_name_prefix } = data;
             const appNames = getTrxAppFilterOptions(
               data.transactions,
@@ -339,7 +399,6 @@ export class TransactionsPage extends React.Component<
               transactionsToDisplay,
               statements,
               isTenant,
-              this.handleDetails,
               search,
             )
               .filter(c => !(c.name === "regionNodes" && regions.length < 2))
@@ -398,11 +457,10 @@ export class TransactionsPage extends React.Component<
                       showNodes={nodes.length > 1}
                     />
                   </PageConfigItem>
-                  <PageConfigItem>
-                    <DateRange
-                      start={this.props.dateRange[0]}
-                      end={this.props.dateRange[1]}
-                      onSubmit={this.changeDateRange}
+                  <PageConfigItem className={commonStyles("separator")}>
+                    <TimeScaleDropdown
+                      currentScale={this.props.timeScale}
+                      setTimeScale={this.changeTimeScale}
                     />
                   </PageConfigItem>
                   <PageConfigItem>
@@ -413,6 +471,12 @@ export class TransactionsPage extends React.Component<
                       reset time
                     </button>
                   </PageConfigItem>
+                  <PageConfigItem className={commonStyles("separator")}>
+                    <ClearStats
+                      resetSQLStats={resetSQLStats}
+                      tooltipType="transaction"
+                    />
+                  </PageConfigItem>
                 </PageConfig>
                 <section className={statisticsClasses.tableContainerClass}>
                   <ColumnsSelector
@@ -421,19 +485,16 @@ export class TransactionsPage extends React.Component<
                   />
                   <TableStatistics
                     pagination={pagination}
-                    lastReset={this.lastReset()}
                     search={search}
                     totalCount={transactionsToDisplay.length}
                     arrayItemName="transactions"
-                    tooltipType="transaction"
                     activeFilters={activeFilters}
                     onClearFilters={this.onClearFilters}
-                    resetSQLStats={resetSQLStats}
                   />
                   <TransactionsTable
                     columns={displayColumns}
                     transactions={transactionsToDisplay}
-                    sortSetting={this.state.sortSetting}
+                    sortSetting={sortSetting}
                     onChangeSortSetting={this.onChangeSortSetting}
                     pagination={pagination}
                     renderNoResult={
@@ -452,49 +513,13 @@ export class TransactionsPage extends React.Component<
               </>
             );
           }}
+          renderError={() =>
+            SQLActivityError({
+              statsType: "transactions",
+            })
+          }
         />
       </div>
     );
-  }
-
-  renderTransactionDetails() {
-    const { statements } = this.props.data;
-    const {
-      aggregatedTs,
-      statementFingerprintIds,
-      transactionStats,
-    } = this.state;
-    const transactionDetails =
-      statementFingerprintIds &&
-      getStatementsByFingerprintIdAndTime(
-        statementFingerprintIds,
-        aggregatedTs,
-        statements,
-      );
-    const transactionText =
-      statementFingerprintIds &&
-      statementFingerprintIdsToText(statementFingerprintIds, statements);
-
-    return (
-      <TransactionDetails
-        transactionText={transactionText}
-        statements={transactionDetails}
-        nodeRegions={this.props.nodeRegions}
-        transactionStats={transactionStats}
-        lastReset={this.lastReset()}
-        handleDetails={this.handleDetails}
-        error={this.props.error}
-        resetSQLStats={this.props.resetSQLStats}
-        isTenant={this.props.isTenant}
-      />
-    );
-  }
-
-  render() {
-    const { statementFingerprintIds } = this.state;
-    const renderTxDetailsView = !!statementFingerprintIds;
-    return renderTxDetailsView
-      ? this.renderTransactionDetails()
-      : this.renderTransactionsList();
   }
 }

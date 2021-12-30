@@ -117,7 +117,7 @@ func (p *planner) UnsafeUpsertDescriptor(
 		existingVersion = mut.GetVersion()
 		marshaled, err := protoutil.Marshal(mut.DescriptorProto())
 		if err != nil {
-			return errors.AssertionFailedf("failed to marshal existing descriptor %v: %v", mut, err)
+			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to marshal existing descriptor %v", mut)
 		}
 		existingStr = hex.EncodeToString(marshaled)
 		previousOwner = mut.GetPrivileges().Owner().Normalized()
@@ -674,7 +674,7 @@ func (p *planner) ForceDeleteTableData(ctx context.Context, descID int64) error 
 		tree.ObjectLookupFlags{
 			CommonLookupFlags: tree.CommonLookupFlags{
 				Required:    true,
-				AvoidCached: true,
+				AvoidLeased: true,
 			},
 			DesiredTableDescKind: tree.ResolveRequireTableDesc,
 		})

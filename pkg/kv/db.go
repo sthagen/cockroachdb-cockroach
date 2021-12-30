@@ -143,6 +143,8 @@ type Result struct {
 	// When ResumeSpan is populated, this specifies the reason why the operation
 	// wasn't completed and needs to be resumed.
 	ResumeReason roachpb.ResumeReason
+	// ResumeNextBytes is the size of the next result when ResumeSpan is populated.
+	ResumeNextBytes int64
 }
 
 // ResumeSpanAsValue returns the resume span as a value if one is set,
@@ -188,7 +190,7 @@ func DefaultDBContext(stopper *stop.Stopper) DBContext {
 	return DBContext{
 		UserPriority: roachpb.NormalUserPriority,
 		// TODO(tbg): this is ugly. Force callers to pass in an SQLIDContainer.
-		NodeID:  base.NewSQLIDContainer(0, &c),
+		NodeID:  base.NewSQLIDContainerForNode(&c),
 		Stopper: stopper,
 	}
 }
@@ -662,17 +664,24 @@ func (db *DB) AdminRelocateRange(
 
 // AddSSTable links a file into the RocksDB log-structured merge-tree. Existing
 // data in the range is cleared.
+//
+// The disallowConflicts, disallowShadowingBelow, and writeAtBatchTs parameters
+// require the MVCCAddSSTable version gate, as they are new in 22.1.
 func (db *DB) AddSSTable(
 	ctx context.Context,
 	begin, end interface{},
 	data []byte,
+	disallowConflicts bool,
 	disallowShadowing bool,
+	disallowShadowingBelow hlc.Timestamp,
 	stats *enginepb.MVCCStats,
 	ingestAsWrites bool,
 	batchTs hlc.Timestamp,
+	writeAtBatchTs bool,
 ) error {
 	b := &Batch{Header: roachpb.Header{Timestamp: batchTs}}
-	b.addSSTable(begin, end, data, disallowShadowing, stats, ingestAsWrites)
+	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
+		stats, ingestAsWrites, writeAtBatchTs)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -818,6 +827,24 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
 	txn := NewTxn(ctx, db, nodeID)
 	txn.SetDebugName("unnamed")
+	return runTxn(ctx, txn, retryable)
+}
+
+// TxnRootKV is the same as Txn, but specifically represents a request
+// originating within KV, and that is at the root of the tree of requests. For
+// KV usage that should be subject to admission control. Do not use this for
+// executing work originating in SQL. This distinction only causes this
+// transaction to undergo admission control. See AdmissionHeader_Source for more
+// details.
+func (db *DB) TxnRootKV(ctx context.Context, retryable func(context.Context, *Txn) error) error {
+	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
+	txn := NewTxnRootKV(ctx, db, nodeID)
+	txn.SetDebugName("unnamed")
+	return runTxn(ctx, txn, retryable)
+}
+
+// runTxn runs the given retryable transaction function using the given *Txn.
+func runTxn(ctx context.Context, txn *Txn, retryable func(context.Context, *Txn) error) error {
 	err := txn.exec(ctx, func(ctx context.Context, txn *Txn) error {
 		return retryable(ctx, txn)
 	})

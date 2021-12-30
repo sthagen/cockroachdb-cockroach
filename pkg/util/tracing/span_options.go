@@ -11,6 +11,9 @@
 package tracing
 
 import (
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -43,17 +46,39 @@ var followsFromAttribute = []attribute.KeyValue{attribute.String("follows-from",
 // field comment below are invoked as arguments to `Tracer.StartSpan`.
 // See the SpanOption interface for a synopsis.
 type spanOptions struct {
-	Parent        *Span                  // see WithParentAndAutoCollection
-	RemoteParent  SpanMeta               // see WithParentAndManualCollection
-	RefType       spanReferenceType      // see WithFollowsFrom
-	LogTags       *logtags.Buffer        // see WithLogTags
-	Tags          map[string]interface{} // see WithTags
-	ForceRealSpan bool                   // see WithForceRealSpan
-	SpanKind      oteltrace.SpanKind     // see WithSpanKind
-	Sterile       bool                   // see WithSterile
+	Parent *Span // see WithParent
+	// ParentDoesNotCollectRecording is set by WithDetachedRecording. It means
+	// that, although this span has a parent, the parent should generally not
+	// include this child's recording when the parent is asked for its own
+	// recording. Usually, a parent span includes all its children in its
+	// recording. However, sometimes that's not desired; sometimes the creator of
+	// a child span has a different plan for how the recording of that child will
+	// end up being collected and reported to where it ultimately needs to go.
+	// Still, even in these cases, a parent-child relationship is still useful
+	// (for example for the purposes of the active spans registry), so the child
+	// span cannot simply be created as a root.
+	//
+	// For example, in the case of DistSQL, each processor in a flow has its own
+	// span, as a child of the flow. The DistSQL infrastructure organizes the
+	// collection of each processor span recording independently, without relying
+	// on collecting the recording of the flow's span.
+	ParentDoesNotCollectRecording bool
+	RemoteParent                  SpanMeta               // see WithRemoteParent
+	RefType                       spanReferenceType      // see WithFollowsFrom
+	LogTags                       *logtags.Buffer        // see WithLogTags
+	Tags                          map[string]interface{} // see WithTags
+	ForceRealSpan                 bool                   // see WithForceRealSpan
+	SpanKind                      oteltrace.SpanKind     // see WithSpanKind
+	Sterile                       bool                   // see WithSterile
+
+	// recordingTypeExplicit is set if the WithRecording() option was used. In
+	// that case, spanOptions.recordingType() returns recordingTypeOpt below. If
+	// not set, recordingType() looks at the parent.
+	recordingTypeExplicit bool
+	recordingTypeOpt      RecordingType
 }
 
-func (opts *spanOptions) parentTraceID() uint64 {
+func (opts *spanOptions) parentTraceID() tracingpb.TraceID {
 	if opts.Parent != nil && !opts.Parent.IsNoop() {
 		return opts.Parent.i.crdb.traceID
 	} else if !opts.RemoteParent.Empty() {
@@ -62,7 +87,7 @@ func (opts *spanOptions) parentTraceID() uint64 {
 	return 0
 }
 
-func (opts *spanOptions) parentSpanID() uint64 {
+func (opts *spanOptions) parentSpanID() tracingpb.SpanID {
 	if opts.Parent != nil && !opts.Parent.IsNoop() {
 		return opts.Parent.i.crdb.spanID
 	} else if !opts.RemoteParent.Empty() {
@@ -71,14 +96,11 @@ func (opts *spanOptions) parentSpanID() uint64 {
 	return 0
 }
 
-func (opts *spanOptions) deriveRootSpan() *crdbSpan {
-	if opts.Parent != nil && !opts.Parent.IsNoop() {
-		return opts.Parent.i.crdb.rootSpan
-	}
-	return nil
-}
-
 func (opts *spanOptions) recordingType() RecordingType {
+	if opts.recordingTypeExplicit {
+		return opts.recordingTypeOpt
+	}
+
 	recordingType := RecordingOff
 	if opts.Parent != nil && !opts.Parent.IsNoop() {
 		recordingType = opts.Parent.i.crdb.recordingType()
@@ -105,23 +127,28 @@ func (opts *spanOptions) otelContext() (oteltrace.Span, oteltrace.SpanContext) {
 // SpanOption is the interface satisfied by options to `Tracer.StartSpan`.
 // A synopsis of the options follows. For details, see their comments.
 //
-// - WithParentAndAutoCollection: create a child Span from a Span.
-// - WithParentAndManualCollection: create a child Span from a SpanMeta.
-// - WithFollowsFrom: indicate that child may outlive parent.
+// - WithParent: create a child Span with a local parent.
+// - WithRemoteParent: create a child Span with a remote parent.
+// - WithFollowsFrom: hint that child may outlive parent.
 // - WithLogTags: populates the Span tags from a `logtags.Buffer`.
 // - WithCtxLogTags: like WithLogTags, but takes a `context.Context`.
 // - WithTags: adds tags to a Span on creation.
 // - WithForceRealSpan: prevents optimizations that can avoid creating a real span.
+// - WithDetachedRecording: don't include the recording in the parent.
 type SpanOption interface {
 	apply(spanOptions) spanOptions
 }
 
-type parentAndAutoCollectionOption Span
+type parentOption Span
 
-// WithParentAndAutoCollection instructs StartSpan to create a child Span
-// from a parent Span.
+// WithParent instructs StartSpan to create a child Span from a (local) parent
+// Span.
 //
-// WithParentAndAutoCollection will be a no-op (i.e. the span resulting from
+// In case when the parent span is created with a different Tracer (generally,
+// when the parent lives in a different process), WithRemoteParent should be
+// used.
+//
+// WithParent will be a no-op (i.e. the span resulting from
 // applying this option will be a root span, just as if this option hadn't been
 // specified) in the following cases:
 // - if `sp` is nil
@@ -130,7 +157,6 @@ type parentAndAutoCollectionOption Span
 //   children). Note that the singleton Tracer.noop span is marked as sterile,
 //   which makes this condition mostly encompass the previous one, however in
 //   theory there could be no-op spans other than the singleton one.
-//
 //
 // The child inherits the parent's log tags. The data collected in the
 // child trace will be retrieved automatically when the parent's data is
@@ -147,56 +173,93 @@ type parentAndAutoCollectionOption Span
 // which corresponds to the expectation that the parent span will
 // wait for the child to Finish(). If this expectation does not hold,
 // WithFollowsFrom should be added to the StartSpan invocation.
-//
-// When the parent Span is not available at the caller,
-// WithParentAndManualCollection should be used, which incurs an
-// obligation to manually propagate the trace data to the parent Span.
-func WithParentAndAutoCollection(sp *Span) SpanOption {
-	if sp == nil || sp.IsNoop() || sp.IsSterile() {
-		return (*parentAndAutoCollectionOption)(nil)
+func WithParent(sp *Span) SpanOption {
+	// Panic if the parent has already been finished, if configured to do so. If
+	// the parent has finished and we're configured not to panic, StartSpan() will
+	// deal with it when passed this WithParent option.
+	_ = sp.detectUseAfterFinish()
+
+	// The sp.IsNoop() case is handled in StartSpan, not here, because we want to
+	// assert that the parent's Tracer is the same as the child's. In contrast, in
+	// the IsSterile() case, it is allowed for the "child" to be created with a
+	// different Tracer than the parent.
+	if sp == nil || sp.IsSterile() {
+		return (*parentOption)(nil)
 	}
-	return (*parentAndAutoCollectionOption)(sp)
+	return (*parentOption)(sp)
 }
 
-func (p *parentAndAutoCollectionOption) apply(opts spanOptions) spanOptions {
+func (p *parentOption) apply(opts spanOptions) spanOptions {
 	opts.Parent = (*Span)(p)
 	return opts
 }
 
-type parentAndManualCollectionOption SpanMeta
+type remoteParent SpanMeta
 
-// WithParentAndManualCollection instructs StartSpan to create a
-// child span descending from a parent described via a SpanMeta. In
-// contrast with WithParentAndAutoCollection, the caller must call
-// `Span.GetRecording` when finishing the returned Span, and propagate the
-// result to the parent Span by calling `Span.ImportRemoteSpans` on it.
+// WithRemoteParent instructs StartSpan to create a child span descending from a
+// parent described via a SpanMeta. Generally this parent span lives in a
+// different process.
 //
-// The canonical use case for this is around RPC boundaries, where a
-// server handling a request wants to create a child span descending
-// from a parent on a remote machine.
+// For the purposes of trace recordings, there's no mechanism ensuring that the
+// child's recording will be passed to the parent span. When that's desired, it
+// has to be done manually by calling Span.GetRecording() and propagating the
+// result to the parent by calling Span.ImportRemoteSpans().
+//
+// The canonical use case for this is around RPC boundaries, where a server
+// handling a request wants to create a child span descending from a parent on a
+// remote machine.
 //
 // node 1                     (network)          node 2
 // --------------------------------------------------------------------------
 // Span.Meta()               ----------> sp2 := Tracer.StartSpan(
-//                                       		WithParentAndManualCollection(.))
+//                                       		WithRemoteParent(.))
 //                                       doSomething(sp2)
-//                                       sp2.Finish()
-// Span.ImportRemoteSpans(.) <---------- sp2.GetRecording()
+// Span.ImportRemoteSpans(.) <---------- sp2.FinishAndGetRecording()
 //
-// By default, the child span is derived using a ChildOf relationship,
-// which corresponds to the expectation that the parent span will
-// wait for the child to Finish(). If this expectation does not hold,
-// WithFollowsFrom should be added to the StartSpan invocation.
-func WithParentAndManualCollection(parent SpanMeta) SpanOption {
+// By default, the child span is derived using a ChildOf relationship, which
+// corresponds to the expectation that the parent span will usually wait for the
+// child to Finish(). If this expectation does not hold, WithFollowsFrom should
+// be added to the StartSpan invocation.
+func WithRemoteParent(parent SpanMeta) SpanOption {
 	if parent.sterile {
-		return parentAndManualCollectionOption{}
+		return remoteParent{}
 	}
-	return (parentAndManualCollectionOption)(parent)
+	return (remoteParent)(parent)
 }
 
-func (p parentAndManualCollectionOption) apply(opts spanOptions) spanOptions {
+func (p remoteParent) apply(opts spanOptions) spanOptions {
 	opts.RemoteParent = (SpanMeta)(p)
 	return opts
+}
+
+type detachedRecording struct{}
+
+var detachedRecordingSingleton = SpanOption(detachedRecording{})
+
+func (o detachedRecording) apply(opts spanOptions) spanOptions {
+	opts.ParentDoesNotCollectRecording = true
+	return opts
+}
+
+// WithDetachedRecording configures the span to not be included in the parent's
+// recording (if any) under most circumstances. Usually, a parent span includes
+// all its children in its recording. However, sometimes that's not desired;
+// sometimes the creator of a child span has a different plan for how the
+// recording of that child will end up being collected and reported to where it
+// ultimately needs to go. Still, even in these cases, a parent-child
+// relationship is still useful (for example for the purposes of the active
+// spans registry), so the child span cannot simply be created as a root.
+//
+// For example, in the case of DistSQL, each processor in a flow has its own
+// span, as a child of the flow. The DistSQL infrastructure organizes the
+// collection of each processor span recording independently, without relying
+// on collecting the recording of the flow's span.
+//
+// In the case when the parent's recording is collected through the span
+// registry, this option is ignore since, in that case, we want as much info as
+// possible.
+func WithDetachedRecording() SpanOption {
+	return detachedRecordingSingleton
 }
 
 type followsFromOpt struct{}
@@ -205,11 +268,11 @@ var followsFromSingleton = SpanOption(followsFromOpt{})
 
 // WithFollowsFrom instructs StartSpan to link the child span to its parent
 // using a different kind of relationship than the regular parent-child one,
-// should a child span be created (i.e. should WithParentAndAutoCollection or
-// WithParentAndManualCollection be supplied as well). This relationship was
+// should a child span be created (i.e. should WithParent or
+// WithRemoteParent be supplied as well). This relationship was
 // called "follows-from" in the old OpenTracing API. This only matters if the
 // trace is sent to an OpenTelemetry tracer; CRDB itself ignores it (what
-// matters for CRDB is the AutoCollection vs ManualCollection distinction).
+// matters for CRDB is the WithDetachedTrace option).
 // OpenTelemetry does not have a concept of a follows-from relationship at the
 // moment; specifying this option results in the child having a Link to the
 // parent.
@@ -239,18 +302,49 @@ type forceRealSpanOption struct{}
 
 var forceRealSpanSingleton = SpanOption(forceRealSpanOption{})
 
-// WithForceRealSpan forces StartSpan to create of a real Span instead of
-// a low-overhead non-recordable noop span.
+// WithForceRealSpan forces StartSpan to create of a real Span regardless of the
+// Tracer's tracing mode (instead of a low-overhead non-recordable noop span).
 //
 // When tracing is disabled all spans are noopSpans; these spans aren't
 // capable of recording, so this option should be passed to StartSpan if the
-// caller wants to be able to call StartRecording on the resulting Span.
+// caller wants to be able to call SetVerbose(true) on the span later. If the
+// span should be recording from the beginning, use WithRecording() instead.
 func WithForceRealSpan() SpanOption {
 	return forceRealSpanSingleton
 }
 
 func (forceRealSpanOption) apply(opts spanOptions) spanOptions {
 	opts.ForceRealSpan = true
+	return opts
+}
+
+type recordingSpanOption struct {
+	recType RecordingType
+}
+
+var structuredRecordingSingleton = SpanOption(recordingSpanOption{recType: RecordingStructured})
+var verboseRecordingSingleton = SpanOption(recordingSpanOption{recType: RecordingVerbose})
+
+// WithRecording configures the span to record in the given mode.
+//
+// The recording mode can be changed later with SetVerbose().
+func WithRecording(recType RecordingType) SpanOption {
+	switch recType {
+	case RecordingStructured:
+		return structuredRecordingSingleton
+	case RecordingVerbose:
+		return verboseRecordingSingleton
+	case RecordingOff:
+		panic("invalid recording option: RecordingOff")
+	default:
+		recCpy := recType // copy excaping to the heap
+		panic(fmt.Sprintf("invalid recording option: %d", recCpy))
+	}
+}
+
+func (o recordingSpanOption) apply(opts spanOptions) spanOptions {
+	opts.recordingTypeExplicit = true
+	opts.recordingTypeOpt = o.recType
 	return opts
 }
 
@@ -283,6 +377,10 @@ type withSterileOption struct{}
 
 // WithSterile configures the span to not permit any child spans. The would-be
 // children of a sterile span end up being root spans.
+//
+// Since WithParent(<sterile span>) is a noop, it is allowed to create children
+// of sterile span with any Tracer. This is unlike children of any other spans,
+// which must be created with the same Tracer as the parent.
 func WithSterile() SpanOption {
 	return withSterileOption{}
 }

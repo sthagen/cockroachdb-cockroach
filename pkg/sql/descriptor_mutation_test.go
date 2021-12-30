@@ -912,7 +912,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	// "foo" is being added.
 	mt.writeIndexMutation(ctx, "foo", descpb.DescriptorMutation{Direction: descpb.DescriptorMutation_ADD})
 	if _, err := sqlDB.Exec(`CREATE INDEX foo ON t.test (c)`); !testutils.IsError(err,
-		`relation "foo" already exists`) {
+		`index with name "foo" already exists`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.
@@ -974,7 +974,8 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 
 	// Add index DROP mutation "foo""
 	mt.writeIndexMutation(ctx, "foo", descpb.DescriptorMutation{Direction: descpb.DescriptorMutation_DROP})
-	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD CONSTRAINT foo UNIQUE (c)`); !testutils.IsError(err, `index "foo" being dropped, try again later`) {
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD CONSTRAINT foo UNIQUE (c)`); !testutils.IsError(err,
+		`constraint with name "foo" already exists`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.
@@ -982,7 +983,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	// "foo" is being added.
 	mt.writeIndexMutation(ctx, "foo", descpb.DescriptorMutation{Direction: descpb.DescriptorMutation_ADD})
 	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD CONSTRAINT foo UNIQUE (c)`); !testutils.IsError(err,
-		`duplicate index name: "foo"`) {
+		`constraint with name "foo" already exists`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.
@@ -1033,9 +1034,9 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	mt.CheckQueryResults(t,
 		"SHOW INDEXES FROM t.test",
 		[][]string{
-			{"test", "primary", "false", "1", "a", "ASC", "false", "false"},
-			{"test", "primary", "false", "2", "b", "N/A", "true", "false"},
-			{"test", "primary", "false", "3", "d", "N/A", "true", "false"},
+			{"test", "test_pkey", "false", "1", "a", "ASC", "false", "false"},
+			{"test", "test_pkey", "false", "2", "b", "N/A", "true", "false"},
+			{"test", "test_pkey", "false", "3", "d", "N/A", "true", "false"},
 			{"test", "ufo", "true", "1", "d", "ASC", "false", "false"},
 			{"test", "ufo", "true", "2", "a", "ASC", "false", "true"},
 		},
@@ -1060,9 +1061,9 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	mt.CheckQueryResults(t,
 		"SHOW COLUMNS FROM t.test",
 		[][]string{
-			{"a", "STRING", "false", "NULL", "", "{primary,ufo}", "false"},
-			{"e", "STRING", "true", "NULL", "", "{primary}", "false"},
-			{"d", "STRING", "true", "NULL", "", "{primary,ufo}", "false"},
+			{"a", "STRING", "false", "NULL", "", "{test_pkey,ufo}", "false"},
+			{"e", "STRING", "true", "NULL", "", "{test_pkey}", "false"},
+			{"d", "STRING", "true", "NULL", "", "{test_pkey,ufo}", "false"},
 		},
 	)
 

@@ -79,7 +79,7 @@ func Watch(ctx context.Context, env *Env, dbs []*kv.DB, dataSpan roachpb.Span) (
 			w.mu.Unlock()
 
 			ds := dss[i]
-			err := ds.RangeFeed(ctx, dataSpan, ts, true /* withDiff */, eventC)
+			err := ds.RangeFeed(ctx, []roachpb.Span{dataSpan}, ts, true /* withDiff */, eventC)
 			if isRetryableRangeFeedErr(err) {
 				log.Infof(ctx, "got retryable RangeFeed error: %+v", err)
 				continue
@@ -207,7 +207,7 @@ func (w *Watcher) processEvents(ctx context.Context, eventC chan *roachpb.RangeF
 				if frontierAdvanced {
 					frontier := w.mu.frontier.Frontier()
 					log.Infof(ctx, `watcher reached frontier %s lagging by %s`,
-						frontier, timeutil.Now().Sub(frontier.GoTime()))
+						frontier, timeutil.Since(frontier.GoTime()))
 					for ts, chs := range w.mu.frontierWaiters {
 						if frontier.Less(ts) {
 							continue

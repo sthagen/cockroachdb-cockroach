@@ -12,6 +12,7 @@ import React from "react";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import classNames from "classnames/bind";
 import _ from "lodash";
+import { RouteComponentProps } from "react-router-dom";
 
 import statementsStyles from "../statementsPage/statementsPage.module.scss";
 import {
@@ -26,11 +27,21 @@ import { baseHeadingClasses } from "../transactionsPage/transactionsPageClasses"
 import { Button } from "../button";
 import { tableClasses } from "../transactionsTable/transactionsTableClasses";
 import { SqlBox } from "../sql";
-import { aggregateStatements } from "../transactionsPage/utils";
+import {
+  aggregateStatements,
+  getStatementsByFingerprintIdAndTime,
+  statementFingerprintIdsToText,
+} from "../transactionsPage/utils";
 import { Loading } from "../loading";
 import { SummaryCard } from "../summaryCard";
-import { Bytes, Duration, formatNumberForDisplay } from "src/util";
+import {
+  Bytes,
+  calculateTotalWorkload,
+  Duration,
+  formatNumberForDisplay,
+} from "src/util";
 import { UIConfigState } from "../store";
+import SQLActivityError from "../sqlActivity/errorComponent";
 
 import summaryCardStyles from "../summaryCard/summaryCard.module.scss";
 import transactionDetailsStyles from "./transactionDetails.modules.scss";
@@ -40,56 +51,126 @@ import { formatTwoPlaces } from "../barCharts";
 import { ArrowLeft } from "@cockroachlabs/icons";
 import {
   populateRegionNodeForStatements,
-  makeStatementFingerprintColumn,
+  makeStatementsColumns,
 } from "src/statementsTable/statementsTable";
 import { TransactionInfo } from "src/transactionsTable";
 import Long from "long";
+import { StatementsRequest } from "../api";
+import { TimeScale, toDateRange } from "../timeScaleDropdown";
 
 const { containerClass } = tableClasses;
 const cx = classNames.bind(statementsStyles);
 
 type Statement = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
-type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
 
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 const transactionDetailsStylesCx = classNames.bind(transactionDetailsStyles);
 
-interface TransactionDetailsProps {
-  transactionText: string;
-  statements?: Statement[];
-  nodeRegions: { [nodeId: string]: string };
-  transactionStats?: TransactionStats;
-  lastReset?: string | Date;
-  handleDetails: (txn?: TransactionInfo) => void;
+export interface TransactionDetailsStateProps {
+  aggregatedTs: string | null;
+  timeScale: TimeScale;
   error?: Error | null;
-  resetSQLStats: () => void;
   isTenant: UIConfigState["isTenant"];
+  nodeRegions: { [nodeId: string]: string };
+  statements?: Statement[];
+  transaction: TransactionInfo;
+  transactionFingerprintId: string;
 }
+
+export interface TransactionDetailsDispatchProps {
+  refreshData: (req?: StatementsRequest) => void;
+}
+
+export type TransactionDetailsProps = TransactionDetailsStateProps &
+  TransactionDetailsDispatchProps &
+  RouteComponentProps;
 
 interface TState {
   sortSetting: SortSetting;
   pagination: ISortedTablePagination;
+  statementsForTransaction: Statement[];
+  transactionText: string;
+}
+
+function statementsRequestFromProps(
+  props: TransactionDetailsProps,
+): protos.cockroach.server.serverpb.StatementsRequest {
+  const [start, end] = toDateRange(props.timeScale);
+  return new protos.cockroach.server.serverpb.StatementsRequest({
+    combined: true,
+    start: Long.fromNumber(start.unix()),
+    end: Long.fromNumber(end.unix()),
+  });
 }
 
 export class TransactionDetails extends React.Component<
   TransactionDetailsProps,
   TState
 > {
-  state: TState = {
-    sortSetting: {
-      // Sort by statement latency as default column.
-      ascending: false,
-      columnTitle: "statementTime",
-    },
-    pagination: {
-      pageSize: 10,
-      current: 1,
-    },
+  constructor(props: TransactionDetailsProps) {
+    super(props);
+    this.state = {
+      sortSetting: {
+        // Sort by statement latency as default column.
+        ascending: false,
+        columnTitle: "statementTime",
+      },
+      pagination: {
+        pageSize: 10,
+        current: 1,
+      },
+      statementsForTransaction: [],
+      transactionText: "",
+    };
+  }
+
+  getTransactionStateInfo = (): void => {
+    const { transaction, aggregatedTs, statements } = this.props;
+    const statementFingerprintIds =
+      transaction?.stats_data?.statement_fingerprint_ids;
+
+    const statementsForTransaction =
+      (statementFingerprintIds &&
+        getStatementsByFingerprintIdAndTime(
+          statementFingerprintIds,
+          aggregatedTs,
+          statements,
+        )) ||
+      [];
+
+    const transactionText =
+      (statementFingerprintIds &&
+        statementFingerprintIdsToText(
+          statementFingerprintIds,
+          statementsForTransaction,
+        )) ||
+      "";
+
+    if (
+      statementsForTransaction?.toString() !=
+        this.state.statementsForTransaction?.toString() ||
+      transactionText != this.state.transactionText
+    ) {
+      this.setState({
+        statementsForTransaction,
+        transactionText,
+      });
+    }
   };
 
-  static defaultProps: Partial<TransactionDetailsProps> = {
-    isTenant: false,
+  refreshData = (): void => {
+    const req = statementsRequestFromProps(this.props);
+    this.props.refreshData(req);
+    this.getTransactionStateInfo();
   };
+
+  componentDidMount(): void {
+    this.refreshData();
+  }
+
+  componentDidUpdate(): void {
+    this.getTransactionStateInfo();
+  }
 
   onChangeSortSetting = (ss: SortSetting): void => {
     this.setState({
@@ -102,21 +183,25 @@ export class TransactionDetails extends React.Component<
     this.setState({ pagination: { ...pagination, current } });
   };
 
+  backToTransactionsClick = (): void => {
+    this.props.history.push("/sql-activity?tab=Transactions");
+  };
+
   render(): React.ReactElement {
     const {
-      transactionText,
-      statements,
-      transactionStats,
-      handleDetails,
       error,
-      resetSQLStats,
       nodeRegions,
+      transaction,
+      transactionFingerprintId,
     } = this.props;
+    const { transactionText, statementsForTransaction } = this.state;
+    const transactionStats = transaction?.stats_data?.stats;
+
     return (
       <div>
         <section className={baseHeadingClasses.wrapper}>
           <Button
-            onClick={() => handleDetails()}
+            onClick={this.backToTransactionsClick}
             type="unstyled-link"
             size="small"
             icon={<ArrowLeft fontSize={"10px"} />}
@@ -129,16 +214,18 @@ export class TransactionDetails extends React.Component<
         </section>
         <Loading
           error={error}
-          loading={!statements || !transactionStats}
+          loading={
+            statementsForTransaction.length == 0 || transactionText.length == 0
+          }
           render={() => {
-            const {
-              statements,
-              transactionStats,
-              lastReset,
-              isTenant,
-            } = this.props;
+            const { isTenant } = this.props;
             const { sortSetting, pagination } = this.state;
-            const aggregatedStatements = aggregateStatements(statements);
+            const txnScopedStmts = statementsForTransaction.filter(
+              s =>
+                s.key.key_data.transaction_fingerprint_id.toString() ===
+                transactionFingerprintId,
+            );
+            const aggregatedStatements = aggregateStatements(txnScopedStmts);
             populateRegionNodeForStatements(
               aggregatedStatements,
               nodeRegions,
@@ -187,7 +274,7 @@ export class TransactionDetails extends React.Component<
                           <Heading type="h5">Mean transaction time</Heading>
                           <Text>
                             {formatNumberForDisplay(
-                              transactionStats.service_lat.mean,
+                              transactionStats?.service_lat.mean,
                               duration,
                             )}
                           </Text>
@@ -282,24 +369,23 @@ export class TransactionDetails extends React.Component<
                   </Row>
                   <TableStatistics
                     pagination={pagination}
-                    totalCount={statements.length}
-                    lastReset={lastReset}
+                    totalCount={statementsForTransaction.length}
                     arrayItemName={
                       "statement fingerprints for this transaction"
                     }
-                    tooltipType="transactionDetails"
                     activeFilters={0}
-                    resetSQLStats={resetSQLStats}
                   />
                   <div className={cx("table-area")}>
                     <SortedTable
                       data={aggregatedStatements}
-                      columns={[
-                        makeStatementFingerprintColumn(
-                          "transactionDetails",
-                          "",
-                        ),
-                      ]}
+                      columns={makeStatementsColumns(
+                        aggregatedStatements,
+                        "", // selectedApp
+                        calculateTotalWorkload(aggregatedStatements),
+                        nodeRegions,
+                        "transactionDetails",
+                        isTenant,
+                      )}
                       className={cx("statements-table")}
                       sortSetting={sortSetting}
                       onChangeSortSetting={this.onChangeSortSetting}
@@ -309,12 +395,17 @@ export class TransactionDetails extends React.Component<
                 <Pagination
                   pageSize={pagination.pageSize}
                   current={pagination.current}
-                  total={statements.length}
+                  total={statementsForTransaction.length}
                   onChange={this.onChangePage}
                 />
               </React.Fragment>
             );
           }}
+          renderError={() =>
+            SQLActivityError({
+              statsType: "transactions",
+            })
+          }
         />
       </div>
     );

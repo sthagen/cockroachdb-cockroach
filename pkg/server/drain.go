@@ -12,11 +12,13 @@ package server
 
 import (
 	"context"
+	"io"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -27,15 +29,21 @@ import (
 
 var (
 	queryWait = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"server.shutdown.query_wait",
-		"the server will wait for at least this amount of time for active queries to finish",
+		"the server will wait for at least this amount of time for active queries to finish "+
+			"(note that the --drain-wait parameter for cockroach node drain may need adjustment "+
+			"after changing this setting)",
 		10*time.Second,
 	).WithPublic()
 
 	drainWait = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"server.shutdown.drain_wait",
 		"the amount of time a server waits in an unready state before proceeding with the rest "+
-			"of the shutdown process",
+			"of the shutdown process "+
+			"(note that the --drain-wait parameter for cockroach node drain may need adjustment "+
+			"after changing this setting)",
 		0*time.Second,
 	).WithPublic()
 )
@@ -47,9 +55,54 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 	ctx := stream.Context()
 	ctx = s.server.AnnotateCtx(ctx)
 
-	if len(req.Pre201Marker) > 0 {
-		return status.Errorf(codes.InvalidArgument,
-			"Drain request coming from unsupported client version older than 20.1.")
+	// Which node is this request for?
+	nodeID, local, err := s.server.status.parseNodeID(req.NodeId)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+	if !local {
+		// This request is for another node. Forward it.
+		// In contrast to many RPC calls we implement around
+		// the server package, the Drain RPC is a *streaming*
+		// RPC. This means that it may have more than one
+		// response. We must forward all of them.
+
+		// Connect to the target node.
+		client, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return err
+		}
+		// Retrieve the stream interface to the target node.
+		drainClient, err := client.Drain(ctx, req)
+		if err != nil {
+			return err
+		}
+		// Forward all the responses from the remote server,
+		// to our client.
+		for {
+			// Receive one response message from the target node.
+			resp, err := drainClient.Recv()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				if grpcutil.IsClosedConnection(err) {
+					// If the drain request contained Shutdown==true, it's
+					// possible for the RPC connection to the target node to be
+					// shut down before a DrainResponse and EOF is
+					// received. This is not truly an error.
+					break
+				}
+
+				return err
+			}
+			// Forward the response from the target node to our remote
+			// client.
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	doDrain := req.DoDrain
@@ -207,7 +260,7 @@ func (s *Server) drainClients(ctx context.Context, reporter func(int, redact.Saf
 
 	// Drain the SQL leases. This must be done after the pgServer has
 	// given sessions a chance to finish ongoing work.
-	s.sqlServer.leaseMgr.SetDraining(true /* drain */, reporter)
+	s.sqlServer.leaseMgr.SetDraining(ctx, true /* drain */, reporter)
 
 	// Done. This executes the defers set above to drain SQL leases.
 	return nil

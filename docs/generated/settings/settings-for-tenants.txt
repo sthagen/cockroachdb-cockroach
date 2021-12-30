@@ -1,17 +1,19 @@
 Setting	Type	Default	Description
-admission.kv.enabled	boolean	false	when true, work performed by the KV layer is subject to admission control
-admission.sql_kv_response.enabled	boolean	false	when true, work performed by the SQL layer when receiving a KV response is subject to admission control
-admission.sql_sql_response.enabled	boolean	false	when true, work performed by the SQL layer when receiving a DistSQL response is subject to admission control
+admission.kv.enabled	boolean	true	when true, work performed by the KV layer is subject to admission control
+admission.sql_kv_response.enabled	boolean	true	when true, work performed by the SQL layer when receiving a KV response is subject to admission control
+admission.sql_sql_response.enabled	boolean	true	when true, work performed by the SQL layer when receiving a DistSQL response is subject to admission control
+bulkio.backup.file_size	byte size	128 MiB	target size for individual data files produced during BACKUP
+bulkio.backup.read_timeout	duration	5m0s	amount of time after which a read attempt is considered timed out, which causes the backup to fail
+bulkio.backup.read_with_priority_after	duration	1m0s	amount of time since the read-as-of time above which a BACKUP should use priority when retrying reads
 bulkio.stream_ingestion.minimum_flush_interval	duration	5s	the minimum timestamp between flushes; flushes may still occur if internal buffers fill up
 changefeed.node_throttle_config	string		specifies node level throttling configuration for all changefeeeds
 cloudstorage.http.custom_ca	string		custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage
 cloudstorage.timeout	duration	10m0s	the timeout for import/export storage operations
 cluster.organization	string		organization name
 cluster.preserve_downgrade_option	string		disable (automatic or manual) cluster version upgrade from the specified version until reset
-diagnostics.forced_sql_stat_reset.interval	duration	2h0m0s	interval after which SQL statement statistics are refreshed even if not collected (should be more than diagnostics.sql_stat_reset.interval). It has a max value of 24H.
+diagnostics.forced_sql_stat_reset.interval	duration	2h0m0s	interval after which the reported SQL Stats are reset even if not collected by telemetry reporter. It has a max value of 24H.
 diagnostics.reporting.enabled	boolean	true	enable reporting diagnostic metrics to cockroach labs
 diagnostics.reporting.interval	duration	1h0m0s	interval at which diagnostics data should be reported
-diagnostics.sql_stat_reset.interval	duration	1h0m0s	interval controlling how often SQL statement statistics should be reset (should be less than diagnostics.forced_sql_stat_reset.interval). It has a max value of 24H.
 enterprise.license	string		the encoded cluster license
 external.graphite.endpoint	string		if nonempty, push server metrics to the Graphite or Carbon server at the specified host:port
 external.graphite.interval	duration	10s	the interval at which metrics are pushed to Graphite (if enabled)
@@ -47,10 +49,10 @@ server.auth_log.sql_sessions.enabled	boolean	false	if set, log SQL session login
 server.authentication_cache.enabled	boolean	true	enables a cache used during authentication to avoid lookups to system tables when retrieving per-user authentication-related information
 server.clock.forward_jump_check_enabled	boolean	false	if enabled, forward clock jumps > max_offset/2 will cause a panic
 server.clock.persist_upper_bound_interval	duration	0s	the interval between persisting the wall time upper bound of the clock. The clock does not generate a wall time greater than the persisted timestamp and will panic if it sees a wall time greater than this value. When cockroach starts, it waits for the wall time to catch-up till this persisted timestamp. This guarantees monotonic wall time across server restarts. Not setting this or setting a value of 0 disables this feature.
-server.consistency_check.max_rate	byte size	8.0 MiB	the rate limit (bytes/sec) to use for consistency checks; used in conjunction with server.consistency_check.interval to control the frequency of consistency checks. Note that setting this too high can negatively impact performance.
 server.eventlog.enabled	boolean	true	if set, logged notable events are also stored in the table system.eventlog
 server.eventlog.ttl	duration	2160h0m0s	if nonzero, entries in system.eventlog older than this duration are deleted every 10m0s. Should not be lowered below 24 hours.
 server.host_based_authentication.configuration	string		host-based authentication configuration to use during connection authentication
+server.identity_map.configuration	string		system-identity to database-username mappings
 server.oidc_authentication.autologin	boolean	false	if true, logged-out visitors to the DB Console will be automatically redirected to the OIDC login endpoint
 server.oidc_authentication.button_text	string	Login with your OIDC provider	text to show on button on DB Console login page to login with your OIDC provider (only shown if OIDC is enabled)
 server.oidc_authentication.claim_json_key	string		sets JSON key of principal to extract from payload after OIDC authentication completes (usually email or sid)
@@ -62,10 +64,11 @@ server.oidc_authentication.provider_url	string		sets OIDC provider URL ({provide
 server.oidc_authentication.redirect_url	string	https://localhost:8080/oidc/v1/callback	sets OIDC redirect URL via a URL string or a JSON string containing a required `redirect_urls` key with an object that maps from region keys to URL strings (URLs should point to your load balancer and must route to the path /oidc/v1/callback) 
 server.oidc_authentication.scopes	string	openid	sets OIDC scopes to include with authentication request (space delimited list of strings, required to start with `openid`)
 server.rangelog.ttl	duration	720h0m0s	if nonzero, range log entries older than this duration are deleted every 10m0s. Should not be lowered below 24 hours.
-server.shutdown.drain_wait	duration	0s	the amount of time a server waits in an unready state before proceeding with the rest of the shutdown process
-server.shutdown.lease_transfer_wait	duration	5s	the amount of time a server waits to transfer range leases before proceeding with the rest of the shutdown process
-server.shutdown.query_wait	duration	10s	the server will wait for at least this amount of time for active queries to finish
+server.shutdown.drain_wait	duration	0s	the amount of time a server waits in an unready state before proceeding with the rest of the shutdown process (note that the --drain-wait parameter for cockroach node drain may need adjustment after changing this setting)
+server.shutdown.lease_transfer_wait	duration	5s	the amount of time a server waits to transfer range leases before proceeding with the rest of the shutdown process (note that the --drain-wait parameter for cockroach node drain may need adjustment after changing this setting)
+server.shutdown.query_wait	duration	10s	the server will wait for at least this amount of time for active queries to finish (note that the --drain-wait parameter for cockroach node drain may need adjustment after changing this setting)
 server.time_until_store_dead	duration	5m0s	the time after which if there is no new gossiped information about a store, it is considered dead
+server.user_login.store_client_pre_hashed_passwords.enabled	boolean	true	whether the server accepts to store passwords pre-hashed by clients
 server.user_login.timeout	duration	10s	timeout after which client authentication times out if some system range is unavailable (0 = no timeout)
 server.web_session.auto_logout.timeout	duration	168h0m0s	the duration that web sessions will survive before being periodically purged, since they were last used
 server.web_session.purge.max_deletions_per_cycle	integer	10	the maximum number of old sessions to delete for each purge
@@ -76,7 +79,6 @@ sql.cross_db_fks.enabled	boolean	false	if true, creating foreign key references 
 sql.cross_db_sequence_owners.enabled	boolean	false	if true, creating sequences owned by tables from other databases is allowed
 sql.cross_db_sequence_references.enabled	boolean	false	if true, sequences referenced by tables from other databases are allowed
 sql.cross_db_views.enabled	boolean	false	if true, creating views that refer to other databases is allowed
-sql.defaults.copy_partitioning_when_deinterleaving_table.enabled	boolean	false	default value for enable_copying_partitioning_when_deinterleaving_table session variable
 sql.defaults.datestyle	enumeration	iso, mdy	default value for DateStyle session setting [iso, mdy = 0, iso, dmy = 1, iso, ymd = 2]
 sql.defaults.datestyle.enabled	boolean	false	default value for datestyle_enabled session setting
 sql.defaults.default_int_size	integer	8	the size, in bytes, of an INT type
@@ -88,7 +90,7 @@ sql.defaults.experimental_distsql_planning	enumeration	off	default experimental_
 sql.defaults.experimental_enable_unique_without_index_constraints.enabled	boolean	false	default value for experimental_enable_unique_without_index_constraints session setting;disables unique without index constraints by default
 sql.defaults.experimental_hash_sharded_indexes.enabled	boolean	false	default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default
 sql.defaults.experimental_implicit_column_partitioning.enabled	boolean	false	default value for experimental_enable_temp_tables; allows for the use of implicit column partitioning
-sql.defaults.experimental_new_schema_changer.enabled	enumeration	off	default value for experimental_use_new_schema_changer session setting;disables new schema changer by default [off = 0, on = 1, unsafe_always = 2]
+sql.defaults.experimental_new_schema_changer.enabled	enumeration	off	default value for experimental_use_new_schema_changer session setting;disables new schema changer by default [off = 0, on = 1, unsafe = 2, unsafe_always = 3]
 sql.defaults.experimental_stream_replication.enabled	boolean	false	default value for experimental_stream_replication session setting;enables the ability to setup a replication stream
 sql.defaults.experimental_temporary_tables.enabled	boolean	false	default value for experimental_enable_temp_tables; allows for use of temporary tables by default
 sql.defaults.foreign_key_cascades_limit	integer	10000	default value for foreign_key_cascades_limit session setting; limits the number of cascading operations that run as part of a single query
@@ -96,7 +98,6 @@ sql.defaults.idle_in_session_timeout	duration	0s	default value for the idle_in_s
 sql.defaults.idle_in_transaction_session_timeout	duration	0s	default value for the idle_in_transaction_session_timeout; controls the duration a session is permitted to idle in a transaction before the session is terminated; if set to 0, there is no timeout
 sql.defaults.implicit_select_for_update.enabled	boolean	true	default value for enable_implicit_select_for_update session setting; enables FOR UPDATE locking during the row-fetch phase of mutation statements
 sql.defaults.insert_fast_path.enabled	boolean	true	default value for enable_insert_fast_path session setting; enables a specialized insert path
-sql.defaults.interleaved_tables.enabled	boolean	false	allows creation of interleaved tables or indexes
 sql.defaults.intervalstyle	enumeration	postgres	default value for IntervalStyle session setting [postgres = 0, iso_8601 = 1, sql_standard = 2]
 sql.defaults.intervalstyle.enabled	boolean	false	default value for intervalstyle_enabled session setting
 sql.defaults.large_full_scan_rows	float	1000	default value for large_full_scan_rows session setting which determines the maximum table size allowed for a full scan when disallow_full_table_scans is set to true
@@ -108,9 +109,10 @@ sql.defaults.optimizer_use_multicol_stats.enabled	boolean	true	default value for
 sql.defaults.override_multi_region_zone_config.enabled	boolean	false	default value for override_multi_region_zone_config; allows for overriding the zone configs of a multi-region table or database
 sql.defaults.prefer_lookup_joins_for_fks.enabled	boolean	false	default value for prefer_lookup_joins_for_fks session setting; causes foreign key operations to use lookup joins when possible
 sql.defaults.primary_region	string		if not empty, all databases created without a PRIMARY REGION will implicitly have the given PRIMARY REGION
+sql.defaults.reorder_joins_limit	integer	8	default number of joins to reorder
 sql.defaults.require_explicit_primary_keys.enabled	boolean	false	default value for requiring explicit primary keys in CREATE TABLE statements
 sql.defaults.results_buffer.size	byte size	16 KiB	default size of the buffer that accumulates results for a statement or a batch of statements before they are sent to the client. This can be overridden on an individual connection with the 'results_buffer_size' parameter. Note that auto-retries generally only happen while no results have been delivered to the client, so reducing this size can increase the number of retriable errors a client receives. On the other hand, increasing the buffer size can increase the delay until the client receives the first result row. Updating the setting only affects new connections. Setting to 0 disables any buffering.
-sql.defaults.serial_normalization	enumeration	rowid	default handling of SERIAL in table definitions [rowid = 0, unordered_rowid = 1, virtual_sequence = 2, sql_sequence = 3, sql_sequence_cached = 4]
+sql.defaults.serial_normalization	enumeration	rowid	default handling of SERIAL in table definitions [rowid = 0, virtual_sequence = 1, sql_sequence = 2, sql_sequence_cached = 3, unordered_rowid = 4]
 sql.defaults.statement_timeout	duration	0s	default value for the statement_timeout; default value for the statement_timeout session setting; controls the duration a query is permitted to run before it is canceled; if set to 0, there is no timeout
 sql.defaults.stub_catalog_tables.enabled	boolean	true	default value for stub_catalog_tables session setting
 sql.defaults.transaction_rows_read_err	integer	0	the limit for the number of rows read by a SQL transaction which - once exceeded - will fail the transaction (or will trigger a logging event to SQL_INTERNAL_PERF for internal transactions); use 0 to disable
@@ -119,7 +121,7 @@ sql.defaults.transaction_rows_written_err	integer	0	the limit for the number of 
 sql.defaults.transaction_rows_written_log	integer	0	the threshold for the number of rows written by a SQL transaction which - once exceeded - will trigger a logging event to SQL_PERF (or SQL_INTERNAL_PERF for internal transactions); use 0 to disable
 sql.defaults.vectorize	enumeration	on	default vectorize mode [on = 0, on = 2, experimental_always = 3, off = 4]
 sql.defaults.zigzag_join.enabled	boolean	true	default value for enable_zigzag_join session setting; allows use of zig-zag join by default
-sql.distsql.max_running_flows	integer	500	maximum number of concurrent flows that can be run on a node
+sql.distsql.max_running_flows	integer	-128	the value - when positive - used as is, or the value - when negative - multiplied by the number of CPUs on a node, to determine the maximum number of concurrent remote flows that can be run on the node
 sql.distsql.temp_storage.workmem	byte size	64 MiB	maximum amount of memory in bytes a processor can use before falling back to temp storage
 sql.guardrails.max_row_size_err	byte size	512 MiB	maximum size of row (or column family if multiple column families are in use) that SQL can write to the database, above which an error is returned; use 0 to disable
 sql.guardrails.max_row_size_log	byte size	64 MiB	maximum size of row (or column family if multiple column families are in use) that SQL can write to the database, above which an event is logged to SQL_PERF (or SQL_INTERNAL_PERF if the mutating statement was internal); use 0 to disable
@@ -137,6 +139,7 @@ sql.metrics.statement_details.plan_collection.enabled	boolean	true	periodically 
 sql.metrics.statement_details.plan_collection.period	duration	5m0s	the time until a new logical plan is collected
 sql.metrics.statement_details.threshold	duration	0s	minimum execution time to cause statement statistics to be collected. If configured, no transaction stats are collected.
 sql.metrics.transaction_details.enabled	boolean	true	collect per-application transaction statistics
+sql.multiple_modifications_of_table.enabled	boolean	false	if true, allow statements containing multiple INSERT ON CONFLICT, UPSERT, UPDATE, or DELETE subqueries modifying the same table, at the risk of data corruption if the same row is modified multiple times by a single statement (multiple INSERT subqueries without ON CONFLICT cannot cause corruption and are always allowed)
 sql.multiregion.drop_primary_region.enabled	boolean	true	allows dropping the PRIMARY REGION of a database if it is the last region
 sql.notices.enabled	boolean	true	enable notices in the server/client protocol being sent
 sql.optimizer.uniqueness_checks_for_gen_random_uuid.enabled	boolean	false	if enabled, uniqueness checks may be planned for mutations of UUID columns updated with gen_random_uuid(); otherwise, uniqueness is assumed due to near-zero collision probability
@@ -165,4 +168,4 @@ trace.debug.enable	boolean	false	if set, traces for recent requests can be seen 
 trace.jaeger.agent	string		the address of a Jaeger agent to receive traces using the Jaeger UDP Thrift protocol, as <host>:<port>. If no port is specified, 6381 will be used.
 trace.opentelemetry.collector	string		address of an OpenTelemetry trace collector to receive traces using the otel gRPC protocol, as <host>:<port>. If no port is specified, 4317 will be used.
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.
-version	version	21.2	set the active cluster version in the format '<major>.<minor>'
+version	version	21.2-34	set the active cluster version in the format '<major>.<minor>'

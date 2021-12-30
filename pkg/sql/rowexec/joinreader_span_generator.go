@@ -35,6 +35,10 @@ type joinReaderSpanGenerator interface {
 	// are returned in rows order, but there are no duplicates (i.e. if a 2nd row
 	// results in the same spans as a previous row, the results don't include them
 	// a second time).
+	//
+	// The returned spans are not accounted for, so it is the caller's
+	// responsibility to register the spans memory usage with our memory
+	// accounting system.
 	generateSpans(ctx context.Context, rows []rowenc.EncDatumRow) (roachpb.Spans, error)
 
 	// getMatchingRowIndices returns the indices of the input rows that desire
@@ -160,6 +164,8 @@ func (g *defaultSpanGenerator) maxLookupCols() int {
 
 // memUsage returns the size of the data structures in the defaultSpanGenerator
 // for memory accounting purposes.
+// NOTE: this does not account for scratchSpans because the joinReader passes
+// the ownership of spans to the fetcher which will account for it accordingly.
 func (g *defaultSpanGenerator) memUsage() int64 {
 	// Account for keyToInputRowIndices.
 	var size int64
@@ -168,14 +174,12 @@ func (g *defaultSpanGenerator) memUsage() int64 {
 		size += memsize.String + int64(len(k))
 		size += memsize.IntSliceOverhead + memsize.Int*int64(cap(v))
 	}
-
-	// Account for scratchSpans.
-	size += g.scratchSpans.MemUsage()
 	return size
 }
 
 func (g *defaultSpanGenerator) close(ctx context.Context) {
 	g.memAcc.Close(ctx)
+	g.spanBuilder.Release()
 	*g = defaultSpanGenerator{}
 }
 
@@ -662,8 +666,7 @@ func (g *multiSpanGenerator) generateSpans(
 			if inputRowIndices == nil {
 				// MaybeSplitSpanIntoSeparateFamilies is an optimization for doing more
 				// efficient point lookups when the span hits multiple column families.
-				// It doesn't work with inequality ranges because the prefixLen we pass
-				// in here is wrong and possibly other reasons.
+				// It doesn't work with inequality ranges because they aren't point lookups.
 				if g.inequalityColIdx != -1 {
 					g.scratchSpans = append(g.scratchSpans, *generatedSpan)
 				} else {
@@ -707,6 +710,8 @@ func (g *multiSpanGenerator) getMatchingRowIndices(key roachpb.Key) []int {
 
 // memUsage returns the size of the data structures in the multiSpanGenerator
 // for memory accounting purposes.
+// NOTE: this does not account for scratchSpans because the joinReader passes
+// the ownership of spans to the fetcher which will account for it accordingly.
 func (g *multiSpanGenerator) memUsage() int64 {
 	// Account for keyToInputRowIndices.
 	var size int64
@@ -718,14 +723,12 @@ func (g *multiSpanGenerator) memUsage() int64 {
 
 	// Account for spanToInputRowIndices.
 	size += g.spanToInputRowIndices.memUsage()
-
-	// Account for scratchSpans.
-	size += g.scratchSpans.MemUsage()
 	return size
 }
 
 func (g *multiSpanGenerator) close(ctx context.Context) {
 	g.memAcc.Close(ctx)
+	g.spanBuilder.Release()
 	*g = multiSpanGenerator{}
 }
 
@@ -739,9 +742,12 @@ type localityOptimizedSpanGenerator struct {
 }
 
 // init must be called before the localityOptimizedSpanGenerator can be used to
-// generate spans.
+// generate spans. Note that we use two different span builders so that both
+// local and remote span generators could release their own when they are
+// close()d.
 func (g *localityOptimizedSpanGenerator) init(
-	spanBuilder *span.Builder,
+	localSpanBuilder *span.Builder,
+	remoteSpanBuilder *span.Builder,
 	numKeyCols int,
 	numInputCols int,
 	localExprHelper *execinfrapb.ExprHelper,
@@ -751,12 +757,12 @@ func (g *localityOptimizedSpanGenerator) init(
 	remoteSpanGenMemAcc *mon.BoundAccount,
 ) error {
 	if err := g.localSpanGen.init(
-		spanBuilder, numKeyCols, numInputCols, localExprHelper, tableOrdToIndexOrd, localSpanGenMemAcc,
+		localSpanBuilder, numKeyCols, numInputCols, localExprHelper, tableOrdToIndexOrd, localSpanGenMemAcc,
 	); err != nil {
 		return err
 	}
 	if err := g.remoteSpanGen.init(
-		spanBuilder, numKeyCols, numInputCols, remoteExprHelper, tableOrdToIndexOrd, remoteSpanGenMemAcc,
+		remoteSpanBuilder, numKeyCols, numInputCols, remoteExprHelper, tableOrdToIndexOrd, remoteSpanGenMemAcc,
 	); err != nil {
 		return err
 	}

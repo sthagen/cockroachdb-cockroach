@@ -914,10 +914,20 @@ func (TransactionStatus) SafeValue() {}
 // write conflicts in a way that avoids starvation of long-running
 // transactions (see Replica.PushTxn).
 //
+// coordinatorNodeID is provided to track the SQL (or possibly KV) node
+// that created this transaction, in order to be used (as
+// of this writing) to enable observability on contention events
+// between different transactions.
+//
 // baseKey can be nil, in which case it will be set when sending the first
 // write.
 func MakeTransaction(
-	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
+	name string,
+	baseKey Key,
+	userPriority UserPriority,
+	now hlc.Timestamp,
+	maxOffsetNs int64,
+	coordinatorNodeID int32,
 ) Transaction {
 	u := uuid.FastMakeV4()
 	// TODO(nvanbenschoten): technically, gul should be a synthetic timestamp.
@@ -927,12 +937,13 @@ func MakeTransaction(
 
 	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
-			Key:            baseKey,
-			ID:             u,
-			WriteTimestamp: now,
-			MinTimestamp:   now,
-			Priority:       MakePriority(userPriority),
-			Sequence:       0, // 1-indexed, incremented before each Request
+			Key:               baseKey,
+			ID:                u,
+			WriteTimestamp:    now,
+			MinTimestamp:      now,
+			Priority:          MakePriority(userPriority),
+			Sequence:          0, // 1-indexed, incremented before each Request
+			CoordinatorNodeID: coordinatorNodeID,
 		},
 		Name:                   name,
 		LastHeartbeat:          now,
@@ -1446,6 +1457,7 @@ func PrepareTransactionForRetry(
 			NormalUserPriority,
 			now.ToTimestamp(),
 			clock.MaxOffset().Nanoseconds(),
+			txn.CoordinatorNodeID,
 		)
 		// Use the priority communicated back by the server.
 		txn.Priority = errTxnPri
@@ -1457,9 +1469,28 @@ func PrepareTransactionForRetry(
 		txn.WriteTimestamp.Forward(tErr.PusheeTxn.WriteTimestamp)
 		txn.UpgradePriority(tErr.PusheeTxn.Priority - 1)
 	case *TransactionRetryError:
-		// Nothing to do. Transaction.Timestamp has already been forwarded to be
-		// ahead of any timestamp cache entries or newer versions which caused
-		// the restart.
+		// Transaction.Timestamp has already been forwarded to be ahead of any
+		// timestamp cache entries or newer versions which caused the restart.
+		if tErr.Reason == RETRY_SERIALIZABLE {
+			// For RETRY_SERIALIZABLE case, we want to bump timestamp further than
+			// timestamp cache.
+			// This helps transactions that had their commit timestamp fixed (See
+			// roachpb.Transaction.CommitTimestampFixed for details on when it happens)
+			// or transactions that hit read-write contention and can't bump
+			// read timestamp because of later writes.
+			// Upon retry, we want those transactions to restart on now() instead of
+			// closed ts to give them some time to complete without a need to refresh
+			// read spans yet again and possibly fail.
+			// The tradeoff here is that transactions that failed because they were
+			// waiting on locks or were slowed down in their first epoch for any other
+			// reason (e.g. lease transfers, network congestion, node failure, etc.)
+			// would have a chance to retry and succeed, but transactions that are
+			// just slow would still retry indefinitely and delay transactions that
+			// try to write to the keys this transaction reads because reads are not
+			// in the past anymore.
+			now := clock.Now()
+			txn.WriteTimestamp.Forward(now)
+		}
 	case *WriteTooOldError:
 		// Increase the timestamp to the ts at which we've actually written.
 		txn.WriteTimestamp.Forward(writeTooOldRetryTimestamp(tErr))
@@ -1475,33 +1506,20 @@ func PrepareTransactionForRetry(
 	return txn
 }
 
-// PrepareTransactionForRefresh returns whether the transaction can be refreshed
-// to the specified timestamp to avoid a client-side transaction restart. If
-// true, returns a cloned, updated Transaction object with the provisional
-// commit timestamp and read timestamp set appropriately.
-func PrepareTransactionForRefresh(txn *Transaction, timestamp hlc.Timestamp) (bool, *Transaction) {
-	if txn.CommitTimestampFixed {
-		return false, nil
-	}
-	newTxn := txn.Clone()
-	newTxn.Refresh(timestamp)
-	return true, newTxn
-}
-
-// CanTransactionRefresh returns whether the transaction specified in the
-// supplied error can be retried at a refreshed timestamp to avoid a client-side
-// transaction restart. If true, returns a cloned, updated Transaction object
-// with the provisional commit timestamp and read timestamp set appropriately.
-func CanTransactionRefresh(ctx context.Context, pErr *Error) (bool, *Transaction) {
+// TransactionRefreshTimestamp returns whether the supplied error is a retry
+// error that can be discarded if the transaction in the error is refreshed. If
+// true, the function returns the timestamp that the Transaction object should
+// be refreshed at in order to discard the error and avoid a restart.
+func TransactionRefreshTimestamp(pErr *Error) (bool, hlc.Timestamp) {
 	txn := pErr.GetTxn()
 	if txn == nil {
-		return false, nil
+		return false, hlc.Timestamp{}
 	}
 	timestamp := txn.WriteTimestamp
 	switch err := pErr.GetDetail().(type) {
 	case *TransactionRetryError:
 		if err.Reason != RETRY_SERIALIZABLE && err.Reason != RETRY_WRITE_TOO_OLD {
-			return false, nil
+			return false, hlc.Timestamp{}
 		}
 	case *WriteTooOldError:
 		// TODO(andrei): Chances of success for on write-too-old conditions might be
@@ -1513,9 +1531,9 @@ func CanTransactionRefresh(ctx context.Context, pErr *Error) (bool, *Transaction
 	case *ReadWithinUncertaintyIntervalError:
 		timestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(err))
 	default:
-		return false, nil
+		return false, hlc.Timestamp{}
 	}
-	return PrepareTransactionForRefresh(txn, timestamp)
+	return true, timestamp
 }
 
 func readWithinUncertaintyIntervalRetryTimestamp(
@@ -1558,18 +1576,12 @@ func writeTooOldRetryTimestamp(err *WriteTooOldError) hlc.Timestamp {
 // Replicas returns all of the replicas present in the descriptor after this
 // trigger applies.
 func (crt ChangeReplicasTrigger) Replicas() []ReplicaDescriptor {
-	if crt.Desc != nil {
-		return crt.Desc.Replicas().Descriptors()
-	}
-	return crt.DeprecatedUpdatedReplicas
+	return crt.Desc.Replicas().Descriptors()
 }
 
 // NextReplicaID returns the next replica id to use after this trigger applies.
 func (crt ChangeReplicasTrigger) NextReplicaID() ReplicaID {
-	if crt.Desc != nil {
-		return crt.Desc.NextReplicaID
-	}
-	return crt.DeprecatedNextReplicaID
+	return crt.Desc.NextReplicaID
 }
 
 // ConfChange returns the configuration change described by the trigger.
@@ -1772,17 +1784,12 @@ func (crt ChangeReplicasTrigger) SafeFormat(w redact.SafePrinter, _ rune) {
 	var nextReplicaID ReplicaID
 	var afterReplicas []ReplicaDescriptor
 	added, removed := crt.Added(), crt.Removed()
-	if crt.Desc != nil {
-		nextReplicaID = crt.Desc.NextReplicaID
-		// NB: we don't want to mutate InternalReplicas, so we don't call
-		// .Replicas()
-		//
-		// TODO(tbg): revisit after #39489 is merged.
-		afterReplicas = crt.Desc.InternalReplicas
-	} else {
-		nextReplicaID = crt.DeprecatedNextReplicaID
-		afterReplicas = crt.DeprecatedUpdatedReplicas
-	}
+	nextReplicaID = crt.Desc.NextReplicaID
+	// NB: we don't want to mutate InternalReplicas, so we don't call
+	// .Replicas()
+	//
+	// TODO(tbg): revisit after #39489 is merged.
+	afterReplicas = crt.Desc.InternalReplicas
 	cc, err := crt.ConfChange(nil)
 	if err != nil {
 		w.Printf("<malformed ChangeReplicasTrigger: %s>", err)
@@ -1837,18 +1844,8 @@ func confChangesToRedactableString(ccs []raftpb.ConfChangeSingle) redact.Redacta
 	})
 }
 
-func (crt ChangeReplicasTrigger) legacy() (ReplicaDescriptor, bool) {
-	if len(crt.InternalAddedReplicas)+len(crt.InternalRemovedReplicas) == 0 && crt.DeprecatedReplica.ReplicaID != 0 {
-		return crt.DeprecatedReplica, true
-	}
-	return ReplicaDescriptor{}, false
-}
-
 // Added returns the replicas added by this change (if there are any).
 func (crt ChangeReplicasTrigger) Added() []ReplicaDescriptor {
-	if rDesc, ok := crt.legacy(); ok && crt.DeprecatedChangeType == ADD_VOTER {
-		return []ReplicaDescriptor{rDesc}
-	}
 	return crt.InternalAddedReplicas
 }
 
@@ -1857,9 +1854,6 @@ func (crt ChangeReplicasTrigger) Added() []ReplicaDescriptor {
 // transitioning to VOTER_{OUTGOING,DEMOTING} (from VOTER_FULL). The subsequent trigger
 // leaving the joint configuration has an empty Removed().
 func (crt ChangeReplicasTrigger) Removed() []ReplicaDescriptor {
-	if rDesc, ok := crt.legacy(); ok && crt.DeprecatedChangeType == REMOVE_VOTER {
-		return []ReplicaDescriptor{rDesc}
-	}
 	return crt.InternalRemovedReplicas
 }
 
@@ -2337,6 +2331,17 @@ func (a Spans) MemUsage() int64 {
 		size += aCap[i].MemUsage()
 	}
 	return size
+}
+
+func (a Spans) String() string {
+	var buf bytes.Buffer
+	for i, span := range a {
+		if i != 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(span.String())
+	}
+	return buf.String()
 }
 
 // RSpan is a key range with an inclusive start RKey and an exclusive end RKey.

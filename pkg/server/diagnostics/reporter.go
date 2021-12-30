@@ -57,6 +57,7 @@ type NodeStatusGenerator interface {
 }
 
 var reportFrequency = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"diagnostics.reporting.interval",
 	"interval at which diagnostics data should be reported",
 	time.Hour,
@@ -169,7 +170,7 @@ func (r *Reporter) CreateReport(
 ) *diagnosticspb.DiagnosticReport {
 	info := diagnosticspb.DiagnosticReport{}
 	secret := sql.ClusterSecret.Get(&r.Settings.SV)
-	uptime := int64(timeutil.Now().Sub(r.StartTime).Seconds())
+	uptime := int64(timeutil.Since(r.StartTime).Seconds())
 
 	// Populate the hardware, OS, binary, and location of the CRDB node or SQL
 	// instance.
@@ -326,7 +327,7 @@ func (r *Reporter) collectSchemaInfo(ctx context.Context) ([]descpb.TableDescrip
 			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", kv.Key)
 		}
 		t, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, kv.Value.Timestamp)
-		if t != nil && t.ID > keys.MaxReservedDescID {
+		if t != nil && t.ParentID != keys.SystemDatabaseID {
 			if err := reflectwalk.Walk(t, redactor); err != nil {
 				panic(err) // stringRedactor never returns a non-nil err
 			}

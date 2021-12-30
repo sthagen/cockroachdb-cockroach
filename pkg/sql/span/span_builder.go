@@ -12,6 +12,7 @@ package span
 
 import (
 	"sort"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -42,65 +43,45 @@ type Builder struct {
 	KeyPrefix []byte
 	alloc     rowenc.DatumAlloc
 
-	// TODO (rohany): The interstices are used to convert opt constraints into spans. In future work,
-	//  we should unify the codepaths and use the allocation free method used on datums.
-	//  This work is tracked in #42738.
-	interstices [][]byte
-
 	neededFamilies []descpb.FamilyID
 }
 
-// Use some functions that aren't needed right now to make the linter happy.
-var _ = (*Builder).UnsetNeededColumns
-var _ = (*Builder).SetNeededFamilies
-var _ = (*Builder).UnsetNeededFamilies
+var builderPool = sync.Pool{
+	New: func() interface{} { return &Builder{} },
+}
 
-// MakeBuilder creates a Builder for a table and index.
+// MakeBuilder creates a Builder for a table and index. The returned object must
+// be Release()d when no longer needed.
 func MakeBuilder(
 	evalCtx *tree.EvalContext,
 	codec keys.SQLCodec,
 	table catalog.TableDescriptor,
 	index catalog.Index,
 ) *Builder {
-	s := &Builder{
+	s := builderPool.Get().(*Builder)
+	*s = Builder{
 		evalCtx:        evalCtx,
 		codec:          codec,
 		table:          table,
 		index:          index,
+		indexColTypes:  s.indexColTypes,
 		KeyPrefix:      rowenc.MakeIndexKeyPrefix(codec, table, index.GetID()),
-		interstices:    make([][]byte, index.NumKeyColumns()+index.NumKeySuffixColumns()+1),
 		neededFamilies: nil,
 	}
 
 	var columnIDs descpb.ColumnIDs
 	columnIDs, s.indexColDirs = catalog.FullIndexColumnIDs(index)
-	s.indexColTypes = make([]*types.T, len(columnIDs))
+	if cap(s.indexColTypes) < len(columnIDs) {
+		s.indexColTypes = make([]*types.T, len(columnIDs))
+	} else {
+		s.indexColTypes = s.indexColTypes[:len(columnIDs)]
+	}
 	for i, colID := range columnIDs {
 		col, _ := table.FindColumnWithID(colID)
 		// TODO (rohany): do I need to look at table columns with mutations here as well?
 		if col != nil && col.Public() {
 			s.indexColTypes[i] = col.GetType()
 		}
-	}
-
-	// Set up the interstices for encoding interleaved tables later.
-	s.interstices[0] = s.KeyPrefix
-	if index.NumInterleaveAncestors() > 0 {
-		// TODO(rohany): too much of this code is copied from EncodePartialIndexKey.
-		sharedPrefixLen := 0
-		for i := 0; i < index.NumInterleaveAncestors(); i++ {
-			ancestor := index.GetInterleaveAncestor(i)
-			// The first ancestor is already encoded in interstices[0].
-			if i != 0 {
-				s.interstices[sharedPrefixLen] = rowenc.EncodePartialTableIDIndexID(
-					s.interstices[sharedPrefixLen], ancestor.TableID, ancestor.IndexID)
-			}
-			sharedPrefixLen += int(ancestor.SharedPrefixLen)
-			s.interstices[sharedPrefixLen] = encoding.EncodeInterleavedSentinel(
-				s.interstices[sharedPrefixLen])
-		}
-		s.interstices[sharedPrefixLen] = rowenc.EncodePartialTableIDIndexID(
-			s.interstices[sharedPrefixLen], table.GetID(), index.GetID())
 	}
 
 	return s
@@ -114,24 +95,6 @@ func (s *Builder) SetNeededColumns(neededCols util.FastIntSet) {
 	s.neededFamilies = rowenc.NeededColumnFamilyIDs(neededCols, s.table, s.index)
 }
 
-// UnsetNeededColumns resets the needed columns for column family specific optimizations
-// that the Builder performs.
-func (s *Builder) UnsetNeededColumns() {
-	s.neededFamilies = nil
-}
-
-// SetNeededFamilies sets the needed families of the span builder directly. This information
-// is used by MaybeSplitSpanIntoSeparateFamilies.
-func (s *Builder) SetNeededFamilies(neededFamilies []descpb.FamilyID) {
-	s.neededFamilies = neededFamilies
-}
-
-// UnsetNeededFamilies resets the needed families for column family specific optimizations
-// that the Builder performs.
-func (s *Builder) UnsetNeededFamilies() {
-	s.neededFamilies = nil
-}
-
 // SpanFromEncDatums encodes a span with prefixLen constraint columns from the
 // index prefixed with the index key prefix that includes the table and index
 // ID. SpanFromEncDatums assumes that the EncDatums in values are in the order
@@ -142,7 +105,7 @@ func (s *Builder) SpanFromEncDatums(
 	values rowenc.EncDatumRow, prefixLen int,
 ) (_ roachpb.Span, containsNull bool, _ error) {
 	return rowenc.MakeSpanFromEncDatums(
-		values[:prefixLen], s.indexColTypes[:prefixLen], s.indexColDirs[:prefixLen], s.table, s.index, &s.alloc, s.KeyPrefix)
+		values[:prefixLen], s.indexColTypes[:prefixLen], s.indexColDirs[:prefixLen], s.index, &s.alloc, s.KeyPrefix)
 }
 
 // SpanFromEncDatumsWithRange encodes a range span. The inequality is assumed to
@@ -166,8 +129,9 @@ func (s *Builder) SpanFromEncDatumsWithRange(
 	}
 
 	makeKeyFromRow := func(r rowenc.EncDatumRow, l int) (k roachpb.Key, cn bool, e error) {
-		k, _, cn, e = rowenc.MakeKeyFromEncDatums(r[:l], s.indexColTypes[:l], s.indexColDirs[:l],
-			s.table, s.index, &s.alloc, s.KeyPrefix)
+		k, _, cn, e = rowenc.MakeKeyFromEncDatums(
+			r[:l], s.indexColTypes[:l], s.indexColDirs[:l], s.index, &s.alloc, s.KeyPrefix,
+		)
 		return
 	}
 
@@ -257,7 +221,7 @@ func (s *Builder) CanSplitSpanIntoFamilySpans(
 	// * The table is not a special system table. (System tables claim to have
 	//   column families, but actually do not, since they're written to with
 	//   raw KV puts in a "legacy" way.)
-	if s.table.GetID() > 0 && s.table.GetID() < keys.MaxReservedDescID {
+	if catalog.IsSystemDescriptor(s.table) {
 		return false
 	}
 
@@ -288,11 +252,6 @@ func (s *Builder) CanSplitSpanIntoFamilySpans(
 		}
 		// * The index cannot be inverted.
 		if s.index.GetType() != descpb.IndexDescriptor_FORWARD {
-			return false
-		}
-
-		// * The index must store some columns.
-		if s.index.NumSecondaryStoredColumns() == 0 {
 			return false
 		}
 
@@ -359,7 +318,9 @@ func (s *Builder) appendSpansFromConstraintSpan(
 		return nil, err
 	}
 	if cs.StartBoundary() == constraint.IncludeBoundary {
-		span.Key = append(span.Key, s.interstices[cs.StartKey().Length()]...)
+		if cs.StartKey().IsEmpty() {
+			span.Key = append(span.Key, s.KeyPrefix...)
+		}
 	} else {
 		// We need to exclude the value this logical part refers to.
 		span.Key = span.Key.PrefixEnd()
@@ -369,7 +330,9 @@ func (s *Builder) appendSpansFromConstraintSpan(
 	if err != nil {
 		return nil, err
 	}
-	span.EndKey = append(span.EndKey, s.interstices[cs.EndKey().Length()]...)
+	if cs.EndKey().IsEmpty() {
+		span.EndKey = append(span.EndKey, s.KeyPrefix...)
+	}
 
 	// Optimization: for single row lookups on a table with one or more column
 	// families, only scan the relevant column families, and use GetRequests
@@ -384,31 +347,30 @@ func (s *Builder) appendSpansFromConstraintSpan(
 		}
 	}
 
-	// We tighten the end key to prevent reading interleaved children after the
-	// last parent key. If cs.End.Inclusive is true, we also advance the key as
-	// necessary.
-	endInclusive := cs.EndBoundary() == constraint.IncludeBoundary
-	span.EndKey, err = rowenc.AdjustEndKeyForInterleave(s.codec, s.table, s.index, span.EndKey, endInclusive)
-	if err != nil {
-		return nil, err
+	// We need to advance the end key if it is inclusive or the index is
+	// inverted.
+	if cs.EndBoundary() == constraint.IncludeBoundary || s.index.GetType() == descpb.IndexDescriptor_INVERTED {
+		span.EndKey = span.EndKey.PrefixEnd()
 	}
+
 	return append(appendTo, span), nil
 }
 
 // encodeConstraintKey encodes each logical part of a constraint.Key into a
-// roachpb.Key; interstices[i] is inserted before the i-th value.
+// roachpb.Key.
 func (s *Builder) encodeConstraintKey(
 	ck constraint.Key,
-) (_ roachpb.Key, containsNull bool, _ error) {
-	var key []byte
+) (key roachpb.Key, containsNull bool, err error) {
+	if ck.IsEmpty() {
+		return key, containsNull, nil
+	}
+	key = append(key, s.KeyPrefix...)
 	for i := 0; i < ck.Length(); i++ {
 		val := ck.Value(i)
 		if val == tree.DNull {
 			containsNull = true
 		}
-		key = append(key, s.interstices[i]...)
 
-		var err error
 		// For extra columns (like implicit columns), the direction
 		// is ascending.
 		dir := encoding.Ascending
@@ -451,8 +413,11 @@ var _ InvertedSpans = inverted.SpanExpressionProtoSpans{}
 // non-inverted prefix columns of the index. Each span in c must have a single
 // key. The resulting roachpb.Spans are created by performing a cross product of
 // keys in c and the invertedSpan keys.
+//
+// scratch can be an optional roachpb.Spans slice that will be reused to
+// populate the result.
 func (s *Builder) SpansFromInvertedSpans(
-	invertedSpans InvertedSpans, c *constraint.Constraint,
+	invertedSpans InvertedSpans, c *constraint.Constraint, scratch roachpb.Spans,
 ) (roachpb.Spans, error) {
 	if invertedSpans == nil {
 		return nil, errors.AssertionFailedf("invertedSpans cannot be nil")
@@ -487,7 +452,7 @@ func (s *Builder) SpansFromInvertedSpans(
 		scratchRows[0] = make(rowenc.EncDatumRow, 1)
 	}
 
-	var spans roachpb.Spans
+	scratch = scratch[:0]
 	for i := range scratchRows {
 		for j, n := 0, invertedSpans.Len(); j < n; j++ {
 			var indexSpan roachpb.Span
@@ -498,11 +463,11 @@ func (s *Builder) SpansFromInvertedSpans(
 			if indexSpan.EndKey, err = s.generateInvertedSpanKey(invertedSpans.End(j), scratchRows[i]); err != nil {
 				return nil, err
 			}
-			spans = append(spans, indexSpan)
+			scratch = append(scratch, indexSpan)
 		}
 	}
-	sort.Sort(spans)
-	return spans, nil
+	sort.Sort(scratch)
+	return scratch, nil
 }
 
 // generateInvertedSpanKey returns a key that encodes enc and scratchRow. The
@@ -533,4 +498,14 @@ func (s *Builder) generateInvertedSpanKey(
 
 	span, _, err := s.SpanFromEncDatums(scratchRow, keyLen)
 	return span.Key, err
+}
+
+// Release implements the execinfra.Releasable interface.
+func (s *Builder) Release() {
+	*s = Builder{
+		// Note that the types are small objects, so we don't bother deeply
+		// resetting the indexColTypes slice.
+		indexColTypes: s.indexColTypes[:0],
+	}
+	builderPool.Put(s)
 }

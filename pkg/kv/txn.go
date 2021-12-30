@@ -100,6 +100,8 @@ type Txn struct {
 
 // NewTxn returns a new RootTxn.
 // Note: for SQL usage, prefer NewTxnWithSteppingEnabled() below.
+// Note: for KV usage that should be subject to admission control, prefer
+// NewTxnRootKV() below.
 //
 // If the transaction is used to send any operations, CommitOrCleanup() or
 // CleanupOnError() should eventually be called to commit/rollback the
@@ -128,6 +130,7 @@ func NewTxn(ctx context.Context, db *DB, gatewayNodeID roachpb.NodeID) *Txn {
 		roachpb.NormalUserPriority,
 		now.ToTimestamp(),
 		db.clock.MaxOffset().Nanoseconds(),
+		int32(db.ctx.NodeID.SQLInstanceID()),
 	)
 
 	return NewTxnFromProto(ctx, db, gatewayNodeID, now, RootTxn, &kvTxn)
@@ -144,6 +147,22 @@ func NewTxnWithSteppingEnabled(ctx context.Context, db *DB, gatewayNodeID roachp
 		Source:     roachpb.AdmissionHeader_FROM_SQL,
 	}
 	_ = txn.ConfigureStepping(ctx, SteppingEnabled)
+	return txn
+}
+
+// NewTxnRootKV is like NewTxn but specifically represents a transaction
+// originating within KV and that is at the root of the tree of requests. For KV
+// usage that should be subject to admission control. Do not use this for
+// executing transactions originating in SQL. This distinction only causes this
+// transaction to undergo admission control. See AdmissionHeader_Source for more
+// details.
+func NewTxnRootKV(ctx context.Context, db *DB, gatewayNodeID roachpb.NodeID) *Txn {
+	txn := NewTxn(ctx, db, gatewayNodeID)
+	txn.admissionHeader = roachpb.AdmissionHeader{
+		Priority:   int32(admission.NormalPri),
+		CreateTime: timeutil.Now().UnixNano(),
+		Source:     roachpb.AdmissionHeader_ROOT_KV,
+	}
 	return txn
 }
 
@@ -947,7 +966,7 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 		if err == nil {
 			if !txn.IsCommitted() {
 				err = txn.Commit(ctx)
-				log.Eventf(ctx, "client.Txn did AutoCommit. err: %v\n", err)
+				log.Eventf(ctx, "client.Txn did AutoCommit. err: %v", err)
 				if err != nil {
 					if !errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) {
 						// We can't retry, so let the caller know we tried to
@@ -1449,7 +1468,8 @@ func (txn *Txn) GenerateForcedRetryableError(ctx context.Context, msg string) er
 			txn.mu.userPriority,
 			now.ToTimestamp(),
 			txn.db.clock.MaxOffset().Nanoseconds(),
-		))
+			int32(txn.db.ctx.NodeID.SQLInstanceID())),
+	)
 }
 
 // PrepareRetryableError returns a
@@ -1636,4 +1656,14 @@ func (txn *Txn) AdmissionHeader() roachpb.AdmissionHeader {
 		h.Priority = int32(admission.HighPri)
 	}
 	return h
+}
+
+// OnePCNotAllowedError signifies that a request had the Require1PC flag set,
+// but 1PC evaluation was not possible for one reason or another.
+type OnePCNotAllowedError struct{}
+
+var _ error = OnePCNotAllowedError{}
+
+func (OnePCNotAllowedError) Error() string {
+	return "could not commit in one phase as requested"
 }

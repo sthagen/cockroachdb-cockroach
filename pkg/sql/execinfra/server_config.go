@@ -101,6 +101,10 @@ type ServerConfig struct {
 	// used by the column and index backfillers.
 	BackfillerMonitor *mon.BytesMonitor
 
+	// Child monitor of the bulk monitor which will be used to monitor the memory
+	// used during backup.
+	BackupMonitor *mon.BytesMonitor
+
 	// ParentDiskMonitor is normally the root disk monitor. It should only be used
 	// when setting up a server, a child monitor (usually belonging to a sql
 	// execution flow), or in tests. It is used to monitor temporary storage disk
@@ -150,6 +154,10 @@ type ServerConfig struct {
 	// SQLStatsController is an interface used to reset SQL stats without the need to
 	// introduce dependency on the sql package.
 	SQLStatsController tree.SQLStatsController
+
+	// IndexUsageStatsController is an interface used to reset index usage stats without
+	// the need to introduce dependency on the sql package.
+	IndexUsageStatsController tree.IndexUsageStatsController
 
 	// SQLSQLResponseAdmissionQ is the admission queue to use for
 	// SQLSQLResponseWork.

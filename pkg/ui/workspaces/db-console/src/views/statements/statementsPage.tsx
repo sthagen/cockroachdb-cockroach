@@ -11,7 +11,6 @@
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import moment, { Moment } from "moment";
 import * as protos from "src/js/protos";
 import {
   refreshStatementDiagnosticsRequests,
@@ -20,33 +19,28 @@ import {
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
 import { StatementsResponseMessage } from "src/util/api";
-import {
-  aggregateStatementStats,
-  combineStatementStats,
-  ExecutionStatistics,
-  flattenStatementStats,
-  statementKey,
-  StatementStatistics,
-} from "src/util/appStats";
 import { appAttr } from "src/util/constants";
-import { TimestampToMoment } from "src/util/convert";
 import { PrintTime } from "src/views/reports/containers/range/print";
 import { selectDiagnosticsReportsPerStatement } from "src/redux/statements/statementsSelectors";
 import { createStatementDiagnosticsAlertLocalSetting } from "src/redux/alerts";
-import { statementsDateRangeLocalSetting } from "src/redux/statementsDateRange";
+import { statementsTimeScaleLocalSetting } from "src/redux/statementsTimeScale";
 import { queryByName } from "src/util/query";
 
-import { StatementsPage, AggregateStatistics } from "@cockroachlabs/cluster-ui";
+import {
+  StatementsPage,
+  AggregateStatistics,
+  Filters,
+  defaultFilters,
+  util,
+} from "@cockroachlabs/cluster-ui";
 import {
   createOpenDiagnosticsModalAction,
   createStatementDiagnosticsReportAction,
-  setCombinedStatementsDateRangeAction,
+  setCombinedStatementsTimeScaleAction,
 } from "src/redux/statements";
 import {
   trackDownloadDiagnosticsBundleAction,
   trackStatementsPaginationAction,
-  trackStatementsSearchAction,
-  trackTableSortAction,
 } from "src/redux/analyticsActions";
 import { resetSQLStatsAction } from "src/redux/sqlStats";
 import { LocalSetting } from "src/redux/localsettings";
@@ -55,9 +49,21 @@ import { nodeRegionsByIDSelector } from "src/redux/nodes";
 type ICollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 type IStatementDiagnosticsReport = protos.cockroach.server.serverpb.IStatementDiagnosticsReport;
 
+const {
+  aggregateStatementStats,
+  combineStatementStats,
+  flattenStatementStats,
+  statementKey,
+} = util;
+
+type ExecutionStatistics = util.ExecutionStatistics;
+type StatementStatistics = util.StatementStatistics;
+
 interface StatementsSummaryData {
   statement: string;
+  statementSummary: string;
   aggregatedTs: number;
+  aggregationInterval: number;
   implicitTxn: boolean;
   fullScan: boolean;
   database: string;
@@ -84,17 +90,24 @@ export const selectStatements = createSelector(
       statement.app.startsWith(state.data.internal_app_name_prefix);
 
     if (app && app !== "All") {
-      let criteria = decodeURIComponent(app);
+      const criteria = decodeURIComponent(app).split(",");
       let showInternal = false;
-      if (criteria === "(unset)") {
-        criteria = "";
-      } else if (criteria === "(internal)") {
+      if (criteria.includes(state.data.internal_app_name_prefix)) {
         showInternal = true;
+      }
+      if (criteria.includes("(unset)")) {
+        criteria.push("");
       }
 
       statements = statements.filter(
         (statement: ExecutionStatistics) =>
-          (showInternal && isInternal(statement)) || statement.app === criteria,
+          (showInternal && isInternal(statement)) ||
+          criteria.includes(statement.app),
+      );
+    } else {
+      // We don't want to show internal statements by default.
+      statements = statements.filter(
+        (statement: ExecutionStatistics) => !isInternal(statement),
       );
     }
 
@@ -106,7 +119,9 @@ export const selectStatements = createSelector(
       if (!(key in statsByStatementKey)) {
         statsByStatementKey[key] = {
           statement: stmt.statement,
+          statementSummary: stmt.statement_summary,
           aggregatedTs: stmt.aggregated_ts,
+          aggregationInterval: stmt.aggregation_interval,
           implicitTxn: stmt.implicit_txn,
           fullScan: stmt.full_scan,
           database: stmt.database,
@@ -120,7 +135,9 @@ export const selectStatements = createSelector(
       const stmt = statsByStatementKey[key];
       return {
         label: stmt.statement,
+        summary: stmt.statementSummary,
         aggregatedTs: stmt.aggregatedTs,
+        aggregationInterval: stmt.aggregationInterval,
         implicitTxn: stmt.implicitTxn,
         fullScan: stmt.fullScan,
         database: stmt.database,
@@ -160,7 +177,7 @@ export const selectApps = createSelector(
       },
     );
     return []
-      .concat(sawInternal ? ["(internal)"] : [])
+      .concat(sawInternal ? [state.data.internal_app_name_prefix] : [])
       .concat(sawBlank ? ["(unset)"] : [])
       .concat(Object.keys(apps));
   },
@@ -175,7 +192,11 @@ export const selectDatabases = createSelector(
       return [];
     }
     return Array.from(
-      new Set(state.data.statements.map(s => s.key.key_data.database)),
+      new Set(
+        state.data.statements.map(s =>
+          s.key.key_data.database ? s.key.key_data.database : "(unset)",
+        ),
+      ),
     ).filter((dbName: string) => dbName !== null && dbName.length > 0);
   },
 );
@@ -201,14 +222,7 @@ export const selectLastReset = createSelector(
     if (!state.data) {
       return "unknown";
     }
-    return PrintTime(TimestampToMoment(state.data.last_reset));
-  },
-);
-
-export const selectDateRange = createSelector(
-  statementsDateRangeLocalSetting.selector,
-  (state: { start: number; end: number }): [Moment, Moment] => {
-    return [moment.unix(state.start), moment.unix(state.end)];
+    return PrintTime(util.TimestampToMoment(state.data.last_reset));
   },
 );
 
@@ -218,32 +232,61 @@ export const statementColumnsLocalSetting = new LocalSetting(
   null,
 );
 
+export const sortSettingLocalSetting = new LocalSetting(
+  "sortSetting/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  { ascending: false, columnTitle: "executionCount" },
+);
+
+export const filtersLocalSetting = new LocalSetting(
+  "filters/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  defaultFilters,
+);
+
+export const searchLocalSetting = new LocalSetting(
+  "search/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  null,
+);
+
 export default withRouter(
   connect(
     (state: AdminUIState, props: RouteComponentProps) => ({
+      apps: selectApps(state),
+      columns: statementColumnsLocalSetting.selectorToArray(state),
+      databases: selectDatabases(state),
+      timeScale: statementsTimeScaleLocalSetting.selector(state),
+      filters: filtersLocalSetting.selector(state),
+      lastReset: selectLastReset(state),
+      nodeRegions: nodeRegionsByIDSelector(state),
+      search: searchLocalSetting.selector(state),
+      sortSetting: sortSettingLocalSetting.selector(state),
       statements: selectStatements(state, props),
       statementsError: state.cachedData.statements.lastError,
-      dateRange: selectDateRange(state),
-      apps: selectApps(state),
-      databases: selectDatabases(state),
       totalFingerprints: selectTotalFingerprints(state),
-      lastReset: selectLastReset(state),
-      columns: statementColumnsLocalSetting.selectorToArray(state),
-      nodeRegions: nodeRegionsByIDSelector(state),
     }),
     {
       refreshStatements: refreshStatements,
-      onDateRangeChange: setCombinedStatementsDateRangeAction,
+      onTimeScaleChange: setCombinedStatementsTimeScaleAction,
       refreshStatementDiagnosticsRequests,
       resetSQLStats: resetSQLStatsAction,
       dismissAlertMessage: () =>
         createStatementDiagnosticsAlertLocalSetting.set({ show: false }),
       onActivateStatementDiagnostics: createStatementDiagnosticsReportAction,
       onDiagnosticsModalOpen: createOpenDiagnosticsModalAction,
-      onSearchComplete: (results: AggregateStatistics[]) =>
-        trackStatementsSearchAction(results.length),
+      onSearchComplete: (query: string) => searchLocalSetting.set(query),
       onPageChanged: trackStatementsPaginationAction,
-      onSortingChange: trackTableSortAction,
+      onSortingChange: (
+        _tableName: string,
+        columnName: string,
+        ascending: boolean,
+      ) =>
+        sortSettingLocalSetting.set({
+          ascending: ascending,
+          columnTitle: columnName,
+        }),
+      onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
       onDiagnosticsReportDownload: (report: IStatementDiagnosticsReport) =>
         trackDownloadDiagnosticsBundleAction(report.statement_fingerprint),
       // We use `null` when the value was never set and it will show all columns.

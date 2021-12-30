@@ -266,7 +266,12 @@ func (h *httpStorage) req(
 		_ = resp.Body.Close()
 		err := errors.Errorf("error response from server: %s %q", resp.Status, body)
 		if err != nil && resp.StatusCode == 404 {
-			err = errors.Wrapf(cloud.ErrFileDoesNotExist, "http storage file does not exist: %s", err.Error())
+			// nolint:errwrap
+			err = errors.Wrapf(
+				errors.Wrap(cloud.ErrFileDoesNotExist, "http storage file does not exist"),
+				"%v",
+				err.Error(),
+			)
 		}
 		return nil, err
 	}

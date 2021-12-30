@@ -46,6 +46,7 @@ import (
 // createStatsPostEvents controls the cluster setting for logging
 // automatic table statistics collection to the event log.
 var createStatsPostEvents = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"sql.stats.post_events.enabled",
 	"if set, an event is logged for every CREATE STATISTICS job",
 	false,
@@ -54,6 +55,7 @@ var createStatsPostEvents = settings.RegisterBoolSetting(
 // featureStatsEnabled is used to enable and disable the CREATE STATISTICS and
 // ANALYZE features.
 var featureStatsEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"feature.stats.enabled",
 	"set to true to enable CREATE STATISTICS/ANALYZE, false to disable; default is true",
 	featureflag.FeatureFlagEnabledDefault,
@@ -203,7 +205,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 
 	case *tree.TableRef:
 		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
-			AvoidCached: n.p.avoidCachedDescriptors,
+			AvoidLeased: n.p.avoidLeasedDescriptors,
 		}}
 		tableDesc, err = n.p.Descriptors().GetImmutableTableByID(ctx, n.p.txn, descpb.ID(t.TableID), flags)
 		if err != nil {

@@ -543,6 +543,7 @@ var ignoredErrorPatterns = []string{
 	// TODO(mjibson): fix these
 	"column .* must appear in the GROUP BY clause or be used in an aggregate function",
 	"aggregate functions are not allowed in ON",
+	"ordered-set aggregations must have a WITHIN GROUP clause containing one ORDER BY column",
 }
 
 var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
@@ -556,7 +557,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 
 	tableStmts := make([]string, 0)
 	testRandomSyntax(t, true, "defaultdb", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
-		setups := []string{"rand-tables", "seed"}
+		setups := []string{sqlsmith.RandTableSetupName, "seed"}
 		for _, s := range setups {
 			randTables := sqlsmith.Setups[s](r.Rnd)
 			if err := db.exec(t, ctx, randTables); err != nil {

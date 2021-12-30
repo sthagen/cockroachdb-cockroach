@@ -84,6 +84,12 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 				"try ALTER DATABASE DROP REGION %s", name)
 		case descpb.TypeDescriptor_ENUM:
 			sqltelemetry.IncrementEnumCounter(sqltelemetry.EnumDrop)
+		case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
+			return nil, pgerror.Newf(
+				pgcode.DependentObjectsStillExist,
+				"cannot drop type %q because table %q requires it",
+				name, name,
+			)
 		}
 
 		// Check if we can drop the type.
@@ -244,15 +250,17 @@ func (p *planner) dropTypeImpl(
 		return errors.Errorf("type %q is already being dropped", typeDesc.Name)
 	}
 
-	// Add a draining name.
-	typeDesc.DrainingNames = append(typeDesc.DrainingNames, descpb.NameInfo{
-		ParentID:       typeDesc.ParentID,
-		ParentSchemaID: typeDesc.ParentSchemaID,
-		Name:           typeDesc.Name,
-	})
-
 	// Actually mark the type as dropped.
-	typeDesc.State = descpb.DescriptorState_DROP
+	typeDesc.SetDropped()
+
+	// Delete namespace entry for type.
+	b := p.txn.NewBatch()
+	p.dropNamespaceEntry(ctx, b, typeDesc)
+	if err := p.txn.Run(ctx, b); err != nil {
+		return err
+	}
+
+	// Write updated type descriptor.
 	if queueJob {
 		return p.writeTypeSchemaChange(ctx, typeDesc, jobDesc)
 	}

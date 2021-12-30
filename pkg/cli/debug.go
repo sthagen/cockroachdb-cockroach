@@ -31,6 +31,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -93,10 +94,10 @@ Create a ballast file to fill the store directory up to a given amount
 	RunE: runDebugBallast,
 }
 
-// PopulateRocksDBConfigHook is a callback set by CCL code.
-// It populates any needed fields in the RocksDBConfig.
+// PopulateStorageConfigHook is a callback set by CCL code.
+// It populates any needed fields in the StorageConfig.
 // It must do nothing in OSS code.
-var PopulateRocksDBConfigHook func(*base.StorageConfig) error
+var PopulateStorageConfigHook func(*base.StorageConfig) error
 
 func parsePositiveInt(arg string) (int64, error) {
 	i, err := strconv.ParseInt(arg, 10, 64)
@@ -145,7 +146,7 @@ func (opts OpenEngineOptions) configOptions() []storage.ConfigOption {
 	return cfgOpts
 }
 
-// OpenExistingStore opens the rocksdb engine rooted at 'dir'.
+// OpenExistingStore opens the Pebble engine rooted at 'dir'.
 // If 'readOnly' is true, opens the store in read-only mode.
 func OpenExistingStore(dir string, stopper *stop.Stopper, readOnly bool) (storage.Engine, error) {
 	return OpenEngine(dir, stopper, OpenEngineOptions{ReadOnly: readOnly, MustExist: true})
@@ -163,7 +164,7 @@ func OpenEngine(dir string, stopper *stop.Stopper, opts OpenEngineOptions) (stor
 		storage.MaxOpenFiles(int(maxOpenFiles)),
 		storage.CacheSize(server.DefaultCacheSize),
 		storage.Settings(serverCfg.Settings),
-		storage.Hook(PopulateRocksDBConfigHook),
+		storage.Hook(PopulateStorageConfigHook),
 		storage.CombineOptions(opts.configOptions()...))
 	if err != nil {
 		return nil, err
@@ -600,14 +601,14 @@ var debugDecodeProtoCmd = &cobra.Command{
 Read from stdin and attempt to decode any hex or base64 encoded proto fields and
 output them as JSON. All other fields will be outputted unchanged. Output fields
 will be separated by tabs.
-	
+
 The default value for --schema is 'cockroach.sql.sqlbase.Descriptor'.
 For example:
 
 $ decode-proto < cat debug/system.decsriptor.txt
 id	descriptor	hex_descriptor
 1	\022!\012\006system\020\001\032\025\012\011\012\005admin\0200\012\010\012\004root\0200	{"database": {"id": 1, "modificationTime": {}, "name": "system", "privileges": {"users": [{"privileges": 48, "user": "admin"}, {"privileges": 48, "user": "root"}]}}}
-...	
+...
 `,
 	Args: cobra.ArbitraryArgs,
 	RunE: runDebugDecodeProto,
@@ -955,9 +956,6 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, drainingInfo))
-		} else if strings.HasPrefix(key, gossip.KeyTableStatAddedPrefix) {
-			gossipedTime := timeutil.Unix(0, info.OrigStamp)
-			output = append(output, fmt.Sprintf("%q: %v", key, gossipedTime))
 		} else if strings.HasPrefix(key, gossip.KeyGossipClientsPrefix) {
 			output = append(output, fmt.Sprintf("%q: %v", key, string(bytes)))
 		}
@@ -1123,7 +1121,7 @@ func removeDeadReplicas(
 
 	var newDescs []roachpb.RangeDescriptor
 
-	err = kvserver.IterateRangeDescriptors(ctx, db, func(desc roachpb.RangeDescriptor) error {
+	err = kvserver.IterateRangeDescriptorsFromDisk(ctx, db, func(desc roachpb.RangeDescriptor) error {
 		numDeadPeers := 0
 		allReplicas := desc.Replicas().Descriptors()
 		maxLiveVoter := roachpb.StoreID(-1)
@@ -1339,6 +1337,10 @@ matching via flags. If the filter regexp contains captures, such as
 	RunE: runDebugMergeLogs,
 }
 
+// filePattern matches log file paths. Redeclared here from the log package
+// due to significant test breakage when adding the fpath named capture group.
+const logFilePattern = "^(?:(?P<fpath>.*)/)?" + log.FileNamePattern + "$"
+
 // TODO(knz): this struct belongs elsewhere.
 // See: https://github.com/cockroachdb/cockroach/issues/49509
 var debugMergeLogsOpts = struct {
@@ -1347,25 +1349,26 @@ var debugMergeLogsOpts = struct {
 	filter         *regexp.Regexp
 	program        *regexp.Regexp
 	file           *regexp.Regexp
-	prefix         string
 	keepRedactable bool
+	prefix         string
 	redactInput    bool
 	format         string
 	useColor       forceColor
 }{
 	program:        nil, // match everything
-	file:           regexp.MustCompile(log.FilePattern),
+	file:           regexp.MustCompile(logFilePattern),
 	keepRedactable: true,
 	redactInput:    false,
 }
 
 func runDebugMergeLogs(cmd *cobra.Command, args []string) error {
 	o := debugMergeLogsOpts
+	p := newFilePrefixer(withTemplate(o.prefix))
 
 	inputEditMode := log.SelectEditMode(o.redactInput, o.keepRedactable)
 
 	s, err := newMergedStreamFromPatterns(context.Background(),
-		args, o.file, o.program, o.from, o.to, inputEditMode, o.format)
+		args, o.file, o.program, o.from, o.to, inputEditMode, o.format, p)
 	if err != nil {
 		return err
 	}
@@ -1403,7 +1406,7 @@ func runDebugMergeLogs(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	return writeLogStream(s, outStream, o.filter, o.prefix, o.keepRedactable, cp)
+	return writeLogStream(s, outStream, o.filter, o.keepRedactable, cp)
 }
 
 var debugIntentCount = &cobra.Command{
@@ -1499,10 +1502,10 @@ func runDebugIntentCount(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// DebugCmdsForRocksDB lists debug commands that access rocksdb through the engine
+// DebugCommandsRequiringEncryption lists debug commands that access Pebble through the engine
 // and need encryption flags (injected by CCL code).
-// Note: do NOT include commands that just call rocksdb code without setting up an engine.
-var DebugCmdsForRocksDB = []*cobra.Command{
+// Note: do NOT include commands that just call Pebble code without setting up an engine.
+var DebugCommandsRequiringEncryption = []*cobra.Command{
 	debugCheckStoreCmd,
 	debugCompactCmd,
 	debugGCCmd,
@@ -1512,10 +1515,21 @@ var DebugCmdsForRocksDB = []*cobra.Command{
 	debugRangeDataCmd,
 	debugRangeDescriptorsCmd,
 	debugUnsafeRemoveDeadReplicasCmd,
+	debugRecoverCollectInfoCmd,
+	debugRecoverExecuteCmd,
 }
 
-// All other debug commands go here.
-var debugCmds = append(DebugCmdsForRocksDB,
+// Debug commands. All commands in this list to be added to root debug command.
+var debugCmds = []*cobra.Command{
+	debugCheckStoreCmd,
+	debugCompactCmd,
+	debugGCCmd,
+	debugIntentCount,
+	debugKeysCmd,
+	debugRaftLogCmd,
+	debugRangeDataCmd,
+	debugRangeDescriptorsCmd,
+	debugUnsafeRemoveDeadReplicasCmd,
 	debugBallastCmd,
 	debugCheckLogConfigCmd,
 	debugDecodeKeyCmd,
@@ -1530,7 +1544,9 @@ var debugCmds = append(DebugCmdsForRocksDB,
 	debugMergeLogsCmd,
 	debugListFilesCmd,
 	debugResetQuorumCmd,
-)
+	debugSendKVBatchCmd,
+	debugRecoverCmd,
+}
 
 // DebugCmd is the root of all debug commands. Exported to allow modification by CCL code.
 var DebugCmd = &cobra.Command{
@@ -1541,7 +1557,7 @@ var DebugCmd = &cobra.Command{
 These commands are useful for extracting data from the data files of a
 process that has failed and cannot restart.
 `,
-	RunE: usageAndErr,
+	RunE: UsageAndErr,
 }
 
 // mvccValueFormatter is a fmt.Formatter for MVCC values.
@@ -1595,7 +1611,7 @@ func init() {
 		return lockValueFormatter{value: value}
 	}
 
-	// To be able to read Cockroach-written RocksDB manifests/SSTables, comparator
+	// To be able to read Cockroach-written Pebble manifests/SSTables, comparator
 	// and merger functions must be specified to pebble that match the ones used
 	// to write those files.
 	pebbleTool := tool.New(tool.Mergers(storage.MVCCMerger),
@@ -1627,6 +1643,22 @@ func init() {
 	f = debugUnsafeRemoveDeadReplicasCmd.Flags()
 	f.IntSliceVar(&removeDeadReplicasOpts.deadStoreIDs, "dead-store-ids", nil,
 		"list of dead store IDs")
+
+	f = debugRecoverCollectInfoCmd.Flags()
+	f.VarP(&debugRecoverCollectInfoOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
+
+	f = debugRecoverPlanCmd.Flags()
+	f.StringVarP(&debugRecoverPlanOpts.outputFileName, "plan", "o", "",
+		"filename to write plan to")
+	f.IntSliceVar(&debugRecoverPlanOpts.deadStoreIDs, "dead-store-ids", nil,
+		"list of dead store IDs")
+	f.VarP(&debugRecoverPlanOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
+		cliflags.ConfirmActions.Usage())
+
+	f = debugRecoverExecuteCmd.Flags()
+	f.VarP(&debugRecoverExecuteOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
+	f.VarP(&debugRecoverExecuteOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
+		cliflags.ConfirmActions.Usage())
 
 	f = debugMergeLogsCmd.Flags()
 	f.Var(flagutil.Time(&debugMergeLogsOpts.from), "from",
@@ -1688,8 +1720,8 @@ func pebbleCryptoInitializer() error {
 		Dir:      serverCfg.Stores.Specs[0].Path,
 	}
 
-	if PopulateRocksDBConfigHook != nil {
-		if err := PopulateRocksDBConfigHook(&storageConfig); err != nil {
+	if PopulateStorageConfigHook != nil {
+		if err := PopulateStorageConfigHook(&storageConfig); err != nil {
 			return err
 		}
 	}

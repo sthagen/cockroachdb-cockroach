@@ -21,9 +21,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
@@ -64,18 +66,18 @@ func runTLP(ctx context.Context, t test.Test, c cluster.Cluster) {
 		fmt.Fprint(tlpLog, "\n\n")
 	}
 
-	conn := c.Conn(ctx, 1)
+	conn := c.Conn(ctx, t.L(), 1)
 
-	rnd, seed := randutil.NewPseudoRand()
+	rnd, seed := randutil.NewTestRand()
 	t.L().Printf("seed: %d", seed)
 
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 	if err := c.PutLibraries(ctx, "./lib"); err != nil {
 		t.Fatalf("could not initialize libraries: %v", err)
 	}
-	c.Start(ctx)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-	setup := sqlsmith.Setups["rand-tables"](rnd)
+	setup := sqlsmith.Setups[sqlsmith.RandTableSetupName](rnd)
 
 	t.Status("executing setup")
 	t.L().Printf("setup:\n%s", setup)
@@ -155,12 +157,11 @@ func runMutationStatement(conn *gosql.DB, smither *sqlsmith.Smither, logStmt fun
 	})
 }
 
-// runTLPQuery runs two queries to perform TLP. If the results of the query are
-// not equal, an error is returned. Currently GenerateTLP always returns
-// unpartitioned and partitioned queries of the form "SELECT count(*) ...". The
-// resulting counts of the queries are compared in order to verify logical
-// correctness. See GenerateTLP for more information on TLP and the generated
-// queries.
+// runTLPQuery runs two queries to perform TLP. One is partitioned and one is
+// unpartitioned. If the results of the queries are not equal, an error is
+// returned. GenerateTLP also returns any placeholder arguments needed for the
+// partitioned query. See GenerateTLP for more information on TLP and the
+// generated queries.
 func runTLPQuery(conn *gosql.DB, smither *sqlsmith.Smither, logStmt func(string)) error {
 	// Ignore panics from GenerateTLP.
 	defer func() {
@@ -169,7 +170,7 @@ func runTLPQuery(conn *gosql.DB, smither *sqlsmith.Smither, logStmt func(string)
 		}
 	}()
 
-	unpartitioned, partitioned := smither.GenerateTLP()
+	unpartitioned, partitioned, args := smither.GenerateTLP()
 
 	return runWithTimeout(func() error {
 		rows1, err := conn.Query(unpartitioned)
@@ -185,7 +186,7 @@ func runTLPQuery(conn *gosql.DB, smither *sqlsmith.Smither, logStmt func(string)
 			//nolint:returnerrcheck
 			return nil
 		}
-		rows2, err := conn.Query(partitioned)
+		rows2, err := conn.Query(partitioned, args...)
 		if err != nil {
 			// Ignore errors.
 			//nolint:returnerrcheck
@@ -203,8 +204,8 @@ func runTLPQuery(conn *gosql.DB, smither *sqlsmith.Smither, logStmt func(string)
 			logStmt(unpartitioned)
 			logStmt(partitioned)
 			return errors.Newf(
-				"expected unpartitioned results to equal partitioned results\n%s\nsql: %s\n%s",
-				diff, unpartitioned, partitioned)
+				"expected unpartitioned and partitioned results to be equal\n%s\nsql: %s\n%s\nwith args: %s",
+				diff, unpartitioned, partitioned, args)
 		}
 		return nil
 	})

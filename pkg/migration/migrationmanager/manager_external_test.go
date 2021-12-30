@@ -150,8 +150,8 @@ RETURNING id;`).Scan(&secondID))
 	// another job. We'll make sure this happens by polling the trace to see
 	// the log line indicating what we want.
 	tr := tc.Server(0).TracerI().(*tracing.Tracer)
-	recCtx, getRecording, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test")
-	defer cancel()
+	recCtx, sp := tr.StartSpanCtx(ctx, "test", tracing.WithRecording(tracing.RecordingVerbose))
+	defer sp.Finish()
 	upgrade2Err := make(chan error, 1)
 	go func() {
 		// Use an internal executor to get access to the trace as it happens.
@@ -161,24 +161,23 @@ RETURNING id;`).Scan(&secondID))
 	}()
 
 	testutils.SucceedsSoon(t, func() error {
-		// TODO(yuzefovich): this check is quite unfortunate since it relies on
-		// the assumption that all recordings from the child spans are imported
-		// into the tracer. However, this is not the case for the DistSQL
-		// processors where child spans are created with
-		// WithParentAndManualCollection option which requires explicitly
-		// importing the recordings from the children. This only happens when
-		// the execution flow is drained which cannot happen until we close
-		// the 'unblock' channel, and this we cannot do until we see the
-		// expected message in the trace.
+		// TODO(yuzefovich): this check is quite unfortunate since it relies on the
+		// assumption that all recordings from the child spans are imported into the
+		// tracer. However, this is not the case for the DistSQL processors whose
+		// recordings require explicit importing. This only happens when the
+		// execution flow is drained which cannot happen until we close the
+		// 'unblock' channel, and this we cannot do until we see the expected
+		// message in the trace.
 		//
 		// At the moment it works in a very fragile manner (by making sure that
 		// no processors actually create their own spans). Instead, a different
 		// way to observe the status of the migration manager should be
 		// introduced and should be used here.
-		if tracing.FindMsgInRecording(getRecording(), "found existing migration job") > 0 {
+		rec := sp.GetRecording(tracing.RecordingVerbose)
+		if tracing.FindMsgInRecording(rec, "found existing migration job") > 0 {
 			return nil
 		}
-		return errors.Errorf("waiting for job to be discovered: %v", getRecording())
+		return errors.Errorf("waiting for job to be discovered: %v", rec)
 	})
 	close(unblock)
 	require.NoError(t, <-upgrade1Err)
@@ -467,9 +466,11 @@ SELECT id
 	// The upgrade should not be done.
 	select {
 	case err := <-upgrade1Err:
-		t.Fatalf("did not expect the first upgrade to finish: %v", err)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "paused before it completed")
 	case err := <-upgrade2Err:
-		t.Fatalf("did not expect the second upgrade to finish: %v", err)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "paused before it completed")
 	case <-ch:
 		t.Fatalf("did not expect the job to run again")
 	case <-time.After(10 * time.Millisecond):
@@ -483,12 +484,14 @@ SELECT id
 	tdb.Exec(t, "RESUME JOB $1", id)
 	ev = <-ch
 	close(ev.unblock)
-	require.NoError(t, <-upgrade1Err)
-	require.NoError(t, <-upgrade2Err)
+	_, err := sqlDB.ExecContext(ctx, `SET CLUSTER SETTING version = $1`, endCV.String())
+	require.NoError(t, err)
 }
 
 // Test that the precondition prevents migrations from being run.
 func TestPrecondition(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Start by running v0. We want the precondition of v1 to prevent
 	// us from reaching v1 (or v2). We want the precondition to not be

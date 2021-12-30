@@ -119,6 +119,7 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"sys.cpu.sys.ns",
 					"sys.cpu.user.ns",
+					"sys.cpu.now.ns",
 				},
 			},
 		},
@@ -150,6 +151,12 @@ var charts = []sectionDescription{
 				Downsampler: DescribeAggregator_MAX,
 				Percentiles: false,
 				Metrics:     []string{"node-id"},
+			},
+			{
+				Title:       "License TTL",
+				Downsampler: DescribeAggregator_MIN,
+				Percentiles: false,
+				Metrics:     []string{"seconds_until_enterprise_license_expiry"},
 			},
 		},
 	},
@@ -278,6 +285,66 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Batch RPCs Received",
+				Metrics: []string{
+					"rpc.batches.recv",
+				},
+			},
+			{
+				Title: "Batch Requests Received",
+				Metrics: []string{
+					"rpc.method.addsstable.recv",
+					"rpc.method.adminchangereplicas.recv",
+					"rpc.method.adminmerge.recv",
+					"rpc.method.adminrelocaterange.recv",
+					"rpc.method.adminscatter.recv",
+					"rpc.method.adminsplit.recv",
+					"rpc.method.admintransferlease.recv",
+					"rpc.method.adminunsplit.recv",
+					"rpc.method.adminverifyprotectedtimestamp.recv",
+					"rpc.method.barrier.recv",
+					"rpc.method.checkconsistency.recv",
+					"rpc.method.clearrange.recv",
+					"rpc.method.computechecksum.recv",
+					"rpc.method.conditionalput.recv",
+					"rpc.method.delete.recv",
+					"rpc.method.deleterange.recv",
+					"rpc.method.endtxn.recv",
+					"rpc.method.export.recv",
+					"rpc.method.gc.recv",
+					"rpc.method.get.recv",
+					"rpc.method.heartbeattxn.recv",
+					"rpc.method.import.recv",
+					"rpc.method.increment.recv",
+					"rpc.method.initput.recv",
+					"rpc.method.leaseinfo.recv",
+					"rpc.method.merge.recv",
+					"rpc.method.migrate.recv",
+					"rpc.method.probe.recv",
+					"rpc.method.pushtxn.recv",
+					"rpc.method.put.recv",
+					"rpc.method.queryintent.recv",
+					"rpc.method.queryresolvedtimestamp.recv",
+					"rpc.method.querytxn.recv",
+					"rpc.method.rangestats.recv",
+					"rpc.method.recomputestats.recv",
+					"rpc.method.recovertxn.recv",
+					"rpc.method.refresh.recv",
+					"rpc.method.refreshrange.recv",
+					"rpc.method.requestlease.recv",
+					"rpc.method.resolveintent.recv",
+					"rpc.method.resolveintentrange.recv",
+					"rpc.method.reversescan.recv",
+					"rpc.method.revertrange.recv",
+					"rpc.method.scan.recv",
+					"rpc.method.scaninterleavedintents.recv",
+					"rpc.method.subsume.recv",
+					"rpc.method.transferlease.recv",
+					"rpc.method.truncatelog.recv",
+					"rpc.method.writebatch.recv",
+				},
+			},
+			{
 				Title: "Requests",
 				Metrics: []string{
 					"distsender.rpc.addsstable.sent",
@@ -326,6 +393,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.scaninterleavedintents.sent",
 					"distsender.rpc.subsume.sent",
 					"distsender.rpc.transferlease.sent",
+					"distsender.rpc.probe.sent",
 					"distsender.rpc.truncatelog.sent",
 					"distsender.rpc.writebatch.sent",
 				},
@@ -359,6 +427,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.err.notleaseholdererrtype",
 					"distsender.rpc.err.oprequirestxnerrtype",
 					"distsender.rpc.err.optimisticevalconflictserrtype",
+					"distsender.rpc.err.refreshfailederrtype",
 					"distsender.rpc.err.raftgroupdeletederrtype",
 					"distsender.rpc.err.rangefeedretryerrtype",
 					"distsender.rpc.err.rangekeymismatcherrtype",
@@ -655,7 +724,7 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{KVTransactionLayer, "Garbage Collection (GC)", "Keys"}},
+		Organization: [][]string{{KVTransactionLayer, "MVCC Garbage Collection (GC)", "Keys"}},
 		Charts: []chartDescription{
 			{
 				Title: "AbortSpan",
@@ -1524,6 +1593,7 @@ var charts = []sectionDescription{
 				Title: "Count",
 				Metrics: []string{
 					"replicas.quiescent",
+					"replicas.uninitialized",
 					"replicas",
 					"replicas.reserved",
 				},
@@ -1624,6 +1694,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total",
 				Metrics: []string{"sql.distsql.flows.total"},
+			},
+			{
+				Title:   "Scheduled",
+				Metrics: []string{"sql.distsql.flows.scheduled"},
 			},
 		},
 	},
@@ -1773,26 +1847,6 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.stats.discarded.current"},
 			},
 			{
-				Title:   "Memory usage for internal fingerprint storage",
-				Metrics: []string{"sql.stats.mem.max.internal"},
-			},
-			{
-				Title:   "Current memory usage for internal fingerprint storage",
-				Metrics: []string{"sql.stats.mem.current.internal"},
-			},
-			{
-				Title:   "Memory usage for internal reported fingerprint storage",
-				Metrics: []string{"sql.stats.reported.mem.max.internal"},
-			},
-			{
-				Title:   "Current memory usage for internal reported fingerprint storage",
-				Metrics: []string{"sql.stats.reported.mem.current.internal"},
-			},
-			{
-				Title:   "Number of internal fingerprint statistics being discarded",
-				Metrics: []string{"sql.stats.discarded.current.internal"},
-			},
-			{
 				Title:   "Number of times SQL Stats are flushed to persistent storage",
 				Metrics: []string{"sql.stats.flush.count"},
 			},
@@ -1805,24 +1859,8 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.stats.flush.duration"},
 			},
 			{
-				Title:   "Number of times internal SQL Stats are flushed to persistent storage",
-				Metrics: []string{"sql.stats.flush.count.internal"},
-			},
-			{
-				Title:   "Number of errors encountered when flushing internal SQL Stats",
-				Metrics: []string{"sql.stats.flush.error.internal"},
-			},
-			{
-				Title:   "Time took to complete internal SQL Stats flush",
-				Metrics: []string{"sql.stats.flush.duration.internal"},
-			},
-			{
 				Title:   "Number of stale statement/transaction roles removed by cleanup job",
 				Metrics: []string{"sql.stats.cleanup.rows_removed"},
-			},
-			{
-				Title:   "Number of internal stale statement/transaction roles removed by cleanup job",
-				Metrics: []string{"sql.stats.cleanup.rows_removed.internal"},
 			},
 		},
 	},
@@ -2400,6 +2438,7 @@ var charts = []sectionDescription{
 					"addsstable.copies",
 					"addsstable.applications",
 					"addsstable.proposals",
+					"addsstable.aswrites",
 				},
 			},
 			{
@@ -2589,6 +2628,7 @@ var charts = []sectionDescription{
 					"jobs.migration.currently_running",
 					"jobs.auto_span_config_reconciliation.currently_running",
 					"jobs.auto_sql_stats_compaction.currently_running",
+					"jobs.stream_replication.currently_running",
 				},
 			},
 			{
@@ -2720,6 +2760,17 @@ var charts = []sectionDescription{
 					"jobs.stream_ingestion.resume_completed",
 					"jobs.stream_ingestion.resume_failed",
 					"jobs.stream_ingestion.resume_retry_error",
+				},
+			},
+			{
+				Title: "Stream Replication",
+				Metrics: []string{
+					"jobs.stream_replication.fail_or_cancel_completed",
+					"jobs.stream_replication.fail_or_cancel_failed",
+					"jobs.stream_replication.fail_or_cancel_retry_error",
+					"jobs.stream_replication.resume_completed",
+					"jobs.stream_replication.resume_failed",
+					"jobs.stream_replication.resume_retry_error",
 				},
 			},
 			{

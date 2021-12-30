@@ -15,7 +15,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
@@ -47,17 +46,19 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 		return nil, err
 	}
 
-	grantees, err := n.Grantees.ToSQLUsernames(p.SessionData())
+	grantees, err := n.Grantees.ToSQLUsernames(p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return nil, err
 	}
+
 	return &changePrivilegesNode{
-		isGrant:      true,
-		targets:      n.Targets,
-		grantees:     grantees,
-		desiredprivs: n.Privileges,
+		isGrant:         true,
+		withGrantOption: n.WithGrantOption,
+		targets:         n.Targets,
+		grantees:        grantees,
+		desiredprivs:    n.Privileges,
 		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, privileges privilege.List, grantee security.SQLUsername) {
-			privDesc.Grant(grantee, privileges)
+			privDesc.Grant(grantee, privileges, n.WithGrantOption)
 		},
 		grantOn:          grantOn,
 		granteesNameList: n.Grantees,
@@ -77,17 +78,18 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 		return nil, err
 	}
 
-	grantees, err := n.Grantees.ToSQLUsernames(p.SessionData())
+	grantees, err := n.Grantees.ToSQLUsernames(p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return nil, err
 	}
 	return &changePrivilegesNode{
-		isGrant:      false,
-		targets:      n.Targets,
-		grantees:     grantees,
-		desiredprivs: n.Privileges,
+		isGrant:         false,
+		withGrantOption: n.GrantOptionFor,
+		targets:         n.Targets,
+		grantees:        grantees,
+		desiredprivs:    n.Privileges,
 		changePrivilege: func(privDesc *descpb.PrivilegeDescriptor, privileges privilege.List, grantee security.SQLUsername) {
-			privDesc.Revoke(grantee, privileges, grantOn)
+			privDesc.Revoke(grantee, privileges, grantOn, n.GrantOptionFor)
 		},
 		grantOn:          grantOn,
 		granteesNameList: n.Grantees,
@@ -96,6 +98,7 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 
 type changePrivilegesNode struct {
 	isGrant         bool
+	withGrantOption bool
 	targets         tree.TargetList
 	grantees        []security.SQLUsername
 	desiredprivs    privilege.List
@@ -119,6 +122,18 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 
 	if err := p.validateRoles(ctx, n.grantees, true /* isPublicValid */); err != nil {
 		return err
+	}
+	// The public role is not allowed to have grant options.
+	if n.isGrant && n.withGrantOption {
+		for _, grantee := range n.grantees {
+			if grantee.IsPublicRole() {
+				return pgerror.Newf(
+					pgcode.InvalidGrantOperation,
+					"grant options cannot be granted to %q role",
+					security.PublicRoleName(),
+				)
+			}
+		}
 	}
 
 	var err error
@@ -162,26 +177,69 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		if n.isGrant {
 			op = "GRANT"
 		}
-		if descriptor.GetID() < keys.MinUserDescID {
+		if catalog.IsSystemDescriptor(descriptor) {
 			return pgerror.Newf(pgcode.InsufficientPrivilege, "cannot %s on system object", op)
 		}
 
-		if err := p.CheckPrivilege(ctx, descriptor, privilege.GRANT); err != nil {
-			return err
+		// The check for GRANT is only needed before the v22.1 upgrade is finalized.
+		// Otherwise, we check grant options later in this function.
+		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
+			if err := p.CheckPrivilege(ctx, descriptor, privilege.GRANT); err != nil {
+				return err
+			}
 		}
 
 		if len(n.desiredprivs) > 0 {
 			// Only allow granting/revoking privileges that the requesting
 			// user themselves have on the descriptor.
+
+			grantPresent, allPresent := false, false
 			for _, priv := range n.desiredprivs {
 				if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
 					return err
 				}
+				grantPresent = grantPresent || priv == privilege.GRANT
+				allPresent = allPresent || priv == privilege.ALL
+			}
+			privileges := descriptor.GetPrivileges()
+
+			if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
+				err := p.CheckGrantOptionsForUser(ctx, descriptor, n.desiredprivs, n.isGrant)
+				if err != nil {
+					return err
+				}
+
+				noticeMessage := ""
+				// we only output the message for ALL privilege if it is being granted without the WITH GRANT OPTION flag
+				// if GRANT privilege is involved, we must always output the message
+				if allPresent && n.isGrant && !n.withGrantOption {
+					noticeMessage = "grant options were automatically applied but this behavior is deprecated"
+				} else if grantPresent {
+					noticeMessage = "the GRANT privilege is deprecated"
+				}
+
+				if len(noticeMessage) > 0 {
+					params.p.noticeSender.BufferNotice(
+						errors.WithHint(
+							pgnotice.Newf("%s", noticeMessage),
+							"please use WITH GRANT OPTION",
+						),
+					)
+				}
 			}
 
-			privileges := descriptor.GetPrivileges()
 			for _, grantee := range n.grantees {
 				n.changePrivilege(privileges, n.desiredprivs, grantee)
+
+				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
+					if grantPresent || allPresent {
+						if n.isGrant {
+							privileges.GrantPrivilegeToGrantOptions(grantee, true /*isGrant*/)
+						} else if !n.isGrant && !n.withGrantOption {
+							privileges.GrantPrivilegeToGrantOptions(grantee, false /*isGrant*/)
+						}
+					}
+				}
 			}
 
 			// Ensure superusers have exactly the allowed privilege set.

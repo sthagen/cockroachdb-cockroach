@@ -22,11 +22,16 @@ type MutationOp interface {
 
 // MutationVisitor is a visitor for MutationOp operations.
 type MutationVisitor interface {
+	NotImplemented(context.Context, NotImplemented) error
 	MakeAddedIndexDeleteOnly(context.Context, MakeAddedIndexDeleteOnly) error
 	MakeAddedIndexDeleteAndWriteOnly(context.Context, MakeAddedIndexDeleteAndWriteOnly) error
+	MakeAddedSecondaryIndexPublic(context.Context, MakeAddedSecondaryIndexPublic) error
 	MakeAddedPrimaryIndexPublic(context.Context, MakeAddedPrimaryIndexPublic) error
 	MakeDroppedPrimaryIndexDeleteAndWriteOnly(context.Context, MakeDroppedPrimaryIndexDeleteAndWriteOnly) error
-	CreateGcJobForDescriptor(context.Context, CreateGcJobForDescriptor) error
+	CreateGcJobForTable(context.Context, CreateGcJobForTable) error
+	CreateGcJobForDatabase(context.Context, CreateGcJobForDatabase) error
+	CreateGcJobForIndex(context.Context, CreateGcJobForIndex) error
+	MarkDescriptorAsDroppedSynthetically(context.Context, MarkDescriptorAsDroppedSynthetically) error
 	MarkDescriptorAsDropped(context.Context, MarkDescriptorAsDropped) error
 	DrainDescriptorName(context.Context, DrainDescriptorName) error
 	UpdateRelationDeps(context.Context, UpdateRelationDeps) error
@@ -47,6 +52,21 @@ type MutationVisitor interface {
 	AddColumnFamily(context.Context, AddColumnFamily) error
 	DropForeignKeyRef(context.Context, DropForeignKeyRef) error
 	RemoveSequenceOwnedBy(context.Context, RemoveSequenceOwnedBy) error
+	AddIndexPartitionInfo(context.Context, AddIndexPartitionInfo) error
+	LogEvent(context.Context, LogEvent) error
+	SetColumnName(context.Context, SetColumnName) error
+	SetIndexName(context.Context, SetIndexName) error
+	DeleteDescriptor(context.Context, DeleteDescriptor) error
+	DeleteDatabaseSchemaEntry(context.Context, DeleteDatabaseSchemaEntry) error
+	RemoveJobReference(context.Context, RemoveJobReference) error
+	AddJobReference(context.Context, AddJobReference) error
+	CreateDeclarativeSchemaChangerJob(context.Context, CreateDeclarativeSchemaChangerJob) error
+	UpdateSchemaChangerJob(context.Context, UpdateSchemaChangerJob) error
+}
+
+// Visit is part of the MutationOp interface.
+func (op NotImplemented) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.NotImplemented(ctx, op)
 }
 
 // Visit is part of the MutationOp interface.
@@ -60,6 +80,11 @@ func (op MakeAddedIndexDeleteAndWriteOnly) Visit(ctx context.Context, v Mutation
 }
 
 // Visit is part of the MutationOp interface.
+func (op MakeAddedSecondaryIndexPublic) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.MakeAddedSecondaryIndexPublic(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
 func (op MakeAddedPrimaryIndexPublic) Visit(ctx context.Context, v MutationVisitor) error {
 	return v.MakeAddedPrimaryIndexPublic(ctx, op)
 }
@@ -70,8 +95,23 @@ func (op MakeDroppedPrimaryIndexDeleteAndWriteOnly) Visit(ctx context.Context, v
 }
 
 // Visit is part of the MutationOp interface.
-func (op CreateGcJobForDescriptor) Visit(ctx context.Context, v MutationVisitor) error {
-	return v.CreateGcJobForDescriptor(ctx, op)
+func (op CreateGcJobForTable) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.CreateGcJobForTable(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op CreateGcJobForDatabase) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.CreateGcJobForDatabase(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op CreateGcJobForIndex) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.CreateGcJobForIndex(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op MarkDescriptorAsDroppedSynthetically) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.MarkDescriptorAsDroppedSynthetically(ctx, op)
 }
 
 // Visit is part of the MutationOp interface.
@@ -172,4 +212,54 @@ func (op DropForeignKeyRef) Visit(ctx context.Context, v MutationVisitor) error 
 // Visit is part of the MutationOp interface.
 func (op RemoveSequenceOwnedBy) Visit(ctx context.Context, v MutationVisitor) error {
 	return v.RemoveSequenceOwnedBy(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op AddIndexPartitionInfo) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.AddIndexPartitionInfo(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op LogEvent) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.LogEvent(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op SetColumnName) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.SetColumnName(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op SetIndexName) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.SetIndexName(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op DeleteDescriptor) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.DeleteDescriptor(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op DeleteDatabaseSchemaEntry) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.DeleteDatabaseSchemaEntry(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op RemoveJobReference) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.RemoveJobReference(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op AddJobReference) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.AddJobReference(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op CreateDeclarativeSchemaChangerJob) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.CreateDeclarativeSchemaChangerJob(ctx, op)
+}
+
+// Visit is part of the MutationOp interface.
+func (op UpdateSchemaChangerJob) Visit(ctx context.Context, v MutationVisitor) error {
+	return v.UpdateSchemaChangerJob(ctx, op)
 }

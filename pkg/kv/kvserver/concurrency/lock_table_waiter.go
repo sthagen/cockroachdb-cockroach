@@ -36,6 +36,7 @@ import (
 // LockTableLivenessPushDelay sets the delay before pushing in order to detect
 // coordinator failures of conflicting transactions.
 var LockTableLivenessPushDelay = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"kv.lock_table.coordinator_liveness_push_delay",
 	"the delay before pushing in order to detect coordinator failures of conflicting transactions",
 	// This is set to a short duration to ensure that we quickly detect failed
@@ -67,6 +68,7 @@ var LockTableLivenessPushDelay = settings.RegisterDurationSetting(
 // LockTableDeadlockDetectionPushDelay sets the delay before pushing in order to
 // detect dependency cycles between transactions.
 var LockTableDeadlockDetectionPushDelay = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"kv.lock_table.deadlock_detection_push_delay",
 	"the delay before pushing in order to detect dependency cycles between transactions",
 	// This is set to a medium duration to ensure that deadlock caused by
@@ -433,31 +435,6 @@ func (w *lockTableWaiterImpl) WaitOn(
 			return roachpb.NewError(&roachpb.NodeUnavailableError{})
 		}
 	}
-}
-
-// WaitOnLock implements the lockTableWaiter interface.
-func (w *lockTableWaiterImpl) WaitOnLock(
-	ctx context.Context, req Request, intent *roachpb.Intent,
-) *Error {
-	sa, _, err := findAccessInSpans(intent.Key, req.LockSpans)
-	if err != nil {
-		return roachpb.NewError(err)
-	}
-	state := waitingState{
-		kind:        waitFor,
-		txn:         &intent.Txn,
-		key:         intent.Key,
-		held:        true,
-		guardAccess: sa,
-	}
-	if req.LockTimeout != 0 {
-		return doWithTimeoutAndFallback(
-			ctx, req.LockTimeout,
-			func(ctx context.Context) *Error { return w.pushLockTxn(ctx, req, state) },
-			func(ctx context.Context) *Error { return w.pushLockTxnAfterTimeout(ctx, req, state) },
-		)
-	}
-	return w.pushLockTxn(ctx, req, state)
 }
 
 // pushLockTxn pushes the holder of the provided lock.

@@ -13,12 +13,15 @@ package optbuilder
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -90,6 +93,11 @@ func (b *Builder) findIndexByName(table cat.Table, name tree.UnrestrictedName) (
 		if tree.Name(name) == idx.Name() {
 			return idx, nil
 		}
+	}
+	// Fallback to referencing @primary as the PRIMARY KEY.
+	// Note that indexes with "primary" as their name takes precedence above.
+	if name == tabledesc.LegacyPrimaryKeyIndexName {
+		return table.Index(0), nil
 	}
 
 	return nil, pgerror.Newf(pgcode.UndefinedObject,
@@ -166,6 +174,7 @@ func (b *Builder) analyzeOrderByArg(
 			((order.NullsOrder == tree.NullsFirst && order.Direction == tree.Descending) ||
 				(order.NullsOrder == tree.NullsLast && order.Direction != tree.Descending))) {
 		nullsDefaultOrder = false
+		telemetry.Inc(sqltelemetry.OrderByNullsNonStandardCounter)
 	}
 
 	// Analyze the ORDER BY column(s).

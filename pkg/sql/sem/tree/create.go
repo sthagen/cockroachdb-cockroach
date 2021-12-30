@@ -213,7 +213,6 @@ type CreateIndex struct {
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
 	Storing          NameList
-	Interleave       *InterleaveDef
 	PartitionByIndex *PartitionByIndex
 	StorageParams    StorageParams
 	Predicate        Expr
@@ -222,11 +221,14 @@ type CreateIndex struct {
 
 // Format implements the NodeFormatter interface.
 func (node *CreateIndex) Format(ctx *FmtCtx) {
+	// Please also update indexForDisplay function in
+	// pkg/sql/catalog/catformat/index.go if there's any update to index
+	// definition components.
 	ctx.WriteString("CREATE ")
 	if node.Unique {
 		ctx.WriteString("UNIQUE ")
 	}
-	if node.Inverted && !ctx.HasFlags(FmtPGCatalog) {
+	if node.Inverted {
 		ctx.WriteString("INVERTED ")
 	}
 	ctx.WriteString("INDEX ")
@@ -242,14 +244,7 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	}
 	ctx.WriteString("ON ")
 	ctx.FormatNode(&node.Table)
-	if ctx.HasFlags(FmtPGCatalog) {
-		ctx.WriteString(" USING")
-		if node.Inverted {
-			ctx.WriteString(" gin")
-		} else {
-			ctx.WriteString(" btree")
-		}
-	}
+
 	ctx.WriteString(" (")
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
@@ -261,9 +256,6 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&node.Storing)
 		ctx.WriteByte(')')
 	}
-	if node.Interleave != nil {
-		ctx.FormatNode(node.Interleave)
-	}
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
 	}
@@ -273,14 +265,8 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.WriteString(")")
 	}
 	if node.Predicate != nil {
-		if ctx.HasFlags(FmtPGCatalog) {
-			ctx.WriteString(" WHERE (")
-			ctx.FormatNode(node.Predicate)
-			ctx.WriteString(")")
-		} else {
-			ctx.WriteString(" WHERE ")
-			ctx.FormatNode(node.Predicate)
-		}
+		ctx.WriteString(" WHERE ")
+		ctx.FormatNode(node.Predicate)
 	}
 }
 
@@ -553,9 +539,11 @@ func NewColumnTableDef(
 			d.OnUpdateExpr.Expr = t.Expr
 			d.OnUpdateExpr.ConstraintName = c.Name
 		case *GeneratedAlwaysAsIdentity, *GeneratedByDefAsIdentity:
-			if typRef.(*types.T).InternalType.Family != types.IntFamily {
-				return nil, pgerror.Newf(pgcode.InvalidParameterValue,
-					"identity column type must be INT, INT2, or INT4")
+			if typ, ok := typRef.(*types.T); !ok || typ.InternalType.Family != types.IntFamily {
+				return nil, pgerror.Newf(
+					pgcode.InvalidParameterValue,
+					"identity column type must be an INT",
+				)
 			}
 			if d.GeneratedIdentity.IsGeneratedAsIdentity {
 				return nil, pgerror.Newf(pgcode.Syntax,
@@ -937,7 +925,6 @@ type IndexTableDef struct {
 	Columns          IndexElemList
 	Sharded          *ShardedIndexDef
 	Storing          NameList
-	Interleave       *InterleaveDef
 	Inverted         bool
 	PartitionByIndex *PartitionByIndex
 	StorageParams    StorageParams
@@ -965,9 +952,6 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&node.Storing)
 		ctx.WriteByte(')')
 	}
-	if node.Interleave != nil {
-		ctx.FormatNode(node.Interleave)
-	}
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
 	}
@@ -992,6 +976,10 @@ type ConstraintTableDef interface {
 
 	// SetName replaces the name of the definition in-place. Used in the parser.
 	SetName(name Name)
+
+	// SetIfNotExists sets this definition as coming from an
+	// ADD CONSTRAINT IF NOT EXISTS statement. Used in the parser.
+	SetIfNotExists()
 }
 
 func (*UniqueConstraintTableDef) constraintTableDef()     {}
@@ -1004,6 +992,7 @@ type UniqueConstraintTableDef struct {
 	IndexTableDef
 	PrimaryKey   bool
 	WithoutIndex bool
+	IfNotExists  bool
 }
 
 // SetName implements the TableDef interface.
@@ -1011,10 +1000,18 @@ func (node *UniqueConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
 
+// SetIfNotExists implements the ConstraintTableDef interface.
+func (node *UniqueConstraintTableDef) SetIfNotExists() {
+	node.IfNotExists = true
+}
+
 // Format implements the NodeFormatter interface.
 func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Name != "" {
 		ctx.WriteString("CONSTRAINT ")
+		if node.IfNotExists {
+			ctx.WriteString("IF NOT EXISTS ")
+		}
 		ctx.FormatNode(&node.Name)
 		ctx.WriteByte(' ')
 	}
@@ -1036,9 +1033,6 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
 		ctx.WriteByte(')')
-	}
-	if node.Interleave != nil {
-		ctx.FormatNode(node.Interleave)
 	}
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
@@ -1118,18 +1112,22 @@ func (c CompositeKeyMatchMethod) String() string {
 
 // ForeignKeyConstraintTableDef represents a FOREIGN KEY constraint in the AST.
 type ForeignKeyConstraintTableDef struct {
-	Name     Name
-	Table    TableName
-	FromCols NameList
-	ToCols   NameList
-	Actions  ReferenceActions
-	Match    CompositeKeyMatchMethod
+	Name        Name
+	Table       TableName
+	FromCols    NameList
+	ToCols      NameList
+	Actions     ReferenceActions
+	Match       CompositeKeyMatchMethod
+	IfNotExists bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ForeignKeyConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Name != "" {
 		ctx.WriteString("CONSTRAINT ")
+		if node.IfNotExists {
+			ctx.WriteString("IF NOT EXISTS ")
+		}
 		ctx.FormatNode(&node.Name)
 		ctx.WriteByte(' ')
 	}
@@ -1158,12 +1156,18 @@ func (node *ForeignKeyConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
 
+// SetIfNotExists implements the ConstraintTableDef interface.
+func (node *ForeignKeyConstraintTableDef) SetIfNotExists() {
+	node.IfNotExists = true
+}
+
 // CheckConstraintTableDef represents a check constraint within a CREATE
 // TABLE statement.
 type CheckConstraintTableDef struct {
-	Name   Name
-	Expr   Expr
-	Hidden bool
+	Name        Name
+	Expr        Expr
+	Hidden      bool
+	IfNotExists bool
 }
 
 // SetName implements the ConstraintTableDef interface.
@@ -1171,10 +1175,18 @@ func (node *CheckConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
 
+// SetIfNotExists implements the ConstraintTableDef interface.
+func (node *CheckConstraintTableDef) SetIfNotExists() {
+	node.IfNotExists = true
+}
+
 // Format implements the NodeFormatter interface.
 func (node *CheckConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Name != "" {
 		ctx.WriteString("CONSTRAINT ")
+		if node.IfNotExists {
+			ctx.WriteString("IF NOT EXISTS ")
+		}
 		ctx.FormatNode(&node.Name)
 		ctx.WriteByte(' ')
 	}
@@ -1212,32 +1224,6 @@ type ShardedIndexDef struct {
 func (node *ShardedIndexDef) Format(ctx *FmtCtx) {
 	ctx.WriteString(" USING HASH WITH BUCKET_COUNT = ")
 	ctx.FormatNode(node.ShardBuckets)
-}
-
-// InterleaveDef represents an interleave definition within a CREATE TABLE
-// or CREATE INDEX statement.
-type InterleaveDef struct {
-	Parent       TableName
-	Fields       NameList
-	DropBehavior DropBehavior
-}
-
-// Format implements the NodeFormatter interface.
-func (node *InterleaveDef) Format(ctx *FmtCtx) {
-	ctx.WriteString(" INTERLEAVE IN PARENT ")
-	ctx.FormatNode(&node.Parent)
-	ctx.WriteString(" (")
-	for i := range node.Fields {
-		if i > 0 {
-			ctx.WriteString(", ")
-		}
-		ctx.FormatNode(&node.Fields[i])
-	}
-	ctx.WriteString(")")
-	if node.DropBehavior != DropDefault {
-		ctx.WriteString(" ")
-		ctx.WriteString(node.DropBehavior.String())
-	}
 }
 
 // PartitionByType is an enum of each type of partitioning (LIST/RANGE).
@@ -1429,7 +1415,6 @@ const (
 type CreateTable struct {
 	IfNotExists      bool
 	Table            TableName
-	Interleave       *InterleaveDef
 	PartitionByTable *PartitionByTable
 	Persistence      Persistence
 	StorageParams    StorageParams
@@ -1495,9 +1480,6 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		ctx.WriteString(" (")
 		ctx.FormatNode(&node.Defs)
 		ctx.WriteByte(')')
-		if node.Interleave != nil {
-			ctx.FormatNode(node.Interleave)
-		}
 		if node.PartitionByTable != nil {
 			ctx.FormatNode(node.PartitionByTable)
 		}
@@ -1629,6 +1611,10 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 		option := &(*node)[i]
 		ctx.WriteByte(' ')
 		switch option.Name {
+		case SeqOptAs:
+			ctx.WriteString(option.Name)
+			ctx.WriteByte(' ')
+			ctx.WriteString(option.AsIntegerType.SQLString())
 		case SeqOptCycle, SeqOptNoCycle:
 			ctx.WriteString(option.Name)
 		case SeqOptCache:
@@ -1702,6 +1688,9 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 // SequenceOption represents an option on a CREATE SEQUENCE statement.
 type SequenceOption struct {
 	Name string
+
+	// AsIntegerType specifies default min and max values of a sequence.
+	AsIntegerType *types.T
 
 	IntVal *int64
 
@@ -1809,7 +1798,9 @@ func (o KVOptions) ToRoleOptions(
 	roleOptions := make(roleoption.List, len(o))
 
 	for i, ro := range o {
-		option, err := roleoption.ToOption(ro.Key.String())
+		// Role options are always stored as keywords in ro.Key by the
+		// parser.
+		option, err := roleoption.ToOption(string(ro.Key))
 		if err != nil {
 			return nil, err
 		}
@@ -1842,23 +1833,21 @@ func (o KVOptions) ToRoleOptions(
 
 func (o *KVOptions) formatAsRoleOptions(ctx *FmtCtx) {
 	for _, option := range *o {
-		ctx.WriteString(" ")
-		ctx.WriteString(
-			// "_" replaces space (" ") in YACC for handling tree.Name formatting.
-			strings.ReplaceAll(
-				strings.ToUpper(option.Key.String()), "_", " "),
-		)
+		ctx.WriteByte(' ')
+		// Role option keys are always sequences of keywords separated
+		// by spaces.
+		ctx.WriteString(strings.ToUpper(string(option.Key)))
 
 		// Password is a special case.
-		if strings.ToUpper(option.Key.String()) == "PASSWORD" {
-			ctx.WriteString(" ")
+		if strings.HasSuffix(string(option.Key), "password") {
+			ctx.WriteByte(' ')
 			if ctx.flags.HasFlags(FmtShowPasswords) {
 				ctx.FormatNode(option.Value)
 			} else {
 				ctx.WriteString(PasswordSubstitution)
 			}
 		} else if option.Value != nil {
-			ctx.WriteString(" ")
+			ctx.WriteByte(' ')
 			if ctx.HasFlags(FmtHideConstants) {
 				ctx.WriteString("'_'")
 			} else {
@@ -1870,7 +1859,7 @@ func (o *KVOptions) formatAsRoleOptions(ctx *FmtCtx) {
 
 // CreateRole represents a CREATE ROLE statement.
 type CreateRole struct {
-	Name        Expr
+	Name        RoleSpec
 	IfNotExists bool
 	IsRole      bool
 	KVOptions   KVOptions
@@ -1887,7 +1876,7 @@ func (node *CreateRole) Format(ctx *FmtCtx) {
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
-	ctx.FormatNode(node.Name)
+	ctx.FormatNode(&node.Name)
 
 	if len(node.KVOptions) > 0 {
 		ctx.WriteString(" WITH")

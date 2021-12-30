@@ -70,7 +70,7 @@ const (
 // aggType is a helper struct that allows tests to test both the ordered and
 // hash aggregators at the same time.
 type aggType struct {
-	new   func(*colexecagg.NewAggregatorArgs) (colexecop.ResettableOperator, error)
+	new   func(*colexecagg.NewAggregatorArgs) colexecop.ResettableOperator
 	name  string
 	order ordering
 }
@@ -79,7 +79,7 @@ var aggTypesWithPartial = []aggType{
 	{
 		// This is a wrapper around NewHashAggregator so its signature is
 		// compatible with NewOrderedAggregator.
-		new: func(args *colexecagg.NewAggregatorArgs) (colexecop.ResettableOperator, error) {
+		new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 			return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, math.MaxInt64)
 		},
 		name:  "hash",
@@ -93,7 +93,7 @@ var aggTypesWithPartial = []aggType{
 	{
 		// This is a wrapper around NewHashAggregator so its signature is
 		// compatible with NewOrderedAggregator.
-		new: func(args *colexecagg.NewAggregatorArgs) (colexecop.ResettableOperator, error) {
+		new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 			return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, math.MaxInt64)
 		},
 		name:  "hash-partial-order",
@@ -815,7 +815,7 @@ func TestAggregators(t *testing.T) {
 						Constructors:   constructors,
 						ConstArguments: constArguments,
 						OutputTypes:    outputTypes,
-					})
+					}), nil
 				})
 		}
 	}
@@ -829,7 +829,7 @@ func TestAggregatorRandom(t *testing.T) {
 	defer evalCtx.Stop(context.Background())
 	// This test aggregates random inputs, keeping track of the expected results
 	// to make sure the aggregations are correct.
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	for _, groupSize := range []int{1, 2, coldata.BatchSize() / 4, coldata.BatchSize() / 2} {
 		if groupSize == 0 {
 			// We might be varying coldata.BatchSize() so that when it is divided by
@@ -932,7 +932,7 @@ func TestAggregatorRandom(t *testing.T) {
 						&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 					)
 					require.NoError(t, err)
-					a, err := agg.new(&colexecagg.NewAggregatorArgs{
+					a := agg.new(&colexecagg.NewAggregatorArgs{
 						Allocator:      testAllocator,
 						MemAccount:     testMemAcc,
 						Input:          source,
@@ -943,9 +943,6 @@ func TestAggregatorRandom(t *testing.T) {
 						ConstArguments: constArguments,
 						OutputTypes:    outputTypes,
 					})
-					if err != nil {
-						t.Fatal(err)
-					}
 					a.Init(context.Background())
 
 					testOutput := colexectestutils.NewOpTestOutput(a, expectedTuples)
@@ -1001,7 +998,7 @@ func benchmarkAggregateFunction(
 			return
 		}
 	}
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	ctx := context.Background()
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
@@ -1073,10 +1070,11 @@ func benchmarkAggregateFunction(
 		aggCols[i] = uint32(numGroupCol + i)
 	}
 	tc := aggregatorTestCase{
-		typs:      typs,
-		groupCols: groupCols,
-		aggCols:   [][]uint32{aggCols},
-		aggFns:    []execinfrapb.AggregatorSpec_Func{aggFn},
+		typs:           typs,
+		groupCols:      groupCols,
+		aggCols:        [][]uint32{aggCols},
+		aggFns:         []execinfrapb.AggregatorSpec_Func{aggFn},
+		unorderedInput: agg.order == unordered,
 	}
 	if distinctProb > 0 {
 		if !typs[0].Identical(types.Int) {
@@ -1090,7 +1088,6 @@ func benchmarkAggregateFunction(
 		}
 	}
 	if agg.order == partial {
-		tc.unorderedInput = false
 		tc.orderedCols = []uint32{0}
 	}
 	require.NoError(b, tc.init())
@@ -1134,7 +1131,7 @@ func benchmarkAggregateFunction(
 			b.SetBytes(int64(argumentsSize * numInputRows))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				a, err := agg.new(&colexecagg.NewAggregatorArgs{
+				a := agg.new(&colexecagg.NewAggregatorArgs{
 					Allocator:      testAllocator,
 					MemAccount:     testMemAcc,
 					Input:          source,
@@ -1145,9 +1142,6 @@ func benchmarkAggregateFunction(
 					ConstArguments: constArguments,
 					OutputTypes:    outputTypes,
 				})
-				if err != nil {
-					b.Fatal(err)
-				}
 				a.Init(ctx)
 				// Exhaust aggregator until all batches have been read or limit, if
 				// non-zero, is reached.

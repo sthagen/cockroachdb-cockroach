@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecspan"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -167,6 +168,12 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 
 			// Index joins will always return exactly one output row per input row.
 			s.rf.setEstimatedRowCount(uint64(rowCount))
+			// Note that the fetcher takes ownership of the spans slice - it
+			// will modify it and perform the memory accounting. We don't care
+			// about the modification here, but we want to be conscious about
+			// the memory accounting - we don't double count for any memory of
+			// spans because the spanAssembler released all of the relevant
+			// memory from its account in GetSpans().
 			if err := s.rf.StartScan(
 				s.Ctx,
 				s.flowCtx.Txn,
@@ -191,6 +198,11 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 			}
 			n := batch.Length()
 			if n == 0 {
+				// NB: the fetcher has just been closed automatically, so it
+				// released all of the resources. We now have to tell the
+				// ColSpanAssembler to account for the spans slice since it
+				// still has the references to it.
+				s.spanAssembler.AccountForSpans()
 				s.state = indexJoinConstructingSpans
 				continue
 			}
@@ -199,6 +211,9 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 			s.mu.Unlock()
 			return batch
 		case indexJoinDone:
+			// Eagerly close the index joiner. Note that closeInternal() is
+			// idempotent, so it's ok if it'll be closed again.
+			s.closeInternal()
 			return coldata.ZeroBatch
 		}
 	}
@@ -369,9 +384,9 @@ func NewColIndexJoin(
 	ctx context.Context,
 	allocator *colmem.Allocator,
 	fetcherAllocator *colmem.Allocator,
+	kvFetcherMemAcc *mon.BoundAccount,
 	flowCtx *execinfra.FlowCtx,
-	evalCtx *tree.EvalContext,
-	semaCtx *tree.SemaContext,
+	helper *colexecargs.ExprHelper,
 	input colexecop.Operator,
 	spec *execinfrapb.JoinReaderSpec,
 	post *execinfrapb.PostProcessSpec,
@@ -396,74 +411,76 @@ func NewColIndexJoin(
 	// just setting the ID and Version in the spec or something like that and
 	// retrieving the hydrated immutable from cache.
 	table := spec.BuildTableDescriptor()
-
-	cols := table.PublicColumns()
-	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		cols = table.DeletableColumns()
-	}
-	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
-	typs := catalog.ColumnTypes(cols)
-
-	// Add all requested system columns to the output.
-	if spec.HasSystemColumns {
-		for _, sysCol := range table.SystemColumns() {
-			typs = append(typs, sysCol.GetType())
-			columnIdxMap.Set(sysCol.GetID(), columnIdxMap.Len())
-		}
-	}
-
-	// Before we can safely use types from the table descriptor, we need to
-	// make sure they are hydrated. In row execution engine it is done during
-	// the processor initialization, but neither ColIndexJoin nor cFetcher are
-	// processors, so we need to do the hydration ourselves.
-	resolver := flowCtx.TypeResolverFactory.NewTypeResolver(evalCtx.Txn)
-	if err := resolver.HydrateTypeSlice(ctx, typs); err != nil {
-		return nil, err
-	}
-
-	indexIdx := int(spec.IndexIdx)
-	if indexIdx >= len(table.ActiveIndexes()) {
-		return nil, errors.Errorf("invalid indexIdx %d", indexIdx)
-	}
-	index := table.ActiveIndexes()[indexIdx]
-
-	// Retrieve the set of columns that the index join needs to fetch.
-	var neededColumns util.FastIntSet
-	if post.OutputColumns != nil {
-		for _, neededColumn := range post.OutputColumns {
-			neededColumns.Add(int(neededColumn))
-		}
-	} else {
-		proc := &execinfra.ProcOutputHelper{}
-		if err := proc.Init(post, typs, semaCtx, evalCtx); err != nil {
-			colexecerror.InternalError(err)
-		}
-		neededColumns = proc.NeededColumns()
-	}
-
-	fetcher, err := initCFetcher(
-		flowCtx, fetcherAllocator, table, index, neededColumns, columnIdxMap, nil, /* invertedColumn */
-		cFetcherArgs{
-			visibility:        spec.Visibility,
-			lockingStrength:   spec.LockingStrength,
-			lockingWaitPolicy: spec.LockingWaitPolicy,
-			hasSystemColumns:  spec.HasSystemColumns,
-			memoryLimit:       execinfra.GetWorkMemLimit(flowCtx),
-		},
+	index := table.ActiveIndexes()[spec.IndexIdx]
+	tableArgs, idxMap, err := populateTableArgs(
+		ctx, flowCtx, table, index, nil, /* invertedCol */
+		spec.Visibility, spec.HasSystemColumns, post, helper,
 	)
 	if err != nil {
 		return nil, err
 	}
+	if idxMap != nil {
+		// The index join is fetching from the primary index, so there should be
+		// no mapping needed.
+		return nil, errors.AssertionFailedf("unexpectedly non-nil idx map for the index join")
+	}
+
+	// Retrieve the set of columns that the index join needs to fetch.
+	var neededColumns []uint32
+	var neededColOrdsInWholeTable util.FastIntSet
+	if post.OutputColumns != nil {
+		neededColumns = post.OutputColumns
+		for _, neededColOrd := range neededColumns {
+			neededColOrdsInWholeTable.Add(int(neededColOrd))
+		}
+	} else {
+		proc := &execinfra.ProcOutputHelper{}
+		// It is ok to use the evalCtx of the flowCtx here since we only use the
+		// ProcOutputHelper to get a set of the needed columns and will not be
+		// evaluating any expressions.
+		if err = proc.Init(post, tableArgs.typs, helper.SemaCtx, flowCtx.EvalCtx); err != nil {
+			return nil, err
+		}
+		neededColOrdsInWholeTable = proc.NeededColumns()
+		neededColumns = make([]uint32, 0, neededColOrdsInWholeTable.Len())
+		for i, ok := neededColOrdsInWholeTable.Next(0); ok; i, ok = neededColOrdsInWholeTable.Next(i + 1) {
+			neededColumns = append(neededColumns, uint32(i))
+		}
+	}
+
+	if err = keepOnlyNeededColumns(
+		flowCtx, tableArgs, idxMap, neededColumns, post, helper,
+	); err != nil {
+		return nil, err
+	}
+
+	fetcher := cFetcherPool.Get().(*cFetcher)
+	fetcher.cFetcherArgs = cFetcherArgs{
+		spec.LockingStrength,
+		spec.LockingWaitPolicy,
+		flowCtx.EvalCtx.SessionData().LockTimeout,
+		execinfra.GetWorkMemLimit(flowCtx),
+		// Note that the correct estimated row count will be set by the index
+		// joiner for each set of spans to read.
+		0,     /* estimatedRowCount */
+		false, /* reverse */
+		flowCtx.TraceKV,
+	}
+	if err = fetcher.Init(flowCtx.Codec(), fetcherAllocator, kvFetcherMemAcc, tableArgs, spec.HasSystemColumns); err != nil {
+		fetcher.Release()
+		return nil, err
+	}
 
 	spanAssembler := colexecspan.NewColSpanAssembler(
-		flowCtx.Codec(), allocator, table, index, inputTypes, neededColumns)
+		flowCtx.Codec(), allocator, table, index, inputTypes, neededColOrdsInWholeTable,
+	)
 
 	op := &ColIndexJoin{
 		OneInputNode:     colexecop.NewOneInputNode(input),
 		flowCtx:          flowCtx,
 		rf:               fetcher,
 		spanAssembler:    spanAssembler,
-		ResultTypes:      typs,
+		ResultTypes:      tableArgs.typs,
 		maintainOrdering: spec.MaintainOrdering,
 	}
 	op.prepareMemLimit(inputTypes)
@@ -533,15 +550,21 @@ func (s *ColIndexJoin) Release() {
 
 // Close implements the colexecop.Closer interface.
 func (s *ColIndexJoin) Close() error {
-	s.rf.Close(s.EnsureCtx())
+	s.closeInternal()
 	if s.tracingSpan != nil {
 		s.tracingSpan.Finish()
 		s.tracingSpan = nil
 	}
+	return nil
+}
+
+// closeInternal is a subset of Close() which doesn't finish the operator's
+// span.
+func (s *ColIndexJoin) closeInternal() {
+	s.rf.Close(s.EnsureCtx())
 	if s.spanAssembler != nil {
 		// spanAssembler can be nil if Release() has already been called.
 		s.spanAssembler.Close()
 	}
 	s.batch = nil
-	return nil
 }

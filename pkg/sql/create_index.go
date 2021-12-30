@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
@@ -66,10 +65,6 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	}
 
 	if tableDesc.MaterializedView() {
-		if n.Interleave != nil {
-			return nil, pgerror.New(pgcode.InvalidObjectDefinition,
-				"cannot create interleaved index on materialized view")
-		}
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidObjectDefinition,
 				"cannot create hash sharded index on materialized view")
@@ -93,27 +88,13 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	return &createIndexNode{tableDesc: tableDesc, n: n}, nil
 }
 
-// setupFamilyAndConstraintForShard adds a newly-created shard column into its appropriate
-// family (see comment above GetColumnFamilyForShard) and adds a check constraint ensuring
-// that the shard column's value is within [0..ShardBuckets-1]. This method is called when
-// a `CREATE INDEX` statement is issued for the creation of a sharded index that *does
-// not* re-use a pre-existing shard column.
-func (p *planner) setupFamilyAndConstraintForShard(
-	ctx context.Context,
-	tableDesc *tabledesc.Mutable,
-	shardCol catalog.Column,
-	idxColumns []string,
-	buckets int32,
+// setupConstraintForShard adds a check constraint ensuring that the shard
+// column's value is within [0..ShardBuckets-1]. This method is called when a
+// `CREATE INDEX`/`ALTER PRIMARY KEY` statement is issued for the creation of a
+// sharded index that *does not* re-use a pre-existing shard column.
+func (p *planner) setupConstraintForShard(
+	ctx context.Context, tableDesc *tabledesc.Mutable, shardCol catalog.Column, buckets int32,
 ) error {
-	family := tabledesc.GetColumnFamilyForShard(tableDesc, idxColumns)
-	if family == "" {
-		return errors.AssertionFailedf("could not find column family for the first column in the index column set")
-	}
-	// Assign shard column to the family of the first column in its index set, and do it
-	// before `AllocateIDs()` assigns it to the primary column family.
-	if err := tableDesc.AddColumnToFamilyMaybeCreate(shardCol.GetName(), family, false, false); err != nil {
-		return err
-	}
 	// Assign an ID to the newly-added shard column, which is needed for the creation
 	// of a valid check constraint.
 	if err := tableDesc.AllocateIDs(ctx); err != nil {
@@ -152,11 +133,11 @@ func (p *planner) setupFamilyAndConstraintForShard(
 	return nil
 }
 
-// MakeIndexDescriptor creates an index descriptor from a CreateIndex node and optionally
+// makeIndexDescriptor creates an index descriptor from a CreateIndex node and optionally
 // adds a hidden computed shard column (along with its check constraint) in case the index
 // is hash sharded. Note that `tableDesc` will be modified when this method is called for
 // a hash sharded index.
-func MakeIndexDescriptor(
+func makeIndexDescriptor(
 	params runParams, n tree.CreateIndex, tableDesc *tabledesc.Mutable,
 ) (*descpb.IndexDescriptor, error) {
 	// Ensure that the columns we want to index are accessible before trying to
@@ -194,9 +175,13 @@ func MakeIndexDescriptor(
 	}
 
 	// Ensure that the index name does not exist before trying to create the index.
-	if err := tableDesc.ValidateIndexNameIsUnique(string(n.Name)); err != nil {
-		return nil, err
+	if idx, _ := tableDesc.FindIndexWithName(string(n.Name)); idx != nil {
+		if idx.Dropped() {
+			return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists and is being dropped, try again later", n.Name)
+		}
+		return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists", n.Name)
 	}
+
 	indexDesc := descpb.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
@@ -205,10 +190,6 @@ func MakeIndexDescriptor(
 	}
 
 	if n.Inverted {
-		if n.Interleave != nil {
-			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
-		}
-
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support hash sharding")
 		}
@@ -245,9 +226,6 @@ func MakeIndexDescriptor(
 		if tableDesc.IsLocalityRegionalByRow() {
 			return nil, hashShardedIndexesOnRegionalByRowError()
 		}
-		if n.Interleave != nil {
-			return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
-		}
 		shardCol, newColumns, newColumn, err := setupShardedIndex(
 			params.ctx,
 			params.EvalContext(),
@@ -263,8 +241,7 @@ func MakeIndexDescriptor(
 		}
 		columns = newColumns
 		if newColumn {
-			if err := params.p.setupFamilyAndConstraintForShard(params.ctx, tableDesc, shardCol,
-				indexDesc.Sharded.ColumnNames, indexDesc.Sharded.ShardBuckets); err != nil {
+			if err := params.p.setupConstraintForShard(params.ctx, tableDesc, shardCol, indexDesc.Sharded.ShardBuckets); err != nil {
 				return nil, err
 			}
 		}
@@ -589,56 +566,10 @@ func maybeCreateAndAddShardCol(
 		} else {
 			desc.AddColumnMutation(shardColDesc, descpb.DescriptorMutation_ADD)
 		}
-		if !shardColDesc.Virtual {
-			primaryIndex := desc.GetPrimaryIndex().IndexDescDeepCopy()
-			primaryIndex.StoreColumnIDs = append(primaryIndex.StoreColumnIDs, shardColDesc.ID)
-			primaryIndex.StoreColumnNames = append(primaryIndex.StoreColumnNames, shardColDesc.Name)
-			desc.SetPrimaryIndex(primaryIndex)
-		}
 		created = true
 	}
 	shardCol, err := desc.FindColumnWithName(tree.Name(shardColDesc.Name))
 	return shardCol, created, err
-}
-
-var interleavedTableDeprecationError = errors.WithIssueLink(
-	pgnotice.Newf("interleaved tables and interleaved indexes are deprecated in 20.2 and will be removed in 21.2"),
-	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-)
-
-var interleavedTableDisabledError = errors.WithIssueLink(
-	pgerror.New(pgcode.WarningDeprecatedFeature,
-		"interleaved tables and interleaved indexes are disabled due to the sql.defaults."+
-			"interleaved_tables.enabled cluster setting. Note that interleaved tables and interleaved indexes will be "+
-			"removed in a future release. For details, see https://www.cockroachlabs.com/docs/releases/v20.2.0#deprecations"),
-	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-)
-
-var interleavedTableDisabledMigrationError = pgnotice.Newf(
-	"creation of new interleaved tables or interleaved indexes is no longer supported and will be ignored." +
-		" For details, see https://www.cockroachlabs.com/docs/releases/v20.2.0#deprecations")
-
-// interleavedTableDeprecationAction either returns an error, if interleaved
-// tables are disabled, or sends a notice, if they're not. Returns any error
-// and if the interleaved option should be ignored.
-func interleavedTableDeprecationAction(params runParams) (ignoreInterleave bool, err error) {
-	// Once interleave tables should be prevented, we should
-	// return a client notice and ignore opeartions.
-	if params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.PreventNewInterleavedTables) {
-		params.p.BufferClientNotice(
-			params.ctx,
-			interleavedTableDisabledMigrationError,
-		)
-		return true, nil
-	}
-	if !InterleavedTablesEnabled.Get(params.p.execCfg.SV()) {
-		return false, interleavedTableDisabledError
-	}
-	params.p.BufferClientNotice(
-		params.ctx,
-		interleavedTableDeprecationError,
-	)
-	return false, nil
 }
 
 func (n *createIndexNode) startExec(params runParams) error {
@@ -677,21 +608,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 		)
 	}
 
-	if n.n.Interleave != nil {
-		if n.n.PartitionByIndex != nil {
-			return pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot be partitioned")
-		}
-
-		interleaveIgnored, err := interleavedTableDeprecationAction(params)
-		if err != nil {
-			return err
-		}
-		if interleaveIgnored {
-			n.n.Interleave = nil
-		}
-	}
-
-	indexDesc, err := MakeIndexDescriptor(params, *n.n, n.tableDesc)
+	indexDesc, err := makeIndexDescriptor(params, *n.n, n.tableDesc)
 	if err != nil {
 		return err
 	}
@@ -701,7 +618,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.SecondaryIndexColumnFamiliesCounter)
 	}
 
-	indexDesc.Version = descpb.StrictIndexColumnIDGuaranteesVersion
+	indexDesc.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
 
 	if n.n.PartitionByIndex != nil && n.tableDesc.GetLocalityConfig() != nil {
 		return pgerror.New(
@@ -743,15 +660,6 @@ func (n *createIndexNode) startExec(params runParams) error {
 	// AllocateIDs(). Retrieve it for the event log below.
 	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
 	indexName := index.Name
-
-	if n.n.Interleave != nil {
-		if err := params.p.addInterleave(params.ctx, n.tableDesc, index, n.n.Interleave); err != nil {
-			return err
-		}
-		if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, index); err != nil {
-			return err
-		}
-	}
 
 	mutationID := n.tableDesc.ClusterVersion.NextMutationID
 	if err := params.p.writeSchemaChange(

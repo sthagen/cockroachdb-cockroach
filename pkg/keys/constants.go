@@ -80,17 +80,12 @@ var (
 	// LocalRangeAppliedStateSuffix is the suffix for the range applied state
 	// key.
 	LocalRangeAppliedStateSuffix = []byte("rask")
-	// LocalRaftAppliedIndexLegacySuffix is the suffix for the raft applied index.
-	LocalRaftAppliedIndexLegacySuffix = []byte("rfta")
-	// LocalRaftTruncatedStateLegacySuffix is the suffix for the legacy
-	// RaftTruncatedState. See VersionUnreplicatedRaftTruncatedState.
+	// LocalRaftTruncatedStateSuffix is the suffix for the
+	// RaftTruncatedState.
 	// Note: This suffix is also used for unreplicated Range-ID keys.
-	LocalRaftTruncatedStateLegacySuffix = []byte("rftt")
+	LocalRaftTruncatedStateSuffix = []byte("rftt")
 	// LocalRangeLeaseSuffix is the suffix for a range lease.
 	LocalRangeLeaseSuffix = []byte("rll-")
-	// LocalLeaseAppliedIndexLegacySuffix is the suffix for the applied lease
-	// index.
-	LocalLeaseAppliedIndexLegacySuffix = []byte("rlla")
 	// LocalRangePriorReadSummarySuffix is the suffix for a range's prior read
 	// summary.
 	LocalRangePriorReadSummarySuffix = []byte("rprs")
@@ -305,9 +300,6 @@ var (
 	NamespaceTableMin = SystemSQLCodec.TablePrefix(NamespaceTableID)
 	// NamespaceTableMax is the end key of system.namespace.
 	NamespaceTableMax = SystemSQLCodec.TablePrefix(NamespaceTableID + 1)
-	//
-	// UserTableDataMin is the start key of user structured data.
-	UserTableDataMin = SystemSQLCodec.TablePrefix(MinUserDescID)
 
 	// 4. Non-system tenant SQL keys
 	//
@@ -325,19 +317,11 @@ const (
 	// this ID range.
 	MaxSystemConfigDescID = 10
 
-	// MaxReservedDescID is the maximum value of reserved descriptor
-	// IDs. Reserved IDs are used by namespaces and tables used internally by
-	// cockroach.
-	MaxReservedDescID = 49
-
-	// MinUserDescID is the first descriptor ID available for user
-	// structured data.
-	MinUserDescID = MaxReservedDescID + 1
-
-	// MinNonPredefinedUserDescID is the first descriptor ID used by
-	// user-level objects that are not created automatically on empty
-	// clusters (default databases).
-	MinNonPredefinedUserDescID = MinUserDescID + 2
+	// minUserDescID is the first descriptor ID available for user
+	// structured data. This is the ID following the maximum value of reserved
+	// descriptor IDs. Reserved IDs are used by namespaces and tables used
+	// internally by cockroach.
+	minUserDescID = 50
 
 	// RootNamespaceID is the ID of the root namespace.
 	RootNamespaceID = 0
@@ -362,10 +346,11 @@ const (
 	ZonesTableConfigColumnID = 2
 	ZonesTableConfigColFamID = 2
 
-	DescriptorTablePrimaryKeyIndexID  = 1
-	DescriptorTableDescriptorColID    = 2
-	DescriptorTableDescriptorColFamID = 2
-	TenantsTablePrimaryKeyIndexID     = 1
+	DescriptorTablePrimaryKeyIndexID         = 1
+	DescriptorTableDescriptorColID           = 2
+	DescriptorTableDescriptorColFamID        = 2
+	TenantsTablePrimaryKeyIndexID            = 1
+	SpanConfigurationsTablePrimaryKeyIndexID = 1
 
 	// Reserved IDs for other system tables. Note that some of these IDs refer
 	// to "Ranges" instead of a Table - these IDs are needed to store custom
@@ -389,7 +374,19 @@ const (
 	ReplicationCriticalLocalitiesTableID = 26
 	ReplicationStatsTableID              = 27
 	ReportsMetaTableID                   = 28
-	PublicSchemaID                       = 29 // pseudo
+	// PublicSchemaID refers to old references where Public schemas are
+	// descriptorless.
+	// TODO(richardjcai): This should be fully removed in 22.2.
+	PublicSchemaID = 29 // pseudo
+	// PublicSchemaIDForBackup is used temporarily to determine cases of
+	// PublicSchemaID being used for backup.
+	// We need to keep this around since backups created prior to 22.1 use 29
+	// as the ID for a virtual public schema. In restores, we look for this 29
+	// and synthesize a public schema with a descriptor when necessary.
+	PublicSchemaIDForBackup = 29
+	// SystemPublicSchemaID represents the ID used for the pseudo public
+	// schema in the system database.
+	SystemPublicSchemaID = 29 // pseudo
 	// New NamespaceTableID for cluster version >= 20.1
 	// Ensures that NamespaceTable does not get gossiped again
 	NamespaceTableID                    = 30

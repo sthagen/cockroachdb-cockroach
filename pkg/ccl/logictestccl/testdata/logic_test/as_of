@@ -11,19 +11,19 @@ CREATE TABLE t (
 statement ok
 INSERT INTO t VALUES (2)
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 SELECT * FROM t AS OF SYSTEM TIME follower_read_timestamp()
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 SELECT * FROM t AS OF SYSTEM TIME experimental_follower_read_timestamp()
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 BEGIN; SET TRANSACTION AS OF SYSTEM TIME follower_read_timestamp(); SELECT * FROM t
 
 statement ok
 ROLLBACK
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 BEGIN AS OF SYSTEM TIME follower_read_timestamp(); SELECT * FROM t
 
 statement ok
@@ -32,13 +32,13 @@ ROLLBACK
 statement ok
 SET DEFAULT_TRANSACTION_USE_FOLLOWER_READS TO TRUE
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 SELECT * FROM t
 
 statement error pq: cannot execute CREATE DATABASE in a read-only transaction
 CREATE DATABASE IF NOT EXISTS d2
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 BEGIN; SELECT * FROM t
 
 statement ok
@@ -74,13 +74,13 @@ BEGIN; CREATE DATABASE IF NOT EXISTS d2; COMMIT
 statement ok
 SET SESSION CHARACTERISTICS AS TRANSACTION AS OF SYSTEM TIME follower_read_timestamp()
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 SELECT * FROM t
 
 statement error pq: cannot execute CREATE DATABASE in a read-only transaction
 CREATE DATABASE IF NOT EXISTS d2
 
-statement error pq: relation "t" does not exist
+statement error pgcode 3D000 pq: database "test" does not exist
 BEGIN; SELECT * FROM t
 
 statement ok
@@ -174,7 +174,7 @@ SELECT * FROM t AS OF SYSTEM TIME with_max_staleness('1ms') WHERE j = 2
 query T
 EXPLAIN (OPT, MEMO) SELECT * FROM t AS OF SYSTEM TIME with_max_staleness('1ms') WHERE j = 2 AND i = 1
 ----
-memo (optimized, ~7KB, required=[presentation: info:6])
+memo (optimized, ~8KB, required=[presentation: info:6])
  ├── G1: (explain G2 [presentation: i:1,j:2,k:3])
  │    └── [presentation: info:6]
  │         ├── best: (explain G2="[presentation: i:1,j:2,k:3]" [presentation: i:1,j:2,k:3])

@@ -361,7 +361,7 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 		}
 
 		for timer := time.NewTimer(initialDelay); ; timer.Reset(
-			getWaitPeriod(&s.Settings.SV, s.TestingKnobs)) {
+			getWaitPeriod(ctx, &s.Settings.SV, jitter, s.TestingKnobs)) {
 			select {
 			case <-stopper.ShouldQuiesce():
 				return
@@ -385,18 +385,21 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 }
 
 var schedulerEnabledSetting = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"jobs.scheduler.enabled",
 	"enable/disable job scheduler",
 	true,
 )
 
 var schedulerPaceSetting = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"jobs.scheduler.pace",
 	"how often to scan system.scheduled_jobs table",
 	time.Minute,
 )
 
 var schedulerMaxJobsPerIterationSetting = settings.RegisterIntSetting(
+	settings.TenantWritable,
 	"jobs.scheduler.max_jobs_per_iteration",
 	"how many schedules to start per iteration; setting to 0 turns off this limit",
 	10,
@@ -420,8 +423,12 @@ const recheckEnabledAfterPeriod = 5 * time.Minute
 
 var warnIfPaceTooLow = log.Every(time.Minute)
 
+type jitterFn func(duration time.Duration) time.Duration
+
 // Returns duration to wait before scanning system.scheduled_jobs.
-func getWaitPeriod(sv *settings.Values, knobs base.ModuleTestingKnobs) time.Duration {
+func getWaitPeriod(
+	ctx context.Context, sv *settings.Values, jitter jitterFn, knobs base.ModuleTestingKnobs,
+) time.Duration {
 	if k, ok := knobs.(*TestingKnobs); ok && k.SchedulerDaemonScanDelay != nil {
 		return k.SchedulerDaemonScanDelay()
 	}
@@ -433,13 +440,13 @@ func getWaitPeriod(sv *settings.Values, knobs base.ModuleTestingKnobs) time.Dura
 	pace := schedulerPaceSetting.Get(sv)
 	if pace < minPacePeriod {
 		if warnIfPaceTooLow.ShouldLog() {
-			log.Warningf(context.Background(),
+			log.Warningf(ctx,
 				"job.scheduler.pace setting too low (%s < %s)", pace, minPacePeriod)
 		}
 		pace = minPacePeriod
 	}
 
-	return pace
+	return jitter(pace)
 }
 
 // StartJobSchedulerDaemon starts a daemon responsible for periodically scanning

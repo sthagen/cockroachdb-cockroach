@@ -46,7 +46,7 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
+	raft "go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
@@ -373,18 +373,18 @@ func replicas(storeIDs ...roachpb.StoreID) []roachpb.ReplicaDescriptor {
 // createTestAllocator creates a stopper, gossip, store pool and allocator for
 // use in tests. Stopper must be stopped by the caller.
 func createTestAllocator(
-	numNodes int, deterministic bool,
+	ctx context.Context, numNodes int, deterministic bool,
 ) (*stop.Stopper, *gossip.Gossip, *StorePool, Allocator, *hlc.ManualClock) {
-	return createTestAllocatorWithKnobs(numNodes, deterministic, nil /* knobs */)
+	return createTestAllocatorWithKnobs(ctx, numNodes, deterministic, nil /* knobs */)
 }
 
 // createTestAllocatorWithKnobs is like `createTestAllocator`, but allows the
 // caller to pass in custom AllocatorTestingKnobs. Stopper must be stopped by
 // the caller.
 func createTestAllocatorWithKnobs(
-	numNodes int, deterministic bool, knobs *AllocatorTestingKnobs,
+	ctx context.Context, numNodes int, deterministic bool, knobs *AllocatorTestingKnobs,
 ) (*stop.Stopper, *gossip.Gossip, *StorePool, Allocator, *hlc.ManualClock) {
-	stopper, g, manual, storePool, _ := createTestStorePool(
+	stopper, g, manual, storePool, _ := createTestStorePool(ctx,
 		TestTimeUntilStoreDeadOff, deterministic,
 		func() int { return numNodes },
 		livenesspb.NodeLivenessStatus_LIVE)
@@ -491,11 +491,12 @@ func TestAllocatorSimpleRetrieval(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(1, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 1, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(singleStore, t)
 	result, _, err := a.AllocateVoter(
-		context.Background(),
+		ctx,
 		simpleSpanConfig,
 		nil /* existingVoters */, nil, /* existingNonVoters */
 	)
@@ -511,10 +512,11 @@ func TestAllocatorNoAvailableDisks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, _, _, a, _ := createTestAllocator(1, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, _, _, a, _ := createTestAllocator(ctx, 1, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	result, _, err := a.AllocateVoter(
-		context.Background(),
+		ctx,
 		simpleSpanConfig,
 		nil /* existingVoters */, nil, /* existingNonVoters */
 	)
@@ -530,10 +532,10 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(1, false /* deterministic */)
-	defer stopper.Stop(context.Background())
-	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
 	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 1, false /* deterministic */)
+	defer stopper.Stop(ctx)
+	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
 	result1, _, err := a.AllocateVoter(
 		ctx,
 		multiDCConfigSSD,
@@ -582,11 +584,12 @@ func TestAllocatorExistingReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(1, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 1, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
 	result, _, err := a.AllocateVoter(
-		context.Background(),
+		ctx,
 		roachpb.SpanConfig{
 			NumReplicas: 0,
 			Constraints: []roachpb.ConstraintsConjunction{
@@ -650,8 +653,9 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 		},
 	}
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 
 	testCases := []struct {
@@ -705,7 +709,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 	for _, tc := range testCases {
 		{
 			result, _, err := a.AllocateVoter(
-				context.Background(), emptySpanConfig(), tc.existing, nil,
+				ctx, emptySpanConfig(), tc.existing, nil,
 			)
 			if e, a := tc.expectTargetAllocate, result != nil; e != a {
 				t.Errorf(
@@ -718,7 +722,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 		{
 			var rangeUsageInfo RangeUsageInfo
 			target, _, details, ok := a.RebalanceVoter(
-				context.Background(),
+				ctx,
 				emptySpanConfig(),
 				nil,
 				tc.existing,
@@ -781,8 +785,9 @@ func TestAllocatorMultipleStoresPerNodeLopsided(t *testing.T) {
 		}
 	}
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	storeGossiper := gossiputil.NewStoreGossiper(g)
 	storeGossiper.GossipStores(stores, t)
 
@@ -791,7 +796,7 @@ func TestAllocatorMultipleStoresPerNodeLopsided(t *testing.T) {
 	var rangeUsageInfo RangeUsageInfo
 	for i := 1; i < 40; i++ {
 		add, remove, _, ok := a.RebalanceVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			nil,
 			ranges[i].InternalReplicas,
@@ -832,7 +837,7 @@ func TestAllocatorMultipleStoresPerNodeLopsided(t *testing.T) {
 	// reached a stable state at this point.
 	for i := 1; i < 40; i++ {
 		_, _, _, ok := a.RebalanceVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			nil,
 			ranges[i].InternalReplicas,
@@ -894,11 +899,11 @@ func TestAllocatorRebalance(t *testing.T) {
 		},
 	}
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
-	ctx := context.Background()
 
 	// Every rebalance target must be either store 1 or 2.
 	for i := 0; i < 10; i++ {
@@ -945,8 +950,9 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-	stopper, g, _, a, _ := createTestAllocator(5, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 5, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	// We make 5 stores in this test -- 3 in the same datacenter, and 1 each in
 	// 2 other datacenters. All of our replicas are distributed within these 3
 	// datacenters. Originally, the stores that are all alone in their datacenter
@@ -1057,7 +1063,7 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	}
 	for i := 0; i < 10; i++ {
 		result, _, details, ok := a.RebalanceVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			status,
 			replicas,
@@ -1072,14 +1078,17 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	}
 
 	// Set up a second round of testing where the other two stores in the big
-	// locality actually have fewer replicas, but enough that it still isn't
-	// worth rebalancing to them.
-	stores[1].Capacity.RangeCount = 46
-	stores[2].Capacity.RangeCount = 46
+	// locality actually have fewer replicas, but enough that it still isn't worth
+	// rebalancing to them. We create a situation where the replacement candidates
+	// for s1 (i.e. s2 and s3) have an average of 48 replicas each (leading to an
+	// overfullness threshold of 51, which is greater than the replica count of
+	// s1).
+	stores[1].Capacity.RangeCount = 48
+	stores[2].Capacity.RangeCount = 48
 	sg.GossipStores(stores, t)
 	for i := 0; i < 10; i++ {
 		target, _, details, ok := a.RebalanceVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			status,
 			replicas,
@@ -1098,7 +1107,7 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	sg.GossipStores(stores, t)
 	for i := 0; i < 10; i++ {
 		target, origin, details, ok := a.RebalanceVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			status,
 			replicas,
@@ -1120,8 +1129,8 @@ func TestAllocatorRebalanceDeadNodes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, _, sp, a, _ := createTestAllocator(8, false /* deterministic */)
 	ctx := context.Background()
+	stopper, _, sp, a, _ := createTestAllocator(ctx, 8, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	mockStorePool(
@@ -1282,8 +1291,9 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Deterministic is required when stressing as test case 8 may rebalance
 			// to different configurations.
-			stopper, g, _, a, _ := createTestAllocator(1, true /* deterministic */)
-			defer stopper.Stop(context.Background())
+			ctx := context.Background()
+			stopper, g, _, a, _ := createTestAllocator(ctx, 1, true /* deterministic */)
+			defer stopper.Stop(ctx)
 
 			st := a.storePool.st
 			cluster := tc.cluster(st)
@@ -1328,7 +1338,7 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 					t.Fatalf("[store %d]: unable to get store %d descriptor", j, store.StoreID)
 				}
 				if a, e := a.scorerOptions().shouldRebalanceBasedOnThresholds(
-					context.Background(), desc, sl,
+					ctx, desc, sl,
 				), cluster[j].shouldRebalanceFrom; a != e {
 					t.Errorf(
 						"[store %d]: shouldRebalanceBasedOnThresholds %t != expected %t", store.StoreID, a, e,
@@ -1414,10 +1424,10 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 	}
 
 	for _, subtest := range tests {
-		stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-		defer stopper.Stop(context.Background())
-		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
 		ctx := context.Background()
+		stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+		defer stopper.Stop(ctx)
+		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
 		var rangeUsageInfo RangeUsageInfo
 		options := qpsScorerOptions{
 			qpsRebalanceThreshold: 0.1,
@@ -1519,10 +1529,10 @@ func TestAllocatorRemoveBasedOnQPS(t *testing.T) {
 	}
 
 	for _, subtest := range tests {
-		stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-		defer stopper.Stop(context.Background())
-		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
 		ctx := context.Background()
+		stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+		defer stopper.Stop(ctx)
+		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
 		options := qpsScorerOptions{
 			qpsRebalanceThreshold: 0.1,
 		}
@@ -1570,11 +1580,11 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 		},
 	}
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
-	ctx := context.Background()
 
 	// Every rebalance target must be store 4 (or nil for case of missing the only option).
 	for i := 0; i < 10; i++ {
@@ -1648,8 +1658,9 @@ func (r *mockRepl) markReplAsNeedingSnapshot(id roachpb.ReplicaID) {
 func TestAllocatorTransferLeaseTarget(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, a, _ := createTestAllocator(10, true /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, true /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	// 3 stores where the lease count for each store is equal to 10x the store
 	// ID.
@@ -1692,7 +1703,7 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
@@ -1723,8 +1734,9 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 		{StoreID: 3, NodeID: 3, ReplicaID: 3},
 		{StoreID: 4, NodeID: 4, ReplicaID: 4},
 	}
-	stopper, g, _, a, _ := createTestAllocator(10, true /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, true /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	// 4 stores where the lease count for each store is equal to 10x the store
 	// ID.
@@ -1807,7 +1819,7 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 		}
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				emptySpanConfig(),
 				c.existing,
 				repl,
@@ -1828,8 +1840,9 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, a, _ := createTestAllocator(10, true /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, true /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	// 6 stores with the following setup
 	// 1 | locality=dc=1 | lease_count=10
@@ -1923,7 +1936,8 @@ func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, storePool, nl := createTestStorePool(
+	ctx := context.Background()
+	stopper, g, _, storePool, nl := createTestStorePool(ctx,
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
@@ -1932,7 +1946,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 			return 0, true
 		}, nil, /* knobs */
 	)
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
 	// 3 stores where the lease count for each store is equal to 100x the store
 	// ID. We'll be draining the store with the fewest leases on it.
@@ -2003,7 +2017,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				c.conf,
 				c.existing,
 				&mockRepl{
@@ -2028,8 +2042,8 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// Set up 8 stores -- 2 in each of the first 2 localities, and 4 in the third.
@@ -2244,8 +2258,9 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 func TestAllocatorShouldTransferLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, a, _ := createTestAllocator(10, true /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, true /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	// 4 stores where the lease count for each store is equal to 10x the store
 	// ID.
@@ -2282,7 +2297,7 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			result := a.ShouldTransferLease(
-				context.Background(),
+				ctx,
 				emptySpanConfig(),
 				c.existing,
 				c.leaseholder,
@@ -2298,7 +2313,8 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, storePool, nl := createTestStorePool(
+	ctx := context.Background()
+	stopper, g, _, storePool, nl := createTestStorePool(ctx,
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
@@ -2346,7 +2362,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			result := a.ShouldTransferLease(
-				context.Background(),
+				ctx,
 				emptySpanConfig(),
 				c.existing,
 				c.leaseholder,
@@ -2362,7 +2378,8 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, clock, storePool, nl := createTestStorePool(
+	ctx := context.Background()
+	stopper, g, clock, storePool, nl := createTestStorePool(ctx,
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
@@ -2389,7 +2406,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	assertShouldTransferLease := func(expected bool) {
 		t.Helper()
 		result := a.ShouldTransferLease(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			replicas(1, 2, 3),
 			2,
@@ -2414,8 +2431,9 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 func TestAllocatorLeasePreferences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, a, _ := createTestAllocator(10, true /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, true /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	// 4 stores with distinct localities, store attributes, and node attributes
 	// where the lease count for each store is equal to 100x the store ID.
@@ -2528,7 +2546,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			conf := roachpb.SpanConfig{LeasePreferences: c.preferences}
 			result := a.ShouldTransferLease(
-				context.Background(),
+				ctx,
 				conf,
 				c.existing,
 				c.leaseholder,
@@ -2539,7 +2557,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 				t.Errorf("expected %v, but found %v", expectTransfer, result)
 			}
 			target := a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				conf,
 				c.existing,
 				&mockRepl{
@@ -2557,7 +2575,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 				t.Errorf("expected s%d for check=true, but found %v", c.expectedCheckTrue, target)
 			}
 			target = a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				conf,
 				c.existing,
 				&mockRepl{
@@ -2581,8 +2599,9 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stopper, g, _, a, _ := createTestAllocator(10, true /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, true /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	// 6 stores, 2 in each of 3 distinct localities.
 	var stores []*roachpb.StoreDescriptor
@@ -2645,7 +2664,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			conf := roachpb.SpanConfig{LeasePreferences: c.preferences}
 			target := a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				conf,
 				c.existing,
 				&mockRepl{
@@ -2663,7 +2682,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 				t.Errorf("expected s%d for check=true, but found %v", c.expectedCheckTrue, target)
 			}
 			target = a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				conf,
 				c.existing,
 				&mockRepl{
@@ -2694,8 +2713,9 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
 
@@ -2742,7 +2762,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 	}
 	for _, c := range testCases {
 		targetVoter, details, err := a.RemoveVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			c.existingVoters, /* voterCandidates */
 			c.existingVoters,
@@ -2761,7 +2781,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 		// non-voting replicas. If non-voters were to have an impact on voters'
 		// diversity score calculations, we would fail here.
 		targetVoter, _, err = a.RemoveVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			c.existingVoters,
 			c.existingVoters,
@@ -2774,7 +2794,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 				" expected %v, got %d", c.expVoterRemovals, targetVoter.StoreID)
 
 		targetNonVoter, _, err := a.RemoveNonVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			c.existingNonVoters, /* nonVoterCandidates */
 			c.existingVoters,
@@ -2837,7 +2857,7 @@ func TestAllocatorConstraintsAndVoterConstraints(t *testing.T) {
 	for i, test := range testCases {
 		t.Run(fmt.Sprintf("%d:%s", i+1, test.name), func(t *testing.T) {
 			ctx := context.Background()
-			stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
+			stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
@@ -2869,8 +2889,9 @@ func TestAllocatorAllocateTargetLocality(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
 
@@ -2927,7 +2948,7 @@ func TestAllocatorAllocateTargetLocality(t *testing.T) {
 				StoreID: storeID,
 			}
 		}
-		targetStore, details, err := a.AllocateVoter(context.Background(), emptySpanConfig(), existingRepls, nil)
+		targetStore, details, err := a.AllocateVoter(ctx, emptySpanConfig(), existingRepls, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2948,8 +2969,9 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 
 	stores := []*roachpb.StoreDescriptor{
 		{
@@ -3046,7 +3068,7 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 		}
 		var rangeUsageInfo RangeUsageInfo
 		target, _, details, ok := a.RebalanceVoter(
-			context.Background(),
+			ctx,
 			emptySpanConfig(),
 			nil,
 			existingRepls,
@@ -3220,51 +3242,48 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 		},
 	}
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
 	sl, _, _ := a.storePool.getStoreList(storeFilterThrottled)
 
 	testCases := []struct {
-		existing []roachpb.StoreID
+		existing roachpb.StoreID
 		excluded []roachpb.StoreID
 		expected []roachpb.StoreID
 	}{
 		{
-			[]roachpb.StoreID{1},
-			[]roachpb.StoreID{2},
-			[]roachpb.StoreID{3, 4},
+			existing: 1,
+			excluded: []roachpb.StoreID{2},
+			expected: []roachpb.StoreID{3, 4},
 		},
 		{
-			[]roachpb.StoreID{1},
-			[]roachpb.StoreID{2, 3},
-			[]roachpb.StoreID{4},
+			existing: 1,
+			excluded: []roachpb.StoreID{2, 3},
+			expected: []roachpb.StoreID{4},
 		},
 		{
-			[]roachpb.StoreID{1},
-			[]roachpb.StoreID{2, 3, 4},
-			[]roachpb.StoreID{},
+			existing: 1,
+			excluded: []roachpb.StoreID{2, 3, 4},
+			expected: []roachpb.StoreID{},
 		},
 		{
-			[]roachpb.StoreID{1},
-			[]roachpb.StoreID{2, 4},
-			[]roachpb.StoreID{3},
+			existing: 1,
+			excluded: []roachpb.StoreID{2, 4},
+			expected: []roachpb.StoreID{3},
 		},
 	}
 
 	for testIdx, tc := range testCases {
-		existingRepls := make([]roachpb.ReplicaDescriptor, len(tc.existing))
-		for i, storeID := range tc.existing {
-			existingRepls[i] = roachpb.ReplicaDescriptor{
-				NodeID:  roachpb.NodeID(storeID),
-				StoreID: storeID,
-			}
+		existingRepls := []roachpb.ReplicaDescriptor{
+			{NodeID: roachpb.NodeID(tc.existing), StoreID: tc.existing},
 		}
 		// No constraints.
 		conf := roachpb.SpanConfig{}
 		analyzed := constraint.AnalyzeConstraints(
-			context.Background(), a.storePool.getStoreDescriptor, existingRepls, conf.NumReplicas,
+			ctx, a.storePool.getStoreDescriptor, existingRepls, conf.NumReplicas,
 			conf.Constraints)
 		allocationConstraintsChecker := voterConstraintsCheckerForAllocation(analyzed, constraint.EmptyAnalyzedConstraints)
 		removalConstraintsChecker := voterConstraintsCheckerForRemoval(analyzed, constraint.EmptyAnalyzedConstraints)
@@ -3281,7 +3300,7 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 
 		t.Run(fmt.Sprintf("%d/allocate", testIdx), func(t *testing.T) {
 			candidates := rankedCandidateListForAllocation(
-				context.Background(),
+				ctx,
 				sl,
 				allocationConstraintsChecker,
 				existingRepls,
@@ -3299,7 +3318,7 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 
 		t.Run(fmt.Sprintf("%d/rebalance", testIdx), func(t *testing.T) {
 			rebalanceOpts := rankedCandidateListForRebalancing(
-				context.Background(),
+				ctx,
 				sl,
 				removalConstraintsChecker,
 				rebalanceConstraintsChecker,
@@ -3316,11 +3335,7 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 					candidateStores[i] = cand.store.StoreID
 				}
 				require.ElementsMatch(t, tc.expected, candidateStores)
-				existingStores := make([]roachpb.StoreID, len(rebalanceOpts[0].existingCandidates))
-				for i, cand := range rebalanceOpts[0].existingCandidates {
-					existingStores[i] = cand.store.StoreID
-				}
-				require.ElementsMatch(t, tc.existing, existingStores)
+				require.Equal(t, tc.existing, rebalanceOpts[0].existing.store.StoreID)
 			} else {
 				require.Len(t, rebalanceOpts, 0)
 			}
@@ -3393,7 +3408,7 @@ func TestAllocatorNonVoterAllocationExcludesVoterNodes(t *testing.T) {
 	for i, test := range testCases {
 		t.Run(fmt.Sprintf("%d:%s", i+1, test.name), func(t *testing.T) {
 			ctx := context.Background()
-			stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
+			stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
@@ -3414,8 +3429,9 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
 	sl, _, _ := a.storePool.getStoreList(storeFilterThrottled)
@@ -3620,12 +3636,12 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 		}
 		conf := roachpb.SpanConfig{Constraints: tc.constraints}
 		analyzed := constraint.AnalyzeConstraints(
-			context.Background(), a.storePool.getStoreDescriptor, existingRepls, conf.NumReplicas,
+			ctx, a.storePool.getStoreDescriptor, existingRepls, conf.NumReplicas,
 			conf.Constraints)
 		checkFn := voterConstraintsCheckerForAllocation(analyzed, constraint.EmptyAnalyzedConstraints)
 
 		candidates := rankedCandidateListForAllocation(
-			context.Background(),
+			ctx,
 			sl,
 			checkFn,
 			existingRepls,
@@ -3660,8 +3676,9 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
 
@@ -3848,7 +3865,6 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 				StoreID: storeID,
 			}
 		}
-		ctx := context.Background()
 		analyzed := constraint.AnalyzeConstraints(ctx, a.storePool.getStoreDescriptor, existingRepls,
 			0 /* numReplicas */, tc.constraints)
 
@@ -4010,7 +4026,7 @@ func TestAllocatorRebalanceNonVoters(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d_%s", i+1, test.name), func(t *testing.T) {
-			stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
+			stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
@@ -4046,8 +4062,8 @@ func TestVotersCanRebalanceToNonVoterStores(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
 
@@ -4090,12 +4106,76 @@ func TestVotersCanRebalanceToNonVoterStores(t *testing.T) {
 	}
 }
 
+// TestNonVotersCannotRebalanceToVoterStores ensures that non-voting replicas
+// cannot rebalance to stores that already have a voting replica for the range.
+func TestNonVotersCannotRebalanceToVoterStores(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx, finishAndGetRecording := tracing.ContextWithRecordingSpan(
+		context.Background(), tracing.NewTracer(), "test",
+	)
+
+	stopper, g, _, a, _ := createTestAllocator(ctx, 2, false /* deterministic */)
+	defer stopper.Stop(ctx)
+	sg := gossiputil.NewStoreGossiper(g)
+
+	// Create 2 stores. Store 2 has a voting replica and store 1 has a non-voting
+	// replica. Make it such that store 1 has a full disk so the allocator will
+	// want to rebalance it away. However, the only possible candidate is store 2
+	// which already has a voting replica. Thus, this rebalance attempt should
+	// fail.
+	stores := []*roachpb.StoreDescriptor{
+		{
+			StoreID: 1,
+			Capacity: roachpb.StoreCapacity{
+				Capacity:  100,
+				Available: 0,
+			},
+		},
+		{
+			StoreID: 2,
+			Capacity: roachpb.StoreCapacity{
+				Capacity:  100,
+				Available: 100,
+			},
+		},
+	}
+	existingNonVoters := replicas(1)
+	existingVoters := replicas(2)
+
+	sg.GossipStores(stores, t)
+	var rangeUsageInfo RangeUsageInfo
+	add, remove, _, ok := a.RebalanceNonVoter(
+		ctx,
+		emptySpanConfig(),
+		nil,
+		existingVoters,
+		existingNonVoters,
+		rangeUsageInfo,
+		storeFilterThrottled,
+		a.scorerOptions(),
+	)
+
+	require.Falsef(
+		t, ok, "expected no action; got rebalance from s%d to s%d", remove.StoreID, add.StoreID,
+	)
+	trace := finishAndGetRecording().String()
+	require.Regexpf(
+		t,
+		"it already has a voter",
+		trace,
+		"expected the voter store to be explicitly ignored; got %s",
+		trace,
+	)
+}
+
 func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
 	sl, _, _ := a.storePool.getStoreList(storeFilterThrottled)
@@ -4104,7 +4184,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 	// stores would be best to remove if we had to remove one purely on the basis
 	// of constraint-matching and locality diversity.
 	type rebalanceStoreIDs struct {
-		existing   []roachpb.StoreID
+		existing   roachpb.StoreID
 		candidates []roachpb.StoreID
 	}
 	testCases := []struct {
@@ -4137,11 +4217,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 			},
@@ -4152,11 +4232,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 3},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{5, 6},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{5, 6},
 				},
 			},
@@ -4167,7 +4247,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 7},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{5, 6},
 				},
 			},
@@ -4178,15 +4258,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 7},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 			},
@@ -4197,11 +4277,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 7, 8},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 				{
-					existing:   []roachpb.StoreID{8},
+					existing:   8,
 					candidates: []roachpb.StoreID{3, 4, 5, 6},
 				},
 			},
@@ -4218,11 +4298,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{1},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{1},
 				},
 			},
@@ -4233,15 +4313,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 			},
@@ -4252,7 +4332,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{2},
 				},
 			},
@@ -4263,11 +4343,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 5, 6},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 			},
@@ -4278,11 +4358,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{3, 5, 6},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 			},
@@ -4293,11 +4373,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{2},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{2},
 				},
 			},
@@ -4314,11 +4394,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{2},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{2},
 				},
 			},
@@ -4329,15 +4409,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{3, 4, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 			},
@@ -4360,11 +4440,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 3},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4375,15 +4455,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1, 5, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 			},
@@ -4394,11 +4474,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 4, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{3, 7},
 				},
 			},
@@ -4409,15 +4489,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{2, 8},
 				},
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{4, 8},
 				},
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4428,15 +4508,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 4, 6},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{3, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 			},
@@ -4459,11 +4539,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 3},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4474,15 +4554,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1, 5, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 			},
@@ -4493,11 +4573,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 4, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{3, 7},
 				},
 			},
@@ -4508,15 +4588,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{2, 8},
 				},
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{4, 8},
 				},
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4527,15 +4607,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 4, 6},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{3, 7},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{5, 7},
 				},
 			},
@@ -4558,7 +4638,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 5, 8},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3},
 				},
 			},
@@ -4569,11 +4649,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 5, 6},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{3, 4, 8},
 				},
 			},
@@ -4584,7 +4664,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4595,7 +4675,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 3},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4606,7 +4686,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{6, 8},
 				},
 			},
@@ -4617,11 +4697,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{1},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{1},
 				},
 			},
@@ -4632,15 +4712,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{5, 6, 7},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{1, 3},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{1, 2, 3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{1, 3},
 				},
 			},
@@ -4651,15 +4731,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{6, 7, 8},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{1, 3},
 				},
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{1, 3},
 				},
 				{
-					existing:   []roachpb.StoreID{8},
+					existing:   8,
 					candidates: []roachpb.StoreID{1, 3},
 				},
 			},
@@ -4670,11 +4750,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 6, 8},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{3},
 				},
 				{
-					existing:   []roachpb.StoreID{8},
+					existing:   8,
 					candidates: []roachpb.StoreID{3},
 				},
 			},
@@ -4685,11 +4765,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 5, 7},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3, 4, 6},
 				},
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{3, 4, 8},
 				},
 			},
@@ -4722,11 +4802,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 3},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{5, 6, 7, 8},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{5, 6, 7, 8},
 				},
 			},
@@ -4738,11 +4818,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{2, 3, 4},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{5, 6, 7, 8},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{5, 6, 7, 8},
 				},
 			},
@@ -4754,15 +4834,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 2, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{1},
+					existing:   1,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{2},
+					existing:   2,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 			},
@@ -4774,15 +4854,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{3, 4, 5},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{3},
+					existing:   3,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 				{
-					existing:   []roachpb.StoreID{4},
+					existing:   4,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{1, 2},
 				},
 			},
@@ -4794,11 +4874,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 5, 7},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 			},
@@ -4810,11 +4890,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{1, 5, 6},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{3, 4},
 				},
 			},
@@ -4826,15 +4906,15 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			existing:    []roachpb.StoreID{5, 6, 7},
 			expected: []rebalanceStoreIDs{
 				{
-					existing:   []roachpb.StoreID{5},
+					existing:   5,
 					candidates: []roachpb.StoreID{1, 2, 3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{6},
+					existing:   6,
 					candidates: []roachpb.StoreID{1, 2, 3, 4},
 				},
 				{
-					existing:   []roachpb.StoreID{7},
+					existing:   7,
 					candidates: []roachpb.StoreID{1, 2, 3, 4},
 				},
 			},
@@ -4856,7 +4936,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			NumReplicas: tc.numReplicas,
 		}
 		analyzed := constraint.AnalyzeConstraints(
-			context.Background(), a.storePool.getStoreDescriptor, existingRepls,
+			ctx, a.storePool.getStoreDescriptor, existingRepls,
 			conf.NumReplicas, conf.Constraints)
 		removalConstraintsChecker := voterConstraintsCheckerForRemoval(
 			analyzed,
@@ -4868,7 +4948,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 		)
 
 		results := rankedCandidateListForRebalancing(
-			context.Background(),
+			ctx,
 			sl,
 			removalConstraintsChecker,
 			rebalanceConstraintsChecker,
@@ -4883,10 +4963,10 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			match = false
 		} else {
 			sort.Slice(results, func(i, j int) bool {
-				return results[i].existingCandidates[0].store.StoreID < results[j].existingCandidates[0].store.StoreID
+				return results[i].existing.store.StoreID < results[j].existing.store.StoreID
 			})
 			for i := range tc.expected {
-				if !expectedStoreIDsMatch(tc.expected[i].existing, results[i].existingCandidates) ||
+				if tc.expected[i].existing != results[i].existing.store.StoreID ||
 					!expectedStoreIDsMatch(tc.expected[i].candidates, results[i].candidates) {
 					match = false
 					break
@@ -4900,7 +4980,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			// Also verify that RebalanceVoter picks out one of the best options as
 			// the final rebalance choice.
 			target, _, details, ok := a.RebalanceVoter(
-				context.Background(),
+				ctx,
 				conf,
 				nil,
 				existingRepls,
@@ -4933,11 +5013,12 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, storePool, _ := createTestStorePool(
+	ctx := context.Background()
+	stopper, g, _, storePool, _ := createTestStorePool(ctx,
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
 	// 3 stores where the lease count for each store is equal to 10x the store ID.
 	var stores []*roachpb.StoreDescriptor
@@ -5084,7 +5165,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 				}, nil, /* knobs */
 			)
 			target := a.TransferLeaseTarget(
-				context.Background(),
+				ctx,
 				emptySpanConfig(),
 				existing,
 				&mockRepl{
@@ -5201,7 +5282,7 @@ func TestLoadBasedLeaseRebalanceScore(t *testing.T) {
 		remoteStore.Capacity.LeaseCount = c.remoteLeases
 		sourceStore.Capacity.LeaseCount = c.sourceLeases
 		score, _ := loadBasedLeaseRebalanceScore(
-			context.Background(),
+			ctx,
 			st,
 			c.remoteWeight,
 			c.remoteLatency,
@@ -5282,7 +5363,7 @@ func TestAllocatorRemoveTargetBasedOnCapacity(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
@@ -5972,8 +6053,8 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 	}
 
-	stopper, _, sp, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, _, sp, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// Set up eight stores. Stores six and seven are marked as dead. Replica eight
@@ -6080,8 +6161,8 @@ func TestAllocatorComputeActionRemoveDead(t *testing.T) {
 		},
 	}
 
-	stopper, _, sp, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, _, sp, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	for i, tcase := range testCases {
@@ -6153,8 +6234,8 @@ func TestAllocatorComputeActionSuspect(t *testing.T) {
 		},
 	}
 
-	stopper, _, sp, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, _, sp, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	for i, tcase := range testCases {
@@ -6432,8 +6513,8 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		},
 	}
 
-	stopper, _, sp, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, _, sp, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	for i, tcase := range testCases {
@@ -6470,8 +6551,8 @@ func TestAllocatorRemoveLearner(t *testing.T) {
 
 	// Removing a learner is prioritized over adding a new replica to an under
 	// replicated range.
-	stopper, _, sp, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, _, sp, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	live, dead := []roachpb.StoreID{1, 2}, []roachpb.StoreID{3}
 	mockStorePool(sp, live, nil, dead, nil, nil, nil)
@@ -6653,7 +6734,8 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 	}
 
 	var numNodes int
-	stopper, _, _, sp, _ := createTestStorePool(
+	ctx := context.Background()
+	stopper, _, _, sp, _ := createTestStorePool(ctx,
 		TestTimeUntilStoreDeadOff, false, /* deterministic */
 		func() int { return numNodes },
 		livenesspb.NodeLivenessStatus_LIVE)
@@ -6663,7 +6745,6 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		}, nil, /* knobs */
 	)
 
-	ctx := context.Background()
 	defer stopper.Stop(ctx)
 	conf := roachpb.SpanConfig{NumReplicas: 5}
 
@@ -6845,8 +6926,8 @@ func TestAllocatorThrottled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
 	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// First test to make sure we would send the replica to purgatory.
@@ -7167,10 +7248,10 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 		},
 	}
 
-	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.Background())
-	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
+	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 
 	for _, tc := range testCases {
 		t.Run(tc.constraint.String(), func(t *testing.T) {
@@ -7219,7 +7300,9 @@ func (ts *testStore) rebalance(ots *testStore, bytes int64) {
 	if ts.Capacity.RangeCount == 0 || (ts.Capacity.Capacity-ts.Capacity.Available) < bytes {
 		return
 	}
-	// Mimic a real Store's behavior of rejecting preemptive snapshots when full.
+	// Mimic a real Store's behavior of not considering target stores that are
+	// almost out of disk. (In a real allocator this is, for example, in
+	// rankedCandidateListFor{Allocation,Rebalancing}).
 	if !maxCapacityCheck(ots.StoreDescriptor) {
 		log.Infof(context.Background(),
 			"s%d too full to accept snapshot from s%d: %v", ots.StoreID, ts.StoreID, ots.Capacity)
@@ -7257,13 +7340,12 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 	// Model a set of stores in a cluster doing rebalancing, with ranges being
 	// randomly added occasionally.
-	rpcContext := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: tr},
-		Config:     &base.Config{Insecure: true},
-		Clock:      clock,
-		Stopper:    stopper,
-		Settings:   st,
+	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
+		TenantID: roachpb.SystemTenantID,
+		Config:   &base.Config{Insecure: true},
+		Clock:    clock,
+		Stopper:  stopper,
+		Settings: st,
 	})
 	server := rpc.NewServer(rpcContext) // never started
 	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
@@ -7277,7 +7359,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 	mockNodeLiveness := newMockNodeLiveness(livenesspb.NodeLivenessStatus_LIVE)
 	sp := NewStorePool(
-		log.AmbientContext{Tracer: tr},
+		log.MakeTestingAmbientContext(tr),
 		st,
 		g,
 		clock,
@@ -7401,18 +7483,17 @@ func Example_rebalancing() {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tr := tracing.NewTracer()
+	ambientCtx := log.MakeTestingAmbientContext(stopper.Tracer())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 
 	// Model a set of stores in a cluster,
 	// adding / rebalancing ranges of random sizes.
-	rpcContext := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: tr},
-		Config:     &base.Config{Insecure: true},
-		Clock:      clock,
-		Stopper:    stopper,
-		Settings:   st,
+	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
+		TenantID: roachpb.SystemTenantID,
+		Config:   &base.Config{Insecure: true},
+		Clock:    clock,
+		Stopper:  stopper,
+		Settings: st,
 	})
 	server := rpc.NewServer(rpcContext) // never started
 	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
@@ -7426,7 +7507,7 @@ func Example_rebalancing() {
 	// Deterministic must be set as this test is comparing the exact output
 	// after each rebalance.
 	sp := NewStorePool(
-		log.AmbientContext{Tracer: tr},
+		ambientCtx,
 		st,
 		g,
 		clock,
@@ -7528,61 +7609,60 @@ func Example_rebalancing() {
 	}
 	table.Render()
 	fmt.Printf("Total bytes=%d, ranges=%d\n", totBytes, totRanges)
-
 	// Output:
 	// +-----+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+
 	// | gen | store 0  | store 1  | store 2  | store 3  | store 4  | store 5  | store 6  | store 7  | store 8  | store 9  | store 10 | store 11 | store 12 | store 13 | store 14 | store 15 | store 16 | store 17 | store 18 | store 19 |
 	// +-----+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+
 	// |   0 |   2 100% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
-	// |   2 |   3  77% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   1  22% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
-	// |   4 |   3  35% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   2  27% |   0   0% |   0   0% |   0   0% |   0   0% |   3  30% |   0   0% |   0   0% |   0   0% |   0   0% |   1   5% |   0   0% |   0   0% |
-	// |   6 |   3  20% |   0   0% |   0   0% |   0   0% |   1   5% |   1   3% |   0   0% |   3  15% |   0   0% |   0   0% |   1   6% |   0   0% |   3  24% |   2   5% |   0   0% |   2  10% |   0   0% |   3   9% |   0   0% |   0   0% |
-	// |   8 |   4  10% |   0   0% |   0   0% |   0   0% |   3  10% |   3   7% |   0   0% |   4   8% |   0   0% |   0   0% |   3   7% |   1   3% |   4  14% |   4   5% |   0   0% |   4  10% |   1   3% |   4  11% |   1   3% |   1   3% |
-	// |  10 |   5   6% |   5  10% |   0   0% |   1   1% |   4   6% |   4   4% |   1   0% |   5   3% |   0   0% |   2   1% |   4   5% |   3   4% |   5  13% |   5   4% |   0   0% |   5  11% |   3   4% |   5   7% |   3   7% |   3   5% |
-	// |  12 |   6   6% |   6   8% |   6   8% |   3   1% |   5   4% |   5   3% |   3   2% |   6   1% |   4   4% |   4   3% |   5   3% |   5   5% |   6   9% |   6   4% |   3   1% |   6   8% |   5   5% |   6   4% |   5   7% |   5   6% |
-	// |  14 |   8   5% |   8   7% |   8   8% |   5   2% |   7   5% |   7   4% |   5   3% |   8   1% |   6   4% |   6   3% |   7   3% |   7   4% |   8   9% |   8   4% |   5   3% |   8   7% |   7   4% |   8   4% |   7   6% |   7   4% |
-	// |  16 |  10   5% |  10   8% |  10   8% |   7   2% |   9   4% |   9   4% |   7   3% |  10   2% |   8   4% |   8   3% |   9   3% |   9   5% |  10   7% |  10   4% |   7   3% |  10   7% |   9   4% |  10   4% |   9   5% |   9   3% |
-	// |  18 |  12   5% |  12   7% |  12   7% |   9   3% |  11   5% |  11   4% |   9   4% |  12   3% |  10   5% |  10   3% |  11   3% |  11   4% |  12   6% |  12   5% |   9   3% |  12   6% |  11   5% |  12   4% |  11   5% |  11   3% |
-	// |  20 |  14   5% |  14   6% |  14   7% |  11   3% |  13   4% |  13   5% |  11   3% |  14   3% |  12   5% |  12   3% |  13   3% |  13   4% |  14   6% |  14   5% |  11   3% |  14   6% |  13   5% |  14   5% |  13   6% |  13   4% |
-	// |  22 |  16   5% |  16   6% |  16   7% |  13   3% |  15   4% |  15   4% |  13   4% |  16   3% |  14   4% |  14   4% |  15   3% |  15   5% |  16   5% |  16   5% |  13   3% |  16   6% |  15   5% |  16   5% |  15   5% |  15   4% |
-	// |  24 |  18   5% |  18   6% |  18   7% |  15   3% |  17   4% |  17   4% |  15   4% |  18   4% |  16   4% |  16   4% |  17   3% |  17   5% |  18   5% |  18   5% |  15   4% |  18   5% |  17   5% |  18   4% |  17   5% |  17   4% |
-	// |  26 |  20   5% |  20   5% |  20   6% |  17   3% |  19   4% |  19   4% |  17   3% |  20   3% |  18   4% |  18   4% |  19   3% |  19   5% |  20   5% |  20   5% |  17   4% |  20   5% |  19   5% |  20   4% |  19   5% |  19   4% |
-	// |  28 |  22   5% |  22   6% |  22   6% |  19   4% |  21   4% |  21   4% |  19   4% |  22   4% |  20   5% |  20   4% |  21   3% |  21   5% |  22   5% |  22   6% |  19   4% |  22   5% |  21   5% |  22   4% |  21   5% |  21   4% |
-	// |  30 |  24   6% |  24   5% |  24   6% |  21   4% |  23   4% |  23   5% |  21   4% |  24   4% |  22   4% |  22   4% |  23   3% |  23   5% |  24   5% |  24   5% |  21   3% |  24   5% |  23   5% |  24   4% |  23   5% |  23   4% |
-	// |  32 |  26   6% |  26   5% |  26   6% |  23   4% |  25   4% |  25   5% |  23   4% |  26   4% |  24   5% |  24   4% |  25   3% |  25   5% |  26   5% |  26   5% |  23   4% |  26   5% |  25   5% |  26   4% |  25   5% |  25   4% |
-	// |  34 |  28   5% |  28   5% |  28   6% |  25   4% |  27   4% |  27   5% |  25   4% |  28   4% |  26   5% |  26   4% |  27   3% |  27   5% |  28   5% |  28   5% |  25   4% |  28   5% |  27   5% |  28   4% |  27   5% |  27   4% |
-	// |  36 |  30   5% |  30   5% |  30   6% |  27   4% |  29   4% |  29   5% |  27   4% |  30   4% |  28   5% |  28   4% |  29   4% |  29   5% |  30   5% |  30   5% |  27   4% |  30   5% |  29   5% |  30   4% |  29   5% |  29   4% |
-	// |  38 |  32   5% |  32   5% |  32   6% |  29   5% |  31   4% |  31   5% |  29   4% |  32   4% |  30   5% |  30   4% |  31   4% |  31   5% |  32   5% |  32   5% |  29   4% |  32   5% |  31   5% |  32   4% |  31   5% |  31   4% |
-	// |  40 |  34   5% |  34   5% |  34   6% |  31   5% |  33   4% |  33   4% |  31   4% |  34   4% |  32   4% |  32   4% |  33   4% |  33   4% |  34   5% |  34   5% |  31   4% |  34   5% |  33   5% |  34   4% |  33   4% |  33   4% |
-	// |  42 |  36   5% |  36   5% |  36   6% |  33   5% |  35   3% |  35   4% |  33   4% |  36   4% |  34   5% |  34   4% |  35   4% |  35   5% |  36   5% |  36   5% |  33   4% |  36   5% |  35   5% |  36   4% |  35   4% |  35   4% |
-	// |  44 |  38   5% |  38   5% |  38   6% |  35   5% |  37   4% |  37   4% |  35   4% |  38   4% |  36   5% |  36   4% |  37   4% |  37   5% |  38   5% |  38   5% |  35   4% |  38   5% |  37   5% |  38   4% |  37   4% |  37   4% |
-	// |  46 |  40   5% |  40   5% |  40   5% |  37   4% |  39   4% |  39   4% |  37   4% |  40   4% |  38   5% |  38   4% |  39   4% |  39   5% |  40   5% |  40   4% |  37   4% |  40   5% |  39   5% |  40   4% |  39   4% |  39   4% |
-	// |  48 |  42   5% |  42   5% |  42   6% |  39   5% |  41   4% |  41   4% |  39   4% |  42   4% |  40   5% |  40   4% |  41   4% |  41   5% |  42   5% |  42   5% |  39   4% |  42   5% |  41   5% |  42   4% |  41   4% |  41   4% |
-	// |  50 |  44   5% |  44   5% |  44   5% |  41   4% |  43   4% |  43   4% |  41   4% |  44   4% |  42   5% |  42   4% |  43   4% |  43   5% |  44   5% |  44   5% |  41   4% |  44   5% |  43   5% |  44   4% |  43   4% |  43   4% |
-	// |  52 |  46   5% |  46   5% |  46   5% |  43   4% |  45   4% |  45   4% |  43   4% |  46   4% |  44   5% |  44   4% |  45   4% |  45   5% |  46   5% |  46   5% |  43   4% |  46   5% |  45   5% |  46   4% |  45   5% |  45   4% |
-	// |  54 |  48   5% |  48   5% |  48   5% |  45   4% |  47   4% |  47   4% |  45   4% |  48   4% |  46   5% |  46   4% |  47   4% |  47   5% |  48   5% |  48   5% |  45   4% |  48   5% |  47   5% |  48   4% |  47   5% |  47   4% |
-	// |  56 |  50   5% |  50   5% |  50   5% |  47   4% |  49   4% |  49   4% |  47   4% |  50   4% |  48   5% |  48   4% |  49   4% |  49   5% |  50   5% |  50   5% |  47   4% |  50   5% |  49   5% |  50   4% |  49   5% |  49   4% |
-	// |  58 |  52   5% |  52   5% |  52   5% |  49   4% |  51   4% |  51   4% |  49   4% |  52   5% |  50   4% |  50   4% |  51   4% |  51   5% |  52   5% |  52   4% |  49   4% |  52   5% |  51   5% |  52   4% |  51   5% |  51   4% |
-	// |  60 |  54   5% |  54   5% |  54   5% |  51   4% |  53   4% |  53   4% |  51   4% |  54   5% |  52   4% |  52   4% |  53   4% |  53   5% |  54   5% |  54   5% |  51   4% |  54   5% |  53   5% |  54   4% |  53   5% |  53   4% |
-	// |  62 |  56   5% |  56   5% |  56   5% |  53   4% |  55   4% |  55   4% |  53   4% |  56   5% |  54   4% |  54   4% |  55   4% |  55   5% |  56   5% |  56   5% |  53   4% |  56   5% |  55   5% |  56   4% |  55   5% |  55   4% |
-	// |  64 |  58   5% |  58   5% |  58   5% |  55   4% |  57   4% |  57   4% |  55   4% |  58   4% |  56   4% |  56   4% |  57   4% |  57   5% |  58   5% |  58   4% |  55   4% |  58   5% |  57   5% |  58   4% |  57   5% |  57   4% |
-	// |  66 |  60   5% |  60   5% |  60   5% |  57   4% |  59   4% |  59   4% |  57   4% |  60   4% |  58   4% |  58   4% |  59   4% |  59   5% |  60   5% |  60   4% |  57   5% |  60   4% |  59   5% |  60   4% |  59   5% |  59   4% |
-	// |  68 |  62   5% |  62   5% |  62   5% |  59   4% |  61   4% |  61   4% |  59   4% |  62   4% |  60   4% |  60   4% |  61   4% |  61   5% |  62   5% |  62   4% |  59   5% |  62   5% |  61   5% |  62   4% |  61   5% |  61   4% |
-	// |  70 |  64   5% |  64   5% |  64   5% |  61   4% |  63   4% |  63   5% |  61   4% |  64   4% |  62   4% |  62   4% |  63   4% |  63   5% |  64   5% |  64   4% |  61   5% |  64   5% |  63   5% |  64   4% |  63   5% |  63   4% |
-	// |  72 |  66   5% |  66   5% |  66   5% |  63   4% |  65   4% |  65   4% |  63   4% |  66   4% |  64   4% |  64   4% |  65   4% |  65   5% |  66   5% |  66   4% |  63   5% |  66   4% |  65   5% |  66   4% |  65   5% |  65   4% |
-	// |  74 |  68   5% |  68   5% |  68   5% |  65   4% |  67   4% |  67   4% |  65   4% |  68   4% |  66   5% |  66   4% |  67   4% |  67   5% |  68   5% |  68   4% |  65   5% |  68   4% |  67   5% |  68   4% |  67   5% |  67   4% |
-	// |  76 |  70   5% |  70   5% |  70   5% |  67   4% |  69   4% |  69   4% |  67   4% |  70   4% |  68   5% |  68   4% |  69   4% |  69   5% |  70   5% |  70   4% |  67   4% |  70   5% |  69   5% |  70   4% |  69   5% |  69   4% |
-	// |  78 |  72   5% |  72   5% |  72   5% |  69   4% |  71   4% |  71   4% |  69   4% |  72   4% |  70   5% |  70   4% |  71   4% |  71   5% |  72   5% |  72   4% |  69   4% |  72   5% |  71   5% |  72   4% |  71   5% |  71   4% |
-	// |  80 |  74   5% |  74   5% |  74   5% |  71   5% |  73   4% |  73   4% |  71   5% |  74   4% |  72   5% |  72   4% |  73   4% |  73   5% |  74   5% |  74   4% |  71   4% |  74   5% |  73   5% |  74   4% |  73   4% |  73   4% |
-	// |  82 |  76   5% |  76   5% |  76   5% |  73   5% |  75   4% |  75   4% |  73   5% |  76   4% |  74   5% |  74   4% |  75   4% |  75   5% |  76   5% |  76   4% |  73   4% |  76   5% |  75   5% |  76   4% |  75   4% |  75   4% |
-	// |  84 |  78   5% |  78   5% |  78   5% |  75   5% |  77   4% |  77   4% |  75   5% |  78   4% |  76   4% |  76   4% |  77   4% |  77   5% |  78   5% |  78   4% |  75   4% |  78   5% |  77   5% |  78   4% |  77   4% |  77   4% |
-	// |  86 |  80   5% |  80   5% |  80   5% |  77   4% |  79   4% |  79   4% |  77   5% |  80   4% |  78   5% |  78   4% |  79   4% |  79   5% |  80   5% |  80   4% |  77   4% |  80   5% |  79   5% |  80   4% |  79   4% |  79   4% |
-	// |  88 |  82   5% |  82   5% |  82   5% |  79   4% |  81   4% |  81   4% |  79   5% |  82   4% |  80   5% |  80   4% |  81   4% |  81   5% |  82   5% |  82   4% |  79   4% |  82   5% |  81   5% |  82   4% |  81   4% |  81   4% |
-	// |  90 |  84   5% |  84   5% |  84   5% |  81   4% |  83   4% |  83   4% |  81   5% |  84   4% |  82   5% |  82   4% |  83   4% |  83   5% |  84   5% |  84   4% |  81   4% |  84   5% |  83   5% |  84   4% |  83   4% |  83   4% |
-	// |  92 |  86   5% |  86   5% |  86   5% |  83   4% |  85   4% |  85   4% |  83   5% |  86   4% |  84   5% |  84   4% |  85   4% |  85   5% |  86   5% |  86   5% |  83   4% |  86   5% |  85   5% |  86   4% |  85   4% |  85   4% |
-	// |  94 |  88   5% |  88   5% |  88   5% |  85   4% |  87   4% |  87   4% |  85   5% |  88   4% |  86   5% |  86   4% |  87   4% |  87   5% |  88   5% |  88   4% |  85   4% |  88   5% |  87   5% |  88   4% |  87   4% |  87   4% |
-	// |  96 |  90   5% |  90   5% |  90   5% |  87   5% |  89   4% |  89   4% |  87   5% |  90   4% |  88   4% |  88   4% |  89   4% |  89   5% |  90   5% |  90   4% |  87   4% |  90   5% |  89   5% |  90   4% |  89   4% |  89   4% |
-	// |  98 |  92   5% |  92   5% |  92   5% |  89   5% |  91   4% |  91   4% |  89   5% |  92   4% |  90   4% |  90   4% |  91   4% |  91   5% |  92   5% |  92   4% |  89   4% |  92   5% |  91   5% |  92   4% |  91   4% |  91   4% |
+	// |   2 |   3  54% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   2  45% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
+	// |   4 |   3  35% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   2  20% |   1   8% |   3  20% |   0   0% |   0   0% |   0   0% |   0   0% |   1  15% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
+	// |   6 |   3   9% |   0   0% |   0   0% |   1   8% |   0   0% |   1   3% |   3   9% |   3  12% |   3  12% |   0   0% |   1   7% |   0   0% |   2   5% |   3  23% |   0   0% |   0   0% |   2   6% |   0   0% |   0   0% |   0   0% |
+	// |   8 |   4   5% |   2   5% |   0   0% |   3   9% |   0   0% |   3   5% |   4   9% |   4   5% |   4   7% |   0   0% |   3   7% |   1   3% |   4  10% |   4  11% |   0   0% |   0   0% |   4  11% |   1   3% |   1   3% |   0   0% |
+	// |  10 |   5   7% |   3   5% |   1   0% |   4   7% |   3   3% |   4   3% |   5   5% |   5   6% |   5   6% |   2   1% |   4   7% |   3   5% |   5   7% |   5   7% |   2   4% |   2   0% |   5   8% |   3   5% |   3   5% |   1   0% |
+	// |  12 |   7   6% |   5   5% |   3   2% |   6   7% |   5   3% |   6   3% |   7   5% |   7   4% |   7   5% |   4   2% |   6   6% |   5   4% |   7   7% |   7   7% |   4   4% |   4   1% |   7   8% |   5   4% |   5   4% |   3   3% |
+	// |  14 |   9   5% |   7   5% |   5   2% |   8   6% |   7   4% |   8   5% |   9   5% |   9   5% |   9   5% |   6   3% |   8   5% |   7   3% |   9   6% |   9   6% |   6   4% |   6   3% |   9   7% |   7   5% |   7   4% |   5   3% |
+	// |  16 |  11   4% |   9   5% |   7   2% |  10   6% |   9   5% |  10   5% |  11   4% |  11   4% |  11   5% |   8   3% |  10   5% |   9   4% |  11   6% |  11   6% |   8   4% |   8   3% |  11   6% |   9   5% |   9   5% |   7   3% |
+	// |  18 |  13   4% |  11   5% |   9   1% |  12   6% |  11   5% |  12   5% |  13   5% |  13   5% |  13   5% |  10   4% |  12   5% |  11   4% |  13   5% |  13   5% |  10   4% |  10   3% |  13   6% |  11   5% |  11   5% |   9   4% |
+	// |  20 |  15   5% |  13   5% |  11   2% |  14   5% |  13   4% |  14   5% |  15   4% |  15   4% |  15   5% |  12   4% |  14   5% |  13   5% |  15   5% |  15   5% |  12   4% |  12   3% |  15   6% |  13   4% |  13   5% |  11   4% |
+	// |  22 |  17   5% |  15   5% |  13   3% |  16   5% |  15   4% |  16   5% |  17   4% |  17   4% |  17   5% |  14   4% |  16   5% |  15   4% |  17   5% |  17   4% |  14   5% |  14   3% |  17   6% |  15   4% |  15   4% |  13   4% |
+	// |  24 |  19   5% |  17   5% |  15   3% |  18   5% |  17   4% |  18   5% |  19   4% |  19   4% |  19   5% |  16   4% |  18   5% |  17   4% |  19   5% |  19   4% |  16   5% |  16   3% |  19   6% |  17   5% |  17   5% |  15   4% |
+	// |  26 |  21   4% |  19   5% |  17   3% |  20   6% |  19   4% |  20   5% |  21   4% |  21   4% |  21   4% |  18   4% |  20   5% |  19   4% |  21   5% |  21   4% |  18   5% |  18   3% |  21   6% |  19   4% |  19   5% |  17   4% |
+	// |  28 |  23   4% |  21   5% |  19   3% |  22   6% |  21   4% |  22   5% |  23   4% |  23   4% |  23   5% |  20   4% |  22   5% |  21   4% |  23   5% |  23   4% |  20   5% |  20   3% |  23   6% |  21   4% |  21   4% |  19   4% |
+	// |  30 |  25   4% |  23   5% |  21   3% |  24   6% |  23   4% |  24   5% |  25   5% |  25   4% |  25   5% |  22   4% |  24   5% |  23   4% |  25   5% |  25   4% |  22   5% |  22   3% |  25   6% |  23   4% |  23   4% |  21   5% |
+	// |  32 |  27   4% |  25   5% |  23   3% |  26   6% |  25   4% |  26   5% |  27   5% |  27   4% |  27   5% |  24   4% |  26   5% |  25   4% |  27   5% |  27   4% |  24   4% |  24   3% |  27   6% |  25   4% |  25   5% |  23   4% |
+	// |  34 |  29   4% |  27   5% |  25   4% |  28   6% |  27   4% |  28   5% |  29   5% |  29   4% |  29   5% |  26   4% |  28   5% |  27   5% |  29   5% |  29   4% |  26   5% |  26   4% |  29   6% |  27   4% |  27   4% |  25   5% |
+	// |  36 |  31   4% |  29   4% |  27   4% |  30   5% |  29   4% |  30   5% |  31   5% |  31   4% |  31   5% |  28   4% |  30   5% |  29   4% |  31   5% |  31   4% |  28   5% |  28   4% |  31   5% |  29   4% |  29   5% |  27   5% |
+	// |  38 |  33   4% |  31   5% |  29   3% |  32   5% |  31   4% |  32   5% |  33   5% |  33   4% |  33   5% |  30   4% |  32   5% |  31   4% |  33   5% |  33   5% |  30   4% |  30   4% |  33   5% |  31   4% |  31   4% |  29   5% |
+	// |  40 |  35   4% |  33   4% |  31   3% |  34   5% |  33   4% |  34   5% |  35   5% |  35   4% |  35   5% |  32   4% |  34   5% |  33   4% |  35   5% |  35   5% |  32   4% |  32   4% |  35   5% |  33   4% |  33   5% |  31   5% |
+	// |  42 |  37   4% |  35   4% |  33   4% |  36   5% |  35   4% |  36   5% |  37   5% |  37   4% |  37   4% |  34   4% |  36   5% |  35   5% |  37   5% |  37   5% |  34   5% |  34   4% |  37   5% |  35   4% |  35   5% |  33   5% |
+	// |  44 |  39   4% |  37   4% |  35   4% |  38   5% |  37   4% |  38   5% |  39   5% |  39   4% |  39   4% |  36   4% |  38   5% |  37   5% |  39   5% |  39   5% |  36   5% |  36   4% |  39   5% |  37   4% |  37   5% |  35   5% |
+	// |  46 |  41   4% |  39   4% |  37   3% |  40   5% |  39   4% |  40   5% |  41   5% |  41   4% |  41   4% |  38   4% |  40   5% |  39   5% |  41   5% |  41   5% |  38   5% |  38   4% |  41   5% |  39   4% |  39   5% |  37   5% |
+	// |  48 |  43   4% |  41   4% |  39   3% |  42   5% |  41   4% |  42   5% |  43   5% |  43   4% |  43   4% |  40   4% |  42   5% |  41   4% |  43   5% |  43   5% |  40   5% |  40   4% |  43   5% |  41   4% |  41   5% |  39   5% |
+	// |  50 |  45   4% |  43   4% |  41   4% |  44   5% |  43   4% |  44   5% |  45   5% |  45   4% |  45   4% |  42   4% |  44   5% |  43   4% |  45   5% |  45   5% |  42   5% |  42   4% |  45   5% |  43   5% |  43   5% |  41   5% |
+	// |  52 |  47   4% |  45   4% |  43   3% |  46   5% |  45   4% |  46   5% |  47   5% |  47   4% |  47   4% |  44   4% |  46   5% |  45   5% |  47   5% |  47   5% |  44   5% |  44   4% |  47   5% |  45   5% |  45   5% |  43   5% |
+	// |  54 |  49   4% |  47   4% |  45   3% |  48   5% |  47   4% |  48   5% |  49   5% |  49   4% |  49   4% |  46   4% |  48   5% |  47   4% |  49   5% |  49   5% |  46   5% |  46   4% |  49   5% |  47   5% |  47   5% |  45   5% |
+	// |  56 |  51   4% |  49   5% |  47   3% |  50   5% |  49   4% |  50   5% |  51   5% |  51   4% |  51   4% |  48   4% |  50   5% |  49   4% |  51   5% |  51   5% |  48   5% |  48   4% |  51   5% |  49   5% |  49   4% |  47   5% |
+	// |  58 |  53   4% |  51   5% |  49   3% |  52   5% |  51   4% |  52   5% |  53   5% |  53   4% |  53   4% |  50   4% |  52   5% |  51   4% |  53   5% |  53   4% |  50   5% |  50   4% |  53   5% |  51   5% |  51   4% |  49   5% |
+	// |  60 |  55   4% |  53   5% |  51   3% |  54   5% |  53   4% |  54   5% |  55   5% |  55   4% |  55   4% |  52   4% |  54   5% |  53   4% |  55   5% |  55   4% |  52   5% |  52   4% |  55   5% |  53   5% |  53   4% |  51   5% |
+	// |  62 |  57   4% |  55   5% |  53   3% |  56   5% |  55   4% |  56   5% |  57   5% |  57   4% |  57   4% |  54   4% |  56   5% |  55   4% |  57   5% |  57   4% |  54   5% |  54   4% |  57   5% |  55   5% |  55   4% |  53   4% |
+	// |  64 |  59   4% |  57   5% |  55   4% |  58   5% |  57   4% |  58   5% |  59   5% |  59   4% |  59   4% |  56   4% |  58   5% |  57   4% |  59   5% |  59   4% |  56   5% |  56   4% |  59   5% |  57   5% |  57   4% |  55   5% |
+	// |  66 |  61   4% |  59   5% |  57   4% |  60   5% |  59   4% |  60   5% |  61   5% |  61   4% |  61   4% |  58   4% |  60   5% |  59   4% |  61   5% |  61   4% |  58   5% |  58   4% |  61   5% |  59   5% |  59   4% |  57   5% |
+	// |  68 |  63   4% |  61   5% |  59   4% |  62   5% |  61   4% |  62   5% |  63   5% |  63   4% |  63   4% |  60   4% |  62   5% |  61   4% |  63   5% |  63   4% |  60   5% |  60   4% |  63   5% |  61   5% |  61   4% |  59   5% |
+	// |  70 |  65   4% |  63   5% |  61   4% |  64   5% |  63   4% |  64   5% |  65   5% |  65   4% |  65   5% |  62   4% |  64   5% |  63   4% |  65   5% |  65   4% |  62   5% |  62   5% |  65   5% |  63   5% |  63   4% |  61   5% |
+	// |  72 |  67   4% |  65   5% |  63   4% |  66   5% |  65   4% |  66   5% |  67   5% |  67   4% |  67   5% |  64   4% |  66   5% |  65   4% |  67   5% |  67   4% |  64   5% |  64   5% |  67   5% |  65   5% |  65   4% |  63   5% |
+	// |  74 |  69   4% |  67   5% |  65   4% |  68   5% |  67   4% |  68   5% |  69   5% |  69   4% |  69   4% |  66   4% |  68   5% |  67   5% |  69   5% |  69   4% |  66   5% |  66   5% |  69   5% |  67   5% |  67   4% |  65   5% |
+	// |  76 |  71   4% |  69   5% |  67   4% |  70   5% |  69   4% |  70   5% |  71   5% |  71   4% |  71   4% |  68   4% |  70   5% |  69   5% |  71   5% |  71   4% |  68   5% |  68   4% |  71   5% |  69   5% |  69   4% |  67   5% |
+	// |  78 |  73   4% |  71   5% |  69   4% |  72   5% |  71   4% |  72   5% |  73   5% |  73   4% |  73   4% |  70   4% |  72   5% |  71   5% |  73   5% |  73   4% |  70   5% |  70   4% |  73   5% |  71   5% |  71   4% |  69   5% |
+	// |  80 |  75   4% |  73   4% |  71   4% |  74   5% |  73   4% |  74   5% |  75   5% |  75   4% |  75   4% |  72   5% |  74   5% |  73   4% |  75   5% |  75   4% |  72   5% |  72   4% |  75   5% |  73   5% |  73   4% |  71   5% |
+	// |  82 |  77   4% |  75   4% |  73   4% |  76   5% |  75   4% |  76   5% |  77   5% |  77   4% |  77   4% |  74   5% |  76   4% |  75   5% |  77   5% |  77   4% |  74   5% |  74   4% |  77   5% |  75   4% |  75   4% |  73   5% |
+	// |  84 |  79   4% |  77   4% |  75   4% |  78   5% |  77   4% |  78   5% |  79   5% |  79   4% |  79   4% |  76   5% |  78   5% |  77   4% |  79   5% |  79   4% |  76   5% |  76   4% |  79   5% |  77   5% |  77   5% |  75   5% |
+	// |  86 |  81   4% |  79   4% |  77   4% |  80   5% |  79   4% |  80   5% |  81   5% |  81   4% |  81   4% |  78   5% |  80   5% |  79   5% |  81   5% |  81   4% |  78   5% |  78   4% |  81   5% |  79   4% |  79   4% |  77   5% |
+	// |  88 |  83   4% |  81   4% |  79   4% |  82   5% |  81   5% |  82   5% |  83   5% |  83   4% |  83   4% |  80   5% |  82   4% |  81   5% |  83   5% |  83   4% |  80   5% |  80   4% |  83   5% |  81   4% |  81   4% |  79   5% |
+	// |  90 |  85   4% |  83   4% |  81   4% |  84   5% |  83   5% |  84   5% |  85   5% |  85   4% |  85   4% |  82   5% |  84   4% |  83   5% |  85   5% |  85   5% |  82   5% |  82   4% |  85   5% |  83   4% |  83   5% |  81   5% |
+	// |  92 |  87   4% |  85   4% |  83   4% |  86   5% |  85   5% |  86   5% |  87   5% |  87   4% |  87   4% |  84   5% |  86   5% |  85   5% |  87   5% |  87   5% |  84   5% |  84   4% |  87   5% |  85   4% |  85   4% |  83   5% |
+	// |  94 |  89   4% |  87   4% |  85   4% |  88   5% |  87   5% |  88   5% |  89   5% |  89   4% |  89   4% |  86   5% |  88   5% |  87   4% |  89   5% |  89   5% |  86   5% |  86   4% |  89   5% |  87   4% |  87   4% |  85   5% |
+	// |  96 |  91   4% |  89   4% |  87   4% |  90   5% |  89   5% |  90   5% |  91   5% |  91   4% |  91   4% |  88   5% |  90   4% |  89   4% |  91   5% |  91   5% |  88   5% |  88   4% |  91   5% |  89   4% |  89   4% |  87   5% |
+	// |  98 |  93   4% |  91   4% |  89   4% |  92   5% |  91   5% |  92   5% |  93   5% |  93   4% |  93   4% |  90   5% |  92   4% |  91   4% |  93   5% |  93   5% |  90   5% |  90   4% |  93   5% |  91   5% |  91   4% |  89   5% |
 	// +-----+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+
-	// Total bytes=957538798, ranges=1840
+	// Total bytes=968307769, ranges=1850
 }

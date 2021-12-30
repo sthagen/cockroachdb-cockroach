@@ -9,7 +9,6 @@
 // licenses/APL.txt.
 
 import { createSelector } from "reselect";
-import moment, { Moment } from "moment";
 import {
   aggregateStatementStats,
   appAttr,
@@ -26,14 +25,17 @@ import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { RouteComponentProps } from "react-router-dom";
 
 import { AppState } from "src/store";
-import { StatementsState } from "../store/statements";
 import { selectDiagnosticsReportsPerStatement } from "../store/statementDiagnostics";
 import { AggregateStatistics } from "../statementsTable";
+import { sqlStatsSelector } from "../store/sqlStats/sqlStats.selector";
+import { SQLStatsState } from "../store/sqlStats";
 
 type ICollectedStatementStatistics = cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 export interface StatementsSummaryData {
   statement: string;
+  statementSummary: string;
   aggregatedTs: number;
+  aggregationInterval: number;
   implicitTxn: boolean;
   fullScan: boolean;
   database: string;
@@ -45,11 +47,6 @@ export const adminUISelector = createSelector(
   adminUiState => adminUiState,
 );
 
-export const statementsSelector = createSelector(
-  adminUISelector,
-  adminUiState => adminUiState.statements,
-);
-
 export const localStorageSelector = createSelector(
   adminUISelector,
   adminUiState => adminUiState.localStorage,
@@ -57,51 +54,50 @@ export const localStorageSelector = createSelector(
 
 // selectApps returns the array of all apps with statement statistics present
 // in the data.
-export const selectApps = createSelector(
-  statementsSelector,
-  statementsState => {
-    if (!statementsState.data) {
-      return [];
-    }
+export const selectApps = createSelector(sqlStatsSelector, sqlStatsState => {
+  if (!sqlStatsState.data || !sqlStatsState.valid) {
+    return [];
+  }
 
-    let sawBlank = false;
-    let sawInternal = false;
-    const apps: { [app: string]: boolean } = {};
-    statementsState.data.statements.forEach(
-      (statement: ICollectedStatementStatistics) => {
-        if (
-          statementsState.data.internal_app_name_prefix &&
-          statement.key.key_data.app.startsWith(
-            statementsState.data.internal_app_name_prefix,
-          )
-        ) {
-          sawInternal = true;
-        } else if (statement.key.key_data.app) {
-          apps[statement.key.key_data.app] = true;
-        } else {
-          sawBlank = true;
-        }
-      },
-    );
-    return []
-      .concat(sawInternal ? ["(internal)"] : [])
-      .concat(sawBlank ? ["(unset)"] : [])
-      .concat(Object.keys(apps));
-  },
-);
+  let sawBlank = false;
+  let sawInternal = false;
+  const apps: { [app: string]: boolean } = {};
+  sqlStatsState.data.statements.forEach(
+    (statement: ICollectedStatementStatistics) => {
+      if (
+        sqlStatsState.data.internal_app_name_prefix &&
+        statement.key.key_data.app.startsWith(
+          sqlStatsState.data.internal_app_name_prefix,
+        )
+      ) {
+        sawInternal = true;
+      } else if (statement.key.key_data.app) {
+        apps[statement.key.key_data.app] = true;
+      } else {
+        sawBlank = true;
+      }
+    },
+  );
+  return []
+    .concat(sawInternal ? [sqlStatsState.data.internal_app_name_prefix] : [])
+    .concat(sawBlank ? ["(unset)"] : [])
+    .concat(Object.keys(apps));
+});
 
 // selectDatabases returns the array of all databases with statement statistics present
 // in the data.
 export const selectDatabases = createSelector(
-  statementsSelector,
-  statementsState => {
-    if (!statementsState.data) {
+  sqlStatsSelector,
+  sqlStatsState => {
+    if (!sqlStatsState.data) {
       return [];
     }
 
     return Array.from(
       new Set(
-        statementsState.data.statements.map(s => s.key.key_data.database),
+        sqlStatsState.data.statements.map(s =>
+          s.key.key_data.database ? s.key.key_data.database : "(unset)",
+        ),
       ),
     ).filter((dbName: string) => dbName !== null && dbName.length > 0);
   },
@@ -110,7 +106,7 @@ export const selectDatabases = createSelector(
 // selectTotalFingerprints returns the count of distinct statement fingerprints
 // present in the data.
 export const selectTotalFingerprints = createSelector(
-  statementsSelector,
+  sqlStatsSelector,
   state => {
     if (!state.data) {
       return 0;
@@ -122,7 +118,7 @@ export const selectTotalFingerprints = createSelector(
 
 // selectLastReset returns a string displaying the last time the statement
 // statistics were reset.
-export const selectLastReset = createSelector(statementsSelector, state => {
+export const selectLastReset = createSelector(sqlStatsSelector, state => {
   if (!state.data) {
     return "";
   }
@@ -131,11 +127,11 @@ export const selectLastReset = createSelector(statementsSelector, state => {
 });
 
 export const selectStatements = createSelector(
-  statementsSelector,
+  sqlStatsSelector,
   (_: AppState, props: RouteComponentProps) => props,
   selectDiagnosticsReportsPerStatement,
   (
-    state: StatementsState,
+    state: SQLStatsState,
     props: RouteComponentProps<any>,
     diagnosticsReportsPerStatement,
   ): AggregateStatistics[] => {
@@ -149,17 +145,24 @@ export const selectStatements = createSelector(
       statement.app.startsWith(state.data.internal_app_name_prefix);
 
     if (app && app !== "All") {
-      let criteria = decodeURIComponent(app);
+      const criteria = decodeURIComponent(app).split(",");
       let showInternal = false;
-      if (criteria === "(unset)") {
-        criteria = "";
-      } else if (criteria === "(internal)") {
+      if (criteria.includes(state.data.internal_app_name_prefix)) {
         showInternal = true;
+      }
+      if (criteria.includes("(unset)")) {
+        criteria.push("");
       }
 
       statements = statements.filter(
         (statement: ExecutionStatistics) =>
-          (showInternal && isInternal(statement)) || statement.app === criteria,
+          (showInternal && isInternal(statement)) ||
+          criteria.includes(statement.app),
+      );
+    } else {
+      // We don't want to show internal statements by default.
+      statements = statements.filter(
+        (statement: ExecutionStatistics) => !isInternal(statement),
       );
     }
 
@@ -171,7 +174,9 @@ export const selectStatements = createSelector(
       if (!(key in statsByStatementKey)) {
         statsByStatementKey[key] = {
           statement: stmt.statement,
+          statementSummary: stmt.statement_summary,
           aggregatedTs: stmt.aggregated_ts,
+          aggregationInterval: stmt.aggregation_interval,
           implicitTxn: stmt.implicit_txn,
           fullScan: stmt.full_scan,
           database: stmt.database,
@@ -185,7 +190,9 @@ export const selectStatements = createSelector(
       const stmt = statsByStatementKey[key];
       return {
         label: stmt.statement,
+        summary: stmt.statementSummary,
         aggregatedTs: stmt.aggregatedTs,
+        aggregationInterval: stmt.aggregationInterval,
         implicitTxn: stmt.implicitTxn,
         fullScan: stmt.fullScan,
         database: stmt.database,
@@ -197,7 +204,7 @@ export const selectStatements = createSelector(
 );
 
 export const selectStatementsLastError = createSelector(
-  statementsSelector,
+  sqlStatsSelector,
   state => state.lastError,
 );
 
@@ -210,16 +217,22 @@ export const selectColumns = createSelector(
       : null,
 );
 
-export const selectLocalStorageDateRange = createSelector(
+export const selectTimeScale = createSelector(
   localStorageSelector,
-  localStorage => localStorage["dateRange/StatementsPage"],
+  localStorage => localStorage["timeScale/SQLActivity"],
 );
 
-export const selectDateRange = createSelector(
-  selectLocalStorageDateRange,
-  dateRange =>
-    [moment.unix(dateRange.start).utc(), moment.unix(dateRange.end).utc()] as [
-      Moment,
-      Moment,
-    ],
+export const selectSortSetting = createSelector(
+  localStorageSelector,
+  localStorage => localStorage["sortSetting/StatementsPage"],
+);
+
+export const selectFilters = createSelector(
+  localStorageSelector,
+  localStorage => localStorage["filters/StatementsPage"],
+);
+
+export const selectSearch = createSelector(
+  localStorageSelector,
+  localStorage => localStorage["search/StatementsPage"],
 );

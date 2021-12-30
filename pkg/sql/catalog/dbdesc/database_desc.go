@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
@@ -81,6 +82,8 @@ func (desc *immutable) DatabaseDesc() *descpb.DatabaseDescriptor {
 }
 
 // SetDrainingNames implements the MutableDescriptor interface.
+//
+// Deprecated: Do not use.
 func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
 	desc.DrainingNames = names
 }
@@ -135,6 +138,16 @@ func (desc *immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// ByteSize implements the Descriptor interface.
+func (desc *immutable) ByteSize() int64 {
+	return int64(desc.Size())
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
+	return NewBuilder(desc.DatabaseDesc())
+}
+
 // IsMultiRegion implements the DatabaseDescriptor interface.
 func (desc *immutable) IsMultiRegion() bool {
 	return desc.RegionConfig != nil
@@ -178,6 +191,22 @@ func (desc *immutable) ForEachSchemaInfo(
 	return nil
 }
 
+// ForEachNonDroppedSchema implements the DatabaseDescriptor interface.
+func (desc *immutable) ForEachNonDroppedSchema(f func(id descpb.ID, name string) error) error {
+	for name, info := range desc.Schemas {
+		if info.Dropped {
+			continue
+		}
+		if err := f(info.ID, name); err != nil {
+			if iterutil.Done(err) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // GetSchemaID implements the DatabaseDescriptor interface.
 func (desc *immutable) GetSchemaID(name string) descpb.ID {
 	info := desc.Schemas[name]
@@ -187,7 +216,21 @@ func (desc *immutable) GetSchemaID(name string) descpb.ID {
 	return info.ID
 }
 
-// GetNonDroppedSchemaName implements the DatabaseDescriptor interface.
+// HasPublicSchemaWithDescriptor returns if the database has a public schema
+// with a descriptor.
+// If descs.Schemas has an explicit entry for "public", then it has a descriptor
+// otherwise it is an implicit public schema.
+func (desc *immutable) HasPublicSchemaWithDescriptor() bool {
+	// The system database does not have a public schema backed by a descriptor.
+	if desc.ID == keys.SystemDatabaseID {
+		return false
+	}
+	_, found := desc.Schemas[tree.PublicSchema]
+	return found
+}
+
+// GetNonDroppedSchemaName returns the name in the schema mapping entry for the
+// given ID, if it's not marked as dropped, empty string otherwise.
 func (desc *immutable) GetNonDroppedSchemaName(schemaID descpb.ID) string {
 	for name, info := range desc.Schemas {
 		if !info.Dropped && info.ID == schemaID {
@@ -366,6 +409,8 @@ func (desc *Mutable) SetOffline(reason string) {
 
 // AddDrainingName adds a draining name to the DatabaseDescriptor's slice of
 // draining names.
+//
+// Deprecated: Do not use.
 func (desc *Mutable) AddDrainingName(name descpb.NameInfo) {
 	desc.DrainingNames = append(desc.DrainingNames, name)
 }
@@ -416,7 +461,7 @@ func (desc *Mutable) HasPostDeserializationChanges() bool {
 func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
 	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
 	if defaultPrivilegeDescriptor == nil {
-		defaultPrivilegeDescriptor = catprivilege.MakeNewDefaultPrivilegeDescriptor()
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_DATABASE)
 	}
 	return catprivilege.MakeDefaultPrivileges(defaultPrivilegeDescriptor)
 }
@@ -425,7 +470,7 @@ func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeD
 func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutable {
 	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
 	if defaultPrivilegeDescriptor == nil {
-		defaultPrivilegeDescriptor = catprivilege.MakeNewDefaultPrivilegeDescriptor()
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_DATABASE)
 	}
 	return catprivilege.NewMutableDefaultPrivileges(defaultPrivilegeDescriptor)
 }
@@ -436,6 +481,20 @@ func (desc *Mutable) SetDefaultPrivilegeDescriptor(
 	defaultPrivilegeDescriptor *descpb.DefaultPrivilegeDescriptor,
 ) {
 	desc.DefaultPrivileges = defaultPrivilegeDescriptor
+}
+
+// AddSchemaToDatabase adds a schemaName and schemaInfo entry into the
+// database's Schemas map. If the map is nil, then we create a map before
+// adding the entry.
+// If there is an existing entry in the map with schemaName as the key,
+// it will be overridden.
+func (desc *Mutable) AddSchemaToDatabase(
+	schemaName string, schemaInfo descpb.DatabaseDescriptor_SchemaInfo,
+) {
+	if desc.Schemas == nil {
+		desc.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
+	}
+	desc.Schemas[schemaName] = schemaInfo
 }
 
 // maybeRemoveDroppedSelfEntryFromSchemas removes an entry in the Schemas map corresponding to the

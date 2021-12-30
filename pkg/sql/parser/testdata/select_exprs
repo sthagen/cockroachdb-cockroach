@@ -1662,7 +1662,7 @@ SELECT a IS NAN
 ----
 SELECT a = 'NaN' -- normalized!
 SELECT ((a) = ('NaN')) -- fully parenthesized
-SELECT a = '_' -- literals removed
+SELECT a = _ -- literals removed
 SELECT _ = 'NaN' -- identifiers removed
 
 parse
@@ -1670,7 +1670,7 @@ SELECT a IS NOT NAN
 ----
 SELECT a != 'NaN' -- normalized!
 SELECT ((a) != ('NaN')) -- fully parenthesized
-SELECT a != '_' -- literals removed
+SELECT a != _ -- literals removed
 SELECT _ != 'NaN' -- identifiers removed
 
 parse
@@ -1806,4 +1806,20 @@ SELECT (0) FROM y[array[]]
 at or near "[": syntax error
 DETAIL: source SQL:
 SELECT (0) FROM y[array[]]
+                 ^
+
+parse
+SELECT ''::void
+----
+SELECT ''::VOID -- normalized!
+SELECT (('')::VOID) -- fully parenthesized
+SELECT '_'::VOID -- literals removed
+SELECT ''::VOID -- identifiers removed
+
+error
+SELECT ''::void[]
+----
+at or near "EOF": syntax error: type void[] does not exist
+DETAIL: source SQL:
+SELECT ''::void[]
                  ^

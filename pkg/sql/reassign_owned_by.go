@@ -43,7 +43,7 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 		return nil, err
 	}
 
-	normalizedOldRoles, err := n.OldRoles.ToSQLUsernames(p.SessionData())
+	normalizedOldRoles, err := n.OldRoles.ToSQLUsernames(p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +59,7 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", oldRole)
 		}
 	}
-	newRole, err := n.NewRole.ToSQLUsername(p.SessionData())
+	newRole, err := n.NewRole.ToSQLUsername(p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return nil, err
 	}
@@ -137,11 +137,18 @@ func (n *reassignOwnedByNode) startExec(params runParams) error {
 		}
 		for _, schemaID := range lCtx.schemaIDs {
 			if IsOwner(lCtx.schemaDescs[schemaID], oldRole) {
+				// Don't reassign public schema.
+				// TODO(richardjcai): revisit this in 22.2, in 22.1 we do not allow
+				// modifying the public schema.
+				if lCtx.schemaDescs[schemaID].GetName() == tree.PublicSchema {
+					continue
+				}
 				if err := n.reassignSchemaOwner(lCtx.schemaDescs[schemaID], currentDbDesc, params); err != nil {
 					return err
 				}
 			}
 		}
+
 		for _, tbID := range lCtx.tbIDs {
 			if IsOwner(lCtx.tbDescs[tbID], oldRole) {
 				if err := n.reassignTableOwner(lCtx.tbDescs[tbID], params); err != nil {
@@ -167,7 +174,7 @@ func (n *reassignOwnedByNode) reassignDatabaseOwner(
 	if err != nil {
 		return err
 	}
-	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData())
+	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return err
 	}
@@ -192,7 +199,7 @@ func (n *reassignOwnedByNode) reassignSchemaOwner(
 	if err != nil {
 		return err
 	}
-	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData())
+	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return err
 	}
@@ -223,7 +230,7 @@ func (n *reassignOwnedByNode) reassignTableOwner(
 		return err
 	}
 
-	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData())
+	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return err
 	}
@@ -262,7 +269,7 @@ func (n *reassignOwnedByNode) reassignTypeOwner(
 		return err
 	}
 
-	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData())
+	owner, err := n.n.NewRole.ToSQLUsername(params.p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return err
 	}

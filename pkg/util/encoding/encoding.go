@@ -101,15 +101,15 @@ const (
 	geoInvertedIndexMarker = box2DMarker + 1
 
 	emptyArray = geoInvertedIndexMarker + 1
+	voidMarker = emptyArray + 1
 
 	arrayKeyTerminator           byte = 0x00
 	arrayKeyDescendingTerminator byte = 0xFF
-	// We use different null encodings for nulls within key arrays.
-	// Doing this allows for the terminator to be less/greater than
-	// the null value within arrays. These byte values overlap with
-	// encodedNotNull, encodedNotNullDesc, and interleavedSentinel,
-	// but they can only exist within an encoded array key. Because
-	// of the context, they cannot be ambiguous with these other bytes.
+	// We use different null encodings for nulls within key arrays. Doing this
+	// allows for the terminator to be less/greater than the null value within
+	// arrays. These byte values overlap with encodedNotNull and
+	// encodedNotNullDesc, but they can only exist within an encoded array key.
+	// Because of the context, they cannot be ambiguous with these other bytes.
 	ascendingNullWithinArrayKey  byte = 0x01
 	descendingNullWithinArrayKey byte = 0xFE
 
@@ -126,16 +126,7 @@ const (
 	// This value is not actually ever present in a stored key, but
 	// it's used in keys used as span boundaries for index scans.
 	encodedNotNullDesc = 0xfe
-	// interleavedSentinel uses the same byte as encodedNotNullDesc.
-	// It is used in the key encoding of interleaved index keys in order
-	// to coerce the key to sort after its respective parent and ancestors'
-	// index keys.
-	// The byte for NotNullDesc was chosen over NullDesc since NotNullDesc
-	// is never used in actual encoded keys.
-	// This allowed the key pretty printer for interleaved keys to work
-	// without table descriptors.
-	interleavedSentinel = 0xfe
-	encodedNullDesc     = 0xff
+	encodedNullDesc    = 0xff
 
 	// offsetSecsToMicros is a constant that allows conversion from seconds
 	// to microseconds for offsetSecs type calculations (e.g. for TimeTZ).
@@ -990,14 +981,6 @@ func EncodeNotNullDescending(b []byte) []byte {
 	return append(b, encodedNotNullDesc)
 }
 
-// EncodeInterleavedSentinel encodes an interleavedSentinel that is necessary
-// for interleaved indexes and their index keys.
-// The interleavedSentinel has a byte value 0xfe and is equivalent to
-// encodedNotNullDesc.
-func EncodeInterleavedSentinel(b []byte) []byte {
-	return append(b, interleavedSentinel)
-}
-
 // DecodeIfNull decodes a NULL value from the input buffer. If the input buffer
 // contains a null at the start of the buffer then it is removed from the
 // buffer and true is returned for the second result. Otherwise, the buffer is
@@ -1026,31 +1009,6 @@ func DecodeIfNotNull(b []byte) ([]byte, bool) {
 		return b[1:], true
 	}
 	return b, false
-}
-
-// DecodeIfNotNullDescending decodes encodedNotNullDesc from the input buffer
-// and returns the remaining buffer without the sentinel if encodedNotNullDesc
-// is the first byte.
-// Otherwise, the buffer is returned unchanged and false is returned.
-func DecodeIfNotNullDescending(b []byte) ([]byte, bool) {
-	if len(b) == 0 {
-		return b, false
-	}
-
-	if b[0] == encodedNotNullDesc {
-		return b[1:], true
-	}
-
-	return b, false
-}
-
-// DecodeIfInterleavedSentinel decodes the interleavedSentinel from the input
-// buffer and returns the remaining buffer without the sentinel if the
-// interleavedSentinel is the first byte.
-// Otherwise, the buffer is returned unchanged and false is returned.
-func DecodeIfInterleavedSentinel(b []byte) ([]byte, bool) {
-	// The interleavedSentinel is equivalent to encodedNotNullDesc
-	return DecodeIfNotNullDescending(b)
 }
 
 // EncodeTimeAscending encodes a time value, appends it to the supplied buffer,
@@ -1110,6 +1068,19 @@ func decodeTime(b []byte) (r []byte, sec int64, nsec int64, err error) {
 		return b, 0, 0, err
 	}
 	return b, sec, nsec, nil
+}
+
+// EncodeVoidAscendingOrDescending encodes a void (valid for both ascending and descending order).
+func EncodeVoidAscendingOrDescending(b []byte) []byte {
+	return append(b, voidMarker)
+}
+
+// DecodeVoidAscendingOrDescending decodes a void  (valid for both ascending and descending order).
+func DecodeVoidAscendingOrDescending(b []byte) ([]byte, error) {
+	if PeekType(b) != Void {
+		return nil, errors.Errorf("did not find Void marker")
+	}
+	return b[1:], nil
 }
 
 // EncodeBox2DAscending encodes a bounding box in ascending order.
@@ -1602,6 +1573,7 @@ const (
 	ArrayKeyAsc  Type = 22 // Array key encoding
 	ArrayKeyDesc Type = 23 // Array key encoded descendingly
 	Box2D        Type = 24
+	Void         Type = 25
 )
 
 // typMap maps an encoded type byte to a decoded Type. It's got 256 slots, one
@@ -1670,6 +1642,8 @@ func slowPeekType(b []byte) Type {
 			return Float
 		case m >= decimalNaN && m <= decimalNaNDesc:
 			return Decimal
+		case m == voidMarker:
+			return Void
 		}
 	}
 	return Unknown
@@ -1759,13 +1733,11 @@ func PeekLength(b []byte) (int, error) {
 	switch m {
 	case encodedNull, encodedNullDesc, encodedNotNull, encodedNotNullDesc,
 		floatNaN, floatNaNDesc, floatZero, decimalZero, byte(True), byte(False),
-		emptyArray:
-		// interleavedSentinel also falls into this path. Since it
-		// contains the same byte value as encodedNotNullDesc, it
-		// cannot be included explicitly in the case statement.
+		emptyArray, voidMarker:
 		// ascendingNullWithinArrayKey and descendingNullWithinArrayKey also
 		// contain the same byte values as encodedNotNull and encodedNotNullDesc
-		// respectively.
+		// respectively, but they cannot be included explicitly in the case
+		// statement.
 		return 1, nil
 	case bitArrayMarker, bitArrayDescMarker:
 		terminator := byte(bitArrayDataTerminator)
@@ -1908,27 +1880,7 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 // after decoding.
 //
 // Ascending will be the default direction (when dir is the 0 value) for all
-// values except for NotNull.
-//
-// NotNull: if Ascending or Descending directions are explicitly provided (i.e.
-// for table keys), then !NULL will be used. Otherwise, # will be used.
-//
-// We prove that the default # will only be used for interleaved sentinels:
-//  - For non-table keys, we never have NotNull.
-//  - For table keys, we always explicitly pass in Ascending and Descending for
-//    all key values, including NotNulls. The only case we do not pass in
-//    direction is during a SHOW RANGES ON TABLE parent and there exists
-//    an interleaved split key. Note that interleaved keys cannot have NotNull
-//    values except for the interleaved sentinel.
-//
-// Defaulting to Ascending for all other value types is fine since all
-// non-table keys encode values with Ascending.
-//
-// The only case where we end up defaulting direction for table keys is for
-// interleaved split keys in SHOW RANGES ON TABLE parent. Since
-// interleaved prefixes are defined on the primary key (and primary key values
-// are always encoded Ascending), this will always print out the correct key
-// even if we don't have directions for the child index's columns.
+// values.
 func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 	var err error
 	switch typ := PeekType(b); typ {
@@ -1982,15 +1934,7 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 		build.WriteString("]")
 		return buf, build.String(), nil
 	case NotNull:
-		// The tag can be either encodedNotNull or encodedNotNullDesc. The
-		// latter can be an interleaved sentinel.
-		isNotNullDesc := (b[0] == encodedNotNullDesc)
 		b, _ = DecodeIfNotNull(b)
-		if dir != Ascending && dir != Descending && isNotNullDesc {
-			// Unspecified direction (0 value) will default to '#' for the
-			// interleaved sentinel.
-			return b, "#", nil
-		}
 		return b, "!NULL", nil
 	case Int:
 		var i int64
@@ -2386,6 +2330,12 @@ func EncodeTimeTZValue(appendTo []byte, colID uint32, t timetz.TimeTZ) []byte {
 func EncodeUntaggedTimeTZValue(appendTo []byte, t timetz.TimeTZ) []byte {
 	appendTo = EncodeNonsortingStdlibVarint(appendTo, int64(t.TimeOfDay))
 	return EncodeNonsortingStdlibVarint(appendTo, int64(t.OffsetSecs))
+}
+
+// EncodeVoidValue encodes a void with its value tag, appends it to
+// the supplied buffer and returns the final buffer.
+func EncodeVoidValue(appendTo []byte, colID uint32) []byte {
+	return EncodeValueTag(appendTo, colID, Void)
 }
 
 // EncodeBox2DValue encodes a geopb.BoundingBox with its value tag, appends it to
@@ -2890,6 +2840,8 @@ func PeekValueLengthWithOffsetsAndType(b []byte, dataOffset int, typ Type) (leng
 	switch typ {
 	case Null:
 		return dataOffset, nil
+	case Void:
+		return dataOffset, nil
 	case True, False:
 		return dataOffset, nil
 	case Int:
@@ -3059,29 +3011,6 @@ func PrettyPrintValueEncoded(b []byte) ([]byte, string, error) {
 	default:
 		return b, "", errors.Errorf("unknown type %s", typ)
 	}
-}
-
-// DecomposeKeyTokens breaks apart a key into its individual key-encoded values
-// and returns a slice of byte slices, one for each key-encoded value.
-// It also returns whether the key contains a NULL value.
-func DecomposeKeyTokens(b []byte) (tokens [][]byte, containsNull bool, err error) {
-	var out [][]byte
-
-	for len(b) > 0 {
-		tokenLen, err := PeekLength(b)
-		if err != nil {
-			return nil, false, err
-		}
-
-		if PeekType(b) == Null {
-			containsNull = true
-		}
-
-		out = append(out, b[:tokenLen])
-		b = b[tokenLen:]
-	}
-
-	return out, containsNull, nil
 }
 
 // getInvertedIndexKeyLength finds the length of an inverted index key

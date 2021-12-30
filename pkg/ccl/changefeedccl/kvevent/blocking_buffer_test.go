@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -65,7 +64,6 @@ func getBoundAccountWithBudget(budget int64) (account mon.BoundAccount, cleanup 
 func TestBlockingBuffer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderDeadlockWithIssue(t, 71364)
 
 	metrics := kvevent.MakeMetrics(time.Minute)
 	ba, release := getBoundAccountWithBudget(4096)
@@ -82,7 +80,7 @@ func TestBlockingBuffer(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	buf := kvevent.NewMemBuffer(ba, &st.SV, &metrics, quotapool.OnWaitStart(notifyWait))
 	defer func() {
-		require.NoError(t, buf.Close(context.Background()))
+		require.NoError(t, buf.CloseWithReason(context.Background(), nil))
 	}()
 
 	producerCtx, stopProducers := context.WithCancel(context.Background())
@@ -93,7 +91,7 @@ func TestBlockingBuffer(t *testing.T) {
 
 	// Start adding KVs to the buffer until we block.
 	wg.GoCtx(func(ctx context.Context) error {
-		rnd, _ := randutil.NewTestPseudoRand()
+		rnd, _ := randutil.NewTestRand()
 		for {
 			err := buf.Add(ctx, kvevent.MakeKVEvent(makeKV(t, rnd), roachpb.Value{}, hlc.Timestamp{}))
 			if err != nil {
@@ -117,7 +115,6 @@ func TestBlockingBuffer(t *testing.T) {
 func TestBlockingBufferNotifiesConsumerWhenOutOfMemory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderDeadlockWithIssue(t, 71364)
 
 	metrics := kvevent.MakeMetrics(time.Minute)
 	ba, release := getBoundAccountWithBudget(4096)
@@ -126,7 +123,7 @@ func TestBlockingBufferNotifiesConsumerWhenOutOfMemory(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	buf := kvevent.NewMemBuffer(ba, &st.SV, &metrics)
 	defer func() {
-		require.NoError(t, buf.Close(context.Background()))
+		require.NoError(t, buf.CloseWithReason(context.Background(), nil))
 	}()
 
 	producerCtx, stopProducer := context.WithCancel(context.Background())
@@ -137,7 +134,7 @@ func TestBlockingBufferNotifiesConsumerWhenOutOfMemory(t *testing.T) {
 
 	// Start adding KVs to the buffer until we block.
 	wg.GoCtx(func(ctx context.Context) error {
-		rnd, _ := randutil.NewTestPseudoRand()
+		rnd, _ := randutil.NewTestRand()
 		for {
 			err := buf.Add(ctx, kvevent.MakeKVEvent(makeKV(t, rnd), roachpb.Value{}, hlc.Timestamp{}))
 			if err != nil {

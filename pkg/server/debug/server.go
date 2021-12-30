@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	pebbletool "github.com/cockroachdb/pebble/tool"
 	metrics "github.com/rcrowley/go-metrics"
@@ -54,7 +53,8 @@ const Endpoint = "/debug/"
 var _ = func() *settings.StringSetting {
 	// This setting definition still exists so as to not break
 	// deployment scripts that set it unconditionally.
-	v := settings.RegisterStringSetting("server.remote_debugging.mode", "unused", "local")
+	v := settings.RegisterStringSetting(
+		settings.TenantWritable, "server.remote_debugging.mode", "unused", "local")
 	v.SetRetired()
 	return v
 }()
@@ -123,7 +123,7 @@ func NewServer(
 	mux.Handle("/debug/pprof/ui/", http.StripPrefix("/debug/pprof/ui", ps))
 
 	mux.HandleFunc("/debug/pprof/goroutineui/", func(w http.ResponseWriter, req *http.Request) {
-		dump := goroutineui.NewDump(timeutil.Now())
+		dump := goroutineui.NewDump()
 
 		_ = req.ParseForm()
 		switch req.Form.Get("sort") {

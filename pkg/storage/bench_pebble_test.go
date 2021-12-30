@@ -40,14 +40,13 @@ func setupMVCCPebble(b testing.TB, dir string) Engine {
 }
 
 func setupMVCCInMemPebble(b testing.TB, loc string) Engine {
-	return setupMVCCInMemPebbleWithSeparatedIntents(b, false /* disabledSeparatedIntents */)
+	return setupMVCCInMemPebbleWithSeparatedIntents(b)
 }
 
-func setupMVCCInMemPebbleWithSeparatedIntents(b testing.TB, disableSeparatedIntents bool) Engine {
+func setupMVCCInMemPebbleWithSeparatedIntents(b testing.TB) Engine {
 	peb, err := Open(
 		context.Background(),
 		InMemory(),
-		SetSeparatedIntents(disableSeparatedIntents),
 		CacheSize(testCacheSize))
 	if err != nil {
 		b.Fatalf("could not create new in-mem pebble instance: %+v", err)
@@ -56,12 +55,11 @@ func setupMVCCInMemPebbleWithSeparatedIntents(b testing.TB, disableSeparatedInte
 }
 
 func BenchmarkMVCCScan_Pebble(b *testing.B) {
-	skip.WithIssue(b, 51840, "TODO: fix benchmark")
-
+	skip.UnderShort(b)
 	ctx := context.Background()
-	for _, numRows := range []int{1, 10, 100, 1000, 10000} {
+	for _, numRows := range []int{1, 10, 100, 1000, 10000, 50000} {
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
-			for _, numVersions := range []int{1, 2, 10, 100} {
+			for _, numVersions := range []int{1, 2, 10, 100, 1000} {
 				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
 					for _, valueSize := range []int{8, 64, 512} {
 						b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
@@ -82,12 +80,11 @@ func BenchmarkMVCCScan_Pebble(b *testing.B) {
 }
 
 func BenchmarkMVCCReverseScan_Pebble(b *testing.B) {
-	skip.WithIssue(b, 51840, "TODO: fix benchmark")
-
+	skip.UnderShort(b)
 	ctx := context.Background()
-	for _, numRows := range []int{1, 10, 100, 1000, 10000} {
+	for _, numRows := range []int{1, 10, 100, 1000, 10000, 50000} {
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
-			for _, numVersions := range []int{1, 2, 10, 100} {
+			for _, numVersions := range []int{1, 2, 10, 100, 1000} {
 				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
 					for _, valueSize := range []int{8, 64, 512} {
 						b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
@@ -361,4 +358,24 @@ func BenchmarkBatchBuilderPut(b *testing.B) {
 	}
 
 	b.StopTimer()
+}
+
+func BenchmarkCheckSSTConflicts(b *testing.B) {
+	for _, numKeys := range []int{1000, 10000, 100000} {
+		b.Run(fmt.Sprintf("keys=%d", numKeys), func(b *testing.B) {
+			for _, numVersions := range []int{8, 64} {
+				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
+					for _, numSstKeys := range []int{1000, 10000} {
+						b.Run(fmt.Sprintf("sstKeys=%d", numSstKeys), func(b *testing.B) {
+							for _, overlap := range []bool{false, true} {
+								b.Run(fmt.Sprintf("overlap=%t", overlap), func(b *testing.B) {
+									runCheckSSTConflicts(b, numKeys, numVersions, numSstKeys, overlap)
+								})
+							}
+						})
+					}
+				})
+			}
+		})
+	}
 }

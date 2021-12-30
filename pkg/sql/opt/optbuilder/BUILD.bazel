@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "optbuilder",
     srcs = [
+        "alter_range.go",
         "alter_table.go",
         "arbiter_set.go",
         "builder.go",
@@ -52,6 +53,7 @@ go_library(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/schemaexpr",
         "//pkg/sql/catalog/seqexpr",
+        "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/catalog/typedesc",
         "//pkg/sql/delegate",
         "//pkg/sql/lex",

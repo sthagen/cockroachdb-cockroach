@@ -15,6 +15,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -106,7 +107,7 @@ func (so *DummySequenceOperators) GetLatestValueInSessionForSequenceByID(
 
 // SetSequenceValueByID implements the tree.SequenceOperators interface.
 func (so *DummySequenceOperators) SetSequenceValueByID(
-	ctx context.Context, seqID int64, newVal int64, isCalled bool,
+	ctx context.Context, seqID uint32, newVal int64, isCalled bool,
 ) error {
 	return errors.WithStack(errSequenceOperators)
 }
@@ -232,6 +233,16 @@ func (*DummyEvalPlanner) ExternalWriteFile(ctx context.Context, uri string, cont
 	return errors.WithStack(errEvalPlanner)
 }
 
+// DecodeGist is part of the EvalPlanner interface.
+func (*DummyEvalPlanner) DecodeGist(gist string) ([]string, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
+// ExecutorConfig is part of the EvalPlanner interface.
+func (*DummyEvalPlanner) ExecutorConfig() interface{} {
+	return nil
+}
+
 var _ tree.EvalPlanner = &DummyEvalPlanner{}
 
 var errEvalPlanner = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessionContext,
@@ -328,6 +339,30 @@ func (ep *DummyEvalPlanner) ResolveType(
 	return nil, errors.WithStack(errEvalPlanner)
 }
 
+// QueryRowEx is part of the tree.EvalPlanner interface.
+func (ep *DummyEvalPlanner) QueryRowEx(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
+	stmt string,
+	qargs ...interface{},
+) (tree.Datums, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
+// QueryIteratorEx is part of the tree.EvalPlanner interface.
+func (ep *DummyEvalPlanner) QueryIteratorEx(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
+	stmt string,
+	qargs ...interface{},
+) (tree.InternalRows, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.
 type DummyPrivilegedAccessor struct{}
 
@@ -338,7 +373,7 @@ var errEvalPrivileged = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSe
 
 // LookupNamespaceID is part of the tree.PrivilegedAccessor interface.
 func (ep *DummyPrivilegedAccessor) LookupNamespaceID(
-	ctx context.Context, parentID int64, name string,
+	ctx context.Context, parentID int64, parentSchemaID int64, name string,
 ) (tree.DInt, bool, error) {
 	return 0, false, errors.WithStack(errEvalPrivileged)
 }

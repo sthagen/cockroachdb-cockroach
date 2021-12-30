@@ -83,6 +83,7 @@ type s3Client struct {
 }
 
 var reuseSession = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"cloudstorage.s3.session_reuse.enabled",
 	"persist the last opened s3 session and re-use it when opening a new session with the same arguments",
 	true,
@@ -433,7 +434,12 @@ func (s *s3Storage) openStreamAt(
 			switch aerr.Code() {
 			// Relevant 404 errors reported by AWS.
 			case s3.ErrCodeNoSuchBucket, s3.ErrCodeNoSuchKey:
-				return nil, errors.Wrapf(cloud.ErrFileDoesNotExist, "s3 object does not exist: %s", err.Error())
+				// nolint:errwrap
+				return nil, errors.Wrapf(
+					errors.Wrap(cloud.ErrFileDoesNotExist, "s3 object does not exist"),
+					"%v",
+					err.Error(),
+				)
 			}
 		}
 		return nil, errors.Wrap(err, "failed to get s3 object")

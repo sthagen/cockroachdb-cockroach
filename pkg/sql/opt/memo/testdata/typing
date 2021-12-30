@@ -385,7 +385,7 @@ project
  ├── columns: x:1(int!null) x:5(string!null) y:2(int!null)
  ├── select
  │    ├── columns: a.x:1(int!null) y:2(int!null) max:10(string!null)
- │    ├── group-by
+ │    ├── group-by (hash)
  │    │    ├── columns: a.x:1(int!null) y:2(int!null) max:10(string!null)
  │    │    ├── grouping columns: a.x:1(int!null)
  │    │    ├── inner-join (hash)
@@ -416,7 +416,7 @@ SELECT EXISTS(SELECT * FROM a WHERE expr<0) FROM (SELECT x+1 AS expr FROM a)
 ----
 project
  ├── columns: exists:10(bool!null)
- ├── group-by
+ ├── group-by (hash)
  │    ├── columns: true_agg:12(bool) rownum:14(int!null)
  │    ├── grouping columns: rownum:14(int!null)
  │    ├── left-join (cross)
@@ -506,7 +506,7 @@ project
  ├── values
  │    └── () [type=tuple]
  └── projections
-      └── ARRAY['red','green']::color[] [as=array:1, type=color[]]
+      └── ARRAY['red','green'] [as=array:1, type=color[]]
 
 norm
 SELECT ARRAY['red', 'green']::color[]
@@ -519,19 +519,12 @@ values
 build
 SELECT ARRAY['foo']::color[]
 ----
-project
- ├── columns: array:1(color[]!null)
- ├── values
- │    └── () [type=tuple]
- └── projections
-      └── ARRAY['foo']::color[] [as=array:1, type=color[]]
+error (22P02): invalid input value for enum color: "foo"
 
 norm
 SELECT ARRAY['foo']::color[]
 ----
-values
- ├── columns: array:1(color[])
- └── (ARRAY['foo']::color[],) [type=tuple{color[]}]
+error (22P02): invalid input value for enum color: "foo"
 
 # Regression tests for #68233.
 build

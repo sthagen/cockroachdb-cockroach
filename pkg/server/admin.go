@@ -56,6 +56,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -85,7 +86,7 @@ func nonTableDescriptorRangeCount() int64 {
 		keys.SystemRangesID,
 		keys.TimeseriesRangesID,
 		keys.LivenessRangesID,
-		keys.PublicSchemaID,
+		keys.PublicSchemaID, // TODO(richardjcai): Remove this in 22.2.
 		keys.TenantsRangesID,
 	}))
 }
@@ -98,8 +99,9 @@ var errAdminAPIError = status.Errorf(codes.Internal, "An internal server error "
 // the cockroach cluster.
 type adminServer struct {
 	*adminPrivilegeChecker
-	server     *Server
-	memMonitor *mon.BytesMonitor
+	internalExecutor *sql.InternalExecutor
+	server           *Server
+	memMonitor       *mon.BytesMonitor
 }
 
 // noteworthyAdminMemoryUsageBytes is the minimum size tracked by the
@@ -112,6 +114,7 @@ var noteworthyAdminMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEW
 func newAdminServer(s *Server, ie *sql.InternalExecutor) *adminServer {
 	server := &adminServer{
 		adminPrivilegeChecker: &adminPrivilegeChecker{ie: ie},
+		internalExecutor:      ie,
 		server:                s,
 	}
 	// TODO(knz): We do not limit memory usage by admin operations
@@ -1096,7 +1099,7 @@ func (s *adminServer) statsForSpan(
 		// TableStats' meta2 query through the DistSender so that it will share
 		// the advantage of populating the cache (without the disadvantage of
 		// potentially returning stale data).
-		// See Github #5435 for some discussion.
+		// See GitHub #5435 for some discussion.
 		RangeCount: int64(len(rangeDescKVs)),
 	}
 	type nodeResponse struct {
@@ -1219,7 +1222,7 @@ func (s *adminServer) Events(
 	// to not use serverError* methods in the body of the function, so we can
 	// just do it here.
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && !errors.Is(retErr, errRequiresAdmin) {
 			retErr = s.serverError(retErr)
 		}
 	}()
@@ -1844,15 +1847,24 @@ func (s *adminServer) Jobs(
 		return nil, err
 	}
 
+	retryRunningCondition := "status='running' AND next_run > now() AND num_runs > 1"
+	retryRevertingCondition := "status='reverting' AND next_run > now() AND num_runs > 1"
+
 	q := makeSQLQuery()
 	q.Append(`
-      SELECT job_id, job_type, description, statement, user_name, descriptor_ids, status,
-						 running_status, created, started, finished, modified,
-						 fraction_completed, high_water_timestamp, error
+      SELECT job_id, job_type, description, statement, user_name, descriptor_ids,
+            case
+              when ` + retryRunningCondition + `then 'retry-running' 
+              when ` + retryRevertingCondition + ` then 'retry-reverting' 
+              else status
+            end as status, running_status, created, started, finished, modified, fraction_completed,
+            high_water_timestamp, error, last_run, next_run, num_runs
         FROM crdb_internal.jobs
        WHERE true
 	`)
-	if req.Status != "" {
+	if req.Status == "retrying" {
+		q.Append(" AND ( ( " + retryRunningCondition + " ) OR ( " + retryRevertingCondition + " ) )")
+	} else if req.Status != "" {
 		q.Append(" AND status = $", req.Status)
 	}
 	if req.Type != jobspb.TypeUnspecified {
@@ -1926,6 +1938,9 @@ func scanRowIntoJob(scanner resultScanner, row tree.Datums, job *serverpb.JobRes
 		&fractionCompletedOrNil,
 		&highwaterOrNil,
 		&job.Error,
+		&job.LastRun,
+		&job.NextRun,
+		&job.NumRuns,
 	); err != nil {
 		return err
 	}
@@ -1969,7 +1984,8 @@ func (s *adminServer) Job(
 	const query = `
       SELECT job_id, job_type, description, statement, user_name, descriptor_ids, status,
 						 running_status, created, started, finished, modified,
-						 fraction_completed, high_water_timestamp, error
+						 fraction_completed, high_water_timestamp, error, last_run,
+						 next_run, num_runs
         FROM crdb_internal.jobs
        WHERE job_id = $1`
 
@@ -2216,9 +2232,27 @@ func (s *adminServer) DecommissionStatus(
 	}
 
 	var res serverpb.DecommissionStatusResponse
+	livenessMap := map[roachpb.NodeID]livenesspb.Liveness{}
+	{
+		// We use GetLivenessesFromKV to avoid races in which the caller has
+		// just made an update to a liveness record but has not received this
+		// update in its local liveness instance yet. Doing a consistent read
+		// here avoids such issues.
+		//
+		// For an example, see:
+		//
+		// https://github.com/cockroachdb/cockroach/issues/73636
+		ls, err := s.server.nodeLiveness.GetLivenessesFromKV(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range ls {
+			livenessMap[rec.NodeID] = rec
+		}
+	}
 
 	for nodeID := range replicaCounts {
-		l, ok := s.server.nodeLiveness.GetLiveness(nodeID)
+		l, ok := livenessMap[nodeID]
 		if !ok {
 			return nil, errors.Newf("unable to get liveness for %d", nodeID)
 		}
@@ -2395,7 +2429,7 @@ func (s *adminServer) DataDistribution(
 		defer acct.Close(txnCtx)
 
 		kvs, err := kvclient.ScanMetaKVs(ctx, txn, roachpb.Span{
-			Key:    keys.UserTableDataMin,
+			Key:    keys.SystemSQLCodec.TablePrefix(keys.MinUserDescriptorID(s.server.sqlServer.execCfg.SystemIDChecker)),
 			EndKey: keys.MaxKey,
 		})
 		if err != nil {
@@ -2411,12 +2445,16 @@ func (s *adminServer) DataDistribution(
 			if err := kv.ValueProto(&rangeDesc); err != nil {
 				return err
 			}
-
-			_, tableID, err := keys.TODOSQLCodec.DecodeTablePrefix(rangeDesc.StartKey.AsRawKey())
+			// TODO(embrown): Tables can use one codec since they
+			// seem to all share the same id.
+			_, tenID, err := keys.DecodeTenantPrefix(rangeDesc.StartKey.AsRawKey())
 			if err != nil {
 				return err
 			}
-
+			_, tableID, err := keys.MakeSQLCodec(tenID).DecodeTablePrefix(rangeDesc.StartKey.AsRawKey())
+			if err != nil {
+				return err
+			}
 			for _, replicaDesc := range rangeDesc.Replicas().Descriptors() {
 				tableInfo, found := tableInfosByTableID[tableID]
 				if !found {
@@ -2583,7 +2621,24 @@ func (s *adminServer) enqueueRangeLocal(
 		return response, nil
 	}
 
-	traceSpans, processErr, err := store.ManuallyEnqueue(ctx, req.Queue, repl, req.SkipShouldQueue)
+	// Handle mixed-version clusters across the "gc" to "mvccGC" queue rename.
+	// TODO(nvanbenschoten): remove this in v23.1. Inline req.Queue again.
+	// The client logic in pkg/ui/workspaces/db-console/src/views/reports/containers/enqueueRange/index.tsx
+	// should stop sending "gc" in v22.2. When removing, confirm that the
+	// associated TODO in index.tsx was addressed in the previous release.
+	//
+	// Explanation of migration:
+	// - v22.1 will understand "gc" and "mvccGC" on the server. Its client will
+	//   continue to send "gc" to interop with v21.2 servers.
+	// - v22.2's client will send "mvccGC" but will still have to understand "gc"
+	//   on the server to deal with v22.1 clients.
+	// - v23.1's server can stop understanding "gc".
+	queueName := req.Queue
+	if strings.ToLower(queueName) == "gc" {
+		queueName = "mvccGC"
+	}
+
+	traceSpans, processErr, err := store.ManuallyEnqueue(ctx, queueName, repl, req.SkipShouldQueue)
 	if err != nil {
 		response.Details[0].Error = err.Error()
 		return response, nil
@@ -2593,6 +2648,47 @@ func (s *adminServer) enqueueRangeLocal(
 		response.Details[0].Error = processErr.Error()
 	}
 	return response, nil
+}
+
+// SendKVBatch proxies the given BatchRequest into KV, returning the
+// response. It is for use by the CLI `debug send-kv-batch` command.
+func (s *adminServer) SendKVBatch(
+	ctx context.Context, ba *roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
+	// Note: the root user will bypass SQL auth checks, which is useful in case of
+	// a cluster outage.
+	user, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ba == nil {
+		return nil, errors.New("BatchRequest cannot be nil")
+	}
+
+	// Emit a structured log event for the call.
+	jsonpb := protoutil.JSONPb{}
+	baJSON, err := jsonpb.Marshal(ba)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to encode BatchRequest as JSON")
+	}
+	event := &eventpb.DebugSendKvBatch{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			Timestamp: timeutil.Now().UnixNano(),
+		},
+		CommonDebugEventDetails: eventpb.CommonDebugEventDetails{
+			NodeID: int32(s.server.NodeID()),
+			User:   user.Normalized(),
+		},
+		BatchRequest: string(baJSON),
+	}
+	log.StructuredEvent(ctx, event)
+
+	// Send the batch to KV.
+	br, pErr := s.server.db.NonTransactionalSender().Send(ctx, *ba)
+	if pErr != nil {
+		return nil, pErr.GoError()
+	}
+	return br, nil
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses

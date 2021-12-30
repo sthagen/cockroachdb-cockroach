@@ -11,20 +11,23 @@
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { withRouter } from "react-router-dom";
-import moment from "moment";
 import { refreshStatements } from "src/redux/apiReducers";
 import { resetSQLStatsAction } from "src/redux/sqlStats";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
 import { StatementsResponseMessage } from "src/util/api";
 
-import { TimestampToMoment } from "src/util/convert";
 import { PrintTime } from "src/views/reports/containers/range/print";
 
-import { TransactionsPage } from "@cockroachlabs/cluster-ui";
+import {
+  TransactionsPage,
+  Filters,
+  defaultFilters,
+  util,
+} from "@cockroachlabs/cluster-ui";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
-import { statementsDateRangeLocalSetting } from "src/redux/statementsDateRange";
-import { setCombinedStatementsDateRangeAction } from "src/redux/statements";
+import { statementsTimeScaleLocalSetting } from "src/redux/statementsTimeScale";
+import { setCombinedStatementsTimeScaleAction } from "src/redux/statements";
 import { LocalSetting } from "src/redux/localsettings";
 
 // selectStatements returns the array of AggregateStatistics to show on the
@@ -32,7 +35,7 @@ import { LocalSetting } from "src/redux/localsettings";
 export const selectData = createSelector(
   (state: AdminUIState) => state.cachedData.statements,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data || state.inFlight) return null;
+    if (!state.data || state.inFlight || !state.valid) return null;
     return state.data;
   },
 );
@@ -46,20 +49,31 @@ export const selectLastReset = createSelector(
       return "unknown";
     }
 
-    return PrintTime(TimestampToMoment(state.data.last_reset));
+    return PrintTime(util.TimestampToMoment(state.data.last_reset));
   },
 );
 
-const selectLastError = createSelector(
+export const selectLastError = createSelector(
   (state: AdminUIState) => state.cachedData.statements,
   (state: CachedDataReducerState<StatementsResponseMessage>) => state.lastError,
 );
 
-export const selectDateRange = createSelector(
-  statementsDateRangeLocalSetting.selector,
-  (state: { start: number; end: number }): [moment.Moment, moment.Moment] => {
-    return [moment.unix(state.start), moment.unix(state.end)];
-  },
+export const sortSettingLocalSetting = new LocalSetting(
+  "sortSetting/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  { ascending: false, columnTitle: "executionCount" },
+);
+
+export const filtersLocalSetting = new LocalSetting(
+  "filters/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  defaultFilters,
+);
+
+export const searchLocalSetting = new LocalSetting(
+  "search/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  null,
 );
 
 export const transactionColumnsLocalSetting = new LocalSetting(
@@ -71,18 +85,21 @@ export const transactionColumnsLocalSetting = new LocalSetting(
 const TransactionsPageConnected = withRouter(
   connect(
     (state: AdminUIState) => ({
-      data: selectData(state),
-      statementsError: state.cachedData.statements.lastError,
-      dateRange: selectDateRange(state),
-      lastReset: selectLastReset(state),
-      error: selectLastError(state),
-      nodeRegions: nodeRegionsByIDSelector(state),
       columns: transactionColumnsLocalSetting.selectorToArray(state),
+      data: selectData(state),
+      timeScale: statementsTimeScaleLocalSetting.selector(state),
+      error: selectLastError(state),
+      filters: filtersLocalSetting.selector(state),
+      lastReset: selectLastReset(state),
+      nodeRegions: nodeRegionsByIDSelector(state),
+      search: searchLocalSetting.selector(state),
+      sortSetting: sortSettingLocalSetting.selector(state),
+      statementsError: state.cachedData.statements.lastError,
     }),
     {
       refreshData: refreshStatements,
       resetSQLStats: resetSQLStatsAction,
-      onDateRangeChange: setCombinedStatementsDateRangeAction,
+      onTimeScaleChange: setCombinedStatementsTimeScaleAction,
       // We use `null` when the value was never set and it will show all columns.
       // If the user modifies the selection and no columns are selected,
       // the function will save the value as a blank space, otherwise
@@ -91,6 +108,17 @@ const TransactionsPageConnected = withRouter(
         transactionColumnsLocalSetting.set(
           value.length === 0 ? " " : value.join(","),
         ),
+      onSortingChange: (
+        _tableName: string,
+        columnName: string,
+        ascending: boolean,
+      ) =>
+        sortSettingLocalSetting.set({
+          ascending: ascending,
+          columnTitle: columnName,
+        }),
+      onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
+      onSearchComplete: (query: string) => searchLocalSetting.set(query),
     },
   )(TransactionsPage),
 );

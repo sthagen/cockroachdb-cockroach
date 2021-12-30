@@ -17,7 +17,6 @@ import (
 	"math"
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -42,7 +41,7 @@ func init() {
 // declareKeysWriteTransaction is the shared portion of
 // declareKeys{End,Heartbeat}Transaction.
 func declareKeysWriteTransaction(
-	_ ImmutableRangeState, header roachpb.Header, req roachpb.Request, latchSpans *spanset.SpanSet,
+	_ ImmutableRangeState, header *roachpb.Header, req roachpb.Request, latchSpans *spanset.SpanSet,
 ) {
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -54,7 +53,7 @@ func declareKeysWriteTransaction(
 
 func declareKeysEndTxn(
 	rs ImmutableRangeState,
-	header roachpb.Header,
+	header *roachpb.Header,
 	req roachpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 ) {
@@ -388,10 +387,11 @@ func EndTxn(
 	return txnResult, nil
 }
 
-// IsEndTxnExceedingDeadline returns true if the transaction exceeded its
-// deadline.
-func IsEndTxnExceedingDeadline(t hlc.Timestamp, args *roachpb.EndTxnRequest) bool {
-	return args.Deadline != nil && args.Deadline.LessEq(t)
+// IsEndTxnExceedingDeadline returns true if the transaction's provisional
+// commit timestamp exceeded its deadline. If so, the transaction should not be
+// allowed to commit.
+func IsEndTxnExceedingDeadline(commitTS hlc.Timestamp, deadline *hlc.Timestamp) bool {
+	return deadline != nil && !deadline.IsEmpty() && deadline.LessEq(commitTS)
 }
 
 // IsEndTxnTriggeringRetryError returns true if the EndTxnRequest cannot be
@@ -416,7 +416,7 @@ func IsEndTxnTriggeringRetryError(
 	}
 
 	// A transaction must obey its deadline, if set.
-	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args) {
+	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args.Deadline) {
 		exceededBy := txn.WriteTimestamp.GoTime().Sub(args.Deadline.GoTime())
 		extraMsg = fmt.Sprintf(
 			"txn timestamp pushed too much; deadline exceeded by %s (%s > %s)",
@@ -457,13 +457,7 @@ func resolveLocalLocks(
 		// These transactions rely on having their locks resolved synchronously.
 		resolveAllowance = math.MaxInt64
 	}
-	onlySeparatedIntents := false
-	st := evalCtx.ClusterSettings()
-	// Some tests have st == nil.
-	if st != nil {
-		onlySeparatedIntents = st.Version.ActiveVersionOrEmpty(ctx).IsActive(
-			clusterversion.PostSeparatedIntentsMigration)
-	}
+
 	for _, span := range args.LockSpans {
 		if err := func() error {
 			if resolveAllowance == 0 {
@@ -504,7 +498,7 @@ func resolveLocalLocks(
 			if inSpan != nil {
 				update.Span = *inSpan
 				num, resumeSpan, err := storage.MVCCResolveWriteIntentRange(
-					ctx, readWriter, ms, update, resolveAllowance, onlySeparatedIntents)
+					ctx, readWriter, ms, update, resolveAllowance)
 				if err != nil {
 					return err
 				}
@@ -984,34 +978,6 @@ func splitTriggerHelper(
 			log.VEventf(ctx, 1, "LHS's GCThreshold of split is not set")
 		}
 
-		// We're about to write the initial state for the replica. We migrated
-		// the formerly replicated truncated state into unreplicated keyspace
-		// in 19.1, but this range may still be using the replicated version
-		// and we need to make a decision about what to use for the RHS that
-		// is consistent across the followers: do for the RHS what the LHS
-		// does: if the LHS has the legacy key, initialize the RHS with a
-		// legacy key as well.
-		//
-		// See VersionUnreplicatedRaftTruncatedState.
-		truncStateType := stateloader.TruncatedStateUnreplicated
-		if found, err := storage.MVCCGetProto(
-			ctx,
-			batch,
-			keys.RaftTruncatedStateLegacyKey(rec.GetRangeID()),
-			hlc.Timestamp{},
-			nil,
-			storage.MVCCGetOptions{},
-		); err != nil {
-			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load legacy truncated state")
-		} else if found {
-			truncStateType = stateloader.TruncatedStateLegacyReplicated
-		}
-
-		replicaVersion, err := sl.LoadVersion(ctx, batch)
-		if err != nil {
-			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCThreshold")
-		}
-
 		// Writing the initial state is subtle since this also seeds the Raft
 		// group. It becomes more subtle due to proposer-evaluated Raft.
 		//
@@ -1041,10 +1007,13 @@ func splitTriggerHelper(
 		// HardState via a call to synthesizeRaftState. Here, we only call
 		// writeInitialReplicaState which essentially writes a ReplicaState
 		// only.
-
+		replicaVersion, err := sl.LoadVersion(ctx, batch)
+		if err != nil {
+			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load replica version")
+		}
 		*h.AbsPostSplitRight(), err = stateloader.WriteInitialReplicaState(
 			ctx, batch, *h.AbsPostSplitRight(), split.RightDesc, rightLease,
-			*gcThreshold, truncStateType, replicaVersion,
+			*gcThreshold, replicaVersion,
 		)
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")

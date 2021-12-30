@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -101,7 +100,8 @@ func makeMockTxnPipeliner(iter condensableSpanSetRangeIterator) (txnPipeliner, *
 }
 
 func makeTxnProto() roachpb.Transaction {
-	return roachpb.MakeTransaction("test", []byte("key"), 0, hlc.Timestamp{WallTime: 10}, 0)
+	return roachpb.MakeTransaction("test", []byte("key"), 0, hlc.Timestamp{WallTime: 10},
+		0 /* maxOffsetNs */, 0 /* coordinatorNodeID */)
 }
 
 // TestTxnPipeliner1PCTransaction tests that the writes performed by 1PC
@@ -1570,7 +1570,7 @@ func TestTxnPipelinerCondenseLockSpans(t *testing.T) {
 		}
 		return resp, nil
 	}
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	ds := NewDistSender(DistSenderConfig{
 		AmbientCtx: ambient,
 		Clock:      s.Clock,

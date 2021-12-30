@@ -69,7 +69,6 @@ func (t *testServerShim) RangeFeedFactory() interface{}         { panic(unsuppor
 func (t *testServerShim) Clock() *hlc.Clock                     { panic(unsupportedShimMethod) }
 func (t *testServerShim) DistSenderI() interface{}              { panic(unsupportedShimMethod) }
 func (t *testServerShim) MigrationServer() interface{}          { panic(unsupportedShimMethod) }
-func (t *testServerShim) SpanConfigAccessor() interface{}       { panic(unsupportedShimMethod) }
 func (t *testServerShim) SQLServer() interface{}                { panic(unsupportedShimMethod) }
 func (t *testServerShim) SQLLivenessProvider() interface{}      { panic(unsupportedShimMethod) }
 func (t *testServerShim) StartupMigrationsManager() interface{} { panic(unsupportedShimMethod) }
@@ -124,3 +123,4 @@ func (t *testServerShim) ScratchRange() (roachpb.Key, error)       { panic(unsup
 func (t *testServerShim) Engines() []storage.Engine                { panic(unsupportedShimMethod) }
 func (t *testServerShim) MetricsRecorder() *status.MetricsRecorder { panic(unsupportedShimMethod) }
 func (t *testServerShim) CollectionFactory() interface{}           { panic(unsupportedShimMethod) }
+func (t *testServerShim) SpanConfigKVSubscriber() interface{}      { panic(unsupportedShimMethod) }

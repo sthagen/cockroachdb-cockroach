@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -117,7 +117,13 @@ func newColumnarizer(
 	c.ProcessorBaseNoHelper.Init(
 		nil, /* self */
 		flowCtx,
-		flowCtx.EvalCtx,
+		// Similar to the materializer, the columnarizer will update the eval
+		// context when closed, so we give it a copy of the eval context to
+		// preserve the "global" eval context from being mutated. In practice,
+		// the columnarizer is closed only when DrainMeta() is called which
+		// occurs at the very end of the execution, yet we choose to be
+		// defensive here.
+		flowCtx.NewEvalCtx(),
 		processorID,
 		nil, /* output */
 		execinfra.ProcStateOpts{
@@ -126,9 +132,9 @@ func newColumnarizer(
 				// Close will call InternalClose(). Note that we don't return
 				// any trailing metadata here because the columnarizers
 				// propagate it in DrainMeta.
-				if err := c.Close(); util.CrdbTestBuild && err != nil {
+				if err := c.Close(); buildutil.CrdbTestBuild && err != nil {
 					// Close never returns an error.
-					colexecerror.InternalError(errors.AssertionFailedf("unexpected error %v from Columnarizer.Close", err))
+					colexecerror.InternalError(errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error from Columnarizer.Close"))
 				}
 				return nil
 			}},
@@ -167,7 +173,7 @@ func (c *Columnarizer) Init(ctx context.Context) {
 
 // GetStats is part of the colexecop.VectorizedStatsCollector interface.
 func (c *Columnarizer) GetStats() *execinfrapb.ComponentStats {
-	if c.removedFromFlow && util.CrdbTestBuild {
+	if c.removedFromFlow && buildutil.CrdbTestBuild {
 		colexecerror.InternalError(errors.AssertionFailedf(
 			"unexpectedly the columnarizer was removed from the flow when stats are being collected",
 		))

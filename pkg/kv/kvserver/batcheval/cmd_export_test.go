@@ -47,11 +47,18 @@ func TestExportCmd(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	kvDB := tc.Server(0).DB()
 
+	// We can't get the tableID programmatically here.
+	// The table id can be retrieved by doing.
+	// CREATE DATABASE test;
+	// CREATE TABLE test.t();
+	// SELECT id FROM system.namespace WHERE name = 't' AND "parentID" != 1
+	const tableID = 56
+
 	export := func(
 		t *testing.T, start hlc.Timestamp, mvccFilter roachpb.MVCCFilter, maxResponseSSTBytes int64,
 	) (roachpb.Response, *roachpb.Error) {
 		req := &roachpb.ExportRequest{
-			RequestHeader: roachpb.RequestHeader{Key: keys.UserTableDataMin, EndKey: keys.MaxKey},
+			RequestHeader: roachpb.RequestHeader{Key: keys.TestingUserTableDataMin(), EndKey: keys.MaxKey},
 			StartTime:     start,
 			Storage: roachpb.ExternalStorage{
 				Provider:  roachpb.ExternalStorageProvider_nodelocal,
@@ -327,7 +334,7 @@ INTO
 		expect(t, res7, 1, 1, 1, 1)
 		latestRespHeader = roachpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/2"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/2", tableID)),
 				EndKey: []byte("/Max"),
 			},
 			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
@@ -335,7 +342,7 @@ INTO
 		}
 		allRespHeader = roachpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/2"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/2", tableID)),
 				EndKey: []byte("/Max"),
 			},
 			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
@@ -351,7 +358,7 @@ INTO
 		expect(t, res7, 2, 2, 2, 2)
 		latestRespHeader = roachpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/3/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/3/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
 			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
@@ -359,7 +366,7 @@ INTO
 		}
 		allRespHeader = roachpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/3/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/3/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
 			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
@@ -374,7 +381,7 @@ INTO
 		expect(t, res7, 99, 99, 99, 99)
 		latestRespHeader = roachpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/100/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/100/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
 			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
@@ -382,7 +389,7 @@ INTO
 		}
 		allRespHeader = roachpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/100/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/100/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
 			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
@@ -416,7 +423,7 @@ func TestExportGCThreshold(t *testing.T) {
 	kvDB := tc.Server(0).DB()
 
 	req := &roachpb.ExportRequest{
-		RequestHeader: roachpb.RequestHeader{Key: keys.UserTableDataMin, EndKey: keys.MaxKey},
+		RequestHeader: roachpb.RequestHeader{Key: keys.TestingUserTableDataMin(), EndKey: keys.MaxKey},
 		StartTime:     hlc.Timestamp{WallTime: -1},
 	}
 	_, pErr := kv.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
@@ -757,7 +764,7 @@ func TestRandomKeyAndTimestampExport(t *testing.T) {
 	testWithTargetSize := func(t *testing.T, targetSize uint64) {
 		e, cleanup := mkEngine(t)
 		defer cleanup()
-		rnd, _ := randutil.NewPseudoRand()
+		rnd, _ := randutil.NewTestRand()
 		numKeys := getNumKeys(t, rnd, targetSize)
 		keys, timestamps := mkData(t, e, rnd, numKeys)
 		var (

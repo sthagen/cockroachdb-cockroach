@@ -13,6 +13,9 @@ import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import Long from "long";
 import moment from "moment";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
+import { SortSetting } from "../sortedtable";
+import { Filters } from "../queryFilter";
+import { TimeScale, defaultTimeScaleOptions } from "../timeScaleDropdown";
 
 const history = createMemoryHistory({ initialEntries: ["/transactions"] });
 
@@ -39,13 +42,30 @@ export const nodeRegions: { [nodeId: string]: string } = {
   "4": "gcp-europe-west1",
 };
 
-export const dateRange: [moment.Moment, moment.Moment] = [
-  moment.utc("2021.08.08"),
-  moment.utc("2021.08.12"),
-];
+export const columns: string[] = ["all"];
+
+export const timeScale: TimeScale = {
+  windowSize: moment.duration(5, "day"),
+  sampleSize: moment.duration(5, "minutes"),
+  windowEnd: moment.utc("2021.08.12"),
+  key: "Custom",
+};
 export const timestamp = new protos.google.protobuf.Timestamp({
   seconds: new Long(Date.parse("Sep 15 2021 01:00:00 GMT") * 1e-3),
 });
+
+export const sortSetting: SortSetting = {
+  ascending: false,
+  columnTitle: "executionCount",
+};
+
+export const filters: Filters = {
+  app: "",
+  timeNumber: "0",
+  timeUnit: "seconds",
+  regions: "",
+  nodes: "",
+};
 
 export const data: cockroach.server.serverpb.IStatementsResponse = {
   statements: [

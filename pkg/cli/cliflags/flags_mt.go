@@ -34,14 +34,9 @@ var (
 		Description: "Listen address for incoming connections.",
 	}
 
-	TokenBucketPeriod = FlagInfo{
-		Name:        "token-bucket-period",
-		Description: "Number of miliseconds before a token is added to the connection attempt bucket.",
-	}
-
-	TokenBucketSize = FlagInfo{
-		Name:        "token-bucket-size",
-		Description: "Size of the token bucket used to throttle connection attempts.",
+	ThrottleBaseDelay = FlagInfo{
+		Name:        "throttle-base-delay",
+		Description: "Initial value for the exponential backoff used to throttle connection attempts.",
 	}
 
 	ListenCert = FlagInfo{
@@ -106,5 +101,15 @@ This rule must include the port of the SQL pod.`,
 	TestDirectoryListenPort = FlagInfo{
 		Name:        "port",
 		Description: "Test directory server binds and listens on this port.",
+	}
+
+	TestDirectoryTenantCertsDir = FlagInfo{
+		Name:        "certs-dir",
+		Description: CertsDir.Description,
+	}
+
+	TestDirectoryTenantBaseDir = FlagInfo{
+		Name:        "base-dir",
+		Description: "If set, the tenant processes will use it as a store location.",
 	}
 )

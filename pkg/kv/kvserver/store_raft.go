@@ -65,16 +65,16 @@ func (q *raftRequestQueue) recycle(processed []raftRequestInfo) {
 // HandleSnapshot reads an incoming streaming snapshot and applies it if
 // possible.
 func (s *Store) HandleSnapshot(
-	header *SnapshotRequest_Header, stream SnapshotResponseStream,
+	ctx context.Context, header *SnapshotRequest_Header, stream SnapshotResponseStream,
 ) error {
-	ctx := s.AnnotateCtx(stream.Context())
+	ctx = s.AnnotateCtx(ctx)
 	const name = "storage.Store: handle snapshot"
 	return s.stopper.RunTaskWithErr(ctx, name, func(ctx context.Context) error {
 		s.metrics.RaftRcvdMessages[raftpb.MsgSnap].Inc(1)
 
 		if s.IsDraining() {
 			return stream.Send(&SnapshotResponse{
-				Status:  SnapshotResponse_DECLINED,
+				Status:  SnapshotResponse_ERROR,
 				Message: storeDrainingMsg,
 			})
 		}
@@ -118,10 +118,9 @@ func (s *Store) uncoalesceBeats(
 				StoreID:   toReplica.StoreID,
 				ReplicaID: beat.ToReplicaID,
 			},
-			Message:                           msg,
-			Quiesce:                           beat.Quiesce,
-			LaggingFollowersOnQuiesce:         beat.LaggingFollowersOnQuiesce,
-			LaggingFollowersOnQuiesceAccurate: beat.LaggingFollowersOnQuiesceAccurate,
+			Message:                   msg,
+			Quiesce:                   beat.Quiesce,
+			LaggingFollowersOnQuiesce: beat.LaggingFollowersOnQuiesce,
 		}
 		if log.V(4) {
 			log.Infof(ctx, "uncoalesced beat: %+v", beatReqs[i])
@@ -240,7 +239,6 @@ func (s *Store) processRaftRequestWithReplica(
 			ctx,
 			req.Message,
 			laggingReplicaSet(req.LaggingFollowersOnQuiesce),
-			req.LaggingFollowersOnQuiesceAccurate,
 		) {
 			return nil
 		}
@@ -264,21 +262,17 @@ func (s *Store) processRaftRequestWithReplica(
 	return nil
 }
 
-// processRaftSnapshotRequest processes the incoming non-preemptive snapshot
-// Raft request on the request's specified replica. The function makes sure to
-// handle any updated Raft Ready state. It also adds and later removes the
-// (potentially) necessary placeholder to protect against concurrent access to
-// the keyspace encompassed by the snapshot but not yet guarded by the replica.
+// processRaftSnapshotRequest processes the incoming snapshot Raft request on
+// the request's specified replica. The function makes sure to handle any
+// updated Raft Ready state. It also adds and later removes the (potentially)
+// necessary placeholder to protect against concurrent access to the keyspace
+// encompassed by the snapshot but not yet guarded by the replica.
 //
 // If (and only if) no error is returned, the placeholder (if any) in inSnap
 // will have been removed.
 func (s *Store) processRaftSnapshotRequest(
 	ctx context.Context, snapHeader *SnapshotRequest_Header, inSnap IncomingSnapshot,
 ) *roachpb.Error {
-	if snapHeader.IsPreemptive() {
-		return roachpb.NewError(errors.AssertionFailedf(`expected a raft or learner snapshot`))
-	}
-
 	return s.withReplicaForRequest(ctx, &snapHeader.RaftMessageRequest, func(
 		ctx context.Context, r *Replica,
 	) (pErr *roachpb.Error) {
@@ -342,6 +336,7 @@ func (s *Store) processRaftSnapshotRequest(
 		var expl string
 		var err error
 		stats, expl, err = r.handleRaftReadyRaftMuLocked(ctx, inSnap)
+		maybeFatalOnRaftReadyErr(ctx, expl, err)
 		if !stats.snap.applied {
 			// This line would be hit if a snapshot was sent when it isn't necessary
 			// (i.e. follower was able to catch up via the log in the interim) or when
@@ -349,7 +344,6 @@ func (s *Store) processRaftSnapshotRequest(
 			// and both the old and new leaders send snapshots).
 			log.Infof(ctx, "ignored stale snapshot at index %d", snapHeader.RaftMessageRequest.Message.Snapshot.Metadata.Index)
 		}
-		maybeFatalOnRaftReadyErr(ctx, expl, err)
 		return nil
 	})
 }
@@ -463,9 +457,8 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 	for i := range infos {
 		info := &infos[i]
 		if pErr := s.withReplicaForRequest(
-			ctx, info.req, func(ctx context.Context, r *Replica) *roachpb.Error {
-				ctx = r.raftSchedulerCtx(ctx)
-				return s.processRaftRequestWithReplica(ctx, r, info.req)
+			ctx, info.req, func(_ context.Context, r *Replica) *roachpb.Error {
+				return s.processRaftRequestWithReplica(r.raftCtx, r, info.req)
 			},
 		); pErr != nil {
 			hadError = true
@@ -488,7 +481,7 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 		// forgiving.
 		//
 		// See https://github.com/cockroachdb/cockroach/issues/30951#issuecomment-428010411.
-		if _, exists := s.mu.replicas.Load(int64(rangeID)); !exists {
+		if _, exists := s.mu.replicasByRangeID.Load(rangeID); !exists {
 			q.Lock()
 			if len(q.infos) == 0 {
 				s.replicaQueues.Delete(int64(rangeID))
@@ -503,14 +496,13 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 	return true // ready
 }
 
-func (s *Store) processReady(ctx context.Context, rangeID roachpb.RangeID) {
-	value, ok := s.mu.replicas.Load(int64(rangeID))
+func (s *Store) processReady(rangeID roachpb.RangeID) {
+	r, ok := s.mu.replicasByRangeID.Load(rangeID)
 	if !ok {
 		return
 	}
 
-	r := (*Replica)(value)
-	ctx = r.raftSchedulerCtx(ctx)
+	ctx := r.raftCtx
 	start := timeutil.Now()
 	stats, expl, err := r.handleRaftReady(ctx, noSnap)
 	maybeFatalOnRaftReadyErr(ctx, expl, err)
@@ -527,16 +519,15 @@ func (s *Store) processReady(ctx context.Context, rangeID roachpb.RangeID) {
 	}
 }
 
-func (s *Store) processTick(ctx context.Context, rangeID roachpb.RangeID) bool {
-	value, ok := s.mu.replicas.Load(int64(rangeID))
+func (s *Store) processTick(_ context.Context, rangeID roachpb.RangeID) bool {
+	r, ok := s.mu.replicasByRangeID.Load(rangeID)
 	if !ok {
 		return false
 	}
 	livenessMap, _ := s.livenessMap.Load().(liveness.IsLiveMap)
 
 	start := timeutil.Now()
-	r := (*Replica)(value)
-	ctx = r.raftSchedulerCtx(ctx)
+	ctx := r.raftCtx
 	exists, err := r.tick(ctx, livenessMap)
 	if err != nil {
 		log.Errorf(ctx, "%v", err)
@@ -564,17 +555,14 @@ func (s *Store) processTick(ctx context.Context, rangeID roachpb.RangeID) bool {
 func (s *Store) nodeIsLiveCallback(l livenesspb.Liveness) {
 	s.updateLivenessMap()
 
-	s.mu.replicas.Range(func(k int64, v unsafe.Pointer) bool {
-		r := (*Replica)(v)
+	s.mu.replicasByRangeID.Range(func(r *Replica) {
 		r.mu.RLock()
 		quiescent := r.mu.quiescent
 		lagging := r.mu.laggingFollowersOnQuiesce
-		laggingAccurate := r.mu.laggingFollowersOnQuiesceAccurate
 		r.mu.RUnlock()
-		if quiescent && (lagging.MemberStale(l) || !laggingAccurate) {
-			r.unquiesce()
+		if quiescent && lagging.MemberStale(l) {
+			r.maybeUnquiesce()
 		}
-		return true
 	})
 }
 
@@ -583,7 +571,7 @@ func (s *Store) processRaft(ctx context.Context) {
 		return
 	}
 
-	s.scheduler.Start(ctx, s.stopper)
+	s.scheduler.Start(s.stopper)
 	// Wait for the scheduler worker goroutines to finish.
 	if err := s.stopper.RunAsyncTask(ctx, "sched-wait", s.scheduler.Wait); err != nil {
 		s.scheduler.Wait(ctx)
@@ -734,13 +722,13 @@ func (s *Store) sendQueuedHeartbeatsToNode(
 
 	if !s.cfg.Transport.SendAsync(chReq, rpc.SystemClass) {
 		for _, beat := range beats {
-			if value, ok := s.mu.replicas.Load(int64(beat.RangeID)); ok {
-				(*Replica)(value).addUnreachableRemoteReplica(beat.ToReplicaID)
+			if repl, ok := s.mu.replicasByRangeID.Load(beat.RangeID); ok {
+				repl.addUnreachableRemoteReplica(beat.ToReplicaID)
 			}
 		}
 		for _, resp := range resps {
-			if value, ok := s.mu.replicas.Load(int64(resp.RangeID)); ok {
-				(*Replica)(value).addUnreachableRemoteReplica(resp.ToReplicaID)
+			if repl, ok := s.mu.replicasByRangeID.Load(resp.RangeID); ok {
+				repl.addUnreachableRemoteReplica(resp.ToReplicaID)
 			}
 		}
 		return 0

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 	"golang.org/x/text/collate"
 )
 
@@ -424,7 +426,7 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 		) error {
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(scName)
-			for _, column := range table.PublicColumns() {
+			for _, column := range table.AccessibleColumns() {
 				collationCatalog := tree.DNull
 				collationSchema := tree.DNull
 				collationName := tree.DNull
@@ -435,7 +437,9 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 				}
 				colDefault := tree.DNull
 				if column.HasDefault() {
-					colExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, column.GetDefaultExpr(), &p.semaCtx, tree.FmtParsable)
+					colExpr, err := schemaexpr.FormatExprForDisplay(
+						ctx, table, column.GetDefaultExpr(), &p.semaCtx, p.SessionData(), tree.FmtParsable,
+					)
 					if err != nil {
 						return err
 					}
@@ -443,7 +447,9 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 				}
 				colComputed := emptyString
 				if column.IsComputed() {
-					colExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, column.GetComputeExpr(), &p.semaCtx, tree.FmtSimple)
+					colExpr, err := schemaexpr.FormatExprForDisplay(
+						ctx, table, column.GetComputeExpr(), &p.semaCtx, p.SessionData(), tree.FmtSimple,
+					)
 					if err != nil {
 						return err
 					}
@@ -612,6 +618,11 @@ https://www.postgresql.org/docs/9.5/infoschema-enabled-roles.html`,
 // string, or if the string's length is not bounded.
 func characterMaximumLength(colType *types.T) tree.Datum {
 	return dIntFnOrNull(func() (int32, bool) {
+		// "char" columns have a width of 1, but should report a NULL maximum
+		// character length.
+		if colType.Oid() == oid.T_char {
+			return 0, false
+		}
 		switch colType.Family() {
 		case types.StringFamily, types.CollatedStringFamily, types.BitFamily:
 			if colType.Width() > 0 {
@@ -628,6 +639,11 @@ func characterMaximumLength(colType *types.T) tree.Datum {
 // string's length is not bounded.
 func characterOctetLength(colType *types.T) tree.Datum {
 	return dIntFnOrNull(func() (int32, bool) {
+		// "char" columns have a width of 1, but should report a NULL octet
+		// length.
+		if colType.Oid() == oid.T_char {
+			return 0, false
+		}
 		switch colType.Family() {
 		case types.StringFamily, types.CollatedStringFamily:
 			if colType.Width() > 0 {
@@ -1528,7 +1544,10 @@ var informationSchemaSessionVariables = virtualSchemaTable{
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		for _, vName := range varNames {
 			gen := varGen[vName]
-			value := gen.Get(&p.extendedEvalCtx)
+			value, err := gen.Get(&p.extendedEvalCtx)
+			if err != nil {
+				return err
+			}
 			if err := addRow(
 				tree.NewDString(vName),
 				tree.NewDString(value),
@@ -2091,7 +2110,15 @@ func forEachSchema(
 		case strings.HasPrefix(name, catconstants.PgTempSchemaName):
 			schemas = append(schemas, schemadesc.NewTemporarySchema(name, id, db.GetID()))
 		case name == tree.PublicSchema:
-			schemas = append(schemas, schemadesc.GetPublicSchema())
+			// TODO(richardjcai): Remove this in 22.2. In 22.2, only the system
+			// public schema will continue to use keys.PublicSchemaID (29).
+			if id == keys.PublicSchemaID {
+				schemas = append(schemas, schemadesc.GetPublicSchema())
+			} else {
+				// The default case is a user defined schema. Collect the ID to get the
+				// descriptor later.
+				userDefinedSchemaIDs = append(userDefinedSchemaIDs, id)
+			}
 		default:
 			// The default case is a user defined schema. Collect the ID to get the
 			// descriptor later.
@@ -2455,7 +2482,12 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 		var scName string
 		if parentExists {
 			var ok bool
-			scName, ok = lCtx.schemaNames[table.GetParentSchemaID()]
+			scName, ok, err = lCtx.GetSchemaName(
+				ctx, table.GetParentSchemaID(), table.GetParentID(), p.ExecCfg().Settings.Version,
+			)
+			if err != nil {
+				return err
+			}
 			// Look up the schemas for this database if we discover that there is a
 			// missing temporary schema name. The only schemas which do not have
 			// descriptors are the public schema and temporary schemas. The public
@@ -2473,11 +2505,22 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 						table.GetParentSchemaID())
 				}
 				for id, n := range namesForSchema {
-					if _, exists := lCtx.schemaNames[id]; exists {
+					_, exists, err := lCtx.GetSchemaName(ctx, id, dbDesc.GetID(), p.ExecCfg().Settings.Version)
+					if err != nil {
+						return err
+					}
+					if exists {
 						continue
 					}
 					lCtx.schemaNames[id] = n
-					scName = lCtx.schemaNames[table.GetParentSchemaID()]
+					var found bool
+					scName, found, err = lCtx.GetSchemaName(ctx, id, dbDesc.GetID(), p.ExecCfg().Settings.Version)
+					if err != nil {
+						return err
+					}
+					if !found {
+						return errors.AssertionFailedf("schema id %d not found", id)
+					}
 				}
 			}
 		}

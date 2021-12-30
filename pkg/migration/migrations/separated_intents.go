@@ -54,6 +54,19 @@ const concurrentMigrateLockTableRequests = 4
 // the migration.
 const migrateLockTableRetries = 3
 
+// defaultPageSize controls how many ranges are paged in by default when
+// iterating through all ranges in a cluster during any given migration. We
+// pulled this number out of thin air(-ish). Let's consider a cluster with 50k
+// ranges, with each range taking ~200ms. We're being somewhat conservative with
+// the duration, but in a wide-area cluster with large hops between the manager
+// and the replicas, it could be true. Here's how long it'll take for various
+// block sizes:
+//
+//   page size of 1   ~ 2h 46m
+//   page size of 50  ~ 3m 20s
+//   page size of 200 ~ 50s
+const defaultPageSize = 200
+
 // migrateLockTableRequest represents migration of one slice of the keyspace. As
 // part of this request, multiple non-transactional requests would need to be
 // run: a Barrier, a ScanInterleavedIntents, then multiple txn pushes and intent
@@ -549,6 +562,18 @@ func postSeparatedIntentsMigration(
 				return err
 			})
 			if err != nil {
+				// TODO(erikgrinaker): This should be moved into a common helper for
+				// all migrations that e.g. manages checkpointing and retries as well.
+				// We add a message here for 21.2 temporarily, since this has been seen
+				// to fail in the wild.
+				log.Warningf(ctx, `Migrate command failed for range %d: %s.
+Command must be applied on all range replicas (not just a quorum). Please make
+sure all ranges are healthy and fully upreplicated. Heavy rebalancing may
+interfere with the migration, consider temporarily disabling rebalancing with
+the cluster setting kv.allocator.load_based_rebalancing=1 and
+kv.allocator.range_rebalance_threshold=1. The timeout can also be increased
+with kv.migration.migrate_application.timeout.`,
+					desc.RangeID, err)
 				return err
 			}
 		}

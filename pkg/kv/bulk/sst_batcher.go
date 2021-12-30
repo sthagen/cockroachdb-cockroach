@@ -28,20 +28,35 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 var (
 	tooSmallSSTSize = settings.RegisterByteSizeSetting(
+		settings.TenantWritable,
 		"kv.bulk_io_write.small_write_size",
 		"size below which a 'bulk' write will be performed as a normal write instead",
 		400*1<<10, // 400 Kib
+	)
+
+	ingestDelay = settings.RegisterDurationSetting(
+		settings.TenantWritable,
+		"bulkio.ingest.flush_delay",
+		"amount of time to wait before sending a file to the KV/Storage layer to ingest",
+		0,
+		settings.NonNegativeDuration,
 	)
 )
 
 type sz int64
 
 func (b sz) String() string {
-	return humanizeutil.IBytes(int64(b))
+	return redact.StringWithoutMarkers(b)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (b sz) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Print(humanizeutil.IBytes(int64(b)))
 }
 
 // SSTBatcher is a helper for bulk-adding many KVs in chunks via AddSSTable. An
@@ -57,8 +72,9 @@ type SSTBatcher struct {
 	maxSize    func() int64
 	splitAfter func() int64
 
-	// allows ingestion of keys where the MVCC.Key would shadow an existing row.
-	disallowShadowing bool
+	// disallowShadowingBelow is described on roachpb.AddSSTableRequest.
+	disallowShadowingBelow hlc.Timestamp
+
 	// skips duplicate keys (iff they are buffered together). This is true when
 	// used to backfill an inverted index. An array in JSONB with multiple values
 	// which are the same, will all correspond to the same kv in the inverted
@@ -71,9 +87,9 @@ type SSTBatcher struct {
 	// maintain uniform behavior, duplicates in the same batch with equal values
 	// will not raise a DuplicateKeyError.
 	skipDuplicates bool
-	// ingestAll can only be set when disallowShadowing and skipDuplicates are
-	// false. It will never return a duplicateKey error and continue ingesting all
-	// data provided to it.
+	// ingestAll can only be set when disallowShadowingBelow is empty and
+	// skipDuplicates is false. It will never return a duplicateKey error and
+	// continue ingesting all data provided to it.
 	ingestAll bool
 
 	// batchTS is the timestamp that will be set on batch requests used to send
@@ -106,7 +122,7 @@ type SSTBatcher struct {
 	batchEndValue   []byte
 	flushKeyChecked bool
 	flushKey        roachpb.Key
-	// stores on-the-fly stats for the SST if disallowShadowing is true.
+	// stores on-the-fly stats for the SST if disallowShadowingBelow is set.
 	ms enginepb.MVCCStats
 	// rows written in the current batch.
 	rowCounter storage.RowCounter
@@ -114,9 +130,15 @@ type SSTBatcher struct {
 
 // MakeSSTBatcher makes a ready-to-use SSTBatcher.
 func MakeSSTBatcher(
-	ctx context.Context, db SSTSender, settings *cluster.Settings, flushBytes func() int64,
+	ctx context.Context,
+	db SSTSender,
+	settings *cluster.Settings,
+	flushBytes func() int64,
+	disallowShadowingBelow hlc.Timestamp,
 ) (*SSTBatcher, error) {
-	b := &SSTBatcher{db: db, settings: settings, maxSize: flushBytes, disallowShadowing: true}
+	b := &SSTBatcher{
+		db: db, settings: settings, maxSize: flushBytes, disallowShadowingBelow: disallowShadowingBelow,
+	}
 	err := b.Reset(ctx)
 	return b, err
 }
@@ -185,7 +207,7 @@ func (b *SSTBatcher) AddMVCCKey(ctx context.Context, key storage.MVCCKey, value 
 	// guaranteed to ingest unique keys. This saves us an extra iteration in
 	// AddSSTable which has been identified as a significant performance
 	// regression for IMPORT.
-	if b.disallowShadowing {
+	if !b.disallowShadowingBelow.IsEmpty() {
 		b.updateMVCCStats(key, value)
 	}
 
@@ -264,6 +286,17 @@ func (b *SSTBatcher) doFlush(ctx context.Context, reason int, nextKey roachpb.Ke
 	}
 	b.flushCounts.total++
 
+	if delay := ingestDelay.Get(&b.settings.SV); delay != 0 {
+		if delay > time.Second || log.V(1) {
+			log.Infof(ctx, "delaying %s before flushing ingestion buffer...", delay)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
 	hour := hlc.Timestamp{WallTime: timeutil.Now().Add(time.Hour).UnixNano()}
 
 	start := roachpb.Key(append([]byte(nil), b.batchStartKey...))
@@ -314,7 +347,7 @@ func (b *SSTBatcher) doFlush(ctx context.Context, reason int, nextKey roachpb.Ke
 	}
 
 	beforeSend := timeutil.Now()
-	files, err := AddSSTable(ctx, b.db, start, end, b.sstFile.Data(), b.disallowShadowing, b.ms, b.settings, b.batchTS)
+	files, err := AddSSTable(ctx, b.db, start, end, b.sstFile.Data(), b.disallowShadowingBelow, b.ms, b.settings, b.batchTS)
 	if err != nil {
 		return err
 	}
@@ -379,19 +412,22 @@ type SSTSender interface {
 		ctx context.Context,
 		begin, end interface{},
 		data []byte,
+		disallowConflicts bool,
 		disallowShadowing bool,
+		disallowShadowingBelow hlc.Timestamp,
 		stats *enginepb.MVCCStats,
 		ingestAsWrites bool,
 		batchTs hlc.Timestamp,
+		writeAtBatchTs bool,
 	) error
 	SplitAndScatter(ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp) error
 }
 
 type sstSpan struct {
-	start, end        roachpb.Key
-	sstBytes          []byte
-	disallowShadowing bool
-	stats             enginepb.MVCCStats
+	start, end             roachpb.Key
+	sstBytes               []byte
+	disallowShadowingBelow hlc.Timestamp
+	stats                  enginepb.MVCCStats
 }
 
 // AddSSTable retries db.AddSSTable if retryable errors occur, including if the
@@ -402,7 +438,7 @@ func AddSSTable(
 	db SSTSender,
 	start, end roachpb.Key,
 	sstBytes []byte,
-	disallowShadowing bool,
+	disallowShadowingBelow hlc.Timestamp,
 	ms enginepb.MVCCStats,
 	settings *cluster.Settings,
 	batchTs hlc.Timestamp,
@@ -425,7 +461,7 @@ func AddSSTable(
 		stats = ms
 	}
 
-	work := []*sstSpan{{start: start, end: end, sstBytes: sstBytes, disallowShadowing: disallowShadowing, stats: stats}}
+	work := []*sstSpan{{start: start, end: end, sstBytes: sstBytes, disallowShadowingBelow: disallowShadowingBelow, stats: stats}}
 	const maxAddSSTableRetries = 10
 	for len(work) > 0 {
 		item := work[0]
@@ -451,7 +487,9 @@ func AddSSTable(
 					ingestAsWriteBatch = true
 				}
 				// This will fail if the range has split but we'll check for that below.
-				err = db.AddSSTable(ctx, item.start, item.end, item.sstBytes, item.disallowShadowing, &item.stats, ingestAsWriteBatch, batchTs)
+				err = db.AddSSTable(ctx, item.start, item.end, item.sstBytes, false, /* disallowConflicts */
+					!item.disallowShadowingBelow.IsEmpty(), item.disallowShadowingBelow, &item.stats,
+					ingestAsWriteBatch, batchTs, false /* writeAtBatchTs */)
 				if err == nil {
 					log.VEventf(ctx, 3, "adding %s AddSSTable [%s,%s) took %v", sz(len(item.sstBytes)), item.start, item.end, timeutil.Since(before))
 					return nil
@@ -460,9 +498,13 @@ func AddSSTable(
 				if m := (*roachpb.RangeKeyMismatchError)(nil); errors.As(err, &m) {
 					// TODO(andrei): We just use the first of m.Ranges; presumably we
 					// should be using all of them to avoid further retries.
-					split := m.Ranges()[0].Desc.EndKey.AsRawKey()
+					mr, err := m.MismatchedRange()
+					if err != nil {
+						return err
+					}
+					split := mr.Desc.EndKey.AsRawKey()
 					log.Infof(ctx, "SSTable cannot be added spanning range bounds %v, retrying...", split)
-					left, right, err := createSplitSSTable(ctx, db, item.start, split, item.disallowShadowing, iter, settings)
+					left, right, err := createSplitSSTable(ctx, db, item.start, split, item.disallowShadowingBelow, iter, settings)
 					if err != nil {
 						return err
 					}
@@ -505,7 +547,7 @@ func createSplitSSTable(
 	ctx context.Context,
 	db SSTSender,
 	start, splitKey roachpb.Key,
-	disallowShadowing bool,
+	disallowShadowingBelow hlc.Timestamp,
 	iter storage.SimpleMVCCIterator,
 	settings *cluster.Settings,
 ) (*sstSpan, *sstSpan, error) {
@@ -534,10 +576,10 @@ func createSplitSSTable(
 				return nil, nil, err
 			}
 			left = &sstSpan{
-				start:             first,
-				end:               last.PrefixEnd(),
-				sstBytes:          sstFile.Data(),
-				disallowShadowing: disallowShadowing,
+				start:                  first,
+				end:                    last.PrefixEnd(),
+				sstBytes:               sstFile.Data(),
+				disallowShadowingBelow: disallowShadowingBelow,
 			}
 			*sstFile = storage.MemFile{}
 			w = storage.MakeIngestionSSTWriter(sstFile)
@@ -563,10 +605,10 @@ func createSplitSSTable(
 		return nil, nil, err
 	}
 	right = &sstSpan{
-		start:             first,
-		end:               last.PrefixEnd(),
-		sstBytes:          sstFile.Data(),
-		disallowShadowing: disallowShadowing,
+		start:                  first,
+		end:                    last.PrefixEnd(),
+		sstBytes:               sstFile.Data(),
+		disallowShadowingBelow: disallowShadowingBelow,
 	}
 	return left, right, nil
 }

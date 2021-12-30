@@ -18,7 +18,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -445,7 +444,7 @@ func TestHashAggregator(t *testing.T) {
 					nil, /* newSpillingQueueArgs */
 					testAllocator,
 					math.MaxInt64,
-				)
+				), nil
 			})
 	}
 }
@@ -460,8 +459,6 @@ func BenchmarkHashAggregatorInputTuplesTracking(b *testing.B) {
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 	defer cleanup()
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
 
 	aggFn := execinfrapb.Min
 	numRows := []int{1, 32, coldata.BatchSize(), 32 * coldata.BatchSize(), 1024 * coldata.BatchSize()}
@@ -475,14 +472,14 @@ func BenchmarkHashAggregatorInputTuplesTracking(b *testing.B) {
 		for _, groupSize := range groupSizes {
 			for _, agg := range []aggType{
 				{
-					new: func(args *colexecagg.NewAggregatorArgs) (colexecop.ResettableOperator, error) {
+					new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 						return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, math.MaxInt64)
 					},
 					name:  "tracking=false",
 					order: unordered,
 				},
 				{
-					new: func(args *colexecagg.NewAggregatorArgs) (colexecop.ResettableOperator, error) {
+					new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 						spillingQueueMemAcc := testMemMonitor.MakeBoundAccount()
 						memAccounts = append(memAccounts, &spillingQueueMemAcc)
 						return NewHashAggregator(args, &colexecutils.NewSpillingQueueArgs{
@@ -523,8 +520,6 @@ func BenchmarkHashAggregatorPartialOrder(b *testing.B) {
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 	defer cleanup()
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
 
 	aggFn := execinfrapb.Min
 	numRows := []int{1, 32, coldata.BatchSize(), 32 * coldata.BatchSize(), 1024 * coldata.BatchSize()}
@@ -539,7 +534,7 @@ func BenchmarkHashAggregatorPartialOrder(b *testing.B) {
 		groupSizes = []int{1, coldata.BatchSize()}
 	}
 	var memAccounts []*mon.BoundAccount
-	f := func(args *colexecagg.NewAggregatorArgs) (colexecop.ResettableOperator, error) {
+	f := func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 		spillingQueueMemAcc := testMemMonitor.MakeBoundAccount()
 		memAccounts = append(memAccounts, &spillingQueueMemAcc)
 		return NewHashAggregator(args, &colexecutils.NewSpillingQueueArgs{

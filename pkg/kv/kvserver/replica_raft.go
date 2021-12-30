@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -81,12 +82,12 @@ func (r *Replica) evalAndPropose(
 	ba *roachpb.BatchRequest,
 	g *concurrency.Guard,
 	st kvserverpb.LeaseStatus,
-	lul hlc.Timestamp,
+	ui uncertainty.Interval,
 	tok TrackedRequestToken,
 ) (chan proposalResult, func(), kvserverbase.CmdIDKey, *roachpb.Error) {
 	defer tok.DoneIfNotMoved(ctx)
 	idKey := makeIDKey()
-	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, lul, g.LatchSpans(), g.LockSpans())
+	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, ui, g.LatchSpans())
 	log.Event(proposal.ctx, "evaluated request")
 
 	// If the request hit a server-side concurrency retry error, immediately
@@ -113,9 +114,13 @@ func (r *Replica) evalAndPropose(
 	// 2. pErr != nil corresponds to a failed proposal - the command resulted
 	//    in an error.
 	if proposal.command == nil {
+		if proposal.Local.RequiresRaft() {
+			return nil, nil, "", roachpb.NewError(errors.AssertionFailedf(
+				"proposal resulting from batch %s erroneously bypassed Raft", ba))
+		}
 		intents := proposal.Local.DetachEncounteredIntents()
 		endTxns := proposal.Local.DetachEndTxns(pErr != nil /* alwaysOnly */)
-		r.handleReadWriteLocalEvalResult(ctx, *proposal.Local, false /* raftMuHeld */)
+		r.handleReadWriteLocalEvalResult(ctx, *proposal.Local)
 
 		pr := proposalResult{
 			Reply:              proposal.Local.Reply,
@@ -164,11 +169,33 @@ func (r *Replica) evalAndPropose(
 		// Continue with proposal...
 	}
 
-	// Attach information about the proposer to the command.
-	proposal.command.ProposerLeaseSequence = st.Lease.Sequence
-	// Perform a sanity check that the lease is owned by this replica.
-	if !st.Lease.OwnedBy(r.store.StoreID()) && !ba.IsLeaseRequest() {
+	// Attach information about the proposer's lease to the command, for
+	// verification below raft. Lease requests are special since they are not
+	// necessarily proposed under a valid lease (by necessity). Instead, they
+	// reference the previous lease. Note that TransferLease also skip lease
+	// checks (for technical reasons, see `TransferLease.flags`) and uses the
+	// same mechanism.
+	if ba.IsSingleSkipsLeaseCheckRequest() {
+		// Lease-related commands have below-raft special casing and will carry the
+		// lease sequence of the lease they are intending to follow.
+		// The remaining requests that skip a lease check (at the time of writing
+		// ProbeRequest) will assign a zero lease sequence and thus won't be able
+		// to mutate state.
+		var seq roachpb.LeaseSequence
+		switch t := ba.Requests[0].GetInner().(type) {
+		case *roachpb.RequestLeaseRequest:
+			seq = t.PrevLease.Sequence
+		case *roachpb.TransferLeaseRequest:
+			seq = t.PrevLease.Sequence
+		default:
+		}
+		proposal.command.ProposerLeaseSequence = seq
+	} else if !st.Lease.OwnedBy(r.store.StoreID()) {
+		// Perform a sanity check that the lease is owned by this replica. This must
+		// have been ascertained by the callers in checkExecutionCanProceed.
 		log.Fatalf(ctx, "cannot propose %s on follower with remotely owned lease %s", ba, st.Lease)
+	} else {
+		proposal.command.ProposerLeaseSequence = st.Lease.Sequence
 	}
 
 	// Once a command is written to the raft log, it must be loaded into memory
@@ -425,7 +452,7 @@ func (r *Replica) stepRaftGroup(req *RaftMessageRequest) error {
 		// other replica is not quiesced, so we don't need to wake the leader.
 		// Note that we avoid campaigning when receiving raft messages, because
 		// we expect the originator to campaign instead.
-		r.unquiesceWithOptionsLocked(false /* campaignOnWake */)
+		r.maybeUnquiesceWithOptionsLocked(false /* campaignOnWake */)
 		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, timeutil.Now())
 		if req.Message.Type == raftpb.MsgSnap {
 			// Occasionally a snapshot message may arrive under an outdated term,
@@ -453,17 +480,6 @@ func (r *Replica) stepRaftGroup(req *RaftMessageRequest) error {
 		}
 		return false /* unquiesceAndWakeLeader */, err
 	})
-}
-
-// raftSchedulerCtx annotates a given Raft scheduler context with information
-// about the replica. The method may return a cached instance of this context.
-func (r *Replica) raftSchedulerCtx(schedulerCtx context.Context) context.Context {
-	if v := r.schedulerCtx.Load(); v != nil {
-		return v.(context.Context)
-	}
-	schedulerCtx = r.AnnotateCtx(schedulerCtx)
-	r.schedulerCtx.Store(schedulerCtx)
-	return schedulerCtx
 }
 
 type handleSnapshotStats struct {
@@ -494,16 +510,23 @@ func (r *Replica) handleRaftReady(
 	return r.handleRaftReadyRaftMuLocked(ctx, inSnap)
 }
 
-// handleRaftReadyLocked is the same as handleRaftReady but requires that the
-// replica's raftMu be held.
+// handleRaftReadyRaftMuLocked is the same as handleRaftReady but requires that
+// the replica's raftMu be held.
 //
 // The returned string is nonzero whenever an error is returned to give a
 // non-sensitive cue as to what happened.
 func (r *Replica) handleRaftReadyRaftMuLocked(
 	ctx context.Context, inSnap IncomingSnapshot,
-) (_ handleRaftReadyStats, _ string, foo error) {
+) (handleRaftReadyStats, string, error) {
+	// handleRaftReadyRaftMuLocked is not prepared to handle context cancellation,
+	// so assert that it's given a non-cancellable context.
+	if ctx.Done() != nil {
+		return handleRaftReadyStats{}, "", errors.AssertionFailedf(
+			"handleRaftReadyRaftMuLocked cannot be called with a cancellable context")
+	}
+
 	var stats handleRaftReadyStats
-	if inSnap.State != nil {
+	if inSnap.Desc != nil {
 		stats.snap.offered = true
 	}
 
@@ -580,7 +603,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		leaderID = roachpb.ReplicaID(rd.SoftState.Lead)
 	}
 
-	if inSnap.State != nil {
+	if inSnap.Desc != nil {
 		if !raft.IsEmptySnap(rd.Snapshot) {
 			snapUUID, err := uuid.FromBytes(rd.Snapshot.Data)
 			if err != nil {
@@ -984,11 +1007,13 @@ func (r *Replica) tick(ctx context.Context, livenessMap liveness.IsLiveMap) (boo
 	if r.mu.quiescent {
 		return false, nil
 	}
-	if r.maybeQuiesceLocked(ctx, livenessMap) {
+
+	now := r.store.Clock().NowAsClockTimestamp()
+	if r.maybeQuiesceLocked(ctx, now, livenessMap) {
 		return false, nil
 	}
 
-	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx)
+	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx, now)
 
 	// For followers, we update lastUpdateTimes when we step a message from them
 	// into the local Raft group. The leader won't hit that path, so we update
@@ -1521,19 +1546,18 @@ func (r *Replica) withRaftGroupLocked(
 		// stricter about validating incoming Quiesce requests) but it's good
 		// defense-in-depth.
 		//
-		// Note that unquiesceAndWakeLeaderLocked won't manage to wake up the
-		// leader since it's unknown to this replica, and at the time of writing
-		// the heuristics for campaigning are defensive (won't campaign if there
-		// is a live leaseholder). But if we are trying to unquiesce because
-		// this follower was asked to propose something, then this means that a
-		// request is going to have to wait until the leader next contacts us,
-		// or, in the worst case, an election timeout. This is not ideal - if a
-		// node holds a live lease, we should direct the client to it
-		// immediately.
+		// Note that maybeUnquiesceAndWakeLeaderLocked won't manage to wake up the
+		// leader since it's unknown to this replica, and at the time of writing the
+		// heuristics for campaigning are defensive (won't campaign if there is a
+		// live leaseholder). But if we are trying to unquiesce because this
+		// follower was asked to propose something, then this means that a request
+		// is going to have to wait until the leader next contacts us, or, in the
+		// worst case, an election timeout. This is not ideal - if a node holds a
+		// live lease, we should direct the client to it immediately.
 		unquiesce = true
 	}
 	if unquiesce {
-		r.unquiesceAndWakeLeaderLocked()
+		r.maybeUnquiesceAndWakeLeaderLocked()
 	}
 	return err
 }
@@ -1611,8 +1635,12 @@ func shouldCampaignOnWake(
 // being quiescent) and campaigns for raft leadership if appropriate.
 func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	// Raft panics if a node that is not currently a member of the
-	// group tries to campaign. That happens primarily when we apply
-	// preemptive snapshots.
+	// group tries to campaign. This method should never be called
+	// otherwise and in fact the Replica should never be in such a
+	// state but better not take any chances. For example, if this
+	// method were to be called on an uninitialized replica (which
+	// has no state and thus an empty raft config), this might cause
+	// problems.
 	if _, currentMember := r.mu.state.Desc.GetReplicaDescriptorByID(r.mu.replicaID); !currentMember {
 		return
 	}
@@ -1711,7 +1739,7 @@ func (r *Replica) maybeAcquireSnapshotMergeLock(
 		// installed a placeholder for snapshot's keyspace. No merge lock needed.
 		return nil, func() {}
 	}
-	for endKey.Less(inSnap.State.Desc.EndKey) {
+	for endKey.Less(inSnap.Desc.EndKey) {
 		sRepl := r.store.LookupReplica(endKey)
 		if sRepl == nil || !endKey.Equal(sRepl.Desc().StartKey) {
 			log.Fatalf(ctx, "snapshot widens existing replica, but no replica exists for subsumed key %s", endKey)
@@ -1798,46 +1826,44 @@ func (r *Replica) acquireMergeLock(
 	return rightRepl.raftMu.Unlock, nil
 }
 
-// handleTruncatedStateBelowRaft is called when a Raft command updates the truncated
-// state. This isn't 100% trivial for two reasons:
-// - in 19.1 we're making the TruncatedState key unreplicated, so there's a migration
-// - we're making use of the above by not sending the Raft log in snapshots (the truncated
-//   state effectively determines the first index of the log, which requires it to be unreplicated).
-//   Updates to the HardState are sent out by a leaseholder truncating the log based on its local
-//   knowledge. For example, the leader might have a log 10..100 and truncates to 50, and will send
-//   out a TruncatedState with Index 50 to that effect. However, some replicas may not even have log
-//   entries that old, and must make sure to ignore this update to the truncated state, as it would
-//   otherwise clobber their "newer" truncated state.
+// handleTruncatedStateBelowRaftPreApply is called before applying a Raft
+// command that updates the truncated state.
+//
+// The truncated state of a replica determines where its Raft log starts (by
+// giving the last index that was already deleted). It's unreplicated -- it can
+// differ between replicas at the same applied index. This divergence occurs
+// primarily occurs through snapshots that contain no log entries; the truncated
+// index in the snapshot is set to equal the applied index it was generated
+// from. The truncation itself then is a purely replicated side effect.
+//
+// Updates to the HardState are sent out by a leaseholder truncating the log
+// based on its local knowledge. For example, the leader might have a log
+// 10..100 and truncates to 50, and will send out a TruncatedState with Index 50
+// to that effect. However, some replicas may not even have log entries that
+// old and must make sure to ignore this update to the truncated state, as it
+// would otherwise clobber their "newer" truncated state. The truncated state
+// provided by the leader then is merely a suggested one -- we could ignore it
+// and still be correct.
+//
+// We also rely on log truncations happening in the apply loop -- this makes
+// sure that a truncation does not remove entries to be applied that we haven't
+// yet. Since a truncation only ever removes committed log indexes, and after
+// choosing the index gets proposed, the truncation command itself will be
+// assigned an index higher than the one it could possibly remove. By the time
+// the truncation itself is handled, the state machine will have applied all
+// entries the truncation could possibly affect.
 //
 // The returned boolean tells the caller whether to apply the truncated state's
 // side effects, which means replacing the in-memory TruncatedState and applying
 // the associated RaftLogDelta. It is usually expected to be true, but may not
 // be for the first truncation after on a replica that recently received a
 // snapshot.
-func handleTruncatedStateBelowRaft(
+func handleTruncatedStateBelowRaftPreApply(
 	ctx context.Context,
-	oldTruncatedState, newTruncatedState *roachpb.RaftTruncatedState,
+	currentTruncatedState, suggestedTruncatedState *roachpb.RaftTruncatedState,
 	loader stateloader.StateLoader,
 	readWriter storage.ReadWriter,
-	assertNoLegacy bool,
 ) (_apply bool, _ error) {
-	// If this is a log truncation, load the resulting unreplicated or legacy
-	// replicated truncated state (in that order). If the migration is happening
-	// in this command, the result will be an empty message. In steady state
-	// after the migration, it's the unreplicated truncated state not taking
-	// into account the current truncation (since the key is unreplicated).
-	// Either way, we'll update it below.
-	//
-	// See VersionUnreplicatedRaftTruncatedState for details.
-	truncStatePostApply, truncStateIsLegacy, err := loader.LoadRaftTruncatedState(ctx, readWriter)
-	if err != nil {
-		return false, errors.Wrap(err, "loading truncated state")
-	}
-
-	if assertNoLegacy && truncStateIsLegacy {
-		log.Fatalf(ctx, "found legacy truncated state which should no longer exist")
-	}
-
 	// Truncate the Raft log from the entry after the previous
 	// truncation index to the new truncation index. This is performed
 	// atomically with the raft command application so that the
@@ -1851,42 +1877,31 @@ func handleTruncatedStateBelowRaft(
 	// perform well here because the tombstones could be "collapsed",
 	// but it is hardly worth the risk at this point.
 	prefixBuf := &loader.RangeIDPrefixBuf
-	for idx := oldTruncatedState.Index + 1; idx <= newTruncatedState.Index; idx++ {
+	for idx := currentTruncatedState.Index + 1; idx <= suggestedTruncatedState.Index; idx++ {
 		// NB: RangeIDPrefixBufs have sufficient capacity (32 bytes) to
 		// avoid allocating when constructing Raft log keys (16 bytes).
 		unsafeKey := prefixBuf.RaftLogKey(idx)
 		if err := readWriter.ClearUnversioned(unsafeKey); err != nil {
-			return false, errors.Wrapf(err, "unable to clear truncated Raft entries for %+v", newTruncatedState)
+			return false, errors.Wrapf(err, "unable to clear truncated Raft entries for %+v at index %d",
+				suggestedTruncatedState, idx)
 		}
 	}
 
-	if !truncStateIsLegacy {
-		if truncStatePostApply.Index < newTruncatedState.Index {
-			// There are two cases here (though handled just the same). In the
-			// first case, the Raft command has just deleted the legacy
-			// replicated truncated state key as part of the migration (so
-			// truncStateIsLegacy is now false for the first time and
-			// truncStatePostApply is zero) and we need to atomically write the
-			// new, unreplicated, key. Or we've already migrated earlier, in
-			// which case truncStatePostApply equals the current value of the
-			// new key (which wasn't touched by the batch), and we need to
-			// overwrite it if this truncation "moves it forward".
-
-			if err := storage.MVCCPutProto(
-				ctx, readWriter, nil /* ms */, prefixBuf.RaftTruncatedStateKey(),
-				hlc.Timestamp{}, nil /* txn */, newTruncatedState,
-			); err != nil {
-				return false, errors.Wrap(err, "unable to migrate RaftTruncatedState")
-			}
-			// Have migrated and this new truncated state is moving us forward.
-			// Tell caller that we applied it and that so should they.
-			return true, nil
-		}
-		// Have migrated, but this truncated state moves the existing one
-		// backwards, so instruct caller to not update in-memory state.
+	if suggestedTruncatedState.Index <= currentTruncatedState.Index {
+		// The suggested truncated state moves us backwards; instruct the
+		// caller to not update the in-memory state.
 		return false, nil
 	}
-	// Haven't migrated yet, don't ever discard the update.
+
+	// The suggested truncated state moves us forward; apply it and tell
+	// the caller as much.
+	if err := storage.MVCCPutProto(
+		ctx, readWriter, nil /* ms */, prefixBuf.RaftTruncatedStateKey(),
+		hlc.Timestamp{}, nil /* txn */, suggestedTruncatedState,
+	); err != nil {
+		return false, errors.Wrap(err, "unable to write RaftTruncatedState")
+	}
+
 	return true, nil
 }
 

@@ -46,10 +46,6 @@ func (s *Store) MergeRange(
 	leftRepl.raftMu.AssertHeld()
 	rightRepl.raftMu.AssertHeld()
 
-	if err := rightRepl.postDestroyRaftMuLocked(ctx, rightRepl.GetMVCCStats()); err != nil {
-		return err
-	}
-
 	// Note that we were called (indirectly) from raft processing so we must
 	// call removeInitializedReplicaRaftMuLocked directly to avoid deadlocking
 	// on the right-hand replica's raftMu.
@@ -58,7 +54,11 @@ func (s *Store) MergeRange(
 		// runPreApplyTriggersAfterStagingWriteBatch.
 		DestroyData: false,
 	}); err != nil {
-		return errors.Errorf("cannot remove range: %s", err)
+		return errors.Wrap(err, "cannot remove range")
+	}
+
+	if err := rightRepl.postDestroyRaftMuLocked(ctx, rightRepl.GetMVCCStats()); err != nil {
+		return err
 	}
 
 	if leftRepl.leaseholderStats != nil {

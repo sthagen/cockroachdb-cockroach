@@ -17,7 +17,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/observedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -29,6 +29,9 @@ import (
 
 const (
 	maxItersBeforeSeek = 10
+
+	// Key value lengths take up 8 bytes (2 x Uint32).
+	kvLenSize = 8
 )
 
 // Struct to store MVCCScan / MVCCGet in the same binary format as that
@@ -50,8 +53,6 @@ func (p *pebbleResults) clear() {
 func (p *pebbleResults) put(
 	ctx context.Context, key []byte, value []byte, memAccount *mon.BoundAccount,
 ) error {
-	// Key value lengths take up 8 bytes (2 x Uint32).
-	const kvLenSize = 8
 	const minSize = 16
 	const maxSize = 128 << 20 // 128 MB
 
@@ -61,7 +62,8 @@ func (p *pebbleResults) put(
 	// cost of the allocation over multiple put calls. If this (key, value) pair
 	// needs capacity greater than maxSize, we allocate exactly the size needed.
 	lenKey := len(key)
-	lenToAdd := kvLenSize + lenKey + len(value)
+	lenValue := len(value)
+	lenToAdd := p.sizeOf(lenKey, lenValue)
 	if len(p.repr)+lenToAdd > cap(p.repr) {
 		newSize := 2 * cap(p.repr)
 		if newSize == 0 || newSize > maxSize {
@@ -88,13 +90,17 @@ func (p *pebbleResults) put(
 
 	startIdx := len(p.repr)
 	p.repr = p.repr[:startIdx+lenToAdd]
-	binary.LittleEndian.PutUint32(p.repr[startIdx:], uint32(len(value)))
+	binary.LittleEndian.PutUint32(p.repr[startIdx:], uint32(lenValue))
 	binary.LittleEndian.PutUint32(p.repr[startIdx+4:], uint32(lenKey))
 	copy(p.repr[startIdx+kvLenSize:], key)
 	copy(p.repr[startIdx+kvLenSize+lenKey:], value)
 	p.count++
 	p.bytes += int64(lenToAdd)
 	return nil
+}
+
+func (p *pebbleResults) sizeOf(lenKey, lenValue int) int {
+	return kvLenSize + lenKey + lenValue
 }
 
 func (p *pebbleResults) finish() [][]byte {
@@ -117,13 +123,19 @@ type pebbleMVCCScanner struct {
 	start, end roachpb.Key
 	// Timestamp with which MVCCScan/MVCCGet was called.
 	ts hlc.Timestamp
-	// Max number of keys to return. Note that targetBytes below is implemented
-	// by mutating maxKeys. (In particular, one must not assume that if maxKeys
-	// is zero initially it will always be zero).
+	// Max number of keys to return.
 	maxKeys int64
 	// Stop adding keys once p.result.bytes matches or exceeds this threshold,
 	// if nonzero.
 	targetBytes int64
+	// If true, don't exceed targetBytes except for the first kv pair.
+	//
+	// TODO(erikgrinaker): This option exists for backwards compatibility with
+	// 21.2 RPC clients, in 22.1 it should always be enabled.
+	targetBytesAvoidExcess bool
+	// If true, return an empty result if the first result exceeds targetBytes
+	// and targetBytesAvoidExcess is true.
+	targetBytesAllowEmpty bool
 	// Stop adding intents and abort scan once maxIntents threshold is reached.
 	// This limit is only applicable to consistent scans since they return
 	// intents as an error.
@@ -139,9 +151,8 @@ type pebbleMVCCScanner struct {
 	txnSequence       enginepb.TxnSeq
 	txnIgnoredSeqNums []enginepb.IgnoredSeqNumRange
 	// Uncertainty related fields.
-	localUncertaintyLimit  hlc.Timestamp
-	globalUncertaintyLimit hlc.Timestamp
-	checkUncertainty       bool
+	uncertainty      uncertainty.Interval
+	checkUncertainty bool
 	// Metadata object for unmarshalling intents.
 	meta enginepb.MVCCMetadata
 	// Bools copied over from MVCC{Scan,Get}Options. See the comment on the
@@ -157,6 +168,7 @@ type pebbleMVCCScanner struct {
 	curUnsafeKey MVCCKey
 	curRawKey    []byte
 	curValue     []byte
+	curExcluded  bool
 	results      pebbleResults
 	intents      pebble.Batch
 	// mostRecentTS stores the largest timestamp observed that is equal to or
@@ -188,8 +200,9 @@ func (p *pebbleMVCCScanner) release() {
 
 // init sets bounds on the underlying pebble iterator, and initializes other
 // fields not set by the calling method.
-func (p *pebbleMVCCScanner) init(txn *roachpb.Transaction, localUncertaintyLimit hlc.Timestamp) {
+func (p *pebbleMVCCScanner) init(txn *roachpb.Transaction, ui uncertainty.Interval) {
 	p.itersBeforeSeek = maxItersBeforeSeek / 2
+	p.curExcluded = false
 
 	if txn != nil {
 		p.txn = txn
@@ -197,12 +210,11 @@ func (p *pebbleMVCCScanner) init(txn *roachpb.Transaction, localUncertaintyLimit
 		p.txnSequence = txn.Sequence
 		p.txnIgnoredSeqNums = txn.IgnoredSeqNums
 
-		p.localUncertaintyLimit = localUncertaintyLimit
-		p.globalUncertaintyLimit = txn.GlobalUncertaintyLimit
-		// We must check uncertainty even if p.ts.Less(localUncertaintyLimit)
+		p.uncertainty = ui
+		// We must check uncertainty even if p.ts.Less(p.uncertainty.LocalLimit)
 		// because the local uncertainty limit cannot be applied to values with
 		// synthetic timestamps.
-		p.checkUncertainty = p.ts.Less(p.globalUncertaintyLimit)
+		p.checkUncertainty = p.ts.Less(p.uncertainty.GlobalLimit)
 	}
 }
 
@@ -219,16 +231,18 @@ func (p *pebbleMVCCScanner) get(ctx context.Context) {
 
 // scan iterates until a limit is exceeded, the underlying iterator is
 // exhausted, or an error is encountered. If a limit was exceeded, it returns a
-// resume span and resume reason.
-func (p *pebbleMVCCScanner) scan(ctx context.Context) (*roachpb.Span, roachpb.ResumeReason, error) {
+// resume span, resume reason, and for targetBytes the size of the next result.
+func (p *pebbleMVCCScanner) scan(
+	ctx context.Context,
+) (*roachpb.Span, roachpb.ResumeReason, int64, error) {
 	p.isGet = false
 	if p.reverse {
 		if !p.iterSeekReverse(MVCCKey{Key: p.end}) {
-			return nil, 0, p.err
+			return nil, 0, 0, p.err
 		}
 	} else {
 		if !p.iterSeek(MVCCKey{Key: p.start}) {
-			return nil, 0, p.err
+			return nil, 0, 0, p.err
 		}
 	}
 
@@ -237,15 +251,14 @@ func (p *pebbleMVCCScanner) scan(ctx context.Context) (*roachpb.Span, roachpb.Re
 	p.maybeFailOnMoreRecent()
 
 	if p.err != nil {
-		return nil, 0, p.err
+		return nil, 0, 0, p.err
 	}
 
-	if p.resumeReason != 0 && p.advanceKey() {
+	if p.resumeReason != 0 && (p.curExcluded || p.advanceKey()) {
 		var resumeSpan *roachpb.Span
+		// curKey was not added to results, so it needs to be included in the
+		// resume span.
 		if p.reverse {
-			// curKey was not added to results, so it needs to be included in the
-			// resume span.
-			//
 			// NB: this is equivalent to:
 			//  append(roachpb.Key(nil), p.curKey.Key...).Next()
 			// but with half the allocations.
@@ -262,9 +275,13 @@ func (p *pebbleMVCCScanner) scan(ctx context.Context) (*roachpb.Span, roachpb.Re
 				EndKey: p.end,
 			}
 		}
-		return resumeSpan, p.resumeReason, nil
+		var resumeNextBytes int64
+		if p.resumeReason == roachpb.RESUME_BYTE_LIMIT && p.curExcluded {
+			resumeNextBytes = int64(p.results.sizeOf(len(p.curRawKey), len(p.curValue)))
+		}
+		return resumeSpan, p.resumeReason, resumeNextBytes, nil
 	}
-	return nil, 0, nil
+	return nil, 0, 0, nil
 }
 
 // Increments itersBeforeSeek while ensuring it stays <= maxItersBeforeSeek
@@ -326,18 +343,10 @@ func (p *pebbleMVCCScanner) maybeFailOnMoreRecent() {
 	p.intents.Reset()
 }
 
-// Returns whether a value with the specified timestamp is within the
-// transaction's uncertainty interval and is considered uncertain.
-//
-// REQUIRES: p.uncertaintyCheck == true
-// REQUIRES: p.ts < ts
-func (p *pebbleMVCCScanner) isUncertainValue(ts hlc.Timestamp) bool {
-	return observedts.IsUncertain(p.localUncertaintyLimit, p.globalUncertaintyLimit, ts)
-}
-
 // Returns an uncertainty error with the specified timestamp and p.txn.
 func (p *pebbleMVCCScanner) uncertaintyError(ts hlc.Timestamp) bool {
-	p.err = roachpb.NewReadWithinUncertaintyIntervalError(p.ts, ts, p.localUncertaintyLimit, p.txn)
+	p.err = roachpb.NewReadWithinUncertaintyIntervalError(
+		p.ts, ts, p.uncertainty.LocalLimit.ToTimestamp(), p.txn)
 	p.results.clear()
 	p.intents.Reset()
 	return false
@@ -388,14 +397,14 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			// 5. Our txn's read timestamp is less than the max timestamp
 			// seen by the txn. We need to check for clock uncertainty
 			// errors.
-			if p.isUncertainValue(p.curUnsafeKey.Timestamp) {
+			if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp) {
 				return p.uncertaintyError(p.curUnsafeKey.Timestamp)
 			}
 
 			// This value is not within the reader's uncertainty window, but
 			// there could be other uncertain committed values, so seek and
-			// check uncertainty using globalUncertaintyLimit.
-			return p.seekVersion(ctx, p.globalUncertaintyLimit, true)
+			// check uncertainty using the uncertainty interval's GlobalLimit.
+			return p.seekVersion(ctx, p.uncertainty.GlobalLimit, true)
 		}
 
 		// 6. Our txn's read timestamp is greater than or equal to the
@@ -412,7 +421,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 	}
 	err := protoutil.Unmarshal(p.curValue, &p.meta)
 	if err != nil {
-		p.err = errors.Errorf("unable to decode MVCCMetadata: %s", err)
+		p.err = errors.Wrap(err, "unable to decode MVCCMetadata")
 		return false
 	}
 	if len(p.meta.RawBytes) != 0 {
@@ -448,13 +457,13 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 		// we want to read the intent regardless of our read timestamp and fall
 		// into case 11 below.
 		if p.checkUncertainty {
-			if p.isUncertainValue(metaTS) {
+			if p.uncertainty.IsUncertain(metaTS) {
 				return p.uncertaintyError(metaTS)
 			}
 			// The intent is not within the uncertainty window, but there could
 			// be an uncertain committed value, so seek and check uncertainty
-			// using globalUncertaintyLimit.
-			return p.seekVersion(ctx, p.globalUncertaintyLimit, true)
+			// using the uncertainty interval's GlobalLimit.
+			return p.seekVersion(ctx, p.uncertainty.GlobalLimit, true)
 		}
 		return p.seekVersion(ctx, p.ts, false)
 	}
@@ -466,6 +475,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 		// historical timestamp < the intent timestamp. However, we
 		// return the intent separately; the caller may want to resolve
 		// it.
+		//
 		// p.intents is a pebble.Batch which grows its byte slice capacity in
 		// chunks to amortize allocations. The memMonitor is under-counting here
 		// by only accounting for the key and value bytes.
@@ -696,15 +706,24 @@ func (p *pebbleMVCCScanner) addAndAdvance(ctx context.Context, rawKey []byte, va
 	// Don't include deleted versions len(val) == 0, unless we've been instructed
 	// to include tombstones in the results.
 	if len(val) > 0 || p.tombstones {
+		// Check if we should apply the targetBytes limit at all. We do this either
+		// if this is not the first result or if targetBytesAllowEmpty is true.
+		if p.targetBytes > 0 && (p.results.count > 0 || p.targetBytesAllowEmpty) {
+			size := p.results.bytes
+			nextSize := int64(p.results.sizeOf(len(rawKey), len(val)))
+			// Check if we actually exceeded the limit.
+			if size >= p.targetBytes || (p.targetBytesAvoidExcess && size+nextSize > p.targetBytes) {
+				p.curExcluded = true
+				p.resumeReason = roachpb.RESUME_BYTE_LIMIT
+				return false
+			}
+		}
 		if err := p.results.put(ctx, rawKey, val, p.memAccount); err != nil {
 			p.err = errors.Wrapf(err, "scan with start key %s", p.start)
 			return false
 		}
-		if p.targetBytes > 0 && p.results.bytes >= p.targetBytes {
-			p.resumeReason = roachpb.RESUME_BYTE_LIMIT
-			return false
-		}
-		if p.maxKeys > 0 && p.results.count == p.maxKeys {
+		if p.maxKeys > 0 && p.results.count >= p.maxKeys {
+			p.curExcluded = false
 			p.resumeReason = roachpb.RESUME_KEY_LIMIT
 			return false
 		}
@@ -744,11 +763,11 @@ func (p *pebbleMVCCScanner) seekVersion(
 			// the interval, it may not be uncertainty. This is because seekTS
 			// is set to the transaction's global uncertainty limit, so we are
 			// seeking based on the worst-case uncertainty, but values with a
-			// time in the range (localUncertaintyLimit, globalUncertaintyLimit]
+			// time in the range (uncertainty.LocalLimit, uncertainty.GlobalLimit]
 			// are only uncertain if their timestamps are synthetic. Meanwhile,
-			// any value with a time in the range (ts, localUncertaintyLimit]
+			// any value with a time in the range (ts, uncertainty.LocalLimit]
 			// is uncertain.
-			if p.isUncertainValue(p.curUnsafeKey.Timestamp) {
+			if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp) {
 				return p.uncertaintyError(p.curUnsafeKey.Timestamp)
 			}
 		}
@@ -768,7 +787,7 @@ func (p *pebbleMVCCScanner) seekVersion(
 		// Iterate through uncertainty interval. See the comment above about why
 		// a value in this interval is not necessarily cause for an uncertainty
 		// error.
-		if p.isUncertainValue(p.curUnsafeKey.Timestamp) {
+		if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp) {
 			return p.uncertaintyError(p.curUnsafeKey.Timestamp)
 		}
 		if !p.iterNext() {

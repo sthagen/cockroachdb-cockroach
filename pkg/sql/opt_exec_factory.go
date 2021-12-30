@@ -134,7 +134,7 @@ func (ef *execFactory) ConstructScan(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
 	}
 
 	return scan, nil
@@ -148,8 +148,9 @@ func generateScanSpans(
 	params exec.ScanParams,
 ) (roachpb.Spans, error) {
 	sb := span.MakeBuilder(evalCtx, codec, tabDesc, index)
+	defer sb.Release()
 	if params.InvertedConstraint != nil {
-		return sb.SpansFromInvertedSpans(params.InvertedConstraint, params.IndexConstraint)
+		return sb.SpansFromInvertedSpans(params.InvertedConstraint, params.IndexConstraint, nil /* scratch */)
 	}
 	return sb.SpansFromConstraint(params.IndexConstraint, params.NeededCols, false /* forDelete */)
 }
@@ -247,12 +248,7 @@ func constructSimpleProjectForPlanNode(
 		r.reqOrdering = ReqOrdering(reqOrdering)
 		return r, nil
 	}
-	var inputCols colinfo.ResultColumns
-	if colNames == nil {
-		// We will need the names of the input columns.
-		inputCols = planColumns(n.(planNode))
-	}
-
+	inputCols := planColumns(n)
 	var rb renderBuilder
 	rb.init(n, reqOrdering)
 
@@ -462,14 +458,17 @@ func (ef *execFactory) ConstructGroupBy(
 	groupColOrdering colinfo.ColumnOrdering,
 	aggregations []exec.AggInfo,
 	reqOrdering exec.OutputOrdering,
+	groupingOrderType exec.GroupingOrderType,
 ) (exec.Node, error) {
 	inputPlan := input.(planNode)
 	inputCols := planColumns(inputPlan)
+	// TODO(harding): Use groupingOrder to determine when to use a hash
+	// aggregator.
 	n := &groupNode{
 		plan:             inputPlan,
 		funcs:            make([]*aggregateFuncHolder, 0, len(groupCols)+len(aggregations)),
 		columns:          getResultColumnsForGroupBy(inputCols, groupCols, aggregations),
-		groupCols:        convertOrdinalsToInts(groupCols),
+		groupCols:        convertNodeOrdinalsToInts(groupCols),
 		groupColOrdering: groupColOrdering,
 		isScalar:         false,
 		reqOrdering:      ReqOrdering(reqOrdering),
@@ -493,7 +492,7 @@ func (ef *execFactory) ConstructGroupBy(
 func (ef *execFactory) addAggregations(n *groupNode, aggregations []exec.AggInfo) error {
 	for i := range aggregations {
 		agg := &aggregations[i]
-		renderIdxs := convertOrdinalsToInts(agg.ArgCols)
+		renderIdxs := convertNodeOrdinalsToInts(agg.ArgCols)
 
 		f := newAggregateFuncHolder(
 			agg.FuncName,
@@ -674,7 +673,7 @@ func (ef *execFactory) ConstructLookupJoin(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
 	}
 
 	n := &lookupJoinNode{
@@ -804,7 +803,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
 	}
 
 	n := &invertedJoinNode{
@@ -868,7 +867,7 @@ func (ef *execFactory) constructScanForZigzag(
 			TableID: roachpb.TableID(tableDesc.GetID()),
 			IndexID: roachpb.IndexID(index.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
 	}
 
 	scan.index = index
@@ -1029,12 +1028,13 @@ func (ef *execFactory) ConstructScanBuffer(ref exec.Node, label string) (exec.No
 
 // ConstructRecursiveCTE is part of the exec.Factory interface.
 func (ef *execFactory) ConstructRecursiveCTE(
-	initial exec.Node, fn exec.RecursiveCTEIterationFn, label string,
+	initial exec.Node, fn exec.RecursiveCTEIterationFn, label string, deduplicate bool,
 ) (exec.Node, error) {
 	return &recursiveCTENode{
 		initial:        initial.(planNode),
 		genIterationFn: fn,
 		label:          label,
+		deduplicate:    deduplicate,
 	}, nil
 }
 
@@ -1157,10 +1157,11 @@ func (e *urlOutputter) finish() (url.URL, error) {
 func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.Node, error) {
 	var out urlOutputter
 
-	c := makeStmtEnvCollector(
+	ie := ef.planner.extendedEvalCtx.ExecCfg.InternalExecutorFactory(
 		ef.planner.EvalContext().Context,
-		ef.planner.extendedEvalCtx.InternalExecutor.(*InternalExecutor),
+		ef.planner.SessionData(),
 	)
+	c := makeStmtEnvCollector(ef.planner.EvalContext().Context, ie.(*InternalExecutor))
 
 	// Show the version of Cockroach running.
 	if err := c.PrintVersion(&out.buf); err != nil {
@@ -1727,11 +1728,11 @@ func (ef *execFactory) ConstructDeleteRange(
 	table cat.Table,
 	needed exec.TableColumnOrdinalSet,
 	indexConstraint *constraint.Constraint,
-	interleavedTables []cat.Table,
 	autoCommit bool,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	sb := span.MakeBuilder(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, tabDesc.GetPrimaryIndex())
+	defer sb.Release()
 
 	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
 		return nil, err
@@ -1745,19 +1746,11 @@ func (ef *execFactory) ConstructDeleteRange(
 	}
 
 	dr := &deleteRangeNode{
-		interleavedFastPath: false,
-		spans:               spans,
-		desc:                tabDesc,
-		autoCommitEnabled:   autoCommit,
+		spans:             spans,
+		desc:              tabDesc,
+		autoCommitEnabled: autoCommit,
 	}
 
-	if len(interleavedTables) > 0 {
-		dr.interleavedFastPath = true
-		dr.interleavedDesc = make([]catalog.TableDescriptor, len(interleavedTables))
-		for i := range dr.interleavedDesc {
-			dr.interleavedDesc[i] = interleavedTables[i].(*optTable).desc
-		}
-	}
 	return dr, nil
 }
 
@@ -1962,18 +1955,36 @@ func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node
 
 // ConstructAlterTableRelocate is part of the exec.Factory interface.
 func (ef *execFactory) ConstructAlterTableRelocate(
-	index cat.Index, input exec.Node, relocateLease bool, relocateNonVoters bool,
+	index cat.Index, input exec.Node, relocateSubject tree.RelocateSubject,
 ) (exec.Node, error) {
 	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(54250)
 	}
 
 	return &relocateNode{
-		relocateLease:     relocateLease,
-		relocateNonVoters: relocateNonVoters,
-		tableDesc:         index.Table().(*optTable).desc,
-		index:             index.(*optIndex).idx,
-		rows:              input.(planNode),
+		subjectReplicas: relocateSubject,
+		tableDesc:       index.Table().(*optTable).desc,
+		index:           index.(*optIndex).idx,
+		rows:            input.(planNode),
+	}, nil
+}
+
+// ConstructAlterRangeRelocate is part of the exec.Factory interface.
+func (ef *execFactory) ConstructAlterRangeRelocate(
+	input exec.Node,
+	relocateSubject tree.RelocateSubject,
+	toStoreID tree.TypedExpr,
+	fromStoreID tree.TypedExpr,
+) (exec.Node, error) {
+	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
+		return nil, errorutil.UnsupportedWithMultiTenancy(54250)
+	}
+
+	return &relocateRange{
+		rows:            input.(planNode),
+		subjectReplicas: relocateSubject,
+		toStoreID:       toStoreID,
+		fromStoreID:     fromStoreID,
 	}, nil
 }
 
@@ -2060,11 +2071,10 @@ func (ef *execFactory) ConstructExplain(
 		return nil, errors.New("ENV only supported with (OPT) option")
 	}
 
-	explainFactory := explain.NewFactory(&execFactory{
+	plan, err := buildFn(&execFactory{
 		planner:   ef.planner,
 		isExplain: true,
 	})
-	plan, err := buildFn(explainFactory)
 	if err != nil {
 		return nil, err
 	}

@@ -16,8 +16,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpch"
 )
 
@@ -27,11 +29,11 @@ func registerTPCHConcurrency(r registry.Registry) {
 	setupCluster := func(ctx context.Context, t test.Test, c cluster.Cluster, disableTxnStatsSampling bool) {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, numNodes-1))
 		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(numNodes))
-		c.Start(ctx, c.Range(1, numNodes-1))
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, numNodes-1))
 
 		// In order to keep more things constant throughout the different test
 		// runs, we disable range merges and range movements.
-		conn := c.Conn(ctx, 1)
+		conn := c.Conn(ctx, t.L(), 1)
 		if _, err := conn.Exec("SET CLUSTER SETTING kv.allocator.min_lease_transfer_interval = '24h';"); err != nil {
 			t.Fatal(err)
 		}
@@ -49,9 +51,9 @@ func registerTPCHConcurrency(r registry.Registry) {
 		}
 	}
 
-	restartCluster := func(ctx context.Context, c cluster.Cluster) {
-		c.Stop(ctx, c.Range(1, numNodes-1))
-		c.Start(ctx, c.Range(1, numNodes-1))
+	restartCluster := func(ctx context.Context, c cluster.Cluster, t test.Test) {
+		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Range(1, numNodes-1))
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, numNodes-1))
 	}
 
 	// checkConcurrency returns an error if at least one node of the cluster
@@ -62,11 +64,11 @@ func registerTPCHConcurrency(r registry.Registry) {
 		// iteration.
 		_ = c.RunE(ctx, c.Node(numNodes), "killall workload")
 
-		restartCluster(ctx, c)
+		restartCluster(ctx, c, t)
 
 		// Scatter the ranges so that a poor initial placement (after loading
 		// the data set) doesn't impact the results much.
-		conn := c.Conn(ctx, 1)
+		conn := c.Conn(ctx, t.L(), 1)
 		if _, err := conn.Exec("USE tpch;"); err != nil {
 			t.Fatal(err)
 		}
@@ -75,7 +77,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 
 		// Populate the range cache on each node.
 		for node := 1; node < numNodes; node++ {
-			conn = c.Conn(ctx, node)
+			conn = c.Conn(ctx, t.L(), node)
 			if _, err := conn.Exec("USE tpch;"); err != nil {
 				t.Fatal(err)
 			}
@@ -164,7 +166,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 		}
 		// Restart the cluster so that if any nodes crashed in the last
 		// iteration, it doesn't fail the test.
-		restartCluster(ctx, c)
+		restartCluster(ctx, c, t)
 		t.Status(fmt.Sprintf("max supported concurrency is %d", minConcurrency))
 		// Write the concurrency number into the stats.json file to be used by
 		// the roachperf.
@@ -191,8 +193,9 @@ func registerTPCHConcurrency(r registry.Registry) {
 			// By default, the timeout is 10 hours which might not be sufficient
 			// given that a single iteration of checkConcurrency might take on
 			// the order of one hour, so in order to let each test run to
-			// complete we'll give it 24 hours.
-			Timeout: 24 * time.Hour,
+			// complete we'll give it 18 hours. Successful runs typically take
+			// a lot less, around six hours.
+			Timeout: 18 * time.Hour,
 		})
 	}
 }

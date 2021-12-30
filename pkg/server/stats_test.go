@@ -75,7 +75,7 @@ CREATE TABLE t.test (x INT PRIMARY KEY);
 	sqlServer.GetReportedSQLStatsController().ResetLocalSQLStats(ctx)
 
 	// Run some queries mixed with diagnostics, and ensure that the statistics
-	// are unnaffected by the calls to report diagnostics.
+	// are unaffected by the calls to report diagnostics.
 	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ($1)`, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestEnsureSQLStatsAreFlushedForTelemetry(t *testing.T) {
 
 	statusServer := s.(*TestServer).status
 	sqlServer := s.(*TestServer).Server.sqlServer.pgServer.SQLServer
-	sqlServer.GetSQLStatsController().ResetLocalSQLStats(ctx)
+	sqlServer.GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
 	testutils.SucceedsSoon(t, func() error {
 		// Get the diagnostic info.
 		res, err := statusServer.Diagnostics(ctx, &serverpb.DiagnosticsRequest{NodeId: "local"})

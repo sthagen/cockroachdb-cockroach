@@ -11,6 +11,7 @@
 import React from "react";
 import _ from "lodash";
 import * as Long from "long";
+import { History } from "history";
 import { Moment } from "moment";
 import { createSelector } from "reselect";
 
@@ -35,6 +36,9 @@ export interface ISortedTablePagination {
 export interface ColumnDescriptor<T> {
   // Title string that should appear in the header column.
   title: React.ReactNode;
+  // Hides the dashed title underline, which represents that a tooltip exists.
+  // Defaults to false and shows the underline if not defined.
+  hideTitleUnderline?: boolean;
   // Function which generates the contents of an individual cell in this table.
   cell: (obj: T) => React.ReactNode;
   // Function which returns a value that can be used to sort the collection of
@@ -127,6 +131,9 @@ const cx = classNames.bind(styles);
 export interface SortableColumn {
   // Text that will appear in the title header of the table.
   title: React.ReactNode;
+  // Hides the dashed title underline, which represents that a tooltip exists.
+  // Defaults to false and shows the underline if not defined.
+  hideTitleUnderline?: boolean;
   // Function which provides the contents for this column for a given row index
   // in the dataset.
   cell: (rowIndex: number) => React.ReactNode;
@@ -251,6 +258,7 @@ export class SortedTable<T> extends React.Component<
           return {
             name: cd.name,
             title: cd.title,
+            hideTitleUnderline: cd.hideTitleUnderline,
             cell: index => cd.cell(sorted[index]),
             columnTitle: cd.sort ? cd.name : undefined,
             rollup: rollups[ii],
@@ -319,7 +327,7 @@ export class SortedTable<T> extends React.Component<
     return sortData ? sortData.slice(start, end) : data.slice(start, end);
   };
 
-  render() {
+  render(): React.ReactElement {
     const {
       data,
       loading,
@@ -397,7 +405,10 @@ export class SortedTable<T> extends React.Component<
  * @param maxLength the max length to which it should display value
  * and hide the remaining.
  */
-export function longListWithTooltip(value: string, maxLength: number) {
+export function longListWithTooltip(
+  value: string,
+  maxLength: number,
+): React.ReactElement {
   const summary =
     value.length > maxLength ? value.slice(0, maxLength) + "..." : value;
   return (
@@ -411,3 +422,83 @@ export function longListWithTooltip(value: string, maxLength: number) {
     </Tooltip>
   );
 }
+
+/**
+ * Get Sort Setting from Query String and if it's different from current
+ * sortSetting calls the onSortChange function.
+ * @param page the page where the table was added (used for analytics)
+ * @param queryString searchParams
+ * @param sortSetting the current sort Setting on the page
+ * @param onSortingChange function to be called if the values from the search
+ * params are different from the current ones. This function can update
+ * the value stored on localStorage for example.
+ */
+export const handleSortSettingFromQueryString = (
+  page: string,
+  queryString: string,
+  sortSetting: SortSetting,
+  onSortingChange: (
+    name: string,
+    columnTitle: string,
+    ascending: boolean,
+  ) => void,
+): void => {
+  const searchParams = new URLSearchParams(queryString);
+  const ascending = (searchParams.get("ascending") || undefined) === "true";
+  const columnTitle = searchParams.get("columnTitle") || undefined;
+  if (
+    onSortingChange &&
+    columnTitle &&
+    (sortSetting.columnTitle != columnTitle ||
+      sortSetting.ascending != ascending)
+  ) {
+    onSortingChange(page, columnTitle, ascending);
+  }
+};
+
+/**
+ * Update the query params to the current values of the Sort Setting.
+ * When we change tabs inside the SQL Activity page for example,
+ * the constructor is called only on the first time.
+ * The component update event is called frequently and can be used to
+ * update the query params by using this function that only updates
+ * the query params if the values did change and we're on the correct tab.
+ * @param tab which the query params should update
+ * @param sortSetting the current sort settings
+ * @param defaultSortSetting the default sort settings
+ * @param history
+ */
+export const updateSortSettingQueryParamsOnTab = (
+  tab: string,
+  sortSetting: SortSetting,
+  defaultSortSetting: SortSetting,
+  history: History,
+): void => {
+  const searchParams = new URLSearchParams(history.location.search);
+  const currentTab = searchParams.get("tab") || "";
+  const ascending =
+    (searchParams.get("ascending") ||
+      defaultSortSetting.ascending.toString()) === "true";
+  const columnTitle =
+    searchParams.get("columnTitle") || defaultSortSetting.columnTitle;
+  if (
+    currentTab === tab &&
+    (sortSetting.columnTitle != columnTitle ||
+      sortSetting.ascending != ascending)
+  ) {
+    const params = {
+      ascending: sortSetting.ascending.toString(),
+      columnTitle: sortSetting.columnTitle,
+    };
+    const nextSearchParams = new URLSearchParams(history.location.search);
+    Object.entries(params).forEach(([key, value]) => {
+      if (!value) {
+        nextSearchParams.delete(key);
+      } else {
+        nextSearchParams.set(key, value);
+      }
+    });
+    history.location.search = nextSearchParams.toString();
+    history.replace(history.location);
+  }
+};

@@ -585,6 +585,22 @@ func (md *Metadata) QualifiedAlias(colID ColumnID, fullyQualify bool, catalog ca
 	return sb.String()
 }
 
+// UpdateTableMeta allows the caller to replace the cat.Table struct that a
+// TableMeta instance stores.
+func (md *Metadata) UpdateTableMeta(tables map[cat.StableID]cat.Table) {
+	for i := range md.tables {
+		if tab, ok := tables[md.tables[i].Table.ID()]; ok {
+			// If there are any inverted hypothetical indexes, the hypothetical table
+			// will have extra inverted columns added. Add any new inverted columns to
+			// the metadata.
+			for j, n := md.tables[i].Table.ColumnCount(), tab.ColumnCount(); j < n; j++ {
+				md.AddColumn(string(tab.Column(i).ColName()), types.Bytes)
+			}
+			md.tables[i].Table = tab
+		}
+	}
+}
+
 // SequenceID uniquely identifies the usage of a sequence within the scope of a
 // query. SequenceID 0 is reserved to mean "unknown sequence".
 type SequenceID uint64

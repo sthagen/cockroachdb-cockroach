@@ -373,11 +373,11 @@ func TestValidateTypeDesc(t *testing.T) {
 		},
 	}).BuildImmutable()
 
-	defaultPrivileges := descpb.NewDefaultPrivilegeDescriptor(security.RootUserName())
-	invalidPrivileges := descpb.NewDefaultPrivilegeDescriptor(security.RootUserName())
+	defaultPrivileges := descpb.NewBasePrivilegeDescriptor(security.RootUserName())
+	invalidPrivileges := descpb.NewBasePrivilegeDescriptor(security.RootUserName())
 	// Make the PrivilegeDescriptor invalid by granting SELECT to a type.
-	invalidPrivileges.Grant(security.TestUserName(), privilege.List{privilege.SELECT})
-	typeDescID := descpb.ID(keys.MaxReservedDescID + 1)
+	invalidPrivileges.Grant(security.TestUserName(), privilege.List{privilege.SELECT}, false)
+	typeDescID := descpb.ID(keys.TestingUserDescID(0))
 	testData := []struct {
 		err  string
 		desc descpb.TypeDescriptor
@@ -811,4 +811,20 @@ func TestOIDToIDConversion(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTableImplicitTypeDescCannotBeSerializedOrValidated(t *testing.T) {
+	td := &descpb.TypeDescriptor{
+		Name:           "foo",
+		ID:             10,
+		ParentID:       1,
+		ParentSchemaID: 1,
+		Kind:           descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE,
+	}
+
+	desc := typedesc.NewBuilder(td).BuildImmutable()
+
+	ctx := context.Background()
+	err := catalog.Validate(ctx, nil, catalog.NoValidationTelemetry, catalog.ValidationLevelSelfOnly, desc).CombinedError()
+	require.Contains(t, err.Error(), "kind TABLE_IMPLICIT_RECORD_TYPE should never be serialized")
 }

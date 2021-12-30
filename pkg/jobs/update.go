@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -142,6 +143,7 @@ func (j *Job) Update(ctx context.Context, txn *kv.Txn, updateFn UpdateFn) error 
 func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateFn UpdateFn) error {
 	var payload *jobspb.Payload
 	var progress *jobspb.Progress
+	var status Status
 	var runStats *RunStats
 
 	backoffIsActive := j.registry.settings.Version.IsActive(ctx, clusterversion.RetryJobsWithExponentialBackoff)
@@ -158,35 +160,32 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 			return err
 		}
 		if row == nil {
-			return errors.Errorf("job %d: not found in system.jobs table", j.ID())
+			return errors.Errorf("not found in system.jobs table")
 		}
 
-		statusString, ok := row[0].(*tree.DString)
-		if !ok {
-			return errors.AssertionFailedf("job %d: expected string status, but got %T", j.ID(), statusString)
-		}
-
-		status := Status(*statusString)
-		if j.sessionID != "" {
-			if row[3] == tree.DNull {
-				return errors.Errorf(
-					"job %d: with status '%s': expected session '%s' but found NULL",
-					j.ID(), statusString, j.sessionID)
-			}
-			storedSession := []byte(*row[3].(*tree.DBytes))
-			if !bytes.Equal(storedSession, j.sessionID.UnsafeBytes()) {
-				return errors.Errorf(
-					"job %d: with status '%s': expected session '%s' but found '%s'",
-					j.ID(), statusString, j.sessionID, storedSession)
-			}
-		} else {
-			log.VInfof(ctx, 1, "job %d: update called with no session ID", j.ID())
+		if status, err = unmarshalStatus(row[0]); err != nil {
+			return err
 		}
 		if payload, err = UnmarshalPayload(row[1]); err != nil {
 			return err
 		}
 		if progress, err = UnmarshalProgress(row[2]); err != nil {
 			return err
+		}
+		if j.sessionID != "" {
+			if row[3] == tree.DNull {
+				return errors.Errorf(
+					"with status %q: expected session %q but found NULL",
+					status, j.sessionID)
+			}
+			storedSession := []byte(*row[3].(*tree.DBytes))
+			if !bytes.Equal(storedSession, j.sessionID.UnsafeBytes()) {
+				return errors.Errorf(
+					"with status %q: expected session %q but found %q",
+					status, j.sessionID, sqlliveness.SessionID(storedSession))
+			}
+		} else {
+			log.VInfof(ctx, 1, "job %d: update called with no session ID", j.ID())
 		}
 
 		md := JobMetadata{
@@ -202,14 +201,15 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 				offset = 1
 			}
 			var lastRun *tree.DTimestamp
+			var ok bool
 			lastRun, ok = row[3+offset].(*tree.DTimestamp)
 			if !ok {
-				return errors.AssertionFailedf("job %d: expected timestamp last_run, but got %T", j.ID(), lastRun)
+				return errors.AssertionFailedf("expected timestamp last_run, but got %T", lastRun)
 			}
 			var numRuns *tree.DInt
 			numRuns, ok = row[4+offset].(*tree.DInt)
 			if !ok {
-				return errors.AssertionFailedf("job %d: expected int num_runs, but got %T", j.ID(), numRuns)
+				return errors.AssertionFailedf("expected int num_runs, but got %T", numRuns)
 			}
 			md.RunStats = &RunStats{
 				NumRuns: int(*numRuns),
@@ -288,12 +288,12 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 		}
 		if n != 1 {
 			return errors.Errorf(
-				"job %d: expected exactly one row affected, but %d rows affected by job update", j.ID(), n,
+				"expected exactly one row affected, but %d rows affected by job update", n,
 			)
 		}
 		return nil
 	}); err != nil {
-		return err
+		return errors.Wrapf(err, "job %d", j.id)
 	}
 	func() {
 		j.mu.Lock()
@@ -306,6 +306,9 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 		}
 		if runStats != nil {
 			j.mu.runStats = runStats
+		}
+		if status != "" {
+			j.mu.status = status
 		}
 	}()
 	return nil

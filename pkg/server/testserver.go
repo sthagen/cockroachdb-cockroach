@@ -15,11 +15,13 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -44,8 +46,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -55,7 +57,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	addrutil "github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -138,7 +142,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	st.ExternalIODir = params.ExternalIODir
 	tr := params.Tracer
 	if params.Tracer == nil {
-		tr = tracing.NewTracerWithOpt(context.TODO(), tracing.WithClusterSettings(&st.SV))
+		tr = tracing.NewTracerWithOpt(context.TODO(), tracing.WithClusterSettings(&st.SV), tracing.WithTracingMode(params.TracingDefault))
 	}
 	cfg := makeTestConfig(st, tr)
 	cfg.TestingKnobs = params.Knobs
@@ -281,10 +285,6 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{}
 	}
 
-	// For test servers, leave interleaved tables enabled by default. We'll remove
-	// this when we remove interleaved tables altogether.
-	sql.InterleavedTablesEnabled.Override(context.Background(), &cfg.Settings.SV, true)
-
 	return cfg
 }
 
@@ -315,6 +315,8 @@ type TestServer struct {
 		err        error
 	}
 }
+
+var _ serverutils.TestServerInterface = &TestServer{}
 
 // Node returns the Node as an interface{}.
 func (ts *TestServer) Node() interface{} {
@@ -422,6 +424,16 @@ func (ts *TestServer) HeartbeatNodeLiveness() error {
 	return err
 }
 
+// SQLInstanceID is part of TestServerInterface.
+func (ts *TestServer) SQLInstanceID() base.SQLInstanceID {
+	return ts.sqlServer.sqlIDContainer.SQLInstanceID()
+}
+
+// StatusServer is part of TestServerInterface.
+func (ts *TestServer) StatusServer() interface{} {
+	return ts.status
+}
+
 // RPCContext returns the rpc context used by the TestServer.
 func (ts *TestServer) RPCContext() *rpc.Context {
 	if ts != nil {
@@ -446,8 +458,9 @@ func (ts *TestServer) DB() *kv.DB {
 	return nil
 }
 
-// PGServer returns the pgwire.Server used by the TestServer.
-func (ts *TestServer) PGServer() *pgwire.Server {
+// PGServer exposes the pgwire.Server instance used by the TestServer as an
+// interface{}.
+func (ts *TestServer) PGServer() interface{} {
 	if ts != nil {
 		return ts.sqlServer.pgServer
 	}
@@ -460,6 +473,13 @@ func (ts *TestServer) RaftTransport() *kvserver.RaftTransport {
 		return ts.raftTransport
 	}
 	return nil
+}
+
+// AmbientCtx implements serverutils.TestTenantInterface. This
+// retrieves the ambient context for this server. This is intended for
+// exclusive use by test code.
+func (ts *TestServer) AmbientCtx() log.AmbientContext {
+	return ts.Cfg.AmbientCtx
 }
 
 // TestingKnobs returns the TestingKnobs used by the TestServer.
@@ -500,49 +520,108 @@ type TestTenant struct {
 	httpAddr string
 }
 
-// SQLAddr is part of the TestTenantInterface interface.
+var _ serverutils.TestTenantInterface = &TestTenant{}
+
+// SQLAddr is part of TestTenantInterface interface.
 func (t *TestTenant) SQLAddr() string {
 	return t.sqlAddr
 }
 
-// HTTPAddr is part of the TestTenantInterface interface.
+// HTTPAddr is part of TestTenantInterface interface.
 func (t *TestTenant) HTTPAddr() string {
 	return t.httpAddr
 }
 
-// PGServer is part of the TestTenantInterface interface.
+// PGServer is part of TestTenantInterface.
 func (t *TestTenant) PGServer() interface{} {
 	return t.pgServer
 }
 
-// DiagnosticsReporter is part of the TestTenantInterface interface.
+// DiagnosticsReporter is part of TestTenantInterface.
 func (t *TestTenant) DiagnosticsReporter() interface{} {
 	return t.diagnosticsReporter
 }
 
-// StatusServer is part of the TestTenantInterface interface.
+// StatusServer is part of TestTenantInterface.
 func (t *TestTenant) StatusServer() interface{} {
 	return t.execCfg.SQLStatusServer
 }
 
-// DistSQLServer is part of the TestTenantInterface interface.
+// DistSQLServer is part of TestTenantInterface.
 func (t *TestTenant) DistSQLServer() interface{} {
 	return t.SQLServer.distSQLServer
 }
 
-// RPCContext is part of the TestTenantInterface interface
+// RPCContext is part of TestTenantInterface.
 func (t *TestTenant) RPCContext() *rpc.Context {
 	return t.execCfg.RPCContext
 }
 
-// JobRegistry is part of the TestTenantInterface interface.
+// JobRegistry is part of TestTenantInterface.
 func (t *TestTenant) JobRegistry() interface{} {
 	return t.SQLServer.jobRegistry
 }
 
-// TestingKnobs is part of the TestTenantInterface interface.
+// ExecutorConfig is part of TestTenantInterface.
+func (t *TestTenant) ExecutorConfig() interface{} {
+	return *t.SQLServer.execCfg
+}
+
+// SystemIDChecker is part of TestTenantInterface.
+func (t *TestTenant) SystemIDChecker() interface{} {
+	return *t.SQLServer.execCfg.SystemIDChecker
+}
+
+// RangeFeedFactory is part of TestTenantInterface.
+func (t *TestTenant) RangeFeedFactory() interface{} {
+	return t.SQLServer.execCfg.RangeFeedFactory
+}
+
+// ClusterSettings is part of TestTenantInterface.
+func (t *TestTenant) ClusterSettings() *cluster.Settings {
+	return t.Cfg.Settings
+}
+
+// Stopper is part of TestTenantInterface.
+func (t *TestTenant) Stopper() *stop.Stopper {
+	return t.stopper
+}
+
+// Clock is part of TestTenantInterface.
+func (t *TestTenant) Clock() *hlc.Clock {
+	return t.SQLServer.execCfg.Clock
+}
+
+// AmbientCtx implements serverutils.TestTenantInterface. This
+// retrieves the ambient context for this server. This is intended for
+// exclusive use by test code.
+func (t *TestTenant) AmbientCtx() log.AmbientContext {
+	return t.Cfg.AmbientCtx
+}
+
+// TestingKnobs is part TestTenantInterface.
 func (t *TestTenant) TestingKnobs() *base.TestingKnobs {
 	return &t.Cfg.TestingKnobs
+}
+
+// SpanConfigKVAccessor is part TestTenantInterface.
+func (t *TestTenant) SpanConfigKVAccessor() interface{} {
+	return t.SQLServer.tenantConnect
+}
+
+// SpanConfigReconciler is part TestTenantInterface.
+func (t *TestTenant) SpanConfigReconciler() interface{} {
+	return t.SQLServer.spanconfigMgr.Reconciler
+}
+
+// SpanConfigSQLTranslator is part TestTenantInterface.
+func (t *TestTenant) SpanConfigSQLTranslator() interface{} {
+	return t.SQLServer.spanconfigSQLTranslator
+}
+
+// SpanConfigSQLWatcher is part TestTenantInterface.
+func (t *TestTenant) SpanConfigSQLWatcher() interface{} {
+	return t.SQLServer.spanconfigSQLWatcher
 }
 
 // StartTenant starts a SQL tenant communicating with this TestServer.
@@ -586,14 +665,45 @@ func (ts *TestServer) StartTenant(
 	if params.TempStorageConfig != nil {
 		sqlCfg.TempStorageConfig = *params.TempStorageConfig
 	}
-	tr := params.Tracer
-	if params.Tracer == nil {
-		tr = tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV))
+
+	stopper := params.Stopper
+	if stopper == nil {
+		// We don't share the stopper with the server because we want their Tracers
+		// to be different, to simulate them being different processes.
+		tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV), tracing.WithTracingMode(params.TracingDefault))
+		stopper = stop.NewStopper(stop.WithTracer(tr))
+		// The server's stopper stops the tenant, for convenience.
+		ts.Stopper().AddCloser(stop.CloserFn(func() { stopper.Stop(context.Background()) }))
+	} else if stopper.Tracer() == nil {
+		tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV), tracing.WithTracingMode(params.TracingDefault))
+		stopper.SetTracer(tr)
 	}
-	baseCfg := makeTestBaseConfig(st, tr)
+
+	baseCfg := makeTestBaseConfig(st, stopper.Tracer())
 	baseCfg.TestingKnobs = params.TestingKnobs
 	baseCfg.Insecure = params.ForceInsecure
 	baseCfg.Locality = params.Locality
+	if params.SSLCertsDir != "" {
+		baseCfg.SSLCertsDir = params.SSLCertsDir
+	}
+	if params.StartingSQLPort > 0 {
+		addr, _, err := addrutil.SplitHostPort(baseCfg.SQLAddr, strconv.Itoa(params.StartingSQLPort))
+		if err != nil {
+			return nil, err
+		}
+		newAddr := net.JoinHostPort(addr, strconv.Itoa(params.StartingSQLPort+int(params.TenantID.ToUint64())))
+		baseCfg.SQLAddr = newAddr
+		baseCfg.SQLAdvertiseAddr = newAddr
+	}
+	if params.StartingHTTPPort > 0 {
+		addr, _, err := addrutil.SplitHostPort(baseCfg.SQLAddr, strconv.Itoa(params.StartingHTTPPort))
+		if err != nil {
+			return nil, err
+		}
+		newAddr := net.JoinHostPort(addr, strconv.Itoa(params.StartingHTTPPort+int(params.TenantID.ToUint64())))
+		baseCfg.HTTPAddr = newAddr
+		baseCfg.HTTPAdvertiseAddr = newAddr
+	}
 	if params.AllowSettingClusterSettings {
 		tenantKnobs, ok := baseCfg.TestingKnobs.TenantTestingKnobs.(*sql.TenantTestingKnobs)
 		if !ok {
@@ -603,10 +713,6 @@ func (ts *TestServer) StartTenant(
 		if tenantKnobs.ClusterSettingsUpdater == nil {
 			tenantKnobs.ClusterSettingsUpdater = st.MakeUpdater()
 		}
-	}
-	stopper := params.Stopper
-	if stopper == nil {
-		stopper = ts.Stopper()
 	}
 	sqlServer, addr, httpAddr, err := StartTenant(
 		ctx,
@@ -623,13 +729,21 @@ func (ts *TestServer) StartTenant(
 // assuming no additional information is added outside of the normal bootstrap
 // process.
 func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
-	return ExpectedInitialRangeCount(ts.DB(), &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig)
+	return ExpectedInitialRangeCount(
+		ts.DB(),
+		&ts.cfg.DefaultZoneConfig,
+		&ts.cfg.DefaultSystemZoneConfig,
+		ts.sqlServer.execCfg.SystemIDChecker,
+	)
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
 // be on the server after bootstrap.
 func ExpectedInitialRangeCount(
-	db *kv.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
+	db *kv.DB,
+	defaultZoneConfig *zonepb.ZoneConfig,
+	defaultSystemZoneConfig *zonepb.ZoneConfig,
+	idChecker keys.SystemIDChecker,
 ) (int, error) {
 	descriptorIDs, err := startupmigrations.ExpectedDescriptorIDs(
 		context.Background(), db, keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig,
@@ -644,7 +758,7 @@ func ExpectedInitialRangeCount(
 	// the span does not have an associated descriptor.
 	maxSystemDescriptorID := descriptorIDs[0]
 	for _, descID := range descriptorIDs {
-		if descID > maxSystemDescriptorID && descID <= keys.MaxReservedDescID {
+		if descID > maxSystemDescriptorID && catalog.IsSystemID(idChecker, descID) {
 			maxSystemDescriptorID = descID
 		}
 	}
@@ -843,7 +957,7 @@ func (ts *TestServer) createAuthUser(userName security.SQLUsername, isAdmin bool
 	if _, err := ts.Server.sqlServer.internalExecutor.ExecEx(context.TODO(),
 		"create-auth-user", nil,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-		"CREATE USER $1", userName.Normalized(),
+		fmt.Sprintf("CREATE USER %s", userName.Normalized()),
 	); err != nil {
 		return err
 	}
@@ -866,6 +980,11 @@ func (ts *TestServer) MustGetSQLCounter(name string) int64 {
 	var c int64
 	var found bool
 
+	type (
+		int64Valuer  interface{ Value() int64 }
+		int64Counter interface{ Count() int64 }
+	)
+
 	ts.registry.Each(func(n string, v interface{}) {
 		if name == n {
 			switch t := v.(type) {
@@ -874,6 +993,12 @@ func (ts *TestServer) MustGetSQLCounter(name string) int64 {
 				found = true
 			case *metric.Gauge:
 				c = t.Value()
+				found = true
+			case int64Valuer:
+				c = t.Value()
+				found = true
+			case int64Counter:
+				c = t.Count()
 				found = true
 			}
 		}
@@ -931,7 +1056,7 @@ func (ts *TestServer) GetNode() *Node {
 	return ts.node
 }
 
-// DistSenderI is part of DistSendeInterface.
+// DistSenderI is part of DistSenderInterface.
 func (ts *TestServer) DistSenderI() interface{} {
 	return ts.distSender
 }
@@ -947,14 +1072,38 @@ func (ts *TestServer) MigrationServer() interface{} {
 	return ts.migrationServer
 }
 
-// SpanConfigAccessor is part of TestServerInterface.
-func (ts *TestServer) SpanConfigAccessor() interface{} {
+// SpanConfigKVAccessor is part of TestServerInterface.
+func (ts *TestServer) SpanConfigKVAccessor() interface{} {
 	return ts.Server.node.spanConfigAccessor
+}
+
+// SpanConfigReconciler is part of TestServerInterface.
+func (ts *TestServer) SpanConfigReconciler() interface{} {
+	if ts.sqlServer.spanconfigMgr == nil {
+		panic("uninitialized; see EnableSpanConfigs testing knob to use span configs")
+	}
+	return ts.sqlServer.spanconfigMgr.Reconciler
+}
+
+// SpanConfigSQLTranslator is part of TestServerInterface.
+func (ts *TestServer) SpanConfigSQLTranslator() interface{} {
+	if ts.sqlServer.spanconfigSQLTranslator == nil {
+		panic("uninitialized; see EnableSpanConfigs testing knob to use span configs")
+	}
+	return ts.sqlServer.spanconfigSQLTranslator
+}
+
+// SpanConfigSQLWatcher is part of TestServerInterface.
+func (ts *TestServer) SpanConfigSQLWatcher() interface{} {
+	if ts.sqlServer.spanconfigSQLWatcher == nil {
+		panic("uninitialized; see EnableSpanConfigs testing knob to use span configs")
+	}
+	return ts.sqlServer.spanconfigSQLWatcher
 }
 
 // SQLServer is part of TestServerInterface.
 func (ts *TestServer) SQLServer() interface{} {
-	return ts.PGServer().SQLServer
+	return ts.sqlServer.pgServer.SQLServer
 }
 
 // DistSQLServer is part of TestServerInterface.
@@ -987,8 +1136,8 @@ func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, err
 	rs, _, err := kv.RangeLookup(context.Background(), ts.DB().NonTransactionalSender(),
 		key, roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 	if err != nil {
-		return roachpb.RangeDescriptor{}, errors.Errorf(
-			"%q: lookup range unexpected error: %s", key, err)
+		return roachpb.RangeDescriptor{}, errors.Wrapf(
+			err, "%q: lookup range unexpected error", key)
 	}
 	return rs[0], nil
 }
@@ -1182,6 +1331,11 @@ func (ts *TestServer) ExecutorConfig() interface{} {
 	return *ts.sqlServer.execCfg
 }
 
+// SystemIDChecker is part of the TestServerInterface.
+func (ts *TestServer) SystemIDChecker() interface{} {
+	return *ts.sqlServer.execCfg.SystemIDChecker
+}
+
 // TracerI is part of the TestServerInterface.
 func (ts *TestServer) TracerI() interface{} {
 	return ts.Tracer()
@@ -1288,6 +1442,11 @@ func (ts *TestServer) MetricsRecorder() *status.MetricsRecorder {
 // CollectionFactory is part of the TestServerInterface.
 func (ts *TestServer) CollectionFactory() interface{} {
 	return ts.sqlServer.execCfg.CollectionFactory
+}
+
+// SpanConfigKVSubscriber is part of the TestServerInterface.
+func (ts *TestServer) SpanConfigKVSubscriber() interface{} {
+	return ts.node.storeCfg.SpanConfigSubscriber
 }
 
 type testServerFactoryImpl struct{}

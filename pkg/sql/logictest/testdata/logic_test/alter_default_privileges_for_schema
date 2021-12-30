@@ -8,6 +8,18 @@ user testuser
 statement ok
 USE d;
 
+# The public schema is special and has hard-coded privileges for the public role.
+# When https://github.com/cockroachdb/cockroach/issues/70266 is resolved,
+# the public role will no longer have CREATE privilege.
+query TTTT colnames
+SHOW GRANTS ON SCHEMA public
+----
+database_name  schema_name  grantee  privilege_type
+d              public       admin    ALL
+d              public       public   CREATE
+d              public       public   USAGE
+d              public       root     ALL
+
 statement ok
 CREATE SCHEMA testuser_s;
 
@@ -137,3 +149,20 @@ database_name  schema_name  grantee   privilege_type
 d              s5           admin     ALL
 d              s5           root      ALL
 d              s5           testuser  CREATE
+
+statement ok
+ALTER DEFAULT PRIVILEGES GRANT ALL ON SCHEMAS TO testuser, testuser2
+
+user root
+
+statement ok
+CREATE SCHEMA s_72322
+
+# When root creates the table, testuser and testuser2 should not get privileges.
+query TTTT colnames
+SHOW GRANTS ON SCHEMA s_72322
+----
+database_name  schema_name  grantee   privilege_type
+d              s_72322      admin     ALL
+d              s_72322      root      ALL
+d              s_72322      testuser  CREATE

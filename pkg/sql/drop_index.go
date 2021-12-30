@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -418,17 +419,6 @@ func (p *planner) dropIndexByName(
 		return err
 	}
 
-	if idx.NumInterleaveAncestors() > 0 {
-		if err := p.removeInterleaveBackReference(ctx, tableDesc, idx); err != nil {
-			return err
-		}
-	}
-	for i := 0; i < idx.NumInterleavedBy(); i++ {
-		if err := p.removeInterleave(ctx, idx.GetInterleavedBy(i)); err != nil {
-			return err
-		}
-	}
-
 	var droppedViews []string
 	for _, tableRef := range tableDesc.DependedOnBy {
 		if tableRef.IndexID == idx.GetID() {
@@ -494,7 +484,11 @@ func (p *planner) dropIndexByName(
 	// automatically merged by the merge queue. Gate this on being the
 	// system tenant because secondary tenants aren't allowed to scan
 	// the meta ranges directly.
-	if p.ExecCfg().Codec.ForSystemTenant() {
+	// TODO(Chengxiong): Remove this range unsplitting in 22.2
+	st := p.EvalContext().Settings
+	if p.ExecCfg().Codec.ForSystemTenant() &&
+		!st.Version.IsActive(ctx, clusterversion.UnsplitRangesInAsyncGCJobs) {
+
 		span := tableDesc.IndexSpan(p.ExecCfg().Codec, idxEntry.ID)
 		txn := p.ExecCfg().DB.NewTxn(ctx, "scan-ranges-for-index-drop")
 		ranges, err := kvclient.ScanMetaKVs(ctx, txn, span)

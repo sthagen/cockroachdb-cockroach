@@ -52,6 +52,7 @@ const readBufferMaxMessageSizeClusterSettingName = "sql.conn.max_read_buffer_mes
 // ReadBufferMaxMessageSizeClusterSetting is the cluster setting for configuring
 // ReadBuffer default message sizes.
 var ReadBufferMaxMessageSizeClusterSetting = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	readBufferMaxMessageSizeClusterSettingName,
 	"maximum buffer size to allow for ingesting sql statements. Connections must be restarted for this to take effect.",
 	defaultMaxReadBufferMessageSize,
@@ -360,6 +361,8 @@ func DecodeDatum(
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as geometry", b)
 			}
 			return d, nil
+		case oid.T_void:
+			return tree.DVoidDatum, nil
 		case oid.T_numeric:
 			d, err := tree.ParseDDecimal(string(b))
 			if err != nil {
@@ -649,6 +652,13 @@ func DecodeDatum(
 			case 0xc000:
 				// https://github.com/postgres/postgres/blob/ffa4cbd623dd69f9fa99e5e92426928a5782cf1a/src/backend/utils/adt/numeric.c#L169
 				return tree.ParseDDecimal("NaN")
+			case 0xd000:
+				// https://github.com/postgres/postgres/blob/a57d312a7706321d850faa048a562a0c0c01b835/src/backend/utils/adt/numeric.c#L201
+				return tree.ParseDDecimal("Inf")
+
+			case 0xf000:
+				// https://github.com/postgres/postgres/blob/a57d312a7706321d850faa048a562a0c0c01b835/src/backend/utils/adt/numeric.c#L200
+				return tree.ParseDDecimal("-Inf")
 			default:
 				return nil, pgerror.Newf(pgcode.Syntax, "unsupported numeric sign: %d", alloc.pgNum.Sign)
 			}
@@ -776,7 +786,7 @@ func DecodeDatum(
 		return tree.MakeDEnumFromLogicalRepresentation(t, string(b))
 	}
 	switch id {
-	case oid.T_text, oid.T_varchar:
+	case oid.T_text, oid.T_varchar, oid.T_unknown:
 		if err := validateStringBytes(b); err != nil {
 			return nil, err
 		}
@@ -928,7 +938,7 @@ func decodeBinaryArray(
 		return nil, err
 	}
 	if t.Oid() != oid.Oid(hdr.ElemOid) {
-		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "wrong element type")
+		return nil, pgerror.Newf(pgcode.ProtocolViolation, "wrong element type")
 	}
 	arr := tree.NewDArray(t)
 	if hdr.Ndims == 0 {

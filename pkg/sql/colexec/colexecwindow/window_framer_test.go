@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -49,18 +50,19 @@ func TestWindowFramer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	// The spilling buffer used by the window framers always uses
+	// colcontainer.DiskQueueCacheModeClearAndReuseCache mode.
+	queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeClearAndReuseCache)
 	memAcc := testMemMonitor.MakeBoundAccount()
 	defer memAcc.Close(evalCtx.Ctx())
 
 	factory := coldataext.NewExtendedColumnFactory(evalCtx)
 	allocator := colmem.NewAllocator(evalCtx.Ctx(), &memAcc, factory)
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
 
 	var memLimits = []int64{1, 1 << 10, 1 << 20}
 
@@ -337,8 +339,8 @@ func initWindowFramers(
 	if testCfg.mode == tree.RANGE {
 		offsetType = GetOffsetTypeFromOrderColType(t, testCfg.typ)
 	}
-	startOffset := MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
-	endOffset := MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
+	startOffset := colexectestutils.MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
+	endOffset := colexectestutils.MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
 
 	peersCol, orderCol := tree.NoColumnIdx, tree.NoColumnIdx
 	if testCfg.ordered {
@@ -356,7 +358,7 @@ func initWindowFramers(
 		Bounds: execinfrapb.WindowerSpec_Frame_Bounds{
 			Start: execinfrapb.WindowerSpec_Frame_Bound{
 				BoundType:   boundToExecinfrapb(testCfg.startBound),
-				TypedOffset: EncodeWindowFrameOffset(t, startOffset),
+				TypedOffset: colexectestutils.EncodeWindowFrameOffset(t, startOffset),
 				OffsetType: execinfrapb.DatumInfo{
 					Type:     testCfg.typ,
 					Encoding: datumEncoding,
@@ -364,7 +366,7 @@ func initWindowFramers(
 			},
 			End: &execinfrapb.WindowerSpec_Frame_Bound{
 				BoundType:   boundToExecinfrapb(testCfg.endBound),
-				TypedOffset: EncodeWindowFrameOffset(t, endOffset),
+				TypedOffset: colexectestutils.EncodeWindowFrameOffset(t, endOffset),
 				OffsetType: execinfrapb.DatumInfo{
 					Type:     testCfg.typ,
 					Encoding: datumEncoding,

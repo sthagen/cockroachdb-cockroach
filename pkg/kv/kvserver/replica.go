@@ -81,6 +81,7 @@ const (
 var testingDisableQuiescence = envutil.EnvOrDefaultBool("COCKROACH_DISABLE_QUIESCENCE", false)
 
 var disableSyncRaftLog = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"kv.raft_log.disable_synchronization_unsafe",
 	"set to true to disable synchronization on Raft log writes to persistent storage. "+
 		"Setting to true risks data loss or data corruption on server crashes. "+
@@ -99,6 +100,7 @@ const (
 
 // MaxCommandSize wraps "kv.raft.command.max_size".
 var MaxCommandSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"kv.raft.command.max_size",
 	"maximum size of a raft command",
 	MaxCommandSizeDefault,
@@ -114,6 +116,7 @@ var MaxCommandSize = settings.RegisterByteSizeSetting(
 // threshold and the current GC TTL (true) or just based on the GC threshold
 // (false).
 var StrictGCEnforcement = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"kv.gc_ttl.strict_enforcement.enabled",
 	"if true, fail to serve requests at timestamps below the TTL even if the data still exists",
 	true,
@@ -191,9 +194,12 @@ func (c *atomicConnectionClass) set(cc rpc.ConnectionClass) {
 // integrity by replacing failed replicas, splitting and merging
 // as appropriate.
 type Replica struct {
+	// A replica's AmbientCtx includes the log tags from the parent node and
+	// store.
 	log.AmbientContext
 
 	RangeID roachpb.RangeID // Only set by the constructor
+
 	// The start key of a Range remains constant throughout its lifetime (it does
 	// not change through splits or merges). This field carries a copy of
 	// r.mu.state.Desc.StartKey (and nil if the replica is not initialized). The
@@ -211,14 +217,27 @@ type Replica struct {
 	// The writes to this key happen in Replica.setStartKeyLocked.
 	startKey roachpb.RKey
 
+	// creationTime is the time that the Replica struct was initially constructed.
+	creationTime time.Time
+
 	store     *Store
 	abortSpan *abortspan.AbortSpan // Avoids anomalous reads after abort
 
 	// leaseholderStats tracks all incoming BatchRequests to the replica and which
 	// localities they come from in order to aid in lease rebalancing decisions.
 	leaseholderStats *replicaStats
-	// writeStats tracks the number of keys written by applied raft commands
-	// in order to aid in replica rebalancing decisions.
+	// writeStats tracks the number of mutations (as counted by the pebble batch
+	// to be applied to the state machine), and additionally, the number of keys
+	// added to MVCCStats, which notably may be approximate in the case of an
+	// AddSSTable. In other words, writeStats should loosely track the write
+	// activity on the replica on a per-key basis, though in an inconsistent way
+	// that in particular may overcount by a factor of roughly two.
+	//
+	// Note that while writeStats were originally introduced to aid in rebalancing
+	// decisions in [1], at the time of writing they are not used for that
+	// purpose.
+	//
+	// [1]: https://github.com/cockroachdb/cockroach/pull/16664
 	writeStats *replicaStats
 
 	// creatingReplica is set when a replica is created as uninitialized
@@ -238,8 +257,12 @@ type Replica struct {
 	// connectionClass controls the ConnectionClass used to send raft messages.
 	connectionClass atomicConnectionClass
 
-	// schedulerCtx is a cached instance of an annotated Raft scheduler context.
-	schedulerCtx atomic.Value // context.Context
+	// raftCtx is the Context to use for below-Raft work on this replica. The
+	// context is pre-determined in order to save on allocations for annotating
+	// with the replica ID. The Raft contexts that raftCtx replaces don't have
+	// anything interesting in them, so the operations using this raftCtx don't
+	// miss out on anything.
+	raftCtx context.Context
 
 	// raftMu protects Raft processing the replica.
 	//
@@ -267,8 +290,17 @@ type Replica struct {
 	concMgr concurrency.Manager
 
 	// tenantLimiter rate limits requests on a per-tenant basis and accumulates
-	// metrics about it.
+	// metrics about it. This is determined by the start key of the Replica,
+	// once initialized.
 	tenantLimiter tenantrate.Limiter
+
+	// tenantMetricsRef is a metrics reference indicating the tenant under
+	// which to track the range's contributions. This is determined by the
+	// start key of the Replica, once initialized.
+	// Its purpose is to help track down missing/extraneous release operations
+	// that would not be apparent or easy to resolve when refcounting at the store
+	// level only.
+	tenantMetricsRef *tenantMetricsRef
 
 	// sideTransportClosedTimestamp encapsulates state related to the closed
 	// timestamp's information about the range. Note that the
@@ -292,12 +324,20 @@ type Replica struct {
 		destroyStatus
 		// Is the range quiescent? Quiescent ranges are not Tick()'d and unquiesce
 		// whenever a Raft operation is performed.
+		//
+		// Replica objects always begin life in a quiescent state, as the field is
+		// set to true in the Replica constructor newUnloadedReplica. They unquiesce
+		// and set the field to false in either maybeUnquiesceAndWakeLeaderLocked or
+		// maybeUnquiesceWithOptionsLocked, which are called in response to Raft
+		// traffic.
+		//
+		// Only initialized replicas that have a non-nil internalRaftGroup are
+		// allowed to unquiesce and be Tick()'d. See canUnquiesceRLocked for an
+		// explanation of these conditions.
 		quiescent bool
 		// laggingFollowersOnQuiesce is the set of dead replicas that are not
 		// up-to-date with the rest of the quiescent Raft group. Nil if !quiescent.
 		laggingFollowersOnQuiesce laggingReplicaSet
-		// TODO(nvanbenschoten): remove in v21.1.
-		laggingFollowersOnQuiesceAccurate bool
 		// mergeComplete is non-nil if a merge is in-progress, in which case any
 		// requests should be held until the completion of the merge is signaled by
 		// the closing of the channel.
@@ -420,6 +460,9 @@ type Replica struct {
 		// The replica's Raft group "node".
 		internalRaftGroup *raft.RawNode
 		// The ID of the replica within the Raft group. This value may never be 0.
+		// It will not change over the lifetime of this replica. If addressed under
+		// a newer replicaID, the replica immediately replicaGCs itself to make
+		// way for the newer incarnation.
 		replicaID roachpb.ReplicaID
 		// The minimum allowed ID for this replica. Initialized from
 		// RangeTombstone.NextReplicaID.
@@ -920,12 +963,10 @@ func (r *Replica) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 func (r *Replica) getImpliedGCThresholdRLocked(
 	st kvserverpb.LeaseStatus, isAdmin bool,
 ) hlc.Timestamp {
-	threshold := *r.mu.state.GCThreshold
-
 	// The GC threshold is the oldest value we can return here.
 	if isAdmin || !StrictGCEnforcement.Get(&r.store.ClusterSettings().SV) ||
 		r.isSystemRangeRLocked() {
-		return threshold
+		return *r.mu.state.GCThreshold
 	}
 
 	// In order to make this check inexpensive, we keep a copy of the reading of
@@ -938,16 +979,16 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	// as they are after the GC threshold.
 	c := r.mu.cachedProtectedTS
 	if st.State != kvserverpb.LeaseState_VALID || c.readAt.Less(st.Lease.Start.ToTimestamp()) {
-		return threshold
+		return *r.mu.state.GCThreshold
 	}
 
-	impliedThreshold := gc.CalculateThreshold(st.Now.ToTimestamp(), r.mu.conf.TTL())
-	threshold.Forward(impliedThreshold)
+	threshold := gc.CalculateThreshold(st.Now.ToTimestamp(), r.mu.conf.TTL())
+	threshold.Forward(*r.mu.state.GCThreshold)
 
 	// If we have a protected timestamp record which precedes the implied
 	// threshold, use the threshold it implies instead.
 	if c.earliestRecord != nil && c.earliestRecord.Timestamp.Less(threshold) {
-		threshold = c.earliestRecord.Timestamp.Prev()
+		return c.earliestRecord.Timestamp.Prev()
 	}
 	return threshold
 }
@@ -962,7 +1003,7 @@ func (r *Replica) isSystemRange() bool {
 
 func (r *Replica) isSystemRangeRLocked() bool {
 	rem, _, err := keys.DecodeTenantPrefix(r.mu.state.Desc.StartKey.AsRawKey())
-	return err == nil && roachpb.Key(rem).Compare(keys.UserTableDataMin) < 0
+	return err == nil && roachpb.Key(rem).Compare(r.store.systemRangeStartUpperBound) < 0
 }
 
 // maxReplicaIDOfAny returns the maximum ReplicaID of any replica, including
@@ -1202,6 +1243,11 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 	if err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
+
+	// We don't care about this field; see comment on
+	// DeprecatedUsingAppliedStateKey for more details. This can be removed once
+	// we stop loading the replica state from snapshot protos.
+	diskState.DeprecatedUsingAppliedStateKey = r.mu.state.DeprecatedUsingAppliedStateKey
 	if !diskState.Equal(r.mu.state) {
 		// The roundabout way of printing here is to expose this information in sentry.io.
 		//
@@ -1217,6 +1263,38 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 			log.Fatalf(ctx, "denormalized start key %s diverged from %s", r.startKey, r.mu.state.Desc.StartKey)
 		}
 	}
+	// A replica is always contained in its descriptor. This is an invariant. When
+	// the replica applies a ChangeReplicasTrigger that removes it, it will
+	// eagerly replicaGC itself. Similarly, snapshots that don't contain the
+	// recipient are refused. In fact, a stronger invariant holds - replicas
+	// will never change replicaID in-place. When a replica receives a raft
+	// message addressing it through a higher replicaID, the replica is
+	// immediately garbage collected as well.
+	//
+	// Unfortunately, the invariant does not hold when the descriptor is
+	// uninitialized, as we are hitting this code during instantiation phase of
+	// replicas where they can briefly be in an inconsistent state. These calls
+	// generally go through tryGetOrCreateReplica and first create a replica from
+	// an uninitialized descriptor that they then populate if on-disk state is
+	// present. This is all complex and we would be better off if we made sure
+	// that a Replica is always initialized (i.e. replace uninitialized replicas
+	// with a different type, similar to ReplicaPlaceholder).
+	//
+	// The invariant is also violated in some tests that set the
+	// DisableEagerReplicaRemoval testing knob, for example in
+	// TestStoreReplicaGCAfterMerge.
+	//
+	// See:
+	// https://github.com/cockroachdb/cockroach/pull/40892
+	if !r.store.TestingKnobs().DisableEagerReplicaRemoval && r.mu.state.Desc.IsInitialized() {
+		replDesc, ok := r.mu.state.Desc.GetReplicaDescriptor(r.store.StoreID())
+		if !ok {
+			log.Fatalf(ctx, "%+v does not contain local store s%d", r.mu.state.Desc, r.store.StoreID())
+		}
+		if replDesc.ReplicaID != r.mu.replicaID {
+			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.mu.replicaID, r.mu.state.Desc)
+		}
+	}
 }
 
 // TODO(nvanbenschoten): move the following 5 methods to replica_send.go.
@@ -1224,8 +1302,11 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 // checkExecutionCanProceed returns an error if a batch request cannot be
 // executed by the Replica. An error indicates that the Replica is not live and
 // able to serve traffic or that the request is not compatible with the state of
-// the Range due to the range's key bounds, the range's lease, or the ranges GC
-// threshold.
+// the Range due to the range's key bounds, the range's lease, the range's GC
+// threshold, or due to a pending merge. On success, returns nil and either a
+// zero LeaseStatus (indicating that the request was permitted to skip the lease
+// checks) or a LeaseStatus in LeaseState_VALID (indicating that the Replica is
+// the leaseholder and able to serve this request).
 //
 // The method accepts a concurrency Guard, which is used to indicate whether the
 // caller has acquired latches. When this condition is false, the batch request
@@ -1235,21 +1316,18 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 func (r *Replica) checkExecutionCanProceed(
 	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard,
 ) (kvserverpb.LeaseStatus, error) {
-	var st kvserverpb.LeaseStatus
-	var shouldExtend bool
-	defer func() {
-		if shouldExtend {
-			r.maybeExtendLeaseAsync(ctx, st)
-		}
-	}()
-	now := r.Clock().NowAsClockTimestamp()
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
 		return kvserverpb.LeaseStatus{}, err
 	}
 
+	var shouldExtend bool
+	postRUnlock := func() {}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	defer func() {
+		r.mu.RUnlock()
+		postRUnlock()
+	}()
 
 	// Has the replica been initialized?
 	// NB: this should have already been checked in Store.Send, so we don't need
@@ -1274,41 +1352,16 @@ func (r *Replica) checkExecutionCanProceed(
 		return kvserverpb.LeaseStatus{}, err
 	}
 
-	// Is the lease valid?
-	if ba.ReadConsistency == roachpb.INCONSISTENT {
-		// For INCONSISTENT requests, we don't need the lease.
-		st = kvserverpb.LeaseStatus{
-			Now: now,
-		}
-	} else if ba.IsSingleSkipLeaseCheckRequest() {
-		// For lease commands, use the provided previous lease for verification.
-		st = kvserverpb.LeaseStatus{
-			Lease: ba.GetPrevLeaseForLeaseRequest(),
-			Now:   now,
-		}
-	} else {
-		// If the request is a write or a consistent read, it requires the
-		// replica serving it to hold the range lease. We pass the write
-		// timestamp of the request because this is the maximum timestamp that
-		// the request will operate at, ignoring the uncertainty interval, which
-		// is already accounted for in LeaseStatus's stasis period handling.
-		st, shouldExtend, err = r.leaseGoodToGoRLocked(ctx, now, ba.WriteTimestamp())
-		if err != nil {
-			// If not, can we serve this request on a follower?
-			if !r.canServeFollowerReadRLocked(ctx, ba) {
-				return st, err
-			}
-			err = nil                     // ignore error
-			st = kvserverpb.LeaseStatus{} // already empty for follower reads, but be explicit
-		}
-	}
-
-	// Is the request below the GC threshold?
-	if err := r.checkTSAboveGCThresholdRLocked(ba.EarliestActiveTimestamp(), st, ba.IsAdmin()); err != nil {
+	st, shouldExtend, err := r.checkGCThresholdAndLeaseRLocked(ctx, ba)
+	if err != nil {
 		return kvserverpb.LeaseStatus{}, err
 	}
 
-	// Is there a merge in progress?
+	// Is there a merge in progress? We intentionally check this last to let requests error out
+	// for other reasons first, in case callers don't require this replica to service the request.
+	// Tests such as TestClosedTimestampFrozenAfterSubsumption also rely on this late-checking of
+	// merges by checking for a NotLeaseholderError on replicas in a critical phase for certain
+	// requests.
 	if r.mergeInProgressRLocked() && g.HoldingLatches() {
 		// We only check for a merge if we are holding latches. In practice,
 		// this means that any request where concurrency.shouldAcquireLatches()
@@ -1323,7 +1376,74 @@ func (r *Replica) checkExecutionCanProceed(
 		}
 	}
 
+	if shouldExtend {
+		// If we're asked to extend the lease, trigger (async) lease renewal.
+		// Kicking this off requires an exclusive lock, and we hold a read-only lock
+		// already, so we jump through a hoop to run it in a suitably positioned
+		// defer.
+		postRUnlock = func() { r.maybeExtendLeaseAsync(ctx, st) }
+	}
 	return st, nil
+}
+
+// checkGCThresholdAndLeaseRLocked checks the provided batch against the GC
+// threshold and lease. A nil error indicates to go ahead with the batch, and
+// is accompanied either by a valid or zero lease status, the latter case
+// indicating that the request was permitted to bypass the lease check. The
+// returned bool indicates whether the lease should be extended (only on nil
+// error).
+func (r *Replica) checkGCThresholdAndLeaseRLocked(
+	ctx context.Context, ba *roachpb.BatchRequest,
+) (kvserverpb.LeaseStatus, bool, error) {
+	now := r.Clock().NowAsClockTimestamp()
+	// If the request is a write or a consistent read, it requires the
+	// replica serving it to hold the range lease. We pass the write
+	// timestamp of the request because this is the maximum timestamp that
+	// the request will operate at, ignoring the uncertainty interval, which
+	// is already accounted for in LeaseStatus's stasis period handling.
+	// For INCONSISTENT requests (which are always pure reads), this coincides
+	// with the read timestamp.
+	reqTS := ba.WriteTimestamp()
+	st := r.leaseStatusForRequestRLocked(ctx, now, reqTS)
+
+	var shouldExtend bool
+	// Write commands that skip the lease check in practice are exactly
+	// RequestLease and TransferLease. Both use the provided previous lease for
+	// verification below raft. We return a zero lease status from this method and
+	// task evalAndPropose with pulling the correct lease sequence number from the
+	// lease request.
+	//
+	// If the request is an INCONSISTENT request (and thus a read), it similarly
+	// doesn't check the lease.
+	if !ba.IsSingleSkipsLeaseCheckRequest() && ba.ReadConsistency != roachpb.INCONSISTENT {
+		// Check the lease.
+		var err error
+		shouldExtend, err = r.leaseGoodToGoForStatusRLocked(ctx, now, reqTS, st)
+		if err != nil {
+			// No valid lease, but if we can serve this request via follower reads,
+			// we may continue.
+			if !r.canServeFollowerReadRLocked(ctx, ba) {
+				// If not, return the error.
+				return kvserverpb.LeaseStatus{}, false, err
+			}
+			// Otherwise, suppress the error. Also, remember that we're not serving
+			// this under the lease by zeroing out the status. We also intentionally
+			// do not pass the original status to checkTSAboveGCThresholdRLocked as
+			// this method assumes that a valid status indicates that this replica
+			// holds the lease (see #73123). `shouldExtend` is already false in this
+			// branch, but for completeness we zero it out as well.
+			st, shouldExtend, err = kvserverpb.LeaseStatus{}, false, nil
+		}
+	}
+
+	// Check if request is below the GC threshold and if so, error out. Note that
+	// this uses the lease status no matter whether it's valid or not, and the
+	// method is set up to handle that.
+	if err := r.checkTSAboveGCThresholdRLocked(ba.EarliestActiveTimestamp(), st, ba.IsAdmin()); err != nil {
+		return kvserverpb.LeaseStatus{}, false, err
+	}
+
+	return st, shouldExtend, nil
 }
 
 // checkExecutionCanProceedForRangeFeed returns an error if a rangefeed request
@@ -1471,6 +1591,8 @@ func (r *Replica) shouldWaitForPendingMergeRLocked(
 				return nil
 			}
 		}
+		return errors.Errorf("merge transaction attempting to issue "+
+			"batch on right-hand side range after subsumption: %s", ba.Summary())
 	}
 
 	// Otherwise, the request must wait. We can't wait for the merge to complete
@@ -1505,14 +1627,7 @@ func (r *Replica) shouldWaitForPendingMergeRLocked(
 // older replica ID including its hard state which may have been synthesized
 // with votes as the newer replica ID. This case tends to be handled safely
 // in practice because the replica should only be receiving messages as the
-// newer replica ID after it has been added to the range. Prior to learner
-// replicas we would only add a store to a range after we've successfully
-// applied a pre-emptive snapshot. If the store were to split between the
-// preemptive snapshot and the addition then the addition would fail due to
-// the conditional put logic. If the store were to then enable learners then
-// we're still okay because we won't promote a learner unless we succeed in
-// sending a learner snapshot. If we fail to send the replica never becomes
-// a voter then its votes don't matter and are safe to discard.
+// newer replica ID after it has been added to the range as a learner.
 //
 // Despite the safety due to the change replicas protocol explained above
 // it'd be good to know for sure that a replica ID for a range on a store
@@ -1605,7 +1720,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 	// orphaned followers would fail to queue themselves for GC.) Unquiesce the
 	// range in case it managed to quiesce between when the Subsume request
 	// arrived and now, which is rare but entirely legal.
-	r.unquiesceLocked()
+	r.maybeUnquiesceLocked()
 
 	taskCtx := r.AnnotateCtx(context.Background())
 	err = r.store.stopper.RunAsyncTask(taskCtx, "wait-for-merge", func(ctx context.Context) {
@@ -1743,11 +1858,13 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 // facilitates quick command application (requests generally need to make it to
 // both the lease holder and the raft leader before being applied by other
 // replicas).
-func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(ctx context.Context) {
+func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
+	ctx context.Context, now hlc.ClockTimestamp,
+) {
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
 	}
-	status := r.leaseStatusAtRLocked(ctx, r.Clock().NowAsClockTimestamp())
+	status := r.leaseStatusAtRLocked(ctx, now)
 	if !status.IsValid() || status.OwnedBy(r.StoreID()) {
 		return
 	}

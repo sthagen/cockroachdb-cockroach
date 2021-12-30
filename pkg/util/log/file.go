@@ -95,7 +95,7 @@ type fileSink struct {
 	// mu protects the remaining elements of this structure and is
 	// used to synchronize output to this file sink..
 	mu struct {
-		syncutil.Mutex
+		syncutil.RWMutex
 
 		// directory prefix where to store this logger's files. This is
 		// under "mu" because the test Scope can overwrite this
@@ -172,7 +172,11 @@ func (l *fileSink) attachHints(stacks []byte) []byte {
 }
 
 // output implements the logSink interface.
-func (l *fileSink) output(extraFlush bool, b []byte) error {
+func (l *fileSink) output(b []byte, opts sinkOutputOptions) error {
+	if opts.ignoreErrors {
+		l.emergencyOutput(b)
+		return nil
+	}
 	if !l.enabled.Get() {
 		// NB: we need to check filesink.enabled a second time here in
 		// case a test Scope() has disabled it asynchronously while
@@ -191,7 +195,7 @@ func (l *fileSink) output(extraFlush bool, b []byte) error {
 		return err
 	}
 
-	if extraFlush || !l.bufferedWrites || logging.flushWrites.Get() {
+	if opts.extraFlush || !l.bufferedWrites || logging.flushWrites.Get() {
 		l.flushAndMaybeSyncLocked(false /*doSync*/)
 	}
 	return nil

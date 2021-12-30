@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-//go:generate mockgen -package=prometheus -destination=mock_generated.go -source=prometheus.go . cluster
+//go:generate mockgen -package=prometheus -destination=mock_generated.go -source=prometheus.go . Cluster
 
 package prometheus
 
@@ -18,8 +18,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"gopkg.in/yaml.v2"
 )
 
@@ -42,11 +42,11 @@ type Config struct {
 	ScrapeConfigs  []ScrapeConfig
 }
 
-// cluster is a subset of roachtest.Cluster.
+// Cluster is a subset of roachtest.Cluster.
 // It is abstracted to prevent a circular dependency on roachtest, as Cluster
 // requires the test interface.
-type cluster interface {
-	ExternalIP(context.Context, option.NodeListOption) ([]string, error)
+type Cluster interface {
+	ExternalIP(context.Context, *logger.Logger, option.NodeListOption) ([]string, error)
 	Get(ctx context.Context, l *logger.Logger, src, dest string, opts ...option.Option) error
 	RunE(ctx context.Context, node option.NodeListOption, args ...string) error
 	PutString(
@@ -63,9 +63,18 @@ type Prometheus struct {
 func Init(
 	ctx context.Context,
 	cfg Config,
-	c cluster,
+	c Cluster,
+	l *logger.Logger,
 	repeatFunc func(context.Context, option.NodeListOption, string, ...string) error,
 ) (*Prometheus, error) {
+	if err := c.RunE(
+		ctx,
+		cfg.PrometheusNode,
+		"sudo systemctl stop prometheus || echo 'no prometheus is running'",
+	); err != nil {
+		return nil, err
+	}
+
 	if err := repeatFunc(
 		ctx,
 		cfg.PrometheusNode,
@@ -78,6 +87,7 @@ func Init(
 
 	yamlCfg, err := makeYAMLConfig(
 		ctx,
+		l,
 		c,
 		cfg.ScrapeConfigs,
 	)
@@ -110,7 +120,7 @@ sudo systemd-run --unit prometheus --same-dir \
 
 // Snapshot takes a snapshot of prometheus and stores the snapshot in the given localPath
 func (pm *Prometheus) Snapshot(
-	ctx context.Context, c cluster, l *logger.Logger, localPath string,
+	ctx context.Context, c Cluster, l *logger.Logger, localPath string,
 ) error {
 	if err := c.RunE(
 		ctx,
@@ -140,7 +150,9 @@ const (
 )
 
 // makeYAMLConfig creates a prometheus YAML config for the server to use.
-func makeYAMLConfig(ctx context.Context, c cluster, scrapeConfigs []ScrapeConfig) (string, error) {
+func makeYAMLConfig(
+	ctx context.Context, l *logger.Logger, c Cluster, scrapeConfigs []ScrapeConfig,
+) (string, error) {
 	type yamlStaticConfig struct {
 		Targets []string
 	}
@@ -166,7 +178,7 @@ func makeYAMLConfig(ctx context.Context, c cluster, scrapeConfigs []ScrapeConfig
 	for _, scrapeConfig := range scrapeConfigs {
 		var targets []string
 		for _, scrapeNode := range scrapeConfig.ScrapeNodes {
-			ips, err := c.ExternalIP(ctx, scrapeNode.Nodes)
+			ips, err := c.ExternalIP(ctx, l, scrapeNode.Nodes)
 			if err != nil {
 				return "", err
 			}

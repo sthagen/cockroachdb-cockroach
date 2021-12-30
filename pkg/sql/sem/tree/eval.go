@@ -2637,6 +2637,7 @@ var CmpOps = cmpOpFixups(map[ComparisonOperatorSymbol]cmpOpOverload{
 const experimentalBox2DClusterSettingName = "sql.spatial.experimental_box2d_comparison_operators.enabled"
 
 var experimentalBox2DClusterSetting = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	experimentalBox2DClusterSettingName,
 	"enables the use of certain experimental box2d comparison operators",
 	false,
@@ -2983,8 +2984,8 @@ func MatchLikeEscape(
 
 	like, err := optimizedLikeFunc(pattern, caseInsensitive, escapeRune)
 	if err != nil {
-		return DBoolFalse, pgerror.Newf(
-			pgcode.InvalidRegularExpression, "LIKE regexp compilation failed: %v", err)
+		return DBoolFalse, pgerror.Wrap(
+			err, pgcode.InvalidRegularExpression, "LIKE regexp compilation failed")
 	}
 
 	if like == nil {
@@ -3008,8 +3009,8 @@ func ConvertLikeToRegexp(
 	key := likeKey{s: pattern, caseInsensitive: caseInsensitive, escape: escape}
 	re, err := ctx.ReCache.GetRegexp(key)
 	if err != nil {
-		return nil, pgerror.Newf(
-			pgcode.InvalidRegularExpression, "LIKE regexp compilation failed: %v", err)
+		return nil, pgerror.Wrap(
+			err, pgcode.InvalidRegularExpression, "LIKE regexp compilation failed")
 	}
 	return re, nil
 }
@@ -3033,8 +3034,8 @@ func matchLike(ctx *EvalContext, left, right Datum, caseInsensitive bool) (Datum
 
 	like, err := optimizedLikeFunc(pattern, caseInsensitive, '\\')
 	if err != nil {
-		return DBoolFalse, pgerror.Newf(
-			pgcode.InvalidRegularExpression, "LIKE regexp compilation failed: %v", err)
+		return DBoolFalse, pgerror.Wrap(
+			err, pgcode.InvalidRegularExpression, "LIKE regexp compilation failed")
 	}
 
 	if like == nil {
@@ -3159,6 +3160,9 @@ type EvalPlanner interface {
 	EvalDatabase
 	TypeResolver
 
+	// ExecutorConfig returns *ExecutorConfig
+	ExecutorConfig() interface{}
+
 	// GetImmutableTableInterfaceByID returns an interface{} with
 	// catalog.TableDescriptor to avoid a circular dependency.
 	GetImmutableTableInterfaceByID(ctx context.Context, id int) (interface{}, error)
@@ -3225,6 +3229,65 @@ type EvalPlanner interface {
 
 	// ExternalWriteFile writes the content to an external file URI.
 	ExternalWriteFile(ctx context.Context, uri string, content []byte) error
+
+	// DecodeGist exposes gist functionality to the builtin functions.
+	DecodeGist(gist string) ([]string, error)
+
+	// QueryRowEx executes the supplied SQL statement and returns a single row, or
+	// nil if no row is found, or an error if more that one row is returned.
+	//
+	// The fields set in session that are set override the respective fields if
+	// they have previously been set through SetSessionData().
+	QueryRowEx(
+		ctx context.Context,
+		opName string,
+		txn *kv.Txn,
+		override sessiondata.InternalExecutorOverride,
+		stmt string,
+		qargs ...interface{}) (Datums, error)
+
+	// QueryIteratorEx executes the query, returning an iterator that can be used
+	// to get the results. If the call is successful, the returned iterator
+	// *must* be closed.
+	//
+	// The fields set in session that are set override the respective fields if they
+	// have previously been set through SetSessionData().
+	QueryIteratorEx(
+		ctx context.Context,
+		opName string,
+		txn *kv.Txn,
+		override sessiondata.InternalExecutorOverride,
+		stmt string,
+		qargs ...interface{},
+	) (InternalRows, error)
+}
+
+// InternalRows is an iterator interface that's exposed by the internal
+// executor. It provides access to the rows from a query.
+// InternalRows is a copy of the one in sql/internal.go excluding the
+// Types function - we don't need the Types function for use cases where
+// QueryIteratorEx is used from the InternalExecutor on the EvalPlanner.
+// Furthermore, we cannot include the Types function due to a cyclic
+// dependency on colinfo.ResultColumns - we cannot import colinfo in tree.
+type InternalRows interface {
+	// Next advances the iterator by one row, returning false if there are no
+	// more rows in this iterator or if an error is encountered (the latter is
+	// then returned).
+	//
+	// The iterator is automatically closed when false is returned, consequent
+	// calls to Next will return the same values as when the iterator was
+	// closed.
+	Next(context.Context) (bool, error)
+
+	// Cur returns the row at the current position of the iterator. The row is
+	// safe to hold onto (meaning that calling Next() or Close() will not
+	// invalidate it).
+	Cur() Datums
+
+	// Close closes this iterator, releasing any resources it held open. Close
+	// is idempotent and *must* be called once the caller is done with the
+	// iterator.
+	Close() error
 }
 
 // CompactEngineSpanFunc is used to compact an engine key span at the given
@@ -3273,25 +3336,6 @@ type ClientNoticeSender interface {
 	BufferClientNotice(ctx context.Context, notice pgnotice.Notice)
 }
 
-// InternalExecutor is a subset of sqlutil.InternalExecutor (which, in turn, is
-// implemented by sql.InternalExecutor) used by this sem/tree package which
-// can't even import sqlutil.
-//
-// Note that the functions offered here should be avoided when possible. They
-// execute the query as root if an user hadn't been previously set on the
-// executor through SetSessionData(). These functions are deprecated in
-// sql.InternalExecutor in favor of a safer interface. Unfortunately, those
-// safer functions cannot be exposed through this interface because they depend
-// on sqlbase, and this package cannot import sqlbase. When possible, downcast
-// this to sqlutil.InternalExecutor or sql.InternalExecutor, and use the
-// alternatives.
-type InternalExecutor interface {
-	// QueryRow is part of the sqlutil.InternalExecutor interface.
-	QueryRow(
-		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
-	) (Datums, error)
-}
-
 // PrivilegedAccessor gives access to certain queries that would otherwise
 // require someone with RootUser access to query a given data source.
 // It is defined independently to prevent a circular dependency on sql, tree and sqlbase.
@@ -3301,10 +3345,10 @@ type PrivilegedAccessor interface {
 	// Returns the id, a bool representing whether the namespace exists, and an error
 	// if there is one.
 	LookupNamespaceID(
-		ctx context.Context, parentID int64, name string,
+		ctx context.Context, parentID int64, parentSchemaID int64, name string,
 	) (DInt, bool, error)
 
-	// LookupZoneConfig returns the zone config given a namespace id.
+	// LookupZoneConfigByNamespaceID returns the zone config given a namespace id.
 	// It is meant as a replacement for looking up system.zones directly.
 	// Returns the config byte array, a bool representing whether the namespace exists,
 	// and an error if there is one.
@@ -3358,7 +3402,7 @@ type SequenceOperators interface {
 	// `newVal` is returned. Otherwise, the next call to nextval will return
 	// `newVal + seqOpts.Increment`.
 	// Takes in a sequence ID rather than a name, unlike SetSequenceValue.
-	SetSequenceValueByID(ctx context.Context, seqID int64, newVal int64, isCalled bool) error
+	SetSequenceValueByID(ctx context.Context, seqID uint32, newVal int64, isCalled bool) error
 }
 
 // TenantOperator is capable of interacting with tenant state, allowing SQL
@@ -3443,6 +3487,13 @@ type SQLStatsController interface {
 	CreateSQLStatsCompactionSchedule(ctx context.Context) error
 }
 
+// IndexUsageStatsController is an interface embedded in EvalCtx which can be
+// used by the builtins to reset index usage stats in the cluster. This interface
+// is introduced to avoid circular dependency.
+type IndexUsageStatsController interface {
+	ResetIndexUsageStats(ctx context.Context) error
+}
+
 // EvalContext defines the context in which to evaluate an expression, allowing
 // the retrieval of state such as the node ID or statement start time.
 //
@@ -3524,13 +3575,6 @@ type EvalContext struct {
 	// Context holds the context in which the expression is evaluated.
 	Context context.Context
 
-	// InternalExecutor gives access to an executor to be used for running
-	// "internal" statements. It may seem bizarre that "expression evaluation" may
-	// need to run a statement, and yet many builtin functions do it.
-	// Note that the executor will be "session-bound" - it will inherit session
-	// variables from a parent session.
-	InternalExecutor InternalExecutor
-
 	Planner EvalPlanner
 
 	PrivilegedAccessor PrivilegedAccessor
@@ -3586,6 +3630,8 @@ type EvalContext struct {
 	SQLLivenessReader sqlliveness.Reader
 
 	SQLStatsController SQLStatsController
+
+	IndexUsageStatsController IndexUsageStatsController
 
 	// CompactEngineSpan is used to force compaction of a span in a store.
 	CompactEngineSpan CompactEngineSpanFunc
@@ -3665,7 +3711,12 @@ func NewTestingEvalContext(st *cluster.Settings) *EvalContext {
 
 // Stop closes out the EvalContext and must be called once it is no longer in use.
 func (ctx *EvalContext) Stop(c context.Context) {
-	ctx.Mon.Stop(c)
+	if r := recover(); r != nil {
+		ctx.Mon.EmergencyStop(c)
+		panic(r)
+	} else {
+		ctx.Mon.Stop(c)
+	}
 }
 
 // FmtCtx creates a FmtCtx with the given options as well as the EvalContext's session data.
@@ -4194,6 +4245,10 @@ func (expr *FuncExpr) MaybeWrapError(err error) error {
 
 // Eval implements the TypedExpr interface.
 func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
+	if expr.fn.FnWithExprs != nil {
+		return expr.fn.FnWithExprs(ctx, expr.Exprs)
+	}
+
 	nullResult, args, err := expr.evalArgs(ctx)
 	if err != nil {
 		return nil, err
@@ -4641,6 +4696,11 @@ func (t *DArray) Eval(_ *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (t *DVoid) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
 func (t *DOid) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
@@ -4679,7 +4739,8 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 		// checking, since the placeholder's type hint didn't match the desired
 		// type for the placeholder. In this case, we cast the expression to
 		// the desired type.
-		// TODO(jordan): introduce a restriction on what casts are allowed here.
+		// TODO(jordan,mgartner): Introduce a restriction on what casts are
+		// allowed here. Most likely, only implicit casts should be allowed.
 		cast := NewTypedCastExpr(e, typ)
 		return cast.Eval(ctx)
 	}
@@ -4919,6 +4980,13 @@ type likeKey struct {
 	s               string
 	caseInsensitive bool
 	escape          rune
+}
+
+// LikeEscape converts a like pattern to a regexp pattern.
+func LikeEscape(pattern string) (string, error) {
+	key := likeKey{s: pattern, caseInsensitive: false, escape: '\\'}
+	re, err := key.patternNoAnchor()
+	return re, err
 }
 
 // unescapePattern unescapes a pattern for a given escape token.
@@ -5280,11 +5348,7 @@ func calculateLengthAfterReplacingCustomEscape(s string, escape rune) (bool, int
 	return changed, retLen, nil
 }
 
-// Pattern implements the RegexpCacheKey interface.
-// The strategy for handling custom escape character
-// is to convert all unescaped escape character into '\'.
-// k.escape can either be empty or a single character.
-func (k likeKey) Pattern() (string, error) {
+func (k likeKey) patternNoAnchor() (string, error) {
 	// QuoteMeta escapes all regexp metacharacters (`\.+*?()|[]{}^$`) with a `\`.
 	pattern := regexp.QuoteMeta(k.s)
 	var err error
@@ -5361,6 +5425,18 @@ func (k likeKey) Pattern() (string, error) {
 		}
 	}
 
+	return pattern, nil
+}
+
+// Pattern implements the RegexpCacheKey interface.
+// The strategy for handling custom escape character
+// is to convert all unescaped escape character into '\'.
+// k.escape can either be empty or a single character.
+func (k likeKey) Pattern() (string, error) {
+	pattern, err := k.patternNoAnchor()
+	if err != nil {
+		return "", err
+	}
 	return anchorPattern(pattern, k.caseInsensitive), nil
 }
 

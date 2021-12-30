@@ -75,7 +75,7 @@ func (b *Builder) buildAlterTableSplit(split *tree.Split, inScope *scope) (outSc
 	outScope = inScope.push()
 	b.synthesizeResultColumns(outScope, colinfo.AlterTableSplitColumns)
 	outScope.expr = b.factory.ConstructAlterTableSplit(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		expiration,
 		&memo.AlterTableSplitPrivate{
 			Table:   b.factory.Metadata().AddTable(table, &tn),
@@ -129,7 +129,7 @@ func (b *Builder) buildAlterTableUnsplit(unsplit *tree.Unsplit, inScope *scope) 
 	private.Props = inputScope.makePhysicalProps()
 
 	outScope.expr = b.factory.ConstructAlterTableUnsplit(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		private,
 	)
 	return outScope
@@ -163,8 +163,8 @@ func (b *Builder) buildAlterTableRelocate(
 
 	// The first column is the target leaseholder or the relocation array,
 	// depending on variant.
-	cmdName := "EXPERIMENTAL_RELOCATE"
-	if relocate.RelocateLease {
+	cmdName := "RELOCATE"
+	if relocate.SubjectReplicas == tree.RelocateLease {
 		cmdName += " LEASE"
 		colNames = append([]string{"target leaseholder"}, colNames...)
 		colTypes = append([]*types.T{types.Int}, colTypes...)
@@ -179,10 +179,9 @@ func (b *Builder) buildAlterTableRelocate(
 	checkInputColumns(cmdName, inputScope, colNames, colTypes, 2)
 
 	outScope.expr = b.factory.ConstructAlterTableRelocate(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		&memo.AlterTableRelocatePrivate{
-			RelocateLease:     relocate.RelocateLease,
-			RelocateNonVoters: relocate.RelocateNonVoters,
+			SubjectReplicas: relocate.SubjectReplicas,
 			AlterTableSplitPrivate: memo.AlterTableSplitPrivate{
 				Table:   b.factory.Metadata().AddTable(table, &tn),
 				Index:   index.Ordinal(),

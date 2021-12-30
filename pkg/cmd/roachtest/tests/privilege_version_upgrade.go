@@ -95,8 +95,12 @@ func runPrivilegeVersionUpgrade(
 	allPrivs := privilege.List{privilege.ALL}
 	upgradeTest(allPrivs, allPrivs, allPrivs, allPrivs).run(ctx, t)
 
+	allDBPrivs := privilege.GetValidPrivilegesForObject(privilege.Database)
+	validDBPrivBits := allDBPrivs.ToBitField() &^ privilege.PGIncompatibleDBPrivileges.ToBitField()
+	validDBPrivs := privilege.ListFromBitField(validDBPrivBits, privilege.Database)
+
 	// Split privileges into two sets so they aren't folded into "ALL".
-	dbPrivsSetOne, dbPrivsSetTwo := splitPrivilegeListHelper(privilege.GetValidPrivilegesForObject(privilege.Database))
+	dbPrivsSetOne, dbPrivsSetTwo := splitPrivilegeListHelper(validDBPrivs)
 	schemaPrivsSetOne, schemaPrivsSetTwo := splitPrivilegeListHelper(privilege.GetValidPrivilegesForObject(privilege.Schema))
 	tablePrivsSetOne, tablePrivsSetTwo := splitPrivilegeListHelper(privilege.GetValidPrivilegesForObject(privilege.Table))
 	typePrivsSetOne, typePrivsSetTwo := splitPrivilegeListHelper(privilege.GetValidPrivilegesForObject(privilege.Type))
@@ -107,7 +111,7 @@ func runPrivilegeVersionUpgrade(
 
 func createDatabasePrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 		_, err = conn.Exec("CREATE DATABASE test")
 		require.NoError(t, err)
@@ -122,7 +126,7 @@ func createDatabasePrivilegesStep(privileges privilege.List) versionStep {
 
 func checkDatabasePrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 
 		r := sqlutils.MakeSQLRunner(conn)
@@ -140,7 +144,7 @@ func checkDatabasePrivilegesStep(privileges privilege.List) versionStep {
 
 func createSchemaPrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 		_, err = conn.Exec("CREATE SCHEMA test.test_schema")
 		require.NoError(t, err)
@@ -156,7 +160,7 @@ func createSchemaPrivilegesStep(privileges privilege.List) versionStep {
 
 func checkSchemaPrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 
 		r := sqlutils.MakeSQLRunner(conn)
@@ -174,7 +178,7 @@ func checkSchemaPrivilegesStep(privileges privilege.List) versionStep {
 
 func createTypePrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 		_, err = conn.Exec("CREATE TYPE test.test_type AS ENUM()")
 		require.NoError(t, err)
@@ -190,7 +194,7 @@ func createTypePrivilegesStep(privileges privilege.List) versionStep {
 
 func checkTypePrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 
 		r := sqlutils.MakeSQLRunner(conn)
@@ -211,7 +215,7 @@ func checkTypePrivilegesStep(privileges privilege.List) versionStep {
 
 func createTablePrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 		_, err = conn.Exec("CREATE TABLE test.test_table()")
 		require.NoError(t, err)
@@ -227,7 +231,7 @@ func createTablePrivilegesStep(privileges privilege.List) versionStep {
 
 func checkTablePrivilegesStep(privileges privilege.List) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 
 		r := sqlutils.MakeSQLRunner(conn)
@@ -248,7 +252,7 @@ func resetStep() versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		err := u.c.WipeE(ctx, t.L())
 		require.NoError(t, err)
-		err = u.c.RunL(ctx, t.L(), u.c.All(), "rm -rf "+t.PerfArtifactsDir())
+		err = u.c.RunE(ctx, u.c.All(), "rm -rf "+t.PerfArtifactsDir())
 		require.NoError(t, err)
 		err = u.c.RunE(ctx, u.c.All(), "rm -rf {store-dir}")
 		require.NoError(t, err)
@@ -257,7 +261,7 @@ func resetStep() versionStep {
 
 func createUserStep() versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		conn, err := u.c.ConnE(ctx, loadNode)
+		conn, err := u.c.ConnE(ctx, t.L(), loadNode)
 		require.NoError(t, err)
 		_, err = conn.Exec("CREATE USER testuser")
 		require.NoError(t, err)

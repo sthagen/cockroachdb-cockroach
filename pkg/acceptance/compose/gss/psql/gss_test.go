@@ -51,6 +51,8 @@ func TestGSS(t *testing.T) {
 		hbaErr string
 		// Error message of gss login.
 		gssErr string
+		// Optionally inject an HBA identity map.
+		identMap string
 	}{
 		{
 			conf:   `host all all all gss include_realm=0 nope=1`,
@@ -61,8 +63,12 @@ func TestGSS(t *testing.T) {
 			hbaErr: `include_realm must be set to 0`,
 		},
 		{
+			conf:   `host all all all gss map=ignored include_realm=1`,
+			hbaErr: `include_realm must be set to 0`,
+		},
+		{
 			conf:   `host all all all gss`,
-			hbaErr: `missing "include_realm=0"`,
+			hbaErr: `at least one of "include_realm=0" or "map" options required`,
 		},
 		{
 			conf:   `host all all all gss include_realm=0`,
@@ -94,6 +100,36 @@ func TestGSS(t *testing.T) {
 			user:   "tester",
 			gssErr: `GSS authentication requires an enterprise license`,
 		},
+		// Validate that we can use the "map" option to strip the realm
+		// data. Note that the system-identity value will have been
+		// normalized into a lower-case value.
+		{
+			conf:     `host all all all gss map=demo`,
+			identMap: `demo /^(.*)@my.ex$ \1`,
+			user:     "tester",
+			gssErr:   `GSS authentication requires an enterprise license`,
+		},
+		// Verify case-sensitivity.
+		{
+			conf:     `host all all all gss map=demo`,
+			identMap: `demo /^(.*)@MY.EX$ \1`,
+			user:     "tester",
+			gssErr:   `system identity "tester@my.ex" did not map to a database role`,
+		},
+		// Validating the use of "map" as a filter.
+		{
+			conf:     `host all all all gss map=demo`,
+			identMap: `demo /^(.*)@NOPE.EX$ \1`,
+			user:     "tester",
+			gssErr:   `system identity "tester@my.ex" did not map to a database role`,
+		},
+		// Check map+include_realm=0 case.
+		{
+			conf:     `host all all all gss include_realm=0 map=demo`,
+			identMap: `demo tester remapped`,
+			user:     "remapped",
+			gssErr:   `GSS authentication requires an enterprise license`,
+		},
 	}
 	for i, tc := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
@@ -103,7 +139,12 @@ func TestGSS(t *testing.T) {
 			if tc.hbaErr != "" {
 				return
 			}
-			if _, err := db.Exec(fmt.Sprintf(`CREATE USER IF NOT EXISTS '%s'`, tc.user)); err != nil {
+			if tc.identMap != "" {
+				if _, err := db.Exec(`SET CLUSTER SETTING server.identity_map.configuration = $1`, tc.identMap); err != nil {
+					t.Fatalf("bad identity_map: %v", err)
+				}
+			}
+			if _, err := db.Exec(fmt.Sprintf(`CREATE USER IF NOT EXISTS %s`, tc.user)); err != nil {
 				t.Fatal(err)
 			}
 			t.Run("libpq", func(t *testing.T) {
@@ -164,7 +205,7 @@ func TestGSSFileDescriptorCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	const user = "tester"
-	if _, err := rootDB.Exec(fmt.Sprintf(`CREATE USER IF NOT EXISTS '%s'`, user)); err != nil {
+	if _, err := rootDB.Exec(fmt.Sprintf(`CREATE USER IF NOT EXISTS %s`, user)); err != nil {
 		t.Fatal(err)
 	}
 

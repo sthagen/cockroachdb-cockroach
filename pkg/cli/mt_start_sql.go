@@ -12,6 +12,8 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"io/ioutil"
 	"os"
 	"os/signal"
 
@@ -20,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/sdnotify"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -59,7 +63,28 @@ well unless it can be verified using a trusted root certificate store. That is,
 }
 
 func runStartSQL(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	tBegin := timeutil.Now()
+
+	// First things first: if the user wants background processing,
+	// relinquish the terminal ASAP by forking and exiting.
+	//
+	// If executing in the background, the function returns ok == true in
+	// the parent process (regardless of err) and the parent exits at
+	// this point.
+	if ok, err := maybeRerunBackground(); ok {
+		return err
+	}
+
+	// Set up a cancellable context for the entire start command.
+	// The context will be canceled at the end.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The context annotation ensures that server identifiers show up
+	// in the logging metadata as soon as they are known.
+	ambientCtx := serverCfg.AmbientCtx
+	ctx = ambientCtx.AnnotateCtx(ctx)
+
 	const clusterName = ""
 
 	stopper, err := setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
@@ -67,6 +92,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer stopper.Stop(ctx)
+	stopper.SetTracer(serverCfg.BaseConfig.AmbientCtx.Tracer)
 
 	st := serverCfg.BaseConfig.Settings
 
@@ -94,7 +120,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 
 	initGEOS(ctx)
 
-	sqlServer, addr, httpAddr, err := server.StartTenant(
+	sqlServer, _, _, err := server.StartTenant(
 		ctx,
 		stopper,
 		clusterName,
@@ -104,6 +130,25 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// If another process was waiting on the PID (e.g. using a FIFO),
+	// this is when we can tell them the node has started listening.
+	if startCtx.pidFile != "" {
+		log.Ops.Infof(ctx, "PID file: %s", startCtx.pidFile)
+		if err := ioutil.WriteFile(startCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
+			log.Ops.Errorf(ctx, "failed writing the PID: %v", err)
+		}
+	}
+
+	// Ensure the configuration logging is written to disk in case a
+	// process is waiting for the sdnotify readiness to read important
+	// information from there.
+	log.Flush()
+
+	// Signal readiness. This unblocks the process when running with
+	// --background or under systemd.
+	if err := sdnotify.Ready(); err != nil {
+		log.Ops.Errorf(ctx, "failed to signal readiness using systemd protocol: %s", err)
+	}
 
 	// Start up the diagnostics reporting loop.
 	// We don't do this in (*server.SQLServer).preStart() because we don't
@@ -112,7 +157,11 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 		sqlServer.StartDiagnostics(ctx)
 	}
 
-	log.Infof(ctx, "SQL server for tenant %s listening at %s, http at %s", serverCfg.SQLConfig.TenantID, addr, httpAddr)
+	// Report the server identifiers and other server details
+	// in the same format as 'cockroach start'.
+	if err := reportServerInfo(ctx, tBegin, &serverCfg, st, false /* isHostNode */, false /* initialStart */); err != nil {
+		return err
+	}
 
 	// TODO(tbg): make the other goodies in `./cockroach start` reusable, such as
 	// logging to files, periodic memory output, heap and goroutine dumps, debug

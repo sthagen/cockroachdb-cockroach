@@ -13,6 +13,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -20,10 +21,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const mirrorFlag = "mirror"
+const forceFlag = "force"
+
 // makeGenerateCmd constructs the subcommand used to generate the specified
 // artifacts.
 func makeGenerateCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
-	return &cobra.Command{
+	lintCmd := &cobra.Command{
 		Use:     "generate [target..]",
 		Aliases: []string{"gen"},
 		Short:   `Generate the specified files`,
@@ -40,6 +44,9 @@ func makeGenerateCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.
 		// (especially considering we've SilenceErrors-ed things away).
 		RunE: runE,
 	}
+	lintCmd.Flags().Bool(mirrorFlag, false, "mirror new dependencies to cloud storage")
+	lintCmd.Flags().Bool(forceFlag, false, "force regeneration even if relevant files are unchanged from upstream")
+	return lintCmd
 }
 
 func (d *dev) generate(cmd *cobra.Command, targets []string) error {
@@ -77,11 +84,21 @@ func (d *dev) generate(cmd *cobra.Command, targets []string) error {
 
 func (d *dev) generateBazel(cmd *cobra.Command) error {
 	ctx := cmd.Context()
+	mirror := mustGetFlagBool(cmd, mirrorFlag)
+	force := mustGetFlagBool(cmd, forceFlag)
 	workspace, err := d.getWorkspace(ctx)
 	if err != nil {
 		return err
 	}
-	return d.exec.CommandContextInheritingStdStreams(ctx, filepath.Join(workspace, "build", "bazelutil", "bazel-generate.sh"))
+	executable := filepath.Join(workspace, "build", "bazelutil", "bazel-generate.sh")
+	env := os.Environ()
+	if mirror {
+		env = append(env, "COCKROACH_BAZEL_CAN_MIRROR=1")
+	}
+	if force {
+		env = append(env, "COCKROACH_BAZEL_FORCE_GENERATE=1")
+	}
+	return d.exec.CommandContextWithEnv(ctx, env, executable)
 }
 
 func (d *dev) generateDocs(cmd *cobra.Command) error {

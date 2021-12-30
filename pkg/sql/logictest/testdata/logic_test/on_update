@@ -62,6 +62,17 @@ SELECT p, j, k FROM test_upsert ORDER BY p
 pk1  val2  regress
 pk2  val3  def
 
+# If there are no explicit target columns, UPSERT sets all columns to their
+# DEFAULT value. Therefore, the ON UPDATE value is not used. See #73984.
+statement ok
+UPSERT INTO test_upsert VALUES ('pk1', 'val20'), ('pk2', 'val30')
+
+query TTT
+SELECT p, j, k FROM test_upsert ORDER BY p
+----
+pk1  val20  def
+pk2  val30  def
+
 # ON UPDATE usage by running ALTER TABLE
 subtest OnUpdateAlterTable
 
@@ -205,8 +216,8 @@ test_show_fk  CREATE TABLE public.test_show_fk (
               p STRING NOT NULL,
               j STRING NULL,
               k STRING NULL ON UPDATE 'regress':::STRING,
-              CONSTRAINT "primary" PRIMARY KEY (p ASC),
-              CONSTRAINT fk_j_ref_test_fk_base FOREIGN KEY (j) REFERENCES public.test_fk_base(j) ON UPDATE CASCADE,
+              CONSTRAINT test_show_fk_pkey PRIMARY KEY (p ASC),
+              CONSTRAINT test_show_fk_j_fkey FOREIGN KEY (j) REFERENCES public.test_fk_base(j) ON UPDATE CASCADE,
               FAMILY fam_0_p (p),
               FAMILY fam_1_j (j),
               FAMILY fam_2_k (k)
@@ -278,6 +289,39 @@ SELECT p, k FROM test_table_seq ORDER BY p
 pk1  3
 pk2  4
 pk3  2
+
+
+# Regression test for issue #72116.
+statement ok
+CREATE SEQUENCE seq_72116;
+CREATE TABLE table_72116 (a INT);
+ALTER TABLE table_72116 ADD COLUMN b INT DEFAULT nextval('seq_72116') ON UPDATE NULL
+
+# Make sure that our DEFAULT has a dependency on seq_72116
+statement error pq: cannot drop sequence seq_72116 because other objects depend on it
+DROP SEQUENCE seq_72116
+
+statement ok
+DROP TABLE table_72116;
+CREATE TABLE table_72116 (a INT DEFAULT nextval('seq_72116') ON UPDATE NULL)
+
+statement error pq: cannot drop sequence seq_72116 because other objects depend on it
+DROP SEQUENCE seq_72116
+
+statement ok
+DROP TABLE table_72116;
+CREATE TABLE table_72116 (a INT);
+ALTER TABLE table_72116 ADD COLUMN b INT DEFAULT (1) ON UPDATE nextval('seq_72116')
+
+statement error pq: cannot drop sequence seq_72116 because other objects depend on it
+DROP SEQUENCE seq_72116
+
+statement ok
+DROP TABLE table_72116;
+CREATE TABLE table_72116 (a INT DEFAULT (1) ON UPDATE nextval('seq_72116'))
+
+statement error pq: cannot drop sequence seq_72116 because other objects depend on it
+DROP SEQUENCE seq_72116
 
 subtest EnumDependencies
 

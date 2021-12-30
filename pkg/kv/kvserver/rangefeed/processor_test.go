@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -145,7 +144,7 @@ func newTestProcessorWithTxnPusher(
 	}
 
 	p := NewProcessor(Config{
-		AmbientContext:       log.AmbientContext{Tracer: tracing.NewTracer()},
+		AmbientContext:       log.MakeTestingAmbientCtxWithNewTracer(),
 		Clock:                hlc.NewClock(hlc.UnixNano, time.Nanosecond),
 		Span:                 roachpb.RSpan{Key: roachpb.RKey("a"), EndKey: roachpb.RKey("z")},
 		TxnPusher:            txnPusher,
@@ -154,15 +153,15 @@ func newTestProcessorWithTxnPusher(
 		EventChanCap:         testProcessorEventCCap,
 		CheckStreamsInterval: 10 * time.Millisecond,
 	})
-	p.Start(stopper, makeIteratorConstructor(rtsIter))
+	p.Start(stopper, makeIntentScannerConstructor(rtsIter))
 	return p, stopper
 }
 
-func makeIteratorConstructor(rtsIter storage.SimpleMVCCIterator) IteratorConstructor {
+func makeIntentScannerConstructor(rtsIter storage.SimpleMVCCIterator) IntentScannerConstructor {
 	if rtsIter == nil {
 		return nil
 	}
-	return func() storage.SimpleMVCCIterator { return rtsIter }
+	return func() IntentScanner { return NewLegacyIntentScanner(rtsIter) }
 }
 
 func newTestProcessor(rtsIter storage.SimpleMVCCIterator) (*Processor, *stop.Stopper) {

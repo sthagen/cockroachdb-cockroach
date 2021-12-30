@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -182,13 +183,13 @@ func IsPermanentSchemaChangeError(err error) bool {
 	if errors.IsAny(err,
 		context.Canceled,
 		context.DeadlineExceeded,
-		errExistingSchemaChangeLease,
-		errExpiredSchemaChangeLease,
-		errNotHitGCTTLDeadline,
-		errSchemaChangeDuringDrain,
 		errSchemaChangeNotFirstInLine,
 		errTableVersionMismatchSentinel,
 	) {
+		return false
+	}
+
+	if flowinfra.IsFlowRetryableError(err) {
 		return false
 	}
 
@@ -205,13 +206,7 @@ func IsPermanentSchemaChangeError(err error) bool {
 	return true
 }
 
-var (
-	errExistingSchemaChangeLease  = errors.Newf("an outstanding schema change lease exists")
-	errExpiredSchemaChangeLease   = errors.Newf("the schema change lease has expired")
-	errSchemaChangeNotFirstInLine = errors.Newf("schema change not first in line")
-	errNotHitGCTTLDeadline        = errors.Newf("not hit gc ttl deadline")
-	errSchemaChangeDuringDrain    = errors.Newf("a schema change ran during the drain phase, re-increment")
-)
+var errSchemaChangeNotFirstInLine = errors.Newf("schema change not first in line")
 
 type errTableVersionMismatch struct {
 	version  descpb.DescriptorVersion
@@ -296,7 +291,7 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 		defer localPlanner.curPlan.close(ctx)
 
 		res := roachpb.BulkOpSummary{}
-		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+		rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
 			// TODO(adityamaru): Use the BulkOpSummary for either telemetry or to
 			// return to user.
 			var counts roachpb.BulkOpSummary
@@ -497,7 +492,8 @@ func startGCJob(
 		return err
 	}
 	log.Infof(ctx, "starting GC job %d", jobID)
-	return jobRegistry.NotifyToAdoptJobs(ctx)
+	jobRegistry.NotifyToAdoptJobs(ctx)
+	return nil
 }
 
 func (sc *SchemaChanger) execLogTags() *logtags.Buffer {
@@ -547,7 +543,7 @@ func (sc *SchemaChanger) getTargetDescriptor(ctx context.Context) (catalog.Descr
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) (err error) {
 		flags := tree.CommonLookupFlags{
-			AvoidCached:    true,
+			AvoidLeased:    true,
 			Required:       true,
 			IncludeOffline: true,
 			IncludeDropped: true,
@@ -799,7 +795,7 @@ func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
 	return sc.txn(ctx, func(ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
 		flags := tree.ObjectLookupFlagsWithRequired()
-		flags.AvoidCached = true
+		flags.AvoidLeased = true
 		desc, err := descriptors.GetImmutableTableByID(ctx, txn, sc.descID, flags)
 		if err != nil {
 			return err
@@ -890,7 +886,8 @@ func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) er
 		return err
 	}
 	log.Infof(ctx, "starting GC job %d", gcJobID)
-	return sc.jobRegistry.NotifyToAdoptJobs(ctx)
+	sc.jobRegistry.NotifyToAdoptJobs(ctx)
+	return nil
 }
 
 // RunStateMachineBeforeBackfill moves the state machine forward
@@ -1085,25 +1082,24 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 			}
 			isRollback = m.IsRollback()
 			if idx := m.AsIndex(); m.Dropped() && idx != nil {
-				if canClearRangeForDrop(idx) {
-					// how we keep track of dropped index names (for, e.g., zone config
-					// lookups), even though in the absence of a GC job there's nothing to
-					// clean them up.
-					scTable.GCMutations = append(
-						scTable.GCMutations,
-						descpb.TableDescriptor_GCDescriptorMutation{
-							IndexID: idx.GetID(),
-						})
+				// how we keep track of dropped index names (for, e.g., zone config
+				// lookups), even though in the absence of a GC job there's nothing to
+				// clean them up.
+				scTable.GCMutations = append(
+					scTable.GCMutations,
+					descpb.TableDescriptor_GCDescriptorMutation{
+						IndexID: idx.GetID(),
+					})
 
-					description := sc.job.Payload().Description
-					if isRollback {
-						description = "ROLLBACK of " + description
-					}
-
-					if err := sc.createIndexGCJob(ctx, idx.GetID(), txn, description); err != nil {
-						return err
-					}
+				description := sc.job.Payload().Description
+				if isRollback {
+					description = "ROLLBACK of " + description
 				}
+
+				if err := sc.createIndexGCJob(ctx, idx.GetID(), txn, description); err != nil {
+					return err
+				}
+
 			}
 			if constraint := m.AsConstraint(); constraint != nil && constraint.Adding() {
 				if constraint.IsForeignKey() && constraint.ForeignKey().Validity == descpb.ConstraintValidity_Unvalidated {
@@ -1200,10 +1196,12 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 							}
 							col.ColumnDesc().DefaultExpr = lcSwap.NewRegionalByRowColumnDefaultExpr
 						}
+
 					} else {
 						// DROP is hit on cancellation, in which case we must roll back.
 						localityConfigToSwapTo = lcSwap.OldLocalityConfig
 					}
+
 					if err := setNewLocalityConfig(
 						ctx, scTable, txn, b, localityConfigToSwapTo, kvTrace, descsCol); err != nil {
 						return err
@@ -1222,48 +1220,6 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 					}
 				}
 
-				// If any old index had an interleaved parent, remove the
-				// backreference from the parent.
-				// N.B. This logic needs to be kept up to date with the
-				// corresponding piece in runSchemaChangesInTxn.
-				err := pkSwap.ForEachOldIndexIDs(func(idxID descpb.IndexID) error {
-					oldIndex, err := scTable.FindIndexWithID(idxID)
-					if err != nil {
-						return err
-					}
-					if oldIndex.NumInterleaveAncestors() != 0 {
-						ancestorInfo := oldIndex.GetInterleaveAncestor(oldIndex.NumInterleaveAncestors() - 1)
-						ancestor, err := descsCol.GetMutableTableVersionByID(ctx, ancestorInfo.TableID, txn)
-						if err != nil {
-							return err
-						}
-						ancestorIdxI, err := ancestor.FindIndexWithID(ancestorInfo.IndexID)
-						if err != nil {
-							return err
-						}
-						ancestorIdx := ancestorIdxI.IndexDesc()
-						foundAncestor := false
-						for k, ref := range ancestorIdx.InterleavedBy {
-							if ref.Table == scTable.ID && ref.Index == oldIndex.GetID() {
-								if foundAncestor {
-									return errors.AssertionFailedf(
-										"ancestor entry in %s for %s@%s found more than once",
-										ancestor.Name, scTable.Name, oldIndex.GetName())
-								}
-								ancestorIdx.InterleavedBy = append(
-									ancestorIdx.InterleavedBy[:k], ancestorIdx.InterleavedBy[k+1:]...)
-								foundAncestor = true
-								if err := descsCol.WriteDescToBatch(ctx, kvTrace, ancestor, b); err != nil {
-									return err
-								}
-							}
-						}
-					}
-					return nil
-				})
-				if err != nil {
-					return err
-				}
 				// If we performed MakeMutationComplete on a PrimaryKeySwap mutation, then we need to start
 				// a job for the index deletion mutations that the primary key swap mutation added, if any.
 				if err := sc.queueCleanupJobs(ctx, scTable, txn); err != nil {
@@ -1377,9 +1333,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 		return err
 	}
 	// Notify the job registry to start jobs, in case we started any.
-	if err := sc.jobRegistry.NotifyToAdoptJobs(ctx); err != nil {
-		return err
-	}
+	sc.jobRegistry.NotifyToAdoptJobs(ctx)
 
 	// If any operations was skipped because a mutation was made
 	// redundant due to a column getting dropped later on then we should
@@ -1995,17 +1949,18 @@ func createSchemaChangeEvalCtx(
 ) extendedEvalContext {
 
 	sd := NewFakeSessionData(execCfg.SV())
+	ie := ieFactory(ctx, sd)
 
 	evalCtx := extendedEvalContext{
 		// Make a session tracing object on-the-fly. This is OK
 		// because it sets "enabled: false" and thus none of the
 		// other fields are used.
-		Tracing: &SessionTracing{},
-		ExecCfg: execCfg,
-		Descs:   descriptors,
+		Tracing:                      &SessionTracing{},
+		ExecCfg:                      execCfg,
+		Descs:                        descriptors,
+		SchemaChangeInternalExecutor: ie.(*InternalExecutor),
 		EvalContext: tree.EvalContext{
 			SessionDataStack: sessiondata.NewStack(sd),
-			InternalExecutor: ieFactory(ctx, sd),
 			// TODO(andrei): This is wrong (just like on the main code path on
 			// setupFlow). Each processor should override Ctx with its own context.
 			Context:            ctx,

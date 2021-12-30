@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -67,6 +65,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/kr/pretty"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -89,28 +88,6 @@ func getStatusJSONProtoWithAdminOption(
 	ts serverutils.TestServerInterface, path string, response protoutil.Message, isAdmin bool,
 ) error {
 	return serverutils.GetJSONProtoWithAdminOption(ts, statusPrefix+path, response, isAdmin)
-}
-
-// TestStatusLocalStacks verifies that goroutine stack traces are available
-// via the /_status/stacks/local endpoint.
-func TestStatusLocalStacks(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
-
-	// Verify match with at least two goroutine stacks.
-	re := regexp.MustCompile("(?s)goroutine [0-9]+.*goroutine [0-9]+.*")
-
-	var stacks serverpb.JSONResponse
-	for _, nodeID := range []string{"local", "1"} {
-		if err := getStatusJSONProto(s, "stacks/"+nodeID, &stacks); err != nil {
-			t.Fatal(err)
-		}
-		if !re.Match(stacks.Data) {
-			t.Errorf("expected %s to match %s", stacks.Data, re)
-		}
-	}
 }
 
 // TestStatusJson verifies that status endpoints return expected Json results.
@@ -371,14 +348,16 @@ func startServer(t *testing.T) *TestServer {
 	return ts
 }
 
-func newRPCTestContext(ts *TestServer, cfg *base.Config) *rpc.Context {
-	rpcContext := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: ts.Tracer()},
-		Config:     cfg,
-		Clock:      ts.Clock(),
-		Stopper:    ts.Stopper(),
-		Settings:   ts.ClusterSettings(),
+func newRPCTestContext(ctx context.Context, ts *TestServer, cfg *base.Config) *rpc.Context {
+	var c base.NodeIDContainer
+	ctx = logtags.AddTag(ctx, "n", &c)
+	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
+		TenantID: roachpb.SystemTenantID,
+		NodeID:   &c,
+		Config:   cfg,
+		Clock:    ts.Clock(),
+		Stopper:  ts.Stopper(),
+		Settings: ts.ClusterSettings(),
 	})
 	// Ensure that the RPC client context validates the server cluster ID.
 	// This ensures that a test where the server is restarted will not let
@@ -406,7 +385,7 @@ func TestStatusGetFiles(t *testing.T) {
 	defer ts.Stopper().Stop(context.Background())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
-	rpcContext := newRPCTestContext(ts, rootConfig)
+	rpcContext := newRPCTestContext(context.Background(), ts, rootConfig)
 
 	url := ts.ServingRPCAddr()
 	nodeID := ts.NodeID()
@@ -1300,7 +1279,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(ctx)
-	rpcContext := newRPCTestContext(ts, ts.RPCContext().Config)
+	rpcContext := newRPCTestContext(ctx, ts, ts.RPCContext().Config)
 	request := serverpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
@@ -1335,7 +1314,7 @@ func TestNodesGRPCResponse(t *testing.T) {
 	defer ts.Stopper().Stop(context.Background())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
-	rpcContext := newRPCTestContext(ts, rootConfig)
+	rpcContext := newRPCTestContext(context.Background(), ts, rootConfig)
 	var request serverpb.NodesRequest
 
 	url := ts.ServingRPCAddr()
@@ -1865,7 +1844,7 @@ func TestStatusAPIStatements(t *testing.T) {
 	}
 
 	// Grant VIEWACTIVITY.
-	thirdServerSQL.Exec(t, "ALTER USER $1 VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized())
+	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
 
 	testPath := func(path string, expectedStmts []string) {
 		// Hit query endpoint.
@@ -1968,7 +1947,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 	}
 
 	// Grant VIEWACTIVITY.
-	thirdServerSQL.Exec(t, "ALTER USER $1 VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized())
+	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
 
 	testPath := func(path string, expectedStmts []string) {
 		// Hit query endpoint.
@@ -2087,7 +2066,7 @@ func TestListSessionsSecurity(t *testing.T) {
 
 	// gRPC requests behave as root and thus are always allowed.
 	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
-	rpcContext := newRPCTestContext(ts, rootConfig)
+	rpcContext := newRPCTestContext(ctx, ts, rootConfig)
 	url := ts.ServingRPCAddr()
 	nodeID := ts.NodeID()
 	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
@@ -2160,7 +2139,7 @@ func TestListActivitySecurity(t *testing.T) {
 			// Note that for this query to work, it is crucial that
 			// getStatusJSONProtoWithAdminOption below is called at least once,
 			// on the previous test case, so that the user exists.
-			_, err := db.Exec("ALTER USER $1 VIEWACTIVITY", myUser)
+			_, err := db.Exec(fmt.Sprintf("ALTER USER %s VIEWACTIVITY", myUser))
 			require.NoError(t, err)
 		}
 		err := getStatusJSONProtoWithAdminOption(s, tc.endpoint, tc.response, tc.requestWithAdmin)
@@ -2182,14 +2161,14 @@ func TestListActivitySecurity(t *testing.T) {
 			}
 		}
 		if tc.requestWithViewActivityGranted {
-			_, err := db.Exec("ALTER USER $1 NOVIEWACTIVITY", myUser)
+			_, err := db.Exec(fmt.Sprintf("ALTER USER %s NOVIEWACTIVITY", myUser))
 			require.NoError(t, err)
 		}
 	}
 
 	// gRPC requests behave as root and thus are always allowed.
 	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
-	rpcContext := newRPCTestContext(ts, rootConfig)
+	rpcContext := newRPCTestContext(ctx, ts, rootConfig)
 	url := ts.ServingRPCAddr()
 	nodeID := ts.NodeID()
 	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
@@ -2466,6 +2445,50 @@ func TestStatementDiagnosticsCompleted(t *testing.T) {
 	}
 }
 
+func TestStatementDiagnosticsDoesNotReturnExpiredRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	db := sqlutils.MakeSQLRunner(sqlDB)
+
+	statementFingerprint := "INSERT INTO test VALUES (_)"
+	expiresAfter := 5 * time.Millisecond
+
+	// Create statement diagnostics request with defined expiry time.
+	req := &serverpb.CreateStatementDiagnosticsReportRequest{
+		StatementFingerprint: statementFingerprint,
+		MinExecutionLatency:  500 * time.Millisecond,
+		ExpiresAfter:         expiresAfter,
+	}
+	var resp serverpb.CreateStatementDiagnosticsReportResponse
+	if err := postStatusJSONProto(s, "stmtdiagreports", req, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for request to expire.
+	time.Sleep(expiresAfter)
+
+	// Check that created statement diagnostics report is incomplete.
+	report := db.QueryStr(t, `
+SELECT completed
+FROM system.statement_diagnostics_requests
+WHERE statement_fingerprint = $1`, statementFingerprint)
+
+	require.Equal(t, report[0][0], "false")
+
+	// Check that expired report is not returned in API response.
+	var respGet serverpb.StatementDiagnosticsReportsResponse
+	if err := getStatusJSONProto(s, "stmtdiagreports", &respGet); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, report := range respGet.Reports {
+		require.NotEqual(t, report.StatementFingerprint, statementFingerprint)
+	}
+}
+
 func TestJobStatusResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -2473,7 +2496,7 @@ func TestJobStatusResponse(t *testing.T) {
 	defer ts.Stopper().Stop(context.Background())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
-	rpcContext := newRPCTestContext(ts, rootConfig)
+	rpcContext := newRPCTestContext(context.Background(), ts, rootConfig)
 
 	url := ts.ServingRPCAddr()
 	nodeID := ts.NodeID()
@@ -2616,59 +2639,22 @@ func TestRegionsResponseFromNodesResponse(t *testing.T) {
 	}
 }
 
-func TestLicenseExpiryMetricNoLicense(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ts := startServer(t)
-	defer ts.Stopper().Stop(context.Background())
-
-	for _, tc := range []struct {
-		name       string
-		expected   string
-		expiryFunc func(context.Context, *cluster.Settings, time.Time) (time.Duration, error)
-	}{
-		{"No License", "seconds_until_enterprise_license_expiry 0\n", nil},
-		{"Valid 1 second License", "seconds_until_enterprise_license_expiry 1\n", func(
-			_ context.Context, _ *cluster.Settings, _ time.Time,
-		) (time.Duration, error) {
-			return time.Second, nil
-		}},
-		{"Valid Long License", "seconds_until_enterprise_license_expiry 1603926294\n", func(
-			_ context.Context, _ *cluster.Settings, _ time.Time,
-		) (time.Duration, error) {
-			return timeutil.Unix(1603926294, 0).Sub(timeutil.Unix(0, 0)), nil
-		}},
-		{"Valid Long Past License", "seconds_until_enterprise_license_expiry -1603926294\n", func(
-			_ context.Context, _ *cluster.Settings, _ time.Time,
-		) (time.Duration, error) {
-			return timeutil.Unix(0, 0).Sub(timeutil.Unix(1603926294, 0)), nil
-		}},
-		{"Error License", "", func(
-			_ context.Context, _ *cluster.Settings, _ time.Time,
-		) (time.Duration, error) {
-			return 0, errors.New("bad license")
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			vh := varsHandler{ts.status.metricSource, ts.status.st}
-			if tc.expiryFunc != nil {
-				base.TimeToEnterpriseLicenseExpiry = tc.expiryFunc
-			}
-
-			buf := new(bytes.Buffer)
-			vh.appendLicenseExpiryMetric(context.Background(), buf)
-
-			require.Equal(t, tc.expected, buf.String())
-		})
-	}
-}
-
 func TestStatusServer_nodeStatusToResp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	var nodeStatus = &statuspb.NodeStatus{
+		StoreStatuses: []statuspb.StoreStatus{
+			{Desc: roachpb.StoreDescriptor{
+				Properties: roachpb.StoreProperties{
+					Encrypted: true,
+					FileStoreProperties: &roachpb.FileStoreProperties{
+						Path:   "/secret",
+						FsType: "ext4",
+					},
+				},
+			}},
+		},
 		Desc: roachpb.NodeDescriptor{
 			Address: util.UnresolvedAddr{
 				NetworkField: "network",
@@ -2696,6 +2682,9 @@ func TestStatusServer_nodeStatusToResp(t *testing.T) {
 	require.Empty(t, resp.Desc.Attrs.Attrs)
 	require.Empty(t, resp.Desc.LocalityAddress)
 	require.Empty(t, resp.Desc.SQLAddress)
+	require.True(t, resp.StoreStatuses[0].Desc.Properties.Encrypted)
+	require.NotEmpty(t, resp.StoreStatuses[0].Desc.Properties.FileStoreProperties.FsType)
+	require.Empty(t, resp.StoreStatuses[0].Desc.Properties.FileStoreProperties.Path)
 
 	// Now fetch all the node statuses as admin.
 	resp = nodeStatusToResp(nodeStatus, true)
@@ -2705,6 +2694,9 @@ func TestStatusServer_nodeStatusToResp(t *testing.T) {
 	require.NotEmpty(t, resp.Desc.Attrs.Attrs)
 	require.NotEmpty(t, resp.Desc.LocalityAddress)
 	require.NotEmpty(t, resp.Desc.SQLAddress)
+	require.True(t, resp.StoreStatuses[0].Desc.Properties.Encrypted)
+	require.NotEmpty(t, resp.StoreStatuses[0].Desc.Properties.FileStoreProperties.FsType)
+	require.NotEmpty(t, resp.StoreStatuses[0].Desc.Properties.FileStoreProperties.Path)
 }
 
 func TestStatusAPIContentionEvents(t *testing.T) {

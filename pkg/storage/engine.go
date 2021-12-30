@@ -13,7 +13,6 @@ package storage
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"time"
 
@@ -153,12 +152,6 @@ type MVCCIterator interface {
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
 	ValueProto(msg protoutil.Message) error
-	// When Key() is positioned on an intent, returns true iff this intent
-	// (represented by MVCCMetadata) is a separated lock/intent. This is a
-	// low-level method that should not be called from outside the storage
-	// package. It is part of the exported interface because there are structs
-	// outside the package that wrap and implement Iterator.
-	IsCurIntentSeparated() bool
 	// ComputeStats scans the underlying engine from start to end keys and
 	// computes stats counters based on the values. This method is used after a
 	// range is split to recompute stats for each subrange. The start key is
@@ -176,10 +169,6 @@ type MVCCIterator interface {
 	// package-level MVCCFindSplitKey instead. For correct operation, the caller
 	// must set the upper bound on the iterator before calling this method.
 	FindSplitKey(start, end, minSplitKey roachpb.Key, targetSize int64) (MVCCKey, error)
-	// CheckForKeyCollisions checks whether any keys collide between the iterator
-	// and the encoded SST data specified, within the provided key range. Returns
-	// stats on skipped KVs, or an error if a collision is found.
-	CheckForKeyCollisions(sstData []byte, start, end roachpb.Key) (enginepb.MVCCStats, error)
 	// SetUpperBound installs a new upper bound for this iterator. The caller
 	// can modify the parameter after this function returns. This must not be a
 	// nil key. When Reader.ConsistentIterators is true, prefer creating a new
@@ -382,13 +371,19 @@ type ExportOptions struct {
 	// to an SST that exceeds maxSize, an error will be returned. This parameter
 	// exists to prevent creating SSTs which are too large to be used.
 	MaxSize uint64
+	// MaxIntents specifies the number of intents to collect and return in a
+	// WriteIntentError. The caller will likely resolve the returned intents and
+	// retry the call, which would be quadratic, so this significantly reduces the
+	// overall number of scans. 0 disables batching and returns the first intent,
+	// pass math.MaxUint64 to collect all.
+	MaxIntents uint64
 	// If StopMidKey is false, once function reaches targetSize it would continue
 	// adding all versions until it reaches next key or end of range. If true, it
 	// would stop immediately when targetSize is reached and return the next versions
 	// timestamp in resumeTs so that subsequent operation can pass it to firstKeyTs.
 	StopMidKey bool
 	// ResourceLimiter limits how long iterator could run until it exhausts allocated
-	// resources. Expot queries limiter in its iteration loop to break out once
+	// resources. Export queries limiter in its iteration loop to break out once
 	// resources are exhausted.
 	ResourceLimiter ResourceLimiter
 	// If UseTBI is true, the backing MVCCIncrementalIterator will initialize a
@@ -493,35 +488,6 @@ type Reader interface {
 	PinEngineStateForIterators() error
 }
 
-// PrecedingIntentState is information needed when writing or clearing an
-// intent for a transaction. It specifies the state of the intent that was
-// there before this write (for the specified transaction).
-type PrecedingIntentState int
-
-const (
-	// ExistingIntentInterleaved specifies that there is an existing intent and
-	// that it is interleaved.
-	ExistingIntentInterleaved PrecedingIntentState = iota
-	// ExistingIntentSeparated specifies that there is an existing intent and
-	// that it is separated (in the lock table key space).
-	ExistingIntentSeparated
-	// NoExistingIntent specifies that there isn't an existing intent.
-	NoExistingIntent
-)
-
-func (is PrecedingIntentState) String() string {
-	switch is {
-	case ExistingIntentInterleaved:
-		return "ExistingIntentInterleaved"
-	case ExistingIntentSeparated:
-		return "ExistingIntentSeparated"
-	case NoExistingIntent:
-		return "NoExistingIntent"
-	default:
-		return fmt.Sprintf("PrecedingIntentState(%d)", is)
-	}
-}
-
 // Writer is the write interface to an engine's data.
 type Writer interface {
 	// ApplyBatchRepr atomically applies a set of batched updates. Created by
@@ -555,7 +521,6 @@ type Writer interface {
 	// txnDidNotUpdateMeta allows for performance optimization when set to true,
 	// and has semantics defined in MVCCMetadata.TxnDidNotUpdateMeta (it can
 	// be conservatively set to false).
-	// REQUIRES: state is ExistingIntentInterleaved or ExistingIntentSeparated.
 	//
 	// It is safe to modify the contents of the arguments after it returns.
 	//
@@ -564,9 +529,7 @@ type Writer interface {
 	// that does a <single-clear, put> pair. If there isn't a performance
 	// decrease, we can stop tracking txnDidNotUpdateMeta and still optimize
 	// ClearIntent by always doing single-clear.
-	ClearIntent(
-		key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-	) (separatedIntentCountDelta int, _ error)
+	ClearIntent(key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID) error
 	// ClearEngineKey removes the item from the db with the given EngineKey.
 	// Note that clear actually removes entries from the storage engine. This is
 	// a general-purpose and low-level method that should be used sparingly,
@@ -659,9 +622,7 @@ type Writer interface {
 	// conservatively set to false).
 	//
 	// It is safe to modify the contents of the arguments after Put returns.
-	PutIntent(
-		ctx context.Context, key roachpb.Key, value []byte, state PrecedingIntentState,
-		txnDidNotUpdateMeta bool, txnUUID uuid.UUID) (separatedIntentCountDelta int, _ error)
+	PutIntent(ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID) error
 	// PutEngineKey sets the given key to the value provided. This is a
 	// general-purpose and low-level method that should be used sparingly,
 	// only when the other Put* methods are not applicable.
@@ -693,31 +654,6 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after it returns.
 	SingleClearEngineKey(key EngineKey) error
-
-	// OverrideTxnDidNotUpdateMetaToFalse is a temporary method that will be removed
-	// for 22.1.
-	//
-	// See #69891 for details on the bug related to usage of SingleDelete in
-	// separated intent resolution. The following is needed for correctly
-	// migrating from 21.1 to 21.2.
-	//
-	// We have fixed the intent resolution code path in 21.2-beta to use
-	// SingleDelete more conservatively. The 21.2-GA will also likely include
-	// Pebble changes to make the old buggy usage of SingleDelete correct.
-	// However, there is a problem if someone upgrades from 21.1 to
-	// 21.2-beta/21.2-GA:
-	// 21.1 nodes will not write separated intents while they are the
-	// leaseholder for a range. However they can become the leaseholder for a
-	// range after a separated intent was written (in a mixed version cluster).
-	// Hence they can resolve separated intents. The logic in 21.1 for using
-	// SingleDelete when resolving intents is similarly buggy, and the Pebble
-	// code included in 21.1 will not make this buggy usage correct. The
-	// solution is for 21.2 nodes to never set txnDidNotUpdateMeta=true when
-	// writing separated intents, until the cluster version is at the version
-	// when the buggy code was fixed in 21.2. So 21.1 code will never use
-	// SingleDelete when resolving these separated intents (since the only
-	// separated intents being written are by 21.2 nodes).
-	OverrideTxnDidNotUpdateMetaToFalse(ctx context.Context) bool
 }
 
 // ReadWriter is the read/write interface to an engine's data.
@@ -733,6 +669,8 @@ type Engine interface {
 	Attrs() roachpb.Attributes
 	// Capacity returns capacity details for the engine's available storage.
 	Capacity() (roachpb.StoreCapacity, error)
+	// Properties returns the low-level properties for the engine's underlying storage.
+	Properties() roachpb.StoreProperties
 	// Compact forces compaction over the entire database.
 	Compact() error
 	// Flush causes the engine to write all in-memory data to disk
@@ -822,11 +760,6 @@ type Engine interface {
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used.
 	CreateCheckpoint(dir string) error
-
-	// IsSeparatedIntentsEnabledForTesting is a test only method used in tests
-	// that know that this enabled setting is not changing and need the value to
-	// adjust their expectations.
-	IsSeparatedIntentsEnabledForTesting(ctx context.Context) bool
 
 	// SetMinVersion is used to signal to the engine the current minimum
 	// version that it must maintain compatibility with.
@@ -943,25 +876,6 @@ type EncryptionRegistries struct {
 	KeyRegistry []byte
 }
 
-// PutProto sets the given key to the protobuf-serialized byte string
-// of msg. Returns the length in bytes of key and the value.
-//
-// Deprecated: use MVCCPutProto instead.
-func PutProto(
-	writer Writer, key roachpb.Key, msg protoutil.Message,
-) (keyBytes, valBytes int64, err error) {
-	bytes, err := protoutil.Marshal(msg)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if err := writer.PutUnversioned(key, bytes); err != nil {
-		return 0, 0, err
-	}
-
-	return int64(MVCCKey{Key: key}.EncodedSize()), int64(len(bytes)), nil
-}
-
 // Scan returns up to max key/value objects starting from start (inclusive)
 // and ending at end (non-inclusive). Specify max=0 for unbounded scans. Since
 // this code may use an intentInterleavingIter, the caller should not attempt
@@ -979,16 +893,15 @@ func Scan(reader Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, err
 	return kvs, err
 }
 
-// ScanSeparatedIntents scans intents using only the separated intents lock
-// table. It does not take interleaved intents into account at all.
-//
-// TODO(erikgrinaker): When we are fully migrated to separated intents, this
-// should be renamed ScanIntents.
-func ScanSeparatedIntents(
-	reader Reader, start, end roachpb.Key, max int64, targetBytes int64,
+// ScanIntents scans intents using only the separated intents lock table. It
+// does not take interleaved intents into account at all.
+func ScanIntents(
+	ctx context.Context, reader Reader, start, end roachpb.Key, maxIntents int64, targetBytes int64,
 ) ([]roachpb.Intent, error) {
+	intents := []roachpb.Intent{}
+
 	if bytes.Compare(start, end) >= 0 {
-		return []roachpb.Intent{}, nil
+		return intents, nil
 	}
 
 	ltStart, _ := keys.LockTableSingleKey(start, nil)
@@ -996,14 +909,18 @@ func ScanSeparatedIntents(
 	iter := reader.NewEngineIterator(IterOptions{LowerBound: ltStart, UpperBound: ltEnd})
 	defer iter.Close()
 
-	var (
-		intents     = []roachpb.Intent{}
-		intentBytes int64
-		meta        enginepb.MVCCMetadata
-	)
-	valid, err := iter.SeekEngineKeyGE(EngineKey{Key: ltStart})
-	for ; valid; valid, err = iter.NextEngineKey() {
-		if max != 0 && int64(len(intents)) >= max {
+	var meta enginepb.MVCCMetadata
+	var intentBytes int64
+	var ok bool
+	var err error
+	for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: ltStart}); ok; ok, err = iter.NextEngineKey() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if maxIntents != 0 && int64(len(intents)) >= maxIntents {
+			break
+		}
+		if targetBytes != 0 && intentBytes >= targetBytes {
 			break
 		}
 		key, err := iter.EngineKey()
@@ -1019,11 +936,11 @@ func ScanSeparatedIntents(
 		}
 		intents = append(intents, roachpb.MakeIntent(meta.Txn, lockedKey))
 		intentBytes += int64(len(lockedKey)) + int64(len(iter.Value()))
-		if (max > 0 && int64(len(intents)) >= max) || (targetBytes > 0 && intentBytes >= targetBytes) {
-			break
-		}
 	}
-	return intents, err
+	if err != nil {
+		return nil, err
+	}
+	return intents, nil
 }
 
 // WriteSyncNoop carries out a synchronous no-op write to the engine.
@@ -1096,12 +1013,14 @@ func ClearRangeWithHeuristic(reader Reader, writer Writer, start, end roachpb.Ke
 }
 
 var ingestDelayL0Threshold = settings.RegisterIntSetting(
+	settings.TenantWritable,
 	"rocksdb.ingest_backpressure.l0_file_count_threshold",
 	"number of L0 files after which to backpressure SST ingestions",
 	20,
 )
 
 var ingestDelayTime = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"rocksdb.ingest_backpressure.max_delay",
 	"maximum amount of time to backpressure a single SST ingestion",
 	time.Second*5,
@@ -1111,7 +1030,7 @@ var ingestDelayTime = settings.RegisterDurationSetting(
 // number of files in it or if PendingCompactionBytesEstimate is elevated. This
 // it is intended to be called before ingesting a new SST, since we'd rather
 // backpressure the bulk operation adding SSTs than slow down the whole RocksDB
-// instance and impact all forground traffic by adding too many files to it.
+// instance and impact all foreground traffic by adding too many files to it.
 // After the number of L0 files exceeds the configured limit, it gradually
 // begins delaying more for each additional file in L0 over the limit until
 // hitting its configured (via settings) maximum delay. If the pending

@@ -11,9 +11,12 @@
 package spanset
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -173,11 +176,6 @@ func (i *MVCCIterator) UnsafeValue() []byte {
 	return i.i.UnsafeValue()
 }
 
-// IsCurIntentSeparated implements the MVCCIterator interface.
-func (i *MVCCIterator) IsCurIntentSeparated() bool {
-	return i.i.IsCurIntentSeparated()
-}
-
 // ComputeStats is part of the storage.MVCCIterator interface.
 func (i *MVCCIterator) ComputeStats(
 	start, end roachpb.Key, nowNanos int64,
@@ -208,13 +206,6 @@ func (i *MVCCIterator) FindSplitKey(
 		}
 	}
 	return i.i.FindSplitKey(start, end, minSplitKey, targetSize)
-}
-
-// CheckForKeyCollisions is part of the storage.MVCCIterator interface.
-func (i *MVCCIterator) CheckForKeyCollisions(
-	sstData []byte, start, end roachpb.Key,
-) (enginepb.MVCCStats, error) {
-	return i.i.CheckForKeyCollisions(sstData, start, end)
 }
 
 // SetUpperBound is part of the storage.MVCCIterator interface.
@@ -543,12 +534,12 @@ func (s spanSetWriter) ClearUnversioned(key roachpb.Key) error {
 }
 
 func (s spanSetWriter) ClearIntent(
-	key roachpb.Key, state storage.PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) (int, error) {
+	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) error {
 	if err := s.checkAllowed(key); err != nil {
-		return 0, err
+		return err
 	}
-	return s.w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID)
+	return s.w.ClearIntent(key, txnDidNotUpdateMeta, txnUUID)
 }
 
 func (s spanSetWriter) ClearEngineKey(key storage.EngineKey) error {
@@ -636,17 +627,12 @@ func (s spanSetWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 }
 
 func (s spanSetWriter) PutIntent(
-	ctx context.Context,
-	key roachpb.Key,
-	value []byte,
-	state storage.PrecedingIntentState,
-	txnDidNotUpdateMeta bool,
-	txnUUID uuid.UUID,
-) (int, error) {
+	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
+) error {
 	if err := s.checkAllowed(key); err != nil {
-		return 0, err
+		return err
 	}
-	return s.w.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID)
+	return s.w.PutIntent(ctx, key, value, txnUUID)
 }
 
 func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {
@@ -669,10 +655,6 @@ func (s spanSetWriter) LogLogicalOp(
 	s.w.LogLogicalOp(op, details)
 }
 
-func (s spanSetWriter) OverrideTxnDidNotUpdateMetaToFalse(ctx context.Context) bool {
-	return s.w.OverrideTxnDidNotUpdateMetaToFalse(ctx)
-}
-
 // ReadWriter is used outside of the spanset package internally, in ccl.
 type ReadWriter struct {
 	spanSetReader
@@ -682,6 +664,7 @@ type ReadWriter struct {
 var _ storage.ReadWriter = ReadWriter{}
 
 func makeSpanSetReadWriter(rw storage.ReadWriter, spans *SpanSet) ReadWriter {
+	spans = addLockTableSpans(spans)
 	return ReadWriter{
 		spanSetReader: spanSetReader{r: rw, spans: spans, spansOnly: true},
 		spanSetWriter: spanSetWriter{w: rw, spans: spans, spansOnly: true},
@@ -689,6 +672,7 @@ func makeSpanSetReadWriter(rw storage.ReadWriter, spans *SpanSet) ReadWriter {
 }
 
 func makeSpanSetReadWriterAt(rw storage.ReadWriter, spans *SpanSet, ts hlc.Timestamp) ReadWriter {
+	spans = addLockTableSpans(spans)
 	return ReadWriter{
 		spanSetReader: spanSetReader{r: rw, spans: spans, ts: ts},
 		spanSetWriter: spanSetWriter{w: rw, spans: spans, ts: ts},
@@ -768,4 +752,32 @@ func DisableReaderAssertions(reader storage.Reader) storage.Reader {
 	default:
 		return reader
 	}
+}
+
+// addLockTableSpans adds corresponding lock table spans for the declared
+// spans. This is to implicitly allow raw access to separated intents in the
+// lock table for any declared keys. Explicitly declaring lock table spans is
+// therefore illegal and will panic, as the implicit access would give
+// insufficient isolation from concurrent requests that only declare lock table
+// keys.
+func addLockTableSpans(spans *SpanSet) *SpanSet {
+	withLocks := spans.Copy()
+	spans.Iterate(func(sa SpanAccess, _ SpanScope, span Span) {
+		// We don't check for spans that contain the entire lock table within them,
+		// because some commands (e.g. TransferLease) declare access to the entire
+		// key space or very large chunks of it. Even though this could be unsafe,
+		// we assume these callers know what they are doing.
+		if bytes.HasPrefix(span.Key, keys.LocalRangeLockTablePrefix) ||
+			bytes.HasPrefix(span.EndKey, keys.LocalRangeLockTablePrefix) {
+			panic(fmt.Sprintf(
+				"declaring raw lock table spans is illegal, use main key spans instead (found %s)", span))
+		}
+		ltKey, _ := keys.LockTableSingleKey(span.Key, nil)
+		var ltEndKey roachpb.Key
+		if span.EndKey != nil {
+			ltEndKey, _ = keys.LockTableSingleKey(span.EndKey, nil)
+		}
+		withLocks.AddNonMVCC(sa, roachpb.Span{Key: ltKey, EndKey: ltEndKey})
+	})
+	return withLocks
 }

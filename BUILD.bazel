@@ -1,4 +1,13 @@
+exports_files([
+    "DEPS.bzl",
+    "TEAMS.yaml",
+    "go.mod",
+    "go.sum",
+])
+
 load("@bazel_gazelle//:def.bzl", "gazelle")
+load("@io_bazel_rules_go//go:def.bzl", "nogo")
+load("//build/bazelutil/staticcheckanalyzers:def.bzl", "STATICCHECK_CHECKS")
 
 # The following directives inform gazelle how to auto-generate BUILD.bazel
 # files throughout the repo. By including them here, we can run gazelle using
@@ -12,7 +21,7 @@ load("@bazel_gazelle//:def.bzl", "gazelle")
 #
 # gazelle:prefix github.com/cockroachdb/cockroach
 # gazelle:build_file_name BUILD.bazel
-# gazelle:build_tags bazel,crdb_test,crdb_test_off,fast_int_set_small,fast_int_set_large,gss
+# gazelle:build_tags bazel,fast_int_set_small,fast_int_set_large,gss
 
 # Enable protobuf generation.
 #
@@ -41,6 +50,7 @@ load("@bazel_gazelle//:def.bzl", "gazelle")
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/sql/colflow_test @cockroach//pkg/sql/colflow:colflow_test
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/caller_test @cockroach//pkg/util/caller:caller_test
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/json_test @cockroach//pkg/util/json:json_test
+# gazelle:resolve go google.golang.org/genproto/googleapis/pubsub/v1 @org_golang_google_genproto//googleapis/pubsub/v1:pubsub
 
 # These packages use github.com/golang/mock to generate mocks. The target
 # generating mocks for a given package necessarily depends on the package's
@@ -50,6 +60,8 @@ load("@bazel_gazelle//:def.bzl", "gazelle")
 # tell gazelle to resolve to this second target instead. See
 # pkg/kv/kvclient/rangefeed/BUILD.bazel for an annotated example.
 #
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/cmd/roachtest/prometheus //pkg/cmd/roachtest/prometheus:with-mocks
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests //pkg/cmd/roachtest/tests:with-mocks
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/roachpb //pkg/roachpb:with-mocks
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord //pkg/kv/kvclient/kvcoord:with-mocks
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed //pkg/kv/kvclient/rangefeed:with-mocks
@@ -57,7 +69,6 @@ load("@bazel_gazelle//:def.bzl", "gazelle")
 
 # See pkg/roachpb/gen/BUILD.bazel for more details.
 #
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/roachpb //pkg/roachpb:with-mocks
 # gazelle:resolve proto go roachpb/api.proto //pkg/roachpb:with-mocks
 # gazelle:resolve proto go roachpb/app_stats.proto //pkg/roachpb:with-mocks
 # gazelle:resolve proto go roachpb/data.proto //pkg/roachpb:with-mocks
@@ -68,7 +79,6 @@ load("@bazel_gazelle//:def.bzl", "gazelle")
 # gazelle:resolve proto go roachpb/io-formats.proto //pkg/roachpb:with-mocks
 # gazelle:resolve proto go roachpb/metadata.proto //pkg/roachpb:with-mocks
 # gazelle:resolve proto go roachpb/span_config.proto //pkg/roachpb:with-mocks
-# gazelle:exclude pkg/roachpb/batch_generated.go
 # gazelle:exclude pkg/roachpb/batch_generated-gen.go
 
 # See pkg/sql/opt/optgen/cmd/langgen/BUILD.bazel for more details.
@@ -106,33 +116,26 @@ load("@bazel_gazelle//:def.bzl", "gazelle")
 # gazelle:exclude **/*.pb.gw.go
 # gazelle:exclude **/*_interval_btree.go
 # gazelle:exclude **/*_interval_btree_test.go
-# gazelle:exclude **/mocks_generated.go
+# gazelle:exclude **/*_generated.go
 # gazelle:exclude pkg/sql/parser/sql.go
 # gazelle:exclude pkg/sql/parser/helpmap_test.go
 # gazelle:exclude pkg/sql/parser/help_messages.go
 # gazelle:exclude pkg/sql/lexbase/keywords.go
 # gazelle:exclude pkg/sql/lexbase/tokens.go
 # gazelle:exclude pkg/sql/lexbase/reserved_keywords.go
+# gazelle:exclude pkg/sql/schemachanger/scexec/mocks_generated_test.go
 # gazelle:exclude pkg/cmd/prereqs/testdata
 # gazelle:exclude pkg/testutils/**/testdata/**
 # gazelle:exclude pkg/security/securitytest/embedded.go
-# gazelle:exclude pkg/cmd/roachprod/vm/aws/embedded.go
+# gazelle:exclude pkg/roachprod/vm/aws/embedded.go
 # gazelle:exclude pkg/**/*_string.go
-# gazelle:exclude pkg/geo/wkt/wkt_generated.go
-# gazelle:exclude pkg/sql/schemachanger/scop/backfill_visitor_generated.go
-# gazelle:exclude pkg/sql/schemachanger/scop/mutation_visitor_generated.go
-# gazelle:exclude pkg/sql/schemachanger/scop/validation_visitor_generated.go
 # gazelle:exclude pkg/ui/distccl/distccl_no_bazel.go
 # gazelle:exclude pkg/ui/distoss/distoss_no_bazel.go
-# gazelle:exclude pkg/util/log/channel/channel_generated.go
-# gazelle:exclude pkg/util/log/eventpb/eventlog_channels_generated.go
-# gazelle:exclude pkg/util/log/eventpb/json_encode_generated.go
-# gazelle:exclude pkg/util/log/log_channels_generated.go
-# gazelle:exclude pkg/util/log/severity/severity_generated.go
-# gazelle:exclude pkg/util/timeutil/lowercase_timezones_generated.go
-#
-# TODO(irfansharif): Hand excluding these _generated.go/_stringer.go files is
-# silly, we should glob exclude everything once we have full coverage.
+# gazelle:exclude pkg/util/buildutil/crdb_test_dyn.go
+# gazelle:exclude pkg/util/buildutil/crdb_test_off.go
+# gazelle:exclude pkg/util/buildutil/crdb_test_on.go
+# gazelle:exclude pkg/acceptance/compose/gss/psql/*
+# gazelle:exclude pkg/acceptance/test_main.go
 #
 # Generally useful references:
 #
@@ -192,6 +195,65 @@ gazelle(
     prefix = "github.com/cockroachdb/cockroach",
 )
 
-exports_files([
-    "TEAMS.yaml",
-])
+nogo(
+    name = "crdb_nogo",
+    config = "//build/bazelutil:nogo_config.json",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//build/toolchains:nonogo": [],
+        "//conditions:default": [
+            "@org_golang_x_tools//go/analysis/passes/asmdecl:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/assign:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/atomic:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/atomicalign:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/bools:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/buildssa:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/buildtag:go_default_library",
+            # TODO(rules_go#2396): pass raw cgo sources to cgocall and re-enable.
+            # "@org_golang_x_tools//go/analysis/passes/cgocall:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/composite:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/copylock:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/ctrlflow:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/deepequalerrors:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/errorsas:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/findcall:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/httpresponse:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/ifaceassert:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/inspect:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/loopclosure:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/lostcancel:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/nilfunc:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/nilness:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/pkgfact:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/printf:go_default_library",
+            # TODO(ricky): we do want to run the shadow check, we just want to exclude
+            # shadows of the variable "err". Presumably we can hack around this. #73069
+            # "@org_golang_x_tools//go/analysis/passes/shadow:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/shift:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/sortslice:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/stdmethods:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/stringintconv:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/structtag:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/testinggoroutine:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/tests:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/unmarshal:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/unreachable:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/unsafeptr:go_default_library",
+            "@org_golang_x_tools//go/analysis/passes/unusedresult:go_default_library",
+            "//pkg/testutils/lint/passes/descriptormarshal",
+            "//pkg/testutils/lint/passes/errcheck",
+            "//pkg/testutils/lint/passes/errcmp",
+            "//pkg/testutils/lint/passes/errwrap",
+            "//pkg/testutils/lint/passes/fmtsafe",
+            "//pkg/testutils/lint/passes/grpcclientconnclose",
+            "//pkg/testutils/lint/passes/grpcstatuswithdetails",
+            "//pkg/testutils/lint/passes/hash",
+            "//pkg/testutils/lint/passes/leaktestcall",
+            "//pkg/testutils/lint/passes/nilness",
+            "//pkg/testutils/lint/passes/nocopy",
+            "//pkg/testutils/lint/passes/returnerrcheck",
+            "//pkg/testutils/lint/passes/timer",
+            "//pkg/testutils/lint/passes/unconvert",
+        ] + STATICCHECK_CHECKS,
+    }),
+)

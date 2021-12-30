@@ -341,6 +341,7 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 	for _, s := range tc.Servers {
 		store, err := s.Stores().GetStore(s.GetFirstStoreID())
 		require.NoError(t, err)
+		tracer := s.Tracer()
 		g.Go(func() error {
 			// Prime range cache so that follower read attempts don't initially miss.
 			if _, err := store.DB().Scan(ctx, keySpan.Key, keySpan.EndKey, 0); err != nil {
@@ -381,9 +382,8 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 					// Trace the request so we can determine whether it was served as a
 					// follower read. If running on a store with a follower replica and
 					// with a NEAREST routing policy, we expect follower reads.
-					ctx, collect, cancel := tracing.ContextWithRecordingSpan(
-						ctx, tracing.NewTracer(), "reader")
-					defer cancel()
+					ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx, tracer, "reader")
+					defer collectAndFinish()
 
 					br, pErr := txn.NegotiateAndSend(ctx, ba)
 					if pErr != nil {
@@ -422,7 +422,7 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 					// where it would be valid for the request to be served by a follower
 					// or redirected to the leaseholder due to timing, so we make no
 					// assertion.
-					rec := collect()
+					rec := collectAndFinish()
 					expFollowerRead := store.StoreID() != lh.StoreID && strict && routeNearest
 					wasFollowerRead := kv.OnlyFollowerReads(rec)
 					ambiguous := !strict && routeNearest
@@ -445,4 +445,66 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 	time.Sleep(testTime)
 	atomic.StoreInt32(&done, 1)
 	require.NoError(t, g.Wait())
+}
+
+// TestRevScanAndGet tests that Get and ReverseScan requests in the same batch
+// can be executed correctly. See illustration below for the various
+// combinations tested.
+func TestRevScanAndGet(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	tci := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := tci.(*testcluster.TestCluster)
+	defer tc.Stopper().Stop(ctx)
+	db := tc.Servers[0].DB()
+
+	require.NoError(t, db.AdminSplit(ctx, "b", hlc.MaxTimestamp))
+	require.NoError(t, db.AdminSplit(ctx, "h", hlc.MaxTimestamp))
+
+	// Setup:
+	// Ranges:      [keyMin-------b) [b--------h) [h------keyMax)
+	// ReverseScan:                     [d-f)
+	// Gets:                     *  *  *  *   *  *   *
+	testCases := []struct {
+		getKey string
+	}{
+		{
+			// Get on a range to the left of the reverse scan.
+			getKey: "a",
+		},
+		{
+			// Get on the left split boundary.
+			getKey: "b",
+		},
+		{
+			// Get on the same range as the reverse scan but to the left.
+			getKey: "c",
+		},
+		{
+			// Get on the same range and enclosed by the reverse scan.
+			getKey: "e",
+		},
+		{
+			// Get on the same range as the reverse scan but to the right.
+			getKey: "g",
+		},
+		{
+			// Get on the right split boundary.
+			getKey: "h",
+		},
+		{
+			// Get on a range to the right of the reverse scan.
+			getKey: "i",
+		},
+	}
+
+	for _, tc := range testCases {
+		txn := db.NewTxn(ctx, "test")
+		b := txn.NewBatch()
+		b.Get(tc.getKey)
+		b.ReverseScan("d", "f")
+		require.NoError(t, txn.Run(ctx, b))
+	}
 }

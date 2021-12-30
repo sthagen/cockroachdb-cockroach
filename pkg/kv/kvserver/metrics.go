@@ -12,6 +12,8 @@ package kvserver
 
 import (
 	"context"
+	"runtime/debug"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -63,6 +65,12 @@ var (
 	metaQuiescentCount = metric.Metadata{
 		Name:        "replicas.quiescent",
 		Help:        "Number of quiesced replicas",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaUninitializedCount = metric.Metadata{
+		Name:        "replicas.uninitialized",
+		Help:        "Number of uninitialized replicas, this does not include uninitialized replicas that can lie dormant in a persistent state.",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -742,27 +750,27 @@ difficult to meaningfully interpret this metric.`,
 	}
 
 	// Replica queue metrics.
-	metaGCQueueSuccesses = metric.Metadata{
+	metaMVCCGCQueueSuccesses = metric.Metadata{
 		Name:        "queue.gc.process.success",
-		Help:        "Number of replicas successfully processed by the GC queue",
+		Help:        "Number of replicas successfully processed by the MVCC GC queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaGCQueueFailures = metric.Metadata{
+	metaMVCCGCQueueFailures = metric.Metadata{
 		Name:        "queue.gc.process.failure",
-		Help:        "Number of replicas which failed processing in the GC queue",
+		Help:        "Number of replicas which failed processing in the MVCC GC queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaGCQueuePending = metric.Metadata{
+	metaMVCCGCQueuePending = metric.Metadata{
 		Name:        "queue.gc.pending",
-		Help:        "Number of pending replicas in the GC queue",
+		Help:        "Number of pending replicas in the MVCC GC queue",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaGCQueueProcessingNanos = metric.Metadata{
+	metaMVCCGCQueueProcessingNanos = metric.Metadata{
 		Name:        "queue.gc.processingnanos",
-		Help:        "Nanoseconds spent processing replicas in the GC queue",
+		Help:        "Nanoseconds spent processing replicas in the MVCC GC queue",
 		Measurement: "Processing Time",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -1153,6 +1161,18 @@ not occurring.
 		Measurement: "Ingestions",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaAddSSTableAsWrites = metric.Metadata{
+		Name: "addsstable.aswrites",
+		Help: `Number of SSTables ingested as normal writes.
+
+These AddSSTable requests do not count towards the addsstable metrics
+'proposals', 'applications', or 'copies', as they are not ingested as AddSSTable
+Raft commands, but rather normal write commands. However, if these requests get
+throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
+`,
+		Measurement: "Ingestions",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaAddSSTableEvalTotalDelay = metric.Metadata{
 		Name:        "addsstable.delay.total",
 		Help:        "Amount by which evaluation of AddSSTable requests was delayed",
@@ -1239,6 +1259,7 @@ type StoreMetrics struct {
 	RaftLeaderNotLeaseHolderCount *metric.Gauge
 	LeaseHolderCount              *metric.Gauge
 	QuiescentCount                *metric.Gauge
+	UninitializedCount            *metric.Gauge
 
 	// Range metrics.
 	RangeCount                *metric.Gauge
@@ -1343,10 +1364,10 @@ type StoreMetrics struct {
 	RaftCoalescedHeartbeatsPending *metric.Gauge
 
 	// Replica queue metrics.
-	GCQueueSuccesses                          *metric.Counter
-	GCQueueFailures                           *metric.Counter
-	GCQueuePending                            *metric.Gauge
-	GCQueueProcessingNanos                    *metric.Counter
+	MVCCGCQueueSuccesses                      *metric.Counter
+	MVCCGCQueueFailures                       *metric.Counter
+	MVCCGCQueuePending                        *metric.Gauge
+	MVCCGCQueueProcessingNanos                *metric.Counter
 	MergeQueueSuccesses                       *metric.Counter
 	MergeQueueFailures                        *metric.Counter
 	MergeQueuePending                         *metric.Gauge
@@ -1416,6 +1437,7 @@ type StoreMetrics struct {
 	AddSSTableProposals           *metric.Counter
 	AddSSTableApplications        *metric.Counter
 	AddSSTableApplicationCopies   *metric.Counter
+	AddSSTableAsWrites            *metric.Counter
 	AddSSTableProposalTotalDelay  *metric.Counter
 	AddSSTableProposalEngineDelay *metric.Counter
 
@@ -1437,6 +1459,29 @@ type StoreMetrics struct {
 
 	// Closed timestamp metrics.
 	ClosedTimestampMaxBehindNanos *metric.Gauge
+}
+
+type tenantMetricsRef struct {
+	// All fields are internal. Don't access them.
+
+	_tenantID roachpb.TenantID
+	_state    int32 // atomic; 0=usable 1=poisoned
+
+	// _stack helps diagnose use-after-release when it occurs.
+	// This field is populated in releaseTenant and printed
+	// in assertions on failure.
+	_stack struct {
+		syncutil.Mutex
+		string
+	}
+}
+
+func (ref *tenantMetricsRef) assert(ctx context.Context) {
+	if atomic.LoadInt32(&ref._state) != 0 {
+		ref._stack.Lock()
+		defer ref._stack.Unlock()
+		log.FatalfDepth(ctx, 1, "tenantMetricsRef already finalized in:\n%s", ref._stack.string)
+	}
 }
 
 // TenantsStorageMetrics are metrics which are aggregated over all tenants
@@ -1461,7 +1506,12 @@ type TenantsStorageMetrics struct {
 	AbortSpanBytes *aggmetric.AggGauge
 
 	// This struct is invisible to the metric package.
-	tenants syncutil.IntMap // map[roachpb.TenantID]*tenantStorageMetrics
+	//
+	// NB: note that the int64 conversion in this map is lossless, so
+	// everything will work with tenantsIDs in excess of math.MaxInt64
+	// except that should one ever look at this map through a debugger
+	// the int64->uint64 conversion has to be done manually.
+	tenants syncutil.IntMap // map[int64(roachpb.TenantID)]*tenantStorageMetrics
 }
 
 var _ metric.Struct = (*TenantsStorageMetrics)(nil)
@@ -1473,7 +1523,7 @@ func (sm *TenantsStorageMetrics) MetricStruct() {}
 // method are reference counted with decrements occurring in the corresponding
 // releaseTenant call. This method must be called prior to adding or subtracting
 // MVCC stats.
-func (sm *TenantsStorageMetrics) acquireTenant(tenantID roachpb.TenantID) {
+func (sm *TenantsStorageMetrics) acquireTenant(tenantID roachpb.TenantID) *tenantMetricsRef {
 	// incRef increments the reference count if it is not already zero indicating
 	// that the struct has already been destroyed.
 	incRef := func(m *tenantStorageMetrics) (alreadyDestroyed bool) {
@@ -1490,7 +1540,9 @@ func (sm *TenantsStorageMetrics) acquireTenant(tenantID roachpb.TenantID) {
 		if mPtr, ok := sm.tenants.Load(key); ok {
 			m := (*tenantStorageMetrics)(mPtr)
 			if alreadyDestroyed := incRef(m); !alreadyDestroyed {
-				return
+				return &tenantMetricsRef{
+					_tenantID: tenantID,
+				}
 			}
 			// Somebody else concurrently took the reference count to zero, go back
 			// around. Because of the locking in releaseTenant, we know that we'll
@@ -1522,7 +1574,9 @@ func (sm *TenantsStorageMetrics) acquireTenant(tenantID roachpb.TenantID) {
 			m.SysCount = sm.SysCount.AddChild(tenantIDStr)
 			m.AbortSpanBytes = sm.AbortSpanBytes.AddChild(tenantIDStr)
 			m.mu.Unlock()
-			return
+			return &tenantMetricsRef{
+				_tenantID: tenantID,
+			}
 		}
 	}
 }
@@ -1530,13 +1584,20 @@ func (sm *TenantsStorageMetrics) acquireTenant(tenantID roachpb.TenantID) {
 // releaseTenant releases the reference to the metrics for this tenant which was
 // acquired with acquireTenant. It will fatally log if no entry exists for this
 // tenant.
-func (sm *TenantsStorageMetrics) releaseTenant(ctx context.Context, tenantID roachpb.TenantID) {
-	m := sm.getTenant(ctx, tenantID)
+func (sm *TenantsStorageMetrics) releaseTenant(ctx context.Context, ref *tenantMetricsRef) {
+	m := sm.getTenant(ctx, ref) // NB: asserts against use-after-release
+	if atomic.SwapInt32(&ref._state, 1) != 0 {
+		ref.assert(ctx) // this will fatal
+		return          // unreachable
+	}
+	ref._stack.Lock()
+	ref._stack.string = string(debug.Stack())
+	ref._stack.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.mu.refCount--
 	if m.mu.refCount < 0 {
-		log.Fatalf(ctx, "invalid refCount on metrics for tenant %v: %d", tenantID, m.mu.refCount)
+		log.Fatalf(ctx, "invalid refCount on metrics for tenant %v: %d", ref._tenantID, m.mu.refCount)
 	} else if m.mu.refCount > 0 {
 		return
 	}
@@ -1558,18 +1619,19 @@ func (sm *TenantsStorageMetrics) releaseTenant(ctx context.Context, tenantID roa
 	m.SysBytes.Destroy()
 	m.SysCount.Destroy()
 	m.AbortSpanBytes.Destroy()
-	sm.tenants.Delete(int64(tenantID.ToUint64()))
+	sm.tenants.Delete(int64(ref._tenantID.ToUint64()))
 }
 
 // getTenant is a helper method used to retrieve the metrics for a tenant. The
 // call will log fatally if no such tenant has been previously acquired.
 func (sm *TenantsStorageMetrics) getTenant(
-	ctx context.Context, tenantID roachpb.TenantID,
+	ctx context.Context, ref *tenantMetricsRef,
 ) *tenantStorageMetrics {
-	key := int64(tenantID.ToUint64())
+	ref.assert(ctx)
+	key := int64(ref._tenantID.ToUint64())
 	mPtr, ok := sm.tenants.Load(key)
 	if !ok {
-		log.Fatalf(ctx, "no metrics exist for tenant %v", tenantID)
+		log.Fatalf(ctx, "no metrics exist for tenant %v", ref._tenantID)
 	}
 	return (*tenantStorageMetrics)(mPtr)
 }
@@ -1630,6 +1692,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftLeaderNotLeaseHolderCount: metric.NewGauge(metaRaftLeaderNotLeaseHolderCount),
 		LeaseHolderCount:              metric.NewGauge(metaLeaseHolderCount),
 		QuiescentCount:                metric.NewGauge(metaQuiescentCount),
+		UninitializedCount:            metric.NewGauge(metaUninitializedCount),
 
 		// Range metrics.
 		RangeCount:                metric.NewGauge(metaRangeCount),
@@ -1742,10 +1805,10 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftCoalescedHeartbeatsPending: metric.NewGauge(metaRaftCoalescedHeartbeatsPending),
 
 		// Replica queue metrics.
-		GCQueueSuccesses:                          metric.NewCounter(metaGCQueueSuccesses),
-		GCQueueFailures:                           metric.NewCounter(metaGCQueueFailures),
-		GCQueuePending:                            metric.NewGauge(metaGCQueuePending),
-		GCQueueProcessingNanos:                    metric.NewCounter(metaGCQueueProcessingNanos),
+		MVCCGCQueueSuccesses:                      metric.NewCounter(metaMVCCGCQueueSuccesses),
+		MVCCGCQueueFailures:                       metric.NewCounter(metaMVCCGCQueueFailures),
+		MVCCGCQueuePending:                        metric.NewGauge(metaMVCCGCQueuePending),
+		MVCCGCQueueProcessingNanos:                metric.NewCounter(metaMVCCGCQueueProcessingNanos),
 		MergeQueueSuccesses:                       metric.NewCounter(metaMergeQueueSuccesses),
 		MergeQueueFailures:                        metric.NewCounter(metaMergeQueueFailures),
 		MergeQueuePending:                         metric.NewGauge(metaMergeQueuePending),
@@ -1811,6 +1874,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		// AddSSTable proposal + applications counters.
 		AddSSTableProposals:           metric.NewCounter(metaAddSSTableProposals),
 		AddSSTableApplications:        metric.NewCounter(metaAddSSTableApplications),
+		AddSSTableAsWrites:            metric.NewCounter(metaAddSSTableAsWrites),
 		AddSSTableApplicationCopies:   metric.NewCounter(metaAddSSTableApplicationCopies),
 		AddSSTableProposalTotalDelay:  metric.NewCounter(metaAddSSTableEvalTotalDelay),
 		AddSSTableProposalEngineDelay: metric.NewCounter(metaAddSSTableEvalEngineDelay),
@@ -1843,9 +1907,10 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 // single snapshot of these gauges in the registry might mix the values of two
 // subsequent updates.
 func (sm *TenantsStorageMetrics) incMVCCGauges(
-	ctx context.Context, tenantID roachpb.TenantID, delta enginepb.MVCCStats,
+	ctx context.Context, ref *tenantMetricsRef, delta enginepb.MVCCStats,
 ) {
-	tm := sm.getTenant(ctx, tenantID)
+	ref.assert(ctx)
+	tm := sm.getTenant(ctx, ref)
 	tm.LiveBytes.Inc(delta.LiveBytes)
 	tm.KeyBytes.Inc(delta.KeyBytes)
 	tm.ValBytes.Inc(delta.ValBytes)
@@ -1863,17 +1928,17 @@ func (sm *TenantsStorageMetrics) incMVCCGauges(
 }
 
 func (sm *TenantsStorageMetrics) addMVCCStats(
-	ctx context.Context, tenantID roachpb.TenantID, delta enginepb.MVCCStats,
+	ctx context.Context, ref *tenantMetricsRef, delta enginepb.MVCCStats,
 ) {
-	sm.incMVCCGauges(ctx, tenantID, delta)
+	sm.incMVCCGauges(ctx, ref, delta)
 }
 
 func (sm *TenantsStorageMetrics) subtractMVCCStats(
-	ctx context.Context, tenantID roachpb.TenantID, delta enginepb.MVCCStats,
+	ctx context.Context, ref *tenantMetricsRef, delta enginepb.MVCCStats,
 ) {
 	var neg enginepb.MVCCStats
 	neg.Subtract(delta)
-	sm.incMVCCGauges(ctx, tenantID, neg)
+	sm.incMVCCGauges(ctx, ref, neg)
 }
 
 func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
@@ -1925,6 +1990,9 @@ func (sm *StoreMetrics) handleMetricsResult(ctx context.Context, metric result.M
 	metric.ResolveAbort = 0
 	sm.ResolvePoisonCount.Inc(int64(metric.ResolvePoison))
 	metric.ResolvePoison = 0
+
+	sm.AddSSTableAsWrites.Inc(int64(metric.AddSSTableAsWrites))
+	metric.AddSSTableAsWrites = 0
 
 	if metric != (result.Metrics{}) {
 		log.Fatalf(ctx, "unhandled fields in metrics result: %+v", metric)

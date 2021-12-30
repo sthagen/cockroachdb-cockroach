@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -80,6 +81,8 @@ func TestZeroDurationDisablesFollowerReadOffset(t *testing.T) {
 
 func TestCanSendToFollower(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t, "test is flaky under deadlock+stress")
+
 	ctx := context.Background()
 	clock := hlc.NewClock(hlc.UnixNano, base.DefaultMaxClockOffset)
 	stale := clock.Now().Add(2*expectedFollowerReadOffset.Nanoseconds(), 0)
@@ -87,7 +90,7 @@ func TestCanSendToFollower(t *testing.T) {
 	future := clock.Now().Add(2*clock.MaxOffset().Nanoseconds(), 0)
 
 	txn := func(ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0)
+		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0, 1)
 		return &txn
 	}
 	withWriteTimestamp := func(txn *roachpb.Transaction, ts hlc.Timestamp) *roachpb.Transaction {
@@ -381,7 +384,7 @@ func TestOracle(t *testing.T) {
 	current := clock.Now()
 	future := clock.Now().Add(2*clock.MaxOffset().Nanoseconds(), 0)
 
-	c := kv.NewDB(log.AmbientContext{Tracer: tracing.NewTracer()}, kv.MockTxnSenderFactory{}, clock, stopper)
+	c := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), kv.MockTxnSenderFactory{}, clock, stopper)
 	staleTxn := kv.NewTxn(ctx, c, 0)
 	require.NoError(t, staleTxn.SetFixedTimestamp(ctx, stale))
 	currentTxn := kv.NewTxn(ctx, c, 0)
@@ -405,7 +408,7 @@ func TestOracle(t *testing.T) {
 	closestFollower := replicas[1]
 	leaseholder := replicas[2]
 
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	setLatency := func(addr string, latency time.Duration) {
 		// All test cases have to have at least 11 measurement values in order for
 		// the exponentially-weighted moving average to work properly. See the
@@ -639,7 +642,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// Remove the follower and add a new non-voter to n3. n2 will no longer have a
 	// replica.
 	n1.Exec(t, `ALTER TABLE test EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 1)`)
-	n1.Exec(t, `ALTER TABLE test EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[3], 1)`)
+	n1.Exec(t, `ALTER TABLE test EXPERIMENTAL_RELOCATE NONVOTERS VALUES (ARRAY[3], 1)`)
 
 	// Execute the query again and assert the cache is updated. This query will
 	// not be executed as a follower read since it attempts to use n2 which

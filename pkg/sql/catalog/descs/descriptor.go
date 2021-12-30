@@ -83,7 +83,7 @@ func (tc *Collection) getDescriptorByIDMaybeSetTxnDeadline(
 			return vd, err
 		}
 
-		if found, sd := tc.synthetic.getByID(id); found {
+		if found, sd := tc.synthetic.getByID(id); found && !flags.AvoidSynthetic {
 			if flags.RequireMutable {
 				return nil, newMutableSyntheticDescriptorAssertionError(sd.GetID())
 			}
@@ -104,7 +104,7 @@ func (tc *Collection) getDescriptorByIDMaybeSetTxnDeadline(
 			}
 		}
 
-		if !flags.AvoidCached && !flags.RequireMutable && !lease.TestingTableLeasesAreDisabled() {
+		if !flags.AvoidLeased && !flags.RequireMutable && !lease.TestingTableLeasesAreDisabled() {
 			// If we have already read all of the descriptors, use it as a negative
 			// cache to short-circuit a lookup we know will be doomed to fail.
 			//
@@ -144,7 +144,7 @@ func (tc *Collection) getDescriptorByIDMaybeSetTxnDeadline(
 		// desired behavior based on the flags (and likely producing unintended
 		// behavior). See the similar comment on etDescriptorByName, which covers
 		// the ordinary name resolution path as well as DDL statements.
-		if desc.Adding() && (desc.IsUncommittedVersion() || flags.AvoidCached || flags.RequireMutable) {
+		if desc.Adding() && (desc.IsUncommittedVersion() || flags.AvoidLeased || flags.RequireMutable) {
 			return desc, nil
 		}
 		return nil, err
@@ -158,20 +158,19 @@ func (tc *Collection) getByName(
 	db catalog.DatabaseDescriptor,
 	sc catalog.SchemaDescriptor,
 	name string,
-	avoidCached, mutable bool,
+	avoidLeased, mutable, avoidSynthetic bool,
 ) (found bool, desc catalog.Descriptor, err error) {
-
 	var parentID, parentSchemaID descpb.ID
 	if db != nil {
 		if sc == nil {
 			// Schema descriptors are handled in a special way, see getSchemaByName
 			// function declaration for details.
-			return getSchemaByName(ctx, tc, txn, db, name, avoidCached, mutable)
+			return getSchemaByName(ctx, tc, txn, db, name, avoidLeased, mutable, avoidSynthetic)
 		}
 		parentID, parentSchemaID = db.GetID(), sc.GetID()
 	}
 
-	if found, sd := tc.synthetic.getByName(parentID, parentSchemaID, name); found {
+	if found, sd := tc.synthetic.getByName(parentID, parentSchemaID, name); found && !avoidSynthetic {
 		if mutable {
 			return false, nil, newMutableSyntheticDescriptorAssertionError(sd.GetID())
 		}
@@ -195,7 +194,7 @@ func (tc *Collection) getByName(
 		}
 	}
 
-	if !avoidCached && !mutable && !lease.TestingTableLeasesAreDisabled() {
+	if !avoidLeased && !mutable && !lease.TestingTableLeasesAreDisabled() {
 		var shouldReadFromStore bool
 		desc, shouldReadFromStore, err = tc.leased.getByName(ctx, tc.deadlineHolder(txn), parentID, parentSchemaID, name)
 		if err != nil {
@@ -255,10 +254,9 @@ func getSchemaByName(
 	txn *kv.Txn,
 	db catalog.DatabaseDescriptor,
 	name string,
-	avoidCached bool,
-	mutable bool,
+	avoidLeased, mutable, avoidSynthetic bool,
 ) (bool, catalog.Descriptor, error) {
-	if name == tree.PublicSchema {
+	if !db.HasPublicSchemaWithDescriptor() && name == tree.PublicSchema {
 		return true, schemadesc.GetPublicSchema(), nil
 	}
 	if sc := tc.virtual.getSchemaByName(name); sc != nil {
@@ -266,7 +264,7 @@ func getSchemaByName(
 	}
 	if isTemporarySchema(name) {
 		if refuseFurtherLookup, sc, err := tc.temporary.getSchemaByName(
-			ctx, txn, db.GetID(), name,
+			ctx, txn, db.GetID(), name, tc.settings.Version,
 		); refuseFurtherLookup || sc != nil || err != nil {
 			return sc != nil, sc, err
 		}
@@ -276,7 +274,8 @@ func getSchemaByName(
 		// it on this path.
 		sc, err := tc.getSchemaByID(ctx, txn, id, tree.SchemaLookupFlags{
 			RequireMutable: mutable,
-			AvoidCached:    avoidCached,
+			AvoidLeased:    avoidLeased,
+			AvoidSynthetic: avoidSynthetic,
 		})
 		// Deal with the fact that ByID retrieval always uses required and the
 		// logic here never returns an error if the descriptor does not exist.

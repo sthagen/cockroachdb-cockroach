@@ -50,6 +50,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 
 	db := tc.Server(0).DB()
 	ds := tc.Server(0).DistSenderI().(*kvcoord.DistSender)
+	tc.Server(0)
 
 	t.Run("works on system ranges", func(t *testing.T) {
 		startTS := db.Clock().Now()
@@ -63,12 +64,12 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		rangefeedErrChan := make(chan error, 1)
 		ctxToCancel, cancel := context.WithCancel(ctx)
 		go func() {
-			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, descTableSpan, startTS, false /* withDiff */, evChan)
+			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, []roachpb.Span{descTableSpan}, startTS, false /* withDiff */, evChan)
 		}()
 
 		// Note: 42 is a system descriptor.
 		const junkDescriptorID = 42
-		require.GreaterOrEqual(t, keys.MaxReservedDescID, junkDescriptorID)
+		require.True(t, keys.TestingSystemIDChecker().IsSystemID(junkDescriptorID))
 		junkDescriptorKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, junkDescriptorID)
 		junkDescriptor := dbdesc.NewInitial(
 			junkDescriptorID, "junk", security.AdminRoleName())
@@ -105,7 +106,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		scratchSpan := roachpb.Span{Key: k, EndKey: k.PrefixEnd()}
 		evChan := make(chan *roachpb.RangeFeedEvent)
 		require.Regexp(t, `rangefeeds require the kv\.rangefeed.enabled setting`,
-			ds.RangeFeed(ctx, scratchSpan, startTS, false /* withDiff */, evChan))
+			ds.RangeFeed(ctx, []roachpb.Span{scratchSpan}, startTS, false /* withDiff */, evChan))
 	})
 }
 
@@ -157,7 +158,7 @@ func TestMergeOfRangeEventTableWhileRunningRangefeed(t *testing.T) {
 	start := db.Clock().Now()
 	go func() {
 		rangefeedErrChan <- ds.RangeFeed(rangefeedCtx,
-			lhsRepl.Desc().RSpan().AsRawSpanWithNoLocals(),
+			[]roachpb.Span{lhsRepl.Desc().RSpan().AsRawSpanWithNoLocals()},
 			start,
 			false, /* withDiff */
 			eventCh)
@@ -207,10 +208,10 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 
 	startTS := db.Clock().Now()
 	rangefeedCtx, rangefeedCancel := context.WithCancel(ctx)
-	rangefeedCtx, getRec, cancel := tracing.ContextWithRecordingSpan(rangefeedCtx,
-		tracing.NewTracer(),
+	rangefeedCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(rangefeedCtx,
+		tc.Server(1).TracerI().(*tracing.Tracer),
 		"rangefeed over non-voter")
-	defer cancel()
+	defer getRecAndFinish()
 
 	// Do a read on the range to make sure that the dist sender learns about the
 	// latest state of the range (with the new non-voter).
@@ -222,7 +223,7 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	go func() {
 		rangefeedErrChan <- ds.RangeFeed(
 			rangefeedCtx,
-			desc.RSpan().AsRawSpanWithNoLocals(),
+			[]roachpb.Span{desc.RSpan().AsRawSpanWithNoLocals()},
 			startTS,
 			false, /* withDiff */
 			eventCh,
@@ -239,5 +240,5 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	}
 	rangefeedCancel()
 	require.Regexp(t, "context canceled", <-rangefeedErrChan)
-	require.Regexp(t, "attempting to create a RangeFeed over replica.*2NON_VOTER", getRec().String())
+	require.Regexp(t, "attempting to create a RangeFeed over replica.*2NON_VOTER", getRecAndFinish().String())
 }

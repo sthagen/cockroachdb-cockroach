@@ -321,8 +321,8 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		mb.outScope.appendColumnsFromScope(mb.fetchScope)
 		mb.outScope.appendColumnsFromScope(fromScope)
 
-		left := mb.fetchScope.expr.(memo.RelExpr)
-		right := fromScope.expr.(memo.RelExpr)
+		left := mb.fetchScope.expr
+		right := fromScope.expr
 		mb.outScope.expr = mb.b.factory.ConstructInnerJoin(left, right, memo.TrueFilter, memo.EmptyJoinPrivate)
 	} else {
 		mb.outScope = mb.fetchScope
@@ -914,13 +914,19 @@ func (mb *mutationBuilder) addCheckConstraintCols(isUpdate bool) {
 func (mb *mutationBuilder) mutationColumnIDs() opt.ColSet {
 	cols := opt.ColSet{}
 	for _, col := range mb.insertColIDs {
-		cols.Add(col)
+		if col != 0 {
+			cols.Add(col)
+		}
 	}
 	for _, col := range mb.updateColIDs {
-		cols.Add(col)
+		if col != 0 {
+			cols.Add(col)
+		}
 	}
 	for _, col := range mb.upsertColIDs {
-		cols.Add(col)
+		if col != 0 {
+			cols.Add(col)
+		}
 	}
 	return cols
 }
@@ -1370,6 +1376,7 @@ func resultsNeeded(r tree.ReturningClause) bool {
 // be different (eg. TEXT and VARCHAR will fit the same scalar type String).
 //
 // This is used by the UPDATE, INSERT and UPSERT code.
+// TODO(mgartner): Remove this once assignment casts are fully supported.
 func checkDatumTypeFitsColumnType(col *cat.Column, typ *types.T) {
 	if typ.Equivalent(col.DatumType()) {
 		return
@@ -1383,41 +1390,91 @@ func checkDatumTypeFitsColumnType(col *cat.Column, typ *types.T) {
 	panic(err)
 }
 
-// checkColumnIsNotGeneratedAlwaysAsIdentity verifies that if current column
-// is not created as an IDENTITY column with the
-// `GENERATED ALWAYS AS IDENTITY` syntax.
-// Such an IDENTITY column is not allowed to be overridden explicitly.
-// Users need to specify the INSERT/UPSERT/UPDATE statement with
-// the OVERRIDING SYSTEM VALUE syntax.
+// addAssignmentCasts builds a projection that wraps columns in srcCols with
+// assignment casts when necessary so that the resulting columns have types
+// identical to their target column types.
 //
-// TODO(janexing): to implement the OVERRIDING SYSTEM VALUE syntax
-// under `INSERT/UPSERT/UPDATE` statement.
-// check also https://github.com/cockroachdb/cockroach/issues/68201.
+// srcCols should be either insertColIDs, updateColIDs, or upsertColsIDs where
+// the length of srcCols is equal to the number of columns in the target table.
+// The columns in srcCols are updated with new column IDs of the projected
+// assignment casts.
 //
-// This function is used in code for UPDATE, INSERT and UPSERT statement.
-func checkColumnIsNotGeneratedAlwaysAsIdentity(col *cat.Column) {
-	if !col.IsGeneratedAlwaysAsIdentity() {
-		return
-	}
-	colName := string(col.ColName())
-	err := sqlerrors.NewGeneratedAlwaysAsIdentityColumnOverrideError(colName)
-	panic(err)
-}
-
-// checkUpdateExpression verifies if current column
-// is compatible with the update expression.
-func checkUpdateExpression(col *cat.Column, updateExpr *tree.UpdateExpr) {
-	if col.IsGeneratedAlwaysAsIdentity() {
-		switch updateExpr.Expr.(type) {
-		// if current column was created with the `GENERATED ALWAYS` syntax,
-		// this column can only be updated to DEFAULT in the update statement.
-		case tree.DefaultVal:
-			return
-		default:
-			err := sqlerrors.NewGeneratedAlwaysAsIdentityColumnUpdateError(string(col.ColName()))
-			panic(err)
+// If there is no valid assignment cast from a column type in srcCols to its
+// corresponding target column type, then this function throws an error.
+func (mb *mutationBuilder) addAssignmentCasts(srcCols opt.OptionalColList) {
+	// If all source columns have types identical to their target column types,
+	// there are no assignment casts necessary. Do not create an empty
+	// projection.
+	castRequired := false
+	for ord, colID := range srcCols {
+		if colID == 0 {
+			// Column not mutated, so nothing to do.
+			continue
+		}
+		srcType := mb.md.ColumnMeta(colID).Type
+		targetType := mb.tab.Column(ord).DatumType()
+		if !srcType.Identical(targetType) {
+			castRequired = true
+			break
 		}
 	}
+	if !castRequired {
+		return
+	}
+
+	projectionScope := mb.outScope.replace()
+	projectionScope.cols = make([]scopeColumn, 0, len(mb.outScope.cols))
+	var uncastedCols opt.ColSet
+
+	for ord, colID := range srcCols {
+		if colID == 0 {
+			// Column not mutated, so nothing to do.
+			continue
+		}
+
+		srcType := mb.md.ColumnMeta(colID).Type
+		targetCol := mb.tab.Column(ord)
+		targetType := mb.tab.Column(ord).DatumType()
+
+		// An assignment cast is not necessary if the source and target types
+		// are identical.
+		if srcType.Identical(targetType) {
+			uncastedCols.Add(colID)
+			continue
+		}
+
+		// Check if an assignment cast is available from the inScope column
+		// type to the out type.
+		if !tree.ValidCast(srcType, targetType, tree.CastContextAssignment) {
+			panic(sqlerrors.NewInvalidAssignmentCastError(srcType, targetType, string(targetCol.ColName())))
+		}
+
+		// Create a new column which casts the input column to the correct
+		// type.
+		variable := mb.b.factory.ConstructVariable(colID)
+		cast := mb.b.factory.ConstructAssignmentCast(variable, targetType)
+		scopeCol := mb.b.synthesizeColumn(
+			projectionScope,
+			scopeColName(targetCol.ColName()).WithMetadataName(""),
+			targetType,
+			nil, /* expr */
+			cast,
+		)
+
+		// Replace old source column with the new one.
+		srcCols[ord] = scopeCol.id
+	}
+
+	// Add uncasted columns to the projection scope so that they become
+	// passthrough columns.
+	for i := range mb.outScope.cols {
+		if uncastedCols.Contains(mb.outScope.cols[i].id) {
+			projectionScope.appendColumn(&mb.outScope.cols[i])
+		}
+	}
+
+	projectionScope.expr = mb.b.constructProject(mb.outScope.expr, projectionScope.cols)
+	mb.outScope = projectionScope
 }
 
 // partialIndexCount returns the number of public, write-only, and delete-only

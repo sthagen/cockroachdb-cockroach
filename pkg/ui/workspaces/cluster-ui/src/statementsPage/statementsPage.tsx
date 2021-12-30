@@ -11,32 +11,33 @@
 import React from "react";
 import { RouteComponentProps } from "react-router-dom";
 import { isNil, merge } from "lodash";
-import Helmet from "react-helmet";
-import moment, { Moment } from "moment";
 import classNames from "classnames/bind";
 import { Loading } from "src/loading";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
-import { ColumnDescriptor, SortSetting } from "src/sortedtable";
+import {
+  ColumnDescriptor,
+  handleSortSettingFromQueryString,
+  SortSetting,
+  updateSortSettingQueryParamsOnTab,
+} from "src/sortedtable";
 import { Search } from "src/search";
 import { Pagination } from "src/pagination";
-import { DateRange } from "src/dateRange";
 import { TableStatistics } from "../tableStatistics";
 import {
   Filter,
   Filters,
   defaultFilters,
   calculateActiveFilters,
-  getFiltersFromQueryString,
   getTimeValueInSeconds,
+  handleFiltersFromQueryString,
+  updateFiltersQueryParamsOnTab,
 } from "../queryFilter";
 
 import {
-  appAttr,
-  getMatchParamByName,
   calculateTotalWorkload,
   unique,
   containAny,
-  queryByName,
+  syncHistory,
 } from "src/util";
 import {
   AggregateStatistics,
@@ -55,16 +56,26 @@ import {
 import { ISortedTablePagination } from "../sortedtable";
 import styles from "./statementsPage.module.scss";
 import { EmptyStatementsPlaceholder } from "./emptyStatementsPlaceholder";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
 
 type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+type IDuration = google.protobuf.IDuration;
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
 import ColumnsSelector from "../columnsSelector/columnsSelector";
 import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
 import { UIConfigState } from "../store";
 import { StatementsRequest } from "src/api/statementsApi";
 import Long from "long";
+import ClearStats from "../sqlActivity/clearStats";
+import SQLActivityError from "../sqlActivity/errorComponent";
+import {
+  TimeScaleDropdown,
+  defaultTimeScaleSelected,
+  TimeScale,
+  toDateRange,
+} from "../timeScaleDropdown";
 
+import { commonStyles } from "../common";
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
 
@@ -78,9 +89,13 @@ export interface StatementsPageDispatchProps {
   refreshStatementDiagnosticsRequests: () => void;
   resetSQLStats: () => void;
   dismissAlertMessage: () => void;
-  onActivateStatementDiagnostics: (statement: string) => void;
+  onActivateStatementDiagnostics: (
+    statement: string,
+    minExecLatency: IDuration,
+    expiresAfter: IDuration,
+  ) => void;
   onDiagnosticsModalOpen?: (statement: string) => void;
-  onSearchComplete?: (results: AggregateStatistics[]) => void;
+  onSearchComplete?: (query: string) => void;
   onPageChanged?: (newPage: number) => void;
   onSortingChange?: (
     name: string,
@@ -88,15 +103,15 @@ export interface StatementsPageDispatchProps {
     ascending: boolean,
   ) => void;
   onDiagnosticsReportDownload?: (report: IStatementDiagnosticsReport) => void;
-  onFilterChange?: (value: string) => void;
+  onFilterChange?: (value: Filters) => void;
   onStatementClick?: (statement: string) => void;
   onColumnsChange?: (selectedColumns: string[]) => void;
-  onDateRangeChange: (start: Moment, end: Moment) => void;
+  onTimeScaleChange: (ts: TimeScale) => void;
 }
 
 export interface StatementsPageStateProps {
   statements: AggregateStatistics[];
-  dateRange: [Moment, Moment];
+  timeScale: TimeScale;
   statementsError: Error | null;
   apps: string[];
   databases: string[];
@@ -104,12 +119,13 @@ export interface StatementsPageStateProps {
   lastReset: string;
   columns: string[];
   nodeRegions: { [key: string]: string };
+  sortSetting: SortSetting;
+  filters: Filters;
+  search: string;
   isTenant?: UIConfigState["isTenant"];
 }
 
 export interface StatementsPageState {
-  sortSetting: SortSetting;
-  search?: string;
   pagination: ISortedTablePagination;
   filters?: Filters;
   activeFilters?: number;
@@ -122,10 +138,11 @@ export type StatementsPageProps = StatementsPageDispatchProps &
 function statementsRequestFromProps(
   props: StatementsPageProps,
 ): cockroach.server.serverpb.StatementsRequest {
+  const [start, end] = toDateRange(props.timeScale);
   return new cockroach.server.serverpb.StatementsRequest({
     combined: true,
-    start: Long.fromNumber(props.dateRange[0].unix()),
-    end: Long.fromNumber(props.dateRange[1].unix()),
+    start: Long.fromNumber(start.unix()),
+    end: Long.fromNumber(end.unix()),
   });
 }
 
@@ -136,91 +153,77 @@ export class StatementsPage extends React.Component<
   activateDiagnosticsRef: React.RefObject<ActivateDiagnosticsModalRef>;
   constructor(props: StatementsPageProps) {
     super(props);
-    const filters = getFiltersFromQueryString(
-      this.props.history.location.search,
-    );
     const defaultState = {
-      sortSetting: {
-        // Sort by Execution Count column as default option.
-        ascending: false,
-        columnTitle: "executionCount",
-      },
       pagination: {
         pageSize: 20,
         current: 1,
       },
-      search: "",
-      filters: filters,
-      activeFilters: calculateActiveFilters(filters),
     };
-
     const stateFromHistory = this.getStateFromHistory();
     this.state = merge(defaultState, stateFromHistory);
     this.activateDiagnosticsRef = React.createRef();
   }
 
-  static defaultProps: Partial<StatementsPageProps> = {
-    isTenant: false,
-  };
-
   getStateFromHistory = (): Partial<StatementsPageState> => {
-    const { history } = this.props;
+    const {
+      history,
+      search,
+      sortSetting,
+      filters,
+      onSearchComplete,
+      onFilterChange,
+      onSortingChange,
+    } = this.props;
     const searchParams = new URLSearchParams(history.location.search);
-    const ascending = searchParams.get("ascending") || undefined;
-    const columnTitle = searchParams.get("columnTitle") || undefined;
+
+    // Search query.
     const searchQuery = searchParams.get("q") || undefined;
+    if (onSearchComplete && searchQuery && search != searchQuery) {
+      onSearchComplete(searchQuery);
+    }
+
+    // Sort Settings.
+    handleSortSettingFromQueryString(
+      "Statements",
+      history.location.search,
+      sortSetting,
+      onSortingChange,
+    );
+
+    // Filters.
+    const latestFilter = handleFiltersFromQueryString(
+      history,
+      filters,
+      onFilterChange,
+    );
 
     return {
-      sortSetting: {
-        ascending: ascending === "true",
-        columnTitle,
-      },
-      search: searchQuery,
+      filters: latestFilter,
+      activeFilters: calculateActiveFilters(latestFilter),
     };
   };
 
-  syncHistory = (params: Record<string, string | undefined>): void => {
-    const { history } = this.props;
-    const nextSearchParams = new URLSearchParams(history.location.search);
-
-    Object.entries(params).forEach(([key, value]) => {
-      if (!value) {
-        nextSearchParams.delete(key);
-      } else {
-        nextSearchParams.set(key, value);
-      }
-    });
-
-    history.location.search = nextSearchParams.toString();
-    history.replace(history.location);
-  };
-
   changeSortSetting = (ss: SortSetting): void => {
-    this.setState({
-      sortSetting: ss,
-    });
-
-    this.syncHistory({
-      ascending: ss.ascending.toString(),
-      columnTitle: ss.columnTitle,
-    });
+    syncHistory(
+      {
+        ascending: ss.ascending.toString(),
+        columnTitle: ss.columnTitle,
+      },
+      this.props.history,
+    );
     if (this.props.onSortingChange) {
       this.props.onSortingChange("Statements", ss.columnTitle, ss.ascending);
     }
   };
 
-  changeDateRange = (start: Moment, end: Moment): void => {
-    if (this.props.onDateRangeChange) {
-      this.props.onDateRangeChange(start, end);
+  changeTimeScale = (ts: TimeScale): void => {
+    if (this.props.onTimeScaleChange) {
+      this.props.onTimeScaleChange(ts);
     }
   };
 
   resetTime = (): void => {
-    // Default range to reset to is one hour ago.
-    this.changeDateRange(
-      moment.utc().subtract(1, "hours"),
-      moment.utc().add(1, "minute"),
-    );
+    this.changeTimeScale(defaultTimeScaleSelected);
   };
 
   resetPagination = (): void => {
@@ -246,13 +249,40 @@ export class StatementsPage extends React.Component<
     }
   }
 
-  componentDidUpdate = (
-    __: StatementsPageProps,
-    prevState: StatementsPageState,
-  ): void => {
-    if (this.state.search && this.state.search !== prevState.search) {
-      this.props.onSearchComplete(this.filteredStatementsData());
+  updateQueryParams(): void {
+    const { history, search, sortSetting } = this.props;
+    const tab = "Statements";
+
+    // Search.
+    const searchParams = new URLSearchParams(history.location.search);
+    const currentTab = searchParams.get("tab") || "";
+    const searchQueryString = searchParams.get("q") || "";
+    if (currentTab === tab && search && search != searchQueryString) {
+      syncHistory(
+        {
+          q: search,
+        },
+        history,
+      );
     }
+
+    // Filters.
+    updateFiltersQueryParamsOnTab(tab, this.state.filters, history);
+
+    // Sort Setting.
+    updateSortSettingQueryParamsOnTab(
+      tab,
+      sortSetting,
+      {
+        ascending: false,
+        columnTitle: "executionCount",
+      },
+      history,
+    );
+  }
+
+  componentDidUpdate = (): void => {
+    this.updateQueryParams();
     this.refreshStatements();
     if (!this.props.isTenant) {
       this.props.refreshStatementDiagnosticsRequests();
@@ -270,63 +300,85 @@ export class StatementsPage extends React.Component<
   };
 
   onSubmitSearchField = (search: string): void => {
-    this.setState({ search });
+    if (this.props.onSearchComplete) {
+      this.props.onSearchComplete(search);
+    }
     this.resetPagination();
-    this.syncHistory({
-      q: search,
-    });
+    syncHistory(
+      {
+        q: search,
+      },
+      this.props.history,
+    );
   };
 
   onSubmitFilters = (filters: Filters): void => {
+    if (this.props.onFilterChange) {
+      this.props.onFilterChange(filters);
+    }
+
     this.setState({
-      filters: {
-        ...this.state.filters,
-        ...filters,
-      },
+      filters: filters,
       activeFilters: calculateActiveFilters(filters),
     });
 
     this.resetPagination();
-    this.syncHistory({
-      app: filters.app,
-      timeNumber: filters.timeNumber,
-      timeUnit: filters.timeUnit,
-      sqlType: filters.sqlType,
-      database: filters.database,
-      regions: filters.regions,
-      nodes: filters.nodes,
-    });
+    syncHistory(
+      {
+        app: filters.app,
+        timeNumber: filters.timeNumber,
+        timeUnit: filters.timeUnit,
+        fullScan: filters.fullScan.toString(),
+        sqlType: filters.sqlType,
+        database: filters.database,
+        regions: filters.regions,
+        nodes: filters.nodes,
+      },
+      this.props.history,
+    );
   };
 
   onClearSearchField = (): void => {
-    this.setState({ search: "" });
-    this.syncHistory({
-      q: undefined,
-    });
+    if (this.props.onSearchComplete) {
+      this.props.onSearchComplete("");
+    }
+    syncHistory(
+      {
+        q: undefined,
+      },
+      this.props.history,
+    );
   };
 
   onClearFilters = (): void => {
+    if (this.props.onFilterChange) {
+      this.props.onFilterChange(defaultFilters);
+    }
+
     this.setState({
-      filters: {
-        ...defaultFilters,
-      },
+      filters: defaultFilters,
       activeFilters: 0,
     });
+
     this.resetPagination();
-    this.syncHistory({
-      app: undefined,
-      timeNumber: undefined,
-      timeUnit: undefined,
-      sqlType: undefined,
-      database: undefined,
-      regions: undefined,
-      nodes: undefined,
-    });
+    syncHistory(
+      {
+        app: undefined,
+        timeNumber: undefined,
+        timeUnit: undefined,
+        fullScan: undefined,
+        sqlType: undefined,
+        database: undefined,
+        regions: undefined,
+        nodes: undefined,
+      },
+      this.props.history,
+    );
   };
 
   filteredStatementsData = (): AggregateStatistics[] => {
-    const { search, filters } = this.state;
-    const { statements, nodeRegions, isTenant } = this.props;
+    const { filters } = this.state;
+    const { search, statements, nodeRegions, isTenant } = this.props;
     const timeValue = getTimeValueInSeconds(filters);
     const sqlTypes =
       filters.sqlType.length > 0
@@ -338,6 +390,9 @@ export class StatementsPage extends React.Component<
         : [];
     const databases =
       filters.database.length > 0 ? filters.database.split(",") : [];
+    if (databases.includes("(unset)")) {
+      databases.push("");
+    }
     const regions =
       filters.regions.length > 0 ? filters.regions.split(",") : [];
     const nodes = filters.nodes.length > 0 ? filters.nodes.split(",") : [];
@@ -352,15 +407,15 @@ export class StatementsPage extends React.Component<
         statement =>
           databases.length == 0 || databases.includes(statement.database),
       )
-      .filter(statement =>
-        this.state.filters.fullScan ? statement.fullScan : true,
-      )
+      .filter(statement => (filters.fullScan ? statement.fullScan : true))
       .filter(statement =>
         search
-          .split(" ")
-          .every(val =>
-            statement.label.toLowerCase().includes(val.toLowerCase()),
-          ),
+          ? search
+              .split(" ")
+              .every(val =>
+                statement.label.toLowerCase().includes(val.toLowerCase()),
+              )
+          : true,
       )
       .filter(
         statement =>
@@ -404,13 +459,12 @@ export class StatementsPage extends React.Component<
       );
   };
 
-  renderStatements = () => {
-    const { pagination, search, filters, activeFilters } = this.state;
+  renderStatements = (): React.ReactElement => {
+    const { pagination, filters, activeFilters } = this.state;
     const {
       statements,
+      apps,
       databases,
-      lastReset,
-      location,
       onDiagnosticsReportDownload,
       onStatementClick,
       resetSQLStats,
@@ -418,11 +472,9 @@ export class StatementsPage extends React.Component<
       onColumnsChange,
       nodeRegions,
       isTenant,
+      sortSetting,
+      search,
     } = this.props;
-    const appAttrValue = queryByName(location, appAttr);
-    const selectedApp = appAttrValue || "";
-    const appOptions = [{ value: "", label: "All" }];
-    this.props.apps.forEach(app => appOptions.push({ value: app, label: app }));
     const data = this.filteredStatementsData();
     const totalWorkload = calculateTotalWorkload(data);
     const totalCount = data.length;
@@ -444,7 +496,7 @@ export class StatementsPage extends React.Component<
     // hiding columns that won't be displayed for tenants.
     const columns = makeStatementsColumns(
       statements,
-      selectedApp,
+      filters.app,
       totalWorkload,
       nodeRegions,
       "statement",
@@ -495,7 +547,7 @@ export class StatementsPage extends React.Component<
           <PageConfigItem>
             <Filter
               onSubmitFilters={this.onSubmitFilters}
-              appNames={appOptions}
+              appNames={apps}
               dbNames={databases}
               regions={regions}
               nodes={nodes.map(n => "n" + n)}
@@ -508,17 +560,19 @@ export class StatementsPage extends React.Component<
               showNodes={nodes.length > 1}
             />
           </PageConfigItem>
-          <PageConfigItem>
-            <DateRange
-              start={this.props.dateRange[0]}
-              end={this.props.dateRange[1]}
-              onSubmit={this.changeDateRange}
+          <PageConfigItem className={commonStyles("separator")}>
+            <TimeScaleDropdown
+              currentScale={this.props.timeScale}
+              setTimeScale={this.changeTimeScale}
             />
           </PageConfigItem>
           <PageConfigItem>
             <button className={cx("reset-btn")} onClick={this.resetTime}>
               reset time
             </button>
+          </PageConfigItem>
+          <PageConfigItem className={commonStyles("separator")}>
+            <ClearStats resetSQLStats={resetSQLStats} tooltipType="statement" />
           </PageConfigItem>
         </PageConfig>
         <section className={sortableTableCx("cl-table-container")}>
@@ -529,21 +583,18 @@ export class StatementsPage extends React.Component<
             />
             <TableStatistics
               pagination={pagination}
-              lastReset={lastReset}
               search={search}
               totalCount={totalCount}
               arrayItemName="statements"
-              tooltipType="statement"
               activeFilters={activeFilters}
               onClearFilters={this.onClearFilters}
-              resetSQLStats={resetSQLStats}
             />
           </div>
           <StatementsSortedTable
             className="statements-table"
             data={data}
             columns={displayColumns}
-            sortSetting={this.state.sortSetting}
+            sortSetting={sortSetting}
             onChangeSortSetting={this.changeSortSetting}
             renderNoResult={
               <EmptyStatementsPlaceholder
@@ -563,22 +614,23 @@ export class StatementsPage extends React.Component<
     );
   };
 
-  render() {
+  render(): React.ReactElement {
     const {
-      location,
       refreshStatementDiagnosticsRequests,
       onActivateStatementDiagnostics,
       onDiagnosticsModalOpen,
     } = this.props;
-    const app = queryByName(location, appAttr);
     return (
       <div className={cx("root", "table-area")}>
-        <Helmet title={app ? `${app} App | Statements` : "Statements"} />
-        <h3 className={cx("base-heading")}>Statements</h3>
         <Loading
           loading={isNil(this.props.statements)}
           error={this.props.statementsError}
           render={this.renderStatements}
+          renderError={() =>
+            SQLActivityError({
+              statsType: "statements",
+            })
+          }
         />
         <ActivateStatementDiagnosticsModal
           ref={this.activateDiagnosticsRef}

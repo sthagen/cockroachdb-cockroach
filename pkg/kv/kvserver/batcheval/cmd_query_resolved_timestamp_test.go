@@ -35,7 +35,7 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	db := storage.NewInMemForTesting(true)
+	db := storage.NewDefaultInMemForTesting()
 	defer db.Close()
 
 	makeTS := func(ts int64) hlc.Timestamp {
@@ -45,7 +45,7 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 		require.NoError(t, storage.MVCCDelete(ctx, db, nil, roachpb.Key(k), makeTS(ts), nil))
 	}
 	writeIntent := func(k string, ts int64) {
-		txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, makeTS(ts), 0)
+		txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, makeTS(ts), 0, 1)
 		require.NoError(t, storage.MVCCDelete(ctx, db, nil, roachpb.Key(k), makeTS(ts), &txn))
 	}
 	writeInline := func(k string) {
@@ -217,7 +217,7 @@ func TestQueryResolvedTimestampErrors(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	db := storage.NewInMemForTesting(true)
+	db := storage.NewDefaultInMemForTesting()
 	defer db.Close()
 
 	txnUUID := uuid.FromUint128(uint128.FromInts(0, 12345))

@@ -2,17 +2,16 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "spanconfigstore",
-    srcs = [
-        "shadow.go",
-        "store.go",
-    ],
+    srcs = ["store.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
         "//pkg/roachpb:with-mocks",
+        "//pkg/settings",
         "//pkg/spanconfig",
         "//pkg/util/interval",
+        "//pkg/util/iterutil",
         "//pkg/util/log",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
@@ -27,6 +26,8 @@ go_test(
     deps = [
         "//pkg/roachpb:with-mocks",
         "//pkg/spanconfig",
+        "//pkg/spanconfig/spanconfigtestutils",
+        "//pkg/testutils",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
         "@com_github_cockroachdb_datadriven//:datadriven",

@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -34,6 +35,7 @@ type blockingBuffer struct {
 	mu struct {
 		syncutil.Mutex
 		closed  bool             // True when buffer closed.
+		reason  error            // Reason buffer is closed.
 		drainCh chan struct{}    // Set when Drain request issued.
 		blocked bool             // Set when event is blocked, waiting to acquire quota.
 		queue   bufferEntryQueue // Queue of added events.
@@ -47,8 +49,10 @@ type blockingBuffer struct {
 func NewMemBuffer(
 	acc mon.BoundAccount, sv *settings.Values, metrics *Metrics, opts ...quotapool.Option,
 ) Buffer {
+	const slowAcquisitionThreshold = 5 * time.Second
+
 	opts = append(opts,
-		quotapool.OnSlowAcquisition(5*time.Second, quotapool.LogSlowAcquisition),
+		quotapool.OnSlowAcquisition(slowAcquisitionThreshold, logSlowAcquisition(slowAcquisitionThreshold)),
 		quotapool.OnWaitFinish(
 			func(ctx context.Context, poolName string, r quotapool.Request, start time.Time) {
 				metrics.BufferPushbackNanos.Inc(timeutil.Since(start).Nanoseconds())
@@ -74,7 +78,7 @@ func (b *blockingBuffer) pop() (e *bufferEntry, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.mu.closed {
-		return nil, ErrBufferClosed
+		return nil, ErrBufferClosed{reason: b.mu.reason}
 	}
 
 	e = b.mu.queue.dequeue()
@@ -106,6 +110,10 @@ func (b *blockingBuffer) pop() (e *bufferEntry, err error) {
 func (b *blockingBuffer) notifyOutOfQuota() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.mu.closed {
+		return
+	}
 	b.mu.blocked = true
 
 	select {
@@ -125,7 +133,6 @@ func (b *blockingBuffer) Get(ctx context.Context) (ev Event, err error) {
 		if got != nil {
 			b.metrics.BufferEntriesOut.Inc(1)
 			e := got.e
-			e.bufferGetTimestamp = timeutil.Now()
 			bufferEntryPool.Put(got)
 			return e, nil
 		}
@@ -153,11 +160,17 @@ func (b *blockingBuffer) ensureOpenedLocked(ctx context.Context) error {
 	return nil
 }
 
-func (b *blockingBuffer) enqueue(ctx context.Context, be *bufferEntry) error {
+func (b *blockingBuffer) enqueue(ctx context.Context, be *bufferEntry) (err error) {
 	// Enqueue message, and signal if anybody is waiting.
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if err := b.ensureOpenedLocked(ctx); err != nil {
+	defer func() {
+		if err != nil {
+			bufferEntryPool.Put(be)
+		}
+	}()
+
+	if err = b.ensureOpenedLocked(ctx); err != nil {
 		return err
 	}
 
@@ -193,6 +206,7 @@ func (b *blockingBuffer) Add(ctx context.Context, e Event) error {
 		entries: 1,
 		ap:      &b.qp,
 	}
+	e.bufferAddTimestamp = timeutil.Now()
 	be := newBufferEntry(e)
 
 	if err := b.qp.Acquire(ctx, be); err != nil {
@@ -230,29 +244,10 @@ func (b *blockingBuffer) Drain(ctx context.Context) error {
 	return nil
 }
 
-// Close implements Writer interface.
-func (b *blockingBuffer) Close(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.mu.closed {
-		logcrash.ReportOrPanic(ctx, b.sv, "close called multiple times")
-		return errors.AssertionFailedf("close called multiple times")
-	}
-
-	b.mu.closed = true
-	close(b.signalCh)
-
+// CloseWithReason implements Writer interface.
+func (b *blockingBuffer) CloseWithReason(ctx context.Context, reason error) error {
 	// Close quota pool -- any requests waiting to acquire will receive an error.
-	// It would be nice if we can logcrash if anybody was waiting.
 	b.qp.Close("blocking buffer closing")
-
-	// Release all resources we have queued up.
-	var alloc Alloc
-	for be := b.mu.queue.dequeue(); be != nil; be = b.mu.queue.dequeue() {
-		alloc.Merge(&be.e.alloc)
-	}
-	alloc.Release(ctx)
 
 	// Mark memory quota closed, and close the underlying bound account,
 	// releasing all of its allocated resources at once.
@@ -275,6 +270,25 @@ func (b *blockingBuffer) Close(ctx context.Context) error {
 		quota.acc.Close(ctx)
 		return false
 	})
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.mu.closed {
+		logcrash.ReportOrPanic(ctx, b.sv, "close called multiple times")
+		return errors.AssertionFailedf("close called multiple times")
+	}
+
+	b.mu.closed = true
+	b.mu.reason = reason
+	close(b.signalCh)
+
+	// Return all queued up entries to the buffer pool.
+	// Note: we do not need to release their resources since we are going to close
+	// bound account anyway.
+	for be := b.mu.queue.dequeue(); be != nil; be = b.mu.queue.dequeue() {
+		bufferEntryPool.Put(be)
+	}
 
 	return nil
 }
@@ -424,4 +438,25 @@ func (ap allocPool) Release(ctx context.Context, bytes, entries int64) {
 		ap.metrics.BufferEntriesReleased.Inc(entries)
 		return true
 	})
+}
+
+// logSlowAcquisition is a function returning a quotapool.SlowAcquisitionFunction.
+// It differs from the quotapool.LogSlowAcquisition in that only some of slow acquisition
+// events are logged to reduce log spam.
+func logSlowAcquisition(slowAcquisitionThreshold time.Duration) quotapool.SlowAcquisitionFunc {
+	logSlowAcquire := log.Every(slowAcquisitionThreshold)
+
+	return func(ctx context.Context, poolName string, r quotapool.Request, start time.Time) func() {
+		shouldLog := logSlowAcquire.ShouldLog()
+		if shouldLog {
+			log.Warningf(ctx, "have been waiting %s attempting to acquire changefeed quota",
+				timeutil.Since(start))
+		}
+
+		return func() {
+			if shouldLog {
+				log.Infof(ctx, "acquired changefeed quota after %s", timeutil.Since(start))
+			}
+		}
+	}
 }

@@ -15,11 +15,15 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -36,9 +40,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/redact"
 )
 
 // Context defaults.
@@ -56,6 +62,10 @@ const (
 	defaultScanMaxIdleTime   = 1 * time.Second
 
 	DefaultStorePath = "cockroach-data"
+	// DefaultSQLNodeStorePathPrefix is path prefix that is used by default
+	// on tenant sql nodes to separate from server node if running on the
+	// same server without explicit --store location.
+	DefaultSQLNodeStorePathPrefix = "cockroach-data-tenant-"
 	// TempDirPrefix is the filename prefix of any temporary subdirectory
 	// created.
 	TempDirPrefix = "cockroach-temp"
@@ -113,6 +123,19 @@ type BaseConfig struct {
 	*base.Config
 
 	Tracer *tracing.Tracer
+
+	// idProvider is an interface that makes the logging package
+	// able to peek into the server IDs defined by this configuration.
+	idProvider *idProvider
+
+	// IDContainer is the Node ID / SQL Instance ID container
+	// that will contain the ID for the server to instantiate.
+	IDContainer *base.NodeIDContainer
+
+	// ClusterIDContainer is the Cluster ID container for the server to
+	// instantiate.
+	ClusterIDContainer *base.ClusterIDContainer
+
 	// AmbientCtx is used to annotate contexts used inside the server.
 	AmbientCtx log.AmbientContext
 
@@ -165,15 +188,27 @@ func MakeBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 	if tr == nil {
 		panic("nil Tracer")
 	}
-	baseCfg := BaseConfig{
-		Tracer:            tr,
-		AmbientCtx:        log.AmbientContext{Tracer: tr},
-		Config:            new(base.Config),
-		Settings:          st,
-		MaxOffset:         MaxOffsetType(base.DefaultMaxClockOffset),
-		DefaultZoneConfig: zonepb.DefaultZoneConfig(),
-		StorageEngine:     storage.DefaultStorageEngine,
+	idsProvider := &idProvider{
+		clusterID: &base.ClusterIDContainer{},
+		serverID:  &base.NodeIDContainer{},
 	}
+	baseCfg := BaseConfig{
+		Tracer:             tr,
+		idProvider:         idsProvider,
+		IDContainer:        idsProvider.serverID,
+		ClusterIDContainer: idsProvider.clusterID,
+		AmbientCtx:         log.MakeServerAmbientContext(tr, idsProvider),
+		Config:             new(base.Config),
+		Settings:           st,
+		MaxOffset:          MaxOffsetType(base.DefaultMaxClockOffset),
+		DefaultZoneConfig:  zonepb.DefaultZoneConfig(),
+		StorageEngine:      storage.DefaultStorageEngine,
+	}
+	// We use the tag "n" here for both KV nodes and SQL instances,
+	// using the knowledge that the value part of a SQL instance ID
+	// container will prefix the value with the string "sql", resulting
+	// in a tag that is prefixed with "nsql".
+	baseCfg.AmbientCtx.AddLogTag("n", baseCfg.IDContainer)
 	baseCfg.InitDefaults()
 	return baseCfg
 }
@@ -282,7 +317,7 @@ type KVConfig struct {
 	// do nontrivial work.
 	ReadyFn func(waitForInit bool)
 
-	// DelayedBootstrapFn is called if the boostrap process does not complete
+	// DelayedBootstrapFn is called if the bootstrap process does not complete
 	// in a timely fashion, typically 30s after the server starts listening.
 	DelayedBootstrapFn func()
 
@@ -402,6 +437,11 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 
 	sqlCfg := MakeSQLConfig(roachpb.SystemTenantID, tempStorageCfg)
 	tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV))
+	// NB: The OnChange callback will be called on server startup when the version
+	// is initialized.
+	st.Version.SetOnChange(func(ctx context.Context, newVersion clusterversion.ClusterVersion) {
+		tr.SetBackwardsCompatibilityWith211(!newVersion.IsActive(clusterversion.TraceIDDoesntImplyStructuredRecording))
+	})
 	baseCfg := MakeBaseConfig(st, tr)
 	kvCfg := MakeKVConfig(storeSpec)
 
@@ -476,7 +516,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		return Engines{}, errors.Errorf("engines already created")
 	}
 	cfg.enginesCreated = true
-	details := []string{fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize))}
+	details := []redact.RedactableString{redact.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize))}
 	pebbleCache := pebble.NewCache(cfg.CacheSize)
 	defer pebbleCache.Unref()
 
@@ -493,10 +533,15 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 	log.Event(ctx, "initializing engines")
 
+	var tableCache *pebble.TableCache
+	if physicalStores > 0 {
+		perStoreLimit := pebble.TableCacheSize(int(openFileLimitPerStore))
+		totalFileLimit := perStoreLimit * physicalStores
+		tableCache = pebble.NewTableCache(pebbleCache, runtime.GOMAXPROCS(0), totalFileLimit)
+	}
+
 	skipSizeCheck := cfg.TestingKnobs.Store != nil &&
 		cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).SkipMinSizeCheck
-	disableSeparatedIntents := cfg.TestingKnobs.Store != nil &&
-		cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).StorageKnobs.DisableSeparatedIntents
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 		var sizeInBytes = spec.Size.InBytes
@@ -512,7 +557,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				return Engines{}, errors.Errorf("%f%% of memory is only %s bytes, which is below the minimum requirement of %s",
 					spec.Size.Percent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
-			details = append(details, fmt.Sprintf("store %d: in-memory, size %s",
+			details = append(details, redact.Sprintf("store %d: in-memory, size %s",
 				i, humanizeutil.IBytes(sizeInBytes)))
 			if spec.StickyInMemoryEngineID != "" {
 				if cfg.TestingKnobs.Server == nil {
@@ -530,6 +575,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				if err != nil {
 					return Engines{}, err
 				}
+				details = append(details, redact.Sprintf("store %d: %+v", i, e.Properties()))
 				engines = append(engines, e)
 			} else {
 				e, err := storage.Open(ctx,
@@ -538,8 +584,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 					storage.CacheSize(cfg.CacheSize),
 					storage.MaxSize(sizeInBytes),
 					storage.EncryptionAtRest(spec.EncryptionOptions),
-					storage.Settings(cfg.Settings),
-					storage.SetSeparatedIntents(disableSeparatedIntents))
+					storage.Settings(cfg.Settings))
 				if err != nil {
 					return Engines{}, err
 				}
@@ -561,24 +606,24 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 					spec.Size.Percent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
 
-			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
+			details = append(details, redact.Sprintf("store %d: max size %s, max open file limit %d",
 				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
 
 			storageConfig := base.StorageConfig{
-				Attrs:                   spec.Attributes,
-				Dir:                     spec.Path,
-				MaxSize:                 sizeInBytes,
-				BallastSize:             storage.BallastSizeBytes(spec, du),
-				Settings:                cfg.Settings,
-				UseFileRegistry:         spec.UseFileRegistry,
-				DisableSeparatedIntents: disableSeparatedIntents,
-				EncryptionOptions:       spec.EncryptionOptions,
+				Attrs:             spec.Attributes,
+				Dir:               spec.Path,
+				MaxSize:           sizeInBytes,
+				BallastSize:       storage.BallastSizeBytes(spec, du),
+				Settings:          cfg.Settings,
+				UseFileRegistry:   spec.UseFileRegistry,
+				EncryptionOptions: spec.EncryptionOptions,
 			}
 			pebbleConfig := storage.PebbleConfig{
 				StorageConfig: storageConfig,
 				Opts:          storage.DefaultPebbleOptions(),
 			}
 			pebbleConfig.Opts.Cache = pebbleCache
+			pebbleConfig.Opts.TableCache = tableCache
 			pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
 			// If the spec contains Pebble options, set those too.
 			if len(spec.PebbleOptions) > 0 {
@@ -594,7 +639,15 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			if err != nil {
 				return Engines{}, err
 			}
+			details = append(details, redact.Sprintf("store %d: %+v", i, eng.Properties()))
 			engines = append(engines, eng)
+		}
+	}
+
+	if tableCache != nil {
+		// Unref the table cache now that the engines hold references to it.
+		if err := tableCache.Unref(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -722,4 +775,110 @@ func parseAttributes(attrsStr string) roachpb.Attributes {
 		}
 	}
 	return roachpb.Attributes{Attrs: filtered}
+}
+
+// idProvider connects the server ID containers in this
+// package to the logging package.
+//
+// For each of the "main" data items, it also memoizes its
+// representation as a string (the one needed by the
+// log.ServerIdentificationPayload interface) as soon as the value is
+// initialized. This saves on conversion costs.
+type idProvider struct {
+	// clusterID contains the cluster ID (initialized late).
+	clusterID *base.ClusterIDContainer
+	// clusterStr is the memoized representation of clusterID, once known.
+	clusterStr atomic.Value
+
+	// tenantID is the tenant ID for this server.
+	tenantID roachpb.TenantID
+	// tenantStr is the memoized representation of tenantID.
+	tenantStr atomic.Value
+
+	// serverID contains the node ID for KV nodes (when tenantID.IsSet() ==
+	// false), or the SQL instance ID for SQL-only servers (when
+	// tenantID.IsSet() == true).
+	serverID *base.NodeIDContainer
+	// serverStr is the memoized representation of serverID.
+	serverStr atomic.Value
+}
+
+var _ log.ServerIdentificationPayload = (*idProvider)(nil)
+
+// ServerIdentityString implements the log.ServerIdentificationPayload interface.
+func (s *idProvider) ServerIdentityString(key log.ServerIdentificationKey) string {
+	switch key {
+	case log.IdentifyClusterID:
+		c := s.clusterStr.Load()
+		cs, ok := c.(string)
+		if !ok {
+			cid := s.clusterID.Get()
+			if cid != uuid.Nil {
+				cs = cid.String()
+				s.clusterStr.Store(cs)
+			}
+		}
+		return cs
+
+	case log.IdentifyTenantID:
+		t := s.tenantStr.Load()
+		ts, ok := t.(string)
+		if !ok {
+			tid := s.tenantID
+			if tid.IsSet() {
+				ts = strconv.FormatUint(tid.ToUint64(), 10)
+				s.tenantStr.Store(ts)
+			}
+		}
+		return ts
+
+	case log.IdentifyInstanceID:
+		// If tenantID is not set, this is a KV node and it has no SQL
+		// instance ID.
+		if !s.tenantID.IsSet() {
+			return ""
+		}
+		return s.maybeMemoizeServerID()
+
+	case log.IdentifyKVNodeID:
+		// If tenantID is set, this is a SQL-only server and it has no
+		// node ID.
+		if s.tenantID.IsSet() {
+			return ""
+		}
+		return s.maybeMemoizeServerID()
+	}
+
+	return ""
+}
+
+// SetTenant informs the provider that it provides data for
+// a SQL server.
+//
+// Note: this should not be called concurrently with logging which may
+// invoke the method from the log.ServerIdentificationPayload
+// interface.
+func (s *idProvider) SetTenant(tenantID roachpb.TenantID) {
+	if !tenantID.IsSet() {
+		panic("programming error: invalid tenant ID")
+	}
+	if s.tenantID.IsSet() {
+		panic("programming error: provider already set for tenant server")
+	}
+	s.tenantID = tenantID
+}
+
+// maybeMemoizeServerID saves the representation of serverID to
+// serverStr if the former is initialized.
+func (s *idProvider) maybeMemoizeServerID() string {
+	si := s.serverStr.Load()
+	sis, ok := si.(string)
+	if !ok {
+		sid := s.serverID.Get()
+		if sid != 0 {
+			sis = strconv.FormatUint(uint64(sid), 10)
+			s.serverStr.Store(sis)
+		}
+	}
+	return sis
 }

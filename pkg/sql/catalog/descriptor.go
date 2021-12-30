@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -145,7 +144,8 @@ type LeasableDescriptor interface {
 	// GetDrainingNames returns the list of "draining names" for this descriptor.
 	// Draining names are names that were in use by this descriptor, but are no
 	// longer due to renames.
-	GetDrainingNames() []descpb.NameInfo
+	// TODO(postamar): remove GetDrainingNames method in 22.2
+	GetDrainingNames() []descpb.NameInfo // Deprecated
 }
 
 // Descriptor is an interface to be shared by individual descriptor
@@ -182,6 +182,12 @@ type Descriptor interface {
 	// DescriptorProto prepares this descriptor for serialization.
 	DescriptorProto() *descpb.Descriptor
 
+	//ByteSize returns the memory held by the Descriptor.
+	ByteSize() int64
+
+	// NewBuilder initializes a DescriptorBuilder with this descriptor.
+	NewBuilder() DescriptorBuilder
+
 	// GetReferencedDescIDs returns the IDs of all descriptors directly referenced
 	// by this descriptor, including itself.
 	GetReferencedDescIDs() (DescriptorIDSet, error)
@@ -213,9 +219,16 @@ type DatabaseDescriptor interface {
 	// MultiRegionEnumID returns the ID of the multi-region enum if the database
 	// is a multi-region database, and an error otherwise.
 	MultiRegionEnumID() (descpb.ID, error)
-	// ForEachSchemaInfo iterates f over each schema info mapping in the descriptor.
+	// ForEachSchemaInfo iterates f over each schema info mapping in the
+	// descriptor.
 	// iterutil.StopIteration is supported.
-	ForEachSchemaInfo(func(id descpb.ID, name string, isDropped bool) error) error
+	// TODO(postamar): remove ForEachSchemaInfo method in 22.2
+	ForEachSchemaInfo(func(id descpb.ID, name string, isDropped bool) error) error // Deprecated
+	// ForEachNonDroppedSchema iterates f over each non-dropped schema info
+	// mapping in the descriptor.
+	// iterutil.StopIteration is supported.
+	// TODO(postamar): rename this in 22.2 when all mappings are non-dropped.
+	ForEachNonDroppedSchema(func(id descpb.ID, name string) error) error
 	// GetSchemaID returns the ID in the schema mapping entry for the
 	// given name, 0 otherwise.
 	GetSchemaID(name string) descpb.ID
@@ -225,6 +238,7 @@ type DatabaseDescriptor interface {
 	// GetDefaultPrivilegeDescriptor returns the default privileges for this
 	// database.
 	GetDefaultPrivilegeDescriptor() DefaultPrivilegeDescriptor
+	HasPublicSchemaWithDescriptor() bool
 }
 
 // TableDescriptor is an interface around the table descriptor types.
@@ -260,9 +274,6 @@ type TableDescriptor interface {
 	// Sequences count as physical tables because their values are stored in
 	// the KV layer.
 	IsPhysicalTable() bool
-	// IsInterleaved returns true if any part of this this table is interleaved with
-	// another table's data.
-	IsInterleaved() bool
 	// MaterializedView returns whether or not this TableDescriptor is a
 	// MaterializedView.
 	MaterializedView() bool
@@ -402,9 +413,6 @@ type TableDescriptor interface {
 	// in preparation to add a new one. In CockroachDB, all tables have primary
 	// keys, even if they're not defined by the user.
 	HasPrimaryKey() bool
-	// PrimaryKeyString returns the pretty-printed primary key declaration for a
-	// table descriptor.
-	PrimaryKeyString() string
 
 	// AllColumns returns a slice of Column interfaces containing the
 	// table's public columns and column mutations, in the canonical order:
@@ -678,7 +686,9 @@ type TypeDescriptor interface {
 // types.T. Implementers of tree.TypeReferenceResolver should implement this
 // interface as well.
 type TypeDescriptorResolver interface {
-	// GetTypeDescriptor returns the type descriptor for the input ID.
+	// GetTypeDescriptor returns the type descriptor for the input ID. Note that
+	// the returned type descriptor may be the implicitly-defined record type for
+	// a table, if the input ID points to a table descriptor.
 	GetTypeDescriptor(ctx context.Context, id descpb.ID) (tree.TypeName, TypeDescriptor, error)
 }
 
@@ -686,14 +696,9 @@ type TypeDescriptorResolver interface {
 // DefaultPrivilegeDescriptor protos are not accessed and interacted
 // with directly.
 type DefaultPrivilegeDescriptor interface {
-	CreatePrivilegesFromDefaultPrivileges(
-		dbID descpb.ID,
-		user security.SQLUsername,
-		targetObject tree.AlterDefaultPrivilegesTargetObject,
-		databasePrivileges *descpb.PrivilegeDescriptor,
-	) *descpb.PrivilegeDescriptor
 	GetDefaultPrivilegesForRole(descpb.DefaultPrivilegesRole) (*descpb.DefaultPrivilegesForRole, bool)
 	ForEachDefaultPrivilegeForRole(func(descpb.DefaultPrivilegesForRole) error) error
+	GetDefaultPrivilegeDescriptorType() descpb.DefaultPrivilegeDescriptor_DefaultPrivilegeDescriptorType
 }
 
 // FilterDescriptorState inspects the state of a given descriptor and returns an
@@ -763,16 +768,16 @@ func FormatSafeDescriptorProperties(w *redact.StringBuilder, desc Descriptor) {
 			w.Printf(", OfflineReason: %q", redact.Safe(offlineReason))
 		}
 	}
-	if drainingNames := desc.GetDrainingNames(); len(drainingNames) > 0 {
-		w.Printf(", NumDrainingNames: %d", len(drainingNames))
-	}
 }
 
 // IsSystemDescriptor returns true iff the descriptor is a system or a reserved
 // descriptor.
 func IsSystemDescriptor(desc Descriptor) bool {
-	if desc.GetID() <= keys.MaxReservedDescID {
+	if desc.GetParentID() == keys.SystemDatabaseID {
 		return true
 	}
-	return desc.GetParentID() == keys.SystemDatabaseID
+	if desc.GetID() == keys.SystemDatabaseID {
+		return true
+	}
+	return false
 }

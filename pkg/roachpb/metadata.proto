@@ -133,19 +133,22 @@ message ReplicaDescriptor {
   option (gogoproto.populate) = true;
 
   optional int32 node_id = 1 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
+      (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID",
+      (gogoproto.moretags) = "yaml:\"NodeID\""];
   optional int32 store_id = 2 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID"];
+      (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID",
+      (gogoproto.moretags) = "yaml:\"StoreID\""];
 
   // replica_id uniquely identifies a replica instance. If a range is removed from
   // a store and then re-added to the same store, the new instance will have a
   // higher replica_id.
   optional int32 replica_id = 3 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "ReplicaID", (gogoproto.casttype) = "ReplicaID"];
+      (gogoproto.customname) = "ReplicaID", (gogoproto.casttype) = "ReplicaID",
+      (gogoproto.moretags) = "yaml:\"ReplicaID\""];
 
   // Type indicates which raft activities a replica participates in. A nil type
   // is equivalent to VOTER.
-  optional ReplicaType type = 4;
+  optional ReplicaType type = 4 [(gogoproto.moretags) = "yaml:\"ReplicaType,omitempty\""];
 }
 
 // ReplicaIdent uniquely identifies a specific replica.
@@ -281,7 +284,7 @@ message RangeDescriptor {
   // merged by the merge queue. Previous, we threw an error when a user
   // attempted to execute ALTER TABLE/INDEX ... SPLIT AT ... when the merge
   // queue is enabled. With sticky_bit, users can manually split ranges without
-  // diabling the merge queue.
+  // disabling the merge queue.
   optional util.hlc.Timestamp sticky_bit = 7;
 }
 
@@ -334,6 +337,34 @@ message StoreCapacity {
   optional Percentiles writes_per_replica = 7 [(gogoproto.nullable) = false];
 }
 
+// StoreProperties contains configuration and OS-level details for a storage device.
+message StoreProperties {
+  // encrypted indicates whether the store is encrypted.
+  optional bool encrypted = 1 [(gogoproto.nullable) = false];
+  // read_only indicates whether the store is attached read_only.
+  optional bool read_only = 2 [(gogoproto.nullable) = false];
+
+  // disk_properties reports details about the underlying filesystem,
+  // when the store is supported by a file store. Unset otherwise.
+  optional FileStoreProperties file_store_properties = 3;
+}
+
+// FileStoreProperties contains configuration and OS-level details for a file store.
+message FileStoreProperties {
+  option (gogoproto.goproto_stringer) = false;
+
+  // path reports the configured filesystem path for the store.
+  optional string path = 1 [(gogoproto.nullable) = false];
+  // fs_type reports the external filesystem type (ufs, ext4, etc), if known.
+  optional string fs_type = 2 [(gogoproto.nullable) = false];
+  // block_device reports which block devices supports the filesystem, if known.
+  optional string block_device = 3 [(gogoproto.nullable) = false];
+  // mount_point reports the mount point of the filesystem, if known.
+  optional string mount_point = 4 [(gogoproto.nullable) = false];
+  // mount_options reports the mount options, if known.
+  optional string mount_options = 5 [(gogoproto.nullable) = false];
+}
+
 // NodeDescriptor holds details on node physical/network topology.
 message NodeDescriptor {
   option (gogoproto.equal) = true;
@@ -349,7 +380,7 @@ message NodeDescriptor {
   optional string cluster_name = 9 [(gogoproto.nullable) = false];
   // The SQL address. If empty, indicates that the base address field
   // is also used to accept SQL connections.
-  optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false, 
+  optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "SQLAddress"];
 }
 
@@ -369,6 +400,7 @@ message StoreDescriptor {
   optional Attributes attrs = 2 [(gogoproto.nullable) = false];
   optional NodeDescriptor node = 3 [(gogoproto.nullable) = false];
   optional StoreCapacity capacity = 4 [(gogoproto.nullable) = false];
+  optional StoreProperties properties = 5 [(gogoproto.nullable) = false];
 }
 
 // StoreDeadReplicas holds a storeID and a list of dead replicas on that store.

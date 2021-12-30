@@ -24,8 +24,10 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpch"
@@ -256,7 +258,7 @@ func (p *tpchVecPerfTest) postTestRunHook(
 				// however, the session variables might contain the old values,
 				// so we will open up new connections for each of the setups in
 				// order to get the correct cluster setup on each.
-				tempConn := c.Conn(ctx, 1)
+				tempConn := c.Conn(ctx, t.L(), 1)
 				defer tempConn.Close()
 				if _, err := tempConn.Exec("USE tpch;"); err != nil {
 					t.Fatal(err)
@@ -303,7 +305,7 @@ func (p *tpchVecPerfTest) postTestRunHook(
 					curlCmd := fmt.Sprintf(
 						"curl %s > logs/bundle_%s_%d.zip", url, runConfig.setupNames[setupIdx], i,
 					)
-					if err = c.RunL(ctx, t.L(), c.Node(1), curlCmd); err != nil {
+					if err = c.RunE(ctx, c.Node(1), curlCmd); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -444,7 +446,7 @@ func (d tpchVecDiskTest) preTestRunHook(
 	// order of 800MiB) in partitions of roughly workmem/4 in size. Such
 	// behavior is determined by the fact that we allocate some RAM for caches
 	// of disk queues (limiting us to use at most 2 input partitions).
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	workmemInKiB := 650 + rng.Intn(1350)
 	workmem := fmt.Sprintf("%dKiB", workmemInKiB)
 	t.Status(fmt.Sprintf("setting workmem='%s'", workmem))
@@ -469,14 +471,15 @@ func baseTestRun(
 			cmd := fmt.Sprintf("./workload run tpch --concurrency=1 --db=tpch "+
 				"--default-vectorize --max-ops=%d --queries=%d {pgurl:1} --enable-checks=true",
 				runConfig.numRunsPerQuery, queryNum)
-			workloadOutput, err := c.RunWithBuffer(ctx, t.L(), firstNode, cmd)
-			t.L().Printf("\n" + string(workloadOutput))
+			result, err := c.RunWithDetailsSingleNode(ctx, t.L(), firstNode, cmd)
+			workloadOutput := result.Stdout + result.Stderr
+			t.L().Printf(workloadOutput)
 			if err != nil {
 				// Note: if you see an error like "exit status 1", it is likely caused
 				// by the erroneous output of the query.
 				t.Fatal(err)
 			}
-			tc.postQueryRunHook(t, workloadOutput, setupIdx)
+			tc.postQueryRunHook(t, []byte(workloadOutput), setupIdx)
 		}
 	}
 }
@@ -542,9 +545,9 @@ func runTPCHVec(
 	firstNode := c.Node(1)
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", firstNode)
-	c.Start(ctx)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-	conn := c.Conn(ctx, 1)
+	conn := c.Conn(ctx, t.L(), 1)
 	disableAutoStats(t, conn)
 	t.Status("restoring TPCH dataset for Scale Factor 1")
 	if err := loadTPCHDataset(ctx, t, c, 1 /* sf */, c.NewMonitor(ctx), c.All()); err != nil {

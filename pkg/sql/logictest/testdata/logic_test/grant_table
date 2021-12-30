@@ -14,6 +14,7 @@ SHOW GRANTS ON DATABASE a
 ----
 database_name  grantee    privilege_type
 a              admin      ALL
+a              public     CONNECT
 a              readwrite  ALL
 a              root       ALL
 
@@ -23,6 +24,7 @@ SHOW GRANTS
 ----
 database_name  schema_name         relation_name                          grantee  privilege_type
 test           NULL                NULL                                   admin    ALL
+test           NULL                NULL                                   public   CONNECT
 test           NULL                NULL                                   root     ALL
 test           crdb_internal       NULL                                   admin    ALL
 test           crdb_internal       NULL                                   root     ALL
@@ -54,7 +56,6 @@ test           crdb_internal       gossip_network                         public
 test           crdb_internal       gossip_nodes                           public   SELECT
 test           crdb_internal       index_columns                          public   SELECT
 test           crdb_internal       index_usage_statistics                 public   SELECT
-test           crdb_internal       interleaved                            public   SELECT
 test           crdb_internal       invalid_objects                        public   SELECT
 test           crdb_internal       jobs                                   public   SELECT
 test           crdb_internal       kv_node_liveness                       public   SELECT
@@ -540,12 +541,17 @@ test           pg_catalog          varchar                                root  
 test           pg_catalog          varchar[]                              admin    ALL
 test           pg_catalog          varchar[]                              public   USAGE
 test           pg_catalog          varchar[]                              root     ALL
+test           pg_catalog          void                                   admin    ALL
+test           pg_catalog          void                                   public   USAGE
+test           pg_catalog          void                                   root     ALL
 test           pg_extension        NULL                                   admin    ALL
 test           pg_extension        NULL                                   root     ALL
 test           pg_extension        geography_columns                      public   SELECT
 test           pg_extension        geometry_columns                       public   SELECT
 test           pg_extension        spatial_ref_sys                        public   SELECT
 test           public              NULL                                   admin    ALL
+test           public              NULL                                   public   CREATE
+test           public              NULL                                   public   USAGE
 test           public              NULL                                   root     ALL
 
 query TTTTT colnames
@@ -633,6 +639,7 @@ test           pg_catalog          varbit          root     ALL
 test           pg_catalog          varbit[]        root     ALL
 test           pg_catalog          varchar         root     ALL
 test           pg_catalog          varchar[]       root     ALL
+test           pg_catalog          void            root     ALL
 test           pg_extension        NULL            root     ALL
 test           public              NULL            root     ALL
 
@@ -983,15 +990,20 @@ a              pg_extension  NULL                             admin      ALL
 a              pg_extension  NULL                             readwrite  ALL
 a              pg_extension  NULL                             root       ALL
 a              public        NULL                             admin      ALL
-a              public        NULL                             readwrite  ALL
+a              public        NULL                             public     CREATE
+a              public        NULL                             public     USAGE
 a              public        NULL                             root       ALL
 defaultdb      pg_extension  NULL                             admin      ALL
 defaultdb      pg_extension  NULL                             root       ALL
 defaultdb      public        NULL                             admin      ALL
+defaultdb      public        NULL                             public     CREATE
+defaultdb      public        NULL                             public     USAGE
 defaultdb      public        NULL                             root       ALL
 postgres       pg_extension  NULL                             admin      ALL
 postgres       pg_extension  NULL                             root       ALL
 postgres       public        NULL                             admin      ALL
+postgres       public        NULL                             public     CREATE
+postgres       public        NULL                             public     USAGE
 postgres       public        NULL                             root       ALL
 system         pg_extension  NULL                             admin      GRANT
 system         pg_extension  NULL                             admin      USAGE
@@ -1004,6 +1016,8 @@ system         public        NULL                             root       USAGE
 test           pg_extension  NULL                             admin      ALL
 test           pg_extension  NULL                             root       ALL
 test           public        NULL                             admin      ALL
+test           public        NULL                             public     CREATE
+test           public        NULL                             public     USAGE
 test           public        NULL                             root       ALL
 
 query TTTTT colnames
@@ -1091,6 +1105,7 @@ a              pg_catalog          varbit                           root     ALL
 a              pg_catalog          varbit[]                         root     ALL
 a              pg_catalog          varchar                          root     ALL
 a              pg_catalog          varchar[]                        root     ALL
+a              pg_catalog          void                             root     ALL
 a              pg_extension        NULL                             root     ALL
 a              public              NULL                             root     ALL
 defaultdb      NULL                NULL                             root     ALL
@@ -1174,6 +1189,7 @@ defaultdb      pg_catalog          varbit                           root     ALL
 defaultdb      pg_catalog          varbit[]                         root     ALL
 defaultdb      pg_catalog          varchar                          root     ALL
 defaultdb      pg_catalog          varchar[]                        root     ALL
+defaultdb      pg_catalog          void                             root     ALL
 defaultdb      pg_extension        NULL                             root     ALL
 defaultdb      public              NULL                             root     ALL
 postgres       NULL                NULL                             root     ALL
@@ -1257,6 +1273,7 @@ postgres       pg_catalog          varbit                           root     ALL
 postgres       pg_catalog          varbit[]                         root     ALL
 postgres       pg_catalog          varchar                          root     ALL
 postgres       pg_catalog          varchar[]                        root     ALL
+postgres       pg_catalog          void                             root     ALL
 postgres       pg_extension        NULL                             root     ALL
 postgres       public              NULL                             root     ALL
 system         NULL                NULL                             root     GRANT
@@ -1344,6 +1361,7 @@ system         pg_catalog          varbit                           root     ALL
 system         pg_catalog          varbit[]                         root     ALL
 system         pg_catalog          varchar                          root     ALL
 system         pg_catalog          varchar[]                        root     ALL
+system         pg_catalog          void                             root     ALL
 system         pg_extension        NULL                             root     GRANT
 system         pg_extension        NULL                             root     USAGE
 system         public              NULL                             root     GRANT
@@ -1588,6 +1606,7 @@ test           pg_catalog          varbit                           root     ALL
 test           pg_catalog          varbit[]                         root     ALL
 test           pg_catalog          varchar                          root     ALL
 test           pg_catalog          varchar[]                        root     ALL
+test           pg_catalog          void                             root     ALL
 test           pg_extension        NULL                             root     ALL
 test           public              NULL                             root     ALL
 
@@ -1848,7 +1867,6 @@ a  crdb_internal       NULL  readwrite  ALL
 a  information_schema  NULL  readwrite  ALL
 a  pg_catalog          NULL  readwrite  ALL
 a  pg_extension        NULL  readwrite  ALL
-a  public              NULL  readwrite  ALL
 a  public              v     readwrite  CREATE
 a  public              v     readwrite  DROP
 a  public              v     readwrite  GRANT
@@ -1882,7 +1900,6 @@ a  crdb_internal       NULL  readwrite  ALL
 a  information_schema  NULL  readwrite  ALL
 a  pg_catalog          NULL  readwrite  ALL
 a  pg_extension        NULL  readwrite  ALL
-a  public              NULL  readwrite  ALL
 
 # Verify that the DB privileges have not changed.
 query TTT colnames
@@ -1890,6 +1907,7 @@ SHOW GRANTS ON DATABASE a
 ----
 database_name  grantee    privilege_type
 a              admin      ALL
+a              public     CONNECT
 a              readwrite  ALL
 a              root       ALL
 
@@ -2037,3 +2055,8 @@ GRANT SELECT ON system.lease TO testuser
 
 statement error pq: cannot REVOKE on system object
 REVOKE SELECT ON system.lease FROM testuser
+
+# Postgres does a no-op here, but since the RULE privilege is very legacy,
+# we error explicitly instead of getting 100% compatibility.
+statement error invalid privilege type RULE for table
+GRANT RULE ON t TO testuser

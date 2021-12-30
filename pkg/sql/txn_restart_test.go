@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -362,7 +364,7 @@ func (ta *TxnAborter) statementFilter(
 	ta.mu.Unlock()
 	if shouldAbort {
 		if err := ta.abortTxn(ri.key); err != nil {
-			panic(errors.AssertionFailedf("TxnAborter failed to abort: %s", err))
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "TxnAborter failed to abort"))
 		}
 	}
 }
@@ -1301,8 +1303,36 @@ func TestDistSQLRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// One of the rows in the table.
-	targetKey := roachpb.Key("\275\211\212")
+	createTable := func(db *gosql.DB) {
+		sqlutils.CreateTable(t, db, "t",
+			"num INT PRIMARY KEY",
+			3, /* numRows */
+			sqlutils.ToRowFn(sqlutils.RowIdxFn))
+	}
+
+	// We can't programmatically get the targetKey since it's used before
+	// the test cluster is created.
+	// targetKey is represents one of the rows in the table.
+	// +2 since the first two available ids are allocated to the database and
+	// public schema.
+	firstTableID := func() (id uint32) {
+		tc := serverutils.StartNewTestCluster(t, 3, /* numNodes */
+			base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+				ServerArgs:      base.TestServerArgs{UseDatabase: "test"},
+			})
+		defer tc.Stopper().Stop(context.Background())
+		db := tc.ServerConn(0)
+		createTable(db)
+		row := db.QueryRow("SELECT 't'::REGCLASS::OID")
+		require.NotNil(t, row)
+		require.NoError(t, row.Scan(&id))
+		return id
+	}()
+	indexID := uint32(1)
+	valInTable := uint64(2)
+	indexKey := keys.SystemSQLCodec.IndexPrefix(firstTableID, indexID)
+	targetKey := encoding.EncodeUvarintAscending(indexKey, valInTable)
 
 	restarted := true
 
@@ -1340,10 +1370,7 @@ func TestDistSQLRetryableError(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 
 	db := tc.ServerConn(0)
-	sqlutils.CreateTable(t, db, "t",
-		"num INT PRIMARY KEY",
-		3, /* numRows */
-		sqlutils.ToRowFn(sqlutils.RowIdxFn))
+	createTable(db)
 
 	// We're going to split one of the tables, but node 4 is unaware of this.
 	_, err := db.Exec(fmt.Sprintf(`

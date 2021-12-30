@@ -188,7 +188,7 @@ message MergeTrigger {
   // RaftCommand.WriteBatch. The persisted summary may be identical to the
   // summary in this field, but it does not have to be. Notably, we intended for
   // the summary included in the ReplicatedEvalResult.Merge.Trigger to
-  // eventually be a much higher-resolution version of the ReadSummmary than the
+  // eventually be a much higher-resolution version of the ReadSummary than the
   // version persisted. This scheme of persisting a compressed ReadSummary
   // indefinitely and including a higher-resolution ReadSummary on the
   // RaftCommand allows us to optimize for the common case where the merge is
@@ -220,28 +220,12 @@ enum ReplicaChangeType {
 message ChangeReplicasTrigger {
   option (gogoproto.goproto_stringer) = false;
 
-  // TODO(tbg): remove once we know that no trigger using this will ever be
-  // applied (this will require something like #39182).
-  //
-  // TODO(tbg): when removing this, also rename internal_x_replicas to just
-  // x_replicas and remove the getter.
-  ReplicaChangeType deprecated_change_type = 1;
-  // The replica being modified.
-  // TODO(tbg): remove once we know that no trigger using this will ever be
-  // applied (this will require something like #39182).
-  ReplicaDescriptor deprecated_replica = 2 [(gogoproto.nullable) = false];
-  // The new replica list with this change applied.
-  repeated ReplicaDescriptor deprecated_updated_replicas = 3 [(gogoproto.nullable) = false];
-  // The next replica id to use with this change applied.
-  int32 deprecated_next_replica_id = 4 [(gogoproto.customname) = "DeprecatedNextReplicaID", (gogoproto.casttype) = "ReplicaID"];
-  // The updated range descriptor. If desc is non-nil, then it overrides
-  // updated_replicas and next_replica_id. This incremental addition is needed
-  // to maintain backwards compatibility.
-  // TODO(jeffreyxiao): Remove deprecated_updated_replicas and
-  // deprecated_next_replica_id in 20.1.
+  // The updated range descriptor.
   RangeDescriptor desc = 5;
   // The new replicas added to the range descriptor in this change, exactly as
   // they appear in the updated range descriptor.
+  //
+  // TODO(tbg): rename internal_x_replicas to just x_replicas and remove the getter.
   repeated ReplicaDescriptor internal_added_replicas = 6 [(gogoproto.nullable) = false];
   // The replicas whose removal is being initiated in this change. If the
   // replica is still present as an outgoing voter in the updated descriptor
@@ -250,6 +234,8 @@ message ChangeReplicasTrigger {
   // removed from the descriptor in the course of this change (which is itself
   // not visible to this trigger).
   repeated ReplicaDescriptor internal_removed_replicas = 7 [(gogoproto.nullable) = false];
+
+  reserved 1 to 4;
 }
 
 // ModifiedSpanTrigger indicates that a specific span has been modified.
@@ -402,7 +388,7 @@ message Transaction {
   // observed timestamp. This reduced uncertainty limit is reflected in the
   // local_uncertainty_limit variable at the time of request evaluation.
   //
-  // See pkg/kv/kvserver/observedts for more details.
+  // See pkg/kv/kvserver/uncertainty for more details.
   //
   // The case global_uncertainty_limit < read_timestamp is possible for
   // transactions which have been pushed or have refreshed; in this case,
@@ -416,7 +402,7 @@ message Transaction {
   // establishing a lower local_uncertainty_limit when evaluating a request on
   // a node in the list.
   //
-  // See pkg/kv/kvserver/observedts for more details.
+  // See pkg/kv/kvserver/uncertainty for more details.
   //
   // The slice of observed timestamps is kept sorted by NodeID. Use
   // Transaction.UpdateObservedTimestamp to maintain the sorted order. The
@@ -524,7 +510,7 @@ message TransactionRecord {
 //
 // Note: avoid constructing Intent directly; consider using MakeIntent() instead.
 message Intent {
-  // SingleKeySpan preseves wire compatibility with an earlier version of this
+  // SingleKeySpan preserves wire compatibility with an earlier version of this
   // proto which used a Span. An Intent never spans keys, so there was no need
   // for this to contain an EndKey.
   message SingleKeySpan {
@@ -537,7 +523,7 @@ message Intent {
 }
 
 // A LockAcquisition represents the action of a Transaction acquiring a lock
-// with a specified durbility level over a Span of keys.
+// with a specified durability level over a Span of keys.
 message LockAcquisition {
   Span span = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   storage.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
@@ -752,4 +738,16 @@ message RangeInfo {
   RangeDescriptor desc = 1 [(gogoproto.nullable) = false];
   Lease lease = 2 [(gogoproto.nullable) = false];
   RangeClosedTimestampPolicy closed_timestamp_policy = 3;
+}
+
+// A TenantID is a unique ID associated with a tenant in a multi-tenant cluster.
+// Each tenant is granted exclusive access to a portion of the keyspace and a
+// collection of SQL tables in that keyspace which comprise a "logical" cluster.
+//
+// It should be treated as opaque by users, and only created/accessed using the
+// public methods MakeTenantID, ToUint64, etc.
+message TenantID {
+  option (gogoproto.goproto_stringer) = false;
+  // InternalValue should not be set or accessed directly; use ToUint64.
+  uint64 id = 1 [(gogoproto.customname) = "InternalValue"];
 }

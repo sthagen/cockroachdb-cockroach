@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -58,6 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 	"github.com/spf13/cobra"
@@ -221,7 +223,7 @@ func initTempStorageConfig(
 			continue
 		}
 		recordPath := filepath.Join(spec.Path, server.TempDirsRecordFilename)
-		if err := storage.CleanupTempDirs(recordPath); err != nil {
+		if err := fs.CleanupTempDirs(recordPath); err != nil {
 			return base.TempStorageConfig{}, errors.Wrap(err,
 				"could not cleanup temporary directories from record file")
 		}
@@ -288,7 +290,7 @@ func initTempStorageConfig(
 	// Create the temporary subdirectory for the temp engine.
 	{
 		var err error
-		if tempStorageConfig.Path, err = storage.CreateTempDir(tempDir, server.TempDirPrefix, stopper); err != nil {
+		if tempStorageConfig.Path, err = fs.CreateTempDir(tempDir, server.TempDirPrefix, stopper); err != nil {
 			return base.TempStorageConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
 		}
 	}
@@ -296,7 +298,7 @@ func initTempStorageConfig(
 	// We record the new temporary directory in the record file (if it
 	// exists) for cleanup in case the node crashes.
 	if recordPath != "" {
-		if err := storage.RecordTempDir(recordPath, tempStorageConfig.Path); err != nil {
+		if err := fs.RecordTempDir(recordPath, tempStorageConfig.Path); err != nil {
 			return base.TempStorageConfig{}, errors.Wrapf(
 				err,
 				"could not record temporary directory path to record file: %s",
@@ -406,16 +408,21 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up a tracing span for the start process.  We want any logging
-	// happening beyond this point to be accounted to this start
-	// context, including logging related to the initialization of
-	// the logging infrastructure below.
-	// This span concludes when the startup goroutine started below
-	// has completed.
-	// TODO(andrei): we don't close the span on the early returns below.
-	tracer := serverCfg.Tracer
-	startupSpan := tracer.StartSpan("server start")
-	ctx = tracing.ContextWithSpan(ctx, startupSpan)
+	ambientCtx := serverCfg.AmbientCtx
+
+	// Annotate the context, and set up a tracing span for the start process.
+	//
+	// The context annotation ensures that server identifiers show up
+	// in the logging metadata as soon as they are known.
+	//
+	// The tracing span is because we want any logging happening beyond
+	// this point to be accounted to this start context, including
+	// logging related to the initialization of the logging
+	// infrastructure below.  This span concludes when the startup
+	// goroutine started below has completed.  TODO(andrei): we don't
+	// close the span on the early returns below.
+	var startupSpan *tracing.Span
+	ctx, startupSpan = ambientCtx.AnnotateCtxWithSpan(ctx, "server start")
 
 	// Set up the logging and profiling output.
 	//
@@ -446,7 +453,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 
 	// Tweak GOMAXPROCS if we're in a cgroup / container that has cpu limits set.
 	// The GO default for GOMAXPROCS is NumCPU(), however this is less
-	// than ideal if the cgruop is limited to a number lower than that.
+	// than ideal if the cgroup is limited to a number lower than that.
 	//
 	// TODO(bilal): various global settings have already been initialized based on
 	// GOMAXPROCS(0) by now.
@@ -555,7 +562,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 		}
 	}
 
-	// DelayedBoostrapFn will be called if the boostrap process is
+	// DelayedBootstrapFn will be called if the bootstrap process is
 	// taking a bit long.
 	serverCfg.DelayedBootstrapFn = func() {
 		const msg = `The server appears to be unable to contact the other nodes in the cluster. Please try:
@@ -567,7 +574,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 If problems persist, please see %s.`
 		docLink := docs.URL("cluster-setup-troubleshooting.html")
 		if !startCtx.inBackground {
-			log.Ops.Shoutf(context.Background(), severity.WARNING, msg, docLink)
+			log.Ops.Shoutf(ctx, severity.WARNING, msg, docLink)
 		} else {
 			// Don't shout to stderr since the server will have detached by
 			// the time this function gets called.
@@ -677,91 +684,7 @@ If problems persist, please see %s.`
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			var buf redact.StringBuilder
-			info := build.GetInfo()
-			buf.Printf("CockroachDB node starting at %s (took %0.1fs)\n", timeutil.Now(), timeutil.Since(tBegin).Seconds())
-			buf.Printf("build:\t%s %s @ %s (%s)\n",
-				redact.Safe(info.Distribution), redact.Safe(info.Tag), redact.Safe(info.Time), redact.Safe(info.GoVersion))
-			buf.Printf("webui:\t%s\n", serverCfg.AdminURL())
-
-			// (Re-)compute the client connection URL. We cannot do this
-			// earlier (e.g. above, in the runStart function) because
-			// at this time the address and port have not been resolved yet.
-			sCtx := rpc.MakeSecurityContext(serverCfg.Config, security.ClusterTLSSettings(serverCfg.Settings), roachpb.SystemTenantID)
-			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
-			if err != nil {
-				log.Ops.Errorf(ctx, "failed computing the URL: %v", err)
-				return err
-			}
-			buf.Printf("sql:\t%s\n", pgURL.ToPQ())
-			buf.Printf("sql (JDBC):\t%s\n", pgURL.ToJDBC())
-
-			buf.Printf("RPC client flags:\t%s\n", clientFlagsRPC())
-			if len(serverCfg.SocketFile) != 0 {
-				buf.Printf("socket:\t%s\n", serverCfg.SocketFile)
-			}
-			logNum := 1
-			_ = cliCtx.logConfig.IterateDirectories(func(d string) error {
-				if logNum == 1 {
-					// Backward-compatibility.
-					buf.Printf("logs:\t%s\n", d)
-				} else {
-					buf.Printf("logs[%d]:\t%s\n", logNum, d)
-				}
-				logNum++
-				return nil
-			})
-			if serverCfg.Attrs != "" {
-				buf.Printf("attrs:\t%s\n", serverCfg.Attrs)
-			}
-			if len(serverCfg.Locality.Tiers) > 0 {
-				buf.Printf("locality:\t%s\n", serverCfg.Locality)
-			}
-			if s.TempDir() != "" {
-				buf.Printf("temp dir:\t%s\n", s.TempDir())
-			}
-			if ext := s.ClusterSettings().ExternalIODir; ext != "" {
-				buf.Printf("external I/O path: \t%s\n", ext)
-			} else {
-				buf.Printf("external I/O path: \t<disabled>\n")
-			}
-			for i, spec := range serverCfg.Stores.Specs {
-				buf.Printf("store[%d]:\t%s\n", i, spec)
-			}
-			buf.Printf("storage engine: \t%s\n", &serverCfg.StorageEngine)
-			nodeID := s.NodeID()
-			if initialStart {
-				if nodeID == kvserver.FirstNodeID {
-					buf.Printf("status:\tinitialized new cluster\n")
-				} else {
-					buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
-				}
-			} else {
-				buf.Printf("status:\trestarted pre-existing node\n")
-			}
-
-			if baseCfg.ClusterName != "" {
-				buf.Printf("cluster name:\t%s\n", baseCfg.ClusterName)
-			}
-
-			// Remember the cluster ID for log file rotation.
-			clusterID := s.ClusterID().String()
-			log.SetNodeIDs(clusterID, int32(nodeID))
-			buf.Printf("clusterID:\t%s\n", clusterID)
-			buf.Printf("nodeID:\t%d\n", nodeID)
-
-			// Collect the formatted string and show it to the user.
-			msg, err := expandTabsInRedactableBytes(buf.RedactableBytes())
-			if err != nil {
-				return err
-			}
-			msgS := msg.ToString()
-			log.Ops.Infof(ctx, "node startup completed:\n%s", msgS)
-			if !startCtx.inBackground && !log.LoggingToStderr(severity.INFO) {
-				fmt.Print(msgS.StripMarkers())
-			}
-
-			return nil
+			return reportServerInfo(ctx, tBegin, &serverCfg, s.ClusterSettings(), true /* isHostNode */, initialStart)
 		}(); err != nil {
 			errChan <- err
 		}
@@ -776,9 +699,10 @@ If problems persist, please see %s.`
 	// decommission`, or a signal.
 
 	// We'll want to log any shutdown activity against a separate span.
-	shutdownSpan := tracer.StartSpan("server shutdown")
+	// We cannot use s.AnnotateCtx here because s might not have
+	// been assigned yet (the goroutine above runs asynchronously).
+	shutdownCtx, shutdownSpan := ambientCtx.AnnotateCtxWithSpan(context.Background(), "server shutdown")
 	defer shutdownSpan.Finish()
-	shutdownCtx := tracing.ContextWithSpan(context.Background(), shutdownSpan)
 
 	stopWithoutDrain := make(chan struct{}) // closed if interrupted very early
 
@@ -841,9 +765,8 @@ If problems persist, please see %s.`
 			}
 			// Don't use shutdownCtx because this is in a goroutine that may
 			// still be running after shutdownCtx's span has been finished.
-			ac := log.AmbientContext{}
-			ac.AddLogTag("server drain process", nil)
-			drainCtx := ac.AnnotateCtx(context.Background())
+			drainCtx := s.AnnotateCtx(context.Background())
+			drainCtx = logtags.AddTag(drainCtx, "server drain process", nil)
 
 			// Perform a graceful drain. We keep retrying forever, in
 			// case there are many range leases or some unavailability
@@ -901,7 +824,7 @@ If problems persist, please see %s.`
 		for {
 			select {
 			case <-ticker.C:
-				log.Ops.Infof(context.Background(), "%d running tasks", stopper.NumTasks())
+				log.Ops.Infof(shutdownCtx, "%d running tasks", stopper.NumTasks())
 			case <-stopper.IsStopped():
 				return
 			case <-stopWithoutDrain:
@@ -955,6 +878,124 @@ If problems persist, please see %s.`
 	}
 
 	return returnErr
+}
+
+// reportServerInfo prints out the server version and network details
+// in a standardized format.
+func reportServerInfo(
+	ctx context.Context,
+	startTime time.Time,
+	serverCfg *server.Config,
+	st *cluster.Settings,
+	isHostNode, initialStart bool,
+) error {
+	srvS := redact.SafeString("SQL server")
+	if isHostNode {
+		srvS = "node"
+	}
+
+	var buf redact.StringBuilder
+	info := build.GetInfo()
+	buf.Printf("CockroachDB %s starting at %s (took %0.1fs)\n", srvS, timeutil.Now(), timeutil.Since(startTime).Seconds())
+	buf.Printf("build:\t%s %s @ %s (%s)\n",
+		redact.Safe(info.Distribution), redact.Safe(info.Tag), redact.Safe(info.Time), redact.Safe(info.GoVersion))
+	buf.Printf("webui:\t%s\n", serverCfg.AdminURL())
+
+	// (Re-)compute the client connection URL. We cannot do this
+	// earlier (e.g. above, in the runStart function) because
+	// at this time the address and port have not been resolved yet.
+	sCtx := rpc.MakeSecurityContext(serverCfg.Config, security.ClusterTLSSettings(serverCfg.Settings), roachpb.SystemTenantID)
+	pgURL, err := sCtx.PGURL(url.User(security.RootUser))
+	if err != nil {
+		log.Ops.Errorf(ctx, "failed computing the URL: %v", err)
+		return err
+	}
+	buf.Printf("sql:\t%s\n", pgURL.ToPQ())
+	buf.Printf("sql (JDBC):\t%s\n", pgURL.ToJDBC())
+
+	buf.Printf("RPC client flags:\t%s\n", clientFlagsRPC())
+	if len(serverCfg.SocketFile) != 0 {
+		buf.Printf("socket:\t%s\n", serverCfg.SocketFile)
+	}
+	logNum := 1
+	_ = cliCtx.logConfig.IterateDirectories(func(d string) error {
+		if logNum == 1 {
+			// Backward-compatibility.
+			buf.Printf("logs:\t%s\n", d)
+		} else {
+			buf.Printf("logs[%d]:\t%s\n", logNum, d)
+		}
+		logNum++
+		return nil
+	})
+	if serverCfg.Attrs != "" {
+		buf.Printf("attrs:\t%s\n", serverCfg.Attrs)
+	}
+	if len(serverCfg.Locality.Tiers) > 0 {
+		buf.Printf("locality:\t%s\n", serverCfg.Locality)
+	}
+	if tmpDir := serverCfg.SQLConfig.TempStorageConfig.Path; tmpDir != "" {
+		buf.Printf("temp dir:\t%s\n", tmpDir)
+	}
+	if ext := st.ExternalIODir; ext != "" {
+		buf.Printf("external I/O path: \t%s\n", ext)
+	} else {
+		buf.Printf("external I/O path: \t<disabled>\n")
+	}
+	for i, spec := range serverCfg.Stores.Specs {
+		buf.Printf("store[%d]:\t%s\n", i, spec)
+	}
+	buf.Printf("storage engine: \t%s\n", &serverCfg.StorageEngine)
+
+	// Print the commong server identifiers.
+	if baseCfg.ClusterName != "" {
+		buf.Printf("cluster name:\t%s\n", baseCfg.ClusterName)
+	}
+	clusterID := serverCfg.BaseConfig.ClusterIDContainer.Get().String()
+	buf.Printf("clusterID:\t%s\n", clusterID)
+
+	nodeID := serverCfg.BaseConfig.IDContainer.Get()
+	if isHostNode {
+		if initialStart {
+			if nodeID == kvserver.FirstNodeID {
+				buf.Printf("status:\tinitialized new cluster\n")
+			} else {
+				buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
+			}
+		} else {
+			buf.Printf("status:\trestarted pre-existing node\n")
+		}
+		// Report the server identifiers.
+		buf.Printf("nodeID:\t%d\n", nodeID)
+	} else {
+		// Report the SQL server identifiers.
+		buf.Printf("tenantID:\t%s\n", serverCfg.SQLConfig.TenantID)
+		buf.Printf("instanceID:\t%d\n", nodeID)
+
+		if kvAddrs := serverCfg.SQLConfig.TenantKVAddrs; len(kvAddrs) > 0 {
+			// Report which KV servers are connected.
+			buf.Printf("KV addresses:\t")
+			comma := redact.SafeString("")
+			for _, addr := range serverCfg.SQLConfig.TenantKVAddrs {
+				buf.Printf("%s%s", comma, addr)
+				comma = ", "
+			}
+			buf.Printf("\n")
+		}
+	}
+
+	// Collect the formatted string and show it to the user.
+	msg, err := expandTabsInRedactableBytes(buf.RedactableBytes())
+	if err != nil {
+		return err
+	}
+	msgS := msg.ToString()
+	log.Ops.Infof(ctx, "%s startup completed:\n%s", srvS, msgS)
+	if !startCtx.inBackground && !log.LoggingToStderr(severity.INFO) {
+		fmt.Print(msgS.StripMarkers())
+	}
+
+	return nil
 }
 
 // expandTabsInRedactableBytes expands tabs in the redactable byte
@@ -1022,7 +1063,7 @@ func maybeWarnMemorySizes(ctx context.Context) {
 		var buf bytes.Buffer
 		fmt.Fprintf(&buf, "Using the default setting for --cache (%s).\n", cacheSizeValue)
 		fmt.Fprintf(&buf, "  A significantly larger value is usually needed for good performance.\n")
-		if size, err := status.GetTotalMemory(context.Background()); err == nil {
+		if size, err := status.GetTotalMemory(ctx); err == nil {
 			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --cache=.25 (%s).",
 				humanizeutil.IBytes(size/4))
 		} else {
@@ -1102,7 +1143,7 @@ func setupAndInitializeLoggingAndProfiling(
 		if addr == "" {
 			addr = "any of your IP addresses"
 		}
-		log.Ops.Shoutf(context.Background(), severity.WARNING,
+		log.Ops.Shoutf(ctx, severity.WARNING,
 			"ALL SECURITY CONTROLS HAVE BEEN DISABLED!\n\n"+
 				"This mode is intended for non-production testing only.\n"+
 				"\n"+
@@ -1112,7 +1153,7 @@ func setupAndInitializeLoggingAndProfiling(
 				"- Intruders can log in without password and read or write any data in the cluster.\n"+
 				"- Intruders can consume all your server's resources and cause unavailability.",
 			addr)
-		log.Ops.Shoutf(context.Background(), severity.INFO,
+		log.Ops.Shoutf(ctx, severity.INFO,
 			"To start a secure server without mandating TLS for clients,\n"+
 				"consider --accept-sql-without-tls instead. For other options, see:\n\n"+
 				"- %s\n"+
@@ -1131,7 +1172,7 @@ func setupAndInitializeLoggingAndProfiling(
 				"to databases, the --locality flag must contain a \"region\" tier.\n" +
 				"For more information, see:\n\n" +
 				"- %s"
-			log.Shoutf(context.Background(), severity.WARNING, warningString,
+			log.Shoutf(ctx, severity.WARNING, warningString,
 				log.Safe(docs.URL("cockroach-start.html#locality")))
 		}
 	}
@@ -1181,14 +1222,14 @@ func getClientGRPCConn(
 	// as that of nodes in the cluster.
 	clock := hlc.NewClock(hlc.UnixNano, 0)
 	stopper := stop.NewStopper()
-	rpcContext := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: cfg.Tracer},
-		Config:     cfg.Config,
-		Clock:      clock,
-		Stopper:    stopper,
-		Settings:   cfg.Settings,
-	})
+	rpcContext := rpc.NewContext(ctx,
+		rpc.ContextOptions{
+			TenantID: roachpb.SystemTenantID,
+			Config:   cfg.Config,
+			Clock:    clock,
+			Stopper:  stopper,
+			Settings: cfg.Settings,
+		})
 	if cfg.TestingKnobs.Server != nil {
 		rpcContext.Knobs = cfg.TestingKnobs.Server.(*server.TestingKnobs).ContextTestingKnobs
 	}

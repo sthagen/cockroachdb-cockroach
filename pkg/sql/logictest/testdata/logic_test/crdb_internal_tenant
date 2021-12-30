@@ -59,7 +59,6 @@ crdb_internal  gossip_network               table  NULL  NULL  NULL
 crdb_internal  gossip_nodes                 table  NULL  NULL  NULL
 crdb_internal  index_columns                table  NULL  NULL  NULL
 crdb_internal  index_usage_statistics       table  NULL  NULL  NULL
-crdb_internal  interleaved                  table  NULL  NULL  NULL
 crdb_internal  invalid_objects              table  NULL  NULL  NULL
 crdb_internal  jobs                         table  NULL  NULL  NULL
 crdb_internal  kv_node_liveness             table  NULL  NULL  NULL
@@ -271,10 +270,10 @@ SELECT * FROM crdb_internal.table_columns WHERE descriptor_name = ''
 ----
 descriptor_id  descriptor_name  column_id  column_name  column_type  nullable  default_expr  hidden
 
-query ITITTBB colnames
+query ITITTBBB colnames
 SELECT * FROM crdb_internal.table_indexes WHERE descriptor_name = ''
 ----
-descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted
+descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted  is_sharded
 
 query ITITTITTB colnames
 SELECT * FROM crdb_internal.index_columns WHERE descriptor_name = ''
@@ -546,8 +545,8 @@ CREATE TYPE enum2 AS ENUM ()
 query ITTITTT
 SELECT * FROM crdb_internal.create_type_statements
 ----
-52  test  public  59  enum1  CREATE TYPE public.enum1 AS ENUM ('hello', 'hi')  {hello,hi}
-52  test  public  61  enum2  CREATE TYPE public.enum2 AS ENUM ()               {}
+54  test  public  63  enum1  CREATE TYPE public.enum1 AS ENUM ('hello', 'hi')  {hello,hi}
+54  test  public  65  enum2  CREATE TYPE public.enum2 AS ENUM ()               {}
 
 # Test the virtual index as well.
 

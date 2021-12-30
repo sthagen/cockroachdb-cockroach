@@ -350,7 +350,7 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
-	return tc.ExecuteDDLWithIndexVersion(sql, descpb.StrictIndexColumnIDGuaranteesVersion)
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.LatestNonPrimaryIndexDescriptorVersion)
 }
 
 // ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
@@ -602,10 +602,6 @@ type Table struct {
 	writeOnlyIdxCount  int
 	deleteOnlyIdxCount int
 
-	// interleaved is true if the table's rows are interleaved with rows from
-	// other table(s).
-	interleaved bool
-
 	outboundFKs []ForeignKeyConstraint
 	inboundFKs  []ForeignKeyConstraint
 
@@ -753,6 +749,12 @@ func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
+// Zone is part of the cat.Table interface.
+func (tt *Table) Zone() cat.Zone {
+	zone := zonepb.DefaultZoneConfig()
+	return &zone
+}
+
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -817,6 +819,10 @@ func (tt *Table) CollectTypes(ord int) (descpb.IDs, error) {
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
+
+	// ExplicitColCount is the number of columns that are explicitly specified in
+	// the index definition.
+	ExplicitColCount int
 
 	// KeyCount is the number of columns that make up the unique key for the
 	// index. See the cat.Index.KeyColumnCount for more details.
@@ -899,6 +905,11 @@ func (ti *Index) ColumnCount() int {
 	return len(ti.Columns)
 }
 
+// ExplicitColumnCount is part of the cat.Index interface.
+func (ti *Index) ExplicitColumnCount() int {
+	return ti.ExplicitColCount
+}
+
 // KeyColumnCount is part of the cat.Index interface.
 func (ti *Index) KeyColumnCount() int {
 	return ti.KeyCount
@@ -950,26 +961,6 @@ func (ti *Index) Predicate() (string, bool) {
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (ti *Index) ImplicitPartitioningColumnCount() int {
 	return 0
-}
-
-// InterleaveAncestorCount is part of the cat.Index interface.
-func (ti *Index) InterleaveAncestorCount() int {
-	return 0
-}
-
-// InterleaveAncestor is part of the cat.Index interface.
-func (ti *Index) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
-	panic("no interleavings")
-}
-
-// InterleavedByCount is part of the cat.Index interface.
-func (ti *Index) InterleavedByCount() int {
-	return 0
-}
-
-// InterleavedBy is part of the cat.Index interface.
-func (ti *Index) InterleavedBy(i int) (table, index cat.StableID) {
-	panic("no interleavings")
 }
 
 // GeoConfig is part of the cat.Index interface.

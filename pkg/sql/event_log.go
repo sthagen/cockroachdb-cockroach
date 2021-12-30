@@ -22,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -237,6 +239,17 @@ func logEventInternalForSchemaChanges(
 	)
 }
 
+// makeCommonSQLEventDetails creates a common exec event
+// payload.
+func makeCommonSQLEventDetails(
+	userName string, stmt string, appName string,
+) *eventpb.CommonSQLEventDetails {
+
+	return &eventpb.CommonSQLEventDetails{ApplicationName: appName,
+		User:      userName,
+		Statement: redact.RedactableString(stmt)}
+}
+
 // logEventInternalForSQLStatements emits a cluster event on behalf of
 // a SQL statement, when the point where the event is emitted does not
 // have access to a (*planner) and the current statement metadata.
@@ -274,13 +287,49 @@ func logEventInternalForSQLStatements(
 		}
 	}
 
-	return insertEventRecords(ctx,
-		execCfg.InternalExecutor, txn,
+	return insertEventRecords(
+		ctx,
+		execCfg.InternalExecutor,
+		txn,
 		int32(execCfg.NodeID.SQLInstanceID()), /* reporter ID */
 		1+depth,                               /* depth */
 		opts,                                  /* eventLogOptions */
 		entries...,                            /* ...eventLogEntry */
 	)
+}
+
+type schemaChangerEventLogger struct {
+	txn     *kv.Txn
+	execCfg *ExecutorConfig
+	depth   int
+}
+
+var _ scexec.EventLogger = (*schemaChangerEventLogger)(nil)
+
+// NewSchemaChangerEventLogger returns a scexec.EventLogger implementation.
+func NewSchemaChangerEventLogger(
+	txn *kv.Txn, execCfg *ExecutorConfig, depth int,
+) scexec.EventLogger {
+	return &schemaChangerEventLogger{
+		txn:     txn,
+		execCfg: execCfg,
+		depth:   depth,
+	}
+}
+
+// LogEvent implements the scexec.EventLogger interface.
+func (l schemaChangerEventLogger) LogEvent(
+	ctx context.Context, descID descpb.ID, metadata scpb.ElementMetadata, event eventpb.EventPayload,
+) error {
+	entry := eventLogEntry{targetID: int32(descID), event: event}
+	commonPayload := makeCommonSQLEventDetails(metadata.Username, metadata.Statement, metadata.AppName)
+	return logEventInternalForSQLStatements(ctx,
+		l.execCfg,
+		l.txn,
+		l.depth,
+		eventLogOptions{dst: LogEverywhere},
+		*commonPayload,
+		entry)
 }
 
 // LogEventForJobs emits a cluster event in the context of a job.
@@ -325,6 +374,7 @@ func LogEventForJobs(
 }
 
 var eventLogSystemTableEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"server.eventlog.enabled",
 	"if set, logged notable events are also stored in the table system.eventlog",
 	true,

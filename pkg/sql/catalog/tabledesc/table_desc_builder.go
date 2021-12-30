@@ -190,18 +190,24 @@ func maybeFillInDescriptor(
 ) (changes PostDeserializationTableDescriptorChanges, err error) {
 	changes.UpgradedFormatVersion = maybeUpgradeFormatVersion(desc)
 
+	changes.FixedIndexEncodingType = maybeFixPrimaryIndexEncoding(&desc.PrimaryIndex)
 	changes.UpgradedIndexFormatVersion = maybeUpgradePrimaryIndexFormatVersion(desc)
 	for i := range desc.Indexes {
-		changes.UpgradedIndexFormatVersion = changes.UpgradedIndexFormatVersion || maybeUpgradeSecondaryIndexFormatVersion(&desc.Indexes[i])
+		idx := &desc.Indexes[i]
+		isUpgraded := maybeUpgradeSecondaryIndexFormatVersion(idx)
+		changes.UpgradedIndexFormatVersion = changes.UpgradedIndexFormatVersion || isUpgraded
 	}
 	for i := range desc.Mutations {
 		if idx := desc.Mutations[i].GetIndex(); idx != nil {
-			changes.UpgradedIndexFormatVersion = changes.UpgradedIndexFormatVersion || maybeUpgradeSecondaryIndexFormatVersion(idx)
+			isUpgraded := maybeUpgradeSecondaryIndexFormatVersion(idx)
+			changes.UpgradedIndexFormatVersion = changes.UpgradedIndexFormatVersion || isUpgraded
 		}
 	}
 	changes.UpgradedNamespaceName = maybeUpgradeNamespaceName(desc)
+	changes.RemovedDefaultExprFromComputedColumn = maybeRemoveDefaultExprFromComputedColumns(desc)
 
 	parentSchemaID := desc.GetUnexposedParentSchemaID()
+	// TODO(richardjcai): Remove this case in 22.2.
 	if parentSchemaID == descpb.InvalidID {
 		parentSchemaID = keys.PublicSchemaID
 	}
@@ -221,6 +227,30 @@ func maybeFillInDescriptor(
 		return PostDeserializationTableDescriptorChanges{}, err
 	}
 	return changes, nil
+}
+
+// maybeRemoveDefaultExprFromComputedColumns removes DEFAULT expressions on
+// computed columns. Although we now have a descriptor validation check to
+// prevent this, this hasn't always been the case, so it's theoretically
+// possible to encounter table descriptors which would fail this validation
+// check. See issue #72881 for details.
+func maybeRemoveDefaultExprFromComputedColumns(desc *descpb.TableDescriptor) (hasChanged bool) {
+	doCol := func(col *descpb.ColumnDescriptor) {
+		if col.IsComputed() && col.HasDefault() {
+			col.DefaultExpr = nil
+			hasChanged = true
+		}
+	}
+
+	for i := range desc.Columns {
+		doCol(&desc.Columns[i])
+	}
+	for _, m := range desc.Mutations {
+		if col := m.GetColumn(); col != nil && m.Direction != descpb.DescriptorMutation_DROP {
+			doCol(col)
+		}
+	}
+	return hasChanged
 }
 
 // maybeUpgradeForeignKeyRepresentation destructively modifies the input table
@@ -472,7 +502,7 @@ func upgradeToFamilyFormatVersion(desc *descpb.TableDescriptor) {
 }
 
 // maybeUpgradePrimaryIndexFormatVersion tries to promote a primary index to
-// version descpb.PrimaryIndexWithStoredColumnsVersion whenever possible.
+// version LatestPrimaryIndexDescriptorVersion whenever possible.
 func maybeUpgradePrimaryIndexFormatVersion(desc *descpb.TableDescriptor) (hasChanged bool) {
 	// Always set the correct encoding type for the primary index.
 	desc.PrimaryIndex.EncodingType = descpb.PrimaryIndexEncoding
@@ -517,12 +547,12 @@ func maybeUpgradePrimaryIndexFormatVersion(desc *descpb.TableDescriptor) (hasCha
 	}
 	desc.PrimaryIndex.StoreColumnIDs = newStoreColumnIDs
 	desc.PrimaryIndex.StoreColumnNames = newStoreColumnNames
-	desc.PrimaryIndex.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+	desc.PrimaryIndex.Version = descpb.LatestPrimaryIndexDescriptorVersion
 	return true
 }
 
 // maybeUpgradeSecondaryIndexFormatVersion tries to promote a secondary index to
-// version descpb.StrictIndexColumnIDGuaranteesVersion whenever possible.
+// version LatestNonPrimaryIndexDescriptorVersion whenever possible.
 func maybeUpgradeSecondaryIndexFormatVersion(idx *descpb.IndexDescriptor) (hasChanged bool) {
 	switch idx.Version {
 	case descpb.SecondaryIndexFamilyFormatVersion:
@@ -545,7 +575,7 @@ func maybeUpgradeSecondaryIndexFormatVersion(idx *descpb.IndexDescriptor) (hasCh
 	if set.Contains(0) {
 		return false
 	}
-	idx.Version = descpb.StrictIndexColumnIDGuaranteesVersion
+	idx.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
 	return true
 }
 
@@ -558,5 +588,15 @@ func maybeUpgradeNamespaceName(d *descpb.TableDescriptor) (hasChanged bool) {
 		return false
 	}
 	d.Name = string(catconstants.NamespaceTableName)
+	return true
+}
+
+// maybeFixPrimaryIndexEncoding ensures that the index descriptor for a primary
+// index has the correct encoding type set.
+func maybeFixPrimaryIndexEncoding(idx *descpb.IndexDescriptor) (hasChanged bool) {
+	if idx.EncodingType == descpb.PrimaryIndexEncoding {
+		return false
+	}
+	idx.EncodingType = descpb.PrimaryIndexEncoding
 	return true
 }

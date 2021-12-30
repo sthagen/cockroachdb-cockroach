@@ -126,6 +126,7 @@ const (
 	exprKindOrderBy
 	exprKindReturning
 	exprKindSelect
+	exprKindStoreID
 	exprKindValues
 	exprKindWhere
 	exprKindWindowFrameStart
@@ -146,6 +147,7 @@ var exprKindName = [...]string{
 	exprKindOrderBy:           "ORDER BY",
 	exprKindReturning:         "RETURNING",
 	exprKindSelect:            "SELECT",
+	exprKindStoreID:           "RELOCATE STORE ID",
 	exprKindValues:            "VALUES",
 	exprKindWhere:             "WHERE",
 	exprKindWindowFrameStart:  "WINDOW FRAME START",
@@ -458,7 +460,7 @@ func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.Typ
 	if err != nil {
 		panic(err)
 	}
-	return tree.ReType(s.ensureNullType(texpr, desired), desired)
+	return s.ensureNullType(texpr, desired)
 }
 
 // ensureNullType tests the type of the given expression. If types.Unknown, then
@@ -924,7 +926,9 @@ func (s *scope) Resolve(
 	inScope := srcMeta.(*scope)
 	for i := range inScope.cols {
 		col := &inScope.cols[i]
-		if col.name.MatchesReferenceName(colName) && sourceNameMatches(*prefix, col.table) {
+		if col.visibility != inaccessible &&
+			col.name.MatchesReferenceName(colName) &&
+			sourceNameMatches(*prefix, col.table) {
 			return col, nil
 		}
 	}

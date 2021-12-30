@@ -153,6 +153,7 @@ func (o *Outbox) Run(
 	flowCtxCancel context.CancelFunc,
 	connectionTimeout time.Duration,
 ) {
+	flowCtx := ctx
 	// Derive a child context so that we can cancel all components rooted in
 	// this outbox.
 	var outboxCtxCancel context.CancelFunc
@@ -183,7 +184,12 @@ func (o *Outbox) Run(
 		}
 
 		client := execinfrapb.NewDistSQLClient(conn)
-		stream, err = client.FlowStream(ctx)
+		// We use the flow context for the RPC so that when outbox context is
+		// canceled in case of a graceful shutdown, the gRPC stream keeps on
+		// running. If, however, the flow context is canceled, then the
+		// termination of the whole query is ungraceful, so we're ok with the
+		// gRPC stream being ungracefully shutdown too.
+		stream, err = client.FlowStream(flowCtx)
 		if err != nil {
 			log.Warningf(
 				ctx,
@@ -228,12 +234,10 @@ func handleStreamErr(
 	flowCtxCancel, outboxCtxCancel context.CancelFunc,
 ) {
 	if err == io.EOF {
-		if log.V(1) {
-			log.Infof(ctx, "Outbox calling outboxCtxCancel after %s EOF", opName)
-		}
+		log.VEventf(ctx, 2, "Outbox calling outboxCtxCancel after %s EOF", opName)
 		outboxCtxCancel()
 	} else {
-		log.Warningf(ctx, "Outbox calling flowCtxCancel after %s connection error: %+v", opName, err)
+		log.VEventf(ctx, 1, "Outbox calling flowCtxCancel after %s connection error: %+v", opName, err)
 		flowCtxCancel()
 	}
 }

@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -358,7 +357,9 @@ https://www.postgresql.org/docs/9.5/catalog-pg-attrdef.html`,
 				// pg_attrdef only expects rows for columns with default values.
 				continue
 			}
-			displayExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, column.GetDefaultExpr(), &p.semaCtx, tree.FmtPGCatalog)
+			displayExpr, err := schemaexpr.FormatExprForDisplay(
+				ctx, table, column.GetDefaultExpr(), &p.semaCtx, p.SessionData(), tree.FmtPGCatalog,
+			)
 			if err != nil {
 				return err
 			}
@@ -839,7 +840,7 @@ func populateTableConstraints(
 			if conkey, err = colIDArrayToDatum(con.Index.KeyColumnIDs); err != nil {
 				return err
 			}
-			condef = tree.NewDString(table.PrimaryKeyString())
+			condef = tree.NewDString(tabledesc.PrimaryKeyString(table))
 
 		case descpb.ConstraintTypeFK:
 			oid = h.ForeignKeyConstraintOid(db.GetID(), scName, table.GetID(), con.FK)
@@ -897,12 +898,14 @@ func populateTableConstraints(
 					return err
 				}
 				f.WriteString("UNIQUE (")
-				if err := catformat.FormatIndexElements(ctx, table, con.Index, f, p.SemaCtx()); err != nil {
+				if err := catformat.FormatIndexElements(
+					ctx, table, con.Index, f, p.SemaCtx(), p.SessionData(),
+				); err != nil {
 					return err
 				}
 				f.WriteByte(')')
 				if con.Index.IsPartial() {
-					pred, err := schemaexpr.FormatExprForDisplay(ctx, table, con.Index.Predicate, p.SemaCtx(), tree.FmtPGCatalog)
+					pred, err := schemaexpr.FormatExprForDisplay(ctx, table, con.Index.Predicate, p.SemaCtx(), p.SessionData(), tree.FmtPGCatalog)
 					if err != nil {
 						return err
 					}
@@ -923,9 +926,7 @@ func populateTableConstraints(
 					f.WriteString(" NOT VALID")
 				}
 				if con.UniqueWithoutIndexConstraint.Predicate != "" {
-					pred, err := schemaexpr.FormatExprForDisplay(
-						ctx, table, con.UniqueWithoutIndexConstraint.Predicate, p.SemaCtx(), tree.FmtPGCatalog,
-					)
+					pred, err := schemaexpr.FormatExprForDisplay(ctx, table, con.UniqueWithoutIndexConstraint.Predicate, p.SemaCtx(), p.SessionData(), tree.FmtPGCatalog)
 					if err != nil {
 						return err
 					}
@@ -944,7 +945,7 @@ func populateTableConstraints(
 			if conkey, err = colIDArrayToDatum(con.CheckConstraint.ColumnIDs); err != nil {
 				return err
 			}
-			displayExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, con.Details, &p.semaCtx, tree.FmtPGCatalog)
+			displayExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, con.Details, &p.semaCtx, p.SessionData(), tree.FmtPGCatalog)
 			if err != nil {
 				return err
 			}
@@ -1243,7 +1244,10 @@ https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 					privileges := privilege.ListFromBitField(
 						userPrivs.Privileges, privilegeObjectType,
 					)
-					defaclItem := createDefACLItem(user, privileges, privilegeObjectType)
+					grantOptions := privilege.ListFromBitField(
+						userPrivs.WithGrantOption, privilegeObjectType,
+					)
+					defaclItem := createDefACLItem(user, privileges, grantOptions, privilegeObjectType)
 					if err := arr.Append(
 						tree.NewDString(defaclItem)); err != nil {
 						return err
@@ -1260,7 +1264,7 @@ https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 						if !catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, tree.Types) &&
 							catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) {
 							defaclItem := createDefACLItem(
-								"" /* public role */, privilege.List{privilege.USAGE}, privilegeObjectType,
+								"" /* public role */, privilege.List{privilege.USAGE}, privilege.List{}, privilegeObjectType,
 							)
 							if err := arr.Append(tree.NewDString(defaclItem)); err != nil {
 								return err
@@ -1270,7 +1274,7 @@ https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 							defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes {
 							defaclItem := createDefACLItem(
 								defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized(),
-								privilege.List{privilege.ALL}, privilegeObjectType,
+								privilege.List{privilege.ALL}, privilege.List{}, privilegeObjectType,
 							)
 							if err := arr.Append(tree.NewDString(defaclItem)); err != nil {
 								return err
@@ -1313,11 +1317,15 @@ https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 }
 
 func createDefACLItem(
-	user string, privileges privilege.List, privilegeObjectType privilege.ObjectType,
+	user string,
+	privileges privilege.List,
+	grantOptions privilege.List,
+	privilegeObjectType privilege.ObjectType,
 ) string {
 	return fmt.Sprintf(`%s=%s/%s`,
 		user,
 		privileges.ListToACL(
+			grantOptions,
 			privilegeObjectType,
 		),
 		// TODO(richardjcai): CockroachDB currently does not track grantors
@@ -1696,12 +1704,26 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 					indoption := tree.NewDArray(types.Int)
 
 					colIDs := make([]descpb.ColumnID, 0, index.NumKeyColumns())
+					exprs := make([]string, 0, index.NumKeyColumns())
 					for i := index.IndexDesc().ExplicitColumnStartIdx(); i < index.NumKeyColumns(); i++ {
 						columnID := index.GetKeyColumnID(i)
-						colIDs = append(colIDs, columnID)
 						col, err := table.FindColumnWithID(columnID)
 						if err != nil {
 							return err
+						}
+						// The indkey for an expression element in an index
+						// should be 0.
+						if col.IsExpressionIndexColumn() {
+							colIDs = append(colIDs, 0)
+							formattedExpr, err := schemaexpr.FormatExprForDisplay(
+								ctx, table, col.GetComputeExpr(), p.SemaCtx(), p.SessionData(), tree.FmtPGCatalog,
+							)
+							if err != nil {
+								return err
+							}
+							exprs = append(exprs, fmt.Sprintf("(%s)", formattedExpr))
+						} else {
+							colIDs = append(colIDs, columnID)
 						}
 						if err := collationOids.Append(typColl(col.GetType(), h)); err != nil {
 							return err
@@ -1739,7 +1761,17 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 					}
 					indpred := tree.DNull
 					if index.IsPartial() {
-						indpred = tree.NewDString(index.GetPredicate())
+						formattedPred, err := schemaexpr.FormatExprForDisplay(
+							ctx, table, index.GetPredicate(), p.SemaCtx(), p.SessionData(), tree.FmtPGCatalog,
+						)
+						if err != nil {
+							return err
+						}
+						indpred = tree.NewDString(formattedPred)
+					}
+					indexprs := tree.DNull
+					if len(exprs) > 0 {
+						indexprs = tree.NewDString(strings.Join(exprs, " "))
 					}
 					return addRow(
 						h.IndexOid(table.GetID(), index.GetID()),     // indexrelid
@@ -1759,7 +1791,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 						collationOidVector,                           // indcollation
 						indclass,                                     // indclass
 						indoptionIntVector,                           // indoption
-						tree.DNull,                                   // indexprs
+						indexprs,                                     // indexprs
 						indpred,                                      // indpred
 						tree.NewDInt(tree.DInt(indnkeyatts)),         // indnkeyatts
 					)
@@ -1775,11 +1807,11 @@ https://www.postgresql.org/docs/9.5/view-pg-indexes.html`,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
 		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual, /* virtual tables do not have indexes */
-			func(db catalog.DatabaseDescriptor, scName string, table catalog.TableDescriptor, tableLookup tableLookupFn) error {
+			func(db catalog.DatabaseDescriptor, scName string, table catalog.TableDescriptor, _ tableLookupFn) error {
 				scNameName := tree.NewDName(scName)
 				tblName := tree.NewDName(table.GetName())
 				return catalog.ForEachIndex(table, catalog.IndexOpts{}, func(index catalog.Index) error {
-					def, err := indexDefFromDescriptor(ctx, p, db, scName, table, index, tableLookup)
+					def, err := indexDefFromDescriptor(ctx, p, db, scName, table, index)
 					if err != nil {
 						return err
 					}
@@ -1806,87 +1838,24 @@ func indexDefFromDescriptor(
 	schemaName string,
 	table catalog.TableDescriptor,
 	index catalog.Index,
-	tableLookup tableLookupFn,
 ) (string, error) {
-	colNames := index.IndexDesc().KeyColumnNames[index.ExplicitColumnStartIdx():]
-	indexDef := tree.CreateIndex{
-		Name:     tree.Name(index.GetName()),
-		Table:    tree.MakeTableNameWithSchema(tree.Name(db.GetName()), tree.Name(schemaName), tree.Name(table.GetName())),
-		Unique:   index.IsUnique(),
-		Columns:  make(tree.IndexElemList, len(colNames)),
-		Storing:  make(tree.NameList, index.NumSecondaryStoredColumns()),
-		Inverted: index.GetType() == descpb.IndexDescriptor_INVERTED,
+	tableName := tree.MakeTableNameWithSchema(tree.Name(db.GetName()), tree.Name(schemaName), tree.Name(table.GetName()))
+	partitionStr := ""
+	fmtStr, err := catformat.IndexForDisplay(
+		ctx,
+		table,
+		&tableName,
+		index,
+		partitionStr,
+		tree.FmtPGCatalog,
+		p.SemaCtx(),
+		p.SessionData(),
+		catformat.IndexDisplayShowCreate,
+	)
+	if err != nil {
+		return "", err
 	}
-	for i, name := range colNames {
-		elem := tree.IndexElem{
-			Column:    tree.Name(name),
-			Direction: tree.Ascending,
-		}
-		col, err := table.FindColumnWithName(tree.Name(name))
-		if err != nil {
-			return "", err
-		}
-		if col.IsExpressionIndexColumn() {
-			expr, err := parser.ParseExpr(col.GetComputeExpr())
-			if err != nil {
-				return "", err
-			}
-			elem.Expr = expr
-		}
-		if index.GetKeyColumnDirection(index.ExplicitColumnStartIdx()+i) == descpb.IndexDescriptor_DESC {
-			elem.Direction = tree.Descending
-		}
-		indexDef.Columns[i] = elem
-	}
-	for i := 0; i < index.NumSecondaryStoredColumns(); i++ {
-		name := index.GetStoredColumnName(i)
-		indexDef.Storing[i] = tree.Name(name)
-	}
-	if index.NumInterleaveAncestors() > 0 {
-		intl := index.IndexDesc().Interleave
-		parentTable, err := tableLookup.getTableByID(intl.Ancestors[len(intl.Ancestors)-1].TableID)
-		if err != nil {
-			return "", err
-		}
-		parentSchemaName := tableLookup.getSchemaName(parentTable)
-		parentDb, err := tableLookup.getDatabaseByID(parentTable.GetParentID())
-		if err != nil {
-			return "", err
-		}
-		var sharedPrefixLen int
-		for _, ancestor := range intl.Ancestors {
-			sharedPrefixLen += int(ancestor.SharedPrefixLen)
-		}
-		fields := colNames[:sharedPrefixLen]
-		intlDef := &tree.InterleaveDef{
-			Parent: tree.MakeTableNameWithSchema(
-				tree.Name(parentDb.GetName()),
-				tree.Name(parentSchemaName),
-				tree.Name(parentTable.GetName())),
-			Fields: make(tree.NameList, len(fields)),
-		}
-		for i, field := range fields {
-			intlDef.Fields[i] = tree.Name(field)
-		}
-		indexDef.Interleave = intlDef
-	}
-	if index.IsPartial() {
-		// Format the raw predicate for display in order to resolve user-defined
-		// types to a human readable form.
-		formattedPred, err := schemaexpr.FormatExprForDisplay(ctx, table, index.GetPredicate(), p.SemaCtx(), tree.FmtPGCatalog)
-		if err != nil {
-			return "", err
-		}
-
-		pred, err := parser.ParseExpr(formattedPred)
-		if err != nil {
-			return "", err
-		}
-		indexDef.Predicate = pred
-	}
-	fmtCtx := tree.NewFmtCtx(tree.FmtPGCatalog)
-	fmtCtx.FormatNode(&indexDef)
-	return fmtCtx.String(), nil
+	return fmtStr, nil
 }
 
 var pgCatalogInheritsTable = virtualSchemaTable{
@@ -2452,7 +2421,10 @@ https://www.postgresql.org/docs/9.5/catalog-pg-settings.html`,
 			if gen.Hidden {
 				continue
 			}
-			value := gen.Get(&p.extendedEvalCtx)
+			value, err := gen.Get(&p.extendedEvalCtx)
+			if err != nil {
+				return err
+			}
 			valueDatum := tree.NewDString(value)
 			var bootDatum tree.Datum = tree.DNull
 			var resetDatum tree.Datum = tree.DNull
@@ -2803,6 +2775,8 @@ func addPGTypeRow(
 			builtinPrefix = "array_"
 			typElem = tree.NewDOid(tree.DInt(typ.ArrayContents().Oid()))
 		}
+	case types.VoidFamily:
+		// void does not have an array type.
 	default:
 		typArray = tree.NewDOid(tree.DInt(types.CalcArrayOid(typ)))
 	}
@@ -2851,6 +2825,30 @@ func addPGTypeRow(
 		tree.DNull,      // typdefault
 		tree.DNull,      // typacl
 	)
+}
+
+func getSchemaAndTypeByTypeID(
+	ctx context.Context, p *planner, id descpb.ID,
+) (string, catalog.TypeDescriptor, error) {
+	typDesc, err := p.Descriptors().GetImmutableTypeByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
+	if err != nil {
+		// If the type was not found, it may be a table.
+		if !(errors.Is(err, catalog.ErrDescriptorNotFound) || pgerror.GetPGCode(err) == pgcode.UndefinedObject) {
+			return "", nil, err
+		}
+		return "", nil, nil
+	}
+
+	sc, err := p.Descriptors().GetImmutableSchemaByID(
+		ctx,
+		p.txn,
+		typDesc.GetParentSchemaID(),
+		tree.SchemaLookupFlags{},
+	)
+	if err != nil {
+		return "", nil, err
+	}
+	return sc.GetName(), typDesc, nil
 }
 
 var pgCatalogTypeTable = virtualSchemaTable{
@@ -2934,20 +2932,20 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 				if err != nil {
 					return false, err
 				}
-				typDesc, err := p.Descriptors().GetImmutableTypeByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
-				if err != nil {
-					// If the type was not found, it may be a table.
-					if !(errors.Is(err, catalog.ErrDescriptorNotFound) || pgerror.GetPGCode(err) == pgcode.UndefinedObject) {
-						return false, err
-					}
-					typDesc = nil
+
+				scName, typDesc, err := getSchemaAndTypeByTypeID(ctx, p, id)
+				if err != nil || typDesc == nil {
+					return false, err
 				}
 
-				// If it is not a type, it has to be a table.
-				if typDesc == nil {
+				// It's an entry for the implicit record type created on behalf of each
+				// table. We have special logic for this case.
+				if typDesc.GetKind() == descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE {
 					table, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
 					if err != nil {
-						if errors.Is(err, catalog.ErrDescriptorNotFound) || pgerror.GetPGCode(err) == pgcode.UndefinedObject {
+						if errors.Is(err, catalog.ErrDescriptorNotFound) ||
+							pgerror.GetPGCode(err) == pgcode.UndefinedObject ||
+							pgerror.GetPGCode(err) == pgcode.UndefinedTable {
 							return false, nil
 						}
 						return false, err
@@ -2973,16 +2971,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 					return true, nil
 				}
 
-				sc, err := p.Descriptors().GetImmutableSchemaByID(
-					ctx,
-					p.txn,
-					typDesc.GetParentSchemaID(),
-					tree.SchemaLookupFlags{},
-				)
-				if err != nil {
-					return false, err
-				}
-				nspOid = h.NamespaceOid(db.GetID(), sc.GetName())
+				nspOid = h.NamespaceOid(db.GetID(), scName)
 				typ, err = typDesc.MakeTypesT(ctx, tree.NewUnqualifiedTypeName(typDesc.GetName()), p)
 				if err != nil {
 					return false, err
@@ -3965,6 +3954,7 @@ var datumToTypeCategory = map[types.Family]*tree.DString{
 	types.UuidFamily:        typCategoryUserDefined,
 	types.INetFamily:        typCategoryNetworkAddr,
 	types.UnknownFamily:     typCategoryUnknown,
+	types.VoidFamily:        typCategoryPseudo,
 }
 
 func typCategory(typ *types.T) tree.Datum {

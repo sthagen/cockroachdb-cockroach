@@ -46,7 +46,7 @@ func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 		kvs = nil
 		it := e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 		defer it.Close()
-		for it.SeekGE(storage.MVCCKey{Key: keys.UserTableDataMin}); ; it.NextKey() {
+		for it.SeekGE(storage.MVCCKey{Key: keys.TestingUserTableDataMin()}); ; it.NextKey() {
 			ok, err := it.Valid()
 			if err != nil {
 				t.Fatal(err)
@@ -82,24 +82,20 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		a STRING PRIMARY KEY, b STRING, c STRING, d STRING,
 		FAMILY (a, b, c), FAMILY (d)
 	)`)
-	parentDesc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
-	var args []row.FetcherTableArgs
-	for _, desc := range []catalog.TableDescriptor{parentDesc} {
-		var colIdxMap catalog.TableColMap
-		var valNeededForCol util.FastIntSet
-		for i, col := range desc.PublicColumns() {
-			colIdxMap.Set(col.GetID(), i)
-			valNeededForCol.Add(i)
-		}
-		args = append(args, row.FetcherTableArgs{
-			Spans:            desc.AllIndexSpans(keys.SystemSQLCodec),
-			Desc:             desc,
-			Index:            desc.GetPrimaryIndex(),
-			ColIdxMap:        colIdxMap,
-			IsSecondaryIndex: false,
-			Cols:             desc.PublicColumns(),
-			ValNeededForCol:  valNeededForCol,
-		})
+	desc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
+	var colIdxMap catalog.TableColMap
+	var valNeededForCol util.FastIntSet
+	for i, col := range desc.PublicColumns() {
+		colIdxMap.Set(col.GetID(), i)
+		valNeededForCol.Add(i)
+	}
+	table := row.FetcherTableArgs{
+		Desc:             desc,
+		Index:            desc.GetPrimaryIndex(),
+		ColIdxMap:        colIdxMap,
+		IsSecondaryIndex: false,
+		Cols:             desc.PublicColumns(),
+		ValNeededForCol:  valNeededForCol,
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
@@ -112,7 +108,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		true, /* isCheck */
 		&rowenc.DatumAlloc{},
 		nil, /* memMonitor */
-		args...,
+		table,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +123,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
-		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {
+		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}, false /* traceKV */); err != nil {
 			t.Fatal(err)
 		}
 		var rows []rowWithMVCCMetadata

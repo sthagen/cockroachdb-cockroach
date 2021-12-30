@@ -160,13 +160,11 @@ var (
 		{name: "RangeTombstone", suffix: LocalRangeTombstoneSuffix},
 		{name: "RaftHardState", suffix: LocalRaftHardStateSuffix},
 		{name: "RangeAppliedState", suffix: LocalRangeAppliedStateSuffix},
-		{name: "RaftAppliedIndex", suffix: LocalRaftAppliedIndexLegacySuffix},
-		{name: "LeaseAppliedIndex", suffix: LocalLeaseAppliedIndexLegacySuffix},
 		{name: "RaftLog", suffix: LocalRaftLogSuffix,
 			ppFunc: raftLogKeyPrint,
 			psFunc: raftLogKeyParse,
 		},
-		{name: "RaftTruncatedState", suffix: LocalRaftTruncatedStateLegacySuffix},
+		{name: "RaftTruncatedState", suffix: LocalRaftTruncatedStateSuffix},
 		{name: "RangeLastReplicaGCTimestamp", suffix: LocalRangeLastReplicaGCTimestampSuffix},
 		{name: "RangeLease", suffix: LocalRangeLeaseSuffix},
 		{name: "RangePriorReadSummary", suffix: LocalRangePriorReadSummarySuffix},
@@ -664,7 +662,7 @@ func prettyPrintInternal(valDirs []encoding.Direction, key roachpb.Key, quoteRaw
 		if quoteRawKeys {
 			return fmt.Sprintf("%q", []byte(key)), false
 		}
-		return fmt.Sprintf("%s", []byte(key)), false
+		return string(key), false
 	}
 
 	for _, k := range keyOfKeyDict {

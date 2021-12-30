@@ -55,7 +55,7 @@ func TestSpanAssembler(t *testing.T) {
 	testColumnFactory := coldataext.NewExtendedColumnFactory(&evalCtx)
 	testAllocator := colmem.NewAllocator(ctx, testMemAcc, testColumnFactory)
 	defer testMemAcc.Close(ctx)
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	typs := []*types.T{types.Int, types.Bytes, types.Decimal}
 
 	for _, useColFamilies := range []bool{true, false} {
@@ -181,7 +181,7 @@ func spanGeneratorOracle(
 }
 
 func makeTable(useColFamilies bool) catalog.TableDescriptor {
-	tableID := keys.MinNonPredefinedUserDescID
+	tableID := keys.TestingUserDescID(0)
 	if !useColFamilies {
 		// We can prevent the span builder from splitting spans into separate column
 		// families by using a system table ID, since system tables do not have
@@ -192,7 +192,7 @@ func makeTable(useColFamilies bool) catalog.TableDescriptor {
 	var testTableDesc = descpb.TableDescriptor{
 		Name:       "abcd",
 		ID:         descpb.ID(tableID),
-		Privileges: descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
+		Privileges: descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
 		Version:    1,
 		Columns: []descpb.ColumnDescriptor{
 			{Name: "a", ID: 1, Type: types.Int},

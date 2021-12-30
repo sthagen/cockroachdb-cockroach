@@ -363,6 +363,8 @@ GRANT admin TO has_admin2;
 			}
 		}()
 	}
+	// Give the cancel queries a chance to propagate before stopping the cluster.
+	time.Sleep(time.Second)
 	testCluster.Stopper().Stop(ctx)
 	wg.Wait()
 }

@@ -71,6 +71,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	_ "github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
@@ -91,6 +92,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
@@ -108,7 +110,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 var (
@@ -116,12 +118,14 @@ var (
 	gzipResponseWriterPool sync.Pool
 
 	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
+		settings.TenantWritable,
 		"server.clock.forward_jump_check_enabled",
 		"if enabled, forward clock jumps > max_offset/2 will cause a panic",
 		false,
 	).WithPublic()
 
 	persistHLCUpperBoundInterval = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"server.clock.persist_upper_bound_interval",
 		"the interval between persisting the wall time upper bound of the clock. The clock "+
 			"does not generate a wall time greater than the persisted timestamp and will panic if "+
@@ -145,20 +149,22 @@ type Server struct {
 	rpcContext      *rpc.Context
 	engines         Engines
 	// The gRPC server on which the different RPC handlers will be registered.
-	grpc         *grpcServer
-	gossip       *gossip.Gossip
-	nodeDialer   *nodedialer.Dialer
-	nodeLiveness *liveness.NodeLiveness
-	storePool    *kvserver.StorePool
-	tcsFactory   *kvcoord.TxnCoordSenderFactory
-	distSender   *kvcoord.DistSender
-	db           *kv.DB
-	node         *Node
-	registry     *metric.Registry
-	recorder     *status.MetricsRecorder
-	runtime      *status.RuntimeStatSampler
-	updates      *diagnostics.UpdateChecker
-	ctSender     *sidetransport.Sender
+	grpc             *grpcServer
+	gossip           *gossip.Gossip
+	nodeDialer       *nodedialer.Dialer
+	nodeLiveness     *liveness.NodeLiveness
+	storePool        *kvserver.StorePool
+	tcsFactory       *kvcoord.TxnCoordSenderFactory
+	distSender       *kvcoord.DistSender
+	db               *kv.DB
+	node             *Node
+	registry         *metric.Registry
+	recorder         *status.MetricsRecorder
+	runtime          *status.RuntimeStatSampler
+	ruleRegistry     *metric.RuleRegistry
+	promRuleExporter *metric.PrometheusRuleExporter
+	updates          *diagnostics.UpdateChecker
+	ctSender         *sidetransport.Sender
 
 	admin           *adminServer
 	status          *statusServer
@@ -176,6 +182,8 @@ type Server struct {
 	replicationReporter   *reports.Reporter
 	protectedtsProvider   protectedts.Provider
 	protectedtsReconciler *ptreconcile.Reconciler
+
+	spanConfigSubscriber *spanconfigkvsubscriber.KVSubscriber
 
 	sqlServer    *SQLServer
 	drainSleepFn func(time.Duration)
@@ -268,6 +276,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		clock = hlc.NewClock(hlc.UnixNano, time.Duration(cfg.MaxOffset))
 	}
 	registry := metric.NewRegistry()
+	ruleRegistry := metric.NewRuleRegistry()
+	promRuleExporter := metric.NewPrometheusRuleExporter(ruleRegistry)
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
 	stopper.AddCloser(cfg.AmbientCtx.Tracer)
 
@@ -283,10 +293,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// regular tag since it's just doing an (atomic) load when a log/trace message
 	// is constructed. The node ID is set by the Store if this host was
 	// bootstrapped; otherwise a new one is allocated in Node.
-	nodeIDContainer := &base.NodeIDContainer{}
-	cfg.AmbientCtx.AddLogTag("n", nodeIDContainer)
-	const sqlInstanceID = base.SQLInstanceID(0)
-	idContainer := base.NewSQLIDContainer(sqlInstanceID, nodeIDContainer)
+	nodeIDContainer := cfg.IDContainer
+	idContainer := base.NewSQLIDContainerForNode(nodeIDContainer)
 
 	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
 
@@ -316,12 +324,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 
 	rpcCtxOpts := rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: cfg.AmbientCtx,
-		Config:     cfg.Config,
-		Clock:      clock,
-		Stopper:    stopper,
-		Settings:   cfg.Settings,
+		TenantID:  roachpb.SystemTenantID,
+		NodeID:    cfg.IDContainer,
+		ClusterID: cfg.ClusterIDContainer,
+		Config:    cfg.Config,
+		Clock:     clock,
+		Stopper:   stopper,
+		Settings:  cfg.Settings,
 		OnOutgoingPing: func(req *rpc.PingRequest) error {
 			// Outgoing ping will block requests with codes.FailedPrecondition to
 			// notify caller that this replica is decommissioned but others could
@@ -333,12 +342,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// signal remote node that it is not considered valid anymore and
 			// operations should fail immediately.
 			return checkPingFor(ctx, req.OriginNodeID, codes.PermissionDenied)
-		}}
+		},
+	}
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
 		rpcCtxOpts.Knobs = serverKnobs.ContextTestingKnobs
 	}
-	rpcContext := rpc.NewContext(rpcCtxOpts)
+	rpcContext := rpc.NewContext(ctx, rpcCtxOpts)
 
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
@@ -379,7 +389,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	g := gossip.New(
 		cfg.AmbientCtx,
-		&rpcContext.ClusterID,
+		rpcContext.ClusterID,
 		nodeIDContainer,
 		rpcContext,
 		grpcServer.Server,
@@ -399,6 +409,15 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	runtimeSampler := status.NewRuntimeStatSampler(ctx, clock)
 	registry.AddMetricStruct(runtimeSampler)
+
+	registry.AddMetric(base.LicenseTTL)
+	err = base.UpdateMetricOnLicenseChange(ctx, cfg.Settings, base.LicenseTTL, timeutil.DefaultTimeSource{}, stopper)
+	if err != nil {
+		log.Errorf(ctx, "unable to initialize periodic license metric update: %v", err)
+	}
+
+	// Create and add KV metric rules
+	kvserver.CreateAndAddRules(ctx, ruleRegistry)
 
 	// A custom RetryOptions is created which uses stopper.ShouldQuiesce() as
 	// the Closer. This prevents infinite retry loops from occurring during
@@ -447,15 +466,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	tcsFactory := kvcoord.NewTxnCoordSenderFactory(txnCoordSenderFactoryCfg, distSender)
 
-	gcoords, metrics := admission.NewGrantCoordinators(admission.Options{
-		MinCPUSlots:                    1,
-		MaxCPUSlots:                    100000, /* TODO(sumeer): add cluster setting */
-		SQLKVResponseBurstTokens:       100000, /* TODO(sumeer): add cluster setting */
-		SQLSQLResponseBurstTokens:      100000, /* arbitrary, and unused */
-		SQLStatementLeafStartWorkSlots: 100,    /* arbitrary, and unused */
-		SQLStatementRootStartWorkSlots: 100,    /* arbitrary, and unused */
-		Settings:                       st,
-	})
+	gcoords, metrics := admission.NewGrantCoordinators(
+		cfg.AmbientCtx,
+		admission.Options{
+			MinCPUSlots:                    1,
+			MaxCPUSlots:                    100000, /* TODO(sumeer): add cluster setting */
+			SQLKVResponseBurstTokens:       100000, /* TODO(sumeer): add cluster setting */
+			SQLSQLResponseBurstTokens:      100000, /* arbitrary, and unused */
+			SQLStatementLeafStartWorkSlots: 100,    /* arbitrary, and unused */
+			SQLStatementRootStartWorkSlots: 100,    /* arbitrary, and unused */
+			Settings:                       st,
+		})
 	for i := range metrics {
 		registry.AddMetricStruct(metrics[i])
 	}
@@ -483,7 +504,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 
 	rangeFeedKnobs, _ := cfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs)
-	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, rangeFeedKnobs)
+	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, st, rangeFeedKnobs)
 	if err != nil {
 		return nil, err
 	}
@@ -611,15 +632,50 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		KVMemoryMonitor:         kvMemoryMonitor,
 	}
 
-	var spanConfigAccessor spanconfig.KVAccessor
+	var spanConfig struct {
+		// kvAccessor powers the span configuration RPCs and the host tenant's
+		// reconciliation job.
+		kvAccessor spanconfig.KVAccessor
+		// subscriber is used by stores to subsribe to span configuration
+		// updates.
+		subscriber *spanconfigkvsubscriber.KVSubscriber
+		// kvAccessorForTenantRecords is when creating/destroying secondary
+		// tenant records.
+		kvAccessorForTenantRecords spanconfig.KVAccessor
+	}
 	if cfg.SpanConfigsEnabled {
 		storeCfg.SpanConfigsEnabled = true
-		spanConfigAccessor = spanconfigkvaccessor.New(
+		spanConfigKnobs, _ := cfg.TestingKnobs.SpanConfig.(*spanconfig.TestingKnobs)
+		if spanConfigKnobs != nil && spanConfigKnobs.StoreKVSubscriberOverride != nil {
+			storeCfg.SpanConfigSubscriber = spanConfigKnobs.StoreKVSubscriberOverride
+		} else {
+			spanConfig.subscriber = spanconfigkvsubscriber.New(
+				stopper,
+				db,
+				clock,
+				rangeFeedFactory,
+				keys.SpanConfigurationsTableID,
+				1<<20, /* 1 MB */
+				storeCfg.DefaultSpanConfig,
+				spanConfigKnobs,
+			)
+			storeCfg.SpanConfigSubscriber = spanConfig.subscriber
+		}
+
+		scKVAccessor := spanconfigkvaccessor.New(
 			db, internalExecutor, cfg.Settings,
 			systemschema.SpanConfigurationsTableName.FQString(),
 		)
+		spanConfig.kvAccessor, spanConfig.kvAccessorForTenantRecords = scKVAccessor, scKVAccessor
 	} else {
-		spanConfigAccessor = spanconfigkvaccessor.DisabledAccessor{}
+		// If the spanconfigs infrastructure is disabled, there should be no
+		// reconciliation jobs or RPCs issued against the infrastructure. Plug
+		// in a disabled spanconfig.KVAccessor that would error out for
+		// unexpected use.
+		spanConfig.kvAccessor = spanconfigkvaccessor.DisabledKVAccessor
+
+		// Use a no-op accessor where tenant records are created/destroyed.
+		spanConfig.kvAccessorForTenantRecords = spanconfigkvaccessor.NoopKVAccessor
 	}
 
 	if storeTestingKnobs := cfg.TestingKnobs.Store; storeTestingKnobs != nil {
@@ -634,7 +690,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		AmbientCtx:    &cfg.AmbientCtx,
 		Config:        cfg.BaseConfig.Config,
 		Settings:      cfg.Settings,
-		ClusterID:     rpcContext.ClusterID.Get,
+		ClusterID:     cfg.ClusterIDContainer.Get,
 		NodeID:        nodeIDContainer.Get,
 		SQLInstanceID: idContainer.SQLInstanceID,
 	}
@@ -652,9 +708,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	node := NewNode(
 		storeCfg, recorder, registry, stopper,
-		txnMetrics, stores, nil /* execCfg */, &rpcContext.ClusterID,
+		txnMetrics, stores, nil /* execCfg */, cfg.ClusterIDContainer,
 		gcoords.Regular.GetWorkQueue(admission.KVWork), gcoords.Stores,
-		tenantUsage, spanConfigAccessor,
+		tenantUsage, spanConfig.kvAccessor,
 	)
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
@@ -739,6 +795,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			externalStorageFromURI:   externalStorageFromURI,
 			isMeta1Leaseholder:       node.stores.IsMeta1Leaseholder,
 			sqlSQLResponseAdmissionQ: gcoords.Regular.GetWorkQueue(admission.SQLSQLResponseWork),
+			spanConfigKVAccessor:     spanConfig.kvAccessorForTenantRecords,
 		},
 		SQLConfig:                &cfg.SQLConfig,
 		BaseConfig:               &cfg.BaseConfig,
@@ -748,7 +805,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		rpcContext:               rpcContext,
 		nodeDescs:                g,
 		systemConfigProvider:     g,
-		spanConfigAccessor:       spanConfigAccessor,
+		spanConfigAccessor:       spanConfig.kvAccessor,
 		nodeDialer:               nodeDialer,
 		distSender:               distSender,
 		db:                       db,
@@ -793,6 +850,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		node:                   node,
 		registry:               registry,
 		recorder:               recorder,
+		ruleRegistry:           ruleRegistry,
+		promRuleExporter:       promRuleExporter,
 		updates:                updates,
 		ctSender:               ctSender,
 		runtime:                runtimeSampler,
@@ -808,6 +867,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		replicationReporter:    replicationReporter,
 		protectedtsProvider:    protectedtsProvider,
 		protectedtsReconciler:  protectedtsReconciler,
+		spanConfigSubscriber:   spanConfig.subscriber,
 		sqlServer:              sqlServer,
 		drainSleepFn:           drainSleepFn,
 		externalStorageBuilder: externalStorageBuilder,
@@ -1000,7 +1060,7 @@ func (s *Server) startMonitoringForwardClockJumps(ctx context.Context) error {
 // successfully persisted timestamp greater then any wall time used by the
 // server.
 //
-// If prevHLCUpperBound is 0, the function sleeps up to max offset
+// If prevHLCUpperBound is 0, the function sleeps up to max offset.
 func ensureClockMonotonicity(
 	ctx context.Context,
 	clock *hlc.Clock,
@@ -1277,7 +1337,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 			return err
 		}
 
-		initConfig := newInitServerConfig(s.cfg, dialOpts)
+		initConfig := newInitServerConfig(ctx, s.cfg, dialOpts)
 		inspectedDiskState, err := inspectEngines(
 			ctx,
 			s.engines,
@@ -1566,14 +1626,17 @@ func (s *Server) PreStart(ctx context.Context) error {
 		}
 	})
 
-	// NB: if this store is freshly initialized (or no upper bound was
-	// persisted), hlcUpperBound will be zero.
-	hlcUpperBound, err := kvserver.ReadMaxHLCUpperBound(ctx, s.engines)
-	if err != nil {
-		return errors.Wrap(err, "reading max HLC upper bound")
-	}
+	// If the server is being restarted, sleep to ensure monotonicity of the HLC
+	// clock. This can be skipped on server bootstrap because the server has never
+	// been used before.
+	var hlcUpperBoundExists bool
+	if !initialStart {
+		hlcUpperBound, err := kvserver.ReadMaxHLCUpperBound(ctx, s.engines)
+		if err != nil {
+			return errors.Wrap(err, "reading max HLC upper bound")
+		}
+		hlcUpperBoundExists = hlcUpperBound > 0
 
-	if hlcUpperBound > 0 {
 		ensureClockMonotonicity(
 			ctx,
 			s.clock,
@@ -1615,12 +1678,12 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return err
 	}
 	// Stores have been initialized, so Node can now provide Pebble metrics.
-	s.storeGrantCoords.SetPebbleMetricsProvider(s.node)
+	s.storeGrantCoords.SetPebbleMetricsProvider(ctx, s.node)
 
 	log.Event(ctx, "started node")
 	if err := s.startPersistingHLCUpperBound(
 		ctx,
-		hlcUpperBound > 0,
+		hlcUpperBoundExists,
 		func(t int64) error { /* function to persist upper bound of HLC to all stores */
 			return s.node.SetHLCUpperBound(context.Background(), t)
 		},
@@ -1726,6 +1789,11 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return err
 	}
 
+	if s.cfg.SpanConfigsEnabled && s.spanConfigSubscriber != nil {
+		if err := s.spanConfigSubscriber.Start(ctx); err != nil {
+			return err
+		}
+	}
 	// Start garbage collecting system events.
 	//
 	// NB: As written, this falls awkwardly between SQL and KV. KV is used only
@@ -1790,7 +1858,6 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
-
 	// Register debugging endpoints.
 	var debugHandler http.Handler = s.debug
 	if s.cfg.RequireWebSession() {
@@ -2070,13 +2137,6 @@ func maybeImportTS(ctx context.Context, s *Server) error {
 		}
 	}
 
-	nodeToStore := map[string][]string{}
-	for n := range nodeIDs {
-		// By default, assume that each node has one store, with a
-		// matching ID, i.e. n1->s1, n2->s2, etc.
-		nodeToStore[n] = []string{n}
-	}
-	storeToNode := map[string]string{}
 	if knobs.ImportTimeseriesMappingFile == "" {
 		return errors.Errorf("need to specify COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE; it should point at " +
 			"a YAML file that maps StoreID to NodeID. For example, if s1 is on n1 and s2 is on n5:\n\n1: 1\n2:5")
@@ -2085,47 +2145,85 @@ func maybeImportTS(ctx context.Context, s *Server) error {
 	if err != nil {
 		return err
 	}
+	storeToNode := map[roachpb.StoreID]roachpb.NodeID{}
 	if err := yaml.NewDecoder(bytes.NewReader(mapBytes)).Decode(&storeToNode); err != nil {
 		return err
 	}
+
+	fakeStatuses, err := makeFakeNodeStatuses(storeToNode)
+	if err != nil {
+		return err
+	}
+	if err := checkFakeStatuses(fakeStatuses, storeIDs); err != nil {
+		return errors.Wrapf(err, "please provide an updated mapping file %s", knobs.ImportTimeseriesMappingFile)
+	}
+
+	// All checks passed, write the statuses.
+	for _, status := range fakeStatuses {
+		key := keys.NodeStatusKey(status.Desc.NodeID)
+		if err := s.db.PutInline(ctx, key, &status); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func makeFakeNodeStatuses(
+	storeToNode map[roachpb.StoreID]roachpb.NodeID,
+) ([]statuspb.NodeStatus, error) {
+	var sl []statuspb.NodeStatus
+	nodeToStore := map[roachpb.NodeID][]roachpb.StoreID{}
 	for sid, nid := range storeToNode {
 		nodeToStore[nid] = append(nodeToStore[nid], sid)
 	}
 
-	for nodeString, storeStrings := range nodeToStore {
-		nid, err := strconv.ParseInt(nodeString, 10, 32)
-		if err != nil {
-			return err
-		}
-		nodeID := roachpb.NodeID(nid)
-
-		var ss []statuspb.StoreStatus
-		for _, storeString := range storeStrings {
-			sid, err := strconv.ParseInt(storeString, 10, 32)
-			if err != nil {
-				return err
-			}
-			ss = append(ss, statuspb.StoreStatus{Desc: roachpb.StoreDescriptor{StoreID: roachpb.StoreID(sid)}})
-			delete(storeIDs, storeString)
-		}
-
-		ns := statuspb.NodeStatus{
+	for nodeID, storeIDs := range nodeToStore {
+		sort.Slice(storeIDs, func(i, j int) bool {
+			return storeIDs[i] < storeIDs[j]
+		})
+		nodeStatus := statuspb.NodeStatus{
 			Desc: roachpb.NodeDescriptor{
 				NodeID: nodeID,
 			},
-			StoreStatuses: ss,
 		}
-		key := keys.NodeStatusKey(nodeID)
-		if err := s.db.PutInline(ctx, key, &ns); err != nil {
-			return err
+		for _, storeID := range storeIDs {
+			nodeStatus.StoreStatuses = append(nodeStatus.StoreStatuses, statuspb.StoreStatus{Desc: roachpb.StoreDescriptor{
+				Node:    nodeStatus.Desc, // don't want cycles here
+				StoreID: storeID,
+			}})
+		}
+
+		sl = append(sl, nodeStatus)
+	}
+	sort.Slice(sl, func(i, j int) bool {
+		return sl[i].Desc.NodeID < sl[j].Desc.NodeID
+	})
+	return sl, nil
+}
+
+func checkFakeStatuses(fakeStatuses []statuspb.NodeStatus, storeIDs map[string]struct{}) error {
+	for _, status := range fakeStatuses {
+		for _, ss := range status.StoreStatuses {
+			storeID := ss.Desc.StoreID
+			strID := fmt.Sprint(storeID)
+			if _, ok := storeIDs[strID]; !ok {
+				// This is likely an mistake and where it isn't (for example since store
+				// is long gone and hasn't supplied metrics in a long time) the user can
+				// react by removing the assignment from the yaml file and trying again.
+				return errors.Errorf(
+					"s%d supplied in input mapping, but no timeseries found for it",
+					ss.Desc.StoreID,
+				)
+			}
+
+			delete(storeIDs, strID)
 		}
 	}
 	if len(storeIDs) > 0 {
 		return errors.Errorf(
-			"need to map the remaining stores %v to nodes %v, please provide an updated mapping file %s",
-			storeIDs, nodeIDs, knobs.ImportTimeseriesMappingFile)
+			"need to map the remaining stores %v to nodes", storeIDs)
 	}
-
 	return nil
 }
 
@@ -2350,16 +2448,19 @@ func (s *SQLServer) startServeSQL(
 		tcpKeepAlive: envutil.EnvOrDefaultDuration("COCKROACH_SQL_TCP_KEEP_ALIVE", time.Minute),
 	}
 
-	_ = stopper.RunAsyncTask(pgCtx, "serve-conn", func(pgCtx context.Context) {
-		netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, pgL, func(conn net.Conn) {
-			connCtx := s.pgServer.AnnotateCtxForIncomingConn(pgCtx, conn)
-			tcpKeepAlive.configure(connCtx, conn)
+	_ = stopper.RunAsyncTaskEx(pgCtx,
+		stop.TaskOpts{TaskName: "pgwire-listener", SpanOpt: stop.SterileRootSpan},
+		func(ctx context.Context) {
+			err := connManager.ServeWith(ctx, stopper, pgL, func(ctx context.Context, conn net.Conn) {
+				connCtx := s.pgServer.AnnotateCtxForIncomingConn(ctx, conn)
+				tcpKeepAlive.configure(connCtx, conn)
 
-			if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
-				log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
-			}
-		}))
-	})
+				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
+					log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
+				}
+			})
+			netutil.FatalIfUnexpected(err)
+		})
 
 	// If a unix socket was requested, start serving there too.
 	if len(socketFile) != 0 {
@@ -2381,21 +2482,26 @@ func (s *SQLServer) startServeSQL(
 				log.Ops.Fatalf(ctx, "%v", err)
 			}
 		}
-		if err := stopper.RunAsyncTask(ctx, "unix-ln-close", func(ctx context.Context) {
-			waitQuiesce(ctx)
-		}); err != nil {
+		if err := stopper.RunAsyncTaskEx(ctx,
+			stop.TaskOpts{TaskName: "unix-ln-close", SpanOpt: stop.SterileRootSpan},
+			func(ctx context.Context) {
+				waitQuiesce(ctx)
+			}); err != nil {
 			waitQuiesce(ctx)
 			return err
 		}
 
-		if err := stopper.RunAsyncTask(pgCtx, "unix-ln-serve", func(pgCtx context.Context) {
-			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, unixLn, func(conn net.Conn) {
-				connCtx := s.pgServer.AnnotateCtxForIncomingConn(pgCtx, conn)
-				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
-					log.Ops.Errorf(connCtx, "%v", err)
-				}
-			}))
-		}); err != nil {
+		if err := stopper.RunAsyncTaskEx(pgCtx,
+			stop.TaskOpts{TaskName: "unix-listener", SpanOpt: stop.SterileRootSpan},
+			func(ctx context.Context) {
+				err := connManager.ServeWith(ctx, stopper, unixLn, func(ctx context.Context, conn net.Conn) {
+					connCtx := s.pgServer.AnnotateCtxForIncomingConn(ctx, conn)
+					if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
+						log.Ops.Errorf(connCtx, "%v", err)
+					}
+				})
+				netutil.FatalIfUnexpected(err)
+			}); err != nil {
 			return err
 		}
 	}
@@ -2620,6 +2726,7 @@ func startSampleEnvironment(ctx context.Context, cfg sampleEnvironmentCfg) error
 					curStats := goMemStats.Load().(*status.GoMemStats)
 					cgoStats := status.GetCGoMemStats(ctx)
 					cfg.runtime.SampleEnvironment(ctx, curStats, cgoStats)
+
 					if goroutineDumper != nil {
 						goroutineDumper.MaybeDump(ctx, cfg.st, cfg.runtime.Goroutines.Value())
 					}
@@ -2643,9 +2750,6 @@ func (s *Server) Stop() {
 
 // ServeHTTP is necessary to implement the http.Handler interface.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// This is our base handler, so catch all panics and make sure they stick.
-	defer log.FatalOnPanic()
-
 	// Disable caching of responses.
 	w.Header().Set("Cache-control", "no-cache")
 
@@ -2671,6 +2775,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 		w = gzw
 	}
+
+	// This is our base handler.
+	// Intercept all panics, log them, and return an internal server error as a response.
+	defer func() {
+		if p := recover(); p != nil {
+			// Note: use of a background context here so we can log even with the absence of a client.
+			// Assumes appropriate timeouts are used.
+			logcrash.ReportPanic(context.Background(), &s.st.SV, p, 1 /* depth */)
+			http.Error(w, errAPIInternalErrorString, http.StatusInternalServerError)
+		}
+	}()
+
 	s.mux.ServeHTTP(w, r)
 }
 

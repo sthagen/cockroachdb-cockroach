@@ -10,7 +10,9 @@
 
 import { Action } from "redux";
 import { PayloadAction } from "src/interfaces/action";
-import { Moment } from "moment";
+import { google } from "@cockroachlabs/crdb-protobuf-client";
+import IDuration = google.protobuf.IDuration;
+import { TimeScale } from "src/redux/timewindow";
 
 export const CREATE_STATEMENT_DIAGNOSTICS_REPORT =
   "cockroachui/statements/CREATE_STATEMENT_DIAGNOSTICS_REPORT";
@@ -25,13 +27,23 @@ export type DiagnosticsReportPayload = {
   statementFingerprint: string;
 };
 
+export type CreateStatementDiagnosticsReportPayload = {
+  statementFingerprint: string;
+  minExecLatency: IDuration;
+  expiresAfter: IDuration;
+};
+
 export function createStatementDiagnosticsReportAction(
   statementFingerprint: string,
-): PayloadAction<DiagnosticsReportPayload> {
+  minExecLatency: IDuration,
+  expiresAfter: IDuration,
+): PayloadAction<CreateStatementDiagnosticsReportPayload> {
   return {
     type: CREATE_STATEMENT_DIAGNOSTICS_REPORT,
     payload: {
       statementFingerprint,
+      minExecLatency,
+      expiresAfter,
     },
   };
 }
@@ -63,23 +75,14 @@ export function createOpenDiagnosticsModalAction(
         Combined Stats Actions
 ****************************************/
 
-export const SET_COMBINED_STATEMENTS_RANGE =
-  "cockroachui/statements/SET_COMBINED_STATEMENTS_RANGE";
+export const SET_COMBINED_STATEMENTS_TIME_SCALE =
+  "cockroachui/statements/SET_COMBINED_STATEMENTS_TIME_SCALE";
 
-export type CombinedStatementsPayload = {
-  start: Moment;
-  end: Moment;
-};
-
-export function setCombinedStatementsDateRangeAction(
-  start: Moment,
-  end: Moment,
-): PayloadAction<CombinedStatementsPayload> {
+export function setCombinedStatementsTimeScaleAction(
+  ts: TimeScale,
+): PayloadAction<TimeScale> {
   return {
-    type: SET_COMBINED_STATEMENTS_RANGE,
-    payload: {
-      start,
-      end,
-    },
+    type: SET_COMBINED_STATEMENTS_TIME_SCALE,
+    payload: ts,
   };
 }

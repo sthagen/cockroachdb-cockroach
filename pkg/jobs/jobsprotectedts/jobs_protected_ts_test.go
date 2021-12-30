@@ -12,7 +12,6 @@ package jobsprotectedts_test
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"testing"
 
@@ -97,20 +96,23 @@ func TestJobsProtectedTimestamp(t *testing.T) {
 	_, recRemains := mkJobAndRecord()
 	ensureNotExists := func(ctx context.Context, txn *kv.Txn, ptsID uuid.UUID) (err error) {
 		_, err = ptp.GetRecord(ctx, txn, ptsID)
+		if err == nil {
+			return errors.New("found pts record, waiting for ErrNotExists")
+		}
 		if errors.Is(err, protectedts.ErrNotExists) {
 			return nil
 		}
-		return fmt.Errorf("waiting for %v, got %v", protectedts.ErrNotExists, err)
+		return errors.Wrap(err, "waiting for ErrNotExists")
 	}
 	testutils.SucceedsSoon(t, func() (err error) {
 		return s0.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			if err := ensureNotExists(ctx, txn, recMovedToFailed.ID); err != nil {
+			if err := ensureNotExists(ctx, txn, recMovedToFailed.ID.GetUUID()); err != nil {
 				return err
 			}
-			if err := ensureNotExists(ctx, txn, recFinished.ID); err != nil {
+			if err := ensureNotExists(ctx, txn, recFinished.ID.GetUUID()); err != nil {
 				return err
 			}
-			_, err := ptp.GetRecord(ctx, txn, recRemains.ID)
+			_, err := ptp.GetRecord(ctx, txn, recRemains.ID.GetUUID())
 			require.NoError(t, err)
 			return err
 		})
@@ -174,17 +176,20 @@ func TestSchedulesProtectedTimestamp(t *testing.T) {
 	_, recSchedule := mkScheduleAndRecord("do-not-drop")
 	ensureNotExists := func(ctx context.Context, txn *kv.Txn, ptsID uuid.UUID) (err error) {
 		_, err = ptp.GetRecord(ctx, txn, ptsID)
+		if err == nil {
+			return errors.New("found pts record, waiting for ErrNotExists")
+		}
 		if errors.Is(err, protectedts.ErrNotExists) {
 			return nil
 		}
-		return fmt.Errorf("waiting for %v, got %v", protectedts.ErrNotExists, err)
+		return errors.Wrap(err, "waiting for ErrNotExists")
 	}
 	testutils.SucceedsSoon(t, func() (err error) {
 		return s0.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			if err := ensureNotExists(ctx, txn, recScheduleDropped.ID); err != nil {
+			if err := ensureNotExists(ctx, txn, recScheduleDropped.ID.GetUUID()); err != nil {
 				return err
 			}
-			_, err := ptp.GetRecord(ctx, txn, recSchedule.ID)
+			_, err := ptp.GetRecord(ctx, txn, recSchedule.ID.GetUUID())
 			require.NoError(t, err)
 			return err
 		})

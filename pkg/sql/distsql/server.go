@@ -253,13 +253,13 @@ func (ds *ServerImpl) setupFlow(
 		// TODO(andrei): localState.IsLocal is not quite the right thing to use.
 		//  If that field is unset, we might still want to create a child span if
 		//  this flow is run synchronously.
-		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName, tracing.WithParentAndAutoCollection(parentSpan))
+		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName, tracing.WithParent(parentSpan))
 	} else {
 		// We use FollowsFrom because the flow's span outlives the SetupFlow request.
 		ctx, sp = ds.Tracer.StartSpanCtx(
 			ctx,
 			opName,
-			tracing.WithParentAndAutoCollection(parentSpan),
+			tracing.WithParent(parentSpan),
 			tracing.WithFollowsFrom(),
 		)
 	}
@@ -326,11 +326,6 @@ func (ds *ServerImpl) setupFlow(
 		if err != nil {
 			return ctx, nil, nil, err
 		}
-		ie := &lazyInternalExecutor{
-			newInternalExecutor: func() sqlutil.InternalExecutor {
-				return ds.SessionBoundInternalExecutorFactory(ctx, sd)
-			},
-		}
 
 		// It's important to populate evalCtx.Txn early. We'll write it again in the
 		// f.SetTxn() call below, but by then it will already have been captured by
@@ -352,18 +347,18 @@ func (ds *ServerImpl) setupFlow(
 			Tracer:           ds.ServerConfig.Tracer,
 			// Most processors will override this Context with their own context in
 			// ProcessorBase. StartInternal().
-			Context:            ctx,
-			Planner:            &faketreeeval.DummyEvalPlanner{},
-			PrivilegedAccessor: &faketreeeval.DummyPrivilegedAccessor{},
-			SessionAccessor:    &faketreeeval.DummySessionAccessor{},
-			ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
-			Sequence:           &faketreeeval.DummySequenceOperators{},
-			Tenant:             &faketreeeval.DummyTenantOperator{},
-			Regions:            &faketreeeval.DummyRegionOperator{},
-			InternalExecutor:   ie,
-			Txn:                leafTxn,
-			SQLLivenessReader:  ds.ServerConfig.SQLLivenessReader,
-			SQLStatsController: ds.ServerConfig.SQLStatsController,
+			Context:                   ctx,
+			Planner:                   &faketreeeval.DummyEvalPlanner{},
+			PrivilegedAccessor:        &faketreeeval.DummyPrivilegedAccessor{},
+			SessionAccessor:           &faketreeeval.DummySessionAccessor{},
+			ClientNoticeSender:        &faketreeeval.DummyClientNoticeSender{},
+			Sequence:                  &faketreeeval.DummySequenceOperators{},
+			Tenant:                    &faketreeeval.DummyTenantOperator{},
+			Regions:                   &faketreeeval.DummyRegionOperator{},
+			Txn:                       leafTxn,
+			SQLLivenessReader:         ds.ServerConfig.SQLLivenessReader,
+			SQLStatsController:        ds.ServerConfig.SQLStatsController,
+			IndexUsageStatsController: ds.ServerConfig.IndexUsageStatsController,
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 		evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
@@ -381,7 +376,7 @@ func (ds *ServerImpl) setupFlow(
 	isVectorized := req.EvalContext.SessionData.VectorizeMode != sessiondatapb.VectorizeOff
 	f := newFlow(
 		flowCtx, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
-		localState.LocalProcs, isVectorized, onFlowCleanup,
+		localState.LocalProcs, isVectorized, onFlowCleanup, req.StatementSQL,
 	)
 	opt := flowinfra.FuseNormally
 	if !localState.MustUseLeafTxn() {
@@ -455,6 +450,7 @@ func (ds *ServerImpl) newFlowContext(
 		Cfg:            &ds.ServerConfig,
 		ID:             id,
 		EvalCtx:        evalCtx,
+		Txn:            evalCtx.Txn,
 		NodeID:         ds.ServerConfig.NodeID,
 		TraceKV:        traceKV,
 		CollectStats:   collectStats,
@@ -465,6 +461,7 @@ func (ds *ServerImpl) newFlowContext(
 		DiskMonitor: execinfra.NewMonitor(
 			ctx, ds.ParentDiskMonitor, "flow-disk-monitor",
 		),
+		PreserveFlowSpecs: localState.PreserveFlowSpecs,
 	}
 
 	if localState.IsLocal && localState.Collection != nil {
@@ -498,8 +495,9 @@ func newFlow(
 	localProcessors []execinfra.LocalProcessor,
 	isVectorized bool,
 	onFlowCleanup func(),
+	statementSQL string,
 ) flowinfra.Flow {
-	base := flowinfra.NewFlowBase(flowCtx, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup)
+	base := flowinfra.NewFlowBase(flowCtx, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup, statementSQL)
 	if isVectorized {
 		return colflow.NewVectorizedFlow(base)
 	}
@@ -532,6 +530,10 @@ type LocalState struct {
 	// LocalProcs is an array of planNodeToRowSource processors. It's in order and
 	// will be indexed into by the RowSourceIdx field in LocalPlanNodeSpec.
 	LocalProcs []execinfra.LocalProcessor
+
+	// PreserveFlowSpecs is true when the flow setup code needs to be careful
+	// when modifying the specifications of processors.
+	PreserveFlowSpecs bool
 }
 
 // MustUseLeafTxn returns true if a LeafTxn must be used. It is valid to call
@@ -563,18 +565,57 @@ func (ds *ServerImpl) SetupLocalSyncFlow(
 	return ctx, f, opChains, err
 }
 
+// setupSpanForIncomingRPC creates a span for a SetupFlow RPC. The caller must
+// finish the returned span.
+//
+// For most other RPCs, there's a gRPC server interceptor that opens spans based
+// on trace info passed as gRPC metadata. But the SetupFlow RPC is common and so
+// we have a more efficient implementation based on tracing information being
+// passed in the request proto.
+func (ds *ServerImpl) setupSpanForIncomingRPC(
+	ctx context.Context, req *execinfrapb.SetupFlowRequest,
+) (context.Context, *tracing.Span) {
+	tr := ds.ServerConfig.AmbientContext.Tracer
+	parentSpan := tracing.SpanFromContext(ctx)
+	if parentSpan != nil {
+		// It's not expected to have a span in the context since the gRPC server
+		// interceptor that generally opens spans exempts this particular RPC. Note
+		// that this method is not called for flows local to the gateway.
+		return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
+			tracing.WithParent(parentSpan),
+			tracing.WithServerSpanKind)
+	}
+
+	var remoteParent tracing.SpanMeta
+	if !req.TraceInfo.Empty() {
+		remoteParent = tracing.SpanMetaFromProto(req.TraceInfo)
+	} else {
+		// For backwards compatibility with 21.2, if tracing info was passed as
+		// gRPC metadata, we use it.
+		var err error
+		remoteParent, err = tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
+		if err != nil {
+			log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
+		}
+	}
+	return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
+		tracing.WithRemoteParent(remoteParent),
+		tracing.WithServerSpanKind)
+}
+
 // SetupFlow is part of the execinfrapb.DistSQLServer interface.
 func (ds *ServerImpl) SetupFlow(
 	ctx context.Context, req *execinfrapb.SetupFlowRequest,
 ) (*execinfrapb.SimpleResponse, error) {
 	log.VEventf(ctx, 1, "received SetupFlow request from n%v for flow %v", req.Flow.Gateway, req.Flow.FlowID)
-	parentSpan := tracing.SpanFromContext(ctx)
+	_, rpcSpan := ds.setupSpanForIncomingRPC(ctx, req)
+	defer rpcSpan.Finish()
 
 	// Note: the passed context will be canceled when this RPC completes, so we
 	// can't associate it with the flow.
 	ctx = ds.AnnotateCtx(context.Background())
 	ctx, f, _, err := ds.setupFlow(
-		ctx, parentSpan, ds.memMonitor, req, nil, /* rowSyncFlowConsumer */
+		ctx, rpcSpan, ds.memMonitor, req, nil, /* rowSyncFlowConsumer */
 		nil /* batchSyncFlowConsumer */, LocalState{},
 	)
 	if err == nil {

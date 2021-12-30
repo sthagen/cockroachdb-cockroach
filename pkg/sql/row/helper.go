@@ -15,6 +15,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -24,11 +25,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/rowencpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,6 +43,7 @@ const (
 )
 
 var maxRowSizeLog = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"sql.guardrails.max_row_size_log",
 	"maximum size of row (or column family if multiple column families are in use) that SQL can "+
 		"write to the database, above which an event is logged to SQL_PERF (or SQL_INTERNAL_PERF "+
@@ -62,6 +66,7 @@ var maxRowSizeLog = settings.RegisterByteSizeSetting(
 ).WithPublic()
 
 var maxRowSizeErr = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"sql.guardrails.max_row_size_err",
 	"maximum size of row (or column family if multiple column families are in use) that SQL can "+
 		"write to the database, above which an error is returned; use 0 to disable",
@@ -89,7 +94,7 @@ type rowHelper struct {
 	TableDesc catalog.TableDescriptor
 	// Secondary indexes.
 	Indexes      []catalog.Index
-	indexEntries []rowenc.IndexEntry
+	indexEntries map[catalog.Index][]rowenc.IndexEntry
 
 	// Computed during initialization for pretty-printing.
 	primIndexValDirs []encoding.Direction
@@ -147,7 +152,11 @@ func (rh *rowHelper) encodeIndexes(
 	values []tree.Datum,
 	ignoreIndexes util.FastIntSet,
 	includeEmpty bool,
-) (primaryIndexKey []byte, secondaryIndexEntries []rowenc.IndexEntry, err error) {
+) (
+	primaryIndexKey []byte,
+	secondaryIndexEntries map[catalog.Index][]rowenc.IndexEntry,
+	err error,
+) {
 	primaryIndexKey, err = rh.encodePrimaryIndex(colIDtoRowIndex, values)
 	if err != nil {
 		return nil, nil, err
@@ -188,12 +197,15 @@ func (rh *rowHelper) encodeSecondaryIndexes(
 	values []tree.Datum,
 	ignoreIndexes util.FastIntSet,
 	includeEmpty bool,
-) (secondaryIndexEntries []rowenc.IndexEntry, err error) {
-	if cap(rh.indexEntries) < len(rh.Indexes) {
-		rh.indexEntries = make([]rowenc.IndexEntry, 0, len(rh.Indexes))
+) (secondaryIndexEntries map[catalog.Index][]rowenc.IndexEntry, err error) {
+
+	if rh.indexEntries == nil {
+		rh.indexEntries = make(map[catalog.Index][]rowenc.IndexEntry, len(rh.Indexes))
 	}
 
-	rh.indexEntries = rh.indexEntries[:0]
+	for i := range rh.indexEntries {
+		rh.indexEntries[i] = rh.indexEntries[i][:0]
+	}
 
 	for i := range rh.Indexes {
 		index := rh.Indexes[i]
@@ -202,7 +214,7 @@ func (rh *rowHelper) encodeSecondaryIndexes(
 			if err != nil {
 				return nil, err
 			}
-			rh.indexEntries = append(rh.indexEntries, entries...)
+			rh.indexEntries[index] = append(rh.indexEntries[index], entries...)
 		}
 	}
 
@@ -287,6 +299,39 @@ func (rh *rowHelper) checkRowSize(
 			rh.metrics.MaxRowSizeErrCount.Inc(1)
 		}
 		return pgerror.WithCandidateCode(&details, pgcode.ProgramLimitExceeded)
+	}
+	return nil
+}
+
+var deleteEncoding protoutil.Message = &rowencpb.IndexValueWrapper{
+	Value:   nil,
+	Deleted: true,
+}
+
+func (rh *rowHelper) deleteIndexEntry(
+	ctx context.Context,
+	batch *kv.Batch,
+	index catalog.Index,
+	valDirs []encoding.Direction,
+	entry *rowenc.IndexEntry,
+	traceKV bool,
+) error {
+	if index.UseDeletePreservingEncoding() {
+		if traceKV {
+			log.VEventf(ctx, 2, "Put (delete) %s", entry.Key)
+		}
+
+		batch.Put(entry.Key, deleteEncoding)
+	} else {
+		if traceKV {
+			if valDirs != nil {
+				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(valDirs, entry.Key))
+			} else {
+				log.VEventf(ctx, 2, "Del %s", entry.Key)
+			}
+		}
+
+		batch.Del(entry.Key)
 	}
 	return nil
 }

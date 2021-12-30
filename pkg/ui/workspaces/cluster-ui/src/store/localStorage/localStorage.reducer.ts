@@ -11,17 +11,26 @@
 import moment from "moment";
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
 import { DOMAIN_NAME } from "../utils";
+import { defaultFilters, Filters } from "../../queryFilter";
+import { TimeScale, defaultTimeScaleSelected } from "../../timeScaleDropdown";
 
-type StatementsDateRangeState = {
-  start: number;
-  end: number;
+type SortSetting = {
+  ascending: boolean;
+  columnTitle: string;
 };
 
 export type LocalStorageState = {
   "adminUi/showDiagnosticsModal": boolean;
   "showColumns/StatementsPage": string;
   "showColumns/TransactionPage": string;
-  "dateRange/StatementsPage": StatementsDateRangeState;
+  "timeScale/SQLActivity": TimeScale;
+  "sortSetting/StatementsPage": SortSetting;
+  "sortSetting/TransactionsPage": SortSetting;
+  "sortSetting/SessionsPage": SortSetting;
+  "filters/StatementsPage": Filters;
+  "filters/TransactionsPage": Filters;
+  "search/StatementsPage": string;
+  "search/TransactionsPage": string;
 };
 
 type Payload = {
@@ -29,12 +38,14 @@ type Payload = {
   value: any;
 };
 
-const defaultDateRange: StatementsDateRangeState = {
-  start: moment
-    .utc()
-    .subtract(1, "hours")
-    .unix(),
-  end: moment.utc().unix() + 60, // Add 1 minute to account for potential lag.
+const defaultSortSetting: SortSetting = {
+  ascending: false,
+  columnTitle: "executionCount",
+};
+
+const defaultSessionsSortSetting: SortSetting = {
+  ascending: false,
+  columnTitle: "statementAge",
 };
 
 // TODO (koorosh): initial state should be restored from preserved keys in LocalStorage
@@ -46,9 +57,28 @@ const initialState: LocalStorageState = {
     JSON.parse(localStorage.getItem("showColumns/StatementsPage")) || null,
   "showColumns/TransactionPage":
     JSON.parse(localStorage.getItem("showColumns/TransactionPage")) || null,
-  "dateRange/StatementsPage":
-    JSON.parse(localStorage.getItem("dateRange/StatementsPage")) ||
-    defaultDateRange,
+  "timeScale/SQLActivity":
+    JSON.parse(localStorage.getItem("timeScale/SQLActivity")) ||
+    defaultTimeScaleSelected,
+  "sortSetting/StatementsPage":
+    JSON.parse(localStorage.getItem("sortSetting/StatementsPage")) ||
+    defaultSortSetting,
+  "sortSetting/TransactionsPage":
+    JSON.parse(localStorage.getItem("sortSetting/TransactionsPage")) ||
+    defaultSortSetting,
+  "sortSetting/SessionsPage":
+    JSON.parse(localStorage.getItem("sortSetting/SessionsPage")) ||
+    defaultSessionsSortSetting,
+  "filters/StatementsPage":
+    JSON.parse(localStorage.getItem("filters/StatementsPage")) ||
+    defaultFilters,
+  "filters/TransactionsPage":
+    JSON.parse(localStorage.getItem("filters/TransactionsPage")) ||
+    defaultFilters,
+  "search/StatementsPage":
+    JSON.parse(localStorage.getItem("search/StatementsPage")) || null,
+  "search/TransactionsPage":
+    JSON.parse(localStorage.getItem("search/TransactionsPage")) || null,
 };
 
 const localStorageSlice = createSlice({

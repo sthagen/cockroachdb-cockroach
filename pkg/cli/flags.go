@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
@@ -53,6 +54,7 @@ var serverSQLAdvertiseAddr, serverSQLAdvertisePort string
 var serverHTTPAddr, serverHTTPPort string
 var localityAdvertiseHosts localityList
 var startBackground bool
+var storeSpecs base.StoreSpecList
 
 // initPreFlagsDefaults initializes the values of the global variables
 // defined above.
@@ -73,6 +75,8 @@ func initPreFlagsDefaults() {
 	localityAdvertiseHosts = localityList{}
 
 	startBackground = false
+
+	storeSpecs = base.StoreSpecList{}
 }
 
 // AddPersistentPreRunE add 'fn' as a persistent pre-run function to 'cmd'.
@@ -294,7 +298,20 @@ func init() {
 			// Finalize the configuration of network settings.
 			return extraServerFlagInit(cmd)
 		})
+		AddPersistentPreRunE(cmd, func(cmd *cobra.Command, _ []string) error {
+			return extraStoreFlagInit(cmd)
+		})
 	}
+
+	// Add store flag handling for the pebble debug command as it needs store
+	// flags configured.
+	AddPersistentPreRunE(DebugPebbleCmd, func(cmd *cobra.Command, _ []string) error {
+		return extraStoreFlagInit(cmd)
+	})
+
+	AddPersistentPreRunE(mtStartSQLCmd, func(cmd *cobra.Command, _ []string) error {
+		return mtStartSQLFlagsInit(cmd)
+	})
 
 	// Map any flags registered in the standard "flag" package into the
 	// top-level cockroach command.
@@ -466,7 +483,7 @@ func init() {
 		stringFlag(f, &serverCfg.Attrs, cliflags.Attrs)
 		varFlag(f, &serverCfg.Locality, cliflags.Locality)
 
-		varFlag(f, &serverCfg.Stores, cliflags.Store)
+		varFlag(f, &storeSpecs, cliflags.Store)
 		varFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
 		varFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
 		stringFlag(f, &serverCfg.ClockDevicePath, cliflags.ClockDevice)
@@ -486,6 +503,7 @@ func init() {
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableHTTP, cliflags.ExternalIODisableHTTP)
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableOutbound, cliflags.ExternalIODisabled)
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableImplicitCredentials, cliflags.ExternalIODisableImplicitCredentials)
+		boolFlag(f, &serverCfg.ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound, cliflags.ExternalIOEnableNonAdminImplicitAndArbitraryOutbound)
 
 		// Certificate principal map.
 		stringSliceFlag(f, &startCtx.serverCertPrincipalMap, cliflags.CertPrincipalMap)
@@ -583,6 +601,7 @@ func init() {
 		debugTimeSeriesDumpCmd,
 		debugZipCmd,
 		debugListFilesCmd,
+		debugSendKVBatchCmd,
 		doctorExamineClusterCmd,
 		doctorExamineFallbackClusterCmd,
 		doctorRecreateClusterCmd,
@@ -685,6 +704,7 @@ func init() {
 	for _, cmd := range []*cobra.Command{quitCmd, drainNodeCmd} {
 		f := cmd.Flags()
 		durationFlag(f, &quitCtx.drainWait, cliflags.DrainWait)
+		boolFlag(f, &quitCtx.nodeDrainSelf, cliflags.NodeDrainSelf)
 	}
 
 	// SQL and demo commands.
@@ -824,6 +844,7 @@ func init() {
 				"For details, see: "+build.MakeIssueURL(53404))
 
 		boolFlag(f, &demoCtx.DisableLicenseAcquisition, cliflags.DemoNoLicense)
+		boolFlag(f, &demoCtx.Multitenant, cliflags.DemoMultitenant)
 		boolFlag(f, &demoCtx.SimulateLatency, cliflags.Global)
 		// The --empty flag is only valid for the top level demo command,
 		// so we use the regular flag set.
@@ -896,7 +917,7 @@ func init() {
 	}
 	{
 		f := debugCheckLogConfigCmd.Flags()
-		varFlag(f, &serverCfg.Stores, cliflags.Store)
+		varFlag(f, &storeSpecs, cliflags.Store)
 	}
 	{
 		f := debugRangeDataCmd.Flags()
@@ -915,7 +936,7 @@ func init() {
 	{
 		// TODO(ayang): clean up so dir isn't passed to both pebble and --store
 		f := DebugPebbleCmd.PersistentFlags()
-		varFlag(f, &serverCfg.Stores, cliflags.Store)
+		varFlag(f, &storeSpecs, cliflags.Store)
 	}
 	{
 		for _, c := range []*cobra.Command{
@@ -950,7 +971,10 @@ func init() {
 		varFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
 		varFlag(f, addrSetter{&serverAdvertiseAddr, &serverAdvertisePort}, cliflags.AdvertiseAddr)
 
-		varFlag(f, &serverCfg.Stores, cliflags.Store)
+		varFlag(f, &serverCfg.Locality, cliflags.Locality)
+		varFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
+		varFlag(f, &storeSpecs, cliflags.Store)
+		stringFlag(f, &startCtx.pidFile, cliflags.PIDFile)
 		stringFlag(f, &startCtx.geoLibsDir, cliflags.GeoLibsDir)
 
 		stringSliceFlag(f, &serverCfg.SQLConfig.TenantKVAddrs, cliflags.KVAddrs)
@@ -967,6 +991,10 @@ func init() {
 		// refers to becomes known.
 		varFlag(f, diskTempStorageSizeValue, cliflags.SQLTempStorage)
 		stringFlag(f, &startCtx.tempDir, cliflags.TempDir)
+
+		if backgroundFlagDefined {
+			boolFlag(f, &startBackground, cliflags.Background)
+		}
 	}
 
 	// Multi-tenancy proxy command flags.
@@ -984,13 +1012,15 @@ func init() {
 		durationFlag(f, &proxyContext.ValidateAccessInterval, cliflags.ValidateAccessInterval)
 		durationFlag(f, &proxyContext.PollConfigInterval, cliflags.PollConfigInterval)
 		durationFlag(f, &proxyContext.DrainTimeout, cliflags.DrainTimeout)
-		intFlag(f, &proxyContext.ThrottlePolicy.Capacity, cliflags.TokenBucketPeriod)
-		durationFlag(f, &proxyContext.ThrottlePolicy.FillPeriod, cliflags.TokenBucketSize)
+		durationFlag(f, &proxyContext.ThrottleBaseDelay, cliflags.ThrottleBaseDelay)
 	}
 	// Multi-tenancy test directory command flags.
 	{
 		f := mtTestDirectorySvr.Flags()
 		intFlag(f, &testDirectorySvrContext.port, cliflags.TestDirectoryListenPort)
+		stringFlag(f, &testDirectorySvrContext.certsDir, cliflags.TestDirectoryTenantCertsDir)
+		stringFlag(f, &testDirectorySvrContext.tenantBaseDir, cliflags.TestDirectoryTenantBaseDir)
+		stringFlag(f, &testDirectorySvrContext.kvAddrs, cliflags.KVAddrs)
 	}
 
 	// userfile upload command.
@@ -1193,6 +1223,20 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 	return nil
 }
 
+// Fill the store paths.
+// We have different defaults for server and tenant pod, and we don't want incorrect
+// default to show up in flag help. To achieve that we create empty spec in private
+// flag copy of spec and then copy this value if it was populated.
+// If it isn't populated, default from server config is used for server commands or
+// alternative default is generated by PreRun multi-tenant hook.
+func extraStoreFlagInit(cmd *cobra.Command) error {
+	fs := flagSetForCmd(cmd)
+	if fs.Changed(cliflags.Store.Name) {
+		serverCfg.Stores = storeSpecs
+	}
+	return nil
+}
+
 func extraClientFlagInit() error {
 	// A command can be either a 'cert' command or an actual client command.
 	// TODO(knz): Clean this up to not use a global variable for the
@@ -1218,6 +1262,18 @@ func extraClientFlagInit() error {
 	// sent.
 	if sqlConnCtx.DebugMode {
 		sqlConnCtx.Echo = true
+	}
+	return nil
+}
+
+func mtStartSQLFlagsInit(cmd *cobra.Command) error {
+	// Override default store for mt to use a per tenant store directory.
+	fs := flagSetForCmd(cmd)
+	if !fs.Changed(cliflags.Store.Name) {
+		// We assume that we only need to change top level store as temp dir configs are
+		// initialized when start is executed and temp dirs inherit path from first store.
+		tenantID := fs.Lookup(cliflags.TenantID.Name).Value.String()
+		serverCfg.Stores.Specs[0].Path = server.DefaultSQLNodeStorePathPrefix + tenantID
 	}
 	return nil
 }

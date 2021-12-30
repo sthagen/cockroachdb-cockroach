@@ -13,7 +13,6 @@ package batcheval
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,7 +24,7 @@ func init() {
 }
 
 func declareKeysResolveIntentRange(
-	rs ImmutableRangeState, _ roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
+	rs ImmutableRangeState, _ *roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
 ) {
 	declareKeysResolveIntentCombined(rs, req, latchSpans)
 }
@@ -44,12 +43,8 @@ func ResolveIntentRange(
 	}
 
 	update := args.AsLockUpdate()
-
-	onlySeparatedIntents :=
-		cArgs.EvalCtx.ClusterSettings().Version.ActiveVersionOrEmpty(ctx).IsActive(
-			clusterversion.PostSeparatedIntentsMigration)
 	numKeys, resumeSpan, err := storage.MVCCResolveWriteIntentRange(
-		ctx, readWriter, ms, update, h.MaxSpanRequestKeys, onlySeparatedIntents)
+		ctx, readWriter, ms, update, h.MaxSpanRequestKeys)
 	if err != nil {
 		return result.Result{}, err
 	}

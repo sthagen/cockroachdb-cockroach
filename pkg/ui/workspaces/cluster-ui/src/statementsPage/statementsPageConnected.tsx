@@ -11,14 +11,12 @@
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import { Dispatch } from "redux";
-import { Moment } from "moment";
 
 import { AppState } from "src/store";
-import { actions as statementsActions } from "src/store/statements";
 import { actions as statementDiagnosticsActions } from "src/store/statementDiagnostics";
 import { actions as analyticsActions } from "src/store/analytics";
 import { actions as localStorageActions } from "src/store/localStorage";
-import { actions as resetSQLStatsActions } from "src/store/sqlStats";
+import { actions as sqlStatsActions } from "src/store/sqlStats";
 import {
   StatementsPage,
   StatementsPageDispatchProps,
@@ -33,12 +31,21 @@ import {
   selectStatementsLastError,
   selectTotalFingerprints,
   selectColumns,
-  selectDateRange,
+  selectTimeScale,
+  selectSortSetting,
+  selectFilters,
+  selectSearch,
 } from "./statementsPage.selectors";
 import { selectIsTenant } from "../store/uiConfig";
-import { AggregateStatistics } from "../statementsTable";
 import { nodeRegionsByIDSelector } from "../store/nodes";
 import { StatementsRequest } from "src/api/statementsApi";
+import { TimeScale } from "../timeScaleDropdown";
+import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
+
+type IDuration = google.protobuf.IDuration;
+
+const CreateStatementDiagnosticsReportRequest =
+  cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
 
 export const ConnectedStatementsPage = withRouter(
   connect<
@@ -47,31 +54,33 @@ export const ConnectedStatementsPage = withRouter(
     RouteComponentProps
   >(
     (state: AppState, props: StatementsPageProps) => ({
+      apps: selectApps(state),
+      columns: selectColumns(state),
+      databases: selectDatabases(state),
+      timeScale: selectTimeScale(state),
+      filters: selectFilters(state),
+      isTenant: selectIsTenant(state),
+      lastReset: selectLastReset(state),
+      nodeRegions: selectIsTenant(state) ? {} : nodeRegionsByIDSelector(state),
+      search: selectSearch(state),
+      sortSetting: selectSortSetting(state),
       statements: selectStatements(state, props),
       statementsError: selectStatementsLastError(state),
-      apps: selectApps(state),
-      databases: selectDatabases(state),
       totalFingerprints: selectTotalFingerprints(state),
-      lastReset: selectLastReset(state),
-      columns: selectColumns(state),
-      nodeRegions: selectIsTenant(state) ? {} : nodeRegionsByIDSelector(state),
-      isTenant: selectIsTenant(state),
-      dateRange: selectDateRange(state),
     }),
     (dispatch: Dispatch) => ({
       refreshStatements: (req?: StatementsRequest) =>
-        dispatch(statementsActions.refresh(req)),
-      onDateRangeChange: (start: Moment, end: Moment) => {
+        dispatch(sqlStatsActions.refresh(req)),
+      onTimeScaleChange: (ts: TimeScale) => {
         dispatch(
-          statementsActions.updateDateRange({
-            start: start.unix(),
-            end: end.unix(),
+          sqlStatsActions.updateTimeScale({
+            ts: ts,
           }),
         );
       },
       refreshStatementDiagnosticsRequests: () =>
         dispatch(statementDiagnosticsActions.refresh()),
-      resetSQLStats: () => dispatch(resetSQLStatsActions.request()),
+      resetSQLStats: () => dispatch(sqlStatsActions.reset()),
       dismissAlertMessage: () =>
         dispatch(
           localStorageActions.update({
@@ -79,9 +88,19 @@ export const ConnectedStatementsPage = withRouter(
             value: false,
           }),
         ),
-      onActivateStatementDiagnostics: (statementFingerprint: string) => {
+      onActivateStatementDiagnostics: (
+        statementFingerprint: string,
+        minExecLatency: IDuration,
+        expiresAfter: IDuration,
+      ) => {
         dispatch(
-          statementDiagnosticsActions.createReport(statementFingerprint),
+          statementDiagnosticsActions.createReport(
+            new CreateStatementDiagnosticsReportRequest({
+              statement_fingerprint: statementFingerprint,
+              min_execution_latency: minExecLatency,
+              expires_after: expiresAfter,
+            }),
+          ),
         );
         dispatch(
           analyticsActions.track({
@@ -99,23 +118,41 @@ export const ConnectedStatementsPage = withRouter(
             action: "Downloaded",
           }),
         ),
-      onSearchComplete: (_results: AggregateStatistics[]) =>
+      onSearchComplete: (query: string) => {
         dispatch(
           analyticsActions.track({
             name: "Keyword Searched",
             page: "Statements",
           }),
-        ),
-      onFilterChange: value =>
+        );
+        dispatch(
+          localStorageActions.update({
+            key: "search/StatementsPage",
+            value: query,
+          }),
+        );
+      },
+      onFilterChange: value => {
         dispatch(
           analyticsActions.track({
             name: "Filter Clicked",
             page: "Statements",
             filterName: "app",
-            value,
+            value: value.toString(),
           }),
-        ),
-      onSortingChange: (tableName: string, columnName: string) =>
+        );
+        dispatch(
+          localStorageActions.update({
+            key: "filters/StatementsPage",
+            value: value,
+          }),
+        );
+      },
+      onSortingChange: (
+        tableName: string,
+        columnName: string,
+        ascending: boolean,
+      ) => {
         dispatch(
           analyticsActions.track({
             name: "Column Sorted",
@@ -123,7 +160,14 @@ export const ConnectedStatementsPage = withRouter(
             tableName,
             columnName,
           }),
-        ),
+        );
+        dispatch(
+          localStorageActions.update({
+            key: "sortSetting/StatementsPage",
+            value: { columnTitle: columnName, ascending: ascending },
+          }),
+        );
+      },
       onStatementClick: () =>
         dispatch(
           analyticsActions.track({

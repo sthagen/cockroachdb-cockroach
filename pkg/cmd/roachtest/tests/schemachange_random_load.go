@@ -18,9 +18,11 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 type randomLoadBenchSpec struct {
@@ -135,13 +137,14 @@ func runSchemaChangeRandomLoad(
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", loadNode)
 
 	t.Status("starting cockroach nodes")
-	c.Start(ctx, roachNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), roachNodes)
 	c.Run(ctx, loadNode, "./workload init schemachange")
 
-	storeDirectory, err := c.RunWithBuffer(ctx, t.L(), c.Node(1), "echo", "-n", "{store-dir}")
+	result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(1), "echo", "-n", "{store-dir}")
 	if err != nil {
 		t.L().Printf("Failed to retrieve store directory from node 1: %v\n", err.Error())
 	}
+	storeDirectory := result.Stdout
 
 	runCmd := []string{
 		"./workload run schemachange --verbose=1",
@@ -150,12 +153,12 @@ func runSchemaChangeRandomLoad(
 		" --histograms=" + t.PerfArtifactsDir() + "/stats.json",
 		fmt.Sprintf("--max-ops %d", maxOps),
 		fmt.Sprintf("--concurrency %d", concurrency),
-		fmt.Sprintf("--txn-log %s", filepath.Join(string(storeDirectory), "transactions.json")),
+		fmt.Sprintf("--txn-log %s", filepath.Join(storeDirectory, "transactions.json")),
 	}
 	t.Status("running schemachange workload")
 	err = c.RunE(ctx, loadNode, runCmd...)
 	if err != nil {
-		saveArtifacts(ctx, t, c, string(storeDirectory))
+		saveArtifacts(ctx, t, c, storeDirectory)
 		t.Fatal(err)
 	}
 
@@ -167,7 +170,7 @@ func runSchemaChangeRandomLoad(
 	// the workload itself (if we even still want it, considering that the
 	// workload itself would be running DROP DATABASE CASCADE).
 
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 
 	t.Status("performing validation after workload")
@@ -183,7 +186,7 @@ func runSchemaChangeRandomLoad(
 
 // saveArtifacts saves important test artifacts in the artifacts directory.
 func saveArtifacts(ctx context.Context, t test.Test, c cluster.Cluster, storeDirectory string) {
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 
 	// Save a backup file called schemachange to the store directory.

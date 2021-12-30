@@ -42,29 +42,32 @@ func (desc *wrapper) ValidateTxnCommit(
 		vea.Report(unimplemented.NewWithIssue(48026,
 			"primary key dropped without subsequent addition of new primary key in same transaction"))
 	}
+	// Check that the mutation ID values are appropriately set when a declarative
+	// schema change is underway.
+	if n := len(desc.Mutations); n > 0 && desc.NewSchemaChangeJobID != 0 {
+		lastMutationID := desc.Mutations[n-1].MutationID
+		if lastMutationID != desc.NextMutationID {
+			vea.Report(errors.AssertionFailedf(
+				"expected next mutation ID to be %d in table undergoing declarative schema change, found %d instead",
+				lastMutationID, desc.NextMutationID))
+		}
+	}
 }
 
 // GetReferencedDescIDs returns the IDs of all descriptors referenced by
 // this descriptor, including itself.
 func (desc *wrapper) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 	ids := catalog.MakeDescriptorIDSet(desc.GetID(), desc.GetParentID())
+	// TODO(richardjcai): Remove logic for keys.PublicSchemaID in 22.2.
 	if desc.GetParentSchemaID() != keys.PublicSchemaID {
 		ids.Add(desc.GetParentSchemaID())
 	}
-	// Collect referenced table IDs in foreign keys and interleaves.
+	// Collect referenced table IDs in foreign keys.
 	for _, fk := range desc.OutboundFKs {
 		ids.Add(fk.ReferencedTableID)
 	}
 	for _, fk := range desc.InboundFKs {
 		ids.Add(fk.OriginTableID)
-	}
-	for _, idx := range desc.NonDropIndexes() {
-		for i := 0; i < idx.NumInterleaveAncestors(); i++ {
-			ids.Add(idx.GetInterleaveAncestor(i).TableID)
-		}
-		for i := 0; i < idx.NumInterleavedBy(); i++ {
-			ids.Add(idx.GetInterleavedBy(i).Table)
-		}
 	}
 	// Collect user defined type Oids and sequence references in columns.
 	for _, col := range desc.DeletableColumns() {
@@ -124,6 +127,7 @@ func (desc *wrapper) ValidateCrossReferences(
 	}
 
 	// Check that parent schema exists.
+	// TODO(richardjcai): Remove logic for keys.PublicSchemaID in 22.2.
 	if desc.GetParentSchemaID() != keys.PublicSchemaID && !desc.IsTemporary() {
 		schemaDesc, err := vdg.GetSchemaDescriptor(desc.GetParentSchemaID())
 		if err != nil {
@@ -177,82 +181,6 @@ func (desc *wrapper) ValidateCrossReferences(
 			}
 		}
 	}
-
-	// Check interleaves.
-	for _, indexI := range desc.NonDropIndexes() {
-		vea.Report(desc.validateIndexInterleave(indexI, vdg))
-	}
-	// TODO(dan): Also validate SharedPrefixLen in the interleaves.
-}
-
-func (desc *wrapper) validateIndexInterleave(
-	indexI catalog.Index, vdg catalog.ValidationDescGetter,
-) error {
-	// Check interleaves.
-	if indexI.NumInterleaveAncestors() > 0 {
-		// Only check the most recent ancestor, the rest of them don't point
-		// back.
-		ancestor := indexI.GetInterleaveAncestor(indexI.NumInterleaveAncestors() - 1)
-		targetTable, err := vdg.GetTableDescriptor(ancestor.TableID)
-		if err != nil {
-			return errors.Wrapf(err,
-				"invalid interleave: missing table=%d index=%d", ancestor.TableID, errors.Safe(ancestor.IndexID))
-		}
-		targetIndex, err := targetTable.FindIndexWithID(ancestor.IndexID)
-		if err != nil {
-			return errors.Wrapf(err,
-				"invalid interleave: missing table=%s index=%d", targetTable.GetName(), errors.Safe(ancestor.IndexID))
-		}
-
-		found := false
-		for j := 0; j < targetIndex.NumInterleavedBy(); j++ {
-			backref := targetIndex.GetInterleavedBy(j)
-			if backref.Table == desc.ID && backref.Index == indexI.GetID() {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return errors.AssertionFailedf(
-				"missing interleave back reference to %q@%q from %q@%q",
-				desc.Name, indexI.GetName(), targetTable.GetName(), targetIndex.GetName())
-		}
-	}
-
-	interleaveBackrefs := make(map[descpb.ForeignKeyReference]struct{})
-	for j := 0; j < indexI.NumInterleavedBy(); j++ {
-		backref := indexI.GetInterleavedBy(j)
-		if _, ok := interleaveBackrefs[backref]; ok {
-			return errors.AssertionFailedf("duplicated interleave backreference %+v", backref)
-		}
-		interleaveBackrefs[backref] = struct{}{}
-		targetTable, err := vdg.GetTableDescriptor(backref.Table)
-		if err != nil {
-			return errors.Wrapf(err,
-				"invalid interleave backreference table=%d index=%d",
-				backref.Table, backref.Index)
-		}
-		targetIndex, err := targetTable.FindIndexWithID(backref.Index)
-		if err != nil {
-			return errors.Wrapf(err,
-				"invalid interleave backreference table=%s index=%d",
-				targetTable.GetName(), backref.Index)
-		}
-		if targetIndex.NumInterleaveAncestors() == 0 {
-			return errors.AssertionFailedf(
-				"broken interleave backward reference from %q@%q to %q@%q",
-				desc.Name, indexI.GetName(), targetTable.GetName(), targetIndex.GetName())
-		}
-		// The last ancestor is required to be a backreference.
-		ancestor := targetIndex.GetInterleaveAncestor(targetIndex.NumInterleaveAncestors() - 1)
-		if ancestor.TableID != desc.ID || ancestor.IndexID != indexI.GetID() {
-			return errors.AssertionFailedf(
-				"broken interleave backward reference from %q@%q to %q@%q",
-				desc.Name, indexI.GetName(), targetTable.GetName(), targetIndex.GetName())
-		}
-	}
-
-	return nil
 }
 
 func (desc *wrapper) validateOutboundFK(
@@ -517,7 +445,7 @@ func (desc *wrapper) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	// of the descriptor, in both the new and old schema change jobs.)
 	if len(desc.MutationJobs) > 0 && desc.NewSchemaChangeJobID != 0 {
 		vea.Report(errors.AssertionFailedf(
-			"invalid concurrent new-style schema change job %d and old-style schema change jobs %v",
+			"invalid concurrent declarative schema change job %d and legacy schema change jobs %v",
 			desc.NewSchemaChangeJobID, desc.MutationJobs))
 	}
 
@@ -623,11 +551,19 @@ func (desc *wrapper) validateColumns(
 			return errors.Newf("virtual column %q is not computed", column.GetName())
 		}
 
-		if column.HasOnUpdate() && column.IsComputed() {
-			return errors.Newf(
-				"computed column %q cannot also have an ON UPDATE expression",
-				column.GetName(),
-			)
+		if column.IsComputed() {
+			if column.HasDefault() {
+				return pgerror.Newf(pgcode.InvalidTableDefinition,
+					"computed column %q cannot also have a DEFAULT expression",
+					column.GetName(),
+				)
+			}
+			if column.HasOnUpdate() {
+				return pgerror.Newf(pgcode.InvalidTableDefinition,
+					"computed column %q cannot also have an ON UPDATE expression",
+					column.GetName(),
+				)
+			}
 		}
 
 		if column.IsHidden() && column.IsInaccessible() {
@@ -834,13 +770,6 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 		columnsByID[col.GetID()] = col
 	}
 
-	// Verify that the primary index columns are not virtual.
-	for _, pkID := range desc.PrimaryIndex.KeyColumnIDs {
-		if col := columnsByID[pkID]; col != nil && col.IsVirtual() {
-			return errors.Newf("primary index column %q cannot be virtual", col.GetName())
-		}
-	}
-
 	indexNames := map[string]struct{}{}
 	indexIDs := map[descpb.IndexID]string{}
 	for _, idx := range desc.NonDropIndexes() {
@@ -853,6 +782,10 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 
 		if idx.IndexDesc().ForeignKey.IsSet() || len(idx.IndexDesc().ReferencedBy) > 0 {
 			return errors.AssertionFailedf("index %q contains deprecated foreign key representation", idx.GetName())
+		}
+
+		if len(idx.IndexDesc().Interleave.Ancestors) > 0 || len(idx.IndexDesc().InterleavedBy) > 0 {
+			return errors.Newf("index is interleaved")
 		}
 
 		if _, indexNameExists := indexNames[idx.GetName()]; indexNameExists {
@@ -936,12 +869,53 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 					idx.GetName(), idx.GetPredicate())
 			}
 		}
-		// Ensure that indexes do not STORE virtual columns.
-		for _, colID := range idx.IndexDesc().KeySuffixColumnIDs {
-			if col := columnsByID[colID]; col != nil && col.IsVirtual() {
-				return errors.Newf("index %q cannot store virtual column %d", idx.GetName(), col)
+
+		// Ensure that indexes do not STORE virtual columns as suffix columns unless
+		// they are primary key columns or future primary key columns (when `ALTER
+		// PRIMARY KEY` is executed and a primary key mutation exists).
+		curPKColIDs := catalog.MakeTableColSet(desc.PrimaryIndex.KeyColumnIDs...)
+		newPKColIDs := catalog.MakeTableColSet()
+		for _, mut := range desc.Mutations {
+			if mut.GetPrimaryKeySwap() != nil {
+				newPKIdxID := mut.GetPrimaryKeySwap().NewPrimaryIndexId
+				newPK, err := desc.FindIndexWithID(newPKIdxID)
+				if err != nil {
+					return err
+				}
+				newPKColIDs.UnionWith(newPK.CollectKeyColumnIDs())
 			}
 		}
+		for _, colID := range idx.IndexDesc().KeySuffixColumnIDs {
+			if _, ok := columnsByID[colID]; !ok {
+				return errors.Newf("column %d does not exist in table %s", colID, desc.Name)
+			}
+			col := columnsByID[colID]
+			if !col.IsVirtual() {
+				continue
+			}
+
+			// When newPKColIDs is empty, it means there's no `ALTER PRIMARY KEY` in
+			// progress.
+			if newPKColIDs.Len() == 0 && curPKColIDs.Contains(colID) {
+				continue
+			}
+
+			// When newPKColIDs is not empty, it means there is an in-progress `ALTER
+			// PRIMARY KEY`. We don't allow queueing schema changes when there's a
+			// primary key mutation, so it's safe to make the assumption that `Adding`
+			// indexes are associated with the new primary key because they are
+			// rewritten and `Non-adding` indexes should only contain virtual column
+			// from old primary key.
+			isOldPKCol := !idx.Adding() && curPKColIDs.Contains(colID)
+			isNewPKCol := idx.Adding() && newPKColIDs.Contains(colID)
+			if newPKColIDs.Len() > 0 && (isOldPKCol || isNewPKCol) {
+				continue
+			}
+
+			return errors.Newf("index %q cannot store virtual column %q", idx.GetName(), col.GetName())
+		}
+
+		// Ensure that indexes do not STORE virtual columns.
 		for i, colID := range idx.IndexDesc().StoreColumnIDs {
 			if col := columnsByID[colID]; col != nil && col.IsVirtual() {
 				return errors.Newf("index %q cannot store virtual column %q",
@@ -949,9 +923,9 @@ func (desc *wrapper) validateTableIndexes(columnNames map[string]descpb.ColumnID
 			}
 		}
 		if idx.Primary() {
-			if idx.GetVersion() != descpb.PrimaryIndexWithStoredColumnsVersion {
+			if idx.GetVersion() != descpb.LatestPrimaryIndexDescriptorVersion {
 				return errors.AssertionFailedf("primary index %q has invalid version %d, expected %d",
-					idx.GetName(), idx.GetVersion(), descpb.PrimaryIndexWithStoredColumnsVersion)
+					idx.GetName(), idx.GetVersion(), descpb.LatestPrimaryIndexDescriptorVersion)
 			}
 			if idx.IndexDesc().EncodingType != descpb.PrimaryIndexEncoding {
 				return errors.AssertionFailedf("primary index %q has invalid encoding type %d in proto, expected %d",
@@ -1052,16 +1026,6 @@ func (desc *wrapper) validatePartitioningDescriptor(
 	}
 	if part.NumColumns() == 0 {
 		return nil
-	}
-
-	// TODO(dan): The sqlccl.GenerateSubzoneSpans logic is easier if we disallow
-	// setting zone configs on indexes that are interleaved into another index.
-	// InterleavedBy is fine, so using the root of the interleave hierarchy will
-	// work. It is expected that this is sufficient for real-world use cases.
-	// Revisit this restriction if that expectation is wrong.
-	if idx.NumInterleaveAncestors() > 0 {
-		return errors.Errorf("cannot set a zone config for interleaved index %s; "+
-			"set it on the root of the interleaved hierarchy instead", idx.GetName())
 	}
 
 	// We don't need real prefixes in the DecodePartitionTuple calls because we're

@@ -17,8 +17,10 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -26,20 +28,35 @@ import (
 	"github.com/gogo/protobuf/proto"
 )
 
+// NamedZone is a custom type for names used to reference ranges outside the
+// SQL keyspace by zone configurations.
+type NamedZone string
+
 // Several ranges outside of the SQL keyspace are given special names so they
 // can be targeted by zone configs.
 const (
-	DefaultZoneName    = "default"
-	LivenessZoneName   = "liveness"
-	MetaZoneName       = "meta"
-	SystemZoneName     = "system"
-	TimeseriesZoneName = "timeseries"
-	TenantsZoneName    = "tenants"
+	DefaultZoneName    NamedZone = "default"
+	LivenessZoneName   NamedZone = "liveness"
+	MetaZoneName       NamedZone = "meta"
+	SystemZoneName     NamedZone = "system"
+	TimeseriesZoneName NamedZone = "timeseries"
+	TenantsZoneName    NamedZone = "tenants"
 )
+
+// NamedZonesList is a list of all named zones that reference ranges
+// outside the SQL keyspace which can be referenced by zone configurations.
+var NamedZonesList = [...]NamedZone{
+	DefaultZoneName,
+	LivenessZoneName,
+	MetaZoneName,
+	SystemZoneName,
+	TimeseriesZoneName,
+	TenantsZoneName,
+}
 
 // NamedZones maps named zones to their pseudo-table ID that can be used to
 // install an entry into the system.zones table.
-var NamedZones = map[string]uint32{
+var NamedZones = map[NamedZone]uint32{
 	DefaultZoneName:    keys.RootNamespaceID,
 	LivenessZoneName:   keys.LivenessRangesID,
 	MetaZoneName:       keys.MetaRangesID,
@@ -50,13 +67,20 @@ var NamedZones = map[string]uint32{
 
 // NamedZonesByID is the inverse of NamedZones: it maps pseudo-table IDs to
 // their zone names.
-var NamedZonesByID = func() map[uint32]string {
-	out := map[uint32]string{}
+var NamedZonesByID = func() map[uint32]NamedZone {
+	out := map[uint32]NamedZone{}
 	for name, id := range NamedZones {
 		out[id] = name
 	}
 	return out
 }()
+
+// IsNamedZoneID returns true if the given ID is one of the pseudo-table IDs
+// that maps to named zones.
+func IsNamedZoneID(id descpb.ID) bool {
+	_, ok := NamedZonesByID[(uint32(id))]
+	return ok
+}
 
 // MultiRegionZoneConfigFields are the fields on a zone configuration which
 // may be set by the system for multi-region objects".
@@ -112,18 +136,20 @@ func ZoneSpecifierFromID(
 // ResolveZoneSpecifier converts a zone specifier to the ID of most specific
 // zone whose config applies.
 func ResolveZoneSpecifier(
+	ctx context.Context,
 	zs *tree.ZoneSpecifier,
 	resolveName func(parentID uint32, schemaID uint32, name string) (id uint32, err error),
+	version clusterversion.Handle,
 ) (uint32, error) {
 	// A zone specifier has one of 3 possible structures:
 	// - a predefined named zone;
 	// - a database name;
 	// - a table or index name.
 	if zs.NamedZone != "" {
-		if zs.NamedZone == DefaultZoneName {
+		if NamedZone(zs.NamedZone) == DefaultZoneName {
 			return keys.RootNamespaceID, nil
 		}
-		if id, ok := NamedZones[string(zs.NamedZone)]; ok {
+		if id, ok := NamedZones[NamedZone(zs.NamedZone)]; ok {
 			return id, nil
 		}
 		return 0, fmt.Errorf("%q is not a built-in zone", string(zs.NamedZone))
@@ -140,8 +166,13 @@ func ResolveZoneSpecifier(
 	if err != nil {
 		return 0, err
 	}
-	schemaID := uint32(keys.PublicSchemaID)
-	if tn.SchemaName != tree.PublicSchemaName {
+	// TODO(richardjcai): Remove version gating logic in 22.2.
+	var schemaID uint32
+	if !version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) && tn.SchemaName == tree.PublicSchemaName {
+		// If we're not on version PublicSchemasWithDescriptors, we're guaranteed
+		// databases are not backed by descriptors, thus we use keys.PublicSchemaID.
+		schemaID = keys.PublicSchemaID
+	} else {
 		schemaID, err = resolveName(databaseID, keys.RootNamespaceID, tn.Schema())
 		if err != nil {
 			return 0, err
@@ -1136,7 +1167,7 @@ func (z *ZoneConfig) EnsureFullyHydrated() error {
 // AsSpanConfig converts a fully hydrated zone configuration to an equivalent
 // SpanConfig. It fatals if the zone config hasn't been fully hydrated (fields
 // are expected to have been cascaded through parent zone configs).
-func (z *ZoneConfig) AsSpanConfig() roachpb.SpanConfig {
+func (z ZoneConfig) AsSpanConfig() roachpb.SpanConfig {
 	spanConfig, err := z.toSpanConfig()
 	if err != nil {
 		log.Fatalf(context.Background(), "%v", err)
@@ -1195,22 +1226,38 @@ func (z *ZoneConfig) toSpanConfig() (roachpb.SpanConfig, error) {
 		return constraintsConjunction, nil
 	}
 
-	sc.Constraints = make([]roachpb.ConstraintsConjunction, len(z.Constraints))
-	sc.Constraints, err = toSpanConfigConstraintsConjunction(z.Constraints)
-	if err != nil {
-		return roachpb.SpanConfig{}, err
-	}
-	sc.VoterConstraints, err = toSpanConfigConstraintsConjunction(z.VoterConstraints)
-	if err != nil {
-		return roachpb.SpanConfig{}, err
-	}
-
-	sc.LeasePreferences = make([]roachpb.LeasePreference, len(z.LeasePreferences))
-	for i, leasePreference := range z.LeasePreferences {
-		sc.LeasePreferences[i].Constraints, err = toSpanConfigConstraints(leasePreference.Constraints)
+	if len(z.Constraints) != 0 {
+		sc.Constraints = make([]roachpb.ConstraintsConjunction, len(z.Constraints))
+		sc.Constraints, err = toSpanConfigConstraintsConjunction(z.Constraints)
 		if err != nil {
 			return roachpb.SpanConfig{}, err
 		}
 	}
+	if len(z.VoterConstraints) != 0 {
+		sc.VoterConstraints, err = toSpanConfigConstraintsConjunction(z.VoterConstraints)
+		if err != nil {
+			return roachpb.SpanConfig{}, err
+		}
+	}
+
+	if len(z.LeasePreferences) != 0 {
+		sc.LeasePreferences = make([]roachpb.LeasePreference, len(z.LeasePreferences))
+		for i, leasePreference := range z.LeasePreferences {
+			sc.LeasePreferences[i].Constraints, err = toSpanConfigConstraints(leasePreference.Constraints)
+			if err != nil {
+				return roachpb.SpanConfig{}, err
+			}
+		}
+	}
 	return sc, nil
+}
+
+func init() {
+	if len(NamedZonesList) != len(NamedZones) {
+		panic(fmt.Errorf(
+			"NamedZonesList (%d) and NamedZones (%d) should have the same number of entries",
+			len(NamedZones),
+			len(NamedZonesList),
+		))
+	}
 }

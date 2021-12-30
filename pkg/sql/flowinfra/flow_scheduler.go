@@ -13,13 +13,16 @@ package flowinfra
 import (
 	"container/list"
 	"context"
+	"runtime"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -29,11 +32,35 @@ import (
 
 const flowDoneChanSize = 8
 
+// We think that it makes sense to scale the default value for
+// max_running_flows based on how beefy the machines are, so we make it a
+// multiple of the number of available CPU cores.
+//
+// The choice of 128 as the default multiple is driven by the old default value
+// of 500 and is such that if we have 4 CPUs, then we'll get the value of 512,
+// pretty close to the old default.
+// TODO(yuzefovich): we probably want to remove / disable this limit completely
+// when we enable the admission control.
 var settingMaxRunningFlows = settings.RegisterIntSetting(
+	settings.TenantWritable,
 	"sql.distsql.max_running_flows",
-	"maximum number of concurrent flows that can be run on a node",
-	500,
+	"the value - when positive - used as is, or the value - when negative - "+
+		"multiplied by the number of CPUs on a node, to determine the "+
+		"maximum number of concurrent remote flows that can be run on the node",
+	-128,
 ).WithPublic()
+
+// getMaxRunningFlows returns an absolute value that determines the maximum
+// number of concurrent remote flows on this node.
+func getMaxRunningFlows(settings *cluster.Settings) int64 {
+	maxRunningFlows := settingMaxRunningFlows.Get(&settings.SV)
+	if maxRunningFlows < 0 {
+		// We use GOMAXPROCS instead of NumCPU because the former could be
+		// adjusted based on cgroup limits (see cgroups.AdjustMaxProcs).
+		return -maxRunningFlows * int64(runtime.GOMAXPROCS(0))
+	}
+	return maxRunningFlows
+}
 
 // FlowScheduler manages running flows and decides when to queue and when to
 // start flows. The main interface it presents is ScheduleFlows, which passes a
@@ -55,7 +82,7 @@ type FlowScheduler struct {
 		//
 		// The memory usage of this map is not accounted for because it is
 		// limited by maxRunningFlows in size.
-		runningFlows map[execinfrapb.FlowID]time.Time
+		runningFlows map[execinfrapb.FlowID]execinfrapb.DistSQLRemoteFlowInfo
 	}
 
 	atomics struct {
@@ -100,11 +127,11 @@ func NewFlowScheduler(
 		flowDoneCh:     make(chan Flow, flowDoneChanSize),
 	}
 	fs.mu.queue = list.New()
-	maxRunningFlows := settingMaxRunningFlows.Get(&settings.SV)
-	fs.mu.runningFlows = make(map[execinfrapb.FlowID]time.Time, maxRunningFlows)
+	maxRunningFlows := getMaxRunningFlows(settings)
+	fs.mu.runningFlows = make(map[execinfrapb.FlowID]execinfrapb.DistSQLRemoteFlowInfo, maxRunningFlows)
 	fs.atomics.maxRunningFlows = int32(maxRunningFlows)
 	settingMaxRunningFlows.SetOnChange(&settings.SV, func(ctx context.Context) {
-		atomic.StoreInt32(&fs.atomics.maxRunningFlows, int32(settingMaxRunningFlows.Get(&settings.SV)))
+		atomic.StoreInt32(&fs.atomics.maxRunningFlows, int32(getMaxRunningFlows(settings)))
 	})
 	return fs
 }
@@ -141,7 +168,11 @@ func (fs *FlowScheduler) runFlowNow(ctx context.Context, f Flow, locked bool) er
 	if !locked {
 		fs.mu.Lock()
 	}
-	fs.mu.runningFlows[f.GetID()] = timeutil.Now()
+	fs.mu.runningFlows[f.GetID()] = execinfrapb.DistSQLRemoteFlowInfo{
+		FlowID:       f.GetID(),
+		Timestamp:    timeutil.Now(),
+		StatementSQL: f.StatementSQL(),
+	}
 	if !locked {
 		fs.mu.Unlock()
 	}
@@ -168,6 +199,8 @@ func (fs *FlowScheduler) runFlowNow(ctx context.Context, f Flow, locked bool) er
 func (fs *FlowScheduler) ScheduleFlow(ctx context.Context, f Flow) error {
 	return fs.stopper.RunTaskWithErr(
 		ctx, "flowinfra.FlowScheduler: scheduling flow", func(ctx context.Context) error {
+			fs.metrics.FlowsScheduled.Inc(1)
+			telemetry.Inc(sqltelemetry.DistSQLFlowsScheduled)
 			if fs.canRunFlow(f) {
 				return fs.runFlowNow(ctx, f, false /* locked */)
 			}
@@ -175,6 +208,7 @@ func (fs *FlowScheduler) ScheduleFlow(ctx context.Context, f Flow) error {
 			defer fs.mu.Unlock()
 			log.VEventf(ctx, 1, "flow scheduler enqueuing flow %s to be run later", f.GetID())
 			fs.metrics.FlowsQueued.Inc(1)
+			telemetry.Inc(sqltelemetry.DistSQLFlowsQueued)
 			fs.mu.queue.PushBack(&flowWithCtx{
 				ctx:         ctx,
 				flow:        f,
@@ -335,27 +369,25 @@ func (fs *FlowScheduler) Start() {
 // "local" flows from the perspective of the gateway node of the query because
 // such flows don't go through the flow scheduler.
 func (fs *FlowScheduler) Serialize() (
-	running []execinfrapb.FlowID,
-	runningSince []time.Time,
-	queued []execinfrapb.FlowID,
-	queuedSince []time.Time,
+	running []execinfrapb.DistSQLRemoteFlowInfo,
+	queued []execinfrapb.DistSQLRemoteFlowInfo,
 ) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	running = make([]execinfrapb.FlowID, 0, len(fs.mu.runningFlows))
-	runningSince = make([]time.Time, 0, len(fs.mu.runningFlows))
-	for f, ts := range fs.mu.runningFlows {
-		running = append(running, f)
-		runningSince = append(runningSince, ts)
+	running = make([]execinfrapb.DistSQLRemoteFlowInfo, 0, len(fs.mu.runningFlows))
+	for _, info := range fs.mu.runningFlows {
+		running = append(running, info)
 	}
 	if fs.mu.queue.Len() > 0 {
-		queued = make([]execinfrapb.FlowID, 0, fs.mu.queue.Len())
-		queuedSince = make([]time.Time, 0, fs.mu.queue.Len())
+		queued = make([]execinfrapb.DistSQLRemoteFlowInfo, 0, fs.mu.queue.Len())
 		for e := fs.mu.queue.Front(); e != nil; e = e.Next() {
 			f := e.Value.(*flowWithCtx)
-			queued = append(queued, f.flow.GetID())
-			queuedSince = append(queuedSince, f.enqueueTime)
+			queued = append(queued, execinfrapb.DistSQLRemoteFlowInfo{
+				FlowID:       f.flow.GetID(),
+				Timestamp:    f.enqueueTime,
+				StatementSQL: f.flow.StatementSQL(),
+			})
 		}
 	}
-	return running, runningSince, queued, queuedSince
+	return running, queued
 }

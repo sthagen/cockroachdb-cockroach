@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -139,6 +140,7 @@ type proposer interface {
 	leaseAppliedIndex() uint64
 	enqueueUpdateCheck()
 	closedTimestampTarget() hlc.Timestamp
+
 	// The following require the proposer to hold an exclusive lock.
 	withGroupLocked(func(proposerRaft) error) error
 	registerProposalLocked(*ProposalData)
@@ -156,6 +158,9 @@ type proposer interface {
 		prop *ProposalData,
 		redirectTo roachpb.ReplicaID,
 	)
+
+	// leaseDebugRLocked returns info on the current lease.
+	leaseDebugRLocked() string
 }
 
 // proposerRaft abstracts the propBuf's dependency on *raft.RawNode, to help
@@ -468,7 +473,21 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 
 		// Raft processing bookkeeping.
 		b.p.registerProposalLocked(p)
+
 		// Exit the tracker.
+		if !reproposal && p.Request.AppliesTimestampCache() {
+			// Sanity check that the request is tracked by the evaluation tracker at
+			// this point. It's supposed to be tracked until the
+			// doneIfNotMovedLocked() call below.
+			wts := p.Request.WriteTimestamp()
+			lb := b.evalTracker.LowerBound(ctx)
+			if wts.Less(lb) {
+				wts, lb := wts, lb // copies escape to heap
+				log.Fatalf(ctx, "%v", errorutil.UnexpectedWithIssueErrorf(72428,
+					"request writing below tracked lower bound: wts: %s < lb: %s; ba: %s; lease: %s.",
+					wts, lb, p.Request, b.p.leaseDebugRLocked()))
+			}
+		}
 		p.tok.doneIfNotMovedLocked(ctx)
 
 		// If we don't have a raft group or if the raft group has rejected one
@@ -502,9 +521,7 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 		// only after performing necessary bookkeeping.
 		if filter := b.testing.submitProposalFilter; filter != nil {
 			if drop, err := filter(p); drop || err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
+				firstErr = err
 				continue
 			}
 		}
@@ -645,20 +662,19 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 		return lai, hlc.Timestamp{}, nil
 	}
 
-	// Sanity check that this command is not violating the closed timestamp. It
-	// must be writing at a timestamp above assignedClosedTimestamp
-	// (assignedClosedTimestamp represents the promise that this replica made
-	// through previous commands to not evaluate requests with lower
-	// timestamps); in other words, assignedClosedTimestamp was not supposed to
-	// have been incremented while requests with lower timestamps were
-	// evaluating (instead, assignedClosedTimestamp was supposed to have bumped
-	// the write timestamp of any request the began evaluating after it was
-	// set).
-	if p.Request.WriteTimestamp().Less(b.assignedClosedTimestamp) && p.Request.IsIntentWrite() {
-		return 0, hlc.Timestamp{}, errors.AssertionFailedf("attempting to propose command writing below closed timestamp. "+
-			"wts: %s < assigned closed: %s; ba: %s",
-			p.Request.WriteTimestamp(), b.assignedClosedTimestamp, p.Request)
-	}
+	// Note that under a steady lease, for requests that leave intents we must
+	// have WriteTimestamp.Less(b.assignedClosedTimestamp) and we used to assert
+	// that here. However, this does not have to be true for proposals that
+	// evaluated under an old lease and which are only entering the proposal
+	// buffer after the lease has returned and in the process of doing so
+	// incremented b.assignedClosedTimestamp. These proposals have no effect (as
+	// they apply as a no-op) but the proposal tracker has no knowledge of the
+	// lease changes and would therefore witness what looks like a violation of
+	// the invariant above. We have an authoritative assertion in
+	// (*replicaAppBatch).assertNoWriteBelowClosedTimestamp that is not
+	// susceptible to the above false positive.
+	//
+	// See https://github.com/cockroachdb/cockroach/issues/72428#issuecomment-976428551.
 
 	lb := b.evalTracker.LowerBound(ctx)
 	if !lb.IsEmpty() {
@@ -992,9 +1008,13 @@ func (rp *replicaProposer) withGroupLocked(fn func(raftGroup proposerRaft) error
 	return (*Replica)(rp).withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
 		// We're proposing a command here so there is no need to wake the leader
 		// if we were quiesced. However, we should make sure we are unquiesced.
-		(*Replica)(rp).unquiesceLocked()
-		return false /* unquiesceLocked */, fn(raftGroup)
+		(*Replica)(rp).maybeUnquiesceLocked()
+		return false /* maybeUnquiesceLocked */, fn(raftGroup)
 	})
+}
+
+func (rp *replicaProposer) leaseDebugRLocked() string {
+	return rp.mu.state.Lease.String()
 }
 
 func (rp *replicaProposer) registerProposalLocked(p *ProposalData) {

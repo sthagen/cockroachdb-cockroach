@@ -12,6 +12,7 @@ package kvserver
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
@@ -58,7 +59,7 @@ func (r *Replica) Metrics(
 	r.mu.RLock()
 	raftStatus := r.raftStatusRLocked()
 	leaseStatus := r.leaseStatusAtRLocked(ctx, now)
-	quiescent := r.mu.quiescent || r.mu.internalRaftGroup == nil
+	quiescent := r.mu.quiescent
 	desc := r.mu.state.Desc
 	conf := r.mu.conf
 	raftLogSize := r.mu.raftLogSize
@@ -248,10 +249,10 @@ func calcBehindCount(
 // A "Query" is a BatchRequest (regardless of its contents) arriving at the
 // leaseholder with a gateway node set in the header (i.e. excluding requests
 // that weren't sent through a DistSender, which in practice should be
-// practically none).
-func (r *Replica) QueriesPerSecond() float64 {
-	qps, _ := r.leaseholderStats.avgQPS()
-	return qps
+// practically none). Also return the amount of time over which the stat was
+// accumulated.
+func (r *Replica) QueriesPerSecond() (float64, time.Duration) {
+	return r.leaseholderStats.avgQPS()
 }
 
 // WritesPerSecond returns the range's average keys written per second. A

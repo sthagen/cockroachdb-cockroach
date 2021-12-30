@@ -62,7 +62,7 @@ func restoreOldSequencesTest(exportDir string) func(t *testing.T) {
 	return func(t *testing.T) {
 		params := base.TestServerArgs{}
 		const numAccounts = 1000
-		_, _, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
+		_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
 			InitManualReplication, base.TestClusterArgs{ServerArgs: params})
 		defer cleanup()
 		err := os.Symlink(exportDir, filepath.Join(dir, "foo"))
@@ -106,7 +106,7 @@ func restoreOldSequencesTest(exportDir string) func(t *testing.T) {
 			`pq: cannot rename relation "s2" because view "v" depends on it`,
 			`ALTER SEQUENCE s2 RENAME TO s3`)
 		sqlDB.CheckQueryResults(t, `SET database = test; SHOW CREATE VIEW test.v`, [][]string{{
-			"test.public.v", `CREATE VIEW public.v (nextval) AS (SELECT nextval('s2':::STRING))`,
+			"test.public.v", "CREATE VIEW public.v (\n\tnextval\n) AS (SELECT nextval('s2':::STRING))",
 		}})
 	}
 }

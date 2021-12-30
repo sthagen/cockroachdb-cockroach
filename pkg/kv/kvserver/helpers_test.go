@@ -21,7 +21,6 @@ import (
 	"math/rand"
 	"testing"
 	"time"
-	"unsafe"
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -179,9 +178,9 @@ func manualQueue(s *Store, q queueImpl, repl *Replica) error {
 	return err
 }
 
-// ManualGC processes the specified replica using the store's GC queue.
-func (s *Store) ManualGC(repl *Replica) error {
-	return manualQueue(s, s.gcQueue, repl)
+// ManualMVCCGC processes the specified replica using the store's MVCC GC queue.
+func (s *Store) ManualMVCCGC(repl *Replica) error {
+	return manualQueue(s, s.mvccGCQueue, repl)
 }
 
 // ManualReplicaGC processes the specified replica using the store's replica
@@ -463,10 +462,10 @@ func (r *Replica) GetQueueLastProcessed(ctx context.Context, queue string) (hlc.
 	return r.getQueueLastProcessed(ctx, queue)
 }
 
-func (r *Replica) UnquiesceAndWakeLeader() {
+func (r *Replica) MaybeUnquiesceAndWakeLeader() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.unquiesceAndWakeLeaderLocked()
+	return r.maybeUnquiesceAndWakeLeaderLocked()
 }
 
 func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
@@ -515,7 +514,7 @@ func WriteRandomDataToRange(
 }
 
 func WatchForDisappearingReplicas(t testing.TB, store *Store) {
-	m := make(map[int64]struct{})
+	m := make(map[roachpb.RangeID]struct{})
 	for {
 		select {
 		case <-store.Stopper().ShouldQuiesce():
@@ -523,13 +522,12 @@ func WatchForDisappearingReplicas(t testing.TB, store *Store) {
 		default:
 		}
 
-		store.mu.replicas.Range(func(k int64, v unsafe.Pointer) bool {
-			m[k] = struct{}{}
-			return true
+		store.mu.replicasByRangeID.Range(func(repl *Replica) {
+			m[repl.RangeID] = struct{}{}
 		})
 
 		for k := range m {
-			if _, ok := store.mu.replicas.Load(k); !ok {
+			if _, ok := store.mu.replicasByRangeID.Load(k); !ok {
 				t.Fatalf("r%d disappeared from Store.mu.replicas map", k)
 			}
 		}

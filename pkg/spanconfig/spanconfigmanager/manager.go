@@ -34,6 +34,7 @@ import (
 // spanconfig.experimental_reconciliation.enabled is configured. For host
 // tenants, COCKROACH_EXPERIMENTAL_SPAN_CONFIGS needs to be additionally set.
 var checkReconciliationJobInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"spanconfig.experimental_reconciliation_job.check_interval",
 	"the frequency at which to check if the span config reconciliation job exists (and to start it if not)",
 	10*time.Minute,
@@ -45,6 +46,7 @@ var checkReconciliationJobInterval = settings.RegisterDurationSetting(
 // For the host tenant it has no effect unless
 // COCKROACH_EXPERIMENTAL_SPAN_CONFIGS is also set.
 var jobEnabledSetting = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"spanconfig.experimental_reconciliation_job.enabled",
 	"enable the use of the kv accessor", false)
 
@@ -59,7 +61,7 @@ type Manager struct {
 	settings *cluster.Settings
 	knobs    *spanconfig.TestingKnobs
 
-	spanconfig.KVAccessor
+	spanconfig.Reconciler
 }
 
 var _ spanconfig.ReconciliationDependencies = &Manager{}
@@ -71,7 +73,7 @@ func New(
 	ie sqlutil.InternalExecutor,
 	stopper *stop.Stopper,
 	settings *cluster.Settings,
-	kvAccessor spanconfig.KVAccessor,
+	reconciler spanconfig.Reconciler,
 	knobs *spanconfig.TestingKnobs,
 ) *Manager {
 	if knobs == nil {
@@ -83,8 +85,8 @@ func New(
 		ie:         ie,
 		stopper:    stopper,
 		settings:   settings,
+		Reconciler: reconciler,
 		knobs:      knobs,
-		KVAccessor: kvAccessor,
 	}
 }
 
@@ -121,7 +123,7 @@ func (m *Manager) run(ctx context.Context) {
 	checkReconciliationJobInterval.SetOnChange(&m.settings.SV, func(ctx context.Context) {
 		triggerJobCheck()
 	})
-	m.settings.Version.SetOnChange(func(ctx context.Context) {
+	m.settings.Version.SetOnChange(func(_ context.Context, _ clusterversion.ClusterVersion) {
 		triggerJobCheck()
 	})
 
@@ -215,6 +217,6 @@ func (m *Manager) createAndStartJobIfNoneExists(ctx context.Context) (bool, erro
 	if fn := m.knobs.ManagerCreatedJobInterceptor; fn != nil {
 		fn(job)
 	}
-	err := m.jr.NotifyToAdoptJobs(ctx)
-	return true, err
+	m.jr.NotifyToAdoptJobs(ctx)
+	return true, nil
 }

@@ -14,12 +14,20 @@
 package serverutils
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
 // TestTenantInterface defines SQL-only tenant functionality that tests need; it
-// is implemented by server.TestTenant.
+// is implemented by server.Test{Tenant,Server}. Tests written against this
+// interface are effectively agnostic to the type of tenant (host or secondary)
+// they're dealing with.
 type TestTenantInterface interface {
 	// SQLInstanceID is the ephemeral ID assigned to a running instance of the
 	// SQLServer. Each tenant can have zero or more running SQLServer instances.
@@ -43,17 +51,66 @@ type TestTenantInterface interface {
 	// interface{}.
 	StatusServer() interface{}
 
-	// DistSQLServer returns the *distsql.ServerImpl as an
-	// interface{}.
+	// DistSQLServer returns the *distsql.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
 
 	// JobRegistry returns the *jobs.Registry as an interface{}.
 	JobRegistry() interface{}
 
-	// TestingKnobs returns the TestingKnobs in use by the test
-	// tenant.
+	// RPCContext returns the *rpc.Context used by the test tenant.
+	RPCContext() *rpc.Context
+
+	// AnnotateCtx annotates a context.
+	AnnotateCtx(context.Context) context.Context
+
+	// ExecutorConfig returns a copy of the tenant's ExecutorConfig.
+	// The real return type is sql.ExecutorConfig.
+	ExecutorConfig() interface{}
+
+	// ExecutorConfig returns a copy of the tenant's SystemIDChecker.
+	// The real return type is keys.SystemIDChecker.
+	SystemIDChecker() interface{}
+
+	// RangeFeedFactory returns the range feed factory used by the tenant.
+	// The real return type is *rangefeed.Factory.
+	RangeFeedFactory() interface{}
+
+	// ClusterSettings returns the ClusterSettings shared by all components of
+	// this tenant.
+	ClusterSettings() *cluster.Settings
+
+	// Stopper returns the stopper used by the tenant.
+	Stopper() *stop.Stopper
+
+	// Clock returns the clock used by the tenant.
+	Clock() *hlc.Clock
+
+	// SpanConfigKVAccessor returns the underlying spanconfig.KVAccessor as an
+	// interface{}.
+	SpanConfigKVAccessor() interface{}
+
+	// SpanConfigReconciler returns the underlying spanconfig.Reconciler as an
+	// interface{}.
+	SpanConfigReconciler() interface{}
+
+	// SpanConfigSQLTranslator returns the underlying spanconfig.SQLTranslator as
+	// an interface{}.
+	SpanConfigSQLTranslator() interface{}
+
+	// SpanConfigSQLWatcher returns the underlying spanconfig.SQLWatcher as an
+	// interface{}.
+	SpanConfigSQLWatcher() interface{}
+
+	// TestingKnobs returns the TestingKnobs in use by the test server.
 	TestingKnobs() *base.TestingKnobs
 
-	// RPCContext returns the *rpc.Context
-	RPCContext() *rpc.Context
+	// AmbientCtx retrieves the AmbientContext for this server,
+	// so that a test can instantiate additional one-off components
+	// using the same context details as the server. This should not
+	// be used in non-test code.
+	AmbientCtx() log.AmbientContext
+
+	// TODO(irfansharif): We'd benefit from an API to construct a *gosql.DB, or
+	// better yet, a *sqlutils.SQLRunner. We use it all the time, constructing
+	// it by hand each time.
 }

@@ -50,6 +50,7 @@ import (
 // TempObjectCleanupInterval is a ClusterSetting controlling how often
 // temporary objects get cleaned up.
 var TempObjectCleanupInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"sql.temp_object_cleaner.cleanup_interval",
 	"how often to clean up orphaned temporary objects",
 	30*time.Minute,
@@ -58,6 +59,7 @@ var TempObjectCleanupInterval = settings.RegisterDurationSetting(
 // TempObjectWaitInterval is a ClusterSetting controlling how long
 // after a creation a temporary object will be cleaned up.
 var TempObjectWaitInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"sql.temp_object_cleaner.wait_interval",
 	"how long after creation a temporary object will be cleaned up",
 	30*time.Minute,
@@ -118,7 +120,7 @@ func (p *planner) getOrCreateTemporarySchema(
 	if err := p.CreateSchemaNamespaceEntry(ctx, catalogkeys.EncodeNameKey(p.ExecCfg().Codec, sKey), id); err != nil {
 		return nil, err
 	}
-	p.sessionDataMutatorIterator.applyForEachMutator(func(m sessionDataMutator) {
+	p.sessionDataMutatorIterator.applyOnEachMutator(func(m sessionDataMutator) {
 		m.SetTemporarySchemaName(sKey.GetName())
 		m.SetTemporarySchemaIDForDatabase(uint32(db.GetID()), uint32(id))
 	})
@@ -213,6 +215,12 @@ func cleanupSessionTempObjects(
 }
 
 // cleanupSchemaObjects removes all objects that is located within a dbID and schema.
+//
+// TODO(postamar): properly use descsCol
+// We're currently unable to leverage descsCol properly because we run DROP
+// statements in the transaction which cause descsCol's cached state to become
+// invalid. We should either drop all objects programmatically via descsCol's
+// API or avoid it entirely.
 func cleanupSchemaObjects(
 	ctx context.Context,
 	settings *cluster.Settings,
@@ -227,7 +235,7 @@ func cleanupSchemaObjects(
 	if err != nil {
 		return err
 	}
-	tbNames, _, err := descsCol.GetObjectNamesAndIDs(
+	tbNames, tbIDs, err := descsCol.GetObjectNamesAndIDs(
 		ctx,
 		txn,
 		dbDesc,
@@ -250,10 +258,8 @@ func cleanupSchemaObjects(
 
 	tblDescsByID := make(map[descpb.ID]catalog.TableDescriptor, len(tbNames))
 	tblNamesByID := make(map[descpb.ID]tree.TableName, len(tbNames))
-	for _, tbName := range tbNames {
-		flags := tree.ObjectLookupFlagsWithRequired()
-		flags.AvoidCached = true
-		_, desc, err := descsCol.GetImmutableTableByName(ctx, txn, &tbName, flags)
+	for i, tbName := range tbNames {
+		desc, err := catalogkv.MustGetTableDescByID(ctx, txn, codec, tbIDs[i])
 		if err != nil {
 			return err
 		}
@@ -321,6 +327,7 @@ func cleanupSchemaObjects(
 						codec,
 						dTableDesc.GetParentID(),
 						dTableDesc.GetParentSchemaID(),
+						settings.Version,
 					)
 					if err != nil {
 						return err

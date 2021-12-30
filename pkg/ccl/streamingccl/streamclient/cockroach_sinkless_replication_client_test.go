@@ -12,6 +12,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"     // Ensure changefeed init hooks run.
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl" // Ensure we can start tenant.
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
@@ -57,8 +58,10 @@ func TestSinklessReplicationClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	defer log.Scope(t).Close(t)
-	h, cleanup := streamingtest.NewReplicationHelper(t)
+	h, cleanup := streamingtest.NewReplicationHelper(t, base.TestServerArgs{})
 	defer cleanup()
+
+	ctx := context.Background()
 
 	h.Tenant.SQL.Exec(t, `
 CREATE DATABASE d;
@@ -70,21 +73,15 @@ INSERT INTO d.t2 VALUES (2);
 
 	t1 := catalogkv.TestingGetTableDescriptor(h.SysServer.DB(), h.Tenant.Codec, "d", "t1")
 
-	pgURL := h.PGUrl
-	q := pgURL.Query()
-	q.Set(TenantID, h.Tenant.ID.String())
-	pgURL.RawQuery = q.Encode()
+	client := &sinklessReplicationClient{remote: &h.PGUrl}
 
-	sa := streamingccl.StreamAddress(pgURL.String())
-
-	client := &sinklessReplicationClient{}
-	top, err := client.GetTopology(sa)
+	id, err := client.Create(ctx, h.Tenant.ID)
 	require.NoError(t, err)
-	require.Equal(t, 1, len(top.Partitions))
-	pa := top.Partitions[0]
-	require.Equal(t, streamingccl.PartitionAddress(pgURL.String()), pa)
 
-	ctx := context.Background()
+	top, err := client.Plan(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(top))
+	token := top[0].SubscriptionToken
 
 	h.Tenant.SQL.Exec(t, `UPDATE d.t1 SET b = 'world' WHERE i = 42`)
 
@@ -94,7 +91,7 @@ INSERT INTO d.t2 VALUES (2);
 
 	t.Run("replicate_existing_tenant", func(t *testing.T) {
 		clientCtx, cancelIngestion := context.WithCancel(ctx)
-		eventCh, errCh, err := client.ConsumePartition(clientCtx, pa, startTime)
+		eventCh, errCh, err := client.Subscribe(clientCtx, id, token, startTime)
 		require.NoError(t, err)
 		feedSource := &channelFeedSource{cancelIngestion: cancelIngestion, eventCh: eventCh, errCh: errCh}
 		feed := streamingtest.MakeReplicationFeed(t, feedSource)
@@ -115,7 +112,7 @@ INSERT INTO d.t2 VALUES (2);
 
 	t.Run("stream-address-disconnects", func(t *testing.T) {
 		clientCtx, cancelIngestion := context.WithCancel(ctx)
-		eventCh, errCh, err := client.ConsumePartition(clientCtx, pa, startTime)
+		eventCh, errCh, err := client.Subscribe(clientCtx, id, token, startTime)
 		require.NoError(t, err)
 		feedSource := &channelFeedSource{eventCh: eventCh, errCh: errCh}
 		feed := streamingtest.MakeReplicationFeed(t, feedSource)

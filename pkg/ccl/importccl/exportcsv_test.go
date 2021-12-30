@@ -17,6 +17,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,11 +36,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
+	goparquet "github.com/fraugster/parquet-go"
+	"github.com/fraugster/parquet-go/parquet"
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 )
 
 const exportFilePattern = "export*-n*.0.csv"
+const parquetExportFilePattern = "export*-n*.0.parquet"
 
 func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, string, func()) {
 	ctx := context.Background()
@@ -107,13 +111,15 @@ func TestExportImportBank(t *testing.T) {
 
 			schema := bank.FromRows(1).Tables()[0].Schema
 			exportedFiles := filepath.Join(exportDir, "*")
-			db.Exec(t, fmt.Sprintf(`IMPORT TABLE bank2 %s CSV DATA ($1) WITH delimiter = '|'%s`, schema, nullIf), exportedFiles)
+			db.Exec(t, fmt.Sprintf("CREATE TABLE bank2 %s", schema))
+			db.Exec(t, fmt.Sprintf(`IMPORT INTO bank2 CSV DATA ($1) WITH delimiter = '|'%s`, nullIf), exportedFiles)
 
 			db.CheckQueryResults(t,
 				fmt.Sprintf(`SELECT * FROM bank AS OF SYSTEM TIME %s ORDER BY id`, asOf), db.QueryStr(t, `SELECT * FROM bank2 ORDER BY id`),
 			)
 			db.CheckQueryResults(t,
-				`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank2`, db.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank`),
+				`SELECT fingerprint FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank2]`,
+				db.QueryStr(t, `SELECT fingerprint FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank]`),
 			)
 			db.Exec(t, "DROP TABLE bank2")
 		})
@@ -154,7 +160,8 @@ func TestExportNullWithEmptyNullAs(t *testing.T) {
 	require.Equal(t, "1,None\n2,8\n", string(contents))
 
 	// Verify successful IMPORT statement `WITH nullif="None"` to complete round trip
-	const importStmt = `IMPORT TABLE accounts2(id INT PRIMARY KEY, balance INT) CSV DATA ('nodelocal://0/t/export*-n*.0.csv') WITH nullif="None"`
+	const importStmt = `IMPORT INTO accounts2 CSV DATA ('nodelocal://0/t/export*-n*.0.csv') WITH nullif="None"`
+	db.Exec(t, `CREATE TABLE accounts2(id INT PRIMARY KEY, balance INT)`)
 	db.Exec(t, importStmt)
 	db.CheckQueryResults(t,
 		"SELECT * FROM accounts2", db.QueryStr(t, "SELECT * FROM accounts"),
@@ -259,6 +266,170 @@ func TestExportOrder(t *testing.T) {
 
 	if expected, got := "3,32,1,34\n2,22,2,24\n", string(content); expected != got {
 		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+// parquetTest provides information to validate a test of EXPORT PARQUET. All
+// fields below name and stmt validate some aspect of the exported parquet file.
+// If a validation field is empty, then that field will not be used in the test.
+type parquetTest struct {
+	name string
+	stmt string
+
+	// colNames provides the expected column names for the parquet file.
+	colNames []string
+
+	// colFieldRepType provides the expected parquet column type of each column in
+	// the parquet file.
+	colFieldRepType []parquet.FieldRepetitionType
+
+	// vals provides the expected values of the parquet file.
+	vals [][]interface{}
+}
+
+// validateParquetFile reads the parquet file, converts each value in the parquet file to its
+// native go type, and asserts its values match the truth.
+func validateParquetFile(t *testing.T, file string, test parquetTest) error {
+	r, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	fr, err := goparquet.NewFileReader(r)
+	if err != nil {
+		return err
+	}
+	t.Logf("Schema: %s", fr.GetSchemaDefinition())
+
+	cols := fr.SchemaReader.GetSchemaDefinition().RootColumn.Children
+
+	if test.colNames != nil {
+		for i, col := range cols {
+			require.Equal(t, col.SchemaElement.Name, test.colNames[i])
+		}
+	}
+	if test.colFieldRepType != nil {
+		for i, col := range cols {
+			require.Equal(t, *col.SchemaElement.RepetitionType, test.colFieldRepType[i])
+		}
+	}
+
+	if test.vals != nil {
+
+		require.Equal(t, len(cols), len(test.vals[0]))
+		require.Equal(t, int(fr.NumRows()), len(test.vals))
+
+		count := 0
+		for {
+			row, err := fr.NextRow()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("reading record failed: %w", err)
+			}
+
+			t.Logf("\n Record %v:", count)
+			for i := 0; i < len(cols); i++ {
+				if test.vals[count][i] == nil {
+					// If we expect a null value, the row created by the parquet reader will not have the
+					// associated column.
+					_, ok := row[cols[i].SchemaElement.Name]
+					require.Equal(t, ok, false)
+					continue
+				}
+				var decodedV interface{}
+				v := row[cols[i].SchemaElement.Name]
+				switch vv := v.(type) {
+				case []byte:
+					// the parquet exporter encodes native go strings as []byte, so an extra
+					// step is required here
+					// TODO (MB): as we add more type support, this
+					// test will be insufficient: many go native types are encoded as
+					// []byte, so in the future, each column will have to call it's own
+					// custom decoder ( this is how IMPORT Parquet will work)
+					decodedV = string(vv)
+				case int64, float64, bool:
+					decodedV = vv
+				default:
+					t.Fatalf("unexepected type: %T", vv)
+				}
+				t.Logf("\t %v", decodedV)
+				require.Equal(t, test.vals[count][i], decodedV)
+			}
+			count++
+		}
+	}
+
+	return nil
+}
+
+// TestBasicParquetTypes exports a relation with bool, int, float and string
+// values to a parquet file, and then asserts that the parquet exporter properly
+// encoded the values of the crdb relation.
+func TestBasicParquetTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY, x STRING, y INT, z FLOAT NOT NULL, a BOOL, 
+INDEX (y))`)
+	sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'Alice', 3, 14.3, true), (2, 'Bob', 2, 24.1, 
+false),(3, 'Carl', 1, 34.214,true),(4, 'Alex', 3, 14.3, NULL), (5, 'Bobby', 2, 3.4,false),
+(6, NULL, NULL, 4.5, NULL)`)
+
+	tests := []parquetTest{
+		{
+			name: "basic",
+			stmt: `EXPORT INTO PARQUET 'nodelocal://0/basic' FROM SELECT *
+							FROM foo WHERE y IS NOT NULL ORDER BY y ASC LIMIT 2 `,
+			colNames: []string{"i", "x", "y", "z", "a"},
+			vals: [][]interface{}{{int64(3), "Carl", int64(1), 34.214, true},
+				{int64(2), "Bob", int64(2), 24.1, false}},
+		},
+		{
+			name: "null_vals",
+			stmt: `EXPORT INTO PARQUET 'nodelocal://0/null_vals' FROM SELECT *
+							FROM foo ORDER BY x ASC LIMIT 2`,
+			vals: [][]interface{}{
+				{int64(6), nil, nil, 4.5, nil},
+				{int64(4), "Alex", int64(3), 14.3, nil}},
+		},
+		{
+			name: "colname",
+			stmt: `EXPORT INTO PARQUET 'nodelocal://0/colname' FROM SELECT avg(z), min(y) AS baz
+							FROM foo`,
+			colNames: []string{"avg", "baz"},
+		},
+		{
+			name: "nullable",
+			stmt: `EXPORT INTO PARQUET 'nodelocal://0/nullable' FROM SELECT y,z,x
+							FROM foo`,
+			colFieldRepType: []parquet.FieldRepetitionType{
+				parquet.FieldRepetitionType_OPTIONAL,
+				parquet.FieldRepetitionType_REQUIRED,
+				parquet.FieldRepetitionType_OPTIONAL},
+		},
+	}
+
+	for _, test := range tests {
+		t.Logf("Test %s", test.name)
+		sqlDB.Exec(t, test.stmt)
+		paths, err := filepath.Glob(filepath.Join(dir, test.name,
+			parquetExportFilePattern))
+		require.NoError(t, err)
+
+		require.Equal(t, 1, len(paths))
+
+		err = validateParquetFile(t, paths[0], test)
+		require.NoError(t, err)
+
 	}
 }
 

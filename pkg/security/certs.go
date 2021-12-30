@@ -11,6 +11,7 @@
 package security
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -41,14 +42,14 @@ func loadCACertAndKey(sslCA, sslCAKey string) (*x509.Certificate, crypto.Private
 	// LoadX509KeyPair does a bunch of validation, including len(Certificates) != 0.
 	caCert, err := tls.LoadX509KeyPair(sslCA, sslCAKey)
 	if err != nil {
-		return nil, nil, errors.Errorf("error loading CA certificate %s and key %s: %s",
-			sslCA, sslCAKey, err)
+		return nil, nil, errors.Wrapf(err, "error loading CA certificate %s and key %s",
+			sslCA, sslCAKey)
 	}
 
 	// Extract x509 certificate from tls cert.
 	x509Cert, err := x509.ParseCertificate(caCert.Certificate[0])
 	if err != nil {
-		return nil, nil, errors.Errorf("error parsing CA certificate %s: %s", sslCA, err)
+		return nil, nil, errors.Wrapf(err, "error parsing CA certificate %s", sslCA)
 	}
 	return x509Cert, caCert.PrivateKey, nil
 }
@@ -297,7 +298,7 @@ func CreateNodePair(
 	nodeCert, err := GenerateServerCert(caCert, caPrivateKey,
 		nodeKey.Public(), lifetime, nodeUser, hosts)
 	if err != nil {
-		return errors.Errorf("error creating node server certificate and key: %s", err)
+		return errors.Wrap(err, "error creating node server certificate and key")
 	}
 
 	certPath := cm.NodeCertPath()
@@ -352,7 +353,7 @@ func CreateUIPair(
 
 	uiCert, err := GenerateUIServerCert(caCert, caPrivateKey, uiKey.Public(), lifetime, hosts)
 	if err != nil {
-		return errors.Errorf("error creating UI server certificate and key: %s", err)
+		return errors.Wrap(err, "error creating UI server certificate and key")
 	}
 
 	certPath := cm.UICertPath()
@@ -423,7 +424,7 @@ func CreateClientPair(
 
 	clientCert, err := GenerateClientCert(caCert, caPrivateKey, clientKey.Public(), lifetime, user)
 	if err != nil {
-		return errors.Errorf("error creating client certificate and key: %s", err)
+		return errors.Wrap(err, "error creating client certificate and key")
 	}
 
 	certPath := cm.ClientCertPath(user)
@@ -508,7 +509,7 @@ func CreateTenantPair(
 		caCert, caPrivateKey, clientKey.Public(), lifetime, tenantIdentifier, hosts,
 	)
 	if err != nil {
-		return nil, errors.Errorf("error creating tenant certificate and key: %s", err)
+		return nil, errors.Wrap(err, "error creating tenant certificate and key")
 	}
 	return &TenantPair{
 		PrivateKey: clientKey,
@@ -560,4 +561,17 @@ func PEMContentsToX509(contents []byte) ([]*x509.Certificate, error) {
 	}
 
 	return certs, nil
+}
+
+// AppendCertificatesToBlob adds the passed PEM encoded certificates to the existing
+// byte slice containing PEM encoded certificates, ensuring that there is a newline
+// separating the original byte slice and each subsequent certificate byte slices.
+func AppendCertificatesToBlob(certBlob []byte, newCerts ...[]byte) []byte {
+	return bytes.Join(
+		append(
+			[][]byte{certBlob},
+			newCerts...,
+		),
+		[]byte{'\n'},
+	)
 }

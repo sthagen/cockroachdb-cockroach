@@ -24,14 +24,17 @@ import (
 	cloudstorage "github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/amazon"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // The following env variable names match those specified in the TeamCity
@@ -53,34 +56,45 @@ const (
 	rows3GiB   = rows30GiB / 10
 )
 
-func importBankDataSplit(
-	ctx context.Context, rows, ranges int, t test.Test, c cluster.Cluster,
-) string {
+func destinationName(c cluster.Cluster) string {
 	dest := c.Name()
-	// Randomize starting with encryption-at-rest enabled.
-	c.EncryptAtRandom(true)
-
 	if c.IsLocal() {
 		dest += fmt.Sprintf("%d", timeutil.Now().UnixNano())
 	}
+	return dest
+}
+
+func importBankDataSplit(
+	ctx context.Context, rows, ranges int, t test.Test, c cluster.Cluster,
+) string {
+	dest := destinationName(c)
+	// Randomize starting with encryption-at-rest enabled.
+	c.EncryptAtRandom(true)
 
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload")
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 
 	// NB: starting the cluster creates the logs dir as a side effect,
 	// needed below.
-	c.Start(ctx)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+	runImportBankDataSplit(ctx, rows, ranges, t, c)
+	return dest
+}
+
+func runImportBankDataSplit(ctx context.Context, rows, ranges int, t test.Test, c cluster.Cluster) {
 	c.Run(ctx, c.All(), `./workload csv-server --port=8081 &> logs/workload-csv-server.log < /dev/null &`)
 	time.Sleep(time.Second) // wait for csv server to open listener
-
 	importArgs := []string{
 		"./workload", "fixtures", "import", "bank",
-		"--db=bank", "--payload-bytes=10240", fmt.Sprintf("--ranges=%d", ranges), "--csv-server", "http://localhost:8081",
-		fmt.Sprintf("--rows=%d", rows), "--seed=1", "{pgurl:1}",
+		"--db=bank",
+		"--payload-bytes=10240",
+		"--csv-server", "http://localhost:8081",
+		"--seed=1",
+		fmt.Sprintf("--ranges=%d", ranges),
+		fmt.Sprintf("--rows=%d", rows),
+		"{pgurl:1}",
 	}
 	c.Run(ctx, c.Node(1), importArgs...)
-
-	return dest
 }
 
 func importBankData(ctx context.Context, rows int, t test.Test, c cluster.Cluster) string {
@@ -111,8 +125,8 @@ func registerBackupNodeShutdown(r registry.Registry) {
 			nodeToShutdown := 3
 			dest := loadBackupData(ctx, t, c)
 			backupQuery := `BACKUP bank.bank TO 'nodelocal://1/` + dest + `' WITH DETACHED`
-			startBackup := func(c cluster.Cluster) (jobID string, err error) {
-				gatewayDB := c.Conn(ctx, gatewayNode)
+			startBackup := func(c cluster.Cluster, t test.Test) (jobID string, err error) {
+				gatewayDB := c.Conn(ctx, t.L(), gatewayNode)
 				defer gatewayDB.Close()
 
 				err = gatewayDB.QueryRowContext(ctx, backupQuery).Scan(&jobID)
@@ -131,8 +145,8 @@ func registerBackupNodeShutdown(r registry.Registry) {
 			nodeToShutdown := 2
 			dest := loadBackupData(ctx, t, c)
 			backupQuery := `BACKUP bank.bank TO 'nodelocal://1/` + dest + `' WITH DETACHED`
-			startBackup := func(c cluster.Cluster) (jobID string, err error) {
-				gatewayDB := c.Conn(ctx, gatewayNode)
+			startBackup := func(c cluster.Cluster, t test.Test) (jobID string, err error) {
+				gatewayDB := c.Conn(ctx, t.L(), gatewayNode)
 				defer gatewayDB.Close()
 
 				err = gatewayDB.QueryRowContext(ctx, backupQuery).Scan(&jobID)
@@ -143,6 +157,63 @@ func registerBackupNodeShutdown(r registry.Registry) {
 		},
 	})
 
+}
+
+func registerBackupMixedVersion(r registry.Registry) {
+	r.Add(registry.TestSpec{
+		Name:    "backup/mixed-version",
+		Owner:   registry.OwnerBulkIO,
+		Cluster: r.MakeClusterSpec(4),
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			// An empty string means that the cockroach binary specified by flag
+			// `cockroach` will be used.
+			const mainVersion = ""
+			roachNodes := c.All()
+			predV, err := PredecessorVersion(*t.BuildVersion())
+			require.NoError(t, err)
+			c.Put(ctx, t.DeprecatedWorkload(), "./workload")
+			loadBackupDataStep := func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+				rows := rows3GiB
+				if c.IsLocal() {
+					rows = 100
+				}
+				runImportBankDataSplit(ctx, rows, 0 /* ranges */, t, u.c)
+			}
+			successfulBackupStep := func(nodeID int, opts ...string) versionStep {
+				return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+					backupOpts := ""
+					if len(opts) > 0 {
+						backupOpts = fmt.Sprintf("WITH %s", strings.Join(opts, ", "))
+					}
+					backupQuery := fmt.Sprintf("BACKUP bank.bank TO 'nodelocal://%d/%s' %s",
+						nodeID, destinationName(c), backupOpts)
+
+					gatewayDB := c.Conn(ctx, t.L(), nodeID)
+					defer gatewayDB.Close()
+					t.Status("Running: ", backupQuery)
+					_, err := gatewayDB.ExecContext(ctx, backupQuery)
+					require.NoError(t, err)
+				}
+			}
+			u := newVersionUpgradeTest(c,
+				uploadAndStartFromCheckpointFixture(roachNodes, predV),
+				waitForUpgradeStep(roachNodes),
+				preventAutoUpgradeStep(1),
+				loadBackupDataStep,
+				// Upgrade some of the nodes.
+				binaryUpgradeStep(c.Nodes(1, 2), mainVersion),
+				// Backup from new node should succeed.
+				successfulBackupStep(1),
+				// Backup from new node with revision history should succeed.
+				successfulBackupStep(2, "revision_history"),
+				// Backup from old node should succeed.
+				successfulBackupStep(3),
+				// Backup from old node with revision history should succeed.
+				successfulBackupStep(4, "revision_history"),
+			)
+			u.run(ctx, t)
+		},
+	})
 }
 
 // initBulkJobPerfArtifacts registers a histogram, creates a performance
@@ -226,7 +297,7 @@ func registerBackup(r registry.Registry) {
 			}
 			dest := importBankData(ctx, rows, t, c)
 
-			conn := c.Conn(ctx, 1)
+			conn := c.Conn(ctx, t.L(), 1)
 			m := c.NewMonitor(ctx)
 			m.Go(func(ctx context.Context) error {
 				_, err := conn.ExecContext(ctx, `
@@ -338,8 +409,8 @@ func registerBackup(r registry.Registry) {
 			c.EncryptAtRandom(true)
 			c.Put(ctx, t.Cockroach(), "./cockroach")
 			c.Put(ctx, t.DeprecatedWorkload(), "./workload")
-			c.Start(ctx)
-			conn := c.Conn(ctx, 1)
+			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+			conn := c.Conn(ctx, t.L(), 1)
 
 			duration := 5 * time.Minute
 			if c.IsLocal() {

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
@@ -80,7 +81,7 @@ func (n *createTypeNode) startExec(params runParams) error {
 	// Check if a type with the same name exists already.
 	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
 		Required:    false,
-		AvoidCached: true,
+		AvoidLeased: true,
 	}}
 	found, _, err := params.p.Descriptors().GetImmutableTypeByName(params.ctx, params.p.Txn(), n.typeName, flags)
 	if err != nil {
@@ -344,9 +345,13 @@ func CreateEnumTypeDesc(
 		}
 	}
 
-	privs := dbDesc.GetDefaultPrivilegeDescriptor().CreatePrivilegesFromDefaultPrivileges(
+	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		dbDesc.GetDefaultPrivilegeDescriptor(),
+		schema.GetDefaultPrivilegeDescriptor(),
 		dbDesc.GetID(),
-		params.p.User(), tree.Types, dbDesc.GetPrivileges(),
+		params.SessionData().User(),
+		tree.Types,
+		dbDesc.GetPrivileges(),
 	)
 
 	enumKind := descpb.TypeDescriptor_ENUM

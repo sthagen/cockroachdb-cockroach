@@ -75,7 +75,7 @@ export const statementsTimeInterval = docsURL(
   "ui-statements-page.html#time-interval",
 );
 export const capacityMetrics = docsURL(
-  "ui-cluster-overview.html#capacity-metrics",
+  "ui-cluster-overview-page.html#capacity-metrics",
 );
 export const nodeLivenessIssues = docsURL(
   "cluster-setup-troubleshooting.html#node-liveness-issues",
@@ -99,3 +99,7 @@ export const enterpriseLicensing =
 
 // Not actually a docs URL.
 export const startTrial = "https://www.cockroachlabs.com/pricing/start-trial/";
+
+export const reduceStorageOfTimeSeriesDataOperationalFlags = docsURL(
+  "operational-faqs.html#can-i-reduce-or-disable-the-storage-of-time-series-data",
+);

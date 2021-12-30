@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -212,6 +213,9 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		}
 	}
 
+	// Check if this table has already been mutated in another subquery.
+	b.checkMultipleMutations(tab, ins.OnConflict == nil /* simpleInsert */)
+
 	var mb mutationBuilder
 	if ins.OnConflict != nil && ins.OnConflict.IsUpsertAlias() {
 		mb.init(b, "upsert", tab, alias)
@@ -255,6 +259,7 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	//
 	//   INSERT INTO <table> DEFAULT VALUES
 	//
+	isUpsert := ins.OnConflict != nil && !ins.OnConflict.DoNothing
 	if !ins.DefaultValues() {
 		// Replace any DEFAULT expressions in the VALUES clause, if a VALUES clause
 		// exists:
@@ -263,15 +268,15 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		//
 		rows := mb.replaceDefaultExprs(ins.Rows)
 
-		mb.buildInputForInsert(inScope, rows)
+		mb.buildInputForInsert(inScope, rows, isUpsert)
 	} else {
-		mb.buildInputForInsert(inScope, nil /* rows */)
+		mb.buildInputForInsert(inScope, nil /* rows */, isUpsert)
 	}
 
 	// Add default columns that were not explicitly specified by name or
 	// implicitly targeted by input columns. Also add any computed columns. In
 	// both cases, include columns undergoing mutations in the write-only state.
-	mb.addSynthesizedColsForInsert()
+	mb.addSynthesizedColsForInsert(isUpsert)
 
 	var returning tree.ReturningExprs
 	if resultsNeeded(ins.Returning) {
@@ -553,7 +558,9 @@ func (mb *mutationBuilder) addTargetTableColsForInsert(maxCols int) {
 
 // buildInputForInsert constructs the memo group for the input expression and
 // constructs a new output scope containing that expression's output columns.
-func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.Select) {
+func (mb *mutationBuilder) buildInputForInsert(
+	inScope *scope, inputRows *tree.Select, isUpsert bool,
+) {
 	// Handle DEFAULT VALUES case by creating a single empty row as input.
 	if inputRows == nil {
 		mb.outScope = inScope.push()
@@ -605,20 +612,30 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 
 	// Loop over input columns and:
 	//   1. Type check each column
+	//   2. Check if the INSERT violates a GENERATED ALWAYS AS IDENTITY column.
 	//   2. Assign name to each column
 	//   3. Add column ID to the insertColIDs list.
 	for i := range mb.outScope.cols {
 		inCol := &mb.outScope.cols[i]
 		ord := mb.tabID.ColumnOrdinal(mb.targetColList[i])
 
-		// Type check the input column against the corresponding table column.
-		checkDatumTypeFitsColumnType(mb.tab.Column(ord), inCol.typ)
+		if isUpsert {
+			// Type check the input column against the corresponding table column.
+			checkDatumTypeFitsColumnType(mb.tab.Column(ord), inCol.typ)
+		}
 
-		// Check if the input column is created with `GENERATED ALWAYS AS IDENTITY`
-		// syntax. If yes, and user does not specify the `OVERRIDING SYSTEM VALUE`
-		// syntax in the `INSERT` statement,
-		// checkColumnIsNotGeneratedAlwaysAsIdentity will raise an error.
-		checkColumnIsNotGeneratedAlwaysAsIdentity(mb.tab.Column(ord))
+		// Raise an error if the target column is a `GENERATED ALWAYS AS
+		// IDENTITY` column. Such a column is not allowed to be explicitly
+		// written to.
+		//
+		// TODO(janexing): Implement the OVERRIDING SYSTEM VALUE syntax for
+		// INSERT which allows a GENERATED ALWAYS AS IDENTITY column to be
+		// overwritten.
+		// See https://github.com/cockroachdb/cockroach/issues/68201.
+		if col := mb.tab.Column(ord); col.IsGeneratedAlwaysAsIdentity() {
+			colName := string(col.ColName())
+			panic(sqlerrors.NewGeneratedAlwaysAsIdentityColumnOverrideError(colName))
+		}
 
 		// Assign name of input column.
 		inCol.name = scopeColName(tree.Name(mb.md.ColumnMeta(mb.targetColList[i]).Alias))
@@ -627,6 +644,10 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 		// into the corresponding target table column.
 		mb.insertColIDs[ord] = inCol.id
 	}
+
+	if !isUpsert {
+		mb.addAssignmentCasts(mb.insertColIDs)
+	}
 }
 
 // addSynthesizedColsForInsert wraps an Insert input expression with a Project
@@ -634,7 +655,7 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 // columns that are not yet part of the target column list. This includes all
 // write-only mutation columns, since they must always have default or computed
 // values.
-func (mb *mutationBuilder) addSynthesizedColsForInsert() {
+func (mb *mutationBuilder) addSynthesizedColsForInsert(isUpsert bool) {
 	// Start by adding non-computed columns that have not already been explicitly
 	// specified in the query. Do this before adding computed columns, since those
 	// may depend on non-computed columns.
@@ -644,15 +665,25 @@ func (mb *mutationBuilder) addSynthesizedColsForInsert() {
 		false, /* applyOnUpdate */
 	)
 
-	// Possibly round DECIMAL-related columns containing insertion values (whether
-	// synthesized or not).
-	mb.roundDecimalValues(mb.insertColIDs, false /* roundComputedCols */)
+	if isUpsert {
+		// Possibly round DECIMAL-related columns containing insertion values (whether
+		// synthesized or not).
+		mb.roundDecimalValues(mb.insertColIDs, false /* roundComputedCols */)
+	} else {
+		// Add assignment casts for default column values.
+		mb.addAssignmentCasts(mb.insertColIDs)
+	}
 
 	// Now add all computed columns.
 	mb.addSynthesizedComputedCols(mb.insertColIDs, false /* restrict */)
 
 	// Possibly round DECIMAL-related computed columns.
-	mb.roundDecimalValues(mb.insertColIDs, true /* roundComputedCols */)
+	if isUpsert {
+		mb.roundDecimalValues(mb.insertColIDs, true /* roundComputedCols */)
+	} else {
+		// Add assignment casts for computed column values.
+		mb.addAssignmentCasts(mb.insertColIDs)
+	}
 }
 
 // buildInsert constructs an Insert operator, possibly wrapped by a Project

@@ -20,7 +20,9 @@ go_library(
         "debug_list_files.go",
         "debug_logconfig.go",
         "debug_merge_logs.go",
+        "debug_recover_loss_of_quorum.go",
         "debug_reset_quorum.go",
+        "debug_send_kv_batch.go",
         "debug_synctest.go",
         "decode.go",
         "demo.go",
@@ -42,6 +44,7 @@ go_library(
         "mt_test_directory.go",
         "node.go",
         "nodelocal.go",
+        "prefixer.go",
         "quit.go",
         "sql_client.go",
         "sql_shell_cmd.go",
@@ -121,6 +124,8 @@ go_library(
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/gc",
         "//pkg/kv/kvserver/liveness/livenesspb",
+        "//pkg/kv/kvserver/loqrecovery",
+        "//pkg/kv/kvserver/loqrecovery/loqrecoverypb",
         "//pkg/kv/kvserver/rditer",
         "//pkg/kv/kvserver/stateloader",
         "//pkg/roachpb:with-mocks",
@@ -158,6 +163,7 @@ go_library(
         "//pkg/startupmigrations",
         "//pkg/storage",
         "//pkg/storage/enginepb",
+        "//pkg/storage/fs",
         "//pkg/testutils/serverutils",
         "//pkg/ts",
         "//pkg/ts/tspb",
@@ -282,6 +288,8 @@ go_test(
         "debug_job_trace_test.go",
         "debug_list_files_test.go",
         "debug_merge_logs_test.go",
+        "debug_recover_loss_of_quorum_test.go",
+        "debug_send_kv_batch_test.go",
         "debug_test.go",
         "decode_test.go",
         "demo_locality_test.go",
@@ -295,6 +303,7 @@ go_test(
         "main_test.go",
         "node_test.go",
         "nodelocal_test.go",
+        "prefixer_test.go",
         "quit_test.go",
         "sqlfmt_test.go",
         "start_test.go",
@@ -326,6 +335,7 @@ go_test(
         "//pkg/kv",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/liveness/livenesspb",
+        "//pkg/kv/kvserver/loqrecovery/loqrecoverypb",
         "//pkg/kv/kvserver/stateloader",
         "//pkg/roachpb:with-mocks",
         "//pkg/rpc",
@@ -351,6 +361,7 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/log/logconfig",
+        "//pkg/util/log/logpb",
         "//pkg/util/protoutil",
         "//pkg/util/stop",
         "//pkg/util/timeutil",
@@ -370,4 +381,20 @@ stringer(
     name = "gen-keytype-stringer",
     src = "flags_util.go",
     typ = "keyType",
+)
+
+filegroup(
+    name = "interactive_tests",
+    srcs = glob(
+        ["interactive_tests/**"],
+        # TODO(rail): The following tests fail under bazel.
+        # https://github.com/cockroachdb/cockroach/issues/71932, aka
+        # "broken_in_bazel"
+        exclude = [
+            "*/test_multiline_statements.tcl",
+            "*/test_pretty.tcl",
+            "*/test_server_sig.tcl",
+        ],
+    ),
+    visibility = ["//visibility:public"],
 )

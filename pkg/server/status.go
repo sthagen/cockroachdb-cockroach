@@ -26,7 +26,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -65,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -78,9 +78,6 @@ import (
 const (
 	// Default Maximum number of log entries returned.
 	defaultMaxLogEntries = 1000
-
-	// stackTraceApproxSize is the approximate size of a goroutine stack trace.
-	stackTraceApproxSize = 1024
 
 	// statusPrefix is the root of the cluster statistics and metrics API.
 	statusPrefix = "/_status/"
@@ -353,33 +350,29 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 
 	nodeIDOrZero, _ := b.sqlServer.sqlIDContainer.OptionalNodeID()
 
-	running, runningSince, queued, queuedSince := b.flowScheduler.Serialize()
-	if len(running) != len(runningSince) {
-		return nil, errors.Errorf("mismatched lengths of running and runningSince")
-	}
-	if len(queued) != len(queuedSince) {
-		return nil, errors.Errorf("mismatched lengths of queued and queuedSince")
-	}
+	running, queued := b.flowScheduler.Serialize()
 	response := &serverpb.ListDistSQLFlowsResponse{
 		Flows: make([]serverpb.DistSQLRemoteFlows, 0, len(running)+len(queued)),
 	}
-	for i, f := range running {
+	for _, f := range running {
 		response.Flows = append(response.Flows, serverpb.DistSQLRemoteFlows{
-			FlowID: f,
+			FlowID: f.FlowID,
 			Infos: []serverpb.DistSQLRemoteFlows_Info{{
 				NodeID:    nodeIDOrZero,
-				Timestamp: runningSince[i],
+				Timestamp: f.Timestamp,
 				Status:    serverpb.DistSQLRemoteFlows_RUNNING,
+				Stmt:      f.StatementSQL,
 			}},
 		})
 	}
-	for i, f := range queued {
+	for _, f := range queued {
 		response.Flows = append(response.Flows, serverpb.DistSQLRemoteFlows{
-			FlowID: f,
+			FlowID: f.FlowID,
 			Infos: []serverpb.DistSQLRemoteFlows_Info{{
 				NodeID:    nodeIDOrZero,
-				Timestamp: queuedSince[i],
+				Timestamp: f.Timestamp,
 				Status:    serverpb.DistSQLRemoteFlows_QUEUED,
+				Stmt:      f.StatementSQL,
 			}},
 		})
 	}
@@ -411,12 +404,26 @@ type statusServer struct {
 // StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
 // used by AdminUI endpoints.
 type StmtDiagnosticsRequester interface {
-
 	// InsertRequest adds an entry to system.statement_diagnostics_requests for
 	// tracing a query with the given fingerprint. Once this returns, calling
-	// shouldCollectDiagnostics() on the current node will return true for the given
-	// fingerprint.
-	InsertRequest(ctx context.Context, fprint string) error
+	// stmtdiagnostics.ShouldCollectDiagnostics() on the current node will
+	// return true for the given fingerprint.
+	// - minExecutionLatency, if non-zero, determines the minimum execution
+	// latency of a query that satisfies the request. In other words, queries
+	// that ran faster than minExecutionLatency do not satisfy the condition
+	// and the bundle is not generated for them.
+	// - expiresAfter, if non-zero, indicates for how long the request should
+	// stay active.
+	InsertRequest(
+		ctx context.Context,
+		stmtFingerprint string,
+		minExecutionLatency time.Duration,
+		expiresAfter time.Duration,
+	) error
+	// CancelRequest updates an entry in system.statement_diagnostics_requests
+	// for tracing a query with the given fingerprint to be expired (thus,
+	// canceling any new tracing for it).
+	CancelRequest(ctx context.Context, stmtFingerprint string) error
 }
 
 // newStatusServer allocates and returns a statusServer.
@@ -610,27 +617,25 @@ func (s *statusServer) Allocator(
 	err = s.stores.VisitStores(func(store *kvserver.Store) error {
 		// All ranges requested:
 		if len(req.RangeIDs) == 0 {
-			// Use IterateRangeDescriptors to read from the engine only
-			// because it's already exported.
-			err := kvserver.IterateRangeDescriptors(ctx, store.Engine(),
-				func(desc roachpb.RangeDescriptor) error {
-					rep := store.GetReplicaIfExists(desc.RangeID)
-					if rep == nil {
-						return nil // continue
-					}
+			var err error
+			store.VisitReplicas(
+				func(rep *kvserver.Replica) bool {
 					if !rep.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
-						return nil
+						return true // continue.
 					}
-					allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+					var allocatorSpans tracing.Recording
+					allocatorSpans, err = store.AllocatorDryRun(ctx, rep)
 					if err != nil {
-						return err
+						return false // break and bubble up the error.
 					}
 					output.DryRuns = append(output.DryRuns, &serverpb.AllocatorDryRun{
-						RangeID: desc.RangeID,
+						RangeID: rep.RangeID,
 						Events:  recordedSpansToTraceEvents(allocatorSpans),
 					})
-					return nil
-				})
+					return true // continue.
+				},
+				kvserver.WithReplicasInOrder(),
+			)
 			return err
 		}
 
@@ -947,8 +952,8 @@ func (s *statusServer) GetFiles(
 
 	var dir string
 	switch req.Type {
-	//TODO(ridwanmsharif): Serve logfiles so debug-zip can fetch them
-	// intead of reading indididual entries.
+	// TODO(ridwanmsharif): Serve logfiles so debug-zip can fetch them
+	// instead of reading individual entries.
 	case serverpb.FileType_HEAP: // Requesting for saved Heap Profiles.
 		dir = s.admin.server.cfg.HeapProfileDirName
 	case serverpb.FileType_GOROUTINES: // Requesting for saved Goroutine dumps.
@@ -1201,9 +1206,6 @@ func (s *statusServer) Logs(
 	return &serverpb.LogEntriesResponse{Entries: entries}, nil
 }
 
-// TODO(tschottdorf): significant overlap with /debug/pprof/goroutine, except
-// that this one allows querying by NodeID.
-//
 // Stacks returns goroutine or thread stack traces.
 func (s *statusServer) Stacks(
 	ctx context.Context, req *serverpb.StacksRequest,
@@ -1228,23 +1230,21 @@ func (s *statusServer) Stacks(
 		return status.Stacks(ctx, req)
 	}
 
+	var debug int
 	switch req.Type {
 	case serverpb.StacksType_GOROUTINE_STACKS:
-		bufSize := runtime.NumGoroutine() * stackTraceApproxSize
-		for {
-			buf := make([]byte, bufSize)
-			length := runtime.Stack(buf, true)
-			// If this wasn't large enough to accommodate the full set of
-			// stack traces, increase by 2 and try again.
-			if length == bufSize {
-				bufSize = bufSize * 2
-				continue
-			}
-			return &serverpb.JSONResponse{Data: buf[:length]}, nil
-		}
+		debug = 2
+	case serverpb.StacksType_GOROUTINE_STACKS_DEBUG_1:
+		debug = 1
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown stacks type: %s", req.Type)
 	}
+
+	var buf bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&buf, debug); err != nil {
+		return nil, status.Errorf(codes.Unknown, "failed to write goroutine stack: %s", err)
+	}
+	return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 }
 
 // TODO(tschottdorf): significant overlap with /debug/pprof/heap, except that
@@ -1411,6 +1411,9 @@ func (s *statusServer) NodesUI(
 	}
 
 	internalResp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
+	if err != nil {
+		return nil, err
+	}
 	resp := &serverpb.NodesResponseExternal{
 		Nodes:            make([]serverpb.NodeResponse, len(internalResp.Nodes)),
 		LivenessByNodeID: internalResp.LivenessByNodeID,
@@ -1468,8 +1471,25 @@ func nodeStatusToResp(n *statuspb.NodeStatus, isAdmin bool) serverpb.NodeRespons
 				Attrs:    ss.Desc.Attrs,
 				Node:     nodeDescriptor,
 				Capacity: ss.Desc.Capacity,
+
+				Properties: roachpb.StoreProperties{
+					ReadOnly:  ss.Desc.Properties.ReadOnly,
+					Encrypted: ss.Desc.Properties.Encrypted,
+				},
 			},
 			Metrics: ss.Metrics,
+		}
+		if fsprops := ss.Desc.Properties.FileStoreProperties; fsprops != nil {
+			sfsprops := &roachpb.FileStoreProperties{
+				FsType: fsprops.FsType,
+			}
+			if isAdmin {
+				sfsprops.Path = fsprops.Path
+				sfsprops.BlockDevice = fsprops.BlockDevice
+				sfsprops.MountPoint = fsprops.MountPoint
+				sfsprops.MountOptions = fsprops.MountOptions
+			}
+			statuses[i].Desc.Properties.FileStoreProperties = sfsprops
 		}
 	}
 
@@ -1618,7 +1638,7 @@ func (s *statusServer) nodeStatus(
 
 	var nodeStatus statuspb.NodeStatus
 	if err := b.Results[0].Rows[0].ValueProto(&nodeStatus); err != nil {
-		err = errors.Errorf("could not unmarshal NodeStatus from %s: %s", key, err)
+		err = errors.Wrapf(err, "could not unmarshal NodeStatus from %s", key)
 		log.Errorf(ctx, "%v", err)
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
@@ -1777,29 +1797,7 @@ func (h varsHandler) handleVars(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	h.appendLicenseExpiryMetric(ctx, w)
 	telemetry.Inc(telemetryPrometheusVars)
-}
-
-// appendLicenseExpiryMetric computes the seconds until the enterprise licence
-// expires on this clusters. the license expiry metric is computed on-demand
-// since it's not regularly computed as part of running the cluster unless
-// enterprise features are accessed.
-func (h varsHandler) appendLicenseExpiryMetric(ctx context.Context, w io.Writer) {
-	durationToExpiry, err := base.TimeToEnterpriseLicenseExpiry(ctx, h.st, timeutil.Now())
-	if err != nil {
-		log.Errorf(ctx, "unable to generate time to license expiry: %v", err)
-		return
-	}
-
-	secondsToExpiry := int64(durationToExpiry / time.Second)
-
-	_, err = w.Write([]byte(
-		fmt.Sprintf("seconds_until_enterprise_license_expiry %d\n", secondsToExpiry),
-	))
-	if err != nil {
-		log.Errorf(ctx, "problem writing license expiry metric: %v", err)
-	}
 }
 
 func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
@@ -1879,12 +1877,13 @@ func (s *statusServer) rangesHelper(
 	}
 
 	constructRangeInfo := func(
-		desc roachpb.RangeDescriptor, rep *kvserver.Replica, storeID roachpb.StoreID, metrics kvserver.ReplicaMetrics,
+		rep *kvserver.Replica, storeID roachpb.StoreID, metrics kvserver.ReplicaMetrics,
 	) serverpb.RangeInfo {
 		raftStatus := rep.RaftStatus()
 		raftState := convertRaftStatus(raftStatus)
 		leaseHistory := rep.GetLeaseHistory()
 		var span serverpb.PrettySpan
+		desc := rep.Desc()
 		span.StartKey = desc.StartKey.String()
 		span.EndKey = desc.EndKey.String()
 		state := rep.State(ctx)
@@ -1902,6 +1901,7 @@ func (s *statusServer) rangesHelper(
 				WaitingWriters: lm.WaitingWriters,
 			})
 		}
+		qps, _ := rep.QueriesPerSecond()
 		return serverpb.RangeInfo{
 			Span:          span,
 			RaftState:     raftState,
@@ -1910,7 +1910,7 @@ func (s *statusServer) rangesHelper(
 			SourceStoreID: storeID,
 			LeaseHistory:  leaseHistory,
 			Stats: serverpb.RangeStatistics{
-				QueriesPerSecond: rep.QueriesPerSecond(),
+				QueriesPerSecond: qps,
 				WritesPerSecond:  rep.WritesPerSecond(),
 			},
 			Problems: serverpb.RangeProblems{
@@ -1940,10 +1940,10 @@ func (s *statusServer) rangesHelper(
 
 	// There are two possibilities for ordering of ranges in the results:
 	// it could either be determined by the RangeIDs in the request (if specified),
-	// or be in RangeID order if not (as that's the ordering that
-	// IterateRangeDescriptors works on). The latter is already sorted in a
-	// stable fashion, as far as pagination is concerned. The former case requires
-	// sorting.
+	// or be in RangeID order if not (as we pass in the
+	// VisitReplicasInSortedOrder option to store.VisitReplicas below). The latter
+	// is already sorted in a stable fashion, as far as pagination is concerned.
+	// The former case requires sorting.
 	if len(req.RangeIDs) > 0 {
 		sort.Slice(req.RangeIDs, func(i, j int) bool {
 			return req.RangeIDs[i] < req.RangeIDs[j]
@@ -1954,25 +1954,19 @@ func (s *statusServer) rangesHelper(
 		now := store.Clock().NowAsClockTimestamp()
 		if len(req.RangeIDs) == 0 {
 			// All ranges requested.
-
-			// Use IterateRangeDescriptors to read from the engine only
-			// because it's already exported.
-			err := kvserver.IterateRangeDescriptors(ctx, store.Engine(),
-				func(desc roachpb.RangeDescriptor) error {
-					rep := store.GetReplicaIfExists(desc.RangeID)
-					if rep == nil {
-						return nil // continue
-					}
+			store.VisitReplicas(
+				func(rep *kvserver.Replica) bool {
 					output.Ranges = append(output.Ranges,
 						constructRangeInfo(
-							desc,
 							rep,
 							store.Ident.StoreID,
 							rep.Metrics(ctx, now, isLiveMap, clusterNodes),
 						))
-					return nil
-				})
-			return err
+					return true // continue.
+				},
+				kvserver.WithReplicasInOrder(),
+			)
+			return nil
 		}
 
 		// Specific ranges requested:
@@ -1982,10 +1976,8 @@ func (s *statusServer) rangesHelper(
 				// Not found: continue.
 				continue
 			}
-			desc := rep.Desc()
 			output.Ranges = append(output.Ranges,
 				constructRangeInfo(
-					*desc,
 					rep,
 					store.Ident.StoreID,
 					rep.Metrics(ctx, now, isLiveMap, clusterNodes),
@@ -2730,7 +2722,7 @@ func marshalToJSON(value interface{}) ([]byte, error) {
 	}
 	body, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return nil, errors.Errorf("unable to marshal %+v to json: %s", value, err)
+		return nil, errors.Wrapf(err, "unable to marshal %+v to json", value)
 	}
 	return body, nil
 }

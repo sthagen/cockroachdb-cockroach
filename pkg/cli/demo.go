@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -120,6 +121,7 @@ func incrementTelemetryCounters(cmd *cobra.Command) {
 func checkDemoConfiguration(
 	cmd *cobra.Command, gen workload.Generator,
 ) (workload.Generator, error) {
+	f := flagSetForCmd(cmd)
 	if gen == nil && !demoCtx.NoExampleDatabase {
 		// Use a default dataset unless prevented by --no-example-database.
 		gen = defaultGenerator
@@ -169,7 +171,7 @@ func checkDemoConfiguration(
 		}
 
 		// If the geo-partitioned replicas flag was given and the nodes have changed, throw an error.
-		if flagSetForCmd(cmd).Lookup(cliflags.DemoNodes.Name).Changed {
+		if f.Lookup(cliflags.DemoNodes.Name).Changed {
 			if demoCtx.NumNodes != 9 {
 				return nil, errors.Newf("--nodes with a value different from 9 cannot be used with %s", geoFlag)
 			}
@@ -228,7 +230,9 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 			return setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
 		},
 		getAdminClient,
-		drainAndShutdown,
+		func(ctx context.Context, ac serverpb.AdminClient) error {
+			return drainAndShutdown(ctx, ac, "local" /* targetNode */)
+		},
 	)
 	if err != nil {
 		c.Close(ctx)
@@ -249,6 +253,13 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 #
 # You are connected to a temporary, in-memory CockroachDB cluster of %d node%s.
 `, demoCtx.NumNodes, util.Pluralize(int64(demoCtx.NumNodes)))
+
+		if demoCtx.Multitenant {
+			cliCtx.PrintfUnlessEmbedded(`#
+# You are connected to tenant 1, but can connect to the system tenant with
+# \connect and the SQL url below.
+`)
+		}
 
 		if demoCtx.SimulateLatency {
 			cliCtx.PrintfUnlessEmbedded(

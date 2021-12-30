@@ -27,14 +27,15 @@ import { TerminateQueryModalRef } from "./terminateQueryModal";
 import { ColumnDescriptor, SortedTable } from "src/sortedtable/sortedtable";
 
 import { Icon } from "antd";
+import { Ellipsis } from "@cockroachlabs/icons";
+
 import {
   Dropdown,
   DropdownOption as DropdownItem,
 } from "src/dropdown/dropdown";
 import { Button } from "src/button/button";
 import { Tooltip } from "@cockroachlabs/ui-components";
-import { summarize } from "../util";
-import { shortStatement } from "../statementsTable";
+import { computeOrUseStmtSummary } from "../util";
 
 const cx = classNames.bind(styles);
 
@@ -91,6 +92,24 @@ const AgeLabel = (props: { start: Moment; thingName: string }) => {
     >
       {props.start.fromNow(true)}
     </Tooltip>
+  );
+};
+
+const StatementTableCell = (props: { session: ISession }) => {
+  const { session } = props;
+
+  if (!(session.active_queries?.length > 0)) {
+    return "N/A";
+  }
+  const stmt = session.active_queries[0].sql;
+  const stmtSummary = session.active_queries[0].sql_summary;
+  const stmtCellText = computeOrUseStmtSummary(stmt, stmtSummary);
+  return (
+    <div>
+      <Tooltip placement="bottom" style="tableTitle" content={<>{stmt}</>}>
+        {stmtCellText}
+      </Tooltip>
+    </div>
   );
 };
 
@@ -160,14 +179,7 @@ export function makeSessionsColumns(
       name: "statement",
       title: SessionTableTitle.statement,
       className: cx("cl-table__col-session", "code"),
-      cell: session => {
-        if (!(session.session.active_queries?.length > 0)) {
-          return "N/A";
-        }
-        const stmt = session.session.active_queries[0].sql;
-        const summary = summarize(stmt);
-        return shortStatement(summary, stmt);
-      },
+      cell: session => StatementTableCell({ session: session.session }),
     },
   ];
 
@@ -217,7 +229,7 @@ export function makeSessionsColumns(
       const renderDropdownToggleButton: JSX.Element = (
         <>
           <Button type="secondary" size="small">
-            <Icon type="ellipsis" />
+            <Icon component={Ellipsis} />
           </Button>
         </>
       );

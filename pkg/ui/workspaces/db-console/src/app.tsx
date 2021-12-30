@@ -20,18 +20,22 @@ import { AdminUIState } from "src/redux/state";
 import { createLoginRoute, createLogoutRoute } from "src/routes/login";
 import visualizationRoutes from "src/routes/visualization";
 import {
+  aggregatedTsAttr,
   appAttr,
   dashboardNameAttr,
   databaseAttr,
   databaseNameAttr,
   implicitTxnAttr,
+  indexNameAttr,
   nodeIDAttr,
   rangeIDAttr,
   sessionAttr,
   statementAttr,
+  tabAttr,
   tableNameAttr,
+  txnFingerprintIdAttr,
 } from "src/util/constants";
-import NotFound from "src/views/app/components/NotFound";
+import NotFound from "src/views/app/components/errorMessage/notFound";
 import Layout from "src/views/app/containers/layout";
 import DataDistributionPage from "src/views/cluster/containers/dataDistribution";
 import { EventPage } from "src/views/cluster/containers/events";
@@ -41,6 +45,7 @@ import NodeOverview from "src/views/cluster/containers/nodeOverview";
 import { DatabasesPage } from "src/views/databases/databasesPage";
 import { DatabaseDetailsPage } from "src/views/databases/databaseDetailsPage";
 import { DatabaseTablePage } from "src/views/databases/databaseTablePage";
+import { IndexDetailsPage } from "src/views/databases/indexDetailsPage";
 import Raft from "src/views/devtools/containers/raft";
 import RaftMessages from "src/views/devtools/containers/raftMessages";
 import RaftRanges from "src/views/devtools/containers/raftRanges";
@@ -59,11 +64,10 @@ import Range from "src/views/reports/containers/range";
 import ReduxDebug from "src/views/reports/containers/redux";
 import Settings from "src/views/reports/containers/settings";
 import Stores from "src/views/reports/containers/stores";
+import SQLActivityPage from "src/views/sqlActivity/sqlActivityPage";
 import StatementDetails from "src/views/statements/statementDetails";
-import StatementsPage from "src/views/statements/statementsPage";
-import SessionsPage from "src/views/sessions/sessionsPage";
 import SessionDetails from "src/views/sessions/sessionDetails";
-import TransactionsPage from "src/views/transactions/transactionsPage";
+import TransactionDetails from "src/views/transactions/transactionDetails";
 import StatementsDiagnosticsHistoryView from "src/views/reports/containers/statementDiagnosticsHistory";
 import { RedirectToStatementDetails } from "src/routes/RedirectToStatementDetails";
 import "styl/app.styl";
@@ -169,6 +173,16 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   path={`/database/:${databaseNameAttr}/table/:${tableNameAttr}`}
                   component={DatabaseTablePage}
                 />
+                <Route
+                  exact
+                  path={`/database/:${databaseNameAttr}/table/:${tableNameAttr}/index/:${indexNameAttr}`}
+                  component={IndexDetailsPage}
+                />
+                <Redirect
+                  exact
+                  from={`/database/:${databaseNameAttr}/table/:${tableNameAttr}/index`}
+                  to={`/database/:${databaseNameAttr}/table/:${tableNameAttr}`}
+                />
 
                 {/* data distribution */}
                 <Route
@@ -177,8 +191,15 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   component={DataDistributionPage}
                 />
 
+                {/* SQL activity */}
+                <Route exact path="/sql-activity" component={SQLActivityPage} />
+
                 {/* statement statistics */}
-                <Route exact path="/statements" component={StatementsPage} />
+                <Redirect
+                  exact
+                  from={`/statements`}
+                  to={`/sql-activity?${tabAttr}=Statements`}
+                />
                 <Redirect
                   exact
                   from={`/statements/:${appAttr}`}
@@ -214,24 +235,34 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   path={`/statement/:${databaseAttr}/:${implicitTxnAttr}/:${statementAttr}`}
                   render={RedirectToStatementDetails}
                 />
-                <Route
+                <Redirect
                   exact
-                  path="/statement"
-                  component={() => <Redirect to="/statements" />}
+                  from={`/statement`}
+                  to={`/sql-activity?${tabAttr}=Statements`}
                 />
 
                 {/* sessions */}
-                <Route exact path="/sessions" component={SessionsPage} />
+                <Redirect
+                  exact
+                  from={`/sessions`}
+                  to={`/sql-activity?${tabAttr}=Sessions`}
+                />
                 <Route
                   exact
                   path={`/session/:${sessionAttr}`}
                   component={SessionDetails}
                 />
+
                 {/* transactions */}
+                <Redirect
+                  exact
+                  from={`/transactions`}
+                  to={`/sql-activity?${tabAttr}=Transactions`}
+                />
                 <Route
                   exact
-                  path="/transactions"
-                  component={TransactionsPage}
+                  path={`/transaction/:${aggregatedTsAttr}/:${txnFingerprintIdAttr}`}
+                  component={TransactionDetails}
                 />
 
                 {/* debug pages */}

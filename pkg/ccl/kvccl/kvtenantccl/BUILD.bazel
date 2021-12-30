@@ -9,6 +9,7 @@ go_library(
         "//pkg/config",
         "//pkg/config/zonepb",
         "//pkg/gossip",
+        "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord:with-mocks",
         "//pkg/kv/kvclient/kvtenant",
         "//pkg/kv/kvclient/rangecache:with-mocks",
@@ -37,6 +38,7 @@ go_test(
     srcs = [
         "connector_test.go",
         "main_test.go",
+        "tenant_kv_test.go",
         "tenant_trace_test.go",
         "tenant_upgrade_test.go",
     ],
@@ -59,6 +61,7 @@ go_test(
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/settings/cluster",
+        "//pkg/sql",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",

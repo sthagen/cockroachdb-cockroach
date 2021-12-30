@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/indexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -159,9 +160,9 @@ func (oc *optCatalog) ResolveSchema(
 ) (cat.Schema, cat.SchemaName, error) {
 	if flags.AvoidDescriptorCaches {
 		defer func(prev bool) {
-			oc.planner.avoidCachedDescriptors = prev
-		}(oc.planner.avoidCachedDescriptors)
-		oc.planner.avoidCachedDescriptors = true
+			oc.planner.avoidLeasedDescriptors = prev
+		}(oc.planner.avoidLeasedDescriptors)
+		oc.planner.avoidLeasedDescriptors = true
 	}
 
 	oc.tn.ObjectNamePrefix = *name
@@ -197,9 +198,9 @@ func (oc *optCatalog) ResolveDataSource(
 ) (cat.DataSource, cat.DataSourceName, error) {
 	if flags.AvoidDescriptorCaches {
 		defer func(prev bool) {
-			oc.planner.avoidCachedDescriptors = prev
-		}(oc.planner.avoidCachedDescriptors)
-		oc.planner.avoidCachedDescriptors = true
+			oc.planner.avoidLeasedDescriptors = prev
+		}(oc.planner.avoidLeasedDescriptors)
+		oc.planner.avoidLeasedDescriptors = true
 	}
 
 	oc.tn = *name
@@ -227,9 +228,9 @@ func (oc *optCatalog) ResolveDataSourceByID(
 ) (_ cat.DataSource, isAdding bool, _ error) {
 	if flags.AvoidDescriptorCaches {
 		defer func(prev bool) {
-			oc.planner.avoidCachedDescriptors = prev
-		}(oc.planner.avoidCachedDescriptors)
-		oc.planner.avoidCachedDescriptors = true
+			oc.planner.avoidLeasedDescriptors = prev
+		}(oc.planner.avoidLeasedDescriptors)
+		oc.planner.avoidLeasedDescriptors = true
 	}
 
 	tableLookup, err := oc.planner.LookupTableByID(ctx, descpb.ID(dataSourceID))
@@ -354,6 +355,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	}
 	scID := desc.GetParentSchemaID()
 	var scName tree.Name
+	// TODO(richardjcai): Remove this in 22.2.
 	if scID == keys.PublicSchemaID {
 		scName = tree.PublicSchemaName
 	} else {
@@ -1133,6 +1135,11 @@ func (ot *optTable) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &ot.uniqueConstraints[i]
 }
 
+// Zone is part of the cat.Table interface.
+func (ot *optTable) Zone() cat.Zone {
+	return ot.zone
+}
+
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
 // cache makes the lookup O(1).
 func (ot *optTable) lookupColumnOrdinal(colID descpb.ColumnID) (int, error) {
@@ -1142,6 +1149,19 @@ func (ot *optTable) lookupColumnOrdinal(colID descpb.ColumnID) (int, error) {
 	}
 	return col, pgerror.Newf(pgcode.UndefinedColumn,
 		"column [%d] does not exist", colID)
+}
+
+// convertTableToOptTable converts a table to an *optTable. This is either an
+// *optTable or a *indexrec.HypotheticalTable (which has an embedded *optTable).
+func convertTableToOptTable(tab cat.Table) *optTable {
+	var optTab *optTable
+	switch t := tab.(type) {
+	case *optTable:
+		optTab = t
+	case *indexrec.HypotheticalTable:
+		optTab = t.Table.(*optTable)
+	}
+	return optTab
 }
 
 // CollectTypes is part of the cat.DataSource interface.
@@ -1332,6 +1352,11 @@ func (oi *optIndex) ColumnCount() int {
 	return oi.numCols
 }
 
+// ExplicitColumnCount is part of the cat.Index interface.
+func (oi *optIndex) ExplicitColumnCount() int {
+	return oi.idx.NumKeyColumns()
+}
+
 // KeyColumnCount is part of the cat.Index interface.
 func (oi *optIndex) KeyColumnCount() int {
 	return oi.numKeyCols
@@ -1406,28 +1431,6 @@ func (oi *optIndex) Ordinal() int {
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (oi *optIndex) ImplicitPartitioningColumnCount() int {
 	return oi.idx.GetPartitioning().NumImplicitColumns()
-}
-
-// InterleaveAncestorCount is part of the cat.Index interface.
-func (oi *optIndex) InterleaveAncestorCount() int {
-	return oi.idx.NumInterleaveAncestors()
-}
-
-// InterleaveAncestor is part of the cat.Index interface.
-func (oi *optIndex) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
-	a := oi.idx.GetInterleaveAncestor(i)
-	return cat.StableID(a.TableID), cat.StableID(a.IndexID), int(a.SharedPrefixLen)
-}
-
-// InterleavedByCount is part of the cat.Index interface.
-func (oi *optIndex) InterleavedByCount() int {
-	return oi.idx.NumInterleavedBy()
-}
-
-// InterleavedBy is part of the cat.Index interface.
-func (oi *optIndex) InterleavedBy(i int) (table, index cat.StableID) {
-	ref := oi.idx.GetInterleavedBy(i)
-	return cat.StableID(ref.Table), cat.StableID(ref.Index)
 }
 
 // GeoConfig is part of the cat.Index interface.
@@ -1627,7 +1630,7 @@ func (u *optUniqueConstraint) ColumnOrdinal(tab cat.Table, i int) int {
 			tab.ID(), u.table,
 		))
 	}
-	optTab := tab.(*optTable)
+	optTab := convertTableToOptTable(tab)
 	ord, _ := optTab.lookupColumnOrdinal(u.columns[i])
 	return ord
 }
@@ -1697,7 +1700,7 @@ func (fk *optForeignKeyConstraint) OriginColumnOrdinal(originTable cat.Table, i 
 		))
 	}
 
-	tab := originTable.(*optTable)
+	tab := convertTableToOptTable(originTable)
 	ord, _ := tab.lookupColumnOrdinal(fk.originColumns[i])
 	return ord
 }
@@ -1710,7 +1713,7 @@ func (fk *optForeignKeyConstraint) ReferencedColumnOrdinal(referencedTable cat.T
 			referencedTable.ID(), fk.referencedTable,
 		))
 	}
-	tab := referencedTable.(*optTable)
+	tab := convertTableToOptTable(referencedTable)
 	ord, _ := tab.lookupColumnOrdinal(fk.referencedColumns[i])
 	return ord
 }
@@ -2027,6 +2030,11 @@ func (ot *optVirtualTable) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	panic(errors.AssertionFailedf("no unique constraints"))
 }
 
+// Zone is part of the cat.Table interface.
+func (ot *optVirtualTable) Zone() cat.Zone {
+	panic(errors.AssertionFailedf("no zone"))
+}
+
 // CollectTypes is part of the cat.DataSource interface.
 func (ot *optVirtualTable) CollectTypes(ord int) (descpb.IDs, error) {
 	col := ot.desc.AllColumns()[ord]
@@ -2077,6 +2085,11 @@ func (oi *optVirtualIndex) IsUnique() bool {
 // IsInverted is part of the cat.Index interface.
 func (oi *optVirtualIndex) IsInverted() bool {
 	return false
+}
+
+// ExplicitColumnCount is part of the cat.Index interface.
+func (oi *optVirtualIndex) ExplicitColumnCount() int {
+	return oi.idx.NumKeyColumns()
 }
 
 // ColumnCount is part of the cat.Index interface.
@@ -2175,26 +2188,6 @@ func (oi *optVirtualIndex) Ordinal() int {
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (oi *optVirtualIndex) ImplicitPartitioningColumnCount() int {
 	return 0
-}
-
-// InterleaveAncestorCount is part of the cat.Index interface.
-func (oi *optVirtualIndex) InterleaveAncestorCount() int {
-	return 0
-}
-
-// InterleaveAncestor is part of the cat.Index interface.
-func (oi *optVirtualIndex) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
-	panic(errors.AssertionFailedf("no interleavings"))
-}
-
-// InterleavedByCount is part of the cat.Index interface.
-func (oi *optVirtualIndex) InterleavedByCount() int {
-	return 0
-}
-
-// InterleavedBy is part of the cat.Index interface.
-func (oi *optVirtualIndex) InterleavedBy(i int) (table, index cat.StableID) {
-	panic(errors.AssertionFailedf("no interleavings"))
 }
 
 // GeoConfig is part of the cat.Index interface.

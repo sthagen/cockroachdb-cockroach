@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -33,7 +34,7 @@ func registerAlterPK(r registry.Registry) {
 		c.Put(ctx, t.DeprecatedWorkload(), "./workload", loadNode)
 
 		t.Status("starting cockroach nodes")
-		c.Start(ctx, roachNodes)
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), roachNodes)
 		return roachNodes, loadNode
 	}
 
@@ -75,7 +76,7 @@ func registerAlterPK(r registry.Registry) {
 			time.Sleep(duration / 10)
 
 			t.Status("beginning primary key change")
-			db := c.Conn(ctx, roachNodes[0])
+			db := c.Conn(ctx, t.L(), roachNodes[0])
 			defer db.Close()
 			cmd := `
 			USE bank;
@@ -137,11 +138,11 @@ func registerAlterPK(r registry.Registry) {
 				`ALTER TABLE order_line ALTER PRIMARY KEY USING COLUMNS (ol_w_id, ol_d_id, ol_o_id DESC, ol_number)`,
 			}
 
-			rand, _ := randutil.NewPseudoRand()
+			rand, _ := randutil.NewTestRand()
 			randStmt := alterStmts[rand.Intn(len(alterStmts))]
 			t.Status("Running command: ", randStmt)
 
-			db := c.Conn(ctx, roachNodes[0])
+			db := c.Conn(ctx, t.L(), roachNodes[0])
 			defer db.Close()
 			alterCmd := `USE tpcc; %s;`
 			t.Status("beginning primary key change")

@@ -14,7 +14,7 @@ export GCE_PROJECT=${GCE_PROJECT-cockroach-roachstress}
 
 mkdir -p artifacts
 
-build/builder/mkrelease.sh amd64-linux-gnu build bin/workload bin/roachtest bin/roachprod \
+build/builder/mkrelease.sh amd64-linux-gnu build bin/workload bin/roachtest \
   > artifacts/build.txt 2>&1 || (cat artifacts/build.txt; false)
 
 build/teamcity-roachtest-invoke.sh \
@@ -26,7 +26,7 @@ build/teamcity-roachtest-invoke.sh \
   --cpu-quota="${CPUQUOTA-1024}" \
   --cluster-id="${TC_BUILD_ID}" \
   --build-tag="${BUILD_TAG}" \
-  --create-args="--lifetime=36h" \
+  --lifetime="36h" \
   --cockroach="${PWD}/cockroach-linux-2.6.32-gnu-amd64" \
   --artifacts="${PWD}/artifacts" \
   --disable-issue \

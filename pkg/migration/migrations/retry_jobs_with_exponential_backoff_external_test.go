@@ -557,7 +557,7 @@ func getDeprecatedJobsDescriptor() *descpb.TableDescriptor {
 	nowString := "now():::TIMESTAMP"
 	pk := func(name string) descpb.IndexDescriptor {
 		return descpb.IndexDescriptor{
-			Name:                tabledesc.PrimaryKeyIndexName,
+			Name:                tabledesc.PrimaryKeyIndexName("jobs"),
 			ID:                  1,
 			Unique:              true,
 			KeyColumnNames:      []string{name},
@@ -616,7 +616,7 @@ func getDeprecatedJobsDescriptor() *descpb.TableDescriptor {
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{2, 3},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 			{
 				Name:                "jobs_created_by_type_created_by_id_idx",
@@ -628,7 +628,7 @@ func getDeprecatedJobsDescriptor() *descpb.TableDescriptor {
 				StoreColumnIDs:      []descpb.ColumnID{2},
 				StoreColumnNames:    []string{"status"},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 			},
 		},
 		NextIndexID:    4,

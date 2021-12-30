@@ -26,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -39,16 +41,17 @@ import (
 func validateCheckExpr(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
 	exprStr string,
 	tableDesc *tabledesc.Mutable,
 	ie *InternalExecutor,
 	txn *kv.Txn,
 ) error {
-	expr, err := schemaexpr.FormatExprForDisplay(ctx, tableDesc, exprStr, semaCtx, tree.FmtParsable)
+	expr, err := schemaexpr.FormatExprForDisplay(ctx, tableDesc, exprStr, semaCtx, sessionData, tree.FmtParsable)
 	if err != nil {
 		return err
 	}
-	colSelectors := tabledesc.ColumnsSelectors(tableDesc.PublicColumns())
+	colSelectors := tabledesc.ColumnsSelectors(tableDesc.AccessibleColumns())
 	columns := tree.AsStringWithFlags(&colSelectors, tree.FmtSerializable)
 	queryStr := fmt.Sprintf(`SELECT %s FROM [%d AS t] WHERE NOT (%s) LIMIT 1`, columns, tableDesc.GetID(), exprStr)
 	log.Infof(ctx, "validating check constraint %q with query %q", expr, queryStr)
@@ -60,7 +63,7 @@ func validateCheckExpr(
 	if rows.Len() > 0 {
 		return pgerror.Newf(pgcode.CheckViolation,
 			"validation of CHECK %q failed on row: %s",
-			expr, labeledRowValues(tableDesc.PublicColumns(), rows))
+			expr, labeledRowValues(tableDesc.AccessibleColumns(), rows))
 	}
 	return nil
 }
@@ -267,7 +270,8 @@ func validateForeignKey(
 			query,
 		)
 
-		values, err := ie.QueryRow(ctx, "validate foreign key constraint", txn, query)
+		values, err := ie.QueryRowEx(ctx, "validate foreign key constraint",
+			txn, sessiondata.NodeUserSessionDataOverride, query)
 		if err != nil {
 			return err
 		}
@@ -292,7 +296,8 @@ func validateForeignKey(
 		query,
 	)
 
-	values, err := ie.QueryRow(ctx, "validate fk constraint", txn, query)
+	values, err := ie.QueryRowEx(ctx, "validate fk constraint", txn,
+		sessiondata.NodeUserSessionDataOverride, query)
 	if err != nil {
 		return err
 	}
@@ -370,7 +375,7 @@ func validateUniqueConstraint(
 	constraintName string,
 	columnIDs []descpb.ColumnID,
 	pred string,
-	ie *InternalExecutor,
+	ie sqlutil.InternalExecutor,
 	txn *kv.Txn,
 ) error {
 	query, colNames, err := duplicateRowQuery(
@@ -387,7 +392,8 @@ func validateUniqueConstraint(
 		query,
 	)
 
-	values, err := ie.QueryRow(ctx, "validate unique constraint", txn, query)
+	values, err := ie.QueryRowEx(ctx, "validate unique constraint", txn,
+		sessiondata.NodeUserSessionDataOverride, query)
 	if err != nil {
 		return err
 	}
@@ -446,6 +452,7 @@ type checkSet = util.FastIntSet
 func checkMutationInput(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
 	tabDesc catalog.TableDescriptor,
 	checkOrds checkSet,
 	checkVals tree.Datums,
@@ -467,7 +474,9 @@ func checkMutationInput(
 		} else if !res && checkVals[colIdx] != tree.DNull {
 			// Failed to satisfy CHECK constraint, so unwrap the serialized
 			// check expression to display to the user.
-			expr, err := schemaexpr.FormatExprForDisplay(ctx, tabDesc, checks[i].Expr, semaCtx, tree.FmtParsable)
+			expr, err := schemaexpr.FormatExprForDisplay(
+				ctx, tabDesc, checks[i].Expr, semaCtx, sessionData, tree.FmtParsable,
+			)
 			if err != nil {
 				// If we ran into an error trying to read the check constraint, wrap it
 				// and return.

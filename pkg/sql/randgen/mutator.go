@@ -361,7 +361,7 @@ func encodeInvertedIndexHistogramUpperBounds(colType *types.T, val tree.Datum) (
 	case types.GeographyFamily:
 		keys, err = rowenc.EncodeGeoInvertedIndexTableKeys(val, nil, *geoindex.DefaultGeographyIndexConfig())
 	default:
-		keys, err = rowenc.EncodeInvertedIndexTableKeys(val, nil, descpb.StrictIndexColumnIDGuaranteesVersion)
+		keys, err = rowenc.EncodeInvertedIndexTableKeys(val, nil, descpb.LatestNonPrimaryIndexDescriptorVersion)
 	}
 
 	if err != nil {
@@ -643,10 +643,6 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 		case *tree.SetClusterSetting, *tree.SetVar:
 			continue
 		case *tree.CreateTable:
-			if stmt.Interleave != nil {
-				stmt.Interleave = nil
-				changed = true
-			}
 			if stmt.PartitionByTable != nil {
 				stmt.PartitionByTable = nil
 				changed = true
@@ -674,10 +670,6 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 						changed = true
 					}
 				case *tree.UniqueConstraintTableDef:
-					if def.Interleave != nil {
-						def.Interleave = nil
-						changed = true
-					}
 					if def.PartitionByIndex != nil {
 						def.PartitionByIndex = nil
 						changed = true
@@ -714,10 +706,6 @@ func postgresCreateTableMutator(
 		mutated = append(mutated, stmt)
 		switch stmt := stmt.(type) {
 		case *tree.CreateTable:
-			if stmt.Interleave != nil {
-				stmt.Interleave = nil
-				changed = true
-			}
 			// Get all the column types first.
 			colTypes := make(map[string]*types.T)
 			for _, def := range stmt.Defs {
@@ -735,9 +723,16 @@ func postgresCreateTableMutator(
 					// to their own statement.
 					var newCols tree.IndexElemList
 					for _, col := range def.Columns {
-						// Postgres doesn't support box2d as a btree index key.
-						colTypeFamily := colTypes[string(col.Column)].Family()
-						if colTypeFamily == types.Box2DFamily {
+						isBox2d := false
+						// NB: col.Column is empty for expression-based indexes.
+						if col.Expr == nil {
+							// Postgres doesn't support box2d as a btree index key.
+							colTypeFamily := colTypes[string(col.Column)].Family()
+							if colTypeFamily == types.Box2DFamily {
+								isBox2d = true
+							}
+						}
+						if isBox2d {
 							changed = true
 						} else {
 							newCols = append(newCols, col)
@@ -764,9 +759,18 @@ func postgresCreateTableMutator(
 				case *tree.UniqueConstraintTableDef:
 					var newCols tree.IndexElemList
 					for _, col := range def.Columns {
-						// Postgres doesn't support box2d as a btree index key.
-						colTypeFamily := colTypes[string(col.Column)].Family()
-						if colTypeFamily == types.Box2DFamily {
+						isBox2d := false
+						// NB: col.Column is empty for expression-based indexes.
+						if col.Expr == nil {
+							// Postgres doesn't support box2d as a btree index key.
+							colTypeFamily := colTypes[string(col.Column)].Family()
+							if colTypeFamily == types.Box2DFamily {
+								isBox2d = true
+							}
+						} else {
+							col.Expr, changed = replaceNonImmutableExpr(rng, col.Expr, colTypes)
+						}
+						if isBox2d {
 							changed = true
 						} else {
 							newCols = append(newCols, col)
@@ -805,34 +809,7 @@ func postgresCreateTableMutator(
 					changed = true
 				case *tree.ColumnTableDef:
 					if def.IsComputed() {
-						// Postgres has different cast volatility for timestamps and OID
-						// types. The substitution here is specific to the output of
-						// testutils.randComputedColumnTableDef.
-						if funcExpr, ok := def.Computed.Expr.(*tree.FuncExpr); ok {
-							if len(funcExpr.Exprs) == 1 {
-								if castExpr, ok := funcExpr.Exprs[0].(*tree.CastExpr); ok {
-									referencedType := colTypes[castExpr.Expr.(*tree.UnresolvedName).String()]
-									isContextDependentType := referencedType.Family() == types.TimestampFamily ||
-										referencedType.Family() == types.OidFamily ||
-										referencedType.Family() == types.DateFamily
-									if isContextDependentType &&
-										tree.MustBeStaticallyKnownType(castExpr.Type) == types.String {
-										def.Computed.Expr = &tree.CaseExpr{
-											Whens: []*tree.When{
-												{
-													Cond: &tree.IsNullExpr{
-														Expr: castExpr.Expr,
-													},
-													Val: RandDatum(rng, types.String, true /* nullOK */),
-												},
-											},
-											Else: RandDatum(rng, types.String, true /* nullOK */),
-										}
-										changed = true
-									}
-								}
-							}
-						}
+						def.Computed.Expr, changed = replaceNonImmutableExpr(rng, def.Computed.Expr, colTypes)
 					}
 					newdefs = append(newdefs, def)
 				default:
@@ -843,6 +820,42 @@ func postgresCreateTableMutator(
 		}
 	}
 	return mutated, changed
+}
+
+// replaceNonImmutableExpr checks if expr has a non-immutable operation in it,
+// and returns an immutable expr if it does. This is needed because Postgres has
+// different cast volatility for timestamps and/OID types. The substitution here
+// is specific to the output of randgen.randExpr, which uses
+// `lower(cast(col as string))`.
+func replaceNonImmutableExpr(
+	rng *rand.Rand, expr tree.Expr, colTypes map[string]*types.T,
+) (newExpr tree.Expr, changed bool) {
+	if funcExpr, ok := expr.(*tree.FuncExpr); ok {
+		if len(funcExpr.Exprs) == 1 {
+			if castExpr, ok := funcExpr.Exprs[0].(*tree.CastExpr); ok {
+				referencedType := colTypes[castExpr.Expr.(*tree.UnresolvedName).String()]
+				isContextDependentType := referencedType.Family() == types.TimestampFamily ||
+					referencedType.Family() == types.OidFamily ||
+					referencedType.Family() == types.DateFamily
+				if isContextDependentType &&
+					tree.MustBeStaticallyKnownType(castExpr.Type) == types.String {
+					newExpr = &tree.CaseExpr{
+						Whens: []*tree.When{
+							{
+								Cond: &tree.IsNullExpr{
+									Expr: castExpr.Expr,
+								},
+								Val: RandDatum(rng, types.String, true /* nullOK */),
+							},
+						},
+						Else: RandDatum(rng, types.String, true /* nullOK */),
+					}
+					return newExpr, true
+				}
+			}
+		}
+	}
+	return expr, false
 }
 
 // columnFamilyMutator is mutations.StatementMutator, but lives here to prevent

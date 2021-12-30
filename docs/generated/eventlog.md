@@ -139,6 +139,35 @@ after being offline.
 | `StartedAt` | The time when this node was last started. | no |
 | `LastUp` | The approximate last time the node was up before the last restart. | no |
 
+## Debugging events
+
+Events in this category pertain to debugging operations performed by
+operators or (more commonly) Cockroach Labs employees. These operations can
+e.g. directly access and mutate internal state, breaking system invariants.
+
+Events in this category are logged to the `OPS` channel.
+
+
+### `debug_send_kv_batch`
+
+An event of type `debug_send_kv_batch` is recorded when an arbitrary KV BatchRequest is submitted
+to the cluster via the `debug send-kv-batch` CLI command.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `BatchRequest` |  | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `NodeID` | The node ID where the event originated. | no |
+| `User` | The user which performed the operation. | yes |
+
 ## Health events
 
 Events in this category pertain to the health of one or more servers.
@@ -1530,6 +1559,7 @@ An event of type `alter_default_privileges` is recorded when default privileges 
 | `DatabaseName` | The name of the affected database. | yes |
 | `RoleName` | Either role_name should be populated or for_all_roles should be true. The role having its default privileges altered. | yes |
 | `ForAllRoles` | Identifies if FOR ALL ROLES is used. | no |
+| `SchemaName` | The name of the affected schema. | yes |
 
 
 #### Common fields
@@ -1766,7 +1796,8 @@ Events of this type are only emitted when the cluster setting
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
 | `Transport` | The connection type after transport negotiation. | no |
-| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+| `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
+| `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
 
 ### `client_authentication_info`
 
@@ -1793,7 +1824,8 @@ Events of this type are only emitted when the cluster setting
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
 | `Transport` | The connection type after transport negotiation. | no |
-| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+| `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
+| `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
 
 ### `client_authentication_ok`
 
@@ -1819,7 +1851,8 @@ Events of this type are only emitted when the cluster setting
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
 | `Transport` | The connection type after transport negotiation. | no |
-| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+| `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
+| `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
 
 ### `client_connection_end`
 
@@ -1892,7 +1925,8 @@ Events of this type are only emitted when the cluster setting
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
 | `Transport` | The connection type after transport negotiation. | no |
-| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+| `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
+| `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
 
 ## SQL Slow Query Log
 
@@ -2236,6 +2270,8 @@ contains common SQL event/execution details.
 | Field | Description | Sensitive |
 |--|--|--|
 | `SkippedQueries` | skipped_queries indicate how many SQL statements were not considered for sampling prior to this one. If the field is omitted, or its value is zero, this indicates that no statement was omitted since the last event. | no |
+| `CostEstimate` | Cost of the query as estimated by the optimizer. | no |
+| `Distribution` | The distribution of the DistSQL query plan (local, full, or partial). | no |
 
 
 #### Common fields

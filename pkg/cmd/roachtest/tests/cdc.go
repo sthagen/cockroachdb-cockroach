@@ -32,15 +32,17 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -63,6 +65,7 @@ type sinkType int32
 const (
 	cloudStorageSink sinkType = iota + 1
 	webhookSink
+	pubsubSink
 )
 
 type cdcTestArgs struct {
@@ -87,12 +90,12 @@ type cdcTestArgs struct {
 func cdcClusterSettings(t test.Test, db *sqlutils.SQLRunner) {
 	// kv.rangefeed.enabled is required for changefeeds to run
 	db.Exec(t, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
-	randomlyRun(t, db, "SET CLUSTER SETTING kv.rangefeed.catchup_scan_iterator_optimization.enabled = true")
+	randomlyRun(t, db, "SET CLUSTER SETTING kv.rangefeed.catchup_scan_iterator_optimization.enabled = false")
 }
 
 const randomSettingPercent = 0.50
 
-var rng, _ = randutil.NewTestPseudoRand()
+var rng, _ = randutil.NewTestRand()
 
 func randomlyRun(t test.Test, db *sqlutils.SQLRunner, query string) {
 	if rng.Float64() < randomSettingPercent {
@@ -108,9 +111,9 @@ func cdcBasicTest(ctx context.Context, t test.Test, c cluster.Cluster, args cdcT
 	kafkaNode := c.Node(c.Spec().NodeCount)
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
-	c.Start(ctx, crdbNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
 
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer stopFeeds(db)
 	tdb := sqlutils.MakeSQLRunner(db)
 	cdcClusterSettings(t, tdb)
@@ -149,6 +152,8 @@ func cdcBasicTest(ctx context.Context, t test.Test, c cluster.Cluster, args cdcT
 		sinkDestHost.RawQuery = params.Encode()
 
 		sinkURI = fmt.Sprintf("webhook-%s", sinkDestHost.String())
+	} else if args.whichSink == pubsubSink {
+		sinkURI = changefeedccl.GcpScheme + `://cockroach-ephemeral` + "?AUTH=implicit&topic_name=pubsubSink-roachtest"
 	} else {
 		t.Status("installing kafka")
 		kafka.install(ctx)
@@ -308,7 +313,7 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 	crdbNodes, workloadNode, kafkaNode := c.Range(1, c.Spec().NodeCount-1), c.Node(c.Spec().NodeCount), c.Node(c.Spec().NodeCount)
 	c.Put(ctx, t.Cockroach(), "./cockroach", crdbNodes)
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
-	c.Start(ctx, crdbNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
 	kafka := kafkaManager{
 		t:     t,
 		c:     c,
@@ -331,7 +336,7 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 	}
 
 	c.Run(ctx, workloadNode, `./workload init bank {pgurl:1}`)
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer stopFeeds(db)
 
 	tdb := sqlutils.MakeSQLRunner(db)
@@ -476,7 +481,7 @@ func runCDCSchemaRegistry(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 	crdbNodes, kafkaNode := c.Node(1), c.Node(1)
 	c.Put(ctx, t.Cockroach(), "./cockroach", crdbNodes)
-	c.Start(ctx, crdbNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
 	kafka := kafkaManager{
 		t:     t,
 		c:     c,
@@ -486,7 +491,7 @@ func runCDCSchemaRegistry(ctx context.Context, t test.Test, c cluster.Cluster) {
 	kafka.start(ctx)
 	defer kafka.stop(ctx)
 
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer stopFeeds(db)
 
 	cdcClusterSettings(t, sqlutils.MakeSQLRunner(db))
@@ -531,32 +536,41 @@ func runCDCSchemaRegistry(ctx context.Context, t test.Test, c cluster.Cluster) {
 		t.Fatal(err)
 	}
 
-	output, err := c.RunWithBuffer(ctx, t.L(), kafkaNode,
-		kafka.makeCommand("kafka-avro-console-consumer",
-			"--from-beginning",
-			"--topic=foo",
-			"--max-messages=14",
-			"--bootstrap-server=localhost:9092"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.L().Printf("\n%s\n", output)
-
-	updatedRE := regexp.MustCompile(`"updated":\{"string":"[^"]+"\}`)
-	updatedMap := make(map[string]struct{})
-	var resolved []string
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.Contains(line, `"updated"`) {
-			line = updatedRE.ReplaceAllString(line, `"updated":{"string":""}`)
-			updatedMap[line] = struct{}{}
-		} else if strings.Contains(line, `"resolved"`) {
-			resolved = append(resolved, line)
-		}
-	}
 	// There are various internal races and retries in changefeeds that can
 	// produce duplicates. This test is really only to verify that the confluent
 	// schema registry works end-to-end, so do the simplest thing and sort +
-	// unique the output.
+	// unique the output, pulling more messages if we get a lot of duplicates
+	// or resolved messages.
+	updatedRE := regexp.MustCompile(`"updated":\{"string":"[^"]+"\}`)
+	updatedMap := make(map[string]struct{})
+	var resolved []string
+	pagesFetched := 0
+	pageSize := 14
+
+	for len(updatedMap) < 10 && pagesFetched < 5 {
+		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), kafkaNode,
+			kafka.makeCommand("kafka-avro-console-consumer",
+				fmt.Sprintf("--offset=%d", pagesFetched*pageSize),
+				"--partition=0",
+				"--topic=foo",
+				fmt.Sprintf("--max-messages=%d", pageSize),
+				"--bootstrap-server=localhost:9092"))
+		t.L().Printf("\n%s\n", result.Stdout+result.Stderr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pagesFetched++
+
+		for _, line := range strings.Split(result.Stdout, "\n") {
+			if strings.Contains(line, `"updated"`) {
+				line = updatedRE.ReplaceAllString(line, `"updated":{"string":""}`)
+				updatedMap[line] = struct{}{}
+			} else if strings.Contains(line, `"resolved"`) {
+				resolved = append(resolved, line)
+			}
+		}
+	}
+
 	updated := make([]string, 0, len(updatedMap))
 	for u := range updatedMap {
 		updated = append(updated, u)
@@ -606,7 +620,7 @@ func runCDCKafkaAuth(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 	crdbNodes, kafkaNode := c.Range(1, lastCrdbNode), c.Node(c.Spec().NodeCount)
 	c.Put(ctx, t.Cockroach(), "./cockroach", crdbNodes)
-	c.Start(ctx, crdbNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
 
 	kafka := kafkaManager{
 		t:     t,
@@ -619,7 +633,7 @@ func runCDCKafkaAuth(ctx context.Context, t test.Test, c cluster.Cluster) {
 	kafka.addSCRAMUsers(ctx)
 	defer kafka.stop(ctx)
 
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer stopFeeds(db)
 
 	tdb := sqlutils.MakeSQLRunner(db)
@@ -799,6 +813,23 @@ func registerCDC(r registry.Registry) {
 			})
 		},
 	})
+	r.Add(registry.TestSpec{
+		Name:            "cdc/pubsub-sink",
+		Owner:           `cdc`,
+		Cluster:         r.MakeClusterSpec(4, spec.CPU(16)),
+		RequiresLicense: true,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			cdcBasicTest(ctx, t, c, cdcTestArgs{
+				workloadType:             tpccWorkloadType,
+				tpccWarehouseCount:       1,
+				workloadDuration:         "30m",
+				initialScan:              true,
+				whichSink:                pubsubSink,
+				targetInitialScanLatency: 30 * time.Minute,
+				targetSteadyLatency:      time.Minute,
+			})
+		},
+	})
 	// TODO(ryan min): uncomment once connectivity issue is fixed,
 	// currently fails with "initial scan did not complete" because sink
 	// URI is set as localhost, need to expose it to the other nodes via IP
@@ -832,6 +863,7 @@ func registerCDC(r registry.Registry) {
 	})
 	r.Add(registry.TestSpec{
 		Name:            "cdc/bank",
+		Skip:            "#72904",
 		Owner:           `cdc`,
 		Cluster:         r.MakeClusterSpec(4),
 		RequiresLicense: true,
@@ -1110,7 +1142,7 @@ fi
 `, confluentDownloadURL, confluentSHA256, confluentInstallBase, confluentCLIVersion, confluentCLIDownloadURLBase)
 
 const (
-	// kafkaJAASConfig is a JAAS configuration file that creats a
+	// kafkaJAASConfig is a JAAS configuration file that creates a
 	// user called "plain" with password "plain-secret" that can
 	// authenticate via SASL/PLAIN.
 	//
@@ -1248,7 +1280,7 @@ func (k kafkaManager) installJRE(ctx context.Context) error {
 
 func (k kafkaManager) configureAuth(ctx context.Context) *testCerts {
 	k.t.Status("generating TLS certificates")
-	ips, err := k.c.InternalIP(ctx, k.nodes)
+	ips, err := k.c.InternalIP(ctx, k.t.L(), k.nodes)
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -1444,7 +1476,7 @@ func (k kafkaManager) chaosLoop(
 }
 
 func (k kafkaManager) sinkURL(ctx context.Context) string {
-	ips, err := k.c.InternalIP(ctx, k.nodes)
+	ips, err := k.c.InternalIP(ctx, k.t.L(), k.nodes)
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -1452,7 +1484,7 @@ func (k kafkaManager) sinkURL(ctx context.Context) string {
 }
 
 func (k kafkaManager) sinkURLTLS(ctx context.Context) string {
-	ips, err := k.c.InternalIP(ctx, k.nodes)
+	ips, err := k.c.InternalIP(ctx, k.t.L(), k.nodes)
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -1460,7 +1492,7 @@ func (k kafkaManager) sinkURLTLS(ctx context.Context) string {
 }
 
 func (k kafkaManager) sinkURLSASL(ctx context.Context) string {
-	ips, err := k.c.InternalIP(ctx, k.nodes)
+	ips, err := k.c.InternalIP(ctx, k.t.L(), k.nodes)
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -1468,7 +1500,7 @@ func (k kafkaManager) sinkURLSASL(ctx context.Context) string {
 }
 
 func (k kafkaManager) consumerURL(ctx context.Context) string {
-	ips, err := k.c.ExternalIP(ctx, k.nodes)
+	ips, err := k.c.ExternalIP(ctx, k.t.L(), k.nodes)
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -1476,7 +1508,7 @@ func (k kafkaManager) consumerURL(ctx context.Context) string {
 }
 
 func (k kafkaManager) schemaRegistryURL(ctx context.Context) string {
-	ips, err := k.c.InternalIP(ctx, k.nodes)
+	ips, err := k.c.InternalIP(ctx, k.t.L(), k.nodes)
 	if err != nil {
 		k.t.Fatal(err)
 	}

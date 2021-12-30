@@ -83,8 +83,17 @@ type Mutable struct {
 var _ redact.SafeMessager = (*immutable)(nil)
 
 // SetDrainingNames implements the MutableDescriptor interface.
+//
+// Deprecated: Do not use.
 func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
 	desc.DrainingNames = names
+}
+
+// AddDrainingName implements the MutableDescriptor interface.
+//
+// Deprecated: Do not use.
+func (desc *Mutable) AddDrainingName(name descpb.NameInfo) {
+	desc.DrainingNames = append(desc.DrainingNames, name)
 }
 
 // GetParentSchemaID implements the Descriptor interface.
@@ -141,6 +150,16 @@ func (desc *immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// ByteSize implements the Descriptor interface.
+func (desc *immutable) ByteSize() int64 {
+	return int64(desc.Size())
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
+	return NewBuilder(desc.SchemaDesc())
+}
+
 // ValidateSelf implements the catalog.Descriptor interface.
 func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	// Validate local properties of the descriptor.
@@ -151,6 +170,11 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 
 	// Validate the privilege descriptor.
 	vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Schema))
+	// The DefaultPrivilegeDescriptor may be nil.
+	if desc.GetDefaultPrivileges() != nil {
+		// Validate the default privilege descriptor.
+		vea.Report(catprivilege.ValidateDefaultPrivileges(*desc.GetDefaultPrivileges()))
+	}
 }
 
 // GetReferencedDescIDs returns the IDs of all descriptors referenced by
@@ -206,6 +230,15 @@ func (desc *immutable) ValidateTxnCommit(
 	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
 ) {
 	// No-op.
+}
+
+// GetDefaultPrivilegeDescriptor returns a DefaultPrivilegeDescriptor.
+func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
+	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
+	if defaultPrivilegeDescriptor == nil {
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_SCHEMA)
+	}
+	return catprivilege.MakeDefaultPrivileges(defaultPrivilegeDescriptor)
 }
 
 // MaybeIncrementVersion implements the MutableDescriptor interface.
@@ -272,14 +305,8 @@ func (desc *Mutable) SetOffline(reason string) {
 	desc.OfflineReason = reason
 }
 
-// SetName sets the name of the schema. It handles installing a draining name
-// for the old name of the descriptor.
+// SetName sets the name of the schema.
 func (desc *Mutable) SetName(name string) {
-	desc.DrainingNames = append(desc.DrainingNames, descpb.NameInfo{
-		ParentID:       desc.ParentID,
-		ParentSchemaID: keys.RootNamespaceID,
-		Name:           desc.Name,
-	})
 	desc.Name = name
 }
 
@@ -292,6 +319,23 @@ func (desc *Mutable) IsUncommittedVersion() bool {
 // RunPostDeserializationChanges.
 func (desc *Mutable) HasPostDeserializationChanges() bool {
 	return desc.changed
+}
+
+// GetMutableDefaultPrivilegeDescriptor returns a catprivilege.Mutable.
+func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutable {
+	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
+	if defaultPrivilegeDescriptor == nil {
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_SCHEMA)
+	}
+	return catprivilege.NewMutableDefaultPrivileges(defaultPrivilegeDescriptor)
+}
+
+// SetDefaultPrivilegeDescriptor sets the default privilege descriptor
+// for the database.
+func (desc *Mutable) SetDefaultPrivilegeDescriptor(
+	defaultPrivilegeDescriptor *descpb.DefaultPrivilegeDescriptor,
+) {
+	desc.DefaultPrivileges = defaultPrivilegeDescriptor
 }
 
 // IsSchemaNameValid returns whether the input name is valid for a user defined

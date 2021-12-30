@@ -14,169 +14,88 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
 )
 
-// spanRe matches strings of the form "[start, end)", capturing both the "start"
-// and "end" keys.
-var spanRe = regexp.MustCompile(`^\[(\w+),\s??(\w+)\)$`)
-
-// configRe matches a single word. It's a shorthand for declaring a unique
-// config.
-var configRe = regexp.MustCompile(`^(\w+)$`)
-
-func TestSpanRe(t *testing.T) {
-	for _, tc := range []struct {
-		input            string
-		expMatch         bool
-		expStart, expEnd string
-	}{
-		{"[a, b)", true, "a", "b"},
-		{"[acd, bfg)", true, "acd", "bfg"}, // multi character keys allowed
-		{"[a,b)", true, "a", "b"},          // separating space is optional
-		{"[ a,b) ", false, "", ""},         // extraneous spaces disallowed
-		{"[a,b ) ", false, "", ""},         // extraneous spaces disallowed
-		{"[a,, b)", false, "", ""},         // only single comma allowed
-		{" [a, b)", false, "", ""},         // need to start with '['
-		{"[a,b)x", false, "", ""},          // need to end with ')'
-	} {
-		require.Equalf(t, tc.expMatch, spanRe.MatchString(tc.input), "input = %s", tc.input)
-		if !tc.expMatch {
-			continue
-		}
-
-		matches := spanRe.FindStringSubmatch(tc.input)
-		require.Len(t, matches, 3)
-		start, end := matches[1], matches[2]
-		require.Equal(t, tc.expStart, start)
-		require.Equal(t, tc.expEnd, end)
-	}
+// TestingApplyInternal exports an internal method for testing purposes.
+func (s *Store) TestingApplyInternal(
+	_ context.Context, dryrun bool, updates ...spanconfig.Update,
+) (deleted []roachpb.Span, added []roachpb.SpanConfigEntry, err error) {
+	return s.applyInternal(dryrun, updates...)
 }
 
-// parseSpan is helper function that constructs a roachpb.Span from a string of
-// the form "[start, end)".
-func parseSpan(t *testing.T, sp string) roachpb.Span {
-	if !spanRe.MatchString(sp) {
-		t.Fatalf("expected %s to match span regex", sp)
-	}
-
-	matches := spanRe.FindStringSubmatch(sp)
-	start, end := matches[1], matches[2]
-	return roachpb.Span{
-		Key:    roachpb.Key(start),
-		EndKey: roachpb.Key(end),
-	}
-}
-
-// parseConfig is helper function that constructs a roachpb.SpanConfig that's
-// "tagged" with the given string (i.e. a constraint with the given string a
-// required key).
-func parseConfig(t *testing.T, conf string) roachpb.SpanConfig {
-	if !configRe.MatchString(conf) {
-		t.Fatalf("expected %s to match config regex", conf)
-	}
-	return roachpb.SpanConfig{
-		Constraints: []roachpb.ConstraintsConjunction{
-			{
-				Constraints: []roachpb.Constraint{
-					{
-						Key: conf,
-					},
-				},
-			},
-		},
-	}
-}
-
-// printSpan is a helper function that transforms roachpb.Span into a string of
-// the form "[start,end)". The span is assumed to have been constructed by the
-// parseSpan helper above.
-func printSpan(sp roachpb.Span) string {
-	return fmt.Sprintf("[%s,%s)", string(sp.Key), string(sp.EndKey))
-}
-
-// printSpanConfig is a helper function that transforms roachpb.SpanConfig into
-// a readable string. The span config is assumed to have been constructed by the
-// parseSpanConfig helper above.
-func printSpanConfig(conf roachpb.SpanConfig) string {
-	return conf.Constraints[0].Constraints[0].Key // see parseConfig for what a "tagged" roachpb.SpanConfig translates to
-}
-
-// printSpanConfigEntry is a helper function that transforms
-// roachpb.SpanConfigEntry into a string of the form "[start, end):config". The
-// span and config are expected to have been constructed using the
-// parse{Span,Config} helpers above.
-func printSpanConfigEntry(entry roachpb.SpanConfigEntry) string {
-	return fmt.Sprintf("%s:%s", printSpan(entry.Span), printSpanConfig(entry.Config))
-}
-
-// TestingGetAllOverlapping is a testing only helper to retrieve the set of
-// overlapping entries in sorted order.
-func (s *Store) TestingGetAllOverlapping(
-	_ context.Context, sp roachpb.Span,
-) []roachpb.SpanConfigEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Iterate over all overlapping ranges and return corresponding span config
-	// entries.
-	var res []roachpb.SpanConfigEntry
-	for _, overlapping := range s.mu.tree.Get(sp.AsRange()) {
-		res = append(res, overlapping.(*storeEntry).SpanConfigEntry)
-	}
-	return res
-}
-
-func TestDatadriven(t *testing.T) {
+// TestDataDriven runs datadriven tests against the Store interface.
+// The syntax is as follows:
+//
+// 		apply
+// 		delete [a,c)
+// 		set [c,h):X
+// 		----
+// 		deleted [b,d)
+// 		deleted [e,g)
+// 		added [c,h):X
+//
+// 		get key=b
+// 		----
+// 		conf=A # or conf=FALLBACK if the key is not present
+//
+// 		needs-split span=[b,h)
+// 		----
+// 		true
+//
+// 		compute-split span=[b,h)
+// 		----
+// 		key=c
+//
+// 		overlapping span=[b,h)
+// 		----
+// 		[b,d):A
+// 		[d,f):B
+// 		[f,h):A
+//
+//
+// Text of the form [a,b) and [a,b):C correspond to spans and span config
+// entries; see spanconfigtestutils.Parse{Span,Config,SpanConfigEntry} for more
+// details.
+func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
-		store := New(parseConfig(t, "FALLBACK"))
+	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+		store := New(spanconfigtestutils.ParseConfig(t, "FALLBACK"))
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-			var (
-				spanStr, confStr, keyStr string
-			)
+			var spanStr, keyStr string
 			switch d.Cmd {
-			case "set":
-				d.ScanArgs(t, "span", &spanStr)
-				d.ScanArgs(t, "conf", &confStr)
-				span, config := parseSpan(t, spanStr), parseConfig(t, confStr)
-
+			case "apply":
+				updates := spanconfigtestutils.ParseStoreApplyArguments(t, d.Input)
 				dryrun := d.HasArg("dryrun")
-				deleted, added := store.Apply(ctx, spanconfig.Update{Span: span, Config: config}, dryrun)
+				deleted, added, err := store.TestingApplyInternal(ctx, dryrun, updates...)
+				if err != nil {
+					return fmt.Sprintf("err: %v", err)
+				}
+
+				sort.Sort(roachpb.Spans(deleted))
+				sort.Slice(added, func(i, j int) bool {
+					return added[i].Span.Key.Compare(added[j].Span.Key) < 0
+				})
 
 				var b strings.Builder
 				for _, sp := range deleted {
-					b.WriteString(fmt.Sprintf("deleted %s\n", printSpan(sp)))
+					b.WriteString(fmt.Sprintf("deleted %s\n", spanconfigtestutils.PrintSpan(sp)))
 				}
 				for _, ent := range added {
-					b.WriteString(fmt.Sprintf("added %s\n", printSpanConfigEntry(ent)))
-				}
-				return b.String()
-
-			case "delete":
-				d.ScanArgs(t, "span", &spanStr)
-				span := parseSpan(t, spanStr)
-
-				dryrun := d.HasArg("dryrun")
-				deleted, added := store.Apply(ctx, spanconfig.Update{Span: span}, dryrun)
-
-				var b strings.Builder
-				for _, sp := range deleted {
-					b.WriteString(fmt.Sprintf("deleted %s\n", printSpan(sp)))
-				}
-				for _, ent := range added {
-					b.WriteString(fmt.Sprintf("added %s\n", printSpanConfigEntry(ent)))
+					b.WriteString(fmt.Sprintf("added %s\n", spanconfigtestutils.PrintSpanConfigEntry(ent)))
 				}
 				return b.String()
 
@@ -184,36 +103,39 @@ func TestDatadriven(t *testing.T) {
 				d.ScanArgs(t, "key", &keyStr)
 				config, err := store.GetSpanConfigForKey(ctx, roachpb.RKey(keyStr))
 				require.NoError(t, err)
-				return fmt.Sprintf("conf=%s", printSpanConfig(config))
+				return fmt.Sprintf("conf=%s", spanconfigtestutils.PrintSpanConfig(config))
 
 			case "needs-split":
 				d.ScanArgs(t, "span", &spanStr)
-				span := parseSpan(t, spanStr)
+				span := spanconfigtestutils.ParseSpan(t, spanStr)
 				start, end := roachpb.RKey(span.Key), roachpb.RKey(span.EndKey)
 				result := store.NeedsSplit(ctx, start, end)
 				return fmt.Sprintf("%t", result)
 
 			case "compute-split":
 				d.ScanArgs(t, "span", &spanStr)
-				span := parseSpan(t, spanStr)
+				span := spanconfigtestutils.ParseSpan(t, spanStr)
 				start, end := roachpb.RKey(span.Key), roachpb.RKey(span.EndKey)
 				splitKey := store.ComputeSplitKey(ctx, start, end)
 				return fmt.Sprintf("key=%s", string(splitKey))
 
 			case "overlapping":
 				d.ScanArgs(t, "span", &spanStr)
-				span := parseSpan(t, spanStr)
-				entries := store.TestingGetAllOverlapping(ctx, span)
+				span := spanconfigtestutils.ParseSpan(t, spanStr)
+
 				var results []string
-				for _, entry := range entries {
-					results = append(results, printSpanConfigEntry(entry))
-				}
+				_ = store.ForEachOverlapping(ctx, span,
+					func(entry roachpb.SpanConfigEntry) error {
+						results = append(results, spanconfigtestutils.PrintSpanConfigEntry(entry))
+						return nil
+					},
+				)
 				return strings.Join(results, "\n")
 
 			default:
+				t.Fatalf("unknown command: %s", d.Cmd)
 			}
 
-			t.Fatalf("unknown command: %s", d.Cmd)
 			return ""
 		})
 	})
@@ -241,85 +163,187 @@ func TestRandomized(t *testing.T) {
 			startIdx, endIdx = endIdx, startIdx
 		}
 		spanStr := fmt.Sprintf("[%s, %s)", string(alphabet[startIdx]), string(alphabet[endIdx]))
-		sp := parseSpan(t, spanStr)
+		sp := spanconfigtestutils.ParseSpan(t, spanStr)
 		require.True(t, sp.Valid())
 		return sp
 	}
 
 	getRandomConf := func() roachpb.SpanConfig {
 		confStr := fmt.Sprintf("conf_%s", string(configs[rand.Intn(len(configs))]))
-		return parseConfig(t, confStr)
+		return spanconfigtestutils.ParseConfig(t, confStr)
 	}
 
 	getRandomOp := func() string {
 		return ops[rand.Intn(2)]
 	}
 
-	testSpan := parseSpan(t, "[f,g)") // pin a single character span to test with
+	getRandomUpdate := func() spanconfig.Update {
+		sp, conf, op := genRandomSpan(), getRandomConf(), getRandomOp()
+		switch op {
+		case "set":
+			return spanconfig.Addition(sp, conf)
+		case "del":
+			return spanconfig.Deletion(sp)
+		default:
+		}
+		t.Fatalf("unexpected op: %s", op)
+		return spanconfig.Update{}
+	}
+
+	getRandomUpdates := func() []spanconfig.Update {
+		numUpdates := 1 + rand.Intn(3)
+		updates := make([]spanconfig.Update, numUpdates)
+		for {
+			for i := 0; i < numUpdates; i++ {
+				updates[i] = getRandomUpdate()
+			}
+			sort.Slice(updates, func(i, j int) bool {
+				return updates[i].Span.Key.Compare(updates[j].Span.Key) < 0
+			})
+			invalid := false
+			for i := 1; i < numUpdates; i++ {
+				if updates[i].Span.Overlaps(updates[i-1].Span) {
+					invalid = true
+				}
+			}
+
+			if invalid {
+				continue // try again
+			}
+
+			rand.Shuffle(len(updates), func(i, j int) {
+				updates[i], updates[j] = updates[j], updates[i]
+			})
+			return updates
+		}
+	}
+
+	testSpan := spanconfigtestutils.ParseSpan(t, "[f,g)") // pin a single character span to test with
 	var expConfig roachpb.SpanConfig
 	var expFound bool
 
 	const numOps = 5000
 	store := New(roachpb.TestingDefaultSpanConfig())
 	for i := 0; i < numOps; i++ {
-		sp, conf, op := genRandomSpan(), getRandomConf(), getRandomOp()
-		switch op {
-		case "set":
-			store.Apply(ctx, spanconfig.Update{Span: sp, Config: conf}, false)
-			if testSpan.Overlaps(sp) {
-				expConfig, expFound = conf, true
+		updates := getRandomUpdates()
+		store.Apply(ctx, false /* dryrun */, updates...)
+		for _, update := range updates {
+			if testSpan.Overlaps(update.Span) {
+				if update.Addition() {
+					expConfig, expFound = update.Config, true
+				} else {
+					expConfig, expFound = roachpb.SpanConfig{}, false
+				}
 			}
-		case "del":
-			store.Apply(ctx, spanconfig.Update{Span: sp}, false)
-			if testSpan.Overlaps(sp) {
-				expConfig, expFound = roachpb.SpanConfig{}, false
-			}
-		default:
-			t.Fatalf("unexpected op: %s", op)
 		}
 	}
 
-	overlappingConfigs := store.TestingGetAllOverlapping(ctx, testSpan)
 	if !expFound {
-		require.Len(t, overlappingConfigs, 0)
+		_ = store.ForEachOverlapping(ctx, testSpan,
+			func(entry roachpb.SpanConfigEntry) error {
+				t.Fatalf("found unexpected entry: %s",
+					spanconfigtestutils.PrintSpanConfigEntry(entry))
+				return nil
+			},
+		)
 	} else {
-		// Check to see that the set of overlapping span configs is exactly what
-		// we expect.
-		require.Len(t, overlappingConfigs, 1)
-		gotSpan, gotConfig := overlappingConfigs[0].Span, overlappingConfigs[0].Config
+		var foundEntry roachpb.SpanConfigEntry
+		_ = store.ForEachOverlapping(ctx, testSpan,
+			func(entry roachpb.SpanConfigEntry) error {
+				if !foundEntry.Empty() {
+					t.Fatalf("expected single overlapping entry, found second: %s",
+						spanconfigtestutils.PrintSpanConfigEntry(entry))
+				}
+				foundEntry = entry
 
-		require.Truef(t, gotSpan.Contains(testSpan),
-			"improper result: expected retrieved span (%s) to contain test span (%s)",
-			printSpan(gotSpan), printSpan(testSpan))
+				// Check that the entry is exactly what we'd expect.
+				gotSpan, gotConfig := entry.Span, entry.Config
+				require.Truef(t, gotSpan.Contains(testSpan),
+					"improper result: expected retrieved span (%s) to contain test span (%s)",
+					spanconfigtestutils.PrintSpan(gotSpan), spanconfigtestutils.PrintSpan(testSpan))
 
-		require.Truef(t, expConfig.Equal(gotConfig),
-			"mismatched configs: expected %s, got %s",
-			printSpanConfig(expConfig), printSpanConfig(gotConfig))
+				require.Truef(t, expConfig.Equal(gotConfig),
+					"mismatched configs: expected %s, got %s",
+					spanconfigtestutils.PrintSpanConfig(expConfig), spanconfigtestutils.PrintSpanConfig(gotConfig))
+
+				return nil
+			},
+		)
 
 		// Ensure that the config accessed through the StoreReader interface is
 		// the same as above.
 		storeReaderConfig, err := store.GetSpanConfigForKey(ctx, roachpb.RKey(testSpan.Key))
 		require.NoError(t, err)
-		require.True(t, gotConfig.Equal(storeReaderConfig))
+		require.True(t, foundEntry.Config.Equal(storeReaderConfig))
 	}
 
-	var last roachpb.SpanConfigEntry
-	everythingSpan := parseSpan(t, fmt.Sprintf("[%s,%s)",
+	everythingSpan := spanconfigtestutils.ParseSpan(t, fmt.Sprintf("[%s,%s)",
 		string(alphabet[0]), string(alphabet[len(alphabet)-1])))
-	for i, cur := range store.TestingGetAllOverlapping(ctx, everythingSpan) {
-		if i == 0 {
-			last = cur
-			continue
-		}
 
-		// Span configs are returned in strictly sorted order.
-		require.True(t, last.Span.Key.Compare(cur.Span.Key) < 0,
-			"expected to find spans in strictly sorted order, found %s then %s",
-			printSpan(last.Span), printSpan(cur.Span))
+	var last roachpb.SpanConfigEntry
+	_ = store.ForEachOverlapping(ctx, everythingSpan,
+		func(cur roachpb.SpanConfigEntry) error {
+			// All spans are expected to be valid.
+			require.True(t, cur.Span.Valid(),
+				"expected to only find valid spans, found %s",
+				spanconfigtestutils.PrintSpan(cur.Span),
+			)
 
-		// Span configs must also be non-overlapping.
-		require.Falsef(t, last.Span.Overlaps(cur.Span),
-			"expected non-overlapping spans, found %s and %s",
-			printSpan(last.Span), printSpan(cur.Span))
+			if last.Empty() {
+				last = cur
+				return nil
+			}
+
+			// Span configs are returned in strictly sorted order.
+			require.True(t, last.Span.Key.Compare(cur.Span.Key) < 0,
+				"expected to find spans in strictly sorted order, found %s then %s",
+				spanconfigtestutils.PrintSpan(last.Span), spanconfigtestutils.PrintSpan(cur.Span))
+
+			// Span configs must also be non-overlapping.
+			require.Falsef(t, last.Span.Overlaps(cur.Span),
+				"expected non-overlapping spans, found %s and %s",
+				spanconfigtestutils.PrintSpan(last.Span), spanconfigtestutils.PrintSpan(cur.Span))
+
+			return nil
+		},
+	)
+}
+
+// TestStoreClone verifies that a cloned store contains the same contents as the
+// original.
+func TestStoreClone(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
+	everything := spanconfigtestutils.ParseSpan(t, "[a, z)")
+	updates := []spanconfig.Update{
+		spanconfig.Addition(spanconfigtestutils.ParseSpan(t, "[a, b)"), spanconfigtestutils.ParseConfig(t, "A")),
+		spanconfig.Addition(spanconfigtestutils.ParseSpan(t, "[c, d)"), spanconfigtestutils.ParseConfig(t, "C")),
+		spanconfig.Addition(spanconfigtestutils.ParseSpan(t, "[e, f)"), spanconfigtestutils.ParseConfig(t, "E")),
+	}
+
+	original := New(roachpb.TestingDefaultSpanConfig())
+	original.Apply(ctx, false, updates...)
+	clone := original.Copy(ctx)
+
+	var originalEntries, clonedEntries []roachpb.SpanConfigEntry
+	_ = original.ForEachOverlapping(ctx, everything,
+		func(entry roachpb.SpanConfigEntry) error {
+			originalEntries = append(originalEntries, entry)
+			return nil
+		},
+	)
+
+	_ = clone.ForEachOverlapping(ctx, everything,
+		func(entry roachpb.SpanConfigEntry) error {
+			clonedEntries = append(clonedEntries, entry)
+			return nil
+		},
+	)
+
+	require.Equal(t, len(originalEntries), len(clonedEntries))
+	for i := 0; i < len(originalEntries); i++ {
+		require.True(t, originalEntries[i].Equal(clonedEntries[i]))
 	}
 }

@@ -29,6 +29,8 @@
 </span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
+<tr><td><a name="array_append"></a><code>array_append(array: anyenum[], elem: anyenum) &rarr; anyenum[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: box2d[], elem: box2d) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: geography[], elem: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -70,6 +72,8 @@
 <tr><td><a name="array_cat"></a><code>array_cat(left: <a href="timestamp.html">timestamptz</a>[], right: <a href="timestamp.html">timestamptz</a>[]) &rarr; <a href="timestamp.html">timestamptz</a>[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: <a href="uuid.html">uuid</a>[], right: <a href="uuid.html">uuid</a>[]) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
+</span></td></tr>
+<tr><td><a name="array_cat"></a><code>array_cat(left: anyenum[], right: anyenum[]) &rarr; anyenum[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: box2d[], right: box2d[]) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td></tr>
@@ -117,6 +121,8 @@
 </span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
+<tr><td><a name="array_position"></a><code>array_position(array: anyenum[], elem: anyenum) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
+</span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: box2d[], elem: box2d) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: geography[], elem: geography) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
@@ -158,6 +164,8 @@
 <tr><td><a name="array_positions"></a><code>array_positions(array: <a href="timestamp.html">timestamptz</a>[], elem: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
+</span></td></tr>
+<tr><td><a name="array_positions"></a><code>array_positions(array: anyenum[], elem: anyenum) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: box2d[], elem: box2d) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td></tr>
@@ -201,6 +209,8 @@
 </span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: <a href="uuid.html">uuid</a>, array: <a href="uuid.html">uuid</a>[]) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
+<tr><td><a name="array_prepend"></a><code>array_prepend(elem: anyenum, array: anyenum[]) &rarr; anyenum[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: box2d, array: box2d[]) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: geography, array: geography[]) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -243,6 +253,8 @@
 </span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: <a href="uuid.html">uuid</a>[], elem: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td></tr>
+<tr><td><a name="array_remove"></a><code>array_remove(array: anyenum[], elem: anyenum) &rarr; anyenum[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
+</span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: box2d[], elem: box2d) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: geography[], elem: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
@@ -284,6 +296,8 @@
 <tr><td><a name="array_replace"></a><code>array_replace(array: <a href="timestamp.html">timestamptz</a>[], toreplace: <a href="timestamp.html">timestamptz</a>, replacewith: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="timestamp.html">timestamptz</a>[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: <a href="uuid.html">uuid</a>[], toreplace: <a href="uuid.html">uuid</a>, replacewith: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
+</span></td></tr>
+<tr><td><a name="array_replace"></a><code>array_replace(array: anyenum[], toreplace: anyenum, replacewith: anyenum) &rarr; anyenum[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: box2d[], toreplace: box2d, replacewith: box2d) &rarr; box2d[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td></tr>
@@ -350,6 +364,21 @@
 <tr><td><a name="num_nonnulls"></a><code>num_nonnulls(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of nonnull arguments.</p>
 </span></td></tr>
 <tr><td><a name="num_nulls"></a><code>num_nulls(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of null arguments.</p>
+</span></td></tr></tbody>
+</table>
+
+### Cryptographic functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="digest"></a><code>digest(data: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Computes a binary hash of the given <code>data</code>. <code>type</code> is the algorithm to use (md5, sha1, sha224, sha256, sha384, or sha512).</p>
+</span></td></tr>
+<tr><td><a name="digest"></a><code>digest(data: <a href="string.html">string</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Computes a binary hash of the given <code>data</code>. <code>type</code> is the algorithm to use (md5, sha1, sha224, sha256, sha384, or sha512).</p>
+</span></td></tr>
+<tr><td><a name="hmac"></a><code>hmac(data: <a href="bytes.html">bytes</a>, key: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Calculates hashed MAC for <code>data</code> with key <code>key</code>. <code>type</code> is the same as in <code>digest()</code>.</p>
+</span></td></tr>
+<tr><td><a name="hmac"></a><code>hmac(data: <a href="string.html">string</a>, key: <a href="string.html">string</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Calculates hashed MAC for <code>data</code> with key <code>key</code>. <code>type</code> is the same as in <code>digest()</code>.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -420,6 +449,33 @@ has no relationship with the commit order of concurrent transactions.</p>
 and which stays constant throughout the transaction. This timestamp
 has no relationship with the commit order of concurrent transactions.</p>
 <p>This function is the preferred overload and will be evaluated by default.</p>
+</span></td></tr>
+<tr><td><a name="date_part"></a><code>date_part(element: <a href="string.html">string</a>, input: <a href="date.html">date</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.</p>
+<p>Compatible elements: millennium, century, decade, year, isoyear,
+quarter, month, week, dayofweek, isodow, dayofyear, julian,
+hour, minute, second, millisecond, microsecond, epoch</p>
+</span></td></tr>
+<tr><td><a name="date_part"></a><code>date_part(element: <a href="string.html">string</a>, input: <a href="interval.html">interval</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.</p>
+<p>Compatible elements: millennium, century, decade, year,
+month, day, hour, minute, second, millisecond, microsecond, epoch</p>
+</span></td></tr>
+<tr><td><a name="date_part"></a><code>date_part(element: <a href="string.html">string</a>, input: <a href="time.html">time</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.</p>
+<p>Compatible elements: hour, minute, second, millisecond, microsecond, epoch</p>
+</span></td></tr>
+<tr><td><a name="date_part"></a><code>date_part(element: <a href="string.html">string</a>, input: <a href="timestamp.html">timestamp</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.</p>
+<p>Compatible elements: millennium, century, decade, year, isoyear,
+quarter, month, week, dayofweek, isodow, dayofyear, julian,
+hour, minute, second, millisecond, microsecond, epoch</p>
+</span></td></tr>
+<tr><td><a name="date_part"></a><code>date_part(element: <a href="string.html">string</a>, input: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.</p>
+<p>Compatible elements: millennium, century, decade, year, isoyear,
+quarter, month, week, dayofweek, isodow, dayofyear, julian,
+hour, minute, second, millisecond, microsecond, epoch,
+timezone, timezone_hour, timezone_minute</p>
+</span></td></tr>
+<tr><td><a name="date_part"></a><code>date_part(element: <a href="string.html">string</a>, input: timetz) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Extracts <code>element</code> from <code>input</code>.</p>
+<p>Compatible elements: hour, minute, second, millisecond, microsecond, epoch,
+timezone, timezone_hour, timezone_minute</p>
 </span></td></tr>
 <tr><td><a name="date_trunc"></a><code>date_trunc(element: <a href="string.html">string</a>, input: <a href="date.html">date</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Truncates <code>input</code> to precision <code>element</code>.  Sets all fields that are less
 significant than <code>element</code> to zero (or one, for day and month)</p>
@@ -911,6 +967,8 @@ available replica will error.</p>
 <tr><td><a name="json_strip_nulls"></a><code>json_strip_nulls(from_json: jsonb) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns from_json with all object fields that have null values omitted. Other null values are untouched.</p>
 </span></td></tr>
 <tr><td><a name="json_typeof"></a><code>json_typeof(val: jsonb) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the type of the outermost JSON value as a text string.</p>
+</span></td></tr>
+<tr><td><a name="json_valid"></a><code>json_valid(string: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the given string is a valid JSON or not</p>
 </span></td></tr>
 <tr><td><a name="jsonb_array_length"></a><code>jsonb_array_length(json: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of elements in the outermost JSON or JSONB array.</p>
 </span></td></tr>
@@ -2475,6 +2533,12 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
 <tr><td><a name="crdb_internal.complete_stream_ingestion_job"></a><code>crdb_internal.complete_stream_ingestion_job(job_id: <a href="int.html">int</a>, cutover_ts: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used to signal a running stream ingestion job to complete. The job will eventually stop ingesting, revert to the specified timestamp and leave the cluster in a consistent state. The specified timestamp can only be specified up to the microsecond. This function does not wait for the job to reach a terminal state, but instead returns the job id as soon as it has signaled the job to complete. This builtin can be used in conjunction with SHOW JOBS WHEN COMPLETE to ensure that the job has left the cluster in a consistent state.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.replication_stream_progress"></a><code>crdb_internal.replication_stream_progress(stream_id: <a href="int.html">int</a>, frontier_ts: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function can be used on the consumer side to heartbeat its replication progress to a replication stream in the source cluster. The returns a StreamReplicationStatus message that indicates stream status (RUNNING, PAUSED, or STOPPED).</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.start_replication_stream"></a><code>crdb_internal.start_replication_stream(tenant_id: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used on the producer side to start a replication stream for the specified tenant. The returned stream ID uniquely identifies created stream. The caller must periodically invoke crdb_internal.heartbeat_stream() function to notify that the replication is still ongoing.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.stream_partition"></a><code>crdb_internal.stream_partition(stream_id: <a href="int.html">int</a>, partition_spec: <a href="bytes.html">bytes</a>) &rarr; tuple{bytes AS stream_event}</code></td><td><span class="funcdesc"><p>Stream partition data</p>
 </span></td></tr></tbody>
 </table>
 
@@ -2517,6 +2581,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="convert_to"></a><code>convert_to(str: <a href="string.html">string</a>, enc: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encode the string <code>str</code> as a byte array using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.decode_plan_gist"></a><code>crdb_internal.decode_plan_gist(gist: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of output similar to EXPLAIN from a gist created by EXPLAIN (GIST)</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.show_create_all_schemas"></a><code>crdb_internal.show_create_all_schemas(database_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of CREATE schema statements.
 The output can be used to recreate a database.’</p>
 </span></td></tr>
@@ -2526,6 +2592,9 @@ by dependencies. All foreign keys are added after the creation of the table
 in the alter statements.
 It is not recommended to perform this operation on a database with many
 tables.
+The output can be used to recreate a database.’</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.show_create_all_types"></a><code>crdb_internal.show_create_all_types(database_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of CREATE type statements.
 The output can be used to recreate a database.’</p>
 </span></td></tr>
 <tr><td><a name="decode"></a><code>decode(text: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
@@ -2831,9 +2900,13 @@ may increase either contention or retry errors, or both.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.approximate_timestamp"></a><code>crdb_internal.approximate_timestamp(timestamp: <a href="decimal.html">decimal</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Converts the crdb_internal_mvcc_timestamp column into an approximate timestamp.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.assignment_cast"></a><code>crdb_internal.assignment_cast(val: anyelement, type: anyelement) &rarr; anyelement</code></td><td><span class="funcdesc"><p>This function is used internally to perform assignment casts during mutations.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.check_consistency"></a><code>crdb_internal.check_consistency(stats_only: <a href="bool.html">bool</a>, start_key: <a href="bytes.html">bytes</a>, end_key: <a href="bytes.html">bytes</a>) &rarr; tuple{int AS range_id, bytes AS start_key, string AS start_key_pretty, string AS status, string AS detail}</code></td><td><span class="funcdesc"><p>Runs a consistency check on ranges touching the specified key range. an empty start or end key is treated as the minimum and maximum possible, respectively. stats_only should only be set to false when targeting a small number of ranges to avoid overloading the cluster. Each returned row contains the range ID, the status (a roachpb.CheckConsistencyResponse_Status), and verbose detail.</p>
 <p>Example usage:
 SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.check_password_hash_format"></a><code>crdb_internal.check_password_hash_format(password: <a href="bytes.html">bytes</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function checks whether a string is a precomputed password hash. Returns the hash algorithm.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.cluster_id"></a><code>crdb_internal.cluster_id() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Returns the cluster ID.</p>
 </span></td></tr>
@@ -2859,12 +2932,15 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.get_database_id"></a><code>crdb_internal.get_database_id(name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td></td></tr>
 <tr><td><a name="crdb_internal.get_namespace_id"></a><code>crdb_internal.get_namespace_id(parent_id: <a href="int.html">int</a>, name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td></td></tr>
+<tr><td><a name="crdb_internal.get_namespace_id"></a><code>crdb_internal.get_namespace_id(parent_id: <a href="int.html">int</a>, parent_schema_id: <a href="int.html">int</a>, name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td></td></tr>
 <tr><td><a name="crdb_internal.get_vmodule"></a><code>crdb_internal.get_vmodule() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the vmodule configuration on the gateway node processing this request.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.get_zone_config"></a><code>crdb_internal.get_zone_config(namespace_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td></td></tr>
 <tr><td><a name="crdb_internal.has_role_option"></a><code>crdb_internal.has_role_option(option: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the current user has the specified role option</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.is_admin"></a><code>crdb_internal.is_admin() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Retrieves the current user’s admin status.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.is_at_least_version"></a><code>crdb_internal.is_at_least_version(version: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the cluster version is not older than the argument.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.lease_holder"></a><code>crdb_internal.lease_holder(key: <a href="bytes.html">bytes</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used to fetch the leaseholder corresponding to a request key</p>
 </span></td></tr>
@@ -2894,7 +2970,7 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: jsonb, version: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
-<tr><td><a name="crdb_internal.payloads_for_span"></a><code>crdb_internal.payloads_for_span(span_id: <a href="int.html">int</a>) &rarr; tuple{string AS payload_type, jsonb AS payload_jsonb}</code></td><td><span class="funcdesc"><p>Returns the payload(s) of the requested span.</p>
+<tr><td><a name="crdb_internal.payloads_for_span"></a><code>crdb_internal.payloads_for_span(span_id: <a href="int.html">int</a>) &rarr; tuple{string AS payload_type, jsonb AS payload_jsonb}</code></td><td><span class="funcdesc"><p>Returns the payload(s) of the requested span and all its children.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.payloads_for_trace"></a><code>crdb_internal.payloads_for_trace(trace_id: <a href="int.html">int</a>) &rarr; tuple{int AS span_id, string AS payload_type, jsonb AS payload_jsonb}</code></td><td><span class="funcdesc"><p>Returns the payload(s) of the requested trace.</p>
 </span></td></tr>
@@ -2903,6 +2979,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.pretty_span"></a><code>crdb_internal.pretty_span(raw_key_start: <a href="bytes.html">bytes</a>, raw_key_end: <a href="bytes.html">bytes</a>, skip_fields: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.range_stats"></a><code>crdb_internal.range_stats(key: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>This function is used to retrieve range statistics information as a JSON object.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.reset_index_usage_stats"></a><code>crdb_internal.reset_index_usage_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected index usage statistics.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.reset_sql_stats"></a><code>crdb_internal.reset_sql_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected SQL statistics.</p>
 </span></td></tr>
@@ -2919,6 +2997,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.set_vmodule"></a><code>crdb_internal.set_vmodule(vmodule_string: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the equivalent of the <code>--vmodule</code> flag on the gateway node processing this request; it affords control over the logging verbosity of different files. Example syntax: <code>crdb_internal.set_vmodule('recordio=2,file=1,gfs*=3')</code>. Reset with: <code>crdb_internal.set_vmodule('')</code>. Raising the verbosity can severely affect performance.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.trace_id"></a><code>crdb_internal.trace_id() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the current trace ID or an error if no trace is open.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.void_func"></a><code>crdb_internal.void_func() &rarr; void</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="current_database"></a><code>current_database() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current database.</p>
 </span></td></tr>

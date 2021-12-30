@@ -12,6 +12,7 @@ package xform
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
@@ -185,41 +186,11 @@ func (c *CustomFuncs) GenerateStreamingGroupBy(
 	orders := ordering.DeriveInterestingOrderings(input)
 	intraOrd := private.Ordering
 	for _, ord := range orders {
-		o := ord.ToOrdering()
-		// We are looking for a prefix of o that satisfies the intra-group ordering
-		// if we ignore grouping columns.
-		oIdx, intraIdx := 0, 0
-		for ; oIdx < len(o); oIdx++ {
-			oCol := o[oIdx].ID()
-			if private.GroupingCols.Contains(oCol) || intraOrd.Optional.Contains(oCol) {
-				// Grouping or optional column.
-				continue
-			}
-
-			if intraIdx < len(intraOrd.Columns) &&
-				intraOrd.Columns[intraIdx].Group.Contains(oCol) &&
-				intraOrd.Columns[intraIdx].Descending == o[oIdx].Descending() {
-				// Column matches the one in the ordering.
-				intraIdx++
-				continue
-			}
-			break
-		}
-		if oIdx == 0 || intraIdx < len(intraOrd.Columns) {
-			// No match.
+		newOrd, fullPrefix, found := getPrefixFromOrdering(ord.ToOrdering(), intraOrd, input,
+			func(id opt.ColumnID) bool { return private.GroupingCols.Contains(id) })
+		if !found || !fullPrefix {
 			continue
 		}
-		o = o[:oIdx]
-
-		var newOrd props.OrderingChoice
-		newOrd.FromOrderingWithOptCols(o, opt.ColSet{})
-
-		// Simplify the ordering according to the input's FDs. Note that this is not
-		// necessary for correctness because buildChildPhysicalProps would do it
-		// anyway, but doing it here once can make things more efficient (and we may
-		// generate fewer expressions if some of these orderings turn out to be
-		// equivalent).
-		newOrd.Simplify(&input.Relational().FuncDeps)
 
 		newPrivate := *private
 		newPrivate.Ordering = newOrd
@@ -352,7 +323,7 @@ func (c *CustomFuncs) SplitGroupByScanIntoUnionScans(
 			break
 		}
 		if len(intraOrd.Columns) > 0 &&
-			intraOrd.Columns[0].Group.Contains(col) {
+			intraOrd.Group(0).Contains(col) {
 			// Column matches the one in the ordering.
 			keyPrefixLength = i
 			break
@@ -393,4 +364,85 @@ func (c *CustomFuncs) MakeGroupingPrivate(
 		NullsAreDistinct: nullsAreDistinct,
 		ErrorOnDup:       errorText,
 	}
+}
+
+// GenerateLimitedGroupByScans enumerates all non-inverted secondary indexes on
+// the given Scan operator's table and generates an alternate Scan operator for
+// each index that includes a partial set of needed columns specified in the
+// ScanOpDef. An IndexJoin is constructed to add missing columns. A GroupBy and
+// Limit are also constructed to make an equivalent expression for the memo.
+//
+// For cases where the Scan's secondary index covers all needed columns, see
+// GenerateIndexScans, which does not construct an IndexJoin.
+func (c *CustomFuncs) GenerateLimitedGroupByScans(
+	grp memo.RelExpr,
+	sp *memo.ScanPrivate,
+	aggs memo.AggregationsExpr,
+	gp *memo.GroupingPrivate,
+	limit opt.ScalarExpr,
+	required props.OrderingChoice,
+) {
+	// If the required ordering and grouping columns do not share columns, then
+	// this optimization is not beneficial.
+	if !required.Any() && !required.Group(0).Intersects(gp.GroupingCols) && !required.Optional.Intersects(gp.GroupingCols) {
+		return
+	}
+	// Iterate over all non-inverted and non-partial secondary indexes.
+	var pkCols opt.ColSet
+	var iter scanIndexIter
+	var sb indexScanBuilder
+	sb.Init(c, sp.Table)
+	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, sp, nil /* filters */, rejectPrimaryIndex|rejectInvertedIndexes)
+	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool, constProj memo.ProjectionsExpr) {
+		// The iterator only produces pseudo-partial indexes (the predicate is
+		// true) because no filters are passed to iter.Init to imply a partial
+		// index predicate. constProj is a projection of constant values based
+		// on a partial index predicate. It should always be empty because a
+		// pseudo-partial index cannot hold a column constant. If it is not, we
+		// panic to avoid performing a logically incorrect transformation.
+		if len(constProj) != 0 {
+			panic(errors.AssertionFailedf("expected constProj to be empty"))
+		}
+
+		// If the secondary index includes the set of needed columns, then this
+		// case does not need a limited group by and will be covered in
+		// GenerateIndexScans.
+		if isCovering {
+			return
+		}
+
+		// Calculate the PK columns once.
+		if pkCols.Empty() {
+			pkCols = c.PrimaryKeyCols(sp.Table)
+		}
+
+		// If the first index column is not in the grouping columns, then there is
+		// no benefit to exploring this index.
+		if col := sp.Table.ColumnID(index.Column(0).Ordinal()); !gp.GroupingCols.Contains(col) {
+			return
+		}
+
+		// If the index doesn't contain any of the required order columns, then
+		// there is no benefit to exploring this index.
+		if !required.Any() && !required.Group(0).Intersects(indexCols) {
+			return
+		}
+
+		// Scan whatever columns we need which are available from the index.
+		newScanPrivate := *sp
+		newScanPrivate.Index = index.Ordinal()
+		newScanPrivate.Cols = indexCols.Intersection(sp.Cols)
+		// If the index is not covering, scan the needed index columns plus
+		// primary key columns.
+		newScanPrivate.Cols.UnionWith(pkCols)
+		sb.SetScan(&newScanPrivate)
+		// Construct an IndexJoin operator that provides the columns missing from
+		// the index.
+		sb.AddIndexJoin(sp.Cols)
+		input := sb.BuildNewExpr()
+		// Reconstruct the GroupBy and Limit so the new expression in the memo is
+		// equivalent.
+		input = c.e.f.ConstructGroupBy(input, aggs, gp)
+		grp.Memo().AddLimitToGroup(&memo.LimitExpr{Limit: limit, Ordering: required, Input: input}, grp)
+	})
 }

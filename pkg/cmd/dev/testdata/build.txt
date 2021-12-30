@@ -42,6 +42,8 @@ mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no
 rm go/src/github.com/cockroachdb/cockroach/cockroach-short
 ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/cmd/cockroach-short/cockroach-short_/cockroach-short go/src/github.com/cockroachdb/cockroach/cockroach-short
+git status --ignored --short go/src/github.com/cockroachdb/cockroach/pkg
+rm pkg/file_to_delete.go
 find /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg -name *.go
 cat go/src/github.com/cockroachdb/cockroach/build/bazelutil/checked_in_genfiles.txt
 cp /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/kv/kvserver/kvserver_go_proto_/github.com/cockroachdb/cockroach/pkg/kv/kvserver/storage_services.pb.go go/src/github.com/cockroachdb/cockroach/pkg/kv/kvserver/storage_services.pb.go
@@ -84,3 +86,13 @@ bazel build //pkg/roachpb:roachpb_test --config=test
 bazel info workspace --color=no
 mkdir go/src/github.com/cockroachdb/cockroach/bin
 bazel info bazel-bin --color=no
+
+dev build pkg/foo/...
+----
+bazel query pkg/foo/... --output=label_kind
+bazel build //pkg/foo:bar //pkg/foo:baz --config=test
+bazel info workspace --color=no
+mkdir go/src/github.com/cockroachdb/cockroach/bin
+bazel info bazel-bin --color=no
+rm go/src/github.com/cockroachdb/cockroach/bin/bar
+ln -s /private/var/tmp/_bazel/99e666e4e674209ecdb66b46371278df/execroot/cockroach/bazel-out/darwin-fastbuild/bin/pkg/foo/bar_/bar go/src/github.com/cockroachdb/cockroach/bin/bar

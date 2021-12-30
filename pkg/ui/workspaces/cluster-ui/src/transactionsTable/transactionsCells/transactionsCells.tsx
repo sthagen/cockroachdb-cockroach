@@ -8,62 +8,69 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import React from "react";
+import { Link } from "react-router-dom";
 import { getHighlightedText } from "src/highlightedText";
-import { Anchor } from "src/anchor";
 import { Tooltip } from "@cockroachlabs/ui-components";
-import { summarize } from "src/util/sql/summarize";
-import { shortStatement } from "src/statementsTable/statementsTable";
-import { statementsSql } from "src/util";
 import { limitText } from "../utils";
 import classNames from "classnames/bind";
 import statementsStyles from "../../statementsTable/statementsTableContent.module.scss";
 import transactionsCellsStyles from "./transactionsCells.module.scss";
-import Long from "long";
+import { TransactionLinkTarget } from "../transactionsTable";
 
 const statementsCx = classNames.bind(statementsStyles);
 const ownCellStyles = classNames.bind(transactionsCellsStyles);
 const descriptionClassName = statementsCx("cl-table-link__description");
-
 const textWrapper = ownCellStyles("text-wrapper");
 const hoverAreaClassName = ownCellStyles("hover-area");
 
-type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
-
 interface TextCellProps {
   transactionText: string;
-  onClick: () => void;
+  transactionSummary: string;
+  aggregatedTs: string;
+  transactionFingerprintId: string;
   search: string;
 }
 
-export const textCell = ({
+export const transactionLink = ({
   transactionText,
-  onClick,
+  transactionSummary,
+  aggregatedTs,
+  transactionFingerprintId,
   search,
 }: TextCellProps): React.ReactElement => {
-  const summary = summarize(transactionText);
+  const linkProps = {
+    aggregatedTs,
+    transactionFingerprintId,
+  };
+
   return (
-    <div>
-      <Tooltip
-        placement="bottom"
-        content={
-          <pre className={descriptionClassName}>
-            {getHighlightedText(transactionText, search, true)}
-          </pre>
-        }
-      >
-        <div className={textWrapper}>
-          <div onClick={onClick} className={hoverAreaClassName}>
-            {getHighlightedText(
-              limitText(shortStatement(summary, transactionText), 200),
-              search,
-              false,
-              true,
-            )}
+    <Link to={TransactionLinkTarget(linkProps)}>
+      <div>
+        <Tooltip
+          placement="bottom"
+          content={
+            <pre className={descriptionClassName}>
+              {getHighlightedText(
+                transactionText,
+                search,
+                true /* hasDarkBkg */,
+              )}
+            </pre>
+          }
+        >
+          <div className={textWrapper}>
+            <div className={hoverAreaClassName}>
+              {getHighlightedText(
+                limitText(transactionSummary, 200),
+                search,
+                false /* hasDarkBkg */,
+                true /* isOriginalText */,
+              )}
+            </div>
           </div>
-        </div>
-      </Tooltip>
-    </div>
+        </Tooltip>
+      </div>
+    </Link>
   );
 };

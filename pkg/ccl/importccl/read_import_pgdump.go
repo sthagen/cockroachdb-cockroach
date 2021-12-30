@@ -17,12 +17,14 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -263,7 +265,7 @@ func createPostgresSchemas(
 
 		// We didn't allocate an ID above, so we must assign it a mock ID until it
 		// is assigned an actual ID later in the import.
-		desc.ID = getNextPlaceholderDescID()
+		desc.ID = getNextPlaceholderDescID(execCfg.SystemIDChecker)
 		desc.SetOffline("importing")
 		return desc, nil
 	}
@@ -274,7 +276,7 @@ func createPostgresSchemas(
 		schemaDescs = nil // reset for retries
 		_, dbDesc, err := descriptors.GetImmutableDatabaseByID(ctx, txn, parentID, tree.DatabaseLookupFlags{
 			Required:    true,
-			AvoidCached: true,
+			AvoidLeased: true,
 		})
 		if err != nil {
 			return err
@@ -304,10 +306,11 @@ func createPostgresSequences(
 	walltime int64,
 	owner security.SQLUsername,
 	schemaNameToDesc map[string]*schemadesc.Mutable,
+	execCfg *sql.ExecutorConfig,
 ) ([]*tabledesc.Mutable, error) {
 	ret := make([]*tabledesc.Mutable, 0)
 	for schemaAndTableName, seq := range createSeq {
-		schema, err := getSchemaByNameFromMap(schemaAndTableName, schemaNameToDesc)
+		schema, err := getSchemaByNameFromMap(ctx, schemaAndTableName, schemaNameToDesc, execCfg.Settings.Version)
 		if err != nil {
 			return nil, err
 		}
@@ -317,9 +320,9 @@ func createPostgresSequences(
 			seq.Options,
 			parentID,
 			schema.GetID(),
-			getNextPlaceholderDescID(),
+			getNextPlaceholderDescID(execCfg.SystemIDChecker),
 			hlc.Timestamp{WallTime: walltime},
-			descpb.NewDefaultPrivilegeDescriptor(owner),
+			descpb.NewBasePrivilegeDescriptor(owner),
 			tree.PersistencePermanent,
 			nil, /* params */
 			// If this is multi-region, this will get added by WriteDescriptors.
@@ -336,18 +339,20 @@ func createPostgresSequences(
 }
 
 func getSchemaByNameFromMap(
-	schemaAndTableName schemaAndTableName, schemaNameToDesc map[string]*schemadesc.Mutable,
+	ctx context.Context,
+	schemaAndTableName schemaAndTableName,
+	schemaNameToDesc map[string]*schemadesc.Mutable,
+	version clusterversion.Handle,
 ) (catalog.SchemaDescriptor, error) {
 	var schema catalog.SchemaDescriptor
-	switch schemaAndTableName.schema {
-	case "", "public":
-		schema = schemadesc.GetPublicSchema()
-	default:
-		var ok bool
-		if schema, ok = schemaNameToDesc[schemaAndTableName.schema]; !ok {
-			return nil, errors.Newf("schema %q not found in the schemas created from the pgdump",
-				schema)
-		}
+	if !version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) &&
+		(schemaAndTableName.schema == "" || schemaAndTableName.schema == tree.PublicSchema) {
+		return schemadesc.GetPublicSchema(), nil
+	}
+	var ok bool
+	if schema, ok = schemaNameToDesc[schemaAndTableName.schema]; !ok {
+		return nil, errors.Newf("schema %q not found in the schemas created from the pgdump",
+			schema)
 	}
 	return schema, nil
 }
@@ -367,7 +372,7 @@ func createPostgresTables(
 		if create == nil {
 			continue
 		}
-		schema, err := getSchemaByNameFromMap(schemaAndTableName, schemaNameToDesc)
+		schema, err := getSchemaByNameFromMap(evalCtx.Ctx(), schemaAndTableName, schemaNameToDesc, evalCtx.Settings.Version)
 		if err != nil {
 			return nil, err
 		}
@@ -376,7 +381,7 @@ func createPostgresTables(
 		// type resolver to protect against unexpected behavior on UDT resolution.
 		semaCtxPtr := makeSemaCtxWithoutTypeResolver(p.SemaCtx())
 		desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), semaCtxPtr, p.ExecCfg().Settings,
-			create, parentDB, schema, getNextPlaceholderDescID(), fks, walltime)
+			create, parentDB, schema, getNextPlaceholderDescID(p.ExecCfg().SystemIDChecker), fks, walltime)
 		if err != nil {
 			return nil, err
 		}
@@ -401,7 +406,7 @@ func resolvePostgresFKs(
 		if desc == nil {
 			continue
 		}
-		schema, err := getSchemaByNameFromMap(schemaAndTableName, schemaNameToDesc)
+		schema, err := getSchemaByNameFromMap(evalCtx.Ctx(), schemaAndTableName, schemaNameToDesc, evalCtx.Settings.Version)
 		if err != nil {
 			return err
 		}
@@ -433,8 +438,6 @@ func resolvePostgresFKs(
 	return nil
 }
 
-var placeholderDescID = defaultCSVTableID
-
 // getNextPlaceholderDescID returns a monotonically increasing placeholder ID
 // that is used when creating table, sequence and schema descriptors during the
 // schema parsing phase of a PGDUMP import.
@@ -444,11 +447,16 @@ var placeholderDescID = defaultCSVTableID
 // data. Thus, we pessimistically wait till all the verification steps in the
 // IMPORT have been completed after which we rewrite the descriptor IDs with
 // "real" unique IDs.
-func getNextPlaceholderDescID() descpb.ID {
-	ret := placeholderDescID
-	placeholderDescID++
+func getNextPlaceholderDescID(idChecker keys.SystemIDChecker) descpb.ID {
+	if placeholderID == 0 {
+		placeholderID = descpb.ID(catalogkeys.MinNonDefaultUserDescriptorID(idChecker) + 2)
+	}
+	ret := placeholderID
+	placeholderID++
 	return ret
 }
+
+var placeholderID descpb.ID
 
 // readPostgresCreateTable returns table descriptors for all tables or the
 // matching table from SQL statements.
@@ -504,6 +512,17 @@ func readPostgresCreateTable(
 		schemaNameToDesc[schemaDesc.GetName()] = schemaDesc
 	}
 
+	if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
+		// The database should already have a public schema so we don't have to create
+		// it. However, we do have to add it to the naming map for name resolution.
+		publicSchema, err := getPublicSchemaDescForDatabase(ctx, p.ExecCfg(), parentDB)
+		if err != nil {
+			return nil, nil, err
+		}
+		schemaNameToDesc[tree.PublicSchema] =
+			schemadesc.NewBuilder(publicSchema.SchemaDesc()).BuildExistingMutableSchema()
+	}
+
 	// Construct sequence descriptors.
 	seqs, err := createPostgresSequences(
 		ctx,
@@ -513,6 +532,7 @@ func readPostgresCreateTable(
 		walltime,
 		owner,
 		schemaNameToDesc,
+		p.ExecCfg(),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -613,7 +633,6 @@ func readPostgresStmt(
 			Columns:          stmt.Columns,
 			Storing:          stmt.Storing,
 			Inverted:         stmt.Inverted,
-			Interleave:       stmt.Interleave,
 			PartitionByIndex: stmt.PartitionByIndex,
 			StorageParams:    stmt.StorageParams,
 		}
@@ -841,12 +860,16 @@ func readPostgresStmt(
 		for _, name := range names {
 			tableName := name.ToUnresolvedObjectName().String()
 			if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				err := catalogkv.CheckObjectCollision(
+				dbDesc, err := catalogkv.GetDatabaseDescByID(ctx, txn, p.ExecCfg().Codec, parentID)
+				if err != nil {
+					return err
+				}
+				err = catalogkv.CheckObjectCollision(
 					ctx,
 					txn,
 					p.ExecCfg().Codec,
 					parentID,
-					keys.PublicSchemaID,
+					dbDesc.GetSchemaID(tree.PublicSchema),
 					tree.NewUnqualifiedTableName(tree.Name(tableName)),
 				)
 				if err != nil {

@@ -60,10 +60,11 @@ func TestBatchRequestString(t *testing.T) {
 	ba := roachpb.BatchRequest{}
 	txn := roachpb.MakeTransaction(
 		"test",
-		nil, /* baseKey */
+		nil, // baseKey
 		roachpb.NormalUserPriority,
 		hlc.Timestamp{}, // now
 		0,               // maxOffsetNs
+		99,              // coordinatorNodeID
 	)
 	txn.ID = uuid.NamespaceDNS
 	ba.Txn = &txn
@@ -118,4 +119,26 @@ func TestRangeDescriptorStringRedact(t *testing.T) {
 		`r1:‹{c-g}› [(n1,s1):?, (n2,s2):?, (n3,s3):?, next=0, gen=0]`,
 		redact.Sprint(desc),
 	)
+}
+
+func TestSpansString(t *testing.T) {
+	for _, tc := range []struct {
+		spans    roachpb.Spans
+		expected string
+	}{
+		{
+			spans:    roachpb.Spans{},
+			expected: "",
+		},
+		{
+			spans:    roachpb.Spans{{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")}},
+			expected: "{a-b}",
+		},
+		{
+			spans:    roachpb.Spans{{Key: roachpb.Key("a")}, {Key: roachpb.Key("c"), EndKey: roachpb.Key("d")}},
+			expected: "a, {c-d}",
+		},
+	} {
+		require.Equal(t, tc.expected, tc.spans.String())
+	}
 }

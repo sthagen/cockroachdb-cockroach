@@ -41,20 +41,11 @@ const (
 	TestTimeUntilStoreDeadOff = 24 * time.Hour
 )
 
-// DeclinedReservationsTimeout specifies a duration during which the local
-// replicate queue will not consider stores which have rejected a reservation a
-// viable target.
-var DeclinedReservationsTimeout = settings.RegisterDurationSetting(
-	"server.declined_reservation_timeout",
-	"the amount of time to consider the store throttled for up-replication after a reservation was declined",
-	1*time.Second,
-	settings.NonNegativeDuration,
-)
-
 // FailedReservationsTimeout specifies a duration during which the local
 // replicate queue will not consider stores which have failed a reservation a
 // viable target.
 var FailedReservationsTimeout = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	"server.failed_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a failed reservation call",
 	5*time.Second,
@@ -66,6 +57,7 @@ const timeAfterStoreSuspectSettingName = "server.time_after_store_suspect"
 // TimeAfterStoreSuspect measures how long we consider a store suspect since
 // it's last failure.
 var TimeAfterStoreSuspect = settings.RegisterDurationSetting(
+	settings.TenantWritable,
 	timeAfterStoreSuspectSettingName,
 	"the amount of time we consider a store suspect for after it fails a node liveness heartbeat."+
 		" A suspect node would not receive any new replicas or lease transfers, but will keep the replicas it has.",
@@ -89,6 +81,7 @@ const timeUntilStoreDeadSettingName = "server.time_until_store_dead"
 // TimeUntilStoreDead wraps "server.time_until_store_dead".
 var TimeUntilStoreDead = func() *settings.DurationSetting {
 	s := settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		timeUntilStoreDeadSettingName,
 		"the time after which if there is no new gossiped information about a store, it is considered dead",
 		5*time.Minute,
@@ -360,10 +353,19 @@ type StorePool struct {
 		nodeLocalities map[roachpb.NodeID]localityWithString
 	}
 
-	// isStoreReadyForRoutineReplicaTransfer returns true if the
-	// store is live and thus a good candidate to receive a replica.
-	// This is defined as a closure reference here instead
+	// isStoreReadyForRoutineReplicaTransfer returns true iff the store's node is
+	// live (as indicated by its `NodeLivenessStatus`) and thus a legal candidate
+	// to receive a replica. This is defined as a closure reference here instead
 	// of a regular method so it can be overridden in tests.
+	//
+	// NB: What this method aims to capture is distinct from "dead" nodes. Nodes
+	// are classified as "dead" if they haven't successfully heartbeat their
+	// liveness record in the last `server.time_until_store_dead` seconds.
+	//
+	// Functionally, the distinction is that we simply avoid transferring replicas
+	// to "non-ready" nodes (i.e. nodes that _currently_ have a non-live
+	// `NodeLivenessStatus`), whereas we _actively move replicas off of "dead"
+	// nodes_.
 	isStoreReadyForRoutineReplicaTransfer func(context.Context, roachpb.StoreID) bool
 }
 
@@ -914,7 +916,6 @@ type throttleReason int
 
 const (
 	_ throttleReason = iota
-	throttleDeclined
 	throttleFailed
 )
 
@@ -929,19 +930,10 @@ func (sp *StorePool) throttle(reason throttleReason, why string, storeID roachpb
 	detail := sp.getStoreDetailLocked(storeID)
 	detail.throttledBecause = why
 
-	// If a snapshot is declined, be it due to an error or because it was
-	// rejected, we mark the store detail as having been declined so it won't
-	// be considered as a candidate for new replicas until after the configured
-	// timeout period has passed.
+	// If a snapshot is declined, we mark the store detail as having been declined
+	// so it won't be considered as a candidate for new replicas until after the
+	// configured timeout period has passed.
 	switch reason {
-	case throttleDeclined:
-		timeout := DeclinedReservationsTimeout.Get(&sp.st.SV)
-		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
-		if log.V(2) {
-			ctx := sp.AnnotateCtx(context.TODO())
-			log.Infof(ctx, "snapshot declined (%s), s%d will be throttled for %s until %s",
-				why, storeID, timeout, detail.throttledUntil)
-		}
 	case throttleFailed:
 		timeout := FailedReservationsTimeout.Get(&sp.st.SV)
 		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
@@ -950,6 +942,8 @@ func (sp *StorePool) throttle(reason throttleReason, why string, storeID roachpb
 			log.Infof(ctx, "snapshot failed (%s), s%d will be throttled for %s until %s",
 				why, storeID, timeout, detail.throttledUntil)
 		}
+	default:
+		log.Warningf(sp.AnnotateCtx(context.TODO()), "unknown throttle reason %v", reason)
 	}
 }
 

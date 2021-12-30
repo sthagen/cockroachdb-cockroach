@@ -57,13 +57,13 @@ var (
 	txn2ID       = uuid.MakeV4()
 	txn1TS       = hlc.Timestamp{Logical: 1}
 	txn2TS       = hlc.Timestamp{Logical: 2}
-	txn1         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, WriteTimestamp: txn1TS, MinTimestamp: txn1TS}, ReadTimestamp: txn1TS}
-	txn1Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, WriteTimestamp: txn1TS, MinTimestamp: txn1TS}, ReadTimestamp: txn1TS, Status: roachpb.COMMITTED}
-	txn1Abort    = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, WriteTimestamp: txn1TS, MinTimestamp: txn1TS}, Status: roachpb.ABORTED}
-	txn1e2       = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 2, WriteTimestamp: txn1TS, MinTimestamp: txn1TS}, ReadTimestamp: txn1TS}
-	txn1e2Commit = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 2, WriteTimestamp: txn1TS, MinTimestamp: txn1TS}, ReadTimestamp: txn1TS, Status: roachpb.COMMITTED}
-	txn2         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn2ID, WriteTimestamp: txn2TS, MinTimestamp: txn2TS}, ReadTimestamp: txn2TS}
-	txn2Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn2ID, WriteTimestamp: txn2TS, MinTimestamp: txn2TS}, ReadTimestamp: txn2TS, Status: roachpb.COMMITTED}
+	txn1         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, WriteTimestamp: txn1TS, MinTimestamp: txn1TS, CoordinatorNodeID: 1}, ReadTimestamp: txn1TS}
+	txn1Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, WriteTimestamp: txn1TS, MinTimestamp: txn1TS, CoordinatorNodeID: 1}, ReadTimestamp: txn1TS, Status: roachpb.COMMITTED}
+	txn1Abort    = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, WriteTimestamp: txn1TS, MinTimestamp: txn1TS, CoordinatorNodeID: 1}, Status: roachpb.ABORTED}
+	txn1e2       = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 2, WriteTimestamp: txn1TS, MinTimestamp: txn1TS, CoordinatorNodeID: 1}, ReadTimestamp: txn1TS}
+	txn1e2Commit = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 2, WriteTimestamp: txn1TS, MinTimestamp: txn1TS, CoordinatorNodeID: 1}, ReadTimestamp: txn1TS, Status: roachpb.COMMITTED}
+	txn2         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn2ID, WriteTimestamp: txn2TS, MinTimestamp: txn2TS, CoordinatorNodeID: 2}, ReadTimestamp: txn2TS}
+	txn2Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn2ID, WriteTimestamp: txn2TS, MinTimestamp: txn2TS, CoordinatorNodeID: 2}, ReadTimestamp: txn2TS, Status: roachpb.COMMITTED}
 	value1       = roachpb.MakeValueFromString("testValue1")
 	value2       = roachpb.MakeValueFromString("testValue2")
 	value3       = roachpb.MakeValueFromString("testValue3")
@@ -2274,7 +2274,7 @@ func TestMVCCClearTimeRange(t *testing.T) {
 					})
 
 					// Add an intent at k3@ts3.
-					txn := roachpb.MakeTransaction("test", nil, roachpb.NormalUserPriority, ts3, 1)
+					txn := roachpb.MakeTransaction("test", nil, roachpb.NormalUserPriority, ts3, 1, 1)
 					setupKVsWithIntent := func(t *testing.T) Engine {
 						e := setupKVs(t)
 						require.NoError(t, MVCCPut(ctx, e, &enginepb.MVCCStats{}, testKey3, ts3, value3, &txn))
@@ -2355,7 +2355,7 @@ func TestMVCCClearTimeRangeOnRandomData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 
 	ctx := context.Background()
 
@@ -2757,7 +2757,7 @@ func TestMVCCReverseScanFirstKeyInFuture(t *testing.T) {
 			defer engine.Close()
 
 			// The value at key2 will be at a lower timestamp than the ReverseScan, but
-			// the value at key3 will be at a larger timetamp. The ReverseScan should
+			// the value at key3 will be at a larger timestamp. The ReverseScan should
 			// see key3 and ignore it because none of it versions are at a low enough
 			// timestamp to read. It should then continue scanning backwards and find a
 			// value at key2.
@@ -2952,7 +2952,7 @@ func TestMVCCResolveNewerIntent(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Now, put down an intent which should return a write too old error
-			// (but will still write the intent at tx1Commit.Timestmap+1.
+			// (but will still write the intent at tx1Commit.Timestamp+1.
 			err := MVCCPut(ctx, engine, nil, testKey1, txn1.ReadTimestamp, value2, txn1)
 			if !errors.HasType(err, (*roachpb.WriteTooOldError)(nil)) {
 				t.Fatalf("expected write too old error; got %s", err)
@@ -3683,7 +3683,7 @@ func TestMVCCResolveWithDiffEpochs(t *testing.T) {
 			}
 			num, _, err := MVCCResolveWriteIntentRange(ctx, engine, nil,
 				roachpb.MakeLockUpdate(txn1e2Commit, roachpb.Span{Key: testKey1, EndKey: testKey2.Next()}),
-				2, engine.IsSeparatedIntentsEnabledForTesting(ctx))
+				2)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3884,7 +3884,7 @@ func TestMVCCResolveTxnRange(t *testing.T) {
 
 			num, resumeSpan, err := MVCCResolveWriteIntentRange(ctx, engine, nil,
 				roachpb.MakeLockUpdate(txn1Commit, roachpb.Span{Key: testKey1, EndKey: testKey4.Next()}),
-				math.MaxInt64, engine.IsSeparatedIntentsEnabledForTesting(ctx))
+				math.MaxInt64)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3977,7 +3977,7 @@ func TestMVCCResolveTxnRangeResume(t *testing.T) {
 			// Resolve up to 6 intents: the keys are 000, 033, 066, 099, 1212, 1515.
 			num, resumeSpan, err := MVCCResolveWriteIntentRange(ctx, rw, nil,
 				roachpb.MakeLockUpdate(txn1Commit, roachpb.Span{Key: roachpb.Key("00"), EndKey: roachpb.Key("33")}),
-				6, engine.IsSeparatedIntentsEnabledForTesting(ctx))
+				6)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -4025,7 +4025,7 @@ func TestMVCCResolveTxnRangeResumeWithManyVersions(t *testing.T) {
 			for {
 				// Resolve up to 20 intents.
 				num, resumeSpan, err := MVCCResolveWriteIntentRange(ctx, engine, nil, lockUpdate,
-					20, engine.IsSeparatedIntentsEnabledForTesting(ctx))
+					20)
 				require.NoError(t, err)
 				if resumeSpan == nil {
 					// Last call resolves 0 intents.
@@ -4247,7 +4247,7 @@ func TestRandomizedMVCCResolveWriteIntentRange(t *testing.T) {
 		func() {
 			batch := engs[i].eng.NewBatch()
 			defer batch.Close()
-			_, _, err := MVCCResolveWriteIntentRange(ctx, batch, &engs[i].stats, lu, 0, i == 0)
+			_, _, err := MVCCResolveWriteIntentRange(ctx, batch, &engs[i].stats, lu, 0)
 			require.NoError(t, err)
 			require.NoError(t, batch.Commit(false))
 		}()
@@ -4265,7 +4265,7 @@ func TestRandomizedMVCCResolveWriteIntentRange(t *testing.T) {
 			func() {
 				batch := engs[i].eng.NewBatch()
 				defer batch.Close()
-				_, _, err := MVCCResolveWriteIntentRange(ctx, batch, &engs[i].stats, lu, 0, i == 0)
+				_, _, err := MVCCResolveWriteIntentRange(ctx, batch, &engs[i].stats, lu, 0)
 				require.NoError(t, err)
 				require.NoError(t, batch.Commit(false))
 			}()
@@ -4354,7 +4354,7 @@ func TestRandomizedSavepointRollbackAndIntentResolution(t *testing.T) {
 	}
 	// All the writes are ignored, so DEL is written for the intent. These
 	// should be buffered in the memtable.
-	_, _, err = MVCCResolveWriteIntentRange(ctx, eng, nil, lu, 0, true)
+	_, _, err = MVCCResolveWriteIntentRange(ctx, eng, nil, lu, 0)
 	require.NoError(t, err)
 	{
 		iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind,
@@ -4386,7 +4386,7 @@ func TestRandomizedSavepointRollbackAndIntentResolution(t *testing.T) {
 	if debug {
 		log.Infof(ctx, "LockUpdate: %s", lu.String())
 	}
-	_, _, err = MVCCResolveWriteIntentRange(ctx, eng, nil, lu, 0, false)
+	_, _, err = MVCCResolveWriteIntentRange(ctx, eng, nil, lu, 0)
 	require.NoError(t, err)
 	// Compact the engine so that SINGLEDEL consumes the SETWITHDEL, becoming a
 	// DEL.
@@ -4523,10 +4523,7 @@ func TestFindValidSplitKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	const userID = keys.MinUserDescID
-	const interleave1 = userID + 1
-	const interleave2 = userID + 2
-	const interleave3 = userID + 3
+	userID := keys.TestingUserDescID(0)
 	// Manually creates rows corresponding to the schema:
 	// CREATE TABLE t (id1 STRING, id2 STRING, ... PRIMARY KEY (id1, id2, ...))
 	addTablePrefix := func(prefix roachpb.Key, id uint32, rowVals ...string) roachpb.Key {
@@ -4542,9 +4539,6 @@ func TestFindValidSplitKeys(t *testing.T) {
 	}
 	addColFam := func(rowKey roachpb.Key, colFam uint32) roachpb.Key {
 		return keys.MakeFamilyKey(append([]byte(nil), rowKey...), colFam)
-	}
-	addInterleave := func(rowKey roachpb.Key) roachpb.Key {
-		return encoding.EncodeInterleavedSentinel(rowKey)
 	}
 
 	type testCase struct {
@@ -4734,7 +4728,7 @@ func TestFindValidSplitKeys(t *testing.T) {
 				addColFam(tablePrefix(userID, "b"), 1),
 				addColFam(tablePrefix(userID, "c"), 1),
 			},
-			rangeStart: keys.SystemSQLCodec.TablePrefix(keys.MinUserDescID),
+			rangeStart: keys.SystemSQLCodec.TablePrefix(keys.TestingUserDescID(0)),
 			expSplit:   tablePrefix(userID, "b"),
 			expError:   false,
 		},
@@ -4766,84 +4760,6 @@ func TestFindValidSplitKeys(t *testing.T) {
 			rangeStart: tablePrefix(userID, "a"),
 			expSplit:   tablePrefix(userID, "a", "b"),
 			expError:   false,
-		},
-		// One large first row with interleaved child rows. Check that we can
-		// split before the first interleaved row.
-		{
-			keys: []roachpb.Key{
-				addColFam(tablePrefix(userID, "a"), 0),
-				addColFam(tablePrefix(userID, "a"), 1),
-				addColFam(tablePrefix(userID, "a"), 2),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"), 0),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"), 1),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave2, "c"), 1),
-			},
-			rangeStart: tablePrefix(userID, "a"),
-			expSplit:   addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-			expError:   false,
-		},
-		// One large first row with a double interleaved child row. Check that
-		// we can split before the double interleaved row.
-		{
-			keys: []roachpb.Key{
-				addColFam(tablePrefix(userID, "a"), 0),
-				addColFam(tablePrefix(userID, "a"), 1),
-				addColFam(tablePrefix(userID, "a"), 2),
-				addColFam(addTablePrefix(addInterleave(
-					addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-				), interleave2, "d"), 3),
-			},
-			rangeStart: tablePrefix(userID, "a"),
-			expSplit: addTablePrefix(addInterleave(
-				addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-			), interleave2, "d"),
-			expError: false,
-		},
-		// Two interleaved rows. Check that we can split between them.
-		{
-			keys: []roachpb.Key{
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"), 0),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"), 1),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave2, "c"), 3),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave2, "c"), 4),
-			},
-			rangeStart: addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-			expSplit:   addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave2, "c"),
-			expError:   false,
-		},
-		// Two small rows with interleaved child rows after the second. Check
-		// that we can split before the first interleaved row.
-		{
-			keys: []roachpb.Key{
-				addColFam(tablePrefix(userID, "a"), 0),
-				addColFam(tablePrefix(userID, "b"), 0),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "b")), interleave1, "b"), 0),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "b")), interleave1, "b"), 1),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "b")), interleave2, "c"), 1),
-			},
-			rangeStart: tablePrefix(userID, "a"),
-			expSplit:   addTablePrefix(addInterleave(tablePrefix(userID, "b")), interleave1, "b"),
-			expError:   false,
-		},
-		// A chain of interleaved rows. Check that we can split them.
-		{
-			keys: []roachpb.Key{
-				addColFam(tablePrefix(userID, "a"), 0),
-				addColFam(addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"), 0),
-				addColFam(addTablePrefix(addInterleave(
-					addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-				), interleave2, "c"), 0),
-				addColFam(addTablePrefix(addInterleave(
-					addTablePrefix(addInterleave(
-						addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-					), interleave2, "c"),
-				), interleave3, "d"), 0),
-			},
-			rangeStart: tablePrefix(userID, "a"),
-			expSplit: addTablePrefix(addInterleave(
-				addTablePrefix(addInterleave(tablePrefix(userID, "a")), interleave1, "b"),
-			), interleave2, "c"),
-			expError: false,
 		},
 	}
 
@@ -5275,7 +5191,7 @@ func TestMVCCGarbageCollectUsesSeekLTAppropriately(t *testing.T) {
 		batch := engine.NewBatch()
 		defer batch.Close()
 		it := batch.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
-			UpperBound: keys.UserTableDataMin,
+			UpperBound: keys.TestingUserTableDataMin(),
 			LowerBound: keys.MaxKey,
 		})
 		defer it.Close()

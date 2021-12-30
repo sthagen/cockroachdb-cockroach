@@ -357,7 +357,7 @@ func (r *RangeDescriptor) Validate() error {
 	stores := map[StoreID]struct{}{}
 	for i, rep := range r.Replicas().Descriptors() {
 		if err := rep.Validate(); err != nil {
-			return errors.Errorf("replica %d is invalid: %s", i, err)
+			return errors.Wrapf(err, "replica %d is invalid", i)
 		}
 		if rep.ReplicaID >= r.NextReplicaID {
 			return errors.Errorf("ReplicaID %d must be less than NextReplicaID %d",
@@ -526,6 +526,20 @@ func (p Percentiles) SafeFormat(w redact.SafePrinter, _ rune) {
 		p.P10, p.P25, p.P50, p.P75, p.P90, p.PMax)
 }
 
+func (sc FileStoreProperties) String() string {
+	return redact.StringWithoutMarkers(sc)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (sc FileStoreProperties) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("{path=%s, fs=%s, blkdev=%s, mnt=%s opts=%s}",
+		sc.Path,
+		redact.SafeString(sc.FsType),
+		sc.BlockDevice,
+		sc.MountPoint,
+		sc.MountOptions)
+}
+
 // String returns a string representation of the StoreCapacity.
 func (sc StoreCapacity) String() string {
 	return redact.StringWithoutMarkers(sc)
@@ -536,8 +550,8 @@ func (sc StoreCapacity) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
 		"ranges=%d, leases=%d, queries=%.2f, writes=%.2f, "+
 		"bytesPerReplica={%s}, writesPerReplica={%s}",
-		redact.Safe(humanizeutil.IBytes(sc.Capacity)), redact.Safe(humanizeutil.IBytes(sc.Available)),
-		redact.Safe(humanizeutil.IBytes(sc.Used)), redact.Safe(humanizeutil.IBytes(sc.LogicalBytes)),
+		humanizeutil.IBytes(sc.Capacity), humanizeutil.IBytes(sc.Available),
+		humanizeutil.IBytes(sc.Used), humanizeutil.IBytes(sc.LogicalBytes),
 		sc.RangeCount, sc.LeaseCount, sc.QueriesPerSecond, sc.WritesPerSecond,
 		sc.BytesPerReplica, sc.WritesPerReplica)
 }
@@ -552,7 +566,7 @@ func (sc StoreCapacity) FractionUsed() float64 {
 	// cost, not truly part of the disk's capacity. This means that the disk's
 	// capacity is really just the available space plus cockroach's usage.
 	//
-	// Fall back to a more pessimistic calcuation of disk usage if we don't know
+	// Fall back to a more pessimistic calculation of disk usage if we don't know
 	// how much space the store's data is taking up.
 	if sc.Used == 0 {
 		return float64(sc.Capacity-sc.Available) / float64(sc.Capacity)

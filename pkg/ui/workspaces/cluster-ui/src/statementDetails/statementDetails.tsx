@@ -17,7 +17,7 @@ import { Link, RouteComponentProps } from "react-router-dom";
 import classNames from "classnames/bind";
 import { format as d3Format } from "d3-format";
 import { ArrowLeft } from "@cockroachlabs/icons";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
 import Long from "long";
 
 import {
@@ -33,9 +33,9 @@ import {
   formatNumberForDisplay,
   calculateTotalWorkload,
   unique,
-  summarize,
   queryByName,
   aggregatedTsAttr,
+  aggregationIntervalAttr,
 } from "src/util";
 import { Loading } from "src/loading";
 import { Button } from "src/button";
@@ -60,10 +60,18 @@ import { DiagnosticsView } from "./diagnostics/diagnosticsView";
 import sortedTableStyles from "src/sortedtable/sortedtable.module.scss";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
 import styles from "./statementDetails.module.scss";
+import { commonStyles } from "src/common";
 import { NodeSummaryStats } from "../nodes";
 import { UIConfigState } from "../store";
-import moment, { Moment } from "moment";
+import moment from "moment";
+import { TimeScale, toDateRange } from "../timeScaleDropdown";
 import { StatementsRequest } from "src/api/statementsApi";
+import SQLActivityError from "../sqlActivity/errorComponent";
+import {
+  ActivateDiagnosticsModalRef,
+  ActivateStatementDiagnosticsModal,
+} from "../statementsDiagnostics";
+type IDuration = google.protobuf.IDuration;
 
 const { TabPane } = Tabs;
 
@@ -132,9 +140,14 @@ export interface StatementDetailsDispatchProps {
   refreshStatementDiagnosticsRequests: () => void;
   refreshNodes: () => void;
   refreshNodesLiveness: () => void;
-  createStatementDiagnosticsReport: (statementFingerprint: string) => void;
+  createStatementDiagnosticsReport: (
+    statementFingerprint: string,
+    minExecLatency: IDuration,
+    expiresAfter: IDuration,
+  ) => void;
   dismissStatementDiagnosticsAlertMessage?: () => void;
   onTabChanged?: (tabName: string) => void;
+  onDiagnosticsModalOpen?: (statementFingerprint: string) => void;
   onDiagnosticBundleDownload?: (statementFingerprint?: string) => void;
   onSortingChange?: (
     name: string,
@@ -147,7 +160,7 @@ export interface StatementDetailsDispatchProps {
 export interface StatementDetailsStateProps {
   statement: SingleStatementStatistics;
   statementsError: Error | null;
-  dateRange: [Moment, Moment];
+  timeScale: TimeScale;
   nodeNames: { [nodeId: string]: string };
   nodeRegions: { [nodeId: string]: string };
   diagnosticsReports: cockroach.server.serverpb.IStatementDiagnosticsReport[];
@@ -165,16 +178,17 @@ const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 function statementsRequestFromProps(
   props: StatementDetailsProps,
 ): cockroach.server.serverpb.StatementsRequest {
+  const [start, end] = toDateRange(props.timeScale);
   return new cockroach.server.serverpb.StatementsRequest({
     combined: true,
-    start: Long.fromNumber(props.dateRange[0].unix()),
-    end: Long.fromNumber(props.dateRange[1].unix()),
+    start: Long.fromNumber(start.unix()),
+    end: Long.fromNumber(end.unix()),
   });
 }
 
 function AppLink(props: { app: string }) {
   if (!props.app) {
-    return <span className={cx("app-name", "app-name__unset")}>(unset)</span>;
+    return <Text className={cx("app-name", "app-name__unset")}>(unset)</Text>;
   }
 
   const searchParams = new URLSearchParams({ [appAttr]: props.app });
@@ -182,7 +196,7 @@ function AppLink(props: { app: string }) {
   return (
     <Link
       className={cx("app-name")}
-      to={`/statements/?${searchParams.toString()}`}
+      to={`/sql-activity?tab=Statements&${searchParams.toString()}`}
     >
       {props.app}
     </Link>
@@ -317,6 +331,7 @@ export class StatementDetails extends React.Component<
   StatementDetailsProps,
   StatementDetailsState
 > {
+  activateDiagnosticsRef: React.RefObject<ActivateDiagnosticsModalRef>;
   constructor(props: StatementDetailsProps) {
     super(props);
     const searchParams = new URLSearchParams(props.history.location.search);
@@ -328,6 +343,7 @@ export class StatementDetails extends React.Component<
       },
       currentTab: searchParams.get("tab") || "overview",
     };
+    this.activateDiagnosticsRef = React.createRef();
   }
 
   static defaultProps: Partial<StatementDetailsProps> = {
@@ -385,13 +401,18 @@ export class StatementDetails extends React.Component<
   };
 
   backToStatementsClick = (): void => {
-    this.props.history.push("/statements");
+    this.props.history.push("/sql-activity?tab=Statements");
     if (this.props.onBackToStatementsClick) {
       this.props.onBackToStatementsClick();
     }
   };
 
   render(): React.ReactElement {
+    const {
+      refreshStatementDiagnosticsRequests,
+      createStatementDiagnosticsReport,
+      onDiagnosticsModalOpen,
+    } = this.props;
     const app = queryByName(this.props.location, appAttr);
     return (
       <div className={cx("root")}>
@@ -407,7 +428,7 @@ export class StatementDetails extends React.Component<
           >
             Statements
           </Button>
-          <h3 className={cx("base-heading", "no-margin-bottom")}>
+          <h3 className={commonStyles("base-heading", "no-margin-bottom")}>
             Statement Details
           </h3>
         </div>
@@ -416,6 +437,17 @@ export class StatementDetails extends React.Component<
             loading={_.isNil(this.props.statement)}
             error={this.props.statementsError}
             render={this.renderContent}
+            renderError={() =>
+              SQLActivityError({
+                statsType: "statements",
+              })
+            }
+          />
+          <ActivateStatementDiagnosticsModal
+            ref={this.activateDiagnosticsRef}
+            activate={createStatementDiagnosticsReport}
+            refreshDiagnosticsReports={refreshStatementDiagnosticsRequests}
+            onOpenModal={onDiagnosticsModalOpen}
           />
         </section>
       </div>
@@ -424,7 +456,6 @@ export class StatementDetails extends React.Component<
 
   renderContent = (): React.ReactElement => {
     const {
-      createStatementDiagnosticsReport,
       diagnosticsReports,
       dismissStatementDiagnosticsAlertMessage,
       onDiagnosticBundleDownload,
@@ -449,7 +480,9 @@ export class StatementDetails extends React.Component<
 
     if (!stats) {
       const sourceApp = queryByName(this.props.location, appAttr);
-      const listUrl = "/statements" + (sourceApp ? "/" + sourceApp : "");
+      const listUrl =
+        "/sql-activity?tab=Statements" +
+        (sourceApp ? "&" + appAttr + "=" + sourceApp : "");
 
       return (
         <React.Fragment>
@@ -520,31 +553,43 @@ export class StatementDetails extends React.Component<
         <span className={cx("tooltip-info")}>unavailable</span>
       </Tooltip>
     );
-    const summary = summarize(statement);
-    const showRowsWritten =
-      stats.sql_type === "TypeDML" && summary.statement !== "select";
 
     // If the aggregatedTs is unset, we are aggregating over the whole date range.
     const aggregatedTs = queryByName(this.props.location, aggregatedTsAttr);
+    const aggregationInterval =
+      queryByName(this.props.location, aggregationIntervalAttr) || 0;
+    const [timeScaleStart, timeScaleEnd] = toDateRange(this.props.timeScale);
     const intervalStartTime = aggregatedTs
       ? moment.unix(parseInt(aggregatedTs)).utc()
-      : this.props.dateRange[0];
+      : timeScaleStart;
+    const intervalEndTime =
+      aggregatedTs && aggregationInterval
+        ? moment
+            .unix(parseInt(aggregatedTs) + parseInt(aggregationInterval))
+            .utc()
+        : timeScaleEnd;
+
+    const db = database ? (
+      <Text>{database}</Text>
+    ) : (
+      <Text className={cx("app-name", "app-name__unset")}>(unset)</Text>
+    );
 
     return (
       <Tabs
         defaultActiveKey="1"
-        className={cx("cockroach--tabs")}
+        className={commonStyles("cockroach--tabs")}
         onChange={this.onTabChange}
         activeKey={currentTab}
       >
         <TabPane tab="Overview" key="overview">
-          <Row gutter={16}>
-            <Col className="gutter-row" span={16}>
+          <Row gutter={24}>
+            <Col className="gutter-row" span={24}>
               <SqlBox value={statement} />
             </Col>
           </Row>
-          <Row gutter={16}>
-            <Col className="gutter-row" span={8}>
+          <Row gutter={24}>
+            <Col className="gutter-row" span={12}>
               <SummaryCard className={cx("summary-card")}>
                 <Row>
                   <Col>
@@ -598,19 +643,15 @@ export class StatementDetails extends React.Component<
                       )}
                       {unavailableTooltip}
                     </div>
-                    {showRowsWritten && (
-                      <div
-                        className={summaryCardStylesCx("summary--card__item")}
-                      >
-                        <Text>Mean rows written</Text>
-                        <Text>
-                          {formatNumberForDisplay(
-                            stats.rows_written?.mean,
-                            formatTwoPlaces,
-                          )}
-                        </Text>
-                      </div>
-                    )}
+                    <div className={summaryCardStylesCx("summary--card__item")}>
+                      <Text>Mean rows written</Text>
+                      <Text>
+                        {formatNumberForDisplay(
+                          stats.rows_written?.mean,
+                          formatTwoPlaces,
+                        )}
+                      </Text>
+                    </div>
                     <div className={summaryCardStylesCx("summary--card__item")}>
                       <Text>Max memory usage</Text>
                       {statementSampled && (
@@ -651,12 +692,21 @@ export class StatementDetails extends React.Component<
                 </Row>
               </SummaryCard>
             </Col>
-            <Col className="gutter-row" span={8}>
+            <Col className="gutter-row" span={12}>
               <SummaryCard className={cx("summary-card")}>
                 <Heading type="h5">Statement details</Heading>
                 <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Interval start time</Text>
-                  <Text>{intervalStartTime.format("MMM D, h:mm A (UTC)")}</Text>
+                  <Text>Aggregation Interval (UTC)</Text>
+                  <Text>
+                    {intervalStartTime.format("MMM D, h:mm A")} -{" "}
+                    {intervalEndTime.format(
+                      `${
+                        intervalStartTime.isSame(intervalEndTime, "day")
+                          ? ""
+                          : "MMM D,"
+                      }h:mm A`,
+                    )}
+                  </Text>
                 </div>
 
                 {!isTenant && (
@@ -679,7 +729,7 @@ export class StatementDetails extends React.Component<
 
                 <div className={summaryCardStylesCx("summary--card__item")}>
                   <Text>Database</Text>
-                  <Text>{database}</Text>
+                  {db}
                 </div>
                 <p
                   className={summaryCardStylesCx(
@@ -768,7 +818,7 @@ export class StatementDetails extends React.Component<
             key="diagnostics"
           >
             <DiagnosticsView
-              activate={createStatementDiagnosticsReport}
+              activateDiagnosticsRef={this.activateDiagnosticsRef}
               diagnosticsReports={diagnosticsReports}
               dismissAlertMessage={dismissStatementDiagnosticsAlertMessage}
               hasData={hasDiagnosticReports}
@@ -798,7 +848,7 @@ export class StatementDetails extends React.Component<
           <SummaryCard>
             <h3
               className={classNames(
-                cx("base-heading"),
+                commonStyles("base-heading"),
                 summaryCardStylesCx("summary--card__title"),
               )}
             >
@@ -841,7 +891,7 @@ export class StatementDetails extends React.Component<
           <SummaryCard>
             <h3
               className={classNames(
-                cx("base-heading"),
+                commonStyles("base-heading"),
                 summaryCardStylesCx("summary--card__title"),
               )}
             >
@@ -881,10 +931,9 @@ export class StatementDetails extends React.Component<
                 },
               ].filter(function(r) {
                 if (
-                  (r.name === "Network Bytes Sent" &&
-                    r.value &&
-                    r.value.mean === 0) ||
-                  (r.name === "Rows Written" && !showRowsWritten)
+                  r.name === "Network Bytes Sent" &&
+                  r.value &&
+                  r.value.mean === 0
                 ) {
                   // Omit if empty.
                   return false;
@@ -897,7 +946,7 @@ export class StatementDetails extends React.Component<
             <SummaryCard className={cx("fit-content-width")}>
               <h3
                 className={classNames(
-                  cx("base-heading"),
+                  commonStyles("base-heading"),
                   summaryCardStylesCx("summary--card__title"),
                 )}
               >

@@ -38,6 +38,7 @@ import "etcd/raft/v3/raftpb/raft.proto";
 import "gogoproto/gogo.proto";
 import "google/api/annotations.proto";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
 
 message CertificatesRequest {
   // node_id is a string so that "local" can be used to specify that no
@@ -212,6 +213,7 @@ message StoreDescriptor {
   roachpb.Attributes attrs = 2 [(gogoproto.nullable) = false];
   NodeDescriptor node = 3 [(gogoproto.nullable) = false];
   roachpb.StoreCapacity capacity = 4 [(gogoproto.nullable) = false];
+  roachpb.StoreProperties properties = 5 [(gogoproto.nullable) = false];
 }
 
 // StoreStatus records the most recent values of metrics for a store.
@@ -556,8 +558,10 @@ message LogFileRequest {
 }
 
 enum StacksType {
+  // GOROUTINE_STACKS corresponds to GOROUTINE_STACKS_DEBUG_2.
   GOROUTINE_STACKS = 0;
   reserved 1;
+  GOROUTINE_STACKS_DEBUG_1 = 2;
 }
 
 message StacksRequest {
@@ -746,6 +750,9 @@ message ActiveQuery {
 
   // The SQL statement fingerprint, compatible with StatementStatisticsKey.
   string sql_no_constants = 8;
+
+  // A summarized version of the sql query.
+  string sql_summary = 9;
 }
 
 // Request object for ListSessions and ListLocalSessions.
@@ -849,7 +856,7 @@ message CancelSessionRequest {
   bytes session_id = 2 [(gogoproto.customname) = "SessionID"];
   // Username of the user making this cancellation request. This may be omitted
   // if the user is the same as the one issuing the CancelSessionRequest.
-  // The caller is responsiblef or case-folding and NFC normalization.
+  // The caller is responsible for case-folding and NFC normalization.
   string username = 3;
 }
 
@@ -910,6 +917,9 @@ message DistSQLRemoteFlows {
 
     // Status is the current status of this remote flow.
     Status status = 3;
+
+    // Stmt is the SQL statement for which this flow is executing.
+    string stmt = 4;
   }
 
   // FlowID is the unique identifier of the physical plan shared by all remote
@@ -1020,7 +1030,7 @@ message ProblemRangesResponse {
 // API: PUBLIC ALPHA
 message HotRangesRequest {
   // NodeID indicates which node to query for a hot range report.
-  // It is posssible to populate any node ID; if the node receiving
+  // It is possible to populate any node ID; if the node receiving
   // the request is not the target node, it will forward the
   // request to the target node.
   //
@@ -1198,6 +1208,9 @@ message StatementsResponse {
     int32 node_id = 2 [(gogoproto.customname) = "NodeID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
     google.protobuf.Timestamp aggregated_ts = 3 [(gogoproto.nullable) = false,  (gogoproto.stdtime) = true];
+    // The aggregation duration.
+    google.protobuf.Duration aggregation_interval = 4 [(gogoproto.nullable) = false,
+      (gogoproto.stdduration) = true];
   }
 
   message CollectedStatementStatistics {
@@ -1239,14 +1252,42 @@ message StatementDiagnosticsReport {
     [ (gogoproto.nullable) = true ];
   google.protobuf.Timestamp requested_at = 5
     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+  google.protobuf.Duration min_execution_latency = 6
+    [ (gogoproto.nullable) = false, (gogoproto.stdduration) = true ];
+  google.protobuf.Timestamp expires_at = 7
+    [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
 }
 
 message CreateStatementDiagnosticsReportRequest {
   string statement_fingerprint = 1;
+  // MinExecutionLatency, when non-zero, indicates the minimum execution latency
+  // of a query for which to collect the diagnostics report. In other words, if
+  // a query executes faster than this threshold, then the diagnostics report is
+  // not collected on it, and we will try to get a bundle the next time we see
+  // the query fingerprint.
+  //
+  // NB: if MinExecutionLatency is non-zero, then all queries that match the
+  // fingerprint will be traced until a slow enough query comes along. This
+  // tracing might have some performance overhead.
+  google.protobuf.Duration min_execution_latency = 2  [ (gogoproto.nullable) = false, (gogoproto.stdduration) = true ];
+  // ExpiresAfter, when non-zero, sets the expiration interval of this request.
+  google.protobuf.Duration expires_after = 3 [ (gogoproto.nullable) = false, (gogoproto.stdduration) = true ];
 }
 
 message CreateStatementDiagnosticsReportResponse {
   StatementDiagnosticsReport report = 1;
+}
+
+message CancelStatementDiagnosticsReportRequest {
+  string statement_fingerprint = 1;
+}
+
+message CancelStatementDiagnosticsReportResponse {
+  // canceled indicates whether the request for the given fingerprint was
+  // actually canceled.
+  bool canceled = 1;
+  // error is set only if canceled is false.
+  string error = 2;
 }
 
 message StatementDiagnosticsReportsRequest {}
@@ -1317,6 +1358,47 @@ message IndexUsageStatisticsRequest {
 // Response object returned by IndexUsageStatistics.
 message IndexUsageStatisticsResponse {
   repeated cockroach.sql.CollectedIndexUsageStatistics statistics = 1 [(gogoproto.nullable) = false];
+  // Timestamp of the last index usage stats reset.
+  google.protobuf.Timestamp last_reset = 3 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+}
+
+// Request object for issuing TableIndexStatsRequest request.
+message TableIndexStatsRequest {
+  // database is the name of the database that contains the table we're
+  // interested in.
+  string database = 1;
+  // table is the name of the table that we're querying. Table may be
+  // schema-qualified (schema.table) and each name component that contains
+  // sql unsafe characters such as . or uppercase letters must be surrounded
+  // in double quotes like "naughty schema".table.
+  string table = 2;
+}
+
+// Response object returned by TableIndexStatsResponse.
+message TableIndexStatsResponse {
+  message ExtendedCollectedIndexUsageStatistics {
+    cockroach.sql.CollectedIndexUsageStatistics statistics = 1;
+    // index_name is the name of the index.
+    string index_name = 2;
+    // index_type is the type of the index i.e. primary, secondary.
+    string index_type = 3;
+    // create_statement is the SQL statement that would re-create the
+    // current index if executed.
+    string create_statement = 4;
+  }
+
+  repeated ExtendedCollectedIndexUsageStatistics statistics = 1;
+  // Timestamp of the last index usage stats reset.
+  google.protobuf.Timestamp last_reset = 2 [(gogoproto.stdtime) = true];
+}
+
+// Request object for issuing a index usage stats reset request.
+message ResetIndexUsageStatsRequest {
+  string node_id = 1 [(gogoproto.customname) = "NodeID"];
+}
+
+// Response object returned by ResetIndexUsageStatsRequest.
+message ResetIndexUsageStatsResponse {
 }
 
 service Status {
@@ -1434,6 +1516,14 @@ service Status {
     option (google.api.http) = {
       post : "/_status/cancel_query/{node_id}"
 			body: "*"
+    };
+  }
+
+  // CancelLocalQuery cancels a SQL query running on this node given its ID.
+  rpc CancelLocalQuery(CancelQueryRequest) returns (CancelQueryResponse) {
+    option (google.api.http) = {
+      post : "/_status/cancel_local_query"
+      body: "*"
     };
   }
 
@@ -1636,6 +1726,12 @@ service Status {
       body: "*"
     };
   }
+  rpc CancelStatementDiagnosticsReport(CancelStatementDiagnosticsReportRequest) returns (CancelStatementDiagnosticsReportResponse) {
+    option (google.api.http) = {
+      post: "/_status/stmtdiagreports/cancel"
+      body: "*"
+    };
+  }
   rpc StatementDiagnosticsRequests(StatementDiagnosticsReportsRequest) returns (StatementDiagnosticsReportsResponse) {
     option (google.api.http) = {
       get: "/_status/stmtdiagreports"
@@ -1667,6 +1763,20 @@ service Status {
   rpc IndexUsageStatistics(IndexUsageStatisticsRequest) returns (IndexUsageStatisticsResponse) {
     option (google.api.http) = {
       get: "/_status/indexusagestatistics"
+    };
+  }
+
+  rpc ResetIndexUsageStats(ResetIndexUsageStatsRequest) returns (ResetIndexUsageStatsResponse) {
+    option (google.api.http) = {
+      post: "/_status/resetindexusagestats"
+      body: "*"
+    };
+  }
+
+  // TableIndexStats retrieves index stats for a table.
+  rpc TableIndexStats(TableIndexStatsRequest) returns (TableIndexStatsResponse) {
+    option (google.api.http) = {
+      get: "/_status/databases/{database}/tables/{table}/indexstats"
     };
   }
 }

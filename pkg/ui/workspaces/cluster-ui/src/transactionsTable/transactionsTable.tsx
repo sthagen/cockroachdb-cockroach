@@ -28,17 +28,24 @@ import {
   transactionsRetryBarChart,
 } from "./transactionsBarCharts";
 import {
-  formatStartIntervalColumn,
+  formatAggregationIntervalColumn,
   statisticsTableTitles,
 } from "../statsTableUtil/statsTableUtil";
 import { tableClasses } from "./transactionsTableClasses";
-import { textCell } from "./transactionsCells";
-import { FixLong, longToInt, TimestampToNumber } from "src/util";
+import { transactionLink } from "./transactionsCells";
+import {
+  FixLong,
+  longToInt,
+  TimestampToNumber,
+  DurationToNumber,
+  TimestampToString,
+} from "src/util";
 import { SortSetting } from "../sortedtable";
 import {
   getStatementsByFingerprintIdAndTime,
   collectStatementsText,
   statementFingerprintIdsToText,
+  statementFingerprintIdsToSummarizedText,
 } from "../transactionsPage/utils";
 import classNames from "classnames/bind";
 import statsTablePageStyles from "src/statementsTable/statementsTableContent.module.scss";
@@ -63,11 +70,23 @@ const { latencyClasses } = tableClasses;
 
 const cx = classNames.bind(statsTablePageStyles);
 
+interface TransactionLinkTargetProps {
+  aggregatedTs: string;
+  transactionFingerprintId: string;
+}
+
+// TransactionLinkTarget returns the link to the relevant transaction page, given
+// the input transaction details.
+export const TransactionLinkTarget = (
+  props: TransactionLinkTargetProps,
+): string => {
+  return `/transaction/${props.aggregatedTs}/${props.transactionFingerprintId}`;
+};
+
 export function makeTransactionsColumns(
   transactions: TransactionInfo[],
   statements: Statement[],
   isTenant: boolean,
-  handleDetails: (txn?: TransactionInfo) => void,
   search?: string,
 ): ColumnDescriptor<TransactionInfo>[] {
   const defaultBarChartOptions = {
@@ -120,30 +139,36 @@ export function makeTransactionsColumns(
       name: "transactions",
       title: statisticsTableTitles.transactions(statType),
       cell: (item: TransactionInfo) =>
-        textCell({
+        transactionLink({
           transactionText: statementFingerprintIdsToText(
             item.stats_data.statement_fingerprint_ids,
             statements,
           ),
-          onClick: () => handleDetails(item),
+          transactionSummary: statementFingerprintIdsToSummarizedText(
+            item.stats_data.statement_fingerprint_ids,
+            statements,
+          ),
+          aggregatedTs: TimestampToString(item.stats_data.aggregated_ts),
+          transactionFingerprintId: item.stats_data.transaction_fingerprint_id.toString(),
           search,
         }),
       sort: (item: TransactionInfo) =>
         collectStatementsText(
           getStatementsByFingerprintIdAndTime(
             item.stats_data.statement_fingerprint_ids,
-            item.stats_data.aggregated_ts,
+            TimestampToString(item.stats_data.aggregated_ts),
             statements,
           ),
         ),
       alwaysShow: true,
     },
     {
-      name: "intervalStartTime",
-      title: statisticsTableTitles.intervalStartTime("transaction"),
+      name: "aggregationInterval",
+      title: statisticsTableTitles.aggregationInterval("transaction"),
       cell: (item: TransactionInfo) =>
-        formatStartIntervalColumn(
+        formatAggregationIntervalColumn(
           TimestampToNumber(item.stats_data?.aggregated_ts),
+          DurationToNumber(item.stats_data?.aggregation_interval),
         ),
       sort: (item: TransactionInfo) =>
         TimestampToNumber(item.stats_data?.aggregated_ts),

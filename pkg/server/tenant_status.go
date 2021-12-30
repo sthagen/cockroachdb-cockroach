@@ -163,10 +163,65 @@ func (t *tenantStatusServer) ListLocalSessions(
 	if err != nil {
 		return nil, err
 	}
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
 	return &serverpb.ListSessionsResponse{Sessions: sessions}, nil
 }
 
 func (t *tenantStatusServer) CancelQuery(
+	ctx context.Context, request *serverpb.CancelQueryRequest,
+) (*serverpb.CancelQueryResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	// Check permissions early to avoid fan-out to all nodes.
+	reqUsername := security.MakeSQLUsernameFromPreNormalizedString(request.Username)
+	if err := t.checkCancelPrivilege(ctx, reqUsername, findSessionByQueryID(request.QueryID)); err != nil {
+		return nil, err
+	}
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
+	response := serverpb.CancelQueryResponse{}
+	distinctErrorMessages := map[string]struct{}{}
+
+	if err := t.iteratePods(
+		ctx,
+		fmt.Sprintf("cancel query ID %s", request.QueryID),
+		t.dialCallback,
+		func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
+			return client.(serverpb.StatusClient).CancelLocalQuery(ctx, request)
+		},
+		func(_ base.SQLInstanceID, nodeResp interface{}) {
+			nodeCancelQueryResponse := nodeResp.(*serverpb.CancelQueryResponse)
+			if nodeCancelQueryResponse.Canceled {
+				response.Canceled = true
+			}
+			distinctErrorMessages[nodeCancelQueryResponse.Error] = struct{}{}
+		},
+		func(_ base.SQLInstanceID, err error) {
+			distinctErrorMessages[err.Error()] = struct{}{}
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	if !response.Canceled {
+		var errorMessages []string
+		for errorMessage := range distinctErrorMessages {
+			errorMessages = append(errorMessages, errorMessage)
+		}
+		response.Error = strings.Join(errorMessages, ", ")
+	}
+
+	return &response, nil
+}
+
+func (t *tenantStatusServer) CancelLocalQuery(
 	ctx context.Context, request *serverpb.CancelQueryRequest,
 ) (*serverpb.CancelQueryResponse, error) {
 	reqUsername := security.MakeSQLUsernameFromPreNormalizedString(request.Username)
@@ -194,6 +249,10 @@ func (t *tenantStatusServer) CancelSession(
 	reqUsername := security.MakeSQLUsernameFromPreNormalizedString(request.Username)
 	if err := t.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(request.SessionID)); err != nil {
 		return nil, err
+	}
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
 	}
 
 	response := serverpb.CancelSessionResponse{}
@@ -252,6 +311,10 @@ func (t *tenantStatusServer) ListContentionEvents(
 		return nil, err
 	}
 
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
 	var response serverpb.ListContentionEventsResponse
 
 	podFn := func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
@@ -293,14 +356,27 @@ func (t *tenantStatusServer) ListContentionEvents(
 	return &response, nil
 }
 
+func (t *tenantStatusServer) ListLocalContentionEvents(
+	ctx context.Context, req *serverpb.ListContentionEventsRequest,
+) (*serverpb.ListContentionEventsResponse, error) {
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+	return t.baseStatusServer.ListLocalContentionEvents(ctx, req)
+}
+
 func (t *tenantStatusServer) ResetSQLStats(
 	ctx context.Context, req *serverpb.ResetSQLStatsRequest,
 ) (*serverpb.ResetSQLStatsResponse, error) {
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = t.AnnotateCtx(ctx)
 
-	if _, err := t.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if _, err := t.privilegeChecker.requireAdminUser(ctx); err != nil {
 		return nil, err
+	}
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
 	}
 
 	response := &serverpb.ResetSQLStatsResponse{}
@@ -611,7 +687,21 @@ func (t *tenantStatusServer) iteratePods(
 func (t *tenantStatusServer) ListDistSQLFlows(
 	ctx context.Context, request *serverpb.ListDistSQLFlowsRequest,
 ) (*serverpb.ListDistSQLFlowsResponse, error) {
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
 	return t.ListLocalDistSQLFlows(ctx, request)
+}
+
+func (t *tenantStatusServer) ListLocalDistSQLFlows(
+	ctx context.Context, request *serverpb.ListDistSQLFlowsRequest,
+) (*serverpb.ListDistSQLFlowsResponse, error) {
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
+	return t.baseStatusServer.ListLocalDistSQLFlows(ctx, request)
 }
 
 // Profile implements the profiling endpoint by delegating the request
@@ -623,6 +713,10 @@ func (t *tenantStatusServer) Profile(
 ) (*serverpb.JSONResponse, error) {
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = t.AnnotateCtx(ctx)
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
 
 	if request.NodeId != "local" {
 		return nil, status.Errorf(codes.Unimplemented, "profiling arbitrary tenants is unsupported")
@@ -638,6 +732,10 @@ func (t *tenantStatusServer) IndexUsageStatistics(
 
 	if _, err := t.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
+	}
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
 	}
 
 	localReq := &serverpb.IndexUsageStatisticsRequest{
@@ -694,5 +792,95 @@ func (t *tenantStatusServer) IndexUsageStatistics(
 		return nil, err
 	}
 
+	// Append last reset time.
+	resp.LastReset = t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().GetLastReset()
+
 	return resp, nil
+}
+
+// ResetIndexUsageStats is the gRPC handler for resetting index usage stats.
+// This endpoint resets index usage statistics for all tables.
+func (t *tenantStatusServer) ResetIndexUsageStats(
+	ctx context.Context, req *serverpb.ResetIndexUsageStatsRequest,
+) (*serverpb.ResetIndexUsageStatsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	if _, err := t.privilegeChecker.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
+	localReq := &serverpb.ResetIndexUsageStatsRequest{
+		NodeID: "local",
+	}
+	resp := &serverpb.ResetIndexUsageStatsResponse{}
+
+	if len(req.NodeID) > 0 {
+		parsedInstanceID, local, err := t.parseInstanceID(req.NodeID)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		if local {
+			t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics().Reset()
+			return resp, nil
+		}
+
+		instance, err := t.sqlServer.sqlInstanceProvider.GetInstance(ctx, parsedInstanceID)
+		if err != nil {
+			return nil, err
+		}
+		statusClient, err := t.dialPod(ctx, parsedInstanceID, instance.InstanceAddr)
+		if err != nil {
+			return nil, err
+		}
+
+		return statusClient.ResetIndexUsageStats(ctx, localReq)
+	}
+
+	resetIndexUsageStats := func(ctx context.Context, client interface{}, _ base.SQLInstanceID) (interface{}, error) {
+		statusClient := client.(serverpb.StatusClient)
+		return statusClient.ResetIndexUsageStats(ctx, localReq)
+	}
+
+	var combinedError error
+
+	if err := t.iteratePods(ctx, fmt.Sprintf("Resetting index usage stats for instance %s", req.NodeID),
+		t.dialCallback,
+		resetIndexUsageStats,
+		func(instanceID base.SQLInstanceID, resp interface{}) {
+			// Nothing to do here.
+		},
+		func(_ base.SQLInstanceID, err error) {
+			combinedError = errors.CombineErrors(combinedError, err)
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// TableIndexStats is the gRPC handler for retrieving index usage statistics
+// by table. This function reads index usage statistics directly from the
+// database and is meant for external usage.
+func (t *tenantStatusServer) TableIndexStats(
+	ctx context.Context, req *serverpb.TableIndexStatsRequest,
+) (*serverpb.TableIndexStatsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = t.AnnotateCtx(ctx)
+
+	if _, err := t.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+		return nil, err
+	}
+
+	if t.sqlServer.SQLInstanceID() == 0 {
+		return nil, status.Errorf(codes.Unavailable, "instanceID not set")
+	}
+
+	return getTableIndexUsageStats(ctx, req, t.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics(),
+		t.sqlServer.internalExecutor)
 }

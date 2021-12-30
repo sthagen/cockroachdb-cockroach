@@ -9,17 +9,28 @@
 // licenses/APL.txt.
 
 import React from "react";
-import { jobStatusToBadgeStatus } from "src/views/jobs/jobStatusOptions";
+import {
+  jobStatusToBadgeStatus,
+  jobStatusToBadgeText,
+} from "src/views/jobs/jobStatusOptions";
 import Job = cockroach.server.serverpb.IJobResponse;
 import { cockroach } from "src/js/protos";
 import { Badge } from "src/components";
 import { Line } from "rc-progress";
+import { ColorIntentInfo3 } from "@cockroachlabs/design-tokens";
 
 export class JobStatusBadge extends React.PureComponent<{ jobStatus: string }> {
   render() {
     const jobStatus = this.props.jobStatus;
     const badgeStatus = jobStatusToBadgeStatus(jobStatus);
-    return <Badge status={badgeStatus} text={jobStatus} />;
+    const badgeText = jobStatusToBadgeText(jobStatus);
+    return <Badge status={badgeStatus} text={badgeText} />;
+  }
+}
+
+export class RetryingStatusBadge extends React.PureComponent {
+  render() {
+    return <Badge status="warning" text="retrying" />;
   }
 }
 
@@ -32,12 +43,14 @@ export class ProgressBar extends React.PureComponent<{
     const percent = this.props.job.fraction_completed * 100;
     return (
       <div className="jobs-table__progress">
-        {this.props.job.running_status ? (
-          <div className="jobs-table__running-status">
-            {this.props.job.running_status}
-          </div>
-        ) : null}
-
+        <Line
+          percent={percent}
+          strokeWidth={this.props.lineWidth}
+          trailWidth={this.props.lineWidth}
+          strokeColor={ColorIntentInfo3}
+          trailColor="#d6dbe7"
+          className="jobs-table__progress-bar"
+        />
         {this.props.showPercentage ? (
           <div
             className="jobs-table__status--percentage"
@@ -46,14 +59,6 @@ export class ProgressBar extends React.PureComponent<{
             {percent.toFixed(1) + "%"}
           </div>
         ) : null}
-        <Line
-          percent={percent}
-          strokeWidth={this.props.lineWidth}
-          trailWidth={this.props.lineWidth}
-          strokeColor="#0788ff"
-          trailColor="#d6dbe7"
-          className="jobs-table__progress-bar"
-        />
       </div>
     );
   }

@@ -42,7 +42,7 @@ import (
 func makeIntTableKVs(numKeys, valueSize, maxRevisions int) []storage.MVCCKeyValue {
 	prefix := keys.SystemSQLCodec.IndexPrefix(100, 1)
 	kvs := make([]storage.MVCCKeyValue, numKeys)
-	r, _ := randutil.NewPseudoRand()
+	r, _ := randutil.NewTestRand()
 
 	var k int
 	for i := 0; i < numKeys; {
@@ -197,8 +197,8 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 			// slow requests or something, so we can inspect the trace in the test to
 			// determine if requests required the expected number of retries.
 			tr := s.TracerI().(*tracing.Tracer)
-			addCtx, getRec, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "add")
-			defer cancel()
+			addCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "add")
+			defer getRecAndFinish()
 			expectedSplitRetries := 0
 			for _, batch := range testCase {
 				for idx, x := range batch {
@@ -224,13 +224,12 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 				}
 			}
 			var splitRetries int
-			for _, sp := range getRec() {
+			for _, sp := range getRecAndFinish() {
 				splitRetries += tracing.CountLogMessages(sp, "SSTable cannot be added spanning range bounds")
 			}
 			if splitRetries != expectedSplitRetries {
 				t.Fatalf("expected %d split-caused retries, got %d", expectedSplitRetries, splitRetries)
 			}
-			cancel()
 
 			added := b.GetSummary()
 			t.Logf("Wrote %d total", added.DataSize)
@@ -261,10 +260,13 @@ func (m mockSender) AddSSTable(
 	ctx context.Context,
 	begin, end interface{},
 	data []byte,
+	disallowConflicts bool,
 	disallowShadowing bool,
+	disallowShadowingBelow hlc.Timestamp,
 	_ *enginepb.MVCCStats,
 	ingestAsWrites bool,
 	batchTS hlc.Timestamp,
+	writeAtBatchTS bool,
 ) error {
 	return m(roachpb.Span{Key: begin.(roachpb.Key), EndKey: end.(roachpb.Key)})
 }
@@ -328,7 +330,7 @@ func TestAddBigSpanningSSTWithSplits(t *testing.T) {
 
 	t.Logf("Adding %dkb sst spanning %d splits from %v to %v", len(sst)/kb, len(splits), start, end)
 	if _, err := bulk.AddSSTable(
-		ctx, mock, start, end, sst, false /* disallowShadowing */, enginepb.MVCCStats{}, cluster.MakeTestingClusterSettings(), hlc.Timestamp{},
+		ctx, mock, start, end, sst, hlc.Timestamp{}, enginepb.MVCCStats{}, cluster.MakeTestingClusterSettings(), hlc.Timestamp{},
 	); err != nil {
 		t.Fatal(err)
 	}

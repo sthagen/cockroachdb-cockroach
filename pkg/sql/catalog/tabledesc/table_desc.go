@@ -101,6 +101,16 @@ func (desc *wrapper) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// ByteSize implements the Descriptor interface.
+func (desc *wrapper) ByteSize() int64 {
+	return int64(desc.Size())
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+func (desc *wrapper) NewBuilder() catalog.DescriptorBuilder {
+	return NewBuilder(desc.TableDesc())
+}
+
 // GetPrimaryIndexID implements the TableDescriptor interface.
 func (desc *wrapper) GetPrimaryIndexID() descpb.IndexID {
 	return desc.PrimaryIndex.ID
@@ -125,6 +135,8 @@ func (desc *Mutable) IsUncommittedVersion() bool {
 }
 
 // SetDrainingNames implements the MutableDescriptor interface.
+//
+// Deprecated: Do not use.
 func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
 	desc.DrainingNames = names
 }

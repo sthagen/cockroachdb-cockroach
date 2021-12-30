@@ -58,18 +58,22 @@ type indexBackfiller struct {
 var _ execinfra.Processor = &indexBackfiller{}
 
 var backfillerBufferSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"schemachanger.backfiller.buffer_size", "the initial size of the BulkAdder buffer handling index backfills", 32<<20,
 )
 
 var backfillerMaxBufferSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"schemachanger.backfiller.max_buffer_size", "the maximum size of the BulkAdder buffer handling index backfills", 512<<20,
 )
 
 var backfillerBufferIncrementSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"schemachanger.backfiller.buffer_increment", "the size by which the BulkAdder attempts to grow its buffer before flushing", 32<<20,
 )
 
 var backillerSSTSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"schemachanger.backfiller.max_sst_size", "target size for ingested files during backfills", 16<<20,
 )
 
@@ -129,8 +133,8 @@ func (ib *indexBackfiller) constructIndexEntries(
 	var entries []rowenc.IndexEntry
 	for i := range ib.spec.Spans {
 		log.VEventf(ctx, 2, "index backfiller starting span %d of %d: %s",
-			i+1, len(ib.spec.Spans), ib.spec.Spans[i].Span)
-		todo := ib.spec.Spans[i].Span
+			i+1, len(ib.spec.Spans), ib.spec.Spans[i])
+		todo := ib.spec.Spans[i]
 		for todo.Key != nil {
 			startKey := todo.Key
 			readAsOf := ib.spec.ReadAsOf
@@ -145,7 +149,7 @@ func (ib *indexBackfiller) constructIndexEntries(
 
 			// Identify the Span for which we have constructed index entries. This is
 			// used for reporting progress and updating the job details.
-			completedSpan := ib.spec.Spans[i].Span
+			completedSpan := ib.spec.Spans[i]
 			if todo.Key != nil {
 				completedSpan.Key = startKey
 				completedSpan.EndKey = todo.Key
@@ -444,7 +448,7 @@ func (ib *indexBackfiller) buildIndexEntryBatch(
 	}); err != nil {
 		return nil, nil, 0, err
 	}
-	prepTime := timeutil.Now().Sub(start)
+	prepTime := timeutil.Since(start)
 	log.VEventf(ctx, 3, "index backfill stats: entries %d, prepare %+v",
 		len(entries), prepTime)
 

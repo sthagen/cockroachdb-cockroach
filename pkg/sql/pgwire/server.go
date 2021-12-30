@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/identmap"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -58,6 +59,7 @@ import (
 // The "results_buffer_size" connection parameter can be used to override this
 // default for an individual connection.
 var connResultsBufferSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
 	"sql.defaults.results_buffer.size",
 	"default size of the buffer that accumulates results for a statement or a batch "+
 		"of statements before they are sent to the client. This can be overridden on "+
@@ -72,11 +74,13 @@ var connResultsBufferSize = settings.RegisterByteSizeSetting(
 ).WithPublic()
 
 var logConnAuth = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	sql.ConnAuditingClusterSettingName,
 	"if set, log SQL client connect and disconnect events (note: may hinder performance on loaded nodes)",
 	false).WithPublic()
 
 var logSessionAuth = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	sql.AuthAuditingClusterSettingName,
 	"if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)",
 	false).WithPublic()
@@ -187,7 +191,8 @@ type Server struct {
 
 	auth struct {
 		syncutil.RWMutex
-		conf *hba.Conf
+		conf        *hba.Conf
+		identityMap *identmap.Conf
 	}
 
 	sqlMemoryPool *mon.BytesMonitor
@@ -300,11 +305,14 @@ func MakeServer(
 	server.mu.connCancelMap = make(cancelChanMap)
 	server.mu.Unlock()
 
-	connAuthConf.SetOnChange(&st.SV,
-		func(ctx context.Context) {
-			loadLocalAuthConfigUponRemoteSettingChange(
-				ambientCtx.AnnotateCtx(context.Background()), server, st)
-		})
+	connAuthConf.SetOnChange(&st.SV, func(ctx context.Context) {
+		loadLocalHBAConfigUponRemoteSettingChange(
+			ambientCtx.AnnotateCtx(context.Background()), server, st)
+	})
+	connIdentityMapConf.SetOnChange(&st.SV, func(ctx context.Context) {
+		loadLocalIdentityMapUponRemoteSettingChange(
+			ambientCtx.AnnotateCtx(context.Background()), server, st)
+	})
 
 	return server
 }
@@ -362,13 +370,12 @@ func (s *Server) Metrics() (res []interface{}) {
 		&s.SQLServer.Metrics.StartedStatementCounters,
 		&s.SQLServer.Metrics.ExecutedStatementCounters,
 		&s.SQLServer.Metrics.EngineMetrics,
-		&s.SQLServer.Metrics.StatsMetrics,
 		&s.SQLServer.Metrics.GuardrailMetrics,
 		&s.SQLServer.InternalMetrics.StartedStatementCounters,
 		&s.SQLServer.InternalMetrics.ExecutedStatementCounters,
 		&s.SQLServer.InternalMetrics.EngineMetrics,
-		&s.SQLServer.InternalMetrics.StatsMetrics,
 		&s.SQLServer.InternalMetrics.GuardrailMetrics,
+		&s.SQLServer.ServerMetrics.StatsMetrics,
 	}
 }
 
@@ -671,8 +678,8 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	// baseSQLMemoryBudget.
 	reserved := s.connMonitor.MakeBoundAccount()
 	if err := reserved.Grow(ctx, baseSQLMemoryBudget); err != nil {
-		return errors.Errorf("unable to pre-allocate %d bytes for this connection: %v",
-			baseSQLMemoryBudget, err)
+		return errors.Wrapf(err, "unable to pre-allocate %d bytes for this connection",
+			baseSQLMemoryBudget)
 	}
 
 	// Load the client-provided session parameters.
@@ -695,6 +702,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 		testingAuthHook = k.AuthHook
 	}
 
+	hbaConf, identMap := s.GetAuthenticationConfiguration()
 	// Defer the rest of the processing to the connection handler.
 	// This includes authentication.
 	s.serveConn(
@@ -706,7 +714,8 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 			connDetails:     connDetails,
 			insecure:        s.cfg.Insecure,
 			ie:              s.execCfg.InternalExecutor,
-			auth:            s.GetAuthenticationConfiguration(),
+			auth:            hbaConf,
+			identMap:        identMap,
 			testingAuthHook: testingAuthHook,
 		})
 	return nil
@@ -730,8 +739,9 @@ func parseClientProvidedSessionParameters(
 	trustClientProvidedRemoteAddr bool,
 ) (sql.SessionArgs, error) {
 	args := sql.SessionArgs{
-		SessionDefaults: make(map[string]string),
-		RemoteAddr:      origRemoteAddr,
+		SessionDefaults:             make(map[string]string),
+		CustomOptionSessionDefaults: make(map[string]string),
+		RemoteAddr:                  origRemoteAddr,
 	}
 	foundBufferSize := false
 
@@ -739,8 +749,10 @@ func parseClientProvidedSessionParameters(
 		// Read a key-value pair from the client.
 		key, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
-				"error reading option key: %s", err)
+			return sql.SessionArgs{}, pgerror.Wrap(
+				err, pgcode.ProtocolViolation,
+				"error reading option key",
+			)
 		}
 		if len(key) == 0 {
 			// End of parameter list.
@@ -748,8 +760,10 @@ func parseClientProvidedSessionParameters(
 		}
 		value, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
-				"error reading option value: %s", err)
+			return sql.SessionArgs{}, pgerror.Wrapf(
+				err, pgcode.ProtocolViolation,
+				"error reading option value for key %q", key,
+			)
 		}
 
 		// Case-fold for the key for easier comparison.
@@ -788,13 +802,17 @@ func parseClientProvidedSessionParameters(
 
 			hostS, portS, err := net.SplitHostPort(value)
 			if err != nil {
-				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
-					"invalid address format: %v", err)
+				return sql.SessionArgs{}, pgerror.Wrap(
+					err, pgcode.ProtocolViolation,
+					"invalid address format",
+				)
 			}
 			port, err := strconv.Atoi(portS)
 			if err != nil {
-				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
-					"remote port is not numeric: %v", err)
+				return sql.SessionArgs{}, pgerror.Wrap(
+					err, pgcode.ProtocolViolation,
+					"remote port is not numeric",
+				)
 			}
 			ip := net.ParseIP(hostS)
 			if ip == nil {
@@ -848,12 +866,14 @@ func parseClientProvidedSessionParameters(
 }
 
 func loadParameter(ctx context.Context, key, value string, args *sql.SessionArgs) error {
+	key = strings.ToLower(key)
 	exists, configurable := sql.IsSessionVariableConfigurable(key)
 
 	switch {
 	case exists && configurable:
 		args.SessionDefaults[key] = value
-
+	case sql.IsCustomOptionSessionVariable(key):
+		args.CustomOptionSessionDefaults[key] = value
 	case !exists:
 		if _, ok := sql.UnsupportedVars[key]; ok {
 			counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)

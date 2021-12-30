@@ -64,7 +64,7 @@ func (p *planner) AlterDatabaseOwner(
 }
 
 func (n *alterDatabaseOwnerNode) startExec(params runParams) error {
-	newOwner, err := n.n.Owner.ToSQLUsername(params.p.SessionData())
+	newOwner, err := n.n.Owner.ToSQLUsername(params.p.SessionData(), security.UsernameValidation)
 	if err != nil {
 		return err
 	}
@@ -286,6 +286,7 @@ type alterDatabaseDropRegionNode struct {
 }
 
 var allowDropFinalRegion = settings.RegisterBoolSetting(
+	settings.TenantWritable,
 	"sql.multiregion.drop_primary_region.enabled",
 	"allows dropping the PRIMARY REGION of a database if it is the last region",
 	true,

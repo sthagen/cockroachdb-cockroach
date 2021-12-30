@@ -456,7 +456,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		// resolveZone determines the ID of the target object of the zone
 		// specifier. This ought to succeed regardless of whether there is
 		// already a zone config for the target object.
-		targetID, err := resolveZone(params.ctx, params.ExecCfg().Codec, params.p.txn, &zs)
+		targetID, err := resolveZone(params.ctx, params.ExecCfg().Codec, params.p.txn, &zs, params.ExecCfg().Settings.Version)
 		if err != nil {
 			return err
 		}
@@ -641,14 +641,12 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			// empty, in which case the unmarshaling will be a no-op. This is
 			// innocuous.
 			if err := yaml.UnmarshalStrict([]byte(yamlConfig), &newZone); err != nil {
-				return pgerror.Newf(pgcode.CheckViolation,
-					"could not parse zone config: %v", err)
+				return pgerror.Wrap(err, pgcode.CheckViolation, "could not parse zone config")
 			}
 
 			// Load settings from YAML into the partial zone as well.
 			if err := yaml.UnmarshalStrict([]byte(yamlConfig), &finalZone); err != nil {
-				return pgerror.Newf(pgcode.CheckViolation,
-					"could not parse zone config: %v", err)
+				return pgerror.Wrap(err, pgcode.CheckViolation, "could not parse zone config")
 			}
 
 			// Load settings from var = val assignments. If there were no such
@@ -739,8 +737,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 
 			// Finally revalidate everything. Validate only the completeZone config.
 			if err := completeZone.Validate(); err != nil {
-				return pgerror.Newf(pgcode.CheckViolation,
-					"could not validate zone config: %v", err)
+				return pgerror.Wrap(err, pgcode.CheckViolation, "could not validate zone config")
 			}
 
 			// Finally check for the extra protection partial zone configs would
@@ -1064,8 +1061,7 @@ func prepareZoneConfigWrites(
 	}
 	buf, err := protoutil.Marshal(zone)
 	if err != nil {
-		return nil, pgerror.Newf(pgcode.CheckViolation,
-			"could not marshal zone config: %v", err)
+		return nil, pgerror.Wrap(err, pgcode.CheckViolation, "could not marshal zone config")
 	}
 	return &zoneConfigUpdate{id: targetID, value: buf}, nil
 }

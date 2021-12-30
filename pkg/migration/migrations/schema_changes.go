@@ -152,7 +152,7 @@ func readTableDescriptor(
 	) (err error) {
 		t, err = descriptors.GetImmutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{
 			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidCached: true,
+				AvoidLeased: true,
 				Required:    true,
 			},
 		})
@@ -247,6 +247,8 @@ func hasIndex(storedTable, expectedTable catalog.TableDescriptor, indexName stri
 	// See https://github.com/cockroachdb/cockroach/issues/65929.
 	storedCopy.CreatedExplicitly = false
 	expectedCopy.CreatedExplicitly = false
+	storedCopy.StoreColumnNames = []string{}
+	expectedCopy.StoreColumnNames = []string{}
 	storedCopy.StoreColumnIDs = []descpb.ColumnID{0, 0, 0}
 	expectedCopy.StoreColumnIDs = []descpb.ColumnID{0, 0, 0}
 

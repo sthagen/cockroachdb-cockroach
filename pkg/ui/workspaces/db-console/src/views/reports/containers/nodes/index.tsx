@@ -16,12 +16,13 @@ import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { withRouter, RouteComponentProps } from "react-router-dom";
+import { InlineAlert } from "src/components";
 
 import * as protos from "src/js/protos";
 import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
-import { LongToMoment } from "src/util/convert";
+import { util } from "@cockroachlabs/cluster-ui";
 import { FixLong } from "src/util/fixLong";
 import {
   getFilters,
@@ -111,9 +112,9 @@ function printTimestampValue(value: string) {
     if (!_.has(status, value)) {
       return null;
     }
-    return LongToMoment(FixLong(_.get(status, value) as Long)).format(
-      dateFormat,
-    );
+    return util
+      .LongToMoment(FixLong(_.get(status, value) as Long))
+      .format(dateFormat);
   };
 }
 
@@ -135,7 +136,7 @@ function titleTimestampValue(value: string) {
       return null;
     }
     const raw = FixLong(_.get(status, value) as Long);
-    return `${LongToMoment(raw).format(dateFormat)}\n${raw.toString()}`;
+    return `${util.LongToMoment(raw).format(dateFormat)}\n${raw.toString()}`;
   };
 }
 
@@ -325,9 +326,24 @@ export class Nodes extends React.Component<NodesProps, {}> {
     );
   }
 
+  requiresAdmin() {
+    const {
+      nodesSummary: { nodeLastError },
+    } = this.props;
+
+    return nodeLastError?.message === "this operation requires admin privilege";
+  }
+
   render() {
     const { nodesSummary } = this.props;
     const { nodeStatusByID } = nodesSummary;
+
+    if (this.requiresAdmin()) {
+      return (
+        <InlineAlert title="" message="This page requires admin privileges." />
+      );
+    }
+
     if (_.isEmpty(nodesSummary.nodeIDs)) {
       return loading;
     }

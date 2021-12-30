@@ -11,6 +11,7 @@
 package tracing
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/logtags"
@@ -21,17 +22,16 @@ import (
 )
 
 func TestLogTags(t *testing.T) {
-	tr := NewTracer()
+	tr := NewTracerWithOpt(context.Background(), WithTracingMode(TracingModeActiveSpansRegistry))
 	sr := tracetest.NewSpanRecorder()
 	otelTr := otelsdk.NewTracerProvider(otelsdk.WithSpanProcessor(sr)).Tracer("test")
 	tr.SetOpenTelemetryTracer(otelTr)
 
 	l := logtags.SingleTagBuffer("tag1", "val1")
 	l = l.Add("tag2", "val2")
-	sp1 := tr.StartSpan("foo", WithForceRealSpan(), WithLogTags(l))
+	sp1 := tr.StartSpan("foo", WithLogTags(l))
 	sp1.SetVerbose(true)
-	sp1.Finish()
-	require.NoError(t, CheckRecordedSpans(sp1.GetRecording(), `
+	require.NoError(t, CheckRecordedSpans(sp1.FinishAndGetRecording(RecordingVerbose), `
 		span: foo
 			tags: _verbose=1 tag1=val1 tag2=val2
 	`))
@@ -48,10 +48,9 @@ func TestLogTags(t *testing.T) {
 	RegisterTagRemapping("tag1", "one")
 	RegisterTagRemapping("tag2", "two")
 
-	sp2 := tr.StartSpan("bar", WithForceRealSpan(), WithLogTags(l))
+	sp2 := tr.StartSpan("bar", WithLogTags(l))
 	sp2.SetVerbose(true)
-	sp2.Finish()
-	require.NoError(t, CheckRecordedSpans(sp2.GetRecording(), `
+	require.NoError(t, CheckRecordedSpans(sp2.FinishAndGetRecording(RecordingVerbose), `
 		span: bar
 			tags: _verbose=1 one=val1 two=val2
 	`))
@@ -66,10 +65,9 @@ func TestLogTags(t *testing.T) {
 		require.Equal(t, exp, otelSpan.Attributes())
 	}
 
-	sp3 := tr.StartSpan("baz", WithLogTags(l), WithForceRealSpan())
+	sp3 := tr.StartSpan("baz", WithLogTags(l))
 	sp3.SetVerbose(true)
-	sp3.Finish()
-	require.NoError(t, CheckRecordedSpans(sp3.GetRecording(), `
+	require.NoError(t, CheckRecordedSpans(sp3.FinishAndGetRecording(RecordingVerbose), `
 		span: baz
 			tags: _verbose=1 one=val1 two=val2
 	`))

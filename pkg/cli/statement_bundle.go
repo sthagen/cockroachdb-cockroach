@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -141,7 +142,9 @@ func runBundleRecreate(cmd *cobra.Command, args []string) error {
 			return setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
 		},
 		getAdminClient,
-		drainAndShutdown,
+		func(ctx context.Context, ac serverpb.AdminClient) error {
+			return drainAndShutdown(ctx, ac, "local" /* targetNode */)
+		},
 	)
 	if err != nil {
 		c.Close(ctx)
@@ -269,6 +272,8 @@ func getExplainCombinations(
 	}
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
+	fmtCtx := tree.FmtBareStrings
+
 	// Map from fully-qualified column name to list of histogram upper_bound
 	// values with unique bucket attributes.
 	statsMap := make(map[string][]string)
@@ -313,9 +318,13 @@ func getExplainCombinations(
 			statsAge[fqColName] = d.Time
 
 			typ := stat["histo_col_type"].(string)
+			if typ == "" {
+				fmt.Println("Ignoring column with empty type ", col)
+				continue
+			}
 			colTypeRef, err := parser.GetTypeFromValidSQLSyntax(typ)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, errors.Wrapf(err, "unable to parse type %s for col %s", typ, col)
 			}
 			colType := tree.MustBeStaticallyKnownType(colTypeRef)
 			buckets := stat["histo_buckets"].([]interface{})
@@ -332,14 +341,14 @@ func getExplainCombinations(
 				bucketMap[key] = []string{upperBound}
 				datum, err := rowenc.ParseDatumStringAs(colType, upperBound, &evalCtx)
 				if err != nil {
-					panic(err)
+					panic("failed parsing datum string as " + datum.String() + " " + err.Error())
 				}
 				if maxUpperBound == nil || maxUpperBound.Compare(&evalCtx, datum) < 0 {
 					maxUpperBound = datum
 				}
 				if numRange > 0 {
 					if prev, ok := datum.Prev(&evalCtx); ok {
-						bucketMap[key] = append(bucketMap[key], prev.String())
+						bucketMap[key] = append(bucketMap[key], tree.AsStringWithFlags(prev, fmtCtx))
 					}
 				}
 			}
@@ -350,7 +359,7 @@ func getExplainCombinations(
 			// Create a value that's outside of histogram range by incrementing the
 			// max value that we've seen.
 			if outside, ok := maxUpperBound.Next(&evalCtx); ok {
-				colSamples = append(colSamples, outside.String())
+				colSamples = append(colSamples, tree.AsStringWithFlags(outside, fmtCtx))
 			}
 			sort.Strings(colSamples)
 			statsMap[fqColName] = colSamples

@@ -26,7 +26,7 @@ import {
   nodeDisplayNameByIDSelector,
   nodeRegionsByIDSelector,
 } from "../store/nodes";
-import { actions as statementsActions } from "src/store/statements";
+import { actions as sqlStatsActions } from "src/store/sqlStats";
 import {
   actions as statementDiagnosticsActions,
   selectDiagnosticsReportsByStatementFingerprint,
@@ -35,7 +35,12 @@ import { actions as analyticsActions } from "src/store/analytics";
 import { actions as localStorageActions } from "src/store/localStorage";
 import { actions as nodesActions } from "../store/nodes";
 import { actions as nodeLivenessActions } from "../store/liveness";
-import { selectDateRange } from "../statementsPage/statementsPage.selectors";
+import { selectTimeScale } from "../statementsPage/statementsPage.selectors";
+import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
+type IDuration = google.protobuf.IDuration;
+
+const CreateStatementDiagnosticsReportRequest =
+  cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
 
 // For tenant cases, we don't show information about node, regions and
 // diagnostics.
@@ -44,8 +49,8 @@ const mapStateToProps = (state: AppState, props: StatementDetailsProps) => {
   const statementFingerprint = statement?.statement;
   return {
     statement,
-    statementsError: state.adminUI.statements.lastError,
-    dateRange: selectDateRange(state),
+    statementsError: state.adminUI.sqlStats.lastError,
+    timeScale: selectTimeScale(state),
     nodeNames: selectIsTenant(state) ? {} : nodeDisplayNameByIDSelector(state),
     nodeRegions: selectIsTenant(state) ? {} : nodeRegionsByIDSelector(state),
     diagnosticsReports: selectIsTenant(state)
@@ -62,7 +67,7 @@ const mapStateToProps = (state: AppState, props: StatementDetailsProps) => {
 const mapDispatchToProps = (
   dispatch: Dispatch,
 ): StatementDetailsDispatchProps => ({
-  refreshStatements: () => dispatch(statementsActions.refresh()),
+  refreshStatements: () => dispatch(sqlStatsActions.refresh()),
   refreshStatementDiagnosticsRequests: () =>
     dispatch(statementDiagnosticsActions.refresh()),
   refreshNodes: () => dispatch(nodesActions.refresh()),
@@ -74,8 +79,20 @@ const mapDispatchToProps = (
         value: false,
       }),
     ),
-  createStatementDiagnosticsReport: (statementFingerprint: string) => {
-    dispatch(statementDiagnosticsActions.createReport(statementFingerprint));
+  createStatementDiagnosticsReport: (
+    statementFingerprint: string,
+    minExecLatency: IDuration,
+    expiresAfter: IDuration,
+  ) => {
+    dispatch(
+      statementDiagnosticsActions.createReport(
+        new CreateStatementDiagnosticsReportRequest({
+          statement_fingerprint: statementFingerprint,
+          min_execution_latency: minExecLatency,
+          expires_after: expiresAfter,
+        }),
+      ),
+    );
     dispatch(
       analyticsActions.track({
         name: "Statement Diagnostics Clicked",

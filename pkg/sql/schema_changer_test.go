@@ -63,7 +63,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -87,14 +86,13 @@ func TestSchemaChangeProcess(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
-	var id = descpb.ID(keys.MinNonPredefinedUserDescID + 1 /* skip over DB ID */)
 	var instance = base.SQLInstanceID(2)
 	stopper := stop.NewStopper()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-	rf, err := rangefeed.NewFactory(stopper, kvDB, nil /* knobs */)
+	rf, err := rangefeed.NewFactory(stopper, kvDB, execCfg.Settings, nil /* knobs */)
 	require.NoError(t, err)
 	leaseMgr := lease.NewLeaseManager(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
+		s.AmbientCtx(),
 		execCfg.NodeID,
 		execCfg.DB,
 		execCfg.Clock,
@@ -107,8 +105,6 @@ func TestSchemaChangeProcess(t *testing.T) {
 	)
 	jobRegistry := s.JobRegistry().(*jobs.Registry)
 	defer stopper.Stop(context.Background())
-	changer := sql.NewSchemaChangerForTesting(
-		id, 0, instance, kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -117,6 +113,11 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 `); err != nil {
 		t.Fatal(err)
 	}
+
+	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
+
+	changer := sql.NewSchemaChangerForTesting(
+		tableID, 0, instance, kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
 
 	// Read table descriptor for version.
 	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
@@ -143,7 +144,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	index.ID = tableDesc.NextIndexID
 	tableDesc.NextIndexID++
 	changer = sql.NewSchemaChangerForTesting(
-		id, tableDesc.NextMutationID, instance, kvDB, leaseMgr, jobRegistry,
+		tableID, tableDesc.NextMutationID, instance, kvDB, leaseMgr, jobRegistry,
 		&execCfg, cluster.MakeTestingClusterSettings(),
 	)
 	tableDesc.TableDesc().Mutations = append(tableDesc.TableDesc().Mutations, descpb.DescriptorMutation{
@@ -2297,7 +2298,7 @@ INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
 	x INT8 NOT NULL,
 	y INT8 NOT NULL,
 	z INT8 NULL,
-	CONSTRAINT "primary" PRIMARY KEY (x ASC),
+	CONSTRAINT test_pkey PRIMARY KEY (x ASC),
 	INDEX i (z ASC),
 	FAMILY "primary" (x, y, z)
 )`
@@ -2318,7 +2319,7 @@ INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
 	x INT8 NOT NULL,
 	y INT8 NOT NULL,
 	z INT8 NULL,
-	CONSTRAINT "primary" PRIMARY KEY (y ASC),
+	CONSTRAINT test_pkey PRIMARY KEY (y ASC),
 	UNIQUE INDEX test_x_key (x ASC),
 	INDEX i (z ASC),
 	FAMILY "primary" (x, y, z)
@@ -2514,6 +2515,8 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 		t.Fatal(err)
 	}
 
+	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -2527,7 +2530,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 
 	// Test that trying different schema changes results an error.
 	_, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN z INT`)
-	expected := `pq: relation "test" \(53\): unimplemented: cannot perform a schema change operation while a primary key change is in progress`
+	expected := fmt.Sprintf(`pq: relation "test" \(%d\): unimplemented: cannot perform a schema change operation while a primary key change is in progress`, tableID)
 	if !testutils.IsError(err, expected) {
 		t.Fatalf("expected to find error %s but found %+v", expected, err)
 	}
@@ -2725,7 +2728,7 @@ UPDATE t.test SET z = NULL, a = $1, b = NULL, c = NULL, d = $1 WHERE y = $2`, 2*
 
 	// Ensure that the count of rows is correct along both indexes.
 	var count int
-	row := sqlDB.QueryRow(`SELECT count(*) FROM t.test@primary`)
+	row := sqlDB.QueryRow(`SELECT count(*) FROM t.test@test_pkey`)
 	if err := row.Scan(&count); err != nil {
 		t.Fatal(err)
 	}
@@ -2842,6 +2845,7 @@ func TestPrimaryKeyChangeKVOps(t *testing.T) {
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
+	defer close(waitBeforeContinuing)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -2857,6 +2861,8 @@ CREATE TABLE t.test (
 `); err != nil {
 		t.Fatal(err)
 	}
+
+	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -2884,91 +2890,91 @@ CREATE TABLE t.test (
 	}
 
 	// Test that we only insert the necessary k/v's.
-	rows, err := sqlDB.Query(`
+	rows, err := sqlDB.Query(fmt.Sprintf(`
 	SET TRACING=on,kv,results;
 	INSERT INTO t.test VALUES (1, 2, 3, NULL, NULL, 6);
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'InitPut /Table/53/2%' ORDER BY message;`)
+		message LIKE 'InitPut /Table/%d/2%%' ORDER BY message;`, tableID))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected := []string{
-		"InitPut /Table/53/2/2/0 -> /TUPLE/1:1:Int/1",
+		fmt.Sprintf("InitPut /Table/%d/2/2/0 -> /TUPLE/1:1:Int/1", tableID),
 		// TODO (rohany): this k/v is spurious and should be removed
 		//  when #45343 is fixed.
-		"InitPut /Table/53/2/2/1/1 -> /INT/2",
-		"InitPut /Table/53/2/2/2/1 -> /TUPLE/3:3:Int/3",
-		"InitPut /Table/53/2/2/4/1 -> /INT/6",
+		fmt.Sprintf("InitPut /Table/%d/2/2/1/1 -> /INT/2", tableID),
+		fmt.Sprintf("InitPut /Table/%d/2/2/2/1 -> /TUPLE/3:3:Int/3", tableID),
+		fmt.Sprintf("InitPut /Table/%d/2/2/4/1 -> /INT/6", tableID),
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
 	// Test that we remove all families when deleting.
-	rows, err = sqlDB.Query(`
+	rows, err = sqlDB.Query(fmt.Sprintf(`
 	SET TRACING=on, kv, results;
 	DELETE FROM t.test WHERE y = 2;
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'Del /Table/53/2%' ORDER BY message;`)
+		message LIKE 'Del /Table/%d/2%%' ORDER BY message;`, tableID))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected = []string{
-		"Del /Table/53/2/2/0",
-		"Del /Table/53/2/2/1/1",
-		"Del /Table/53/2/2/2/1",
-		"Del /Table/53/2/2/3/1",
-		"Del /Table/53/2/2/4/1",
+		fmt.Sprintf("Del /Table/%d/2/2/0", tableID),
+		fmt.Sprintf("Del /Table/%d/2/2/1/1", tableID),
+		fmt.Sprintf("Del /Table/%d/2/2/2/1", tableID),
+		fmt.Sprintf("Del /Table/%d/2/2/3/1", tableID),
+		fmt.Sprintf("Del /Table/%d/2/2/4/1", tableID),
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
 	// Test that we update all families when the key changes.
-	rows, err = sqlDB.Query(`
+	rows, err = sqlDB.Query(fmt.Sprintf(`
 	INSERT INTO t.test VALUES (1, 2, 3, NULL, NULL, 6);
 	SET TRACING=on, kv, results;
 	UPDATE t.test SET y = 3 WHERE y = 2;
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'Put /Table/53/2%' OR
-		message LIKE 'Del /Table/53/2%' OR
-		message LIKE 'CPut /Table/53/2%';`)
+		message LIKE 'Put /Table/%d/2%%' OR
+		message LIKE 'Del /Table/%d/2%%' OR
+		message LIKE 'CPut /Table/%d/2%%';`, tableID, tableID, tableID))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected = []string{
-		"Del /Table/53/2/2/0",
-		"CPut /Table/53/2/3/0 -> /TUPLE/1:1:Int/1 (expecting does not exist)",
+		fmt.Sprintf("Del /Table/%d/2/2/0", tableID),
+		fmt.Sprintf("CPut /Table/%d/2/3/0 -> /TUPLE/1:1:Int/1 (expecting does not exist)", tableID),
 		// TODO (rohany): this k/v is spurious and should be removed
 		//  when #45343 is fixed.
-		"Del /Table/53/2/2/1/1",
-		"CPut /Table/53/2/3/1/1 -> /INT/3 (expecting does not exist)",
-		"Del /Table/53/2/2/2/1",
-		"CPut /Table/53/2/3/2/1 -> /TUPLE/3:3:Int/3 (expecting does not exist)",
-		"Del /Table/53/2/2/4/1",
-		"CPut /Table/53/2/3/4/1 -> /INT/6 (expecting does not exist)",
+		fmt.Sprintf("Del /Table/%d/2/2/1/1", tableID),
+		fmt.Sprintf("CPut /Table/%d/2/3/1/1 -> /INT/3 (expecting does not exist)", tableID),
+		fmt.Sprintf("Del /Table/%d/2/2/2/1", tableID),
+		fmt.Sprintf("CPut /Table/%d/2/3/2/1 -> /TUPLE/3:3:Int/3 (expecting does not exist)", tableID),
+		fmt.Sprintf("Del /Table/%d/2/2/4/1", tableID),
+		fmt.Sprintf("CPut /Table/%d/2/3/4/1 -> /INT/6 (expecting does not exist)", tableID),
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
 	// Test that we only update necessary families when the key doesn't change.
-	rows, err = sqlDB.Query(`
+	rows, err = sqlDB.Query(fmt.Sprintf(`
 	SET TRACING=on, kv, results;
 	UPDATE t.test SET z = NULL, b = 5, c = NULL WHERE y = 3;
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'Put /Table/53/2%' OR
-		message LIKE 'Del /Table/53/2%' OR
-		message LIKE 'CPut /Table/53/2%';`)
+		message LIKE 'Put /Table/%d/2%%' OR
+		message LIKE 'Del /Table/%d/2%%' OR
+		message LIKE 'CPut /Table/%d/2%%';`, tableID, tableID, tableID))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected = []string{
-		"Del /Table/53/2/3/2/1",
-		"CPut /Table/53/2/3/3/1 -> /INT/5 (expecting does not exist)",
-		"Del /Table/53/2/3/4/1",
+		fmt.Sprintf("Del /Table/%d/2/3/2/1", tableID),
+		fmt.Sprintf("CPut /Table/%d/2/3/3/1 -> /INT/5 (expecting does not exist)", tableID),
+		fmt.Sprintf("Del /Table/%d/2/3/4/1", tableID),
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
@@ -3648,13 +3654,6 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		secondStmt  string
 		expectedErr string
 	}{
-		// DROP TABLE followed by CREATE TABLE case.
-		{
-			name:        `drop-create`,
-			firstStmt:   `DROP TABLE t.kv`,
-			secondStmt:  `CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR)`,
-			expectedErr: `table "kv" is being dropped, try again later`,
-		},
 		// schema change followed by another statement works.
 		{
 			name:        `createindex-insert`,
@@ -6516,61 +6515,6 @@ CREATE INDEX i ON t.test (a) WHERE b > 2
 	if numKeys != expectedNumKeys {
 		t.Errorf("partial index contains an incorrect number of keys: expected %d, but found %d", expectedNumKeys, numKeys)
 	}
-}
-
-// TestDrainingNamesCannotBeResolved tests that during the draining names state
-// for renamed descriptors, old names cannot be used via the uncached name
-// resolution path.
-func TestDrainingNamesCannotBeResolved(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		// Don't drain names. This also means that we don't wait for leases to
-		// drain before returning, which is fine since we're testing the non-
-		// leased name resolution path.
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SchemaChangeJobNoOp: func() bool { return true },
-		},
-		SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
-			TypeSchemaChangeJobNoOp: func() bool { return true },
-		},
-	}
-
-	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-
-	// Create descriptors and rename them so that the old names get stuck as
-	// draining names.
-	sqlRun.Exec(t, `
-CREATE TABLE tbl();
-ALTER TABLE tbl RENAME TO tbl2;
-
-CREATE TYPE typ AS ENUM();
-ALTER TYPE typ RENAME TO typ2;
-
-CREATE SCHEMA sc;
-ALTER SCHEMA sc RENAME TO sc2;
-
-CREATE DATABASE db;
-ALTER DATABASE db RENAME TO db2;
-`)
-
-	// Ensure that the old namespace entries still exist.
-	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'tbl'`, [][]string{{"1"}})
-	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'typ'`, [][]string{{"1"}})
-	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'sc'`, [][]string{{"1"}})
-	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'db'`, [][]string{{"1"}})
-
-	// Test uncached name resolution by attempting schema changes. As of 20.2 we
-	// have some internal inconsistency in error messages.
-	sqlRun.ExpectErr(t, `relation "tbl" does not exist`, `ALTER TABLE tbl RENAME TO tbl3`)
-	sqlRun.ExpectErr(t, `type "typ" does not exist`, `ALTER TYPE typ RENAME TO typ3`)
-	sqlRun.ExpectErr(t, `unknown schema "sc"`, `ALTER SCHEMA sc RENAME TO sc3`)
-	sqlRun.ExpectErr(t, `database "db" does not exist`, `ALTER DATABASE db RENAME TO db3`)
 }
 
 // TestAddingTableResolution tests that table names cannot be resolved in the

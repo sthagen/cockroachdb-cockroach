@@ -243,7 +243,7 @@ func init() {
 						// Wrap the output in a <div> so that the Markdown parser
 						// doesn't attempt to parse the inside of the contained
 						// <svg> as Markdown.
-						body = fmt.Sprintf(`<div>%s</div>`, body)
+						body = fmt.Sprintf(`<div style="overflow-x:auto;">%s</div>`, body)
 						// Remove blank lines and strip spaces.
 						body = stripRE.ReplaceAllString(body, "\n") + "\n"
 					}
@@ -259,6 +259,7 @@ func init() {
 	cmdSVG.Flags().StringVar(&railroadJar, "railroad", "", "Location of Railroad.jar; empty to use website")
 	cmdSVG.Flags().DurationVar(&railroadAPITimeout, "timeout", time.Second*120, "Timeout in seconds for railroad HTTP Api, "+
 		"only relevant when the web api is used; default 120s.")
+	cmdSVG.Flags().StringVar(&addr, "addr", "./pkg/sql/parser/sql.y", "Location of sql.y file. Can also specify an http address.")
 
 	diagramCmd := &cobra.Command{
 		Use:   "grammar",
@@ -380,6 +381,11 @@ var specs = []stmtSpec{
 	{
 		name: "alter_database_drop_region",
 		stmt: "alter_database_drop_region_stmt",
+	},
+	{
+		name:    "alter_default_privileges_stmt",
+		inline:  []string{"opt_for_roles", "role_or_group_or_user", "name_list", "opt_in_schemas", "schema_name_list", "abbreviated_grant_stmt", "opt_with_grant_option", "alter_default_privileges_target_object", "abbreviated_revoke_stmt", "opt_drop_behavior"},
+		nosplit: true,
 	},
 	{
 		name:   "alter_primary_key",
@@ -618,27 +624,6 @@ var specs = []stmtSpec{
 			".* 'CREATE' .* 'INVERTED' 'INDEX' .*": "",
 		},
 		nosplit: true,
-	},
-	{
-		name:   "create_index_interleaved_stmt",
-		stmt:   "create_index_stmt",
-		match:  []*regexp.Regexp{regexp.MustCompile("'INTERLEAVE'")},
-		inline: []string{"opt_unique", "opt_storing", "opt_interleave", "opt_concurrently"},
-		replace: map[string]string{
-			"'ON' a_expr":                          "'ON' column_name",
-			"'=' a_expr":                           "'=' n_buckets",
-			" opt_index_name":                      "",
-			" opt_partition_by":                    "",
-			" opt_index_access_method":             "",
-			"'ON' table_name '(' index_params ')'": "'...'",
-			"storing '(' name_list ')'":            "'STORING' '(' stored_columns ')'",
-			"table_name '(' name_list":             "parent_table '(' interleave_prefix",
-		},
-		exclude: []*regexp.Regexp{
-			regexp.MustCompile("'CREATE' 'INVERTED'"),
-			regexp.MustCompile("'EXISTS'"),
-		},
-		unlink: []string{"stored_columns", "parent_table", "interleave_prefix", "n_buckets"},
 	},
 	{
 		name:   "create_inverted_index_stmt",
@@ -880,11 +865,6 @@ var specs = []stmtSpec{
 	{
 		name:   "grant_stmt",
 		inline: []string{"privileges", "opt_privileges_clause"},
-		exclude: []*regexp.Regexp{
-			regexp.MustCompile("'TYPE' target_types"),
-			regexp.MustCompile("'SCHEMA' schema_name_list"),
-		},
-		unlink: []string{"targets"},
 	},
 	{
 		name: "foreign_key_column_level",
@@ -971,20 +951,10 @@ var specs = []stmtSpec{
 	},
 	{name: "iso_level"},
 	{
-		name:    "interleave",
-		stmt:    "create_table_stmt",
-		inline:  []string{"opt_interleave", "opt_table_with", "opt_with_storage_parameter_list", "storage_parameter_list", "opt_create_table_on_commit"},
-		replace: map[string]string{"opt_table_elem_list": "table_definition"},
-		unlink:  []string{"table_definition"},
-	},
-	{
 		name: "not_null_column_level",
 		stmt: "stmt_block",
 		replace: map[string]string{"	stmt": "	'CREATE' 'TABLE' table_name '(' column_name column_type 'NOT NULL' ( column_constraints | ) ( ',' ( column_def ( ',' column_def )* ) | ) ( table_constraints | ) ')' ')'"},
 		unlink: []string{"table_name", "column_name", "column_type", "table_constraints"},
-	},
-	{
-		name: "opt_interleave",
 	},
 	{
 		name:   "opt_with_storage_parameter_list",
@@ -1090,11 +1060,6 @@ var specs = []stmtSpec{
 	{
 		name:   "revoke_stmt",
 		inline: []string{"privileges", "opt_privileges_clause"},
-		exclude: []*regexp.Regexp{
-			regexp.MustCompile("'TYPE' target_types"),
-			regexp.MustCompile("'SCHEMA' schema_name_list"),
-		},
-		unlink: []string{"targets"},
 	},
 	{
 		name:    "rollback_transaction",
@@ -1241,6 +1206,10 @@ var specs = []stmtSpec{
 	{
 		name:   "show_databases_stmt",
 		inline: []string{"with_comment"},
+	},
+	{
+		name:   "show_default_privileges_stmt",
+		inline: []string{"opt_for_roles", "role_or_group_or_user", "name_list"},
 	},
 	{
 		name: "show_enums",

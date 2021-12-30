@@ -77,6 +77,12 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 		}
 	case descpb.TypeDescriptor_ENUM:
 		sqltelemetry.IncrementEnumCounter(sqltelemetry.EnumAlter)
+	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
+		return nil, pgerror.Newf(
+			pgcode.WrongObjectType,
+			"%q is a table's record type and cannot be modified",
+			tree.AsStringWithFQNames(n.Type, &p.semaCtx.Annotations),
+		)
 	}
 
 	return &alterTypeNode{
@@ -111,7 +117,7 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		// See https://github.com/cockroachdb/cockroach/issues/57741
 		err = params.p.setTypeSchema(params.ctx, n, string(t.Schema))
 	case *tree.AlterTypeOwner:
-		owner, err := t.Owner.ToSQLUsername(params.SessionData())
+		owner, err := t.Owner.ToSQLUsername(params.SessionData(), security.UsernameValidation)
 		if err != nil {
 			return err
 		}
@@ -269,23 +275,27 @@ func (p *planner) performRenameTypeDesc(
 	newSchemaID descpb.ID,
 	jobDesc string,
 ) error {
-	// Record the rename details in the descriptor for draining.
-	name := descpb.NameInfo{
-		ParentID:       desc.ParentID,
-		ParentSchemaID: desc.ParentSchemaID,
-		Name:           desc.Name,
+	oldNameKey := descpb.NameInfo{
+		ParentID:       desc.GetParentID(),
+		ParentSchemaID: desc.GetParentSchemaID(),
+		Name:           desc.GetName(),
 	}
-	desc.AddDrainingName(name)
 
-	// Set the descriptor up with the new name.
-	desc.Name = newName
-	// Set the descriptor to the new schema ID.
+	// Update the type descriptor with the new name and new schema ID.
+	desc.SetName(newName)
 	desc.SetParentSchemaID(newSchemaID)
+
+	// Populate the namespace update batch.
+	b := p.txn.NewBatch()
+	p.renameNamespaceEntry(ctx, b, oldNameKey, desc)
+
+	// Write the updated type descriptor.
 	if err := p.writeTypeSchemaChange(ctx, desc, jobDesc); err != nil {
 		return err
 	}
-	// Write the new namespace key.
-	return p.writeNameKey(ctx, desc, desc.ID)
+
+	// Run the namespace update batch.
+	return p.txn.Run(ctx, b)
 }
 
 func (p *planner) renameTypeValue(

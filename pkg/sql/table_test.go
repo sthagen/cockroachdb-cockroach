@@ -160,7 +160,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 		},
 		{
 			`"char"`,
-			types.MakeQChar(0),
+			types.QChar,
 			true,
 		},
 		{
@@ -182,7 +182,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (a " + d.sqlType + " PRIMARY KEY, b " + d.sqlType + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
+			descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
@@ -210,21 +210,21 @@ func TestMakeTableDescIndexes(t *testing.T) {
 		{
 			"a INT PRIMARY KEY",
 			descpb.IndexDescriptor{
-				Name:                tabledesc.PrimaryKeyIndexName,
+				Name:                tabledesc.PrimaryKeyIndexName("test"),
 				ID:                  1,
 				Unique:              true,
 				KeyColumnNames:      []string{"a"},
 				KeyColumnIDs:        []descpb.ColumnID{1},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
 			},
 			[]descpb.IndexDescriptor{},
 		},
 		{
 			"a INT UNIQUE, b INT PRIMARY KEY",
 			descpb.IndexDescriptor{
-				Name:                "primary",
+				Name:                "test_pkey",
 				ID:                  1,
 				Unique:              true,
 				KeyColumnNames:      []string{"b"},
@@ -233,7 +233,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				StoreColumnNames:    []string{"a"},
 				StoreColumnIDs:      []descpb.ColumnID{1},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
 			},
 			[]descpb.IndexDescriptor{
 				{
@@ -244,7 +244,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					KeyColumnIDs:        []descpb.ColumnID{1},
 					KeySuffixColumnIDs:  []descpb.ColumnID{2},
 					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-					Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+					Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 				},
 			},
 		},
@@ -258,21 +258,21 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
 			},
 			[]descpb.IndexDescriptor{},
 		},
 		{
 			"a INT, b INT, CONSTRAINT c UNIQUE (b), PRIMARY KEY (a, b)",
 			descpb.IndexDescriptor{
-				Name:                "primary",
+				Name:                tabledesc.PrimaryKeyIndexName("test"),
 				ID:                  1,
 				Unique:              true,
 				KeyColumnNames:      []string{"a", "b"},
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
 			},
 			[]descpb.IndexDescriptor{
 				{
@@ -283,21 +283,21 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					KeyColumnIDs:        []descpb.ColumnID{2},
 					KeySuffixColumnIDs:  []descpb.ColumnID{1},
 					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-					Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+					Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
 				},
 			},
 		},
 		{
 			"a INT, b INT, PRIMARY KEY (a, b)",
 			descpb.IndexDescriptor{
-				Name:                tabledesc.PrimaryKeyIndexName,
+				Name:                tabledesc.PrimaryKeyIndexName("test"),
 				ID:                  1,
 				Unique:              true,
 				KeyColumnNames:      []string{"a", "b"},
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -305,7 +305,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
+			descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
@@ -375,7 +375,7 @@ func TestMakeTableDescUniqueConstraints(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
+			descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
@@ -394,7 +394,7 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	s := "CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))"
 	ctx := context.Background()
 	desc, err := CreateTestTableDescriptor(ctx, 1, 100, s,
-		descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()))
+		descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,46 +466,46 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 		// Test a simple UDT as the default value.
 		{
 			"x greeting DEFAULT ('hello')",
-			`x'80':::@100053`,
+			`x'80':::@100056`,
 			getDefault,
 		},
 		{
 			"x greeting DEFAULT ('hello':::greeting)",
-			`x'80':::@100053`,
+			`x'80':::@100056`,
 			getDefault,
 		},
 		// Test when a UDT is used in a default value, but isn't the
 		// final type of the column.
 		{
 			"x INT DEFAULT (CASE WHEN 'hello'::greeting = 'hello'::greeting THEN 0 ELSE 1 END)",
-			`CASE WHEN x'80':::@100053 = x'80':::@100053 THEN 0:::INT8 ELSE 1:::INT8 END`,
+			`CASE WHEN x'80':::@100056 = x'80':::@100056 THEN 0:::INT8 ELSE 1:::INT8 END`,
 			getDefault,
 		},
 		{
 			"x BOOL DEFAULT ('hello'::greeting IS OF (greeting, greeting))",
-			`x'80':::@100053 IS OF (@100053, @100053)`,
+			`x'80':::@100056 IS OF (@100056, @100056)`,
 			getDefault,
 		},
 		// Test check constraints.
 		{
 			"x greeting, CHECK (x = 'hello')",
-			`x = x'80':::@100053`,
+			`x = x'80':::@100056`,
 			getCheck,
 		},
 		{
 			"x greeting, y STRING, CHECK (y::greeting = x)",
-			`y::@100053 = x`,
+			`y::@100056 = x`,
 			getCheck,
 		},
 		// Test a computed column in the same cases as above.
 		{
 			"x greeting AS ('hello') STORED",
-			`x'80':::@100053`,
+			`x'80':::@100056`,
 			getComputed,
 		},
 		{
 			"x INT AS (CASE WHEN 'hello'::greeting = 'hello'::greeting THEN 0 ELSE 1 END) STORED",
-			`CASE WHEN x'80':::@100053 = x'80':::@100053 THEN 0:::INT8 ELSE 1:::INT8 END`,
+			`CASE WHEN x'80':::@100056 = x'80':::@100056 THEN 0:::INT8 ELSE 1:::INT8 END`,
 			getComputed,
 		},
 	}
@@ -553,22 +553,22 @@ func TestSerializedUDTsInView(t *testing.T) {
 		// Test simple UDT in the view query.
 		{
 			"SELECT 'hello':::greeting",
-			`(SELECT b'\x80':::@100053)`,
+			`(SELECT b'\x80':::@100056)`,
 		},
 		// Test when a UDT is used in a view query, but isn't the
 		// final type of the column.
 		{
 			"SELECT 'hello'::greeting < 'hello'::greeting",
-			`(SELECT b'\x80':::@100053 < b'\x80':::@100053)`,
+			`(SELECT b'\x80':::@100056 < b'\x80':::@100056)`,
 		},
 		// Test when a UDT is used in various parts of a view (subquery, CTE, etc.).
 		{
 			"SELECT k FROM (SELECT 'hello'::greeting AS k)",
-			`(SELECT k FROM (SELECT b'\x80':::@100053 AS k))`,
+			`(SELECT k FROM (SELECT b'\x80':::@100056 AS k))`,
 		},
 		{
 			"WITH w AS (SELECT 'hello':::greeting AS k) SELECT k FROM w",
-			`(WITH w AS (SELECT b'\x80':::@100053 AS k) SELECT k FROM w)`,
+			`(WITH w AS (SELECT b'\x80':::@100056 AS k) SELECT k FROM w)`,
 		},
 	}
 

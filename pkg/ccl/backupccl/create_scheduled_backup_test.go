@@ -408,19 +408,6 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 			},
 		},
 		{
-			name:  "full-cluster-with-interleaved-table",
-			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=neverappears' WITH INCLUDE_DEPRECATED_INTERLEAVES RECURRING '@hourly'",
-			user:  freeUser,
-			expectedSchedules: []expectedSchedule{
-				{
-					nameRe:     "BACKUP .+",
-					backupStmt: "BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=neverappears' WITH detached, include_deprecated_interleaves",
-					shownStmt:  "BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=redacted' WITH detached, include_deprecated_interleaves",
-					period:     time.Hour,
-				},
-			},
-		},
-		{
 			name:  "full-cluster-always",
 			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup' WITH revision_history RECURRING '@hourly' FULL BACKUP ALWAYS",
 			user:  enterpriseUser,
@@ -429,6 +416,25 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 					nameRe:     "BACKUP .+",
 					backupStmt: "BACKUP INTO 'nodelocal://0/backup' WITH revision_history, detached",
 					period:     time.Hour,
+				},
+			},
+		},
+		{
+			name:  "full-cluster-remote-incremental-storage",
+			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup' WITH incremental_storage = 'nodelocal://1/incremental' RECURRING '@hourly'",
+			user:  enterpriseUser,
+			expectedSchedules: []expectedSchedule{
+				{
+					nameRe:     "BACKUP .*",
+					backupStmt: "BACKUP INTO LATEST IN 'nodelocal://0/backup' WITH detached, incremental_storage = 'nodelocal://1/incremental'",
+					period:     time.Hour,
+					paused:     true,
+				},
+				{
+					nameRe:     "BACKUP .+",
+					backupStmt: "BACKUP INTO 'nodelocal://0/backup' WITH detached",
+					period:     24 * time.Hour,
+					runsNow:    true,
 				},
 			},
 		},

@@ -768,7 +768,7 @@ func TestReadConsistencyTypes(t *testing.T) {
 				})
 
 			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-			db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+			db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 			prepWithRC := func() *kv.Batch {
 				b := &kv.Batch{}
@@ -916,9 +916,9 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		if nodeID != 0 {
 			c.Set(context.Background(), nodeID)
 		}
-		dbCtx.NodeID = base.NewSQLIDContainer(0, &c)
+		dbCtx.NodeID = base.NewSQLIDContainerForNode(&c)
 
-		db := kv.NewDBWithContext(testutils.MakeAmbientCtx(), factory, clock, dbCtx)
+		db := kv.NewDBWithContext(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, dbCtx)
 		return db
 	}
 
@@ -937,7 +937,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
 			db := setup(test.nodeID)
 			now := db.Clock().NowAsClockTimestamp()
-			kvTxn := roachpb.MakeTransaction("unnamed", nil /*baseKey*/, roachpb.NormalUserPriority, now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds())
+			kvTxn := roachpb.MakeTransaction("unnamed", nil /* baseKey */, roachpb.NormalUserPriority, now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds(), int32(test.nodeID))
 			txn := kv.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
 			ots := txn.TestingCloneTxn().ObservedTimestamps
 			if (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {

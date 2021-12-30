@@ -663,17 +663,17 @@ func prepareZoneConfigForMultiRegionTable(
 		return nil, nil
 	}
 	if err := newZoneConfig.Validate(); err != nil {
-		return nil, pgerror.Newf(
-			pgcode.CheckViolation,
-			"could not validate zone config: %v",
+		return nil, pgerror.Wrap(
 			err,
+			pgcode.CheckViolation,
+			"could not validate zone config",
 		)
 	}
 	if err := newZoneConfig.ValidateTandemFields(); err != nil {
-		return nil, pgerror.Newf(
-			pgcode.CheckViolation,
-			"could not validate zone config: %v",
+		return nil, pgerror.Wrap(
 			err,
+			pgcode.CheckViolation,
+			"could not validate zone config",
 		)
 	}
 	return prepareZoneConfigWrites(
@@ -1128,7 +1128,7 @@ func SynthesizeRegionConfig(
 
 	regionConfig := multiregion.RegionConfig{}
 	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, dbID, tree.DatabaseLookupFlags{
-		AvoidCached:    !o.useCache,
+		AvoidLeased:    !o.useCache,
 		Required:       true,
 		IncludeOffline: o.includeOffline,
 	})
@@ -1147,7 +1147,7 @@ func SynthesizeRegionConfig(
 		regionEnumID,
 		tree.ObjectLookupFlags{
 			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidCached:    !o.useCache,
+				AvoidLeased:    !o.useCache,
 				IncludeOffline: o.includeOffline,
 			},
 		},

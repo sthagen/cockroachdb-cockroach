@@ -11,7 +11,6 @@
 package row
 
 import (
-	"bytes"
 	"context"
 	"time"
 
@@ -64,9 +63,10 @@ type txnKVFetcher struct {
 	// individual Span has only a start key, it will be interpreted as a
 	// single-key fetch and may use a GetRequest under the hood.
 	spans roachpb.Spans
-	// spansScratch is the largest allocated slice of roachpb.Spans that we need
-	// to hold on to since we're slicing off spans in nextBatch(). Any resume
-	// spans are copied into this slice when processing each response.
+	// spansScratch is the initial state of spans (given to the fetcher when
+	// starting the scan) that we need to hold on to since we're slicing off
+	// spans in nextBatch(). Any resume spans are copied into this slice when
+	// processing each response.
 	spansScratch roachpb.Spans
 	// newFetchSpansIdx tracks the number of resume spans we have copied into
 	// spansScratch after the last fetch.
@@ -89,10 +89,10 @@ type txnKVFetcher struct {
 
 	reverse bool
 	// lockStrength represents the locking mode to use when fetching KVs.
-	lockStrength descpb.ScanLockingStrength
+	lockStrength lock.Strength
 	// lockWaitPolicy represents the policy to be used for handling conflicting
 	// locks held by other active transactions.
-	lockWaitPolicy descpb.ScanLockingWaitPolicy
+	lockWaitPolicy lock.WaitPolicy
 	// lockTimeout specifies the maximum amount of time that the fetcher will
 	// wait while attempting to acquire a lock on a key or while blocking on an
 	// existing lock in order to perform a non-locking read on a key.
@@ -106,7 +106,7 @@ type txnKVFetcher struct {
 	responses        []roachpb.ResponseUnion
 	remainingBatches [][]byte
 
-	acc mon.BoundAccount
+	acc *mon.BoundAccount
 	// spansAccountedFor and batchResponseAccountedFor track the number of bytes
 	// that we've already registered with acc in regards to spans and the batch
 	// response, respectively.
@@ -121,7 +121,7 @@ type txnKVFetcher struct {
 	responseAdmissionQ     *admission.WorkQueue
 }
 
-var _ kvBatchFetcher = &txnKVFetcher{}
+var _ KVBatchFetcher = &txnKVFetcher{}
 
 // getBatchKeyLimit returns the max size of the next batch. The size is
 // expressed in number of result keys (i.e. this size will be used for
@@ -152,12 +152,12 @@ func (f *txnKVFetcher) getBatchKeyLimitForIdx(batchIdx int) rowinfra.KeyLimit {
 		// size and at least 1/10 of the default batch size). Sample
 		// progressions of batch sizes:
 		//
-		//  First batch | Second batch | Subsequent batches
+		//  First batch |  Second batch  | Subsequent batches
 		//  -----------------------------------------------
-		//         1    |     1,000     |     10,000
-		//       100    |     1,000     |     10,000
-		//       500    |     5,000     |     10,000
-		//      1000    |    10,000     |     10,000
+		//         1    |     10,000     |     100,000
+		//       100    |     10,000     |     100,000
+		//      5000    |     50,000     |     100,000
+		//     10000    |    100,000     |     100,000
 		secondBatch := f.firstBatchKeyLimit * 10
 		switch {
 		case secondBatch < kvBatchSize/10:
@@ -170,53 +170,6 @@ func (f *txnKVFetcher) getBatchKeyLimitForIdx(batchIdx int) rowinfra.KeyLimit {
 
 	default:
 		return kvBatchSize
-	}
-}
-
-// getKeyLockingStrength returns the configured per-key locking strength to use
-// for key-value scans.
-func (f *txnKVFetcher) getKeyLockingStrength() lock.Strength {
-	switch f.lockStrength {
-	case descpb.ScanLockingStrength_FOR_NONE:
-		return lock.None
-
-	case descpb.ScanLockingStrength_FOR_KEY_SHARE:
-		// Promote to FOR_SHARE.
-		fallthrough
-	case descpb.ScanLockingStrength_FOR_SHARE:
-		// We currently perform no per-key locking when FOR_SHARE is used
-		// because Shared locks have not yet been implemented.
-		return lock.None
-
-	case descpb.ScanLockingStrength_FOR_NO_KEY_UPDATE:
-		// Promote to FOR_UPDATE.
-		fallthrough
-	case descpb.ScanLockingStrength_FOR_UPDATE:
-		// We currently perform exclusive per-key locking when FOR_UPDATE is
-		// used because Upgrade locks have not yet been implemented.
-		return lock.Exclusive
-
-	default:
-		panic(errors.AssertionFailedf("unknown locking strength %s", f.lockStrength))
-	}
-}
-
-// getWaitPolicy returns the configured lock wait policy to use for key-value
-// scans.
-func (f *txnKVFetcher) getWaitPolicy() lock.WaitPolicy {
-	switch f.lockWaitPolicy {
-	case descpb.ScanLockingWaitPolicy_BLOCK:
-		return lock.WaitPolicy_Block
-
-	case descpb.ScanLockingWaitPolicy_SKIP:
-		// Should not get here. Query should be rejected during planning.
-		panic(errors.AssertionFailedf("unsupported wait policy %s", f.lockWaitPolicy))
-
-	case descpb.ScanLockingWaitPolicy_ERROR:
-		return lock.WaitPolicy_Error
-
-	default:
-		panic(errors.AssertionFailedf("unknown wait policy %s", f.lockWaitPolicy))
 	}
 }
 
@@ -233,12 +186,21 @@ func makeKVBatchFetcherDefaultSendFunc(txn *kv.Txn) sendFunc {
 	}
 }
 
-// makeKVBatchFetcher initializes a kvBatchFetcher for the given spans. If
+// makeKVBatchFetcher initializes a KVBatchFetcher for the given spans. If
 // useBatchLimit is true, the number of result keys per batch is limited; the
 // limit grows between subsequent batches, starting at firstBatchKeyLimit (if not
 // 0) to ProductionKVBatchSize.
 //
+// The fetcher takes ownership of the spans slice - it can modify the slice and
+// will perform the memory accounting accordingly (if acc is non-nil). The
+// caller can only reuse the spans slice after the fetcher has been closed, and
+// if the caller does, it becomes responsible for the memory accounting.
+//
 // Batch limits can only be used if the spans are ordered.
+//
+// The passed-in memory account is owned by the fetcher throughout its lifetime
+// but is **not** closed - it is the caller's responsibility to close acc if it
+// is non-nil.
 func makeKVBatchFetcher(
 	ctx context.Context,
 	sendFn sendFunc,
@@ -249,7 +211,7 @@ func makeKVBatchFetcher(
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
 	lockTimeout time.Duration,
-	mon *mon.BytesMonitor,
+	acc *mon.BoundAccount,
 	forceProductionKVBatchSize bool,
 	requestAdmissionHeader roachpb.AdmissionHeader,
 	responseAdmissionQ *admission.WorkQueue,
@@ -290,7 +252,7 @@ func makeKVBatchFetcher(
 				// Current span's start key is greater than or equal to the last span's
 				// end key - we're good.
 				continue
-			} else if curEndKey.Compare(spans[i-1].Key) < 0 {
+			} else if curEndKey.Compare(spans[i-1].Key) <= 0 {
 				// Current span's end key is less than or equal to the last span's start
 				// key - also good.
 				continue
@@ -307,35 +269,40 @@ func makeKVBatchFetcher(
 		reverse:                    reverse,
 		batchBytesLimit:            batchBytesLimit,
 		firstBatchKeyLimit:         firstBatchKeyLimit,
-		lockStrength:               lockStrength,
-		lockWaitPolicy:             lockWaitPolicy,
+		lockStrength:               getKeyLockingStrength(lockStrength),
+		lockWaitPolicy:             GetWaitPolicy(lockWaitPolicy),
 		lockTimeout:                lockTimeout,
-		acc:                        mon.MakeBoundAccount(),
+		acc:                        acc,
 		forceProductionKVBatchSize: forceProductionKVBatchSize,
 		requestAdmissionHeader:     requestAdmissionHeader,
 		responseAdmissionQ:         responseAdmissionQ,
 	}
 
-	// Account for the memory we're about to allocate below.
-	if f.acc.Monitor() != nil {
+	// Account for the memory of the spans that we're taking the ownership of.
+	if f.acc != nil {
 		f.spansAccountedFor = spans.MemUsage()
 		if err := f.acc.Grow(ctx, f.spansAccountedFor); err != nil {
 			return txnKVFetcher{}, err
 		}
 	}
 
-	// Make a copy of the spans because we update them.
-	f.spans = make(roachpb.Spans, len(spans))
+	// Since the fetcher takes ownership of the spans slice, we don't need to
+	// perform the deep copy. Notably, the spans might be modified (when the
+	// fetcher receives the resume spans), but the fetcher will always keep the
+	// memory accounting up to date.
+	f.spans = spans
 	if reverse {
-		// Reverse scans receive the spans in decreasing order.
-		for i := range spans {
-			f.spans[len(spans)-i-1] = spans[i]
+		// Reverse scans receive the spans in decreasing order. Note that we
+		// need to be this tricky since we're updating the spans slice in place.
+		i, j := 0, len(spans)-1
+		for i < j {
+			f.spans[i], f.spans[j] = f.spans[j], f.spans[i]
+			i++
+			j--
 		}
-	} else {
-		copy(f.spans, spans)
 	}
-	// Keep the reference to the newly allocated spans slice. We will never need
-	// larger slice for the resume spans.
+	// Keep the reference to the full spans slice. We will never need larger
+	// slice for the resume spans.
 	f.spansScratch = f.spans
 
 	return f, nil
@@ -344,89 +311,18 @@ func makeKVBatchFetcher(
 // fetch retrieves spans from the kv layer.
 func (f *txnKVFetcher) fetch(ctx context.Context) error {
 	var ba roachpb.BatchRequest
-	ba.Header.WaitPolicy = f.getWaitPolicy()
+	ba.Header.WaitPolicy = f.lockWaitPolicy
 	ba.Header.LockTimeout = f.lockTimeout
 	ba.Header.TargetBytes = int64(f.batchBytesLimit)
 	ba.Header.MaxSpanRequestKeys = int64(f.getBatchKeyLimit())
 	ba.AdmissionHeader = f.requestAdmissionHeader
-	ba.Requests = make([]roachpb.RequestUnion, len(f.spans))
-	keyLocking := f.getKeyLockingStrength()
-
-	// Detect the number of gets vs scans, so we can batch allocate all of the
-	// requests precisely.
-	nGets := 0
-	for i := range f.spans {
-		if f.spans[i].EndKey == nil {
-			nGets++
-		}
-	}
-	gets := make([]struct {
-		req   roachpb.GetRequest
-		union roachpb.RequestUnion_Get
-	}, nGets)
-
-	// curGet is incremented each time we fill in a GetRequest.
-	curGet := 0
-	if f.reverse {
-		scans := make([]struct {
-			req   roachpb.ReverseScanRequest
-			union roachpb.RequestUnion_ReverseScan
-		}, len(f.spans)-nGets)
-		for i := range f.spans {
-			if f.spans[i].EndKey == nil {
-				// A span without an EndKey indicates that the caller is requesting a
-				// single key fetch, which can be served using a GetRequest.
-				gets[curGet].req.Key = f.spans[i].Key
-				gets[curGet].req.KeyLocking = keyLocking
-				gets[curGet].union.Get = &gets[curGet].req
-				ba.Requests[i].Value = &gets[curGet].union
-				curGet++
-				continue
-			}
-			curScan := i - curGet
-			scans[curScan].req.SetSpan(f.spans[i])
-			scans[curScan].req.ScanFormat = roachpb.BATCH_RESPONSE
-			scans[curScan].req.KeyLocking = keyLocking
-			scans[curScan].union.ReverseScan = &scans[curScan].req
-			ba.Requests[i].Value = &scans[curScan].union
-		}
-	} else {
-		scans := make([]struct {
-			req   roachpb.ScanRequest
-			union roachpb.RequestUnion_Scan
-		}, len(f.spans)-nGets)
-		for i := range f.spans {
-			if f.spans[i].EndKey == nil {
-				// A span without an EndKey indicates that the caller is requesting a
-				// single key fetch, which can be served using a GetRequest.
-				gets[curGet].req.Key = f.spans[i].Key
-				gets[curGet].req.KeyLocking = keyLocking
-				gets[curGet].union.Get = &gets[curGet].req
-				ba.Requests[i].Value = &gets[curGet].union
-				curGet++
-				continue
-			}
-			curScan := i - curGet
-			scans[curScan].req.SetSpan(f.spans[i])
-			scans[curScan].req.ScanFormat = roachpb.BATCH_RESPONSE
-			scans[curScan].req.KeyLocking = keyLocking
-			scans[curScan].union.Scan = &scans[curScan].req
-			ba.Requests[i].Value = &scans[curScan].union
-		}
-	}
+	ba.Requests = spansToRequests(f.spans, f.reverse, f.lockStrength)
 
 	if log.ExpensiveLogEnabled(ctx, 2) {
-		var buf bytes.Buffer
-		for i, span := range f.spans {
-			if i != 0 {
-				buf.WriteString(", ")
-			}
-			buf.WriteString(span.String())
-		}
-		log.VEventf(ctx, 2, "Scan %s", buf.String())
+		log.VEventf(ctx, 2, "Scan %s", f.spans)
 	}
 
-	monitoring := f.acc.Monitor() != nil
+	monitoring := f.acc != nil
 
 	const tokenFetchAllocation = 1 << 10
 	if !monitoring || f.batchResponseAccountedFor < tokenFetchAllocation {
@@ -595,7 +491,7 @@ func (f *txnKVFetcher) nextBatch(
 		}
 		// We have some resume spans.
 		f.spans = f.spansScratch[:f.newFetchSpansIdx]
-		if f.acc.Monitor() != nil {
+		if f.acc != nil {
 			used := f.acc.Used()
 			delta := f.spans.MemUsage() - f.spansAccountedFor
 			if err := f.acc.Resize(ctx, used, used+delta); err != nil {
@@ -618,5 +514,74 @@ func (f *txnKVFetcher) close(ctx context.Context) {
 	f.remainingBatches = nil
 	f.spans = nil
 	f.spansScratch = nil
-	f.acc.Close(ctx)
+	f.acc.Clear(ctx)
+}
+
+func spansToRequests(
+	spans roachpb.Spans, reverse bool, keyLocking lock.Strength,
+) []roachpb.RequestUnion {
+	reqs := make([]roachpb.RequestUnion, len(spans))
+	// Detect the number of gets vs scans, so we can batch allocate all of the
+	// requests precisely.
+	nGets := 0
+	for i := range spans {
+		if spans[i].EndKey == nil {
+			nGets++
+		}
+	}
+	gets := make([]struct {
+		req   roachpb.GetRequest
+		union roachpb.RequestUnion_Get
+	}, nGets)
+
+	// curGet is incremented each time we fill in a GetRequest.
+	curGet := 0
+	if reverse {
+		scans := make([]struct {
+			req   roachpb.ReverseScanRequest
+			union roachpb.RequestUnion_ReverseScan
+		}, len(spans)-nGets)
+		for i := range spans {
+			if spans[i].EndKey == nil {
+				// A span without an EndKey indicates that the caller is requesting a
+				// single key fetch, which can be served using a GetRequest.
+				gets[curGet].req.Key = spans[i].Key
+				gets[curGet].req.KeyLocking = keyLocking
+				gets[curGet].union.Get = &gets[curGet].req
+				reqs[i].Value = &gets[curGet].union
+				curGet++
+				continue
+			}
+			curScan := i - curGet
+			scans[curScan].req.SetSpan(spans[i])
+			scans[curScan].req.ScanFormat = roachpb.BATCH_RESPONSE
+			scans[curScan].req.KeyLocking = keyLocking
+			scans[curScan].union.ReverseScan = &scans[curScan].req
+			reqs[i].Value = &scans[curScan].union
+		}
+	} else {
+		scans := make([]struct {
+			req   roachpb.ScanRequest
+			union roachpb.RequestUnion_Scan
+		}, len(spans)-nGets)
+		for i := range spans {
+			if spans[i].EndKey == nil {
+				// A span without an EndKey indicates that the caller is requesting a
+				// single key fetch, which can be served using a GetRequest.
+				gets[curGet].req.Key = spans[i].Key
+				gets[curGet].req.KeyLocking = keyLocking
+				gets[curGet].union.Get = &gets[curGet].req
+				reqs[i].Value = &gets[curGet].union
+				curGet++
+				continue
+			}
+			curScan := i - curGet
+			scans[curScan].req.SetSpan(spans[i])
+			scans[curScan].req.ScanFormat = roachpb.BATCH_RESPONSE
+			scans[curScan].req.KeyLocking = keyLocking
+			scans[curScan].union.Scan = &scans[curScan].req
+			reqs[i].Value = &scans[curScan].union
+		}
+	}
+	return reqs
 }

@@ -33,6 +33,7 @@ import (
 var (
 	// DefaultTTL specifies the time to expiration when a session is created.
 	DefaultTTL = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"server.sqlliveness.ttl",
 		"default sqlliveness session ttl",
 		40*time.Second,
@@ -40,6 +41,7 @@ var (
 	)
 	// DefaultHeartBeat specifies the period between attempts to extend a session.
 	DefaultHeartBeat = settings.RegisterDurationSetting(
+		settings.TenantWritable,
 		"server.sqlliveness.heartbeat",
 		"duration heart beats to push session expiration further out in time",
 		5*time.Second,
@@ -61,7 +63,9 @@ type session struct {
 	id sqlliveness.SessionID
 	mu struct {
 		syncutil.RWMutex
-		exp                    hlc.Timestamp
+		exp hlc.Timestamp
+		// sessionExpiryCallbacks are invoked when the session expires. They're
+		// invoked under the session's lock, so keep them small.
 		sessionExpiryCallbacks []func(ctx context.Context)
 	}
 }
@@ -89,7 +93,7 @@ func (s *session) invokeSessionExpiryCallbacks(ctx context.Context) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, callback := range s.mu.sessionExpiryCallbacks {
-		go callback(ctx)
+		callback(ctx)
 	}
 }
 

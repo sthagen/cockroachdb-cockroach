@@ -146,7 +146,8 @@ func TestRegistry(t *testing.T) {
 			registry.AddContentionEvent(roachpb.ContentionEvent{
 				Key: keyBytes,
 				TxnMeta: enginepb.TxnMeta{
-					ID: contendingTxnID,
+					ID:                contendingTxnID,
+					CoordinatorNodeID: 6,
 				},
 				Duration: time.Duration(contentionDuration),
 			})
@@ -189,7 +190,7 @@ func TestRegistryConcurrentAdds(t *testing.T) {
 // - all three levels of objects satisfy the respective ordering
 //   requirements.
 func TestSerializedRegistryInvariants(t *testing.T) {
-	rng, _ := randutil.NewPseudoRand()
+	rng, _ := randutil.NewTestRand()
 	const nonSQLKeyProbability = 0.1
 	const sizeLimit = 5
 	const keySpaceSize = sizeLimit * sizeLimit
@@ -233,8 +234,9 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 			r.AddContentionEvent(roachpb.ContentionEvent{
 				Key: key,
 				TxnMeta: enginepb.TxnMeta{
-					ID:  uuid.MakeV4(),
-					Key: getKey(),
+					ID:                uuid.MakeV4(),
+					Key:               getKey(),
+					CoordinatorNodeID: 6,
 				},
 				Duration: time.Duration(int64(rng.Uint64())),
 			})

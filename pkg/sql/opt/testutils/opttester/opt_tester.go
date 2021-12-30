@@ -33,6 +33,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -40,7 +42,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	_ "github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder" // for ExprFmtHideScalars.
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/indexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
@@ -54,6 +58,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/datadriven"
@@ -294,6 +301,12 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    Builds an expression tree from a SQL query, fully optimizes it using the
 //    memo, and then outputs the lowest cost tree.
 //
+//  - assign-placeholders-build query-args=(...)
+//
+//    Builds a query that has placeholders (with normalization disabled), then
+//    assigns placeholders to the given query arguments. Normalization rules are
+//    disabled when assigning placeholders.
+//
 //  - assign-placeholders-norm query-args=(...)
 //
 //    Builds a query that has placeholders (with normalization enabled), then
@@ -386,6 +399,16 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    and memo groups created. If the rule-limit or group-limit flags are set,
 //    check-size will result in a test error if the rule application or memo
 //    group count exceeds the corresponding limit.
+//
+//  - index-candidates
+//
+//    Walks through the SQL statement to determine candidates for index
+//    recommendation. See the indexrec package.
+//
+//  - index-recommendations
+//
+//    Walks through the SQL statement and recommends indexes to add in order to
+//    speed up its execution, if these indexes exist. See the indexrec package.
 //
 // Supported flags:
 //
@@ -554,9 +577,10 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		ot.postProcess(tb, d, e)
 		return ot.FormatExpr(e)
 
-	case "assign-placeholders-norm", "assign-placeholders-opt":
+	case "assign-placeholders-build", "assign-placeholders-norm", "assign-placeholders-opt":
 		explore := d.Cmd == "assign-placeholders-opt"
-		e, err := ot.AssignPlaceholders(ot.Flags.QueryArgs, explore)
+		normalize := explore || d.Cmd == "assign-placeholders-norm"
+		e, err := ot.AssignPlaceholders(ot.Flags.QueryArgs, normalize, explore)
 		if err != nil {
 			d.Fatalf(tb, "%+v", err)
 		}
@@ -655,6 +679,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		if err != nil {
 			d.Fatalf(tb, "%+v", err)
 		}
+		ot.checkExpectedRules(tb, d)
 		return result
 
 	case "expr":
@@ -702,6 +727,20 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		}
 		return result
 
+	case "index-candidates":
+		result, err := ot.IndexCandidates()
+		if err != nil {
+			d.Fatalf(tb, "%+v", err)
+		}
+		return result
+
+	case "index-recommendations":
+		result, err := ot.IndexRecommendations()
+		if err != nil {
+			d.Fatalf(tb, "%+v", err)
+		}
+		return result
+
 	default:
 		d.Fatalf(tb, "unsupported command: %s", d.Cmd)
 		return ""
@@ -730,15 +769,7 @@ func formatRuleSet(r RuleSet) string {
 	return buf.String()
 }
 
-func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Expr) {
-	fillInLazyProps(e)
-
-	if rel, ok := e.(memo.RelExpr); ok {
-		for _, cols := range ot.Flags.ColStats {
-			memo.RequestColStat(&ot.evalCtx, rel, cols)
-		}
-	}
-
+func (ot *OptTester) checkExpectedRules(tb testing.TB, d *datadriven.TestData) {
 	if !ot.Flags.ExpectedRules.SubsetOf(ot.appliedRules) {
 		unseen := ot.Flags.ExpectedRules.Difference(ot.appliedRules)
 		d.Fatalf(tb, "expected to see %s, but was not triggered. Did see %s",
@@ -749,6 +780,17 @@ func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Ex
 		seen := ot.Flags.UnexpectedRules.Intersection(ot.appliedRules)
 		d.Fatalf(tb, "expected not to see %s, but it was triggered", formatRuleSet(seen))
 	}
+}
+
+func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Expr) {
+	fillInLazyProps(e)
+
+	if rel, ok := e.(memo.RelExpr); ok {
+		for _, cols := range ot.Flags.ColStats {
+			memo.RequestColStat(&ot.evalCtx, rel, cols)
+		}
+	}
+	ot.checkExpectedRules(tb, d)
 }
 
 // Fills in lazily-derived properties (for display).
@@ -1020,7 +1062,7 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 func (ot *OptTester) OptBuild() (opt.Expr, error) {
 	o := ot.makeOptimizer()
 	o.DisableOptimizations()
-	return ot.optimizeExpr(o)
+	return ot.optimizeExpr(o, nil)
 }
 
 // OptNorm constructs an opt expression tree for the SQL query, with all
@@ -1040,27 +1082,48 @@ func (ot *OptTester) OptNorm() (opt.Expr, error) {
 	if !ot.Flags.NoStableFolds {
 		o.Factory().FoldingControl().AllowStableFolds()
 	}
-	return ot.optimizeExpr(o)
+	return ot.optimizeExpr(o, nil)
 }
 
 // Optimize constructs an opt expression tree for the SQL query, with all
 // transformations applied to it. The result is the memo expression tree with
 // the lowest estimated cost.
 func (ot *OptTester) Optimize() (opt.Expr, error) {
+	return ot.OptimizeWithTables(nil)
+}
+
+// OptimizeWithTables is identical to Optimize except it also allows the user to
+// update the table metadata used for optimization. Optimize constructs an opt
+// expression tree for the SQL query, with all transformations applied to it.
+// The result is the memo expression tree with the lowest estimated cost.
+func (ot *OptTester) OptimizeWithTables(tables map[cat.StableID]cat.Table) (opt.Expr, error) {
 	o := ot.makeOptimizer()
 	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		return !ot.Flags.DisableRules.Contains(int(ruleName))
 	})
 	o.Factory().FoldingControl().AllowStableFolds()
-	return ot.optimizeExpr(o)
+	return ot.optimizeExpr(o, tables)
 }
 
 // AssignPlaceholders builds the given query with placeholders, then assigns the
 // placeholders to the given argument values, and optionally runs exploration.
 //
 // The arguments are parsed as SQL expressions.
-func (ot *OptTester) AssignPlaceholders(queryArgs []string, explore bool) (opt.Expr, error) {
+func (ot *OptTester) AssignPlaceholders(
+	queryArgs []string, normalize, explore bool,
+) (opt.Expr, error) {
+	maybeDisableRule := func(ruleName opt.RuleName) bool {
+		if !normalize && ruleName.IsNormalize() {
+			return false
+		}
+		if !explore && ruleName.IsExplore() {
+			return false
+		}
+		return true
+	}
+
 	o := ot.makeOptimizer()
+	o.NotifyOnMatchedRule(maybeDisableRule)
 
 	// Build the prepared memo. Note that placeholders don't have values yet, so
 	// they won't be replaced.
@@ -1105,15 +1168,7 @@ func (ot *OptTester) AssignPlaceholders(queryArgs []string, explore bool) (opt.E
 	ot.appliedRules = RuleSet{}
 	// Now assign placeholders.
 	o = ot.makeOptimizer()
-	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
-		if !explore && !ruleName.IsNormalize() {
-			return false
-		}
-		if ot.Flags.DisableRules.Contains(int(ruleName)) {
-			return false
-		}
-		return true
-	})
+	o.NotifyOnMatchedRule(maybeDisableRule)
 
 	o.Factory().FoldingControl().AllowStableFolds()
 	if err := o.Factory().AssignPlaceholders(prepMemo); err != nil {
@@ -1140,9 +1195,11 @@ func (ot *OptTester) PlaceholderFastPath() (_ opt.Expr, ok bool, _ error) {
 // Memo returns a string that shows the memo data structure that is constructed
 // by the optimizer.
 func (ot *OptTester) Memo() (string, error) {
-	var o xform.Optimizer
-	o.Init(&ot.evalCtx, ot.catalog)
-	if _, err := ot.optimizeExpr(&o); err != nil {
+	o := ot.makeOptimizer()
+	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
+		return !ot.Flags.DisableRules.Contains(int(ruleName))
+	})
+	if _, err := ot.optimizeExpr(o, nil); err != nil {
 		return "", err
 	}
 	return o.FormatMemo(ot.Flags.MemoFormat), nil
@@ -1207,7 +1264,7 @@ func (ot *OptTester) RuleStats() (string, error) {
 			}
 		},
 	)
-	if _, err := ot.optimizeExpr(o); err != nil {
+	if _, err := ot.optimizeExpr(o, nil); err != nil {
 		return "", err
 	}
 
@@ -1954,7 +2011,7 @@ func (ot *OptTester) CheckSize() (string, error) {
 	o.Memo().NotifyOnNewGroup(func(expr opt.Expr) {
 		groups++
 	})
-	if _, err := ot.optimizeExpr(o); err != nil {
+	if _, err := ot.optimizeExpr(o, nil); err != nil {
 		return "", err
 	}
 	if ot.Flags.RuleApplicationLimit > 0 && ruleApplications > ot.Flags.RuleApplicationLimit {
@@ -1965,6 +2022,73 @@ func (ot *OptTester) CheckSize() (string, error) {
 		return "", fmt.Errorf("memo groups exceeded limit: %d groups", groups)
 	}
 	return fmt.Sprintf("Rules Applied: %d\nGroups Added: %d\n", ruleApplications, groups), nil
+}
+
+// IndexCandidates is used with the index-candidates option. It finds index
+// candidates for the SQL statement and formats them as a sorted string.
+func (ot *OptTester) IndexCandidates() (string, error) {
+	expr, err := ot.OptNorm()
+	if err != nil {
+		return "", err
+	}
+	indexCandidates := indexrec.FindIndexCandidateSet(expr, expr.(memo.RelExpr).Memo().Metadata())
+
+	// Build a formatted string to output from the map of indexCandidates.
+	tablesOutput := make([]string, 0, len(indexCandidates))
+	for t, indexes := range indexCandidates {
+		var tableSb strings.Builder
+		tableName := t.Name()
+		tableSb.WriteString(tableName.String())
+		tableSb.WriteString(":\n")
+		indexesOutput := make([]string, len(indexes))
+		for i, index := range indexes {
+			var indexSb strings.Builder
+			indexSb.WriteString(" (")
+			for j, indexCol := range index {
+				if j > 0 {
+					indexSb.WriteString(", ")
+				}
+				colName := indexCol.Column.ColName()
+				indexSb.WriteString(colName.String())
+				if indexCol.Descending {
+					indexSb.WriteString(" DESC")
+				}
+			}
+			indexSb.WriteString(")\n")
+			indexesOutput[i] = indexSb.String()
+		}
+		sort.Strings(indexesOutput)
+		tableSb.WriteString(strings.Join(indexesOutput, ""))
+		tablesOutput = append(tablesOutput, tableSb.String())
+	}
+	sort.Strings(tablesOutput)
+	return strings.Join(tablesOutput, ""), nil
+}
+
+// IndexRecommendations is used with the index-recommendations option. It
+// determines index recommendations for the SQL statement, if they exist, and
+// formats them as a human-readable string.
+func (ot *OptTester) IndexRecommendations() (string, error) {
+	normExpr, err := ot.OptNorm()
+	if err != nil {
+		return "", err
+	}
+	md := normExpr.(memo.RelExpr).Memo().Metadata()
+	indexCandidates := indexrec.FindIndexCandidateSet(normExpr, md)
+	_, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+
+	optExpr, err := ot.OptimizeWithTables(hypTables)
+	if err != nil {
+		return "", err
+	}
+	md = optExpr.(memo.RelExpr).Memo().Metadata()
+	indexRecommendations := indexrec.FindIndexRecommendationSet(optExpr, md)
+	result := indexRecommendations.Output()
+
+	if result == nil {
+		return fmt.Sprintf("No index recommendations.\n--\nOptimal Plan.\n%s", ot.FormatExpr(optExpr)), nil
+	}
+	return fmt.Sprintf("%s\n--\nOptimal Plan.\n%s", strings.Join(result, "\n"), ot.FormatExpr(optExpr)), nil
 }
 
 func (ot *OptTester) buildExpr(factory *norm.Factory) error {
@@ -1996,10 +2120,17 @@ func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	return &o
 }
 
-func (ot *OptTester) optimizeExpr(o *xform.Optimizer) (opt.Expr, error) {
+// optimizeExpr calls the optimizer's Optimize function. The tables argument, if
+// not nil, allows the caller to update the table metadata before optimizing.
+func (ot *OptTester) optimizeExpr(
+	o *xform.Optimizer, tables map[cat.StableID]cat.Table,
+) (opt.Expr, error) {
 	err := ot.buildExpr(o.Factory())
 	if err != nil {
 		return nil, err
+	}
+	if tables != nil {
+		o.Memo().Metadata().UpdateTableMeta(tables)
 	}
 	root, err := o.Optimize()
 	if err != nil {
@@ -2040,4 +2171,19 @@ func ruleFromString(str string) (opt.RuleName, error) {
 	}
 
 	return opt.InvalidRuleName, fmt.Errorf("rule '%s' does not exist", str)
+}
+
+// ExecBuild is used for testing to expose makeOptimizer.
+func (ot *OptTester) ExecBuild(f exec.Factory, mem *memo.Memo, expr opt.Expr) (exec.Plan, error) {
+	// For DDL we need a fresh root transaction that isn't system tenant.
+	if opt.IsDDLOp(expr) {
+		ot.evalCtx.Codec = keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+		factory := kv.MockTxnSenderFactory{}
+		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		stopper := stop.NewStopper()
+		db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
+		ot.evalCtx.Txn = kv.NewTxn(context.Background(), db, 1)
+	}
+	bld := execbuilder.New(f, ot.makeOptimizer(), mem, ot.catalog, expr, &ot.evalCtx, true)
+	return bld.Build()
 }

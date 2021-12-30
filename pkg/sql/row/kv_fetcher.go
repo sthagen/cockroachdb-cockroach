@@ -26,10 +26,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// KVFetcher wraps kvBatchFetcher, providing a NextKV interface that returns the
+// KVFetcher wraps KVBatchFetcher, providing a NextKV interface that returns the
 // next kv from its input.
 type KVFetcher struct {
-	kvBatchFetcher
+	KVBatchFetcher
 
 	kvs []roachpb.KeyValue
 
@@ -44,7 +44,12 @@ type KVFetcher struct {
 }
 
 // NewKVFetcher creates a new KVFetcher.
-// If mon is non-nil, this fetcher will track its fetches and must be Closed.
+// If acc is non-nil, this fetcher will track its fetches and must be Closed.
+//
+// The fetcher takes ownership of the spans slice - it can modify the slice and
+// will perform the memory accounting accordingly (if acc is non-nil). The
+// caller can only reuse the spans slice after the fetcher has been closed, and
+// if the caller does, it becomes responsible for the memory accounting.
 func NewKVFetcher(
 	ctx context.Context,
 	txn *kv.Txn,
@@ -56,7 +61,7 @@ func NewKVFetcher(
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
 	lockTimeout time.Duration,
-	mon *mon.BytesMonitor,
+	acc *mon.BoundAccount,
 	forceProductionKVBatchSize bool,
 ) (*KVFetcher, error) {
 	var sendFn sendFunc
@@ -95,7 +100,7 @@ func NewKVFetcher(
 		lockStrength,
 		lockWaitPolicy,
 		lockTimeout,
-		mon,
+		acc,
 		forceProductionKVBatchSize,
 		txn.AdmissionHeader(),
 		txn.DB().SQLKVResponseAdmissionQ,
@@ -103,9 +108,9 @@ func NewKVFetcher(
 	return newKVFetcher(&kvBatchFetcher), err
 }
 
-func newKVFetcher(batchFetcher kvBatchFetcher) *KVFetcher {
+func newKVFetcher(batchFetcher KVBatchFetcher) *KVFetcher {
 	ret := &KVFetcher{
-		kvBatchFetcher: batchFetcher,
+		KVBatchFetcher: batchFetcher,
 	}
 	return ret
 }
@@ -205,15 +210,15 @@ func (f *KVFetcher) NextKV(
 // at the end of execution if the fetcher was provisioned with a memory
 // monitor.
 func (f *KVFetcher) Close(ctx context.Context) {
-	f.kvBatchFetcher.close(ctx)
+	f.KVBatchFetcher.close(ctx)
 }
 
-// SpanKVFetcher is a kvBatchFetcher that returns a set slice of kvs.
+// SpanKVFetcher is a KVBatchFetcher that returns a set slice of kvs.
 type SpanKVFetcher struct {
 	KVs []roachpb.KeyValue
 }
 
-// nextBatch implements the kvBatchFetcher interface.
+// nextBatch implements the KVBatchFetcher interface.
 func (f *SpanKVFetcher) nextBatch(
 	ctx context.Context,
 ) (ok bool, kvs []roachpb.KeyValue, batchResponse []byte, err error) {
@@ -227,7 +232,7 @@ func (f *SpanKVFetcher) nextBatch(
 
 func (f *SpanKVFetcher) close(context.Context) {}
 
-// BackupSSTKVFetcher is a kvBatchFetcher that wraps storage.SimpleMVCCIterator
+// BackupSSTKVFetcher is a KVBatchFetcher that wraps storage.SimpleMVCCIterator
 // and returns a batch of kv from backupSST.
 type BackupSSTKVFetcher struct {
 	iter          storage.SimpleMVCCIterator

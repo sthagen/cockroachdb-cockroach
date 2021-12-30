@@ -54,10 +54,12 @@ func (w metadataCarrier) ForEach(fn func(key, val string) error) error {
 	return nil
 }
 
-func extractSpanMeta(ctx context.Context, tracer *Tracer) (SpanMeta, error) {
+// ExtractSpanMetaFromGRPCCtx retrieves a SpanMeta carried as gRPC metadata by
+// an RPC.
+func ExtractSpanMetaFromGRPCCtx(ctx context.Context, tracer *Tracer) (SpanMeta, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		md = metadata.New(nil)
+		return SpanMeta{}, nil
 	}
 	return tracer.ExtractMetaFrom(metadataCarrier{md})
 }
@@ -85,6 +87,24 @@ func setGRPCErrorTag(sp *Span, err error) {
 	}
 }
 
+// BatchMethodName is the method name of Internal.Batch RPC.
+const BatchMethodName = "/cockroach.roachpb.Internal/Batch"
+
+// SetupFlowMethodName is the method name of DistSQL.SetupFlow RPC.
+const SetupFlowMethodName = "/cockroach.sql.distsqlrun.DistSQL/SetupFlow"
+const flowStreamMethodName = "/cockroach.sql.distsqlrun.DistSQL/FlowStream"
+
+// methodExcludedFromTracing returns true if a call to the given RPC method does
+// not need to propagate tracing info. Some RPCs (Internal.Batch,
+// DistSQL.SetupFlow) have dedicated fields for passing along the tracing
+// context in the request, which is more efficient than letting the RPC
+// interceptors deal with it. Others (DistSQL.FlowStream) are simply exempt from
+// tracing because it's not worth it.
+func methodExcludedFromTracing(method string) bool {
+	return method == BatchMethodName || method == SetupFlowMethodName ||
+		method == flowStreamMethodName
+}
+
 // ServerInterceptor returns a grpc.UnaryServerInterceptor suitable
 // for use in a grpc.NewServer call.
 //
@@ -107,7 +127,11 @@ func ServerInterceptor(tracer *Tracer) grpc.UnaryServerInterceptor {
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (resp interface{}, err error) {
-		spanMeta, err := extractSpanMeta(ctx, tracer)
+		if methodExcludedFromTracing(info.FullMethod) {
+			return handler(ctx, req)
+		}
+
+		spanMeta, err := ExtractSpanMetaFromGRPCCtx(ctx, tracer)
 		if err != nil {
 			return nil, err
 		}
@@ -118,7 +142,7 @@ func ServerInterceptor(tracer *Tracer) grpc.UnaryServerInterceptor {
 		ctx, serverSpan := tracer.StartSpanCtx(
 			ctx,
 			info.FullMethod,
-			WithParentAndManualCollection(spanMeta),
+			WithRemoteParent(spanMeta),
 			WithServerSpanKind,
 		)
 		defer serverSpan.Finish()
@@ -150,7 +174,10 @@ func ServerInterceptor(tracer *Tracer) grpc.UnaryServerInterceptor {
 // application-specific gRPC handler(s) to access.
 func StreamServerInterceptor(tracer *Tracer) grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		spanMeta, err := extractSpanMeta(ss.Context(), tracer)
+		if methodExcludedFromTracing(info.FullMethod) {
+			return handler(srv, ss)
+		}
+		spanMeta, err := ExtractSpanMetaFromGRPCCtx(ss.Context(), tracer)
 		if err != nil {
 			return err
 		}
@@ -161,7 +188,7 @@ func StreamServerInterceptor(tracer *Tracer) grpc.StreamServerInterceptor {
 		ctx, serverSpan := tracer.StartSpanCtx(
 			ss.Context(),
 			info.FullMethod,
-			WithParentAndManualCollection(spanMeta),
+			WithRemoteParent(spanMeta),
 			WithServerSpanKind,
 		)
 		defer serverSpan.Finish()
@@ -207,11 +234,7 @@ func injectSpanMeta(ctx context.Context, tracer *Tracer, clientSpan *Span) conte
 	} else {
 		md = md.Copy()
 	}
-
-	if err := tracer.InjectMetaInto(clientSpan.Meta(), metadataCarrier{md}); err != nil {
-		// We have no better place to record an error than the Span itself.
-		clientSpan.Recordf("error: %s", err)
-	}
+	tracer.InjectMetaInto(clientSpan.Meta(), metadataCarrier{md})
 	return metadata.NewOutgoingContext(ctx, md)
 }
 
@@ -229,7 +252,15 @@ func injectSpanMeta(ctx context.Context, tracer *Tracer, clientSpan *Span) conte
 // metadata; they will also look in the context.Context for an active
 // in-process parent Span and establish a ChildOf relationship if such a parent
 // Span could be found.
-func ClientInterceptor(tracer *Tracer, init func(*Span)) grpc.UnaryClientInterceptor {
+//
+// compatibilityMode is a callback that will be used to check whether the node
+// (still) needs compatibility with 21.2. If it doesn't, then a more performant
+// trace propagation mechanism is used. The compatibility check is built as a
+// callback rather than directly checking the cluster version because this
+// tracing package cannot use cluster settings.
+func ClientInterceptor(
+	tracer *Tracer, init func(*Span), compatibilityMode func(ctx context.Context) bool,
+) grpc.UnaryClientInterceptor {
 	if init == nil {
 		init = func(*Span) {}
 	}
@@ -245,15 +276,24 @@ func ClientInterceptor(tracer *Tracer, init func(*Span)) grpc.UnaryClientInterce
 		if !spanInclusionFuncForClient(parent) {
 			return invoker(ctx, method, req, resp, cc, opts...)
 		}
+
 		clientSpan := tracer.StartSpan(
 			method,
-			WithParentAndAutoCollection(parent),
+			WithParent(parent),
 			WithClientSpanKind,
 		)
 		init(clientSpan)
 		defer clientSpan.Finish()
-		ctx = injectSpanMeta(ctx, tracer, clientSpan)
-		err := invoker(ctx, method, req, resp, cc, opts...)
+
+		// For most RPCs we pass along tracing info as gRPC metadata. Some select
+		// RPCs carry the tracing in the request protos, which is more efficient.
+		if compatibilityMode(ctx) || !methodExcludedFromTracing(method) {
+			ctx = injectSpanMeta(ctx, tracer, clientSpan)
+		}
+		var err error
+		if invoker != nil {
+			err = invoker(ctx, method, req, resp, cc, opts...)
+		}
 		if err != nil {
 			setGRPCErrorTag(clientSpan, err)
 			clientSpan.Recordf("error: %s", err)
@@ -296,11 +336,14 @@ func StreamClientInterceptor(tracer *Tracer, init func(*Span)) grpc.StreamClient
 
 		clientSpan := tracer.StartSpan(
 			method,
-			WithParentAndAutoCollection(parent),
+			WithParent(parent),
 			WithClientSpanKind,
 		)
 		init(clientSpan)
-		ctx = injectSpanMeta(ctx, tracer, clientSpan)
+
+		if !methodExcludedFromTracing(method) {
+			ctx = injectSpanMeta(ctx, tracer, clientSpan)
+		}
 		cs, err := streamer(ctx, desc, cc, method, opts...)
 		if err != nil {
 			clientSpan.Recordf("error: %s", err)

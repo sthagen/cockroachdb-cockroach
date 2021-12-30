@@ -29,15 +29,61 @@ import (
 type RecordingType int32
 
 const (
-	// RecordingOff means that the Span discards all events handed to it.
-	// Child spans created from it similarly won't be recording by default.
+	// RecordingOff means that the Span discards events passed in.
 	RecordingOff RecordingType = iota
-	// RecordingVerbose means that the Span is adding events passed in via LogKV
-	// and LogData to its recording and that derived spans will do so as well.
-	RecordingVerbose
 
-	// TODO(tbg): add RecordingBackground for always-on tracing.
+	// RecordingStructured means that the Span discards events passed in through
+	// Recordf(), but collects events passed in through RecordStructured(), as
+	// well as information about child spans (their name, start and stop time).
+	RecordingStructured
+
+	// RecordingVerbose means that the Span collects events passed in through
+	// Recordf() in its recording.
+	RecordingVerbose
 )
+
+// ToCarrierValue encodes the RecordingType to be propagated through a carrier.
+func (t RecordingType) ToCarrierValue() string {
+	switch t {
+	case RecordingOff:
+		return "n"
+	case RecordingStructured:
+		return "s"
+	case RecordingVerbose:
+		return "v"
+	default:
+		panic(fmt.Sprintf("invalid RecordingType: %d", t))
+	}
+}
+
+// ToProto converts t to the corresponding proto enum.
+func (t RecordingType) ToProto() tracingpb.TraceInfo_RecordingMode {
+	switch t {
+	case RecordingOff:
+		return tracingpb.TraceInfo_NONE
+	case RecordingStructured:
+		return tracingpb.TraceInfo_STRUCTURED
+	case RecordingVerbose:
+		return tracingpb.TraceInfo_VERBOSE
+	default:
+		panic(fmt.Sprintf("invalid RecordingType: %d", t))
+	}
+}
+
+// RecordingTypeFromCarrierValue decodes a recording type carried by a carrier.
+func RecordingTypeFromCarrierValue(val string) RecordingType {
+	switch val {
+	case "v":
+		return RecordingVerbose
+	case "s":
+		return RecordingStructured
+	case "n":
+		return RecordingOff
+	default:
+		// Unrecognized.
+		return RecordingOff
+	}
+}
 
 type traceLogData struct {
 	logRecord
@@ -115,7 +161,7 @@ func (r Recording) String() string {
 
 // OrphanSpans returns the spans with parents missing from the recording.
 func (r Recording) OrphanSpans() []tracingpb.RecordedSpan {
-	spanIDs := make(map[uint64]struct{})
+	spanIDs := make(map[tracingpb.SpanID]struct{})
 	for _, sp := range r {
 		spanIDs[sp.SpanID] = struct{}{}
 	}
@@ -215,22 +261,21 @@ func (r Recording) visitSpan(sp tracingpb.RecordedSpan, depth int) []traceLogDat
 		ownLogs = append(ownLogs, conv(sb.RedactableString(), l.Time, lastLog.Timestamp))
 	}
 
-	// If the span was verbose then the Structured events would have been
-	// stringified and included in the Logs above. If the span was not verbose
-	// we should add the Structured events now.
-	if !isVerbose(sp) {
-		sp.Structured(func(sr *types.Any, t time.Time) {
-			str, err := MessageToJSONString(sr, true /* emitDefaults */)
-			if err != nil {
-				return
-			}
-			lastLog := ownLogs[len(ownLogs)-1]
-			var sb redact.StringBuilder
-			sb.SafeString("structured:")
-			_, _ = sb.WriteString(str)
-			ownLogs = append(ownLogs, conv(sb.RedactableString(), t, lastLog.Timestamp))
-		})
-	}
+	// If the span was verbose at the time when the structured event was recorded,
+	// then the Structured events will also have been stringified and included in
+	// the Logs above. We conservatively serialize the structured events again
+	// here, for the case when the span had not been verbose at the time.
+	sp.Structured(func(sr *types.Any, t time.Time) {
+		str, err := MessageToJSONString(sr, true /* emitDefaults */)
+		if err != nil {
+			return
+		}
+		lastLog := ownLogs[len(ownLogs)-1]
+		var sb redact.StringBuilder
+		sb.SafeString("structured:")
+		_, _ = sb.WriteString(str)
+		ownLogs = append(ownLogs, conv(sb.RedactableString(), t, lastLog.Timestamp))
+	})
 
 	childSpans := make([][]traceLogData, 0)
 	for _, osp := range r {
@@ -295,8 +340,8 @@ func (r Recording) ToJaegerJSON(stmt, comment, nodeStr string) (string, error) {
 	tagsCopy["statement"] = stmt
 	r[0].Tags = tagsCopy
 
-	toJaegerSpanID := func(spanID uint64) jaegerjson.SpanID {
-		return jaegerjson.SpanID(strconv.FormatUint(spanID, 10))
+	toJaegerSpanID := func(spanID tracingpb.SpanID) jaegerjson.SpanID {
+		return jaegerjson.SpanID(strconv.FormatUint(uint64(spanID), 10))
 	}
 
 	// Each Span in Jaeger belongs to a "process" that generated it. Spans
@@ -329,7 +374,7 @@ func (r Recording) ToJaegerJSON(stmt, comment, nodeStr string) (string, error) {
 	}
 
 	var t jaegerjson.Trace
-	t.TraceID = jaegerjson.TraceID(strconv.FormatUint(r[0].TraceID, 10))
+	t.TraceID = jaegerjson.TraceID(strconv.FormatUint(uint64(r[0].TraceID), 10))
 	t.Processes = processes
 
 	for _, sp := range r {
@@ -369,10 +414,14 @@ func (r Recording) ToJaegerJSON(stmt, comment, nodeStr string) (string, error) {
 			s.Logs = append(s.Logs, jl)
 		}
 
-		// If the span was verbose then the Structured events would have been
-		// stringified and included in the Logs above. If the span was not verbose
-		// we should add the Structured events now.
-		if !isVerbose(sp) {
+		// If the span was verbose at the time when each structured event was
+		// recorded, then the respective events would have been stringified and
+		// included in the Logs above. If the span was not verbose at the time, we
+		// need to produce a string now. We don't know whether the span was verbose
+		// or not at the time each event was recorded, so we make a guess based on
+		// whether the span was verbose at the moment when the Recording was
+		// produced.
+		if !sp.Verbose {
 			sp.Structured(func(sr *types.Any, t time.Time) {
 				jl := jaegerjson.Log{Timestamp: uint64(t.UnixNano() / 1000)}
 				jsonStr, err := MessageToJSONString(sr, true /* emitDefaults */)
@@ -411,13 +460,4 @@ type TraceCollection struct {
 	// Comment is a dummy field we use to put instructions on how to load the trace.
 	Comment string             `json:"_comment"`
 	Data    []jaegerjson.Trace `json:"data"`
-}
-
-// isVerbose returns true if the RecordedSpan was started is a verbose mode.
-func isVerbose(s tracingpb.RecordedSpan) bool {
-	if s.Baggage == nil {
-		return false
-	}
-	_, isVerbose := s.Baggage[verboseTracingBaggageKey]
-	return isVerbose
 }

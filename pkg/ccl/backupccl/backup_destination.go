@@ -13,7 +13,6 @@ import (
 	"io/ioutil"
 	"net/url"
 	"path"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
@@ -34,7 +33,8 @@ func fetchPreviousBackups(
 	user security.SQLUsername,
 	makeCloudStorage cloud.ExternalStorageFromURIFactory,
 	prevBackupURIs []string,
-	encryptionParams backupEncryptionParams,
+	encryptionParams jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
 ) ([]BackupManifest, *jobspb.BackupEncryptionOptions, error) {
 	if len(prevBackupURIs) == 0 {
 		return nil, nil, nil
@@ -42,7 +42,7 @@ func fetchPreviousBackups(
 
 	baseBackup := prevBackupURIs[0]
 	encryptionOptions, err := getEncryptionFromBase(ctx, user, makeCloudStorage, baseBackup,
-		encryptionParams)
+		encryptionParams, kmsEnv)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -64,27 +64,19 @@ func fetchPreviousBackups(
 // explicitly, or due to the auto-append feature), it will resolve the
 // encryption options based on the base backup, as well as find all previous
 // backup manifests in the backup chain.
-//
-// TODO(pbardea): Cleanup list for after stability
-//  - We shouldn't need to pass `to` and (`defaultURI`, `urisByLocalityKV`). We
-//  can determine the latter from the former.
 func resolveDest(
 	ctx context.Context,
 	user security.SQLUsername,
-	nested, appendToLatest bool,
-	defaultURI string,
-	urisByLocalityKV map[string]string,
+	dest jobspb.BackupDetails_Destination,
 	makeCloudStorage cloud.ExternalStorageFromURIFactory,
 	endTime hlc.Timestamp,
-	to []string,
 	incrementalFrom []string,
-	subdir string,
 ) (
 	string, /* collectionURI */
-	string, /* defaultURI */
-	string, /* chosenSuffix */
+	string, /* defaultURI - the full path for the planned backup */
+	string, /* chosenSuffix - the resolved subdir for the planned backup */
 	map[string]string, /* urisByLocalityKV */
-	[]string, /* prevBackupURIs */
+	[]string, /* prevBackupURIs - list of full paths for previous backups in the chain */
 	error,
 ) {
 	// chosenSuffix is the automatically chosen suffix within the collection path
@@ -94,19 +86,30 @@ func resolveDest(
 	var chosenSuffix string
 	var err error
 
-	if nested {
-		collectionURI, chosenSuffix, err = resolveBackupCollection(ctx, user, defaultURI,
-			appendToLatest, makeCloudStorage, endTime, subdir)
-		if err != nil {
-			return "", "", "", nil, nil, err
-		}
+	defaultURI, urisByLocalityKV, err := getURIsByLocalityKV(dest.To, "")
+	if err != nil {
+		return "", "", "", nil, nil, err
+	}
 
-		defaultURI, urisByLocalityKV, err = getURIsByLocalityKV(to, chosenSuffix)
+	if dest.Subdir != "" {
+		collectionURI = defaultURI
+		chosenSuffix = dest.Subdir
+		if chosenSuffix == latestFileName {
+			latest, err := readLatestFile(ctx, defaultURI, makeCloudStorage, user)
+			if err != nil {
+				return "", "", "", nil, nil, err
+			}
+			chosenSuffix = latest
+		}
+		defaultURI, urisByLocalityKV, err = getURIsByLocalityKV(dest.To, chosenSuffix)
 		if err != nil {
 			return "", "", "", nil, nil, err
 		}
 	}
 
+	// At this point, the defaultURI is the full path for the backup. For BACKUP
+	// INTO, this path includes the chosenSuffix Once this function returns, the
+	// defaultURI will be the full path for this backup in planning.
 	if len(incrementalFrom) != 0 {
 		prevBackupURIs = incrementalFrom
 	} else {
@@ -120,13 +123,44 @@ func resolveDest(
 			return "", "", "", nil, nil, err
 		}
 		if exists {
-			// The backup in the auto-append directory is the full backup.
+			// The defaultStore contains a full backup; consequently,
+			// we're conducting an incremental backup.
 			prevBackupURIs = append(prevBackupURIs, defaultURI)
-			priors, err := FindPriorBackups(ctx, defaultStore, OmitManifest)
-			for _, prior := range priors {
-				priorURI, err := url.Parse(defaultURI)
+
+			var priors []string
+			var backupChainURI string
+			if len(dest.IncrementalStorage) > 0 {
+				// Implies the incremental backup chain lives in
+				// incrementalStorage/chosenSuffix, while the full backup lives in
+				// defaultStore/chosenSuffix. The incremental backup chain in
+				// incrementalStorage/chosenSuffix will not contain any incremental backups that live
+				// elsewhere.
+				backupChainURI, _, err = getURIsByLocalityKV(dest.IncrementalStorage,
+					chosenSuffix)
 				if err != nil {
-					return "", "", "", nil, nil, errors.Wrapf(err, "parsing default backup location %s", defaultURI)
+					return "", "", "", nil, nil, err
+				}
+				incrementalStore, err := makeCloudStorage(ctx, backupChainURI, user)
+				if err != nil {
+					return "", "", "", nil, nil, err
+				}
+				defer incrementalStore.Close()
+				priors, err = FindPriorBackups(ctx, incrementalStore, OmitManifest)
+				if err != nil {
+					return "", "", "", nil, nil, err
+				}
+			} else {
+				backupChainURI = defaultURI
+				priors, err = FindPriorBackups(ctx, defaultStore, OmitManifest)
+				if err != nil {
+					return "", "", "", nil, nil, err
+				}
+			}
+			for _, prior := range priors {
+				priorURI, err := url.Parse(backupChainURI)
+				if err != nil {
+					return "", "", "", nil, nil, errors.Wrapf(err, "parsing default backup location %s",
+						backupChainURI)
 				}
 				priorURI.Path = path.Join(priorURI.Path, prior)
 				prevBackupURIs = append(prevBackupURIs, priorURI.String())
@@ -135,16 +169,19 @@ func resolveDest(
 				return "", "", "", nil, nil, errors.Wrap(err, "finding previous backups")
 			}
 
-			// Pick a piece-specific suffix and update the destination path(s).
+			// Within the chosenSuffix dir, differentiate files with partName.
 			partName := endTime.GoTime().Format(DateBasedIncFolderName)
 			partName = path.Join(chosenSuffix, partName)
-			defaultURI, urisByLocalityKV, err = getURIsByLocalityKV(to, partName)
+			if len(dest.IncrementalStorage) > 0 {
+				defaultURI, urisByLocalityKV, err = getURIsByLocalityKV(dest.IncrementalStorage, partName)
+			} else {
+				defaultURI, urisByLocalityKV, err = getURIsByLocalityKV(dest.To, partName)
+			}
 			if err != nil {
 				return "", "", "", nil, nil, errors.Wrap(err, "adjusting backup destination to append new layer to existing backup")
 			}
 		}
 	}
-
 	return collectionURI, defaultURI, chosenSuffix, urisByLocalityKV, prevBackupURIs, nil
 }
 
@@ -198,10 +235,11 @@ func getEncryptionFromBase(
 	user security.SQLUsername,
 	makeCloudStorage cloud.ExternalStorageFromURIFactory,
 	baseBackupURI string,
-	encryptionParams backupEncryptionParams,
+	encryptionParams jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
 ) (*jobspb.BackupEncryptionOptions, error) {
 	var encryptionOptions *jobspb.BackupEncryptionOptions
-	if encryptionParams.encryptMode != noEncryption {
+	if encryptionParams.Mode != jobspb.EncryptionMode_None {
 		exportStore, err := makeCloudStorage(ctx, baseBackupURI, user)
 		if err != nil {
 			return nil, err
@@ -212,15 +250,15 @@ func getEncryptionFromBase(
 			return nil, err
 		}
 
-		switch encryptionParams.encryptMode {
-		case passphrase:
+		switch encryptionParams.Mode {
+		case jobspb.EncryptionMode_Passphrase:
 			encryptionOptions = &jobspb.BackupEncryptionOptions{
 				Mode: jobspb.EncryptionMode_Passphrase,
-				Key:  storageccl.GenerateKey(encryptionParams.encryptionPassphrase, opts.Salt),
+				Key:  storageccl.GenerateKey([]byte(encryptionParams.RawPassphrae), opts.Salt),
 			}
-		case kms:
-			defaultKMSInfo, err := validateKMSURIsAgainstFullBackup(encryptionParams.kmsURIs,
-				newEncryptedDataKeyMapFromProtoMap(opts.EncryptedDataKeyByKMSMasterKeyID), encryptionParams.kmsEnv)
+		case jobspb.EncryptionMode_KMS:
+			defaultKMSInfo, err := validateKMSURIsAgainstFullBackup(encryptionParams.RawKmsUris,
+				newEncryptedDataKeyMapFromProtoMap(opts.EncryptedDataKeyByKMSMasterKeyID), kmsEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -232,46 +270,30 @@ func getEncryptionFromBase(
 	return encryptionOptions, nil
 }
 
-// resolveBackupCollection returns the collectionURI and chosenSuffix that we
-// should use for a backup that is pointing to a collection.
-func resolveBackupCollection(
+func readLatestFile(
 	ctx context.Context,
-	user security.SQLUsername,
-	defaultURI string,
-	appendToLatest bool,
+	collectionURI string,
 	makeCloudStorage cloud.ExternalStorageFromURIFactory,
-	endTime hlc.Timestamp,
-	subdir string,
-) (string, string, error) {
-	var chosenSuffix string
-	collectionURI := defaultURI
-	if appendToLatest {
-		collection, err := makeCloudStorage(ctx, collectionURI, user)
-		if err != nil {
-			return "", "", err
-		}
-		defer collection.Close()
-		latestFile, err := collection.ReadFile(ctx, latestFileName)
-		if err != nil {
-			if errors.Is(err, cloud.ErrFileDoesNotExist) {
-				return "", "", pgerror.Wrapf(err, pgcode.UndefinedFile, "path does not contain a completed latest backup")
-			}
-			return "", "", pgerror.WithCandidateCode(err, pgcode.Io)
-		}
-		latest, err := ioutil.ReadAll(latestFile)
-		if err != nil {
-			return "", "", err
-		}
-		if len(latest) == 0 {
-			return "", "", errors.Errorf("malformed LATEST file")
-		}
-		chosenSuffix = string(latest)
-	} else if subdir != "" {
-		// User has specified a subdir via `BACKUP INTO 'subdir' IN...`.
-		chosenSuffix = strings.TrimPrefix(subdir, "/")
-		chosenSuffix = "/" + chosenSuffix
-	} else {
-		chosenSuffix = endTime.GoTime().Format(DateBasedIntoFolderName)
+	user security.SQLUsername,
+) (string, error) {
+	collection, err := makeCloudStorage(ctx, collectionURI, user)
+	if err != nil {
+		return "", err
 	}
-	return collectionURI, chosenSuffix, nil
+	defer collection.Close()
+	latestFile, err := collection.ReadFile(ctx, latestFileName)
+	if err != nil {
+		if errors.Is(err, cloud.ErrFileDoesNotExist) {
+			return "", pgerror.Wrapf(err, pgcode.UndefinedFile, "path does not contain a completed latest backup")
+		}
+		return "", pgerror.WithCandidateCode(err, pgcode.Io)
+	}
+	latest, err := ioutil.ReadAll(latestFile)
+	if err != nil {
+		return "", err
+	}
+	if len(latest) == 0 {
+		return "", errors.Errorf("malformed LATEST file")
+	}
+	return string(latest), nil
 }

@@ -167,7 +167,7 @@ func (s *Container) IterateAggregatedTransactionStats(
 
 	err := visitor(s.appName, &txnStat)
 	if err != nil {
-		return fmt.Errorf("sql stats iteration abort: %s", err)
+		return errors.Wrap(err, "sql stats iteration abort")
 	}
 
 	return nil
@@ -281,6 +281,7 @@ func NewTempContainerFromExistingStmtStats(
 		stmtStats.mu.distSQLUsed = statistics[i].Key.KeyData.DistSQL
 		stmtStats.mu.fullScan = statistics[i].Key.KeyData.FullScan
 		stmtStats.mu.database = statistics[i].Key.KeyData.Database
+		stmtStats.mu.querySummary = statistics[i].Key.KeyData.QuerySummary
 	}
 
 	return container, nil /* remaining */, nil /* err */
@@ -408,8 +409,11 @@ type stmtStats struct {
 		fullScan bool
 
 		// database records the database from the session the statement
-		// was executed from
+		// was executed from.
 		database string
+
+		// querySummary records a summarized format of the query statement.
+		querySummary string
 
 		data roachpb.StatementStatistics
 	}
@@ -684,7 +688,8 @@ func (s *Container) MergeApplicationStatementStats(
 		// Calling Iterate.*Stats() function with a visitor function that does not
 		// return error should not cause any error.
 		panic(
-			errors.AssertionFailedf("unexpected error returned when iterating through application stats: %s", err))
+			errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error returned when iterating through application stats"),
+		)
 	}
 
 	return discardedStats
@@ -716,7 +721,8 @@ func (s *Container) MergeApplicationTransactionStats(
 		// Calling Iterate.*Stats() function with a visitor function that does not
 		// return error should not cause any error.
 		panic(
-			errors.AssertionFailedf("unexpected error returned when iterating through application stats: %s", err))
+			errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error returned when iterating through application stats"),
+		)
 	}
 
 	return discardedStats

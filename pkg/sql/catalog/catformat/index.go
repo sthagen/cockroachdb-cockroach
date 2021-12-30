@@ -20,7 +20,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
+)
+
+// IndexDisplayMode influences how an index should be formatted for pretty print
+// in IndexForDisplay function.
+type IndexDisplayMode int
+
+const (
+	// IndexDisplayShowCreate indicates index definition to be printed as a CREATE
+	// INDEX statement.
+	IndexDisplayShowCreate IndexDisplayMode = iota
+	// IndexDisplayDefOnly indicates index definition to be printed as INDEX
+	// definition format within a CREATE TABLE statement.
+	IndexDisplayDefOnly
 )
 
 // IndexForDisplay formats an index descriptor as a SQL string. It converts user
@@ -42,10 +56,23 @@ func IndexForDisplay(
 	tableName *tree.TableName,
 	index catalog.Index,
 	partition string,
-	interleave string,
+	formatFlags tree.FmtFlags,
 	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
+	displayMode IndexDisplayMode,
 ) (string, error) {
-	return indexForDisplay(ctx, table, tableName, index.IndexDesc(), index.Primary(), partition, interleave, semaCtx)
+	return indexForDisplay(
+		ctx,
+		table,
+		tableName,
+		index.IndexDesc(),
+		index.Primary(),
+		partition,
+		formatFlags,
+		semaCtx,
+		sessionData,
+		displayMode,
+	)
 }
 
 func indexForDisplay(
@@ -55,14 +82,26 @@ func indexForDisplay(
 	index *descpb.IndexDescriptor,
 	isPrimary bool,
 	partition string,
-	interleave string,
+	formatFlags tree.FmtFlags,
 	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
+	displayMode IndexDisplayMode,
 ) (string, error) {
-	f := tree.NewFmtCtx(tree.FmtSimple)
+	// Please also update CreateIndex's "Format" method in
+	// pkg/sql/sem/tree/create.go if there's any update to index definition
+	// components.
+	if displayMode == IndexDisplayShowCreate && *tableName == descpb.AnonymousTable {
+		return "", errors.New("tableName must be set for IndexDisplayShowCreate mode")
+	}
+
+	f := tree.NewFmtCtx(formatFlags)
+	if displayMode == IndexDisplayShowCreate {
+		f.WriteString("CREATE ")
+	}
 	if index.Unique {
 		f.WriteString("UNIQUE ")
 	}
-	if index.Type == descpb.IndexDescriptor_INVERTED {
+	if !f.HasFlags(tree.FmtPGCatalog) && index.Type == descpb.IndexDescriptor_INVERTED {
 		f.WriteString("INVERTED ")
 	}
 	f.WriteString("INDEX ")
@@ -71,8 +110,18 @@ func indexForDisplay(
 		f.WriteString(" ON ")
 		f.FormatNode(tableName)
 	}
+
+	if f.HasFlags(tree.FmtPGCatalog) {
+		f.WriteString(" USING")
+		if index.Type == descpb.IndexDescriptor_INVERTED {
+			f.WriteString(" gin")
+		} else {
+			f.WriteString(" btree")
+		}
+	}
+
 	f.WriteString(" (")
-	if err := FormatIndexElements(ctx, table, index, f, semaCtx); err != nil {
+	if err := FormatIndexElements(ctx, table, index, f, semaCtx, sessionData); err != nil {
 		return "", err
 	}
 	f.WriteByte(')')
@@ -93,22 +142,32 @@ func indexForDisplay(
 		f.WriteByte(')')
 	}
 
-	f.WriteString(interleave)
 	f.WriteString(partition)
 
-	if err := formatStorageConfigs(table, index, f); err != nil {
-		return "", err
+	if !f.HasFlags(tree.FmtPGCatalog) {
+		if err := formatStorageConfigs(table, index, f); err != nil {
+			return "", err
+		}
 	}
 
 	if index.IsPartial() {
-		f.WriteString(" WHERE ")
-		pred, err := schemaexpr.FormatExprForDisplay(
-			ctx, table, index.Predicate, semaCtx, tree.FmtParsable,
-		)
+		predFmtFlag := tree.FmtParsable
+		if f.HasFlags(tree.FmtPGCatalog) {
+			predFmtFlag = tree.FmtPGCatalog
+		}
+		pred, err := schemaexpr.FormatExprForDisplay(ctx, table, index.Predicate, semaCtx, sessionData, predFmtFlag)
 		if err != nil {
 			return "", err
 		}
-		f.WriteString(pred)
+
+		f.WriteString(" WHERE ")
+		if f.HasFlags(tree.FmtPGCatalog) {
+			f.WriteString("(")
+			f.WriteString(pred)
+			f.WriteString(")")
+		} else {
+			f.WriteString(pred)
+		}
 	}
 
 	return f.CloseAndGetString(), nil
@@ -125,7 +184,13 @@ func FormatIndexElements(
 	index *descpb.IndexDescriptor,
 	f *tree.FmtCtx,
 	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
 ) error {
+	elemFmtFlag := tree.FmtParsable
+	if f.HasFlags(tree.FmtPGCatalog) {
+		elemFmtFlag = tree.FmtPGCatalog
+	}
+
 	startIdx := index.ExplicitColumnStartIdx()
 	for i, n := startIdx, len(index.KeyColumnIDs); i < n; i++ {
 		col, err := table.FindColumnWithID(index.KeyColumnIDs[i])
@@ -137,7 +202,7 @@ func FormatIndexElements(
 		}
 		if col.IsExpressionIndexColumn() {
 			expr, err := schemaexpr.FormatExprForExpressionIndexDisplay(
-				ctx, table, col.GetComputeExpr(), semaCtx, tree.FmtParsable,
+				ctx, table, col.GetComputeExpr(), semaCtx, sessionData, elemFmtFlag,
 			)
 			if err != nil {
 				return err

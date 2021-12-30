@@ -30,7 +30,8 @@ _gen_script = rule(
         "test": attr.label(mandatory = True),
         "_template": attr.label(
             default = "@cockroach//build/bazelutil:lint.sh.in",
-            allow_single_file = True)
+            allow_single_file = True,
+        ),
     },
 )
 
@@ -46,16 +47,8 @@ def lint_binary(name, test):
         srcs = [script_name],
         data = [
             test,
-            "//c-deps:libedit_files",
-            "//c-deps:libgeos_files",
-            "//c-deps:libproj_files",
-            "//pkg/cmd/returncheck",
-            "//pkg/cmd/roachvet",
             "//pkg/sql/opt/optgen/cmd/optfmt",
-            "@co_honnef_go_tools//cmd/staticcheck",
-            "@com_github_client9_misspell//cmd/misspell:misspell",
             "@com_github_cockroachdb_crlfmt//:crlfmt",
-            "@com_github_kisielk_errcheck//:errcheck",
             "@go_sdk//:bin/go",
             "@org_golang_x_lint//golint:golint",
         ],

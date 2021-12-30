@@ -123,7 +123,9 @@ insert uniq
                           └── k:32 != uniq.k:25
 
 # No need to plan checks for w since it's always null.
-build
+# NOTE: We use the norm directive here so that assignment casts are eliminated
+# by normalization rules, allowing removal of unique checks.
+norm
 INSERT INTO uniq VALUES (1, 1, NULL, 1, 1), (2, 2, NULL, 2, 2)
 ----
 insert uniq
@@ -137,31 +139,31 @@ insert uniq
  ├── input binding: &1
  ├── values
  │    ├── columns: column1:8!null column2:9!null column3:10 column4:11!null column5:12!null
- │    ├── (1, 1, NULL::INT8, 1, 1)
- │    └── (2, 2, NULL::INT8, 2, 2)
+ │    ├── (1, 1, NULL, 1, 1)
+ │    └── (2, 2, NULL, 2, 2)
  └── unique-checks
       └── unique-checks-item: uniq(x,y)
            └── project
                 ├── columns: x:23!null y:24!null
                 └── semi-join (hash)
-                     ├── columns: k:20!null v:21!null w:22 x:23!null y:24!null
+                     ├── columns: k:20!null x:23!null y:24!null
                      ├── with-scan &1
-                     │    ├── columns: k:20!null v:21!null w:22 x:23!null y:24!null
+                     │    ├── columns: k:20!null x:23!null y:24!null
                      │    └── mapping:
                      │         ├──  column1:8 => k:20
-                     │         ├──  column2:9 => v:21
-                     │         ├──  column3:10 => w:22
                      │         ├──  column4:11 => x:23
                      │         └──  column5:12 => y:24
                      ├── scan uniq
-                     │    └── columns: uniq.k:13!null uniq.v:14 uniq.w:15 uniq.x:16 uniq.y:17
+                     │    └── columns: uniq.k:13!null uniq.x:16 uniq.y:17
                      └── filters
                           ├── x:23 = uniq.x:16
                           ├── y:24 = uniq.y:17
                           └── k:20 != uniq.k:13
 
 # No need to plan checks for x,y since x is always null.
-build
+# NOTE: We use the norm directive here so that assignment casts are eliminated
+# by normalization rules, allowing removal of unique checks.
+norm
 INSERT INTO uniq VALUES (1, 1, 1, NULL, 1), (2, 2, NULL, NULL, 2)
 ----
 insert uniq
@@ -175,30 +177,29 @@ insert uniq
  ├── input binding: &1
  ├── values
  │    ├── columns: column1:8!null column2:9!null column3:10 column4:11 column5:12!null
- │    ├── (1, 1, 1, NULL::INT8, 1)
- │    └── (2, 2, NULL::INT8, NULL::INT8, 2)
+ │    ├── (1, 1, 1, NULL, 1)
+ │    └── (2, 2, NULL, NULL, 2)
  └── unique-checks
       └── unique-checks-item: uniq(w)
            └── project
                 ├── columns: w:22
                 └── semi-join (hash)
-                     ├── columns: k:20!null v:21!null w:22 x:23 y:24!null
+                     ├── columns: k:20!null w:22
                      ├── with-scan &1
-                     │    ├── columns: k:20!null v:21!null w:22 x:23 y:24!null
+                     │    ├── columns: k:20!null w:22
                      │    └── mapping:
                      │         ├──  column1:8 => k:20
-                     │         ├──  column2:9 => v:21
-                     │         ├──  column3:10 => w:22
-                     │         ├──  column4:11 => x:23
-                     │         └──  column5:12 => y:24
+                     │         └──  column3:10 => w:22
                      ├── scan uniq
-                     │    └── columns: uniq.k:13!null uniq.v:14 uniq.w:15 uniq.x:16 uniq.y:17
+                     │    └── columns: uniq.k:13!null uniq.w:15
                      └── filters
                           ├── w:22 = uniq.w:15
                           └── k:20 != uniq.k:13
 
 # No need to plan checks for x,y since y is always null.
-build
+# NOTE: We use the norm directive here so that assignment casts are eliminated
+# by normalization rules, allowing removal of unique checks.
+norm
 INSERT INTO uniq VALUES (1, 1, 1, 1, NULL), (2, 2, 2, 2, NULL)
 ----
 insert uniq
@@ -212,30 +213,29 @@ insert uniq
  ├── input binding: &1
  ├── values
  │    ├── columns: column1:8!null column2:9!null column3:10!null column4:11!null column5:12
- │    ├── (1, 1, 1, 1, NULL::INT8)
- │    └── (2, 2, 2, 2, NULL::INT8)
+ │    ├── (1, 1, 1, 1, NULL)
+ │    └── (2, 2, 2, 2, NULL)
  └── unique-checks
       └── unique-checks-item: uniq(w)
            └── project
                 ├── columns: w:22!null
                 └── semi-join (hash)
-                     ├── columns: k:20!null v:21!null w:22!null x:23!null y:24
+                     ├── columns: k:20!null w:22!null
                      ├── with-scan &1
-                     │    ├── columns: k:20!null v:21!null w:22!null x:23!null y:24
+                     │    ├── columns: k:20!null w:22!null
                      │    └── mapping:
                      │         ├──  column1:8 => k:20
-                     │         ├──  column2:9 => v:21
-                     │         ├──  column3:10 => w:22
-                     │         ├──  column4:11 => x:23
-                     │         └──  column5:12 => y:24
+                     │         └──  column3:10 => w:22
                      ├── scan uniq
-                     │    └── columns: uniq.k:13!null uniq.v:14 uniq.w:15 uniq.x:16 uniq.y:17
+                     │    └── columns: uniq.k:13!null uniq.w:15
                      └── filters
                           ├── w:22 = uniq.w:15
                           └── k:20 != uniq.k:13
 
 # No need to plan any checks, since w, x and y are always null.
-build
+# NOTE: We use the norm directive here so that assignment casts are eliminated
+# by normalization rules, allowing removal of unique checks.
+norm
 INSERT INTO uniq VALUES (1, 1, NULL, NULL, NULL), (2, 2, NULL, NULL, NULL)
 ----
 insert uniq
@@ -248,8 +248,8 @@ insert uniq
  │    └── column5:12 => y:5
  └── values
       ├── columns: column1:8!null column2:9!null column3:10 column4:11 column5:12
-      ├── (1, 1, NULL::INT8, NULL::INT8, NULL::INT8)
-      └── (2, 2, NULL::INT8, NULL::INT8, NULL::INT8)
+      ├── (1, 1, NULL, NULL, NULL)
+      └── (2, 2, NULL, NULL, NULL)
 
 # Use all the unique indexes and constraints as arbiters for DO NOTHING with no
 # conflict columns.
@@ -258,7 +258,7 @@ INSERT INTO uniq VALUES (1, 2, 3, 4, 5) ON CONFLICT DO NOTHING
 ----
 insert uniq
  ├── columns: <none>
- ├── arbiter indexes: primary uniq_v_key
+ ├── arbiter indexes: uniq_pkey uniq_v_key
  ├── arbiter constraints: unique_w unique_x_y
  ├── insert-mapping:
  │    ├── column1:8 => k:1
@@ -872,7 +872,9 @@ insert uniq_partial
                           └── k:14 != uniq_partial.k:9
 
 # No need to plan checks for a since it's always null.
-build
+# NOTE: We use the norm directive here so that assignment casts are eliminated
+# by normalization rules, allowing removal of unique checks.
+norm
 INSERT INTO uniq_partial VALUES (1, NULL, 1), (2, NULL, 2)
 ----
 insert uniq_partial
@@ -883,8 +885,8 @@ insert uniq_partial
  │    └── column3:8 => b:3
  └── values
       ├── columns: column1:6!null column2:7 column3:8!null
-      ├── (1, NULL::INT8, 1)
-      └── (2, NULL::INT8, 2)
+      ├── (1, NULL, 1)
+      └── (2, NULL, 2)
 
 # Use all the unique constraint as an arbiter for DO NOTHING with no conflict
 # columns.
@@ -893,7 +895,7 @@ INSERT INTO uniq_partial VALUES (1, 2, 3), (2, 2, 3) ON CONFLICT DO NOTHING
 ----
 insert uniq_partial
  ├── columns: <none>
- ├── arbiter indexes: primary
+ ├── arbiter indexes: uniq_partial_pkey
  ├── arbiter constraints: unique_a
  ├── insert-mapping:
  │    ├── column1:6 => k:1
@@ -1309,7 +1311,7 @@ ON CONFLICT (a) WHERE b > 10 DO NOTHING
 ----
 insert uniq_partial_constraint_and_index
  ├── columns: <none>
- ├── arbiter indexes: secondary
+ ├── arbiter indexes: uniq_partial_constraint_and_index_a_key
  ├── insert-mapping:
  │    ├── column1:6 => uniq_partial_constraint_and_index.k:1
  │    ├── column2:7 => uniq_partial_constraint_and_index.a:2
@@ -1328,7 +1330,7 @@ insert uniq_partial_constraint_and_index
  │    │    │    ├── scan uniq_partial_constraint_and_index
  │    │    │    │    ├── columns: uniq_partial_constraint_and_index.a:10
  │    │    │    │    └── partial index predicates
- │    │    │    │         └── secondary: filters (true)
+ │    │    │    │         └── uniq_partial_constraint_and_index_a_key: filters (true)
  │    │    │    └── filters
  │    │    │         └── uniq_partial_constraint_and_index.a:10 = 1
  │    │    └── filters (true)
@@ -1355,7 +1357,7 @@ insert uniq_partial_constraint_and_index
                      │    ├── scan uniq_partial_constraint_and_index
                      │    │    ├── columns: uniq_partial_constraint_and_index.k:16!null uniq_partial_constraint_and_index.a:17 uniq_partial_constraint_and_index.b:18
                      │    │    └── partial index predicates
-                     │    │         └── secondary: filters (true)
+                     │    │         └── uniq_partial_constraint_and_index_a_key: filters (true)
                      │    └── filters
                      │         └── uniq_partial_constraint_and_index.b:18 > 10
                      └── filters
@@ -1399,7 +1401,7 @@ insert uniq_constraint_and_partial_index
       │    │    ├── scan uniq_constraint_and_partial_index
       │    │    │    ├── columns: a:10
       │    │    │    └── partial index predicates
-      │    │    │         └── secondary: filters
+      │    │    │         └── uniq_constraint_and_partial_index_a_key: filters
       │    │    │              └── b:11 > 0
       │    │    └── filters
       │    │         └── a:10 = 1
@@ -1425,7 +1427,7 @@ ON CONFLICT (a) WHERE b > 10 DO NOTHING
 ----
 insert uniq_partial_constraint_and_partial_index
  ├── columns: <none>
- ├── arbiter indexes: secondary
+ ├── arbiter indexes: uniq_partial_constraint_and_partial_index_a_key
  ├── arbiter constraints: unique_a
  ├── insert-mapping:
  │    ├── column1:6 => k:1
@@ -1444,10 +1446,10 @@ insert uniq_partial_constraint_and_partial_index
       │         │    ├── project
       │         │    │    ├── columns: column1:6!null column2:7!null column3:8!null
       │         │    │    └── upsert-distinct-on
-      │         │    │         ├── columns: column1:6!null column2:7!null column3:8!null arbiter_secondary_distinct:19
-      │         │    │         ├── grouping columns: column2:7!null arbiter_secondary_distinct:19
+      │         │    │         ├── columns: column1:6!null column2:7!null column3:8!null arbiter_uniq_partial_constraint_and_partial_index_a_key_distinct:19
+      │         │    │         ├── grouping columns: column2:7!null arbiter_uniq_partial_constraint_and_partial_index_a_key_distinct:19
       │         │    │         ├── project
-      │         │    │         │    ├── columns: arbiter_secondary_distinct:19 column1:6!null column2:7!null column3:8!null
+      │         │    │         │    ├── columns: arbiter_uniq_partial_constraint_and_partial_index_a_key_distinct:19 column1:6!null column2:7!null column3:8!null
       │         │    │         │    ├── anti-join (hash)
       │         │    │         │    │    ├── columns: column1:6!null column2:7!null column3:8!null
       │         │    │         │    │    ├── anti-join (hash)
@@ -1460,7 +1462,7 @@ insert uniq_partial_constraint_and_partial_index
       │         │    │         │    │    │    │    ├── scan uniq_partial_constraint_and_partial_index
       │         │    │         │    │    │    │    │    ├── columns: k:9!null a:10 b:11
       │         │    │         │    │    │    │    │    └── partial index predicates
-      │         │    │         │    │    │    │    │         └── secondary: filters
+      │         │    │         │    │    │    │    │         └── uniq_partial_constraint_and_partial_index_a_key: filters
       │         │    │         │    │    │    │    │              └── b:11 > 0
       │         │    │         │    │    │    │    └── filters
       │         │    │         │    │    │    │         └── b:11 > 0
@@ -1472,7 +1474,7 @@ insert uniq_partial_constraint_and_partial_index
       │         │    │         │    │    │    ├── scan uniq_partial_constraint_and_partial_index
       │         │    │         │    │    │    │    ├── columns: k:14!null a:15 b:16
       │         │    │         │    │    │    │    └── partial index predicates
-      │         │    │         │    │    │    │         └── secondary: filters
+      │         │    │         │    │    │    │         └── uniq_partial_constraint_and_partial_index_a_key: filters
       │         │    │         │    │    │    │              └── b:16 > 0
       │         │    │         │    │    │    └── filters
       │         │    │         │    │    │         └── b:16 > 10
@@ -1480,7 +1482,7 @@ insert uniq_partial_constraint_and_partial_index
       │         │    │         │    │         ├── column2:7 = a:15
       │         │    │         │    │         └── column3:8 > 10
       │         │    │         │    └── projections
-      │         │    │         │         └── (column3:8 > 0) OR NULL::BOOL [as=arbiter_secondary_distinct:19]
+      │         │    │         │         └── (column3:8 > 0) OR NULL::BOOL [as=arbiter_uniq_partial_constraint_and_partial_index_a_key_distinct:19]
       │         │    │         └── aggregations
       │         │    │              ├── first-agg [as=column1:6]
       │         │    │              │    └── column1:6

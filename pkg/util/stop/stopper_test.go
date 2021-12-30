@@ -270,12 +270,13 @@ func TestStopperCloserConcurrent(t *testing.T) {
 func TestStopperNumTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	defer s.Stop(context.Background())
+	ctx := context.Background()
+	defer s.Stop(ctx)
 	var tasks []chan bool
 	for i := 0; i < 3; i++ {
 		c := make(chan bool)
 		tasks = append(tasks, c)
-		if err := s.RunAsyncTask(context.Background(), "test", func(_ context.Context) {
+		if err := s.RunAsyncTask(ctx, "test", func(_ context.Context) {
 			// Wait for channel to close
 			<-c
 		}); err != nil {
@@ -687,16 +688,11 @@ func (cf closerFunc) Close() { cf() }
 // the ChildSpan option.
 func TestStopperRunAsyncTaskTracing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	tr := tracing.NewTracerWithOpt(context.Background(), tracing.WithTestingKnobs(
-		tracing.TracerTestingKnobs{
-			// We want the tracer to generate real spans so that we can test that the
-			// RootSpan option produces a root span.
-			ForceRealSpans: true,
-		}))
+	tr := tracing.NewTracerWithOpt(context.Background(), tracing.WithTracingMode(tracing.TracingModeActiveSpansRegistry))
 	s := stop.NewStopper(stop.WithTracer(tr))
 
-	ctx, getRecording, finish := tracing.ContextWithRecordingSpan(
-		context.Background(), tr, "parent")
+	ctx, getRecAndFinish := tracing.ContextWithRecordingSpan(context.Background(), tr, "parent")
+	defer getRecAndFinish()
 	root := tracing.SpanFromContext(ctx)
 	require.NotNil(t, root)
 	traceID := root.TraceID()
@@ -733,7 +729,7 @@ func TestStopperRunAsyncTaskTracing(t *testing.T) {
 					errC <- errors.Errorf("missing span")
 					return
 				}
-				sp = tr.StartSpan("child", tracing.WithParentAndAutoCollection(sp))
+				sp = tr.StartSpan("child", tracing.WithParent(sp))
 				if sp.TraceID() == traceID {
 					errC <- errors.Errorf("expected different trace")
 				}
@@ -744,10 +740,11 @@ func TestStopperRunAsyncTaskTracing(t *testing.T) {
 	}
 
 	s.Stop(ctx)
-	finish()
-	require.NoError(t, tracing.CheckRecordedSpans(getRecording(), `
+	require.NoError(t, tracing.CheckRecordedSpans(getRecAndFinish(), `
 		span: parent
+			tags: _verbose=1
 			span: async child same trace
+				tags: _verbose=1
 				event: async 2`))
 }
 

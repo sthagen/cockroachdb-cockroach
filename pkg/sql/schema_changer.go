@@ -491,8 +491,8 @@ func startGCJob(
 	}); err != nil {
 		return err
 	}
-	log.Infof(ctx, "starting GC job %d", jobID)
-	jobRegistry.NotifyToAdoptJobs(ctx)
+	log.Infof(ctx, "created GC job %d", jobID)
+	jobRegistry.NotifyToResume(ctx, jobID)
 	return nil
 }
 
@@ -658,7 +658,9 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 		} else {
 			// We've dropped a non-physical table, no need for a GC job, let's delete
 			// its descriptor and zone config immediately.
-			if err := DeleteTableDescAndZoneConfig(ctx, sc.db, sc.execCfg.Codec, tableDesc); err != nil {
+			if err := DeleteTableDescAndZoneConfig(
+				ctx, sc.db, sc.settings, sc.execCfg.Codec, tableDesc,
+			); err != nil {
 				return err
 			}
 		}
@@ -886,7 +888,7 @@ func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) er
 		return err
 	}
 	log.Infof(ctx, "starting GC job %d", gcJobID)
-	sc.jobRegistry.NotifyToAdoptJobs(ctx)
+	sc.jobRegistry.NotifyToResume(ctx, gcJobID)
 	return nil
 }
 
@@ -1003,6 +1005,7 @@ func (sc *SchemaChanger) createIndexGCJob(
 		return err
 	}
 	log.Infof(ctx, "created index GC job %d", jobID)
+	sc.jobRegistry.NotifyToResume(ctx, jobID)
 	return nil
 }
 
@@ -1018,13 +1021,14 @@ func WaitToUpdateLeases(
 		MaxBackoff:     time.Second,
 		Multiplier:     1.5,
 	}
+	start := timeutil.Now()
 	log.Infof(ctx, "waiting for a single version...")
 	desc, err := leaseMgr.WaitForOneVersion(ctx, descID, retryOpts)
 	var version descpb.DescriptorVersion
 	if desc != nil {
 		version = desc.GetVersion()
 	}
-	log.Infof(ctx, "waiting for a single version... done (at v %d)", version)
+	log.Infof(ctx, "waiting for a single version... done (at v %d), took %v", version, timeutil.Since(start))
 	return desc, err
 }
 
@@ -1040,9 +1044,12 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 	// descriptor updates are published.
 	var didUpdate bool
 	var depMutationJobs []jobspb.JobID
+	var otherJobIDs []jobspb.JobID
 	err := sc.execCfg.CollectionFactory.Txn(ctx, sc.execCfg.InternalExecutor, sc.db, func(
 		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
 	) error {
+		depMutationJobs = depMutationJobs[:0]
+		otherJobIDs = otherJobIDs[:0]
 		var err error
 		scTable, err := descsCol.GetMutableTableVersionByID(ctx, sc.descID, txn)
 		if err != nil {
@@ -1222,8 +1229,12 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 
 				// If we performed MakeMutationComplete on a PrimaryKeySwap mutation, then we need to start
 				// a job for the index deletion mutations that the primary key swap mutation added, if any.
-				if err := sc.queueCleanupJobs(ctx, scTable, txn); err != nil {
+				jobID, err := sc.queueCleanupJob(ctx, scTable, txn)
+				if err != nil {
 					return err
+				}
+				if jobID > 0 {
+					depMutationJobs = append(depMutationJobs, jobID)
 				}
 			}
 
@@ -1235,8 +1246,12 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				// If we performed MakeMutationComplete on a computed column swap, then
 				// we need to start a job for the column deletion that the swap mutation
 				// added if any.
-				if err := sc.queueCleanupJobs(ctx, scTable, txn); err != nil {
+				jobID, err := sc.queueCleanupJob(ctx, scTable, txn)
+				if err != nil {
 					return err
+				}
+				if jobID > 0 {
+					depMutationJobs = append(depMutationJobs, jobID)
 				}
 			}
 			didUpdate = true
@@ -1252,10 +1267,11 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 
 		// Check any jobs that we need to depend on for the current
 		// job to be successful.
-		depMutationJobs, err = sc.getDependentMutationsJobs(ctx, scTable, committedMutations)
+		existingDepMutationJobs, err := sc.getDependentMutationsJobs(ctx, scTable, committedMutations)
 		if err != nil {
 			return err
 		}
+		depMutationJobs = append(depMutationJobs, existingDepMutationJobs...)
 
 		for i, g := range scTable.MutationJobs {
 			if g.MutationID == sc.mutationID {
@@ -1332,13 +1348,11 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Notify the job registry to start jobs, in case we started any.
-	sc.jobRegistry.NotifyToAdoptJobs(ctx)
 
 	// If any operations was skipped because a mutation was made
 	// redundant due to a column getting dropped later on then we should
 	// wait for those jobs to complete before returning our result back.
-	if err := sc.jobRegistry.WaitForJobs(ctx, sc.execCfg.InternalExecutor, depMutationJobs); err != nil {
+	if err := sc.jobRegistry.Run(ctx, sc.execCfg.InternalExecutor, depMutationJobs); err != nil {
 		return errors.Wrap(err, "A dependent transaction failed for this schema change")
 	}
 
@@ -1936,24 +1950,18 @@ func (sc *SchemaChanger) txn(
 // used in the surrounding SQL session, so session tracing is unable
 // to capture schema change activity.
 func createSchemaChangeEvalCtx(
-	ctx context.Context,
-	execCfg *ExecutorConfig,
-	ts hlc.Timestamp,
-	ieFactory sqlutil.SessionBoundInternalExecutorFactory,
-	descriptors *descs.Collection,
+	ctx context.Context, execCfg *ExecutorConfig, ts hlc.Timestamp, descriptors *descs.Collection,
 ) extendedEvalContext {
 
 	sd := NewFakeSessionData(execCfg.SV())
-	ie := ieFactory(ctx, sd)
 
 	evalCtx := extendedEvalContext{
 		// Make a session tracing object on-the-fly. This is OK
 		// because it sets "enabled: false" and thus none of the
 		// other fields are used.
-		Tracing:                      &SessionTracing{},
-		ExecCfg:                      execCfg,
-		Descs:                        descriptors,
-		SchemaChangeInternalExecutor: ie.(*InternalExecutor),
+		Tracing: &SessionTracing{},
+		ExecCfg: execCfg,
+		Descs:   descriptors,
 		EvalContext: tree.EvalContext{
 			SessionDataStack: sessiondata.NewStack(sd),
 			// TODO(andrei): This is wrong (just like on the main code path on
@@ -2312,11 +2320,11 @@ func init() {
 	jobs.RegisterConstructor(jobspb.TypeSchemaChange, createResumerFn)
 }
 
-// queueCleanupJobs checks if the completed schema change needs to start a
+// queueCleanupJob checks if the completed schema change needs to start a
 // child job to clean up dropped schema elements.
-func (sc *SchemaChanger) queueCleanupJobs(
+func (sc *SchemaChanger) queueCleanupJob(
 	ctx context.Context, scDesc *tabledesc.Mutable, txn *kv.Txn,
-) error {
+) (jobspb.JobID, error) {
 	// Create jobs for dropped columns / indexes to be deleted.
 	mutationID := scDesc.ClusterVersion.NextMutationID
 	span := scDesc.PrimaryIndexSpan(sc.execCfg.Codec)
@@ -2330,6 +2338,7 @@ func (sc *SchemaChanger) queueCleanupJobs(
 	}
 	// Only start a job if spanList has any spans. If len(spanList) == 0, then
 	// no mutations were enqueued by the primary key change.
+	var jobID jobspb.JobID
 	if len(spanList) > 0 {
 		jobRecord := jobs.Record{
 			Description:   fmt.Sprintf("CLEANUP JOB for '%s'", sc.job.Payload().Description),
@@ -2346,9 +2355,9 @@ func (sc *SchemaChanger) queueCleanupJobs(
 			Progress:      jobspb.SchemaChangeProgress{},
 			NonCancelable: true,
 		}
-		jobID := sc.jobRegistry.MakeJobID()
+		jobID = sc.jobRegistry.MakeJobID()
 		if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, jobRecord, jobID, txn); err != nil {
-			return err
+			return 0, err
 		}
 		log.Infof(ctx, "created job %d to drop previous columns and indexes", jobID)
 		scDesc.MutationJobs = append(scDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
@@ -2356,7 +2365,7 @@ func (sc *SchemaChanger) queueCleanupJobs(
 			JobID:      int64(jobID),
 		})
 	}
-	return nil
+	return jobID, nil
 }
 
 func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
@@ -2457,12 +2466,18 @@ func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 
 // DeleteTableDescAndZoneConfig removes a table's descriptor and zone config from the KV database.
 func DeleteTableDescAndZoneConfig(
-	ctx context.Context, db *kv.DB, codec keys.SQLCodec, tableDesc catalog.TableDescriptor,
+	ctx context.Context,
+	db *kv.DB,
+	settings *cluster.Settings,
+	codec keys.SQLCodec,
+	tableDesc catalog.TableDescriptor,
 ) error {
 	log.Infof(ctx, "removing table descriptor and zone config for table %d", tableDesc.GetID())
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetSystemConfigTrigger(codec.ForSystemTenant()); err != nil {
-			return err
+		if !descs.UnsafeSkipSystemConfigTrigger.Get(&settings.SV) {
+			if err := txn.SetSystemConfigTrigger(codec.ForSystemTenant()); err != nil {
+				return err
+			}
 		}
 		b := &kv.Batch{}
 

@@ -164,6 +164,11 @@ const (
 	// Start22_1 demarcates work towards CockroachDB v22.1.
 	Start22_1
 
+	// TargetBytesAvoidExcess prevents exceeding BatchRequest.Header.TargetBytes
+	// except when there is a single value in the response. 21.2 DistSender logic
+	// requires the limit to always be overshot in order to properly enforce
+	// limits when splitting requests.
+	TargetBytesAvoidExcess
 	// AvoidDrainingNames avoids using the draining_names field when renaming or
 	// dropping descriptors.
 	AvoidDrainingNames
@@ -220,6 +225,10 @@ const (
 	SeedTenantSpanConfigs
 	// Public schema is backed by a descriptor.
 	PublicSchemasWithDescriptors
+	// AlterSystemProtectedTimestampAddColumn adds a target column to the
+	// system.protected_ts_records table that describes what is protected by the
+	// record.
+	AlterSystemProtectedTimestampAddColumn
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -259,6 +268,10 @@ var versionsSingleton = keyedVersions{
 	{
 		Key:     Start22_1,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 2},
+	},
+	{
+		Key:     TargetBytesAvoidExcess,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 4},
 	},
 	{
 		Key:     AvoidDrainingNames,
@@ -319,6 +332,10 @@ var versionsSingleton = keyedVersions{
 	{
 		Key:     PublicSchemasWithDescriptors,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 34},
+	},
+	{
+		Key:     AlterSystemProtectedTimestampAddColumn,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 36},
 	},
 
 	// *************************************************

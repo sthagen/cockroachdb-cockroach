@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -415,9 +417,6 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 		).Scan(&lastRun)
 		return jobID, lastRun
 	}
-	validateResumeCounts := func(t *testing.T, expected, found int64) {
-		require.Equal(t, expected, found, "unexpected number of jobs resumed")
-	}
 	waitUntilCount := func(t *testing.T, counter *metric.Counter, count int64) {
 		testutils.SucceedsSoon(t, func() error {
 			cnt := counter.Count()
@@ -471,6 +470,9 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 		adopted                  *metric.Counter
 		resumed                  *metric.Counter
 		afterJobStateMachineKnob func()
+		// expectImmediateRetry is true if the test should expect immediate
+		// resumption on retry, such as after pausing and resuming job.
+		expectImmediateRetry bool
 	}
 	testInfraSetUp := func(ctx context.Context, bti *BackoffTestInfra) func() {
 		// We use a manual clock to control and evaluate job execution times.
@@ -577,8 +579,13 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			// adopt-loops do not resume jobs without correctly following the job
 			// schedules.
 			waitUntilCount(t, bti.adopted, bti.adopted.Count()+2)
-			// Validate that the job is not resumed yet.
-			validateResumeCounts(t, expectedResumed, bti.resumed.Count())
+			if bti.expectImmediateRetry && i > 0 {
+				// Validate that the job did not wait to resume on retry.
+				require.Equal(t, expectedResumed+1, bti.resumed.Count(), "unexpected number of jobs resumed in retry %d", i)
+			} else {
+				// Validate that the job is not resumed yet.
+				require.Equal(t, expectedResumed, bti.resumed.Count(), "unexpected number of jobs resumed in retry %d", i)
+			}
 			// Advance the clock by delta from the expected time of next retry.
 			bti.clock.Advance(unitTime)
 			// Wait until the resumer completes its execution.
@@ -586,7 +593,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			expectedResumed++
 			retryCnt++
 			// Validate that the job is resumed only once.
-			validateResumeCounts(t, expectedResumed, bti.resumed.Count())
+			require.Equal(t, expectedResumed, bti.resumed.Count(), "unexpected number of jobs resumed in retry %d", i)
 			lastRun = bti.clock.Now()
 		}
 		bti.done.Store(true)
@@ -629,7 +636,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 
 	t.Run("pause running", func(t *testing.T) {
 		ctx := context.Background()
-		bti := BackoffTestInfra{}
+		bti := BackoffTestInfra{expectImmediateRetry: true}
 		bti.afterJobStateMachineKnob = func() {
 			if bti.done.Load().(bool) {
 				return
@@ -704,7 +711,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 
 	t.Run("pause reverting", func(t *testing.T) {
 		ctx := context.Background()
-		bti := BackoffTestInfra{}
+		bti := BackoffTestInfra{expectImmediateRetry: true}
 		bti.afterJobStateMachineKnob = func() {
 			if bti.done.Load().(bool) {
 				return
@@ -921,4 +928,74 @@ func TestJitterCalculation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRunWithoutLoop tests that Run calls will trigger the execution of a
+// job even when the adoption loop is set to infinitely slow and that the
+// observation of the completion of the job using the notification channel
+// for local jobs works.
+func TestRunWithoutLoop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	defer ResetConstructors()
+	var shouldFailCounter int64
+	var ran, failure int64
+	RegisterConstructor(jobspb.TypeImport, func(job *Job, cs *cluster.Settings) Resumer {
+		var successDone, failureDone int64
+		shouldFail := atomic.AddInt64(&shouldFailCounter, 1)%2 == 0
+		maybeIncrementCounter := func(check, counter *int64) {
+			if atomic.CompareAndSwapInt64(check, 0, 1) {
+				atomic.AddInt64(counter, 1)
+			}
+		}
+		return FakeResumer{
+			OnResume: func(ctx context.Context) error {
+				maybeIncrementCounter(&successDone, &ran)
+				if shouldFail {
+					return errors.New("boom")
+				}
+				return nil
+			},
+			FailOrCancel: func(ctx context.Context) error {
+				maybeIncrementCounter(&failureDone, &failure)
+				return nil
+			},
+		}
+	})
+
+	ctx := context.Background()
+	settings := cluster.MakeTestingClusterSettings()
+	intervalBaseSetting.Override(ctx, &settings.SV, 1e6)
+	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		Settings: settings,
+	})
+
+	defer s.Stopper().Stop(ctx)
+	r := s.JobRegistry().(*Registry)
+	var records []*Record
+	const N = 10
+	for i := 0; i < N; i++ {
+		records = append(records, &Record{
+			JobID:       r.MakeJobID(),
+			Description: "testing",
+			Username:    security.RootUserName(),
+			Details:     jobspb.ImportDetails{},
+			Progress:    jobspb.ImportProgress{},
+		})
+	}
+	var jobIDs []jobspb.JobID
+	require.NoError(t, kvDB.Txn(ctx, func(
+		ctx context.Context, txn *kv.Txn,
+	) (err error) {
+		jobIDs, err = r.CreateJobsWithTxn(ctx, txn, records)
+		return err
+	}))
+	require.EqualError(t, r.Run(
+		ctx, s.InternalExecutor().(sqlutil.InternalExecutor), jobIDs,
+	), "boom")
+	// No adoption loops should have been run.
+	require.Equal(t, int64(0), r.metrics.AdoptIterations.Count())
+	require.Equal(t, int64(N), atomic.LoadInt64(&ran))
+	require.Equal(t, int64(N/2), atomic.LoadInt64(&failure))
 }

@@ -387,8 +387,9 @@ CREATE TABLE system.protected_ts_records (
    num_spans INT8 NOT NULL, -- num spans is important to know how to decode spans
    spans     BYTES NOT NULL,
    verified  BOOL NOT NULL DEFAULT (false),
+   target    BYTES,         -- target is an encoded protobuf that specifies what the pts record will protect
    CONSTRAINT "primary" PRIMARY KEY (id),
-	 FAMILY "primary" (id, ts, meta_type, meta, num_spans, spans, verified)
+	 FAMILY "primary" (id, ts, meta_type, meta, num_spans, spans, verified, target)
 );`
 
 	StatementBundleChunksTableSchema = `
@@ -1661,12 +1662,16 @@ var (
 				{Name: "num_spans", ID: 5, Type: types.Int},
 				{Name: "spans", ID: 6, Type: types.Bytes},
 				{Name: "verified", ID: 7, Type: types.Bool, DefaultExpr: &falseBoolString},
+				// target will store an encoded protobuf indicating what the protected
+				// timestamp record will protect. A record can protect either a cluster,
+				// tenants or a schema objects (databases/tables).
+				{Name: "target", ID: 8, Type: types.Bytes, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name:        "primary",
-					ColumnNames: []string{"id", "ts", "meta_type", "meta", "num_spans", "spans", "verified"},
-					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7},
+					ColumnNames: []string{"id", "ts", "meta_type", "meta", "num_spans", "spans", "verified", "target"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2291,23 +2296,66 @@ var (
 			}}
 		},
 	)
+)
 
-	// UnleasableSystemDescriptors contains the system descriptors which cannot
-	// be leased. This includes the lease table itself, among others.
-	UnleasableSystemDescriptors = func(s []catalog.Descriptor) map[descpb.ID]catalog.Descriptor {
-		m := make(map[descpb.ID]catalog.Descriptor, len(s))
-		for _, d := range s {
-			m[d.GetID()] = d
-		}
-		return m
-	}([]catalog.Descriptor{
+type descRefByName struct {
+	parentID       descpb.ID
+	parentSchemaID descpb.ID
+	name           string
+}
+
+var (
+	// UnleasableSystemDescriptors contains the system descriptors which
+	// cannot be leased. This includes the lease table itself, among others.
+	UnleasableSystemDescriptors = []catalog.Descriptor{
 		SystemDB,
 		LeaseTable,
 		DescriptorTable,
 		NamespaceTable,
 		RangeEventTable,
-	})
+	}
+
+	unleasableSystemDescriptorsByID = func(s []catalog.Descriptor) map[descpb.ID]struct{} {
+		m := make(map[descpb.ID]struct{}, len(s))
+		for _, d := range s {
+			m[d.GetID()] = struct{}{}
+		}
+		return m
+	}(UnleasableSystemDescriptors)
+
+	unleasableSystemDescriptorsByName = func(s []catalog.Descriptor) map[descRefByName]struct{} {
+		m := make(map[descRefByName]struct{}, len(s))
+		for _, d := range s {
+			m[descRefByName{
+				parentID:       d.GetParentID(),
+				parentSchemaID: d.GetParentSchemaID(),
+				name:           d.GetName(),
+			}] = struct{}{}
+		}
+		return m
+	}(UnleasableSystemDescriptors)
 )
+
+// IsUnleasableSystemDescriptorByID returns whether the specified descriptor is
+// a member of the UnleasableSystemDescriptors set, given an ID.
+func IsUnleasableSystemDescriptorByID(id descpb.ID) bool {
+	_, ok := unleasableSystemDescriptorsByID[id]
+	return ok
+}
+
+// IsUnleasableSystemDescriptorByName returns whether the specified descriptor
+// is a member of the UnleasableSystemDescriptors set, given a database, schema,
+// and name.
+func IsUnleasableSystemDescriptorByName(
+	parentID descpb.ID, parentSchemaID descpb.ID, name string,
+) bool {
+	_, ok := unleasableSystemDescriptorsByName[descRefByName{
+		parentID:       parentID,
+		parentSchemaID: parentSchemaID,
+		name:           name,
+	}]
+	return ok
+}
 
 // SpanConfigurationsTableName represents system.span_configurations.
 var SpanConfigurationsTableName = tree.NewTableNameWithSchema("system", tree.PublicSchemaName, tree.Name(catconstants.SpanConfigurationsTableName))

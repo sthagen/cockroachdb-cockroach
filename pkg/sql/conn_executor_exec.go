@@ -116,11 +116,17 @@ func (ex *connExecutor) execStmt(
 			if rAddr := ex.sessionData().RemoteAddr; rAddr != nil {
 				remoteAddr = rAddr.String()
 			}
+			var stmtNoConstants string
+			if prepared != nil {
+				stmtNoConstants = prepared.StatementNoConstants
+			} else {
+				stmtNoConstants = formatStatementHideConstants(ast)
+			}
 			labels := pprof.Labels(
 				"appname", ex.sessionData().ApplicationName,
 				"addr", remoteAddr,
 				"stmt.tag", ast.StatementTag(),
-				"stmt.no.constants", formatStatementHideConstants(ast),
+				"stmt.no.constants", stmtNoConstants,
 			)
 			pprof.Do(ctx, labels, func(ctx context.Context) {
 				ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res)
@@ -694,7 +700,12 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 	p.stmt = stmt
 	p.cancelChecker.Reset(ctx)
-	p.autoCommit = os.ImplicitTxn.Get() && !ex.server.cfg.TestingKnobs.DisableAutoCommit
+
+	// We need to turn off autocommit behavior here so that the "insert fast path"
+	// does not get triggered. The postgres docs say that commands in the extended
+	// protocol are all treated as an implicit transaction that does not get
+	// committed until a Sync message is received.
+	p.autoCommit = os.ImplicitTxn.Get() && !isExtendedProtocol && !ex.server.cfg.TestingKnobs.DisableAutoCommit
 
 	var stmtThresholdSpan *tracing.Span
 	alreadyRecording := ex.transitionCtx.sessionTracing.Enabled()
@@ -841,15 +852,16 @@ func (ex *connExecutor) reportSessionDataChanges(fn func() error) error {
 			if err != nil {
 				return err
 			}
+			if v.Equal == nil {
+				return errors.AssertionFailedf("Equal for %s must be set", param.name)
+			}
 			if v.GetFromSessionData == nil {
 				return errors.AssertionFailedf("GetFromSessionData for %s must be set", param.name)
 			}
-			beforeVal := v.GetFromSessionData(before)
-			afterVal := v.GetFromSessionData(after)
-			if beforeVal != afterVal {
+			if !v.Equal(before, after) {
 				ex.dataMutatorIterator.paramStatusUpdater.BufferParamStatusUpdate(
 					param.name,
-					afterVal,
+					v.GetFromSessionData(after),
 				)
 			}
 		}

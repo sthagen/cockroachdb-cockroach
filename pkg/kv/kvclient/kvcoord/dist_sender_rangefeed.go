@@ -22,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -40,6 +42,14 @@ type singleRangeInfo struct {
 	startFrom hlc.Timestamp
 	token     rangecache.EvictionToken
 }
+
+var useDedicatedRangefeedConnectionClass = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.rangefeed.use_dedicated_connection_class.enabled",
+	"uses dedicated connection when running rangefeeds",
+	util.ConstantWithMetamorphicTestBool(
+		"kv.rangefeed.use_dedicated_connection_class.enabled", false),
+)
 
 // RangeFeed divides a RangeFeed request on range boundaries and establishes a
 // RangeFeed to each of the individual ranges. It streams back results on the
@@ -208,7 +218,7 @@ func (ds *DistSender) divideAndSendRangeFeedToRanges(
 	// boundaries. So, as we go, keep track of the remaining uncovered part of
 	// `rs` in `nextRS`.
 	nextRS := rs
-	ri := NewRangeIterator(ds)
+	ri := MakeRangeIterator(ds)
 	for ri.Seek(ctx, nextRS.Key, Ascending); ri.Valid(); ri.Next(ctx) {
 		desc := ri.Desc()
 		partialRS, err := nextRS.Intersect(desc)
@@ -370,7 +380,7 @@ func (ds *DistSender) singleRangeFeed(
 	replicas.OptimizeReplicaOrder(ds.getNodeDescriptor(), latencyFn)
 	// The RangeFeed is not used for system critical traffic so use a DefaultClass
 	// connection regardless of the range.
-	opts := SendOptions{class: rpc.DefaultClass}
+	opts := SendOptions{class: connectionClass(&ds.st.SV)}
 	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas)
 	if err != nil {
 		return args.Timestamp, err
@@ -425,4 +435,11 @@ func (ds *DistSender) singleRangeFeed(
 			}
 		}
 	}
+}
+
+func connectionClass(sv *settings.Values) rpc.ConnectionClass {
+	if useDedicatedRangefeedConnectionClass.Get(sv) {
+		return rpc.RangefeedClass
+	}
+	return rpc.DefaultClass
 }

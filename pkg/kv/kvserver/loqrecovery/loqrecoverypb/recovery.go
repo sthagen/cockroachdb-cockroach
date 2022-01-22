@@ -13,6 +13,7 @@ package loqrecoverypb
 import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 )
@@ -59,4 +60,34 @@ func (m ReplicaUpdate) NodeID() roachpb.NodeID {
 // StoreID is a StoreID on which this replica update should be applied.
 func (m ReplicaUpdate) StoreID() roachpb.StoreID {
 	return m.NewReplica.StoreID
+}
+
+// Replica gets replica for the store where this info and range
+// descriptor were collected. Returns err if it can't find replica
+// descriptor for the store it originated from.
+func (m *ReplicaInfo) Replica() (roachpb.ReplicaDescriptor, error) {
+	if d, ok := m.Desc.GetReplicaDescriptor(m.StoreID); ok {
+		return d, nil
+	}
+	return roachpb.ReplicaDescriptor{}, errors.Errorf(
+		"invalid replica info: its own store s%d is not present in descriptor replicas %s",
+		m.StoreID, m.Desc)
+}
+
+// AsStructuredLog creates a structured log entry from the record.
+func (m *ReplicaRecoveryRecord) AsStructuredLog() eventpb.DebugRecoverReplica {
+	return eventpb.DebugRecoverReplica{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			Timestamp: m.Timestamp,
+		},
+		CommonDebugEventDetails: eventpb.CommonDebugEventDetails{
+			NodeID: int32(m.NewReplica.NodeID),
+		},
+		RangeID:           int64(m.RangeID),
+		StoreID:           int64(m.NewReplica.StoreID),
+		SurvivorReplicaID: int32(m.OldReplicaID),
+		UpdatedReplicaID:  int32(m.NewReplica.ReplicaID),
+		StartKey:          m.StartKey.AsRKey().String(),
+		EndKey:            m.EndKey.AsRKey().String(),
+	}
 }

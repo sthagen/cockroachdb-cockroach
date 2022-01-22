@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/xml"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -18,14 +19,16 @@ import (
 	"strings"
 
 	"github.com/alessio/shellescape"
+	bazelutil "github.com/cockroachdb/cockroach/pkg/build/util"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
 const (
-	buildSubcmd        = "build"
-	testSubcmd         = "test"
-	mungeTestXMLSubcmd = "munge-test-xml"
+	buildSubcmd         = "build"
+	testSubcmd          = "test"
+	mergeTestXMLsSubcmd = "merge-test-xmls"
+	mungeTestXMLSubcmd  = "munge-test-xml"
 )
 
 var (
@@ -97,8 +100,8 @@ func parseArgs(args []string, argsLenAtDash int) (*parsedArgs, error) {
 	if len(args) < 2 {
 		return nil, errUsage
 	}
-	if args[0] != buildSubcmd && args[0] != testSubcmd && args[0] != mungeTestXMLSubcmd {
-		return nil, errors.Newf("First argument must be `build`, `test`, or `munge-test-xml`; got %v", args[0])
+	if args[0] != buildSubcmd && args[0] != testSubcmd && args[0] != mungeTestXMLSubcmd && args[0] != mergeTestXMLsSubcmd {
+		return nil, errors.Newf("First argument must be `build`, `test`, `merge-test-xmls`, or `munge-test-xml`; got %v", args[0])
 	}
 	var splitLoc int
 	if argsLenAtDash < 0 {
@@ -212,10 +215,13 @@ func bazciImpl(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Special case: munge-test-xml doesn't require running Bazel at all.
+	// Special case: munge-test-xml/merge-test-xmls don't require running Bazel at all.
 	// Perform the munge then exit immediately.
 	if parsedArgs.subcmd == mungeTestXMLSubcmd {
 		return mungeTestXMLs(*parsedArgs)
+	}
+	if parsedArgs.subcmd == mergeTestXMLsSubcmd {
+		return mergeTestXMLs(*parsedArgs)
 	}
 
 	info, err := getBuildInfo(*parsedArgs)
@@ -254,7 +260,7 @@ func mungeTestXMLs(args parsedArgs) error {
 			return err
 		}
 		var buf bytes.Buffer
-		err = mungeTestXML(contents, &buf)
+		err = bazelutil.MungeTestXML(contents, &buf)
 		if err != nil {
 			return err
 		}
@@ -264,6 +270,23 @@ func mungeTestXMLs(args parsedArgs) error {
 		}
 	}
 	return nil
+}
+
+func mergeTestXMLs(args parsedArgs) error {
+	var xmlsToMerge []bazelutil.TestSuites
+	for _, file := range args.targets {
+		contents, err := ioutil.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		var testSuites bazelutil.TestSuites
+		err = xml.Unmarshal(contents, &testSuites)
+		if err != nil {
+			return err
+		}
+		xmlsToMerge = append(xmlsToMerge, testSuites)
+	}
+	return bazelutil.MergeTestXMLs(xmlsToMerge, os.Stdout)
 }
 
 func configArgList() []string {

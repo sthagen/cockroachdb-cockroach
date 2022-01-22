@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
@@ -151,9 +152,11 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 	}
 	runJobWithProtectedTimestamp := func(ptsID uuid.UUID, ts hlc.Timestamp, jr jobs.Record) error {
 		return source.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			deprecatedTenantSpan := roachpb.Spans{*makeTenantSpan(30)}
+			tenantTarget := ptpb.MakeTenantsTarget([]roachpb.TenantID{roachpb.MakeTenantID(30)})
 			if err := ptp.Protect(ctx, txn,
 				jobsprotectedts.MakeRecord(ptsID, int64(jr.JobID), ts,
-					[]roachpb.Span{*makeTenantSpan(30)}, jobsprotectedts.Jobs)); err != nil {
+					deprecatedTenantSpan, jobsprotectedts.Jobs, tenantTarget)); err != nil {
 				return err
 			}
 			_, err := registry.CreateAdoptableJobWithTxn(ctx, jr, jr.JobID, txn)
@@ -185,14 +188,14 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 			_, err := getPTSRecord(ptsID)
 			require.Error(t, err, "protected timestamp record does not exist")
 
-			var status jobspb.StreamReplicationStatus
+			var status streampb.StreamReplicationStatus
 			require.NoError(t, source.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				status, err = updateReplicationStreamProgress(
 					ctx, timeutil.Now(), ptp, registry, streaming.StreamID(jr.JobID),
 					hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}, txn)
 				return err
 			}))
-			require.Equal(t, jobspb.StreamReplicationStatus_STREAM_INACTIVE, status.StreamStatus)
+			require.Equal(t, streampb.StreamReplicationStatus_STREAM_INACTIVE, status.StreamStatus)
 		}
 
 		{ // Job starts running and eventually fails after it's timed out
@@ -214,7 +217,7 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 			}
 
 			// Set expiration to a new time in the future
-			var streamStatus jobspb.StreamReplicationStatus
+			var streamStatus streampb.StreamReplicationStatus
 			var err error
 			expire := expirationTime(jr).Add(10 * time.Millisecond)
 			require.NoError(t, source.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -223,7 +226,7 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 					ptp, registry, streaming.StreamID(jr.JobID), updatedFrontier, txn)
 				return err
 			}))
-			require.Equal(t, jobspb.StreamReplicationStatus_STREAM_ACTIVE, streamStatus.StreamStatus)
+			require.Equal(t, streampb.StreamReplicationStatus_STREAM_ACTIVE, streamStatus.StreamStatus)
 			require.Equal(t, updatedFrontier, *streamStatus.ProtectedTimestamp)
 
 			r, err := getPTSRecord(ptsID)

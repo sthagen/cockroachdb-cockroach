@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
@@ -128,13 +129,25 @@ func (p *planner) createDatabase(
 		return nil, false, err
 	}
 
+	owner := p.SessionData().User()
+	if !database.Owner.Undefined() {
+		owner, err = database.Owner.ToSQLUsername(p.SessionData(), security.UsernameValidation)
+		if err != nil {
+			return nil, true, err
+		}
+	}
+
 	desc := dbdesc.NewInitial(
 		id,
 		string(database.Name),
-		p.SessionData().User(),
+		owner,
 		dbdesc.MaybeWithDatabaseRegionConfig(regionConfig),
 		dbdesc.WithPublicSchemaID(publicSchemaID),
 	)
+
+	if err := p.checkCanAlterToNewOwner(ctx, desc, owner); err != nil {
+		return nil, true, err
+	}
 
 	if err := p.createDescriptorWithID(ctx, dKey, id, desc, nil, jobDesc); err != nil {
 		return nil, true, err
@@ -143,6 +156,7 @@ func (p *planner) createDatabase(
 	// Initialize the multi-region database by creating the multi-region enum and
 	// database-level zone configuration if there is a region config on the
 	// descriptor.
+
 	if err := p.maybeInitializeMultiRegionDatabase(ctx, desc, regionConfig); err != nil {
 		return nil, true, err
 	}
@@ -323,9 +337,7 @@ func TranslateDataPlacement(g tree.DataPlacement) (descpb.DataPlacement, error) 
 	}
 }
 
-func (p *planner) checkRegionIsCurrentlyActive(
-	ctx context.Context, region descpb.RegionName,
-) error {
+func (p *planner) checkRegionIsCurrentlyActive(ctx context.Context, region catpb.RegionName) error {
 	liveRegions, err := p.getLiveClusterRegions(ctx)
 	if err != nil {
 		return err
@@ -342,7 +354,7 @@ var InitializeMultiRegionMetadataCCL = func(
 	execCfg *ExecutorConfig,
 	liveClusterRegions LiveClusterRegions,
 	survivalGoal tree.SurvivalGoal,
-	primaryRegion descpb.RegionName,
+	primaryRegion catpb.RegionName,
 	regions []tree.Name,
 	dataPlacement tree.DataPlacement,
 ) (*multiregion.RegionConfig, error) {
@@ -396,7 +408,7 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 		p.ExecCfg(),
 		liveRegions,
 		survivalGoal,
-		descpb.RegionName(primaryRegion),
+		catpb.RegionName(primaryRegion),
 		regions,
 		placement,
 	)

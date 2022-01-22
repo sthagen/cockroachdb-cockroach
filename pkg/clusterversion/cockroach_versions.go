@@ -223,12 +223,31 @@ const (
 	// This version comes with a migration to populate the same seed data
 	// for existing tenants.
 	SeedTenantSpanConfigs
-	// Public schema is backed by a descriptor.
+	// PublicSchemasWithDescriptors backs public schemas with descriptors.
 	PublicSchemasWithDescriptors
 	// AlterSystemProtectedTimestampAddColumn adds a target column to the
 	// system.protected_ts_records table that describes what is protected by the
 	// record.
 	AlterSystemProtectedTimestampAddColumn
+	// EnsureSpanConfigReconciliation ensures that the host tenant has run its
+	// reconciliation process at least once.
+	EnsureSpanConfigReconciliation
+	// EnsureSpanConfigSubscription ensures that all KV nodes are subscribed to
+	// the global span configuration state, observing the entries installed as
+	// in EnsureSpanConfigReconciliation.
+	EnsureSpanConfigSubscription
+	// EnableSpanConfigStore enables the use of the span configs infrastructure
+	// in KV.
+	EnableSpanConfigStore
+	// ScanWholeRows is the version at which the Header.WholeRowsOfSize parameter
+	// was introduced, preventing limited scans from returning partial rows.
+	ScanWholeRows
+	// SCRAM authentication is available.
+	SCRAMAuthentication
+	// UnsafeLossOfQuorumRecoveryRangeLog adds a new value to RangeLogEventReason
+	// that correspond to range descriptor changes resulting from recovery
+	// procedures.
+	UnsafeLossOfQuorumRecoveryRangeLog
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -336,6 +355,30 @@ var versionsSingleton = keyedVersions{
 	{
 		Key:     AlterSystemProtectedTimestampAddColumn,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 36},
+	},
+	{
+		Key:     EnsureSpanConfigReconciliation,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 38},
+	},
+	{
+		Key:     EnsureSpanConfigSubscription,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 40},
+	},
+	{
+		Key:     EnableSpanConfigStore,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 42},
+	},
+	{
+		Key:     ScanWholeRows,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 44},
+	},
+	{
+		Key:     SCRAMAuthentication,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 46},
+	},
+	{
+		Key:     UnsafeLossOfQuorumRecoveryRangeLog,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 48},
 	},
 
 	// *************************************************

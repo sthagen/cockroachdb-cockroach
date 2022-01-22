@@ -19,6 +19,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	benchTimeFlag = "bench-time"
+	benchMemFlag  = "bench-mem"
+)
+
 // makeBenchCmd constructs the subcommand used to run the specified benchmarks.
 func makeBenchCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	benchCmd := &cobra.Command{
@@ -26,23 +31,39 @@ func makeBenchCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 		Short: `Run the specified benchmarks`,
 		Long:  `Run the specified benchmarks.`,
 		Example: `
-	dev bench
-        dev bench pkg/sql/parser
-        dev bench pkg/sql/parser/...
-        dev bench pkg/sql/parser --filter=BenchmarkParse`,
+	dev bench pkg/sql/parser --filter=BenchmarkParse
+	dev bench pkg/bench -f='BenchmarkTracing/1node/scan/trace=off' --count=2 --bench-time=10x --bench-mem`,
 		Args: cobra.MinimumNArgs(0),
 		RunE: runE,
 	}
 	addCommonBuildFlags(benchCmd)
 	addCommonTestFlags(benchCmd)
+
+	benchCmd.Flags().BoolP(vFlag, "v", false, "show benchmark process output")
+	benchCmd.Flags().BoolP(showLogsFlag, "", false, "show crdb logs in-line")
+	benchCmd.Flags().Int(countFlag, 1, "run benchmark n times")
+	// We use a string flag for benchtime instead of a duration; the go test
+	// runner accepts input of the form "Nx" to run the benchmark N times (see
+	// `go help testflag`).
+	benchCmd.Flags().String(benchTimeFlag, "", "duration to run each benchmark for")
+	benchCmd.Flags().Bool(benchMemFlag, false, "print memory allocations for benchmarks")
+
 	return benchCmd
 }
 
-func (d *dev) bench(cmd *cobra.Command, pkgs []string) error {
+func (d *dev) bench(cmd *cobra.Command, commandLine []string) error {
+	pkgs, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
-	filter := mustGetFlagString(cmd, filterFlag)
-	timeout := mustGetFlagDuration(cmd, timeoutFlag)
-	short := mustGetFlagBool(cmd, shortFlag)
+	var (
+		filter    = mustGetFlagString(cmd, filterFlag)
+		timeout   = mustGetFlagDuration(cmd, timeoutFlag)
+		short     = mustGetFlagBool(cmd, shortFlag)
+		showLogs  = mustGetFlagBool(cmd, showLogsFlag)
+		verbose   = mustGetFlagBool(cmd, vFlag)
+		count     = mustGetFlagInt(cmd, countFlag)
+		benchTime = mustGetFlagString(cmd, benchTimeFlag)
+		benchMem  = mustGetFlagBool(cmd, benchMemFlag)
+	)
 
 	// Enumerate all benches to run.
 	if len(pkgs) == 0 {
@@ -51,28 +72,26 @@ func (d *dev) bench(cmd *cobra.Command, pkgs []string) error {
 	}
 	benchesMap := make(map[string]bool)
 	for _, pkg := range pkgs {
-		pkg = strings.TrimPrefix(pkg, "//")
-		pkg = strings.TrimRight(pkg, "/")
-
-		if !strings.HasPrefix(pkg, "pkg/") {
-			return fmt.Errorf("malformed package %q, expecting %q", pkg, "pkg/{...}")
+		dir, isRecursive, tag, err := d.parsePkg(pkg)
+		if err != nil {
+			return err
 		}
-
-		if strings.HasSuffix(pkg, "/...") {
-			pkg = strings.TrimSuffix(pkg, "/...")
+		if isRecursive {
 			// Use `git grep` to find all Go files that contain benchmark tests.
-			out, err := d.exec.CommandContextSilent(ctx, "git", "grep", "-l", "^func Benchmark", "--", pkg+"/*_test.go")
+			out, err := d.exec.CommandContextSilent(ctx, "git", "grep", "-l", "^func Benchmark", "--", dir+"/*_test.go")
 			if err != nil {
 				return err
 			}
 			files := strings.Split(strings.TrimSpace(string(out)), "\n")
 			for _, file := range files {
-				dir, _ := filepath.Split(file)
+				dir, _ = filepath.Split(file)
 				dir = strings.TrimSuffix(dir, "/")
 				benchesMap[dir] = true
 			}
+		} else if tag != "" {
+			return fmt.Errorf("malformed package %q, tags not supported in 'bench' command", pkg)
 		} else {
-			benchesMap[pkg] = true
+			benchesMap[dir] = true
 		}
 	}
 	// De-duplicate and sort the list of benches to run.
@@ -90,13 +109,30 @@ func (d *dev) bench(cmd *cobra.Command, pkgs []string) error {
 	if numCPUs != 0 {
 		argsBase = append(argsBase, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
 	}
+	if verbose {
+		argsBase = append(argsBase, "--test_arg", "-test.v")
+	}
+	if showLogs {
+		argsBase = append(argsBase, "--test_arg", "-show-logs")
+	}
+	if count != 1 {
+		argsBase = append(argsBase, "--test_arg", fmt.Sprintf("-test.count=%d", count))
+	}
+	if benchTime != "" {
+		argsBase = append(argsBase, "--test_arg", fmt.Sprintf("-test.benchtime=%s", benchTime))
+	}
+	if benchMem {
+		argsBase = append(argsBase, "--test_arg", "-test.benchmem")
+	}
 
 	for _, bench := range benches {
 		args := make([]string, len(argsBase))
 		copy(args, argsBase)
 		base := filepath.Base(bench)
 		target := "//" + bench + ":" + base + "_test"
-		args = append(args, target, "--", "-test.run=-")
+		args = append(args, target)
+		args = append(args, additionalBazelArgs...)
+		args = append(args, "--", "-test.run=-")
 		if filter == "" {
 			args = append(args, "-test.bench=.")
 		} else {

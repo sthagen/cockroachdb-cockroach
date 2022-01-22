@@ -13,6 +13,7 @@ package keys
 import (
 	"bytes"
 	"fmt"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -121,6 +122,33 @@ func DecodeStoreCachedSettingsKey(key roachpb.Key) (settingKey roachpb.Key, err 
 		return nil, errors.Errorf("invalid key has trailing garbage: %q", detail)
 	}
 	return
+}
+
+// StoreUnsafeReplicaRecoveryKey creates a key for loss of quorum replica
+// recovery entry. Those keys are written by `debug recover apply-plan` command
+// on the store while node is stopped. Once node boots up, entries are
+// translated into structured log events to leave audit trail of recovery
+// operation.
+func StoreUnsafeReplicaRecoveryKey(uuid uuid.UUID) roachpb.Key {
+	key := make(roachpb.Key, 0, len(LocalStoreUnsafeReplicaRecoveryKeyMin)+len(uuid))
+	key = append(key, LocalStoreUnsafeReplicaRecoveryKeyMin...)
+	key = append(key, uuid.GetBytes()...)
+	return key
+}
+
+// DecodeStoreUnsafeReplicaRecoveryKey decodes uuid key used to create record
+// key for unsafe replica recovery record.
+func DecodeStoreUnsafeReplicaRecoveryKey(key roachpb.Key) (uuid.UUID, error) {
+	if !bytes.HasPrefix(key, LocalStoreUnsafeReplicaRecoveryKeyMin) {
+		return uuid.UUID{},
+			errors.Errorf("key %q does not have %q prefix", string(key), LocalRangeIDPrefix)
+	}
+	remainder := key[len(LocalStoreUnsafeReplicaRecoveryKeyMin):]
+	entryID, err := uuid.FromBytes(remainder)
+	if err != nil {
+		return entryID, errors.Wrap(err, "failed to get uuid from unsafe replica recovery key")
+	}
+	return entryID, nil
 }
 
 // NodeLivenessKey returns the key for the node liveness record.
@@ -747,6 +775,26 @@ func MakeFamilyKey(key []byte, famID uint32) []byte {
 	// single byte by EncodeUvarint. This is currently always true because the
 	// varint encoding will encode 1-9 bytes.
 	return encoding.EncodeUvarintAscending(key, uint64(len(key)-size))
+}
+
+// DecodeFamilyKey returns the family ID in the given row key. Returns an error
+// if the key does not contain a family ID.
+func DecodeFamilyKey(key []byte) (uint32, error) {
+	n, err := GetRowPrefixLength(key)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 || n >= len(key) {
+		return 0, errors.Errorf("invalid row prefix, got prefix length %d for key %s", n, key)
+	}
+	_, colFamilyID, err := encoding.DecodeUvarintAscending(key[n:])
+	if err != nil {
+		return 0, err
+	}
+	if colFamilyID > math.MaxUint32 {
+		return 0, errors.Errorf("column family ID overflow, got %d", colFamilyID)
+	}
+	return uint32(colFamilyID), nil
 }
 
 // DecodeTableIDIndexID decodes a table id followed by an index id from the

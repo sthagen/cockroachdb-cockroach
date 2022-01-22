@@ -16,7 +16,6 @@ go_library(
         "//pkg/sql/colexecop",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
-        "//pkg/sql/parser",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/mon",
@@ -30,5 +29,6 @@ go_test(
     name = "colexecargs_test",
     srcs = ["dep_test.go"],
     embed = [":colexecargs"],
+    tags = ["no-remote"],
     deps = ["//pkg/testutils/buildutil"],
 )

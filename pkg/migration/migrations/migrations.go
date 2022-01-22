@@ -59,7 +59,7 @@ var migrations = []migration.Migration{
 		alterSystemStmtDiagReqs,
 	),
 	migration.NewTenantMigration(
-		"seed system.span_configurations with configs for existing for existing tenants",
+		"seed system.span_configurations with configs for existing tenants",
 		toCV(clusterversion.SeedTenantSpanConfigs),
 		NoPrecondition,
 		seedTenantSpanConfigsMigration,
@@ -74,6 +74,22 @@ var migrations = []migration.Migration{
 		toCV(clusterversion.AlterSystemProtectedTimestampAddColumn),
 		NoPrecondition,
 		alterTableProtectedTimestampRecords,
+	),
+	migration.NewTenantMigration("update synthetic public schemas to be backed by a descriptor",
+		toCV(clusterversion.PublicSchemasWithDescriptors),
+		NoPrecondition,
+		publicSchemaMigration,
+	),
+	migration.NewTenantMigration(
+		"enable span configs infrastructure",
+		toCV(clusterversion.EnsureSpanConfigReconciliation),
+		NoPrecondition,
+		ensureSpanConfigReconciliation,
+	),
+	migration.NewSystemMigration(
+		"enable span configs infrastructure",
+		toCV(clusterversion.EnsureSpanConfigSubscription),
+		ensureSpanConfigSubscription,
 	),
 }
 

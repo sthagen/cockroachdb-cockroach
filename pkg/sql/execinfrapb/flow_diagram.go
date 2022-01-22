@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
@@ -143,10 +144,33 @@ func indexDetail(desc *descpb.TableDescriptor, indexIdx uint32) string {
 
 // summary implements the diagramCellType interface.
 func (tr *TableReaderSpec) summary() (string, []string) {
-	details := []string{indexDetail(&tr.Table, tr.IndexIdx)}
+	details := make([]string, 0, 3)
+	details = append(details, indexDetail(&tr.Table, tr.IndexIdx))
+	tbl := tabledesc.NewUnsafeImmutable(&tr.Table)
+	var b strings.Builder
+	b.WriteString("Columns:")
+	const wrapAt = 100
+	for i, colID := range tr.ColumnIDs {
+		col, err := tbl.FindColumnWithID(colID)
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		var name string
+		if err != nil {
+			name = fmt.Sprintf("?%d?", colID)
+		} else {
+			name = col.GetName()
+		}
+		if b.Len()+len(name)+1 > wrapAt {
+			details = append(details, b.String())
+			b.Reset()
+		}
+		b.WriteByte(' ')
+		b.WriteString(name)
+	}
+	details = append(details, b.String())
 
 	if len(tr.Spans) > 0 {
-		tbl := tr.BuildTableDescriptor()
 		// only show the first span
 		idx := tbl.ActiveIndexes()[int(tr.IndexIdx)]
 		valDirs := catalogkeys.IndexKeyValDirs(idx)

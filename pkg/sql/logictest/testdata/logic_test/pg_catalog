@@ -4032,17 +4032,20 @@ application_name                                      ·                   NULL 
 avoid_buffering                                       off                 NULL      NULL        NULL        string
 backslash_quote                                       safe_encoding       NULL      NULL        NULL        string
 bytea_output                                          hex                 NULL      NULL        NULL        string
+check_function_bodies                                 on                  NULL      NULL        NULL        string
 client_encoding                                       UTF8                NULL      NULL        NULL        string
 client_min_messages                                   notice              NULL      NULL        NULL        string
 database                                              test                NULL      NULL        NULL        string
 datestyle                                             ISO, MDY            NULL      NULL        NULL        string
 datestyle_enabled                                     off                 NULL      NULL        NULL        string
 default_int_size                                      8                   NULL      NULL        NULL        string
+default_table_access_method                           heap                NULL      NULL        NULL        string
 default_tablespace                                    ·                   NULL      NULL        NULL        string
 default_transaction_isolation                         serializable        NULL      NULL        NULL        string
 default_transaction_priority                          normal              NULL      NULL        NULL        string
 default_transaction_read_only                         off                 NULL      NULL        NULL        string
 default_transaction_use_follower_reads                off                 NULL      NULL        NULL        string
+default_with_oids                                     off                 NULL      NULL        NULL        string
 disable_partially_distributed_plans                   off                 NULL      NULL        NULL        string
 disable_plan_gists                                    off                 NULL      NULL        NULL        string
 disallow_full_table_scans                             off                 NULL      NULL        NULL        string
@@ -4094,6 +4097,7 @@ optimizer_use_histograms                              on                  NULL  
 optimizer_use_multicol_stats                          on                  NULL      NULL        NULL        string
 override_multi_region_zone_config                     off                 NULL      NULL        NULL        string
 parallelize_multi_key_lookup_joins_enabled            off                 NULL      NULL        NULL        string
+password_encryption                                   scram-sha-256       NULL      NULL        NULL        string
 prefer_lookup_joins_for_fks                           off                 NULL      NULL        NULL        string
 propagate_input_ordering                              off                 NULL      NULL        NULL        string
 reorder_joins_limit                                   8                   NULL      NULL        NULL        string
@@ -4125,6 +4129,7 @@ transaction_rows_written_err                          0                   NULL  
 transaction_rows_written_log                          0                   NULL      NULL        NULL        string
 transaction_status                                    NoTxn               NULL      NULL        NULL        string
 vectorize                                             on                  NULL      NULL        NULL        string
+xmloption                                             content             NULL      NULL        NULL        string
 
 skipif config 3node-tenant
 query TTTTTTT colnames
@@ -4140,17 +4145,20 @@ application_name                                      ·                   NULL 
 avoid_buffering                                       off                 NULL  user     NULL      false               false
 backslash_quote                                       safe_encoding       NULL  user     NULL      safe_encoding       safe_encoding
 bytea_output                                          hex                 NULL  user     NULL      hex                 hex
+check_function_bodies                                 on                  NULL  user     NULL      on                  on
 client_encoding                                       UTF8                NULL  user     NULL      UTF8                UTF8
 client_min_messages                                   notice              NULL  user     NULL      notice              notice
 database                                              test                NULL  user     NULL      ·                   test
 datestyle                                             ISO, MDY            NULL  user     NULL      ISO, MDY            ISO, MDY
 datestyle_enabled                                     off                 NULL  user     NULL      off                 off
 default_int_size                                      8                   NULL  user     NULL      8                   8
+default_table_access_method                           heap                NULL  user     NULL      heap                heap
 default_tablespace                                    ·                   NULL  user     NULL      ·                   ·
 default_transaction_isolation                         serializable        NULL  user     NULL      default             default
 default_transaction_priority                          normal              NULL  user     NULL      normal              normal
 default_transaction_read_only                         off                 NULL  user     NULL      off                 off
 default_transaction_use_follower_reads                off                 NULL  user     NULL      off                 off
+default_with_oids                                     off                 NULL  user     NULL      off                 off
 disable_partially_distributed_plans                   off                 NULL  user     NULL      off                 off
 disable_plan_gists                                    off                 NULL  user     NULL      off                 off
 disallow_full_table_scans                             off                 NULL  user     NULL      off                 off
@@ -4202,6 +4210,7 @@ optimizer_use_histograms                              on                  NULL  
 optimizer_use_multicol_stats                          on                  NULL  user     NULL      on                  on
 override_multi_region_zone_config                     off                 NULL  user     NULL      off                 off
 parallelize_multi_key_lookup_joins_enabled            off                 NULL  user     NULL      false               false
+password_encryption                                   scram-sha-256       NULL  user     NULL      scram-sha-256       scram-sha-256
 prefer_lookup_joins_for_fks                           off                 NULL  user     NULL      off                 off
 propagate_input_ordering                              off                 NULL  user     NULL      off                 off
 reorder_joins_limit                                   8                   NULL  user     NULL      8                   8
@@ -4233,6 +4242,7 @@ transaction_rows_written_err                          0                   NULL  
 transaction_rows_written_log                          0                   NULL  user     NULL      0                   0
 transaction_status                                    NoTxn               NULL  user     NULL      NoTxn               NoTxn
 vectorize                                             on                  NULL  user     NULL      on                  on
+xmloption                                             content             NULL  user     NULL      content             content
 
 query TTTTTT colnames
 SELECT name, source, min_val, max_val, sourcefile, sourceline FROM pg_catalog.pg_settings
@@ -4242,6 +4252,7 @@ application_name                                      NULL    NULL     NULL     
 avoid_buffering                                       NULL    NULL     NULL     NULL        NULL
 backslash_quote                                       NULL    NULL     NULL     NULL        NULL
 bytea_output                                          NULL    NULL     NULL     NULL        NULL
+check_function_bodies                                 NULL    NULL     NULL     NULL        NULL
 client_encoding                                       NULL    NULL     NULL     NULL        NULL
 client_min_messages                                   NULL    NULL     NULL     NULL        NULL
 crdb_version                                          NULL    NULL     NULL     NULL        NULL
@@ -4249,11 +4260,13 @@ database                                              NULL    NULL     NULL     
 datestyle                                             NULL    NULL     NULL     NULL        NULL
 datestyle_enabled                                     NULL    NULL     NULL     NULL        NULL
 default_int_size                                      NULL    NULL     NULL     NULL        NULL
+default_table_access_method                           NULL    NULL     NULL     NULL        NULL
 default_tablespace                                    NULL    NULL     NULL     NULL        NULL
 default_transaction_isolation                         NULL    NULL     NULL     NULL        NULL
 default_transaction_priority                          NULL    NULL     NULL     NULL        NULL
 default_transaction_read_only                         NULL    NULL     NULL     NULL        NULL
 default_transaction_use_follower_reads                NULL    NULL     NULL     NULL        NULL
+default_with_oids                                     NULL    NULL     NULL     NULL        NULL
 disable_partially_distributed_plans                   NULL    NULL     NULL     NULL        NULL
 disable_plan_gists                                    NULL    NULL     NULL     NULL        NULL
 disallow_full_table_scans                             NULL    NULL     NULL     NULL        NULL
@@ -4306,6 +4319,7 @@ optimizer_use_histograms                              NULL    NULL     NULL     
 optimizer_use_multicol_stats                          NULL    NULL     NULL     NULL        NULL
 override_multi_region_zone_config                     NULL    NULL     NULL     NULL        NULL
 parallelize_multi_key_lookup_joins_enabled            NULL    NULL     NULL     NULL        NULL
+password_encryption                                   NULL    NULL     NULL     NULL        NULL
 prefer_lookup_joins_for_fks                           NULL    NULL     NULL     NULL        NULL
 propagate_input_ordering                              NULL    NULL     NULL     NULL        NULL
 reorder_joins_limit                                   NULL    NULL     NULL     NULL        NULL
@@ -4338,6 +4352,7 @@ transaction_rows_written_err                          NULL    NULL     NULL     
 transaction_rows_written_log                          NULL    NULL     NULL     NULL        NULL
 transaction_status                                    NULL    NULL     NULL     NULL        NULL
 vectorize                                             NULL    NULL     NULL     NULL        NULL
+xmloption                                             NULL    NULL     NULL     NULL        NULL
 
 # pg_catalog.pg_sequence
 

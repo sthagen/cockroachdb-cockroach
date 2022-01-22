@@ -148,6 +148,30 @@ e.g. directly access and mutate internal state, breaking system invariants.
 Events in this category are logged to the `OPS` channel.
 
 
+### `debug_recover_replica`
+
+An event of type `debug_recover_replica` is recorded when unsafe loss of quorum recovery is performed.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `RangeID` |  | no |
+| `StoreID` |  | no |
+| `SurvivorReplicaID` |  | no |
+| `UpdatedReplicaID` |  | no |
+| `StartKey` |  | yes |
+| `EndKey` |  | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `NodeID` | The node ID where the event originated. | no |
+| `User` | The user which performed the operation. | yes |
+
 ### `debug_send_kv_batch`
 
 An event of type `debug_send_kv_batch` is recorded when an arbitrary KV BatchRequest is submitted
@@ -2253,6 +2277,26 @@ An event of type `drop_role` is recorded when a role is dropped.
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | depends |
 | `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
+### `password_hash_converted`
+
+An event of type `password_hash_converted` is recorded when the password credentials
+are automatically converted server-side.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `RoleName` | The name of the user/role whose credentials have been converted. | yes |
+| `OldMethod` | The previous hash method. | no |
+| `NewMethod` | The new hash method. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
 
 ## Telemetry events
 

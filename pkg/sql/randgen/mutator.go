@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -301,7 +302,7 @@ func randHistogram(rng *rand.Rand, colType *types.T) stats.HistogramData {
 			encs := encodeInvertedIndexHistogramUpperBounds(colType, upper)
 			encodedUpperBounds = append(encodedUpperBounds, encs...)
 		} else {
-			enc, err := rowenc.EncodeTableKey(nil, upper, encoding.Ascending)
+			enc, err := keyside.Encode(nil, upper, encoding.Ascending)
 			if err != nil {
 				panic(err)
 			}
@@ -368,11 +369,11 @@ func encodeInvertedIndexHistogramUpperBounds(colType *types.T, val tree.Datum) (
 		panic(err)
 	}
 
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 	for i := range keys {
 		// Each key much be a byte-encoded datum so that it can be
 		// decoded in JSONStatistic.SetHistogram.
-		enc, err := rowenc.EncodeTableKey(nil, da.NewDBytes(tree.DBytes(keys[i])), encoding.Ascending)
+		enc, err := keyside.Encode(nil, da.NewDBytes(tree.DBytes(keys[i])), encoding.Ascending)
 		if err != nil {
 			panic(err)
 		}
@@ -767,8 +768,6 @@ func postgresCreateTableMutator(
 							if colTypeFamily == types.Box2DFamily {
 								isBox2d = true
 							}
-						} else {
-							col.Expr, changed = replaceNonImmutableExpr(rng, col.Expr, colTypes)
 						}
 						if isBox2d {
 							changed = true
@@ -807,11 +806,6 @@ func postgresCreateTableMutator(
 						Storing:  def.Storing,
 					})
 					changed = true
-				case *tree.ColumnTableDef:
-					if def.IsComputed() {
-						def.Computed.Expr, changed = replaceNonImmutableExpr(rng, def.Computed.Expr, colTypes)
-					}
-					newdefs = append(newdefs, def)
 				default:
 					newdefs = append(newdefs, def)
 				}
@@ -820,42 +814,6 @@ func postgresCreateTableMutator(
 		}
 	}
 	return mutated, changed
-}
-
-// replaceNonImmutableExpr checks if expr has a non-immutable operation in it,
-// and returns an immutable expr if it does. This is needed because Postgres has
-// different cast volatility for timestamps and/OID types. The substitution here
-// is specific to the output of randgen.randExpr, which uses
-// `lower(cast(col as string))`.
-func replaceNonImmutableExpr(
-	rng *rand.Rand, expr tree.Expr, colTypes map[string]*types.T,
-) (newExpr tree.Expr, changed bool) {
-	if funcExpr, ok := expr.(*tree.FuncExpr); ok {
-		if len(funcExpr.Exprs) == 1 {
-			if castExpr, ok := funcExpr.Exprs[0].(*tree.CastExpr); ok {
-				referencedType := colTypes[castExpr.Expr.(*tree.UnresolvedName).String()]
-				isContextDependentType := referencedType.Family() == types.TimestampFamily ||
-					referencedType.Family() == types.OidFamily ||
-					referencedType.Family() == types.DateFamily
-				if isContextDependentType &&
-					tree.MustBeStaticallyKnownType(castExpr.Type) == types.String {
-					newExpr = &tree.CaseExpr{
-						Whens: []*tree.When{
-							{
-								Cond: &tree.IsNullExpr{
-									Expr: castExpr.Expr,
-								},
-								Val: RandDatum(rng, types.String, true /* nullOK */),
-							},
-						},
-						Else: RandDatum(rng, types.String, true /* nullOK */),
-					}
-					return newExpr, true
-				}
-			}
-		}
-	}
-	return expr, false
 }
 
 // columnFamilyMutator is mutations.StatementMutator, but lives here to prevent

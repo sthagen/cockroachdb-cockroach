@@ -12,7 +12,6 @@ package rowenc
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"unsafe"
 
@@ -23,7 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/rowencpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -42,10 +43,8 @@ import (
 // MakeIndexKeyPrefix returns the key prefix used for the index's data. If you
 // need the corresponding Span, prefer desc.IndexSpan(indexID) or
 // desc.PrimaryIndexSpan().
-func MakeIndexKeyPrefix(
-	codec keys.SQLCodec, desc catalog.TableDescriptor, indexID descpb.IndexID,
-) []byte {
-	return codec.IndexPrefix(uint32(desc.GetID()), uint32(indexID))
+func MakeIndexKeyPrefix(codec keys.SQLCodec, tableID descpb.ID, indexID descpb.IndexID) []byte {
+	return codec.IndexPrefix(uint32(tableID), uint32(indexID))
 }
 
 // EncodeIndexKey creates a key by concatenating keyPrefix with the
@@ -63,7 +62,6 @@ func EncodeIndexKey(
 ) (key []byte, containsNull bool, err error) {
 	var colIDWithNullVal descpb.ColumnID
 	key, colIDWithNullVal, err = EncodePartialIndexKey(
-		tableDesc,
 		index,
 		index.NumKeyColumns(), /* encode all columns */
 		colMap,
@@ -88,7 +86,6 @@ func EncodeIndexKey(
 // given table, index, and values, with the same method as
 // EncodePartialIndexKey.
 func EncodePartialIndexSpan(
-	tableDesc catalog.TableDescriptor,
 	index catalog.Index,
 	numCols int,
 	colMap catalog.TableColMap,
@@ -97,7 +94,7 @@ func EncodePartialIndexSpan(
 ) (span roachpb.Span, containsNull bool, err error) {
 	var key roachpb.Key
 	var colIDWithNullVal descpb.ColumnID
-	key, colIDWithNullVal, err = EncodePartialIndexKey(tableDesc, index, numCols, colMap, values, keyPrefix)
+	key, colIDWithNullVal, err = EncodePartialIndexKey(index, numCols, colMap, values, keyPrefix)
 	containsNull = colIDWithNullVal != 0
 	if err != nil {
 		return span, containsNull, err
@@ -110,7 +107,6 @@ func EncodePartialIndexSpan(
 //  - index.KeyColumnIDs for unique indexes, and
 //  - append(index.KeyColumnIDs, index.KeySuffixColumnIDs) for non-unique indexes.
 func EncodePartialIndexKey(
-	tableDesc catalog.TableDescriptor,
 	index catalog.Index,
 	numCols int,
 	colMap catalog.TableColMap,
@@ -176,7 +172,7 @@ func MakeSpanFromEncDatums(
 	types []*types.T,
 	dirs []descpb.IndexDescriptor_Direction,
 	index catalog.Index,
-	alloc *DatumAlloc,
+	alloc *tree.DatumAlloc,
 	keyPrefix []byte,
 ) (_ roachpb.Span, containsNull bool, _ error) {
 	startKey, _, containsNull, err := MakeKeyFromEncDatums(values, types, dirs, index, alloc, keyPrefix)
@@ -366,7 +362,7 @@ func MakeKeyFromEncDatums(
 	types []*types.T,
 	dirs []descpb.IndexDescriptor_Direction,
 	index catalog.Index,
-	alloc *DatumAlloc,
+	alloc *tree.DatumAlloc,
 	keyPrefix []byte,
 ) (_ roachpb.Key, complete bool, containsNull bool, _ error) {
 	// Values may be a prefix of the index columns.
@@ -413,7 +409,7 @@ func appendEncDatumsToKey(
 	types []*types.T,
 	values EncDatumRow,
 	dirs []descpb.IndexDescriptor_Direction,
-	alloc *DatumAlloc,
+	alloc *tree.DatumAlloc,
 ) (_ roachpb.Key, containsNull bool, _ error) {
 	for i, val := range values {
 		encoding := descpb.DatumEncoding_ASCENDING_KEY
@@ -444,7 +440,7 @@ func DecodePartialTableIDIndexID(key []byte) ([]byte, descpb.ID, descpb.IndexID,
 //
 // Don't use this function in the scan "hot path".
 func DecodeIndexKeyPrefix(
-	codec keys.SQLCodec, desc catalog.TableDescriptor, key []byte,
+	codec keys.SQLCodec, expectedTableID descpb.ID, key []byte,
 ) (indexID descpb.IndexID, remaining []byte, err error) {
 	key, err = codec.StripTenantPrefix(key)
 	if err != nil {
@@ -455,9 +451,9 @@ func DecodeIndexKeyPrefix(
 	if err != nil {
 		return 0, nil, err
 	}
-	if tableID != desc.GetID() {
+	if tableID != expectedTableID {
 		return 0, nil, errors.Errorf(
-			"unexpected table ID %d, expected %d instead", tableID, desc.GetID())
+			"unexpected table ID %d, expected %d instead", tableID, expectedTableID)
 	}
 	return indexID, key, err
 }
@@ -468,28 +464,27 @@ func DecodeIndexKeyPrefix(
 // The remaining bytes in the index key are returned which will either be an
 // encoded column ID for the primary key index, the primary key suffix for
 // non-unique secondary indexes or unique secondary indexes containing NULL or
-// empty. If the given descriptor does not match the key, false is returned with
-// no error.
+// empty.
 func DecodeIndexKey(
 	codec keys.SQLCodec,
 	types []*types.T,
 	vals []EncDatum,
 	colDirs []descpb.IndexDescriptor_Direction,
 	key []byte,
-) (remainingKey []byte, matches bool, foundNull bool, _ error) {
+) (remainingKey []byte, foundNull bool, _ error) {
 	key, err := codec.StripTenantPrefix(key)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, err
 	}
 	key, _, _, err = DecodePartialTableIDIndexID(key)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, err
 	}
 	remainingKey, foundNull, err = DecodeKeyVals(types, vals, colDirs, key)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, err
 	}
-	return remainingKey, true, foundNull, nil
+	return remainingKey, foundNull, nil
 }
 
 // DecodeKeyVals decodes the values that are part of the key. The decoded
@@ -716,7 +711,7 @@ func encodeArrayInvertedIndexTableKeys(
 		}
 		outKey := make([]byte, len(inKey))
 		copy(outKey, inKey)
-		newKey, err := EncodeTableKey(outKey, d, encoding.Ascending)
+		newKey, err := keyside.Encode(outKey, d, encoding.Ascending)
 		if err != nil {
 			return nil, err
 		}
@@ -881,7 +876,7 @@ func EncodePrimaryIndex(
 	values []tree.Datum,
 	includeEmpty bool,
 ) ([]IndexEntry, error) {
-	keyPrefix := MakeIndexKeyPrefix(codec, tableDesc, index.GetID())
+	keyPrefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), index.GetID())
 	indexKey, _, err := EncodeIndexKey(tableDesc, index, colMap, values, keyPrefix)
 	if err != nil {
 		return nil, err
@@ -911,7 +906,7 @@ func EncodePrimaryIndex(
 				if err != nil {
 					return err
 				}
-				value, err := MarshalColumnValue(col, datum)
+				value, err := valueside.MarshalLegacy(col.GetType(), datum)
 				if err != nil {
 					return err
 				}
@@ -971,7 +966,7 @@ func EncodeSecondaryIndex(
 	values []tree.Datum,
 	includeEmpty bool,
 ) ([]IndexEntry, error) {
-	secondaryIndexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, secondaryIndex.GetID())
+	secondaryIndexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), secondaryIndex.GetID())
 
 	// Use the primary key encoding for covering indexes.
 	if secondaryIndex.GetEncodingType() == descpb.PrimaryIndexEncoding {
@@ -1222,13 +1217,10 @@ func writeColumnValues(
 		if val == tree.DNull || (col.isComposite && !val.(tree.CompositeDatum).IsComposite()) {
 			continue
 		}
-		if lastColID > col.id {
-			panic(fmt.Errorf("cannot write column id %d after %d", col.id, lastColID))
-		}
-		colIDDiff := col.id - lastColID
+		colIDDelta := valueside.MakeColumnIDDelta(lastColID, col.id)
 		lastColID = col.id
 		var err error
-		value, err = EncodeTableValue(value, colIDDiff, val, nil)
+		value, err = valueside.Encode(value, colIDDelta, val, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1326,7 +1318,7 @@ func EncodeColumns(
 			return nil, colIDWithNullVal, err
 		}
 
-		if key, err = EncodeTableKey(key, val, dir); err != nil {
+		if key, err = keyside.Encode(key, val, dir); err != nil {
 			return nil, colIDWithNullVal, err
 		}
 	}
@@ -1342,8 +1334,12 @@ func growKey(key []byte, additionalCapacity int) []byte {
 }
 
 func getIndexValueWrapperBytes(entry *IndexEntry) ([]byte, error) {
+	var value []byte
+	if entry.Value.IsPresent() {
+		value = entry.Value.TagAndDataBytes()
+	}
 	tempKV := rowencpb.IndexValueWrapper{
-		Value:   entry.Value.TagAndDataBytes(),
+		Value:   value,
 		Deleted: false,
 	}
 

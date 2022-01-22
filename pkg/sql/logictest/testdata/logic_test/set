@@ -530,6 +530,60 @@ SET standard_conforming_strings='true'
 statement ok
 SET standard_conforming_strings='on'
 
+subtest default_table_access_method_test
+
+query T
+SHOW default_table_access_method
+----
+heap
+
+statement ok
+SET default_table_access_method = 'heap'
+
+query T
+SHOW default_table_access_method
+----
+heap
+
+statement error invalid value for parameter "default_table_access_method": "not-heap"
+SET default_table_access_method = 'not-heap'
+
+subtest default_with_oids_test
+
+query T
+SHOW default_with_oids
+----
+off
+
+statement ok
+SET default_with_oids = 'false'
+
+query T
+SHOW default_with_oids
+----
+off
+
+statement error invalid value for parameter "default_with_oids": "true"
+SET default_with_oids = 'true'
+
+subtest xmloption_test
+
+query T
+SHOW xmloption
+----
+content
+
+statement ok
+SET xmloption = 'content'
+
+query T
+SHOW xmloption
+----
+content
+
+statement error invalid value for parameter "xmloption": "document"
+SET xmloption = 'document'
+
 subtest backslash_quote_test
 
 statement ok
@@ -623,6 +677,24 @@ SET LC_NUMERIC = 'en_US.UTF-8'
 
 statement error invalid value for parameter "lc_time": "en_US.UTF-8"
 SET LC_TIME = 'en_US.UTF-8'
+
+subtest check_function_bodies_test
+
+statement ok
+SET check_function_bodies = true
+
+query T
+SHOW check_function_bodies
+----
+on
+
+statement ok
+SET check_function_bodies = false
+
+query T
+SHOW check_function_bodies
+----
+off
 
 # Test custom session variables
 

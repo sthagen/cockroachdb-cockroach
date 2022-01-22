@@ -490,24 +490,15 @@ func resolveCast(
 		return nil
 
 	default:
-		var v Volatility
-		var hint string
-		if cast, ok := lookupCast(castFrom.Oid(), castTo.Oid()); ok && cast.volatility != volatilityTODO {
-			// If the volatility has been set in castMap, use it.
-			// TODO(mgartner): Add hints to castMap and use them here.
-			v = cast.volatility
-		} else if cast := lookupCastInfo(fromFamily, toFamily, intervalStyleEnabled, dateStyleEnabled); cast != nil {
-			// Otherwise, fallback to the volatility in castInfo.
-			v = cast.volatility
-			hint = cast.volatilityHint
-		} else {
+		cast, ok := lookupCast(castFrom, castTo, intervalStyleEnabled, dateStyleEnabled)
+		if !ok {
 			return invalidCastError(castFrom, castTo)
 		}
-		if !allowStable && v >= VolatilityStable {
+		if !allowStable && cast.volatility >= VolatilityStable {
 			err := NewContextDependentOpsNotAllowedError(context)
 			err = pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s::%s", castFrom, castTo)
-			if hint != "" {
-				err = errors.WithHint(err, hint)
+			if cast.volatilityHint != "" {
+				err = errors.WithHint(err, cast.volatilityHint)
 			}
 			return err
 		}
@@ -2317,6 +2308,8 @@ func TypeCheckSameTypedExprs(
 			if err != nil {
 				return nil, nil, err
 			}
+			// TODO(#75103): For UNION, CASE, and related expressions we should
+			// only allow types that can be implicitly cast to firstValidType.
 			if typ := typedExpr.ResolvedType(); !(typ.Equivalent(firstValidType) || typ.Family() == types.UnknownFamily) {
 				return nil, nil, unexpectedTypeError(exprs[i], firstValidType, typ)
 			}

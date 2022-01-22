@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
@@ -277,8 +276,10 @@ func newZigzagJoiner(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*zigzagJoiner, error) {
-	// TODO(ajwerner): Utilize a cached copy of these tables.
-	tables := spec.BuildTableDescriptors()
+	tables := make([]catalog.TableDescriptor, len(spec.Tables))
+	for i := range spec.Tables {
+		tables[i] = flowCtx.TableDescriptor(&spec.Tables[i])
+	}
 	if len(tables) != 2 {
 		return nil, errors.AssertionFailedf("zigzag joins only of two tables (or indexes) are supported, %d requested", len(tables))
 	}
@@ -380,10 +381,13 @@ func (z *zigzagJoiner) Start(ctx context.Context) {
 // zigzagJoinerInfo contains all the information that needs to be
 // stored for each side of the join.
 type zigzagJoinerInfo struct {
-	fetcher rowFetcher
+	fetcher      rowFetcher
+	row          rowenc.EncDatumRow
+	rowColIdxMap catalog.TableColMap
+
 	// rowsRead is the total number of rows that this fetcher read from disk.
 	rowsRead   int64
-	alloc      *rowenc.DatumAlloc
+	alloc      *tree.DatumAlloc
 	table      catalog.TableDescriptor
 	index      catalog.Index
 	indexTypes []*types.T
@@ -427,18 +431,22 @@ func (z *zigzagJoiner) setupInfo(
 	z.side = side
 	info := z.infos[side]
 
-	info.alloc = &rowenc.DatumAlloc{}
+	info.alloc = &tree.DatumAlloc{}
 	info.table = tables[side]
 	info.eqColumns = spec.EqColumns[side].Columns
 	indexOrdinal := spec.IndexOrdinals[side]
 	info.index = info.table.ActiveIndexes()[indexOrdinal]
 
-	var columnIDs []descpb.ColumnID
-	columnIDs, info.indexDirs = catalog.FullIndexColumnIDs(info.index)
-	info.indexTypes = make([]*types.T, len(columnIDs))
+	info.indexDirs = info.table.IndexFullColumnDirections(info.index)
+	columns := info.table.IndexFullColumns(info.index)
+	info.indexTypes = make([]*types.T, len(columns))
 	columnTypes := catalog.ColumnTypes(info.table.PublicColumns())
 	colIdxMap := catalog.ColumnIDToOrdinalMap(info.table.PublicColumns())
-	for i, columnID := range columnIDs {
+	for i, col := range columns {
+		if col == nil {
+			continue
+		}
+		columnID := col.GetID()
 		if info.index.GetType() == descpb.IndexDescriptor_INVERTED &&
 			columnID == info.index.InvertedColumnID() {
 			// Inverted key columns have type Bytes.
@@ -458,7 +466,7 @@ func (z *zigzagJoiner) setupInfo(
 
 	// Add the fixed columns.
 	for i := 0; i < len(info.fixedValues); i++ {
-		neededCols.Add(colIdxMap.GetDefault(columnIDs[i]))
+		neededCols.Add(colIdxMap.GetDefault(columns[i].GetID()))
 	}
 
 	// Add the equality columns.
@@ -474,19 +482,14 @@ func (z *zigzagJoiner) setupInfo(
 	info.spanBuilder = span.MakeBuilder(flowCtx.EvalCtx, flowCtx.Codec(), info.table, info.index)
 
 	// Setup the Fetcher.
-	var fetcher row.Fetcher
-	_, _, err := initRowFetcher(
+	fetcher, err := makeRowFetcherLegacy(
 		flowCtx,
-		&fetcher,
 		info.table,
 		int(indexOrdinal),
-		catalog.ColumnIDToOrdinalMap(info.table.PublicColumns()),
 		false, /* reverse */
 		neededCols,
-		false, /* check */
 		flowCtx.EvalCtx.Mon,
 		info.alloc,
-		execinfra.ScanVisibilityPublic,
 		// NB: zigzag joins are disabled when a row-level locking clause is
 		// supplied, so there is no locking strength on *ZigzagJoinerSpec.
 		descpb.ScanLockingStrength_FOR_NONE,
@@ -497,14 +500,16 @@ func (z *zigzagJoiner) setupInfo(
 	if err != nil {
 		return err
 	}
+	info.row = make(rowenc.EncDatumRow, len(info.table.PublicColumns()))
+	info.rowColIdxMap = catalog.ColumnIDToOrdinalMap(info.table.PublicColumns())
 
 	if collectingStats {
-		info.fetcher = newRowFetcherStatCollector(&fetcher)
+		info.fetcher = newRowFetcherStatCollector(fetcher)
 	} else {
-		info.fetcher = &fetcher
+		info.fetcher = fetcher
 	}
 
-	info.prefix = rowenc.MakeIndexKeyPrefix(flowCtx.Codec(), info.table, info.index.GetID())
+	info.prefix = rowenc.MakeIndexKeyPrefix(flowCtx.Codec(), info.table.GetID(), info.index.GetID())
 	span, err := z.produceSpanFromBaseRow()
 
 	if err != nil {
@@ -545,22 +550,24 @@ func (z *zigzagJoiner) fetchRow(ctx context.Context) (rowenc.EncDatumRow, error)
 func (z *zigzagJoiner) fetchRowFromSide(
 	ctx context.Context, side int,
 ) (fetchedRow rowenc.EncDatumRow, err error) {
+	info := z.infos[side]
 	// Keep fetching until a row is found that does not have null in an equality
 	// column.
 	hasNull := func(row rowenc.EncDatumRow) bool {
-		for _, c := range z.infos[side].eqColumns {
+		for _, c := range info.eqColumns {
 			if row[c].IsNull() {
 				return true
 			}
 		}
 		return false
 	}
+	fetchedRow = info.row
 	for {
-		fetchedRow, _, _, err = z.infos[side].fetcher.NextRow(ctx)
-		if fetchedRow == nil || err != nil {
-			return fetchedRow, err
+		ok, err := info.fetcher.NextRowInto(ctx, fetchedRow, info.rowColIdxMap)
+		if !ok || err != nil {
+			return nil, err
 		}
-		z.infos[side].rowsRead++
+		info.rowsRead++
 		if !hasNull(fetchedRow) {
 			break
 		}
@@ -718,7 +725,7 @@ func (z *zigzagJoiner) matchBase(curRow rowenc.EncDatumRow, side int) (bool, err
 	}
 
 	// Compare the equality columns of the baseRow to that of the curRow.
-	da := &rowenc.DatumAlloc{}
+	da := &tree.DatumAlloc{}
 	cmp, err := prevEqDatums.Compare(eqColTypes, da, ordering, z.FlowCtx.EvalCtx, curEqDatums)
 	if err != nil {
 		return false, err
@@ -866,7 +873,7 @@ func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatu
 			if err != nil {
 				return nil, err
 			}
-			da := &rowenc.DatumAlloc{}
+			da := &tree.DatumAlloc{}
 			cmp, err := prevEqCols.Compare(eqColTypes, da, ordering, z.FlowCtx.EvalCtx, currentEqCols)
 			if err != nil {
 				return nil, err

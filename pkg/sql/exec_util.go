@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	apd "github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -185,17 +185,20 @@ var allowCrossDatabaseSeqReferences = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
-const secondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.experimental_allow_for_secondary_tenant.enabled"
+const secondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_for_secondary_tenant.enabled"
 
 // secondaryTenantZoneConfigsEnabled controls if secondary tenants are allowed
 // to set zone configurations. It has no effect for the system tenant.
 //
 // This setting has no effect on zone configurations that have already been set.
+//
+// TODO(irfansharif): This should be a tenant-readonly setting, possible after
+// the work for #73349 is completed.
 var secondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	secondaryTenantsZoneConfigsEnabledSettingName,
 	"allow secondary tenants to set zone configurations; does not affect the system tenant",
-	false,
+	true,
 )
 
 // traceTxnThreshold can be used to log SQL transactions that take
@@ -873,6 +876,12 @@ var (
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
+	MetaCopyStarted = metric.Metadata{
+		Name:        "sql.copy.started.count",
+		Help:        "Number of COPY SQL statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaMiscStarted = metric.Metadata{
 		Name:        "sql.misc.started.count",
 		Help:        "Number of other SQL statements started",
@@ -971,6 +980,12 @@ var (
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
+	MetaCopyExecuted = metric.Metadata{
+		Name:        "sql.copy.count",
+		Help:        "Number of COPY SQL statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaMiscExecuted = metric.Metadata{
 		Name:        "sql.misc.count",
 		Help:        "Number of other SQL statements successfully executed",
@@ -1030,6 +1045,12 @@ var (
 		Help:        "Number of stale statistics rows that are removed",
 		Measurement: "SQL Stats Cleanup",
 		Unit:        metric.Unit_COUNT,
+	}
+	MetaSQLTxnStatsCollectionOverhead = metric.Metadata{
+		Name:        "sql.stats.txn_stats_collection.duration",
+		Help:        "Time took in nanoseconds to collect transaction stats",
+		Measurement: "SQL Transaction Stats Collection Overhead",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	MetaTxnRowsWrittenLog = metric.Metadata{
 		Name:        "sql.guardrails.transaction_rows_written_log.count",
@@ -1143,6 +1164,7 @@ type ExecutorConfig struct {
 	StreamingTestingKnobs                *StreamingTestingKnobs
 	SQLStatsTestingKnobs                 *sqlstats.TestingKnobs
 	TelemetryLoggingTestingKnobs         *TelemetryLoggingTestingKnobs
+	SpanConfigTestingKnobs               *spanconfig.TestingKnobs
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
 
@@ -1184,6 +1206,9 @@ type ExecutorConfig struct {
 	// IndexValidator is used to validate indexes.
 	IndexValidator scexec.IndexValidator
 
+	// CommentUpdaterFactory is used to issue queries for updating comments.
+	CommentUpdaterFactory scexec.CommentUpdaterFactory
+
 	// ContentionRegistry is a node-level registry of contention events used for
 	// contention observability.
 	ContentionRegistry *contention.Registry
@@ -1208,9 +1233,9 @@ type ExecutorConfig struct {
 	// CollectionFactory is used to construct a descs.Collection.
 	CollectionFactory *descs.CollectionFactory
 
-	// SpanConfigReconciliationJobDeps are used to drive the span config
-	// reconciliation job.
-	SpanConfigReconciliationJobDeps spanconfig.ReconciliationDependencies
+	// SpanConfigReconciler is used to drive the span config reconciliation job
+	// and related migrations.
+	SpanConfigReconciler spanconfig.Reconciler
 
 	// SpanConfigKVAccessor is used when creating and deleting tenant
 	// records.
@@ -1224,6 +1249,10 @@ type ExecutorConfig struct {
 	// SystemIDChecker is used to check whether an ID is part of the
 	// system database.
 	SystemIDChecker *catalog.SystemIDChecker
+
+	// AllowSessionRevival is true if the cluster is allowed to create session
+	// revival tokens and use them to authenticate a session.
+	AllowSessionRevival bool
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1297,14 +1326,14 @@ type ExecutorTestingKnobs struct {
 	// BeforeRestart is called before a transaction restarts.
 	BeforeRestart func(ctx context.Context, reason error)
 
-	// DisableAutoCommit, if set, disables the auto-commit functionality of some
-	// SQL statements. That functionality allows some statements to commit
+	// DisableAutoCommitDuringExec, if set, disables the auto-commit functionality
+	// of some SQL statements. That functionality allows some statements to commit
 	// directly when they're executed in an implicit SQL txn, without waiting for
 	// the Executor to commit the implicit txn.
 	// This has to be set in tests that need to abort such statements using a
-	// StatementFilter; otherwise, the statement commits immediately after
+	// StatementFilter; otherwise, the statement commits at the same time as
 	// execution so there'll be nothing left to abort by the time the filter runs.
-	DisableAutoCommit bool
+	DisableAutoCommitDuringExec bool
 
 	// BeforeAutoCommit is called when the Executor is about to commit the KV
 	// transaction after running a statement in an implicit transaction, allowing
@@ -1905,6 +1934,10 @@ func (r *SessionRegistry) SerializeAll() []serverpb.Session {
 const MaxSQLBytes = 1000
 
 type jobsCollection []jobspb.JobID
+
+func (jc *jobsCollection) add(ids ...jobspb.JobID) {
+	*jc = append(*jc, ids...)
+}
 
 // truncateStatementStringForTelemetry truncates the string
 // representation of a statement to a maximum length, so as to not
@@ -2837,6 +2870,10 @@ func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
 }
 
+func (m *sessionDataMutator) SetCheckFunctionBodies(val bool) {
+	m.data.CheckFunctionBodies = val
+}
+
 func (m *sessionDataMutator) SetPreferLookupJoinsForFKs(val bool) {
 	m.data.PreferLookupJoinsForFKs = val
 }
@@ -3073,6 +3110,8 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 	return f.CloseAndGetString(), true
 }
 
+// formatStmtKeyAsRedactableString given an AST node this function will fully
+// qualify names using annotations to format it out into a redactable string.
 func formatStmtKeyAsRedactableString(
 	vt VirtualTabler, rootAST tree.Statement, ann *tree.Annotations,
 ) redact.RedactableString {

@@ -99,8 +99,7 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0,     /* lockTimeout */
-		false, /* isCheck */
+		0, /* lockTimeout */
 		params.p.alloc,
 		nil, /* memMonitor */
 		table,
@@ -187,12 +186,9 @@ func (d *deleteRangeNode) processResults(
 				continue
 			}
 
-			after, ok, _, err := d.fetcher.ReadIndexKey(keyBytes)
+			after, _, err := d.fetcher.DecodeIndexKey(keyBytes)
 			if err != nil {
 				return nil, err
-			}
-			if !ok {
-				return nil, errors.AssertionFailedf("key did not match descriptor")
 			}
 			k := keyBytes[:len(keyBytes)-len(after)]
 			if !bytes.Equal(k, prev) {

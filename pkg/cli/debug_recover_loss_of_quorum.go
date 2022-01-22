@@ -28,6 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -280,8 +282,9 @@ Discarded live replicas: %d
 `, report.TotalReplicas, len(report.PlannedUpdates), report.DiscardedNonSurvivors)
 	for _, r := range report.PlannedUpdates {
 		_, _ = fmt.Fprintf(stderr, "Recovering range r%d:%s updating replica %s to %s. "+
-			"Discarding replicas: %s\n",
-			r.RangeID, r.StartKey, r.OldReplica, r.Replica, r.DiscardedReplicas)
+			"Discarding available replicas: [%s], discarding dead replicas: [%s].\n",
+			r.RangeID, r.StartKey, r.OldReplica, r.Replica,
+			r.DiscardedAvailableReplicas, r.DiscardedDeadReplicas)
 	}
 
 	deadStoreMsg := fmt.Sprintf("\nDiscovered dead stores from provided files: %s",
@@ -410,16 +413,16 @@ func runDebugExecuteRecoverPlan(cmd *cobra.Command, args []string) error {
 	var localNodeID roachpb.NodeID
 	batches := make(map[roachpb.StoreID]storage.Batch)
 	for _, storeSpec := range debugRecoverExecuteOpts.Stores.Specs {
-		db, err := OpenExistingStore(storeSpec.Path, stopper, false /* readOnly */)
+		store, err := OpenExistingStore(storeSpec.Path, stopper, false /* readOnly */)
 		if err != nil {
 			return errors.Wrapf(err, "failed to open store at path %q. ensure that store path is "+
 				"correct and that it is not used by another process", storeSpec.Path)
 		}
-		batch := db.NewBatch()
-		defer db.Close()
+		batch := store.NewBatch()
+		defer store.Close()
 		defer batch.Close()
 
-		storeIdent, err := kvserver.ReadStoreIdent(cmd.Context(), db)
+		storeIdent, err := kvserver.ReadStoreIdent(cmd.Context(), store)
 		if err != nil {
 			return err
 		}
@@ -433,14 +436,16 @@ func runDebugExecuteRecoverPlan(cmd *cobra.Command, args []string) error {
 		batches[storeIdent.StoreID] = batch
 	}
 
+	updateTime := timeutil.Now()
 	prepReport, err := loqrecovery.PrepareUpdateReplicas(
-		cmd.Context(), nodeUpdates, localNodeID, batches)
+		cmd.Context(), nodeUpdates, uuid.DefaultGenerator, updateTime, localNodeID, batches)
 	if err != nil {
 		return err
 	}
 
 	for _, r := range prepReport.SkippedReplicas {
-		_, _ = fmt.Fprintf(stderr, "Replica %s for range r%d is already updated.\n", r.Replica, r.RangeID)
+		_, _ = fmt.Fprintf(stderr, "Replica %s for range r%d is already updated.\n",
+			r.Replica, r.RangeID())
 	}
 
 	if len(prepReport.UpdatedReplicas) == 0 {
@@ -455,7 +460,7 @@ func runDebugExecuteRecoverPlan(cmd *cobra.Command, args []string) error {
 	for _, r := range prepReport.UpdatedReplicas {
 		message := fmt.Sprintf(
 			"Replica %s for range %d:%s will be updated to %s with peer replica(s) removed: %s",
-			r.OldReplica, r.RangeID, r.StartKey, r.Replica, r.RemovedReplicas)
+			r.OldReplica, r.RangeID(), r.StartKey(), r.Replica, r.RemovedReplicas)
 		if r.AbortedTransaction {
 			message += fmt.Sprintf(", and range update transaction %s aborted.",
 				r.AbortedTransactionID.Short())

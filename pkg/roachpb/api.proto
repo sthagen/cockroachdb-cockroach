@@ -131,6 +131,10 @@ message ResponseHeader {
   // TargetBytes is exactly satisfied by a result that exhausted a range scan,
   // or by a response from a multi-request batch, we won't do additional work
   // (e.g. send another RPC to the next range) only to obtain resume_next_bytes.
+  //
+  // Also note that this is unaffected by whole_rows_of_size. The client may
+  // care about whole rows, but we'll only return the size of the next KV pair
+  // (which may just be part of the row), to avoid the cost of additional IO.
   int64 resume_next_bytes = 9;
 
   // The number of keys operated on.
@@ -1572,9 +1576,9 @@ message AdminVerifyProtectedTimestampResponse {
 }
 
 // AddSSTableRequest contains arguments to the AddSSTable method, which links an
-// SST file into the Pebble log-structured merge-tree. The SST should only
-// contain committed versioned values with non-zero MVCC timestamps (no intents
-// or inline values) and no tombstones, but this is only fully enforced when
+// SST file into the Pebble log-structured merge-tree. The SST must only contain
+// committed versioned values with non-zero MVCC timestamps (no intents or
+// inline values) and no tombstones, but this is only fully enforced when
 // WriteAtRequestTimestamp is enabled, for performance. It cannot be used in a
 // transaction, cannot be split across ranges, and must be alone in a batch.
 // 
@@ -1632,6 +1636,16 @@ message AddSSTableRequest {
   // 
   // Added in 22.1, so check the MVCCAddSSTable version gate before using.
   bool write_at_request_timestamp = 6;
+
+  // SSTTimestamp is a promise from the client that all MVCC timestamps in the
+  // SST equal the provided timestamp, and that there are no inline values,
+  // intents, or tombstones. When used together with WriteAtRequestTimestamp,
+  // this can avoid an SST rewrite (and the associated overhead) if the SST
+  // timestamp equals the request timestamp (i.e. if it was provided by the
+  // client and the request was not pushed due to e.g. the closed timestamp or
+  // contention).
+  util.hlc.Timestamp sst_timestamp = 9
+    [(gogoproto.customname) = "SSTTimestamp", (gogoproto.nullable) = false];
 
   // DisallowConflicts will check for MVCC conflicts with existing keys, i.e.
   // scan for existing keys with a timestamp at or above the SST key and
@@ -2251,10 +2265,24 @@ message Header {
   // supported requests from max_span_request_keys apply to the target_bytes
   // option as well.
   int64 target_bytes = 15;
-  // If true, allow returning an empty result when the first result exceeds
-  // target_bytes. Only effective on 22.1 clusters with TargetBytesAvoidExcess
-  // cluster version enabled. Only supported by Get, Scan, and ReverseScan.
-  bool target_bytes_allow_empty = 23;
+  // If true, allow returning an empty result when the first result exceeds a
+  // limit (e.g. TargetBytes). Only effective on 22.1 clusters with
+  // TargetBytesAvoidExcess version gate enabled. Only supported by Get, Scan,
+  // and ReverseScan.
+  bool allow_empty = 23;
+  // If positive, Scan and ReverseScan requests with limits (MaxSpanRequestKeys
+  // or TargetBytes) will not return results with partial SQL rows at the end
+  // (recall that SQL rows can span multiple keys). Such partial rows will be
+  // removed from the result, unless AllowEmpty is false and the partial row is
+  // the first result row, in which case additional keys will be fetched to
+  // complete the row.
+  //
+  // The given value specifies the maximum number of keys in a row (i.e. the
+  // number of column families). If any larger rows are found at the end of the
+  // result, an error is returned.
+  //
+  // Added in 22.1, callers must check the ScanWholeRows version gate first.
+  int32 whole_rows_of_size = 26;
   // If true, DistSender returns partial non-empty results when encountering a
   // range boundary, with an appropriate resume span and reason
   // RESUME_RANGE_BOUNDARY. This will disable parallelism of DistSender
@@ -2610,6 +2638,60 @@ message GossipSubscriptionEvent {
   kv.kvpb.Error error = 4;
 }
 
+// TenantSettingsRequest establishes an indefinite stream that provides
+// up-to-date overrides for tenant settings.
+//
+// Upon establishment of the stream, the current overrides are returned as an
+// event, and any time the overrides change a new event is generated.
+message TenantSettingsRequest {
+  TenantID tenant_id = 1 [(gogoproto.customname) = "TenantID", (gogoproto.nullable) = false];
+}
+
+// TenantSettingsEvent is used to report changes to setting overrides for a
+// particular tenant.
+//
+// Each event pertains to a certain precedence value (see
+// TenantSettingsPrecedence).
+//
+// Note: this API is designed to allow flexibility of implementation on the
+// server side (e.g. to make it maintain very little state per tenant).
+message TenantSettingsEvent {
+  // Precedence must be a valid TenantSettingsPrecedence value.
+  uint32 precedence = 1 [(gogoproto.casttype) = "TenantSettingsPrecedence"];
+
+  // Incremental is true if the list of overrides is a list of changes since the
+  // last event. In that case, any overrides that have been removed are returned
+  // as TenantSettings with empty RawValue and ValueType fields.
+  //
+  // When Incremental is false, the overrides contains the complete list of
+  // current overrides for this precedence.
+  //
+  // The first event for a precedence is never incremental.
+  bool incremental = 2;
+
+  // Overrides contains:
+  //  - all current setting overrides for the given precedence if Incremental is
+  //    false; or
+  //  - the changed overrides since the last event for the precedence if
+  //    Incremental is true (removed overrides have empty RawValue and ValueType
+  //    fields).
+  repeated TenantSetting overrides = 3;
+
+  // If non-nil, the other fields will be empty and this will be the final event
+  // sent on the stream before it is terminated.
+  errorspb.EncodedError error = 4 [(gogoproto.nullable) = false];
+}
+
+// TenantSetting contains the name and value of a tenant setting.
+//
+// The value representation is the same as that used by the system.settings
+// table (value and valueType columns).
+message TenantSetting {
+  string name = 1;
+  string raw_value = 2;
+  string value_type = 3;
+}
+
 // TenantConsumption contains information about resource utilization by a
 // tenant, which directly factors into their bill.
 message TenantConsumption {
@@ -2743,6 +2825,10 @@ service Internal {
   // UpdateSpanConfigs is used to update the span configurations over given
   // keyspans.
   rpc UpdateSpanConfigs (UpdateSpanConfigsRequest) returns (UpdateSpanConfigsResponse) { }
+
+  // TenantSettings is used by tenants to obtain and stay up to date with tenant
+  // setting overrides.
+  rpc TenantSettings (TenantSettingsRequest) returns (stream TenantSettingsEvent) { }
 }
 
 // ContentionEvent is a message that will be attached to BatchResponses

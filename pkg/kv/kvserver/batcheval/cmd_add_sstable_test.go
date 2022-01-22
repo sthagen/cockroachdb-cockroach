@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -70,15 +71,17 @@ func TestEvalAddSSTable(t *testing.T) {
 
 	// These are run with IngestAsWrites both disabled and enabled.
 	testcases := map[string]struct {
-		data           []mvccKV
-		sst            []mvccKV
-		atReqTS        int64 // WriteAtRequestTimestamp with given timestamp
-		noConflict     bool  // DisallowConflicts
-		noShadow       bool  // DisallowShadowing
-		noShadowBelow  int64 // DisallowShadowingBelow
-		expect         []mvccKV
-		expectErr      interface{} // error type, substring, or true (any error)
-		expectStatsEst bool        // expect MVCCStats.ContainsEstimates, don't check stats
+		data               []mvccKV
+		sst                []mvccKV
+		sstTimestamp       int64 // SSTTimestamp set to given timestamp
+		atReqTS            int64 // WriteAtRequestTimestamp with given timestamp
+		noConflict         bool  // DisallowConflicts
+		noShadow           bool  // DisallowShadowing
+		noShadowBelow      int64 // DisallowShadowingBelow
+		expect             []mvccKV
+		expectErr          interface{} // error type, substring, or true (any error)
+		expectErrUnderRace interface{}
+		expectStatsEst     bool // expect MVCCStats.ContainsEstimates, don't check stats
 	}{
 		// Blind writes.
 		"blind writes below existing": {
@@ -610,6 +613,25 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:           []mvccKV{{"a", 7, "a8"}},
 			expectErr:     &roachpb.WriteTooOldError{},
 		},
+
+		// SSTTimestamp
+		"SSTTimestamp works with WriteAtRequestTimestamp": {
+			atReqTS:        7,
+			data:           []mvccKV{{"a", 6, "a6"}},
+			sst:            []mvccKV{{"a", 7, "a7"}},
+			sstTimestamp:   7,
+			expect:         []mvccKV{{"a", 7, "a7"}, {"a", 6, "a6"}},
+			expectStatsEst: true,
+		},
+		"SSTTimestamp doesn't rewrite with incorrect timestamp, but errors under race": {
+			atReqTS:            8,
+			data:               []mvccKV{{"a", 6, "a6"}},
+			sst:                []mvccKV{{"a", 7, "a7"}},
+			sstTimestamp:       8,
+			expect:             []mvccKV{{"a", 7, "a7"}, {"a", 6, "a6"}},
+			expectErrUnderRace: `incorrect timestamp 0.000000007,0 for SST key "a" (expected 0.000000008,0)`,
+			expectStatsEst:     true,
+		},
 	}
 	testutils.RunTrueAndFalse(t, "IngestAsWrites", func(t *testing.T, ingestAsWrites bool) {
 		for name, tc := range testcases {
@@ -657,20 +679,25 @@ func TestEvalAddSSTable(t *testing.T) {
 						DisallowShadowing:       tc.noShadow,
 						DisallowShadowingBelow:  hlc.Timestamp{WallTime: tc.noShadowBelow},
 						WriteAtRequestTimestamp: tc.atReqTS != 0,
+						SSTTimestamp:            hlc.Timestamp{WallTime: tc.sstTimestamp},
 						IngestAsWrites:          ingestAsWrites,
 					},
 				}, resp)
 
-				if tc.expectErr != nil {
+				expectErr := tc.expectErr
+				if expectErr == nil && tc.expectErrUnderRace != nil && util.RaceEnabled {
+					expectErr = tc.expectErrUnderRace
+				}
+				if expectErr != nil {
 					require.Error(t, err)
-					if b, ok := tc.expectErr.(bool); ok && b {
+					if b, ok := expectErr.(bool); ok && b {
 						// any error is fine
-					} else if expectMsg, ok := tc.expectErr.(string); ok {
+					} else if expectMsg, ok := expectErr.(string); ok {
 						require.Contains(t, err.Error(), expectMsg)
-					} else if expectErr, ok := tc.expectErr.(error); ok {
-						require.True(t, errors.HasType(err, expectErr), "expected %T, got %v", expectErr, err)
+					} else if e, ok := expectErr.(error); ok {
+						require.True(t, errors.HasType(err, e), "expected %T, got %v", e, err)
 					} else {
-						require.Fail(t, "invalid expectErr", "expectErr=%v", tc.expectErr)
+						require.Fail(t, "invalid expectErr", "expectErr=%v", expectErr)
 					}
 					return
 				}
@@ -776,7 +803,6 @@ func runTestDBAddSSTable(
 ) {
 	tr.TestingRecordAsyncSpans() // we assert on async span traces in this test
 	const ingestAsWrites, ingestAsSST = true, false
-	const writeAtSST = false
 	const allowConflicts = false
 	const allowShadowing = false
 	var allowShadowingBelow hlc.Timestamp
@@ -788,13 +814,13 @@ func runTestDBAddSSTable(
 
 		// Key is before the range in the request span.
 		err := db.AddSSTable(
-			ctx, "d", "e", sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS, writeAtSST)
+			ctx, "d", "e", sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "not in request range")
 
 		// Key is after the range in the request span.
 		err = db.AddSSTable(
-			ctx, "a", "b", sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS, writeAtSST)
+			ctx, "a", "b", sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "not in request range")
 
@@ -802,7 +828,7 @@ func runTestDBAddSSTable(
 		ingestCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test-recording")
 		defer getRecAndFinish()
 		require.NoError(t, db.AddSSTable(
-			ingestCtx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS, writeAtSST))
+			ingestCtx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS))
 		trace := getRecAndFinish().String()
 		require.Contains(t, trace, "evaluating AddSSTable")
 		require.Contains(t, trace, "sideloadable proposal detected")
@@ -828,7 +854,7 @@ func runTestDBAddSSTable(
 	{
 		sst, start, end := makeSST(t, []mvccKV{{"bb", 1, "2"}})
 		require.NoError(t, db.AddSSTable(
-			ctx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS, writeAtSST))
+			ctx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS))
 		r, err := db.Get(ctx, "bb")
 		require.NoError(t, err)
 		require.Equal(t, []byte("1"), r.ValueBytes())
@@ -851,7 +877,7 @@ func runTestDBAddSSTable(
 			defer getRecAndFinish()
 
 			require.NoError(t, db.AddSSTable(
-				ingestCtx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS, writeAtSST))
+				ingestCtx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS))
 			trace := getRecAndFinish().String()
 			require.Contains(t, trace, "evaluating AddSSTable")
 			require.Contains(t, trace, "sideloadable proposal detected")
@@ -887,7 +913,7 @@ func runTestDBAddSSTable(
 			defer getRecAndFinish()
 
 			require.NoError(t, db.AddSSTable(
-				ingestCtx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsWrites, noTS, writeAtSST))
+				ingestCtx, start, end, sst, allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsWrites, noTS))
 			trace := getRecAndFinish().String()
 			require.Contains(t, trace, "evaluating AddSSTable")
 			require.Contains(t, trace, "via regular write batch")
@@ -918,7 +944,7 @@ func runTestDBAddSSTable(
 		require.NoError(t, w.Finish())
 
 		err := db.AddSSTable(
-			ctx, "b", "c", sstFile.Data(), allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS, writeAtSST)
+			ctx, "b", "c", sstFile.Data(), allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "invalid checksum")
 	}

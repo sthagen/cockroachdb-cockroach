@@ -40,53 +40,55 @@ const nullProbability = 0.2
 const randTypesProbability = 0.5
 
 var aggregateFuncToNumArguments = map[execinfrapb.AggregatorSpec_Func]int{
-	execinfrapb.AnyNotNull:         1,
-	execinfrapb.Avg:                1,
-	execinfrapb.BoolAnd:            1,
-	execinfrapb.BoolOr:             1,
-	execinfrapb.ConcatAgg:          1,
-	execinfrapb.Count:              1,
-	execinfrapb.Max:                1,
-	execinfrapb.Min:                1,
-	execinfrapb.Stddev:             1,
-	execinfrapb.Sum:                1,
-	execinfrapb.SumInt:             1,
-	execinfrapb.Variance:           1,
-	execinfrapb.XorAgg:             1,
-	execinfrapb.CountRows:          0,
-	execinfrapb.Sqrdiff:            1,
-	execinfrapb.FinalVariance:      3,
-	execinfrapb.FinalVarPop:        3,
-	execinfrapb.FinalStddev:        3,
-	execinfrapb.FinalStddevPop:     3,
-	execinfrapb.ArrayAgg:           1,
-	execinfrapb.JSONAgg:            1,
-	execinfrapb.JSONBAgg:           1,
-	execinfrapb.StringAgg:          2,
-	execinfrapb.BitAnd:             1,
-	execinfrapb.BitOr:              1,
-	execinfrapb.Corr:               2,
-	execinfrapb.PercentileDiscImpl: 2,
-	execinfrapb.PercentileContImpl: 2,
-	execinfrapb.JSONObjectAgg:      2,
-	execinfrapb.JSONBObjectAgg:     2,
-	execinfrapb.VarPop:             1,
-	execinfrapb.StddevPop:          1,
-	execinfrapb.StMakeline:         1,
-	execinfrapb.StExtent:           1,
-	execinfrapb.StUnion:            1,
-	execinfrapb.StCollect:          1,
-	execinfrapb.CovarPop:           2,
-	execinfrapb.CovarSamp:          2,
-	execinfrapb.RegrIntercept:      2,
-	execinfrapb.RegrR2:             2,
-	execinfrapb.RegrSlope:          2,
-	execinfrapb.RegrSxx:            2,
-	execinfrapb.RegrSxy:            2,
-	execinfrapb.RegrSyy:            2,
-	execinfrapb.RegrCount:          2,
-	execinfrapb.RegrAvgx:           2,
-	execinfrapb.RegrAvgy:           2,
+	execinfrapb.AnyNotNull:              1,
+	execinfrapb.Avg:                     1,
+	execinfrapb.BoolAnd:                 1,
+	execinfrapb.BoolOr:                  1,
+	execinfrapb.ConcatAgg:               1,
+	execinfrapb.Count:                   1,
+	execinfrapb.Max:                     1,
+	execinfrapb.Min:                     1,
+	execinfrapb.Stddev:                  1,
+	execinfrapb.Sum:                     1,
+	execinfrapb.SumInt:                  1,
+	execinfrapb.Variance:                1,
+	execinfrapb.XorAgg:                  1,
+	execinfrapb.CountRows:               0,
+	execinfrapb.Sqrdiff:                 1,
+	execinfrapb.FinalVariance:           3,
+	execinfrapb.FinalVarPop:             3,
+	execinfrapb.FinalStddev:             3,
+	execinfrapb.FinalStddevPop:          3,
+	execinfrapb.ArrayAgg:                1,
+	execinfrapb.JSONAgg:                 1,
+	execinfrapb.JSONBAgg:                1,
+	execinfrapb.StringAgg:               2,
+	execinfrapb.BitAnd:                  1,
+	execinfrapb.BitOr:                   1,
+	execinfrapb.Corr:                    2,
+	execinfrapb.PercentileDiscImpl:      2,
+	execinfrapb.PercentileContImpl:      2,
+	execinfrapb.JSONObjectAgg:           2,
+	execinfrapb.JSONBObjectAgg:          2,
+	execinfrapb.VarPop:                  1,
+	execinfrapb.StddevPop:               1,
+	execinfrapb.StMakeline:              1,
+	execinfrapb.StExtent:                1,
+	execinfrapb.StUnion:                 1,
+	execinfrapb.StCollect:               1,
+	execinfrapb.CovarPop:                2,
+	execinfrapb.CovarSamp:               2,
+	execinfrapb.RegrIntercept:           2,
+	execinfrapb.RegrR2:                  2,
+	execinfrapb.RegrSlope:               2,
+	execinfrapb.RegrSxx:                 2,
+	execinfrapb.RegrSxy:                 2,
+	execinfrapb.RegrSyy:                 2,
+	execinfrapb.RegrCount:               2,
+	execinfrapb.RegrAvgx:                2,
+	execinfrapb.RegrAvgy:                2,
+	execinfrapb.TransitionRegrAggregate: 2,
+	execinfrapb.FinalCovarPop:           1,
 }
 
 // TestAggregateFuncToNumArguments ensures that all aggregate functions are
@@ -122,7 +124,7 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 		groupingCols[i] = i
 		orderingCols[i].ColIdx = i
 	}
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 
 	// We need +1 because an entry for index=6 was omitted by mistake.
 	numSupportedAggFns := len(execinfrapb.AggregatorSpec_Func_name) + 1
@@ -344,7 +346,7 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 func TestDistinctAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 
@@ -547,7 +549,7 @@ func TestSorterAgainstProcessor(t *testing.T) {
 func TestSortChunksAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
@@ -817,7 +819,7 @@ func generateEqualityColumns(rng *rand.Rand, nCols int, nEqCols int) []uint32 {
 func TestMergeJoinerAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 
@@ -1171,43 +1173,65 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 						ResultTypes: append(inputTypes, outputType),
 					}
 					args := verifyColOperatorArgs{
+						rng:        rng,
 						anyOrder:   true,
 						inputTypes: [][]*types.T{inputTypes},
 						inputs:     []rowenc.EncDatumRows{rows},
 						pspec:      pspec,
+						// Some window functions don't buffer anything, so they
+						// won't ever spill to disk. Rather than examining each
+						// function and checking whether it buffers or not,
+						// we're being lazy and don't require the spilling to
+						// occur.
+						forcedDiskSpillMightNotOccur: true,
 					}
-					if err := verifyColOperator(t, args); err != nil {
-						if strings.Contains(err.Error(), "different errors returned") {
-							// Columnar and row-based windowers are likely to hit
-							// different errors, and we will swallow those and move
-							// on.
+					for _, spillForced := range []bool{false, true} {
+						if spillForced && nRows == manyRows {
+							// Don't force disk spilling with many rows since it
+							// might take a while.
 							continue
 						}
-						if strings.Contains(err.Error(), "integer out of range") &&
-							fun.AggregateFunc != nil && *fun.AggregateFunc == execinfrapb.SumInt {
-							// The columnar implementation of this window function uses the
-							// sliding window optimization, but the row engine version
-							// doesn't. As a result, in some cases the row engine will
-							// overflow while the vectorized engine doesn't.
-							continue
+						args.forceDiskSpill = spillForced
+						if err := verifyColOperator(t, args); err != nil {
+							if strings.Contains(err.Error(), "different errors returned") {
+								// Columnar and row-based windowers are likely to hit
+								// different errors, and we will swallow those and move
+								// on.
+								continue
+							}
+							if strings.Contains(err.Error(), "Err:windower-limited: memory budget exceeded") {
+								// The row-based windower can hit a memory error
+								// because some of its state cannot be spilled
+								// to disk. Ignore such cases.
+								continue
+							}
+							if strings.Contains(err.Error(), "integer out of range") &&
+								fun.AggregateFunc != nil && *fun.AggregateFunc == execinfrapb.SumInt {
+								// The columnar implementation of this window function uses the
+								// sliding window optimization, but the row engine version
+								// doesn't. As a result, in some cases the row engine will
+								// overflow while the vectorized engine doesn't.
+								continue
+							}
+							fmt.Printf("force disk spill: %t\n", spillForced)
+							fmt.Printf("window function: %s\n", funcName)
+							fmt.Printf("partitionCols: %v\n", partitionBy)
+							fmt.Print("ordering: ")
+							for i := range ordering.Columns {
+								fmt.Printf("%v %v, ", ordering.Columns[i].ColIdx, ordering.Columns[i].Direction)
+							}
+							fmt.Println()
+							fmt.Printf("argIdxs: %v\n", argsIdxs)
+							frame := windowerSpec.WindowFns[0].Frame
+							fmt.Printf("frame mode: %v\n", frame.Mode)
+							fmt.Printf("start bound: %v\n", frame.Bounds.Start)
+							fmt.Printf("end bound: %v\n", *frame.Bounds.End)
+							fmt.Printf("frame exclusion: %v\n", frame.Exclusion)
+							fmt.Printf("seed = %d\n", seed)
+							prettyPrintTypes(inputTypes, "t" /* tableName */)
+							prettyPrintInput(rows, inputTypes, "t" /* tableName */)
+							t.Fatal(err)
 						}
-						fmt.Printf("window function: %s\n", funcName)
-						fmt.Printf("partitionCols: %v\n", partitionBy)
-						fmt.Print("ordering: ")
-						for i := range ordering.Columns {
-							fmt.Printf("%v %v, ", ordering.Columns[i].ColIdx, ordering.Columns[i].Direction)
-						}
-						fmt.Println()
-						fmt.Printf("argIdxs: %v\n", argsIdxs)
-						frame := windowerSpec.WindowFns[0].Frame
-						fmt.Printf("frame mode: %v\n", frame.Mode)
-						fmt.Printf("start bound: %v\n", frame.Bounds.Start)
-						fmt.Printf("end bound: %v\n", *frame.Bounds.End)
-						fmt.Printf("frame exclusion: %v\n", frame.Exclusion)
-						fmt.Printf("seed = %d\n", seed)
-						prettyPrintTypes(inputTypes, "t" /* tableName */)
-						prettyPrintInput(rows, inputTypes, "t" /* tableName */)
-						t.Fatal(err)
 					}
 				}
 			}

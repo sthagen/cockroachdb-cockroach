@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -41,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -352,33 +350,32 @@ INSERT INTO foo VALUES (1), (10), (100);
 		ctx context.Context, t *testing.T, txn *kv.Txn, table *tabledesc.Mutable, indexID descpb.IndexID,
 	) []tree.Datums {
 		t.Helper()
-		var fetcher row.Fetcher
-		var alloc rowenc.DatumAlloc
 
 		mm := mon.MakeStandaloneBudget(1 << 30)
 		idx, err := table.FindIndexWithID(indexID)
-		colIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
-		var valsNeeded util.FastIntSet
-		{
-			colIDsNeeded := idx.CollectKeyColumnIDs()
-			if idx.Primary() {
-				for _, column := range table.PublicColumns() {
-					if !column.IsVirtual() {
-						colIDsNeeded.Add(column.GetID())
-					}
+		colIDsNeeded := idx.CollectKeyColumnIDs()
+		if idx.Primary() {
+			for _, column := range table.PublicColumns() {
+				if !column.IsVirtual() {
+					colIDsNeeded.Add(column.GetID())
 				}
-			} else {
-				colIDsNeeded.UnionWith(idx.CollectSecondaryStoredColumnIDs())
-				colIDsNeeded.UnionWith(idx.CollectKeySuffixColumnIDs())
 			}
-
-			colIDsNeeded.ForEach(func(colID descpb.ColumnID) {
-				valsNeeded.Add(colIdxMap.GetDefault(colID))
-			})
+		} else {
+			colIDsNeeded.UnionWith(idx.CollectSecondaryStoredColumnIDs())
+			colIDsNeeded.UnionWith(idx.CollectKeySuffixColumnIDs())
 		}
+
 		require.NoError(t, err)
 		spans := []roachpb.Span{table.IndexSpan(keys.SystemSQLCodec, indexID)}
 		const reverse = false
+		var fetcherCols []catalog.Column
+		for _, col := range table.PublicColumns() {
+			if colIDsNeeded.Contains(col.GetID()) {
+				fetcherCols = append(fetcherCols, col)
+			}
+		}
+		var alloc tree.DatumAlloc
+		var fetcher row.Fetcher
 		require.NoError(t, fetcher.Init(
 			ctx,
 			keys.SystemSQLCodec,
@@ -386,15 +383,12 @@ INSERT INTO foo VALUES (1), (10), (100);
 			descpb.ScanLockingStrength_FOR_NONE,
 			descpb.ScanLockingWaitPolicy_BLOCK,
 			0,
-			false,
 			&alloc,
 			mm.Monitor(),
 			row.FetcherTableArgs{
 				Desc:             table,
 				Index:            idx,
-				ColIdxMap:        colIdxMap,
-				Cols:             table.PublicColumns(),
-				ValNeededForCol:  valsNeeded,
+				Columns:          fetcherCols,
 				IsSecondaryIndex: !idx.Primary(),
 			},
 		))
@@ -404,18 +398,13 @@ INSERT INTO foo VALUES (1), (10), (100);
 		))
 		var rows []tree.Datums
 		for {
-			datums, _, _, err := fetcher.NextRowDecoded(ctx)
+			datums, err := fetcher.NextRowDecoded(ctx)
 			require.NoError(t, err)
 			if datums == nil {
 				break
 			}
 			// Copy the datums out as the slice is reused internally.
-			row := make(tree.Datums, 0, valsNeeded.Len())
-			for i := range datums {
-				if valsNeeded.Contains(i) {
-					row = append(row, datums[i])
-				}
-			}
+			row := append(tree.Datums(nil), datums...)
 			rows = append(rows, row)
 		}
 		return rows

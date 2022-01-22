@@ -149,11 +149,7 @@ func (s *ColBatchScan) DrainMeta() []execinfrapb.ProducerMetadata {
 func (s *ColBatchScan) GetBytesRead() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Note that if Init() was never called, s.rf.fetcher will remain nil, and
-	// GetBytesRead() will return 0. We are also holding the mutex, so a
-	// concurrent call to Init() will have to wait, and the fetcher will remain
-	// uninitialized until we return.
-	return s.rf.fetcher.GetBytesRead()
+	return s.rf.getBytesRead()
 }
 
 // GetRowsRead is part of the colexecop.KVReader interface.
@@ -194,29 +190,14 @@ func NewColBatchScan(
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a ColBatchScan with uninitialized NodeID")
 	}
-	if spec.IsCheck {
-		// cFetchers don't support these checks.
-		return nil, errors.AssertionFailedf("attempting to create a cFetcher with the IsCheck flag set")
-	}
-
 	limitHint := rowinfra.RowLimit(execinfra.LimitHint(spec.LimitHint, post))
-	// TODO(ajwerner): The need to construct an immutable here
-	// indicates that we're probably doing this wrong. Instead we should be
-	// just setting the ID and Version in the spec or something like that and
-	// retrieving the hydrated immutable from cache.
-	table := spec.BuildTableDescriptor()
+	table := flowCtx.TableDescriptor(&spec.Table)
 	invertedColumn := tabledesc.FindInvertedColumn(table, spec.InvertedColumn)
-	tableArgs, idxMap, err := populateTableArgs(
+	tableArgs, err := populateTableArgs(
 		ctx, flowCtx, table, table.ActiveIndexes()[spec.IndexIdx],
-		invertedColumn, spec.Visibility, spec.HasSystemColumns, post, helper,
+		spec.ColumnIDs, invertedColumn, helper,
 	)
 	if err != nil {
-		return nil, err
-	}
-
-	if err = keepOnlyNeededColumns(
-		flowCtx, tableArgs, idxMap, spec.NeededColumns, post, helper,
-	); err != nil {
 		return nil, err
 	}
 
@@ -231,7 +212,7 @@ func NewColBatchScan(
 		flowCtx.TraceKV,
 	}
 
-	if err = fetcher.Init(flowCtx.Codec(), allocator, kvFetcherMemAcc, tableArgs, spec.HasSystemColumns); err != nil {
+	if err = fetcher.Init(flowCtx.Codec(), allocator, kvFetcherMemAcc, tableArgs); err != nil {
 		fetcher.Release()
 		return nil, err
 	}

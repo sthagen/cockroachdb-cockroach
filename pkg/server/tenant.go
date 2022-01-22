@@ -211,7 +211,7 @@ func StartTenant(
 	)
 
 	mux := http.NewServeMux()
-	debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn(), s.execCfg.SQLStatusServer)
+	debugServer := debug.NewServer(baseCfg.AmbientCtx, args.Settings, s.pgServer.HBADebugFn(), s.execCfg.SQLStatusServer)
 	mux.Handle("/", debugServer)
 	mux.Handle("/_status/", gwMux)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
@@ -450,10 +450,12 @@ func makeTenantSQLServerArgs(
 	// clusters.
 	var protectedTSProvider protectedts.Provider
 	{
+		protectedtsKnobs, _ := baseCfg.TestingKnobs.ProtectedTS.(*protectedts.TestingKnobs)
 		pp, err := ptprovider.New(ptprovider.Config{
 			DB:               db,
 			InternalExecutor: circularInternalExecutor,
 			Settings:         st,
+			Knobs:            protectedtsKnobs,
 		})
 		if err != nil {
 			panic(err)
@@ -531,6 +533,7 @@ func makeTenantSQLServerArgs(
 		rangeFeedFactory:         rangeFeedFactory,
 		regionsServer:            tenantConnect,
 		costController:           costController,
+		allowSessionRevival:      true,
 	}, nil
 }
 

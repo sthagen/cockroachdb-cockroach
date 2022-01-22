@@ -108,11 +108,18 @@ func NewKVFetcher(
 	return newKVFetcher(&kvBatchFetcher), err
 }
 
+// NewKVStreamingFetcher returns a new KVFetcher that utilizes the provided
+// TxnKVStreamer to perform KV reads.
+func NewKVStreamingFetcher(streamer *TxnKVStreamer) *KVFetcher {
+	return &KVFetcher{
+		KVBatchFetcher: streamer,
+	}
+}
+
 func newKVFetcher(batchFetcher KVBatchFetcher) *KVFetcher {
-	ret := &KVFetcher{
+	return &KVFetcher{
 		KVBatchFetcher: batchFetcher,
 	}
-	return ret
 }
 
 // GetBytesRead returns the number of bytes read by this fetcher. It is safe for
@@ -122,6 +129,16 @@ func (f *KVFetcher) GetBytesRead() int64 {
 		return 0
 	}
 	return atomic.LoadInt64(&f.atomics.bytesRead)
+}
+
+// ResetBytesRead resets the number of bytes read by this fetcher and returns
+// the number before the reset. It is safe for concurrent use and is able to
+// handle a case of uninitialized fetcher.
+func (f *KVFetcher) ResetBytesRead() int64 {
+	if f == nil {
+		return 0
+	}
+	return atomic.SwapInt64(&f.atomics.bytesRead, 0)
 }
 
 // MVCCDecodingStrategy controls if and how the fetcher should decode MVCC
@@ -147,7 +164,7 @@ const (
 // unexpectedly.
 func (f *KVFetcher) NextKV(
 	ctx context.Context, mvccDecodeStrategy MVCCDecodingStrategy,
-) (moreKVs bool, kv roachpb.KeyValue, finalReferenceToBatch bool, err error) {
+) (ok bool, kv roachpb.KeyValue, finalReferenceToBatch bool, err error) {
 	for {
 		// Only one of f.kvs or f.batchResponse will be set at a given time. Which
 		// one is set depends on the format returned by a given BatchRequest.
@@ -189,12 +206,9 @@ func (f *KVFetcher) NextKV(
 			}, lastKey, nil
 		}
 
-		moreKVs, f.kvs, f.batchResponse, err = f.nextBatch(ctx)
-		if err != nil {
-			return moreKVs, kv, false, err
-		}
-		if !moreKVs {
-			return false, kv, false, nil
+		ok, f.kvs, f.batchResponse, err = f.nextBatch(ctx)
+		if err != nil || !ok {
+			return ok, kv, false, err
 		}
 		f.newSpan = true
 		nBytes := len(f.batchResponse)

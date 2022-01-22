@@ -28,6 +28,7 @@ go_library(
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/tabledesc",
+        "//pkg/sql/catalog/typedesc",
         "//pkg/sql/parser",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
@@ -65,12 +66,15 @@ go_test(
     srcs = [
         "component_stats_test.go",
         "expr_test.go",
+        "flow_diagram_external_test.go",
         "flow_diagram_test.go",
     ],
     embed = [":execinfrapb"],
     deps = [
         "//pkg/roachpb:with-mocks",
+        "//pkg/security",
         "//pkg/settings/cluster",
+        "//pkg/sql",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
@@ -97,6 +101,7 @@ proto_library(
     deps = [
         "//pkg/jobs/jobspb:jobspb_proto",
         "//pkg/roachpb:roachpb_proto",
+        "//pkg/sql/catalog/catpb:catpb_proto",
         "//pkg/sql/catalog/descpb:descpb_proto",
         "//pkg/sql/inverted:inverted_proto",
         "//pkg/sql/pgwire/pgerror:pgerror_proto",
@@ -121,6 +126,7 @@ go_proto_library(
     deps = [
         "//pkg/jobs/jobspb",
         "//pkg/roachpb:with-mocks",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/inverted",
         "//pkg/sql/pgwire/pgerror",

@@ -193,6 +193,11 @@ func (dsp *DistSQLPlanner) shouldPlanTestMetadata() bool {
 	return dsp.distSQLSrv.TestingKnobs.MetadataTestLevel >= dsp.metadataTestTolerance
 }
 
+// GetNodeInfo gets a node descriptor by node ID.
+func (dsp *DistSQLPlanner) GetNodeInfo(nodeID roachpb.NodeID) (*roachpb.NodeDescriptor, error) {
+	return dsp.nodeDescs.GetNodeDescriptor(nodeID)
+}
+
 // SetNodeInfo sets the planner's node descriptor.
 // The first call to SetNodeInfo leads to the construction of the SpanResolver.
 func (dsp *DistSQLPlanner) SetNodeInfo(desc roachpb.NodeDescriptor) {
@@ -1097,23 +1102,32 @@ func getIndexIdx(index catalog.Index, desc catalog.TableDescriptor) (uint32, err
 	return 0, errors.Errorf("invalid index %v (table %s)", index, desc.GetName())
 }
 
-// initTableReaderSpec initializes a TableReaderSpec/PostProcessSpec that
-// corresponds to a scanNode, except for the Spans and OutputColumns.
-func initTableReaderSpec(
+// initTableReaderSpecTemplate initializes a TableReaderSpec/PostProcessSpec
+// that corresponds to a scanNode, except for the following fields:
+//  - Spans
+//  - Parallelize
+//  - BatchBytesLimit
+// The generated specs will be used as templates for planning potentially
+// multiple TableReaders.
+func initTableReaderSpecTemplate(
 	n *scanNode,
 ) (*execinfrapb.TableReaderSpec, execinfrapb.PostProcessSpec, error) {
+	if n.isCheck {
+		return nil, execinfrapb.PostProcessSpec{}, errors.AssertionFailedf("isCheck no longer supported")
+	}
+	colIDs := make([]descpb.ColumnID, len(n.cols))
+	for i := range n.cols {
+		colIDs[i] = n.cols[i].GetID()
+	}
 	s := physicalplan.NewTableReaderSpec()
 	*s = execinfrapb.TableReaderSpec{
 		Table:             *n.desc.TableDesc(),
 		Reverse:           n.reverse,
-		IsCheck:           n.isCheck,
-		Visibility:        n.colCfg.visibility,
+		ColumnIDs:         colIDs,
 		LockingStrength:   n.lockingStrength,
 		LockingWaitPolicy: n.lockingWaitPolicy,
-		HasSystemColumns:  n.containsSystemColumns,
-		NeededColumns:     n.colCfg.wantedColumnsOrdinals,
 	}
-	if vc := getInvertedColumn(n.colCfg.invertedColumn, n.cols); vc != nil {
+	if vc := getInvertedColumn(n.colCfg.invertedColumnID, n.cols); vc != nil {
 		s.InvertedColumn = vc.ColumnDesc()
 	}
 
@@ -1122,13 +1136,6 @@ func initTableReaderSpec(
 		return nil, execinfrapb.PostProcessSpec{}, err
 	}
 	s.IndexIdx = indexIdx
-
-	// When a TableReader is running scrub checks, do not allow a
-	// post-processor. This is because the outgoing stream is a fixed
-	// format (rowexec.ScrubTypes).
-	if n.isCheck {
-		return s, execinfrapb.PostProcessSpec{}, nil
-	}
 
 	var post execinfrapb.PostProcessSpec
 	if n.hardLimit != 0 {
@@ -1140,19 +1147,14 @@ func initTableReaderSpec(
 }
 
 // getInvertedColumn returns the column in cols with ID matching
-// invertedColumn.colID.
-func getInvertedColumn(
-	invertedColumn *struct {
-		colID tree.ColumnID
-		typ   *types.T
-	}, cols []catalog.Column,
-) catalog.Column {
-	if invertedColumn == nil {
+// invertedColumnID.
+func getInvertedColumn(invertedColumnID tree.ColumnID, cols []catalog.Column) catalog.Column {
+	if invertedColumnID == 0 {
 		return nil
 	}
 
 	for i := range cols {
-		if tree.ColumnID(cols[i].GetID()) == invertedColumn.colID {
+		if cols[i].GetID() == invertedColumnID {
 			return cols[i]
 		}
 	}
@@ -1160,53 +1162,12 @@ func getInvertedColumn(
 }
 
 // tableOrdinal returns the index of a column with the given ID.
-func tableOrdinal(
-	desc catalog.TableDescriptor, colID descpb.ColumnID, visibility execinfrapb.ScanVisibility,
-) int {
+func tableOrdinal(desc catalog.TableDescriptor, colID descpb.ColumnID) int {
 	col, _ := desc.FindColumnWithID(colID)
-	if col != nil && (col.IsSystemColumn() || visibility == execinfra.ScanVisibilityPublicAndNotPublic || col.Public()) {
-		return col.Ordinal()
+	if col == nil {
+		panic(errors.AssertionFailedf("column %d not in desc.Columns", colID))
 	}
-
-	panic(errors.AssertionFailedf("column %d not in desc.Columns", colID))
-}
-
-func highestTableOrdinal(desc catalog.TableDescriptor, visibility execinfrapb.ScanVisibility) int {
-	highest := len(desc.PublicColumns()) - 1
-	if visibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		highest = len(desc.DeletableColumns()) - 1
-	}
-	return highest
-}
-
-// toTableOrdinals returns a mapping from column ordinals in cols to table
-// reader column ordinals.
-func toTableOrdinals(
-	cols []catalog.Column, desc catalog.TableDescriptor, visibility execinfrapb.ScanVisibility,
-) []int {
-	res := make([]int, len(cols))
-	for i := range res {
-		res[i] = tableOrdinal(desc, cols[i].GetID(), visibility)
-	}
-	return res
-}
-
-// getOutputColumnsFromColsForScan returns the indices of the columns that are
-// returned by a scanNode or a tableReader.
-// If remap is not nil, the column ordinals are remapped accordingly.
-func getOutputColumnsFromColsForScan(cols []catalog.Column, remap []int) []uint32 {
-	outputColumns := make([]uint32, len(cols))
-	// TODO(radu): if we have a scan with a filter, cols will include the
-	// columns needed for the filter, even if they aren't needed for the next
-	// stage.
-	for i := range outputColumns {
-		colIdx := i
-		if remap != nil {
-			colIdx = remap[i]
-		}
-		outputColumns[i] = uint32(colIdx)
-	}
-	return outputColumns
+	return col.Ordinal()
 }
 
 // convertOrdering maps the columns in props.ordering to the output columns of a
@@ -1299,13 +1260,7 @@ func (dsp *DistSQLPlanner) CheckNodeHealthAndVersion(
 func (dsp *DistSQLPlanner) createTableReaders(
 	planCtx *PlanningCtx, n *scanNode,
 ) (*PhysicalPlan, error) {
-	if n.colCfg.addUnwantedAsHidden {
-		panic("addUnwantedAsHidden not supported")
-	}
-	// scanNodeToTableOrdinalMap is a map from scan node column ordinal to
-	// table reader column ordinal.
-	scanNodeToTableOrdinalMap := toTableOrdinals(n.cols, n.desc, n.colCfg.visibility)
-	spec, post, err := initTableReaderSpec(n)
+	spec, post, err := initTableReaderSpecTemplate(n)
 	if err != nil {
 		return nil, err
 	}
@@ -1315,18 +1270,15 @@ func (dsp *DistSQLPlanner) createTableReaders(
 		planCtx,
 		p,
 		&tableReaderPlanningInfo{
-			spec:                  spec,
-			post:                  post,
-			desc:                  n.desc,
-			spans:                 n.spans,
-			reverse:               n.reverse,
-			scanVisibility:        n.colCfg.visibility,
-			parallelize:           n.parallelize,
-			estimatedRowCount:     n.estimatedRowCount,
-			reqOrdering:           n.reqOrdering,
-			cols:                  n.cols,
-			colsToTableOrdinalMap: scanNodeToTableOrdinalMap,
-			containsSystemColumns: n.containsSystemColumns,
+			spec:              spec,
+			post:              post,
+			desc:              n.desc,
+			spans:             n.spans,
+			reverse:           n.reverse,
+			parallelize:       n.parallelize,
+			estimatedRowCount: n.estimatedRowCount,
+			reqOrdering:       n.reqOrdering,
+			cols:              n.cols,
 		},
 	)
 	return p, err
@@ -1336,18 +1288,15 @@ func (dsp *DistSQLPlanner) createTableReaders(
 // needed to perform the physical planning of table readers once the specs have
 // been created. See scanNode to get more context on some of the fields.
 type tableReaderPlanningInfo struct {
-	spec                  *execinfrapb.TableReaderSpec
-	post                  execinfrapb.PostProcessSpec
-	desc                  catalog.TableDescriptor
-	spans                 []roachpb.Span
-	reverse               bool
-	scanVisibility        execinfrapb.ScanVisibility
-	parallelize           bool
-	estimatedRowCount     uint64
-	reqOrdering           ReqOrdering
-	cols                  []catalog.Column
-	colsToTableOrdinalMap []int
-	containsSystemColumns bool
+	spec              *execinfrapb.TableReaderSpec
+	post              execinfrapb.PostProcessSpec
+	desc              catalog.TableDescriptor
+	spans             []roachpb.Span
+	reverse           bool
+	parallelize       bool
+	estimatedRowCount uint64
+	reqOrdering       ReqOrdering
+	cols              []catalog.Column
 }
 
 const defaultLocalScansConcurrencyLimit = 1024
@@ -1526,51 +1475,13 @@ func (dsp *DistSQLPlanner) planTableReaders(
 	}
 
 	invertedColumn := tabledesc.FindInvertedColumn(info.desc, info.spec.InvertedColumn)
-	cols := info.desc.PublicColumns()
-	returnMutations := info.scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic
-	if returnMutations {
-		cols = info.desc.DeletableColumns()
-	}
-	typs := catalog.ColumnTypesWithInvertedCol(cols, invertedColumn)
-	if info.containsSystemColumns {
-		for _, col := range info.desc.SystemColumns() {
-			typs = append(typs, col.GetType())
-		}
-	}
+	typs := catalog.ColumnTypesWithInvertedCol(info.cols, invertedColumn)
 
 	// Note: we will set a merge ordering below.
 	p.AddNoInputStage(corePlacement, info.post, typs, execinfrapb.Ordering{})
 
-	outCols := getOutputColumnsFromColsForScan(info.cols, info.colsToTableOrdinalMap)
-	planToStreamColMap := make([]int, len(info.cols))
-	var descColumnIDs util.FastIntMap
-	colID := 0
-	for _, col := range info.desc.AllColumns() {
-		var addCol bool
-		if col.IsSystemColumn() {
-			// If it is a system column, we want to treat it carefully because
-			// its ID is a very large number, so adding it into util.FastIntMap
-			// will incur an allocation.
-			addCol = info.containsSystemColumns
-		} else {
-			addCol = col.Public() || returnMutations
-		}
-		if addCol {
-			descColumnIDs.Set(colID, int(col.GetID()))
-			colID++
-		}
-	}
-
-	for i := range planToStreamColMap {
-		planToStreamColMap[i] = -1
-		for j, c := range outCols {
-			if descColumnIDs.GetDefault(int(c)) == int(info.cols[i].GetID()) {
-				planToStreamColMap[i] = j
-				break
-			}
-		}
-	}
-	p.AddProjection(outCols, dsp.convertOrdering(info.reqOrdering, planToStreamColMap))
+	p.PlanToStreamColMap = identityMap(make([]int, len(info.cols)), len(info.cols))
+	p.SetMergeOrdering(dsp.convertOrdering(info.reqOrdering, p.PlanToStreamColMap))
 
 	if parallelizeLocal {
 		// If we planned multiple table readers, we need to merge the streams
@@ -1578,7 +1489,6 @@ func (dsp *DistSQLPlanner) planTableReaders(
 		p.AddSingleGroupStage(dsp.gatewayNodeID, execinfrapb.ProcessorCoreUnion{Noop: &execinfrapb.NoopCoreSpec{}}, execinfrapb.PostProcessSpec{}, p.GetResultTypes())
 	}
 
-	p.PlanToStreamColMap = planToStreamColMap
 	return nil
 }
 
@@ -2265,7 +2175,6 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 		Table:             *n.table.desc.TableDesc(),
 		IndexIdx:          0,
 		Type:              descpb.InnerJoin,
-		Visibility:        n.table.colCfg.visibility,
 		LockingStrength:   n.table.lockingStrength,
 		LockingWaitPolicy: n.table.lockingWaitPolicy,
 		MaintainOrdering:  len(n.reqOrdering) > 0,
@@ -2281,7 +2190,7 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(n.cols))
 
 	for i := range n.cols {
-		ord := tableOrdinal(n.table.desc, n.cols[i].GetID(), n.table.colCfg.visibility)
+		ord := tableOrdinal(n.table.desc, n.cols[i].GetID())
 		post.OutputColumns[i] = uint32(ord)
 	}
 
@@ -2321,7 +2230,6 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	joinReaderSpec := execinfrapb.JoinReaderSpec{
 		Table:                    *n.table.desc.TableDesc(),
 		Type:                     n.joinType,
-		Visibility:               n.table.colCfg.visibility,
 		LockingStrength:          n.table.lockingStrength,
 		LockingWaitPolicy:        n.table.lockingWaitPolicy,
 		MaintainOrdering:         len(n.reqOrdering) > 0,
@@ -2435,13 +2343,12 @@ func mappingHelperForLookupJoins(
 	}
 	for i := range table.cols {
 		outTypes[numLeftCols+i] = table.cols[i].GetType()
-		ord := tableOrdinal(table.desc, table.cols[i].GetID(), table.colCfg.visibility)
+		ord := tableOrdinal(table.desc, table.cols[i].GetID())
 		post.OutputColumns[numLeftCols+i] = uint32(numLeftCols + ord)
 	}
 	if addContinuationCol {
 		outTypes[numOutCols-1] = types.Bool
-		post.OutputColumns[numOutCols-1] =
-			uint32(numLeftCols + highestTableOrdinal(table.desc, table.colCfg.visibility) + 1)
+		post.OutputColumns[numOutCols-1] = uint32(numLeftCols + len(table.desc.DeletableColumns()))
 	}
 
 	// Map the columns of the lookupJoinNode to the result streams of the
@@ -2653,7 +2560,7 @@ func (dsp *DistSQLPlanner) planZigzagJoin(
 		// colCfg.wantedColumns for only the necessary columns in
 		// opt/exec/execbuilder/relational_builder.go, similar to lookup joins.
 		for _, col := range side.cols {
-			ord := tableOrdinal(side.desc, col.GetID(), execinfra.ScanVisibilityPublic)
+			ord := tableOrdinal(side.desc, col.GetID())
 			post.OutputColumns[i] = uint32(colOffset + ord)
 			types[i] = col.GetType()
 			planToStreamColMap[i] = i
@@ -3298,7 +3205,7 @@ func (dsp *DistSQLPlanner) createValuesPlan(
 func (dsp *DistSQLPlanner) createValuesSpecFromTuples(
 	planCtx *PlanningCtx, tuples [][]tree.TypedExpr, resultTypes []*types.T,
 ) (*execinfrapb.ValuesCoreSpec, error) {
-	var a rowenc.DatumAlloc
+	var a tree.DatumAlloc
 	evalCtx := &planCtx.ExtendedEvalCtx.EvalContext
 	numRows := len(tuples)
 	if len(resultTypes) == 0 {
@@ -4045,7 +3952,6 @@ func checkScanParallelizationIfLocal(
 				}
 				return true, nil
 			case *scanNode:
-				prohibitParallelization = n.isCheck
 				if len(n.reqOrdering) == 0 && n.parallelize {
 					hasScanNodeToParallelize = true
 				}

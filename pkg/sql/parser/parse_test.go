@@ -33,7 +33,7 @@ import (
 // TestParseDataDriven verifies that we can parse the supplied SQL and regenerate the SQL
 // string from the syntax tree.
 func TestParseDatadriven(t *testing.T) {
-	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
+	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "parse":
@@ -395,6 +395,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`CREATE ACCESS METHOD a`, 0, `create access method`, ``},
 
+		{`COMMENT ON FUNCTION f() is 'f'`, 17511, ``, ``},
 		{`COPY x FROM STDIN WHERE a = b`, 54580, ``, ``},
 
 		{`CREATE AGGREGATE a`, 0, `create aggregate`, ``},
@@ -442,6 +443,8 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`SET CONSTRAINTS foo`, 0, `set constraints`, ``},
 		{`SET foo FROM CURRENT`, 0, `set from current`, ``},
+
+		{`CREATE MATERIALIZED VIEW a AS SELECT 1 WITH NO DATA`, 74083, ``, ``},
 
 		{`CREATE TABLE a(x INT[][])`, 32552, ``, ``},
 		{`CREATE TABLE a(x INT[1][2])`, 32552, ``, ``},
@@ -512,7 +515,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE INDEX a ON b(a DESC NULLS FIRST)`, 6224, ``, ``},
 
 		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
-		{`INSERT INTO foo VALUES (1,2) ON CONFLICT ON CONSTRAINT a DO NOTHING`, 28161, ``, ``},
 
 		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`, ``},
 
@@ -535,9 +537,9 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b JSONPATH)`, 22513, `jsonpath`, ``},
 		{`CREATE TABLE a(b LINE)`, 21286, `line`, ``},
 		{`CREATE TABLE a(b LSEG)`, 21286, `lseg`, ``},
-		{`CREATE TABLE a(b MACADDR)`, 0, `macaddr`, ``},
-		{`CREATE TABLE a(b MACADDR8)`, 0, `macaddr8`, ``},
-		{`CREATE TABLE a(b MONEY)`, 0, `money`, ``},
+		{`CREATE TABLE a(b MACADDR)`, 45813, `macaddr`, ``},
+		{`CREATE TABLE a(b MACADDR8)`, 45813, `macaddr8`, ``},
+		{`CREATE TABLE a(b MONEY)`, 41578, `money`, ``},
 		{`CREATE TABLE a(b PATH)`, 21286, `path`, ``},
 		{`CREATE TABLE a(b PG_LSN)`, 0, `pg_lsn`, ``},
 		{`CREATE TABLE a(b POINT)`, 21286, `point`, ``},
@@ -545,7 +547,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b TSQUERY)`, 7821, `tsquery`, ``},
 		{`CREATE TABLE a(b TSVECTOR)`, 7821, `tsvector`, ``},
 		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`, ``},
-		{`CREATE TABLE a(b XML)`, 0, `xml`, ``},
+		{`CREATE TABLE a(b XML)`, 43355, `xml`, ``},
 
 		{`CREATE TABLE a(a INT, PRIMARY KEY (a) NOT VALID)`, 0, `table constraint`,
 			`PRIMARY KEY constraints cannot be marked NOT VALID`},

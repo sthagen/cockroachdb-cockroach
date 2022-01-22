@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,6 +39,11 @@ type Reconciler struct {
 	codec   keys.SQLCodec
 	tenID   roachpb.TenantID
 	knobs   *spanconfig.TestingKnobs
+
+	mu struct {
+		syncutil.RWMutex
+		lastCheckpoint hlc.Timestamp
+	}
 }
 
 var _ spanconfig.Reconciler = &Reconciler{}
@@ -122,7 +128,7 @@ func New(
 // checkpoint. For changes to, say, RANGE DEFAULT, the RPC request proto is
 // proportional to the number of schema objects.
 func (r *Reconciler) Reconcile(
-	ctx context.Context, startTS hlc.Timestamp, callback func(checkpoint hlc.Timestamp) error,
+	ctx context.Context, startTS hlc.Timestamp, onCheckpoint func() error,
 ) error {
 	// TODO(irfansharif): Check system.{zones,descriptors} for last GC timestamp
 	// and avoid the full reconciliation pass if the startTS provided is
@@ -130,21 +136,31 @@ func (r *Reconciler) Reconcile(
 	// pass every time the reconciliation job kicks us off.
 	_ = startTS
 
+	if fn := r.knobs.ReconcilerInitialInterceptor; fn != nil {
+		fn()
+	}
+
 	full := fullReconciler{
 		sqlTranslator: r.sqlTranslator,
 		kvAccessor:    r.kvAccessor,
 		codec:         r.codec,
 		tenID:         r.tenID,
+		knobs:         r.knobs,
 	}
-	latestStore, reconciledUpto, err := full.reconcile(ctx)
+	latestStore, reconciledUpUntil, err := full.reconcile(ctx)
 	if err != nil {
 		return err
 	}
 
-	if err := callback(reconciledUpto); err != nil {
+	r.mu.Lock()
+	r.mu.lastCheckpoint = reconciledUpUntil
+	r.mu.Unlock()
+
+	if err := onCheckpoint(); err != nil {
 		return err
 	}
 
+	incrementalStartTS := reconciledUpUntil
 	incremental := incrementalReconciler{
 		sqlTranslator:       r.sqlTranslator,
 		sqlWatcher:          r.sqlWatcher,
@@ -154,7 +170,21 @@ func (r *Reconciler) Reconcile(
 		codec:               r.codec,
 		knobs:               r.knobs,
 	}
-	return incremental.reconcile(ctx, reconciledUpto, callback)
+	return incremental.reconcile(ctx, incrementalStartTS, func(reconciledUpUntil hlc.Timestamp) error {
+		r.mu.Lock()
+		r.mu.lastCheckpoint = reconciledUpUntil
+		r.mu.Unlock()
+
+		return onCheckpoint()
+	})
+}
+
+// Checkpoint is part of the spanconfig.Reconciler interface.
+func (r *Reconciler) Checkpoint() hlc.Timestamp {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.mu.lastCheckpoint
 }
 
 // fullReconciler is a single-use orchestrator for the full reconciliation
@@ -165,6 +195,7 @@ type fullReconciler struct {
 
 	codec keys.SQLCodec
 	tenID roachpb.TenantID
+	knobs *spanconfig.TestingKnobs
 }
 
 // reconcile runs the full reconciliation process, returning:
@@ -250,6 +281,9 @@ func (f *fullReconciler) fetchExistingSpanConfigs(
 		tenantSpan = roachpb.Span{
 			Key:    keys.EverythingSpan.Key,
 			EndKey: keys.TableDataMax,
+		}
+		if f.knobs.ConfigureScratchRange {
+			tenantSpan.EndKey = keys.ScratchRangeMax
 		}
 	} else {
 		// Secondary tenants govern everything prefixed by their tenant ID.
@@ -383,7 +417,9 @@ func (r *incrementalReconciler) reconcile(
 func (r *incrementalReconciler) filterForMissingTableIDs(
 	ctx context.Context, updates []spanconfig.DescriptorUpdate,
 ) (descpb.IDs, error) {
+	seen := make(map[descpb.ID]struct{})
 	var missingIDs descpb.IDs
+
 	if err := sql.DescsTxn(ctx, r.execCfg,
 		func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
 			for _, update := range updates {
@@ -408,7 +444,10 @@ func (r *incrementalReconciler) filterForMissingTableIDs(
 				}
 
 				if considerAsMissing {
-					missingIDs = append(missingIDs, update.ID) // accumulate the set of missing table IDs
+					if _, found := seen[update.ID]; !found {
+						seen[update.ID] = struct{}{}
+						missingIDs = append(missingIDs, update.ID) // accumulate the set of missing table IDs
+					}
 				}
 			}
 

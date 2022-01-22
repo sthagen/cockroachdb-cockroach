@@ -66,7 +66,6 @@ export interface OwnProps {
   cancelQuery: (payload: ICancelQueryRequest) => void;
   uiConfig?: UIConfigState["pages"]["sessionDetails"];
   isTenant?: UIConfigState["isTenant"];
-  isCloud?: boolean;
   onBackButtonClick?: () => void;
   onTerminateSessionClick?: () => void;
   onTerminateStatementClick?: () => void;
@@ -136,12 +135,11 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
       sessionError,
       cancelSession,
       cancelQuery,
-      isCloud,
       onTerminateSessionClick,
       onTerminateStatementClick,
     } = this.props;
     const session = this.props.session?.session;
-    const showActionButtons = !!session && !sessionError && !isCloud;
+    const showActionButtons = !!session && !sessionError;
     return (
       <div className={cx("sessions-details")}>
         <Helmet title={`Details | ${sessionID} | Sessions`} />
@@ -323,7 +321,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                 />
                 <Link
                   to={StatementLinkTarget({
-                    statement: stmt.sql,
+                    statementFingerprintID: stmt.id,
                     statementNoConstants: stmt.sql_no_constants,
                     implicitTxn: session.active_txn?.implicit,
                     app: "",

@@ -81,6 +81,10 @@ type StoreTestingKnobs struct {
 	// error returned to the client, or to simulate network failures.
 	TestingResponseFilter kvserverbase.ReplicaResponseFilter
 
+	// SlowReplicationThresholdOverride is an interceptor that allows setting a
+	// per-Batch SlowReplicationThreshold.
+	SlowReplicationThresholdOverride func(ba *roachpb.BatchRequest) time.Duration
+
 	// TestingRangefeedFilter is called before a replica processes a rangefeed
 	// in order for unit tests to modify the request, error returned to the client
 	// or data.
@@ -367,6 +371,10 @@ type StoreTestingKnobs struct {
 	// MakeSystemConfigSpanUnavailableToQueues makes the system config span
 	// unavailable to queues that ask for it.
 	MakeSystemConfigSpanUnavailableToQueues bool
+	// UseSystemConfigSpanForQueues uses the system config span infrastructure
+	// for internal queues (as opposed to the span configs infrastructure). This
+	// is used only for (old) tests written with the system config span in mind.
+	UseSystemConfigSpanForQueues bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

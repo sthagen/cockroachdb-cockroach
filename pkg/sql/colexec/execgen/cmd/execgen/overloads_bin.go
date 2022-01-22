@@ -151,7 +151,9 @@ func registerBinOpOutputTypes() {
 			binOpOutputTypes[tree.Mult][typePair{types.IntervalFamily, anyWidth, numberTypeFamily, numberTypeWidth}] = types.Interval
 		}
 	}
-	binOpOutputTypes[tree.Div][typePair{types.IntervalFamily, anyWidth, types.IntFamily, anyWidth}] = types.Interval
+	for _, intWidth := range supportedWidthsByCanonicalTypeFamily[types.IntFamily] {
+		binOpOutputTypes[tree.Div][typePair{types.IntervalFamily, anyWidth, types.IntFamily, intWidth}] = types.Interval
+	}
 	binOpOutputTypes[tree.Div][typePair{types.IntervalFamily, anyWidth, types.FloatFamily, anyWidth}] = types.Interval
 	binOpOutputTypes[tree.Plus][typePair{types.TimestampTZFamily, anyWidth, types.IntervalFamily, anyWidth}] = types.TimestampTZ
 	binOpOutputTypes[tree.Minus][typePair{types.TimestampTZFamily, anyWidth, types.IntervalFamily, anyWidth}] = types.TimestampTZ
@@ -472,10 +474,10 @@ func (c intCustomizer) getBinOpAssignFunc() assignFunc {
 				if {{.Right}} == 0 {
 					colexecerror.ExpectedError(tree.ErrDivByZero)
 				}
-				leftTmpDec, rightTmpDec := &_overloadHelper.TmpDec1, &_overloadHelper.TmpDec2
+				var leftTmpDec, rightTmpDec apd.Decimal //gcassert:noescape
 				leftTmpDec.SetInt64(int64({{.Left}}))
 				rightTmpDec.SetInt64(int64({{.Right}}))
-				if _, err := tree.{{.Ctx}}.Quo(&{{.Target}}, leftTmpDec, rightTmpDec); err != nil {
+				if _, err := tree.{{.Ctx}}.Quo(&{{.Target}}, &leftTmpDec, &rightTmpDec); err != nil {
 					colexecerror.ExpectedError(err)
 				}
 			}
@@ -485,10 +487,10 @@ func (c intCustomizer) getBinOpAssignFunc() assignFunc {
 
 			t = template.Must(template.New("").Parse(`
 			{
-				leftTmpDec, rightTmpDec := &_overloadHelper.TmpDec1, &_overloadHelper.TmpDec2
+				var leftTmpDec, rightTmpDec apd.Decimal //gcassert:noescape
 				leftTmpDec.SetInt64(int64({{.Left}}))
 				rightTmpDec.SetInt64(int64({{.Right}}))
-				if _, err := tree.{{.Ctx}}.Pow(leftTmpDec, leftTmpDec, rightTmpDec); err != nil {
+				if _, err := tree.{{.Ctx}}.Pow(&leftTmpDec, &leftTmpDec, &rightTmpDec); err != nil {
 					colexecerror.ExpectedError(err)
 				}
 				resultInt, err := leftTmpDec.Int64()
@@ -550,9 +552,9 @@ func (c decimalIntCustomizer) getBinOpAssignFunc() assignFunc {
 					colexecerror.ExpectedError(tree.ErrDivByZero)
 				}
 				{{end}}
-				tmpDec := &_overloadHelper.TmpDec1
+				var tmpDec apd.Decimal //gcassert:noescape
 				tmpDec.SetInt64(int64({{.Right}}))
-				if _, err := tree.{{.Ctx}}.{{.Op}}(&{{.Target}}, &{{.Left}}, tmpDec); err != nil {
+				if _, err := tree.{{.Ctx}}.{{.Op}}(&{{.Target}}, &{{.Left}}, &tmpDec); err != nil {
 					colexecerror.ExpectedError(err)
 				}
 			}
@@ -583,9 +585,9 @@ func (c intDecimalCustomizer) getBinOpAssignFunc() assignFunc {
 					colexecerror.ExpectedError(tree.ErrDivByZero)
 				}
 				{{end}}
-				tmpDec := &_overloadHelper.TmpDec1
+				var tmpDec apd.Decimal //gcassert:noescape
 				tmpDec.SetInt64(int64({{.Left}}))
-				_, err := tree.{{.Ctx}}.{{.Op}}(&{{.Target}}, tmpDec, &{{.Right}})
+				_, err := tree.{{.Ctx}}.{{.Op}}(&{{.Target}}, &tmpDec, &{{.Right}})
 				if err != nil {
 					colexecerror.ExpectedError(err)
 				}

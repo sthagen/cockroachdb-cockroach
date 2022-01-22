@@ -129,6 +129,7 @@ go_test(
         "txn_coord_sender_server_test.go",
         "txn_coord_sender_test.go",
         "txn_correctness_test.go",
+        "txn_intercepter_pipeliner_client_test.go",
         "txn_interceptor_committer_test.go",
         "txn_interceptor_heartbeater_test.go",
         "txn_interceptor_pipeliner_test.go",
@@ -138,6 +139,7 @@ go_test(
     ],
     data = glob(["testdata/**"]),
     embed = [":with-mocks"],  # keep
+    tags = ["no-remote"],
     deps = [
         "//build/bazelutil:noop",
         "//pkg/base",

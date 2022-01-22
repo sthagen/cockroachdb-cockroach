@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -935,7 +936,7 @@ func TestValidateTableDesc(t *testing.T) {
 						KeyColumnIDs:        []descpb.ColumnID{2, 1},
 						KeyColumnNames:      []string{"crdb_internal_bar_shard_5", "bar"},
 						KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
-						Sharded: descpb.ShardedDescriptor{
+						Sharded: catpb.ShardedDescriptor{
 							IsSharded:    true,
 							Name:         "does not exist",
 							ShardBuckets: 5,
@@ -1422,7 +1423,7 @@ func TestValidateTableDesc(t *testing.T) {
 					{
 						ID:                      1,
 						Name:                    "bar",
-						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
 						OnUpdateExpr:            proto.String("'blah'"),
 					},
 				},
@@ -1442,7 +1443,7 @@ func TestValidateTableDesc(t *testing.T) {
 					{
 						ID:                      1,
 						Name:                    "bar",
-						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
 						OnUpdateExpr:            proto.String("'blah'"),
 					},
 				},
@@ -1460,7 +1461,7 @@ func TestValidateTableDesc(t *testing.T) {
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "bar", Nullable: true,
-						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
 					},
 				},
 				NextColumnID: 3,
@@ -1473,7 +1474,7 @@ func TestValidateTableDesc(t *testing.T) {
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "bar", Nullable: true,
-						GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
 					},
 				},
 				NextColumnID: 3,
@@ -1485,7 +1486,7 @@ func TestValidateTableDesc(t *testing.T) {
 				Name:          "foo",
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
-					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
 						ComputeExpr: &computedExpr},
 				},
 				NextColumnID: 3,
@@ -1497,7 +1498,7 @@ func TestValidateTableDesc(t *testing.T) {
 				Name:          "foo",
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
-					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
 						ComputeExpr: &computedExpr},
 				},
 				NextColumnID: 3,
@@ -1510,7 +1511,7 @@ func TestValidateTableDesc(t *testing.T) {
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "bar", Nullable: true,
-						GeneratedAsIdentityType:           descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+						GeneratedAsIdentityType:           catpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
 						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
 					},
 				},
@@ -1524,7 +1525,7 @@ func TestValidateTableDesc(t *testing.T) {
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "bar", Nullable: true,
-						GeneratedAsIdentityType:           descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+						GeneratedAsIdentityType:           catpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
 						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
 					},
 				},
@@ -1537,7 +1538,7 @@ func TestValidateTableDesc(t *testing.T) {
 				Name:          "foo",
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
-					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
 						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
 						ComputeExpr:                       &computedExpr},
 				},
@@ -1550,7 +1551,7 @@ func TestValidateTableDesc(t *testing.T) {
 				Name:          "foo",
 				FormatVersion: descpb.InterleavedFormatVersion,
 				Columns: []descpb.ColumnDescriptor{
-					{ID: 1, Name: "bar", GeneratedAsIdentityType: descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
+					{ID: 1, Name: "bar", GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
 						GeneratedAsIdentitySequenceOption: &generatedAsIdentitySequenceOptionExpr,
 						ComputeExpr:                       &computedExpr},
 				},
@@ -1620,7 +1621,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 	}{
 		// Foreign keys
 		{ // 0
-			err: `invalid foreign key: missing table=52: referenced table ID 52: descriptor not found`,
+			err: `invalid foreign key: missing table=52: referenced table ID 52: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -1666,7 +1667,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{ // 2
-			err: `invalid foreign key backreference: missing table=52: referenced table ID 52: descriptor not found`,
+			err: `invalid foreign key backreference: missing table=52: referenced table ID 52: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -1715,7 +1716,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{ // 4
-			err: `referenced type ID 500: descriptor not found`,
+			err: `referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -1738,7 +1739,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 		},
 		// Add some expressions with invalid type references.
 		{ // 5
-			err: `referenced type ID 500: descriptor not found`,
+			err: `referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -1761,7 +1762,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			},
 		},
 		{ // 6
-			err: `referenced type ID 500: descriptor not found`,
+			err: `referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -1784,7 +1785,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			},
 		},
 		{ // 7
-			err: `referenced type ID 500: descriptor not found`,
+			err: `referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -1798,7 +1799,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			},
 		},
 		{ // 8
-			err: `referenced type ID 500: descriptor not found`,
+			err: `referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,

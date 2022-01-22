@@ -502,6 +502,16 @@ var (
 		Measurement: "Leader Transfers",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRangeLossOfQuorumRecoveries = metric.Metadata{
+		Name: "range.recoveries",
+		Help: `Count of offline loss of quorum recovery operations performed on ranges.
+
+This count increments for every range recovered in offline loss of quorum
+recovery operation. Metric is updated when node on which survivor replica
+is located starts following the recovery.`,
+		Measurement: "Quorum Recoveries",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Raft processing metrics.
 	metaRaftTicks = metric.Metadata{
@@ -1242,6 +1252,26 @@ throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
 		Measurement: "Attempts",
 		Unit:        metric.Unit_COUNT,
 	}
+
+	// Replica circuit breaker.
+	metaReplicaCircuitBreakerCurTripped = metric.Metadata{
+		Name: "kv.replica_circuit_breaker.num_tripped_replicas",
+		Help: `Number of Replicas for which the per-Replica circuit breaker is currently tripped.
+
+A nonzero value indicates range or replica unavailability, and should be investigated.
+Replicas in this state will fail-fast all inbound requests.
+`,
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	// Replica circuit breaker.
+	metaReplicaCircuitBreakerCumTripped = metric.Metadata{
+		Name:        "kv.replica_circuit_breaker.num_tripped_events",
+		Help:        `Number of times the per-Replica circuit breakers tripped since process start.`,
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // StoreMetrics is the set of metrics for a given store.
@@ -1337,6 +1367,7 @@ type StoreMetrics struct {
 	RangeSnapshotsAppliedForInitialUpreplication *metric.Counter
 	RangeSnapshotsAppliedByNonVoters             *metric.Counter
 	RangeRaftLeaderTransfers                     *metric.Counter
+	RangeLossOfQuorumRecoveries                  *metric.Counter
 
 	// Raft processing metrics.
 	RaftTicks                 *metric.Counter
@@ -1459,6 +1490,10 @@ type StoreMetrics struct {
 
 	// Closed timestamp metrics.
 	ClosedTimestampMaxBehindNanos *metric.Gauge
+
+	// Replica circuit breaker.
+	ReplicaCircuitBreakerCurTripped *metric.Gauge
+	ReplicaCircuitBreakerCumTripped *metric.Counter
 }
 
 type tenantMetricsRef struct {
@@ -1764,6 +1799,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeSnapshotsAppliedForInitialUpreplication: metric.NewCounter(metaRangeSnapshotsAppliedForInitialUpreplication),
 		RangeSnapshotsAppliedByNonVoters:             metric.NewCounter(metaRangeSnapshotsAppliedByNonVoter),
 		RangeRaftLeaderTransfers:                     metric.NewCounter(metaRangeRaftLeaderTransfers),
+		RangeLossOfQuorumRecoveries:                  metric.NewCounter(metaRangeLossOfQuorumRecoveries),
 
 		// Raft processing metrics.
 		RaftTicks:                 metric.NewCounter(metaRaftTicks),
@@ -1896,6 +1932,10 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 
 		// Closed timestamp metrics.
 		ClosedTimestampMaxBehindNanos: metric.NewGauge(metaClosedTimestampMaxBehindNanos),
+
+		// Replica circuit breaker.
+		ReplicaCircuitBreakerCurTripped: metric.NewGauge(metaReplicaCircuitBreakerCurTripped),
+		ReplicaCircuitBreakerCumTripped: metric.NewCounter(metaReplicaCircuitBreakerCumTripped),
 	}
 	storeRegistry.AddMetricStruct(sm)
 

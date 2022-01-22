@@ -99,6 +99,11 @@ func init() {
 	cloud.RegisterKMSFromURIFactory(MakeTestKMS, "testkms")
 }
 
+func makeTableSpan(tableID uint32) roachpb.Span {
+	k := keys.SystemSQLCodec.TablePrefix(tableID)
+	return roachpb.Span{Key: k, EndKey: k.PrefixEnd()}
+}
+
 type sqlDBKey struct {
 	server string
 	user   string
@@ -266,7 +271,7 @@ func TestBackupRestoreDataDriven(t *testing.T) {
 	defer httpServerCleanup()
 
 	ctx := context.Background()
-	datadriven.Walk(t, "testdata/backup-restore/", func(t *testing.T, path string) {
+	datadriven.Walk(t, testutils.TestDataPath(t, "backup-restore", ""), func(t *testing.T, path string) {
 		var lastCreatedServer string
 		ds := newDatadrivenTestState()
 		defer ds.cleanup(ctx)
@@ -762,7 +767,7 @@ func TestBackupRestoreAppend(t *testing.T) {
 
 		sqlDB.ExpectErr(t, "cannot append a backup of specific", "BACKUP system.users TO ($1, $2, "+
 			"$3)", test.backups...)
-		//TODO(dt): prevent backing up different targets to same collection?
+		// TODO(dt): prevent backing up different targets to same collection?
 
 		sqlDB.Exec(t, "DROP DATABASE data CASCADE")
 		sqlDB.Exec(t, "RESTORE DATABASE data FROM ($1, $2, $3)", test.backups...)
@@ -1840,7 +1845,7 @@ func TestBackupRestoreResume(t *testing.T) {
 			t.Fatal(err)
 		}
 		if isGZipped(backupManifestBytes) {
-			backupManifestBytes, err = decompressData(backupManifestBytes)
+			backupManifestBytes, err = decompressData(ctx, nil, backupManifestBytes)
 			require.NoError(t, err)
 		}
 		var backupManifest BackupManifest
@@ -1928,7 +1933,12 @@ func TestBackupRestoreControlJob(t *testing.T) {
 	// force every call to update
 	defer jobs.TestingSetProgressThresholds()()
 
-	serverArgs := base.TestServerArgs{Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}}
+	serverArgs := base.TestServerArgs{
+		DisableSpanConfigs: true,
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	}
 	// Disable external processing of mutations so that the final check of
 	// crdb_internal.tables is guaranteed to not be cleaned up. Although this
 	// was never observed by a stress test, it is here for safety.
@@ -4399,7 +4409,7 @@ func TestBackupRestoreChecksum(t *testing.T) {
 			t.Fatalf("%+v", err)
 		}
 		if isGZipped(backupManifestBytes) {
-			backupManifestBytes, err = decompressData(backupManifestBytes)
+			backupManifestBytes, err = decompressData(context.Background(), nil, backupManifestBytes)
 			require.NoError(t, err)
 		}
 		if err := protoutil.Unmarshal(backupManifestBytes, &backupManifest); err != nil {
@@ -6742,6 +6752,8 @@ func TestRestoreErrorPropagates(t *testing.T) {
 
 // TestProtectedTimestampsFailDueToLimits ensures that when creating a protected
 // timestamp record fails, we return the correct error.
+//
+// TODO(adityamaru): Remove in 22.2 once no records protect spans.
 func TestProtectedTimestampsFailDueToLimits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -6781,7 +6793,14 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	serverArgs := base.TestServerArgs{Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}}
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
 	var numExportRequests int
-	exportRequestSpans := make([]string, 0)
+
+	mu := struct {
+		syncutil.Mutex
+		exportRequestSpansSet map[string]struct{}
+		exportRequestSpans    []string
+	}{}
+	mu.exportRequestSpansSet = make(map[string]struct{})
+	mu.exportRequestSpans = make([]string, 0)
 
 	requestSpanStr := func(span roachpb.Span, timestamp hlc.Timestamp) string {
 		spanStr := ""
@@ -6804,10 +6823,15 @@ func TestPaginatedBackupTenant(t *testing.T) {
 			for _, ru := range request.Requests {
 				if exportRequest, ok := ru.GetInner().(*roachpb.ExportRequest); ok &&
 					!isLeasingExportRequest(exportRequest) {
-					exportRequestSpans = append(
-						exportRequestSpans,
-						requestSpanStr(roachpb.Span{Key: exportRequest.Key, EndKey: exportRequest.EndKey}, exportRequest.ResumeKeyTS),
-					)
+
+					mu.Lock()
+					defer mu.Unlock()
+					req := requestSpanStr(roachpb.Span{Key: exportRequest.Key, EndKey: exportRequest.EndKey}, exportRequest.ResumeKeyTS)
+					if _, found := mu.exportRequestSpansSet[req]; found {
+						return nil // nothing to do
+					}
+					mu.exportRequestSpansSet[req] = struct{}{}
+					mu.exportRequestSpans = append(mu.exportRequestSpans, req)
 					numExportRequests++
 				}
 			}
@@ -6834,8 +6858,12 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	_ = security.EmbeddedTenantIDs()
 
 	resetStateVars := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
 		numExportRequests = 0
-		exportRequestSpans = exportRequestSpans[:0]
+		mu.exportRequestSpansSet = make(map[string]struct{})
+		mu.exportRequestSpans = mu.exportRequestSpans[:0]
 	}
 
 	_, conn10 := serverutils.StartTenant(t, srv,
@@ -6851,26 +6879,27 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	systemDB.Exec(t, `SET CLUSTER SETTING kv.bulk_sst.max_allowed_overage='0b'`)
 
 	tenant10.Exec(t, `BACKUP DATABASE foo TO 'userfile://defaultdb.myfililes/test'`)
-	require.Equal(t, 1, numExportRequests)
 	startingSpan := roachpb.Span{Key: []byte("/Tenant/10/Table/56/1"), EndKey: []byte("/Tenant/10/Table/56/2")}
-	require.Equal(t, exportRequestSpans, []string{startingSpan.String()})
+	mu.Lock()
+	require.Equal(t, []string{startingSpan.String()}, mu.exportRequestSpans)
+	mu.Unlock()
 	resetStateVars()
 
 	// Two ExportRequests with one resume span.
 	systemDB.Exec(t, `SET CLUSTER SETTING kv.bulk_sst.target_size='50b'`)
 	tenant10.Exec(t, `BACKUP DATABASE foo TO 'userfile://defaultdb.myfililes/test2'`)
-	require.Equal(t, 2, numExportRequests)
 	startingSpan = roachpb.Span{Key: []byte("/Tenant/10/Table/56/1"),
 		EndKey: []byte("/Tenant/10/Table/56/2")}
 	resumeSpan := roachpb.Span{Key: []byte("/Tenant/10/Table/56/1/510/0"),
 		EndKey: []byte("/Tenant/10/Table/56/2")}
-	require.Equal(t, exportRequestSpans, []string{startingSpan.String(), resumeSpan.String()})
+	mu.Lock()
+	require.Equal(t, []string{startingSpan.String(), resumeSpan.String()}, mu.exportRequestSpans)
+	mu.Unlock()
 	resetStateVars()
 
 	// One ExportRequest for every KV.
 	systemDB.Exec(t, `SET CLUSTER SETTING kv.bulk_sst.target_size='10b'`)
 	tenant10.Exec(t, `BACKUP DATABASE foo TO 'userfile://defaultdb.myfililes/test3'`)
-	require.Equal(t, 5, numExportRequests)
 	var expected []string
 	for _, resume := range []exportResumePoint{
 		{[]byte("/Tenant/10/Table/56/1"), []byte("/Tenant/10/Table/56/2"), withoutTS},
@@ -6881,7 +6910,9 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	} {
 		expected = append(expected, requestSpanStr(roachpb.Span{Key: resume.key, EndKey: resume.endKey}, resume.timestamp))
 	}
-	require.Equal(t, expected, exportRequestSpans)
+	mu.Lock()
+	require.Equal(t, expected, mu.exportRequestSpans)
+	mu.Unlock()
 	resetStateVars()
 
 	tenant10.Exec(t, `CREATE DATABASE baz; CREATE TABLE baz.bar(i int primary key, v string); INSERT INTO baz.bar VALUES (110, 'a'), (210, 'b'), (310, 'c'), (410, 'd'), (510, 'e')`)
@@ -6908,7 +6939,9 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	} {
 		expected = append(expected, requestSpanStr(roachpb.Span{Key: resume.key, EndKey: resume.endKey}, resume.timestamp))
 	}
-	require.Equal(t, expected, exportRequestSpans)
+	mu.Lock()
+	require.Equal(t, expected, mu.exportRequestSpans)
+	mu.Unlock()
 	resetStateVars()
 
 	// TODO(adityamaru): Add a RESTORE inside tenant once it is supported.
@@ -8095,7 +8128,7 @@ func TestManifestTooNew(t *testing.T) {
 	manifestPath := filepath.Join(rawDir, "too_new", backupManifestName)
 	manifestData, err := ioutil.ReadFile(manifestPath)
 	require.NoError(t, err)
-	manifestData, err = decompressData(manifestData)
+	manifestData, err = decompressData(context.Background(), nil, manifestData)
 	require.NoError(t, err)
 	var backupManifest BackupManifest
 	require.NoError(t, protoutil.Unmarshal(manifestData, &backupManifest))
@@ -8461,7 +8494,7 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 	fullBackup := LocalFoo + "/full"
 	sqlDB.Exec(t, `BACKUP DATABASE data TO $1 WITH revision_history`, fullBackup)
 
-	fullBackupSpans := getSpansFromManifest(t, locationToDir(fullBackup))
+	fullBackupSpans := getSpansFromManifest(ctx, t, locationToDir(fullBackup))
 	require.Equal(t, 1, len(fullBackupSpans))
 	require.Equal(t, "/Table/56/{1-2}", fullBackupSpans[0].String())
 
@@ -8505,10 +8538,10 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 	// Wait for the backfill and incremental backup to complete.
 	require.NoError(t, g.Wait())
 
-	inc1Spans := getSpansFromManifest(t, locationToDir(inc1Loc))
+	inc1Spans := getSpansFromManifest(ctx, t, locationToDir(inc1Loc))
 	require.Equalf(t, 0, len(inc1Spans), "expected inc1 to not have any data, found %v", inc1Spans)
 
-	inc2Spans := getSpansFromManifest(t, locationToDir(inc2Loc))
+	inc2Spans := getSpansFromManifest(ctx, t, locationToDir(inc2Loc))
 	require.Equalf(t, 0, len(inc2Spans), "expected inc2 to not have any data, found %v", inc2Spans)
 
 	// Take another incremental backup that should only contain the newly added
@@ -8516,7 +8549,7 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 	inc3Loc := LocalFoo + "/inc3"
 	sqlDB.Exec(t, `BACKUP DATABASE data TO $1 INCREMENTAL FROM $2, $3, $4 WITH revision_history`,
 		inc3Loc, fullBackup, inc1Loc, inc2Loc)
-	inc3Spans := getSpansFromManifest(t, locationToDir(inc3Loc))
+	inc3Spans := getSpansFromManifest(ctx, t, locationToDir(inc3Loc))
 	require.Equal(t, 1, len(inc3Spans))
 	require.Equal(t, "/Table/56/{2-3}", inc3Spans[0].String())
 
@@ -8873,7 +8906,7 @@ DROP TABLE foo;
 }
 
 // TestRestoreNewDatabaseName tests the new_db_name optional feature for single database
-//restores, which allows the user to rename the database they intend to restore.
+// restores, which allows the user to rename the database they intend to restore.
 func TestRestoreNewDatabaseName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)

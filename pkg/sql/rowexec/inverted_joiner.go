@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
@@ -85,9 +84,11 @@ type invertedJoiner struct {
 	// fetcher wraps the row.Fetcher used to perform scans. This enables the
 	// invertedJoiner to wrap the fetcher with a stat collector when necessary.
 	fetcher rowFetcher
+	row     rowenc.EncDatumRow
+
 	// rowsRead is the total number of rows that the fetcher read from disk.
 	rowsRead int64
-	alloc    rowenc.DatumAlloc
+	alloc    tree.DatumAlloc
 	rowAlloc rowenc.EncDatumRowAlloc
 
 	// tableRow represents a row with all the columns of the table, where only
@@ -195,7 +196,7 @@ func newInvertedJoiner(
 		return nil, errors.AssertionFailedf("unexpected inverted join type %s", spec.Type)
 	}
 	ij := &invertedJoiner{
-		desc:                 spec.BuildTableDescriptor(),
+		desc:                 flowCtx.TableDescriptor(&spec.Table),
 		input:                input,
 		inputTypes:           input.OutputTypes(),
 		prefixEqualityCols:   spec.PrefixEqualityColumns,
@@ -215,14 +216,18 @@ func newInvertedJoiner(
 
 	// Initialize tableRow, indexRow, indexRowTypes, and indexRowToTableRowMap,
 	// a mapping from indexRow column ordinal to tableRow column ordinals.
-	indexColumnIDs, _ := catalog.FullIndexColumnIDs(ij.index)
+	indexColumns := ij.desc.IndexFullColumns(ij.index)
 	// Inverted joins are not used for mutations.
 	ij.tableRow = make(rowenc.EncDatumRow, len(ij.desc.PublicColumns()))
-	ij.indexRow = make(rowenc.EncDatumRow, len(indexColumnIDs)-1)
+	ij.indexRow = make(rowenc.EncDatumRow, len(indexColumns)-1)
 	ij.indexRowTypes = make([]*types.T, len(ij.indexRow))
 	ij.indexRowToTableRowMap = make([]int, len(ij.indexRow))
 	indexRowIdx := 0
-	for _, colID := range indexColumnIDs {
+	for _, col := range indexColumns {
+		if col == nil {
+			continue
+		}
+		colID := col.GetID()
 		// Do not include the inverted column in the map.
 		if colID == ij.invertedColID {
 			continue
@@ -269,7 +274,7 @@ func newInvertedJoiner(
 		return nil, err
 	}
 
-	semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
+	semaCtx := flowCtx.NewSemaContext(flowCtx.EvalCtx.Txn)
 	onExprColTypes := make([]*types.T, 0, len(ij.inputTypes)+len(rightColTypes))
 	onExprColTypes = append(onExprColTypes, ij.inputTypes...)
 	onExprColTypes = append(onExprColTypes, rightColTypes...)
@@ -299,7 +304,6 @@ func newInvertedJoiner(
 		ij.batchedExprEval.filterer = ij.datumsToInvertedExpr
 	}
 
-	var fetcher row.Fetcher
 	// In general we need all the columns in the index to compute the set
 	// expression. There may be InvertedJoinerSpec.InvertedExpr that are known
 	// to generate only set union expressions, which together with LEFT_SEMI and
@@ -308,27 +312,29 @@ func newInvertedJoiner(
 	// here. For now, we do the simple thing, since we have no idea whether
 	// such workloads actually occur in practice.
 	allIndexCols := util.MakeFastIntSet()
-	for _, colID := range indexColumnIDs {
-		allIndexCols.Add(ij.colIdxMap.GetDefault(colID))
+	for _, col := range indexColumns {
+		if col == nil {
+			continue
+		}
+		allIndexCols.Add(ij.colIdxMap.GetDefault(col.GetID()))
 	}
-	// We use ScanVisibilityPublic since inverted joins are not used for mutations,
-	// and so do not need to see in-progress schema changes.
-	_, _, err = initRowFetcher(
-		flowCtx, &fetcher, ij.desc, int(spec.IndexIdx), ij.colIdxMap, false, /* reverse */
-		allIndexCols, false /* isCheck */, flowCtx.EvalCtx.Mon, &ij.alloc, execinfra.ScanVisibilityPublic,
+	fetcher, err := makeRowFetcherLegacy(
+		flowCtx, ij.desc, int(spec.IndexIdx), false, /* reverse */
+		allIndexCols, flowCtx.EvalCtx.Mon, &ij.alloc,
 		descpb.ScanLockingStrength_FOR_NONE, descpb.ScanLockingWaitPolicy_BLOCK,
 		false /* withSystemColumns */, nil, /* virtualColumn */
 	)
 	if err != nil {
 		return nil, err
 	}
+	ij.row = make(rowenc.EncDatumRow, len(ij.desc.PublicColumns()))
 
 	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		ij.input = newInputStatCollector(ij.input)
-		ij.fetcher = newRowFetcherStatCollector(&fetcher)
+		ij.fetcher = newRowFetcherStatCollector(fetcher)
 		ij.ExecStatsForTrace = ij.execStatsForTrace
 	} else {
-		ij.fetcher = &fetcher
+		ij.fetcher = fetcher
 	}
 
 	ij.spanBuilder = span.MakeBuilder(flowCtx.EvalCtx, flowCtx.Codec(), ij.desc, ij.index)
@@ -517,15 +523,16 @@ func (ij *invertedJoiner) performScan() (invertedJoinerState, *execinfrapb.Produ
 	// Read the entire set of rows that are part of the scan.
 	for {
 		// Fetch the next row and copy it into the row container.
-		scannedRow, _, _, err := ij.fetcher.NextRow(ij.Ctx)
+		ok, err := ij.fetcher.NextRowInto(ij.Ctx, ij.row, ij.colIdxMap)
 		if err != nil {
 			ij.MoveToDraining(scrub.UnwrapScrubError(err))
 			return ijStateUnknown, ij.DrainHelper()
 		}
-		if scannedRow == nil {
+		if !ok {
 			// Done with this input batch.
 			break
 		}
+		scannedRow := ij.row
 		ij.rowsRead++
 
 		// NB: Inverted columns are custom encoded in a manner that does not

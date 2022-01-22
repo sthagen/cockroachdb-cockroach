@@ -59,6 +59,8 @@ go_library(
         "//pkg/sql/protoreflect",
         "//pkg/sql/roleoption",
         "//pkg/sql/rowenc",
+        "//pkg/sql/rowenc/keyside",
+        "//pkg/sql/rowenc/valueside",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
         "//pkg/sql/sessiondatapb",
@@ -93,7 +95,7 @@ go_library(
         "//pkg/util/ulid",
         "//pkg/util/unaccent",
         "//pkg/util/uuid",
-        "@com_github_cockroachdb_apd_v2//:apd",
+        "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_golang_geo//s1",
         "@com_github_knz_strtime//:strtime",
@@ -105,7 +107,7 @@ go_library(
 
 go_test(
     name = "builtins_test",
-    size = "small",
+    size = "medium",
     srcs = [
         "aggregate_builtins_test.go",
         "all_builtins_test.go",
@@ -134,6 +136,7 @@ go_test(
         "//pkg/sql/randgen",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
+        "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",

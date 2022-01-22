@@ -523,7 +523,7 @@ func (c *transientCluster) createAndAddNode(
 	}
 	nodeID := roachpb.NodeID(idx + 1)
 	args := c.demoCtx.testServerArgsForTransientCluster(
-		c.sockForServer(nodeID), nodeID, joinAddr, c.demoDir,
+		c.sockForServer(nodeID, "" /* databaseNameOverride */), nodeID, joinAddr, c.demoDir,
 		c.sqlFirstPort,
 		c.httpFirstPort,
 		c.stickyEngineRegistry,
@@ -944,7 +944,7 @@ func (c *transientCluster) RestartNode(ctx context.Context, nodeID int32) error 
 		return errors.Errorf("restarting nodes is not supported in --%s configurations", cliflags.Global.Name)
 	}
 	args := c.demoCtx.testServerArgsForTransientCluster(
-		c.sockForServer(roachpb.NodeID(nodeID)),
+		c.sockForServer(roachpb.NodeID(nodeID), "" /* databaseNameOverride */),
 		roachpb.NodeID(nodeID),
 		c.firstServer.ServingRPCAddr(), c.demoDir,
 		c.sqlFirstPort, c.httpFirstPort, c.stickyEngineRegistry)
@@ -1117,6 +1117,11 @@ func (demoCtx *Context) generateCerts(certsDir string) (err error) {
 			if err := security.WriteTenantPair(certsDir, pair, false /* overwrite */); err != nil {
 				return err
 			}
+			if err := security.CreateTenantSigningPair(
+				certsDir, demoCtx.DefaultCertLifetime, false /* overwrite */, uint64(i+2),
+			); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1132,13 +1137,18 @@ func (c *transientCluster) getNetworkURLForServer(
 		}
 	}
 	sqlAddr := c.servers[serverIdx].ServingSQLAddr()
+	database := c.defaultDB
 	if isTenant {
 		sqlAddr = c.tenantServers[serverIdx].SQLAddr()
+	}
+	if !isTenant && c.demoCtx.Multitenant {
+		database = catalogkeys.DefaultDatabaseName
 	}
 	host, port, _ := addr.SplitHostPort(sqlAddr, "")
 	u.
 		WithNet(pgurl.NetTCP(host, port)).
-		WithDatabase(c.defaultDB)
+		WithDatabase(database).
+		WithUsername(c.adminUser.Normalized())
 
 	// For a demo cluster we don't use client TLS certs and instead use
 	// password-based authentication with the password pre-filled in the
@@ -1147,7 +1157,6 @@ func (c *transientCluster) getNetworkURLForServer(
 		u.WithInsecure()
 	} else {
 		u.
-			WithUsername(c.adminUser.Normalized()).
 			WithAuthn(pgurl.AuthnPassword(true, c.adminPassword)).
 			WithTransport(pgurl.TransportTLS(pgurl.TLSRequire, ""))
 	}
@@ -1353,11 +1362,17 @@ func (c *transientCluster) AcquireDemoLicense(ctx context.Context) (chan error, 
 // sockForServer generates the metadata for a unix socket for the given node.
 // For example, node 1 gets socket /tmpdemodir/.s.PGSQL.26267,
 // node 2 gets socket /tmpdemodir/.s.PGSQL.26268, etc.
-func (c *transientCluster) sockForServer(nodeID roachpb.NodeID) unixSocketDetails {
+func (c *transientCluster) sockForServer(
+	nodeID roachpb.NodeID, databaseNameOverride string,
+) unixSocketDetails {
 	if !c.useSockets {
 		return unixSocketDetails{}
 	}
 	port := strconv.Itoa(c.sqlFirstPort + int(nodeID) - 1)
+	databaseName := c.defaultDB
+	if databaseNameOverride != "" {
+		databaseName = databaseNameOverride
+	}
 	return unixSocketDetails{
 		socketDir: c.demoDir,
 		port:      port,
@@ -1365,7 +1380,7 @@ func (c *transientCluster) sockForServer(nodeID roachpb.NodeID) unixSocketDetail
 			WithNet(pgurl.NetUnix(c.demoDir, port)).
 			WithUsername(c.adminUser.Normalized()).
 			WithAuthn(pgurl.AuthnPassword(true, c.adminPassword)).
-			WithDatabase(c.defaultDB),
+			WithDatabase(databaseName),
 	}
 }
 
@@ -1445,7 +1460,11 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne bool) {
 		}
 		// Print unix socket if defined.
 		if c.useSockets {
-			sock := c.sockForServer(nodeID)
+			databaseNameOverride := ""
+			if c.demoCtx.Multitenant {
+				databaseNameOverride = catalogkeys.DefaultDatabaseName
+			}
+			sock := c.sockForServer(nodeID, databaseNameOverride)
 			fmt.Fprintln(w, "  (sql/unix)", sock)
 		}
 		fmt.Fprintln(w)

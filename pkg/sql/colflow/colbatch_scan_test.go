@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -77,8 +78,8 @@ func TestColBatchScanMeta(t *testing.T) {
 				Spans: []roachpb.Span{
 					td.PrimaryIndexSpan(keys.SystemSQLCodec),
 				},
-				NeededColumns: []uint32{0},
-				Table:         *td.TableDesc(),
+				Table:     *td.TableDesc(),
+				ColumnIDs: []descpb.ColumnID{td.PublicColumns()[0].GetID()},
 			}},
 		ResultTypes: types.OneIntCol,
 	}
@@ -134,7 +135,10 @@ func BenchmarkColBatchScan(b *testing.B) {
 					TableReader: &execinfrapb.TableReaderSpec{
 						Table: *tableDesc.TableDesc(),
 						// Spans will be set below.
-						NeededColumns: []uint32{0, 1},
+						ColumnIDs: []descpb.ColumnID{
+							tableDesc.PublicColumns()[0].GetID(),
+							tableDesc.PublicColumns()[1].GetID(),
+						},
 					}},
 				ResultTypes: types.TwoIntCols,
 			}

@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,8 +65,8 @@ import (
 func TestRestoreOldVersions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	const (
-		testdataBase                = "testdata/restore_old_versions"
+	testdataBase := testutils.TestDataPath(t, "restore_old_versions")
+	var (
 		exportDirsWithoutInterleave = testdataBase + "/exports-without-interleaved"
 		exportDirs                  = testdataBase + "/exports"
 		fkRevDirs                   = testdataBase + "/fk-rev-history"
@@ -274,6 +276,17 @@ ORDER BY object_type, object_name`, [][]string{
 			exportDir, err := filepath.Abs(filepath.Join(publicSchemaDirs, dir.Name()))
 			require.NoError(t, err)
 			t.Run(dir.Name(), restoreSyntheticPublicSchemaNamespaceEntry(exportDir))
+		}
+	})
+
+	t.Run("missing_public_schema_namespace_entry_cleanup_on_fail", func(t *testing.T) {
+		dirs, err := ioutil.ReadDir(publicSchemaDirs)
+		require.NoError(t, err)
+		for _, dir := range dirs {
+			require.True(t, dir.IsDir())
+			exportDir, err := filepath.Abs(filepath.Join(publicSchemaDirs, dir.Name()))
+			require.NoError(t, err)
+			t.Run(dir.Name(), restoreSyntheticPublicSchemaNamespaceEntryCleanupOnFail(exportDir))
 		}
 	})
 }
@@ -655,7 +668,7 @@ func TestRestoreOldBackupMissingOfflineIndexes(t *testing.T) {
 	skip.UnderRace(t, "times out under race cause it starts up two test servers")
 	ctx := context.Background()
 
-	badBackups, err := filepath.Abs("testdata/restore_old_versions/inc_missing_addsst/v20.2.7")
+	badBackups, err := filepath.Abs(testutils.TestDataPath(t, "restore_old_versions", "inc_missing_addsst", "v20.2.7"))
 	require.NoError(t, err)
 	args := base.TestServerArgs{ExternalIODir: badBackups}
 	backupDirs := make([]string, 9)
@@ -728,10 +741,10 @@ func TestRestoreWithDroppedSchemaCorruption(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
+	backupDir := testutils.TestDataPath(t, "restore_with_dropped_schema", "exports", "v20.2.7")
 	const (
-		dbName    = "foo"
-		backupDir = "testdata/restore_with_dropped_schema/exports/v20.2.7"
-		fromDir   = "nodelocal://0/"
+		dbName  = "foo"
+		fromDir = "nodelocal://0/"
 	)
 
 	args := base.TestServerArgs{ExternalIODir: backupDir}
@@ -918,5 +931,52 @@ func restoreSyntheticPublicSchemaNamespaceEntry(exportDir string) func(t *testin
 		row.Scan(&dbID)
 
 		sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT id FROM system.namespace WHERE name = 'public' AND "parentID"=%d`, dbID), [][]string{{"29"}})
+	}
+}
+
+func restoreSyntheticPublicSchemaNamespaceEntryCleanupOnFail(exportDir string) func(t *testing.T) {
+	return func(t *testing.T) {
+		const numAccounts = 1000
+		_, _, tmpDir, cleanupFn := BackupRestoreTestSetup(t, MultiNode, numAccounts, InitManualReplication)
+		defer cleanupFn()
+
+		tc, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
+			InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+						Server: &server.TestingKnobs{
+							DisableAutomaticVersionUpgrade: 1,
+							BinaryVersionOverride:          clusterversion.ByKey(clusterversion.PublicSchemasWithDescriptors - 1),
+						},
+					},
+				}})
+		defer cleanup()
+		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
+		require.NoError(t, err)
+
+		for _, server := range tc.Servers {
+			registry := server.JobRegistry().(*jobs.Registry)
+			registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+				jobspb.TypeRestore: func(raw jobs.Resumer) jobs.Resumer {
+					r := raw.(*restoreResumer)
+					r.testingKnobs.beforePublishingDescriptors = func() error {
+						return errors.New("boom")
+					}
+					return r
+				},
+			}
+		}
+
+		// Drop the default databases so only the system database remains.
+		sqlDB.Exec(t, "DROP DATABASE defaultdb")
+		sqlDB.Exec(t, "DROP DATABASE postgres")
+
+		restoreQuery := fmt.Sprintf("RESTORE DATABASE d FROM '%s'", LocalFoo)
+		sqlDB.ExpectErr(t, "boom", restoreQuery)
+
+		// We should have no non-system database with a public schema name space
+		// entry with id 29.
+		sqlDB.CheckQueryResults(t, `SELECT id FROM system.namespace WHERE name = 'public' AND id=29 AND "parentID"!=1`, [][]string{})
 	}
 }

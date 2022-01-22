@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -48,7 +48,7 @@ func MakeInserter(
 	codec keys.SQLCodec,
 	tableDesc catalog.TableDescriptor,
 	insertCols []catalog.Column,
-	alloc *rowenc.DatumAlloc,
+	alloc *tree.DatumAlloc,
 	sv *settings.Values,
 	internal bool,
 	metrics *Metrics,
@@ -143,10 +143,13 @@ func (ri *Inserter) InsertRow(
 	// Encode the values to the expected column type. This needs to
 	// happen before index encoding because certain datum types (i.e. tuple)
 	// cannot be used as index values.
+	//
+	// TODO(radu): the legacy marshaling is used only in rare cases; this is
+	// wasteful.
 	for i, val := range values {
 		// Make sure the value can be written to the column before proceeding.
 		var err error
-		if ri.marshaled[i], err = rowenc.MarshalColumnValue(ri.InsertCols[i], val); err != nil {
+		if ri.marshaled[i], err = valueside.MarshalLegacy(ri.InsertCols[i].GetType(), val); err != nil {
 			return err
 		}
 	}
@@ -188,7 +191,13 @@ func (ri *Inserter) InsertRow(
 		if ok {
 			for i := range entries {
 				e := &entries[i]
-				putFn(ctx, b, &e.Key, &e.Value, traceKV)
+
+				// We don't want to check any conflicts when trying to preserve deletes.
+				if ri.Helper.Indexes[idx].UseDeletePreservingEncoding() {
+					insertPutFn(ctx, b, &e.Key, &e.Value, traceKV)
+				} else {
+					putFn(ctx, b, &e.Key, &e.Value, traceKV)
+				}
 			}
 		}
 	}

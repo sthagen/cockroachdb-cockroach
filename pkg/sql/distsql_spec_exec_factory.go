@@ -12,6 +12,7 @@ package sql
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
@@ -191,12 +191,16 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 	sb := span.MakeBuilder(e.planner.EvalContext(), e.planner.ExecCfg().Codec, tabDesc, idx)
 	defer sb.Release()
 
-	// Note that initColsForScan and setting ResultColumns below are equivalent
-	// to what scan.initTable call does in execFactory.ConstructScan.
-	cols, err := initColsForScan(tabDesc, colCfg)
-	if err != nil {
-		return nil, err
+	cols := make([]catalog.Column, 0, params.NeededCols.Len())
+	allCols := tabDesc.AllColumns()
+	for ord, ok := params.NeededCols.Next(0); ok; ord, ok = params.NeededCols.Next(ord + 1) {
+		cols = append(cols, allCols[ord])
 	}
+	columnIDs := make([]descpb.ColumnID, len(cols))
+	for i := range cols {
+		columnIDs[i] = cols[i].GetID()
+	}
+
 	p.ResultColumns = colinfo.ResultColumnsFromColumns(tabDesc.GetID(), cols)
 
 	if params.IndexConstraint != nil && params.IndexConstraint.IsContradiction() {
@@ -207,6 +211,7 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 	}
 
 	var spans roachpb.Spans
+	var err error
 	if params.InvertedConstraint != nil {
 		spans, err = sb.SpansFromInvertedSpans(params.InvertedConstraint, params.IndexConstraint, nil /* scratch */)
 	} else {
@@ -230,17 +235,13 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 
 	// Phase 2: perform the table reader planning. This phase is equivalent to
 	// what DistSQLPlanner.createTableReaders does.
-	colsToTableOrdinalMap := toTableOrdinals(cols, tabDesc, colCfg.visibility)
 	trSpec := physicalplan.NewTableReaderSpec()
 	*trSpec = execinfrapb.TableReaderSpec{
-		Table:            *tabDesc.TableDesc(),
-		Reverse:          params.Reverse,
-		IsCheck:          false,
-		Visibility:       colCfg.visibility,
-		HasSystemColumns: scanContainsSystemColumns(&colCfg),
-		NeededColumns:    colCfg.wantedColumnsOrdinals,
+		Table:     *tabDesc.TableDesc(),
+		Reverse:   params.Reverse,
+		ColumnIDs: columnIDs,
 	}
-	if vc := getInvertedColumn(colCfg.invertedColumn, cols); vc != nil {
+	if vc := getInvertedColumn(colCfg.invertedColumnID, cols); vc != nil {
 		trSpec.InvertedColumn = vc.ColumnDesc()
 	}
 
@@ -274,18 +275,15 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 		e.getPlanCtx(recommendation),
 		p,
 		&tableReaderPlanningInfo{
-			spec:                  trSpec,
-			post:                  post,
-			desc:                  tabDesc,
-			spans:                 spans,
-			reverse:               params.Reverse,
-			scanVisibility:        colCfg.visibility,
-			parallelize:           params.Parallelize,
-			estimatedRowCount:     uint64(params.EstimatedRowCount),
-			reqOrdering:           ReqOrdering(reqOrdering),
-			cols:                  cols,
-			colsToTableOrdinalMap: colsToTableOrdinalMap,
-			containsSystemColumns: trSpec.HasSystemColumns,
+			spec:              trSpec,
+			post:              post,
+			desc:              tabDesc,
+			spans:             spans,
+			reverse:           params.Reverse,
+			parallelize:       params.Parallelize,
+			estimatedRowCount: uint64(params.EstimatedRowCount),
+			reqOrdering:       ReqOrdering(reqOrdering),
+			cols:              cols,
 		},
 	)
 
@@ -693,11 +691,7 @@ func (e *distSQLSpecExecFactory) constructZigzagJoinSide(
 	desc := table.(*optTable).desc
 	colCfg := scanColumnsConfig{wantedColumns: make([]tree.ColumnID, 0, wantedCols.Len())}
 	for c, ok := wantedCols.Next(0); ok; c, ok = wantedCols.Next(c + 1) {
-		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(desc.PublicColumns()[c].GetID()))
-	}
-	ctx := e.planner.extendedEvalCtx.Ctx()
-	if err := e.planner.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
-		return zigzagPlanningSide{}, err
+		colCfg.wantedColumns = append(colCfg.wantedColumns, desc.PublicColumns()[c].GetID())
 	}
 	cols, err := initColsForScan(desc, colCfg)
 	if err != nil {

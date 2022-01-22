@@ -1033,11 +1033,20 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	// See https://www.postgresql.org/docs/12/runtime-config-client.html.
+	`default_table_access_method`: makeCompatStringVar(`default_table_access_method`, `heap`),
+
 	// See https://www.postgresql.org/docs/13/runtime-config-compatible.html
 	// CockroachDB only supports safe_encoding for now. If `client_encoding` is updated to
 	// allow encodings other than UTF8, then the default value of `backslash_quote` should
 	// be changed to `on`.
 	`backslash_quote`: makeCompatStringVar(`backslash_quote`, `safe_encoding`),
+
+	// See https://www.postgresql.org/docs/9.5/runtime-config-compatible.html
+	`default_with_oids`: makeCompatBoolVar(`default_with_oids`, false, false),
+
+	// See https://www.postgresql.org/docs/current/datatype-xml.html.
+	`xmloption`: makeCompatStringVar(`xmloption`, `content`),
 
 	// Supported for PG compatibility only.
 	// See https://www.postgresql.org/docs/10/static/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
@@ -1080,6 +1089,23 @@ var varGen = map[string]sessionVar{
 			return nil
 		},
 		GlobalDefault: globalFalse,
+	},
+
+	// See https://www.postgresql.org/docs/13/runtime-config-client.html.
+	`check_function_bodies`: {
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().CheckFunctionBodies), nil
+		},
+		GetStringVal: makePostgresBoolGetStringValFn("check_function_bodies"),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("check_function_bodies", s)
+			if err != nil {
+				return err
+			}
+			m.SetCheckFunctionBodies(b)
+			return nil
+		},
+		GlobalDefault: globalTrue,
 	},
 
 	// CockroachDB extension.
@@ -1233,6 +1259,15 @@ var varGen = map[string]sessionVar{
 		Hidden: true,
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return evalCtx.SessionData().User().Normalized(), nil
+		},
+	},
+
+	// See https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION
+	// We only support reading this setting in clients: it is not desirable to let clients choose
+	// their own password hash algorithm.
+	`password_encryption`: {
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return security.GetConfiguredPasswordHashMethod(evalCtx.Ctx(), &evalCtx.Settings.SV).String(), nil
 		},
 	},
 

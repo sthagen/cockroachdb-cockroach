@@ -46,13 +46,14 @@ go_library(
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_gogo_protobuf//types",
-        "@com_github_gorhill_cronexpr//:cronexpr",
+        "@com_github_robfig_cron_v3//:cron",
     ],
 )
 
 go_test(
     name = "persistedsqlstats_test",
     srcs = [
+        "bench_test.go",
         "compaction_test.go",
         "controller_test.go",
         "datadriven_test.go",
@@ -86,6 +87,7 @@ go_test(
         "//pkg/sql/tests",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/encoding",

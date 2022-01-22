@@ -75,7 +75,7 @@ func TestClusterFlow(t *testing.T) {
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	makeIndexSpan := func(start, end int) roachpb.Span {
 		var span roachpb.Span
-		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PublicNonPrimaryIndexes()[0].GetID()))
+		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc.GetID(), desc.PublicNonPrimaryIndexes()[0].GetID()))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -104,24 +104,24 @@ func TestClusterFlow(t *testing.T) {
 		leafInputState := txn.GetLeafTxnInputState(ctx)
 
 		tr1 := execinfrapb.TableReaderSpec{
-			Table:         *desc.TableDesc(),
-			IndexIdx:      1,
-			Spans:         []roachpb.Span{makeIndexSpan(0, 8)},
-			NeededColumns: []uint32{0, 1},
+			Table:     *desc.TableDesc(),
+			IndexIdx:  1,
+			Spans:     []roachpb.Span{makeIndexSpan(0, 8)},
+			ColumnIDs: []descpb.ColumnID{1, 2},
 		}
 
 		tr2 := execinfrapb.TableReaderSpec{
-			Table:         *desc.TableDesc(),
-			IndexIdx:      1,
-			Spans:         []roachpb.Span{makeIndexSpan(8, 12)},
-			NeededColumns: []uint32{0, 1},
+			Table:     *desc.TableDesc(),
+			IndexIdx:  1,
+			Spans:     []roachpb.Span{makeIndexSpan(8, 12)},
+			ColumnIDs: []descpb.ColumnID{1, 2},
 		}
 
 		tr3 := execinfrapb.TableReaderSpec{
-			Table:         *desc.TableDesc(),
-			IndexIdx:      1,
-			Spans:         []roachpb.Span{makeIndexSpan(12, 100)},
-			NeededColumns: []uint32{0, 1},
+			Table:     *desc.TableDesc(),
+			IndexIdx:  1,
+			Spans:     []roachpb.Span{makeIndexSpan(12, 100)},
+			ColumnIDs: []descpb.ColumnID{1, 2},
 		}
 
 		fid := execinfrapb.FlowID{UUID: uuid.MakeV4()}
@@ -134,10 +134,6 @@ func TestClusterFlow(t *testing.T) {
 				Processors: []execinfrapb.ProcessorSpec{{
 					ProcessorID: 1,
 					Core:        execinfrapb.ProcessorCoreUnion{TableReader: &tr1},
-					Post: execinfrapb.PostProcessSpec{
-						Projection:    true,
-						OutputColumns: []uint32{0, 1},
-					},
 					Output: []execinfrapb.OutputRouterSpec{{
 						Type: execinfrapb.OutputRouterSpec_PASS_THROUGH,
 						Streams: []execinfrapb.StreamEndpointSpec{
@@ -157,10 +153,6 @@ func TestClusterFlow(t *testing.T) {
 				Processors: []execinfrapb.ProcessorSpec{{
 					ProcessorID: 2,
 					Core:        execinfrapb.ProcessorCoreUnion{TableReader: &tr2},
-					Post: execinfrapb.PostProcessSpec{
-						Projection:    true,
-						OutputColumns: []uint32{0, 1},
-					},
 					Output: []execinfrapb.OutputRouterSpec{{
 						Type: execinfrapb.OutputRouterSpec_PASS_THROUGH,
 						Streams: []execinfrapb.StreamEndpointSpec{
@@ -181,10 +173,6 @@ func TestClusterFlow(t *testing.T) {
 					{
 						ProcessorID: 3,
 						Core:        execinfrapb.ProcessorCoreUnion{TableReader: &tr3},
-						Post: execinfrapb.PostProcessSpec{
-							Projection:    true,
-							OutputColumns: []uint32{0, 1},
-						},
 						Output: []execinfrapb.OutputRouterSpec{{
 							Type: execinfrapb.OutputRouterSpec_PASS_THROUGH,
 							Streams: []execinfrapb.StreamEndpointSpec{
@@ -799,7 +787,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 						if len(rows) != numNodes*numRows {
 							b.Errorf("got %d rows, expected %d", len(rows), numNodes*numRows)
 						}
-						var a rowenc.DatumAlloc
+						var a tree.DatumAlloc
 						for i := range rows {
 							if err := rows[i][0].EnsureDecoded(types.Int, &a); err != nil {
 								b.Fatal(err)

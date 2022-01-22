@@ -362,7 +362,7 @@ SELECT has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'test
 ----
 true  true  true  true
 
-query error pgcode 3D000 database 'does_not_exist' does not exist
+query error pgcode 3D000 database "does_not_exist" does not exist
 SELECT has_database_privilege('does_not_exist', 'CREATE')
 
 query BBBBB
@@ -733,7 +733,7 @@ true  true  true
 query error pgcode 42P01 relation "does_not_exist" does not exist
 SELECT has_sequence_privilege('does_not_exist', 'SELECT')
 
-query error pgcode 42809 't' is not a sequence
+query error pgcode 42809 "t" is not a sequence
 SELECT has_sequence_privilege('t', 'SELECT')
 
 query BBB

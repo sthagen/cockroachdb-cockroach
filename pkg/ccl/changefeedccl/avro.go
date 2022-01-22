@@ -13,7 +13,8 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -160,7 +161,7 @@ type avroDataRecord struct {
 	// Allocate Go native representation once, to avoid repeated map allocation
 	// when encoding.
 	native map[string]interface{}
-	alloc  rowenc.DatumAlloc
+	alloc  tree.DatumAlloc
 }
 
 // avroMetadata is the `avroEnvelopeRecord` metadata.
@@ -754,7 +755,10 @@ const (
 // If a name suffix is provided (as opposed to avroSchemaNoSuffix), it will be
 // appended to the end of the avro record's name.
 func tableToAvroSchema(
-	tableDesc catalog.TableDescriptor, nameSuffix string, namespace string,
+	tableDesc catalog.TableDescriptor,
+	nameSuffix string,
+	namespace string,
+	virtualColumnVisibility string,
 ) (*avroDataRecord, error) {
 	name := SQLNameToAvroName(tableDesc.GetName())
 	if nameSuffix != avroSchemaNoSuffix {
@@ -771,6 +775,9 @@ func tableToAvroSchema(
 		fieldIdxByColIdx: make(map[int]int),
 	}
 	for _, col := range tableDesc.PublicColumns() {
+		if col.IsVirtual() && virtualColumnVisibility == string(changefeedbase.OptVirtualColumnsOmitted) {
+			continue
+		}
 		field, err := columnToAvroSchema(col)
 		if err != nil {
 			return nil, err
@@ -1015,12 +1022,13 @@ func decimalToRat(dec apd.Decimal, scale int32) (big.Rat, error) {
 	if dec.Exponent >= 0 {
 		exp := big.NewInt(10)
 		exp = exp.Exp(exp, big.NewInt(int64(dec.Exponent)), nil)
-		var coeff big.Int
-		r.SetFrac(coeff.Mul(&dec.Coeff, exp), big.NewInt(1))
+		coeff := dec.Coeff.MathBigInt()
+		r.SetFrac(coeff.Mul(coeff, exp), big.NewInt(1))
 	} else {
 		exp := big.NewInt(10)
 		exp = exp.Exp(exp, big.NewInt(int64(-dec.Exponent)), nil)
-		r.SetFrac(&dec.Coeff, exp)
+		coeff := dec.Coeff.MathBigInt()
+		r.SetFrac(coeff, exp)
 	}
 	if dec.Negative {
 		r.Mul(&r, big.NewRat(-1, 1))
@@ -1036,7 +1044,8 @@ func ratToDecimal(rat big.Rat, scale int32) apd.Decimal {
 	exp := big.NewInt(10)
 	exp = exp.Exp(exp, big.NewInt(int64(scale)), nil)
 	sf := denom.Div(exp, denom)
-	coeff := num.Mul(num, sf)
-	dec := apd.NewWithBigInt(coeff, -scale)
+	var coeff apd.BigInt
+	coeff.SetMathBigInt(num.Mul(num, sf))
+	dec := apd.NewWithBigInt(&coeff, -scale)
 	return *dec
 }

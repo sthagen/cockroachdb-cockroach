@@ -17,15 +17,17 @@ import (
 	"io"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
 )
@@ -805,12 +807,23 @@ func getRangesBeforeAndAfter(
 		return rangeBefore, rangeAfter, true
 
 	case types.TimeTZFamily:
-		lowerBefore := beforeLowerBound.(*tree.DTimeTZ).TimeOfDay
-		upperBefore := beforeUpperBound.(*tree.DTimeTZ).TimeOfDay
-		lowerAfter := afterLowerBound.(*tree.DTimeTZ).TimeOfDay
-		upperAfter := afterUpperBound.(*tree.DTimeTZ).TimeOfDay
-		rangeBefore = float64(upperBefore) - float64(lowerBefore)
-		rangeAfter = float64(upperAfter) - float64(lowerAfter)
+		// timeTZOffsetSecsRange is the total number of possible values for offset.
+		timeTZOffsetSecsRange := timetz.MaxTimeTZOffsetSecs - timetz.MinTimeTZOffsetSecs + 1
+
+		// Find the ranges in microseconds based on the absolute times of the range
+		// boundaries.
+		lowerBefore := beforeLowerBound.(*tree.DTimeTZ)
+		upperBefore := beforeUpperBound.(*tree.DTimeTZ)
+		lowerAfter := afterLowerBound.(*tree.DTimeTZ)
+		upperAfter := afterUpperBound.(*tree.DTimeTZ)
+		rangeBefore = float64(upperBefore.ToTime().Sub(lowerBefore.ToTime()) / time.Microsecond)
+		rangeAfter = float64(upperAfter.ToTime().Sub(lowerAfter.ToTime()) / time.Microsecond)
+
+		// Account for the offset.
+		rangeBefore *= float64(timeTZOffsetSecsRange)
+		rangeAfter *= float64(timeTZOffsetSecsRange)
+		rangeBefore += float64(upperBefore.OffsetSecs - lowerBefore.OffsetSecs)
+		rangeAfter += float64(upperAfter.OffsetSecs - lowerAfter.OffsetSecs)
 		return rangeBefore, rangeAfter, true
 
 	case types.StringFamily, types.BytesFamily, types.UuidFamily, types.INetFamily:
@@ -824,7 +837,7 @@ func getRangesBeforeAndAfter(
 		for i := range boundArr {
 			var err error
 			// Encode each bound value into a sortable byte format.
-			boundArrByte[i], err = rowenc.EncodeTableKey(nil, boundArr[i], encoding.Ascending)
+			boundArrByte[i], err = keyside.Encode(nil, boundArr[i], encoding.Ascending)
 			if err != nil {
 				return 0, 0, false
 			}

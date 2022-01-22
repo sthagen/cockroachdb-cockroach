@@ -19,9 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
@@ -49,7 +49,7 @@ type tableReader struct {
 	// fetcher wraps a row.Fetcher, allowing the tableReader to add a stat
 	// collection layer.
 	fetcher rowFetcher
-	alloc   rowenc.DatumAlloc
+	alloc   tree.DatumAlloc
 
 	scanStats execinfra.ScanStats
 
@@ -103,22 +103,22 @@ func newTableReader(
 	tr.batchBytesLimit = batchBytesLimit
 	tr.maxTimestampAge = time.Duration(spec.MaxTimestampAgeNanos)
 
-	tableDesc := spec.BuildTableDescriptor()
-	invertedColumn := tabledesc.FindInvertedColumn(tableDesc, spec.InvertedColumn)
-	cols := tableDesc.PublicColumns()
-	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		cols = tableDesc.DeletableColumns()
-	}
-	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
-	resultTypes := catalog.ColumnTypesWithInvertedCol(cols, invertedColumn)
+	tableDesc := flowCtx.TableDescriptor(&spec.Table)
 
-	// Add all requested system columns to the output.
-	if spec.HasSystemColumns {
-		for _, sysCol := range tableDesc.SystemColumns() {
-			resultTypes = append(resultTypes, sysCol.GetType())
-			columnIdxMap.Set(sysCol.GetID(), columnIdxMap.Len())
+	cols := make([]catalog.Column, len(spec.ColumnIDs))
+	for i, colID := range spec.ColumnIDs {
+		if spec.InvertedColumn != nil && colID == spec.InvertedColumn.ID {
+			cols[i] = tabledesc.FindInvertedColumn(tableDesc, spec.InvertedColumn)
+		} else {
+			var err error
+			cols[i], err = tableDesc.FindColumnWithID(colID)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
+
+	resultTypes := catalog.ColumnTypes(cols)
 
 	tr.ignoreMisplannedRanges = flowCtx.Local
 	if err := tr.Init(
@@ -141,26 +141,18 @@ func newTableReader(
 		return nil, err
 	}
 
-	neededColumns := tr.OutputHelper.NeededColumns()
-
-	var fetcher row.Fetcher
-	if _, _, err := initRowFetcher(
+	fetcher, err := makeRowFetcher(
 		flowCtx,
-		&fetcher,
 		tableDesc,
 		int(spec.IndexIdx),
-		columnIdxMap,
+		cols,
 		spec.Reverse,
-		neededColumns,
-		spec.IsCheck,
 		flowCtx.EvalCtx.Mon,
 		&tr.alloc,
-		spec.Visibility,
 		spec.LockingStrength,
 		spec.LockingWaitPolicy,
-		spec.HasSystemColumns,
-		invertedColumn,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 
@@ -172,10 +164,10 @@ func newTableReader(
 	}
 
 	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
-		tr.fetcher = newRowFetcherStatCollector(&fetcher)
+		tr.fetcher = newRowFetcherStatCollector(fetcher)
 		tr.ExecStatsForTrace = tr.execStatsForTrace
 	} else {
-		tr.fetcher = &fetcher
+		tr.fetcher = fetcher
 	}
 
 	return tr, nil
@@ -273,7 +265,7 @@ func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 			return nil, meta
 		}
 
-		row, _, _, err := tr.fetcher.NextRow(tr.Ctx)
+		row, err := tr.fetcher.NextRow(tr.Ctx)
 		if row == nil || err != nil {
 			tr.MoveToDraining(err)
 			break

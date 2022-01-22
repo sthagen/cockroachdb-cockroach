@@ -13,6 +13,8 @@ package execinfrapb
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
@@ -110,7 +112,7 @@ type ExprHelper struct {
 
 	Types      []*types.T
 	Row        rowenc.EncDatumRow
-	datumAlloc rowenc.DatumAlloc
+	datumAlloc tree.DatumAlloc
 }
 
 func (eh *ExprHelper) String() string {
@@ -181,6 +183,13 @@ func (eh *ExprHelper) Init(
 		// Bind IndexedVars to our eh.Vars.
 		eh.Vars.Rebind(eh.Expr)
 		return nil
+	}
+	if semaCtx.TypeResolver != nil {
+		for _, t := range types {
+			if err := typedesc.EnsureTypeIsHydrated(evalCtx.Context, t, semaCtx.TypeResolver.(catalog.TypeDescriptorResolver)); err != nil {
+				return err
+			}
+		}
 	}
 	var err error
 	eh.Expr, err = DeserializeExpr(expr.Expr, semaCtx, evalCtx, &eh.Vars)

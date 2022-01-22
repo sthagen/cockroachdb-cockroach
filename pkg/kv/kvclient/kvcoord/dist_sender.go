@@ -172,6 +172,8 @@ var rangeDescriptorCacheSize = settings.RegisterIntSetting(
 	1e6,
 )
 
+// senderConcurrencyLimit controls the maximum number of asynchronous send
+// requests.
 var senderConcurrencyLimit = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"kv.dist_sender.concurrency_limit",
@@ -1318,7 +1320,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			// one, and unless both descriptors are stale, the next descriptor's
 			// StartKey would move us to the beginning of the current range,
 			// resulting in a duplicate scan.
-			seekKey, err = next(ba.Requests, ri.Desc().EndKey)
+			seekKey, err = Next(ba.Requests, ri.Desc().EndKey)
 			nextRS.Key = seekKey
 		}
 		if err != nil {
@@ -1367,11 +1369,8 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				// might be passed recursively to further divideAndSendBatchToRanges()
 				// calls.
 				if ba.MaxSpanRequestKeys > 0 {
-					if replyKeys > ba.MaxSpanRequestKeys {
-						log.Fatalf(ctx, "received %d results, limit was %d", replyKeys, ba.MaxSpanRequestKeys)
-					}
 					ba.MaxSpanRequestKeys -= replyKeys
-					if ba.MaxSpanRequestKeys == 0 {
+					if ba.MaxSpanRequestKeys <= 0 {
 						couldHaveSkippedResponses = true
 						resumeReason = roachpb.RESUME_KEY_LIMIT
 						return
@@ -1509,7 +1508,7 @@ func (ds *DistSender) sendPartialBatch(
 		if err != nil {
 			return response{pErr: roachpb.NewError(err)}
 		}
-		ba.Requests, positions, err = truncate(ba.Requests, rs)
+		ba.Requests, positions, err = Truncate(ba.Requests, rs)
 		if len(positions) == 0 && err == nil {
 			// This shouldn't happen in the wild, but some tests exercise it.
 			return response{

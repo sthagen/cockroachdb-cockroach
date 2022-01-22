@@ -394,12 +394,12 @@ func TestChangefeedFullTableName(t *testing.T) {
 			assertPayloads(t, foo, []string{`d.public.foo: [1]->{"after": {"a": 1, "b": "a"}}`})
 		})
 	}
-	//TODO(zinger): Plumb this option through to all encoders so it works in sinkless mode
-	//t.Run(`sinkless`, sinklessTest(testFn))
+	// TODO(zinger): Plumb this option through to all encoders so it works in sinkless mode
+	// t.Run(`sinkless`, sinklessTest(testFn))
 	t.Run(`enterprise`, enterpriseTest(testFn))
 	t.Run(`kafka`, kafkaTest(testFn))
 	t.Run(`webhook`, webhookTest(testFn))
-	//t.Run(`pubsub`, pubsubTest(testFn))
+	// t.Run(`pubsub`, pubsubTest(testFn))
 }
 
 func TestChangefeedMultiTable(t *testing.T) {
@@ -2285,30 +2285,69 @@ func TestChangefeedVirtualComputedColumn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
-		sqlDB.Exec(t, `CREATE TABLE cc (
-		a INT primary key, b INT, c INT AS (b + 1) VIRTUAL NOT NULL
-	)`)
-		sqlDB.Exec(t, `INSERT INTO cc VALUES (1, 1)`)
-
-		cc := feed(t, f, `CREATE CHANGEFEED FOR cc with diff`)
-		defer closeFeed(t, cc)
-
-		assertPayloads(t, cc, []string{
-			`cc: [1]->{"after": {"a": 1, "b": 1, "c": null}, "before": null}`,
-		})
-
-		sqlDB.Exec(t, `UPDATE cc SET b=10 WHERE a=1`)
-		assertPayloads(t, cc, []string{
-			`cc: [1]->{"after": {"a": 1, "b": 10, "c": null}, "before": {"a": 1, "b": 1, "c": null}}`,
-		})
+	tests := map[string]struct {
+		formatOpt               changefeedbase.FormatType
+		virtualColumnVisibility changefeedbase.VirtualColumnVisibility
+		changeFeedStmt          string
+		payloadAfterInsert      []string
+		payloadAfterUpdate      []string
+	}{
+		`format="json",virtual_columns="omitted"`: {
+			formatOpt:               changefeedbase.OptFormatJSON,
+			virtualColumnVisibility: changefeedbase.OptVirtualColumnsOmitted,
+			payloadAfterInsert:      []string{`cc: [1]->{"after": {"a": 1, "b": 1}, "before": null}`},
+			payloadAfterUpdate:      []string{`cc: [1]->{"after": {"a": 1, "b": 10}, "before": {"a": 1, "b": 1}}`},
+		},
+		`format="json",virtual_columns="null"`: {
+			formatOpt:               changefeedbase.OptFormatJSON,
+			virtualColumnVisibility: changefeedbase.OptVirtualColumnsNull,
+			payloadAfterInsert:      []string{`cc: [1]->{"after": {"a": 1, "b": 1, "c": null}, "before": null}`},
+			payloadAfterUpdate:      []string{`cc: [1]->{"after": {"a": 1, "b": 10, "c": null}, "before": {"a": 1, "b": 1, "c": null}}`},
+		},
+		`format="avro",virtual_columns="omitted"`: {
+			formatOpt:               changefeedbase.OptFormatAvro,
+			virtualColumnVisibility: changefeedbase.OptVirtualColumnsOmitted,
+			payloadAfterInsert:      []string{`cc: {"a":{"long":1}}->{"after":{"cc":{"a":{"long":1},"b":{"long":1}}},"before":null}`},
+			payloadAfterUpdate:      []string{`cc: {"a":{"long":1}}->{"after":{"cc":{"a":{"long":1},"b":{"long":10}}},"before":{"cc_before":{"a":{"long":1},"b":{"long":1}}}}`},
+		},
+		`format="avro",virtual_columns="null"`: {
+			formatOpt:               changefeedbase.OptFormatAvro,
+			virtualColumnVisibility: changefeedbase.OptVirtualColumnsNull,
+			payloadAfterInsert:      []string{`cc: {"a":{"long":1}}->{"after":{"cc":{"a":{"long":1},"b":{"long":1},"c":null}},"before":null}`},
+			payloadAfterUpdate:      []string{`cc: {"a":{"long":1}}->{"after":{"cc":{"a":{"long":1},"b":{"long":10},"c":null}},"before":{"cc_before":{"a":{"long":1},"b":{"long":1},"c":null}}}`},
+		},
 	}
 
-	t.Run(`sinkless`, sinklessTest(testFn))
-	t.Run(`enterprise`, enterpriseTest(testFn))
-	t.Run(`kafka`, kafkaTest(testFn))
-	t.Run(`webhook`, webhookTest(testFn))
+	for _, test := range tests {
+		testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+			sqlDB := sqlutils.MakeSQLRunner(db)
+
+			sqlDB.Exec(t, `CREATE TABLE cc (
+					a INT primary key, b INT, c INT AS (b + 1) VIRTUAL NOT NULL
+				)`)
+			defer sqlDB.Exec(t, `DROP TABLE cc`)
+
+			sqlDB.Exec(t, `INSERT INTO cc VALUES (1, 1)`)
+
+			changeFeed := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR cc WITH diff, format="%s", virtual_columns="%s"`,
+				test.formatOpt, test.virtualColumnVisibility))
+			defer closeFeed(t, changeFeed)
+
+			assertPayloads(t, changeFeed, test.payloadAfterInsert)
+
+			sqlDB.Exec(t, `UPDATE cc SET b=10 WHERE a=1`)
+
+			assertPayloads(t, changeFeed, test.payloadAfterUpdate)
+		}
+
+		if test.formatOpt != changefeedbase.OptFormatAvro {
+			t.Run(`sinkless`, sinklessTest(testFn))
+			t.Run(`enterprise`, enterpriseTest(testFn))
+			t.Run(`webhook`, webhookTest(testFn))
+		}
+
+		t.Run(`kafka`, kafkaTest(testFn))
+	}
 }
 
 func TestChangefeedUpdatePrimaryKey(t *testing.T) {
@@ -2417,7 +2456,7 @@ func TestChangefeedTruncateOrDrop(t *testing.T) {
 	t.Run(`kafka`, kafkaTest(testFn))
 	t.Run(`webhook`, webhookTest(testFn))
 	t.Run(`pubsub`, pubsubTest(testFn))
-	//will sometimes fail, non deterministic
+	// will sometimes fail, non deterministic
 }
 
 func TestChangefeedMonitoring(t *testing.T) {
@@ -3332,6 +3371,16 @@ func TestChangefeedErrors(t *testing.T) {
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH updated, webhook_sink_config='{"Retry":{"Max":"inf"}}'`,
 		`webhook-https://fake-host`,
 	)
+	sqlDB.ExpectErr(
+		t, `client_cert requires client_key to be set`,
+		`CREATE CHANGEFEED FOR foo INTO $1`,
+		`webhook-https://fake-host?client_cert=Zm9v`,
+	)
+	sqlDB.ExpectErr(
+		t, `client_key requires client_cert to be set`,
+		`CREATE CHANGEFEED FOR foo INTO $1`,
+		`webhook-https://fake-host?client_key=Zm9v`,
+	)
 
 	// Sanity check on_error option
 	sqlDB.ExpectErr(
@@ -3371,7 +3420,8 @@ func TestChangefeedDescription(t *testing.T) {
 	sqlDB.QueryRow(t,
 		`SELECT description FROM [SHOW JOBS] WHERE job_id = $1`, jobID,
 	).Scan(&description)
-	expected := `CREATE CHANGEFEED FOR TABLE foo INTO '` + sink.String() +
+	redactedSink := strings.Replace(sink.String(), security.RootUser, `redacted`, 1)
+	expected := `CREATE CHANGEFEED FOR TABLE foo INTO '` + redactedSink +
 		`' WITH envelope = 'wrapped', updated`
 	require.Equal(t, expected, description)
 }
@@ -3578,8 +3628,8 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 		func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 			defer close(done)
 			sqlDB := sqlutils.MakeSQLRunner(db)
-			sqlDB.Exec(t, `ALTER RANGE default CONFIGURE ZONE USING gc.ttlseconds = 1`)
-			sqlDB.Exec(t, `ALTER RANGE system CONFIGURE ZONE USING gc.ttlseconds = 1`)
+			sqlDB.Exec(t, `ALTER RANGE default CONFIGURE ZONE USING gc.ttlseconds = 100`)
+			sqlDB.Exec(t, `ALTER RANGE system CONFIGURE ZONE USING gc.ttlseconds = 100`)
 			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 			sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b'), (4, 'c'), (7, 'd'), (8, 'e')`)
 
@@ -4092,7 +4142,15 @@ func TestChangefeedRestartDuringBackfill(t *testing.T) {
 		})
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	useSysCfgInKV := withKnobsFn(func(knobs *base.TestingKnobs) {
+		// TODO(irfansharif): This test is "skipped" under span configs;
+		// #75080.
+		if knobs.Store == nil {
+			knobs.Store = &kvserver.StoreTestingKnobs{}
+		}
+		knobs.Store.(*kvserver.StoreTestingKnobs).UseSystemConfigSpanForQueues = true
+	})
+	t.Run(`kafka`, kafkaTest(testFn, useSysCfgInKV))
 }
 
 func TestChangefeedHandlesDrainingNodes(t *testing.T) {

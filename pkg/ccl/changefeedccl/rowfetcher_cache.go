@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -41,7 +40,7 @@ type rowFetcherCache struct {
 	collection *descs.Collection
 	db         *kv.DB
 
-	a rowenc.DatumAlloc
+	a tree.DatumAlloc
 }
 
 var rfCacheConfig = cache.Config{
@@ -155,30 +154,20 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 	}
 
 	// TODO(dan): Allow for decoding a subset of the columns.
-	var colIdxMap catalog.TableColMap
-	var valNeededForCol util.FastIntSet
-	for _, col := range tableDesc.PublicColumns() {
-		colIdxMap.Set(col.GetID(), col.Ordinal())
-		valNeededForCol.Add(col.Ordinal())
-	}
-
-	var rf row.Fetcher
 	rfArgs := row.FetcherTableArgs{
 		Desc:             tableDesc,
 		Index:            tableDesc.GetPrimaryIndex(),
-		ColIdxMap:        colIdxMap,
 		IsSecondaryIndex: false,
-		Cols:             tableDesc.PublicColumns(),
-		ValNeededForCol:  valNeededForCol,
+		Columns:          tableDesc.PublicColumns(),
 	}
+	var rf row.Fetcher
 	if err := rf.Init(
 		context.TODO(),
 		c.codec,
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0,     /* lockTimeout */
-		false, /* isCheck */
+		0, /* lockTimeout */
 		&c.a,
 		nil, /* memMonitor */
 		rfArgs,

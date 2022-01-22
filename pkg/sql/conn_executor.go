@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -448,6 +447,9 @@ func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 				MetaSQLStatsFlushDuration, 6*metricsSampleInterval,
 			),
 			SQLStatsRemovedRows: metric.NewCounter(MetaSQLStatsRemovedRows),
+			SQLTxnStatsCollectionOverhead: metric.NewLatency(
+				MetaSQLTxnStatsCollectionOverhead, 6*metricsSampleInterval,
+			),
 		},
 	}
 }
@@ -801,7 +803,7 @@ func (s *Server) newConnExecutor(
 			execTestingKnobs: s.GetExecutorConfig().TestingKnobs,
 		},
 		memMetrics: memMetrics,
-		planner:    planner{execCfg: s.cfg, alloc: &rowenc.DatumAlloc{}},
+		planner:    planner{execCfg: s.cfg, alloc: &tree.DatumAlloc{}},
 
 		// ctxHolder will be reset at the start of run(). We only define
 		// it here so that an early call to close() doesn't panic.
@@ -1860,9 +1862,12 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		// message causes the backend to close the current transaction if it's not
 		// inside a BEGIN/COMMIT transaction block (“close” meaning to commit if no
 		// error, or roll back if error)."
-		// In other words, Sync is treated as auto-commit for implicit transactions.
+		// In other words, Sync is treated as commit for implicit transactions.
 		if op, ok := ex.machine.CurState().(stateOpen); ok {
 			if op.ImplicitTxn.Get() {
+				// Note that the handling of ev in the case of Sync is massaged a bit
+				// later - Sync is special in that, if it encounters an error, that does
+				// *not *cause the session to ignore all commands until the next Sync.
 				ev, payload = ex.handleAutoCommit(ctx, &tree.CommitTransaction{})
 			}
 		}
@@ -1913,11 +1918,29 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// Massage the advancing for Sync, which is special.
+		if _, ok := cmd.(Sync); ok {
+			switch advInfo.code {
+			case skipBatch:
+				// An error on Sync doesn't cause us to skip commands (and errors are
+				// possible because Sync can trigger a commit). We generate the
+				// ErrorResponse and the ReadyForQuery responses, and we continue with
+				// the next command. From the Postgres docs:
+				// """
+				// Note that no skipping occurs if an error is detected while processing
+				// Sync — this ensures that there is one and only one ReadyForQuery sent for
+				// each Sync.
+				// """
+				advInfo = advanceInfo{code: advanceOne}
+			case advanceOne:
+			case rewind:
+			case stayInPlace:
+				return errors.AssertionFailedf("unexpected advance code stayInPlace when processing Sync")
+			}
+		}
 	} else {
 		// If no event was generated synthesize an advance code.
-		advInfo = advanceInfo{
-			code: advanceOne,
-		}
+		advInfo = advanceInfo{code: advanceOne}
 	}
 
 	// Decide if we need to close the result or not. We don't need to do it if
@@ -2160,7 +2183,13 @@ func isCopyToExternalStorage(cmd CopyIn) bool {
 // and writing up to the CommandComplete message.
 func (ex *connExecutor) execCopyIn(
 	ctx context.Context, cmd CopyIn,
-) (fsm.Event, fsm.EventPayload, error) {
+) (_ fsm.Event, retPayload fsm.EventPayload, retErr error) {
+	ex.incrementStartedStmtCounter(cmd.Stmt)
+	defer func() {
+		if retErr == nil && !payloadHasError(retPayload) {
+			ex.incrementExecutedStmtCounter(cmd.Stmt)
+		}
+	}()
 
 	// When we're done, unblock the network connection.
 	defer cmd.CopyDone.Done()
@@ -2474,6 +2503,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			Planner:                   p,
 			PrivilegedAccessor:        p,
 			SessionAccessor:           p,
+			JobExecContext:            p,
 			ClientNoticeSender:        p,
 			Sequence:                  p,
 			Tenant:                    p,
@@ -2727,7 +2757,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		if err := ex.server.cfg.JobRegistry.Run(
 			ex.ctxHolder.connCtx,
 			ex.server.cfg.InternalExecutor,
-			ex.extraTxnState.jobs); err != nil {
+			ex.extraTxnState.jobs,
+		); err != nil {
 			handleErr(err)
 		}
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionEndPostCommitJob, timeutil.Now())
@@ -2938,6 +2969,7 @@ func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
 func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 	scs := &ex.extraTxnState.schemaChangerState
 	deps := newSchemaChangerTxnRunDependencies(
+		ex.planner.SessionData(),
 		ex.planner.User(),
 		ex.server.cfg,
 		ex.planner.txn,
@@ -2956,7 +2988,7 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 	scs.state = after
 	scs.jobID = jobID
 	if jobID != jobspb.InvalidJobID {
-		ex.extraTxnState.jobs = append(ex.extraTxnState.jobs, jobID)
+		ex.extraTxnState.jobs.add(jobID)
 		log.Infof(ctx, "queued new schema change job %d using the new schema changer", jobID)
 	}
 	return nil
@@ -2989,6 +3021,9 @@ type StatementCounters struct {
 	RestartSavepointCount           telemetry.CounterWithMetric
 	ReleaseRestartSavepointCount    telemetry.CounterWithMetric
 	RollbackToRestartSavepointCount telemetry.CounterWithMetric
+
+	// CopyCount counts all COPY statements.
+	CopyCount telemetry.CounterWithMetric
 
 	// DdlCount counts all statements whose StatementReturnType is DDL.
 	DdlCount telemetry.CounterWithMetric
@@ -3027,6 +3062,8 @@ func makeStartedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDeleteStarted, internal)),
 		DdlCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaDdlStarted, internal)),
+		CopyCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyStarted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscStarted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3064,6 +3101,8 @@ func makeExecutedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDeleteExecuted, internal)),
 		DdlCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaDdlExecuted, internal)),
+		CopyCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyExecuted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscExecuted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3112,6 +3151,8 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 		} else {
 			sc.RollbackToSavepointCount.Inc()
 		}
+	case *tree.CopyFrom:
+		sc.CopyCount.Inc()
 	default:
 		if tree.CanModifySchema(stmt) {
 			sc.DdlCount.Inc()

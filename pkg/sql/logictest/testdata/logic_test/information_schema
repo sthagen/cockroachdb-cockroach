@@ -4625,17 +4625,20 @@ application_name                                      ·
 avoid_buffering                                       off
 backslash_quote                                       safe_encoding
 bytea_output                                          hex
+check_function_bodies                                 on
 client_encoding                                       UTF8
 client_min_messages                                   notice
 database                                              test
 datestyle                                             ISO, MDY
 datestyle_enabled                                     off
 default_int_size                                      8
+default_table_access_method                           heap
 default_tablespace                                    ·
 default_transaction_isolation                         serializable
 default_transaction_priority                          normal
 default_transaction_read_only                         off
 default_transaction_use_follower_reads                off
+default_with_oids                                     off
 disable_partially_distributed_plans                   off
 disable_plan_gists                                    off
 disallow_full_table_scans                             off
@@ -4688,6 +4691,7 @@ optimizer_use_histograms                              on
 optimizer_use_multicol_stats                          on
 override_multi_region_zone_config                     off
 parallelize_multi_key_lookup_joins_enabled            off
+password_encryption                                   scram-sha-256
 prefer_lookup_joins_for_fks                           off
 propagate_input_ordering                              off
 reorder_joins_limit                                   8
@@ -4721,6 +4725,7 @@ transaction_rows_read_log                             0
 transaction_rows_written_err                          0
 transaction_rows_written_log                          0
 transaction_status                                    NoTxn
+xmloption                                             content
 
 # information_schema can be used with the anonymous database.
 # It should show information across all databases.

@@ -36,7 +36,6 @@ func TestPreSeedSpanConfigsWrittenWhenActive(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			EnableSpanConfigs: true, // we use spanconfig.KVAccessor to check if its contents are as we'd expect
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
 					DisableAutomaticVersionUpgrade: 1,
@@ -52,7 +51,17 @@ func TestPreSeedSpanConfigsWrittenWhenActive(t *testing.T) {
 	ts := tc.Server(0)
 
 	tenantID := roachpb.MakeTenantID(10)
-	_, err := ts.StartTenant(ctx, base.TestTenantArgs{TenantID: tenantID})
+	_, err := ts.StartTenant(ctx, base.TestTenantArgs{
+		TenantID: tenantID,
+		TestingKnobs: base.TestingKnobs{
+			SpanConfig: &spanconfig.TestingKnobs{
+				// Disable the tenant's span config reconciliation process,
+				// it'll muck with the tenant's span configs that we check
+				// below.
+				ManagerDisableJobCreation: true,
+			},
+		},
+	})
 	require.NoError(t, err)
 
 	scKVAccessor := ts.SpanConfigKVAccessor().(spanconfig.KVAccessor)
@@ -79,7 +88,6 @@ func TestSeedTenantSpanConfigs(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			EnableSpanConfigs: true, // we use spanconfig.KVAccessor to check if its contents are as we'd expect
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
 					DisableAutomaticVersionUpgrade: 1,
@@ -101,7 +109,17 @@ func TestSeedTenantSpanConfigs(t *testing.T) {
 	tenantSpan := roachpb.Span{Key: tenantPrefix, EndKey: tenantPrefix.PrefixEnd()}
 	tenantSeedSpan := roachpb.Span{Key: tenantPrefix, EndKey: tenantPrefix.Next()}
 	{
-		_, err := ts.StartTenant(ctx, base.TestTenantArgs{TenantID: tenantID})
+		_, err := ts.StartTenant(ctx, base.TestTenantArgs{
+			TenantID: tenantID,
+			TestingKnobs: base.TestingKnobs{
+				SpanConfig: &spanconfig.TestingKnobs{
+					// Disable the tenant's span config reconciliation process,
+					// it'll muck with the tenant's span configs that we check
+					// below.
+					ManagerDisableJobCreation: true,
+				},
+			},
+		})
 		require.NoError(t, err)
 	}
 
@@ -137,7 +155,6 @@ func TestSeedTenantSpanConfigsWithExistingEntry(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			EnableSpanConfigs: true, // we use spanconfig.KVAccessor to check if its contents are as we'd expect
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
 					DisableAutomaticVersionUpgrade: 1,
@@ -159,7 +176,17 @@ func TestSeedTenantSpanConfigsWithExistingEntry(t *testing.T) {
 	tenantSpan := roachpb.Span{Key: tenantPrefix, EndKey: tenantPrefix.PrefixEnd()}
 	tenantSeedSpan := roachpb.Span{Key: tenantPrefix, EndKey: tenantPrefix.Next()}
 	{
-		_, err := ts.StartTenant(ctx, base.TestTenantArgs{TenantID: tenantID})
+		_, err := ts.StartTenant(ctx, base.TestTenantArgs{
+			TenantID: tenantID,
+			TestingKnobs: base.TestingKnobs{
+				SpanConfig: &spanconfig.TestingKnobs{
+					// Disable the tenant's span config reconciliation process,
+					// it'll muck with the tenant's span configs that we check
+					// below.
+					ManagerDisableJobCreation: true,
+				},
+			},
+		})
 		require.NoError(t, err)
 	}
 

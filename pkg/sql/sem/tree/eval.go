@@ -14,13 +14,12 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/big"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -75,8 +74,8 @@ var (
 	// ErrShiftArgOutOfRange is reported when a shift argument is out of range.
 	ErrShiftArgOutOfRange = pgerror.New(pgcode.InvalidParameterValue, "shift argument out of range")
 
-	big10E6  = big.NewInt(1e6)
-	big10E10 = big.NewInt(1e10)
+	big10E6  = apd.NewBigInt(1e6)
+	big10E10 = apd.NewBigInt(1e10)
 )
 
 // NewCannotMixBitArraySizesError creates an error for the case when a bitwise
@@ -495,19 +494,19 @@ func initNonArrayToNonArrayConcatenation() {
 			Volatility: volatility,
 		})
 	}
-	fromTypeToVolatility := make(map[types.Family]Volatility)
-	for _, cast := range validCasts {
-		if cast.to == types.StringFamily {
-			fromTypeToVolatility[cast.from] = cast.volatility
+	fromTypeToVolatility := make(map[oid.Oid]Volatility)
+	ForEachCast(func(src, tgt oid.Oid) {
+		if tgt == oid.T_text {
+			fromTypeToVolatility[src] = castMap[src][tgt].volatility
 		}
-	}
+	})
 	// We allow tuple + string concatenation, as well as any scalar types.
 	for _, t := range append([]*types.T{types.AnyTuple}, types.Scalar...) {
 		// Do not re-add String+String or String+Bytes, as they already exist
 		// and have predefined correct behavior.
 		if t != types.String && t != types.Bytes {
-			addConcat(t, types.String, fromTypeToVolatility[t.Family()])
-			addConcat(types.String, t, fromTypeToVolatility[t.Family()])
+			addConcat(t, types.String, fromTypeToVolatility[t.Oid()])
+			addConcat(types.String, t, fromTypeToVolatility[t.Oid()])
 		}
 	}
 }
@@ -1429,10 +1428,11 @@ var BinOps = map[BinaryOperatorSymbol]binOpOverload{
 				if rInt == 0 {
 					return nil, ErrDivByZero
 				}
-				div := ctx.getTmpDec().SetInt64(int64(rInt))
+				var div apd.Decimal
+				div.SetInt64(int64(rInt))
 				dd := &DDecimal{}
 				dd.SetInt64(int64(MustBeDInt(left)))
-				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, div)
+				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, &div)
 				return dd, err
 			},
 			Volatility: VolatilityImmutable,
@@ -3115,18 +3115,27 @@ type EvalDatabase interface {
 		ctx context.Context,
 		specifier HasPrivilegeSpecifier,
 		user security.SQLUsername,
-		kind privilege.Kind,
+		priv privilege.Privilege,
 	) (bool, error)
 }
 
 // HasPrivilegeSpecifier specifies an object to lookup privilege for.
+// Only one of { DatabaseName, DatabaseOID, TableName, TableOID } is filled.
 type HasPrivilegeSpecifier struct {
-	// Only one of these is filled.
+
+	// Database privilege
+	DatabaseName *string
+	DatabaseOID  *oid.Oid
+
+	// Table privilege
 	TableName *string
 	TableOID  *oid.Oid
+	// Sequences are stored internally as a table
+	IsSequence *bool
 
-	// Only one of these is filled.
-	// Only used if TableName or TableOID is specified.
+	// Column privilege
+	// Requires TableName or TableOID.
+	// Only one of ColumnName, ColumnAttNum is filled.
 	ColumnName   *Name
 	ColumnAttNum *uint32
 }
@@ -3233,6 +3242,14 @@ type EvalPlanner interface {
 
 	// DecodeGist exposes gist functionality to the builtin functions.
 	DecodeGist(gist string) ([]string, error)
+
+	// CreateSessionRevivalToken creates a token that can be used to log in
+	// as the current user, in bytes form.
+	CreateSessionRevivalToken() (*DBytes, error)
+
+	// ValidateSessionRevivalToken checks if the given bytes are a valid
+	// session revival token.
+	ValidateSessionRevivalToken(token *DBytes) (*DBool, error)
 
 	// QueryRowEx executes the supplied SQL statement and returns a single row, or
 	// nil if no row is found, or an error if more that one row is returned.
@@ -3416,8 +3433,9 @@ type TenantOperator interface {
 	CreateTenant(ctx context.Context, tenantID uint64) error
 
 	// DestroyTenant attempts to uninstall an existing tenant from the system.
-	// It returns an error if the tenant does not exist.
-	DestroyTenant(ctx context.Context, tenantID uint64) error
+	// It returns an error if the tenant does not exist. If synchronous is true
+	// the gc job will not wait for a GC ttl.
+	DestroyTenant(ctx context.Context, tenantID uint64, synchronous bool) error
 
 	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
 	// success it also removes the tenant record.
@@ -3578,6 +3596,9 @@ type EvalContext struct {
 
 	Planner EvalPlanner
 
+	// Not using sql.JobExecContext type to avoid cycle dependency with sql package
+	JobExecContext interface{}
+
 	PrivilegedAccessor PrivilegedAccessor
 
 	SessionAccessor EvalSessionAccessor
@@ -3601,7 +3622,6 @@ type EvalContext struct {
 	DB *kv.DB
 
 	ReCache *RegexpCache
-	tmpDec  apd.Decimal
 
 	// TODO(mjibson): remove prepareOnly in favor of a 2-step prepare-exec solution
 	// that is also able to save the plan to skip work during the exec step.
@@ -3772,7 +3792,7 @@ func TimestampToDecimal(ts hlc.Timestamp) apd.Decimal {
 	val := &res.Coeff
 	val.SetInt64(ts.WallTime)
 	val.Mul(val, big10E10)
-	val.Add(val, big.NewInt(int64(ts.Logical)))
+	val.Add(val, apd.NewBigInt(int64(ts.Logical)))
 
 	// val must be positive. If it was set to a negative value above,
 	// transfer the sign to res.Negative.
@@ -3797,7 +3817,7 @@ func DecimalToInexactDTimestampTZ(d *DDecimal) (*DTimestampTZ, error) {
 }
 
 func decimalToHLC(d *DDecimal) (hlc.Timestamp, error) {
-	var coef big.Int
+	var coef apd.BigInt
 	coef.Set(&d.Decimal.Coeff)
 	// The physical portion of the HLC is stored shifted up by 10^10, so shift
 	// it down and clear out the logical component.
@@ -3928,10 +3948,6 @@ func (ctx *EvalContext) GetDateStyle() pgdate.DateStyle {
 // Ctx returns the session's context.
 func (ctx *EvalContext) Ctx() context.Context {
 	return ctx.Context
-}
-
-func (ctx *EvalContext) getTmpDec() *apd.Decimal {
-	return &ctx.tmpDec
 }
 
 // Eval implements the TypedExpr interface.

@@ -516,7 +516,7 @@ Store.HandleRaftRequest (which is part of the RaftMessageHandler interface),
 ultimately resulting in a call to Replica.handleRaftReadyRaftMuLocked, which
 houses the integration with the etcd/raft library (raft.RawNode). This may
 generate Raft messages to be sent to other Stores; these are handed to
-Replica.sendRaftMessages which ultimately hands them to the Store's
+Replica.sendRaftMessagesRaftMuLocked which ultimately hands them to the Store's
 RaftTransport.SendAsync method. Raft uses message passing (not
 request-response), and outgoing messages will use a gRPC stream that differs
 from that used for incoming messages (which makes asymmetric partitions more
@@ -1049,20 +1049,16 @@ type StoreConfig struct {
 	// tests.
 	KVMemoryMonitor *mon.BytesMonitor
 
-	// SpanConfigsEnabled determines whether we're able to use the span configs
-	// infrastructure.
-	SpanConfigsEnabled bool
+	// SpanConfigsDisabled determines whether we're able to use the span configs
+	// infrastructure or not.
+	SpanConfigsDisabled bool
 	// Used to subscribe to span configuration changes, keeping up-to-date a
 	// data structure useful for retrieving span configs. Only available if
-	// SpanConfigsEnabled.
+	// SpanConfigsDisabled is unset.
 	SpanConfigSubscriber spanconfig.KVSubscriber
 
 	// KVAdmissionController is an optional field used for admission control.
 	KVAdmissionController KVAdmissionController
-
-	// SlowReplicationThreshold is the duration after which an in-flight proposal
-	// is tracked in the requests.slow.raft metric.
-	SlowReplicationThreshold time.Duration
 }
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
@@ -1108,9 +1104,6 @@ func (sc *StoreConfig) SetDefaults() {
 
 	if sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction == 0 {
 		sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction = defaultGossipWhenCapacityDeltaExceedsFraction
-	}
-	if sc.SlowReplicationThreshold == 0 {
-		sc.SlowReplicationThreshold = base.SlowRequestThreshold
 	}
 }
 
@@ -1508,10 +1501,10 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString)) {
 						if transferStatus != transferOK {
 							if err != nil {
 								log.VErrEventf(ctx, 1, "failed to transfer lease %s for range %s when draining: %s",
-									&drainingLeaseStatus.Lease, desc, err)
+									drainingLeaseStatus.Lease, desc, err)
 							} else {
 								log.VErrEventf(ctx, 1, "failed to transfer lease %s for range %s when draining: %s",
-									&drainingLeaseStatus.Lease, desc, transferStatus)
+									drainingLeaseStatus.Lease, desc, transferStatus)
 							}
 						}
 					}
@@ -1952,7 +1945,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		})
 	}
 
-	if s.cfg.SpanConfigsEnabled {
+	if !s.cfg.SpanConfigsDisabled {
 		s.cfg.SpanConfigSubscriber.Subscribe(func(update roachpb.Span) {
 			s.onSpanConfigUpdate(ctx, update)
 		})
@@ -2104,7 +2097,7 @@ func (s *Store) startGossip() {
 var errSysCfgUnavailable = errors.New("system config not available in gossip")
 
 // GetConfReader exposes access to a configuration reader.
-func (s *Store) GetConfReader() (spanconfig.StoreReader, error) {
+func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, error) {
 	if s.cfg.TestingKnobs.MakeSystemConfigSpanUnavailableToQueues {
 		return nil, errSysCfgUnavailable
 	}
@@ -2114,11 +2107,37 @@ func (s *Store) GetConfReader() (spanconfig.StoreReader, error) {
 		return nil, errSysCfgUnavailable
 	}
 
-	if s.cfg.SpanConfigsEnabled && spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-		return s.cfg.SpanConfigSubscriber, nil
+	// We need a version gate here before switching over to the span configs
+	// infrastructure. In a mixed-version cluster we need to wait for
+	// the host tenant to have fully populated `system.span_configurations`
+	// (read: reconciled) at least once before using it as a view for all
+	// split/config decisions.
+	_ = clusterversion.EnsureSpanConfigReconciliation
+	//
+	// We also want to ensure that the KVSubscriber on each store is at least as
+	// up-to-date as some full reconciliation timestamp.
+	_ = clusterversion.EnsureSpanConfigSubscription
+	//
+	// Without a version gate, it would be possible for a replica on a
+	// new-binary-server to apply the static fallback config (assuming no
+	// entries in `system.span_configurations`), in violation of explicit
+	// configs directly set by the user. Though unlikely, it's also possible for
+	// us to merge all ranges into a single one -- with no entries in
+	// system.span_configurations, the infrastructure can erroneously conclude
+	// that there are zero split points.
+	//
+	// We achieve all this through a three-step migration process, culminating
+	// in the following cluster version gate:
+	_ = clusterversion.EnableSpanConfigStore
+
+	if s.cfg.SpanConfigsDisabled ||
+		!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) ||
+		!s.cfg.Settings.Version.IsActive(ctx, clusterversion.EnableSpanConfigStore) ||
+		s.TestingKnobs().UseSystemConfigSpanForQueues {
+		return sysCfg, nil
 	}
 
-	return sysCfg, nil
+	return s.cfg.SpanConfigSubscriber, nil
 }
 
 // startLeaseRenewer runs an infinite loop in a goroutine which regularly
@@ -2317,6 +2336,9 @@ func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
 	}
 
 	now := s.cfg.Clock.NowAsClockTimestamp()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if err := s.mu.replicasByKey.VisitKeyRange(ctx, sp.Key, sp.EndKey, AscendingKeyOrder,
 		func(ctx context.Context, it replicaOrPlaceholder) error {
 			repl := it.repl
@@ -3260,7 +3282,7 @@ func (s *Store) ManuallyEnqueue(
 		return nil, nil, errors.Errorf("unknown queue type %q", queueName)
 	}
 
-	confReader, err := s.GetConfReader()
+	confReader, err := s.GetConfReader(ctx)
 	if err != nil {
 		return nil, nil, errors.Wrap(err,
 			"unable to retrieve conf reader, cannot run queue; make sure "+
@@ -3351,6 +3373,25 @@ func (s *Store) PurgeOutdatedReplicas(ctx context.Context, version roachpb.Versi
 	})
 
 	return g.Wait()
+}
+
+// WaitForSpanConfigSubscription waits until the store is wholly subscribed to
+// the global span configurations state.
+func (s *Store) WaitForSpanConfigSubscription(ctx context.Context) error {
+	if s.cfg.SpanConfigsDisabled {
+		return nil // nothing to do here
+	}
+
+	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
+		if !s.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty() {
+			return nil
+		}
+
+		log.Warningf(ctx, "waiting for span config subscription...")
+		continue
+	}
+
+	return errors.Newf("unable to subscribe to span configs")
 }
 
 // registerLeaseholder registers the provided replica as a leaseholder in the

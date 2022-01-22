@@ -19,17 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -83,19 +80,10 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		FAMILY (a, b, c), FAMILY (d)
 	)`)
 	desc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
-	var colIdxMap catalog.TableColMap
-	var valNeededForCol util.FastIntSet
-	for i, col := range desc.PublicColumns() {
-		colIdxMap.Set(col.GetID(), i)
-		valNeededForCol.Add(i)
-	}
 	table := row.FetcherTableArgs{
-		Desc:             desc,
-		Index:            desc.GetPrimaryIndex(),
-		ColIdxMap:        colIdxMap,
-		IsSecondaryIndex: false,
-		Cols:             desc.PublicColumns(),
-		ValNeededForCol:  valNeededForCol,
+		Desc:    desc,
+		Index:   desc.GetPrimaryIndex(),
+		Columns: desc.PublicColumns(),
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
@@ -104,9 +92,8 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0,    /* lockTimeout */
-		true, /* isCheck */
-		&rowenc.DatumAlloc{},
+		0, /* lockTimeout */
+		&tree.DatumAlloc{},
 		nil, /* memMonitor */
 		table,
 	); err != nil {
@@ -128,7 +115,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		}
 		var rows []rowWithMVCCMetadata
 		for {
-			datums, _, _, err := rf.NextRowDecoded(ctx)
+			datums, err := rf.NextRowDecoded(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}

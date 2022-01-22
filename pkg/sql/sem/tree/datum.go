@@ -15,7 +15,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"math/big"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,7 +23,7 @@ import (
 	"unicode"
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
@@ -1058,10 +1057,10 @@ func (d *DDecimal) CompareError(ctx *EvalContext, other Datum) (int, error) {
 		// NULL is less than any non-NULL value.
 		return 1, nil
 	}
-	v := ctx.getTmpDec()
+	var v apd.Decimal
 	switch t := UnwrapDatum(ctx, other).(type) {
 	case *DDecimal:
-		v = &t.Decimal
+		v.Set(&t.Decimal)
 	case *DInt:
 		v.SetInt64(int64(*t))
 	case *DFloat:
@@ -1071,7 +1070,7 @@ func (d *DDecimal) CompareError(ctx *EvalContext, other Datum) (int, error) {
 	default:
 		return 0, makeUnsupportedComparisonMessage(d, other)
 	}
-	res := CompareDecimals(&d.Decimal, v)
+	res := CompareDecimals(&d.Decimal, &v)
 	return res, nil
 }
 
@@ -1149,23 +1148,14 @@ func (d *DDecimal) Format(ctx *FmtCtx) {
 	}
 }
 
-// shallowDecimalSize is the size of the fixed-size part of apd.Decimal in
-// bytes.
-const shallowDecimalSize = unsafe.Sizeof(apd.Decimal{})
-
-// SizeOfDecimal returns the size in bytes of an apd.Decimal.
-func SizeOfDecimal(d *apd.Decimal) uintptr {
-	return shallowDecimalSize + uintptr(cap(d.Coeff.Bits()))*unsafe.Sizeof(big.Word(0))
-}
-
 // Size implements the Datum interface.
 func (d *DDecimal) Size() uintptr {
-	return SizeOfDecimal(&d.Decimal)
+	return d.Decimal.Size()
 }
 
 var (
 	decimalNegativeZero = &apd.Decimal{Negative: true}
-	bigTen              = big.NewInt(10)
+	bigTen              = apd.NewBigInt(10)
 )
 
 // IsComposite implements the CompositeDatum interface.
@@ -1176,7 +1166,7 @@ func (d *DDecimal) IsComposite() bool {
 	}
 
 	// Check if d is divisible by 10.
-	var r big.Int
+	var r apd.BigInt
 	r.Rem(&d.Decimal.Coeff, bigTen)
 	return r.Sign() == 0
 }
@@ -2318,7 +2308,28 @@ func (d *DTimeTZ) Prev(ctx *EvalContext) (Datum, bool) {
 	if d.IsMin(ctx) {
 		return nil, false
 	}
-	return NewDTimeTZFromOffset(d.TimeOfDay-1, d.OffsetSecs), true
+	// In the common case, the absolute time doesn't change, we simply decrement
+	// the offset by one second and increment the time of day by one second. Once
+	// we hit the minimum offset for the current absolute time, then we decrement
+	// the absolute time by one microsecond and wrap around to the highest offset
+	// for the new absolute time. This aligns with how Before and After are
+	// defined for TimeTZ.
+	var newTimeOfDay timeofday.TimeOfDay
+	var newOffsetSecs int32
+	if d.OffsetSecs == timetz.MinTimeTZOffsetSecs ||
+		d.TimeOfDay+duration.MicrosPerSec > timeofday.Max {
+		newTimeOfDay = d.TimeOfDay - 1
+		shiftSeconds := int32((newTimeOfDay - timeofday.Min) / duration.MicrosPerSec)
+		if d.OffsetSecs+shiftSeconds > timetz.MaxTimeTZOffsetSecs {
+			shiftSeconds = timetz.MaxTimeTZOffsetSecs - d.OffsetSecs
+		}
+		newOffsetSecs = d.OffsetSecs + shiftSeconds
+		newTimeOfDay -= timeofday.TimeOfDay(shiftSeconds) * duration.MicrosPerSec
+	} else {
+		newTimeOfDay = d.TimeOfDay + duration.MicrosPerSec
+		newOffsetSecs = d.OffsetSecs - 1
+	}
+	return NewDTimeTZFromOffset(newTimeOfDay, newOffsetSecs), true
 }
 
 // Next implements the Datum interface.
@@ -2326,7 +2337,28 @@ func (d *DTimeTZ) Next(ctx *EvalContext) (Datum, bool) {
 	if d.IsMax(ctx) {
 		return nil, false
 	}
-	return NewDTimeTZFromOffset(d.TimeOfDay+1, d.OffsetSecs), true
+	// In the common case, the absolute time doesn't change, we simply increment
+	// the offset by one second and decrement the time of day by one second. Once
+	// we hit the maximum offset for the current absolute time, then we increment
+	// the absolute time by one microsecond and wrap around to the lowest offset
+	// for the new absolute time. This aligns with how Before and After are
+	// defined for TimeTZ.
+	var newTimeOfDay timeofday.TimeOfDay
+	var newOffsetSecs int32
+	if d.OffsetSecs == timetz.MaxTimeTZOffsetSecs ||
+		d.TimeOfDay-duration.MicrosPerSec < timeofday.Min {
+		newTimeOfDay = d.TimeOfDay + 1
+		shiftSeconds := int32((timeofday.Max - newTimeOfDay) / duration.MicrosPerSec)
+		if d.OffsetSecs-shiftSeconds < timetz.MinTimeTZOffsetSecs {
+			shiftSeconds = d.OffsetSecs - timetz.MinTimeTZOffsetSecs
+		}
+		newOffsetSecs = d.OffsetSecs - shiftSeconds
+		newTimeOfDay += timeofday.TimeOfDay(shiftSeconds) * duration.MicrosPerSec
+	} else {
+		newTimeOfDay = d.TimeOfDay - duration.MicrosPerSec
+		newOffsetSecs = d.OffsetSecs + 1
+	}
+	return NewDTimeTZFromOffset(newTimeOfDay, newOffsetSecs), true
 }
 
 // IsMax implements the Datum interface.
@@ -3670,6 +3702,11 @@ func NewDTuple(typ *types.T, d ...Datum) *DTuple {
 // NewDTupleWithLen creates a *DTuple with the provided length.
 func NewDTupleWithLen(typ *types.T, l int) *DTuple {
 	return &DTuple{D: make(Datums, l), typ: typ}
+}
+
+// MakeDTuple creates a DTuple with the provided datums. See NewDTuple.
+func MakeDTuple(typ *types.T, d ...Datum) DTuple {
+	return DTuple{D: d, typ: typ}
 }
 
 // AsDTuple attempts to retrieve a *DTuple from an Expr, returning a *DTuple and

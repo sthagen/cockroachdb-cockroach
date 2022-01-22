@@ -85,7 +85,7 @@ func (so *DummySequenceOperators) HasPrivilege(
 	ctx context.Context,
 	specifier tree.HasPrivilegeSpecifier,
 	user security.SQLUsername,
-	kind privilege.Kind,
+	priv privilege.Privilege,
 ) (bool, error) {
 	return false, errors.WithStack(errEvalPlanner)
 }
@@ -238,6 +238,16 @@ func (*DummyEvalPlanner) DecodeGist(gist string) ([]string, error) {
 	return nil, errors.WithStack(errEvalPlanner)
 }
 
+// CreateSessionRevivalToken is part of the EvalPlanner interface.
+func (*DummyEvalPlanner) CreateSessionRevivalToken() (*tree.DBytes, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
+// ValidateSessionRevivalToken is part of the EvalPlanner interface.
+func (*DummyEvalPlanner) ValidateSessionRevivalToken(token *tree.DBytes) (*tree.DBool, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
 // ExecutorConfig is part of the EvalPlanner interface.
 func (*DummyEvalPlanner) ExecutorConfig() interface{} {
 	return nil
@@ -305,7 +315,7 @@ func (ep *DummyEvalPlanner) HasPrivilege(
 	ctx context.Context,
 	specifier tree.HasPrivilegeSpecifier,
 	user security.SQLUsername,
-	kind privilege.Kind,
+	priv privilege.Privilege,
 ) (bool, error) {
 	return false, errors.WithStack(errEvalPlanner)
 }
@@ -441,7 +451,9 @@ func (c *DummyTenantOperator) CreateTenant(_ context.Context, _ uint64) error {
 }
 
 // DestroyTenant is part of the tree.TenantOperator interface.
-func (c *DummyTenantOperator) DestroyTenant(_ context.Context, _ uint64) error {
+func (c *DummyTenantOperator) DestroyTenant(
+	ctx context.Context, tenantID uint64, synchronous bool,
+) error {
 	return errors.WithStack(errEvalTenant)
 }
 

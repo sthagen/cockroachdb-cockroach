@@ -1074,10 +1074,10 @@ func TestAdminAPISettings(t *testing.T) {
 	// Any bool that defaults to true will work here.
 	const settingKey = "sql.metrics.statement_details.enabled"
 	st := s.ClusterSettings()
-	allKeys := settings.Keys()
+	allKeys := settings.Keys(settings.ForSystemTenant)
 
 	checkSetting := func(t *testing.T, k string, v serverpb.SettingsResponse_Value) {
-		ref, ok := settings.Lookup(k, settings.LookupForReporting)
+		ref, ok := settings.Lookup(k, settings.LookupForReporting, settings.ForSystemTenant)
 		if !ok {
 			t.Fatalf("%s: not found after initial lookup", k)
 		}
@@ -1765,8 +1765,8 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 		query string
 		exp   []string
 	}{
-		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
-		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
+		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Columns: id"}},
+		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Columns: id"}},
 	}
 	for i, testCase := range testCases {
 		var res serverpb.QueryPlanResponse

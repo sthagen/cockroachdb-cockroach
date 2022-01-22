@@ -56,6 +56,10 @@ const (
 	MODIFYCLUSTERSETTING
 	NOMODIFYCLUSTERSETTING
 	DEFAULTSETTINGS
+	VIEWACTIVITYREDACTED
+	NOVIEWACTIVITYREDACTED
+	SQLLOGIN
+	NOSQLLOGIN
 )
 
 // toSQLStmts is a map of Kind -> SQL statement string for applying the
@@ -80,6 +84,10 @@ var toSQLStmts = map[Option]string{
 	NOCANCELQUERY:          `DELETE FROM system.role_options WHERE username = $1 AND option = 'CANCELQUERY'`,
 	MODIFYCLUSTERSETTING:   `UPSERT INTO system.role_options (username, option) VALUES ($1, 'MODIFYCLUSTERSETTING')`,
 	NOMODIFYCLUSTERSETTING: `DELETE FROM system.role_options WHERE username = $1 AND option = 'MODIFYCLUSTERSETTING'`,
+	SQLLOGIN:               `DELETE FROM system.role_options WHERE username = $1 AND option = 'NOSQLLOGIN'`,
+	NOSQLLOGIN:             `UPSERT INTO system.role_options (username, option) VALUES ($1, 'NOSQLLOGIN')`,
+	VIEWACTIVITYREDACTED:   `UPSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWACTIVITYREDACTED')`,
+	NOVIEWACTIVITYREDACTED: `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWACTIVITYREDACTED'`,
 }
 
 // Mask returns the bitmask for a given role option.
@@ -110,6 +118,10 @@ var ByName = map[string]Option{
 	"MODIFYCLUSTERSETTING":   MODIFYCLUSTERSETTING,
 	"NOMODIFYCLUSTERSETTING": NOMODIFYCLUSTERSETTING,
 	"DEFAULTSETTINGS":        DEFAULTSETTINGS,
+	"VIEWACTIVITYREDACTED":   VIEWACTIVITYREDACTED,
+	"NOVIEWACTIVITYREDACTED": VIEWACTIVITYREDACTED,
+	"SQLLOGIN":               SQLLOGIN,
+	"NOSQLLOGIN":             NOSQLLOGIN,
 }
 
 // ToOption takes a string and returns the corresponding Option.
@@ -213,7 +225,11 @@ func (rol List) CheckRoleOptionConflicts() error {
 		(roleOptionBits&CANCELQUERY.Mask() != 0 &&
 			roleOptionBits&NOCANCELQUERY.Mask() != 0) ||
 		(roleOptionBits&MODIFYCLUSTERSETTING.Mask() != 0 &&
-			roleOptionBits&NOMODIFYCLUSTERSETTING.Mask() != 0) {
+			roleOptionBits&NOMODIFYCLUSTERSETTING.Mask() != 0) ||
+		(roleOptionBits&VIEWACTIVITYREDACTED.Mask() != 0 &&
+			roleOptionBits&NOVIEWACTIVITYREDACTED.Mask() != 0) ||
+		(roleOptionBits&SQLLOGIN.Mask() != 0 &&
+			roleOptionBits&NOSQLLOGIN.Mask() != 0) {
 		return pgerror.Newf(pgcode.Syntax, "conflicting role options")
 	}
 	return nil

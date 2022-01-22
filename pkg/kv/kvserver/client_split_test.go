@@ -1014,6 +1014,8 @@ func TestStoreZoneUpdateAndRangeSplit(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue: true,
+				// This test was written with the SystemConfigSpan in mind.
+				UseSystemConfigSpanForQueues: true,
 			},
 		},
 	})
@@ -1083,6 +1085,8 @@ func TestStoreRangeSplitWithMaxBytesUpdate(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue: true,
+				// This test was written with the system config span in mind.
+				UseSystemConfigSpanForQueues: true,
 			},
 		},
 	})
@@ -1308,7 +1312,10 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 	// Intentionally leave the merge queue enabled. This indirectly tests that the
 	// merge queue respects these split points.
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// This test was written with the system config span in mind.
+		DisableSpanConfigs: true,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	userTableMax := keys.TestingUserDescID(4)
@@ -1697,13 +1704,13 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 			return nil
 		}
 		log.Infof(ctx, "received lease request (%s, %s)",
-			leaseReq.Span(), &leaseReq.Lease)
+			leaseReq.Span(), leaseReq.Lease)
 		if !reflect.DeepEqual(*forbiddenDesc, leaseReq.Lease.Replica) {
 			return nil
 		}
 		log.Infof(ctx,
 			"refusing lease request (%s, %s) because %+v held lease for LHS of split",
-			leaseReq.Span(), &leaseReq.Lease, forbiddenDesc)
+			leaseReq.Span(), leaseReq.Lease, forbiddenDesc)
 		return roachpb.NewError(&roachpb.NotLeaseHolderError{RangeID: args.Hdr.RangeID})
 	}
 
@@ -3011,7 +3018,7 @@ func TestStoreSplitRangeLookupRace(t *testing.T) {
 		select {
 		case <-blockRangeLookups:
 			if kv.TestingIsRangeLookup(ba) &&
-				ba.Requests[0].GetInner().(*roachpb.ScanRequest).Key.Equal(bounds.Key.AsRawKey()) {
+				ba.Requests[0].GetInner().Header().Key.Equal(bounds.Key.AsRawKey()) {
 
 				select {
 				case rangeLookupIsBlocked <- struct{}{}:
@@ -3557,8 +3564,10 @@ func TestStoreRangeSplitAndMergeWithGlobalReads(t *testing.T) {
 	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				DisableMergeQueue:     true,
-				TestingResponseFilter: respFilter,
+				DisableMergeQueue: true,
+				// This test was written with the system config span in mind.
+				UseSystemConfigSpanForQueues: true,
+				TestingResponseFilter:        respFilter,
 			},
 		},
 	})

@@ -50,6 +50,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
@@ -80,6 +82,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scjob" // register jobs declared outside of pkg/sql
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -580,10 +583,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		user security.SQLUsername) (cloud.ExternalStorage, error) {
 		return externalStorageBuilder.makeExternalStorageFromURI(ctx, uri, user)
 	}
+
+	protectedtsKnobs, _ := cfg.TestingKnobs.ProtectedTS.(*protectedts.TestingKnobs)
 	protectedtsProvider, err := ptprovider.New(ptprovider.Config{
 		DB:               db,
 		InternalExecutor: internalExecutor,
 		Settings:         st,
+		Knobs:            protectedtsKnobs,
 	})
 	if err != nil {
 		return nil, err
@@ -643,8 +649,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		// tenant records.
 		kvAccessorForTenantRecords spanconfig.KVAccessor
 	}
-	if cfg.SpanConfigsEnabled {
-		storeCfg.SpanConfigsEnabled = true
+	storeCfg.SpanConfigsDisabled = cfg.SpanConfigsDisabled
+	if !cfg.SpanConfigsDisabled {
 		spanConfigKnobs, _ := cfg.TestingKnobs.SpanConfig.(*spanconfig.TestingKnobs)
 		if spanConfigKnobs != nil && spanConfigKnobs.StoreKVSubscriberOverride != nil {
 			storeCfg.SpanConfigSubscriber = spanConfigKnobs.StoreKVSubscriberOverride
@@ -829,7 +835,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	sStatus.setStmtDiagnosticsRequester(sqlServer.execCfg.StmtDiagnosticsRecorder)
 	sStatus.baseStatusServer.sqlServer = sqlServer
-	debugServer := debug.NewServer(st, sqlServer.pgServer.HBADebugFn(), sStatus)
+	debugServer := debug.NewServer(cfg.BaseConfig.AmbientCtx, st, sqlServer.pgServer.HBADebugFn(), sStatus)
 	node.InitLogger(sqlServer.execCfg)
 
 	*lateBoundServer = Server{
@@ -1761,6 +1767,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	//   stores)
 	s.node.waitForAdditionalStoreInit()
 
+	// Once all stores are initialized, check if offline storage recovery
+	// was done prior to start and record any actions appropriately.
+	logPendingLossOfQuorumRecoveryEvents(ctx, s.node.stores)
+
 	log.Ops.Infof(ctx, "starting %s server at %s (use: %s)",
 		redact.Safe(s.cfg.HTTPRequestScheme()), s.cfg.HTTPAddr, s.cfg.HTTPAdvertiseAddr)
 	rpcConnType := redact.SafeString("grpc/postgres")
@@ -1794,7 +1804,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return err
 	}
 
-	if s.cfg.SpanConfigsEnabled && s.spanConfigSubscriber != nil {
+	if !s.cfg.SpanConfigsDisabled && s.spanConfigSubscriber != nil {
 		if err := s.spanConfigSubscriber.Start(ctx); err != nil {
 			return err
 		}
@@ -1929,6 +1939,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
 	s.debug.RegisterClosedTimestampSideTransport(s.ctSender, s.node.storeCfg.ClosedTimestampReceiver)
+	s.debug.RegisterTracez(s.cfg.Tracer)
 
 	s.ctSender.Run(ctx, state.nodeID)
 
@@ -1941,6 +1952,12 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to start KV prober")
 	}
 
+	// As final stage of loss of quorum recovery, write events into corresponding
+	// range logs. We do it as a separate stage to log events early just in case
+	// startup fails, and write to range log once the server is running as we need
+	// to run sql statements to update rangelog.
+	publishPendingLossOfQuorumRecoveryEvents(ctx, s.node.stores, s.stopper)
+
 	log.Event(ctx, "server initialized")
 
 	// Begin recording time series data collected by the status monitor.
@@ -1951,6 +1968,71 @@ func (s *Server) PreStart(ctx context.Context) error {
 	)
 
 	return maybeImportTS(ctx, s)
+}
+
+func logPendingLossOfQuorumRecoveryEvents(ctx context.Context, stores *kvserver.Stores) {
+	if err := stores.VisitStores(func(s *kvserver.Store) error {
+		// We are not requesting entry deletion here because we need those entries
+		// at the end of startup to populate rangelog and possibly other durable
+		// cluster-replicated destinations.
+		eventCount, err := loqrecovery.RegisterOfflineRecoveryEvents(
+			ctx,
+			s.Engine(),
+			func(ctx context.Context, record loqrecoverypb.ReplicaRecoveryRecord) (bool, error) {
+				event := record.AsStructuredLog()
+				log.StructuredEvent(ctx, &event)
+				return false, nil
+			})
+		if eventCount > 0 {
+			log.Infof(
+				ctx, "registered %d loss of quorum replica recovery events for s%d",
+				eventCount, s.Ident.StoreID)
+		}
+		return err
+	}); err != nil {
+		// We don't want to abort server if we can't record recovery events
+		// as it is the last thing we need if cluster is already unhealthy.
+		log.Errorf(ctx, "failed to record loss of quorum recovery events: %v", err)
+	}
+}
+
+func publishPendingLossOfQuorumRecoveryEvents(
+	ctx context.Context, stores *kvserver.Stores, stopper *stop.Stopper,
+) {
+	_ = stopper.RunAsyncTask(ctx, "publish-loss-of-quorum-events", func(ctx context.Context) {
+		if err := stores.VisitStores(func(s *kvserver.Store) error {
+			recoveryEventsSupported := s.ClusterSettings().Version.IsActive(ctx,
+				clusterversion.UnsafeLossOfQuorumRecoveryRangeLog)
+			_, err := loqrecovery.RegisterOfflineRecoveryEvents(
+				ctx,
+				s.Engine(),
+				func(ctx context.Context, record loqrecoverypb.ReplicaRecoveryRecord) (bool, error) {
+					sqlExec := func(ctx context.Context, stmt string, args ...interface{}) (int, error) {
+						return s.GetStoreConfig().SQLExecutor.ExecEx(ctx, "", nil,
+							sessiondata.InternalExecutorOverride{User: security.RootUserName()}, stmt, args...)
+					}
+					if recoveryEventsSupported {
+						if err := loqrecovery.UpdateRangeLogWithRecovery(ctx, sqlExec, record); err != nil {
+							return false, errors.Wrap(err,
+								"loss of quorum recovery failed to write RangeLog entry")
+						}
+					}
+					// We only bump metrics as the last step when all processing of events
+					// is finished. This is done to ensure that we don't increase metrics
+					// more than once.
+					// Note that if actual deletion of event fails, it is possible to
+					// duplicate rangelog and metrics, but that is very unlikely event
+					// and user should be able to identify those events.
+					s.Metrics().RangeLossOfQuorumRecoveries.Inc(1)
+					return true, nil
+				})
+			return err
+		}); err != nil {
+			// We don't want to abort server if we can't record recovery events
+			// as it is the last thing we need if cluster is already unhealthy.
+			log.Errorf(ctx, "failed to update range log with loss of quorum recovery events: %v", err)
+		}
+	})
 }
 
 // ConfigureGRPCGateway initializes services necessary for running the

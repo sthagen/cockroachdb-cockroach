@@ -15,12 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -182,9 +181,8 @@ type HashTable struct {
 	// each other.
 	allowNullEquality bool
 
-	overloadHelper execgen.OverloadHelper
-	datumAlloc     rowenc.DatumAlloc
-	cancelChecker  colexecutils.CancelChecker
+	datumAlloc    tree.DatumAlloc
+	cancelChecker colexecutils.CancelChecker
 
 	BuildMode HashTableBuildMode
 	probeMode HashTableProbeMode
@@ -520,6 +518,7 @@ func (ht *HashTable) checkCols(probeVecs []coldata.Vec, nToCheck uint64, probeSe
 
 // checkColsForDistinctTuples performs a column by column check to find distinct
 // tuples in the probe table that are not present in the build table.
+// NOTE: It assumes that probeSel has already been populated and it is not nil.
 func (ht *HashTable) checkColsForDistinctTuples(
 	probeVecs []coldata.Vec, nToCheck uint64, probeSel []int,
 ) {
@@ -552,7 +551,7 @@ func (ht *HashTable) ComputeBuckets(buckets []uint64, keys []coldata.Vec, nKeys 
 	}
 
 	for i := range ht.keyCols {
-		rehash(buckets, keys[i], nKeys, sel, ht.cancelChecker, &ht.overloadHelper, &ht.datumAlloc)
+		rehash(buckets, keys[i], nKeys, sel, ht.cancelChecker, &ht.datumAlloc)
 	}
 
 	finalizeHash(buckets, nKeys, ht.numBuckets)
@@ -689,6 +688,30 @@ func (ht *HashTable) CheckBuildForAggregation(
 				// keyID of that duplicate.
 				ht.ProbeScratch.HeadID[toCheck] = ht.ProbeScratch.GroupID[toCheck]
 			}
+		}
+	}
+	return nDiffers
+}
+
+// DistinctCheck determines if the current key in the GroupID bucket matches the
+// equality column key. If there is a match, then the key is removed from
+// ToCheck. If the bucket has reached the end, the key is rejected. The ToCheck
+// list is reconstructed to only hold the indices of the eqCol keys that have
+// not been found. The new length of ToCheck is returned by this function.
+func (ht *HashTable) DistinctCheck(nToCheck uint64, probeSel []int) uint64 {
+	ht.checkCols(ht.Keys, nToCheck, probeSel)
+	// Select the indices that differ and put them into ToCheck.
+	nDiffers := uint64(0)
+	toCheckSlice := ht.ProbeScratch.ToCheck
+	_ = toCheckSlice[nToCheck-1]
+	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+		//gcassert:bce
+		toCheck := toCheckSlice[toCheckPos]
+		if ht.ProbeScratch.differs[toCheck] {
+			ht.ProbeScratch.differs[toCheck] = false
+			//gcassert:bce
+			toCheckSlice[nDiffers] = toCheck
+			nDiffers++
 		}
 	}
 	return nDiffers

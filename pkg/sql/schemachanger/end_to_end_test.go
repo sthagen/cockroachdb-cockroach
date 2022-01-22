@@ -14,7 +14,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -52,7 +51,7 @@ func TestSchemaChangerSideEffects(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	datadriven.Walk(t, filepath.Join("testdata"), func(t *testing.T, path string) {
+	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
 		// Create a test cluster.
 		// Its purpose is to seed the test dependencies with interesting states.
 		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -133,7 +132,7 @@ func waitForSchemaChangesToComplete(t *testing.T, tdb *sqlutils.SQLRunner) {
 func execStatementWithTestDeps(
 	ctx context.Context, t *testing.T, deps *sctestdeps.TestState, stmt parser.Statement,
 ) {
-	state, err := scbuild.Build(ctx, deps, scpb.State{}, stmt.AST)
+	state, err := scbuild.Build(ctx, deps, scpb.CurrentState{}, stmt.AST)
 	require.NoError(t, err, "error in builder")
 
 	var jobID jobspb.JobID
@@ -160,7 +159,7 @@ func execStatementWithTestDeps(
 		progress := job.Progress.(jobspb.NewSchemaChangeProgress)
 		const rollback = false
 		err = scrun.RunSchemaChangesInJob(
-			ctx, deps.TestingKnobs(), deps.ClusterSettings(), deps, jobID, job.DescriptorIDs, details, progress, rollback,
+			ctx, deps.TestingKnobs(), deps.ClusterSettings(), deps, jobID, details, progress, rollback,
 		)
 		require.NoError(t, err, "error in mock schema change job execution")
 		deps.LogSideEffectf("# end %s", deps.Phase())
@@ -204,7 +203,7 @@ func TestRollback(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	datadriven.Walk(t, filepath.Join("testdata"), func(t *testing.T, path string) {
+	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
 		var setup []parser.Statement
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {

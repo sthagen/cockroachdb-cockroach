@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	apd "github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
@@ -44,10 +44,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -295,7 +293,7 @@ func getManifestFromURI(ctx context.Context, path string) (backupccl.BackupManif
 	// upgraded from the old FK representation, or even older formats). If more
 	// fields are added to the output, the table descriptors may need to be
 	// upgraded.
-	backupManifest, err := backupccl.ReadBackupManifestFromURI(ctx, path, security.RootUserName(),
+	backupManifest, _, err := backupccl.ReadBackupManifestFromURI(ctx, nil /* mem */, path, security.RootUserName(),
 		externalStorageFromURIFactory, nil)
 	if err != nil {
 		return backupccl.BackupManifest{}, err
@@ -390,7 +388,7 @@ func runListIncrementalCmd(cmd *cobra.Command, args []string) error {
 			defer stores[i].Close()
 		}
 
-		manifest, err := backupccl.ReadBackupManifestFromStore(ctx, stores[i], nil)
+		manifest, _, err := backupccl.ReadBackupManifestFromStore(ctx, nil /* mem */, stores[i], nil)
 		if err != nil {
 			return err
 		}
@@ -565,33 +563,24 @@ func makeIters(
 func makeRowFetcher(
 	ctx context.Context, entry backupccl.BackupTableEntry, codec keys.SQLCodec,
 ) (row.Fetcher, error) {
-	var colIdxMap catalog.TableColMap
-	var valNeededForCol util.FastIntSet
 	colDescs := make([]catalog.Column, len(entry.Desc.PublicColumns()))
 	for i, col := range entry.Desc.PublicColumns() {
-		colIdxMap.Set(col.GetID(), i)
-		valNeededForCol.Add(i)
 		colDescs[i] = col
 	}
 
 	if debugBackupArgs.withRevisions {
-		newIndex := len(entry.Desc.PublicColumns())
 		newCol, err := entry.Desc.FindColumnWithName(colinfo.MVCCTimestampColumnName)
 		if err != nil {
 			return row.Fetcher{}, errors.Wrapf(err, "get mvcc timestamp column")
 		}
-		colIdxMap.Set(newCol.GetID(), newIndex)
-		valNeededForCol.Add(newIndex)
 		colDescs = append(colDescs, newCol)
 	}
 
 	table := row.FetcherTableArgs{
 		Desc:             entry.Desc,
 		Index:            entry.Desc.GetPrimaryIndex(),
-		ColIdxMap:        colIdxMap,
 		IsSecondaryIndex: false,
-		Cols:             colDescs,
-		ValNeededForCol:  valNeededForCol,
+		Columns:          colDescs,
 	}
 
 	var rf row.Fetcher
@@ -601,9 +590,8 @@ func makeRowFetcher(
 		false, /*reverse*/
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0,     /* lockTimeout */
-		false, /*isCheck*/
-		&rowenc.DatumAlloc{},
+		0, /* lockTimeout */
+		&tree.DatumAlloc{},
 		nil, /*mon.BytesMonitor*/
 		table,
 	); err != nil {
@@ -650,7 +638,7 @@ func processEntryFiles(
 	}
 
 	for {
-		datums, _, _, err := rf.NextRowDecoded(ctx)
+		datums, err := rf.NextRowDecoded(ctx)
 		if err != nil {
 			return errors.Wrapf(err, "decode row")
 		}

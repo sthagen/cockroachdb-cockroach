@@ -818,8 +818,8 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 
 %token <str> NAN NAME NAMES NATURAL NEVER NEW_DB_NAME NEXT NO NOCANCELQUERY NOCONTROLCHANGEFEED
 %token <str> NOCONTROLJOB NOCREATEDB NOCREATELOGIN NOCREATEROLE NOLOGIN NOMODIFYCLUSTERSETTING
-%token <str> NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT NOTHING NOTNULL
-%token <str> NOVIEWACTIVITY NOWAIT NULL NULLIF NULLS NUMERIC
+%token <str> NOSQLLOGIN NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT NOTHING NOTNULL
+%token <str> NOVIEWACTIVITY NOVIEWACTIVITYREDACTED NOWAIT NULL NULLIF NULLS NUMERIC
 
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR ON ONLY OPT OPTION OPTIONS OR
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OWNER OPERATOR
@@ -841,6 +841,7 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 %token <str> SERIALIZABLE SERVER SESSION SESSIONS SESSION_USER SET SETS SETTING SETTINGS
 %token <str> SHARE SHOW SIMILAR SIMPLE SKIP SKIP_LOCALITIES_CHECK SKIP_MISSING_FOREIGN_KEYS
 %token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
+%token <str> SQLLOGIN
 
 %token <str> START STATISTICS STATUS STDIN STREAM STRICT STRING STORAGE STORE STORED STORING SUBSTRING
 %token <str> SURVIVE SURVIVAL SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION STATEMENTS
@@ -854,7 +855,7 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 %token <str> UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN UNLOGGED UNSPLIT
 %token <str> UPDATE UPSERT UNTIL USE USER USERS USING UUID
 
-%token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VIEW VARYING VIEWACTIVITY VIRTUAL VISIBLE VOTERS
+%token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIRTUAL VISIBLE VOTERS
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1199,7 +1200,7 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 %type <[]tree.RangePartition> range_partitions
 %type <empty> opt_all_clause
 %type <empty> opt_privileges_clause
-%type <bool> distinct_clause
+%type <bool> distinct_clause opt_with_data
 %type <tree.DistinctOn> distinct_on_clause
 %type <tree.NameList> opt_column_list insert_column_list opt_stats_columns query_stats_cols
 %type <tree.OrderBy> sort_clause single_sort_clause opt_sort_clause
@@ -1331,7 +1332,7 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 %type <str> unrestricted_name type_function_name type_function_name_no_crdb_extra
 %type <str> non_reserved_word
 %type <str> non_reserved_word_or_sconst
-%type <tree.RoleSpec> role_spec
+%type <tree.RoleSpec> role_spec opt_owner_clause
 %type <tree.RoleSpecList> role_spec_list
 %type <tree.Expr> zone_value
 %type <tree.Expr> string_or_placeholder
@@ -1665,12 +1666,14 @@ alter_sequence_options_stmt:
 // %Category: DDL
 // %Text:
 // ALTER DATABASE <name> RENAME TO <newname>
+// ALTER DATABASE <name> CONFIGURE ZONE <zone config>
 // ALTER DATABASE <name> OWNER TO <newowner>
 // ALTER DATABASE <name> CONVERT TO SCHEMA WITH PARENT <name>
-// ALTER DATABASE <name> ADD REGIONS <regions>
-// ALTER DATABASE <name> DROP REGIONS <regions>
+// ALTER DATABASE <name> ADD REGION [IF NOT EXISTS] <region>
+// ALTER DATABASE <name> DROP REGION [IF EXISTS] <region>
 // ALTER DATABASE <name> PRIMARY REGION <region>
 // ALTER DATABASE <name> SURVIVE <failure type>
+// ALTER DATABASE <name> PLACEMENT { RESTRICTED | DEFAULT }
 // ALTER DATABASE <name> SET var { TO | = } { value | DEFAULT }
 // ALTER DATABASE <name> RESET { var | ALL }
 // %SeeAlso: WEBDOCS/alter-database.html
@@ -3527,6 +3530,7 @@ comment_stmt:
     $$.val = &tree.CommentOnConstraint{Constraint:tree.Name($4), Table: $6.unresolvedObjectName(), Comment: $8.strPtr()}
   }
 | COMMENT ON EXTENSION error { return unimplemented(sqllex, "comment on extension") }
+| COMMENT ON FUNCTION error { return unimplementedWithIssueDetail(sqllex, 17511, "comment on function") }
 
 comment_text:
   SCONST
@@ -7433,7 +7437,7 @@ sequence_option_list:
 | sequence_option_list sequence_option_elem  { $$.val = append($1.seqOpts(), $2.seqOpt()) }
 
 sequence_option_elem:
-  AS typename                  { 
+  AS typename                  {
                                   // Valid option values must be integer types (ex. int2, bigint)
                                   parsedType := $2.colType()
                                   if parsedType.Family() != types.IntFamily {
@@ -7634,7 +7638,7 @@ create_view_stmt:
       Replace: false,
     }
   }
-| CREATE MATERIALIZED VIEW view_name opt_column_list AS select_stmt
+| CREATE MATERIALIZED VIEW view_name opt_column_list AS select_stmt opt_with_data
   {
     name := $4.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateView{
@@ -7644,7 +7648,7 @@ create_view_stmt:
       Materialized: true,
     }
   }
-| CREATE MATERIALIZED VIEW IF NOT EXISTS view_name opt_column_list AS select_stmt
+| CREATE MATERIALIZED VIEW IF NOT EXISTS view_name opt_column_list AS select_stmt opt_with_data
   {
     name := $7.unresolvedObjectName().ToTableName()
     $$.val = &tree.CreateView{
@@ -7656,6 +7660,20 @@ create_view_stmt:
     }
   }
 | CREATE opt_temp opt_view_recursive VIEW error // SHOW HELP: CREATE VIEW
+
+opt_with_data:
+  WITH NO DATA error
+  {
+    return unimplementedWithIssue(sqllex, 74083)
+  }
+| WITH DATA
+  {
+    $$.val = true
+  }
+| /* EMPTY */
+  {
+    $$.val = true
+  }
 
 role_option:
   CREATEROLE
@@ -7714,6 +7732,14 @@ role_option:
   {
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
+| VIEWACTIVITYREDACTED
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
+| NOVIEWACTIVITYREDACTED
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
 | CANCELQUERY
   {
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
@@ -7727,6 +7753,14 @@ role_option:
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
 | NOMODIFYCLUSTERSETTING
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
+| SQLLOGIN
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
+| NOSQLLOGIN
   {
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
@@ -8758,7 +8792,7 @@ transaction_deferrable_mode:
 // %Text: CREATE DATABASE [IF NOT EXISTS] <name>
 // %SeeAlso: WEBDOCS/create-database.html
 create_database_stmt:
-  CREATE DATABASE database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause
+  CREATE DATABASE database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause opt_owner_clause
   {
     $$.val = &tree.CreateDatabase{
       Name: tree.Name($3),
@@ -8771,6 +8805,7 @@ create_database_stmt:
       Regions: $11.nameList(),
       SurvivalGoal: $12.survivalGoal(),
       Placement: $13.dataPlacement(),
+      Owner: $14.roleSpec(),
     }
   }
 | CREATE DATABASE IF NOT EXISTS database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause
@@ -8916,6 +8951,18 @@ opt_connection_limit:
     $$.val = int32(-1)
   }
 
+opt_owner_clause:
+  OWNER opt_equal role_spec
+  {
+    $$ = $3
+  }
+| /* EMPTY */
+   {
+		 $$.val = tree.RoleSpec{
+		   RoleSpecType: tree.CurrentUser,
+		 }
+   }
+
 opt_equal:
   '=' {}
 | /* EMPTY */ {}
@@ -9054,7 +9101,21 @@ on_conflict:
       Where: tree.NewWhere(tree.AstWhere, $11.expr()),
     }
   }
-| ON CONFLICT ON CONSTRAINT constraint_name { return unimplementedWithIssue(sqllex, 28161) }
+| ON CONFLICT ON CONSTRAINT constraint_name DO NOTHING
+  {
+    $$.val = &tree.OnConflict{
+      Constraint: tree.Name($5),
+      DoNothing: true,
+    }
+  }
+| ON CONFLICT ON CONSTRAINT constraint_name DO UPDATE SET set_clause_list opt_where_clause
+  {
+    $$.val = &tree.OnConflict{
+      Constraint: tree.Name($5),
+      Exprs: $9.updateExprs(),
+      Where: tree.NewWhere(tree.AstWhere, $10.expr()),
+    }
+  }
 
 returning_clause:
   RETURNING target_list
@@ -13436,7 +13497,9 @@ unreserved_keyword:
 | NOLOGIN
 | NOMODIFYCLUSTERSETTING
 | NONVOTERS
+| NOSQLLOGIN
 | NOVIEWACTIVITY
+| NOVIEWACTIVITYREDACTED
 | NOWAIT
 | NULLS
 | IGNORE_FOREIGN_KEYS
@@ -13546,6 +13609,7 @@ unreserved_keyword:
 | SNAPSHOT
 | SPLIT
 | SQL
+| SQLLOGIN
 | START
 | STATEMENTS
 | STATISTICS
@@ -13595,6 +13659,7 @@ unreserved_keyword:
 | VARYING
 | VIEW
 | VIEWACTIVITY
+| VIEWACTIVITYREDACTED
 | VISIBLE
 | VOTERS
 | WITHIN

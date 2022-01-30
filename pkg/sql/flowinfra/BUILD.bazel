@@ -15,6 +15,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/flowinfra",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/base",
         "//pkg/kv",
         "//pkg/roachpb:with-mocks",
         "//pkg/server/telemetry",
@@ -78,8 +79,8 @@ go_test(
         "//pkg/server",
         "//pkg/settings/cluster",
         "//pkg/sql",
-        "//pkg/sql/catalog/catalogkv",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/desctestutils",
         "//pkg/sql/distsql",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",

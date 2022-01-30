@@ -236,7 +236,9 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 	}
 
 	// Compute SHA asynchronously and store it in a map by UUID.
-	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
+	// Don't use the proposal's context for this, as it likely to be canceled very
+	// soon.
+	if err := stopper.RunAsyncTask(r.AnnotateCtx(context.Background()), "storage.Replica: computing checksum", func(ctx context.Context) {
 		func() {
 			defer snap.Close()
 			var snapshot *roachpb.RaftSnapshotData
@@ -504,7 +506,7 @@ func (r *Replica) leasePostApplyLocked(
 	if iAmTheLeaseHolder {
 		// NB: run these in an async task to keep them out of the critical section
 		// (r.mu is held here).
-		_ = r.store.stopper.RunAsyncTask(ctx, "lease-triggers", func(ctx context.Context) {
+		_ = r.store.stopper.RunAsyncTask(r.AnnotateCtx(context.Background()), "lease-triggers", func(ctx context.Context) {
 			// Re-acquire the raftMu, as we are now in an async task.
 			r.raftMu.Lock()
 			defer r.raftMu.Unlock()
@@ -583,8 +585,12 @@ func addSSTablePreApply(
 
 	copied := false
 	if eng.InMem() {
+		// Ingest a copy of the SST. Otherwise, Pebble will claim and mutate the
+		// sst.Data byte slice, which will also be used later by e.g. rangefeeds.
+		data := make([]byte, len(sst.Data))
+		copy(data, sst.Data)
 		path = fmt.Sprintf("%x", checksum)
-		if err := eng.WriteFile(path, sst.Data); err != nil {
+		if err := eng.WriteFile(path, data); err != nil {
 			log.Fatalf(ctx, "unable to write sideloaded SSTable at term %d, index %d: %s", term, index, err)
 		}
 	} else {

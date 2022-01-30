@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/types"
 )
@@ -25,6 +26,7 @@ import (
 // This benchmark explicitly excludes construction of
 // the SpanOptions, which require allocations as well.
 func BenchmarkTracer_StartSpanCtx(b *testing.B) {
+	skip.UnderDeadlock(b, "span reuse triggers false-positives in the deadlock detector")
 	ctx := context.Background()
 
 	staticLogTags := logtags.Buffer{}
@@ -43,18 +45,28 @@ func BenchmarkTracer_StartSpanCtx(b *testing.B) {
 		{"real,manualparent", TracingModeActiveSpansRegistry, true, []SpanOption{WithDetachedRecording()}},
 	} {
 		b.Run(fmt.Sprintf("opts=%s", tc.name), func(b *testing.B) {
-			tr := NewTracerWithOpt(ctx, WithTracingMode(TracingModeActiveSpansRegistry))
+			tr := NewTracerWithOpt(ctx,
+				WithTracingMode(TracingModeActiveSpansRegistry),
+				WithSpanReusePercent(100))
 			b.ResetTimer()
 
+			var parent *Span
+			var numOpts = len(tc.opts)
 			if tc.parent {
-				parSp := tr.StartSpan("one-off")
-				defer parSp.Finish()
-				tc.opts = append(tc.opts, WithParent(parSp))
+				parent = tr.StartSpan("one-off")
+				defer parent.Finish()
+				numOpts++
 			}
+			opts := make([]SpanOption, numOpts)
+			copy(opts, tc.opts)
 
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				newCtx, sp := tr.StartSpanCtx(ctx, "benching", tc.opts...)
+				if parent != nil {
+					// The WithParent option needs to be re-created every time; it cannot be reused.
+					opts[len(opts)-1] = WithParent(parent)
+				}
+				newCtx, sp := tr.StartSpanCtx(ctx, "benching", opts...)
 				_ = newCtx
 				sp.Finish() // clean up
 			}
@@ -93,7 +105,10 @@ func BenchmarkSpan_GetRecording(b *testing.B) {
 }
 
 func BenchmarkRecordingWithStructuredEvent(b *testing.B) {
-	tr := NewTracerWithOpt(context.Background(), WithTracingMode(TracingModeActiveSpansRegistry))
+	skip.UnderDeadlock(b, "span reuse triggers false-positives in the deadlock detector")
+	tr := NewTracerWithOpt(context.Background(),
+		WithTracingMode(TracingModeActiveSpansRegistry),
+		WithSpanReusePercent(100))
 
 	ev := &types.Int32Value{Value: 5}
 	b.ReportAllocs()
@@ -109,7 +124,10 @@ func BenchmarkRecordingWithStructuredEvent(b *testing.B) {
 
 // BenchmarkSpanCreation creates traces with a couple of spans in them.
 func BenchmarkSpanCreation(b *testing.B) {
-	tr := NewTracerWithOpt(context.Background(), WithTracingMode(TracingModeActiveSpansRegistry))
+	skip.UnderDeadlock(b, "span reuse triggers false-positives in the deadlock detector")
+	tr := NewTracerWithOpt(context.Background(),
+		WithTracingMode(TracingModeActiveSpansRegistry),
+		WithSpanReusePercent(100))
 	const numChildren = 5
 	childNames := make([]string, numChildren)
 	for i := 0; i < numChildren; i++ {

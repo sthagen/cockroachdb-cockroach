@@ -90,6 +90,12 @@ type MutationVisitorStateUpdater interface {
 		constraintType scpb.ConstraintType,
 	) error
 
+	// DeleteDatabaseRoleSettings removes a database role setting
+	DeleteDatabaseRoleSettings(
+		ctx context.Context,
+		db catalog.DatabaseDescriptor,
+	) error
+
 	// AddNewGCJobForTable enqueues a GC job for the given table.
 	AddNewGCJobForTable(descriptor catalog.TableDescriptor)
 
@@ -362,17 +368,21 @@ func (m *visitor) RemoveRelationDependedOnBy(
 	if err != nil {
 		return err
 	}
-	for depIdx, dependsOnBy := range tbl.DependedOnBy {
-		if dependsOnBy.ID == op.DependedOnBy {
-			tbl.DependedOnBy = append(tbl.DependedOnBy[:depIdx], tbl.DependedOnBy[depIdx+1:]...)
-			break
+	// DependedOnBy can contain multiple entries per-dependency, so
+	// this isn't a single delete operation.
+	newDependedOnBy := make([]descpb.TableDescriptor_Reference, 0, len(tbl.DependedOnBy))
+	for _, dependsOnBy := range tbl.DependedOnBy {
+		if dependsOnBy.ID != op.DependedOnBy {
+			newDependedOnBy = append(newDependedOnBy, dependsOnBy)
 		}
 	}
+	tbl.DependedOnBy = newDependedOnBy
 	// Intentionally set empty slices to nil, so that for our data driven tests
 	// these fields are omitted in the output.
 	if len(tbl.DependedOnBy) == 0 {
 		tbl.DependedOnBy = nil
 	}
+
 	for depIdx, dependsOn := range depDesc.DependsOn {
 		if dependsOn == op.TableID {
 			depDesc.DependsOn = append(depDesc.DependsOn[:depIdx], depDesc.DependsOn[depIdx+1:]...)
@@ -1068,6 +1078,16 @@ func (m *visitor) RemoveConstraintComment(
 		return err
 	}
 	return m.s.DeleteConstraintComment(ctx, tbl.(catalog.TableDescriptor), op.ConstraintName, op.ConstraintType)
+}
+
+func (m *visitor) RemoveDatabaseRoleSettings(
+	ctx context.Context, op scop.RemoveDatabaseRoleSettings,
+) error {
+	db, err := m.cr.MustReadImmutableDescriptor(ctx, op.DatabaseID)
+	if err != nil {
+		return err
+	}
+	return m.s.DeleteDatabaseRoleSettings(ctx, db.(catalog.DatabaseDescriptor))
 }
 
 var _ scop.MutationVisitor = (*visitor)(nil)

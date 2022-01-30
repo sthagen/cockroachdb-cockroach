@@ -15,6 +15,7 @@ import * as protos from "src/js/protos";
 import {
   refreshStatementDiagnosticsRequests,
   refreshStatements,
+  refreshUserSQLRoles,
 } from "src/redux/apiReducers";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
@@ -24,6 +25,7 @@ import { PrintTime } from "src/views/reports/containers/range/print";
 import { selectDiagnosticsReportsPerStatement } from "src/redux/statements/statementsSelectors";
 import { createStatementDiagnosticsAlertLocalSetting } from "src/redux/alerts";
 import { statementsTimeScaleLocalSetting } from "src/redux/statementsTimeScale";
+import { selectHasViewActivityRedactedRole } from "src/redux/user";
 import { queryByName } from "src/util/query";
 
 import {
@@ -161,28 +163,27 @@ export const selectApps = createSelector(
     }
 
     let sawBlank = false;
-    let sawInternal = false;
     const apps: { [app: string]: boolean } = {};
     state.data.statements.forEach(
       (statement: ICollectedStatementStatistics) => {
-        if (
+        const isNotInternalApp =
           state.data.internal_app_name_prefix &&
-          statement.key.key_data.app.startsWith(
+          !statement.key.key_data.app.startsWith(
             state.data.internal_app_name_prefix,
-          )
+          );
+        if (
+          state.data.internal_app_name_prefix == undefined ||
+          isNotInternalApp
         ) {
-          sawInternal = true;
-        } else if (statement.key.key_data.app) {
-          apps[statement.key.key_data.app] = true;
-        } else {
-          sawBlank = true;
+          if (statement.key.key_data.app) {
+            apps[statement.key.key_data.app] = true;
+          } else {
+            sawBlank = true;
+          }
         }
       },
     );
-    return []
-      .concat(sawInternal ? [state.data.internal_app_name_prefix] : [])
-      .concat(sawBlank ? ["(unset)"] : [])
-      .concat(Object.keys(apps));
+    return [].concat(sawBlank ? ["(unset)"] : []).concat(Object.keys(apps));
   },
 );
 
@@ -268,11 +269,13 @@ export default withRouter(
       statements: selectStatements(state, props),
       statementsError: state.cachedData.statements.lastError,
       totalFingerprints: selectTotalFingerprints(state),
+      hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
     }),
     {
       refreshStatements: refreshStatements,
       onTimeScaleChange: setCombinedStatementsTimeScaleAction,
       refreshStatementDiagnosticsRequests,
+      refreshUserSQLRoles,
       resetSQLStats: resetSQLStatsAction,
       dismissAlertMessage: () =>
         createStatementDiagnosticsAlertLocalSetting.set({ show: false }),

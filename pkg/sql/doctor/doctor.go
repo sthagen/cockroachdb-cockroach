@@ -19,14 +19,16 @@ import (
 	"io"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -66,43 +68,41 @@ func (jt JobsTable) GetJobMetadata(jobID jobspb.JobID) (*jobs.JobMetadata, error
 	return nil, errors.Newf("job %d not found", jobID)
 }
 
-func newDescGetter(
-	ctx context.Context, stdout io.Writer, descRows []DescriptorTableRow, nsRows []NamespaceTableRow,
-) (catalog.MapDescGetter, error) {
-	ddg := catalog.MapDescGetter{
-		Descriptors: make(map[descpb.ID]catalog.Descriptor, len(descRows)),
-		Namespace:   make(map[descpb.NameInfo]descpb.ID, len(nsRows)),
-	}
-	// Build the descGetter first with un-upgraded descriptors.
+func processDescriptorTable(
+	stdout io.Writer, descRows []DescriptorTableRow,
+) (func(descpb.ID) catalog.Descriptor, error) {
+	m := make(map[int64]catalog.Descriptor, len(descRows))
+	// Build the map first with un-upgraded descriptors.
 	for _, r := range descRows {
 		var d descpb.Descriptor
 		if err := protoutil.Unmarshal(r.DescBytes, &d); err != nil {
-			return ddg, errors.Wrapf(err, "failed to unmarshal descriptor %d", r.ID)
+			return nil, errors.Wrapf(err, "failed to unmarshal descriptor %d", r.ID)
 		}
-		b := catalogkv.NewBuilderWithMVCCTimestamp(&d, r.ModTime)
+		b := descbuilder.NewBuilderWithMVCCTimestamp(&d, r.ModTime)
 		if b != nil {
-			ddg.Descriptors[descpb.ID(r.ID)] = b.BuildImmutable()
+			b.RunPostDeserializationChanges()
+			m[r.ID] = b.BuildImmutable()
 		}
 	}
-	// Rebuild the descGetter with upgrades.
+	// Run post-restore upgrades.
 	for _, r := range descRows {
-		var d descpb.Descriptor
-		if err := protoutil.Unmarshal(r.DescBytes, &d); err != nil {
-			return ddg, errors.Wrapf(err, "failed to unmarshal descriptor %d", r.ID)
+		desc := m[r.ID]
+		if desc == nil {
+			continue
 		}
-		b := catalogkv.NewBuilderWithMVCCTimestamp(&d, r.ModTime)
-		if b != nil {
-			if err := b.RunPostDeserializationChanges(ctx, ddg); err != nil {
-				descReport(stdout, ddg.Descriptors[descpb.ID(r.ID)], "failed to upgrade descriptor: %v", err)
-			} else {
-				ddg.Descriptors[descpb.ID(r.ID)] = b.BuildImmutable()
-			}
+		b := desc.NewBuilder()
+		b.RunPostDeserializationChanges()
+		if err := b.RunRestoreChanges(func(id descpb.ID) catalog.Descriptor {
+			return m[int64(id)]
+		}); err != nil {
+			descReport(stdout, desc, "failed to upgrade descriptor: %v", err)
+			continue
 		}
+		m[r.ID] = b.BuildImmutable()
 	}
-	for _, r := range nsRows {
-		ddg.Namespace[r.NameInfo] = descpb.ID(r.ID)
-	}
-	return ddg, nil
+	return func(id descpb.ID) catalog.Descriptor {
+		return m[int64(id)]
+	}, nil
 }
 
 // Examine runs a suite of consistency checks over system tables.
@@ -137,26 +137,34 @@ func ExamineDescriptors(
 	fmt.Fprintf(
 		stdout, "Examining %d descriptors and %d namespace entries...\n",
 		len(descTable), len(namespaceTable))
-	ddg, err := newDescGetter(ctx, stdout, descTable, namespaceTable)
+	descLookupFn, err := processDescriptorTable(stdout, descTable)
 	if err != nil {
 		return false, err
 	}
 	var problemsFound bool
-
+	var cb nstree.MutableCatalog
+	for _, row := range namespaceTable {
+		cb.UpsertNamespaceEntry(row.NameInfo, descpb.ID(row.ID))
+	}
 	for _, row := range descTable {
-		desc, ok := ddg.Descriptors[descpb.ID(row.ID)]
-		if !ok {
+		id := descpb.ID(row.ID)
+		desc := descLookupFn(id)
+		if desc == nil {
 			// This should never happen as ids are parsed and inserted from descTable.
-			log.Fatalf(ctx, "Descriptor id %d not found", row.ID)
+			log.Fatalf(ctx, "Descriptor ID %d not found", row.ID)
 		}
-
-		if int64(desc.GetID()) != row.ID {
-			descReport(stdout, desc, "different id in descriptor table: %d", row.ID)
+		if desc.GetID() != id {
 			problemsFound = true
+			descReport(stdout, desc, "different id in descriptor table: %d", row.ID)
 			continue
 		}
-		ve := catalog.ValidateWithRecover(ctx, ddg, catalog.ValidationLevelAllPreTxnCommit, desc)
-		for _, err := range ve.Errors() {
+		cb.UpsertDescriptorEntry(desc)
+	}
+	for _, row := range descTable {
+		id := descpb.ID(row.ID)
+		desc := descLookupFn(id)
+		ve := cb.ValidateWithRecover(ctx, desc)
+		for _, err := range ve {
 			problemsFound = true
 			descReport(stdout, desc, "%s", err)
 		}
@@ -170,13 +178,12 @@ func ExamineDescriptors(
 			descReport(stdout, desc, "processed")
 		}
 	}
-
 	for _, row := range namespaceTable {
-		desc := ddg.Descriptors[descpb.ID(row.ID)]
+		desc := cb.LookupDescriptorEntry(descpb.ID(row.ID))
 		err := validateNamespaceRow(row, desc)
 		if err != nil {
-			nsReport(stdout, row, err.Error())
 			problemsFound = true
+			nsReport(stdout, row, err.Error())
 		} else if verbose {
 			nsReport(stdout, row, "processed")
 		}
@@ -229,7 +236,7 @@ func ExamineJobs(
 	stdout io.Writer,
 ) (ok bool, err error) {
 	fmt.Fprintf(stdout, "Examining %d jobs...\n", len(jobsTable))
-	ddg, err := newDescGetter(ctx, stdout, descTable, nil)
+	descLookupFn, err := processDescriptorTable(stdout, descTable)
 	if err != nil {
 		return false, err
 	}
@@ -238,7 +245,7 @@ func ExamineJobs(
 		if verbose {
 			fmt.Fprintf(stdout, "Processing job %d\n", j.ID)
 		}
-		jobs.ValidateDescriptorReferencesInJob(j, ddg.Descriptors, func(err error) {
+		jobs.ValidateDescriptorReferencesInJob(j, descLookupFn, func(err error) {
 			problemsFound = true
 			fmt.Fprintf(stdout, "job %d: %s.\n", j.ID, err)
 		})
@@ -270,9 +277,10 @@ func descReport(stdout io.Writer, desc catalog.Descriptor, format string, args .
 // with the possible exception of the version counter and the modification time
 // timestamp.
 func DumpSQL(out io.Writer, descTable DescriptorTable, namespaceTable NamespaceTable) error {
-	idChecker := bootstrap.BootstrappedSystemIDChecker()
-	minUserDescID := keys.MinUserDescriptorID(idChecker)
-	minUserCreatedDescID := catalogkeys.MinNonDefaultUserDescriptorID(idChecker)
+	// Assume the target is an empty cluster with the same binary version
+	ms := bootstrap.MakeMetadataSchema(keys.SystemSQLCodec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
+	minUserDescID := ms.MaxSystemDescriptorID() + 1
+	minUserCreatedDescID := minUserDescID + descpb.ID(len(catalogkeys.DefaultUserDBs))*2
 	// Print first transaction, which removes all predefined user descriptors.
 	fmt.Fprintln(out, `BEGIN;`)
 	// Add a query which triggers a divide-by-zero error when the txn runs on a
@@ -297,14 +305,11 @@ func DumpSQL(out io.Writer, descTable DescriptorTable, namespaceTable NamespaceT
 		reverseNamespace[row.ID] = append(reverseNamespace[row.ID], row)
 	}
 	for _, descRow := range descTable {
-		if idChecker.IsSystemID(uint32(descRow.ID)) {
-			// Skip system descriptors.
-			continue
-		}
 		// Update the descriptor representation to make it safe to insert:
 		// - set the version to 1,
 		// - unset the descriptor modification time,
 		// - unset the descriptor create-as-of time, for table descriptors.
+		// Also, skip system descriptors.
 		updatedDescBytes, err := descriptorModifiedForInsert(descRow)
 		if err != nil {
 			return err
@@ -323,7 +328,7 @@ func DumpSQL(out io.Writer, descTable DescriptorTable, namespaceTable NamespaceT
 	}
 	// Handle dangling namespace entries.
 	for _, namespaceRow := range namespaceTable {
-		if idChecker.IsSystemID(uint32(namespaceRow.ID)) {
+		if namespaceRow.ID == keys.SystemDatabaseID || namespaceRow.ParentID == keys.SystemDatabaseID {
 			// Skip system entries.
 			continue
 		}
@@ -344,11 +349,14 @@ func descriptorModifiedForInsert(r DescriptorTableRow) ([]byte, error) {
 	if err := protoutil.Unmarshal(r.DescBytes, &descProto); err != nil {
 		return nil, errors.Wrapf(err, "failed to unmarshal descriptor %d", r.ID)
 	}
-	b := catalogkv.NewBuilderWithMVCCTimestamp(&descProto, r.ModTime)
+	b := descbuilder.NewBuilderWithMVCCTimestamp(&descProto, r.ModTime)
 	if b == nil {
 		return nil, nil
 	}
 	mut := b.BuildCreatedMutable()
+	if catalog.IsSystemDescriptor(mut) {
+		return nil, nil
+	}
 	switch d := mut.(type) {
 	case catalog.DatabaseDescriptor:
 		d.DatabaseDesc().ModificationTime = hlc.Timestamp{}

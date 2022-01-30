@@ -1285,7 +1285,17 @@ func TestReplicaTSCacheLowWaterOnLease(t *testing.T) {
 	}
 
 	for i, test := range testCases {
+		// Make a unique ProposedTS. Without this, we don't have replay protection.
+		// This can bite us at i=2, where the lease stays entirely identical and
+		// thus matches the predecessor lease even when replayed, meaning that the
+		// replay will also apply. This wouldn't be an issue (after all, the lease
+		// stays the same) but it does mean that the corresponding pending inflight
+		// proposal gets finished twice, which tickles an assertion in
+		// ApplySideEffects.
+		propTS := test.start.UnsafeToClockTimestamp()
+		propTS.Logical = int32(i)
 		if err := sendLeaseRequest(tc.repl, &roachpb.Lease{
+			ProposedTS: &propTS,
 			Start:      test.start.UnsafeToClockTimestamp(),
 			Expiration: test.expiration.Clone(),
 			Replica: roachpb.ReplicaDescriptor{
@@ -7791,7 +7801,8 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 	}
 
 	// Test LeaseRequest since it's special: MaxLeaseIndex plays no role and so
-	// there is no re-evaluation of the request.
+	// there is no re-evaluation of the request. Replay protection is conferred
+	// by the lease sequence.
 	atomic.StoreInt32(&c, 0)
 	{
 		prevLease, _ := tc.repl.GetLease()
@@ -7800,6 +7811,8 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 
 		lease := prevLease
 		lease.Sequence = 0
+		now := tc.Clock().Now().UnsafeToClockTimestamp()
+		lease.ProposedTS = &now
 
 		ba.Add(&roachpb.RequestLeaseRequest{
 			RequestHeader: roachpb.RequestHeader{
@@ -8461,9 +8474,9 @@ func TestFailureToProcessCommandClearsLocalResult(t *testing.T) {
 	}
 }
 
-// TestCommandTimeThreshold verifies that commands outside the replica GC
-// threshold fail.
-func TestCommandTimeThreshold(t *testing.T) {
+// TestBatchTimestampBelowGCThreshold verifies that commands below the replica
+// GC threshold fail.
+func TestBatchTimestampBelowGCThreshold(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
@@ -8540,6 +8553,76 @@ func TestCommandTimeThreshold(t *testing.T) {
 	}, &cpArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
+}
+
+// TestRefreshFromBelowGCThreshold verifies that refresh requests that need to
+// see MVCC history below the replica GC threshold fail.
+func TestRefreshFromBelowGCThreshold(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testutils.RunTrueAndFalse(t, "ranged", func(t *testing.T, ranged bool) {
+		ctx := context.Background()
+		tc := testContext{}
+		stopper := stop.NewStopper()
+		defer stopper.Stop(ctx)
+		tc.Start(ctx, t, stopper)
+
+		now := tc.Clock().Now()
+		ts1 := now.Add(1, 0)
+		ts2 := now.Add(2, 0)
+		ts3 := now.Add(3, 0)
+		ts4 := now.Add(4, 0)
+		ts5 := now.Add(5, 0)
+
+		keyA := roachpb.Key("a")
+		keyB := roachpb.Key("b")
+
+		// Construct a Refresh{Range} request for a transaction that refreshes the
+		// time interval (ts2, ts4].
+		var refresh roachpb.Request
+		if ranged {
+			refresh = &roachpb.RefreshRangeRequest{
+				RequestHeader: roachpb.RequestHeader{Key: keyA, EndKey: keyB},
+				RefreshFrom:   ts2,
+			}
+		} else {
+			refresh = &roachpb.RefreshRequest{
+				RequestHeader: roachpb.RequestHeader{Key: keyA},
+				RefreshFrom:   ts2,
+			}
+		}
+		txn := roachpb.MakeTransaction("test", keyA, 0, ts2, 0, 0)
+		txn.Refresh(ts4)
+
+		for _, testCase := range []struct {
+			gc     hlc.Timestamp
+			expErr bool
+		}{
+			{hlc.Timestamp{}, false},
+			{ts1, false},
+			{ts2, false},
+			{ts3, true},
+			{ts4, true},
+			{ts5, true},
+		} {
+			t.Run(fmt.Sprintf("gcThreshold=%s", testCase.gc), func(t *testing.T) {
+				if !testCase.gc.IsEmpty() {
+					gcr := roachpb.GCRequest{Threshold: testCase.gc}
+					_, pErr := tc.SendWrapped(&gcr)
+					require.Nil(t, pErr)
+				}
+
+				_, pErr := tc.SendWrappedWith(roachpb.Header{Txn: &txn}, refresh)
+				if testCase.expErr {
+					require.NotNil(t, pErr)
+					require.Regexp(t, `batch timestamp .* must be after replica GC threshold .*`, pErr)
+				} else {
+					require.Nil(t, pErr)
+				}
+			})
+		}
+	})
 }
 
 func TestReplicaTimestampCacheBumpNotLost(t *testing.T) {

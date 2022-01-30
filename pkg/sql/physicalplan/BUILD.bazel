@@ -13,6 +13,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/physicalplan",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/base",
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord:with-mocks",
@@ -34,7 +35,7 @@ go_library(
 
 go_test(
     name = "physicalplan_test",
-    size = "medium",
+    size = "large",
     srcs = [
         "aggregator_funcs_test.go",
         "fake_span_resolver_test.go",
@@ -56,8 +57,8 @@ go_test(
         "//pkg/server",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catalogkeys",
-        "//pkg/sql/catalog/catalogkv",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/desctestutils",
         "//pkg/sql/distsql",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",

@@ -48,8 +48,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
@@ -65,6 +65,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -4076,6 +4077,65 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
+	"crdb_internal.merge_statement_stats": makeBuiltin(arrayProps(),
+		tree.Overload{
+			Types:      tree.ArgTypes{{"input", types.JSONArray}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				var aggregatedStats roachpb.StatementStatistics
+				for _, statsDatum := range arr.Array {
+					var stats roachpb.StatementStatistics
+					statsJSON := tree.MustBeDJSON(statsDatum).JSON
+					if err := sqlstatsutil.DecodeStmtStatsStatisticsJSON(statsJSON, &stats); err != nil {
+						return nil, err
+					}
+
+					aggregatedStats.Add(&stats)
+				}
+
+				aggregatedJSON, err := sqlstatsutil.BuildStmtStatisticsJSON(&aggregatedStats)
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDJSON(aggregatedJSON), nil
+			},
+			Info:       "Merge an array of roachpb.StatementStatistics into a single JSONB object",
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"crdb_internal.merge_transaction_stats": makeBuiltin(arrayProps(),
+		tree.Overload{
+			Types:      tree.ArgTypes{{"input", types.JSONArray}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				var aggregatedStats roachpb.TransactionStatistics
+				for _, statsDatum := range arr.Array {
+					var stats roachpb.TransactionStatistics
+					statsJSON := tree.MustBeDJSON(statsDatum).JSON
+					if err := sqlstatsutil.DecodeTxnStatsStatisticsJSON(statsJSON, &stats); err != nil {
+						return nil, err
+					}
+
+					aggregatedStats.Add(&stats)
+				}
+
+				aggregatedJSON, err := sqlstatsutil.BuildTxnStatisticsJSON(
+					&roachpb.CollectedTransactionStatistics{
+						Stats: aggregatedStats,
+					})
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDJSON(aggregatedJSON), nil
+			},
+			Info:       "Merge an array of roachpb.TransactionStatistics into a single JSONB object",
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 
 	// Enum functions.
 	"enum_first": makeBuiltin(
@@ -4693,14 +4753,11 @@ value if you rely on the HLC for accuracy.`,
 				}
 
 				// Get the referenced table and index.
-				tableDescIntf, err := ctx.Planner.GetImmutableTableInterfaceByID(
-					ctx.Context,
-					tableID,
-				)
+				tableDescI, err := ctx.Planner.GetImmutableTableInterfaceByID(ctx.Ctx(), tableID)
 				if err != nil {
 					return nil, err
 				}
-				tableDesc := tableDescIntf.(catalog.TableDescriptor)
+				tableDesc := tableDescI.(catalog.TableDescriptor)
 				index, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
@@ -5296,8 +5353,11 @@ value if you rely on the HLC for accuracy.`,
 				tableID := int(tree.MustBeDInt(args[0]))
 				indexID := int(tree.MustBeDInt(args[1]))
 				g := tree.MustBeDGeography(args[2])
-				// TODO(ajwerner): This should be able to use the normal lookup mechanisms.
-				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
+				// TODO(postamar): give the tree.EvalContext a useful interface
+				// instead of cobbling a descs.Collection in this way.
+				cf := descs.NewBareBonesCollectionFactory(ctx.Settings, ctx.Codec)
+				descsCol := cf.MakeCollection(descs.NewTemporarySchemaProvider(ctx.SessionDataStack))
+				tableDesc, err := descsCol.MustGetTableDescByID(ctx.Ctx(), ctx.Txn, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
@@ -5331,7 +5391,11 @@ value if you rely on the HLC for accuracy.`,
 				tableID := int(tree.MustBeDInt(args[0]))
 				indexID := int(tree.MustBeDInt(args[1]))
 				g := tree.MustBeDGeometry(args[2])
-				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
+				// TODO(postamar): give the tree.EvalContext a useful interface
+				// instead of cobbling a descs.Collection in this way.
+				cf := descs.NewBareBonesCollectionFactory(ctx.Settings, ctx.Codec)
+				descsCol := cf.MakeCollection(descs.NewTemporarySchemaProvider(ctx.SessionDataStack))
+				tableDesc, err := descsCol.MustGetTableDescByID(ctx.Ctx(), ctx.Txn, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
@@ -6319,6 +6383,9 @@ table's zone configuration this will return NULL.`,
 						pgcode.InsufficientPrivilege,
 						"can only deserialize matching session users",
 					)
+				}
+				if err := evalCtx.Planner.CheckCanBecomeUser(evalCtx.Context, sd.User()); err != nil {
+					return nil, err
 				}
 				*evalCtx.SessionData() = *sd
 				return tree.MakeDBool(true), nil

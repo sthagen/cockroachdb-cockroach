@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -350,7 +349,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	}
 
 	dbID := desc.GetParentID()
-	dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, oc.codec(), dbID)
+	dbDesc, err := oc.planner.Descriptors().MustGetDatabaseDescByID(ctx, txn, dbID)
 	if err != nil {
 		return cat.DataSourceName{}, err
 	}
@@ -360,7 +359,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	if scID == keys.PublicSchemaID {
 		scName = tree.PublicSchemaName
 	} else {
-		scDesc, err := catalogkv.MustGetSchemaDescByID(ctx, txn, oc.codec(), scID)
+		scDesc, err := oc.planner.Descriptors().MustGetSchemaDescByID(ctx, txn, scID)
 		if err != nil {
 			return cat.DataSourceName{}, err
 		}
@@ -806,22 +805,25 @@ func newOptTable(
 			}
 		}
 		if idx.GetType() == descpb.IndexDescriptor_INVERTED {
-			// The last column of an inverted index is special: in the
+			// The inverted column of an inverted index is special: in the
 			// descriptors, it looks as if the table column is part of the
 			// index; in fact the key contains values *derived* from that
 			// column. In the catalog, we refer to this key as a separate,
 			// inverted column.
-			invertedSourceColOrdinal, _ := ot.lookupColumnOrdinal(idx.GetKeyColumnID(idx.NumKeyColumns() - 1))
+			invertedColumnID := idx.InvertedColumnID()
+			invertedColumnName := idx.InvertedColumnName()
+			invertedColumnType := idx.InvertedColumnKeyType()
+
+			invertedSourceColOrdinal, _ := ot.lookupColumnOrdinal(invertedColumnID)
 
 			// Add a inverted column that refers to the inverted index key.
 			invertedCol, invertedColOrd := newColumn()
 
 			// All inverted columns have type bytes.
-			typ := types.Bytes
 			invertedCol.InitInverted(
 				invertedColOrd,
-				tree.Name(string(ot.Column(invertedSourceColOrdinal).ColName())+"_inverted_key"),
-				typ,
+				tree.Name(invertedColumnName+"_inverted_key"),
+				invertedColumnType,
 				false, /* nullable */
 				invertedSourceColOrdinal,
 			)
@@ -1065,7 +1067,7 @@ func (ot *optTable) WritableIndexCount() int {
 // DeletableIndexCount is part of the cat.Table interface.
 func (ot *optTable) DeletableIndexCount() int {
 	// Primary index is always present, so count is always >= 1.
-	return len(ot.desc.AllIndexes())
+	return len(ot.desc.DeletableNonPrimaryIndexes()) + 1
 }
 
 // Index is part of the cat.Table interface.
@@ -1544,6 +1546,11 @@ func (os *optTableStat) DistinctCount() uint64 {
 // NullCount is part of the cat.TableStatistic interface.
 func (os *optTableStat) NullCount() uint64 {
 	return os.stat.NullCount
+}
+
+// AvgSize is part of the cat.TableStatistic interface.
+func (os *optTableStat) AvgSize() uint64 {
+	return os.stat.AvgSize
 }
 
 // Histogram is part of the cat.TableStatistic interface.

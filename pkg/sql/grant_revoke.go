@@ -120,6 +120,12 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 	ctx := params.ctx
 	p := params.p
 
+	if n.withGrantOption && !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
+		return pgerror.Newf(pgcode.FeatureNotSupported,
+			"version %v must be finalized to use grant options",
+			clusterversion.ByKey(clusterversion.ValidateGrantOption))
+	}
+
 	if err := p.validateRoles(ctx, n.grantees, true /* isPublicValid */); err != nil {
 		return err
 	}
@@ -151,19 +157,6 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		return nil
 	}
 
-	if n.grantOn == privilege.Database {
-		compatiblePrivileges, err := convertPGIncompatibleDatabasePrivilegesToDefaultPrivileges(ctx, p, n, params)
-		if err != nil {
-			return err
-		}
-		// When granting, we exclude the incompatible privileges.
-		// Note: we can't do this when revoking in case the privilege was granted
-		// before 21.2 where this conversion does not happen.
-		if n.isGrant {
-			n.desiredprivs = compatiblePrivileges
-		}
-	}
-
 	var events []eventLogEntry
 
 	// First, update the descriptors. We want to catch all errors before
@@ -188,11 +181,10 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		}
 
 		if len(n.desiredprivs) > 0 {
-			// Only allow granting/revoking privileges that the requesting
-			// user themselves have on the descriptor.
-
 			grantPresent, allPresent := false, false
 			for _, priv := range n.desiredprivs {
+				// Only allow granting/revoking privileges that the requesting
+				// user themselves have on the descriptor.
 				if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
 					return err
 				}
@@ -201,43 +193,49 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			}
 			privileges := descriptor.GetPrivileges()
 
+			noticeMessage := ""
 			if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-				err := p.CheckGrantOptionsForUser(ctx, descriptor, n.desiredprivs, n.isGrant)
+				err := p.CheckGrantOptionsForUser(ctx, descriptor, n.desiredprivs, p.User(), n.isGrant)
 				if err != nil {
 					return err
 				}
 
-				noticeMessage := ""
-				// we only output the message for ALL privilege if it is being granted without the WITH GRANT OPTION flag
-				// if GRANT privilege is involved, we must always output the message
+				// We only output the message for ALL privilege if it is being granted
+				// without the WITH GRANT OPTION flag if GRANT privilege is involved, we
+				// must always output the message
 				if allPresent && n.isGrant && !n.withGrantOption {
 					noticeMessage = "grant options were automatically applied but this behavior is deprecated"
 				} else if grantPresent {
 					noticeMessage = "the GRANT privilege is deprecated"
-				}
-
-				if len(noticeMessage) > 0 {
-					params.p.noticeSender.BufferNotice(
-						errors.WithHint(
-							pgnotice.Newf("%s", noticeMessage),
-							"please use WITH GRANT OPTION",
-						),
-					)
 				}
 			}
 
 			for _, grantee := range n.grantees {
 				n.changePrivilege(privileges, n.desiredprivs, grantee)
 
-				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-					if grantPresent || allPresent {
-						if n.isGrant {
-							privileges.GrantPrivilegeToGrantOptions(grantee, true /*isGrant*/)
-						} else if !n.isGrant && !n.withGrantOption {
-							privileges.GrantPrivilegeToGrantOptions(grantee, false /*isGrant*/)
-						}
+				// TODO (sql-exp): remove the rest of this loop in 22.2.
+				granteeHasGrantPriv := privileges.CheckPrivilege(grantee, privilege.GRANT)
+
+				if granteeHasGrantPriv && n.isGrant && !n.withGrantOption && len(noticeMessage) == 0 {
+					noticeMessage = "grant options were automatically applied but this behavior is deprecated"
+				}
+				if grantPresent || allPresent || (granteeHasGrantPriv && n.isGrant) {
+					if n.isGrant {
+						privileges.GrantPrivilegeToGrantOptions(grantee, true /*isGrant*/)
+					} else if !n.isGrant && !n.withGrantOption {
+						privileges.GrantPrivilegeToGrantOptions(grantee, false /*isGrant*/)
 					}
 				}
+			}
+
+			if len(noticeMessage) > 0 {
+				params.p.BufferClientNotice(
+					ctx,
+					errors.WithHint(
+						pgnotice.Newf("%s", noticeMessage),
+						"please use WITH GRANT OPTION",
+					),
+				)
 			}
 
 			// Ensure superusers have exactly the allowed privilege set.
@@ -405,76 +403,4 @@ func (p *planner) validateRoles(
 	}
 
 	return nil
-}
-
-// convertPGIncompatibleDatabasePrivilegesToDefaultPrivileges takes the
-// incompatible database privileges in the grant statement and creates
-// a alter default privileges AST and plan node and executes the plan node.
-func convertPGIncompatibleDatabasePrivilegesToDefaultPrivileges(
-	ctx context.Context, p *planner, n *changePrivilegesNode, params runParams,
-) (compatiblePrivs privilege.List, err error) {
-	databaseTargets := n.targets.Databases
-
-	// Convert PGIncompatibleDatabase privileges to default privileges instead.
-	var incompatiblePrivs privilege.List
-	for _, priv := range n.desiredprivs {
-		if privilege.PGIncompatibleDBPrivileges.Contains(priv) {
-			incompatiblePrivs = append(incompatiblePrivs, priv)
-		} else {
-			compatiblePrivs = append(compatiblePrivs, priv)
-		}
-	}
-
-	// The incompatible privileges are added as default privileges for all roles
-	// on the databases.
-	for _, database := range databaseTargets {
-		// If n.targets.Database has elements, all descriptors must be database
-		// descriptors.
-		// The objectType is always Tables since the incompatible pg privileges
-		// are (SELECT, INSERT, UPDATE, DELETE) which were previously allowed
-		// for the sake of inheriting privileges from the DB to the table.
-		objectType := tree.Tables
-		var translatedStatement string
-		if len(incompatiblePrivs) > 0 {
-			alterDefaultPrivilegesASTNode := tree.AlterDefaultPrivileges{
-				ForAllRoles: true,
-				IsGrant:     n.isGrant,
-				Database:    &database,
-			}
-			if n.isGrant {
-				alterDefaultPrivilegesASTNode.Grant = tree.AbbreviatedGrant{
-					Grantees:   n.granteesNameList,
-					Privileges: incompatiblePrivs,
-					Target:     objectType,
-				}
-			} else if !n.isGrant {
-				// If revoke is specified, we need to revoke both existing privileges
-				// on the database and also default privileges.
-				alterDefaultPrivilegesASTNode.Revoke = tree.AbbreviatedRevoke{
-					Grantees:   n.granteesNameList,
-					Privileges: incompatiblePrivs,
-					Target:     objectType,
-				}
-			}
-			alterDefaultPrivilegesNode, err := p.alterDefaultPrivileges(
-				ctx, &alterDefaultPrivilegesASTNode,
-			)
-			if err != nil {
-				return nil, err
-			}
-			translatedStatement = fmt.Sprintf("USE %s; %s;", database.Normalize(),
-				alterDefaultPrivilegesASTNode.String())
-			if err := alterDefaultPrivilegesNode.startExec(params); err != nil {
-				return nil, err
-			}
-
-			p.BufferClientNotice(ctx, pgnotice.Newf(
-				"GRANT %s ON DATABASE is deprecated.\n"+
-					"This statement was automatically converted to %s\n"+
-					"Please use ALTER DEFAULT PRIVILEGES going forward",
-				incompatiblePrivs, translatedStatement,
-			))
-		}
-	}
-	return compatiblePrivs, nil
 }

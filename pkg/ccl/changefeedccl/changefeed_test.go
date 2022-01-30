@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Shopify/sarama"
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
@@ -52,8 +53,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -77,6 +79,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1054,7 +1057,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			context.Background(), &f.Server().ClusterSettings().SV, maxCheckpointSize)
 
 		// Note the tableSpan to avoid resolved events that leave no gaps
-		fooDesc := catalogkv.TestingGetTableDescriptor(
+		fooDesc := desctestutils.TestingGetPublicTableDescriptor(
 			f.Server().DB(), keys.SystemSQLCodec, "d", "foo")
 		tableSpan := fooDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
 
@@ -1695,6 +1698,60 @@ func TestChangefeedAvroNotice(t *testing.T) {
 
 	sql := fmt.Sprintf("CREATE CHANGEFEED FOR d.foo INTO 'null://' WITH format=experimental_avro, confluent_schema_registry='%s'", schemaReg.URL())
 	expectNotice(t, s, sql, `avro is no longer experimental, use format=avro`)
+}
+
+func TestChangefeedOutputTopics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		pgURL, cleanup := sqlutils.PGUrl(t, f.Server().ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		defer cleanup()
+		pgBase, err := pq.NewConnector(pgURL.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual := "(no notice)"
+		connector := pq.ConnectorWithNoticeHandler(pgBase, func(n *pq.Error) {
+			actual = n.Message
+		})
+
+		dbWithHandler := gosql.OpenDB(connector)
+		defer dbWithHandler.Close()
+
+		sqlDB := sqlutils.MakeSQLRunner(dbWithHandler)
+
+		sqlDB.Exec(t, `CREATE TABLE ☃ (i INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO ☃ VALUES (0)`)
+
+		tg := newTeeGroup()
+		feedCh := make(chan *sarama.ProducerMessage, 1024)
+		wrapSink := func(s Sink) Sink {
+			return &fakeKafkaSink{
+				Sink:   s,
+				tg:     tg,
+				feedCh: feedCh,
+			}
+		}
+		c := &kafkaFeed{
+			jobFeed:        newJobFeed(dbWithHandler, wrapSink),
+			seenTrackerMap: make(map[string]struct{}),
+			source:         feedCh,
+			tg:             tg,
+		}
+		defer func() {
+			err = c.Close()
+			require.NoError(t, err)
+		}()
+		kafkaFeed, ok := f.(*kafkaFeedFactory)
+		require.True(t, ok)
+		kafkaFeed.di.prepareJob(c.jobFeed)
+
+		sqlDB.Exec(t, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`)
+		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
 }
 
 func requireErrorSoon(
@@ -3209,6 +3266,14 @@ func TestChangefeedErrors(t *testing.T) {
 		`kafka://nope`,
 	)
 
+	// The topics option should not be exposed to users since it is used
+	// internally to display topics in the show changefeed jobs query
+	sqlDB.ExpectErr(
+		t, `invalid option "topics"`,
+		`CREATE CHANGEFEED FOR foo INTO $1 WITH topics='foo,bar'`,
+		`kafka://nope`,
+	)
+
 	// The cloudStorageSink is particular about the options it will work with.
 	sqlDB.ExpectErr(
 		t, `this sink is incompatible with option confluent_schema_registry`,
@@ -3542,7 +3607,7 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 	var (
 		ctx      = context.Background()
 		userSpan = roachpb.Span{
-			Key:    keys.TestingUserTableDataMin(),
+			Key:    bootstrap.TestingUserTableDataMin(),
 			EndKey: keys.TableDataMax,
 		}
 		done               = make(chan struct{})
@@ -4037,6 +4102,7 @@ func TestChangefeedTelemetry(t *testing.T) {
 // Regression test for #41694.
 func TestChangefeedRestartDuringBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 75080, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	// TODO(yevgeniy): Rework this test.  It's too brittle.
@@ -4598,7 +4664,7 @@ func TestChangefeedBackfillCheckpoint(t *testing.T) {
 		sqlDB.Exec(t, `CREATE TABLE foo(key INT PRIMARY KEY DEFAULT unique_rowid(), val INT)`)
 		sqlDB.Exec(t, `INSERT INTO foo (val) SELECT * FROM generate_series(1, 1000)`)
 
-		fooDesc := catalogkv.TestingGetTableDescriptor(
+		fooDesc := desctestutils.TestingGetPublicTableDescriptor(
 			f.Server().DB(), keys.SystemSQLCodec, "d", "foo")
 		tableSpan := fooDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
 

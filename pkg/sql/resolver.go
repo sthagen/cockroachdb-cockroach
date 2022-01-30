@@ -19,8 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -317,20 +317,31 @@ func (p *planner) HasPrivilege(
 	// hasPrivilegeFunc checks whether any role has the given privilege.
 	hasPrivilegeFunc := func(priv privilege.Privilege) (bool, error) {
 		err := p.CheckPrivilegeForUser(ctx, desc, priv.Kind, user)
-		if err == nil {
-			if priv.GrantOption {
-				if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-					err = p.CheckPrivilegeForUser(ctx, desc, privilege.GRANT, user)
-				} else {
-					err = p.CheckGrantOptionsForUser(ctx, desc, []privilege.Kind{priv.Kind}, true /* isGrant */)
-				}
-			}
-		}
 		if err != nil {
 			if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
 				return false, nil
 			}
 			return false, err
+		}
+
+		if priv.GrantOption {
+			if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
+				err := p.CheckPrivilegeForUser(ctx, desc, privilege.GRANT, user)
+				if err != nil {
+					if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
+						return false, nil
+					}
+					return false, err
+				}
+			} else {
+				err := p.CheckGrantOptionsForUser(ctx, desc, []privilege.Kind{priv.Kind}, user, true /* isGrant */)
+				if err != nil {
+					if pgerror.GetPGCode(err) == pgcode.WarningPrivilegeNotGranted {
+						return false, nil
+					}
+					return false, err
+				}
+			}
 		}
 
 		return true, nil
@@ -367,6 +378,16 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 			ctx, p.txn, descpb.ID(*specifier.DatabaseOID), tree.DatabaseLookupFlags{Required: true},
 		)
 		return database, err
+	} else if specifier.SchemaName != nil {
+		database, err := p.Descriptors().GetImmutableDatabaseByName(
+			ctx, p.txn, *specifier.SchemaDatabaseName, tree.DatabaseLookupFlags{Required: true},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return p.Descriptors().GetImmutableSchemaByName(
+			ctx, p.txn, database, *specifier.SchemaName, tree.SchemaLookupFlags{Required: true},
+		)
 	} else if specifier.TableName != nil || specifier.TableOID != nil {
 		var table catalog.TableDescriptor
 		var err error
@@ -1060,9 +1081,6 @@ func (r *fkSelfResolver) LookupObject(
 // aliased as tableLookupFn below.
 //
 // It only reveals physical descriptors (not virtual descriptors).
-// It also implements catalog.DescGetter for table validation. In this scenario
-// it may fall back to utilizing the fallback DescGetter to resolve references
-// outside of the dbContext in which it was initialized.
 //
 // TODO(ajwerner): remove in 21.2 or whenever cross-database references are
 // fully removed.
@@ -1077,9 +1095,6 @@ type internalLookupCtx struct {
 	tbIDs       []descpb.ID
 	typDescs    map[descpb.ID]catalog.TypeDescriptor
 	typIDs      []descpb.ID
-
-	// fallback is utilized in GetDesc and GetNamespaceEntry.
-	fallback catalog.DescGetter
 }
 
 // GetSchemaName looks up a schema with the given id in the LookupContext.
@@ -1110,52 +1125,22 @@ func (l *internalLookupCtx) GetSchemaName(
 	return schemaName, found, nil
 }
 
-// GetDesc implements the catalog.DescGetter interface.
-func (l *internalLookupCtx) GetDesc(ctx context.Context, id descpb.ID) (catalog.Descriptor, error) {
-	if desc, ok := l.dbDescs[id]; ok {
-		return desc, nil
-	}
-	if desc, ok := l.schemaDescs[id]; ok {
-		return desc, nil
-	}
-	if desc, ok := l.typDescs[id]; ok {
-		return desc, nil
-	}
-	if desc, ok := l.tbDescs[id]; ok {
-		return desc, nil
-	}
-	if l.fallback != nil {
-		return l.fallback.GetDesc(ctx, id)
-	}
-	return nil, nil
-}
-
-// GetNamespaceEntry implements the catalog.DescGetter interface.
-func (l *internalLookupCtx) GetNamespaceEntry(
-	ctx context.Context, parentID, parentSchemaID descpb.ID, name string,
-) (descpb.ID, error) {
-	if l.fallback != nil {
-		return l.fallback.GetNamespaceEntry(ctx, parentID, parentSchemaID, name)
-	}
-	return descpb.InvalidID, nil
-}
-
 // tableLookupFn can be used to retrieve a table descriptor and its corresponding
 // database descriptor using the table's ID.
 type tableLookupFn = *internalLookupCtx
 
-// newInternalLookupCtxFromDescriptors "unwraps" the descriptors into the
+// newInternalLookupCtxFromDescriptorProtos "unwraps" the descriptors into the
 // appropriate implementation of Descriptor before constructing a new
 // internalLookupCtx. It also hydrates any table descriptors with enum
 // information. It is intended only for use when dealing with backups.
-func newInternalLookupCtxFromDescriptors(
+func newInternalLookupCtxFromDescriptorProtos(
 	ctx context.Context, rawDescs []descpb.Descriptor, prefix catalog.DatabaseDescriptor,
 ) (*internalLookupCtx, error) {
 	descriptors := make([]catalog.Descriptor, len(rawDescs))
 	for i := range rawDescs {
-		descriptors[i] = catalogkv.NewBuilder(&rawDescs[i]).BuildImmutable()
+		descriptors[i] = descbuilder.NewBuilder(&rawDescs[i]).BuildImmutable()
 	}
-	lCtx := newInternalLookupCtx(ctx, descriptors, prefix, nil /* fallback */)
+	lCtx := newInternalLookupCtx(descriptors, prefix)
 	if err := descs.HydrateGivenDescriptors(ctx, descriptors); err != nil {
 		return nil, err
 	}
@@ -1165,10 +1150,7 @@ func newInternalLookupCtxFromDescriptors(
 // newInternalLookupCtx provides cached access to a set of descriptors for use
 // in virtual tables.
 func newInternalLookupCtx(
-	ctx context.Context,
-	descs []catalog.Descriptor,
-	prefix catalog.DatabaseDescriptor,
-	fallback catalog.DescGetter,
+	descs []catalog.Descriptor, prefix catalog.DatabaseDescriptor,
 ) *internalLookupCtx {
 	dbNames := make(map[descpb.ID]string)
 	dbDescs := make(map[descpb.ID]catalog.DatabaseDescriptor)
@@ -1222,11 +1204,8 @@ func newInternalLookupCtx(
 		tbIDs:       tbIDs,
 		dbIDs:       dbIDs,
 		typIDs:      typIDs,
-		fallback:    fallback,
 	}
 }
-
-var _ catalog.DescGetter = (*internalLookupCtx)(nil)
 
 func (l *internalLookupCtx) getDatabaseByID(id descpb.ID) (catalog.DatabaseDescriptor, error) {
 	db, ok := l.dbDescs[id]

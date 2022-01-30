@@ -13,6 +13,7 @@ package pgwire
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -47,9 +48,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // ATTENTION: After changing this value in a unit test, you probably want to
@@ -650,7 +653,8 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	if clientErr != nil {
 		return s.sendErr(ctx, conn, clientErr)
 	}
-	ctx = logtags.AddTag(ctx, connType.String(), nil)
+	sp := tracing.SpanFromContext(ctx)
+	sp.SetTag("conn_type", attribute.StringValue(connType.String()))
 
 	// What does the client want to do?
 	switch version {
@@ -691,10 +695,11 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 
 	// Populate the client address field in the context tags and the
 	// shared struct for structured logging.
-	// Only know do we know the remote client address for sure (it may have
+	// Only now do we know the remote client address for sure (it may have
 	// been overridden by a status parameter).
 	connDetails.RemoteAddress = sArgs.RemoteAddr.String()
 	ctx = logtags.AddTag(ctx, "client", connDetails.RemoteAddress)
+	sp.SetTag("client", attribute.StringValue(connDetails.RemoteAddress))
 
 	// If a test is hooking in some authentication option, load it.
 	var testingAuthHook func(context.Context) error
@@ -777,10 +782,19 @@ func parseClientProvidedSessionParameters(
 			// here, so that further lookups for authentication have the correct
 			// identifier.
 			args.User, _ = security.MakeSQLUsernameFromUserInput(value, security.UsernameValidation)
-			// TODO(#sql-experience): we should retrieve the admin status during
-			// authentication using the roles cache, instead of using a simple/naive
-			// username match. See #69355.
+			// IsSuperuser will get updated later when we load the user's session
+			// initialization information.
 			args.IsSuperuser = args.User.IsRootUser()
+
+		case "crdb:session_revival_token_base64":
+			token, err := base64.StdEncoding.DecodeString(value)
+			if err != nil {
+				return sql.SessionArgs{}, pgerror.Wrapf(
+					err, pgcode.ProtocolViolation,
+					"%s", key,
+				)
+			}
+			args.SessionRevivalToken = token
 
 		case "results_buffer_size":
 			if args.ConnResultsBufferSize, err = humanizeutil.ParseBytes(value); err != nil {

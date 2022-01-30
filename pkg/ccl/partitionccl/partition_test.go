@@ -18,20 +18,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
@@ -49,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/require"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -142,14 +147,14 @@ func (pt *partitioningTest) parse() error {
 			return errors.Errorf("expected *tree.CreateTable got %T", stmt)
 		}
 		st := cluster.MakeTestingClusterSettings()
-		parentID, tableID := descpb.ID(keys.TestingUserDescID(0)), descpb.ID(keys.TestingUserDescID(1))
+		parentID, tableID := descpb.ID(bootstrap.TestingUserDescID(0)), descpb.ID(bootstrap.TestingUserDescID(1))
 		mutDesc, err := importccl.MakeTestingSimpleTableDescriptor(
 			ctx, &semaCtx, st, createTable, parentID, keys.PublicSchemaID, tableID, importccl.NoFKs, hlc.UnixNano())
 		if err != nil {
 			return err
 		}
 		pt.parsed.tableDesc = mutDesc
-		if err := catalog.ValidateSelf(pt.parsed.tableDesc); err != nil {
+		if err := descbuilder.ValidateSelf(pt.parsed.tableDesc); err != nil {
 			return err
 		}
 	}
@@ -1444,7 +1449,7 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
 	}
 
 	// Get the zone config corresponding to the table.
-	table := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
+	table := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
 	kv, err := kvDB.Get(ctx, config.MakeZoneKey(keys.SystemSQLCodec, table.GetID()))
 	if err != nil {
 		t.Fatal(err)
@@ -1536,4 +1541,101 @@ func TestRemovePartitioningExpiredLicense(t *testing.T) {
 	expectErr(`ALTER INDEX t@i PARTITION BY RANGE (a) (PARTITION p45 VALUES FROM (4) TO (5))`, partitionErr)
 	expectErr(`ALTER INDEX t@t_pkey CONFIGURE ZONE USING DEFAULT`, zoneErr)
 	expectErr(`ALTER INDEX t@i CONFIGURE ZONE USING DEFAULT`, zoneErr)
+}
+
+// Test that dropping an enum value fails if there's a concurrent index drop
+// for an index partitioned by that enum value. The reason is that it
+// would be bad if we rolled back the dropping of the index.
+func TestDropEnumValueWithConcurrentPartitionedIndexDrop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var s serverutils.TestServerInterface
+	var sqlDB *gosql.DB
+
+	// Use the dropCh to block any DROP INDEX job until the channel is closed.
+	dropCh := make(chan chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	s, sqlDB, _ = serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+				RunBeforeResume: func(jobID jobspb.JobID) error {
+					var isDropJob bool
+					if err := sqlDB.QueryRow(`
+SELECT count(*) > 0
+  FROM [SHOW JOB $1]
+ WHERE description LIKE 'DROP INDEX %'
+`, jobID).Scan(&isDropJob); err != nil {
+						return err
+					}
+					if !isDropJob {
+						return nil
+					}
+					ch := make(chan struct{})
+					select {
+					case dropCh <- ch:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					select {
+					case <-ch:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					return nil
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(context.Background())
+	defer cancel()
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+
+	// Set up the table to have an index which is partitioned by the enum value
+	// we're going to drop.
+	for _, stmt := range []string{
+		`CREATE TYPE t AS ENUM ('a', 'b', 'c')`,
+		`CREATE TABLE tbl (
+    i INT8, k t,
+    PRIMARY KEY (i, k),
+    INDEX idx (k)
+        PARTITION BY RANGE (k)
+            (PARTITION a VALUES FROM ('a') TO ('b'))
+)`,
+	} {
+		tdb.Exec(t, stmt)
+	}
+	// Run a transaction to drop the index and the enum value.
+	errCh := make(chan error)
+	go func() {
+		errCh <- crdb.ExecuteTx(ctx, sqlDB, nil, func(tx *gosql.Tx) error {
+			if _, err := tx.Exec("drop index tbl@idx;"); err != nil {
+				return err
+			}
+			_, err := tx.Exec("alter type t drop value 'a';")
+			return err
+		})
+	}()
+	// Wait until the dropping of the enum value has finished.
+	ch := <-dropCh
+	testutils.SucceedsSoon(t, func() error {
+		var done bool
+		tdb.QueryRow(t, `
+SELECT bool_and(done)
+  FROM (
+        SELECT status NOT IN `+jobs.NonTerminalStatusTupleString+` AS done
+          FROM [SHOW JOBS]
+         WHERE job_type = 'TYPEDESC SCHEMA CHANGE'
+       );`).
+			Scan(&done)
+		if done {
+			return nil
+		}
+		return errors.Errorf("not done")
+	})
+	// Allow the dropping of the index to proceed.
+	close(ch)
+	// Ensure we got the right error.
+	require.Regexp(t,
+		`could not remove enum value "a" as it is being used in the partitioning of index tbl@idx`,
+		<-errCh)
 }

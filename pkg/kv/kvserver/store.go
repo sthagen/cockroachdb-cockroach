@@ -1133,15 +1133,13 @@ func NewStore(
 		log.Fatalf(ctx, "invalid store configuration: %+v", &cfg)
 	}
 	s := &Store{
-		cfg:      cfg,
-		db:       cfg.DB, // TODO(tschottdorf): remove redundancy.
-		engine:   eng,
-		nodeDesc: nodeDesc,
-		metrics:  newStoreMetrics(cfg.HistogramWindowInterval),
-		ctSender: cfg.ClosedTimestampSender,
-		systemRangeStartUpperBound: keys.SystemSQLCodec.TablePrefix(
-			keys.MinUserDescriptorID(keys.DeprecatedSystemIDChecker()),
-		),
+		cfg:                        cfg,
+		db:                         cfg.DB, // TODO(tschottdorf): remove redundancy.
+		engine:                     eng,
+		nodeDesc:                   nodeDesc,
+		metrics:                    newStoreMetrics(cfg.HistogramWindowInterval),
+		ctSender:                   cfg.ClosedTimestampSender,
+		systemRangeStartUpperBound: keys.SystemSQLCodec.TablePrefix(keys.MaxReservedDescID + 1),
 	}
 	if cfg.RPCContext != nil {
 		s.allocator = MakeAllocator(
@@ -1367,7 +1365,7 @@ func (s *Store) AnnotateCtx(ctx context.Context) context.Context {
 // to report work that needed to be done and which may or may not have
 // been done by the time this call returns. See the explanation in
 // pkg/server/drain.go for details.
-func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString)) {
+func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString), verbose bool) {
 	s.draining.Store(drain)
 	if !drain {
 		return
@@ -1438,7 +1436,7 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString)) {
 						// We need this check here because each call of
 						// transferAllAway() traverses all stores/replicas without
 						// checking for the timeout otherwise.
-						if log.V(1) {
+						if verbose || log.V(1) {
 							log.Infof(ctx, "lease transfer aborted due to exceeded timeout")
 						}
 						return
@@ -1477,39 +1475,55 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString)) {
 					// manually to a non-draining replica.
 
 					if !needsLeaseTransfer {
-						if log.V(1) {
+						if verbose || log.V(1) {
 							// This logging is useful to troubleshoot incomplete drains.
 							log.Info(ctx, "not moving out")
 						}
 						atomic.AddInt32(&numTransfersAttempted, -1)
 						return
 					}
-					if log.V(1) {
+
+					desc, conf := r.DescAndSpanConfig()
+
+					if verbose || log.V(1) {
 						// This logging is useful to troubleshoot incomplete drains.
-						log.Infof(ctx, "trying to move replica out")
+						log.Infof(ctx, "attempting to transfer lease %v for range %s", drainingLeaseStatus.Lease, desc)
 					}
 
-					if needsLeaseTransfer {
-						desc, conf := r.DescAndSpanConfig()
-						transferStatus, err := s.replicateQueue.shedLease(
-							ctx,
-							r,
+					start := timeutil.Now()
+					transferStatus, err := s.replicateQueue.shedLease(
+						ctx,
+						r,
+						desc,
+						conf,
+						transferLeaseOptions{},
+					)
+					duration := timeutil.Since(start).Microseconds()
+
+					if transferStatus != transferOK {
+						const failFormat = "failed to transfer lease %s for range %s when draining: %v"
+						const durationFailFormat = "blocked for %d microseconds on transfer attempt"
+
+						infoArgs := []interface{}{
+							drainingLeaseStatus.Lease,
 							desc,
-							conf,
-							transferLeaseOptions{},
-						)
-						if transferStatus != transferOK {
-							if err != nil {
-								log.VErrEventf(ctx, 1, "failed to transfer lease %s for range %s when draining: %s",
-									drainingLeaseStatus.Lease, desc, err)
-							} else {
-								log.VErrEventf(ctx, 1, "failed to transfer lease %s for range %s when draining: %s",
-									drainingLeaseStatus.Lease, desc, transferStatus)
-							}
+						}
+						if err != nil {
+							infoArgs = append(infoArgs, err)
+						} else {
+							infoArgs = append(infoArgs, transferStatus)
+						}
+
+						if verbose {
+							log.Dev.Infof(ctx, failFormat, infoArgs...)
+							log.Dev.Infof(ctx, durationFailFormat, duration)
+						} else {
+							log.VErrEventf(ctx, 1 /* level */, failFormat, infoArgs...)
+							log.VErrEventf(ctx, 1 /* level */, durationFailFormat, duration)
 						}
 					}
 				}); err != nil {
-				if log.V(1) {
+				if verbose || log.V(1) {
 					log.Errorf(ctx, "error running draining task: %+v", err)
 				}
 				wg.Done()
@@ -1950,9 +1964,9 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			s.onSpanConfigUpdate(ctx, update)
 		})
 
-		// When toggling between the system config span and the span configs
-		// infrastructure, we want to re-apply configs on all replicas from
-		// whatever the new source is.
+		// When toggling between the system config span and the span
+		// configs infrastructure, we want to re-apply configs on all
+		// replicas from whatever the new source is.
 		spanconfigstore.EnabledSetting.SetOnChange(&s.ClusterSettings().SV, func(ctx context.Context) {
 			enabled := spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV)
 			if enabled {
@@ -2281,6 +2295,10 @@ func (s *Store) removeReplicaWithRangefeed(rangeID roachpb.RangeID) {
 // systemGossipUpdate is a callback for gossip updates to
 // the system config which affect range split boundaries.
 func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
+	if !s.cfg.SpanConfigsDisabled && spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
+		return // nothing to do
+	}
+
 	ctx := s.AnnotateCtx(context.Background())
 	s.computeInitialMetrics.Do(func() {
 		// Metrics depend in part on the system config. Compute them as soon as we

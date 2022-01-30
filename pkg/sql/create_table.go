@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -158,10 +158,9 @@ func getSchemaForCreateTable(
 		return nil, err
 	}
 
-	desc, err := catalogkv.GetDescriptorCollidingWithObject(
+	desc, err := params.p.Descriptors().GetDescriptorCollidingWithObject(
 		params.ctx,
 		params.p.txn,
-		params.ExecCfg().Codec,
 		db.GetID(),
 		schema.GetID(),
 		tableName.Table(),
@@ -329,7 +328,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		}
 	}
 
-	id, err := catalogkv.GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB, params.p.ExecCfg().Codec)
+	id, err := descidgen.GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB, params.p.ExecCfg().Codec)
 	if err != nil {
 		return err
 	}
@@ -406,7 +405,6 @@ func (n *createTableNode) startExec(params runParams) error {
 		catalogkeys.MakeObjectNameKey(params.ExecCfg().Codec, n.dbDesc.GetID(), schema.GetID(), n.n.Table.Table()),
 		id,
 		desc,
-		params.EvalContext().Settings,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
 	); err != nil {
 		return err
@@ -1272,7 +1270,7 @@ func NewTableDesc(
 		id, dbID, sc.GetID(), n.Table.Table(), creationTime, privileges, persistence,
 	)
 
-	if err := paramparse.ApplyStorageParameters(
+	if err := paramparse.SetStorageParameters(
 		ctx,
 		semaCtx,
 		evalCtx,
@@ -1777,7 +1775,7 @@ func NewTableDesc(
 				}
 				idx.Predicate = expr
 			}
-			if err := paramparse.ApplyStorageParameters(
+			if err := paramparse.SetStorageParameters(
 				ctx,
 				semaCtx,
 				evalCtx,
@@ -2187,16 +2185,6 @@ func newTableDesc(
 	privileges *descpb.PrivilegeDescriptor,
 	affected map[descpb.ID]*tabledesc.Mutable,
 ) (ret *tabledesc.Mutable, err error) {
-	// Process any SERIAL columns to remove the SERIAL type,
-	// as required by NewTableDesc.
-	createStmt := n
-	ensureCopy := func() {
-		if createStmt == n {
-			newCreateStmt := *n
-			n.Defs = append(tree.TableDefs(nil), n.Defs...)
-			createStmt = &newCreateStmt
-		}
-	}
 	newDefs, err := replaceLikeTableOpts(n, params)
 	if err != nil {
 		return nil, err
@@ -2209,37 +2197,13 @@ func newTableDesc(
 		n.Defs = newDefs
 	}
 
-	tn := tree.MakeTableNameFromPrefix(catalog.ResolvedObjectPrefix{
-		Database: db,
-		Schema:   sc,
-	}.NamePrefix(), tree.Name(n.Table.Table()))
-	for i, def := range n.Defs {
-		d, ok := def.(*tree.ColumnTableDef)
-		if !ok {
-			continue
-		}
-		newDef, prefix, seqName, seqOpts, err := params.p.processSerialLikeInColumnDef(params.ctx, d, &tn)
-		if err != nil {
-			return nil, err
-		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
-		if seqName != nil {
-			if err := doCreateSequence(
-				params,
-				prefix.Database,
-				prefix.Schema,
-				seqName,
-				n.Persistence,
-				seqOpts,
-				fmt.Sprintf("creating sequence %s for new table %s", seqName, n.Table.Table()),
-			); err != nil {
-				return nil, err
-			}
-		}
-		if d != newDef {
-			ensureCopy()
-			n.Defs[i] = newDef
-		}
+	// Process any SERIAL columns to remove the SERIAL type, as required by
+	// NewTableDesc.
+	colNameToOwnedSeq, err := createSequencesForSerialColumns(
+		params.ctx, params.p, params.SessionData(), db, sc, n,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	var regionConfig *multiregion.RegionConfig
@@ -2274,6 +2238,17 @@ func newTableDesc(
 			n.Persistence,
 		)
 	})
+
+	// We need to ensure sequence ownerships so that column owned sequences are
+	// correctly dropped when a column/table is dropped.
+	for colName, seqDesc := range colNameToOwnedSeq {
+		// When a table is first created, `affected` includes all the newly created
+		// sequenced. So `affectedSeqDesc` should be always non-nil.
+		affectedSeqDesc := affected[seqDesc.ID]
+		if err := setSequenceOwner(affectedSeqDesc, colName, ret); err != nil {
+			return nil, err
+		}
+	}
 
 	return ret, err
 }
@@ -2620,5 +2595,34 @@ func checkTypeIsSupported(ctx context.Context, settings *cluster.Settings, typ *
 			typ.SQLString(),
 		)
 	}
+	return nil
+}
+
+// setSequenceOwner adds sequence id to the sequence id list owned by a column
+// and set ownership values of sequence options.
+func setSequenceOwner(
+	seqDesc *tabledesc.Mutable, colName tree.Name, table *tabledesc.Mutable,
+) error {
+	if !seqDesc.IsSequence() {
+		return errors.Errorf("%s is not a sequence", seqDesc.Name)
+	}
+
+	col, err := table.FindColumnWithName(colName)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, seqID := range col.ColumnDesc().OwnsSequenceIds {
+		if seqID == seqDesc.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		col.ColumnDesc().OwnsSequenceIds = append(col.ColumnDesc().OwnsSequenceIds, seqDesc.ID)
+	}
+	seqDesc.SequenceOpts.SequenceOwner.OwnerTableID = table.ID
+	seqDesc.SequenceOpts.SequenceOwner.OwnerColumnID = col.GetID()
+
 	return nil
 }

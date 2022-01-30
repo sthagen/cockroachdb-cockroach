@@ -34,7 +34,6 @@ func makeAcceptanceCmd(runE func(cmd *cobra.Command, args []string) error) *cobr
 func (d *dev) acceptance(cmd *cobra.Command, _ []string) error {
 	ctx := cmd.Context()
 	var (
-		// cpus, remote-cache
 		filter  = mustGetFlagString(cmd, filterFlag)
 		short   = mustGetFlagBool(cmd, shortFlag)
 		timeout = mustGetFlagDuration(cmd, timeoutFlag)

@@ -248,7 +248,7 @@ func checkForcedErr(
 			// lease but not Equivalent to each other. If these leases are
 			// proposed under that same third lease, neither will be able to
 			// detect whether the other has applied just by looking at the
-			// current lease sequence number because neither will will increment
+			// current lease sequence number because neither will increment
 			// the sequence number.
 			//
 			// This can lead to inversions in lease expiration timestamps if
@@ -262,13 +262,23 @@ func checkForcedErr(
 				leaseMismatch = !replicaState.Lease.Equivalent(requestedLease)
 			}
 
-			// This is a check to see if the lease we proposed this lease request against is the same
-			// lease that we're trying to update. We need to check proposal timestamps because
-			// extensions don't increment sequence numbers. Without this check a lease could
-			// be extended and then another lease proposed against the original lease would
-			// be applied over the extension.
+			// This is a check to see if the lease we proposed this lease request
+			// against is the same lease that we're trying to update. We need to check
+			// proposal timestamps because extensions don't increment sequence
+			// numbers. Without this check a lease could be extended and then another
+			// lease proposed against the original lease would be applied over the
+			// extension.
+			//
+			// This check also confers replay protection when the sequence number
+			// matches, as it ensures that only the first of duplicated proposal can
+			// apply, and the second will be rejected (since its PrevLeaseProposal
+			// refers to the original lease, and not itself).
+			//
+			// PrevLeaseProposal is always set. Its nullability dates back to the
+			// migration that introduced it.
 			if raftCmd.ReplicatedEvalResult.PrevLeaseProposal != nil &&
-				(*raftCmd.ReplicatedEvalResult.PrevLeaseProposal != *replicaState.Lease.ProposedTS) {
+				// NB: ProposedTS can be nil if the right-hand side is the Range's initial zero Lease.
+				(!raftCmd.ReplicatedEvalResult.PrevLeaseProposal.Equal(replicaState.Lease.ProposedTS)) {
 				leaseMismatch = true
 			}
 		}
@@ -616,6 +626,19 @@ func (b *replicaAppBatch) runPreApplyTriggersAfterStagingWriteBatch(
 ) error {
 	res := cmd.replicatedResult()
 
+	// MVCC history mutations violate the closed timestamp, modifying data that
+	// has already been emitted and checkpointed via a rangefeed. Callers are
+	// expected to ensure that no rangefeeds are currently active across such
+	// spans, but as a safeguard we disconnect the overlapping rangefeeds
+	// with a non-retriable error anyway.
+	if res.MVCCHistoryMutation != nil {
+		for _, span := range res.MVCCHistoryMutation.Spans {
+			b.r.disconnectRangefeedSpanWithErr(span, roachpb.NewError(&roachpb.MVCCHistoryMutationError{
+				Span: span,
+			}))
+		}
+	}
+
 	// AddSSTable ingestions run before the actual batch gets written to the
 	// storage engine. This makes sure that when the Raft command is applied,
 	// the ingestion has definitely succeeded. Note that we have taken
@@ -643,6 +666,10 @@ func (b *replicaAppBatch) runPreApplyTriggersAfterStagingWriteBatch(
 		}
 		if added := res.Delta.KeyCount; added > 0 {
 			b.r.writeStats.recordCount(float64(added), 0)
+		}
+		if res.AddSSTable.AtWriteTimestamp {
+			b.r.handleSSTableRaftMuLocked(
+				ctx, res.AddSSTable.Data, res.AddSSTable.Span, res.WriteTimestamp)
 		}
 		res.AddSSTable = nil
 	}

@@ -393,8 +393,14 @@ func (u *sqlSymUnion) storageParams() []tree.StorageParam {
     }
     return nil
 }
+func (u *sqlSymUnion) storageParamKeys() []tree.Name {
+    if params, ok := u.val.([]tree.Name); ok {
+        return params
+    }
+    return nil
+}
 func (u *sqlSymUnion) persistence() tree.Persistence {
- return u.val.(tree.Persistence)
+  return u.val.(tree.Persistence)
 }
 func (u *sqlSymUnion) colType() *types.T {
     if colType, ok := u.val.(*types.T); ok && colType != nil {
@@ -1118,6 +1124,8 @@ func (u *sqlSymUnion) setVar() *tree.SetVar {
 %type <*tree.RestoreOptions> opt_with_restore_options restore_options restore_options_list
 %type <*tree.CopyOptions> opt_with_copy_options copy_options copy_options_list
 %type <str> import_format
+%type <str> storage_parameter_key
+%type <tree.NameList> storage_parameter_key_list
 %type <tree.StorageParam> storage_parameter
 %type <[]tree.StorageParam> storage_parameter_list opt_table_with opt_with_storage_parameter_list
 
@@ -1552,6 +1560,7 @@ alter_ddl_stmt:
 //   ALTER TABLE ... RENAME TO <newname>
 //   ALTER TABLE ... RENAME [COLUMN] <colname> TO <newname>
 //   ALTER TABLE ... VALIDATE CONSTRAINT <constraintname>
+//   ALTER TABLE ... SET (storage_param = value, ...)
 //   ALTER TABLE ... SPLIT AT <selectclause> [WITH EXPIRATION <expr>]
 //   ALTER TABLE ... UNSPLIT AT <selectclause>
 //   ALTER TABLE ... UNSPLIT ALL
@@ -2365,6 +2374,18 @@ alter_table_cmd:
       Stats: $3.expr(),
     }
   }
+| SET '(' storage_parameter_list ')'
+  {
+    $$.val = &tree.AlterTableSetStorageParams{
+      StorageParams: $3.storageParams(),
+    }
+  }
+| RESET '(' storage_parameter_key_list ')'
+  {
+    $$.val = &tree.AlterTableResetStorageParams{
+      Params: $3.storageParamKeys(),
+    }
+  }
 
 audit_mode:
   READ WRITE { $$.val = tree.AuditModeReadWrite }
@@ -3135,7 +3156,7 @@ import_format:
 alter_unsupported_stmt:
   ALTER FUNCTION error
   {
-    return unimplemented(sqllex, "alter function")
+    return unimplementedWithIssueDetail(sqllex, 17511, "alter function")
   }
 | ALTER DOMAIN error
   {
@@ -3143,7 +3164,7 @@ alter_unsupported_stmt:
   }
 | ALTER AGGREGATE error
   {
-    return unimplemented(sqllex, "alter aggregate")
+    return unimplementedWithIssueDetail(sqllex, 74775, "alter aggregate")
   }
 
 // %Help: IMPORT - load data from file in a distributed manner
@@ -3529,7 +3550,7 @@ comment_stmt:
   {
     $$.val = &tree.CommentOnConstraint{Constraint:tree.Name($4), Table: $6.unresolvedObjectName(), Comment: $8.strPtr()}
   }
-| COMMENT ON EXTENSION error { return unimplemented(sqllex, "comment on extension") }
+| COMMENT ON EXTENSION error { return unimplementedWithIssueDetail(sqllex, 74777, "comment on extension") }
 | COMMENT ON FUNCTION error { return unimplementedWithIssueDetail(sqllex, 17511, "comment on function") }
 
 comment_text:
@@ -3572,12 +3593,18 @@ create_extension_stmt:
 | CREATE EXTENSION name {
     $$.val = &tree.CreateExtension{Name: $3}
   }
-| CREATE EXTENSION IF NOT EXISTS name WITH error { return unimplemented(sqllex, "create extension if not exists with") }
+| CREATE EXTENSION IF NOT EXISTS name WITH error
+  {
+    return unimplementedWithIssueDetail(sqllex, 74777, "create extension if not exists with")
+  }
+| CREATE EXTENSION name WITH error {
+    return unimplementedWithIssueDetail(sqllex, 74777, "create extension with")
+  }
 | CREATE EXTENSION error // SHOW HELP: CREATE EXTENSION
 
 create_unsupported:
   CREATE ACCESS METHOD error { return unimplemented(sqllex, "create access method") }
-| CREATE AGGREGATE error { return unimplemented(sqllex, "create aggregate") }
+| CREATE AGGREGATE error { return unimplementedWithIssueDetail(sqllex, 74775, "create aggregate") }
 | CREATE CAST error { return unimplemented(sqllex, "create cast") }
 | CREATE CONSTRAINT TRIGGER error { return unimplementedWithIssueDetail(sqllex, 28296, "create constraint") }
 | CREATE CONVERSION error { return unimplemented(sqllex, "create conversion") }
@@ -3610,13 +3637,13 @@ opt_procedural:
 
 drop_unsupported:
   DROP ACCESS METHOD error { return unimplemented(sqllex, "drop access method") }
-| DROP AGGREGATE error { return unimplemented(sqllex, "drop aggregate") }
+| DROP AGGREGATE error { return unimplementedWithIssueDetail(sqllex, 74775, "drop aggregate") }
 | DROP CAST error { return unimplemented(sqllex, "drop cast") }
 | DROP COLLATION error { return unimplemented(sqllex, "drop collation") }
 | DROP CONVERSION error { return unimplemented(sqllex, "drop conversion") }
 | DROP DOMAIN error { return unimplementedWithIssueDetail(sqllex, 27796, "drop") }
-| DROP EXTENSION IF EXISTS name error { return unimplemented(sqllex, "drop extension " + $5) }
-| DROP EXTENSION name error { return unimplemented(sqllex, "drop extension " + $3) }
+| DROP EXTENSION IF EXISTS name error { return unimplementedWithIssueDetail(sqllex, 74777, "drop extension if exists") }
+| DROP EXTENSION name error { return unimplementedWithIssueDetail(sqllex, 74777, "drop extension") }
 | DROP FOREIGN TABLE error { return unimplemented(sqllex, "drop foreign table") }
 | DROP FOREIGN DATA error { return unimplemented(sqllex, "drop fdw") }
 | DROP FUNCTION error { return unimplementedWithIssueDetail(sqllex, 17511, "drop function") }
@@ -4421,7 +4448,7 @@ grant_stmt:
   }
 | GRANT privileges ON SEQUENCE error
   {
-    return unimplemented(sqllex, "grant privileges on sequence")
+    return unimplementedWithIssueDetail(sqllex, 74780, "grant privileges on sequence")
   }
 | GRANT error // SHOW HELP: GRANT
 
@@ -6579,12 +6606,22 @@ opt_create_table_on_commit:
     return unimplementedWithIssueDetail(sqllex, 46556, "drop")
   }
 
-storage_parameter:
-  name '=' var_value
+storage_parameter_key:
+  name
+| SCONST
+
+storage_parameter_key_list:
+  storage_parameter_key
   {
-    $$.val = tree.StorageParam{Key: tree.Name($1), Value: $3.expr()}
+    $$.val = []tree.Name{tree.Name($1)}
   }
-|  SCONST '=' var_value
+| storage_parameter_key_list ',' storage_parameter_key
+  {
+    $$.val = append($1.storageParamKeys(), tree.Name($3))
+  }
+
+storage_parameter:
+  storage_parameter_key '=' var_value
   {
     $$.val = tree.StorageParam{Key: tree.Name($1), Value: $3.expr()}
   }
@@ -6951,7 +6988,14 @@ col_qualification_elem:
   {
     $$.val = tree.PrimaryKeyConstraint{}
   }
-| PRIMARY KEY USING HASH WITH BUCKET_COUNT '=' a_expr
+| PRIMARY KEY USING HASH
+{
+  $$.val = tree.ShardedPrimaryKeyConstraint{
+    Sharded: true,
+    ShardBuckets: tree.DefaultVal{},
+  }
+}
+| PRIMARY KEY USING HASH WITH_LA BUCKET_COUNT '=' a_expr
 {
   $$.val = tree.ShardedPrimaryKeyConstraint{
     Sharded: true,
@@ -7279,10 +7323,17 @@ opt_storing:
   }
 
 opt_hash_sharded:
-  USING HASH WITH BUCKET_COUNT '=' a_expr
+  USING HASH WITH_LA BUCKET_COUNT '=' a_expr
   {
     $$.val = &tree.ShardedIndexDef{
       ShardBuckets: $6.expr(),
+    }
+  }
+  |
+  USING HASH
+  {
+    $$.val = &tree.ShardedIndexDef{
+      ShardBuckets: tree.DefaultVal{},
     }
   }
   | /* EMPTY */

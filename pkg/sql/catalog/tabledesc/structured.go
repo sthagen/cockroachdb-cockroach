@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -62,11 +63,6 @@ var ErrMissingColumns = errors.New("table must contain at least 1 column")
 
 // ErrMissingPrimaryKey indicates a table with no primary key.
 var ErrMissingPrimaryKey = errors.New("table must contain a primary key")
-
-// ErrIndexGCMutationsList is returned by FindIndexWithID to signal that the
-// index with the given ID does not have a descriptor and is in the garbage
-// collected mutations list.
-var ErrIndexGCMutationsList = errors.New("index in GC mutations list")
 
 // PostDeserializationTableDescriptorChanges are a set of booleans to indicate
 // which types of upgrades or fixes occurred when filling in the descriptor
@@ -637,7 +633,7 @@ func (desc *Mutable) AllocateIDs(ctx context.Context) error {
 	if desc.ID == 0 {
 		desc.ID = keys.SystemDatabaseID
 	}
-	err := catalog.ValidateSelf(desc)
+	err := validate.Self(desc)
 	desc.ID = savedID
 
 	return err
@@ -712,7 +708,7 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 	}
 
 	// Assign names to unnamed indexes.
-	err := catalog.ForEachDeletableNonPrimaryIndex(desc, func(idx catalog.Index) error {
+	err := catalog.ForEachNonPrimaryIndex(desc, func(idx catalog.Index) error {
 		if len(idx.GetName()) == 0 {
 			name, err := BuildIndexName(desc, idx.IndexDesc())
 			if err != nil {
@@ -2319,9 +2315,8 @@ func (desc *immutable) ActiveChecks() []descpb.TableDescriptor_CheckConstraint {
 	return desc.allChecks
 }
 
-// IsShardColumn returns true if col corresponds to a non-dropped hash sharded
-// index. This method assumes that col is currently a member of desc.
-func (desc *Mutable) IsShardColumn(col catalog.Column) bool {
+// IsShardColumn implements the TableDescriptor interface.
+func (desc *wrapper) IsShardColumn(col catalog.Column) bool {
 	return nil != catalog.FindNonDropIndex(desc, func(idx catalog.Index) bool {
 		return idx.IsSharded() && idx.GetShardColumnName() == col.GetName()
 	})

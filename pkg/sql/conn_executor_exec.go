@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // execStmt executes one statement by dispatching according to the current
@@ -77,6 +78,7 @@ func (ex *connExecutor) execStmt(
 	prepared *PreparedStatement,
 	pinfo *tree.PlaceholderInfo,
 	res RestrictedCommandResult,
+	canAutoCommit bool,
 ) (fsm.Event, fsm.EventPayload, error) {
 	ast := parserStmt.AST
 	if log.V(2) || logStatementsExecuteEnabled.Get(&ex.server.cfg.Settings.SV) ||
@@ -129,10 +131,10 @@ func (ex *connExecutor) execStmt(
 				"stmt.no.constants", stmtNoConstants,
 			)
 			pprof.Do(ctx, labels, func(ctx context.Context) {
-				ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res)
+				ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res, canAutoCommit)
 			})
 		} else {
-			ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res)
+			ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res, canAutoCommit)
 		}
 		switch ev.(type) {
 		case eventNonRetriableErr:
@@ -197,6 +199,7 @@ func (ex *connExecutor) execPortal(
 	portalName string,
 	stmtRes CommandResult,
 	pinfo *tree.PlaceholderInfo,
+	canAutoCommit bool,
 ) (ev fsm.Event, payload fsm.EventPayload, err error) {
 	switch ex.machine.CurState().(type) {
 	case stateOpen:
@@ -219,7 +222,7 @@ func (ex *connExecutor) execPortal(
 		if portal.exhausted {
 			return nil, nil, nil
 		}
-		ev, payload, err = ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes)
+		ev, payload, err = ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes, canAutoCommit)
 		// Portal suspension is supported via a "side" state machine
 		// (see pgwire.limitedCommandResult for details), so when
 		// execStmt returns, we know for sure that the portal has been
@@ -235,7 +238,7 @@ func (ex *connExecutor) execPortal(
 		return ev, payload, err
 
 	default:
-		return ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes)
+		return ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes, canAutoCommit)
 	}
 }
 
@@ -258,7 +261,12 @@ func (ex *connExecutor) execStmtInOpenState(
 	prepared *PreparedStatement,
 	pinfo *tree.PlaceholderInfo,
 	res RestrictedCommandResult,
+	canAutoCommit bool,
 ) (retEv fsm.Event, retPayload fsm.EventPayload, retErr error) {
+	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "sql query")
+	// TODO(andrei): Consider adding the placeholders as tags too.
+	sp.SetTag("statement", attribute.StringValue(parserStmt.SQL))
+	defer sp.Finish()
 	ast := parserStmt.AST
 	ctx = withStatement(ctx, ast)
 
@@ -276,27 +284,12 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 	os := ex.machine.CurState().(stateOpen)
 
-	isNextCmdSync := false
 	isExtendedProtocol := prepared != nil
 	if isExtendedProtocol {
 		stmt = makeStatementFromPrepared(prepared, queryID)
-		// Only check for Sync in the extended protocol. In the simple protocol,
-		// Sync is meaningless, so it's OK to let isNextCmdSync default to false.
-		isNextCmdSync, err = ex.stmtBuf.isNextCmdSync()
-		if err != nil {
-			return makeErrEvent(err)
-		}
 	} else {
 		stmt = makeStatement(parserStmt, queryID)
 	}
-
-	// In some cases, we need to turn off autocommit behavior here. The postgres
-	// docs say that commands in the extended protocol are all treated as an
-	// implicit transaction that does not get committed until a Sync message is
-	// received. However, if we are executing a statement that is immediately
-	// followed by Sync (which is the common case), then we still can auto-commit,
-	// which allows the "insert fast path" (1PC optimization) to be used.
-	canAutoCommit := os.ImplicitTxn.Get() && (!isExtendedProtocol || isNextCmdSync)
 
 	ex.incrementStartedStmtCounter(ast)
 	defer func() {
@@ -825,12 +818,10 @@ func (ex *connExecutor) checkDescriptorTwoVersionInvariant(ctx context.Context) 
 // transaction. commitFn is passed as a separate function, so that we avoid
 // executing transactional logic when handling COMMIT in the CommitWait state.
 func (ex *connExecutor) commitSQLTransaction(
-	ctx context.Context,
-	ast tree.Statement,
-	commitFn func(ctx context.Context, ast tree.Statement) error,
+	ctx context.Context, ast tree.Statement, commitFn func(ctx context.Context) error,
 ) (fsm.Event, fsm.EventPayload) {
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartTransactionCommit, timeutil.Now())
-	if err := commitFn(ctx, ast); err != nil {
+	if err := commitFn(ctx); err != nil {
 		return ex.makeErrEvent(err, ast)
 	}
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndTransactionCommit, timeutil.Now())
@@ -880,9 +871,10 @@ func (ex *connExecutor) reportSessionDataChanges(fn func() error) error {
 	return nil
 }
 
-func (ex *connExecutor) commitSQLTransactionInternal(
-	ctx context.Context, ast tree.Statement,
-) error {
+func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error {
+	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "commit sql txn")
+	defer sp.Finish()
+
 	if err := ex.createJobs(ctx); err != nil {
 		return err
 	}
@@ -1615,7 +1607,7 @@ func (ex *connExecutor) execStmtInCommitWaitState(
 		return ex.commitSQLTransaction(
 			ctx,
 			ast,
-			func(ctx context.Context, ast tree.Statement) error {
+			func(ctx context.Context) error {
 				// COMMIT while in the CommitWait state is a no-op.
 				return nil
 			},
@@ -1956,7 +1948,7 @@ func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent) {
 	}
 }
 
-func (ex *connExecutor) onTxnRestart() {
+func (ex *connExecutor) onTxnRestart(ctx context.Context) {
 	if ex.extraTxnState.shouldExecuteOnTxnRestart {
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionMostRecentStartExecTransaction, timeutil.Now())
 		ex.extraTxnState.transactionStatementFingerprintIDs = nil
@@ -1970,7 +1962,7 @@ func (ex *connExecutor) onTxnRestart() {
 		ex.extraTxnState.rowsWritten = 0
 
 		if ex.server.cfg.TestingKnobs.BeforeRestart != nil {
-			ex.server.cfg.TestingKnobs.BeforeRestart(ex.Ctx(), ex.extraTxnState.autoRetryReason)
+			ex.server.cfg.TestingKnobs.BeforeRestart(ctx, ex.extraTxnState.autoRetryReason)
 		}
 	}
 }

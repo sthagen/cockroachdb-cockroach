@@ -507,6 +507,9 @@ type testClusterConfig struct {
 	// localities is set if nodes should be set to a particular locality.
 	// Nodes are 1-indexed.
 	localities map[int]roachpb.Locality
+	// declarativeSchemaChanger determines if the declarative schema changer
+	// is enabled.
+	declarativeSchemaChanger bool
 }
 
 const threeNodeTenantConfigName = "3node-tenant"
@@ -580,6 +583,13 @@ var logicTestConfigs = []testClusterConfig{
 		numNodes:            1,
 		overrideDistSQLMode: "off",
 		overrideAutoStats:   "false",
+	},
+	{
+		name:                     "local-declarative-schema",
+		numNodes:                 5,
+		overrideDistSQLMode:      "off",
+		overrideAutoStats:        "false",
+		declarativeSchemaChanger: true,
 	},
 	{
 		name:                "local-vec-off",
@@ -799,6 +809,7 @@ var (
 	defaultConfigName  = "default-configs"
 	defaultConfigNames = []string{
 		"local",
+		"local-declarative-schema",
 		"local-vec-off",
 		"local-spec-planning",
 		"fakedist",
@@ -1217,7 +1228,7 @@ type logicTest struct {
 	// new one, but keep some shared resources across the entire test. An example
 	// would be an IO directory used throughout the test.
 	testCleanupFuncs []func()
-	// progress holds the number of tests executed so far.
+	// progress holds the number of statements executed so far.
 	progress int
 	// failures holds the number of tests failed so far, when
 	// -try-harder is set.
@@ -1325,11 +1336,13 @@ func (t *logicTest) close() {
 // out emits a message both on stdout and the log files if
 // verbose is set.
 func (t *logicTest) outf(format string, args ...interface{}) {
-	if t.verbose {
-		fmt.Printf(format, args...)
-		fmt.Println()
-		log.Infof(context.Background(), format, args...)
+	if !t.verbose {
+		return
 	}
+	log.Infof(context.Background(), format, args...)
+	msg := fmt.Sprintf(format, args...)
+	now := timeutil.Now().Format("15:04:05")
+	fmt.Printf("[%s] %s\n", now, msg)
 }
 
 // setUser sets the DB client to the specified user.
@@ -1658,6 +1671,14 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs, opts []clusterOpt) {
 			"SET CLUSTER SETTING sql.crdb_internal.table_row_statistics.as_of_time = '-1µs'",
 		); err != nil {
 			t.Fatal(err)
+		}
+
+		if cfg.declarativeSchemaChanger {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.defaults.experimental_new_schema_changer.enabled = 'on'",
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
@@ -2450,6 +2471,11 @@ func (t *logicTest) processSubtest(subtest subtestDetails, path string) error {
 					}
 				}
 			} else {
+				if *rewriteResultsInTestfiles {
+					for _, l := range query.expectedResultsRaw {
+						t.emit(l)
+					}
+				}
 				s.LogAndResetSkip(t)
 			}
 			repeat = 1
@@ -3220,7 +3246,7 @@ func (t *logicTest) success(file string) {
 	now := timeutil.Now()
 	if now.Sub(t.lastProgress) >= 2*time.Second {
 		t.lastProgress = now
-		t.outf("--- progress: %s: %d statements/queries", file, t.progress)
+		t.outf("--- progress: %s: %d statements", file, t.progress)
 	}
 }
 
@@ -3593,7 +3619,7 @@ func RunLogicTestWithDefaultConfig(
 					now := timeutil.Now()
 					if now.Sub(progress.lastProgress) >= 2*time.Second {
 						progress.lastProgress = now
-						lt.outf("--- total progress: %d statements/queries", progress.total)
+						lt.outf("--- total progress: %d statements", progress.total)
 					}
 				})
 			}

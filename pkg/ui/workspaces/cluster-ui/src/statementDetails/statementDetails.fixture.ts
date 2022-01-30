@@ -151,14 +151,7 @@ export const getStatementDetailsPropsFixture = (): StatementDetailsProps => ({
   },
   statement: {
     statement:
-      "CREATE TABLE IF NOT EXISTS promo_codes (\n" +
-      "  code            VARCHAR NOT NULL,\n" +
-      "  description     VARCHAR NULL,\n" +
-      "  creation_time   TIMESTAMP NULL,\n" +
-      "  expiration_time TIMESTAMP NULL,\n" +
-      "  rules           JSONB NULL,\n" +
-      "  PRIMARY KEY (code ASC)\n" +
-      ")",
+      "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
     stats: statementStats,
     database: "defaultdb",
     byNode: [
@@ -247,6 +240,7 @@ export const getStatementDetailsPropsFixture = (): StatementDetailsProps => ({
   refreshStatementDiagnosticsRequests: noop,
   refreshNodes: noop,
   refreshNodesLiveness: noop,
+  refreshUserSQLRoles: noop,
   diagnosticsReports: [],
   dismissStatementDiagnosticsAlertMessage: noop,
   createStatementDiagnosticsReport: noop,
@@ -254,4 +248,5 @@ export const getStatementDetailsPropsFixture = (): StatementDetailsProps => ({
     showStatementDiagnosticsLink: true,
   },
   isTenant: false,
+  hasViewActivityRedactedRole: false,
 });

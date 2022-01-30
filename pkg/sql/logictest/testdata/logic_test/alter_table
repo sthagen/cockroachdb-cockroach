@@ -2106,3 +2106,208 @@ ALTER TABLE colsource ADD COLUMN customer_id UUID  REFERENCES colref(id), ADD CO
 
 statement ok
 COMMIT
+
+# Issue #75074 occurred when we added multiple columns inside a single transaction,
+# where the backfill logic was completely skipped because the last added column
+# did not require one. This test will add multiple columns and confirm that a
+# backfill has occurred.
+subtest add_multiple_in_txn
+
+statement ok
+CREATE SEQUENCE IF NOT EXISTS multipleinstmt_seq MAXVALUE 9007199254740991;
+
+statement ok
+CREATE TABLE IF NOT EXISTS multipleinstmt (
+	id INT8 DEFAULT nextval('multipleinstmt_seq') PRIMARY KEY, key STRING, value STRING
+);
+INSERT INTO multipleinstmt (key, value) VALUES ('a', 'a');
+INSERT INTO multipleinstmt (key, value) VALUES ('b', 'b');
+INSERT INTO multipleinstmt (key, value) VALUES ('c', 'c');
+
+
+statement ok
+BEGIN;
+ALTER TABLE multipleinstmt ADD COLUMN IF NOT EXISTS a BOOL DEFAULT false;
+ALTER TABLE multipleinstmt ADD COLUMN IF NOT EXISTS b STRING;
+COMMIT;
+
+query ITTBT
+SELECT * FROM multipleinstmt ORDER BY id ASC;
+----
+1  a  a  false  NULL
+2  b  b  false  NULL
+3  c  c  false  NULL
+
+statement ok
+ALTER TABLE multipleinstmt ADD COLUMN IF NOT EXISTS c BOOL DEFAULT true,
+                           ADD COLUMN IF NOT EXISTS d STRING;
+
+query ITTBTBT
+SELECT * FROM multipleinstmt ORDER BY id ASC;
+----
+1  a  a  false  NULL  true  NULL
+2  b  b  false  NULL  true  NULL
+3  c  c  false  NULL  true  NULL
+
+subtest storage_params
+
+statement ok
+CREATE TABLE storage_param_table()
+
+statement error pgcode 22023 invalid storage parameter "foo"
+ALTER TABLE storage_param_table SET (foo=100)
+
+statement error parameter "fillfactor" requires a float value
+ALTER TABLE storage_param_table SET (fillfactor=true)
+
+statement error unimplemented: storage parameter "toast_tuple_target"
+ALTER TABLE storage_param_table SET (toast_tuple_target=100)
+
+query T noticetrace
+ALTER TABLE storage_param_table SET (fillfactor=99.9, autovacuum_enabled = off)
+----
+NOTICE: storage parameter "fillfactor" is ignored
+NOTICE: storage parameter "autovacuum_enabled = 'off'" is ignored
+
+statement error parameter "autovacuum_enabled" requires a Boolean value
+ALTER TABLE storage_param_table SET (autovacuum_enabled='11')
+
+statement error pgcode 22023 invalid storage parameter "foo"
+ALTER TABLE storage_param_table RESET (foo)
+
+statement ok
+ALTER TABLE storage_param_table RESET (fillfactor, toast_tuple_target)
+
+# Fixes issue 75154 when dropping and re-creating a constraint in a transaction
+# we incorrectly detected the primary index as being used, even if its dropped
+# inside the transaction. The primary index will still exist, but will be
+# disabled via the drop constraint.
+subtest drop-and-add-constraint-primary-index
+
+statement ok
+BEGIN;
+create table const_tbl (a int, b int, constraint "bob" primary key (a, b));
+alter table const_tbl drop constraint "bob";
+alter table const_tbl add constraint "bob" primary key (a, b); -- this statement
+COMMIT;
+
+statement error relation \"const_tbl\" \(\d+\): unimplemented: primary key dropped without subsequent addition of new primary key in same transaction.*
+BEGIN;
+alter table const_tbl drop constraint "bob";
+alter table const_tbl add constraint "bob" primary key (a, b); -- this statement
+alter table const_tbl drop constraint "bob";
+COMMIT;
+
+statement ok
+BEGIN;
+alter table const_tbl drop constraint "bob";
+-- Note: Primary key must be restored first before any other command will
+-- be allowed.
+alter table const_tbl add constraint "steve" primary key (a, b); -- this statement
+
+statement error pq: relation \"const_tbl\" \(\d+\): unimplemented: cannot perform other schema changes in the same transaction as a primary key change.*
+alter table const_tbl add constraint "bob" CHECK (a > 100);
+
+statement ok
+rollback
+
+statement ok
+alter table const_tbl add constraint "steve" CHECK (a > 100);
+
+statement ok
+BEGIN;
+alter table const_tbl drop constraint "steve";
+alter table const_tbl add constraint "steve" CHECK (a > 100);
+COMMIT;
+
+statement error  pq: duplicate constraint name: "steve"
+BEGIN;
+alter table const_tbl drop constraint "steve";
+alter table const_tbl add constraint "steve" CHECK (a > 100);
+alter table const_tbl add constraint "steve" CHECK (a > 100);
+COMMIT;
+
+# This is needed for following tests not to run in the aborted transaction
+# above.
+statement ok
+rollback
+
+# Test sequence is drop when a owner table/column is dropped
+subtest test_serial_ownership_add_column
+
+statement ok
+SET serial_normalization = sql_sequence;
+
+statement ok
+CREATE TABLE test_serial (
+	a INT PRIMARY KEY
+);
+
+statement ok
+ALTER TABLE test_serial ADD COLUMN b SERIAL;
+
+query ITTT colnames
+SELECT l.table_id, l.name, l.state, r.refobjid
+FROM (
+  SELECT table_id, name, state
+  FROM crdb_internal.tables WHERE name
+  LIKE 'test_serial%' AND state = 'PUBLIC'
+) l
+LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
+----
+table_id  name               state   refobjid
+155       test_serial_b_seq  PUBLIC  154
+154       test_serial        PUBLIC  NULL
+
+statement ok
+DROP TABLE test_serial;
+
+query ITTT colnames
+SELECT l.table_id, l.name, l.state, r.refobjid
+FROM (
+  SELECT table_id, name, state
+  FROM crdb_internal.tables WHERE name
+  LIKE 'test_serial%' AND state = 'PUBLIC'
+) l
+LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
+----
+table_id  name  state  refobjid
+
+statement ok
+CREATE TABLE test_serial (
+	a INT PRIMARY KEY
+);
+
+statement ok
+ALTER TABLE test_serial ADD COLUMN b SERIAL;
+
+query ITTT colnames
+SELECT l.table_id, l.name, l.state, r.refobjid
+FROM (
+  SELECT table_id, name, state
+  FROM crdb_internal.tables WHERE name
+  LIKE 'test_serial%' AND state = 'PUBLIC'
+) l
+LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
+----
+table_id  name               state   refobjid
+157       test_serial_b_seq  PUBLIC  156
+156       test_serial        PUBLIC  NULL
+
+statement ok
+ALTER TABLE test_serial DROP COLUMN b;
+
+query ITTT colnames
+SELECT l.table_id, l.name, l.state, r.refobjid
+FROM (
+  SELECT table_id, name, state
+  FROM crdb_internal.tables WHERE name
+  LIKE 'test_serial%' AND state = 'PUBLIC'
+) l
+LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
+----
+table_id  name         state   refobjid
+156       test_serial  PUBLIC  NULL
+
+statement ok
+DROP TABLE test_serial;

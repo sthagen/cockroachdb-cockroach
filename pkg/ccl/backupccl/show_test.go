@@ -25,7 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -163,8 +164,8 @@ ORDER BY object_type, object_name`, full)
 	sqlDB.Exec(t, `CREATE TABLE data.details2()`)
 	sqlDB.Exec(t, `BACKUP data.details1, data.details2 TO $1;`, details)
 
-	details1Desc := catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details1")
-	details2Desc := catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details2")
+	details1Desc := desctestutils.TestingGetPublicTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details1")
+	details2Desc := desctestutils.TestingGetPublicTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details2")
 	details1Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details1Desc.GetID(), details1Desc.GetPrimaryIndexID()))
 	details2Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details2Desc.GetID(), details2Desc.GetPrimaryIndexID()))
 
@@ -205,8 +206,8 @@ ORDER BY object_type, object_name`, full)
 
 		// Create tables with the same ID as data.tableA to ensure that comments
 		// from different tables in the restoring cluster don't appear.
-		tableA := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "data", "tablea")
-		for i := keys.TestingUserDescID(0); i < uint32(tableA.GetID()); i++ {
+		tableA := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "data", "tablea")
+		for i := bootstrap.TestingUserDescID(0); i < uint32(tableA.GetID()); i++ {
 			tableName := fmt.Sprintf("foo%d", i)
 			sqlDBRestore.Exec(t, fmt.Sprintf("CREATE TABLE %s ();", tableName))
 			sqlDBRestore.Exec(t, fmt.Sprintf("COMMENT ON TABLE %s IS 'table comment'", tableName))
@@ -333,7 +334,7 @@ GRANT agents TO agent_bond;
 GRANT agents TO agent_thomas;
 
 GRANT ALL ON DATABASE mi5 TO agents;
-REVOKE UPDATE ON DATABASE mi5 FROM agents;
+--REVOKE UPDATE ON DATABASE mi5 FROM agents;
 
 GRANT ALL ON SCHEMA locator TO m;
 GRANT ALL ON SCHEMA locator TO agent_bond;
@@ -355,8 +356,8 @@ GRANT UPDATE ON top_secret TO agent_bond;
 		sqlDB.Exec(t, `BACKUP DATABASE mi5 TO $1;`, showPrivs)
 
 		want := [][]string{
-			{`mi5`, `database`, `GRANT ALL ON mi5 TO admin; GRANT CONNECT, CREATE, DELETE, DROP, GRANT, INSERT, ` +
-				`SELECT, ZONECONFIG ON mi5 TO agents; GRANT CONNECT ON mi5 TO public; GRANT ALL ON mi5 TO root; `, `root`},
+			{`mi5`, `database`, `GRANT ALL ON mi5 TO admin; GRANT ALL ` +
+				`ON mi5 TO agents; GRANT CONNECT ON mi5 TO public; GRANT ALL ON mi5 TO root; `, `root`},
 			{`public`, `schema`, `GRANT ALL ON public TO admin; GRANT CREATE, USAGE ON public TO public; GRANT ALL ON public TO root; `, `admin`},
 			{`locator`, `schema`, `GRANT ALL ON locator TO admin; GRANT CREATE, GRANT ON locator TO agent_bond; GRANT ALL ON locator TO m; ` +
 				`GRANT ALL ON locator TO root; `, `root`},

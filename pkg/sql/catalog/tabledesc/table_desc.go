@@ -288,6 +288,13 @@ func (desc *wrapper) PartialIndexes() []catalog.Index {
 	return desc.getExistingOrNewIndexCache().partial
 }
 
+// NonPrimaryIndexes returns a slice of all non-primary indexes, in
+// their canonical order. This is equivalent to taking the slice
+// produced by AllIndexes and removing the primary index.
+func (desc *wrapper) NonPrimaryIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().nonPrimary
+}
+
 // PublicNonPrimaryIndexes returns a slice of all active secondary indexes,
 // in their canonical order. This is equivalent to the Indexes array in the
 // proto.
@@ -304,10 +311,11 @@ func (desc *wrapper) WritableNonPrimaryIndexes() []catalog.Index {
 	return desc.getExistingOrNewIndexCache().writableNonPrimary
 }
 
-// DeletableNonPrimaryIndexes returns a slice of all non-primary indexes
-// which allow being deleted from: public + delete-and-write-only +
-// delete-only, in  their canonical order. This is equivalent to taking
-// the slice produced by AllIndexes and removing the primary index.
+// DeletableNonPrimaryIndexes returns a slice of all non-primary
+// indexes which allow being deleted from: public +
+// delete-and-write-only + delete-only, in their canonical order. This
+// is equivalent to taking the slice produced by AllIndexes and
+// removing the primary index and backfilling indexes.
 func (desc *wrapper) DeletableNonPrimaryIndexes() []catalog.Index {
 	return desc.getExistingOrNewIndexCache().deletableNonPrimary
 }
@@ -333,11 +341,6 @@ func (desc *wrapper) FindIndexWithID(id descpb.IndexID) (catalog.Index, error) {
 		return idx.GetID() == id
 	}); idx != nil {
 		return idx, nil
-	}
-	for _, m := range desc.GCMutations {
-		if m.IndexID == id {
-			return nil, ErrIndexGCMutationsList
-		}
 	}
 	return nil, errors.Errorf("index-id \"%d\" does not exist", id)
 }

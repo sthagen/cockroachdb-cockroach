@@ -25,7 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -119,7 +120,7 @@ USE data2;
 CREATE SCHEMA empty_schema;
 CREATE TABLE data2.foo (a int);
 `)
-	tableDesc := catalogkv.TestingGetTableDescriptor(backupKVDB, keys.SystemSQLCodec, "data2", "foo")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(backupKVDB, keys.SystemSQLCodec, "data2", "foo")
 	// Store the highest user-table ID for later assertions.
 	maxBackupTableID := tableDesc.GetID()
 
@@ -156,7 +157,6 @@ CREATE TABLE data2.foo (a int);
 	)
 	// Populate system.role_members.
 	sqlDB.Exec(t, `CREATE ROLE system_ops;`)
-	sqlDB.Exec(t, `GRANT CREATE, SELECT ON DATABASE data TO system_ops;`)
 	sqlDB.Exec(t, `GRANT system_ops TO maxroach1;`)
 
 	// Populate system.scheduled_jobs table with a first run in the future to prevent immediate adoption.
@@ -205,7 +205,7 @@ CREATE TABLE data2.foo (a int);
 
 		// Check there is no data in the span that we expect user data to be imported.
 		store := tcRestore.GetFirstStoreFromServer(t, 0)
-		startKey := keys.SystemSQLCodec.TablePrefix(keys.TestingUserDescID(0))
+		startKey := keys.SystemSQLCodec.TablePrefix(bootstrap.TestingUserDescID(0))
 		endKey := keys.SystemSQLCodec.TablePrefix(uint32(maxBackupTableID)).PrefixEnd()
 		it := store.Engine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 			UpperBound: endKey,

@@ -21,10 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -86,7 +86,7 @@ func (mt mutationTest) makeMutationsActive(ctx context.Context) {
 	}
 	mt.tableDesc.Mutations = nil
 	mt.tableDesc.Version++
-	if err := catalog.ValidateSelf(mt.tableDesc); err != nil {
+	if err := descbuilder.ValidateSelf(mt.tableDesc); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -146,7 +146,7 @@ func (mt mutationTest) writeMutation(ctx context.Context, m descpb.DescriptorMut
 	}
 	mt.tableDesc.Mutations = append(mt.tableDesc.Mutations, m)
 	mt.tableDesc.Version++
-	if err := catalog.ValidateSelf(mt.tableDesc); err != nil {
+	if err := descbuilder.ValidateSelf(mt.tableDesc); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -189,7 +189,7 @@ ALTER TABLE t.test ADD COLUMN i VARCHAR NOT NULL DEFAULT 'i';
 	}
 
 	// read table descriptor
-	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
@@ -251,7 +251,7 @@ CREATE INDEX allidx ON t.test (k, v);
 	}
 
 	// read table descriptor
-	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
@@ -274,7 +274,7 @@ CREATE INDEX allidx ON t.test (k, v);
 					}
 
 					// read table descriptor
-					mTest.tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
+					mTest.tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
 						kvDB, keys.SystemSQLCodec, "t", "test")
 
 					initRows := [][]string{{"a", "z", "q"}}
@@ -456,21 +456,21 @@ CREATE INDEX allidx ON t.test (k, v);
 	// Check that a mutation can only be inserted with an explicit mutation state, and direction.
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []descpb.DescriptorMutation{{}}
-	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
+	if err := descbuilder.ValidateSelf(tableDesc); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Column{Column: &tableDesc.Columns[len(tableDesc.Columns)-1]}}}
 	tableDesc.Columns = tableDesc.Columns[:len(tableDesc.Columns)-1]
-	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
+	if err := descbuilder.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = descpb.DescriptorMutation_DELETE_ONLY
-	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
+	if err := descbuilder.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = descpb.DescriptorMutation_UNKNOWN
 	tableDesc.Mutations[0].Direction = descpb.DescriptorMutation_DROP
-	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
+	if err := descbuilder.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
 		t.Fatal(err)
 	}
 }
@@ -520,7 +520,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	}
 
 	// read table descriptor
-	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
@@ -529,8 +529,11 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	indexQuery := `SELECT v FROM t.test@foo`
 	for _, useUpsert := range []bool{true, false} {
 		// See the effect of the operations depending on the state.
-		for _, state := range []descpb.DescriptorMutation_State{descpb.DescriptorMutation_DELETE_ONLY,
-			descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY} {
+		for _, state := range []descpb.DescriptorMutation_State{
+			descpb.DescriptorMutation_DELETE_ONLY,
+			descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
+			descpb.DescriptorMutation_BACKFILLING,
+		} {
 			// Init table with some entries.
 			if _, err := sqlDB.Exec(`TRUNCATE TABLE t.test`); err != nil {
 				t.Fatal(err)
@@ -542,7 +545,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 				t.Fatal(err)
 			}
 			// read table descriptor
-			mTest.tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
+			mTest.tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
 				kvDB, keys.SystemSQLCodec, "t", "test")
 
 			initRows := [][]string{{"a", "z"}, {"b", "y"}}
@@ -573,12 +576,14 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 
 			// Make index "foo" live so that we can read it.
 			mTest.makeMutationsActive(ctx)
-			if state == descpb.DescriptorMutation_DELETE_ONLY {
+			switch state {
+			case descpb.DescriptorMutation_DELETE_ONLY, descpb.DescriptorMutation_BACKFILLING:
 				// "x" didn't get added to the index.
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"y"}, {"z"}})
-			} else {
+			default:
 				// "x" got added to the index.
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"x"}, {"y"}, {"z"}})
+
 			}
 
 			// Make "foo" a mutation.
@@ -597,11 +602,15 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 
 			// Make index "foo" live so that we can read it.
 			mTest.makeMutationsActive(ctx)
-			if state == descpb.DescriptorMutation_DELETE_ONLY {
+			switch state {
+			case descpb.DescriptorMutation_BACKFILLING:
+				// Update results in no modifications to index.
+				mTest.CheckQueryResults(t, indexQuery, [][]string{{"y"}, {"z"}})
+			case descpb.DescriptorMutation_DELETE_ONLY:
 				// updating "x" -> "w" will result in "x" being deleted from the index.
 				// updating "z" -> "z" results in "z" being deleted from the index.
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"y"}})
-			} else {
+			default:
 				// updating "x" -> "w" results in the index updating from "x" -> "w",
 				// updating "z" -> "z" is a noop on the index.
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"w"}, {"y"}, {"z"}})
@@ -618,9 +627,13 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 			// Updating the primary key for a row when we're in delete-only won't
 			// create a new index entry, and will delete the old one. Otherwise it'll
 			// create a new entry and delete the old one.
-			if state == descpb.DescriptorMutation_DELETE_ONLY {
+			switch state {
+			case descpb.DescriptorMutation_BACKFILLING:
+				// Update results in no modifications to index.
+				mTest.CheckQueryResults(t, indexQuery, [][]string{{"y"}, {"z"}})
+			case descpb.DescriptorMutation_DELETE_ONLY:
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"y"}})
-			} else {
+			default:
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"w"}, {"y"}, {"z"}})
 			}
 
@@ -633,9 +646,13 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 			// Make index "foo" live so that we can read it.
 			mTest.makeMutationsActive(ctx)
 			// Deleting row "b" deletes "y" from the index.
-			if state == descpb.DescriptorMutation_DELETE_ONLY {
+			switch state {
+			case descpb.DescriptorMutation_BACKFILLING:
+				// Update results in no modifications to index.
+				mTest.CheckQueryResults(t, indexQuery, [][]string{{"y"}, {"z"}})
+			case descpb.DescriptorMutation_DELETE_ONLY:
 				mTest.CheckQueryResults(t, indexQuery, [][]string{})
-			} else {
+			default:
 				mTest.CheckQueryResults(t, indexQuery, [][]string{{"w"}, {"z"}})
 			}
 		}
@@ -646,7 +663,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	index := tableDesc.PublicNonPrimaryIndexes()[len(tableDesc.PublicNonPrimaryIndexes())-1]
 	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Index{Index: index.IndexDesc()}}}
 	tableDesc.RemovePublicNonPrimaryIndex(index.Ordinal())
-	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
+	if err := descbuilder.ValidateSelf(tableDesc); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
 		t.Fatal(err)
 	}
 }
@@ -682,7 +699,7 @@ CREATE INDEX allidx ON t.test (k, v);
 	}
 
 	// read table descriptor
-	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
@@ -698,6 +715,7 @@ CREATE INDEX allidx ON t.test (k, v);
 			for _, idxState := range []descpb.DescriptorMutation_State{
 				descpb.DescriptorMutation_DELETE_ONLY,
 				descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
+				descpb.DescriptorMutation_BACKFILLING,
 			} {
 				// Ignore the impossible column in DELETE_ONLY state while index
 				// is in the DELETE_AND_WRITE_ONLY state.
@@ -718,7 +736,7 @@ CREATE INDEX allidx ON t.test (k, v);
 				}
 
 				// read table descriptor
-				mTest.tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
+				mTest.tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
 					kvDB, keys.SystemSQLCodec, "t", "test")
 
 				initRows := [][]string{{"a", "z", "q"}, {"b", "y", "r"}}
@@ -748,10 +766,14 @@ CREATE INDEX allidx ON t.test (k, v);
 				mTest.makeMutationsActive(ctx)
 				// column "i" has no entry.
 				mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "z", "q"}, {"b", "y", "r"}, {"c", "x", "NULL"}})
-				if idxState == descpb.DescriptorMutation_DELETE_ONLY {
+				switch idxState {
+				case descpb.DescriptorMutation_DELETE_ONLY:
 					// No index entry for row "c"
 					mTest.CheckQueryResults(t, indexQuery, [][]string{{"q"}, {"r"}})
-				} else {
+				case descpb.DescriptorMutation_BACKFILLING:
+					// No index modification
+					mTest.CheckQueryResults(t, indexQuery, [][]string{{"q"}, {"r"}})
+				default:
 					// Index entry for row "c"
 					mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"q"}, {"r"}})
 				}
@@ -809,10 +831,14 @@ CREATE INDEX allidx ON t.test (k, v);
 					mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "NULL"}, {"b", "y", "r"}, {"c", "x", "NULL"}})
 				}
 
-				if idxState == descpb.DescriptorMutation_DELETE_ONLY {
+				switch idxState {
+				case descpb.DescriptorMutation_DELETE_ONLY:
 					// Index entry for row "a" is deleted.
 					mTest.CheckQueryResults(t, indexQuery, [][]string{{"r"}})
-				} else {
+				case descpb.DescriptorMutation_BACKFILLING:
+					// No index modification
+					mTest.CheckQueryResults(t, indexQuery, [][]string{{"q"}, {"r"}})
+				default:
 					// Index "foo" has NULL "i" value for row "a".
 					mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"NULL"}, {"r"}})
 				}
@@ -841,10 +867,15 @@ CREATE INDEX allidx ON t.test (k, v);
 					numKVs++
 				}
 
-				if idxState == descpb.DescriptorMutation_DELETE_ONLY {
+				switch idxState {
+				case descpb.DescriptorMutation_DELETE_ONLY:
 					// Index entry for row "a" is deleted.
 					mTest.CheckQueryResults(t, indexQuery, [][]string{})
-				} else {
+					// No index modification
+				case descpb.DescriptorMutation_BACKFILLING:
+					mTest.CheckQueryResults(t, indexQuery, [][]string{{"q"}, {"r"}})
+					numKVs += 2
+				default:
 					// Index entry for row "a" is deleted.
 					if state == descpb.DescriptorMutation_DELETE_ONLY {
 						mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"q"}})
@@ -854,7 +885,6 @@ CREATE INDEX allidx ON t.test (k, v);
 					// We have two index values.
 					numKVs += 2
 				}
-
 				// Check that there are no hidden KV values for row "b", and column
 				// "i" for row "b" was deleted. Also check that the index values are
 				// all accounted for.
@@ -894,7 +924,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	}
 
 	// Read table descriptor
-	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mt := makeMutationTest(t, kvDB, sqlDB, tableDesc)
@@ -1026,7 +1056,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	mt.Exec(t, `ALTER TABLE t.test RENAME COLUMN c TO d`)
 	// The mutation in the table descriptor has changed and we would like
 	// to update our copy to make it live.
-	mt.tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	mt.tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Make "ufo" live.
 	mt.makeMutationsActive(ctx)
@@ -1052,7 +1082,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 
 	// The mutation in the table descriptor has changed and we would like
 	// to update our copy to make it live.
-	mt.tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
+	mt.tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Make column "e" live.
@@ -1135,7 +1165,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR UNIQUE);
 	}
 
 	// read table descriptor
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	expected := []struct {
 		name  string
@@ -1182,6 +1212,8 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR UNIQUE);
 			actualState = descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY
 		} else if m.DeleteOnly() {
 			actualState = descpb.DescriptorMutation_DELETE_ONLY
+		} else if m.Backfilling() {
+			actualState = descpb.DescriptorMutation_BACKFILLING
 		}
 		if state := expected[i].state; actualState != state {
 			t.Errorf("%d entry: state %s, expected %s", i, actualState, state)
@@ -1211,7 +1243,7 @@ func TestAddingFKs(t *testing.T) {
 	}
 
 	// Step the referencing table back to the ADD state.
-	ordersDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+	ordersDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "orders")
 	ordersDesc.State = descpb.DescriptorState_ADD
 	ordersDesc.Version++

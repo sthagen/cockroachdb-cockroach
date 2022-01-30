@@ -673,6 +673,19 @@ message DescriptorMutation {
     // (column default or index data) can only be backfilled once
     // all nodes have transitioned into the DELETE_AND_WRITE_ONLY state.
     DELETE_AND_WRITE_ONLY = 2;
+
+    // Operations other than non-transactional backfilling must not
+    // use this descriptor.
+    //
+    // Column: Columns do not use this state. A column descriptor in
+    // this state is a programming error.
+    //
+    // Index: A descriptor in this state is invisible to an INSERT,
+    // UPDATE, and DELETE.
+    //
+    // TODO(ssd): This is currently unused and is being added to
+    // facilitate the new temporary-index-based backfilling process.
+    BACKFILLING = 3;
   }
   optional State state = 3 [(gogoproto.nullable) = false];
 
@@ -1108,6 +1121,7 @@ message TableDescriptor {
                               (gogoproto.customname) = "JobID", deprecated = true];
   }
 
+  // Before 22.1:
   // The schema elements that have been dropped and whose underlying
   // data needs to be gc-ed. These schema elements have already transitioned
   // through the drop state machine when they were in the above mutations
@@ -1115,8 +1129,12 @@ message TableDescriptor {
   // can be reused. This list is separate because mutations can
   // lie in this list for a long time (gc deadline) and should not block
   // the execution of other schema changes on the table.
+  //
+  // Since 22.1 this is field is deprecated and no longer maintained.
+  // The index GC job still removes mutations it finds in this list.
   repeated GCDescriptorMutation gc_mutations = 33 [(gogoproto.nullable) = false,
-                                                  (gogoproto.customname) = "GCMutations"];
+                                                   (gogoproto.customname) = "GCMutations",
+                                                   deprecated = true];
 
   optional string create_query = 34 [(gogoproto.nullable) = false];
 

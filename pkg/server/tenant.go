@@ -177,7 +177,7 @@ func StartTenant(
 
 	// TODO(asubiotto): remove this. Right now it is needed to initialize the
 	// SpanResolver.
-	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: 0})
+	s.execCfg.DistSQLPlanner.SetSQLInstanceInfo(roachpb.NodeDescriptor{NodeID: 0})
 
 	// Register and start gRPC service on pod. This is separate from the
 	// gRPC + Gateway services configured below.
@@ -460,7 +460,7 @@ func makeTenantSQLServerArgs(
 		if err != nil {
 			panic(err)
 		}
-		protectedTSProvider = dummyProtectedTSProvider{pp}
+		protectedTSProvider = tenantProtectedTSProvider{Provider: pp, st: st}
 	}
 
 	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st)

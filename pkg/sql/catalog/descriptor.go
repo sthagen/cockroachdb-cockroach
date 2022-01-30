@@ -72,13 +72,15 @@ type DescriptorBuilder interface {
 	// built by this builder.
 	DescriptorType() DescriptorType
 
-	// RunPostDeserializationChanges attempts to perform post-deserialization
-	// changes to the descriptor being built.
-	// These changes are always done on a best-effort basis, meaning that all
-	// arguments other than ctx are optional. As of writing this, the only other
-	// argument is a DescGetter and a nil value will cause table foreign-key
-	// representation upgrades to be skipped.
-	RunPostDeserializationChanges(ctx context.Context, dg DescGetter) error
+	// RunPostDeserializationChanges attempts to perform changes to the descriptor
+	// being built from a deserialized protobuf.
+	RunPostDeserializationChanges()
+
+	// RunRestoreChanges attempts to perform changes to the descriptor being
+	// built from a deserialized protobuf obtained by restoring a backup.
+	// This is to compensate for the fact that these are not subject to cluster
+	// upgrade migrations
+	RunRestoreChanges(descLookupFn func(id descpb.ID) Descriptor) error
 
 	// BuildImmutable returns an immutable Descriptor.
 	BuildImmutable() Descriptor
@@ -383,9 +385,17 @@ type TableDescriptor interface {
 
 	// DeletableNonPrimaryIndexes returns a slice of all non-primary indexes
 	// which allow being deleted from: public + delete-and-write-only +
-	// delete-only, in  their canonical order. This is equivalent to taking
-	// the slice produced by AllIndexes and removing the primary index.
+	// delete-only, in their canonical order. This is equivalent to taking
+	// the slice produced by AllIndexes and removing the primary index and
+	// backfilling indexes.
 	DeletableNonPrimaryIndexes() []Index
+
+	// NonPrimaryIndexes returns a slice of all the indexes that
+	// are not yet public: backfilling, delete, and
+	// delete-and-write-only, in their canonical order. This is
+	// equivalent to taking the slice produced by AllIndexes and
+	// removing the primary index.
+	NonPrimaryIndexes() []Index
 
 	// DeleteOnlyNonPrimaryIndexes returns a slice of all non-primary indexes
 	// which allow only being deleted from, in their canonical order. This is
@@ -505,6 +515,9 @@ type TableDescriptor interface {
 	// CheckConstraintUsesColumn returns whether the check constraint uses the
 	// specified column.
 	CheckConstraintUsesColumn(cc *descpb.TableDescriptor_CheckConstraint, colID descpb.ColumnID) (bool, error)
+	// IsShardColumn returns true if col corresponds to a non-dropped hash sharded
+	// index. This method assumes that col is currently a member of desc.
+	IsShardColumn(col Column) bool
 
 	// GetFamilies returns the column families of this table. All tables contain
 	// at least one column family. The returned list is sorted by family ID.
@@ -533,8 +546,6 @@ type TableDescriptor interface {
 	MakePublic() TableDescriptor
 	// AllMutations returns all of the table descriptor's mutations.
 	AllMutations() []Mutation
-	// GetGCMutations returns the table descriptor's GC mutations.
-	GetGCMutations() []descpb.TableDescriptor_GCDescriptorMutation
 	// GetMutationJobs returns the table descriptor's mutation jobs.
 	GetMutationJobs() []descpb.TableDescriptor_MutationJob
 

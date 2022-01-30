@@ -85,8 +85,10 @@ sql.cross_db_fks.enabled	boolean	false	if true, creating foreign key references 
 sql.cross_db_sequence_owners.enabled	boolean	false	if true, creating sequences owned by tables from other databases is allowed
 sql.cross_db_sequence_references.enabled	boolean	false	if true, sequences referenced by tables from other databases are allowed
 sql.cross_db_views.enabled	boolean	false	if true, creating views that refer to other databases is allowed
+sql.defaults.cost_scans_with_default_col_size.enabled	boolean	false	setting to true uses the same size for all columns to compute scan cost
 sql.defaults.datestyle	enumeration	iso, mdy	default value for DateStyle session setting [iso, mdy = 0, iso, dmy = 1, iso, ymd = 2]
 sql.defaults.datestyle.enabled	boolean	false	default value for datestyle_enabled session setting
+sql.defaults.default_hash_sharded_index_bucket_count	integer	8	used as bucket count if bucket count is not specified in hash sharded index definition
 sql.defaults.default_int_size	integer	8	the size, in bytes, of an INT type
 sql.defaults.disallow_full_table_scans.enabled	boolean	false	setting to true rejects queries that have planned a full table scan
 sql.defaults.distsql	enumeration	auto	default distributed SQL execution mode [off = 0, auto = 1, on = 2, always = 3]
@@ -155,11 +157,12 @@ sql.stats.automatic_collection.fraction_stale_rows	float	0.2	target fraction of 
 sql.stats.automatic_collection.min_stale_rows	integer	500	target minimum number of stale rows per table that will trigger a statistics refresh
 sql.stats.cleanup.recurrence	string	@hourly	cron-tab recurrence for SQL Stats cleanup job
 sql.stats.flush.enabled	boolean	true	if set, SQL execution statistics are periodically flushed to disk
-sql.stats.flush.interval	duration	1h0m0s	the interval at which SQL execution statistics are flushed to disk
+sql.stats.flush.interval	duration	10m0s	the interval at which SQL execution statistics are flushed to disk, this value must be less than or equal to sql.stats.aggregation.interval
 sql.stats.histogram_collection.enabled	boolean	true	histogram collection mode
 sql.stats.multi_column_collection.enabled	boolean	true	multi-column statistics collection mode
 sql.stats.persisted_rows.max	integer	1000000	maximum number of rows of statement and transaction statistics that will be persisted in the system tables
 sql.stats.post_events.enabled	boolean	false	if set, an event is logged for every CREATE STATISTICS job
+sql.stats.response.max	integer	20000	the maximum number of statements and transaction stats returned in a CombinedStatements request
 sql.telemetry.query_sampling.enabled	boolean	false	when set to true, executed queries will emit an event on the telemetry logging channel
 sql.temp_object_cleaner.cleanup_interval	duration	30m0s	how often to clean up orphaned temporary objects
 sql.temp_object_cleaner.wait_interval	duration	30m0s	how long after creation a temporary object will be cleaned up
@@ -174,4 +177,4 @@ trace.debug.enable	boolean	false	if set, traces for recent requests can be seen 
 trace.jaeger.agent	string		the address of a Jaeger agent to receive traces using the Jaeger UDP Thrift protocol, as <host>:<port>. If no port is specified, 6381 will be used.
 trace.opentelemetry.collector	string		address of an OpenTelemetry trace collector to receive traces using the otel gRPC protocol, as <host>:<port>. If no port is specified, 4317 will be used.
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.
-version	version	21.2-48	set the active cluster version in the format '<major>.<minor>'
+version	version	21.2-50	set the active cluster version in the format '<major>.<minor>'

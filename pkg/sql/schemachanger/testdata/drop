@@ -10,6 +10,7 @@ CREATE SCHEMA db.sc;
 test
 DROP SCHEMA db.sc;
 ----
+checking for feature: DROP SCHEMA
 begin transaction #1
 # begin StatementPhase
 ## StatementPhase stage 1 of 1 with 2 MutationType ops
@@ -29,7 +30,7 @@ upsert descriptor #54
   +  version: "3"
 upsert descriptor #56
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
@@ -61,6 +62,7 @@ CREATE TYPE db.sc.e AS ENUM('a', 'b', 'c');
 test
 DROP TABLE db.sc.t;
 ----
+checking for feature: DROP TABLE
 begin transaction #1
 # begin StatementPhase
 ## StatementPhase stage 1 of 1 with 6 MutationType ops
@@ -117,6 +119,7 @@ commit transaction #2
 test
 DROP SCHEMA db.sc CASCADE;
 ----
+checking for feature: DROP SCHEMA
 begin transaction #1
 # begin StatementPhase
 ## StatementPhase stage 1 of 1 with 4 MutationType ops
@@ -138,21 +141,21 @@ upsert descriptor #54
   +  version: "5"
 upsert descriptor #57
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
   +  version: "2"
 upsert descriptor #59
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
   +  version: "2"
 upsert descriptor #60
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
@@ -163,6 +166,7 @@ commit transaction #1
 begin transaction #2
 ## PostCommitNonRevertiblePhase stage 1 of 1 with 12 MutationType ops
 write *eventpb.DropSchema to event log for descriptor #57: DROP SCHEMA ‹db›.‹sc› CASCADE
+write *eventpb.DropType to event log for descriptor #60: DROP SCHEMA ‹db›.‹sc› CASCADE
 update progress of schema change job #1
 set schema change job #1 to non-cancellable
 delete schema namespace entry {54 0 sc} -> 57
@@ -175,11 +179,13 @@ commit transaction #2
 test
 DROP DATABASE db CASCADE;
 ----
+checking for feature: DROP DATABASE
 begin transaction #1
 # begin StatementPhase
-## StatementPhase stage 1 of 1 with 4 MutationType ops
+## StatementPhase stage 1 of 1 with 5 MutationType ops
 delete comment for descriptor #55 of type SchemaCommentType
 delete comment for descriptor #54 of type DatabaseCommentType
+delete role settings for database on #54
 # end StatementPhase
 # begin PreCommitPhase
 ## PreCommitPhase stage 1 of 1 with 6 MutationType ops
@@ -187,7 +193,7 @@ create job #1: "schema change job"
   descriptor IDs: [54 55]
 upsert descriptor #54
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  schemas:
   -    public:
@@ -198,7 +204,7 @@ upsert descriptor #54
   +  version: "6"
 upsert descriptor #55
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
@@ -258,9 +264,10 @@ CREATE VIEW db1.sc1.v5 AS (SELECT 'a'::db1.sc1.typ::string AS k, n2, n1 from db1
 test
 DROP DATABASE db1 CASCADE
 ----
+checking for feature: DROP DATABASE
 begin transaction #1
 # begin StatementPhase
-## StatementPhase stage 1 of 1 with 36 MutationType ops
+## StatementPhase stage 1 of 1 with 37 MutationType ops
 delete comment for descriptor #64 of type TableCommentType
 delete comment for descriptor #67 of type TableCommentType
 delete comment for descriptor #67 of type ColumnCommentType
@@ -283,6 +290,7 @@ delete comment for descriptor #63 of type SchemaCommentType
 delete comment for descriptor #61 of type DatabaseCommentType
 delete comment for constraint on #67, name: t1_pkey, type: PrimaryKey
 delete comment for constraint on #66, name: t1_pkey, type: PrimaryKey
+delete role settings for database on #61
 # end StatementPhase
 # begin PreCommitPhase
 ## PreCommitPhase stage 1 of 1 with 56 MutationType ops
@@ -301,7 +309,7 @@ delete object namespace entry {61 63 _typ} -> 73
 delete object namespace entry {61 63 v5} -> 74
 upsert descriptor #61
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  schemas:
   -    public:
@@ -314,14 +322,14 @@ upsert descriptor #61
   +  version: "3"
 upsert descriptor #62
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
   +  version: "2"
 upsert descriptor #63
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  version: "1"
   +  state: DROP
@@ -550,7 +558,7 @@ upsert descriptor #71
      viewQuery: (SELECT n2, n1 FROM db1.sc1.v2)
 upsert descriptor #72
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  referencingDescriptorIds:
   -  - 74
@@ -560,7 +568,7 @@ upsert descriptor #72
   +  version: "3"
 upsert descriptor #73
   ...
-         userProto: root
+         withGrantOption: 2
        version: 2
   -  referencingDescriptorIds:
   -  - 74
@@ -598,6 +606,7 @@ begin transaction #2
 create job #2: "GC for dropping descriptors 64 67 65 66 68 69 70 71 74 and parent database 61"
   descriptor IDs: [64 67 65 66 68 69 70 71 74]
 write *eventpb.DropDatabase to event log for descriptor #61: DROP DATABASE ‹db1› CASCADE
+write *eventpb.DropType to event log for descriptor #73: DROP DATABASE ‹db1› CASCADE
 update progress of schema change job #1
 set schema change job #1 to non-cancellable
 delete database namespace entry {0 0 db1} -> 61

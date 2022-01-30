@@ -557,9 +557,9 @@ func (n *Node) IsDraining() bool {
 // to report work that needed to be done and which may or may not have
 // been done by the time this call returns. See the explanation in
 // pkg/server/drain.go for details.
-func (n *Node) SetDraining(drain bool, reporter func(int, redact.SafeString)) error {
+func (n *Node) SetDraining(drain bool, reporter func(int, redact.SafeString), verbose bool) error {
 	return n.stores.VisitStores(func(s *kvserver.Store) error {
-		s.SetDraining(drain, reporter)
+		s.SetDraining(drain, reporter, verbose)
 		return nil
 	})
 }
@@ -1517,4 +1517,27 @@ func (n *Node) UpdateSpanConfigs(
 		return nil, err
 	}
 	return &roachpb.UpdateSpanConfigsResponse{}, nil
+}
+
+// GetSystemSpanConfigs implements the roachpb.InternalServer interface.
+func (n *Node) GetSystemSpanConfigs(
+	ctx context.Context, _ *roachpb.GetSystemSpanConfigsRequest,
+) (*roachpb.GetSystemSpanConfigsResponse, error) {
+	entries, err := n.spanConfigAccessor.GetSystemSpanConfigEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &roachpb.GetSystemSpanConfigsResponse{SystemSpanConfigEntries: entries}, nil
+}
+
+// UpdateSystemSpanConfigs implements the roachpb.InternalServer interface.
+func (n *Node) UpdateSystemSpanConfigs(
+	ctx context.Context, req *roachpb.UpdateSystemSpanConfigsRequest,
+) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
+	err := n.spanConfigAccessor.UpdateSystemSpanConfigEntries(ctx, req.ToDelete, req.ToUpsert)
+	if err != nil {
+		return nil, err
+	}
+	return &roachpb.UpdateSystemSpanConfigsResponse{}, nil
 }

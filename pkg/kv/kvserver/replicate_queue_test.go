@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -78,7 +79,7 @@ func TestReplicateQueueRebalance(t *testing.T) {
 	const newRanges = 10
 	trackedRanges := map[roachpb.RangeID]struct{}{}
 	for i := uint32(0); i < newRanges; i++ {
-		tableID := keys.TestingUserDescID(i)
+		tableID := bootstrap.TestingUserDescID(i)
 		splitKey := keys.SystemSQLCodec.TablePrefix(tableID)
 		// Retry the splits on descriptor errors which are likely as the replicate
 		// queue is already hard at work.
@@ -122,7 +123,6 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		tc.Servers[0].DB(),
 		zonepb.DefaultZoneConfigRef(),
 		zonepb.DefaultSystemZoneConfigRef(),
-		tc.Servers[0].SystemIDChecker().(keys.SystemIDChecker),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -245,59 +245,62 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 	skip.UnderRace(t, "takes >1min under race")
 
 	ctx := context.Background()
-	const replicaCount = 3
-
-	// The goal of this test is to ensure that down replication occurs correctly
-	// using the replicate queue, and to ensure that's the case, the test
-	// cluster needs to be kept in auto replication mode.
-	tc := testcluster.StartTestCluster(t, replicaCount+2,
+	// The goal of this test is to ensure that down replication occurs
+	// correctly using the replicate queue, and to ensure that's the case,
+	// the test cluster needs to be kept in auto replication mode.
+	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationAuto,
 			ServerArgs: base.TestServerArgs{
 				ScanMinIdleTime: 10 * time.Millisecond,
 				ScanMaxIdleTime: 10 * time.Millisecond,
+				Knobs: base.TestingKnobs{
+					SpanConfig: &spanconfig.TestingKnobs{
+						ConfigureScratchRange: true,
+					},
+				},
 			},
 		},
 	)
 	defer tc.Stopper().Stop(ctx)
 
-	// Disable the replication queues so that the range we're about to create
-	// doesn't get down-replicated too soon.
-	tc.ToggleReplicateQueues(false)
-
 	testKey := tc.ScratchRange(t)
-	desc := tc.LookupRangeOrFatal(t, testKey)
-	// At the end of StartTestCluster(), all ranges have 5 replicas since they're
-	// all "system ranges". When the ScratchRange() splits its range, it also
-	// starts up with 5 replicas. Since it's not a system range, its default zone
-	// config asks for 3x replication, and the replication queue will
-	// down-replicate it.
-	require.Len(t, desc.Replicas().Descriptors(), 5)
-	// Re-enable the replication queue.
-	tc.ToggleReplicateQueues(true)
-
-	// Now wait until the replicas have been down-replicated back to the
-	// desired number.
 	testutils.SucceedsSoon(t, func() error {
-		descriptor, err := tc.LookupRange(testKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(descriptor.InternalReplicas) != replicaCount {
-			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.InternalReplicas))
+		desc := tc.LookupRangeOrFatal(t, testKey)
+		if got := len(desc.Replicas().Descriptors()); got != 3 {
+			return errors.Newf("expected 3 replicas for scratch range, found %d", got)
 		}
 		return nil
 	})
 
+	_, err := tc.ServerConn(0).Exec(
+		`ALTER RANGE DEFAULT CONFIGURE ZONE USING num_replicas = 1`,
+	)
+	require.NoError(t, err)
+
+	for _, s := range tc.Servers {
+		require.NoError(t, s.Stores().VisitStores(func(s *kvserver.Store) error {
+			require.NoError(t, s.ForceReplicationScanAndProcess())
+			return nil
+		}))
+	}
+
+	// Now wait until the replicas have been down-replicated back to the
+	// desired number.
+	testutils.SucceedsSoon(t, func() error {
+		desc := tc.LookupRangeOrFatal(t, testKey)
+		if got := len(desc.Replicas().Descriptors()); got != 1 {
+			return errors.Errorf("expected 1 replica, found %d", got)
+		}
+		return nil
+	})
+
+	desc := tc.LookupRangeOrFatal(t, testKey)
 	infos, err := filterRangeLog(
 		tc.Conns[0], desc.RangeID, kvserverpb.RangeLogEventType_remove_voter, kvserverpb.ReasonRangeOverReplicated,
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(infos) < 1 {
-		t.Fatalf("found no downreplication due to over-replication in the range logs")
-	}
+	require.NoError(t, err)
+	require.Truef(t, len(infos) >= 1, "found no down replication due to over-replication in the range logs")
 }
 
 func scanAndGetNumNonVoters(

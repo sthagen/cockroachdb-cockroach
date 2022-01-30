@@ -23,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -854,6 +856,115 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  2,
 			}},
+		{`index "secondary" contains stored column "quux" with unknown ID 123`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "baz"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1, 2}, ColumnNames: []string{"bar", "baz"}},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:                  1,
+					Name:                "primary",
+					KeyColumnIDs:        []descpb.ColumnID{1},
+					KeyColumnNames:      []string{"bar"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					EncodingType:        descpb.PrimaryIndexEncoding,
+					Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				},
+				Indexes: []descpb.IndexDescriptor{{
+					ID:                  2,
+					Name:                "secondary",
+					KeyColumnIDs:        []descpb.ColumnID{1},
+					KeyColumnNames:      []string{"bar"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					StoreColumnIDs:      []descpb.ColumnID{123},
+					StoreColumnNames:    []string{"quux"},
+				}},
+				NextColumnID: 3,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
+		{`index "secondary" stored column ID 2 should have name "baz", but found name "quux"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "baz"},
+					{ID: 3, Name: "quux"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{{
+					ID:          0,
+					Name:        "primary",
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3},
+					ColumnNames: []string{"bar", "baz", "quux"},
+				}},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:                  1,
+					Name:                "primary",
+					KeyColumnIDs:        []descpb.ColumnID{1},
+					KeyColumnNames:      []string{"bar"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					EncodingType:        descpb.PrimaryIndexEncoding,
+					Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				},
+				Indexes: []descpb.IndexDescriptor{{
+					ID:                  2,
+					Name:                "secondary",
+					KeyColumnIDs:        []descpb.ColumnID{2},
+					KeyColumnNames:      []string{"baz"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					KeySuffixColumnIDs:  []descpb.ColumnID{1},
+					StoreColumnIDs:      []descpb.ColumnID{2},
+					StoreColumnNames:    []string{"quux"},
+				}},
+				NextColumnID: 4,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
+		{`index "secondary" key suffix column ID 123 is invalid`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "baz"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1, 2}, ColumnNames: []string{"bar", "baz"}},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:                  1,
+					Name:                "primary",
+					KeyColumnIDs:        []descpb.ColumnID{1},
+					KeyColumnNames:      []string{"bar"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					EncodingType:        descpb.PrimaryIndexEncoding,
+					Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				},
+				Indexes: []descpb.IndexDescriptor{{
+					ID:                  2,
+					Name:                "secondary",
+					KeyColumnIDs:        []descpb.ColumnID{2},
+					KeyColumnNames:      []string{"baz"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					KeySuffixColumnIDs:  []descpb.ColumnID{123},
+				}},
+				NextColumnID: 3,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
 		{`index "primary" contains deprecated foreign key representation`,
 			descpb.TableDescriptor{
 				ID:            2,
@@ -1594,7 +1705,7 @@ func TestValidateTableDesc(t *testing.T) {
 		t.Run(d.err, func(t *testing.T) {
 			desc := NewBuilder(&d.desc).BuildImmutableTable()
 			expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), d.err)
-			err := catalog.ValidateSelf(desc)
+			err := validate.Self(desc)
 			if d.err == "" && err != nil {
 				t.Errorf("%d: expected success, but found error: \"%+v\"", i, err)
 			} else if d.err != "" && err == nil {
@@ -1836,16 +1947,16 @@ func TestValidateCrossTableReferences(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		descs := catalog.MakeMapDescGetter()
-		descs.Descriptors[1] = dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable()
+		var cb nstree.MutableCatalog
+		cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable())
 		for _, otherDesc := range test.otherDescs {
 			otherDesc.Privileges = descpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
-			descs.Descriptors[otherDesc.ID] = NewBuilder(&otherDesc).BuildImmutable()
+			cb.UpsertDescriptorEntry(NewBuilder(&otherDesc).BuildImmutable())
 		}
 		desc := NewBuilder(&test.desc).BuildImmutable()
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
 		const validateCrossReferencesOnly = catalog.ValidationLevelCrossReferences &^ (catalog.ValidationLevelCrossReferences >> 1)
-		results := catalog.Validate(ctx, descs, catalog.NoValidationTelemetry, validateCrossReferencesOnly, desc)
+		results := cb.Validate(ctx, catalog.NoValidationTelemetry, validateCrossReferencesOnly, desc)
 		if err := results.CombinedError(); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, expectedErr, test.desc)

@@ -48,7 +48,7 @@ case "${cmd}" in
     gcloud compute firewall-rules create "${NAME}-mosh" --allow udp:60000-61000
 
     # wait a bit to let gcloud create the instance before retrying
-    sleep 30s
+    sleep 30
     # Retry while vm and sshd start up.
     retry gcloud compute ssh "${NAME}" --command=true
 
@@ -100,18 +100,14 @@ case "${cmd}" in
     echo "****************************************"
     echo "Hint: you should also be able to directly invoke:"
     echo "ssh ${FQNAME}"
+    echo "  or"
+    echo "mosh ${FQNAME}"
     echo "instead of '$0 ssh'."
     echo "****************************************"
     gcloud compute ssh "${NAME}" --ssh-flag="-A" "$@"
     ;;
     mosh)
-    # An alternative solution would be to run gcloud compute config-ssh after
-    # starting or creating the vm, which adds stanzas to ~/.ssh/config that
-    # make `ssh $HOST` (and by extension, hopefully, mosh).
-    read -r -a arr <<< "$(gcloud compute ssh "${NAME}" --dry-run)"
-    host="${arr[-1]}"
-    unset 'arr[${#arr[@]}-1]'
-    mosh --ssh=$(printf '%q' "${arr}") $host
+    mosh "${FQNAME}"
     ;;
     scp)
     # Example: $0 scp gceworker-youruser:go/src/github.com/cockroachdb/cockroach/cockroach-data/logs gcelogs --recurse

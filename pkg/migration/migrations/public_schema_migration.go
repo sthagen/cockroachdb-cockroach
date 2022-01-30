@@ -22,13 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -108,6 +108,13 @@ func createPublicSchemaDescriptor(
 	publicSchemaDesc, _, err := sql.CreateSchemaDescriptorWithPrivileges(
 		ctx, d.DB, d.Codec, desc, tree.PublicSchema, security.AdminRoleName(), security.AdminRoleName(), true, /* allocateID */
 	)
+	// The public role has hardcoded privileges; see comment in
+	// maybeCreatePublicSchemaWithDescriptor.
+	publicSchemaDesc.Privileges.Grant(
+		security.PublicRoleName(),
+		privilege.List{privilege.CREATE, privilege.USAGE},
+		false, /* withGrantOption */
+	)
 	if err != nil {
 		return err
 	}
@@ -117,13 +124,10 @@ func createPublicSchemaDescriptor(
 	// Remove namespace entry for old public schema.
 	b.Del(oldKey)
 	b.CPut(newKey, publicSchemaID, nil)
-	if err := catalogkv.WriteNewDescToBatch(
+	if err := descriptors.WriteNewDescToBatch(
 		ctx,
 		false,
-		d.Settings,
 		b,
-		d.Codec,
-		publicSchemaID,
 		publicSchemaDesc,
 	); err != nil {
 		return err
@@ -143,10 +147,11 @@ func createPublicSchemaDescriptor(
 	if err := descriptors.WriteDescToBatch(ctx, false, dbDesc, b); err != nil {
 		return err
 	}
-	allDescriptors, err := descriptors.GetAllDescriptors(ctx, txn)
+	all, err := descriptors.GetAllDescriptors(ctx, txn)
 	if err != nil {
 		return err
 	}
+	allDescriptors := all.OrderedDescriptors()
 	if err := migrateObjectsInDatabase(ctx, dbID, d, txn, publicSchemaID, descriptors, allDescriptors); err != nil {
 		return err
 	}

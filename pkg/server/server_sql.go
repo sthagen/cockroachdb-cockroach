@@ -56,15 +56,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqlwatcher"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/commenter"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -605,7 +604,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		NodeID:    cfg.nodeIDContainer,
 	}
 
-	var isAvailable func(roachpb.NodeID) bool
+	var isAvailable func(sqlInstanceID base.SQLInstanceID) bool
 	nodeLiveness, hasNodeLiveness := cfg.nodeLiveness.Optional(47900)
 	if hasNodeLiveness {
 		// TODO(erikgrinaker): We may want to use IsAvailableNotDraining instead, to
@@ -613,11 +612,13 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		// that are being drained/decommissioned. However, these nodes can still be
 		// leaseholders, and preventing processor scheduling on them can cause a
 		// performance cliff for e.g. table reads that then hit the network.
-		isAvailable = nodeLiveness.IsAvailable
+		isAvailable = func(sqlInstanceID base.SQLInstanceID) bool {
+			return nodeLiveness.IsAvailable(roachpb.NodeID(sqlInstanceID))
+		}
 	} else {
 		// We're on a SQL tenant, so this is the only node DistSQL will ever
 		// schedule on - always returning true is fine.
-		isAvailable = func(roachpb.NodeID) bool {
+		isAvailable = func(sqlInstanceID base.SQLInstanceID) bool {
 			return true
 		}
 	}
@@ -671,7 +672,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			ctx,
 			execinfra.Version,
 			cfg.Settings,
-			roachpb.NodeID(cfg.nodeIDContainer.SQLInstanceID()),
+			cfg.nodeIDContainer.SQLInstanceID(),
 			cfg.rpcContext,
 			distSQLServer,
 			cfg.distSender,
@@ -701,10 +702,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		GCJobNotifier:              gcJobNotifier,
 		RangeFeedFactory:           cfg.rangeFeedFactory,
 		CollectionFactory:          collectionFactory,
-
-		SystemIDChecker: &catalog.SystemIDChecker{
-			SystemIDChecker: keys.DeprecatedSystemIDChecker(),
-		},
 	}
 
 	if sqlSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
@@ -814,9 +811,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sql.ValidateInvertedIndexes,
 		sql.NewFakeSessionData,
 	)
-	execCfg.CommentUpdaterFactory = commenter.NewCommentUpdaterFactory(
+	execCfg.DescMetadaUpdaterFactory = descmetadata.NewMetadataUpdaterFactory(
 		ieFactory,
-		sql.MakeConstraintOidBuilder)
+		sql.MakeConstraintOidBuilder,
+		collectionFactory,
+		&execCfg.Settings.SV,
+	)
 	execCfg.InternalExecutorFactory = ieFactory
 
 	distSQLServer.ServerConfig.ProtectedTimestampProvider = execCfg.ProtectedTimestampProvider
@@ -1041,7 +1041,7 @@ func (s *SQLServer) initInstanceID(ctx context.Context) error {
 		return err
 	}
 	s.sqlLivenessSessionID = sessionID
-	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(instanceID)})
+	s.execCfg.DistSQLPlanner.SetSQLInstanceInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(instanceID)})
 	return nil
 }
 

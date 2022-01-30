@@ -54,7 +54,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
@@ -85,6 +84,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -323,6 +323,14 @@ var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_hash_sharded_indexes.enabled",
 	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
 	false,
+).WithPublic()
+
+var maxHashShardedIndexRangePreSplit = settings.RegisterIntSetting(
+	settings.SystemOnly,
+	"sql.hash_sharded_range_pre_split.max",
+	"max pre-split ranges to have when adding hash sharded index to an existing table",
+	16,
+	settings.PositiveInt,
 ).WithPublic()
 
 var zigzagJoinClusterMode = settings.RegisterBoolSetting(
@@ -696,6 +704,13 @@ var largeFullScanRows = settings.RegisterFloatSetting(
 		"the maximum table size allowed for a full scan when disallow_full_table_scans "+
 		"is set to true",
 	1000.0,
+).WithPublic()
+
+var costScansWithDefaultColSize = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	`sql.defaults.cost_scans_with_default_col_size.enabled`,
+	"setting to true uses the same size for all columns to compute scan cost",
+	false,
 ).WithPublic()
 
 var errNoTransactionInProgress = errors.New("there is no transaction in progress")
@@ -1206,8 +1221,8 @@ type ExecutorConfig struct {
 	// IndexValidator is used to validate indexes.
 	IndexValidator scexec.IndexValidator
 
-	// CommentUpdaterFactory is used to issue queries for updating comments.
-	CommentUpdaterFactory scexec.CommentUpdaterFactory
+	// DescMetadaUpdaterFactory is used to issue queries for updating comments.
+	DescMetadaUpdaterFactory scexec.DescriptorMetadataUpdaterFactory
 
 	// ContentionRegistry is a node-level registry of contention events used for
 	// contention observability.
@@ -1245,10 +1260,6 @@ type ExecutorConfig struct {
 	// SessionData and other ExtraTxnState.
 	// This is currently only for builtin functions where we need to execute sql.
 	InternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
-
-	// SystemIDChecker is used to check whether an ID is part of the
-	// system database.
-	SystemIDChecker *catalog.SystemIDChecker
 
 	// AllowSessionRevival is true if the cluster is allowed to create session
 	// revival tokens and use them to authenticate a session.
@@ -1372,7 +1383,7 @@ type ExecutorTestingKnobs struct {
 	// query (i.e. no subqueries). The physical plan is only safe for use for the
 	// lifetime of this function. Note that returning a nil function is
 	// unsupported and will lead to a panic.
-	TestingSaveFlows func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error
+	TestingSaveFlows func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execinfra.OpChains) error
 
 	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
 	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
@@ -1834,6 +1845,11 @@ type SessionArgs struct {
 	// client.
 	RemoteAddr            net.Addr
 	ConnResultsBufferSize int64
+	// SessionRevivalToken may contain a token generated from a different session
+	// that can be used to authenticate this session. If it is set, all other
+	// authentication is skipped. Once the token is used to authenticate, this
+	// value should be zeroed out.
+	SessionRevivalToken []byte
 }
 
 // SessionRegistry stores a set of all sessions on this node.
@@ -3067,6 +3083,12 @@ func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsEnabled(val bool) 
 	m.data.ParallelizeMultiKeyLookupJoinsEnabled = val
 }
 
+// TODO(harding): Remove this when costing scans based on average column size
+// is fully supported.
+func (m *sessionDataMutator) SetCostScansWithDefaultColSize(val bool) {
+	m.data.CostScansWithDefaultColSize = val
+}
+
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
@@ -3174,6 +3196,17 @@ func DescsTxn(
 	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
 ) error {
 	return execCfg.CollectionFactory.Txn(ctx, execCfg.InternalExecutor, execCfg.DB, f)
+}
+
+// TestingDescsTxn is a convenience function for running a transaction on
+// descriptors when you have a serverutils.TestServerInterface.
+func TestingDescsTxn(
+	ctx context.Context,
+	s serverutils.TestServerInterface,
+	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
+) error {
+	execCfg := s.ExecutorConfig().(ExecutorConfig)
+	return DescsTxn(ctx, &execCfg, f)
 }
 
 // NewRowMetrics creates a row.Metrics struct for either internal or user

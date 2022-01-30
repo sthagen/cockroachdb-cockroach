@@ -76,6 +76,7 @@ import {
 } from "../timeScaleDropdown";
 
 import { commonStyles } from "../common";
+import { flattenTreeAttributes, planNodeToString } from "../statementDetails";
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
 
@@ -87,6 +88,7 @@ const sortableTableCx = classNames.bind(sortableTableStyles);
 export interface StatementsPageDispatchProps {
   refreshStatements: (req?: StatementsRequest) => void;
   refreshStatementDiagnosticsRequests: () => void;
+  refreshUserSQLRoles: () => void;
   resetSQLStats: () => void;
   dismissAlertMessage: () => void;
   onActivateStatementDiagnostics: (
@@ -123,6 +125,7 @@ export interface StatementsPageStateProps {
   filters: Filters;
   search: string;
   isTenant?: UIConfigState["isTenant"];
+  hasViewActivityRedactedRole?: UIConfigState["hasViewActivityRedactedRole"];
 }
 
 export interface StatementsPageState {
@@ -146,6 +149,25 @@ function statementsRequestFromProps(
   });
 }
 
+// filterBySearchQuery returns true if a search query matches the statement.
+export function filterBySearchQuery(
+  statement: AggregateStatistics,
+  search: string,
+): boolean {
+  const label = statement.label;
+  const plan = planNodeToString(
+    flattenTreeAttributes(
+      statement.stats.sensitive_info &&
+        statement.stats.sensitive_info.most_recent_plan_description,
+    ),
+  );
+  const matchString = `${label} ${plan}`.toLowerCase();
+  return search
+    .toLowerCase()
+    .split(" ")
+    .every(val => matchString.includes(val));
+}
+
 export class StatementsPage extends React.Component<
   StatementsPageProps,
   StatementsPageState
@@ -163,6 +185,11 @@ export class StatementsPage extends React.Component<
     this.state = merge(defaultState, stateFromHistory);
     this.activateDiagnosticsRef = React.createRef();
   }
+
+  static defaultProps: Partial<StatementsPageProps> = {
+    isTenant: false,
+    hasViewActivityRedactedRole: false,
+  };
 
   getStateFromHistory = (): Partial<StatementsPageState> => {
     const {
@@ -244,7 +271,8 @@ export class StatementsPage extends React.Component<
 
   componentDidMount(): void {
     this.refreshStatements();
-    if (!this.props.isTenant) {
+    this.props.refreshUserSQLRoles();
+    if (!this.props.isTenant && !this.props.hasViewActivityRedactedRole) {
       this.props.refreshStatementDiagnosticsRequests();
     }
   }
@@ -283,8 +311,7 @@ export class StatementsPage extends React.Component<
 
   componentDidUpdate = (): void => {
     this.updateQueryParams();
-    this.refreshStatements();
-    if (!this.props.isTenant) {
+    if (!this.props.isTenant && !this.props.hasViewActivityRedactedRole) {
       this.props.refreshStatementDiagnosticsRequests();
     }
   };
@@ -408,15 +435,6 @@ export class StatementsPage extends React.Component<
           databases.length == 0 || databases.includes(statement.database),
       )
       .filter(statement => (filters.fullScan ? statement.fullScan : true))
-      .filter(statement =>
-        search
-          ? search
-              .split(" ")
-              .every(val =>
-                statement.label.toLowerCase().includes(val.toLowerCase()),
-              )
-          : true,
-      )
       .filter(
         statement =>
           statement.stats.service_lat.mean >= timeValue ||
@@ -456,22 +474,23 @@ export class StatementsPage extends React.Component<
               statement.stats.nodes.map(node => "n" + node),
               nodes,
             )),
+      )
+      .filter(statement =>
+        search ? filterBySearchQuery(statement, search) : true,
       );
   };
 
-  renderStatements = (): React.ReactElement => {
+  renderStatements = (regions: string[]): React.ReactElement => {
     const { pagination, filters, activeFilters } = this.state;
     const {
       statements,
-      apps,
-      databases,
       onDiagnosticsReportDownload,
       onStatementClick,
-      resetSQLStats,
       columns: userSelectedColumnsToShow,
       onColumnsChange,
       nodeRegions,
       isTenant,
+      hasViewActivityRedactedRole,
       sortSetting,
       search,
     } = this.props;
@@ -481,14 +500,6 @@ export class StatementsPage extends React.Component<
     const isEmptySearchResults = statements?.length > 0 && search?.length > 0;
     // If the cluster is a tenant cluster we don't show info
     // about nodes/regions.
-    const nodes = isTenant
-      ? []
-      : Object.keys(nodeRegions)
-          .map(n => Number(n))
-          .sort();
-    const regions = isTenant
-      ? []
-      : unique(nodes.map(node => nodeRegions[node.toString()])).sort();
     populateRegionNodeForStatements(statements, nodeRegions, isTenant);
 
     // Creates a list of all possible columns,
@@ -501,6 +512,7 @@ export class StatementsPage extends React.Component<
       nodeRegions,
       "statement",
       isTenant,
+      hasViewActivityRedactedRole,
       search,
       this.activateDiagnosticsRef,
       onDiagnosticsReportDownload,
@@ -536,45 +548,6 @@ export class StatementsPage extends React.Component<
 
     return (
       <div>
-        <PageConfig>
-          <PageConfigItem>
-            <Search
-              onSubmit={this.onSubmitSearchField as any}
-              onClear={this.onClearSearchField}
-              defaultValue={search}
-            />
-          </PageConfigItem>
-          <PageConfigItem>
-            <Filter
-              onSubmitFilters={this.onSubmitFilters}
-              appNames={apps}
-              dbNames={databases}
-              regions={regions}
-              nodes={nodes.map(n => "n" + n)}
-              activeFilters={activeFilters}
-              filters={filters}
-              showDB={true}
-              showSqlType={true}
-              showScan={true}
-              showRegions={regions.length > 1}
-              showNodes={nodes.length > 1}
-            />
-          </PageConfigItem>
-          <PageConfigItem className={commonStyles("separator")}>
-            <TimeScaleDropdown
-              currentScale={this.props.timeScale}
-              setTimeScale={this.changeTimeScale}
-            />
-          </PageConfigItem>
-          <PageConfigItem>
-            <button className={cx("reset-btn")} onClick={this.resetTime}>
-              reset time
-            </button>
-          </PageConfigItem>
-          <PageConfigItem className={commonStyles("separator")}>
-            <ClearStats resetSQLStats={resetSQLStats} tooltipType="statement" />
-          </PageConfigItem>
-        </PageConfig>
         <section className={sortableTableCx("cl-table-container")}>
           <div>
             <ColumnsSelector
@@ -619,13 +592,69 @@ export class StatementsPage extends React.Component<
       refreshStatementDiagnosticsRequests,
       onActivateStatementDiagnostics,
       onDiagnosticsModalOpen,
+      apps,
+      databases,
+      search,
+      isTenant,
+      nodeRegions,
+      resetSQLStats,
     } = this.props;
+
+    const nodes = isTenant
+      ? []
+      : Object.keys(nodeRegions)
+          .map(n => Number(n))
+          .sort();
+    const regions = isTenant
+      ? []
+      : unique(nodes.map(node => nodeRegions[node.toString()])).sort();
+    const { filters, activeFilters } = this.state;
+
     return (
       <div className={cx("root", "table-area")}>
+        <PageConfig>
+          <PageConfigItem>
+            <Search
+              onSubmit={this.onSubmitSearchField as any}
+              onClear={this.onClearSearchField}
+              defaultValue={search}
+            />
+          </PageConfigItem>
+          <PageConfigItem>
+            <Filter
+              onSubmitFilters={this.onSubmitFilters}
+              appNames={apps}
+              dbNames={databases}
+              regions={regions}
+              nodes={nodes.map(n => "n" + n)}
+              activeFilters={activeFilters}
+              filters={filters}
+              showDB={true}
+              showSqlType={true}
+              showScan={true}
+              showRegions={regions.length > 1}
+              showNodes={nodes.length > 1}
+            />
+          </PageConfigItem>
+          <PageConfigItem className={commonStyles("separator")}>
+            <TimeScaleDropdown
+              currentScale={this.props.timeScale}
+              setTimeScale={this.changeTimeScale}
+            />
+          </PageConfigItem>
+          <PageConfigItem>
+            <button className={cx("reset-btn")} onClick={this.resetTime}>
+              reset time
+            </button>
+          </PageConfigItem>
+          <PageConfigItem className={commonStyles("separator")}>
+            <ClearStats resetSQLStats={resetSQLStats} tooltipType="statement" />
+          </PageConfigItem>
+        </PageConfig>
         <Loading
           loading={isNil(this.props.statements)}
           error={this.props.statementsError}
-          render={this.renderStatements}
+          render={() => this.renderStatements(regions)}
           renderError={() =>
             SQLActivityError({
               statsType: "statements",

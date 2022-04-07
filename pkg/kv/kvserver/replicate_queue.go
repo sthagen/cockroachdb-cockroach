@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
@@ -51,7 +52,7 @@ const (
 // for rebalancing. It does not prevent transferring leases in order to allow
 // a replica to be removed from a range.
 var MinLeaseTransferInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.allocator.min_lease_transfer_interval",
 	"controls how frequently leases can be transferred for rebalancing. "+
 		"It does not prevent transferring leases in order to allow a "+
@@ -60,11 +61,22 @@ var MinLeaseTransferInterval = settings.RegisterDurationSetting(
 	settings.NonNegativeDuration,
 )
 
-// TODO(aayush): Expand this metric set to include metrics about non-voting replicas.
 var (
 	metaReplicateQueueAddReplicaCount = metric.Metadata{
 		Name:        "queue.replicate.addreplica",
 		Help:        "Number of replica additions attempted by the replicate queue",
+		Measurement: "Replica Additions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueAddVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.addvoterreplica",
+		Help:        "Number of voter replica additions attempted by the replicate queue",
+		Measurement: "Replica Additions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueAddNonVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.addnonvoterreplica",
+		Help:        "Number of non-voter replica additions attempted by the replicate queue",
 		Measurement: "Replica Additions",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -74,9 +86,51 @@ var (
 		Measurement: "Replica Removals",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaReplicateQueueRemoveVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removevoterreplica",
+		Help:        "Number of voter replica removals attempted by the replicate queue (typically in response to a rebalancer-initiated addition)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRemoveNonVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removenonvoterreplica",
+		Help:        "Number of non-voter replica removals attempted by the replicate queue (typically in response to a rebalancer-initiated addition)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaReplicateQueueRemoveDeadReplicaCount = metric.Metadata{
 		Name:        "queue.replicate.removedeadreplica",
 		Help:        "Number of dead replica removals attempted by the replicate queue (typically in response to a node outage)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRemoveDeadVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removedeadvoterreplica",
+		Help:        "Number of dead voter replica removals attempted by the replicate queue (typically in response to a node outage)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRemoveDeadNonVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removedeadnonvoterreplica",
+		Help:        "Number of dead non-voter replica removals attempted by the replicate queue (typically in response to a node outage)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRemoveDecommissioningReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removedecommissioningreplica",
+		Help:        "Number of decommissioning replica removals attempted by the replicate queue (typically in response to a node outage)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRemoveDecommissioningVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removedecommissioningvoterreplica",
+		Help:        "Number of decommissioning voter replica removals attempted by the replicate queue (typically in response to a node outage)",
+		Measurement: "Replica Removals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRemoveDecommissioningNonVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.removedecommissioningnonvoterreplica",
+		Help:        "Number of decommissioning non-voter replica removals attempted by the replicate queue (typically in response to a node outage)",
 		Measurement: "Replica Removals",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -89,6 +143,18 @@ var (
 	metaReplicateQueueRebalanceReplicaCount = metric.Metadata{
 		Name:        "queue.replicate.rebalancereplica",
 		Help:        "Number of replica rebalancer-initiated additions attempted by the replicate queue",
+		Measurement: "Replica Additions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRebalanceVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.rebalancevoterreplica",
+		Help:        "Number of voter replica rebalancer-initiated additions attempted by the replicate queue",
+		Measurement: "Replica Additions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaReplicateQueueRebalanceNonVoterReplicaCount = metric.Metadata{
+		Name:        "queue.replicate.rebalancenonvoterreplica",
+		Help:        "Number of non-voter replica rebalancer-initiated additions attempted by the replicate queue",
 		Measurement: "Replica Additions",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -132,28 +198,140 @@ func (e *quorumError) Error() string {
 func (*quorumError) purgatoryErrorMarker() {}
 
 // ReplicateQueueMetrics is the set of metrics for the replicate queue.
-// TODO(aayush): Track metrics for non-voting replicas separately here.
 type ReplicateQueueMetrics struct {
-	AddReplicaCount           *metric.Counter
-	RemoveReplicaCount        *metric.Counter
-	RemoveDeadReplicaCount    *metric.Counter
-	RemoveLearnerReplicaCount *metric.Counter
-	RebalanceReplicaCount     *metric.Counter
-	TransferLeaseCount        *metric.Counter
-	NonVoterPromotionsCount   *metric.Counter
-	VoterDemotionsCount       *metric.Counter
+	AddReplicaCount                           *metric.Counter
+	AddVoterReplicaCount                      *metric.Counter
+	AddNonVoterReplicaCount                   *metric.Counter
+	RemoveReplicaCount                        *metric.Counter
+	RemoveVoterReplicaCount                   *metric.Counter
+	RemoveNonVoterReplicaCount                *metric.Counter
+	RemoveDeadReplicaCount                    *metric.Counter
+	RemoveDeadVoterReplicaCount               *metric.Counter
+	RemoveDeadNonVoterReplicaCount            *metric.Counter
+	RemoveDecommissioningReplicaCount         *metric.Counter
+	RemoveDecommissioningVoterReplicaCount    *metric.Counter
+	RemoveDecommissioningNonVoterReplicaCount *metric.Counter
+	RemoveLearnerReplicaCount                 *metric.Counter
+	RebalanceReplicaCount                     *metric.Counter
+	RebalanceVoterReplicaCount                *metric.Counter
+	RebalanceNonVoterReplicaCount             *metric.Counter
+	TransferLeaseCount                        *metric.Counter
+	NonVoterPromotionsCount                   *metric.Counter
+	VoterDemotionsCount                       *metric.Counter
 }
 
 func makeReplicateQueueMetrics() ReplicateQueueMetrics {
 	return ReplicateQueueMetrics{
-		AddReplicaCount:           metric.NewCounter(metaReplicateQueueAddReplicaCount),
-		RemoveReplicaCount:        metric.NewCounter(metaReplicateQueueRemoveReplicaCount),
-		RemoveDeadReplicaCount:    metric.NewCounter(metaReplicateQueueRemoveDeadReplicaCount),
-		RemoveLearnerReplicaCount: metric.NewCounter(metaReplicateQueueRemoveLearnerReplicaCount),
-		RebalanceReplicaCount:     metric.NewCounter(metaReplicateQueueRebalanceReplicaCount),
-		TransferLeaseCount:        metric.NewCounter(metaReplicateQueueTransferLeaseCount),
-		NonVoterPromotionsCount:   metric.NewCounter(metaReplicateQueueNonVoterPromotionsCount),
-		VoterDemotionsCount:       metric.NewCounter(metaReplicateQueueVoterDemotionsCount),
+		AddReplicaCount:                           metric.NewCounter(metaReplicateQueueAddReplicaCount),
+		AddVoterReplicaCount:                      metric.NewCounter(metaReplicateQueueAddVoterReplicaCount),
+		AddNonVoterReplicaCount:                   metric.NewCounter(metaReplicateQueueAddNonVoterReplicaCount),
+		RemoveReplicaCount:                        metric.NewCounter(metaReplicateQueueRemoveReplicaCount),
+		RemoveVoterReplicaCount:                   metric.NewCounter(metaReplicateQueueRemoveVoterReplicaCount),
+		RemoveNonVoterReplicaCount:                metric.NewCounter(metaReplicateQueueRemoveNonVoterReplicaCount),
+		RemoveDeadReplicaCount:                    metric.NewCounter(metaReplicateQueueRemoveDeadReplicaCount),
+		RemoveDeadVoterReplicaCount:               metric.NewCounter(metaReplicateQueueRemoveDeadVoterReplicaCount),
+		RemoveDeadNonVoterReplicaCount:            metric.NewCounter(metaReplicateQueueRemoveDeadNonVoterReplicaCount),
+		RemoveLearnerReplicaCount:                 metric.NewCounter(metaReplicateQueueRemoveLearnerReplicaCount),
+		RemoveDecommissioningReplicaCount:         metric.NewCounter(metaReplicateQueueRemoveDecommissioningReplicaCount),
+		RemoveDecommissioningVoterReplicaCount:    metric.NewCounter(metaReplicateQueueRemoveDecommissioningVoterReplicaCount),
+		RemoveDecommissioningNonVoterReplicaCount: metric.NewCounter(metaReplicateQueueRemoveDecommissioningNonVoterReplicaCount),
+		RebalanceReplicaCount:                     metric.NewCounter(metaReplicateQueueRebalanceReplicaCount),
+		RebalanceVoterReplicaCount:                metric.NewCounter(metaReplicateQueueRebalanceVoterReplicaCount),
+		RebalanceNonVoterReplicaCount:             metric.NewCounter(metaReplicateQueueRebalanceNonVoterReplicaCount),
+		TransferLeaseCount:                        metric.NewCounter(metaReplicateQueueTransferLeaseCount),
+		NonVoterPromotionsCount:                   metric.NewCounter(metaReplicateQueueNonVoterPromotionsCount),
+		VoterDemotionsCount:                       metric.NewCounter(metaReplicateQueueVoterDemotionsCount),
+	}
+}
+
+// trackAddReplicaCount increases the AddReplicaCount metric and separately
+// tracks voter/non-voter metrics given a replica targetType.
+func (metrics *ReplicateQueueMetrics) trackAddReplicaCount(targetType targetReplicaType) {
+	metrics.AddReplicaCount.Inc(1)
+	switch targetType {
+	case voterTarget:
+		metrics.AddVoterReplicaCount.Inc(1)
+	case nonVoterTarget:
+		metrics.AddNonVoterReplicaCount.Inc(1)
+	default:
+		panic(fmt.Sprintf("unsupported targetReplicaType: %v", targetType))
+	}
+}
+
+// trackRemoveMetric increases total RemoveReplicaCount metrics and
+// increments dead/decommissioning metrics depending on replicaStatus.
+func (metrics *ReplicateQueueMetrics) trackRemoveMetric(
+	targetType targetReplicaType, replicaStatus replicaStatus,
+) {
+	metrics.trackRemoveReplicaCount(targetType)
+	switch replicaStatus {
+	case dead:
+		metrics.trackRemoveDeadReplicaCount(targetType)
+	case decommissioning:
+		metrics.trackRemoveDecommissioningReplicaCount(targetType)
+	case alive:
+		return
+	default:
+		panic(fmt.Sprintf("unknown replicaStatus %v", replicaStatus))
+	}
+}
+
+// trackRemoveReplicaCount increases the RemoveReplicaCount metric and
+// separately tracks voter/non-voter metrics given a replica targetType.
+func (metrics *ReplicateQueueMetrics) trackRemoveReplicaCount(targetType targetReplicaType) {
+	metrics.RemoveReplicaCount.Inc(1)
+	switch targetType {
+	case voterTarget:
+		metrics.RemoveVoterReplicaCount.Inc(1)
+	case nonVoterTarget:
+		metrics.RemoveNonVoterReplicaCount.Inc(1)
+	default:
+		panic(fmt.Sprintf("unsupported targetReplicaType: %v", targetType))
+	}
+}
+
+// trackRemoveDeadReplicaCount increases the RemoveDeadReplicaCount metric and
+// separately tracks voter/non-voter metrics given a replica targetType.
+func (metrics *ReplicateQueueMetrics) trackRemoveDeadReplicaCount(targetType targetReplicaType) {
+	metrics.RemoveDeadReplicaCount.Inc(1)
+	switch targetType {
+	case voterTarget:
+		metrics.RemoveDeadVoterReplicaCount.Inc(1)
+	case nonVoterTarget:
+		metrics.RemoveDeadNonVoterReplicaCount.Inc(1)
+	default:
+		panic(fmt.Sprintf("unsupported targetReplicaType: %v", targetType))
+	}
+}
+
+// trackRemoveDecommissioningReplicaCount increases the
+// RemoveDecommissioningReplicaCount metric and separately tracks
+// voter/non-voter metrics given a replica targetType.
+func (metrics *ReplicateQueueMetrics) trackRemoveDecommissioningReplicaCount(
+	targetType targetReplicaType,
+) {
+	metrics.RemoveDecommissioningReplicaCount.Inc(1)
+	switch targetType {
+	case voterTarget:
+		metrics.RemoveDecommissioningVoterReplicaCount.Inc(1)
+	case nonVoterTarget:
+		metrics.RemoveDecommissioningNonVoterReplicaCount.Inc(1)
+	default:
+		panic(fmt.Sprintf("unsupported targetReplicaType: %v", targetType))
+	}
+}
+
+// trackRebalanceReplicaCount increases the RebalanceReplicaCount metric and
+// separately tracks voter/non-voter metrics given a replica targetType.
+func (metrics *ReplicateQueueMetrics) trackRebalanceReplicaCount(targetType targetReplicaType) {
+	metrics.RebalanceReplicaCount.Inc(1)
+	switch targetType {
+	case voterTarget:
+		metrics.RebalanceVoterReplicaCount.Inc(1)
+	case nonVoterTarget:
+		metrics.RebalanceNonVoterReplicaCount.Inc(1)
+	default:
+		panic(fmt.Sprintf("unsupported targetReplicaType: %v", targetType))
 	}
 }
 
@@ -280,7 +458,7 @@ func (rq *replicateQueue) shouldQueue(
 	status := repl.LeaseStatusAt(ctx, now)
 	if status.IsValid() &&
 		rq.canTransferLeaseFrom(ctx, repl) &&
-		rq.allocator.ShouldTransferLease(ctx, conf, voterReplicas, status.Lease.Replica.StoreID, repl.leaseholderStats) {
+		rq.allocator.ShouldTransferLease(ctx, conf, voterReplicas, repl, repl.leaseholderStats) {
 
 		log.VEventf(ctx, 2, "lease transfer needed, enqueuing")
 		return true, 0
@@ -304,7 +482,9 @@ func (rq *replicateQueue) process(
 	// selected target.
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
-			requeue, err := rq.processOneChange(ctx, repl, rq.canTransferLeaseFrom, false /* dryRun */)
+			requeue, err := rq.processOneChange(
+				ctx, repl, rq.canTransferLeaseFrom, false /* scatter */, false, /* dryRun */
+			)
 			if isSnapshotError(err) {
 				// If ChangeReplicas failed because the snapshot failed, we log the
 				// error but then return success indicating we should retry the
@@ -341,7 +521,7 @@ func (rq *replicateQueue) processOneChange(
 	ctx context.Context,
 	repl *Replica,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-	dryRun bool,
+	scatter, dryRun bool,
 ) (requeue bool, _ error) {
 	// Check lease and destroy status here. The queue does this higher up already, but
 	// adminScatter (and potential other future callers) also call this method and don't
@@ -362,8 +542,6 @@ func (rq *replicateQueue) processOneChange(
 	// range descriptor.
 	desc, conf := repl.DescAndSpanConfig()
 
-	// Avoid taking action if the range has too many dead replicas to make quorum.
-	// Consider stores marked suspect as live in order to make this determination.
 	voterReplicas := desc.Replicas().VoterDescriptors()
 	nonVoterReplicas := desc.Replicas().NonVoterDescriptors()
 	liveVoterReplicas, deadVoterReplicas := rq.allocator.storePool.liveAndDeadReplicas(
@@ -396,9 +574,13 @@ func (rq *replicateQueue) processOneChange(
 
 	// Add replicas.
 	case AllocatorAddVoter:
-		return rq.addOrReplaceVoters(ctx, repl, liveVoterReplicas, liveNonVoterReplicas, -1 /* removeIdx */, dryRun)
+		return rq.addOrReplaceVoters(
+			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, -1 /* removeIdx */, alive, dryRun,
+		)
 	case AllocatorAddNonVoter:
-		return rq.addOrReplaceNonVoters(ctx, repl, liveVoterReplicas, liveNonVoterReplicas, -1 /* removeIdx */, dryRun)
+		return rq.addOrReplaceNonVoters(
+			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, -1 /* removeIdx */, alive, dryRun,
+		)
 
 	// Remove replicas.
 	case AllocatorRemoveVoter:
@@ -418,7 +600,8 @@ func (rq *replicateQueue) processOneChange(
 				"dead voter %v unexpectedly not found in %v",
 				deadVoterReplicas[0], voterReplicas)
 		}
-		return rq.addOrReplaceVoters(ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, dryRun)
+		return rq.addOrReplaceVoters(
+			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, dead, dryRun)
 	case AllocatorReplaceDeadNonVoter:
 		if len(deadNonVoterReplicas) == 0 {
 			// Nothing to do.
@@ -430,7 +613,8 @@ func (rq *replicateQueue) processOneChange(
 				"dead non-voter %v unexpectedly not found in %v",
 				deadNonVoterReplicas[0], nonVoterReplicas)
 		}
-		return rq.addOrReplaceNonVoters(ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, dryRun)
+		return rq.addOrReplaceNonVoters(
+			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, dead, dryRun)
 
 	// Replace decommissioning replicas.
 	case AllocatorReplaceDecommissioningVoter:
@@ -445,7 +629,8 @@ func (rq *replicateQueue) processOneChange(
 				"decommissioning voter %v unexpectedly not found in %v",
 				decommissioningVoterReplicas[0], voterReplicas)
 		}
-		return rq.addOrReplaceVoters(ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, dryRun)
+		return rq.addOrReplaceVoters(
+			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, decommissioning, dryRun)
 	case AllocatorReplaceDecommissioningNonVoter:
 		decommissioningNonVoterReplicas := rq.allocator.storePool.decommissioningReplicas(nonVoterReplicas)
 		if len(decommissioningNonVoterReplicas) == 0 {
@@ -457,7 +642,8 @@ func (rq *replicateQueue) processOneChange(
 				"decommissioning non-voter %v unexpectedly not found in %v",
 				decommissioningNonVoterReplicas[0], nonVoterReplicas)
 		}
-		return rq.addOrReplaceNonVoters(ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, dryRun)
+		return rq.addOrReplaceNonVoters(
+			ctx, repl, liveVoterReplicas, liveNonVoterReplicas, removeIdx, decommissioning, dryRun)
 
 	// Remove decommissioning replicas.
 	//
@@ -482,9 +668,18 @@ func (rq *replicateQueue) processOneChange(
 	case AllocatorRemoveLearner:
 		return rq.removeLearner(ctx, repl, dryRun)
 	case AllocatorConsiderRebalance:
-		return rq.considerRebalance(ctx, repl, voterReplicas, nonVoterReplicas, canTransferLeaseFrom, dryRun)
+		return rq.considerRebalance(
+			ctx,
+			repl,
+			voterReplicas,
+			nonVoterReplicas,
+			canTransferLeaseFrom,
+			scatter,
+			dryRun,
+		)
 	case AllocatorFinalizeAtomicReplicationChange:
-		_, err := maybeLeaveAtomicChangeReplicasAndRemoveLearners(ctx, repl.store, repl.Desc())
+		_, err :=
+			repl.maybeLeaveAtomicChangeReplicasAndRemoveLearners(ctx, repl.Desc())
 		// Requeue because either we failed to transition out of a joint state
 		// (bad) or we did and there might be more to do for that range.
 		return true, err
@@ -518,6 +713,7 @@ func (rq *replicateQueue) addOrReplaceVoters(
 	repl *Replica,
 	liveVoterReplicas, liveNonVoterReplicas []roachpb.ReplicaDescriptor,
 	removeIdx int,
+	replicaStatus replicaStatus,
 	dryRun bool,
 ) (requeue bool, _ error) {
 	desc, conf := repl.DescAndSpanConfig()
@@ -539,33 +735,38 @@ func (rq *replicateQueue) addOrReplaceVoters(
 				break
 			}
 		}
-		// See about transferring the lease away if we're about to remove the
-		// leaseholder.
-		done, err := rq.maybeTransferLeaseAway(
-			ctx, repl, existingVoters[removeIdx].StoreID, dryRun, nil /* canTransferLeaseFrom */)
-		if err != nil {
-			return false, err
-		}
-		if done {
-			// Lease was transferred away. Next leaseholder is going to take over.
-			return false, nil
+		// Determines whether we can remove the leaseholder without first
+		// transferring the lease away. The call to allocator below makes sure
+		// that we proceed with the change only if we replace the removed replica
+		// with a VOTER_INCOMING.
+		lhRemovalAllowed := repl.store.cfg.Settings.Version.IsActive(ctx,
+			clusterversion.EnableLeaseHolderRemoval)
+		if !lhRemovalAllowed {
+			// See about transferring the lease away if we're about to remove the
+			// leaseholder.
+			done, err := rq.maybeTransferLeaseAway(
+				ctx, repl, existingVoters[removeIdx].StoreID, dryRun, nil /* canTransferLeaseFrom */)
+			if err != nil {
+				return false, err
+			}
+			if done {
+				// Lease was transferred away. Next leaseholder is going to take over.
+				return false, nil
+			}
 		}
 	}
 
+	lhBeingRemoved := removeIdx >= 0 && existingVoters[removeIdx].StoreID == repl.store.StoreID()
 	// The allocator should not try to re-add this replica since there is a reason
 	// we're removing it (i.e. dead or decommissioning). If we left the replica in
 	// the slice, the allocator would not be guaranteed to pick a replica that
 	// fills the gap removeRepl leaves once it's gone.
-	newStore, details, err := rq.allocator.AllocateVoter(ctx, conf, remainingLiveVoters, remainingLiveNonVoters)
+	newVoter, details, err := rq.allocator.AllocateVoter(ctx, conf, remainingLiveVoters, remainingLiveNonVoters)
 	if err != nil {
 		return false, err
 	}
-	if removeIdx >= 0 && newStore.StoreID == existingVoters[removeIdx].StoreID {
-		return false, errors.AssertionFailedf("allocator suggested to replace replica on s%d with itself", newStore.StoreID)
-	}
-	newVoter := roachpb.ReplicationTarget{
-		NodeID:  newStore.Node.NodeID,
-		StoreID: newStore.StoreID,
+	if removeIdx >= 0 && newVoter.StoreID == existingVoters[removeIdx].StoreID {
+		return false, errors.AssertionFailedf("allocator suggested to replace replica on s%d with itself", newVoter.StoreID)
 	}
 
 	clusterNodes := rq.allocator.storePool.ClusterNodeCount()
@@ -588,10 +789,10 @@ func (rq *replicateQueue) addOrReplaceVoters(
 		// This means we are going to up-replicate to an even replica state.
 		// Check if it is possible to go to an odd replica state beyond it.
 		oldPlusNewReplicas := append([]roachpb.ReplicaDescriptor(nil), existingVoters...)
-		oldPlusNewReplicas = append(oldPlusNewReplicas, roachpb.ReplicaDescriptor{
-			NodeID:  newStore.Node.NodeID,
-			StoreID: newStore.StoreID,
-		})
+		oldPlusNewReplicas = append(
+			oldPlusNewReplicas,
+			roachpb.ReplicaDescriptor{NodeID: newVoter.NodeID, StoreID: newVoter.StoreID},
+		)
 		_, _, err := rq.allocator.AllocateVoter(ctx, conf, oldPlusNewReplicas, remainingLiveNonVoters)
 		if err != nil {
 			// It does not seem possible to go to the next odd replica state. Note
@@ -600,7 +801,6 @@ func (rq *replicateQueue) addOrReplaceVoters(
 			return false, errors.Wrap(err, "avoid up-replicating to fragile quorum")
 		}
 	}
-	rq.metrics.AddReplicaCount.Inc(1)
 
 	// Figure out whether we should be promoting an existing non-voting replica to
 	// a voting replica or if we ought to be adding a voter afresh.
@@ -613,16 +813,23 @@ func (rq *replicateQueue) addOrReplaceVoters(
 		}
 		// If the allocation target has a non-voter already, we will promote it to a
 		// voter.
-		rq.metrics.NonVoterPromotionsCount.Inc(1)
+		if !dryRun {
+			rq.metrics.NonVoterPromotionsCount.Inc(1)
+		}
 		ops = roachpb.ReplicationChangesForPromotion(newVoter)
 	} else {
+		if !dryRun {
+			rq.metrics.trackAddReplicaCount(voterTarget)
+		}
 		ops = roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, newVoter)
 	}
 	if removeIdx < 0 {
 		log.VEventf(ctx, 1, "adding voter %+v: %s",
 			newVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
 	} else {
-		rq.metrics.RemoveReplicaCount.Inc(1)
+		if !dryRun {
+			rq.metrics.trackRemoveMetric(voterTarget, replicaStatus)
+		}
 		removeVoter := existingVoters[removeIdx]
 		log.VEventf(ctx, 1, "replacing voter %s with %+v: %s",
 			removeVoter, newVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
@@ -644,15 +851,17 @@ func (rq *replicateQueue) addOrReplaceVoters(
 		repl,
 		ops,
 		desc,
-		SnapshotRequest_RECOVERY,
+		kvserverpb.SnapshotRequest_RECOVERY,
 		kvserverpb.ReasonRangeUnderReplicated,
 		details,
 		dryRun,
 	); err != nil {
 		return false, err
 	}
-	// Always requeue to see if more work needs to be done.
-	return true, nil
+	// Unless just removed myself (the leaseholder), always requeue to see
+	// if more work needs to be done. If leaseholder is removed, someone
+	// else will take over.
+	return !lhBeingRemoved, nil
 }
 
 // addOrReplaceNonVoters adds a non-voting replica to `repl`s range.
@@ -661,27 +870,28 @@ func (rq *replicateQueue) addOrReplaceNonVoters(
 	repl *Replica,
 	liveVoterReplicas, liveNonVoterReplicas []roachpb.ReplicaDescriptor,
 	removeIdx int,
+	replicaStatus replicaStatus,
 	dryRun bool,
 ) (requeue bool, _ error) {
 	desc, conf := repl.DescAndSpanConfig()
 	existingNonVoters := desc.Replicas().NonVoterDescriptors()
 
-	newStore, details, err := rq.allocator.AllocateNonVoter(ctx, conf, liveVoterReplicas, liveNonVoterReplicas)
+	newNonVoter, details, err := rq.allocator.AllocateNonVoter(ctx, conf, liveVoterReplicas, liveNonVoterReplicas)
 	if err != nil {
 		return false, err
 	}
-	rq.metrics.AddReplicaCount.Inc(1)
-
-	newNonVoter := roachpb.ReplicationTarget{
-		NodeID:  newStore.Node.NodeID,
-		StoreID: newStore.StoreID,
+	if !dryRun {
+		rq.metrics.trackAddReplicaCount(nonVoterTarget)
 	}
+
 	ops := roachpb.MakeReplicationChanges(roachpb.ADD_NON_VOTER, newNonVoter)
 	if removeIdx < 0 {
 		log.VEventf(ctx, 1, "adding non-voter %+v: %s",
 			newNonVoter, rangeRaftProgress(repl.RaftStatus(), existingNonVoters))
 	} else {
-		rq.metrics.RemoveReplicaCount.Inc(1)
+		if !dryRun {
+			rq.metrics.trackRemoveMetric(nonVoterTarget, replicaStatus)
+		}
 		removeNonVoter := existingNonVoters[removeIdx]
 		log.VEventf(ctx, 1, "replacing non-voter %s with %+v: %s",
 			removeNonVoter, newNonVoter, rangeRaftProgress(repl.RaftStatus(), existingNonVoters))
@@ -697,7 +907,7 @@ func (rq *replicateQueue) addOrReplaceNonVoters(
 		repl,
 		ops,
 		desc,
-		SnapshotRequest_RECOVERY,
+		kvserverpb.SnapshotRequest_RECOVERY,
 		kvserverpb.ReasonRangeUnderReplicated,
 		details,
 		dryRun,
@@ -724,7 +934,7 @@ func (rq *replicateQueue) findRemoveVoter(
 		RaftStatus() *raft.Status
 	},
 	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
-) (roachpb.ReplicaDescriptor, string, error) {
+) (roachpb.ReplicationTarget, string, error) {
 	_, zone := repl.DescAndSpanConfig()
 	// This retry loop involves quick operations on local state, so a
 	// small MaxBackoff is good (but those local variables change on
@@ -749,7 +959,7 @@ func (rq *replicateQueue) findRemoveVoter(
 		raftStatus := repl.RaftStatus()
 		if raftStatus == nil || raftStatus.RaftState != raft.StateLeader {
 			// If we've lost raft leadership, we're unlikely to regain it so give up immediately.
-			return roachpb.ReplicaDescriptor{}, "", &benignError{errors.Errorf("not raft leader while range needs removal")}
+			return roachpb.ReplicationTarget{}, "", &benignError{errors.Errorf("not raft leader while range needs removal")}
 		}
 		candidates = filterUnremovableReplicas(ctx, raftStatus, existingVoters, lastReplAdded)
 		log.VEventf(ctx, 3, "filtered unremovable replicas from %v to get %v as candidates for removal: %s",
@@ -780,8 +990,12 @@ func (rq *replicateQueue) findRemoveVoter(
 	}
 	if len(candidates) == 0 {
 		// If we timed out and still don't have any valid candidates, give up.
-		return roachpb.ReplicaDescriptor{}, "", &benignError{errors.Errorf("no removable replicas from range that needs a removal: %s",
-			rangeRaftProgress(repl.RaftStatus(), existingVoters))}
+		return roachpb.ReplicationTarget{}, "", &benignError{
+			errors.Errorf(
+				"no removable replicas from range that needs a removal: %s",
+				rangeRaftProgress(repl.RaftStatus(), existingVoters),
+			),
+		}
 	}
 
 	return rq.allocator.RemoveVoter(
@@ -833,7 +1047,11 @@ func (rq *replicateQueue) maybeTransferLeaseAway(
 		desc,
 		conf,
 		transferLeaseOptions{
+			goal:   leaseCountConvergence,
 			dryRun: dryRun,
+			// NB: This option means that the allocator is asked to not consider the
+			// current replica in its set of potential candidates.
+			excludeLeaseRepl: true,
 		},
 	)
 	return transferred == transferOK, err
@@ -860,13 +1078,12 @@ func (rq *replicateQueue) removeVoter(
 	}
 
 	// Remove a replica.
-	rq.metrics.RemoveReplicaCount.Inc(1)
+	if !dryRun {
+		rq.metrics.trackRemoveMetric(voterTarget, alive)
+	}
+
 	log.VEventf(ctx, 1, "removing voting replica %+v due to over-replication: %s",
 		removeVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
-	target := roachpb.ReplicationTarget{
-		NodeID:  removeVoter.NodeID,
-		StoreID: removeVoter.StoreID,
-	}
 	desc := repl.Desc()
 	// TODO(aayush): Directly removing the voter here is a bit of a missed
 	// opportunity since we could potentially be 1 non-voter short and the
@@ -876,9 +1093,9 @@ func (rq *replicateQueue) removeVoter(
 	if err := rq.changeReplicas(
 		ctx,
 		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
+		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, removeVoter),
 		desc,
-		SnapshotRequest_UNKNOWN, // unused
+		kvserverpb.SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonRangeOverReplicated,
 		details,
 		dryRun,
@@ -894,7 +1111,6 @@ func (rq *replicateQueue) removeNonVoter(
 	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
 	dryRun bool,
 ) (requeue bool, _ error) {
-	rq.metrics.RemoveReplicaCount.Inc(1)
 
 	desc, conf := repl.DescAndSpanConfig()
 	removeNonVoter, details, err := rq.allocator.RemoveNonVoter(
@@ -908,7 +1124,9 @@ func (rq *replicateQueue) removeNonVoter(
 	if err != nil {
 		return false, err
 	}
-
+	if !dryRun {
+		rq.metrics.trackRemoveMetric(nonVoterTarget, alive)
+	}
 	log.VEventf(ctx, 1, "removing non-voting replica %+v due to over-replication: %s",
 		removeNonVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
 	target := roachpb.ReplicationTarget{
@@ -921,7 +1139,7 @@ func (rq *replicateQueue) removeNonVoter(
 		repl,
 		roachpb.MakeReplicationChanges(roachpb.REMOVE_NON_VOTER, target),
 		desc,
-		SnapshotRequest_UNKNOWN,
+		kvserverpb.SnapshotRequest_UNKNOWN,
 		kvserverpb.ReasonRangeOverReplicated,
 		details,
 		dryRun,
@@ -967,7 +1185,9 @@ func (rq *replicateQueue) removeDecommissioning(
 	}
 
 	// Remove the decommissioning replica.
-	rq.metrics.RemoveReplicaCount.Inc(1)
+	if !dryRun {
+		rq.metrics.trackRemoveMetric(targetType, decommissioning)
+	}
 	log.VEventf(ctx, 1, "removing decommissioning %s %+v from store", targetType, decommissioningReplica)
 	target := roachpb.ReplicationTarget{
 		NodeID:  decommissioningReplica.NodeID,
@@ -978,7 +1198,7 @@ func (rq *replicateQueue) removeDecommissioning(
 		repl,
 		roachpb.MakeReplicationChanges(targetType.RemoveChangeType(), target),
 		desc,
-		SnapshotRequest_UNKNOWN, // unused
+		kvserverpb.SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonStoreDecommissioning, "", dryRun,
 	); err != nil {
 		return false, err
@@ -1006,7 +1226,9 @@ func (rq *replicateQueue) removeDead(
 		return true, nil
 	}
 	deadReplica := deadReplicas[0]
-	rq.metrics.RemoveDeadReplicaCount.Inc(1)
+	if !dryRun {
+		rq.metrics.trackRemoveMetric(targetType, dead)
+	}
 	log.VEventf(ctx, 1, "removing dead %s %+v from store", targetType, deadReplica)
 	target := roachpb.ReplicationTarget{
 		NodeID:  deadReplica.NodeID,
@@ -1022,7 +1244,7 @@ func (rq *replicateQueue) removeDead(
 		repl,
 		roachpb.MakeReplicationChanges(targetType.RemoveChangeType(), target),
 		desc,
-		SnapshotRequest_UNKNOWN, // unused
+		kvserverpb.SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonStoreDead,
 		"",
 		dryRun,
@@ -1043,7 +1265,9 @@ func (rq *replicateQueue) removeLearner(
 		return true, nil
 	}
 	learnerReplica := learnerReplicas[0]
-	rq.metrics.RemoveLearnerReplicaCount.Inc(1)
+	if !dryRun {
+		rq.metrics.RemoveLearnerReplicaCount.Inc(1)
+	}
 	log.VEventf(ctx, 1, "removing learner replica %+v from store", learnerReplica)
 	target := roachpb.ReplicationTarget{
 		NodeID:  learnerReplica.NodeID,
@@ -1057,7 +1281,7 @@ func (rq *replicateQueue) removeLearner(
 		repl,
 		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
 		desc,
-		SnapshotRequest_UNKNOWN,
+		kvserverpb.SnapshotRequest_UNKNOWN,
 		kvserverpb.ReasonAbandonedLearner,
 		"",
 		dryRun,
@@ -1072,10 +1296,15 @@ func (rq *replicateQueue) considerRebalance(
 	repl *Replica,
 	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-	dryRun bool,
+	scatter, dryRun bool,
 ) (requeue bool, _ error) {
 	desc, conf := repl.DescAndSpanConfig()
 	rebalanceTargetType := voterTarget
+
+	scorerOpts := scorerOptions(rq.allocator.scorerOptions())
+	if scatter {
+		scorerOpts = rq.allocator.scorerOptionsForScatter()
+	}
 	if !rq.store.TestingKnobs().DisableReplicaRebalancing {
 		rangeUsageInfo := rangeUsageInfoForRepl(repl)
 		addTarget, removeTarget, details, ok := rq.allocator.RebalanceVoter(
@@ -1086,7 +1315,7 @@ func (rq *replicateQueue) considerRebalance(
 			existingNonVoters,
 			rangeUsageInfo,
 			storeFilterThrottled,
-			rq.allocator.scorerOptions(),
+			scorerOpts,
 		)
 		if !ok {
 			// If there was nothing to do for the set of voting replicas on this
@@ -1100,21 +1329,31 @@ func (rq *replicateQueue) considerRebalance(
 				existingNonVoters,
 				rangeUsageInfo,
 				storeFilterThrottled,
-				rq.allocator.scorerOptions(),
+				scorerOpts,
 			)
 			rebalanceTargetType = nonVoterTarget
 		}
 
+		// Determines whether we can remove the leaseholder without first
+		// transferring the lease away
+		lhRemovalAllowed := addTarget != (roachpb.ReplicationTarget{}) &&
+			repl.store.cfg.Settings.Version.IsActive(ctx, clusterversion.EnableLeaseHolderRemoval)
+		lhBeingRemoved := removeTarget.StoreID == repl.store.StoreID()
+
 		if !ok {
 			log.VEventf(ctx, 1, "no suitable rebalance target for non-voters")
-		} else if done, err := rq.maybeTransferLeaseAway(
-			ctx, repl, removeTarget.StoreID, dryRun, canTransferLeaseFrom,
-		); err != nil {
-			log.VEventf(ctx, 1, "want to remove self, but failed to transfer lease away: %s", err)
-		} else if done {
-			// Lease is now elsewhere, so we're not in charge any more.
-			return false, nil
-		} else {
+		} else if !lhRemovalAllowed {
+			if done, err := rq.maybeTransferLeaseAway(
+				ctx, repl, removeTarget.StoreID, dryRun, canTransferLeaseFrom,
+			); err != nil {
+				log.VEventf(ctx, 1, "want to remove self, but failed to transfer lease away: %s", err)
+				ok = false
+			} else if done {
+				// Lease is now elsewhere, so we're not in charge any more.
+				return false, nil
+			}
+		}
+		if ok {
 			// If we have a valid rebalance action (ok == true) and we haven't
 			// transferred our lease away, execute the rebalance.
 			chgs, performingSwap, err := replicationChangesForRebalance(ctx, desc, len(existingVoters), addTarget,
@@ -1122,10 +1361,12 @@ func (rq *replicateQueue) considerRebalance(
 			if err != nil {
 				return false, err
 			}
-			rq.metrics.RebalanceReplicaCount.Inc(1)
-			if performingSwap {
-				rq.metrics.VoterDemotionsCount.Inc(1)
-				rq.metrics.NonVoterPromotionsCount.Inc(1)
+			if !dryRun {
+				rq.metrics.trackRebalanceReplicaCount(rebalanceTargetType)
+				if performingSwap {
+					rq.metrics.VoterDemotionsCount.Inc(1)
+					rq.metrics.NonVoterPromotionsCount.Inc(1)
+				}
 			}
 			log.VEventf(ctx,
 				1,
@@ -1140,14 +1381,17 @@ func (rq *replicateQueue) considerRebalance(
 				repl,
 				chgs,
 				desc,
-				SnapshotRequest_REBALANCE,
+				kvserverpb.SnapshotRequest_REBALANCE,
 				kvserverpb.ReasonRebalance,
 				details,
 				dryRun,
 			); err != nil {
 				return false, err
 			}
-			return true, nil
+			// Unless just removed myself (the leaseholder), always requeue to see
+			// if more work needs to be done. If leaseholder is removed, someone
+			// else will take over.
+			return !lhBeingRemoved, nil
 		}
 	}
 
@@ -1165,10 +1409,10 @@ func (rq *replicateQueue) considerRebalance(
 		desc,
 		conf,
 		transferLeaseOptions{
-			goal:                     followTheWorkload,
-			checkTransferLeaseSource: true,
-			checkCandidateFullness:   true,
-			dryRun:                   dryRun,
+			goal:                   followTheWorkload,
+			excludeLeaseRepl:       false,
+			checkCandidateFullness: true,
+			dryRun:                 dryRun,
 		},
 	)
 	return false, err
@@ -1286,10 +1530,10 @@ const (
 
 type transferLeaseOptions struct {
 	goal transferLeaseGoal
-	// checkTransferLeaseSource, when false, tells `TransferLeaseTarget` to
-	// exclude the current leaseholder from consideration as a potential target
-	// (i.e. when the caller explicitly wants to shed its lease away).
-	checkTransferLeaseSource bool
+	// excludeLeaseRepl, when true, tells `TransferLeaseTarget` to exclude the
+	// current leaseholder from consideration as a potential target (i.e. when the
+	// caller explicitly wants to shed its lease away).
+	excludeLeaseRepl bool
 	// checkCandidateFullness, when false, tells `TransferLeaseTarget`
 	// to disregard the existing lease counts on candidates.
 	checkCandidateFullness bool
@@ -1380,7 +1624,7 @@ func (rq *replicateQueue) changeReplicas(
 	repl *Replica,
 	chgs roachpb.ReplicationChanges,
 	desc *roachpb.RangeDescriptor,
-	priority SnapshotRequest_Priority,
+	priority kvserverpb.SnapshotRequest_Priority,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 	dryRun bool,

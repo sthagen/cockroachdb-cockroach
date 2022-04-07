@@ -36,7 +36,9 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 	testCtx := testContext{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	testCtx.Start(ctx, t, stopper)
+	tsc := TestStoreConfig(nil)
+	tsc.SpanConfigsDisabled = true
+	testCtx.StartWithStoreConfig(ctx, t, stopper, tsc)
 
 	mq := newMergeQueue(testCtx.store, testCtx.store.DB())
 	kvserverbase.MergeQueueEnabled.Override(ctx, &testCtx.store.ClusterSettings().SV, true)
@@ -150,7 +152,7 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
-			repl := &Replica{}
+			repl := &Replica{store: testCtx.store}
 			repl.mu.state.Desc = &roachpb.RangeDescriptor{StartKey: tc.startKey, EndKey: tc.endKey}
 			repl.mu.state.Stats = &enginepb.MVCCStats{KeyBytes: tc.bytes}
 			zoneConfig := zonepb.DefaultZoneConfigRef()

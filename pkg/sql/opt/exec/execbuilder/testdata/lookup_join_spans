@@ -837,16 +837,14 @@ vectorized: true
         │ equality cols are key
         │
         └── • lookup join
+            │ estimated row count: 0
             │ table: metric_values@secondary
             │ lookup condition: ((metric_id = id) AND (nullable = 1)) AND ("time" < '2020-01-01 00:00:10+00:00')
             │
-            └── • render
-                │ estimated row count: 1
-                │
-                └── • scan
-                      estimated row count: 1 (10% of the table; stats collected <hidden> ago)
-                      table: metrics@name_index
-                      spans: [/'cpu' - /'cpu']
+            └── • scan
+                  estimated row count: 1 (10% of the table; stats collected <hidden> ago)
+                  table: metrics@name_index
+                  spans: [/'cpu' - /'cpu']
 
 
 # Regression test for issue #68200.  This ensures that we properly construct the
@@ -862,7 +860,7 @@ CREATE INDEX ol_io ON order_line (ol_i_id, ol_o_id);
 CREATE TABLE stock (s_i_id INT8);
 INSERT INTO stock (s_i_id) VALUES (6463)
 
-query T kvtrace(Scan,prefix=/Table/59/2/6463/{)
+query T kvtrace(Scan,prefix=/Table/109/2/6463/{)
 SELECT
   s_i_id, ol_o_id
 FROM
@@ -870,7 +868,7 @@ FROM
 WHERE
   ol_o_id BETWEEN 20 AND 100
 ----
-Scan /Table/59/2/6463/{20-101}
+Scan /Table/109/2/6463/{20-101}
 
 query T
 EXPLAIN (VERBOSE)

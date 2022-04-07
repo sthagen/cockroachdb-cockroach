@@ -20,9 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptstorage"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptverifier"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -123,6 +124,13 @@ func TestProtectedTimestamps(t *testing.T) {
 		return startKey
 	}
 
+	getTableID := func() descpb.ID {
+		var tableID descpb.ID
+		require.NoError(t,
+			conn.QueryRow(`SELECT id FROM system.namespace WHERE name = 'foo'`).Scan(&tableID))
+		return tableID
+	}
+
 	getStoreAndReplica := func() (*kvserver.Store, *kvserver.Replica) {
 		startKey := getTableStartKey()
 		// Okay great now we have a key and can go find replicas and stores and what not.
@@ -175,17 +183,11 @@ func TestProtectedTimestamps(t *testing.T) {
 	pts := ptstorage.New(s0.ClusterSettings(), s0.InternalExecutor().(*sql.InternalExecutor),
 		nil /* knobs */)
 	ptsWithDB := ptstorage.WithDatabase(pts, s0.DB())
-	startKey := getTableStartKey()
 	ptsRec := ptpb.Record{
 		ID:        uuid.MakeV4().GetBytes(),
 		Timestamp: s0.Clock().Now(),
 		Mode:      ptpb.PROTECT_AFTER,
-		DeprecatedSpans: []roachpb.Span{
-			{
-				Key:    startKey,
-				EndKey: startKey.PrefixEnd(),
-			},
-		},
+		Target:    ptpb.MakeSchemaObjectsTarget([]descpb.ID{getTableID()}),
 	}
 	require.NoError(t, ptsWithDB.Protect(ctx, nil /* txn */, &ptsRec))
 	upsertUntilBackpressure()
@@ -210,12 +212,15 @@ func TestProtectedTimestamps(t *testing.T) {
 	thresh := thresholdFromTrace(trace)
 	require.Truef(t, thresh.Less(ptsRec.Timestamp), "threshold: %v, protected %v %q", thresh, ptsRec.Timestamp, trace)
 
-	// Verify that the record indeed did apply as far as the replica is concerned.
-	ptv := ptverifier.New(s0.DB(), pts)
-	require.NoError(t, ptv.Verify(ctx, ptsRec.ID.GetUUID()))
-	ptsRecVerified, err := ptsWithDB.GetRecord(ctx, nil /* txn */, ptsRec.ID.GetUUID())
-	require.NoError(t, err)
-	require.True(t, ptsRecVerified.Verified)
+	// Verify that the record did indeed make its way down into KV where the
+	// replica can read it from.
+	ptsReader := tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().ProtectedTimestampReader
+	require.NoError(
+		t,
+		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
+			ctx, t, s0, ptsReader, ptsRec.Timestamp, ptsRec.DeprecatedSpans,
+		),
+	)
 
 	// Make a new record that is doomed to fail.
 	failedRec := ptsRec
@@ -226,9 +231,15 @@ func TestProtectedTimestamps(t *testing.T) {
 	_, err = ptsWithDB.GetRecord(ctx, nil /* txn */, failedRec.ID.GetUUID())
 	require.NoError(t, err)
 
-	// Verify that it indeed did fail.
-	verifyErr := ptv.Verify(ctx, failedRec.ID.GetUUID())
-	require.Regexp(t, "failed to verify protection", verifyErr)
+	// Verify that the record did indeed make its way down into KV where the
+	// replica can read it from. We then verify (below) that the failed record
+	// does not affect the ability to GC.
+	require.NoError(
+		t,
+		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
+			ctx, t, s0, ptsReader, failedRec.Timestamp, failedRec.DeprecatedSpans,
+		),
+	)
 
 	// Add a new record that is after the old record.
 	laterRec := ptsRec
@@ -236,7 +247,12 @@ func TestProtectedTimestamps(t *testing.T) {
 	laterRec.Timestamp = afterWrites
 	laterRec.Timestamp.Logical = 0
 	require.NoError(t, ptsWithDB.Protect(ctx, nil /* txn */, &laterRec))
-	require.NoError(t, ptv.Verify(ctx, laterRec.ID.GetUUID()))
+	require.NoError(
+		t,
+		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
+			ctx, t, s0, ptsReader, laterRec.Timestamp, laterRec.DeprecatedSpans,
+		),
+	)
 
 	// Release the record that had succeeded and ensure that GC eventually
 	// happens up to the protected timestamp of the new record.

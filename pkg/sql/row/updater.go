@@ -323,7 +323,7 @@ func (ru *Updater) UpdateRow(
 				return nil, err
 			}
 		}
-		if ru.Helper.Indexes[i].GetType() == descpb.IndexDescriptor_INVERTED {
+		if ru.Helper.Indexes[i].GetType() == descpb.IndexDescriptor_INVERTED && !ru.Helper.Indexes[i].IsTemporaryIndexForBackfill() {
 			// Deduplicate the keys we're adding and removing if we're updating an
 			// inverted index. For example, imagine a table with an inverted index on j:
 			//
@@ -335,6 +335,10 @@ func (ru *Updater) UpdateRow(
 			// want to delete the /foo/bar key and re-add it, that would be wasted work.
 			// So, we are going to remove keys from both the new and old index entry
 			// array if they're identical.
+			//
+			// We don't do this deduplication on temporary indexes used during the
+			// backfill because any deletes that are elided here are not elided on the
+			// newly added index when it is in DELETE_ONLY.
 			newIndexEntries := ru.newIndexEntries[i]
 			oldIndexEntries := ru.oldIndexEntries[i]
 			sort.Slice(oldIndexEntries, func(i, j int) bool {
@@ -417,14 +421,19 @@ func (ru *Updater) UpdateRow(
 						}
 					} else if !newEntry.Value.EqualTagAndData(oldEntry.Value) {
 						expValue = oldEntry.Value.TagAndDataBytes()
-					} else {
+					} else if !index.IsTemporaryIndexForBackfill() {
+						// If this is a temporary index for backfill, we want to make sure we write out all
+						// index values even in the case where they should be the same. We do this because the
+						// temporary index is eventually merged into a newly added index that might be in a
+						// DELETE_ONLY state at the time of this update and thus the temporary index needs to
+						// have all of the entries.
+						//
+						// Otherwise, skip this put since the key and value are the same.
 						continue
 					}
 
-					if index.UseDeletePreservingEncoding() {
-						// Delete preserving encoding indexes are used only as a log of
-						// index writes during backfill, thus we can blindly put values into
-						// them.
+					if index.ForcePut() {
+						// See the comment on (catalog.Index).ForcePut() for more details.
 						insertPutFn(ctx, batch, &newEntry.Key, &newEntry.Value, traceKV)
 					} else {
 						if traceKV {
@@ -459,10 +468,8 @@ func (ru *Updater) UpdateRow(
 						)
 					}
 
-					if index.UseDeletePreservingEncoding() {
-						// Delete preserving encoding indexes are used only as a log of
-						// index writes during backfill, thus we can blindly put values into
-						// them.
+					if index.ForcePut() {
+						// See the comment on (catalog.Index).ForcePut() for more details.
 						insertPutFn(ctx, batch, &newEntry.Key, &newEntry.Value, traceKV)
 					} else {
 						// In this case, the index now has a k/v that did not exist in the
@@ -497,7 +504,8 @@ func (ru *Updater) UpdateRow(
 				// and the old row values do not match the partial index
 				// predicate.
 				newEntry := &newEntries[newIdx]
-				if index.UseDeletePreservingEncoding() {
+				if index.ForcePut() {
+					// See the comment on (catalog.Index).ForcePut() for more details.
 					insertPutFn(ctx, batch, &newEntry.Key, &newEntry.Value, traceKV)
 				} else {
 					if traceKV {
@@ -518,9 +526,8 @@ func (ru *Updater) UpdateRow(
 			}
 			// We're adding all of the inverted index entries from the row being updated.
 			for j := range ru.newIndexEntries[i] {
-				if index.UseDeletePreservingEncoding() {
-					// Delete preserving encoding indexes are used only as a log of index
-					// writes during backfill, thus we can blindly put values into them.
+				if index.ForcePut() {
+					// See the comment on (catalog.Index).ForcePut() for more details.
 					insertPutFn(ctx, batch, &ru.newIndexEntries[i][j].Key, &ru.newIndexEntries[i][j].Value, traceKV)
 				} else {
 					insertInvertedPutFn(ctx, batch, &ru.newIndexEntries[i][j].Key, &ru.newIndexEntries[i][j].Value, traceKV)

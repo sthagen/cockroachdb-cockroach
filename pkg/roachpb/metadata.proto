@@ -330,11 +330,17 @@ message StoreCapacity {
   // by ranges in the store. The stat is tracked over the time period defined
   // in storage/replica_stats.go, which as of July 2018 is 30 minutes.
   optional double writes_per_second = 5 [(gogoproto.nullable) = false];
+  // l0_sublevels tracks the current number of l0 sublevels in the store.
+  // TODO(kvoli): Use of this field will need to be version-gated, to avoid
+  // instances where overlapping node-binary versions within a cluster result
+  // in this this field missing.
+  optional int64 l0_sublevels = 12 [(gogoproto.nullable) = false];
   // bytes_per_replica and writes_per_replica contain percentiles for the
   // number of bytes and writes-per-second to each replica in the store.
   // This information can be used for rebalancing decisions.
   optional Percentiles bytes_per_replica = 6 [(gogoproto.nullable) = false];
   optional Percentiles writes_per_replica = 7 [(gogoproto.nullable) = false];
+  reserved 11;
 }
 
 // StoreProperties contains configuration and OS-level details for a storage device.
@@ -382,6 +388,10 @@ message NodeDescriptor {
   // is also used to accept SQL connections.
   optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "SQLAddress"];
+  // The HTTP address. If empty, will prevent nodes from proxying HTTP
+  // requests to each other.
+  optional util.UnresolvedAddr http_address = 11 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "HTTPAddress"];
 }
 
 // LocalityAddress holds the private address accessible only from other nodes
@@ -439,8 +449,8 @@ message Version {
   // The names "major" and "minor" are reserved in C in
   // some platforms (e.g. FreeBSD).
 
-  optional int32 major_val = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "Major"];
-  optional int32 minor_val = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "Minor"];
+  optional int32 major_val = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "Major", (gogoproto.jsontag) = "major"];
+  optional int32 minor_val = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "Minor", (gogoproto.jsontag) = "minor"];
   // Note that patch is a placeholder and will always be zero.
   optional int32 patch = 3 [(gogoproto.nullable) = false];
   // The internal version is used to introduce migrations during the development

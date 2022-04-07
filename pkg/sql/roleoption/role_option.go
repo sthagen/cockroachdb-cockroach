@@ -49,6 +49,11 @@ const (
 	NOCREATEDB
 	CREATELOGIN
 	NOCREATELOGIN
+	// VIEWACTIVITY is responsible for controlling access to DB Console
+	// endpoints that allow a user to view data in the UI without having
+	// the Admin role. In addition, the VIEWACTIVITY role permits viewing
+	// *unredacted* data in the `/nodes` and `/nodes_ui` endpoints which
+	// display IP addresses and hostnames.
 	VIEWACTIVITY
 	NOVIEWACTIVITY
 	CANCELQUERY
@@ -60,6 +65,8 @@ const (
 	NOVIEWACTIVITYREDACTED
 	SQLLOGIN
 	NOSQLLOGIN
+	VIEWCLUSTERSETTING
+	NOVIEWCLUSTERSETTING
 )
 
 // toSQLStmts is a map of Kind -> SQL statement string for applying the
@@ -88,6 +95,8 @@ var toSQLStmts = map[Option]string{
 	NOSQLLOGIN:             `UPSERT INTO system.role_options (username, option) VALUES ($1, 'NOSQLLOGIN')`,
 	VIEWACTIVITYREDACTED:   `UPSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWACTIVITYREDACTED')`,
 	NOVIEWACTIVITYREDACTED: `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWACTIVITYREDACTED'`,
+	VIEWCLUSTERSETTING:     `UPSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWCLUSTERSETTING')`,
+	NOVIEWCLUSTERSETTING:   `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWCLUSTERSETTING'`,
 }
 
 // Mask returns the bitmask for a given role option.
@@ -122,6 +131,8 @@ var ByName = map[string]Option{
 	"NOVIEWACTIVITYREDACTED": NOVIEWACTIVITYREDACTED,
 	"SQLLOGIN":               SQLLOGIN,
 	"NOSQLLOGIN":             NOSQLLOGIN,
+	"VIEWCLUSTERSETTING":     VIEWCLUSTERSETTING,
+	"NOVIEWCLUSTERSETTING":   NOVIEWCLUSTERSETTING,
 }
 
 // ToOption takes a string and returns the corresponding Option.
@@ -229,7 +240,9 @@ func (rol List) CheckRoleOptionConflicts() error {
 		(roleOptionBits&VIEWACTIVITYREDACTED.Mask() != 0 &&
 			roleOptionBits&NOVIEWACTIVITYREDACTED.Mask() != 0) ||
 		(roleOptionBits&SQLLOGIN.Mask() != 0 &&
-			roleOptionBits&NOSQLLOGIN.Mask() != 0) {
+			roleOptionBits&NOSQLLOGIN.Mask() != 0) ||
+		(roleOptionBits&VIEWCLUSTERSETTING.Mask() != 0 &&
+			roleOptionBits&NOVIEWCLUSTERSETTING.Mask() != 0) {
 		return pgerror.Newf(pgcode.Syntax, "conflicting role options")
 	}
 	return nil

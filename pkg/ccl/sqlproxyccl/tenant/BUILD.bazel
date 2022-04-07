@@ -8,7 +8,10 @@ proto_library(
     srcs = ["directory.proto"],
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
-    deps = ["@com_github_gogo_protobuf//gogoproto:gogo_proto"],
+    deps = [
+        "@com_github_gogo_protobuf//gogoproto:gogo_proto",
+        "@com_google_protobuf//:timestamp_proto",
+    ],
 )
 
 go_proto_library(
@@ -23,18 +26,16 @@ go_proto_library(
 go_library(
     name = "tenant",
     srcs = [
-        "directory.go",
+        "directory_cache.go",
         "entry.go",
-        "pod.go",
     ],
     embed = [":tenant_go_proto"],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/grpcutil",
         "//pkg/util/log",
-        "//pkg/util/randutil",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
@@ -45,19 +46,19 @@ go_library(
 
 go_test(
     name = "tenant_test",
+    size = "large",
     srcs = [
-        "directory_test.go",
+        "directory_cache_test.go",
         "main_test.go",
-        "pod_test.go",
     ],
-    embed = [":tenant"],
     deps = [
+        ":tenant",
         "//pkg/base",
         "//pkg/ccl",
         "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/ccl/sqlproxyccl/tenantdirsvr",
         "//pkg/ccl/utilccl",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/server",

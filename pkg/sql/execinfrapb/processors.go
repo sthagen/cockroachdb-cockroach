@@ -17,9 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
@@ -33,92 +32,6 @@ func GetAggregateFuncIdx(funcName string) (int32, error) {
 		return 0, errors.Errorf("unknown aggregate %s", funcStr)
 	}
 	return funcIdx, nil
-}
-
-// AggregateConstructor is a function that creates an aggregate function.
-type AggregateConstructor func(*tree.EvalContext, tree.Datums) tree.AggregateFunc
-
-// GetAggregateInfo returns the aggregate constructor and the return type for
-// the given aggregate function when applied on the given type.
-func GetAggregateInfo(
-	fn AggregatorSpec_Func, inputTypes ...*types.T,
-) (aggregateConstructor AggregateConstructor, returnType *types.T, err error) {
-	if fn == AnyNotNull {
-		// The ANY_NOT_NULL builtin does not have a fixed return type;
-		// handle it separately.
-		if len(inputTypes) != 1 {
-			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
-		}
-		return builtins.NewAnyNotNullAggregate, inputTypes[0], nil
-	}
-
-	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(fn.String()))
-	for _, b := range builtins {
-		typs := b.Types.Types()
-		if len(typs) != len(inputTypes) {
-			continue
-		}
-		match := true
-		for i, t := range typs {
-			if !inputTypes[i].Equivalent(t) {
-				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
-					continue
-				}
-				match = false
-				break
-			}
-		}
-		if match {
-			// Found!
-			constructAgg := func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return b.AggregateFunc(inputTypes, evalCtx, arguments)
-			}
-			colTyp := b.InferReturnTypeFromInputArgTypes(inputTypes)
-			return constructAgg, colTyp, nil
-		}
-	}
-	return nil, nil, errors.Errorf(
-		"no builtin aggregate for %s on %+v", fn, inputTypes,
-	)
-}
-
-// GetAggregateConstructor processes the specification of a single aggregate
-// function.
-//
-// evalCtx will not be mutated.
-func GetAggregateConstructor(
-	evalCtx *tree.EvalContext,
-	semaCtx *tree.SemaContext,
-	aggInfo *AggregatorSpec_Aggregation,
-	inputTypes []*types.T,
-) (constructor AggregateConstructor, arguments tree.Datums, outputType *types.T, err error) {
-	argTypes := make([]*types.T, len(aggInfo.ColIdx)+len(aggInfo.Arguments))
-	for j, c := range aggInfo.ColIdx {
-		if c >= uint32(len(inputTypes)) {
-			err = errors.Errorf("ColIdx out of range (%d)", aggInfo.ColIdx)
-			return
-		}
-		argTypes[j] = inputTypes[c]
-	}
-	arguments = make(tree.Datums, len(aggInfo.Arguments))
-	var d tree.Datum
-	for j, argument := range aggInfo.Arguments {
-		h := ExprHelper{}
-		// Pass nil types and row - there are no variables in these expressions.
-		if err = h.Init(argument, nil /* types */, semaCtx, evalCtx); err != nil {
-			err = errors.Wrapf(err, "%s", argument)
-			return
-		}
-		d, err = h.Eval(nil /* row */)
-		if err != nil {
-			err = errors.Wrapf(err, "%s", argument)
-			return
-		}
-		argTypes[len(aggInfo.ColIdx)+j] = d.ResolvedType()
-		arguments[j] = d
-	}
-	constructor, outputType, err = GetAggregateInfo(aggInfo.Func, argTypes...)
-	return
 }
 
 // Equals returns true if two aggregation specifiers are identical (and thus
@@ -181,67 +94,13 @@ func GetWindowFuncIdx(funcName string) (int32, error) {
 	return funcIdx, nil
 }
 
-// GetWindowFunctionInfo returns windowFunc constructor and the return type
-// when given fn is applied to given inputTypes.
-func GetWindowFunctionInfo(
-	fn WindowerSpec_Func, inputTypes ...*types.T,
-) (windowConstructor func(*tree.EvalContext) tree.WindowFunc, returnType *types.T, err error) {
-	if fn.AggregateFunc != nil && *fn.AggregateFunc == AnyNotNull {
-		// The ANY_NOT_NULL builtin does not have a fixed return type;
-		// handle it separately.
-		if len(inputTypes) != 1 {
-			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
-		}
-		return builtins.NewAggregateWindowFunc(builtins.NewAnyNotNullAggregate), inputTypes[0], nil
-	}
-
-	var funcStr string
-	if fn.AggregateFunc != nil {
-		funcStr = fn.AggregateFunc.String()
-	} else if fn.WindowFunc != nil {
-		funcStr = fn.WindowFunc.String()
-	} else {
-		return nil, nil, errors.Errorf(
-			"function is neither an aggregate nor a window function",
-		)
-	}
-	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(funcStr))
-	for _, b := range builtins {
-		typs := b.Types.Types()
-		if len(typs) != len(inputTypes) {
-			continue
-		}
-		match := true
-		for i, t := range typs {
-			if !inputTypes[i].Equivalent(t) {
-				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
-					continue
-				}
-				match = false
-				break
-			}
-		}
-		if match {
-			// Found!
-			constructAgg := func(evalCtx *tree.EvalContext) tree.WindowFunc {
-				return b.WindowFunc(inputTypes, evalCtx)
-			}
-			colTyp := b.InferReturnTypeFromInputArgTypes(inputTypes)
-			return constructAgg, colTyp, nil
-		}
-	}
-	return nil, nil, errors.Errorf(
-		"no builtin aggregate/window function for %s on %v", funcStr, inputTypes,
-	)
-}
-
-func (spec *WindowerSpec_Frame_Mode) initFromAST(w tree.WindowFrameMode) error {
+func (spec *WindowerSpec_Frame_Mode) initFromAST(w treewindow.WindowFrameMode) error {
 	switch w {
-	case tree.RANGE:
+	case treewindow.RANGE:
 		*spec = WindowerSpec_Frame_RANGE
-	case tree.ROWS:
+	case treewindow.ROWS:
 		*spec = WindowerSpec_Frame_ROWS
-	case tree.GROUPS:
+	case treewindow.GROUPS:
 		*spec = WindowerSpec_Frame_GROUPS
 	default:
 		return errors.AssertionFailedf("unexpected WindowFrameMode")
@@ -249,17 +108,17 @@ func (spec *WindowerSpec_Frame_Mode) initFromAST(w tree.WindowFrameMode) error {
 	return nil
 }
 
-func (spec *WindowerSpec_Frame_BoundType) initFromAST(bt tree.WindowFrameBoundType) error {
+func (spec *WindowerSpec_Frame_BoundType) initFromAST(bt treewindow.WindowFrameBoundType) error {
 	switch bt {
-	case tree.UnboundedPreceding:
+	case treewindow.UnboundedPreceding:
 		*spec = WindowerSpec_Frame_UNBOUNDED_PRECEDING
-	case tree.OffsetPreceding:
+	case treewindow.OffsetPreceding:
 		*spec = WindowerSpec_Frame_OFFSET_PRECEDING
-	case tree.CurrentRow:
+	case treewindow.CurrentRow:
 		*spec = WindowerSpec_Frame_CURRENT_ROW
-	case tree.OffsetFollowing:
+	case treewindow.OffsetFollowing:
 		*spec = WindowerSpec_Frame_OFFSET_FOLLOWING
-	case tree.UnboundedFollowing:
+	case treewindow.UnboundedFollowing:
 		*spec = WindowerSpec_Frame_UNBOUNDED_FOLLOWING
 	default:
 		return errors.AssertionFailedf("unexpected WindowFrameBoundType")
@@ -267,15 +126,15 @@ func (spec *WindowerSpec_Frame_BoundType) initFromAST(bt tree.WindowFrameBoundTy
 	return nil
 }
 
-func (spec *WindowerSpec_Frame_Exclusion) initFromAST(e tree.WindowFrameExclusion) error {
+func (spec *WindowerSpec_Frame_Exclusion) initFromAST(e treewindow.WindowFrameExclusion) error {
 	switch e {
-	case tree.NoExclusion:
+	case treewindow.NoExclusion:
 		*spec = WindowerSpec_Frame_NO_EXCLUSION
-	case tree.ExcludeCurrentRow:
+	case treewindow.ExcludeCurrentRow:
 		*spec = WindowerSpec_Frame_EXCLUDE_CURRENT_ROW
-	case tree.ExcludeGroup:
+	case treewindow.ExcludeGroup:
 		*spec = WindowerSpec_Frame_EXCLUDE_GROUP
-	case tree.ExcludeTies:
+	case treewindow.ExcludeTies:
 		*spec = WindowerSpec_Frame_EXCLUDE_TIES
 	default:
 		return errors.AssertionFailedf("unexpected WindowerFrameExclusion")
@@ -286,7 +145,7 @@ func (spec *WindowerSpec_Frame_Exclusion) initFromAST(e tree.WindowFrameExclusio
 // If offset exprs are present, we evaluate them and save the encoded results
 // in the spec.
 func (spec *WindowerSpec_Frame_Bounds) initFromAST(
-	b tree.WindowFrameBounds, m tree.WindowFrameMode, evalCtx *tree.EvalContext,
+	b tree.WindowFrameBounds, m treewindow.WindowFrameMode, evalCtx *tree.EvalContext,
 ) error {
 	if b.StartBound == nil {
 		return errors.Errorf("unexpected: Start Bound is nil")
@@ -305,13 +164,13 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 			return pgerror.Newf(pgcode.NullValueNotAllowed, "frame starting offset must not be null")
 		}
 		switch m {
-		case tree.ROWS:
+		case treewindow.ROWS:
 			startOffset := int64(tree.MustBeDInt(dStartOffset))
 			if startOffset < 0 {
 				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame starting offset must not be negative")
 			}
 			spec.Start.IntOffset = uint64(startOffset)
-		case tree.RANGE:
+		case treewindow.RANGE:
 			if isNegative(evalCtx, dStartOffset) {
 				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
 			}
@@ -325,7 +184,7 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 				return err
 			}
 			spec.Start.TypedOffset = buf
-		case tree.GROUPS:
+		case treewindow.GROUPS:
 			startOffset := int64(tree.MustBeDInt(dStartOffset))
 			if startOffset < 0 {
 				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame starting offset must not be negative")
@@ -349,13 +208,13 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 				return pgerror.Newf(pgcode.NullValueNotAllowed, "frame ending offset must not be null")
 			}
 			switch m {
-			case tree.ROWS:
+			case treewindow.ROWS:
 				endOffset := int64(tree.MustBeDInt(dEndOffset))
 				if endOffset < 0 {
 					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame ending offset must not be negative")
 				}
 				spec.End.IntOffset = uint64(endOffset)
-			case tree.RANGE:
+			case treewindow.RANGE:
 				if isNegative(evalCtx, dEndOffset) {
 					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
 				}
@@ -369,7 +228,7 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 					return err
 				}
 				spec.End.TypedOffset = buf
-			case tree.GROUPS:
+			case treewindow.GROUPS:
 				endOffset := int64(tree.MustBeDInt(dEndOffset))
 				if endOffset < 0 {
 					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame ending offset must not be negative")
@@ -410,48 +269,48 @@ func (spec *WindowerSpec_Frame) InitFromAST(f *tree.WindowFrame, evalCtx *tree.E
 	return spec.Bounds.initFromAST(f.Bounds, f.Mode, evalCtx)
 }
 
-func (spec WindowerSpec_Frame_Mode) convertToAST() (tree.WindowFrameMode, error) {
+func (spec WindowerSpec_Frame_Mode) convertToAST() (treewindow.WindowFrameMode, error) {
 	switch spec {
 	case WindowerSpec_Frame_RANGE:
-		return tree.RANGE, nil
+		return treewindow.RANGE, nil
 	case WindowerSpec_Frame_ROWS:
-		return tree.ROWS, nil
+		return treewindow.ROWS, nil
 	case WindowerSpec_Frame_GROUPS:
-		return tree.GROUPS, nil
+		return treewindow.GROUPS, nil
 	default:
-		return tree.WindowFrameMode(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Mode")
+		return treewindow.WindowFrameMode(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Mode")
 	}
 }
 
-func (spec WindowerSpec_Frame_BoundType) convertToAST() (tree.WindowFrameBoundType, error) {
+func (spec WindowerSpec_Frame_BoundType) convertToAST() (treewindow.WindowFrameBoundType, error) {
 	switch spec {
 	case WindowerSpec_Frame_UNBOUNDED_PRECEDING:
-		return tree.UnboundedPreceding, nil
+		return treewindow.UnboundedPreceding, nil
 	case WindowerSpec_Frame_OFFSET_PRECEDING:
-		return tree.OffsetPreceding, nil
+		return treewindow.OffsetPreceding, nil
 	case WindowerSpec_Frame_CURRENT_ROW:
-		return tree.CurrentRow, nil
+		return treewindow.CurrentRow, nil
 	case WindowerSpec_Frame_OFFSET_FOLLOWING:
-		return tree.OffsetFollowing, nil
+		return treewindow.OffsetFollowing, nil
 	case WindowerSpec_Frame_UNBOUNDED_FOLLOWING:
-		return tree.UnboundedFollowing, nil
+		return treewindow.UnboundedFollowing, nil
 	default:
-		return tree.WindowFrameBoundType(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_BoundType")
+		return treewindow.WindowFrameBoundType(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_BoundType")
 	}
 }
 
-func (spec WindowerSpec_Frame_Exclusion) convertToAST() (tree.WindowFrameExclusion, error) {
+func (spec WindowerSpec_Frame_Exclusion) convertToAST() (treewindow.WindowFrameExclusion, error) {
 	switch spec {
 	case WindowerSpec_Frame_NO_EXCLUSION:
-		return tree.NoExclusion, nil
+		return treewindow.NoExclusion, nil
 	case WindowerSpec_Frame_EXCLUDE_CURRENT_ROW:
-		return tree.ExcludeCurrentRow, nil
+		return treewindow.ExcludeCurrentRow, nil
 	case WindowerSpec_Frame_EXCLUDE_GROUP:
-		return tree.ExcludeGroup, nil
+		return treewindow.ExcludeGroup, nil
 	case WindowerSpec_Frame_EXCLUDE_TIES:
-		return tree.ExcludeTies, nil
+		return treewindow.ExcludeTies, nil
 	default:
-		return tree.WindowFrameExclusion(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Exclusion")
+		return treewindow.WindowFrameExclusion(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Exclusion")
 	}
 }
 

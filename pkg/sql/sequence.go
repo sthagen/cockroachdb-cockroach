@@ -135,16 +135,32 @@ func (p *planner) incrementSequenceUsingCache(
 ) (int64, error) {
 	seqOpts := descriptor.GetSequenceOpts()
 
-	cacheSize := seqOpts.EffectiveCacheSize()
+	sequenceID := descriptor.GetID()
+	createdInCurrentTxn := p.createdSequences.isCreatedSequence(sequenceID)
+	var cacheSize int64
+	if createdInCurrentTxn {
+		cacheSize = 1
+	} else {
+		cacheSize = seqOpts.EffectiveCacheSize()
+	}
 
 	fetchNextValues := func() (currentValue, incrementAmount, sizeOfCache int64, err error) {
-		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(descriptor.GetID()))
+		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(sequenceID))
 
-		// We *do not* use the planner txn here, since nextval does not respect
-		// transaction boundaries. This matches the specification at
-		// https://www.postgresql.org/docs/14/functions-sequence.html
-		endValue, err := kv.IncrementValRetryable(
-			ctx, p.ExecCfg().DB, seqValueKey, seqOpts.Increment*cacheSize)
+		// The planner txn is only used if the sequence is accessed in the same
+		// transaction that it was created. Otherwise, we *do not* use the planner
+		// txn here, since nextval does not respect transaction boundaries.
+		// This matches the specification at
+		// https://www.postgresql.org/docs/14/functions-sequence.html.
+		var endValue int64
+		if createdInCurrentTxn {
+			var res kv.KeyValue
+			res, err = p.txn.Inc(ctx, seqValueKey, seqOpts.Increment*cacheSize)
+			endValue = res.ValueInt()
+		} else {
+			endValue, err = kv.IncrementValRetryable(
+				ctx, p.ExecCfg().DB, seqValueKey, seqOpts.Increment*cacheSize)
+		}
 
 		if err != nil {
 			if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
@@ -188,7 +204,7 @@ func (p *planner) incrementSequenceUsingCache(
 			return 0, err
 		}
 	} else {
-		val, err = p.GetOrInitSequenceCache().NextValue(uint32(descriptor.GetID()), uint32(descriptor.GetVersion()), fetchNextValues)
+		val, err = p.GetOrInitSequenceCache().NextValue(uint32(sequenceID), uint32(descriptor.GetVersion()), fetchNextValues)
 		if err != nil {
 			return 0, err
 		}
@@ -314,9 +330,16 @@ func setSequenceValueHelper(
 		return err
 	}
 
-	// We *do not* use the planner txn here, since setval does not respect
-	// transaction boundaries. This matches the specification at
-	// https://www.postgresql.org/docs/14/functions-sequence.html
+	createdInCurrentTxn := p.createdSequences.isCreatedSequence(descriptor.GetID())
+	if createdInCurrentTxn {
+		return p.txn.Put(ctx, seqValueKey, newVal)
+	}
+
+	// The planner txn is only used if the sequence is accessed in the same
+	// transaction that it was created. Otherwise, we *do not* use the planner
+	// txn here, since setval does not respect transaction boundaries.
+	// This matches the specification at
+	// https://www.postgresql.org/docs/14/functions-sequence.html.
 	// TODO(vilterp): not supposed to mix usage of Inc and Put on a key,
 	// according to comments on Inc operation. Switch to Inc if `desired-current`
 	// overflows correctly.
@@ -771,7 +794,7 @@ func maybeAddSequenceDependencies(
 	ctx context.Context,
 	st *cluster.Settings,
 	sc resolver.SchemaResolver,
-	tableDesc *tabledesc.Mutable,
+	tableDesc catalog.TableDescriptor,
 	col *descpb.ColumnDescriptor,
 	expr tree.TypedExpr,
 	backrefs map[descpb.ID]*tabledesc.Mutable,
@@ -807,22 +830,43 @@ func maybeAddSequenceDependencies(
 		if prev, ok := backrefs[seqDesc.ID]; ok {
 			seqDesc = prev
 		}
-		col.UsesSequenceIds = append(col.UsesSequenceIds, seqDesc.ID)
 		// Add reference from sequence descriptor to column.
+		{
+			var found bool
+			for _, seqID := range col.UsesSequenceIds {
+				if seqID == seqDesc.ID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				col.UsesSequenceIds = append(col.UsesSequenceIds, seqDesc.ID)
+			}
+		}
 		refIdx := -1
 		for i, reference := range seqDesc.DependedOnBy {
-			if reference.ID == tableDesc.ID {
+			if reference.ID == tableDesc.GetID() {
 				refIdx = i
 			}
 		}
 		if refIdx == -1 {
 			seqDesc.DependedOnBy = append(seqDesc.DependedOnBy, descpb.TableDescriptor_Reference{
-				ID:        tableDesc.ID,
+				ID:        tableDesc.GetID(),
 				ColumnIDs: []descpb.ColumnID{col.ID},
 				ByID:      true,
 			})
 		} else {
-			seqDesc.DependedOnBy[refIdx].ColumnIDs = append(seqDesc.DependedOnBy[refIdx].ColumnIDs, col.ID)
+			ref := &seqDesc.DependedOnBy[refIdx]
+			var found bool
+			for _, colID := range ref.ColumnIDs {
+				if colID == col.ID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				ref.ColumnIDs = append(ref.ColumnIDs, col.ID)
+			}
 		}
 		seqDescs = append(seqDescs, seqDesc)
 	}

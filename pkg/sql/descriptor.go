@@ -33,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -71,10 +70,10 @@ func (p *planner) createDatabase(
 	dbName := string(database.Name)
 	dKey := catalogkeys.MakeDatabaseNameKey(p.ExecCfg().Codec, dbName)
 
-	if dbID, err := p.Descriptors().LookupDatabaseID(ctx, p.txn, dbName); err == nil && dbID != descpb.InvalidID {
+	if dbID, err := p.Descriptors().Direct().LookupDatabaseID(ctx, p.txn, dbName); err == nil && dbID != descpb.InvalidID {
 		if database.IfNotExists {
 			// Check if the database is in a dropping state
-			desc, err := p.Descriptors().MustGetDatabaseDescByID(ctx, p.txn, dbID)
+			desc, err := p.Descriptors().Direct().MustGetDatabaseDescByID(ctx, p.txn, dbID)
 			if err != nil {
 				return nil, false, err
 			}
@@ -177,14 +176,7 @@ func (p *planner) maybeCreatePublicSchemaWithDescriptor(
 
 	// Every database must be initialized with the public schema.
 	// Create the SchemaDescriptor.
-	// In postgres, the user "postgres" is the owner of the public schema in a
-	// newly created db. Postgres and Public have USAGE and CREATE privileges.
-	// In CockroachDB, root is our substitute for the postgres user.
-	publicSchemaPrivileges := descpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
-	// By default, everyone has USAGE and CREATE on the public schema.
-	// Once https://github.com/cockroachdb/cockroach/issues/70266 is resolved,
-	// the public role will no longer have CREATE privileges.
-	publicSchemaPrivileges.Grant(security.PublicRoleName(), privilege.List{privilege.CREATE, privilege.USAGE}, false)
+	publicSchemaPrivileges := catpb.NewPublicSchemaPrivilegeDescriptor()
 	publicSchemaDesc := schemadesc.NewBuilder(&descpb.SchemaDescriptor{
 		ParentID:   dbID,
 		Name:       tree.PublicSchema,
@@ -254,7 +246,7 @@ func (p *planner) createDescriptorWithID(
 		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
 	}
 	b.CPut(idKey, descID, nil)
-	if err := p.Descriptors().WriteNewDescToBatch(
+	if err := p.Descriptors().Direct().WriteNewDescToBatch(
 		ctx,
 		p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
 		b,

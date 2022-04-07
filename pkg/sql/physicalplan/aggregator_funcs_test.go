@@ -140,9 +140,12 @@ func checkDistAggregationInfo(
 
 	makeTableReader := func(startPK, endPK int, streamID int) execinfrapb.ProcessorSpec {
 		tr := execinfrapb.TableReaderSpec{
-			Table:     *tableDesc.TableDesc(),
-			Spans:     make([]roachpb.Span, 1),
-			ColumnIDs: columnIDs,
+			Spans: make([]roachpb.Span, 1),
+		}
+		if err := rowenc.InitIndexFetchSpec(
+			&tr.FetchSpec, keys.SystemSQLCodec, tableDesc, tableDesc.GetPrimaryIndex(), columnIDs,
+		); err != nil {
+			t.Fatal(err)
 		}
 
 		var err error
@@ -185,7 +188,7 @@ func checkDistAggregationInfo(
 	intermediaryTypes := make([]*types.T, numIntermediary)
 	for i, fn := range info.LocalStage {
 		var err error
-		_, returnTyp, err := execinfrapb.GetAggregateInfo(fn, colTypes...)
+		_, returnTyp, err := execinfra.GetAggregateInfo(fn, colTypes...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +207,7 @@ func checkDistAggregationInfo(
 			inputTypes[i] = intermediaryTypes[localIdx]
 		}
 		var err error
-		_, finalOutputTypes[i], err = execinfrapb.GetAggregateInfo(finalInfo.Fn, inputTypes...)
+		_, finalOutputTypes[i], err = execinfra.GetAggregateInfo(finalInfo.Fn, inputTypes...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -506,7 +509,7 @@ func TestSingleArgumentDistAggregateFunctions(t *testing.T) {
 				continue
 			}
 			// See if this column works with this function.
-			_, _, err := execinfrapb.GetAggregateInfo(fn, col.GetType())
+			_, _, err := execinfra.GetAggregateInfo(fn, col.GetType())
 			if err != nil {
 				continue
 			}

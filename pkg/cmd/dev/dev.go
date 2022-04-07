@@ -25,6 +25,11 @@ type dev struct {
 	cli  *cobra.Command
 	os   *os.OS
 	exec *exec.Exec
+
+	knobs struct { // testing knobs
+		skipDoctorCheck bool
+		devBinOverride  string
+	}
 }
 
 func makeDevCmd() *dev {
@@ -112,6 +117,7 @@ Typical usage:
 		makeBenchCmd(ret.bench),
 		makeBuildCmd(ret.build),
 		makeBuilderCmd(ret.builder),
+		makeCacheCmd(ret.cache),
 		makeComposeCmd(ret.compose),
 		makeDoctorCmd(ret.doctor),
 		makeGenerateCmd(ret.generate),
@@ -120,18 +126,23 @@ Typical usage:
 		makeTestLogicCmd(ret.testlogic),
 		makeLintCmd(ret.lint),
 		makeTestCmd(ret.test),
+		makeUICmd(&ret),
 	)
+
 	// Add all the shared flags.
 	var debugVar bool
-	for _, subCmd := range ret.cli.Commands() {
-		subCmd.Flags().BoolVar(&debugVar, "debug", false, "enable debug logging for dev")
-	}
-	for _, subCmd := range ret.cli.Commands() {
-		subCmd.PreRun = func(cmd *cobra.Command, args []string) {
-			if debugVar {
-				ret.log.SetOutput(stdos.Stderr)
+	ret.cli.PersistentFlags().BoolVar(&debugVar, "debug", false, "enable debug logging for dev")
+	ret.cli.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		skipDoctorCheck := cmd.Name() == "doctor" || cmd.Name() == "merge-test-xmls"
+		if !skipDoctorCheck {
+			if err := ret.checkDoctorStatus(cmd.Context()); err != nil {
+				return err
 			}
 		}
+		if debugVar {
+			ret.log.SetOutput(stdos.Stderr)
+		}
+		return nil
 	}
 
 	return &ret

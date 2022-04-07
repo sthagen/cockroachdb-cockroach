@@ -25,16 +25,6 @@ type BulkAdderOptions struct {
 	// behalf of which it is adding data.
 	Name string
 
-	// SSTSize is the size at which an SST will be flushed and a new one started.
-	// SSTs are also split during a buffer flush to avoid spanning range bounds so
-	// they may be smaller than this limit.
-	SSTSize func() int64
-
-	// SplitAndScatterAfter is the number of bytes which if added without hitting
-	// an existing split will cause the adder to split and scatter the next span.
-	// A function returning -1 is interpreted as indicating not to split.
-	SplitAndScatterAfter func() int64
-
 	// MinBufferSize is the initial size of the BulkAdder buffer. It indicates the
 	// amount of memory we require to be able to buffer data before flushing for
 	// SST creation.
@@ -42,10 +32,6 @@ type BulkAdderOptions struct {
 
 	// BufferSize is the maximum size we can grow the BulkAdder buffer to.
 	MaxBufferSize func() int64
-
-	// StepBufferSize is the increment in which we will attempt to grow the
-	// BulkAdder buffer if the memory monitor permits.
-	StepBufferSize int64
 
 	// SkipDuplicates configures handling of duplicate keys within a local sorted
 	// batch. When true if the same key/value pair is added more than once
@@ -68,14 +54,21 @@ type BulkAdderOptions struct {
 	// actually applied to each key).
 	BatchTimestamp hlc.Timestamp
 
-	// WriteAtRequestTime is used to set the corresponding field when sending
-	// constructed SSTables to AddSSTable. See roachpb.AddSSTableRequest.
-	WriteAtRequestTime bool
-}
+	// WriteAtBatchTimestamp will rewrite the SST to use the batch timestamp, even
+	// if it gets pushed to a different timestamp on the server side. All SST MVCC
+	// timestamps must equal BatchTimestamp. See
+	// roachpb.AddSSTableRequest.SSTTimestampToRequestTimestamp.
+	WriteAtBatchTimestamp bool
 
-// DisableExplicitSplits can be returned by a SplitAndScatterAfter function to
-// indicate that the SSTBatcher should not issue explicit splits.
-const DisableExplicitSplits = -1
+	// InitialSplitsIfUnordered specifies a number of splits to make before the
+	// first flush of the buffer if the contents of that buffer were unsorted.
+	// Being unsorted suggests the remaining input is likely unsorted as well and
+	// thus future flushes and flushes on other nodes will overlap, so we want to
+	// pre-split the target span now before we start filling it, using the keys in
+	// the first buffer to pick split points in the hope it is a representative
+	// sample of the overall input.
+	InitialSplitsIfUnordered int
+}
 
 // BulkAdderFactory describes a factory function for BulkAdders.
 type BulkAdderFactory func(

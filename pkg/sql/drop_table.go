@@ -17,20 +17,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -384,11 +380,8 @@ func (p *planner) initiateDropTable(
 	// Exit early with an error if the table is undergoing a declarative schema
 	// change, before we try to get job IDs and update job statuses later. See
 	// createOrUpdateSchemaChangeJob.
-	if tableDesc.NewSchemaChangeJobID != 0 {
-		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-			"cannot perform a schema change on table %q while it is undergoing a declarative schema change",
-			tableDesc.GetName(),
-		)
+	if tableDesc.GetDeclarativeSchemaChangerState() != nil {
+		return scerrors.ConcurrentSchemaChangeError(tableDesc)
 	}
 
 	// Use the delayed GC mechanism to schedule usage of the more efficient
@@ -460,7 +453,7 @@ func (p *planner) markTableMutationJobsSuccessful(
 	ctx context.Context, tableDesc *tabledesc.Mutable,
 ) error {
 	for _, mj := range tableDesc.MutationJobs {
-		jobID := jobspb.JobID(mj.JobID)
+		jobID := mj.JobID
 		// Jobs are only added in the cache during the transaction and are created
 		// in a batch only when the transaction commits. So, if a job's record exists
 		// in the cache, we can simply delete that record from cache because the
@@ -638,15 +631,7 @@ func removeMatchingReferences(
 }
 
 func (p *planner) removeTableComments(ctx context.Context, tableDesc *tabledesc.Mutable) error {
-	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
-		ctx,
-		"delete-table-comments",
-		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-		"DELETE FROM system.comments WHERE object_id=$1",
-		tableDesc.ID)
-	if err != nil {
-		return err
-	}
-	return err
+	return p.execCfg.DescMetadaUpdaterFactory.NewMetadataUpdater(
+		ctx, p.Txn(), p.SessionData(),
+	).DeleteAllCommentsForTables(catalog.MakeDescriptorIDSet(tableDesc.GetID()))
 }

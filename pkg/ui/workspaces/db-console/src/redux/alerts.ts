@@ -35,7 +35,10 @@ import {
   refreshVersion,
   refreshHealth,
 } from "./apiReducers";
-import { singleVersionSelector, versionsSelector } from "src/redux/nodes";
+import {
+  singleVersionSelector,
+  numNodesByVersionsSelector,
+} from "src/redux/nodes";
 import { AdminUIState, AppDispatch } from "./state";
 import * as docsURL from "src/util/docs";
 
@@ -134,23 +137,27 @@ export const staggeredVersionDismissedSetting = new LocalSetting(
  * This excludes decommissioned nodes.
  */
 export const staggeredVersionWarningSelector = createSelector(
-  versionsSelector,
+  numNodesByVersionsSelector,
   staggeredVersionDismissedSetting.selector,
-  (versions, versionMismatchDismissed): Alert => {
+  (versionsMap, versionMismatchDismissed): Alert => {
     if (versionMismatchDismissed) {
       return undefined;
     }
-
-    if (!versions || versions.length <= 1) {
+    if (!versionsMap || versionsMap.size < 2) {
       return undefined;
     }
-
+    const versionsText = Array.from(versionsMap)
+      .map(([k, v]) => `${v} nodes are running on ${k}`)
+      .join(" and ")
+      .concat(". ");
     return {
       level: AlertLevel.WARNING,
-      title: "Staggered Version",
-      text: `We have detected that multiple versions of CockroachDB are running
-      in this cluster. This may be part of a normal rolling upgrade process, but
-      should be investigated if this is unexpected.`,
+      title: "Multiple versions of CockroachDB are running on this cluster.",
+      text:
+        versionsText +
+        `You can see a list of all nodes and their versions below.
+        This may be part of a normal rolling upgrade process, but should be investigated
+        if unexpected.`,
       dismiss: (dispatch: AppDispatch) => {
         dispatch(staggeredVersionDismissedSetting.set(true));
         return Promise.resolve();
@@ -365,6 +372,58 @@ export const createStatementDiagnosticsAlertSelector = createSelector(
   },
 );
 
+type CancelStatementDiagnosticsAlertPayload = {
+  show: boolean;
+  status?: "SUCCESS" | "FAILED";
+};
+
+export const cancelStatementDiagnosticsAlertLocalSetting = new LocalSetting<
+  AdminUIState,
+  CancelStatementDiagnosticsAlertPayload
+>("cancel_stmnt_diagnostics_alert", localSettingsSelector, { show: false });
+
+export const cancelStatementDiagnosticsAlertSelector = createSelector(
+  cancelStatementDiagnosticsAlertLocalSetting.selector,
+  (cancelStatementDiagnosticsAlert): Alert => {
+    if (
+      !cancelStatementDiagnosticsAlert ||
+      !cancelStatementDiagnosticsAlert.show
+    ) {
+      return undefined;
+    }
+    const { status } = cancelStatementDiagnosticsAlert;
+
+    if (status === "FAILED") {
+      return {
+        level: AlertLevel.CRITICAL,
+        title: "There was an error cancelling statement diagnostics",
+        text:
+          "Please try cancelling the statement diagnostic again. If the problem continues please reach out to customer support.",
+        showAsAlert: true,
+        dismiss: (dispatch: Dispatch<Action>) => {
+          dispatch(
+            cancelStatementDiagnosticsAlertLocalSetting.set({ show: false }),
+          );
+          return Promise.resolve();
+        },
+      };
+    }
+    return {
+      level: AlertLevel.SUCCESS,
+      title: "Statement diagnostics were successfully cancelled",
+      showAsAlert: true,
+      autoClose: true,
+      closable: false,
+      dismiss: (dispatch: Dispatch<Action>) => {
+        dispatch(
+          cancelStatementDiagnosticsAlertLocalSetting.set({ show: false }),
+        );
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
 type TerminateSessionAlertPayload = {
   show: boolean;
   status?: "SUCCESS" | "FAILED";
@@ -386,9 +445,9 @@ export const terminateSessionAlertSelector = createSelector(
     if (status === "FAILED") {
       return {
         level: AlertLevel.CRITICAL,
-        title: "There was an error terminating the session.",
+        title: "There was an error cancelling the session.",
         text:
-          "Please try activating again. If the problem continues please reach out to customer support.",
+          "Please try cancelling again. If the problem continues please reach out to customer support.",
         showAsAlert: true,
         dismiss: (dispatch: Dispatch<Action>) => {
           dispatch(terminateSessionAlertLocalSetting.set({ show: false }));
@@ -398,7 +457,7 @@ export const terminateSessionAlertSelector = createSelector(
     }
     return {
       level: AlertLevel.SUCCESS,
-      title: "Session terminated.",
+      title: "Session cancelled.",
       showAsAlert: true,
       autoClose: true,
       closable: false,
@@ -431,9 +490,9 @@ export const terminateQueryAlertSelector = createSelector(
     if (status === "FAILED") {
       return {
         level: AlertLevel.CRITICAL,
-        title: "There was an error terminating the query.",
+        title: "There was an error cancelling the statement.",
         text:
-          "Please try terminating again. If the problem continues please reach out to customer support.",
+          "Please try cancelling again. If the problem continues please reach out to customer support.",
         showAsAlert: true,
         dismiss: (dispatch: Dispatch<Action>) => {
           dispatch(terminateQueryAlertLocalSetting.set({ show: false }));
@@ -443,7 +502,7 @@ export const terminateQueryAlertSelector = createSelector(
     }
     return {
       level: AlertLevel.SUCCESS,
-      title: "Query terminated.",
+      title: "Statement cancelled.",
       showAsAlert: true,
       autoClose: true,
       closable: false,
@@ -452,6 +511,18 @@ export const terminateQueryAlertSelector = createSelector(
         return Promise.resolve();
       },
     };
+  },
+);
+
+/**
+ * Selector which returns an array of all active alerts which should be
+ * displayed in the overview list page, these should be non-critical alerts.
+ */
+
+export const overviewListAlertsSelector = createSelector(
+  staggeredVersionWarningSelector,
+  (...alerts: Alert[]): Alert[] => {
+    return _.without(alerts, null, undefined);
   },
 );
 
@@ -478,6 +549,7 @@ export const bannerAlertsSelector = createSelector(
   disconnectedAlertSelector,
   emailSubscriptionAlertSelector,
   createStatementDiagnosticsAlertSelector,
+  cancelStatementDiagnosticsAlertSelector,
   terminateSessionAlertSelector,
   terminateQueryAlertSelector,
   (...alerts: Alert[]): Alert[] => {

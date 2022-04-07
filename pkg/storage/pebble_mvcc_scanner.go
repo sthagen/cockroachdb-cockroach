@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -28,11 +29,14 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
-const (
-	maxItersBeforeSeek = 10
+// Key value lengths take up 8 bytes (2 x Uint32).
+const kvLenSize = 8
 
-	// Key value lengths take up 8 bytes (2 x Uint32).
-	kvLenSize = 8
+var maxItersBeforeSeek = util.ConstantWithMetamorphicTestRange(
+	"mvcc-max-iters-before-seek",
+	10, /* defaultValue */
+	0,  /* min */
+	3,  /* max */
 )
 
 // Struct to store MVCCScan / MVCCGet in the same binary format as that
@@ -356,7 +360,7 @@ type pebbleMVCCScanner struct {
 	// Stores any error returned. If non-nil, iteration short circuits.
 	err error
 	// Number of iterations to try before we do a Seek/SeekReverse. Stays within
-	// [1, maxItersBeforeSeek] and defaults to maxItersBeforeSeek/2 .
+	// [0, maxItersBeforeSeek] and defaults to maxItersBeforeSeek/2 .
 	itersBeforeSeek int
 }
 
@@ -391,13 +395,14 @@ func (p *pebbleMVCCScanner) init(
 		p.txnEpoch = txn.Epoch
 		p.txnSequence = txn.Sequence
 		p.txnIgnoredSeqNums = txn.IgnoredSeqNums
-
-		p.uncertainty = ui
-		// We must check uncertainty even if p.ts.Less(p.uncertainty.LocalLimit)
-		// because the local uncertainty limit cannot be applied to values with
-		// synthetic timestamps.
-		p.checkUncertainty = p.ts.Less(p.uncertainty.GlobalLimit)
 	}
+
+	p.uncertainty = ui
+	// We must check uncertainty even if p.ts >= local_uncertainty_limit
+	// because the local uncertainty limit cannot be applied to values with
+	// synthetic timestamps. We are only able to skip uncertainty checks if
+	// p.ts >= global_uncertainty_limit.
+	p.checkUncertainty = p.ts.Less(p.uncertainty.GlobalLimit)
 }
 
 // get iterates exactly once and adds one KV to the result set.
@@ -482,8 +487,8 @@ func (p *pebbleMVCCScanner) incrementItersBeforeSeek() {
 // Decrements itersBeforeSeek while ensuring it stays positive.
 func (p *pebbleMVCCScanner) decrementItersBeforeSeek() {
 	p.itersBeforeSeek--
-	if p.itersBeforeSeek < 1 {
-		p.itersBeforeSeek = 1
+	if p.itersBeforeSeek < 0 {
+		p.itersBeforeSeek = 0
 	}
 }
 
@@ -743,7 +748,7 @@ func (p *pebbleMVCCScanner) getAndAdvance(ctx context.Context) bool {
 			// about to advance. If this proves to be a problem later, we can extend
 			// addAndAdvance to take an MVCCKey explicitly.
 			p.curUnsafeKey.Timestamp = metaTS
-			p.keyBuf = EncodeKeyToBuf(p.keyBuf[:0], p.curUnsafeKey)
+			p.keyBuf = EncodeMVCCKeyToBuf(p.keyBuf[:0], p.curUnsafeKey)
 			return p.addAndAdvance(ctx, p.curUnsafeKey.Key, p.keyBuf, value)
 		}
 		// 13. If no value in the intent history has a sequence number equal to
@@ -970,8 +975,15 @@ func (p *pebbleMVCCScanner) addAndAdvance(
 func (p *pebbleMVCCScanner) seekVersion(
 	ctx context.Context, seekTS hlc.Timestamp, uncertaintyCheck bool,
 ) bool {
+	if seekTS.IsEmpty() {
+		// If the seek timestamp is empty, we've already seen all versions of this
+		// key, so seek to the next key. Seeking to version zero of the current key
+		// would be incorrect, as version zero is stored before all other versions.
+		return p.advanceKey()
+	}
+
 	seekKey := MVCCKey{Key: p.curUnsafeKey.Key, Timestamp: seekTS}
-	p.keyBuf = EncodeKeyToBuf(p.keyBuf[:0], seekKey)
+	p.keyBuf = EncodeMVCCKeyToBuf(p.keyBuf[:0], seekKey)
 	origKey := p.keyBuf[:len(p.curUnsafeKey.Key)]
 	// We will need seekKey below, if the next's don't suffice. Even though the
 	// MVCCIterator will be at a different version of the same key, it is free

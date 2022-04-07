@@ -35,7 +35,7 @@ func (tc *Collection) GetMutableTableByName(
 	return true, desc.(*tabledesc.Mutable), nil
 }
 
-// GetImmutableTableByName returns a mutable table descriptor with properties
+// GetImmutableTableByName returns a immutable table descriptor with properties
 // according to the provided lookup flags. RequireMutable is ignored.
 func (tc *Collection) GetImmutableTableByName(
 	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
@@ -63,7 +63,7 @@ func (tc *Collection) getTableByName(
 func (tc *Collection) GetLeasedImmutableTableByID(
 	ctx context.Context, txn *kv.Txn, tableID descpb.ID,
 ) (catalog.TableDescriptor, error) {
-	desc, _, err := tc.leased.getByID(ctx, tc.deadlineHolder(txn), tableID, false /* setTxnDeadline */)
+	desc, _, err := tc.leased.getByID(ctx, tc.deadlineHolder(txn), tableID)
 	if err != nil || desc == nil {
 		return nil, err
 	}
@@ -81,11 +81,10 @@ func (tc *Collection) GetLeasedImmutableTableByID(
 // GetUncommittedMutableTableByID returns an uncommitted mutable table by its
 // ID.
 func (tc *Collection) GetUncommittedMutableTableByID(id descpb.ID) (*tabledesc.Mutable, error) {
-	ud := tc.uncommitted.getByID(id)
-	if ud == nil {
+	if imm, status := tc.uncommitted.getImmutableByID(id); imm == nil || status == notValidatedYet {
 		return nil, nil
 	}
-	mut, err := tc.uncommitted.checkOut(ud.GetID())
+	mut, err := tc.uncommitted.checkOut(id)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +144,7 @@ func (tc *Collection) GetImmutableTableByID(
 func (tc *Collection) getTableByID(
 	ctx context.Context, txn *kv.Txn, tableID descpb.ID, flags tree.ObjectLookupFlags,
 ) (catalog.TableDescriptor, error) {
-	desc, err := tc.getDescriptorByID(ctx, txn, tableID, flags.CommonLookupFlags)
+	descs, err := tc.getDescriptorsByID(ctx, txn, flags.CommonLookupFlags, tableID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
 			return nil, sqlerrors.NewUndefinedRelationError(
@@ -153,7 +152,7 @@ func (tc *Collection) getTableByID(
 		}
 		return nil, err
 	}
-	table, ok := desc.(catalog.TableDescriptor)
+	table, ok := descs[0].(catalog.TableDescriptor)
 	if !ok {
 		return nil, sqlerrors.NewUndefinedRelationError(
 			&tree.TableRef{TableID: int64(tableID)})

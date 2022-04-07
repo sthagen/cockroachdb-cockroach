@@ -42,7 +42,7 @@ files_unchanged_from_upstream () {
 # be blocked by the existence of a file before the bazel command is
 # invoked. For now, this is left as an exercise for the user.
 
-if files_unchanged_from_upstream go.mod go.sum DEPS.bzl $(find ./pkg/cmd/generate-staticcheck -name BUILD.bazel -or -name '*.go'); then
+if files_unchanged_from_upstream go.mod go.sum DEPS.bzl $(find ./pkg/cmd/mirror -name BUILD.bazel -or -name '*.go') $(find ./pkg/cmd/generate-staticcheck -name BUILD.bazel -or -name '*.go') $(find ./build/patches -name '*.patch'); then
   echo "Skipping //pkg/cmd/mirror (relevant files are unchanged from upstream)."
   echo "Skipping //pkg/cmd/generate-staticcheck (relevant files are unchanged from upstream)."
 else
@@ -53,7 +53,13 @@ fi
 
 bazel run //:gazelle
 
-if files_unchanged_from_upstream $(find ./pkg -name BUILD.bazel) $(find ./pkg -name '*.bzl'); then
+if files_unchanged_from_upstream $(find ./pkg -name '*.proto') $(find ./pkg -name BUILD.bazel) $(find ./pkg -name '*.bzl') $(find ./docs -name 'BUILD.bazel') $(find ./docs -name '*.bzl') $(find ./pkg/gen/genbzl -name '*.go'); then
+  echo "Skipping //pkg/gen/genbzl (relevant files are unchanged from upstream)."
+else
+  bazel run pkg/gen/genbzl --run_under="cd $PWD && " -- --out-dir pkg/gen
+fi
+
+if files_unchanged_from_upstream $(find ./pkg/cmd/generate-test-suites -name BUILD.bazel -or -name '*.go') $(find ./pkg -name BUILD.bazel) $(find ./pkg -name '*.bzl'); then
   echo "Skipping //pkg/cmd/generate-test-suites (relevant files are unchanged from upstream)."
 else
   CONTENTS=$(bazel run //pkg/cmd/generate-test-suites --run_under="cd $PWD && ")

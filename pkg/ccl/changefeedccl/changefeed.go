@@ -10,13 +10,12 @@ package changefeedccl
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -52,41 +51,36 @@ func emitResolvedTimestamp(
 func createProtectedTimestampRecord(
 	ctx context.Context,
 	codec keys.SQLCodec,
-	pts protectedts.Storage,
-	txn *kv.Txn,
 	jobID jobspb.JobID,
-	targets jobspb.ChangefeedTargets,
+	targets []jobspb.ChangefeedTargetSpecification,
 	resolved hlc.Timestamp,
 	progress *jobspb.ChangefeedProgress,
-) error {
-	if !codec.ForSystemTenant() {
-		return errors.AssertionFailedf("createProtectedTimestampRecord called on tenant-based changefeed")
-	}
-
+) *ptpb.Record {
 	progress.ProtectedTimestampRecord = uuid.MakeV4()
-	log.VEventf(ctx, 2, "creating protected timestamp %v at %v",
-		progress.ProtectedTimestampRecord, resolved)
 	deprecatedSpansToProtect := makeSpansToProtect(codec, targets)
 	targetToProtect := makeTargetToProtect(targets)
-	rec := jobsprotectedts.MakeRecord(
+
+	log.VEventf(ctx, 2, "creating protected timestamp %v at %v", progress.ProtectedTimestampRecord, resolved)
+	return jobsprotectedts.MakeRecord(
 		progress.ProtectedTimestampRecord, int64(jobID), resolved, deprecatedSpansToProtect,
 		jobsprotectedts.Jobs, targetToProtect)
-	return pts.Protect(ctx, txn, rec)
 }
 
-func makeTargetToProtect(targets jobspb.ChangefeedTargets) *ptpb.Target {
+func makeTargetToProtect(targets []jobspb.ChangefeedTargetSpecification) *ptpb.Target {
 	// NB: We add 1 because we're also going to protect system.descriptors.
 	// We protect system.descriptors because a changefeed needs all of the history
 	// of table descriptors to version data.
 	tablesToProtect := make(descpb.IDs, 0, len(targets)+1)
-	for t := range targets {
-		tablesToProtect = append(tablesToProtect, t)
+	for _, t := range targets {
+		tablesToProtect = append(tablesToProtect, t.TableID)
 	}
 	tablesToProtect = append(tablesToProtect, keys.DescriptorTableID)
 	return ptpb.MakeSchemaObjectsTarget(tablesToProtect)
 }
 
-func makeSpansToProtect(codec keys.SQLCodec, targets jobspb.ChangefeedTargets) []roachpb.Span {
+func makeSpansToProtect(
+	codec keys.SQLCodec, targets []jobspb.ChangefeedTargetSpecification,
+) []roachpb.Span {
 	// NB: We add 1 because we're also going to protect system.descriptors.
 	// We protect system.descriptors because a changefeed needs all of the history
 	// of table descriptors to version data.
@@ -98,18 +92,68 @@ func makeSpansToProtect(codec keys.SQLCodec, targets jobspb.ChangefeedTargets) [
 			EndKey: tablePrefix.PrefixEnd(),
 		})
 	}
-	for t := range targets {
-		addTablePrefix(uint32(t))
+	for _, t := range targets {
+		addTablePrefix(uint32(t.TableID))
 	}
 	addTablePrefix(keys.DescriptorTableID)
 	return spansToProtect
 }
 
-// initialScanFromOptions returns whether or not the options indicate the need
-// for an initial scan on the first run.
-func initialScanFromOptions(opts map[string]string) bool {
+// initialScanTypeFromOpts determines the type of initial scan the changefeed
+// should perform on the first run given the options provided from the user
+func initialScanTypeFromOpts(opts map[string]string) (changefeedbase.InitialScanType, error) {
 	_, cursor := opts[changefeedbase.OptCursor]
-	_, initialScan := opts[changefeedbase.OptInitialScan]
-	_, noInitialScan := opts[changefeedbase.OptNoInitialScan]
-	return (cursor && initialScan) || (!cursor && !noInitialScan)
+	initialScanType, initialScanSet := opts[changefeedbase.OptInitialScan]
+	_, initialScanOnlySet := opts[changefeedbase.OptInitialScanOnly]
+	_, noInitialScanSet := opts[changefeedbase.OptNoInitialScan]
+
+	if initialScanSet && noInitialScanSet {
+		return changefeedbase.InitialScan, errors.Errorf(
+			`cannot specify both %s and %s`, changefeedbase.OptInitialScan,
+			changefeedbase.OptNoInitialScan)
+	}
+
+	if initialScanSet && initialScanOnlySet {
+		return changefeedbase.InitialScan, errors.Errorf(
+			`cannot specify both %s and %s`, changefeedbase.OptInitialScan,
+			changefeedbase.OptInitialScanOnly)
+	}
+
+	if noInitialScanSet && initialScanOnlySet {
+		return changefeedbase.InitialScan, errors.Errorf(
+			`cannot specify both %s and %s`, changefeedbase.OptInitialScanOnly,
+			changefeedbase.OptNoInitialScan)
+	}
+
+	if initialScanSet {
+		const opt = changefeedbase.OptInitialScan
+		switch strings.ToLower(initialScanType) {
+		case ``, `yes`:
+			return changefeedbase.InitialScan, nil
+		case `no`:
+			return changefeedbase.NoInitialScan, nil
+		case `only`:
+			return changefeedbase.OnlyInitialScan, nil
+		default:
+			return changefeedbase.InitialScan, errors.Errorf(
+				`unknown %s: %s`, opt, initialScanType)
+		}
+	}
+
+	if initialScanOnlySet {
+		return changefeedbase.OnlyInitialScan, nil
+	}
+
+	if noInitialScanSet {
+		return changefeedbase.NoInitialScan, nil
+	}
+
+	// If we reach this point, this implies that the user did not specify any initial scan
+	// options. In this case the default behaviour is to perform an initial scan if the
+	// cursor is not specified.
+	if !cursor {
+		return changefeedbase.InitialScan, nil
+	}
+
+	return changefeedbase.NoInitialScan, nil
 }

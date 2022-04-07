@@ -16,7 +16,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -512,12 +515,120 @@ func TestConsolidateSpans(t *testing.T) {
 			spans := parseSpans(&evalCtx, tc.s)
 			var c Constraint
 			c.Init(kc, &spans)
-			c.ConsolidateSpans(kc.EvalCtx)
+			c.ConsolidateSpans(kc.EvalCtx, nil)
 			if res := c.Spans.String(); res != tc.e {
 				t.Errorf("expected  %s  got  %s", tc.e, res)
 			}
 		})
 	}
+}
+
+func TestConsolidateLocalAndRemoteSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+
+	testData := []struct {
+		spanInputs string
+		// expected value
+		expected string
+
+		// Partition Spans
+		// The start key of each span defines a different PARTITION BY LIST value.
+		// The end key is ignored.
+		partitionSpans string
+
+		// Partition Localities, one for each partitionSpan above
+		// true == local, false == remote
+		// There must be the same number of entries as partition spans.
+		localities []bool
+	}{
+		{
+			partitionSpans: "[/1 - /1] [/3 - /3] [/7 - /9]",
+			localities:     []bool{true, false, false},
+			spanInputs:     "[/1/2 - /1/3] [/1/4 - /6] [/7 - /9]",
+			expected:       "[/1/2 - /1/3] [/1/4 - /9]",
+		},
+		// TODO(msirek):  This result is expected to change if span-based
+		//                partition locality checking is enabled, in which case
+		//                the span [/3 - /4] would not get consolidated.
+		{
+			partitionSpans: "[/3 - /3] [/4 - /4]",
+			localities:     []bool{true, true},
+			spanInputs:     "[/1 - /2] [/3 - /4] [/7 - /9]",
+			expected:       "[/1 - /4] [/7 - /9]",
+		},
+		{
+			partitionSpans: "[/1/2 - /1/2] [/1/4 - /1/4] [/1 - /1]",
+			localities:     []bool{true, true, false},
+			spanInputs:     "[/1/2 - /1/4] [/1/5 - /5]",
+			expected:       "[/1/2 - /5]",
+		},
+		// TODO(msirek):  This result is expected to change when span-based
+		//                partition locality checking is enabled.
+		{
+			partitionSpans: "[/1/2 - /1/2] [/1/3 - /1/3] [/1/4 - /1/4] [/1 - /1]",
+			localities:     []bool{true, true, true, false},
+			spanInputs:     "[/1/2 - /1/4] [/1/5 - /5]",
+			expected:       "[/1/2 - /5]",
+		},
+		// TODO(msirek):  This result is expected to change when span-based
+		//                partition locality checking is enabled.
+		{
+			partitionSpans: "[/1/2 - /1/2] [/1/3 - /1/3] [/1/4 - /1/4] [/1/2/3 - /1/2/3]",
+			localities:     []bool{true, true, true, false},
+			spanInputs:     "[/1/2 - /1/4] [/1/5 - /5]",
+			expected:       "[/1/2 - /5]",
+		},
+		{
+			partitionSpans: "[/1/2/3 - /1/2/3] [/9 - /9]",
+			localities:     []bool{true, false},
+			spanInputs:     "[/1/2/1 - /1/2/2] [/1/2/3 - /1/2/3] [/1/2/4 - /9]",
+			expected:       "[/1/2/1 - /1/2/2] [/1/2/3 - /1/2/3] [/1/2/4 - /9]",
+		},
+	}
+
+	kc := testKeyContext(1, 2, 3)
+	for i, tc := range testData {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			// Read the partitionSpans and localities entries to make an index that
+			// only has the partitions and ps (PrefixSorter) elements populated.
+			partitionSpans := parseSpans(&evalCtx, tc.partitionSpans)
+			partitions := make([]testcat.Partition, partitionSpans.Count())
+			localPartitions := util.FastIntSet{}
+			for j := 0; j < partitionSpans.Count(); j++ {
+				span := partitionSpans.Get(j)
+				spanDatums := make([]tree.Datums, 1)
+				datumSlice := make(tree.Datums, span.StartKey().Length())
+				for k := 0; k < span.StartKey().Length(); k++ {
+					datumSlice[k] = span.StartKey().Value(k)
+				}
+				spanDatums[0] = datumSlice
+				partitions[j] = testcat.Partition{}
+				partitions[j].SetDatums(spanDatums)
+
+				if tc.localities[j] {
+					localPartitions.Add(j)
+				}
+			}
+
+			// Make the index
+			index := &testcat.Index{}
+			index.SetPartitions(partitions)
+			// Make the PrefixSorter.
+			ps := partition.GetSortedPrefixes(index, localPartitions, &evalCtx)
+
+			// Run the test.
+			spans := parseSpans(&evalCtx, tc.spanInputs)
+			var c Constraint
+			c.Init(kc, &spans)
+			c.ConsolidateSpans(kc.EvalCtx, ps)
+			if res := c.Spans.String(); res != tc.expected {
+				t.Errorf("expected  %s  got  %s", tc.expected, res)
+			}
+		})
+	}
+
 }
 
 func TestExactPrefix(t *testing.T) {
@@ -890,6 +1001,109 @@ func TestExtractNotNullCols(t *testing.T) {
 			if exp := opt.MakeColSet(tc.e...); !cols.Equals(exp) {
 				t.Errorf("expected %s; got %s", exp, cols)
 			}
+		})
+	}
+}
+
+func TestCollectFirstColumnValues(t *testing.T) {
+	test := func(t *testing.T, evalCtx *tree.EvalContext, testConstraint *Constraint, expected string, hasNull bool) {
+		t.Helper()
+
+		var values tree.Datums
+		var hasNullValue, ok bool
+		values, hasNullValue, ok = testConstraint.CollectFirstColumnValues(evalCtx)
+		if !ok {
+			if expected != "()" {
+				format := "Failed to collect values from constraint: %s  Expected values: %v"
+				t.Errorf(format, testConstraint.String(), expected)
+			}
+		}
+		actual := values.String()
+
+		if hasNull != hasNullValue {
+			format := "Collect values hasNull mismatch for constraint: %s. expected: %t, actual: %t"
+			t.Errorf(format, testConstraint.String(), hasNull, hasNullValue)
+		}
+
+		if actual != expected {
+			format := "testConstraint: %s, expected: %v, actual: %v"
+			t.Errorf(format, testConstraint.String(), expected, actual)
+		}
+	}
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+
+	testData := []struct {
+		spans          string
+		expectedValues string
+		hasNull        bool
+	}{
+		{ // 0
+			spans:          "/1: [/2 - ]",
+			expectedValues: "()",
+			hasNull:        false,
+		},
+		{ // 1
+			spans:          "/1: [/2 - /2]",
+			expectedValues: "(2)",
+			hasNull:        false,
+		},
+		{ // 2
+			spans:          "/1: [/NULL - /4]",
+			expectedValues: "()",
+			hasNull:        false,
+		},
+		{ // 3
+			spans:          "/1: [/1 - /4]",
+			expectedValues: "(1, 2, 3, 4)",
+			hasNull:        false,
+		},
+		{ // 4
+			spans:          "/1: [/1 - /4] [/5 - /5] [/7 - /8]",
+			expectedValues: "(1, 2, 3, 4, 5, 7, 8)",
+			hasNull:        false,
+		},
+		{ // 5
+			spans:          "/1: (/1 - /4]",
+			expectedValues: "()",
+			hasNull:        false,
+		},
+		{ // 6
+			spans:          "/1: [/NULL - /NULL]",
+			expectedValues: "(NULL)",
+			hasNull:        true,
+		},
+		{ // 7
+			spans:          "/1/2: [/NULL/1 - /NULL/3]",
+			expectedValues: "(NULL)",
+			hasNull:        true,
+		},
+		{ // 8
+			spans:          "/1/2: [/1/NULL - /2/NULL]",
+			expectedValues: "(1, 2)",
+			hasNull:        false,
+		},
+		{ // 9
+			spans:          "/1/2/3/4: [/1/1/1/1 - /1/1/2/1] [/3/3/3/1 - /3/3/4/1]",
+			expectedValues: "(1, 3)",
+			hasNull:        false,
+		},
+		{ // 10
+			spans:          "/1/2/3: [/1/1/NULL - /1/1/2] [/3/3/3 - /3/3/4]",
+			expectedValues: "(1, 3)",
+			hasNull:        false,
+		},
+		{ // 11
+			spans:          "/1/2/3: [/1/1 - /1/1] [/1/3 - /1/3]",
+			expectedValues: "(1)",
+			hasNull:        false,
+		},
+	}
+
+	for i, tc := range testData {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			c := ParseConstraint(&evalCtx, tc.spans)
+			test(t, &evalCtx, &c, tc.expectedValues, tc.hasNull)
 		})
 	}
 }

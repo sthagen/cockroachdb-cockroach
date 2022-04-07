@@ -274,13 +274,12 @@ func (c *CustomFuncs) DuplicateColumnIDs(
 	table opt.TableID, cols opt.ColSet,
 ) (opt.TableID, opt.ColSet) {
 	md := c.mem.Metadata()
-	tabMeta := md.TableMeta(table)
 	newTableID := md.DuplicateTable(table, c.RemapCols)
 
 	// Build a new set of column IDs from the new TableMeta.
 	var newColIDs opt.ColSet
 	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col + 1) {
-		ord := tabMeta.MetaID.ColumnOrdinal(col)
+		ord := table.ColumnOrdinal(col)
 		newColID := newTableID.ColumnID(ord)
 		newColIDs.Add(newColID)
 	}
@@ -1067,5 +1066,14 @@ func (c *CustomFuncs) DuplicateScanPrivate(sp *memo.ScanPrivate) *memo.ScanPriva
 		Cols:    cols,
 		Flags:   sp.Flags,
 		Locking: sp.Locking,
+	}
+}
+
+// DuplicateJoinPrivate copies a JoinPrivate, preserving the Flags and
+// SkipReorderJoins field values.
+func (c *CustomFuncs) DuplicateJoinPrivate(jp *memo.JoinPrivate) *memo.JoinPrivate {
+	return &memo.JoinPrivate{
+		Flags:            jp.Flags,
+		SkipReorderJoins: jp.SkipReorderJoins,
 	}
 }

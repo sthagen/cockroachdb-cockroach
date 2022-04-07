@@ -209,6 +209,71 @@ RegionsResponse describes the available regions.
 
 
 
+## NodesList
+
+
+
+NodesList returns all available nodes with their addresses.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+NodesListRequest requests list of all nodes.
+The nodes are KV nodes when the cluster is a single
+tenant cluster or the host cluster in case of multi-tenant
+clusters.
+The nodes are SQL instances in case of multi-tenant
+clusters.
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+NodesListResponse contains a list of all nodes with their addresses.
+The nodes are KV nodes when the cluster is a single
+tenant cluster or the host cluster in case of multi-tenant
+clusters.
+The nodes are SQL instances in case of multi-tenant
+clusters.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| nodes | [NodeDetails](#cockroach.server.serverpb.NodesListResponse-cockroach.server.serverpb.NodeDetails) | repeated | nodes contains a list of NodeDetails. Each individual node within the list is a SQL node in case of a tenant server and KV nodes in case of a KV server. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.NodesListResponse-cockroach.server.serverpb.NodeDetails"></a>
+#### NodeDetails
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [int32](#cockroach.server.serverpb.NodesListResponse-int32) |  | node_id is a unique identifier for the node. This corresponds to SQL instance ID for a tenant server and KV node id for for a KV server. | [reserved](#support-status) |
+| address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesListResponse-cockroach.util.UnresolvedAddr) |  | address is the RPC address for a KV node. This will be set to null for a tenant server node. | [reserved](#support-status) |
+| sql_address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesListResponse-cockroach.util.UnresolvedAddr) |  | sql_address is the SQL address for a node. | [reserved](#support-status) |
+
+
+
+
+
+
 ## Nodes
 
 `GET /_status/nodes`
@@ -359,8 +424,6 @@ StoreStatus records the most recent values of metrics for a store.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| incoming | [int64](#cockroach.server.serverpb.NodesResponse-int64) |  | in bytes | [reserved](#support-status) |
-| outgoing | [int64](#cockroach.server.serverpb.NodesResponse-int64) |  | in bytes | [reserved](#support-status) |
 | latency | [int64](#cockroach.server.serverpb.NodesResponse-int64) |  | in nanoseconds | [reserved](#support-status) |
 
 
@@ -513,8 +576,6 @@ StoreStatus records the most recent values of metrics for a store.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| incoming | [int64](#cockroach.server.status.statuspb.NodeStatus-int64) |  | in bytes | [reserved](#support-status) |
-| outgoing | [int64](#cockroach.server.status.statuspb.NodeStatus-int64) |  | in bytes | [reserved](#support-status) |
 | latency | [int64](#cockroach.server.status.statuspb.NodeStatus-int64) |  | in nanoseconds | [reserved](#support-status) |
 
 
@@ -770,8 +831,6 @@ NodeDescriptor holds details on node physical/network topology.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| incoming | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | in bytes | [reserved](#support-status) |
-| outgoing | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | in bytes | [reserved](#support-status) |
 | latency | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | in nanoseconds | [reserved](#support-status) |
 
 
@@ -1030,8 +1089,6 @@ NodeDescriptor holds details on node physical/network topology.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| incoming | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | in bytes | [reserved](#support-status) |
-| outgoing | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | in bytes | [reserved](#support-status) |
 | latency | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | in nanoseconds | [reserved](#support-status) |
 
 
@@ -1164,6 +1221,9 @@ Support status: [reserved](#support-status)
 | locks_with_wait_queues | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) |  |  | [reserved](#support-status) |
 | lock_wait_queue_waiters | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) |  |  | [reserved](#support-status) |
 | top_k_locks_by_wait_queue_waiters | [RangeInfo.LockInfo](#cockroach.server.serverpb.RaftDebugResponse-cockroach.server.serverpb.RangeInfo.LockInfo) | repeated |  | [reserved](#support-status) |
+| locality | [Locality](#cockroach.server.serverpb.RaftDebugResponse-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
+| is_leaseholder | [bool](#cockroach.server.serverpb.RaftDebugResponse-bool) |  |  | [reserved](#support-status) |
+| lease_valid | [bool](#cockroach.server.serverpb.RaftDebugResponse-bool) |  |  | [reserved](#support-status) |
 
 
 
@@ -1249,6 +1309,7 @@ RangeProblems describes issues reported by a range. For internal use only.
 | no_lease | [bool](#cockroach.server.serverpb.RaftDebugResponse-bool) |  |  | [reserved](#support-status) |
 | quiescent_equals_ticking | [bool](#cockroach.server.serverpb.RaftDebugResponse-bool) |  | Quiescent ranges do not tick by definition, but we track this in two different ways and suspect that they're getting out of sync. If the replica's quiescent flag doesn't agree with the store's list of replicas that are ticking, warn about it. | [reserved](#support-status) |
 | raft_log_too_large | [bool](#cockroach.server.serverpb.RaftDebugResponse-bool) |  | When the raft log is too large, it can be a symptom of other issues. | [reserved](#support-status) |
+| circuit_breaker_error | [bool](#cockroach.server.serverpb.RaftDebugResponse-bool) |  |  | [reserved](#support-status) |
 
 
 
@@ -1282,6 +1343,34 @@ only.
 | waiters | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) |  |  | [reserved](#support-status) |
 | waiting_readers | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) |  |  | [reserved](#support-status) |
 | waiting_writers | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.RaftDebugResponse-cockroach.server.serverpb.Locality"></a>
+#### Locality
+
+Locality is an ordered set of key value Tiers that describe a node's
+location. The tier keys should be the same across all nodes.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| tiers | [Tier](#cockroach.server.serverpb.RaftDebugResponse-cockroach.server.serverpb.Tier) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.RaftDebugResponse-cockroach.server.serverpb.Tier"></a>
+#### Tier
+
+Tier represents one level of the locality hierarchy.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.RaftDebugResponse-string) |  | Key is the name of tier and should match all other nodes. | [reserved](#support-status) |
+| value | [string](#cockroach.server.serverpb.RaftDebugResponse-string) |  | Value is node specific value corresponding to the key. | [reserved](#support-status) |
 
 
 
@@ -1321,6 +1410,8 @@ Support status: [reserved](#support-status)
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [string](#cockroach.server.serverpb.RangesRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
 | range_ids | [int64](#cockroach.server.serverpb.RangesRequest-int64) | repeated |  | [reserved](#support-status) |
+| limit | [int32](#cockroach.server.serverpb.RangesRequest-int32) |  | The pagination limit to use, if set. NB: Pagination is based on ascending RangeID. | [reserved](#support-status) |
+| offset | [int32](#cockroach.server.serverpb.RangesRequest-int32) |  | The pagination offset to use, if set. NB: Pagination is based on ascending RangeID. | [reserved](#support-status) |
 
 
 
@@ -1339,6 +1430,7 @@ Support status: [reserved](#support-status)
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | ranges | [RangeInfo](#cockroach.server.serverpb.RangesResponse-cockroach.server.serverpb.RangeInfo) | repeated |  | [reserved](#support-status) |
+| next | [int32](#cockroach.server.serverpb.RangesResponse-int32) |  | The next pagination offset to use, if any results remain. A value of 0 indicates no more results. NB: Pagination is based on ascending RangeID. | [reserved](#support-status) |
 
 
 
@@ -1370,6 +1462,9 @@ Support status: [reserved](#support-status)
 | locks_with_wait_queues | [int64](#cockroach.server.serverpb.RangesResponse-int64) |  |  | [reserved](#support-status) |
 | lock_wait_queue_waiters | [int64](#cockroach.server.serverpb.RangesResponse-int64) |  |  | [reserved](#support-status) |
 | top_k_locks_by_wait_queue_waiters | [RangeInfo.LockInfo](#cockroach.server.serverpb.RangesResponse-cockroach.server.serverpb.RangeInfo.LockInfo) | repeated |  | [reserved](#support-status) |
+| locality | [Locality](#cockroach.server.serverpb.RangesResponse-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
+| is_leaseholder | [bool](#cockroach.server.serverpb.RangesResponse-bool) |  |  | [reserved](#support-status) |
+| lease_valid | [bool](#cockroach.server.serverpb.RangesResponse-bool) |  |  | [reserved](#support-status) |
 
 
 
@@ -1455,6 +1550,7 @@ RangeProblems describes issues reported by a range. For internal use only.
 | no_lease | [bool](#cockroach.server.serverpb.RangesResponse-bool) |  |  | [reserved](#support-status) |
 | quiescent_equals_ticking | [bool](#cockroach.server.serverpb.RangesResponse-bool) |  | Quiescent ranges do not tick by definition, but we track this in two different ways and suspect that they're getting out of sync. If the replica's quiescent flag doesn't agree with the store's list of replicas that are ticking, warn about it. | [reserved](#support-status) |
 | raft_log_too_large | [bool](#cockroach.server.serverpb.RangesResponse-bool) |  | When the raft log is too large, it can be a symptom of other issues. | [reserved](#support-status) |
+| circuit_breaker_error | [bool](#cockroach.server.serverpb.RangesResponse-bool) |  |  | [reserved](#support-status) |
 
 
 
@@ -1488,6 +1584,212 @@ only.
 | waiters | [int64](#cockroach.server.serverpb.RangesResponse-int64) |  |  | [reserved](#support-status) |
 | waiting_readers | [int64](#cockroach.server.serverpb.RangesResponse-int64) |  |  | [reserved](#support-status) |
 | waiting_writers | [int64](#cockroach.server.serverpb.RangesResponse-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.RangesResponse-cockroach.server.serverpb.Locality"></a>
+#### Locality
+
+Locality is an ordered set of key value Tiers that describe a node's
+location. The tier keys should be the same across all nodes.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| tiers | [Tier](#cockroach.server.serverpb.RangesResponse-cockroach.server.serverpb.Tier) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.RangesResponse-cockroach.server.serverpb.Tier"></a>
+#### Tier
+
+Tier represents one level of the locality hierarchy.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.RangesResponse-string) |  | Key is the name of tier and should match all other nodes. | [reserved](#support-status) |
+| value | [string](#cockroach.server.serverpb.RangesResponse-string) |  | Value is node specific value corresponding to the key. | [reserved](#support-status) |
+
+
+
+
+
+
+## TenantRanges
+
+`GET /_status/tenant_ranges`
+
+TenantRanges requests internal details about all range replicas within
+the tenant's keyspace.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| limit | [int32](#cockroach.server.serverpb.TenantRangesRequest-int32) |  | The pagination limit. This limit will be applied to each node, meaning that if a range is replicated 3 times, 3*limit elements will be returned. NB: Pagination here is based on ascending RangeID. | [reserved](#support-status) |
+| offset | [int32](#cockroach.server.serverpb.TenantRangesRequest-int32) |  | The pagination offset. NB: Pagination here is based on ascending RangeID. | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| ranges_by_locality | [TenantRangesResponse.RangesByLocalityEntry](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangesResponse.RangesByLocalityEntry) | repeated | ranges_by_locality maps each range replica to its specified availability zone, as defined within the replica's locality metadata (default key `az`). Replicas without the default available zone key set will fall under the `locality-unset` key. | [reserved](#support-status) |
+| next | [int32](#cockroach.server.serverpb.TenantRangesResponse-int32) |  | The next offset, if pagination was used. NB: Pagination here is based on ascending RangeID. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangesResponse.RangesByLocalityEntry"></a>
+#### TenantRangesResponse.RangesByLocalityEntry
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.TenantRangesResponse-string) |  |  |  |
+| value | [TenantRangesResponse.TenantRangeList](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangesResponse.TenantRangeList) |  |  |  |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangesResponse.TenantRangeList"></a>
+#### TenantRangesResponse.TenantRangeList
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| ranges | [TenantRangeInfo](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangeInfo) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangeInfo"></a>
+#### TenantRangeInfo
+
+TenantRangeInfo provides metadata about a specific range replica,
+where concepts not considered to be relevant within the tenant
+abstraction (e.g. NodeIDs) are omitted. Instead, Locality information
+is used to distinguish replicas.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| range_id | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The ID of the Range. | [reserved](#support-status) |
+| span | [PrettySpan](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.PrettySpan) |  | The pretty-printed key span of the range. | [reserved](#support-status) |
+| locality | [Locality](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.Locality) |  | Any locality information associated with this specific replica. | [reserved](#support-status) |
+| is_leaseholder | [bool](#cockroach.server.serverpb.TenantRangesResponse-bool) |  | Whether the range's specific replica is a leaseholder. | [reserved](#support-status) |
+| lease_valid | [bool](#cockroach.server.serverpb.TenantRangesResponse-bool) |  | Whether the range's specific replica holds a valid lease. | [reserved](#support-status) |
+| range_stats | [RangeStatistics](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.RangeStatistics) |  | Statistics about the range replica, e.g. QPS, WPS. | [reserved](#support-status) |
+| mvcc_stats | [cockroach.storage.enginepb.MVCCStats](#cockroach.server.serverpb.TenantRangesResponse-cockroach.storage.enginepb.MVCCStats) |  | MVCC stats about the range replica, e.g. live_bytes. | [reserved](#support-status) |
+| read_latches | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | Read count as reported by the range replica's spanlatch.Manager. | [reserved](#support-status) |
+| write_latches | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | Write count as reported by the range replica's spanlatch.Manager. | [reserved](#support-status) |
+| locks | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The number of locks as reported by the range replica's lockTable. | [reserved](#support-status) |
+| locks_with_wait_queues | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The number of locks with non-empty wait-queues as reported by the range replica's lockTable | [reserved](#support-status) |
+| lock_wait_queue_waiters | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The aggregate number of waiters in wait-queues across all locks as reported by the range replica's lockTable | [reserved](#support-status) |
+| top_k_locks_by_wait_queue_waiters | [TenantRangeInfo.LockInfo](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangeInfo.LockInfo) | repeated | The top-k locks with the most waiters (readers + writers) in their wait-queue, ordered in descending order. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.PrettySpan"></a>
+#### PrettySpan
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| start_key | [string](#cockroach.server.serverpb.TenantRangesResponse-string) |  |  | [reserved](#support-status) |
+| end_key | [string](#cockroach.server.serverpb.TenantRangesResponse-string) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.Locality"></a>
+#### Locality
+
+Locality is an ordered set of key value Tiers that describe a node's
+location. The tier keys should be the same across all nodes.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| tiers | [Tier](#cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.Tier) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.Tier"></a>
+#### Tier
+
+Tier represents one level of the locality hierarchy.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.TenantRangesResponse-string) |  | Key is the name of tier and should match all other nodes. | [reserved](#support-status) |
+| value | [string](#cockroach.server.serverpb.TenantRangesResponse-string) |  | Value is node specific value corresponding to the key. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.RangeStatistics"></a>
+#### RangeStatistics
+
+RangeStatistics describes statistics reported by a range. For internal use
+only.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| queries_per_second | [double](#cockroach.server.serverpb.TenantRangesResponse-double) |  | Queries per second served by this range.<br><br>Note that queries per second will only be known by the leaseholder. All other replicas will report it as 0. | [reserved](#support-status) |
+| writes_per_second | [double](#cockroach.server.serverpb.TenantRangesResponse-double) |  | Writes per second served by this range. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.TenantRangesResponse-cockroach.server.serverpb.TenantRangeInfo.LockInfo"></a>
+#### TenantRangeInfo.LockInfo
+
+LockInfo provides metadata about the state of a single lock
+in the range replica's lockTable.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| pretty_key | [string](#cockroach.server.serverpb.TenantRangesResponse-string) |  | The lock's key in pretty format. | [reserved](#support-status) |
+| key | [bytes](#cockroach.server.serverpb.TenantRangesResponse-bytes) |  | The lock's key. | [reserved](#support-status) |
+| held | [bool](#cockroach.server.serverpb.TenantRangesResponse-bool) |  | Is the lock actively held by a transaction, or just a reservation? | [reserved](#support-status) |
+| waiters | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The number of waiters in the lock's wait queue. | [reserved](#support-status) |
+| waiting_readers | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The number of waiting readers in the lock's wait queue. | [reserved](#support-status) |
+| waiting_writers | [int64](#cockroach.server.serverpb.TenantRangesResponse-int64) |  | The number of waiting writers in the lock's wait queue. | [reserved](#support-status) |
 
 
 
@@ -1768,6 +2070,7 @@ Response object for ListSessions and ListLocalSessions.
 | ----- | ---- | ----- | ----------- | -------------- |
 | sessions | [Session](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.Session) | repeated | A list of sessions on this node or cluster. | [reserved](#support-status) |
 | errors | [ListSessionsError](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ListSessionsError) | repeated | Any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
+| internal_app_name_prefix | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
 
 
 
@@ -1839,6 +2142,7 @@ TxnInfo represents an in flight user transaction on some Session.
 | read_only | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  | [reserved](#support-status) |
 | is_historical | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  | [reserved](#support-status) |
 | priority | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  |  | [reserved](#support-status) |
+| quality_of_service | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  |  | [reserved](#support-status) |
 
 
 
@@ -1897,6 +2201,7 @@ Response object for ListSessions and ListLocalSessions.
 | ----- | ---- | ----- | ----------- | -------------- |
 | sessions | [Session](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.Session) | repeated | A list of sessions on this node or cluster. | [reserved](#support-status) |
 | errors | [ListSessionsError](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ListSessionsError) | repeated | Any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
+| internal_app_name_prefix | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
 
 
 
@@ -1968,6 +2273,7 @@ TxnInfo represents an in flight user transaction on some Session.
 | read_only | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  | [reserved](#support-status) |
 | is_historical | [bool](#cockroach.server.serverpb.ListSessionsResponse-bool) |  |  | [reserved](#support-status) |
 | priority | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  |  | [reserved](#support-status) |
+| quality_of_service | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  |  | [reserved](#support-status) |
 
 
 
@@ -2075,6 +2381,54 @@ Response returned by target query's gateway node.
 | ----- | ---- | ----- | ----------- | -------------- |
 | canceled | [bool](#cockroach.server.serverpb.CancelQueryResponse-bool) |  | Whether the cancellation request succeeded and the query was canceled. | [reserved](#support-status) |
 | error | [string](#cockroach.server.serverpb.CancelQueryResponse-string) |  | Error message (accompanied with canceled = false). | [reserved](#support-status) |
+
+
+
+
+
+
+
+## CancelQueryByKey
+
+
+
+CancelQueryByKey cancels a SQL query given its pgwire BackendKeyData.
+It is invoked through the pgwire protocol, so it's not exposed as an
+HTTP endpoint.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+Request object for issuing a pgwire query cancel request.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| sql_instance_id | [int32](#cockroach.server.serverpb.CancelQueryByKeyRequest-int32) |  | The SQLInstanceID of the gateway node for the query to be canceled. | [reserved](#support-status) |
+| cancel_query_key | [uint64](#cockroach.server.serverpb.CancelQueryByKeyRequest-uint64) |  | The key that was generated during session initialization as part of the pgwire protocol. | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+Response returned by target query's gateway node for a pgwire cancel request.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| canceled | [bool](#cockroach.server.serverpb.CancelQueryByKeyResponse-bool) |  | Whether the cancellation request succeeded and the query was canceled. | [reserved](#support-status) |
+| error | [string](#cockroach.server.serverpb.CancelQueryByKeyResponse-string) |  | Error message (accompanied with canceled = false). | [reserved](#support-status) |
 
 
 
@@ -2586,7 +2940,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.StacksRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
+| node_id | [string](#cockroach.server.serverpb.StacksRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. node_id translates to a KV node ID on a storage server and SQL instance ID on a SQL only server. | [reserved](#support-status) |
 | type | [StacksType](#cockroach.server.serverpb.StacksRequest-cockroach.server.serverpb.StacksType) |  |  | [reserved](#support-status) |
 
 
@@ -2631,7 +2985,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.ProfileRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
+| node_id | [string](#cockroach.server.serverpb.ProfileRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. node_id translates to a KV node ID on a storage server and SQL instance ID on a SQL only server. | [reserved](#support-status) |
 | type | [ProfileRequest.Type](#cockroach.server.serverpb.ProfileRequest-cockroach.server.serverpb.ProfileRequest.Type) |  | The type of profile to retrieve. | [reserved](#support-status) |
 | seconds | [int32](#cockroach.server.serverpb.ProfileRequest-int32) |  | applies only to Type=CPU, defaults to 30 | [reserved](#support-status) |
 | labels | [bool](#cockroach.server.serverpb.ProfileRequest-bool) |  | applies only to Type=CPU, defaults to false | [reserved](#support-status) |
@@ -2726,7 +3080,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.GetFilesRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
+| node_id | [string](#cockroach.server.serverpb.GetFilesRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. node_id translates to a KV node ID on a storage server and SQL instance ID on a SQL only server. | [reserved](#support-status) |
 | list_only | [bool](#cockroach.server.serverpb.GetFilesRequest-bool) |  | If list_only is true then the contents of the files will not be populated in the response. Only filenames and sizes will be returned. | [reserved](#support-status) |
 | type | [FileType](#cockroach.server.serverpb.GetFilesRequest-cockroach.server.serverpb.FileType) |  |  | [reserved](#support-status) |
 | patterns | [string](#cockroach.server.serverpb.GetFilesRequest-string) | repeated | Each pattern given is matched with Files of the above type in the node using filepath.Glob(). The patterns only match to filenames and so path separators cannot be used. Example: * will match all files of requested type. | [reserved](#support-status) |
@@ -2984,6 +3338,7 @@ Support status: [reserved](#support-status)
 | overreplicated_range_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
 | quiescent_equals_ticking_range_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
 | raft_log_too_large_range_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
+| circuit_breaker_error_range_ids | [int64](#cockroach.server.serverpb.ProblemRangesResponse-int64) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -3010,6 +3365,8 @@ of ranges currently considered “hot” by the node(s).
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is possible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. | [alpha](#support-status) |
+| page_size | [int32](#cockroach.server.serverpb.HotRangesRequest-int32) |  |  | [reserved](#support-status) |
+| page_token | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  |  | [reserved](#support-status) |
 
 
 
@@ -3089,6 +3446,92 @@ target node(s) selected in a HotRangesRequest.
 | ----- | ---- | ----- | ----------- | -------------- |
 | desc | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.HotRangesResponse-cockroach.roachpb.RangeDescriptor) |  | Desc is the descriptor of the range for which the report was produced.<br><br>TODO(knz): This field should be removed. See: https://github.com/cockroachdb/cockroach/issues/53212 | [reserved](#support-status) |
 | queries_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  | QueriesPerSecond is the recent number of queries per second on this range. | [alpha](#support-status) |
+| leaseholder_node_id | [int32](#cockroach.server.serverpb.HotRangesResponse-int32) |  | LeaseholderNodeID indicates the Node ID that is the current leaseholder for the given range. | [reserved](#support-status) |
+
+
+
+
+
+
+## HotRangesV2
+
+`POST /_status/v2/hotranges`
+
+
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+HotRangesRequest queries one or more cluster nodes for a list
+of ranges currently considered “hot” by the node(s).
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is possible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. | [alpha](#support-status) |
+| page_size | [int32](#cockroach.server.serverpb.HotRangesRequest-int32) |  |  | [reserved](#support-status) |
+| page_token | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+HotRangesResponseV2 is a response payload returned by `HotRangesV2` service.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| ranges | [HotRangesResponseV2.HotRange](#cockroach.server.serverpb.HotRangesResponseV2-cockroach.server.serverpb.HotRangesResponseV2.HotRange) | repeated | Ranges contain list of hot ranges info that has highest number of QPS. | [reserved](#support-status) |
+| errors_by_node_id | [HotRangesResponseV2.ErrorsByNodeIdEntry](#cockroach.server.serverpb.HotRangesResponseV2-cockroach.server.serverpb.HotRangesResponseV2.ErrorsByNodeIdEntry) | repeated | errors contains any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
+| next_page_token | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | NextPageToken represents next pagination token to request next slice of data. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.HotRangesResponseV2-cockroach.server.serverpb.HotRangesResponseV2.HotRange"></a>
+#### HotRangesResponseV2.HotRange
+
+HotRange message describes a single hot range, ie its QPS, node ID it belongs to, etc.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| range_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | range_id indicates Range ID that's identified as hot range. | [reserved](#support-status) |
+| node_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | node_id indicates the node that contains the current hot range. | [reserved](#support-status) |
+| qps | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | qps (queries per second) shows the amount of queries that interact with current range. | [reserved](#support-status) |
+| table_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | table_name indicates the SQL table that the range belongs to. | [reserved](#support-status) |
+| database_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | database_name indicates on database that has current hot range. | [reserved](#support-status) |
+| index_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | index_name indicates the index name for current range. | [reserved](#support-status) |
+| replica_node_ids | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) | repeated | replica_node_ids specifies the list of node ids that contain replicas with current hot range. | [reserved](#support-status) |
+| leaseholder_node_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | leaseholder_node_id indicates the Node ID that is the current leaseholder for the given range. | [reserved](#support-status) |
+| schema_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | schema_name provides the name of schema (if exists) for table in current range. | [reserved](#support-status) |
+| store_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | store_id indicates the Store ID where range is stored. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.HotRangesResponseV2-cockroach.server.serverpb.HotRangesResponseV2.ErrorsByNodeIdEntry"></a>
+#### HotRangesResponseV2.ErrorsByNodeIdEntry
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  |  |  |
+| value | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  |  |  |
 
 
 
@@ -3194,6 +3637,9 @@ Support status: [reserved](#support-status)
 | locks_with_wait_queues | [int64](#cockroach.server.serverpb.RangeResponse-int64) |  |  | [reserved](#support-status) |
 | lock_wait_queue_waiters | [int64](#cockroach.server.serverpb.RangeResponse-int64) |  |  | [reserved](#support-status) |
 | top_k_locks_by_wait_queue_waiters | [RangeInfo.LockInfo](#cockroach.server.serverpb.RangeResponse-cockroach.server.serverpb.RangeInfo.LockInfo) | repeated |  | [reserved](#support-status) |
+| locality | [Locality](#cockroach.server.serverpb.RangeResponse-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
+| is_leaseholder | [bool](#cockroach.server.serverpb.RangeResponse-bool) |  |  | [reserved](#support-status) |
+| lease_valid | [bool](#cockroach.server.serverpb.RangeResponse-bool) |  |  | [reserved](#support-status) |
 
 
 
@@ -3279,6 +3725,7 @@ RangeProblems describes issues reported by a range. For internal use only.
 | no_lease | [bool](#cockroach.server.serverpb.RangeResponse-bool) |  |  | [reserved](#support-status) |
 | quiescent_equals_ticking | [bool](#cockroach.server.serverpb.RangeResponse-bool) |  | Quiescent ranges do not tick by definition, but we track this in two different ways and suspect that they're getting out of sync. If the replica's quiescent flag doesn't agree with the store's list of replicas that are ticking, warn about it. | [reserved](#support-status) |
 | raft_log_too_large | [bool](#cockroach.server.serverpb.RangeResponse-bool) |  | When the raft log is too large, it can be a symptom of other issues. | [reserved](#support-status) |
+| circuit_breaker_error | [bool](#cockroach.server.serverpb.RangeResponse-bool) |  |  | [reserved](#support-status) |
 
 
 
@@ -3312,6 +3759,34 @@ only.
 | waiters | [int64](#cockroach.server.serverpb.RangeResponse-int64) |  |  | [reserved](#support-status) |
 | waiting_readers | [int64](#cockroach.server.serverpb.RangeResponse-int64) |  |  | [reserved](#support-status) |
 | waiting_writers | [int64](#cockroach.server.serverpb.RangeResponse-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.RangeResponse-cockroach.server.serverpb.Locality"></a>
+#### Locality
+
+Locality is an ordered set of key value Tiers that describe a node's
+location. The tier keys should be the same across all nodes.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| tiers | [Tier](#cockroach.server.serverpb.RangeResponse-cockroach.server.serverpb.Tier) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.RangeResponse-cockroach.server.serverpb.Tier"></a>
+#### Tier
+
+Tier represents one level of the locality hierarchy.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.RangeResponse-string) |  | Key is the name of tier and should match all other nodes. | [reserved](#support-status) |
+| value | [string](#cockroach.server.serverpb.RangeResponse-string) |  | Value is node specific value corresponding to the key. | [reserved](#support-status) |
 
 
 
@@ -3604,6 +4079,104 @@ Support status: [reserved](#support-status)
 
 
 
+## StatementDetails
+
+`GET /_status/stmtdetails/{fingerprint_id}`
+
+
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+StatementDetailsRequest requests the details of a Statement, based on its keys.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| fingerprint_id | [string](#cockroach.server.serverpb.StatementDetailsRequest-string) |  | fingerprint_id is generated by ConstructStatementFingerprintID using: query, failed, implicitTxn and database. So we don't need to add them to the request. | [reserved](#support-status) |
+| app_names | [string](#cockroach.server.serverpb.StatementDetailsRequest-string) | repeated |  | [reserved](#support-status) |
+| start | [int64](#cockroach.server.serverpb.StatementDetailsRequest-int64) |  | Unix time range for aggregated statements. | [reserved](#support-status) |
+| end | [int64](#cockroach.server.serverpb.StatementDetailsRequest-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| statement | [StatementDetailsResponse.CollectedStatementSummary](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.server.serverpb.StatementDetailsResponse.CollectedStatementSummary) |  | statement returns the total statistics for the statement. | [reserved](#support-status) |
+| statement_statistics_per_aggregated_ts | [StatementDetailsResponse.CollectedStatementGroupedByAggregatedTs](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.server.serverpb.StatementDetailsResponse.CollectedStatementGroupedByAggregatedTs) | repeated | statement_statistics_per_aggregated_ts returns the same statement from above, but with its statistics separated by the aggregated timestamp. | [reserved](#support-status) |
+| statement_statistics_per_plan_hash | [StatementDetailsResponse.CollectedStatementGroupedByPlanHash](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.server.serverpb.StatementDetailsResponse.CollectedStatementGroupedByPlanHash) | repeated | statement_statistics_per_plan_hash returns the same statement from above, but with its statistics separated by the plan hash. | [reserved](#support-status) |
+| internal_app_name_prefix | [string](#cockroach.server.serverpb.StatementDetailsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.StatementDetailsResponse-cockroach.server.serverpb.StatementDetailsResponse.CollectedStatementSummary"></a>
+#### StatementDetailsResponse.CollectedStatementSummary
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| metadata | [cockroach.sql.AggregatedStatementMetadata](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.sql.AggregatedStatementMetadata) |  |  | [reserved](#support-status) |
+| stats | [cockroach.sql.StatementStatistics](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.sql.StatementStatistics) |  |  | [reserved](#support-status) |
+| aggregation_interval | [google.protobuf.Duration](#cockroach.server.serverpb.StatementDetailsResponse-google.protobuf.Duration) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.StatementDetailsResponse-cockroach.server.serverpb.StatementDetailsResponse.CollectedStatementGroupedByAggregatedTs"></a>
+#### StatementDetailsResponse.CollectedStatementGroupedByAggregatedTs
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| metadata | [cockroach.sql.AggregatedStatementMetadata](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.sql.AggregatedStatementMetadata) |  |  | [reserved](#support-status) |
+| stats | [cockroach.sql.StatementStatistics](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.sql.StatementStatistics) |  |  | [reserved](#support-status) |
+| aggregation_interval | [google.protobuf.Duration](#cockroach.server.serverpb.StatementDetailsResponse-google.protobuf.Duration) |  |  | [reserved](#support-status) |
+| aggregated_ts | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementDetailsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.StatementDetailsResponse-cockroach.server.serverpb.StatementDetailsResponse.CollectedStatementGroupedByPlanHash"></a>
+#### StatementDetailsResponse.CollectedStatementGroupedByPlanHash
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| metadata | [cockroach.sql.AggregatedStatementMetadata](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.sql.AggregatedStatementMetadata) |  |  | [reserved](#support-status) |
+| stats | [cockroach.sql.StatementStatistics](#cockroach.server.serverpb.StatementDetailsResponse-cockroach.sql.StatementStatistics) |  |  | [reserved](#support-status) |
+| aggregation_interval | [google.protobuf.Duration](#cockroach.server.serverpb.StatementDetailsResponse-google.protobuf.Duration) |  |  | [reserved](#support-status) |
+| explain_plan | [string](#cockroach.server.serverpb.StatementDetailsResponse-string) |  |  | [reserved](#support-status) |
+| plan_hash | [uint64](#cockroach.server.serverpb.StatementDetailsResponse-uint64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
 ## CreateStatementDiagnosticsReport
 
 `POST /_status/stmtdiagreports`
@@ -3687,7 +4260,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| statement_fingerprint | [string](#cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest-string) |  |  | [reserved](#support-status) |
+| request_id | [int64](#cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest-int64) |  |  | [reserved](#support-status) |
 
 
 
@@ -4099,6 +4672,7 @@ Response object returned by TableIndexStatsResponse.
 | ----- | ---- | ----- | ----------- | -------------- |
 | statistics | [TableIndexStatsResponse.ExtendedCollectedIndexUsageStatistics](#cockroach.server.serverpb.TableIndexStatsResponse-cockroach.server.serverpb.TableIndexStatsResponse.ExtendedCollectedIndexUsageStatistics) | repeated |  | [reserved](#support-status) |
 | last_reset | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableIndexStatsResponse-google.protobuf.Timestamp) |  | Timestamp of the last index usage stats reset. | [reserved](#support-status) |
+| index_recommendations | [cockroach.sql.IndexRecommendation](#cockroach.server.serverpb.TableIndexStatsResponse-cockroach.sql.IndexRecommendation) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -4116,6 +4690,7 @@ Response object returned by TableIndexStatsResponse.
 | index_name | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | index_name is the name of the index. | [reserved](#support-status) |
 | index_type | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | index_type is the type of the index i.e. primary, secondary. | [reserved](#support-status) |
 | create_statement | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | create_statement is the SQL statement that would re-create the current index if executed. | [reserved](#support-status) |
+| created_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableIndexStatsResponse-google.protobuf.Timestamp) |  | CreatedAt is an approximate timestamp at which the index was created. Note that it may not always be populated. | [reserved](#support-status) |
 
 
 
@@ -4155,6 +4730,109 @@ UserSQLRolesResponse returns a list of roles for the logged SQL user.
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | roles | [string](#cockroach.server.serverpb.UserSQLRolesResponse-string) | repeated | roles is a list of roles for the SQL user. | [reserved](#support-status) |
+
+
+
+
+
+
+
+## TxnIDResolution
+
+
+
+TxnIDResolution is used by the contention event store to resolve
+transaction ID into transaction fingerprint IDs.
+This RPC does not have a corresponding HTTP endpoint on purpose, since
+DB Console should never directly query this endpoint.
+
+The API contract is the following:
+- if the server can resolve the transaction IDs in the RPC request, it will
+  be returned in the RPC response.
+- if the server is not able to resolve the transaction IDs, it will
+  instructs the transaction ID cache to drain its write buffer. (Since
+  transaction ID cache's write path is asynchronous, the transaction ID
+  requested by the client might not be available in the cache yet).
+  Client is responsible to perform retries if the requested transaction ID
+  is not returned in the RPC response.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+Request object for issuing Transaction ID Resolution.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| coordinator_id | [string](#cockroach.server.serverpb.TxnIDResolutionRequest-string) |  | coordinator_id is either the NodeID or SQLInstanceID depending on whether the transaction is executed on a system tenant or a regular tenant. | [reserved](#support-status) |
+| txnIDs | [bytes](#cockroach.server.serverpb.TxnIDResolutionRequest-bytes) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+Response object for issuing Transaction ID Resolution.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| resolvedTxnIDs | [cockroach.sql.contentionpb.ResolvedTxnID](#cockroach.server.serverpb.TxnIDResolutionResponse-cockroach.sql.contentionpb.ResolvedTxnID) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+## TransactionContentionEvents
+
+`GET /_status/transactioncontentionevents`
+
+TransactionContentionEvents returns a list of un-aggregated contention
+events sorted by the collection timestamp.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [string](#cockroach.server.serverpb.TransactionContentionEventsRequest-string) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| events | [cockroach.sql.contentionpb.ExtendedContentionEvent](#cockroach.server.serverpb.TransactionContentionEventsResponse-cockroach.sql.contentionpb.ExtendedContentionEvent) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -4419,6 +5097,7 @@ zone configuration, and size statistics for a database.
 | range_count | [int64](#cockroach.server.serverpb.DatabaseDetailsResponse-int64) |  | The number of ranges, as determined from a query of range meta keys, across all tables. | [reserved](#support-status) |
 | approximate_disk_bytes | [uint64](#cockroach.server.serverpb.DatabaseDetailsResponse-uint64) |  | An approximation of the disk space (in bytes) used for all replicas of all tables across the cluster. | [reserved](#support-status) |
 | node_ids | [int32](#cockroach.server.serverpb.DatabaseDetailsResponse-int32) | repeated | node_ids is the ordered list of node ids on which data is stored. | [reserved](#support-status) |
+| num_index_recommendations | [int32](#cockroach.server.serverpb.DatabaseDetailsResponse-int32) |  |  | [reserved](#support-status) |
 
 
 
@@ -4487,6 +5166,8 @@ a table.
 | zone_config_level | [ZoneConfigurationLevel](#cockroach.server.serverpb.TableDetailsResponse-cockroach.server.serverpb.ZoneConfigurationLevel) |  | The level at which this object's zone configuration is set. | [reserved](#support-status) |
 | descriptor_id | [int64](#cockroach.server.serverpb.TableDetailsResponse-int64) |  | descriptor_id is an identifier used to uniquely identify this table. It can be used to find events pertaining to this table by filtering on the 'target_id' field of events. | [reserved](#support-status) |
 | configure_zone_statement | [string](#cockroach.server.serverpb.TableDetailsResponse-string) |  | configure_zone_statement is the output of "SHOW ZONE CONFIGURATION FOR TABLE" for this table. It is a SQL statement that would re-configure the table's current zone if executed. | [reserved](#support-status) |
+| stats_last_created_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableDetailsResponse-google.protobuf.Timestamp) |  | stats_last_created_at is the time at which statistics were last created. | [reserved](#support-status) |
+| has_index_recommendations | [bool](#cockroach.server.serverpb.TableDetailsResponse-bool) |  | has_index_recommendations notifies if the there are index recommendations on this table. | [reserved](#support-status) |
 
 
 
@@ -5046,6 +5727,7 @@ SettingsResponse is the response to SettingsRequest.
 | type | [string](#cockroach.server.serverpb.SettingsResponse-string) |  |  | [reserved](#support-status) |
 | description | [string](#cockroach.server.serverpb.SettingsResponse-string) |  |  | [reserved](#support-status) |
 | public | [bool](#cockroach.server.serverpb.SettingsResponse-bool) |  |  | [reserved](#support-status) |
+| last_updated | [google.protobuf.Timestamp](#cockroach.server.serverpb.SettingsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
 
 
 
@@ -5235,6 +5917,7 @@ JobResponse contains the job record for a job.
 | next_run | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
 | num_runs | [int64](#cockroach.server.serverpb.JobsResponse-int64) |  |  | [reserved](#support-status) |
 | execution_failures | [JobResponse.ExecutionFailure](#cockroach.server.serverpb.JobsResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure) | repeated | ExecutionFailures is a log of execution failures of the job. It is not guaranteed to contain all execution failures and some execution failures may not contain an error or end. | [reserved](#support-status) |
+| coordinator_id | [int64](#cockroach.server.serverpb.JobsResponse-int64) |  | coordinator_id identifies the node coordinating the job. This value will only be present for jobs that are currently running or recently ran. | [reserved](#support-status) |
 
 
 
@@ -5314,6 +5997,7 @@ JobResponse contains the job record for a job.
 | next_run | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
 | num_runs | [int64](#cockroach.server.serverpb.JobResponse-int64) |  |  | [reserved](#support-status) |
 | execution_failures | [JobResponse.ExecutionFailure](#cockroach.server.serverpb.JobResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure) | repeated | ExecutionFailures is a log of execution failures of the job. It is not guaranteed to contain all execution failures and some execution failures may not contain an error or end. | [reserved](#support-status) |
+| coordinator_id | [int64](#cockroach.server.serverpb.JobResponse-int64) |  | coordinator_id identifies the node coordinating the job. This value will only be present for jobs that are currently running or recently ran. | [reserved](#support-status) |
 
 
 
@@ -5516,6 +6200,7 @@ If no NodeIDs are given, it targets the recipient node.
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_ids | [int32](#cockroach.server.serverpb.DecommissionRequest-int32) | repeated |  | [reserved](#support-status) |
 | target_membership | [cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus](#cockroach.server.serverpb.DecommissionRequest-cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus) |  |  | [reserved](#support-status) |
+| num_replica_report | [int32](#cockroach.server.serverpb.DecommissionRequest-int32) |  | The number of decommissioning replicas to be reported. | [reserved](#support-status) |
 
 
 
@@ -5552,6 +6237,21 @@ DecommissionStatusResponse lists decommissioning statuses for a number of NodeID
 | replica_count | [int64](#cockroach.server.serverpb.DecommissionStatusResponse-int64) |  | The number of replicas on the node, computed by scanning meta2 ranges. | [reserved](#support-status) |
 | membership | [cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus](#cockroach.server.serverpb.DecommissionStatusResponse-cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus) |  | The membership status of the given node. | [reserved](#support-status) |
 | draining | [bool](#cockroach.server.serverpb.DecommissionStatusResponse-bool) |  |  | [reserved](#support-status) |
+| reported_replicas | [DecommissionStatusResponse.Replica](#cockroach.server.serverpb.DecommissionStatusResponse-cockroach.server.serverpb.DecommissionStatusResponse.Replica) | repeated | Decommissioning replicas on the given node to be reported. How many replicas are reported is determined by what was specified in the request. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.DecommissionStatusResponse-cockroach.server.serverpb.DecommissionStatusResponse.Replica"></a>
+#### DecommissionStatusResponse.Replica
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| replica_id | [int32](#cockroach.server.serverpb.DecommissionStatusResponse-int32) |  |  | [reserved](#support-status) |
+| range_id | [int32](#cockroach.server.serverpb.DecommissionStatusResponse-int32) |  |  | [reserved](#support-status) |
 
 
 
@@ -5580,6 +6280,7 @@ specified or, if none are specified, all nodes.
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_ids | [int32](#cockroach.server.serverpb.DecommissionStatusRequest-int32) | repeated |  | [reserved](#support-status) |
+| num_replica_report | [int32](#cockroach.server.serverpb.DecommissionStatusRequest-int32) |  | The number of decommissioning replicas to be reported. | [reserved](#support-status) |
 
 
 
@@ -5616,6 +6317,21 @@ DecommissionStatusResponse lists decommissioning statuses for a number of NodeID
 | replica_count | [int64](#cockroach.server.serverpb.DecommissionStatusResponse-int64) |  | The number of replicas on the node, computed by scanning meta2 ranges. | [reserved](#support-status) |
 | membership | [cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus](#cockroach.server.serverpb.DecommissionStatusResponse-cockroach.kv.kvserver.liveness.livenesspb.MembershipStatus) |  | The membership status of the given node. | [reserved](#support-status) |
 | draining | [bool](#cockroach.server.serverpb.DecommissionStatusResponse-bool) |  |  | [reserved](#support-status) |
+| reported_replicas | [DecommissionStatusResponse.Replica](#cockroach.server.serverpb.DecommissionStatusResponse-cockroach.server.serverpb.DecommissionStatusResponse.Replica) | repeated | Decommissioning replicas on the given node to be reported. How many replicas are reported is determined by what was specified in the request. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.DecommissionStatusResponse-cockroach.server.serverpb.DecommissionStatusResponse.Replica"></a>
+#### DecommissionStatusResponse.Replica
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| replica_id | [int32](#cockroach.server.serverpb.DecommissionStatusResponse-int32) |  |  | [reserved](#support-status) |
+| range_id | [int32](#cockroach.server.serverpb.DecommissionStatusResponse-int32) |  |  | [reserved](#support-status) |
 
 
 
@@ -6036,6 +6752,334 @@ Support status: [reserved](#support-status)
 
 
 #### Response Parameters
+
+
+
+## ListTracingSnapshots
+
+`GET /_admin/v1/trace_snapshots`
+
+ListTracingSnapshots retrieves the list of snapshots of the Active Spans
+Registry that the node currently has in memory. A new snapshot can be
+captured with TakeTracingSnapshots.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshots | [SnapshotInfo](#cockroach.server.serverpb.ListTracingSnapshotsResponse-cockroach.server.serverpb.SnapshotInfo) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.ListTracingSnapshotsResponse-cockroach.server.serverpb.SnapshotInfo"></a>
+#### SnapshotInfo
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot_id | [int64](#cockroach.server.serverpb.ListTracingSnapshotsResponse-int64) |  |  | [reserved](#support-status) |
+| captured_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListTracingSnapshotsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+## TakeTracingSnapshot
+
+`POST /_admin/v1/trace_snapshots`
+
+TakeTracingSnapshot captures a new snapshot of the Active Spans Registry.
+The new snapshot is returned, and also made available through
+ListTracingSnapshots.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot | [SnapshotInfo](#cockroach.server.serverpb.TakeTracingSnapshotResponse-cockroach.server.serverpb.SnapshotInfo) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.TakeTracingSnapshotResponse-cockroach.server.serverpb.SnapshotInfo"></a>
+#### SnapshotInfo
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot_id | [int64](#cockroach.server.serverpb.TakeTracingSnapshotResponse-int64) |  |  | [reserved](#support-status) |
+| captured_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TakeTracingSnapshotResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+## GetTracingSnapshot
+
+`GET /_admin/v1/trace_snapshots/{snapshot_id}`
+
+GetTracingSnapshot returns a snapshot of the tracing spans in the active
+spans registry previously generated through TakeTracingSnapshots.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot_id | [int64](#cockroach.server.serverpb.GetTracingSnapshotRequest-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot | [TracingSnapshot](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.TracingSnapshot) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.TracingSnapshot"></a>
+#### TracingSnapshot
+
+TracingSnapshot represents a snapshot of the active spans registry, including
+all the spans that were open at the time when the snapshot was taken.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot_id | [int64](#cockroach.server.serverpb.GetTracingSnapshotResponse-int64) |  |  | [reserved](#support-status) |
+| captured_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.GetTracingSnapshotResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+| spans | [TracingSpan](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.TracingSpan) | repeated |  | [reserved](#support-status) |
+| stacks | [TracingSnapshot.StacksEntry](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.TracingSnapshot.StacksEntry) | repeated | Ideally we'd use int64 to match the goroutine_id type but unfortunately, the way that grpc-gateway parses these objects into Javascript results in odd encodings of Long JS types that are difficult to interact with as map keys. Thus, we settle for string. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.TracingSpan"></a>
+#### TracingSpan
+
+TracingSpan represents a span, in a form slightly processed for the use of
+the tracing UI.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| operation | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+| trace_id | [uint64](#cockroach.server.serverpb.GetTracingSnapshotResponse-uint64) |  |  | [reserved](#support-status) |
+| span_id | [uint64](#cockroach.server.serverpb.GetTracingSnapshotResponse-uint64) |  |  | [reserved](#support-status) |
+| parent_span_id | [uint64](#cockroach.server.serverpb.GetTracingSnapshotResponse-uint64) |  |  | [reserved](#support-status) |
+| start | [google.protobuf.Timestamp](#cockroach.server.serverpb.GetTracingSnapshotResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+| goroutine_id | [uint64](#cockroach.server.serverpb.GetTracingSnapshotResponse-uint64) |  |  | [reserved](#support-status) |
+| processed_tags | [SpanTag](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.SpanTag) | repeated |  | [reserved](#support-status) |
+| current | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  | current is set if the span is still alive (i.e. still present in the active spans registry). | [reserved](#support-status) |
+| current_recording_mode | [cockroach.util.tracing.tracingpb.RecordingMode](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.util.tracing.tracingpb.RecordingMode) |  | current_recording_mode represents the span's current recording mode. This is not set if current == false. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.SpanTag"></a>
+#### SpanTag
+
+SpanTag represents a tag on a tracing span, in a form processed for the use
+of the tracing UI.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+| val | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+| caption | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+| link | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+| hidden | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  |  | [reserved](#support-status) |
+| highlight | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  |  | [reserved](#support-status) |
+| inherit | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  |  | [reserved](#support-status) |
+| inherited | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  |  | [reserved](#support-status) |
+| propagate_up | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  |  | [reserved](#support-status) |
+| copied_from_child | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.TracingSnapshot.StacksEntry"></a>
+#### TracingSnapshot.StacksEntry
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  |  |
+| value | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  |  |
+
+
+
+
+
+
+## GetTrace
+
+`POST /_admin/v1/traces`
+
+GetTrace returns the trace with a specified ID. Depending on the request,
+the trace is returned either from a snapshot that was previously taken, or
+directly from the active spans registry.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+GetTrace represents the request of the GetTrace RPC.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot_id | [int64](#cockroach.server.serverpb.GetTraceRequest-int64) |  | If a snapshot is specified, the trace information is returned from that snapshot. If a snapshot is not specified, information about currently opened spans is returned from the active spans registry. | [reserved](#support-status) |
+| trace_id | [uint64](#cockroach.server.serverpb.GetTraceRequest-uint64) |  |  | [reserved](#support-status) |
+| recording_type | [cockroach.util.tracing.tracingpb.RecordingMode](#cockroach.server.serverpb.GetTraceRequest-cockroach.util.tracing.tracingpb.RecordingMode) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+GetTrace represents the response to the GetTrace RPC.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| snapshot_id | [int64](#cockroach.server.serverpb.GetTraceResponse-int64) |  | snapshot_id identifies the snapshot that the trace was retrieved from. If 0, the trace was not retrieved from a registry, but directly from the active spans registry. | [reserved](#support-status) |
+| trace_id | [uint64](#cockroach.server.serverpb.GetTraceResponse-uint64) |  |  | [reserved](#support-status) |
+| still_exists | [bool](#cockroach.server.serverpb.GetTraceResponse-bool) |  | still_exists is set if any spans from this trace are currently present in the active spans registry.<br><br>If snapshot_id is 0, still_exists is always set. | [reserved](#support-status) |
+| serialized_recording | [string](#cockroach.server.serverpb.GetTraceResponse-string) |  | serialized_recording represents the serialization of trace recording. We return the recording already serialized as formatted string for easy consumption in the browser. | [reserved](#support-status) |
+
+
+
+
+
+
+
+## SetTraceRecordingType
+
+`POST /_admin/v1/settracerecordingtype`
+
+SetTraceRecordingType sets the recording mode of all or some of the spans
+in a trace.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+SetTraceRecordingTypeRequest is the request for SetTraceRecordingType, which
+sets the recording mode of all or some of the spans in a trace.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| trace_id | [uint64](#cockroach.server.serverpb.SetTraceRecordingTypeRequest-uint64) |  | TraceID identifies the trace to toggle the recording of. It must always be specified. | [reserved](#support-status) |
+| span_id | [uint64](#cockroach.server.serverpb.SetTraceRecordingTypeRequest-uint64) |  | SpanID, if not zero, controls which spans in the trace get their recording mode set. If zero, all spans in the trace are updated. If not zero, only the respective span and its descendants get updated. | [reserved](#support-status) |
+| recording_mode | [cockroach.util.tracing.tracingpb.RecordingMode](#cockroach.server.serverpb.SetTraceRecordingTypeRequest-cockroach.util.tracing.tracingpb.RecordingMode) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+SetTraceRecordingTypeRequest is the response for SetTraceRecordingType.
+
+
+
+
+
 
 
 

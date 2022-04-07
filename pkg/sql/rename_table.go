@@ -169,7 +169,7 @@ func (n *renameTableNode) startExec(params runParams) error {
 
 	// Ensure tables cannot be moved cross-database.
 	if oldTn.Catalog() != newTn.Catalog() {
-		// TODO(richardjcai): Remove this in 22.1. In 21.2, we allow moving tables
+		// TODO(richardjcai): Remove this in 22.2. In 21.2, we allow moving tables
 		// from one database's public schema to another database's public schema
 		// as a special case. However after 22.1 all public schemas will be backed
 		// by a descriptor and will be a regular UDS. We do not support moving
@@ -221,7 +221,7 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return nil
 	}
 
-	err := p.Descriptors().CheckObjectCollision(
+	err := p.Descriptors().Direct().CheckObjectCollision(
 		params.ctx,
 		params.p.txn,
 		targetDbDesc.GetID(),
@@ -278,7 +278,7 @@ func (n *renameTableNode) Close(context.Context)        {}
 func (p *planner) dependentViewError(
 	ctx context.Context, typeName, objName string, parentID, viewID descpb.ID, op string,
 ) error {
-	viewDesc, err := p.Descriptors().MustGetTableDescByID(ctx, p.txn, viewID)
+	viewDesc, err := p.Descriptors().Direct().MustGetTableDescByID(ctx, p.txn, viewID)
 	if err != nil {
 		return err
 	}

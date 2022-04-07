@@ -14,7 +14,9 @@ import (
 	"context"
 	"math"
 	"time"
+	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -141,6 +143,13 @@ type granter interface {
 	// 5x and shifted ~2s of latency (at p99) from the scheduler into admission
 	// control (which is desirable since the latter is where we can
 	// differentiate between work).
+	//
+	// TODO(sumeer): the "grant chain" concept is subtle and under-documented.
+	// It's easy to go through most of this package thinking it has something to
+	// do with dependent requests (e.g. intent resolution chains on an end txn).
+	// It would help for a top-level comment on grantChainID or continueGrantChain
+	// to spell out what grant chains are, their purpose, and how they work with
+	// an example.
 	continueGrantChain(grantChainID grantChainID)
 }
 
@@ -548,9 +557,17 @@ func (sg *kvGranter) setAvailableIOTokensLocked(tokens int64) {
 	} else {
 		sg.availableIOTokens = tokens
 	}
-	if wasExhausted && sg.availableIOTokens > 0 && sg.ioTokensExhaustedDurationMetric != nil {
-		exhaustedMicros := timeutil.Since(sg.exhaustedStart).Microseconds()
+	if wasExhausted && sg.ioTokensExhaustedDurationMetric != nil {
+		// NB: sg.availableIOTokens may still be 0, i.e., tokens may continue to
+		// be exhausted. We do want to tick the metric so that it doesn't show a
+		// burst of activity after many minutes of exhaustion (which we had
+		// observed prior to this code).
+		now := timeutil.Now()
+		exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
 		sg.ioTokensExhaustedDurationMetric.Inc(exhaustedMicros)
+		if sg.availableIOTokens == 0 {
+			sg.exhaustedStart = now
+		}
 	}
 }
 
@@ -590,6 +607,13 @@ type GrantCoordinator struct {
 	// disabled.
 	useGrantChains bool
 
+	// The admission control code needs high sampling frequency of the cpu load,
+	// and turns off admission control enforcement when the sampling frequency
+	// is too low. For testing queueing behavior, we do not want the enforcement
+	// to be turned off in a non-deterministic manner so add a testing flag to
+	// disable that feature.
+	testingDisableSkipEnforcement bool
+
 	// grantChainActive indicates whether a grant chain is active. If active,
 	// grantChainID is the ID of that chain. If !active, grantChainID is the ID
 	// of the next chain that will become active. IDs are assigned by
@@ -614,13 +638,56 @@ type Options struct {
 	SQLSQLResponseBurstTokens      int
 	SQLStatementLeafStartWorkSlots int
 	SQLStatementRootStartWorkSlots int
+	TestingDisableSkipEnforcement  bool
 	Settings                       *cluster.Settings
 	// Only non-nil for tests.
 	makeRequesterFunc makeRequesterFunc
 }
 
+var _ base.ModuleTestingKnobs = &Options{}
+
+// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
+func (*Options) ModuleTestingKnobs() {}
+
+// DefaultOptions are the default settings for various admission control knobs.
+var DefaultOptions Options = Options{
+	MinCPUSlots:                    1,
+	MaxCPUSlots:                    100000, /* TODO(sumeer): add cluster setting */
+	SQLKVResponseBurstTokens:       100000, /* TODO(sumeer): add cluster setting */
+	SQLSQLResponseBurstTokens:      100000, /* TODO(sumeer): add cluster setting */
+	SQLStatementLeafStartWorkSlots: 100,    /* arbitrary, and unused */
+	SQLStatementRootStartWorkSlots: 100,    /* arbitrary, and unused */
+}
+
+// Override applies values from "override" to the receiver that differ from Go
+// defaults.
+func (o *Options) Override(override *Options) {
+	if override.MinCPUSlots != 0 {
+		o.MinCPUSlots = override.MinCPUSlots
+	}
+	if override.MaxCPUSlots != 0 {
+		o.MaxCPUSlots = override.MaxCPUSlots
+	}
+	if override.SQLKVResponseBurstTokens != 0 {
+		o.SQLKVResponseBurstTokens = override.SQLKVResponseBurstTokens
+	}
+	if override.SQLSQLResponseBurstTokens != 0 {
+		o.SQLSQLResponseBurstTokens = override.SQLSQLResponseBurstTokens
+	}
+	if override.SQLStatementLeafStartWorkSlots != 0 {
+		o.SQLStatementLeafStartWorkSlots = override.SQLStatementLeafStartWorkSlots
+	}
+	if override.SQLStatementRootStartWorkSlots != 0 {
+		o.SQLStatementRootStartWorkSlots = override.SQLStatementRootStartWorkSlots
+	}
+	if override.TestingDisableSkipEnforcement {
+		o.TestingDisableSkipEnforcement = true
+	}
+}
+
 type makeRequesterFunc func(
-	workKind WorkKind, granter granter, settings *cluster.Settings, opts workQueueOptions) requester
+	_ log.AmbientContext, workKind WorkKind, granter granter, settings *cluster.Settings,
+	opts workQueueOptions) requester
 
 // NewGrantCoordinators constructs GrantCoordinators and WorkQueues for a
 // regular cluster node. Caller is responsible for hooking up
@@ -653,13 +720,14 @@ func NewGrantCoordinators(
 		totalSlotsMetric: metrics.KVTotalSlots,
 	}
 	coord := &GrantCoordinator{
-		ambientCtx:           ambientCtx,
-		settings:             st,
-		cpuOverloadIndicator: kvSlotAdjuster,
-		cpuLoadListener:      kvSlotAdjuster,
-		useGrantChains:       true,
-		numProcs:             1,
-		grantChainID:         1,
+		ambientCtx:                    ambientCtx,
+		settings:                      st,
+		cpuOverloadIndicator:          kvSlotAdjuster,
+		cpuLoadListener:               kvSlotAdjuster,
+		useGrantChains:                true,
+		testingDisableSkipEnforcement: opts.TestingDisableSkipEnforcement,
+		numProcs:                      1,
+		grantChainID:                  1,
 	}
 
 	kvg := &kvGranter{
@@ -668,7 +736,7 @@ func NewGrantCoordinators(
 		usedSlotsMetric: metrics.KVUsedSlots,
 	}
 	kvSlotAdjuster.granter = kvg
-	coord.queues[KVWork] = makeRequester(KVWork, kvg, st, makeWorkQueueOptions(KVWork))
+	coord.queues[KVWork] = makeRequester(ambientCtx, KVWork, kvg, st, makeWorkQueueOptions(KVWork))
 	kvg.requester = coord.queues[KVWork]
 	coord.granters[KVWork] = kvg
 
@@ -680,7 +748,7 @@ func NewGrantCoordinators(
 		cpuOverload:          kvSlotAdjuster,
 	}
 	coord.queues[SQLKVResponseWork] = makeRequester(
-		SQLKVResponseWork, tg, st, makeWorkQueueOptions(SQLKVResponseWork))
+		ambientCtx, SQLKVResponseWork, tg, st, makeWorkQueueOptions(SQLKVResponseWork))
 	tg.requester = coord.queues[SQLKVResponseWork]
 	coord.granters[SQLKVResponseWork] = tg
 
@@ -691,7 +759,7 @@ func NewGrantCoordinators(
 		maxBurstTokens:       opts.SQLSQLResponseBurstTokens,
 		cpuOverload:          kvSlotAdjuster,
 	}
-	coord.queues[SQLSQLResponseWork] = makeRequester(
+	coord.queues[SQLSQLResponseWork] = makeRequester(ambientCtx,
 		SQLSQLResponseWork, tg, st, makeWorkQueueOptions(SQLSQLResponseWork))
 	tg.requester = coord.queues[SQLSQLResponseWork]
 	coord.granters[SQLSQLResponseWork] = tg
@@ -703,7 +771,7 @@ func NewGrantCoordinators(
 		cpuOverload:     kvSlotAdjuster,
 		usedSlotsMetric: metrics.SQLLeafStartUsedSlots,
 	}
-	coord.queues[SQLStatementLeafStartWork] = makeRequester(
+	coord.queues[SQLStatementLeafStartWork] = makeRequester(ambientCtx,
 		SQLStatementLeafStartWork, sg, st, makeWorkQueueOptions(SQLStatementLeafStartWork))
 	sg.requester = coord.queues[SQLStatementLeafStartWork]
 	coord.granters[SQLStatementLeafStartWork] = sg
@@ -715,7 +783,7 @@ func NewGrantCoordinators(
 		cpuOverload:     kvSlotAdjuster,
 		usedSlotsMetric: metrics.SQLRootStartUsedSlots,
 	}
-	coord.queues[SQLStatementRootStartWork] = makeRequester(
+	coord.queues[SQLStatementRootStartWork] = makeRequester(ambientCtx,
 		SQLStatementRootStartWork, sg, st, makeWorkQueueOptions(SQLStatementRootStartWork))
 	sg.requester = coord.queues[SQLStatementRootStartWork]
 	coord.granters[SQLStatementRootStartWork] = sg
@@ -766,7 +834,7 @@ func NewGrantCoordinatorSQL(
 		maxBurstTokens:       opts.SQLKVResponseBurstTokens,
 		cpuOverload:          sqlNodeCPU,
 	}
-	coord.queues[SQLKVResponseWork] = makeRequester(
+	coord.queues[SQLKVResponseWork] = makeRequester(ambientCtx,
 		SQLKVResponseWork, tg, st, makeWorkQueueOptions(SQLKVResponseWork))
 	tg.requester = coord.queues[SQLKVResponseWork]
 	coord.granters[SQLKVResponseWork] = tg
@@ -778,7 +846,7 @@ func NewGrantCoordinatorSQL(
 		maxBurstTokens:       opts.SQLSQLResponseBurstTokens,
 		cpuOverload:          sqlNodeCPU,
 	}
-	coord.queues[SQLSQLResponseWork] = makeRequester(
+	coord.queues[SQLSQLResponseWork] = makeRequester(ambientCtx,
 		SQLSQLResponseWork, tg, st, makeWorkQueueOptions(SQLSQLResponseWork))
 	tg.requester = coord.queues[SQLSQLResponseWork]
 	coord.granters[SQLSQLResponseWork] = tg
@@ -790,7 +858,7 @@ func NewGrantCoordinatorSQL(
 		cpuOverload:     sqlNodeCPU,
 		usedSlotsMetric: metrics.SQLLeafStartUsedSlots,
 	}
-	coord.queues[SQLStatementLeafStartWork] = makeRequester(
+	coord.queues[SQLStatementLeafStartWork] = makeRequester(ambientCtx,
 		SQLStatementLeafStartWork, sg, st, makeWorkQueueOptions(SQLStatementLeafStartWork))
 	sg.requester = coord.queues[SQLStatementLeafStartWork]
 	coord.granters[SQLStatementLeafStartWork] = sg
@@ -802,7 +870,7 @@ func NewGrantCoordinatorSQL(
 		cpuOverload:     sqlNodeCPU,
 		usedSlotsMetric: metrics.SQLRootStartUsedSlots,
 	}
-	coord.queues[SQLStatementRootStartWork] = makeRequester(
+	coord.queues[SQLStatementRootStartWork] = makeRequester(ambientCtx,
 		SQLStatementRootStartWork, sg, st, makeWorkQueueOptions(SQLStatementRootStartWork))
 	sg.requester = coord.queues[SQLStatementRootStartWork]
 	coord.granters[SQLStatementRootStartWork] = sg
@@ -825,7 +893,7 @@ func appendMetricStructsForQueues(ms []metric.Struct, coord *GrantCoordinator) [
 // pebbleMetricsTick is called every adjustmentInterval seconds and passes
 // through to the ioLoadListener, so that it can adjust the plan for future IO
 // token allocations.
-func (coord *GrantCoordinator) pebbleMetricsTick(ctx context.Context, m pebble.Metrics) {
+func (coord *GrantCoordinator) pebbleMetricsTick(ctx context.Context, m *pebble.Metrics) {
 	coord.ioLoadListener.pebbleMetricsTick(ctx, m)
 }
 
@@ -892,7 +960,10 @@ func (coord *GrantCoordinator) CPULoad(runnable int, procs int, samplePeriod tim
 	coord.granters[SQLKVResponseWork].(*tokenGranter).refillBurstTokens(skipEnforcement)
 	coord.granters[SQLSQLResponseWork].(*tokenGranter).refillBurstTokens(skipEnforcement)
 	if coord.granters[KVWork] != nil {
-		coord.granters[KVWork].(*kvGranter).skipSlotEnforcement = skipEnforcement
+		if !coord.testingDisableSkipEnforcement {
+			kvg := coord.granters[KVWork].(*kvGranter)
+			kvg.skipSlotEnforcement = skipEnforcement
+		}
 	}
 	if coord.grantChainActive && !coord.tryTerminateGrantChain() {
 		return
@@ -1151,7 +1222,11 @@ type StoreGrantCoordinators struct {
 	// These metrics are shared by WorkQueues across stores.
 	workQueueMetrics WorkQueueMetrics
 
-	gcMap                 map[int32]*GrantCoordinator
+	gcMap syncutil.IntMap // map[int64(StoreID)]*GrantCoordinator
+	// numStores is used to track the number of stores which have been added
+	// to the gcMap. This is used because the IntMap doesn't expose a size
+	// api.
+	numStores             int
 	pebbleMetricsProvider PebbleMetricsProvider
 	closeCh               chan struct{}
 }
@@ -1164,14 +1239,19 @@ func (sgc *StoreGrantCoordinators) SetPebbleMetricsProvider(
 	if sgc.pebbleMetricsProvider != nil {
 		panic(errors.AssertionFailedf("SetPebbleMetricsProvider called more than once"))
 	}
-	sgc.gcMap = make(map[int32]*GrantCoordinator)
 	sgc.pebbleMetricsProvider = pmp
 	sgc.closeCh = make(chan struct{})
 	metrics := sgc.pebbleMetricsProvider.GetPebbleMetrics()
 	for _, m := range metrics {
 		gc := sgc.initGrantCoordinator(m.StoreID)
-		sgc.gcMap[m.StoreID] = gc
-		gc.pebbleMetricsTick(startupCtx, *m.Metrics)
+		// Defensive call to LoadAndStore even though Store ought to be sufficient
+		// since SetPebbleMetricsProvider can only be called once. This code
+		// guards against duplication of stores returned by GetPebbleMetrics.
+		_, loaded := sgc.gcMap.LoadOrStore(int64(m.StoreID), unsafe.Pointer(gc))
+		if !loaded {
+			sgc.numStores++
+		}
+		gc.pebbleMetricsTick(startupCtx, m.Metrics)
 		gc.allocateIOTokensTick()
 	}
 
@@ -1188,22 +1268,27 @@ func (sgc *StoreGrantCoordinators) SetPebbleMetricsProvider(
 				ticks++
 				if ticks%adjustmentInterval == 0 {
 					metrics := sgc.pebbleMetricsProvider.GetPebbleMetrics()
-					if len(metrics) != len(sgc.gcMap) {
+					if len(metrics) != sgc.numStores {
 						log.Warningf(ctx,
-							"expected %d store metrics and found %d metrics", len(sgc.gcMap), len(metrics))
+							"expected %d store metrics and found %d metrics", sgc.numStores, len(metrics))
 					}
 					for _, m := range metrics {
-						if gc, ok := sgc.gcMap[m.StoreID]; ok {
-							gc.pebbleMetricsTick(ctx, *m.Metrics)
+						if unsafeGc, ok := sgc.gcMap.Load(int64(m.StoreID)); ok {
+							gc := (*GrantCoordinator)(unsafeGc)
+							gc.pebbleMetricsTick(ctx, m.Metrics)
 						} else {
 							log.Warningf(ctx,
 								"seeing metrics for unknown storeID %d", m.StoreID)
 						}
 					}
 				}
-				for _, gc := range sgc.gcMap {
+				sgc.gcMap.Range(func(_ int64, unsafeGc unsafe.Pointer) bool {
+					gc := (*GrantCoordinator)(unsafeGc)
 					gc.allocateIOTokensTick()
-				}
+					// true indicates that iteration should continue after the
+					// current entry has been processed.
+					return true
+				})
 			case <-sgc.closeCh:
 				done = true
 			}
@@ -1247,7 +1332,7 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(storeID int32) *GrantCoo
 	// Share the WorkQueue metrics across all stores.
 	// TODO(sumeer): add per-store WorkQueue state for debug.zip and db console.
 	opts.metrics = &sgc.workQueueMetrics
-	coord.queues[KVWork] = sgc.makeRequesterFunc(KVWork, kvg, sgc.settings, opts)
+	coord.queues[KVWork] = sgc.makeRequesterFunc(sgc.ambientCtx, KVWork, kvg, sgc.settings, opts)
 	kvg.requester = coord.queues[KVWork]
 	coord.granters[KVWork] = kvg
 	coord.ioLoadListener = &ioLoadListener{
@@ -1263,7 +1348,8 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(storeID int32) *GrantCoo
 // TryGetQueueForStore returns a WorkQueue for the given storeID, or nil if
 // the storeID is not known.
 func (sgc *StoreGrantCoordinators) TryGetQueueForStore(storeID int32) *WorkQueue {
-	if granter, ok := sgc.gcMap[storeID]; ok {
+	if unsafeGranter, ok := sgc.gcMap.Load(int64(storeID)); ok {
+		granter := (*GrantCoordinator)(unsafeGranter)
 		return granter.GetWorkQueue(KVWork)
 	}
 	return nil
@@ -1274,9 +1360,14 @@ func (sgc *StoreGrantCoordinators) close() {
 	if sgc.closeCh != nil {
 		close(sgc.closeCh)
 	}
-	for _, c := range sgc.gcMap {
-		c.Close()
-	}
+
+	sgc.gcMap.Range(func(_ int64, unsafeGc unsafe.Pointer) bool {
+		gc := (*GrantCoordinator)(unsafeGc)
+		gc.Close()
+		// true indicates that iteration should continue after the
+		// current entry has been processed.
+		return true
+	})
 }
 
 // GrantCoordinators holds a regular GrantCoordinator for all work, and a
@@ -1438,8 +1529,9 @@ type ioLoadListener struct {
 	l0Bytes          int64
 	l0AddedBytes     uint64
 	// Exponentially smoothed per interval values.
-	smoothedBytesRemoved int64
-	smoothedNumAdmit     float64
+	smoothedBytesRemoved      int64
+	smoothedNumAdmit          float64
+	smoothedBytesAddedPerWork float64
 
 	// totalTokens represents the tokens to give out until the next call to
 	// adjustTokens. They are given out with smoothing -- tokensAllocated
@@ -1491,7 +1583,7 @@ const adjustmentInterval = 15
 
 // pebbleMetricsTicks is called every adjustmentInterval seconds, and decides
 // the token allocations until the next call.
-func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, m pebble.Metrics) {
+func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, m *pebble.Metrics) {
 	if !io.statsInitialized {
 		io.statsInitialized = true
 		// Initialize cumulative stats.
@@ -1524,15 +1616,14 @@ func (io *ioLoadListener) allocateTokensTick() {
 			toAllocate = io.totalTokens - io.tokensAllocated
 		}
 	}
-	if toAllocate > 0 {
-		io.mu.Lock()
-		defer io.mu.Unlock()
-		io.tokensAllocated += toAllocate
-		if io.tokensAllocated < 0 {
-			panic(errors.AssertionFailedf("tokens allocated is negative %d", io.tokensAllocated))
-		}
-		io.mu.kvGranter.setAvailableIOTokensLocked(toAllocate)
+	// INVARIANT: toAllocate >= 0.
+	io.mu.Lock()
+	defer io.mu.Unlock()
+	io.tokensAllocated += toAllocate
+	if io.tokensAllocated < 0 {
+		panic(errors.AssertionFailedf("tokens allocated is negative %d", io.tokensAllocated))
 	}
+	io.mu.kvGranter.setAvailableIOTokensLocked(toAllocate)
 }
 
 // adjustTokens computes a new value of totalTokens (and resets
@@ -1540,7 +1631,7 @@ func (io *ioLoadListener) allocateTokensTick() {
 // many bytes are being moved out of L0 via compactions with the average
 // number of bytes being added to L0 per KV work. We want the former to be
 // (significantly) larger so that L0 returns to a healthy state.
-func (io *ioLoadListener) adjustTokens(ctx context.Context, m pebble.Metrics) {
+func (io *ioLoadListener) adjustTokens(ctx context.Context, m *pebble.Metrics) {
 	io.tokensAllocated = 0
 	// Grab the cumulative stats.
 	admittedCount := io.kvRequester.getAdmittedCount()
@@ -1582,19 +1673,41 @@ func (io *ioLoadListener) adjustTokens(ctx context.Context, m pebble.Metrics) {
 		// situation.
 		doLog = false
 	}
+	// Attribute the bytesAdded equally to all the admitted work.
+	// INVARIANT: perWork >= 0
+	if perWork := float64(bytesAdded) / float64(admitted); perWork > 0 && admitted > 1 {
+		// Track an exponentially smoothed estimate of bytes added per work when
+		// there was some work actually admitted. Note we treat having admitted
+		// one item as the same as having admitted zero both because we clamp
+		// admitted to 1 and if we only admitted one thing, do we really want to
+		// use that for our estimate? The conjunction includes perWork > 0 (and
+		// not just admitted), since we have seen situation where perWork=0 and
+		// admitted > 1. This can happen since the stats from Pebble (bytesAdded)
+		// and those from the requester (admitted) are not synchronized -- the
+		// bytes are written to Pebble after admission, so there is a lag from
+		// when the counter is incremented in the latter and the bytes are
+		// incremented in the former.
+		if io.smoothedBytesAddedPerWork == 0 {
+			io.smoothedBytesAddedPerWork = perWork
+		} else {
+			io.smoothedBytesAddedPerWork = alpha*perWork +
+				(1-alpha)*io.smoothedBytesAddedPerWork
+		}
+	}
+
 	// We constrain admission if the store if over the threshold.
 	if m.Levels[0].NumFiles > L0FileCountOverloadThreshold.Get(&io.settings.SV) ||
 		m.Levels[0].Sublevels > int32(L0SubLevelCountOverloadThreshold.Get(&io.settings.SV)) {
-		// Attribute the bytesAdded equally to all the admitted work.
-		// INVARIANT: bytesAddedPerWork >= 0
-		bytesAddedPerWork := float64(bytesAdded) / float64(admitted)
-		if bytesAddedPerWork == 0 {
-			// We are here because bytesAdded was 0. This will be very rare.
-			bytesAddedPerWork = 1
+
+		smoothedBytesAddedPerWork := io.smoothedBytesAddedPerWork
+		if io.smoothedBytesAddedPerWork < 1 {
+			// Rare case where we've never seen any work items or somehow the
+			// estimate is less than 1. This is important to avoid overflow.
+			smoothedBytesAddedPerWork = 1
 		}
 		// Don't admit more work than we can remove via compactions. numAdmit
 		// tracks our goal for admission.
-		numAdmit := float64(io.smoothedBytesRemoved) / bytesAddedPerWork
+		numAdmit := float64(io.smoothedBytesRemoved) / smoothedBytesAddedPerWork
 		// Scale down since we want to get under the thresholds over time. This
 		// scaling could be adjusted based on how much above the threshold we are,
 		// but for now we just use a constant.
@@ -1617,7 +1730,7 @@ func (io *ioLoadListener) adjustTokens(ctx context.Context, m pebble.Metrics) {
 		}
 	} else {
 		// Under the threshold. Maintain a smoothedNumAdmit so that it is not 0
-		// when we first go over the threshold. Instead use what we actually
+		// when we first go over the threshold. Instead, use what we actually
 		// admitted.
 		io.smoothedNumAdmit = alpha*float64(admitted) + (1-alpha)*io.smoothedNumAdmit
 		io.totalTokens = unlimitedTokens

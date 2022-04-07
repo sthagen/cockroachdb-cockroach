@@ -89,9 +89,11 @@ func TestTenantsStorageMetricsOnSplit(t *testing.T) {
 			return true
 		})
 		ex := metric.MakePrometheusExporter()
-		ex.ScrapeRegistry(store.Registry(), true /* includeChildMetrics */)
+		scrape := func(ex *metric.PrometheusExporter) {
+			ex.ScrapeRegistry(store.Registry(), true /* includeChildMetrics */)
+		}
 		var in bytes.Buffer
-		if err := ex.PrintAsText(&in); err != nil {
+		if err := ex.ScrapeAndPrintAsText(&in, scrape); err != nil {
 			t.Fatalf("failed to print prometheus data: %v", err)
 		}
 		if seen != 2 {
@@ -227,7 +229,7 @@ func TestTenantRateLimiter(t *testing.T) {
 	// Create some tooling to read and verify metrics off of the prometheus
 	// endpoint.
 	runner.Exec(t, `SET CLUSTER SETTING server.child_metrics.enabled = true`)
-	httpClient, err := s.GetHTTPClient()
+	httpClient, err := s.GetUnauthenticatedHTTPClient()
 	require.NoError(t, err)
 	getMetrics := func() string {
 		resp, err := httpClient.Get(s.AdminURL() + "/_status/vars")

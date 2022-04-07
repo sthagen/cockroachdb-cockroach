@@ -47,12 +47,12 @@ BACKUP TABLE foo INTO LATEST IN '_' -- literals removed
 BACKUP TABLE _ INTO LATEST IN 'bar' -- identifiers removed
 
 parse
-BACKUP TABLE foo INTO LATEST IN 'bar' WITH incremental_storage = 'baz'
+BACKUP TABLE foo INTO LATEST IN 'bar' WITH incremental_location = 'baz'
 ----
-BACKUP TABLE foo INTO LATEST IN 'bar' WITH incremental_storage = 'baz'
-BACKUP TABLE (foo) INTO LATEST IN ('bar') WITH incremental_storage = ('baz') -- fully parenthesized
-BACKUP TABLE foo INTO LATEST IN '_' WITH incremental_storage = '_' -- literals removed
-BACKUP TABLE _ INTO LATEST IN 'bar' WITH incremental_storage = 'baz' -- identifiers removed
+BACKUP TABLE foo INTO LATEST IN 'bar' WITH incremental_location = 'baz'
+BACKUP TABLE (foo) INTO LATEST IN ('bar') WITH incremental_location = ('baz') -- fully parenthesized
+BACKUP TABLE foo INTO LATEST IN '_' WITH incremental_location = '_' -- literals removed
+BACKUP TABLE _ INTO LATEST IN 'bar' WITH incremental_location = 'baz' -- identifiers removed
 
 parse
 BACKUP TABLE foo INTO 'subdir' IN 'bar'
@@ -165,6 +165,38 @@ SHOW BACKUP 'foo' IN 'bar'
 SHOW BACKUP ('foo') IN ('bar') -- fully parenthesized
 SHOW BACKUP '_' IN '_' -- literals removed
 SHOW BACKUP 'foo' IN 'bar' -- identifiers removed
+
+parse
+SHOW BACKUP FROM $1 IN $2 WITH foo = 'bar'
+----
+SHOW BACKUP FROM $1 IN $2 WITH foo = 'bar'
+SHOW BACKUP FROM ($1) IN ($2) WITH foo = ('bar') -- fully parenthesized
+SHOW BACKUP FROM $1 IN $2 WITH foo = '_' -- literals removed
+SHOW BACKUP FROM $1 IN $2 WITH _ = 'bar' -- identifiers removed
+
+parse
+SHOW BACKUP FILES FROM 'foo' IN 'bar'
+----
+SHOW BACKUP FILES FROM 'foo' IN 'bar'
+SHOW BACKUP FILES FROM ('foo') IN ('bar') -- fully parenthesized
+SHOW BACKUP FILES FROM '_' IN '_' -- literals removed
+SHOW BACKUP FILES FROM 'foo' IN 'bar' -- identifiers removed
+
+parse
+SHOW BACKUP RANGES FROM 'foo' IN 'bar'
+----
+SHOW BACKUP RANGES FROM 'foo' IN 'bar'
+SHOW BACKUP RANGES FROM ('foo') IN ('bar') -- fully parenthesized
+SHOW BACKUP RANGES FROM '_' IN '_' -- literals removed
+SHOW BACKUP RANGES FROM 'foo' IN 'bar' -- identifiers removed
+
+parse
+SHOW BACKUP SCHEMAS FROM 'foo' IN 'bar'
+----
+SHOW BACKUP SCHEMAS FROM 'foo' IN 'bar'
+SHOW BACKUP SCHEMAS FROM ('foo') IN ('bar') -- fully parenthesized
+SHOW BACKUP SCHEMAS FROM '_' IN '_' -- literals removed
+SHOW BACKUP SCHEMAS FROM 'foo' IN 'bar' -- identifiers removed
 
 parse
 SHOW BACKUP $1 IN $2 WITH foo = 'bar'
@@ -319,7 +351,7 @@ BACKUP TENANT 36 TO 'bar'
 ----
 BACKUP TENANT 36 TO 'bar'
 BACKUP TENANT 36 TO ('bar') -- fully parenthesized
-BACKUP TENANT 36 TO '_' -- literals removed
+BACKUP TENANT _ TO '_' -- literals removed
 BACKUP TENANT 36 TO 'bar' -- identifiers removed
 
 parse
@@ -487,12 +519,12 @@ RESTORE DATABASE foo FROM '_' WITH new_db_name = '_' -- literals removed
 RESTORE DATABASE _ FROM 'bar' WITH new_db_name = 'baz' -- identifiers removed
 
 parse
-RESTORE DATABASE foo FROM 'bar' IN LATEST WITH incremental_storage = 'baz'
+RESTORE DATABASE foo FROM 'bar' IN LATEST WITH incremental_location = 'baz'
 ----
-RESTORE DATABASE foo FROM 'bar' IN 'latest' WITH incremental_storage = 'baz' -- normalized!
-RESTORE DATABASE foo FROM ('bar') IN ('latest') WITH incremental_storage = ('baz') -- fully parenthesized
-RESTORE DATABASE foo FROM '_' IN '_' WITH incremental_storage = '_' -- literals removed
-RESTORE DATABASE _ FROM 'bar' IN 'latest' WITH incremental_storage = 'baz' -- identifiers removed
+RESTORE DATABASE foo FROM 'bar' IN 'latest' WITH incremental_location = 'baz' -- normalized!
+RESTORE DATABASE foo FROM ('bar') IN ('latest') WITH incremental_location = ('baz') -- fully parenthesized
+RESTORE DATABASE foo FROM '_' IN '_' WITH incremental_location = '_' -- literals removed
+RESTORE DATABASE _ FROM 'bar' IN 'latest' WITH incremental_location = 'baz' -- identifiers removed
 
 parse
 RESTORE DATABASE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'
@@ -662,23 +694,31 @@ RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'
 ----
 RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'
 RESTORE TENANT 36 FROM (($1), ($2)) AS OF SYSTEM TIME ('1') -- fully parenthesized
-RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '_' -- literals removed
+RESTORE TENANT _ FROM ($1, $2) AS OF SYSTEM TIME '_' -- literals removed
 RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1' -- identifiers removed
 
 parse
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar'
+RESTORE TENANT 36 FROM ($1, $2) WITH tenant = '5'
 ----
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar'
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM ('bar') -- fully parenthesized
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM '_' -- literals removed
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' -- identifiers removed
+RESTORE TENANT 36 FROM ($1, $2) WITH tenant = '5'
+RESTORE TENANT 36 FROM (($1), ($2)) WITH tenant = ('5') -- fully parenthesized
+RESTORE TENANT _ FROM ($1, $2) WITH tenant = '_' -- literals removed
+RESTORE TENANT 36 FROM ($1, $2) WITH tenant = '5' -- identifiers removed
+
+parse
+RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS TENANT 321
+----
+RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS TENANT 321
+RESTORE TENANT 123 FROM REPLICATION STREAM FROM ('bar') AS TENANT 321 -- fully parenthesized
+RESTORE TENANT _ FROM REPLICATION STREAM FROM '_' AS TENANT _ -- literals removed
+RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS TENANT 321 -- identifiers removed
 
 parse
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1
 ----
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM ($1) -- fully parenthesized
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 -- literals removed
+RESTORE TENANT _ FROM REPLICATION STREAM FROM $1 -- literals removed
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 -- identifiers removed
 
 parse
@@ -686,7 +726,7 @@ RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS OF SYSTEM TIME '1'
 ----
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS OF SYSTEM TIME '1'
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM ('bar') AS OF SYSTEM TIME ('1') -- fully parenthesized
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM '_' AS OF SYSTEM TIME '_' -- literals removed
+RESTORE TENANT _ FROM REPLICATION STREAM FROM '_' AS OF SYSTEM TIME '_' -- literals removed
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM 'bar' AS OF SYSTEM TIME '1' -- identifiers removed
 
 parse
@@ -694,7 +734,7 @@ RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME '1'
 ----
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME '1'
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM ($1) AS OF SYSTEM TIME ('1') -- fully parenthesized
-RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME '_' -- literals removed
+RESTORE TENANT _ FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME '_' -- literals removed
 RESTORE TENANT 123 FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME '1' -- identifiers removed
 
 parse

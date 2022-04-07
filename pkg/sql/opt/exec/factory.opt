@@ -249,6 +249,7 @@ define IndexJoin {
     KeyCols []exec.NodeColumnOrdinal
     TableCols exec.TableColumnOrdinalSet
     ReqOrdering exec.OutputOrdering
+    LimitHint int
 }
 
 # LookupJoin performs a lookup join.
@@ -280,9 +281,11 @@ define LookupJoin {
     RemoteLookupExpr tree.TypedExpr
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
+    IsFirstJoinInPairedJoiner bool
     IsSecondJoinInPairedJoiner bool
     ReqOrdering exec.OutputOrdering
     Locking *tree.LockingItem
+    LimitHint int
 }
 
 # InvertedJoin performs a lookup join into an inverted index.

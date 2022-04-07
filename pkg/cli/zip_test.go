@@ -76,7 +76,6 @@ table_name NOT IN (
 	'databases',
 	'forward_dependencies',
 	'index_columns',
-	'interleaved',
 	'lost_descriptors_with_data',
 	'table_columns',
 	'table_row_statistics',
@@ -90,7 +89,8 @@ table_name NOT IN (
 	'cluster_transaction_statistics',
 	'statement_statistics',
 	'transaction_statistics',
-	'tenant_usage_details'
+	'tenant_usage_details',
+  'pg_catalog_table_is_implemented'
 )
 ORDER BY name ASC`)
 	assert.NoError(t, err)
@@ -107,6 +107,9 @@ ORDER BY name ASC`)
 		"system.descriptor",
 		"system.namespace",
 		"system.scheduled_jobs",
+		"system.replication_constraint_stats",
+		"system.replication_critical_localities",
+		"system.replication_stats",
 		"system.settings",
 	)
 	sort.Strings(tables)

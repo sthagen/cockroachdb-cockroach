@@ -198,7 +198,7 @@ func GetResumeSpans(
 	mutationID descpb.MutationID,
 	filter backfill.MutationFilter,
 ) ([]roachpb.Span, *jobs.Job, int, error) {
-	tableDesc, err := col.MustGetTableDescByID(ctx, txn, tableID)
+	tableDesc, err := col.Direct().MustGetTableDescByID(ctx, txn, tableID)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -229,7 +229,7 @@ func GetResumeSpans(
 		// know which job it's associated with.
 		for _, job := range tableDesc.GetMutationJobs() {
 			if job.MutationID == mutationID {
-				jobID = jobspb.JobID(job.JobID)
+				jobID = job.JobID
 				break
 			}
 		}

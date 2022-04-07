@@ -62,6 +62,7 @@ var (
 		catconstants.TenantUsageTableName,
 		catconstants.SQLInstancesTableName,
 		catconstants.SpanConfigurationsTableName,
+		catconstants.TenantSettingsTableName,
 	}
 
 	systemSuperuserPrivileges = func() map[descpb.NameInfo]privilege.List {
@@ -78,7 +79,7 @@ var (
 			tableKey.Name = string(r)
 			m[tableKey] = privilege.ReadData
 		}
-		m[descpb.NameInfo{Name: catconstants.SystemDatabaseName}] = privilege.ReadData
+		m[descpb.NameInfo{Name: catconstants.SystemDatabaseName}] = privilege.List{privilege.CONNECT}
 		return m
 	}()
 )

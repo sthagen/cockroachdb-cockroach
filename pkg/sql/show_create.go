@@ -13,6 +13,7 @@ package sql
 import (
 	"bytes"
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
@@ -173,6 +174,12 @@ func ShowCreateTable(
 		a, p.ExecCfg().Codec, desc, desc.GetPrimaryIndex(), desc.GetPrimaryIndex().GetPartitioning(), &f.Buffer, 0 /* indent */, 0, /* colOffset */
 	); err != nil {
 		return "", err
+	}
+
+	if storageParams := desc.GetStorageParams(true /* spaceBetweenEqual */); len(storageParams) > 0 {
+		f.Buffer.WriteString(` WITH (`)
+		f.Buffer.WriteString(strings.Join(storageParams, ", "))
+		f.Buffer.WriteString(`)`)
 	}
 
 	if err := showCreateLocality(desc, f); err != nil {

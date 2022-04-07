@@ -48,18 +48,18 @@ type mutation struct {
 	batchIdx int
 }
 
-// GetSpanConfigEntriesFor is part of the KVAccessor interface.
-func (r *KVAccessorRecorder) GetSpanConfigEntriesFor(
-	ctx context.Context, spans []roachpb.Span,
-) ([]roachpb.SpanConfigEntry, error) {
-	return r.underlying.GetSpanConfigEntriesFor(ctx, spans)
+// GetSpanConfigRecords is part of the KVAccessor interface.
+func (r *KVAccessorRecorder) GetSpanConfigRecords(
+	ctx context.Context, targets []spanconfig.Target,
+) ([]spanconfig.Record, error) {
+	return r.underlying.GetSpanConfigRecords(ctx, targets)
 }
 
-// UpdateSpanConfigEntries is part of the KVAccessor interface.
-func (r *KVAccessorRecorder) UpdateSpanConfigEntries(
-	ctx context.Context, toDelete []roachpb.Span, toUpsert []roachpb.SpanConfigEntry,
+// UpdateSpanConfigRecords is part of the KVAccessor interface.
+func (r *KVAccessorRecorder) UpdateSpanConfigRecords(
+	ctx context.Context, toDelete []spanconfig.Target, toUpsert []spanconfig.Record,
 ) error {
-	if err := r.underlying.UpdateSpanConfigEntries(ctx, toDelete, toUpsert); err != nil {
+	if err := r.underlying.UpdateSpanConfigRecords(ctx, toDelete, toUpsert); err != nil {
 		return err
 	}
 
@@ -67,8 +67,12 @@ func (r *KVAccessorRecorder) UpdateSpanConfigEntries(
 	defer r.mu.Unlock()
 
 	for _, d := range toDelete {
+		del, err := spanconfig.Deletion(d)
+		if err != nil {
+			return err
+		}
 		r.mu.mutations = append(r.mu.mutations, mutation{
-			update:   spanconfig.Deletion(d),
+			update:   del,
 			batchIdx: r.mu.batchCount,
 		})
 	}
@@ -80,6 +84,14 @@ func (r *KVAccessorRecorder) UpdateSpanConfigEntries(
 	}
 	r.mu.batchCount++
 	return nil
+}
+
+// GetAllSystemSpanConfigsThatApply is part of the spanconfig.KVAccessor
+// interface.
+func (r *KVAccessorRecorder) GetAllSystemSpanConfigsThatApply(
+	ctx context.Context, id roachpb.TenantID,
+) ([]roachpb.SpanConfig, error) {
+	return r.underlying.GetAllSystemSpanConfigsThatApply(ctx, id)
 }
 
 // WithTxn is part of the KVAccessor interface.
@@ -99,8 +111,8 @@ func (r *KVAccessorRecorder) Recording(clear bool) string {
 		if mi.batchIdx != mj.batchIdx { // sort by batch/ts order
 			return mi.batchIdx < mj.batchIdx
 		}
-		if !mi.update.Span.Key.Equal(mj.update.Span.Key) { // sort by key order
-			return mi.update.Span.Key.Compare(mj.update.Span.Key) < 0
+		if !mi.update.GetTarget().Equal(mj.update.GetTarget()) { // sort by target order
+			return mi.update.GetTarget().Less(mj.update.GetTarget())
 		}
 
 		return mi.update.Deletion() // sort deletes before upserts
@@ -112,10 +124,18 @@ func (r *KVAccessorRecorder) Recording(clear bool) string {
 	var output strings.Builder
 	for _, m := range r.mu.mutations {
 		if m.update.Deletion() {
-			output.WriteString(fmt.Sprintf("delete %s\n", m.update.Span))
+			output.WriteString(fmt.Sprintf("delete %s\n", m.update.GetTarget()))
 		} else {
-			output.WriteString(fmt.Sprintf("upsert %-35s %s\n", m.update.Span,
-				PrintSpanConfigDiffedAgainstDefaults(m.update.Config)))
+			switch {
+			case m.update.GetTarget().IsSpanTarget():
+				output.WriteString(fmt.Sprintf("upsert %-35s %s\n", m.update.GetTarget(),
+					PrintSpanConfigDiffedAgainstDefaults(m.update.GetConfig())))
+			case m.update.GetTarget().IsSystemTarget():
+				output.WriteString(fmt.Sprintf("upsert %-35s %s\n", m.update.GetTarget(),
+					PrintSystemSpanConfigDiffedAgainstDefault(m.update.GetConfig())))
+			default:
+				panic("unsupported target type")
+			}
 		}
 	}
 
@@ -125,18 +145,4 @@ func (r *KVAccessorRecorder) Recording(clear bool) string {
 	}
 
 	return output.String()
-}
-
-// GetSystemSpanConfigEntries is part of the spanconfig.KVAccessor interface.
-func (r *KVAccessorRecorder) GetSystemSpanConfigEntries(
-	context.Context,
-) ([]roachpb.SystemSpanConfigEntry, error) {
-	panic("unimplemented")
-}
-
-// UpdateSystemSpanConfigEntries is part of the spanconfig.KVAccessor interface.
-func (r *KVAccessorRecorder) UpdateSystemSpanConfigEntries(
-	context.Context, []roachpb.SystemSpanConfigTarget, []roachpb.SystemSpanConfigEntry,
-) error {
-	panic("unimplemented")
 }

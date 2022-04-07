@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 )
 
 // distRestore plans a 2 stage distSQL flow for a distributed restore. It
@@ -41,6 +40,7 @@ import (
 func distRestore(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
+	jobID int64,
 	chunks [][]execinfrapb.RestoreSpanEntry,
 	pkIDs map[uint64]bool,
 	encryption *jobspb.BackupEncryptionOptions,
@@ -49,7 +49,6 @@ func distRestore(
 	restoreTime hlc.Timestamp,
 	progCh chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
 ) error {
-	ctx = logtags.AddTag(ctx, "restore-distsql", nil)
 	defer close(progCh)
 	var noTxn *kv.Txn
 
@@ -89,11 +88,13 @@ func distRestore(
 	}
 
 	restoreDataSpec := execinfrapb.RestoreDataSpec{
+		JobID:        jobID,
 		RestoreTime:  restoreTime,
 		Encryption:   fileEncryption,
 		TableRekeys:  tableRekeys,
 		TenantRekeys: tenantRekeys,
 		PKIDs:        pkIDs,
+		Validation:   jobspb.RestoreValidation_DefaultRestore,
 	}
 
 	if len(splitAndScatterSpecs) == 0 {
@@ -258,6 +259,7 @@ func makeSplitAndScatterSpecs(
 				}},
 				TableRekeys:  tableRekeys,
 				TenantRekeys: tenantRekeys,
+				Validation:   jobspb.RestoreValidation_DefaultRestore,
 			}
 		}
 	}

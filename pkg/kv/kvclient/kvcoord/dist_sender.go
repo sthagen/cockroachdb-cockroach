@@ -139,6 +139,30 @@ errors as 'roachpb.InternalErrType'.
 		Measurement: "Errors",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDistSenderRangefeedTotalRanges = metric.Metadata{
+		Name: "distsender.rangefeed.total_ranges",
+		Help: `Number of ranges executing rangefeed
+
+This counts the number of ranges with an active rangefeed.
+`,
+		Measurement: "Ranges",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderRangefeedCatchupRanges = metric.Metadata{
+		Name: "distsender.rangefeed.catchup_ranges",
+		Help: `Number of ranges in catchup mode
+
+This counts the number of ranges with an active rangefeed that are performing catchup scan.
+`,
+		Measurement: "Ranges",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderRangefeedErrorCatchupRanges = metric.Metadata{
+		Name:        "distsender.rangefeed.error_catchup_ranges",
+		Help:        `Number of ranges in catchup mode which experienced an error`,
+		Measurement: "Ranges",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // CanSendToFollower is used by the DistSender to determine if it needs to look
@@ -202,6 +226,9 @@ type DistSenderMetrics struct {
 	InLeaseTransferBackoffs *metric.Counter
 	RangeLookups            *metric.Counter
 	SlowRPCs                *metric.Gauge
+	RangefeedRanges         *metric.Gauge
+	RangefeedCatchupRanges  *metric.Gauge
+	RangefeedErrorCatchup   *metric.Counter
 	MethodCounts            [roachpb.NumMethods]*metric.Counter
 	ErrCounts               [roachpb.NumErrors]*metric.Counter
 }
@@ -219,6 +246,9 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		InLeaseTransferBackoffs: metric.NewCounter(metaDistSenderInLeaseTransferBackoffsCount),
 		RangeLookups:            metric.NewCounter(metaDistSenderRangeLookups),
 		SlowRPCs:                metric.NewGauge(metaDistSenderSlowRPCs),
+		RangefeedRanges:         metric.NewGauge(metaDistSenderRangefeedTotalRanges),
+		RangefeedCatchupRanges:  metric.NewGauge(metaDistSenderRangefeedCatchupRanges),
+		RangefeedErrorCatchup:   metric.NewCounter(metaDistSenderRangefeedErrorCatchupRanges),
 	}
 	for i := range m.MethodCounts {
 		method := roachpb.Method(i).String()
@@ -279,13 +309,14 @@ type DistSender struct {
 	firstRangeProvider FirstRangeProvider
 	transportFactory   TransportFactory
 	rpcContext         *rpc.Context
-	nodeDialer         *nodedialer.Dialer
-	rpcRetryOptions    retry.Options
-	asyncSenderSem     *quotapool.IntPool
-	// clusterID is used to verify access to enterprise features.
+	// nodeDialer allows RPC calls from the SQL layer to the KV layer.
+	nodeDialer      *nodedialer.Dialer
+	rpcRetryOptions retry.Options
+	asyncSenderSem  *quotapool.IntPool
+	// clusterID is the logical cluster ID used to verify access to enterprise features.
 	// It is copied out of the rpcContext at construction time and used in
 	// testing.
-	clusterID *base.ClusterIDContainer
+	logicalClusterID *base.ClusterIDContainer
 
 	// batchInterceptor is set for tenants; when set, information about all
 	// BatchRequests and BatchResponses are passed through this interceptor, which
@@ -334,7 +365,8 @@ type DistSenderConfig struct {
 	nodeDescriptor  *roachpb.NodeDescriptor
 	RPCRetryOptions *retry.Options
 	RPCContext      *rpc.Context
-	NodeDialer      *nodedialer.Dialer
+	// NodeDialer is the dialer from the SQL layer to the KV layer.
+	NodeDialer *nodedialer.Dialer
 
 	// One of the following two must be provided, but not both.
 	//
@@ -420,7 +452,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	if ds.rpcRetryOptions.Closer == nil {
 		ds.rpcRetryOptions.Closer = ds.rpcContext.Stopper.ShouldQuiesce()
 	}
-	ds.clusterID = cfg.RPCContext.ClusterID
+	ds.logicalClusterID = cfg.RPCContext.LogicalClusterID
 	ds.asyncSenderSem = quotapool.NewIntPool("DistSender async concurrency",
 		uint64(senderConcurrencyLimit.Get(&cfg.Settings.SV)))
 	senderConcurrencyLimit.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
@@ -607,7 +639,7 @@ func (ds *DistSender) getRoutingInfo(
 		}
 		if !containsFn(returnToken.Desc(), descKey) {
 			log.Fatalf(ctx, "programming error: range resolution returning non-matching descriptor: "+
-				"desc: %s, key: %s, reverse: %t", returnToken.Desc(), descKey, log.Safe(useReverseScan))
+				"desc: %s, key: %s, reverse: %t", returnToken.Desc(), descKey, redact.Safe(useReverseScan))
 		}
 	}
 
@@ -643,7 +675,8 @@ func (ds *DistSender) initAndVerifyBatch(
 			inner := req.GetInner()
 			switch inner.(type) {
 			case *roachpb.ScanRequest, *roachpb.ResolveIntentRangeRequest,
-				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest, *roachpb.ExportRequest:
+				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest,
+				*roachpb.ExportRequest, *roachpb.QueryLocksRequest:
 				// Accepted forward range requests.
 				if isReverse {
 					return roachpb.NewErrorf("batch with limit contains both forward and reverse scans")
@@ -762,7 +795,7 @@ func (ds *DistSender) Send(
 		// We already verified above that the batch contains only scan requests of the same type.
 		// Such a batch should never need splitting.
 		log.Fatalf(ctx, "batch with MaxSpanRequestKeys=%d, TargetBytes=%d needs splitting",
-			log.Safe(ba.MaxSpanRequestKeys), log.Safe(ba.TargetBytes))
+			redact.Safe(ba.MaxSpanRequestKeys), redact.Safe(ba.TargetBytes))
 	}
 	var singleRplChunk [1]*roachpb.BatchResponse
 	rplChunks := singleRplChunk[:0:1]
@@ -1187,7 +1220,13 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	// turning single-range queries into multi-range queries for no good
 	// reason.
 	if ba.IsUnsplittable() {
-		mismatch := roachpb.NewRangeKeyMismatchError(ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), ri.Desc(), nil /* lease */)
+		mismatch := roachpb.NewRangeKeyMismatchErrorWithCTPolicy(ctx,
+			rs.Key.AsRawKey(),
+			rs.EndKey.AsRawKey(),
+			ri.Desc(),
+			nil, /* lease */
+			ri.ClosedTimestampPolicy(),
+		)
 		return nil, roachpb.NewError(mismatch)
 	}
 	// If there's no transaction and ba spans ranges, possibly re-run as part of
@@ -1886,7 +1925,7 @@ func (ds *DistSender) sendToReplicas(
 	// If this request can be sent to a follower to perform a consistent follower
 	// read under the closed timestamp, promote its routing policy to NEAREST.
 	if ba.RoutingPolicy == roachpb.RoutingPolicy_LEASEHOLDER &&
-		CanSendToFollower(ds.clusterID.Get(), ds.st, ds.clock, routing.ClosedTimestampPolicy(), ba) {
+		CanSendToFollower(ds.logicalClusterID.Get(), ds.st, ds.clock, routing.ClosedTimestampPolicy(), ba) {
 		ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
 	}
 
@@ -2146,10 +2185,10 @@ func (ds *DistSender) sendToReplicas(
 
 					var updatedLeaseholder bool
 					if tErr.Lease != nil {
-						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease, tErr.DescriptorGeneration)
+						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease, tErr.RangeDesc.Generation)
 					} else if tErr.LeaseHolder != nil {
 						// tErr.LeaseHolder might be set when tErr.Lease isn't.
-						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder, tErr.DescriptorGeneration)
+						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder, tErr.RangeDesc.Generation)
 						updatedLeaseholder = true
 					}
 					// Move the new leaseholder to the head of the queue for the next
@@ -2204,16 +2243,18 @@ func (ds *DistSender) sendToReplicas(
 
 		// Has the caller given up?
 		if ctx.Err() != nil {
-			reportedErr := errors.Wrap(ctx.Err(), "context done during DistSender.Send")
-			log.Eventf(ctx, "%v", reportedErr)
-			if ambiguousError != nil {
-				return nil, roachpb.NewAmbiguousResultErrorf(reportedErr.Error())
-			}
 			// Don't consider this a sendError, because sendErrors indicate that we
 			// were unable to reach a replica that could serve the request, and they
 			// cause range cache evictions. Context cancellations just mean the
 			// sender changed its mind or the request timed out.
-			return nil, errors.Wrap(ctx.Err(), "aborted during DistSender.Send")
+
+			if ambiguousError != nil {
+				err = roachpb.NewAmbiguousResultError(errors.Wrapf(ambiguousError, "context done during DistSender.Send"))
+			} else {
+				err = errors.Wrap(ctx.Err(), "aborted during DistSender.Send")
+			}
+			log.Eventf(ctx, "%v", err)
+			return nil, err
 		}
 	}
 }
@@ -2285,6 +2326,11 @@ type sendError struct {
 // newSendError creates a sendError.
 func newSendError(msg string) error {
 	return sendError{message: msg}
+}
+
+// TestNewSendError creates a new sendError for the purpose of unit tests
+func TestNewSendError(msg string) error {
+	return newSendError(msg)
 }
 
 func (s sendError) Error() string {

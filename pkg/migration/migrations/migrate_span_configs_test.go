@@ -13,21 +13,126 @@ package migrations_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqlwatcher"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
+
+// TestMixedVersionClusterEnableRangefeeds tests that clusters that haven't
+// migrated into the span configs still support rangefeeds over system table
+// ranges.
+func TestMixedVersionClusterEnableRangefeeds(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+					BinaryVersionOverride: clusterversion.ByKey(
+						clusterversion.EnsureSpanConfigReconciliation - 1,
+					),
+				},
+				SpanConfig: &spanconfig.TestingKnobs{
+					ManagerDisableJobCreation: true,
+				},
+			},
+		},
+	})
+
+	defer tc.Stopper().Stop(ctx)
+	ts := tc.Server(0)
+
+	// We spin up a SQL watcher, which makes use of range feeds internally over
+	// system tables. By observing SQL descriptor updates through the watcher, we
+	// know that the rangefeeds are enabled.
+	noopCheckpointDuration := 100 * time.Millisecond
+	sqlWatcher := spanconfigsqlwatcher.New(
+		keys.SystemSQLCodec,
+		ts.ClusterSettings(),
+		ts.RangeFeedFactory().(*rangefeed.Factory),
+		1<<20, /* 1 MB, bufferMemLimit */
+		ts.Stopper(),
+		noopCheckpointDuration,
+		nil, /* knobs */
+	)
+
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0 /* idx */))
+	beforeStmtTS := ts.Clock().Now()
+	tdb.Exec(t, "CREATE TABLE t()")
+	afterStmtTS := ts.Clock().Now()
+	var expDescID descpb.ID
+	row := tdb.QueryRow(t, `SELECT id FROM system.namespace WHERE name='t'`)
+	row.Scan(&expDescID)
+
+	var wg sync.WaitGroup
+	mu := struct {
+		syncutil.Mutex
+		lastCheckpoint hlc.Timestamp
+	}{}
+
+	watch := func(ctx context.Context, onCheckpoint func(hlc.Timestamp)) {
+		defer wg.Done()
+
+		receivedIDs := make(map[descpb.ID]struct{})
+		err := sqlWatcher.WatchForSQLUpdates(ctx, beforeStmtTS,
+			func(_ context.Context, updates []spanconfig.SQLUpdate, checkpointTS hlc.Timestamp) error {
+				onCheckpoint(checkpointTS)
+
+				for _, update := range updates {
+					receivedIDs[update.GetDescriptorUpdate().ID] = struct{}{}
+				}
+				return nil
+			})
+		require.True(t, testutils.IsError(err, "context canceled"))
+		require.Equal(t, 1, len(receivedIDs))
+		_, seen := receivedIDs[expDescID]
+		require.True(t, seen)
+	}
+
+	watcherCtx, watcherCancel := context.WithCancel(ctx)
+	wg.Add(1)
+	go watch(watcherCtx, func(ts hlc.Timestamp) {
+		mu.Lock()
+		mu.lastCheckpoint = ts
+		mu.Unlock()
+	})
+
+	testutils.SucceedsSoon(t, func() error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if mu.lastCheckpoint.Less(afterStmtTS) {
+			return errors.New("w1 checkpoint precedes statement timestamp")
+		}
+		return nil
+	})
+
+	watcherCancel()
+	wg.Wait()
+}
 
 // TestEnsureSpanConfigReconciliation verifies that the migration waits for a
 // span config reconciliation attempt, blocking until it occurs.
@@ -42,7 +147,7 @@ func TestEnsureSpanConfigReconciliation(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride: clusterversion.ByKey(
 						clusterversion.EnsureSpanConfigReconciliation - 1,
 					),
@@ -65,12 +170,13 @@ func TestEnsureSpanConfigReconciliation(t *testing.T) {
 	tdb.Exec(t, `SET CLUSTER SETTING spanconfig.reconciliation_job.enabled = true`)
 	tdb.Exec(t, `SET CLUSTER SETTING spanconfig.reconciliation_job.checkpoint_interval = '100ms'`)
 
-	{ // Ensure that no span config entries are found.
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{
-			keys.EverythingSpan,
-		})
+	{ // Ensure that no span config records are found.
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx,
+			spanconfig.TestingEntireSpanConfigurationStateTargets(),
+		)
 		require.NoError(t, err)
-		require.Empty(t, entries)
+		require.Empty(t, records)
 	}
 
 	// Ensure that upgrade attempts without having reconciled simply fail.
@@ -88,14 +194,17 @@ func TestEnsureSpanConfigReconciliation(t *testing.T) {
 	require.False(t, scReconciler.Checkpoint().IsEmpty())
 
 	{ // Ensure that the host tenant's span configs are installed.
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{
-			keys.EverythingSpan,
-		})
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx,
+			spanconfig.TestingEntireSpanConfigurationStateTargets(),
+		)
 		require.NoError(t, err)
-		require.NotEmpty(t, entries)
+		require.NotEmpty(t, records)
 	}
 }
 
+// TestEnsureSpanConfigReconciliationMultiNode verifies that the span config
+// reconciliation migration works in a multi-node setting.
 func TestEnsureSpanConfigReconciliationMultiNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -118,7 +227,7 @@ func TestEnsureSpanConfigReconciliationMultiNode(t *testing.T) {
 		serverArgs[i] = base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride: clusterversion.ByKey(
 						clusterversion.EnsureSpanConfigReconciliation - 1,
 					),
@@ -131,7 +240,7 @@ func TestEnsureSpanConfigReconciliationMultiNode(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride: clusterversion.ByKey(
 						clusterversion.EnsureSpanConfigReconciliation - 1,
 					),
@@ -150,12 +259,13 @@ func TestEnsureSpanConfigReconciliationMultiNode(t *testing.T) {
 	tdb.Exec(t, `SET CLUSTER SETTING spanconfig.reconciliation_job.enabled = true`)
 	tdb.Exec(t, `SET CLUSTER SETTING spanconfig.reconciliation_job.checkpoint_interval = '100ms'`)
 
-	{ // Ensure that no span config entries are to be found.
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{
-			keys.EverythingSpan,
-		})
+	{ // Ensure that no span config records are to be found.
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx,
+			spanconfig.TestingEntireSpanConfigurationStateTargets(),
+		)
 		require.NoError(t, err)
-		require.Empty(t, entries)
+		require.Empty(t, records)
 	}
 
 	// Ensure that upgrade attempts without having reconciled simply fail.
@@ -173,11 +283,12 @@ func TestEnsureSpanConfigReconciliationMultiNode(t *testing.T) {
 	require.False(t, scReconciler.Checkpoint().IsEmpty())
 
 	{ // Ensure that the host tenant's span configs are installed.
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{
-			keys.EverythingSpan,
-		})
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx,
+			spanconfig.TestingEntireSpanConfigurationStateTargets(),
+		)
 		require.NoError(t, err)
-		require.NotEmpty(t, entries)
+		require.NotEmpty(t, records)
 	}
 }
 
@@ -194,14 +305,14 @@ func TestEnsureSpanConfigSubscription(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride: clusterversion.ByKey(
 						clusterversion.EnsureSpanConfigSubscription - 1,
 					),
 				},
 				SpanConfig: &spanconfig.TestingKnobs{
-					KVSubscriberPostRangefeedStartInterceptor: func() {
-						<-blockSubscriberCh
+					KVSubscriberRangeFeedKnobs: &rangefeedcache.TestingKnobs{
+						PostRangeFeedStart: func() { <-blockSubscriberCh },
 					},
 				},
 			},
@@ -217,11 +328,12 @@ func TestEnsureSpanConfigSubscription(t *testing.T) {
 	tdb.Exec(t, `SET CLUSTER SETTING spanconfig.reconciliation_job.enabled = true`)
 
 	testutils.SucceedsSoon(t, func() error {
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{
-			keys.EverythingSpan,
-		})
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx,
+			spanconfig.TestingEntireSpanConfigurationStateTargets(),
+		)
 		require.NoError(t, err)
-		if len(entries) == 0 {
+		if len(records) == 0 {
 			return fmt.Errorf("empty global span configuration state")
 		}
 		return nil

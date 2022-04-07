@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -34,6 +33,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
+
+func newTestDiskMonitor(ctx context.Context, st *cluster.Settings) *mon.BytesMonitor {
+	diskMonitor := mon.NewMonitor(
+		"test-disk",
+		mon.DiskResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+		st,
+	)
+	diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	return diskMonitor
+}
 
 // Tests the de-duping functionality of DiskBackedNumberedRowContainer.
 func TestNumberedRowContainerDeDuping(t *testing.T) {
@@ -62,7 +75,7 @@ func TestNumberedRowContainerDeDuping(t *testing.T) {
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
+	diskMonitor := newTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	memoryBudget := math.MaxInt64
@@ -148,7 +161,7 @@ func TestNumberedRowContainerIteratorCaching(t *testing.T) {
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
+	diskMonitor := newTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	numRows := 200
@@ -187,9 +200,13 @@ func TestNumberedRowContainerIteratorCaching(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, i, idx)
 		}
-		// We want all the memory to be usable by the cache, so spill to disk.
-		require.NoError(t, rc.testingSpillToDisk(ctx))
-		require.True(t, rc.UsingDisk())
+		if !rc.UsingDisk() {
+			// We want all the memory to be usable by the cache, so spill to
+			// disk.
+			spilled, err := rc.SpillToDisk(ctx)
+			require.NoError(t, err)
+			require.True(t, spilled)
+		}
 		// Random access of the inserted rows.
 		var accesses [][]int
 		for i := 0; i < 2*numRows; i++ {
@@ -237,7 +254,7 @@ func TestCompareNumberedAndIndexedRowContainers(t *testing.T) {
 	}
 	defer tempEngine.Close()
 
-	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
+	diskMonitor := newTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	numRows := 200
@@ -356,7 +373,8 @@ func (d numberedContainerUsingNRC) getRow(
 	return d.rc.GetRow(ctx, idx, false)
 }
 func (d numberedContainerUsingNRC) spillToDisk(ctx context.Context) error {
-	return d.rc.testingSpillToDisk(ctx)
+	_, err := d.rc.SpillToDisk(ctx)
+	return err
 }
 func (d numberedContainerUsingNRC) unsafeReset(ctx context.Context) error {
 	return d.rc.UnsafeReset(ctx)
@@ -376,9 +394,9 @@ func makeNumberedContainerUsingNRC(
 	diskMonitor *mon.BytesMonitor,
 ) numberedContainerUsingNRC {
 	memoryMonitor := makeMemMonitorAndStart(ctx, st, memoryBudget)
-	rc := NewDiskBackedNumberedRowContainer(
-		false /* deDup */, types, evalCtx, engine, memoryMonitor, diskMonitor)
-	require.NoError(t, rc.testingSpillToDisk(ctx))
+	rc := NewDiskBackedNumberedRowContainer(false /* deDup */, types, evalCtx, engine, memoryMonitor, diskMonitor)
+	_, err := rc.SpillToDisk(ctx)
+	require.NoError(t, err)
 	return numberedContainerUsingNRC{rc: rc, memoryMonitor: memoryMonitor}
 }
 
@@ -546,7 +564,7 @@ func BenchmarkNumberedContainerIteratorCaching(b *testing.B) {
 	}
 	defer tempEngine.Close()
 
-	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
+	diskMonitor := newTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	// Each row is 10 string columns. Each string has a mean length of 5, and the

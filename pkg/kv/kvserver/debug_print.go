@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -52,7 +53,7 @@ func SprintEngineKey(key storage.EngineKey) string {
 
 // SprintMVCCKey pretty-prints the specified MVCCKey.
 func SprintMVCCKey(key storage.MVCCKey) string {
-	return fmt.Sprintf("%s %s (%#x): ", key.Timestamp, key.Key, storage.EncodeKey(key))
+	return fmt.Sprintf("%s %s (%#x): ", key.Timestamp, key.Key, storage.EncodeMVCCKey(key))
 }
 
 // SprintEngineKeyValue is like PrintEngineKeyValue, but returns a string.  In
@@ -216,7 +217,7 @@ func tryRaftLogEntry(kv storage.MVCCKeyValue) (string, error) {
 		if len(ent.Data) == 0 {
 			return fmt.Sprintf("%s: EMPTY\n", &ent), nil
 		}
-		_, cmdData := DecodeRaftCommand(ent.Data)
+		_, cmdData := kvserverbase.DecodeRaftCommand(ent.Data)
 		if err := protoutil.Unmarshal(cmdData, &cmd); err != nil {
 			return "", err
 		}
@@ -236,7 +237,7 @@ func tryRaftLogEntry(kv storage.MVCCKeyValue) (string, error) {
 			c = cc
 		}
 
-		var ctx ConfChangeContext
+		var ctx kvserverpb.ConfChangeContext
 		if err := protoutil.Unmarshal(c.AsV2().Context, &ctx); err != nil {
 			return "", err
 		}

@@ -48,6 +48,13 @@ var MustExist ConfigOption = func(cfg *engineConfig) error {
 	return nil
 }
 
+// DisableAutomaticCompactions configures an engine to be opened with disabled
+// automatic compactions. Used primarily for debugCompactCmd.
+var DisableAutomaticCompactions ConfigOption = func(cfg *engineConfig) error {
+	cfg.Opts.DisableAutomaticCompactions = true
+	return nil
+}
+
 // ForTesting configures the engine for use in testing. It may randomize some
 // config options to improve test coverage.
 var ForTesting ConfigOption = func(cfg *engineConfig) error {
@@ -195,5 +202,18 @@ func Open(ctx context.Context, loc Location, opts ...ConfigOption) (*Pebble, err
 	if cfg.Settings == nil {
 		cfg.Settings = cluster.MakeClusterSettings()
 	}
-	return NewPebble(ctx, cfg.PebbleConfig)
+	p, err := NewPebble(ctx, cfg.PebbleConfig)
+	if err != nil {
+		return nil, err
+	}
+	// Set the active cluster version, ensuring the engine's format
+	// major version is ratcheted sufficiently high to match the
+	// settings cluster version.
+	if v := p.settings.Version.ActiveVersionOrEmpty(ctx).Version; v != (roachpb.Version{}) {
+		if err := p.SetMinVersion(v); err != nil {
+			p.Close()
+			return nil, err
+		}
+	}
+	return p, nil
 }

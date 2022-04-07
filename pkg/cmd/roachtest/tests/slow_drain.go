@@ -12,7 +12,6 @@ package tests
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"regexp"
 	"time"
@@ -27,7 +26,7 @@ import (
 
 func registerSlowDrain(r registry.Registry) {
 	numNodes := 6
-	duration := 30 * time.Minute
+	duration := time.Minute
 
 	r.Add(registry.TestSpec{
 		Name:    fmt.Sprintf("slow-drain/duration=%s", duration),
@@ -55,7 +54,6 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 	require.NoError(t, err)
 
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
-	c.Run(ctx, c.Node(pinnedNodeID), `./cockroach workload init kv --drop --splits 1000`)
 
 	run := func(stmt string) {
 		db := c.Conn(ctx, t.L(), pinnedNodeID)
@@ -67,54 +65,31 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 		t.L().Printf("run: %s\n", stmt)
 	}
 
-	waitForReplication := func(db *gosql.DB) {
-		t.Status("waiting for initial up-replication")
-		for {
-			fullReplicated := false
+	{
+		db := c.Conn(ctx, t.L(), pinnedNodeID)
+		defer db.Close()
 
-			err = db.QueryRow(
-				// Check if all ranges are fully replicated.
-				"SELECT min(array_length(replicas, 1)) >= $1 FROM crdb_internal.ranges",
-				replicationFactor,
-			).Scan(&fullReplicated)
-			require.NoError(t, err)
+		// Set the replication factor.
+		run(fmt.Sprintf(`ALTER RANGE default CONFIGURE ZONE USING num_replicas=%d`, replicationFactor))
+		run(fmt.Sprintf(`ALTER DATABASE system CONFIGURE ZONE USING num_replicas=%d`, replicationFactor))
 
-			if fullReplicated {
-				break
-			}
-
-			time.Sleep(time.Second)
-		}
+		// Wait for initial up-replication.
+		err := WaitForReplication(ctx, t, db, replicationFactor)
+		require.NoError(t, err)
 	}
 
-	run(fmt.Sprintf(`ALTER RANGE default CONFIGURE ZONE USING num_replicas=%d`, replicationFactor))
-	run(fmt.Sprintf(`ALTER DATABASE system CONFIGURE ZONE USING num_replicas=%d`, replicationFactor))
-
-	db := c.Conn(ctx, t.L(), pinnedNodeID)
-	defer db.Close()
-
-	waitForReplication(db)
-
+	// Drain the last 5 nodes from the cluster, resulting in immovable leases on
+	// at least one of the nodes.
 	m := c.NewMonitor(ctx)
-	m.Go(func(ctx context.Context) error {
-		return c.RunE(ctx, c.Node(pinnedNodeID),
-			fmt.Sprintf("./cockroach workload run kv --max-rate 500 --tolerate-errors --duration=%s {pgurl:1-6}",
-				duration.String(),
-			),
-		)
-	},
-	)
-
-	// Let the workload run for a small amount of time.
-	time.Sleep(1 * time.Minute)
-
-	// Drain the last 5 nodes from the cluster, resulting in immovable leases on at least one of the nodes.
 	for nodeID := 2; nodeID <= numNodes; nodeID++ {
 		id := nodeID
 		m.Go(func(ctx context.Context) error {
 			drain := func(id int) error {
 				t.Status(fmt.Sprintf("draining node %d", id))
-				return c.RunE(ctx, c.Node(id), fmt.Sprintf("./cockroach node drain %d --insecure", id))
+				return c.RunE(ctx,
+					c.Node(id),
+					fmt.Sprintf("./cockroach node drain %d --insecure --drain-wait=%s", id, duration.String()),
+				)
 			}
 			return drain(id)
 		})
@@ -125,6 +100,7 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 
 	// Check for more verbose logging concerning lease transfer stalls.
 	// The extra logging should exist on the logs of at least one of the nodes.
+	t.Status("checking for stalling drain logging...")
 	found := false
 	for nodeID := 2; nodeID <= numNodes; nodeID++ {
 		if err := c.RunE(ctx, c.Node(nodeID),
@@ -134,8 +110,10 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 		}
 	}
 	require.True(t, found)
+	t.Status("log messages found")
 
-	// Expect a failed drain.
+	// Expect the drain timeout to expire.
+	t.Status("waiting for the drain timeout to elapse...")
 	err = m.WaitE()
 	require.Error(t, err)
 }

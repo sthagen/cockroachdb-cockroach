@@ -12,12 +12,10 @@ package kvserver
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -76,7 +74,7 @@ func (r *replicaRaftStorage) InitialState() (raftpb.HardState, raftpb.ConfState,
 // and this method will always return at least one entry even if it exceeds
 // maxBytes. Sideloaded proposals count towards maxBytes with their payloads inlined.
 func (r *replicaRaftStorage) Entries(lo, hi, maxBytes uint64) ([]raftpb.Entry, error) {
-	readonly := r.store.Engine().NewReadOnly()
+	readonly := r.store.Engine().NewReadOnly(storage.StandardDurability)
 	defer readonly.Close()
 	ctx := r.AnnotateCtx(context.TODO())
 	if r.raftMu.sideloaded == nil {
@@ -282,7 +280,7 @@ func (r *replicaRaftStorage) Term(i uint64) (uint64, error) {
 	if e, ok := r.store.raftEntryCache.Get(r.RangeID, i); ok {
 		return e.Term, nil
 	}
-	readonly := r.store.Engine().NewReadOnly()
+	readonly := r.store.Engine().NewReadOnly(storage.StandardDurability)
 	defer readonly.Close()
 	ctx := r.AnnotateCtx(context.TODO())
 	return term(ctx, r.mu.stateLoader, readonly, r.RangeID, r.store.raftEntryCache, i)
@@ -386,6 +384,15 @@ func (r *Replica) GetLeaseAppliedIndex() uint64 {
 // r.mu is held. Note that the returned snapshot is a placeholder and
 // does not contain any of the replica data. The snapshot is actually generated
 // (and sent) by the Raft snapshot queue.
+//
+// More specifically, this method is called by etcd/raft in
+// (*raftLog).snapshot. Raft expects that it generates the snapshot (by
+// calling Snapshot) and that "sending" the result actually sends the
+// snapshot. In CockroachDB, that message is intercepted (at the sender) and
+// instead we add the replica (the raft leader) to the raft snapshot queue,
+// and when its turn comes we look at the raft state for followers that want a
+// snapshot, and then send one. That actual sending path does not call this
+// Snapshot method.
 func (r *replicaRaftStorage) Snapshot() (raftpb.Snapshot, error) {
 	r.mu.AssertHeld()
 	appliedIndex := r.mu.state.RaftAppliedIndex
@@ -410,7 +417,7 @@ func (r *Replica) raftSnapshotLocked() (raftpb.Snapshot, error) {
 // replica. If this method returns without error, callers must eventually call
 // OutgoingSnapshot.Close.
 func (r *Replica) GetSnapshot(
-	ctx context.Context, snapType SnapshotRequest_Type, recipientStore roachpb.StoreID,
+	ctx context.Context, snapType kvserverpb.SnapshotRequest_Type, recipientStore roachpb.StoreID,
 ) (_ *OutgoingSnapshot, err error) {
 	snapUUID := uuid.MakeV4()
 	// Get a snapshot while holding raftMu to make sure we're not seeing "half
@@ -418,11 +425,27 @@ func (r *Replica) GetSnapshot(
 	// the corresponding Raft command not applied yet).
 	r.raftMu.Lock()
 	snap := r.store.engine.NewSnapshot()
-	r.mu.Lock()
-	appliedIndex := r.mu.state.RaftAppliedIndex
-	// Cleared when OutgoingSnapshot closes.
-	r.addSnapshotLogTruncationConstraintLocked(ctx, snapUUID, appliedIndex, recipientStore)
-	r.mu.Unlock()
+	{
+		r.mu.Lock()
+		// We will fetch the applied index later again, from snap. The
+		// appliedIndex fetched here is narrowly used for adding a log truncation
+		// constraint to prevent log entries > appliedIndex from being removed.
+		// Note that the appliedIndex maintained in Replica actually lags the one
+		// in the engine, since replicaAppBatch.ApplyToStateMachine commits the
+		// engine batch and then acquires Replica.mu to update
+		// Replica.mu.state.RaftAppliedIndex. The use of a possibly stale value
+		// here is harmless since using a lower index in this constraint, than the
+		// actual snapshot index, preserves more from a log truncation
+		// perspective.
+		//
+		// TODO(sumeer): despite the above justification, this is unnecessarily
+		// complicated. Consider loading the RaftAppliedIndex from the snap for
+		// this use case.
+		appliedIndex := r.mu.state.RaftAppliedIndex
+		// Cleared when OutgoingSnapshot closes.
+		r.addSnapshotLogTruncationConstraintLocked(ctx, snapUUID, appliedIndex, recipientStore)
+		r.mu.Unlock()
+	}
 	r.raftMu.Unlock()
 
 	release := func() {
@@ -489,7 +512,7 @@ type OutgoingSnapshot struct {
 	// sideloaded storage in the meantime.
 	WithSideloaded func(func(SideloadStorage) error) error
 	RaftEntryCache *raftentry.Cache
-	snapType       SnapshotRequest_Type
+	snapType       kvserverpb.SnapshotRequest_Type
 	onClose        func()
 }
 
@@ -521,7 +544,7 @@ type IncomingSnapshot struct {
 	// The descriptor in the snapshot, never nil.
 	Desc             *roachpb.RangeDescriptor
 	DataSize         int64
-	snapType         SnapshotRequest_Type
+	snapType         kvserverpb.SnapshotRequest_Type
 	placeholder      *ReplicaPlaceholder
 	raftAppliedIndex uint64 // logging only
 }
@@ -542,7 +565,7 @@ func snapshot(
 	ctx context.Context,
 	snapUUID uuid.UUID,
 	rsl stateloader.StateLoader,
-	snapType SnapshotRequest_Type,
+	snapType kvserverpb.SnapshotRequest_Type,
 	snap storage.Reader,
 	rangeID roachpb.RangeID,
 	eCache *raftentry.Cache,
@@ -568,6 +591,12 @@ func snapshot(
 	}
 
 	term, err := term(ctx, rsl, snap, rangeID, eCache, state.RaftAppliedIndex)
+	// If we've migrated to populating RaftAppliedIndexTerm, check that the term
+	// from the two sources are equal.
+	if state.RaftAppliedIndexTerm != 0 && term != state.RaftAppliedIndexTerm {
+		return OutgoingSnapshot{},
+			errors.AssertionFailedf("unequal terms %d != %d", term, state.RaftAppliedIndexTerm)
+	}
 	if err != nil {
 		return OutgoingSnapshot{}, errors.Wrapf(err, "failed to fetch term of %d", state.RaftAppliedIndex)
 	}
@@ -848,7 +877,9 @@ func (r *Replica) applySnapshot(
 	}(timeutil.Now())
 
 	unreplicatedSSTFile := &storage.MemFile{}
-	unreplicatedSST := storage.MakeIngestionSSTWriter(unreplicatedSSTFile)
+	unreplicatedSST := storage.MakeIngestionSSTWriter(
+		ctx, r.ClusterSettings(), unreplicatedSSTFile,
+	)
 	defer unreplicatedSST.Close()
 
 	// Clearing the unreplicated state.
@@ -862,6 +893,12 @@ func (r *Replica) applySnapshot(
 	// Update HardState.
 	if err := r.raftMu.stateLoader.SetHardState(ctx, &unreplicatedSST, hs); err != nil {
 		return errors.Wrapf(err, "unable to write HardState to unreplicated SST writer")
+	}
+	// We've cleared all the raft state above, so we are forced to write the
+	// RaftReplicaID again here.
+	if err := r.raftMu.stateLoader.SetRaftReplicaID(
+		ctx, &unreplicatedSST, r.replicaID); err != nil {
+		return errors.Wrapf(err, "unable to write RaftReplicaID to unreplicated SST writer")
 	}
 
 	// Update Raft entries.
@@ -920,6 +957,12 @@ func (r *Replica) applySnapshot(
 		log.Fatalf(ctx, "snapshot RaftAppliedIndex %d doesn't match its metadata index %d",
 			state.RaftAppliedIndex, nonemptySnap.Metadata.Index)
 	}
+	// If we've migrated to populating RaftAppliedIndexTerm, check that the term
+	// from the two sources are equal.
+	if state.RaftAppliedIndexTerm != 0 && state.RaftAppliedIndexTerm != nonemptySnap.Metadata.Term {
+		log.Fatalf(ctx, "snapshot RaftAppliedIndexTerm %d doesn't match its metadata term %d",
+			state.RaftAppliedIndexTerm, nonemptySnap.Metadata.Term)
+	}
 
 	// The on-disk state is now committed, but the corresponding in-memory state
 	// has not yet been updated. Any errors past this point must therefore be
@@ -975,6 +1018,11 @@ func (r *Replica) applySnapshot(
 	// feelings about this ever change, we can add a LastIndex field to
 	// raftpb.SnapshotMetadata.
 	r.mu.lastIndex = state.RaftAppliedIndex
+
+	// TODO(sumeer): We should be able to set this to
+	// nonemptySnap.Metadata.Term. See
+	// https://github.com/cockroachdb/cockroach/pull/75675#pullrequestreview-867926687
+	// for a discussion regarding this.
 	r.mu.lastTerm = invalidLastTerm
 	r.mu.raftLogSize = 0
 	// Update the store stats for the data in the snapshot.
@@ -1000,7 +1048,7 @@ func (r *Replica) applySnapshot(
 	// we missed the application of a merge) and we are the new leaseholder, we
 	// make sure to update the timestamp cache using the prior read summary to
 	// account for any reads that were served on the right-hand side range(s).
-	if len(subsumedRepls) > 0 && state.Lease.Replica.ReplicaID == r.mu.replicaID && prioReadSum != nil {
+	if len(subsumedRepls) > 0 && state.Lease.Replica.ReplicaID == r.replicaID && prioReadSum != nil {
 		applyReadSummaryToTimestampCache(r.store.tsCache, r.descRLocked(), *prioReadSum)
 	}
 
@@ -1065,7 +1113,9 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 
 		// We have to create an SST for the subsumed replica's range-id local keys.
 		subsumedReplSSTFile := &storage.MemFile{}
-		subsumedReplSST := storage.MakeIngestionSSTWriter(subsumedReplSSTFile)
+		subsumedReplSST := storage.MakeIngestionSSTWriter(
+			ctx, r.ClusterSettings(), subsumedReplSSTFile,
+		)
 		defer subsumedReplSST.Close()
 		// NOTE: We set mustClearRange to true because we are setting
 		// RangeTombstoneKey. Since Clears and Puts need to be done in increasing
@@ -1121,7 +1171,9 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 	for i := range keyRanges {
 		if totalKeyRanges[i].End.Compare(keyRanges[i].End) > 0 {
 			subsumedReplSSTFile := &storage.MemFile{}
-			subsumedReplSST := storage.MakeIngestionSSTWriter(subsumedReplSSTFile)
+			subsumedReplSST := storage.MakeIngestionSSTWriter(
+				ctx, r.ClusterSettings(), subsumedReplSSTFile,
+			)
 			defer subsumedReplSST.Close()
 			if err := storage.ClearRangeWithHeuristic(
 				r.store.Engine(),
@@ -1188,67 +1240,4 @@ func (r *Replica) clearSubsumedReplicaInMemoryData(
 		}
 	}
 	return phs, nil
-}
-
-type raftCommandEncodingVersion byte
-
-// Raft commands are encoded with a 1-byte version (currently 0 or 1), an 8-byte
-// ID, followed by the payload. This inflexible encoding is used so we can
-// efficiently parse the command id while processing the logs.
-//
-// TODO(bdarnell): is this commandID still appropriate for our needs?
-const (
-	// The initial Raft command version, used for all regular Raft traffic.
-	raftVersionStandard raftCommandEncodingVersion = 0
-	// A proposal containing an SSTable which preferably should be sideloaded
-	// (i.e. not stored in the Raft log wholesale). Can be treated as a regular
-	// proposal when arriving on the wire, but when retrieved from the local
-	// Raft log it necessary to inline the payload first as it has usually
-	// been sideloaded.
-	raftVersionSideloaded raftCommandEncodingVersion = 1
-	// The prescribed length for each command ID.
-	raftCommandIDLen = 8
-	// The prescribed length of each encoded command's prefix.
-	raftCommandPrefixLen = 1 + raftCommandIDLen
-	// The no-split bit is now unused, but we still apply the mask to the first
-	// byte of the command for backward compatibility.
-	//
-	// TODO(tschottdorf): predates v1.0 by a significant margin. Remove.
-	raftCommandNoSplitBit  = 1 << 7
-	raftCommandNoSplitMask = raftCommandNoSplitBit - 1
-)
-
-func encodeRaftCommand(
-	version raftCommandEncodingVersion, commandID kvserverbase.CmdIDKey, command []byte,
-) []byte {
-	b := make([]byte, raftCommandPrefixLen+len(command))
-	encodeRaftCommandPrefix(b[:raftCommandPrefixLen], version, commandID)
-	copy(b[raftCommandPrefixLen:], command)
-	return b
-}
-
-func encodeRaftCommandPrefix(
-	b []byte, version raftCommandEncodingVersion, commandID kvserverbase.CmdIDKey,
-) {
-	if len(commandID) != raftCommandIDLen {
-		panic(fmt.Sprintf("invalid command ID length; %d != %d", len(commandID), raftCommandIDLen))
-	}
-	if len(b) != raftCommandPrefixLen {
-		panic(fmt.Sprintf("invalid command prefix length; %d != %d", len(b), raftCommandPrefixLen))
-	}
-	b[0] = byte(version)
-	copy(b[1:], []byte(commandID))
-}
-
-// DecodeRaftCommand splits a raftpb.Entry.Data into its commandID and
-// command portions. The caller is responsible for checking that the data
-// is not empty (which indicates a dummy entry generated by raft rather
-// than a real command). Usage is mostly internal to the storage package
-// but is exported for use by debugging tools.
-func DecodeRaftCommand(data []byte) (kvserverbase.CmdIDKey, []byte) {
-	v := raftCommandEncodingVersion(data[0] & raftCommandNoSplitMask)
-	if v != raftVersionStandard && v != raftVersionSideloaded {
-		panic(fmt.Sprintf("unknown command encoding version %v", data[0]))
-	}
-	return kvserverbase.CmdIDKey(data[1 : 1+raftCommandIDLen]), data[1+raftCommandIDLen:]
 }

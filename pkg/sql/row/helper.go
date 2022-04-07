@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -48,7 +48,7 @@ var maxRowSizeLog = settings.RegisterByteSizeSetting(
 	"maximum size of row (or column family if multiple column families are in use) that SQL can "+
 		"write to the database, above which an event is logged to SQL_PERF (or SQL_INTERNAL_PERF "+
 		"if the mutating statement was internal); use 0 to disable",
-	kvserver.MaxCommandSizeDefault,
+	kvserverbase.MaxCommandSizeDefault,
 	func(size int64) error {
 		if size != 0 && size < maxRowSizeFloor {
 			return errors.Newf(
@@ -177,8 +177,13 @@ func (rh *rowHelper) encodePrimaryIndex(
 			rh.Codec, rh.TableDesc.GetID(), rh.TableDesc.GetPrimaryIndexID(),
 		)
 	}
-	primaryIndexKey, _, err = rowenc.EncodeIndexKey(
-		rh.TableDesc, rh.TableDesc.GetPrimaryIndex(), colIDtoRowIndex, values, rh.primaryIndexKeyPrefix)
+	idx := rh.TableDesc.GetPrimaryIndex()
+	primaryIndexKey, containsNull, err := rowenc.EncodeIndexKey(
+		rh.TableDesc, idx, colIDtoRowIndex, values, rh.primaryIndexKeyPrefix,
+	)
+	if containsNull {
+		return nil, rowenc.MakeNullPKError(rh.TableDesc, idx, colIDtoRowIndex, values)
+	}
 	return primaryIndexKey, err
 }
 

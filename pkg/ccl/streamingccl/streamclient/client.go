@@ -74,6 +74,9 @@ type Client interface {
 
 	// Close releases all the resources used by this client.
 	Close() error
+
+	// Complete completes a replication stream consumption.
+	Complete(ctx context.Context, streamID streaming.StreamID) error
 }
 
 // Topology is a configuration of stream partitions. These are particular to a
@@ -113,8 +116,7 @@ type Subscription interface {
 	Err() error
 }
 
-// NewStreamClient creates a new stream client based on the stream
-// address.
+// NewStreamClient creates a new stream client based on the stream address.
 func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
 	var streamClient Client
 	streamURL, err := streamAddress.URL()
@@ -126,7 +128,7 @@ func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
 	case "postgres", "postgresql":
 		// The canonical PostgreSQL URL scheme is "postgresql", however our
 		// own client commands also accept "postgres".
-		return newPGWireReplicationClient(streamURL)
+		return newPartitionedStreamClient(streamURL)
 	case RandomGenScheme:
 		streamClient, err = newRandomStreamClient(streamURL)
 		if err != nil {

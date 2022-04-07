@@ -46,23 +46,29 @@ func (r *Replica) executeReadOnlyBatch(
 
 	// Compute the transaction's local uncertainty limit using observed
 	// timestamps, which can help avoid uncertainty restarts.
-	ui := uncertainty.ComputeInterval(ba.Txn, st)
+	ui := uncertainty.ComputeInterval(&ba.Header, st, r.Clock().MaxOffset())
 
 	// Evaluate read-only batch command.
-	spans := g.LatchSpans()
-	rec := NewReplicaEvalContext(r, spans)
+	rec := NewReplicaEvalContext(ctx, r, g.LatchSpans(), ba.RequiresClosedTSOlderThanStorageSnapshot())
+	defer rec.Release()
 
 	// TODO(irfansharif): It's unfortunate that in this read-only code path,
 	// we're stuck with a ReadWriter because of the way evaluateBatch is
 	// designed.
-	rw := r.store.Engine().NewReadOnly()
+	rw := r.store.Engine().NewReadOnly(storage.StandardDurability)
 	if !rw.ConsistentIterators() {
 		// This is not currently needed for correctness, but future optimizations
 		// may start relying on this, so we assert here.
 		panic("expected consistent iterators")
 	}
+	// Pin engine state eagerly so that all iterators created over this Reader are
+	// based off the state of the engine as of this point and are mutually
+	// consistent.
+	if err := rw.PinEngineStateForIterators(); err != nil {
+		return nil, g, roachpb.NewError(err)
+	}
 	if util.RaceEnabled {
-		rw = spanset.NewReadWriterAt(rw, spans, ba.Timestamp)
+		rw = spanset.NewReadWriterAt(rw, g.LatchSpans(), ba.Timestamp)
 	}
 	defer rw.Close()
 
@@ -81,9 +87,7 @@ func (r *Replica) executeReadOnlyBatch(
 	// the latches are released.
 
 	var result result.Result
-	br, result, pErr = r.executeReadOnlyBatchWithServersideRefreshes(
-		ctx, rw, rec, ba, ui, spans,
-	)
+	br, result, pErr = r.executeReadOnlyBatchWithServersideRefreshes(ctx, rw, rec, ba, ui, g)
 
 	// If the request hit a server-side concurrency retry error, immediately
 	// propagate the error. Don't assume ownership of the concurrency guard.
@@ -237,7 +241,7 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 	rec batcheval.EvalContext,
 	ba *roachpb.BatchRequest,
 	ui uncertainty.Interval,
-	latchSpans *spanset.SpanSet,
+	g *concurrency.Guard,
 ) (br *roachpb.BatchResponse, res result.Result, pErr *roachpb.Error) {
 	log.Event(ctx, "executing read-only batch")
 
@@ -290,7 +294,7 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 		br, res, pErr = evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, ba, ui, true /* readOnly */)
 		// If we can retry, set a higher batch timestamp and continue.
 		// Allow one retry only.
-		if pErr == nil || retries > 0 || !canDoServersideRetry(ctx, pErr, ba, br, latchSpans, nil /* deadline */) {
+		if pErr == nil || retries > 0 || !canDoServersideRetry(ctx, pErr, ba, br, g, nil /* deadline */) {
 			break
 		}
 	}
@@ -355,6 +359,9 @@ func (r *Replica) collectSpansRead(
 		}
 
 		switch t := resp.(type) {
+		case *roachpb.GetResponse:
+			// The request did not evaluate. Ignore it.
+			continue
 		case *roachpb.ScanResponse:
 			if header.Key.Equal(t.ResumeSpan.Key) {
 				// The request did not evaluate. Ignore it.

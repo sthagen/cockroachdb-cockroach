@@ -404,7 +404,7 @@ var (
 	}
 	metaRdbNumSSTables = metric.Metadata{
 		Name:        "rocksdb.num-sstables",
-		Help:        "Number of rocksdb SSTables",
+		Help:        "Number of storage engine SSTables",
 		Measurement: "SSTables",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -413,6 +413,12 @@ var (
 		Help:        "Estimated pending compaction bytes",
 		Measurement: "Storage",
 		Unit:        metric.Unit_BYTES,
+	}
+	metaRdbMarkedForCompactionFiles = metric.Metadata{
+		Name:        "storage.marked-for-compaction-files",
+		Help:        "Count of SSTables marked for compaction",
+		Measurement: "SSTables",
+		Unit:        metric.Unit_COUNT,
 	}
 	metaRdbL0Sublevels = metric.Metadata{
 		Name:        "storage.l0-sublevels",
@@ -494,6 +500,18 @@ var (
 		Name:        "range.snapshots.applied-non-voter",
 		Help:        "Number of snapshots applied by non-voter replicas",
 		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapshotRcvdBytes = metric.Metadata{
+		Name:        "range.snapshots.rcvd-bytes",
+		Help:        "Number of snapshot bytes received",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapshotSentBytes = metric.Metadata{
+		Name:        "range.snapshots.sent-bytes",
+		Help:        "Number of snapshot bytes sent",
+		Measurement: "Bytes",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaRangeRaftLeaderTransfers = metric.Metadata{
@@ -1220,6 +1238,20 @@ throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
 		Measurement: "Locks",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaConcurrencyAverageLockHoldDurationNanos = metric.Metadata{
+		Name: "kv.concurrency.avg_lock_hold_duration_nanos",
+		Help: "Average lock hold duration across locks currently held in lock tables. " +
+			"Does not include replicated locks (intents) that are not held in memory",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaConcurrencyMaxLockHoldDurationNanos = metric.Metadata{
+		Name: "kv.concurrency.max_lock_hold_duration_nanos",
+		Help: "Maximum length of time any lock in a lock table is held. " +
+			"Does not include replicated locks (intents) that are not held in memory",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 	metaConcurrencyLocksWithWaitQueues = metric.Metadata{
 		Name:        "kv.concurrency.locks_with_wait_queues",
 		Help:        "Number of active locks held in lock tables with active wait-queues",
@@ -1231,6 +1263,18 @@ throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
 		Help:        "Number of requests actively waiting in a lock wait-queue",
 		Measurement: "Lock-Queue Waiters",
 		Unit:        metric.Unit_COUNT,
+	}
+	metaConcurrencyAverageLockWaitDurationNanos = metric.Metadata{
+		Name:        "kv.concurrency.avg_lock_wait_duration_nanos",
+		Help:        "Average lock wait duration across requests currently waiting in lock wait-queues",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaConcurrencyMaxLockWaitDurationNanos = metric.Metadata{
+		Name:        "kv.concurrency.max_lock_wait_duration_nanos",
+		Help:        "Maximum lock wait duration across requests currently waiting in lock wait-queues",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	metaConcurrencyMaxLockWaitQueueWaitersForLock = metric.Metadata{
 		Name:        "kv.concurrency.max_lock_wait_queue_waiters_for_lock",
@@ -1344,6 +1388,7 @@ type StoreMetrics struct {
 	RdbReadAmplification        *metric.Gauge
 	RdbNumSSTables              *metric.Gauge
 	RdbPendingCompaction        *metric.Gauge
+	RdbMarkedForCompactionFiles *metric.Gauge
 	RdbL0Sublevels              *metric.Gauge
 	RdbL0NumFiles               *metric.Gauge
 	RdbWriteStalls              *metric.Gauge
@@ -1358,16 +1403,20 @@ type StoreMetrics struct {
 	// accordingly.
 
 	// Range event metrics.
-	RangeSplits                                  *metric.Counter
-	RangeMerges                                  *metric.Counter
-	RangeAdds                                    *metric.Counter
-	RangeRemoves                                 *metric.Counter
+	RangeSplits                 *metric.Counter
+	RangeMerges                 *metric.Counter
+	RangeAdds                   *metric.Counter
+	RangeRemoves                *metric.Counter
+	RangeRaftLeaderTransfers    *metric.Counter
+	RangeLossOfQuorumRecoveries *metric.Counter
+
+	// Range snapshot metrics.
 	RangeSnapshotsGenerated                      *metric.Counter
 	RangeSnapshotsAppliedByVoters                *metric.Counter
 	RangeSnapshotsAppliedForInitialUpreplication *metric.Counter
 	RangeSnapshotsAppliedByNonVoters             *metric.Counter
-	RangeRaftLeaderTransfers                     *metric.Counter
-	RangeLossOfQuorumRecoveries                  *metric.Counter
+	RangeSnapshotRcvdBytes                       *metric.Counter
+	RangeSnapshotSentBytes                       *metric.Counter
 
 	// Raft processing metrics.
 	RaftTicks                 *metric.Counter
@@ -1484,8 +1533,12 @@ type StoreMetrics struct {
 
 	// Concurrency control metrics.
 	Locks                          *metric.Gauge
+	AverageLockHoldDurationNanos   *metric.Gauge
+	MaxLockHoldDurationNanos       *metric.Gauge
 	LocksWithWaitQueues            *metric.Gauge
 	LockWaitQueueWaiters           *metric.Gauge
+	AverageLockWaitDurationNanos   *metric.Gauge
+	MaxLockWaitDurationNanos       *metric.Gauge
 	MaxLockWaitQueueWaitersForLock *metric.Gauge
 
 	// Closed timestamp metrics.
@@ -1781,6 +1834,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbReadAmplification:        metric.NewGauge(metaRdbReadAmplification),
 		RdbNumSSTables:              metric.NewGauge(metaRdbNumSSTables),
 		RdbPendingCompaction:        metric.NewGauge(metaRdbPendingCompaction),
+		RdbMarkedForCompactionFiles: metric.NewGauge(metaRdbMarkedForCompactionFiles),
 		RdbL0Sublevels:              metric.NewGauge(metaRdbL0Sublevels),
 		RdbL0NumFiles:               metric.NewGauge(metaRdbL0NumFiles),
 		RdbWriteStalls:              metric.NewGauge(metaRdbWriteStalls),
@@ -1798,6 +1852,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeSnapshotsAppliedByVoters: metric.NewCounter(metaRangeSnapshotsAppliedByVoters),
 		RangeSnapshotsAppliedForInitialUpreplication: metric.NewCounter(metaRangeSnapshotsAppliedForInitialUpreplication),
 		RangeSnapshotsAppliedByNonVoters:             metric.NewCounter(metaRangeSnapshotsAppliedByNonVoter),
+		RangeSnapshotRcvdBytes:                       metric.NewCounter(metaRangeSnapshotRcvdBytes),
+		RangeSnapshotSentBytes:                       metric.NewCounter(metaRangeSnapshotSentBytes),
 		RangeRaftLeaderTransfers:                     metric.NewCounter(metaRangeRaftLeaderTransfers),
 		RangeLossOfQuorumRecoveries:                  metric.NewCounter(metaRangeLossOfQuorumRecoveries),
 
@@ -1926,8 +1982,12 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 
 		// Concurrency control metrics.
 		Locks:                          metric.NewGauge(metaConcurrencyLocks),
+		AverageLockHoldDurationNanos:   metric.NewGauge(metaConcurrencyAverageLockHoldDurationNanos),
+		MaxLockHoldDurationNanos:       metric.NewGauge(metaConcurrencyMaxLockHoldDurationNanos),
 		LocksWithWaitQueues:            metric.NewGauge(metaConcurrencyLocksWithWaitQueues),
 		LockWaitQueueWaiters:           metric.NewGauge(metaConcurrencyLockWaitQueueWaiters),
+		AverageLockWaitDurationNanos:   metric.NewGauge(metaConcurrencyAverageLockWaitDurationNanos),
+		MaxLockWaitDurationNanos:       metric.NewGauge(metaConcurrencyMaxLockWaitDurationNanos),
 		MaxLockWaitQueueWaitersForLock: metric.NewGauge(metaConcurrencyMaxLockWaitQueueWaitersForLock),
 
 		// Closed timestamp metrics.
@@ -2002,6 +2062,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbTableReadersMemEstimate.Update(m.TableCache.Size)
 	sm.RdbReadAmplification.Update(int64(m.ReadAmp()))
 	sm.RdbPendingCompaction.Update(int64(m.Compact.EstimatedDebt))
+	sm.RdbMarkedForCompactionFiles.Update(int64(m.Compact.MarkedFiles))
 	sm.RdbL0Sublevels.Update(int64(m.Levels[0].Sublevels))
 	sm.RdbL0NumFiles.Update(m.Levels[0].NumFiles)
 	sm.RdbNumSSTables.Update(m.NumSSTables())

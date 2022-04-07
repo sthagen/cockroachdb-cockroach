@@ -128,7 +128,6 @@ type Config struct {
 	// Configs + Knobs.
 	MaxLockTableSize  int64
 	DisableTxnPushing bool
-	OnContentionEvent func(*roachpb.ContentionEvent) // may be nil; allowed to mutate the event
 	TxnWaitKnobs      txnwait.TestingKnobs
 }
 
@@ -142,7 +141,7 @@ func (c *Config) initDefaults() {
 func NewManager(cfg Config) Manager {
 	cfg.initDefaults()
 	m := new(managerImpl)
-	lt := newLockTable(cfg.MaxLockTableSize)
+	lt := newLockTable(cfg.MaxLockTableSize, cfg.RangeDesc.RangeID, cfg.Clock)
 	*m = managerImpl{
 		st: cfg.Settings,
 		// TODO(nvanbenschoten): move pkg/storage/spanlatch to a new
@@ -162,7 +161,6 @@ func NewManager(cfg Config) Manager {
 			ir:                cfg.IntentResolver,
 			lt:                lt,
 			disableTxnPushing: cfg.DisableTxnPushing,
-			onContentionEvent: cfg.OnContentionEvent,
 		},
 		// TODO(nvanbenschoten): move pkg/storage/txnwait to a new
 		// pkg/storage/concurrency/txnwait package.
@@ -229,7 +227,7 @@ func (m *managerImpl) sequenceReqWithGuard(ctx context.Context, g *Guard) (Respo
 	// them.
 	if shouldWaitOnLatchesWithoutAcquiring(g.Req) {
 		log.Event(ctx, "waiting on latches without acquiring")
-		return nil, m.lm.WaitFor(ctx, g.Req.LatchSpans)
+		return nil, m.lm.WaitFor(ctx, g.Req.LatchSpans, g.Req.PoisonPolicy)
 	}
 
 	// Provide the manager with an opportunity to intercept the request. It
@@ -381,6 +379,15 @@ func shouldWaitOnLatchesWithoutAcquiring(req Request) bool {
 	return req.isSingle(roachpb.Barrier)
 }
 
+// PoisonReq implements the RequestSequencer interface.
+func (m *managerImpl) PoisonReq(g *Guard) {
+	// NB: g.lg == nil is the case for requests that ignore latches, see
+	// shouldIgnoreLatches.
+	if g.lg != nil {
+		m.lm.Poison(g.lg)
+	}
+}
+
 // FinishReq implements the RequestSequencer interface.
 func (m *managerImpl) FinishReq(g *Guard) {
 	// NOTE: we release latches _before_ exiting lock wait-queues deliberately.
@@ -499,6 +506,13 @@ func (m *managerImpl) OnLockUpdated(ctx context.Context, up *roachpb.LockUpdate)
 	}
 }
 
+// QueryLockTableState implements the LockManager interface.
+func (m *managerImpl) QueryLockTableState(
+	ctx context.Context, span roachpb.Span, opts QueryLockTableOptions,
+) ([]roachpb.LockStateInfo, QueryLockTableResumeState) {
+	return m.lt.QueryLockTableState(span, opts)
+}
+
 // OnTransactionUpdated implements the TransactionManager interface.
 func (m *managerImpl) OnTransactionUpdated(ctx context.Context, txn *roachpb.Transaction) {
 	m.twq.UpdateTxn(ctx, txn)
@@ -586,6 +600,11 @@ func (m *managerImpl) TestingTxnWaitQueue() *txnwait.Queue {
 	return m.twq.(*txnwait.Queue)
 }
 
+// TestingSetMaxLocks implements the TestingAccessor interface.
+func (m *managerImpl) TestingSetMaxLocks(maxLocks int64) {
+	m.lt.(*lockTableImpl).setMaxLocks(maxLocks)
+}
+
 func (r *Request) txnMeta() *enginepb.TxnMeta {
 	if r.Txn == nil {
 		return nil
@@ -656,6 +675,26 @@ func (g *Guard) AssertNoLatches() {
 	if g.HoldingLatches() {
 		panic("unexpected latches held")
 	}
+}
+
+// IsolatedAtLaterTimestamps returns whether the request holding the guard would
+// continue to be isolated from other requests / transactions even if it were to
+// increase its request timestamp while evaluating. If the method returns false,
+// the concurrency guard must be dropped and re-acquired with the new timestamp
+// before the request can evaluate at that later timestamp.
+func (g *Guard) IsolatedAtLaterTimestamps() bool {
+	// If the request acquired any read latches with bounded (MVCC) timestamps
+	// then it can not trivially bump its timestamp without dropping and
+	// re-acquiring those latches. Doing so could allow the request to read at an
+	// unprotected timestamp. We only look at global latch spans because local
+	// latch spans always use unbounded (NonMVCC) timestamps.
+	return len(g.Req.LatchSpans.GetSpans(spanset.SpanReadOnly, spanset.SpanGlobal)) == 0 &&
+		// Similarly, if the request declared any global or local read lock spans
+		// then it can not trivially bump its timestamp without dropping its
+		// lockTableGuard and re-scanning the lockTable. Doing so could allow the
+		// request to conflict with locks that it previously did not conflict with.
+		len(g.Req.LockSpans.GetSpans(spanset.SpanReadOnly, spanset.SpanGlobal)) == 0 &&
+		len(g.Req.LockSpans.GetSpans(spanset.SpanReadOnly, spanset.SpanLocal)) == 0
 }
 
 // CheckOptimisticNoConflicts checks that the {latch,lock}SpansRead do not

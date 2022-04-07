@@ -1230,7 +1230,7 @@ SELECT sign(-2.0), sign(-0.0), sign(0.0), sign(2.0)
 query RR
 SELECT sqrt(4.0::float), sqrt(9.0::decimal)
 ----
-2 3
+2  3.0000000000000000000
 
 query error cannot take square root of a negative number
 SELECT sqrt(-1.0::float)
@@ -2829,7 +2829,7 @@ select crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, 
 ----
 system
 
-query error pq: crdb_internal.pb_to_json\(\): unknown proto message type cockroach.sql.sqlbase.descriptor
+query error pq: crdb_internal.pb_to_json\(\): invalid protocol message: unknown proto message type cockroach.sql.sqlbase.descriptor
 select crdb_internal.pb_to_json('cockroach.sql.sqlbase.descriptor', descriptor)->'database'->>'name' from system.descriptor where id=1
 
 query B
@@ -2842,7 +2842,7 @@ select crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', crdb_interna
 ----
 true
 
-query error pq: crdb_internal.json_to_pb\(\): unmarshaling json to cockroach.sql.sqlbase.Descriptor: unknown field "__redacted__" in descpb.Descriptor
+query error pq: crdb_internal.json_to_pb\(\): invalid proto JSON: unmarshaling json to cockroach.sql.sqlbase.Descriptor: unknown field "__redacted__" in descpb.Descriptor
 select crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, true, true)) = descriptor from system.descriptor where id = 1
 
 subtest regexp_split
@@ -3136,6 +3136,17 @@ SELECT hmac('dog', 'key', 'made up alg')
 
 subtest session_revival_token
 
+user host-cluster-root
+
+statement ok
+ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = true
+
+user root
+
+statement ok
+CREATE USER parentuser;
+GRANT parentuser TO testuser
+
 skipif config 3node-tenant
 statement error session revival tokens are not supported on this cluster
 select crdb_internal.create_session_revival_token()
@@ -3143,10 +3154,6 @@ select crdb_internal.create_session_revival_token()
 onlyif config 3node-tenant
 statement error cannot create token for root user
 select crdb_internal.create_session_revival_token()
-
-statement ok
-CREATE USER parentuser;
-GRANT parentuser TO testuser
 
 user testuser
 
@@ -3194,3 +3201,413 @@ FROM
   c, a
 ----
 Ed25519  testuser  true  true  true  true
+
+user host-cluster-root
+
+statement ok
+ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = false
+
+user root
+
+# test OVERLAPS expression
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 01:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 01:00:00',
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 00:15:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 01:00:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 01:00:00',
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 00:15:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 01:00:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 01:00:00',
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 00:15:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 01:00:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 01:00:00',
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 00:15:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+DATE '2000-01-03',
+DATE '2000-01-02',
+DATE '2000-01-04');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-03',
+DATE '2000-01-01',
+DATE '2000-01-02',
+DATE '2000-01-04');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+DATE '2000-01-02',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '100 days',
+TIMESTAMP '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '100 s',
+TIMESTAMP '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '30 minutes',
+TIMESTAMP '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+INTERVAL '100 days',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+INTERVAL '100 s',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+INTERVAL '30 minutes',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+INTERVAL '2 hours',
+TIME '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+INTERVAL '100 s',
+TIME '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+INTERVAL '30 minutes',
+TIME '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '00:00:00',
+INTERVAL '3 hours',
+TIMETZ '00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '00:00:00',
+INTERVAL '100 s',
+TIMETZ '00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '00:00:00',
+INTERVAL '30 minutes',
+TIMETZ '00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+INTERVAL '3 hours',
+DATE '2000-01-02',
+INTERVAL '2 days');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+INTERVAL '2 days',
+DATE '2000-01-02',
+INTERVAL '2 days');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+INTERVAL '1 day',
+DATE '2000-01-02',
+INTERVAL '2 days');
+----
+false
+
+query error pq: unknown signature: overlaps\(date, date, date, date, date\)
+SELECT overlaps
+(DATE '2000-01-03',
+DATE '2000-02-03',
+DATE '2000-03-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+
+query T
+SELECT overlaps(NULL, NULL, NULL, NULL);
+----
+NULL
+
+query T
+SELECT overlaps(NULL, INTERVAL '1 day', NULL, NULL);
+----
+NULL
+
+query T
+SELECT overlaps(DATE '2000-01-01', INTERVAL '1 day', NULL, NULL);
+----
+NULL
+
+query T
+SELECT overlaps(DATE '2000-01-01', NULL, DATE '2000-01-01', DATE '2000-01-02');
+----
+NULL
+
+query error pq: unknown signature: overlaps\(timestamp, time, time, timestamp\)
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIME '2000-01-01 01:00:00',
+TIME '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+
+query error pq: unknown signature: overlaps\(timestamp, interval, date, timestamptz\)
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '2 days',
+DATE '2000-01-01',
+TIMESTAMPTZ '2000-01-01 01:30:00');

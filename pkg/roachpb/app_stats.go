@@ -60,6 +60,9 @@ func ConstructStatementFingerprintID(
 // individual statement fingerprint IDs that comprise the transaction.
 type TransactionFingerprintID uint64
 
+// InvalidTransactionFingerprintID denotes an invalid transaction fingerprint ID.
+const InvalidTransactionFingerprintID = TransactionFingerprintID(0)
+
 // Size returns the size of the TransactionFingerprintID.
 func (t TransactionFingerprintID) Size() int64 {
 	return 8
@@ -161,6 +164,7 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 	s.RowsRead.Add(other.RowsRead, s.Count, other.Count)
 	s.RowsWritten.Add(other.RowsWritten, s.Count, other.Count)
 	s.Nodes = util.CombineUniqueInt64(s.Nodes, other.Nodes)
+	s.PlanGists = util.CombineUniqueString(s.PlanGists, other.PlanGists)
 
 	s.ExecStats.Add(other.ExecStats)
 

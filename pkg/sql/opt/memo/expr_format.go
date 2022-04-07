@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
@@ -525,6 +526,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		if t.LookupColsAreTableKey {
 			tp.Childf("lookup columns are key")
 		}
+		if t.IsFirstJoinInPairedJoiner {
+			f.formatColList(e, tp, "first join in paired joiner; continuation column:", opt.ColList{t.ContinuationCol})
+		}
 		if t.IsSecondJoinInPairedJoiner {
 			tp.Childf("second join in paired joiner")
 		}
@@ -574,12 +578,12 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 	case *InsertExpr:
+		f.formatArbiterIndexes(tp, t.ArbiterIndexes, t.Table)
+		f.formatArbiterConstraints(tp, t.ArbiterConstraints, t.Table)
 		if !f.HasFlags(ExprFmtHideColumns) {
 			if len(colList) == 0 {
 				tp.Child("columns: <none>")
 			}
-			f.formatArbiterIndexes(tp, t.ArbiterIndexes, t.Table)
-			f.formatArbiterConstraints(tp, t.ArbiterConstraints, t.Table)
 			f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
 			f.formatOptionalColList(e, tp, "check columns:", t.CheckCols)
 			f.formatOptionalColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
@@ -600,13 +604,13 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 	case *UpsertExpr:
+		f.formatArbiterIndexes(tp, t.ArbiterIndexes, t.Table)
+		f.formatArbiterConstraints(tp, t.ArbiterConstraints, t.Table)
 		if !f.HasFlags(ExprFmtHideColumns) {
 			if len(colList) == 0 {
 				tp.Child("columns: <none>")
 			}
 			if t.CanaryCol != 0 {
-				f.formatArbiterIndexes(tp, t.ArbiterIndexes, t.Table)
-				f.formatArbiterConstraints(tp, t.ArbiterConstraints, t.Table)
 				f.formatColList(e, tp, "canary column:", opt.ColList{t.CanaryCol})
 				f.formatOptionalColList(e, tp, "fetch columns:", t.FetchCols)
 				f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
@@ -967,10 +971,10 @@ func (f *ExprFmtCtx) formatScalarWithLabel(
 			}
 			// Only show the frame if it differs from the default.
 			def := WindowFrame{
-				Mode:           tree.RANGE,
-				StartBoundType: tree.UnboundedPreceding,
-				EndBoundType:   tree.CurrentRow,
-				FrameExclusion: tree.NoExclusion,
+				Mode:           treewindow.RANGE,
+				StartBoundType: treewindow.UnboundedPreceding,
+				EndBoundType:   treewindow.CurrentRow,
+				FrameExclusion: treewindow.NoExclusion,
 			}
 			if item.Frame != def {
 				emitProp("frame=%q", item.Frame.String())

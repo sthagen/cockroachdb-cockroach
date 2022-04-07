@@ -13,6 +13,7 @@ package batcheval
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -29,7 +30,11 @@ func init() {
 }
 
 func declareKeysSubsume(
-	_ ImmutableRangeState, _ *roachpb.Header, _ roachpb.Request, latchSpans, _ *spanset.SpanSet,
+	_ ImmutableRangeState,
+	_ *roachpb.Header,
+	_ roachpb.Request,
+	latchSpans, _ *spanset.SpanSet,
+	_ time.Duration,
 ) {
 	// Subsume must not run concurrently with any other command. It declares a
 	// non-MVCC write over every addressable key in the range; this guarantees
@@ -147,7 +152,7 @@ func Subsume(
 	// think about.
 	priorReadSum.Merge(rspb.FromTimestamp(reply.FreezeStart.ToTimestamp()))
 	reply.ReadSummary = &priorReadSum
-	reply.ClosedTimestamp = cArgs.EvalCtx.GetClosedTimestamp(ctx)
+	reply.ClosedTimestamp = cArgs.EvalCtx.GetCurrentClosedTimestamp(ctx)
 
 	return result.Result{}, nil
 }

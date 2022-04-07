@@ -16,7 +16,7 @@ go_library(
     visibility = ["//visibility:public"],
     # Pin the dependencies used in auto-generated code.
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/inverted",  # keep
@@ -87,6 +87,10 @@ genrule(
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ execexplain $(locations //pkg/sql/opt/exec:defs)
     """,
     exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 # Define a generator for gist factory code.
@@ -101,4 +105,8 @@ genrule(
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ execplangist $(locations //pkg/sql/opt/exec:defs)
     """,
     exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )

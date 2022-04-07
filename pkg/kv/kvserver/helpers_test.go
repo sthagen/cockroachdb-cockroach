@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -53,7 +54,7 @@ func (s *Store) FindTargetAndTransferLease(
 	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, conf roachpb.SpanConfig,
 ) (bool, error) {
 	transferStatus, err := s.replicateQueue.shedLease(
-		ctx, repl, desc, conf, transferLeaseOptions{},
+		ctx, repl, desc, conf, transferLeaseOptions{excludeLeaseRepl: true},
 	)
 	return transferStatus == transferOK, err
 }
@@ -170,7 +171,7 @@ func (s *Store) EnqueueRaftUpdateCheck(rangeID roachpb.RangeID) {
 }
 
 func manualQueue(s *Store, q queueImpl, repl *Replica) error {
-	cfg := s.Gossip().GetSystemConfig()
+	cfg := s.cfg.SystemConfigProvider.GetSystemConfig()
 	if cfg == nil {
 		return fmt.Errorf("%s: system config not yet available", s)
 	}
@@ -390,9 +391,11 @@ func (r *Replica) LoadBasedSplitter() *split.Decider {
 	return &r.loadBasedSplitter
 }
 
-func MakeSSTable(key, value string, ts hlc.Timestamp) ([]byte, storage.MVCCKeyValue) {
+func MakeSSTable(
+	ctx context.Context, key, value string, ts hlc.Timestamp,
+) ([]byte, storage.MVCCKeyValue) {
 	sstFile := &storage.MemFile{}
-	sst := storage.MakeIngestionSSTWriter(sstFile)
+	sst := storage.MakeIngestionSSTWriter(ctx, cluster.MakeTestingClusterSettings(), sstFile)
 	defer sst.Close()
 
 	v := roachpb.MakeValueFromBytes([]byte(value))
@@ -420,7 +423,7 @@ func ProposeAddSSTable(ctx context.Context, key, val string, ts hlc.Timestamp, s
 	ba.RangeID = store.LookupReplica(roachpb.RKey(key)).RangeID
 
 	var addReq roachpb.AddSSTableRequest
-	addReq.Data, _ = MakeSSTable(key, val, ts)
+	addReq.Data, _ = MakeSSTable(ctx, key, val, ts)
 	addReq.Key = roachpb.Key(key)
 	addReq.EndKey = addReq.Key.Next()
 	ba.Add(&addReq)
@@ -473,12 +476,14 @@ func (r *Replica) MaybeUnquiesceAndWakeLeader() bool {
 	return r.maybeUnquiesceAndWakeLeaderLocked()
 }
 
-func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
+func (r *Replica) ReadProtectedTimestamps(ctx context.Context) error {
 	var ts cachedProtectedTimestampState
 	defer r.maybeUpdateCachedProtectedTS(&ts)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ts = r.readProtectedTimestampsRLocked(ctx, nil /* f */)
+	var err error
+	ts, err = r.readProtectedTimestampsRLocked(ctx)
+	return err
 }
 
 // ClosedTimestampPolicy returns the closed timestamp policy of the range, which
@@ -487,6 +492,11 @@ func (r *Replica) ClosedTimestampPolicy() roachpb.RangeClosedTimestampPolicy {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.closedTimestampPolicyRLocked()
+}
+
+// TripBreaker synchronously trips the breaker.
+func (r *Replica) TripBreaker() {
+	r.breaker.tripSync(errors.New("injected error"))
 }
 
 // GetCircuitBreaker returns the circuit breaker controlling

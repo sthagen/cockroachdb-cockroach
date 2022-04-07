@@ -41,7 +41,11 @@ postgres       root   NULL            {}       NULL           NULL
 system         node   NULL            {}       NULL           NULL
 test           root   NULL            {}       NULL           NULL
 
-query TT colnames
+# Verify that SHOW SCHEMAS FROM a includes user-defined schemas.
+statement ok
+CREATE SCHEMA a.s
+
+query TT colnames,rowsort
 SHOW SCHEMAS FROM a
 ----
 schema_name         owner
@@ -50,6 +54,7 @@ information_schema  NULL
 pg_catalog          NULL
 pg_extension        NULL
 public              admin
+s                   root
 
 statement ok
 CREATE DATABASE b TEMPLATE=template0
@@ -149,11 +154,21 @@ DROP DATABASE IF EXISTS b
 
 statement ok
 DROP DATABASE b2 CASCADE;
-  DROP DATABASE b3 CASCADE;
-  DROP DATABASE b4 CASCADE;
-  DROP DATABASE b5 CASCADE;
-  DROP DATABASE b6 CASCADE;
-  DROP DATABASE b7 CASCADE
+
+statement ok
+DROP DATABASE b3 CASCADE;
+
+statement ok
+DROP DATABASE b4 CASCADE;
+
+statement ok
+DROP DATABASE b5 CASCADE;
+
+statement ok
+DROP DATABASE b6 CASCADE;
+
+statement ok
+DROP DATABASE b7 CASCADE
 
 statement error pgcode 42601 empty database name
 DROP DATABASE ""

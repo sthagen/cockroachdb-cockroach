@@ -518,6 +518,8 @@ created_as_global  CREATE TABLE public.created_as_global (
 # for REGIONAL BY ROW transformations.
 statement ok
 DROP TABLE created_as_global;
+
+statement ok
 CREATE TABLE created_as_global (
   pk int primary key,
   i int,
@@ -526,6 +528,8 @@ CREATE TABLE created_as_global (
   unique(i),
   FAMILY (pk, i, b)
 ) LOCALITY GLOBAL;
+
+statement ok
 INSERT INTO created_as_global VALUES (0, 1, 2)
 
 query TTT
@@ -650,6 +654,8 @@ ap-southeast-2  1
 # Drop the table and try again with the crdb_region column defined.
 statement ok
 DROP TABLE created_as_global;
+
+statement ok
 CREATE TABLE created_as_global (
   pk int primary key,
   i int,
@@ -665,6 +671,8 @@ ALTER TABLE created_as_global SET LOCALITY REGIONAL BY ROW
 
 statement ok
 DROP TABLE created_as_global;
+
+statement ok
 CREATE TABLE created_as_global (
   pk int primary key,
   i int,
@@ -674,6 +682,8 @@ CREATE TABLE created_as_global (
   crdb_region crdb_internal_region,
   FAMILY (pk, i, b, crdb_region)
 ) LOCALITY GLOBAL;
+
+statement ok
 INSERT INTO created_as_global VALUES (0, 1, 2, 'us-east-1')
 
 statement error cannot use column crdb_region for REGIONAL BY ROW table as it may contain NULL values
@@ -681,6 +691,8 @@ ALTER TABLE created_as_global SET LOCALITY REGIONAL BY ROW
 
 statement ok
 ALTER TABLE created_as_global ALTER COLUMN crdb_region SET NOT NULL;
+
+statement ok
 ALTER TABLE created_as_global SET LOCALITY REGIONAL BY ROW
 
 query TT
@@ -750,6 +762,8 @@ created_as_global           CREATE TABLE public.created_as_global (
 # Test altering to REGIONAL BY ROW AS <col>.
 statement ok
 DROP TABLE created_as_global;
+
+statement ok
 CREATE TABLE created_as_global (
   pk int primary key,
   i int,
@@ -759,6 +773,8 @@ CREATE TABLE created_as_global (
   cr crdb_internal_region,
   FAMILY (pk, i, b, cr)
 ) LOCALITY GLOBAL;
+
+statement ok
 INSERT INTO created_as_global VALUES (0, 1, 2, 'us-east-1')
 
 statement error column "non_exist" does not exist
@@ -1224,8 +1240,7 @@ SHOW CREATE TABLE regional_by_table_no_region
 regional_by_table_no_region                     CREATE TABLE public.regional_by_table_no_region (
                                                 i INT8 NULL,
                                                 rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                                                CONSTRAINT regional_by_table_no_region_pkey PRIMARY KEY (rowid ASC),
-                                                FAMILY "primary" (i, rowid)
+                                                CONSTRAINT regional_by_table_no_region_pkey PRIMARY KEY (rowid ASC)
 ) LOCALITY REGIONAL BY TABLE IN PRIMARY REGION
 
 query TTT
@@ -1273,8 +1288,7 @@ SHOW CREATE TABLE regional_by_table_no_region
 regional_by_table_no_region  CREATE TABLE public.regional_by_table_no_region (
                              i INT8 NULL,
                              rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                             CONSTRAINT regional_by_table_no_region_pkey PRIMARY KEY (rowid ASC),
-                             FAMILY "primary" (i, rowid)
+                             CONSTRAINT regional_by_table_no_region_pkey PRIMARY KEY (rowid ASC)
 ) LOCALITY GLOBAL
 
 query TTT
@@ -1318,6 +1332,8 @@ TABLE regional_by_table_no_region  ALTER TABLE regional_by_table_no_region CONFI
 # REGIONAL BY ROW transformations.
 statement ok
 DROP TABLE regional_by_table_no_region;
+
+statement ok
 CREATE TABLE regional_by_table_no_region (
   pk int primary key,
   i int,
@@ -1326,6 +1342,8 @@ CREATE TABLE regional_by_table_no_region (
   unique(i),
   FAMILY (pk, i, b)
 ) LOCALITY REGIONAL BY TABLE;
+
+statement ok
 INSERT INTO regional_by_table_no_region VALUES (0, 1, 2)
 
 statement ok
@@ -1347,6 +1365,8 @@ regional_by_table_no_region  CREATE TABLE public.regional_by_table_no_region (
 
 statement ok
 DROP TABLE regional_by_table_no_region;
+
+statement ok
 CREATE TABLE regional_by_table_no_region (
   pk int primary key,
   i int,
@@ -1356,6 +1376,8 @@ CREATE TABLE regional_by_table_no_region (
   cr crdb_internal_region NOT NULL NOT NULL,
   FAMILY (pk, i, b, cr)
 ) LOCALITY REGIONAL BY TABLE;
+
+statement ok
 INSERT INTO regional_by_table_no_region VALUES (0, 1, 2, 'us-east-1')
 
 query TTT
@@ -1398,6 +1420,8 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 # REGIONAL BY ROW AS transformations.
 statement ok
 DROP TABLE regional_by_table_no_region;
+
+statement ok
 CREATE TABLE regional_by_table_no_region (
   pk int primary key,
   i int,
@@ -1407,6 +1431,8 @@ CREATE TABLE regional_by_table_no_region (
   unique(i),
   FAMILY (pk, i, b, cr)
 ) LOCALITY REGIONAL BY TABLE;
+
+statement ok
 INSERT INTO regional_by_table_no_region VALUES (0, 1, 2, 'us-east-1')
 
 statement ok
@@ -1671,6 +1697,8 @@ TABLE regional_by_table_in_us_east  ALTER TABLE regional_by_table_in_us_east CON
 # REGIONAL BY ROW transformations.
 statement ok
 DROP TABLE regional_by_table_in_us_east;
+
+statement ok
 CREATE TABLE regional_by_table_in_us_east (
   pk int PRIMARY KEY,
   i int,
@@ -1679,7 +1707,11 @@ CREATE TABLE regional_by_table_in_us_east (
   unique(i),
   FAMILY (pk, i, b)
 ) LOCALITY REGIONAL BY TABLE IN "us-east-1";
+
+statement ok
 INSERT INTO regional_by_table_in_us_east VALUES (0, 1, 2);
+
+statement ok
 ALTER TABLE regional_by_table_in_us_east SET LOCALITY REGIONAL BY ROW
 
 query TT
@@ -1736,6 +1768,8 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 # REGIONAL BY ROW AS transformations.
 statement ok
 DROP TABLE regional_by_table_in_us_east;
+
+statement ok
 CREATE TABLE regional_by_table_in_us_east (
   pk int PRIMARY KEY,
   i int,
@@ -1745,7 +1779,11 @@ CREATE TABLE regional_by_table_in_us_east (
   cr crdb_internal_region NOT NULL NOT NULL,
   FAMILY (pk, i, b, cr)
 ) LOCALITY REGIONAL BY TABLE IN "us-east-1";
+
+statement ok
 INSERT INTO regional_by_table_in_us_east VALUES (0, 1, 2, 'us-east-1');
+
+statement ok
 ALTER TABLE regional_by_table_in_us_east SET LOCALITY REGIONAL BY ROW AS "cr"
 
 query TT
@@ -1836,13 +1874,19 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 
 statement ok
 DROP TABLE regional_by_row;
+
+statement ok
 CREATE TABLE regional_by_row (
   pk INT PRIMARY KEY,
   i INT,
   INDEX(i),
   FAMILY (pk, i)
 ) LOCALITY REGIONAL BY ROW;
+
+statement ok
 INSERT INTO regional_by_row (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY TABLE in "ap-southeast-2"
 
 query TT
@@ -1877,13 +1921,19 @@ TABLE regional_by_row  ALTER TABLE regional_by_row CONFIGURE ZONE USING
 
 statement ok
 DROP TABLE regional_by_row;
+
+statement ok
 CREATE TABLE regional_by_row (
   pk INT PRIMARY KEY,
   i INT,
   INDEX(i),
   FAMILY (pk, i)
 ) LOCALITY REGIONAL BY ROW;
+
+statement ok
 INSERT INTO regional_by_row (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION
 
 query TT
@@ -1918,13 +1968,19 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 
 statement ok
 DROP TABLE regional_by_row;
+
+statement ok
 CREATE TABLE regional_by_row (
   pk INT PRIMARY KEY,
   i INT,
   INDEX(i),
   FAMILY (pk, i)
 ) LOCALITY REGIONAL BY ROW;
+
+statement ok
 INSERT INTO regional_by_row (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row SET LOCALITY GLOBAL
 
 query TT
@@ -1960,13 +2016,19 @@ TABLE regional_by_row  ALTER TABLE regional_by_row CONFIGURE ZONE USING
 
 statement ok
 DROP TABLE regional_by_row;
+
+statement ok
 CREATE TABLE regional_by_row (
   pk INT PRIMARY KEY,
   i INT,
   INDEX(i),
   FAMILY (pk, i)
 ) LOCALITY REGIONAL BY ROW;
+
+statement ok
 INSERT INTO regional_by_row (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY ROW
 
 query TT
@@ -2128,7 +2190,11 @@ CREATE TABLE regional_by_row_to_regional_by_row_as (
   INDEX(i),
   FAMILY (pk, i)
 ) LOCALITY REGIONAL BY ROW;
+
+statement ok
 INSERT INTO regional_by_row_to_regional_by_row_as (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row_to_regional_by_row_as SET LOCALITY REGIONAL BY ROW AS "cr"
 
 query TT
@@ -2236,6 +2302,8 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 
 statement ok
 DROP TABLE regional_by_row_as;
+
+statement ok
 CREATE TABLE regional_by_row_as (
   pk INT PRIMARY KEY,
   i INT,
@@ -2243,7 +2311,11 @@ CREATE TABLE regional_by_row_as (
   INDEX(i),
   FAMILY (cr, pk, i)
 ) LOCALITY REGIONAL BY ROW AS "cr";
+
+statement ok
 INSERT INTO regional_by_row_as (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row_as SET LOCALITY REGIONAL BY TABLE in "ap-southeast-2"
 
 query TT
@@ -2296,6 +2368,8 @@ TABLE regional_by_row_as  ALTER TABLE regional_by_row_as CONFIGURE ZONE USING
 
 statement ok
 DROP TABLE regional_by_row_as;
+
+statement ok
 CREATE TABLE regional_by_row_as (
   pk INT PRIMARY KEY,
   i INT,
@@ -2303,7 +2377,11 @@ CREATE TABLE regional_by_row_as (
   INDEX(i),
   FAMILY (cr, pk, i)
 ) LOCALITY REGIONAL BY ROW AS "cr";
+
+statement ok
 INSERT INTO regional_by_row_as (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row_as SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION
 
 query TT
@@ -2356,6 +2434,8 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 
 statement ok
 DROP TABLE regional_by_row_as;
+
+statement ok
 CREATE TABLE regional_by_row_as (
   pk INT PRIMARY KEY,
   i INT,
@@ -2363,7 +2443,11 @@ CREATE TABLE regional_by_row_as (
   INDEX(i),
   FAMILY (cr, pk, i)
 ) LOCALITY REGIONAL BY ROW AS "cr";
+
+statement ok
 INSERT INTO regional_by_row_as (pk, i) VALUES (1, 1);
+
+statement ok
 ALTER TABLE regional_by_row_as SET LOCALITY GLOBAL
 
 query TT
@@ -2423,6 +2507,8 @@ CREATE TABLE regional_by_row_as_to_regional_by_row (
   INDEX(i),
   FAMILY (cr, pk, i)
 ) LOCALITY REGIONAL BY ROW AS "cr";
+
+statement ok
 INSERT INTO regional_by_row_as_to_regional_by_row (pk, i) VALUES (1, 1);
 ALTER TABLE regional_by_row_as_to_regional_by_row SET LOCALITY REGIONAL BY ROW
 
@@ -2477,6 +2563,8 @@ DATABASE alter_locality_test  ALTER DATABASE alter_locality_test CONFIGURE ZONE 
 
 statement ok
 DROP TABLE regional_by_row_as;
+
+statement ok
 CREATE TABLE regional_by_row_as (
   pk INT PRIMARY KEY,
   i INT,
@@ -2618,11 +2706,8 @@ TABLE rbt_table_gc_ttl  ALTER TABLE rbt_table_gc_ttl CONFIGURE ZONE USING
                         lease_preferences = '[[+region=ca-central-1]]'
 
 statement ok
-SET experimental_enable_hash_sharded_indexes = true
-
-statement ok
 CREATE TABLE hash_sharded_idx_table (
-  pk INT PRIMARY KEY USING HASH WITH BUCKET_COUNT = 8
+  pk INT PRIMARY KEY USING HASH WITH (bucket_count=8)
 )
 
 statement error cannot convert hash_sharded_idx_table to REGIONAL BY ROW as the table contains hash sharded indexes

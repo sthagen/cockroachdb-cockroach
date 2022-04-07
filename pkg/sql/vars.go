@@ -14,18 +14,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -199,7 +203,7 @@ var varGen = map[string]sessionVar{
 		Set: func(
 			_ context.Context, m sessionDataMutator, s string,
 		) error {
-			mode, ok := sessiondatapb.BytesEncodeFormatFromString(s)
+			mode, ok := lex.BytesEncodeFormatFromString(s)
 			if !ok {
 				return newVarValueError(`bytea_output`, s, "hex", "escape", "base64")
 			}
@@ -209,7 +213,7 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return evalCtx.SessionData().DataConversionConfig.BytesEncodeFormat.String(), nil
 		},
-		GlobalDefault: func(sv *settings.Values) string { return sessiondatapb.BytesEncodeHex.String() },
+		GlobalDefault: func(sv *settings.Values) string { return lex.BytesEncodeHex.String() },
 	},
 
 	`client_min_messages`: {
@@ -300,7 +304,7 @@ var varGen = map[string]sessionVar{
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-DATESTYLE
 	`datestyle`: {
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
 			ds, err := pgdate.ParseDateStyle(s, m.data.GetDateStyle())
 			if err != nil {
 				return newVarValueError("DateStyle", s, pgdate.AllowedDateStyles()...)
@@ -308,7 +312,11 @@ var varGen = map[string]sessionVar{
 			if ds.Style != pgdate.Style_ISO {
 				return unimplemented.NewWithIssue(41773, "only ISO style is supported")
 			}
-			if ds.Order != pgdate.Order_MDY && !m.data.DateStyleEnabled {
+			allowed := m.data.DateStyleEnabled
+			if m.settings.Version.IsActive(ctx, clusterversion.DateStyleIntervalStyleCastRewrite) {
+				allowed = true
+			}
+			if ds.Order != pgdate.Order_MDY && !allowed {
 				return errors.WithDetailf(
 					errors.WithHintf(
 						pgerror.Newf(
@@ -342,18 +350,34 @@ var varGen = map[string]sessionVar{
 			return a.GetDateStyle() == b.GetDateStyle()
 		},
 	},
+
+	// TODO(sql-exp): remove this setting in 22.2 by turning it into a no-op.
 	`datestyle_enabled`: {
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			if evalCtx.Settings.Version.IsActive(evalCtx.Ctx(), clusterversion.DateStyleIntervalStyleCastRewrite) {
+				return formatBoolAsPostgresSetting(true), nil
+			}
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().DateStyleEnabled), nil
 		},
 		GetStringVal: makePostgresBoolGetStringValFn("datestyle_enabled"),
-		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
+		SetWithPlanner: func(ctx context.Context, p *planner, local bool, s string) error {
 			b, err := paramparse.ParseBoolVar(`datestyle_enabled`, s)
 			if err != nil {
 				return err
 			}
-			m.SetDateStyleEnabled(b)
-			return nil
+			if p.execCfg.Settings.Version.IsActive(ctx, clusterversion.DateStyleIntervalStyleCastRewrite) {
+				p.BufferClientNotice(ctx, pgnotice.Newf("ignoring datestyle_enabled setting; it is always true"))
+				b = true
+			}
+			applyFunc := func(m sessionDataMutator) error {
+				m.SetDateStyleEnabled(b)
+				return nil
+			}
+			if local {
+				return p.sessionDataMutatorIterator.applyOnTopMutator(applyFunc)
+			}
+			return p.sessionDataMutatorIterator.applyOnEachMutatorError(applyFunc)
+
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(dateStyleEnabled.Get(sv))
@@ -918,7 +942,7 @@ var varGen = map[string]sessionVar{
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-INTERVALSTYLE
 	`intervalstyle`: {
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
 			styleVal, ok := duration.IntervalStyle_value[strings.ToUpper(s)]
 			if !ok {
 				validIntervalStyles := make([]string, 0, len(duration.IntervalStyle_value))
@@ -928,8 +952,11 @@ var varGen = map[string]sessionVar{
 				return newVarValueError(`IntervalStyle`, s, validIntervalStyles...)
 			}
 			style := duration.IntervalStyle(styleVal)
-			if style != duration.IntervalStyle_POSTGRES &&
-				!m.data.IntervalStyleEnabled {
+			allowed := m.data.IntervalStyleEnabled
+			if m.settings.Version.IsActive(ctx, clusterversion.DateStyleIntervalStyleCastRewrite) {
+				allowed = true
+			}
+			if style != duration.IntervalStyle_POSTGRES && !allowed {
 				return errors.WithDetailf(
 					errors.WithHintf(
 						pgerror.Newf(
@@ -962,18 +989,32 @@ var varGen = map[string]sessionVar{
 			return a.GetIntervalStyle() == b.GetIntervalStyle()
 		},
 	},
+	// TODO(sql-exp): remove this in 22.2, possibly by converting it into a no-op.
 	`intervalstyle_enabled`: {
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			if evalCtx.Settings.Version.IsActive(evalCtx.Ctx(), clusterversion.DateStyleIntervalStyleCastRewrite) {
+				return formatBoolAsPostgresSetting(true), nil
+			}
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().IntervalStyleEnabled), nil
 		},
 		GetStringVal: makePostgresBoolGetStringValFn("intervalstyle_enabled"),
-		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
+		SetWithPlanner: func(ctx context.Context, p *planner, local bool, s string) error {
 			b, err := paramparse.ParseBoolVar(`intervalstyle_enabled`, s)
 			if err != nil {
 				return err
 			}
-			m.SetIntervalStyleEnabled(b)
-			return nil
+			if p.execCfg.Settings.Version.IsActive(ctx, clusterversion.DateStyleIntervalStyleCastRewrite) {
+				p.BufferClientNotice(ctx, pgnotice.Newf("ignoring intervalstyle_enabled setting; it is always true"))
+				b = true
+			}
+			applyFunc := func(m sessionDataMutator) error {
+				m.SetIntervalStyleEnabled(b)
+				return nil
+			}
+			if local {
+				return p.sessionDataMutatorIterator.applyOnTopMutator(applyFunc)
+			}
+			return p.sessionDataMutatorIterator.applyOnEachMutatorError(applyFunc)
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(intervalStyleEnabled.Get(sv))
@@ -1269,6 +1310,13 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return security.GetConfiguredPasswordHashMethod(evalCtx.Ctx(), &evalCtx.Settings.SV).String(), nil
 		},
+		SetWithPlanner: func(ctx context.Context, p *planner, local bool, val string) error {
+			method := security.GetConfiguredPasswordHashMethod(ctx, &p.ExecCfg().Settings.SV)
+			if val != method.String() {
+				return newCannotChangeParameterError("password_encryption")
+			}
+			return nil
+		},
 	},
 
 	// Supported for PG compatibility only.
@@ -1539,18 +1587,9 @@ var varGen = map[string]sessionVar{
 
 	// CockroachDB extension.
 	// This is only kept for backwards compatibility and no longer has any effect.
-	`enable_drop_enum_value`: {
-		Hidden:       true,
-		GetStringVal: makePostgresBoolGetStringValFn(`enable_drop_enum_value`),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			_, err := paramparse.ParseBoolVar("enable_drop_enum_value", s)
-			return err
-		},
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(true), nil
-		},
-		GlobalDefault: globalTrue,
-	},
+	`enable_drop_enum_value`: makeBackwardsCompatBoolVar(
+		"enable_drop_enum_value", true,
+	),
 
 	// CockroachDB extension.
 	`override_multi_region_zone_config`: {
@@ -1572,23 +1611,10 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`experimental_enable_hash_sharded_indexes`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_hash_sharded_indexes`),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("experimental_enable_hash_sharded_indexes", s)
-			if err != nil {
-				return err
-			}
-			m.SetHashShardedIndexesEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().HashShardedIndexesEnabled), nil
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(hashShardedIndexesEnabledClusterMode.Get(sv))
-		},
-	},
+	// This is only kept for backwards compatibility and no longer has any effect.
+	`experimental_enable_hash_sharded_indexes`: makeBackwardsCompatBoolVar(
+		"experimental_enable_hash_sharded_indexes", true,
+	),
 
 	// CockroachDB extension.
 	`disallow_full_table_scans`: {
@@ -1648,13 +1674,13 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	`experimental_use_new_schema_changer`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_use_new_schema_changer`),
+	`use_declarative_schema_changer`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`use_declarative_schema_changer`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
 			mode, ok := sessiondatapb.NewSchemaChangerModeFromString(s)
 			if !ok {
-				return newVarValueError(`experimental_use_new_schema_changer`, s,
-					"off", "on", "unsafe_always")
+				return newVarValueError(`use_declarative_schema_changer`, s,
+					"off", "on", "unsafe", "unsafe_always")
 			}
 			m.SetUseNewSchemaChanger(mode)
 			return nil
@@ -1908,6 +1934,121 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalFalse,
 	},
+	`default_transaction_quality_of_service`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`default_transaction_quality_of_service`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			qosLevel, ok := sessiondatapb.ParseQoSLevelFromString(s)
+			if !ok {
+				return newVarValueError(`default_transaction_quality_of_service`, s,
+					sessiondatapb.NormalName, sessiondatapb.UserHighName, sessiondatapb.UserLowName)
+			}
+			m.SetQualityOfService(qosLevel)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return evalCtx.QualityOfService().String(), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return sessiondatapb.Normal.String()
+		},
+	},
+	`opt_split_scan_limit`: {
+		GetStringVal: makeIntGetStringValFn(`opt_split_scan_limit`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			if b < 0 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set opt_split_scan_limit to a negative value: %d", b)
+			}
+			if b > math.MaxInt32 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set opt_split_scan_limit to a value greater than %d", math.MaxInt32)
+			}
+
+			m.SetOptSplitScanLimit(int32(b))
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return strconv.FormatInt(int64(evalCtx.SessionData().OptSplitScanLimit), 10), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatInt(int64(tabledesc.MaxBucketAllowed), 10)
+		},
+	},
+
+	// CockroachDB extension.
+	`enable_super_regions`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_super_regions`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_super_regions", s)
+			if err != nil {
+				return err
+			}
+			m.SetEnableSuperRegions(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().EnableSuperRegions), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(enableSuperRegions.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`alter_primary_region_super_region_override`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`alter_primary_region_super_region_override`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("alter_primary_region_super_region_override", s)
+			if err != nil {
+				return err
+			}
+			m.SetEnableOverrideAlterPrimaryRegionInSuperRegion(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OverrideAlterPrimaryRegionInSuperRegion), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(overrideAlterPrimaryRegionInSuperRegion.Get(sv))
+		}},
+
+	// CockroachDB extension.
+	`enable_implicit_transaction_for_batch_statements`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_transaction_for_batch_statements`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_implicit_transaction_for_batch_statements", s)
+			if err != nil {
+				return err
+			}
+			m.SetEnableImplicitTransactionForBatchStatements(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().EnableImplicitTransactionForBatchStatements), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`expect_and_ignore_not_visible_columns_in_copy`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`expect_and_ignore_not_visible_columns_in_copy`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("expect_and_ignore_not_visible_columns_in_copy", s)
+			if err != nil {
+				return err
+			}
+			m.SetExpectAndIgnoreNotVisibleColumnsInCopy(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().ExpectAndIgnoreNotVisibleColumnsInCopy), nil
+		},
+		GlobalDefault: globalFalse,
+	},
 }
 
 const compatErrMsg = "this parameter is currently recognized only for compatibility and has no effect in CockroachDB."
@@ -1937,6 +2078,11 @@ func init() {
 	for k, v := range DummyVars {
 		varGen[k] = v
 	}
+
+	// Alias `idle_session_timeout` to match the PG 14 name.
+	// We create `idle_in_session_timeout` before its existence.
+	varGen[`idle_session_timeout`] = varGen[`idle_in_session_timeout`]
+
 	// Initialize delegate.ValidVars.
 	for v := range varGen {
 		delegate.ValidVars[v] = struct{}{}
@@ -2075,6 +2221,24 @@ func makeCompatStringVar(varName, displayValue string, extraAllowed ...string) s
 			return err
 		},
 		GlobalDefault: func(sv *settings.Values) string { return displayValue },
+	}
+}
+
+func makeBackwardsCompatBoolVar(varName string, displayValue bool) sessionVar {
+	displayValStr := formatBoolAsPostgresSetting(displayValue)
+	return sessionVar{
+		Hidden:       true,
+		GetStringVal: makePostgresBoolGetStringValFn(varName),
+		SetWithPlanner: func(ctx context.Context, p *planner, local bool, s string) error {
+			p.BufferClientNotice(ctx, pgnotice.Newf("%s no longer has any effect", varName))
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) (string, error) {
+			return displayValStr, nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return displayValStr
+		},
 	}
 }
 

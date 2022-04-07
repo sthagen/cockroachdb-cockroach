@@ -14,9 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"reflect"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,12 +28,31 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
-	"github.com/kr/pretty"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/assert"
 )
 
-// WaitForJob waits for the specified job ID to terminate.
-func WaitForJob(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) {
+// WaitForJobToSucceed waits for the specified job ID to succeed.
+func WaitForJobToSucceed(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) {
+	t.Helper()
+	waitForJobToHaveStatus(t, db, jobID, jobs.StatusSucceeded)
+}
+
+// WaitForJobToPause waits for the specified job ID to be paused.
+func WaitForJobToPause(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) {
+	t.Helper()
+	waitForJobToHaveStatus(t, db, jobID, jobs.StatusPaused)
+}
+
+// WaitForJobToCancel waits for the specified job ID to be in a cancelled state.
+func WaitForJobToCancel(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) {
+	t.Helper()
+	waitForJobToHaveStatus(t, db, jobID, jobs.StatusCanceled)
+}
+
+func waitForJobToHaveStatus(
+	t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID, expectedStatus jobs.Status,
+) {
 	t.Helper()
 	if err := retry.ForDuration(time.Minute*2, func() error {
 		var status string
@@ -50,7 +67,7 @@ func WaitForJob(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) {
 			}
 			t.Fatalf("job failed")
 		}
-		if e, a := jobs.StatusSucceeded, jobs.Status(status); e != a {
+		if e, a := expectedStatus, jobs.Status(status); e != a {
 			return errors.Errorf("expected job status %s, but got %s", e, a)
 		}
 		return nil
@@ -115,6 +132,11 @@ func BulkOpResponseFilter(allowProgressIota *chan struct{}) kvserverbase.Replica
 	}
 }
 
+type logT struct{ testing.TB }
+
+func (n logT) Errorf(format string, args ...interface{}) { n.Logf(format, args...) }
+func (n logT) FailNow()                                  {}
+
 func verifySystemJob(
 	t testing.TB,
 	db *sqlutils.SQLRunner,
@@ -153,11 +175,10 @@ func verifySystemJob(
 	sort.Sort(actual.DescriptorIDs)
 	sort.Sort(expected.DescriptorIDs)
 	expected.Details = nil
-	if e, a := expected, actual; !reflect.DeepEqual(e, a) {
+	if e, a := expected, actual; !assert.Equal(logT{t}, e, a) {
 		return errors.Errorf("job %d did not match:\n%s",
-			offset, strings.Join(pretty.Diff(e, a), "\n"))
+			offset, sqlutils.MatrixToStr(db.QueryStr(t, "SELECT * FROM crdb_internal.jobs")))
 	}
-
 	if expectedStatus != statusString {
 		return errors.Errorf("job %d: expected status %v, got %v", offset, expectedStatus, statusString)
 	}

@@ -136,6 +136,10 @@ type Table interface {
 
 	// Zone returns a table's zone.
 	Zone() Zone
+
+	// IsPartitionAllBy returns true if this is a PARTITION ALL BY table. This
+	// includes REGIONAL BY ROW tables.
+	IsPartitionAllBy() bool
 }
 
 // CheckConstraint contains the SQL text and the validity status for a check
@@ -291,6 +295,13 @@ type UniqueConstraint interface {
 	// cannot make any assumptions about the data. An unvalidated constraint still
 	// needs to be enforced on new mutations.
 	Validated() bool
+
+	// UniquenessGuaranteedByAnotherIndex returns true when WithoutIndex() returns
+	// true and the uniqueness of the constraint is guaranteed by another index.
+	// When true, the optimizer will always consider the constraint to be
+	// satisfied when building functional dependencies for the table. This enables
+	// additional optimizations, such as omission of uniqueness checks.
+	UniquenessGuaranteedByAnotherIndex() bool
 }
 
 // UniqueOrdinal identifies a unique constraint (in the context of a Table).

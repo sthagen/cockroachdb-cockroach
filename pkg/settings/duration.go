@@ -60,6 +60,20 @@ func (d *DurationSetting) EncodedDefault() string {
 	return EncodeDuration(d.defaultValue)
 }
 
+// DecodeToString decodes and renders an encoded value.
+func (d *DurationSetting) DecodeToString(encoded string) (string, error) {
+	v, err := d.DecodeValue(encoded)
+	if err != nil {
+		return "", err
+	}
+	return EncodeDuration(v), nil
+}
+
+// DecodeValue decodes the value into a float.
+func (d *DurationSetting) DecodeValue(encoded string) (time.Duration, error) {
+	return time.ParseDuration(encoded)
+}
+
 // Typ returns the short (1 char) string denoting the type of setting.
 func (*DurationSetting) Typ() string {
 	return "d"
@@ -89,7 +103,7 @@ func (d *DurationSetting) Validate(v time.Duration) error {
 // For testing usage only.
 func (d *DurationSetting) Override(ctx context.Context, sv *Values, v time.Duration) {
 	sv.setInt64(ctx, d.slot, int64(v))
-	sv.setDefaultOverrideInt64(d.slot, int64(v))
+	sv.setDefaultOverride(d.slot, v)
 }
 
 func (d *DurationSetting) set(ctx context.Context, sv *Values, v time.Duration) error {
@@ -102,11 +116,10 @@ func (d *DurationSetting) set(ctx context.Context, sv *Values, v time.Duration) 
 
 func (d *DurationSetting) setToDefault(ctx context.Context, sv *Values) {
 	// See if the default value was overridden.
-	ok, val, _ := sv.getDefaultOverride(d.slot)
-	if ok {
+	if val := sv.getDefaultOverride(d.slot); val != nil {
 		// As per the semantics of override, these values don't go through
 		// validation.
-		_ = d.set(ctx, sv, time.Duration(val))
+		_ = d.set(ctx, sv, val.(time.Duration))
 		return
 	}
 	if err := d.set(ctx, sv, d.defaultValue); err != nil {

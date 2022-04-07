@@ -84,6 +84,9 @@ export const reviewOfCockroachTerminology = docsURL(
   "ui-replication-dashboard.html#review-of-cockroachdb-terminology",
 );
 export const sessionsTable = docsURL("ui-sessions-page.html");
+export const tableStatsClusterSetting = docsURL(
+  "cost-based-optimizer.html#control-automatic-statistics",
+);
 // Note that these explicitly don't use the current version, since we want to
 // link to the most up-to-date documentation available.
 export const upgradeCockroachVersion =
@@ -115,3 +118,6 @@ export const transactionLayerOverview = docsURL(
 // Not actually a docs URL.
 export const startTrial = "https://www.cockroachlabs.com/pricing/start-trial/";
 export const transactionsTable = docsURL("ui-transactions-page.html");
+export const performanceTuningRecipes = docsURLNoVersion(
+  "performance-recipes.html#fix-slow-writes",
+);

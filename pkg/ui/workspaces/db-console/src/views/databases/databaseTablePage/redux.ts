@@ -20,6 +20,7 @@ import {
   refreshTableStats,
   refreshNodes,
   refreshIndexStats,
+  refreshSettings,
 } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import { databaseNameAttr, tableNameAttr } from "src/util/constants";
@@ -31,12 +32,15 @@ import {
 } from "src/redux/nodes";
 import { getNodesByRegionString } from "../utils";
 import { resetIndexUsageStatsAction } from "src/redux/indexUsageStats";
+import { selectAutomaticStatsCollectionEnabled } from "src/redux/clusterSettings";
 
 const {
   TableDetailsRequest,
   TableStatsRequest,
   TableIndexStatsRequest,
 } = cockroach.server.serverpb;
+
+const { RecommendationType } = cockroach.sql.IndexRecommendation;
 
 export const mapStateToProps = createSelector(
   (_state: AdminUIState, props: RouteComponentProps): string =>
@@ -49,6 +53,7 @@ export const mapStateToProps = createSelector(
   state => state.cachedData.indexStats,
   state => nodeRegionsByIDSelector(state),
   state => selectIsMoreThanOneNode(state),
+  state => selectAutomaticStatsCollectionEnabled(state),
 
   (
     database,
@@ -58,6 +63,7 @@ export const mapStateToProps = createSelector(
     indexUsageStats,
     nodeRegions,
     showNodeRegionsSection,
+    automaticStatsCollectionEnabled,
   ): DatabaseTablePageData => {
     const details = tableDetails[generateTableID(database, table)];
     const stats = tableStats[generateTableID(database, table)];
@@ -70,21 +76,44 @@ export const mapStateToProps = createSelector(
           indexStat.statistics?.stats?.last_read,
         );
         let lastUsed, lastUsedType;
-        if (lastRead.isAfter(lastReset)) {
-          lastUsed = lastRead;
-          lastUsedType = "read";
+        if (indexStat.created_at !== null) {
+          lastUsed = util.TimestampToMoment(indexStat.created_at);
+          lastUsedType = "created";
         } else {
           lastUsed = lastReset;
           lastUsedType = "reset";
         }
+        if (lastReset.isAfter(lastUsed)) {
+          lastUsed = lastReset;
+          lastUsedType = "reset";
+        }
+        if (lastRead.isAfter(lastUsed)) {
+          lastUsed = lastRead;
+          lastUsedType = "read";
+        }
+        const filteredIndexRecommendations =
+          indexStats?.data?.index_recommendations.filter(
+            indexRec =>
+              indexRec.index_id === indexStat?.statistics.key.index_id,
+          ) || [];
+        const indexRecommendations = filteredIndexRecommendations.map(
+          indexRec => {
+            return {
+              type: RecommendationType[indexRec.type].toString(),
+              reason: indexRec.reason,
+            };
+          },
+        );
         return {
           indexName: indexStat.index_name,
           totalReads: longToInt(indexStat.statistics?.stats?.total_read_count),
           lastUsed: lastUsed,
           lastUsedType: lastUsedType,
+          indexRecommendations,
         };
       },
     );
+
     const grants = _.flatMap(details?.data?.grants, grant =>
       _.map(grant.privileges, privilege => {
         return { user: grant.user, privilege };
@@ -102,8 +131,12 @@ export const mapStateToProps = createSelector(
         replicaCount: details?.data?.zone_config?.num_replicas || 0,
         indexNames: _.uniq(_.map(details?.data?.indexes, index => index.name)),
         grants: grants,
+        statsLastUpdated: details?.data?.stats_last_created_at
+          ? util.TimestampToMoment(details?.data?.stats_last_created_at)
+          : null,
       },
       showNodeRegionsSection,
+      automaticStatsCollectionEnabled,
       stats: {
         loading: !!stats?.inFlight,
         loaded: !!stats?.valid,
@@ -139,4 +172,6 @@ export const mapDispatchToProps = {
   resetIndexUsageStats: resetIndexUsageStatsAction,
 
   refreshNodes,
+
+  refreshSettings,
 };

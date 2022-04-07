@@ -41,25 +41,29 @@ type TestingKnobs struct {
 	// job from persisting checkpoints.
 	JobDisablePersistingCheckpoints bool
 
-	// KVSubscriberPostRangefeedStartInterceptor is invoked after the rangefeed
-	// is started.
-	KVSubscriberPostRangefeedStartInterceptor func()
+	// JobDisableInternalRetry disables the span config reconciliation job's
+	// internal retry loop.
+	JobDisableInternalRetry bool
 
-	// KVSubscriberPreExitInterceptor is invoked right before returning from
-	// subscribeInner, after tearing down internal components.
-	KVSubscriberPreExitInterceptor func()
+	// JobPersistCheckpointInterceptor, if set, is invoked before the
+	// reconciliation job persists checkpoints.
+	JobOnCheckpointInterceptor func() error
 
-	// KVSubscriberOnTimestampAdvanceInterceptor is invoked each time the
-	// KVSubscriber has process all updates before the provided timestamp.
-	KVSubscriberOnTimestampAdvanceInterceptor func(hlc.Timestamp)
-
-	// KVSubscriberErrorInjectionCh is a way for tests to conveniently inject
-	// buffer overflow errors into the subscriber in order to test recovery.
-	KVSubscriberErrorInjectionCh chan error
+	// KVSubscriberRangeFeedKnobs control lifecycle events for the rangefeed
+	// underlying the KVSubscriber.
+	KVSubscriberRangeFeedKnobs base.ModuleTestingKnobs
 
 	// StoreKVSubscriberOverride is used to override the KVSubscriber used when
 	// setting up a new store.
 	StoreKVSubscriberOverride KVSubscriber
+
+	// KVAccessorPaginationInterceptor, if set, is invoked on every pagination
+	// event.
+	KVAccessorPaginationInterceptor func()
+
+	// KVAccessorBatchSizeOverride overrides the batch size KVAccessor makes use
+	// of internally.
+	KVAccessorBatchSizeOverrideFn func() int
 
 	// SQLWatcherOnEventInterceptor, if set, is invoked when the SQLWatcher
 	// receives an event on one of its rangefeeds.
@@ -68,6 +72,10 @@ type TestingKnobs struct {
 	// SQLWatcherCheckpointNoopsEveryDurationOverride, if set, overrides how
 	// often the SQLWatcher checkpoints noops.
 	SQLWatcherCheckpointNoopsEveryDurationOverride time.Duration
+
+	// SplitterStepLogger is used to capture internal steps the splitter is
+	// making, for debugging and test-readability purposes.
+	SplitterStepLogger func(string)
 
 	// ExcludeDroppedDescriptorsFromLookup is used to control if the
 	// SQLTranslator ignores dropped descriptors. If enabled, dropped
@@ -82,6 +90,10 @@ type TestingKnobs struct {
 	// ReconcilerInitialInterceptor, if set, is invoked at the very outset of
 	// the reconciliation process.
 	ReconcilerInitialInterceptor func()
+
+	// ProtectedTSReaderOverrideFn returns a ProtectedTSReader which is used to
+	// override the ProtectedTSReader used when setting up a new store.
+	ProtectedTSReaderOverrideFn func(clock *hlc.Clock) ProtectedTSReader
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

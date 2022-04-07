@@ -12,6 +12,7 @@ package kvserver_test
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -32,7 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,7 +53,7 @@ const (
 	n2 = 1
 
 	pauseHeartbeats = true
-	keepHeartbeats  = true
+	keepHeartbeats  = false
 )
 
 // This is a sanity check in which the breaker plays no role.
@@ -77,12 +83,13 @@ func TestReplicaCircuitBreaker_LeaseholderTripped(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	tc := setupCircuitBreakerTest(t)
 	defer tc.Stopper().Stop(context.Background())
+	k := tc.ScratchRange(t)
 
 	// Get lease on n1.
 	require.NoError(t, tc.Write(n1))
 	// Disable the probe so that when the breaker trips, it stays tripped.
 	tc.SetProbeEnabled(n1, false)
-	tc.Report(n1, errors.New("boom"))
+	tc.TripBreaker(n1)
 
 	s1 := tc.GetFirstStoreFromServer(t, n1)
 	s2 := tc.GetFirstStoreFromServer(t, n2)
@@ -92,10 +99,10 @@ func TestReplicaCircuitBreaker_LeaseholderTripped(t *testing.T) {
 	require.Zero(t, s2.Metrics().ReplicaCircuitBreakerCurTripped.Value())
 	require.Zero(t, s2.Metrics().ReplicaCircuitBreakerCumTripped.Count())
 
-	// n1 could theoretically still serve reads (there is a valid lease
-	// and none of the latches are taken), but since it is hard to determine
-	// that upfront we currently fail all reads as well.
-	tc.RequireIsBreakerOpen(t, tc.Read(n1))
+	// n1 can still serve reads despite the breaker having tripped, as there is a
+	// valid lease and no poisoned latches prevent the read.
+	require.NoError(t, tc.Read(n1))
+	require.NoError(t, tc.FollowerRead(n1))
 	tc.RequireIsBreakerOpen(t, tc.Write(n1))
 
 	// When we go through the KV client stack, we still get the breaker error
@@ -103,23 +110,29 @@ func TestReplicaCircuitBreaker_LeaseholderTripped(t *testing.T) {
 	tc.RequireIsBreakerOpen(t, tc.WriteDS(n1))
 	tc.RequireIsBreakerOpen(t, tc.WriteDS(n2))
 
+	// Can't transfer the lease away while breaker is tripped. (This would be
+	// a bad idea, since n1 would stop serving strong reads, thus making the
+	// outage worse).
+	tc.RequireIsBreakerOpen(t,
+		tc.TransferRangeLease(tc.LookupRangeOrFatal(t, k), tc.Target(n2)),
+	)
+
 	// n2 does not have the lease so all it does is redirect to the leaseholder
-	// n1.
+	// n1, but it can serve follower reads.
 	tc.RequireIsNotLeaseholderError(t, tc.Read(n2))
+	require.NoError(t, tc.FollowerRead(n2))
 	tc.RequireIsNotLeaseholderError(t, tc.Write(n2))
 
 	// Enable the probe. Even a read should trigger the probe
 	// and within due time the breaker should heal.
 	tc.SetProbeEnabled(n1, true)
-	tc.UntripsSoon(t, tc.Read, n1)
-	// Same behavior on writes.
-	tc.Report(n1, errors.New("boom again"))
+	require.NoError(t, tc.Read(n1)) // this always worked
+	// Writes heal soon.
 	tc.UntripsSoon(t, tc.Write, n1)
 
-	// Currently tripped drops back to zero, all-time is two (since we tripped
-	// it twice)
+	// Currently tripped drops back to zero, all-time remains at one.
 	require.EqualValues(t, 0, s1.Metrics().ReplicaCircuitBreakerCurTripped.Value())
-	require.EqualValues(t, 2, s1.Metrics().ReplicaCircuitBreakerCumTripped.Count())
+	require.EqualValues(t, 1, s1.Metrics().ReplicaCircuitBreakerCumTripped.Count())
 	// s2 wasn't affected by any breaker events.
 	require.Zero(t, s2.Metrics().ReplicaCircuitBreakerCurTripped.Value())
 	require.Zero(t, s2.Metrics().ReplicaCircuitBreakerCumTripped.Count())
@@ -129,9 +142,9 @@ func TestReplicaCircuitBreaker_LeaseholderTripped(t *testing.T) {
 // breaker on follower n2. Before the breaker is tripped, we see
 // NotLeaseholderError. When it's tripped, those are supplanted by the breaker
 // errors. Once we allow the breaker to probe, the breaker untrips. In
-// particular, this tests that the probe can succeed even when run on a
-// follower (which would not be true if it required the local Replica to
-// execute an operation that requires the lease).
+// particular, this tests that the probe can succeed even when run on a follower
+// (which would not be true if it required the local Replica to execute an
+// operation that requires the lease).
 func TestReplicaCircuitBreaker_FollowerTripped(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -142,7 +155,7 @@ func TestReplicaCircuitBreaker_FollowerTripped(t *testing.T) {
 	require.NoError(t, tc.Write(n1))
 	// Disable the probe on n2 so that when the breaker trips, it stays tripped.
 	tc.SetProbeEnabled(n2, false)
-	tc.Report(n2, errors.New("boom"))
+	tc.TripBreaker(n2)
 
 	// We didn't trip the leaseholder n1, so it is unaffected.
 	require.NoError(t, tc.Read(n1))
@@ -153,31 +166,21 @@ func TestReplicaCircuitBreaker_FollowerTripped(t *testing.T) {
 	// time of writing it would propagate it.
 	require.NoError(t, tc.WriteDS(n1))
 
-	tc.RequireIsBreakerOpen(t, tc.Read(n2))
-	tc.RequireIsBreakerOpen(t, tc.Write(n2))
+	tc.RequireIsNotLeaseholderError(t, tc.Read(n2))
+	tc.RequireIsNotLeaseholderError(t, tc.Write(n2))
+	require.NoError(t, tc.FollowerRead(n2))
 
-	// Enable the probe. Even a read should trigger the probe
-	// and within due time the breaker should heal, giving us
-	// NotLeaseholderErrors again.
-	//
-	// TODO(tbg): this test would be more meaningful with follower reads. They
-	// should succeed when the breaker is open and fail if the breaker is
-	// tripped. However knowing that the circuit breaker check sits at the top
-	// of Replica.sendWithRangeID, it's clear that it won't make a difference.
+	// Enable the probe again. n2 should untrip soon.
 	tc.SetProbeEnabled(n2, true)
+	tc.RequireIsNotLeaseholderError(t, tc.Read(n2))
+	tc.RequireIsNotLeaseholderError(t, tc.Write(n2))
 	testutils.SucceedsSoon(t, func() error {
-		if err := tc.Read(n2); !errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
-			return err
-		}
-		return nil
-	})
-	// Same behavior on writes.
-	tc.Report(n2, errors.New("boom again"))
-	testutils.SucceedsSoon(t, func() error {
-		if err := tc.Write(n2); !errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
-			return err
-		}
-		return nil
+		// NB: this is slightly contrived - the mere act of accessing Err() is what
+		// triggers the probe! Regular requests on the replica wouldn'd do that,
+		// since we're intentionally preferring a NotLeaseholderError over a breaker
+		// error (and thus aren't ever accessing the breaker when we can't serve the
+		// request).
+		return tc.repls[n2].Breaker().Signal().Err()
 	})
 }
 
@@ -197,34 +200,45 @@ func TestReplicaCircuitBreaker_LeaselessTripped(t *testing.T) {
 	// disabled.
 	require.NoError(t, tc.Write(n1))
 	tc.SetProbeEnabled(n1, false)
-	tc.Report(n1, errors.New("boom"))
-	resumeHeartbeats := tc.ExpireAllLeases(t, pauseHeartbeats)
+	tc.TripBreaker(n1)
+	resumeHeartbeats := tc.ExpireAllLeasesAndN1LivenessRecord(t, pauseHeartbeats)
 
-	// n2 (not n1) will return a NotLeaseholderError. This may be surprising -
-	// why isn't it trying and succeeding to acquire a lease - but it does
-	// not do that because it sees that the new leaseholder (n2) is not live
-	// itself. We'll revisit this after re-enabling liveness later in the test.
-	{
-		err := tc.Read(n2)
-		// At time of writing: not incrementing epoch on n1 because next
-		// leaseholder (n2) not live.
-		t.Log(err)
-		tc.RequireIsNotLeaseholderError(t, err)
-		// Same behavior for write on n2.
-		tc.RequireIsNotLeaseholderError(t, tc.Write(n2))
-	}
-	// On n1, run into the circuit breaker when requesting lease.
-	{
-		tc.RequireIsBreakerOpen(t, tc.Read(n1))
+	// On n1, run into the circuit breaker when requesting lease. We have to
+	// resume heartbeats for this to not time out, as requesting the new lease
+	// entails doing liveness checks which can't succeed if nobody is
+	// heartbeating, and we'd get stuck in liveness before reaching the circuit
+	// breaker. (In other words, replica circuit breaking doesn't fail-fast
+	// requests reliably if liveness is unavailable; this is tracked in #74616).
+	// We don't attempt to acquire a lease on n2 since it would try and succeed
+	// (except the test harness categorically prevents n2 from getting a lease,
+	// injecting an error).
+	resumeHeartbeats()
+	testutils.SucceedsSoon(t, func() error {
+		err := tc.Read(n1)
+		if errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
+			// Retriable errors can occur when manipulating the liveness record in
+			// preparation for requesting a lease, such as:
+			//
+			// [NotLeaseHolderError] failed to manipulate liveness record: heartbeat
+			// failed on epoch increment; r45: replica (n1,s1):1 not lease holder;
+			// current lease is repl=(n1,s1):1 seq=1 start=0,0 epo=1 pro=[...]
+			return err
+		}
+		tc.RequireIsBreakerOpen(t, err)
 		tc.RequireIsBreakerOpen(t, tc.Write(n1))
-	}
+		return nil
+	})
+
+	// Can still perform follower reads on both nodes, as this does not rely on
+	// the lease and does not consult the breaker.
+	require.NoError(t, tc.FollowerRead(n1))
+	require.NoError(t, tc.FollowerRead(n2))
 
 	// Let the breaker heal and things should go back to normal. This is not a
 	// trivial thing to hold, as the probe needs to go through for this, and if
 	// we're not careful, the probe itself is held up by the breaker as well, or
 	// the probe will try to acquire a lease (which we're currently careful to
 	// avoid).
-	resumeHeartbeats()
 	tc.SetProbeEnabled(n1, true)
 	tc.UntripsSoon(t, tc.Read, n1)
 	tc.UntripsSoon(t, tc.Write, n1)
@@ -249,21 +263,33 @@ func TestReplicaCircuitBreaker_Leaseholder_QuorumLoss(t *testing.T) {
 	tc.StopServer(n2) // lose quorum
 
 	// We didn't lose the liveness range (which is only on n1).
-	require.NoError(t, tc.Server(n1).HeartbeatNodeLiveness())
+	tc.HeartbeatNodeLiveness(t, n1)
+
+	// Read still works, as we have valid lease and no poisoned latch
+	// underneath.
+	require.NoError(t, tc.Read(n1))
 	tc.SetSlowThreshold(10 * time.Millisecond)
 	{
 		err := tc.Write(n1)
 		var ae *roachpb.AmbiguousResultError
 		require.True(t, errors.As(err, &ae), "%+v", err)
 		t.Log(err)
+		tc.RequireIsBreakerOpen(t, err)
 	}
-	tc.RequireIsBreakerOpen(t, tc.Read(n1))
+	// We still have a valid lease, but now the above write is holding a poisoned
+	// latch (this is true despite the write itself having returned already).
+	// However, can still serve follower reads because those don't check latches
+	// (nor do they need the lease, though there is a valid one in this case).
+	{
+		tc.RequireIsBreakerOpen(t, tc.Read(n1))
+		require.NoError(t, tc.FollowerRead(n1))
+	}
 
 	// Bring n2 back and service should be restored.
 	tc.SetSlowThreshold(0) // reset
 	require.NoError(t, tc.RestartServer(n2))
-	tc.UntripsSoon(t, tc.Read, n1)
-	require.NoError(t, tc.Write(n1))
+	tc.UntripsSoon(t, tc.Write, n1) // poisoned latch goes away
+	require.NoError(t, tc.Read(n1))
 }
 
 // In this test, the range is on n1 and n2 and we place the lease on n2 and
@@ -274,6 +300,7 @@ func TestReplicaCircuitBreaker_Leaseholder_QuorumLoss(t *testing.T) {
 // leases have lots of special casing internally, this is easy to get wrong.
 func TestReplicaCircuitBreaker_Follower_QuorumLoss(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 76781, "flaky test")
 	defer log.Scope(t).Close(t)
 	tc := setupCircuitBreakerTest(t)
 	defer tc.Stopper().Stop(context.Background())
@@ -281,12 +308,13 @@ func TestReplicaCircuitBreaker_Follower_QuorumLoss(t *testing.T) {
 	// Get lease to n2 so that we can lose it without taking down the system ranges.
 	desc := tc.LookupRangeOrFatal(t, tc.ScratchRange(t))
 	tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(n2))
-	resumeHeartbeats := tc.ExpireAllLeases(t, keepHeartbeats)
+	resumeHeartbeats := tc.ExpireAllLeasesAndN1LivenessRecord(t, keepHeartbeats)
 	tc.StopServer(n2) // lose quorum and leaseholder
 	resumeHeartbeats()
 
 	// We didn't lose the liveness range (which is only on n1).
-	require.NoError(t, tc.Server(n1).HeartbeatNodeLiveness())
+	tc.HeartbeatNodeLiveness(t, n1)
+
 	tc.SetSlowThreshold(10 * time.Millisecond)
 	tc.RequireIsBreakerOpen(t, tc.Write(n1))
 	tc.RequireIsBreakerOpen(t, tc.Read(n1))
@@ -294,8 +322,8 @@ func TestReplicaCircuitBreaker_Follower_QuorumLoss(t *testing.T) {
 	// Bring n2 back and service should be restored.
 	tc.SetSlowThreshold(0) // reset
 	require.NoError(t, tc.RestartServer(n2))
-	tc.UntripsSoon(t, tc.Read, n1)
-	require.NoError(t, tc.Write(n1))
+	tc.UntripsSoon(t, tc.Write, n1)
+	require.NoError(t, tc.Read(n1))
 }
 
 // This test is skipped but documents that the current circuit breakers cannot
@@ -347,7 +375,7 @@ func TestReplicaCircuitBreaker_Liveness_QuorumLoss(t *testing.T) {
 
 	// Expire all leases. We also pause all heartbeats but that doesn't really
 	// matter since the liveness range is unavailable anyway.
-	resume := tc.ExpireAllLeases(t, pauseHeartbeats)
+	resume := tc.ExpireAllLeasesAndN1LivenessRecord(t, pauseHeartbeats)
 	defer resume()
 
 	// Since there isn't a lease, and the liveness range is down, the circuit
@@ -364,6 +392,263 @@ func TestReplicaCircuitBreaker_Liveness_QuorumLoss(t *testing.T) {
 
 	tc.UntripsSoon(t, tc.Read, n1)
 	require.NoError(t, tc.Write(n1))
+}
+
+type dummyStream struct {
+	name string
+	t    interface {
+		Helper()
+		Logf(string, ...interface{})
+	}
+	ctx  context.Context
+	recv chan *roachpb.RangeFeedEvent
+}
+
+func (s *dummyStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *dummyStream) Send(ev *roachpb.RangeFeedEvent) error {
+	if ev.Val == nil && ev.Error == nil {
+		s.t.Logf("%s: ignoring event: %v", s.name, ev)
+		return nil
+	}
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case s.recv <- ev:
+		return nil
+	}
+}
+
+// This test verifies that RangeFeed bypasses the circuit breaker. When the
+// breaker is tripped, existing RangeFeeds remain in place and new ones can be
+// started. When the breaker untrips, these feeds can make progress. The test
+// goes as far as actually losing quorum to verify this end-to-end.
+func TestReplicaCircuitBreaker_RangeFeed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	tc := setupCircuitBreakerTest(t)
+	ctx := context.Background()
+	defer tc.Stopper().Stop(ctx)
+
+	require.NoError(t, tc.Write(n1))
+	desc := tc.LookupRangeOrFatal(t, tc.ScratchRange(t))
+	args := &roachpb.RangeFeedRequest{
+		Span: roachpb.Span{Key: desc.StartKey.AsRawKey(), EndKey: desc.EndKey.AsRawKey()},
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream1 := &dummyStream{t: t, ctx: ctx, name: "rangefeed1", recv: make(chan *roachpb.RangeFeedEvent)}
+	require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "stream1", func(ctx context.Context) {
+		err := tc.repls[0].RangeFeed(args, stream1).GoError()
+		if ctx.Err() != nil {
+			return // main goroutine stopping
+		}
+		assert.NoError(t, err) // avoid Fatal on goroutine
+	}))
+
+	readOneVal := func(ctx context.Context, stream *dummyStream, timeout time.Duration) error {
+		for {
+			select {
+			case <-time.After(timeout):
+				return errors.Errorf("%s: read timed out after %.2fs", stream.name, timeout.Seconds())
+			case <-ctx.Done():
+				return ctx.Err()
+			case ev := <-stream.recv:
+				if ev.Error != nil {
+					return ev.Error.Error.GoError()
+				}
+				if ev.Val != nil {
+					t.Logf("%s: %s", stream.name, ev)
+					return nil
+				}
+			}
+		}
+	}
+
+	testutils.SucceedsSoon(t, func() error {
+		require.NoError(t, tc.Write(n1))
+		return readOneVal(ctx, stream1, time.Millisecond)
+	})
+
+	// NB: keep heartbeats because we're not trying to lose the liveness range.
+	undo := tc.ExpireAllLeasesAndN1LivenessRecord(t, keepHeartbeats)
+	undo()
+	tc.SetSlowThreshold(10 * time.Millisecond)
+	tc.StopServer(n2)
+	// NB: this is essentially always a breaker error but we can also get
+	// NotLeaseholderError(heartbeat failed on epoch increment), so we retry
+	// until we see the breaker error.
+	testutils.SucceedsSoon(t, func() error {
+		err := tc.Write(n1)
+		if err == nil {
+			return errors.New("no error returned")
+		}
+		if !tc.IsBreakerOpen(err) {
+			return err
+		}
+		return nil
+	})
+
+	// Start another stream during the "outage" to make sure it isn't rejected by
+	// the breaker.
+	stream2 := &dummyStream{t: t, ctx: ctx, name: "rangefeed2", recv: make(chan *roachpb.RangeFeedEvent)}
+	require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "stream2", func(ctx context.Context) {
+		err := tc.repls[0].RangeFeed(args, stream2).GoError()
+		if ctx.Err() != nil {
+			return // main goroutine stopping
+		}
+		assert.NoError(t, err) // avoid Fatal on goroutine
+	}))
+
+	tc.SetSlowThreshold(0)
+	require.NoError(t, tc.RestartServer(n2))
+
+	tc.UntripsSoon(t, tc.Write, n1)
+	require.NoError(t, readOneVal(ctx, stream1, testutils.DefaultSucceedsSoonDuration))
+	// For the stream that started mid-way through the outage, we expect it to
+	// return a circuit breaker error, but in theory it could also never have
+	// tried to acquire a lease, in which case it might return a value as well.
+	if err := readOneVal(ctx, stream2, testutils.DefaultSucceedsSoonDuration); err != nil {
+		if !tc.IsBreakerOpen(err) && !errors.HasType(err, (*roachpb.RangeFeedRetryError)(nil)) {
+			t.Fatalf("%+v", err)
+		}
+	}
+}
+
+func TestReplicaCircuitBreaker_ExemptRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	tc := setupCircuitBreakerTest(t)
+	defer tc.Stopper().Stop(context.Background())
+
+	// Put the lease on n1 but then trip the breaker with the probe
+	// disabled, i.e. it will stay tripped.
+	require.NoError(t, tc.Write(n1))
+	tc.SetProbeEnabled(n1, false)
+	tc.TripBreaker(n1)
+
+	exemptRequests := []func() roachpb.Request{
+		func() roachpb.Request { return &roachpb.ExportRequest{ReturnSST: true} },
+		func() roachpb.Request {
+			sstFile := &storage.MemFile{}
+			sst := storage.MakeIngestionSSTWriter(context.Background(), cluster.MakeTestingClusterSettings(), sstFile)
+			defer sst.Close()
+			require.NoError(t, sst.LogData([]byte("hello")))
+			require.NoError(t, sst.Finish())
+
+			addReq := &roachpb.AddSSTableRequest{
+				Data:           sstFile.Data(),
+				IngestAsWrites: true,
+			}
+			return addReq
+		},
+		func() roachpb.Request {
+			return &roachpb.RevertRangeRequest{TargetTime: tc.Servers[0].Clock().Now()}
+		},
+		func() roachpb.Request {
+			return &roachpb.GCRequest{}
+		},
+		func() roachpb.Request {
+			return &roachpb.ClearRangeRequest{}
+		},
+		func() roachpb.Request {
+			return &roachpb.ProbeRequest{}
+		},
+	}
+
+	for _, reqFn := range exemptRequests {
+		req := reqFn()
+		tc.Run(t, fmt.Sprintf("with-existing-lease/%s", req.Method()), func(t *testing.T) {
+			require.NoError(t, tc.Send(n1, req))
+		})
+	}
+	for _, reqFn := range exemptRequests {
+		req := reqFn()
+		tc.Run(t, fmt.Sprintf("with-acquire-lease/%s", req.Method()), func(t *testing.T) {
+			resumeHeartbeats := tc.ExpireAllLeasesAndN1LivenessRecord(t, pauseHeartbeats)
+			resumeHeartbeats() // intentionally resume right now so that lease can be acquired
+			// NB: when looking into the traces here, we sometimes see - as expected -
+			// that when the request tries to acquire a lease, the breaker is still
+			// tripped. That's why there is a retry loop here.
+			testutils.SucceedsSoon(t, func() error {
+				err := tc.Send(n1, req)
+				if errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
+					return err
+				}
+				require.NoError(t, err)
+				return nil
+			})
+		})
+	}
+
+	resumeHeartbeats := tc.ExpireAllLeasesAndN1LivenessRecord(t, pauseHeartbeats)
+
+	for _, reqFn := range exemptRequests {
+		req := reqFn()
+		tc.Run(t, fmt.Sprintf("with-unavailable-lease/%s", req.Method()), func(t *testing.T) {
+			if m := req.Method(); m == roachpb.Probe {
+				// Probe does not require the lease, and is the most-tested of the bunch
+				// already. We don't have to test it again here, which would require undue
+				// amounts of special-casing below.
+				skip.IgnoreLintf(t, "subtest does not apply to %s", m)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Millisecond)
+			defer cancel()
+			const maxWait = 5 * time.Second
+			tBegin := timeutil.Now()
+			err := tc.SendCtx(ctx, n1, req)
+			t.Log(err) // usually: [NotLeaseHolderError] lease acquisition canceled because context canceled
+			require.Error(t, err)
+			require.Error(t, ctx.Err())
+			// Make sure we didn't run into the "long" timeout inside of SendCtx but
+			// actually terminated as a result of our ctx cancelling.
+			require.Less(t, timeutil.Since(tBegin), maxWait)
+		})
+	}
+
+	// Restore the breaker via the probe.
+	resumeHeartbeats()
+	tc.SetProbeEnabled(n1, true)
+	tc.UntripsSoon(t, tc.Write, n1)
+
+	// Lose quorum (liveness stays intact).
+	tc.SetSlowThreshold(10 * time.Millisecond)
+	tc.StopServer(n2)
+	// Let the breaker trip. This leaves a poisoned latch behind that at least some of
+	// the requests will interact with.
+	tc.RequireIsBreakerOpen(t, tc.Write(n1))
+	tc.RequireIsBreakerOpen(t, tc.Read(n1))
+
+	for _, reqFn := range exemptRequests {
+		req := reqFn()
+		tc.Run(t, fmt.Sprintf("with-poisoned-latch/%s", req.Method()), func(t *testing.T) {
+			if m := req.Method(); m == roachpb.GC {
+				// GC without GCKeys acquires no latches and is a pure read. If we want
+				// to put a key in there, we need to pick the right timestamp (since you
+				// can't GC a live key); it's all rather annoying and not worth it. In
+				// the long run, we also completely want to avoid acquiring latches for
+				// this request (since it should only mutate keyspace that has since
+				// fallen under the GCThreshold), so avoid cooking up anything special
+				// here.
+				skip.IgnoreLintf(t, "subtest does not apply to %s", m)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Millisecond)
+			defer cancel()
+			const maxWait = 5 * time.Second
+			tBegin := timeutil.Now()
+			err := tc.SendCtx(ctx, n1, req)
+			t.Log(err)
+			require.Error(t, err)
+			require.Error(t, ctx.Err())
+			// Make sure we didn't run into the "long" timeout inside of SendCtx but
+			// actually terminated as a result of our ctx cancelling.
+			require.Less(t, timeutil.Since(tBegin), maxWait)
+		})
+	}
 }
 
 // Test infrastructure below.
@@ -389,19 +674,18 @@ func makeBreakerToggleable(b *circuit.Breaker) (setProbeEnabled func(bool)) {
 	}
 }
 
-type replWithKnob struct {
-	*kvserver.Replica
-	setProbeEnabled func(bool)
-}
-
 type circuitBreakerTest struct {
+	t decoT
 	*testcluster.TestCluster
 	slowThresh  *atomic.Value // time.Duration
 	ManualClock *hlc.HybridManualClock
 	repls       []replWithKnob // 0 -> repl on Servers[0], etc
+
+	seq int
 }
 
 func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
+	skip.UnderStressRace(t)
 	manualClock := hlc.NewHybridManualClock()
 	var rangeID int64             // atomic
 	slowThresh := &atomic.Value{} // supports .SetSlowThreshold(x)
@@ -472,7 +756,8 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 	k := tc.ScratchRange(t)
 	atomic.StoreInt64(&rangeID, int64(tc.LookupRangeOrFatal(t, k).RangeID))
 
-	tc.AddVotersOrFatal(t, k, tc.Target(1))
+	tc.AddVotersOrFatal(t, k, tc.Target(n2))
+	require.NoError(t, tc.WaitForVoters(k, tc.Target(n2)))
 
 	var repls []replWithKnob
 	for i := range tc.Servers {
@@ -481,6 +766,7 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 		repls = append(repls, replWithKnob{repl, enableProbe})
 	}
 	return &circuitBreakerTest{
+		t:           decoT{t},
 		TestCluster: tc,
 		ManualClock: manualClock,
 		repls:       repls,
@@ -488,12 +774,28 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 	}
 }
 
+// Run is a wrapper around t.Run that allows the test harness to print traces
+// using the subtest's *testing.T.
+func (cbt *circuitBreakerTest) Run(t *testing.T, name string, f func(t *testing.T)) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) {
+		t.Helper()
+		outerT := cbt.t
+		cbt.t = decoT{t}
+		defer func() {
+			cbt.t = outerT
+		}()
+		f(t)
+	})
+}
+
 func (cbt *circuitBreakerTest) SetProbeEnabled(idx int, to bool) {
 	cbt.repls[idx].setProbeEnabled(to)
 }
 
-func (cbt *circuitBreakerTest) Report(idx int, err error) {
-	cbt.repls[idx].Replica.Breaker().Report(err)
+func (cbt *circuitBreakerTest) TripBreaker(idx int) {
+	repl := cbt.repls[idx].Replica
+	repl.TripBreaker()
 }
 
 func (cbt *circuitBreakerTest) UntripsSoon(t *testing.T, method func(idx int) error, idx int) {
@@ -502,31 +804,60 @@ func (cbt *circuitBreakerTest) UntripsSoon(t *testing.T, method func(idx int) er
 		t.Helper()
 		err := method(idx)
 		// All errors coming out should be annotated as coming from
-		// the circuit breaker.
-		if err != nil && !errors.Is(err, circuit.ErrBreakerOpen) {
+		// the circuit breaker. In rare cases, we can also see a
+		// NotLeaseholderError such as this one:
+		// [NotLeaseHolderError] failed to manipulate liveness record: heartbeat
+		// failed on epoch increment; r45: replica (n1,s1):1 not lease holder;
+		// current lease is repl=(n1,s1):1 seq=1 start=0,0 epo=1 pro=[...]
+		if err != nil &&
+			!errors.Is(err, circuit.ErrBreakerOpen) &&
+			!errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil)) {
+
 			t.Fatalf("saw unexpected error %+v", err)
 		}
 		return err
 	})
 }
 
-func (cbt *circuitBreakerTest) ExpireAllLeases(t *testing.T, pauseHeartbeats bool) (undo func()) {
+func (cbt *circuitBreakerTest) ExpireAllLeasesAndN1LivenessRecord(
+	t *testing.T, pauseHeartbeats bool,
+) (undo func()) {
 	t.Helper()
-	var maxWT int64
 	var fs []func()
-	for _, srv := range cbt.Servers {
+	for idx, srv := range cbt.Servers {
 		lv := srv.NodeLiveness().(*liveness.NodeLiveness)
+
 		if pauseHeartbeats {
 			undo := lv.PauseAllHeartbeatsForTest()
 			fs = append(fs, undo)
 		}
+
 		self, ok := lv.Self()
 		require.True(t, ok)
-		if maxWT < self.Expiration.WallTime {
-			maxWT = self.Expiration.WallTime
+
+		cbt.ManualClock.Forward(self.Expiration.WallTime)
+		if idx == n1 {
+			// Invalidate n1's liveness record, to make sure that ranges on n1 need
+			// to acquire a new lease (vs waiting for a heartbeat to the liveness
+			// record resuscitating the old one).
+			//
+			// Needing to do this is the reason for special-casing this entire method
+			// around n1; if we stop heartbeats for both nodes, they can't increment
+			// each others liveness records: if a node's liveness is paused, it doesn't
+			// allow incrementing records neither. (This is silly).
+			lv2 := cbt.Server(n2).NodeLiveness().(*liveness.NodeLiveness)
+			testutils.SucceedsSoon(t, func() error {
+				self, ok := lv.Self()
+				require.True(t, ok)
+				if self.IsLive(cbt.Server(n2).Clock().Now().GoTime()) {
+					// Someone else must have incremented epoch.
+					return nil
+				}
+				return lv2.IncrementEpoch(context.Background(), self)
+			})
 		}
 	}
-	cbt.ManualClock.Forward(maxWT + 1)
+
 	return func() {
 		for _, f := range fs {
 			f()
@@ -534,24 +865,70 @@ func (cbt *circuitBreakerTest) ExpireAllLeases(t *testing.T, pauseHeartbeats boo
 	}
 }
 
-func (*circuitBreakerTest) sendViaRepl(repl *kvserver.Replica, req roachpb.Request) error {
+func (cbt *circuitBreakerTest) Send(idx int, req roachpb.Request) error {
+	cbt.t.Helper()
+	return cbt.SendCtx(context.Background(), idx, req)
+}
+
+func (cbt *circuitBreakerTest) SendCtx(ctx context.Context, idx int, req roachpb.Request) error {
+	return cbt.SendCtxTS(ctx, idx, req, cbt.repls[idx].Clock().Now())
+}
+
+func (cbt *circuitBreakerTest) SendCtxTS(
+	ctx context.Context, idx int, req roachpb.Request, ts hlc.Timestamp,
+) error {
+	cbt.t.Helper()
+	ctx, finishAndGet := tracing.ContextWithRecordingSpan(ctx, cbt.repls[idx].Tracer, "SendCtx("+req.Method().String()+")")
+	defer time.AfterFunc(10*time.Second, func() {
+		rec := tracing.SpanFromContext(ctx).GetConfiguredRecording()
+		cbt.t.Logf("slow request: %s", rec)
+	}).Stop()
+	defer func() {
+		cbt.t.Helper()
+		rec := finishAndGet()
+		cbt.t.Logf("%s", rec)
+	}()
 	var ba roachpb.BatchRequest
+	repl := cbt.repls[idx]
 	ba.RangeID = repl.Desc().RangeID
-	ba.Timestamp = repl.Clock().Now()
+	ba.Timestamp = ts
 	ba.Add(req)
-	ctx, cancel := context.WithTimeout(context.Background(), testutils.DefaultSucceedsSoonDuration)
+	if h := req.Header(); len(h.Key) == 0 {
+		h.Key = repl.Desc().StartKey.AsRawKey()
+		if roachpb.IsRange(req) {
+			h.EndKey = repl.Desc().EndKey.AsRawKey()
+		}
+		req.SetHeader(h)
+	}
+	parCtx := ctx
+	ctx, cancel := context.WithTimeout(ctx, testutils.DefaultSucceedsSoonDuration)
 	defer cancel()
+	// Tag the breaker with the request. Once Send returns, we'll check that it's
+	// no longer tracked by the breaker. This gives good coverage that we're not
+	// going to leak memory.
+	ctx = context.WithValue(ctx, req, struct{}{})
+
 	_, pErr := repl.Send(ctx, ba)
 	// If our context got canceled, return an opaque error regardless of presence or
 	// absence of actual error. This makes sure we don't accidentally pass tests as
 	// a result of our context cancellation.
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil && parCtx.Err() == nil {
 		pErr = roachpb.NewErrorf("timed out waiting for batch response: %v", pErr)
 	}
+
 	return pErr.GoError()
 }
 
-func (*circuitBreakerTest) sendViaDistSender(ds *kvcoord.DistSender, req roachpb.Request) error {
+func (cbt *circuitBreakerTest) WriteDS(idx int) error {
+	cbt.t.Helper()
+	put := roachpb.NewPut(cbt.repls[idx].Desc().StartKey.AsRawKey(), roachpb.MakeValueFromString("hello"))
+	return cbt.sendViaDistSender(cbt.Servers[idx].DistSender(), put)
+}
+
+func (cbt *circuitBreakerTest) sendViaDistSender(
+	ds *kvcoord.DistSender, req roachpb.Request,
+) error {
+	cbt.t.Helper()
 	var ba roachpb.BatchRequest
 	ba.Add(req)
 	ctx, cancel := context.WithTimeout(context.Background(), testutils.DefaultSucceedsSoonDuration)
@@ -566,24 +943,30 @@ func (*circuitBreakerTest) sendViaDistSender(ds *kvcoord.DistSender, req roachpb
 	return pErr.GoError()
 }
 
-func (*circuitBreakerTest) RequireIsBreakerOpen(t *testing.T, err error) {
+func (*circuitBreakerTest) IsBreakerOpen(err error) bool {
+	// NB: we will see AmbiguousResultError here when proposals are inflight while
+	// the breaker trips. These are wrapping errors, so the assertions below will
+	// look through them.
+	if !errors.Is(err, circuit.ErrBreakerOpen) {
+		return false
+	}
+	return errors.HasType(err, (*roachpb.ReplicaUnavailableError)(nil))
+}
+
+func (cbt *circuitBreakerTest) RequireIsBreakerOpen(t *testing.T, err error) {
 	t.Helper()
-	require.True(t, errors.Is(err, circuit.ErrBreakerOpen), "%+v", err)
+	t.Log(err)
+	// NB: we will see AmbiguousResultError here when proposals are inflight while
+	// the breaker trips. These are wrapping errors, so the assertions below will
+	// look through them.
+	require.True(t, cbt.IsBreakerOpen(err), "%+v", err)
 }
 
 func (*circuitBreakerTest) RequireIsNotLeaseholderError(t *testing.T, err error) {
 	t.Helper()
+	t.Log(err)
 	ok := errors.HasType(err, (*roachpb.NotLeaseHolderError)(nil))
 	require.True(t, ok, "%+v", err)
-}
-
-func (cbt *circuitBreakerTest) Write(idx int) error {
-	return cbt.writeViaRepl(cbt.repls[idx].Replica)
-}
-
-func (cbt *circuitBreakerTest) WriteDS(idx int) error {
-	put := roachpb.NewPut(cbt.repls[idx].Desc().StartKey.AsRawKey(), roachpb.MakeValueFromString("hello"))
-	return cbt.sendViaDistSender(cbt.Servers[idx].DistSender(), put)
 }
 
 // SetSlowThreshold sets the SlowReplicationThreshold for requests sent through the
@@ -593,16 +976,57 @@ func (cbt *circuitBreakerTest) SetSlowThreshold(dur time.Duration) {
 	cbt.slowThresh.Store(dur)
 }
 
+func (cbt *circuitBreakerTest) Write(idx int) error {
+	cbt.t.Helper()
+	repl := cbt.repls[idx]
+	cbt.seq++
+	put := roachpb.NewPut(
+		repl.Desc().StartKey.AsRawKey(), roachpb.MakeValueFromString(fmt.Sprintf("hello-%d", cbt.seq)),
+	)
+	return cbt.Send(idx, put)
+}
+
 func (cbt *circuitBreakerTest) Read(idx int) error {
-	return cbt.readViaRepl(cbt.repls[idx].Replica)
-}
-
-func (cbt *circuitBreakerTest) writeViaRepl(repl *kvserver.Replica) error {
-	put := roachpb.NewPut(repl.Desc().StartKey.AsRawKey(), roachpb.MakeValueFromString("hello"))
-	return cbt.sendViaRepl(repl, put)
-}
-
-func (cbt *circuitBreakerTest) readViaRepl(repl *kvserver.Replica) error {
+	cbt.t.Helper()
+	repl := cbt.repls[idx]
 	get := roachpb.NewGet(repl.Desc().StartKey.AsRawKey(), false /* forUpdate */)
-	return cbt.sendViaRepl(repl, get)
+	return cbt.Send(idx, get)
+}
+
+func (cbt *circuitBreakerTest) FollowerRead(idx int) error {
+	cbt.t.Helper()
+	repl := cbt.repls[idx]
+	get := roachpb.NewGet(repl.Desc().StartKey.AsRawKey(), false /* forUpdate */)
+	ctx := context.Background()
+	ts := repl.GetCurrentClosedTimestamp(ctx)
+	return cbt.SendCtxTS(ctx, idx, get, ts)
+}
+
+func (cbt *circuitBreakerTest) HeartbeatNodeLiveness(t *testing.T, idx int) {
+	// Retry loop is needed because heartbeat may race with internal heartbeat
+	// loop.
+	testutils.SucceedsSoon(t, func() error {
+		return cbt.Server(idx).HeartbeatNodeLiveness()
+	})
+}
+
+type replWithKnob struct {
+	*kvserver.Replica
+	setProbeEnabled func(bool)
+}
+
+type logT interface {
+	Helper()
+	Logf(string, ...interface{})
+}
+
+type decoT struct {
+	logT
+}
+
+func (t *decoT) Logf(format string, args ...interface{}) {
+	// It can be difficult to spot the actual failure among all of the
+	// traces, so this is a convenient place to annotate the logging
+	// (or disable it one-off).
+	t.logT.Logf("info:\n"+format, args...)
 }

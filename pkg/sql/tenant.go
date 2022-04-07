@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -148,18 +149,28 @@ func CreateTenantRecord(
 	// Does it even matter given it'll disappear as soon as tenant starts
 	// reconciling?
 	tenantSpanConfig := execCfg.DefaultZoneConfig.AsSpanConfig()
+	// Make sure to enable rangefeeds; the tenant will need them on its system
+	// tables as soon as it starts up. It's not unsafe/buggy if we didn't do this,
+	// -- the tenant's span config reconciliation process would eventually install
+	// appropriate (rangefeed.enabled = true) configs for its system tables, at
+	// which point subsystems that rely on rangefeeds are able to proceed. All of
+	// this can noticeably slow down pod startup, so we just enable things to
+	// start with.
+	tenantSpanConfig.RangefeedEnabled = true
+	// Make it behave like usual system database ranges, for good measure.
+	tenantSpanConfig.GCPolicy.IgnoreStrictEnforcement = true
+
 	tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenID))
-	toUpsert := []roachpb.SpanConfigEntry{
-		{
-			Span: roachpb.Span{
-				Key:    tenantPrefix,
-				EndKey: tenantPrefix.Next(),
-			},
-			Config: tenantSpanConfig,
-		},
+	record, err := spanconfig.MakeRecord(spanconfig.MakeTargetFromSpan(roachpb.Span{
+		Key:    tenantPrefix,
+		EndKey: tenantPrefix.Next(),
+	}), tenantSpanConfig)
+	if err != nil {
+		return err
 	}
+	toUpsert := []spanconfig.Record{record}
 	scKVAccessor := execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn)
-	return scKVAccessor.UpdateSpanConfigEntries(
+	return scKVAccessor.UpdateSpanConfigRecords(
 		ctx, nil /* toDelete */, toUpsert,
 	)
 }
@@ -436,28 +447,47 @@ func GCTenantSync(ctx context.Context, execCfg *ExecutorConfig, info *descpb.Ten
 			return errors.Wrapf(err, "deleting tenant %d usage", info.ID)
 		}
 
+		if execCfg.Settings.Version.IsActive(ctx, clusterversion.TenantSettingsTable) {
+			if _, err := execCfg.InternalExecutor.ExecEx(
+				ctx, "delete-tenant-settings", txn, sessiondata.NodeUserSessionDataOverride,
+				`DELETE FROM system.tenant_settings WHERE tenant_id = $1`, info.ID,
+			); err != nil {
+				return errors.Wrapf(err, "deleting tenant %d settings", info.ID)
+			}
+		}
+
 		if !execCfg.Settings.Version.IsActive(ctx, clusterversion.PreSeedTenantSpanConfigs) {
 			return nil
 		}
 
-		// Clear out all span config entries left over by the tenant.
-		tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(info.ID))
+		// Clear out all span config records left over by the tenant.
+		tenID := roachpb.MakeTenantID(info.ID)
+		tenantPrefix := keys.MakeTenantPrefix(tenID)
 		tenantSpan := roachpb.Span{
 			Key:    tenantPrefix,
 			EndKey: tenantPrefix.PrefixEnd(),
 		}
 
+		systemTarget, err := spanconfig.MakeTenantKeyspaceTarget(tenID, tenID)
+		if err != nil {
+			return err
+		}
 		scKVAccessor := execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn)
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{tenantSpan})
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx, []spanconfig.Target{
+				spanconfig.MakeTargetFromSpan(tenantSpan),
+				spanconfig.MakeTargetFromSystemTarget(systemTarget),
+			},
+		)
 		if err != nil {
 			return err
 		}
 
-		toDelete := make([]roachpb.Span, len(entries))
-		for i, entry := range entries {
-			toDelete[i] = entry.Span
+		toDelete := make([]spanconfig.Target, len(records))
+		for i, record := range records {
+			toDelete[i] = record.GetTarget()
 		}
-		return scKVAccessor.UpdateSpanConfigEntries(ctx, toDelete, nil /* toUpsert */)
+		return scKVAccessor.UpdateSpanConfigRecords(ctx, toDelete, nil /* toUpsert */)
 	})
 	return errors.Wrapf(err, "deleting tenant %d record", info.ID)
 }
@@ -504,8 +534,8 @@ func gcTenantJob(
 func (p *planner) GCTenant(ctx context.Context, tenID uint64) error {
 	// TODO(jeffswenson): Delete internal_crdb.gc_tenant after the DestroyTenant
 	// changes are deployed to all Cockroach Cloud serverless hosts.
-	if !p.ExtendedEvalContext().TxnImplicit {
-		return errors.Errorf("gc_tenant cannot be used inside a transaction")
+	if !p.extendedEvalCtx.TxnIsSingleStmt {
+		return errors.Errorf("gc_tenant cannot be used inside a multi-statement transaction")
 	}
 	var info *descpb.TenantInfo
 	if txnErr := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -548,4 +578,12 @@ func (p *planner) UpdateTenantResourceLimits(
 		ctx, p.Txn(), roachpb.MakeTenantID(tenantID),
 		availableRU, refillRate, maxBurstRU, asOf, asOfConsumedRequestUnits,
 	)
+}
+
+// TestingUpdateTenantRecord is a public wrapper around updateTenantRecord
+// intended for testing purposes.
+func TestingUpdateTenantRecord(
+	ctx context.Context, execCfg *ExecutorConfig, txn *kv.Txn, info *descpb.TenantInfo,
+) error {
+	return updateTenantRecord(ctx, execCfg, txn, info)
 }

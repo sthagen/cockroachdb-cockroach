@@ -10,7 +10,10 @@
 
 package settings
 
-import "context"
+import (
+	"context"
+	"strconv"
+)
 
 // BoolSetting is the interface of a setting variable that will be
 // updated automatically when the corresponding cluster-wide setting
@@ -41,6 +44,20 @@ func (b *BoolSetting) EncodedDefault() string {
 	return EncodeBool(b.defaultValue)
 }
 
+// DecodeToString decodes and renders an encoded value.
+func (b *BoolSetting) DecodeToString(encoded string) (string, error) {
+	bv, err := b.DecodeValue(encoded)
+	if err != nil {
+		return "", err
+	}
+	return EncodeBool(bv), nil
+}
+
+// DecodeValue decodes the value into a float.
+func (b *BoolSetting) DecodeValue(encoded string) (bool, error) {
+	return strconv.ParseBool(encoded)
+}
+
 // Typ returns the short (1 char) string denoting the type of setting.
 func (*BoolSetting) Typ() string {
 	return "b"
@@ -60,12 +77,7 @@ var _ = (*BoolSetting).Default
 // For testing usage only.
 func (b *BoolSetting) Override(ctx context.Context, sv *Values, v bool) {
 	b.set(ctx, sv, v)
-
-	vInt := int64(0)
-	if v {
-		vInt = 1
-	}
-	sv.setDefaultOverrideInt64(b.slot, vInt)
+	sv.setDefaultOverride(b.slot, v)
 }
 
 func (b *BoolSetting) set(ctx context.Context, sv *Values, v bool) {
@@ -78,9 +90,8 @@ func (b *BoolSetting) set(ctx context.Context, sv *Values, v bool) {
 
 func (b *BoolSetting) setToDefault(ctx context.Context, sv *Values) {
 	// See if the default value was overridden.
-	ok, val, _ := sv.getDefaultOverride(b.slot)
-	if ok {
-		b.set(ctx, sv, val > 0)
+	if val := sv.getDefaultOverride(b.slot); val != nil {
+		b.set(ctx, sv, val.(bool))
 		return
 	}
 	b.set(ctx, sv, b.defaultValue)

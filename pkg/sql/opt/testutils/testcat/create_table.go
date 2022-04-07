@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -76,7 +75,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 
 	tab := &Table{TabID: tc.nextStableID(), TabName: stmt.Table, Catalog: tc}
 
-	// Find the PK columns; we have to force these to be non-nullable.
+	// Find the PK columns.
 	pkCols := make(map[tree.Name]struct{})
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
@@ -100,7 +99,11 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		case *tree.ColumnTableDef:
 			if !isMutationColumn(def) {
 				if _, isPKCol := pkCols[def.Name]; isPKCol {
+					// Force PK columns to be non-nullable and non-virtual.
 					def.Nullable.Nullability = tree.NotNull
+					if def.Computed.Computed {
+						def.Computed.Virtual = false
+					}
 				}
 				tab.addColumn(def)
 			}
@@ -398,7 +401,7 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 		// If no columns are specified, attempt to default to PK, ignoring implicit
 		// columns.
 		idx := targetTable.Index(cat.PrimaryIndex)
-		numImplicitCols := idx.ImplicitPartitioningColumnCount()
+		numImplicitCols := idx.ImplicitColumnCount()
 		referencedColNames = make(
 			tree.NameList,
 			0,
@@ -550,14 +553,7 @@ func (tt *Table) addUniqueConstraint(
 	}
 	sort.Ints(cols)
 
-	// Don't add duplicate constraints.
-	for _, c := range tt.uniqueConstraints {
-		if reflect.DeepEqual(c.columnOrdinals, cols) && c.withoutIndex == withoutIndex {
-			return
-		}
-	}
-
-	// We didn't find an existing constraint, so add a new one.
+	// Create the constraint.
 	u := UniqueConstraint{
 		name:           tt.makeUniqueConstraintName(name, columns),
 		tabID:          tt.TabID,
@@ -569,6 +565,16 @@ func (tt *Table) addUniqueConstraint(
 	if predicate != nil {
 		u.predicate = tree.Serialize(predicate)
 	}
+
+	// Don't add duplicate constraints.
+	for _, c := range tt.uniqueConstraints {
+		if reflect.DeepEqual(c.columnOrdinals, u.columnOrdinals) &&
+			c.predicate == u.predicate &&
+			c.withoutIndex == u.withoutIndex {
+			return
+		}
+	}
+
 	tt.uniqueConstraints = append(tt.uniqueConstraints, u)
 }
 
@@ -685,7 +691,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 }
 
 func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
-	return tt.addIndexWithVersion(def, typ, descpb.LatestNonPrimaryIndexDescriptorVersion)
+	return tt.addIndexWithVersion(def, typ, descpb.LatestIndexDescriptorVersion)
 }
 
 func (tt *Table) addIndexWithVersion(
@@ -700,7 +706,7 @@ func (tt *Table) addIndexWithVersion(
 		IdxName:  tt.makeIndexName(def.Name, def.Columns, typ),
 		Unique:   typ != nonUniqueIndex,
 		Inverted: def.Inverted,
-		IdxZone:  &zonepb.ZoneConfig{},
+		IdxZone:  cat.EmptyZone(),
 		table:    tt,
 		version:  version,
 	}
@@ -714,7 +720,8 @@ func (tt *Table) addIndexWithVersion(
 		tt.deleteOnlyIdxCount++
 	}
 
-	// Add explicit columns and mark primary key columns as not null.
+	// Add explicit columns. Primary key columns definitions have already been
+	// updated to be non-nullable and non-virtual.
 	// Add the geoConfig if applicable.
 	idx.ExplicitColCount = len(def.Columns)
 	notNullIndex := true
@@ -733,7 +740,7 @@ func (tt *Table) addIndexWithVersion(
 			switch tt.Columns[col.InvertedSourceColumnOrdinal()].DatumType().Family() {
 			case types.GeometryFamily:
 				// Don't use the default config because it creates a huge number of spans.
-				idx.geoConfig = &geoindex.Config{
+				idx.geoConfig = geoindex.Config{
 					S2Geometry: &geoindex.S2GeometryConfig{
 						MinX: -5,
 						MaxX: 5,
@@ -750,7 +757,7 @@ func (tt *Table) addIndexWithVersion(
 
 			case types.GeographyFamily:
 				// Don't use the default config because it creates a huge number of spans.
-				idx.geoConfig = &geoindex.Config{
+				idx.geoConfig = geoindex.Config{
 					S2Geography: &geoindex.S2GeographyConfig{S2Config: &geoindex.S2Config{
 						MinLevel: 0,
 						MaxLevel: 2,
@@ -785,7 +792,7 @@ func (tt *Table) addIndexWithVersion(
 				p := &partitionBy.List[i]
 				idx.partitions[i] = Partition{
 					name:   string(p.Name),
-					zone:   &zonepb.ZoneConfig{},
+					zone:   cat.EmptyZone(),
 					datums: make([]tree.Datums, 0, len(p.Exprs)),
 				}
 
@@ -915,7 +922,7 @@ func (tt *Table) makeIndexName(defName tree.Name, cols tree.IndexElemList, typ i
 	}
 
 	if typ == primaryIndex {
-		return fmt.Sprintf("%s_pkey", tt.TabName.Table())
+		return tt.TabName.Table() + "_pkey"
 	}
 
 	var sb strings.Builder
@@ -1043,10 +1050,20 @@ func (ti *Index) addColumn(
 
 // columnForIndexElemExpr returns a VirtualComputed table column that can be
 // used as an index column when the index element is an expression. If an
-// existing VirtualComputed column with the same expression exists, it is
-// reused. Otherwise, a new column is added to the table.
+// existing, inaccessible, VirtualComputed column with the same expression
+// exists, it is reused. Otherwise, a new column is added to the table.
 func columnForIndexElemExpr(tt *Table, expr tree.Expr) cat.Column {
 	exprStr := serializeTableDefExpr(expr)
+
+	// Find an existing, inaccessible, virtual computed column with the same
+	// expression.
+	for _, col := range tt.Columns {
+		if col.IsVirtualComputed() &&
+			col.Visibility() == cat.Inaccessible &&
+			col.ComputedExprStr() == exprStr {
+			return col
+		}
+	}
 
 	// Add a new virtual computed column with a unique name.
 	prefix := "crdb_internal_idx_expr"

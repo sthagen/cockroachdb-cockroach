@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -41,6 +42,10 @@ type immutable struct {
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
 	isUncommittedVersion bool
+
+	// changed represents whether or not the descriptor was changed
+	// after RunPostDeserializationChanges.
+	changes catalog.PostDeserializationChanges
 }
 
 // Mutable wraps a database descriptor and provides methods
@@ -48,10 +53,6 @@ type immutable struct {
 type Mutable struct {
 	immutable
 	ClusterVersion *immutable
-
-	// changed represents whether or not the descriptor was changed
-	// after RunPostDeserializationChanges.
-	changed bool
 }
 
 // SafeMessage makes immutable a SafeMessager.
@@ -146,7 +147,15 @@ func (desc *immutable) ByteSize() int64 {
 
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
-	return NewBuilder(desc.DatabaseDesc())
+	return newBuilder(desc.DatabaseDesc(), desc.isUncommittedVersion, desc.changes)
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+//
+// It overrides the wrapper's implementation to deal with the fact that
+// mutable has overridden the definition of IsUncommittedVersion.
+func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
+	return newBuilder(desc.DatabaseDesc(), desc.IsUncommittedVersion(), desc.changes)
 }
 
 // IsMultiRegion implements the DatabaseDescriptor interface.
@@ -252,7 +261,12 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	}
 
 	// Validate the privilege descriptor.
-	vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Database))
+	if desc.Privileges == nil {
+		vea.Report(errors.AssertionFailedf("privileges not set"))
+	} else {
+		vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Database))
+	}
+
 	// The DefaultPrivilegeDescriptor may be nil.
 	if desc.GetDefaultPrivileges() != nil {
 		// Validate the default privilege descriptor.
@@ -303,6 +317,9 @@ func (desc *immutable) ValidateCrossReferences(
 			report(err)
 			return
 		}
+		if typ.Dropped() {
+			report(errors.Errorf("type descriptor is dropped"))
+		}
 		if typ.GetParentID() != desc.GetID() {
 			report(errors.Errorf("parentID is actually %d", typ.GetParentID()))
 		}
@@ -335,6 +352,10 @@ func (desc *immutable) ValidateTxnCommit(
 		}
 		if schemaDesc.GetParentID() != desc.GetID() {
 			report(errors.Errorf("schema parentID is actually %d", schemaDesc.GetParentID()))
+		}
+		if schemaDesc.Dropped() {
+			report(errors.Errorf("back-referenced schema %q (%d) is dropped",
+				schemaDesc.GetName(), schemaDesc.GetID()))
 		}
 	}
 }
@@ -375,9 +396,7 @@ func (desc *Mutable) OriginalVersion() descpb.DescriptorVersion {
 
 // ImmutableCopy implements the MutableDescriptor interface.
 func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
-	imm := NewBuilder(desc.DatabaseDesc()).BuildImmutableDatabase()
-	imm.(*immutable).isUncommittedVersion = desc.IsUncommittedVersion()
-	return imm
+	return desc.NewBuilder().BuildImmutable()
 }
 
 // IsNew implements the MutableDescriptor interface.
@@ -452,17 +471,23 @@ func (desc *Mutable) SetPlacement(placement descpb.DataPlacement) {
 	desc.RegionConfig.Placement = placement
 }
 
-// HasPostDeserializationChanges returns if the MutableDescriptor was changed after running
+// GetPostDeserializationChanges returns if the MutableDescriptor was changed after running
 // RunPostDeserializationChanges.
-func (desc *Mutable) HasPostDeserializationChanges() bool {
-	return desc.changed
+func (desc *immutable) GetPostDeserializationChanges() catalog.PostDeserializationChanges {
+	return desc.changes
+}
+
+// HasConcurrentSchemaChanges implements catalog.Descriptor.
+func (desc *immutable) HasConcurrentSchemaChanges() bool {
+	return desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID
 }
 
 // GetDefaultPrivilegeDescriptor returns a DefaultPrivilegeDescriptor.
 func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
 	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
 	if defaultPrivilegeDescriptor == nil {
-		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_DATABASE)
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_DATABASE)
 	}
 	return catprivilege.MakeDefaultPrivileges(defaultPrivilegeDescriptor)
 }
@@ -471,7 +496,7 @@ func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeD
 func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutable {
 	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
 	if defaultPrivilegeDescriptor == nil {
-		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(descpb.DefaultPrivilegeDescriptor_DATABASE)
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_DATABASE)
 	}
 	return catprivilege.NewMutableDefaultPrivileges(defaultPrivilegeDescriptor)
 }
@@ -479,7 +504,7 @@ func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutabl
 // SetDefaultPrivilegeDescriptor sets the default privilege descriptor
 // for the database.
 func (desc *Mutable) SetDefaultPrivilegeDescriptor(
-	defaultPrivilegeDescriptor *descpb.DefaultPrivilegeDescriptor,
+	defaultPrivilegeDescriptor *catpb.DefaultPrivilegeDescriptor,
 ) {
 	desc.DefaultPrivileges = defaultPrivilegeDescriptor
 }
@@ -496,6 +521,18 @@ func (desc *Mutable) AddSchemaToDatabase(
 		desc.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
 	}
 	desc.Schemas[schemaName] = schemaInfo
+}
+
+// GetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	return desc.DeclarativeSchemaChangerState.Clone()
+}
+
+// SetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorState) {
+	desc.DeclarativeSchemaChangerState = state
 }
 
 // maybeRemoveDroppedSelfEntryFromSchemas removes an entry in the Schemas map corresponding to the

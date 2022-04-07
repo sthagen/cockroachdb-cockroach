@@ -29,18 +29,49 @@ import (
 // Flush flushes in-memory sql stats into system table. Any errors encountered
 // during the flush will be logged as warning.
 func (s *PersistedSQLStats) Flush(ctx context.Context) {
+	now := s.getTimeNow()
+
+	allowDiscardWhenDisabled := DiscardInMemoryStatsWhenFlushDisabled.Get(&s.cfg.Settings.SV)
+	minimumFlushInterval := MinimumInterval.Get(&s.cfg.Settings.SV)
+
+	enabled := SQLStatsFlushEnabled.Get(&s.cfg.Settings.SV)
+	flushingTooSoon := now.Before(s.lastFlushStarted.Add(minimumFlushInterval))
+
+	// Handle wiping in-memory stats here, we only wipe in-memory stats under 2
+	// circumstances:
+	// 1. flush is enabled, and we are not early aborting the flush due to flushing
+	//    too frequently.
+	// 2. flush is disabled, but we allow discard in-memory stats when disabled.
+	shouldWipeInMemoryStats := enabled && !flushingTooSoon
+	shouldWipeInMemoryStats = shouldWipeInMemoryStats || (!enabled && allowDiscardWhenDisabled)
+
+	if shouldWipeInMemoryStats {
+		defer func() {
+			if err := s.SQLStats.Reset(ctx); err != nil {
+				log.Warningf(ctx, "fail to reset in-memory SQL Stats: %s", err)
+			}
+		}()
+	}
+
+	// Handle early abortion of the flush.
+	if !enabled {
+		return
+	}
+
+	if flushingTooSoon {
+		log.Infof(ctx, "flush aborted due to high flush frequency. "+
+			"The minimum interval between flushes is %s", minimumFlushInterval.String())
+		return
+	}
+
+	s.lastFlushStarted = now
 	log.Infof(ctx, "flushing %d stmt/txn fingerprints (%d bytes) after %s",
 		s.SQLStats.GetTotalFingerprintCount(), s.SQLStats.GetTotalFingerprintBytes(), timeutil.Since(s.lastFlushStarted))
 
 	aggregatedTs := s.ComputeAggregatedTs()
-	s.lastFlushStarted = s.getTimeNow()
 
 	s.flushStmtStats(ctx, aggregatedTs)
 	s.flushTxnStats(ctx, aggregatedTs)
-
-	if err := s.SQLStats.Reset(ctx); err != nil {
-		log.Warningf(ctx, "fail to reset in-memory SQL Stats: %s", err)
-	}
 }
 
 func (s *PersistedSQLStats) flushStmtStats(ctx context.Context, aggregatedTs time.Time) {
@@ -147,7 +178,7 @@ func (s *PersistedSQLStats) doFlushSingleStmtStats(
 
 		serializedFingerprintID := sqlstatsutil.EncodeUint64ToBytes(uint64(scopedStats.ID))
 		serializedTransactionFingerprintID := sqlstatsutil.EncodeUint64ToBytes(uint64(scopedStats.Key.TransactionFingerprintID))
-		serializedPlanHash := sqlstatsutil.EncodeUint64ToBytes(uint64(dummyPlanHash))
+		serializedPlanHash := sqlstatsutil.EncodeUint64ToBytes(scopedStats.Key.PlanHash)
 
 		insertFn := func(ctx context.Context, txn *kv.Txn) (alreadyExists bool, err error) {
 			rowsAffected, err := s.insertStatementStats(
@@ -417,7 +448,7 @@ WHERE fingerprint_id = $2
 			"plan_hash: %d, "+
 			"node_id: %d",
 			serializedFingerprintID, serializedTransactionFingerprintID, stats.Key.App,
-			aggregatedTs, dummyPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
+			aggregatedTs, serializedPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
 	}
 
 	return nil
@@ -581,12 +612,12 @@ FOR UPDATE
 	if row == nil {
 		return errors.AssertionFailedf(
 			"statement statistics not found fingerprint_id: %s, app: %s, aggregated_ts: %s, plan_hash: %d, node_id: %d",
-			serializedFingerprintID, key.App, aggregatedTs, dummyPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
+			serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
 	}
 
 	if len(row) != 1 {
 		return errors.AssertionFailedf("unexpectedly found %d returning columns for fingerprint_id: %s, app: %s, aggregated_ts: %s, plan_hash %d, node_id: %d",
-			len(row), serializedFingerprintID, key.App, aggregatedTs, dummyPlanHash,
+			len(row), serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash,
 			s.cfg.SQLIDContainer.SQLInstanceID())
 	}
 

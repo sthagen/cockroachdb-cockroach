@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 type splitAndScatterer interface {
@@ -208,13 +210,19 @@ func newSplitAndScatterProcessor(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
+
+	if spec.Validation != jobspb.RestoreValidation_DefaultRestore {
+		return nil, errors.New("Split and Scatter Processor does not support validation yet")
+	}
+
 	numEntries := 0
 	for _, chunk := range spec.Chunks {
 		numEntries += len(chunk.Entries)
 	}
 
 	db := flowCtx.Cfg.DB
-	kr, err := makeKeyRewriterFromRekeys(flowCtx.Codec(), spec.TableRekeys, spec.TenantRekeys)
+	kr, err := MakeKeyRewriterFromRekeys(flowCtx.Codec(), spec.TableRekeys, spec.TenantRekeys,
+		false /* restoreTenantFromStream */)
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +252,7 @@ func newSplitAndScatterProcessor(
 
 // Start is part of the RowSource interface.
 func (ssp *splitAndScatterProcessor) Start(ctx context.Context) {
+	ctx = logtags.AddTag(ctx, "job", ssp.spec.JobID)
 	ctx = ssp.StartInternal(ctx, splitAndScatterProcessorName)
 	// Note that the loop over doneScatterCh in Next should prevent the goroutine
 	// below from leaking when there are no errors. However, if that loop needs to

@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -485,7 +486,7 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	tryLogin := func(username, password string) (*http.Response, error) {
 		// We need to instantiate our own HTTP Request, because we must inspect
 		// the returned headers.
-		httpClient, err := ts.GetHTTPClient()
+		httpClient, err := ts.GetUnauthenticatedHTTPClient()
 		if util.RaceEnabled {
 			httpClient.Timeout += 30 * time.Second
 		}
@@ -610,7 +611,7 @@ func TestLogout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	invalidAuthClient, err := s.GetHTTPClient()
+	invalidAuthClient, err := s.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,11 +647,11 @@ func TestAuthenticationMux(t *testing.T) {
 	tsrv := s.(*TestServer)
 
 	// Both the normal and authenticated client will be used for each test.
-	normalClient, err := tsrv.GetHTTPClient()
+	normalClient, err := tsrv.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	authClient, err := tsrv.GetAdminAuthenticatedHTTPClient()
+	authClient, err := tsrv.GetAdminHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +757,7 @@ func TestGRPCAuthentication(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			_ = stream.Send(&kvserver.RaftMessageRequestBatch{})
+			_ = stream.Send(&kvserverpb.RaftMessageRequestBatch{})
 			_, err = stream.Recv()
 			return err
 		}},

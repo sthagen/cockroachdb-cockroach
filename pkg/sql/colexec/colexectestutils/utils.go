@@ -440,7 +440,7 @@ func RunTestsWithOrderedCols(
 // setting, the closing happens at the end of the query execution.
 func closeIfCloser(t *testing.T, op colexecop.Operator) {
 	if c, ok := op.(colexecop.Closer); ok {
-		if err := c.Close(); err != nil {
+		if err := c.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -477,6 +477,11 @@ func RunTestsWithoutAllNullsInjection(
 	RunTestsWithoutAllNullsInjectionWithErrorHandler(t, allocator, tups, typs, expected, verifier, constructor, func(err error) { t.Fatal(err) }, nil /* orderedCols */)
 }
 
+// SkipRandomNullsInjection is an error handler that can be provided to
+// RunTestsWithoutAllNullsInjectionWithErrorHandler when the caller wants to
+// skip "random nulls injection" subtest.
+var SkipRandomNullsInjection = func(error) {}
+
 // RunTestsWithoutAllNullsInjectionWithErrorHandler is the same as
 // RunTestsWithoutAllNullsInjection but takes in an additional argument function
 // that handles any errors encountered during the test run (e.g. if the panic is
@@ -505,6 +510,14 @@ func RunTestsWithoutAllNullsInjectionWithErrorHandler(
 	} else if verifier == PartialOrderedVerifier {
 		verifyFn = (*OpTestOutput).VerifyPartialOrder
 		skipVerifySelAndNullsResets = false
+	}
+	skipRandomNullsInjection := &errorHandler == &SkipRandomNullsInjection
+	if skipRandomNullsInjection {
+		errorHandler = func(err error) {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	RunTestsWithFn(t, allocator, tups, typs, func(t *testing.T, inputs []colexecop.Operator) {
 		op, err := constructor(inputs)
@@ -612,7 +625,7 @@ func RunTestsWithoutAllNullsInjectionWithErrorHandler(
 		}
 	}
 
-	{
+	if !skipRandomNullsInjection {
 		log.Info(ctx, "randomNullsInjection")
 		// This test randomly injects nulls in the input tuples and ensures that
 		// the operator doesn't panic.
@@ -910,7 +923,6 @@ func (s *opTestInput) Next() coldata.Batch {
 	if len(s.tuples) == 0 {
 		return coldata.ZeroBatch
 	}
-	s.batch.ResetInternalBatch()
 	batchSize := s.batchSize
 	if len(s.tuples) < batchSize {
 		batchSize = len(s.tuples)
@@ -965,19 +977,16 @@ func (s *opTestInput) Next() coldata.Batch {
 
 		s.batch.SetSelection(true)
 		copy(s.batch.Selection(), s.selection)
-	}
-
-	// Reset nulls for all columns in this batch.
-	for _, colVec := range s.batch.ColVecs() {
-		if colVec.CanonicalTypeFamily() != types.UnknownFamily {
-			colVec.Nulls().UnsetNulls()
-		}
+	} else {
+		s.batch.SetSelection(false)
 	}
 
 	rng, _ := randutil.NewTestRand()
 
 	for i := range s.typs {
 		vec := s.batch.ColVec(i)
+		// Unset nulls only on the vectors owned by the opTestInput.
+		vec.Nulls().UnsetNulls()
 		// Automatically convert the Go values into exec.Type slice elements using
 		// reflection. This is slow, but acceptable for tests.
 		col := reflect.ValueOf(vec.Col())
@@ -1114,11 +1123,6 @@ func (s *opFixedSelTestInput) Init(context.Context) {
 			colexecerror.InternalError(errors.AssertionFailedf("mismatched tuple lens: found %+v expected %d vals",
 				s.tuples[i], tupleLen))
 		}
-	}
-
-	// Reset nulls for all columns in this batch.
-	for i := 0; i < s.batch.Width(); i++ {
-		s.batch.ColVec(i).Nulls().UnsetNulls()
 	}
 
 	if s.sel != nil {

@@ -11,6 +11,7 @@
 package contention_test
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -68,6 +70,7 @@ func TestRegistry(t *testing.T) {
 		}
 		return stringRepresentation
 	}
+	st := cluster.MakeTestingClusterSettings()
 	registryMap := make(map[string]*contention.Registry)
 	// registry is the current registry.
 	var registry *contention.Registry
@@ -79,7 +82,8 @@ func TestRegistry(t *testing.T) {
 			var ok bool
 			registry, ok = registryMap[registryKey]
 			if !ok {
-				registry = contention.NewRegistry()
+				m := contention.NewMetrics()
+				registry = contention.NewRegistry(st, nil /* status */, &m)
 				registryMap[registryKey] = registry
 			}
 			return d.Expected
@@ -144,7 +148,7 @@ func TestRegistry(t *testing.T) {
 				return fmt.Sprintf("could not parse duration %s as int: %v", duration, err)
 			}
 			keyBytes = encoding.EncodeStringAscending(keyBytes, key)
-			registry.AddContentionEvent(roachpb.ContentionEvent{
+			addContentionEvent(registry, roachpb.ContentionEvent{
 				Key: keyBytes,
 				TxnMeta: enginepb.TxnMeta{
 					ID:                contendingTxnID,
@@ -170,11 +174,15 @@ func TestRegistryConcurrentAdds(t *testing.T) {
 	const numGoroutines = 10
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
-	registry := contention.NewRegistry()
+	st := cluster.MakeTestingClusterSettings()
+	// Disable the event store.
+	contention.TxnIDResolutionInterval.Override(context.Background(), &st.SV, 0)
+	m := contention.NewMetrics()
+	registry := contention.NewRegistry(st, nil /* status */, &m)
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
 			defer wg.Done()
-			registry.AddContentionEvent(roachpb.ContentionEvent{
+			addContentionEvent(registry, roachpb.ContentionEvent{
 				Key: keys.MakeTableIDIndexID(nil /* key */, 1 /* tableID */, 1 /* indexID */),
 			})
 		}()
@@ -232,7 +240,7 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 				key = keys.MakeTableIDIndexID(key, tableID, indexID)
 			}
 			key = append(key, getKey()...)
-			r.AddContentionEvent(roachpb.ContentionEvent{
+			addContentionEvent(r, roachpb.ContentionEvent{
 				Key: key,
 				TxnMeta: enginepb.TxnMeta{
 					ID:                uuid.MakeV4(),
@@ -301,8 +309,12 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 		}
 	}
 
+	st := cluster.MakeTestingClusterSettings()
+	// Disable the event store.
+	contention.TxnIDResolutionInterval.Override(context.Background(), &st.SV, 0)
 	createNewSerializedRegistry := func() contentionpb.SerializedRegistry {
-		r := contention.NewRegistry()
+		m := contention.NewMetrics()
+		r := contention.NewRegistry(st, nil /* status */, &m)
 		populateRegistry(r)
 		s := r.Serialize()
 		checkSerializedRegistryInvariants(s)
@@ -317,4 +329,10 @@ func TestSerializedRegistryInvariants(t *testing.T) {
 		m = contention.MergeSerializedRegistries(m, s)
 		checkSerializedRegistryInvariants(m)
 	}
+}
+
+func addContentionEvent(r *contention.Registry, ev roachpb.ContentionEvent) {
+	r.AddContentionEvent(contentionpb.ExtendedContentionEvent{
+		BlockingEvent: ev,
+	})
 }

@@ -79,8 +79,9 @@ func TestScanBatchSize(t *testing.T) {
 
 			// Create the table with disabled automatic table stats collection (so
 			// that we can control whether they are present or not).
-			_, err := conn.ExecContext(ctx, `
-SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false;
+			_, err := conn.ExecContext(ctx, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false;`)
+			assert.NoError(t, err)
+			_, err = conn.ExecContext(ctx, `
 CREATE TABLE t (a PRIMARY KEY, b) AS SELECT i, i FROM generate_series(1, 511) AS g(i)
 `)
 			assert.NoError(t, err)
@@ -148,11 +149,13 @@ func TestCFetcherLimitsOutputBatch(t *testing.T) {
 	// such setup the cFetcher will allocate an output batch of capacity 50, yet
 	// after setting the 7th or so row the footprint of the batch will exceed
 	// the memory limit. As a result, we will get around 7 batches.
-	_, err := conn.ExecContext(ctx, `
-SET distsql_workmem='128KiB';
-CREATE TABLE t (a PRIMARY KEY, b) AS SELECT i, repeat('a', 16 * 1024) FROM generate_series(1, 50) AS g(i);
-ANALYZE t
-`)
+	_, err := conn.ExecContext(ctx, `SET distsql_workmem='128KiB';`)
+	assert.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `
+CREATE TABLE t (a PRIMARY KEY, b) AS
+SELECT i, repeat('a', 16 * 1024) FROM generate_series(1, 50) AS g(i);`)
+	assert.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `ANALYZE t`)
 	assert.NoError(t, err)
 
 	batchCountRegex := regexp.MustCompile(`vectorized batch count: (\d+)`)

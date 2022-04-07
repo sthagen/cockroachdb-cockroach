@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
@@ -66,11 +67,13 @@ func newDistSQLSpecExecFactory(p *planner, planningMode distSQLPlanningMode) exe
 		planningMode:         planningMode,
 		gatewaySQLInstanceID: p.extendedEvalCtx.DistSQLPlanner.gatewaySQLInstanceID,
 	}
-	distribute := e.singleTenant && e.planningMode != distSQLLocalOnlyPlanning
+	distribute := DistributionType(DistributionTypeNone)
+	if e.planningMode != distSQLLocalOnlyPlanning {
+		distribute = DistributionTypeSystemTenantOnly
+	}
 	evalCtx := p.ExtendedEvalContext()
-	e.planCtx = e.dsp.NewPlanningCtx(
-		evalCtx.Context, evalCtx, e.planner, e.planner.txn, distribute,
-	)
+	e.planCtx = e.dsp.NewPlanningCtx(evalCtx.Context, evalCtx, e.planner,
+		e.planner.txn, distribute)
 	return e
 }
 
@@ -189,8 +192,8 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 	idx := index.(*optIndex).idx
 	colCfg := makeScanColumnsConfig(table, params.NeededCols)
 
-	sb := span.MakeBuilder(e.planner.EvalContext(), e.planner.ExecCfg().Codec, tabDesc, idx)
-	defer sb.Release()
+	var sb span.Builder
+	sb.Init(e.planner.EvalContext(), e.planner.ExecCfg().Codec, tabDesc, idx)
 
 	cols := make([]catalog.Column, 0, params.NeededCols.Len())
 	allCols := tabDesc.AllColumns()
@@ -216,7 +219,8 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 	if params.InvertedConstraint != nil {
 		spans, err = sb.SpansFromInvertedSpans(params.InvertedConstraint, params.IndexConstraint, nil /* scratch */)
 	} else {
-		spans, err = sb.SpansFromConstraint(params.IndexConstraint, params.NeededCols, false /* forDelete */)
+		splitter := span.MakeSplitter(tabDesc, idx, params.NeededCols)
+		spans, err = sb.SpansFromConstraint(params.IndexConstraint, splitter)
 	}
 	if err != nil {
 		return nil, err
@@ -238,16 +242,10 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 	// what DistSQLPlanner.createTableReaders does.
 	trSpec := physicalplan.NewTableReaderSpec()
 	*trSpec = execinfrapb.TableReaderSpec{
-		Table:     *tabDesc.TableDesc(),
-		Reverse:   params.Reverse,
-		ColumnIDs: columnIDs,
+		Reverse:                         params.Reverse,
+		TableDescriptorModificationTime: tabDesc.GetModificationTime(),
 	}
-	if vc := getInvertedColumn(colCfg.invertedColumnID, cols); vc != nil {
-		trSpec.InvertedColumn = vc.ColumnDesc()
-	}
-
-	trSpec.IndexIdx, err = getIndexIdx(idx, tabDesc)
-	if err != nil {
+	if err := rowenc.InitIndexFetchSpec(&trSpec.FetchSpec, e.planner.ExecCfg().Codec, tabDesc, idx, columnIDs); err != nil {
 		return nil, err
 	}
 	if params.Locking != nil {
@@ -284,7 +282,6 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 			parallelize:       params.Parallelize,
 			estimatedRowCount: uint64(params.EstimatedRowCount),
 			reqOrdering:       ReqOrdering(reqOrdering),
-			cols:              cols,
 		},
 	)
 
@@ -352,8 +349,8 @@ func (e *distSQLSpecExecFactory) ConstructSimpleProject(
 ) (exec.Node, error) {
 	physPlan, plan := getPhysPlan(n)
 	projection := make([]uint32, len(cols))
-	for i := range cols {
-		projection[i] = uint32(cols[physPlan.PlanToStreamColMap[i]])
+	for i, col := range cols {
+		projection[i] = uint32(physPlan.PlanToStreamColMap[col])
 	}
 	newColMap := identityMap(physPlan.PlanToStreamColMap, len(cols))
 	physPlan.AddProjection(
@@ -373,8 +370,8 @@ func (e *distSQLSpecExecFactory) ConstructSerializingProject(
 	physPlan, plan := getPhysPlan(n)
 	physPlan.EnsureSingleStreamOnGateway()
 	projection := make([]uint32, len(cols))
-	for i := range cols {
-		projection[i] = uint32(cols[physPlan.PlanToStreamColMap[i]])
+	for i, col := range cols {
+		projection[i] = uint32(physPlan.PlanToStreamColMap[col])
 	}
 	physPlan.AddProjection(projection, execinfrapb.Ordering{})
 	physPlan.ResultColumns = getResultColumnsForSimpleProject(cols, colNames, physPlan.GetResultTypes(), physPlan.ResultColumns)
@@ -643,6 +640,7 @@ func (e *distSQLSpecExecFactory) ConstructIndexJoin(
 	keyCols []exec.NodeColumnOrdinal,
 	tableCols exec.TableColumnOrdinalSet,
 	reqOrdering exec.OutputOrdering,
+	limitHint int,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: index join")
 }
@@ -658,9 +656,11 @@ func (e *distSQLSpecExecFactory) ConstructLookupJoin(
 	remoteLookupExpr tree.TypedExpr,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
+	isFirstJoinInPairedJoiner bool,
 	isSecondJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
 	locking *tree.LockingItem,
+	limitHint int,
 ) (exec.Node, error) {
 	// TODO (rohany): Implement production of system columns by the underlying scan here.
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: lookup join")
@@ -690,10 +690,13 @@ func (e *distSQLSpecExecFactory) constructZigzagJoinSide(
 	eqCols []exec.TableColumnOrdinal,
 ) (zigzagPlanningSide, error) {
 	desc := table.(*optTable).desc
-	colCfg := scanColumnsConfig{wantedColumns: make([]tree.ColumnID, 0, wantedCols.Len())}
-	for c, ok := wantedCols.Next(0); ok; c, ok = wantedCols.Next(c + 1) {
-		colCfg.wantedColumns = append(colCfg.wantedColumns, desc.PublicColumns()[c].GetID())
+	colCfg := makeScanColumnsConfig(table, wantedCols)
+
+	eqColOrdinals, err := tableToScanOrdinals(wantedCols, eqCols)
+	if err != nil {
+		return zigzagPlanningSide{}, err
 	}
+
 	cols, err := initColsForScan(desc, colCfg)
 	if err != nil {
 		return zigzagPlanningSide{}, err
@@ -713,7 +716,7 @@ func (e *distSQLSpecExecFactory) constructZigzagJoinSide(
 		desc:        desc,
 		index:       index.(*optIndex).idx,
 		cols:        cols,
-		eqCols:      convertTableOrdinalsToInts(eqCols),
+		eqCols:      eqColOrdinals,
 		fixedValues: valuesSpec,
 	}, nil
 }

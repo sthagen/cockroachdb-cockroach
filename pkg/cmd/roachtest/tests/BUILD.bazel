@@ -2,17 +2,6 @@ load("@bazel_gomock//:gomock.bzl", "gomock")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
-    name = "with-mocks",
-    srcs = [":mocks_drt"],
-    embed = [":tests"],
-    importpath = "github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests",
-    visibility = ["//visibility:public"],
-    deps = [
-        "@com_github_golang_mock//gomock",
-    ],
-)
-
-go_library(
     name = "tests",
     srcs = [
         "acceptance.go",
@@ -43,6 +32,7 @@ go_library(
         "disk_stall.go",
         "django.go",
         "django_blocklist.go",
+        "drain.go",
         "drop.go",
         "drt.go",
         "encryption.go",
@@ -94,7 +84,6 @@ go_library(
         "pgx_blocklist.go",
         "pop.go",
         "predecessor_version.go",
-        "privilege_version_upgrade.go",
         "psycopg.go",
         "psycopg_blocklist.go",
         "python_helpers.go",
@@ -103,6 +92,7 @@ go_library(
         "rapid_restart.go",
         "rebalance_load.go",
         "registry.go",
+        "remove_invalid_database_privileges.go",
         "replicagc.go",
         "reset_quorum.go",
         "restart.go",
@@ -143,13 +133,14 @@ go_library(
         "util_if_local.go",
         "util_load_group.go",
         "validate_grant_option.go",
+        "validate_system_schema_after_version_upgrade.go",
         "version.go",
         "version_upgrade_public_schema.go",
         "versionupgrade.go",
         "ycsb.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests",
-    visibility = ["//visibility:private"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
         "//pkg/ccl/changefeedccl",
@@ -158,11 +149,12 @@ go_library(
         "//pkg/cli",
         "//pkg/cloud",
         "//pkg/cloud/amazon",
+        "//pkg/cloud/gcp",
         "//pkg/clusterversion",
         "//pkg/cmd/cmpconn",
         "//pkg/cmd/roachtest/cluster",
         "//pkg/cmd/roachtest/option",
-        "//pkg/cmd/roachtest/prometheus:with-mocks",
+        "//pkg/cmd/roachtest/prometheus",
         "//pkg/cmd/roachtest/registry",
         "//pkg/cmd/roachtest/spec",
         "//pkg/cmd/roachtest/test",
@@ -171,14 +163,13 @@ go_library(
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/roachprod/install",
         "//pkg/roachprod/logger",
         "//pkg/server",
         "//pkg/server/serverpb",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
-        "//pkg/sql/privilege",
         "//pkg/testutils",
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
@@ -228,11 +219,12 @@ go_test(
         "drt_test.go",
         "tpcc_test.go",
         "util_load_group_test.go",
+        ":mocks_drt",  # keep
     ],
-    embed = [":with-mocks"],  # keep
+    embed = [":tests"],
     deps = [
         "//pkg/cmd/roachtest/option",
-        "//pkg/cmd/roachtest/prometheus:with-mocks",
+        "//pkg/cmd/roachtest/prometheus",
         "//pkg/cmd/roachtest/spec",
         "//pkg/roachprod/logger",
         "//pkg/testutils/skip",
@@ -247,8 +239,12 @@ go_test(
 
 gomock(
     name = "mocks_drt",
-    out = "drt_generated.go",
-    interfaces = ["PromClient"],
-    library = ":tests",
+    out = "drt_generated_test.go",
+    interfaces = ["Client"],
+    library = "//pkg/cmd/roachtest/prometheus",
     package = "tests",
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )

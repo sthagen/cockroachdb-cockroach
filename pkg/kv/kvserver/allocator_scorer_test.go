@@ -1052,7 +1052,7 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	options := rangeCountScorerOptions{}
+	options := &rangeCountScorerOptions{}
 	newStore := func(id int, locality roachpb.Locality) roachpb.StoreDescriptor {
 		return roachpb.StoreDescriptor{
 			StoreID: roachpb.StoreID(id),
@@ -1205,6 +1205,7 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 			existingStoreLocalities,
 			func(context.Context, roachpb.StoreID) bool { return true },
 			options,
+			AllocatorMetrics{},
 		)
 		actual := len(targets) > 0
 		if actual != tc.expected {

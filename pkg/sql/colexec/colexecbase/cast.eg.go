@@ -839,11 +839,6 @@ func (c *castOpNullAny) Next() coldata.Batch {
 	projVec := batch.ColVec(c.outputIdx)
 	vecNulls := vec.Nulls()
 	projNulls := projVec.Nulls()
-	if projVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over nulls values in the
-		// output vector.
-		projNulls.UnsetNulls()
-	}
 	if sel := batch.Selection(); sel != nil {
 		sel = sel[:n]
 		for _, i := range sel {
@@ -1105,9 +1100,6 @@ func (c *castBoolFloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -1158,7 +1150,6 @@ func (c *castBoolFloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -1241,9 +1232,6 @@ func (c *castBoolInt2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -1294,7 +1282,6 @@ func (c *castBoolInt2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -1377,9 +1364,6 @@ func (c *castBoolInt4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -1430,7 +1414,6 @@ func (c *castBoolInt4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -1513,9 +1496,6 @@ func (c *castBoolIntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -1566,7 +1546,6 @@ func (c *castBoolIntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -1639,9 +1618,6 @@ func (c *castDecimalBoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -1682,7 +1658,6 @@ func (c *castDecimalBoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -1793,9 +1768,6 @@ func (c *castDecimalInt2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -1874,7 +1846,6 @@ func (c *castDecimalInt2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -1985,9 +1956,6 @@ func (c *castDecimalInt4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2066,7 +2034,6 @@ func (c *castDecimalInt4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2165,9 +2132,6 @@ func (c *castDecimalIntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2234,7 +2198,6 @@ func (c *castDecimalIntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2323,9 +2286,6 @@ func (c *castDecimalFloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2382,7 +2342,6 @@ func (c *castDecimalFloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2465,9 +2424,6 @@ func (c *castDecimalDecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2518,7 +2474,6 @@ func (c *castDecimalDecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2591,9 +2546,6 @@ func (c *castInt2Int4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2634,7 +2586,6 @@ func (c *castInt2Int4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2707,9 +2658,6 @@ func (c *castInt2IntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2750,7 +2698,6 @@ func (c *castInt2IntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2827,9 +2774,6 @@ func (c *castInt2BoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -2874,7 +2818,6 @@ func (c *castInt2BoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -2959,9 +2902,6 @@ func (c *castInt2DecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3014,7 +2954,6 @@ func (c *castInt2DecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3091,9 +3030,6 @@ func (c *castInt2FloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3138,7 +3074,6 @@ func (c *castInt2FloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3223,9 +3158,6 @@ func (c *castInt4Int2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3278,7 +3210,6 @@ func (c *castInt4Int2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3351,9 +3282,6 @@ func (c *castInt4IntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3394,7 +3322,6 @@ func (c *castInt4IntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3471,9 +3398,6 @@ func (c *castInt4BoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3518,7 +3442,6 @@ func (c *castInt4BoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3603,9 +3526,6 @@ func (c *castInt4DecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3658,7 +3578,6 @@ func (c *castInt4DecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3735,9 +3654,6 @@ func (c *castInt4FloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3782,7 +3698,6 @@ func (c *castInt4FloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -3867,9 +3782,6 @@ func (c *castIntInt2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -3922,7 +3834,6 @@ func (c *castIntInt2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4007,9 +3918,6 @@ func (c *castIntInt4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4062,7 +3970,6 @@ func (c *castIntInt4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4139,9 +4046,6 @@ func (c *castIntBoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4186,7 +4090,6 @@ func (c *castIntBoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4271,9 +4174,6 @@ func (c *castIntDecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4326,7 +4226,6 @@ func (c *castIntDecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4403,9 +4302,6 @@ func (c *castIntFloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4450,7 +4346,6 @@ func (c *castIntFloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4527,9 +4422,6 @@ func (c *castFloatBoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4574,7 +4466,6 @@ func (c *castFloatBoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4663,9 +4554,6 @@ func (c *castFloatDecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4722,7 +4610,6 @@ func (c *castFloatDecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4805,9 +4692,6 @@ func (c *castFloatInt2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4858,7 +4742,6 @@ func (c *castFloatInt2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -4941,9 +4824,6 @@ func (c *castFloatInt4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -4994,7 +4874,6 @@ func (c *castFloatInt4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5077,9 +4956,6 @@ func (c *castFloatIntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5130,7 +5006,6 @@ func (c *castFloatIntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5215,9 +5090,6 @@ func (c *castDateInt2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5270,7 +5142,6 @@ func (c *castDateInt2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5355,9 +5226,6 @@ func (c *castDateInt4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5410,7 +5278,6 @@ func (c *castDateInt4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5483,9 +5350,6 @@ func (c *castDateIntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5526,7 +5390,6 @@ func (c *castDateIntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5603,9 +5466,6 @@ func (c *castDateFloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5650,7 +5510,6 @@ func (c *castDateFloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5735,9 +5594,6 @@ func (c *castDateDecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5790,7 +5646,6 @@ func (c *castDateDecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -5871,9 +5726,6 @@ func (c *castBytesUuidOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -5922,7 +5774,6 @@ func (c *castBytesUuidOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6005,9 +5856,6 @@ func (c *castStringBoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6058,7 +5906,6 @@ func (c *castStringBoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6139,9 +5986,6 @@ func (c *castStringBytesOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6190,7 +6034,6 @@ func (c *castStringBytesOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6311,9 +6154,6 @@ func (c *castStringStringOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6402,7 +6242,6 @@ func (c *castStringStringOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6483,9 +6322,6 @@ func (c *castStringUuidOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6534,7 +6370,6 @@ func (c *castStringUuidOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6625,9 +6460,6 @@ func (c *castJsonbStringOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6686,7 +6518,6 @@ func (c *castJsonbStringOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6774,9 +6605,6 @@ func (c *castDatumBoolOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6831,7 +6659,6 @@ func (c *castDatumBoolOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -6919,9 +6746,6 @@ func (c *castDatumInt2Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -6976,7 +6800,6 @@ func (c *castDatumInt2Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7064,9 +6887,6 @@ func (c *castDatumInt4Op) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7121,7 +6941,6 @@ func (c *castDatumInt4Op) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7209,9 +7028,6 @@ func (c *castDatumIntOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7266,7 +7082,6 @@ func (c *castDatumIntOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7354,9 +7169,6 @@ func (c *castDatumFloatOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7411,7 +7223,6 @@ func (c *castDatumFloatOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7499,9 +7310,6 @@ func (c *castDatumDecimalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7556,7 +7364,6 @@ func (c *castDatumDecimalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7644,9 +7451,6 @@ func (c *castDatumDateOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7701,7 +7505,6 @@ func (c *castDatumDateOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7789,9 +7592,6 @@ func (c *castDatumTimestampOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7846,7 +7646,6 @@ func (c *castDatumTimestampOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -7934,9 +7733,6 @@ func (c *castDatumIntervalOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -7991,7 +7787,6 @@ func (c *castDatumIntervalOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -8077,9 +7872,6 @@ func (c *castDatumStringOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -8132,7 +7924,6 @@ func (c *castDatumStringOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -8218,9 +8009,6 @@ func (c *castDatumBytesOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -8273,7 +8061,6 @@ func (c *castDatumBytesOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -8361,9 +8148,6 @@ func (c *castDatumTimestamptzOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -8418,7 +8202,6 @@ func (c *castDatumTimestamptzOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -8504,9 +8287,6 @@ func (c *castDatumUuidOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -8559,7 +8339,6 @@ func (c *castDatumUuidOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -8645,9 +8424,6 @@ func (c *castDatumJsonbOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -8700,7 +8476,6 @@ func (c *castDatumJsonbOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -8797,9 +8572,6 @@ func (c *castDatumDatumOp) Next() coldata.Batch {
 					}
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
 					{
 						var evalCtx *tree.EvalContext = c.evalCtx
@@ -8864,7 +8636,6 @@ func (c *castDatumDatumOp) Next() coldata.Batch {
 					}
 				}
 			}
-			batch.SetLength(n)
 		},
 	)
 	return batch

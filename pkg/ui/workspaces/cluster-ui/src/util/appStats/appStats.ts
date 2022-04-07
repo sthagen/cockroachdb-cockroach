@@ -15,7 +15,9 @@ import {
   TimestampToNumber,
   DurationToNumber,
   uniqueLong,
+  unique,
 } from "src/util";
+import Long from "long";
 
 export type StatementStatistics = protos.cockroach.sql.IStatementStatistics;
 export type ExecStats = protos.cockroach.sql.IExecStats;
@@ -127,6 +129,15 @@ export function addStatementStats(
 ): Required<StatementStatistics> {
   const countA = FixLong(a.count).toInt();
   const countB = FixLong(b.count).toInt();
+  let planGists: string[] = [];
+  if (a.plan_gists && b.plan_gists) {
+    planGists = unique(a.plan_gists.concat(b.plan_gists));
+  } else if (a.plan_gists) {
+    planGists = a.plan_gists;
+  } else if (b.plan_gists) {
+    planGists = b.plan_gists;
+  }
+
   return {
     count: a.count.add(b.count),
     first_attempt_count: a.first_attempt_count.add(b.first_attempt_count),
@@ -174,6 +185,7 @@ export function addStatementStats(
         ? a.last_exec_timestamp
         : b.last_exec_timestamp,
     nodes: uniqueLong([...a.nodes, ...b.nodes]),
+    plan_gists: planGists,
   };
 }
 
@@ -272,3 +284,39 @@ export function transactionScopedStatementKey(
 ): string {
   return statementKey(stmt) + stmt.transaction_fingerprint_id.toString();
 }
+
+export const generateStmtDetailsToID = (
+  fingerprintID: string,
+  appNames: string,
+  start: Long,
+  end: Long,
+): string => {
+  if (
+    appNames &&
+    (appNames.includes("$ internal") || appNames.includes("unset"))
+  ) {
+    const apps = appNames.split(",");
+    for (let i = 0; i < apps.length; i++) {
+      if (apps[i].includes("$ internal")) {
+        apps[i] = "$ internal";
+      }
+      if (apps[i].includes("unset")) {
+        apps[i] = "";
+      }
+    }
+    appNames = unique(apps)
+      .sort()
+      .toString();
+  }
+  let generatedID = fingerprintID;
+  if (appNames) {
+    generatedID += `/${appNames}`;
+  }
+  if (start) {
+    generatedID += `/${start}`;
+  }
+  if (end) {
+    generatedID += `/${end}`;
+  }
+  return generatedID;
+};

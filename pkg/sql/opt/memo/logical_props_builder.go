@@ -21,8 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 var fdAnnID = opt.NewTableAnnID()
@@ -698,7 +698,7 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 		len(setPrivate.OutCols) != len(setPrivate.RightCols) {
 		panic(errors.AssertionFailedf(
 			"lists in SetPrivate are not all the same length. new:%d, left:%d, right:%d",
-			log.Safe(len(setPrivate.OutCols)), log.Safe(len(setPrivate.LeftCols)), log.Safe(len(setPrivate.RightCols)),
+			redact.Safe(len(setPrivate.OutCols)), redact.Safe(len(setPrivate.LeftCols)), redact.Safe(len(setPrivate.RightCols)),
 		))
 	}
 
@@ -1799,48 +1799,50 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 	}
 
 	// Add keys from unique constraints.
-	if !md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys {
-		for i := 0; i < tab.UniqueCount(); i++ {
-			unique := tab.Unique(i)
+	for i := 0; i < tab.UniqueCount(); i++ {
+		unique := tab.Unique(i)
 
-			if !unique.Validated() {
-				// This unique constraint has not been validated, so we cannot use it
-				// as a key.
-				continue
-			}
+		if md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys && !unique.UniquenessGuaranteedByAnotherIndex() {
+			continue
+		}
 
-			if _, isPartial := unique.Predicate(); isPartial {
-				// Partial constraints cannot be considered while building functional
-				// dependency keys for the table because their keys are only unique
-				// for a subset of the rows in the table.
-				continue
-			}
+		if !unique.Validated() {
+			// This unique constraint has not been validated, so we cannot use it
+			// as a key.
+			continue
+		}
 
-			// If any of the columns are nullable, add a lax key FD. Otherwise, add a
-			// strict key.
-			var keyCols opt.ColSet
-			hasNulls := false
-			for i := 0; i < unique.ColumnCount(); i++ {
-				ord := unique.ColumnOrdinal(tab, i)
-				keyCols.Add(tabID.ColumnID(ord))
-				if tab.Column(ord).IsNullable() {
-					hasNulls = true
-				}
-			}
+		if _, isPartial := unique.Predicate(); isPartial {
+			// Partial constraints cannot be considered while building functional
+			// dependency keys for the table because their keys are only unique
+			// for a subset of the rows in the table.
+			continue
+		}
 
-			if excludeColumn != 0 && keyCols.Contains(excludeColumn) {
-				// See comment above where excludeColumn is set.
-				// (Virtual tables currently do not have UNIQUE WITHOUT INDEX constraints
-				// or implicitly partitioned UNIQUE indexes, but we add this check in case
-				// of future changes.)
-				continue
+		// If any of the columns are nullable, add a lax key FD. Otherwise, add a
+		// strict key.
+		var keyCols opt.ColSet
+		hasNulls := false
+		for i := 0; i < unique.ColumnCount(); i++ {
+			ord := unique.ColumnOrdinal(tab, i)
+			keyCols.Add(tabID.ColumnID(ord))
+			if tab.Column(ord).IsNullable() {
+				hasNulls = true
 			}
+		}
 
-			if hasNulls {
-				fd.AddLaxKey(keyCols, allCols)
-			} else {
-				fd.AddStrictKey(keyCols, allCols)
-			}
+		if excludeColumn != 0 && keyCols.Contains(excludeColumn) {
+			// See comment above where excludeColumn is set.
+			// (Virtual tables currently do not have UNIQUE WITHOUT INDEX constraints
+			// or implicitly partitioned UNIQUE indexes, but we add this check in case
+			// of future changes.)
+			continue
+		}
+
+		if hasNulls {
+			fd.AddLaxKey(keyCols, allCols)
+		} else {
+			fd.AddStrictKey(keyCols, allCols)
 		}
 	}
 
@@ -2565,6 +2567,15 @@ func (b *logicalPropsBuilder) buildFakeRelProps(fake *FakeRelExpr, rel *props.Re
 func (b *logicalPropsBuilder) buildNormCycleTestRelProps(
 	nc *NormCycleTestRelExpr, rel *props.Relational,
 ) {
+}
+
+func (b *logicalPropsBuilder) buildMemoCycleTestRelProps(
+	mc *MemoCycleTestRelExpr, rel *props.Relational,
+) {
+	// Make the cardinality non-zero to prevent SimplifyZeroCardinalityGroup
+	// from transforming mc into an empty Values expression.
+	inputProps := mc.Input.Relational()
+	rel.Cardinality = inputProps.Cardinality
 }
 
 // WithUses returns the WithUsesMap for the given expression.

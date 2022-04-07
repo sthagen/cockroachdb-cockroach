@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
@@ -139,7 +140,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		NodeID:   nc,
 	})
 	cfg.RPCContext.NodeID.Set(ctx, nodeID)
-	clusterID := cfg.RPCContext.ClusterID
+	clusterID := cfg.RPCContext.StorageClusterID
 	server := rpc.NewServer(cfg.RPCContext) // never started
 	ltc.Gossip = gossip.New(ambient, clusterID, nc, cfg.RPCContext, server, ltc.stopper, metric.NewRegistry(), roachpb.Locality{}, zonepb.DefaultZoneConfigRef())
 	var err error
@@ -217,14 +218,18 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		t.Fatal(err)
 	}
 	cfg.SpanConfigSubscriber = spanconfigkvsubscriber.New(
-		ltc.stopper,
-		ltc.DB,
 		clock,
 		rangeFeedFactory,
 		keys.SpanConfigurationsTableID,
 		1<<20, /* 1 MB */
 		cfg.DefaultSpanConfig,
 		nil,
+	)
+	cfg.SystemConfigProvider = systemconfigwatcher.New(
+		keys.SystemSQLCodec,
+		cfg.Clock,
+		rangeFeedFactory,
+		zonepb.DefaultZoneConfigRef(),
 	)
 
 	ltc.Store = kvserver.NewStore(ctx, cfg, ltc.Eng, nodeDesc)

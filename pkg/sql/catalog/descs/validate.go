@@ -13,6 +13,7 @@ package descs
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -20,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 )
 
 // Validate returns any descriptor validation errors after validating using the
@@ -33,11 +33,15 @@ func (tc *Collection) Validate(
 	targetLevel catalog.ValidationLevel,
 	descriptors ...catalog.Descriptor,
 ) (err error) {
-	cbd := &collectionBackedDereferencer{
-		tc:  tc,
-		txn: txn,
-	}
-	return validate.Validate(ctx, cbd, telemetry, targetLevel, descriptors...).CombinedError()
+	vd := tc.newValidationDereferencer(txn)
+	version := tc.settings.Version.ActiveVersion(ctx)
+	return validate.Validate(
+		ctx,
+		version,
+		vd,
+		telemetry,
+		targetLevel,
+		descriptors...).CombinedError()
 }
 
 // ValidateUncommittedDescriptors validates all uncommitted descriptors.
@@ -57,6 +61,10 @@ func (tc *Collection) ValidateUncommittedDescriptors(ctx context.Context, txn *k
 	return tc.Validate(ctx, txn, catalog.ValidationWriteTelemetry, catalog.ValidationLevelAllPreTxnCommit, descs...)
 }
 
+func (tc *Collection) newValidationDereferencer(txn *kv.Txn) validate.ValidationDereferencer {
+	return &collectionBackedDereferencer{tc: tc, txn: txn}
+}
+
 // collectionBackedDereferencer wraps a Collection to implement the
 // validate.ValidationDereferencer interface for validation.
 type collectionBackedDereferencer struct {
@@ -69,7 +77,7 @@ var _ validate.ValidationDereferencer = &collectionBackedDereferencer{}
 // DereferenceDescriptors implements the validate.ValidationDereferencer
 // interface by leveraging the collection's uncommitted descriptors.
 func (c collectionBackedDereferencer) DereferenceDescriptors(
-	ctx context.Context, reqs []descpb.ID,
+	ctx context.Context, version clusterversion.ClusterVersion, reqs []descpb.ID,
 ) (ret []catalog.Descriptor, _ error) {
 	ret = make([]catalog.Descriptor, len(reqs))
 	fallbackReqs := make([]descpb.ID, 0, len(reqs))
@@ -87,14 +95,26 @@ func (c collectionBackedDereferencer) DereferenceDescriptors(
 		}
 	}
 	if len(fallbackReqs) > 0 {
-		// TODO(postamar): actually use the Collection here instead,
-		// either by calling the Collection's methods or by caching the results
-		// of this call in the Collection.
-		fallbackRet, err := catkv.GetCrossReferencedDescriptorsForValidation(ctx, c.txn, c.tc.codec(), fallbackReqs)
+		fallbackRet, err := catkv.GetCrossReferencedDescriptorsForValidation(
+			ctx,
+			version,
+			c.tc.codec(),
+			c.txn,
+			fallbackReqs,
+		)
 		if err != nil {
 			return nil, err
 		}
 		for j, desc := range fallbackRet {
+			if desc == nil {
+				continue
+			}
+			if uc, _ := c.tc.uncommitted.getImmutableByID(desc.GetID()); uc == nil {
+				desc, err = c.tc.uncommitted.add(desc.NewBuilder().BuildExistingMutable(), notValidatedYet)
+				if err != nil {
+					return nil, err
+				}
+			}
 			ret[fallbackRetIndexes[j]] = desc
 		}
 	}
@@ -104,11 +124,13 @@ func (c collectionBackedDereferencer) DereferenceDescriptors(
 func (c collectionBackedDereferencer) fastDescLookup(
 	ctx context.Context, id descpb.ID,
 ) (catalog.Descriptor, error) {
-	leaseCacheEntry := c.tc.leased.cache.GetByID(id)
-	if leaseCacheEntry != nil {
-		return leaseCacheEntry.(lease.LeasedDescriptor).Underlying(), nil
+	if uc, status := c.tc.uncommitted.getImmutableByID(id); uc != nil {
+		if status == checkedOutAtLeastOnce {
+			return nil, nil
+		}
+		return uc, nil
 	}
-	return c.tc.uncommitted.getByID(id), nil
+	return nil, nil
 }
 
 // DereferenceDescriptorIDs implements the validate.ValidationDereferencer
@@ -159,8 +181,8 @@ func (c collectionBackedDereferencer) fastNamespaceLookup(
 		}
 	case keys.SystemDatabaseID:
 		// Looking up system database objects, which are cached.
-		id, err = lookupSystemDatabaseNamespaceCache(ctx, c.tc.codec(), req.ParentSchemaID, req.Name)
-		return id != descpb.InvalidID, id, err
+		id = c.tc.kv.systemNamespace.lookup(req.ParentSchemaID, req.Name)
+		return id != descpb.InvalidID, id, nil
 	}
 	return false, descpb.InvalidID, nil
 }

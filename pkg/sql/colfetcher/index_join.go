@@ -18,15 +18,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecspan"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/kvstreamer"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -62,11 +62,22 @@ type ColIndexJoin struct {
 	// and may not correspond to batch boundaries.
 	startIdx int
 
+	// limitHintHelper is used in limiting batches of input rows in the presence
+	// of hard and soft limits.
+	limitHintHelper execinfra.LimitHintHelper
+
 	mem struct {
 		// inputBatchSize tracks the size of the rows that have been used to
 		// generate spans so far. This is used to prevent memory usage from growing
 		// too large.
 		inputBatchSize int64
+
+		// inputBatchSizeLimit is a batch size limit for the number of input
+		// rows that will be used to form lookup spans for each scan. It is
+		// usually equal to the inputBatchSizeLimit metamorphic variable, but it
+		// might be lower than that value when low distsql_workmem limit is
+		// used.
+		inputBatchSizeLimit int64
 
 		// currentBatchSize tracks the size of the current input batch. This
 		// provides a shortcut when the entire batch fits in the memory limit.
@@ -113,6 +124,7 @@ type ColIndexJoin struct {
 		*kvstreamer.Streamer
 		budgetAcc   *mon.BoundAccount
 		budgetLimit int64
+		diskMonitor *mon.BytesMonitor
 	}
 }
 
@@ -141,10 +153,16 @@ func (s *ColIndexJoin) Init(ctx context.Context) {
 			s.streamerInfo.budgetLimit,
 			s.streamerInfo.budgetAcc,
 		)
+		mode := kvstreamer.OutOfOrder
+		if s.maintainOrdering {
+			mode = kvstreamer.InOrder
+		}
 		s.streamerInfo.Streamer.Init(
-			kvstreamer.OutOfOrder,
+			mode,
 			kvstreamer.Hints{UniqueRequests: true},
-			s.cf.maxKeysPerRow,
+			int(s.cf.table.spec.MaxKeysPerRow),
+			s.flowCtx.Cfg.TempStorage,
+			s.streamerInfo.diskMonitor,
 		)
 	}
 }
@@ -162,21 +180,34 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 	for {
 		switch s.state {
 		case indexJoinConstructingSpans:
-			var rowCount int
+			var rowCount int64
 			var spans roachpb.Spans
 			s.mem.inputBatchSize = 0
 			for s.next() {
 				// Because index joins discard input rows, we do not have to maintain a
 				// reference to input tuples after span generation. So, we can discard
 				// the input batch reference on each iteration.
-				endIdx := s.findEndIndex(len(spans) > 0)
-				rowCount += endIdx - s.startIdx
+				endIdx := s.findEndIndex(rowCount > 0)
+				// If we have a limit hint, make sure we don't include more rows
+				// than needed.
+				if l := s.limitHintHelper.LimitHint(); l != 0 && rowCount+int64(endIdx-s.startIdx) > l {
+					endIdx = s.startIdx + int(l-rowCount)
+				}
+				rowCount += int64(endIdx - s.startIdx)
 				s.spanAssembler.ConsumeBatch(s.batch, s.startIdx, endIdx)
 				s.startIdx = endIdx
+				if l := s.limitHintHelper.LimitHint(); l != 0 && rowCount == l {
+					// Reached the limit hint. Note that rowCount cannot be
+					// larger than l because we chopped the former off above.
+					break
+				}
 				if endIdx < s.batch.Length() {
 					// Reached the memory limit.
 					break
 				}
+			}
+			if err := s.limitHintHelper.ReadSomeRows(rowCount); err != nil {
+				colexecerror.InternalError(err)
 			}
 			spans = s.spanAssembler.GetSpans()
 			if len(spans) == 0 {
@@ -258,19 +289,6 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 	}
 }
 
-// inputBatchSizeLimit is a batch size limit for the number of input rows that
-// will be used to form lookup spans for each scan. This is used as a proxy for
-// result batch size in order to prevent OOMs, because index joins do not limit
-// result batches. TODO(drewk): once the Streamer work is finished, the fetcher
-// logic will be able to control result size without sacrificing parallelism, so
-// we can remove this limit.
-var inputBatchSizeLimit = int64(util.ConstantWithMetamorphicTestRange(
-	"ColIndexJoin-batch-size",
-	4<<20, /* 4 MB */
-	1,     /* min */
-	4<<20, /* max */
-))
-
 // findEndIndex returns an index endIdx into s.batch such that generating spans
 // for rows in the interval [s.startIdx, endIdx) will get as close to the memory
 // limit as possible without exceeding it, subject to the length of the batch.
@@ -279,23 +297,23 @@ var inputBatchSizeLimit = int64(util.ConstantWithMetamorphicTestRange(
 // for the current iteration, endIdx == s.startIdx.
 func (s *ColIndexJoin) findEndIndex(hasSpans bool) (endIdx int) {
 	n := s.batch.Length()
-	if n == 0 || s.startIdx >= n || s.mem.inputBatchSize >= inputBatchSizeLimit {
+	if n == 0 || s.startIdx >= n || s.mem.inputBatchSize >= s.mem.inputBatchSizeLimit {
 		// No more spans should be generated.
 		return s.startIdx
 	}
-	if s.mem.inputBatchSize+s.mem.currentBatchSize <= inputBatchSizeLimit {
+	if s.mem.inputBatchSize+s.mem.currentBatchSize <= s.mem.inputBatchSizeLimit {
 		// The entire batch fits within the memory limit.
 		s.mem.inputBatchSize += s.mem.currentBatchSize
 		return n
 	}
 	for endIdx = s.startIdx; endIdx < n; endIdx++ {
 		s.mem.inputBatchSize += s.getRowSize(endIdx)
-		if s.mem.inputBatchSize > inputBatchSizeLimit {
+		if s.mem.inputBatchSize > s.mem.inputBatchSizeLimit {
 			// The current row (but not the previous) brings us to or over the memory
 			// limit, so use it as the exclusive end index.
 			break
 		}
-		if s.mem.inputBatchSize == inputBatchSizeLimit {
+		if s.mem.inputBatchSize == s.mem.inputBatchSizeLimit {
 			// The current row exactly meets the memory limit. Increment idx in order
 			// to make it exclusive.
 			endIdx++
@@ -414,7 +432,23 @@ func (s *ColIndexJoin) GetCumulativeContentionTime() time.Duration {
 	return execinfra.GetCumulativeContentionTime(s.Ctx)
 }
 
+// inputBatchSizeLimit is a batch size limit for the number of input rows that
+// will be used to form lookup spans for each scan. This is used as a proxy for
+// result batch size in order to prevent OOMs, because index joins do not limit
+// result batches. TODO(drewk): once the Streamer work is finished, the fetcher
+// logic will be able to control result size without sacrificing parallelism, so
+// we can remove this limit.
+var inputBatchSizeLimit = int64(util.ConstantWithMetamorphicTestRange(
+	"ColIndexJoin-batch-size",
+	4<<20, /* 4 MB */
+	1,     /* min */
+	4<<20, /* max */
+))
+
 // NewColIndexJoin creates a new ColIndexJoin operator.
+//
+// If spec.MaintainOrdering is true, then the diskMonitor argument must be
+// non-nil.
 func NewColIndexJoin(
 	ctx context.Context,
 	allocator *colmem.Allocator,
@@ -422,11 +456,11 @@ func NewColIndexJoin(
 	kvFetcherMemAcc *mon.BoundAccount,
 	streamerBudgetAcc *mon.BoundAccount,
 	flowCtx *execinfra.FlowCtx,
-	helper *colexecargs.ExprHelper,
 	input colexecop.Operator,
 	spec *execinfrapb.JoinReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 	inputTypes []*types.T,
+	diskMonitor *mon.BytesMonitor,
 ) (*ColIndexJoin, error) {
 	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
@@ -442,19 +476,15 @@ func NewColIndexJoin(
 		return nil, errors.AssertionFailedf("non-empty ON expressions are not supported for index joins")
 	}
 
-	table := flowCtx.TableDescriptor(&spec.Table)
-	index := table.ActiveIndexes()[spec.IndexIdx]
-	tableArgs, neededColumns, err := populateTableArgsLegacy(
-		ctx, flowCtx, table, index, nil, /* invertedCol */
-		spec.HasSystemColumns, post, helper,
-	)
+	tableArgs, err := populateTableArgs(ctx, flowCtx, &spec.FetchSpec)
 	if err != nil {
 		return nil, err
 	}
 
 	memoryLimit := execinfra.GetWorkMemLimit(flowCtx)
 
-	useStreamer := row.CanUseStreamer(ctx, flowCtx.EvalCtx.Settings) && !spec.MaintainOrdering
+	useStreamer := flowCtx.Txn != nil && flowCtx.Txn.Type() == kv.LeafTxn &&
+		row.CanUseStreamer(ctx, flowCtx.EvalCtx.Settings)
 	if useStreamer {
 		if streamerBudgetAcc == nil {
 			return nil, errors.AssertionFailedf("streamer budget account is nil when the Streamer API is desired")
@@ -478,14 +508,14 @@ func NewColIndexJoin(
 		flowCtx.TraceKV,
 	}
 	if err = fetcher.Init(
-		flowCtx.Codec(), fetcherAllocator, kvFetcherMemAcc, tableArgs,
+		fetcherAllocator, kvFetcherMemAcc, tableArgs,
 	); err != nil {
 		fetcher.Release()
 		return nil, err
 	}
 
 	spanAssembler := colexecspan.NewColSpanAssembler(
-		flowCtx.Codec(), allocator, table, index, inputTypes, neededColumns,
+		flowCtx.Codec(), allocator, &spec.FetchSpec, spec.SplitFamilyIDs, inputTypes,
 	)
 
 	op := &ColIndexJoin{
@@ -496,11 +526,31 @@ func NewColIndexJoin(
 		ResultTypes:      tableArgs.typs,
 		maintainOrdering: spec.MaintainOrdering,
 		usesStreamer:     useStreamer,
+		limitHintHelper:  execinfra.MakeLimitHintHelper(spec.LimitHint, post),
 	}
+	op.mem.inputBatchSizeLimit = inputBatchSizeLimit
 	op.prepareMemLimit(inputTypes)
 	if useStreamer {
 		op.streamerInfo.budgetLimit = 3 * memoryLimit
 		op.streamerInfo.budgetAcc = streamerBudgetAcc
+		if spec.MaintainOrdering && diskMonitor == nil {
+			return nil, errors.AssertionFailedf("diskMonitor is nil when ordering needs to be maintained")
+		}
+		op.streamerInfo.diskMonitor = diskMonitor
+		if memoryLimit < inputBatchSizeLimit {
+			// If we have a low workmem limit, then we want to reduce the input
+			// batch size limit.
+			//
+			// The Streamer gets three quarters of workmem as its budget which
+			// accounts for two usages - for the footprint of the spans
+			// themselves in the enqueued requests as well as the footprint of
+			// the responses received by the Streamer. If we don't reduce the
+			// input batch size limit here, then 4MiB value will be used, and
+			// the constructed spans (i.e. the enqueued requests) alone might
+			// exceed the budget leading to the Streamer erroring out in
+			// Enqueue().
+			op.mem.inputBatchSizeLimit = memoryLimit
+		}
 	}
 
 	return op, nil
@@ -567,7 +617,7 @@ func (s *ColIndexJoin) Release() {
 }
 
 // Close implements the colexecop.Closer interface.
-func (s *ColIndexJoin) Close() error {
+func (s *ColIndexJoin) Close(context.Context) error {
 	s.closeInternal()
 	if s.tracingSpan != nil {
 		s.tracingSpan.Finish()
@@ -579,13 +629,17 @@ func (s *ColIndexJoin) Close() error {
 // closeInternal is a subset of Close() which doesn't finish the operator's
 // span.
 func (s *ColIndexJoin) closeInternal() {
-	s.cf.Close(s.EnsureCtx())
+	// Note that we're using the context of the ColIndexJoin rather than the
+	// argument of Close() because the ColIndexJoin derives its own tracing
+	// span.
+	ctx := s.EnsureCtx()
+	s.cf.Close(ctx)
 	if s.spanAssembler != nil {
 		// spanAssembler can be nil if Release() has already been called.
 		s.spanAssembler.Close()
 	}
 	if s.streamerInfo.Streamer != nil {
-		s.streamerInfo.Streamer.Close()
+		s.streamerInfo.Streamer.Close(ctx)
 	}
 	s.batch = nil
 }

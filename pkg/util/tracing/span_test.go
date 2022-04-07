@@ -27,6 +27,8 @@ import (
 	"github.com/gogo/protobuf/types"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
+	otelsdk "go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc/metadata"
 )
@@ -66,7 +68,7 @@ func TestRecordingString(t *testing.T) {
 	wireSpanMeta, err := tr2.ExtractMetaFrom(carrier)
 	require.NoError(t, err)
 
-	remoteChild := tr2.StartSpan("remote child", WithRemoteParent(wireSpanMeta), WithDetachedRecording())
+	remoteChild := tr2.StartSpan("remote child", WithRemoteParentFromSpanMeta(wireSpanMeta), WithDetachedRecording())
 	root.Record("root 2")
 	remoteChild.Record("remote child 1")
 
@@ -191,21 +193,23 @@ func TestImportRemoteSpans(t *testing.T) {
 	for _, verbose := range []bool{false, true} {
 		t.Run(fmt.Sprintf("%s=%t", "verbose-child=", verbose), func(t *testing.T) {
 			tr := NewTracerWithOpt(context.Background())
-			sp := tr.StartSpan("root", WithRecording(RecordingStructured))
+			var opt SpanOption
+			if verbose {
+				opt = WithRecording(RecordingVerbose)
+			} else {
+				opt = WithRecording(RecordingStructured)
+			}
+			sp := tr.StartSpan("root", opt)
 			ch := tr.StartSpan("child", WithParent(sp), WithDetachedRecording())
 			ch.RecordStructured(&types.Int32Value{Value: 4})
-			if verbose {
-				sp.SetVerbose(true)
-				ch.SetVerbose(true)
-			}
 			ch.Record("foo")
-			ch.SetVerbose(false)
 			sp.ImportRemoteSpans(ch.FinishAndGetRecording(RecordingVerbose))
 
 			if verbose {
 				require.NoError(t, CheckRecording(sp.FinishAndGetRecording(RecordingVerbose), `
 				=== operation:root _verbose:1
 					=== operation:child _verbose:1
+					event:&Int32Value{Value:4,XXX_unrecognized:[],}
 					event:foo
 					structured:{"@type":"type.googleapis.com/google.protobuf.Int32Value","value":4}
 	`))
@@ -288,7 +292,7 @@ func TestSpanRecordStructuredLimit(t *testing.T) {
 		sp.RecordStructured(payload(i))
 	}
 
-	sp.SetVerbose(true)
+	sp.SetRecordingType(RecordingVerbose)
 	rec := sp.GetRecording(RecordingVerbose)
 	require.Len(t, rec, 1)
 	require.Len(t, rec[0].StructuredRecords, numStructuredRecordings)
@@ -504,6 +508,53 @@ func (i *countingStringer) String() string {
 	return fmt.Sprint(*i)
 }
 
+type testExpandingTag struct{}
+
+var _ LazyTag = testExpandingTag{}
+
+func (t testExpandingTag) Render() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		{
+			Key:   "exp1",
+			Value: attribute.IntValue(1),
+		},
+		{
+			Key:   "exp2",
+			Value: attribute.IntValue(2),
+		},
+	}
+}
+
+type testStringerLazyTag struct{}
+
+func (t testStringerLazyTag) String() string {
+	return "lazy stringer"
+}
+
+func TestSpanTags(t *testing.T) {
+	tr := NewTracer()
+	sp := tr.StartSpan("root", WithRecording(RecordingVerbose))
+	defer sp.Finish()
+	sp.SetTag("tag", attribute.IntValue(42))
+	sp.SetLazyTag("lazy expanding tag", testExpandingTag{})
+	sp.SetLazyTag("lazy tag", testStringerLazyTag{})
+
+	tag, ok := sp.GetLazyTag("lazy expanding tag")
+	require.True(t, ok)
+	require.IsType(t, testExpandingTag{}, tag)
+
+	rec := sp.GetRecording(RecordingVerbose)
+	tags := rec[0].Tags
+	require.Contains(t, tags, "tag")
+	require.Contains(t, tags, "lazy tag")
+	require.NotContains(t, tags, "lazy expanding tag")
+	require.Contains(t, tags, "exp1")
+	require.Contains(t, tags, "exp2")
+	require.Equal(t, tags["exp1"], "1")
+	require.Equal(t, tags["exp2"], "2")
+	require.Equal(t, tags["lazy tag"], "lazy stringer")
+}
+
 // TestSpanTagsInRecordings verifies that tags added before a recording started
 // are part of the recording.
 func TestSpanTagsInRecordings(t *testing.T) {
@@ -524,7 +575,7 @@ func TestSpanTagsInRecordings(t *testing.T) {
 	// We didn't stringify the log tag.
 	require.Zero(t, int(counter))
 
-	sp.SetVerbose(true)
+	sp.SetRecordingType(RecordingVerbose)
 	rec = sp.GetRecording(RecordingVerbose)
 	require.Len(t, rec, 1)
 	require.Len(t, rec[0].Tags, 5) // _unfinished:1 _verbose:1 foo:tagbar foo1:1 foor2:bar2
@@ -542,6 +593,31 @@ func TestSpanTagsInRecordings(t *testing.T) {
 	_, ok = rec[0].Tags["foo3"]
 	require.True(t, ok)
 	require.Equal(t, 2, int(counter))
+}
+
+// Check that recordings have the "_verbose" marker tag only while the
+// respective span is recording verbosely.
+func TestVerboseTag(t *testing.T) {
+	tr := NewTracerWithOpt(context.Background(), WithTracingMode(TracingModeActiveSpansRegistry))
+	sp := tr.StartSpan("root")
+	defer sp.Finish()
+
+	sp.SetRecordingType(RecordingStructured)
+	rec := sp.GetRecording(RecordingVerbose)
+	_, ok := rec[0].Tags["_verbose"]
+	require.False(t, ok)
+
+	// The tag is present while the span is recording verbosely.
+	sp.SetRecordingType(RecordingVerbose)
+	rec = sp.GetRecording(RecordingVerbose)
+	_, ok = rec[0].Tags["_verbose"]
+	require.True(t, ok)
+
+	// After we stop recording, the tag goes away.
+	sp.SetRecordingType(RecordingStructured)
+	rec = sp.GetRecording(RecordingVerbose)
+	_, ok = rec[0].Tags["_verbose"]
+	require.False(t, ok)
 }
 
 func TestStructureRecording(t *testing.T) {
@@ -594,4 +670,33 @@ func TestOpenChildIncludedRecording(t *testing.T) {
 			=== operation:child _unfinished:1 _verbose:1
 	`))
 	child.Finish()
+}
+
+func TestWithRemoteParentFromTraceInfo(t *testing.T) {
+	traceID := tracingpb.TraceID(1)
+	parentSpanID := tracingpb.SpanID(2)
+	otelTraceID := [16]byte{1, 2, 3, 4, 5}
+	otelSpanID := [8]byte{6, 7, 8, 9, 10}
+	ti := tracingpb.TraceInfo{
+		TraceID:       traceID,
+		ParentSpanID:  parentSpanID,
+		RecordingMode: tracingpb.RecordingMode_STRUCTURED,
+		Otel: &tracingpb.TraceInfo_OtelInfo{
+			TraceID: otelTraceID[:],
+			SpanID:  otelSpanID[:],
+		},
+	}
+
+	tr := NewTracer()
+	tr.SetOpenTelemetryTracer(otelsdk.NewTracerProvider().Tracer("test"))
+
+	sp := tr.StartSpan("test", WithRemoteParentFromTraceInfo(&ti))
+	defer sp.Finish()
+
+	require.Equal(t, traceID, sp.TraceID())
+	require.Equal(t, parentSpanID, sp.i.crdb.parentSpanID)
+	require.Equal(t, RecordingStructured, sp.RecordingType())
+	require.NotNil(t, sp.i.otelSpan)
+	otelCtx := sp.i.otelSpan.SpanContext()
+	require.Equal(t, oteltrace.TraceID(otelTraceID), otelCtx.TraceID())
 }

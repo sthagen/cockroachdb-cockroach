@@ -11,7 +11,6 @@
 package concurrency
 
 import (
-	"bytes"
 	"context"
 	"math"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // LockTableLivenessPushDelay sets the delay before pushing in order to detect
@@ -105,9 +106,6 @@ type lockTableWaiterImpl struct {
 	// When set, WriteIntentError are propagated instead of pushing
 	// conflicting transactions.
 	disableTxnPushing bool
-	// When set, called just before each ContentionEvent is emitted.
-	// Is allowed to mutate the event.
-	onContentionEvent func(ev *roachpb.ContentionEvent)
 	// When set, called just before each push timer event is processed.
 	onPushTimer func()
 }
@@ -145,11 +143,9 @@ func (w *lockTableWaiterImpl) WaitOn(
 	// Used to enforce lock timeouts.
 	var lockDeadline time.Time
 
-	h := contentionEventHelper{
-		sp:      tracing.SpanFromContext(ctx),
-		onEvent: w.onContentionEvent,
-	}
-	defer h.emit()
+	tracer := newContentionEventTracer(tracing.SpanFromContext(ctx), w.clock)
+	// Make sure the contention time info is finalized when exiting the function.
+	defer tracer.notify(ctx, waitingState{kind: doneWaiting})
 
 	for {
 		select {
@@ -162,7 +158,7 @@ func (w *lockTableWaiterImpl) WaitOn(
 			timerC = nil
 			state := guard.CurState()
 			log.Eventf(ctx, "lock wait-queue event: %s", state)
-			h.emitAndInit(state)
+			tracer.notify(ctx, state)
 			switch state.kind {
 			case waitFor, waitForDistinguished:
 				if req.WaitPolicy == lock.WaitPolicy_Error {
@@ -843,73 +839,256 @@ func (c *txnCache) insertFrontLocked(txn *roachpb.Transaction) {
 	c.txns[0] = txn
 }
 
-// contentionEventHelper tracks and emits ContentionEvents.
-type contentionEventHelper struct {
+// tagContentionTracer is the tracing span tag that the *contentionEventTracer
+// lives under.
+const tagContentionTracer = "contention_tracer"
+
+// tagWaitKey is the tracing span tag indicating the key of the lock the request
+// is currently waiting on.
+const tagWaitKey = "lock_wait_key"
+
+// tagWaitStart is the tracing span tag indicating when the request started
+// waiting on the lock it's currently waiting on.
+const tagWaitStart = "lock_wait_start"
+
+// tagLockHolderTxn is the tracing span tag indicating the ID of the txn holding
+// the lock (or a reservation on the lock) that the request is currently waiting
+// on.
+const tagLockHolderTxn = "lock_holder_txn"
+
+// tagNumLocks is the tracing span tag indicating the number of locks that the
+// request has previously waited on. If the request is currently waiting on
+// a lock, that lock is included.
+const tagNumLocks = "lock_num"
+
+// tagWaited is the tracing span tag indicating the total time that the span has
+// waited on locks. If the span is currently waiting on a lock, the time it has
+// already waited on that lock is included.
+const tagWaited = "lock_wait"
+
+// contentionEventTracer adds lock contention information to the trace, in the
+// form of events and tags. The contentionEventTracer is associated with a
+// tracing span.
+type contentionEventTracer struct {
 	sp      *tracing.Span
 	onEvent func(event *roachpb.ContentionEvent) // may be nil
-
-	// Internal.
-	ev     *roachpb.ContentionEvent
-	tBegin time.Time
+	tag     contentionTag
 }
 
-// emit emits the open contention event, if any.
-func (h *contentionEventHelper) emit() {
-	if h.ev == nil {
+// contentionTag represents a lazy tracing span tag containing lock contention
+// information. The contentionTag is fed info from the parent
+// contentionEventTracer.
+type contentionTag struct {
+	clock *hlc.Clock
+	mu    struct {
+		syncutil.Mutex
+
+		// lockWait accumulates time waited for locks before the current waiting
+		// period (the current waiting period starts at waitStart).
+		lockWait time.Duration
+
+		// waiting is set if the contentionEventTracer has been notified of a lock
+		// that the underlying request is waiting on. The contentionEventTracer
+		// starts with waiting=false, and transitions to waiting=true on the first
+		// notify() call. It transitions back to waiting=false on terminal events,
+		// and can then continue transitioning back and forth (in case the request
+		// is sequenced again and encounters more locks).
+		waiting bool
+
+		// waitStart represents the timestamp when the request started waiting on
+		// locks in the current iteration of the contentionEventTracer. The wait
+		// time in previous iterations is accumulated in lockWait. When not waiting
+		// any more, timeutil.Since(waitStart) is added to lockWait.
+		waitStart time.Time
+
+		// curState is the current wait state, if any. It is overwritten every time
+		// the lock table notify()s the contentionEventTracer of a new state. It is
+		// not set if waiting is false.
+		curState waitingState
+
+		// numLocks counts the number of locks this contentionEventTracer has seen so
+		// far, including the one we're currently waiting on (if any).
+		numLocks int
+	}
+}
+
+// newContentionEventTracer creates a contentionEventTracer and associates it
+// with the provided tracing span. The contentionEventTracer will emit events to
+// the respective span and will also act as a lazy tag on the span.
+//
+// sp can be nil, in which case the tracer will not do anything.
+//
+// It is legal to create a tracer on a span that has previously had another
+// tracer. In that case, the new tracer will absorb the counters from the
+// previous one, and replace it as a span tag. However, it is illegal to create
+// a contentionEventTracer on a span that already has an "active"
+// contentionEventTracer; two tracers sharing a span concurrently doesn't work,
+// as they'd clobber each other. The expectation is that, if this span had a
+// tracer on it, that tracer should have been properly shutdown.
+func newContentionEventTracer(sp *tracing.Span, clock *hlc.Clock) *contentionEventTracer {
+	t := &contentionEventTracer{}
+	t.tag.clock = clock
+
+	// If the span had previously had contention info, we'll absorb the info into
+	// the new tracer/tag.
+	oldTag, ok := sp.GetLazyTag(tagContentionTracer)
+	if ok {
+		oldContentionTag := oldTag.(*contentionTag)
+		oldContentionTag.mu.Lock()
+		waiting := oldContentionTag.mu.waiting
+		if waiting {
+			oldContentionTag.mu.Unlock()
+			panic("span already contains contention tag in the waiting state")
+		}
+		t.tag.mu.numLocks = oldContentionTag.mu.numLocks
+		t.tag.mu.lockWait = oldContentionTag.mu.lockWait
+		oldContentionTag.mu.Unlock()
+	}
+
+	sp.SetLazyTag(tagContentionTracer, &t.tag)
+	t.sp = sp
+	return t
+}
+
+// SetOnContentionEvent registers a callback to be called before each event is
+// emitted. The callback may modify the event.
+func (h *contentionEventTracer) SetOnContentionEvent(f func(ev *roachpb.ContentionEvent)) {
+	h.onEvent = f
+}
+
+var _ tracing.LazyTag = &contentionTag{}
+
+// notify processes an event from the lock table.
+// compares the waitingState's active txn (if any) against the current
+// ContentionEvent (if any). If they match, we are continuing to handle the
+// same event and no action is taken. If they differ, the open event (if any) is
+// finalized and added to the Span, and a new event initialized from the inputs.
+func (h *contentionEventTracer) notify(ctx context.Context, s waitingState) {
+	if h.sp == nil {
+		// No span to manipulate - don't do any work.
 		return
 	}
-	h.ev.Duration = timeutil.Since(h.tBegin)
+
+	event := h.tag.notify(ctx, s)
+	if event != nil {
+		h.emit(event)
+	}
+}
+
+// emit records a ContentionEvent to the tracing span corresponding to the
+// current wait state (if any).
+func (h *contentionEventTracer) emit(event *roachpb.ContentionEvent) {
+	if event == nil {
+		return
+	}
 	if h.onEvent != nil {
 		// NB: this is intentionally above the call to RecordStructured so that
 		// this interceptor gets to mutate the event (used for test determinism).
-		h.onEvent(h.ev)
+		h.onEvent(event)
 	}
-	h.sp.RecordStructured(h.ev)
-	h.ev = nil
+	h.sp.RecordStructured(event)
 }
 
-// emitAndInit compares the waitingState's active txn (if any) against the current
-// ContentionEvent (if any). If the they match, we are continuing to handle the
-// same event and no action is taken. If they differ, the open event (if any) is
-// finalized and added to the Span, and a new event initialized from the inputs.
-func (h *contentionEventHelper) emitAndInit(s waitingState) {
-	if h.sp == nil {
-		// No span to attach payloads to - don't do any work.
-		//
-		// TODO(tbg): we could special case the noop span here too, but the plan is for
-		// nobody to use noop spans any more (trace.mode=background).
-		return
+func (tag *contentionTag) generateEventLocked() *roachpb.ContentionEvent {
+	if !tag.mu.waiting {
+		return nil
 	}
 
-	// If true, we want to emit the current event and possibly start a new one.
-	// Otherwise,
+	return &roachpb.ContentionEvent{
+		Key:      tag.mu.curState.key,
+		TxnMeta:  *tag.mu.curState.txn,
+		Duration: tag.clock.PhysicalTime().Sub(tag.mu.curState.lockWaitStart),
+	}
+}
+
+// See contentionEventTracer.notify.
+func (tag *contentionTag) notify(ctx context.Context, s waitingState) *roachpb.ContentionEvent {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+
+	// Depending on the kind of notification, we check whether we're now waiting
+	// on a different key than we were previously. If we're now waiting on a
+	// different key, we'll return an event corresponding to the previous key.
 	switch s.kind {
-	case waitFor, waitForDistinguished, waitSelf:
+	case waitFor, waitForDistinguished, waitSelf, waitElsewhere:
 		// If we're tracking an event and see a different txn/key, the event is
 		// done and we initialize the new event tracking the new txn/key.
 		//
 		// NB: we're guaranteed to have `s.{txn,key}` populated here.
-		if h.ev != nil &&
-			(!h.ev.TxnMeta.ID.Equal(s.txn.ID) || !bytes.Equal(h.ev.Key, s.key)) {
-			h.emit() // h.ev is now nil
+		var differentLock bool
+		if !tag.mu.waiting {
+			differentLock = true
+		} else {
+			curLockHolder, curKey := tag.mu.curState.txn.ID, tag.mu.curState.key
+			differentLock = !curLockHolder.Equal(s.txn.ID) || !curKey.Equal(s.key)
 		}
-
-		if h.ev == nil {
-			h.ev = &roachpb.ContentionEvent{
-				Key:     s.key,
-				TxnMeta: *s.txn,
-			}
-			h.tBegin = timeutil.Now()
+		var res *roachpb.ContentionEvent
+		if differentLock {
+			res = tag.generateEventLocked()
 		}
-	case waitElsewhere, waitQueueMaxLengthExceeded, doneWaiting:
-		// If we have an event, emit it now and that's it - the case we're in
-		// does not give us a new transaction/key.
-		if h.ev != nil {
-			h.emit()
+		tag.mu.curState = s
+		tag.mu.waiting = true
+		if differentLock {
+			tag.mu.waitStart = tag.clock.PhysicalTime()
+			tag.mu.numLocks++
+			return res
 		}
+		return nil
+	case doneWaiting, waitQueueMaxLengthExceeded:
+		// There will be no more state updates; we're done waiting.
+		res := tag.generateEventLocked()
+		tag.mu.waiting = false
+		tag.mu.curState = waitingState{}
+		tag.mu.lockWait += tag.clock.PhysicalTime().Sub(tag.mu.waitStart)
+		// Accumulate the wait time.
+		tag.mu.waitStart = time.Time{}
+		return res
 	default:
-		panic("unhandled waitingState.kind")
+		kind := s.kind // escapes to the heap
+		log.Fatalf(ctx, "unhandled waitingState.kind: %v", kind)
 	}
+	panic("unreachable")
+}
+
+// Render implements the tracing.LazyTag interface.
+func (tag *contentionTag) Render() []attribute.KeyValue {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+	tags := make([]attribute.KeyValue, 0, 4)
+	if tag.mu.numLocks > 0 {
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagNumLocks,
+			Value: attribute.IntValue(tag.mu.numLocks),
+		})
+	}
+	// Compute how long the request has waited on locks by adding the prior wait
+	// time (if any) and the current wait time (if we're currently waiting).
+	lockWait := tag.mu.lockWait
+	if !tag.mu.waitStart.IsZero() {
+		lockWait += tag.clock.PhysicalTime().Sub(tag.mu.waitStart)
+	}
+	if lockWait != 0 {
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagWaited,
+			Value: attribute.StringValue(string(humanizeutil.Duration(lockWait))),
+		})
+	}
+
+	if tag.mu.waiting {
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagWaitKey,
+			Value: attribute.StringValue(tag.mu.curState.key.String()),
+		})
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagLockHolderTxn,
+			Value: attribute.StringValue(tag.mu.curState.txn.ID.String()),
+		})
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagWaitStart,
+			Value: attribute.StringValue(tag.mu.curState.lockWaitStart.Format("15:04:05.123")),
+		})
+	}
+	return tags
 }
 
 const (

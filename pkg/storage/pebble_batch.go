@@ -47,9 +47,11 @@ type pebbleBatch struct {
 	normalIter       pebbleIterator
 	prefixEngineIter pebbleIterator
 	normalEngineIter pebbleIterator
-	iter             cloneableIter
-	writeOnly        bool
-	closed           bool
+
+	iter       cloneableIter
+	writeOnly  bool
+	iterUnused bool
+	closed     bool
 
 	wrappedIntentWriter intentDemuxWriter
 	// scratch space for wrappedIntentWriter.
@@ -104,6 +106,12 @@ func (p *pebbleBatch) Close() {
 	}
 	p.closed = true
 
+	if p.iterUnused {
+		if err := p.iter.Close(); err != nil {
+			panic(err)
+		}
+	}
+
 	// Setting iter to nil is sufficient since it will be closed by one of the
 	// subsequent destroy calls.
 	p.iter = nil
@@ -143,7 +151,7 @@ func (p *pebbleBatch) MVCCGet(key MVCCKey) ([]byte, error) {
 	return v, err
 }
 
-func (p *pebbleBatch) rawGet(key []byte) ([]byte, error) {
+func (p *pebbleBatch) rawMVCCGet(key []byte) ([]byte, error) {
 	r := pebble.Reader(p.batch)
 	if p.writeOnly {
 		panic("write-only batch")
@@ -209,7 +217,7 @@ func (p *pebbleBatch) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) M
 
 	if !opts.MinTimestampHint.IsEmpty() {
 		// MVCCIterators that specify timestamp bounds cannot be cached.
-		iter := MVCCIterator(newPebbleIterator(p.batch, nil, opts))
+		iter := MVCCIterator(newPebbleIterator(p.batch, nil, opts, StandardDurability))
 		if util.RaceEnabled {
 			iter = wrapInUnsafeIter(iter)
 		}
@@ -230,14 +238,15 @@ func (p *pebbleBatch) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) M
 		iter.setBounds(opts.LowerBound, opts.UpperBound)
 	} else {
 		if p.batch.Indexed() {
-			iter.init(p.batch, p.iter, opts)
+			iter.init(p.batch, p.iter, p.iterUnused, opts, StandardDurability)
 		} else {
-			iter.init(p.db, p.iter, opts)
+			iter.init(p.db, p.iter, p.iterUnused, opts, StandardDurability)
 		}
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
 		}
+		p.iterUnused = false
 	}
 
 	iter.inuse = true
@@ -272,14 +281,15 @@ func (p *pebbleBatch) NewEngineIterator(opts IterOptions) EngineIterator {
 		iter.setBounds(opts.LowerBound, opts.UpperBound)
 	} else {
 		if p.batch.Indexed() {
-			iter.init(p.batch, p.iter, opts)
+			iter.init(p.batch, p.iter, p.iterUnused, opts, StandardDurability)
 		} else {
-			iter.init(p.db, p.iter, opts)
+			iter.init(p.db, p.iter, p.iterUnused, opts, StandardDurability)
 		}
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
 		}
+		p.iterUnused = false
 	}
 
 	iter.inuse = true
@@ -299,6 +309,10 @@ func (p *pebbleBatch) PinEngineStateForIterators() error {
 		} else {
 			p.iter = p.db.NewIter(nil)
 		}
+		// Since the iterator is being created just to pin the state of the engine
+		// for future iterators, we'll avoid cloning it the next time we want an
+		// iterator and instead just re-use what we created here.
+		p.iterUnused = true
 	}
 	return nil
 }
@@ -349,7 +363,7 @@ func (p *pebbleBatch) clear(key MVCCKey) error {
 		return emptyKeyError()
 	}
 
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
+	p.buf = EncodeMVCCKeyToBuf(p.buf[:0], key)
 	return p.batch.Delete(p.buf, nil)
 }
 
@@ -381,8 +395,8 @@ func (p *pebbleBatch) ClearMVCCRange(start, end MVCCKey) error {
 }
 
 func (p *pebbleBatch) clearRange(start, end MVCCKey) error {
-	p.buf = EncodeKeyToBuf(p.buf[:0], start)
-	buf2 := EncodeKey(end)
+	p.buf = EncodeMVCCKeyToBuf(p.buf[:0], start)
+	buf2 := EncodeMVCCKey(end)
 	return p.batch.DeleteRange(p.buf, buf2, nil)
 }
 
@@ -419,7 +433,7 @@ func (p *pebbleBatch) Merge(key MVCCKey, value []byte) error {
 		return emptyKeyError()
 	}
 
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
+	p.buf = EncodeMVCCKeyToBuf(p.buf[:0], key)
 	return p.batch.Merge(p.buf, value, nil)
 }
 
@@ -460,7 +474,7 @@ func (p *pebbleBatch) put(key MVCCKey, value []byte) error {
 		return emptyKeyError()
 	}
 
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
+	p.buf = EncodeMVCCKeyToBuf(p.buf[:0], key)
 	return p.batch.Set(p.buf, value, nil)
 }
 

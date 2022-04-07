@@ -161,6 +161,12 @@ func TestTypeCheck(t *testing.T) {
 		{`(1:::INT8, 2:::INT8)`, `(1:::INT8, 2:::INT8)`},
 		{`(ROW (1,2))`, `(1:::INT8, 2:::INT8)`},
 		{`ROW(1:::INT8, 2:::INT8)`, `(1:::INT8, 2:::INT8)`},
+		// Regression test #74729. Correctly handle NULLs annotated as a tuple
+		// type.
+		{
+			`CASE WHEN true THEN ('a', 2) ELSE NULL:::RECORD END`,
+			`CASE WHEN true THEN ('a':::STRING, 2:::INT8) ELSE NULL END`,
+		},
 
 		{`((ROW (1) AS a)).a`, `1:::INT8`},
 		{`((('1', 2) AS a, b)).a`, `'1':::STRING`},
@@ -244,7 +250,7 @@ func TestTypeCheckError(t *testing.T) {
 		expr     string
 		expected string
 	}{
-		{`'1' + '2'`, `unsupported binary operator:`},
+		{`'1' + '2'`, `ambiguous binary operator:`},
 		{`'a' + 0`, `unsupported binary operator:`},
 		{`1.1 # 3.1`, `unsupported binary operator:`},
 		{`~0.1`, `unsupported unary operator:`},

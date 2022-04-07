@@ -15,8 +15,10 @@ package serverutils
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -39,6 +41,9 @@ type TestTenantInterface interface {
 	// HTTPAddr returns the tenant's http address.
 	HTTPAddr() string
 
+	// RPCAddr returns the tenant's RPC address.
+	RPCAddr() string
+
 	// PGServer returns the tenant's *pgwire.Server as an interface{}.
 	PGServer() interface{}
 
@@ -50,6 +55,10 @@ type TestTenantInterface interface {
 	// StatusServer returns the tenant's *server.SQLStatusServer as an
 	// interface{}.
 	StatusServer() interface{}
+
+	// TenantStatusServer returns the tenant's *server.TenantStatusServer as an
+	// interface{}.
+	TenantStatusServer() interface{}
 
 	// DistSQLServer returns the *distsql.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
@@ -89,9 +98,9 @@ type TestTenantInterface interface {
 	// interface{}.
 	SpanConfigReconciler() interface{}
 
-	// SpanConfigSQLTranslator returns the underlying spanconfig.SQLTranslator as
-	// an interface{}.
-	SpanConfigSQLTranslator() interface{}
+	// SpanConfigSQLTranslatorFactory returns the underlying
+	// spanconfig.SQLTranslatorFactory as an interface{}.
+	SpanConfigSQLTranslatorFactory() interface{}
 
 	// SpanConfigSQLWatcher returns the underlying spanconfig.SQLWatcher as an
 	// interface{}.
@@ -105,6 +114,27 @@ type TestTenantInterface interface {
 	// using the same context details as the server. This should not
 	// be used in non-test code.
 	AmbientCtx() log.AmbientContext
+
+	// AdminURL returns the URL for the admin UI.
+	AdminURL() string
+	// GetUnauthenticatedHTTPClient returns an http client configured with the client TLS
+	// config required by the TestServer's configuration.
+	// Discourages implementer from using unauthenticated http connections
+	// with verbose method name.
+	GetUnauthenticatedHTTPClient() (http.Client, error)
+	// GetAdminHTTPClient returns an http client which has been
+	// authenticated to access Admin API methods (via a cookie).
+	// The user has admin privileges.
+	GetAdminHTTPClient() (http.Client, error)
+	// GetAuthenticatedHTTPClient returns an http client which has been
+	// authenticated to access Admin API methods (via a cookie).
+	GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error)
+
+	// DrainClients shuts down client connections.
+	DrainClients(ctx context.Context) error
+
+	// SystemConfigProvider provides access to the system config.
+	SystemConfigProvider() config.SystemConfigProvider
 
 	// TODO(irfansharif): We'd benefit from an API to construct a *gosql.DB, or
 	// better yet, a *sqlutils.SQLRunner. We use it all the time, constructing

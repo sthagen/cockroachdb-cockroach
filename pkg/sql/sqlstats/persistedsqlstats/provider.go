@@ -31,20 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 )
-
-const (
-	// TODO(azhng): currently we do not have the ability to compute a hash for
-	//  query plan. This is currently being worked on by the SQL Queries team.
-	//  Once we are able get consistent hash value from a query plan, we should
-	//  update this.
-	dummyPlanHash = int64(0)
-)
-
-// ErrConcurrentSQLStatsCompaction is reported when two sql stats compaction
-// jobs are issued concurrently. This is a sentinel error.
-var ErrConcurrentSQLStatsCompaction = errors.New("another sql stats compaction job is already running")
 
 // Config is a configuration struct for the persisted SQL stats subsystem.
 type Config struct {
@@ -154,10 +141,7 @@ func (s *PersistedSQLStats) startSQLStatsFlushLoop(ctx context.Context, stopper 
 				return
 			}
 
-			enabled := SQLStatsFlushEnabled.Get(&s.cfg.Settings.SV)
-			if enabled {
-				s.Flush(ctx)
-			}
+			s.Flush(ctx)
 		}
 	})
 }

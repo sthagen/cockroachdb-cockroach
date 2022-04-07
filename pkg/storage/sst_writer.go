@@ -15,7 +15,9 @@ import (
 	"context"
 	"io"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/sstable"
@@ -52,13 +54,36 @@ func (noopSyncCloser) Close() error {
 	return nil
 }
 
+// MakeIngestionWriterOptions returns writer options suitable for writing SSTs
+// that will subsequently be ingested (e.g. with AddSSTable).
+func MakeIngestionWriterOptions(ctx context.Context, cs *cluster.Settings) sstable.WriterOptions {
+	// By default, take a conservative approach and assume we don't have newer
+	// table features available. Upgrade to an appropriate version only if the
+	// cluster supports it.
+	format := sstable.TableFormatRocksDBv2
+	// Cases are ordered from newer to older versions.
+	switch {
+	case cs.Version.IsActive(ctx, clusterversion.EnablePebbleFormatVersionBlockProperties):
+		format = sstable.TableFormatPebblev1 // Block properties.
+	}
+	opts := DefaultPebbleOptions().MakeWriterOptions(0, format)
+	if format < sstable.TableFormatPebblev1 {
+		// Block properties aren't available at this version. Disable collection.
+		opts.BlockPropertyCollectors = nil
+	}
+	opts.MergerName = "nullptr"
+	return opts
+}
+
 // MakeBackupSSTWriter creates a new SSTWriter tailored for backup SSTs which
 // are typically only ever iterated in their entirety.
-func MakeBackupSSTWriter(f io.Writer) SSTWriter {
-	opts := DefaultPebbleOptions().MakeWriterOptions(0)
+func MakeBackupSSTWriter(_ context.Context, _ *cluster.Settings, f io.Writer) SSTWriter {
+	// By default, take a conservative approach and assume we don't have newer
+	// table features available. Upgrade to an appropriate version only if the
+	// cluster supports it.
+	opts := DefaultPebbleOptions().MakeWriterOptions(0, sstable.TableFormatRocksDBv2)
 	// Don't need BlockPropertyCollectors for backups.
 	opts.BlockPropertyCollectors = nil
-	opts.TableFormat = sstable.TableFormatRocksDBv2
 
 	// Disable bloom filters since we only ever iterate backups.
 	opts.FilterPolicy = nil
@@ -75,16 +100,13 @@ func MakeBackupSSTWriter(f io.Writer) SSTWriter {
 // MakeIngestionSSTWriter creates a new SSTWriter tailored for ingestion SSTs.
 // These SSTs have bloom filters enabled (as set in DefaultPebbleOptions) and
 // format set to RocksDBv2.
-func MakeIngestionSSTWriter(f writeCloseSyncer) SSTWriter {
-	opts := DefaultPebbleOptions().MakeWriterOptions(0)
-	// TODO(sumeer): we should use BlockPropertyCollectors here if the cluster
-	// version permits (which is also reflected in the store's roachpb.Version
-	// and pebble.FormatMajorVersion).
-	opts.BlockPropertyCollectors = nil
-	opts.TableFormat = sstable.TableFormatRocksDBv2
-	opts.MergerName = "nullptr"
-	sst := sstable.NewWriter(f, opts)
-	return SSTWriter{fw: sst, f: f}
+func MakeIngestionSSTWriter(
+	ctx context.Context, cs *cluster.Settings, f writeCloseSyncer,
+) SSTWriter {
+	return SSTWriter{
+		fw: sstable.NewWriter(f, MakeIngestionWriterOptions(ctx, cs)),
+		f:  f,
+	}
 }
 
 // Finish finalizes the writer and returns the constructed file's contents,
@@ -120,8 +142,8 @@ func (fw *SSTWriter) clearRange(start, end MVCCKey) error {
 		return errors.New("cannot call ClearRange on a closed writer")
 	}
 	fw.DataSize += int64(len(start.Key)) + int64(len(end.Key))
-	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], start)
-	return fw.fw.DeleteRange(fw.scratch, EncodeKey(end))
+	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], start)
+	return fw.fw.DeleteRange(fw.scratch, EncodeMVCCKey(end))
 }
 
 // Put puts a kv entry into the sstable being built. An error is returned if it
@@ -135,7 +157,7 @@ func (fw *SSTWriter) Put(key MVCCKey, value []byte) error {
 		return errors.New("cannot call Put on a closed writer")
 	}
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
-	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
 	return fw.fw.Set(fw.scratch, value)
 }
 
@@ -189,7 +211,7 @@ func (fw *SSTWriter) put(key MVCCKey, value []byte) error {
 		return errors.New("cannot call Put on a closed writer")
 	}
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
-	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
 	return fw.fw.Set(fw.scratch, value)
 }
 
@@ -247,7 +269,7 @@ func (fw *SSTWriter) clear(key MVCCKey) error {
 	if fw.fw == nil {
 		return errors.New("cannot call Clear on a closed writer")
 	}
-	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
 	fw.DataSize += int64(len(key.Key))
 	return fw.fw.Delete(fw.scratch)
 }
@@ -268,7 +290,7 @@ func (fw *SSTWriter) Merge(key MVCCKey, value []byte) error {
 		return errors.New("cannot call Merge on a closed writer")
 	}
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
-	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
 	return fw.fw.Merge(fw.scratch, value)
 }
 

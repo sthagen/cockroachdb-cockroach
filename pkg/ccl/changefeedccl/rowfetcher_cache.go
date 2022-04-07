@@ -12,6 +12,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 )
 
 // rowFetcherCache maintains a cache of single table RowFetchers. Given a key
@@ -33,9 +35,10 @@ import (
 // StartScanFrom can be used to turn that key (or all the keys making up the
 // column families of one row) into a row.
 type rowFetcherCache struct {
-	codec    keys.SQLCodec
-	leaseMgr *lease.Manager
-	fetchers *cache.UnorderedCache
+	codec           keys.SQLCodec
+	leaseMgr        *lease.Manager
+	fetchers        *cache.UnorderedCache
+	watchedFamilies map[watchedFamily]struct{}
 
 	collection *descs.Collection
 	db         *kv.DB
@@ -44,8 +47,15 @@ type rowFetcherCache struct {
 }
 
 type cachedFetcher struct {
-	tableDesc catalog.TableDescriptor
-	fetcher   row.Fetcher
+	tableDesc  catalog.TableDescriptor
+	fetcher    row.Fetcher
+	familyDesc descpb.ColumnFamilyDescriptor
+	skip       bool
+}
+
+type watchedFamily struct {
+	tableID    descpb.ID
+	familyName string
 }
 
 var rfCacheConfig = cache.Config{
@@ -59,6 +69,7 @@ var rfCacheConfig = cache.Config{
 type idVersion struct {
 	id      descpb.ID
 	version descpb.DescriptorVersion
+	family  descpb.FamilyID
 }
 
 func newRowFetcherCache(
@@ -67,28 +78,42 @@ func newRowFetcherCache(
 	leaseMgr *lease.Manager,
 	cf *descs.CollectionFactory,
 	db *kv.DB,
+	details jobspb.ChangefeedDetails,
 ) *rowFetcherCache {
+	specs := details.TargetSpecifications
+	watchedFamilies := make(map[watchedFamily]struct{}, len(specs))
+	for _, s := range specs {
+		watchedFamilies[watchedFamily{tableID: s.TableID, familyName: s.FamilyName}] = struct{}{}
+	}
 	return &rowFetcherCache{
-		codec:      codec,
-		leaseMgr:   leaseMgr,
-		collection: cf.NewCollection(nil /* TemporarySchemaProvider */),
-		db:         db,
-		fetchers:   cache.NewUnorderedCache(rfCacheConfig),
+		codec:           codec,
+		leaseMgr:        leaseMgr,
+		collection:      cf.NewCollection(ctx, nil /* TemporarySchemaProvider */),
+		db:              db,
+		fetchers:        cache.NewUnorderedCache(rfCacheConfig),
+		watchedFamilies: watchedFamilies,
 	}
 }
 
 func (c *rowFetcherCache) TableDescForKey(
 	ctx context.Context, key roachpb.Key, ts hlc.Timestamp,
-) (catalog.TableDescriptor, error) {
+) (catalog.TableDescriptor, descpb.FamilyID, error) {
 	var tableDesc catalog.TableDescriptor
 	key, err := c.codec.StripTenantPrefix(key)
 	if err != nil {
-		return nil, err
+		return nil, descpb.FamilyID(0), err
 	}
 	remaining, tableID, _, err := rowenc.DecodePartialTableIDIndexID(key)
 	if err != nil {
-		return nil, err
+		return nil, descpb.FamilyID(0), err
 	}
+
+	familyID, err := keys.DecodeFamilyKey(key)
+	if err != nil {
+		return nil, descpb.FamilyID(0), err
+	}
+
+	family := descpb.FamilyID(familyID)
 
 	// Retrieve the target TableDescriptor from the lease manager. No caching
 	// is attempted because the lease manager does its own caching.
@@ -96,7 +121,7 @@ func (c *rowFetcherCache) TableDescForKey(
 	if err != nil {
 		// Manager can return all kinds of errors during chaos, but based on
 		// its usage, none of them should ever be terminal.
-		return nil, changefeedbase.MarkRetryableError(err)
+		return nil, family, changefeedbase.MarkRetryableError(err)
 	}
 	tableDesc = desc.Underlying().(catalog.TableDescriptor)
 	// Immediately release the lease, since we only need it for the exact
@@ -123,7 +148,7 @@ func (c *rowFetcherCache) TableDescForKey(
 		}); err != nil {
 			// Manager can return all kinds of errors during chaos, but based on
 			// its usage, none of them should ever be terminal.
-			return nil, changefeedbase.MarkRetryableError(err)
+			return nil, family, changefeedbase.MarkRetryableError(err)
 		}
 		// Immediately release the lease, since we only need it for the exact
 		// timestamp requested.
@@ -134,52 +159,77 @@ func (c *rowFetcherCache) TableDescForKey(
 	for skippedCols := 0; skippedCols < tableDesc.GetPrimaryIndex().NumKeyColumns(); skippedCols++ {
 		l, err := encoding.PeekLength(remaining)
 		if err != nil {
-			return nil, err
+			return nil, family, err
 		}
 		remaining = remaining[l:]
 	}
 
-	return tableDesc, nil
+	return tableDesc, family, nil
 }
 
-func (c *rowFetcherCache) RowFetcherForTableDesc(
-	tableDesc catalog.TableDescriptor,
+// ErrUnwatchedFamily is a sentinel error that indicates this part of the row
+// is not being watched and does not need to be decoded.
+var ErrUnwatchedFamily = errors.New("watched table but unwatched family")
+
+func (c *rowFetcherCache) RowFetcherForColumnFamily(
+	tableDesc catalog.TableDescriptor, family descpb.FamilyID,
 ) (*row.Fetcher, error) {
-	idVer := idVersion{id: tableDesc.GetID(), version: tableDesc.GetVersion()}
-	// Ensure that all user defined types are up to date with the cached
-	// version and the desired version to use the cache. It is safe to use
-	// UserDefinedTypeColsHaveSameVersion if we have a hit because we are
-	// guaranteed that the tables have the same version. Additionally, these
-	// fetchers are always initialized with a single tabledesc.Immutable.
+	idVer := idVersion{id: tableDesc.GetID(), version: tableDesc.GetVersion(), family: family}
 	if v, ok := c.fetchers.Get(idVer); ok {
 		f := v.(*cachedFetcher)
+		if f.skip {
+			return &f.fetcher, ErrUnwatchedFamily
+		}
+		// Ensure that all user defined types are up to date with the cached
+		// version and the desired version to use the cache. It is safe to use
+		// UserDefinedTypeColsHaveSameVersion if we have a hit because we are
+		// guaranteed that the tables have the same version. Additionally, these
+		// fetchers are always initialized with a single tabledesc.Immutable.
+		// TODO (zinger): Only check types used in the relevant family.
 		if catalog.UserDefinedTypeColsHaveSameVersion(tableDesc, f.tableDesc) {
 			return &f.fetcher, nil
 		}
 	}
 
+	familyDesc, err := tableDesc.FindFamilyByID(family)
+	if err != nil {
+		return nil, err
+	}
+
 	f := &cachedFetcher{
-		tableDesc: tableDesc,
+		tableDesc:  tableDesc,
+		familyDesc: *familyDesc,
 	}
 	rf := &f.fetcher
 
-	// TODO(dan): Allow for decoding a subset of the columns.
-	rfArgs := row.FetcherTableArgs{
-		Desc:             tableDesc,
-		Index:            tableDesc.GetPrimaryIndex(),
-		IsSecondaryIndex: false,
-		Columns:          tableDesc.PublicColumns(),
+	_, wholeTableWatched := c.watchedFamilies[watchedFamily{tableID: tableDesc.GetID()}]
+	if !wholeTableWatched {
+		_, familyWatched := c.watchedFamilies[watchedFamily{tableID: tableDesc.GetID(), familyName: familyDesc.Name}]
+		if !familyWatched {
+			f.skip = true
+			return rf, ErrUnwatchedFamily
+		}
 	}
+
+	var spec descpb.IndexFetchSpec
+
+	// TODO (zinger): Make fetchColumnIDs only the family and the primary key.
+	// This seems to cause an error without further work but would be more efficient.
+	if err := rowenc.InitIndexFetchSpec(
+		&spec, c.codec, tableDesc, tableDesc.GetPrimaryIndex(), tableDesc.PublicColumnIDs(),
+	); err != nil {
+		return nil, err
+	}
+
 	if err := rf.Init(
 		context.TODO(),
-		c.codec,
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
 		0, /* lockTimeout */
 		&c.a,
 		nil, /* memMonitor */
-		rfArgs,
+		&spec,
 	); err != nil {
 		return nil, err
 	}

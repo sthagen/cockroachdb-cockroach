@@ -28,7 +28,7 @@ import (
 // MergeQueueEnabled is a setting that controls whether the merge queue is
 // enabled.
 var MergeQueueEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range_merge.queue_enabled",
 	"whether the automatic merge queue is enabled",
 	true,
@@ -59,13 +59,14 @@ var _ redact.SafeFormatter = CmdIDKey("")
 
 // FilterArgs groups the arguments to a ReplicaCommandFilter.
 type FilterArgs struct {
-	Ctx   context.Context
-	CmdID CmdIDKey
-	Index int
-	Sid   roachpb.StoreID
-	Req   roachpb.Request
-	Hdr   roachpb.Header
-	Err   error // only used for TestingPostEvalFilter
+	Ctx     context.Context
+	CmdID   CmdIDKey
+	Index   int
+	Sid     roachpb.StoreID
+	Req     roachpb.Request
+	Hdr     roachpb.Header
+	Version roachpb.Version
+	Err     error // only used for TestingPostEvalFilter
 }
 
 // ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
@@ -222,3 +223,7 @@ var SplitByLoadMergeDelay = settings.RegisterDurationSetting(
 		return nil
 	},
 )
+
+// MaxCommandSizeDefault is the default for the kv.raft.command.max_size
+// cluster setting.
+const MaxCommandSizeDefault = 64 << 20

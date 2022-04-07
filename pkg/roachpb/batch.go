@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-//go:generate go run -tags gen-batch gen/main.go
+//go:generate go run gen/main.go --filename batch_generated.go *.pb.go
 
 // WriteTimestamp returns the timestamps at which this request is writing. For
 // non-transactional requests, this is the same as the read timestamp. For
@@ -54,8 +54,8 @@ func (h Header) RequiredFrontier() hlc.Timestamp {
 // carried out. For transactional requests, ba.Timestamp must be zero initially
 // and it will be set to txn.ReadTimestamp (note though this mostly impacts
 // reads; writes use txn.WriteTimestamp). For non-transactional requests, if no
-// timestamp is specified, nowFn is used to create and set one.
-func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
+// timestamp is specified, clock is used to create and set one.
+func (ba *BatchRequest) SetActiveTimestamp(clock *hlc.Clock) error {
 	if txn := ba.Txn; txn != nil {
 		if !ba.Timestamp.IsEmpty() {
 			return errors.New("transactional request must not set batch timestamp")
@@ -71,10 +71,11 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 		// txn.WriteTimestamp, regardless of the batch timestamp.
 		ba.Timestamp = txn.ReadTimestamp
 	} else {
-		// When not transactional, allow empty timestamp and use nowFn instead
+		// When not transactional, allow empty timestamp and use clock instead.
 		if ba.Timestamp.IsEmpty() {
-			ba.Timestamp = nowFn()
-			ba.TimestampFromServerClock = true
+			now := clock.NowAsClockTimestamp()
+			ba.Timestamp = now.ToTimestamp() // copies value, not aliasing reference
+			ba.TimestampFromServerClock = &now
 		}
 	}
 	return nil
@@ -272,6 +273,15 @@ func (ba *BatchRequest) Require1PC() bool {
 	}
 	etArg := arg.(*EndTxnRequest)
 	return etArg.Require1PC
+}
+
+// RequiresClosedTSOlderThanStorageSnapshot returns true if the batch contains a
+// request that needs to read a replica's closed timestamp that is older than
+// the state of the storage snapshot the request is evaluating over.
+//
+// NB: This is only used by QueryResolvedTimestampRequest at the moment.
+func (ba *BatchRequest) RequiresClosedTSOlderThanStorageSnapshot() bool {
+	return ba.hasFlag(requiresClosedTSOlderThanStorageSnapshot)
 }
 
 // IsSingleAbortTxnRequest returns true iff the batch contains a single request,

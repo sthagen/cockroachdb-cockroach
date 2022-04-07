@@ -25,6 +25,7 @@ import {
   dashboardNameAttr,
   databaseAttr,
   databaseNameAttr,
+  executionIdAttr,
   implicitTxnAttr,
   indexNameAttr,
   nodeIDAttr,
@@ -34,6 +35,7 @@ import {
   tabAttr,
   tableNameAttr,
   txnFingerprintIdAttr,
+  viewAttr,
 } from "src/util/constants";
 import NotFound from "src/views/app/components/errorMessage/notFound";
 import Layout from "src/views/app/containers/layout";
@@ -62,6 +64,7 @@ import Nodes from "src/views/reports/containers/nodes";
 import ProblemRanges from "src/views/reports/containers/problemRanges";
 import Range from "src/views/reports/containers/range";
 import ReduxDebug from "src/views/reports/containers/redux";
+import HotRanges from "src/views/reports/containers/hotranges";
 import Settings from "src/views/reports/containers/settings";
 import Stores from "src/views/reports/containers/stores";
 import SQLActivityPage from "src/views/sqlActivity/sqlActivityPage";
@@ -70,7 +73,11 @@ import SessionDetails from "src/views/sessions/sessionDetails";
 import TransactionDetails from "src/views/transactions/transactionDetails";
 import StatementsDiagnosticsHistoryView from "src/views/reports/containers/statementDiagnosticsHistory";
 import { RedirectToStatementDetails } from "src/routes/RedirectToStatementDetails";
+import HotRangesPage from "src/views/hotRanges/index";
+import ActiveStatementDetails from "./views/statements/activeStatementDetailsConnected";
+import ActiveTransactionDetails from "./views/transactions/activeTransactionDetailsConnected";
 import "styl/app.styl";
+import { Tracez } from "src/views/tracez/tracez";
 
 // NOTE: If you are adding a new path to the router, and that path contains any
 // components that are personally identifying information, you MUST update the
@@ -194,11 +201,24 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                 {/* SQL activity */}
                 <Route exact path="/sql-activity" component={SQLActivityPage} />
 
+                {/* Active executions */}
+                <Route
+                  exact
+                  path={`/execution/statement/:${executionIdAttr}`}
+                  component={ActiveStatementDetails}
+                />
+
+                <Route
+                  exact
+                  path={`/execution/transaction/:${executionIdAttr}`}
+                  component={ActiveTransactionDetails}
+                />
+
                 {/* statement statistics */}
                 <Redirect
                   exact
                   from={`/statements`}
-                  to={`/sql-activity?${tabAttr}=Statements`}
+                  to={`/sql-activity?${tabAttr}=Statements&${viewAttr}=fingerprints`}
                 />
                 <Redirect
                   exact
@@ -238,7 +258,7 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                 <Redirect
                   exact
                   from={`/statement`}
-                  to={`/sql-activity?${tabAttr}=Statements`}
+                  to={`/sql-activity?${tabAttr}=Statements&view=fingerprints`}
                 />
 
                 {/* sessions */}
@@ -267,12 +287,19 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
 
                 {/* debug pages */}
                 <Route exact path="/debug" component={Debug} />
+                <Route exact path="/debug/tracez" component={Tracez} />
                 <Route exact path="/debug/redux" component={ReduxDebug} />
                 <Route exact path="/debug/chart" component={CustomChart} />
                 <Route
                   exact
                   path="/debug/enqueue_range"
                   component={EnqueueRange}
+                />
+                <Route exact path="/debug/hotranges" component={HotRanges} />
+                <Route
+                  exact
+                  path="/debug/hotranges/:node_id"
+                  component={HotRanges}
                 />
 
                 <Route path="/raft">
@@ -342,7 +369,8 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   path={`/reports/statements/diagnosticshistory`}
                   component={StatementsDiagnosticsHistoryView}
                 />
-
+                {/* hot ranges */}
+                <Route exact path={`/hotranges`} component={HotRangesPage} />
                 {/* old route redirects */}
                 <Redirect
                   exact

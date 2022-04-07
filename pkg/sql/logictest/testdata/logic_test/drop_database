@@ -25,11 +25,10 @@ DROP DATABASE "foo-bar" RESTRICT
 statement ok
 DROP DATABASE "foo-bar" CASCADE
 
-skipif config local-declarative-schema
 query TTT
 SELECT name, database_name, state FROM crdb_internal.tables WHERE name = 't'
 ----
-t  [56]  DROP
+t  [106]  DROP
 
 query TTTTT
 SHOW DATABASES
@@ -39,14 +38,12 @@ postgres   root  NULL  {}  NULL
 system     node  NULL  {}  NULL
 test       root  NULL  {}  NULL
 
-skipif config local-declarative-schema
 query TT
 SELECT job_type, status FROM [SHOW JOBS] WHERE user_name = 'root'
 ----
-SCHEMA CHANGE     succeeded
-SCHEMA CHANGE     succeeded
-SCHEMA CHANGE     succeeded
-SCHEMA CHANGE GC  running
+SCHEMA CHANGE      succeeded
+SCHEMA CHANGE      succeeded
+NEW SCHEMA CHANGE  succeeded
 
 statement ok
 CREATE DATABASE "foo bar"
@@ -221,7 +218,6 @@ CREATE TABLE constraint_db.t2 (
 statement ok
 DROP DATABASE constraint_db CASCADE
 
-skipif config local-declarative-schema
 query TTT
 WITH cte AS (
   SELECT job_type, description, status
@@ -231,10 +227,10 @@ WITH cte AS (
   LIMIT 4
 ) SELECT * FROM cte ORDER BY job_type, description
 ----
-SCHEMA CHANGE     DROP DATABASE constraint_db CASCADE                                                             succeeded
-SCHEMA CHANGE     updating table "t2" after removing constraint "fk" from table "constraint_db.public.t1"         succeeded
-SCHEMA CHANGE GC  GC for DROP DATABASE constraint_db CASCADE                                                      running
-SCHEMA CHANGE GC  GC for updating table "t2" after removing constraint "fk" from table "constraint_db.public.t1"  running
+SCHEMA CHANGE     CREATE TABLE constraint_db.public.t2 (t1_id INT8, CONSTRAINT fk FOREIGN KEY (t1_id) REFERENCES constraint_db.public.t1 (a), INDEX (t1_id))  succeeded
+SCHEMA CHANGE     updating referenced FK table t1(125) for table t2(126)                                                                                      succeeded
+SCHEMA CHANGE GC  GC for DROP DATABASE constraint_db CASCADE                                                                                                  running
+SCHEMA CHANGE GC  GC for DROP DATABASE d2 CASCADE                                                                                                             running
 
 query TTTTT
 SHOW DATABASES
@@ -266,10 +262,16 @@ SET sql_safe_updates = FALSE; DROP DATABASE foo
 
 # Check that the default databases can be dropped and re-created like any other.
 statement OK
-DROP DATABASE defaultdb; DROP DATABASE postgres
+DROP DATABASE defaultdb;
+
+statement OK
+DROP DATABASE postgres
 
 statement ok
-CREATE DATABASE defaultdb; CREATE DATABASE postgres
+CREATE DATABASE defaultdb;
+
+statement OK
+CREATE DATABASE postgres
 
 # Test that an empty database doesn't get a GC job.
 statement ok

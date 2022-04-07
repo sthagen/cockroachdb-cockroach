@@ -44,7 +44,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -62,6 +64,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -95,7 +98,7 @@ func postAdminJSONProtoWithAdminOption(
 // getText fetches the HTTP response body as text in the form of a
 // byte slice from the specified URL.
 func getText(ts serverutils.TestServerInterface, url string) ([]byte, error) {
-	httpClient, err := ts.GetAdminAuthenticatedHTTPClient()
+	httpClient, err := ts.GetAdminHTTPClient()
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +226,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	url := debugURL(s)
 
 	// Unauthenticated.
-	client, err := ts.GetHTTPClient()
+	client, err := ts.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +281,7 @@ func TestAdminDebugRedirect(t *testing.T) {
 	origURL := expURL + "incorrect"
 
 	// Must be admin to access debug endpoints
-	client, err := ts.GetAdminAuthenticatedHTTPClient()
+	client, err := ts.GetAdminHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,6 +676,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 				"CREATE USER app",
 				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, tblName),
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, tblName),
+				fmt.Sprintf("CREATE STATISTICS test_stats FROM %s.%s", escDBName, tblName),
 			}
 			pgURL, cleanupGoDB := sqlutils.PGUrl(
 				t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
@@ -776,6 +780,22 @@ func TestAdminAPITableDetails(t *testing.T) {
 
 				if a, e := resp.CreateTableStatement, createStmt; a != e {
 					t.Fatalf("mismatched create table statement; expected %s, got %s", e, a)
+				}
+			}
+
+			// Verify statistics last updated.
+			{
+
+				showStatisticsForTableQuery := fmt.Sprintf("SELECT max(created) AS created FROM [SHOW STATISTICS FOR TABLE %s.%s]", escDBName, tblName)
+
+				row := db.QueryRow(showStatisticsForTableQuery)
+				var createdTs time.Time
+				if err := row.Scan(&createdTs); err != nil {
+					t.Fatal(err)
+				}
+
+				if a, e := resp.StatsLastCreatedAt, createdTs; reflect.DeepEqual(a, e) {
+					t.Fatalf("mismatched statistics creation timestamp; expected %s, got %s", e, a)
 				}
 			}
 
@@ -1068,7 +1088,7 @@ func TestAdminAPISettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	// Any bool that defaults to true will work here.
@@ -1102,6 +1122,20 @@ func TestAdminAPISettings(t *testing.T) {
 		}
 		if typ != v.Type {
 			t.Errorf("%s: expected type %s, got %s", k, typ, v.Type)
+		}
+		if v.LastUpdated != nil {
+			db := sqlutils.MakeSQLRunner(conn)
+			q := makeSQLQuery()
+			q.Append(`SELECT name, "lastUpdated" FROM system.settings WHERE name=$`, k)
+			rows := db.Query(
+				t,
+				q.String(),
+				q.QueryArguments()...,
+			)
+			defer rows.Close()
+			if rows.Next() == false {
+				t.Errorf("missing sql row for %s", k)
+			}
 		}
 	}
 
@@ -1346,7 +1380,7 @@ func TestClusterAPI(t *testing.T) {
 				if err := getAdminJSONProto(s, "cluster", &resp); err != nil {
 					return err
 				}
-				if a, e := resp.ClusterID, s.RPCContext().ClusterID.String(); a != e {
+				if a, e := resp.ClusterID, s.RPCContext().StorageClusterID.String(); a != e {
 					return errors.Errorf("cluster ID %s != expected %s", a, e)
 				}
 				if a, e := resp.ReportingEnabled, reportingOn; a != e {
@@ -1379,13 +1413,13 @@ func TestHealthAPI(t *testing.T) {
 	})
 
 	// Make the SQL listener appear unavailable. Verify that health fails after that.
-	ts.sqlServer.acceptingClients.Set(false)
+	ts.sqlServer.isReady.Set(false)
 	var resp serverpb.HealthResponse
 	err := getAdminJSONProto(s, "health?ready=1", &resp)
 	if err == nil {
 		t.Error("server appears ready even though SQL listener is not")
 	}
-	ts.sqlServer.acceptingClients.Set(true)
+	ts.sqlServer.isReady.Set(true)
 	err = getAdminJSONProto(s, "health?ready=1", &resp)
 	if err != nil {
 		t.Errorf("server not ready after SQL listener is ready again: %v", err)
@@ -1418,13 +1452,26 @@ func TestHealthAPI(t *testing.T) {
 	}
 }
 
-// getSystemJobIDs queries the jobs table for all job IDs that have
+// getSystemJobIDsForNonAutoJobs queries the jobs table for all job IDs that have
 // the given status. Sorted by decreasing creation time.
-func getSystemJobIDs(t testing.TB, db *sqlutils.SQLRunner, status jobs.Status) []int64 {
+func getSystemJobIDsForNonAutoJobs(
+	t testing.TB, db *sqlutils.SQLRunner, status jobs.Status,
+) []int64 {
+	q := makeSQLQuery()
+	q.Append(`SELECT job_id FROM crdb_internal.jobs WHERE status=$`, status)
+	q.Append(` AND (`)
+	for i, jobType := range jobspb.AutomaticJobTypes {
+		q.Append(`job_type != $`, jobType.String())
+		if i < len(jobspb.AutomaticJobTypes)-1 {
+			q.Append(" AND ")
+		}
+	}
+	q.Append(` OR job_type IS NULL)`)
+	q.Append(` ORDER BY created DESC`)
 	rows := db.Query(
 		t,
-		`SELECT job_id FROM crdb_internal.jobs WHERE status=$1 ORDER BY created DESC`,
-		status,
+		q.String(),
+		q.QueryArguments()...,
 	)
 	defer rows.Close()
 
@@ -1456,8 +1503,8 @@ func TestAdminAPIJobs(t *testing.T) {
 		}
 	})
 
-	existingSucceededIDs := getSystemJobIDs(t, sqlDB, jobs.StatusSucceeded)
-	existingRunningIDs := getSystemJobIDs(t, sqlDB, jobs.StatusRunning)
+	existingSucceededIDs := getSystemJobIDsForNonAutoJobs(t, sqlDB, jobs.StatusSucceeded)
+	existingRunningIDs := getSystemJobIDsForNonAutoJobs(t, sqlDB, jobs.StatusRunning)
 	existingIDs := append(existingSucceededIDs, existingRunningIDs...)
 
 	runningOnlyIds := []int64{1, 2, 4}
@@ -1610,7 +1657,6 @@ func TestAdminAPIJobs(t *testing.T) {
 			if e, a := expected, resIDs; !reflect.DeepEqual(e, a) {
 				t.Errorf("%d: expected job IDs %v, but got %v", i, e, a)
 			}
-
 		}
 	})
 }
@@ -2395,14 +2441,14 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.DataDistribution(ctx, &serverpb.DataDistributionRequest{})
 			return err
 		}},
-		{"Decommission", codes.Unknown, func(c serverpb.AdminClient) error {
+		{"Decommission", codes.Internal, func(c serverpb.AdminClient) error {
 			_, err := c.Decommission(ctx, &serverpb.DecommissionRequest{
 				NodeIDs:          []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 				TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONED,
 			})
 			return err
 		}},
-		{"DecommissionStatus", codes.Unknown, func(c serverpb.AdminClient) error {
+		{"DecommissionStatus", codes.Internal, func(c serverpb.AdminClient) error {
 			_, err := c.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{
 				NodeIDs: []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 			})
@@ -2493,4 +2539,233 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			}, 10*time.Second, 100*time.Millisecond, "timed out waiting for gRPC error, got %s", err)
 		})
 	}
+}
+
+func TestAdminPrivilegeChecker(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, "CREATE USER withadmin")
+	sqlDB.Exec(t, "GRANT admin TO withadmin")
+	sqlDB.Exec(t, "CREATE USER withva")
+	sqlDB.Exec(t, "ALTER ROLE withva WITH VIEWACTIVITY")
+	sqlDB.Exec(t, "CREATE USER withvaredacted")
+	sqlDB.Exec(t, "ALTER ROLE withvaredacted WITH VIEWACTIVITYREDACTED")
+	sqlDB.Exec(t, "CREATE USER withvaandredacted")
+	sqlDB.Exec(t, "ALTER ROLE withvaandredacted WITH VIEWACTIVITY")
+	sqlDB.Exec(t, "ALTER ROLE withvaandredacted WITH VIEWACTIVITYREDACTED")
+	sqlDB.Exec(t, "CREATE USER withoutprivs")
+
+	underTest := &adminPrivilegeChecker{
+		ie: s.InternalExecutor().(*sql.InternalExecutor),
+	}
+
+	withAdmin, err := security.MakeSQLUsernameFromPreNormalizedStringChecked("withadmin")
+	require.NoError(t, err)
+	withVa, err := security.MakeSQLUsernameFromPreNormalizedStringChecked("withva")
+	require.NoError(t, err)
+	withVaRedacted, err := security.MakeSQLUsernameFromPreNormalizedStringChecked("withvaredacted")
+	require.NoError(t, err)
+	withVaAndRedacted, err := security.MakeSQLUsernameFromPreNormalizedStringChecked("withvaandredacted")
+	require.NoError(t, err)
+	withoutPrivs, err := security.MakeSQLUsernameFromPreNormalizedStringChecked("withoutprivs")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name            string
+		checkerFun      func(context.Context) error
+		usernameWantErr map[security.SQLUsername]bool
+	}{
+		{
+			"requireViewActivityPermission",
+			underTest.requireViewActivityPermission,
+			map[security.SQLUsername]bool{
+				withAdmin: false, withVa: false, withVaRedacted: true, withVaAndRedacted: false, withoutPrivs: true,
+			},
+		},
+		{
+			"requireViewActivityOrViewActivityRedactedPermission",
+			underTest.requireViewActivityOrViewActivityRedactedPermission,
+			map[security.SQLUsername]bool{
+				withAdmin: false, withVa: false, withVaRedacted: false, withVaAndRedacted: false, withoutPrivs: true,
+			},
+		},
+		{
+			"requireViewActivityAndNoViewActivityRedactedPermission",
+			underTest.requireViewActivityAndNoViewActivityRedactedPermission,
+			map[security.SQLUsername]bool{
+				withAdmin: false, withVa: false, withVaRedacted: true, withVaAndRedacted: true, withoutPrivs: true,
+			},
+		},
+	}
+	for _, tt := range tests {
+		for userName, wantErr := range tt.usernameWantErr {
+			t.Run(fmt.Sprintf("%s-%s", tt.name, userName), func(t *testing.T) {
+				ctx := metadata.NewIncomingContext(ctx, metadata.New(map[string]string{"websessionuser": userName.SQLIdentifier()}))
+				err := tt.checkerFun(ctx)
+				if wantErr {
+					require.Error(t, err)
+					return
+				}
+				require.NoError(t, err)
+			})
+		}
+	}
+}
+
+func TestDatabaseAndTableIndexRecommendations(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	stubTime := stubUnusedIndexTime{}
+	stubDropUnusedDuration := time.Hour
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			UnusedIndexRecommendKnobs: &idxusage.UnusedIndexRecommendationTestingKnobs{
+				GetCreatedAt:   stubTime.getCreatedAt,
+				GetLastRead:    stubTime.getLastRead,
+				GetCurrentTime: stubTime.getCurrent,
+			},
+		},
+	})
+	idxusage.DropUnusedIndexDuration.Override(context.Background(), &s.ClusterSettings().SV, stubDropUnusedDuration)
+	defer s.Stopper().Stop(context.Background())
+
+	db := sqlutils.MakeSQLRunner(sqlDB)
+	db.Exec(t, "CREATE DATABASE test")
+	db.Exec(t, "USE test")
+	// Create a table, the statistics on its primary index will be fetched.
+	db.Exec(t, "CREATE TABLE test.test_table (num INT PRIMARY KEY, letter char)")
+
+	// Test when last read does not exist and there is no creation time. Expect
+	// an index recommendation (index never used).
+	stubTime.setLastRead(time.Time{})
+	stubTime.setCreatedAt(nil)
+
+	// Test database details endpoint.
+	var dbDetails serverpb.DatabaseDetailsResponse
+	if err := getAdminJSONProto(
+		s,
+		"databases/test?include_stats=true",
+		&dbDetails,
+	); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, int32(1), dbDetails.Stats.NumIndexRecommendations)
+
+	// Test table details endpoint.
+	var tableDetails serverpb.TableDetailsResponse
+	if err := getAdminJSONProto(s, "databases/test/tables/test_table", &tableDetails); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, true, tableDetails.HasIndexRecommendations)
+
+	// Test when last read does not exist and there is a creation time, and the
+	// unused index duration has been exceeded. Expect an index recommendation.
+	currentTime := timeutil.Now()
+	createdTime := currentTime.Add(-stubDropUnusedDuration)
+	stubTime.setCurrent(currentTime)
+	stubTime.setLastRead(time.Time{})
+	stubTime.setCreatedAt(&createdTime)
+
+	// Test database details endpoint.
+	dbDetails = serverpb.DatabaseDetailsResponse{}
+	if err := getAdminJSONProto(
+		s,
+		"databases/test?include_stats=true",
+		&dbDetails,
+	); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, int32(1), dbDetails.Stats.NumIndexRecommendations)
+
+	// Test table details endpoint.
+	tableDetails = serverpb.TableDetailsResponse{}
+	if err := getAdminJSONProto(s, "databases/test/tables/test_table", &tableDetails); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, true, tableDetails.HasIndexRecommendations)
+
+	// Test when last read does not exist and there is a creation time, and the
+	// unused index duration has not been exceeded. Expect no index
+	// recommendation.
+	currentTime = timeutil.Now()
+	stubTime.setCurrent(currentTime)
+	stubTime.setLastRead(time.Time{})
+	stubTime.setCreatedAt(&currentTime)
+
+	// Test database details endpoint.
+	dbDetails = serverpb.DatabaseDetailsResponse{}
+	if err := getAdminJSONProto(
+		s,
+		"databases/test?include_stats=true",
+		&dbDetails,
+	); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, int32(0), dbDetails.Stats.NumIndexRecommendations)
+
+	// Test table details endpoint.
+	tableDetails = serverpb.TableDetailsResponse{}
+	if err := getAdminJSONProto(s, "databases/test/tables/test_table", &tableDetails); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, false, tableDetails.HasIndexRecommendations)
+
+	// Test when last read exists and the unused index duration has been
+	// exceeded. Expect an index recommendation.
+	currentTime = timeutil.Now()
+	lastRead := currentTime.Add(-stubDropUnusedDuration)
+	stubTime.setCurrent(currentTime)
+	stubTime.setLastRead(lastRead)
+	stubTime.setCreatedAt(nil)
+
+	// Test database details endpoint.
+	dbDetails = serverpb.DatabaseDetailsResponse{}
+	if err := getAdminJSONProto(
+		s,
+		"databases/test?include_stats=true",
+		&dbDetails,
+	); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, int32(1), dbDetails.Stats.NumIndexRecommendations)
+
+	// Test table details endpoint.
+	tableDetails = serverpb.TableDetailsResponse{}
+	if err := getAdminJSONProto(s, "databases/test/tables/test_table", &tableDetails); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, true, tableDetails.HasIndexRecommendations)
+
+	// Test when last read exists and the unused index duration has not been
+	// exceeded. Expect no index recommendation.
+	currentTime = timeutil.Now()
+	stubTime.setCurrent(currentTime)
+	stubTime.setLastRead(currentTime)
+	stubTime.setCreatedAt(nil)
+
+	// Test database details endpoint.
+	dbDetails = serverpb.DatabaseDetailsResponse{}
+	if err := getAdminJSONProto(
+		s,
+		"databases/test?include_stats=true",
+		&dbDetails,
+	); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, int32(0), dbDetails.Stats.NumIndexRecommendations)
+
+	// Test table details endpoint.
+	tableDetails = serverpb.TableDetailsResponse{}
+	if err := getAdminJSONProto(s, "databases/test/tables/test_table", &tableDetails); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, false, tableDetails.HasIndexRecommendations)
 }

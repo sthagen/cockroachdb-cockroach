@@ -13,12 +13,12 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # Load go bazel tools. This gives us access to the go bazel SDK/toolchains.
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "5c4bd27429b1a307d51cd23d4677126aa6315fff608f0cd85c5bfb642a13b953",
-    strip_prefix = "cockroachdb-rules_go-23b381c",
+    sha256 = "a80c384a85ab9f6318419ed38a39b13e8481e9d2ea25a696ea9e25438e017b5f",
+    strip_prefix = "cockroachdb-rules_go-f96cc04",
     urls = [
-        # cockroachdb/rules_go as of 23b381cc8a679f5b10fd2459fc87997728b3740c
+        # cockroachdb/rules_go as of f96cc0445102a7b08bceeb0bba32b4d82467a065
         # (upstream release-0.29 plus a few patches).
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-52-g23b381c.tar.gz",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-54-gf96cc04.tar.gz",
     ],
 )
 
@@ -137,15 +137,34 @@ http_archive(
 load(
     "@io_bazel_rules_go//go:deps.bzl",
     "go_download_sdk",
+    "go_host_sdk",
+    "go_local_sdk",
     "go_register_toolchains",
     "go_rules_dependencies",
 )
 
+# To point to a mirrored artifact, use:
+#
 go_download_sdk(
     name = "go_sdk",
     urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/{}"],
     version = "1.17.6",
 )
+
+# To point to a local SDK path, use the following instead. We'll call the
+# directory into which you cloned the Go repository $GODIR[1]. You'll have to
+# first run ./make.bash from $GODIR/src to pick up any custom changes.
+#
+# [1]: https://go.dev/doc/contribute#testing
+#
+#   go_local_sdk(
+#       name = "go_sdk",
+#       path = "<path to $GODIR>",
+#   )
+
+# To use your whatever your local SDK is, use the following instead:
+#
+#   go_host_sdk(name = "go_sdk")
 
 go_rules_dependencies()
 
@@ -184,6 +203,10 @@ yarn_install(
     package_json = "//pkg/ui:package.json",
     strict_visibility = False,
     yarn_lock = "//pkg/ui:yarn.lock",
+    links = {
+      "@cockroachlabs/crdb-protobuf-client": "//pkg/ui/workspaces/db-console/src/js:crdb-protobuf-client",
+      "@cockroachlabs/cluster-ui": "//pkg/ui/workspaces/cluster-ui:cluster-ui",
+    },
 )
 
 #################################
@@ -367,10 +390,16 @@ load("//build/toolchains:REPOSITORIES.bzl", "toolchain_dependencies")
 toolchain_dependencies()
 
 register_toolchains(
-    "//build/toolchains:cross_linux_toolchain",
-    "//build/toolchains:cross_linux_arm_toolchain",
-    "//build/toolchains:cross_macos_toolchain",
-    "//build/toolchains:cross_windows_toolchain",
+    "//build/toolchains:cross_x86_64_linux_toolchain",
+    "//build/toolchains:cross_x86_64_linux_arm_toolchain",
+    "//build/toolchains:cross_x86_64_macos_toolchain",
+    "//build/toolchains:cross_x86_64_macos_arm_toolchain",
+    "//build/toolchains:cross_x86_64_windows_toolchain",
+    "//build/toolchains:cross_arm64_linux_toolchain",
+    "//build/toolchains:cross_arm64_linux_arm_toolchain",
+    "//build/toolchains:cross_arm64_windows_toolchain",
+    "//build/toolchains:cross_arm64_macos_toolchain",
+    "//build/toolchains:cross_arm64_macos_arm_toolchain",
     "//build/toolchains:dev_darwin_x86_64_toolchain",
 )
 

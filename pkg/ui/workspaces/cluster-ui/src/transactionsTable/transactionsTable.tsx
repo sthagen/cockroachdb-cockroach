@@ -27,19 +27,10 @@ import {
   transactionsNetworkBytesBarChart,
   transactionsRetryBarChart,
 } from "./transactionsBarCharts";
-import {
-  formatAggregationIntervalColumn,
-  statisticsTableTitles,
-} from "../statsTableUtil/statsTableUtil";
+import { statisticsTableTitles } from "../statsTableUtil/statsTableUtil";
 import { tableClasses } from "./transactionsTableClasses";
 import { transactionLink } from "./transactionsCells";
-import {
-  FixLong,
-  longToInt,
-  TimestampToNumber,
-  DurationToNumber,
-  TimestampToString,
-} from "src/util";
+import { FixLong, longToInt, TimestampToString } from "src/util";
 import { SortSetting } from "../sortedtable";
 import {
   getStatementsByFingerprintIdAndTime,
@@ -161,17 +152,6 @@ export function makeTransactionsColumns(
           ),
         ),
       alwaysShow: true,
-    },
-    {
-      name: "aggregationInterval",
-      title: statisticsTableTitles.aggregationInterval("transaction"),
-      cell: (item: TransactionInfo) =>
-        formatAggregationIntervalColumn(
-          TimestampToNumber(item.stats_data?.aggregated_ts),
-          DurationToNumber(item.stats_data?.aggregation_interval),
-        ),
-      sort: (item: TransactionInfo) =>
-        TimestampToNumber(item.stats_data?.aggregated_ts),
     },
     {
       name: "executionCount",

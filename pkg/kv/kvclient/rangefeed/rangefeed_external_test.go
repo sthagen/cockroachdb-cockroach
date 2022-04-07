@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sstutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -82,7 +83,7 @@ func TestRangeFeedIntegration(t *testing.T) {
 			case <-ctx.Done():
 			}
 		},
-		rangefeed.WithDiff(),
+		rangefeed.WithDiff(true),
 		rangefeed.WithInitialScan(func(ctx context.Context) {
 			close(initialScanDone)
 		}),
@@ -386,7 +387,7 @@ func TestRangefeedValueTimestamps(t *testing.T) {
 			case <-ctx.Done():
 			}
 		},
-		rangefeed.WithDiff(),
+		rangefeed.WithDiff(true),
 	)
 	require.NoError(t, err)
 	defer r.Close()
@@ -510,8 +511,8 @@ func TestWithOnSSTable(t *testing.T) {
 	now.Logical = 0
 	ts := now.WallTime
 	sstKVs := []sstutil.KV{{"a", ts, "1"}, {"b", ts, "2"}, {"c", ts, "3"}, {"d", ts, "4"}, {"e", ts, "5"}}
-	sst, sstStart, sstEnd := sstutil.MakeSST(t, sstKVs)
-	_, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
+	sst, sstStart, sstEnd := sstutil.MakeSST(t, srv.ClusterSettings(), sstKVs)
+	_, _, _, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
 		false /* disallowConflicts */, false /* disallowShadowing */, hlc.Timestamp{}, nil, /* stats */
 		false /* ingestAsWrites */, now)
 	require.Nil(t, pErr)
@@ -586,8 +587,8 @@ func TestWithOnSSTableCatchesUpIfNotSet(t *testing.T) {
 	ts := now.WallTime
 	sstKVs := []sstutil.KV{{"a", ts, "1"}, {"b", ts, "2"}, {"c", ts, "3"}, {"d", ts, "4"}, {"e", ts, "5"}}
 	expectKVs := []sstutil.KV{{"c", ts, "3"}, {"d", ts, "4"}}
-	sst, sstStart, sstEnd := sstutil.MakeSST(t, sstKVs)
-	_, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
+	sst, sstStart, sstEnd := sstutil.MakeSST(t, srv.ClusterSettings(), sstKVs)
+	_, _, _, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
 		false /* disallowConflicts */, false /* disallowShadowing */, hlc.Timestamp{}, nil, /* stats */
 		false /* ingestAsWrites */, now)
 	require.Nil(t, pErr)
@@ -618,7 +619,15 @@ func TestUnrecoverableErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SpanConfig: &spanconfig.TestingKnobs{
+					ConfigureScratchRange: true,
+				},
+			},
+		},
+	})
 	defer tc.Stopper().Stop(ctx)
 
 	srv0 := tc.Server(0)
@@ -649,9 +658,18 @@ func TestUnrecoverableErrors(t *testing.T) {
 		syncutil.Mutex
 		internalErr error
 	}{}
+
+	testutils.SucceedsSoon(t, func() error {
+		repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(roachpb.RKey(scratchKey))
+		if repl.SpanConfig().GCPolicy.IgnoreStrictEnforcement {
+			return errors.New("waiting for span config to apply")
+		}
+		return nil
+	})
+
 	r, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, preGCThresholdTS,
 		func(context.Context, *roachpb.RangeFeedValue) {},
-		rangefeed.WithDiff(),
+		rangefeed.WithDiff(true),
 		rangefeed.WithOnInternalError(func(ctx context.Context, err error) {
 			mu.Lock()
 			defer mu.Unlock()

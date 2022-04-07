@@ -11,6 +11,8 @@
 package catalog
 
 import (
+	"time"
+
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -44,6 +46,10 @@ type TableElementMaybeMutation interface {
 	// Backfilling returns true iff the table element is in a
 	// mutation in the backfilling state.
 	Backfilling() bool
+
+	// Mergin returns true iff the table element is in a
+	// mutation in the merging state.
+	Merging() bool
 
 	// Adding returns true iff the table element is in an add mutation.
 	Adding() bool
@@ -79,6 +85,10 @@ type Mutation interface {
 	// AsMaterializedViewRefresh returns the corresponding MaterializedViewRefresh
 	// if the mutation is a materialized view refresh, nil otherwise.
 	AsMaterializedViewRefresh() MaterializedViewRefresh
+
+	// AsModifyRowLevelTTL returns the corresponding ModifyRowLevelTTL
+	// if the mutation is a row-level TTL alter, nil otherwise.
+	AsModifyRowLevelTTL() ModifyRowLevelTTL
 
 	// NOTE: When adding new types of mutations to this interface, be sure to
 	// audit the code which unpacks and introspects mutations to be sure to add
@@ -123,6 +133,7 @@ type Index interface {
 	// The remaining methods operate on the underlying descpb.IndexDescriptor object.
 
 	GetID() descpb.IndexID
+	GetConstraintID() descpb.ConstraintID
 	GetName() string
 	IsPartial() bool
 	IsUnique() bool
@@ -169,7 +180,7 @@ type Index interface {
 	InvertedColumnName() string
 
 	// InvertedColumnKeyType returns the type of the data element that is encoded
-	// as the inverted index key. This is currently always Bytes.
+	// as the inverted index key. This is currently always EncodedKey.
 	//
 	// Panics if the index is not inverted.
 	InvertedColumnKeyType() *types.T
@@ -186,6 +197,34 @@ type Index interface {
 	NumCompositeColumns() int
 	GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID
 	UseDeletePreservingEncoding() bool
+	// ForcePut, if true, forces all writes to use Put rather than CPut or InitPut.
+	//
+	// Users of this options should take great care as it
+	// effectively mean unique constraints are not respected.
+	//
+	// Currently (2022-01-19) this two users: delete preserving
+	// indexes and merging indexes.
+	//
+	// Delete preserving encoding indexes are used only as a log of
+	// index writes during backfill, thus we can blindly put values into
+	// them.
+	//
+	// New indexes may miss updates during the backfilling process
+	// that would lead to CPut failures until the missed updates
+	// are merged into the index. Uniqueness for such indexes is
+	// checked by the schema changer before they are brought back
+	// online.
+	ForcePut() bool
+
+	// CreatedAt is an approximate timestamp at which the index was created.
+	// It is derived from the statement time at which the relevant statement
+	// was issued.
+	CreatedAt() time.Time
+
+	// IsTemporaryIndexForBackfill() returns true iff the index is
+	// an index being used as the temporary index being used by an
+	// in-progress index backfill.
+	IsTemporaryIndexForBackfill() bool
 }
 
 // Column is an interface around the column descriptor types.
@@ -364,6 +403,9 @@ type ConstraintToUpdate interface {
 	// UniqueWithoutIndex returns the underlying unique without index constraint, if
 	// there is one.
 	UniqueWithoutIndex() descpb.UniqueWithoutIndexConstraint
+
+	// GetConstraintID returns the ID for the constraint.
+	GetConstraintID() descpb.ConstraintID
 }
 
 // PrimaryKeySwap is an interface around a primary key swap mutation.
@@ -426,11 +468,19 @@ type MaterializedViewRefresh interface {
 	TableWithNewIndexes(tbl TableDescriptor) TableDescriptor
 }
 
+// ModifyRowLevelTTL is an interface around a modify row level TTL mutation.
+type ModifyRowLevelTTL interface {
+	TableElementMaybeMutation
+
+	// RowLevelTTL returns the row level TTL for the mutation.
+	RowLevelTTL() *catpb.RowLevelTTL
+}
+
 // Partitioning is an interface around an index partitioning.
 type Partitioning interface {
 
 	// PartitioningDesc returns the underlying protobuf descriptor.
-	PartitioningDesc() *descpb.PartitioningDescriptor
+	PartitioningDesc() *catpb.PartitioningDescriptor
 
 	// DeepCopy returns a deep copy of the receiver.
 	DeepCopy() Partitioning
@@ -635,6 +685,51 @@ func FindDeleteOnlyNonPrimaryIndex(desc TableDescriptor, test func(idx Index) bo
 	return findIndex(desc.DeleteOnlyNonPrimaryIndexes(), test)
 }
 
+// FindCorrespondingTemporaryIndexByID finds the temporary index that
+// corresponds to the currently mutated index identified by ID. It
+// assumes that the temporary index for a given index ID exists
+// directly after it in the mutations array.
+//
+// Callers should take care that AllocateIDs() has been called before
+// using this function.
+func FindCorrespondingTemporaryIndexByID(desc TableDescriptor, id descpb.IndexID) Index {
+	mutations := desc.AllMutations()
+	var ord int
+	for _, m := range mutations {
+		idx := m.AsIndex()
+		if idx != nil && idx.IndexDesc().ID == id {
+			// We want the mutation after this mutation
+			// since the temporary index is added directly
+			// after.
+			ord = m.MutationOrdinal() + 1
+		}
+	}
+
+	// A temporary index will never be found at index 0 since we
+	// always add them _after_ the index they correspond to.
+	if ord == 0 {
+		return nil
+	}
+
+	if len(mutations) >= ord+1 {
+		candidateMutation := mutations[ord]
+		if idx := candidateMutation.AsIndex(); idx != nil {
+			if idx.IsTemporaryIndexForBackfill() {
+				return idx
+			}
+		}
+	}
+	return nil
+}
+
+// IsCorrespondingTemporaryIndex returns true iff idx is a temporary index
+// created during a backfill and is the corresponding temporary index for
+// otherIdx. It assumes that idx and otherIdx are both indexes from the same
+// table.
+func IsCorrespondingTemporaryIndex(idx Index, otherIdx Index) bool {
+	return idx.IsTemporaryIndexForBackfill() && idx.Ordinal() == otherIdx.Ordinal()+1
+}
+
 // UserDefinedTypeColsHaveSameVersion returns whether one table descriptor's
 // columns with user defined type metadata have the same versions of metadata
 // as in the other descriptor. Note that this function is only valid on two
@@ -700,14 +795,4 @@ func ColumnNeedsBackfill(col Column) bool {
 		return false
 	}
 	return col.HasDefault() || !col.IsNullable() || col.IsComputed()
-}
-
-// HasConcurrentSchemaChanges returns whether the table descriptor is undergoing
-// concurrent schema changes.
-func HasConcurrentSchemaChanges(table TableDescriptor) bool {
-	// TODO(ajwerner): For now we simply check for the absence of mutations. Once
-	// we start implementing schema changes with ops to be executed during
-	// statement execution, we'll have to take into account mutations that were
-	// written in this transaction.
-	return len(table.AllMutations()) > 0
 }

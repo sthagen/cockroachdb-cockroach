@@ -46,7 +46,8 @@ import (
 // adoptedJobs represents a the epoch and cancelation of a job id being run
 // by the registry.
 type adoptedJob struct {
-	sid sqlliveness.SessionID
+	sid    sqlliveness.SessionID
+	isIdle bool
 	// Calling the func will cancel the context the job was resumed with.
 	cancel context.CancelFunc
 }
@@ -88,17 +89,18 @@ const (
 type Registry struct {
 	serverCtx context.Context
 
-	ac       log.AmbientContext
-	stopper  *stop.Stopper
-	db       *kv.DB
-	ex       sqlutil.InternalExecutor
-	clock    *hlc.Clock
-	nodeID   *base.SQLIDContainer
-	settings *cluster.Settings
-	execCtx  jobExecCtxMaker
-	metrics  Metrics
-	td       *tracedumper.TraceDumper
-	knobs    TestingKnobs
+	ac        log.AmbientContext
+	stopper   *stop.Stopper
+	db        *kv.DB
+	ex        sqlutil.InternalExecutor
+	clock     *hlc.Clock
+	clusterID *base.ClusterIDContainer
+	nodeID    *base.SQLIDContainer
+	settings  *cluster.Settings
+	execCtx   jobExecCtxMaker
+	metrics   Metrics
+	td        *tracedumper.TraceDumper
+	knobs     TestingKnobs
 
 	// adoptionChan is used to nudge the registry to resume claimed jobs and
 	// potentially attempt to claim jobs.
@@ -181,6 +183,7 @@ func MakeRegistry(
 	clock *hlc.Clock,
 	db *kv.DB,
 	ex sqlutil.InternalExecutor,
+	clusterID *base.ClusterIDContainer,
 	nodeID *base.SQLIDContainer,
 	sqlInstance sqlliveness.Instance,
 	settings *cluster.Settings,
@@ -197,6 +200,7 @@ func MakeRegistry(
 		clock:               clock,
 		db:                  db,
 		ex:                  ex,
+		clusterID:           clusterID,
 		nodeID:              nodeID,
 		sqlInstance:         sqlInstance,
 		settings:            settings,
@@ -274,27 +278,29 @@ func (r *Registry) MakeJobID() jobspb.JobID {
 }
 
 // newJob creates a new Job.
-func (r *Registry) newJob(record Record) *Job {
+func (r *Registry) newJob(ctx context.Context, record Record) *Job {
 	job := &Job{
 		id:        record.JobID,
 		registry:  r,
 		createdBy: record.CreatedBy,
 	}
-	job.mu.payload = r.makePayload(&record)
+	job.mu.payload = r.makePayload(ctx, &record)
 	job.mu.progress = r.makeProgress(&record)
 	job.mu.status = StatusRunning
 	return job
 }
 
 // makePayload creates a Payload structure based on the given Record.
-func (r *Registry) makePayload(record *Record) jobspb.Payload {
+func (r *Registry) makePayload(ctx context.Context, record *Record) jobspb.Payload {
 	return jobspb.Payload{
-		Description:   record.Description,
-		Statement:     record.Statements,
-		UsernameProto: record.Username.EncodeProto(),
-		DescriptorIDs: record.DescriptorIDs,
-		Details:       jobspb.WrapPayloadDetails(record.Details),
-		Noncancelable: record.NonCancelable,
+		Description:            record.Description,
+		Statement:              record.Statements,
+		UsernameProto:          record.Username.EncodeProto(),
+		DescriptorIDs:          record.DescriptorIDs,
+		Details:                jobspb.WrapPayloadDetails(record.Details),
+		Noncancelable:          record.NonCancelable,
+		CreationClusterVersion: r.settings.Version.ActiveVersion(ctx).Version,
+		CreationClusterID:      r.clusterID.Get(),
 	}
 }
 
@@ -343,7 +349,7 @@ func (r *Registry) createJobsInBatchWithTxn(
 		start = txn.ReadTimestamp().GoTime()
 	}
 	modifiedMicros := timeutil.ToUnixMicros(start)
-	stmt, args, jobIDs, err := r.batchJobInsertStmt(s.ID(), records, modifiedMicros)
+	stmt, args, jobIDs, err := r.batchJobInsertStmt(ctx, s.ID(), records, modifiedMicros)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +364,7 @@ func (r *Registry) createJobsInBatchWithTxn(
 // batchJobInsertStmt creates an INSERT statement and its corresponding arguments
 // for batched jobs creation.
 func (r *Registry) batchJobInsertStmt(
-	sessionID sqlliveness.SessionID, records []*Record, modifiedMicros int64,
+	ctx context.Context, sessionID sqlliveness.SessionID, records []*Record, modifiedMicros int64,
 ) (string, []interface{}, []jobspb.JobID, error) {
 	instanceID := r.ID()
 	const numColumns = 6
@@ -376,7 +382,7 @@ func (r *Registry) batchJobInsertStmt(
 		`claim_session_id`:  func(rec *Record) interface{} { return sessionID.UnsafeBytes() },
 		`claim_instance_id`: func(rec *Record) interface{} { return instanceID },
 		`payload`: func(rec *Record) interface{} {
-			payload := r.makePayload(rec)
+			payload := r.makePayload(ctx, rec)
 			return marshalPanic(&payload)
 		},
 		`progress`: func(rec *Record) interface{} {
@@ -438,7 +444,7 @@ func (r *Registry) CreateJobWithTxn(
 	// TODO(sajjad): Clean up the interface - remove jobID from the params as
 	// Record now has JobID field.
 	record.JobID = jobID
-	j := r.newJob(record)
+	j := r.newJob(ctx, record)
 
 	s, err := r.sqlInstance.Session(ctx)
 	if err != nil {
@@ -475,7 +481,7 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 	// TODO(sajjad): Clean up the interface - remove jobID from the params as
 	// Record now has JobID field.
 	record.JobID = jobID
-	j := r.newJob(record)
+	j := r.newJob(ctx, record)
 	if err := j.runInTxn(ctx, txn, func(ctx context.Context, txn *kv.Txn) error {
 		// Note: although the following uses ReadTimestamp and
 		// ReadTimestamp can diverge from the value of now() throughout a
@@ -1119,9 +1125,16 @@ func (r *Registry) stepThroughStateMachine(
 		var err error
 		func() {
 			jm.CurrentlyRunning.Inc(1)
-			defer jm.CurrentlyRunning.Dec(1)
+			r.metrics.RunningNonIdleJobs.Inc(1)
+			defer func() {
+				jm.CurrentlyRunning.Dec(1)
+				r.metrics.RunningNonIdleJobs.Dec(1)
+			}()
 			err = resumer.Resume(resumeCtx, execCtx)
 		}()
+
+		r.MarkIdle(job, false)
+
 		if err == nil {
 			jm.ResumeCompleted.Inc(1)
 			return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusSucceeded, nil)
@@ -1137,7 +1150,10 @@ func (r *Registry) stepThroughStateMachine(
 		}
 
 		if errors.Is(err, errPauseSelfSentinel) {
-			return r.PauseRequested(ctx, nil, job.ID(), err.Error())
+			if err := r.PauseRequested(ctx, nil, job.ID(), err.Error()); err != nil {
+				return err
+			}
+			return errors.Wrap(err, PauseRequestExplained)
 		}
 		// TODO(spaskob): enforce a limit on retries.
 
@@ -1207,7 +1223,11 @@ func (r *Registry) stepThroughStateMachine(
 		var err error
 		func() {
 			jm.CurrentlyRunning.Inc(1)
-			defer jm.CurrentlyRunning.Dec(1)
+			r.metrics.RunningNonIdleJobs.Inc(1)
+			defer func() {
+				jm.CurrentlyRunning.Dec(1)
+				r.metrics.RunningNonIdleJobs.Dec(1)
+			}()
 			err = resumer.OnFailOrCancel(onFailOrCancelCtx, execCtx)
 		}()
 		if successOnFailOrCancel := err == nil; successOnFailOrCancel {
@@ -1280,6 +1300,30 @@ func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+// MarkIdle marks a currently adopted job as Idle.
+// A single job should not toggle its idleness more than twice per-minute as it
+// is logged and may write to persisted job state in the future.
+func (r *Registry) MarkIdle(job *Job, isIdle bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if aj, ok := r.mu.adoptedJobs[job.ID()]; ok {
+		payload := job.Payload()
+		jobType := payload.Type()
+		jm := r.metrics.JobMetrics[jobType]
+		if aj.isIdle != isIdle {
+			log.Infof(r.serverCtx, "%s job %d: toggling idleness to %+v", jobType, job.ID(), isIdle)
+			if isIdle {
+				r.metrics.RunningNonIdleJobs.Dec(1)
+				jm.CurrentlyIdle.Inc(1)
+			} else {
+				r.metrics.RunningNonIdleJobs.Inc(1)
+				jm.CurrentlyIdle.Dec(1)
+			}
+			aj.isIdle = isIdle
+		}
+	}
 }
 
 func (r *Registry) cancelAllAdoptedJobs() {
@@ -1395,4 +1439,12 @@ func (r *Registry) CheckPausepoint(name string) error {
 		}
 	}
 	return nil
+}
+
+// TestingIsJobIdle returns true if the job is adopted and currently idle.
+func (r *Registry) TestingIsJobIdle(jobID jobspb.JobID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	adoptedJob := r.mu.adoptedJobs[jobID]
+	return adoptedJob != nil && adoptedJob.isIdle
 }

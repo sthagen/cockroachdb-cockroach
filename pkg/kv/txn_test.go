@@ -42,7 +42,7 @@ func TestTxnVerboseTrace(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	tracer := tracing.NewTracer()
-	ctx, sp := tracing.StartVerboseTrace(context.Background(), tracer, "test-txn")
+	ctx, sp := tracer.StartSpanCtx(context.Background(), "test-txn", tracing.WithRecording(tracing.RecordingVerbose))
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
@@ -538,7 +538,7 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 	}
 }
 
-// Test that, if SetSystemConfigTrigger() fails, the systemConfigTrigger has not
+// Test that, if DeprecatedSetSystemConfigTrigger() fails, the systemConfigTrigger has not
 // been set.
 func TestAnchoringErrorNoTrigger(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -555,7 +555,7 @@ func TestAnchoringErrorNoTrigger(t *testing.T) {
 			return nil, nil
 		}), clock, stopper)
 	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
-	require.EqualError(t, txn.SetSystemConfigTrigger(true /* forSystemTenant */), "unimplemented")
+	require.EqualError(t, txn.DeprecatedSetSystemConfigTrigger(true /* forSystemTenant */), "unimplemented")
 	require.False(t, txn.systemConfigTrigger)
 }
 

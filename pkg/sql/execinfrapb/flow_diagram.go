@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
@@ -133,33 +133,15 @@ func (a *AggregatorSpec) summary() (string, []string) {
 	return "Aggregator", details
 }
 
-func indexDetail(desc *descpb.TableDescriptor, indexIdx uint32) string {
-	index := "primary"
-	if indexIdx > 0 {
-		index = desc.Indexes[indexIdx-1].Name
-	}
-	return fmt.Sprintf("%s@%s", desc.Name, index)
-}
-
-// summary implements the diagramCellType interface.
-func (tr *TableReaderSpec) summary() (string, []string) {
-	details := make([]string, 0, 3)
-	details = append(details, indexDetail(&tr.Table, tr.IndexIdx))
-	tbl := tabledesc.NewUnsafeImmutable(&tr.Table)
+func appendColumns(details []string, columns []descpb.IndexFetchSpec_Column) []string {
 	var b strings.Builder
 	b.WriteString("Columns:")
 	const wrapAt = 100
-	for i, colID := range tr.ColumnIDs {
-		col, err := tbl.FindColumnWithID(colID)
+	for i := range columns {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		var name string
-		if err != nil {
-			name = fmt.Sprintf("?%d?", colID)
-		} else {
-			name = col.GetName()
-		}
+		name := columns[i].Name
 		if b.Len()+len(name)+1 > wrapAt {
 			details = append(details, b.String())
 			b.Reset()
@@ -168,15 +150,28 @@ func (tr *TableReaderSpec) summary() (string, []string) {
 		b.WriteString(name)
 	}
 	details = append(details, b.String())
+	return details
+}
+
+// summary implements the diagramCellType interface.
+func (tr *TableReaderSpec) summary() (string, []string) {
+	details := make([]string, 0, 3)
+	details = append(details, fmt.Sprintf("%s@%s", tr.FetchSpec.TableName, tr.FetchSpec.IndexName))
+	details = appendColumns(details, tr.FetchSpec.FetchedColumns)
 
 	if len(tr.Spans) > 0 {
 		// only show the first span
-		idx := tbl.ActiveIndexes()[int(tr.IndexIdx)]
-		valDirs := catalogkeys.IndexKeyValDirs(idx)
+		keyDirs := make([]encoding.Direction, len(tr.FetchSpec.KeyAndSuffixColumns))
+		for i := range keyDirs {
+			keyDirs[i] = encoding.Ascending
+			if tr.FetchSpec.KeyAndSuffixColumns[i].Direction == descpb.IndexDescriptor_DESC {
+				keyDirs[i] = encoding.Descending
+			}
+		}
 
 		var spanStr strings.Builder
 		spanStr.WriteString("Spans: ")
-		spanStr.WriteString(catalogkeys.PrettySpan(valDirs, tr.Spans[0], 2))
+		spanStr.WriteString(catalogkeys.PrettySpan(keyDirs, tr.Spans[0], 2))
 
 		if len(tr.Spans) > 1 {
 			spanStr.WriteString(fmt.Sprintf(" and %d other", len(tr.Spans)-1))
@@ -198,7 +193,7 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 	if jr.Type != descpb.InnerJoin {
 		details = append(details, joinTypeDetail(jr.Type))
 	}
-	details = append(details, indexDetail(&jr.Table, jr.IndexIdx))
+	details = append(details, fmt.Sprintf("%s@%s", jr.FetchSpec.TableName, jr.FetchSpec.IndexName))
 	if len(jr.LookupColumns) > 0 {
 		details = append(details, fmt.Sprintf("Lookup join on: %s", colListStr(jr.LookupColumns)))
 	}
@@ -214,6 +209,10 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 	if jr.LeftJoinWithPairedJoiner {
 		details = append(details, "second join in paired-join")
 	}
+	if jr.OutputGroupContinuationForLeftRow {
+		details = append(details, "first join in paired-join")
+	}
+	details = appendColumns(details, jr.FetchSpec.FetchedColumns)
 	return "JoinReader", details
 }
 
@@ -298,12 +297,13 @@ func (mj *MergeJoinerSpec) summary() (string, []string) {
 // summary implements the diagramCellType interface.
 func (zj *ZigzagJoinerSpec) summary() (string, []string) {
 	name := "ZigzagJoiner"
-	tables := zj.Tables
-	details := make([]string, 0, len(tables)+1)
-	for i, table := range tables {
+	details := make([]string, 0, len(zj.Sides)+1)
+	for i := range zj.Sides {
+		fetchSpec := &zj.Sides[i].FetchSpec
 		details = append(details, fmt.Sprintf(
-			"Side %d: %s", i, indexDetail(&table, zj.IndexOrdinals[i]),
+			"Side %d: %s@%s", i, fetchSpec.TableName, fetchSpec.IndexName,
 		))
+		details = appendColumns(details, fetchSpec.FetchedColumns)
 	}
 	if !zj.OnExpr.Empty() {
 		details = append(details, fmt.Sprintf("ON %s", zj.OnExpr))
@@ -317,7 +317,7 @@ func (ij *InvertedJoinerSpec) summary() (string, []string) {
 	if ij.Type != descpb.InnerJoin {
 		details = append(details, joinTypeDetail(ij.Type))
 	}
-	details = append(details, indexDetail(&ij.Table, ij.IndexIdx))
+	details = append(details, fmt.Sprintf("%s@%s", ij.FetchSpec.TableName, ij.FetchSpec.IndexName))
 	details = append(details, fmt.Sprintf("InvertedExpr %s", ij.InvertedExpr))
 	if !ij.OnExpr.Empty() {
 		details = append(details, fmt.Sprintf("ON %s", ij.OnExpr))
@@ -325,6 +325,7 @@ func (ij *InvertedJoinerSpec) summary() (string, []string) {
 	if ij.OutputGroupContinuationForLeftRow {
 		details = append(details, "first join in paired-join")
 	}
+	details = appendColumns(details, ij.FetchSpec.FetchedColumns)
 	return "InvertedJoiner", details
 }
 
@@ -511,6 +512,17 @@ func (post *PostProcessSpec) summary() []string {
 }
 
 // summary implements the diagramCellType interface.
+func (c *RestoreDataSpec) summary() (string, []string) {
+	return "RestoreDataSpec", []string{}
+}
+
+// summary implements the diagramCellType interface.
+func (c *SplitAndScatterSpec) summary() (string, []string) {
+	detail := fmt.Sprintf("%d chunks", len(c.Chunks))
+	return "SplitAndScatterSpec", []string{detail}
+}
+
+// summary implements the diagramCellType interface.
 func (c *ReadImportDataSpec) summary() (string, []string) {
 	ss := make([]string, 0, len(c.Uri))
 	for _, s := range c.Uri {
@@ -520,8 +532,23 @@ func (c *ReadImportDataSpec) summary() (string, []string) {
 }
 
 // summary implements the diagramCellType interface.
-func (s *CSVWriterSpec) summary() (string, []string) {
-	return "CSVWriter", []string{s.Destination}
+func (s *StreamIngestionDataSpec) summary() (string, []string) {
+	return "StreamIngestionData", []string{}
+}
+
+// summary implements the diagramCellType interface.
+func (s *StreamIngestionFrontierSpec) summary() (string, []string) {
+	return "StreamIngestionFrontier", []string{}
+}
+
+// summary implements the diagramCellType interface.
+func (s *IndexBackfillMergerSpec) summary() (string, []string) {
+	return "IndexBackfillMerger", []string{}
+}
+
+// summary implements the diagramCellType interface.
+func (s *ExportSpec) summary() (string, []string) {
+	return "Exporter", []string{s.Destination}
 }
 
 // summary implements the diagramCellType interface.

@@ -23,11 +23,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -71,10 +73,6 @@ type Mutable struct {
 	// ClusterVersion represents the version of the type descriptor read
 	// from the store.
 	ClusterVersion *immutable
-
-	// changed represents whether or not the descriptor was changed
-	// after RunPostDeserializationChanges.
-	changed bool
 }
 
 // IsUncommittedVersion implements the Descriptor interface.
@@ -95,6 +93,10 @@ type immutable struct {
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
 	isUncommittedVersion bool
+
+	// changes represents how descriptor was changes	after
+	// RunPostDeserializationChanges.
+	changes catalog.PostDeserializationChanges
 }
 
 // UpdateCachedFieldsOnModifiedMutable refreshes the immutable field by
@@ -184,8 +186,16 @@ func (desc *immutable) ByteSize() int64 {
 }
 
 // NewBuilder implements the catalog.Descriptor interface.
+//
+// It overrides the wrapper's implementation to deal with the fact that
+// mutable has overridden the definition of IsUncommittedVersion.
+func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
+	return newBuilder(desc.TypeDesc(), desc.IsUncommittedVersion(), desc.changes)
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
 func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
-	return NewBuilder(desc.TypeDesc())
+	return newBuilder(desc.TypeDesc(), desc.IsUncommittedVersion(), desc.changes)
 }
 
 // PrimaryRegionName implements the TypeDescriptor interface.
@@ -246,6 +256,17 @@ func (desc *immutable) RegionNamesForValidation() (catpb.RegionNames, error) {
 		regions = append(regions, catpb.RegionName(member.LogicalRepresentation))
 	}
 	return regions, nil
+}
+
+// SuperRegions implements the TypeDescriptor interface.
+func (desc *immutable) SuperRegions() ([]descpb.SuperRegion, error) {
+	if desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
+		return nil, errors.AssertionFailedf(
+			"can not get regions of a non multi-region enum %d", desc.ID,
+		)
+	}
+
+	return desc.RegionConfig.SuperRegions, nil
 }
 
 // RegionNamesIncludingTransitioning implements the TypeDescriptor interface.
@@ -315,9 +336,7 @@ func (desc *Mutable) OriginalVersion() descpb.DescriptorVersion {
 
 // ImmutableCopy implements the MutableDescriptor interface.
 func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
-	imm := NewBuilder(desc.TypeDesc()).BuildImmutableType()
-	imm.(*immutable).isUncommittedVersion = desc.IsUncommittedVersion()
-	return imm
+	return desc.NewBuilder().(TypeDescriptorBuilder).BuildImmutableType()
 }
 
 // IsNew implements the MutableDescriptor interface.
@@ -486,9 +505,14 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 		vea.Report(errors.AssertionFailedf("invalid parent schema ID %d", desc.GetParentSchemaID()))
 	}
 
+	if desc.Privileges == nil {
+		vea.Report(errors.AssertionFailedf("privileges not set"))
+	} else if desc.Kind != descpb.TypeDescriptor_ALIAS {
+		vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Type))
+	}
+
 	switch desc.Kind {
 	case descpb.TypeDescriptor_MULTIREGION_ENUM:
-		vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Type))
 		// Check presence of region config
 		if desc.RegionConfig == nil {
 			vea.Report(errors.AssertionFailedf("no region config on %s type desc", desc.Kind.String()))
@@ -507,7 +531,6 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 			}
 		}
 	case descpb.TypeDescriptor_ENUM:
-		vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Type))
 		if desc.RegionConfig != nil {
 			vea.Report(errors.AssertionFailedf("found region config on %s type desc", desc.Kind.String()))
 		}
@@ -598,6 +621,9 @@ func (desc *immutable) ValidateCrossReferences(
 	dbDesc, err := vdg.GetDatabaseDescriptor(desc.GetParentID())
 	if err != nil {
 		vea.Report(err)
+	} else if dbDesc.Dropped() {
+		vea.Report(errors.AssertionFailedf("parent database %q (%d) is dropped",
+			dbDesc.GetName(), dbDesc.GetID()))
 	}
 
 	// Check that the parent schema exists.
@@ -609,6 +635,10 @@ func (desc *immutable) ValidateCrossReferences(
 			vea.Report(errors.AssertionFailedf("parent schema %d is in different database %d",
 				desc.GetParentSchemaID(), schemaDesc.GetParentID()))
 		}
+		if schemaDesc != nil && schemaDesc.Dropped() {
+			vea.Report(errors.AssertionFailedf("parent schema %q (%d) is dropped",
+				schemaDesc.GetName(), schemaDesc.GetID()))
+		}
 	}
 
 	if desc.GetKind() == descpb.TypeDescriptor_MULTIREGION_ENUM && dbDesc != nil {
@@ -619,8 +649,10 @@ func (desc *immutable) ValidateCrossReferences(
 	switch desc.GetKind() {
 	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
 		// Ensure that the referenced array type exists.
-		if _, err := vdg.GetTypeDescriptor(desc.GetArrayTypeID()); err != nil {
+		if typ, err := vdg.GetTypeDescriptor(desc.GetArrayTypeID()); err != nil {
 			vea.Report(errors.Wrapf(err, "arrayTypeID %d does not exist for %q", desc.GetArrayTypeID(), desc.GetKind()))
+		} else if typ.Dropped() {
+			vea.Report(errors.AssertionFailedf("array type %q (%d) is dropped", typ.GetName(), typ.GetID()))
 		}
 	case descpb.TypeDescriptor_ALIAS:
 		if desc.GetAlias().UserDefined() {
@@ -628,8 +660,10 @@ func (desc *immutable) ValidateCrossReferences(
 			if err != nil {
 				vea.Report(err)
 			}
-			if _, err := vdg.GetTypeDescriptor(aliasedID); err != nil {
+			if typ, err := vdg.GetTypeDescriptor(aliasedID); err != nil {
 				vea.Report(errors.Wrapf(err, "aliased type %d does not exist", aliasedID))
+			} else if typ.Dropped() {
+				vea.Report(errors.AssertionFailedf("aliased type %q (%d) is dropped", typ.GetName(), typ.GetID()))
 			}
 		}
 	}
@@ -687,11 +721,11 @@ func (desc *immutable) validateMultiRegion(
 			dbPrimaryRegion, primaryRegion))
 	}
 
+	regionNames, err := desc.RegionNames()
+	if err != nil {
+		vea.Report(err)
+	}
 	if dbDesc.GetRegionConfig().SurvivalGoal == descpb.SurvivalGoal_REGION_FAILURE {
-		regionNames, err := desc.RegionNames()
-		if err != nil {
-			vea.Report(err)
-		}
 		if len(regionNames) < 3 {
 			vea.Report(
 				errors.AssertionFailedf(
@@ -701,6 +735,19 @@ func (desc *immutable) validateMultiRegion(
 				),
 			)
 		}
+	}
+
+	superRegions, err := desc.SuperRegions()
+	if err != nil {
+		vea.Report(err)
+	}
+
+	err = multiregion.ValidateSuperRegions(superRegions, dbDesc.GetRegionConfig().SurvivalGoal, regionNames, func(err error) error {
+		vea.Report(err)
+		return nil
+	})
+	if err != nil {
+		vea.Report(err)
 	}
 }
 
@@ -920,6 +967,23 @@ func (desc *immutable) HasPendingSchemaChanges() bool {
 	}
 }
 
+// GetPostDeserializationChanges implements the Descriptor interface.
+func (desc *immutable) GetPostDeserializationChanges() catalog.PostDeserializationChanges {
+	return desc.changes
+}
+
+// HasConcurrentSchemaChanges implements catalog.Descriptor.
+func (desc *immutable) HasConcurrentSchemaChanges() bool {
+	if desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID {
+		return true
+	}
+	// TODO(fqazi): In the future we may not have concurrent declarative schema
+	// changes without a job ID. So, we should scan the elements involved for
+	// types.
+	return false
+}
+
 // GetIDClosure implements the TypeDescriptor interface.
 func (desc *immutable) GetIDClosure() (map[descpb.ID]struct{}, error) {
 	ret := make(map[descpb.ID]struct{})
@@ -988,8 +1052,8 @@ func GetTypeDescriptorClosure(typ *types.T) (map[descpb.ID]struct{}, error) {
 	return ret, nil
 }
 
-// HasPostDeserializationChanges returns if the MutableDescriptor was changed after running
-// RunPostDeserializationChanges.
-func (desc *Mutable) HasPostDeserializationChanges() bool {
-	return desc.changed
+// SetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorState) {
+	desc.DeclarativeSchemaChangerState = state
 }

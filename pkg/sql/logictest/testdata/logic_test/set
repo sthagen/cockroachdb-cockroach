@@ -394,13 +394,23 @@ SHOW idle_in_session_timeout
 ----
 10000
 
+query T
+SHOW idle_session_timeout
+----
+10000
+
 statement ok
-SET idle_in_session_timeout = 10000
+SET idle_session_timeout = 100000
 
 query T
 SHOW idle_in_session_timeout
 ----
-10000
+100000
+
+query T
+SHOW idle_session_timeout
+----
+100000
 
 statement ok
 SET idle_in_session_timeout = 0;
@@ -743,6 +753,27 @@ SHOW tracing.custom
 ----
 ijk
 
+# Show a notice if a custom session variable has the same name as a cluster setting.
+query T noticetrace
+SET server.shutdown.drain_wait = '10s'
+----
+NOTICE: setting custom variable "server.shutdown.drain_wait"
+HINT: did you mean SET CLUSTER SETTING?
+
+# Test that RESET ALL changes custom options to empty strings.
+statement ok
+RESET ALL
+
+query T
+SHOW tracing.custom
+----
+·
+
+query T
+SHOW custom_option.set_sql
+----
+·
+
 statement error unrecognized configuration parameter "custom_option.does_not_yet_exist"
 SHOW custom_option.does_not_yet_exist
 
@@ -757,3 +788,30 @@ SET parallelize_multi_key_lookup_joins_enabled = true
 
 statement ok
 SET parallelize_multi_key_lookup_joins_enabled = false
+
+query T
+SHOW opt_split_scan_limit
+----
+2048
+
+statement error pq: cannot set opt_split_scan_limit to a negative value: -1
+SET opt_split_scan_limit = -1
+
+statement error pq: cannot set opt_split_scan_limit to a value greater than 2147483647
+SET opt_split_scan_limit = 2147483648
+
+statement ok
+SET opt_split_scan_limit = 100000
+
+query T
+SHOW opt_split_scan_limit
+----
+100000
+
+statement ok
+RESET opt_split_scan_limit
+
+query T
+SHOW opt_split_scan_limit
+----
+2048

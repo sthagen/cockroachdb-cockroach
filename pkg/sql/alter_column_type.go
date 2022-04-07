@@ -82,10 +82,6 @@ func AlterColumnType(
 		return err
 	}
 
-	if err := checkTypeIsSupported(ctx, params.ExecCfg().Settings, typ); err != nil {
-		return err
-	}
-
 	// Special handling for STRING COLLATE xy to verify that we recognize the language.
 	if t.Collation != "" {
 		if types.IsStringType(typ) {
@@ -263,8 +259,8 @@ func alterColumnTypeGeneral(
 		}
 	}
 
-	// Disallow ALTER COLUMN TYPE general inside an explicit transaction.
-	if !params.p.EvalContext().TxnImplicit {
+	// Disallow ALTER COLUMN TYPE general inside a multi-statement transaction.
+	if !params.extendedEvalCtx.TxnIsSingleStmt {
 		return AlterColTypeInTxnNotSupportedErr
 	}
 
@@ -415,7 +411,8 @@ func alterColumnTypeGeneral(
 		tableDesc.SetPrimaryIndex(primaryIndex)
 	}
 
-	if err := tableDesc.AllocateIDs(ctx); err != nil {
+	version := params.ExecCfg().Settings.Version.ActiveVersion(ctx)
+	if err := tableDesc.AllocateIDs(ctx, version); err != nil {
 		return err
 	}
 

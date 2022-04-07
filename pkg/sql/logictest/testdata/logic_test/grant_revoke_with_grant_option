@@ -1,3 +1,4 @@
+
 # TODO(jack.wu): Replace these tests once the GRANT privilege is removed in 22.2
 # (look in the file history to the version before this for inspiration)
 # Currently, this file has been rewritten to accommodate giving grant options to
@@ -491,14 +492,14 @@ CREATE DATABASE d
 statement ok
 GRANT ALL PRIVILEGES ON DATABASE d TO testuser WITH GRANT OPTION
 
-query TTT colnames
+query TTTB colnames
 SHOW GRANTS ON DATABASE d
 ----
-database_name   grantee    privilege_type
-d               admin      ALL
-d               public     CONNECT
-d               root       ALL
-d               testuser   ALL
+database_name  grantee   privilege_type  is_grantable
+d              admin     ALL             true
+d              public    CONNECT         false
+d              root      ALL             true
+d              testuser  ALL             true
 
 #
 # Make testuser2 a member of testuser; it should inherit grant options
@@ -512,15 +513,15 @@ user testuser2
 statement ok
 GRANT CONNECT ON DATABASE d TO TARGET
 
-query TTT colnames
+query TTTB colnames
 SHOW GRANTS ON DATABASE d
 ----
-database_name  grantee   privilege_type
-d              admin     ALL
-d              public    CONNECT
-d              root      ALL
-d              target    CONNECT
-d              testuser  ALL
+database_name  grantee   privilege_type  is_grantable
+d              admin     ALL             true
+d              public    CONNECT         false
+d              root      ALL             true
+d              target    CONNECT         false
+d              testuser  ALL             true
 
 user root
 
@@ -546,30 +547,30 @@ GRANT CREATE ON DATABASE d TO target WITH GRANT OPTION
 
 user root
 
-query TTT colnames
+query TTTB colnames
 SHOW GRANTS ON DATABASE d
 ----
-database_name   grantee    privilege_type
-d               admin      ALL
-d               public     CONNECT
-d               root       ALL
-d               target     CONNECT
-d               testuser   ALL
-d               testuser2  CONNECT
-d               testuser2  CREATE
+database_name  grantee    privilege_type  is_grantable
+d              admin      ALL             true
+d              public     CONNECT         false
+d              root       ALL             true
+d              target     CONNECT         true
+d              testuser   ALL             true
+d              testuser2  CONNECT         true
+d              testuser2  CREATE          false
 
 statement ok
 REVOKE ALL PRIVILEGES ON DATABASE d FROM testuser2
 
-query TTT colnames
+query TTTB colnames
 SHOW GRANTS ON DATABASE d
 ----
-database_name   grantee    privilege_type
-d               admin      ALL
-d               public     CONNECT
-d               root       ALL
-d               target     CONNECT
-d               testuser   ALL
+database_name  grantee   privilege_type  is_grantable
+d              admin     ALL             true
+d              public    CONNECT         false
+d              root      ALL             true
+d              target    CONNECT         true
+d              testuser  ALL             true
 
 user testuser2
 
@@ -619,11 +620,10 @@ CREATE TABLE t1()
 query TTTTTB colnames
 SHOW GRANTS ON TABLE t1;
 ----
-database_name  schema_name  table_name  grantee    privilege_type  is_grantable
-test           public       t1          admin      ALL             true
-test           public       t1          root       ALL             true
-test           public       t1          testuser   ALL             false
-test           public       t1          testuser2  CREATE          false
+database_name  schema_name  table_name  grantee   privilege_type  is_grantable
+test           public       t1          admin     ALL             true
+test           public       t1          root      ALL             true
+test           public       t1          testuser  ALL             false
 
 statement ok
 GRANT SELECT ON TABLE t1 TO testuser2
@@ -637,7 +637,6 @@ SHOW GRANTS ON TABLE t1;
 database_name  schema_name  table_name  grantee    privilege_type  is_grantable
 test           public       t1          admin      ALL             true
 test           public       t1          root       ALL             true
-test           public       t1          testuser2  CREATE          false
 test           public       t1          testuser2  SELECT          false
 
 # even though testuser doesn't have privileges on table t1, it can still grant
@@ -676,3 +675,57 @@ test           public       t1          admin      ALL             true
 test           public       t1          root       ALL             true
 test           public       t1          testuser   ALL             true
 test           public       t1          testuser2  ALL             true
+
+# non-ALL privileges should appear if ALL does not have grant option, but another privilege does
+user root
+
+statement ok
+CREATE TABLE grant_ordering_table (id INT PRIMARY KEY);
+CREATE USER grant_ordering_user
+
+statement ok
+GRANT ALL ON TABLE grant_ordering_table TO grant_ordering_user
+
+query TTTTTB colnames
+SHOW GRANTS ON grant_ordering_table FOR grant_ordering_user
+----
+database_name  schema_name  table_name            grantee              privilege_type  is_grantable
+test           public       grant_ordering_table  grant_ordering_user  ALL             true
+
+statement ok
+REVOKE GRANT OPTION FOR ALL ON TABLE grant_ordering_table FROM grant_ordering_user
+
+query TTTTTB colnames
+SHOW GRANTS ON grant_ordering_table FOR grant_ordering_user
+----
+database_name  schema_name  table_name            grantee              privilege_type  is_grantable
+test           public       grant_ordering_table  grant_ordering_user  ALL             false
+
+statement ok
+GRANT SELECT ON TABLE grant_ordering_table TO grant_ordering_user WITH GRANT OPTION
+
+query TTTTTB colnames
+SHOW GRANTS ON grant_ordering_table FOR grant_ordering_user
+----
+database_name  schema_name  table_name            grantee              privilege_type  is_grantable
+test           public       grant_ordering_table  grant_ordering_user  ALL             false
+test           public       grant_ordering_table  grant_ordering_user  SELECT          true
+
+statement ok
+REVOKE GRANT OPTION FOR ALL ON TABLE grant_ordering_table FROM grant_ordering_user
+
+query TTTTTB colnames
+SHOW GRANTS ON grant_ordering_table FOR grant_ordering_user
+----
+database_name  schema_name  table_name            grantee              privilege_type  is_grantable
+test           public       grant_ordering_table  grant_ordering_user  ALL             false
+
+# has the effect of granting WITH GRANT OPTION to ALL because of GRANT privilege via ALL
+statement ok
+GRANT UPDATE ON TABLE grant_ordering_table TO grant_ordering_user
+
+query TTTTTB colnames
+SHOW GRANTS ON grant_ordering_table FOR grant_ordering_user
+----
+database_name  schema_name  table_name            grantee              privilege_type  is_grantable
+test           public       grant_ordering_table  grant_ordering_user  ALL             true

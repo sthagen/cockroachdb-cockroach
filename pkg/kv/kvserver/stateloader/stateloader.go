@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -78,6 +79,7 @@ func (rsl StateLoader) Load(
 		return kvserverpb.ReplicaState{}, err
 	}
 	s.RaftAppliedIndex = as.RaftAppliedIndex
+	s.RaftAppliedIndexTerm = as.RaftAppliedIndexTerm
 	s.LeaseAppliedIndex = as.LeaseAppliedIndex
 	ms := as.RangeStats.ToStats()
 	s.Stats = &ms
@@ -133,8 +135,9 @@ func (rsl StateLoader) Save(
 			return enginepb.MVCCStats{}, err
 		}
 	}
-	rai, lai, ct := state.RaftAppliedIndex, state.LeaseAppliedIndex, &state.RaftClosedTimestamp
-	if err := rsl.SetRangeAppliedState(ctx, readWriter, rai, lai, ms, ct); err != nil {
+	rai, lai, rait, ct := state.RaftAppliedIndex, state.LeaseAppliedIndex, state.RaftAppliedIndexTerm,
+		&state.RaftClosedTimestamp
+	if err := rsl.SetRangeAppliedState(ctx, readWriter, rai, lai, rait, ms, ct); err != nil {
 		return enginepb.MVCCStats{}, err
 	}
 	return *ms, nil
@@ -194,14 +197,15 @@ func (rsl StateLoader) LoadMVCCStats(
 func (rsl StateLoader) SetRangeAppliedState(
 	ctx context.Context,
 	readWriter storage.ReadWriter,
-	appliedIndex, leaseAppliedIndex uint64,
+	appliedIndex, leaseAppliedIndex, appliedIndexTerm uint64,
 	newMS *enginepb.MVCCStats,
 	raftClosedTimestamp *hlc.Timestamp,
 ) error {
 	as := enginepb.RangeAppliedState{
-		RaftAppliedIndex:  appliedIndex,
-		LeaseAppliedIndex: leaseAppliedIndex,
-		RangeStats:        newMS.ToPersistentStats(),
+		RaftAppliedIndex:     appliedIndex,
+		LeaseAppliedIndex:    leaseAppliedIndex,
+		RangeStats:           newMS.ToPersistentStats(),
+		RaftAppliedIndexTerm: appliedIndexTerm,
 	}
 	if raftClosedTimestamp != nil && !raftClosedTimestamp.IsEmpty() {
 		as.RaftClosedTimestamp = raftClosedTimestamp
@@ -223,7 +227,8 @@ func (rsl StateLoader) SetMVCCStats(
 		return err
 	}
 	return rsl.SetRangeAppliedState(
-		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, newMS, as.RaftClosedTimestamp)
+		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, as.RaftAppliedIndexTerm, newMS,
+		as.RaftClosedTimestamp)
 }
 
 // SetClosedTimestamp overwrites the closed timestamp.
@@ -235,7 +240,7 @@ func (rsl StateLoader) SetClosedTimestamp(
 		return err
 	}
 	return rsl.SetRangeAppliedState(
-		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex,
+		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, as.RaftAppliedIndexTerm,
 		as.RangeStats.ToStatsPtr(), closedTS)
 }
 
@@ -418,7 +423,7 @@ func (rsl StateLoader) SynthesizeHardState(
 
 	if oldHS.Commit > newHS.Commit {
 		return errors.Newf("can't decrease HardState.Commit from %d to %d",
-			log.Safe(oldHS.Commit), log.Safe(newHS.Commit))
+			redact.Safe(oldHS.Commit), redact.Safe(newHS.Commit))
 	}
 	if oldHS.Term > newHS.Term {
 		// The existing HardState is allowed to be ahead of us, which is
@@ -433,4 +438,30 @@ func (rsl StateLoader) SynthesizeHardState(
 	}
 	err := rsl.SetHardState(ctx, readWriter, newHS)
 	return errors.Wrapf(err, "writing HardState %+v", &newHS)
+}
+
+// SetRaftReplicaID overwrites the RaftReplicaID.
+func (rsl StateLoader) SetRaftReplicaID(
+	ctx context.Context, writer storage.Writer, replicaID roachpb.ReplicaID,
+) error {
+	rid := roachpb.RaftReplicaID{ReplicaID: replicaID}
+	// "Blind" because ms == nil and timestamp.IsEmpty().
+	return storage.MVCCBlindPutProto(
+		ctx,
+		writer,
+		nil, /* ms */
+		rsl.RaftReplicaIDKey(),
+		hlc.Timestamp{}, /* timestamp */
+		&rid,
+		nil, /* txn */
+	)
+}
+
+// LoadRaftReplicaID loads the RaftReplicaID.
+func (rsl StateLoader) LoadRaftReplicaID(
+	ctx context.Context, reader storage.Reader,
+) (replicaID roachpb.RaftReplicaID, found bool, err error) {
+	found, err = storage.MVCCGetProto(ctx, reader, rsl.RaftReplicaIDKey(),
+		hlc.Timestamp{}, &replicaID, storage.MVCCGetOptions{})
+	return
 }

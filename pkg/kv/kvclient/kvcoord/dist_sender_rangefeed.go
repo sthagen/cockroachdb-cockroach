@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 	"unsafe"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -50,6 +52,22 @@ var useDedicatedRangefeedConnectionClass = settings.RegisterBoolSetting(
 	util.ConstantWithMetamorphicTestBool(
 		"kv.rangefeed.use_dedicated_connection_class.enabled", false),
 )
+
+var catchupScanConcurrency = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"kv.rangefeed.catchup_scan_concurrency",
+	"number of catchup scans that a single rangefeed can execute concurrently; 0 implies unlimited",
+	8,
+	settings.NonNegativeInt,
+)
+
+func maxConcurrentCatchupScans(sv *settings.Values) int {
+	l := catchupScanConcurrency.Get(sv)
+	if l == 0 {
+		return math.MaxInt
+	}
+	return int(l)
+}
 
 // RangeFeed divides a RangeFeed request on range boundaries and establishes a
 // RangeFeed to each of the individual ranges. It streams back results on the
@@ -76,6 +94,9 @@ func (ds *DistSender) RangeFeed(
 	ds.activeRangeFeeds.Store(rr, nil)
 	defer ds.activeRangeFeeds.Delete(rr)
 
+	catchupSem := limit.MakeConcurrentRequestLimiter(
+		"distSenderCatchupLimit", maxConcurrentCatchupScans(&ds.st.SV))
+
 	g := ctxgroup.WithContext(ctx)
 	// Goroutine that processes subdivided ranges and creates a rangefeed for
 	// each.
@@ -86,7 +107,7 @@ func (ds *DistSender) RangeFeed(
 			case sri := <-rangeCh:
 				// Spawn a child goroutine to process this feed.
 				g.GoCtx(func(ctx context.Context) error {
-					return ds.partialRangeFeed(ctx, rr, sri.rs, sri.startFrom, sri.token, withDiff, rangeCh, eventCh)
+					return ds.partialRangeFeed(ctx, rr, sri.rs, sri.startFrom, sri.token, withDiff, &catchupSem, rangeCh, eventCh)
 				})
 			case <-ctx.Done():
 				return ctx.Err()
@@ -124,6 +145,7 @@ type PartialRangeFeed struct {
 	StartTS           hlc.Timestamp
 	NodeID            roachpb.NodeID
 	RangeID           roachpb.RangeID
+	CreatedTime       time.Time
 	LastValueReceived time.Time
 	Resolved          hlc.Timestamp
 }
@@ -253,6 +275,7 @@ func (ds *DistSender) partialRangeFeed(
 	startFrom hlc.Timestamp,
 	token rangecache.EvictionToken,
 	withDiff bool,
+	catchupSem *limit.ConcurrentRequestLimiter,
 	rangeCh chan<- singleRangeInfo,
 	eventCh chan<- *roachpb.RangeFeedEvent,
 ) error {
@@ -262,12 +285,15 @@ func (ds *DistSender) partialRangeFeed(
 	// Register partial range feed with registry.
 	active := &activeRangeFeed{
 		PartialRangeFeed: PartialRangeFeed{
-			Span:    span,
-			StartTS: startFrom,
+			Span:        span,
+			StartTS:     startFrom,
+			CreatedTime: timeutil.Now(),
 		},
 	}
 	rr.ranges.Store(active, nil)
+	ds.metrics.RangefeedRanges.Inc(1)
 	defer rr.ranges.Delete(active)
+	defer ds.metrics.RangefeedRanges.Dec(1)
 
 	// Start a retry loop for sending the batch to the range.
 	for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
@@ -286,7 +312,8 @@ func (ds *DistSender) partialRangeFeed(
 		}
 
 		// Establish a RangeFeed for a single Range.
-		maxTS, err := ds.singleRangeFeed(ctx, span, startFrom, withDiff, token.Desc(), eventCh, active.onRangeEvent)
+		maxTS, err := ds.singleRangeFeed(ctx, span, startFrom, withDiff, token.Desc(),
+			catchupSem, eventCh, active.onRangeEvent)
 
 		// Forward the timestamp in case we end up sending it again.
 		startFrom.Forward(maxTS)
@@ -357,6 +384,7 @@ func (ds *DistSender) singleRangeFeed(
 	startFrom hlc.Timestamp,
 	withDiff bool,
 	desc *roachpb.RangeDescriptor,
+	catchupSem *limit.ConcurrentRequestLimiter,
 	eventCh chan<- *roachpb.RangeFeedEvent,
 	onRangeEvent onRangeEventCb,
 ) (hlc.Timestamp, error) {
@@ -387,6 +415,24 @@ func (ds *DistSender) singleRangeFeed(
 	}
 	defer transport.Release()
 
+	// Indicate catchup scan is starting;  Before potentially blocking on a semaphore, take
+	// opportunity to update semaphore limit.
+	catchupSem.SetLimit(maxConcurrentCatchupScans(&ds.st.SV))
+	catchupRes, err := catchupSem.Begin(ctx)
+	if err != nil {
+		return hlc.Timestamp{}, err
+	}
+	ds.metrics.RangefeedCatchupRanges.Inc(1)
+	finishCatchupScan := func() {
+		if catchupRes != nil {
+			catchupRes.Release()
+			ds.metrics.RangefeedCatchupRanges.Dec(1)
+			catchupRes = nil
+		}
+	}
+	// cleanup catchup reservation in case of early termination.
+	defer finishCatchupScan()
+
 	for {
 		if transport.IsExhausted() {
 			return args.Timestamp, newSendError(
@@ -399,6 +445,7 @@ func (ds *DistSender) singleRangeFeed(
 			log.VErrEventf(ctx, 2, "RPC error: %s", err)
 			continue
 		}
+
 		log.VEventf(ctx, 3, "attempting to create a RangeFeed over replica %s", args.Replica)
 		stream, err := client.RangeFeed(clientCtx, &args)
 		if err != nil {
@@ -409,6 +456,7 @@ func (ds *DistSender) singleRangeFeed(
 			}
 			continue
 		}
+
 		for {
 			event, err := stream.Recv()
 			if err == io.EOF {
@@ -420,10 +468,17 @@ func (ds *DistSender) singleRangeFeed(
 			switch t := event.GetValue().(type) {
 			case *roachpb.RangeFeedCheckpoint:
 				if t.Span.Contains(args.Span) {
+					// If we see the first non-empty checkpoint, we know we're done with the catchup scan.
+					if !t.ResolvedTS.IsEmpty() && catchupRes != nil {
+						finishCatchupScan()
+					}
 					args.Timestamp.Forward(t.ResolvedTS)
 				}
 			case *roachpb.RangeFeedError:
 				log.VErrEventf(ctx, 2, "RangeFeedError: %s", t.Error.GoError())
+				if catchupRes != nil {
+					ds.metrics.RangefeedErrorCatchup.Inc(1)
+				}
 				return args.Timestamp, t.Error.GoError()
 			}
 			onRangeEvent(args.Replica.NodeID, desc.RangeID, event)

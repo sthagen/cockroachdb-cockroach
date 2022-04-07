@@ -46,7 +46,7 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	raft "go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
@@ -391,15 +391,14 @@ func createTestAllocatorWithKnobs(
 	a := MakeAllocator(
 		storePool, func(string) (time.Duration, bool) {
 			return 0, true
-		},
-		knobs,
+		}, knobs, nil, /* storeMetrics */
 	)
 	return stopper, g, storePool, a, manual
 }
 
 // checkReplExists checks whether the given `repl` exists on any of the
 // `stores`.
-func checkReplExists(repl roachpb.ReplicaDescriptor, stores []roachpb.StoreID) (found bool) {
+func checkReplExists(repl roachpb.ReplicationTarget, stores []roachpb.StoreID) (found bool) {
 	for _, storeID := range stores {
 		if repl.StoreID == storeID {
 			found = true
@@ -503,7 +502,7 @@ func TestAllocatorSimpleRetrieval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %+v", err)
 	}
-	if result.Node.NodeID != 1 || result.StoreID != 1 {
+	if result.NodeID != 1 || result.StoreID != 1 {
 		t.Errorf("expected NodeID 1 and StoreID 1: %+v", result)
 	}
 }
@@ -520,7 +519,7 @@ func TestAllocatorNoAvailableDisks(t *testing.T) {
 		simpleSpanConfig,
 		nil /* existingVoters */, nil, /* existingNonVoters */
 	)
-	if result != nil {
+	if !roachpb.Empty(result) {
 		t.Errorf("expected nil result: %+v", result)
 	}
 	if err == nil {
@@ -548,17 +547,17 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 		ctx,
 		multiDCConfigSSD,
 		[]roachpb.ReplicaDescriptor{{
-			NodeID:  result1.Node.NodeID,
+			NodeID:  result1.NodeID,
 			StoreID: result1.StoreID,
 		}}, nil, /* existingNonVoters */
 	)
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %+v", err)
 	}
-	ids := []int{int(result1.Node.NodeID), int(result2.Node.NodeID)}
+	ids := []int{int(result1.NodeID), int(result2.NodeID)}
 	sort.Ints(ids)
 	if expected := []int{1, 2}; !reflect.DeepEqual(ids, expected) {
-		t.Errorf("Expected nodes %+v: %+v vs %+v", expected, result1.Node, result2.Node)
+		t.Errorf("Expected nodes %+v: %+v vs %+v", expected, result1.NodeID, result2.NodeID)
 	}
 	// Verify that no result is forthcoming if we already have a replica.
 	result3, _, err := a.AllocateVoter(
@@ -566,11 +565,11 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 		multiDCConfigSSD,
 		[]roachpb.ReplicaDescriptor{
 			{
-				NodeID:  result1.Node.NodeID,
+				NodeID:  result1.NodeID,
 				StoreID: result1.StoreID,
 			},
 			{
-				NodeID:  result2.Node.NodeID,
+				NodeID:  result2.NodeID,
 				StoreID: result2.StoreID,
 			},
 		}, nil, /* existingNonVoters */
@@ -711,7 +710,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 			result, _, err := a.AllocateVoter(
 				ctx, emptySpanConfig(), tc.existing, nil,
 			)
-			if e, a := tc.expectTargetAllocate, result != nil; e != a {
+			if e, a := tc.expectTargetAllocate, !roachpb.Empty(result); e != a {
 				t.Errorf(
 					"AllocateVoter(%v) got target %v, err %v; expectTarget=%v",
 					tc.existing, result, err, tc.expectTargetAllocate,
@@ -940,7 +939,11 @@ func TestAllocatorRebalanceBasedOnRangeCount(t *testing.T) {
 			t.Fatalf("%d: unable to get store %d descriptor", i, store.StoreID)
 		}
 		eqClass.existing = desc
-		result := a.scorerOptions().shouldRebalanceBasedOnThresholds(ctx, eqClass)
+		result := a.scorerOptions().shouldRebalanceBasedOnThresholds(
+			ctx,
+			eqClass,
+			a.metrics,
+		)
 		if expResult := (i >= 2); expResult != result {
 			t.Errorf("%d: expected rebalance %t; got %t; desc %+v; sl: %+v", i, expResult, result, desc, sl)
 		}
@@ -1345,7 +1348,9 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 				}
 				eqClass.existing = desc
 				if a, e := a.scorerOptions().shouldRebalanceBasedOnThresholds(
-					context.Background(), eqClass,
+					context.Background(),
+					eqClass,
+					a.metrics,
 				), cluster[j].shouldRebalanceFrom; a != e {
 					t.Errorf(
 						"[store %d]: shouldRebalanceBasedOnThresholds %t != expected %t", store.StoreID, a, e,
@@ -1465,7 +1470,7 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 		defer stopper.Stop(ctx)
 		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
 		var rangeUsageInfo RangeUsageInfo
-		options := qpsScorerOptions{
+		options := &qpsScorerOptions{
 			qpsPerReplica:         100,
 			qpsRebalanceThreshold: 0.2,
 		}
@@ -1490,7 +1495,11 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 					existing:    desc,
 					candidateSL: sl,
 				}
-				result := options.shouldRebalanceBasedOnThresholds(ctx, eqClass)
+				result := options.shouldRebalanceBasedOnThresholds(
+					ctx,
+					eqClass,
+					a.metrics,
+				)
 				require.True(t, result)
 			} else {
 				t.Fatalf("unable to get store %d descriptor", remove.StoreID)
@@ -1574,7 +1583,7 @@ func TestAllocatorRemoveBasedOnQPS(t *testing.T) {
 		stopper, g, _, a, _ := createTestAllocator(ctx, 10, false /* deterministic */)
 		defer stopper.Stop(ctx)
 		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
-		options := qpsScorerOptions{
+		options := &qpsScorerOptions{
 			qpsRebalanceThreshold: 0.1,
 		}
 		remove, _, err := a.RemoveVoter(
@@ -1656,7 +1665,11 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 			existing:    desc,
 			candidateSL: sl,
 		}
-		result := a.scorerOptions().shouldRebalanceBasedOnThresholds(ctx, eqClass)
+		result := a.scorerOptions().shouldRebalanceBasedOnThresholds(
+			ctx,
+			eqClass,
+			a.metrics,
+		)
 		if expResult := (i < 3); expResult != result {
 			t.Errorf("%d: expected rebalance %t; got %t", i, expResult, result)
 		}
@@ -1728,22 +1741,22 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 
 	// TODO(peter): Add test cases for non-empty constraints.
 	testCases := []struct {
-		existing    []roachpb.ReplicaDescriptor
-		leaseholder roachpb.StoreID
-		check       bool
-		expected    roachpb.StoreID
+		existing       []roachpb.ReplicaDescriptor
+		leaseholder    roachpb.StoreID
+		allowLeaseRepl bool
+		expected       roachpb.StoreID
 	}{
 		// No existing lease holder, nothing to do.
-		{existing: existing, leaseholder: 0, check: true, expected: 0},
+		{existing: existing, leaseholder: 0, allowLeaseRepl: true, expected: 0},
 		// Store 1 is not a lease transfer source.
-		{existing: existing, leaseholder: 1, check: true, expected: 0},
-		{existing: existing, leaseholder: 1, check: false, expected: 2},
+		{existing: existing, leaseholder: 1, allowLeaseRepl: true, expected: 0},
+		{existing: existing, leaseholder: 1, allowLeaseRepl: false, expected: 2},
 		// Store 2 is not a lease transfer source.
-		{existing: existing, leaseholder: 2, check: true, expected: 0},
-		{existing: existing, leaseholder: 2, check: false, expected: 1},
+		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 0},
+		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 1},
 		// Store 3 is a lease transfer source.
-		{existing: existing, leaseholder: 3, check: true, expected: 1},
-		{existing: existing, leaseholder: 3, check: false, expected: 1},
+		{existing: existing, leaseholder: 3, allowLeaseRepl: true, expected: 1},
+		{existing: existing, leaseholder: 3, allowLeaseRepl: false, expected: 1},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -1758,8 +1771,8 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: c.check,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       !c.allowLeaseRepl,
+					checkCandidateFullness: true,
 				},
 			)
 			if c.expected != target.StoreID {
@@ -1800,56 +1813,56 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 		existing          []roachpb.ReplicaDescriptor
 		replsNeedingSnaps []roachpb.ReplicaID
 		leaseholder       roachpb.StoreID
-		checkSource       bool
+		allowLeaseRepl    bool
 		transferTarget    roachpb.StoreID
 	}{
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       3,
-			checkSource:       true,
+			allowLeaseRepl:    true,
 			transferTarget:    0,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       3,
-			checkSource:       false,
+			allowLeaseRepl:    false,
 			transferTarget:    2,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       4,
-			checkSource:       true,
+			allowLeaseRepl:    true,
 			transferTarget:    2,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       4,
-			checkSource:       false,
+			allowLeaseRepl:    false,
 			transferTarget:    2,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1, 2},
 			leaseholder:       4,
-			checkSource:       false,
+			allowLeaseRepl:    false,
 			transferTarget:    3,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1, 2},
 			leaseholder:       4,
-			checkSource:       true,
+			allowLeaseRepl:    true,
 			transferTarget:    0,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1, 2, 3},
 			leaseholder:       4,
-			checkSource:       true,
+			allowLeaseRepl:    true,
 			transferTarget:    0,
 		},
 	}
@@ -1871,8 +1884,8 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 				nil,
 				false, /* alwaysAllowDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: c.checkSource,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       !c.allowLeaseRepl,
+					checkCandidateFullness: true,
 				},
 			)
 			if c.transferTarget != target.StoreID {
@@ -1965,8 +1978,8 @@ func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: true,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       false,
+					checkCandidateFullness: true,
 				},
 			)
 			if c.expected != target.StoreID {
@@ -1989,7 +2002,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	a := MakeAllocator(
 		storePool, func(string) (time.Duration, bool) {
 			return 0, true
-		}, nil, /* knobs */
+		}, nil /* knobs */, nil, /* storeMetrics */
 	)
 	defer stopper.Stop(ctx)
 
@@ -2033,31 +2046,36 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	}
 
 	testCases := []struct {
-		existing    []roachpb.ReplicaDescriptor
-		leaseholder roachpb.StoreID
-		check       bool
-		expected    roachpb.StoreID
-		conf        roachpb.SpanConfig
+		existing       []roachpb.ReplicaDescriptor
+		leaseholder    roachpb.StoreID
+		allowLeaseRepl bool
+		expected       roachpb.StoreID
+		conf           roachpb.SpanConfig
 	}{
 		// No existing lease holder, nothing to do.
-		{existing: existing, leaseholder: 0, check: true, expected: 0, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 0, allowLeaseRepl: true, expected: 0, conf: emptySpanConfig()},
 		// Store 1 is draining, so it will try to transfer its lease if
-		// checkTransferLeaseSource is false. This behavior isn't relied upon,
+		// excludeLeaseRepl is false. This behavior isn't relied upon,
 		// though; leases are manually transferred when draining.
-		{existing: existing, leaseholder: 1, check: true, expected: 0, conf: emptySpanConfig()},
-		{existing: existing, leaseholder: 1, check: false, expected: 2, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 1, allowLeaseRepl: true, expected: 0, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 1, allowLeaseRepl: false, expected: 2, conf: emptySpanConfig()},
 		// Store 2 is not a lease transfer source.
-		{existing: existing, leaseholder: 2, check: true, expected: 0, conf: emptySpanConfig()},
-		{existing: existing, leaseholder: 2, check: false, expected: 3, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 0, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 3, conf: emptySpanConfig()},
 		// Store 3 is a lease transfer source, but won't transfer to
 		// node 1 because it's draining.
-		{existing: existing, leaseholder: 3, check: true, expected: 2, conf: emptySpanConfig()},
-		{existing: existing, leaseholder: 3, check: false, expected: 2, conf: emptySpanConfig()},
-		// Verify that lease preferences dont impact draining
-		{existing: existing, leaseholder: 2, check: true, expected: 0, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
-		{existing: existing, leaseholder: 2, check: false, expected: 0, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
-		{existing: existing, leaseholder: 2, check: true, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
-		{existing: existing, leaseholder: 2, check: false, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
+		{existing: existing, leaseholder: 3, allowLeaseRepl: true, expected: 2, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 3, allowLeaseRepl: false, expected: 2, conf: emptySpanConfig()},
+		// Verify that lease preferences dont impact draining.
+		// If the store that is within the lease preferences (store 1) is draining,
+		// we'd like the lease to stay on the next best store (which is store 2).
+		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 0, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
+		// If the current lease on store 2 needs to be shed (indicated by
+		// excludeLeaseRepl = false), and store 1 is draining, then store 3
+		// is the only reasonable lease transfer target.
+		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
+		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
+		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -2072,8 +2090,8 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: c.check,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       !c.allowLeaseRepl,
+					checkCandidateFullness: true,
 				},
 			)
 			if c.expected != target.StoreID {
@@ -2209,7 +2227,8 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 			nil,
 			rangeUsageInfo,
 			storeFilterThrottled,
-			a.scorerOptions())
+			a.scorerOptions(),
+		)
 		var resultID roachpb.StoreID
 		if ok {
 			resultID = result.StoreID
@@ -2345,7 +2364,10 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 				ctx,
 				emptySpanConfig(),
 				c.existing,
-				c.leaseholder,
+				&mockRepl{
+					storeID:           c.leaseholder,
+					replicationFactor: int32(len(c.existing)),
+				},
 				nil, /* replicaStats */
 			)
 			if c.expected != result {
@@ -2366,7 +2388,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	a := MakeAllocator(
 		storePool, func(string) (time.Duration, bool) {
 			return 0, true
-		}, nil, /* knobs */
+		}, nil /* knobs */, nil, /* storeMetrics */
 	)
 	defer stopper.Stop(context.Background())
 
@@ -2410,7 +2432,10 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 				ctx,
 				emptySpanConfig(),
 				c.existing,
-				c.leaseholder,
+				&mockRepl{
+					storeID:           c.leaseholder,
+					replicationFactor: int32(len(c.existing)),
+				},
 				nil, /* replicaStats */
 			)
 			if c.expected != result {
@@ -2431,7 +2456,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	a := MakeAllocator(
 		storePool, func(string) (time.Duration, bool) {
 			return 0, true
-		}, nil, /* knobs */
+		}, nil /* knobs */, nil, /* storeMetrics */
 	)
 	defer stopper.Stop(context.Background())
 
@@ -2454,7 +2479,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 			ctx,
 			emptySpanConfig(),
 			replicas(1, 2, 3),
-			2,
+			&mockRepl{storeID: 2, replicationFactor: 3},
 			nil, /* replicaStats */
 		)
 		require.Equal(t, expected, result)
@@ -2532,11 +2557,11 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 	}
 
 	testCases := []struct {
-		leaseholder        roachpb.StoreID
-		existing           []roachpb.ReplicaDescriptor
-		preferences        []roachpb.LeasePreference
-		expectedCheckTrue  roachpb.StoreID /* checkTransferLeaseSource = true */
-		expectedCheckFalse roachpb.StoreID /* checkTransferLeaseSource = false */
+		leaseholder            roachpb.StoreID
+		existing               []roachpb.ReplicaDescriptor
+		preferences            []roachpb.LeasePreference
+		expectAllowLeaseRepl   roachpb.StoreID /* excludeLeaseRepl = false */
+		expectExcludeLeaseRepl roachpb.StoreID /* excludeLeaseRepl = true */
 	}{
 		{1, nil, preferDC1, 0, 0},
 		{1, replicas(1, 2, 3, 4), preferDC1, 0, 2},
@@ -2594,10 +2619,13 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 				ctx,
 				conf,
 				c.existing,
-				c.leaseholder,
+				&mockRepl{
+					storeID:           c.leaseholder,
+					replicationFactor: int32(len(c.existing)),
+				},
 				nil, /* replicaStats */
 			)
-			expectTransfer := c.expectedCheckTrue != 0
+			expectTransfer := c.expectAllowLeaseRepl != 0
 			if expectTransfer != result {
 				t.Errorf("expected %v, but found %v", expectTransfer, result)
 			}
@@ -2612,12 +2640,12 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: true,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       false,
+					checkCandidateFullness: true,
 				},
 			)
-			if c.expectedCheckTrue != target.StoreID {
-				t.Errorf("expected s%d for check=true, but found %v", c.expectedCheckTrue, target)
+			if c.expectAllowLeaseRepl != target.StoreID {
+				t.Errorf("expected s%d for excludeLeaseRepl=false, but found %v", c.expectAllowLeaseRepl, target)
 			}
 			target = a.TransferLeaseTarget(
 				ctx,
@@ -2630,12 +2658,12 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: false,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       true,
+					checkCandidateFullness: true,
 				},
 			)
-			if c.expectedCheckFalse != target.StoreID {
-				t.Errorf("expected s%d for check=false, but found %v", c.expectedCheckFalse, target)
+			if c.expectExcludeLeaseRepl != target.StoreID {
+				t.Errorf("expected s%d for excludeLeaseRepl=true, but found %v", c.expectExcludeLeaseRepl, target)
 			}
 		})
 	}
@@ -2687,14 +2715,17 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 	}
 
 	testCases := []struct {
-		leaseholder        roachpb.StoreID
-		existing           []roachpb.ReplicaDescriptor
-		preferences        []roachpb.LeasePreference
-		expectedCheckTrue  roachpb.StoreID /* checkTransferLeaseSource = true */
-		expectedCheckFalse roachpb.StoreID /* checkTransferLeaseSource = false */
+		leaseholder              roachpb.StoreID
+		existing                 []roachpb.ReplicaDescriptor
+		preferences              []roachpb.LeasePreference
+		expectedAllowLeaseRepl   roachpb.StoreID /* excludeLeaseRepl = false */
+		expectedExcludeLeaseRepl roachpb.StoreID /* excludeLeaseRepl = true */
 	}{
 		{1, replicas(1, 3, 5), preferEast, 0, 3},
-		{1, replicas(1, 2, 3), preferEast, 0, 2},
+		// When `excludeLeaseRepl` = false, we'd expect either store 2 or 3
+		// to be produced by `TransferLeaseTarget` (since both of them have
+		// less-than-mean leases). In this case, the rng should produce 3.
+		{1, replicas(1, 2, 3), preferEast, 0, 3},
 		{3, replicas(1, 3, 5), preferEast, 0, 1},
 		{5, replicas(1, 4, 5), preferEast, 1, 1},
 		{5, replicas(3, 4, 5), preferEast, 3, 3},
@@ -2719,13 +2750,14 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: true,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       false,
+					checkCandidateFullness: true,
 				},
 			)
-			if c.expectedCheckTrue != target.StoreID {
-				t.Errorf("expected s%d for check=true, but found %v", c.expectedCheckTrue, target)
+			if c.expectedAllowLeaseRepl != target.StoreID {
+				t.Errorf("expected s%d for excludeLeaseRepl=false, but found %v", c.expectedAllowLeaseRepl, target)
 			}
+
 			target = a.TransferLeaseTarget(
 				ctx,
 				conf,
@@ -2737,12 +2769,12 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 				nil,   /* stats */
 				false, /* forceDecisionWithoutStats */
 				transferLeaseOptions{
-					checkTransferLeaseSource: false,
-					checkCandidateFullness:   true,
+					excludeLeaseRepl:       true,
+					checkCandidateFullness: true,
 				},
 			)
-			if c.expectedCheckFalse != target.StoreID {
-				t.Errorf("expected s%d for check=false, but found %v", c.expectedCheckFalse, target)
+			if c.expectedExcludeLeaseRepl != target.StoreID {
+				t.Errorf("expected s%d for excludeLeaseRepl=true, but found %v", c.expectedExcludeLeaseRepl, target)
 			}
 		})
 	}
@@ -3372,6 +3404,7 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 				a.storePool.getLocalitiesByStore(existingRepls),
 				a.storePool.isStoreReadyForRoutineReplicaTransfer,
 				a.scorerOptions(),
+				a.metrics,
 			)
 			if len(tc.expected) > 0 {
 				require.Len(t, rebalanceOpts, 1)
@@ -4075,7 +4108,8 @@ func TestAllocatorRebalanceNonVoters(t *testing.T) {
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
-			add, remove, _, ok := a.RebalanceNonVoter(ctx,
+			add, remove, _, ok := a.RebalanceNonVoter(
+				ctx,
 				test.conf,
 				nil,
 				test.existingVoters,
@@ -5002,6 +5036,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			a.storePool.getLocalitiesByStore(existingRepls),
 			func(context.Context, roachpb.StoreID) bool { return true },
 			a.scorerOptions(),
+			a.metrics,
 		)
 		match := true
 		if len(tc.expected) != len(results) {
@@ -5108,17 +5143,17 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	// the unknown node 99 in evenlyBalanced to verify that requests from
 	// unknown localities don't affect the algorithm.
 	evenlyBalanced := newReplicaStats(clock, localityFn)
-	evenlyBalanced.record(1)
-	evenlyBalanced.record(2)
-	evenlyBalanced.record(3)
+	evenlyBalanced.recordCount(1, 1)
+	evenlyBalanced.recordCount(1, 2)
+	evenlyBalanced.recordCount(1, 3)
 	imbalanced1 := newReplicaStats(clock, localityFn)
 	imbalanced2 := newReplicaStats(clock, localityFn)
 	imbalanced3 := newReplicaStats(clock, localityFn)
 	for i := 0; i < 100*int(MinLeaseTransferStatsDuration.Seconds()); i++ {
-		evenlyBalanced.record(99)
-		imbalanced1.record(1)
-		imbalanced2.record(2)
-		imbalanced3.record(3)
+		evenlyBalanced.recordCount(1, 99)
+		imbalanced1.recordCount(1, 1)
+		imbalanced2.recordCount(1, 2)
+		imbalanced3.recordCount(1, 3)
 	}
 
 	manual.Increment(int64(MinLeaseTransferStatsDuration))
@@ -5137,69 +5172,69 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	}
 
 	testCases := []struct {
-		leaseholder roachpb.StoreID
-		latency     map[string]time.Duration
-		stats       *replicaStats
-		check       bool
-		expected    roachpb.StoreID
+		leaseholder    roachpb.StoreID
+		latency        map[string]time.Duration
+		stats          *replicaStats
+		allowLeaseRepl bool
+		expected       roachpb.StoreID
 	}{
 		// No existing lease holder, nothing to do.
-		{leaseholder: 0, latency: noLatency, stats: evenlyBalanced, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, check: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, check: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, check: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, check: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, check: false, expected: 1},
-		{leaseholder: 0, latency: noLatency, stats: imbalanced1, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced1, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced1, check: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced1, check: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced1, check: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced1, check: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced1, check: false, expected: 1},
-		{leaseholder: 0, latency: noLatency, stats: imbalanced2, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced2, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced2, check: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced2, check: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced2, check: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced2, check: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced2, check: false, expected: 1},
-		{leaseholder: 0, latency: noLatency, stats: imbalanced3, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced3, check: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced3, check: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced3, check: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced3, check: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced3, check: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced3, check: false, expected: 1},
-		{leaseholder: 0, latency: highLatency, stats: evenlyBalanced, check: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, check: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, check: false, expected: 2},
-		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, check: true, expected: 1},
-		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, check: false, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, check: true, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, check: false, expected: 1},
-		{leaseholder: 0, latency: highLatency, stats: imbalanced1, check: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced1, check: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced1, check: false, expected: 2},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced1, check: true, expected: 1},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced1, check: false, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced1, check: true, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced1, check: false, expected: 1},
-		{leaseholder: 0, latency: highLatency, stats: imbalanced2, check: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced2, check: true, expected: 2},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced2, check: false, expected: 2},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced2, check: true, expected: 0},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced2, check: false, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced2, check: true, expected: 2},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced2, check: false, expected: 2},
-		{leaseholder: 0, latency: highLatency, stats: imbalanced3, check: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced3, check: true, expected: 3},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced3, check: false, expected: 3},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced3, check: true, expected: 3},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced3, check: false, expected: 3},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced3, check: true, expected: 0},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced3, check: false, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 2},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 2},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 2},
+		{leaseholder: 0, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 3},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 3},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 3},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 3},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 1},
 	}
 
 	for _, c := range testCases {
@@ -5207,7 +5242,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 			a := MakeAllocator(
 				storePool, func(addr string) (time.Duration, bool) {
 					return c.latency[addr], true
-				}, nil, /* knobs */
+				}, nil /* knobs */, nil, /* storeMetrics */
 			)
 			target := a.TransferLeaseTarget(
 				ctx,
@@ -5220,9 +5255,9 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 				c.stats,
 				false,
 				transferLeaseOptions{
-					checkTransferLeaseSource: c.check,
-					checkCandidateFullness:   true,
-					dryRun:                   false,
+					excludeLeaseRepl:       !c.allowLeaseRepl,
+					checkCandidateFullness: true,
+					dryRun:                 false,
 				},
 			)
 			if c.expected != target.StoreID {
@@ -5426,7 +5461,7 @@ func TestAllocatorRemoveTargetBasedOnCapacity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if a, e1, e2 := targetRepl, replicas[1], replicas[2]; a != e1 && a != e2 {
+		if a, e1, e2 := targetRepl, replicas[1], replicas[2]; a.StoreID != e1.StoreID && a.StoreID != e2.StoreID {
 			t.Fatalf("%d: RemoveVoter did not select either expected replica; expected %v or %v, got %v",
 				i, e1, e2, a)
 		}
@@ -6787,7 +6822,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 	a := MakeAllocator(
 		sp, func(string) (time.Duration, bool) {
 			return 0, true
-		}, nil, /* knobs */
+		}, nil /* knobs */, nil, /* storeMetrics */
 	)
 
 	defer stopper.Stop(ctx)
@@ -6892,7 +6927,7 @@ func TestAllocatorComputeActionNoStorePool(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	a := MakeAllocator(nil /* storePool */, nil /* nodeLatencyFn */, nil /* knobs */)
+	a := MakeAllocator(nil, nil, nil /* knobs */, nil /* storeMetrics */)
 	action, priority := a.ComputeAction(context.Background(), roachpb.SpanConfig{}, nil)
 	if action != AllocatorNoop {
 		t.Errorf("expected AllocatorNoop, but got %v", action)
@@ -6987,7 +7022,7 @@ func TestAllocatorThrottled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to perform allocation: %+v", err)
 	}
-	if result.Node.NodeID != 1 || result.StoreID != 1 {
+	if result.NodeID != 1 || result.StoreID != 1 {
 		t.Errorf("expected NodeID 1 and StoreID 1: %+v", result)
 	}
 
@@ -7206,6 +7241,79 @@ func TestSimulateFilterUnremovableReplicas(t *testing.T) {
 	}
 }
 
+// TestAllocatorRebalanceWithScatter tests that when `scatter` is set to true,
+// the allocator will produce rebalance opportunities even when it normally
+// wouldn't.
+func TestAllocatorRebalanceWithScatter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper, g, _, a, _ := createTestAllocator(ctx, 10 /* numNodes */, true /* deterministic */)
+	defer stopper.Stop(ctx)
+
+	stores := []*roachpb.StoreDescriptor{
+		{
+			StoreID: 1,
+			Node: roachpb.NodeDescriptor{
+				NodeID: 1,
+			},
+			Capacity: roachpb.StoreCapacity{
+				RangeCount: 1000,
+			},
+		},
+		{
+			StoreID: 2,
+			Node: roachpb.NodeDescriptor{
+				NodeID: 2,
+			},
+			Capacity: roachpb.StoreCapacity{
+				RangeCount: 1000,
+			},
+		},
+		{
+			StoreID: 3,
+			Node: roachpb.NodeDescriptor{
+				NodeID: 3,
+			},
+			Capacity: roachpb.StoreCapacity{
+				RangeCount: 1000,
+			},
+		},
+	}
+
+	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
+
+	var rangeUsageInfo RangeUsageInfo
+
+	// Ensure that we wouldn't normally rebalance when all stores have the same
+	// replica count.
+	_, _, _, ok := a.RebalanceVoter(
+		ctx,
+		emptySpanConfig(),
+		nil,
+		replicas(1),
+		nil,
+		rangeUsageInfo,
+		storeFilterThrottled,
+		a.scorerOptions(),
+	)
+	require.False(t, ok)
+
+	// Ensure that we would produce a rebalance target when running with scatter.
+	_, _, _, ok = a.RebalanceVoter(
+		ctx,
+		emptySpanConfig(),
+		nil,
+		replicas(1),
+		nil,
+		rangeUsageInfo,
+		storeFilterThrottled,
+		a.scorerOptionsForScatter(),
+	)
+	require.True(t, ok)
+}
+
 // TestAllocatorRebalanceAway verifies that when a replica is on a node with a
 // bad span config, the replica will be rebalanced off of it.
 func TestAllocatorRebalanceAway(t *testing.T) {
@@ -7422,7 +7530,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 	alloc := MakeAllocator(
 		sp, func(string) (time.Duration, bool) {
 			return 0, false
-		}, nil, /* knobs */
+		}, nil /* knobs */, nil, /* storeMetrics */
 	)
 
 	var wg sync.WaitGroup
@@ -7632,7 +7740,7 @@ func qpsBasedRebalanceFn(
 ) {
 	avgQPS := candidate.Capacity.QueriesPerSecond / float64(candidate.Capacity.RangeCount)
 	jitteredQPS := avgQPS * (1 + alloc.randGen.Float64())
-	opts := qpsScorerOptions{
+	opts := &qpsScorerOptions{
 		qpsPerReplica:         jitteredQPS,
 		qpsRebalanceThreshold: 0.2,
 	}
@@ -7868,7 +7976,7 @@ func exampleRebalancing(
 	alloc := MakeAllocator(
 		sp, func(string) (time.Duration, bool) {
 			return 0, false
-		}, nil, /* knobs */
+		}, nil /* knobs */, nil, /* storeMetrics */
 	)
 
 	var wg sync.WaitGroup

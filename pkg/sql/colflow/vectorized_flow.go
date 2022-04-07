@@ -13,8 +13,6 @@ package colflow
 import (
 	"context"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 	"github.com/marusama/semaphore"
 )
 
@@ -205,7 +204,7 @@ func (f *vectorizedFlow) Setup(
 		f.GetWaitGroup(),
 		f.GetRowSyncFlowConsumer(),
 		f.GetBatchSyncFlowConsumer(),
-		flowCtx.Cfg.NodeDialer,
+		flowCtx.Cfg.PodNodeDialer,
 		f.GetID(),
 		diskQueueCfg,
 		f.countingSemaphore,
@@ -719,11 +718,14 @@ func (s *vectorizedFlowCreator) setupRouter(
 	}
 
 	// HashRouter memory monitor names are the concatenated output stream IDs.
-	streamIDs := make([]string, len(output.Streams))
+	var streamIDs redact.RedactableString
 	for i, s := range output.Streams {
-		streamIDs[i] = strconv.Itoa(int(s.StreamID))
+		if i > 0 {
+			streamIDs = streamIDs + ","
+		}
+		streamIDs = redact.Sprintf("%s%d", streamIDs, s.StreamID)
 	}
-	mmName := "hash-router-[" + strings.Join(streamIDs, ",") + "]"
+	mmName := "hash-router-[" + streamIDs + "]"
 
 	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccounts(ctx, flowCtx, mmName, len(output.Streams))
 	allocators := make([]*colmem.Allocator, len(output.Streams))
@@ -736,7 +738,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 		s.diskQueueCfg, s.fdSemaphore, diskAccounts,
 	)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
-		router.Run(logtags.AddTag(ctx, "hashRouterID", strings.Join(streamIDs, ",")))
+		router.Run(logtags.AddTag(ctx, "hashRouterID", streamIDs))
 	}
 	s.accumulateAsyncComponent(runRouter)
 
@@ -1037,14 +1039,14 @@ func (s *vectorizedFlowCreator) setupOutput(
 // callbackCloser is a utility struct that implements the Closer interface by
 // calling the provided callback.
 type callbackCloser struct {
-	closeCb func() error
+	closeCb func(context.Context) error
 }
 
 var _ colexecop.Closer = &callbackCloser{}
 
 // Close implements the Closer interface.
-func (c *callbackCloser) Close() error {
-	return c.closeCb()
+func (c *callbackCloser) Close(ctx context.Context) error {
+	return c.closeCb(ctx)
 }
 
 func (s *vectorizedFlowCreator) setupFlow(
@@ -1131,12 +1133,12 @@ func (s *vectorizedFlowCreator) setupFlow(
 				for i := range toCloseCopy {
 					func(idx int) {
 						closed := false
-						result.ToClose[idx] = &callbackCloser{closeCb: func() error {
+						result.ToClose[idx] = &callbackCloser{closeCb: func(ctx context.Context) error {
 							if !closed {
 								closed = true
 								atomic.AddInt32(&s.numClosed, 1)
 							}
-							return toCloseCopy[idx].Close()
+							return toCloseCopy[idx].Close(ctx)
 						}}
 					}(i)
 				}

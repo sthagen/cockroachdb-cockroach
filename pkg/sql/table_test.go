@@ -12,14 +12,18 @@ package sql
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -184,7 +188,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (a " + d.sqlType + " PRIMARY KEY, b " + d.sqlType + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
+			catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
@@ -219,7 +223,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				KeyColumnIDs:        []descpb.ColumnID{1},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				ConstraintID:        1,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -235,7 +240,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				StoreColumnNames:    []string{"a"},
 				StoreColumnIDs:      []descpb.ColumnID{1},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				ConstraintID:        2,
 			},
 			[]descpb.IndexDescriptor{
 				{
@@ -246,7 +252,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					KeyColumnIDs:        []descpb.ColumnID{1},
 					KeySuffixColumnIDs:  []descpb.ColumnID{2},
 					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-					Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
+					Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+					ConstraintID:        1,
 				},
 			},
 		},
@@ -260,7 +267,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				ConstraintID:        1,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -274,7 +282,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				ConstraintID:        2,
 			},
 			[]descpb.IndexDescriptor{
 				{
@@ -285,7 +294,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					KeyColumnIDs:        []descpb.ColumnID{2},
 					KeySuffixColumnIDs:  []descpb.ColumnID{1},
 					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-					Version:             descpb.LatestNonPrimaryIndexDescriptorVersion,
+					Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+					ConstraintID:        1,
 				},
 			},
 		},
@@ -299,7 +309,8 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
 				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_ASC},
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+				ConstraintID:        1,
 			},
 			[]descpb.IndexDescriptor{},
 		},
@@ -307,7 +318,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
+			catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
@@ -342,9 +353,10 @@ func TestMakeTableDescUniqueConstraints(t *testing.T) {
 			"a INT UNIQUE WITHOUT INDEX, b INT PRIMARY KEY",
 			[]descpb.UniqueWithoutIndexConstraint{
 				{
-					TableID:   100,
-					ColumnIDs: []descpb.ColumnID{1},
-					Name:      "unique_a",
+					TableID:      100,
+					ColumnIDs:    []descpb.ColumnID{1},
+					Name:         "unique_a",
+					ConstraintID: 2,
 				},
 			},
 		},
@@ -352,9 +364,10 @@ func TestMakeTableDescUniqueConstraints(t *testing.T) {
 			"a INT, b INT, CONSTRAINT c UNIQUE WITHOUT INDEX (b), UNIQUE (a, b)",
 			[]descpb.UniqueWithoutIndexConstraint{
 				{
-					TableID:   100,
-					ColumnIDs: []descpb.ColumnID{2},
-					Name:      "c",
+					TableID:      100,
+					ColumnIDs:    []descpb.ColumnID{2},
+					Name:         "c",
+					ConstraintID: 3,
 				},
 			},
 		},
@@ -362,14 +375,16 @@ func TestMakeTableDescUniqueConstraints(t *testing.T) {
 			"a INT, b INT, c INT, UNIQUE WITHOUT INDEX (a, b), UNIQUE WITHOUT INDEX (c)",
 			[]descpb.UniqueWithoutIndexConstraint{
 				{
-					TableID:   100,
-					ColumnIDs: []descpb.ColumnID{1, 2},
-					Name:      "unique_a_b",
+					TableID:      100,
+					ColumnIDs:    []descpb.ColumnID{1, 2},
+					Name:         "unique_a_b",
+					ConstraintID: 2,
 				},
 				{
-					TableID:   100,
-					ColumnIDs: []descpb.ColumnID{3},
-					Name:      "unique_c",
+					TableID:      100,
+					ColumnIDs:    []descpb.ColumnID{3},
+					Name:         "unique_c",
+					ConstraintID: 3,
 				},
 			},
 		},
@@ -377,7 +392,7 @@ func TestMakeTableDescUniqueConstraints(t *testing.T) {
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
 		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s,
-			descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
+			catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
@@ -396,13 +411,13 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	s := "CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))"
 	ctx := context.Background()
 	desc, err := CreateTestTableDescriptor(ctx, 1, 100, s,
-		descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
+		catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	desc.SetPrimaryIndex(descpb.IndexDescriptor{})
 
-	err = descbuilder.ValidateSelf(desc)
+	err = descbuilder.ValidateSelf(desc, clusterversion.TestingClusterVersion)
 	if !testutils.IsError(err, tabledesc.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -427,7 +442,7 @@ CREATE TABLE test.tt (x test.t);
 	typLookup := func(ctx context.Context, id descpb.ID) (tree.TypeName, catalog.TypeDescriptor, error) {
 		var typeDesc catalog.TypeDescriptor
 		if err := TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-			typeDesc, err = col.MustGetTypeDescByID(ctx, txn, id)
+			typeDesc, err = col.Direct().MustGetTypeDescByID(ctx, txn, id)
 			return err
 		}); err != nil {
 			return tree.TypeName{}, nil, err
@@ -468,46 +483,46 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 		// Test a simple UDT as the default value.
 		{
 			"x greeting DEFAULT ('hello')",
-			`x'80':::@100056`,
+			`x'80':::@$OID`,
 			getDefault,
 		},
 		{
 			"x greeting DEFAULT ('hello':::greeting)",
-			`x'80':::@100056`,
+			`x'80':::@$OID`,
 			getDefault,
 		},
 		// Test when a UDT is used in a default value, but isn't the
 		// final type of the column.
 		{
 			"x INT DEFAULT (CASE WHEN 'hello'::greeting = 'hello'::greeting THEN 0 ELSE 1 END)",
-			`CASE WHEN x'80':::@100056 = x'80':::@100056 THEN 0:::INT8 ELSE 1:::INT8 END`,
+			`CASE WHEN x'80':::@$OID = x'80':::@$OID THEN 0:::INT8 ELSE 1:::INT8 END`,
 			getDefault,
 		},
 		{
 			"x BOOL DEFAULT ('hello'::greeting IS OF (greeting, greeting))",
-			`x'80':::@100056 IS OF (@100056, @100056)`,
+			`x'80':::@$OID IS OF (@$OID, @$OID)`,
 			getDefault,
 		},
 		// Test check constraints.
 		{
 			"x greeting, CHECK (x = 'hello')",
-			`x = x'80':::@100056`,
+			`x = x'80':::@$OID`,
 			getCheck,
 		},
 		{
 			"x greeting, y STRING, CHECK (y::greeting = x)",
-			`y::@100056 = x`,
+			`y::@$OID = x`,
 			getCheck,
 		},
 		// Test a computed column in the same cases as above.
 		{
 			"x greeting AS ('hello') STORED",
-			`x'80':::@100056`,
+			`x'80':::@$OID`,
 			getComputed,
 		},
 		{
 			"x INT AS (CASE WHEN 'hello'::greeting = 'hello'::greeting THEN 0 ELSE 1 END) STORED",
-			`CASE WHEN x'80':::@100056 = x'80':::@100056 THEN 0:::INT8 ELSE 1:::INT8 END`,
+			`CASE WHEN x'80':::@$OID = x'80':::@$OID THEN 0:::INT8 ELSE 1:::INT8 END`,
 			getComputed,
 		},
 	}
@@ -522,6 +537,10 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 `); err != nil {
 		t.Fatal(err)
 	}
+	typDesc := desctestutils.TestingGetTypeDescriptor(
+		kvDB, keys.SystemSQLCodec, "test", "public", "greeting",
+	)
+	oid := fmt.Sprintf("%d", typedesc.TypeIDToOID(typDesc.GetID()))
 	for _, tc := range testdata {
 		create := "CREATE TABLE t (" + tc.colSQL + ")"
 		if _, err := sqlDB.Exec(create); err != nil {
@@ -529,8 +548,9 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 		}
 		desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 		found := tc.getExpr(desc)
-		if tc.expectedExpr != found {
-			t.Errorf("for column %s, found %s, expected %s", tc.colSQL, found, tc.expectedExpr)
+		expected := os.Expand(tc.expectedExpr, expander{"OID": oid}.mapping)
+		if expected != found {
+			t.Errorf("for column %s, found %s, expected %s", tc.colSQL, found, expected)
 		}
 		if _, err := sqlDB.Exec("DROP TABLE t"); err != nil {
 			t.Fatal(err)
@@ -555,22 +575,22 @@ func TestSerializedUDTsInView(t *testing.T) {
 		// Test simple UDT in the view query.
 		{
 			"SELECT 'hello':::greeting",
-			`(SELECT b'\x80':::@100056)`,
+			`(SELECT b'\x80':::@$OID)`,
 		},
 		// Test when a UDT is used in a view query, but isn't the
 		// final type of the column.
 		{
 			"SELECT 'hello'::greeting < 'hello'::greeting",
-			`(SELECT b'\x80':::@100056 < b'\x80':::@100056)`,
+			`(SELECT b'\x80':::@$OID < b'\x80':::@$OID)`,
 		},
 		// Test when a UDT is used in various parts of a view (subquery, CTE, etc.).
 		{
 			"SELECT k FROM (SELECT 'hello'::greeting AS k)",
-			`(SELECT k FROM (SELECT b'\x80':::@100056 AS k))`,
+			`(SELECT k FROM (SELECT b'\x80':::@$OID AS k))`,
 		},
 		{
 			"WITH w AS (SELECT 'hello':::greeting AS k) SELECT k FROM w",
-			`(WITH w AS (SELECT b'\x80':::@100056 AS k) SELECT k FROM w)`,
+			`(WITH w AS (SELECT b'\x80':::@$OID AS k) SELECT k FROM w)`,
 		},
 	}
 
@@ -584,6 +604,10 @@ func TestSerializedUDTsInView(t *testing.T) {
 `); err != nil {
 		t.Fatal(err)
 	}
+	typDesc := desctestutils.TestingGetTypeDescriptor(
+		kvDB, keys.SystemSQLCodec, "test", "public", "greeting",
+	)
+	oid := fmt.Sprintf("%d", typedesc.TypeIDToOID(typDesc.GetID()))
 	for _, tc := range testdata {
 		create := "CREATE VIEW v AS (" + tc.viewQuery + ")"
 		if _, err := sqlDB.Exec(create); err != nil {
@@ -591,13 +615,24 @@ func TestSerializedUDTsInView(t *testing.T) {
 		}
 		desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "v")
 		foundViewQuery := desc.GetViewQuery()
-		if tc.expectedExpr != foundViewQuery {
-			t.Errorf("for view %s, found %s, expected %s", tc.viewQuery, foundViewQuery, tc.expectedExpr)
+		expected := os.Expand(tc.expectedExpr, expander{"OID": oid}.mapping)
+		if expected != foundViewQuery {
+			t.Errorf("for view %s, found %s, expected %s", tc.viewQuery, foundViewQuery, expected)
 		}
 		if _, err := sqlDB.Exec("DROP VIEW v"); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+// expander is useful for expanding strings using os.Expand
+type expander map[string]string
+
+func (e expander) mapping(from string) (to string) {
+	if to, ok := e[from]; ok {
+		return to
+	}
+	return ""
 }
 
 // TestJobsCache verifies that a job for a given table gets cached and reused
@@ -621,22 +656,26 @@ func TestJobsCache(t *testing.T) {
 
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
 
 	// ALTER TABLE t1 ADD COLUMN x INT should have created a job for the table
 	// we're altering.
 	// Further schema changes to the table should have an existing cache
 	// entry for the job.
-	if _, err := sqlDB.Exec(`
-CREATE TABLE t1();
-BEGIN;
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE t1()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN;
 ALTER TABLE t1 ADD COLUMN x INT;
 `); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := sqlDB.Exec(`
-ALTER TABLE t1 ADD COLUMN y INT;
-`); err != nil {
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE t1 ADD COLUMN y INT;`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -647,15 +686,13 @@ ALTER TABLE t1 ADD COLUMN y INT;
 
 	// Verify that the cache is cleared once the transaction ends.
 	// Commit the old transaction.
-	if _, err := sqlDB.Exec(`
-COMMIT;
-`); err != nil {
+	if _, err := conn.ExecContext(ctx, `COMMIT;`); err != nil {
 		t.Fatal(err)
 	}
 
 	foundInCache = false
 
-	if _, err := sqlDB.Exec(`
+	if _, err := conn.ExecContext(ctx, `
 BEGIN;
 ALTER TABLE t1 ADD COLUMN z INT;
 `); err != nil {

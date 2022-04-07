@@ -12,12 +12,12 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -132,14 +132,13 @@ func planBackup(
 	ctx context.Context, p sql.PlanHookState, backupStmt tree.Statement,
 ) (sql.PlanHookRowFn, error) {
 	fn, cols, _, _, err := backupPlanHook(ctx, backupStmt, p)
-
 	if err != nil {
 		return nil, errors.Wrapf(err, "backup eval: %q", tree.AsString(backupStmt))
 	}
 	if fn == nil {
 		return nil, errors.Newf("backup eval: %q", tree.AsString(backupStmt))
 	}
-	if len(cols) != len(utilccl.DetachedJobExecutionResultHeader) {
+	if len(cols) != len(jobs.DetachedJobExecutionResultHeader) {
 		return nil, errors.Newf("unexpected result columns")
 	}
 	return fn, nil
@@ -175,6 +174,7 @@ func (e *scheduledBackupExecutor) GetCreateScheduleStatement(
 	ctx context.Context,
 	env scheduledjobs.JobSchedulerEnv,
 	txn *kv.Txn,
+	descsCol *descs.Collection,
 	sj *jobs.ScheduledJob,
 	ex sqlutil.InternalExecutor,
 ) (string, error) {
@@ -306,7 +306,8 @@ func (e *scheduledBackupExecutor) GetCreateScheduleStatement(
 
 	node := &tree.ScheduledBackup{
 		ScheduleLabelSpec: tree.ScheduleLabelSpec{
-			IfNotExists: false, Label: tree.NewDString(sj.ScheduleLabel())},
+			IfNotExists: false, Label: tree.NewDString(sj.ScheduleLabel()),
+		},
 		Recurrence:      tree.NewDString(recurrence),
 		FullBackup:      fullBackup,
 		Targets:         redactedBackupNode.Targets,
@@ -449,6 +450,7 @@ func (e *scheduledBackupExecutor) OnDrop(
 	env scheduledjobs.JobSchedulerEnv,
 	sj *jobs.ScheduledJob,
 	txn *kv.Txn,
+	descsCol *descs.Collection,
 ) error {
 	args := &ScheduledBackupExecutionArgs{}
 	if err := pbtypes.UnmarshalAny(sj.ExecutionArgs().Args, args); err != nil {

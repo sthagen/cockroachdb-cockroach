@@ -133,7 +133,7 @@ func doDrain(
 	if errors.HasType(err, (*contextutil.TimeoutError)(nil)) || grpcutil.IsTimeout(err) {
 		log.Infof(ctx, "drain timed out: %v", err)
 		err = errors.New("drain timeout, consider adjusting --drain-wait, especially under " +
-			"custom server.shutdown.{drain,query,lease_transfer}_wait cluster settings")
+			"custom server.shutdown.{drain,query,connection,lease_transfer}_wait cluster settings")
 	}
 	return
 }
@@ -180,7 +180,7 @@ func doDrainNoTimeout(
 			if err != nil {
 				// Unexpected error.
 				fmt.Fprintf(stderr, "\n") // finish the line started above.
-				log.Infof(ctx, "graceful shutdown failed: %v", err)
+				log.Infof(ctx, "graceful drain failed: %v", err)
 				return false, remaining > 0, err
 			}
 

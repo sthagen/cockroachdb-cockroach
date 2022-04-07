@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -92,11 +91,6 @@ func migrateTable(
 		if mutations := storedTable.GetMutationJobs(); len(mutations) > 0 {
 			for _, mutation := range mutations {
 				log.Infof(ctx, "waiting for the mutation job %v to complete", mutation.JobID)
-				// TODO(cameron): Remove this knob conditional once the related migration code has been removed.
-				// See pkg/migration/testing_knobs.go for more details.
-				if d.TestingKnobs.BeforeWaitInRetryJobsWithExponentialBackoffMigration != nil {
-					d.TestingKnobs.BeforeWaitInRetryJobsWithExponentialBackoffMigration(jobspb.JobID(mutation.JobID))
-				}
 				if _, err := d.InternalExecutor.Exec(ctx, "migration-mutations-wait",
 					nil, "SHOW JOB WHEN COMPLETE $1", mutation.JobID); err != nil {
 					return err
@@ -122,9 +116,6 @@ func migrateTable(
 		}
 		if exists {
 			log.Infof(ctx, "skipping %s operation as the schema change already exists.", op.name)
-			if d.TestingKnobs != nil && d.TestingKnobs.SkippedMutation != nil {
-				d.TestingKnobs.SkippedMutation()
-			}
 			return nil
 		}
 
@@ -254,6 +245,58 @@ func hasIndex(storedTable, expectedTable catalog.TableDescriptor, indexName stri
 
 	if err = ensureProtoMessagesAreEqual(&expectedCopy, &storedCopy); err != nil {
 		return false, err
+	}
+	return true, nil
+}
+
+// doesNotHaveIndex returns true if storedTable does not have an index named indexName.
+func doesNotHaveIndex(
+	storedTable, expectedTable catalog.TableDescriptor, indexName string,
+) (bool, error) {
+	idx, _ := storedTable.FindIndexWithName(indexName)
+	return idx == nil, nil
+}
+
+// hasColumnFamily returns true if storedTable already has the given column
+// family, comparing with expectedTable. storedTable descriptor must be read
+// from system storage as compared to reading from the systemschema package. On
+// the contrary, expectedTable must be accessed directly from systemschema
+// package. This function returns an error if the column doesn't exist in the
+// expectedTable descriptor.
+func hasColumnFamily(
+	storedTable, expectedTable catalog.TableDescriptor, colFamily string,
+) (bool, error) {
+	var storedFamily, expectedFamily *descpb.ColumnFamilyDescriptor
+	for _, fam := range storedTable.GetFamilies() {
+		if fam.Name == colFamily {
+			storedFamily = &fam
+			break
+		}
+	}
+	if storedFamily == nil {
+		return false, nil
+	}
+
+	for _, fam := range expectedTable.GetFamilies() {
+		if fam.Name == colFamily {
+			expectedFamily = &fam
+			break
+		}
+	}
+	if expectedFamily == nil {
+		return false, errors.Errorf("column family %s does not exist", colFamily)
+	}
+
+	// Check that columns match.
+	storedFamilyCols := storedFamily.ColumnNames
+	expectedFamilyCols := expectedFamily.ColumnNames
+	if len(storedFamilyCols) != len(expectedFamilyCols) {
+		return false, nil
+	}
+	for i, storedCol := range storedFamilyCols {
+		if storedCol != expectedFamilyCols[i] {
+			return false, nil
+		}
 	}
 	return true, nil
 }

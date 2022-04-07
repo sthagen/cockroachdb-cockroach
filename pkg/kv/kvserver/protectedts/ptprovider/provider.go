@@ -21,9 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptcache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptstorage"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptverifier"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 )
@@ -38,10 +38,12 @@ type Config struct {
 	Knobs                *protectedts.TestingKnobs
 }
 
-type provider struct {
+// Provider is the concrete implementation of protectedts.Provider interface.
+type Provider struct {
 	protectedts.Storage
-	protectedts.Verifier
 	protectedts.Cache
+	protectedts.Reconciler
+	metric.Struct
 }
 
 // New creates a new protectedts.Provider.
@@ -50,15 +52,18 @@ func New(cfg Config) (protectedts.Provider, error) {
 		return nil, err
 	}
 	storage := ptstorage.New(cfg.Settings, cfg.InternalExecutor, cfg.Knobs)
-	verifier := ptverifier.New(cfg.DB, storage)
-	return &provider{
-		Storage: storage,
-		Cache: ptcache.New(ptcache.Config{
-			DB:       cfg.DB,
-			Storage:  storage,
-			Settings: cfg.Settings,
-		}),
-		Verifier: verifier,
+	reconciler := ptreconcile.New(cfg.Settings, cfg.DB, storage, cfg.ReconcileStatusFuncs)
+	cache := ptcache.New(ptcache.Config{
+		DB:       cfg.DB,
+		Storage:  storage,
+		Settings: cfg.Settings,
+	})
+
+	return &Provider{
+		Storage:    storage,
+		Cache:      cache,
+		Reconciler: reconciler,
+		Struct:     reconciler.Metrics(),
 	}, nil
 }
 
@@ -75,9 +80,15 @@ func validateConfig(cfg Config) error {
 	}
 }
 
-func (p *provider) Start(ctx context.Context, stopper *stop.Stopper) error {
+// Start implements the protectedts.Provider interface.
+func (p *Provider) Start(ctx context.Context, stopper *stop.Stopper) error {
 	if cache, ok := p.Cache.(*ptcache.Cache); ok {
 		return cache.Start(ctx, stopper)
 	}
 	return nil
+}
+
+// Metrics implements the protectedts.Provider interface.
+func (p *Provider) Metrics() metric.Struct {
+	return p.Struct
 }

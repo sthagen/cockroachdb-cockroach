@@ -634,15 +634,7 @@ type clusterImpl struct {
 	// the cluster is running in insecure mode.
 	localCertsDir string
 	expiration    time.Time
-	// encryptDefault is true if the cluster should default to having encryption
-	// at rest enabled. The default only applies if encryption is not explicitly
-	// enabled or disabled by options passed to Start.
-	encryptDefault bool
-	// encryptAtRandom is true if the cluster should enable encryption-at-rest
-	// on about half of all runs. Only valid if encryptDefault is false. Only
-	// applies if encryption is not explicitly enabled or disabled by options
-	// passed to Start. For use in roachtests.
-	encryptAtRandom bool
+	encAtRest     bool // use encryption at rest
 
 	// destroyState contains state related to the cluster's destruction.
 	destroyState destroyState
@@ -651,18 +643,6 @@ type clusterImpl struct {
 // Name returns the cluster name, i.e. something like `teamcity-....`
 func (c *clusterImpl) Name() string {
 	return c.name
-}
-
-// EncryptAtRandom sets whether the cluster will start new nodes with
-// encryption enabled.
-func (c *clusterImpl) EncryptAtRandom(b bool) {
-	c.encryptAtRandom = b
-}
-
-// EncryptDefault sets the default for encryption-at-rest. This can be overridden
-// by options passed to `c.Start`.
-func (c *clusterImpl) EncryptDefault(b bool) {
-	c.encryptDefault = b
 }
 
 // Spec returns the spec underlying the cluster.
@@ -818,6 +798,15 @@ func createFlagsOverride(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 	}
 }
 
+// clusterMock creates a cluster to be used for (self) testing.
+func (f *clusterFactory) clusterMock(cfg clusterConfig) *clusterImpl {
+	return &clusterImpl{
+		name:       f.genName(cfg),
+		expiration: timeutil.Now().Add(24 * time.Hour),
+		r:          f.r,
+	}
+}
+
 // newCluster creates a new roachprod cluster.
 //
 // setStatus is called with status messages indicating the stage of cluster
@@ -836,12 +825,8 @@ func (f *clusterFactory) newCluster(
 	}
 
 	if cfg.spec.NodeCount == 0 {
-		// For tests. Return the minimum that makes them happy.
-		c := &clusterImpl{
-			name:       f.genName(cfg),
-			expiration: timeutil.Now().Add(24 * time.Hour),
-			r:          f.r,
-		}
+		// For tests, use a mock cluster.
+		c := f.clusterMock(cfg)
 		if err := f.r.registerCluster(c); err != nil {
 			return nil, err
 		}
@@ -886,11 +871,10 @@ func (f *clusterFactory) newCluster(
 			// the loop. See:
 			//
 			// https://github.com/cockroachdb/cockroach/issues/67906#issuecomment-887477675
-			name:           f.genName(cfg),
-			spec:           cfg.spec,
-			expiration:     cfg.spec.Expiration(),
-			encryptDefault: encrypt.asBool(),
-			r:              f.r,
+			name:       f.genName(cfg),
+			spec:       cfg.spec,
+			expiration: cfg.spec.Expiration(),
+			r:          f.r,
 			destroyState: destroyState{
 				owned: true,
 				alloc: cfg.alloc,
@@ -967,11 +951,10 @@ func attachToExistingCluster(
 		exp = timeutil.Now().Add(100000 * time.Hour)
 	}
 	c := &clusterImpl{
-		name:           name,
-		spec:           spec,
-		l:              l,
-		expiration:     exp,
-		encryptDefault: encrypt.asBool(),
+		name:       name,
+		spec:       spec,
+		l:          l,
+		expiration: exp,
 		destroyState: destroyState{
 			// If we're attaching to an existing cluster, we're not going to destroy it.
 			owned: false,
@@ -1296,35 +1279,21 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, t test.Test) error {
 	})
 }
 
-// FailOnDeadNodes fails the test if nodes that have a populated data dir are
-// found to be not running. It prints both to t.L() and the test output.
-func (c *clusterImpl) FailOnDeadNodes(ctx context.Context, t test.Test) {
+// checkNoDeadNode reports an error (via `t.Error`) if nodes that have a populated
+// data dir are found to be not running. It prints both to t.L() and the test
+// output.
+func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
 		return
 	}
 
-	// Don't hang forever.
-	_ = contextutil.RunWithTimeout(ctx, "detect dead nodes", time.Minute, func(ctx context.Context) error {
-		messages, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
-		// If there's an error, it means either that the monitor command failed
-		// completely, or that it found a dead node worth complaining about.
-		if err != nil {
-			if ctx.Err() != nil {
-				// Don't fail if we timed out.
-				return nil
-			}
-			// TODO(tbg): remove this type assertion.
-			t.(*testImpl).printfAndFail(0 /* skip */, "dead node detection: %s", err)
-		}
-		for msg := range messages {
-			if msg.Err != nil {
-				msg.Msg += "error: " + msg.Err.Error()
-				return errors.Newf("%d: %s", msg.Node, msg.Msg)
-			}
-		}
-		return nil
-	})
+	_, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
+	// If there's an error, it means either that the monitor command failed
+	// completely, or that it found a dead node worth complaining about.
+	if err != nil {
+		t.Errorf("dead node detection: %s", err)
+	}
 }
 
 // CheckReplicaDivergenceOnDB runs a fast consistency check of the whole keyspace
@@ -1376,7 +1345,7 @@ WHERE t.status NOT IN ('RANGE_CONSISTENT', 'RANGE_INDETERMINATE')`)
 // crdb_internal.check_consistency(true, '', '') indicates that any ranges'
 // replicas are inconsistent with each other. It uses the first node that
 // is up to run the query.
-func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t test.Test) {
+func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t *testImpl) {
 	if c.spec.NodeCount < 1 {
 		return // unit tests
 	}
@@ -1412,12 +1381,7 @@ func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t test.Test) 
 			return c.CheckReplicaDivergenceOnDB(ctx, t.L(), db)
 		},
 	); err != nil {
-		// NB: we don't call t.Fatal() here because this method is
-		// for use by the test harness beyond the point at which
-		// it can interpret `t.Fatal`.
-		//
-		// TODO(tbg): remove this type assertion.
-		t.(*testImpl).printAndFail(0, err)
+		t.Errorf("consistency check failed: %v", err)
 	}
 }
 
@@ -1674,7 +1638,7 @@ func (c *clusterImpl) PutE(
 
 	c.status("uploading file")
 	defer c.status("")
-	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, false /* useTreeDist */), "cluster.PutE")
+	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
 }
 
 // PutLibraries inserts all available library files into all nodes on the cluster
@@ -1829,31 +1793,7 @@ func (c *clusterImpl) StartE(
 	c.setStatusForClusterOpt("starting", startOpts.RoachtestOpts.Worker, opts...)
 	defer c.clearStatusForClusterOpt(startOpts.RoachtestOpts.Worker)
 
-	if startOpts.RoachtestOpts.DontEncrypt {
-		startOpts.RoachprodOpts.EncryptedStores = false
-	} else if c.encryptDefault {
-		startOpts.RoachprodOpts.EncryptedStores = true
-	} else if c.encryptAtRandom {
-		rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
-		if rng.Intn(2) == 1 {
-			// Force encryption in future calls of Start with the same cluster.
-			c.encryptDefault = true
-			startOpts.RoachprodOpts.EncryptedStores = true
-		}
-	}
-
-	// Set some env vars. The first two also the default for `roachprod start`,
-	// but we have to add them so that the third one doesn't wipe them out.
-	if !envExists(settings.Env, "COCKROACH_ENABLE_RPC_COMPRESSION") {
-		// RPC compressions costs around 5% on kv95, so we disable it. It might help
-		// when moving snapshots around, though.
-		settings.Env = append(settings.Env, "COCKROACH_ENABLE_RPC_COMPRESSION=false")
-	}
-
-	if !envExists(settings.Env, "COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED") {
-		// Get rid of an annoying popup in the UI.
-		settings.Env = append(settings.Env, "COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true")
-	}
+	startOpts.RoachprodOpts.EncryptedStores = c.encAtRest
 
 	if !envExists(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH") {
 		// Panic on span use-after-Finish, so we catch such bugs.
@@ -1932,6 +1872,9 @@ func (c *clusterImpl) StopE(
 ) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.StopE")
+	}
+	if c.spec.NodeCount == 0 {
+		return nil // unit tests
 	}
 	c.setStatusForClusterOpt("stopping", stopOpts.RoachtestOpts.Worker, nodes...)
 	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)

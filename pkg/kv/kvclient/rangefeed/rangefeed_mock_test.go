@@ -69,7 +69,7 @@ func (m *mockClient) Scan(
 
 var _ rangefeed.KVDB = (*mockClient)(nil)
 
-// TestRangefeedMock utilizes the kvDB interface to test the behavior of the
+// TestRangefeedMock utilizes the DB interface to test the behavior of the
 // RangeFeed.
 func TestRangeFeedMock(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -281,7 +281,7 @@ func TestRangeFeedMock(t *testing.T) {
 			ctx context.Context, value *roachpb.RangeFeedValue,
 		) {
 			rows <- value
-		}, rangefeed.WithDiff())
+		}, rangefeed.WithDiff(true))
 		require.NoError(t, err)
 		<-rows
 		r.Close()
@@ -347,7 +347,7 @@ func TestBackoffOnRangefeedFailure(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	ctrl := gomock.NewController(t)
-	db := rangefeed.NewMockkvDB(ctrl)
+	db := rangefeed.NewMockDB(ctrl)
 
 	// Make sure scan failure gets retried.
 	db.EXPECT().Scan(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("scan failed"))

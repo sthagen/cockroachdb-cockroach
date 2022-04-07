@@ -16,10 +16,12 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
@@ -354,30 +356,37 @@ func TestValidateTypeDesc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
+	const (
+		dbID            = 1000
+		schemaID        = dbID + 1
+		typeID          = dbID + 2
+		multiRegionDBID = 2000
+	)
+
 	var cb nstree.MutableCatalog
 	cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
 		Name: "db",
-		ID:   100,
+		ID:   dbID,
 	}).BuildImmutable())
 	cb.UpsertDescriptorEntry(schemadesc.NewBuilder(&descpb.SchemaDescriptor{
-		ID:       101,
-		ParentID: 100,
+		ID:       schemaID,
+		ParentID: dbID,
 		Name:     "schema",
 	}).BuildImmutable())
 	cb.UpsertDescriptorEntry(typedesc.NewBuilder(&descpb.TypeDescriptor{
-		ID:   102,
+		ID:   typeID,
 		Name: "type",
 	}).BuildImmutable())
 	cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
 		Name: "multi-region-db",
-		ID:   200,
+		ID:   multiRegionDBID,
 		RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
 			PrimaryRegion: "us-east-1",
 		},
 	}).BuildImmutable())
 
-	defaultPrivileges := descpb.NewBasePrivilegeDescriptor(security.RootUserName())
-	invalidPrivileges := descpb.NewBasePrivilegeDescriptor(security.RootUserName())
+	defaultPrivileges := catpb.NewBasePrivilegeDescriptor(security.RootUserName())
+	invalidPrivileges := catpb.NewBasePrivilegeDescriptor(security.RootUserName())
 	// Make the PrivilegeDescriptor invalid by granting SELECT to a type.
 	invalidPrivileges.Grant(security.TestUserName(), privilege.List{privilege.SELECT}, false)
 	typeDescID := descpb.ID(bootstrap.TestingUserDescID(0))
@@ -411,7 +420,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:       "t",
 				ID:         typeDescID,
-				ParentID:   100,
+				ParentID:   dbID,
 				Privileges: defaultPrivileges,
 			},
 		},
@@ -420,7 +429,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
@@ -440,7 +449,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
@@ -461,7 +470,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
@@ -485,7 +494,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
@@ -506,7 +515,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
@@ -527,7 +536,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
@@ -546,7 +555,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
@@ -565,7 +574,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
@@ -587,7 +596,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_ALIAS,
 				Privileges:     defaultPrivileges,
@@ -610,7 +619,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
+				ParentID:       dbID,
 				ParentSchemaID: 500,
 				Kind:           descpb.TypeDescriptor_ALIAS,
 				Alias:          types.Int,
@@ -622,8 +631,8 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
-				ParentSchemaID: 101,
+				ParentID:       dbID,
+				ParentSchemaID: schemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				ArrayTypeID:    500,
 				Privileges:     defaultPrivileges,
@@ -634,7 +643,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
@@ -655,10 +664,10 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:                     "t",
 				ID:                       typeDescID,
-				ParentID:                 100,
+				ParentID:                 dbID,
 				ParentSchemaID:           keys.PublicSchemaID,
 				Kind:                     descpb.TypeDescriptor_ENUM,
-				ArrayTypeID:              102,
+				ArrayTypeID:              typeID,
 				ReferencingDescriptorIDs: []descpb.ID{500},
 				Privileges:               defaultPrivileges,
 			},
@@ -668,7 +677,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
@@ -680,7 +689,7 @@ func TestValidateTypeDesc(t *testing.T) {
 						PhysicalRepresentation: []byte{1},
 					},
 				},
-				ArrayTypeID:              102,
+				ArrayTypeID:              typeID,
 				ReferencingDescriptorIDs: []descpb.ID{500},
 				Privileges:               defaultPrivileges,
 			},
@@ -690,10 +699,10 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
-				ParentSchemaID: 101,
+				ParentID:       dbID,
+				ParentSchemaID: schemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
-				ArrayTypeID:    102,
+				ArrayTypeID:    typeID,
 				Privileges:     invalidPrivileges,
 			},
 		},
@@ -702,8 +711,8 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       100,
-				ParentSchemaID: 101,
+				ParentID:       dbID,
+				ParentSchemaID: schemaID,
 				Kind:           descpb.TypeDescriptor_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
 					PrimaryRegion: "us-east-1",
@@ -714,7 +723,7 @@ func TestValidateTypeDesc(t *testing.T) {
 						PhysicalRepresentation: []byte{2},
 					},
 				},
-				ArrayTypeID: 102,
+				ArrayTypeID: typeID,
 				Privileges:  defaultPrivileges,
 			},
 		},
@@ -723,7 +732,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
@@ -732,7 +741,7 @@ func TestValidateTypeDesc(t *testing.T) {
 						PhysicalRepresentation: []byte{2},
 					},
 				},
-				ArrayTypeID: 102,
+				ArrayTypeID: typeID,
 				Privileges:  defaultPrivileges,
 			},
 		},
@@ -741,7 +750,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
@@ -753,7 +762,7 @@ func TestValidateTypeDesc(t *testing.T) {
 						PhysicalRepresentation: []byte{2},
 					},
 				},
-				ArrayTypeID: 102,
+				ArrayTypeID: typeID,
 				Privileges:  defaultPrivileges,
 			},
 		},
@@ -762,7 +771,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
-				ParentID:       200,
+				ParentID:       multiRegionDBID,
 				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
@@ -774,7 +783,7 @@ func TestValidateTypeDesc(t *testing.T) {
 						PhysicalRepresentation: []byte{2},
 					},
 				},
-				ArrayTypeID: 102,
+				ArrayTypeID: typeID,
 				Privileges:  defaultPrivileges,
 			},
 		},
@@ -783,7 +792,7 @@ func TestValidateTypeDesc(t *testing.T) {
 	for i, test := range testData {
 		desc := typedesc.NewBuilder(&test.desc).BuildImmutable()
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
-		ve := cb.Validate(ctx, catalog.NoValidationTelemetry, catalog.ValidationLevelCrossReferences, desc)
+		ve := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, catalog.ValidationLevelCrossReferences, desc)
 		if err := ve.CombinedError(); err == nil {
 			t.Errorf("#%d expected err: %s but found nil: %v", i, expectedErr, test.desc)
 		} else if expectedErr != err.Error() {
@@ -824,10 +833,11 @@ func TestTableImplicitTypeDescCannotBeSerializedOrValidated(t *testing.T) {
 		ParentID:       1,
 		ParentSchemaID: 1,
 		Kind:           descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE,
+		Privileges:     catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
 	}
 
 	desc := typedesc.NewBuilder(td).BuildImmutable()
 
-	err := validate.Self(desc)
+	err := validate.Self(clusterversion.TestingClusterVersion, desc)
 	require.Contains(t, err.Error(), "kind TABLE_IMPLICIT_RECORD_TYPE should never be serialized")
 }

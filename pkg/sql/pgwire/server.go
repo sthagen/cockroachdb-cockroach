@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -53,6 +55,8 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ATTENTION: After changing this value in a unit test, you probably want to
@@ -87,6 +91,15 @@ var logSessionAuth = settings.RegisterBoolSetting(
 	sql.AuthAuditingClusterSettingName,
 	"if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)",
 	false).WithPublic()
+
+var maxNumConnections = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"server.max_connections_per_gateway",
+	"the maximum number of non-superuser SQL connections per gateway allowed at a given time "+
+		"(note: this will only limit future connection attempts and will not affect already established connections). "+
+		"Negative values result in unlimited number of connections. Superusers are not affected by this limit.",
+	-1, // Postgres defaults to 100, but we default to -1 to match our previous behavior of unlimited.
+).WithPublic()
 
 const (
 	// ErrSSLRequired is returned when a client attempts to connect to a
@@ -132,6 +145,24 @@ var (
 		Help:        "Latency to establish and authenticate a SQL connection",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
+	}
+	MetaPGWireCancelTotal = metric.Metadata{
+		Name:        "sql.pgwire_cancel.total",
+		Help:        "Counter of the number of pgwire query cancel requests",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaPGWireCancelIgnored = metric.Metadata{
+		Name:        "sql.pgwire_cancel.ignored",
+		Help:        "Counter of the number of pgwire query cancel requests that were ignored due to rate limiting",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaPGWireCancelSuccessful = metric.Metadata{
+		Name:        "sql.pgwire_cancel.successful",
+		Help:        "Counter of the number of pgwire query cancel requests that were successful",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
 	}
 )
 
@@ -189,7 +220,15 @@ type Server struct {
 		// cancel the associated connection. The corresponding key is a channel
 		// that is closed when the connection is done.
 		connCancelMap cancelChanMap
-		draining      bool
+		// draining is set to true when the server starts draining the SQL layer.
+		// When set to true, remaining SQL connections will be closed.
+		// After the timeout set by server.shutdown.query_wait,
+		// all connections will be closed regardless any queries in flight.
+		draining bool
+		// rejectNewConnections is set true when the server does not accept new
+		// SQL connections, e.g. when the draining process enters the phase whose
+		// duration is specified by the server.shutdown.connection_wait.
+		rejectNewConnections bool
 	}
 
 	auth struct {
@@ -229,26 +268,32 @@ type Server struct {
 
 // ServerMetrics is the set of metrics for the pgwire server.
 type ServerMetrics struct {
-	BytesInCount   *metric.Counter
-	BytesOutCount  *metric.Counter
-	Conns          *metric.Gauge
-	NewConns       *metric.Counter
-	ConnLatency    *metric.Histogram
-	ConnMemMetrics sql.BaseMemoryMetrics
-	SQLMemMetrics  sql.MemoryMetrics
+	BytesInCount                *metric.Counter
+	BytesOutCount               *metric.Counter
+	Conns                       *metric.Gauge
+	NewConns                    *metric.Counter
+	ConnLatency                 *metric.Histogram
+	PGWireCancelTotalCount      *metric.Counter
+	PGWireCancelIgnoredCount    *metric.Counter
+	PGWireCancelSuccessfulCount *metric.Counter
+	ConnMemMetrics              sql.BaseMemoryMetrics
+	SQLMemMetrics               sql.MemoryMetrics
 }
 
 func makeServerMetrics(
 	sqlMemMetrics sql.MemoryMetrics, histogramWindow time.Duration,
 ) ServerMetrics {
 	return ServerMetrics{
-		BytesInCount:   metric.NewCounter(MetaBytesIn),
-		BytesOutCount:  metric.NewCounter(MetaBytesOut),
-		Conns:          metric.NewGauge(MetaConns),
-		NewConns:       metric.NewCounter(MetaNewConns),
-		ConnLatency:    metric.NewLatency(MetaConnLatency, histogramWindow),
-		ConnMemMetrics: sql.MakeBaseMemMetrics("conns", histogramWindow),
-		SQLMemMetrics:  sqlMemMetrics,
+		BytesInCount:                metric.NewCounter(MetaBytesIn),
+		BytesOutCount:               metric.NewCounter(MetaBytesOut),
+		Conns:                       metric.NewGauge(MetaConns),
+		NewConns:                    metric.NewCounter(MetaNewConns),
+		ConnLatency:                 metric.NewLatency(MetaConnLatency, histogramWindow),
+		PGWireCancelTotalCount:      metric.NewCounter(MetaPGWireCancelTotal),
+		PGWireCancelIgnoredCount:    metric.NewCounter(MetaPGWireCancelIgnored),
+		PGWireCancelSuccessfulCount: metric.NewCounter(MetaPGWireCancelSuccessful),
+		ConnMemMetrics:              sql.MakeBaseMemMetrics("conns", histogramWindow),
+		SQLMemMetrics:               sqlMemMetrics,
 	}
 }
 
@@ -379,11 +424,12 @@ func (s *Server) Metrics() (res []interface{}) {
 		&s.SQLServer.InternalMetrics.EngineMetrics,
 		&s.SQLServer.InternalMetrics.GuardrailMetrics,
 		&s.SQLServer.ServerMetrics.StatsMetrics,
+		&s.SQLServer.ServerMetrics.ContentionSubsystemMetrics,
 	}
 }
 
-// Drain prevents new connections from being served and waits for drainWait for
-// open connections to terminate before canceling them.
+// Drain prevents new connections from being served and waits the duration of
+// queryWait for open connections to terminate before canceling them.
 // An error will be returned when connections that have been canceled have not
 // responded to this cancellation and closed themselves in time. The server
 // will remain in draining state, though open connections may continue to
@@ -397,27 +443,129 @@ func (s *Server) Metrics() (res []interface{}) {
 // been done by the time this call returns. See the explanation in
 // pkg/server/drain.go for details.
 func (s *Server) Drain(
-	ctx context.Context, drainWait time.Duration, reporter func(int, redact.SafeString),
+	ctx context.Context,
+	queryWait time.Duration,
+	reporter func(int, redact.SafeString),
+	stopper *stop.Stopper,
 ) error {
-	return s.drainImpl(ctx, drainWait, cancelMaxWait, reporter)
+	return s.drainImpl(ctx, queryWait, cancelMaxWait, reporter, stopper)
 }
 
 // Undrain switches the server back to the normal mode of operation in which
 // connections are accepted.
 func (s *Server) Undrain() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setRejectNewConnectionsLocked(false)
 	s.setDrainingLocked(false)
-	s.mu.Unlock()
 }
 
 // setDrainingLocked sets the server's draining state and returns whether the
-// state changed (i.e. drain != s.mu.draining). s.mu must be locked.
+// state changed (i.e. drain != s.mu.draining). s.mu must be locked when
+// setDrainingLocked is called.
 func (s *Server) setDrainingLocked(drain bool) bool {
 	if s.mu.draining == drain {
 		return false
 	}
 	s.mu.draining = drain
 	return true
+}
+
+// setRejectNewConnectionsLocked sets the server's rejectNewConnections state.
+// s.mu must be locked when setRejectNewConnectionsLocked is called.
+func (s *Server) setRejectNewConnectionsLocked(rej bool) {
+	s.mu.rejectNewConnections = rej
+}
+
+// GetConnCancelMapLen returns the length of connCancelMap of the server.
+// This is a helper function when the server waits the SQL connections to be
+// closed. During this period, the server listens to the status of all
+// connections, and early exits this draining phase if there remains no active
+// SQL connections.
+func (s *Server) GetConnCancelMapLen() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.mu.connCancelMap)
+}
+
+// WaitForSQLConnsToClose waits for the client to close all SQL connections for the
+// duration of connectionWait.
+// With this phase, the node starts rejecting SQL connections, and as
+// soon as all existing SQL connections are closed, the server early exits this
+// draining phase.
+func (s *Server) WaitForSQLConnsToClose(
+	ctx context.Context, connectionWait time.Duration, stopper *stop.Stopper,
+) error {
+	// If we're already draining the SQL connections, we don't need to wait again.
+	if s.IsDraining() {
+		return nil
+	}
+
+	s.mu.Lock()
+	s.setRejectNewConnectionsLocked(true)
+	s.mu.Unlock()
+
+	if connectionWait == 0 {
+		return nil
+	}
+
+	log.Ops.Info(ctx, "waiting for clients to close existing SQL connections")
+
+	timer := time.NewTimer(connectionWait)
+	defer timer.Stop()
+
+	_, allConnsDone, quitWaitingForConns := s.waitConnsDone()
+	defer close(quitWaitingForConns)
+
+	select {
+	// Connection wait times out.
+	case <-time.After(connectionWait):
+		log.Ops.Warningf(ctx,
+			"%d connections remain after waiting %s; proceeding to drain SQL connections",
+			s.GetConnCancelMapLen(),
+			connectionWait,
+		)
+	case <-allConnsDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-stopper.ShouldQuiesce():
+		return context.Canceled
+	}
+
+	return nil
+}
+
+// waitConnsDone returns a copy of s.mu.connCancelMap, and a channel that
+// will be closed once all sql connections are closed, or the server quits
+// waiting for connections, whichever earlier.
+func (s *Server) waitConnsDone() (cancelChanMap, chan struct{}, chan struct{}) {
+	connCancelMap := func() cancelChanMap {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		connCancelMap := make(cancelChanMap)
+		for done, cancel := range s.mu.connCancelMap {
+			connCancelMap[done] = cancel
+		}
+		return connCancelMap
+	}()
+
+	allConnsDone := make(chan struct{}, 1)
+
+	quitWaitingForConns := make(chan struct{}, 1)
+
+	go func() {
+		defer close(allConnsDone)
+
+		for done := range connCancelMap {
+			select {
+			case <-done:
+			case <-quitWaitingForConns:
+				return
+			}
+		}
+	}()
+
+	return connCancelMap, allConnsDone, quitWaitingForConns
 }
 
 // drainImpl drains the SQL clients.
@@ -437,9 +585,30 @@ func (s *Server) drainImpl(
 	queryWait time.Duration,
 	cancelWait time.Duration,
 	reporter func(int, redact.SafeString),
+	stopper *stop.Stopper,
 ) error {
-	// This anonymous function returns a copy of s.mu.connCancelMap if there are
-	// any active connections to cancel. We will only attempt to cancel
+
+	s.mu.Lock()
+	if !s.setDrainingLocked(true) {
+		// We are already draining.
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	// If there is no open SQL connections to drain, just return.
+	if s.GetConnCancelMapLen() == 0 {
+		return nil
+	}
+
+	log.Ops.Info(ctx, "starting draining SQL connections")
+
+	// Spin off a goroutine that waits for all connections to signal that they
+	// are done and reports it on allConnsDone. The main goroutine signals this
+	// goroutine to stop work through quitWaitingForConns.
+
+	// This s.waitConnsDone function returns a copy of s.mu.connCancelMap if there
+	// are any active connections to cancel. We will only attempt to cancel
 	// connections that were active at the moment the draining switch happened.
 	// It is enough to do this because:
 	// 1) If no new connections are added to the original map all connections
@@ -448,49 +617,23 @@ func (s *Server) drainImpl(
 	// were added when s.mu.draining = false, thus not requiring cancellation.
 	// These connections are not our responsibility and will be handled when the
 	// server starts draining again.
-	connCancelMap := func() cancelChanMap {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if !s.setDrainingLocked(true) {
-			// We are already draining.
-			return nil
-		}
-		connCancelMap := make(cancelChanMap)
-		for done, cancel := range s.mu.connCancelMap {
-			connCancelMap[done] = cancel
-		}
-		return connCancelMap
-	}()
-	if len(connCancelMap) == 0 {
-		return nil
-	}
+	connCancelMap, allConnsDone, quitWaitingForConns := s.waitConnsDone()
+	defer close(quitWaitingForConns)
+
 	if reporter != nil {
 		// Report progress to the Drain RPC.
 		reporter(len(connCancelMap), "SQL clients")
 	}
 
-	// Spin off a goroutine that waits for all connections to signal that they
-	// are done and reports it on allConnsDone. The main goroutine signals this
-	// goroutine to stop work through quitWaitingForConns.
-	allConnsDone := make(chan struct{})
-	quitWaitingForConns := make(chan struct{})
-	defer close(quitWaitingForConns)
-	go func() {
-		defer close(allConnsDone)
-		for done := range connCancelMap {
-			select {
-			case <-done:
-			case <-quitWaitingForConns:
-				return
-			}
-		}
-	}()
-
-	// Wait for all connections to finish up to drainWait.
+	// Wait for connections to finish up their queries for the duration of queryWait.
 	select {
 	case <-time.After(queryWait):
 		log.Ops.Warningf(ctx, "canceling all sessions after waiting %s", queryWait)
 	case <-allConnsDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-stopper.ShouldQuiesce():
+		return context.Canceled
 	}
 
 	// Cancel the contexts of all sessions if the server is still in draining
@@ -568,7 +711,7 @@ func (s *Server) TestingEnableAuthLogging() {
 //
 // An error is returned if the initial handshake of the connection fails.
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType SocketType) error {
-	ctx, draining, onCloseFn := s.registerConn(ctx)
+	ctx, rejectNewConnections, onCloseFn := s.registerConn(ctx)
 	defer onCloseFn()
 
 	connDetails := eventpb.CommonConnectionDetails{
@@ -616,7 +759,8 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	case versionCancel:
 		// The cancel message is rather peculiar: it is sent without
 		// authentication, always over an unencrypted channel.
-		return handleCancel(conn)
+		s.handleCancel(ctx, conn, &buf)
+		return nil
 
 	case versionGSSENC:
 		// This is a request for an unsupported feature: GSS encryption.
@@ -633,7 +777,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	}
 
 	// If the server is shutting down, terminate the connection early.
-	if draining {
+	if rejectNewConnections {
 		log.Ops.Info(ctx, "rejecting new connection while server is draining")
 		return s.sendErr(ctx, conn, newAdminShutdownErr(ErrDrainingNewConn))
 	}
@@ -667,7 +811,8 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 		// Yet, we've found clients in the wild that send the cancel
 		// after the TLS handshake, for example at
 		// https://github.com/cockroachlabs/support/issues/600.
-		return handleCancel(conn)
+		s.handleCancel(ctx, conn, &buf)
+		return nil
 
 	default:
 		// We don't know this protocol.
@@ -698,7 +843,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	// Only now do we know the remote client address for sure (it may have
 	// been overridden by a status parameter).
 	connDetails.RemoteAddress = sArgs.RemoteAddr.String()
-	ctx = logtags.AddTag(ctx, "client", connDetails.RemoteAddress)
+	ctx = logtags.AddTag(ctx, "client", log.SafeOperational(connDetails.RemoteAddress))
 	sp.SetTag("client", attribute.StringValue(connDetails.RemoteAddress))
 
 	// If a test is hooking in some authentication option, load it.
@@ -708,6 +853,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	}
 
 	hbaConf, identMap := s.GetAuthenticationConfiguration()
+
 	// Defer the rest of the processing to the connection handler.
 	// This includes authentication.
 	s.serveConn(
@@ -722,16 +868,55 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 			auth:            hbaConf,
 			identMap:        identMap,
 			testingAuthHook: testingAuthHook,
-		})
+		},
+	)
 	return nil
 }
 
-func handleCancel(conn net.Conn) error {
-	// Since we don't support this, close the door in the client's
-	// face. Make a note of that use in telemetry.
+// handleCancel handles a pgwire query cancellation request. Note that the
+// request is unauthenticated. To mitigate the security risk (i.e., a
+// malicious actor spamming this endpoint with random data to try to cancel
+// a query), the logic is rate-limited by a semaphore. Refer to the comments
+// in the pgwirecancel package for more information.
+//
+// This function does not return an error, so the caller (and possible
+// attacker) will not know if the cancellation attempt succeeded. Errors are
+// logged so that an operator can be aware of any possibly malicious requests.
+func (s *Server) handleCancel(ctx context.Context, conn net.Conn, buf *pgwirebase.ReadBuffer) {
 	telemetry.Inc(sqltelemetry.CancelRequestCounter)
-	_ = conn.Close()
-	return nil
+	s.metrics.PGWireCancelTotalCount.Inc(1)
+
+	resp, err := func() (*serverpb.CancelQueryByKeyResponse, error) {
+		backendKeyDataBits, err := buf.GetUint64()
+		// The connection that issued the cancel is not a SQL session -- it's an
+		// entirely new connection that's created just to send the cancel. We close
+		// the connection as soon as possible after reading the data, since there
+		// is nothing to send back to the client.
+		_ = conn.Close()
+		if err != nil {
+			return nil, err
+		}
+		cancelKey := pgwirecancel.BackendKeyData(backendKeyDataBits)
+		// The request is forwarded to the appropriate node.
+		req := &serverpb.CancelQueryByKeyRequest{
+			SQLInstanceID:  cancelKey.GetSQLInstanceID(),
+			CancelQueryKey: cancelKey,
+		}
+		resp, err := s.execCfg.SQLStatusServer.CancelQueryByKey(ctx, req)
+		if resp != nil && len(resp.Error) > 0 {
+			err = errors.CombineErrors(err, errors.Newf("error from CancelQueryByKeyResponse: %s", resp.Error))
+		}
+		return resp, err
+	}()
+
+	if resp != nil && resp.Canceled {
+		s.metrics.PGWireCancelSuccessfulCount.Inc(1)
+	} else if err != nil {
+		if respStatus := status.Convert(err); respStatus.Code() == codes.ResourceExhausted {
+			s.metrics.PGWireCancelIgnoredCount.Inc(1)
+		}
+		log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
+	}
 }
 
 // parseClientProvidedSessionParameters reads the incoming k/v pairs
@@ -1103,19 +1288,20 @@ func (s *Server) maybeUpgradeToSecureConn(
 }
 
 // registerConn registers the incoming connection to the map of active connections,
-// which can be canceled by a concurrent server drain. It also returns
-// the current draining status of the server.
+// which can be canceled by a concurrent server drain. It also returns a boolean
+// variable rejectConn, which shows if the server is rejecting new SQL
+// connections.
 //
 // The onCloseFn() callback must be called at the end of the
 // connection by the caller.
 func (s *Server) registerConn(
 	ctx context.Context,
-) (newCtx context.Context, draining bool, onCloseFn func()) {
+) (newCtx context.Context, rejectNewConnections bool, onCloseFn func()) {
 	onCloseFn = func() {}
 	newCtx = ctx
 	s.mu.Lock()
-	draining = s.mu.draining
-	if !draining {
+	rejectNewConnections = s.mu.rejectNewConnections
+	if !rejectNewConnections {
 		var cancel context.CancelFunc
 		newCtx, cancel = contextutil.WithCancel(ctx)
 		done := make(chan struct{})
@@ -1130,11 +1316,11 @@ func (s *Server) registerConn(
 	}
 	s.mu.Unlock()
 
-	// If the Server is draining, we will use the connection only to send an
-	// error, so we don't count it in the stats. This makes sense since
-	// DrainClient() waits for that number to drop to zero,
+	// If the server is rejecting new SQL connections, we will use the connection
+	// only to send an error, so we don't count it in the stats. This makes sense
+	// since DrainClient() waits for that number to drop to zero,
 	// so we don't want it to oscillate unnecessarily.
-	if !draining {
+	if !rejectNewConnections {
 		s.metrics.NewConns.Inc(1)
 		s.metrics.Conns.Inc(1)
 		prevOnCloseFn := onCloseFn

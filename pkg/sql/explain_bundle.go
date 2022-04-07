@@ -532,11 +532,10 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		{sessionSetting: "locality_optimized_partitioned_index_scan", clusterSetting: localityOptimizedSearchMode, convFunc: boolToOnOff},
 		{sessionSetting: "propagate_input_ordering", clusterSetting: propagateInputOrdering, convFunc: boolToOnOff},
 		{sessionSetting: "prefer_lookup_joins_for_fks", clusterSetting: preferLookupJoinsForFKs, convFunc: boolToOnOff},
-		{sessionSetting: "intervalstyle_enabled", clusterSetting: intervalStyleEnabled, convFunc: boolToOnOff},
-		{sessionSetting: "datestyle_enabled", clusterSetting: dateStyleEnabled, convFunc: boolToOnOff},
 		{sessionSetting: "disallow_full_table_scans", clusterSetting: disallowFullTableScans, convFunc: boolToOnOff},
 		{sessionSetting: "large_full_scan_rows", clusterSetting: largeFullScanRows},
 		{sessionSetting: "cost_scans_with_default_col_size", clusterSetting: costScansWithDefaultColSize, convFunc: boolToOnOff},
+		{sessionSetting: "default_transaction_quality_of_service"},
 		{sessionSetting: "distsql", clusterSetting: DistSQLClusterExecMode, convFunc: distsqlConv},
 		{sessionSetting: "vectorize", clusterSetting: VectorizeClusterMode, convFunc: vectorizeConv},
 	}
@@ -547,7 +546,14 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 			return err
 		}
 		// Get the default value for the cluster setting.
-		def := s.clusterSetting.EncodedDefault()
+		var def string
+		if s.clusterSetting == nil {
+			// Special handling for default_transaction_quality_of_service since it
+			// has no cluster setting.
+			def = sessiondatapb.Normal.String()
+		} else {
+			def = s.clusterSetting.EncodedDefault()
+		}
 		if s.convFunc != nil {
 			// If necessary, convert the encoded cluster setting to a session setting
 			// value (e.g.  "true"->"on"), depending on the setting.

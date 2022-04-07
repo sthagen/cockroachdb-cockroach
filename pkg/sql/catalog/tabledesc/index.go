@@ -13,6 +13,7 @@ package tabledesc
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var _ catalog.Index = (*index)(nil)
@@ -67,6 +69,11 @@ func (w index) Public() bool {
 // GetID returns the index ID.
 func (w index) GetID() descpb.IndexID {
 	return w.desc.ID
+}
+
+// GetConstraintID returns the constraint ID.
+func (w index) GetConstraintID() descpb.ConstraintID {
+	return w.desc.ConstraintID
 }
 
 // GetName returns the index name.
@@ -318,28 +325,64 @@ func (w index) GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID 
 
 // UseDeletePreservingEncoding returns true if the index is to be encoded with
 // an additional bit that indicates whether or not the value has been deleted.
+//
 // Index key-values that are deleted in this way are not actually deleted,
 // but remain in the index with a value which has the delete bit set to true.
 // This is necessary to preserve the delete history for the MVCC-compatible
 // index backfiller
 // docs/RFCS/20211004_incremental_index_backfiller.md#new-index-encoding-for-deletions-vs-mvcc
+//
+// We only use the delete preserving encoding if the index is
+// writable. Otherwise, we may preserve a delete when in DELETE_ONLY but never
+// see a subsequent write that replaces it. This a problem for the
+// MVCC-compatible index backfiller which merges entries from a
+// delete-preserving index into a newly-added index. A delete preserved in
+// DELETE_ONLY could result in a value being erroneously deleted during the
+// merge process. While we could filter such deletes, the filtering would
+// require more data being stored in each deleted entry and further complicate
+// the merge process. See #75720 for further details.
 func (w index) UseDeletePreservingEncoding() bool {
+	return w.desc.UseDeletePreservingEncoding && !w.maybeMutation.DeleteOnly()
+}
+
+// ForcePut returns true if writes to the index should only use Put (rather than
+// CPut or InitPut). This is used by indexes currently being built by the
+// MVCC-compliant index backfiller and the temporary indexes that support that
+// process.
+func (w index) ForcePut() bool {
+	return w.Merging() || w.desc.UseDeletePreservingEncoding
+}
+
+func (w index) CreatedAt() time.Time {
+	if w.desc.CreatedAtNanos == 0 {
+		return time.Time{}
+	}
+	return timeutil.Unix(0, w.desc.CreatedAtNanos)
+}
+
+// IsTemporaryIndexForBackfill() returns true iff the index is
+// an index being used as the temporary index being used by an
+// in-progress index backfill.
+//
+// TODO(ssd): This could be its own boolean or we could store the ID
+// of the index it is a temporary index for.
+func (w index) IsTemporaryIndexForBackfill() bool {
 	return w.desc.UseDeletePreservingEncoding
 }
 
 // partitioning is the backing struct for a catalog.Partitioning interface.
 type partitioning struct {
-	desc *descpb.PartitioningDescriptor
+	desc *catpb.PartitioningDescriptor
 }
 
 // PartitioningDesc returns the underlying protobuf descriptor.
-func (p partitioning) PartitioningDesc() *descpb.PartitioningDescriptor {
+func (p partitioning) PartitioningDesc() *catpb.PartitioningDescriptor {
 	return p.desc
 }
 
 // DeepCopy returns a deep copy of the receiver.
 func (p partitioning) DeepCopy() catalog.Partitioning {
-	return &partitioning{desc: protoutil.Clone(p.desc).(*descpb.PartitioningDescriptor)}
+	return &partitioning{desc: protoutil.Clone(p.desc).(*catpb.PartitioningDescriptor)}
 }
 
 // FindPartitionByName recursively searches the partitioning for a partition

@@ -12,14 +12,12 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/alessio/shellescape"
+	"github.com/google/shlex"
 	"github.com/spf13/cobra"
 )
 
@@ -27,16 +25,17 @@ const (
 	stressTarget = "@com_github_cockroachdb_stress//:stress"
 
 	// General testing flags.
-	countFlag       = "count"
-	vFlag           = "verbose"
-	showLogsFlag    = "show-logs"
-	stressFlag      = "stress"
-	stressArgsFlag  = "stress-args"
-	raceFlag        = "race"
-	ignoreCacheFlag = "ignore-cache"
-	rewriteFlag     = "rewrite"
-	rewriteArgFlag  = "rewrite-arg"
-	vModuleFlag     = "vmodule"
+	countFlag        = "count"
+	vFlag            = "verbose"
+	showLogsFlag     = "show-logs"
+	stressFlag       = "stress"
+	stressArgsFlag   = "stress-args"
+	raceFlag         = "race"
+	ignoreCacheFlag  = "ignore-cache"
+	rewriteFlag      = "rewrite"
+	streamOutputFlag = "stream-output"
+	testArgsFlag     = "test-args"
+	vModuleFlag      = "vmodule"
 )
 
 func makeTestCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
@@ -44,11 +43,18 @@ func makeTestCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Comm
 	testCmd := &cobra.Command{
 		Use:   "test [pkg..]",
 		Short: `Run the specified tests`,
-		Long:  `Run the specified tests.`,
+		Long: `Run the specified tests.
+
+This command takes a list of packages or build targets and tests all of them.
+The build target can be a normal bazel build target (like
+pkg/kv/kvserver:kvserver_test), or it can be a plain directory (like
+pkg/kv/kvserver). Furthermore, we accept the following shorthands: all
+and all_tests.`,
 		Example: `
 	dev test
 	dev test pkg/kv/kvserver --filter=TestReplicaGC* -v --timeout=1m
 	dev test pkg/server -f=TestSpanStatsResponse -v --count=5 --vmodule='raft=1'
+        dev test all_tests -v
 	dev test --stress --race ...`,
 		Args: cobra.MinimumNArgs(0),
 		RunE: runE,
@@ -72,9 +78,9 @@ func makeTestCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Comm
 	testCmd.Flags().String(stressArgsFlag, "", "additional arguments to pass to stress")
 	testCmd.Flags().Bool(raceFlag, false, "run tests using race builds")
 	testCmd.Flags().Bool(ignoreCacheFlag, false, "ignore cached test runs")
-	testCmd.Flags().String(rewriteFlag, "", "argument to pass to underlying test binary (only applicable to certain tests)")
-	testCmd.Flags().String(rewriteArgFlag, "", "additional argument to pass to -rewrite (implies --rewrite)")
-	testCmd.Flags().Lookup(rewriteFlag).NoOptDefVal = "-rewrite"
+	testCmd.Flags().Bool(rewriteFlag, false, "rewrite test files using results from test run (only applicable to certain tests)")
+	testCmd.Flags().Bool(streamOutputFlag, false, "stream test output during run")
+	testCmd.Flags().String(testArgsFlag, "", "additional arguments to pass to go test binary")
 	testCmd.Flags().String(vModuleFlag, "", "comma-separated list of pattern=N settings for file-filtered logging")
 	return testCmd
 }
@@ -83,24 +89,33 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	pkgs, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
 	var (
-		filter      = mustGetFlagString(cmd, filterFlag)
-		ignoreCache = mustGetFlagBool(cmd, ignoreCacheFlag)
-		race        = mustGetFlagBool(cmd, raceFlag)
-		rewrite     = mustGetFlagString(cmd, rewriteFlag)
-		rewriteArg  = mustGetFlagString(cmd, rewriteArgFlag)
-		short       = mustGetFlagBool(cmd, shortFlag)
-		stress      = mustGetFlagBool(cmd, stressFlag)
-		stressArgs  = mustGetFlagString(cmd, stressArgsFlag)
-		timeout     = mustGetFlagDuration(cmd, timeoutFlag)
-		verbose     = mustGetFlagBool(cmd, vFlag)
-		showLogs    = mustGetFlagBool(cmd, showLogsFlag)
-		count       = mustGetFlagInt(cmd, countFlag)
-		vModule     = mustGetFlagString(cmd, vModuleFlag)
+		filter        = mustGetFlagString(cmd, filterFlag)
+		ignoreCache   = mustGetFlagBool(cmd, ignoreCacheFlag)
+		race          = mustGetFlagBool(cmd, raceFlag)
+		rewrite       = mustGetFlagBool(cmd, rewriteFlag)
+		streamOutput  = mustGetFlagBool(cmd, streamOutputFlag)
+		testArgs      = mustGetFlagString(cmd, testArgsFlag)
+		short         = mustGetFlagBool(cmd, shortFlag)
+		stress        = mustGetFlagBool(cmd, stressFlag)
+		stressCmdArgs = mustGetFlagString(cmd, stressArgsFlag)
+		timeout       = mustGetFlagDuration(cmd, timeoutFlag)
+		verbose       = mustGetFlagBool(cmd, vFlag)
+		showLogs      = mustGetFlagBool(cmd, showLogsFlag)
+		count         = mustGetFlagInt(cmd, countFlag)
+		vModule       = mustGetFlagString(cmd, vModuleFlag)
 	)
+	if rewrite {
+		ignoreCache = true
+	}
+
+	// Enumerate all tests to run.
+	if len(pkgs) == 0 {
+		// Empty `dev test` does the same thing as `dev test all_tests`.
+		pkgs = append(pkgs, "all_tests")
+	}
 
 	var args []string
 	args = append(args, "test")
-	args = append(args, mustGetRemoteCacheArgs(remoteCacheAddr)...)
 	if numCPUs != 0 {
 		args = append(args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
 	}
@@ -112,59 +127,35 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 
 	var testTargets []string
 	for _, pkg := range pkgs {
-		dir, isRecursive, tag, err := d.parsePkg(pkg)
-		if err != nil {
-			return err
+		if pkg == "all" || pkg == "all_tests" {
+			testTargets = append(testTargets, "//pkg:all_tests")
+			continue
 		}
-		querySuffix := ""
-		if isRecursive {
-			// Similar to `go test`, we implement `...` expansion to allow
-			// callers to use the following pattern to test all packages under a
-			// named one:
-			//
-			//     dev test pkg/util/... -v
-			//
-			// NB: We'll want to filter for just the go_test targets here. Not
-			// doing so prompts bazel to try and build all named targets. This
-			// is undesirable for the various `*_proto` targets seeing as how
-			// they're not buildable in isolation. This is because we often
-			// attach methods to proto types in hand-written files, files that
-			// are not picked up by the proto bazel targets[1]. Regular bazel
-			// compilation is still fine seeing as how the top-level go_library
-			// targets both embeds the proto target, and sources the
-			// hand-written file. But the proto target in isolation may not be
-			// buildable because without those additional methods, those types
-			// may fail to satisfy required interfaces.
-			//
-			// So, blinding selecting for all targets won't work, and we'll want
-			// to filter things out first.
-			//
-			// [1]: pkg/rpc/heartbeat.proto is one example of this pattern,
-			// where we define `Stringer` separately for the `RemoteOffset`
-			// type.
-			querySuffix = "/..."
+
+		pkg = strings.TrimPrefix(pkg, "//")
+		pkg = strings.TrimPrefix(pkg, "./")
+		pkg = strings.TrimRight(pkg, "/")
+
+		if !strings.HasPrefix(pkg, "pkg/") {
+			return fmt.Errorf("malformed package %q, expecting %q", pkg, "pkg/{...}")
+		}
+
+		var target string
+		if strings.Contains(pkg, ":") {
+			// For parity with bazel, we allow specifying named build targets.
+			target = pkg
 		} else {
-			if tag == "" {
-				tag = "all"
-			}
-			querySuffix = ":" + tag
+			target = fmt.Sprintf("%s:all", pkg)
 		}
-		query := fmt.Sprintf("kind(go_test, //%s%s)", dir, querySuffix)
-		out, err := d.getQueryOutput(ctx, query)
-		if err != nil {
-			return err
-		}
-		tests := strings.Split(strings.TrimSpace(string(out)), "\n")
-		testTargets = append(testTargets, tests...)
+		testTargets = append(testTargets, target)
 	}
 
 	args = append(args, testTargets...)
-
 	if ignoreCache {
 		args = append(args, "--nocache_test_results")
 	}
 	args = append(args, "--test_env=GOTRACEBACK=all")
-	if rewrite != "" {
+	if rewrite {
 		if stress {
 			return fmt.Errorf("cannot combine --%s and --%s", stressFlag, rewriteFlag)
 		}
@@ -173,13 +164,16 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 			return err
 		}
 		args = append(args, fmt.Sprintf("--test_env=COCKROACH_WORKSPACE=%s", workspace))
-		args = append(args, "--test_arg", rewrite)
-		if rewriteArg != "" {
-			args = append(args, "--test_arg", rewriteArg)
-		}
+		args = append(args, "--test_arg", "-rewrite")
 		for _, testTarget := range testTargets {
 			dir := getDirectoryFromTarget(testTarget)
 			args = append(args, fmt.Sprintf("--sandbox_writable_path=%s", filepath.Join(workspace, dir)))
+			if strings.Contains(testTarget, "pkg/ccl/logictestccl") {
+				// The ccl logictest target shares the testdata directory with the base
+				// logictest target -- make an allowance explicitly for that.
+				args = append(args, fmt.Sprintf("--sandbox_writable_path=%s",
+					filepath.Join(workspace, "pkg/sql/logictest")))
+			}
 		}
 	}
 	if timeout > 0 && !stress {
@@ -189,35 +183,15 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	}
 
 	if stress {
-		var stressCmdArgs []string
-		if timeout > 0 {
-			stressCmdArgs = append(stressCmdArgs, fmt.Sprintf("-maxtime=%s", timeout))
-			// The bazel timeout should be higher than the stress duration, lets
-			// generously give it an extra minute.
-			args = append(args, fmt.Sprintf("--test_timeout=%d", int((timeout+time.Minute).Seconds())))
-		} else {
-			// We're running under stress and no timeout is specified. We want
-			// to respect the timeout passed down to stress[1]. Similar to above
-			// we want the bazel timeout to be longer, so lets just set it to
-			// 24h.
-			//
-			// [1]: Through --stress-arg=-maxtime or if nothing is specified,
-			//      -maxtime=0 is taken as "run forever".
-			args = append(args, fmt.Sprintf("--test_timeout=%.0f", 24*time.Hour.Seconds()))
-		}
-		if numCPUs > 0 {
-			stressCmdArgs = append(stressCmdArgs, fmt.Sprintf("-p=%d", numCPUs))
-		}
-		stressCmdArgs = append(stressCmdArgs, stressArgs)
-		args = append(args, "--run_under",
-			// NB: Run with -bazel, which propagates `TEST_TMPDIR` to `TMPDIR`,
-			// and -shardable-artifacts set such that we can merge the XML output
-			// files.
-			fmt.Sprintf("%s -bazel -shardable-artifacts 'XML_OUTPUT_FILE=%s merge-test-xmls' %s", stressTarget, getDevBin(), strings.Join(stressCmdArgs, " ")))
+		args = append(args, d.getStressArgs(stressCmdArgs, timeout)...)
 	}
 
 	if filter != "" {
 		args = append(args, fmt.Sprintf("--test_filter=%s", filter))
+		// For sharded test packages, it doesn't make much sense to spawn multiple
+		// test processes that don't end up running anything. Default to running
+		// things in a single process if a filter is specified.
+		args = append(args, "--test_sharding_strategy=disabled")
 	}
 	if short {
 		args = append(args, "--test_arg", "-test.short")
@@ -234,26 +208,100 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	if vModule != "" {
 		args = append(args, "--test_arg", fmt.Sprintf("-vmodule=%s", vModule))
 	}
-	// TODO(irfansharif): Support --go-flags, to pass in an arbitrary set of
-	// flags into the go test binaries. Gives better coverage to everything
-	// listed under `go help testflags`.
-
-	{ // Handle test output flags.
-		testOutputArgs := []string{"--test_output", "errors"}
-		if stress {
-			// Stream the output to continually observe the number of successful
-			// test iterations.
-			testOutputArgs = []string{"--test_output", "streamed"}
-		} else if verbose || showLogs {
-			testOutputArgs = []string{"--test_output", "all"}
+	if testArgs != "" {
+		goTestArgs, err := d.getGoTestArgs(ctx, testArgs)
+		if err != nil {
+			return err
 		}
-		args = append(args, testOutputArgs...)
+		args = append(args, goTestArgs...)
 	}
 
+	args = append(args, d.getTestOutputArgs(stress, verbose, showLogs, streamOutput)...)
 	args = append(args, additionalBazelArgs...)
 
 	logCommand("bazel", args...)
 	return d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...)
+
+	// TODO(irfansharif): Both here and in `dev bench`, if the command is
+	// unsuccessful we could explicitly check for "missing package" errors. The
+	// situation is not so bad currently however:
+	//
+	//   [...] while parsing 'pkg/f:all': no such package 'pkg/f'
+}
+
+func (d *dev) getGoTestArgs(ctx context.Context, testArgs string) ([]string, error) {
+	var goTestArgs []string
+	if testArgs != "" {
+		// The test output directory defaults to wherever "go test" is running,
+		// which for us is somewhere in the sandbox. When passing arguments for
+		// go test (-{mem,cpu}profile, -trace for e.g.), we may be interested in
+		// output files. For that reason, configure it to write (if anything) to the
+		// workspace by default.
+		//
+		// TODO(irfansharif): We could also elevate the go test flags that do write
+		// output into top-level dev flags (like --rewrite) and only selectively
+		// configure -test.outputdir and the sandbox writable path.
+		workspace, err := d.getWorkspace(ctx)
+		if err != nil {
+			return nil, err
+		}
+		goTestArgs = append(goTestArgs,
+			"--test_arg", fmt.Sprintf("-test.outputdir=%s", workspace),
+			fmt.Sprintf("--sandbox_writable_path=%s", filepath.Join(workspace)),
+		)
+
+		parts, err := shlex.Split(testArgs)
+		if err != nil {
+			return nil, err
+		}
+		for _, part := range parts {
+			goTestArgs = append(goTestArgs, "--test_arg", part)
+		}
+	}
+	return goTestArgs, nil
+}
+
+func (d *dev) getTestOutputArgs(stress, verbose, showLogs, streamOutput bool) []string {
+	testOutputArgs := []string{"--test_output", "errors"}
+	if stress || streamOutput {
+		// Stream the output to continually observe the number of successful
+		// test iterations.
+		testOutputArgs = []string{"--test_output", "streamed"}
+	} else if verbose || showLogs {
+		testOutputArgs = []string{"--test_output", "all"}
+	}
+	return testOutputArgs
+}
+
+func (d *dev) getStressArgs(stressCmdArg string, timeout time.Duration) []string {
+	var stressArgs, stressCmdArgs []string
+	if timeout > 0 {
+		stressCmdArgs = append(stressCmdArgs, fmt.Sprintf("-maxtime=%s", timeout))
+		// The bazel timeout should be higher than the stress duration, lets
+		// generously give it an extra minute.
+		stressArgs = append(stressArgs, fmt.Sprintf("--test_timeout=%d", int((timeout+time.Minute).Seconds())))
+	} else {
+		// We're running under stress and no timeout is specified. We want
+		// to respect the timeout passed down to stress[1]. Similar to above
+		// we want the bazel timeout to be longer, so lets just set it to
+		// 24h.
+		//
+		// [1]: Through --stress-arg=-maxtime or if nothing is specified,
+		//      -maxtime=0 is taken as "run forever".
+		stressArgs = append(stressArgs, fmt.Sprintf("--test_timeout=%.0f", 24*time.Hour.Seconds()))
+	}
+	if numCPUs > 0 {
+		stressCmdArgs = append(stressCmdArgs, fmt.Sprintf("-p=%d", numCPUs))
+	}
+	if stressCmdArg != "" {
+		stressCmdArgs = append(stressCmdArgs, stressCmdArg)
+	}
+	stressArgs = append(stressArgs, "--run_under",
+		// NB: Run with -bazel, which propagates `TEST_TMPDIR` to `TMPDIR`,
+		// and -shardable-artifacts set such that we can merge the XML output
+		// files.
+		fmt.Sprintf("%s -bazel -shardable-artifacts 'XML_OUTPUT_FILE=%s merge-test-xmls' %s", stressTarget, d.getDevBin(), strings.Join(stressCmdArgs, " ")))
+	return stressArgs
 }
 
 func getDirectoryFromTarget(target string) string {
@@ -263,26 +311,4 @@ func getDirectoryFromTarget(target string) string {
 		return target
 	}
 	return target[:colon]
-}
-
-// getQueryOutput runs `bazel query` w/ the given arguments, but returns
-// a more informative error if the query fails.
-func (d *dev) getQueryOutput(ctx context.Context, args ...string) ([]byte, error) {
-	queryArgs := []string{"query"}
-	queryArgs = append(queryArgs, args...)
-	stdoutBytes, err := d.exec.CommandContextSilent(ctx, "bazel", queryArgs...)
-	if err == nil {
-		return stdoutBytes, err
-	}
-	var cmderr *exec.ExitError
-	var stdout, stderr string
-	if len(stdoutBytes) > 0 {
-		stdout = fmt.Sprintf("stdout: \"%s\" ", string(stdoutBytes))
-	}
-	if errors.As(err, &cmderr) && len(cmderr.Stderr) > 0 {
-		stderr = fmt.Sprintf("stderr: \"%s\" ", strings.TrimSpace(string(cmderr.Stderr)))
-	}
-	return nil, fmt.Errorf("failed to run `bazel %s` %s%s(%w)",
-		shellescape.QuoteCommand(queryArgs), stdout, stderr, err)
-
 }

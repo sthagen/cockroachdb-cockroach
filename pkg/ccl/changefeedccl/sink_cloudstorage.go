@@ -20,11 +20,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -32,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/google/btree"
 )
@@ -59,13 +62,13 @@ func cloudStorageFormatTime(ts hlc.Timestamp) string {
 
 type cloudStorageSinkFile struct {
 	cloudStorageSinkKey
-	codec         io.WriteCloser
-	rawSize       int
-	numMessages   int
-	buf           bytes.Buffer
-	alloc         kvevent.Alloc
-	oldestMVCC    hlc.Timestamp
-	recordMetrics recordEmittedMessagesCallback
+	created     time.Time
+	codec       io.WriteCloser
+	rawSize     int
+	numMessages int
+	buf         bytes.Buffer
+	alloc       kvevent.Alloc
+	oldestMVCC  hlc.Timestamp
 }
 
 var _ io.Writer = &cloudStorageSinkFile{}
@@ -281,6 +284,7 @@ type cloudStorageSink struct {
 	targetMaxFileSize int64
 	settings          *cluster.Settings
 	partitionFormat   string
+	topicNamer        *TopicNamer
 
 	ext          string
 	rowDelimiter []byte
@@ -345,6 +349,15 @@ func makeCloudStorageSink(
 	if err != nil {
 		return nil, err
 	}
+
+	// Using + rather than . here because some consumers may be relying on there being exactly
+	// one '.' in the filepath, and '+' shares with '-' the useful property of being
+	// lexicographically earlier than '.'.
+	tn, err := MakeTopicNamer([]jobspb.ChangefeedTargetSpecification{}, WithJoinByte('+'))
+	if err != nil {
+		return nil, err
+	}
+
 	s := &cloudStorageSink{
 		srcID:             srcID,
 		sinkID:            sinkID,
@@ -356,6 +369,7 @@ func makeCloudStorageSink(
 		// TODO(dan,ajwerner): Use the jobs framework's session ID once that's available.
 		jobSessionID: sessID,
 		metrics:      m,
+		topicNamer:   tn,
 	}
 
 	if partitionFormat := u.consumeParam(changefeedbase.SinkParamPartitionFormat); partitionFormat != "" {
@@ -413,7 +427,8 @@ func makeCloudStorageSink(
 func (s *cloudStorageSink) getOrCreateFile(
 	topic TopicDescriptor, eventMVCC hlc.Timestamp,
 ) *cloudStorageSinkFile {
-	key := cloudStorageSinkKey{topic.GetName(), int64(topic.GetVersion())}
+	name, _ := s.topicNamer.Name(topic)
+	key := cloudStorageSinkKey{name, int64(topic.GetVersion())}
 	if item := s.files.Get(key); item != nil {
 		f := item.(*cloudStorageSinkFile)
 		if eventMVCC.Less(f.oldestMVCC) {
@@ -422,8 +437,8 @@ func (s *cloudStorageSink) getOrCreateFile(
 		return f
 	}
 	f := &cloudStorageSinkFile{
+		created:             timeutil.Now(),
 		cloudStorageSinkKey: key,
-		recordMetrics:       s.metrics.recordEmittedMessages(),
 		oldestMVCC:          eventMVCC,
 	}
 	switch s.compression {
@@ -446,6 +461,7 @@ func (s *cloudStorageSink) EmitRow(
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
 
+	s.metrics.recordMessageSize(int64(len(key) + len(value)))
 	file := s.getOrCreateFile(topic, mvcc)
 	file.alloc.Merge(&alloc)
 
@@ -586,7 +602,7 @@ func (s *cloudStorageSink) flushFile(ctx context.Context, file *cloudStorageSink
 	if err := cloud.WriteFile(ctx, s.es, filepath.Join(s.dataFilePartition, filename), bytes.NewReader(file.buf.Bytes())); err != nil {
 		return err
 	}
-	file.recordMetrics(file.numMessages, file.oldestMVCC, file.rawSize, compressedBytes)
+	s.metrics.recordEmittedBatch(file.created, file.numMessages, file.oldestMVCC, file.rawSize, compressedBytes)
 
 	return nil
 }

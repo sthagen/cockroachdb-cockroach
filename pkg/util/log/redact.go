@@ -138,11 +138,6 @@ func maybeRedactEntry(payload entryPayload, editor redactEditor) (res entryPaylo
 	return res
 }
 
-// Safe constructs a SafeFormatter / SafeMessager.
-// This is obsolete. Use redact.Safe directly.
-// TODO(knz): Remove this.
-var Safe = redact.Safe
-
 func init() {
 	// We consider booleans and numeric values to be always safe for
 	// reporting. A log call can opt out by using redact.Unsafe() around
@@ -204,4 +199,14 @@ func TestingSetRedactable(redactableLogs bool) (cleanup func()) {
 			debugLog.sinkInfos[i].editor = e
 		}
 	}
+}
+
+// SafeOperational is a transparent wrapper around `redact.Safe` that
+// acts as documentation for *why* the object is being marked as safe.
+// In this case, the intent is to label this piece of information as
+// "operational" data which is helpful for telemetry and operator
+// actions. Typically, this includes schema structure and information
+// about internals that is *not* user data or derived from user data.
+func SafeOperational(s interface{}) redact.SafeValue {
+	return redact.Safe(s)
 }

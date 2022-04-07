@@ -42,7 +42,6 @@ import {
   statisticsTableTitles,
   NodeNames,
   StatisticType,
-  formatAggregationIntervalColumn,
 } from "../statsTableUtil/statsTableUtil";
 
 type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
@@ -92,17 +91,6 @@ function makeCommonColumns(
   const retryBar = retryBarChart(statements, defaultBarChartOptions);
 
   return [
-    {
-      name: "aggregationInterval",
-      title: statisticsTableTitles.aggregationInterval(statType),
-      className: cx("statements-table__interval_time"),
-      cell: (stmt: AggregateStatistics) =>
-        formatAggregationIntervalColumn(
-          stmt.aggregatedTs,
-          stmt.aggregationInterval,
-        ),
-      sort: (stmt: AggregateStatistics) => stmt.aggregatedTs,
-    },
     {
       name: "executionCount",
       title: statisticsTableTitles.executionCount(statType),
@@ -225,7 +213,10 @@ export interface AggregateStatistics {
 
 export class StatementsSortedTable extends SortedTable<AggregateStatistics> {}
 
-export function shortStatement(summary: StatementSummary, original: string) {
+export function shortStatement(
+  summary: StatementSummary,
+  original: string,
+): string {
   switch (summary.statement) {
     case "update":
       return "UPDATE " + summary.table;
@@ -246,7 +237,7 @@ export function shortStatement(summary: StatementSummary, original: string) {
 
 export function makeStatementFingerprintColumn(
   statType: StatisticType,
-  selectedApp: string,
+  selectedApps: string[],
   search?: string,
   onStatementClick?: (statement: string) => void,
 ): ColumnDescriptor<AggregateStatistics> {
@@ -254,7 +245,7 @@ export function makeStatementFingerprintColumn(
     name: "statements",
     title: statisticsTableTitles.statements(statType),
     className: cx("cl-table__col-query-text"),
-    cell: StatementTableCell.statements(search, selectedApp, onStatementClick),
+    cell: StatementTableCell.statements(search, selectedApps, onStatementClick),
     sort: stmt => stmt.label,
     alwaysShow: true,
   };
@@ -262,7 +253,7 @@ export function makeStatementFingerprintColumn(
 
 export function makeStatementsColumns(
   statements: AggregateStatistics[],
-  selectedApp: string,
+  selectedApps: string[],
   // totalWorkload is the sum of service latency of all statements listed on the table.
   totalWorkload: number,
   nodeRegions: { [nodeId: string]: string },
@@ -271,13 +262,15 @@ export function makeStatementsColumns(
   hasViewActivityRedactedRole: boolean,
   search?: string,
   activateDiagnosticsRef?: React.RefObject<ActivateDiagnosticsModalRef>,
-  onDiagnosticsDownload?: (report: IStatementDiagnosticsReport) => void,
+  onSelectDiagnosticsReportDropdownOption?: (
+    report: IStatementDiagnosticsReport,
+  ) => void,
   onStatementClick?: (statement: string) => void,
 ): ColumnDescriptor<AggregateStatistics>[] {
   const columns: ColumnDescriptor<AggregateStatistics>[] = [
     makeStatementFingerprintColumn(
       statType,
-      selectedApp,
+      selectedApps,
       search,
       onStatementClick,
     ),
@@ -292,7 +285,7 @@ export function makeStatementsColumns(
       title: statisticsTableTitles.diagnostics(statType),
       cell: StatementTableCell.diagnostics(
         activateDiagnosticsRef,
-        onDiagnosticsDownload,
+        onSelectDiagnosticsReportDropdownOption,
       ),
       sort: stmt => {
         if (stmt.diagnosticsReports?.length > 0) {

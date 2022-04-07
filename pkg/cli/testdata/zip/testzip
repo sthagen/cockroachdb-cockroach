@@ -23,6 +23,9 @@ debug zip --concurrency=1 --cpu-profile-duration=1s /dev/null
 [cluster] retrieving SQL data for system.namespace... writing output: debug/system.namespace.txt... done
 [cluster] retrieving SQL data for system.scheduled_jobs... writing output: debug/system.scheduled_jobs.txt... done
 [cluster] retrieving SQL data for system.settings... writing output: debug/system.settings.txt... done
+[cluster] retrieving SQL data for system.replication_stats... writing output: debug/system.replication_stats.txt... done
+[cluster] retrieving SQL data for system.replication_critical_localities... writing output: debug/system.replication_critical_localities.txt... done
+[cluster] retrieving SQL data for system.replication_constraint_stats... writing output: debug/system.replication_constraint_stats.txt... done
 [cluster] retrieving SQL data for "".crdb_internal.create_schema_statements... writing output: debug/crdb_internal.create_schema_statements.txt... done
 [cluster] retrieving SQL data for "".crdb_internal.create_statements... writing output: debug/crdb_internal.create_statements.txt... done
 [cluster] retrieving SQL data for "".crdb_internal.create_type_statements... writing output: debug/crdb_internal.create_type_statements.txt... done
@@ -31,13 +34,18 @@ debug zip --concurrency=1 --cpu-profile-duration=1s /dev/null
 [cluster] retrieving SQL data for crdb_internal.kv_store_status... writing output: debug/crdb_internal.kv_store_status.txt... done
 [cluster] retrieving SQL data for crdb_internal.regions... writing output: debug/crdb_internal.regions.txt... done
 [cluster] retrieving SQL data for crdb_internal.schema_changes... writing output: debug/crdb_internal.schema_changes.txt... done
+[cluster] retrieving SQL data for crdb_internal.super_regions... writing output: debug/crdb_internal.super_regions.txt... done
 [cluster] retrieving SQL data for crdb_internal.partitions... writing output: debug/crdb_internal.partitions.txt... done
 [cluster] retrieving SQL data for crdb_internal.zones... writing output: debug/crdb_internal.zones.txt... done
 [cluster] retrieving SQL data for crdb_internal.invalid_objects... writing output: debug/crdb_internal.invalid_objects.txt... done
 [cluster] retrieving SQL data for crdb_internal.index_usage_statistics... writing output: debug/crdb_internal.index_usage_statistics.txt... done
 [cluster] retrieving SQL data for crdb_internal.table_indexes... writing output: debug/crdb_internal.table_indexes.txt... done
+[cluster] retrieving SQL data for crdb_internal.transaction_contention_events... writing output: debug/crdb_internal.transaction_contention_events.txt... done
 [cluster] requesting nodes... received response... converting to JSON... writing binary output: debug/nodes.json... done
 [cluster] requesting liveness... received response... converting to JSON... writing binary output: debug/liveness.json... done
+[cluster] requesting tenant ranges... received response...
+[cluster] requesting tenant ranges: last request failed: rpc error: ...
+[cluster] requesting tenant ranges: creating error output: debug/tenant_ranges.err.txt... done
 [cluster] requesting CPU profiles
 [cluster] profiles generated
 [cluster] profile for node 1... writing binary output: debug/nodes/1/cpu.pprof... done
@@ -75,7 +83,7 @@ debug zip --concurrency=1 --cpu-profile-duration=1s /dev/null
 [node 1] requesting log file ...
 [node 1] 0 log file ...
 [node 1] requesting ranges... received response... done
-[node 1] 43 ranges found
+[node 1] 44 ranges found
 [node 1] writing range 1... converting to JSON... writing binary output: debug/nodes/1/ranges/1.json... done
 [node 1] writing range 2... converting to JSON... writing binary output: debug/nodes/1/ranges/2.json... done
 [node 1] writing range 3... converting to JSON... writing binary output: debug/nodes/1/ranges/3.json... done
@@ -119,5 +127,7 @@ debug zip --concurrency=1 --cpu-profile-duration=1s /dev/null
 [node 1] writing range 41... converting to JSON... writing binary output: debug/nodes/1/ranges/41.json... done
 [node 1] writing range 42... converting to JSON... writing binary output: debug/nodes/1/ranges/42.json... done
 [node 1] writing range 43... converting to JSON... writing binary output: debug/nodes/1/ranges/43.json... done
+[node 1] writing range 44... converting to JSON... writing binary output: debug/nodes/1/ranges/44.json... done
 [cluster] pprof summary script... writing binary output: debug/pprof-summary.sh... done
 [cluster] hot range summary script... writing binary output: debug/hot-ranges.sh... done
+[cluster] tenant hot range summary script... writing binary output: debug/hot-ranges-tenant.sh... done

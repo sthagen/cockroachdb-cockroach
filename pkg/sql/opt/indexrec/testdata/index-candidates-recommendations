@@ -245,7 +245,7 @@ project
            │    ├── columns: k:1 i:2 f:3 rowid:5!null
            │    ├── left columns: k:8 i:9 f:10 rowid:12
            │    ├── right columns: k:15 i:16 f:17 rowid:19
-           │    ├── cost: 764.534444
+           │    ├── cost: 764.534445
            │    ├── select
            │    │    ├── columns: k:8!null i:9!null f:10 rowid:12!null
            │    │    ├── cost: 380.716667
@@ -290,7 +290,7 @@ Optimal Plan.
 scan t1@_hyp_1
  ├── columns: s:4!null
  ├── constraint: /4/5: [/'NG' - /'NG']
- ├── cost: 24.62
+ ├── cost: 24.6200001
  └── fd: ()-->(4)
 
 index-candidates
@@ -454,7 +454,7 @@ union-all
  ├── columns: k:15!null
  ├── left columns: t1.k:1
  ├── right columns: t1.k:8
- ├── cost: 741.393333
+ ├── cost: 741.393334
  ├── ordering: -15
  ├── scan t1@_hyp_1
  │    ├── columns: t1.k:1!null
@@ -607,7 +607,7 @@ left-join (cross)
  ├── scan t2@_hyp_1
  │    ├── columns: t2.k:8 t2.i:9
  │    ├── constraint: /9/11: [/NULL - /NULL]
- │    ├── cost: 24.6200001
+ │    ├── cost: 24.6200002
  │    └── fd: ()-->(9)
  └── filters
       ├── t1.k:1 != t2.k:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ])]
@@ -696,7 +696,7 @@ inner-join (zigzag t1@_hyp_1 t1@_hyp_2)
  ├── eq columns: [5] = [5]
  ├── left fixed columns: [1] = [1]
  ├── right fixed columns: [2] = [2]
- ├── cost: 11.8278162
+ ├── cost: 10.6474054
  ├── fd: ()-->(1,2)
  └── filters
       ├── k:1 = 1 [outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
@@ -1344,7 +1344,7 @@ Optimal Plan.
 project
  ├── columns: k:1!null f:3
  ├── immutable
- ├── cost: 22.11
+ ├── cost: 22.1100001
  ├── fd: ()-->(1)
  └── select
       ├── columns: t4.k:1!null f:3 j:4
@@ -1541,11 +1541,11 @@ Optimal Plan.
 project
  ├── columns: k:1 f:3
  ├── immutable
- ├── cost: 21.992
+ ├── cost: 21.9920001
  └── index-join t4
       ├── columns: t4.k:1 i:2!null f:3 a:5!null
       ├── immutable
-      ├── cost: 21.961
+      ├── cost: 21.9610001
       ├── fd: ()-->(2)
       └── scan t4@_hyp_3
            ├── columns: rowid:6!null
@@ -1604,7 +1604,7 @@ Optimal Plan.
 index-join t4
  ├── columns: k:1!null j:4
  ├── immutable
- ├── cost: 21.9622222
+ ├── cost: 21.9622223
  ├── fd: ()-->(1)
  └── scan t4@inverted
       ├── columns: rowid:6!null
@@ -1677,17 +1677,17 @@ Optimal Plan.
 project
  ├── columns: j:4
  ├── immutable
- ├── cost: 21.9822222
+ ├── cost: 21.9822223
  └── index-join t4
       ├── columns: i:2!null j:4
       ├── immutable
-      ├── cost: 21.9511111
+      ├── cost: 21.9511112
       ├── fd: ()-->(2)
       └── scan t4@partial_inverted_idx,partial
            ├── columns: rowid:6!null
            ├── inverted constraint: /10/6
            │    └── spans: ["7a\x00\x01*\x02\x00", "7a\x00\x01*\x02\x00"]
-           ├── cost: 15.1644444
+           ├── cost: 15.1644445
            └── key: (6)
 
 # Ensure that we don't recommend replacing partial indexes, partial unique

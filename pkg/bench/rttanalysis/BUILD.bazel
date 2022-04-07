@@ -13,7 +13,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/kv/kvclient/kvcoord:with-mocks",
+        "//pkg/kv/kvclient/kvcoord",
         "//pkg/sql",
         "//pkg/testutils",
         "//pkg/testutils/skip",
@@ -49,6 +49,7 @@ go_test(
     ],
     data = glob(["testdata/**"]),
     embed = [":rttanalysis"],
+    shard_count = 16,
     deps = [
         "//pkg/base",
         "//pkg/security",

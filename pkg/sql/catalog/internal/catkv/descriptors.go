@@ -13,6 +13,7 @@ package catkv
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -27,7 +28,7 @@ import (
 // GetCatalogUnvalidated looks up and returns all available descriptors and
 // namespace system table entries but does not validate anything.
 func GetCatalogUnvalidated(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
+	ctx context.Context, codec keys.SQLCodec, txn *kv.Txn,
 ) (nstree.Catalog, error) {
 	cq := catalogQuerier{
 		isRequired:   true,
@@ -47,20 +48,27 @@ func GetCatalogUnvalidated(
 }
 
 func lookupDescriptorsAndValidate(
-	ctx context.Context, txn *kv.Txn, cq catalogQuerier, ids []descpb.ID,
+	ctx context.Context,
+	version clusterversion.ClusterVersion,
+	txn *kv.Txn,
+	cq catalogQuerier,
+	vd validate.ValidationDereferencer,
+	ids []descpb.ID,
 ) ([]catalog.Descriptor, error) {
 	descs, err := lookupDescriptorsUnvalidated(ctx, txn, cq, ids)
 	if err != nil || len(descs) == 0 {
 		return nil, err
 	}
-	rvd := &readValidationDereferencer{
-		catalogQuerier: catalogQuerier{
-			expectedType: catalog.Any,
-			codec:        cq.codec,
-		},
-		txn: txn,
+	if vd == nil {
+		vd = &readValidationDereferencer{
+			catalogQuerier: catalogQuerier{
+				expectedType: catalog.Any,
+				codec:        cq.codec,
+			},
+			txn: txn,
+		}
 	}
-	ve := validate.Validate(ctx, rvd, catalog.ValidationReadTelemetry, catalog.ValidationLevelCrossReferences, descs...)
+	ve := validate.Validate(ctx, version, vd, catalog.ValidationReadTelemetry, catalog.ValidationLevelCrossReferences, descs...)
 	if err := ve.CombinedError(); err != nil {
 		return nil, err
 	}
@@ -77,9 +85,9 @@ var _ validate.ValidationDereferencer = (*readValidationDereferencer)(nil)
 // DereferenceDescriptors implements the validate.ValidationDereferencer
 // interface.
 func (t *readValidationDereferencer) DereferenceDescriptors(
-	ctx context.Context, reqs []descpb.ID,
+	ctx context.Context, version clusterversion.ClusterVersion, reqs []descpb.ID,
 ) ([]catalog.Descriptor, error) {
-	return GetCrossReferencedDescriptorsForValidation(ctx, t.txn, t.codec, reqs)
+	return GetCrossReferencedDescriptorsForValidation(ctx, version, t.codec, t.txn, reqs)
 }
 
 // DereferenceDescriptorIDs implements the validate.ValidationDereferencer
@@ -95,7 +103,11 @@ func (t *readValidationDereferencer) DereferenceDescriptorIDs(
 // consistent.
 // These can then be used for cross-reference validation of another descriptor.
 func GetCrossReferencedDescriptorsForValidation(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, ids []descpb.ID,
+	ctx context.Context,
+	version clusterversion.ClusterVersion,
+	codec keys.SQLCodec,
+	txn *kv.Txn,
+	ids []descpb.ID,
 ) ([]catalog.Descriptor, error) {
 	cq := catalogQuerier{
 		expectedType: catalog.Any,
@@ -105,7 +117,7 @@ func GetCrossReferencedDescriptorsForValidation(
 	if err != nil || len(descs) == 0 {
 		return nil, err
 	}
-	if err := validate.Self(descs...); err != nil {
+	if err := validate.Self(version, descs...); err != nil {
 		return nil, err
 	}
 	return descs, nil
@@ -115,8 +127,10 @@ func GetCrossReferencedDescriptorsForValidation(
 // returning nil if the descriptor is not found.
 func MaybeGetDescriptorByID(
 	ctx context.Context,
-	txn *kv.Txn,
+	version clusterversion.ClusterVersion,
 	codec keys.SQLCodec,
+	txn *kv.Txn,
+	vd validate.ValidationDereferencer,
 	id descpb.ID,
 	expectedType catalog.DescriptorType,
 ) (catalog.Descriptor, error) {
@@ -124,7 +138,7 @@ func MaybeGetDescriptorByID(
 		expectedType: expectedType,
 		codec:        codec,
 	}
-	descs, err := lookupDescriptorsAndValidate(ctx, txn, cq, []descpb.ID{id})
+	descs, err := lookupDescriptorsAndValidate(ctx, version, txn, cq, vd, []descpb.ID{id})
 	if err != nil {
 		return nil, err
 	}
@@ -135,8 +149,10 @@ func MaybeGetDescriptorByID(
 // returning an error if any descriptor is not found.
 func MustGetDescriptorsByID(
 	ctx context.Context,
-	txn *kv.Txn,
+	version clusterversion.ClusterVersion,
 	codec keys.SQLCodec,
+	txn *kv.Txn,
+	vd validate.ValidationDereferencer,
 	ids []descpb.ID,
 	expectedType catalog.DescriptorType,
 ) ([]catalog.Descriptor, error) {
@@ -145,19 +161,21 @@ func MustGetDescriptorsByID(
 		isRequired:   true,
 		expectedType: expectedType,
 	}
-	return lookupDescriptorsAndValidate(ctx, txn, cq, ids)
+	return lookupDescriptorsAndValidate(ctx, version, txn, cq, vd, ids)
 }
 
 // MustGetDescriptorByID looks up the descriptor given its ID,
 // returning an error if the descriptor is not found.
 func MustGetDescriptorByID(
 	ctx context.Context,
-	txn *kv.Txn,
+	version clusterversion.ClusterVersion,
 	codec keys.SQLCodec,
+	txn *kv.Txn,
+	vd validate.ValidationDereferencer,
 	id descpb.ID,
 	expectedType catalog.DescriptorType,
 ) (catalog.Descriptor, error) {
-	descs, err := MustGetDescriptorsByID(ctx, txn, codec, []descpb.ID{id}, expectedType)
+	descs, err := MustGetDescriptorsByID(ctx, version, codec, txn, vd, []descpb.ID{id}, expectedType)
 	if err != nil {
 		return nil, err
 	}

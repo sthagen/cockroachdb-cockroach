@@ -234,7 +234,10 @@ SELECT * FROM regression_47030
 1
 
 statement ok
-TRUNCATE regression_47030; INSERT INTO regression_47030 VALUES (2)
+TRUNCATE regression_47030
+
+statement ok
+INSERT INTO regression_47030 VALUES (2)
 
 query I
 SELECT * FROM regression_47030
@@ -253,7 +256,7 @@ ALTER TABLE regression_48233 RENAME TO reg_48233
 query IITI rowsort
 SELECT * FROM system.namespace WHERE name LIKE '%48233'
 ----
-50  69  reg_48233  82
+100  119  reg_48233  132
 
 statement error pq: cannot change schema of table with RENAME
 ALTER TABLE reg_48233 RENAME TO public.reg_48233

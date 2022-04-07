@@ -20,12 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -63,11 +64,6 @@ func (p projBitandInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -133,9 +129,6 @@ func (p projBitandInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -159,11 +152,6 @@ func (p projBitandInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -229,9 +217,6 @@ func (p projBitandInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -255,11 +240,6 @@ func (p projBitandInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -325,9 +305,6 @@ func (p projBitandInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -351,11 +328,6 @@ func (p projBitandInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -421,9 +393,6 @@ func (p projBitandInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -447,11 +416,6 @@ func (p projBitandInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -517,9 +481,6 @@ func (p projBitandInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -543,11 +504,6 @@ func (p projBitandInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -613,9 +569,6 @@ func (p projBitandInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -639,11 +592,6 @@ func (p projBitandInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -709,9 +657,6 @@ func (p projBitandInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -735,11 +680,6 @@ func (p projBitandInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -805,9 +745,6 @@ func (p projBitandInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -831,11 +768,6 @@ func (p projBitandInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -901,23 +833,17 @@ func (p projBitandInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projBitandDatumConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projBitandDatumConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -932,11 +858,6 @@ func (p projBitandDatumConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1028,9 +949,6 @@ func (p projBitandDatumConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1054,11 +972,6 @@ func (p projBitorInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1124,9 +1037,6 @@ func (p projBitorInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1150,11 +1060,6 @@ func (p projBitorInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1220,9 +1125,6 @@ func (p projBitorInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1246,11 +1148,6 @@ func (p projBitorInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1316,9 +1213,6 @@ func (p projBitorInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1342,11 +1236,6 @@ func (p projBitorInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1412,9 +1301,6 @@ func (p projBitorInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1438,11 +1324,6 @@ func (p projBitorInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1508,9 +1389,6 @@ func (p projBitorInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1534,11 +1412,6 @@ func (p projBitorInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1604,9 +1477,6 @@ func (p projBitorInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1630,11 +1500,6 @@ func (p projBitorInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1700,9 +1565,6 @@ func (p projBitorInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1726,11 +1588,6 @@ func (p projBitorInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1796,9 +1653,6 @@ func (p projBitorInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -1822,11 +1676,6 @@ func (p projBitorInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -1892,23 +1741,17 @@ func (p projBitorInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projBitorDatumConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projBitorDatumConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -1923,11 +1766,6 @@ func (p projBitorDatumConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2019,9 +1857,6 @@ func (p projBitorDatumConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2045,11 +1880,6 @@ func (p projBitxorInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2115,9 +1945,6 @@ func (p projBitxorInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2141,11 +1968,6 @@ func (p projBitxorInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2211,9 +2033,6 @@ func (p projBitxorInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2237,11 +2056,6 @@ func (p projBitxorInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2307,9 +2121,6 @@ func (p projBitxorInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2333,11 +2144,6 @@ func (p projBitxorInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2403,9 +2209,6 @@ func (p projBitxorInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2429,11 +2232,6 @@ func (p projBitxorInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2499,9 +2297,6 @@ func (p projBitxorInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2525,11 +2320,6 @@ func (p projBitxorInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2595,9 +2385,6 @@ func (p projBitxorInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2621,11 +2408,6 @@ func (p projBitxorInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2691,9 +2473,6 @@ func (p projBitxorInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2717,11 +2496,6 @@ func (p projBitxorInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2787,9 +2561,6 @@ func (p projBitxorInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -2813,11 +2584,6 @@ func (p projBitxorInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -2883,23 +2649,17 @@ func (p projBitxorInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projBitxorDatumConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projBitxorDatumConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -2914,11 +2674,6 @@ func (p projBitxorDatumConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3010,9 +2765,6 @@ func (p projBitxorDatumConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3036,11 +2788,6 @@ func (p projPlusDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3134,9 +2881,6 @@ func (p projPlusDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3160,11 +2904,6 @@ func (p projPlusDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3258,9 +2997,6 @@ func (p projPlusDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3284,11 +3020,6 @@ func (p projPlusDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3382,9 +3113,6 @@ func (p projPlusDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3408,11 +3136,6 @@ func (p projPlusDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3502,9 +3225,6 @@ func (p projPlusDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3528,11 +3248,6 @@ func (p projPlusInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3622,9 +3337,6 @@ func (p projPlusInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3648,11 +3360,6 @@ func (p projPlusInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3742,9 +3449,6 @@ func (p projPlusInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3768,11 +3472,6 @@ func (p projPlusInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3862,9 +3561,6 @@ func (p projPlusInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -3888,11 +3584,6 @@ func (p projPlusInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -3990,23 +3681,17 @@ func (p projPlusInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusInt16ConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg int16
 }
 
 func (p projPlusInt16ConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -4021,11 +3706,6 @@ func (p projPlusInt16ConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4135,9 +3815,6 @@ func (p projPlusInt16ConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -4161,11 +3838,6 @@ func (p projPlusInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4255,9 +3927,6 @@ func (p projPlusInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -4281,11 +3950,6 @@ func (p projPlusInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4375,9 +4039,6 @@ func (p projPlusInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -4401,11 +4062,6 @@ func (p projPlusInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4495,9 +4151,6 @@ func (p projPlusInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -4521,11 +4174,6 @@ func (p projPlusInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4623,23 +4271,17 @@ func (p projPlusInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusInt32ConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg int32
 }
 
 func (p projPlusInt32ConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -4654,11 +4296,6 @@ func (p projPlusInt32ConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4768,9 +4405,6 @@ func (p projPlusInt32ConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -4794,11 +4428,6 @@ func (p projPlusInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -4888,9 +4517,6 @@ func (p projPlusInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -4914,11 +4540,6 @@ func (p projPlusInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5008,9 +4629,6 @@ func (p projPlusInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -5034,11 +4652,6 @@ func (p projPlusInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5128,9 +4741,6 @@ func (p projPlusInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -5154,11 +4764,6 @@ func (p projPlusInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5256,23 +4861,17 @@ func (p projPlusInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusInt64ConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg int64
 }
 
 func (p projPlusInt64ConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -5287,11 +4886,6 @@ func (p projPlusInt64ConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5401,9 +4995,6 @@ func (p projPlusInt64ConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -5427,11 +5018,6 @@ func (p projPlusFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5509,9 +5095,6 @@ func (p projPlusFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -5535,11 +5118,6 @@ func (p projPlusTimestampConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Timestamp()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5617,9 +5195,6 @@ func (p projPlusTimestampConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -5643,11 +5218,6 @@ func (p projPlusIntervalConstTimestampOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Timestamp()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5725,9 +5295,6 @@ func (p projPlusIntervalConstTimestampOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -5751,11 +5318,6 @@ func (p projPlusIntervalConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5813,23 +5375,17 @@ func (p projPlusIntervalConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusIntervalConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg duration.Duration
 }
 
 func (p projPlusIntervalConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -5844,11 +5400,6 @@ func (p projPlusIntervalConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -5958,23 +5509,17 @@ func (p projPlusIntervalConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusDatumConstIntervalOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projPlusDatumConstIntervalOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -5989,11 +5534,6 @@ func (p projPlusDatumConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6101,23 +5641,17 @@ func (p projPlusDatumConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusDatumConstInt16Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projPlusDatumConstInt16Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -6132,11 +5666,6 @@ func (p projPlusDatumConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6244,23 +5773,17 @@ func (p projPlusDatumConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusDatumConstInt32Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projPlusDatumConstInt32Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -6275,11 +5798,6 @@ func (p projPlusDatumConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6387,23 +5905,17 @@ func (p projPlusDatumConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projPlusDatumConstInt64Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projPlusDatumConstInt64Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -6418,11 +5930,6 @@ func (p projPlusDatumConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6530,9 +6037,6 @@ func (p projPlusDatumConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -6556,11 +6060,6 @@ func (p projMinusDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6654,9 +6153,6 @@ func (p projMinusDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -6680,11 +6176,6 @@ func (p projMinusDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6778,9 +6269,6 @@ func (p projMinusDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -6804,11 +6292,6 @@ func (p projMinusDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -6902,9 +6385,6 @@ func (p projMinusDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -6928,11 +6408,6 @@ func (p projMinusDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7022,9 +6497,6 @@ func (p projMinusDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7048,11 +6520,6 @@ func (p projMinusInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7142,9 +6609,6 @@ func (p projMinusInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7168,11 +6632,6 @@ func (p projMinusInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7262,9 +6721,6 @@ func (p projMinusInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7288,11 +6744,6 @@ func (p projMinusInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7382,9 +6833,6 @@ func (p projMinusInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7408,11 +6856,6 @@ func (p projMinusInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7510,23 +6953,17 @@ func (p projMinusInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusInt16ConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg int16
 }
 
 func (p projMinusInt16ConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -7541,11 +6978,6 @@ func (p projMinusInt16ConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7655,9 +7087,6 @@ func (p projMinusInt16ConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7681,11 +7110,6 @@ func (p projMinusInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7775,9 +7199,6 @@ func (p projMinusInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7801,11 +7222,6 @@ func (p projMinusInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -7895,9 +7311,6 @@ func (p projMinusInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -7921,11 +7334,6 @@ func (p projMinusInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8015,9 +7423,6 @@ func (p projMinusInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -8041,11 +7446,6 @@ func (p projMinusInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8143,23 +7543,17 @@ func (p projMinusInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusInt32ConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg int32
 }
 
 func (p projMinusInt32ConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -8174,11 +7568,6 @@ func (p projMinusInt32ConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8288,9 +7677,6 @@ func (p projMinusInt32ConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -8314,11 +7700,6 @@ func (p projMinusInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8408,9 +7789,6 @@ func (p projMinusInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -8434,11 +7812,6 @@ func (p projMinusInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8528,9 +7901,6 @@ func (p projMinusInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -8554,11 +7924,6 @@ func (p projMinusInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8648,9 +8013,6 @@ func (p projMinusInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -8674,11 +8036,6 @@ func (p projMinusInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8776,23 +8133,17 @@ func (p projMinusInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusInt64ConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg int64
 }
 
 func (p projMinusInt64ConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -8807,11 +8158,6 @@ func (p projMinusInt64ConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -8921,9 +8267,6 @@ func (p projMinusInt64ConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -8947,11 +8290,6 @@ func (p projMinusFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9029,9 +8367,6 @@ func (p projMinusFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9055,11 +8390,6 @@ func (p projMinusTimestampConstTimestampOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9129,9 +8459,6 @@ func (p projMinusTimestampConstTimestampOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9155,11 +8482,6 @@ func (p projMinusTimestampConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Timestamp()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9237,9 +8559,6 @@ func (p projMinusTimestampConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9263,11 +8582,6 @@ func (p projMinusIntervalConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9325,23 +8639,17 @@ func (p projMinusIntervalConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusIntervalConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg duration.Duration
 }
 
 func (p projMinusIntervalConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -9356,11 +8664,6 @@ func (p projMinusIntervalConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9470,9 +8773,6 @@ func (p projMinusIntervalConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9496,11 +8796,6 @@ func (p projMinusJSONConstBytesOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9592,9 +8887,6 @@ func (p projMinusJSONConstBytesOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9618,11 +8910,6 @@ func (p projMinusJSONConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9698,9 +8985,6 @@ func (p projMinusJSONConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9724,11 +9008,6 @@ func (p projMinusJSONConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9804,9 +9083,6 @@ func (p projMinusJSONConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -9830,11 +9106,6 @@ func (p projMinusJSONConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -9910,23 +9181,17 @@ func (p projMinusJSONConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusDatumConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projMinusDatumConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -9941,11 +9206,6 @@ func (p projMinusDatumConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10037,23 +9297,17 @@ func (p projMinusDatumConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusDatumConstIntervalOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projMinusDatumConstIntervalOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -10068,11 +9322,6 @@ func (p projMinusDatumConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10180,23 +9429,17 @@ func (p projMinusDatumConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusDatumConstBytesOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projMinusDatumConstBytesOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -10211,11 +9454,6 @@ func (p projMinusDatumConstBytesOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10323,23 +9561,17 @@ func (p projMinusDatumConstBytesOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusDatumConstInt16Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projMinusDatumConstInt16Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -10354,11 +9586,6 @@ func (p projMinusDatumConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10466,23 +9693,17 @@ func (p projMinusDatumConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusDatumConstInt32Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projMinusDatumConstInt32Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -10497,11 +9718,6 @@ func (p projMinusDatumConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10609,23 +9825,17 @@ func (p projMinusDatumConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projMinusDatumConstInt64Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projMinusDatumConstInt64Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -10640,11 +9850,6 @@ func (p projMinusDatumConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10752,9 +9957,6 @@ func (p projMinusDatumConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -10778,11 +9980,6 @@ func (p projMultDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -10876,9 +10073,6 @@ func (p projMultDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -10902,11 +10096,6 @@ func (p projMultDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11000,9 +10189,6 @@ func (p projMultDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11026,11 +10212,6 @@ func (p projMultDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11124,9 +10305,6 @@ func (p projMultDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11150,11 +10328,6 @@ func (p projMultDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11244,9 +10417,6 @@ func (p projMultDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11270,11 +10440,6 @@ func (p projMultDecimalConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11352,9 +10517,6 @@ func (p projMultDecimalConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11378,11 +10540,6 @@ func (p projMultInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11504,9 +10661,6 @@ func (p projMultInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11530,11 +10684,6 @@ func (p projMultInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11656,9 +10805,6 @@ func (p projMultInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11682,11 +10828,6 @@ func (p projMultInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11808,9 +10949,6 @@ func (p projMultInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11834,11 +10972,6 @@ func (p projMultInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -11936,9 +11069,6 @@ func (p projMultInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -11962,11 +11092,6 @@ func (p projMultInt16ConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12024,9 +11149,6 @@ func (p projMultInt16ConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12050,11 +11172,6 @@ func (p projMultInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12176,9 +11293,6 @@ func (p projMultInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12202,11 +11316,6 @@ func (p projMultInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12328,9 +11437,6 @@ func (p projMultInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12354,11 +11460,6 @@ func (p projMultInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12480,9 +11581,6 @@ func (p projMultInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12506,11 +11604,6 @@ func (p projMultInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12608,9 +11701,6 @@ func (p projMultInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12634,11 +11724,6 @@ func (p projMultInt32ConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12696,9 +11781,6 @@ func (p projMultInt32ConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12722,11 +11804,6 @@ func (p projMultInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -12848,9 +11925,6 @@ func (p projMultInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -12874,11 +11948,6 @@ func (p projMultInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13000,9 +12069,6 @@ func (p projMultInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13026,11 +12092,6 @@ func (p projMultInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13152,9 +12213,6 @@ func (p projMultInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13178,11 +12236,6 @@ func (p projMultInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13280,9 +12333,6 @@ func (p projMultInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13306,11 +12356,6 @@ func (p projMultInt64ConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13368,9 +12413,6 @@ func (p projMultInt64ConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13394,11 +12436,6 @@ func (p projMultFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13476,9 +12513,6 @@ func (p projMultFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13502,11 +12536,6 @@ func (p projMultFloat64ConstIntervalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13564,9 +12593,6 @@ func (p projMultFloat64ConstIntervalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13590,11 +12616,6 @@ func (p projMultIntervalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13652,9 +12673,6 @@ func (p projMultIntervalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13678,11 +12696,6 @@ func (p projMultIntervalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13740,9 +12753,6 @@ func (p projMultIntervalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13766,11 +12776,6 @@ func (p projMultIntervalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13828,9 +12833,6 @@ func (p projMultIntervalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13854,11 +12856,6 @@ func (p projMultIntervalConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -13916,9 +12913,6 @@ func (p projMultIntervalConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -13942,11 +12936,6 @@ func (p projMultIntervalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14024,9 +13013,6 @@ func (p projMultIntervalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14050,11 +13036,6 @@ func (p projDivDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14164,9 +13145,6 @@ func (p projDivDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14190,11 +13168,6 @@ func (p projDivDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14304,9 +13277,6 @@ func (p projDivDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14330,11 +13300,6 @@ func (p projDivDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14444,9 +13409,6 @@ func (p projDivDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14470,11 +13432,6 @@ func (p projDivDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14580,9 +13537,6 @@ func (p projDivDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14606,11 +13560,6 @@ func (p projDivInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14716,9 +13665,6 @@ func (p projDivInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14742,11 +13688,6 @@ func (p projDivInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14852,9 +13793,6 @@ func (p projDivInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -14878,11 +13816,6 @@ func (p projDivInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -14988,9 +13921,6 @@ func (p projDivInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15014,11 +13944,6 @@ func (p projDivInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15132,9 +14057,6 @@ func (p projDivInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15158,11 +14080,6 @@ func (p projDivInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15268,9 +14185,6 @@ func (p projDivInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15294,11 +14208,6 @@ func (p projDivInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15404,9 +14313,6 @@ func (p projDivInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15430,11 +14336,6 @@ func (p projDivInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15540,9 +14441,6 @@ func (p projDivInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15566,11 +14464,6 @@ func (p projDivInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15684,9 +14577,6 @@ func (p projDivInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15710,11 +14600,6 @@ func (p projDivInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15820,9 +14705,6 @@ func (p projDivInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15846,11 +14728,6 @@ func (p projDivInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -15956,9 +14833,6 @@ func (p projDivInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -15982,11 +14856,6 @@ func (p projDivInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16092,9 +14961,6 @@ func (p projDivInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16118,11 +14984,6 @@ func (p projDivInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16236,9 +15097,6 @@ func (p projDivInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16262,11 +15120,6 @@ func (p projDivFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16360,9 +15213,6 @@ func (p projDivFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16386,11 +15236,6 @@ func (p projDivIntervalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16464,9 +15309,6 @@ func (p projDivIntervalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16490,11 +15332,6 @@ func (p projDivIntervalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16568,9 +15405,6 @@ func (p projDivIntervalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16594,11 +15428,6 @@ func (p projDivIntervalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16672,9 +15501,6 @@ func (p projDivIntervalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16698,11 +15524,6 @@ func (p projDivIntervalConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Interval()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16776,9 +15597,6 @@ func (p projDivIntervalConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16802,11 +15620,6 @@ func (p projFloorDivDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -16916,9 +15729,6 @@ func (p projFloorDivDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -16942,11 +15752,6 @@ func (p projFloorDivDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17056,9 +15861,6 @@ func (p projFloorDivDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17082,11 +15884,6 @@ func (p projFloorDivDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17196,9 +15993,6 @@ func (p projFloorDivDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17222,11 +16016,6 @@ func (p projFloorDivDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17332,9 +16121,6 @@ func (p projFloorDivDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17358,11 +16144,6 @@ func (p projFloorDivInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17448,9 +16229,6 @@ func (p projFloorDivInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17474,11 +16252,6 @@ func (p projFloorDivInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17564,9 +16337,6 @@ func (p projFloorDivInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17590,11 +16360,6 @@ func (p projFloorDivInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17680,9 +16445,6 @@ func (p projFloorDivInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17706,11 +16468,6 @@ func (p projFloorDivInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17824,9 +16581,6 @@ func (p projFloorDivInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17850,11 +16604,6 @@ func (p projFloorDivInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -17940,9 +16689,6 @@ func (p projFloorDivInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -17966,11 +16712,6 @@ func (p projFloorDivInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18056,9 +16797,6 @@ func (p projFloorDivInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18082,11 +16820,6 @@ func (p projFloorDivInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18172,9 +16905,6 @@ func (p projFloorDivInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18198,11 +16928,6 @@ func (p projFloorDivInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18316,9 +17041,6 @@ func (p projFloorDivInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18342,11 +17064,6 @@ func (p projFloorDivInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18432,9 +17149,6 @@ func (p projFloorDivInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18458,11 +17172,6 @@ func (p projFloorDivInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18548,9 +17257,6 @@ func (p projFloorDivInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18574,11 +17280,6 @@ func (p projFloorDivInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18664,9 +17365,6 @@ func (p projFloorDivInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18690,11 +17388,6 @@ func (p projFloorDivInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18808,9 +17501,6 @@ func (p projFloorDivInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18834,11 +17524,6 @@ func (p projFloorDivFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -18932,9 +17617,6 @@ func (p projFloorDivFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -18958,11 +17640,6 @@ func (p projModDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19072,9 +17749,6 @@ func (p projModDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19098,11 +17772,6 @@ func (p projModDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19212,9 +17881,6 @@ func (p projModDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19238,11 +17904,6 @@ func (p projModDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19352,9 +18013,6 @@ func (p projModDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19378,11 +18036,6 @@ func (p projModDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19488,9 +18141,6 @@ func (p projModDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19514,11 +18164,6 @@ func (p projModInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19604,9 +18249,6 @@ func (p projModInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19630,11 +18272,6 @@ func (p projModInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19720,9 +18357,6 @@ func (p projModInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19746,11 +18380,6 @@ func (p projModInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19836,9 +18465,6 @@ func (p projModInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -19862,11 +18488,6 @@ func (p projModInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -19980,9 +18601,6 @@ func (p projModInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20006,11 +18624,6 @@ func (p projModInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20096,9 +18709,6 @@ func (p projModInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20122,11 +18732,6 @@ func (p projModInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20212,9 +18817,6 @@ func (p projModInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20238,11 +18840,6 @@ func (p projModInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20328,9 +18925,6 @@ func (p projModInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20354,11 +18948,6 @@ func (p projModInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20472,9 +19061,6 @@ func (p projModInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20498,11 +19084,6 @@ func (p projModInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20588,9 +19169,6 @@ func (p projModInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20614,11 +19192,6 @@ func (p projModInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20704,9 +19277,6 @@ func (p projModInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20730,11 +19300,6 @@ func (p projModInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20820,9 +19385,6 @@ func (p projModInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20846,11 +19408,6 @@ func (p projModInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -20964,9 +19521,6 @@ func (p projModInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -20990,11 +19544,6 @@ func (p projModFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21088,9 +19637,6 @@ func (p projModFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21114,11 +19660,6 @@ func (p projPowDecimalConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21212,9 +19753,6 @@ func (p projPowDecimalConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21238,11 +19776,6 @@ func (p projPowDecimalConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21336,9 +19869,6 @@ func (p projPowDecimalConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21362,11 +19892,6 @@ func (p projPowDecimalConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21460,9 +19985,6 @@ func (p projPowDecimalConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21486,11 +20008,6 @@ func (p projPowDecimalConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21580,9 +20097,6 @@ func (p projPowDecimalConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21606,11 +20120,6 @@ func (p projPowInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21724,9 +20233,6 @@ func (p projPowInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21750,11 +20256,6 @@ func (p projPowInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -21868,9 +20369,6 @@ func (p projPowInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -21894,11 +20392,6 @@ func (p projPowInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22012,9 +20505,6 @@ func (p projPowInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22038,11 +20528,6 @@ func (p projPowInt16ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22140,9 +20625,6 @@ func (p projPowInt16ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22166,11 +20648,6 @@ func (p projPowInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22284,9 +20761,6 @@ func (p projPowInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22310,11 +20784,6 @@ func (p projPowInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22428,9 +20897,6 @@ func (p projPowInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22454,11 +20920,6 @@ func (p projPowInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22572,9 +21033,6 @@ func (p projPowInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22598,11 +21056,6 @@ func (p projPowInt32ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22700,9 +21153,6 @@ func (p projPowInt32ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22726,11 +21176,6 @@ func (p projPowInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22844,9 +21289,6 @@ func (p projPowInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -22870,11 +21312,6 @@ func (p projPowInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -22988,9 +21425,6 @@ func (p projPowInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23014,11 +21448,6 @@ func (p projPowInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23132,9 +21561,6 @@ func (p projPowInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23158,11 +21584,6 @@ func (p projPowInt64ConstDecimalOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Decimal()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23260,9 +21681,6 @@ func (p projPowInt64ConstDecimalOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23286,11 +21704,6 @@ func (p projPowFloat64ConstFloat64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Float64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23368,9 +21781,6 @@ func (p projPowFloat64ConstFloat64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23394,11 +21804,6 @@ func (p projConcatBytesConstBytesOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Bytes()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23482,9 +21887,6 @@ func (p projConcatBytesConstBytesOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23508,11 +21910,6 @@ func (p projConcatJSONConstJSONOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23592,23 +21989,17 @@ func (p projConcatJSONConstJSONOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projConcatDatumConstDatumOp struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projConcatDatumConstDatumOp) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -23623,11 +22014,6 @@ func (p projConcatDatumConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23719,9 +22105,6 @@ func (p projConcatDatumConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23745,11 +22128,6 @@ func (p projLShiftInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23839,9 +22217,6 @@ func (p projLShiftInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23865,11 +22240,6 @@ func (p projLShiftInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -23959,9 +22329,6 @@ func (p projLShiftInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -23985,11 +22352,6 @@ func (p projLShiftInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24079,9 +22441,6 @@ func (p projLShiftInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -24105,11 +22464,6 @@ func (p projLShiftInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24199,9 +22553,6 @@ func (p projLShiftInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -24225,11 +22576,6 @@ func (p projLShiftInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24319,9 +22665,6 @@ func (p projLShiftInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -24345,11 +22688,6 @@ func (p projLShiftInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24439,9 +22777,6 @@ func (p projLShiftInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -24465,11 +22800,6 @@ func (p projLShiftInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24559,9 +22889,6 @@ func (p projLShiftInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -24585,11 +22912,6 @@ func (p projLShiftInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24679,9 +23001,6 @@ func (p projLShiftInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -24705,11 +23024,6 @@ func (p projLShiftInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24799,23 +23113,17 @@ func (p projLShiftInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projLShiftDatumConstInt16Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projLShiftDatumConstInt16Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -24830,11 +23138,6 @@ func (p projLShiftDatumConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -24942,23 +23245,17 @@ func (p projLShiftDatumConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projLShiftDatumConstInt32Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projLShiftDatumConstInt32Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -24973,11 +23270,6 @@ func (p projLShiftDatumConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25085,23 +23377,17 @@ func (p projLShiftDatumConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projLShiftDatumConstInt64Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projLShiftDatumConstInt64Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -25116,11 +23402,6 @@ func (p projLShiftDatumConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25228,9 +23509,6 @@ func (p projLShiftDatumConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25254,11 +23532,6 @@ func (p projRShiftInt16ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25348,9 +23621,6 @@ func (p projRShiftInt16ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25374,11 +23644,6 @@ func (p projRShiftInt16ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25468,9 +23733,6 @@ func (p projRShiftInt16ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25494,11 +23756,6 @@ func (p projRShiftInt16ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25588,9 +23845,6 @@ func (p projRShiftInt16ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25614,11 +23868,6 @@ func (p projRShiftInt32ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25708,9 +23957,6 @@ func (p projRShiftInt32ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25734,11 +23980,6 @@ func (p projRShiftInt32ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25828,9 +24069,6 @@ func (p projRShiftInt32ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25854,11 +24092,6 @@ func (p projRShiftInt32ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -25948,9 +24181,6 @@ func (p projRShiftInt32ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -25974,11 +24204,6 @@ func (p projRShiftInt64ConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26068,9 +24293,6 @@ func (p projRShiftInt64ConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -26094,11 +24316,6 @@ func (p projRShiftInt64ConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26188,9 +24405,6 @@ func (p projRShiftInt64ConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -26214,11 +24428,6 @@ func (p projRShiftInt64ConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Int64()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26308,23 +24517,17 @@ func (p projRShiftInt64ConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projRShiftDatumConstInt16Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projRShiftDatumConstInt16Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -26339,11 +24542,6 @@ func (p projRShiftDatumConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26451,23 +24649,17 @@ func (p projRShiftDatumConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projRShiftDatumConstInt32Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projRShiftDatumConstInt32Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -26482,11 +24674,6 @@ func (p projRShiftDatumConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26594,23 +24781,17 @@ func (p projRShiftDatumConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
 
 type projRShiftDatumConstInt64Op struct {
 	projConstOpBase
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	constArg interface{}
 }
 
 func (p projRShiftDatumConstInt64Op) Next() coldata.Batch {
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
 	_overloadHelper := p.BinaryOverloadHelper
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -26625,11 +24806,6 @@ func (p projRShiftDatumConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Datum()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26737,9 +24913,6 @@ func (p projRShiftDatumConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -26763,11 +24936,6 @@ func (p projJSONFetchValJSONConstBytesOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26871,9 +25039,6 @@ func (p projJSONFetchValJSONConstBytesOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -26897,11 +25062,6 @@ func (p projJSONFetchValJSONConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -26993,9 +25153,6 @@ func (p projJSONFetchValJSONConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27019,11 +25176,6 @@ func (p projJSONFetchValJSONConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -27115,9 +25267,6 @@ func (p projJSONFetchValJSONConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27141,11 +25290,6 @@ func (p projJSONFetchValJSONConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -27237,9 +25381,6 @@ func (p projJSONFetchValJSONConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27263,11 +25404,6 @@ func (p projJSONFetchTextJSONConstBytesOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Bytes()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -27407,9 +25543,6 @@ func (p projJSONFetchTextJSONConstBytesOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27433,11 +25566,6 @@ func (p projJSONFetchTextJSONConstInt16Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Bytes()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -27565,9 +25693,6 @@ func (p projJSONFetchTextJSONConstInt16Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27591,11 +25716,6 @@ func (p projJSONFetchTextJSONConstInt32Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Bytes()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -27723,9 +25843,6 @@ func (p projJSONFetchTextJSONConstInt32Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27749,11 +25866,6 @@ func (p projJSONFetchTextJSONConstInt64Op) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Bytes()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -27881,9 +25993,6 @@ func (p projJSONFetchTextJSONConstInt64Op) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -27907,11 +26016,6 @@ func (p projJSONFetchValPathJSONConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.JSON()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -28003,9 +26107,6 @@ func (p projJSONFetchValPathJSONConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -28029,11 +26130,6 @@ func (p projJSONFetchTextPathJSONConstDatumOp) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec.Bytes()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -28165,9 +26261,6 @@ func (p projJSONFetchTextPathJSONConstDatumOp) Next() coldata.Batch {
 			// If $hasNulls is false, then there are no input Nulls. _outNulls is
 			// projVec.Nulls() so there is no need to call projVec.SetNulls().
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -28198,9 +26291,9 @@ func GetProjectionLConstOperator(
 	c := colconv.GetDatumToPhysicalFn(constType)(constArg)
 	leftType, rightType := constType, inputTypes[colIdx]
 	switch op := op.(type) {
-	case tree.BinaryOperator:
+	case treebin.BinaryOperator:
 		switch op.Symbol {
-		case tree.Bitand:
+		case treebin.Bitand:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.IntFamily:
 				switch leftType.Width() {
@@ -28294,13 +26387,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.Bitor:
+		case treebin.Bitor:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.IntFamily:
 				switch leftType.Width() {
@@ -28394,13 +26487,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.Bitxor:
+		case treebin.Bitxor:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.IntFamily:
 				switch leftType.Width() {
@@ -28494,13 +26587,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.Plus:
+		case treebin.Plus:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -28585,7 +26678,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(int16),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -28631,7 +26724,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(int32),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -28678,7 +26771,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(int64),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -28750,7 +26843,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(duration.Duration),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -28768,7 +26861,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					case types.IntFamily:
@@ -28778,14 +26871,14 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case 32:
 							op := &projPlusDatumConstInt32Op{
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case -1:
 						default:
@@ -28793,13 +26886,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.Minus:
+		case treebin.Minus:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -28884,7 +26977,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(int16),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -28930,7 +27023,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(int32),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -28977,7 +27070,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(int64),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -29049,7 +27142,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        c.(duration.Duration),
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
@@ -29106,7 +27199,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					case types.IntervalFamily:
@@ -29117,7 +27210,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					case types.BytesFamily:
@@ -29128,7 +27221,7 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					case types.IntFamily:
@@ -29138,14 +27231,14 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case 32:
 							op := &projMinusDatumConstInt32Op{
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case -1:
 						default:
@@ -29153,13 +27246,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.Mult:
+		case treebin.Mult:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -29426,7 +27519,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.Div:
+		case treebin.Div:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -29633,7 +27726,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.FloorDiv:
+		case treebin.FloorDiv:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -29801,7 +27894,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.Mod:
+		case treebin.Mod:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -29969,7 +28062,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.Pow:
+		case treebin.Pow:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.DecimalFamily:
 				switch leftType.Width() {
@@ -30137,7 +28230,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.Concat:
+		case treebin.Concat:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.BytesFamily:
 				switch leftType.Width() {
@@ -30186,13 +28279,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.LShift:
+		case treebin.LShift:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.IntFamily:
 				switch leftType.Width() {
@@ -30285,14 +28378,14 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case 32:
 							op := &projLShiftDatumConstInt32Op{
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case -1:
 						default:
@@ -30300,13 +28393,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.RShift:
+		case treebin.RShift:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.IntFamily:
 				switch leftType.Width() {
@@ -30399,14 +28492,14 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case 32:
 							op := &projRShiftDatumConstInt32Op{
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						case -1:
 						default:
@@ -30414,13 +28507,13 @@ func GetProjectionLConstOperator(
 								projConstOpBase: projConstOpBase,
 								constArg:        constArg,
 							}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							return op, nil
 						}
 					}
 				}
 			}
-		case tree.JSONFetchVal:
+		case treebin.JSONFetchVal:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.JsonFamily:
 				switch leftType.Width() {
@@ -30462,7 +28555,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.JSONFetchText:
+		case treebin.JSONFetchText:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.JsonFamily:
 				switch leftType.Width() {
@@ -30504,7 +28597,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.JSONFetchValPath:
+		case treebin.JSONFetchValPath:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.JsonFamily:
 				switch leftType.Width() {
@@ -30524,7 +28617,7 @@ func GetProjectionLConstOperator(
 					}
 				}
 			}
-		case tree.JSONFetchTextPath:
+		case treebin.JSONFetchTextPath:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			case types.JsonFamily:
 				switch leftType.Width() {

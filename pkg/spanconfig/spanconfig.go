@@ -24,38 +24,29 @@ import (
 // KVAccessor mediates access to KV span configurations pertaining to a given
 // tenant.
 type KVAccessor interface {
-	// GetSpanConfigEntriesFor returns the span configurations that overlap with
-	// the given spans.
-	GetSpanConfigEntriesFor(
-		ctx context.Context,
-		spans []roachpb.Span,
-	) ([]roachpb.SpanConfigEntry, error)
+	// GetSpanConfigRecords returns the span configurations that apply to or
+	// overlap with the supplied targets.
+	GetSpanConfigRecords(ctx context.Context, targets []Target) ([]Record, error)
 
-	// UpdateSpanConfigEntries updates configurations for the given spans. This
-	// is a "targeted" API: the spans being deleted are expected to have been
-	// present with the exact same bounds; if spans are being updated with new
-	// configs, they're expected to have been present with the same bounds. When
-	// divvying up an existing span into multiple others with distinct configs,
-	// callers are to issue a delete for the previous span and upserts for the
-	// new ones.
-	UpdateSpanConfigEntries(
-		ctx context.Context,
-		toDelete []roachpb.Span,
-		toUpsert []roachpb.SpanConfigEntry,
-	) error
+	// GetAllSystemSpanConfigsThatApply returns all system span configurations
+	// that apply over ranges of the supplied tenant ID. This includes those
+	// set by the tenant itself and those set by the system tenant.
+	GetAllSystemSpanConfigsThatApply(
+		ctx context.Context, id roachpb.TenantID,
+	) ([]roachpb.SpanConfig, error)
 
-	// GetSystemSpanConfigEntries returns the system span config entries that
-	// have been installed by the tenant.
-	GetSystemSpanConfigEntries(ctx context.Context) ([]roachpb.SystemSpanConfigEntry, error)
-
-	// UpdateSystemSpanConfigEntries updates system span configurations for the
-	// given targets. Targets for span config entries being deleted are expected
-	// to have been present; targets must be distinct within and across the two
-	// lists.
-	UpdateSystemSpanConfigEntries(
+	// UpdateSpanConfigRecords updates configurations for the given key targets.
+	// This is a "targeted" API: the exact targets being deleted are expected to
+	// have been present; if targets are being updated with new configs, they're
+	// expected to be present exactly as well.
+	//
+	// Targets are not allowed to overlap with each other. When divvying up an
+	// existing target into multiple others with distinct configs, callers must
+	// issue deletes for the previous target and upserts for the new records.
+	UpdateSpanConfigRecords(
 		ctx context.Context,
-		toDelete []roachpb.SystemSpanConfigTarget,
-		toUpsert []roachpb.SystemSpanConfigEntry,
+		toDelete []Target,
+		toUpsert []Record,
 	) error
 
 	// WithTxn returns a KVAccessor that runs using the given transaction (with
@@ -64,10 +55,12 @@ type KVAccessor interface {
 	WithTxn(context.Context, *kv.Txn) KVAccessor
 }
 
-// KVSubscriber presents a consistent[1] snapshot of a StoreReader that's
-// incrementally maintained with changes made to the global span configurations
-// state (system.span_configurations). The maintenance happens transparently;
-// callers can subscribe to learn about what key spans may have seen a
+// KVSubscriber presents a consistent[1] snapshot of a StoreReader and
+// ProtectedTSReader that's incrementally maintained with changes made to the
+// global span configurations state (system.span_configurations). The
+// maintenance happens transparently.
+//
+// Callers can subscribe to learn about what key spans may have seen a
 // configuration change. After learning about a span update through a callback
 // invocation, subscribers can consult the embedded StoreReader to retrieve an
 // up-to-date[2] config for the updated span. The callback is called in a single
@@ -82,10 +75,11 @@ type KVAccessor interface {
 // StoreReader for the given span would still retrieve the last config observed
 // for the span[3].
 //
-// [1]: The contents of the StoreReader at t1 corresponds exactly to the
-//      contents of the global span configuration state at t0 where t0 <= t1. If
-//      the StoreReader is read from at t2 where t2 > t1, it's guaranteed to
-//      observe a view of the global state at t >= t0.
+// [1]: The contents of the StoreReader and ProtectedTSReader at t1 corresponds
+//      exactly to the contents of the global span configuration state at t0
+//      where t0 <= t1. If the StoreReader or ProtectedTSReader is read from at
+//      t2 where t2 > t1, it's guaranteed to observe a view of the global state
+//      at t >= t0.
 // [2]: For the canonical KVSubscriber implementation, this is typically lagging
 //      by the closed timestamp target duration.
 // [3]: The canonical KVSubscriber implementation is bounced whenever errors
@@ -93,8 +87,10 @@ type KVAccessor interface {
 //      (typically through a coarsely targeted [min,max) span).
 type KVSubscriber interface {
 	StoreReader
+	ProtectedTSReader
+
 	LastUpdated() hlc.Timestamp
-	Subscribe(func(updated roachpb.Span))
+	Subscribe(func(ctx context.Context, updated roachpb.Span))
 }
 
 // SQLTranslator translates SQL descriptors and their corresponding zone
@@ -114,8 +110,11 @@ type KVSubscriber interface {
 type SQLTranslator interface {
 	// Translate generates the span configuration state given a list of
 	// {descriptor, named zone} IDs. Entries are unique, and are omitted for IDs
-	// that don't exist. The timestamp at which the translation is valid is also
-	// returned.
+	// that don't exist.
+	// Additionally, if `generateSystemSpanConfigurations` is set to true,
+	// Translate will generate all the span configurations that apply to
+	// `spanconfig.SystemTargets`. The timestamp at which the translation is valid
+	// is also returned.
 	//
 	// For every ID we first descend the zone configuration hierarchy with the
 	// ID as the root to accumulate IDs of all leaf objects. Leaf objects are
@@ -125,20 +124,24 @@ type SQLTranslator interface {
 	// for each one of these accumulated IDs, we generate <span, config> tuples
 	// by following up the inheritance chain to fully hydrate the span
 	// configuration. Translate also accounts for and negotiates subzone spans.
-	Translate(ctx context.Context, ids descpb.IDs) ([]roachpb.SpanConfigEntry, hlc.Timestamp, error)
+	Translate(ctx context.Context, ids descpb.IDs,
+		generateSystemSpanConfigurations bool) ([]Record, hlc.Timestamp, error)
 }
 
 // FullTranslate translates the entire SQL zone configuration state to the span
 // configuration state. The timestamp at which such a translation is valid is
 // also returned.
-func FullTranslate(
-	ctx context.Context, s SQLTranslator,
-) ([]roachpb.SpanConfigEntry, hlc.Timestamp, error) {
+func FullTranslate(ctx context.Context, s SQLTranslator) ([]Record, hlc.Timestamp, error) {
 	// As RANGE DEFAULT is the root of all zone configurations (including other
 	// named zones for the system tenant), we can construct the entire span
 	// configuration state by starting from RANGE DEFAULT.
-	return s.Translate(ctx, descpb.IDs{keys.RootNamespaceID})
+	return s.Translate(ctx, descpb.IDs{keys.RootNamespaceID},
+		true /* generateSystemSpanConfigurations */)
 }
+
+// SQLWatcherHandler is the signature of a handler that can be passed into
+// SQLWatcher.WatchForSQLUpdates as described below.
+type SQLWatcherHandler func(context.Context, []SQLUpdate, hlc.Timestamp) error
 
 // SQLWatcher watches for events on system.zones and system.descriptors.
 type SQLWatcher interface {
@@ -161,7 +164,7 @@ type SQLWatcher interface {
 	WatchForSQLUpdates(
 		ctx context.Context,
 		startTS hlc.Timestamp,
-		handler func(ctx context.Context, updates []DescriptorUpdate, checkpointTS hlc.Timestamp) error,
+		handler SQLWatcherHandler,
 	) error
 }
 
@@ -199,6 +202,12 @@ type Reconciler interface {
 type Store interface {
 	StoreWriter
 	StoreReader
+	// ForEachOverlappingSpanConfig invokes the supplied callback on each
+	// span config that overlaps with the supplied span. In addition to the
+	// SpanConfig, the span it applies over is passed into the callback as well.
+	ForEachOverlappingSpanConfig(
+		context.Context, roachpb.Span, func(roachpb.Span, roachpb.SpanConfig) error,
+	) error
 }
 
 // StoreWriter is the write-only portion of the Store interface.
@@ -234,8 +243,9 @@ type StoreWriter interface {
 	//
 	// [1]: Unless dryrun is true. We'll still generate the same {deleted,added}
 	//      lists.
+	// TODO(arul): Get rid of dryrun; we don't make use of it anywhere.
 	Apply(ctx context.Context, dryrun bool, updates ...Update) (
-		deleted []roachpb.Span, added []roachpb.SpanConfigEntry,
+		deleted []Target, added []Record,
 	)
 }
 
@@ -247,47 +257,191 @@ type StoreReader interface {
 	GetSpanConfigForKey(ctx context.Context, key roachpb.RKey) (roachpb.SpanConfig, error)
 }
 
+// Splitter returns the number of split points for the given table descriptor.
+// It steps through every "unit" that we can apply configurations over (table,
+// indexes, partitions and sub-partitions) and figures out the actual key
+// boundaries that we may need to split over. For example:
+//
+//		CREATE TABLE db.parts(i INT PRIMARY KEY, j INT) PARTITION BY LIST (i) (
+//			PARTITION one_and_five    VALUES IN (1, 5),
+//			PARTITION four_and_three  VALUES IN (4, 3),
+//			PARTITION everything_else VALUES IN (6, default)
+//		);
+//
+// We'd spit out 15:
+//
+//	+ 1  between start of table and start of 1st index
+//	+ 1  between start of index and start of 1st partition-by-list value
+//	+ 1  for 1st partition-by-list value
+//	+ 1  for 2nd partition-by-list value
+//	+ 1  for 3rd partition-by-list value
+//	+ 1  for 4th partition-by-list value
+//	+ 1  for 5th partition-by-list value
+//	+ 1  for 6th partition-by-list value
+//	+ 5  gap(s) between 6 partition-by-list value spans
+//	+ 1  between end of 6th partition-by-list value span and end of index
+//	+ 13 for 1st index
+//	+ 1  between end of 1st index and end of table
+//	= 15
+//
+type Splitter interface {
+	Splits(ctx context.Context, table catalog.TableDescriptor) (int, error)
+}
+
+// SQLUpdate captures either a descriptor or a protected timestamp update.
+// It is the unit emitted by the SQLWatcher.
+type SQLUpdate struct {
+	descriptorUpdate         DescriptorUpdate
+	protectedTimestampUpdate ProtectedTimestampUpdate
+}
+
+// MakeDescriptorSQLUpdate returns a SQLUpdate that represents an update to a
+// descriptor.
+func MakeDescriptorSQLUpdate(id descpb.ID, descType catalog.DescriptorType) SQLUpdate {
+	return SQLUpdate{descriptorUpdate: DescriptorUpdate{
+		ID:   id,
+		Type: descType,
+	}}
+}
+
+// GetDescriptorUpdate returns a DescriptorUpdate.
+func (d *SQLUpdate) GetDescriptorUpdate() DescriptorUpdate {
+	return d.descriptorUpdate
+}
+
+// IsDescriptorUpdate returns true if the SQLUpdate represents an update to a
+// descriptor.
+func (d *SQLUpdate) IsDescriptorUpdate() bool {
+	return d.descriptorUpdate != DescriptorUpdate{}
+}
+
+// MakeTenantProtectedTimestampSQLUpdate returns a SQLUpdate that represents an update
+// to a protected timestamp record with a tenant target.
+func MakeTenantProtectedTimestampSQLUpdate(tenantID roachpb.TenantID) SQLUpdate {
+	return SQLUpdate{protectedTimestampUpdate: ProtectedTimestampUpdate{TenantTarget: tenantID}}
+}
+
+// MakeClusterProtectedTimestampSQLUpdate returns a SQLUpdate that represents an update
+// to a protected timestamp record with a cluster target.
+func MakeClusterProtectedTimestampSQLUpdate() SQLUpdate {
+	return SQLUpdate{protectedTimestampUpdate: ProtectedTimestampUpdate{ClusterTarget: true}}
+}
+
+// GetProtectedTimestampUpdate returns the target of the updated protected
+// timestamp record.
+func (d *SQLUpdate) GetProtectedTimestampUpdate() ProtectedTimestampUpdate {
+	return d.protectedTimestampUpdate
+}
+
+// IsProtectedTimestampUpdate returns true if the SQLUpdate represents an update
+// to a protected timestamp record.
+func (d *SQLUpdate) IsProtectedTimestampUpdate() bool {
+	return d.protectedTimestampUpdate != ProtectedTimestampUpdate{}
+}
+
 // DescriptorUpdate captures the ID and the type of descriptor or zone that been
-// updated. It's the unit of what the SQLWatcher emits.
+// updated.
 type DescriptorUpdate struct {
 	// ID of the descriptor/zone that has been updated.
 	ID descpb.ID
 
-	// DescriptorType of the descriptor/zone that has been updated. Could be either
+	// Type of the descriptor/zone that has been updated. Could be either
 	// the specific type or catalog.Any if no information is available.
-	DescriptorType catalog.DescriptorType
+	Type catalog.DescriptorType
+}
+
+// ProtectedTimestampUpdate captures a protected timestamp record with a cluster
+// or tenant target that been updated.
+type ProtectedTimestampUpdate struct {
+	// ClusterTarget is set if the pts record targets a cluster.
+	ClusterTarget bool
+	// TenantsTarget is set if the pts record targets a tenant.
+	TenantTarget roachpb.TenantID
+}
+
+// IsClusterUpdate returns true if the ProtectedTimestampUpdate has a cluster
+// target.
+func (p *ProtectedTimestampUpdate) IsClusterUpdate() bool {
+	return p.ClusterTarget
+}
+
+// IsTenantsUpdate returns true if the ProtectedTimestampUpdate has a tenants
+// target.
+func (p *ProtectedTimestampUpdate) IsTenantsUpdate() bool {
+	return !p.ClusterTarget
 }
 
 // Update captures a span and the corresponding config change. It's the unit of
 // what can be applied to a StoreWriter. The embedded span captures what's being
 // updated; the config captures what it's being updated to. An empty config
 // indicates a deletion.
-type Update roachpb.SpanConfigEntry
+type Update Record
 
-// Deletion constructs an update that represents a deletion over the given span.
-func Deletion(span roachpb.Span) Update {
-	return Update{
-		Span:   span,
-		Config: roachpb.SpanConfig{}, // delete
+// Deletion constructs an update that represents a deletion over the given
+// target.
+func Deletion(target Target) (Update, error) {
+	record, err := MakeRecord(target, roachpb.SpanConfig{}) // delete
+	if err != nil {
+		return Update{}, err
 	}
+	return Update(record), nil
 }
 
 // Addition constructs an update that represents adding the given config over
-// the given span.
-func Addition(span roachpb.Span, conf roachpb.SpanConfig) Update {
-	return Update{
-		Span:   span,
-		Config: conf,
+// the given target.
+func Addition(target Target, conf roachpb.SpanConfig) (Update, error) {
+	record, err := MakeRecord(target, conf)
+	if err != nil {
+		return Update{}, err
 	}
+	return Update(record), nil
 }
 
 // Deletion returns true if the update corresponds to a span config being
 // deleted.
 func (u Update) Deletion() bool {
-	return u.Config.IsEmpty()
+	return u.config.IsEmpty()
 }
 
 // Addition returns true if the update corresponds to a span config being added.
 func (u Update) Addition() bool {
 	return !u.Deletion()
+}
+
+// GetTarget returns the underlying spanconfig.Record target.
+func (u Update) GetTarget() Target {
+	return u.target
+}
+
+// GetConfig returns the underlying spanconfig.Record config.
+func (u Update) GetConfig() roachpb.SpanConfig {
+	return u.config
+}
+
+// ProtectedTSReader is the read-only portion for querying protected
+// timestamp information. It doubles up as an adaptor interface for
+// protectedts.Cache.
+type ProtectedTSReader interface {
+	// GetProtectionTimestamps returns all protected timestamps that apply to any
+	// part of the given key span. The time at which this protected timestamp
+	// state is valid is returned as well.
+	GetProtectionTimestamps(ctx context.Context, sp roachpb.Span) (
+		protectionTimestamps []hlc.Timestamp, asOf hlc.Timestamp, _ error,
+	)
+}
+
+// EmptyProtectedTSReader returns a ProtectedTSReader which contains no records
+// and is always up-to date. This is intended for testing.
+func EmptyProtectedTSReader(c *hlc.Clock) ProtectedTSReader {
+	return (*emptyProtectedTSReader)(c)
+}
+
+type emptyProtectedTSReader hlc.Clock
+
+// GetProtectionTimestamps is part of the spanconfig.ProtectedTSReader
+// interface.
+func (r *emptyProtectedTSReader) GetProtectionTimestamps(
+	context.Context, roachpb.Span,
+) ([]hlc.Timestamp, hlc.Timestamp, error) {
+	return nil, (*hlc.Clock)(r).Now(), nil
 }

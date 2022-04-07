@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq" // register postgres driver
@@ -38,6 +39,11 @@ import (
 // roachtest in which the infrastructure worked, but at least one
 // test failed.
 const ExitCodeTestsFailed = 10
+
+// ExitCodeClusterProvisioningFailed is the exit code that results
+// from a run of roachtest in which some clusters could not be
+// created due to errors during cloud hardware allocation.
+const ExitCodeClusterProvisioningFailed = 11
 
 // runnerLogsDir is the dir under the artifacts root where the test runner log
 // and other runner-related logs (i.e. cluster creation logs) will be written.
@@ -328,6 +334,9 @@ runner itself.
 		if errors.Is(err, errTestsFailed) {
 			code = ExitCodeTestsFailed
 		}
+		if errors.Is(err, errClusterProvisioningFailed) {
+			code = ExitCodeClusterProvisioningFailed
+		}
 		// Cobra has already printed the error message.
 		os.Exit(code)
 	}
@@ -357,7 +366,9 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	}
 	register(&r)
 	cr := newClusterRegistry()
-	runner := newTestRunner(cr, r.buildVersion)
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.Background())
+	runner := newTestRunner(cr, stopper, r.buildVersion)
 
 	filter := registry.NewTestFilter(cfg.args)
 	clusterType := roachprodCluster
@@ -412,7 +423,7 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	err = runner.Run(
 		ctx, tests, cfg.count, cfg.parallelism, opt,
 		testOpts{versionsBinaryOverride: cfg.versionsBinaryOverride},
-		lopt)
+		lopt, nil /* clusterAllocator */)
 
 	// Make sure we attempt to clean up. We run with a non-canceled ctx; the
 	// ctx above might be canceled in case a signal was received. If that's

@@ -13,6 +13,7 @@ package settingswatcher
 import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -30,13 +31,6 @@ type RowDecoder struct {
 	decoder valueside.Decoder
 }
 
-// RawValue contains a raw-value / value-type pair, corresponding to the value
-// and valueType columns of the settings table.
-type RawValue struct {
-	Value string
-	Type  string
-}
-
 // MakeRowDecoder makes a new RowDecoder for the settings table.
 func MakeRowDecoder(codec keys.SQLCodec) RowDecoder {
 	columns := systemschema.SettingsTable.PublicColumns()
@@ -52,33 +46,33 @@ func MakeRowDecoder(codec keys.SQLCodec) RowDecoder {
 // tombstone bool will be set.
 func (d *RowDecoder) DecodeRow(
 	kv roachpb.KeyValue,
-) (setting string, val RawValue, tombstone bool, _ error) {
+) (setting string, val settings.EncodedValue, tombstone bool, _ error) {
 	// First we need to decode the setting name field from the index key.
 	{
 		types := []*types.T{d.columns[0].GetType()}
 		nameRow := make([]rowenc.EncDatum, 1)
 		_, _, err := rowenc.DecodeIndexKey(d.codec, types, nameRow, nil, kv.Key)
 		if err != nil {
-			return "", RawValue{}, false, errors.Wrap(err, "failed to decode key")
+			return "", settings.EncodedValue{}, false, errors.Wrap(err, "failed to decode key")
 		}
 		if err := nameRow[0].EnsureDecoded(types[0], &d.alloc); err != nil {
-			return "", RawValue{}, false, err
+			return "", settings.EncodedValue{}, false, err
 		}
 		setting = string(tree.MustBeDString(nameRow[0].Datum))
 	}
 	if !kv.Value.IsPresent() {
-		return setting, RawValue{}, true, nil
+		return setting, settings.EncodedValue{}, true, nil
 	}
 
 	// The rest of the columns are stored as a family.
 	bytes, err := kv.Value.GetTuple()
 	if err != nil {
-		return "", RawValue{}, false, err
+		return "", settings.EncodedValue{}, false, err
 	}
 
 	datums, err := d.decoder.Decode(&d.alloc, bytes)
 	if err != nil {
-		return "", RawValue{}, false, err
+		return "", settings.EncodedValue{}, false, err
 	}
 
 	if value := datums[1]; value != tree.DNull {

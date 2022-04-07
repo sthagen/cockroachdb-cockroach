@@ -12,6 +12,7 @@ package scstage
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
@@ -22,10 +23,13 @@ import (
 )
 
 // BuildStages builds the plan's stages for this and all subsequent phases.
+// Note that the scJobIDSupplier function is idempotent, and must return the
+// same value for all calls.
 func BuildStages(
 	init scpb.CurrentState, phase scop.Phase, g *scgraph.Graph, scJobIDSupplier func() jobspb.JobID,
 ) []Stage {
 	c := buildContext{
+		rollback:               init.InRollback,
 		g:                      g,
 		scJobIDSupplier:        scJobIDSupplier,
 		isRevertibilityIgnored: true,
@@ -41,12 +45,23 @@ func BuildStages(
 		c.isRevertibilityIgnored = false
 		stages = buildStages(c)
 	}
+	// Add job ops to the stages.
+	for i := range stages {
+		var cur, next *Stage
+		if i+1 < len(stages) {
+			next = &stages[i+1]
+		}
+		cur = &stages[i]
+		jobOps := c.computeExtraJobOps(cur, next)
+		cur.ExtraOps = jobOps
+	}
 	return decorateStages(stages)
 }
 
 // buildContext contains the global constants for building the stages.
 // Only the BuildStages function mutates it, it's read-only everywhere else.
 type buildContext struct {
+	rollback               bool
 	g                      *scgraph.Graph
 	scJobIDSupplier        func() jobspb.JobID
 	isRevertibilityIgnored bool
@@ -103,6 +118,7 @@ func buildStages(bc buildContext) (stages []Stage) {
 			bs.phase++
 		}
 	}
+
 	return stages
 }
 
@@ -146,16 +162,20 @@ func (bc buildContext) makeStageBuilder(bs buildState) (sb stageBuilder) {
 // makeStageBuilderForType creates and populates a stage builder for the given
 // op type.
 func (bc buildContext) makeStageBuilderForType(bs buildState, opType scop.Type) stageBuilder {
+	numTargets := len(bc.targetState.Targets)
 	sb := stageBuilder{
 		bc:         bc,
 		bs:         bs,
 		opType:     opType,
-		current:    make([]currentTargetState, len(bc.targetState.Targets)),
+		current:    make([]currentTargetState, numTargets),
 		fulfilling: map[*screl.Node]struct{}{},
+		lut:        make(map[*scpb.Target]*currentTargetState, numTargets),
+		visited:    make(map[*screl.Node]uint64, numTargets),
 	}
 	for i, n := range bc.nodes(bs.incumbent) {
 		t := sb.makeCurrentTargetState(n)
 		sb.current[i] = t
+		sb.lut[t.n.Target] = &sb.current[i]
 	}
 	// Greedily try to make progress by going down op edges when possible.
 	for isDone := false; !isDone; {
@@ -167,6 +187,9 @@ func (bc buildContext) makeStageBuilderForType(bs buildState, opType scop.Type) 
 			if sb.hasUnmetInboundDeps(t.e.To()) {
 				continue
 			}
+			// Increment the visit epoch for the next batch of recursive calls to
+			// hasUnmeetableOutboundDeps. See comments in function body for details.
+			sb.visitEpoch++
 			if sb.hasUnmeetableOutboundDeps(t.e.To()) {
 				continue
 			}
@@ -187,6 +210,12 @@ type stageBuilder struct {
 	current    []currentTargetState
 	fulfilling map[*screl.Node]struct{}
 	opEdges    []*scgraph.OpEdge
+
+	// Helper data structures used to improve performance.
+
+	lut        map[*scpb.Target]*currentTargetState
+	visited    map[*screl.Node]uint64
+	visitEpoch uint64
 }
 
 type currentTargetState struct {
@@ -256,6 +285,12 @@ func (sb stageBuilder) nextTargetState(t currentTargetState) currentTargetState 
 	return next
 }
 
+// hasUnmeetableOutboundDeps returns true iff the candidate node has inbound
+// dependencies which aren't yet met.
+//
+// In plain english: we can only schedule this node in this stage if all the
+// other nodes which need to be scheduled not after it have already been
+// scheduled.
 func (sb stageBuilder) hasUnmetInboundDeps(n *screl.Node) (ret bool) {
 	_ = sb.bc.g.ForEachDepEdgeTo(n, func(de *scgraph.DepEdge) error {
 		if sb.isUnmetInboundDep(de) {
@@ -296,65 +331,87 @@ func (sb *stageBuilder) isUnmetInboundDep(de *scgraph.DepEdge) bool {
 		de.String(), de.Name()))
 }
 
+// hasUnmeetableOutboundDeps returns true iff the candidate node has outbound
+// dependencies which cannot possibly be met.
+// This is the case when, among all the nodes transitively connected to or from
+// it via same-stage dependency edges, there is at least one which cannot (for
+// whatever reason) be scheduled in this stage.
+// This function recursively visits this set of connected nodes.
+//
+// In plain english: we can only schedule this node in this stage if we are able
+// to also schedule all the other nodes which would be forced to be scheduled in
+// the same stage as this one.
 func (sb stageBuilder) hasUnmeetableOutboundDeps(n *screl.Node) (ret bool) {
-	candidates := make(map[*screl.Node]int, len(sb.current))
-	for i, t := range sb.current {
-		if t.e != nil {
-			candidates[t.e.To()] = i
-		}
+	// This recursive function needs to track which nodes it has already visited
+	// to avoid running around in circles: although this is a DAG that we're
+	// traversing a DAG we're ignoring edge directions here.
+	// We reuse the same map for each set of calls to avoid potentially wasteful
+	// allocations. This requires us to maintain a _visit epoch_ counter to
+	// differentiate between different traversals.
+	if sb.visited[n] == sb.visitEpoch {
+		// The node has already been visited in this traversal.
+		// Considering that the traversal didn't end during the previous visit,
+		// we can infer that this node doesn't have any unmeetable outbound
+		// dependencies.
+		return false
 	}
-	visited := make(map[*screl.Node]bool)
-	var visit func(n *screl.Node)
-	visit = func(n *screl.Node) {
-		if ret || visited[n] {
-			return
+	// Mark this node as having been visited in this traversal.
+	sb.visited[n] = sb.visitEpoch
+	// Do some sanity checks.
+	if _, isFulfilled := sb.bs.fulfilled[n]; isFulfilled {
+		// This should never happen.
+		panic(errors.AssertionFailedf("%s should not yet be fulfilled",
+			screl.NodeString(n)))
+	}
+	if _, isFulfilling := sb.bs.fulfilled[n]; isFulfilling {
+		// This should never happen.
+		panic(errors.AssertionFailedf("%s should not yet be scheduled for this stage",
+			screl.NodeString(n)))
+	}
+	// Look up the current target state for this node, via the lookup table.
+	if t := sb.lut[n.Target]; t == nil {
+		// This should never happen.
+		panic(errors.AssertionFailedf("%s target not found in look-up table",
+			screl.NodeString(n)))
+	} else if t.e == nil || t.e.To() != n {
+		// The visited node is not yet a candidate for scheduling in this stage.
+		// Either we're unable to schedule it due to some unsatisfied constraint or
+		// there are other nodes preceding it in the op-edge path that need to be
+		// scheduled first.
+		return true
+	}
+	// At this point, the visited node might be scheduled in this stage if it,
+	// in turn, also doesn't have any unmet inbound dependencies or any unmeetable
+	// outbound dependencies.
+	// We check the inbound and outbound dep edges for this purpose and
+	// recursively visit the neighboring nodes connected via same-stage dep edges
+	// to make sure this property is verified transitively.
+	_ = sb.bc.g.ForEachDepEdgeTo(n, func(de *scgraph.DepEdge) error {
+		if sb.visited[de.From()] == sb.visitEpoch {
+			return nil
 		}
-		visited[n] = true
-		if _, isFulfilled := sb.bs.fulfilled[n]; isFulfilled {
-			// This should never happen.
-			panic(errors.AssertionFailedf("%s should not yet be fulfilled",
-				screl.NodeString(n)))
+		if !sb.isUnmetInboundDep(de) {
+			return nil
 		}
-		if _, isFulfilling := sb.bs.fulfilled[n]; isFulfilling {
-			// This should never happen.
-			panic(errors.AssertionFailedf("%s should not yet be scheduled for this stage",
-				screl.NodeString(n)))
-		}
-		if _, isCandidate := candidates[n]; !isCandidate {
+		if de.Kind() != scgraph.SameStagePrecedence || sb.hasUnmeetableOutboundDeps(de.From()) {
 			ret = true
-			return
+			return iterutil.StopIteration()
 		}
-		_ = sb.bc.g.ForEachDepEdgeTo(n, func(de *scgraph.DepEdge) error {
-			if ret {
-				return iterutil.StopIteration()
-			}
-			if visited[de.From()] {
-				return nil
-			}
-			if !sb.isUnmetInboundDep(de) {
-				return nil
-			}
-			if de.Kind() == scgraph.SameStagePrecedence {
-				visit(de.From())
-			} else {
-				ret = true
-			}
-			return nil
-		})
-		_ = sb.bc.g.ForEachDepEdgeFrom(n, func(de *scgraph.DepEdge) error {
-			if ret {
-				return iterutil.StopIteration()
-			}
-			if visited[de.To()] {
-				return nil
-			}
-			if de.Kind() == scgraph.SameStagePrecedence {
-				visit(de.To())
-			}
-			return nil
-		})
+		return nil
+	})
+	if ret {
+		return true
 	}
-	visit(n)
+	_ = sb.bc.g.ForEachDepEdgeFrom(n, func(de *scgraph.DepEdge) error {
+		if sb.visited[de.To()] == sb.visitEpoch {
+			return nil
+		}
+		if de.Kind() == scgraph.SameStagePrecedence && sb.hasUnmeetableOutboundDeps(de.To()) {
+			ret = true
+			return iterutil.StopIteration()
+		}
+		return nil
+	})
 	return ret
 }
 
@@ -374,82 +431,78 @@ func (sb stageBuilder) build() Stage {
 		}
 		s.EdgeOps = append(s.EdgeOps, e.Op()...)
 	}
-	// Decorate stage with job-related operations.
-	// TODO(ajwerner): Rather than adding this above the opgen layer, it'd be
-	// better to do it as part of graph generation. We could treat the job as
-	// and the job references as elements and track their relationships. The
-	// oddity here is that the job gets both added and removed. In practice, this
-	// may prove to be a somewhat common pattern in other cases: consider the
-	// intermediate index needed when adding and dropping columns as part of the
-	// same transaction.
+	return s
+}
+
+// Decorate stage with job-related operations.
+//
+// TODO(ajwerner): Rather than adding this above the opgen layer, it may be
+// better to do it as part of graph generation. We could treat the job as
+// and the job references as elements and track their relationships. The
+// oddity here is that the job gets both added and removed. In practice, this
+// may prove to be a somewhat common pattern in other cases: consider the
+// intermediate index needed when adding and dropping columns as part of the
+// same transaction.
+func (bc buildContext) computeExtraJobOps(s, next *Stage) []scop.Op {
+	revertible := next != nil && next.Phase < scop.PostCommitNonRevertiblePhase
 	switch s.Phase {
 	case scop.PreCommitPhase:
 		// If this pre-commit stage is non-terminal, this means there will be at
 		// least one post-commit stage, so we need to create a schema changer job
 		// and update references for the affected descriptors.
-		if !sb.bc.isStateTerminal(after) {
-			s.ExtraOps = append(sb.bc.addJobReferenceOps(), sb.bc.createSchemaChangeJobOp(after))
+		if next != nil {
+			const initialize = true
+			return append(bc.setJobStateOnDescriptorOps(initialize, revertible, s.After),
+				bc.createSchemaChangeJobOp(revertible))
 		}
+		return nil
 	case scop.PostCommitPhase, scop.PostCommitNonRevertiblePhase:
-		if sb.opType == scop.MutationType {
-			if sb.bc.isStateTerminal(after) {
-				// The terminal mutation stage needs to remove references to the schema
-				// changer job in the affected descriptors.
-				s.ExtraOps = sb.bc.removeJobReferenceOps()
-			}
-			// Post-commit mutation stages all update the progress of the schema
-			// changer job.
-			s.ExtraOps = append(s.ExtraOps, sb.bc.updateJobProgressOp(after, s.Phase > scop.PostCommitPhase))
+		if s.Type() != scop.MutationType {
+			return nil
 		}
+		var ops []scop.Op
+		if next == nil {
+			// The terminal mutation stage needs to remove references to the schema
+			// changer job in the affected descriptors.
+			ops = bc.removeJobReferenceOps()
+		} else {
+			const initialize = false
+			ops = bc.setJobStateOnDescriptorOps(initialize, revertible, s.After)
+		}
+		// If we just moved to a non-cancelable phase, we need to tell the job
+		// that it cannot be canceled. Ideally we'd do this just once.
+		ops = append(ops, bc.updateJobProgressOp(revertible))
+		return ops
+	default:
+		return nil
 	}
-	return s
 }
 
-func (bc buildContext) createSchemaChangeJobOp(current []scpb.Status) scop.Op {
-	return &scop.CreateDeclarativeSchemaChangerJob{
-		JobID:       bc.scJobIDSupplier(),
-		TargetState: bc.targetState,
-		Current:     current,
+func (bc buildContext) createSchemaChangeJobOp(revertible bool) scop.Op {
+	return &scop.CreateSchemaChangerJob{
+		JobID:         bc.scJobIDSupplier(),
+		Statements:    bc.targetState.Statements,
+		Authorization: bc.targetState.Authorization,
+		DescriptorIDs: screl.AllTargetDescIDs(bc.targetState).Ordered(),
+		NonCancelable: !revertible,
 	}
 }
 
-func (bc buildContext) addJobReferenceOps() []scop.Op {
-	jobID := bc.scJobIDSupplier()
-	return generateOpsForJobIDs(
-		screl.GetDescIDs(bc.targetState),
-		jobID,
-		func(descID descpb.ID, id jobspb.JobID) scop.Op {
-			return &scop.AddJobReference{DescriptorID: descID, JobID: jobID}
-		},
-	)
-}
-
-func (bc buildContext) updateJobProgressOp(current []scpb.Status, isNonCancellable bool) scop.Op {
+func (bc buildContext) updateJobProgressOp(revertible bool) scop.Op {
 	return &scop.UpdateSchemaChangerJob{
 		JobID:           bc.scJobIDSupplier(),
-		Current:         current,
-		IsNonCancelable: isNonCancellable,
+		IsNonCancelable: !revertible,
 	}
 }
 
-func (bc buildContext) removeJobReferenceOps() []scop.Op {
+func (bc buildContext) removeJobReferenceOps() (ops []scop.Op) {
 	jobID := bc.scJobIDSupplier()
-	return generateOpsForJobIDs(
-		screl.GetDescIDs(bc.targetState),
-		jobID,
-		func(descID descpb.ID, id jobspb.JobID) scop.Op {
-			return &scop.RemoveJobReference{DescriptorID: descID, JobID: jobID}
-		},
-	)
-}
-
-func generateOpsForJobIDs(
-	descIDs []descpb.ID, jobID jobspb.JobID, f func(descID descpb.ID, id jobspb.JobID) scop.Op,
-) []scop.Op {
-	ops := make([]scop.Op, len(descIDs))
-	for i, descID := range descIDs {
-		ops[i] = f(descID, jobID)
-	}
+	screl.AllTargetDescIDs(bc.targetState).ForEach(func(descID descpb.ID) {
+		ops = append(ops, &scop.RemoveJobStateFromDescriptor{
+			DescriptorID: descID,
+			JobID:        jobID,
+		})
+	})
 	return ops
 }
 
@@ -465,6 +518,62 @@ func (bc buildContext) nodes(current []scpb.Status) []*screl.Node {
 		nodes[i] = n
 	}
 	return nodes
+}
+
+func (bc buildContext) setJobStateOnDescriptorOps(
+	initialize, revertible bool, after []scpb.Status,
+) []scop.Op {
+	descIDs, states := makeDescriptorStates(
+		bc.scJobIDSupplier(), bc.rollback, revertible, bc.targetState, after,
+	)
+	ops := make([]scop.Op, 0, descIDs.Len())
+	descIDs.ForEach(func(descID descpb.ID) {
+		ops = append(ops, &scop.SetJobStateOnDescriptor{
+			DescriptorID: descID,
+			Initialize:   initialize,
+			State:        *states[descID],
+		})
+	})
+	return ops
+}
+
+func makeDescriptorStates(
+	jobID jobspb.JobID, inRollback, revertible bool, ts scpb.TargetState, statuses []scpb.Status,
+) (catalog.DescriptorIDSet, map[descpb.ID]*scpb.DescriptorState) {
+	descIDs := screl.AllTargetDescIDs(ts)
+	states := make(map[descpb.ID]*scpb.DescriptorState, descIDs.Len())
+	descIDs.ForEach(func(id descpb.ID) {
+		states[id] = &scpb.DescriptorState{
+			Authorization: ts.Authorization,
+			JobID:         jobID,
+			InRollback:    inRollback,
+			Revertible:    revertible,
+		}
+	})
+	noteRelevantStatement := func(state *scpb.DescriptorState, stmtRank uint32) {
+		for i := range state.RelevantStatements {
+			stmt := &state.RelevantStatements[i]
+			if stmt.StatementRank != stmtRank {
+				continue
+			}
+			return
+		}
+		state.RelevantStatements = append(state.RelevantStatements,
+			scpb.DescriptorState_Statement{
+				Statement:     ts.Statements[stmtRank],
+				StatementRank: stmtRank,
+			})
+	}
+	for i, t := range ts.Targets {
+		descID := screl.GetDescID(t.Element())
+		state := states[descID]
+		stmtID := t.Metadata.StatementID
+		noteRelevantStatement(state, stmtID)
+		state.Targets = append(state.Targets, t)
+		state.TargetRanks = append(state.TargetRanks, uint32(i))
+		state.CurrentStatuses = append(state.CurrentStatuses, statuses[i])
+	}
+	return descIDs, states
 }
 
 // decorateStages decorates stages with position in plan.

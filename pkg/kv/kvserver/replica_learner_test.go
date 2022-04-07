@@ -24,8 +24,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -144,7 +146,7 @@ func TestAddReplicaViaLearner(t *testing.T) {
 	blockUntilSnapshotCh := make(chan struct{})
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserver.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
 		close(blockUntilSnapshotCh)
 		select {
 		case <-blockSnapshotsCh:
@@ -311,11 +313,12 @@ func TestLearnerSnapshotFailsRollback(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderShort(t) // Takes 90s.
+	skip.UnderRace(t)
 
 	runTest := func(t *testing.T, replicaType roachpb.ReplicaType) {
 		var rejectSnapshots int64
 		knobs, ltk := makeReplicationTestKnobs()
-		ltk.storeKnobs.ReceiveSnapshot = func(h *kvserver.SnapshotRequest_Header) error {
+		ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
 			if atomic.LoadInt64(&rejectSnapshots) > 0 {
 				return errors.New(`nope`)
 			}
@@ -357,15 +360,7 @@ func TestLearnerSnapshotFailsRollback(t *testing.T) {
 	})
 }
 
-// TestNonVoterCatchesUpViaRaftSnapshotQueue ensures that a non-voting replica
-// in need of a snapshot will receive one via the raft snapshot queue. This is
-// also meant to test that a non-voting replica that is initialized via an
-// `INITIAL` snapshot during its addition is not ignored by the raft snapshot
-// queue for future snapshots.
-func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
+func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 	skip.UnderShort(t, "this test sleeps for a few seconds")
 
 	var skipInitialSnapshot int64
@@ -386,6 +381,7 @@ func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
 	// Disable the raft snapshot queue, we will manually queue a replica into it
 	// below.
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true
+
 	tc := testcluster.StartTestCluster(
 		t, 2, base.TestClusterArgs{
 			ServerArgs:      base.TestServerArgs{Knobs: knobs},
@@ -405,6 +401,8 @@ func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
 		return err
 	})
 
+	// Wait until we remove the lock that prevents the raft snapshot queue from
+	// sending this replica a snapshot.
 	select {
 	case <-nonVoterSnapLockRemoved:
 	case <-time.After(testutils.DefaultSucceedsSoonDuration):
@@ -419,6 +417,16 @@ func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
 	require.NotNil(t, leaseholderRepl)
 
 	time.Sleep(kvserver.RaftLogQueuePendingSnapshotGracePeriod)
+
+	if drainReceivingNode {
+		// Draining nodes shouldn't reject raft snapshots, so this should have no
+		// effect on the outcome of this test.
+		const drainingServerIdx = 1
+		const drainingNodeID = drainingServerIdx + 1
+		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
+		require.NoError(t, err)
+		drain(ctx, t, client, drainingNodeID)
+	}
 
 	testutils.SucceedsSoon(t, func() error {
 		// Manually enqueue the leaseholder replica into its store's raft snapshot
@@ -443,6 +451,62 @@ func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, g.Wait())
+}
+
+func drain(ctx context.Context, t *testing.T, client serverpb.AdminClient, drainingNodeID int) {
+	stream, err := client.Drain(ctx, &serverpb.DrainRequest{
+		NodeId:  strconv.Itoa(drainingNodeID),
+		DoDrain: true,
+	})
+	require.NoError(t, err)
+
+	// Wait until the draining node acknowledges that it's draining.
+	_, err = stream.Recv()
+	require.NoError(t, err)
+}
+
+// TestSnapshotsToDrainingNodes tests that rebalancing snapshots to draining
+// receivers are rejected, but Raft snapshots aren't.
+func TestSnapshotsToDrainingNodes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	t.Run("rebalancing snapshots", func(t *testing.T) {
+		ctx := context.Background()
+
+		// We set up a 2 node test cluster with the second node marked draining.
+		const drainingServerIdx = 1
+		const drainingNodeID = drainingServerIdx + 1
+		tc := testcluster.StartTestCluster(
+			t, 2, base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+			},
+		)
+		defer tc.Stopper().Stop(ctx)
+		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
+		require.NoError(t, err)
+		drain(ctx, t, client, drainingNodeID)
+
+		// Now, we try to add a replica to it, we expect that to fail.
+		scratchKey := tc.ScratchRange(t)
+		_, err = tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
+		require.Regexp(t, "store is draining", err)
+	})
+
+	t.Run("raft snapshots", func(t *testing.T) {
+		testRaftSnapshotsToNonVoters(t, true /* drainReceivingNode */)
+	})
+}
+
+// TestNonVoterCatchesUpViaRaftSnapshotQueue ensures that a non-voting replica
+// in need of a snapshot will receive one via the raft snapshot queue. This is
+// also meant to test that a non-voting replica that is initialized via an
+// `INITIAL` snapshot during its addition is not ignored by the raft snapshot
+// queue for future snapshots.
+func TestNonVoterCatchesUpViaRaftSnapshotQueue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	testRaftSnapshotsToNonVoters(t, false /* drainReceivingNode */)
 }
 
 func TestSplitWithLearnerOrJointConfig(t *testing.T) {
@@ -607,7 +671,7 @@ func TestRaftSnapshotQueueSeesLearner(t *testing.T) {
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserver.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
 		select {
 		case <-blockSnapshotsCh:
 		case <-time.After(10 * time.Second):
@@ -669,7 +733,7 @@ func TestLearnerAdminChangeReplicasRace(t *testing.T) {
 	blockUntilSnapshotCh := make(chan struct{}, 2)
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserver.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
 		blockUntilSnapshotCh <- struct{}{}
 		<-blockSnapshotsCh
 		return nil
@@ -744,7 +808,7 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 	// In this case we'll get a snapshot error from the replicate queue which
 	// will retry the up-replication with a new descriptor and succeed.
 	ltk.storeKnobs.DisableEagerReplicaRemoval = true
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserver.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
 		if atomic.LoadInt64(&skipReceiveSnapshotKnobAtomic) > 0 {
 			return nil
 		}
@@ -976,7 +1040,11 @@ func TestLearnerOrJointConfigAdminRelocateRange(t *testing.T) {
 
 	check := func(voterTargets []roachpb.ReplicationTarget) {
 		require.NoError(t, tc.Server(0).DB().AdminRelocateRange(
-			ctx, scratchStartKey, voterTargets, []roachpb.ReplicationTarget{},
+			ctx,
+			scratchStartKey,
+			voterTargets,
+			[]roachpb.ReplicationTarget{},
+			true, /* transferLeaseToFirstVoter */
 		))
 		desc := tc.LookupRangeOrFatal(t, scratchStartKey)
 		voters := desc.Replicas().VoterDescriptors()
@@ -1190,7 +1258,7 @@ func TestMergeQueueSeesLearnerOrJointConfig(t *testing.T) {
 		require.False(t, desc.Replicas().InAtomicReplicationChange(), desc)
 
 		// Repeat the game, except now we start with two replicas and we're
-		// giving the RHS a VOTER_OUTGOING.
+		// giving the RHS a VOTER_DEMOTING_LEARNER.
 		desc = splitAndUnsplit()
 		ltk.withStopAfterJointConfig(func() {
 			descRight := tc.RemoveVotersOrFatal(t, desc.EndKey.AsRawKey(), tc.Target(1))

@@ -506,8 +506,7 @@ delivery  CREATE TABLE public.delivery (
           CONSTRAINT delivery_pkey PRIMARY KEY (rowid ASC),
           CONSTRAINT delivery_order_shipment_fkey FOREIGN KEY ("order", shipment) REFERENCES public.orders(id, shipment),
           CONSTRAINT delivery_item_fkey FOREIGN KEY (item) REFERENCES public.products(upc),
-          INDEX delivery_item_idx (item ASC),
-          FAMILY "primary" (ts, "order", shipment, item, rowid)
+          INDEX delivery_item_idx (item ASC)
 )
 
 statement ok
@@ -656,10 +655,10 @@ ALTER TABLE delivery DROP COLUMN "item"
 statement ok
 DROP INDEX products@products_upc_key CASCADE
 
-statement error "products" is referenced by foreign key from table "orders"
+statement error "products" is referenced by foreign key from table "customer reviews"
 DROP TABLE products
 
-statement error referenced by foreign key from table "orders"
+statement error referenced by foreign key from table "customer reviews"
 DROP TABLE products RESTRICT
 
 statement error referenced by foreign key from table "customer reviews"
@@ -828,8 +827,7 @@ refpairs  CREATE TABLE public.refpairs (
           rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
           CONSTRAINT refpairs_pkey PRIMARY KEY (rowid ASC),
           CONSTRAINT refpairs_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.pairs(src, dest) ON UPDATE RESTRICT,
-          INDEX refpairs_a_b_c_idx (a ASC, b ASC, c ASC),
-          FAMILY "primary" (a, b, c, rowid)
+          INDEX refpairs_a_b_c_idx (a ASC, b ASC, c ASC)
 )
 
 statement error pgcode 23503 insert on table "refpairs" violates foreign key constraint "refpairs_a_b_fkey"\nDETAIL: Key \(a, b\)=\(100, 'two'\) is not present in table "pairs".
@@ -999,19 +997,15 @@ DELETE FROM a WHERE id > 2
 statement ok
 DELETE FROM b WHERE id = 2
 
-let $a_table_id
-SELECT 'a'::REGCLASS::INT::STRING
-
 statement ok
 DROP TABLE a
 
 # Check proper GC job description formatting when removing FK back-references when dropping a table (#59221).
-query T
-SELECT job_type FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' AND
- (description LIKE 'GC for updating table "a"%' OR
-  description = 'GC for dropping descriptor ' || $a_table_id);
+query TT
+SELECT job_type, description FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' AND
+ description LIKE 'GC for DROP TABLE test.public.a';
 ----
-SCHEMA CHANGE GC
+SCHEMA CHANGE GC  GC for DROP TABLE test.public.a
 
 statement ok
 DROP TABLE b
@@ -1049,8 +1043,7 @@ refers  CREATE TABLE public.refers (
         CONSTRAINT refers_pkey PRIMARY KEY (rowid ASC),
         CONSTRAINT refers_a_fkey FOREIGN KEY (a) REFERENCES public.referee(id),
         INDEX another_idx (b ASC),
-        INDEX foo (a ASC),
-        FAMILY "primary" (a, b, rowid)
+        INDEX foo (a ASC)
 )
 
 statement ok
@@ -1129,8 +1122,7 @@ SHOW CREATE TABLE pkref_b
 pkref_b  CREATE TABLE public.pkref_b (
          b INT8 NOT NULL,
          CONSTRAINT pkref_b_pkey PRIMARY KEY (b ASC),
-         CONSTRAINT pkref_b_b_fkey FOREIGN KEY (b) REFERENCES public.pkref_a(a) ON DELETE RESTRICT,
-         FAMILY "primary" (b)
+         CONSTRAINT pkref_b_b_fkey FOREIGN KEY (b) REFERENCES public.pkref_a(a) ON DELETE RESTRICT
 )
 
 subtest 20042
@@ -3182,11 +3174,23 @@ SELECT * FROM t2
 NULL
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE NO ACTION', followed by 'ON DELETE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE NO ACTION; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE NO ACTION;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3199,11 +3203,23 @@ SELECT * FROM t2
 ----
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE RESTRICT', followed by 'ON DELETE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE RESTRICT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE RESTRICT;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3217,11 +3233,23 @@ SELECT * FROM t2
 NULL
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE RESTRICT', followed by 'ON DELETE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE RESTRICT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE RESTRICT;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3234,11 +3262,23 @@ SELECT * FROM t2
 ----
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE CASCADE', followed by 'ON DELETE SET DEFAULT'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3251,11 +3291,23 @@ SELECT * FROM t2
 ----
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE CASCADE', followed by 'ON DELETE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3268,7 +3320,16 @@ SELECT * FROM t2
 ----
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE CASCADE'
 statement ok
@@ -3288,7 +3349,16 @@ SELECT * FROM t2
 123
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE SET NULL'
 statement ok
@@ -3308,11 +3378,23 @@ SELECT * FROM t2
 123
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON DELETE SET NULL', followed by 'ON DELETE SET DEFAULT'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3326,24 +3408,45 @@ SELECT * FROM t2
 NULL
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
 
 statement ok
-DROP TABLE t2 CASCADE; DROP TABLE t1 CASCADE
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
+
+statement ok
+DROP TABLE t2 CASCADE;
+
+statement ok
+DROP TABLE t1 CASCADE
 
 #
 # ON UPDATE
 #
 
 statement ok
-CREATE TABLE t1 (a INT PRIMARY KEY); CREATE TABLE t2 (a INT DEFAULT 1)
+CREATE TABLE t1 (a INT PRIMARY KEY);
+
+statement ok
+CREATE TABLE t2 (a INT DEFAULT 1)
 
 # 'ON UPDATE NO ACTION', followed by 'ON UPDATE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE NO ACTION; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE NO ACTION;
 
 statement ok
-insert into t1 values (123); insert into t2 values (123)
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
+
+statement ok
+insert into t1 values (123);
+
+statement ok
+insert into t2 values (123)
 
 statement ok
 UPDATE t1 SET a = 2 WHERE a = 123
@@ -3354,17 +3457,29 @@ SELECT * FROM t2
 NULL
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE NO ACTION', followed by 'ON UPDATE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE NO ACTION; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE NO ACTION;
 
 statement ok
-insert into t1 values (123); insert into t2 values (123)
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE
 
 statement ok
-UPDATE t1 SET a = 2 WHERE a = 123
+insert into t1 values (123);
+
+statement ok
+insert into t2 values (123); UPDATE t1 SET a = 2 WHERE a = 123
 
 query I
 SELECT * FROM t2
@@ -3372,11 +3487,23 @@ SELECT * FROM t2
 2
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE RESTRICT', followed by 'ON UPDATE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE RESTRICT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE RESTRICT;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3390,11 +3517,23 @@ SELECT * FROM t2
 NULL
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE RESTRICT', followed by 'ON UPDATE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE RESTRICT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE RESTRICT;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3408,11 +3547,23 @@ SELECT * FROM t2
 2
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE CASCADE', followed by 'ON UPDATE SET DEFAULT'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3426,11 +3577,23 @@ SELECT * FROM t2
 2
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE CASCADE', followed by 'ON UPDATE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3444,11 +3607,23 @@ SELECT * FROM t2
 2
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE SET DEFAULT', followed by 'ON UPDATE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE CASCADE
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3462,11 +3637,23 @@ SELECT * FROM t2
 123
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE SET DEFAULT', followed by 'ON UPDATE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3480,11 +3667,23 @@ SELECT * FROM t2
 123
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
+
+statement ok
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
 
 # 'ON UPDATE SET NULL', followed by 'ON UPDATE SET DEFAULT'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET NULL;
+
+statement ok
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON UPDATE SET DEFAULT
 
 statement ok
 insert into t1 values (123); insert into t2 values (123)
@@ -3498,10 +3697,22 @@ SELECT * FROM t2
 NULL
 
 statement ok
-ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE TABLE t2; TRUNCATE TABLE t1
+ALTER TABLE t2 DROP CONSTRAINT fk1;
 
 statement ok
-DROP TABLE t2 CASCADE; DROP TABLE t1 CASCADE
+ALTER TABLE t2 DROP CONSTRAINT fk2;
+
+statement ok
+TRUNCATE TABLE t2;
+
+statement ok
+TRUNCATE TABLE t1
+
+statement ok
+DROP TABLE t2 CASCADE;
+
+statement ok
+DROP TABLE t1 CASCADE
 
 # Test FK check that is using a non-unique index (#43969). In this case the
 # index on k2 is preferred because it doesn't contain unnecessary column v.
@@ -3839,3 +4050,38 @@ NOTICE: type of foreign key column "parent_id" (int4) is not identical to refere
 
 statement ok
 DROP DATABASE db_type_test
+
+# Regression test for #76852. Correctly maintain child indexes on virtual
+# columns during a cascading delete.
+statement ok
+CREATE TABLE p76852 (
+  p STRING PRIMARY KEY,
+  i INT
+);
+CREATE TABLE c76852 (
+  b BOOL,
+  v STRING AS (b::STRING) VIRTUAL,
+  p STRING REFERENCES p76852 (p) ON DELETE CASCADE,
+  PRIMARY KEY (p, b),
+  INDEX idx (v)
+);
+
+statement ok
+INSERT INTO p76852 (p, i) VALUES ('foo', 1);
+INSERT INTO c76852 (b, p) VALUES (true, 'foo');
+DELETE FROM p76852 WHERE true;
+
+# Fast path case.
+query B
+SELECT b FROM c76852@idx WHERE b
+----
+
+statement ok
+INSERT INTO p76852 (p, i) VALUES ('foo', 1);
+INSERT INTO c76852 (b, p) VALUES (true, 'foo');
+DELETE FROM p76852 WHERE i = 1;
+
+# Non-fast path case.
+query B
+SELECT b FROM c76852@idx WHERE b
+----

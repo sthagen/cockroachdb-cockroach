@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"path/filepath"
@@ -64,17 +63,17 @@ func TestEngineComparer(t *testing.T) {
 		Timestamp: hlc.Timestamp{WallTime: 2},
 	}
 
-	require.Equal(t, -1, EngineComparer.Compare(EncodeKey(keyAMetadata), EncodeKey(keyA1)),
+	require.Equal(t, -1, EngineComparer.Compare(EncodeMVCCKey(keyAMetadata), EncodeMVCCKey(keyA1)),
 		"expected key metadata to sort first")
-	require.Equal(t, -1, EngineComparer.Compare(EncodeKey(keyA2), EncodeKey(keyA1)),
+	require.Equal(t, -1, EngineComparer.Compare(EncodeMVCCKey(keyA2), EncodeMVCCKey(keyA1)),
 		"expected higher timestamp to sort first")
-	require.Equal(t, -1, EngineComparer.Compare(EncodeKey(keyA2), EncodeKey(keyB2)),
+	require.Equal(t, -1, EngineComparer.Compare(EncodeMVCCKey(keyA2), EncodeMVCCKey(keyB2)),
 		"expected lower key to sort first")
 
 	suffix := func(key []byte) []byte {
 		return key[EngineComparer.Split(key):]
 	}
-	require.Equal(t, -1, EngineComparer.Compare(suffix(EncodeKey(keyA2)), suffix(EncodeKey(keyA1))),
+	require.Equal(t, -1, EngineComparer.Compare(suffix(EncodeMVCCKey(keyA2)), suffix(EncodeMVCCKey(keyA1))),
 		"expected bare suffix with higher timestamp to sort first")
 }
 
@@ -102,7 +101,7 @@ func TestPebbleTimeBoundPropCollector(t *testing.T) {
 					return err.Error()
 				}
 				ikey := pebble.InternalKey{
-					UserKey: EncodeKey(MVCCKey{
+					UserKey: EncodeMVCCKey(MVCCKey{
 						Key:       key,
 						Timestamp: hlc.Timestamp{WallTime: int64(timestamp)},
 					}),
@@ -266,7 +265,8 @@ func TestPebbleIterBoundSliceStabilityAndNoop(t *testing.T) {
 
 	eng := createTestPebbleEngine().(*Pebble)
 	defer eng.Close()
-	iter := newPebbleIterator(eng.db, nil, IterOptions{UpperBound: roachpb.Key("foo")})
+	iter := newPebbleIterator(
+		eng.db, nil, IterOptions{UpperBound: roachpb.Key("foo")}, StandardDurability)
 	defer iter.Close()
 	checker := &iterBoundsChecker{t: t}
 	iter.testingSetBoundsListener = checker
@@ -416,8 +416,8 @@ func TestPebbleSeparatorSuccessor(t *testing.T) {
 	}
 	for _, tc := range sepCases {
 		t.Run("", func(t *testing.T) {
-			got := string(EngineComparer.Separator(nil, EncodeKey(tc.a), EncodeKey(tc.b)))
-			if got != string(EncodeKey(tc.want)) {
+			got := string(EngineComparer.Separator(nil, EncodeMVCCKey(tc.a), EncodeMVCCKey(tc.b)))
+			if got != string(EncodeMVCCKey(tc.want)) {
 				t.Errorf("a, b = %q, %q: got %q, want %q", tc.a, tc.b, got, tc.want)
 			}
 		})
@@ -451,8 +451,8 @@ func TestPebbleSeparatorSuccessor(t *testing.T) {
 	}
 	for _, tc := range succCases {
 		t.Run("", func(t *testing.T) {
-			got := string(EngineComparer.Successor(nil, EncodeKey(tc.a)))
-			if got != string(EncodeKey(tc.want)) {
+			got := string(EngineComparer.Successor(nil, EncodeMVCCKey(tc.a)))
+			if got != string(EncodeMVCCKey(tc.want)) {
 				t.Errorf("a = %q: got %q, want %q", tc.a, got, tc.want)
 			}
 		})
@@ -500,9 +500,9 @@ func TestPebbleIterConsistency(t *testing.T) {
 	require.NoError(t, eng.PutMVCC(k1, []byte("a1")))
 
 	var (
-		roEngine  = eng.NewReadOnly()
+		roEngine  = eng.NewReadOnly(StandardDurability)
 		batch     = eng.NewBatch()
-		roEngine2 = eng.NewReadOnly()
+		roEngine2 = eng.NewReadOnly(StandardDurability)
 		batch2    = eng.NewBatch()
 	)
 	defer roEngine.Close()
@@ -601,26 +601,42 @@ func TestPebbleIterConsistency(t *testing.T) {
 }
 
 func BenchmarkMVCCKeyCompare(b *testing.B) {
+	keys := makeRandEncodedKeys()
+	b.ResetTimer()
+	for i, j := 0, 0; i < b.N; i, j = i+1, j+3 {
+		_ = EngineKeyCompare(keys[i%len(keys)], keys[j%len(keys)])
+	}
+}
+
+func BenchmarkMVCCKeyEqual(b *testing.B) {
+	keys := makeRandEncodedKeys()
+	b.ResetTimer()
+	for i, j := 0, 0; i < b.N; i, j = i+1, j+3 {
+		_ = EngineKeyEqual(keys[i%len(keys)], keys[j%len(keys)])
+	}
+}
+
+func makeRandEncodedKeys() [][]byte {
 	rng := rand.New(rand.NewSource(timeutil.Now().Unix()))
 	keys := make([][]byte, 1000)
 	for i := range keys {
 		k := MVCCKey{
-			Key: randutil.RandBytes(rng, 8),
+			Key: []byte("shared" + [...]string{"a", "b", "c"}[rng.Intn(3)]),
 			Timestamp: hlc.Timestamp{
-				WallTime: int64(rng.Intn(5)),
+				WallTime: rng.Int63n(5),
 			},
 		}
-		keys[i] = EncodeKey(k)
+		if rng.Int31n(5) == 0 {
+			// 20% of keys have a logical component.
+			k.Timestamp.Logical = rng.Int31n(4) + 1
+		}
+		if rng.Int31n(1000) == 0 && !k.Timestamp.IsEmpty() {
+			// 0.1% of keys have a synthetic component.
+			k.Timestamp.Synthetic = true
+		}
+		keys[i] = EncodeMVCCKey(k)
 	}
-
-	b.ResetTimer()
-	var c int
-	for i, j := 0, 0; i < b.N; i, j = i+1, j+3 {
-		c = EngineKeyCompare(keys[i%len(keys)], keys[j%len(keys)])
-	}
-	if testing.Verbose() {
-		fmt.Fprint(ioutil.Discard, c)
-	}
+	return keys
 }
 
 type testValue struct {
@@ -1111,18 +1127,34 @@ func TestPebbleMVCCTimeIntervalCollector(t *testing.T) {
 	// The added key was not an MVCCKey.
 	finishAndCheck(0, 0)
 	require.NoError(t, collector.Add(pebble.InternalKey{
-		UserKey: EncodeKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 2, Logical: 1}})},
+		UserKey: EncodeMVCCKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 2, Logical: 1}})},
 		[]byte("foo")))
 	// Added 1 MVCCKey which sets both the upper and lower bound.
 	finishAndCheck(2, 3)
 	require.NoError(t, collector.Add(pebble.InternalKey{
-		UserKey: EncodeKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 22, Logical: 1}})},
+		UserKey: EncodeMVCCKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 22, Logical: 1}})},
 		[]byte("foo")))
 	require.NoError(t, collector.Add(pebble.InternalKey{
-		UserKey: EncodeKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 25, Logical: 1}})},
+		UserKey: EncodeMVCCKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 25, Logical: 1}})},
 		[]byte("foo")))
 	// Added 2 MVCCKeys.
 	finishAndCheck(22, 26)
+	// Using the same suffix for all keys in a block results in an interval of
+	// width one (inclusive lower bound to exclusive upper bound).
+	suffix := EncodeMVCCTimestampSuffix(hlc.Timestamp{WallTime: 42, Logical: 1})
+	require.NoError(t, collector.UpdateKeySuffixes(
+		nil /* old prop */, nil /* old suffix */, suffix,
+	))
+	finishAndCheck(42, 43)
+	// An invalid key results in an error.
+	// Case 1: malformed sentinel.
+	key := EncodeMVCCKey(MVCCKey{aKey, hlc.Timestamp{WallTime: 2, Logical: 1}})
+	sentinelPos := len(key) - 1 - int(key[len(key)-1])
+	key[sentinelPos] = '\xff'
+	require.Error(t, collector.UpdateKeySuffixes(nil, nil, key))
+	// Case 2: malformed bare suffix (too short).
+	suffix = EncodeMVCCTimestampSuffix(hlc.Timestamp{WallTime: 42, Logical: 1})[1:]
+	require.Error(t, collector.UpdateKeySuffixes(nil, nil, suffix))
 }
 
 func TestPebbleMVCCTimeIntervalCollectorAndFilter(t *testing.T) {
@@ -1164,4 +1196,60 @@ func TestPebbleMVCCTimeIntervalCollectorAndFilter(t *testing.T) {
 	require.NoError(t, err)
 	expected := []int64{7, 6, 5}
 	require.Equal(t, expected, found)
+}
+
+func TestPebbleFlushCallbackAndDurabilityRequirement(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	eng := createTestPebbleEngine()
+	defer eng.Close()
+
+	ts := hlc.Timestamp{WallTime: 1}
+	k := MVCCKey{[]byte("a"), ts}
+	// Write.
+	require.NoError(t, eng.PutMVCC(k, []byte("a1")))
+	cbCount := int32(0)
+	eng.RegisterFlushCompletedCallback(func() {
+		atomic.AddInt32(&cbCount, 1)
+	})
+	roStandard := eng.NewReadOnly(StandardDurability)
+	defer roStandard.Close()
+	roGuaranteed := eng.NewReadOnly(GuaranteedDurability)
+	defer roGuaranteed.Close()
+	roGuaranteedPinned := eng.NewReadOnly(GuaranteedDurability)
+	defer roGuaranteedPinned.Close()
+	require.NoError(t, roGuaranteedPinned.PinEngineStateForIterators())
+	// Returns the value found or nil.
+	checkGetAndIter := func(reader Reader) []byte {
+		v, err := reader.MVCCGet(k)
+		require.NoError(t, err)
+		iter := reader.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: k.Key.Next()})
+		defer iter.Close()
+		iter.SeekGE(k)
+		valid, err := iter.Valid()
+		require.NoError(t, err)
+		require.Equal(t, v != nil, valid)
+		if valid {
+			require.Equal(t, v, iter.Value())
+		}
+		return v
+	}
+	require.Equal(t, "a1", string(checkGetAndIter(roStandard)))
+	// Write is not visible yet.
+	require.Nil(t, checkGetAndIter(roGuaranteed))
+	require.Nil(t, checkGetAndIter(roGuaranteedPinned))
+
+	// Flush the engine and wait for it to complete.
+	require.NoError(t, eng.Flush())
+	testutils.SucceedsSoon(t, func() error {
+		if atomic.LoadInt32(&cbCount) < 1 {
+			return errors.Errorf("not flushed")
+		}
+		return nil
+	})
+	// Write is visible to new guaranteed reader. We need to use a new reader
+	// due to iterator caching.
+	roGuaranteed2 := eng.NewReadOnly(GuaranteedDurability)
+	defer roGuaranteed2.Close()
+	require.Equal(t, "a1", string(checkGetAndIter(roGuaranteed2)))
 }

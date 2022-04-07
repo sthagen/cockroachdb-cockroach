@@ -13,11 +13,12 @@ package cockroach.server.serverpb;
 option go_package = "serverpb";
 
 import "config/zonepb/zone.proto";
+import "util/tracing/tracingpb/tracing.proto";
 import "jobs/jobspb/jobs.proto";
 import "server/serverpb/status.proto";
 import "storage/enginepb/mvcc.proto";
 import "kv/kvserver/liveness/livenesspb/liveness.proto";
-import "kv/kvserver/kvserverpb/log.proto";
+import "kv/kvserver/kvserverpb/range_log.proto";
 import "roachpb/api.proto";
 import "ts/catalog/chart_catalog.proto";
 import "util/metric/metric.proto";
@@ -92,6 +93,8 @@ message DatabaseDetailsResponse {
     // node_ids is the ordered list of node ids on which data is stored.
     repeated int32 node_ids = 4 [(gogoproto.customname) = "NodeIDs",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+
+    int32 num_index_recommendations = 5;
   }
 
   // grants are the results of SHOW GRANTS for this database.
@@ -210,6 +213,11 @@ message TableDetailsResponse {
   // for this table. It is a SQL statement that would re-configure the table's current
   // zone if executed.
   string configure_zone_statement = 9;
+  // stats_last_created_at is the time at which statistics were last created.
+  google.protobuf.Timestamp stats_last_created_at = 10 [(gogoproto.stdtime) = true];
+  // has_index_recommendations notifies if the there are index recommendations
+  // on this table.
+  bool has_index_recommendations = 11;
 }
 
 // TableStatsRequest is a request for detailed, computationally expensive
@@ -473,6 +481,8 @@ message DrainResponse {
 message DecommissionStatusRequest {
   repeated int32 node_ids = 1 [(gogoproto.customname) = "NodeIDs",
                                (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+  // The number of decommissioning replicas to be reported.
+  int32 num_replica_report = 2;
 }
 
 // DecommissionRequest requests the server to set the membership status on
@@ -483,10 +493,18 @@ message DecommissionRequest {
   repeated int32 node_ids = 1 [(gogoproto.customname) = "NodeIDs",
                                (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
   kv.kvserver.liveness.livenesspb.MembershipStatus target_membership = 2;
+  // The number of decommissioning replicas to be reported.
+  int32 num_replica_report = 3;
 }
 
 // DecommissionStatusResponse lists decommissioning statuses for a number of NodeIDs.
 message DecommissionStatusResponse {
+  message Replica {
+    int32 replica_id = 1 [ (gogoproto.customname) = "ReplicaID",
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.ReplicaID"];
+    int32 range_id = 2 [ (gogoproto.customname) = "RangeID",
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID"];
+  }
   message Status {
     int32 node_id = 1 [ (gogoproto.customname) = "NodeID",
                         (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
@@ -496,6 +514,10 @@ message DecommissionStatusResponse {
     // The membership status of the given node.
     kv.kvserver.liveness.livenesspb.MembershipStatus membership = 4;
     bool draining = 5;
+    // Decommissioning replicas on the given node to be reported.
+    // How many replicas are reported is determined by what was specified in the
+    // request.
+    repeated Replica reported_replicas = 6;
   }
   // Status of all affected nodes.
   repeated Status status = 2 [(gogoproto.nullable) = false];
@@ -522,6 +544,7 @@ message SettingsResponse {
       string type = 2;
       string description = 3;
       bool public = 4;
+      google.protobuf.Timestamp last_updated = 5 [(gogoproto.nullable) = true, (gogoproto.stdtime) = true];
    }
    map<string, Value> key_values = 1 [(gogoproto.nullable) = false];
 }
@@ -634,6 +657,10 @@ message JobResponse {
   // guaranteed to contain all execution failures and some execution failures
   // may not contain an error or end.
   repeated ExecutionFailure execution_failures = 20;
+
+  // coordinator_id identifies the node coordinating the job. This value will
+  // only be present for jobs that are currently running or recently ran.
+  int64 coordinator_id = 21 [(gogoproto.customname) = "CoordinatorID"];
 }
 
 // LocationsRequest requests system locality location information.
@@ -1043,4 +1070,166 @@ service Admin {
   // response. It is used by the CLI `debug send-kv-batch` command.
   rpc SendKVBatch(roachpb.BatchRequest) returns (roachpb.BatchResponse) {
   }
+
+  // ListTracingSnapshots retrieves the list of snapshots of the Active Spans
+  // Registry that the node currently has in memory. A new snapshot can be
+  // captured with TakeTracingSnapshots.
+  rpc ListTracingSnapshots(ListTracingSnapshotsRequest) returns (ListTracingSnapshotsResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/trace_snapshots"
+    };
+  }
+
+  // TakeTracingSnapshot captures a new snapshot of the Active Spans Registry.
+  // The new snapshot is returned, and also made available through
+  // ListTracingSnapshots.
+  rpc TakeTracingSnapshot(TakeTracingSnapshotRequest) returns (TakeTracingSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/_admin/v1/trace_snapshots"
+    };
+  }
+
+  // GetTracingSnapshot returns a snapshot of the tracing spans in the active
+  // spans registry previously generated through TakeTracingSnapshots.
+  rpc GetTracingSnapshot(GetTracingSnapshotRequest) returns (GetTracingSnapshotResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/trace_snapshots/{snapshot_id}"
+    };
+  }
+
+  // GetTrace returns the trace with a specified ID. Depending on the request,
+  // the trace is returned either from a snapshot that was previously taken, or
+  // directly from the active spans registry.
+  rpc GetTrace(GetTraceRequest) returns (GetTraceResponse) {
+    option (google.api.http) = {
+      post: "/_admin/v1/traces"
+      body: "*"
+    };
+  }
+
+  // SetTraceRecordingType sets the recording mode of all or some of the spans
+  // in a trace.
+  rpc SetTraceRecordingType(SetTraceRecordingTypeRequest) returns (SetTraceRecordingTypeResponse) {
+    option (google.api.http) = {
+      post: "/_admin/v1/settracerecordingtype"
+      body: "*"
+    };
+  }
 }
+
+message ListTracingSnapshotsRequest {}
+
+message ListTracingSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message SnapshotInfo {
+  int64 snapshot_id = 1 [(gogoproto.customname) = "SnapshotID"];
+  google.protobuf.Timestamp captured_at = 2 [(gogoproto.stdtime) = true];
+}
+
+message TakeTracingSnapshotRequest {}
+
+message TakeTracingSnapshotResponse {
+  SnapshotInfo snapshot = 1;
+}
+
+message GetTracingSnapshotRequest {
+  int64 snapshot_id = 1;
+}
+
+message GetTracingSnapshotResponse {
+  TracingSnapshot snapshot = 1;
+}
+
+// GetTrace represents the request of the GetTrace RPC.
+message GetTraceRequest {
+  // If a snapshot is specified, the trace information is returned from that
+  // snapshot. If a snapshot is not specified, information about currently
+  // opened spans is returned from the active spans registry.
+  int64 snapshot_id = 1 [(gogoproto.customname) = "SnapshotID"];
+  uint64 trace_id = 2 [(gogoproto.nullable)=false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
+  util.tracing.tracingpb.RecordingMode recording_type = 3;
+}
+
+// GetTrace represents the response to the GetTrace RPC.
+message GetTraceResponse {
+  // snapshot_id identifies the snapshot that the trace was retrieved from. If
+  // 0, the trace was not retrieved from a registry, but directly from the
+  // active spans registry.
+  int64 snapshot_id = 1 [(gogoproto.customname) = "SnapshotID"];
+  uint64 trace_id = 2 [(gogoproto.nullable)=false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
+  // still_exists is set if any spans from this trace are currently present in
+  // the active spans registry.
+  //
+  // If snapshot_id is 0, still_exists is always set.
+  bool still_exists = 3;
+  // serialized_recording represents the serialization of trace recording. We
+  // return the recording already serialized as formatted string for easy
+  // consumption in the browser.
+  string serialized_recording = 4;
+}
+
+// TracingSnapshot represents a snapshot of the active spans registry, including
+// all the spans that were open at the time when the snapshot was taken.
+message TracingSnapshot {
+  int64 snapshot_id = 1 [(gogoproto.customname) = "SnapshotID"];
+  google.protobuf.Timestamp captured_at = 2 [(gogoproto.stdtime) = true];
+  repeated TracingSpan spans = 3;
+  // Ideally we'd use int64 to match the goroutine_id type
+  // but unfortunately, the way that grpc-gateway parses
+  // these objects into Javascript results in odd encodings
+  // of Long JS types that are difficult to interact with
+  // as map keys. Thus, we settle for string.
+  map<string, string> stacks = 4;
+}
+
+// TracingSpan represents a span, in a form slightly processed for the use of
+// the tracing UI.
+message TracingSpan {
+  string operation = 1;
+  uint64 trace_id = 2 [(gogoproto.customname) = "TraceID"];
+  uint64 span_id = 3 [(gogoproto.customname) = "SpanID"];
+  uint64 parent_span_id = 4 [(gogoproto.customname) = "ParentSpanID"];
+  google.protobuf.Timestamp start = 5 [(gogoproto.stdtime) = true, (gogoproto.nullable) = false];
+  uint64 goroutine_id = 6 [(gogoproto.customname) = "GoroutineID"];
+  repeated SpanTag processed_tags = 7;
+  // current is set if the span is still alive (i.e. still present in the active
+  // spans registry).
+  bool current = 8;
+  // current_recording_mode represents the span's current recording mode. This is
+  // not set if current == false.
+  util.tracing.tracingpb.RecordingMode current_recording_mode = 9;
+}
+
+// SpanTag represents a tag on a tracing span, in a form processed for the use
+// of the tracing UI.
+message SpanTag {
+  string key = 1;
+  string val = 2;
+  string caption = 3;
+  string link = 4;
+  bool hidden = 5;
+  bool highlight = 6;
+  bool inherit = 7;
+  bool inherited = 8;
+  bool propagate_up = 9;
+  bool copied_from_child = 10;
+}
+
+// SetTraceRecordingTypeRequest is the request for SetTraceRecordingType, which
+// sets the recording mode of all or some of the spans in a trace.
+message SetTraceRecordingTypeRequest {
+  // TraceID identifies the trace to toggle the recording of. It must always be
+  // specified.
+  uint64 trace_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
+  // SpanID, if not zero, controls which spans in the trace get their recording
+  // mode set. If zero, all spans in the trace are updated. If not zero, only
+  // the respective span and its descendants get updated.
+  uint64 span_id = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "SpanID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.SpanID"];
+  util.tracing.tracingpb.RecordingMode recording_mode = 3;
+}
+
+// SetTraceRecordingTypeRequest is the response for SetTraceRecordingType.
+message SetTraceRecordingTypeResponse{}
+

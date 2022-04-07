@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -41,6 +42,9 @@ func lookupDescriptorsUnvalidated(
 		for _, id := range ids {
 			key := catalogkeys.MakeDescMetadataKey(codec, id)
 			b.Get(key)
+		}
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, "looking up unvalidated descriptors by id: %v", ids)
 		}
 	})
 	if err != nil {
@@ -81,14 +85,14 @@ func lookupIDs(
 	}
 	ret := make([]descpb.ID, len(nameInfos))
 	for i, nameInfo := range nameInfos {
-		id := cb.LookupNamespaceEntry(nameInfo)
-		if id == descpb.InvalidID {
+		ne := cb.LookupNamespaceEntry(nameInfo)
+		if ne == nil {
 			if cq.isRequired {
 				return nil, errors.AssertionFailedf("expected namespace entry for %s, none found", nameInfo.String())
 			}
 			continue
 		}
-		ret[i] = id
+		ret[i] = ne.GetID()
 	}
 	return ret, nil
 }
@@ -199,7 +203,9 @@ func build(
 	if expectedType != catalog.Any && b.DescriptorType() != expectedType {
 		return nil, pgerror.Newf(pgcode.WrongObjectType, "descriptor is a %s", b.DescriptorType())
 	}
-	b.RunPostDeserializationChanges()
+	if err := b.RunPostDeserializationChanges(); err != nil {
+		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error during RunPostDeserializationChanges")
+	}
 	desc := b.BuildImmutable()
 	if id != desc.GetID() {
 		return nil, errors.AssertionFailedf("unexpected ID %d in descriptor", desc.GetID())

@@ -11,13 +11,13 @@ package changefeedccl
 import (
 	"context"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -27,18 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
-
-// TopicDescriptor describes topic emitted by the sink.
-type TopicDescriptor interface {
-	// GetName returns topic name.
-	GetName() string
-	// GetID returns topic identifier.
-	GetID() descpb.ID
-	// GetVersion returns topic version.
-	// For example, the underlying data source (e.g. table) may change, in which case
-	// we may want to emit same Name/ID, but a different version number.
-	GetVersion() descpb.DescriptorVersion
-}
 
 // Sink is an abstraction for anything that a changefeed may emit into.
 type Sink interface {
@@ -109,7 +97,7 @@ func getSink(
 			return makeNullSink(sinkURL{URL: u}, m)
 		case u.Scheme == changefeedbase.SinkSchemeKafka:
 			return validateOptionsAndMakeSink(changefeedbase.KafkaValidOptions, func() (Sink, error) {
-				return makeKafkaSink(ctx, sinkURL{URL: u}, feedCfg.Targets, feedCfg.Opts, m)
+				return makeKafkaSink(ctx, sinkURL{URL: u}, AllTargets(feedCfg), feedCfg.Opts, m)
 			})
 		case isWebhookSink(u):
 			return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
@@ -119,7 +107,7 @@ func getSink(
 		case isPubsubSink(u):
 			// TODO: add metrics to pubsubsink
 			return validateOptionsAndMakeSink(changefeedbase.PubsubValidOptions, func() (Sink, error) {
-				return MakePubsubSink(ctx, u, feedCfg.Opts, feedCfg.Targets)
+				return MakePubsubSink(ctx, u, feedCfg.Opts, AllTargets(feedCfg))
 			})
 		case isCloudStorageSink(u):
 			return validateOptionsAndMakeSink(changefeedbase.CloudStorageValidOptions, func() (Sink, error) {
@@ -130,7 +118,7 @@ func getSink(
 			})
 		case u.Scheme == changefeedbase.SinkSchemeExperimentalSQL:
 			return validateOptionsAndMakeSink(changefeedbase.SQLValidOptions, func() (Sink, error) {
-				return makeSQLSink(sinkURL{URL: u}, sqlSinkTableName, feedCfg.Targets, m)
+				return makeSQLSink(sinkURL{URL: u}, sqlSinkTableName, AllTargets(feedCfg), m)
 			})
 		case u.Scheme == "":
 			return nil, errors.Errorf(`no scheme found for sink URL %q`, feedCfg.SinkURI)
@@ -322,16 +310,17 @@ func (s *bufferSink) EmitRow(
 	r kvevent.Alloc,
 ) error {
 	defer r.Release(ctx)
-	defer s.metrics.recordEmittedMessages()(1, mvcc, len(key)+len(value), sinkDoesNotCompress)
+	defer s.metrics.recordOneMessage()(mvcc, len(key)+len(value), sinkDoesNotCompress)
 
 	if s.closed {
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
+
 	s.buf.Push(rowenc.EncDatumRow{
 		{Datum: tree.DNull}, // resolved span
-		{Datum: s.alloc.NewDString(tree.DString(topic.GetName()))}, // topic
-		{Datum: s.alloc.NewDBytes(tree.DBytes(key))},               // key
-		{Datum: s.alloc.NewDBytes(tree.DBytes(value))},             // value
+		{Datum: s.getTopicDatum(topic)},
+		{Datum: s.alloc.NewDBytes(tree.DBytes(key))},   // key
+		{Datum: s.alloc.NewDBytes(tree.DBytes(value))}, // value
 	})
 	return nil
 }
@@ -377,6 +366,12 @@ func (s *bufferSink) Dial() error {
 	return nil
 }
 
+// TODO (zinger): Make this a tuple or array datum if it can be
+// done without breaking backwards compatibility.
+func (s *bufferSink) getTopicDatum(t TopicDescriptor) *tree.DString {
+	return s.alloc.NewDString(tree.DString(strings.Join(t.GetNameComponents(), ".")))
+}
+
 type nullSink struct {
 	ticker  *time.Ticker
 	metrics *sliMetrics
@@ -417,7 +412,7 @@ func (n *nullSink) EmitRow(
 	r kvevent.Alloc,
 ) error {
 	defer r.Release(ctx)
-	defer n.metrics.recordEmittedMessages()(1, mvcc, len(key)+len(value), sinkDoesNotCompress)
+	defer n.metrics.recordOneMessage()(mvcc, len(key)+len(value), sinkDoesNotCompress)
 	if err := n.pace(ctx); err != nil {
 		return err
 	}

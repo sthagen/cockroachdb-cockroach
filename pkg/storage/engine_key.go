@@ -42,6 +42,7 @@ type EngineKey struct {
 // their particular use case, that demultiplex on the various lengths below.
 // If adding another length to this list, remember to search for code
 // referencing these lengths and fix it.
+// TODO(nvanbenschoten): unify these constants with those in mvcc_key.go.
 const (
 	engineKeyNoVersion                             = 0
 	engineKeyVersionWallTimeLen                    = 8
@@ -64,6 +65,7 @@ func (k EngineKey) Format(f fmt.State, c rune) {
 // look like an encoded EngineKey. By splitting, at Key + \x00, the Key looks
 // like an EngineKey with no Version.
 const (
+	sentinel               = '\x00'
 	sentinelLen            = 1
 	suffixEncodedLengthLen = 1
 )

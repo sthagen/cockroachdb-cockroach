@@ -86,8 +86,8 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	for i, c := range scan.cols {
 		colIdxMap.Set(c.GetID(), i)
 	}
-	sb := span.MakeBuilder(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
-	defer sb.Release()
+	var sb span.Builder
+	sb.Init(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
 	scan.spans, err = sb.UnconstrainedSpans()
 	if err != nil {
 		return nil, err
@@ -254,7 +254,7 @@ func (dsp *DistSQLPlanner) createPlanForCreateStats(
 	histogramCollectionEnabled := stats.HistogramClusterMode.Get(&dsp.st.SV)
 	for i := 0; i < len(reqStats); i++ {
 		histogram := details.ColumnStats[i].HasHistogram && histogramCollectionEnabled
-		var histogramMaxBuckets uint32 = defaultHistogramBuckets
+		var histogramMaxBuckets uint32 = stats.DefaultHistogramBuckets
 		if details.ColumnStats[i].HistogramMaxBuckets > 0 {
 			histogramMaxBuckets = details.ColumnStats[i].HistogramMaxBuckets
 		}

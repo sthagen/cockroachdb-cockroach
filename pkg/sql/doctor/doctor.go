@@ -19,6 +19,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -51,6 +52,13 @@ type NamespaceTableRow struct {
 	ID int64
 }
 
+var _ catalog.NameEntry = (*NamespaceTableRow)(nil)
+
+// GetID implements the catalog.NameEntry interface.
+func (nsr *NamespaceTableRow) GetID() descpb.ID {
+	return descpb.ID(nsr.ID)
+}
+
 // NamespaceTable represents data read from `system.namespace`.
 type NamespaceTable []NamespaceTableRow
 
@@ -80,7 +88,9 @@ func processDescriptorTable(
 		}
 		b := descbuilder.NewBuilderWithMVCCTimestamp(&d, r.ModTime)
 		if b != nil {
-			b.RunPostDeserializationChanges()
+			if err := b.RunPostDeserializationChanges(); err != nil {
+				return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error during RunPostDeserializationChanges")
+			}
 			m[r.ID] = b.BuildImmutable()
 		}
 	}
@@ -91,7 +101,9 @@ func processDescriptorTable(
 			continue
 		}
 		b := desc.NewBuilder()
-		b.RunPostDeserializationChanges()
+		if err := b.RunPostDeserializationChanges(); err != nil {
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error during RunPostDeserializationChanges")
+		}
 		if err := b.RunRestoreChanges(func(id descpb.ID) catalog.Descriptor {
 			return m[int64(id)]
 		}); err != nil {
@@ -108,13 +120,21 @@ func processDescriptorTable(
 // Examine runs a suite of consistency checks over system tables.
 func Examine(
 	ctx context.Context,
+	version clusterversion.ClusterVersion,
 	descTable DescriptorTable,
 	namespaceTable NamespaceTable,
 	jobsTable JobsTable,
 	verbose bool,
 	stdout io.Writer,
 ) (ok bool, err error) {
-	descOk, err := ExamineDescriptors(ctx, descTable, namespaceTable, jobsTable, verbose, stdout)
+	descOk, err := ExamineDescriptors(
+		ctx,
+		version,
+		descTable,
+		namespaceTable,
+		jobsTable,
+		verbose,
+		stdout)
 	if err != nil {
 		return false, err
 	}
@@ -128,6 +148,7 @@ func Examine(
 // ExamineDescriptors runs a suite of checks over the descriptor table.
 func ExamineDescriptors(
 	ctx context.Context,
+	version clusterversion.ClusterVersion,
 	descTable DescriptorTable,
 	namespaceTable NamespaceTable,
 	jobsTable JobsTable,
@@ -163,7 +184,7 @@ func ExamineDescriptors(
 	for _, row := range descTable {
 		id := descpb.ID(row.ID)
 		desc := descLookupFn(id)
-		ve := cb.ValidateWithRecover(ctx, desc)
+		ve := cb.ValidateWithRecover(ctx, version, desc)
 		for _, err := range ve {
 			problemsFound = true
 			descReport(stdout, desc, "%s", err)
@@ -179,8 +200,7 @@ func ExamineDescriptors(
 		}
 	}
 	for _, row := range namespaceTable {
-		desc := cb.LookupDescriptorEntry(descpb.ID(row.ID))
-		err := validateNamespaceRow(row, desc)
+		err := cb.ValidateNamespaceEntry(row)
 		if err != nil {
 			problemsFound = true
 			nsReport(stdout, row, err.Error())
@@ -190,41 +210,6 @@ func ExamineDescriptors(
 	}
 
 	return !problemsFound, err
-}
-
-func validateNamespaceRow(row NamespaceTableRow, desc catalog.Descriptor) error {
-	id := descpb.ID(row.ID)
-	if id == keys.PublicSchemaID {
-		// The public schema doesn't have a descriptor.
-		return nil
-	}
-	isSchema := row.ParentID != keys.RootNamespaceID && row.ParentSchemaID == keys.RootNamespaceID
-	if isSchema && strings.HasPrefix(row.Name, "pg_temp_") {
-		// Temporary schemas have namespace entries but not descriptors.
-		return nil
-	}
-	if id == descpb.InvalidID {
-		return errors.New("invalid descriptor ID")
-	}
-	if desc == nil {
-		return catalog.ErrDescriptorNotFound
-	}
-	for _, dn := range desc.GetDrainingNames() {
-		if dn == row.NameInfo {
-			return nil
-		}
-	}
-	if desc.Dropped() {
-		return errors.Newf("no matching name info in draining names of dropped %s",
-			desc.DescriptorType())
-	}
-	if row.ParentID == desc.GetParentID() &&
-		row.ParentSchemaID == desc.GetParentSchemaID() &&
-		row.Name == desc.GetName() {
-		return nil
-	}
-	return errors.Newf("no matching name info found in non-dropped %s %q",
-		desc.DescriptorType(), desc.GetName())
 }
 
 // ExamineJobs runs a suite of consistency checks over the system.jobs table.
@@ -279,7 +264,7 @@ func descReport(stdout io.Writer, desc catalog.Descriptor, format string, args .
 func DumpSQL(out io.Writer, descTable DescriptorTable, namespaceTable NamespaceTable) error {
 	// Assume the target is an empty cluster with the same binary version
 	ms := bootstrap.MakeMetadataSchema(keys.SystemSQLCodec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
-	minUserDescID := ms.MaxSystemDescriptorID() + 1
+	minUserDescID := ms.FirstNonSystemDescriptorID()
 	minUserCreatedDescID := minUserDescID + descpb.ID(len(catalogkeys.DefaultUserDBs))*2
 	// Print first transaction, which removes all predefined user descriptors.
 	fmt.Fprintln(out, `BEGIN;`)

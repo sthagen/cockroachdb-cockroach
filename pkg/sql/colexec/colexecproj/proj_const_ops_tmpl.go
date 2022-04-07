@@ -28,13 +28,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexeccmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -84,7 +86,7 @@ func _ASSIGN(_, _, _, _, _, _ interface{}) {
 type _OP_CONST_NAME struct {
 	projConstOpBase
 	// {{if .NeedsBinaryOverloadHelper}}
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	// {{end}}
 	// {{if _IS_CONST_LEFT}}
 	constArg _L_GO_TYPE
@@ -95,9 +97,11 @@ type _OP_CONST_NAME struct {
 
 func (p _OP_CONST_NAME) Next() coldata.Batch {
 	// {{if .NeedsBinaryOverloadHelper}}
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
+	// {{/*
+	//     In order to inline the templated code of the binary overloads
+	//     operating on datums, we need to have a `_overloadHelper` local
+	//     variable of type `colexecbase.BinaryOverloadHelper`.
+	// */}}
 	_overloadHelper := p.BinaryOverloadHelper
 	// {{end}}
 	batch := p.Input.Next()
@@ -117,11 +121,6 @@ func (p _OP_CONST_NAME) Next() coldata.Batch {
 		// Capture col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
 		col := col
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec._RET_TYP()
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
@@ -133,9 +132,6 @@ func (p _OP_CONST_NAME) Next() coldata.Batch {
 		} else {
 			_SET_PROJECTION(false)
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -280,10 +276,10 @@ func GetProjection_CONST_SIDEConstOperator(
 	leftType, rightType := inputTypes[colIdx], constType
 	// {{end}}
 	switch op := op.(type) {
-	case tree.BinaryOperator:
+	case treebin.BinaryOperator:
 		switch op.Symbol {
 		// {{range .BinOps}}
-		case tree._NAME:
+		case treebin._NAME:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
 			// {{$leftFamilyStr := .LeftCanonicalFamilyStr}}
@@ -315,7 +311,7 @@ func GetProjection_CONST_SIDEConstOperator(
 								// {{end}}
 							}
 							// {{if .NeedsBinaryOverloadHelper}}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							// {{end}}
 							return op, nil
 							// {{end}}
@@ -334,14 +330,14 @@ func GetProjection_CONST_SIDEConstOperator(
 	//     the right side, so we skip generating the code when the constant is on
 	//     the left.
 	// */}}
-	case tree.ComparisonOperator:
+	case treecmp.ComparisonOperator:
 		if leftType.Family() != types.TupleFamily && rightType.Family() != types.TupleFamily {
 			// Tuple comparison has special null-handling semantics, so we will
 			// fallback to the default comparison operator if either of the
 			// input vectors is of a tuple type.
 			switch op.Symbol {
 			// {{range .CmpOps}}
-			case tree._NAME:
+			case treecmp._NAME:
 				switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 				// {{range .LeftFamilies}}
 				case _LEFT_CANONICAL_TYPE_FAMILY:

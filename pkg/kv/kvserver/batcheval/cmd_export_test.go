@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -47,13 +48,6 @@ func TestExportCmd(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: dir}})
 	defer tc.Stopper().Stop(ctx)
 	kvDB := tc.Server(0).DB()
-
-	// We can't get the tableID programmatically here.
-	// The table id can be retrieved by doing.
-	// CREATE DATABASE test;
-	// CREATE TABLE test.t();
-	// SELECT id FROM system.namespace WHERE name = 't' AND "parentID" != 1
-	const tableID = 56
 
 	export := func(
 		t *testing.T, start hlc.Timestamp, mvccFilter roachpb.MVCCFilter, maxResponseSSTBytes int64,
@@ -173,6 +167,10 @@ func TestExportCmd(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
 	sqlDB.Exec(t, `CREATE DATABASE mvcclatest`)
 	sqlDB.Exec(t, `CREATE TABLE mvcclatest.export (id INT PRIMARY KEY, value INT)`)
+	tableID := descpb.ID(sqlutils.QueryTableID(
+		t, sqlDB.DB, "mvcclatest", "public", "export",
+	))
+
 	const (
 		targetSizeSetting = "kv.bulk_sst.target_size"
 		maxOverageSetting = "kv.bulk_sst.max_allowed_overage"
@@ -436,6 +434,7 @@ func TestExportGCThreshold(t *testing.T) {
 // exportUsingGoIterator uses the legacy implementation of export, and is used
 // as an oracle to check the correctness of pebbleExportToSst.
 func exportUsingGoIterator(
+	ctx context.Context,
 	filter roachpb.MVCCFilter,
 	startTime, endTime hlc.Timestamp,
 	startKey, endKey roachpb.Key,
@@ -443,7 +442,9 @@ func exportUsingGoIterator(
 	reader storage.Reader,
 ) ([]byte, error) {
 	memFile := &storage.MemFile{}
-	sst := storage.MakeIngestionSSTWriter(memFile)
+	sst := storage.MakeIngestionSSTWriter(
+		ctx, cluster.MakeTestingClusterSettings(), memFile,
+	)
 	defer sst.Close()
 
 	var skipTombstones bool
@@ -571,7 +572,7 @@ func assertEqualKVs(
 
 		// Run the oracle which is a legacy implementation of pebbleExportToSst
 		// backed by an MVCCIncrementalIterator.
-		expected, err := exportUsingGoIterator(filter, startTime, endTime,
+		expected, err := exportUsingGoIterator(ctx, filter, startTime, endTime,
 			startKey, endKey, enableTimeBoundIteratorOptimization, e)
 		if err != nil {
 			t.Fatalf("Oracle failed to export provided key range.")

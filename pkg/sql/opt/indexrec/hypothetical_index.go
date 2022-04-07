@@ -11,7 +11,6 @@
 package indexrec
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -34,7 +33,7 @@ type hypotheticalIndex struct {
 	indexOrdinal int
 
 	// zone stores the table's zone.
-	zone *zonepb.ZoneConfig
+	zone cat.Zone
 
 	// suffixKeyColsOrdList contains all implicit column ordinals. Implicit
 	// columns are columns that are in the table's primary key but are not already
@@ -57,7 +56,7 @@ func (hi *hypotheticalIndex) init(
 	cols []cat.IndexColumn,
 	indexOrd int,
 	inverted bool,
-	zone *zonepb.ZoneConfig,
+	zone cat.Zone,
 ) {
 	hi.tab = tab
 	hi.name = name
@@ -195,6 +194,11 @@ func (hi *hypotheticalIndex) Ordinal() int {
 	return hi.indexOrdinal
 }
 
+// ImplicitColumnCount is part of the cat.Index interface.
+func (hi *hypotheticalIndex) ImplicitColumnCount() int {
+	return 0
+}
+
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (hi *hypotheticalIndex) ImplicitPartitioningColumnCount() int {
 	return 0
@@ -202,15 +206,13 @@ func (hi *hypotheticalIndex) ImplicitPartitioningColumnCount() int {
 
 // GeoConfig is part of the cat.Index interface.
 // TODO(nehageorge): Add support for spatial index recommendations.
-func (hi *hypotheticalIndex) GeoConfig() *geoindex.Config {
-	return nil
+func (hi *hypotheticalIndex) GeoConfig() geoindex.Config {
+	return geoindex.Config{}
 }
 
 // Version is part of the cat.Index interface.
 func (hi *hypotheticalIndex) Version() descpb.IndexDescriptorVersion {
-	// Return the latest version for non-primary indexes, since hypothetical
-	// indexes are not primary indexes.
-	return descpb.LatestNonPrimaryIndexDescriptorVersion
+	return descpb.LatestIndexDescriptorVersion
 }
 
 // PartitionCount is part of the cat.Index interface.

@@ -11,10 +11,12 @@
 package kvserver
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -75,6 +77,10 @@ type StoreTestingKnobs struct {
 	// rocksdb but before in-memory side effects have been processed.
 	// It is only called on the replica the proposed the command.
 	TestingPostApplyFilter kvserverbase.ReplicaApplyFilter
+
+	// TestingResponseErrorEvent is called when an error is returned applying
+	// a command.
+	TestingResponseErrorEvent func(context.Context, *roachpb.BatchRequest, error)
 
 	// TestingResponseFilter is called after the replica processes a
 	// command in order for unittests to modify the batch response,
@@ -263,7 +269,7 @@ type StoreTestingKnobs struct {
 	// ReceiveSnapshot is run after receiving a snapshot header but before
 	// acquiring snapshot quota or doing shouldAcceptSnapshotData checks. If an
 	// error is returned from the hook, it's sent as an ERROR SnapshotResponse.
-	ReceiveSnapshot func(*SnapshotRequest_Header) error
+	ReceiveSnapshot func(*kvserverpb.SnapshotRequest_Header) error
 	// ReplicaAddSkipLearnerRollback causes replica addition to skip the learner
 	// rollback that happens when either the initial snapshot or the promotion of
 	// a learner to a voter fails.
@@ -300,7 +306,7 @@ type StoreTestingKnobs struct {
 	ReplicationAlwaysUseJointConfig func() bool
 	// BeforeSnapshotSSTIngestion is run just before the SSTs are ingested when
 	// applying a snapshot.
-	BeforeSnapshotSSTIngestion func(IncomingSnapshot, SnapshotRequest_Type, []string) error
+	BeforeSnapshotSSTIngestion func(IncomingSnapshot, kvserverpb.SnapshotRequest_Type, []string) error
 	// OnRelocatedOne intercepts the return values of s.relocateOne after they
 	// have successfully been put into effect.
 	OnRelocatedOne func(_ []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget)
@@ -343,6 +349,9 @@ type StoreTestingKnobs struct {
 	// SpanConfigUpdateInterceptor is called after the store hears about a span
 	// config update.
 	SpanConfigUpdateInterceptor func(spanconfig.Update)
+	// SetSpanConfigInterceptor is called before updating a replica's embedded
+	// SpanConfig. The returned SpanConfig is used instead.
+	SetSpanConfigInterceptor func(*roachpb.RangeDescriptor, roachpb.SpanConfig) roachpb.SpanConfig
 	// If set, use the given version as the initial replica version when
 	// bootstrapping ranges. This is used for testing the migration
 	// infrastructure.
@@ -378,6 +387,9 @@ type StoreTestingKnobs struct {
 	// TODO(irfansharif): Get rid of this knob, maybe by first moving
 	// DisableSpanConfigs into a testing knob instead of a server arg.
 	UseSystemConfigSpanForQueues bool
+	// IgnoreStrictGCEnforcement is used by tests to op out of strict GC
+	// enforcement.
+	IgnoreStrictGCEnforcement bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

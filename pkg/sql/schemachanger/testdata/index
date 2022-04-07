@@ -2,7 +2,7 @@ setup
 CREATE TABLE t (k INT PRIMARY KEY, v STRING NOT NULL);
 ----
 ...
-+object {50 51 t} -> 54
++object {100 101 t} -> 104
 
 test
 CREATE INDEX idx1 ON t (v);
@@ -13,15 +13,60 @@ begin transaction #1
 # end StatementPhase
 # begin PreCommitPhase
 ## PreCommitPhase stage 1 of 1 with 3 MutationType ops
-create job #1: "schema change job"
-  descriptor IDs: [54]
-upsert descriptor #54
+upsert descriptor #104
   ...
-     id: 54
+     createAsOfTime:
+       wallTime: "1"
+  +  declarativeSchemaChangerState:
+  +    authorization: {}
+  +    currentStatuses:
+  +    - DELETE_ONLY
+  +    - ABSENT
+  +    jobId: "1"
+  +    relevantStatements:
+  +    - statement:
+  +        redactedStatement: CREATE INDEX ‹idx1› ON ‹defaultdb›.‹public›.‹t› (‹v›)
+  +        statement: CREATE INDEX idx1 ON t (v)
+  +        statementTag: CREATE INDEX
+  +    revertible: true
+  +    targetRanks:
+  +    - 0
+  +    - 1
+  +    targets:
+  +    - elementProto:
+  +        secondaryIndex:
+  +          embeddedIndex:
+  +            indexId: 2
+  +            keyColumnDirections:
+  +            - ASC
+  +            keyColumnIds:
+  +            - 2
+  +            keySuffixColumnIds:
+  +            - 1
+  +            sourceIndexId: 1
+  +            tableId: 104
+  +      metadata:
+  +        sourceElementId: 1
+  +        subWorkId: 1
+  +      targetStatus: PUBLIC
+  +    - elementProto:
+  +        indexName:
+  +          indexId: 2
+  +          name: idx1
+  +          tableId: 104
+  +      metadata:
+  +        sourceElementId: 1
+  +        subWorkId: 1
+  +      targetStatus: PUBLIC
+     families:
+     - columnIds:
+  ...
+     id: 104
      modificationTime: {}
   +  mutations:
   +  - direction: ADD
   +    index:
+  +      constraintId: 2
   +      createdExplicitly: true
   +      foreignKey: {}
   +      geoConfig: {}
@@ -38,61 +83,118 @@ upsert descriptor #54
   +      name: crdb_internal_index_2_name_placeholder
   +      partitioning: {}
   +      sharded: {}
-  +      storeColumnIds: []
   +      storeColumnNames: []
-  +      version: 3
+  +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
      name: t
-  +  newSchemaChangeJobId: "1"
      nextColumnId: 3
+  -  nextConstraintId: 2
+  +  nextConstraintId: 3
      nextFamilyId: 1
   -  nextIndexId: 2
   +  nextIndexId: 3
      nextMutationId: 1
-     parentId: 50
+     parentId: 100
   ...
        time: {}
-     unexposedParentSchemaId: 51
+     unexposedParentSchemaId: 101
   -  version: "1"
   +  version: "2"
+create job #1 (non-cancelable: false): "CREATE INDEX idx1 ON defaultdb.public.t (v)"
+  descriptor IDs: [104]
 # end PreCommitPhase
 commit transaction #1
 # begin PostCommitPhase
 begin transaction #2
-## PostCommitPhase stage 1 of 4 with 2 MutationType ops
-update progress of schema change job #1
-upsert descriptor #54
+commit transaction #2
+begin transaction #3
+## PostCommitPhase stage 1 of 4 with 3 MutationType ops
+upsert descriptor #104
   ...
-         version: 3
+       authorization: {}
+       currentStatuses:
+  -    - DELETE_ONLY
+  +    - WRITE_ONLY
+       - ABSENT
+       jobId: "1"
+  ...
+         version: 4
        mutationId: 1
   -    state: DELETE_ONLY
   +    state: DELETE_AND_WRITE_ONLY
      name: t
-     newSchemaChangeJobId: "1"
+     nextColumnId: 3
   ...
        time: {}
-     unexposedParentSchemaId: 51
+     unexposedParentSchemaId: 101
   -  version: "2"
   +  version: "3"
-commit transaction #2
-begin transaction #3
-## PostCommitPhase stage 2 of 4 with 1 BackfillType ops
-backfill indexes [2] from index #1 in table #54
+update progress of schema change job #1
 commit transaction #3
 begin transaction #4
-## PostCommitPhase stage 3 of 4 with 1 ValidationType ops
-validate forward indexes [2] in table #54
+## PostCommitPhase stage 2 of 4 with 1 BackfillType ops
+backfill indexes [2] from index #1 in table #104
 commit transaction #4
 begin transaction #5
+## PostCommitPhase stage 3 of 4 with 1 ValidationType ops
+validate forward indexes [2] in table #104
+commit transaction #5
+begin transaction #6
 ## PostCommitPhase stage 4 of 4 with 4 MutationType ops
-update progress of schema change job #1
-upsert descriptor #54
+upsert descriptor #104
+  ...
+     createAsOfTime:
+       wallTime: "1"
+  -  declarativeSchemaChangerState:
+  -    authorization: {}
+  -    currentStatuses:
+  -    - WRITE_ONLY
+  -    - ABSENT
+  -    jobId: "1"
+  -    relevantStatements:
+  -    - statement:
+  -        redactedStatement: CREATE INDEX ‹idx1› ON ‹defaultdb›.‹public›.‹t› (‹v›)
+  -        statement: CREATE INDEX idx1 ON t (v)
+  -        statementTag: CREATE INDEX
+  -    revertible: true
+  -    targetRanks:
+  -    - 0
+  -    - 1
+  -    targets:
+  -    - elementProto:
+  -        secondaryIndex:
+  -          embeddedIndex:
+  -            indexId: 2
+  -            keyColumnDirections:
+  -            - ASC
+  -            keyColumnIds:
+  -            - 2
+  -            keySuffixColumnIds:
+  -            - 1
+  -            sourceIndexId: 1
+  -            tableId: 104
+  -      metadata:
+  -        sourceElementId: 1
+  -        subWorkId: 1
+  -      targetStatus: PUBLIC
+  -    - elementProto:
+  -        indexName:
+  -          indexId: 2
+  -          name: idx1
+  -          tableId: 104
+  -      metadata:
+  -        sourceElementId: 1
+  -        subWorkId: 1
+  -      targetStatus: PUBLIC
+     families:
+     - columnIds:
   ...
      formatVersion: 3
-     id: 54
+     id: 104
   +  indexes:
-  +  - createdExplicitly: true
+  +  - constraintId: 2
+  +    createdExplicitly: true
   +    foreignKey: {}
   +    geoConfig: {}
   +    id: 2
@@ -108,13 +210,13 @@ upsert descriptor #54
   +    name: idx1
   +    partitioning: {}
   +    sharded: {}
-  +    storeColumnIds: []
   +    storeColumnNames: []
-  +    version: 3
+  +    version: 4
      modificationTime: {}
   -  mutations:
   -  - direction: ADD
   -    index:
+  -      constraintId: 2
   -      createdExplicitly: true
   -      foreignKey: {}
   -      geoConfig: {}
@@ -131,19 +233,18 @@ upsert descriptor #54
   -      name: crdb_internal_index_2_name_placeholder
   -      partitioning: {}
   -      sharded: {}
-  -      storeColumnIds: []
   -      storeColumnNames: []
-  -      version: 3
+  -      version: 4
   -    mutationId: 1
   -    state: DELETE_AND_WRITE_ONLY
      name: t
-  -  newSchemaChangeJobId: "1"
      nextColumnId: 3
-     nextFamilyId: 1
   ...
        time: {}
-     unexposedParentSchemaId: 51
+     unexposedParentSchemaId: 101
   -  version: "3"
   +  version: "4"
-commit transaction #5
+update progress of schema change job #1
+set schema change job #1 to non-cancellable
+commit transaction #6
 # end PostCommitPhase

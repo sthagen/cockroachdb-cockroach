@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"net"
@@ -40,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -179,8 +181,6 @@ func NewServer(rpcCtx *Context, opts ...ServerOption) *grpc.Server {
 		grpc.MaxConcurrentStreams(math.MaxInt32),
 		grpc.KeepaliveParams(serverKeepalive),
 		grpc.KeepaliveEnforcementPolicy(serverEnforcement),
-		// A stats handler to measure server network stats.
-		grpc.StatsHandler(&rpcCtx.stats),
 	}
 	if !rpcCtx.Config.Insecure {
 		tlsConfig, err := rpcCtx.GetServerTLSConfig()
@@ -346,7 +346,7 @@ type Context struct {
 
 	breakerClock breakerClock
 	RemoteClocks *RemoteClockMonitor
-	masterCtx    context.Context
+	MasterCtx    context.Context
 
 	heartbeatTimeout time.Duration
 	HeartbeatCB      func()
@@ -356,8 +356,6 @@ type Context struct {
 	localInternalClient roachpb.InternalClient
 
 	conns syncmap.Map
-
-	stats StatsHandler
 
 	metrics Metrics
 
@@ -407,10 +405,10 @@ type ContextOptions struct {
 	// preliminary checks but before recording clock offset information.
 	//
 	// It can inject an error.
-	OnIncomingPing func(*PingRequest) error
+	OnIncomingPing func(context.Context, *PingRequest) error
 	// OnOutgoingPing intercepts outgoing PingRequests. It may inject an
 	// error.
-	OnOutgoingPing func(*PingRequest) error
+	OnOutgoingPing func(context.Context, *PingRequest) error
 	Knobs          ContextTestingKnobs
 
 	// NodeID is the node ID / SQL instance ID container shared
@@ -421,10 +419,16 @@ type ContextOptions struct {
 	// https://github.com/cockroachdb/cockroach/pull/73309
 	NodeID *base.NodeIDContainer
 
-	// ClusterID is the cluster ID shared with the remainder of the
-	// server. If unset in the options, the RPC context will instantiate
-	// its own separate container (this is useful in tests).
-	ClusterID *base.ClusterIDContainer
+	// StorageClusterID is the storage cluster's ID, shared with all
+	// tenants on the same storage cluster. If unset in the options, the
+	// RPC context will instantiate its own separate container (this is
+	// useful in tests).
+	StorageClusterID *base.ClusterIDContainer
+
+	// LogicalClusterID is this server's cluster ID, different for each
+	// tenant sharing the same storage cluster. If unset in the options,
+	// the RPC context will use a mix of StorageClusterID and TenantID.
+	LogicalClusterID *base.ClusterIDContainer
 
 	// ClientOnly indicates that this RPC context is run by a CLI
 	// utility, not a server, and thus misses server configuration, a
@@ -468,10 +472,46 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 		opts.NodeID = &c
 	}
 
-	if opts.ClusterID == nil {
+	if opts.StorageClusterID == nil {
 		// Tests rely on NewContext to generate its own ID container.
 		var c base.ClusterIDContainer
-		opts.ClusterID = &c
+		opts.StorageClusterID = &c
+	}
+
+	if opts.LogicalClusterID == nil {
+		if opts.TenantID.IsSystem() {
+			// We currently expose the storage cluster ID as logical
+			// cluster ID in the system tenant so that someone with
+			// access to the system tenant can extract the storage cluster ID
+			// via e.g. crdb_internal.cluster_id().
+			//
+			// TODO(knz): Remove this special case. The system tenant ought
+			// to use a separate logical cluster ID too. We should use
+			// separate primitives in crdb_internal, etc. to retrieve
+			// the logical and storage cluster ID separately from each other.
+			opts.LogicalClusterID = opts.StorageClusterID
+		} else {
+			// Create a logical cluster ID derived from the storage cluster
+			// ID, but different for each tenant.
+			// TODO(knz): Move this logic out of RPCContext.
+			logicalClusterID := &base.ClusterIDContainer{}
+			hasher := fnv.New64a()
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], opts.TenantID.ToUint64())
+			hasher.Write(b[:])
+			hashedTenantID := hasher.Sum64()
+
+			prevOnSet := opts.StorageClusterID.OnSet
+			opts.StorageClusterID.OnSet = func(id uuid.UUID) {
+				if prevOnSet != nil {
+					prevOnSet(id)
+				}
+				hiLo := id.ToUint128()
+				hiLo.Lo += hashedTenantID
+				logicalClusterID.Set(ctx, uuid.FromUint128(hiLo))
+			}
+			opts.LogicalClusterID = logicalClusterID
+		}
 	}
 
 	masterCtx, cancel := context.WithCancel(ctx)
@@ -485,12 +525,12 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 		RemoteClocks: newRemoteClockMonitor(
 			opts.Clock, 10*opts.Config.RPCHeartbeatInterval, opts.Config.HistogramWindowInterval()),
 		rpcCompression:   enableRPCCompression,
-		masterCtx:        masterCtx,
+		MasterCtx:        masterCtx,
 		metrics:          makeMetrics(),
 		heartbeatTimeout: 2 * opts.Config.RPCHeartbeatInterval,
 	}
-	if id := opts.Knobs.ClusterID; id != nil {
-		rpcCtx.ClusterID.Set(masterCtx, *id)
+	if id := opts.Knobs.StorageClusterID; id != nil {
+		rpcCtx.StorageClusterID.Set(masterCtx, *id)
 	}
 
 	waitQuiesce := func(context.Context) {
@@ -511,8 +551,8 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 			return true
 		})
 	}
-	if err := rpcCtx.Stopper.RunAsyncTask(rpcCtx.masterCtx, "wait-rpcctx-quiesce", waitQuiesce); err != nil {
-		waitQuiesce(rpcCtx.masterCtx)
+	if err := rpcCtx.Stopper.RunAsyncTask(rpcCtx.MasterCtx, "wait-rpcctx-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(rpcCtx.MasterCtx)
 	}
 	return rpcCtx
 }
@@ -524,13 +564,6 @@ func (rpcCtx *Context) ClusterName() string {
 		return "<MISSING RPC CONTEXT>"
 	}
 	return rpcCtx.Config.ClusterName
-}
-
-// GetStatsMap returns a map of network statistics maintained by the
-// internal stats handler. The map is from the remote network address
-// (in string form) to an rpc.Stats object.
-func (rpcCtx *Context) GetStatsMap() *syncmap.Map {
-	return &rpcCtx.stats.stats
 }
 
 // Metrics returns the Context's Metrics struct.
@@ -600,25 +633,18 @@ func (a internalClientAdapter) GetSpanConfigs(
 	return a.server.GetSpanConfigs(ctx, req)
 }
 
+// GetAllSystemSpanConfigsThatApply is part of the roachpb.InternalClient interface.
+func (a internalClientAdapter) GetAllSystemSpanConfigsThatApply(
+	ctx context.Context, req *roachpb.GetAllSystemSpanConfigsThatApplyRequest, _ ...grpc.CallOption,
+) (*roachpb.GetAllSystemSpanConfigsThatApplyResponse, error) {
+	return a.server.GetAllSystemSpanConfigsThatApply(ctx, req)
+}
+
 // UpdateSpanConfigs is part of the roachpb.InternalClient interface.
 func (a internalClientAdapter) UpdateSpanConfigs(
 	ctx context.Context, req *roachpb.UpdateSpanConfigsRequest, _ ...grpc.CallOption,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
 	return a.server.UpdateSpanConfigs(ctx, req)
-}
-
-// GetSystemSpanConfigs is part of the roachpb.InternalClient interface.
-func (a internalClientAdapter) GetSystemSpanConfigs(
-	ctx context.Context, req *roachpb.GetSystemSpanConfigsRequest, _ ...grpc.CallOption,
-) (*roachpb.GetSystemSpanConfigsResponse, error) {
-	return a.server.GetSystemSpanConfigs(ctx, req)
-}
-
-// UpdateSystemSpanConfigs is part of the roachpb.InternalClient interface.
-func (a internalClientAdapter) UpdateSystemSpanConfigs(
-	ctx context.Context, req *roachpb.UpdateSystemSpanConfigsRequest, _ ...grpc.CallOption,
-) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
-	return a.server.UpdateSystemSpanConfigs(ctx, req)
 }
 
 type respStreamClientAdapter struct {
@@ -828,11 +854,11 @@ func (rpcCtx *Context) removeConn(conn *Connection, keys ...connKey) {
 	for _, key := range keys {
 		rpcCtx.conns.Delete(key)
 	}
-	log.Health.Infof(rpcCtx.masterCtx, "closing %+v", keys)
+	log.Health.Infof(rpcCtx.MasterCtx, "closing %+v", keys)
 	if grpcConn := conn.grpcConn; grpcConn != nil {
 		err := grpcConn.Close() // nolint:grpcconnclose
 		if err != nil && !grpcutil.IsClosedConnection(err) {
-			log.Health.Warningf(rpcCtx.masterCtx, "failed to close client connection: %v", err)
+			log.Health.Warningf(rpcCtx.MasterCtx, "failed to close client connection: %v", err)
 		}
 	}
 }
@@ -967,7 +993,7 @@ func (rpcCtx *Context) grpcDialOptions(
 			return dialer.DialContext(ctx, "tcp", target)
 		}
 		latency := rpcCtx.Knobs.ArtificialLatencyMap[target]
-		log.VEventf(rpcCtx.masterCtx, 1, "connecting to node %s with simulated latency %dms", target, latency)
+		log.VEventf(rpcCtx.MasterCtx, 1, "connecting to node %s with simulated latency %dms", target, latency)
 		dialer := artificialLatencyDialer{
 			dialerFunc: dialerFunc,
 			latencyMS:  latency,
@@ -1125,9 +1151,22 @@ func (d *delayingConn) Read(b []byte) (n int, err error) {
 			return 0, errors.WithStack(errMagicNotFound)
 		}
 
-		// Once we receive our first packet, we set our delay to the expected
-		// delay that was sent on the write side.
-		d.latency = time.Duration(hdr.DelayMS) * time.Millisecond
+		// Once we receive our first packet with a DelayMS field set, we set our
+		// delay to the expected delay that was sent on the write side. We only
+		// want to set the latency the first time we receive a non-zero DelayMS
+		// because there are cases (still not yet fully debugged, but which
+		// occur when demo is run with the --insecure flag) where we set a
+		// non-zero DelayMS which is then overwritten, in a subsequent call to
+		// this function, with a zero value. Since the simulated latencies are
+		// not dynamic, overwriting a non-zero value with a zero value is
+		// never valid. Rather than perform the lengthy investigation to
+		// determine why we're being called with a zero DelayMS after we've set
+		// d.latency to a non-zero value, we instead key off of a zero value of
+		// d.latency to indicate that d.latency has not yet been initialized.
+		// Once it's initialized to a non-zero value, we won't update it again.
+		if d.latency == 0 && hdr.DelayMS != 0 {
+			d.latency = time.Duration(hdr.DelayMS) * time.Millisecond
+		}
 		defer func() {
 			time.Sleep(timeutil.Until(timeutil.Unix(0, hdr.ReadTime)))
 		}()
@@ -1150,7 +1189,7 @@ type delayingHeader struct {
 func (rpcCtx *Context) makeDialCtx(
 	target string, remoteNodeID roachpb.NodeID, class ConnectionClass,
 ) context.Context {
-	dialCtx := rpcCtx.masterCtx
+	dialCtx := rpcCtx.MasterCtx
 	var rnodeID interface{} = remoteNodeID
 	if remoteNodeID == 0 {
 		rnodeID = '?'
@@ -1182,9 +1221,6 @@ func (rpcCtx *Context) grpcDialRaw(
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// Add a stats handler to measure client network stats.
-	dialOpts = append(dialOpts, grpc.WithStatsHandler(rpcCtx.stats.newClient(target)))
 
 	// Lower the MaxBackoff (which defaults to ~minutes) to something in the
 	// ~second range.
@@ -1224,7 +1260,7 @@ func (rpcCtx *Context) grpcDialRaw(
 
 	log.Health.Infof(ctx, "dialing")
 	conn, err := grpc.DialContext(ctx, target, dialOpts...)
-	if err != nil && rpcCtx.masterCtx.Err() != nil {
+	if err != nil && rpcCtx.MasterCtx.Err() != nil {
 		// If the node is draining, discard the error (which is likely gRPC's version
 		// of context.Canceled) and return errDialRejected which instructs callers not
 		// to retry.
@@ -1344,7 +1380,7 @@ func (rpcCtx *Context) NewBreaker(name string) *circuit.Breaker {
 	if rpcCtx.BreakerFactory != nil {
 		return rpcCtx.BreakerFactory()
 	}
-	return newBreaker(rpcCtx.masterCtx, name, &rpcCtx.breakerClock)
+	return newBreaker(rpcCtx.MasterCtx, name, &rpcCtx.breakerClock)
 }
 
 // ErrNotHeartbeated is returned by ConnHealth when we have not yet performed
@@ -1409,7 +1445,7 @@ func (rpcCtx *Context) runHeartbeat(
 
 		if err := rpcCtx.Stopper.RunTaskWithErr(ctx, "rpc heartbeat", func(ctx context.Context) error {
 			// We re-mint the PingRequest to pick up any asynchronous update to clusterID.
-			clusterID := rpcCtx.ClusterID.Get()
+			clusterID := rpcCtx.StorageClusterID.Get()
 			request := &PingRequest{
 				OriginNodeID:         rpcCtx.NodeID.Get(),
 				OriginAddr:           rpcCtx.Config.Addr,
@@ -1419,7 +1455,7 @@ func (rpcCtx *Context) runHeartbeat(
 				ServerVersion:        rpcCtx.Settings.Version.BinaryVersion(),
 			}
 
-			interceptor := func(*PingRequest) error { return nil }
+			interceptor := func(context.Context, *PingRequest) error { return nil }
 			if fn := rpcCtx.OnOutgoingPing; fn != nil {
 				interceptor = fn
 			}
@@ -1429,7 +1465,7 @@ func (rpcCtx *Context) runHeartbeat(
 			ping := func(ctx context.Context) error {
 				// NB: We want the request to fail-fast (the default), otherwise we won't
 				// be notified of transport failures.
-				if err := interceptor(request); err != nil {
+				if err := interceptor(ctx, request); err != nil {
 					returnErr = true
 					return err
 				}
@@ -1528,7 +1564,7 @@ func (rpcCtx *Context) NewHeartbeatService() *HeartbeatService {
 		remoteClockMonitor:                    rpcCtx.RemoteClocks,
 		clusterName:                           rpcCtx.ClusterName(),
 		disableClusterNameVerification:        rpcCtx.Config.DisableClusterNameVerification,
-		clusterID:                             rpcCtx.ClusterID,
+		clusterID:                             rpcCtx.StorageClusterID,
 		nodeID:                                rpcCtx.NodeID,
 		settings:                              rpcCtx.Settings,
 		onHandlePing:                          rpcCtx.OnIncomingPing,

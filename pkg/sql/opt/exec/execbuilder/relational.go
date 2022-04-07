@@ -16,10 +16,10 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -34,14 +34,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 type execPlan struct {
@@ -106,7 +107,7 @@ func (ep *execPlan) makeBuildScalarCtx() buildScalarCtx {
 func (ep *execPlan) getNodeColumnOrdinal(col opt.ColumnID) exec.NodeColumnOrdinal {
 	ord, ok := ep.outputCols.Get(int(col))
 	if !ok {
-		panic(errors.AssertionFailedf("column %d not in input", log.Safe(col)))
+		panic(errors.AssertionFailedf("column %d not in input", redact.Safe(col)))
 	}
 	return exec.NodeColumnOrdinal(ord)
 }
@@ -158,8 +159,10 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		// `BEGIN; INSERT INTO ...; CREATE TABLE IF NOT EXISTS ...; COMMIT;`
 		// where the table already exists. This will generate some false schema
 		// cache refreshes, but that's expected to be quite rare in practice.
-		if !descs.UnsafeSkipSystemConfigTrigger.Get(&b.evalCtx.Settings.SV) {
-			if err := b.evalCtx.Txn.SetSystemConfigTrigger(b.evalCtx.Codec.ForSystemTenant()); err != nil {
+		if !b.evalCtx.Settings.Version.IsActive(
+			b.evalCtx.Ctx(), clusterversion.DisableSystemConfigGossipTrigger,
+		) {
+			if err := b.evalCtx.Txn.DeprecatedSetSystemConfigTrigger(b.evalCtx.Codec.ForSystemTenant()); err != nil {
 				return execPlan{}, errors.WithSecondaryError(
 					unimplemented.NewWithIssuef(26508,
 						"the first schema change statement in a transaction must precede any writes"),
@@ -534,22 +537,23 @@ func (b *Builder) scanParams(
 		var err error
 		switch {
 		case isInverted && isPartial:
-			err = fmt.Errorf(
+			err = pgerror.Newf(pgcode.WrongObjectType,
 				"index \"%s\" is a partial inverted index and cannot be used for this query",
 				idx.Name(),
 			)
 		case isInverted:
-			err = fmt.Errorf(
+			err = pgerror.Newf(pgcode.WrongObjectType,
 				"index \"%s\" is inverted and cannot be used for this query",
 				idx.Name(),
 			)
 		case isPartial:
-			err = fmt.Errorf(
+			err = pgerror.Newf(pgcode.WrongObjectType,
 				"index \"%s\" is a partial index that does not contain all the rows needed to execute this query",
 				idx.Name(),
 			)
 		default:
-			err = fmt.Errorf("index \"%s\" cannot be used for this query", idx.Name())
+			err = pgerror.Newf(pgcode.WrongObjectType,
+				"index \"%s\" cannot be used for this query", idx.Name())
 			if b.evalCtx.SessionData().DisallowFullTableScans &&
 				(b.ContainsLargeFullTableScan || b.ContainsLargeFullIndexScan) {
 				err = errors.WithHint(err,
@@ -1286,7 +1290,7 @@ func joinOpToJoinType(op opt.Operator) descpb.JoinType {
 		return descpb.LeftAntiJoin
 
 	default:
-		panic(errors.AssertionFailedf("not a join op %s", log.Safe(op)))
+		panic(errors.AssertionFailedf("not a join op %s", redact.Safe(op)))
 	}
 }
 
@@ -1531,7 +1535,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	case opt.ExceptAllOp:
 		typ, all = tree.ExceptOp, true
 	default:
-		panic(errors.AssertionFailedf("invalid operator %s", log.Safe(set.Op())))
+		panic(errors.AssertionFailedf("invalid operator %s", redact.Safe(set.Op())))
 	}
 
 	hardLimit := uint64(0)
@@ -1719,7 +1723,7 @@ func (b *Builder) buildIndexJoin(join *memo.IndexJoinExpr) (execPlan, error) {
 	needed, output := b.getColumns(cols, join.Table)
 	res := execPlan{outputCols: output}
 	res.root, err = b.factory.ConstructIndexJoin(
-		input.root, tab, keyCols, needed, res.reqOrdering(join),
+		input.root, tab, keyCols, needed, res.reqOrdering(join), int(math.Ceil(join.RequiredPhysical().LimitHint)),
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -1752,10 +1756,25 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	inputCols := join.Input.Relational().OutputCols
 	lookupCols := join.Cols.Difference(inputCols)
+	if join.IsFirstJoinInPairedJoiner {
+		lookupCols.Remove(join.ContinuationCol)
+	}
 
 	lookupOrdinals, lookupColMap := b.getColumns(lookupCols, join.Table)
-	allCols := joinOutputMap(input.outputCols, lookupColMap)
-
+	// allExprCols are the columns used in expressions evaluated by this join.
+	allExprCols := joinOutputMap(input.outputCols, lookupColMap)
+	allCols := allExprCols
+	if join.IsFirstJoinInPairedJoiner {
+		// allCols needs to include the continuation column since it will be
+		// in the result output by this join.
+		allCols = allExprCols.Copy()
+		maxValue, ok := allCols.MaxValue()
+		if !ok {
+			return execPlan{}, errors.AssertionFailedf("allCols should not be empty")
+		}
+		// Assign the continuation column the next unused value in the map.
+		allCols.Set(int(join.ContinuationCol), maxValue+1)
+	}
 	res := execPlan{outputCols: allCols}
 	if join.JoinType == opt.SemiJoinOp || join.JoinType == opt.AntiJoinOp {
 		// For semi and anti join, only the left columns are output.
@@ -1763,8 +1782,8 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	}
 
 	ctx := buildScalarCtx{
-		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
-		ivarMap: allCols,
+		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allExprCols.Len()),
+		ivarMap: allExprCols,
 	}
 	var lookupExpr, remoteLookupExpr tree.TypedExpr
 	if len(join.LookupExpr) > 0 {
@@ -1809,9 +1828,11 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		remoteLookupExpr,
 		lookupOrdinals,
 		onExpr,
+		join.IsFirstJoinInPairedJoiner,
 		join.IsSecondJoinInPairedJoiner,
 		res.reqOrdering(join),
 		locking,
+		int(math.Ceil(join.RequiredPhysical().LimitHint)),
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -1940,10 +1961,27 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 		leftEqCols[i] = exec.TableColumnOrdinal(join.LeftTable.ColumnOrdinal(join.LeftEqCols[i]))
 		rightEqCols[i] = exec.TableColumnOrdinal(join.RightTable.ColumnOrdinal(join.RightEqCols[i]))
 	}
+
+	// Determine the columns that are needed from each side.
 	leftCols := md.TableMeta(join.LeftTable).IndexColumns(join.LeftIndex).Intersection(join.Cols)
 	rightCols := md.TableMeta(join.RightTable).IndexColumns(join.RightIndex).Intersection(join.Cols)
 	// Remove duplicate columns, if any.
 	rightCols.DifferenceWith(leftCols)
+	// Make sure each side's columns always include the equality columns.
+	for i := range join.LeftEqCols {
+		leftCols.Add(join.LeftEqCols[i])
+		rightCols.Add(join.RightEqCols[i])
+	}
+	// Make sure each side's columns always include the fixed index prefix
+	// columns.
+	leftNumFixed := len(join.FixedVals[0].(*memo.TupleExpr).Elems)
+	for i := 0; i < leftNumFixed; i++ {
+		leftCols.Add(join.LeftTable.IndexColumnID(leftIndex, i))
+	}
+	rightNumFixed := len(join.FixedVals[1].(*memo.TupleExpr).Elems)
+	for i := 0; i < rightNumFixed; i++ {
+		rightCols.Add(join.RightTable.IndexColumnID(rightIndex, i))
+	}
 
 	leftOrdinals, leftColMap := b.getColumns(leftCols, join.LeftTable)
 	rightOrdinals, rightColMap := b.getColumns(rightCols, join.RightTable)
@@ -2000,7 +2038,8 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 
-	return res, nil
+	// Apply a post-projection to retain only the columns we need.
+	return b.applySimpleProject(res, join.Cols, join.ProvidedPhysical().Ordering)
 }
 
 func (b *Builder) buildMax1Row(max1Row *memo.Max1RowExpr) (execPlan, error) {
@@ -2250,8 +2289,8 @@ func (b *Builder) extractWindowFunction(e opt.ScalarExpr) opt.ScalarExpr {
 	return b.extractWindowFunction(e.Child(0).(opt.ScalarExpr))
 }
 
-func (b *Builder) isOffsetMode(boundType tree.WindowFrameBoundType) bool {
-	return boundType == tree.OffsetPreceding || boundType == tree.OffsetFollowing
+func (b *Builder) isOffsetMode(boundType treewindow.WindowFrameBoundType) bool {
+	return boundType == treewindow.OffsetPreceding || boundType == treewindow.OffsetFollowing
 }
 
 func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowFrame, error) {

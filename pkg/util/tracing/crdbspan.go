@@ -30,10 +30,17 @@ import (
 // crdbSpan is a span for internal crdb usage. This is used to power SQL session
 // tracing.
 type crdbSpan struct {
+	// tracer is the Tracer that created this span.
 	tracer *Tracer
+	// sp is Span that this crdbSpan is part of.
+	sp *Span
 
-	traceID      tracingpb.TraceID // probabilistically unique
-	spanID       tracingpb.SpanID  // probabilistically unique
+	traceID tracingpb.TraceID // probabilistically unique
+	spanID  tracingpb.SpanID  // probabilistically unique
+	// parentSpanID indicates the parent at the time when this span was created. 0
+	// if this span didn't have a parent. If crdbSpan.mu.parent is set,
+	// parentSpanID corresponds to it. However, if the parent finishes, or if the
+	// parent is a span from a remote node, crdbSpan.mu.parent will be nil.
 	parentSpanID tracingpb.SpanID
 	operation    string // name of operation associated with the span
 
@@ -110,13 +117,18 @@ type crdbSpanMu struct {
 
 	recording recordingState
 
-	// tags are only captured when recording. These are tags that have been
-	// added to this Span, and will be appended to the tags in logTags when
-	// someone needs to actually observe the total set of tags that is a part of
-	// this Span.
-	// TODO(radu): perhaps we want a recording to capture all the tags (even
-	// those that were set before recording started)?
+	// tags are a list of key/value pairs associated with the span through
+	// SetTag(). They will be appended to the tags in logTags when someone needs
+	// to actually observe the total set of tags that is a part of this Span.
 	tags []attribute.KeyValue
+	// lazyTags are tags whose values are only string-ified on demand. Each lazy
+	// tag is expected to implement either fmt.Stringer or LazyTag.
+	lazyTags []lazyTag
+}
+
+type lazyTag struct {
+	Key   string
+	Value interface{}
 }
 
 type recordingState struct {
@@ -262,10 +274,11 @@ func (s *crdbSpan) finish() bool {
 			s.mu.finishing = false
 		}
 
-		// If the span is not part of the registry now, it never will be. So, we'll
-		// need to remove it from the registry only if it currently does not have a
-		// parent. We'll also need to manipulate the registry if there are open
-		// children (they'll need to be added to the registry).
+		// If the span was not part of the registry the first time the lock was
+		// acquired, above, it never will be (because we marked it as finished). So,
+		// we'll need to remove it from the registry only if it currently does not
+		// have a parent. We'll also need to manipulate the registry if there are
+		// open children (they'll need to be added to the registry).
 		needRegistryChange = !hasParent || len(s.mu.openChildren) > 0
 
 		// Deal with the orphaned children - make them roots. We call into the
@@ -312,18 +325,14 @@ func (s *crdbSpan) enableRecording(recType RecordingType) {
 	s.mu.recording.recordingType.swap(recType)
 }
 
-func (s *crdbSpan) disableRecording() {
-	if s.recordingType() == RecordingOff {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mu.recording.recordingType.swap(RecordingOff)
-}
-
 // TraceID is part of the RegistrySpan interface.
 func (s *crdbSpan) TraceID() tracingpb.TraceID {
 	return s.traceID
+}
+
+// SpanID is part of the RegistrySpan interface.
+func (s *crdbSpan) SpanID() tracingpb.SpanID {
+	return s.spanID
 }
 
 // GetRecording returns the span's recording.
@@ -497,6 +506,33 @@ func (s *crdbSpan) setTagLocked(key string, value attribute.Value) {
 	s.mu.tags = append(s.mu.tags, attribute.KeyValue{Key: k, Value: value})
 }
 
+// setLazyTagLocked sets a tag that's only stringified if s' recording is
+// collected.
+//
+// value is expected to implement either Stringer or LazyTag.
+//
+// key is expected to not match the key of a non-lazy tag.
+func (s *crdbSpan) setLazyTagLocked(key string, value interface{}) {
+	for i := range s.mu.lazyTags {
+		if s.mu.lazyTags[i].Key == key {
+			s.mu.lazyTags[i].Value = value
+			return
+		}
+	}
+	s.mu.lazyTags = append(s.mu.lazyTags, lazyTag{Key: key, Value: value})
+}
+
+// getLazyTagLocked returns the value of the tag with the given key. If that tag
+// doesn't exist, the bool retval is false.
+func (s *crdbSpan) getLazyTagLocked(key string) (interface{}, bool) {
+	for i := range s.mu.lazyTags {
+		if s.mu.lazyTags[i].Key == key {
+			return s.mu.lazyTags[i].Value, true
+		}
+	}
+	return nil, false
+}
+
 // record includes a log message in s' recording.
 func (s *crdbSpan) record(msg redact.RedactableString) {
 	if s.recordingType() != RecordingVerbose {
@@ -640,6 +676,7 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 		Duration:       s.mu.duration,
 		RedactableLogs: true,
 		Verbose:        s.recordingType() == RecordingVerbose,
+		RecordingMode:  s.recordingType().ToProto(),
 	}
 
 	if rs.Duration == -1 {
@@ -671,7 +708,9 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 		if !finishing && !s.mu.finished {
 			addTag("_unfinished", "1")
 		}
-		addTag("_verbose", "1")
+		if s.recordingType() == RecordingVerbose {
+			addTag("_verbose", "1")
+		}
 		if s.mu.recording.dropped {
 			addTag("_dropped", "1")
 		}
@@ -694,6 +733,18 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 		for _, kv := range s.mu.tags {
 			// We encode the tag values as strings.
 			addTag(string(kv.Key), kv.Value.Emit())
+		}
+		for _, kv := range s.mu.lazyTags {
+			switch v := kv.Value.(type) {
+			case LazyTag:
+				for _, tag := range v.Render() {
+					addTag(string(tag.Key), tag.Value.Emit())
+				}
+			case fmt.Stringer:
+				addTag(kv.Key, v.String())
+			default:
+				addTag(kv.Key, fmt.Sprintf("<can't render %T>", kv.Value))
+			}
 		}
 	}
 
@@ -847,24 +898,31 @@ func (s *crdbSpan) parentFinished() {
 	s.mu.parent.release()
 }
 
-// SetVerbose is part of the RegistrySpan interface.
-func (s *crdbSpan) SetVerbose(to bool) {
-	if to {
-		s.enableRecording(RecordingVerbose)
-	} else {
-		s.disableRecording()
+// visitOpenChildren calls the visitor for every open child. The receiver's lock
+// is held for the duration of the iteration, so the visitor should be quick.
+// The visitor is not allowed to hold on to children after it returns.
+func (s *crdbSpan) visitOpenChildren(visitor func(child *Span)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.mu.openChildren {
+		visitor(c.spanRef.Span)
 	}
+}
+
+// SetRecordingType is part of the RegistrySpan interface.
+func (s *crdbSpan) SetRecordingType(to RecordingType) {
+	s.mu.recording.recordingType.swap(to)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, child := range s.mu.openChildren {
-		child.SetVerbose(to)
+		child.SetRecordingType(to)
 	}
+}
 
-	// TODO(andrei): The children that have started while this span was not
-	// recording are not linked into openChildren. The children that are still
-	// open can be found through the registry, so we could go spelunking in there
-	// and link them into the parent.
+// RecordingType is part of the RegistrySpan interface.
+func (s *crdbSpan) RecordingType() RecordingType {
+	return s.recordingType()
 }
 
 // withLock calls f while holding s' lock.

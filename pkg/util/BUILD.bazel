@@ -6,6 +6,8 @@ go_library(
     name = "util",
     srcs = [
         "constants.go",
+        "constants_metamorphic_disable.go",  # keep
+        "constants_metamorphic_enable.go",
         "every_n.go",
         "fast_int_map.go",
         "fast_int_set.go",  # keep
@@ -37,6 +39,7 @@ go_library(
         "//pkg/util/randutil",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@org_golang_x_tools//container/intsets",
     ],
 )

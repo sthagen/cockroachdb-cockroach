@@ -1,5 +1,6 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//pkg/sql/colexecop:EXECGEN.bzl", "eg_go_filegroup", "gen_eg_go_rules")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "colexecproj",
@@ -15,6 +16,7 @@ go_library(
         "//pkg/col/typeconv",  # keep
         "//pkg/server/telemetry",  # keep
         "//pkg/sql/colconv",  # keep
+        "//pkg/sql/colexec/colexecbase",  # keep
         "//pkg/sql/colexec/colexeccmp",
         "//pkg/sql/colexec/colexecutils",
         "//pkg/sql/colexec/execgen",  # keep
@@ -23,6 +25,8 @@ go_library(
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",  # keep
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treebin",  # keep
+        "//pkg/sql/sem/tree/treecmp",  # keep
         "//pkg/sql/sqltelemetry",  # keep
         "//pkg/sql/types",
         "//pkg/util/duration",  # keep
@@ -36,7 +40,6 @@ go_test(
     name = "colexecproj_test",
     srcs = [
         "default_cmp_op_test.go",
-        "dep_test.go",
         "inject_setup_test.go",
         "main_test.go",
         "projection_ops_test.go",
@@ -58,8 +61,9 @@ go_test(
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treebin",
+        "//pkg/sql/sem/tree/treecmp",
         "//pkg/sql/types",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/skip",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -87,3 +91,15 @@ eg_go_filegroup(
 
 # Define gen rules for individual eg.go files.
 gen_eg_go_rules(targets)
+
+disallowed_imports_test(
+    "colexecproj",
+    [
+        "//pkg/sql/colexec",
+        "//pkg/sql/colexec/colexecagg",
+        "//pkg/sql/colexec/colexechash",
+        "//pkg/sql/colexec/colexecjoin",
+        "//pkg/sql/colexec/colexecsel",
+        "//pkg/sql/colexec/colexecwindow",
+    ],
+)

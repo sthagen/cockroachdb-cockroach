@@ -42,7 +42,7 @@ go_test(
     deps = [
         "//pkg/geo",
         "//pkg/geo/geopb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/bitarray",
         "//pkg/util/duration",
         "//pkg/util/ipaddr",
@@ -91,5 +91,9 @@ genrule(
     exec_tools = [
         "@go_sdk//:bin/go",
         "@com_github_cockroachdb_tools//cmd/stringer",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
     ],
 )

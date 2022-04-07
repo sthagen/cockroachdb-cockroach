@@ -272,7 +272,10 @@ func createTestStoreWithConfig(
 ) *Store {
 	store := createTestStoreWithoutStart(ctx, t, stopper, opts, cfg)
 	// Put an empty system config into gossip.
-	if err := store.Gossip().AddInfoProto(gossip.KeySystemConfig,
+	//
+	// TODO(ajwerner): Remove this in 22.2. It's possible it can be removed
+	// already.
+	if err := store.Gossip().AddInfoProto(gossip.KeyDeprecatedSystemConfig,
 		&config.SystemConfigEntries{}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -1133,22 +1136,6 @@ func TestStoreSendWithClockOffset(t *testing.T) {
 	}
 }
 
-// TestStoreSendBadRange passes a bad range.
-func TestStoreSendBadRange(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
-	args := getArgs([]byte("0"))
-	if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
-		RangeID: 2, // no such range
-	}, &args); pErr == nil {
-		t.Error("expected invalid range")
-	}
-}
-
 // splitTestRange splits a range. This does *not* fully emulate a real split
 // and should not be used in new tests. Tests that need splits should either live in
 // client_split_test.go and use AdminSplit instead of this function or use the
@@ -1168,7 +1155,8 @@ func splitTestRange(store *Store, splitKey roachpb.RKey, t *testing.T) *Replica 
 }
 
 // TestStoreSendOutOfRange passes a key not contained
-// within the range's key range.
+// within the range's key range and not present in any
+// adjacent ranges on a store.
 func TestStoreSendOutOfRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1177,24 +1165,25 @@ func TestStoreSendOutOfRange(t *testing.T) {
 	defer stopper.Stop(ctx)
 	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 
-	splitKey := roachpb.RKey("b")
-	repl2 := splitTestRange(store, splitKey, t)
-
-	// Range 1 is from KeyMin to "b", so reading "b" from range 1 should
-	// fail because it's just after the range boundary.
-	args := getArgs([]byte("b"))
+	// key 'a' isn't in Range 1000 and Range 1000 doesn't exist
+	// adjacent on this store
+	args := getArgs([]byte("a"))
 	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
-		RangeID: 1,
+		RangeID: 1000, // doesn't exist
 	}, &args); err == nil {
 		t.Error("expected key to be out of range")
 	}
 
-	// Range 2 is from "b" to KeyMax, so reading "a" from range 2 should
-	// fail because it's before the start of the range.
-	args = getArgs([]byte("a"))
+	splitKey := roachpb.RKey("b")
+	repl2 := splitTestRange(store, splitKey, t)
+
+	// Range 2 is from "b" to KeyMax, so reading "a"-"c" from range 2 should
+	// fail because it's before the start of the range and straddles multiple ranges
+	// so it cannot be server side retried.
+	scanArgs := scanArgs([]byte("a"), []byte("c"))
 	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
 		RangeID: repl2.RangeID,
-	}, &args); err == nil {
+	}, scanArgs); err == nil {
 		t.Error("expected key to be out of range")
 	}
 }
@@ -1892,9 +1881,9 @@ func TestStoreReadInconsistent(t *testing.T) {
 	}
 }
 
-// TestStoreScanResumeTSCache verifies that the timestamp cache is
-// properly updated when scans and reverse scans return partial
-// results and a resume span.
+// TestStoreScanResumeTSCache verifies that the timestamp cache is properly
+// updated when scans, reverse scan, and get requests return partial results
+// and a resume span.
 func TestStoreScanResumeTSCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1973,6 +1962,38 @@ func TestStoreScanResumeTSCache(t *testing.T) {
 	if a, lt := rTS, makeTS(t2.Nanoseconds(), 0); lt.LessEq(a) {
 		t.Errorf("expected timestamp cache for \"a\" set less than %s; got %s", lt, a)
 	}
+
+	// Scan the span using 3 Get requests at t3 with max keys and verify the
+	// expected resume spans. The two Get requests that are evaluated should be
+	// accounted for in the timestamp cache, but the third request which is not
+	// evaluated due to the key limit should not be accounted for.
+	t3 := 4 * time.Second
+	manualClock.Set(t3.Nanoseconds())
+	h.Timestamp = makeTS(t3.Nanoseconds(), 0)
+	ba := roachpb.BatchRequest{}
+	ba.Header = h
+	ba.Add(getArgsString("a"), getArgsString("b"), getArgsString("c"))
+	br, pErr := store.TestSender().Send(ctx, ba)
+	require.Nil(t, pErr)
+	require.Len(t, br.Responses, 3)
+	for i, ru := range br.Responses {
+		resp := ru.GetGet()
+		if i < 2 {
+			require.NotNil(t, resp.Value)
+			require.Nil(t, resp.ResumeSpan)
+		} else {
+			require.Nil(t, resp.Value)
+			require.NotNil(t, resp.ResumeSpan)
+		}
+	}
+
+	// Verify the timestamp cache has been set for "a" and "b", but not for "c".
+	rTS, _ = store.tsCache.GetMax(roachpb.Key("a"), nil)
+	require.Equal(t, makeTS(t3.Nanoseconds(), 0), rTS)
+	rTS, _ = store.tsCache.GetMax(roachpb.Key("b"), nil)
+	require.Equal(t, makeTS(t3.Nanoseconds(), 0), rTS)
+	rTS, _ = store.tsCache.GetMax(roachpb.Key("c"), nil)
+	require.Equal(t, makeTS(t2.Nanoseconds(), 0), rTS)
 }
 
 // TestStoreScanIntents verifies that a scan across 10 intents resolves
@@ -2105,6 +2126,7 @@ func TestStoreScanInconsistentResolvesIntents(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var intercept atomic.Value
+	intercept.Store(uuid.Nil)
 	cfg := TestStoreConfig(nil)
 	cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
@@ -2356,6 +2378,10 @@ func (fq *fakeRangeQueue) Name() string {
 
 func (fq *fakeRangeQueue) NeedsLease() bool {
 	return false
+}
+
+func (fq *fakeRangeQueue) SetDisabled(disabled bool) {
+	// Do nothing.
 }
 
 // TestMaybeRemove tests that MaybeRemove is called when a range is removed.
@@ -2647,7 +2673,7 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 
 	uninitDesc := roachpb.RangeDescriptor{RangeID: repl1.Desc().RangeID}
 	if err := stateloader.WriteInitialRangeState(
-		ctx, s.Engine(), uninitDesc, roachpb.Version{},
+		ctx, s.Engine(), uninitDesc, 2, roachpb.Version{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -2669,9 +2695,9 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 	// Wrap the snapshot in a minimal header. The request will be dropped
 	// because the Raft log index and term are less than the hard state written
 	// above.
-	req := &SnapshotRequest_Header{
+	req := &kvserverpb.SnapshotRequest_Header{
 		State: kvserverpb.ReplicaState{Desc: repl1.Desc()},
-		RaftMessageRequest: RaftMessageRequest{
+		RaftMessageRequest: kvserverpb.RaftMessageRequest{
 			RangeID: 1,
 			ToReplica: roachpb.ReplicaDescriptor{
 				NodeID:    1,
@@ -2734,15 +2760,15 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 }
 
 type fakeSnapshotStream struct {
-	nextResp *SnapshotResponse
+	nextResp *kvserverpb.SnapshotResponse
 	nextErr  error
 }
 
-func (c fakeSnapshotStream) Recv() (*SnapshotResponse, error) {
+func (c fakeSnapshotStream) Recv() (*kvserverpb.SnapshotResponse, error) {
 	return c.nextResp, c.nextErr
 }
 
-func (c fakeSnapshotStream) Send(request *SnapshotRequest) error {
+func (c fakeSnapshotStream) Send(request *kvserverpb.SnapshotRequest) error {
 	return nil
 }
 
@@ -2771,7 +2797,7 @@ func TestSendSnapshotThrottling(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 
-	header := SnapshotRequest_Header{
+	header := kvserverpb.SnapshotRequest_Header{
 		State: kvserverpb.ReplicaState{
 			Desc: &roachpb.RangeDescriptor{RangeID: 1},
 		},
@@ -2783,7 +2809,9 @@ func TestSendSnapshotThrottling(t *testing.T) {
 		sp := &fakeStorePool{}
 		expectedErr := errors.New("")
 		c := fakeSnapshotStream{nil, expectedErr}
-		err := sendSnapshot(ctx, st, c, sp, header, nil, newBatch, nil)
+		err := sendSnapshot(
+			ctx, st, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* bytesSentCounter */
+		)
 		if sp.failedThrottles != 1 {
 			t.Fatalf("expected 1 failed throttle, but found %d", sp.failedThrottles)
 		}
@@ -2795,11 +2823,13 @@ func TestSendSnapshotThrottling(t *testing.T) {
 	// Test that an errored snapshot causes a fail throttle.
 	{
 		sp := &fakeStorePool{}
-		resp := &SnapshotResponse{
-			Status: SnapshotResponse_ERROR,
+		resp := &kvserverpb.SnapshotResponse{
+			Status: kvserverpb.SnapshotResponse_ERROR,
 		}
 		c := fakeSnapshotStream{resp, nil}
-		err := sendSnapshot(ctx, st, c, sp, header, nil, newBatch, nil)
+		err := sendSnapshot(
+			ctx, st, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* bytesSentCounter */
+		)
 		if sp.failedThrottles != 1 {
 			t.Fatalf("expected 1 failed throttle, but found %d", sp.failedThrottles)
 		}
@@ -2820,7 +2850,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	tc.Start(ctx, t, stopper)
 	s := tc.store
 
-	cleanupNonEmpty1, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+	cleanupNonEmpty1, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2831,7 +2861,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}
 
 	// Ensure we allow a concurrent empty snapshot.
-	cleanupEmpty, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{})
+	cleanupEmpty, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2857,7 +2887,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 		}
 	}()
 
-	cleanupNonEmpty3, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+	cleanupNonEmpty3, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2900,7 +2930,7 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 	}
 
 	// A snapshot should be allowed.
-	cleanupAccepted, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+	cleanupAccepted, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2974,7 +3004,7 @@ func TestReserveSnapshotQueueTimeoutAvoidsStarvation(t *testing.T) {
 				if err := func() error {
 					snapCtx, cancel := context.WithTimeout(ctx, timeout)
 					defer cancel()
-					cleanup, err := s.reserveSnapshot(snapCtx, &SnapshotRequest_Header{RangeSize: 1})
+					cleanup, err := s.reserveSnapshot(snapCtx, &kvserverpb.SnapshotRequest_Header{RangeSize: 1})
 					if err != nil {
 						if errors.Is(err, context.DeadlineExceeded) {
 							return nil
@@ -3017,13 +3047,13 @@ func TestSnapshotRateLimit(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		priority      SnapshotRequest_Priority
+		priority      kvserverpb.SnapshotRequest_Priority
 		expectedLimit rate.Limit
 		expectedErr   string
 	}{
-		{SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
-		{SnapshotRequest_RECOVERY, 32 << 20, ""},
-		{SnapshotRequest_REBALANCE, 32 << 20, ""},
+		{kvserverpb.SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
+		{kvserverpb.SnapshotRequest_RECOVERY, 32 << 20, ""},
+		{kvserverpb.SnapshotRequest_REBALANCE, 32 << 20, ""},
 	}
 	for _, c := range testCases {
 		t.Run(c.priority.String(), func(t *testing.T) {
@@ -3058,6 +3088,32 @@ func TestManuallyEnqueueUninitializedReplica(t *testing.T) {
 	_, _, err := tc.store.ManuallyEnqueue(ctx, "replicaGC", repl, true)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not enqueueing uninitialized replica")
+}
+
+// TestStoreGetOrCreateReplicaWritesRaftReplicaID tests that an uninitialized
+// replica has a RaftReplicaID.
+func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	tc := testContext{}
+	tc.Start(ctx, t, stopper)
+
+	repl, created, err := tc.store.getOrCreateReplica(
+		ctx, 42, 7, &roachpb.ReplicaDescriptor{
+			NodeID:    tc.store.NodeID(),
+			StoreID:   tc.store.StoreID(),
+			ReplicaID: 7,
+		})
+	require.NoError(t, err)
+	require.True(t, created)
+	replicaID, found, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.Engine())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

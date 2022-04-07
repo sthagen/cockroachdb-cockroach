@@ -97,11 +97,7 @@ func initializeMultiRegionMetadata(
 		return nil, err
 	}
 	regionConfig := multiregion.MakeRegionConfig(
-		regionNames,
-		primaryRegion,
-		survivalGoal,
-		regionEnumID,
-		placement,
+		regionNames, primaryRegion, survivalGoal, regionEnumID, placement, nil,
 	)
 	if err := multiregion.ValidateRegionConfig(regionConfig); err != nil {
 		return nil, err
@@ -115,7 +111,7 @@ func initializeMultiRegionMetadata(
 func CheckClusterSupportsMultiRegion(execCfg *sql.ExecutorConfig) error {
 	return utilccl.CheckEnterpriseEnabled(
 		execCfg.Settings,
-		execCfg.ClusterID(),
+		execCfg.LogicalClusterID(),
 		execCfg.Organization(),
 		"multi-region features",
 	)
@@ -126,7 +122,7 @@ func getMultiRegionEnumAddValuePlacement(
 ) (tree.AlterTypeAddValue, error) {
 	if err := utilccl.CheckEnterpriseEnabled(
 		execCfg.Settings,
-		execCfg.ClusterID(),
+		execCfg.LogicalClusterID(),
 		execCfg.Organization(),
 		"ADD REGION",
 	); err != nil {

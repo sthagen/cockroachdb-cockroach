@@ -327,6 +327,16 @@ func (r *RangeDescriptor) GetReplicaDescriptorByID(replicaID ReplicaID) (Replica
 	return ReplicaDescriptor{}, false
 }
 
+// ContainsVoterIncoming returns true if the descriptor contains a VOTER_INCOMING replica.
+func (r *RangeDescriptor) ContainsVoterIncoming() bool {
+	for _, repDesc := range r.Replicas().Descriptors() {
+		if repDesc.GetType() == VOTER_INCOMING {
+			return true
+		}
+	}
+	return false
+}
+
 // IsInitialized returns false if this descriptor represents an
 // uninitialized range.
 // TODO(bdarnell): unify this with Validate().
@@ -485,6 +495,18 @@ func (r ReplicaDescriptor) IsVoterNewConfig() bool {
 	}
 }
 
+// IsAnyVoter returns true if the replica is a voter in the previous
+// config (pre-reconfiguration) or the incoming config. Can be used as a filter
+// for ReplicaDescriptors.Filter(ReplicaDescriptor.IsVoterOldConfig).
+func (r ReplicaDescriptor) IsAnyVoter() bool {
+	switch r.GetType() {
+	case VOTER_FULL, VOTER_INCOMING, VOTER_OUTGOING, VOTER_DEMOTING_NON_VOTER, VOTER_DEMOTING_LEARNER:
+		return true
+	default:
+		return false
+	}
+}
+
 // PercentilesFromData derives percentiles from a slice of data points.
 // Sorts the input data if it isn't already sorted.
 func PercentilesFromData(data []float64) Percentiles {
@@ -549,11 +571,11 @@ func (sc StoreCapacity) String() string {
 func (sc StoreCapacity) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
 		"ranges=%d, leases=%d, queries=%.2f, writes=%.2f, "+
-		"bytesPerReplica={%s}, writesPerReplica={%s}",
+		"l0Sublevels=%d, bytesPerReplica={%s}, writesPerReplica={%s}",
 		humanizeutil.IBytes(sc.Capacity), humanizeutil.IBytes(sc.Available),
 		humanizeutil.IBytes(sc.Used), humanizeutil.IBytes(sc.LogicalBytes),
 		sc.RangeCount, sc.LeaseCount, sc.QueriesPerSecond, sc.WritesPerSecond,
-		sc.BytesPerReplica, sc.WritesPerReplica)
+		sc.L0Sublevels, sc.BytesPerReplica, sc.WritesPerReplica)
 }
 
 // FractionUsed computes the fraction of storage capacity that is in use.

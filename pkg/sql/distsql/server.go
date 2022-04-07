@@ -338,7 +338,7 @@ func (ds *ServerImpl) setupFlow(
 		evalCtx = &tree.EvalContext{
 			Settings:         ds.ServerConfig.Settings,
 			SessionDataStack: sessiondata.NewStack(sd),
-			ClusterID:        ds.ServerConfig.ClusterID.Get(),
+			ClusterID:        ds.ServerConfig.LogicalClusterID.Get(),
 			ClusterName:      ds.ServerConfig.ClusterName,
 			NodeID:           ds.ServerConfig.NodeID,
 			Codec:            ds.ServerConfig.Codec,
@@ -376,7 +376,7 @@ func (ds *ServerImpl) setupFlow(
 	// to restore the original value which can have data races under stress.
 	isVectorized := req.EvalContext.SessionData.VectorizeMode != sessiondatapb.VectorizeOff
 	f := newFlow(
-		flowCtx, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
+		flowCtx, sp, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
 		localState.LocalProcs, isVectorized, onFlowCleanup, req.StatementSQL,
 	)
 	opt := flowinfra.FuseNormally
@@ -397,8 +397,8 @@ func (ds *ServerImpl) setupFlow(
 		return ctx, nil, nil, err
 	}
 	if !f.IsLocal() {
-		flowCtx.AddLogTag("f", f.GetFlowCtx().ID.Short())
-		flowCtx.AnnotateCtx(ctx)
+		flowCtx.AmbientContext.AddLogTag("f", f.GetFlowCtx().ID.Short())
+		ctx = flowCtx.AmbientContext.AnnotateCtx(ctx)
 		telemetry.Inc(sqltelemetry.DistSQLExecCounter)
 	}
 	if f.IsVectorized() {
@@ -406,22 +406,11 @@ func (ds *ServerImpl) setupFlow(
 	}
 
 	// Figure out what txn the flow needs to run in, if any. For gateway flows
-	// that have no remote flows and also no concurrency, the txn comes from
-	// localState.Txn. Otherwise, we create a txn based on the request's
-	// LeafTxnInputState.
-	useLeaf := false
-	for _, proc := range req.Flow.Processors {
-		if jr := proc.Core.JoinReader; jr != nil {
-			if !jr.MaintainOrdering && jr.IsIndexJoin() {
-				// Index joins when ordering doesn't have to be maintained are
-				// executed via the Streamer API that has concurrency.
-				useLeaf = true
-				break
-			}
-		}
-	}
+	// that have no remote flows and also no concurrency, the (root) txn comes
+	// from localState.Txn if we haven't already created a leaf txn. Otherwise,
+	// we create, if necessary, a txn based on the request's LeafTxnInputState.
 	var txn *kv.Txn
-	if localState.IsLocal && !f.ConcurrentTxnUse() && !useLeaf {
+	if localState.IsLocal && !f.ConcurrentTxnUse() && leafTxn == nil {
 		txn = localState.Txn
 	} else {
 		// If I haven't created the leaf already, do it now.
@@ -485,7 +474,7 @@ func (ds *ServerImpl) newFlowContext(
 		// If we weren't passed a descs.Collection, then make a new one. We are
 		// responsible for cleaning it up and releasing any accessed descriptors
 		// on flow cleanup.
-		flowCtx.Descriptors = ds.CollectionFactory.NewCollection(descs.NewTemporarySchemaProvider(evalCtx.SessionDataStack))
+		flowCtx.Descriptors = ds.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(evalCtx.SessionDataStack))
 		flowCtx.IsDescriptorsCleanupRequired = true
 	}
 	return flowCtx
@@ -493,6 +482,7 @@ func (ds *ServerImpl) newFlowContext(
 
 func newFlow(
 	flowCtx execinfra.FlowCtx,
+	sp *tracing.Span,
 	flowReg *flowinfra.FlowRegistry,
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
@@ -501,7 +491,7 @@ func newFlow(
 	onFlowCleanup func(),
 	statementSQL string,
 ) flowinfra.Flow {
-	base := flowinfra.NewFlowBase(flowCtx, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup, statementSQL)
+	base := flowinfra.NewFlowBase(flowCtx, sp, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup, statementSQL)
 	if isVectorized {
 		return colflow.NewVectorizedFlow(base)
 	}
@@ -523,7 +513,6 @@ type LocalState struct {
 	IsLocal bool
 
 	// HasConcurrency indicates whether the local flow uses multiple goroutines.
-	// It is set only if IsLocal is true.
 	HasConcurrency bool
 
 	// Txn is filled in on the gateway only. It is the RootTxn that the query is running in.
@@ -590,20 +579,19 @@ func (ds *ServerImpl) setupSpanForIncomingRPC(
 			tracing.WithServerSpanKind)
 	}
 
-	var remoteParent tracing.SpanMeta
 	if !req.TraceInfo.Empty() {
-		remoteParent = tracing.SpanMetaFromProto(req.TraceInfo)
-	} else {
-		// For backwards compatibility with 21.2, if tracing info was passed as
-		// gRPC metadata, we use it.
-		var err error
-		remoteParent, err = tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
-		if err != nil {
-			log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
-		}
+		return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
+			tracing.WithRemoteParentFromTraceInfo(&req.TraceInfo),
+			tracing.WithServerSpanKind)
+	}
+	// For backwards compatibility with 21.2, if tracing info was passed as
+	// gRPC metadata, we use it.
+	remoteParent, err := tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
+	if err != nil {
+		log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
 	}
 	return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
-		tracing.WithRemoteParent(remoteParent),
+		tracing.WithRemoteParentFromSpanMeta(remoteParent),
 		tracing.WithServerSpanKind)
 }
 
@@ -669,7 +657,7 @@ func (ds *ServerImpl) flowStreamInt(
 	}
 	defer cleanup()
 	log.VEventf(ctx, 1, "connected inbound stream %s/%d", flowID.Short(), streamID)
-	return streamStrategy.Run(f.AnnotateCtx(ctx), stream, msg, f)
+	return streamStrategy.Run(f.AmbientContext.AnnotateCtx(ctx), stream, msg, f)
 }
 
 // FlowStream is part of the execinfrapb.DistSQLServer interface.

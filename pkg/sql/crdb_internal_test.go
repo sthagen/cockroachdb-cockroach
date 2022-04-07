@@ -234,9 +234,6 @@ CREATE TABLE t.test (k INT);
 
 	// Write the modified descriptor.
 	if err := kvDB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
-			return err
-		}
 		return txn.Put(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
 	}); err != nil {
 		t.Fatal(err)
@@ -415,30 +412,33 @@ func TestInvalidObjects(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	var id int
-	var dbName, schemaName, objName, errStr string
-	// No inconsistency should be found so this should return ErrNoRow.
-	require.Error(t, sqlDB.QueryRow(`SELECT * FROM "".crdb_internal.invalid_objects`).
-		Scan(&id, dbName, schemaName, objName, errStr))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
-	if _, err := sqlDB.Exec(`CREATE DATABASE t;
+	// No inconsistency should be found.
+	tdb.CheckQueryResults(t, `SELECT count(*) FROM "".crdb_internal.invalid_objects`, [][]string{{"0"}})
+
+	// Create a database and some tables.
+	tdb.Exec(t, `
+CREATE DATABASE t;
 CREATE TABLE t.test (k INT8);
 CREATE TABLE fktbl (id INT8 PRIMARY KEY);
 CREATE TABLE tbl (
 	customer INT8 NOT NULL REFERENCES fktbl (id)
 );
-CREATE TABLE nojob (k INT8);`); err != nil {
-		t.Fatal(err)
-	}
+CREATE TABLE nojob (k INT8);
+	`)
 
+	// Retrieve their IDs.
 	databaseID := int(sqlutils.QueryDatabaseID(t, sqlDB, "t"))
+	schemaID := int(sqlutils.QuerySchemaID(t, sqlDB, "t", "public"))
 	tableTID := int(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
 	tableFkTblID := int(sqlutils.QueryTableID(t, sqlDB, "defaultdb", "public", "fktbl"))
 	tableTblID := int(sqlutils.QueryTableID(t, sqlDB, "defaultdb", "public", "tbl"))
 	tableNoJobID := int(sqlutils.QueryTableID(t, sqlDB, "defaultdb", "public", "nojob"))
+	const fakeID = 12345
 
 	// Now introduce some inconsistencies.
-	if _, err := sqlDB.Exec(fmt.Sprintf(`
+	tdb.Exec(t, fmt.Sprintf(`
 INSERT INTO system.users VALUES ('node', NULL, true);
 GRANT node TO root;
 DELETE FROM system.descriptor WHERE id = %d;
@@ -467,51 +467,34 @@ FROM
 	system.descriptor
 WHERE
 	id = %d;
-UPDATE system.namespace SET id = 12345 WHERE id = %d;
-`, databaseID, tableFkTblID, tableNoJobID, tableTID)); err != nil {
-		t.Fatal(err)
-	}
+UPDATE system.namespace SET id = %d WHERE id = %d;
+	`, databaseID, tableFkTblID, tableNoJobID, fakeID, tableTID))
 
-	require.NoError(t, sqlDB.QueryRow(`SELECT id FROM system.descriptor ORDER BY id DESC LIMIT 1`).
-		Scan(&id))
-	require.Equal(t, tableNoJobID, id)
+	tdb.CheckQueryResults(t, `SELECT id FROM system.descriptor ORDER BY id DESC LIMIT 1`, [][]string{
+		{fmt.Sprintf("%d", tableNoJobID)},
+	})
 
-	rows, err := sqlDB.Query(`SELECT * FROM "".crdb_internal.invalid_objects`)
-	require.NoError(t, err)
-	defer rows.Close()
-
-	require.True(t, rows.Next())
-	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
-	require.Equal(t, tableTID, id)
-	require.Equal(t, "", dbName)
-	require.Equal(t, "", schemaName)
-	require.Equal(t, fmt.Sprintf(`relation "test" (%d): referenced database ID %d: referenced descriptor not found`, tableTID, databaseID), errStr)
-
-	require.True(t, rows.Next())
-	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
-	require.Equal(t, tableTID, id)
-	require.Equal(t, "", dbName)
-	require.Equal(t, "", schemaName)
-	require.Equal(t, fmt.Sprintf(`relation "test" (%d): expected matching namespace entry value, instead found 12345`, tableTID), errStr)
-
-	require.True(t, rows.Next())
-	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
-	require.Equal(t, tableTblID, id)
-	require.Equal(t, "defaultdb", dbName)
-	require.Equal(t, "public", schemaName)
-	require.Equal(t, fmt.Sprintf(
-		`relation "tbl" (%d): invalid foreign key: missing table=%d: referenced table ID %d: referenced descriptor not found`,
-		tableTblID, tableFkTblID, tableFkTblID), errStr)
-
-	require.True(t, rows.Next())
-	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
-	require.Equal(t, tableNoJobID, id)
-	require.Equal(t, "defaultdb", dbName)
-	require.Equal(t, "public", schemaName)
-	require.Equal(t, "nojob", objName)
-	require.Equal(t, `mutation job 123456: job not found`, errStr)
-
-	require.False(t, rows.Next())
+	tdb.CheckQueryResults(t, `SELECT * FROM "".crdb_internal.invalid_objects`, [][]string{
+		{fmt.Sprintf("%d", tableTID), fmt.Sprintf("[%d]", databaseID), "public", "test",
+			fmt.Sprintf(`relation "test" (%d): referenced database ID %d: referenced descriptor not found`, tableTID, databaseID),
+		},
+		{fmt.Sprintf("%d", tableTID), fmt.Sprintf("[%d]", databaseID), "public", "test",
+			fmt.Sprintf(`relation "test" (%d): expected matching namespace entry value, instead found 12345`, tableTID),
+		},
+		{fmt.Sprintf("%d", tableTblID), "defaultdb", "public", "tbl",
+			fmt.Sprintf(
+				`relation "tbl" (%d): invalid foreign key: missing table=%d:`+
+					` referenced table ID %d: referenced descriptor not found`,
+				tableTblID, tableFkTblID, tableFkTblID),
+		},
+		{fmt.Sprintf("%d", tableNoJobID), "defaultdb", "public", "nojob", `mutation job 123456: job not found`},
+		{fmt.Sprintf("%d", schemaID), fmt.Sprintf("[%d]", databaseID), "public", "",
+			fmt.Sprintf(`schema "public" (%d): referenced database ID %d: referenced descriptor not found`, schemaID, databaseID),
+		},
+		{fmt.Sprintf("%d", databaseID), "t", "", "", `descriptor not found`},
+		{fmt.Sprintf("%d", tableFkTblID), "defaultdb", "public", "fktbl", `descriptor not found`},
+		{fmt.Sprintf("%d", fakeID), fmt.Sprintf("[%d]", databaseID), "public", "test", `descriptor not found`},
+	})
 }
 
 func TestDistSQLFlowsVirtualTables(t *testing.T) {
@@ -524,15 +507,14 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 	var queryRunningAtomic, stallAtomic int64
 	unblock := make(chan struct{})
 
-	// We can't get the tableID programmatically here.
-	// The table id can be retrieved by doing.
-	// CREATE DATABASE test;
-	// CREATE TABLE test.t();
-	// SELECT id FROM system.namespace WHERE name = 't' AND "parentID" != 1
-	const tableID = 56
-
-	tableKey := keys.SystemSQLCodec.TablePrefix(tableID)
-	tableSpan := roachpb.Span{Key: tableKey, EndKey: tableKey.PrefixEnd()}
+	// We'll populate the key for the knob after we create the table.
+	var tableKey atomic.Value
+	tableKey.Store(roachpb.Key(""))
+	getTableKey := func() roachpb.Key { return tableKey.Load().(roachpb.Key) }
+	spanFromKey := func(k roachpb.Key) roachpb.Span {
+		return roachpb.Span{Key: k, EndKey: k.PrefixEnd()}
+	}
+	getTableSpan := func() roachpb.Span { return spanFromKey(getTableKey()) }
 
 	// Install a store filter which, if both queryRunningAtomic and stallAtomic
 	// are 1, will block the scan requests until 'unblock' channel is closed.
@@ -546,7 +528,7 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 					if atomic.LoadInt64(&stallAtomic) == 1 {
 						if req.IsSingleRequest() {
 							scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
-							if ok && tableSpan.ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
+							if ok && getTableSpan().ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
 								t.Logf("stalling on scan at %s and waiting for test to unblock...", scan.Key)
 								<-unblock
 							}
@@ -583,6 +565,10 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 			tc.Server(2).GetFirstStoreID(),
 		),
 	)
+
+	execCfg := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig)
+	tableID := sqlutils.QueryTableID(t, sqlDB.DB, "test", "public", "foo")
+	tableKey.Store(execCfg.Codec.TablePrefix(tableID))
 
 	const query = "SELECT * FROM test.foo"
 
@@ -774,12 +760,12 @@ func setupTraces(t1, t2 *tracing.Tracer) (tracingpb.TraceID, func()) {
 	childDetachedChild := t1.StartSpan("root.child.detached_child", tracing.WithParent(child), tracing.WithDetachedRecording())
 
 	// Start a remote child span on "node 2".
-	childRemoteChild := t2.StartSpan("root.child.remotechild", tracing.WithRemoteParent(child.Meta()))
+	childRemoteChild := t2.StartSpan("root.child.remotechild", tracing.WithRemoteParentFromSpanMeta(child.Meta()))
 
 	time.Sleep(10 * time.Millisecond)
 
 	// Start another remote child span on "node 2" that we finish.
-	childRemoteChildFinished := t2.StartSpan("root.child.remotechilddone", tracing.WithRemoteParent(child.Meta()))
+	childRemoteChildFinished := t2.StartSpan("root.child.remotechilddone", tracing.WithRemoteParentFromSpanMeta(child.Meta()))
 	child.ImportRemoteSpans(childRemoteChildFinished.FinishAndGetRecording(tracing.RecordingVerbose))
 
 	// Start another remote child span on "node 2" that we finish. This will have
@@ -817,7 +803,9 @@ func TestClusterInflightTracesVirtualTable(t *testing.T) {
 	// the query contains an index constraint.
 
 	t.Run("no-index-constraint", func(t *testing.T) {
-		sqlDB.CheckQueryResults(t, `SELECT * from crdb_internal.cluster_inflight_traces`, [][]string{})
+		_, err := sqlDB.DB.ExecContext(ctx, `SELECT * from crdb_internal.cluster_inflight_traces`)
+		require.NotNil(t, err)
+		require.Contains(t, err.Error(), "a trace_id value needs to be specified")
 	})
 
 	t.Run("with-index-constraint", func(t *testing.T) {

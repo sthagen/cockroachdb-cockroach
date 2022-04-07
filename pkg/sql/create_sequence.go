@@ -17,8 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
@@ -130,6 +132,7 @@ func doCreateSequence(
 	desc, err := NewSequenceTableDesc(
 		ctx,
 		p,
+		p.EvalContext().Settings,
 		name.Object(),
 		opts,
 		dbDesc.GetID(),
@@ -155,6 +158,9 @@ func doCreateSequence(
 	// Initialize the sequence value.
 	seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(id))
 	b := &kv.Batch{}
+	if err := p.createdSequences.addCreatedSequence(id); err != nil {
+		return nil, err
+	}
 	b.Inc(seqValueKey, desc.SequenceOpts.Start-desc.SequenceOpts.Increment)
 	if err := p.txn.Run(ctx, b); err != nil {
 		return nil, err
@@ -239,13 +245,14 @@ func (*createSequenceNode) Close(context.Context)        {}
 func NewSequenceTableDesc(
 	ctx context.Context,
 	p *planner,
+	settings *clustersettings.Settings,
 	sequenceName string,
 	sequenceOptions tree.SequenceOptions,
 	parentID descpb.ID,
 	schemaID descpb.ID,
 	id descpb.ID,
 	creationTime hlc.Timestamp,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
 	persistence tree.Persistence,
 	isMultiRegion bool,
 ) (*tabledesc.Mutable, error) {
@@ -274,7 +281,8 @@ func NewSequenceTableDesc(
 		KeyColumnNames:      []string{tabledesc.SequenceColumnName},
 		KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
 		EncodingType:        descpb.PrimaryIndexEncoding,
-		Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+		Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+		CreatedAtNanos:      creationTime.WallTime,
 	})
 	desc.Families = []descpb.ColumnFamilyDescriptor{
 		{
@@ -312,7 +320,8 @@ func NewSequenceTableDesc(
 		desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
 	}
 
-	if err := descbuilder.ValidateSelf(&desc); err != nil {
+	version := settings.Version.ActiveVersion(ctx)
+	if err := descbuilder.ValidateSelf(&desc, version); err != nil {
 		return nil, err
 	}
 	return &desc, nil

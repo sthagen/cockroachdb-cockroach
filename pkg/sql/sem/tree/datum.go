@@ -1525,8 +1525,7 @@ func (d *DBytes) Max(_ *EvalContext) (Datum, bool) {
 // AmbiguousFormat implements the Datum interface.
 func (*DBytes) AmbiguousFormat() bool { return true }
 
-func writeAsHexString(ctx *FmtCtx, d *DBytes) {
-	b := string(*d)
+func writeAsHexString(ctx *FmtCtx, b string) {
 	for i := 0; i < len(b); i++ {
 		ctx.Write(stringencoding.RawHexMap[b[i]])
 	}
@@ -1537,7 +1536,7 @@ func (d *DBytes) Format(ctx *FmtCtx) {
 	f := ctx.flags
 	if f.HasFlags(fmtPgwireFormat) {
 		ctx.WriteString(`"\\x`)
-		writeAsHexString(ctx, d)
+		writeAsHexString(ctx, string(*d))
 		ctx.WriteString(`"`)
 	} else if f.HasFlags(fmtFormatByteLiterals) {
 		ctx.WriteByte('x')
@@ -1550,7 +1549,7 @@ func (d *DBytes) Format(ctx *FmtCtx) {
 			ctx.WriteByte('\'')
 		}
 		ctx.WriteString("\\x")
-		writeAsHexString(ctx, d)
+		writeAsHexString(ctx, string(*d))
 		if withQuotes {
 			ctx.WriteByte('\'')
 		}
@@ -1559,6 +1558,78 @@ func (d *DBytes) Format(ctx *FmtCtx) {
 
 // Size implements the Datum interface.
 func (d *DBytes) Size() uintptr {
+	return unsafe.Sizeof(*d) + uintptr(len(*d))
+}
+
+// DEncodedKey is a special Datum of types.EncodedKey type, used to pass through
+// encoded key data. It is similar to DBytes, except when it comes to
+// encoding/decoding. It is currently used to pass around inverted index keys,
+// which do not fully encode an object.
+type DEncodedKey string
+
+// NewDEncodedKey is a helper routine to create a *DEncodedKey initialized from its
+// argument.
+func NewDEncodedKey(d DEncodedKey) *DEncodedKey {
+	return &d
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (*DEncodedKey) ResolvedType() *types.T {
+	return types.EncodedKey
+}
+
+// Compare implements the Datum interface.
+func (d *DEncodedKey) Compare(ctx *EvalContext, other Datum) int {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+// CompareError implements the Datum interface.
+func (d *DEncodedKey) CompareError(ctx *EvalContext, other Datum) (int, error) {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+// Prev implements the Datum interface.
+func (d *DEncodedKey) Prev(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Next implements the Datum interface.
+func (d *DEncodedKey) Next(_ *EvalContext) (Datum, bool) {
+	return nil, true
+}
+
+// IsMax implements the Datum interface.
+func (*DEncodedKey) IsMax(_ *EvalContext) bool {
+	return false
+}
+
+// IsMin implements the Datum interface.
+func (d *DEncodedKey) IsMin(_ *EvalContext) bool {
+	return false
+}
+
+// Min implements the Datum interface.
+func (d *DEncodedKey) Min(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Max implements the Datum interface.
+func (d *DEncodedKey) Max(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (*DEncodedKey) AmbiguousFormat() bool {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+// Format implements the NodeFormatter interface.
+func (d *DEncodedKey) Format(ctx *FmtCtx) {
+	(*DBytes)(d).Format(ctx)
+}
+
+// Size implements the Datum interface.
+func (d *DEncodedKey) Size() uintptr {
 	return unsafe.Sizeof(*d) + uintptr(len(*d))
 }
 
@@ -2417,7 +2488,9 @@ type DTimestamp struct {
 func MakeDTimestamp(t time.Time, precision time.Duration) (*DTimestamp, error) {
 	ret := t.Round(precision)
 	if ret.After(MaxSupportedTime) || ret.Before(MinSupportedTime) {
-		return nil, errors.Newf("timestamp %q exceeds supported timestamp bounds", ret.Format(time.RFC3339))
+		return nil, pgerror.Newf(
+			pgcode.InvalidTimeZoneDisplacementValue,
+			"timestamp %q exceeds supported timestamp bounds", ret.Format(time.RFC3339))
 	}
 	return &DTimestamp{Time: ret}, nil
 }
@@ -2699,7 +2772,9 @@ type DTimestampTZ struct {
 func MakeDTimestampTZ(t time.Time, precision time.Duration) (*DTimestampTZ, error) {
 	ret := t.Round(precision)
 	if ret.After(MaxSupportedTime) || ret.Before(MinSupportedTime) {
-		return nil, errors.Newf("timestamp %q exceeds supported timestamp bounds", ret.Format(time.RFC3339))
+		return nil, pgerror.Newf(
+			pgcode.InvalidTimeZoneDisplacementValue,
+			"timestamp %q exceeds supported timestamp bounds", ret.Format(time.RFC3339))
 	}
 	return &DTimestampTZ{Time: ret}, nil
 }
@@ -4180,7 +4255,24 @@ func MustBeDArray(e Expr) *DArray {
 	return i
 }
 
-// ResolvedType implements the TypedExpr interface.
+// MaybeSetCustomOid checks whether t has a special oid that we want to set into
+// d. Must be kept in sync with DArray.ResolvedType. Returns an error if t is
+// not an array type.
+func (d *DArray) MaybeSetCustomOid(t *types.T) error {
+	if t.Family() != types.ArrayFamily {
+		return errors.AssertionFailedf("expected array type, got %s", t.SQLString())
+	}
+	switch t.Oid() {
+	case oid.T_int2vector:
+		d.customOid = oid.T_int2vector
+	case oid.T_oidvector:
+		d.customOid = oid.T_oidvector
+	}
+	return nil
+}
+
+// ResolvedType implements the TypedExpr interface. Must be kept in sync with
+// DArray.MaybeSetCustomOid.
 func (d *DArray) ResolvedType() *types.T {
 	switch d.customOid {
 	case oid.T_int2vector:
@@ -4753,13 +4845,15 @@ type DOid struct {
 }
 
 // MakeDOid is a helper routine to create a DOid initialized from a DInt.
-func MakeDOid(d DInt) DOid {
-	return DOid{DInt: d, semanticType: types.Oid, name: ""}
+func MakeDOid(d DInt, semanticType *types.T) DOid {
+	return DOid{DInt: d, semanticType: semanticType, name: ""}
 }
 
 // NewDOid is a helper routine to create a *DOid initialized from a DInt.
 func NewDOid(d DInt) *DOid {
-	oid := MakeDOid(d)
+	// TODO(yuzefovich): audit the callers of NewDOid to see whether any want to
+	// create a DOid with a semantic type different from types.Oid.
+	oid := MakeDOid(d, types.Oid)
 	return &oid
 }
 
@@ -5372,8 +5466,8 @@ func NewDName(d string) Datum {
 	return NewDNameFromDString(NewDString(d))
 }
 
-// NewDIntVectorFromDArray is a helper routine to create a *DIntVector
-// (implemented as a *DOidWrapper) initialized from an existing *DArray.
+// NewDIntVectorFromDArray is a helper routine to create a new *DArray,
+// initialized from an existing *DArray, with the special oid for IntVector.
 func NewDIntVectorFromDArray(d *DArray) Datum {
 	ret := new(DArray)
 	*ret = *d
@@ -5381,8 +5475,8 @@ func NewDIntVectorFromDArray(d *DArray) Datum {
 	return ret
 }
 
-// NewDOidVectorFromDArray is a helper routine to create a *DOidVector
-// (implemented as a *DOidWrapper) initialized from an existing *DArray.
+// NewDOidVectorFromDArray is a helper routine to create a new *DArray,
+// initialized from an existing *DArray, with the special oid for OidVector.
 func NewDOidVectorFromDArray(d *DArray) Datum {
 	ret := new(DArray)
 	*ret = *d
@@ -5535,6 +5629,7 @@ var baseDatumTypeSizes = map[types.Family]struct {
 	types.StringFamily:         {unsafe.Sizeof(DString("")), variableSize},
 	types.CollatedStringFamily: {unsafe.Sizeof(DCollatedString{"", "", nil}), variableSize},
 	types.BytesFamily:          {unsafe.Sizeof(DBytes("")), variableSize},
+	types.EncodedKeyFamily:     {unsafe.Sizeof(DBytes("")), variableSize},
 	types.DateFamily:           {unsafe.Sizeof(DDate{}), fixedSize},
 	types.GeographyFamily:      {unsafe.Sizeof(DGeography{}), variableSize},
 	types.GeometryFamily:       {unsafe.Sizeof(DGeometry{}), variableSize},
@@ -5645,4 +5740,92 @@ func MaxDistinctCount(evalCtx *EvalContext, first, last Datum) (_ int64, ok bool
 		return 0, false
 	}
 	return delta + 1, true
+}
+
+// ParseDatumPath parses a span key string like "/1/2/3".
+// Only NULL and a subset of types are currently supported.
+func ParseDatumPath(evalCtx *EvalContext, str string, typs []types.Family) []Datum {
+	var res []Datum
+	for i, valStr := range ParsePath(str) {
+		if i >= len(typs) {
+			panic(errors.AssertionFailedf("invalid types"))
+		}
+
+		if valStr == "NULL" {
+			res = append(res, DNull)
+			continue
+		}
+		var val Datum
+		var err error
+		switch typs[i] {
+		case types.BoolFamily:
+			val, err = ParseDBool(valStr)
+		case types.IntFamily:
+			val, err = ParseDInt(valStr)
+		case types.FloatFamily:
+			val, err = ParseDFloat(valStr)
+		case types.DecimalFamily:
+			val, err = ParseDDecimal(valStr)
+		case types.DateFamily:
+			val, _, err = ParseDDate(evalCtx, valStr)
+		case types.TimestampFamily:
+			val, _, err = ParseDTimestamp(evalCtx, valStr, time.Microsecond)
+		case types.TimestampTZFamily:
+			val, _, err = ParseDTimestampTZ(evalCtx, valStr, time.Microsecond)
+		case types.StringFamily:
+			val = NewDString(valStr)
+		case types.BytesFamily:
+			val = NewDBytes(DBytes(valStr))
+		case types.OidFamily:
+			dInt, err := ParseDInt(valStr)
+			if err == nil {
+				val = NewDOid(*dInt)
+			}
+		case types.UuidFamily:
+			val, err = ParseDUuidFromString(valStr)
+		case types.INetFamily:
+			val, err = ParseDIPAddrFromINetString(valStr)
+		case types.TimeFamily:
+			val, _, err = ParseDTime(evalCtx, valStr, time.Microsecond)
+		case types.TimeTZFamily:
+			val, _, err = ParseDTimeTZ(evalCtx, valStr, time.Microsecond)
+		default:
+			panic(errors.AssertionFailedf("type %s not supported", typs[i].String()))
+		}
+		if err != nil {
+			panic(err)
+		}
+		res = append(res, val)
+	}
+	return res
+}
+
+// ParsePath splits a string of the form "/foo/bar" into strings ["foo", "bar"].
+// An empty string is allowed, otherwise the string must start with /.
+func ParsePath(str string) []string {
+	if str == "" {
+		return nil
+	}
+	if str[0] != '/' {
+		panic(str)
+	}
+	return strings.Split(str, "/")[1:]
+}
+
+// InferTypes takes a list of strings produced by ParsePath and returns a slice
+// of datum types inferred from the strings. Type DInt will be used if possible,
+// otherwise DString. For example, a vals slice ["1", "foo"] will give a types
+// slice [Dint, DString].
+func InferTypes(vals []string) []types.Family {
+	// Infer the datum types and populate typs accordingly.
+	typs := make([]types.Family, len(vals))
+	for i := 0; i < len(vals); i++ {
+		typ := types.IntFamily
+		_, err := ParseDInt(vals[i])
+		if err != nil {
+			typ = types.StringFamily
+		}
+		typs[i] = typ
+	}
+	return typs
 }

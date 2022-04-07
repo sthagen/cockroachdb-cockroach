@@ -53,7 +53,7 @@ type snapshotWithID struct {
 // subsequently through t.GetSnapshot(id).
 //
 // Snapshots also include a dump of all the goroutine stack traces.
-func (t *Tracer) SaveSnapshot() SnapshotID {
+func (t *Tracer) SaveSnapshot() SnapshotInfo {
 	snap := t.generateSnapshot()
 	t.snapshotsMu.Lock()
 	defer t.snapshotsMu.Unlock()
@@ -73,7 +73,10 @@ func (t *Tracer) SaveSnapshot() SnapshotID {
 		ID:            id,
 		SpansSnapshot: snap,
 	})
-	return id
+	return SnapshotInfo{
+		ID:         id,
+		CapturedAt: snap.CapturedAt,
+	}
 }
 
 var errSnapshotTooOld = errors.Newf(
@@ -142,7 +145,7 @@ func (t *Tracer) generateSnapshot() SpansSnapshot {
 	capturedAt := timeutil.Now()
 	// Collect the traces.
 	traces := make([]Recording, 0, 1000)
-	_ = t.SpanRegistry().VisitSpans(func(sp RegistrySpan) error {
+	_ = t.SpanRegistry().VisitRoots(func(sp RegistrySpan) error {
 		rec := sp.GetFullRecording(RecordingVerbose)
 		traces = append(traces, rec)
 		return nil

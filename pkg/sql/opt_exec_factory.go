@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -122,7 +123,7 @@ func (ef *execFactory) ConstructScan(
 		scan.lockingWaitPolicy = descpb.ToScanLockingWaitPolicy(params.Locking.WaitPolicy)
 	}
 	scan.localityOptimized = params.LocalityOptimized
-	if !ef.isExplain {
+	if !ef.isExplain && !ef.planner.isInternalPlanner {
 		idxUsageKey := roachpb.IndexUsageKey{
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
@@ -140,12 +141,13 @@ func generateScanSpans(
 	index catalog.Index,
 	params exec.ScanParams,
 ) (roachpb.Spans, error) {
-	sb := span.MakeBuilder(evalCtx, codec, tabDesc, index)
-	defer sb.Release()
+	var sb span.Builder
+	sb.Init(evalCtx, codec, tabDesc, index)
 	if params.InvertedConstraint != nil {
 		return sb.SpansFromInvertedSpans(params.InvertedConstraint, params.IndexConstraint, nil /* scratch */)
 	}
-	return sb.SpansFromConstraint(params.IndexConstraint, params.NeededCols, false /* forDelete */)
+	splitter := span.MakeSplitter(tabDesc, index, params.NeededCols)
+	return sb.SpansFromConstraint(params.IndexConstraint, splitter)
 }
 
 func (ef *execFactory) constructVirtualScan(
@@ -595,6 +597,7 @@ func (ef *execFactory) ConstructIndexJoin(
 	keyCols []exec.NodeColumnOrdinal,
 	tableCols exec.TableColumnOrdinalSet,
 	reqOrdering exec.OutputOrdering,
+	limitHint int,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	colCfg := makeScanColumnsConfig(table, tableCols)
@@ -607,8 +610,17 @@ func (ef *execFactory) ConstructIndexJoin(
 		return nil, err
 	}
 
-	tableScan.index = tabDesc.GetPrimaryIndex()
+	idx := tabDesc.GetPrimaryIndex()
+	tableScan.index = idx
 	tableScan.disableBatchLimit()
+
+	if !ef.isExplain {
+		idxUsageKey := roachpb.IndexUsageKey{
+			TableID: roachpb.TableID(tabDesc.GetID()),
+			IndexID: roachpb.IndexID(idx.GetID()),
+		}
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
+	}
 
 	n := &indexJoinNode{
 		input:         input.(planNode),
@@ -616,6 +628,7 @@ func (ef *execFactory) ConstructIndexJoin(
 		cols:          cols,
 		resultColumns: colinfo.ResultColumnsFromColumns(tabDesc.GetID(), cols),
 		reqOrdering:   ReqOrdering(reqOrdering),
+		limitHint:     limitHint,
 	}
 
 	n.keyCols = make([]int, len(keyCols))
@@ -638,9 +651,11 @@ func (ef *execFactory) ConstructLookupJoin(
 	remoteLookupExpr tree.TypedExpr,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
+	isFirstJoinInPairedJoiner bool,
 	isSecondJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
 	locking *tree.LockingItem,
+	limitHint int,
 ) (exec.Node, error) {
 	if table.IsVirtualTable() {
 		return ef.constructVirtualTableLookupJoin(joinType, input, table, index, eqCols, lookupCols, onCond)
@@ -674,8 +689,10 @@ func (ef *execFactory) ConstructLookupJoin(
 		table:                      tableScan,
 		joinType:                   joinType,
 		eqColsAreKey:               eqColsAreKey,
+		isFirstJoinInPairedJoiner:  isFirstJoinInPairedJoiner,
 		isSecondJoinInPairedJoiner: isSecondJoinInPairedJoiner,
 		reqOrdering:                ReqOrdering(reqOrdering),
+		limitHint:                  limitHint,
 	}
 	n.eqCols = make([]int, len(eqCols))
 	for i, c := range eqCols {
@@ -692,6 +709,9 @@ func (ef *execFactory) ConstructLookupJoin(
 		n.onCond = pred.iVarHelper.Rebind(onCond)
 	}
 	n.columns = pred.cols
+	if isFirstJoinInPairedJoiner {
+		n.columns = append(n.columns, colinfo.ResultColumn{Name: "cont", Typ: types.Bool})
+	}
 
 	return n, nil
 }
@@ -777,11 +797,6 @@ func (ef *execFactory) ConstructInvertedJoin(
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	idx := index.(*optIndex).idx
-	// NB: lookupCols does not include the inverted column, which is only a partial
-	// representation of the original table column. This scan configuration does not
-	// affect what the invertedJoiner implementation retrieves from the inverted
-	// index (which includes the inverted column). This scan configuration is used
-	// later for computing the output from the inverted join.
 	colCfg := makeScanColumnsConfig(table, lookupCols)
 	tableScan := ef.planner.Scan()
 
@@ -838,34 +853,38 @@ func (ef *execFactory) ConstructInvertedJoin(
 // Helper function to create a scanNode from just a table / index descriptor
 // and requested cols.
 func (ef *execFactory) constructScanForZigzag(
-	index catalog.Index, tableDesc catalog.TableDescriptor, cols exec.TableColumnOrdinalSet,
-) (*scanNode, error) {
+	table cat.Table,
+	index cat.Index,
+	cols exec.TableColumnOrdinalSet,
+	eqCols []exec.TableColumnOrdinal,
+) (_ *scanNode, eqColOrdinals []int, _ error) {
+	colCfg := makeScanColumnsConfig(table, cols)
 
-	colCfg := scanColumnsConfig{
-		wantedColumns: make([]tree.ColumnID, 0, cols.Len()),
+	var err error
+	eqColOrdinals, err = tableToScanOrdinals(cols, eqCols)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	for c, ok := cols.Next(0); ok; c, ok = cols.Next(c + 1) {
-		colCfg.wantedColumns = append(colCfg.wantedColumns, tableDesc.PublicColumns()[c].GetID())
-	}
-
+	tableDesc := table.(*optTable).desc
+	idxDesc := index.(*optIndex).idx
 	scan := ef.planner.Scan()
 	ctx := ef.planner.extendedEvalCtx.Ctx()
 	if err := scan.initTable(ctx, ef.planner, tableDesc, colCfg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if !ef.isExplain {
 		idxUsageKey := roachpb.IndexUsageKey{
 			TableID: roachpb.TableID(tableDesc.GetID()),
-			IndexID: roachpb.IndexID(index.GetID()),
+			IndexID: roachpb.IndexID(idxDesc.GetID()),
 		}
 		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
 	}
 
-	scan.index = index
+	scan.index = idxDesc
 
-	return scan, nil
+	return scan, eqColOrdinals, nil
 }
 
 // ConstructZigzagJoin is part of the exec.Factory interface.
@@ -883,49 +902,37 @@ func (ef *execFactory) ConstructZigzagJoin(
 	onCond tree.TypedExpr,
 	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
-	leftIdx := leftIndex.(*optIndex).idx
-	leftTabDesc := leftTable.(*optTable).desc
-	rightIdx := rightIndex.(*optIndex).idx
-	rightTabDesc := rightTable.(*optTable).desc
-
-	leftScan, err := ef.constructScanForZigzag(leftIdx, leftTabDesc, leftCols)
-	if err != nil {
-		return nil, err
-	}
-	rightScan, err := ef.constructScanForZigzag(rightIdx, rightTabDesc, rightCols)
-	if err != nil {
-		return nil, err
+	if len(leftEqCols) != len(rightEqCols) {
+		return nil, errors.AssertionFailedf("creating zigzag join with unequal number of equated cols")
 	}
 
 	n := &zigzagJoinNode{
+		sides:       make([]zigzagJoinSide, 2),
 		reqOrdering: ReqOrdering(reqOrdering),
 	}
+	var err error
+	n.sides[0].scan, n.sides[0].eqCols, err = ef.constructScanForZigzag(leftTable, leftIndex, leftCols, leftEqCols)
+	if err != nil {
+		return nil, err
+	}
+	n.sides[1].scan, n.sides[1].eqCols, err = ef.constructScanForZigzag(rightTable, rightIndex, rightCols, rightEqCols)
+	if err != nil {
+		return nil, err
+	}
+
 	if onCond != nil && onCond != tree.DBoolTrue {
 		n.onCond = onCond
 	}
-	n.sides = make([]zigzagJoinSide, 2)
-	n.sides[0].scan = leftScan
-	n.sides[1].scan = rightScan
-	n.sides[0].eqCols = make([]int, len(leftEqCols))
-	n.sides[1].eqCols = make([]int, len(rightEqCols))
 
-	if len(leftEqCols) != len(rightEqCols) {
-		panic("creating zigzag join with unequal number of equated cols")
-	}
-
-	for i, c := range leftEqCols {
-		n.sides[0].eqCols[i] = int(c)
-		n.sides[1].eqCols[i] = int(rightEqCols[i])
-	}
 	// The resultant columns are identical to those from individual index scans; so
 	// reuse the resultColumns generated in the scanNodes.
 	n.columns = make(
 		colinfo.ResultColumns,
 		0,
-		len(leftScan.resultColumns)+len(rightScan.resultColumns),
+		len(n.sides[0].scan.resultColumns)+len(n.sides[1].scan.resultColumns),
 	)
-	n.columns = append(n.columns, leftScan.resultColumns...)
-	n.columns = append(n.columns, rightScan.resultColumns...)
+	n.columns = append(n.columns, n.sides[0].scan.resultColumns...)
+	n.columns = append(n.columns, n.sides[1].scan.resultColumns...)
 
 	// Fixed values are the values fixed for a prefix of each side's index columns.
 	// See the comment in pkg/sql/rowexec/zigzagjoiner.go for how they are used.
@@ -1081,7 +1088,7 @@ func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec
 		}
 		if len(wi.Ordering) == 0 {
 			frame := p.funcs[i].frame
-			if frame.Mode == tree.RANGE && frame.Bounds.HasOffset() {
+			if frame.Mode == treewindow.RANGE && frame.Bounds.HasOffset() {
 				// Execution requires a single column to order by when there is
 				// a RANGE mode frame with at least one 'offset' bound.
 				return nil, errors.AssertionFailedf("a RANGE mode frame with an offset bound must have an ORDER BY column")
@@ -1724,16 +1731,14 @@ func (ef *execFactory) ConstructDeleteRange(
 	autoCommit bool,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
-	sb := span.MakeBuilder(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, tabDesc.GetPrimaryIndex())
-	defer sb.Release()
+	var sb span.Builder
+	sb.Init(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, tabDesc.GetPrimaryIndex())
 
 	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
 		return nil, err
 	}
 
-	// Setting the "forDelete" flag includes all column families in case where a
-	// single record is deleted.
-	spans, err := sb.SpansFromConstraint(indexConstraint, needed, true /* forDelete */)
+	spans, err := sb.SpansFromConstraint(indexConstraint, span.NoopSplitter())
 	if err != nil {
 		return nil, err
 	}

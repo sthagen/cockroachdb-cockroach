@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/stretchr/testify/require"
 )
 
 func registerInconsistency(r registry.Registry) {
@@ -31,13 +32,11 @@ func registerInconsistency(r registry.Registry) {
 }
 
 func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
-	// With encryption on, our attempt below to manually introduce an inconsistency
-	// will fail.
-	c.EncryptDefault(false)
+	startOps := option.DefaultStartOpts()
 
 	nodes := c.Range(1, 3)
 	c.Put(ctx, t.Cockroach(), "./cockroach", nodes)
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), nodes)
+	c.Start(ctx, t.L(), startOps, install.MakeClusterSettings(), nodes)
 
 	{
 		db := c.Conn(ctx, t.L(), 1)
@@ -45,10 +44,9 @@ func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
 		// inconsistency and wish for it to be detected when we've set up the test
 		// to expect it.
 		_, err := db.ExecContext(ctx, `SET CLUSTER SETTING server.consistency_check.interval = '0'`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		WaitFor3XReplication(t, db)
+		require.NoError(t, err)
+		err = WaitFor3XReplication(ctx, t, db)
+		require.NoError(t, err)
 		_, db = db.Close(), nil
 	}
 

@@ -11,12 +11,16 @@
 import _ from "lodash";
 import { combineReducers } from "redux";
 import moment from "moment";
+import { util } from "@cockroachlabs/cluster-ui";
+const { generateStmtDetailsToID } = util;
 
 import {
   CachedDataReducer,
   CachedDataReducerState,
   KeyedCachedDataReducer,
   KeyedCachedDataReducerState,
+  PaginatedCachedDataReducer,
+  PaginatedCachedDataReducerState,
 } from "./cachedDataReducer";
 import * as api from "src/util/api";
 import { VersionList } from "src/interfaces/cockroachlabs";
@@ -99,7 +103,19 @@ const databaseDetailsReducerObj = new KeyedCachedDataReducer(
   "databaseDetails",
   databaseRequestToID,
 );
+
+const hotRangesRequestToID = (req: api.HotRangesRequestMessage) =>
+  req.page_token;
+
+export const hotRangesReducerObj = new PaginatedCachedDataReducer(
+  api.getHotRanges,
+  "hotRanges",
+  hotRangesRequestToID,
+);
+
 export const refreshDatabaseDetails = databaseDetailsReducerObj.refresh;
+
+export const refreshHotRanges = hotRangesReducerObj.refresh;
 
 // NOTE: We encode the db and table name so we can combine them as a string.
 // TODO(maxlang): there's probably a nicer way to do this
@@ -292,13 +308,36 @@ const storesReducerObj = new KeyedCachedDataReducer(
 export const refreshStores = storesReducerObj.refresh;
 
 const queriesReducerObj = new CachedDataReducer(
-  api.getStatements,
+  api.getCombinedStatements,
   "statements",
   moment.duration(5, "m"),
-  moment.duration(1, "m"),
+  moment.duration(30, "m"),
 );
 export const invalidateStatements = queriesReducerObj.invalidateData;
 export const refreshStatements = queriesReducerObj.refresh;
+
+export const statementDetailsRequestToID = (
+  req: api.StatementDetailsRequestMessage,
+): string =>
+  generateStmtDetailsToID(
+    req.fingerprint_id.toString(),
+    req.app_names.toString(),
+    req.start,
+    req.end,
+  );
+
+const queryReducerObj = new KeyedCachedDataReducer(
+  api.getStatementDetails,
+  "statementDetails",
+  statementDetailsRequestToID,
+  moment.duration(5, "m"),
+);
+
+export const invalidateStatementDetails =
+  queryReducerObj.cachedDataReducer.invalidateData;
+export const invalidateAllStatementDetails =
+  queryReducerObj.cachedDataReducer.invalidateAllData;
+export const refreshStatementDetails = queryReducerObj.refresh;
 
 const userSQLRolesReducerObj = new CachedDataReducer(
   api.getUserSQLRoles,
@@ -365,12 +404,16 @@ export interface APIReducersState {
   settings: CachedDataReducerState<api.SettingsResponseMessage>;
   stores: KeyedCachedDataReducerState<api.StoresResponseMessage>;
   statements: CachedDataReducerState<api.StatementsResponseMessage>;
+  statementDetails: KeyedCachedDataReducerState<
+    api.StatementDetailsResponseMessage
+  >;
   dataDistribution: CachedDataReducerState<api.DataDistributionResponseMessage>;
   metricMetadata: CachedDataReducerState<api.MetricMetadataResponseMessage>;
   statementDiagnosticsReports: CachedDataReducerState<
     api.StatementDiagnosticsReportsResponseMessage
   >;
   userSQLRoles: CachedDataReducerState<api.UserSQLRolesResponseMessage>;
+  hotRanges: PaginatedCachedDataReducerState<api.HotRangesV2ResponseMessage>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -402,12 +445,14 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [sessionsReducerObj.actionNamespace]: sessionsReducerObj.reducer,
   [storesReducerObj.actionNamespace]: storesReducerObj.reducer,
   [queriesReducerObj.actionNamespace]: queriesReducerObj.reducer,
+  [queryReducerObj.actionNamespace]: queryReducerObj.reducer,
   [dataDistributionReducerObj.actionNamespace]:
     dataDistributionReducerObj.reducer,
   [metricMetadataReducerObj.actionNamespace]: metricMetadataReducerObj.reducer,
   [statementDiagnosticsReportsReducerObj.actionNamespace]:
     statementDiagnosticsReportsReducerObj.reducer,
   [userSQLRolesReducerObj.actionNamespace]: userSQLRolesReducerObj.reducer,
+  [hotRangesReducerObj.actionNamespace]: hotRangesReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

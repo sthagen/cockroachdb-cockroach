@@ -76,6 +76,7 @@ var pebbleIterPool = sync.Pool{
 
 type cloneableIter interface {
 	Clone() (*pebble.Iterator, error)
+	Close() error
 }
 
 type testingSetBoundsListener interface {
@@ -84,11 +85,14 @@ type testingSetBoundsListener interface {
 
 // Instantiates a new Pebble iterator, or gets one from the pool.
 func newPebbleIterator(
-	handle pebble.Reader, iterToClone cloneableIter, opts IterOptions,
+	handle pebble.Reader,
+	iterToClone cloneableIter,
+	opts IterOptions,
+	durability DurabilityRequirement,
 ) *pebbleIterator {
 	iter := pebbleIterPool.Get().(*pebbleIterator)
 	iter.reusable = false // defensive
-	iter.init(handle, iterToClone, opts)
+	iter.init(handle, iterToClone, false /* iterUnused */, opts, durability)
 	return iter
 }
 
@@ -97,7 +101,16 @@ func newPebbleIterator(
 // pebbleBatch), or a newly-instantiated one through newPebbleIterator. The
 // underlying *pebble.Iterator is created using iterToClone, if non-nil and
 // there are no timestamp hints, else it is created using handle.
-func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, opts IterOptions) {
+//
+// **NOTE**: the durability parameter may be ignored if iterToClone is
+// non-nil, so make sure that the desired durability is the same.
+func (p *pebbleIterator) init(
+	handle pebble.Reader,
+	iterToClone cloneableIter,
+	iterUnused bool,
+	opts IterOptions,
+	durability DurabilityRequirement,
+) {
 	*p = pebbleIterator{
 		keyBuf:        p.keyBuf,
 		lowerBoundBuf: p.lowerBoundBuf,
@@ -110,6 +123,10 @@ func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, o
 		panic("iterator must set prefix or upper bound or lower bound")
 	}
 
+	p.options.OnlyReadGuaranteedDurable = false
+	if durability == GuaranteedDurability {
+		p.options.OnlyReadGuaranteedDurable = true
+	}
 	if opts.LowerBound != nil {
 		// This is the same as
 		// p.options.LowerBound = EncodeKeyToBuf(p.lowerBoundBuf[0][:0], MVCCKey{Key: opts.LowerBound})
@@ -131,8 +148,8 @@ func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, o
 	doClone := iterToClone != nil
 	if !opts.MaxTimestampHint.IsEmpty() {
 		doClone = false
-		encodedMinTS := string(encodeTimestamp(opts.MinTimestampHint))
-		encodedMaxTS := string(encodeTimestamp(opts.MaxTimestampHint))
+		encodedMinTS := string(encodeMVCCTimestamp(opts.MinTimestampHint))
+		encodedMaxTS := string(encodeMVCCTimestamp(opts.MaxTimestampHint))
 		p.options.TableFilter = func(userProps map[string]string) bool {
 			tableMinTS := userProps["crdb.ts.min"]
 			if len(tableMinTS) == 0 {
@@ -157,7 +174,7 @@ func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, o
 		// We are given an inclusive [MinTimestampHint, MaxTimestampHint]. The
 		// MVCCWAllTimeIntervalCollector has collected the WallTimes and we need
 		// [min, max), i.e., exclusive on the upper bound.
-		p.options.BlockPropertyFilters = []pebble.BlockPropertyFilter{
+		p.options.PointKeyFilters = []pebble.BlockPropertyFilter{
 			sstable.NewBlockIntervalFilter(mvccWallTimeIntervalCollector,
 				uint64(opts.MinTimestampHint.WallTime),
 				uint64(opts.MaxTimestampHint.WallTime)+1),
@@ -168,8 +185,15 @@ func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, o
 
 	if doClone {
 		var err error
-		if p.iter, err = iterToClone.Clone(); err != nil {
-			panic(err)
+		if iterUnused {
+			// NB: If the iterator was never used (at the time of writing, this means
+			// that the iterator was created by `PinEngineStateForIterators()`), we
+			// don't need to clone it.
+			p.iter = iterToClone.(*pebble.Iterator)
+		} else {
+			if p.iter, err = iterToClone.Clone(); err != nil {
+				panic(err)
+			}
 		}
 		p.iter.SetBounds(p.options.LowerBound, p.options.UpperBound)
 	} else {
@@ -267,7 +291,7 @@ func (p *pebbleIterator) Close() {
 func (p *pebbleIterator) SeekGE(key MVCCKey) {
 	p.mvccDirIsReverse = false
 	p.mvccDone = false
-	p.keyBuf = EncodeKeyToBuf(p.keyBuf[:0], key)
+	p.keyBuf = EncodeMVCCKeyToBuf(p.keyBuf[:0], key)
 	if p.prefix {
 		p.iter.SeekPrefixGE(p.keyBuf)
 	} else {
@@ -471,7 +495,7 @@ func (p *pebbleIterator) UnsafeValue() []byte {
 func (p *pebbleIterator) SeekLT(key MVCCKey) {
 	p.mvccDirIsReverse = true
 	p.mvccDone = false
-	p.keyBuf = EncodeKeyToBuf(p.keyBuf[:0], key)
+	p.keyBuf = EncodeMVCCKeyToBuf(p.keyBuf[:0], key)
 	p.iter.SeekLT(p.keyBuf)
 }
 

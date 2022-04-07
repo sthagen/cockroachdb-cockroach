@@ -375,8 +375,7 @@ t1  CREATE TABLE public.t1 (
     x public.greeting NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
     CONSTRAINT t1_pkey PRIMARY KEY (rowid ASC),
-    INDEX i (x ASC),
-    FAMILY "primary" (x, rowid)
+    INDEX i (x ASC)
 )
 
 # SHOW CREATE uses a virtual index, so also check the code path where a
@@ -388,8 +387,7 @@ CREATE TABLE public.t1 (
    x public.greeting NULL,
    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
    CONSTRAINT t1_pkey PRIMARY KEY (rowid ASC),
-   INDEX i (x ASC),
-   FAMILY "primary" (x, rowid)
+   INDEX i (x ASC)
 )
 
 # Test that the implicit array type has been created, and that we can use it.
@@ -435,10 +433,10 @@ FROM
 WHERE
   typname IN ('collision', '_collision', '__collision', '___collision')
 ----
-_collision    100089  0       100090
-__collision   100090  100089  0
-collision     100091  0       100092
-___collision  100092  100091  0
+_collision    100139  0       100140
+__collision   100140  100139  0
+collision     100141  0       100142
+___collision  100142  100141  0
 
 # Regression for #49756.
 query TT
@@ -449,7 +447,7 @@ FROM
 WHERE
   descriptor_name = 'enum_array' AND column_name = 'x'
 ----
-x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100071 array_contents:<family: EnumFamily width: 0 precision: 0 locale: "" visible_type: 0 oid: 100070 time_precision_is_set: false udt_metadata: <   array_type_oid: 100071 > > time_precision_is_set:false
+x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100121 array_contents:<family: EnumFamily width: 0 precision: 0 locale: "" visible_type: 0 oid: 100120 time_precision_is_set: false udt_metadata: <   array_type_oid: 100121 > > time_precision_is_set:false
 
 # Test tables using enums in DEFAULT expressions.
 statement ok
@@ -585,7 +583,6 @@ enum_checks  CREATE TABLE public.enum_checks (
              x public.greeting NULL,
              rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
              CONSTRAINT enum_checks_pkey PRIMARY KEY (rowid ASC),
-             FAMILY "primary" (x, rowid),
              CONSTRAINT check_x CHECK (x = 'hello':::public.greeting),
              CONSTRAINT "check" CHECK ('hello':::public.greeting = 'hello':::public.greeting)
 )
@@ -593,6 +590,14 @@ enum_checks  CREATE TABLE public.enum_checks (
 # Ensure that we can add check constraints to tables with enums.
 statement ok
 DROP TABLE enum_checks;
+
+# Since the DROP and CREATE will be executed in a single statement, because of
+# that we can end up with the declarative schema changer executed and legacy
+# schema changers executed in a single statement. When this happens, certain
+# features are not fully compatible the CREATE below can fail, since descriptors
+# are only synthetically dropped in the new world. So, we intentionally, split
+# this from the statement above.
+statement ok
 CREATE TABLE enum_checks (x greeting);
 INSERT INTO enum_checks VALUES ('hi'), ('howdy');
 ALTER TABLE enum_checks ADD CHECK (x > 'hello')
@@ -608,6 +613,8 @@ ALTER TABLE enum_checks ADD CHECK (x = 'hello')
 # Check the above cases, but in a transaction.
 statement ok
 DROP TABLE enum_checks;
+
+statement ok
 BEGIN;
 CREATE TABLE enum_checks (x greeting);
 INSERT INTO enum_checks VALUES ('hi'), ('howdy');
@@ -817,9 +824,11 @@ SELECT * FROM enum_ctas
 ----
 hi hello {hello} {hello,howdy,hi}
 
-# Test CTAS with a SELECT query in a transaction.
 statement ok
 DROP TABLE enum_ctas;
+
+# Test CTAS with a SELECT query in a transaction.
+statement ok
 BEGIN;
 CREATE TABLE enum_ctas AS (SELECT x, enum_first(y), z, enum_range(x) FROM enum_ctas_base)
 
@@ -948,9 +957,11 @@ ALTER TABLE enum_origin ADD FOREIGN KEY (x) REFERENCES enum_referenced (x)
 statement error pq: insert on table "enum_origin" violates foreign key constraint "enum_origin_x_fkey"
 INSERT INTO enum_origin VALUES ('howdy')
 
-# Try the above, but in a transaction.
 statement ok
 DROP TABLE enum_referenced, enum_origin;
+
+# Try the above, but in a transaction.
+statement ok
 BEGIN;
 CREATE TABLE enum_origin (x greeting PRIMARY KEY);
 CREATE TABLE enum_referenced (x greeting PRIMARY KEY);
@@ -981,7 +992,11 @@ statement ok
 SET enable_experimental_alter_column_type_general = true;
 CREATE TABLE enum_data_type (x STRING);
 INSERT INTO enum_data_type VALUES ('hello'), ('howdy');
+
+statement ok
 ALTER TABLE enum_data_type ALTER COLUMN x SET DATA TYPE greeting;
+
+statement ok
 INSERT INTO enum_data_type VALUES ('hi')
 
 query T rowsort
@@ -993,6 +1008,14 @@ hi
 
 statement ok
 DROP TABLE enum_data_type;
+
+# Since the DROP and CREATE will be executed in a single statement, because of
+# that we can end up with the declarative schema changer executed and legacy
+# schema changers executed in a single statement. When this happens, certain
+# features are not fully compatible the CREATE below can fail, since descriptors
+# are only synthetically dropped in the new world. So, we intentionally, split
+# this from the statement above.
+statement ok
 CREATE TABLE enum_data_type (x greeting);
 INSERT INTO enum_data_type VALUES ('hello'), ('howdy')
 
@@ -1013,6 +1036,14 @@ howdy
 # Convert an enum type into another with USING.
 statement ok
 DROP TABLE enum_data_type;
+
+# Since the DROP and CREATE will be executed in a single statement, because of
+# that we can end up with the declarative schema changer executed and legacy
+# schema changers executed in a single statement. When this happens, certain
+# features are not fully compatible the CREATE below can fail, since descriptors
+# are only synthetically dropped in the new world. So, we intentionally, split
+# this from the statement above.
+statement ok
 CREATE TABLE enum_data_type (x greeting);
 INSERT INTO enum_data_type VALUES ('hello'), ('hi')
 
@@ -1029,6 +1060,14 @@ postgres
 # Test when the conversion of string -> enum should fail.
 statement ok
 DROP TABLE enum_data_type;
+
+# Since the DROP and CREATE will be executed in a single statement, because of
+# that we can end up with the declarative schema changer executed and legacy
+# schema changers executed in a single statement. When this happens, certain
+# features are not fully compatible the CREATE below can fail, since descriptors
+# are only synthetically dropped in the new world. So, we intentionally, split
+# this from the statement above.
+statement ok
 CREATE TABLE enum_data_type (x STRING);
 INSERT INTO enum_data_type VALUES ('notagreeting')
 
@@ -1214,6 +1253,15 @@ USE to_drop;
 CREATE TYPE greeting AS ENUM ('hi');
 CREATE TABLE t(a greeting);
 USE defaultdb;
+
+# Since the DROP and CREATE will be executed in a single statement, because of
+# that we can end up with the declarative schema changer executed and legacy
+# schema changers executed in a single statement. When this happens, certain
+# features are not fully compatible the CREATE below can fail, since descriptors
+# are only synthetically dropped in the new world. So, we intentionally, split
+# this from the statement above. Note: This case can run into a hang when
+# we mix the two.
+statement ok
 DROP DATABASE to_drop CASCADE;
 
 # Before the bug-fix which introduced this test, this call would load all
@@ -1507,9 +1555,17 @@ subtest regression_71388
 
 statement ok
 CREATE TYPE enum_test AS ENUM ('a', 'b');
+
+statement ok
 CREATE TABLE enum_table (id SERIAL PRIMARY KEY, elem enum_test);
+
+statement ok
 INSERT INTO enum_table (elem) VALUES ('a'), ('b');
+
+statement ok
 CREATE TABLE enum_array_table (id SERIAL PRIMARY KEY, elems enum_test[]);
+
+statement ok
 INSERT INTO enum_array_table (elems) VALUES (array['a']), (array['b']), (array['a', 'b'])
 
 query TB
@@ -1578,6 +1634,8 @@ a
 
 statement ok
 ALTER TYPE enum_70378 ADD VALUE 'c';
+
+statement ok
 EXECUTE q('c')
 
 query T rowsort
@@ -1589,8 +1647,14 @@ c
 # Regression test for not hydrating an enum when it is used in a tuple.
 statement ok
 DROP TYPE IF EXISTS greeting;
+
+statement ok
 CREATE TYPE greeting AS ENUM ('hello', 'howdy', 'hi');
+
+statement ok
 CREATE TABLE seed AS SELECT g::INT8 AS _int8 FROM generate_series(1, 5) AS g;
+
+statement ok
 WITH
   cte1 (col1)
     AS (
@@ -1617,3 +1681,17 @@ query T
 SELECT _enum FROM t58889 WHERE _enum::greeting58889 IN (NULL, 'hi':::greeting58889);
 ----
 hi
+
+subtest cast_from_enum_to_bytes
+
+statement ok
+CREATE TYPE myenum AS ENUM ('foo', 'bar');
+
+statement error invalid cast: myenum -> bytes
+SELECT 'foo'::myenum::bytes;
+
+statement error invalid cast: myenum -> bytes
+SELECT 'foo'::myenum::bytea;
+
+statement error invalid cast: myenum -> bytes
+SELECT 'foo'::myenum::blob;

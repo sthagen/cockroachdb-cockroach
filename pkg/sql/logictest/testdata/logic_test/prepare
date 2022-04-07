@@ -196,8 +196,8 @@ PREPARE x AS SELECT avg(column1) OVER (PARTITION BY column2) FROM (VALUES (1, 2)
 query R rowsort
 EXECUTE x
 ----
-1
-3
+1.0000000000000000000
+3.0000000000000000000
 
 statement
 PREPARE y AS SELECT avg(a.column1) OVER (PARTITION BY a.column2) FROM (VALUES (1, 2), (3, 4)) a
@@ -205,8 +205,8 @@ PREPARE y AS SELECT avg(a.column1) OVER (PARTITION BY a.column2) FROM (VALUES (1
 query R rowsort
 EXECUTE y
 ----
-1
-3
+1.0000000000000000000
+3.0000000000000000000
 
 statement
 DEALLOCATE ALL
@@ -885,7 +885,10 @@ query error pq: column "b" does not exist
 EXECUTE change_drop
 
 statement ok
-ALTER TABLE othertable ADD COLUMN b INT; UPDATE othertable SET b=10
+ALTER TABLE othertable ADD COLUMN b INT;
+
+statement ok
+UPDATE othertable SET b=10
 
 query II
 EXECUTE change_drop
@@ -942,7 +945,7 @@ query OOIIIIIB colnames
 EXECUTE pg_catalog_query
 ----
 seqrelid  seqtypid  seqstart  seqincrement  seqmax               seqmin  seqcache  seqcycle
-71        20        1         1             9223372036854775807  1       1         false
+121       20        1         1             9223372036854775807  1       1         false
 
 statement ok
 USE test
@@ -1170,7 +1173,7 @@ EXECUTE e
 select
  ├── columns: k:1 str:2
  ├── immutable
- ├── stats: [rows=333.333333]
+ ├── stats: [rows=333.3333]
  ├── cost: 1074.45
  ├── key: (1)
  ├── fd: (1)-->(2)
@@ -1222,7 +1225,7 @@ PREPARE rcc(string) AS SELECT $1::REGCLASS::OID
 query O
 EXECUTE rcc('t')
 ----
-56
+106
 
 user root
 

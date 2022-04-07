@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -36,10 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -349,7 +348,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	}
 
 	dbID := desc.GetParentID()
-	dbDesc, err := oc.planner.Descriptors().MustGetDatabaseDescByID(ctx, txn, dbID)
+	dbDesc, err := oc.planner.Descriptors().Direct().MustGetDatabaseDescByID(ctx, txn, dbID)
 	if err != nil {
 		return cat.DataSourceName{}, err
 	}
@@ -359,7 +358,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	if scID == keys.PublicSchemaID {
 		scName = tree.PublicSchemaName
 	} else {
-		scDesc, err := oc.planner.Descriptors().MustGetSchemaDescByID(ctx, txn, scID)
+		scDesc, err := oc.planner.Descriptors().Direct().MustGetSchemaDescByID(ctx, txn, scID)
 		if err != nil {
 			return cat.DataSourceName{}, err
 		}
@@ -455,13 +454,13 @@ func (oc *optCatalog) dataSourceForTable(
 	return ds, nil
 }
 
-var emptyZoneConfig = &zonepb.ZoneConfig{}
+var emptyZoneConfig = cat.EmptyZone()
 
 // getZoneConfig returns the ZoneConfig data structure for the given table.
 // ZoneConfigs are stored in protobuf binary format in the SystemConfig, which
 // is gossiped around the cluster. Note that the returned ZoneConfig might be
 // somewhat stale, since it's taken from the gossiped SystemConfig.
-func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (*zonepb.ZoneConfig, error) {
+func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (cat.Zone, error) {
 	// Lookup table's zone if system config is available (it may not be as node
 	// is starting up and before it's received the gossiped config). If it is
 	// not available, use an empty config that has no zone constraints.
@@ -474,9 +473,9 @@ func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (*zonepb.ZoneC
 	}
 	if zone == nil {
 		// This can happen with tests that override the hook.
-		zone = emptyZoneConfig
+		return emptyZoneConfig, nil
 	}
-	return zone, err
+	return cat.AsZone(zone), nil
 }
 
 func (oc *optCatalog) codec() keys.SQLCodec {
@@ -617,7 +616,7 @@ type optTable struct {
 	// stats are the inlined wrappers for table statistics.
 	stats []optTableStat
 
-	zone *zonepb.ZoneConfig
+	zone cat.Zone
 
 	// family is the inlined wrapper for the table's primary family. The primary
 	// family is the first family explicitly specified by the user. If no families
@@ -651,7 +650,7 @@ func newOptTable(
 	desc catalog.TableDescriptor,
 	codec keys.SQLCodec,
 	stats []*stats.TableStatistic,
-	tblZone *zonepb.ZoneConfig,
+	tblZone cat.Zone,
 ) (*optTable, error) {
 	ot := &optTable{
 		desc:     desc,
@@ -660,7 +659,10 @@ func newOptTable(
 		zone:     tblZone,
 	}
 
-	// First, determine how many columns we will potentially need.
+	// Determine the primary key columns.
+	pkCols := desc.GetPrimaryIndex().CollectKeyColumnIDs()
+
+	// Determine how many columns we will potentially need.
 	cols := ot.desc.DeletableColumns()
 	numCols := len(ot.desc.AllColumns())
 	// Add one for each inverted index column.
@@ -690,7 +692,10 @@ func newOptTable(
 			kind = cat.DeleteOnly
 			visibility = cat.Inaccessible
 		}
-		if !col.IsVirtual() {
+		// Primary key columns that are virtual in the descriptor are considered
+		// "stored" from the perspective of the optimizer because they are
+		// written to the primary index and all secondary indexes.
+		if !col.IsVirtual() || pkCols.Contains(col.GetID()) {
 			ot.columns[col.Ordinal()].Init(
 				col.Ordinal(),
 				cat.StableID(col.GetID()),
@@ -787,20 +792,17 @@ func newOptTable(
 		// use the table zone. Save subzones that apply to partitions, since we will
 		// use those later when initializing partitions in the index.
 		idxZone := tblZone
-		partZones := make(map[string]*zonepb.ZoneConfig)
-		for j := range tblZone.Subzones {
-			subzone := &tblZone.Subzones[j]
-			if subzone.IndexID == uint32(idx.GetID()) {
-				if subzone.PartitionName == "" {
+		partZones := make(map[string]cat.Zone)
+		for j := 0; j < tblZone.SubzoneCount(); j++ {
+			subzone := tblZone.Subzone(j)
+			if subzone.Index() == cat.StableID(idx.GetID()) {
+				copyZone := subzone.Zone().InheritFromParent(tblZone)
+				if subzone.Partition() == "" {
 					// Subzone applies to the whole index.
-					copyZone := subzone.Config
-					copyZone.InheritFromParent(tblZone)
-					idxZone = &copyZone
+					idxZone = copyZone
 				} else {
 					// Subzone applies to a partition.
-					copyZone := subzone.Config
-					copyZone.InheritFromParent(tblZone)
-					partZones[subzone.PartitionName] = &copyZone
+					partZones[subzone.Partition()] = copyZone
 				}
 			}
 		}
@@ -832,18 +834,31 @@ func newOptTable(
 			ot.indexes[i].init(ot, i, idx, idxZone, partZones, -1 /* invertedColOrd */)
 		}
 
-		// Add unique constraints for implicitly partitioned unique indexes.
-		if idx.IsUnique() && idx.GetPartitioning().NumImplicitColumns() > 0 {
-			ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
-				name:         idx.GetName(),
-				table:        ot.ID(),
-				columns:      idx.IndexDesc().KeyColumnIDs[idx.GetPartitioning().NumImplicitColumns():],
-				withoutIndex: true,
-				predicate:    idx.GetPredicate(),
-				// TODO(rytaft): will we ever support an unvalidated unique constraint
-				// here?
-				validity: descpb.ConstraintValidity_Validated,
-			})
+		if idx.IsUnique() {
+			if idx.GetPartitioning().NumImplicitColumns() > 0 {
+				// Add unique constraints for implicitly partitioned unique indexes.
+				ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
+					name:         idx.GetName(),
+					table:        ot.ID(),
+					columns:      idx.IndexDesc().KeyColumnIDs[idx.IndexDesc().ExplicitColumnStartIdx():],
+					withoutIndex: true,
+					predicate:    idx.GetPredicate(),
+					// TODO(rytaft): will we ever support an unvalidated unique constraint
+					// here?
+					validity: descpb.ConstraintValidity_Validated,
+				})
+			} else if idx.IsSharded() {
+				// Add unique constraint for hash sharded indexes.
+				ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
+					name:                               idx.GetName(),
+					table:                              ot.ID(),
+					columns:                            idx.IndexDesc().KeyColumnIDs[idx.IndexDesc().ExplicitColumnStartIdx():],
+					withoutIndex:                       true,
+					predicate:                          idx.GetPredicate(),
+					validity:                           descpb.ConstraintValidity_Validated,
+					uniquenessGuaranteedByAnotherIndex: true,
+				})
+			}
 		}
 	}
 
@@ -896,7 +911,7 @@ func newOptTable(
 			case types.EnumFamily:
 				// We synthesize an (x IN (v1, v2, v3...)) check for enum types.
 				expr := &tree.ComparisonExpr{
-					Operator: tree.MakeComparisonOperator(tree.In),
+					Operator: treecmp.MakeComparisonOperator(treecmp.In),
 					Left:     &tree.ColumnItem{ColumnName: col.ColName()},
 					Right:    tree.NewDTuple(colType, tree.MakeAllDEnumsInType(colType)...),
 				}
@@ -949,7 +964,7 @@ func (ot *optTable) PostgresDescriptorID() cat.StableID {
 // isStale checks if the optTable object needs to be refreshed because the stats,
 // zone config, or used types have changed. False positives are ok.
 func (ot *optTable) isStale(
-	rawDesc catalog.TableDescriptor, tableStats []*stats.TableStatistic, zone *zonepb.ZoneConfig,
+	rawDesc catalog.TableDescriptor, tableStats []*stats.TableStatistic, zone cat.Zone,
 ) bool {
 	// Fast check to verify that the statistics haven't changed: we check the
 	// length and the address of the underlying array. This is not a perfect
@@ -1002,7 +1017,7 @@ func (ot *optTable) Equals(other cat.Object) bool {
 
 	// Verify that indexes are in same zones. For performance, skip deep equality
 	// check if it's the same as the previous index (common case).
-	var prevLeftZone, prevRightZone *zonepb.ZoneConfig
+	var prevLeftZone, prevRightZone cat.Zone
 	for i := range ot.indexes {
 		leftZone := ot.indexes[i].zone
 		rightZone := otherTable.indexes[i].zone
@@ -1113,7 +1128,7 @@ func (ot *optTable) OutboundForeignKeyCount() int {
 	return len(ot.outboundFKs)
 }
 
-// OutboundForeignKeyCount is part of the cat.Table interface.
+// OutboundForeignKey is part of the cat.Table interface.
 func (ot *optTable) OutboundForeignKey(i int) cat.ForeignKeyConstraint {
 	return &ot.outboundFKs[i]
 }
@@ -1141,6 +1156,11 @@ func (ot *optTable) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 // Zone is part of the cat.Table interface.
 func (ot *optTable) Zone() cat.Zone {
 	return ot.zone
+}
+
+// IsPartitionAllBy is part of the cat.Table interface.
+func (ot *optTable) IsPartitionAllBy() bool {
+	return ot.desc.IsPartitionAllBy()
 }
 
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
@@ -1178,7 +1198,7 @@ func (ot *optTable) CollectTypes(ord int) (descpb.IDs, error) {
 type optIndex struct {
 	tab  *optTable
 	idx  catalog.Index
-	zone *zonepb.ZoneConfig
+	zone cat.Zone
 
 	// columnOrds maps the index columns to table column ordinals.
 	columnOrds []int
@@ -1210,8 +1230,8 @@ func (oi *optIndex) init(
 	tab *optTable,
 	indexOrdinal int,
 	idx catalog.Index,
-	zone *zonepb.ZoneConfig,
-	partZones map[string]*zonepb.ZoneConfig,
+	zone cat.Zone,
+	partZones map[string]cat.Zone,
 	invertedColOrd int,
 ) {
 	oi.tab = tab
@@ -1224,15 +1244,11 @@ func (oi *optIndex) init(
 		// descriptor does not contain columns that are not explicitly part of the
 		// primary key. Retrieve those columns from the table descriptor.
 		oi.storedCols = make([]descpb.ColumnID, 0, tab.ColumnCount()-idx.NumKeyColumns())
-		var pkCols util.FastIntSet
-		for i := 0; i < idx.NumKeyColumns(); i++ {
-			id := idx.GetKeyColumnID(i)
-			pkCols.Add(int(id))
-		}
+		pkCols := idx.CollectKeyColumnIDs()
 		for i, n := 0, tab.ColumnCount(); i < n; i++ {
 			if col := tab.Column(i); col.Kind() != cat.Inverted && !col.IsVirtualComputed() {
-				if id := col.ColID(); !pkCols.Contains(int(id)) {
-					oi.storedCols = append(oi.storedCols, descpb.ColumnID(id))
+				if id := descpb.ColumnID(col.ColID()); !pkCols.Contains(id) {
+					oi.storedCols = append(oi.storedCols, id)
 				}
 			}
 		}
@@ -1248,7 +1264,7 @@ func (oi *optIndex) init(
 	_ = idxPartitioning.ForEachList(func(name string, values [][]byte, subPartitioning catalog.Partitioning) error {
 		op := optPartition{
 			name:   name,
-			zone:   &zonepb.ZoneConfig{},
+			zone:   cat.EmptyZone(),
 			datums: make([]tree.Datums, 0, len(values)),
 		}
 
@@ -1431,14 +1447,23 @@ func (oi *optIndex) Ordinal() int {
 	return oi.indexOrdinal
 }
 
+// ImplicitColumnCount is part of the cat.Index interface.
+func (oi *optIndex) ImplicitColumnCount() int {
+	implicitColCnt := oi.idx.GetPartitioning().NumImplicitColumns()
+	if oi.idx.IsSharded() {
+		implicitColCnt++
+	}
+	return implicitColCnt
+}
+
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (oi *optIndex) ImplicitPartitioningColumnCount() int {
 	return oi.idx.GetPartitioning().NumImplicitColumns()
 }
 
 // GeoConfig is part of the cat.Index interface.
-func (oi *optIndex) GeoConfig() *geoindex.Config {
-	return &oi.idx.IndexDesc().GeoConfig
+func (oi *optIndex) GeoConfig() geoindex.Config {
+	return oi.idx.IndexDesc().GeoConfig
 }
 
 // Version is part of the cat.Index interface.
@@ -1460,7 +1485,7 @@ func (oi *optIndex) Partition(i int) cat.Partition {
 // partition of an index.
 type optPartition struct {
 	name   string
-	zone   *zonepb.ZoneConfig
+	zone   cat.Zone
 	datums []tree.Datums
 }
 
@@ -1611,6 +1636,8 @@ type optUniqueConstraint struct {
 
 	withoutIndex bool
 	validity     descpb.ConstraintValidity
+
+	uniquenessGuaranteedByAnotherIndex bool
 }
 
 var _ cat.UniqueConstraint = &optUniqueConstraint{}
@@ -1656,6 +1683,14 @@ func (u *optUniqueConstraint) WithoutIndex() bool {
 // Validated is part of the cat.UniqueConstraint interface.
 func (u *optUniqueConstraint) Validated() bool {
 	return u.validity == descpb.ConstraintValidity_Validated
+}
+
+// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
+// interface. It is a hack to make unique hash sharded index work before issue
+// #75070 is resolved. Be sure to remove `ignoreUniquenessCheck` field from
+// `optUniqueConstraint` struct when dropping this hack.
+func (u *optUniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
+	return u.uniquenessGuaranteedByAnotherIndex
 }
 
 // optForeignKeyConstraint implements cat.ForeignKeyConstraint and represents a
@@ -2043,6 +2078,11 @@ func (ot *optVirtualTable) Zone() cat.Zone {
 	panic(errors.AssertionFailedf("no zone"))
 }
 
+// IsPartitionAllBy is part of the cat.Table interface.
+func (ot *optVirtualTable) IsPartitionAllBy() bool {
+	return false
+}
+
 // CollectTypes is part of the cat.DataSource interface.
 func (ot *optVirtualTable) CollectTypes(ord int) (descpb.IDs, error) {
 	col := ot.desc.AllColumns()[ord]
@@ -2193,14 +2233,19 @@ func (oi *optVirtualIndex) Ordinal() int {
 	return oi.indexOrdinal
 }
 
+// ImplicitColumnCount is part of the cat.Index interface.
+func (oi *optVirtualIndex) ImplicitColumnCount() int {
+	return 0
+}
+
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (oi *optVirtualIndex) ImplicitPartitioningColumnCount() int {
 	return 0
 }
 
 // GeoConfig is part of the cat.Index interface.
-func (oi *optVirtualIndex) GeoConfig() *geoindex.Config {
-	return nil
+func (oi *optVirtualIndex) GeoConfig() geoindex.Config {
+	return geoindex.Config{}
 }
 
 // Version is part of the cat.Index interface.

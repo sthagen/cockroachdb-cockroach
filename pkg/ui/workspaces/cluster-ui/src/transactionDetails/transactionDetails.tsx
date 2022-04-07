@@ -192,7 +192,7 @@ export class TransactionDetails extends React.Component<
   };
 
   backToTransactionsClick = (): void => {
-    this.props.history.push("/sql-activity?tab=Transactions");
+    this.props.history.push("/sql-activity?tab=Transactions&view=fingerprints");
   };
 
   render(): React.ReactElement {
@@ -222,6 +222,7 @@ export class TransactionDetails extends React.Component<
         </section>
         <Loading
           error={error}
+          page={"transaction details"}
           loading={
             statementsForTransaction.length == 0 || transactionText.length == 0
           }
@@ -388,7 +389,7 @@ export class TransactionDetails extends React.Component<
                       data={aggregatedStatements}
                       columns={makeStatementsColumns(
                         aggregatedStatements,
-                        "", // selectedApp
+                        [],
                         calculateTotalWorkload(aggregatedStatements),
                         nodeRegions,
                         "transactionDetails",

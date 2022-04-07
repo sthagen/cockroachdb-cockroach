@@ -28,6 +28,7 @@ import (
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/keysbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -57,7 +58,7 @@ var (
 	// KeyMin is a minimum key value which sorts before all other keys.
 	KeyMin = Key(RKeyMin)
 	// RKeyMax is a maximum key value which sorts after all other keys.
-	RKeyMax = RKey{0xff, 0xff}
+	RKeyMax = RKey(keysbase.KeyMax)
 	// KeyMax is a maximum key value which sorts after all other keys.
 	KeyMax = Key(RKeyMax)
 
@@ -123,10 +124,7 @@ func (rk RKey) Next() RKey {
 // is added to the final byte and the carry propagated. The special
 // cases of nil and KeyMin always returns KeyMax.
 func (rk RKey) PrefixEnd() RKey {
-	if len(rk) == 0 {
-		return RKeyMax
-	}
-	return RKey(bytesPrefixEnd(rk))
+	return RKey(keysbase.PrefixEnd(rk))
 }
 
 func (rk RKey) String() string {
@@ -159,19 +157,14 @@ func BytesNext(b []byte) []byte {
 	return bn
 }
 
-func bytesPrefixEnd(b []byte) []byte {
-	// Switched to "make and copy" pattern in #4963 for performance.
-	end := make([]byte, len(b))
-	copy(end, b)
-	for i := len(end) - 1; i >= 0; i-- {
-		end[i] = end[i] + 1
-		if end[i] != 0 {
-			return end[:i+1]
-		}
+// Clone returns a copy of the key.
+func (k Key) Clone() Key {
+	if k == nil {
+		return nil
 	}
-	// This statement will only be reached if the key is already a
-	// maximal byte string (i.e. already \xff...).
-	return b
+	c := make(Key, len(k))
+	copy(c, k)
+	return c
 }
 
 // Next returns the next key in lexicographic sort order. The method may only
@@ -192,10 +185,7 @@ func (k Key) IsPrev(m Key) bool {
 // is added to the final byte and the carry propagated. The special
 // cases of nil and KeyMin always returns KeyMax.
 func (k Key) PrefixEnd() Key {
-	if len(k) == 0 {
-		return Key(RKeyMax)
-	}
-	return Key(bytesPrefixEnd(k))
+	return Key(keysbase.PrefixEnd(k))
 }
 
 // Equal returns whether two keys are identical.
@@ -1462,7 +1452,7 @@ func PrepareTransactionForRetry(
 		// Use the priority communicated back by the server.
 		txn.Priority = errTxnPri
 	case *ReadWithinUncertaintyIntervalError:
-		txn.WriteTimestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(tErr))
+		txn.WriteTimestamp.Forward(tErr.RetryTimestamp())
 	case *TransactionPushError:
 		// Increase timestamp if applicable, ensuring that we're just ahead of
 		// the pushee.
@@ -1493,7 +1483,7 @@ func PrepareTransactionForRetry(
 		}
 	case *WriteTooOldError:
 		// Increase the timestamp to the ts at which we've actually written.
-		txn.WriteTimestamp.Forward(writeTooOldRetryTimestamp(tErr))
+		txn.WriteTimestamp.Forward(tErr.RetryTimestamp())
 	default:
 		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
 	}
@@ -1527,50 +1517,13 @@ func TransactionRefreshTimestamp(pErr *Error) (bool, hlc.Timestamp) {
 		// error, obviously the refresh will fail. It might be worth trying to
 		// detect these cases and save the futile attempt; we'd need to have access
 		// to the key that generated the error.
-		timestamp.Forward(writeTooOldRetryTimestamp(err))
+		timestamp.Forward(err.RetryTimestamp())
 	case *ReadWithinUncertaintyIntervalError:
-		timestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(err))
+		timestamp.Forward(err.RetryTimestamp())
 	default:
 		return false, hlc.Timestamp{}
 	}
 	return true, timestamp
-}
-
-func readWithinUncertaintyIntervalRetryTimestamp(
-	err *ReadWithinUncertaintyIntervalError,
-) hlc.Timestamp {
-	// If the reader encountered a newer write within the uncertainty interval,
-	// we advance the txn's timestamp just past the uncertain value's timestamp.
-	// This ensures that we read above the uncertain value on a retry.
-	ts := err.ExistingTimestamp.Next()
-	// In addition to advancing past the uncertainty value's timestamp, we also
-	// advance the txn's timestamp up to the local uncertainty limit on the node
-	// which hit the error. This ensures that no future read after the retry on
-	// this node (ignoring lease complications in ComputeLocalUncertaintyLimit
-	// and values with synthetic timestamps) will throw an uncertainty error,
-	// even when reading other keys.
-	//
-	// Note that if the request was not able to establish a local uncertainty
-	// limit due to a missing observed timestamp (for instance, if the request
-	// was evaluated on a follower replica and the txn had never visited the
-	// leaseholder), then LocalUncertaintyLimit will be empty and the Forward
-	// will be a no-op. In this case, we could advance all the way past the
-	// global uncertainty limit, but this time would likely be in the future, so
-	// this would necessitate a commit-wait period after committing.
-	//
-	// In general, we expect the local uncertainty limit, if set, to be above
-	// the uncertainty value's timestamp. So we expect this Forward to advance
-	// ts. However, this is not always the case. The one exception is if the
-	// uncertain value had a synthetic timestamp, so it was compared against the
-	// global uncertainty limit to determine uncertainty (see IsUncertain). In
-	// such cases, we're ok advancing just past the value's timestamp. Either
-	// way, we won't see the same value in our uncertainty interval on a retry.
-	ts.Forward(err.LocalUncertaintyLimit)
-	return ts
-}
-
-func writeTooOldRetryTimestamp(err *WriteTooOldError) hlc.Timestamp {
-	return err.ActualTimestamp
 }
 
 // Replicas returns all of the replicas present in the descriptor after this
@@ -2100,6 +2053,38 @@ func (u *LockUpdate) SetTxn(txn *Transaction) {
 	u.IgnoredSeqNums = txn.IgnoredSeqNums
 }
 
+// SafeFormat implements redact.SafeFormatter.
+func (ls LockStateInfo) SafeFormat(w redact.SafePrinter, r rune) {
+	expand := w.Flag('+')
+	w.Printf("range_id=%d key=%s ", ls.RangeID, ls.Key)
+	redactableLockHolder := redact.Sprint(nil)
+	if ls.LockHolder != nil {
+		if expand {
+			redactableLockHolder = redact.Sprint(ls.LockHolder.ID)
+		} else {
+			redactableLockHolder = redact.Sprint(ls.LockHolder.Short())
+		}
+	}
+	w.Printf("holder=%s ", redactableLockHolder)
+	w.Printf("durability=%s ", ls.Durability)
+	w.Printf("duration=%s", ls.HoldDuration)
+	if len(ls.Waiters) > 0 {
+		w.Printf("\n waiters:")
+
+		for _, lw := range ls.Waiters {
+			if expand {
+				w.Printf("\n  %+v", lw)
+			} else {
+				w.Printf("\n  %s", lw)
+			}
+		}
+	}
+}
+
+func (ls LockStateInfo) String() string {
+	return redact.StringWithoutMarkers(ls)
+}
+
 // EqualValue is Equal.
 //
 // TODO(tbg): remove this passthrough.
@@ -2529,4 +2514,11 @@ func (ReplicaChangeType) SafeValue() {}
 func (ri RangeInfo) String() string {
 	return fmt.Sprintf("desc: %s, lease: %s, closed_timestamp_policy: %s",
 		ri.Desc, ri.Lease, ri.ClosedTimestampPolicy)
+}
+
+// Add adds another RowCount to the receiver.
+func (r *RowCount) Add(other RowCount) {
+	r.DataSize += other.DataSize
+	r.Rows += other.Rows
+	r.IndexEntries += other.IndexEntries
 }

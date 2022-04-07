@@ -299,69 +299,61 @@ func (p *planner) IsTypeVisible(
 	return false, true, nil
 }
 
-// HasPrivilege is part of the tree.EvalDatabase interface.
-func (p *planner) HasPrivilege(
+// HasAnyPrivilege is part of the tree.EvalDatabase interface.
+func (p *planner) HasAnyPrivilege(
 	ctx context.Context,
 	specifier tree.HasPrivilegeSpecifier,
 	user security.SQLUsername,
-	priv privilege.Privilege,
-) (bool, error) {
+	privs []privilege.Privilege,
+) (tree.HasAnyPrivilegeResult, error) {
 	desc, err := p.ResolveDescriptorForPrivilegeSpecifier(
 		ctx,
 		specifier,
 	)
 	if err != nil {
-		return false, err
+		return tree.HasNoPrivilege, err
+	}
+	if desc == nil {
+		return tree.ObjectNotFound, nil
 	}
 
-	// hasPrivilegeFunc checks whether any role has the given privilege.
-	hasPrivilegeFunc := func(priv privilege.Privilege) (bool, error) {
-		err := p.CheckPrivilegeForUser(ctx, desc, priv.Kind, user)
-		if err != nil {
-			if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
-				return false, nil
-			}
-			return false, err
-		}
-
-		if priv.GrantOption {
-			if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-				err := p.CheckPrivilegeForUser(ctx, desc, privilege.GRANT, user)
-				if err != nil {
-					if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
-						return false, nil
-					}
-					return false, err
-				}
-			} else {
-				err := p.CheckGrantOptionsForUser(ctx, desc, []privilege.Kind{priv.Kind}, user, true /* isGrant */)
-				if err != nil {
-					if pgerror.GetPGCode(err) == pgcode.WarningPrivilegeNotGranted {
-						return false, nil
-					}
-					return false, err
-				}
-			}
-		}
-
-		return true, nil
-	}
-
-	if priv.Kind == privilege.RULE {
+	for _, priv := range privs {
 		// RULE was only added for compatibility with Postgres, and Postgres
 		// never allows RULE to be granted, even if the user has ALL privileges.
 		// See https://www.postgresql.org/docs/8.1/sql-grant.html
 		// and https://www.postgresql.org/docs/release/8.2.0/.
-		return false, nil
+		if priv.Kind == privilege.RULE {
+			continue
+		}
+
+		if err := p.CheckPrivilegeForUser(ctx, desc, priv.Kind, user); err != nil {
+			if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
+				continue
+			}
+			return tree.HasNoPrivilege, err
+		}
+
+		if priv.GrantOption {
+			if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
+				if err := p.CheckPrivilegeForUser(ctx, desc, privilege.GRANT, user); err != nil {
+					if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
+						continue
+					}
+					return tree.HasNoPrivilege, err
+				}
+			} else {
+				if err := p.CheckGrantOptionsForUser(ctx, desc, []privilege.Kind{priv.Kind}, user, true /* isGrant */); err != nil {
+					if pgerror.GetPGCode(err) == pgcode.WarningPrivilegeNotGranted {
+						continue
+					}
+					return tree.HasNoPrivilege, err
+				}
+			}
+		}
+		return tree.HasPrivilege, nil
 	}
-	hasPrivilege, err := hasPrivilegeFunc(privilege.Privilege{Kind: privilege.ALL})
-	if err != nil {
-		return false, err
-	}
-	if hasPrivilege {
-		return true, nil
-	}
-	return hasPrivilegeFunc(priv)
+
+	return tree.HasNoPrivilege, nil
 }
 
 // ResolveDescriptorForPrivilegeSpecifier resolves a tree.HasPrivilegeSpecifier
@@ -375,7 +367,7 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 		)
 	} else if specifier.DatabaseOID != nil {
 		_, database, err := p.Descriptors().GetImmutableDatabaseByID(
-			ctx, p.txn, descpb.ID(*specifier.DatabaseOID), tree.DatabaseLookupFlags{Required: true},
+			ctx, p.txn, descpb.ID(*specifier.DatabaseOID), tree.DatabaseLookupFlags{},
 		)
 		return database, err
 	} else if specifier.SchemaName != nil {
@@ -386,7 +378,7 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 			return nil, err
 		}
 		return p.Descriptors().GetImmutableSchemaByName(
-			ctx, p.txn, database, *specifier.SchemaName, tree.SchemaLookupFlags{Required: true},
+			ctx, p.txn, database, *specifier.SchemaName, tree.SchemaLookupFlags{Required: *specifier.SchemaIsRequired},
 		)
 	} else if specifier.TableName != nil || specifier.TableOID != nil {
 		var table catalog.TableDescriptor
@@ -408,21 +400,17 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 					"cross-database references are not implemented: %s", tn)
 			}
 			_, table, err = p.Descriptors().GetImmutableTableByName(
-				ctx, p.txn, tn, tree.ObjectLookupFlags{
-					CommonLookupFlags: tree.CommonLookupFlags{
-						Required: true,
-					},
-				},
+				ctx, p.txn, tn, tree.ObjectLookupFlags{},
 			)
 		} else {
 			table, err = p.Descriptors().GetImmutableTableByID(
-				ctx, p.txn, descpb.ID(*specifier.TableOID),
-				tree.ObjectLookupFlags{
-					CommonLookupFlags: tree.CommonLookupFlags{
-						Required: true,
-					},
-				},
+				ctx, p.txn, descpb.ID(*specifier.TableOID), tree.ObjectLookupFlags{},
 			)
+			// When a TableOID is specified and the relation is not found, we return NULL.
+			if err != nil && sqlerrors.IsUndefinedRelationError(err) {
+				// nolint:returnerrcheck
+				return nil, nil
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -484,7 +472,7 @@ func (p *planner) GetTypeDescriptor(
 		return tree.TypeName{}, nil, err
 	}
 	sc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{})
+		ctx, p.txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{Required: true})
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
@@ -621,13 +609,13 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 				if err != nil {
 					return nil, err
 				}
-				for i := range objectIDs {
-					descriptor, err := p.Descriptors().GetMutableDescriptorByID(ctx, objectIDs[i], p.txn)
-					if err != nil {
-						return nil, err
-					}
-					if descriptor != nil && descriptor.DescriptorType() == catalog.Table {
-						descs = append(descs, descriptor)
+				muts, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.txn, objectIDs...)
+				if err != nil {
+					return nil, err
+				}
+				for _, mut := range muts {
+					if mut != nil && mut.DescriptorType() == catalog.Table {
+						descs = append(descs, mut)
 					}
 				}
 			}
@@ -685,14 +673,13 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		if err != nil {
 			return nil, err
 		}
-
-		for i := range objectIDs {
-			descriptor, err := p.Descriptors().GetMutableDescriptorByID(ctx, objectIDs[i], p.txn)
-			if err != nil {
-				return nil, err
-			}
-			if descriptor != nil && descriptor.DescriptorType() == catalog.Table {
-				descs = append(descs, descriptor)
+		muts, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.txn, objectIDs...)
+		if err != nil {
+			return nil, err
+		}
+		for _, mut := range muts {
+			if mut != nil && mut.DescriptorType() == catalog.Table {
+				descs = append(descs, mut)
 			}
 		}
 	}
@@ -760,9 +747,9 @@ func (p *planner) getQualifiedTableName(
 			AvoidLeased:    true,
 		})
 	switch {
-	case err == nil:
+	case scDesc != nil:
 		schemaName = tree.Name(scDesc.GetName())
-	case desc.IsTemporary() && errors.Is(err, catalog.ErrDescriptorNotFound):
+	case desc.IsTemporary() && scDesc == nil:
 		// We've lost track of the session which owned this schema, but we
 		// can come up with a name that is also going to be unique and
 		// informative and looks like a pg_temp_<session_id> name.
@@ -838,7 +825,7 @@ func (p *planner) getQualifiedTypeName(
 
 	schemaID := desc.GetParentSchemaID()
 	scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.txn, schemaID, tree.SchemaLookupFlags{},
+		ctx, p.txn, schemaID, tree.SchemaLookupFlags{Required: true},
 	)
 	if err != nil {
 		return nil, err

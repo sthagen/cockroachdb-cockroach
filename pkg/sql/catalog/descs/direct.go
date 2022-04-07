@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -27,71 +28,164 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// GetCatalogUnvalidated looks up and returns all available descriptors and
-// namespace system table entries but does not validate anything.
-// It is exported solely to be used by functions which want to perform explicit
-// validation to detect corruption.
-func (tc *Collection) GetCatalogUnvalidated(
-	ctx context.Context, txn *kv.Txn,
-) (nstree.Catalog, error) {
-	return catkv.GetCatalogUnvalidated(ctx, txn, tc.codec())
+// Direct provides direct access to the underlying KV-storage.
+func (tc *Collection) Direct() Direct { return &tc.direct }
+
+// Direct provides access to the underlying key-value store directly. A key
+// difference between descriptors retrieved directly vs. descriptors retrieved
+// through the Collection is that the descriptors will not be hydrated.
+//
+// Note: If you are tempted to use this in a place which is not currently using
+// it, pause, and consider the decision very carefully.
+type Direct interface {
+	// GetCatalogUnvalidated looks up and returns all available descriptors and
+	// namespace system table entries but does not validate anything.
+	// It is exported solely to be used by functions which want to perform explicit
+	// validation to detect corruption.
+	GetCatalogUnvalidated(
+		ctx context.Context, txn *kv.Txn,
+	) (nstree.Catalog, error)
+
+	// MustGetDatabaseDescByID looks up the database descriptor given its ID,
+	// returning an error if the descriptor is not found.
+	MustGetDatabaseDescByID(
+		ctx context.Context, txn *kv.Txn, id descpb.ID,
+	) (catalog.DatabaseDescriptor, error)
+
+	// MustGetSchemaDescByID looks up the schema descriptor given its ID,
+	// returning an error if the descriptor is not found.
+	MustGetSchemaDescByID(
+		ctx context.Context, txn *kv.Txn, id descpb.ID,
+	) (catalog.SchemaDescriptor, error)
+
+	// MustGetTypeDescByID looks up the type descriptor given its ID,
+	// returning an error if the type is not found.
+	MustGetTypeDescByID(
+		ctx context.Context, txn *kv.Txn, id descpb.ID,
+	) (catalog.TypeDescriptor, error)
+
+	// MustGetTableDescByID looks up the table descriptor given its ID,
+	// returning an error if the table is not found.
+	MustGetTableDescByID(
+		ctx context.Context, txn *kv.Txn, id descpb.ID,
+	) (catalog.TableDescriptor, error)
+
+	// GetSchemaDescriptorsFromIDs returns the schema descriptors from an input
+	// list of schema IDs. It will return an error if any one of the IDs is not
+	// a schema.
+	GetSchemaDescriptorsFromIDs(
+		ctx context.Context, txn *kv.Txn, ids []descpb.ID,
+	) ([]catalog.SchemaDescriptor, error)
+
+	// ResolveSchemaID resolves a schema's ID based on db and name.
+	ResolveSchemaID(
+		ctx context.Context, txn *kv.Txn, dbID descpb.ID, scName string,
+	) (descpb.ID, error)
+
+	// GetDescriptorCollidingWithObject looks up the object ID and returns the
+	// corresponding descriptor if it exists.
+	GetDescriptorCollidingWithObject(
+		ctx context.Context, txn *kv.Txn, parentID descpb.ID, parentSchemaID descpb.ID, name string,
+	) (catalog.Descriptor, error)
+
+	// CheckObjectCollision returns an error if an object already exists with the
+	// same parentID, parentSchemaID and name.
+	CheckObjectCollision(
+		ctx context.Context,
+		txn *kv.Txn,
+		parentID descpb.ID,
+		parentSchemaID descpb.ID,
+		name tree.ObjectName,
+	) error
+
+	// LookupDatabaseID is a wrapper around LookupObjectID for databases.
+	LookupDatabaseID(
+		ctx context.Context, txn *kv.Txn, dbName string,
+	) (descpb.ID, error)
+
+	// LookupSchemaID is a wrapper around LookupObjectID for schemas.
+	LookupSchemaID(
+		ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaName string,
+	) (descpb.ID, error)
+
+	// LookupObjectID returns the table or type descriptor ID for the namespace
+	// entry keyed by (parentID, parentSchemaID, name).
+	// Returns descpb.InvalidID when no matching entry exists.
+	LookupObjectID(
+		ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaID descpb.ID, objectName string,
+	) (descpb.ID, error)
+
+	// WriteNewDescToBatch adds a CPut command writing a descriptor proto to the
+	// descriptors table. It writes the descriptor desc at the id descID, asserting
+	// that there was no previous descriptor at that id present already. If kvTrace
+	// is enabled, it will log an event explaining the CPut that was performed.
+	WriteNewDescToBatch(
+		ctx context.Context, kvTrace bool, b *kv.Batch, desc catalog.Descriptor,
+	) error
 }
 
-// MustGetDatabaseDescByID looks up the database descriptor given its ID,
-// returning an error if the descriptor is not found.
-func (tc *Collection) MustGetDatabaseDescByID(
+type direct struct {
+	settings *cluster.Settings
+	codec    keys.SQLCodec
+	version  clusterversion.ClusterVersion
+}
+
+func makeDirect(ctx context.Context, codec keys.SQLCodec, s *cluster.Settings) direct {
+	return direct{
+		settings: s,
+		codec:    codec,
+		version:  s.Version.ActiveVersion(ctx),
+	}
+}
+
+func (d *direct) GetCatalogUnvalidated(ctx context.Context, txn *kv.Txn) (nstree.Catalog, error) {
+	return catkv.GetCatalogUnvalidated(ctx, d.codec, txn)
+}
+
+func (d *direct) MustGetDatabaseDescByID(
 	ctx context.Context, txn *kv.Txn, id descpb.ID,
 ) (catalog.DatabaseDescriptor, error) {
-	desc, err := catkv.MustGetDescriptorByID(ctx, txn, tc.codec(), id, catalog.Database)
+	desc, err := catkv.MustGetDescriptorByID(ctx, d.version, d.codec, txn, nil /* vd */, id, catalog.Database)
 	if err != nil {
 		return nil, err
 	}
 	return desc.(catalog.DatabaseDescriptor), nil
 }
 
-// MustGetSchemaDescByID looks up the schema descriptor given its ID,
-// returning an error if the descriptor is not found.
-func (tc *Collection) MustGetSchemaDescByID(
+func (d *direct) MustGetSchemaDescByID(
 	ctx context.Context, txn *kv.Txn, id descpb.ID,
 ) (catalog.SchemaDescriptor, error) {
-	desc, err := catkv.MustGetDescriptorByID(ctx, txn, tc.codec(), id, catalog.Schema)
+	desc, err := catkv.MustGetDescriptorByID(ctx, d.version, d.codec, txn, nil /* vd */, id, catalog.Schema)
 	if err != nil {
 		return nil, err
 	}
 	return desc.(catalog.SchemaDescriptor), nil
 }
 
-// MustGetTableDescByID looks up the table descriptor given its ID,
-// returning an error if the table is not found.
-func (tc *Collection) MustGetTableDescByID(
+func (d *direct) MustGetTableDescByID(
 	ctx context.Context, txn *kv.Txn, id descpb.ID,
 ) (catalog.TableDescriptor, error) {
-	desc, err := catkv.MustGetDescriptorByID(ctx, txn, tc.codec(), id, catalog.Table)
+	desc, err := catkv.MustGetDescriptorByID(ctx, d.version, d.codec, txn, nil /* vd */, id, catalog.Table)
 	if err != nil {
 		return nil, err
 	}
 	return desc.(catalog.TableDescriptor), nil
 }
 
-// MustGetTypeDescByID looks up the type descriptor given its ID,
-// returning an error if the type is not found.
-func (tc *Collection) MustGetTypeDescByID(
+func (d *direct) MustGetTypeDescByID(
 	ctx context.Context, txn *kv.Txn, id descpb.ID,
 ) (catalog.TypeDescriptor, error) {
-	desc, err := catkv.MustGetDescriptorByID(ctx, txn, tc.codec(), id, catalog.Type)
+	desc, err := catkv.MustGetDescriptorByID(ctx, d.version, d.codec, txn, nil /* vd */, id, catalog.Type)
 	if err != nil {
 		return nil, err
 	}
 	return desc.(catalog.TypeDescriptor), nil
 }
 
-// GetSchemaDescriptorsFromIDs returns the schema descriptors from an input
-// list of schema IDs. It will return an error if any one of the IDs is not
-// a schema.
-func (tc *Collection) GetSchemaDescriptorsFromIDs(
+func (d *direct) GetSchemaDescriptorsFromIDs(
 	ctx context.Context, txn *kv.Txn, ids []descpb.ID,
 ) ([]catalog.SchemaDescriptor, error) {
-	descs, err := catkv.MustGetDescriptorsByID(ctx, txn, tc.codec(), ids, catalog.Schema)
+	descs, err := catkv.MustGetDescriptorsByID(ctx, d.version, d.codec, txn, nil /* vd */, ids, catalog.Schema)
 	if err != nil {
 		return nil, err
 	}
@@ -102,31 +196,28 @@ func (tc *Collection) GetSchemaDescriptorsFromIDs(
 	return ret, nil
 }
 
-// ResolveSchemaID resolves a schema's ID based on db and name.
-func (tc *Collection) ResolveSchemaID(
+func (d *direct) ResolveSchemaID(
 	ctx context.Context, txn *kv.Txn, dbID descpb.ID, scName string,
 ) (descpb.ID, error) {
-	if !tc.settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
+	if !d.version.IsActive(clusterversion.PublicSchemasWithDescriptors) {
 		// Try to use the system name resolution bypass. Avoids a hotspot by explicitly
 		// checking for public schema.
 		if scName == tree.PublicSchema {
 			return keys.PublicSchemaID, nil
 		}
 	}
-	return catkv.LookupID(ctx, txn, tc.codec(), dbID, keys.RootNamespaceID, scName)
+	return catkv.LookupID(ctx, txn, d.codec, dbID, keys.RootNamespaceID, scName)
 }
 
-// GetDescriptorCollidingWithObject looks up the object ID and returns the
-// corresponding descriptor if it exists.
-func (tc *Collection) GetDescriptorCollidingWithObject(
+func (d *direct) GetDescriptorCollidingWithObject(
 	ctx context.Context, txn *kv.Txn, parentID descpb.ID, parentSchemaID descpb.ID, name string,
 ) (catalog.Descriptor, error) {
-	id, err := catkv.LookupID(ctx, txn, tc.codec(), parentID, parentSchemaID, name)
+	id, err := catkv.LookupID(ctx, txn, d.codec, parentID, parentSchemaID, name)
 	if err != nil || id == descpb.InvalidID {
 		return nil, err
 	}
 	// ID is already in use by another object.
-	desc, err := catkv.MaybeGetDescriptorByID(ctx, txn, tc.codec(), id, catalog.Any)
+	desc, err := catkv.MaybeGetDescriptorByID(ctx, d.version, d.codec, txn, nil /* vd */, id, catalog.Any)
 	if desc == nil && err == nil {
 		return nil, errors.NewAssertionErrorWithWrappedErrf(
 			catalog.ErrDescriptorNotFound,
@@ -139,16 +230,14 @@ func (tc *Collection) GetDescriptorCollidingWithObject(
 	return desc, nil
 }
 
-// CheckObjectCollision returns an error if an object already exists with the
-// same parentID, parentSchemaID and name.
-func (tc *Collection) CheckObjectCollision(
+func (d *direct) CheckObjectCollision(
 	ctx context.Context,
 	txn *kv.Txn,
 	parentID descpb.ID,
 	parentSchemaID descpb.ID,
 	name tree.ObjectName,
 ) error {
-	desc, err := tc.GetDescriptorCollidingWithObject(ctx, txn, parentID, parentSchemaID, name.Object())
+	desc, err := d.GetDescriptorCollidingWithObject(ctx, txn, parentID, parentSchemaID, name.Object())
 	if err != nil {
 		return err
 	}
@@ -162,37 +251,28 @@ func (tc *Collection) CheckObjectCollision(
 	return nil
 }
 
-// LookupObjectID returns the table or type descriptor ID for the namespace
-// entry keyed by (parentID, parentSchemaID, name).
-// Returns descpb.InvalidID when no matching entry exists.
-func (tc *Collection) LookupObjectID(
+func (d *direct) LookupObjectID(
 	ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaID descpb.ID, objectName string,
 ) (descpb.ID, error) {
-	return catkv.LookupID(ctx, txn, tc.codec(), dbID, schemaID, objectName)
+	return catkv.LookupID(ctx, txn, d.codec, dbID, schemaID, objectName)
 }
 
-// LookupSchemaID is a wrapper around LookupObjectID for schemas.
-func (tc *Collection) LookupSchemaID(
+func (d *direct) LookupSchemaID(
 	ctx context.Context, txn *kv.Txn, dbID descpb.ID, schemaName string,
 ) (descpb.ID, error) {
-	return catkv.LookupID(ctx, txn, tc.codec(), dbID, keys.RootNamespaceID, schemaName)
+	return catkv.LookupID(ctx, txn, d.codec, dbID, keys.RootNamespaceID, schemaName)
 }
 
-// LookupDatabaseID is a wrapper around LookupObjectID for databases.
-func (tc *Collection) LookupDatabaseID(
+func (d *direct) LookupDatabaseID(
 	ctx context.Context, txn *kv.Txn, dbName string,
 ) (descpb.ID, error) {
-	return catkv.LookupID(ctx, txn, tc.codec(), keys.RootNamespaceID, keys.RootNamespaceID, dbName)
+	return catkv.LookupID(ctx, txn, d.codec, keys.RootNamespaceID, keys.RootNamespaceID, dbName)
 }
 
-// WriteNewDescToBatch adds a CPut command writing a descriptor proto to the
-// descriptors table. It writes the descriptor desc at the id descID, asserting
-// that there was no previous descriptor at that id present already. If kvTrace
-// is enabled, it will log an event explaining the CPut that was performed.
-func (tc *Collection) WriteNewDescToBatch(
+func (d *direct) WriteNewDescToBatch(
 	ctx context.Context, kvTrace bool, b *kv.Batch, desc catalog.Descriptor,
 ) error {
-	descKey := catalogkeys.MakeDescMetadataKey(tc.codec(), desc.GetID())
+	descKey := catalogkeys.MakeDescMetadataKey(d.codec, desc.GetID())
 	proto := desc.DescriptorProto()
 	if kvTrace {
 		log.VEventf(ctx, 2, "CPut %s -> %s", descKey, proto)

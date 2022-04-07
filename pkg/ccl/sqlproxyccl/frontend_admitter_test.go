@@ -59,12 +59,13 @@ func TestFrontendAdmitWithClientSSLDisableAndCustomParam(t *testing.T) {
 		fmt.Printf("Done\n")
 	}()
 
-	frontendCon, msg, err := FrontendAdmit(srv, nil)
-	require.NoError(t, err)
-	require.Equal(t, srv, frontendCon)
-	require.NotNil(t, msg)
-	require.Contains(t, msg.Parameters, "p1")
-	require.Equal(t, msg.Parameters["p1"], "a")
+	fe := FrontendAdmit(srv, nil)
+	require.NoError(t, fe.err)
+	require.Equal(t, srv, fe.conn)
+	require.NotNil(t, fe.msg)
+	require.Contains(t, fe.msg.Parameters, "p1")
+	require.Equal(t, fe.msg.Parameters["p1"], "a")
+	require.Contains(t, fe.msg.Parameters, remoteAddrStartupParam)
 }
 
 func TestFrontendAdmitWithClientSSLRequire(t *testing.T) {
@@ -89,11 +90,12 @@ func TestFrontendAdmitWithClientSSLRequire(t *testing.T) {
 
 	tlsConfig, err := tlsConfig()
 	require.NoError(t, err)
-	frontendCon, msg, err := FrontendAdmit(srv, tlsConfig)
+	fe := FrontendAdmit(srv, tlsConfig)
 	require.NoError(t, err)
-	defer func() { _ = frontendCon.Close() }()
-	require.NotEqual(t, srv, frontendCon) // The connection was replaced by SSL
-	require.NotNil(t, msg)
+	defer func() { _ = fe.conn.Close() }()
+	require.NotEqual(t, srv, fe.conn) // The connection was replaced by SSL
+	require.NotNil(t, fe.msg)
+	require.Contains(t, fe.msg.Parameters, remoteAddrStartupParam)
 }
 
 // TestFrontendAdmitRequireEncryption sends StartupRequest when SSlRequest is
@@ -116,12 +118,12 @@ func TestFrontendAdmitRequireEncryption(t *testing.T) {
 
 	tlsConfig, err := tlsConfig()
 	require.NoError(t, err)
-	frontendCon, msg, err := FrontendAdmit(srv, tlsConfig)
-	require.EqualError(t, err,
+	fe := FrontendAdmit(srv, tlsConfig)
+	require.EqualError(t, fe.err,
 		"codeUnexpectedInsecureStartupMessage: "+
 			"unsupported startup message: *pgproto3.StartupMessage")
-	require.NotNil(t, frontendCon)
-	require.Nil(t, msg)
+	require.NotNil(t, fe.conn)
+	require.Nil(t, fe.msg)
 }
 
 // TestFrontendAdmitWithCancel sends CancelRequest.
@@ -138,10 +140,10 @@ func TestFrontendAdmitWithCancel(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
-	frontendCon, msg, err := FrontendAdmit(srv, nil)
-	require.NoError(t, err)
-	require.NotNil(t, frontendCon)
-	require.Nil(t, msg)
+	fe := FrontendAdmit(srv, nil)
+	require.NoError(t, fe.err)
+	require.NotNil(t, fe.conn)
+	require.Nil(t, fe.msg)
 }
 
 // TestFrontendAdmitWithSSLAndCancel sends SSLRequest followed by CancelRequest.
@@ -168,11 +170,42 @@ func TestFrontendAdmitWithSSLAndCancel(t *testing.T) {
 
 	tlsConfig, err := tlsConfig()
 	require.NoError(t, err)
-	frontendCon, msg, err := FrontendAdmit(srv, tlsConfig)
-	require.EqualError(t, err,
+	fe := FrontendAdmit(srv, tlsConfig)
+	require.EqualError(t, fe.err,
 		"codeUnexpectedStartupMessage: "+
 			"unsupported post-TLS startup message: *pgproto3.CancelRequest",
 	)
-	require.NotNil(t, frontendCon)
-	require.Nil(t, msg)
+	require.NotNil(t, fe.conn)
+	require.Nil(t, fe.msg)
+}
+
+func TestFrontendAdmitSessionRevivalToken(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cli, srv := net.Pipe()
+	require.NoError(t, srv.SetReadDeadline(timeutil.Now().Add(3e9)))
+	require.NoError(t, cli.SetReadDeadline(timeutil.Now().Add(3e9)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		cfg, err := pgconn.ParseConfig(
+			"postgres://localhost?sslmode=disable&crdb:session_revival_token_base64=abc",
+		)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+		cfg.DialFunc = func(
+			ctx context.Context, network, addr string,
+		) (net.Conn, error) {
+			return cli, nil
+		}
+		_, _ = pgconn.ConnectConfig(ctx, cfg)
+		fmt.Printf("Done\n")
+	}()
+
+	fe := FrontendAdmit(srv, nil)
+	require.EqualError(t, fe.err, "codeUnexpectedStartupMessage: parameter crdb:session_revival_token_base64 is not allowed")
+	require.NotNil(t, fe.conn)
+	require.Nil(t, fe.msg)
 }

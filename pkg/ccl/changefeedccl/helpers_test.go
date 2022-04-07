@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
@@ -328,6 +328,7 @@ func startTestFullServer(
 	knobs := base.TestingKnobs{
 		DistSQL:          &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		Server:           &server.TestingKnobs{},
 	}
 	if options.knobsFn != nil {
 		options.knobsFn(&knobs)
@@ -358,8 +359,8 @@ func startTestFullServer(
 		}
 	}()
 
-	_, err = db.ExecContext(ctx, serverSetupStatements)
-	require.NoError(t, err)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.ExecMultiple(t, strings.Split(serverSetupStatements, ";")...)
 
 	if region := serverArgsRegion(args); region != "" {
 		_, err = db.ExecContext(ctx, fmt.Sprintf(`ALTER DATABASE d PRIMARY REGION "%s"`, region))
@@ -398,8 +399,8 @@ func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB
 			require.NoError(t, err)
 		}
 	}()
-	_, err = db.ExecContext(ctx, serverSetupStatements)
-	require.NoError(t, err)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.ExecMultiple(t, strings.Split(serverSetupStatements, ";")...)
 
 	_, err = db.ExecContext(ctx, `ALTER DATABASE d PRIMARY REGION "us-east1"`)
 	return cluster, db, cleanupAndReset
@@ -408,12 +409,11 @@ func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB
 func startTestTenant(
 	t testing.TB, options feedTestOptions,
 ) (serverutils.TestServerInterface, *gosql.DB, func()) {
-	ctx := context.Background()
-
 	kvServer, _, cleanupCluster := startTestFullServer(t, options)
 	knobs := base.TestingKnobs{
 		DistSQL:          &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		Server:           &server.TestingKnobs{},
 	}
 	if options.knobsFn != nil {
 		options.knobsFn(&knobs)
@@ -430,8 +430,8 @@ func startTestTenant(
 
 	tenantServer, tenantDB := serverutils.StartTenant(t, kvServer, tenantArgs)
 	// Re-run setup on the tenant as well
-	_, err := tenantDB.ExecContext(ctx, serverSetupStatements)
-	require.NoError(t, err)
+	tenantRunner := sqlutils.MakeSQLRunner(tenantDB)
+	tenantRunner.ExecMultiple(t, strings.Split(serverSetupStatements, ";")...)
 
 	server := &testServerShim{tenantServer, kvServer}
 	// Log so that it is clear if a failed test happened
@@ -566,10 +566,10 @@ func cloudStorageTestWithOptions(testFn cdcTestFn, options feedTestOptions) func
 			}
 			blobClientFactory := blobs.NewLocalOnlyBlobClientFactory(options.externalIODir)
 			if serverKnobs, ok := knobs.Server.(*server.TestingKnobs); ok {
-				serverKnobs.TenantBlobClientFactory = blobClientFactory
+				serverKnobs.BlobClientFactory = blobClientFactory
 			} else {
 				knobs.Server = &server.TestingKnobs{
-					TenantBlobClientFactory: blobClientFactory,
+					BlobClientFactory: blobClientFactory,
 				}
 			}
 		}

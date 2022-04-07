@@ -31,11 +31,23 @@ type SchemaChangePolicy string
 // include virtual columns in an event
 type VirtualColumnVisibility string
 
+// InitialScanType configures whether the changefeed will perform an
+// initial scan, and the type of initial scan that it will perform
+type InitialScanType int
+
+// Constants for the initial scan types
+const (
+	InitialScan InitialScanType = iota
+	NoInitialScan
+	OnlyInitialScan
+)
+
 // Constants for the options.
 const (
 	OptAvroSchemaPrefix         = `avro_schema_prefix`
 	OptConfluentSchemaRegistry  = `confluent_schema_registry`
 	OptCursor                   = `cursor`
+	OptEndTime                  = `end_time`
 	OptEnvelope                 = `envelope`
 	OptFormat                   = `format`
 	OptFullTableName            = `full_table_name`
@@ -49,6 +61,7 @@ const (
 	OptCompression              = `compression`
 	OptSchemaChangeEvents       = `schema_change_events`
 	OptSchemaChangePolicy       = `schema_change_policy`
+	OptSplitColumnFamilies      = `split_column_families`
 	OptProtectDataFromGCOnPause = `protect_data_from_gc_on_pause`
 	OptWebhookAuthHeader        = `webhook_auth_header`
 	OptWebhookClientTimeout     = `webhook_client_timeout`
@@ -93,6 +106,8 @@ const (
 	// Sentinel value to indicate that all resolved timestamp events should be emitted.
 	OptEmitAllResolvedTimestamps = ``
 
+	OptInitialScanOnly = `initial_scan_only`
+
 	OptEnvelopeKeyOnly       EnvelopeType = `key_only`
 	OptEnvelopeRow           EnvelopeType = `row`
 	OptEnvelopeDeprecatedRow EnvelopeType = `deprecated_row`
@@ -117,6 +132,10 @@ const (
 	// OptKafkaSinkConfig is a JSON configuration for kafka sink (kafkaSinkConfig).
 	OptKafkaSinkConfig   = `kafka_sink_config`
 	OptWebhookSinkConfig = `webhook_sink_config`
+
+	// OptSink allows users to alter the Sink URI of an existing changefeed.
+	// Note that this option is only allowed for alter changefeed statements.
+	OptSink = `sink`
 
 	SinkParamCACert                 = `ca_cert`
 	SinkParamClientCert             = `client_cert`
@@ -161,6 +180,7 @@ var ChangefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
 	OptAvroSchemaPrefix:         sql.KVStringOptRequireValue,
 	OptConfluentSchemaRegistry:  sql.KVStringOptRequireValue,
 	OptCursor:                   sql.KVStringOptRequireValue,
+	OptEndTime:                  sql.KVStringOptRequireValue,
 	OptEnvelope:                 sql.KVStringOptRequireValue,
 	OptFormat:                   sql.KVStringOptRequireValue,
 	OptFullTableName:            sql.KVStringOptRequireNoValue,
@@ -174,8 +194,10 @@ var ChangefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
 	OptCompression:              sql.KVStringOptRequireValue,
 	OptSchemaChangeEvents:       sql.KVStringOptRequireValue,
 	OptSchemaChangePolicy:       sql.KVStringOptRequireValue,
-	OptInitialScan:              sql.KVStringOptRequireNoValue,
+	OptSplitColumnFamilies:      sql.KVStringOptRequireNoValue,
+	OptInitialScan:              sql.KVStringOptAny,
 	OptNoInitialScan:            sql.KVStringOptRequireNoValue,
+	OptInitialScanOnly:          sql.KVStringOptRequireNoValue,
 	OptProtectDataFromGCOnPause: sql.KVStringOptRequireNoValue,
 	OptKafkaSinkConfig:          sql.KVStringOptRequireValue,
 	OptWebhookSinkConfig:        sql.KVStringOptRequireValue,
@@ -195,14 +217,14 @@ func makeStringSet(opts ...string) map[string]struct{} {
 }
 
 // CommonOptions is options common to all sinks
-var CommonOptions = makeStringSet(OptCursor, OptEnvelope,
+var CommonOptions = makeStringSet(OptCursor, OptEndTime, OptEnvelope,
 	OptFormat, OptFullTableName,
 	OptKeyInValue, OptTopicInValue,
 	OptResolvedTimestamps, OptUpdatedTimestamps,
-	OptMVCCTimestamps, OptDiff,
+	OptMVCCTimestamps, OptDiff, OptSplitColumnFamilies,
 	OptSchemaChangeEvents, OptSchemaChangePolicy,
 	OptProtectDataFromGCOnPause, OptOnError,
-	OptInitialScan, OptNoInitialScan,
+	OptInitialScan, OptNoInitialScan, OptInitialScanOnly,
 	OptMinCheckpointFrequency, OptMetricsScope, OptVirtualColumns, Topics)
 
 // SQLValidOptions is options exclusive to SQL sink
@@ -232,4 +254,31 @@ var NoLongerExperimental = map[string]string{
 	DeprecatedSinkSchemeCloudStorageHTTPS:     SinkSchemeCloudStorageHTTPS,
 	DeprecatedSinkSchemeCloudStorageNodelocal: SinkSchemeCloudStorageNodelocal,
 	DeprecatedSinkSchemeCloudStorageS3:        SinkSchemeCloudStorageS3,
+}
+
+// AlterChangefeedUnsupportedOptions are changefeed options that we do not allow
+// users to alter.
+// TODO(sherman): At the moment we disallow altering both the initial_scan_only
+// and the end_time option. However, there are instances in which it should be
+// allowed to alter either of these options. We need to support the alteration
+// of these fields.
+var AlterChangefeedUnsupportedOptions = makeStringSet(OptCursor, OptInitialScan,
+	OptNoInitialScan, OptInitialScanOnly, OptEndTime)
+
+// AlterChangefeedOptionExpectValues is used to parse alter changefeed options
+// using PlanHookState.TypeAsStringOpts().
+var AlterChangefeedOptionExpectValues = func() map[string]sql.KVStringOptValidate {
+	alterChangefeedOptions := make(map[string]sql.KVStringOptValidate, len(ChangefeedOptionExpectValues)+1)
+	for key, value := range ChangefeedOptionExpectValues {
+		alterChangefeedOptions[key] = value
+	}
+	alterChangefeedOptions[OptSink] = sql.KVStringOptRequireValue
+	return alterChangefeedOptions
+}()
+
+// AlterChangefeedTargetOptions is used to parse target specific alter
+// changefeed options using PlanHookState.TypeAsStringOpts().
+var AlterChangefeedTargetOptions = map[string]sql.KVStringOptValidate{
+	OptInitialScan:   sql.KVStringOptRequireNoValue,
+	OptNoInitialScan: sql.KVStringOptRequireNoValue,
 }

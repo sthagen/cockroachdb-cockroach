@@ -97,6 +97,40 @@ var migrations = []migration.Migration{
 		NoPrecondition,
 		grantOptionMigration,
 	),
+	migration.NewTenantMigration(
+		"delete comments that belong to dropped indexes",
+		toCV(clusterversion.DeleteCommentsWithDroppedIndexes),
+		NoPrecondition,
+		ensureCommentsHaveNonDroppedIndexes,
+	),
+	migration.NewTenantMigration(
+		"convert incompatible database privileges to default privileges",
+		toCV(clusterversion.RemoveIncompatibleDatabasePrivileges),
+		NoPrecondition,
+		runRemoveInvalidDatabasePrivileges,
+	),
+	migration.NewSystemMigration(
+		"populate RangeAppliedState.RaftAppliedIndexTerm for all ranges",
+		toCV(clusterversion.AddRaftAppliedIndexTermMigration),
+		raftAppliedIndexTermMigration,
+	),
+	migration.NewSystemMigration(
+		"purge all replicas not populating RangeAppliedState.RaftAppliedIndexTerm",
+		toCV(clusterversion.PostAddRaftAppliedIndexTermMigration),
+		postRaftAppliedIndexTermMigration,
+	),
+	migration.NewTenantMigration(
+		"add the system.tenant_settings table",
+		toCV(clusterversion.TenantSettingsTable),
+		NoPrecondition,
+		tenantSettingsTableMigration,
+	),
+	migration.NewTenantMigration(
+		"Rewrites cast that are negatively affected by DateStyle/IntervalStyle",
+		toCV(clusterversion.DateStyleIntervalStyleCastRewrite),
+		NoPrecondition,
+		fixCastForStyleMigration,
+	),
 }
 
 func init() {

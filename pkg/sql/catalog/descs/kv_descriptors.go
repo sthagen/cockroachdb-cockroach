@@ -13,12 +13,14 @@ package descs
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
@@ -28,6 +30,10 @@ import (
 
 type kvDescriptors struct {
 	codec keys.SQLCodec
+
+	// systemNamespace is a cache of system table namespace entries. We assume
+	// these are immutable for the life of the process.
+	systemNamespace *systemDatabaseNamespaceCache
 
 	// allDescriptors is a slice of all available descriptors. The descriptors
 	// are cached to avoid repeated lookups by users like virtual tables. The
@@ -78,9 +84,12 @@ func (d *allDescriptors) contains(id descpb.ID) bool {
 	return d.c.IsInitialized() && d.c.LookupDescriptorEntry(id) != nil
 }
 
-func makeKVDescriptors(codec keys.SQLCodec) kvDescriptors {
+func makeKVDescriptors(
+	codec keys.SQLCodec, systemNamespace *systemDatabaseNamespaceCache,
+) kvDescriptors {
 	return kvDescriptors{
-		codec: codec,
+		codec:           codec,
+		systemNamespace: systemNamespace,
 	}
 }
 
@@ -108,10 +117,6 @@ func (kd *kvDescriptors) releaseAllDescriptors() {
 // - When we're looking up a schema for which we already have the descriptor
 //   of the parent database. The schema ID can be looked up in it.
 //
-// TODO(postamar): add namespace caching to the Collection
-// By having the Collection mediate all namespace queries for a transaction
-// (i.e. what it's already doing for descriptors) we could prevent more
-// unnecessary roundtrips to the storage layer.
 func (kd *kvDescriptors) lookupName(
 	ctx context.Context,
 	txn *kv.Txn,
@@ -119,7 +124,7 @@ func (kd *kvDescriptors) lookupName(
 	parentID descpb.ID,
 	parentSchemaID descpb.ID,
 	name string,
-) (descpb.ID, error) {
+) (id descpb.ID, err error) {
 	// Handle special cases which might avoid a namespace table query.
 	switch parentID {
 	case descpb.InvalidID:
@@ -131,8 +136,20 @@ func (kd *kvDescriptors) lookupName(
 	case keys.SystemDatabaseID:
 		// Special case: looking up something in the system database.
 		// Those namespace table entries are cached.
-		id, err := lookupSystemDatabaseNamespaceCache(ctx, kd.codec, parentSchemaID, name)
-		return id, err
+		id = kd.systemNamespace.lookup(parentSchemaID, name)
+		if id != descpb.InvalidID {
+			return id, err
+		}
+		// Make sure to cache the result if we had to look it up.
+		defer func() {
+			if err == nil && id != descpb.InvalidID {
+				kd.systemNamespace.add(descpb.NameInfo{
+					ParentID:       keys.SystemDatabaseID,
+					ParentSchemaID: parentSchemaID,
+					Name:           name,
+				}, id)
+			}
+		}()
 	default:
 		if parentSchemaID == descpb.InvalidID {
 			// At this point we know that parentID is not zero, so a zero
@@ -161,17 +178,19 @@ func (kd *kvDescriptors) lookupName(
 //
 func (kd *kvDescriptors) getByName(
 	ctx context.Context,
+	version clusterversion.ClusterVersion,
 	txn *kv.Txn,
+	vd validate.ValidationDereferencer,
 	maybeDB catalog.DatabaseDescriptor,
 	parentID descpb.ID,
 	parentSchemaID descpb.ID,
 	name string,
-) (desc catalog.MutableDescriptor, err error) {
+) (catalog.Descriptor, error) {
 	descID, err := kd.lookupName(ctx, txn, maybeDB, parentID, parentSchemaID, name)
 	if err != nil || descID == descpb.InvalidID {
 		return nil, err
 	}
-	desc, err = kd.getByID(ctx, txn, descID)
+	descs, err := kd.getByIDs(ctx, version, txn, vd, []descpb.ID{descID})
 	if err != nil {
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
 			// Having done the namespace lookup, the descriptor must exist.
@@ -179,7 +198,7 @@ func (kd *kvDescriptors) getByName(
 		}
 		return nil, err
 	}
-	if desc.GetName() != name {
+	if descs[0].GetName() != name {
 		// Immediately after a RENAME an old name still points to the descriptor
 		// during the drain phase for the name. Do not return a descriptor during
 		// draining.
@@ -190,44 +209,61 @@ func (kd *kvDescriptors) getByName(
 		// uncommitted namespace operations.
 		return nil, nil
 	}
-	return desc, nil
+	return descs[0], nil
 }
 
-// getByID actually reads a descriptor from the storage layer.
-func (kd *kvDescriptors) getByID(
-	ctx context.Context, txn *kv.Txn, id descpb.ID,
-) (_ catalog.MutableDescriptor, _ error) {
-	if id == keys.SystemDatabaseID {
-		// Special handling for the system database descriptor.
-		//
-		// This is done for performance reasons, to save ourselves an unnecessary
-		// round trip to storage which otherwise quickly compounds.
-		//
-		// The system database descriptor should never actually be mutated, which is
-		// why we return the same hard-coded descriptor every time. It's assumed
-		// that callers of this method will check the privileges on the descriptor
-		// (like any other database) and return an error.
-		return dbdesc.NewBuilder(systemschema.SystemDB.DatabaseDesc()).BuildExistingMutable(), nil
+// getByIDs actually reads a batch of descriptors from the storage layer.
+func (kd *kvDescriptors) getByIDs(
+	ctx context.Context,
+	version clusterversion.ClusterVersion,
+	txn *kv.Txn,
+	vd validate.ValidationDereferencer,
+	ids []descpb.ID,
+) ([]catalog.Descriptor, error) {
+	ret := make([]catalog.Descriptor, len(ids))
+	kvIDs := make([]descpb.ID, 0, len(ids))
+	indexes := make([]int, 0, len(ids))
+	for i, id := range ids {
+		if id == keys.SystemDatabaseID {
+			// Special handling for the system database descriptor.
+			//
+			// This is done for performance reasons, to save ourselves an unnecessary
+			// round trip to storage which otherwise quickly compounds.
+			//
+			// The system database descriptor should never actually be mutated, which is
+			// why we return the same hard-coded descriptor every time. It's assumed
+			// that callers of this method will check the privileges on the descriptor
+			// (like any other database) and return an error.
+			ret[i] = dbdesc.NewBuilder(systemschema.SystemDB.DatabaseDesc()).BuildExistingMutable()
+		} else {
+			kvIDs = append(kvIDs, id)
+			indexes = append(indexes, i)
+		}
 	}
-
-	imm, err := catkv.MustGetDescriptorByID(ctx, txn, kd.codec, id, catalog.Any)
+	if len(kvIDs) == 0 {
+		return ret, nil
+	}
+	kvDescs, err := catkv.MustGetDescriptorsByID(ctx, version, kd.codec, txn, vd, kvIDs, catalog.Any)
 	if err != nil {
 		return nil, err
 	}
-	return imm.NewBuilder().BuildExistingMutable(), err
+	for j, desc := range kvDescs {
+		ret[indexes[j]] = desc
+	}
+	return ret, nil
 }
 
 func (kd *kvDescriptors) getAllDescriptors(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn *kv.Txn, version clusterversion.ClusterVersion,
 ) (nstree.Catalog, error) {
 	if kd.allDescriptors.isUnset() {
-		c, err := catkv.GetCatalogUnvalidated(ctx, txn, kd.codec)
+		c, err := catkv.GetCatalogUnvalidated(ctx, kd.codec, txn)
 		if err != nil {
 			return nstree.Catalog{}, err
 		}
 
 		descs := c.OrderedDescriptors()
-		ve := c.Validate(ctx, catalog.ValidationReadTelemetry, catalog.ValidationLevelCrossReferences, descs...)
+		ve := c.Validate(ctx, version, catalog.ValidationReadTelemetry, catalog.ValidationLevelCrossReferences, descs...)
 		if err := ve.CombinedError(); err != nil {
 			return nstree.Catalog{}, err
 		}
@@ -246,14 +282,17 @@ func (kd *kvDescriptors) getAllDescriptors(
 }
 
 func (kd *kvDescriptors) getAllDatabaseDescriptors(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context,
+	version clusterversion.ClusterVersion,
+	txn *kv.Txn,
+	vd validate.ValidationDereferencer,
 ) ([]catalog.DatabaseDescriptor, error) {
 	if kd.allDatabaseDescriptors == nil {
 		c, err := catkv.GetAllDatabaseDescriptorIDs(ctx, txn, kd.codec)
 		if err != nil {
 			return nil, err
 		}
-		dbDescs, err := catkv.MustGetDescriptorsByID(ctx, txn, kd.codec, c.OrderedDescriptorIDs(), catalog.Database)
+		dbDescs, err := catkv.MustGetDescriptorsByID(ctx, version, kd.codec, txn, vd, c.OrderedDescriptorIDs(), catalog.Database)
 		if err != nil {
 			return nil, err
 		}

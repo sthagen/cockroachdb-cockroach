@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "coldata",
@@ -18,13 +19,11 @@ go_library(
     deps = [
         "//pkg/col/typeconv",
         "//pkg/sql/colexecerror",
-        "//pkg/sql/memsize",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/buildutil",
         "//pkg/util/duration",
         "//pkg/util/json",
-        "//pkg/util/uuid",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
@@ -37,7 +36,6 @@ go_test(
     srcs = [
         "batch_test.go",
         "bytes_test.go",
-        "dep_test.go",
         "main_test.go",
         "nulls_test.go",
         "vec_test.go",
@@ -49,7 +47,6 @@ go_test(
         "//pkg/sql/colconv",
         "//pkg/sql/randgen",
         "//pkg/sql/types",
-        "//pkg/testutils/buildutil",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
         "@com_github_cockroachdb_errors//:errors",
@@ -70,5 +67,17 @@ genrule(
     exec_tools = [
         "//pkg/sql/colexec/execgen/cmd/execgen",
         "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
+)
+
+disallowed_imports_test(
+    "coldata",
+    [
+        "//pkg/sql/catalog",
+        "//pkg/sql/sem/tree",
     ],
 )

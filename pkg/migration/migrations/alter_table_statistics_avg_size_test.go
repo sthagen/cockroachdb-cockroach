@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/migration/migrations"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -37,7 +38,7 @@ func TestAlterSystemTableStatisticsTable(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride: clusterversion.ByKey(
 						clusterversion.AlterSystemTableStatisticsAddAvgSizeCol - 1),
 				},
@@ -57,6 +58,8 @@ func TestAlterSystemTableStatisticsTable(t *testing.T) {
 	var (
 		validationSchemas = []migrations.Schema{
 			{Name: "avgSize", ValidationFn: migrations.HasColumn},
+			{Name: "fam_0_tableID_statisticID_name_columnIDs_createdAt_rowCount_distinctCount_nullCount_histogram",
+				ValidationFn: migrations.HasColumnFamily},
 		}
 	)
 
@@ -149,7 +152,7 @@ func getDeprecatedTableStatisticsDescriptor() *descpb.TableDescriptor {
 			KeyColumnIDs:        []descpb.ColumnID{1, 2},
 		},
 		NextIndexID:    2,
-		Privileges:     descpb.NewCustomSuperuserPrivilegeDescriptor(privilege.ReadWriteData, security.NodeUserName()),
+		Privileges:     catpb.NewCustomSuperuserPrivilegeDescriptor(privilege.ReadWriteData, security.NodeUserName()),
 		NextMutationID: 1,
 		FormatVersion:  3,
 	}

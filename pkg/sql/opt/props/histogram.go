@@ -375,6 +375,8 @@ func (h *Histogram) InvertedFilter(spans inverted.Spans) *Histogram {
 
 func makeSpanFromInvertedSpan(invSpan inverted.Span) *constraint.Span {
 	var span constraint.Span
+	// The statistics use the Bytes type for the encoded key, so we use DBytes
+	// here.
 	span.Init(
 		constraint.MakeKey(tree.NewDBytes(tree.DBytes(invSpan.Start))),
 		constraint.IncludeBoundary,
@@ -603,12 +605,18 @@ func getFilteredBucket(
 
 	// Determine whether this span includes the original upper bound of the
 	// bucket.
-	isSpanEndBoundaryInclusive := filteredSpan.EndBoundary() == constraint.IncludeBoundary
-	includesOriginalUpperBound := isSpanEndBoundaryInclusive && cmpSpanEndBucketEnd == 0
-	if iter.desc {
-		isSpanStartBoundaryInclusive := filteredSpan.StartBoundary() == constraint.IncludeBoundary
-		includesOriginalUpperBound = isSpanStartBoundaryInclusive && cmpSpanStartBucketStart == 0
+	var keyLength, cmp int
+	var keyBoundaryInclusive bool
+	if !iter.desc {
+		keyLength = filteredSpan.EndKey().Length()
+		keyBoundaryInclusive = filteredSpan.EndBoundary() == constraint.IncludeBoundary
+		cmp = cmpSpanEndBucketEnd
+	} else {
+		keyLength = filteredSpan.StartKey().Length()
+		keyBoundaryInclusive = filteredSpan.StartBoundary() == constraint.IncludeBoundary
+		cmp = cmpSpanStartBucketStart
 	}
+	includesOriginalUpperBound := cmp == 0 && ((colOffset < keyLength-1) || keyBoundaryInclusive)
 
 	// Calculate the new value for numEq.
 	var numEq float64

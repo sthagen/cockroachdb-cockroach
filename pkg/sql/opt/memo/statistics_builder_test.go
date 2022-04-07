@@ -121,7 +121,8 @@ func TestGetStatsFromConstraint(t *testing.T) {
 
 		// Calculate row count and selectivity.
 		s.RowCount = scan.Relational().Stats.RowCount
-		s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(cols, sel, s))
+		selectivity, _ := sb.selectivityFromMultiColDistinctCounts(cols, sel, s)
+		s.ApplySelectivity(selectivity)
 
 		// Update null counts.
 		sb.updateNullCountsFromNotNullCols(relProps.NotNullCols, s)
@@ -154,31 +155,31 @@ func TestGetStatsFromConstraint(t *testing.T) {
 	cs1 := constraint.SingleConstraint(&c1)
 	statsFunc(
 		cs1,
-		"[rows=140000000, distinct(1)=7, null(1)=0, avgsize(1)=4]",
+		"[rows=1.4e+08, distinct(1)=7, null(1)=0, avgsize(1)=4]",
 	)
 
 	cs2 := constraint.SingleConstraint(&c2)
 	statsFunc(
 		cs2,
-		"[rows=3.33333333e+09, distinct(2)=166.666667, null(2)=0, avgsize(2)=4]",
+		"[rows=3.333333e+09, distinct(2)=166.667, null(2)=0, avgsize(2)=4]",
 	)
 
 	cs3 := constraint.SingleConstraint(&c3)
 	statsFunc(
 		cs3,
-		"[rows=20000000, distinct(3)=1, null(3)=0, avgsize(3)=4]",
+		"[rows=2e+07, distinct(3)=1, null(3)=0, avgsize(3)=4]",
 	)
 
 	cs12 := constraint.SingleConstraint(&c12)
 	statsFunc(
 		cs12,
-		"[rows=20000000, distinct(1)=1, null(1)=0, avgsize(1)=4]",
+		"[rows=2e+07, distinct(1)=1, null(1)=0, avgsize(1)=4]",
 	)
 
 	cs123 := constraint.SingleConstraint(&c123)
 	statsFunc(
 		cs123,
-		"[rows=36040, distinct(1)=1, null(1)=0, avgsize(1)=4, distinct(2)=1, null(2)=0, avgsize(2)=4, distinct(3)=5, null(3)=0, avgsize(3)=4, distinct(1,2)=1, null(1,2)=0, avgsize(1,2)=8, distinct(1-3)=5, null(1-3)=0, avgsize(1-3)=12]",
+		"[rows=400, distinct(1)=1, null(1)=0, avgsize(1)=4, distinct(2)=1, null(2)=0, avgsize(2)=4, distinct(3)=5, null(3)=0, avgsize(3)=4, distinct(1,2)=1, null(1,2)=0, avgsize(1,2)=8, distinct(1-3)=5, null(1-3)=0, avgsize(1-3)=12]",
 	)
 
 	cs123n := constraint.SingleConstraint(&c123n)
@@ -202,7 +203,7 @@ func TestGetStatsFromConstraint(t *testing.T) {
 	cs312 := constraint.SingleConstraint(&c312)
 	statsFunc(
 		cs312,
-		"[rows=24490654.6, distinct(1)=2, null(1)=0, avgsize(1)=4, distinct(2)=7, null(2)=0, avgsize(2)=4, distinct(3)=2, null(3)=0, avgsize(3)=4, distinct(1-3)=26.9394737, null(1-3)=0, avgsize(1-3)=12]",
+		"[rows=2.449065e+07, distinct(1)=2, null(1)=0, avgsize(1)=4, distinct(2)=7, null(2)=0, avgsize(2)=4, distinct(3)=2, null(3)=0, avgsize(3)=4, distinct(1-3)=26.9395, null(1-3)=0, avgsize(1-3)=12]",
 	)
 
 	cs312n := constraint.SingleConstraint(&c312n)
@@ -214,13 +215,13 @@ func TestGetStatsFromConstraint(t *testing.T) {
 	cs := cs3.Intersect(&evalCtx, cs123)
 	statsFunc(
 		cs,
-		"[rows=909098.909, distinct(1)=1, null(1)=0, avgsize(1)=4, distinct(2)=1, null(2)=0, avgsize(2)=4, distinct(3)=1, null(3)=0, avgsize(3)=4, distinct(1-3)=1, null(1-3)=0, avgsize(1-3)=12]",
+		"[rows=909098.9, distinct(1)=1, null(1)=0, avgsize(1)=4, distinct(2)=1, null(2)=0, avgsize(2)=4, distinct(3)=1, null(3)=0, avgsize(3)=4, distinct(1-3)=1, null(1-3)=0, avgsize(1-3)=12]",
 	)
 
 	cs = cs32.Intersect(&evalCtx, cs123)
 	statsFunc(
 		cs,
-		"[rows=909098.909, distinct(1)=1, null(1)=0, avgsize(1)=4, distinct(2)=1, null(2)=0, avgsize(2)=4, distinct(3)=1, null(3)=0, avgsize(3)=4, distinct(1-3)=1, null(1-3)=0, avgsize(1-3)=12]",
+		"[rows=909098.9, distinct(1)=1, null(1)=0, avgsize(1)=4, distinct(2)=1, null(2)=0, avgsize(2)=4, distinct(3)=1, null(3)=0, avgsize(3)=4, distinct(1-3)=1, null(1-3)=0, avgsize(1-3)=12]",
 	)
 
 	cs45 := constraint.SingleSpanConstraint(&keyCtx45, &sp45)

@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 var minimumFlushInterval = settings.RegisterPublicDurationSettingWithExplicitUnit(
@@ -74,6 +75,9 @@ type streamIngestionProcessor struct {
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.StreamIngestionDataSpec
 	output  execinfra.RowReceiver
+	rekeyer *backupccl.KeyRewriter
+	// rewriteToDiffKey Indicates whether we are rekeying a key into a different key.
+	rewriteToDiffKey bool
 
 	// curBatch temporarily batches MVCC Keys so they can be
 	// sorted before ingestion.
@@ -88,6 +92,9 @@ type streamIngestionProcessor struct {
 	// client is a streaming client which provides a stream of events from a given
 	// address.
 	forceClientForTests streamclient.Client
+	// streamPartitionClients are a collection of streamclient.Client created for
+	// consuming multiple partitions from a stream.
+	streamPartitionClients []streamclient.Client
 
 	// Checkpoint events may need to be buffered if they arrive within the same
 	// minimumFlushInterval.
@@ -146,8 +153,10 @@ type partitionEvent struct {
 	partition string
 }
 
-var _ execinfra.Processor = &streamIngestionProcessor{}
-var _ execinfra.RowSource = &streamIngestionProcessor{}
+var (
+	_ execinfra.Processor = &streamIngestionProcessor{}
+	_ execinfra.RowSource = &streamIngestionProcessor{}
+)
 
 const streamIngestionProcessorName = "stream-ingestion-processor"
 
@@ -158,7 +167,12 @@ func newStreamIngestionDataProcessor(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
-
+	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(flowCtx.Codec(),
+		nil /* tableRekeys */, []execinfrapb.TenantRekey{spec.TenantRekey},
+		true /* restoreTenantFromStream */)
+	if err != nil {
+		return nil, err
+	}
 	sip := &streamIngestionProcessor{
 		flowCtx:             flowCtx,
 		spec:                spec,
@@ -168,8 +182,9 @@ func newStreamIngestionDataProcessor(
 		maxFlushRateTimer:   timeutil.NewTimer(),
 		cutoverCh:           make(chan struct{}),
 		closePoller:         make(chan struct{}),
+		rekeyer:             rekeyer,
+		rewriteToDiffKey:    spec.TenantRekey.NewID != spec.TenantRekey.OldID,
 	}
-
 	if err := sip.Init(sip, post, streamIngestionResultTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{},
@@ -187,6 +202,7 @@ func newStreamIngestionDataProcessor(
 
 // Start is part of the RowSource interface.
 func (sip *streamIngestionProcessor) Start(ctx context.Context) {
+	ctx = logtags.AddTag(ctx, "job", sip.spec.JobID)
 	log.Infof(ctx, "starting ingest proc")
 	ctx = sip.StartInternal(ctx, streamIngestionProcessorName)
 
@@ -195,8 +211,7 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 	evalCtx := sip.FlowCtx.EvalCtx
 	db := sip.FlowCtx.Cfg.DB
 	var err error
-	sip.batcher, err = bulk.MakeStreamSSTBatcher(ctx, db, evalCtx.Settings,
-		func() int64 { return storageccl.MaxIngestBatchSize(evalCtx.Settings) })
+	sip.batcher, err = bulk.MakeStreamSSTBatcher(ctx, db, evalCtx.Settings)
 	if err != nil {
 		sip.MoveToDraining(errors.Wrap(err, "creating stream sst batcher"))
 		return
@@ -220,6 +235,7 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 	// Initialize the event streams.
 	subscriptions := make(map[string]streamclient.Subscription)
 	sip.cg = ctxgroup.WithContext(ctx)
+	sip.streamPartitionClients = make([]streamclient.Client, 0)
 	for i := range sip.spec.PartitionIds {
 		id := sip.spec.PartitionIds[i]
 		spec := streamclient.SubscriptionToken(sip.spec.PartitionSpecs[i])
@@ -229,11 +245,16 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 			streamClient = sip.forceClientForTests
 			log.Infof(ctx, "using testing client")
 		} else {
-			streamClient, err = streamclient.NewStreamClient(streamingccl.StreamAddress(addr))
 			if err != nil {
-				sip.MoveToDraining(errors.Wrapf(err, "creating client for parition spec %q from %q", spec, addr))
+				sip.MoveToDraining(errors.Wrapf(err, "creating client for partition spec %q from %q", spec, addr))
 				return
 			}
+			streamClient, err = streamclient.NewStreamClient(streamingccl.StreamAddress(addr))
+			if err != nil {
+				sip.MoveToDraining(errors.Wrapf(err, "creating client for partition spec %q from %q", spec, addr))
+				return
+			}
+			sip.streamPartitionClients = append(sip.streamPartitionClients, streamClient)
 		}
 
 		sub, err := streamClient.Subscribe(ctx, streaming.StreamID(sip.spec.StreamID), spec, sip.spec.StartTime)
@@ -291,6 +312,11 @@ func (sip *streamIngestionProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pr
 	return nil, sip.DrainHelper()
 }
 
+// MustBeStreaming implements the Processor interface.
+func (sip *streamIngestionProcessor) MustBeStreaming() bool {
+	return true
+}
+
 // ConsumerClosed is part of the RowSource interface.
 func (sip *streamIngestionProcessor) ConsumerClosed() {
 	sip.close()
@@ -301,6 +327,9 @@ func (sip *streamIngestionProcessor) close() {
 		return
 	}
 
+	for _, client := range sip.streamPartitionClients {
+		_ = client.Close()
+	}
 	if sip.batcher != nil {
 		sip.batcher.Close()
 	}
@@ -518,11 +547,25 @@ func (sip *streamIngestionProcessor) bufferKV(event partitionEvent) error {
 	// TODO: In addition to flushing when receiving a checkpoint event, we
 	// should also flush when we've buffered sufficient KVs. A buffering adder
 	// would save us here.
-
 	kv := event.GetKV()
 	if kv == nil {
 		return errors.New("kv event expected to have kv")
 	}
+
+	rekey, ok, err := sip.rekeyer.RewriteKey(kv.Key)
+	if !ok {
+		return errors.New("every key is expected to match tenant prefix")
+	}
+	if err != nil {
+		return err
+	}
+	kv.Key = rekey
+
+	if sip.rewriteToDiffKey {
+		kv.Value.ClearChecksum()
+		kv.Value.InitChecksum(kv.Key)
+	}
+
 	mvccKey := storage.MVCCKey{
 		Key:       kv.Key,
 		Timestamp: kv.Value.Timestamp,
@@ -554,7 +597,7 @@ func (sip *streamIngestionProcessor) flush() (*jobspb.ResolvedSpans, error) {
 
 	totalSize := 0
 	for _, kv := range sip.curBatch {
-		if err := sip.batcher.AddMVCCKey(sip.Ctx, kv.Key, kv.Value); err != nil {
+		if err := sip.batcher.AddMVCCKey(sip.Ctx, kv.Key, kv.Value); err != nil { // problem is here
 			return nil, errors.Wrapf(err, "adding key %+v", kv)
 		}
 		totalSize += len(kv.Key.Key) + len(kv.Value)

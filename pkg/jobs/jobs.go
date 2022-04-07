@@ -756,6 +756,12 @@ func (j *Job) MakeSessionBoundInternalExecutor(
 	return j.registry.sessionBoundInternalExecutorFactory(ctx, sd)
 }
 
+// MarkIdle marks the job as Idle.  Idleness should not be toggled frequently
+// (no more than ~twice a minute) as the action is logged.
+func (j *Job) MarkIdle(isIdle bool) {
+	j.registry.MarkIdle(j, isIdle)
+}
+
 func (j *Job) runInTxn(
 	ctx context.Context, txn *kv.Txn, fn func(context.Context, *kv.Txn) error,
 ) error {
@@ -926,10 +932,6 @@ func (sj *StartableJob) Start(ctx context.Context) (err error) {
 	}()
 	if !sj.txn.IsCommitted() {
 		return fmt.Errorf("cannot resume %T job which is not committed", sj.resumer)
-	}
-
-	if err := sj.started(ctx, nil /* txn */); err != nil {
-		return err
 	}
 
 	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(ctx context.Context) {

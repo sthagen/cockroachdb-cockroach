@@ -13,11 +13,15 @@ package batcheval
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -34,19 +38,62 @@ func init() {
 	// could instead iterate over the SST and take out point latches/locks, but
 	// the cost is likely not worth it since AddSSTable is often used with
 	// unpopulated spans.
-	RegisterReadWriteCommand(roachpb.AddSSTable, DefaultDeclareIsolatedKeys, EvalAddSSTable)
+	RegisterReadWriteCommand(roachpb.AddSSTable, declareKeysAddSSTable, EvalAddSSTable)
 }
+
+func declareKeysAddSSTable(
+	rs ImmutableRangeState,
+	header *roachpb.Header,
+	req roachpb.Request,
+	latchSpans, lockSpans *spanset.SpanSet,
+	maxOffset time.Duration,
+) {
+	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+	// We look up the range descriptor key to return its span.
+	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+}
+
+// AddSSTableRewriteConcurrency sets the concurrency of a single SST rewrite.
+var AddSSTableRewriteConcurrency = settings.RegisterIntSetting(
+	settings.SystemOnly,
+	"kv.bulk_io_write.sst_rewrite_concurrency.per_call",
+	"concurrency to use when rewriting sstable timestamps by block, or 0 to use a loop",
+	int64(util.ConstantWithMetamorphicTestRange("addsst-rewrite-concurrency", 0, 0, 16)),
+	settings.NonNegativeInt,
+)
+
+// AddSSTableRequireAtRequestTimestamp will reject any AddSSTable requests that
+// aren't sent with SSTTimestampToRequestTimestamp. This can be used to verify
+// that all callers have been migrated to use SSTTimestampToRequestTimestamp.
+var AddSSTableRequireAtRequestTimestamp = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.bulk_io_write.sst_require_at_request_timestamp.enabled",
+	"rejects addsstable requests that don't write at the request timestamp",
+	false,
+)
+
+// addSSTableCapacityRemainingLimit is the fraction of remaining store capacity
+// under which addsstable requests are rejected.
+var addSSTableCapacityRemainingLimit = settings.RegisterFloatSetting(
+	settings.SystemOnly,
+	"kv.bulk_io_write.min_capacity_remaining_fraction",
+	"remaining store capacity fraction below which an addsstable request is rejected",
+	0.05,
+)
+
+var forceRewrite = util.ConstantWithMetamorphicTestBool("addsst-rewrite-forced", false)
 
 // EvalAddSSTable evaluates an AddSSTable command. For details, see doc comment
 // on AddSSTableRequest.
 func EvalAddSSTable(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, _ roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.AddSSTableRequest)
 	h := cArgs.Header
 	ms := cArgs.Stats
 	start, end := storage.MVCCKey{Key: args.Key}, storage.MVCCKey{Key: args.EndKey}
 	sst := args.Data
+	sstToReqTS := args.SSTTimestampToRequestTimestamp
 
 	var span *tracing.Span
 	var err error
@@ -54,22 +101,47 @@ func EvalAddSSTable(
 	defer span.Finish()
 	log.Eventf(ctx, "evaluating AddSSTable [%s,%s)", start.Key, end.Key)
 
-	// Under the race detector, scan the SST contents and make sure it satisfies
-	// the AddSSTable requirements. We do not always perform these checks
-	// otherwise, due to the cost.
+	if min := addSSTableCapacityRemainingLimit.Get(&cArgs.EvalCtx.ClusterSettings().SV); min > 0 {
+		cap, err := cArgs.EvalCtx.GetEngineCapacity()
+		if err != nil {
+			return result.Result{}, err
+		}
+		if remaining := float64(cap.Available) / float64(cap.Capacity); remaining < min {
+			return result.Result{}, &roachpb.InsufficientSpaceError{
+				StoreID:   cArgs.EvalCtx.StoreID(),
+				Op:        "ingest data",
+				Available: cap.Available,
+				Capacity:  cap.Capacity,
+				Required:  min,
+			}
+		}
+	}
+
+	// Reject AddSSTable requests not writing at the request timestamp if requested.
+	if cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx, clusterversion.MVCCAddSSTable) &&
+		AddSSTableRequireAtRequestTimestamp.Get(&cArgs.EvalCtx.ClusterSettings().SV) &&
+		sstToReqTS.IsEmpty() {
+		return result.Result{}, errors.AssertionFailedf(
+			"AddSSTable requests must set SSTTimestampToRequestTimestamp")
+	}
+
+	// Under the race detector, check that the SST contents satisfy AddSSTable
+	// requirements. We don't always do this otherwise, due to the cost.
 	if util.RaceEnabled {
-		if err := assertSSTContents(sst, args.SSTTimestamp, args.MVCCStats); err != nil {
+		if err := assertSSTContents(sst, sstToReqTS, args.MVCCStats); err != nil {
 			return result.Result{}, err
 		}
 	}
 
-	// If requested, rewrite the SST's MVCC timestamps to the request timestamp.
-	// This ensures the writes comply with the timestamp cache and closed
-	// timestamp, i.e. by not writing to timestamps that have already been
-	// observed or closed.
-	if args.WriteAtRequestTimestamp &&
-		(args.SSTTimestamp.IsEmpty() || h.Timestamp != args.SSTTimestamp) {
-		sst, err = storage.UpdateSSTTimestamps(sst, h.Timestamp)
+	// If requested and necessary, rewrite the SST's MVCC timestamps to the
+	// request timestamp. This ensures the writes comply with the timestamp cache
+	// and closed timestamp, i.e. by not writing to timestamps that have already
+	// been observed or closed.
+	if sstToReqTS.IsSet() && (h.Timestamp != sstToReqTS || forceRewrite) {
+		st := cArgs.EvalCtx.ClusterSettings()
+		// TODO(dt): use a quotapool.
+		conc := int(AddSSTableRewriteConcurrency.Get(&cArgs.EvalCtx.ClusterSettings().SV))
+		sst, err = storage.UpdateSSTTimestamps(ctx, st, sst, sstToReqTS, h.Timestamp, conc)
 		if err != nil {
 			return result.Result{}, errors.Wrap(err, "updating SST timestamps")
 		}
@@ -211,9 +283,35 @@ func EvalAddSSTable(
 	ms.Add(stats)
 
 	var mvccHistoryMutation *kvserverpb.ReplicatedEvalResult_MVCCHistoryMutation
-	if !args.WriteAtRequestTimestamp {
+	if sstToReqTS.IsEmpty() {
 		mvccHistoryMutation = &kvserverpb.ReplicatedEvalResult_MVCCHistoryMutation{
 			Spans: []roachpb.Span{{Key: start.Key, EndKey: end.Key}},
+		}
+	}
+
+	reply := resp.(*roachpb.AddSSTableResponse)
+	reply.RangeSpan = cArgs.EvalCtx.Desc().KeySpan().AsRawSpanWithNoLocals()
+	reply.AvailableBytes = cArgs.EvalCtx.GetMaxBytes() - cArgs.EvalCtx.GetMVCCStats().Total() - stats.Total()
+
+	// If requested, locate and return the start of the span following the file
+	// span which may be non-empty, that is, the first key after the file's end
+	// at which there may be existing data in the range. "May" is operative here:
+	// it allows us to avoid consistency/isolation promises and thus avoid needing
+	// to latch the entire remainder of the range and/or look through intents in
+	// addition, and instead just use this key-only iterator. If a caller actually
+	// needs to know what data is there, it must issue its own real Scan.
+	if args.ReturnFollowingLikelyNonEmptySpanStart {
+		existingIter := spanset.DisableReaderAssertions(readWriter).NewMVCCIterator(
+			storage.MVCCKeyIterKind, // don't care if it is committed or not, just that it isn't empty.
+			storage.IterOptions{UpperBound: reply.RangeSpan.EndKey},
+		)
+		defer existingIter.Close()
+		existingIter.SeekGE(end)
+		ok, err = existingIter.Valid()
+		if err != nil {
+			return result.Result{}, errors.Wrap(err, "error while searching for non-empty span start")
+		} else if ok {
+			reply.FollowingLikelyNonEmptySpanStart = existingIter.Key().Key
 		}
 	}
 
@@ -246,7 +344,7 @@ func EvalAddSSTable(
 			// write by not allowing writing below existing keys, and we want to
 			// retain parity with regular SST ingestion which does allow this. We
 			// therefore record these operations ourselves.
-			if args.WriteAtRequestTimestamp {
+			if sstToReqTS.IsSet() {
 				readWriter.LogLogicalOp(storage.MVCCWriteValueOpType, storage.MVCCLogicalOpDetails{
 					Key:       k.Key,
 					Timestamp: k.Timestamp,
@@ -272,7 +370,7 @@ func EvalAddSSTable(
 				Data:             sst,
 				CRC32:            util.CRC32(sst),
 				Span:             roachpb.Span{Key: start.Key, EndKey: end.Key},
-				AtWriteTimestamp: args.WriteAtRequestTimestamp,
+				AtWriteTimestamp: sstToReqTS.IsSet(),
 			},
 			MVCCHistoryMutation: mvccHistoryMutation,
 		},
@@ -310,18 +408,20 @@ func assertSSTContents(sst []byte, sstTimestamp hlc.Timestamp, stats *enginepb.M
 		if len(value) == 0 {
 			return errors.AssertionFailedf("SST contains tombstone for key %s", key)
 		}
-		if !sstTimestamp.IsEmpty() && key.Timestamp != sstTimestamp {
-			return errors.AssertionFailedf("SST has incorrect timestamp %s for SST key %s (expected %s)",
-				key.Timestamp, key.Key, sstTimestamp)
+		if sstTimestamp.IsSet() && key.Timestamp != sstTimestamp {
+			return errors.AssertionFailedf("SST has unexpected timestamp %s (expected %s) for key %s",
+				key.Timestamp, sstTimestamp, key.Key)
 		}
 		iter.Next()
 	}
 
-	// Compare statistics with those passed by client.
+	// Compare statistics with those passed by client. We calculate them at the
+	// same timestamp as the given statistics, since they may contain
+	// timing-dependent values (typically MVCC garbage, i.e. multiple versions).
 	if stats != nil {
 		given := *stats
-		given.LastUpdateNanos = 0
-		actual, err := storage.ComputeStatsForRange(iter, keys.MinKey, keys.MaxKey, 0)
+		actual, err := storage.ComputeStatsForRange(
+			iter, keys.MinKey, keys.MaxKey, given.LastUpdateNanos)
 		if err != nil {
 			return errors.Wrap(err, "failed to compare stats: %w")
 		}

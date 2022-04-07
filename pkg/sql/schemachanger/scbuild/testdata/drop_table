@@ -43,374 +43,389 @@ CREATE VIEW v1 as (select customer_id, carrier from defaultdb.shipments);
 build
 DROP TABLE defaultdb.shipments CASCADE;
 ----
-- [[Column:{DescID: 59, ColumnID: 1}, ABSENT], PUBLIC]
+- [[Column:{DescID: 109, ColumnID: 1}, ABSENT], PUBLIC]
   details:
     columnId: 1
-    defaultExpr: gen_random_uuid()
-    familyName: primary
-    pgAttributeNum: 1
-    tableId: 59
-    type:
-      family: UuidFamily
-      oid: 2950
-- [[Column:{DescID: 59, ColumnID: 2}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Column:{DescID: 109, ColumnID: 2}, ABSENT], PUBLIC]
   details:
     columnId: 2
-    familyName: primary
-    nullable: true
-    pgAttributeNum: 2
-    tableId: 59
-    type:
-      family: StringFamily
-      oid: 25
-- [[Column:{DescID: 59, ColumnID: 3}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Column:{DescID: 109, ColumnID: 3}, ABSENT], PUBLIC]
   details:
     columnId: 3
-    familyName: primary
-    nullable: true
-    pgAttributeNum: 3
-    tableId: 59
-    type:
-      family: StringFamily
-      oid: 25
-- [[Column:{DescID: 59, ColumnID: 4}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Column:{DescID: 109, ColumnID: 4}, ABSENT], PUBLIC]
   details:
     columnId: 4
-    familyName: primary
-    nullable: true
-    pgAttributeNum: 4
-    tableId: 59
-    type:
-      family: IntFamily
-      oid: 20
-      width: 64
-- [[Column:{DescID: 59, ColumnID: 5}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Column:{DescID: 109, ColumnID: 5}, ABSENT], PUBLIC]
   details:
     columnId: 5
-    defaultExpr: nextval(56:::REGCLASS)
-    familyName: primary
-    nullable: true
-    pgAttributeNum: 5
-    tableId: 59
-    type:
-      family: IntFamily
-      oid: 20
-      width: 64
-    usesSequenceIds:
-    - 56
-- [[Column:{DescID: 59, ColumnID: 6}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Column:{DescID: 109, ColumnID: 6}, ABSENT], PUBLIC]
   details:
     columnId: 6
-    computerExpr: x'80':::@100057
-    familyName: primary
-    nullable: true
-    pgAttributeNum: 6
-    tableId: 59
-    type:
-      family: EnumFamily
-      oid: 100057
-      udtMetadata:
-        arrayTypeOid: 100058
-- [[ColumnComment:{DescID: 59, ColumnID: 1}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Column:{DescID: 111, ColumnID: 1}, ABSENT], PUBLIC]
   details:
     columnId: 1
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[ColumnComment:{DescID: 59, ColumnID: 2}, ABSENT], PUBLIC]
+    tableId: 111
+- [[Column:{DescID: 111, ColumnID: 2}, ABSENT], PUBLIC]
   details:
     columnId: 2
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[ColumnComment:{DescID: 59, ColumnID: 3}, ABSENT], PUBLIC]
-  details:
-    columnId: 3
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[ColumnComment:{DescID: 59, ColumnID: 4}, ABSENT], PUBLIC]
-  details:
-    columnId: 4
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[ColumnComment:{DescID: 59, ColumnID: 5}, ABSENT], PUBLIC]
-  details:
-    columnId: 5
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[ColumnComment:{DescID: 59, ColumnID: 6}, ABSENT], PUBLIC]
-  details:
-    columnId: 6
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[ColumnName:{DescID: 59, ColumnID: 1, Name: tracking_number}, ABSENT], PUBLIC]
+    tableId: 111
+- [[ColumnComment:{DescID: 109, ColumnID: 1}, ABSENT], PUBLIC]
   details:
     columnId: 1
-    name: tracking_number
-    tableId: 59
-- [[ColumnName:{DescID: 59, ColumnID: 2, Name: carrier}, ABSENT], PUBLIC]
+    comment: __placeholder_comment__
+    tableId: 109
+- [[ColumnComment:{DescID: 109, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    comment: __placeholder_comment__
+    tableId: 109
+- [[ColumnComment:{DescID: 109, ColumnID: 3}, ABSENT], PUBLIC]
+  details:
+    columnId: 3
+    comment: __placeholder_comment__
+    tableId: 109
+- [[ColumnComment:{DescID: 109, ColumnID: 4}, ABSENT], PUBLIC]
+  details:
+    columnId: 4
+    comment: __placeholder_comment__
+    tableId: 109
+- [[ColumnComment:{DescID: 109, ColumnID: 5}, ABSENT], PUBLIC]
+  details:
+    columnId: 5
+    comment: __placeholder_comment__
+    tableId: 109
+- [[ColumnComment:{DescID: 109, ColumnID: 6}, ABSENT], PUBLIC]
+  details:
+    columnId: 6
+    comment: __placeholder_comment__
+    tableId: 109
+- [[ColumnComment:{DescID: 111, ColumnID: 1}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    comment: __placeholder_comment__
+    tableId: 111
+- [[ColumnComment:{DescID: 111, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    comment: __placeholder_comment__
+    tableId: 111
+- [[ColumnDefaultExpression:{DescID: 109, ColumnID: 1}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    embeddedExpr:
+      expr: gen_random_uuid()
+    tableId: 109
+- [[ColumnDefaultExpression:{DescID: 109, ColumnID: 5}, ABSENT], PUBLIC]
+  details:
+    columnId: 5
+    embeddedExpr:
+      expr: nextval(106:::REGCLASS)
+      usesSequenceIds:
+      - 106
+    tableId: 109
+- [[ColumnFamily:{DescID: 109, ColumnFamilyID: 0, Name: primary}, ABSENT], PUBLIC]
+  details:
+    name: primary
+    tableId: 109
+- [[ColumnName:{DescID: 109, Name: carrier, ColumnID: 2}, ABSENT], PUBLIC]
   details:
     columnId: 2
     name: carrier
-    tableId: 59
-- [[ColumnName:{DescID: 59, ColumnID: 3, Name: status}, ABSENT], PUBLIC]
-  details:
-    columnId: 3
-    name: status
-    tableId: 59
-- [[ColumnName:{DescID: 59, ColumnID: 4, Name: customer_id}, ABSENT], PUBLIC]
+    tableId: 109
+- [[ColumnName:{DescID: 109, Name: customer_id, ColumnID: 4}, ABSENT], PUBLIC]
   details:
     columnId: 4
     name: customer_id
-    tableId: 59
-- [[ColumnName:{DescID: 59, ColumnID: 5, Name: randcol}, ABSENT], PUBLIC]
+    tableId: 109
+- [[ColumnName:{DescID: 109, Name: randcol, ColumnID: 5}, ABSENT], PUBLIC]
   details:
     columnId: 5
     name: randcol
-    tableId: 59
-- [[ColumnName:{DescID: 59, ColumnID: 6, Name: val}, ABSENT], PUBLIC]
+    tableId: 109
+- [[ColumnName:{DescID: 109, Name: status, ColumnID: 3}, ABSENT], PUBLIC]
+  details:
+    columnId: 3
+    name: status
+    tableId: 109
+- [[ColumnName:{DescID: 109, Name: tracking_number, ColumnID: 1}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    name: tracking_number
+    tableId: 109
+- [[ColumnName:{DescID: 109, Name: val, ColumnID: 6}, ABSENT], PUBLIC]
   details:
     columnId: 6
     name: val
-    tableId: 59
-- [[ColumnTypeReference:{DescID: 59, ColumnID: 6, ReferencedDescID: 57}, ABSENT], PUBLIC]
+    tableId: 109
+- [[ColumnName:{DescID: 111, Name: carrier, ColumnID: 2}, ABSENT], PUBLIC]
   details:
-    columnId: 6
-    tableId: 59
-    typeId: 57
-- [[ColumnTypeReference:{DescID: 59, ColumnID: 6, ReferencedDescID: 58}, ABSENT], PUBLIC]
-  details:
-    columnId: 6
-    tableId: 59
-    typeId: 58
-- [[ComputedExprTypeReference:{DescID: 59, ColumnID: 6, ReferencedDescID: 57}, ABSENT], PUBLIC]
-  details:
-    columnId: 6
-    tableId: 59
-    typeId: 57
-- [[ComputedExprTypeReference:{DescID: 59, ColumnID: 6, ReferencedDescID: 58}, ABSENT], PUBLIC]
-  details:
-    columnId: 6
-    tableId: 59
-    typeId: 58
-- [[ConstraintComment:{DescID: 59, ConstraintType: FK, Name: fk_customers}, ABSENT], PUBLIC]
-  details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    constraintName: fk_customers
-    constraintType: FK
-    tableId: 59
-- [[ConstraintComment:{DescID: 59, ConstraintType: FK, Name: fk_orders}, ABSENT], PUBLIC]
-  details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    constraintName: fk_orders
-    constraintType: FK
-    tableId: 59
-- [[ConstraintComment:{DescID: 59, ConstraintType: PrimaryKey, Name: shipments_pkey}, ABSENT], PUBLIC]
-  details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    constraintName: shipments_pkey
-    constraintType: PrimaryKey
-    tableId: 59
-- [[DefaultExpression:{DescID: 59, ColumnID: 1}, ABSENT], PUBLIC]
+    columnId: 2
+    name: carrier
+    tableId: 111
+- [[ColumnName:{DescID: 111, Name: customer_id, ColumnID: 1}, ABSENT], PUBLIC]
   details:
     columnId: 1
-    defaultExpr: gen_random_uuid()
-    tableId: 59
-    usesSequenceIDs: []
-- [[DefaultExpression:{DescID: 59, ColumnID: 5}, ABSENT], PUBLIC]
+    name: customer_id
+    tableId: 111
+- [[ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 1}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    embeddedTypeT:
+      type:
+        family: UuidFamily
+        oid: 2950
+    isRelationBeingDropped: true
+    tableId: 109
+- [[ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    embeddedTypeT:
+      type:
+        family: StringFamily
+        oid: 25
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 109
+- [[ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 3}, ABSENT], PUBLIC]
+  details:
+    columnId: 3
+    embeddedTypeT:
+      type:
+        family: StringFamily
+        oid: 25
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 109
+- [[ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4}, ABSENT], PUBLIC]
+  details:
+    columnId: 4
+    embeddedTypeT:
+      type:
+        family: IntFamily
+        oid: 20
+        width: 64
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 109
+- [[ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 5}, ABSENT], PUBLIC]
   details:
     columnId: 5
-    defaultExpr: nextval(56:::REGCLASS)
-    tableId: 59
-    usesSequenceIDs:
-    - 56
-- [[ForeignKey:{DescID: 59, ReferencedDescID: 54, Name: fk_customers}, ABSENT], PUBLIC]
+    embeddedTypeT:
+      type:
+        family: IntFamily
+        oid: 20
+        width: 64
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 109
+- [[ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 6}, ABSENT], PUBLIC]
   details:
+    columnId: 6
+    computeExpr:
+      expr: x'80':::@100107
+      usesTypeIds:
+      - 107
+      - 108
+    embeddedTypeT:
+      closedTypeIds:
+      - 107
+      - 108
+      type:
+        family: EnumFamily
+        oid: 100107
+        udtMetadata:
+          arrayTypeOid: 100108
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 109
+- [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 1}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    embeddedTypeT:
+      type:
+        family: IntFamily
+        oid: 20
+        width: 64
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 111
+- [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    embeddedTypeT:
+      type:
+        family: StringFamily
+        oid: 25
+    isNullable: true
+    isRelationBeingDropped: true
+    tableId: 111
+- [[ConstraintComment:{DescID: 109, ConstraintID: 2}, ABSENT], PUBLIC]
+  details:
+    comment: __placeholder_comment__
+    constraintId: 2
+    tableId: 109
+- [[ConstraintComment:{DescID: 109, ConstraintID: 3}, ABSENT], PUBLIC]
+  details:
+    comment: __placeholder_comment__
+    constraintId: 3
+    tableId: 109
+- [[ConstraintName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT], PUBLIC]
+  details:
+    constraintId: 2
     name: fk_customers
-    originColumns:
-    - 4
-    originId: 59
-    referenceColumns:
-    - 1
-    referenceId: 54
-- [[ForeignKey:{DescID: 59, ReferencedDescID: 55, Name: fk_orders}, ABSENT], PUBLIC]
+    tableId: 109
+- [[ConstraintName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT], PUBLIC]
   details:
+    constraintId: 3
     name: fk_orders
-    originColumns:
-    - 4
-    originId: 59
-    referenceColumns:
-    - 2
-    referenceId: 55
-- [[ForeignKeyBackReference:{DescID: 54, ReferencedDescID: 59, Name: fk_customers}, ABSENT], PUBLIC]
+    tableId: 109
+- [[ForeignKeyConstraint:{DescID: 109, ConstraintID: 2, ReferencedDescID: 104}, ABSENT], PUBLIC]
   details:
-    name: fk_customers
-    originColumns:
+    columnIds:
+    - 4
+    constraintId: 2
+    referencedColumnIds:
     - 1
-    originId: 54
-    referenceColumns:
-    - 4
-    referenceId: 59
-- [[ForeignKeyBackReference:{DescID: 55, ReferencedDescID: 59, Name: fk_orders}, ABSENT], PUBLIC]
+    referencedTableId: 104
+    tableId: 109
+- [[ForeignKeyConstraint:{DescID: 109, ConstraintID: 3, ReferencedDescID: 105}, ABSENT], PUBLIC]
   details:
-    name: fk_orders
-    originColumns:
+    columnIds:
+    - 4
+    constraintId: 3
+    referencedColumnIds:
     - 2
-    originId: 55
-    referenceColumns:
-    - 4
-    referenceId: 59
-- [[IndexComment:{DescID: 59, IndexID: 1}, ABSENT], PUBLIC]
+    referencedTableId: 105
+    tableId: 109
+- [[IndexComment:{DescID: 109, IndexID: 1}, ABSENT], PUBLIC]
   details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
+    comment: __placeholder_comment__
     indexId: 1
-    tableId: 59
-- [[IndexName:{DescID: 59, IndexID: 1, Name: shipments_pkey}, ABSENT], PUBLIC]
+    tableId: 109
+- [[IndexName:{DescID: 109, Name: shipments_pkey, IndexID: 1}, ABSENT], PUBLIC]
   details:
     indexId: 1
     name: shipments_pkey
-    tableId: 59
-- [[Locality:{DescID: 59}, ABSENT], PUBLIC]
+    tableId: 109
+- [[Namespace:{DescID: 109, Name: shipments, ReferencedDescID: 100}, ABSENT], PUBLIC]
   details:
-    descriptorId: 59
-- [[Locality:{DescID: 60}, ABSENT], PUBLIC]
-  details:
-    descriptorId: 60
-- [[Locality:{DescID: 61}, ABSENT], PUBLIC]
-  details:
-    descriptorId: 61
-- [[Namespace:{DescID: 59, Name: shipments}, ABSENT], PUBLIC]
-  details:
-    databaseId: 50
-    descriptorId: 59
+    databaseId: 100
+    descriptorId: 109
     name: shipments
-    schemaId: 51
-- [[Namespace:{DescID: 60, Name: sq1}, ABSENT], PUBLIC]
+    schemaId: 101
+- [[Namespace:{DescID: 110, Name: sq1, ReferencedDescID: 100}, ABSENT], PUBLIC]
   details:
-    databaseId: 50
-    descriptorId: 60
+    databaseId: 100
+    descriptorId: 110
     name: sq1
-    schemaId: 51
-- [[Namespace:{DescID: 61, Name: v1}, ABSENT], PUBLIC]
+    schemaId: 101
+- [[Namespace:{DescID: 111, Name: v1, ReferencedDescID: 100}, ABSENT], PUBLIC]
   details:
-    databaseId: 50
-    descriptorId: 61
+    databaseId: 100
+    descriptorId: 111
     name: v1
-    schemaId: 51
-- [[Owner:{DescID: 59}, ABSENT], PUBLIC]
+    schemaId: 101
+- [[ObjectParent:{DescID: 109, ReferencedDescID: 101}, ABSENT], PUBLIC]
   details:
-    descriptorId: 59
+    objectId: 109
+    parentSchemaId: 101
+- [[ObjectParent:{DescID: 110, ReferencedDescID: 101}, ABSENT], PUBLIC]
+  details:
+    objectId: 110
+    parentSchemaId: 101
+- [[ObjectParent:{DescID: 111, ReferencedDescID: 101}, ABSENT], PUBLIC]
+  details:
+    objectId: 111
+    parentSchemaId: 101
+- [[Owner:{DescID: 109}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 109
     owner: root
-- [[Owner:{DescID: 60}, ABSENT], PUBLIC]
+- [[Owner:{DescID: 110}, ABSENT], PUBLIC]
   details:
-    descriptorId: 60
+    descriptorId: 110
     owner: root
-- [[Owner:{DescID: 61}, ABSENT], PUBLIC]
+- [[Owner:{DescID: 111}, ABSENT], PUBLIC]
   details:
-    descriptorId: 61
+    descriptorId: 111
     owner: root
-- [[PrimaryIndex:{DescID: 59, IndexID: 1}, ABSENT], PUBLIC]
+- [[PrimaryIndex:{DescID: 109, IndexID: 1}, ABSENT], PUBLIC]
   details:
-    indexId: 1
-    keyColumnDirection:
-    - ASC
-    keyColumnIds:
-    - 1
-    shardedDescriptor: {}
-    sourceIndexId: 1
-    storingColumnIds:
-    - 2
-    - 3
-    - 4
-    - 5
-    - 6
-    tableId: 59
-    unique: true
-- [[RelationDependedOnBy:{DescID: 56, ReferencedDescID: 59}, ABSENT], PUBLIC]
+    embeddedIndex:
+      indexId: 1
+      isUnique: true
+      keyColumnDirections:
+      - ASC
+      keyColumnIds:
+      - 1
+      storingColumnIds:
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      tableId: 109
+- [[Sequence:{DescID: 110}, ABSENT], PUBLIC]
   details:
-    columnID: 5
-    dependedOn: 59
-    tableId: 56
-- [[RelationDependedOnBy:{DescID: 59, ReferencedDescID: 61}, ABSENT], PUBLIC]
+    sequenceId: 110
+- [[SequenceOwner:{DescID: 109, ColumnID: 2, ReferencedDescID: 110}, ABSENT], PUBLIC]
   details:
-    columnID: 2
-    dependedOn: 61
-    tableId: 59
-- [[Sequence:{DescID: 60}, ABSENT], PUBLIC]
+    columnId: 2
+    sequenceId: 110
+    tableId: 109
+- [[Table:{DescID: 109}, ABSENT], PUBLIC]
   details:
-    sequenceId: 60
-- [[SequenceOwnedBy:{DescID: 60, ReferencedDescID: 59}, ABSENT], PUBLIC]
+    tableId: 109
+- [[TableComment:{DescID: 109}, ABSENT], PUBLIC]
   details:
-    ownerTableId: 59
-    sequenceId: 60
-- [[Table:{DescID: 59}, ABSENT], PUBLIC]
+    comment: __placeholder_comment__
+    tableId: 109
+- [[TableComment:{DescID: 110}, ABSENT], PUBLIC]
   details:
-    tableId: 59
-- [[TableComment:{DescID: 59}, ABSENT], PUBLIC]
+    comment: __placeholder_comment__
+    tableId: 110
+- [[TableComment:{DescID: 111}, ABSENT], PUBLIC]
   details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 59
-- [[TableComment:{DescID: 60}, ABSENT], PUBLIC]
+    comment: __placeholder_comment__
+    tableId: 111
+- [[UserPrivileges:{DescID: 109, Name: admin}, ABSENT], PUBLIC]
   details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 60
-- [[TableComment:{DescID: 61}, ABSENT], PUBLIC]
-  details:
-    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
-      doing decomposition
-    tableId: 61
-- [[UserPrivileges:{DescID: 59, Username: admin}, ABSENT], PUBLIC]
-  details:
-    descriptorId: 59
+    descriptorId: 109
     privileges: 2
-    username: admin
-- [[UserPrivileges:{DescID: 59, Username: public}, ABSENT], PUBLIC]
+    userName: admin
+- [[UserPrivileges:{DescID: 109, Name: root}, ABSENT], PUBLIC]
   details:
-    descriptorId: 59
-    username: public
-- [[UserPrivileges:{DescID: 59, Username: root}, ABSENT], PUBLIC]
-  details:
-    descriptorId: 59
+    descriptorId: 109
     privileges: 2
-    username: root
-- [[UserPrivileges:{DescID: 60, Username: admin}, ABSENT], PUBLIC]
+    userName: root
+- [[UserPrivileges:{DescID: 110, Name: admin}, ABSENT], PUBLIC]
   details:
-    descriptorId: 60
+    descriptorId: 110
     privileges: 2
-    username: admin
-- [[UserPrivileges:{DescID: 60, Username: public}, ABSENT], PUBLIC]
+    userName: admin
+- [[UserPrivileges:{DescID: 110, Name: root}, ABSENT], PUBLIC]
   details:
-    descriptorId: 60
-    username: public
-- [[UserPrivileges:{DescID: 60, Username: root}, ABSENT], PUBLIC]
-  details:
-    descriptorId: 60
+    descriptorId: 110
     privileges: 2
-    username: root
-- [[UserPrivileges:{DescID: 61, Username: admin}, ABSENT], PUBLIC]
+    userName: root
+- [[UserPrivileges:{DescID: 111, Name: admin}, ABSENT], PUBLIC]
   details:
-    descriptorId: 61
+    descriptorId: 111
     privileges: 2
-    username: admin
-- [[UserPrivileges:{DescID: 61, Username: public}, ABSENT], PUBLIC]
+    userName: admin
+- [[UserPrivileges:{DescID: 111, Name: root}, ABSENT], PUBLIC]
   details:
-    descriptorId: 61
-    username: public
-- [[UserPrivileges:{DescID: 61, Username: root}, ABSENT], PUBLIC]
-  details:
-    descriptorId: 61
+    descriptorId: 111
     privileges: 2
-    username: root
-- [[View:{DescID: 61}, ABSENT], PUBLIC]
+    userName: root
+- [[View:{DescID: 111}, ABSENT], PUBLIC]
   details:
-    tableId: 61
+    usesRelationIds:
+    - 109
+    viewId: 111

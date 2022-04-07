@@ -209,11 +209,12 @@ func TestEncoders(t *testing.T) {
 				t.Fatalf(`unknown format: %s`, o[changefeedbase.OptFormat])
 			}
 
-			target := jobspb.ChangefeedTarget{
+			target := jobspb.ChangefeedTargetSpecification{
+				Type:              jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
+				TableID:           tableDesc.GetID(),
 				StatementTimeName: tableDesc.GetName(),
 			}
-			targets := jobspb.ChangefeedTargets{}
-			targets[tableDesc.GetID()] = target
+			targets := []jobspb.ChangefeedTargetSpecification{target}
 
 			e, err := getEncoder(o, targets)
 			if len(expected.err) > 0 {
@@ -360,11 +361,12 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 			return string(avroToJSON(t, reg, r))
 		}
 
-		target := jobspb.ChangefeedTarget{
+		target := jobspb.ChangefeedTargetSpecification{
+			Type:              jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
+			TableID:           tableDesc.GetID(),
 			StatementTimeName: tableDesc.GetName(),
 		}
-		targets := jobspb.ChangefeedTargets{}
-		targets[tableDesc.GetID()] = target
+		targets := []jobspb.ChangefeedTargetSpecification{target}
 
 		e, err := getEncoder(opts, targets)
 		require.NoError(t, err)
@@ -670,6 +672,26 @@ func TestAvroSchemaNaming(t *testing.T) {
 		//Both changes to the subject are also reflected in the schema name in the posted schemas
 		require.Contains(t, foo.registry.SchemaForSubject(`supermovr.public.drivers-key`), `supermovr`)
 		require.Contains(t, foo.registry.SchemaForSubject(`supermovr.public.drivers-value`), `supermovr`)
+
+		sqlDB.Exec(t, `ALTER TABLE movr.drivers ADD COLUMN vehicle_id int CREATE FAMILY volatile`)
+		multiFamilyFeed := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=%s, %s`, changefeedbase.OptFormatAvro, changefeedbase.OptSplitColumnFamilies))
+		defer closeFeed(t, multiFamilyFeed)
+		foo = multiFamilyFeed.(*kafkaFeed)
+
+		sqlDB.Exec(t, `UPDATE movr.drivers SET vehicle_id = 1 WHERE id=1`)
+
+		assertPayloads(t, multiFamilyFeed, []string{
+			`drivers.primary: {"id":{"long":1}}->{"after":{"drivers_u002e_primary":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+			`drivers.volatile: {"id":{"long":1}}->{"after":{"drivers_u002e_volatile":{"vehicle_id":{"long":1}}}}`,
+		})
+
+		assertRegisteredSubjects(t, foo.registry, []string{
+			`drivers.primary-key`,
+			`drivers.primary-value`,
+			`drivers.volatile-value`,
+		})
+
 	}
 
 	t.Run(`kafka`, kafkaTest(testFn))

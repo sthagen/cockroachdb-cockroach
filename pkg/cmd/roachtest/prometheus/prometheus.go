@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-//go:generate mockgen -package=prometheus -destination=mock_generated.go -source=prometheus.go . Cluster
+//go:generate mockgen -package=prometheus -destination=mocks_generated_test.go . Cluster
 
 package prometheus
 
@@ -16,12 +16,20 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 	"gopkg.in/yaml.v2"
 )
+
+// Client is an interface allowing queries against Prometheus.
+type Client interface {
+	Query(ctx context.Context, query string, ts time.Time) (model.Value, promv1.Warnings, error)
+}
 
 // ScrapeNode are nodes to scrape from.
 type ScrapeNode struct {
@@ -118,10 +126,9 @@ sudo systemd-run --unit prometheus --same-dir \
 	return &Prometheus{Config: cfg}, nil
 }
 
-// Snapshot takes a snapshot of prometheus and stores the snapshot in the given localPath
-func (pm *Prometheus) Snapshot(
-	ctx context.Context, c Cluster, l *logger.Logger, localPath string,
-) error {
+// Snapshot takes a snapshot of prometheus and stores the snapshot and a script to spin up
+// a docker instance for it to the given directory.
+func (pm *Prometheus) Snapshot(ctx context.Context, c Cluster, l *logger.Logger, dir string) error {
 	if err := c.RunE(
 		ctx,
 		pm.PrometheusNode,
@@ -130,12 +137,37 @@ func (pm *Prometheus) Snapshot(
 	); err != nil {
 		return err
 	}
+	if err := os.WriteFile(filepath.Join(dir, "prometheus-docker-run.sh"), []byte(`#!/bin/sh
+set -eu
+
+tar xf prometheus-snapshot.tar.gz
+snapdir=$(find data/snapshots -mindepth 1 -maxdepth 1 -type d)
+promyml=$(mktemp)
+chmod -R o+rw "${snapdir}" "${promyml}"
+
+cat <<EOF > "${promyml}"
+global:
+  scrape_interval: 10s
+  scrape_timeout: 5s
+EOF
+
+set -x
+# Worked as of v2.33.1 so you can hard-code that if necessary.
+docker run --privileged -p 9090:9090 \
+    -v "${promyml}:/etc/prometheus/prometheus.yml" -v "${PWD}/${snapdir}:/prometheus" \
+    prom/prometheus:latest \
+    --config.file=/etc/prometheus/prometheus.yml \
+    --storage.tsdb.path=/prometheus \
+    --web.enable-admin-api
+`), 0755); err != nil {
+		return err
+	}
 
 	return c.Get(
 		ctx,
 		l,
 		"/tmp/prometheus/prometheus-snapshot.tar.gz",
-		localPath,
+		dir,
 		pm.PrometheusNode,
 	)
 }

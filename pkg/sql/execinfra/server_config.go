@@ -52,10 +52,16 @@ type ServerConfig struct {
 	Settings     *cluster.Settings
 	RuntimeStats RuntimeStats
 
-	ClusterID   *base.ClusterIDContainer
+	// LogicalClusterID is the logical cluster ID for this tenant.
+	LogicalClusterID *base.ClusterIDContainer
+
+	// ClusterName is the security string used to protect the RPC layer
+	// against connections to the wrong cluster.
 	ClusterName string
 
-	// NodeID is the id of the node on which this Server is running.
+	// NodeID is either the KV node ID or the SQL instance ID, depending
+	// on circumstances.
+	// TODO(knz,radu): Split this into different fields.
 	NodeID *base.SQLIDContainer
 
 	// Locality is the locality of the node on which this Server is running.
@@ -131,7 +137,11 @@ type ServerConfig struct {
 	// draining state.
 	Gossip gossip.OptionalGossip
 
+	// Dialer for communication between SQL and KV nodes.
 	NodeDialer *nodedialer.Dialer
+
+	// Dialer for communication between SQL nodes/pods.
+	PodNodeDialer *nodedialer.Dialer
 
 	// SessionBoundInternalExecutorFactory is used to construct session-bound
 	// executors. The idea is that a higher-layer binds some of the arguments
@@ -260,6 +270,10 @@ type TestingKnobs struct {
 
 	// StreamingTestingKnobs are backup and restore specific testing knobs.
 	StreamingTestingKnobs base.ModuleTestingKnobs
+
+	// IndexBackfillMergerTestingKnobs are the index backfill merger specific
+	// testing knobs.
+	IndexBackfillMergerTestingKnobs base.ModuleTestingKnobs
 }
 
 // MetadataTestLevel represents the types of queries where metadata test

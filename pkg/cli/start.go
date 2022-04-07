@@ -58,6 +58,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/logtags"
@@ -86,7 +87,7 @@ import (
 //
 // See #64329 for details.
 var debugTSImportFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_FILE", "")
-var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", debugTSImportFile+".yaml")
+var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", "")
 
 // startCmd starts a node by initializing the stores and joining
 // the cluster.
@@ -185,6 +186,7 @@ func initTraceDir(ctx context.Context, dir string) {
 var cacheSizeValue = newBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
 var sqlSizeValue = newBytesOrPercentageValue(&serverCfg.MemoryPoolSize, memoryPercentResolver)
 var diskTempStorageSizeValue = newBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
+var tsdbSizeValue = newBytesOrPercentageValue(&serverCfg.TimeSeriesServerConfig.QueryMemoryMax, memoryPercentResolver)
 
 func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, error) {
 	externalIODir := startCtx.externalIODir
@@ -377,22 +379,6 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// signals later, some startup logging might be lost.
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, drainSignals...)
-
-	// SIGQUIT is handled differently: for SIGQUIT we spawn a goroutine
-	// and we always handle it, no matter at which point during
-	// execution we are. This makes it possible to use SIGQUIT to
-	// inspect a running process and determine what it is currently
-	// doing, even if it gets stuck somewhere.
-	if quitSignal != nil {
-		quitSignalCh := make(chan os.Signal, 1)
-		signal.Notify(quitSignalCh, quitSignal)
-		go func() {
-			for {
-				<-quitSignalCh
-				log.DumpStacks(context.Background())
-			}
-		}()
-	}
 
 	// Check for stores with full disks and exit with an informative exit
 	// code. This needs to happen early during start, before we perform any
@@ -592,14 +578,7 @@ If problems persist, please see %s.`
 	// Run the rest of the startup process in a goroutine separate from
 	// the main goroutine to avoid preventing proper handling of signals
 	// if we get stuck on something during initialization (#10138).
-	var serverStatusMu struct {
-		syncutil.Mutex
-		// Used to synchronize server startup with server shutdown if something
-		// interrupts the process during initialization (it isn't safe to try to
-		// drain a server that doesn't exist or is in the middle of starting up,
-		// or to start a server after draining has begun).
-		started, draining bool
-	}
+	var serverStatusMu serverStatus
 	var s *server.Server
 	errChan := make(chan error, 1)
 	go func() {
@@ -685,12 +664,48 @@ If problems persist, please see %s.`
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			return reportServerInfo(ctx, tBegin, &serverCfg, s.ClusterSettings(), true /* isHostNode */, initialStart)
+			return reportServerInfo(ctx, tBegin, &serverCfg, s.ClusterSettings(),
+				true /* isHostNode */, initialStart, uuid.UUID{} /* tenantClusterID */)
 		}(); err != nil {
 			errChan <- err
 		}
 	}()
 
+	return waitForShutdown(
+		// NB: we delay the access to s, as it is assigned
+		// asynchronously in a goroutine above.
+		func() serverShutdownInterface { return s },
+		stopper, errChan, signalCh,
+		&serverStatusMu)
+}
+
+type serverStatus struct {
+	syncutil.Mutex
+	// Used to synchronize server startup with server shutdown if something
+	// interrupts the process during initialization (it isn't safe to try to
+	// drain a server that doesn't exist or is in the middle of starting up,
+	// or to start a server after draining has begun).
+	started, draining bool
+}
+
+// serverShutdownInterface is the subset of the APIs on a server
+// object that's sufficient to run a server shutdown.
+type serverShutdownInterface interface {
+	AnnotateCtx(context.Context) context.Context
+	Drain(ctx context.Context, verbose bool) (uint64, redact.RedactableString, error)
+}
+
+// waitForShutdown lets the server run asynchronously and waits for
+// shutdown, either due to the server spontaneously shutting down
+// (signaled by stopper), or due to a server error (signaled on
+// errChan), by receiving a signal (signaled by signalCh).
+func waitForShutdown(
+	getS func() serverShutdownInterface,
+	stopper *stop.Stopper,
+	errChan chan error,
+	signalCh chan os.Signal,
+	serverStatusMu *serverStatus,
+) (returnErr error) {
 	// The remainder of the main function executes concurrently with the
 	// start up goroutine started above.
 	//
@@ -700,9 +715,9 @@ If problems persist, please see %s.`
 	// decommission`, or a signal.
 
 	// We'll want to log any shutdown activity against a separate span.
-	// We cannot use s.AnnotateCtx here because s might not have
+	// We cannot use s.AnnotateCtx here because the server might not have
 	// been assigned yet (the goroutine above runs asynchronously).
-	shutdownCtx, shutdownSpan := ambientCtx.AnnotateCtxWithSpan(context.Background(), "server shutdown")
+	shutdownCtx, shutdownSpan := serverCfg.AmbientCtx.AnnotateCtxWithSpan(context.Background(), "server shutdown")
 	defer shutdownSpan.Finish()
 
 	stopWithoutDrain := make(chan struct{}) // closed if interrupted very early
@@ -766,8 +781,7 @@ If problems persist, please see %s.`
 			}
 			// Don't use shutdownCtx because this is in a goroutine that may
 			// still be running after shutdownCtx's span has been finished.
-			drainCtx := s.AnnotateCtx(context.Background())
-			drainCtx = logtags.AddTag(drainCtx, "server drain process", nil)
+			drainCtx := logtags.AddTag(getS().AnnotateCtx(context.Background()), "server drain process", nil)
 
 			// Perform a graceful drain. We keep retrying forever, in
 			// case there are many range leases or some unavailability
@@ -781,7 +795,8 @@ If problems persist, please see %s.`
 			)
 
 			for ; ; prevRemaining = remaining {
-				remaining, _, err = s.Drain(drainCtx, verbose)
+				var err error
+				remaining, _, err = getS().Drain(drainCtx, verbose)
 				if err != nil {
 					log.Ops.Errorf(drainCtx, "graceful drain failed: %v", err)
 					break
@@ -875,7 +890,7 @@ If problems persist, please see %s.`
 			// shutdown process.
 			log.Ops.Shoutf(shutdownCtx, severity.ERROR,
 				"received signal '%s' during shutdown, initiating hard shutdown%s",
-				log.Safe(sig), log.Safe(hardShutdownHint))
+				redact.Safe(sig), redact.Safe(hardShutdownHint))
 			handleSignalDuringShutdown(sig)
 			panic("unreachable")
 
@@ -903,6 +918,7 @@ func reportServerInfo(
 	serverCfg *server.Config,
 	st *cluster.Settings,
 	isHostNode, initialStart bool,
+	tenantClusterID uuid.UUID,
 ) error {
 	srvS := redact.SafeString("SQL server")
 	if isHostNode {
@@ -966,9 +982,13 @@ func reportServerInfo(
 	if baseCfg.ClusterName != "" {
 		buf.Printf("cluster name:\t%s\n", baseCfg.ClusterName)
 	}
-	clusterID := serverCfg.BaseConfig.ClusterIDContainer.Get().String()
-	buf.Printf("clusterID:\t%s\n", clusterID)
-
+	clusterID := serverCfg.BaseConfig.ClusterIDContainer.Get()
+	if clusterID.Equal(tenantClusterID) {
+		buf.Printf("clusterID:\t%s\n", clusterID)
+	} else {
+		buf.Printf("storage clusterID:\t%s\n", clusterID)
+		buf.Printf("tenant clusterID:\t%s\n", tenantClusterID)
+	}
 	nodeID := serverCfg.BaseConfig.IDContainer.Get()
 	if isHostNode {
 		if initialStart {
@@ -1089,12 +1109,12 @@ func maybeWarnMemorySizes(ctx context.Context) {
 
 	// Check that the total suggested "max" memory is well below the available memory.
 	if maxMemory, err := status.GetTotalMemory(ctx); err == nil {
-		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize
+		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize + serverCfg.TimeSeriesServerConfig.QueryMemoryMax
 		maxRecommendedMem := int64(.75 * float64(maxMemory))
 		if requestedMem > maxRecommendedMem {
 			log.Ops.Shoutf(ctx, severity.WARNING,
-				"the sum of --max-sql-memory (%s) and --cache (%s) is larger than 75%% of total RAM (%s).\nThis server is running at increased risk of memory-related failures.",
-				sqlSizeValue, cacheSizeValue, humanizeutil.IBytes(maxRecommendedMem))
+				"the sum of --max-sql-memory (%s), --cache (%s), and --max-tsdb-memory (%s) is larger than 75%% of total RAM (%s).\nThis server is running at increased risk of memory-related failures.",
+				sqlSizeValue, cacheSizeValue, tsdbSizeValue, humanizeutil.IBytes(maxRecommendedMem))
 		}
 	}
 }
@@ -1174,7 +1194,7 @@ func setupAndInitializeLoggingAndProfiling(
 				"- %s\n"+
 				"- %s",
 			build.MakeIssueURL(53404),
-			log.Safe(docs.URL("secure-a-cluster.html")),
+			redact.Safe(docs.URL("secure-a-cluster.html")),
 		)
 	}
 
@@ -1188,7 +1208,7 @@ func setupAndInitializeLoggingAndProfiling(
 				"For more information, see:\n\n" +
 				"- %s"
 			log.Shoutf(ctx, severity.WARNING, warningString,
-				log.Safe(docs.URL("cockroach-start.html#locality")))
+				redact.Safe(docs.URL("cockroach-start.html#locality")))
 		}
 	}
 
@@ -1236,7 +1256,11 @@ func getClientGRPCConn(
 	// cluster, so there's no need to enforce that its max offset is the same
 	// as that of nodes in the cluster.
 	clock := hlc.NewClock(hlc.UnixNano, 0)
-	stopper := stop.NewStopper()
+	tracer := cfg.Tracer
+	if tracer == nil {
+		tracer = tracing.NewTracer()
+	}
+	stopper := stop.NewStopper(stop.WithTracer(tracer))
 	rpcContext := rpc.NewContext(ctx,
 		rpc.ContextOptions{
 			TenantID: roachpb.SystemTenantID,

@@ -3,17 +3,20 @@
 exec
 SELECT crdb_internal.deserialize_session('invalid proto')
 ----
-pq: crdb_internal.deserialize_session(): error deserializing session: unexpected EOF
+ERROR: crdb_internal.deserialize_session(): error deserializing session: unexpected EOF (SQLSTATE 22023)
 
 exec
 SET experimental_enable_temp_tables = true;
+----
+
+exec
 CREATE TEMP TABLE temp_tbl()
 ----
 
 query
 SELECT crdb_internal.serialize_session()
 ----
-pq: crdb_internal.serialize_session(): cannot serialize session with temporary schemas
+ERROR: crdb_internal.serialize_session(): cannot serialize session with temporary schemas (SQLSTATE 25000)
 
 reset
 ----
@@ -25,7 +28,7 @@ BEGIN
 query
 SELECT crdb_internal.serialize_session()
 ----
-pq: crdb_internal.serialize_session(): cannot serialize a session which is inside a transaction
+ERROR: crdb_internal.serialize_session(): cannot serialize a session which is inside a transaction (SQLSTATE 25000)
 
 reset
 ----
@@ -41,7 +44,7 @@ BEGIN
 exec
 SELECT crdb_internal.deserialize_session( decode('$x', 'hex') )
 ----
-pq: crdb_internal.deserialize_session(): cannot deserialize a session whilst inside a transaction
+ERROR: crdb_internal.deserialize_session(): cannot deserialize a session whilst inside a multi-statement transaction (SQLSTATE 25000)
 
 reset
 ----
@@ -55,7 +58,7 @@ SELECT crdb_internal.deserialize_session(
   )
 )
 ----
-pq: crdb_internal.deserialize_session(): can only deserialize matching session users
+ERROR: crdb_internal.deserialize_session(): can only deserialize matching session users (SQLSTATE 42501)
 
 # We cannot deserialize a different session_user, even if current_user matches.
 exec
@@ -66,7 +69,7 @@ SELECT crdb_internal.deserialize_session(
   )
 )
 ----
-pq: crdb_internal.deserialize_session(): can only deserialize matching session users
+ERROR: crdb_internal.deserialize_session(): can only deserialize matching session users (SQLSTATE 42501)
 
 # We cannot deserialize into a current_user we do not match.
 user
@@ -84,4 +87,4 @@ SELECT crdb_internal.deserialize_session(
   )
 )
 ----
-pq: crdb_internal.deserialize_session(): only root can become root
+ERROR: crdb_internal.deserialize_session(): only root can become root (SQLSTATE 42501)

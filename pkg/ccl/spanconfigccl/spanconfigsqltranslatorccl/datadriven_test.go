@@ -13,28 +13,30 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
 )
@@ -81,6 +83,18 @@ func TestDataDriven(t *testing.T) {
 
 	ctx := context.Background()
 
+	gcWaiter := sync.NewCond(&syncutil.Mutex{})
+	allowGC := true
+	gcTestingKnobs := &sql.GCJobTestingKnobs{
+		RunBeforeResume: func(_ jobspb.JobID) error {
+			gcWaiter.L.Lock()
+			for !allowGC {
+				gcWaiter.Wait()
+			}
+			gcWaiter.L.Unlock()
+			return nil
+		},
+	}
 	scKnobs := &spanconfig.TestingKnobs{
 		// Instead of relying on the GC job to wait out TTLs and clear out
 		// descriptors, let's simply exclude dropped tables to simulate
@@ -91,34 +105,34 @@ func TestDataDriven(t *testing.T) {
 		// test cluster).
 		ManagerDisableJobCreation: true,
 	}
-	// TODO(adityamaru): Delete once the value for this knob defaults to true
-	// prior to release-22.1.
-	ptsKnobs := &protectedts.TestingKnobs{
-		EnableProtectedTimestampForMultiTenant: true,
-	}
 	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
-					SpanConfig:  scKnobs,
-					ProtectedTS: ptsKnobs,
+					GCJob:      gcTestingKnobs,
+					SpanConfig: scKnobs,
 				},
 			},
 		})
 		defer tc.Stopper().Stop(ctx)
 
-		spanConfigTestCluster := spanconfigtestcluster.NewHandle(t, tc, scKnobs, ptsKnobs)
+		spanConfigTestCluster := spanconfigtestcluster.NewHandle(t, tc, scKnobs)
 		defer spanConfigTestCluster.Cleanup()
 
 		var tenant *spanconfigtestcluster.Tenant
 		if strings.Contains(path, "tenant") {
-			tenant = spanConfigTestCluster.InitializeTenant(ctx, roachpb.MakeTenantID(10))
-			tenant.Exec(`SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true`)
+			tenantID := roachpb.MakeTenantID(10)
+			tenant = spanConfigTestCluster.InitializeTenant(ctx, tenantID)
+			spanConfigTestCluster.AllowSecondaryTenantToSetZoneConfigurations(t, tenantID)
+			spanConfigTestCluster.EnsureTenantCanSetZoneConfigurationsOrFatal(t, tenant)
 		} else {
 			tenant = spanConfigTestCluster.InitializeTenant(ctx, roachpb.SystemTenantID)
 		}
+		execCfg := tenant.ExecCfg()
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+			var generateSystemSpanConfigs bool
+			var descIDs []descpb.ID
 			switch d.Cmd {
 			case "exec-sql":
 				tenant.Exec(d.Input)
@@ -130,60 +144,87 @@ func TestDataDriven(t *testing.T) {
 				return output
 
 			case "translate":
-				// Parse the args to get the object ID we're looking to
+				// Parse the args to get the descriptor ID we're looking to
 				// translate.
-				var objID descpb.ID
 				switch {
 				case d.HasArg("named-zone"):
 					var zone string
 					d.ScanArgs(t, "named-zone", &zone)
 					namedZoneID, found := zonepb.NamedZones[zonepb.NamedZone(zone)]
 					require.Truef(t, found, "unknown named zone: %s", zone)
-					objID = descpb.ID(namedZoneID)
+					descIDs = []descpb.ID{descpb.ID(namedZoneID)}
 				case d.HasArg("id"):
 					var scanID int
 					d.ScanArgs(t, "id", &scanID)
-					objID = descpb.ID(scanID)
+					descIDs = []descpb.ID{descpb.ID(scanID)}
 				case d.HasArg("database"):
 					var dbName string
 					d.ScanArgs(t, "database", &dbName)
 					if d.HasArg("table") {
 						var tbName string
 						d.ScanArgs(t, "table", &tbName)
-						objID = tenant.LookupTableByName(ctx, dbName, tbName).GetID()
+						descIDs = []descpb.ID{tenant.LookupTableByName(ctx, dbName, tbName).GetID()}
 					} else {
-						objID = tenant.LookupDatabaseByName(ctx, dbName).GetID()
+						descIDs = []descpb.ID{tenant.LookupDatabaseByName(ctx, dbName).GetID()}
 					}
+				case d.HasArg("system-span-configurations"):
+					generateSystemSpanConfigs = true
 				default:
 					d.Fatalf(t, "insufficient/improper args (%v) provided to translate", d.CmdArgs)
 				}
 
-				sqlTranslator := tenant.SpanConfigSQLTranslator().(spanconfig.SQLTranslator)
-				entries, _, err := sqlTranslator.Translate(ctx, descpb.IDs{objID})
-				require.NoError(t, err)
-				sort.Slice(entries, func(i, j int) bool {
-					return entries[i].Span.Key.Compare(entries[j].Span.Key) < 0
+				var records []spanconfig.Record
+				sqlTranslatorFactory := tenant.SpanConfigSQLTranslatorFactory().(*spanconfigsqltranslator.Factory)
+				err := sql.DescsTxn(ctx, &execCfg, func(
+					ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+				) error {
+					sqlTranslator := sqlTranslatorFactory.NewSQLTranslator(txn, descsCol)
+					var err error
+					records, _, err = sqlTranslator.Translate(ctx, descIDs, generateSystemSpanConfigs)
+					require.NoError(t, err)
+					return nil
 				})
+				require.NoError(t, err)
 
+				sort.Slice(records, func(i, j int) bool {
+					return records[i].GetTarget().Less(records[j].GetTarget())
+				})
 				var output strings.Builder
-				for _, entry := range entries {
-					output.WriteString(fmt.Sprintf("%-42s %s\n", entry.Span,
-						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(entry.Config)))
+				for _, record := range records {
+					switch {
+					case record.GetTarget().IsSpanTarget():
+						output.WriteString(fmt.Sprintf("%-42s %s\n", record.GetTarget().GetSpan(),
+							spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.GetConfig())))
+					case record.GetTarget().IsSystemTarget():
+						output.WriteString(fmt.Sprintf("%-42s %s\n", record.GetTarget().GetSystemTarget(),
+							spanconfigtestutils.PrintSystemSpanConfigDiffedAgainstDefault(record.GetConfig())))
+					default:
+						panic("unsupported target type")
+					}
 				}
 				return output.String()
 
 			case "full-translate":
-				sqlTranslator := tenant.SpanConfigSQLTranslator().(spanconfig.SQLTranslator)
-				entries, _, err := spanconfig.FullTranslate(ctx, sqlTranslator)
+				sqlTranslatorFactory := tenant.SpanConfigSQLTranslatorFactory().(*spanconfigsqltranslator.Factory)
+				var records []spanconfig.Record
+				err := sql.DescsTxn(ctx, &execCfg, func(
+					ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+				) error {
+					sqlTranslator := sqlTranslatorFactory.NewSQLTranslator(txn, descsCol)
+					var err error
+					records, _, err = spanconfig.FullTranslate(ctx, sqlTranslator)
+					require.NoError(t, err)
+					return nil
+				})
 				require.NoError(t, err)
 
-				sort.Slice(entries, func(i, j int) bool {
-					return entries[i].Span.Key.Compare(entries[j].Span.Key) < 0
+				sort.Slice(records, func(i, j int) bool {
+					return records[i].GetTarget().Less(records[j].GetTarget())
 				})
 				var output strings.Builder
-				for _, entry := range entries {
-					output.WriteString(fmt.Sprintf("%-42s %s\n", entry.Span,
-						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(entry.Config)))
+				for _, record := range records {
+					output.WriteString(fmt.Sprintf("%-42s %s\n", record.GetTarget().GetSpan(),
+						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.GetConfig())))
 				}
 				return output.String()
 
@@ -209,31 +250,24 @@ func TestDataDriven(t *testing.T) {
 				d.ScanArgs(t, "record-id", &recordID)
 				d.ScanArgs(t, "ts", &protectTS)
 				target := spanconfigtestutils.ParseProtectionTarget(t, d.Input)
-
-				jobID := tenant.JobsRegistry().MakeJobID()
-				require.NoError(t, tenant.ExecCfg().DB.Txn(ctx,
-					func(ctx context.Context, txn *kv.Txn) (err error) {
-						require.Len(t, recordID, 1,
-							"datadriven test only supports single character record IDs")
-						recID, err := uuid.FromBytes([]byte(strings.Repeat(recordID, 16)))
-						require.NoError(t, err)
-						rec := jobsprotectedts.MakeRecord(recID, int64(jobID),
-							hlc.Timestamp{WallTime: int64(protectTS)}, nil, /* deprecatedSpans */
-							jobsprotectedts.Jobs, target)
-						return tenant.ProtectedTimestampProvider().Protect(ctx, txn, rec)
-					}))
+				target.IgnoreIfExcludedFromBackup = d.HasArg("ignore-if-excluded-from-backup")
+				tenant.MakeProtectedTimestampRecordAndProtect(ctx, recordID, protectTS, target)
 
 			case "release":
 				var recordID string
 				d.ScanArgs(t, "record-id", &recordID)
-				require.NoError(t, tenant.ExecCfg().DB.Txn(ctx,
-					func(ctx context.Context, txn *kv.Txn) error {
-						require.Len(t, recordID, 1,
-							"datadriven test only supports single character record IDs")
-						recID, err := uuid.FromBytes([]byte(strings.Repeat(recordID, 16)))
-						require.NoError(t, err)
-						return tenant.ProtectedTimestampProvider().Release(ctx, txn, recID)
-					}))
+				tenant.ReleaseProtectedTimestampRecord(ctx, recordID)
+
+			case "block-gc-jobs":
+				gcWaiter.L.Lock()
+				allowGC = false
+				gcWaiter.L.Unlock()
+
+			case "unblock-gc-jobs":
+				gcWaiter.L.Lock()
+				allowGC = true
+				gcWaiter.Signal()
+				gcWaiter.L.Unlock()
 			default:
 				t.Fatalf("unknown command: %s", d.Cmd)
 			}

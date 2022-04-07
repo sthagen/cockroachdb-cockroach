@@ -635,6 +635,7 @@ func DefaultStartOpts() install.StartOpts {
 	return install.StartOpts{
 		Sequential:      true,
 		EncryptedStores: false,
+		NumFilesLimit:   config.DefaultNumFilesLimit,
 		SkipInit:        false,
 		StoreCount:      1,
 		TenantID:        2,
@@ -674,7 +675,9 @@ func Monitor(
 type StopOpts struct {
 	ProcessTag string
 	Sig        int
-	Wait       bool
+	// If Wait is set, roachprod waits until the PID disappears (i.e. the
+	// process has terminated).
+	Wait bool // forced to true when Sig == 9
 }
 
 // DefaultStopOpts returns StopOpts populated with the default values used by Stop.

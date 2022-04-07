@@ -13,6 +13,7 @@ package batcheval
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 func init() {
@@ -30,7 +32,11 @@ func init() {
 }
 
 func declareKeysPushTransaction(
-	rs ImmutableRangeState, _ *roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
+	rs ImmutableRangeState,
+	_ *roachpb.Header,
+	req roachpb.Request,
+	latchSpans, _ *spanset.SpanSet,
+	_ time.Duration,
 ) {
 	pr := req.(*roachpb.PushTxnRequest)
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(pr.PusheeTxn.Key, pr.PusheeTxn.ID)})
@@ -263,10 +269,10 @@ func PushTxn(
 			s = "failed to push"
 		}
 		log.Infof(ctx, "%s %s (push type=%s) %s: %s (pushee last active: %s)",
-			args.PusherTxn.Short(), log.Safe(s),
-			log.Safe(pushType),
+			args.PusherTxn.Short(), redact.Safe(s),
+			redact.Safe(pushType),
 			args.PusheeTxn.Short(),
-			log.Safe(reason),
+			redact.Safe(reason),
 			reply.PusheeTxn.LastActive())
 	}
 

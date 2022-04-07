@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -547,17 +548,14 @@ func IsRangeNotFoundError(err error) bool {
 	return errors.HasType(err, (*RangeNotFoundError)(nil))
 }
 
-// NewRangeKeyMismatchError initializes a new RangeKeyMismatchError.
-//
-// desc and lease represent info about the range that the request was
-// erroneously routed to. lease can be nil. If it's not nil but the leaseholder
-// is not part of desc, it is ignored. This allows callers to read the
-// descriptor and lease non-atomically without worrying about incoherence.
-//
-// Note that more range info is commonly added to the error after the error is
-// created.
-func NewRangeKeyMismatchError(
-	ctx context.Context, start, end Key, desc *RangeDescriptor, lease *Lease,
+// NewRangeKeyMismatchErrorWithCTPolicy initializes a new RangeKeyMismatchError.
+// identical to NewRangeKeyMismatchError, with the given ClosedTimestampPolicy.
+func NewRangeKeyMismatchErrorWithCTPolicy(
+	ctx context.Context,
+	start, end Key,
+	desc *RangeDescriptor,
+	lease *Lease,
+	ctPolicy RangeClosedTimestampPolicy,
 ) *RangeKeyMismatchError {
 	if desc == nil {
 		panic("NewRangeKeyMismatchError with nil descriptor")
@@ -579,9 +577,35 @@ func NewRangeKeyMismatchError(
 		RequestStartKey: start,
 		RequestEndKey:   end,
 	}
+	ri := RangeInfo{
+		Desc:                  *desc,
+		Lease:                 l,
+		ClosedTimestampPolicy: ctPolicy,
+	}
 	// More ranges are sometimes added to rangesInternal later.
-	e.AppendRangeInfo(ctx, *desc, l)
+	e.AppendRangeInfo(ctx, ri)
 	return e
+}
+
+// NewRangeKeyMismatchError initializes a new RangeKeyMismatchError.
+//
+// desc and lease represent info about the range that the request was
+// erroneously routed to. lease can be nil. If it's not nil but the leaseholder
+// is not part of desc, it is ignored. This allows callers to read the
+// descriptor and lease non-atomically without worrying about incoherence.
+//
+// Note that more range info is commonly added to the error after the error is
+// created.
+func NewRangeKeyMismatchError(
+	ctx context.Context, start, end Key, desc *RangeDescriptor, lease *Lease,
+) *RangeKeyMismatchError {
+	return NewRangeKeyMismatchErrorWithCTPolicy(ctx,
+		start,
+		end,
+		desc,
+		lease,
+		LAG_BY_CLUSTER_SETTING, /* default closed timestsamp policy*/
+	)
 }
 
 func (e *RangeKeyMismatchError) Error() string {
@@ -613,54 +637,23 @@ func (e *RangeKeyMismatchError) MismatchedRange() (RangeInfo, error) {
 	return e.Ranges[0], nil
 }
 
-// AppendRangeInfo appends info about one range to the set returned to the
+// AppendRangeInfo appends info about a group of ranges to the set returned to the
 // kvclient.
 //
 // l can be empty. Otherwise, the leaseholder is asserted to be a replica in
 // desc.
-func (e *RangeKeyMismatchError) AppendRangeInfo(
-	ctx context.Context, desc RangeDescriptor, l Lease,
-) {
-	if !l.Empty() {
-		if _, ok := desc.GetReplicaDescriptorByID(l.Replica.ReplicaID); !ok {
-			log.Fatalf(ctx, "lease names missing replica; lease: %s, desc: %s", l, desc)
+func (e *RangeKeyMismatchError) AppendRangeInfo(ctx context.Context, ris ...RangeInfo) {
+	for _, ri := range ris {
+		if !ri.Lease.Empty() {
+			if _, ok := ri.Desc.GetReplicaDescriptorByID(ri.Lease.Replica.ReplicaID); !ok {
+				log.Fatalf(ctx, "lease names missing replica; lease: %s, desc: %s", ri.Lease, ri.Desc)
+			}
 		}
+		e.Ranges = append(e.Ranges, ri)
 	}
-	e.Ranges = append(e.Ranges, RangeInfo{
-		Desc:  desc,
-		Lease: l,
-	})
 }
 
 var _ ErrorDetailInterface = &RangeKeyMismatchError{}
-
-// NewAmbiguousResultError initializes a new AmbiguousResultError with
-// an explanatory message.
-func NewAmbiguousResultError(msg string) *AmbiguousResultError {
-	return &AmbiguousResultError{Message: msg}
-}
-
-// NewAmbiguousResultErrorf initializes a new AmbiguousResultError with
-// an explanatory format and set of arguments.
-func NewAmbiguousResultErrorf(format string, args ...interface{}) *AmbiguousResultError {
-	return NewAmbiguousResultError(fmt.Sprintf(format, args...))
-}
-
-func (e *AmbiguousResultError) Error() string {
-	return e.message(nil)
-}
-
-func (e *AmbiguousResultError) message(_ *Error) string {
-	if e.WrappedErr != nil {
-		return fmt.Sprintf("result is ambiguous (%v)", e.WrappedErr)
-	}
-	return fmt.Sprintf("result is ambiguous (%s)", e.Message)
-}
-
-// Type is part of the ErrorDetailInterface.
-func (e *AmbiguousResultError) Type() ErrorDetailType {
-	return AmbiguousResultErrType
-}
 
 // ClientVisibleAmbiguousError implements the ClientVisibleAmbiguousError interface.
 func (e *AmbiguousResultError) ClientVisibleAmbiguousError() {}
@@ -929,6 +922,12 @@ func (e *WriteTooOldError) Type() ErrorDetailType {
 	return WriteTooOldErrType
 }
 
+// RetryTimestamp returns the timestamp that should be used to retry an
+// operation after encountering a WriteTooOldError.
+func (e *WriteTooOldError) RetryTimestamp() hlc.Timestamp {
+	return e.ActualTimestamp
+}
+
 var _ ErrorDetailInterface = &WriteTooOldError{}
 var _ transactionRestartError = &WriteTooOldError{}
 
@@ -987,6 +986,39 @@ func (e *ReadWithinUncertaintyIntervalError) Type() ErrorDetailType {
 
 func (*ReadWithinUncertaintyIntervalError) canRestartTransaction() TransactionRestart {
 	return TransactionRestart_IMMEDIATE
+}
+
+// RetryTimestamp returns the timestamp that should be used to retry an
+// operation after encountering a ReadWithinUncertaintyIntervalError.
+func (e *ReadWithinUncertaintyIntervalError) RetryTimestamp() hlc.Timestamp {
+	// If the reader encountered a newer write within the uncertainty interval,
+	// we advance the txn's timestamp just past the uncertain value's timestamp.
+	// This ensures that we read above the uncertain value on a retry.
+	ts := e.ExistingTimestamp.Next()
+	// In addition to advancing past the uncertainty value's timestamp, we also
+	// advance the txn's timestamp up to the local uncertainty limit on the node
+	// which hit the error. This ensures that no future read after the retry on
+	// this node (ignoring lease complications in ComputeLocalUncertaintyLimit
+	// and values with synthetic timestamps) will throw an uncertainty error,
+	// even when reading other keys.
+	//
+	// Note that if the request was not able to establish a local uncertainty
+	// limit due to a missing observed timestamp (for instance, if the request
+	// was evaluated on a follower replica and the txn had never visited the
+	// leaseholder), then LocalUncertaintyLimit will be empty and the Forward
+	// will be a no-op. In this case, we could advance all the way past the
+	// global uncertainty limit, but this time would likely be in the future, so
+	// this would necessitate a commit-wait period after committing.
+	//
+	// In general, we expect the local uncertainty limit, if set, to be above
+	// the uncertainty value's timestamp. So we expect this Forward to advance
+	// ts. However, this is not always the case. The one exception is if the
+	// uncertain value had a synthetic timestamp, so it was compared against the
+	// global uncertainty limit to determine uncertainty (see IsUncertain). In
+	// such cases, we're ok advancing just past the value's timestamp. Either
+	// way, we won't see the same value in our uncertainty interval on a retry.
+	ts.Forward(e.LocalUncertaintyLimit)
+	return ts
 }
 
 var _ ErrorDetailInterface = &ReadWithinUncertaintyIntervalError{}
@@ -1384,3 +1416,8 @@ func (e *RefreshFailedError) Type() ErrorDetailType {
 }
 
 var _ ErrorDetailInterface = &RefreshFailedError{}
+
+func (e *InsufficientSpaceError) Error() string {
+	return fmt.Sprintf("store %d has insufficient remaining capacity to %s (remaining: %s / %.1f%%, min required: %.1f%%)",
+		e.StoreID, e.Op, humanizeutil.IBytes(e.Available), float64(e.Available)/float64(e.Capacity)*100, e.Required*100)
+}

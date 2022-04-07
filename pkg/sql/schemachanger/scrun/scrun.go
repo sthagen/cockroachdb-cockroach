@@ -12,14 +12,19 @@ package scrun
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -81,11 +86,13 @@ func RunSchemaChangesInJob(
 	settings *cluster.Settings,
 	deps JobRunDependencies,
 	jobID jobspb.JobID,
-	jobDetails jobspb.NewSchemaChangeDetails,
-	jobProgress jobspb.NewSchemaChangeProgress,
+	descriptorIDs []descpb.ID,
 	rollback bool,
 ) error {
-	state := makeState(ctx, settings, jobDetails.TargetState, jobProgress.Current, rollback)
+	state, err := makeState(ctx, deps, descriptorIDs, rollback)
+	if err != nil {
+		return errors.Wrapf(err, "failed to construct state for job %d", jobID)
+	}
 	sc, err := scplan.MakePlan(state, scplan.Params{
 		ExecutionPhase:             scop.PostCommitPhase,
 		SchemaChangerJobIDSupplier: func() jobspb.JobID { return jobID },
@@ -97,12 +104,28 @@ func RunSchemaChangesInJob(
 	for i := range sc.Stages {
 		// Execute each stage in its own transaction.
 		if err := deps.WithTxnInJob(ctx, func(ctx context.Context, td scexec.Dependencies) error {
+			if err := td.TransactionalJobRegistry().CheckPausepoint(
+				pausepointName(state, i),
+			); err != nil {
+				return err
+			}
 			return executeStage(ctx, knobs, td, sc, i, sc.Stages[i])
 		}); err != nil {
+			if knobs.OnPostCommitError != nil {
+				return knobs.OnPostCommitError(sc, i, err)
+			}
 			return err
 		}
 	}
 	return nil
+}
+
+// pausepointName construct a name for the job execution phase pausepoint.
+func pausepointName(state scpb.CurrentState, i int) string {
+	return fmt.Sprintf(
+		"schemachanger.%s.%s.%d",
+		state.Authorization.UserName, state.Authorization.AppName, i,
+	)
 }
 
 func executeStage(
@@ -112,40 +135,84 @@ func executeStage(
 	p scplan.Plan,
 	stageIdx int,
 	stage scplan.Stage,
-) error {
+) (err error) {
 	if knobs != nil && knobs.BeforeStage != nil {
 		if err := knobs.BeforeStage(p, stageIdx); err != nil {
 			return err
 		}
 	}
+
+	log.Infof(ctx, "executing stage %d/%d in %v, %d ops of type %s (rollback=%v)",
+		stage.Ordinal, stage.StagesInPhase, stage.Phase, len(stage.Ops()), stage.Ops()[0].Type(), p.InRollback)
+	start := timeutil.Now()
+	defer func() {
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, "executed stage %d/%d in %v, %d ops of type %s (rollback=%v) took %v: err = %v",
+				stage.Ordinal, stage.StagesInPhase, stage.Phase, len(stage.Ops()), stage.Ops()[0].Type(), p.InRollback,
+				timeutil.Since(start), err)
+		}
+	}()
 	if err := scexec.ExecuteStage(ctx, deps, stage.Ops()); err != nil {
-		return errors.Wrapf(p.DecorateErrorWithPlanDetails(err), "error executing %s", stage.String())
+		// Don't go through the effort to wrap the error if it's a retry or it's a
+		// cancelation.
+		if !errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) &&
+			!errors.Is(err, context.Canceled) {
+			err = p.DecorateErrorWithPlanDetails(err)
+		}
+		return errors.Wrapf(err, "error executing %s", stage.String())
 	}
+	if knobs != nil && knobs.AfterStage != nil {
+		if err := knobs.AfterStage(p, stageIdx); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func makeState(
-	ctx context.Context,
-	sv *cluster.Settings,
-	targetState scpb.TargetState,
-	incumbent []scpb.Status,
-	rollback bool,
-) scpb.CurrentState {
-	if len(targetState.Targets) != len(incumbent) {
-		logcrash.ReportOrPanic(ctx, &sv.SV, "unexpected slice size mismatch %d and %d",
-			len(targetState.Targets), len(incumbent))
-	}
-	s := scpb.CurrentState{TargetState: targetState, Current: incumbent}
-	if rollback {
-		for i := range s.Targets {
-			t := &s.Targets[i]
-			switch t.TargetStatus {
-			case scpb.Status_PUBLIC:
-				t.TargetStatus = scpb.Status_ABSENT
-			case scpb.Status_ABSENT:
-				t.TargetStatus = scpb.Status_PUBLIC
-			}
+	ctx context.Context, deps JobRunDependencies, descriptorIDs []descpb.ID, rollback bool,
+) (scpb.CurrentState, error) {
+	var descriptorStates []*scpb.DescriptorState
+	if err := deps.WithTxnInJob(ctx, func(ctx context.Context, txnDeps scexec.Dependencies) error {
+		descriptorStates = nil
+		// Reset for restarts.
+		descs, err := txnDeps.Catalog().MustReadImmutableDescriptors(ctx, descriptorIDs...)
+		if err != nil {
+			// TODO(ajwerner): It seems possible that a descriptor could be deleted
+			// and the schema change is in a happy place. Ideally we'd enforce that
+			// descriptors may only be deleted on the very last step of the schema
+			// change.
+			return err
 		}
+		for _, desc := range descs {
+			// TODO(ajwerner): Verify that the job ID matches on all of the
+			// descriptors. Also verify that the Authorization matches.
+			cs := desc.GetDeclarativeSchemaChangerState()
+			if cs == nil {
+				return errors.Errorf(
+					"descriptor %q (%d) does not contain schema changer state", desc.GetName(), desc.GetID(),
+				)
+			}
+			descriptorStates = append(descriptorStates, cs)
+		}
+		return nil
+	}); err != nil {
+		return scpb.CurrentState{}, err
 	}
-	return s
+	state, err := scpb.MakeCurrentStateFromDescriptors(descriptorStates)
+	if err != nil {
+		return scpb.CurrentState{}, err
+	}
+	if !rollback && state.InRollback {
+		// If we do not mark the error as permanent, but we've configured the job to
+		// be non-cancelable, we'll never make it to the reverting state.
+		return scpb.CurrentState{}, jobs.MarkAsPermanentJobError(errors.Errorf(
+			"job in running state but schema change in rollback, " +
+				"returning an error to restart in the reverting state"))
+	}
+	if rollback && !state.InRollback {
+		state.Rollback()
+	}
+	return state, nil
 }

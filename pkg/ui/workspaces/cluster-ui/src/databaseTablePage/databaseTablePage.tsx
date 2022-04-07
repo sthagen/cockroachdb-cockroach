@@ -12,27 +12,35 @@ import React from "react";
 import { Col, Row, Tabs } from "antd";
 import { RouteComponentProps } from "react-router-dom";
 import classNames from "classnames/bind";
-import _ from "lodash";
 import { Tooltip } from "antd";
 import { Heading } from "@cockroachlabs/ui-components";
 
+import { Anchor } from "src/anchor";
 import { Breadcrumbs } from "src/breadcrumbs";
 import { CaretRight } from "src/icon/caretRight";
 import { StackIcon } from "src/icon/stackIcon";
 import { SqlBox } from "src/sql";
 import { ColumnDescriptor, SortSetting, SortedTable } from "src/sortedtable";
-import { SummaryCard, SummaryCardItem } from "src/summaryCard";
+import {
+  SummaryCard,
+  SummaryCardItem,
+  SummaryCardItemBoolSetting,
+} from "src/summaryCard";
 import * as format from "src/util/format";
-import { syncHistory } from "src/util";
+import { syncHistory, tableStatsClusterSetting } from "src/util";
 
 import styles from "./databaseTablePage.module.scss";
 import { commonStyles } from "src/common";
 import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
 import moment, { Moment } from "moment";
 import { Search as IndexIcon } from "@cockroachlabs/icons";
-import { formatDate } from "antd/es/date-picker/utils";
 import { Link } from "react-router-dom";
+import classnames from "classnames/bind";
+import booleanSettingStyles from "../settings/booleanSetting.module.scss";
+import { CircleFilled } from "../icon";
+import { performanceTuningRecipes } from "src/util/docs";
 const cx = classNames.bind(styles);
+const booleanSettingCx = classnames.bind(booleanSettingStyles);
 
 const { TabPane } = Tabs;
 
@@ -84,6 +92,7 @@ export interface DatabaseTablePageData {
   stats: DatabaseTablePageDataStats;
   indexStats: DatabaseTablePageIndexStats;
   showNodeRegionsSection?: boolean;
+  automaticStatsCollectionEnabled?: boolean;
 }
 
 export interface DatabaseTablePageDataDetails {
@@ -93,6 +102,7 @@ export interface DatabaseTablePageDataDetails {
   replicaCount: number;
   indexNames: string[];
   grants: Grant[];
+  statsLastUpdated?: Moment;
 }
 
 export interface DatabaseTablePageIndexStats {
@@ -107,6 +117,12 @@ interface IndexStat {
   totalReads: number;
   lastUsed: Moment;
   lastUsedType: string;
+  indexRecommendations: IndexRecommendation[];
+}
+
+interface IndexRecommendation {
+  type: string;
+  reason: string;
 }
 
 interface Grant {
@@ -125,6 +141,7 @@ export interface DatabaseTablePageDataStats {
 export interface DatabaseTablePageActions {
   refreshTableDetails: (database: string, table: string) => void;
   refreshTableStats: (database: string, table: string) => void;
+  refreshSettings: () => void;
   refreshIndexStats?: (database: string, table: string) => void;
   resetIndexUsageStats?: (database: string, table: string) => void;
   refreshNodes?: () => void;
@@ -203,6 +220,10 @@ export class DatabaseTablePage extends React.Component<
         this.props.name,
       );
     }
+
+    if (this.props.refreshSettings != null) {
+      this.props.refreshSettings();
+    }
   }
 
   minDate = moment.utc("0001-01-01"); // minimum value as per UTC
@@ -217,33 +238,68 @@ export class DatabaseTablePage extends React.Component<
       return "Last reset: Never";
     } else {
       return (
-        "Last reset: " +
-        formatDate(lastReset, "MMM DD, YYYY [at] h:mm A [(UTC)]")
+        "Last reset: " + lastReset.format("MMM DD, YYYY [at] h:mm A [(UTC)]")
       );
     }
   }
 
   private getLastUsedString(indexStat: IndexStat) {
-    const lastReset = this.props.indexStats.lastReset;
-    switch (indexStat.lastUsedType) {
-      case "read":
-        return formatDate(
-          indexStat.lastUsed,
-          "[Last read:] MMM DD, YYYY [at] h:mm A",
-        );
-      case "reset":
-      default:
-        // TODO(lindseyjin): replace default case with create time after it's added to table_indexes
-        if (lastReset.isSame(this.minDate)) {
-          return "Never";
-        } else {
-          return formatDate(
-            lastReset,
-            "[Last reset:] MMM DD, YYYY [at] h:mm A",
-          );
-        }
+    // This case only occurs when we have no reads, resets, or creation time on
+    // the index.
+    if (indexStat.lastUsed.isSame(this.minDate)) {
+      return "Never";
     }
+    return indexStat.lastUsed.format(
+      `[Last ${indexStat.lastUsedType}:] MMM DD, YYYY [at] h:mm A`,
+    );
   }
+
+  private renderIndexRecommendations = (
+    indexStat: IndexStat,
+  ): React.ReactNode => {
+    const classname =
+      indexStat.indexRecommendations.length > 0
+        ? "index-recommendations-icon__exist"
+        : "index-recommendations-icon__none";
+
+    if (indexStat.indexRecommendations.length === 0) {
+      return (
+        <div>
+          <CircleFilled className={cx(classname)} />
+          <span>None</span>
+        </div>
+      );
+    }
+    return indexStat.indexRecommendations.map(recommendation => {
+      let text: string;
+      switch (recommendation.type) {
+        case "DROP_UNUSED":
+          text = "Drop unused index";
+      }
+      // TODO(thomas): using recommendation.type as the key seems not good.
+      //  - if it is possible for an index to have multiple recommendations of the same type
+      //  this could cause issues.
+      return (
+        <Tooltip
+          key={recommendation.type}
+          placement="bottom"
+          title={
+            <div className={cx("index-recommendations-text__tooltip-anchor")}>
+              {recommendation.reason}{" "}
+              <Anchor href={performanceTuningRecipes} target="_blank">
+                Learn more
+              </Anchor>
+            </div>
+          }
+        >
+          <CircleFilled className={cx(classname)} />
+          <span className={cx("index-recommendations-text__border")}>
+            {text}
+          </span>
+        </Tooltip>
+      );
+    });
+  };
 
   private indexStatsColumns: ColumnDescriptor<IndexStat>[] = [
     {
@@ -277,7 +333,19 @@ export class DatabaseTablePage extends React.Component<
       cell: indexStat => this.getLastUsedString(indexStat),
       sort: indexStat => indexStat.lastUsed,
     },
-    // TODO(lindseyjin): add index recommendations column
+    {
+      name: "index recommendations",
+      title: (
+        <Tooltip
+          placement="bottom"
+          title="Index recommendations will appear if the system detects improper index usage, such as the occurrence of unused indexes. Following index recommendations may help improve query performance."
+        >
+          Index recommendations
+        </Tooltip>
+      ),
+      cell: this.renderIndexRecommendations,
+      sort: indexStat => indexStat.indexRecommendations.length,
+    },
   ];
 
   private grantsColumns: ColumnDescriptor<Grant>[] = [
@@ -337,7 +405,7 @@ export class DatabaseTablePage extends React.Component<
             onChange={this.onTabChange}
             activeKey={this.state.tab}
           >
-            <TabPane tab="Overview" key="overview">
+            <TabPane tab="Overview" key="overview" className={cx("tab-pane")}>
               <Row gutter={18}>
                 <Col className="gutter-row" span={18}>
                   <SqlBox value={this.props.details.createStatement} />
@@ -359,6 +427,37 @@ export class DatabaseTablePage extends React.Component<
                       label="Ranges"
                       value={this.props.stats.rangeCount}
                     />
+                    {this.props.details.statsLastUpdated && (
+                      <SummaryCardItem
+                        label="Table Stats Last Updated"
+                        value={this.props.details.statsLastUpdated.format(
+                          "MMM DD, YYYY [at] h:mm A [(UTC)]",
+                        )}
+                      />
+                    )}
+                    {this.props.automaticStatsCollectionEnabled != null && (
+                      <SummaryCardItemBoolSetting
+                        label="Auto Stats Collection"
+                        value={this.props.automaticStatsCollectionEnabled}
+                        toolTipText={
+                          <span>
+                            {" "}
+                            Automatic statistics can help improve query
+                            performance. Learn how to{" "}
+                            <Anchor
+                              href={tableStatsClusterSetting}
+                              target="_blank"
+                              className={booleanSettingCx(
+                                "crl-hover-text__link-text",
+                              )}
+                            >
+                              manage statistics collection
+                            </Anchor>
+                            .
+                          </span>
+                        }
+                      />
+                    )}
                   </SummaryCard>
                 </Col>
 
@@ -376,7 +475,7 @@ export class DatabaseTablePage extends React.Component<
                     />
                     <SummaryCardItem
                       label="Indexes"
-                      value={_.join(this.props.details.indexNames, ", ")}
+                      value={this.props.details.indexNames.join(", ")}
                       className={cx("database-table-page__indexes--value")}
                     />
                   </SummaryCard>
@@ -391,7 +490,7 @@ export class DatabaseTablePage extends React.Component<
                     <div className={cx("index-stats__reset-info")}>
                       <Tooltip
                         placement="bottom"
-                        title="Index stats accumulate from the time they were last cleared. Clicking ‘Reset all index stats’ will reset index stats for the entire cluster."
+                        title="Index stats accumulate from the time the index was created or had its stats reset. Clicking ‘Reset all index stats’ will reset index stats for the entire cluster."
                       >
                         <div
                           className={cx("index-stats__last-reset", "underline")}
@@ -429,7 +528,7 @@ export class DatabaseTablePage extends React.Component<
                 </SummaryCard>
               </Row>
             </TabPane>
-            <TabPane tab="Grants" key="grants">
+            <TabPane tab="Grants" key="grants" className={cx("tab-pane")}>
               <DatabaseTableGrantsTable
                 data={this.props.details.grants}
                 columns={this.grantsColumns}

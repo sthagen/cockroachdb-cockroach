@@ -52,11 +52,12 @@ type storage struct {
 
 var _ protectedts.Storage = (*storage)(nil)
 
+// TODO(adityamaru): Delete in 22.2.
 func useDeprecatedProtectedTSStorage(
 	ctx context.Context, st *cluster.Settings, knobs *protectedts.TestingKnobs,
 ) bool {
 	return !st.Version.IsActive(ctx, clusterversion.AlterSystemProtectedTimestampAddColumn) ||
-		!knobs.EnableProtectedTimestampForMultiTenant
+		knobs.DisableProtectedTimestampForMultiTenant
 }
 
 // New creates a new Storage.
@@ -169,7 +170,8 @@ func (p *storage) Protect(ctx context.Context, txn *kv.Txn, r *ptpb.Record) erro
 	// already verified that the record has a valid `target`.
 	r.DeprecatedSpans = nil
 	s := makeSettings(p.settings)
-	encodedTarget, err := protoutil.Marshal(&ptpb.Target{Union: r.Target.GetUnion()})
+	encodedTarget, err := protoutil.Marshal(&ptpb.Target{Union: r.Target.GetUnion(),
+		IgnoreIfExcludedFromBackup: r.Target.IgnoreIfExcludedFromBackup})
 	if err != nil { // how can this possibly fail?
 		return errors.Wrap(err, "failed to marshal spans")
 	}

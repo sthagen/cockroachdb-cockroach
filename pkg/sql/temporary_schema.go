@@ -255,7 +255,7 @@ func cleanupSchemaObjects(
 	tblDescsByID := make(map[descpb.ID]catalog.TableDescriptor, len(tbNames))
 	tblNamesByID := make(map[descpb.ID]tree.TableName, len(tbNames))
 	for i, tbName := range tbNames {
-		desc, err := descsCol.MustGetTableDescByID(ctx, txn, tbIDs[i])
+		desc, err := descsCol.Direct().MustGetTableDescByID(ctx, txn, tbIDs[i])
 		if err != nil {
 			return err
 		}
@@ -313,11 +313,11 @@ func cleanupSchemaObjects(
 					if _, ok := tblDescsByID[d.ID]; ok {
 						return nil
 					}
-					dTableDesc, err := descsCol.MustGetTableDescByID(ctx, txn, d.ID)
+					dTableDesc, err := descsCol.Direct().MustGetTableDescByID(ctx, txn, d.ID)
 					if err != nil {
 						return err
 					}
-					db, err := descsCol.MustGetDatabaseDescByID(ctx, txn, dTableDesc.GetParentID())
+					db, err := descsCol.Direct().MustGetDatabaseDescByID(ctx, txn, dTableDesc.GetParentID())
 					if err != nil {
 						return err
 					}
@@ -521,7 +521,7 @@ func (c *TemporaryObjectCleaner) doTemporaryObjectCleanup(
 	waitTimeForCreation := TempObjectWaitInterval.Get(&c.settings.SV)
 	// Build a set of all databases with temporary objects.
 	var allDbDescs []catalog.DatabaseDescriptor
-	descsCol := c.collectionFactory.NewCollection(nil /* temporarySchemaProvider */)
+	descsCol := c.collectionFactory.NewCollection(ctx, nil /* TemporarySchemaProvider */)
 	if err := retryFunc(ctx, func() error {
 		var err error
 		allDbDescs, err = descsCol.GetAllDatabaseDescriptors(ctx, txn)

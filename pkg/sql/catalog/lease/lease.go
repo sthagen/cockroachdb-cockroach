@@ -123,7 +123,8 @@ func (m *Manager) WaitForOneVersion(
 ) (desc catalog.Descriptor, _ error) {
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
 		if err := m.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			desc, err = catkv.MustGetDescriptorByID(ctx, txn, m.Codec(), id, catalog.Any)
+			version := m.storage.settings.Version.ActiveVersion(ctx)
+			desc, err = catkv.MustGetDescriptorByID(ctx, version, m.Codec(), txn, nil /* vd */, id, catalog.Any)
 			return err
 		}); err != nil {
 			return nil, err
@@ -475,11 +476,8 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		// of the first context cancels other callers to the `acquireNodeLease()` method,
 		// because of its use of `singleflight.Group`. See issue #41780 for how this has
 		// happened.
-		baseCtx := m.ambientCtx.AnnotateCtx(context.Background())
-		// AddTags and not WithTags, so that we combine the tags with those
-		// filled by AnnotateCtx.
-		baseCtx = logtags.AddTags(baseCtx, logtags.FromContext(ctx))
-		newCtx, cancel := m.stopper.WithCancelOnQuiesce(baseCtx)
+		lt := logtags.FromContext(ctx)
+		ctx, cancel := m.stopper.WithCancelOnQuiesce(logtags.AddTags(m.ambientCtx.AnnotateCtx(context.Background()), lt))
 		defer cancel()
 		if m.isDraining() {
 			return nil, errors.New("cannot acquire lease when draining")
@@ -489,7 +487,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		if newest != nil {
 			minExpiration = newest.getExpiration()
 		}
-		desc, expiration, err := m.storage.acquire(newCtx, minExpiration, id)
+		desc, expiration, err := m.storage.acquire(ctx, minExpiration, id)
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +496,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		t.mu.takenOffline = false
 		defer t.mu.Unlock()
 		var newDescVersionState *descriptorVersionState
-		newDescVersionState, toRelease, err = t.upsertLeaseLocked(newCtx, desc, expiration)
+		newDescVersionState, toRelease, err = t.upsertLeaseLocked(ctx, desc, expiration)
 		if err != nil {
 			return nil, err
 		}
@@ -545,7 +543,7 @@ func releaseLease(ctx context.Context, lease *storedLease, m *Manager) {
 
 // purgeOldVersions removes old unused descriptor versions older than
 // minVersion and releases any associated leases.
-// If takenOffline is set, minVersion is ignored; no lease is acquired and all
+// If dropped is set, minVersion is ignored; no lease is acquired and all
 // existing unused versions are removed. The descriptor is further marked dropped,
 // which will cause existing in-use leases to be eagerly released once
 // they're not in use any more.
@@ -638,7 +636,7 @@ type Manager struct {
 	storage          storage
 	mu               struct {
 		syncutil.Mutex
-		//TODO(james): Track size of leased descriptors in memory.
+		// TODO(james): Track size of leased descriptors in memory.
 		descriptors map[descpb.ID]*descriptorState
 
 		// updatesResolvedTimestamp keeps track of a timestamp before which all
@@ -724,6 +722,9 @@ func NameMatchesDescriptor(
 // findNewest returns the newest descriptor version state for the ID.
 func (m *Manager) findNewest(id descpb.ID) *descriptorVersionState {
 	t := m.findDescriptorState(id, false /* create */)
+	if t == nil {
+		return nil
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.mu.active.findNewest()

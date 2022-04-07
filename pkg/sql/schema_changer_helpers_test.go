@@ -31,7 +31,9 @@ func (sc *SchemaChanger) TestingDistIndexBackfill(
 	addedIndexes []descpb.IndexID,
 	filter backfill.MutationFilter,
 ) error {
-	return sc.distIndexBackfill(ctx, version, targetSpans, addedIndexes, filter)
+	s := &multiStageFractionScaler{initial: 0.0, stages: backfillStageFractions}
+	err := sc.distIndexBackfill(ctx, version, targetSpans, addedIndexes, true, filter, s)
+	return err
 }
 
 // SetJob sets the job.

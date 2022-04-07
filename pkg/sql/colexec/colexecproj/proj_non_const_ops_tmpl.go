@@ -28,13 +28,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexeccmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -100,15 +102,17 @@ type projOpBase struct {
 type _OP_NAME struct {
 	projOpBase
 	// {{if .NeedsBinaryOverloadHelper}}
-	execgen.BinaryOverloadHelper
+	colexecbase.BinaryOverloadHelper
 	// {{end}}
 }
 
 func (p _OP_NAME) Next() coldata.Batch {
 	// {{if .NeedsBinaryOverloadHelper}}
-	// In order to inline the templated code of the binary overloads operating
-	// on datums, we need to have a `_overloadHelper` local variable of type
-	// `execgen.BinaryOverloadHelper`.
+	// {{/*
+	//     In order to inline the templated code of the binary overloads
+	//     operating on datums, we need to have a `_overloadHelper` local
+	//     variable of type `colexecbase.BinaryOverloadHelper`.
+	// */}}
 	_overloadHelper := p.BinaryOverloadHelper
 	// {{end}}
 	batch := p.Input.Next()
@@ -118,11 +122,6 @@ func (p _OP_NAME) Next() coldata.Batch {
 	}
 	projVec := batch.ColVec(p.outputIdx)
 	p.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
-		if projVec.MaybeHasNulls() {
-			// We need to make sure that there are no left over null values in the
-			// output vector.
-			projVec.Nulls().UnsetNulls()
-		}
 		projCol := projVec._RET_TYP()
 		vec1 := batch.ColVec(p.col1Idx)
 		vec2 := batch.ColVec(p.col2Idx)
@@ -138,9 +137,6 @@ func (p _OP_NAME) Next() coldata.Batch {
 		} else {
 			_SET_PROJECTION(false)
 		}
-		// Although we didn't change the length of the batch, it is necessary to set
-		// the length anyway (this helps maintaining the invariant of flat bytes).
-		batch.SetLength(n)
 	})
 	return batch
 }
@@ -269,10 +265,10 @@ func GetProjectionOperator(
 
 	leftType, rightType := inputTypes[col1Idx], inputTypes[col2Idx]
 	switch op := op.(type) {
-	case tree.BinaryOperator:
+	case treebin.BinaryOperator:
 		switch op.Symbol {
 		// {{range .BinOps}}
-		case tree._NAME:
+		case treebin._NAME:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:
@@ -287,7 +283,7 @@ func GetProjectionOperator(
 						case _RIGHT_TYPE_WIDTH:
 							op := &_OP_NAME{projOpBase: projOpBase}
 							// {{if .NeedsBinaryOverloadHelper}}
-							op.BinaryOverloadHelper = execgen.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
+							op.BinaryOverloadHelper = colexecbase.BinaryOverloadHelper{BinFn: binFn, EvalCtx: evalCtx}
 							// {{end}}
 							return op, nil
 							// {{end}}
@@ -300,14 +296,14 @@ func GetProjectionOperator(
 			}
 			// {{end}}
 		}
-	case tree.ComparisonOperator:
+	case treecmp.ComparisonOperator:
 		if leftType.Family() != types.TupleFamily && rightType.Family() != types.TupleFamily {
 			// Tuple comparison has special null-handling semantics, so we will
 			// fallback to the default comparison operator if either of the
 			// input vectors is of a tuple type.
 			switch op.Symbol {
 			// {{range .CmpOps}}
-			case tree._NAME:
+			case treecmp._NAME:
 				switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 				// {{range .LeftFamilies}}
 				case _LEFT_CANONICAL_TYPE_FAMILY:

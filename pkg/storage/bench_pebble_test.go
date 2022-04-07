@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -32,7 +33,8 @@ func setupMVCCPebble(b testing.TB, dir string) Engine {
 	peb, err := Open(
 		context.Background(),
 		Filesystem(dir),
-		CacheSize(testCacheSize))
+		CacheSize(testCacheSize),
+		Settings(cluster.MakeTestingClusterSettings()))
 	if err != nil {
 		b.Fatalf("could not create new pebble instance at %s: %+v", dir, err)
 	}
@@ -387,7 +389,7 @@ func BenchmarkBatchBuilderPut(b *testing.B) {
 		for j := i; j < end; j++ {
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(j)))
 			ts := hlc.Timestamp{WallTime: int64(j)}
-			require.NoError(b, batch.Set(EncodeKey(MVCCKey{key, ts}), value, nil /* WriteOptions */))
+			require.NoError(b, batch.Set(EncodeMVCCKey(MVCCKey{key, ts}), value, nil /* WriteOptions */))
 		}
 		batch.Reset()
 	}

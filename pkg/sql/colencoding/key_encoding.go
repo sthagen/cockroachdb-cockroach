@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // DecodeKeyValsToCols decodes the values that are part of the key, writing the
@@ -49,14 +49,12 @@ func DecodeKeyValsToCols(
 	rowIdx int,
 	indexColIdx []int,
 	checkAllColsForNull bool,
-	types []*types.T,
-	directions []descpb.IndexDescriptor_Direction,
+	keyCols []descpb.IndexFetchSpec_KeyColumn,
 	unseen *util.FastIntSet,
 	key []byte,
-	invertedColIdx int,
 	scratch []byte,
 ) (remainingKey []byte, foundNull bool, retScratch []byte, _ error) {
-	for j := range types {
+	for j := range keyCols {
 		var err error
 		vecIdx := indexColIdx[j]
 		if vecIdx == -1 {
@@ -71,8 +69,11 @@ func DecodeKeyValsToCols(
 				unseen.Remove(vecIdx)
 			}
 			var isNull bool
-			isInverted := invertedColIdx == vecIdx
-			key, isNull, scratch, err = decodeTableKeyToCol(da, vecs, vecIdx, rowIdx, types[j], key, directions[j], isInverted, scratch)
+			key, isNull, scratch, err = decodeTableKeyToCol(
+				da, vecs, vecIdx, rowIdx,
+				keyCols[j].Type, key, keyCols[j].Direction,
+				scratch,
+			)
 			foundNull = isNull || foundNull
 		}
 		if err != nil {
@@ -94,11 +95,10 @@ func decodeTableKeyToCol(
 	valType *types.T,
 	key []byte,
 	dir descpb.IndexDescriptor_Direction,
-	isInverted bool,
 	scratch []byte,
 ) (_ []byte, _ bool, retScratch []byte, _ error) {
 	if (dir != descpb.IndexDescriptor_ASC) && (dir != descpb.IndexDescriptor_DESC) {
-		return nil, false, scratch, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
+		return nil, false, scratch, errors.AssertionFailedf("invalid direction: %d", redact.Safe(dir))
 	}
 	var isNull bool
 	if key, isNull = encoding.DecodeIfNull(key); isNull {
@@ -109,17 +109,6 @@ func decodeTableKeyToCol(
 	// Find the position of the target vector among the typed columns of its
 	// type.
 	colIdx := vecs.ColsMap[vecIdx]
-
-	// Inverted columns should not be decoded, but should instead be
-	// passed on as a DBytes datum.
-	if isInverted {
-		keyLen, err := encoding.PeekLength(key)
-		if err != nil {
-			return nil, false, scratch, err
-		}
-		vecs.BytesCols[colIdx].Set(rowIdx, key[:keyLen])
-		return key[keyLen:], false, scratch, nil
-	}
 
 	var rkey []byte
 	var err error
@@ -201,6 +190,14 @@ func decodeTableKeyToCol(
 		jsonLen, err = encoding.PeekLength(key)
 		vecs.JSONCols[colIdx].Bytes.Set(rowIdx, key[:jsonLen])
 		rkey = key[jsonLen:]
+	case types.EncodedKeyFamily:
+		// Don't attempt to decode the inverted key.
+		keyLen, err := encoding.PeekLength(key)
+		if err != nil {
+			return nil, false, scratch, err
+		}
+		vecs.BytesCols[colIdx].Set(rowIdx, key[:keyLen])
+		rkey = key[keyLen:]
 	default:
 		var d tree.Datum
 		encDir := encoding.Ascending

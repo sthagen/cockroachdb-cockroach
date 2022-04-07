@@ -16,15 +16,22 @@ import (
 	"go/constant"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
@@ -42,6 +49,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -50,6 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
+	pbtypes "github.com/gogo/protobuf/types"
 	"github.com/lib/pq/oid"
 )
 
@@ -158,7 +168,7 @@ func getSchemaForCreateTable(
 		return nil, err
 	}
 
-	desc, err := params.p.Descriptors().GetDescriptorCollidingWithObject(
+	desc, err := params.p.Descriptors().Direct().GetDescriptorCollidingWithObject(
 		params.ctx,
 		params.p.txn,
 		db.GetID(),
@@ -365,9 +375,9 @@ func (n *createTableNode) startExec(params runParams) error {
 			return err
 		}
 
-		// If we have an implicit txn we want to run CTAS async, and consequently
-		// ensure it gets queued as a SchemaChange.
-		if params.p.ExtendedEvalContext().TxnImplicit {
+		// If we have a single statement txn we want to run CTAS async, and
+		// consequently ensure it gets queued as a SchemaChange.
+		if params.extendedEvalCtx.TxnIsSingleStmt {
 			desc.State = descpb.DescriptorState_ADD
 		}
 	} else {
@@ -490,9 +500,9 @@ func (n *createTableNode) startExec(params runParams) error {
 		return err
 	}
 
-	// If we are in an explicit txn or the source has placeholders, we execute the
-	// CTAS query synchronously.
-	if n.n.As() && !params.p.ExtendedEvalContext().TxnImplicit {
+	// If we are in a multi-statement txn or the source has placeholders, we
+	// execute the CTAS query synchronously.
+	if n.n.As() && !params.extendedEvalCtx.TxnIsSingleStmt {
 		err = func() error {
 			// The data fill portion of CREATE AS must operate on a read snapshot,
 			// so that it doesn't end up observing its own writes.
@@ -764,13 +774,14 @@ func ResolveUniqueWithoutIndexConstraint(
 	}
 
 	uc := descpb.UniqueWithoutIndexConstraint{
-		Name:      constraintName,
-		TableID:   tbl.ID,
-		ColumnIDs: columnIDs,
-		Predicate: predicate,
-		Validity:  validity,
+		Name:         constraintName,
+		TableID:      tbl.ID,
+		ColumnIDs:    columnIDs,
+		Predicate:    predicate,
+		Validity:     validity,
+		ConstraintID: tbl.NextConstraintID,
 	}
-
+	tbl.NextConstraintID++
 	if ts == NewTable {
 		tbl.UniqueWithoutIndexConstraints = append(tbl.UniqueWithoutIndexConstraints, uc)
 	} else {
@@ -1023,8 +1034,9 @@ func ResolveFK(
 		OnDelete:            descpb.ForeignKeyReferenceActionValue[d.Actions.Delete],
 		OnUpdate:            descpb.ForeignKeyReferenceActionValue[d.Actions.Update],
 		Match:               descpb.CompositeKeyMatchMethodValue[d.Match],
+		ConstraintID:        tbl.NextConstraintID,
 	}
-
+	tbl.NextConstraintID++
 	if ts == NewTable {
 		tbl.OutboundFKs = append(tbl.OutboundFKs, ref)
 		target.InboundFKs = append(target.InboundFKs, ref)
@@ -1042,12 +1054,12 @@ func CreatePartitioning(
 	ctx context.Context,
 	st *cluster.Settings,
 	evalCtx *tree.EvalContext,
-	tableDesc *tabledesc.Mutable,
+	tableDesc catalog.TableDescriptor,
 	indexDesc descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
 	allowedNewColumnNames []tree.Name,
 	allowImplicitPartitioning bool,
-) (newImplicitCols []catalog.Column, newPartitioning descpb.PartitioningDescriptor, err error) {
+) (newImplicitCols []catalog.Column, newPartitioning catpb.PartitioningDescriptor, err error) {
 	if partBy == nil {
 		if indexDesc.Partitioning.NumImplicitColumns > 0 {
 			return nil, newPartitioning, unimplemented.Newf(
@@ -1060,7 +1072,15 @@ func CreatePartitioning(
 		return nil, newPartitioning, nil
 	}
 	return CreatePartitioningCCL(
-		ctx, st, evalCtx, tableDesc, indexDesc, partBy, allowedNewColumnNames, allowImplicitPartitioning,
+		ctx,
+		st,
+		evalCtx,
+		tableDesc.FindColumnWithName,
+		int(indexDesc.Partitioning.NumImplicitColumns),
+		indexDesc.KeyColumnNames,
+		partBy,
+		allowedNewColumnNames,
+		allowImplicitPartitioning,
 	)
 }
 
@@ -1070,13 +1090,14 @@ var CreatePartitioningCCL = func(
 	ctx context.Context,
 	st *cluster.Settings,
 	evalCtx *tree.EvalContext,
-	tableDesc *tabledesc.Mutable,
-	indexDesc descpb.IndexDescriptor,
+	columnLookupFn func(tree.Name) (catalog.Column, error),
+	oldNumImplicitColumns int,
+	oldKeyColumnNames []string,
 	partBy *tree.PartitionBy,
 	allowedNewColumnNames []tree.Name,
 	allowImplicitPartitioning bool,
-) (newImplicitCols []catalog.Column, newPartitioning descpb.PartitioningDescriptor, err error) {
-	return nil, descpb.PartitioningDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
+) (newImplicitCols []catalog.Column, newPartitioning catpb.PartitioningDescriptor, err error) {
+	return nil, catpb.PartitioningDescriptor{}, sqlerrors.NewCCLRequiredError(errors.New(
 		"creating or manipulating partitions requires a CCL binary"))
 }
 
@@ -1140,9 +1161,13 @@ func newTableDescIfAs(
 	id descpb.ID,
 	creationTime hlc.Timestamp,
 	resultColumns []colinfo.ResultColumn,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
 	evalContext *tree.EvalContext,
 ) (desc *tabledesc.Mutable, err error) {
+	if err := validateUniqueConstraintParamsForCreateTableAs(p); err != nil {
+		return nil, err
+	}
+
 	colResIndex := 0
 	// TableDefs for a CREATE TABLE ... AS AST node comprise of a ColumnTableDef
 	// for each column, and a ConstraintTableDef for any constraints on those
@@ -1225,6 +1250,10 @@ func NewTableDescOptionBypassLocalityOnNonMultiRegionDatabaseCheck() NewTableDes
 // semaCtx can be nil if the table to be created has no default expression on
 // any of the columns and no check constraints.
 //
+// regionConfig indicates if the table is being created in a multi-region db.
+// A non-nil regionConfig represents the region configuration of a multi-region
+// db. A nil regionConfig means current db is not multi-regional.
+//
 // The caller must also ensure that the SchemaResolver is configured
 // to bypass caching and enable visibility of just-added descriptors.
 // This is used to resolve sequence and FK dependencies. Also see the
@@ -1245,7 +1274,7 @@ func NewTableDesc(
 	id descpb.ID,
 	regionConfig *multiregion.RegionConfig,
 	creationTime hlc.Timestamp,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
 	affected map[descpb.ID]*tabledesc.Mutable,
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
@@ -1275,12 +1304,12 @@ func NewTableDesc(
 		semaCtx,
 		evalCtx,
 		n.StorageParams,
-		&paramparse.TableStorageParamObserver{},
+		paramparse.NewTableStorageParamObserver(&desc),
 	); err != nil {
 		return nil, err
 	}
 
-	indexEncodingVersion := descpb.LatestNonPrimaryIndexDescriptorVersion
+	indexEncodingVersion := descpb.StrictIndexColumnIDGuaranteesVersion
 	isRegionalByRow := n.Locality != nil && n.Locality.LocalityLevel == tree.LocalityLevelRow
 
 	var partitionAllBy *tree.PartitionBy
@@ -1296,6 +1325,7 @@ func NewTableDesc(
 		)
 	}
 
+	// PARTITION BY and PARTITION ALL BY are not supported in multi-regional table.
 	if n.Locality != nil || regionConfig != nil {
 		// Check PARTITION BY is not set on any column, index or table definition.
 		if n.PartitionByTable.ContainsPartitioningClause() {
@@ -1411,6 +1441,41 @@ func NewTableDesc(
 		primaryIndexColumnSet[string(regionalByRowCol)] = struct{}{}
 	}
 
+	// Create the TTL column if one does not already exist.
+	if ttl := desc.GetRowLevelTTL(); ttl != nil {
+		if err := checkTTLEnabledForCluster(ctx, st); err != nil {
+			return nil, err
+		}
+		hasRowLevelTTLColumn := false
+		for _, def := range n.Defs {
+			switch def := def.(type) {
+			case *tree.ColumnTableDef:
+				if def.Name == colinfo.TTLDefaultExpirationColumnName {
+					// If we find the column, make sure it has the expected type.
+					if def.Type.SQLString() != types.TimestampTZ.SQLString() {
+						return nil, pgerror.Newf(
+							pgcode.InvalidTableDefinition,
+							`table %s has TTL defined, but column %s is not a %s`,
+							def.Name,
+							colinfo.TTLDefaultExpirationColumnName,
+							types.TimestampTZ.SQLString(),
+						)
+					}
+					hasRowLevelTTLColumn = true
+					break
+				}
+			}
+		}
+		if !hasRowLevelTTLColumn {
+			col, err := rowLevelTTLAutomaticColumnDef(ttl)
+			if err != nil {
+				return nil, err
+			}
+			n.Defs = append(n.Defs, col)
+			cdd = append(cdd, nil)
+		}
+	}
+
 	if n.PartitionByTable.ContainsPartitioningClause() {
 		// Table PARTITION BY columns are always part of the primary index
 		// column set.
@@ -1468,20 +1533,11 @@ func NewTableDesc(
 					)
 				}
 			}
-			if err := checkTypeIsSupported(ctx, st, defType); err != nil {
-				return nil, err
-			}
 			if d.PrimaryKey.Sharded {
-				if !sessionData.HashShardedIndexesEnabled {
-					return nil, hashShardedIndexesDisabledError
+				if n.PartitionByTable.ContainsPartitions() && !n.PartitionByTable.All {
+					return nil, pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes cannot be explicitly partitioned")
 				}
-				if isRegionalByRow {
-					return nil, hashShardedIndexesOnRegionalByRowError()
-				}
-				if n.PartitionByTable.ContainsPartitions() {
-					return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
-				}
-				buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
+				buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.PrimaryKey.ShardBuckets, d.PrimaryKey.StorageParams)
 				if err != nil {
 					return nil, err
 				}
@@ -1594,24 +1650,30 @@ func NewTableDesc(
 	setupShardedIndexForNewTable := func(
 		d tree.IndexTableDef, idx *descpb.IndexDescriptor,
 	) (columns tree.IndexElemList, _ error) {
-		if n.PartitionByTable.ContainsPartitions() {
-			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
+		if d.PartitionByIndex.ContainsPartitions() {
+			return nil, pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes cannot be explicitly partitioned")
+		}
+		if desc.IsPartitionAllBy() && anyColumnIsPartitioningField(d.Columns, partitionAllBy) {
+			return nil, pgerror.New(
+				pgcode.FeatureNotSupported,
+				`hash sharded indexes cannot include implicit partitioning columns from "PARTITION ALL BY" or "LOCALITY REGIONAL BY ROW"`,
+			)
 		}
 		shardCol, newColumns, err := setupShardedIndex(
 			ctx,
 			evalCtx,
 			semaCtx,
-			sessionData.HashShardedIndexesEnabled,
 			d.Columns,
 			d.Sharded.ShardBuckets,
 			&desc,
 			idx,
+			d.StorageParams,
 			true /* isNewTable */)
 		if err != nil {
 			return nil, err
 		}
 
-		buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.Sharded.ShardBuckets)
+		buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.Sharded.ShardBuckets, d.StorageParams)
 		if err != nil {
 			return nil, err
 		}
@@ -1692,8 +1754,6 @@ func NewTableDesc(
 				d.Inverted,
 				true, /* isNewTable */
 				semaCtx,
-				evalCtx,
-				sessionData,
 			); err != nil {
 				return nil, err
 			}
@@ -1707,9 +1767,6 @@ func NewTableDesc(
 			}
 			columns := d.Columns
 			if d.Sharded != nil {
-				if isRegionalByRow {
-					return nil, hashShardedIndexesOnRegionalByRowError()
-				}
 				var err error
 				columns, err = setupShardedIndexForNewTable(*d, &idx)
 				if err != nil {
@@ -1735,37 +1792,37 @@ func NewTableDesc(
 					idx.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
 				}
 			}
-			if d.PartitionByIndex.ContainsPartitioningClause() || desc.PartitionAllBy {
-				partitionBy := partitionAllBy
-				if !desc.PartitionAllBy {
-					if d.PartitionByIndex.ContainsPartitions() {
-						partitionBy = d.PartitionByIndex.PartitionBy
-					}
-				} else if d.PartitionByIndex.ContainsPartitioningClause() {
-					return nil, pgerror.New(
-						pgcode.FeatureNotSupported,
-						"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
-					)
-				}
 
-				if partitionBy != nil {
-					var err error
-					newImplicitCols, newPartitioning, err := CreatePartitioning(
-						ctx,
-						st,
-						evalCtx,
-						&desc,
-						idx,
-						partitionBy,
-						nil, /* allowedNewColumnNames */
-						allowImplicitPartitioning,
-					)
-					if err != nil {
-						return nil, err
-					}
-					tabledesc.UpdateIndexPartitioning(&idx, false /* isIndexPrimary */, newImplicitCols, newPartitioning)
-				}
+			var idxPartitionBy *tree.PartitionBy
+			if desc.PartitionAllBy && d.PartitionByIndex.ContainsPartitions() {
+				return nil, pgerror.New(
+					pgcode.FeatureNotSupported,
+					"cannot define PARTITION BY on an index if the table is implicitly partitioned with PARTITION ALL BY or LOCALITY REGIONAL BY ROW definition",
+				)
 			}
+			if desc.PartitionAllBy {
+				idxPartitionBy = partitionAllBy
+			} else if d.PartitionByIndex.ContainsPartitions() {
+				idxPartitionBy = d.PartitionByIndex.PartitionBy
+			}
+			if idxPartitionBy != nil {
+				var err error
+				newImplicitCols, newPartitioning, err := CreatePartitioning(
+					ctx,
+					st,
+					evalCtx,
+					&desc,
+					idx,
+					idxPartitionBy,
+					nil, /* allowedNewColumnNames */
+					allowImplicitPartitioning,
+				)
+				if err != nil {
+					return nil, err
+				}
+				tabledesc.UpdateIndexPartitioning(&idx, false /* isIndexPrimary */, newImplicitCols, newPartitioning)
+			}
+
 			if d.Predicate != nil {
 				expr, err := schemaexpr.ValidatePartialIndexPredicate(
 					ctx, &desc, d.Predicate, &n.Table, semaCtx,
@@ -1812,8 +1869,6 @@ func NewTableDesc(
 				false, /* isInverted */
 				true,  /* isNewTable */
 				semaCtx,
-				evalCtx,
-				sessionData,
 			); err != nil {
 				return nil, err
 			}
@@ -1825,8 +1880,11 @@ func NewTableDesc(
 			}
 			columns := d.Columns
 			if d.Sharded != nil {
-				if isRegionalByRow {
-					return nil, hashShardedIndexesOnRegionalByRowError()
+				if d.PrimaryKey && n.PartitionByTable.ContainsPartitions() && !n.PartitionByTable.All {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"hash sharded indexes cannot be explicitly partitioned",
+					)
 				}
 				var err error
 				columns, err = setupShardedIndexForNewTable(d.IndexTableDef, &idx)
@@ -1847,20 +1905,21 @@ func NewTableDesc(
 			// We should only do partitioning of non-primary indexes at this point -
 			// the PRIMARY KEY CreatePartitioning is done at the of CreateTable, so
 			// avoid the duplicate work.
-			if !d.PrimaryKey && (d.PartitionByIndex.ContainsPartitioningClause() || desc.PartitionAllBy) {
-				partitionBy := partitionAllBy
-				if !desc.PartitionAllBy {
-					if d.PartitionByIndex.ContainsPartitions() {
-						partitionBy = d.PartitionByIndex.PartitionBy
-					}
-				} else if d.PartitionByIndex.ContainsPartitioningClause() {
+			if !d.PrimaryKey {
+				if desc.PartitionAllBy && d.PartitionByIndex.ContainsPartitions() {
 					return nil, pgerror.New(
 						pgcode.FeatureNotSupported,
-						"cannot define PARTITION BY on an unique constraint if the table has a PARTITION ALL BY definition",
+						"cannot define PARTITION BY on an unique constraint if the table is implicitly partitioned with PARTITION ALL BY or LOCALITY REGIONAL BY ROW definition",
 					)
 				}
+				var idxPartitionBy *tree.PartitionBy
+				if desc.PartitionAllBy {
+					idxPartitionBy = partitionAllBy
+				} else if d.PartitionByIndex.ContainsPartitions() {
+					idxPartitionBy = d.PartitionByIndex.PartitionBy
+				}
 
-				if partitionBy != nil {
+				if idxPartitionBy != nil {
 					var err error
 					newImplicitCols, newPartitioning, err := CreatePartitioning(
 						ctx,
@@ -1868,7 +1927,7 @@ func NewTableDesc(
 						evalCtx,
 						&desc,
 						idx,
-						partitionBy,
+						idxPartitionBy,
 						nil, /* allowedNewColumnNames */
 						allowImplicitPartitioning,
 					)
@@ -1936,8 +1995,8 @@ func NewTableDesc(
 			desc.AddFamily(fam)
 		}
 	}
-
-	if err := desc.AllocateIDs(ctx); err != nil {
+	version := st.Version.ActiveVersionOrEmpty(ctx)
+	if err := desc.AllocateIDs(ctx, version); err != nil {
 		return nil, err
 	}
 
@@ -2113,8 +2172,19 @@ func NewTableDesc(
 	// happens to work in gc, but does not work in gccgo.
 	//
 	// See https://github.com/golang/go/issues/23188.
-	if err := desc.AllocateIDs(ctx); err != nil {
+	if err := desc.AllocateIDs(ctx, version); err != nil {
 		return nil, err
+	}
+
+	// Note that due to historical reasons, the automatic creation of the primary
+	// index occurs in AllocateIDs. That call does not have access to the current
+	// timestamp to set the created_at timestamp.
+	if desc.IsPhysicalTable() && !catalog.IsSystemDescriptor(&desc) {
+		ts := evalCtx.GetTxnTimestamp(time.Microsecond).UnixNano()
+		_ = catalog.ForEachNonDropIndex(&desc, func(idx catalog.Index) error {
+			idx.IndexDesc().CreatedAtNanos = ts
+			return nil
+		})
 	}
 
 	// Record the types of indexes that the table has.
@@ -2125,10 +2195,10 @@ func NewTableDesc(
 		if idx.GetType() == descpb.IndexDescriptor_INVERTED {
 			telemetry.Inc(sqltelemetry.InvertedIndexCounter)
 			geoConfig := idx.GetGeoConfig()
-			if !geoindex.IsEmptyConfig(&geoConfig) {
-				if geoindex.IsGeographyConfig(&geoConfig) {
+			if !geoConfig.IsEmpty() {
+				if geoConfig.IsGeography() {
 					telemetry.Inc(sqltelemetry.GeographyInvertedIndexCounter)
-				} else if geoindex.IsGeometryConfig(&geoConfig) {
+				} else if geoConfig.IsGeometry() {
 					telemetry.Inc(sqltelemetry.GeometryInvertedIndexCounter)
 				}
 			}
@@ -2182,9 +2252,13 @@ func newTableDesc(
 	sc catalog.SchemaDescriptor,
 	id descpb.ID,
 	creationTime hlc.Timestamp,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
 	affected map[descpb.ID]*tabledesc.Mutable,
 ) (ret *tabledesc.Mutable, err error) {
+	if err := validateUniqueConstraintParamsForCreateTable(n); err != nil {
+		return nil, err
+	}
+
 	newDefs, err := replaceLikeTableOpts(n, params)
 	if err != nil {
 		return nil, err
@@ -2238,6 +2312,9 @@ func newTableDesc(
 			n.Persistence,
 		)
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	// We need to ensure sequence ownerships so that column owned sequences are
 	// correctly dropped when a column/table is dropped.
@@ -2250,7 +2327,122 @@ func newTableDesc(
 		}
 	}
 
-	return ret, err
+	// Row level TTL tables require a scheduled job to be created as well.
+	if ttl := ret.RowLevelTTL; ttl != nil {
+		j, err := CreateRowLevelTTLScheduledJob(
+			params.ctx,
+			params.ExecCfg(),
+			params.p.txn,
+			params.p.User(),
+			ret.GetID(),
+			ttl,
+		)
+		if err != nil {
+			return nil, err
+		}
+		ttl.ScheduleID = j.ScheduleID()
+	}
+	return ret, nil
+}
+
+// defaultTTLScheduleCron is the default cron duration for row-level TTL.
+// defaultTTLScheduleCron cannot be a cluster setting as this would involve
+// changing all existing schedules to match the new setting.
+const defaultTTLScheduleCron = "@hourly"
+
+// newRowLevelTTLScheduledJob returns a *jobs.ScheduledJob for row level TTL
+// for a given table.
+func newRowLevelTTLScheduledJob(
+	env scheduledjobs.JobSchedulerEnv,
+	owner security.SQLUsername,
+	tblID descpb.ID,
+	ttl *catpb.RowLevelTTL,
+) (*jobs.ScheduledJob, error) {
+	sj := jobs.NewScheduledJob(env)
+	sj.SetScheduleLabel(fmt.Sprintf("row-level-ttl-%d", tblID))
+	sj.SetOwner(owner)
+	sj.SetScheduleDetails(jobspb.ScheduleDetails{
+		Wait: jobspb.ScheduleDetails_WAIT,
+		// If a job fails, try again at the allocated cron time.
+		OnError: jobspb.ScheduleDetails_RETRY_SCHED,
+	})
+
+	if err := sj.SetSchedule(rowLevelTTLSchedule(ttl)); err != nil {
+		return nil, err
+	}
+	args := &catpb.ScheduledRowLevelTTLArgs{
+		TableID: tblID,
+	}
+	any, err := pbtypes.MarshalAny(args)
+	if err != nil {
+		return nil, err
+	}
+	sj.SetExecutionDetails(
+		tree.ScheduledRowLevelTTLExecutor.InternalName(),
+		jobspb.ExecutionArguments{Args: any},
+	)
+	return sj, nil
+}
+
+func rowLevelTTLSchedule(ttl *catpb.RowLevelTTL) string {
+	if override := ttl.DeletionCron; override != "" {
+		return override
+	}
+	return defaultTTLScheduleCron
+}
+
+func checkTTLEnabledForCluster(ctx context.Context, st *cluster.Settings) error {
+	if !st.Version.IsActive(ctx, clusterversion.RowLevelTTL) {
+		return pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"row level TTL is only available once the cluster is fully upgraded",
+		)
+	}
+	return nil
+}
+
+// CreateRowLevelTTLScheduledJob creates a new row-level TTL schedule.
+func CreateRowLevelTTLScheduledJob(
+	ctx context.Context,
+	execCfg *ExecutorConfig,
+	txn *kv.Txn,
+	owner security.SQLUsername,
+	tblID descpb.ID,
+	ttl *catpb.RowLevelTTL,
+) (*jobs.ScheduledJob, error) {
+	telemetry.Inc(sqltelemetry.RowLevelTTLCreated)
+	env := JobSchedulerEnv(execCfg)
+	j, err := newRowLevelTTLScheduledJob(env, owner, tblID, ttl)
+	if err != nil {
+		return nil, err
+	}
+	if err := j.Create(ctx, execCfg.InternalExecutor, txn); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+func rowLevelTTLAutomaticColumnDef(ttl *catpb.RowLevelTTL) (*tree.ColumnTableDef, error) {
+	def := &tree.ColumnTableDef{
+		Name:   colinfo.TTLDefaultExpirationColumnName,
+		Type:   types.TimestampTZ,
+		Hidden: true,
+	}
+	intervalExpr, err := parser.ParseExpr(string(ttl.DurationExpr))
+	if err != nil {
+		return nil, errors.Wrapf(err, "unexpected expression for TTL duration")
+	}
+	def.DefaultExpr.Expr = rowLevelTTLAutomaticColumnExpr(intervalExpr)
+	def.OnUpdateExpr.Expr = rowLevelTTLAutomaticColumnExpr(intervalExpr)
+	return def, nil
+}
+
+func rowLevelTTLAutomaticColumnExpr(intervalExpr tree.Expr) tree.Expr {
+	return &tree.BinaryExpr{
+		Operator: treebin.MakeBinaryOperator(treebin.Plus),
+		Left:     &tree.FuncExpr{Func: tree.WrapFunction("current_timestamp")},
+		Right:    intervalExpr,
+	}
 }
 
 // replaceLikeTableOps processes the TableDefs in the input CreateTableNode,
@@ -2467,7 +2659,7 @@ func makeShardColumnDesc(colNames []string, buckets int) (*descpb.ColumnDescript
 	col := &descpb.ColumnDescriptor{
 		Hidden:   true,
 		Nullable: false,
-		Type:     types.Int4,
+		Type:     types.Int,
 		Virtual:  true,
 	}
 	col.Name = tabledesc.GetShardColumnName(colNames, int32(buckets))
@@ -2488,7 +2680,7 @@ func makeShardCheckConstraintDef(
 	}
 	return &tree.CheckConstraintTableDef{
 		Expr: &tree.ComparisonExpr{
-			Operator: tree.MakeComparisonOperator(tree.In),
+			Operator: treecmp.MakeComparisonOperator(treecmp.In),
 			Left: &tree.ColumnItem{
 				ColumnName: tree.Name(shardCol.GetName()),
 			},
@@ -2582,22 +2774,6 @@ func regionalByRowDefaultColDef(
 	return c
 }
 
-func hashShardedIndexesOnRegionalByRowError() error {
-	return pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes are not compatible with REGIONAL BY ROW tables")
-}
-
-func checkTypeIsSupported(ctx context.Context, settings *cluster.Settings, typ *types.T) error {
-	version := settings.Version.ActiveVersionOrEmpty(ctx)
-	if supported := types.IsTypeSupportedInVersion(version, typ); !supported {
-		return pgerror.Newf(
-			pgcode.FeatureNotSupported,
-			"type %s is not supported until version upgrade is finalized",
-			typ.SQLString(),
-		)
-	}
-	return nil
-}
-
 // setSequenceOwner adds sequence id to the sequence id list owned by a column
 // and set ownership values of sequence options.
 func setSequenceOwner(
@@ -2624,5 +2800,61 @@ func setSequenceOwner(
 	seqDesc.SequenceOpts.SequenceOwner.OwnerTableID = table.ID
 	seqDesc.SequenceOpts.SequenceOwner.OwnerColumnID = col.GetID()
 
+	return nil
+}
+
+// validateUniqueConstraintParamsForCreateTable validate storage params of
+// unique constraints passed in through `CREATE TABLE` statement.
+func validateUniqueConstraintParamsForCreateTable(n *tree.CreateTable) error {
+	for _, def := range n.Defs {
+		switch d := def.(type) {
+		case *tree.ColumnTableDef:
+			if err := paramparse.ValidateUniqueConstraintParams(
+				d.PrimaryKey.StorageParams,
+				paramparse.UniqueConstraintParamContext{
+					IsPrimaryKey: true,
+					IsSharded:    d.PrimaryKey.Sharded,
+				}); err != nil {
+				return err
+			}
+		case *tree.UniqueConstraintTableDef:
+			if err := paramparse.ValidateUniqueConstraintParams(
+				d.IndexTableDef.StorageParams,
+				paramparse.UniqueConstraintParamContext{
+					IsPrimaryKey: d.PrimaryKey,
+					IsSharded:    d.Sharded != nil,
+				},
+			); err != nil {
+				return err
+			}
+		case *tree.IndexTableDef:
+			if d.Sharded == nil && d.StorageParams.GetVal(`bucket_count`) != nil {
+				return pgerror.New(
+					pgcode.InvalidParameterValue,
+					`"bucket_count" storage param should only be set with "USING HASH" for hash sharded index`,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+// validateUniqueConstraintParamsForCreateTableAs validate storage params of
+// unique constraints passed in through `CREATE TABLE...AS...` statement.
+func validateUniqueConstraintParamsForCreateTableAs(n *tree.CreateTable) error {
+	// TODO (issue 75896): enable storage parameters of primary key.
+	const errMsg = `storage parameters are not supported on primary key for CREATE TABLE...AS... statement`
+	for _, def := range n.Defs {
+		switch d := def.(type) {
+		case *tree.ColumnTableDef:
+			if len(d.PrimaryKey.StorageParams) > 0 {
+				return pgerror.New(pgcode.FeatureNotSupported, errMsg)
+			}
+		case *tree.UniqueConstraintTableDef:
+			if d.PrimaryKey && len(d.StorageParams) > 0 {
+				return pgerror.New(pgcode.FeatureNotSupported, errMsg)
+			}
+		}
+	}
 	return nil
 }

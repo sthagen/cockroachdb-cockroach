@@ -53,7 +53,7 @@ type Key int
 //     is as yet inactive. Consider the sender:
 //
 //      func invokeSomeRPC(req) {
-//	        if (specific-version is active) {
+//          if (specific-version is active) {
 //              // Like mentioned above, this implies that all nodes in the
 //              // cluster are running binaries that can handle this new
 //              // feature. We may have learned about this fact before the
@@ -63,9 +63,9 @@ type Key int
 //              // where that happens. Still, it's safe for us to enable the new
 //              // feature flags as we trust the recipient to know how to deal
 //              // with it.
-//		        req.NewFeatureFlag = true
-//	        }
-//	        send(req)
+//            req.NewFeatureFlag = true
+//          }
+//          send(req)
 //      }
 //
 //    And consider the recipient:
@@ -186,7 +186,7 @@ const (
 	// bundles when the query latency exceeds the user provided threshold.
 	AlterSystemStmtDiagReqs
 	// MVCCAddSSTable supports MVCC-compliant AddSSTable requests via the new
-	// WriteAtRequestTimestamp and DisallowConflicts parameters.
+	// SSTTimestampToRequestTimestamp and DisallowConflicts parameters.
 	MVCCAddSSTable
 	// InsertPublicSchemaNamespaceEntryOnRestore ensures all public schemas
 	// have an entry in system.namespace upon being restored.
@@ -251,6 +251,90 @@ const (
 	// EnableProtectedTimestampsForTenant enables the use of protected timestamps
 	// in secondary tenants.
 	EnableProtectedTimestampsForTenant
+	// DeleteCommentsWithDroppedIndexes cleans up left over comments that belong
+	// to dropped indexes.
+	DeleteCommentsWithDroppedIndexes
+	// RemoveIncompatibleDatabasePrivileges adds the migration which guarantees that
+	// databases do not have incompatible privileges
+	RemoveIncompatibleDatabasePrivileges
+	// AddRaftAppliedIndexTermMigration is a migration that causes each range
+	// replica to start populating RangeAppliedState.RaftAppliedIndexTerm field.
+	AddRaftAppliedIndexTermMigration
+	// PostAddRaftAppliedIndexTermMigration is used for asserting that
+	// RaftAppliedIndexTerm is populated.
+	PostAddRaftAppliedIndexTermMigration
+	// DontProposeWriteTimestampForLeaseTransfers stops setting the WriteTimestamp
+	// on lease transfer Raft proposals. New leaseholders now forward their clock
+	// directly to the new lease start time.
+	DontProposeWriteTimestampForLeaseTransfers
+	// TenantSettingsTable adds the system table for tracking tenant usage.
+	TenantSettingsTable
+	// EnablePebbleFormatVersionBlockProperties enables a new Pebble SSTable
+	// format version for block property collectors.
+	// NB: this cluster version is paired with PebbleFormatBlockPropertyCollector
+	// in a two-phase migration. The first cluster version acts as a gate for
+	// updating the format major version on all stores, while the second cluster
+	// version is used as a feature gate. A node in a cluster that sees the second
+	// version is guaranteed to have seen the first version, and therefore has an
+	// engine running at the required format major version, as do all other nodes
+	// in the cluster.
+	EnablePebbleFormatVersionBlockProperties
+	// DisableSystemConfigGossipTrigger is a follow-up to EnableSpanConfigStore
+	// to disable the data propagation mechanism it and the entire spanconfig
+	// infrastructure obviates.
+	DisableSystemConfigGossipTrigger
+	// MVCCIndexBackfiller supports MVCC-compliant index
+	// backfillers via a new BACKFILLING index state, delete
+	// preserving temporary indexes, and a post-backfill merging
+	// processing.
+	MVCCIndexBackfiller
+	// EnableLeaseHolderRemoval enables removing a leaseholder and transferring the lease
+	// during joint configuration, including to VOTER_INCOMING replicas.
+	EnableLeaseHolderRemoval
+	// BackupResolutionInJob defaults to resolving backup destinations during the
+	// execution of a backup job rather than during planning.
+	BackupResolutionInJob
+	// LooselyCoupledRaftLogTruncation allows the cluster to reduce the coupling
+	// for raft log truncation, by allowing each replica to treat a truncation
+	// proposal as an upper bound on what should be truncated.
+	LooselyCoupledRaftLogTruncation
+	// ChangefeedIdleness is the version where changefeed aggregators forward
+	// idleness-related information alnog with resolved spans to the frontier
+	ChangefeedIdleness
+	// BackupDoesNotOverwriteLatestAndCheckpoint is the version where we
+	// stop overwriting the LATEST and checkpoint files during backup execution.
+	// Instead, it writes new files alongside the old in reserved subdirectories.
+	BackupDoesNotOverwriteLatestAndCheckpoint
+	// EnableDeclarativeSchemaChanger is the version where new declarative schema changer
+	// can be used to construct schema change plan node.
+	EnableDeclarativeSchemaChanger
+	// RowLevelTTL is the version where we allow row level TTL tables.
+	RowLevelTTL
+	// PebbleFormatSplitUserKeysMarked performs a Pebble-level migration and
+	// upgrades the Pebble format major version to FormatSplitUserKeysMarked.
+	PebbleFormatSplitUserKeysMarked
+
+	// IncrementalBackupSubdir enables backing up new incremental backups to a
+	// dedicated subdirectory, to make it easier to apply a different ttl.
+	IncrementalBackupSubdir
+
+	// DateStyleIntervalStyleCastRewrite rewrites cast that cause inconsistencies
+	// when DateStyle/IntervalStyle is enabled.
+	DateStyleIntervalStyleCastRewrite
+	// EnableNewStoreRebalancer enables the new store rebalancer introduced in
+	// 22.1.
+	EnableNewStoreRebalancer
+	// ClusterLocksVirtualTable enables querying the crdb_internal.cluster_locks
+	// virtual table, which sends a QueryLocksRequest RPC to all cluster ranges.
+	ClusterLocksVirtualTable
+
+	// AutoStatsTableSettings is the version where we allow auto stats related
+	// table settings.
+	AutoStatsTableSettings
+	// ForecastStats enables statistics forecasting per table.
+	ForecastStats
+	// SuperRegions enables the usage on super regions.
+	SuperRegions
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -386,6 +470,105 @@ var versionsSingleton = keyedVersions{
 	{
 		Key:     EnableProtectedTimestampsForTenant,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 50},
+	},
+	{
+		Key:     DeleteCommentsWithDroppedIndexes,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 52},
+	},
+	{
+		Key:     RemoveIncompatibleDatabasePrivileges,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 54},
+	},
+	{
+		Key:     AddRaftAppliedIndexTermMigration,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 56},
+	},
+	{
+		Key:     PostAddRaftAppliedIndexTermMigration,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 58},
+	},
+	{
+		Key:     DontProposeWriteTimestampForLeaseTransfers,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 60},
+	},
+	{
+		Key:     TenantSettingsTable,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 62},
+	},
+	{
+		Key:     EnablePebbleFormatVersionBlockProperties,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 64},
+	},
+	{
+		Key:     DisableSystemConfigGossipTrigger,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 66},
+	},
+	{
+		Key:     MVCCIndexBackfiller,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 68},
+	},
+	{
+		Key:     EnableLeaseHolderRemoval,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 70},
+	},
+	// Internal: 72 was reverted (EnsurePebbleFormatVersionRangeKeys)
+	// Internal: 74 was reverted (EnablePebbleFormatVersionRangeKeys)
+	{
+		Key:     BackupResolutionInJob,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 76},
+	},
+	// Internal: 78 was reverted (ExperimentalMVCCRangeTombstones)
+	{
+		Key:     LooselyCoupledRaftLogTruncation,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 80},
+	},
+	{
+		Key:     ChangefeedIdleness,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 82},
+	},
+	{
+		Key:     BackupDoesNotOverwriteLatestAndCheckpoint,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 84},
+	},
+	{
+		Key:     EnableDeclarativeSchemaChanger,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 86},
+	},
+	{
+		Key:     RowLevelTTL,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 88},
+	},
+	{
+		Key:     PebbleFormatSplitUserKeysMarked,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 90},
+	},
+	{
+		Key:     IncrementalBackupSubdir,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 92},
+	},
+	{
+		Key:     DateStyleIntervalStyleCastRewrite,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 94},
+	},
+	{
+		Key:     EnableNewStoreRebalancer,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 96},
+	},
+	{
+		Key:     ClusterLocksVirtualTable,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 98},
+	},
+	{
+		Key:     AutoStatsTableSettings,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 100},
+	},
+	{
+		Key:     ForecastStats,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 102},
+	},
+	{
+		Key:     SuperRegions,
+		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 104},
 	},
 
 	// *************************************************

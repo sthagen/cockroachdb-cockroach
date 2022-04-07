@@ -399,23 +399,27 @@ func checkServerArgsForCluster(
 	return nil
 }
 
-// AddAndStartServer creates a server with the specified arguments and appends it to
+// AddAndStartServer calls through to AddAndStartServerE.
+func (tc *TestCluster) AddAndStartServer(t *testing.T, serverArgs base.TestServerArgs) {
+	t.Helper()
+	require.NoError(t, tc.AddAndStartServerE(serverArgs))
+}
+
+// AddAndStartServerE creates a server with the specified arguments and appends it to
 // the TestCluster. It also starts it.
 //
 // The new Server's copy of serverArgs might be changed according to the
 // cluster's ReplicationMode.
-func (tc *TestCluster) AddAndStartServer(t testing.TB, serverArgs base.TestServerArgs) {
+func (tc *TestCluster) AddAndStartServerE(serverArgs base.TestServerArgs) error {
 	if serverArgs.JoinAddr == "" && len(tc.Servers) > 0 {
 		serverArgs.JoinAddr = tc.Servers[0].ServingRPCAddr()
 	}
 	_, err := tc.AddServer(serverArgs)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 
-	if err := tc.startServer(len(tc.Servers)-1, serverArgs); err != nil {
-		t.Fatal(err)
-	}
+	return tc.startServer(len(tc.Servers)-1, serverArgs)
 }
 
 // AddServer is like AddAndStartServer, except it does not start it.
@@ -744,6 +748,13 @@ func (tc *TestCluster) WaitForVoters(
 // respective replica has caught up with the config change).
 //
 // targets are replication target for change replica.
+//
+// TODO(tbg): it seems silly that most callers pass `waitForVoter==false` even
+// when they are adding a voter, and instead well over a dozen tests then go and
+// call `.WaitForVoter` instead. It is very rare for a test to want to add a
+// voter but not wait for this voter to show up on the target replica (perhaps
+// when some strange error is injected) so the rare test should have to do the
+// extra work instead.
 func (tc *TestCluster) waitForNewReplicas(
 	startKey roachpb.Key, waitForVoter bool, targets ...roachpb.ReplicationTarget,
 ) error {
@@ -888,7 +899,7 @@ func (tc *TestCluster) TransferRangeLeaseOrFatal(
 	t testing.TB, rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
 ) {
 	if err := tc.TransferRangeLease(rangeDesc, dest); err != nil {
-		t.Fatalf(`could transfer lease for range %s error is %+v`, rangeDesc, err)
+		t.Fatalf(`could not transfer lease for range %s error is %+v`, rangeDesc, err)
 	}
 }
 

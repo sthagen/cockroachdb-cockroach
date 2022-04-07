@@ -645,6 +645,16 @@ func (sp *StorePool) IsUnknown(storeID roachpb.StoreID) (bool, error) {
 	return status == storeStatusUnknown, nil
 }
 
+// IsDraining returns true if the given store's status is `storeStatusDraining`
+// or an error if the store is not found in the pool.
+func (sp *StorePool) IsDraining(storeID roachpb.StoreID) (bool, error) {
+	status, err := sp.storeStatus(storeID)
+	if err != nil {
+		return false, err
+	}
+	return status == storeStatusDraining, nil
+}
+
 // IsLive returns true if the node is considered alive by the store pool or an error
 // if the store is not found in the pool.
 func (sp *StorePool) IsLive(storeID roachpb.StoreID) (bool, error) {
@@ -780,17 +790,20 @@ func (sl StoreList) String() string {
 		sl.candidateRanges.mean,
 		sl.candidateLeases.mean,
 		humanizeutil.IBytes(int64(sl.candidateLogicalBytes.mean)),
-		sl.candidateQueriesPerSecond.mean)
+		sl.candidateQueriesPerSecond.mean,
+	)
 	if len(sl.stores) > 0 {
 		fmt.Fprintf(&buf, "\n")
 	} else {
 		fmt.Fprintf(&buf, " <no candidates>")
 	}
 	for _, desc := range sl.stores {
-		fmt.Fprintf(&buf, "  %d: ranges=%d leases=%d disk-usage=%s queries-per-second=%.2f\n",
+		fmt.Fprintf(&buf, "  %d: ranges=%d leases=%d disk-usage=%s queries-per-second=%.2f l0-sublevels=%d\n",
 			desc.StoreID, desc.Capacity.RangeCount,
 			desc.Capacity.LeaseCount, humanizeutil.IBytes(desc.Capacity.LogicalBytes),
-			desc.Capacity.QueriesPerSecond)
+			desc.Capacity.QueriesPerSecond,
+			desc.Capacity.L0Sublevels,
+		)
 	}
 	return buf.String()
 }

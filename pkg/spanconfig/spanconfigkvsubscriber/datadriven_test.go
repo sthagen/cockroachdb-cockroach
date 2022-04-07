@@ -18,9 +18,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
@@ -45,8 +45,9 @@ import (
 //      delete [c,e)
 //      upsert [c,d):C
 //      upsert [d,e):D
+//      upsert {entire-keyspace}:X
+//      delete {source=1,target=20}
 //      ----
-//      ok
 //
 //      get
 //      span [a,b)
@@ -80,10 +81,10 @@ import (
 //      ----
 //      ok
 //
-// - update and get tie into GetSpanConfigEntriesFor and
-//   UpdateSpanConfigEntries respectively on the KVAccessor interface, and are a
-//   convenient shorthand to populate the system table that the KVSubscriber
-//   subscribes to. The input is processed in a single batch.
+// - update and get tie into GetSpanConfigRecords and UpdateSpanConfigRecords
+//   respectively on the KVAccessor interface, and are a convenient shorthand to
+//   populate the system table that the KVSubscriber subscribes to. The input is
+//   processed in a single batch.
 // - start starts the subscription process. It can also be used to verify
 //   behavior when re-establishing subscriptions after hard errors.
 // - updates lists the span updates the KVSubscriber receives, in the listed
@@ -96,8 +97,9 @@ import (
 //   kvsubscriber and is useful to test teardown and recovery behavior.
 //
 // Text of the form [a,b) and [a,b):C correspond to spans and span config
-// entries; see spanconfigtestutils.Parse{Span,Config,SpanConfigEntry} for more
+// records; see spanconfigtestutils.Parse{Span,Config,SpanConfigRecord} for more
 // details.
+// TODO(arul): Add ability to express tenant spans to this datadriven test.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -126,6 +128,7 @@ func TestDataDriven(t *testing.T) {
 			tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
 			tc.Server(0).ClusterSettings(),
 			fmt.Sprintf("defaultdb.public.%s", dummyTableName),
+			nil, /* knobs */
 		)
 
 		mu := struct {
@@ -137,34 +140,34 @@ func TestDataDriven(t *testing.T) {
 		injectedErrCh := make(chan error)
 
 		kvSubscriber := spanconfigkvsubscriber.New(
-			ts.Stopper(),
-			ts.DB(),
 			ts.Clock(),
 			ts.RangeFeedFactory().(*rangefeed.Factory),
 			dummyTableID,
 			10<<20, /* 10 MB */
-			spanconfigtestutils.ParseConfig(t, "MISSING"),
+			spanconfigtestutils.ParseConfig(t, "FALLBACK"),
 			&spanconfig.TestingKnobs{
-				KVSubscriberOnTimestampAdvanceInterceptor: func(ts hlc.Timestamp) {
-					mu.Lock()
-					defer mu.Unlock()
-					mu.lastFrontierTS = ts
+				KVSubscriberRangeFeedKnobs: &rangefeedcache.TestingKnobs{
+					OnTimestampAdvance: func(ts hlc.Timestamp) {
+						mu.Lock()
+						defer mu.Unlock()
+						mu.lastFrontierTS = ts
+					},
+					PostRangeFeedStart: func() {
+						mu.Lock()
+						defer mu.Unlock()
+						mu.subscriberRunning = true
+					},
+					PreExit: func() {
+						mu.Lock()
+						defer mu.Unlock()
+						mu.subscriberRunning = false
+					},
+					ErrorInjectionCh: injectedErrCh,
 				},
-				KVSubscriberPostRangefeedStartInterceptor: func() {
-					mu.Lock()
-					defer mu.Unlock()
-					mu.subscriberRunning = true
-				},
-				KVSubscriberPreExitInterceptor: func() {
-					mu.Lock()
-					defer mu.Unlock()
-					mu.subscriberRunning = false
-				},
-				KVSubscriberErrorInjectionCh: injectedErrCh,
 			},
 		)
 
-		kvSubscriber.Subscribe(func(span roachpb.Span) {
+		kvSubscriber.Subscribe(func(ctx context.Context, span roachpb.Span) {
 			mu.Lock()
 			defer mu.Unlock()
 			mu.receivedUpdates = append(mu.receivedUpdates, span)
@@ -174,19 +177,19 @@ func TestDataDriven(t *testing.T) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "get":
-				spans := spanconfigtestutils.ParseKVAccessorGetArguments(t, d.Input)
-				entries, err := kvAccessor.GetSpanConfigEntriesFor(ctx, spans)
+				targets := spanconfigtestutils.ParseKVAccessorGetArguments(t, d.Input)
+				records, err := kvAccessor.GetSpanConfigRecords(ctx, targets)
 				require.NoError(t, err)
 
 				var output strings.Builder
-				for _, entry := range entries {
-					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpanConfigEntry(entry)))
+				for _, record := range records {
+					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpanConfigRecord(t, record)))
 				}
 				return output.String()
 
 			case "update":
 				toDelete, toUpsert := spanconfigtestutils.ParseKVAccessorUpdateArguments(t, d.Input)
-				require.NoError(t, kvAccessor.UpdateSpanConfigEntries(ctx, toDelete, toUpsert))
+				require.NoError(t, kvAccessor.UpdateSpanConfigRecords(ctx, toDelete, toUpsert))
 				lastUpdateTS = ts.Clock().Now()
 
 			case "start":
@@ -240,14 +243,7 @@ func TestDataDriven(t *testing.T) {
 					if i != 0 && receivedUpdates[i].Equal(receivedUpdates[i-1]) {
 						continue // de-dup updates
 					}
-
-					var spanStr string
-					if update.Equal(keys.EverythingSpan) {
-						spanStr = update.String()
-					} else {
-						spanStr = spanconfigtestutils.PrintSpan(update)
-					}
-					output.WriteString(fmt.Sprintf("%s\n", spanStr))
+					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpan(update)))
 				}
 
 				return output.String()
@@ -261,7 +257,6 @@ func TestDataDriven(t *testing.T) {
 						return errors.New("expected subscriber to have stopped")
 					}
 					return nil
-
 				})
 
 			case "store-reader":

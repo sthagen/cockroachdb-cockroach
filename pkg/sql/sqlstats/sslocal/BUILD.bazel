@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "sslocal",
     srcs = [
+        "cluster_settings.go",
         "sql_stats.go",
         "sql_stats_controller.go",
         "sslocal_iterator.go",
@@ -15,7 +16,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/server/serverpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
@@ -43,11 +44,12 @@ go_test(
     deps = [
         ":sslocal",
         "//pkg/base",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/server/serverpb",
+        "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql",
         "//pkg/sql/sessionphase",
@@ -55,6 +57,7 @@ go_test(
         "//pkg/sql/sqlstats/persistedsqlstats",
         "//pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil",
         "//pkg/sql/tests",
+        "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",

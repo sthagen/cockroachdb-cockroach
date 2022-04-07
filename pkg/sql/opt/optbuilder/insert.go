@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -275,6 +276,10 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	// implicitly targeted by input columns. Also add any computed columns. In
 	// both cases, include columns undergoing mutations in the write-only state.
 	mb.addSynthesizedColsForInsert()
+
+	// Set insertExpr. This expression is used when building uniqueness checks.
+	// See mutationBuilder.buildCheckInputScan.
+	mb.insertExpr = mb.outScope.expr
 
 	var returning tree.ReturningExprs
 	if resultsNeeded(ins.Returning) {
@@ -802,7 +807,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 			Type: whereClause.Type,
 			Expr: &tree.OrExpr{
 				Left: &tree.ComparisonExpr{
-					Operator: tree.MakeComparisonOperator(tree.IsNotDistinctFrom),
+					Operator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
 					Left:     canaryCol,
 					Right:    tree.DNull,
 				},

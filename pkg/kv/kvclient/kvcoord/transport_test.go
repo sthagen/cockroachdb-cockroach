@@ -158,7 +158,7 @@ func (m *mockInternalClient) Batch(
 	log.Eventf(ctx, "mockInternalClient processing batch")
 	br := &roachpb.BatchResponse{}
 	br.Error = m.pErr
-	if rec := sp.GetRecording(tracing.RecordingVerbose); rec != nil {
+	if rec := sp.GetConfiguredRecording(); rec != nil {
 		br.CollectedSpans = append(br.CollectedSpans, rec...)
 	}
 	return br, nil
@@ -203,21 +203,15 @@ func (m *mockInternalClient) GetSpanConfigs(
 	return nil, fmt.Errorf("unsupported GetSpanConfigs call")
 }
 
+func (m *mockInternalClient) GetAllSystemSpanConfigsThatApply(
+	context.Context, *roachpb.GetAllSystemSpanConfigsThatApplyRequest, ...grpc.CallOption,
+) (*roachpb.GetAllSystemSpanConfigsThatApplyResponse, error) {
+	return nil, fmt.Errorf("unsupported GetAllSystemSpanConfigsThatApply call")
+}
+
 func (m *mockInternalClient) UpdateSpanConfigs(
 	_ context.Context, _ *roachpb.UpdateSpanConfigsRequest, _ ...grpc.CallOption,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
-	return nil, fmt.Errorf("unsupported UpdateSpanConfigs call")
-}
-
-func (m *mockInternalClient) GetSystemSpanConfigs(
-	_ context.Context, _ *roachpb.GetSystemSpanConfigsRequest, _ ...grpc.CallOption,
-) (*roachpb.GetSystemSpanConfigsResponse, error) {
-	return nil, fmt.Errorf("unsupported GetSpanConfigs call")
-}
-
-func (m *mockInternalClient) UpdateSystemSpanConfigs(
-	_ context.Context, _ *roachpb.UpdateSystemSpanConfigsRequest, _ ...grpc.CallOption,
-) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
 	return nil, fmt.Errorf("unsupported UpdateSpanConfigs call")
 }
 

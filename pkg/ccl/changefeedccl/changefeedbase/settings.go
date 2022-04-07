@@ -59,6 +59,16 @@ var SlowSpanLogThreshold = settings.RegisterDurationSetting(
 	settings.NonNegativeDuration,
 )
 
+// IdleTimeout controls how long the changefeed will wait for a new KV being
+// emitted before marking itself as idle.
+var IdleTimeout = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.idle_timeout",
+	"a changefeed will mark itself idle if no changes have been emitted for greater than this duration; if 0, the changefeed will never be marked idle",
+	10*time.Minute,
+	settings.NonNegativeDuration,
+)
+
 // FrontierCheckpointFrequency controls the frequency of frontier checkpoints.
 var FrontierCheckpointFrequency = settings.RegisterDurationSetting(
 	settings.TenantWritable,
@@ -166,4 +176,22 @@ var EventMemoryMultiplier = settings.RegisterFloatSetting(
 		}
 		return nil
 	},
+)
+
+// ProtectTimestampInterval controls the frequency of protected timestamp record updates
+var ProtectTimestampInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.protect_timestamp_interval",
+	"controls how often the changefeed forwards its protected timestamp to the resolved timestamp",
+	10*time.Minute,
+	settings.PositiveDuration,
+)
+
+// ActiveProtectedTimestampsEnabled enables always having protected timestamps
+// laid down that are periodically advanced to the highwater mark.
+var ActiveProtectedTimestampsEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.active_protected_timestamps.enabled",
+	"if set, rather than only protecting changefeed targets from garbage collection during backfills, data will always be protected up to the changefeed's frontier",
+	true,
 )

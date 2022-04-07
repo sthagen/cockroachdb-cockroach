@@ -24,9 +24,6 @@ var (
 	// returning nothing).
 	NoopKVAccessor = dummyKVAccessor{error: nil}
 
-	// IllegalKVAccessor is a KVAccessor that only returns "illegal use" errors.
-	IllegalKVAccessor = dummyKVAccessor{error: errors.New("illegal use of kvaccessor")}
-
 	// DisabledKVAccessor is a KVAccessor that only returns "disabled" errors.
 	DisabledKVAccessor = dummyKVAccessor{error: errors.New("span configs disabled")}
 )
@@ -39,32 +36,26 @@ type dummyKVAccessor struct {
 
 var _ spanconfig.KVAccessor = &dummyKVAccessor{}
 
-// GetSpanConfigEntriesFor is part of the KVAccessor interface.
-func (k dummyKVAccessor) GetSpanConfigEntriesFor(
-	context.Context, []roachpb.Span,
-) ([]roachpb.SpanConfigEntry, error) {
+// GetSpanConfigRecords is part of the KVAccessor interface.
+func (k dummyKVAccessor) GetSpanConfigRecords(
+	context.Context, []spanconfig.Target,
+) ([]spanconfig.Record, error) {
 	return nil, k.error
 }
 
-// UpdateSpanConfigEntries is part of the KVAccessor interface.
-func (k dummyKVAccessor) UpdateSpanConfigEntries(
-	context.Context, []roachpb.Span, []roachpb.SpanConfigEntry,
+// UpdateSpanConfigRecords is part of the KVAccessor interface.
+func (k dummyKVAccessor) UpdateSpanConfigRecords(
+	context.Context, []spanconfig.Target, []spanconfig.Record,
 ) error {
 	return k.error
 }
 
-// GetSystemSpanConfigEntries is part of the spanconfig.KVAccessor interface.
-func (k dummyKVAccessor) GetSystemSpanConfigEntries(
-	context.Context,
-) ([]roachpb.SystemSpanConfigEntry, error) {
+// GetAllSystemSpanConfigsThatApply is part of the spanconfig.KVAccessor
+// interface.
+func (k dummyKVAccessor) GetAllSystemSpanConfigsThatApply(
+	context.Context, roachpb.TenantID,
+) ([]roachpb.SpanConfig, error) {
 	return nil, k.error
-}
-
-// UpdateSystemSpanConfigEntries is part of the spanconfig.KVAccessor interface.
-func (k dummyKVAccessor) UpdateSystemSpanConfigEntries(
-	context.Context, []roachpb.SystemSpanConfigTarget, []roachpb.SystemSpanConfigEntry,
-) error {
-	return k.error
 }
 
 func (k dummyKVAccessor) WithTxn(context.Context, *kv.Txn) spanconfig.KVAccessor {

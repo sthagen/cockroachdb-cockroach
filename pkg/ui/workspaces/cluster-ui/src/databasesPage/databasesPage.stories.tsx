@@ -22,6 +22,7 @@ const history = H.createHashHistory();
 const withLoadingIndicator: DatabasesPageProps = {
   loading: true,
   loaded: false,
+  automaticStatsCollectionEnabled: true,
   databases: [],
   sortSetting: {
     ascending: false,
@@ -29,6 +30,7 @@ const withLoadingIndicator: DatabasesPageProps = {
   },
   onSortingChange: () => {},
   refreshDatabases: () => {},
+  refreshSettings: () => {},
   refreshDatabaseDetails: () => {},
   refreshTableStats: () => {},
   location: history.location,
@@ -44,6 +46,7 @@ const withLoadingIndicator: DatabasesPageProps = {
 const withoutData: DatabasesPageProps = {
   loading: false,
   loaded: true,
+  automaticStatsCollectionEnabled: true,
   databases: [],
   sortSetting: {
     ascending: false,
@@ -51,6 +54,7 @@ const withoutData: DatabasesPageProps = {
   },
   onSortingChange: () => {},
   refreshDatabases: () => {},
+  refreshSettings: () => {},
   refreshDatabaseDetails: () => {},
   refreshTableStats: () => {},
   location: history.location,
@@ -67,11 +71,12 @@ const withData: DatabasesPageProps = {
   loading: false,
   loaded: true,
   showNodeRegionsColumn: true,
+  automaticStatsCollectionEnabled: true,
   sortSetting: {
     ascending: false,
     columnTitle: "name",
   },
-  databases: _.map(Array(42), _item => {
+  databases: Array(42).map(() => {
     return {
       loading: false,
       loaded: true,
@@ -82,10 +87,12 @@ const withData: DatabasesPageProps = {
       missingTables: [],
       nodesByRegionString:
         "gcp-europe-west1(n8), gcp-us-east1(n1), gcp-us-west1(n6)",
+      numIndexRecommendations: 0,
     };
   }),
   onSortingChange: () => {},
   refreshDatabases: () => {},
+  refreshSettings: () => {},
   refreshDatabaseDetails: () => {},
   refreshTableStats: () => {},
   location: history.location,

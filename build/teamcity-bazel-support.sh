@@ -1,7 +1,7 @@
 # FYI: You can run `./dev builder` to run this Docker image. :)
 # `dev` depends on this variable! Don't change the name or format unless you
 # also update `dev` accordingly.
-BAZEL_IMAGE=cockroachdb/bazel:20220121-121551
+BAZEL_IMAGE=cockroachdb/bazel:20220328-163955
 
 # Call `run_bazel $NAME_OF_SCRIPT` to start an appropriately-configured Docker
 # container with the `cockroachdb/bazel` image running the given script.
@@ -51,6 +51,9 @@ _tc_release_branch() {
 #   `GO_TEST_JSON_OUTPUT_FILE`.
 # create_tarball: whether to create a tarball with full logs. If the test's
 #   exit code is passed, the tarball is generated on failures.
+#
+# The variable BAZEL_SUPPORT_EXTRA_GITHUB_POST_ARGS can be set to add extra
+# arguments to $github_post.
 process_test_json() {
   local testfilter=$1
   local github_post=$2
@@ -79,7 +82,7 @@ process_test_json() {
       echo "GITHUB_API_TOKEN must be set"
       exit 1
     else
-      $github_post < "$test_json"
+      $github_post ${BAZEL_SUPPORT_EXTRA_GITHUB_POST_ARGS:+$BAZEL_SUPPORT_EXTRA_GITHUB_POST_ARGS} < "$test_json"
     fi
   fi
 

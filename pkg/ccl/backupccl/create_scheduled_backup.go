@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -39,7 +38,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 	pbtypes "github.com/gogo/protobuf/types"
-	"github.com/robfig/cron/v3"
+	cron "github.com/robfig/cron/v3"
 )
 
 const (
@@ -270,7 +269,7 @@ func canChainProtectedTimestampRecords(p sql.PlanHookState, eval *scheduledBacku
 	}
 
 	// Return true if the backup has table targets or is backing up a tenant.
-	return eval.Targets.Tables != nil || eval.Targets.Tenant != roachpb.TenantID{}
+	return eval.Targets.Tables != nil || eval.Targets.TenantID.IsSet()
 }
 
 // doCreateBackupSchedule creates requested schedule (or schedules).
@@ -301,12 +300,7 @@ func doCreateBackupSchedules(
 		}
 	}
 
-	env := scheduledjobs.ProdJobSchedulerEnv
-	if knobs, ok := p.ExecCfg().DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
-		if knobs.JobSchedulerEnv != nil {
-			env = knobs.JobSchedulerEnv
-		}
-	}
+	env := sql.JobSchedulerEnv(p.ExecCfg())
 
 	// Evaluate incremental and full recurrence.
 	incRecurrence, err := computeScheduleRecurrence(env.Now(), eval.recurrence)
@@ -560,16 +554,10 @@ func checkForExistingBackupsInCollection(
 	if err != nil {
 		return err
 	}
-	defaultStore, err := makeCloudFactory(ctx, collectionURI, p.User())
-	if err != nil {
-		return err
-	}
-	defer defaultStore.Close()
 
-	r, err := defaultStore.ReadFile(ctx, latestFileName)
+	_, err = readLatestFile(ctx, collectionURI, makeCloudFactory, p.User())
 	if err == nil {
 		// A full backup has already been taken to this location.
-		r.Close()
 		return errors.Newf("backups already created in %s; to ignore existing backups, "+
 			"the schedule can be created with the 'ignore_existing_backups' option",
 			collectionURI)
@@ -774,7 +762,7 @@ func fullyQualifyScheduledBackupTargetTables(
 					if err != nil {
 						return err
 					}
-					schemaID, err = col.ResolveSchemaID(ctx, txn, dbDesc.GetID(), tp.SchemaName.String())
+					schemaID, err = col.Direct().ResolveSchemaID(ctx, txn, dbDesc.GetID(), tp.SchemaName.String())
 					return err
 				}); err != nil {
 					return nil, err
@@ -829,7 +817,7 @@ func makeScheduledBackupEval(
 	}
 
 	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(),
+		p.ExecCfg().Settings, p.ExecCfg().LogicalClusterID(), p.ExecCfg().Organization(),
 		"BACKUP INTO LATEST")
 	eval.isEnterpriseUser = enterpriseCheckErr == nil
 
@@ -849,6 +837,12 @@ func makeScheduledBackupEval(
 			// All backups are full cluster backups for free users.
 			eval.fullBackupRecurrence = eval.recurrence
 			eval.recurrence = nil
+			if schedule.FullBackup == nil {
+				p.BufferClientNotice(ctx,
+					pgnotice.Newf("Without an enterprise license,"+
+						" this schedule will only run full backups. To mute this notice, "+
+						"add the 'FULL BACKUP ALWAYS' clause to your CREATE SCHEDULE command."))
+			}
 		} else {
 			// Cannot use incremental backup w/out enterprise license.
 			return nil, enterpriseCheckErr
@@ -1002,6 +996,18 @@ func (m ScheduledBackupExecutionArgs) MarshalJSONPB(marshaller *jsonpb.Marshaler
 		backup.IncrementalFrom[i] = tree.NewDString(clean)
 	}
 
+	for i := range backup.Options.IncrementalStorage {
+		raw, ok := backup.Options.IncrementalStorage[i].(*tree.StrVal)
+		if !ok {
+			return nil, errors.Errorf("unexpected %T arg in backup schedule: %v", raw, raw)
+		}
+		clean, err := cloud.SanitizeExternalStorageURI(raw.RawString(), nil /* extraParams */)
+		if err != nil {
+			return nil, err
+		}
+		backup.Options.IncrementalStorage[i] = tree.NewDString(clean)
+	}
+
 	for i := range backup.Options.EncryptionKMSURI {
 		raw, ok := backup.Options.EncryptionKMSURI[i].(*tree.StrVal)
 		if !ok {
@@ -1023,5 +1029,5 @@ func (m ScheduledBackupExecutionArgs) MarshalJSONPB(marshaller *jsonpb.Marshaler
 }
 
 func init() {
-	sql.AddPlanHook(createBackupScheduleHook)
+	sql.AddPlanHook("schedule backup", createBackupScheduleHook)
 }

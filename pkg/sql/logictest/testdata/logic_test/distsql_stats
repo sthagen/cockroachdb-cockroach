@@ -1,9 +1,6 @@
 # LogicTest: 5node 5node-metadata
 
-# Disable automatic stats.
-statement ok
-SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
-
+# Disable histogram collection.
 statement ok
 SET CLUSTER SETTING sql.stats.histogram_collection.enabled = false
 
@@ -200,7 +197,46 @@ statistics_name  column_names  row_count  distinct_count  null_count
 NULL             {b}           256        4               0
 s1               {a}           256        4               0
 
+# Ignore stats with non-existent columns.
+query T noticetrace
+ALTER TABLE data INJECT STATISTICS '[
+    {
+        "columns": ["z"],
+        "created_at": "2018-05-01 1:00:00.00000+00:00",
+        "row_count": 10,
+        "distinct_count": 2
+    },
+    {
+        "columns": ["a", "z"],
+        "created_at": "2018-05-01 1:00:00.00000+00:00",
+        "row_count": 10,
+        "distinct_count": 2
+    },
+    {
+        "columns": ["a"],
+        "created_at": "2018-05-01 1:00:00.00000+00:00",
+        "row_count": 10,
+        "distinct_count": 2
+    }
+]'
+----
+NOTICE: column "z" does not exist
+NOTICE: column "z" does not exist
+
+query TTIII colnames
+SELECT statistics_name, column_names, row_count, distinct_count, null_count
+FROM [SHOW STATISTICS FOR TABLE data]
+ORDER BY statistics_name, column_names::STRING
+----
+statistics_name  column_names  row_count  distinct_count  null_count
+NULL             {a}           10         2               0
+
 # Test AS OF SYSTEM TIME
+
+# We're reading from timestamps that precede the GC thresholds, disable strict
+# enforcement.
+statement ok
+SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = false
 
 statement error pgcode 3D000 database "test" does not exist
 CREATE STATISTICS s2 ON a FROM data AS OF SYSTEM TIME '2017'
@@ -214,7 +250,6 @@ FROM [SHOW STATISTICS FOR TABLE data]
 ORDER BY statistics_name, column_names::STRING
 ----
 statistics_name  column_names  row_count  distinct_count  null_count
-NULL             {b}           256        4               0
 s2               {a}           256        4               0
 
 #
@@ -630,8 +665,14 @@ arr_stats_x      {x}           4          3               1           false
 # Test that enum columns always have histograms collected for them.
 statement ok
 CREATE TYPE e AS ENUM ('hello', 'howdy', 'hi');
+
+statement ok
 CREATE TABLE et (x e, y e, PRIMARY KEY (x));
+
+statement ok
 INSERT INTO et VALUES ('hello', 'hello'), ('howdy', 'howdy'), ('hi', 'hi');
+
+statement ok
 CREATE STATISTICS s FROM et
 
 query TTIIB colnames,rowsort
@@ -727,7 +768,11 @@ SET CLUSTER SETTING sql.stats.multi_column_collection.enabled = false
 
 statement ok
 CREATE TABLE prim (a INT, b INT, c INT, PRIMARY KEY (a, b, c));
+
+statement ok
 INSERT INTO prim VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
+
+statement ok
 CREATE STATISTICS s FROM prim
 
 query TTIIB colnames,rowsort
@@ -763,7 +808,11 @@ upper_bound  range_rows  distinct_range_rows  equal_rows
 # collected for them, with up to 200 buckets.
 statement ok
 CREATE TABLE sec (a INT, b INT, c INT, INDEX (a, b, c));
+
+statement ok
 INSERT INTO sec VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
+
+statement ok
 CREATE STATISTICS s FROM sec
 
 query TTIIB colnames,rowsort
@@ -808,7 +857,11 @@ CREATE TABLE partial (
   INDEX (a) WHERE b > 0 OR c > 0,
   INVERTED INDEX (j) WHERE d = 10
 );
+
+statement ok
 INSERT INTO partial VALUES (1, 1, 1, 1, '{"a": "b"}'), (2, 2, 2, 10, '{"c": "d"}'), (3, 3, 3, 1, '{"e": "f"}');
+
+statement ok
 CREATE STATISTICS s FROM partial
 
 query TTIIB colnames,rowsort
@@ -894,6 +947,8 @@ CREATE TABLE expression (
   INVERTED INDEX j_a ((j->'a')),
   INVERTED INDEX a_j_a (a, (j->'a'))
 );
+
+statement ok
 INSERT INTO expression VALUES (1, 1, '{"a": "b"}'), (2, 10, '{"c": "d"}'), (3, 1, '{"e": "f"}');
 
 statement ok
@@ -921,7 +976,11 @@ s                {rowid}       3          0           true
 # up to 2 buckets.
 statement ok
 CREATE TABLE noind (a INT, b INT, c INT);
+
+statement ok
 INSERT INTO noind VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
+
+statement ok
 CREATE STATISTICS s FROM noind
 
 query TTIIB colnames,rowsort
@@ -960,7 +1019,11 @@ CREATE TABLE geo_table (
    geog GEOGRAPHY(GEOMETRY,4326) NULL,
    geom GEOMETRY(GEOMETRY,3857) NULL
 );
+
+statement ok
 INSERT INTO geo_table VALUES (1, 'LINESTRING(0 0, 100 100)', ST_GeomFromText('LINESTRING(0 0, 100 100)', 3857));
+
+statement ok
 CREATE STATISTICS s FROM geo_table;
 
 query TB colnames
@@ -979,7 +1042,11 @@ column_names  has_histogram
 
 statement ok
 CREATE INDEX geom_idx_1 ON geo_table USING GIST(geom) WITH (geometry_min_x=0, s2_max_level=15);
+
+statement ok
 CREATE INDEX geog_idx_1 ON geo_table USING GIST(geog) WITH (s2_level_mod=3);
+
+statement ok
 CREATE STATISTICS s FROM geo_table;
 
 query TB colnames
@@ -998,7 +1065,11 @@ column_names  has_histogram
 
 statement ok
 CREATE INDEX geom_idx_2 ON geo_table USING GIST(geom) WITH (geometry_min_x=5);
+
+statement ok
 CREATE INDEX geog_idx_2 ON geo_table USING GIST(geog);
+
+statement ok
 CREATE STATISTICS s FROM geo_table;
 
 query TB colnames
@@ -1029,6 +1100,8 @@ upper_bound                                                                     
 
 statement ok
 DROP INDEX geo_table@geog_idx_1;
+
+statement ok
 CREATE STATISTICS s FROM geo_table;
 
 # Demonstrate that buckets change when the first chosen index is dropped.
@@ -1053,7 +1126,11 @@ CREATE TABLE multi_col (
   j JSON,
   INVERTED INDEX (s, j)
 );
+
+statement ok
 INSERT INTO multi_col VALUES (1, 'foo', '{"a": "b"}');
+
+statement ok
 CREATE STATISTICS s FROM multi_col;
 
 query TB colnames
@@ -1100,7 +1177,11 @@ SET CLUSTER SETTING sql.stats.multi_column_collection.enabled = false
 # an error.
 statement ok
 CREATE TABLE all_null (k INT PRIMARY KEY, c INT);
+
+statement ok
 INSERT INTO all_null VALUES (1, NULL);
+
+statement ok
 CREATE STATISTICS s FROM all_null
 
 query T
@@ -1150,8 +1231,14 @@ SELECT * FROM all_null WHERE c IS NOT NULL
 # Regression for 58220.
 statement ok
 CREATE TYPE greeting AS ENUM ('hello', 'howdy', 'hi');
+
+statement ok
 CREATE TABLE greeting_stats (x greeting PRIMARY KEY);
+
+statement ok
 INSERT INTO greeting_stats VALUES ('hi');
+
+statement ok
 CREATE STATISTICS s FROM greeting_stats
 
 query T
@@ -1214,7 +1301,11 @@ CREATE TABLE t63387 (
     j JSONB,
     INDEX (i) WHERE j->>'a' = 'b'
 );
+
+statement ok
 INSERT INTO t63387 VALUES (1, '{}');
+
+statement ok
 CREATE STATISTICS s FROM t63387;
 
 # Regression test for #71080. Stats collection should succeed on tables with NOT
@@ -1241,3 +1332,16 @@ CREATE STATISTICS s ON b FROM t71080;
 
 statement error cannot create statistics on virtual column \"b\"
 CREATE STATISTICS s ON a, b FROM t71080;
+
+# Regression test for #76867. Do not attempt to collect empty multi-column stats
+# when there are indexes on columns that are all virtual.
+statement ok
+CREATE TABLE t76867 (
+  a INT,
+  b INT AS (a + 1) VIRTUAL,
+  c INT AS (a + 2) VIRTUAL,
+  INDEX (b, c)
+)
+
+statement ok
+ANALYZE t76867

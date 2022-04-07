@@ -6,12 +6,16 @@ pkg/base/node_id.go | `*NodeIDContainer`
 pkg/base/node_id.go | `*SQLIDContainer`
 pkg/base/node_id.go | `*StoreIDContainer`
 pkg/cli/exit/exit.go | `Code`
-pkg/jobs/jobspb/wrap.go | `JobID`
 pkg/jobs/jobspb/wrap.go | `Type`
+pkg/kv/bulk/sst_batcher.go | `sorted`
+pkg/kv/bulk/sst_batcher.go | `sz`
+pkg/kv/bulk/sst_batcher.go | `timing`
 pkg/kv/kvserver/closedts/ctpb/service.go | `LAI`
 pkg/kv/kvserver/closedts/ctpb/service.go | `SeqNum`
+pkg/kv/kvserver/concurrency/lock/locking.go | `Durability`
+pkg/kv/kvserver/concurrency/lock/locking.go | `Strength`
 pkg/kv/kvserver/concurrency/lock/locking.go | `WaitPolicy`
-pkg/kv/kvserver/raft.go | `SnapshotRequest_Type`
+pkg/kv/kvserver/kvserverpb/raft.go | `SnapshotRequest_Type`
 pkg/roachpb/data.go | `LeaseSequence`
 pkg/roachpb/data.go | `ReplicaChangeType`
 pkg/roachpb/data.go | `TransactionStatus`
@@ -25,6 +29,7 @@ pkg/roachpb/method.go | `Method`
 pkg/roachpb/tenant.go | `TenantID`
 pkg/rpc/connection_class.go | `ConnectionClass`
 pkg/sql/catalog/catpb/constraint.go | `ForeignKeyAction`
+pkg/sql/catalog/catpb/job_id.go | `JobID`
 pkg/sql/catalog/descpb/structured.go | `ConstraintType`
 pkg/sql/catalog/descpb/structured.go | `ConstraintValidity`
 pkg/sql/catalog/descpb/structured.go | `DescriptorMutation_Direction`
@@ -34,6 +39,7 @@ pkg/sql/catalog/descpb/structured.go | `DescriptorVersion`
 pkg/sql/catalog/descpb/structured.go | `IndexDescriptorVersion`
 pkg/sql/catalog/descpb/structured.go | `MutationID`
 pkg/sql/sem/catid/ids.go | `ColumnID`
+pkg/sql/sem/catid/ids.go | `ConstraintID`
 pkg/sql/sem/catid/ids.go | `DescID`
 pkg/sql/sem/catid/ids.go | `FamilyID`
 pkg/sql/sem/catid/ids.go | `IndexID`

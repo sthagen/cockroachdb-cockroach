@@ -198,7 +198,7 @@ func (t *typeSchemaChanger) getTypeDescFromStore(
 ) (catalog.TypeDescriptor, error) {
 	var typeDesc catalog.TypeDescriptor
 	if err := DescsTxn(ctx, t.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-		typeDesc, err = col.MustGetTypeDescByID(ctx, txn, t.typeID)
+		typeDesc, err = col.Direct().MustGetTypeDescByID(ctx, txn, t.typeID)
 		return err
 	}); err != nil {
 		return nil, err
@@ -1177,7 +1177,7 @@ func (t *typeSchemaChanger) canRemoveEnumValueFromArrayUsages(
 		if len(rows) > 0 {
 			// Use an FQN in the error message.
 			parentSchema, err := descsCol.GetImmutableSchemaByID(
-				ctx, txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{})
+				ctx, txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{Required: true})
 			if err != nil {
 				return err
 			}
@@ -1232,6 +1232,9 @@ func (t *typeSchemaChanger) execWithRetry(ctx context.Context) error {
 		Multiplier:     1.5,
 	}
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+		if err := t.execCfg.JobRegistry.CheckPausepoint("typeschemachanger.before.exec"); err != nil {
+			return err
+		}
 		tcErr := t.exec(ctx)
 		switch {
 		case tcErr == nil:

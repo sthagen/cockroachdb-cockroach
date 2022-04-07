@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -46,6 +47,7 @@ type eventStream struct {
 	eventsCh    chan roachpb.RangeFeedEvent // Channel receiving rangefeed events.
 	errCh       chan error                  // Signaled when error occurs in rangefeed.
 	streamCh    chan tree.Datums            // Channel signaled to forward datums to consumer.
+	sp          *tracing.Span               // Span representing the lifetime of the eventStream.
 }
 
 var _ tree.ValueGenerator = (*eventStream)(nil)
@@ -104,7 +106,7 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 		opts = append(opts,
 			rangefeed.WithInitialScan(func(ctx context.Context) {}),
 			rangefeed.WithScanRetryBehavior(rangefeed.ScanRetryRemaining),
-
+			rangefeed.WithRowTimestampInInitialScan(true),
 			rangefeed.WithOnInitialScanError(func(ctx context.Context, err error) (shouldFail bool) {
 				// TODO(yevgeniy): Update metrics
 				return false
@@ -171,7 +173,9 @@ func (s *eventStream) startStreamProcessor(ctx context.Context, frontier *span.F
 	// Context group responsible for coordinating rangefeed event production with
 	// ValueGenerator implementation that consumes rangefeed events and forwards them to the
 	// destination cluster consumer.
-	s.streamGroup = ctxgroup.WithContext(ctx)
+	streamCtx, sp := tracing.ChildSpan(ctx, "event stream")
+	s.sp = sp
+	s.streamGroup = ctxgroup.WithContext(streamCtx)
 	s.streamGroup.GoCtx(withErrCapture(func(ctx context.Context) error {
 		return s.streamLoop(ctx, frontier)
 	}))
@@ -206,6 +210,8 @@ func (s *eventStream) Close(ctx context.Context) {
 		// Note: error in close is normal; we expect to be terminated with context canceled.
 		log.Errorf(ctx, "partition stream %d terminated with error %v", s.streamID, err)
 	}
+
+	s.sp.Finish()
 }
 
 func (s *eventStream) onEvent(ctx context.Context, value *roachpb.RangeFeedValue) {
@@ -388,7 +394,7 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 
 func setConfigDefaults(cfg *streampb.StreamPartitionSpec_ExecutionConfig) {
 	const defaultInitialScanParallelism = 16
-	const defaultMinCheckpointFrequency = time.Minute
+	const defaultMinCheckpointFrequency = 10 * time.Second
 	const defaultBatchSize = 1 << 20
 
 	if cfg.InitialScanParallelism <= 0 {
@@ -424,10 +430,10 @@ func streamPartition(
 
 	execCfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
 
-	return &eventStream{
+	return tree.MakeStreamingValueGenerator(&eventStream{
 		streamID: streamID,
 		spec:     spec,
 		execCfg:  execCfg,
 		mon:      evalCtx.Mon,
-	}, nil
+	}), nil
 }

@@ -64,6 +64,8 @@ var requireConstFmt = map[string]bool{
 
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash.ReportOrPanic": true,
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb.NewAmbiguousResultErrorf": true,
+
 	"(*github.com/cockroachdb/cockroach/pkg/util/tracing.Span).Recordf":      true,
 	"(*github.com/cockroachdb/cockroach/pkg/util/tracing.spanInner).Recordf": true,
 
@@ -116,8 +118,8 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/sql/logictest.logicTest).Errorf": true,
 	"(*github.com/cockroachdb/cockroach/pkg/sql/logictest.logicTest).Fatalf": true,
 
-	"(*github.com/cockroachdb/cockroach/pkg/server.adminServer).serverErrorf": true,
-	"github.com/cockroachdb/cockroach/pkg/server.guaranteedExitFatal":         true,
+	"github.com/cockroachdb/cockroach/pkg/server.serverErrorf":        true,
+	"github.com/cockroachdb/cockroach/pkg/server.guaranteedExitFatal": true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl.kafkaLogAdapter).Printf": true,
 

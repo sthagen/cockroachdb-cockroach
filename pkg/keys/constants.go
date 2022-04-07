@@ -87,10 +87,11 @@ var (
 	// LocalRangeAppliedStateSuffix is the suffix for the range applied state
 	// key.
 	LocalRangeAppliedStateSuffix = []byte("rask")
-	// LocalRaftTruncatedStateSuffix is the suffix for the
+	// This was previously used for the replicated RaftTruncatedState. It is no
+	// longer used and this key has been removed via a migration. See
+	// LocalRaftTruncatedStateSuffix for the corresponding unreplicated
 	// RaftTruncatedState.
-	// Note: This suffix is also used for unreplicated Range-ID keys.
-	LocalRaftTruncatedStateSuffix = []byte("rftt")
+	_ = []byte("rftt")
 	// LocalRangeLeaseSuffix is the suffix for a range lease.
 	LocalRangeLeaseSuffix = []byte("rll-")
 	// LocalRangePriorReadSummarySuffix is the suffix for a range's prior read
@@ -122,6 +123,13 @@ var (
 	localRaftLastIndexSuffix = []byte("rfti")
 	// LocalRaftLogSuffix is the suffix for the raft log.
 	LocalRaftLogSuffix = []byte("rftl")
+	// LocalRaftReplicaIDSuffix is the suffix for the RaftReplicaID. This is
+	// written when a replica is created.
+	LocalRaftReplicaIDSuffix = []byte("rftr")
+	// LocalRaftTruncatedStateSuffix is the suffix for the unreplicated
+	// RaftTruncatedState.
+	LocalRaftTruncatedStateSuffix = []byte("rftt")
+
 	// LocalRangeLastReplicaGCTimestampSuffix is the suffix for a range's last
 	// replica GC timestamp (for GC of old replicas).
 	LocalRangeLastReplicaGCTimestampSuffix = []byte("rlrt")
@@ -293,6 +301,30 @@ var (
 	TimeseriesPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("tsd")))
 	// TimeseriesKeyMax is the maximum value for any timeseries data.
 	TimeseriesKeyMax = TimeseriesPrefix.PrefixEnd()
+	//
+	// SystemSpanConfigPrefix is the key prefix for all system span config data.
+	//
+	// We sort this at the end of the system keyspace to easily be able to exclude
+	// it from the span configuration that applies over the system keyspace. This
+	// is important because spans carved out from this range are used to store
+	// system span configurations in the `system.span_configurations` table, and
+	// as such, have special meaning associated with them; nothing is stored in
+	// the range itself.
+	SystemSpanConfigPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("\xffsys-scfg")))
+	// SystemSpanConfigEntireKeyspace is the key prefix used to denote that the
+	// associated system span configuration applies over the entire keyspace
+	// (including all secondary tenants).
+	SystemSpanConfigEntireKeyspace = roachpb.Key(makeKey(SystemSpanConfigPrefix, roachpb.RKey("host/all")))
+	// SystemSpanConfigHostOnTenantKeyspace is the key prefix used to denote that
+	// the associated system span configuration was applied by the host tenant
+	// over the keyspace of a secondary tenant.
+	SystemSpanConfigHostOnTenantKeyspace = roachpb.Key(makeKey(SystemSpanConfigPrefix, roachpb.RKey("host/ten/")))
+	// SystemSpanConfigSecondaryTenantOnEntireKeyspace is the key prefix used to
+	// denote that the associated system span configuration was applied by a
+	// secondary tenant over its entire keyspace.
+	SystemSpanConfigSecondaryTenantOnEntireKeyspace = roachpb.Key(makeKey(SystemSpanConfigPrefix, roachpb.RKey("ten/")))
+	// SystemSpanConfigKeyMax is the maximum value for any system span config key.
+	SystemSpanConfigKeyMax = SystemSpanConfigPrefix.PrefixEnd()
 
 	// 3. System tenant SQL keys
 	//
@@ -464,6 +496,9 @@ const (
 // there's no table descriptor). They're grouped here because the cluster
 // bootstrap process needs to create splits for them; splits for the tables
 // happen separately.
+//
+// TODO(ajwerner): There is no reason at all for these to have their own
+// splits.
 var PseudoTableIDs = []uint32{
 	MetaRangesID,
 	SystemRangesID,

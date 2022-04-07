@@ -36,7 +36,7 @@ eexpect $prompt
 
 start_test "Expect partitioning succeeds"
 # test that partitioning works if a license could be acquired
-send "$argv demo --geo-partitioned-replicas\r"
+send "$argv demo --multitenant=false --geo-partitioned-replicas\r"
 
 # wait for the shell to start up
 wait_for_partitioning_or_exit
@@ -95,7 +95,7 @@ eexpect "8"
 eexpect "(1 row)"
 eexpect "movr>"
 
-interrupt
+send_eof
 eexpect $prompt
 end_test
 
@@ -119,7 +119,7 @@ eexpect "  survival_goal"
 eexpect "zone"
 eexpect "movr>"
 
-interrupt
+send_eof
 eexpect $prompt
 
 send "$argv demo movr --geo-partitioned-replicas --multi-region --survive=region\r"
@@ -131,7 +131,7 @@ eexpect "  survival_goal"
 eexpect "region"
 eexpect "movr>"
 
-interrupt
+send_eof
 eexpect $prompt
 
 end_test
@@ -146,6 +146,13 @@ end_test
 start_test "Ensure that licensed commands with -e error when license acquisition is disabled"
 send "$argv demo --disable-demo-license -e \"ALTER TABLE users PARTITION BY LIST (city) (PARTITION p1 VALUES IN ('new york'))\"\r"
 eexpect "ERROR: use of partitions requires an enterprise license"
+eexpect $prompt
+end_test
+
+start_test "Expect an error if geo-partitioning is requested with multitenant mode"
+send "$argv demo --geo-partitioned-replicas\r"
+# expect a failure
+eexpect "operation is unsupported in multi-tenancy mode"
 eexpect $prompt
 end_test
 
@@ -164,12 +171,11 @@ start_test "Expect an error if geo-partitioning is requested and license acquisi
 send "export COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING=true\r"
 send "$argv demo --geo-partitioned-replicas\r"
 # expect a failure
-eexpect ERROR:
 eexpect "enterprise features are needed for this demo"
-# clean up after the test
-eexpect $prompt"
-
-# clean up after the test
 eexpect $prompt
+end_test
 
+# clean up after the test
+send_eof
+eexpect eof
 end_test

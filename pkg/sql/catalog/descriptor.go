@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -74,7 +75,9 @@ type DescriptorBuilder interface {
 
 	// RunPostDeserializationChanges attempts to perform changes to the descriptor
 	// being built from a deserialized protobuf.
-	RunPostDeserializationChanges()
+	// NOTE: any error returned by this function should be treated as an assertion
+	// failure, and indicates either corruption or a programming error.
+	RunPostDeserializationChanges() error
 
 	// RunRestoreChanges attempts to perform changes to the descriptor being
 	// built from a deserialized protobuf obtained by restoring a backup.
@@ -161,7 +164,7 @@ type Descriptor interface {
 	// describes the set of privileges that users have to use, modify, or delete
 	// the object represented by this descriptor. Each descriptor type may have a
 	// different set of capabilities represented by the PrivilegeDescriptor.
-	GetPrivileges() *descpb.PrivilegeDescriptor
+	GetPrivileges() *catpb.PrivilegeDescriptor
 	// DescriptorType returns the type of this descriptor (like relation, type,
 	// schema, database).
 	DescriptorType() DescriptorType
@@ -203,6 +206,21 @@ type Descriptor interface {
 
 	// ValidateTxnCommit performs pre-commit checks.
 	ValidateTxnCommit(vea ValidationErrorAccumulator, vdg ValidationDescGetter)
+
+	// GetDeclarativeSchemaChangerState returns the state of the declarative
+	// schema change currently operating on this descriptor. It will be nil if
+	// there is no declarative schema change job. Note that it is a clone of
+	// the value on the descriptor. Changes will need to be written back to
+	// the descriptor using SetDeclarativeSchemaChangeState.
+	GetDeclarativeSchemaChangerState() *scpb.DescriptorState
+
+	// GetPostDeserializationChanges returns the set of ways the Descriptor
+	// was changed after running RunPostDeserializationChanges.
+	GetPostDeserializationChanges() PostDeserializationChanges
+
+	// HasConcurrentSchemaChanges returns if declarative schema
+	// changes are currently in progress.
+	HasConcurrentSchemaChanges() bool
 }
 
 // DatabaseDescriptor encapsulates the concept of a database.
@@ -241,6 +259,8 @@ type DatabaseDescriptor interface {
 	// GetDefaultPrivilegeDescriptor returns the default privileges for this
 	// database.
 	GetDefaultPrivilegeDescriptor() DefaultPrivilegeDescriptor
+	// HasPublicSchemaWithDescriptor returns true iff the database has a public
+	// schema which itself has a descriptor.
 	HasPublicSchemaWithDescriptor() bool
 }
 
@@ -333,11 +353,6 @@ type TableDescriptor interface {
 	// 1. Whether the index is a mutation
 	// 2. if so, is it in state DELETE_AND_WRITE_ONLY
 	GetIndexMutationCapabilities(id descpb.IndexID) (isMutation, isWriteOnly bool)
-	// KeysPerRow returns the maximum number of keys used to encode a row for the
-	// given index. If a secondary index doesn't store any columns, then it only
-	// has one k/v pair, but if it stores some columns, it can return up to one
-	// k/v pair per family in the table, just like a primary index.
-	KeysPerRow(id descpb.IndexID) (int, error)
 
 	// AllIndexes returns a slice with all indexes, public and non-public,
 	// in the underlying proto, in their canonical order:
@@ -469,6 +484,10 @@ type TableDescriptor interface {
 	// colinfo.AllSystemColumnDescs.
 	SystemColumns() []Column
 
+	// PublicColumnIDs creates a slice of column IDs corresponding to the public
+	// columns.
+	PublicColumnIDs() []descpb.ColumnID
+
 	// IndexColumns returns a slice of Column interfaces containing all
 	// columns present in the specified Index in any capacity.
 	IndexColumns(idx Index) []Column
@@ -493,6 +512,16 @@ type TableDescriptor interface {
 	// stored columns in the specified Index.
 	IndexStoredColumns(idx Index) []Column
 
+	// IndexKeysPerRow returns the maximum number of keys used to encode a row for
+	// the given index. If a secondary index doesn't store any columns, then it
+	// only has one k/v pair, but if it stores some columns, it can return up to
+	// one k/v pair per family in the table, just like a primary index.
+	IndexKeysPerRow(idx Index) int
+
+	// IndexFetchSpecKeyAndSuffixColumns returns information about the key and
+	// suffix columns, suitable for populating a descpb.IndexFetchSpec.
+	IndexFetchSpecKeyAndSuffixColumns(idx Index) []descpb.IndexFetchSpec_KeyColumn
+
 	// FindColumnWithID returns the first column found whose ID matches the
 	// provided target ID, in the canonical order.
 	// If no column is found then an error is also returned.
@@ -512,6 +541,9 @@ type TableDescriptor interface {
 	// GetNextColumnID returns the next unused column ID for this table. Column
 	// IDs are unique per table, but not unique globally.
 	GetNextColumnID() descpb.ColumnID
+	// GetNextConstraintID returns the next unused constraint ID for this table.
+	// Constraint IDs are unique per table, but not unique globally.
+	GetNextConstraintID() descpb.ConstraintID
 	// CheckConstraintUsesColumn returns whether the check constraint uses the
 	// specified column.
 	CheckConstraintUsesColumn(cc *descpb.TableDescriptor_CheckConstraint, colID descpb.ColumnID) (bool, error)
@@ -532,6 +564,10 @@ type TableDescriptor interface {
 	// GetNextFamilyID returns the next unused family ID for this table. Family
 	// IDs are unique per table, but not unique globally.
 	GetNextFamilyID() descpb.FamilyID
+
+	// FamilyDefaultColumns returns the default column IDs for families with a
+	// default column. See IndexFetchSpec.FamilyDefaultColumns.
+	FamilyDefaultColumns() []descpb.IndexFetchSpec_FamilyDefaultColumn
 
 	// HasColumnBackfillMutation returns whether the table has any queued column
 	// mutations that require a backfill.
@@ -633,6 +669,15 @@ type TableDescriptor interface {
 	// GetRegionalByRowTableRegionColumnName returns the region column name of a
 	// REGIONAL BY ROW table.
 	GetRegionalByRowTableRegionColumnName() (tree.Name, error)
+	// GetRowLevelTTL returns the row-level TTL config for the table.
+	GetRowLevelTTL() *catpb.RowLevelTTL
+	// HasRowLevelTTL returns where there is a row-level TTL config for the table.
+	HasRowLevelTTL() bool
+	// GetExcludeDataFromBackup returns true if the table's row data is configured
+	// to be excluded during backup.
+	GetExcludeDataFromBackup() bool
+	// GetStorageParams returns a list of storage parameters for the table.
+	GetStorageParams(spaceBetweenEqual bool) []string
 }
 
 // TypeDescriptor will eventually be called typedesc.Descriptor.
@@ -691,6 +736,8 @@ type TypeDescriptor interface {
 	// TransitioningRegionNames returns regions which are transitioning to PUBLIC
 	// or are being removed.
 	TransitioningRegionNames() (catpb.RegionNames, error)
+	// SuperRegions returns the list of super regions.
+	SuperRegions() ([]descpb.SuperRegion, error)
 
 	// The following fields are set if the type is an enum or a multi-region enum.
 
@@ -731,9 +778,9 @@ type TypeDescriptorResolver interface {
 // DefaultPrivilegeDescriptor protos are not accessed and interacted
 // with directly.
 type DefaultPrivilegeDescriptor interface {
-	GetDefaultPrivilegesForRole(descpb.DefaultPrivilegesRole) (*descpb.DefaultPrivilegesForRole, bool)
-	ForEachDefaultPrivilegeForRole(func(descpb.DefaultPrivilegesForRole) error) error
-	GetDefaultPrivilegeDescriptorType() descpb.DefaultPrivilegeDescriptor_DefaultPrivilegeDescriptorType
+	GetDefaultPrivilegesForRole(catpb.DefaultPrivilegesRole) (*catpb.DefaultPrivilegesForRole, bool)
+	ForEachDefaultPrivilegeForRole(func(catpb.DefaultPrivilegesForRole) error) error
+	GetDefaultPrivilegeDescriptorType() catpb.DefaultPrivilegeDescriptor_DefaultPrivilegeDescriptorType
 }
 
 // FilterDescriptorState inspects the state of a given descriptor and returns an

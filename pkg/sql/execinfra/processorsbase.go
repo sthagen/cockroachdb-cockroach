@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -178,33 +179,6 @@ func (h *ProcOutputHelper) Init(
 	}
 
 	return nil
-}
-
-// NeededColumns calculates the set of internal processor columns that are
-// actually used by the post-processing stage.
-func (h *ProcOutputHelper) NeededColumns() (colIdxs util.FastIntSet) {
-	if h.outputCols == nil && len(h.renderExprs) == 0 {
-		// No projection or rendering; all columns are needed.
-		colIdxs.AddRange(0, h.numInternalCols-1)
-		return colIdxs
-	}
-
-	// Add all explicit output columns.
-	for _, c := range h.outputCols {
-		colIdxs.Add(int(c))
-	}
-
-	for i := 0; i < h.numInternalCols; i++ {
-		// See if render expressions require this column.
-		for j := range h.renderExprs {
-			if h.renderExprs[j].Vars.IndexedVarUsed(i) {
-				colIdxs.Add(i)
-				break
-			}
-		}
-	}
-
-	return colIdxs
 }
 
 // EmitRow sends a row through the post-processing stage. The same row can be
@@ -666,7 +640,7 @@ func (pb *ProcessorBaseNoHelper) moveToTrailingMeta() {
 				pb.span.RecordStructured(stats)
 			}
 		}
-		if trace := pb.span.GetRecording(pb.span.RecordingType()); trace != nil {
+		if trace := pb.span.GetConfiguredRecording(); trace != nil {
 			pb.trailingMeta = append(pb.trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
 		}
 	}
@@ -892,7 +866,16 @@ func (pb *ProcessorBaseNoHelper) startImpl(
 //     // Perform processor specific close work.
 //   }
 func (pb *ProcessorBase) InternalClose() bool {
-	closing := pb.ProcessorBaseNoHelper.InternalClose()
+	return pb.InternalCloseEx(nil /* onClose */)
+}
+
+// InternalCloseEx is like InternalClose, but also takes a closure to run in
+// case the processor was not already closed. The closure is run before the
+// processor's span is finished, so the closure can finalize work that relies on
+// that span (e.g. async work previously started by the processor that has
+// captured the processor's span).
+func (pb *ProcessorBase) InternalCloseEx(onClose func()) bool {
+	closing := pb.ProcessorBaseNoHelper.InternalCloseEx(onClose)
 	if closing {
 		// This prevents Next() from returning more rows.
 		pb.OutputHelper.consumerClosed()
@@ -902,24 +885,33 @@ func (pb *ProcessorBase) InternalClose() bool {
 
 // InternalClose is the meat of ProcessorBase.InternalClose.
 func (pb *ProcessorBaseNoHelper) InternalClose() bool {
-	closing := !pb.Closed
+	return pb.InternalCloseEx(nil /* onClose */)
+}
+
+// InternalCloseEx is the meat of ProcessorBase.InternalCloseEx.
+func (pb *ProcessorBaseNoHelper) InternalCloseEx(onClose func()) bool {
 	// Protection around double closing is useful for allowing ConsumerClosed() to
 	// be called on processors that have already closed themselves by moving to
 	// StateTrailingMeta.
-	if closing {
-		for _, input := range pb.inputsToDrain[pb.curInputToDrain:] {
-			input.ConsumerClosed()
-		}
-
-		pb.Closed = true
-		pb.span.Finish()
-		pb.span = nil
-		// Reset the context so that any incidental uses after this point do not
-		// access the finished span.
-		pb.Ctx = pb.origCtx
-		pb.EvalCtx.Context = pb.origCtx
+	if pb.Closed {
+		return false
 	}
-	return closing
+	for _, input := range pb.inputsToDrain[pb.curInputToDrain:] {
+		input.ConsumerClosed()
+	}
+
+	if onClose != nil {
+		onClose()
+	}
+
+	pb.Closed = true
+	pb.span.Finish()
+	pb.span = nil
+	// Reset the context so that any incidental uses after this point do not
+	// access the finished span.
+	pb.Ctx = pb.origCtx
+	pb.EvalCtx.Context = pb.origCtx
+	return true
 }
 
 // ConsumerDone is part of the RowSource interface.
@@ -936,7 +928,9 @@ func (pb *ProcessorBaseNoHelper) ConsumerClosed() {
 // NewMonitor is a utility function used by processors to create a new
 // memory monitor with the given name and start it. The returned monitor must
 // be closed.
-func NewMonitor(ctx context.Context, parent *mon.BytesMonitor, name string) *mon.BytesMonitor {
+func NewMonitor(
+	ctx context.Context, parent *mon.BytesMonitor, name redact.RedactableString,
+) *mon.BytesMonitor {
 	monitor := mon.NewMonitorInheritWithLimit(name, 0 /* limit */, parent)
 	monitor.Start(ctx, parent, mon.BoundAccount{})
 	return monitor
@@ -949,7 +943,7 @@ func NewMonitor(ctx context.Context, parent *mon.BytesMonitor, name string) *mon
 // ServerConfig.TestingKnobs.ForceDiskSpill is set or
 // ServerConfig.TestingKnobs.MemoryLimitBytes if not.
 func NewLimitedMonitor(
-	ctx context.Context, parent *mon.BytesMonitor, flowCtx *FlowCtx, name string,
+	ctx context.Context, parent *mon.BytesMonitor, flowCtx *FlowCtx, name redact.RedactableString,
 ) *mon.BytesMonitor {
 	limitedMon := mon.NewMonitorInheritWithLimit(name, GetWorkMemLimit(flowCtx), parent)
 	limitedMon.Start(ctx, parent, mon.BoundAccount{})
@@ -963,7 +957,7 @@ func NewLimitedMonitorNoFlowCtx(
 	parent *mon.BytesMonitor,
 	config *ServerConfig,
 	sd *sessiondata.SessionData,
-	name string,
+	name redact.RedactableString,
 ) *mon.BytesMonitor {
 	// Create a fake FlowCtx populating only the required fields.
 	flowCtx := &FlowCtx{

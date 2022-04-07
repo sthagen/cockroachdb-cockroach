@@ -11,9 +11,10 @@ go_library(
     deps = [
         "//pkg/kv",
         "//pkg/kv/kvserver/protectedts/ptpb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/spanconfig",
         "//pkg/sql/catalog/descpb",
+        "//pkg/util/hlc",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_stretchr_testify//require",

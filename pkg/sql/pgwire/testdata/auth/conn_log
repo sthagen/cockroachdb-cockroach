@@ -4,12 +4,19 @@ config secure
 sql
 CREATE USER userpw WITH PASSWORD 'pass';
 CREATE USER usernopw;
+----
+ok
+
+sql
 ALTER USER root WITH PASSWORD 'secureabc';
+----
+ok
+
+sql
 CREATE USER trusted;
 CREATE USER usernologin WITH NOLOGIN PASSWORD '123';
 CREATE USER usernosqllogin WITH NOSQLLOGIN PASSWORD '123';
 CREATE USER userexpired WITH PASSWORD '123' VALID UNTIL '2000-01-01'
-
 ----
 ok
 
@@ -71,7 +78,7 @@ authlog 7
 
 connect user=root password=badpass sslmode=require sslcert= sslkey=
 ----
-ERROR: password authentication failed for user root (SQLSTATE 28000)
+ERROR: password authentication failed for user root (SQLSTATE 28P01)
 
 authlog 8
 .*client_connection_end
@@ -124,7 +131,7 @@ authlog 7
 
 connect user=userpw password=badpass
 ----
-ERROR: password authentication failed for user userpw (SQLSTATE 28000)
+ERROR: password authentication failed for user userpw (SQLSTATE 28P01)
 
 authlog 8
 .*client_connection_end
@@ -144,7 +151,7 @@ subtest conn_tls/no_password
 
 connect user=usernopw
 ----
-ERROR: password authentication failed for user usernopw (SQLSTATE 28000)
+ERROR: password authentication failed for user usernopw (SQLSTATE 28P01)
 
 authlog 8
 .*client_connection_end
@@ -183,7 +190,7 @@ authlog 5
 
 connect_unix user=root password=badpass
 ----
-ERROR: password authentication failed for user root (SQLSTATE 28000)
+ERROR: password authentication failed for user root (SQLSTATE 28P01)
 
 authlog 5
 .*client_connection_end
@@ -231,7 +238,7 @@ authlog 5
 
 connect_unix user=userpw password=badpass
 ----
-ERROR: password authentication failed for user userpw (SQLSTATE 28000)
+ERROR: password authentication failed for user userpw (SQLSTATE 28P01)
 
 authlog 5
 .*client_connection_end

@@ -51,9 +51,7 @@ type replicatedCmd struct {
 	// Replica's proposal map.
 	proposal *ProposalData
 
-	// ctx is a context that follows from the proposal's context if it was
-	// proposed locally. Otherwise, it will follow from the context passed to
-	// ApplyCommittedEntries.
+	// ctx is a non-cancelable context used to apply the command.
 	ctx context.Context
 	// sp is the tracing span corresponding to ctx. It is closed in
 	// finishTracingSpan. This span "follows from" the proposer's span (even
@@ -90,7 +88,7 @@ type decodedRaftEntry struct {
 // decodedConfChange represents the fields of a config change raft command.
 type decodedConfChange struct {
 	raftpb.ConfChangeI
-	ConfChangeContext
+	kvserverpb.ConfChangeContext
 }
 
 // decode decodes the entry e into the replicatedCmd.
@@ -122,9 +120,7 @@ func (c *replicatedCmd) Ctx() context.Context {
 // AckErrAndFinish implements the apply.Command interface.
 func (c *replicatedCmd) AckErrAndFinish(ctx context.Context, err error) error {
 	if c.IsLocal() {
-		c.response.Err = roachpb.NewError(
-			roachpb.NewAmbiguousResultError(
-				err.Error()))
+		c.response.Err = roachpb.NewError(roachpb.NewAmbiguousResultError(err))
 	}
 	return c.AckOutcomeAndFinish(ctx)
 }
@@ -212,7 +208,7 @@ func (d *decodedRaftEntry) decode(ctx context.Context, e *raftpb.Entry) error {
 
 func (d *decodedRaftEntry) decodeNormalEntry(e *raftpb.Entry) error {
 	var encodedCommand []byte
-	d.idKey, encodedCommand = DecodeRaftCommand(e.Data)
+	d.idKey, encodedCommand = kvserverbase.DecodeRaftCommand(e.Data)
 	// An empty command is used to unquiesce a range and wake the
 	// leader. Clear commandID so it's ignored for processing.
 	if len(encodedCommand) == 0 {

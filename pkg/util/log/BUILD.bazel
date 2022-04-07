@@ -1,8 +1,6 @@
 load("@bazel_gomock//:gomock.bzl", "gomock")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
-# gazelle:exclude mock_generated.go
-
 go_library(
     name = "log",
     srcs = [
@@ -202,14 +200,24 @@ genrule(
     exec_tools = [
         "//pkg/util/log/gen",
     ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 gomock(
     name = "mock_logsink",
-    out = "mock_generated.go",
-    interfaces = ["logSink"],
+    out = "mocks_generated_test.go",
+    interfaces = [
+        "TestingLogSink",
+    ],
     library = ":log",
-    mock_names = {"logSink": "MockLogSink"},
+    mock_names = {"TestingLogSink": "MockLogSink"},
     package = "log",
-    source = "sinks.go",
+    self_package = "github.com/cockroachdb/cockroach/pkg/util/log",
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )

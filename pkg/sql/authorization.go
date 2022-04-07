@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -33,10 +34,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 // MembershipCache is a shared cache for role membership information.
@@ -46,12 +51,17 @@ type MembershipCache struct {
 	boundAccount mon.BoundAccount
 	// userCache is a mapping from username to userRoleMembership.
 	userCache map[security.SQLUsername]userRoleMembership
+	// populateCacheGroup ensures that there is at most one request in-flight
+	// for each key.
+	populateCacheGroup singleflight.Group
+	stopper            *stop.Stopper
 }
 
 // NewMembershipCache initializes a new MembershipCache.
-func NewMembershipCache(account mon.BoundAccount) *MembershipCache {
+func NewMembershipCache(account mon.BoundAccount, stopper *stop.Stopper) *MembershipCache {
 	return &MembershipCache{
 		boundAccount: account,
+		stopper:      stopper,
 	}
 }
 
@@ -269,6 +279,12 @@ func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor catalog.Desc
 	}
 
 	user := p.SessionData().User()
+
+	if user.IsNodeUser() {
+		// User "node" has all privileges.
+		return nil
+	}
+
 	privs := descriptor.GetPrivileges()
 
 	// Check if 'user' itself has privileges.
@@ -401,77 +417,142 @@ func MemberOfWithAdminOption(
 
 	tableVersion := tableDesc.GetVersion()
 	if tableDesc.IsUncommittedVersion() {
-		return resolveMemberOfWithAdminOption(ctx, member, ie, txn)
+		return resolveMemberOfWithAdminOption(ctx, member, ie, txn, useSingleQueryForRoleMembershipCache.Get(execCfg.SV()))
 	}
 
-	// We loop in case the table version changes while we're looking up memberships.
-	for {
-		// Check version and maybe clear cache while holding the mutex.
-		// We use a closure here so that we release the lock here, then keep
-		// going and re-lock if adding the looked-up entry.
-		userMapping, found := func() (userRoleMembership, bool) {
-			roleMembersCache.Lock()
-			defer roleMembersCache.Unlock()
-			if roleMembersCache.tableVersion != tableVersion {
-				// Update version and drop the map.
-				roleMembersCache.tableVersion = tableVersion
-				roleMembersCache.userCache = make(map[security.SQLUsername]userRoleMembership)
-				roleMembersCache.boundAccount.Empty(ctx)
-			}
-			userMapping, ok := roleMembersCache.userCache[member]
-			return userMapping, ok
-		}()
+	// Check version and maybe clear cache while holding the mutex.
+	// We use a closure here so that we release the lock here, then keep
+	// going and re-lock if adding the looked-up entry.
+	userMapping, found := func() (userRoleMembership, bool) {
+		roleMembersCache.Lock()
+		defer roleMembersCache.Unlock()
+		if roleMembersCache.tableVersion < tableVersion {
+			// If the cache is based on an old table version, then update version and
+			// drop the map.
+			roleMembersCache.tableVersion = tableVersion
+			roleMembersCache.userCache = make(map[security.SQLUsername]userRoleMembership)
+			roleMembersCache.boundAccount.Empty(ctx)
+		} else if roleMembersCache.tableVersion > tableVersion {
+			// If the cache is based on a newer table version, then this transaction
+			// should not use the cached data.
+			return nil, false
+		}
+		userMapping, ok := roleMembersCache.userCache[member]
+		return userMapping, ok
+	}()
 
-		if found {
-			// Found: return.
-			return userMapping, nil
+	if found {
+		// Found: return.
+		return userMapping, nil
+	}
+
+	// Lookup memberships outside the lock. There will be at most one request
+	// in-flight for each user. The role_memberships table version is also part
+	// of the request key so that we don't read data from an old version of the
+	// table.
+	ch, _ := roleMembersCache.populateCacheGroup.DoChan(
+		fmt.Sprintf("%s-%d", member.Normalized(), tableVersion),
+		func() (interface{}, error) {
+			// Use a different context to fetch, so that it isn't possible for
+			// one query to timeout and cause all the goroutines that are waiting
+			// to get a timeout error.
+			ctx, cancel := roleMembersCache.stopper.WithCancelOnQuiesce(
+				logtags.WithTags(context.Background(), logtags.FromContext(ctx)))
+			defer cancel()
+			return resolveMemberOfWithAdminOption(
+				ctx, member, ie, txn,
+				useSingleQueryForRoleMembershipCache.Get(execCfg.SV()),
+			)
+		},
+	)
+	var memberships map[security.SQLUsername]bool
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		memberships = res.Val.(map[security.SQLUsername]bool)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	func() {
+		// Update membership if the table version hasn't changed.
+		roleMembersCache.Lock()
+		defer roleMembersCache.Unlock()
+		if roleMembersCache.tableVersion != tableVersion {
+			// Table version has changed while we were looking: don't cache the data.
+			return
 		}
 
-		// Lookup memberships outside the lock.
-		memberships, err := resolveMemberOfWithAdminOption(ctx, member, ie, txn)
-		if err != nil {
+		// Table version remains the same: update map, unlock, return.
+		sizeOfEntry := int64(len(member.Normalized()))
+		for m := range memberships {
+			sizeOfEntry += int64(len(m.Normalized()))
+			sizeOfEntry += memsize.Bool
+		}
+		if err := roleMembersCache.boundAccount.Grow(ctx, sizeOfEntry); err != nil {
+			// If there is no memory available to cache the entry, we can still
+			// proceed so that the query has a chance to succeed.
+			log.Ops.Warningf(ctx, "no memory available to cache role membership info: %v", err)
+		} else {
+			roleMembersCache.userCache[member] = memberships
+		}
+	}()
+	return memberships, nil
+}
+
+var defaultSingleQueryForRoleMembershipCache = util.ConstantWithMetamorphicTestBool(
+	"resolve-membership-single-scan-enabled",
+	true, /* defaultValue */
+)
+
+var useSingleQueryForRoleMembershipCache = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.auth.resolve_membership_single_scan.enabled",
+	"determines whether to populate the role membership cache with a single scan",
+	defaultSingleQueryForRoleMembershipCache,
+).WithPublic()
+
+// resolveMemberOfWithAdminOption performs the actual recursive role membership lookup.
+func resolveMemberOfWithAdminOption(
+	ctx context.Context,
+	member security.SQLUsername,
+	ie sqlutil.InternalExecutor,
+	txn *kv.Txn,
+	singleQuery bool,
+) (map[security.SQLUsername]bool, error) {
+	ret := map[security.SQLUsername]bool{}
+	if singleQuery {
+		type membership struct {
+			role    security.SQLUsername
+			isAdmin bool
+		}
+		memberToRoles := make(map[security.SQLUsername][]membership)
+		if err := forEachRoleMembership(ctx, ie, txn, func(role, member security.SQLUsername, isAdmin bool) error {
+			memberToRoles[member] = append(memberToRoles[member], membership{role, isAdmin})
+			return nil
+		}); err != nil {
 			return nil, err
 		}
 
-		finishedLoop := func() bool {
-			// Update membership.
-			roleMembersCache.Lock()
-			defer roleMembersCache.Unlock()
-			if roleMembersCache.tableVersion != tableVersion {
-				// Table version has changed while we were looking, unlock and start over.
-				tableVersion = roleMembersCache.tableVersion
-				return false
+		// Recurse through all roles associated with the member.
+		var recurse func(u security.SQLUsername)
+		recurse = func(u security.SQLUsername) {
+			for _, membership := range memberToRoles[u] {
+				// If the parent role was seen before, we still might need to update
+				// the isAdmin flag for that role, but there's no need to recurse
+				// through the role's ancestry again.
+				prev, alreadySeen := ret[membership.role]
+				ret[membership.role] = prev || membership.isAdmin
+				if !alreadySeen {
+					recurse(membership.role)
+				}
 			}
-
-			// Table version remains the same: update map, unlock, return.
-			sizeOfEntry := int64(len(member.Normalized()))
-			for m := range memberships {
-				sizeOfEntry += int64(len(m.Normalized()))
-				sizeOfEntry += memsize.Bool
-			}
-			if err := roleMembersCache.boundAccount.Grow(ctx, sizeOfEntry); err != nil {
-				// If there is no memory available to cache the entry, we can still
-				// proceed so that the query has a chance to succeed..
-				log.Ops.Warningf(ctx, "no memory available to cache role membership info: %v", err)
-			} else {
-				roleMembersCache.userCache[member] = memberships
-			}
-			return true
-		}()
-		if finishedLoop {
-			return memberships, nil
 		}
+		recurse(member)
+		return ret, nil
 	}
-}
-
-// resolveMemberOfWithAdminOption performs the actual recursive role membership lookup.
-// TODO(mberhault): this is the naive way and performs a full lookup for each user,
-// we could save detailed memberships (as opposed to fully expanded) and reuse them
-// across users. We may then want to lookup more than just this user.
-func resolveMemberOfWithAdminOption(
-	ctx context.Context, member security.SQLUsername, ie sqlutil.InternalExecutor, txn *kv.Txn,
-) (map[security.SQLUsername]bool, error) {
-	ret := map[security.SQLUsername]bool{}
 
 	// Keep track of members we looked up.
 	visited := map[security.SQLUsername]struct{}{}
@@ -613,7 +694,7 @@ func (p *planner) canCreateOnSchema(
 	checkPublicSchema shouldCheckPublicSchema,
 ) error {
 	scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{})
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{Required: true})
 	if err != nil {
 		return err
 	}
@@ -738,7 +819,7 @@ func (p *planner) HasOwnershipOnSchema(
 		return p.User().IsNodeUser(), nil
 	}
 	scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{},
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{Required: true},
 	)
 	if err != nil {
 		return false, err

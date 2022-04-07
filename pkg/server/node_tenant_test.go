@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -43,12 +44,12 @@ func TestRedactRecordingForTenant(t *testing.T) {
 		t.Helper()
 		tags := (&logtags.Buffer{}).
 			Add("tag_sensitive", tagSensitive).
-			Add("tag_not_sensitive", log.Safe(tagNotSensitive))
+			Add("tag_not_sensitive", redact.Safe(tagNotSensitive))
 		ctx := logtags.WithTags(context.Background(), tags)
 		tracer := tracing.NewTracer()
 		tracer.SetRedactable(true)
 		ctx, sp := tracer.StartSpanCtx(ctx, "foo", tracing.WithRecording(tracing.RecordingVerbose))
-		log.Eventf(ctx, "%s %s", msgSensitive, log.Safe(msgNotSensitive))
+		log.Eventf(ctx, "%s %s", msgSensitive, redact.Safe(msgNotSensitive))
 		sp.SetTag("all_span_tags_are_stripped", attribute.StringValue("because_no_redactability"))
 		rec := sp.FinishAndGetRecording(tracing.RecordingVerbose)
 		require.Len(t, rec, 1)
@@ -103,6 +104,7 @@ func TestRedactRecordingForTenant(t *testing.T) {
 			RedactableLogs    bool
 			Logs              []tracingpb.LogRecord
 			Verbose           bool
+			RecordingMode     tracingpb.RecordingMode
 			GoroutineID       uint64
 			Finished          bool
 			StructuredRecords []tracingpb.StructuredRecord

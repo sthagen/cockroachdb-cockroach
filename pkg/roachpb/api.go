@@ -14,13 +14,16 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
+	"github.com/dustin/go-humanize"
 )
 
-//go:generate mockgen -package=roachpb -destination=mocks_generated.go . InternalClient,Internal_RangeFeedClient
+//go:generate mockgen -package=roachpbmock -destination=roachpbmock/mocks_generated.go . InternalClient,Internal_RangeFeedClient
 
 // UserPriority is a custom type for transaction's user priority.
 type UserPriority float64
@@ -74,23 +77,25 @@ func (rc ReadConsistencyType) SupportsBatch(ba BatchRequest) error {
 type flag int
 
 const (
-	isAdmin             flag = 1 << iota // admin cmds don't go through raft, but run on lease holder
-	isRead                               // read-only cmds don't go through raft, but may run on lease holder
-	isWrite                              // write cmds go through raft and must be proposed on lease holder
-	isTxn                                // txn commands may be part of a transaction
-	isLocking                            // locking cmds acquire locks for their transaction
-	isIntentWrite                        // intent write cmds leave intents when they succeed
-	isRange                              // range commands may span multiple keys
-	isReverse                            // reverse commands traverse ranges in descending direction
-	isAlone                              // requests which must be alone in a batch
-	isPrefix                             // requests which, in a batch, must not be split from the following request
-	isUnsplittable                       // range command that must not be split during sending
-	skipsLeaseCheck                      // commands which skip the check that the evaluating replica has a valid lease
-	appliesTSCache                       // commands which apply the timestamp cache and closed timestamp
-	updatesTSCache                       // commands which update the timestamp cache
-	updatesTSCacheOnErr                  // commands which make read data available on errors
-	needsRefresh                         // commands which require refreshes to avoid serializable retries
-	canBackpressure                      // commands which deserve backpressure when a Range grows too large
+	isAdmin                                  flag = 1 << iota // admin cmds don't go through raft, but run on lease holder
+	isRead                                                    // read-only cmds don't go through raft, but may run on lease holder
+	isWrite                                                   // write cmds go through raft and must be proposed on lease holder
+	isTxn                                                     // txn commands may be part of a transaction
+	isLocking                                                 // locking cmds acquire locks for their transaction
+	isIntentWrite                                             // intent write cmds leave intents when they succeed
+	isRange                                                   // range commands may span multiple keys
+	isReverse                                                 // reverse commands traverse ranges in descending direction
+	isAlone                                                   // requests which must be alone in a batch
+	isPrefix                                                  // requests which, in a batch, must not be split from the following request
+	isUnsplittable                                            // range command that must not be split during sending
+	skipsLeaseCheck                                           // commands which skip the check that the evaluating replica has a valid lease
+	appliesTSCache                                            // commands which apply the timestamp cache and closed timestamp
+	updatesTSCache                                            // commands which update the timestamp cache
+	updatesTSCacheOnErr                                       // commands which make read data available on errors
+	needsRefresh                                              // commands which require refreshes to avoid serializable retries
+	canBackpressure                                           // commands which deserve backpressure when a Range grows too large
+	bypassesReplicaCircuitBreaker                             // commands which bypass the replica circuit breaker, i.e. opt out of fail-fast
+	requiresClosedTSOlderThanStorageSnapshot                  // commands which read a replica's closed timestamp that is older than the state of the storage engine
 )
 
 // flagDependencies specifies flag dependencies, asserted by TestFlagCombinations.
@@ -198,6 +203,13 @@ func NeedsRefresh(args Request) bool {
 // when waiting for a Range to split after it has grown too large.
 func CanBackpressure(args Request) bool {
 	return (args.flags() & canBackpressure) != 0
+}
+
+// BypassesReplicaCircuitBreaker returns whether the command bypasses
+// the per-Replica circuit breakers. These requests will thus hang when
+// addressed to an unavailable range (instead of failing fast).
+func BypassesReplicaCircuitBreaker(args Request) bool {
+	return (args.flags() & bypassesReplicaCircuitBreaker) != 0
 }
 
 // Request is an interface for RPC requests.
@@ -487,6 +499,20 @@ func (r *ScanInterleavedIntentsResponse) combine(c combinable) error {
 
 var _ combinable = &ScanInterleavedIntentsResponse{}
 
+// combine implements the combinable interface.
+func (r *QueryLocksResponse) combine(c combinable) error {
+	otherR := c.(*QueryLocksResponse)
+	if r != nil {
+		if err := r.ResponseHeader.combine(otherR.Header()); err != nil {
+			return err
+		}
+		r.Locks = append(r.Locks, otherR.Locks...)
+	}
+	return nil
+}
+
+var _ combinable = &QueryLocksResponse{}
+
 // Header implements the Request interface.
 func (rh RequestHeader) Header() RequestHeader {
 	return rh
@@ -653,6 +679,9 @@ func (*QueryTxnRequest) Method() Method { return QueryTxn }
 
 // Method implements the Request interface.
 func (*QueryIntentRequest) Method() Method { return QueryIntent }
+
+// Method implements the Request interface.
+func (*QueryLocksRequest) Method() Method { return QueryLocks }
 
 // Method implements the Request interface.
 func (*ResolveIntentRequest) Method() Method { return ResolveIntent }
@@ -866,6 +895,12 @@ func (qtr *QueryTxnRequest) ShallowCopy() Request {
 
 // ShallowCopy implements the Request interface.
 func (pir *QueryIntentRequest) ShallowCopy() Request {
+	shallowCopy := *pir
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (pir *QueryLocksRequest) ShallowCopy() Request {
 	shallowCopy := *pir
 	return &shallowCopy
 }
@@ -1253,11 +1288,15 @@ func (drr *DeleteRangeRequest) flags() flag {
 
 // Note that ClearRange commands cannot be part of a transaction as
 // they clear all MVCC versions.
-func (*ClearRangeRequest) flags() flag { return isWrite | isRange | isAlone }
+func (*ClearRangeRequest) flags() flag {
+	return isWrite | isRange | isAlone | bypassesReplicaCircuitBreaker
+}
 
 // Note that RevertRange commands cannot be part of a transaction as
 // they clear all MVCC versions above their target time.
-func (*RevertRangeRequest) flags() flag { return isWrite | isRange }
+func (*RevertRangeRequest) flags() flag {
+	return isWrite | isRange | isAlone | bypassesReplicaCircuitBreaker
+}
 
 func (sr *ScanRequest) flags() flag {
 	maybeLocking := flagForLockStrength(sr.KeyLocking)
@@ -1279,7 +1318,13 @@ func (*AdminMergeRequest) flags() flag          { return isAdmin | isAlone }
 func (*AdminTransferLeaseRequest) flags() flag  { return isAdmin | isAlone }
 func (*AdminChangeReplicasRequest) flags() flag { return isAdmin | isAlone }
 func (*AdminRelocateRangeRequest) flags() flag  { return isAdmin | isAlone }
-func (*GCRequest) flags() flag                  { return isWrite | isRange }
+
+func (*GCRequest) flags() flag {
+	// We defensively let GCRequest bypass the circuit breaker because otherwise,
+	// the GC queue might busy loop on an unavailable range, doing lots of work
+	// but never making progress.
+	return isWrite | isRange | bypassesReplicaCircuitBreaker
+}
 
 // HeartbeatTxn updates the timestamp cache with transaction records,
 // to avoid checking for them on disk when considering 1PC evaluation.
@@ -1299,11 +1344,14 @@ func (*QueryTxnRequest) flags() flag   { return isRead | isAlone }
 func (*QueryIntentRequest) flags() flag {
 	return isRead | isPrefix | updatesTSCache | updatesTSCacheOnErr
 }
+func (*QueryLocksRequest) flags() flag         { return isRead | isRange }
 func (*ResolveIntentRequest) flags() flag      { return isWrite }
 func (*ResolveIntentRangeRequest) flags() flag { return isWrite | isRange }
 func (*TruncateLogRequest) flags() flag        { return isWrite }
 func (*MergeRequest) flags() flag              { return isWrite | canBackpressure }
-func (*RequestLeaseRequest) flags() flag       { return isWrite | isAlone | skipsLeaseCheck }
+func (*RequestLeaseRequest) flags() flag {
+	return isWrite | isAlone | skipsLeaseCheck | bypassesReplicaCircuitBreaker
+}
 
 // LeaseInfoRequest is usually executed in an INCONSISTENT batch, which has the
 // effect of the `skipsLeaseCheck` flag that lease write operations have.
@@ -1321,20 +1369,27 @@ func (*TransferLeaseRequest) flags() flag {
 	// the store has registered that a transfer is in progress and
 	// `redirectOnOrAcquireLease` would already tentatively redirect to the future
 	// lease holder.
+	//
+	// Note that we intentionally don't let TransferLease bypass the Replica
+	// circuit breaker. Transferring a lease while the replication layer is
+	// unavailable results in the "old" leaseholder relinquishing the ability
+	// to serve (strong) reads, without being able to hand over the lease.
 	return isWrite | isAlone | skipsLeaseCheck
 }
 func (*ProbeRequest) flags() flag {
-	return isWrite | isAlone | skipsLeaseCheck
+	return isWrite | isAlone | skipsLeaseCheck | bypassesReplicaCircuitBreaker
 }
-func (*RecomputeStatsRequest) flags() flag                { return isWrite | isAlone }
-func (*ComputeChecksumRequest) flags() flag               { return isWrite }
-func (*CheckConsistencyRequest) flags() flag              { return isAdmin | isRange | isAlone }
-func (*ExportRequest) flags() flag                        { return isRead | isRange | updatesTSCache }
+func (*RecomputeStatsRequest) flags() flag   { return isWrite | isAlone }
+func (*ComputeChecksumRequest) flags() flag  { return isWrite }
+func (*CheckConsistencyRequest) flags() flag { return isAdmin | isRange | isAlone }
+func (*ExportRequest) flags() flag {
+	return isRead | isRange | updatesTSCache | bypassesReplicaCircuitBreaker
+}
 func (*AdminScatterRequest) flags() flag                  { return isAdmin | isRange | isAlone }
 func (*AdminVerifyProtectedTimestampRequest) flags() flag { return isAdmin | isRange | isAlone }
 func (r *AddSSTableRequest) flags() flag {
-	flags := isWrite | isRange | isAlone | isUnsplittable | canBackpressure
-	if r.WriteAtRequestTimestamp {
+	flags := isWrite | isRange | isAlone | isUnsplittable | canBackpressure | bypassesReplicaCircuitBreaker
+	if r.SSTTimestampToRequestTimestamp.IsSet() {
 		flags |= appliesTSCache
 	}
 	return flags
@@ -1350,9 +1405,11 @@ func (r *RefreshRangeRequest) flags() flag {
 	return isRead | isTxn | isRange | updatesTSCache
 }
 
-func (*SubsumeRequest) flags() flag                { return isRead | isAlone | updatesTSCache }
-func (*RangeStatsRequest) flags() flag             { return isRead }
-func (*QueryResolvedTimestampRequest) flags() flag { return isRead | isRange }
+func (*SubsumeRequest) flags() flag    { return isRead | isAlone | updatesTSCache }
+func (*RangeStatsRequest) flags() flag { return isRead }
+func (*QueryResolvedTimestampRequest) flags() flag {
+	return isRead | isRange | requiresClosedTSOlderThanStorageSnapshot
+}
 func (*ScanInterleavedIntentsRequest) flags() flag { return isRead | isRange }
 func (*BarrierRequest) flags() flag                { return isWrite | isRange }
 
@@ -1458,6 +1515,11 @@ func (e *RangeFeedEvent) ShallowCopy() *RangeFeedEvent {
 		panic(fmt.Sprintf("unexpected RangeFeedEvent variant: %v", t))
 	}
 	return &cpy
+}
+
+// Timestamp is part of rangefeedbuffer.Event.
+func (e *RangeFeedValue) Timestamp() hlc.Timestamp {
+	return e.Value.Timestamp
 }
 
 // MakeReplicationChanges returns a slice of changes of the given type with an
@@ -1617,6 +1679,7 @@ var _ = (*TenantConsumption).Equal
 // Add consumption from the given structure.
 func (c *TenantConsumption) Add(other *TenantConsumption) {
 	c.RU += other.RU
+	c.KVRU += other.KVRU
 	c.ReadRequests += other.ReadRequests
 	c.ReadBytes += other.ReadBytes
 	c.WriteRequests += other.WriteRequests
@@ -1631,6 +1694,12 @@ func (c *TenantConsumption) Sub(other *TenantConsumption) {
 		c.RU = 0
 	} else {
 		c.RU -= other.RU
+	}
+
+	if c.KVRU < other.KVRU {
+		c.KVRU = 0
+	} else {
+		c.KVRU -= other.KVRU
 	}
 
 	if c.ReadRequests < other.ReadRequests {
@@ -1670,10 +1739,22 @@ func (c *TenantConsumption) Sub(other *TenantConsumption) {
 	}
 }
 
+func humanizePointCount(n uint64) redact.SafeString {
+	return redact.SafeString(humanize.SI(float64(n), ""))
+}
+
 // SafeFormat implements redact.SafeFormatter.
 func (s *ScanStats) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("scan stats: stepped %d times (%d internal); seeked %d times (%d internal)",
-		s.NumInterfaceSteps, s.NumInternalSteps, s.NumInterfaceSeeks, s.NumInternalSeeks)
+	w.Printf("scan stats: stepped %d times (%d internal); seeked %d times (%d internal); "+
+		"block-bytes: (total %s, cached %s); "+
+		"points: (count %s, key-bytes %s, value-bytes %s, tombstoned: %s)",
+		s.NumInterfaceSteps, s.NumInternalSteps, s.NumInterfaceSeeks, s.NumInternalSeeks,
+		humanizeutil.IBytes(int64(s.BlockBytes)),
+		humanizeutil.IBytes(int64(s.BlockBytesInCache)),
+		humanizePointCount(s.PointCount),
+		humanizeutil.IBytes(int64(s.KeyBytes)),
+		humanizeutil.IBytes(int64(s.ValueBytes)),
+		humanizePointCount(s.PointsCoveredByRangeTombstones))
 }
 
 // String implements fmt.Stringer.

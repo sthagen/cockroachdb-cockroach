@@ -26,11 +26,13 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -41,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -78,7 +81,7 @@ func TestSelfBootstrap(t *testing.T) {
 	}
 	defer s.Stopper().Stop(context.Background())
 
-	if s.RPCContext().ClusterID.Get() == uuid.Nil {
+	if s.RPCContext().StorageClusterID.Get() == uuid.Nil {
 		t.Error("cluster ID failed to be set on the RPC context")
 	}
 }
@@ -93,7 +96,7 @@ func TestPanicRecovery(t *testing.T) {
 	ts := s.(*TestServer)
 
 	// Enable a test-only endpoint that induces a panic.
-	ts.mux.Handle("/panic", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	ts.http.mux.Handle("/panic", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic("induced panic for testing")
 	}))
 
@@ -104,7 +107,7 @@ func TestPanicRecovery(t *testing.T) {
 	// Create a ResponseRecorder to record the response.
 	rr := httptest.NewRecorder()
 	require.NotPanics(t, func() {
-		ts.ServeHTTP(rr, req)
+		ts.http.baseHandler(rr, req)
 	})
 
 	// Check that the status code is correct.
@@ -294,7 +297,7 @@ func TestSecureHTTPRedirect(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
-	httpClient, err := s.GetHTTPClient()
+	httpClient, err := s.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +346,7 @@ func TestAcceptEncoding(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	client, err := s.GetAdminAuthenticatedHTTPClient()
+	client, err := s.GetAdminHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,12 +396,34 @@ func TestAcceptEncoding(t *testing.T) {
 	}
 }
 
+// TestSystemConfigGossip tests that system config gossip works in the mixed
+// version state. After the 22.1 release is finalized, system config gossip
+// will no longer occur.
+//
+// TODO(ajwerner): Delete this test in 22.2.
 func TestSystemConfigGossip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	settings := cluster.MakeTestingClusterSettingsWithVersions(
+		clusterversion.TestingBinaryMinSupportedVersion,
+		clusterversion.TestingBinaryMinSupportedVersion,
+		false,
+	)
+	serverArgs := base.TestServerArgs{
+		Settings: settings,
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableMergeQueue: true,
+			},
+			Server: &TestingKnobs{
+				BinaryVersionOverride:          clusterversion.TestingBinaryMinSupportedVersion,
+				DisableAutomaticVersionUpgrade: make(chan struct{}),
+			},
+		},
+	}
+	s, _, kvDB := serverutils.StartServer(t, serverArgs)
 	defer s.Stopper().Stop(ctx)
 	ts := s.(*TestServer)
 
@@ -410,7 +435,7 @@ func TestSystemConfigGossip(t *testing.T) {
 	}
 
 	// Register a callback for gossip updates.
-	resultChan := ts.Gossip().RegisterSystemConfigChannel()
+	resultChan := ts.Gossip().DeprecatedRegisterSystemConfigChannel()
 
 	// The span gets gossiped when it first shows up.
 	select {
@@ -422,7 +447,7 @@ func TestSystemConfigGossip(t *testing.T) {
 
 	// Write a system key with the transaction marked as having a Gossip trigger.
 	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
+		if err := txn.DeprecatedSetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
 			return err
 		}
 		return txn.Put(ctx, key, valAt(2))
@@ -438,7 +463,7 @@ func TestSystemConfigGossip(t *testing.T) {
 		var systemConfig *config.SystemConfig
 		select {
 		case <-resultChan:
-			systemConfig = ts.gossip.GetSystemConfig()
+			systemConfig = ts.gossip.DeprecatedGetSystemConfig()
 
 		case <-time.After(500 * time.Millisecond):
 			return errors.Errorf("did not receive gossip message")
@@ -805,8 +830,6 @@ func TestServeIndexHTML(t *testing.T) {
 			window.dataFromServer = %s;
 		</script>
 
-		<script src="protos.dll.js" type="text/javascript"></script>
-		<script src="vendor.dll.js" type="text/javascript"></script>
 		<script src="bundle.js" type="text/javascript"></script>
 	</body>
 </html>
@@ -832,7 +855,7 @@ func TestServeIndexHTML(t *testing.T) {
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
 
-		client, err := tsrv.GetHTTPClient()
+		client, err := tsrv.GetUnauthenticatedHTTPClient()
 		require.NoError(t, err)
 
 		t.Run("short build", func(t *testing.T) {
@@ -886,9 +909,9 @@ Binary built without web UI.
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
 
-		loggedInClient, err := tsrv.GetAdminAuthenticatedHTTPClient()
+		loggedInClient, err := tsrv.GetAdminHTTPClient()
 		require.NoError(t, err)
-		loggedOutClient, err := tsrv.GetHTTPClient()
+		loggedOutClient, err := tsrv.GetUnauthenticatedHTTPClient()
 		require.NoError(t, err)
 
 		cases := []struct {
@@ -931,6 +954,84 @@ Binary built without web UI.
 				respString := string(respBytes)
 				expected := fmt.Sprintf(htmlTemplate, testCase.json)
 				require.Equal(t, expected, respString)
+			})
+		}
+	})
+
+	t.Run("Client-side caching", func(t *testing.T) {
+		linkInFakeUI()
+		defer unlinkFakeUI()
+
+		// Set up fake asset FS
+		mapfs := fstest.MapFS{
+			"bundle.js": &fstest.MapFile{
+				Data: []byte("console.log('hello world');"),
+			},
+		}
+		fsys, err := mapfs.Sub(".")
+		require.NoError(t, err)
+		ui.Assets = fsys
+
+		// Clear fake asset FS when we're done
+		defer func() {
+			ui.Assets = nil
+		}()
+
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		defer s.Stopper().Stop(ctx)
+		tsrv := s.(*TestServer)
+
+		loggedInClient, err := tsrv.GetAdminHTTPClient()
+		require.NoError(t, err)
+		loggedOutClient, err := tsrv.GetUnauthenticatedHTTPClient()
+		require.NoError(t, err)
+
+		cases := []struct {
+			desc   string
+			client http.Client
+		}{
+			{
+				desc:   "unauthenticated user",
+				client: loggedOutClient,
+			},
+			{
+				desc:   "authenticated user",
+				client: loggedInClient,
+			},
+		}
+
+		for _, testCase := range cases {
+			t.Run(fmt.Sprintf("bundle caching for %s", testCase.desc), func(t *testing.T) {
+				// Request bundle.js without an If-None-Match header first, to simulate the initial load
+				uncachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL()+"/bundle.js", nil)
+				require.NoError(t, err)
+
+				uncachedResp, err := testCase.client.Do(uncachedReq)
+				require.NoError(t, err)
+				defer uncachedResp.Body.Close()
+				require.Equal(t, 200, uncachedResp.StatusCode)
+
+				etag := uncachedResp.Header.Get("ETag")
+				require.NotEmpty(t, etag, "Server must provide ETag response header with asset responses")
+
+				// Use that ETag header on the next request to simulate a client reload
+				cachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL()+"/bundle.js", nil)
+				require.NoError(t, err)
+				cachedReq.Header.Add("If-None-Match", etag)
+
+				cachedResp, err := testCase.client.Do(cachedReq)
+				require.NoError(t, err)
+				defer cachedResp.Body.Close()
+				require.Equal(t, 304, cachedResp.StatusCode)
+
+				respBytes, err := ioutil.ReadAll(cachedResp.Body)
+				require.NoError(t, err)
+				require.Empty(t, respBytes, "Server must provide empty body for cached response")
+
+				etagFromEmptyResp := cachedResp.Header.Get("ETag")
+				require.NotEmpty(t, etag, "Server must provide ETag response header with asset responses")
+
+				require.Equal(t, etag, etagFromEmptyResp, "Server must provide consistent ETag response headers")
 			})
 		}
 	})
@@ -1131,11 +1232,9 @@ func Test_makeFakeNodeStatuses(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := makeFakeNodeStatuses(tt.mapping)
-			if err == nil {
-				err = checkFakeStatuses(result, tt.storesSeen)
-			}
-			if err != nil {
+			result := makeFakeNodeStatuses(tt.mapping)
+			var err error
+			if err = checkFakeStatuses(result, tt.storesSeen); err != nil {
 				result = nil
 			}
 			require.Equal(t, tt.exp, result)

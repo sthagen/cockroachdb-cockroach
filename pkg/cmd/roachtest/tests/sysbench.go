@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/stretchr/testify/require"
 )
 
 type sysbenchWorkload int
@@ -98,10 +99,11 @@ func runSysbench(ctx context.Context, t test.Test, c cluster.Cluster, opts sysbe
 	t.Status("installing cockroach")
 	c.Put(ctx, t.Cockroach(), "./cockroach", allNodes)
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), roachNodes)
-	WaitFor3XReplication(t, c.Conn(ctx, t.L(), allNodes[0]))
+	err := WaitFor3XReplication(ctx, t, c.Conn(ctx, t.L(), allNodes[0]))
+	require.NoError(t, err)
 
 	t.Status("installing haproxy")
-	if err := c.Install(ctx, t.L(), loadNode, "haproxy"); err != nil {
+	if err = c.Install(ctx, t.L(), loadNode, "haproxy"); err != nil {
 		t.Fatal(err)
 	}
 	c.Run(ctx, loadNode, "./cockroach gen haproxy --insecure --url {pgurl:1}")
@@ -135,7 +137,7 @@ func registerSysbench(r registry.Registry) {
 	for w := sysbenchWorkload(0); w < numSysbenchWorkloads; w++ {
 		const n = 3
 		const cpus = 32
-		const conc = 4 * cpus
+		const conc = 8 * cpus
 		opts := sysbenchOptions{
 			workload:     w,
 			duration:     10 * time.Minute,

@@ -432,7 +432,7 @@ var aggregatorsTestCases = []aggregatorTestCase{
 		},
 		expected: colexectestutils.Tuples{
 			{0, "1.5333333333333333333", 4.6},
-			{1, 4.32, 8.64},
+			{1, "4.3200000000000000000", 8.64},
 		},
 		convToDecimal: true,
 	},
@@ -610,10 +610,10 @@ var aggregatorsTestCases = []aggregatorTestCase{
 			execinfrapb.ConcatAgg,
 		},
 		expected: colexectestutils.Tuples{
-			{0, 2, 2.1, 2, 4.2, 5, 2, 3, false, true, "zero", "zerozero"},
-			{1, 2, 2.6, 2, 5.2, 1, 0, 1, false, false, "one", "oneone"},
-			{2, 1, 1.1, 1, 1.1, 1, 1, 1, true, true, "two", "two"},
-			{3, 2, 4.6, 2, 9.2, 0, 0, 0, false, true, "three", "threethree"},
+			{0, 2, "2.1000000000000000000", 2, 4.2, 5, 2, 3, false, true, "zero", "zerozero"},
+			{1, 2, "2.6000000000000000000", 2, 5.2, 1, 0, 1, false, false, "one", "oneone"},
+			{2, 1, "1.1000000000000000000", 1, 1.1, 1, 1, 1, true, true, "two", "two"},
+			{3, 2, "4.6000000000000000000", 2, 9.2, 0, 0, 0, false, true, "three", "threethree"},
 		},
 		convToDecimal: true,
 	},
@@ -644,8 +644,8 @@ var aggregatorsTestCases = []aggregatorTestCase{
 			execinfrapb.ConcatAgg,
 		},
 		expected: colexectestutils.Tuples{
-			{nil, 1, 1.1, 1, 1.1, 1.1, 4, 4, 4, true, true, "a"},
-			{0, 2, 3.1, 1, 3.1, 3.1, 5, 5, 5, nil, nil, "b"},
+			{nil, 1, 1.1, 1, 1.1, "1.1000000000000000000", 4, 4, 4, true, true, "a"},
+			{0, 2, 3.1, 1, 3.1, "3.1000000000000000000", 5, 5, 5, nil, nil, "b"},
 			{1, 2, nil, 0, nil, nil, nil, nil, nil, false, false, nil},
 		},
 		convToDecimal: true,
@@ -1152,7 +1152,7 @@ func benchmarkAggregateFunction(
 						break
 					}
 				}
-				if err = a.(colexecop.Closer).Close(); err != nil {
+				if err = a.(colexecop.Closer).Close(ctx); err != nil {
 					b.Fatal(err)
 				}
 				source.Reset(ctx)
@@ -1172,25 +1172,17 @@ func BenchmarkAggregator(b *testing.B) {
 		numRows = []int{32, 32 * coldata.BatchSize()}
 		groupSizes = []int{1, coldata.BatchSize()}
 	}
-	for _, aggFn := range []execinfrapb.AggregatorSpec_Func{
-		// We choose any_not_null aggregate function because it is the simplest
-		// possible and, thus, its Compute function call will have the least
-		// impact when benchmarking the aggregator logic.
-		execinfrapb.AnyNotNull,
-		// min aggregate function has been used before transitioning to
-		// any_not_null in 22.1 cycle. It is kept so that we could use it for
-		// comparison of 22.1 against 21.2.
-		// TODO(yuzefovich): use only any_not_null in 22.2 (#75106).
-		execinfrapb.Min,
-	} {
-		for _, agg := range aggTypes {
-			for _, numInputRows := range numRows {
-				for _, groupSize := range groupSizes {
-					benchmarkAggregateFunction(
-						b, agg, aggFn, []*types.T{types.Int}, 1, /* numGroupCol */
-						groupSize, 0 /* distinctProb */, numInputRows,
-						0 /* chunkSize */, 0 /* limit */)
-				}
+	// We choose any_not_null aggregate function because it is the simplest
+	// possible and, thus, its Compute function call will have the least impact
+	// when benchmarking the aggregator logic.
+	aggFn := execinfrapb.AnyNotNull
+	for _, agg := range aggTypes {
+		for _, numInputRows := range numRows {
+			for _, groupSize := range groupSizes {
+				benchmarkAggregateFunction(
+					b, agg, aggFn, []*types.T{types.Int}, 1, /* numGroupCol */
+					groupSize, 0 /* distinctProb */, numInputRows,
+					0 /* chunkSize */, 0 /* limit */)
 			}
 		}
 	}

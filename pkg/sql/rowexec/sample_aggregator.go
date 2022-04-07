@@ -152,8 +152,9 @@ func newSampleAggregator(
 	)
 	for i := range spec.InvertedSketches {
 		var sr stats.SampleReservoir
-		// The datums are converted to their inverted index bytes and
-		// sent as a single DBytes column.
+		// The datums are converted to their inverted index bytes and sent as a
+		// single DBytes column. We do not use DEncodedKey here because it would
+		// introduce backward compatibility complications.
 		var srCols util.FastIntSet
 		srCols.Add(0)
 		sr.Init(int(spec.SampleSize), int(spec.MinSampleSize), bytesRowType, &s.memAcc, srCols)
@@ -587,7 +588,8 @@ func (s *sampleAggregator) generateHistogram(
 			prevCapacity, sr.Cap(),
 		)
 	}
-	return stats.EquiDepthHistogram(evalCtx, colType, values, numRows, distinctCount, maxBuckets)
+	h, _, err := stats.EquiDepthHistogram(evalCtx, colType, values, numRows, distinctCount, maxBuckets)
+	return h, err
 }
 
 var _ execinfra.DoesNotUseTxn = &sampleAggregator{}

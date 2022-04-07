@@ -540,9 +540,8 @@ func formatPebbleMetamorphicIssue(
 			s := f.testMessage[i+len(seedHeader):]
 			s = strings.TrimSpace(s)
 			s = strings.TrimSpace(s[:strings.Index(s, "\n")])
-
 			repro = fmt.Sprintf("go test -mod=vendor -tags 'invariants' -exec 'stress -p 1' "+
-				`-timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed %s -ops "uniform:5000-25000"`, s)
+				`-timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed %s -ops "uniform:5000-10000"`, s)
 		}
 	}
 	return issues.UnitTestFormatter, issues.PostRequest{

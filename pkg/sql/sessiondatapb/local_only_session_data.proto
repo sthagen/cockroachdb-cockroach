@@ -101,8 +101,7 @@ message LocalOnlySessionData {
   // OverrideMultiRegionZoneConfigEnabled indicates whether zone configurations can be
   // modified for multi-region databases and tables/indexes/partitions.
   bool override_multi_region_zone_config_enabled = 24;
-  // HashShardedIndexesEnabled indicates whether hash sharded indexes can be created.
-  bool hash_sharded_indexes_enabled = 25;
+  reserved 25;
   // DisallowFullTableScans indicates whether queries that plan full table scans
   // should be rejected.
   bool disallow_full_table_scans = 26;
@@ -226,6 +225,27 @@ message LocalOnlySessionData {
   // and joins using the same default number of bytes per column instead of
   // column sizes from the AvgSize table statistic.
   bool cost_scans_with_default_col_size = 61;
+  // DefaultTxnQualityOfService indicates the default QoSLevel/WorkPriority of
+  // newly created transactions.
+  int32 default_txn_quality_of_service = 62 [(gogoproto.casttype)="QoSLevel"];
+  // OptSplitScanLimit indicates the maximum number of UNION ALL statements a
+  // Scan may be split into during query optimization to avoid a sort.
+  int32 opt_split_scan_limit = 63;
+  // EnableSuperRegions is true when super region functionality is enabled.
+  bool enable_super_regions = 64;
+  // OverrideAlterPrimaryRegionInSuperRegion is true when the user is allowed
+  // to modify a primary region that is part of a super region.
+  bool override_alter_primary_region_in_super_region = 65;
+  // EnableImplicitTransactionForBatchStatements configures the handling of
+  // multiple statements in a single query. If enabled, then an implicit
+  // transaction is used when multiple statements are sent in a single query.
+  // Setting this to false is a divergence from the pgwire protocol, but
+  // matches the behavior of CockroachDB v21.2 and earlier.
+  bool enable_implicit_transaction_for_batch_statements = 66;
+  // ExpectAndIgnoreNotVisibleColumnsInCopy changes behaviour for COPY t FROM ...
+  // (with no column name specifiers) to expect and ignore not visible column
+  // fields.
+  bool expect_and_ignore_not_visible_columns_in_copy = 67;
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //

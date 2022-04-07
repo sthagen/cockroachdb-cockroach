@@ -23,10 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // RelExpr is implemented by all operators tagged as Relational. Relational
@@ -593,10 +594,10 @@ func (sj *SemiJoinExpr) getMultiplicity() props.JoinMultiplicity {
 // WindowFrame denotes the definition of a window frame for an individual
 // window function, excluding the OFFSET expressions, if present.
 type WindowFrame struct {
-	Mode           tree.WindowFrameMode
-	StartBoundType tree.WindowFrameBoundType
-	EndBoundType   tree.WindowFrameBoundType
-	FrameExclusion tree.WindowFrameExclusion
+	Mode           treewindow.WindowFrameMode
+	StartBoundType treewindow.WindowFrameBoundType
+	EndBoundType   treewindow.WindowFrameBoundType
+	FrameExclusion treewindow.WindowFrameExclusion
 }
 
 // HasOffset returns true if the WindowFrame contains a specific offset.
@@ -607,21 +608,21 @@ func (f *WindowFrame) HasOffset() bool {
 func (f *WindowFrame) String() string {
 	var bld strings.Builder
 	switch f.Mode {
-	case tree.GROUPS:
+	case treewindow.GROUPS:
 		fmt.Fprintf(&bld, "groups")
-	case tree.ROWS:
+	case treewindow.ROWS:
 		fmt.Fprintf(&bld, "rows")
-	case tree.RANGE:
+	case treewindow.RANGE:
 		fmt.Fprintf(&bld, "range")
 	}
 
-	frameBoundName := func(b tree.WindowFrameBoundType) string {
+	frameBoundName := func(b treewindow.WindowFrameBoundType) string {
 		switch b {
-		case tree.UnboundedFollowing, tree.UnboundedPreceding:
+		case treewindow.UnboundedFollowing, treewindow.UnboundedPreceding:
 			return "unbounded"
-		case tree.CurrentRow:
+		case treewindow.CurrentRow:
 			return "current-row"
-		case tree.OffsetFollowing, tree.OffsetPreceding:
+		case treewindow.OffsetFollowing, treewindow.OffsetPreceding:
 			return "offset"
 		}
 		panic(errors.AssertionFailedf("unexpected bound"))
@@ -631,11 +632,11 @@ func (f *WindowFrame) String() string {
 		frameBoundName(f.EndBoundType),
 	)
 	switch f.FrameExclusion {
-	case tree.ExcludeCurrentRow:
+	case treewindow.ExcludeCurrentRow:
 		bld.WriteString(" exclude current row")
-	case tree.ExcludeGroup:
+	case treewindow.ExcludeGroup:
 		bld.WriteString(" exclude group")
-	case tree.ExcludeTies:
+	case treewindow.ExcludeTies:
 		bld.WriteString(" exclude ties")
 	}
 	return bld.String()
@@ -665,6 +666,12 @@ func (s *ScanPrivate) IsFullIndexScan(md *opt.Metadata) bool {
 	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
 		s.InvertedConstraint == nil &&
 		s.HardLimit == 0
+}
+
+// IsVirtualTable returns true if the table being scanned is a virtual table.
+func (s *ScanPrivate) IsVirtualTable(md *opt.Metadata) bool {
+	tab := md.Table(s.Table)
+	return tab.IsVirtualTable()
 }
 
 // IsLocking returns true if the ScanPrivate is configured to use a row-level
@@ -749,7 +756,7 @@ func (m *MutationPrivate) MapToInputCols(cols opt.ColSet) opt.ColSet {
 	tabCols.ForEach(func(t opt.ColumnID) {
 		id := m.MapToInputID(t)
 		if id == 0 {
-			panic(errors.AssertionFailedf("could not find input column for %d", log.Safe(t)))
+			panic(errors.AssertionFailedf("could not find input column for %d", redact.Safe(t)))
 		}
 		inCols.Add(id)
 	})
@@ -829,6 +836,52 @@ func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
 // columns plus the synthesized columns.
 func (prj *ProjectExpr) InternalFDs() *props.FuncDepSet {
 	return &prj.internalFuncDeps
+}
+
+// FindInlinableConstants returns the set of input columns that are synthesized
+// constant value expressions: ConstOp, TrueOp, FalseOp, or NullOp. Constant
+// value expressions can often be inlined into referencing expressions. Only
+// Project and Values operators synthesize constant value expressions.
+func FindInlinableConstants(input RelExpr) opt.ColSet {
+	var cols opt.ColSet
+	if project, ok := input.(*ProjectExpr); ok {
+		for i := range project.Projections {
+			item := &project.Projections[i]
+			if opt.IsConstValueOp(item.Element) {
+				cols.Add(item.Col)
+			}
+		}
+	} else if values, ok := input.(*ValuesExpr); ok && len(values.Rows) == 1 {
+		tup := values.Rows[0].(*TupleExpr)
+		for i, scalar := range tup.Elems {
+			if opt.IsConstValueOp(scalar) {
+				cols.Add(values.Cols[i])
+			}
+		}
+	}
+	return cols
+}
+
+// ExtractColumnFromProjectOrValues searches a Project or Values input
+// expression for the column having the given id. It returns the expression for
+// that column.
+func ExtractColumnFromProjectOrValues(input RelExpr, col opt.ColumnID) opt.ScalarExpr {
+	if project, ok := input.(*ProjectExpr); ok {
+		for i := range project.Projections {
+			item := &project.Projections[i]
+			if item.Col == col {
+				return item.Element
+			}
+		}
+	} else if values, ok := input.(*ValuesExpr); ok && len(values.Rows) == 1 {
+		tup := values.Rows[0].(*TupleExpr)
+		for i, scalar := range tup.Elems {
+			if values.Cols[i] == col {
+				return scalar
+			}
+		}
+	}
+	panic(errors.AssertionFailedf("could not find column to extract"))
 }
 
 // ExprIsNeverNull makes a best-effort attempt to prove that the provided

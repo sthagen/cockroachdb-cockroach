@@ -84,7 +84,7 @@ func (t *testProposerRaft) Step(msg raftpb.Message) error {
 	}
 	// Decode and save all the commands.
 	for _, e := range msg.Entries {
-		_ /* idKey */, encodedCommand := DecodeRaftCommand(e.Data)
+		_ /* idKey */, encodedCommand := kvserverbase.DecodeRaftCommand(e.Data)
 		t.proposals = append(t.proposals, kvserverpb.RaftCommand{})
 		if err := protoutil.Unmarshal(encodedCommand, &t.proposals[len(t.proposals)-1]); err != nil {
 			return err
@@ -117,7 +117,7 @@ func (t *testProposer) rlocker() sync.Locker {
 	return t.RWMutex.RLocker()
 }
 
-func (t *testProposer) replicaID() roachpb.ReplicaID {
+func (t *testProposer) getReplicaID() roachpb.ReplicaID {
 	return 1
 }
 
@@ -170,7 +170,7 @@ func (t *testProposer) leaderStatusRLocked(raftGroup proposerRaft) rangeLeaderIn
 	var iAmTheLeader, leaderEligibleForLease bool
 	if leaderKnown {
 		leaderRep = roachpb.ReplicaID(raftGroup.BasicStatus().Lead)
-		iAmTheLeader = leaderRep == t.replicaID()
+		iAmTheLeader = leaderRep == t.getReplicaID()
 		repDesc := roachpb.ReplicaDescriptor{
 			ReplicaID: leaderRep,
 			Type:      &t.leaderReplicaType,
@@ -249,11 +249,11 @@ func (pc proposalCreator) newProposal(ba roachpb.BatchRequest) *ProposalData {
 
 func (pc proposalCreator) encodeProposal(p *ProposalData) []byte {
 	cmdLen := p.command.Size()
-	needed := raftCommandPrefixLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
-	data := make([]byte, raftCommandPrefixLen, needed)
-	encodeRaftCommandPrefix(data, raftVersionStandard, p.idKey)
-	data = data[:raftCommandPrefixLen+p.command.Size()]
-	if _, err := protoutil.MarshalTo(p.command, data[raftCommandPrefixLen:]); err != nil {
+	needed := kvserverbase.RaftCommandPrefixLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
+	data := make([]byte, kvserverbase.RaftCommandPrefixLen, needed)
+	kvserverbase.EncodeRaftCommandPrefix(data, kvserverbase.RaftVersionStandard, p.idKey)
+	data = data[:kvserverbase.RaftCommandPrefixLen+p.command.Size()]
+	if _, err := protoutil.MarshalTo(p.command, data[kvserverbase.RaftCommandPrefixLen:]); err != nil {
 		panic(err)
 	}
 	return data
@@ -521,9 +521,9 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var p testProposer
 			var pc proposalCreator
-			// p.replicaID() is hardcoded; it'd better be hardcoded to what this test
-			// expects.
-			require.Equal(t, self, uint64(p.replicaID()))
+			// p.getReplicaID() is hardcoded; it'd better be hardcoded to what this
+			// test expects.
+			require.Equal(t, self, uint64(p.getReplicaID()))
 
 			var rejected roachpb.ReplicaID
 			if tc.expRejection {

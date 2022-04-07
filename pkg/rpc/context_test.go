@@ -83,7 +83,6 @@ func newTestServer(t testing.TB, ctx *Context, extraOpts ...grpc.ServerOption) *
 	}
 	opts := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
-		grpc.StatsHandler(&ctx.stats),
 	}
 	opts = append(opts, extraOpts...)
 	return grpc.NewServer(opts...)
@@ -102,9 +101,9 @@ func newTestContextWithKnobs(
 	})
 }
 
-func newTestContext(clusterID uuid.UUID, clock *hlc.Clock, stopper *stop.Stopper) *Context {
+func newTestContext(storageClusterID uuid.UUID, clock *hlc.Clock, stopper *stop.Stopper) *Context {
 	return newTestContextWithKnobs(clock, stopper, ContextTestingKnobs{
-		ClusterID: &clusterID,
+		StorageClusterID: &storageClusterID,
 	})
 }
 
@@ -128,7 +127,7 @@ func TestHeartbeatCB(t *testing.T) {
 		RegisterHeartbeatServer(s, &HeartbeatService{
 			clock:              clock,
 			remoteClockMonitor: serverCtx.RemoteClocks,
-			clusterID:          serverCtx.ClusterID,
+			clusterID:          serverCtx.StorageClusterID,
 			nodeID:             serverCtx.NodeID,
 			settings:           serverCtx.Settings,
 		})
@@ -179,13 +178,13 @@ func TestPingInterceptors(t *testing.T) {
 		Clock:    hlc.NewClock(hlc.UnixNano, 500*time.Millisecond),
 		Stopper:  stop.NewStopper(),
 		Settings: cluster.MakeTestingClusterSettings(),
-		OnOutgoingPing: func(req *PingRequest) error {
+		OnOutgoingPing: func(ctx context.Context, req *PingRequest) error {
 			if req.TargetNodeID == blockedTargetNodeID {
 				return errBoomSend
 			}
 			return nil
 		},
-		OnIncomingPing: func(req *PingRequest) error {
+		OnIncomingPing: func(ctx context.Context, req *PingRequest) error {
 			if req.OriginNodeID == blockedOriginNodeID {
 				return errBoomRecv
 			}
@@ -270,15 +269,9 @@ func (*internalServer) GetSpanConfigs(
 	panic("unimplemented")
 }
 
-func (*internalServer) UpdateSystemSpanConfigs(
-	context.Context, *roachpb.UpdateSystemSpanConfigsRequest,
-) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
-	panic("unimplemented")
-}
-
-func (*internalServer) GetSystemSpanConfigs(
-	context.Context, *roachpb.GetSystemSpanConfigsRequest,
-) (*roachpb.GetSystemSpanConfigsResponse, error) {
+func (*internalServer) GetAllSystemSpanConfigsThatApply(
+	context.Context, *roachpb.GetAllSystemSpanConfigsThatApplyRequest,
+) (*roachpb.GetAllSystemSpanConfigsThatApplyResponse, error) {
 	panic("unimplemented")
 }
 
@@ -609,7 +602,7 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		clusterID:          serverCtx.ClusterID,
+		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
 		settings:           serverCtx.Settings,
 	})
@@ -790,7 +783,7 @@ func TestOffsetMeasurement(t *testing.T) {
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              serverClock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		clusterID:          serverCtx.ClusterID,
+		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
 		settings:           serverCtx.Settings,
 	})
@@ -970,7 +963,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 		RegisterHeartbeatServer(s, &HeartbeatService{
 			clock:              clock,
 			remoteClockMonitor: nodeCtxs[i].ctx.RemoteClocks,
-			clusterID:          nodeCtxs[i].ctx.ClusterID,
+			clusterID:          nodeCtxs[i].ctx.StorageClusterID,
 			nodeID:             nodeCtxs[i].ctx.NodeID,
 			settings:           nodeCtxs[i].ctx.Settings,
 		})
@@ -1011,13 +1004,13 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 
 	for i, nodeCtx := range nodeCtxs {
 		if nodeOffset := nodeCtx.offset; nodeOffset > maxOffset {
-			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.masterCtx); testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
+			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.MasterCtx); testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
 				t.Logf("max offset: %s - node %d with excessive clock offset of %s returned expected error: %s", maxOffset, i, nodeOffset, err)
 			} else {
 				t.Errorf("max offset: %s - node %d with excessive clock offset of %s returned unexpected error: %v", maxOffset, i, nodeOffset, err)
 			}
 		} else {
-			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.masterCtx); err != nil {
+			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.MasterCtx); err != nil {
 				t.Errorf("max offset: %s - node %d with acceptable clock offset of %s returned unexpected error: %s", maxOffset, i, nodeOffset, err)
 			} else {
 				t.Logf("max offset: %s - node %d with acceptable clock offset of %s did not return an error, as expected", maxOffset, i, nodeOffset)
@@ -1152,7 +1145,6 @@ func grpcRunKeepaliveTestCase(testCtx context.Context, c grpcKeepaliveTestCase) 
 	}
 	s := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
-		grpc.StatsHandler(&serverCtx.stats),
 		grpc.KeepaliveParams(sKeepalive),
 	)
 
@@ -1164,7 +1156,7 @@ func grpcRunKeepaliveTestCase(testCtx context.Context, c grpcKeepaliveTestCase) 
 		HeartbeatService: HeartbeatService{
 			clock:              clock,
 			remoteClockMonitor: serverCtx.RemoteClocks,
-			clusterID:          serverCtx.ClusterID,
+			clusterID:          serverCtx.StorageClusterID,
 			nodeID:             serverCtx.NodeID,
 			settings:           serverCtx.Settings,
 		},
@@ -1443,7 +1435,7 @@ func TestClusterIDMismatch(t *testing.T) {
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		clusterID:          serverCtx.ClusterID,
+		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
 		settings:           serverCtx.Settings,
 	})
@@ -1516,7 +1508,7 @@ func TestClusterNameMismatch(t *testing.T) {
 			RegisterHeartbeatServer(s, &HeartbeatService{
 				clock:                          clock,
 				remoteClockMonitor:             serverCtx.RemoteClocks,
-				clusterID:                      serverCtx.ClusterID,
+				clusterID:                      serverCtx.StorageClusterID,
 				nodeID:                         serverCtx.NodeID,
 				settings:                       serverCtx.Settings,
 				clusterName:                    serverCtx.Config.ClusterName,
@@ -1529,7 +1521,7 @@ func TestClusterNameMismatch(t *testing.T) {
 			}
 			remoteAddr := ln.Addr().String()
 
-			clientCtx := newTestContext(serverCtx.ClusterID.Get(), clock, stopper)
+			clientCtx := newTestContext(serverCtx.StorageClusterID.Get(), clock, stopper)
 			clientCtx.Config.ClusterName = c.clientName
 			clientCtx.Config.DisableClusterNameVerification = c.clientDisablePeerCheck
 
@@ -1566,7 +1558,7 @@ func TestNodeIDMismatch(t *testing.T) {
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		clusterID:          serverCtx.ClusterID,
+		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
 		settings:           serverCtx.Settings,
 	})
@@ -1639,7 +1631,7 @@ func TestVersionCheckBidirectional(t *testing.T) {
 			RegisterHeartbeatServer(s, &HeartbeatService{
 				clock:              clock,
 				remoteClockMonitor: serverCtx.RemoteClocks,
-				clusterID:          serverCtx.ClusterID,
+				clusterID:          serverCtx.StorageClusterID,
 				nodeID:             serverCtx.NodeID,
 				settings:           serverCtx.Settings,
 			})
@@ -1685,7 +1677,7 @@ func TestGRPCDialClass(t *testing.T) {
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		clusterID:          serverCtx.ClusterID,
+		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
 		settings:           serverCtx.Settings,
 	})
@@ -1693,7 +1685,7 @@ func TestGRPCDialClass(t *testing.T) {
 	ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
 	require.Nil(t, err)
 	remoteAddr := ln.Addr().String()
-	clientCtx := newTestContext(serverCtx.ClusterID.Get(), clock, stopper)
+	clientCtx := newTestContext(serverCtx.StorageClusterID.Get(), clock, stopper)
 
 	def1 := clientCtx.GRPCDialNode(remoteAddr, serverNodeID, DefaultClass)
 	sys1 := clientCtx.GRPCDialNode(remoteAddr, serverNodeID, SystemClass)
@@ -1743,7 +1735,7 @@ func TestTestingKnobs(t *testing.T) {
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		clusterID:          serverCtx.ClusterID,
+		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
 		settings:           serverCtx.Settings,
 	})
@@ -1772,7 +1764,7 @@ func TestTestingKnobs(t *testing.T) {
 		seen[call]++
 	}
 	clientCtx := newTestContextWithKnobs(clock, stopper, ContextTestingKnobs{
-		ClusterID: &clusterID,
+		StorageClusterID: &clusterID,
 		StreamClientInterceptor: func(
 			target string, class ConnectionClass,
 		) grpc.StreamClientInterceptor {
@@ -1901,13 +1893,13 @@ func TestRunHeartbeatSetsHeartbeatStateWhenExitingBeforeFirstHeartbeat(t *testin
 	redialChan := make(chan struct{})
 	close(redialChan)
 
-	c.grpcConn, _, c.dialErr = rpcCtx.grpcDialRaw(rpcCtx.masterCtx, remoteAddr, serverNodeID, DefaultClass)
+	c.grpcConn, _, c.dialErr = rpcCtx.grpcDialRaw(rpcCtx.MasterCtx, remoteAddr, serverNodeID, DefaultClass)
 	require.NoError(t, c.dialErr)
 	// It is possible that the redial chan being closed is not seen on the first
 	// pass through the loop.
 	// NB: we use rpcCtx.masterCtx and not just ctx because we need
 	// this to be cancelled when the RPC context is closed.
-	err = rpcCtx.runHeartbeat(rpcCtx.masterCtx, c, "", redialChan)
+	err = rpcCtx.runHeartbeat(rpcCtx.MasterCtx, c, "", redialChan)
 	require.EqualError(t, err, grpcutil.ErrCannotReuseClientConn.Error())
 	// Even when the runHeartbeat returns, we could have heartbeated successfully.
 	// If we did not, then we expect the `not yet heartbeated` error.

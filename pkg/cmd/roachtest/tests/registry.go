@@ -34,6 +34,7 @@ func RegisterTests(r registry.Registry) {
 	registerDiskFull(r)
 	RegisterDiskStalledDetection(r)
 	registerDjango(r)
+	registerDrain(r)
 	registerDrop(r)
 	registerEncryption(r)
 	registerEngineSwitch(r)
@@ -75,7 +76,6 @@ func RegisterTests(r registry.Registry) {
 	registerPgx(r)
 	registerNodeJSPostgres(r)
 	registerPop(r)
-	registerPrivilegeVersionUpgrade(r)
 	registerPsycopg(r)
 	registerQueue(r)
 	registerQuitAllNodes(r)
@@ -124,6 +124,8 @@ func RegisterTests(r registry.Registry) {
 	registerOverload(r)
 	registerMultiTenantUpgrade(r)
 	registerVersionUpgradePublicSchema(r)
+	registerRemoveInvalidDatabasePrivileges(r)
+	registerValidateSystemSchemaAfterVersionUpgrade(r)
 }
 
 // RegisterBenchmarks registers all benchmarks to the registry. This powers `roachtest bench`.

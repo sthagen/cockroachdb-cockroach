@@ -13,118 +13,8 @@ import Long from "long";
 import { createMemoryHistory } from "history";
 import { noop } from "lodash";
 import { StatementDetailsProps } from "./statementDetails";
-import { ExecStats } from "../util";
 
 const history = createMemoryHistory({ initialEntries: ["/statements"] });
-
-const execStats: Required<ExecStats> = {
-  count: Long.fromNumber(1),
-  network_bytes: {
-    mean: 4160407,
-    squared_diffs: 47880000000000,
-  },
-  max_mem_usage: {
-    mean: 4160407,
-    squared_diffs: 47880000000000,
-  },
-  contention_time: {
-    mean: 4160407,
-    squared_diffs: 47880000000000,
-  },
-  network_messages: {
-    mean: 4160407,
-    squared_diffs: 47880000000000,
-  },
-  max_disk_usage: {
-    mean: 4160407,
-    squared_diffs: 47880000000000,
-  },
-};
-
-const statementStats: any = {
-  count: Long.fromNumber(36958),
-  first_attempt_count: Long.fromNumber(36958),
-  max_retries: Long.fromNumber(0),
-  num_rows: {
-    mean: 11.651577466313078,
-    squared_diffs: 1493154.3630337175,
-  },
-  parse_lat: {
-    mean: 0,
-    squared_diffs: 0,
-  },
-  plan_lat: {
-    mean: 0.00022804377942529385,
-    squared_diffs: 0.0030062544511648935,
-  },
-  run_lat: {
-    mean: 0.00098355830943233,
-    squared_diffs: 0.04090499253784317,
-  },
-  service_lat: {
-    mean: 0.0013101634016992284,
-    squared_diffs: 0.055668241814216965,
-  },
-  overhead_lat: {
-    mean: 0.00009856131284160407,
-    squared_diffs: 0.0017520019405651047,
-  },
-  bytes_read: {
-    mean: 4160407,
-    squared_diffs: 47880000000000,
-  },
-  rows_read: {
-    mean: 7,
-    squared_diffs: 1000000,
-  },
-  rows_written: {
-    mean: 1,
-    squared_diffs: 10,
-  },
-  last_exec_timestamp: {
-    seconds: Long.fromInt(1599670292),
-    nanos: 111613000,
-  },
-  database: "defaultdb",
-  nodes: [Long.fromInt(1), Long.fromInt(2)],
-  sensitive_info: {
-    last_err: "",
-    most_recent_plan_description: {
-      name: "render",
-      attrs: [
-        {
-          key: "render",
-          value: "city",
-        },
-        {
-          key: "render",
-          value: "id",
-        },
-      ],
-      children: [
-        {
-          name: "scan",
-          attrs: [
-            {
-              key: "table",
-              value: "vehicles@vehicles_auto_index_fk_city_ref_users",
-            },
-            {
-              key: "spans",
-              value: "1 span",
-            },
-          ],
-          children: [],
-        },
-      ],
-    },
-  },
-  exec_stats: execStats,
-};
-
-const fingerprintID = "4705782015019656142";
-const aggregatedTs = Date.parse("Sep 15 2021 01:00:00 GMT") * 1e-3;
-const aggregationInterval = 3600; // 1 hour
 
 export const getStatementDetailsPropsFixture = (): StatementDetailsProps => ({
   history,
@@ -146,82 +36,694 @@ export const getStatementDetailsPropsFixture = (): StatementDetailsProps => ({
   timeScale: {
     windowSize: moment.duration(5, "day"),
     sampleSize: moment.duration(5, "minutes"),
-    windowEnd: moment.utc("2021.12.12"),
+    fixedWindowEnd: moment.utc("2021.12.12"),
     key: "Custom",
   },
-  statement: {
-    statement:
-      "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
-    stats: statementStats,
-    database: "defaultdb",
-    byNode: [
+  statementDetails: {
+    statement: {
+      metadata: {
+        query: "SELECT * FROM crdb_internal.node_build_info",
+        app_names: ["$ cockroach sql", "newname"],
+        dist_sql_count: new Long(2),
+        failed_count: new Long(2),
+        implicit_txn: true,
+        vec_count: new Long(2),
+        full_scan_count: new Long(2),
+        databases: ["defaultdb"],
+        query_summary: "SELECT * FROM crdb_internal.node_build_info",
+        formatted_query: "SELECT * FROM crdb_internal.node_build_info\n",
+        stmt_type: "DDL",
+        total_count: new Long(3),
+      },
+      stats: {
+        count: new Long(5),
+        first_attempt_count: new Long(5),
+        max_retries: new Long(0),
+        legacy_last_err: "",
+        legacy_last_err_redacted: "",
+        num_rows: {
+          mean: 6,
+          squared_diffs: 0,
+        },
+        parse_lat: {
+          mean: 0.0000876,
+          squared_diffs: 2.35792e-8,
+        },
+        plan_lat: {
+          mean: 0.008131,
+          squared_diffs: 0.00127640837,
+        },
+        run_lat: {
+          mean: 0.0002796,
+          squared_diffs: 2.401919999999999e-8,
+        },
+        service_lat: {
+          mean: 0.008522,
+          squared_diffs: 0.001298238058,
+        },
+        overhead_lat: {
+          mean: 0.000023799999999999972,
+          squared_diffs: 5.492799999999973e-9,
+        },
+        sensitive_info: {
+          last_err: "",
+          most_recent_plan_description: {
+            name: "virtual table",
+            attrs: [
+              {
+                key: "Table",
+                value: "node_build_info@primary",
+              },
+            ],
+            children: [],
+          },
+          most_recent_plan_timestamp: {
+            seconds: new Long(1614851546),
+            nanos: 956814000,
+          },
+        },
+        bytes_read: {
+          mean: 0,
+          squared_diffs: 0,
+        },
+        rows_read: {
+          mean: 0,
+          squared_diffs: 0,
+        },
+        rows_written: {
+          mean: 0,
+          squared_diffs: 0,
+        },
+        exec_stats: {
+          count: new Long(5),
+          network_bytes: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          max_mem_usage: {
+            mean: 10240,
+            squared_diffs: 0,
+          },
+          contention_time: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          network_messages: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          max_disk_usage: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+        },
+        sql_type: "TypeDML",
+        last_exec_timestamp: {
+          seconds: Long.fromInt(1599670290),
+          nanos: 111613000,
+        },
+        nodes: [new Long(1)],
+        plan_gists: ["AgH6////nxkAAA4AAAAGBg=="],
+      },
+    },
+    statement_statistics_per_aggregated_ts: [
       {
-        aggregatedFingerprintID: fingerprintID,
-        label: "4",
-        summary:
-          "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
-        aggregatedTs,
-        aggregationInterval,
-        implicitTxn: true,
-        database: "defaultdb",
-        fullScan: true,
-        stats: statementStats,
+        stats: {
+          count: new Long(1),
+          first_attempt_count: new Long(1),
+          max_retries: new Long(0),
+          legacy_last_err: "",
+          legacy_last_err_redacted: "",
+          num_rows: {
+            mean: 6,
+            squared_diffs: 0,
+          },
+          parse_lat: {
+            mean: 0.00004,
+            squared_diffs: 0,
+          },
+          plan_lat: {
+            mean: 0.000105,
+            squared_diffs: 0,
+          },
+          run_lat: {
+            mean: 0.000285,
+            squared_diffs: 0,
+          },
+          service_lat: {
+            mean: 0.000436,
+            squared_diffs: 0,
+          },
+          overhead_lat: {
+            mean: 0.000006000000000000037,
+            squared_diffs: 0,
+          },
+          sensitive_info: {
+            last_err: "",
+            most_recent_plan_description: {
+              name: "virtual table",
+              attrs: [
+                {
+                  key: "Table",
+                  value: "node_build_info@primary",
+                },
+              ],
+              children: [],
+            },
+            most_recent_plan_timestamp: {
+              seconds: new Long(1614851546),
+              nanos: 956814000,
+            },
+          },
+          bytes_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_written: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          exec_stats: {
+            count: new Long(1),
+            network_bytes: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_mem_usage: {
+              mean: 10240,
+              squared_diffs: 0,
+            },
+            contention_time: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            network_messages: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_disk_usage: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+          },
+          sql_type: "TypeDML",
+          last_exec_timestamp: {
+            seconds: Long.fromInt(1599670292),
+            nanos: 111613000,
+          },
+          nodes: [new Long(1)],
+          plan_gists: ["AgH6////nxkAAA4AAAAGBg=="],
+        },
+        aggregated_ts: {
+          seconds: Long.fromInt(1599670292),
+          nanos: 111613000,
+        },
       },
       {
-        aggregatedFingerprintID: fingerprintID,
-        label: "3",
-        summary:
-          "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
-        aggregatedTs,
-        aggregationInterval,
-        implicitTxn: true,
-        database: "defaultdb",
-        fullScan: true,
-        stats: statementStats,
+        stats: {
+          count: new Long(2),
+          first_attempt_count: new Long(2),
+          max_retries: new Long(0),
+          legacy_last_err: "",
+          legacy_last_err_redacted: "",
+          num_rows: {
+            mean: 6,
+            squared_diffs: 0,
+          },
+          parse_lat: {
+            mean: 0.000071,
+            squared_diffs: 4.050000000000001e-9,
+          },
+          plan_lat: {
+            mean: 0.0001525,
+            squared_diffs: 3.960499999999999e-9,
+          },
+          run_lat: {
+            mean: 0.0002255,
+            squared_diffs: 1.08045e-8,
+          },
+          service_lat: {
+            mean: 0.0004555,
+            squared_diffs: 1.0224500000000002e-8,
+          },
+          overhead_lat: {
+            mean: 0.000006499999999999995,
+            squared_diffs: 4.499999999999893e-12,
+          },
+          sensitive_info: {
+            last_err: "",
+            most_recent_plan_description: {
+              name: "virtual table",
+              attrs: [
+                {
+                  key: "Table",
+                  value: "node_build_info@primary",
+                },
+              ],
+              children: [],
+            },
+            most_recent_plan_timestamp: {
+              seconds: new Long(1614851546),
+              nanos: 956814000,
+            },
+          },
+          bytes_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_written: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          exec_stats: {
+            count: new Long(2),
+            network_bytes: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_mem_usage: {
+              mean: 10240,
+              squared_diffs: 0,
+            },
+            contention_time: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            network_messages: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_disk_usage: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+          },
+          sql_type: "TypeDML",
+          last_exec_timestamp: {
+            seconds: Long.fromInt(1599670292),
+            nanos: 111613000,
+          },
+          nodes: [new Long(1)],
+          plan_gists: ["AgH6////nxkAAA4AAAAGBg=="],
+        },
+        aggregated_ts: {
+          seconds: Long.fromInt(1599670292),
+          nanos: 111613000,
+        },
       },
       {
-        aggregatedFingerprintID: fingerprintID,
-        label: "2",
-        summary:
-          "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
-        aggregatedTs,
-        aggregationInterval,
-        implicitTxn: true,
-        database: "defaultdb",
-        fullScan: true,
-        stats: statementStats,
+        stats: {
+          count: new Long(1),
+          first_attempt_count: new Long(1),
+          max_retries: new Long(0),
+          legacy_last_err: "",
+          legacy_last_err_redacted: "",
+          num_rows: {
+            mean: 6,
+            squared_diffs: 0,
+          },
+          parse_lat: {
+            mean: 0.000046,
+            squared_diffs: 0,
+          },
+          plan_lat: {
+            mean: 0.000159,
+            squared_diffs: 0,
+          },
+          run_lat: {
+            mean: 0.000299,
+            squared_diffs: 0,
+          },
+          service_lat: {
+            mean: 0.000514,
+            squared_diffs: 0,
+          },
+          overhead_lat: {
+            mean: 0.000010000000000000026,
+            squared_diffs: 0,
+          },
+          sensitive_info: {
+            last_err: "",
+            most_recent_plan_description: {
+              name: "virtual table",
+              attrs: [
+                {
+                  key: "Table",
+                  value: "node_build_info@primary",
+                },
+              ],
+              children: [],
+            },
+            most_recent_plan_timestamp: {
+              seconds: new Long(1614851546),
+              nanos: 956814000,
+            },
+          },
+          bytes_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_written: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          exec_stats: {
+            count: new Long(1),
+            network_bytes: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_mem_usage: {
+              mean: 10240,
+              squared_diffs: 0,
+            },
+            contention_time: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            network_messages: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_disk_usage: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+          },
+          sql_type: "TypeDML",
+          last_exec_timestamp: {
+            seconds: Long.fromInt(1599670292),
+            nanos: 111613000,
+          },
+          nodes: [new Long(1)],
+          plan_gists: ["AgH6////nxkAAA4AAAAGBg=="],
+        },
+        aggregated_ts: {
+          seconds: Long.fromInt(1599671292),
+          nanos: 111613000,
+        },
       },
       {
-        aggregatedFingerprintID: fingerprintID,
-        label: "1",
-        summary:
-          "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
-        aggregatedTs,
-        aggregationInterval,
-        implicitTxn: true,
-        database: "defaultdb",
-        fullScan: true,
-        stats: statementStats,
+        stats: {
+          count: new Long(1),
+          first_attempt_count: new Long(1),
+          max_retries: new Long(0),
+          legacy_last_err: "",
+          legacy_last_err_redacted: "",
+          num_rows: {
+            mean: 6,
+            squared_diffs: 0,
+          },
+          parse_lat: {
+            mean: 0.00021,
+            squared_diffs: 0,
+          },
+          plan_lat: {
+            mean: 0.040086,
+            squared_diffs: 0,
+          },
+          run_lat: {
+            mean: 0.000363,
+            squared_diffs: 0,
+          },
+          service_lat: {
+            mean: 0.040749,
+            squared_diffs: 0,
+          },
+          overhead_lat: {
+            mean: 0.0000899999999999998,
+            squared_diffs: 0,
+          },
+          sensitive_info: {
+            last_err: "",
+            most_recent_plan_description: {
+              name: "virtual table",
+              attrs: [
+                {
+                  key: "Table",
+                  value: "node_build_info@primary",
+                },
+              ],
+              children: [],
+            },
+            most_recent_plan_timestamp: {
+              seconds: new Long(1614851546),
+              nanos: 956814000,
+            },
+          },
+          bytes_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_written: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          exec_stats: {
+            count: new Long(1),
+            network_bytes: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_mem_usage: {
+              mean: 10240,
+              squared_diffs: 0,
+            },
+            contention_time: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            network_messages: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_disk_usage: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+          },
+          sql_type: "TypeDML",
+          last_exec_timestamp: {
+            seconds: Long.fromInt(1599670292),
+            nanos: 111613000,
+          },
+          nodes: [new Long(1)],
+          plan_gists: ["AgH6////nxkAAA4AAAAGBg=="],
+        },
+        aggregated_ts: {
+          seconds: Long.fromInt(1599680292),
+          nanos: 111613000,
+        },
       },
     ],
-    app: ["movr"],
-    distSQL: {
-      numerator: 0,
-      denominator: 36958,
-    },
-    vec: {
-      numerator: 36958,
-      denominator: 36958,
-    },
-    implicit_txn: {
-      numerator: 36958,
-      denominator: 36958,
-    },
-    failed: {
-      numerator: 0,
-      denominator: 36958,
-    },
-    node_id: [4, 3, 2, 1],
+    statement_statistics_per_plan_hash: [
+      {
+        stats: {
+          count: new Long(3),
+          first_attempt_count: new Long(3),
+          max_retries: new Long(0),
+          legacy_last_err: "",
+          legacy_last_err_redacted: "",
+          num_rows: {
+            mean: 6,
+            squared_diffs: 0,
+          },
+          parse_lat: {
+            mean: 0.0000876,
+            squared_diffs: 2.35792e-8,
+          },
+          plan_lat: {
+            mean: 0.008131,
+            squared_diffs: 0.00127640837,
+          },
+          run_lat: {
+            mean: 0.0002796,
+            squared_diffs: 2.401919999999999e-8,
+          },
+          service_lat: {
+            mean: 0.008522,
+            squared_diffs: 0.001298238058,
+          },
+          overhead_lat: {
+            mean: 0.000023799999999999972,
+            squared_diffs: 5.492799999999973e-9,
+          },
+          sensitive_info: {
+            last_err: "",
+            most_recent_plan_description: {
+              name: "virtual table",
+              attrs: [
+                {
+                  key: "Table",
+                  value: "node_build_info@primary",
+                },
+              ],
+              children: [],
+            },
+            most_recent_plan_timestamp: {
+              seconds: new Long(1614851546),
+              nanos: 956814000,
+            },
+          },
+          bytes_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_written: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          exec_stats: {
+            count: new Long(5),
+            network_bytes: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_mem_usage: {
+              mean: 10240,
+              squared_diffs: 0,
+            },
+            contention_time: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            network_messages: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_disk_usage: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+          },
+          sql_type: "TypeDML",
+          last_exec_timestamp: {
+            seconds: Long.fromInt(1599670292),
+            nanos: 111613000,
+          },
+          nodes: [new Long(1)],
+          plan_gists: ["AgH6////nxkAAA4AAAAGBg=="],
+        },
+        explain_plan: "• virtual table\n  table: @primary",
+        plan_hash: new Long(14192395335876201826),
+      },
+      {
+        stats: {
+          count: new Long(2),
+          first_attempt_count: new Long(2),
+          max_retries: new Long(0),
+          legacy_last_err: "",
+          legacy_last_err_redacted: "",
+          num_rows: {
+            mean: 6,
+            squared_diffs: 0,
+          },
+          parse_lat: {
+            mean: 0.0000876,
+            squared_diffs: 2.35792e-8,
+          },
+          plan_lat: {
+            mean: 0.008131,
+            squared_diffs: 0.00127640837,
+          },
+          run_lat: {
+            mean: 0.0002796,
+            squared_diffs: 2.401919999999999e-8,
+          },
+          service_lat: {
+            mean: 0.008522,
+            squared_diffs: 0.001298238058,
+          },
+          overhead_lat: {
+            mean: 0.000023799999999999972,
+            squared_diffs: 5.492799999999973e-9,
+          },
+          sensitive_info: {
+            last_err: "",
+            most_recent_plan_description: {
+              name: "virtual table",
+              attrs: [
+                {
+                  key: "Table",
+                  value: "node_build_info@primary",
+                },
+              ],
+              children: [],
+            },
+            most_recent_plan_timestamp: {
+              seconds: new Long(1614851546),
+              nanos: 956814000,
+            },
+          },
+          bytes_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_read: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          rows_written: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          exec_stats: {
+            count: new Long(5),
+            network_bytes: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_mem_usage: {
+              mean: 10240,
+              squared_diffs: 0,
+            },
+            contention_time: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            network_messages: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+            max_disk_usage: {
+              mean: 0,
+              squared_diffs: 0,
+            },
+          },
+          sql_type: "TypeDML",
+          last_exec_timestamp: {
+            seconds: Long.fromInt(1599670292),
+            nanos: 111613000,
+          },
+          nodes: [new Long(1)],
+          plan_gists: ["Ah0GAg=="],
+        },
+        explain_plan: "• virtual table\n  table: @primary\nFULL SCAN",
+        plan_hash: new Long(14192395335876212345),
+      },
+    ],
+    internal_app_name_prefix: "$ internal",
+    toJSON: () => ({}),
   },
   statementsError: null,
   nodeNames: {
@@ -236,7 +738,7 @@ export const getStatementDetailsPropsFixture = (): StatementDetailsProps => ({
     "3": "gcp-us-west1",
     "4": "gcp-europe-west1",
   },
-  refreshStatements: noop,
+  refreshStatementDetails: noop,
   refreshStatementDiagnosticsRequests: noop,
   refreshNodes: noop,
   refreshNodesLiveness: noop,

@@ -50,6 +50,7 @@ import statementsPageStyles from "src/statementsPage/statementsPage.module.scss"
 import styles from "./sessionDetails.module.scss";
 import classNames from "classnames/bind";
 import { commonStyles } from "src/common";
+import { CircleFilled } from "../icon";
 
 const cx = classNames.bind(styles);
 const statementsPageCx = classNames.bind(statementsPageStyles);
@@ -178,7 +179,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                   type="secondary"
                   size="small"
                 >
-                  Cancel query
+                  Cancel statement
                 </Button>
                 <Button
                   onClick={() => {
@@ -204,6 +205,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
         >
           <Loading
             loading={_.isNil(this.props.session)}
+            page={"sessions details"}
             error={this.props.sessionError}
             render={this.renderContent}
             renderError={() =>
@@ -278,18 +280,18 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
           <Col className="gutter-row" span={4} />
           <Col className="gutter-row" span={10}>
             <SummaryCardItem
-              label={"Priority"}
-              value={txn.priority}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Read Only?"}
+              label={"Read Only"}
               value={yesOrNo(txn.read_only)}
               className={cx("details-item")}
             />
             <SummaryCardItem
               label={"AS OF SYSTEM TIME?"}
               value={yesOrNo(txn.is_historical)}
+              className={cx("details-item")}
+            />
+            <SummaryCardItem
+              label={"Priority"}
+              value={txn.priority}
               className={cx("details-item")}
             />
             <MemoryUsageItem
@@ -319,19 +321,26 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                   value={TimestampToMoment(stmt.start).format(DATE_FORMAT)}
                   className={cx("details-item")}
                 />
-                <Link
-                  to={StatementLinkTarget({
-                    statementFingerprintID: stmt.id,
-                    statementNoConstants: stmt.sql_no_constants,
-                    implicitTxn: session.active_txn?.implicit,
-                    app: "",
-                  })}
-                  onClick={() =>
-                    this.props.onStatementClick && this.props.onStatementClick()
+                <SummaryCardItem
+                  label={
+                    <div className={cx("session-details-link")}>
+                      <Link
+                        to={StatementLinkTarget({
+                          statementFingerprintID: stmt.id,
+                          implicitTxn: session.active_txn?.implicit,
+                        })}
+                        onClick={() =>
+                          this.props.onStatementClick &&
+                          this.props.onStatementClick()
+                        }
+                      >
+                        View Statement Details
+                      </Link>
+                    </div>
                   }
-                >
-                  View Statement Details
-                </Link>
+                  value={""}
+                  className={cx("details-item")}
+                />
               </Col>
               <Col className="gutter-row" span={4} />
               <Col className="gutter-row" span={10}>
@@ -362,10 +371,12 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                   label={"Gateway Node"}
                   value={
                     this.props.uiConfig.showGatewayNodeLink ? (
-                      <NodeLink
-                        nodeId={session.node_id.toString()}
-                        nodeNames={this.props.nodeNames}
-                      />
+                      <div className={cx("session-details-link")}>
+                        <NodeLink
+                          nodeId={session.node_id.toString()}
+                          nodeNames={this.props.nodeNames}
+                        />
+                      </div>
                     ) : (
                       session.node_id.toString()
                     )
@@ -373,17 +384,45 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                   className={cx("details-item")}
                 />
               )}
+              <SummaryCardItem
+                label={"Application name"}
+                value={session.application_name}
+                className={cx("details-item")}
+              />
+              <SummaryCardItem
+                label={"Status"}
+                value={
+                  <div>
+                    <CircleFilled
+                      className={cx(
+                        session.active_queries.length > 0
+                          ? "session-status-icon__active"
+                          : "session-status-icon__idle",
+                      )}
+                    />
+                    <span>
+                      {session.active_queries.length > 0 ? "Active" : "Idle"}
+                    </span>
+                  </div>
+                }
+                className={cx("details-item")}
+              />
             </Col>
             <Col className="gutter-row" span={4} />
             <Col className="gutter-row" span={10}>
               <SummaryCardItem
-                label={"Client Address"}
+                label={"Client IP Address"}
                 value={session.client_address}
                 className={cx("details-item")}
               />
               <MemoryUsageItem
                 alloc_bytes={session.alloc_bytes}
                 max_alloc_bytes={session.max_alloc_bytes}
+              />
+              <SummaryCardItem
+                label={"User name"}
+                value={session.username}
+                className={cx("details-item")}
               />
             </Col>
           </Row>
@@ -393,7 +432,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
         </Text>
         <SummaryCard className={cx("details-section")}>{txnInfo}</SummaryCard>
         <Text textType={TextTypes.Heading5} className={cx("details-header")}>
-          Statement
+          Most Recent Statement
         </Text>
         {curStmtInfo}
       </React.Fragment>

@@ -83,6 +83,7 @@ const (
 	TenantUsageTableName                   SystemTableName = "tenant_usage"
 	SQLInstancesTableName                  SystemTableName = "sql_instances"
 	SpanConfigurationsTableName            SystemTableName = "span_configurations"
+	TenantSettingsTableName                SystemTableName = "tenant_settings"
 )
 
 // Oid for virtual database and table.
@@ -113,6 +114,7 @@ const (
 	CrdbInternalGossipAlertsTableID
 	CrdbInternalGossipLivenessTableID
 	CrdbInternalGossipNetworkTableID
+	CrdbInternalTransactionContentionEvents
 	CrdbInternalIndexColumnsTableID
 	CrdbInternalIndexUsageStatisticsTableID
 	CrdbInternalInflightTraceSpanTableID
@@ -153,6 +155,8 @@ const (
 	CrdbInternalDefaultPrivilegesTable
 	CrdbInternalActiveRangeFeedsTable
 	CrdbInternalTenantUsageDetailsViewID
+	CrdbInternalPgCatalogTableIsImplementedTableID
+	CrdbInternalSuperRegions
 	InformationSchemaID
 	InformationSchemaAdministrableRoleAuthorizationsID
 	InformationSchemaApplicableRolesID
@@ -384,6 +388,6 @@ var DefaultHashShardedIndexBucketCount = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"sql.defaults.default_hash_sharded_index_bucket_count",
 	"used as bucket count if bucket count is not specified in hash sharded index definition",
-	8,
+	16,
 	settings.NonNegativeInt,
 ).WithPublic()

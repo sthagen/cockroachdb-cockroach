@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 )
 
@@ -58,12 +59,12 @@ type ExternalStorage interface {
 	// ReadFile is shorthand for ReadFileAt with offset 0.
 	// ErrFileDoesNotExist is raised if `basename` cannot be located in storage.
 	// This can be leveraged for an existence check.
-	ReadFile(ctx context.Context, basename string) (io.ReadCloser, error)
+	ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error)
 
 	// ReadFileAt returns a Reader for requested name reading at offset.
 	// ErrFileDoesNotExist is raised if `basename` cannot be located in storage.
 	// This can be leveraged for an existence check.
-	ReadFileAt(ctx context.Context, basename string, offset int64) (io.ReadCloser, int64, error)
+	ReadFileAt(ctx context.Context, basename string, offset int64) (ioctx.ReadCloserCtx, int64, error)
 
 	// Writer returns a writer for the requested name.
 	//
@@ -77,10 +78,10 @@ type ExternalStorage interface {
 	// List enumerates files within the supplied prefix, calling the passed
 	// function with the name of each file found, relative to the external storage
 	// destination's configured prefix. If the passed function returns a non-nil
-	// error, iteration is stopped it is returned. If delimiter is non-empty names
-	// which have the same prefix, prior to the delimiter, are grouped into a
-	// single result which is that prefix. The order that results are passed to
-	// the callback is undefined.
+	// error, iteration is stopped it is returned. If delimiter is non-empty
+	// names which have the same prefix, prior to the delimiter, are grouped
+	// into a single result which is that prefix. The order that results are
+	// passed to the callback is undefined.
 	List(ctx context.Context, prefix, delimiter string, fn ListingFn) error
 
 	// Delete removes the named file from the store.
@@ -114,6 +115,9 @@ var ErrFileDoesNotExist = errors.New("external_storage: file doesn't exist")
 
 // ErrListingUnsupported is a marker for indicating listing is unsupported.
 var ErrListingUnsupported = errors.New("listing is not supported")
+
+// ErrListingDone is a marker for indicating listing is done.
+var ErrListingDone = errors.New("listing is done")
 
 // RedactedParams is a helper for making a set of param names to redact in URIs.
 func RedactedParams(strs ...string) map[string]struct{} {

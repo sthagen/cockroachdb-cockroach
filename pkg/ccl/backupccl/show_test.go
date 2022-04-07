@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -36,25 +37,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TODO (msbutler): when refactoring these tests to data driven tests, keep the
+// original go test on 22.1 and only use new backup syntax in data driven test
+
 func TestShowBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 11
-	tc, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	tc, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	kvDB := tc.Server(0).DB()
 	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
-	sqlDB.Exec(t, `
+	sqlDB.ExecMultiple(t, strings.Split(`
 SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
 CREATE TYPE data.welcome AS ENUM ('hello', 'hi');
 USE data; CREATE SCHEMA sc;
 CREATE TABLE data.sc.t1 (a INT);
 CREATE TABLE data.sc.t2 (a data.welcome);
-`)
+`,
+		`;`)...)
 
-	const full, inc, inc2 = LocalFoo + "/full", LocalFoo + "/inc", LocalFoo + "/inc2"
+	const full, inc, inc2 = localFoo + "/full", localFoo + "/inc", localFoo + "/inc2"
 
 	beforeTS := sqlDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s'`, beforeTS), full)
@@ -93,6 +98,41 @@ ORDER BY object_type, object_name`, full)
 
 	// Check the appended base backup.
 	res = sqlDB.QueryStr(t, `SELECT object_name, backup_type, start_time::string, end_time::string, rows, is_full_cluster FROM [SHOW BACKUP $1]`, full)
+	require.Equal(t, [][]string{
+		// Full.
+		{"data", "full", "NULL", beforeTS, "NULL", "false"},
+		{"public", "full", "NULL", beforeTS, "NULL", "false"},
+		{"bank", "full", "NULL", beforeTS, strconv.Itoa(numAccounts), "false"},
+		{"welcome", "full", "NULL", beforeTS, "NULL", "false"},
+		{"_welcome", "full", "NULL", beforeTS, "NULL", "false"},
+		{"sc", "full", "NULL", beforeTS, "NULL", "false"},
+		{"t1", "full", "NULL", beforeTS, "0", "false"},
+		{"t2", "full", "NULL", beforeTS, "0", "false"},
+		// Incremental.
+		{"data", "incremental", beforeTS, incTS, "NULL", "false"},
+		{"public", "incremental", beforeTS, incTS, "NULL", "false"},
+		{"bank", "incremental", beforeTS, incTS, strconv.Itoa(int(affectedRows * 2)), "false"},
+		{"welcome", "incremental", beforeTS, incTS, "NULL", "false"},
+		{"_welcome", "incremental", beforeTS, incTS, "NULL", "false"},
+		{"sc", "incremental", beforeTS, incTS, "NULL", "false"},
+		{"t1", "incremental", beforeTS, incTS, "0", "false"},
+		{"t2", "incremental", beforeTS, incTS, "0", "false"},
+	}, res)
+
+	// Different systems output different precisions (i.e. local OS X vs CI).
+	// Truncate decimal places so Go's very rigid parsing will work.
+	// TODO(bardin): Consider using a third-party library for this, or some kind
+	// of time-freezing on the test cluster.
+	truncateBackupTimeRE := regexp.MustCompile(`^(.*\.[0-9]{2})[0-9]*$`)
+	matchResult := truncateBackupTimeRE.FindStringSubmatch(beforeTS)
+	require.NotNil(t, matchResult)
+	backupTime, err := time.Parse("2006-01-02 15:04:05.00", matchResult[1])
+	require.NoError(t, err)
+	backupFolder := backupTime.Format(DateBasedIntoFolderName)
+	resolvedBackupFolder := full + backupFolder
+	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data INTO $1 AS OF SYSTEM TIME '%s'`, beforeTS), full)
+	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data INTO LATEST IN $1 AS OF SYSTEM TIME '%s'`, incTS), full)
+	res = sqlDB.QueryStr(t, `SELECT object_name, backup_type, start_time::string, end_time::string, rows, is_full_cluster FROM [SHOW BACKUP $1]`, resolvedBackupFolder)
 	require.Equal(t, [][]string{
 		// Full.
 		{"data", "full", "NULL", beforeTS, "NULL", "false"},
@@ -157,7 +197,7 @@ ORDER BY object_type, object_name`, full)
 		{"users", incTS, inc2TS, "3"},
 	}, res)
 
-	const details = LocalFoo + "/details"
+	const details = localFoo + "/details"
 	sqlDB.Exec(t, `CREATE TABLE data.details1 (c INT PRIMARY KEY)`)
 	sqlDB.Exec(t, `INSERT INTO data.details1 (SELECT generate_series(1, 100))`)
 	sqlDB.Exec(t, `ALTER TABLE data.details1 SPLIT AT VALUES (1), (42)`)
@@ -166,19 +206,38 @@ ORDER BY object_type, object_name`, full)
 
 	details1Desc := desctestutils.TestingGetPublicTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details1")
 	details2Desc := desctestutils.TestingGetPublicTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details2")
-	details1Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details1Desc.GetID(), details1Desc.GetPrimaryIndexID()))
-	details2Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details2Desc.GetID(), details2Desc.GetPrimaryIndexID()))
+	d1ID := details1Desc.GetID()
+	d2ID := details2Desc.GetID()
+	details1Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, d1ID, details1Desc.GetPrimaryIndexID()))
+	details2Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, d2ID, details2Desc.GetPrimaryIndexID()))
 
 	sqlDBRestore.CheckQueryResults(t, fmt.Sprintf(`SHOW BACKUP RANGES '%s'`, details), [][]string{
-		{"/Table/64/1", "/Table/64/2", string(details1Key), string(details1Key.PrefixEnd())},
-		{"/Table/65/1", "/Table/65/2", string(details2Key), string(details2Key.PrefixEnd())},
+		{
+			fmt.Sprintf("/Table/%d/1", d1ID),
+			fmt.Sprintf("/Table/%d/2", d1ID),
+			string(details1Key),
+			string(details1Key.PrefixEnd())},
+		{
+			fmt.Sprintf("/Table/%d/1", d2ID),
+			fmt.Sprintf("/Table/%d/2", d2ID),
+			string(details2Key),
+			string(details2Key.PrefixEnd()),
+		},
 	})
 
 	var showFiles = fmt.Sprintf(`SELECT start_pretty, end_pretty, size_bytes, rows
 		FROM [SHOW BACKUP FILES '%s']`, details)
 	sqlDBRestore.CheckQueryResults(t, showFiles, [][]string{
-		{"/Table/64/1/1", "/Table/64/1/42", "369", "41"},
-		{"/Table/64/1/42", "/Table/64/2", "531", "59"},
+		{
+			fmt.Sprintf("/Table/%d/1/1", d1ID),
+			fmt.Sprintf("/Table/%d/1/42", d1ID),
+			"410", "41",
+		},
+		{
+			fmt.Sprintf("/Table/%d/1/42", d1ID),
+			fmt.Sprintf("/Table/%d/2", d1ID),
+			"590", "59",
+		},
 	})
 	sstMatcher := regexp.MustCompile(`\d+\.sst`)
 	pathRows := sqlDB.QueryStr(t, `SELECT path FROM [SHOW BACKUP FILES $1]`, details)
@@ -198,7 +257,7 @@ ORDER BY object_type, object_name`, full)
 
 	// Test that tables, views and sequences are all supported.
 	{
-		viewTableSeq := LocalFoo + "/tableviewseq"
+		viewTableSeq := localFoo + "/tableviewseq"
 		sqlDB.Exec(t, `CREATE TABLE data.tableA (a int primary key, b int, INDEX tableA_b_idx (b ASC))`)
 		sqlDB.Exec(t, `CREATE VIEW data.viewA AS SELECT a from data.tableA`)
 		sqlDB.Exec(t, `CREATE SEQUENCE data.seqA START 1 INCREMENT 2 MAXVALUE 20`)
@@ -217,8 +276,7 @@ ORDER BY object_type, object_name`, full)
 		a INT8 NOT NULL,
 		b INT8 NULL,
 		CONSTRAINT tablea_pkey PRIMARY KEY (a ASC),
-		INDEX tablea_b_idx (b ASC),
-		FAMILY "primary" (a, b)
+		INDEX tablea_b_idx (b ASC)
 	)`
 		expectedCreateView := "CREATE VIEW viewa (\n\ta\n) AS SELECT a FROM data.public.tablea"
 		expectedCreateSeq := `CREATE SEQUENCE seqa MINVALUE 1 MAXVALUE 20 INCREMENT 2 START 1`
@@ -241,7 +299,7 @@ ORDER BY object_type, object_name`, full)
 	// Test that foreign keys that reference tables that are in the backup
 	// are included.
 	{
-		includedFK := LocalFoo + "/includedFK"
+		includedFK := localFoo + "/includedFK"
 		sqlDB.Exec(t, `CREATE TABLE data.FKSrc (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `CREATE TABLE data.FKRefTable (a INT PRIMARY KEY, B INT REFERENCES data.FKSrc(a))`)
 		sqlDB.Exec(t, `CREATE DATABASE data2`)
@@ -252,15 +310,13 @@ ORDER BY object_type, object_name`, full)
 				a INT8 NOT NULL,
 				b INT8 NULL,
 				CONSTRAINT fkreftable_pkey PRIMARY KEY (a ASC),
-				CONSTRAINT fkreftable_b_fkey FOREIGN KEY (b) REFERENCES public.fksrc(a),
-				FAMILY "primary" (a, b)
+				CONSTRAINT fkreftable_b_fkey FOREIGN KEY (b) REFERENCES public.fksrc(a)
 			)`
 		wantDiffDB := `CREATE TABLE fkreftable (
 				a INT8 NOT NULL,
 				b INT8 NULL,
 				CONSTRAINT fkreftable_pkey PRIMARY KEY (a ASC),
-				CONSTRAINT fkreftable_b_fkey FOREIGN KEY (b) REFERENCES data.public.fksrc(a),
-				FAMILY "primary" (a, b)
+				CONSTRAINT fkreftable_b_fkey FOREIGN KEY (b) REFERENCES data.public.fksrc(a)
 			)`
 
 		showBackupRows = sqlDBRestore.QueryStr(t, fmt.Sprintf(`SELECT create_statement FROM [SHOW BACKUP SCHEMAS '%s'] WHERE object_type='table'`, includedFK))
@@ -278,14 +334,13 @@ ORDER BY object_type, object_name`, full)
 	// Foreign keys that were not included in the backup are not mentioned in
 	// the create statement.
 	{
-		missingFK := LocalFoo + "/missingFK"
+		missingFK := localFoo + "/missingFK"
 		sqlDB.Exec(t, `BACKUP data2.FKRefTable TO $1;`, missingFK)
 
 		want := `CREATE TABLE fkreftable (
 				a INT8 NOT NULL,
 				b INT8 NULL,
-				CONSTRAINT fkreftable_pkey PRIMARY KEY (a ASC),
-				FAMILY "primary" (a, b)
+				CONSTRAINT fkreftable_pkey PRIMARY KEY (a ASC)
 			)`
 
 		showBackupRows = sqlDBRestore.QueryStr(t, fmt.Sprintf(`SELECT create_statement FROM [SHOW BACKUP SCHEMAS '%s'] WHERE object_type='table'`, missingFK))
@@ -296,7 +351,7 @@ ORDER BY object_type, object_name`, full)
 	}
 
 	{
-		fullCluster := LocalFoo + "/full_cluster"
+		fullCluster := localFoo + "/full_cluster"
 		sqlDB.Exec(t, `BACKUP TO $1;`, fullCluster)
 
 		showBackupRows = sqlDBRestore.QueryStr(t, fmt.Sprintf(`SELECT is_full_cluster FROM [SHOW BACKUP '%s']`, fullCluster))
@@ -305,7 +360,7 @@ ORDER BY object_type, object_name`, full)
 			t.Fatal("expected show backup to indicate that backup was full cluster")
 		}
 
-		fullClusterInc := LocalFoo + "/full_cluster_inc"
+		fullClusterInc := localFoo + "/full_cluster_inc"
 		sqlDB.Exec(t, `BACKUP TO $1 INCREMENTAL FROM $2;`, fullClusterInc, fullCluster)
 
 		showBackupRows = sqlDBRestore.QueryStr(t, fmt.Sprintf(`SELECT is_full_cluster FROM [SHOW BACKUP '%s']`, fullCluster))
@@ -317,7 +372,7 @@ ORDER BY object_type, object_name`, full)
 
 	// Show privileges of descriptors that are backed up.
 	{
-		showPrivs := LocalFoo + "/show_privs"
+		showPrivs := localFoo + "/show_privs"
 		sqlDB.Exec(t, `
 CREATE DATABASE mi5; USE mi5;
 CREATE SCHEMA locator;
@@ -375,7 +430,7 @@ GRANT UPDATE ON top_secret TO agent_bond;
 		sqlDBRestore.CheckQueryResults(t, showQuery, want)
 
 		// Change the owner and expect the changes to be reflected in a new backup
-		showOwner := LocalFoo + "/show_owner"
+		showOwner := localFoo + "/show_owner"
 		sqlDB.Exec(t, `
 ALTER DATABASE mi5 OWNER TO agent_thomas;
 ALTER SCHEMA locator OWNER TO agent_thomas;
@@ -408,13 +463,13 @@ func TestShowBackups(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 11
-	_, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
-	const full = LocalFoo + "/full"
-	const remoteInc = LocalFoo + "/inc"
+	const full = localFoo + "/full"
+	const remoteInc = localFoo + "/inc"
 
 	// Make an initial backup.
 	sqlDB.Exec(t, `BACKUP data.bank INTO $1`, full)
@@ -430,8 +485,8 @@ func TestShowBackups(t *testing.T) {
 	sqlDB.Exec(t, `BACKUP data.bank INTO $1`, full)
 	sqlDB.Exec(t, `BACKUP data.bank INTO LATEST IN $1`, full)
 	// Make 2 remote incremental backups, chaining to the third full backup
-	sqlDB.Exec(t, `BACKUP data.bank INTO LATEST IN $1 WITH incremental_storage = $2`, full, remoteInc)
-	sqlDB.Exec(t, `BACKUP data.bank INTO LATEST IN $1 WITH incremental_storage = $2`, full, remoteInc)
+	sqlDB.Exec(t, `BACKUP data.bank INTO LATEST IN $1 WITH incremental_location = $2`, full, remoteInc)
+	sqlDB.Exec(t, `BACKUP data.bank INTO LATEST IN $1 WITH incremental_location = $2`, full, remoteInc)
 
 	rows := sqlDBRestore.QueryStr(t, `SHOW BACKUPS IN $1`, full)
 
@@ -441,7 +496,8 @@ func TestShowBackups(t *testing.T) {
 	// check that we can show the inc layers in the individual full backups.
 	b1 := sqlDBRestore.QueryStr(t, `SELECT * FROM [SHOW BACKUP $1 IN $2] WHERE object_type='table'`, rows[0][0], full)
 	require.Equal(t, 4, len(b1))
-	b2 := sqlDBRestore.QueryStr(t, `SELECT * FROM [SHOW BACKUP $1 IN $2] WHERE object_type='table'`, rows[1][0], full)
+	b2 := sqlDBRestore.QueryStr(t,
+		`SELECT * FROM [SHOW BACKUP FROM $1 IN $2] WHERE object_type='table'`, rows[1][0], full)
 	require.Equal(t, 3, len(b2))
 
 	require.Equal(t,
@@ -451,17 +507,107 @@ func TestShowBackups(t *testing.T) {
 
 	// check that full and remote incremental backups appear
 	b3 := sqlDBRestore.QueryStr(t,
-		`SELECT * FROM [SHOW BACKUP LATEST IN $1 WITH incremental_storage= 'nodelocal://0/foo/inc'] WHERE object_type='table'`, full)
+		`SELECT * FROM [SHOW BACKUP LATEST IN $1 WITH incremental_location= 'nodelocal://0/foo/inc'] WHERE object_type='table'`, full)
 	require.Equal(t, 3, len(b3))
 
 }
 
+func TestShowNonDefaultBackups(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numAccounts = 11
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+
+	const full = localFoo + "/full"
+	const remoteInc = localFoo + "/inc"
+
+	// Make an initial backup.
+	fullNonDefault := full + "NonDefault"
+	incNonDefault := remoteInc + "NonDefault"
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, fullNonDefault)
+
+	// Get base number of files, schemas, and ranges in the backup
+	var oldCount [3]int
+	for i, typ := range []string{"FILES", "SCHEMAS", "RANGES"} {
+		query := fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUP %s FROM LATEST IN '%s']`, typ,
+			fullNonDefault)
+		count, err := strconv.Atoi(sqlDB.QueryStr(t, query)[0][0])
+		require.NoError(t, err, "error converting original count to integer")
+		oldCount[i] = count
+	}
+
+	// Increase the number of files,schemas, and ranges that will be in the backup chain
+	sqlDB.Exec(t, `CREATE TABLE data.blob (a INT PRIMARY KEY); INSERT INTO data.blob VALUES (0)`)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN $1`, fullNonDefault)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN $1 WITH incremental_location=$2`, fullNonDefault, incNonDefault)
+
+	// Show backup should contain more rows as new files/schemas/ranges were
+	// added in the incremental backup
+	for i, typ := range []string{"FILES", "SCHEMAS", "RANGES"} {
+		query := fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUP %s FROM LATEST IN '%s']`, typ,
+			fullNonDefault)
+		newCount, err := strconv.Atoi(sqlDB.QueryStr(t, query)[0][0])
+		require.NoError(t, err, "error converting new count to integer")
+		require.Greater(t, newCount, oldCount[i])
+
+		queryInc := fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUP %s FROM LATEST IN '%s' WITH incremental_location='%s']`, typ,
+			fullNonDefault, incNonDefault)
+		newCountInc, err := strconv.Atoi(sqlDB.QueryStr(t, queryInc)[0][0])
+		require.NoError(t, err, "error converting new count to integer")
+		require.Greater(t, newCountInc, oldCount[i])
+	}
+}
+
+// TestShowBackupTenantView ensures that SHOW BACKUP on a tenant backup returns the same results
+// as a SHOW BACKUP on a cluster backup that contains the same data.
+// TODO(msbutler): convert to data driven test, and test cluster and database
+// level backups once tenants support nodelocal or once http external storage supports listing.
+func TestShowBackupTenantView(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numAccounts = 1
+	tc, systemDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+	srv := tc.Server(0)
+
+	_ = security.EmbeddedTenantIDs()
+
+	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	defer conn10.Close()
+
+	tenant10 := sqlutils.MakeSQLRunner(conn10)
+	dataQuery := `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`
+	backupQuery := `BACKUP TABLE foo.bar INTO $1`
+	showBackupQuery := "SELECT object_name, object_type, rows FROM [SHOW BACKUP FROM LATEST IN $1]"
+	tenant10.Exec(t, dataQuery)
+
+	// First, assert that SHOW BACKUPS on a tenant backup returns the same results if
+	// either the system tenant or tenant10 calls it.
+	tenantAddr, httpServerCleanup := makeInsecureHTTPServer(t)
+	defer httpServerCleanup()
+
+	tenant10.Exec(t, backupQuery, tenantAddr)
+	systemTenantShowRes := systemDB.QueryStr(t, showBackupQuery, tenantAddr)
+	require.Equal(t, systemTenantShowRes, tenant10.QueryStr(t, showBackupQuery, tenantAddr))
+
+	// If the system tenant created the same data, and conducted the same backup,
+	// the row counts should look the same.
+	systemAddr, httpServerCleanup2 := makeInsecureHTTPServer(t)
+	defer httpServerCleanup2()
+
+	systemDB.Exec(t, dataQuery)
+	systemDB.Exec(t, backupQuery, systemAddr)
+	require.Equal(t, systemTenantShowRes, systemDB.QueryStr(t, showBackupQuery, systemAddr))
+}
 func TestShowBackupTenants(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 1
-	tc, systemDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	tc, systemDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 	srv := tc.Server(0)
 
@@ -529,7 +675,7 @@ func TestShowBackupPrivileges(t *testing.T) {
 	}()
 
 	// Make an initial backup.
-	const full = LocalFoo + "/full"
+	const full = localFoo + "/full"
 	sqlDB.Exec(t, `BACKUP privs INTO $1`, full)
 	// Add an incremental backup to it.
 	sqlDB.Exec(t, `BACKUP privs INTO LATEST IN $1`, full)
@@ -588,15 +734,15 @@ func showUpgradedForeignKeysTest(exportDir string) func(t *testing.T) {
 		for _, tc := range []testCase{
 			{
 				"circular",
-				"CONSTRAINT self_fk FOREIGN KEY \\(selfid\\) REFERENCES public\\.circular\\(selfid\\) NOT VALID,",
+				"CONSTRAINT self_fk FOREIGN KEY \\(selfid\\) REFERENCES public\\.circular\\(selfid\\) NOT VALID",
 			},
 			{
 				"child",
-				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\),",
+				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\)",
 			},
 			{
 				"child_pk",
-				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\),",
+				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\)",
 			},
 		} {
 			results := sqlDB.QueryStr(t, `
@@ -606,7 +752,7 @@ func showUpgradedForeignKeysTest(exportDir string) func(t *testing.T) {
 					[SHOW BACKUP SCHEMAS $1]
 				WHERE
 					object_type = 'table' AND object_name = $2
-				`, LocalFoo, tc.table)
+				`, localFoo, tc.table)
 			require.NotEmpty(t, results)
 			require.Regexp(t, regexp.MustCompile(tc.expectedForeignKeyPattern), results[0][0])
 		}
@@ -619,19 +765,19 @@ func TestShowBackupWithDebugIDs(t *testing.T) {
 
 	const numAccounts = 11
 	// Create test database with bank table
-	_, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
 	// add 1 type, 1 schema, and 2 tables to the database
-	sqlDB.Exec(t, `
+	sqlDB.ExecMultiple(t, strings.Split(`
 		SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
 		CREATE TYPE data.welcome AS ENUM ('hello', 'hi');
 		USE data; CREATE SCHEMA sc;
 		CREATE TABLE data.sc.t1 (a INT);
-		CREATE TABLE data.sc.t2 (a data.welcome);
-  `)
+		CREATE TABLE data.sc.t2 (a data.welcome);`,
+		`;`)...)
 
-	const full = LocalFoo + "/full"
+	const full = localFoo + "/full"
 
 	beforeTS := sqlDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s'`, beforeTS), full)
@@ -661,7 +807,7 @@ func TestShowBackupWithDebugIDs(t *testing.T) {
 
 	expectedObjects := [][]string{
 		{"NULL", "NULL", "NULL", "NULL", "data", dbIDStr, "database"},
-		{"data", "54", "NULL", "NULL", "public", strconv.Itoa(dbID + 1), "schema"},
+		{"data", dbIDStr, "NULL", "NULL", "public", strconv.Itoa(dbID + 1), "schema"},
 		{"data", dbIDStr, "public", publicIDStr, "bank", strconv.Itoa(dbID + 2), "table"},
 		{"data", dbIDStr, "public", publicIDStr, "welcome", strconv.Itoa(dbID + 3), "type"},
 		{"data", dbIDStr, "public", publicIDStr, "_welcome", strconv.Itoa(dbID + 4), "type"},
@@ -681,13 +827,13 @@ func TestShowBackupPathIsCollectionRoot(t *testing.T) {
 	const numAccounts = 11
 
 	// Create test database with bank table.
-	_, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
 	// Make an initial backup.
-	sqlDB.Exec(t, `BACKUP data.bank INTO $1`, LocalFoo)
+	sqlDB.Exec(t, `BACKUP data.bank INTO $1`, localFoo)
 
 	// Ensure proper error gets returned from back SHOW BACKUP Path
 	sqlDB.ExpectErr(t, "The specified path is the root of a backup collection.",
-		"SHOW BACKUP $1", LocalFoo)
+		"SHOW BACKUP $1", localFoo)
 }

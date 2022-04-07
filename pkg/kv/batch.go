@@ -668,7 +668,9 @@ func (b *Batch) adminMerge(key interface{}) {
 
 // adminSplit is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminSplit(splitKeyIn interface{}, expirationTime hlc.Timestamp) {
+func (b *Batch) adminSplit(
+	splitKeyIn interface{}, expirationTime hlc.Timestamp, predicateKeys []roachpb.Key,
+) {
 	splitKey, err := marshalKey(splitKeyIn)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -680,6 +682,7 @@ func (b *Batch) adminSplit(splitKeyIn interface{}, expirationTime hlc.Timestamp)
 		},
 		SplitKey:       splitKey,
 		ExpirationTime: expirationTime,
+		PredicateKeys:  predicateKeys,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -742,7 +745,9 @@ func (b *Batch) adminChangeReplicas(
 // adminRelocateRange is only exported on DB. It is here for symmetry with the
 // other operations.
 func (b *Batch) adminRelocateRange(
-	key interface{}, voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
+	key interface{},
+	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
+	transferLeaseToFirstVoter bool,
 ) {
 	k, err := marshalKey(key)
 	if err != nil {
@@ -753,8 +758,10 @@ func (b *Batch) adminRelocateRange(
 		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
-		VoterTargets:    voterTargets,
-		NonVoterTargets: nonVoterTargets,
+		VoterTargets:                      voterTargets,
+		NonVoterTargets:                   nonVoterTargets,
+		TransferLeaseToFirstVoter:         transferLeaseToFirstVoter,
+		TransferLeaseToFirstVoterAccurate: true,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -769,8 +776,7 @@ func (b *Batch) addSSTable(
 	disallowShadowingBelow hlc.Timestamp,
 	stats *enginepb.MVCCStats,
 	ingestAsWrites bool,
-	writeAtRequestTimestamp bool,
-	sstTimestamp hlc.Timestamp,
+	sstTimestampToRequestTimestamp hlc.Timestamp,
 ) {
 	begin, err := marshalKey(s)
 	if err != nil {
@@ -787,14 +793,13 @@ func (b *Batch) addSSTable(
 			Key:    begin,
 			EndKey: end,
 		},
-		Data:                    data,
-		DisallowConflicts:       disallowConflicts,
-		DisallowShadowing:       disallowShadowing,
-		DisallowShadowingBelow:  disallowShadowingBelow,
-		MVCCStats:               stats,
-		IngestAsWrites:          ingestAsWrites,
-		WriteAtRequestTimestamp: writeAtRequestTimestamp,
-		SSTTimestamp:            sstTimestamp,
+		Data:                           data,
+		DisallowConflicts:              disallowConflicts,
+		DisallowShadowing:              disallowShadowing,
+		DisallowShadowingBelow:         disallowShadowingBelow,
+		MVCCStats:                      stats,
+		IngestAsWrites:                 ingestAsWrites,
+		SSTTimestampToRequestTimestamp: sstTimestampToRequestTimestamp,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)

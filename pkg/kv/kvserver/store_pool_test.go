@@ -520,6 +520,7 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 				LogicalBytes:     30,
 				QueriesPerSecond: 100,
 				WritesPerSecond:  30,
+				L0Sublevels:      4,
 			},
 		},
 		{
@@ -533,6 +534,7 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 				LogicalBytes:     25,
 				QueriesPerSecond: 50,
 				WritesPerSecond:  25,
+				L0Sublevels:      8,
 			},
 		},
 	}
@@ -547,7 +549,7 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 	replica.mu.Unlock()
 	rs := newReplicaStats(clock, nil)
 	for _, store := range stores {
-		rs.record(store.Node.NodeID)
+		rs.recordCount(1, store.Node.NodeID)
 	}
 	manual.Increment(int64(MinStatsDuration + time.Second))
 	replica.leaseholderStats = rs
@@ -574,6 +576,9 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 	if expectedWPS := 30 + WPS; desc.Capacity.WritesPerSecond != expectedWPS {
 		t.Errorf("expected WritesPerSecond %f, but got %f", expectedWPS, desc.Capacity.WritesPerSecond)
 	}
+	if expectedL0Sublevels := int64(4); desc.Capacity.L0Sublevels != expectedL0Sublevels {
+		t.Errorf("expected L0 Sub-Levels %d, but got %d", expectedL0Sublevels, desc.Capacity.L0Sublevels)
+	}
 
 	sp.updateLocalStoreAfterRebalance(roachpb.StoreID(2), rangeUsageInfo, roachpb.REMOVE_VOTER)
 	desc, ok = sp.getStoreDescriptor(roachpb.StoreID(2))
@@ -591,6 +596,9 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 	}
 	if expectedWPS := 25 - WPS; desc.Capacity.WritesPerSecond != expectedWPS {
 		t.Errorf("expected WritesPerSecond %f, but got %f", expectedWPS, desc.Capacity.WritesPerSecond)
+	}
+	if expectedL0Sublevels := int64(8); desc.Capacity.L0Sublevels != expectedL0Sublevels {
+		t.Errorf("expected L0 Sub-Levels %d, but got %d", expectedL0Sublevels, desc.Capacity.L0Sublevels)
 	}
 
 	sp.updateLocalStoresAfterLeaseTransfer(roachpb.StoreID(1), roachpb.StoreID(2), rangeUsageInfo.QueriesPerSecond)

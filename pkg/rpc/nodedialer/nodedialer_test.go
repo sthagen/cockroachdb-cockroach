@@ -455,7 +455,7 @@ func newTestContext(clock *hlc.Clock, stopper *stop.Stopper) *rpc.Context {
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
 	// unrelated concurrent tests.
-	rctx.ClusterID.Set(ctx, uuid.MakeV4())
+	rctx.StorageClusterID.Set(ctx, uuid.MakeV4())
 
 	return rctx
 }
@@ -592,21 +592,15 @@ func (*internalServer) GetSpanConfigs(
 	panic("unimplemented")
 }
 
+func (*internalServer) GetAllSystemSpanConfigsThatApply(
+	context.Context, *roachpb.GetAllSystemSpanConfigsThatApplyRequest,
+) (*roachpb.GetAllSystemSpanConfigsThatApplyResponse, error) {
+	panic("unimplemented")
+}
+
 func (*internalServer) UpdateSpanConfigs(
 	context.Context, *roachpb.UpdateSpanConfigsRequest,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
-	panic("unimplemented")
-}
-
-func (*internalServer) GetSystemSpanConfigs(
-	context.Context, *roachpb.GetSystemSpanConfigsRequest,
-) (*roachpb.GetSystemSpanConfigsResponse, error) {
-	panic("unimplemented")
-}
-
-func (*internalServer) UpdateSystemSpanConfigs(
-	context.Context, *roachpb.UpdateSystemSpanConfigsRequest,
-) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
 	panic("unimplemented")
 }
 

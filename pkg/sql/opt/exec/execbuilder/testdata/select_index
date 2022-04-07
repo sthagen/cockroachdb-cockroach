@@ -712,11 +712,11 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 4 (missing stats)
+│ estimated row count: 3 (missing stats)
 │
 └── • scan
       columns: (a, b)
-      estimated row count: 4 (missing stats)
+      estimated row count: 3 (missing stats)
       table: abcd@abcd
       spans: /1/4-/1/5 /2/9-/2/10
 
@@ -771,7 +771,7 @@ CREATE TABLE abz(a INT, b INT, c INT, PRIMARY KEY (a DESC, b ASC), UNIQUE(c DESC
 ----
 abz  abz_c_b_key  false  1  c  DESC  false  false
 abz  abz_c_b_key  false  2  b  ASC   false  false
-abz  abz_c_b_key  false  3  a  ASC   false  true
+abz  abz_c_b_key  false  3  a  ASC   true   true
 abz  abz_pkey     false  1  a  DESC  false  false
 abz  abz_pkey     false  2  b  ASC   false  false
 abz  abz_pkey     false  3  c  N/A   true   false
@@ -995,7 +995,7 @@ vectorized: true
 • scan
   columns: (a, b, c, d)
   ordering: +c
-  estimated row count: 1 (missing stats)
+  estimated row count: 0 (missing stats)
   table: abcd@abcd
   spans: /1/NULL/1-/1/NULL/10
 
@@ -1329,9 +1329,9 @@ output row: [1 2 3 4]
 # interleaved tables.
 query T rowsort
 SELECT message FROM [SHOW KV TRACE FOR SESSION]
-WHERE message LIKE 'Scan /Table/70/1%'
+WHERE message LIKE 'Scan /Table/120/1%'
 ----
-Scan /Table/70/1/{1-2}
+Scan /Table/120/1/{1-2}
 
 query T
 EXPLAIN SELECT * FROM noncover WHERE c = 6

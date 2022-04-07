@@ -352,7 +352,7 @@ SELECT has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'syst
        has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'system'), 'TEMPORARY'),
        has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'system'), 'TEMP')
 ----
-false  false  false  false
+false  true  false  false
 
 query BBBB
 SELECT has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'test'), 'CREATE'),
@@ -372,7 +372,7 @@ SELECT has_database_privilege('system', '  CrEaTe      '),
        has_database_privilege('system', 'TEMP'),
        has_database_privilege('system', '  CrEaTe      ,CONNECT')
 ----
-false  false  false  false  false
+false  true  false  false  true
 
 query BBBBB
 SELECT has_database_privilege('test', '  CrEaTe      '),
@@ -413,6 +413,7 @@ SELECT datname FROM pg_database WHERE has_database_privilege(datname, 'CONNECT')
 ----
 defaultdb
 postgres
+system
 test
 
 query T
@@ -967,7 +968,7 @@ SELECT has_table_privilege('bar', 't', 'SELECT'),
        has_table_privilege('bar', 't', 'INSERT, UPDATE'),
        has_table_privilege('bar', 't', 'RULE')
 ----
-false  false  false  true  true  false  true  false  true  false  false
+false  false  false  true  true  false  false  false  true  false  false
 
 query BBBBBBBBBBB
 SELECT has_table_privilege('bar', 't', 'SELECT WITH GRANT OPTION'),
@@ -982,7 +983,7 @@ SELECT has_table_privilege('bar', 't', 'SELECT WITH GRANT OPTION'),
        has_table_privilege('bar', 't', 'INSERT WITH GRANT OPTION, UPDATE WITH GRANT OPTION'),
        has_table_privilege('bar', 't', 'RULE WITH GRANT OPTION')
 ----
-false  false  false  true  true  false  true  false  true  false  false
+false  false  false  true  true  false  false  false  true  false  false
 
 
 ## has_tablespace_privilege
@@ -1296,7 +1297,7 @@ CREATE TABLE s.t()
 query B
 SELECT has_schema_privilege('testuser', 's', 'create')
 ----
-true
+false
 
 statement ok
 REVOKE USAGE ON SCHEMA s FROM testuser;
@@ -1332,7 +1333,7 @@ SELECT has_schema_privilege('testuser', 's', 'create'),
        has_schema_privilege('testuser2', 's', 'create'),
        has_schema_privilege('testuser2', 's', 'usage')
 ----
-true false true true
+false  false  true  true
 
 # Confirm privilege checks on all objects with testuser2, should match testuser.
 query BBB

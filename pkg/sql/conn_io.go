@@ -136,6 +136,10 @@ type ExecStmt struct {
 	// stats reporting.
 	ParseStart time.Time
 	ParseEnd   time.Time
+
+	// LastInBatch indicates if this command contains the last query in a
+	// simple protocol Query message that contains a batch of 1 or more queries.
+	LastInBatch bool
 }
 
 // command implements the Command interface.
@@ -329,8 +333,12 @@ type CopyIn struct {
 // command implements the Command interface.
 func (CopyIn) command() string { return "copy" }
 
-func (CopyIn) String() string {
-	return "CopyIn"
+func (c CopyIn) String() string {
+	s := "(empty)"
+	if c.Stmt != nil {
+		s = c.Stmt.String()
+	}
+	return fmt.Sprintf("CopyIn: %s", s)
 }
 
 var _ Command = CopyIn{}

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -146,7 +147,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		return &StrVal{s: s}
 	}
 	plus := func(left, right Expr) Expr {
-		return &BinaryExpr{Operator: MakeBinaryOperator(Plus), Left: left, Right: right}
+		return &BinaryExpr{Operator: treebin.MakeBinaryOperator(treebin.Plus), Left: left, Right: right}
 	}
 	placeholder := func(id int) *Placeholder {
 		return &Placeholder{Idx: PlaceholderIdx(id)}
@@ -186,7 +187,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		{nil, []Expr{intConst("1")}, []overloadImpl{unaryIntFn, unaryIntFn}, ambiguous, false},
 		{nil, []Expr{intConst("1")}, []overloadImpl{unaryIntFn, unaryFloatFn}, unaryIntFn, false},
 		{nil, []Expr{decConst("1.0")}, []overloadImpl{unaryIntFn, unaryDecimalFn}, unaryDecimalFn, false},
-		{nil, []Expr{decConst("1.0")}, []overloadImpl{unaryIntFn, unaryFloatFn}, unsupported, false},
+		{nil, []Expr{decConst("1.0")}, []overloadImpl{unaryIntFn, unaryFloatFn}, ambiguous, false},
 		{nil, []Expr{intConst("1")}, []overloadImpl{unaryIntFn, binaryIntFn}, unaryIntFn, false},
 		{nil, []Expr{intConst("1")}, []overloadImpl{unaryFloatFn, unaryStringFn}, unaryFloatFn, false},
 		{nil, []Expr{intConst("1")}, []overloadImpl{unaryStringFn, binaryIntFn}, unsupported, false},
@@ -248,7 +249,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		{nil, []Expr{NewDInt(1), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, binaryIntFn, false},
 		{nil, []Expr{NewDFloat(1), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, unsupported, false},
 		{nil, []Expr{intConst("1"), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, binaryIntFn, false},
-		{nil, []Expr{decConst("1.0"), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, unsupported, false}, // Limitation.
+		{nil, []Expr{decConst("1.0"), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, ambiguous, false}, // Limitation.
 		{types.Date, []Expr{NewDInt(1), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, binaryIntDateFn, false},
 		{types.Date, []Expr{NewDFloat(1), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, unsupported, false},
 		{types.Date, []Expr{intConst("1"), placeholder(1)}, []overloadImpl{binaryIntFn, binaryIntDateFn}, binaryIntDateFn, false},

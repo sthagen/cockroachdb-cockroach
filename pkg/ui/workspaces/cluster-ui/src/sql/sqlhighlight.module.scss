@@ -27,7 +27,7 @@
     font-family: SFMono-Semibold;
     font-size: 14px;
     line-height: 1.57;
-    white-space: pre-line;
+    white-space: pre;
     word-wrap: break-word;
 
     span {
@@ -48,6 +48,14 @@
       color: $colors--functional-purple-1;
     }
   }
+}
+
+.small {
+  height: 200px;
+}
+
+.large {
+  height: 400px;
 }
 
 .highlight-divider {

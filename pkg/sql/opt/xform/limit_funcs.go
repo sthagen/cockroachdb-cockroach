@@ -60,7 +60,14 @@ func (c *CustomFuncs) CanLimitFilteredScan(
 		// unconstrained scans on non-partial indexes.
 		return false
 	}
-
+	// Virtual indexes are not sorted, but are presented to the optimizer as
+	// sorted, and have a sort automatically applied to them on the output of the
+	// scan. Since this implicit sort happens after the scan, we can't place a
+	// hard limit on the scan if the query semantics require a sort order on the
+	// entire relation.
+	if scanPrivate.IsVirtualTable(md) && !required.Any() {
+		return false
+	}
 	ok, _ := ordering.ScanPrivateCanProvide(c.e.mem.Metadata(), scanPrivate, &required)
 	return ok
 }
@@ -87,6 +94,14 @@ func (c *CustomFuncs) CanLimitFilteredScan(
 func (c *CustomFuncs) GenerateLimitedScans(
 	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, limit tree.Datum, required props.OrderingChoice,
 ) {
+	// Virtual indexes are not sorted, but are presented to the optimizer as
+	// sorted, and have a sort automatically applied to them on the output of the
+	// scan. Since this implicit sort happens after the scan, we can't place a
+	// hard limit on the scan if the query semantics require a sort order on the
+	// entire relation.
+	if scanPrivate.IsVirtualTable(c.e.mem.Metadata()) && !required.Any() {
+		return
+	}
 	limitVal := int64(*limit.(*tree.DInt))
 
 	var pkCols opt.ColSet
@@ -177,6 +192,26 @@ func (c *CustomFuncs) ScanIsInverted(sp *memo.ScanPrivate) bool {
 func (c *CustomFuncs) SplitLimitedScanIntoUnionScans(
 	limitOrdering props.OrderingChoice, scan memo.RelExpr, sp *memo.ScanPrivate, limit tree.Datum,
 ) (_ memo.RelExpr, ok bool) {
+	return c.SplitLimitedSelectIntoUnionScansOrSelects(limitOrdering, scan, sp, limit, nil)
+}
+
+// SplitLimitedSelectIntoUnionScansOrSelects returns a UnionAll tree of Scans
+// with limits or Selects from Scans with limit hints that each scan over a
+// single key from the Select's original Scan constraints. If no such UnionAll
+// of Scans or Selects can be found, ok=false is returned. This is beneficial in
+// cases where the original Select had to scan over many rows but had relatively
+// few keys to scan over. The original Select is not a parameter. Instead,
+// parameters scan and filters, the children of the original Select, are passed.
+// Selects whose first child is not a Scan are not applicable.
+// If filters is nil, Scans are produced, otherwise Selects.
+func (c *CustomFuncs) SplitLimitedSelectIntoUnionScansOrSelects(
+	limitOrdering props.OrderingChoice,
+	scan memo.RelExpr,
+	sp *memo.ScanPrivate,
+	limit tree.Datum,
+	filters memo.FiltersExpr,
+) (_ memo.RelExpr, ok bool) {
+
 	cons, ok := c.getKnownScanConstraint(sp)
 	if !ok {
 		// No valid constraint was found.
@@ -206,7 +241,7 @@ func (c *CustomFuncs) SplitLimitedScanIntoUnionScans(
 	}
 
 	limitVal := int(*limit.(*tree.DInt))
-	return c.splitScanIntoUnionScans(limitOrdering, scan, sp, cons, limitVal, keyPrefixLength)
+	return c.splitScanIntoUnionScansOrSelects(limitOrdering, scan, sp, cons, limitVal, keyPrefixLength, filters)
 }
 
 // MakeTopKPrivate returns a TopKPrivate operator with a constant, positive
@@ -233,6 +268,12 @@ func (c *CustomFuncs) GenerateLimitedTopKScans(
 	grp memo.RelExpr, sp *memo.ScanPrivate, tp *memo.TopKPrivate,
 ) {
 	required := tp.Ordering
+	// If the ordering was already optimized out (e.g., there is only one possible
+	// value for what would have been the required ordering), then there is no
+	// benefit to exploring limited top K.
+	if len(required.Columns) == 0 {
+		return
+	}
 	// Iterate over all non-inverted and non-partial secondary indexes.
 	var pkCols opt.ColSet
 	var iter scanIndexIter

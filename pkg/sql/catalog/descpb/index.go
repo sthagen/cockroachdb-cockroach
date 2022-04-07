@@ -31,10 +31,11 @@ func (desc *IndexDescriptor) IsPartial() bool {
 // ExplicitColumnStartIdx returns the start index of any explicit columns.
 func (desc *IndexDescriptor) ExplicitColumnStartIdx() int {
 	start := int(desc.Partitioning.NumImplicitColumns)
-	// We do not currently handle implicit columns along with hash sharded indexes.
-	// Thus, safe to override this to 1.
+	// Currently, we only allow implicit partitioning on hash sharded index. When
+	// that happens, the shard column always comes after implicit partition
+	// columns.
 	if desc.IsSharded() {
-		start = 1
+		start++
 	}
 	return start
 }
@@ -115,12 +116,12 @@ func (desc *IndexDescriptor) InvertedColumnName() string {
 }
 
 // InvertedColumnKeyType returns the type of the data element that is encoded
-// as the inverted index key. This is currently always Bytes.
+// as the inverted index key. This is currently always EncodedKey.
 //
 // Panics if the index is not inverted.
 func (desc *IndexDescriptor) InvertedColumnKeyType() *types.T {
 	if desc.Type != IndexDescriptor_INVERTED {
 		panic(errors.AssertionFailedf("index is not inverted"))
 	}
-	return types.Bytes
+	return types.EncodedKey
 }

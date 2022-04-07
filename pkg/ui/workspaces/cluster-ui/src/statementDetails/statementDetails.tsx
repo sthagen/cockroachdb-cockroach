@@ -21,41 +21,34 @@ import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
 import Long from "long";
 
 import {
+  NumericStat,
   intersperse,
   Bytes,
   Duration,
   FixLong,
   longToInt,
-  appAttr,
-  NumericStat,
-  StatementStatistics,
   stdDev,
   formatNumberForDisplay,
-  calculateTotalWorkload,
   unique,
   queryByName,
-  aggregatedTsAttr,
-  aggregationIntervalAttr,
+  getMatchParamByName,
+  appAttr,
+  appNamesAttr,
+  statementAttr,
+  RenderCount,
 } from "src/util";
 import { Loading } from "src/loading";
 import { Button } from "src/button";
-import { SqlBox } from "src/sql";
+import { SqlBox, SqlBoxSize } from "src/sql";
 import { SortSetting } from "src/sortedtable";
 import { Tooltip } from "@cockroachlabs/ui-components";
-import { PlanView } from "./planView";
+import { PlanDetails } from "./planDetails";
 import { SummaryCard } from "src/summaryCard";
 import {
-  approximify,
   latencyBreakdown,
   genericBarChart,
   formatTwoPlaces,
 } from "src/barCharts";
-import {
-  AggregateStatistics,
-  populateRegionNodeForStatements,
-  makeNodesColumns,
-  StatementsSortedTable,
-} from "src/statementsTable";
 import { DiagnosticsView } from "./diagnostics/diagnosticsView";
 import sortedTableStyles from "src/sortedtable/sortedtable.module.scss";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
@@ -64,33 +57,22 @@ import { commonStyles } from "src/common";
 import { NodeSummaryStats } from "../nodes";
 import { UIConfigState } from "../store";
 import moment from "moment";
-import { TimeScale, toDateRange } from "../timeScaleDropdown";
-import { StatementsRequest } from "src/api/statementsApi";
+import { TimeScale, toRoundedDateRange } from "../timeScaleDropdown";
+import { StatementDetailsRequest } from "src/api/statementsApi";
 import SQLActivityError from "../sqlActivity/errorComponent";
 import {
   ActivateDiagnosticsModalRef,
   ActivateStatementDiagnosticsModal,
 } from "../statementsDiagnostics";
 type IDuration = google.protobuf.IDuration;
+type StatementDetailsResponse = cockroach.server.serverpb.StatementDetailsResponse;
+type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
 
 const { TabPane } = Tabs;
 
 export interface Fraction {
   numerator: number;
   denominator: number;
-}
-
-interface SingleStatementStatistics {
-  statement: string;
-  app: string[];
-  database: string;
-  distSQL: Fraction;
-  vec: Fraction;
-  implicit_txn: Fraction;
-  failed: Fraction;
-  node_id: number[];
-  stats: StatementStatistics;
-  byNode: AggregateStatistics[];
 }
 
 export type StatementDetailsProps = StatementDetailsOwnProps &
@@ -136,7 +118,7 @@ export type NodesSummary = {
 };
 
 export interface StatementDetailsDispatchProps {
-  refreshStatements: (req?: StatementsRequest) => void;
+  refreshStatementDetails: (req: StatementDetailsRequest) => void;
   refreshStatementDiagnosticsRequests: () => void;
   refreshUserSQLRoles: () => void;
   refreshNodes: () => void;
@@ -150,6 +132,7 @@ export interface StatementDetailsDispatchProps {
   onTabChanged?: (tabName: string) => void;
   onDiagnosticsModalOpen?: (statementFingerprint: string) => void;
   onDiagnosticBundleDownload?: (statementFingerprint?: string) => void;
+  onDiagnosticCancelRequest?: (report: IStatementDiagnosticsReport) => void;
   onSortingChange?: (
     name: string,
     columnTitle: string,
@@ -159,7 +142,7 @@ export interface StatementDetailsDispatchProps {
 }
 
 export interface StatementDetailsStateProps {
-  statement: SingleStatementStatistics;
+  statementDetails: StatementDetailsResponse;
   statementsError: Error | null;
   timeScale: TimeScale;
   nodeNames: { [nodeId: string]: string };
@@ -177,12 +160,18 @@ const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortedTableStyles);
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 
-function statementsRequestFromProps(
+function statementDetailsRequestFromProps(
   props: StatementDetailsProps,
-): cockroach.server.serverpb.StatementsRequest {
-  const [start, end] = toDateRange(props.timeScale);
-  return new cockroach.server.serverpb.StatementsRequest({
-    combined: true,
+): cockroach.server.serverpb.StatementDetailsRequest {
+  const [start, end] = toRoundedDateRange(props.timeScale);
+  const statementFingerprintID = getMatchParamByName(
+    props.match,
+    statementAttr,
+  );
+
+  return new cockroach.server.serverpb.StatementDetailsRequest({
+    fingerprint_id: statementFingerprintID,
+    app_names: queryByName(props.location, appNamesAttr)?.split(","),
     start: Long.fromNumber(start.unix()),
     end: Long.fromNumber(end.unix()),
   });
@@ -197,7 +186,7 @@ function AppLink(props: { app: string }) {
 
   return (
     <Link
-      className={cx("app-name")}
+      className={cx("text-link")}
       to={`/sql-activity?tab=Statements&${searchParams.toString()}`}
     >
       {props.app}
@@ -208,7 +197,7 @@ function AppLink(props: { app: string }) {
 function NodeLink(props: { node: string }) {
   return (
     <Link
-      className={cx("app-name")}
+      className={cx("text-link")}
       to={`/node/${encodeURIComponent(props.node)}`}
     >
       N{props.node}
@@ -216,36 +205,11 @@ function NodeLink(props: { node: string }) {
   );
 }
 
-function renderTransactionType(implicitTxn: Fraction) {
-  if (Number.isNaN(implicitTxn.numerator)) {
-    return "(unknown)";
-  }
-  if (implicitTxn.numerator === 0) {
-    return "Explicit";
-  }
-  if (implicitTxn.numerator === implicitTxn.denominator) {
+function renderTransactionType(implicitTxn: boolean) {
+  if (implicitTxn) {
     return "Implicit";
   }
-  const fraction =
-    approximify(implicitTxn.numerator) +
-    " of " +
-    approximify(implicitTxn.denominator);
-  return `${fraction} were Implicit Txns`;
-}
-
-function renderBools(fraction: Fraction) {
-  if (Number.isNaN(fraction.numerator)) {
-    return "(unknown)";
-  }
-  if (fraction.numerator === 0) {
-    return "No";
-  }
-  if (fraction.numerator === fraction.denominator) {
-    return "Yes";
-  }
-  return (
-    approximify(fraction.numerator) + " of " + approximify(fraction.denominator)
-  );
+  return "Explicit";
 }
 
 class NumericStatTable extends React.Component<NumericStatTableProps> {
@@ -366,13 +330,13 @@ export class StatementDetails extends React.Component<
     }
   };
 
-  refreshStatements = (): void => {
-    const req = statementsRequestFromProps(this.props);
-    this.props.refreshStatements(req);
+  refreshStatementDetails = (): void => {
+    const req = statementDetailsRequestFromProps(this.props);
+    this.props.refreshStatementDetails(req);
   };
 
   componentDidMount(): void {
-    this.refreshStatements();
+    this.refreshStatementDetails();
     this.props.refreshUserSQLRoles();
     if (!this.props.isTenant) {
       this.props.refreshNodes();
@@ -384,7 +348,7 @@ export class StatementDetails extends React.Component<
   }
 
   componentDidUpdate(): void {
-    this.refreshStatements();
+    this.refreshStatementDetails();
     if (!this.props.isTenant) {
       this.props.refreshNodes();
       this.props.refreshNodesLiveness();
@@ -409,7 +373,7 @@ export class StatementDetails extends React.Component<
   };
 
   backToStatementsClick = (): void => {
-    this.props.history.push("/sql-activity?tab=Statements");
+    this.props.history.push("/sql-activity?tab=Statements&view=fingerprints");
     if (this.props.onBackToStatementsClick) {
       this.props.onBackToStatementsClick();
     }
@@ -442,7 +406,8 @@ export class StatementDetails extends React.Component<
         </div>
         <section className={cx("section", "section--container")}>
           <Loading
-            loading={_.isNil(this.props.statement)}
+            loading={_.isNil(this.props.statementDetails)}
+            page={"statement details"}
             error={this.props.statementsError}
             render={this.renderContent}
             renderError={() =>
@@ -467,27 +432,28 @@ export class StatementDetails extends React.Component<
       diagnosticsReports,
       dismissStatementDiagnosticsAlertMessage,
       onDiagnosticBundleDownload,
+      onDiagnosticCancelRequest,
       nodeRegions,
       isTenant,
       hasViewActivityRedactedRole,
     } = this.props;
     const { currentTab } = this.state;
-
-    if (!this.props.statement) {
-      return null;
-    }
+    const { statement_statistics_per_plan_hash } = this.props.statementDetails;
+    const { stats } = this.props.statementDetails.statement;
     const {
-      stats,
-      statement,
-      app,
-      distSQL,
-      vec,
-      failed,
+      app_names,
+      formatted_query,
+      query,
+      databases,
+      dist_sql_count,
+      failed_count,
+      full_scan_count,
+      vec_count,
+      total_count,
       implicit_txn,
-      database,
-    } = this.props.statement;
+    } = this.props.statementDetails.statement.metadata;
 
-    if (!stats) {
+    if (Number(stats.count) == 0) {
       const sourceApp = queryByName(this.props.location, appAttr);
       const listUrl =
         "/sql-activity?tab=Statements" +
@@ -495,9 +461,6 @@ export class StatementDetails extends React.Component<
 
       return (
         <React.Fragment>
-          <section className={cx("section")}>
-            <SqlBox value={statement} />
-          </section>
           <section className={cx("section")}>
             <h3>Unable to find statement</h3>
             There are no execution statistics for this statement.{" "}
@@ -510,36 +473,29 @@ export class StatementDetails extends React.Component<
     }
 
     const count = FixLong(stats.count).toInt();
-
+    const { statement } = this.props.statementDetails;
     const {
       parseBarChart,
       planBarChart,
       runBarChart,
       overheadBarChart,
       overallBarChart,
-    } = latencyBreakdown(this.props.statement);
+    } = latencyBreakdown(statement);
 
-    const totalCountBarChart = longToInt(this.props.statement.stats.count);
+    const totalCountBarChart = longToInt(statement.stats.count);
     const firstAttemptsBarChart = longToInt(
-      this.props.statement.stats.first_attempt_count,
+      statement.stats.first_attempt_count,
     );
     const retriesBarChart = totalCountBarChart - firstAttemptsBarChart;
-    const maxRetriesBarChart = longToInt(
-      this.props.statement.stats.max_retries,
-    );
+    const maxRetriesBarChart = longToInt(statement.stats.max_retries);
 
-    const statsByNode = this.props.statement.byNode;
-    const totalWorkload = calculateTotalWorkload(statsByNode);
-    populateRegionNodeForStatements(statsByNode, nodeRegions, isTenant);
     const nodes: string[] = unique(
       (stats.nodes || []).map(node => node.toString()),
     ).sort();
     const regions = unique(
       (stats.nodes || []).map(node => nodeRegions[node.toString()]),
     ).sort();
-    const explainPlan =
-      stats.sensitive_info && stats.sensitive_info.most_recent_plan_description;
-    const explainGlobalProps = { distribution: distSQL, vectorized: vec };
+
     const duration = (v: number) => Duration(v * 1e9);
     const hasDiagnosticReports = diagnosticsReports.length > 0;
     const lastExec =
@@ -563,23 +519,8 @@ export class StatementDetails extends React.Component<
       </Tooltip>
     );
 
-    // If the aggregatedTs is unset, we are aggregating over the whole date range.
-    const aggregatedTs = queryByName(this.props.location, aggregatedTsAttr);
-    const aggregationInterval =
-      queryByName(this.props.location, aggregationIntervalAttr) || 0;
-    const [timeScaleStart, timeScaleEnd] = toDateRange(this.props.timeScale);
-    const intervalStartTime = aggregatedTs
-      ? moment.unix(parseInt(aggregatedTs)).utc()
-      : timeScaleStart;
-    const intervalEndTime =
-      aggregatedTs && aggregationInterval
-        ? moment
-            .unix(parseInt(aggregatedTs) + parseInt(aggregationInterval))
-            .utc()
-        : timeScaleEnd;
-
-    const db = database ? (
-      <Text>{database}</Text>
+    const db = databases ? (
+      <Text>{databases}</Text>
     ) : (
       <Text className={cx("app-name", "app-name__unset")}>(unset)</Text>
     );
@@ -594,7 +535,7 @@ export class StatementDetails extends React.Component<
         <TabPane tab="Overview" key="overview">
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
-              <SqlBox value={statement} />
+              <SqlBox value={formatted_query} size={SqlBoxSize.small} />
             </Col>
           </Row>
           <Row gutter={24}>
@@ -704,20 +645,6 @@ export class StatementDetails extends React.Component<
             <Col className="gutter-row" span={12}>
               <SummaryCard className={cx("summary-card")}>
                 <Heading type="h5">Statement details</Heading>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Aggregation Interval (UTC)</Text>
-                  <Text>
-                    {intervalStartTime.format("MMM D, h:mm A")} -{" "}
-                    {intervalEndTime.format(
-                      `${
-                        intervalStartTime.isSame(intervalEndTime, "day")
-                          ? ""
-                          : "MMM D,"
-                      }h:mm A`,
-                    )}
-                  </Text>
-                </div>
-
                 {!isTenant && (
                   <div>
                     <div className={summaryCardStylesCx("summary--card__item")}>
@@ -749,22 +676,26 @@ export class StatementDetails extends React.Component<
                   <Text>App</Text>
                   <Text>
                     {intersperse<ReactNode>(
-                      app.map(a => <AppLink app={a} key={a} />),
+                      app_names.map(a => <AppLink app={a} key={a} />),
                       ", ",
                     )}
                   </Text>
                 </div>
                 <div className={summaryCardStylesCx("summary--card__item")}>
                   <Text>Failed?</Text>
-                  <Text>{renderBools(failed)}</Text>
+                  <Text>{RenderCount(failed_count, total_count)}</Text>
                 </div>
                 <div className={summaryCardStylesCx("summary--card__item")}>
                   <Text>Distributed execution?</Text>
-                  <Text>{renderBools(distSQL)}</Text>
+                  <Text>{RenderCount(dist_sql_count, total_count)}</Text>
+                </div>
+                <div className={summaryCardStylesCx("summary--card__item")}>
+                  <Text>Full Scan?</Text>
+                  <Text>{RenderCount(full_scan_count, total_count)}</Text>
                 </div>
                 <div className={summaryCardStylesCx("summary--card__item")}>
                   <Text>Vectorized execution?</Text>
-                  <Text>{renderBools(vec)}</Text>
+                  <Text>{RenderCount(vec_count, total_count)}</Text>
                 </div>
                 <div className={summaryCardStylesCx("summary--card__item")}>
                   <Text>Transaction type</Text>
@@ -819,6 +750,15 @@ export class StatementDetails extends React.Component<
             </Col>
           </Row>
         </TabPane>
+        <TabPane tab="Explain Plans" key="explain-plan">
+          <Row gutter={24}>
+            <Col className="gutter-row" span={24}>
+              <SqlBox value={formatted_query} size={SqlBoxSize.small} />
+            </Col>
+          </Row>
+          <p className={summaryCardStylesCx("summary--card__divider")} />
+          <PlanDetails plans={statement_statistics_per_plan_hash} />
+        </TabPane>
         {!isTenant && !hasViewActivityRedactedRole && (
           <TabPane
             tab={`Diagnostics ${
@@ -831,8 +771,9 @@ export class StatementDetails extends React.Component<
               diagnosticsReports={diagnosticsReports}
               dismissAlertMessage={dismissStatementDiagnosticsAlertMessage}
               hasData={hasDiagnosticReports}
-              statementFingerprint={statement}
+              statementFingerprint={query}
               onDownloadDiagnosticBundleClick={onDiagnosticBundleDownload}
+              onDiagnosticCancelRequestClick={onDiagnosticCancelRequest}
               showDiagnosticsViewLink={
                 this.props.uiConfig.showStatementDiagnosticsLink
               }
@@ -840,15 +781,6 @@ export class StatementDetails extends React.Component<
             />
           </TabPane>
         )}
-        <TabPane tab="Explain Plan" key="explain-plan">
-          <SummaryCard>
-            <PlanView
-              title="Explain Plan"
-              plan={explainPlan}
-              globalProperties={explainGlobalProps}
-            />
-          </SummaryCard>
-        </TabPane>
         <TabPane
           tab="Execution Stats"
           key="execution-stats"
@@ -951,42 +883,6 @@ export class StatementDetails extends React.Component<
               })}
             />
           </SummaryCard>
-          {!isTenant && (
-            <SummaryCard className={cx("fit-content-width")}>
-              <h3
-                className={classNames(
-                  commonStyles("base-heading"),
-                  summaryCardStylesCx("summary--card__title"),
-                )}
-              >
-                Stats By Node
-                <div className={cx("numeric-stats-table__tooltip")}>
-                  <Tooltip content="Execution statistics for this statement per gateway node.">
-                    <div
-                      className={cx("numeric-stats-table__tooltip-hover-area")}
-                    >
-                      <div className={cx("numeric-stats-table__info-icon")}>
-                        i
-                      </div>
-                    </div>
-                  </Tooltip>
-                </div>
-              </h3>
-              <StatementsSortedTable
-                className={cx("statements-table")}
-                data={statsByNode}
-                columns={makeNodesColumns(
-                  statsByNode,
-                  this.props.nodeNames,
-                  totalWorkload,
-                  nodeRegions,
-                )}
-                sortSetting={this.state.sortSetting}
-                onChangeSortSetting={this.changeSortSetting}
-                firstCellBordered
-              />
-            </SummaryCard>
-          )}
         </TabPane>
       </Tabs>
     );

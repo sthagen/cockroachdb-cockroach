@@ -298,7 +298,7 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	for b := sorter.Next(); b.Length() > 0; b = sorter.Next() {
 	}
 	for _, c := range closers {
-		require.NoError(t, c.Close())
+		require.NoError(t, c.Close(ctx))
 	}
 
 	require.True(t, spilled)
@@ -454,14 +454,12 @@ func createDiskBackedSorter(
 	sorterSpec := &execinfrapb.SorterSpec{
 		OutputOrdering:   execinfrapb.Ordering{Columns: ordCols},
 		OrderingMatchLen: uint32(matchLen),
+		Limit:            int64(k),
 	}
 	spec := &execinfrapb.ProcessorSpec{
 		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: typs}},
 		Core: execinfrapb.ProcessorCoreUnion{
 			Sorter: sorterSpec,
-		},
-		Post: execinfrapb.PostProcessSpec{
-			Limit: k,
 		},
 		ResultTypes: typs,
 	}

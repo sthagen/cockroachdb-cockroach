@@ -12,17 +12,19 @@ package sql_test
 
 import (
 	"context"
+	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -30,6 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/rowencpb"
@@ -57,16 +61,15 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	params, _ := tests.CreateTestServerParams()
-	startBackfill := make(chan bool)
-	atBackfillStage := make(chan bool)
+	mergeFinished := make(chan struct{})
+	completeSchemaChange := make(chan struct{})
 	errorChan := make(chan error, 1)
 
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeIndexBackfill: func() {
-				// Wait until we get a signal to begin backfill.
-				atBackfillStage <- true
-				<-startBackfill
+			RunAfterTempIndexMerge: func() {
+				mergeFinished <- struct{}{}
+				<-completeSchemaChange
 			},
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
@@ -76,11 +79,18 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 	}
 
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';`)
+	require.NoError(t, err)
+	_, err = sqlDB.Exec(`SET use_declarative_schema_changer = 'off';`)
+	require.NoError(t, err)
 	defer server.Stopper().Stop(context.Background())
 
 	getRevisionsForTest := func(setupSQL, schemaChangeSQL, dataSQL string, deletePreservingEncoding bool) ([]kvclient.VersionedValues, []byte, error) {
-		if _, err := sqlDB.Exec(setupSQL); err != nil {
-			t.Fatal(err)
+		setupStmts := strings.Split(setupSQL, ";")
+		for _, stmt := range setupStmts {
+			if _, err := sqlDB.Exec(stmt); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		// Start the schema change but pause right before the backfill.
@@ -93,36 +103,20 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 
 			finishedSchemaChange.Done()
 		}()
+		<-mergeFinished
 
-		<-atBackfillStage
-		// Find the descriptors for the indices.
+		// Find the descriptor for the temporary index mutation.
 		codec := keys.SystemSQLCodec
 		tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, codec, "d", "t")
 		var index *descpb.IndexDescriptor
-		var ord int
-		for idx, i := range tableDesc.Mutations {
-			if i.GetIndex() != nil {
+		for _, i := range tableDesc.Mutations {
+			if i.GetIndex() != nil && i.GetIndex().UseDeletePreservingEncoding == deletePreservingEncoding {
 				index = i.GetIndex()
-				ord = idx
+				break
 			}
 		}
-
 		if index == nil {
 			return nil, nil, errors.Newf("Could not find index mutation")
-		}
-
-		if deletePreservingEncoding {
-			// Mutate index descriptor to use the delete-preserving encoding.
-			index.UseDeletePreservingEncoding = true
-			tableDesc.Mutations[ord].Descriptor_ = &descpb.DescriptorMutation_Index{Index: index}
-
-			if err := kvDB.Put(
-				context.Background(),
-				catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
-				tableDesc.DescriptorProto(),
-			); err != nil {
-				return nil, nil, err
-			}
 		}
 
 		// Make some transactions.
@@ -132,7 +126,7 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 		}
 		end := kvDB.Clock().Now()
 
-		// Grab the revision histories for both indices.
+		// Grab the revision histories for the index.
 		prefix := rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, tableDesc.GetID(), index.ID)
 		prefixEnd := append(prefix, []byte("\xff")...)
 
@@ -141,7 +135,7 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 			return nil, nil, err
 		}
 
-		startBackfill <- true
+		completeSchemaChange <- struct{}{}
 		finishedSchemaChange.Wait()
 		if err := <-errorChan; err != nil {
 			t.Logf("Schema change with delete_preserving=%v encountered an error: %s, continuing...", deletePreservingEncoding, err)
@@ -219,16 +213,13 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 			if err := resetTestData(); err != nil {
 				t.Fatalf("error while resetting test data %s", err)
 			}
-
 			delEncRevisions, delEncPrefix, err := getRevisionsForTest(test.setupSQL, test.schemaChangeSQL, test.dataSQL, true)
 			if err != nil {
 				t.Fatalf("error while getting delete encoding revisions %s", err)
 			}
-
 			if err := resetTestData(); err != nil {
 				t.Fatalf("error while resetting test data %s", err)
 			}
-
 			defaultRevisions, defaultPrefix, err := getRevisionsForTest(test.setupSQL, test.schemaChangeSQL, test.dataSQL, false)
 			if err != nil {
 				t.Fatalf("error while getting default revisions %s", err)
@@ -242,10 +233,80 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 	}
 }
 
-// TestDeletePreservingIndexEncodingWithEmptyValues tests
+// TestDeletePreservingIndexEncodingUsesNormalDeletesInDeleteOnly
+// tests that deletes from an index in DELETE_ONLY uses actual deletes
+// and not preserved deletes.
+func TestDeletePreservingIndexEncodingUsesNormalDeletesInDeleteOnly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer lease.TestingDisableTableLeases()()
+
+	params, _ := tests.CreateTestServerParams()
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.Background())
+
+	setupSQL := `
+CREATE DATABASE t;
+CREATE TABLE t.test (a INT PRIMARY KEY, b INT);
+CREATE UNIQUE INDEX test_index_to_mutate ON t.test (b);
+`
+	_, err := sqlDB.Exec(setupSQL)
+	require.NoError(t, err)
+	codec := server.ExecutorConfig().(sql.ExecutorConfig).Codec
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, codec, "t", "test")
+
+	// Move index to DELETE_ONLY. The following delete should not
+	// be preserved even though the index sees the delete.
+	err = mutateIndexByName(kvDB, codec, tableDesc, "test_index_to_mutate", func(idx *descpb.IndexDescriptor) error {
+		idx.UseDeletePreservingEncoding = true
+		return nil
+	}, descpb.DescriptorMutation_DELETE_ONLY)
+	require.NoError(t, err)
+
+	_, err = sqlDB.Exec(`INSERT INTO t.test VALUES (1, 1)`)
+	require.NoError(t, err)
+
+	_, err = sqlDB.Exec(`DELETE FROM t.test WHERE a = 1`)
+	require.NoError(t, err)
+
+	// Move index to DELETE_AND_WRITE_ONLY. The following inserts
+	// are seen by the index and deletes should be preserved.
+	err = mutateIndexByName(kvDB, codec, tableDesc, "test_index_to_mutate", nil, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)
+	require.NoError(t, err)
+
+	_, err = sqlDB.Exec(`INSERT INTO t.test VALUES (2, 2), (3, 3)`)
+	require.NoError(t, err)
+	_, err = sqlDB.Exec(`DELETE FROM t.test WHERE a = 2`)
+	require.NoError(t, err)
+
+	idx, err := tableDesc.FindIndexWithName("test_index_to_mutate")
+	require.NoError(t, err)
+
+	span := tableDesc.IndexSpan(codec, idx.GetID())
+	kvs, err := kvDB.Scan(context.Background(), span.Key, span.EndKey, 0)
+	require.NoError(t, err)
+
+	// We should have 2 values, 1 deleted value and 1 normal.
+	require.Len(t, kvs, 2)
+	wrappedValue, err := rowenc.DecodeWrapper(kvs[0].Value)
+	require.NoError(t, err)
+	require.True(t, wrappedValue.Deleted)
+	wrappedValue, err = rowenc.DecodeWrapper(kvs[1].Value)
+	require.NoError(t, err)
+	require.False(t, wrappedValue.Deleted)
+}
+
+// TestDeletePreservingIndexEncodingWithEmptyValues is a regression
+// test for a panic when attempting to encode a KV with an empty body.
 func TestDeletePreservingIndexEncodingWithEmptyValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer lease.TestingDisableTableLeases()()
+
 	params, _ := tests.CreateTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.Background())
@@ -271,7 +332,7 @@ CREATE UNIQUE INDEX test_index_to_mutate ON t.test (y) STORING (z, a);
 		idx.StoreColumnIDs = []catid.ColumnID{0x1, 0x3, 0x4}
 		idx.KeySuffixColumnIDs = nil
 		return nil
-	})
+	}, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)
 	require.NoError(t, err)
 	_, err = sqlDB.Exec(`INSERT INTO t.test VALUES (1, 1, 1, 1); DELETE FROM t.test WHERE x = 1;`)
 	require.NoError(t, err)
@@ -283,22 +344,36 @@ func mutateIndexByName(
 	tableDesc *tabledesc.Mutable,
 	index string,
 	fn func(*descpb.IndexDescriptor) error,
+	state descpb.DescriptorMutation_State,
 ) error {
 	idx, err := tableDesc.FindIndexWithName(index)
 	if err != nil {
 		return err
 	}
 	idxCopy := *idx.IndexDesc()
-	if err := fn(&idxCopy); err != nil {
-		return err
+	if fn != nil {
+		if err := fn(&idxCopy); err != nil {
+			return err
+		}
 	}
 
-	tableDesc.RemovePublicNonPrimaryIndex(idx.Ordinal())
 	m := descpb.DescriptorMutation{}
 	m.Descriptor_ = &descpb.DescriptorMutation_Index{Index: &idxCopy}
 	m.Direction = descpb.DescriptorMutation_ADD
-	m.State = descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY
-	tableDesc.Mutations = append(tableDesc.Mutations, m)
+	m.State = state
+	if !idx.IsMutation() {
+		tableDesc.RemovePublicNonPrimaryIndex(idx.Ordinal())
+		tableDesc.Mutations = append(tableDesc.Mutations, m)
+	} else {
+		var ord int
+		for _, m := range tableDesc.AllMutations() {
+			if idx := m.AsIndex(); idx != nil && idx.GetID() == idxCopy.ID {
+				ord = m.MutationOrdinal()
+				break
+			}
+		}
+		tableDesc.Mutations[ord] = m
+	}
 	tableDesc.Version++
 	return kvDB.Put(
 		context.Background(),
@@ -408,9 +483,25 @@ func compareVersionedValueWrappers(
 	return nil
 }
 
+type fakeReceiver struct {
+	err error
+}
+
+func (f *fakeReceiver) ProducerDone() {
+}
+
+func (f *fakeReceiver) Push(
+	row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata,
+) execinfra.ConsumerStatus {
+	if meta.Err != nil {
+		f.err = meta.Err
+	}
+	return 0
+}
+
 // This test tests that the schema changer is able to merge entries from a
 // delete-preserving index into a regular index.
-func TestMergeProcess(t *testing.T) {
+func TestMergeProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
@@ -445,7 +536,7 @@ func TestMergeProcess(t *testing.T) {
 			// with 3000/3, 4000/4 entries, and a delete for the 2000/2 entry.
 			dstDataSQL: `INSERT INTO d.t (k, a, b) VALUES (1, 100, 1000), (2, 200, 2000)`,
 			srcDataSQL: `INSERT INTO d.t (k, a, b) VALUES (3, 300, 3000), (4, 400, 4000);
-   								 DELETE FROM d.t WHERE k = 2`,
+  								 DELETE FROM d.t WHERE k = 2`,
 			// Insert another row for the 2000/2 entry just so that there's a primary
 			// index row for the index to return when we read it.
 			dstDataSQL2: `INSERT INTO d.t (k, a, b) VALUES (2, 201, 2000)`,
@@ -468,14 +559,14 @@ func TestMergeProcess(t *testing.T) {
 				CREATE TABLE d.t (k INT PRIMARY KEY, a INT, b INT,
 					UNIQUE INDEX idx (b),
 					UNIQUE INDEX idx_temp (b)
-  			);`,
+ 			);`,
 			srcIndex: "idx_temp",
 			dstIndex: "idx",
 			// Populate dstIndex with some 1000/1, 2000/2 entries. Populate srcIndex
 			// with 3000/3, 4000/4 entries, and a delete for a nonexistent key.
 			dstDataSQL: `INSERT INTO d.t (k, a, b) VALUES (1, 100, 1000), (2, 200, 2000)`,
 			srcDataSQL: `INSERT INTO d.t (k, a, b) VALUES (3, 300, 3000), (4, 400, 4000);
-   								 DELETE FROM d.t WHERE k = 5`,
+  								 DELETE FROM d.t WHERE k = 5`,
 			dstContentsBeforeMerge: [][]string{
 				{"1", "1000"},
 				{"2", "2000"},
@@ -492,7 +583,7 @@ func TestMergeProcess(t *testing.T) {
 			name: "index with overriding values",
 			setupSQL: `
 				CREATE DATABASE d;
-   			CREATE TABLE d.t (k INT PRIMARY KEY, a INT, b INT,
+  			CREATE TABLE d.t (k INT PRIMARY KEY, a INT, b INT,
 					UNIQUE INDEX idx (b),
 					UNIQUE INDEX idx_temp (b)
 				);`,
@@ -523,43 +614,57 @@ func TestMergeProcess(t *testing.T) {
 
 		codec := keys.SystemSQLCodec
 		tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, codec, "d", "t")
-		lm := server.LeaseManager().(*lease.Manager)
 		settings := server.ClusterSettings()
 		execCfg := server.ExecutorConfig().(sql.ExecutorConfig)
-		jr := server.JobRegistry().(*jobs.Registry)
-
-		changer := sql.NewSchemaChangerForTesting(
-			tableDesc.GetID(), 1, execCfg.NodeID.SQLInstanceID(), kvDB, lm, jr, &execCfg, settings)
+		evalCtx := tree.EvalContext{Settings: settings, Codec: codec}
+		mm := mon.NewUnlimitedMonitor(ctx, "MemoryMonitor", mon.MemoryResource, nil, nil, math.MaxInt64, settings)
+		flowCtx := execinfra.FlowCtx{
+			Cfg: &execinfra.ServerConfig{
+				DB:                kvDB,
+				Settings:          settings,
+				Codec:             codec,
+				BackfillerMonitor: mm,
+			},
+			EvalCtx: &evalCtx,
+		}
 
 		// Here want to have different entries for the two indices, so we manipulate
 		// the index to DELETE_ONLY when we don't want to write to it, and
 		// DELETE_AND_WRITE_ONLY when we write to it.
-		mTest := makeMutationTest(t, kvDB, tdb, tableDesc)
+		setUseDeletePreservingEncoding := func(b bool) func(*descpb.IndexDescriptor) error {
+			return func(idx *descpb.IndexDescriptor) error {
+				idx.UseDeletePreservingEncoding = b
+				return nil
+			}
+		}
 
-		mTest.writeIndexMutation(ctx, test.dstIndex, descpb.DescriptorMutation{State: descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY})
-		mTest.updateIndexMutation(ctx, test.srcIndex, descpb.DescriptorMutation{State: descpb.DescriptorMutation_DELETE_ONLY}, true)
+		err := mutateIndexByName(kvDB, codec, tableDesc, test.dstIndex, nil, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)
+		require.NoError(t, err)
+		err = mutateIndexByName(kvDB, codec, tableDesc, test.srcIndex, setUseDeletePreservingEncoding(true), descpb.DescriptorMutation_DELETE_ONLY)
+		require.NoError(t, err)
 
 		if _, err := tdb.Exec(test.dstDataSQL); err != nil {
 			t.Fatal(err)
 		}
 
-		mTest.makeMutationsActive(ctx)
-		mTest.writeIndexMutation(ctx, test.dstIndex, descpb.DescriptorMutation{State: descpb.DescriptorMutation_DELETE_ONLY})
-		mTest.writeIndexMutation(ctx, test.srcIndex, descpb.DescriptorMutation{State: descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY})
+		err = mutateIndexByName(kvDB, codec, tableDesc, test.dstIndex, nil, descpb.DescriptorMutation_DELETE_ONLY)
+		require.NoError(t, err)
+		err = mutateIndexByName(kvDB, codec, tableDesc, test.srcIndex, nil, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)
+		require.NoError(t, err)
 
 		if _, err := tdb.Exec(test.srcDataSQL); err != nil {
 			t.Fatal(err)
 		}
 
-		mTest.makeMutationsActive(ctx)
-		mTest.writeIndexMutation(ctx, test.dstIndex, descpb.DescriptorMutation{State: descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY})
-		mTest.writeIndexMutation(ctx, test.srcIndex, descpb.DescriptorMutation{State: descpb.DescriptorMutation_DELETE_ONLY})
+		err = mutateIndexByName(kvDB, codec, tableDesc, test.dstIndex, nil, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)
+		require.NoError(t, err)
+		err = mutateIndexByName(kvDB, codec, tableDesc, test.srcIndex, nil, descpb.DescriptorMutation_DELETE_ONLY)
+		require.NoError(t, err)
 
 		if _, err := tdb.Exec(test.dstDataSQL2); err != nil {
 			t.Fatal(err)
 		}
 
-		mTest.makeMutationsActive(ctx)
 		tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, codec, "d", "t")
 
 		dstIndex, err := tableDesc.FindIndexWithName(test.dstIndex)
@@ -585,13 +690,24 @@ func TestMergeProcess(t *testing.T) {
 			return nil
 		}))
 
-		if err := changer.Merge(context.Background(),
-			codec,
-			tableDesc,
-			srcIndex.GetID(),
-			dstIndex.GetID(),
-			tableDesc.IndexSpan(codec, srcIndex.GetID())); err != nil {
+		sp := tableDesc.IndexSpan(codec, srcIndex.GetID())
+
+		output := fakeReceiver{}
+		im, err := backfill.NewIndexBackfillMerger(ctx, &flowCtx, execinfrapb.IndexBackfillMergerSpec{
+			Table:            tableDesc.TableDescriptor,
+			TemporaryIndexes: []descpb.IndexID{srcIndex.GetID()},
+			AddedIndexes:     []descpb.IndexID{dstIndex.GetID()},
+			Spans:            []roachpb.Span{sp},
+			SpanIdx:          []int32{0},
+			MergeTimestamp:   kvDB.Clock().Now(),
+		}, &output)
+		if err != nil {
 			t.Fatal(err)
+		}
+
+		im.Run(ctx)
+		if output.err != nil {
+			t.Fatal(output.err)
 		}
 
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
@@ -614,23 +730,6 @@ func TestMergeProcess(t *testing.T) {
 	}
 }
 
-func (mt mutationTest) updateIndexMutation(
-	ctx context.Context, index string, m descpb.DescriptorMutation, preserveDeletes bool,
-) {
-	tableDesc := mt.tableDesc
-	idx, err := tableDesc.FindIndexWithName(index)
-	if err != nil {
-		mt.Fatal(err)
-	}
-	// The rewrite below potentially invalidates the original object with an overwrite.
-	// Clarify what's going on.
-	idxCopy := *idx.IndexDesc()
-	idxCopy.UseDeletePreservingEncoding = preserveDeletes
-	tableDesc.RemovePublicNonPrimaryIndex(idx.Ordinal())
-	m.Descriptor_ = &descpb.DescriptorMutation_Index{Index: &idxCopy}
-	mt.writeMutation(ctx, m)
-}
-
 // fetchIndex fetches the contents of an a table index returning the results
 // as datums. The datums will correspond to each of the columns stored in the
 // index, ordered by column ID.
@@ -643,6 +742,7 @@ func fetchIndex(
 
 	mm := mon.MakeStandaloneBudget(1 << 30)
 	idx, err := table.FindIndexWithName(indexName)
+	require.NoError(t, err)
 	colIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
 	var valsNeeded util.FastIntSet
 	{
@@ -662,31 +762,27 @@ func fetchIndex(
 			valsNeeded.Add(colIdxMap.GetDefault(colID))
 		})
 	}
-	var columns []catalog.Column
+	var columns []descpb.ColumnID
 	for i, col := range table.PublicColumns() {
 		if valsNeeded.Contains(i) {
-			columns = append(columns, col)
+			columns = append(columns, col.GetID())
 		}
 	}
 
-	require.NoError(t, err)
+	var spec descpb.IndexFetchSpec
+	require.NoError(t, rowenc.InitIndexFetchSpec(&spec, keys.SystemSQLCodec, table, idx, columns))
+
 	spans := []roachpb.Span{table.IndexSpan(keys.SystemSQLCodec, idx.GetID())}
 	const reverse = false
 	require.NoError(t, fetcher.Init(
 		ctx,
-		keys.SystemSQLCodec,
 		reverse,
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
 		0,
 		&alloc,
 		mm.Monitor(),
-		row.FetcherTableArgs{
-			Desc:             table,
-			Index:            idx,
-			Columns:          columns,
-			IsSecondaryIndex: !idx.Primary(),
-		},
+		&spec,
 	))
 
 	require.NoError(t, fetcher.StartScan(

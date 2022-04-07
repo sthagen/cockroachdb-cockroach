@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
@@ -78,7 +79,10 @@ func TestSpanAssembler(t *testing.T) {
 								probOfOmittingRow = 0.3
 							}
 							sel := coldatatestutils.RandomSel(rng, coldata.BatchSize(), probOfOmittingRow)
-							testTable := makeTable(useColFamilies)
+							testTable, err := makeTable(useColFamilies)
+							if err != nil {
+								t.Fatal(err)
+							}
 							neededColumns := util.MakeFastIntSet(1, 2, 3, 4)
 
 							cols := make([]coldata.Vec, len(typs))
@@ -99,12 +103,23 @@ func TestSpanAssembler(t *testing.T) {
 							oracleSource.Init(ctx)
 							converter := colconv.NewAllVecToDatumConverter(len(typs))
 
-							builder := span.MakeBuilder(&evalCtx, keys.TODOSQLCodec, testTable, testTable.GetPrimaryIndex())
-							builder.SetNeededColumns(neededColumns)
+							var builder span.Builder
+							builder.Init(&evalCtx, keys.TODOSQLCodec, testTable, testTable.GetPrimaryIndex())
+							splitter := span.MakeSplitter(testTable, testTable.GetPrimaryIndex(), neededColumns)
+
+							var fetchSpec descpb.IndexFetchSpec
+							if err := rowenc.InitIndexFetchSpec(
+								&fetchSpec, keys.TODOSQLCodec, testTable, testTable.GetPrimaryIndex(), nil, /* fetchedColumnIDs */
+							); err != nil {
+								t.Fatal(err)
+							}
 
 							colBuilder := NewColSpanAssembler(
-								keys.TODOSQLCodec, testAllocator, testTable,
-								testTable.GetPrimaryIndex(), typs, neededColumns,
+								keys.TODOSQLCodec,
+								testAllocator,
+								&fetchSpec,
+								splitter.FamilyIDs(),
+								typs,
 							)
 							defer func() {
 								colBuilder.Close()
@@ -142,7 +157,7 @@ func TestSpanAssembler(t *testing.T) {
 									}
 									rows[i] = row
 								}
-								oracleSpans = append(oracleSpans, spanGeneratorOracle(t, builder, rows, len(typs))...)
+								oracleSpans = append(oracleSpans, spanGeneratorOracle(t, &builder, splitter, rows, len(typs))...)
 							}
 
 							if len(oracleSpans) != len(testSpans) {
@@ -167,21 +182,25 @@ func TestSpanAssembler(t *testing.T) {
 // spanGeneratorOracle extracts the logic from joinreader_span_generator.go that
 // pertains to index joins.
 func spanGeneratorOracle(
-	t *testing.T, spanBuilder *span.Builder, rows []rowenc.EncDatumRow, lookupCols int,
+	t *testing.T,
+	spanBuilder *span.Builder,
+	spanSplitter span.Splitter,
+	rows []rowenc.EncDatumRow,
+	lookupCols int,
 ) roachpb.Spans {
 	var spans roachpb.Spans
 	for _, inputRow := range rows {
-		generatedSpan, containsNull, err := spanBuilder.SpanFromEncDatums(inputRow, lookupCols)
+		generatedSpan, containsNull, err := spanBuilder.SpanFromEncDatums(inputRow[:lookupCols])
 		if err != nil {
 			t.Fatal(err)
 		}
-		spans = spanBuilder.MaybeSplitSpanIntoSeparateFamilies(
+		spans = spanSplitter.MaybeSplitSpanIntoSeparateFamilies(
 			spans, generatedSpan, lookupCols, containsNull)
 	}
 	return spans
 }
 
-func makeTable(useColFamilies bool) catalog.TableDescriptor {
+func makeTable(useColFamilies bool) (catalog.TableDescriptor, error) {
 	tableID := bootstrap.TestingUserDescID(0)
 	if !useColFamilies {
 		// We can prevent the span builder from splitting spans into separate column
@@ -193,7 +212,7 @@ func makeTable(useColFamilies bool) catalog.TableDescriptor {
 	var testTableDesc = descpb.TableDescriptor{
 		Name:       "abcd",
 		ID:         descpb.ID(tableID),
-		Privileges: descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+		Privileges: catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
 		Version:    1,
 		Columns: []descpb.ColumnDescriptor{
 			{Name: "a", ID: 1, Type: types.Int},
@@ -232,6 +251,8 @@ func makeTable(useColFamilies bool) catalog.TableDescriptor {
 	}
 
 	b := tabledesc.NewBuilder(&testTableDesc)
-	b.RunPostDeserializationChanges()
-	return b.BuildImmutableTable()
+	if err := b.RunPostDeserializationChanges(); err != nil {
+		return nil, err
+	}
+	return b.BuildImmutableTable(), nil
 }

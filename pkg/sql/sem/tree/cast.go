@@ -272,7 +272,8 @@ var castMap = map[oid.Oid]map[oid.Oid]cast{
 		oidext.T_geometry:  {maxContext: CastContextImplicit, origin: contextOriginPgCast, volatility: VolatilityImmutable},
 		oid.T_uuid:         {maxContext: CastContextExplicit, origin: contextOriginLegacyConversion, volatility: VolatilityImmutable},
 		// Automatic I/O conversions to string types.
-		// TODO(mgartner): Cast from BYTES to string types should be immutable.
+		// Casts from BYTEA to string types are stable, since they depend on
+		// the bytea_output session variable.
 		oid.T_bpchar:  {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
 		oid.T_char:    {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
 		oid.T_name:    {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
@@ -419,7 +420,8 @@ var castMap = map[oid.Oid]map[oid.Oid]cast{
 		oid.T_interval: {maxContext: CastContextExplicit, origin: contextOriginLegacyConversion, volatility: VolatilityImmutable},
 		oid.T_numeric:  {maxContext: CastContextAssignment, origin: contextOriginPgCast, volatility: VolatilityImmutable},
 		// Automatic I/O conversions to string types.
-		// TODO(mgartner): Cast from FLOAT4 to string types should be immutable.
+		// Casts from FLOAT4 to string types are stable, since they depend on the
+		// extra_float_digits session variable.
 		oid.T_bpchar:  {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
 		oid.T_char:    {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
 		oid.T_name:    {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
@@ -435,7 +437,8 @@ var castMap = map[oid.Oid]map[oid.Oid]cast{
 		oid.T_interval: {maxContext: CastContextExplicit, origin: contextOriginLegacyConversion, volatility: VolatilityImmutable},
 		oid.T_numeric:  {maxContext: CastContextAssignment, origin: contextOriginPgCast, volatility: VolatilityImmutable},
 		// Automatic I/O conversions to string types.
-		// TODO(mgartner): Cast from FLOAT8 to string types should be immutable.
+		// Casts from FLOAT8 to string types are stable, since they depend on the
+		// extra_float_digits session variable.
 		oid.T_bpchar:  {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
 		oid.T_char:    {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
 		oid.T_name:    {maxContext: CastContextAssignment, origin: contextOriginAutomaticIOConversion, volatility: VolatilityStable},
@@ -1280,7 +1283,11 @@ func ValidCast(src, tgt *types.T, ctx CastContext) bool {
 
 	// If src and tgt are tuple types, check for a valid cast between each
 	// corresponding tuple element.
-	if srcFamily == types.TupleFamily && tgtFamily == types.TupleFamily {
+	//
+	// Casts from a tuple type to AnyTuple are a no-op so they are always valid.
+	// If tgt is AnyTuple, we continue to lookupCast below which contains a
+	// special case for these casts.
+	if srcFamily == types.TupleFamily && tgtFamily == types.TupleFamily && tgt != types.AnyTuple {
 		srcTypes := src.TupleContents()
 		tgtTypes := tgt.TupleContents()
 		// The tuple types must have the same number of elements.
@@ -1347,16 +1354,6 @@ func lookupCast(src, tgt *types.T, intervalStyleEnabled, dateStyleEnabled bool) 
 				maxContext: CastContextImplicit,
 				volatility: VolatilityImmutable,
 			}, true
-		case types.BytesFamily:
-			// Casts from byte types to enums are immutable and allowed in
-			// explicit contexts.
-			// TODO(mgartner): We may not want to support the cast from BYTES to
-			// ENUM because Postgres does not support it, and it's been the
-			// source of at least one minor bug (see #74316).
-			return cast{
-				maxContext: CastContextExplicit,
-				volatility: VolatilityImmutable,
-			}, true
 		}
 	}
 
@@ -1378,6 +1375,15 @@ func lookupCast(src, tgt *types.T, intervalStyleEnabled, dateStyleEnabled bool) 
 	if srcFamily == types.TupleFamily && tgtFamily == types.StringFamily {
 		return cast{
 			maxContext: CastContextAssignment,
+			volatility: VolatilityImmutable,
+		}, true
+	}
+
+	// Casts from any tuple type to AnyTuple are no-ops, so they are implicit
+	// and immutable.
+	if srcFamily == types.TupleFamily && tgt == types.AnyTuple {
+		return cast{
+			maxContext: CastContextImplicit,
 			volatility: VolatilityImmutable,
 		}, true
 	}
@@ -2442,6 +2448,9 @@ func performCastWithoutPrecisionTruncation(
 			return res, err
 		case *DArray:
 			dcast := NewDArray(t.ArrayContents())
+			if err := dcast.MaybeSetCustomOid(t); err != nil {
+				return nil, err
+			}
 			for _, e := range v.Array {
 				ecast := DNull
 				if e != DNull {

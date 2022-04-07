@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"testing"
 	"time"
 
@@ -149,8 +148,7 @@ func TestTransientClusterSimulateLatencies(t *testing.T) {
 	demoCtx.SimulateLatency = true
 	demoCtx.NumNodes = 9
 
-	certsDir, err := ioutil.TempDir("", "cli-demo-test")
-	require.NoError(t, err)
+	certsDir := t.TempDir()
 
 	cleanupFunc := securitytest.CreateTestCerts(certsDir)
 	defer func() {
@@ -237,6 +235,7 @@ func TestTransientClusterSimulateLatencies(t *testing.T) {
 			startTime := timeutil.Now()
 			sqlExecCtx := clisqlexec.Context{}
 			_, _, err = sqlExecCtx.RunQuery(
+				context.Background(),
 				conn,
 				clisqlclient.MakeQuery(`SHOW ALL CLUSTER QUERIES`),
 				false,
@@ -272,16 +271,9 @@ func TestTransientClusterMultitenant(t *testing.T) {
 	}
 
 	security.ResetAssetLoader()
-	certsDir, err := ioutil.TempDir("", "cli-demo-mt-test")
-	require.NoError(t, err)
+	certsDir := t.TempDir()
 
 	require.NoError(t, demoCtx.generateCerts(certsDir))
-
-	defer func() {
-		if err := os.RemoveAll(certsDir); err != nil {
-			t.Fatal(err)
-		}
-	}()
 
 	ctx := context.Background()
 
@@ -326,6 +318,6 @@ func TestTransientClusterMultitenant(t *testing.T) {
 		}()
 
 		// Create a table on each tenant to make sure that the tenants are separate.
-		require.NoError(t, conn.Exec("CREATE TABLE a (a int PRIMARY KEY)", nil))
+		require.NoError(t, conn.Exec(context.Background(), "CREATE TABLE a (a int PRIMARY KEY)"))
 	}
 }

@@ -1025,7 +1025,12 @@ func TestDistSenderIgnoresNLHEBasedOnOldRangeGeneration(t *testing.T) {
 		calls = append(calls, ba.Replica.NodeID)
 		if ba.Replica.NodeID == 2 {
 			reply := &roachpb.BatchResponse{}
-			err := &roachpb.NotLeaseHolderError{Lease: &ambiguousLease, DescriptorGeneration: oldGeneration}
+			err := &roachpb.NotLeaseHolderError{
+				Lease: &ambiguousLease,
+				RangeDesc: roachpb.RangeDescriptor{
+					Generation: oldGeneration,
+				},
+			}
 			reply.Error = roachpb.NewError(err)
 			return reply, nil
 		}
@@ -1477,7 +1482,7 @@ func TestEvictCacheOnError(t *testing.T) {
 
 	rangeMismachErr := roachpb.NewRangeKeyMismatchError(
 		context.Background(), nil, nil, &lhs, nil /* lease */)
-	rangeMismachErr.AppendRangeInfo(context.Background(), rhs, roachpb.Lease{})
+	rangeMismachErr.AppendRangeInfo(context.Background(), roachpb.RangeInfo{Desc: rhs, Lease: roachpb.Lease{}})
 
 	testCases := []struct {
 		canceledCtx            bool
@@ -1791,7 +1796,7 @@ func TestRetryOnWrongReplicaErrorWithSuggestion(t *testing.T) {
 		if ba.RangeID == staleDesc.RangeID {
 			var br roachpb.BatchResponse
 			err := roachpb.NewRangeKeyMismatchError(ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), &rhsDesc, nil /* lease */)
-			err.AppendRangeInfo(ctx, lhsDesc, roachpb.Lease{})
+			err.AppendRangeInfo(ctx, roachpb.RangeInfo{Desc: lhsDesc, Lease: roachpb.Lease{}})
 			br.Error = roachpb.NewError(err)
 			return &br, nil
 		} else if ba.RangeID != lhsDesc.RangeID {
@@ -3146,14 +3151,14 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 			queryTxnFn: func() (roachpb.TransactionStatus, bool, error) {
 				return roachpb.ABORTED, txnRecordSynthesized, nil
 			},
-			expErr: "result is ambiguous (intent missing and record aborted)",
+			expErr: "result is ambiguous: intent missing and record aborted",
 		},
 		{
 			name: "QueryTxn error, unresolved ambiguity",
 			queryTxnFn: func() (roachpb.TransactionStatus, bool, error) {
 				return 0, false, errors.New("unable to query txn")
 			},
-			expErr: "result is ambiguous (error=unable to query txn [intent missing])",
+			expErr: "result is ambiguous: error=unable to query txn [intent missing]",
 		},
 	}
 	for _, test := range testCases {
@@ -3849,7 +3854,7 @@ func TestCanSendToFollower(t *testing.T) {
 			sentTo = roachpb.ReplicaDescriptor{}
 			canSend = c.canSendToFollower
 			ds := NewDistSender(cfg)
-			ds.clusterID = &base.ClusterIDContainer{}
+			ds.logicalClusterID = &base.ClusterIDContainer{}
 			// Make store 2 the leaseholder.
 			lease := roachpb.Lease{
 				Replica:  testUserRangeDescriptor3Replicas.InternalReplicas[1],
@@ -3998,7 +4003,11 @@ func TestEvictMetaRange(t *testing.T) {
 				err := roachpb.NewRangeKeyMismatchError(
 					ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), &testMeta2RangeDescriptor1, nil /* lease */)
 				if hasSuggestedRange {
-					err.AppendRangeInfo(ctx, testMeta2RangeDescriptor2, roachpb.Lease{})
+					ri := roachpb.RangeInfo{
+						Desc:  testMeta2RangeDescriptor2,
+						Lease: roachpb.Lease{},
+					}
+					err.AppendRangeInfo(ctx, ri)
 				}
 				reply.Error = roachpb.NewError(err)
 				return reply, nil

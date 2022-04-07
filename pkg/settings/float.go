@@ -13,6 +13,7 @@ package settings
 import (
 	"context"
 	"math"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 )
@@ -47,6 +48,20 @@ func (f *FloatSetting) EncodedDefault() string {
 	return EncodeFloat(f.defaultValue)
 }
 
+// DecodeToString decodes and renders an encoded value.
+func (f *FloatSetting) DecodeToString(encoded string) (string, error) {
+	fv, err := f.DecodeValue(encoded)
+	if err != nil {
+		return "", err
+	}
+	return EncodeFloat(fv), nil
+}
+
+// DecodeValue decodes the value into a float.
+func (f *FloatSetting) DecodeValue(encoded string) (float64, error) {
+	return strconv.ParseFloat(encoded, 64)
+}
+
 // Typ returns the short (1 char) string denoting the type of setting.
 func (*FloatSetting) Typ() string {
 	return "f"
@@ -68,7 +83,7 @@ func (f *FloatSetting) Override(ctx context.Context, sv *Values, v float64) {
 	if err := f.set(ctx, sv, v); err != nil {
 		panic(err)
 	}
-	sv.setDefaultOverrideInt64(f.slot, int64(math.Float64bits(v)))
+	sv.setDefaultOverride(f.slot, v)
 }
 
 // Validate that a value conforms with the validation function.
@@ -91,11 +106,10 @@ func (f *FloatSetting) set(ctx context.Context, sv *Values, v float64) error {
 
 func (f *FloatSetting) setToDefault(ctx context.Context, sv *Values) {
 	// See if the default value was overridden.
-	ok, val, _ := sv.getDefaultOverride(f.slot)
-	if ok {
+	if val := sv.getDefaultOverride(f.slot); val != nil {
 		// As per the semantics of override, these values don't go through
 		// validation.
-		_ = f.set(ctx, sv, math.Float64frombits(uint64((val))))
+		_ = f.set(ctx, sv, val.(float64))
 		return
 	}
 	if err := f.set(ctx, sv, f.defaultValue); err != nil {

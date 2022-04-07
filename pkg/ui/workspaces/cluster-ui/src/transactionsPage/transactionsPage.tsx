@@ -19,7 +19,6 @@ import {
   TransactionsTable,
 } from "../transactionsTable";
 import {
-  ColumnDescriptor,
   handleSortSettingFromQueryString,
   ISortedTablePagination,
   SortSetting,
@@ -62,10 +61,12 @@ import SQLActivityError from "../sqlActivity/errorComponent";
 import { commonStyles } from "../common";
 import {
   TimeScaleDropdown,
-  defaultTimeScaleSelected,
   TimeScale,
   toDateRange,
 } from "../timeScaleDropdown";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { TransactionViewType } from "./transactionsPageTypes";
+import { isSelectedColumn } from "../columnsSelector/utils";
 
 type IStatementsResponse = protos.cockroach.server.serverpb.IStatementsResponse;
 
@@ -90,8 +91,8 @@ export interface TransactionsPageStateProps {
 }
 
 export interface TransactionsPageDispatchProps {
-  refreshData: (req?: StatementsRequest) => void;
-  resetSQLStats: () => void;
+  refreshData: (req: StatementsRequest) => void;
+  resetSQLStats: (req: StatementsRequest) => void;
   onTimeScaleChange?: (ts: TimeScale) => void;
   onColumnsChange?: (selectedColumns: string[]) => void;
   onFilterChange?: (value: Filters) => void;
@@ -174,6 +175,10 @@ export class TransactionsPage extends React.Component<
   refreshData = (): void => {
     const req = statementsRequestFromProps(this.props);
     this.props.refreshData(req);
+  };
+  resetSQLStats = (): void => {
+    const req = statementsRequestFromProps(this.props);
+    this.props.resetSQLStats(req);
   };
 
   componentDidMount(): void {
@@ -324,14 +329,9 @@ export class TransactionsPage extends React.Component<
     }
   };
 
-  resetTime = (): void => {
-    this.changeTimeScale(defaultTimeScaleSelected);
-  };
-
   render(): React.ReactElement {
     const {
       data,
-      resetSQLStats,
       nodeRegions,
       isTenant,
       onColumnsChange,
@@ -374,13 +374,19 @@ export class TransactionsPage extends React.Component<
       data?.transactions || [],
       internal_app_name_prefix,
     );
+    const longLoadingMessage = !this.props?.data && (
+      <InlineAlert
+        intent="info"
+        title="If the selected time period contains a large amount of data, this page might take a few minutes to load."
+      />
+    );
 
     return (
       <div className={cx("table-area")}>
         <PageConfig>
           <PageConfigItem>
             <Search
-              onSubmit={this.onSubmitSearchField as any}
+              onSubmit={this.onSubmitSearchField}
               onClear={this.onClearSearchField}
               defaultValue={search}
               placeholder={"Search Transactions"}
@@ -404,20 +410,16 @@ export class TransactionsPage extends React.Component<
               setTimeScale={this.changeTimeScale}
             />
           </PageConfigItem>
-          <PageConfigItem>
-            <button className={cx("reset-btn")} onClick={this.resetTime}>
-              reset time
-            </button>
-          </PageConfigItem>
           <PageConfigItem className={commonStyles("separator")}>
             <ClearStats
-              resetSQLStats={resetSQLStats}
+              resetSQLStats={this.resetSQLStats}
               tooltipType="transaction"
             />
           </PageConfigItem>
         </PageConfig>
         <Loading
           loading={!this.props?.data}
+          page={"transactions"}
           error={this.props?.error}
           render={() => {
             const { pagination } = this.state;
@@ -447,17 +449,6 @@ export class TransactionsPage extends React.Component<
               .filter(c => !(c.name === "regionNodes" && regions.length < 2))
               .filter(c => !(isTenant && c.hideIfTenant));
 
-            const isColumnSelected = (c: ColumnDescriptor<TransactionInfo>) => {
-              return (
-                ((userSelectedColumnsToShow === null ||
-                  userSelectedColumnsToShow === undefined) &&
-                  c.showByDefault !== false) || // show column if list of visible was never defined and can be show by default.
-                (userSelectedColumnsToShow !== null &&
-                  userSelectedColumnsToShow.includes(c.name)) || // show column if user changed its visibility.
-                c.alwaysShow === true // show column if alwaysShow option is set explicitly.
-              );
-            };
-
             // Iterate over all available columns and create list of SelectOptions with initial selection
             // values based on stored user selections in local storage and default column configs.
             // Columns that are set to alwaysShow are filtered from the list.
@@ -470,12 +461,14 @@ export class TransactionsPage extends React.Component<
                     "transaction",
                   ),
                   value: c.name,
-                  isSelected: isColumnSelected(c),
+                  isSelected: isSelectedColumn(userSelectedColumnsToShow, c),
                 }),
               );
 
             // List of all columns that will be displayed based on the column selection.
-            const displayColumns = columns.filter(c => isColumnSelected(c));
+            const displayColumns = columns.filter(c =>
+              isSelectedColumn(userSelectedColumnsToShow, c),
+            );
 
             return (
               <>
@@ -500,6 +493,7 @@ export class TransactionsPage extends React.Component<
                     pagination={pagination}
                     renderNoResult={
                       <EmptyTransactionsPlaceholder
+                        transactionView={TransactionViewType.FINGERPRINTS}
                         isEmptySearchResults={hasData && isUsedFilter}
                       />
                     }
@@ -520,6 +514,7 @@ export class TransactionsPage extends React.Component<
             })
           }
         />
+        {longLoadingMessage}
       </div>
     );
   }

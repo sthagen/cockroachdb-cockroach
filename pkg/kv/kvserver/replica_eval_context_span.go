@@ -165,6 +165,12 @@ func (rec SpanSetReplicaEvalContext) GetGCThreshold() hlc.Timestamp {
 	return rec.i.GetGCThreshold()
 }
 
+// ExcludeDataFromBackup returns whether the replica is to be excluded from a
+// backup.
+func (rec SpanSetReplicaEvalContext) ExcludeDataFromBackup() bool {
+	return rec.i.ExcludeDataFromBackup()
+}
+
 // String implements Stringer.
 func (rec SpanSetReplicaEvalContext) String() string {
 	return rec.i.String()
@@ -216,9 +222,15 @@ func (rec *SpanSetReplicaEvalContext) GetCurrentReadSummary(ctx context.Context)
 	return rec.i.GetCurrentReadSummary(ctx)
 }
 
-// GetClosedTimestamp is part of the EvalContext interface.
-func (rec *SpanSetReplicaEvalContext) GetClosedTimestamp(ctx context.Context) hlc.Timestamp {
-	return rec.i.GetClosedTimestamp(ctx)
+// GetCurrentClosedTimestamp is part of the EvalContext interface.
+func (rec *SpanSetReplicaEvalContext) GetCurrentClosedTimestamp(ctx context.Context) hlc.Timestamp {
+	return rec.i.GetCurrentClosedTimestamp(ctx)
+}
+
+// GetClosedTimestampOlderThanStorageSnapshot is part of the EvalContext
+// interface.
+func (rec *SpanSetReplicaEvalContext) GetClosedTimestampOlderThanStorageSnapshot() hlc.Timestamp {
+	return rec.i.GetClosedTimestampOlderThanStorageSnapshot()
 }
 
 // GetExternalStorage returns an ExternalStorage object, based on
@@ -251,3 +263,16 @@ func (rec *SpanSetReplicaEvalContext) WatchForMerge(ctx context.Context) error {
 func (rec *SpanSetReplicaEvalContext) GetResponseMemoryAccount() *mon.BoundAccount {
 	return rec.i.GetResponseMemoryAccount()
 }
+
+// GetMaxBytes implements the batcheval.EvalContext interface.
+func (rec *SpanSetReplicaEvalContext) GetMaxBytes() int64 {
+	return rec.i.GetMaxBytes()
+}
+
+// GetEngineCapacity implements the batcheval.EvalContext interface.
+func (rec *SpanSetReplicaEvalContext) GetEngineCapacity() (roachpb.StoreCapacity, error) {
+	return rec.i.GetEngineCapacity()
+}
+
+// Release implements the batcheval.EvalContext interface.
+func (rec *SpanSetReplicaEvalContext) Release() { rec.i.Release() }

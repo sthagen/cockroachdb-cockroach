@@ -109,7 +109,7 @@ func createPublicSchemaDescriptor(
 		ctx, d.DB, d.Codec, desc, tree.PublicSchema, security.AdminRoleName(), security.AdminRoleName(), true, /* allocateID */
 	)
 	// The public role has hardcoded privileges; see comment in
-	// maybeCreatePublicSchemaWithDescriptor.
+	// descpb.NewPublicSchemaPrivilegeDescriptor.
 	publicSchemaDesc.Privileges.Grant(
 		security.PublicRoleName(),
 		privilege.List{privilege.CREATE, privilege.USAGE},
@@ -124,7 +124,7 @@ func createPublicSchemaDescriptor(
 	// Remove namespace entry for old public schema.
 	b.Del(oldKey)
 	b.CPut(newKey, publicSchemaID, nil)
-	if err := descriptors.WriteNewDescToBatch(
+	if err := descriptors.Direct().WriteNewDescToBatch(
 		ctx,
 		false,
 		b,

@@ -392,14 +392,14 @@ func (c *transientCluster) Start(
 			for i := 0; i < c.demoCtx.NumNodes; i++ {
 				latencyMap := c.servers[i].Cfg.TestingKnobs.Server.(*server.TestingKnobs).ContextTestingKnobs.ArtificialLatencyMap
 				c.infoLog(ctx, "starting tenant node %d", i)
-				stopper := stop.NewStopper()
+				tenantStopper := stop.NewStopper()
 				ts, err := c.servers[i].StartTenant(ctx, base.TestTenantArgs{
 					// We set the tenant ID to i+2, since tenant 0 is not a tenant, and
 					// tenant 1 is the system tenant. We also subtract 2 for the "starting"
 					// SQL/HTTP ports so the first tenant ends up with the desired default
 					// ports.
 					TenantID:         roachpb.MakeTenantID(uint64(i + 2)),
-					Stopper:          stopper,
+					Stopper:          tenantStopper,
 					ForceInsecure:    c.demoCtx.Insecure,
 					SSLCertsDir:      c.demoDir,
 					StartingSQLPort:  c.demoCtx.SQLPort - 2,
@@ -418,7 +418,7 @@ func (c *transientCluster) Start(
 					if ts != nil {
 						stopCtx = ts.AnnotateCtx(stopCtx)
 					}
-					stopper.Stop(stopCtx)
+					tenantStopper.Stop(stopCtx)
 				}))
 				if err != nil {
 					return err
@@ -1322,7 +1322,12 @@ func (c *transientCluster) AcquireDemoLicense(ctx context.Context) (chan error, 
 		go func() {
 			defer db.Close()
 
-			success, err := GetAndApplyLicense(db, c.firstServer.ClusterID(), demoOrg)
+			// TODO(knz): The wisdom of reporting the randomly generated
+			// storage cluster ID of a demo cluster in the license request
+			// is questionable.  What would a product analyst do with this
+			// information? Perhaps best to use a common, fixed string that
+			// identifies a demo cluster.
+			success, err := GetAndApplyLicense(db, c.firstServer.StorageClusterID(), demoOrg)
 			if err != nil {
 				select {
 				case licenseDone <- err:

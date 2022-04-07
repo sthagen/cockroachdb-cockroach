@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -321,7 +322,7 @@ type testContext struct {
 	db  *kv.DB
 
 	// If set to false, the test will be run with
-	// `EnableProtectedTimestampForMultiTenant` set to true, thereby testing the
+	// `DisableProtectedTimestampForMultiTenant` set to true, thereby testing the
 	// "new" protected timestamp logic that runs on targets instead of spans.
 	runWithDeprecatedSpans bool
 
@@ -472,8 +473,8 @@ func (test testCase) run(t *testing.T) {
 	var params base.TestServerArgs
 
 	ptsKnobs := &protectedts.TestingKnobs{}
-	if !test.runWithDeprecatedSpans {
-		ptsKnobs.EnableProtectedTimestampForMultiTenant = true
+	if test.runWithDeprecatedSpans {
+		ptsKnobs.DisableProtectedTimestampForMultiTenant = true
 		params.Knobs.ProtectedTS = ptsKnobs
 	}
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
@@ -661,12 +662,18 @@ func TestCorruptData(t *testing.T) {
 		scope := log.Scope(t)
 		defer scope.Close(t)
 
-		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					SpanConfig:  &spanconfig.TestingKnobs{ManagerDisableJobCreation: true},
+					ProtectedTS: &protectedts.TestingKnobs{DisableProtectedTimestampForMultiTenant: true},
+				},
+			},
+		})
 		defer tc.Stopper().Stop(ctx)
 
 		s := tc.Server(0)
-		pts := ptstorage.New(s.ClusterSettings(), s.InternalExecutor().(*sql.InternalExecutor),
-			nil /* knobs */)
+		pts := s.ExecutorConfig().(sql.ExecutorConfig).ProtectedTimestampProvider
 
 		tCtx := &testContext{runWithDeprecatedSpans: true}
 		runCorruptDataTest(tCtx, s, tc, pts)
@@ -677,13 +684,12 @@ func TestCorruptData(t *testing.T) {
 		defer scope.Close(t)
 
 		params, _ := tests.CreateTestServerParams()
-		ptsKnobs := &protectedts.TestingKnobs{EnableProtectedTimestampForMultiTenant: true}
-		params.Knobs.ProtectedTS = ptsKnobs
+		params.Knobs.SpanConfig = &spanconfig.TestingKnobs{ManagerDisableJobCreation: true}
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
 		defer tc.Stopper().Stop(ctx)
 
 		s := tc.Server(0)
-		pts := ptstorage.New(s.ClusterSettings(), s.InternalExecutor().(*sql.InternalExecutor), ptsKnobs)
+		pts := s.ExecutorConfig().(sql.ExecutorConfig).ProtectedTimestampProvider
 		runCorruptDataTest(&testContext{}, s, tc, pts)
 	})
 	t.Run("corrupt hlc timestamp", func(t *testing.T) {
@@ -692,13 +698,12 @@ func TestCorruptData(t *testing.T) {
 		defer scope.Close(t)
 
 		params, _ := tests.CreateTestServerParams()
-		ptsKnobs := &protectedts.TestingKnobs{EnableProtectedTimestampForMultiTenant: true}
-		params.Knobs.ProtectedTS = ptsKnobs
+		params.Knobs.SpanConfig = &spanconfig.TestingKnobs{ManagerDisableJobCreation: true}
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
 		defer tc.Stopper().Stop(ctx)
 
 		s := tc.Server(0)
-		pts := ptstorage.New(s.ClusterSettings(), s.InternalExecutor().(*sql.InternalExecutor), ptsKnobs)
+		pts := s.ExecutorConfig().(sql.ExecutorConfig).ProtectedTimestampProvider
 
 		rec := newRecord(&testContext{}, s.Clock().Now(), "foo", []byte("bar"), tableTarget(42), tableSpan(42))
 		require.NoError(t, s.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -747,8 +752,6 @@ func TestCorruptData(t *testing.T) {
 func TestErrorsFromSQL(t *testing.T) {
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
-	ptsKnobs := &protectedts.TestingKnobs{EnableProtectedTimestampForMultiTenant: true}
-	params.Knobs.ProtectedTS = ptsKnobs
 
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
 	defer tc.Stopper().Stop(ctx)
@@ -756,7 +759,7 @@ func TestErrorsFromSQL(t *testing.T) {
 	s := tc.Server(0)
 	ie := s.InternalExecutor().(sqlutil.InternalExecutor)
 	wrappedIE := &wrappedInternalExecutor{wrapped: ie}
-	pts := ptstorage.New(s.ClusterSettings(), wrappedIE, ptsKnobs)
+	pts := ptstorage.New(s.ClusterSettings(), wrappedIE, &protectedts.TestingKnobs{})
 
 	wrappedIE.setErrFunc(func(string) error {
 		return errors.New("boom")

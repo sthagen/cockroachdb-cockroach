@@ -18,6 +18,8 @@ import moment from "moment";
 import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
 import { propsToQueryString } from "src/util/query";
+import { cockroach } from "src/js/protos";
+import TakeTracingSnapshotRequest = cockroach.server.serverpb.TakeTracingSnapshotRequest;
 
 export type DatabasesRequestMessage = protos.cockroach.server.serverpb.DatabasesRequest;
 export type DatabasesResponseMessage = protos.cockroach.server.serverpb.DatabasesResponse;
@@ -116,6 +118,7 @@ export type StoresResponseMessage = protos.cockroach.server.serverpb.StoresRespo
 export type UserLogoutResponseMessage = protos.cockroach.server.serverpb.UserLogoutResponse;
 
 export type StatementsResponseMessage = protos.cockroach.server.serverpb.StatementsResponse;
+export type StatementDetailsResponseMessage = protos.cockroach.server.serverpb.StatementDetailsResponse;
 
 export type DataDistributionResponseMessage = protos.cockroach.server.serverpb.DataDistributionResponse;
 
@@ -131,10 +134,14 @@ export type StatementDiagnosticsReportsResponseMessage = protos.cockroach.server
 export type CreateStatementDiagnosticsReportRequestMessage = protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
 export type CreateStatementDiagnosticsReportResponseMessage = protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse;
 
+export type CancelStatementDiagnosticsReportRequestMessage = protos.cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest;
+export type CancelStatementDiagnosticsReportResponseMessage = protos.cockroach.server.serverpb.CancelStatementDiagnosticsReportResponse;
+
 export type StatementDiagnosticsRequestMessage = protos.cockroach.server.serverpb.StatementDiagnosticsRequest;
 export type StatementDiagnosticsResponseMessage = protos.cockroach.server.serverpb.StatementDiagnosticsResponse;
 
 export type StatementsRequestMessage = protos.cockroach.server.serverpb.StatementsRequest;
+export type StatementDetailsRequestMessage = protos.cockroach.server.serverpb.StatementDetailsRequest;
 
 export type ResetSQLStatsRequestMessage = protos.cockroach.server.serverpb.ResetSQLStatsRequest;
 export type ResetSQLStatsResponseMessage = protos.cockroach.server.serverpb.ResetSQLStatsResponse;
@@ -144,6 +151,23 @@ export type ResetIndexUsageStatsResponseMessage = protos.cockroach.server.server
 
 export type UserSQLRolesRequestMessage = protos.cockroach.server.serverpb.UserSQLRolesRequest;
 export type UserSQLRolesResponseMessage = protos.cockroach.server.serverpb.UserSQLRolesResponse;
+
+export type HotRangesRequestMessage = protos.cockroach.server.serverpb.HotRangesRequest;
+export type HotRangesV2ResponseMessage = protos.cockroach.server.serverpb.HotRangesResponseV2;
+export type ListTracingSnapshotsRequestMessage = protos.cockroach.server.serverpb.ListTracingSnapshotsRequest;
+export type ListTracingSnapshotsResponseMessage = protos.cockroach.server.serverpb.ListTracingSnapshotsResponse;
+
+export type TakeTracingSnapshotRequestMessage = protos.cockroach.server.serverpb.TakeTracingSnapshotRequest;
+export type TakeTracingSnapshotResponseMessage = protos.cockroach.server.serverpb.TakeTracingSnapshotResponse;
+
+export type GetTracingSnapshotRequestMessage = protos.cockroach.server.serverpb.GetTracingSnapshotRequest;
+export type GetTracingSnapshotResponseMessage = protos.cockroach.server.serverpb.GetTracingSnapshotResponse;
+
+export type GetTraceRequestMessage = protos.cockroach.server.serverpb.GetTraceRequest;
+export type GetTraceResponseMessage = protos.cockroach.server.serverpb.GetTraceResponse;
+
+export type SetTraceRecordingTypeRequestMessage = protos.cockroach.server.serverpb.SetTraceRecordingTypeRequest;
+export type SetTraceRecordingTypeResponseMessage = protos.cockroach.server.serverpb.SetTraceRecordingTypeResponse;
 
 // API constants
 
@@ -681,8 +705,8 @@ export function getStores(
   );
 }
 
-// getStatements returns statements the cluster has recently executed, and some stats about them.
-export function getStatements(
+// getCombinedStatements returns statements the cluster has recently executed, and some stats about them.
+export function getCombinedStatements(
   req: StatementsRequestMessage,
   timeout?: moment.Duration,
 ): Promise<StatementsResponseMessage> {
@@ -694,6 +718,26 @@ export function getStatements(
   return timeoutFetch(
     serverpb.StatementsResponse,
     `${STATUS_PREFIX}/statements?${queryStr}`,
+    null,
+    timeout,
+  );
+}
+
+// getStatementDetails returns the statistics about the selected statement.
+export function getStatementDetails(
+  req: StatementDetailsRequestMessage,
+  timeout?: moment.Duration,
+): Promise<StatementDetailsResponseMessage> {
+  let queryStr = propsToQueryString({
+    start: req.start.toInt(),
+    end: req.end.toInt(),
+  });
+  for (const app of req.app_names) {
+    queryStr += `&appNames=${app}`;
+  }
+  return timeoutFetch(
+    serverpb.StatementDetailsResponse,
+    `${STATUS_PREFIX}/stmtdetails/${req.fingerprint_id}?${queryStr}`,
     null,
     timeout,
   );
@@ -717,6 +761,18 @@ export function createStatementDiagnosticsReport(
   return timeoutFetch(
     serverpb.CreateStatementDiagnosticsReportResponse,
     `${STATUS_PREFIX}/stmtdiagreports`,
+    req as any,
+    timeout,
+  );
+}
+
+export function cancelStatementDiagnosticsReport(
+  req: CancelStatementDiagnosticsReportRequestMessage,
+  timeout?: moment.Duration,
+): Promise<CancelStatementDiagnosticsReportResponseMessage> {
+  return timeoutFetch(
+    serverpb.CancelStatementDiagnosticsReportResponse,
+    `${STATUS_PREFIX}/stmtdiagreports/cancel`,
     req as any,
     timeout,
   );
@@ -802,6 +858,90 @@ export function getUserSQLRoles(
   return timeoutFetch(
     serverpb.UserSQLRolesResponse,
     `${STATUS_PREFIX}/sqlroles`,
+    req as any,
+    timeout,
+  );
+}
+
+export function getHotRanges(
+  req: HotRangesRequestMessage,
+  timeout?: moment.Duration,
+): Promise<HotRangesV2ResponseMessage> {
+  return timeoutFetch(
+    serverpb.HotRangesResponseV2,
+    `${STATUS_PREFIX}/v2/hotranges`,
+    req as any,
+    timeout,
+  );
+}
+
+export function listTracingSnapshots(
+  timeout?: moment.Duration,
+): Promise<ListTracingSnapshotsResponseMessage> {
+  return timeoutFetch(
+    serverpb.ListTracingSnapshotsResponse,
+    `${API_PREFIX}/trace_snapshots`,
+    null,
+    timeout,
+  );
+}
+
+export function takeTracingSnapshot(
+  timeout?: moment.Duration,
+): Promise<TakeTracingSnapshotResponseMessage> {
+  const req = new TakeTracingSnapshotRequest();
+  return timeoutFetch(
+    serverpb.TakeTracingSnapshotResponse,
+    `${API_PREFIX}/trace_snapshots`,
+    req as any,
+    timeout,
+  );
+}
+
+export function getTracingSnapshot(
+  req: GetTracingSnapshotRequestMessage,
+  timeout?: moment.Duration,
+): Promise<GetTracingSnapshotResponseMessage> {
+  return timeoutFetch(
+    serverpb.GetTracingSnapshotResponse,
+    `${API_PREFIX}/trace_snapshots/${req.snapshot_id}`,
+    null,
+    timeout,
+  );
+}
+
+export function getTraceForSnapshot(
+  req: GetTraceRequestMessage,
+  timeout?: moment.Duration,
+): Promise<GetTraceResponseMessage> {
+  return timeoutFetch(
+    serverpb.GetTraceResponse,
+    `${API_PREFIX}/traces`,
+    req as any,
+    timeout,
+  );
+}
+
+export function getLiveTrace(
+  req: GetTraceRequestMessage,
+  timeout?: moment.Duration,
+): Promise<GetTraceResponseMessage> {
+  return timeoutFetch(
+    serverpb.GetTraceResponse,
+    `${API_PREFIX}/traces`,
+    req as any,
+    timeout,
+  );
+}
+
+export function setTraceRecordingType(
+  req: SetTraceRecordingTypeRequestMessage,
+  timeout?: moment.Duration,
+): Promise<SetTraceRecordingTypeResponseMessage> {
+  return timeoutFetch(
+    serverpb.SetTraceRecordingTypeResponse,
+    // TODO(davidh): Consider making this endpoint just POST to `/traces/{trace_ID}`
+    `${API_PREFIX}/settracerecordingtype`,
     req as any,
     timeout,
   );

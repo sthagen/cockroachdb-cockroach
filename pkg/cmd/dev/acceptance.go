@@ -17,6 +17,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	noRebuildCockroachFlag = "no-rebuild-cockroach"
+)
+
 func makeAcceptanceCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	acceptanceCmd := &cobra.Command{
 		Use:     "acceptance",
@@ -28,16 +32,32 @@ func makeAcceptanceCmd(runE func(cmd *cobra.Command, args []string) error) *cobr
 	}
 	addCommonBuildFlags(acceptanceCmd)
 	addCommonTestFlags(acceptanceCmd)
+	acceptanceCmd.Flags().Bool(noRebuildCockroachFlag, false, "set if it is unnecessary to rebuild cockroach (artifacts/cockroach-short must already exist, e.g. after being created by a previous `dev acceptance` run)")
+	acceptanceCmd.Flags().String(volumeFlag, "bzlhome", "the Docker volume to use as the container home directory (only used for cross builds)")
 	return acceptanceCmd
 }
 
 func (d *dev) acceptance(cmd *cobra.Command, _ []string) error {
 	ctx := cmd.Context()
 	var (
-		filter  = mustGetFlagString(cmd, filterFlag)
-		short   = mustGetFlagBool(cmd, shortFlag)
-		timeout = mustGetFlagDuration(cmd, timeoutFlag)
+		filter             = mustGetFlagString(cmd, filterFlag)
+		noRebuildCockroach = mustGetFlagBool(cmd, noRebuildCockroachFlag)
+		short              = mustGetFlagBool(cmd, shortFlag)
+		timeout            = mustGetFlagDuration(cmd, timeoutFlag)
 	)
+
+	// First we have to build cockroach.
+	if !noRebuildCockroach {
+		crossArgs, targets, err := d.getBasicBuildArgs(ctx, []string{"//pkg/cmd/cockroach-short:cockroach-short"})
+		if err != nil {
+			return err
+		}
+		volume := mustGetFlagString(cmd, volumeFlag)
+		err = d.crossBuild(ctx, crossArgs, targets, "crosslinux", volume)
+		if err != nil {
+			return err
+		}
+	}
 
 	workspace, err := d.getWorkspace(ctx)
 	if err != nil {
@@ -48,10 +68,10 @@ func (d *dev) acceptance(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	cockroachBin := filepath.Join(workspace, "artifacts", "cockroach-short")
 
 	var args []string
 	args = append(args, "run", "//pkg/acceptance:acceptance_test", "--config=test")
-	args = append(args, mustGetRemoteCacheArgs(remoteCacheAddr)...)
 	if numCPUs != 0 {
 		args = append(args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
 	}
@@ -66,6 +86,7 @@ func (d *dev) acceptance(cmd *cobra.Command, _ []string) error {
 	}
 	args = append(args, fmt.Sprintf("--test_arg=-l=%s", logDir))
 	args = append(args, "--test_env=TZ=America/New_York")
+	args = append(args, fmt.Sprintf("--test_arg=-b=%s", cockroachBin))
 
 	logCommand("bazel", args...)
 	return d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...)

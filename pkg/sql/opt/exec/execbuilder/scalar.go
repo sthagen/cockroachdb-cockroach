@@ -16,9 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 type buildScalarCtx struct {
@@ -90,7 +92,7 @@ func init() {
 func (b *Builder) buildScalar(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
 	fn := scalarBuildFuncMap[scalar.Op()]
 	if fn == nil {
-		return nil, errors.AssertionFailedf("unsupported op %s", log.Safe(scalar.Op()))
+		return nil, errors.AssertionFailedf("unsupported op %s", redact.Safe(scalar.Op()))
 	}
 	return fn(b, ctx, scalar)
 }
@@ -112,7 +114,11 @@ func (b *Builder) buildTypedExpr(
 }
 
 func (b *Builder) buildNull(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
-	return tree.ReType(tree.DNull, scalar.DataType()), nil
+	retypedNull, ok := tree.ReType(tree.DNull, scalar.DataType())
+	if !ok {
+		return nil, errors.AssertionFailedf("failed to retype NULL to %s", scalar.DataType())
+	}
+	return retypedNull, nil
 }
 
 func (b *Builder) buildVariable(
@@ -126,7 +132,7 @@ func (b *Builder) indexedVar(
 ) tree.TypedExpr {
 	idx, ok := ctx.ivarMap.Get(int(colID))
 	if !ok {
-		panic(errors.AssertionFailedf("cannot map variable %d to an indexed var", log.Safe(colID)))
+		panic(errors.AssertionFailedf("cannot map variable %d to an indexed var", redact.Safe(colID)))
 	}
 	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type)
 }
@@ -209,7 +215,7 @@ func (b *Builder) buildBoolean(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree
 		return tree.NewTypedIsNotNullExpr(expr), nil
 
 	default:
-		panic(errors.AssertionFailedf("invalid op %s", log.Safe(scalar.Op())))
+		panic(errors.AssertionFailedf("invalid op %s", redact.Safe(scalar.Op())))
 	}
 }
 
@@ -238,7 +244,7 @@ func (b *Builder) buildComparison(
 	}
 
 	operator := opt.ComparisonOpReverseMap[scalar.Op()]
-	return tree.NewTypedComparisonExpr(tree.MakeComparisonOperator(operator), left, right), nil
+	return tree.NewTypedComparisonExpr(treecmp.MakeComparisonOperator(operator), left, right), nil
 }
 
 func (b *Builder) buildUnary(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
@@ -260,7 +266,7 @@ func (b *Builder) buildBinary(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.
 		return nil, err
 	}
 	operator := opt.BinaryOpReverseMap[scalar.Op()]
-	return tree.NewTypedBinaryExpr(tree.MakeBinaryOperator(operator), left, right, scalar.DataType()), nil
+	return tree.NewTypedBinaryExpr(treebin.MakeBinaryOperator(operator), left, right, scalar.DataType()), nil
 }
 
 func (b *Builder) buildFunction(
@@ -433,8 +439,8 @@ func (b *Builder) buildAnyScalar(
 
 	cmp := opt.ComparisonOpReverseMap[any.Cmp]
 	return tree.NewTypedComparisonExprWithSubOp(
-		tree.MakeComparisonOperator(tree.Any),
-		tree.MakeComparisonOperator(cmp),
+		treecmp.MakeComparisonOperator(treecmp.Any),
+		treecmp.MakeComparisonOperator(cmp),
 		left,
 		right,
 	), nil
@@ -552,8 +558,8 @@ func (b *Builder) buildAny(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 
 	cmp := opt.ComparisonOpReverseMap[any.Cmp]
 	return tree.NewTypedComparisonExprWithSubOp(
-		tree.MakeComparisonOperator(tree.Any),
-		tree.MakeComparisonOperator(cmp),
+		treecmp.MakeComparisonOperator(treecmp.Any),
+		treecmp.MakeComparisonOperator(cmp),
 		scalarExpr,
 		subqueryExpr,
 	), nil

@@ -54,9 +54,10 @@ import (
 // The input files use the following DSL:
 //
 // new-txn      name=<txn-name> ts=<int>[,<int>] epoch=<int> [uncertainty-limit=<int>[,<int>]]
-// new-request  name=<req-name> txn=<txn-name>|none ts=<int>[,<int>] [priority] [inconsistent] [wait-policy=<policy>] [lock-timeout] [max-lock-wait-queue-length=<int>]
+// new-request  name=<req-name> txn=<txn-name>|none ts=<int>[,<int>] [priority] [inconsistent] [wait-policy=<policy>] [lock-timeout] [max-lock-wait-queue-length=<int>] [poison-policy=[err|wait]]
 //   <proto-name> [<field-name>=<field-value>...] (hint: see scanSingleRequest)
 // sequence     req=<req-name> [eval-kind=<pess|opt|pess-after-opt]
+// poison       req=<req-name>
 // finish       req=<req-name>
 //
 // handle-write-intent-error  req=<req-name> txn=<txn-name> key=<key> lease-seq=<seq>
@@ -77,7 +78,9 @@ import (
 // debug-lock-table
 // debug-disable-txn-pushes
 // debug-set-clock           ts=<secs>
+// debug-advance-clock       ts=<secs>
 // debug-set-discovered-locks-threshold-to-consult-finalized-txn-cache n=<count>
+// debug-set-max-locks n=<count>
 // reset
 //
 func TestConcurrencyManagerBasic(t *testing.T) {
@@ -169,6 +172,8 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					d.ScanArgs(t, "max-lock-wait-queue-length", &maxLockWaitQueueLength)
 				}
 
+				pp := scanPoisonPolicy(t, d)
+
 				// Each roachpb.Request is provided on an indented line.
 				reqs, reqUnions := scanRequests(t, d, c)
 				latchSpans, lockSpans := c.collectSpans(t, txn, ts, reqs)
@@ -184,6 +189,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					Requests:               reqUnions,
 					LatchSpans:             latchSpans,
 					LockSpans:              lockSpans,
+					PoisonPolicy:           pp,
 				}
 				return ""
 
@@ -254,6 +260,21 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					c.mu.Lock()
 					delete(c.guardsByReqName, reqName)
 					c.mu.Unlock()
+				})
+				return c.waitAndCollect(t, mon)
+
+			case "poison":
+				var reqName string
+				d.ScanArgs(t, "req", &reqName)
+				guard, ok := c.guardsByReqName[reqName]
+				if !ok {
+					d.Fatalf(t, "unknown request: %s", reqName)
+				}
+
+				opName := fmt.Sprintf("poison %s", reqName)
+				mon.runSync(opName, func(ctx context.Context) {
+					log.Event(ctx, "poisoning request")
+					m.PoisonReq(guard)
 				})
 				return c.waitAndCollect(t, mon)
 
@@ -510,10 +531,22 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				c.manual.Set(nanos)
 				return ""
 
+			case "debug-advance-clock":
+				var secs int
+				d.ScanArgs(t, "ts", &secs)
+				c.manual.Increment(int64(secs) * time.Second.Nanoseconds())
+				return ""
+
 			case "debug-set-discovered-locks-threshold-to-consult-finalized-txn-cache":
 				var n int
 				d.ScanArgs(t, "n", &n)
 				c.setDiscoveredLocksThresholdToConsultFinalizedTxnCache(n)
+				return ""
+
+			case "debug-set-max-locks":
+				var n int
+				d.ScanArgs(t, "n", &n)
+				m.TestingSetMaxLocks(int64(n))
 				return ""
 
 			case "reset":
@@ -617,9 +650,6 @@ func (c *cluster) makeConfig() concurrency.Config {
 		Settings:       c.st,
 		Clock:          c.clock,
 		IntentResolver: c,
-		OnContentionEvent: func(ev *roachpb.ContentionEvent) {
-			ev.Duration = 1234 * time.Millisecond // for determinism
-		},
 		TxnWaitMetrics: txnwait.NewMetrics(time.Minute),
 	}
 }
@@ -912,7 +942,7 @@ func (c *cluster) collectSpans(
 	h := roachpb.Header{Txn: txn, Timestamp: ts}
 	for _, req := range reqs {
 		if cmd, ok := batcheval.LookupCommand(req.Method()); ok {
-			cmd.DeclareKeys(c.rangeDesc, &h, req, latchSpans, lockSpans)
+			cmd.DeclareKeys(c.rangeDesc, &h, req, latchSpans, lockSpans, 0)
 		} else {
 			t.Fatalf("unrecognized command %s", req.Method())
 		}
@@ -973,7 +1003,7 @@ func (m *monitor) runSync(opName string, fn func(context.Context)) {
 		opName: opName,
 		ctx:    ctx,
 		collect: func() tracing.Recording {
-			return sp.GetRecording(tracing.RecordingVerbose)
+			return sp.GetConfiguredRecording()
 		},
 		cancel: sp.Finish,
 	}
@@ -990,7 +1020,7 @@ func (m *monitor) runAsync(opName string, fn func(context.Context)) (cancel func
 		opName: opName,
 		ctx:    ctx,
 		collect: func() tracing.Recording {
-			return sp.GetRecording(tracing.RecordingVerbose)
+			return sp.GetConfiguredRecording()
 		},
 		cancel: sp.Finish,
 	}

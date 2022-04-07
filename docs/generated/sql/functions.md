@@ -325,6 +325,8 @@
 </span></td></tr>
 <tr><td><a name="crdb_internal.merge_statement_stats"></a><code>crdb_internal.merge_statement_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of roachpb.StatementStatistics into a single JSONB object</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.merge_stats_metadata"></a><code>crdb_internal.merge_stats_metadata(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of StmtStatsMetadata into a single JSONB object</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.merge_transaction_stats"></a><code>crdb_internal.merge_transaction_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of roachpb.TransactionStatistics into a single JSONB object</p>
 </span></td></tr>
 <tr><td><a name="string_to_array"></a><code>string_to_array(str: <a href="string.html">string</a>, delimiter: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Split a string into components on a delimiter.</p>
@@ -486,6 +488,11 @@ significant than <code>element</code> to zero (or one, for day and month)</p>
 <p>Compatible elements: millennium, century, decade, year, quarter, month,
 week, day, hour, minute, second, millisecond, microsecond.</p>
 </span></td></tr>
+<tr><td><a name="date_trunc"></a><code>date_trunc(element: <a href="string.html">string</a>, input: <a href="interval.html">interval</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Truncates <code>input</code> to precision <code>element</code>.  Sets all fields that are less
+significant than <code>element</code> to zero (or one, for day and month)</p>
+<p>Compatible elements: millennium, century, decade, year, quarter, month,
+week, day, hour, minute, second, millisecond, microsecond.</p>
+</span></td></tr>
 <tr><td><a name="date_trunc"></a><code>date_trunc(element: <a href="string.html">string</a>, input: <a href="time.html">time</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Truncates <code>input</code> to precision <code>element</code>.  Sets all fields that are less
 significant than <code>element</code> to zero.</p>
 <p>Compatible elements: hour, minute, second, millisecond, microsecond.</p>
@@ -599,6 +606,26 @@ has no relationship with the commit order of concurrent transactions.</p>
 and which stays constant throughout the transaction. This timestamp
 has no relationship with the commit order of concurrent transactions.</p>
 <p>This function is the preferred overload and will be evaluated by default.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="date.html">date</a>, e1: <a href="date.html">date</a>, s1: <a href="date.html">date</a>, e2: <a href="date.html">date</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="date.html">date</a>, e1: <a href="interval.html">interval</a>, s1: <a href="date.html">date</a>, e2: <a href="interval.html">interval</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="time.html">time</a>, e1: <a href="interval.html">interval</a>, s1: <a href="time.html">time</a>, e2: <a href="interval.html">interval</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="time.html">time</a>, e1: <a href="time.html">time</a>, s1: <a href="time.html">time</a>, e2: <a href="time.html">time</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="timestamp.html">timestamp</a>, e1: <a href="interval.html">interval</a>, s1: <a href="timestamp.html">timestamp</a>, e2: <a href="interval.html">interval</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="timestamp.html">timestamp</a>, e1: <a href="timestamp.html">timestamp</a>, s1: <a href="timestamp.html">timestamp</a>, e2: <a href="timestamp.html">timestamp</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="timestamp.html">timestamptz</a>, e1: <a href="interval.html">interval</a>, s1: <a href="timestamp.html">timestamptz</a>, e2: <a href="interval.html">interval</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: <a href="timestamp.html">timestamptz</a>, e1: <a href="timestamp.html">timestamptz</a>, s1: <a href="timestamp.html">timestamptz</a>, e2: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: timetz, e1: <a href="interval.html">interval</a>, s1: timetz, e2: <a href="interval.html">interval</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
+</span></td></tr>
+<tr><td><a name="overlaps"></a><code>overlaps(s1: timetz, e1: timetz, s1: timetz, e2: timetz) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns if two time periods (defined by their endpoints) overlap.</p>
 </span></td></tr>
 <tr><td><a name="statement_timestamp"></a><code>statement_timestamp() &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Returns the start time of the current statement.</p>
 </span></td></tr>
@@ -1218,6 +1245,8 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <tr><td><a name="jsonb_populate_recordset"></a><code>jsonb_populate_recordset(base: anyelement, from_json: jsonb) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Expands the outermost array of objects in from_json to a set of rows whose columns match the record type defined by base</p>
 </span></td></tr>
 <tr><td><a name="pg_get_keywords"></a><code>pg_get_keywords() &rarr; tuple{string AS word, string AS catcode, string AS catdesc}</code></td><td><span class="funcdesc"><p>Produces a virtual table containing the keywords known to the SQL parser.</p>
+</span></td></tr>
+<tr><td><a name="pg_options_to_table"></a><code>pg_options_to_table(options: <a href="string.html">string</a>[]) &rarr; tuple{string AS option_name, string AS option_value}</code></td><td><span class="funcdesc"><p>Converts the options array format to a table.</p>
 </span></td></tr>
 <tr><td><a name="regexp_split_to_table"></a><code>regexp_split_to_table(string: <a href="string.html">string</a>, pattern: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Split string using a POSIX regular expression as the delimiter.</p>
 </span></td></tr>
@@ -2536,11 +2565,13 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
+<tr><td><a name="crdb_internal.complete_replication_stream"></a><code>crdb_internal.complete_replication_stream(stream_id: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used on the producer side to complete and clean up a replication stream after the consumer receives a cutover event and finishes the ingestion</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.complete_stream_ingestion_job"></a><code>crdb_internal.complete_stream_ingestion_job(job_id: <a href="int.html">int</a>, cutover_ts: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used to signal a running stream ingestion job to complete. The job will eventually stop ingesting, revert to the specified timestamp and leave the cluster in a consistent state. The specified timestamp can only be specified up to the microsecond. This function does not wait for the job to reach a terminal state, but instead returns the job id as soon as it has signaled the job to complete. This builtin can be used in conjunction with SHOW JOBS WHEN COMPLETE to ensure that the job has left the cluster in a consistent state.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.replication_stream_progress"></a><code>crdb_internal.replication_stream_progress(stream_id: <a href="int.html">int</a>, frontier_ts: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function can be used on the consumer side to heartbeat its replication progress to a replication stream in the source cluster. The returns a StreamReplicationStatus message that indicates stream status (RUNNING, PAUSED, or STOPPED).</p>
 </span></td></tr>
-<tr><td><a name="crdb_internal.replication_stream_spec"></a><code>crdb_internal.replication_stream_spec(stream_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function can be used on the consumer side to get a replication stream specification for the specified stream starting from the specified ‘start_from’ timestamp. The consumer will later call ‘stream_partition’ to a partition with the spec to start streaming.</p>
+<tr><td><a name="crdb_internal.replication_stream_spec"></a><code>crdb_internal.replication_stream_spec(stream_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function can be used on the consumer side to get a replication stream specification for the specified stream. The consumer will later call ‘stream_partition’ to a partition with the spec to start streaming.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.start_replication_stream"></a><code>crdb_internal.start_replication_stream(tenant_id: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used on the producer side to start a replication stream for the specified tenant. The returned stream ID uniquely identifies created stream. The caller must periodically invoke crdb_internal.heartbeat_stream() function to notify that the replication is still ongoing.</p>
 </span></td></tr>
@@ -2587,7 +2618,7 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="convert_to"></a><code>convert_to(str: <a href="string.html">string</a>, enc: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encode the string <code>str</code> as a byte array using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
 </span></td></tr>
-<tr><td><a name="crdb_internal.decode_plan_gist"></a><code>crdb_internal.decode_plan_gist(gist: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of output similar to EXPLAIN from a gist created by EXPLAIN (GIST)</p>
+<tr><td><a name="crdb_internal.decode_plan_gist"></a><code>crdb_internal.decode_plan_gist(gist: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of output similar to EXPLAIN from a gist such as those found in planGists element of the statistics column of the statement_statistics table.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.show_create_all_schemas"></a><code>crdb_internal.show_create_all_schemas(database_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of CREATE schema statements.
 The output can be used to recreate a database.’</p>
@@ -2910,6 +2941,8 @@ a CockroachDB HLC in decimal form.</p>
 <p>Note that uses of this function disable server-side optimizations and
 may increase either contention or retry errors, or both.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.active_version"></a><code>crdb_internal.active_version() &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the current active cluster version.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.approximate_timestamp"></a><code>crdb_internal.approximate_timestamp(timestamp: <a href="decimal.html">decimal</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Converts the crdb_internal_mvcc_timestamp column into an approximate timestamp.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.assignment_cast"></a><code>crdb_internal.assignment_cast(val: anyelement, type: anyelement) &rarr; anyelement</code></td><td><span class="funcdesc"><p>This function is used internally to perform assignment casts during mutations.</p>
@@ -2920,15 +2953,19 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.check_password_hash_format"></a><code>crdb_internal.check_password_hash_format(password: <a href="bytes.html">bytes</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function checks whether a string is a precomputed password hash. Returns the hash algorithm.</p>
 </span></td></tr>
-<tr><td><a name="crdb_internal.cluster_id"></a><code>crdb_internal.cluster_id() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Returns the cluster ID.</p>
+<tr><td><a name="crdb_internal.cluster_id"></a><code>crdb_internal.cluster_id() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Returns the logical cluster ID for this tenant.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.cluster_name"></a><code>crdb_internal.cluster_name() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the cluster name.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.cluster_setting_encoded_default"></a><code>crdb_internal.cluster_setting_encoded_default(setting: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the encoded default value of the given cluster setting.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.completed_migrations"></a><code>crdb_internal.completed_migrations() &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.create_join_token"></a><code>crdb_internal.create_join_token() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Creates a join token for use when adding a new node to a secure cluster.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.create_session_revival_token"></a><code>crdb_internal.create_session_revival_token() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Generate a token that can be used to create a new session for the current user.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.decode_cluster_setting"></a><code>crdb_internal.decode_cluster_setting(setting: <a href="string.html">string</a>, value: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Decodes the given encoded value for a cluster setting.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.deserialize_session"></a><code>crdb_internal.deserialize_session(session: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function deserializes the serialized variables into the current session.</p>
 </span></td></tr>
@@ -2994,9 +3031,20 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.range_stats"></a><code>crdb_internal.range_stats(key: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>This function is used to retrieve range statistics information as a JSON object.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.repair_ttl_table_scheduled_job"></a><code>crdb_internal.repair_ttl_table_scheduled_job(oid: oid) &rarr; void</code></td><td><span class="funcdesc"><p>Repairs the scheduled job for a TTL table if it is missing.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.reset_index_usage_stats"></a><code>crdb_internal.reset_index_usage_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected index usage statistics.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.reset_sql_stats"></a><code>crdb_internal.reset_sql_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected SQL statistics.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.revalidate_unique_constraint"></a><code>crdb_internal.revalidate_unique_constraint(table_name: <a href="string.html">string</a>, constraint_name: <a href="string.html">string</a>) &rarr; void</code></td><td><span class="funcdesc"><p>This function is used to revalidate the given unique constraint in the given
+table. Returns an error if validation fails.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.revalidate_unique_constraints_in_all_tables"></a><code>crdb_internal.revalidate_unique_constraints_in_all_tables() &rarr; void</code></td><td><span class="funcdesc"><p>This function is used to revalidate all unique constraints in tables
+in the current database. Returns an error if validation fails.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.revalidate_unique_constraints_in_table"></a><code>crdb_internal.revalidate_unique_constraints_in_table(table_name: <a href="string.html">string</a>) &rarr; void</code></td><td><span class="funcdesc"><p>This function is used to revalidate all unique constraints in the given
+table. Returns an error if validation fails.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.round_decimal_values"></a><code>crdb_internal.round_decimal_values(val: <a href="decimal.html">decimal</a>, scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>This function is used internally to round decimal values during mutations.</p>
 </span></td></tr>
@@ -3014,6 +3062,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.validate_session_revival_token"></a><code>crdb_internal.validate_session_revival_token(token: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Validate a token that was created by create_session_revival_token. Intended for testing.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.validate_ttl_scheduled_jobs"></a><code>crdb_internal.validate_ttl_scheduled_jobs() &rarr; void</code></td><td><span class="funcdesc"><p>Validate all TTL tables have a valid scheduled job attached.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.void_func"></a><code>crdb_internal.void_func() &rarr; void</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
 <tr><td><a name="current_database"></a><code>current_database() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current database.</p>
@@ -3025,6 +3075,18 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="current_user"></a><code>current_user() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current user. This function is provided for compatibility with PostgreSQL.</p>
 </span></td></tr>
 <tr><td><a name="session_user"></a><code>session_user() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the session user. This function is provided for compatibility with PostgreSQL.</p>
+</span></td></tr>
+<tr><td><a name="to_regclass"></a><code>to_regclass(text: <a href="string.html">string</a>) &rarr; regtype</code></td><td><span class="funcdesc"><p>Translates a textual relation name to its OID</p>
+</span></td></tr>
+<tr><td><a name="to_regnamespace"></a><code>to_regnamespace(text: <a href="string.html">string</a>) &rarr; regtype</code></td><td><span class="funcdesc"><p>Translates a textual schema name to its OID</p>
+</span></td></tr>
+<tr><td><a name="to_regproc"></a><code>to_regproc(text: <a href="string.html">string</a>) &rarr; regtype</code></td><td><span class="funcdesc"><p>Translates a textual function or procedure name to its OID</p>
+</span></td></tr>
+<tr><td><a name="to_regprocedure"></a><code>to_regprocedure(text: <a href="string.html">string</a>) &rarr; regtype</code></td><td><span class="funcdesc"><p>Translates a textual function or procedure name(with argument types) to its OID</p>
+</span></td></tr>
+<tr><td><a name="to_regrole"></a><code>to_regrole(text: <a href="string.html">string</a>) &rarr; regtype</code></td><td><span class="funcdesc"><p>Translates a textual role name to its OID</p>
+</span></td></tr>
+<tr><td><a name="to_regtype"></a><code>to_regtype(text: <a href="string.html">string</a>) &rarr; regtype</code></td><td><span class="funcdesc"><p>Translates a textual type name to its OID</p>
 </span></td></tr>
 <tr><td><a name="version"></a><code>version() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the node’s version of CockroachDB.</p>
 </span></td></tr></tbody>

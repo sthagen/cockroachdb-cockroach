@@ -129,10 +129,45 @@ func parsePositiveDuration(arg string) (time.Duration, error) {
 	return duration, nil
 }
 
+type keyFormat int
+
+const (
+	hexKey = iota
+	base64Key
+)
+
+func (f *keyFormat) Set(value string) error {
+	switch value {
+	case "hex":
+		*f = hexKey
+	case "base64":
+		*f = base64Key
+	default:
+		return errors.Errorf("unsupported format %s", value)
+	}
+	return nil
+}
+
+func (f *keyFormat) String() string {
+	switch *f {
+	case hexKey:
+		return "hex"
+	case base64Key:
+		return "base64"
+	default:
+		panic(errors.AssertionFailedf("invalid format value %d", *f))
+	}
+}
+
+func (f *keyFormat) Type() string {
+	return "hex|base64"
+}
+
 // OpenEngineOptions tunes the behavior of OpenEngine.
 type OpenEngineOptions struct {
-	ReadOnly  bool
-	MustExist bool
+	ReadOnly                    bool
+	MustExist                   bool
+	DisableAutomaticCompactions bool
 }
 
 func (opts OpenEngineOptions) configOptions() []storage.ConfigOption {
@@ -143,13 +178,22 @@ func (opts OpenEngineOptions) configOptions() []storage.ConfigOption {
 	if opts.MustExist {
 		cfgOpts = append(cfgOpts, storage.MustExist)
 	}
+	if opts.DisableAutomaticCompactions {
+		cfgOpts = append(cfgOpts, storage.DisableAutomaticCompactions)
+	}
 	return cfgOpts
 }
 
-// OpenExistingStore opens the Pebble engine rooted at 'dir'.
-// If 'readOnly' is true, opens the store in read-only mode.
-func OpenExistingStore(dir string, stopper *stop.Stopper, readOnly bool) (storage.Engine, error) {
-	return OpenEngine(dir, stopper, OpenEngineOptions{ReadOnly: readOnly, MustExist: true})
+// OpenExistingStore opens the Pebble engine rooted at 'dir'. If 'readOnly' is
+// true, opens the store in read-only mode. If 'disableAutomaticCompactions' is
+// true, disables automatic/background compactions (only used for manual
+// compactions).
+func OpenExistingStore(
+	dir string, stopper *stop.Stopper, readOnly, disableAutomaticCompactions bool,
+) (storage.Engine, error) {
+	return OpenEngine(dir, stopper, OpenEngineOptions{
+		ReadOnly: readOnly, MustExist: true, DisableAutomaticCompactions: disableAutomaticCompactions,
+	})
 }
 
 // OpenEngine opens the engine at 'dir'. Depending on the supplied options,
@@ -237,7 +281,7 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -410,7 +454,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -500,7 +544,7 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -518,19 +562,34 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	})
 }
 
+var decodeKeyOptions struct {
+	encoding keyFormat
+}
+
 var debugDecodeKeyCmd = &cobra.Command{
 	Use:   "decode-key",
 	Short: "decode <key>",
 	Long: `
-Decode a hexadecimal-encoded key and pretty-print it. For example:
+Decode encoded keys provided as command arguments and pretty-print them.
+Key encoding type could be changed using encoding flag.
+For example:
 
-	$ decode-key BB89F902ADB43000151C2D1ED07DE6C009
+	$ cockroach debug decode-key BB89F902ADB43000151C2D1ED07DE6C009
 	/Table/51/1/44938288/1521140384.514565824,0
 `,
 	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, arg := range args {
-			b, err := gohex.DecodeString(arg)
+			var b []byte
+			var err error
+			switch decodeKeyOptions.encoding {
+			case hexKey:
+				b, err = gohex.DecodeString(arg)
+			case base64Key:
+				b, err = base64.StdEncoding.DecodeString(arg)
+			default:
+				return errors.Errorf("unsupported key format %d", decodeKeyOptions.encoding)
+			}
 			if err != nil {
 				return err
 			}
@@ -628,7 +687,7 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -642,8 +701,8 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	end := keys.RaftLogPrefix(rangeID).PrefixEnd()
 	fmt.Printf("Printing keys %s -> %s (RocksDB keys: %#x - %#x )\n",
 		start, end,
-		string(storage.EncodeKey(storage.MakeMVCCMetadataKey(start))),
-		string(storage.EncodeKey(storage.MakeMVCCMetadataKey(end))))
+		string(storage.EncodeMVCCKey(storage.MakeMVCCMetadataKey(start))),
+		string(storage.EncodeMVCCKey(storage.MakeMVCCMetadataKey(end))))
 
 	// NB: raft log does not have intents.
 	return db.MVCCIterate(start, end, storage.MVCCKeyIterKind, func(kv storage.MVCCKeyValue) error {
@@ -698,7 +757,7 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -796,7 +855,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(args[0], stopper, false /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, false /* readOnly */, true /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -904,7 +963,7 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %v", key, clusterID))
-		} else if key == gossip.KeySystemConfig {
+		} else if key == gossip.KeyDeprecatedSystemConfig {
 			if debugCtx.printSystemConfig {
 				var config config.SystemConfigEntries
 				if err := protoutil.Unmarshal(bytes, &config); err != nil {
@@ -1064,7 +1123,7 @@ func runDebugUnsafeRemoveDeadReplicas(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(args[0], stopper, false /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, false /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -1426,7 +1485,7 @@ func runDebugIntentCount(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	defer stopper.Stop(ctx)
 
-	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */)
+	db, err := OpenExistingStore(args[0], stopper, true /* readOnly */, false /* disableAutomaticCompactions */)
 	if err != nil {
 		return err
 	}
@@ -1654,6 +1713,9 @@ func init() {
 		"list of dead store IDs")
 	f.VarP(&debugRecoverPlanOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
 		cliflags.ConfirmActions.Usage())
+	f.BoolVar(&debugRecoverPlanOpts.force, "force", false,
+		"force creation of plan even when problems were encountered; applying this plan may "+
+			"result in additional problems and should be done only with care and as a last resort")
 
 	f = debugRecoverExecuteCmd.Flags()
 	f.VarP(&debugRecoverExecuteOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
@@ -1684,6 +1746,9 @@ func init() {
 	f.Var(&debugMergeLogsOpts.useColor, "color",
 		"force use of TTY escape codes to colorize the output")
 
+	f = debugDecodeKeyCmd.Flags()
+	f.Var(&decodeKeyOptions.encoding, "encoding", "key argument encoding")
+
 	f = debugDecodeProtoCmd.Flags()
 	f.StringVar(&debugDecodeProtoName, "schema", "cockroach.sql.sqlbase.Descriptor",
 		"fully qualified name of the proto to decode")
@@ -1697,6 +1762,14 @@ func init() {
 	f.Var(&debugTimeSeriesDumpOpts.format, "format", "output format (text, csv, tsv, raw)")
 	f.Var(&debugTimeSeriesDumpOpts.from, "from", "oldest timestamp to include (inclusive)")
 	f.Var(&debugTimeSeriesDumpOpts.to, "to", "newest timestamp to include (inclusive)")
+
+	f = debugSendKVBatchCmd.Flags()
+	f.StringVar(&debugSendKVBatchContext.traceFormat, "trace", debugSendKVBatchContext.traceFormat,
+		"which format to use for the trace output (off, text, jaeger)")
+	f.BoolVar(&debugSendKVBatchContext.keepCollectedSpans, "keep-collected-spans", debugSendKVBatchContext.keepCollectedSpans,
+		"whether to keep the CollectedSpans field on the response, to learn about how traces work")
+	f.StringVar(&debugSendKVBatchContext.traceFile, "trace-output", debugSendKVBatchContext.traceFile,
+		"the output file to use for the trace. If left empty, output to stderr.")
 }
 
 func initPebbleCmds(cmd *cobra.Command) {

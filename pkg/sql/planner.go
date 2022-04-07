@@ -12,9 +12,9 @@ package sql
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/migration"
@@ -43,6 +43,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
+	"github.com/lib/pq/oid"
 )
 
 // extendedEvalContext extends tree.EvalContext with fields that are needed for
@@ -99,6 +101,8 @@ type extendedEvalContext struct {
 	indexUsageStats *idxusage.LocalIndexUsageStats
 
 	SchemaChangerState *SchemaChangerState
+
+	statementPreparer statementPreparer
 }
 
 // copyFromExecCfg copies relevant fields from an ExecutorConfig.
@@ -111,7 +115,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.SQLLivenessReader = execCfg.SQLLiveness
 	evalCtx.CompactEngineSpan = execCfg.CompactEngineSpanFunc
 	evalCtx.TestingKnobs = execCfg.EvalContextTestingKnobs
-	evalCtx.ClusterID = execCfg.ClusterID()
+	evalCtx.ClusterID = execCfg.LogicalClusterID()
 	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	evalCtx.NodeID = execCfg.NodeID
 	evalCtx.Locality = execCfg.Locality
@@ -120,6 +124,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.SQLStatusServer = execCfg.SQLStatusServer
 	evalCtx.DistSQLPlanner = execCfg.DistSQLPlanner
 	evalCtx.VirtualSchemas = execCfg.VirtualSchemas
+	evalCtx.KVStoresIterator = execCfg.KVStoresIterator
 }
 
 // copy returns a deep copy of ctx.
@@ -181,6 +186,10 @@ type planner struct {
 
 	preparedStatements preparedStatementsAccessor
 
+	sqlCursors sqlCursors
+
+	createdSequences createdSequences
+
 	// avoidLeasedDescriptors, when true, instructs all code that
 	// accesses table/view descriptors to force reading the descriptors
 	// within the transaction. This is necessary to read descriptors
@@ -190,10 +199,12 @@ type planner struct {
 	// 2. Disable the use of the table cache in tests.
 	avoidLeasedDescriptors bool
 
-	// autoCommit indicates whether we're planning for an implicit transaction.
-	// If autoCommit is true, the plan is allowed (but not required) to commit the
-	// transaction along with other KV operations. Committing the txn might be
-	// beneficial because it may enable the 1PC optimization.
+	// autoCommit indicates whether the plan is allowed (but not required) to
+	// commit the transaction along with other KV operations. Committing the txn
+	// might be beneficial because it may enable the 1PC optimization. Note that
+	// autocommit may be false for implicit transactions; for example, an implicit
+	// transaction is used for all the statements sent in a batch at the same
+	// time.
 	//
 	// NOTE: plan node must be configured appropriately to actually perform an
 	// auto-commit. This is dependent on information from the optimizer.
@@ -289,6 +300,7 @@ func NewInternalPlanner(
 // Returns a cleanup function that must be called once the caller is done with
 // the planner.
 func newInternalPlanner(
+	// TODO(yuzefovich): make this redact.RedactableString.
 	opName string,
 	txn *kv.Txn,
 	user security.SQLUsername,
@@ -325,7 +337,7 @@ func newInternalPlanner(
 	sds := sessiondata.NewStack(sd)
 
 	if params.collection == nil {
-		params.collection = execCfg.CollectionFactory.NewCollection(descs.NewTemporarySchemaProvider(sds))
+		params.collection = execCfg.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(sds))
 	}
 
 	var ts time.Time
@@ -345,14 +357,19 @@ func newInternalPlanner(
 	p.isInternalPlanner = true
 
 	p.semaCtx = tree.MakeSemaContext()
+	if p.execCfg.Settings.Version.IsActive(ctx, clusterversion.DateStyleIntervalStyleCastRewrite) {
+		p.semaCtx.IntervalStyleEnabled = true
+		p.semaCtx.DateStyleEnabled = true
+	} else {
+		p.semaCtx.IntervalStyleEnabled = sd.IntervalStyleEnabled
+		p.semaCtx.DateStyleEnabled = sd.DateStyleEnabled
+	}
 	p.semaCtx.SearchPath = sd.SearchPath
-	p.semaCtx.IntervalStyleEnabled = sd.IntervalStyleEnabled
-	p.semaCtx.DateStyleEnabled = sd.DateStyleEnabled
 	p.semaCtx.TypeResolver = p
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
 
-	plannerMon := mon.NewMonitor(fmt.Sprintf("internal-planner.%s.%s", user, opName),
+	plannerMon := mon.NewMonitor(redact.Sprintf("internal-planner.%s.%s", user, opName),
 		mon.MemoryResource,
 		memMetrics.CurBytesCount, memMetrics.MaxBytesHist,
 		-1, /* increment */
@@ -380,7 +397,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Tenant = p
 	p.extendedEvalCtx.Regions = p
 	p.extendedEvalCtx.JoinTokenCreator = p
-	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
+	p.extendedEvalCtx.ClusterID = execCfg.LogicalClusterID()
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
@@ -396,6 +413,7 @@ func newInternalPlanner(
 
 	p.queryCacheSession.Init()
 	p.optPlanningCtx.init(p)
+	p.createdSequences = emptyCreatedSequences{}
 
 	return p, func() {
 		// Note that we capture ctx here. This is only valid as long as we create
@@ -457,6 +475,7 @@ func internalExtendedEvalCtx(
 			SessionDataStack:          sds,
 			TxnReadOnly:               false,
 			TxnImplicit:               true,
+			TxnIsSingleStmt:           true,
 			Context:                   ctx,
 			Mon:                       plannerMon,
 			TestingKnobs:              evalContextTestingKnobs,
@@ -805,6 +824,23 @@ func (p *planner) Ann() *tree.Annotations {
 func (p *planner) ExecutorConfig() interface{} {
 	return p.execCfg
 }
+
+// statementPreparer is an interface used when deserializing a session in order
+// to prepare statements.
+type statementPreparer interface {
+	// addPreparedStmt creates a prepared statement with the given name and type
+	// hints, and returns it.
+	addPreparedStmt(
+		ctx context.Context,
+		name string,
+		stmt Statement,
+		placeholderHints tree.PlaceholderTypes,
+		rawTypeHints []oid.Oid,
+		origin PreparedStatementOrigin,
+	) (*PreparedStatement, error)
+}
+
+var _ statementPreparer = &connExecutor{}
 
 // txnModesSetter is an interface used by SQL execution to influence the current
 // transaction.

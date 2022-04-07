@@ -130,7 +130,7 @@ SUBTESTS :=
 LINTTIMEOUT := 30m
 
 ## Test timeout to use for regular tests.
-TESTTIMEOUT := 45m
+TESTTIMEOUT := 60m
 
 ## Test timeout to use for race tests.
 RACETIMEOUT := 45m
@@ -549,6 +549,9 @@ native-tag := $(subst -,_,$(TARGET_TRIPLE))$(if $(use-stdmalloc),_stdmalloc)
 # encounters a given native tag or when the build signature changes (see
 # build/defs.mk.sig). These tags are unset when building with the Go toolchain
 # directly, so these files are only compiled when building with Make.
+#
+# NB: If you update the zcgo_flags.go generation below, make sure to make the
+# corresponding changes to `dev generate cgo`.
 CGO_PKGS := \
 	pkg/cli \
 	pkg/cli/clisqlshell \
@@ -619,7 +622,7 @@ $(JEMALLOC_DIR)/Makefile: $(C_DEPS_DIR)/jemalloc-rebuild $(JEMALLOC_SRC_DIR)/con
 $(KRB5_SRC_DIR)/src/configure.in: | bin/.submodules-initialized
 
 $(KRB5_SRC_DIR)/src/configure: $(KRB5_SRC_DIR)/src/configure.in
-	cd $(KRB5_SRC_DIR)/src && autoreconf
+	cd $(KRB5_SRC_DIR)/src && autoreconf -Wno-obsolete
 
 $(KRB5_DIR)/Makefile: $(C_DEPS_DIR)/krb5-rebuild $(KRB5_SRC_DIR)/src/configure
 	rm -rf $(KRB5_DIR)
@@ -796,12 +799,8 @@ DOCGEN_TARGETS := \
 	docs/generated/eventlog.md
 
 GENERATED_TARGETS = \
-  pkg/cmd/roachtest/prometheus/mock_generated.go \
-  pkg/cmd/roachtest/tests/drt_generated.go \
-  pkg/kv/kvclient/rangefeed/mocks_generated.go \
   pkg/roachprod/vm/aws/embedded.go \
-  pkg/security/securitytest/embedded.go \
-  pkg/security/certmgr/mocks_generated.go
+  pkg/security/securitytest/embedded.go
 
 EXECGEN_TARGETS = \
   pkg/col/coldata/vec.eg.go \
@@ -874,7 +873,6 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/colexecsel/default_cmp_sel_ops.eg.go \
   pkg/sql/colexec/colexecsel/selection_ops.eg.go \
   pkg/sql/colexec/colexecsel/sel_like_ops.eg.go \
-  pkg/sql/colexec/colexecspan/span_assembler.eg.go \
   pkg/sql/colexec/colexecspan/span_encoder.eg.go \
   pkg/sql/colexec/colexecwindow/first_value.eg.go \
   pkg/sql/colexec/colexecwindow/lag.eg.go \
@@ -979,7 +977,7 @@ $(go-targets): override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.cgoTargetTriple=$(TARGET_TRIPLE)" \
 	$(if $(BUILDCHANNEL),-X "github.com/cockroachdb/cockroach/pkg/build.channel=$(BUILDCHANNEL)") \
-	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log.crashReportEnv=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))")
+	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log/logcrash.crashReportEnv=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))")
 
 # The build.utcTime format must remain in sync with TimeFormat in
 # pkg/build/info.go. It is not installed in tests or in `buildshort` to avoid
@@ -1375,13 +1373,13 @@ UI_OSS_MANIFESTS := $(subst .ccl,.oss,$(UI_CCL_MANIFESTS))
 # files. Normally, Make would run the recipe twice if dist/FOO.js and
 # FOO-manifest.js were both out-of-date. [0]
 #
-# XXX: Ideally we'd scope the dependency on $(UI_PROTOS*) to the appropriate
-# protos DLLs, but Make v3.81 has a bug that causes the dependency to be ignored
-# [1]. We're stuck with this workaround until Apple decides to update the
-# version of Make they ship with macOS or we require a newer version of Make.
-# Such a requirement would need to be strictly enforced, as the way this fails
-# is extremely subtle and doesn't present until the web UI is loaded in the
-# browser.
+# TODO(irfansharif): Ideally we'd scope the dependency on $(UI_PROTOS*) to the
+# appropriate protos DLLs, but Make v3.81 has a bug that causes the dependency
+# to be ignored [1]. We're stuck with this workaround until Apple decides to
+# update the version of Make they ship with macOS or we require a newer version
+# of Make. Such a requirement would need to be strictly enforced, as the way
+# this fails is extremely subtle and doesn't present until the web UI is loaded
+# in the browser.
 #
 # [0]: https://stackoverflow.com/a/3077254/1122351
 # [1]: http://savannah.gnu.org/bugs/?19108
@@ -1395,11 +1393,13 @@ pkg/ui/workspaces/db-console/dist/%.ccl.dll.js pkg/ui/workspaces/db-console/%.cc
 
 .PHONY: ui-test
 ui-test: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
+	$(info $(yellow)NOTE: consider using `./dev ui test` instead of `make ui-test`$(term-reset))
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start
 	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn ci
 
 .PHONY: ui-test-watch
 ui-test-watch: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
+	$(info $(yellow)NOTE: consider using `./dev ui test --watch` instead of `make ui-test-watch`$(term-reset))
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start --no-single-run --auto-watch & \
 	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn test
 
@@ -1412,9 +1412,6 @@ pkg/ui/assets.ccl.installed: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_JS_CCL) $(s
 pkg/ui/assets.oss.installed: $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS) $(UI_JS_OSS)
 pkg/ui/assets.%.installed: pkg/ui/workspaces/db-console/webpack.app.js $(shell find pkg/ui/workspaces/db-console/src pkg/ui/workspaces/db-console/styl -type f) | bin/.bootstrap
 	find pkg/ui/dist$*/assets -mindepth 1 -not -name .gitkeep -delete
-	for dll in $(shell find pkg/ui/workspaces/db-console/dist -name '*.dll.js' -type f); do \
-		echo $$dll | sed -E "s/.oss.dll.js|.ccl.dll.js/.dll.js/" | sed -E "s|^.*\/|pkg/ui/dist$*/assets/|" | xargs -I{} cp $$dll {};\
-	done
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) --config webpack.app.js --env.dist=$*
 	touch $@
 
@@ -1435,11 +1432,13 @@ ui-watch ui-watch-secure: $(UI_CCL_DLLS) pkg/ui/yarn.opt.installed
   #
   # `node-run.sh` wrapper is removed because this command is supposed to be run in dev environment (not in docker of CI)
   # so it is safe to run yarn commands directly to preserve formatting and colors for outputs
+	$(info $(yellow)NOTE: consider using `./dev ui watch [--secure]` instead of `make ui-watch[-secure]`$(term-reset))
 	yarn --cwd pkg/ui/workspaces/cluster-ui build:watch & \
-	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
+	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.app.js --env.dist=ccl --env.WEBPACK_SERVE --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
 
 .PHONY: ui-clean
 ui-clean: ## Remove build artifacts.
+	$(info $(yellow)NOTE: consider using `./dev ui clean` instead of `make ui-clean`$(term-reset))
 	find pkg/ui/distccl/assets pkg/ui/distoss/assets -mindepth 1 -not -name .gitkeep -delete
 	rm -rf pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
 	rm -rf pkg/ui/dist_vendor/*
@@ -1450,25 +1449,14 @@ ui-clean: ## Remove build artifacts.
 .PHONY: ui-maintainer-clean
 ui-maintainer-clean: ## Like clean, but also remove installed dependencies
 ui-maintainer-clean: ui-clean
+	$(info $(yellow)NOTE: consider using `./dev ui clean --all` instead of `make ui-maintainer-clean`$(term-reset))
 	rm -rf pkg/ui/node_modules pkg/ui/workspaces/db-console/node_modules pkg/ui/yarn.installed pkg/ui/workspaces/cluster-ui/node_modules
-
-pkg/cmd/roachtest/prometheus/mock_generated.go: bin/.bootstrap pkg/cmd/roachtest/prometheus/prometheus.go
-	(cd pkg/cmd/roachtest/prometheus && $(GO) generate)
-
-pkg/cmd/roachtest/tests/drt_generated.go: bin/.bootstrap pkg/cmd/roachtest/tests/drt.go
-	(cd pkg/cmd/roachtest/tests && $(GO) generate)
-
-pkg/kv/kvclient/rangefeed/mocks_generated.go: bin/.bootstrap pkg/kv/kvclient/rangefeed/rangefeed.go
-	(cd pkg/kv/kvclient/rangefeed && $(GO) generate)
 
 pkg/roachprod/vm/aws/embedded.go: bin/.bootstrap pkg/roachprod/vm/aws/config.json pkg/roachprod/vm/aws/old.json bin/terraformgen
 	(cd pkg/roachprod/vm/aws && $(GO) generate)
 
 pkg/security/securitytest/embedded.go: bin/.bootstrap $(shell find pkg/security/securitytest/test_certs -type f -not -name README.md -not -name regenerate.sh)
 	(cd pkg/security/securitytest && $(GO) generate)
-
-pkg/security/certmgr/mocks_generated.go: bin/.bootstrap pkg/security/certmgr/cert.go
-	(cd pkg/security/certmgr && $(GO) generate)
 
 .SECONDARY: pkg/sql/parser/gen/sql.go.tmp
 pkg/sql/parser/gen/sql.go.tmp: pkg/sql/parser/gen/sql-gen.y bin/.bootstrap
@@ -1644,7 +1632,7 @@ pkg/util/log/log_channels_generated.go: pkg/util/log/gen/main.go pkg/util/log/lo
 .PHONY: execgen
 execgen: ## Regenerate generated code for the vectorized execution engine.
 execgen: $(EXECGEN_TARGETS) bin/execgen
-	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && ./bin/execgen -fmt=false $$i > $$i; done
+	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && COCKROACH_INTERNAL_DISABLE_METAMORPHIC_TESTING=true ./bin/execgen -fmt=false $$i > $$i; done
 	goimports -w $(EXECGEN_TARGETS)
 
 # Add a catch-all rule for any non-existent execgen generated
@@ -1738,7 +1726,6 @@ bins = \
   bin/cockroach-oss \
   bin/cockroach-short \
   bin/cockroach-sql \
-  bin/compile-builds \
   bin/docgen \
   bin/execgen \
   bin/fuzz \

@@ -12,7 +12,10 @@ package nstree
 
 import (
 	"context"
+	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
@@ -58,15 +61,11 @@ func (c Catalog) LookupDescriptorEntry(id descpb.ID) catalog.Descriptor {
 }
 
 // LookupNamespaceEntry looks up a descriptor ID by name.
-func (c Catalog) LookupNamespaceEntry(key catalog.NameKey) descpb.ID {
+func (c Catalog) LookupNamespaceEntry(key catalog.NameKey) catalog.NameEntry {
 	if !c.IsInitialized() || key == nil {
-		return descpb.InvalidID
+		return nil
 	}
-	e := c.underlying.byName.getByName(key.GetParentID(), key.GetParentSchemaID(), key.GetName())
-	if e == nil {
-		return descpb.InvalidID
-	}
-	return e.GetID()
+	return c.underlying.byName.getByName(key.GetParentID(), key.GetParentSchemaID(), key.GetName())
 }
 
 // OrderedDescriptors returns the descriptors in an ordered fashion.
@@ -107,7 +106,7 @@ var _ validate.ValidationDereferencer = MutableCatalog{}
 // DereferenceDescriptors implements the validate.ValidationDereferencer
 // interface.
 func (c Catalog) DereferenceDescriptors(
-	_ context.Context, reqs []descpb.ID,
+	ctx context.Context, version clusterversion.ClusterVersion, reqs []descpb.ID,
 ) ([]catalog.Descriptor, error) {
 	ret := make([]catalog.Descriptor, len(reqs))
 	for i, id := range reqs {
@@ -123,7 +122,11 @@ func (c Catalog) DereferenceDescriptorIDs(
 ) ([]descpb.ID, error) {
 	ret := make([]descpb.ID, len(reqs))
 	for i, req := range reqs {
-		ret[i] = c.LookupNamespaceEntry(req)
+		ne := c.LookupNamespaceEntry(req)
+		if ne == nil {
+			continue
+		}
+		ret[i] = ne.GetID()
 	}
 	return ret, nil
 }
@@ -131,18 +134,66 @@ func (c Catalog) DereferenceDescriptorIDs(
 // Validate delegates to validate.Validate.
 func (c Catalog) Validate(
 	ctx context.Context,
+	version clusterversion.ClusterVersion,
 	telemetry catalog.ValidationTelemetry,
 	targetLevel catalog.ValidationLevel,
 	descriptors ...catalog.Descriptor,
 ) (ve catalog.ValidationErrors) {
-	return validate.Validate(ctx, c, telemetry, targetLevel, descriptors...)
+	return validate.Validate(ctx, version, c, telemetry, targetLevel, descriptors...)
+}
+
+// ValidateNamespaceEntry returns an error if the specified namespace entry
+// is invalid.
+func (c Catalog) ValidateNamespaceEntry(key catalog.NameKey) error {
+	ne := c.LookupNamespaceEntry(key)
+	if ne == nil {
+		return errors.New("invalid descriptor ID")
+	}
+	// Handle special cases.
+	switch ne.GetID() {
+	case descpb.InvalidID:
+		return errors.New("invalid descriptor ID")
+	case keys.PublicSchemaID:
+		// The public schema doesn't have a descriptor.
+		return nil
+	default:
+		isSchema := ne.GetParentID() != keys.RootNamespaceID && ne.GetParentSchemaID() == keys.RootNamespaceID
+		if isSchema && strings.HasPrefix(ne.GetName(), "pg_temp_") {
+			// Temporary schemas have namespace entries but not descriptors.
+			return nil
+		}
+	}
+	// Compare the namespace entry with the referenced descriptor.
+	desc := c.LookupDescriptorEntry(ne.GetID())
+	if desc == nil {
+		return catalog.ErrDescriptorNotFound
+	}
+	// TODO(postamar): remove draining name checks in 22.2
+	for _, dn := range desc.GetDrainingNames() {
+		if ne.GetParentID() == dn.GetParentID() &&
+			ne.GetParentSchemaID() == dn.GetParentSchemaID() &&
+			ne.GetName() == dn.GetName() {
+			return nil
+		}
+	}
+	if desc.Dropped() {
+		return errors.Newf("no matching name info in draining names of dropped %s",
+			desc.DescriptorType())
+	}
+	if ne.GetParentID() == desc.GetParentID() &&
+		ne.GetParentSchemaID() == desc.GetParentSchemaID() &&
+		ne.GetName() == desc.GetName() {
+		return nil
+	}
+	return errors.Newf("no matching name info found in non-dropped %s %q",
+		desc.DescriptorType(), desc.GetName())
 }
 
 // ValidateWithRecover is like Validate but which recovers from panics.
 // This is useful when we're validating many descriptors separately and we don't
 // want a corrupt descriptor to prevent validating the others.
 func (c Catalog) ValidateWithRecover(
-	ctx context.Context, desc catalog.Descriptor,
+	ctx context.Context, version clusterversion.ClusterVersion, desc catalog.Descriptor,
 ) (ve catalog.ValidationErrors) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -154,7 +205,7 @@ func (c Catalog) ValidateWithRecover(
 			ve = append(ve, err)
 		}
 	}()
-	return c.Validate(ctx, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, desc)
+	return c.Validate(ctx, version, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, desc)
 }
 
 // MutableCatalog is like Catalog but mutable.

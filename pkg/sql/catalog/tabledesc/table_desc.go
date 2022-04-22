@@ -139,7 +139,8 @@ func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
 
 // IsUncommittedVersion implements the Descriptor interface.
 func (desc *Mutable) IsUncommittedVersion() bool {
-	return desc.IsNew() || desc.GetVersion() != desc.ClusterVersion.GetVersion()
+	clusterVersion := desc.ClusterVersion()
+	return desc.IsNew() || desc.GetVersion() != clusterVersion.GetVersion()
 }
 
 // SetDrainingNames implements the MutableDescriptor interface.
@@ -536,6 +537,19 @@ func (desc *wrapper) FindColumnWithID(id descpb.ColumnID) (catalog.Column, error
 	}
 
 	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column-id \"%d\" does not exist", id)
+}
+
+// FindColumnWithPGAttributeNum implements the TableDescriptor interface.
+func (desc *wrapper) FindColumnWithPGAttributeNum(
+	id descpb.PGAttributeNum,
+) (catalog.Column, error) {
+	for _, col := range desc.AllColumns() {
+		if col.GetPGAttributeNum() == id {
+			return col, nil
+		}
+	}
+
+	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column with logical order %q does not exist", id)
 }
 
 // FindColumnWithName implements the TableDescriptor interface.

@@ -5,11 +5,13 @@ admission.epoch_lifo.epoch_duration	duration	100ms	the duration of an epoch, for
 admission.epoch_lifo.queue_delay_threshold_to_switch_to_lifo	duration	105ms	the queue delay encountered by a (tenant,priority) for switching to epoch-LIFO ordering
 admission.sql_kv_response.enabled	boolean	true	when true, work performed by the SQL layer when receiving a KV response is subject to admission control
 admission.sql_sql_response.enabled	boolean	true	when true, work performed by the SQL layer when receiving a DistSQL response is subject to admission control
+bulkio.backup.deprecated_full_backup_with_subdir.enabled	boolean	false	when true, a backup command with a user specified subdirectory will create a full backup at the subdirectory if no backup already exists at that subdirectory.
 bulkio.backup.file_size	byte size	128 MiB	target size for individual data files produced during BACKUP
 bulkio.backup.read_timeout	duration	5m0s	amount of time after which a read attempt is considered timed out, which causes the backup to fail
 bulkio.backup.read_with_priority_after	duration	1m0s	amount of time since the read-as-of time above which a BACKUP should use priority when retrying reads
 bulkio.stream_ingestion.minimum_flush_interval	duration	5s	the minimum timestamp between flushes; flushes may still occur if internal buffers fill up
 changefeed.node_throttle_config	string		specifies node level throttling configuration for all changefeeeds
+changefeed.schema_feed.read_with_priority_after	duration	1m0s	retry with high priority if we were not able to read descriptors for too long; 0 disables
 cloudstorage.http.custom_ca	string		custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage
 cloudstorage.timeout	duration	10m0s	the timeout for import/export storage operations
 cluster.organization	string		organization name
@@ -39,7 +41,7 @@ kv.rangefeed.enabled	boolean	false	if set, rangefeed registration is enabled
 kv.replica_stats.addsst_request_size_factor	integer	50000	the divisor that is applied to addsstable request sizes, then recorded in a leaseholders QPS; 0 means all requests are treated as cost 1
 kv.replication_reports.interval	duration	1m0s	the frequency for generating the replication_constraint_stats, replication_stats_report and replication_critical_localities reports (set to 0 to disable)
 kv.transaction.max_intents_bytes	integer	4194304	maximum number of bytes used to track locks in transactions
-kv.transaction.max_refresh_spans_bytes	integer	256000	maximum number of bytes used to track refresh spans in serializable transactions
+kv.transaction.max_refresh_spans_bytes	integer	4194304	maximum number of bytes used to track refresh spans in serializable transactions
 kv.transaction.reject_over_max_intents_budget.enabled	boolean	false	if set, transactions that exceed their lock tracking budget (kv.transaction.max_intents_bytes) are rejected instead of having their lock spans imprecisely compressed
 schedules.backup.gc_protection.enabled	boolean	false	enable chaining of GC protection across backups run as part of a schedule; default is false
 security.ocsp.mode	enumeration	off	use OCSP to check whether TLS certificates are revoked. If the OCSP server is unreachable, in strict mode all certificates will be rejected and in lax mode all certificates will be accepted. [off = 0, lax = 1, strict = 2]
@@ -77,7 +79,6 @@ server.user_login.min_password_length	integer	1	the minimum length accepted for 
 server.user_login.password_encryption	enumeration	scram-sha-256	which hash method to use to encode cleartext passwords passed via ALTER/CREATE USER/ROLE WITH PASSWORD [crdb-bcrypt = 2, scram-sha-256 = 3]
 server.user_login.password_hashes.default_cost.crdb_bcrypt	integer	10	the hashing cost to use when storing passwords supplied as cleartext by SQL clients with the hashing method crdb-bcrypt (allowed range: 4-31)
 server.user_login.password_hashes.default_cost.scram_sha_256	integer	119680	the hashing cost to use when storing passwords supplied as cleartext by SQL clients with the hashing method scram-sha-256 (allowed range: 4096-240000000000)
-server.user_login.store_client_pre_hashed_passwords.enabled	boolean	true	whether the server accepts to store passwords pre-hashed by clients
 server.user_login.timeout	duration	10s	timeout after which client authentication times out if some system range is unavailable (0 = no timeout)
 server.user_login.upgrade_bcrypt_stored_passwords_to_scram.enabled	boolean	true	whether to automatically re-encode stored passwords using crdb-bcrypt to scram-sha-256
 server.web_session.auto_logout.timeout	duration	168h0m0s	the duration that web sessions will survive before being periodically purged, since they were last used
@@ -193,4 +194,4 @@ trace.jaeger.agent	string		the address of a Jaeger agent to receive traces using
 trace.opentelemetry.collector	string		address of an OpenTelemetry trace collector to receive traces using the otel gRPC protocol, as <host>:<port>. If no port is specified, 4317 will be used.
 trace.span_registry.enabled	boolean	true	if set, ongoing traces can be seen at https://<ui>/#/debug/tracez
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.
-version	version	21.2-104	set the active cluster version in the format '<major>.<minor>'
+version	version	21.2-112	set the active cluster version in the format '<major>.<minor>'

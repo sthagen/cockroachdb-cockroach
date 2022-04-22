@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -401,11 +402,49 @@ func TestAlterChangefeedDropAllTargetsError(t *testing.T) {
 	t.Run(`kafka`, kafkaTest(testFn))
 }
 
+func TestAlterChangefeedTelemetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
+		sqlDB.Exec(t, `CREATE TABLE bar (a INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO bar VALUES (1)`)
+		sqlDB.Exec(t, `CREATE TABLE baz (a INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO baz VALUES (1)`)
+
+		// Reset the counts.
+		_ = telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
+
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo, bar WITH diff`)
+		defer closeFeed(t, testFeed)
+
+		feed := testFeed.(cdctest.EnterpriseTestFeed)
+
+		require.NoError(t, feed.Pause())
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d DROP bar, foo ADD baz UNSET diff SET resolved, format=json`, feed.JobID()))
+
+		counts := telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
+		require.Equal(t, int32(1), counts[`changefeed.alter`])
+		require.Equal(t, int32(1), counts[`changefeed.alter.dropped_targets.2`])
+		require.Equal(t, int32(1), counts[`changefeed.alter.added_targets.1`])
+		require.Equal(t, int32(1), counts[`changefeed.alter.set_options.2`])
+		require.Equal(t, int32(1), counts[`changefeed.alter.unset_options.1`])
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
+}
+
 // The purpose of this test is to ensure that the ALTER CHANGEFEED statement
 // does not accidentally redact secret keys in the changefeed details
 func TestAlterChangefeedPersistSinkURI(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	bucket, accessKey, secretKey := checkS3Credentials(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, rawSQLDB, _ := serverutils.StartServer(t, params)
@@ -436,8 +475,8 @@ func TestAlterChangefeedPersistSinkURI(t *testing.T) {
 		},
 	}
 
-	query = `CREATE CHANGEFEED FOR TABLE foo, bar INTO
-		's3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456'`
+	query = fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE foo, bar INTO
+		's3://%s/fake/path?AWS_ACCESS_KEY_ID=%s&AWS_SECRET_ACCESS_KEY=%s'`, bucket, accessKey, secretKey)
 	sqlDB.QueryRow(t, query).Scan(&changefeedID)
 
 	sqlDB.Exec(t, `PAUSE JOB $1`, changefeedID)
@@ -453,12 +492,15 @@ func TestAlterChangefeedPersistSinkURI(t *testing.T) {
 	details, ok := job.Details().(jobspb.ChangefeedDetails)
 	require.True(t, ok)
 
-	require.Equal(t, details.SinkURI, `s3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456`)
+	require.Equal(t, details.SinkURI,
+		fmt.Sprintf(`s3://%s/fake/path?AWS_ACCESS_KEY_ID=%s&AWS_SECRET_ACCESS_KEY=%s`, bucket, accessKey, secretKey))
 }
 
 func TestAlterChangefeedChangeSinkTypeError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	bucket, accessKey, secretKey := checkS3Credentials(t)
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
@@ -475,7 +517,7 @@ func TestAlterChangefeedChangeSinkTypeError(t *testing.T) {
 
 		sqlDB.ExpectErr(t,
 			`pq: New sink type "s3" does not match original sink type "kafka". Altering the sink type of a changefeed is disallowed, consider creating a new changefeed instead.`,
-			fmt.Sprintf(`ALTER CHANGEFEED %d SET sink = 's3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456'`, feed.JobID()),
+			fmt.Sprintf(`ALTER CHANGEFEED %d SET sink = 's3://%s/fake/path?AWS_ACCESS_KEY_ID=%s&AWS_SECRET_ACCESS_KEY=%s'`, feed.JobID(), bucket, accessKey, secretKey),
 		)
 	}
 
@@ -607,6 +649,251 @@ func TestAlterChangefeedAddTargetErrors(t *testing.T) {
 	}
 
 	t.Run(`kafka`, kafkaTest(testFn, feedTestNoTenants))
+}
+
+func TestAlterChangefeedDatabaseQualifiedNames(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE movr.users (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO movr.users VALUES (1, 'Bob')`,
+		)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers WITH resolved = '100ms', diff`)
+		defer closeFeed(t, testFeed)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers: [1]->{"after": {"id": 1, "name": "Alice"}, "before": null}`,
+		})
+
+		expectResolvedTimestamp(t, testFeed)
+
+		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		require.NoError(t, feed.Pause())
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD movr.users WITH initial_scan UNSET diff`, feed.JobID()))
+
+		require.NoError(t, feed.Resume())
+
+		assertPayloads(t, testFeed, []string{
+			`users: [1]->{"after": {"id": 1, "name": "Bob"}}`,
+		})
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (3, 'Carol')`,
+		)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers: [3]->{"after": {"id": 3, "name": "Carol"}}`,
+		})
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
+}
+
+func TestAlterChangefeedDatabaseScope(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE DATABASE new_movr`)
+
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE new_movr.drivers (id INT PRIMARY KEY, name STRING)`)
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO new_movr.drivers VALUES (1, 'Bob')`,
+		)
+
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers WITH diff`)
+		defer closeFeed(t, testFeed)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers: [1]->{"after": {"id": 1, "name": "Alice"}, "before": null}`,
+		})
+
+		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		require.NoError(t, feed.Pause())
+
+		sqlDB.Exec(t, `USE new_movr`)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d DROP movr.drivers ADD drivers WITH initial_scan UNSET diff`, feed.JobID()))
+
+		require.NoError(t, feed.Resume())
+
+		assertPayloads(t, testFeed, []string{
+			`drivers: [1]->{"after": {"id": 1, "name": "Bob"}}`,
+		})
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
+}
+
+func TestAlterChangefeedDatabaseScopeUnqualifiedName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE DATABASE new_movr`)
+
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE new_movr.drivers (id INT PRIMARY KEY, name STRING)`)
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
+		)
+
+		sqlDB.Exec(t, `USE movr`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR drivers WITH diff, resolved = '100ms'`)
+		defer closeFeed(t, testFeed)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers: [1]->{"after": {"id": 1, "name": "Alice"}, "before": null}`,
+		})
+
+		expectResolvedTimestamp(t, testFeed)
+
+		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		require.NoError(t, feed.Pause())
+
+		sqlDB.Exec(t, `USE new_movr`)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d UNSET diff`, feed.JobID()))
+
+		require.NoError(t, feed.Resume())
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (2, 'Bob')`,
+		)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers: [2]->{"after": {"id": 2, "name": "Bob"}}`,
+		})
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
+}
+
+func TestAlterChangefeedColumnFamilyDatabaseScope(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING, FAMILY onlyid (id), FAMILY onlyname (name))`)
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
+		)
+
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers WITH diff, split_column_families`)
+		defer closeFeed(t, testFeed)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers.onlyid: [1]->{"after": {"id": 1}, "before": null}`,
+			`drivers.onlyname: [1]->{"after": {"name": "Alice"}, "before": null}`,
+		})
+
+		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		require.NoError(t, feed.Pause())
+
+		sqlDB.Exec(t, `USE movr`)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d DROP movr.drivers ADD movr.drivers FAMILY onlyid ADD drivers FAMILY onlyname UNSET diff`, feed.JobID()))
+
+		require.NoError(t, feed.Resume())
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (2, 'Bob')`,
+		)
+
+		assertPayloads(t, testFeed, []string{
+			`drivers.onlyid: [2]->{"after": {"id": 2}}`,
+			`drivers.onlyname: [2]->{"after": {"name": "Bob"}}`,
+		})
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
+}
+
+func TestAlterChangefeedAlterTableName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE TABLE movr.users (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t,
+			`INSERT INTO movr.users VALUES (1, 'Alice')`,
+		)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.users WITH diff, resolved = '100ms'`)
+		defer closeFeed(t, testFeed)
+
+		assertPayloads(t, testFeed, []string{
+			`users: [1]->{"after": {"id": 1, "name": "Alice"}, "before": null}`,
+		})
+
+		expectResolvedTimestamp(t, testFeed)
+
+		waitForSchemaChange(t, sqlDB, `ALTER TABLE movr.users RENAME TO movr.riders`)
+
+		var tsLogical string
+		sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&tsLogical)
+
+		ts := parseTimeToHLC(t, tsLogical)
+
+		// ensure that the high watermark has progressed past the time in which the
+		// schema change occurred
+		testutils.SucceedsSoon(t, func() error {
+			resolvedTS, _ := expectResolvedTimestamp(t, testFeed)
+			if resolvedTS.Less(ts) {
+				return errors.New("waiting for resolved timestamp to progress past the schema change event")
+			}
+			return nil
+		})
+
+		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		require.NoError(t, feed.Pause())
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d UNSET diff`, feed.JobID()))
+
+		require.NoError(t, feed.Resume())
+
+		sqlDB.Exec(t,
+			`INSERT INTO movr.riders VALUES (2, 'Bob')`,
+		)
+		assertPayloads(t, testFeed, []string{
+			`users: [2]->{"after": {"id": 2, "name": "Bob"}}`,
+		})
+	}
+
+	t.Run(`kafka`, kafkaTest(testFn))
 }
 
 func TestAlterChangefeedInitialScan(t *testing.T) {

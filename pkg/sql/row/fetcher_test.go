@@ -73,13 +73,12 @@ func initFetcher(
 
 	if err := fetcher.Init(
 		context.Background(),
-		reverseScan,
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
-		alloc,
-		memMon,
-		&spec,
+		FetcherInitArgs{
+			Reverse:    reverseScan,
+			Alloc:      alloc,
+			MemMonitor: memMon,
+			Spec:       &spec,
+		},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +257,7 @@ func TestNextRowBatchLimiting(t *testing.T) {
 				context.Background(),
 				kv.NewTxn(ctx, kvDB, 0),
 				roachpb.Spans{tableDesc.IndexSpan(keys.SystemSQLCodec, tableDesc.GetPrimaryIndexID())},
-				rowinfra.DefaultBatchBytesLimit,
+				rowinfra.GetDefaultBatchBytesLimit(false /* forceProductionValue */),
 				10,    /*limitHint*/
 				false, /*traceKV*/
 				false, /*forceProductionKVBatchSize*/
@@ -429,7 +428,7 @@ INDEX(c)
 		roachpb.Spans{indexSpan,
 			roachpb.Span{Key: midKey, EndKey: endKey},
 		},
-		rowinfra.DefaultBatchBytesLimit,
+		rowinfra.GetDefaultBatchBytesLimit(false /* forceProductionValue */),
 		// Set a limitHint of 1 to more quickly end the first batch, causing a
 		// batch that ends between rows.
 		1,     /*limitHint*/
@@ -706,13 +705,10 @@ func TestRowFetcherReset(t *testing.T) {
 	spec := makeIndexFetchSpec(t, args)
 	if err := resetFetcher.Init(
 		ctx,
-		false, /*reverse*/
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
-		&da,
-		nil, /* memMonitor */
-		&spec,
+		FetcherInitArgs{
+			Alloc: &da,
+			Spec:  &spec,
+		},
 	); err != nil {
 		t.Fatal(err)
 	}

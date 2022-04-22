@@ -62,15 +62,16 @@ func alterTableAddColumn(
 		panic(err)
 	}
 	desc := cdd.ColumnDescriptor
+	desc.ID = b.NextTableColumnID(tbl)
 	spec := addColumnSpec{
 		tbl: tbl,
 		col: &scpb.Column{
 			TableID:                 tbl.TableID,
-			ColumnID:                b.NextTableColumnID(tbl),
+			ColumnID:                desc.ID,
 			IsHidden:                desc.Hidden,
 			IsInaccessible:          desc.Inaccessible,
 			GeneratedAsIdentityType: desc.GeneratedAsIdentityType,
-			PgAttributeNum:          desc.PGAttributeNum,
+			PgAttributeNum:          desc.GetPGAttributeNum(),
 		},
 	}
 	if ptr := desc.GeneratedAsIdentitySequenceOption; ptr != nil {

@@ -312,7 +312,7 @@ New expression 3 of 3:
 memo join-limit=0 expect-not=ReorderJoins
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
-memo (optimized, ~28KB, required=[presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:12])
+memo (optimized, ~27KB, required=[presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:12])
  ├── G1: (inner-join G2 G3 G4) (merge-join G2 G3 G5 inner-join,+1,+10)
  │    └── [presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:12]
  │         ├── best: (merge-join G2="[ordering: +1]" G3 G5 inner-join,+1,+10)
@@ -365,7 +365,7 @@ memo (optimized, ~28KB, required=[presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:
 memo join-limit=2
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
-memo (optimized, ~46KB, required=[presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:12])
+memo (optimized, ~43KB, required=[presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:12])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (inner-join G5 G6 G7) (inner-join G6 G5 G7) (merge-join G2 G3 G8 inner-join,+1,+10) (merge-join G3 G2 G8 inner-join,+10,+1) (lookup-join G3 G8 bx,keyCols=[10],outCols=(1,2,5,6,9-12)) (merge-join G5 G6 G8 inner-join,+5,+11) (merge-join G6 G5 G8 inner-join,+11,+5) (lookup-join G6 G8 cy,keyCols=[11],outCols=(1,2,5,6,9-12))
  │    └── [presentation: b:1,x:2,c:5,y:6,a:9,b:10,c:11,d:12]
  │         ├── best: (lookup-join G3 G8 bx,keyCols=[10],outCols=(1,2,5,6,9-12))
@@ -535,7 +535,7 @@ inner-join (cross)
 memo join-limit=0
 SELECT * FROM bx, cy, dz, abc WHERE x = y AND y = z AND z = a
 ----
-memo (optimized, ~29KB, required=[presentation: b:1,x:2,c:5,y:6,d:9,z:10,a:13,b:14,c:15,d:16])
+memo (optimized, ~28KB, required=[presentation: b:1,x:2,c:5,y:6,d:9,z:10,a:13,b:14,c:15,d:16])
  ├── G1: (inner-join G2 G3 G4) (merge-join G2 G3 G5 inner-join,+2,+6)
  │    └── [presentation: b:1,x:2,c:5,y:6,d:9,z:10,a:13,b:14,c:15,d:16]
  │         ├── best: (inner-join G2 G3 G4)
@@ -2061,42 +2061,6 @@ Joins Considered: 6
 Join Tree #4
 --------------------------------------------------------------------------------
   inner-join (hash)
-   ├── scan abc [as=a1]
-   ├── inner-join (hash)
-   │    ├── scan abc [as=a2]
-   │    ├── distinct-on
-   │    │    └── scan abc [as=a5]
-   │    └── filters
-   │         └── a2.c = a5.c
-   └── filters
-        └── a1.a = a2.a
-Vertexes
-  C:
-    scan abc [as=a1]
-  A:
-    scan abc [as=a2]
-  B:
-    distinct-on
-     └── scan abc [as=a5]
-Edges
-  a2.c = a5.c [inner, ses=AB, tes=AB, rules=()]
-  a1.a = a2.a [inner, ses=CA, tes=CA, rules=()]
-Joining CA
-  C A [inner, refs=CA]
-  A C [inner, refs=CA]
-Joining AB
-  A B [inner, refs=AB]
-  B A [inner, refs=AB]
-Joining CAB
-  C AB [inner, refs=CA]
-  AB C [inner, refs=CA]
-  CA B [inner, refs=AB]
-  B CA [inner, refs=AB]
-Joins Considered: 8
---------------------------------------------------------------------------------
-Join Tree #5
---------------------------------------------------------------------------------
-  inner-join (hash)
    ├── inner-join (hash)
    │    ├── scan abc [as=a1]
    │    ├── semi-join (hash)
@@ -2136,7 +2100,7 @@ Joining CAD
   D CA [inner, refs=AD]
 Joins Considered: 8
 --------------------------------------------------------------------------------
-Join Tree #6
+Join Tree #5
 --------------------------------------------------------------------------------
   inner-join (hash)
    ├── inner-join (hash)
@@ -2456,8 +2420,8 @@ WHERE EXISTS (SELECT 1 FROM dz WHERE z = y)
 AND EXISTS (SELECT 1 FROM bx WHERE x = y)
 AND EXISTS (SELECT 1 FROM abc WHERE a = y)
 ----
-Rules Applied: 148
-Groups Added: 80
+Rules Applied: 134
+Groups Added: 73
 
 
 # Regression test for #76522. Do not produce query plans where some of the

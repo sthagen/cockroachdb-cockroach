@@ -60,6 +60,8 @@ const (
 	Name
 	// ReferencedDescID is the descriptor ID to which this element refers.
 	ReferencedDescID
+	// PgAttributeNum is the logical order of a column.
+	PgAttributeNum
 
 	// TargetStatus is the target status of an element.
 	TargetStatus
@@ -121,14 +123,17 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.Column)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ColumnID, "ColumnID"),
+		rel.EntityAttr(PgAttributeNum, "PgAttributeNum"),
 	),
 	rel.EntityMapping(t((*scpb.PrimaryIndex)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(IndexID, "IndexID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
 	),
 	rel.EntityMapping(t((*scpb.SecondaryIndex)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(IndexID, "IndexID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
 	),
 	rel.EntityMapping(t((*scpb.TemporaryIndex)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -251,7 +256,7 @@ var elementSchemaOptions = []rel.SchemaOption{
 	),
 	rel.EntityMapping(t((*scpb.ColumnComment)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
-		rel.EntityAttr(ColumnID, "ColumnID"),
+		rel.EntityAttr(PgAttributeNum, "PgAttributeNum"),
 	),
 	rel.EntityMapping(t((*scpb.IndexComment)(nil)),
 		rel.EntityAttr(DescID, "TableID"),

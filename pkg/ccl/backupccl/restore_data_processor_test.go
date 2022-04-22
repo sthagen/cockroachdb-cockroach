@@ -93,17 +93,8 @@ func slurpSSTablesLatestKey(
 			v := roachpb.Value{RawBytes: newKv.Value}
 			v.ClearChecksum()
 			v.InitChecksum(newKv.Key.Key)
-			// NB: import data does not contain intents, so data with no timestamps
-			// is inline meta and not intents. Therefore this is not affected by the
-			// choice of interleaved or separated intents.
-			if newKv.Key.Timestamp.IsEmpty() {
-				if err := batch.PutUnversioned(newKv.Key.Key, v.RawBytes); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if err := batch.PutMVCC(newKv.Key, v.RawBytes); err != nil {
-					t.Fatal(err)
-				}
+			if err := batch.PutMVCC(newKv.Key, v.RawBytes); err != nil {
+				t.Fatal(err)
 			}
 			sst.Next()
 		}
@@ -246,7 +237,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			DB: kvDB,
 			ExternalStorage: func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
 				return cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{},
-					s.ClusterSettings(), blobs.TestBlobServiceClient(s.ClusterSettings().ExternalIODir), nil, nil)
+					s.ClusterSettings(), blobs.TestBlobServiceClient(s.ClusterSettings().ExternalIODir), nil, nil, nil)
 			},
 			Settings: s.ClusterSettings(),
 			Codec:    keys.SystemSQLCodec,

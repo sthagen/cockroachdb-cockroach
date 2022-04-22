@@ -118,7 +118,7 @@ func (ef *execFactory) ConstructScan(
 	}
 	scan.reqOrdering = ReqOrdering(reqOrdering)
 	scan.estimatedRowCount = uint64(params.EstimatedRowCount)
-	if params.Locking != nil {
+	if params.Locking.IsLocking() {
 		scan.lockingStrength = descpb.ToScanLockingStrength(params.Locking.Strength)
 		scan.lockingWaitPolicy = descpb.ToScanLockingWaitPolicy(params.Locking.WaitPolicy)
 	}
@@ -597,7 +597,7 @@ func (ef *execFactory) ConstructIndexJoin(
 	keyCols []exec.NodeColumnOrdinal,
 	tableCols exec.TableColumnOrdinalSet,
 	reqOrdering exec.OutputOrdering,
-	limitHint int,
+	limitHint int64,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	colCfg := makeScanColumnsConfig(table, tableCols)
@@ -654,8 +654,8 @@ func (ef *execFactory) ConstructLookupJoin(
 	isFirstJoinInPairedJoiner bool,
 	isSecondJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
-	locking *tree.LockingItem,
-	limitHint int,
+	locking opt.Locking,
+	limitHint int64,
 ) (exec.Node, error) {
 	if table.IsVirtualTable() {
 		return ef.constructVirtualTableLookupJoin(joinType, input, table, index, eqCols, lookupCols, onCond)
@@ -671,7 +671,7 @@ func (ef *execFactory) ConstructLookupJoin(
 	}
 
 	tableScan.index = idx
-	if locking != nil {
+	if locking.IsLocking() {
 		tableScan.lockingStrength = descpb.ToScanLockingStrength(locking.Strength)
 		tableScan.lockingWaitPolicy = descpb.ToScanLockingWaitPolicy(locking.WaitPolicy)
 	}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -65,6 +66,15 @@ type TestingKnobs struct {
 	// of internally.
 	KVAccessorBatchSizeOverrideFn func() int
 
+	// KVAccessorPreCommitMinTSWaitInterceptor, if set, is invoked before
+	// UpdateSpanConfigRecords waits for present time to be in advance of the
+	// minimum commit timestamp.
+	KVAccessorPreCommitMinTSWaitInterceptor func()
+
+	// KVAccessorPostCommitDeadlineSetInterceptor is invoked after we set the
+	// commit deadline.
+	KVAccessorPostCommitDeadlineSetInterceptor func(*kv.Txn)
+
 	// SQLWatcherOnEventInterceptor, if set, is invoked when the SQLWatcher
 	// receives an event on one of its rangefeeds.
 	SQLWatcherOnEventInterceptor func() error
@@ -94,6 +104,10 @@ type TestingKnobs struct {
 	// ProtectedTSReaderOverrideFn returns a ProtectedTSReader which is used to
 	// override the ProtectedTSReader used when setting up a new store.
 	ProtectedTSReaderOverrideFn func(clock *hlc.Clock) ProtectedTSReader
+
+	// LimiterLimitOverride, if set, allows tests to dynamically override the span
+	// config limit.
+	LimiterLimitOverride func() int64
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

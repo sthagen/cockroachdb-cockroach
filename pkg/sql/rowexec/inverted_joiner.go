@@ -15,8 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -146,12 +149,12 @@ type invertedJoiner struct {
 	spanBuilder           span.Builder
 	outputContinuationCol bool
 
-	scanStats execinfra.ScanStats
+	scanStats execstats.ScanStats
 }
 
 var _ execinfra.Processor = &invertedJoiner{}
 var _ execinfra.RowSource = &invertedJoiner{}
-var _ execinfra.OpNode = &invertedJoiner{}
+var _ execopnode.OpNode = &invertedJoiner{}
 
 const invertedJoinerProcName = "inverted joiner"
 
@@ -218,6 +221,17 @@ func newInvertedJoiner(
 		}
 	}
 
+	// Make sure the key column types are hydrated. The fetched column types
+	// will be hydrated in ProcessorBase.Init below.
+	resolver := flowCtx.NewTypeResolver(flowCtx.Txn)
+	for i := range spec.FetchSpec.KeyAndSuffixColumns {
+		if err := typedesc.EnsureTypeIsHydrated(
+			flowCtx.EvalCtx.Ctx(), spec.FetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
+		); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := ij.ProcessorBase.Init(
 		ij, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
@@ -276,18 +290,17 @@ func newInvertedJoiner(
 	var fetcher row.Fetcher
 	if err := fetcher.Init(
 		flowCtx.EvalCtx.Context,
-		false, /* reverse */
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		flowCtx.EvalCtx.SessionData().LockTimeout,
-		&ij.alloc,
-		flowCtx.EvalCtx.Mon,
-		&spec.FetchSpec,
+		row.FetcherInitArgs{
+			LockTimeout: flowCtx.EvalCtx.SessionData().LockTimeout,
+			Alloc:       &ij.alloc,
+			MemMonitor:  flowCtx.EvalCtx.Mon,
+			Spec:        &spec.FetchSpec,
+		},
 	); err != nil {
 		return nil, err
 	}
 
-	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
 		ij.input = newInputStatCollector(ij.input)
 		ij.fetcher = newRowFetcherStatCollector(&fetcher)
 		ij.ExecStatsForTrace = ij.execStatsForTrace
@@ -480,7 +493,7 @@ func (ij *invertedJoiner) readInput() (invertedJoinerState, *execinfrapb.Produce
 	log.VEventf(ij.Ctx, 1, "scanning %d spans", len(ij.indexSpans))
 	if err = ij.fetcher.StartScan(
 		ij.Ctx, ij.FlowCtx.Txn, ij.indexSpans, rowinfra.NoBytesLimit, rowinfra.NoRowLimit,
-		ij.FlowCtx.TraceKV, ij.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
+		ij.FlowCtx.TraceKV, ij.EvalCtx.TestingKnobs.ForceProductionValues,
 	); err != nil {
 		ij.MoveToDraining(err)
 		return ijStateUnknown, ij.DrainHelper()
@@ -744,14 +757,14 @@ func (ij *invertedJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 	if !ok {
 		return nil
 	}
-	ij.scanStats = execinfra.GetScanStats(ij.Ctx)
+	ij.scanStats = execstats.GetScanStats(ij.Ctx)
 	ret := execinfrapb.ComponentStats{
 		Inputs: []execinfrapb.InputStats{is},
 		KV: execinfrapb.KVStats{
 			BytesRead:      optional.MakeUint(uint64(ij.fetcher.GetBytesRead())),
 			TuplesRead:     fis.NumTuples,
 			KVTime:         fis.WaitTime,
-			ContentionTime: optional.MakeTimeValue(execinfra.GetCumulativeContentionTime(ij.Ctx)),
+			ContentionTime: optional.MakeTimeValue(execstats.GetCumulativeContentionTime(ij.Ctx)),
 		},
 		Exec: execinfrapb.ExecStats{
 			MaxAllocatedMem:  optional.MakeUint(uint64(ij.MemMonitor.MaximumBytes())),
@@ -759,7 +772,7 @@ func (ij *invertedJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 		},
 		Output: ij.OutputHelper.Stats(),
 	}
-	execinfra.PopulateKVMVCCStats(&ret.KV, &ij.scanStats)
+	execstats.PopulateKVMVCCStats(&ret.KV, &ij.scanStats)
 	return &ret
 }
 
@@ -775,21 +788,21 @@ func (ij *invertedJoiner) generateMeta() []execinfrapb.ProducerMetadata {
 	return trailingMeta
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (ij *invertedJoiner) ChildCount(verbose bool) int {
-	if _, ok := ij.input.(execinfra.OpNode); ok {
+	if _, ok := ij.input.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (ij *invertedJoiner) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (ij *invertedJoiner) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		if n, ok := ij.input.(execinfra.OpNode); ok {
+		if n, ok := ij.input.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("input to invertedJoiner is not an execinfra.OpNode")
+		panic("input to invertedJoiner is not an execopnode.OpNode")
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecjoin"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecproj"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecprojconst"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecsel"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecwindow"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colfetcher"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
@@ -68,9 +70,9 @@ func wrapRowSources(
 	newToWrap func([]execinfra.RowSource) (execinfra.RowSource, error),
 	materializerSafeToRelease bool,
 	factory coldata.ColumnFactory,
-) (*colexec.Columnarizer, []execinfra.Releasable, error) {
+) (*colexec.Columnarizer, []execreleasable.Releasable, error) {
 	var toWrapInputs []execinfra.RowSource
-	var releasables []execinfra.Releasable
+	var releasables []execreleasable.Releasable
 	for i := range inputs {
 		// Optimization: if the input is a Columnarizer, its input is
 		// necessarily a execinfra.RowSource, so remove the unnecessary
@@ -1618,7 +1620,7 @@ func (r *postProcessResult) planPostProcessSpec(
 	args *colexecargs.NewColOperatorArgs,
 	post *execinfrapb.PostProcessSpec,
 	factory coldata.ColumnFactory,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) error {
 	if post.Projection {
 		r.Op, r.ColumnTypes = addProjection(r.Op, r.ColumnTypes, post.OutputColumns)
@@ -1717,7 +1719,7 @@ func planFilterExpr(
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
 	helper *colexecargs.ExprHelper,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) (colexecop.Operator, error) {
 	expr, err := helper.ProcessExpr(filter, flowCtx.EvalCtx, columnTypes)
 	if err != nil {
@@ -1766,7 +1768,7 @@ func planSelectionOperators(
 	input colexecop.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	switch t := expr.(type) {
 	case *tree.AndExpr:
@@ -1837,7 +1839,7 @@ func planSelectionOperators(
 				op, err = colexecsel.GetSelectionConstOperator(
 					cmpOp, leftOp, ct, leftIdx, constArg, evalCtx, t,
 				)
-				if r, ok := op.(execinfra.Releasable); ok {
+				if r, ok := op.(execreleasable.Releasable); ok {
 					*releasables = append(*releasables, r)
 				}
 			}
@@ -1852,7 +1854,7 @@ func planSelectionOperators(
 		op, err = colexecsel.GetSelectionOperator(
 			cmpOp, rightOp, ct, leftIdx, rightIdx, evalCtx, t,
 		)
-		if r, ok := op.(execinfra.Releasable); ok {
+		if r, ok := op.(execreleasable.Releasable); ok {
 			*releasables = append(*releasables, r)
 		}
 		return op, resultIdx, ct, err
@@ -1956,7 +1958,7 @@ func planProjectionOperators(
 	input colexecop.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	// projectDatum is a helper function that adds a new constant projection
 	// operator for the given datum. typs are updated accordingly.
@@ -2161,7 +2163,7 @@ func planProjectionOperators(
 		op, err = colexec.NewBuiltinFunctionOperator(
 			colmem.NewAllocator(ctx, acc, factory), evalCtx, t, typs, inputCols, resultIdx, op,
 		)
-		if r, ok := op.(execinfra.Releasable); ok {
+		if r, ok := op.(execreleasable.Releasable); ok {
 			*releasables = append(*releasables, r)
 		}
 		typs = appendOneType(typs, t.ResolvedType())
@@ -2248,7 +2250,7 @@ func planProjectionOperators(
 		op = colexec.NewTupleProjOp(
 			colmem.NewAllocator(ctx, acc, factory), typs, tupleContentsIdxs, outputType, input, resultIdx,
 		)
-		*releasables = append(*releasables, op.(execinfra.Releasable))
+		*releasables = append(*releasables, op.(execreleasable.Releasable))
 		typs = appendOneType(typs, outputType)
 		return op, resultIdx, typs, err
 	default:
@@ -2300,7 +2302,7 @@ func planProjectionExpr(
 	factory coldata.ColumnFactory,
 	binFn tree.TwoArgFn,
 	cmpExpr *tree.ComparisonExpr,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	if err := checkSupportedProjectionExpr(left, right); err != nil {
 		return nil, resultIdx, typs, err
@@ -2335,7 +2337,7 @@ func planProjectionExpr(
 		resultIdx = len(typs)
 		// The projection result will be outputted to a new column which is
 		// appended to the input batch.
-		op, err = colexecproj.GetProjectionLConstOperator(
+		op, err = colexecprojconst.GetProjectionLConstOperator(
 			allocator, typs, left.ResolvedType(), outputType, projOp, input,
 			rightIdx, lConstArg, resultIdx, evalCtx, binFn, cmpExpr,
 		)
@@ -2381,7 +2383,7 @@ func planProjectionExpr(
 				switch cmpProjOp.Symbol {
 				case treecmp.Like, treecmp.NotLike:
 					negate := cmpProjOp.Symbol == treecmp.NotLike
-					op, err = colexecproj.GetLikeProjectionOperator(
+					op, err = colexecprojconst.GetLikeProjectionOperator(
 						allocator, evalCtx, input, leftIdx, resultIdx,
 						string(tree.MustBeDString(rConstArg)), negate,
 					)
@@ -2412,7 +2414,7 @@ func planProjectionExpr(
 			if op == nil || err != nil {
 				// op hasn't been created yet, so let's try the constructor for
 				// all other projection operators.
-				op, err = colexecproj.GetProjectionRConstOperator(
+				op, err = colexecprojconst.GetProjectionRConstOperator(
 					allocator, typs, right.ResolvedType(), outputType, projOp,
 					input, leftIdx, rConstArg, resultIdx, evalCtx, binFn, cmpExpr,
 				)
@@ -2436,7 +2438,7 @@ func planProjectionExpr(
 	if err != nil {
 		return op, resultIdx, typs, err
 	}
-	if r, ok := op.(execinfra.Releasable); ok {
+	if r, ok := op.(execreleasable.Releasable); ok {
 		*releasables = append(*releasables, r)
 	}
 	typs = appendOneType(typs, outputType)
@@ -2453,7 +2455,7 @@ func planLogicalProjectionOp(
 	input colexecop.Operator,
 	acc *mon.BoundAccount,
 	factory coldata.ColumnFactory,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	// Add a new boolean column that will store the result of the projection.
 	resultIdx = len(columnTypes)
@@ -2522,7 +2524,7 @@ func planIsNullProjectionOp(
 	acc *mon.BoundAccount,
 	negate bool,
 	factory coldata.ColumnFactory,
-	releasables *[]execinfra.Releasable,
+	releasables *[]execreleasable.Releasable,
 ) (op colexecop.Operator, resultIdx int, typs []*types.T, err error) {
 	op, resultIdx, typs, err = planProjectionOperators(
 		ctx, evalCtx, expr, columnTypes, input, acc, factory, releasables,

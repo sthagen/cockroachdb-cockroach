@@ -63,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob/gcjobnotifier"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
@@ -76,8 +77,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
@@ -1188,8 +1189,8 @@ type ExecutorConfig struct {
 
 	SchemaChangerMetrics *SchemaChangerMetrics
 	FeatureFlagMetrics   *featureflag.DenialMetrics
-	RowMetrics           *row.Metrics
-	InternalRowMetrics   *row.Metrics
+	RowMetrics           *rowinfra.Metrics
+	InternalRowMetrics   *rowinfra.Metrics
 
 	TestingKnobs                         ExecutorTestingKnobs
 	MigrationTestingKnobs                *migration.TestingKnobs
@@ -1288,6 +1289,13 @@ type ExecutorConfig struct {
 	// SpanConfigReconciler is used to drive the span config reconciliation job
 	// and related migrations.
 	SpanConfigReconciler spanconfig.Reconciler
+
+	// SpanConfigSplitter is used during migrations to seed system.span_count with
+	// the right number of tenant spans.
+	SpanConfigSplitter spanconfig.Splitter
+
+	// SpanConfigLimiter is used to limit how many span configs installed.
+	SpanConfigLimiter spanconfig.Limiter
 
 	// SpanConfigKVAccessor is used when creating and deleting tenant
 	// records.
@@ -1416,7 +1424,7 @@ type ExecutorTestingKnobs struct {
 	// query (i.e. no subqueries). The physical plan is only safe for use for the
 	// lifetime of this function. Note that returning a nil function is
 	// unsupported and will lead to a panic.
-	TestingSaveFlows func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execinfra.OpChains) error
+	TestingSaveFlows func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains) error
 
 	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
 	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
@@ -3197,6 +3205,10 @@ func (m *sessionDataMutator) SetExpectAndIgnoreNotVisibleColumnsInCopy(val bool)
 	m.data.ExpectAndIgnoreNotVisibleColumnsInCopy = val
 }
 
+func (m *sessionDataMutator) SetMultipleModificationsOfTable(val bool) {
+	m.data.MultipleModificationsOfTable = val
+}
+
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
@@ -3317,18 +3329,18 @@ func TestingDescsTxn(
 	return DescsTxn(ctx, &execCfg, f)
 }
 
-// NewRowMetrics creates a row.Metrics struct for either internal or user
+// NewRowMetrics creates a rowinfra.Metrics struct for either internal or user
 // queries.
-func NewRowMetrics(internal bool) row.Metrics {
-	return row.Metrics{
-		MaxRowSizeLogCount: metric.NewCounter(getMetricMeta(row.MetaMaxRowSizeLog, internal)),
-		MaxRowSizeErrCount: metric.NewCounter(getMetricMeta(row.MetaMaxRowSizeErr, internal)),
+func NewRowMetrics(internal bool) rowinfra.Metrics {
+	return rowinfra.Metrics{
+		MaxRowSizeLogCount: metric.NewCounter(getMetricMeta(rowinfra.MetaMaxRowSizeLog, internal)),
+		MaxRowSizeErrCount: metric.NewCounter(getMetricMeta(rowinfra.MetaMaxRowSizeErr, internal)),
 	}
 }
 
-// GetRowMetrics returns the proper RowMetrics for either internal or user
+// GetRowMetrics returns the proper rowinfra.Metrics for either internal or user
 // queries.
-func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *row.Metrics {
+func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *rowinfra.Metrics {
 	if internal {
 		return cfg.InternalRowMetrics
 	}

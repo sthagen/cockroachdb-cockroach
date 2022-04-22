@@ -13,9 +13,12 @@ import (
 	gosql "database/sql"
 	gojson "encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/url"
+	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,9 +41,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -681,4 +686,88 @@ func forceTableGC(
 	if err := tsi.ForceTableGC(context.Background(), database, table, tsi.Clock().Now()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// All structured logs should contain this property which stores the snake_cased
+// version of the name of the message struct
+type BaseEventStruct struct {
+	EventType string
+}
+
+var cmLogRe = regexp.MustCompile(`event_log\.go`)
+
+func checkStructuredLogs(t *testing.T, eventType string, startTime int64) []string {
+	var matchingEntries []string
+	testutils.SucceedsSoon(t, func() error {
+		log.Flush()
+		entries, err := log.FetchEntriesFromFiles(startTime,
+			math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, e := range entries {
+			jsonPayload := []byte(e.Message)
+			var baseStruct BaseEventStruct
+			if err := gojson.Unmarshal(jsonPayload, &baseStruct); err != nil {
+				continue
+			}
+			if baseStruct.EventType != eventType {
+				continue
+			}
+
+			matchingEntries = append(matchingEntries, e.Message)
+		}
+
+		return nil
+	})
+
+	return matchingEntries
+}
+
+func checkCreateChangefeedLogs(t *testing.T, startTime int64) []eventpb.CreateChangefeed {
+	var matchingEntries []eventpb.CreateChangefeed
+
+	for _, m := range checkStructuredLogs(t, "create_changefeed", startTime) {
+		jsonPayload := []byte(m)
+		var event eventpb.CreateChangefeed
+		if err := gojson.Unmarshal(jsonPayload, &event); err != nil {
+			t.Errorf("unmarshalling %q: %v", m, err)
+		}
+		matchingEntries = append(matchingEntries, event)
+	}
+
+	return matchingEntries
+}
+
+func checkChangefeedFailedLogs(t *testing.T, startTime int64) []eventpb.ChangefeedFailed {
+	var matchingEntries []eventpb.ChangefeedFailed
+
+	for _, m := range checkStructuredLogs(t, "changefeed_failed", startTime) {
+		jsonPayload := []byte(m)
+		var event eventpb.ChangefeedFailed
+		if err := gojson.Unmarshal(jsonPayload, &event); err != nil {
+			t.Errorf("unmarshalling %q: %v", m, err)
+		}
+		matchingEntries = append(matchingEntries, event)
+	}
+
+	return matchingEntries
+}
+
+func checkS3Credentials(t *testing.T) (bucket string, accessKey string, secretKey string) {
+	accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	if accessKey == "" {
+		skip.IgnoreLint(t, "AWS_ACCESS_KEY_ID env var must be set")
+	}
+	secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if secretKey == "" {
+		skip.IgnoreLint(t, "AWS_SECRET_ACCESS_KEY env var must be set")
+	}
+	bucket = os.Getenv("AWS_S3_BUCKET")
+	if bucket == "" {
+		skip.IgnoreLint(t, "AWS_S3_BUCKET env var must be set")
+	}
+
+	return bucket, accessKey, secretKey
 }

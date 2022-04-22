@@ -284,7 +284,7 @@ func externalStorageFromURIFactory(
 	defaultSettings := &cluster.Settings{}
 	defaultSettings.SV.Init(ctx, nil /* opaque */)
 	return cloud.ExternalStorageFromURI(ctx, uri, base.ExternalIODirConfig{},
-		defaultSettings, newBlobFactory, user, nil /*Internal Executor*/, nil /*kvDB*/)
+		defaultSettings, newBlobFactory, user, nil /*Internal Executor*/, nil /*kvDB*/, nil)
 }
 
 func getManifestFromURI(ctx context.Context, path string) (backupccl.BackupManifest, error) {
@@ -580,7 +580,7 @@ func makeIters(
 		var err error
 		clusterSettings := cluster.MakeClusterSettings()
 		dirStorage[i], err = cloud.MakeExternalStorage(ctx, file.Dir, base.ExternalIODirConfig{},
-			clusterSettings, newBlobFactory, nil /*internal executor*/, nil /*kvDB*/)
+			clusterSettings, newBlobFactory, nil /*internal executor*/, nil /*kvDB*/, nil)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "making external storage")
 		}
@@ -619,16 +619,11 @@ func makeRowFetcher(
 	}
 
 	var rf row.Fetcher
-	if err := rf.Init(
-		ctx,
-		false, /*reverse*/
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
-		&tree.DatumAlloc{},
-		nil, /*mon.BytesMonitor*/
-		&spec,
-	); err != nil {
+	if err := rf.Init(ctx,
+		row.FetcherInitArgs{
+			Alloc: &tree.DatumAlloc{},
+			Spec:  &spec,
+		}); err != nil {
 		return rf, err
 	}
 	return rf, nil

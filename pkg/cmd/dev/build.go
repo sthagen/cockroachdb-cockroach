@@ -43,7 +43,7 @@ func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 		Short: "Build the specified binaries",
 		Long: fmt.Sprintf(
 			"Build the specified binaries either using their bazel targets or one "+
-				"of the following shorthands:\n\t%s",
+				"of the following shorthands:\n\n\t%s",
 			strings.Join(allBuildTargets, "\n\t"),
 		),
 		// TODO(irfansharif): Flesh out the example usage patterns.
@@ -55,23 +55,16 @@ func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 		RunE: runE,
 	}
 	buildCmd.Flags().String(volumeFlag, "bzlhome", "the Docker volume to use as the container home directory (only used for cross builds)")
-	buildCmd.Flags().String(crossFlag, "", `
-        Turns on cross-compilation. Builds the binary using the builder image w/ Docker.
-        You can optionally set a config, as in --cross=windows.
-        Defaults to linux if not specified. The config should be the name of a
-        build configuration specified in .bazelrc, minus the "cross" prefix.`)
+	buildCmd.Flags().String(crossFlag, "", "cross-compiles using the builder image (options: linux, linuxarm, macos, macosarm, windows)")
 	buildCmd.Flags().Lookup(crossFlag).NoOptDefVal = "linux"
 	addCommonBuildFlags(buildCmd)
 	return buildCmd
 }
 
 // TODO(irfansharif): Add grouping shorthands like "all" or "bins", etc.
-// TODO(irfansharif): Make sure all the relevant binary targets are defined
-// above, and in usage docs.
 
 // buildTargetMapping maintains shorthands that map 1:1 with bazel targets.
 var buildTargetMapping = map[string]string{
-	"all_tests":        "//pkg:all_tests",
 	"bazel-remote":     bazelRemoteTarget,
 	"buildifier":       "@com_github_bazelbuild_buildtools//buildifier:buildifier",
 	"buildozer":        "@com_github_bazelbuild_buildtools//buildozer:buildozer",
@@ -82,6 +75,7 @@ var buildTargetMapping = map[string]string{
 	"crlfmt":           "@com_github_cockroachdb_crlfmt//:crlfmt",
 	"dev":              "//pkg/cmd/dev:dev",
 	"docgen":           "//pkg/cmd/docgen:docgen",
+	"docs-issue-gen":   "//pkg/cmd/docs-issue-generation:docs-issue-generation",
 	"execgen":          "//pkg/sql/colexec/execgen/cmd/execgen:execgen",
 	"gofmt":            "@com_github_cockroachdb_gostdlib//cmd/gofmt:gofmt",
 	"goimports":        "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports:goimports",
@@ -337,7 +331,12 @@ func (d *dev) getBasicBuildArgs(
 		}
 
 		args = append(args, aliased)
-		buildTargets = append(buildTargets, buildTarget{fullName: aliased, kind: "go_binary"})
+		if aliased == "//pkg:all_tests" {
+			buildTargets = append(buildTargets, buildTarget{fullName: aliased, kind: "test_suite"})
+			shouldBuildWithTestConfig = true
+		} else {
+			buildTargets = append(buildTargets, buildTarget{fullName: aliased, kind: "go_binary"})
+		}
 	}
 
 	// Add --config=with_ui iff we're building a target that needs it.

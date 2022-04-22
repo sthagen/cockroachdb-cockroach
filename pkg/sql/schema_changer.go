@@ -1060,7 +1060,10 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 			ctx,
 			txn,
 			tbl.GetParentID(),
-			tree.DatabaseLookupFlags{Required: true},
+			tree.DatabaseLookupFlags{
+				Required:    true,
+				AvoidLeased: true,
+			},
 		)
 		if err != nil {
 			return err
@@ -1315,7 +1318,10 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 			ctx,
 			txn,
 			scTable.GetParentID(),
-			tree.DatabaseLookupFlags{Required: true},
+			tree.DatabaseLookupFlags{
+				Required:    true,
+				AvoidLeased: true,
+			},
 		)
 		if err != nil {
 			return err
@@ -2792,10 +2798,10 @@ func (sc *SchemaChanger) queueCleanupJob(
 	ctx context.Context, scDesc *tabledesc.Mutable, txn *kv.Txn,
 ) (jobspb.JobID, error) {
 	// Create jobs for dropped columns / indexes to be deleted.
-	mutationID := scDesc.ClusterVersion.NextMutationID
+	mutationID := scDesc.ClusterVersion().NextMutationID
 	span := scDesc.PrimaryIndexSpan(sc.execCfg.Codec)
 	var spanList []jobspb.ResumeSpanList
-	for j := len(scDesc.ClusterVersion.Mutations); j < len(scDesc.Mutations); j++ {
+	for j := len(scDesc.ClusterVersion().Mutations); j < len(scDesc.Mutations); j++ {
 		spanList = append(spanList,
 			jobspb.ResumeSpanList{
 				ResumeSpans: roachpb.Spans{span},

@@ -13,7 +13,6 @@ package builtins
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/hmac"
 	"crypto/md5"
 	cryptorand "crypto/rand"
 	"crypto/sha1"
@@ -679,8 +678,105 @@ var builtins = map[string]builtinDefinition{
 			Volatility: tree.VolatilityImmutable,
 		}),
 
-	"gen_random_uuid":  generateRandomUUIDImpl,
-	"uuid_generate_v4": generateRandomUUIDImpl,
+	"uuid_generate_v4": generateRandomUUID4Impl,
+
+	"uuid_nil": generateConstantUUIDImpl(
+		uuid.Nil, "Returns a nil UUID constant.",
+	),
+	"uuid_ns_dns": generateConstantUUIDImpl(
+		uuid.NamespaceDNS, "Returns a constant designating the DNS namespace for UUIDs.",
+	),
+	"uuid_ns_url": generateConstantUUIDImpl(
+		uuid.NamespaceURL, "Returns a constant designating the URL namespace for UUIDs.",
+	),
+	"uuid_ns_oid": generateConstantUUIDImpl(
+		uuid.NamespaceOID,
+		"Returns a constant designating the ISO object identifier (OID) namespace for UUIDs. "+
+			"These are unrelated to the OID type used internally in the database.",
+	),
+	"uuid_ns_x500": generateConstantUUIDImpl(
+		uuid.NamespaceX500, "Returns a constant designating the X.500 distinguished name (DN) namespace for UUIDs.",
+	),
+
+	"uuid_generate_v1": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categoryIDGeneration,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.Uuid),
+			Fn: func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
+				uv, err := uuid.NewV1()
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDUuid(tree.DUuid{UUID: uv}), nil
+			},
+			Info: "Generates a version 1 UUID, and returns it as a value of UUID type. " +
+				"This uses the real MAC address of the server and a timestamp.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"uuid_generate_v1mc": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categoryIDGeneration,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.Uuid),
+			Fn: func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
+				gen := uuid.NewGenWithHWAF(uuid.RandomHardwareAddrFunc)
+				uv, err := gen.NewV1()
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDUuid(tree.DUuid{UUID: uv}), nil
+			},
+			Info: "Generates a version 1 UUID, and returns it as a value of UUID type. " +
+				"This uses a random MAC address and a timestamp.",
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	"uuid_generate_v3": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categoryIDGeneration,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"namespace", types.Uuid}, {"name", types.String}},
+			ReturnType: tree.FixedReturnType(types.Uuid),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				namespace := tree.MustBeDUuid(args[0])
+				name := tree.MustBeDString(args[1])
+				uv := uuid.NewV3(namespace.UUID, string(name))
+				return tree.NewDUuid(tree.DUuid{UUID: uv}), nil
+			},
+			Info: "Generates a version 3 UUID in the given namespace using the specified input name, " +
+				"with md5 as the hashing method. " +
+				"The namespace should be one of the special constants produced by the uuid_ns_*() functions.",
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+
+	"uuid_generate_v5": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categoryIDGeneration,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"namespace", types.Uuid}, {"name", types.String}},
+			ReturnType: tree.FixedReturnType(types.Uuid),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				namespace := tree.MustBeDUuid(args[0])
+				name := tree.MustBeDString(args[1])
+				uv := uuid.NewV5(namespace.UUID, string(name))
+				return tree.NewDUuid(tree.DUuid{UUID: uv}), nil
+			},
+			Info: "Generates a version 5 UUID in the given namespace using the specified input name. " +
+				"This is similar to a version 3 UUID, except it uses SHA-1 for hashing.",
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
 
 	"to_uuid": makeBuiltin(defProps(),
 		tree.Overload{
@@ -1286,90 +1382,6 @@ var builtins = map[string]builtinDefinition{
 	"crc32c": hash32Builtin(
 		func() hash.Hash32 { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) },
 		"Calculates the CRC-32 hash using the Castagnoli polynomial.",
-	),
-
-	"digest": makeBuiltin(
-		tree.FunctionProperties{Category: categoryCrypto},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.String}, {"type", types.String}},
-			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				alg := tree.MustBeDString(args[1])
-				hashFunc, err := getHashFunc(string(alg))
-				if err != nil {
-					return nil, err
-				}
-				h := hashFunc()
-				if ok, err := feedHash(h, args[:1]); !ok || err != nil {
-					return tree.DNull, err
-				}
-				return tree.NewDBytes(tree.DBytes(h.Sum(nil))), nil
-			},
-			Info: "Computes a binary hash of the given `data`. `type` is the algorithm " +
-				"to use (md5, sha1, sha224, sha256, sha384, or sha512).",
-			Volatility: tree.VolatilityLeakProof,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.Bytes}, {"type", types.String}},
-			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				alg := tree.MustBeDString(args[1])
-				hashFunc, err := getHashFunc(string(alg))
-				if err != nil {
-					return nil, err
-				}
-				h := hashFunc()
-				if ok, err := feedHash(h, args[:1]); !ok || err != nil {
-					return tree.DNull, err
-				}
-				return tree.NewDBytes(tree.DBytes(h.Sum(nil))), nil
-			},
-			Info: "Computes a binary hash of the given `data`. `type` is the algorithm " +
-				"to use (md5, sha1, sha224, sha256, sha384, or sha512).",
-			Volatility: tree.VolatilityImmutable,
-		},
-	),
-
-	"hmac": makeBuiltin(
-		tree.FunctionProperties{Category: categoryCrypto},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.String}, {"key", types.String}, {"type", types.String}},
-			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				key := tree.MustBeDString(args[1])
-				alg := tree.MustBeDString(args[2])
-				hashFunc, err := getHashFunc(string(alg))
-				if err != nil {
-					return nil, err
-				}
-				h := hmac.New(hashFunc, []byte(key))
-				if ok, err := feedHash(h, args[:1]); !ok || err != nil {
-					return tree.DNull, err
-				}
-				return tree.NewDBytes(tree.DBytes(h.Sum(nil))), nil
-			},
-			Info:       "Calculates hashed MAC for `data` with key `key`. `type` is the same as in `digest()`.",
-			Volatility: tree.VolatilityLeakProof,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"data", types.Bytes}, {"key", types.Bytes}, {"type", types.String}},
-			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				key := tree.MustBeDBytes(args[1])
-				alg := tree.MustBeDString(args[2])
-				hashFunc, err := getHashFunc(string(alg))
-				if err != nil {
-					return nil, err
-				}
-				h := hmac.New(hashFunc, []byte(key))
-				if ok, err := feedHash(h, args[:1]); !ok || err != nil {
-					return tree.DNull, err
-				}
-				return tree.NewDBytes(tree.DBytes(h.Sum(nil))), nil
-			},
-			Info:       "Calculates hashed MAC for `data` with key `key`. `type` is the same as in `digest()`.",
-			Volatility: tree.VolatilityImmutable,
-		},
 	),
 
 	"to_hex": makeBuiltin(
@@ -2292,7 +2304,7 @@ var builtins = map[string]builtinDefinition{
 
 				newVal := tree.MustBeDInt(args[1])
 				if err := evalCtx.Sequence.SetSequenceValueByID(
-					evalCtx.Ctx(), uint32(dOid.DInt), int64(newVal), false /* isCalled */); err != nil {
+					evalCtx.Ctx(), uint32(dOid.DInt), int64(newVal), true /* isCalled */); err != nil {
 					return nil, err
 				}
 				return args[1], nil
@@ -2308,7 +2320,7 @@ var builtins = map[string]builtinDefinition{
 				oid := tree.MustBeDOid(args[0])
 				newVal := tree.MustBeDInt(args[1])
 				if err := evalCtx.Sequence.SetSequenceValueByID(
-					evalCtx.Ctx(), uint32(oid.DInt), int64(newVal), false /* isCalled */); err != nil {
+					evalCtx.Ctx(), uint32(oid.DInt), int64(newVal), true /* isCalled */); err != nil {
 					return nil, err
 				}
 				return args[1], nil
@@ -5546,7 +5558,7 @@ value if you rely on the HLC for accuracy.`,
 				// TODO(postamar): give the tree.EvalContext a useful interface
 				// instead of cobbling a descs.Collection in this way.
 				cf := descs.NewBareBonesCollectionFactory(ctx.Settings, ctx.Codec)
-				descsCol := cf.MakeCollection(ctx.Context, descs.NewTemporarySchemaProvider(ctx.SessionDataStack))
+				descsCol := cf.MakeCollection(ctx.Context, descs.NewTemporarySchemaProvider(ctx.SessionDataStack), nil /* monitor */)
 				tableDesc, err := descsCol.Direct().MustGetTableDescByID(ctx.Ctx(), ctx.Txn, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
@@ -5584,7 +5596,7 @@ value if you rely on the HLC for accuracy.`,
 				// TODO(postamar): give the tree.EvalContext a useful interface
 				// instead of cobbling a descs.Collection in this way.
 				cf := descs.NewBareBonesCollectionFactory(ctx.Settings, ctx.Codec)
-				descsCol := cf.MakeCollection(ctx.Context, descs.NewTemporarySchemaProvider(ctx.SessionDataStack))
+				descsCol := cf.MakeCollection(ctx.Context, descs.NewTemporarySchemaProvider(ctx.SessionDataStack), nil /* monitor */)
 				tableDesc, err := descsCol.Direct().MustGetTableDescByID(ctx.Ctx(), ctx.Txn, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
@@ -6421,12 +6433,20 @@ table's zone configuration this will return NULL.`,
 	),
 	"crdb_internal.reset_index_usage_stats": makeBuiltin(
 		tree.FunctionProperties{
-			Category: categorySystemInfo,
+			Category:         categorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(evalCtx.Ctx())
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errors.New("crdb_internal.reset_index_usage_stats() requires admin privilege")
+				}
 				if evalCtx.IndexUsageStatsController == nil {
 					return nil, errors.AssertionFailedf("index usage stats controller not set")
 				}
@@ -6442,12 +6462,20 @@ table's zone configuration this will return NULL.`,
 	),
 	"crdb_internal.reset_sql_stats": makeBuiltin(
 		tree.FunctionProperties{
-			Category: categorySystemInfo,
+			Category:         categorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(evalCtx.Ctx())
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errors.New("crdb_internal.reset_sql_stats() requires admin privilege")
+				}
 				if evalCtx.SQLStatsController == nil {
 					return nil, errors.AssertionFailedf("sql stats controller not set")
 				}
@@ -7144,7 +7172,7 @@ func getSubstringFromIndexOfLengthBytes(str, errMsg string, start, length int) (
 	return string(bytes[start:end]), nil
 }
 
-var generateRandomUUIDImpl = makeBuiltin(
+var generateRandomUUID4Impl = makeBuiltin(
 	tree.FunctionProperties{
 		Category: categoryIDGeneration,
 	},
@@ -7152,10 +7180,13 @@ var generateRandomUUIDImpl = makeBuiltin(
 		Types:      tree.ArgTypes{},
 		ReturnType: tree.FixedReturnType(types.Uuid),
 		Fn: func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
-			uv := uuid.MakeV4()
+			uv, err := uuid.NewV4()
+			if err != nil {
+				return nil, err
+			}
 			return tree.NewDUuid(tree.DUuid{UUID: uv}), nil
 		},
-		Info:       "Generates a random UUID and returns it as a value of UUID type.",
+		Info:       "Generates a random version 4 UUID, and returns it as a value of UUID type.",
 		Volatility: tree.VolatilityVolatile,
 	},
 )
@@ -7174,6 +7205,23 @@ var uuidV4Impl = makeBuiltin(
 		Volatility: tree.VolatilityVolatile,
 	},
 )
+
+func generateConstantUUIDImpl(id uuid.UUID, info string) builtinDefinition {
+	return makeBuiltin(
+		tree.FunctionProperties{
+			Category: categoryIDGeneration,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.Uuid),
+			Fn: func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
+				return tree.NewDUuid(tree.DUuid{UUID: id}), nil
+			},
+			Info:       info,
+			Volatility: tree.VolatilityImmutable,
+		},
+	)
+}
 
 const txnTSContextDoc = `
 

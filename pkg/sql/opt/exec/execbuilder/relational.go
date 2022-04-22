@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -571,7 +570,7 @@ func (b *Builder) scanParams(
 	}
 
 	// Raise error if row-level locking is part of a read-only transaction.
-	if locking != nil && locking.Strength > tree.ForNone && b.evalCtx.TxnReadOnly {
+	if locking.IsLocking() && b.evalCtx.TxnReadOnly {
 		return exec.ScanParams{}, opt.ColMap{}, pgerror.Newf(pgcode.ReadOnlySQLTransaction,
 			"cannot execute %s in a read-only transaction", locking.Strength.String())
 	}
@@ -595,7 +594,7 @@ func (b *Builder) scanParams(
 		sqltelemetry.IncrementPartitioningCounter(sqltelemetry.PartitionConstrainedScan)
 	}
 
-	softLimit := int64(math.Ceil(reqProps.LimitHint))
+	softLimit := reqProps.LimitHintInt64()
 	hardLimit := scan.HardLimit.RowCount()
 
 	// If this is a bounded staleness query, check that it touches at most one
@@ -625,7 +624,7 @@ func (b *Builder) scanParams(
 	parallelize := false
 	if hardLimit == 0 && softLimit == 0 {
 		maxResults, ok := b.indexConstraintMaxResults(scan, relProps)
-		if ok && maxResults < ParallelScanResultThreshold {
+		if ok && maxResults < getParallelScanResultThreshold(b.evalCtx.TestingKnobs.ForceProductionValues) {
 			// Don't set the flag when we have a single span which returns a single
 			// row: it does nothing in this case except litter EXPLAINs.
 			// There are still cases where the flag doesn't do anything when the spans
@@ -1723,7 +1722,7 @@ func (b *Builder) buildIndexJoin(join *memo.IndexJoinExpr) (execPlan, error) {
 	needed, output := b.getColumns(cols, join.Table)
 	res := execPlan{outputCols: output}
 	res.root, err = b.factory.ConstructIndexJoin(
-		input.root, tab, keyCols, needed, res.reqOrdering(join), int(math.Ceil(join.RequiredPhysical().LimitHint)),
+		input.root, tab, keyCols, needed, res.reqOrdering(join), join.RequiredPhysical().LimitHintInt64(),
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -1812,7 +1811,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
 
-	var locking *tree.LockingItem
+	var locking opt.Locking
 	if b.forceForUpdateLocking {
 		locking = forUpdateLocking
 	}
@@ -1832,7 +1831,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		join.IsSecondJoinInPairedJoiner,
 		res.reqOrdering(join),
 		locking,
-		int(math.Ceil(join.RequiredPhysical().LimitHint)),
+		join.RequiredPhysical().LimitHintInt64(),
 	)
 	if err != nil {
 		return execPlan{}, err

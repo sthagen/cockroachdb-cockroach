@@ -13,6 +13,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -77,13 +78,13 @@ func registerTPCHConcurrency(r registry.Registry) {
 		require.NoError(t, err)
 
 		// Populate the range cache on each node.
-		for node := 1; node < numNodes; node++ {
-			conn = c.Conn(ctx, t.L(), node)
-			if _, err := conn.Exec("USE tpch;"); err != nil {
+		for nodeIdx := 1; nodeIdx < numNodes; nodeIdx++ {
+			node := c.Conn(ctx, t.L(), nodeIdx)
+			if _, err := node.Exec("USE tpch;"); err != nil {
 				t.Fatal(err)
 			}
 			for _, table := range tpchTables {
-				if _, err := conn.Exec(fmt.Sprintf("SELECT count(*) FROM %s", table)); err != nil {
+				if _, err := node.Exec(fmt.Sprintf("SELECT count(*) FROM %s", table)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -95,6 +96,22 @@ func registerTPCHConcurrency(r registry.Registry) {
 			// Run each query once on each connection.
 			for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
 				t.Status("running Q", queryNum)
+				// To aid during the debugging later, we'll print the DistSQL
+				// diagram of the query.
+				rows, err := conn.Query("EXPLAIN (DISTSQL) " + tpch.QueriesByNumber[queryNum])
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer rows.Close()
+				for rows.Next() {
+					var line string
+					if err = rows.Scan(&line); err != nil {
+						t.Fatal(err)
+					}
+					if strings.Contains(line, "Diagram:") {
+						t.Status(line)
+					}
+				}
 				// The way --max-ops flag works is as follows: the global ops
 				// counter is incremented **after** each worker completes a
 				// single operation, so it is possible for all connections start
@@ -158,7 +175,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 		// additional step to ensure that some kind of lower bound for the
 		// supported concurrency is always sustained and fail the test if it
 		// isn't.
-		minConcurrency, maxConcurrency := 32, 192
+		minConcurrency, maxConcurrency := 48, 160
 		// Run the binary search to find the largest concurrency that doesn't
 		// crash a node in the cluster. The current range is represented by
 		// [minConcurrency, maxConcurrency).
@@ -193,9 +210,9 @@ func registerTPCHConcurrency(r registry.Registry) {
 		},
 		// By default, the timeout is 10 hours which might not be sufficient
 		// given that a single iteration of checkConcurrency might take on the
-		// order of one hour, so in order to let each test run to complete we'll
-		// give it 18 hours. Successful runs typically take a lot less, around
-		// six hours.
-		Timeout: 18 * time.Hour,
+		// order of an hour and a half, so in order to let each test run to
+		// complete, we'll give it 12 hours. Successful runs typically take
+		// less, around 8 hours.
+		Timeout: 12 * time.Hour,
 	})
 }

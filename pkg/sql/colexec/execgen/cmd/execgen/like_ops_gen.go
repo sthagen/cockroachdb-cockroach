@@ -24,8 +24,10 @@ import (
 // are several different implementations which may be chosen depending on the
 // complexity of the LIKE pattern.
 //
-// likeTemplate needs to be used as a format string expecting exactly one %s
-// arguments that describes the type of the operator (either "sel" or "proj").
+// likeTemplate needs to be used as a format string expecting exactly two %s
+// arguments:
+// [1]: is the package suffix (either "sel" or "projconst")
+// [2]: is the type of the operator (either "sel" or "proj").
 const likeTemplate = `
 // Copyright 2019 The Cockroach Authors.
 //
@@ -48,12 +50,15 @@ import (
 )
 
 {{range .}}
-{{template "%[1]sConstOp" .}}
+{{template "%[2]sConstOp" .}}
 {{end}}
 `
 
 func genLikeOps(
 	tmplGetter func(inputFileContents string) (*template.Template, error),
+	// pkgSuffix is the suffix of the package for the operator to be generated
+	// in (either "sel" or "projconst").
+	pkgSuffix string,
 	// opType is the type of the operator to be generated (either "sel" or
 	// "proj").
 	opType string,
@@ -63,7 +68,7 @@ func genLikeOps(
 		if err != nil {
 			return err
 		}
-		tmpl, err = tmpl.Parse(fmt.Sprintf(likeTemplate, opType))
+		tmpl, err = tmpl.Parse(fmt.Sprintf(likeTemplate, pkgSuffix, opType))
 		if err != nil {
 			return err
 		}
@@ -112,6 +117,30 @@ func genLikeOps(
 				Right:        rightWidthOverload,
 			}
 		}
+		// makeSkeletonAssignFunc returns a string that assigns 'targetElem' to
+		// the result of evaluation 'leftElem' (LIKE | NOT LIKE) pattern where
+		// pattern is of the form '%word1%word2%...%' where "words" come from
+		// 'rightElem' (which is [][]byte).
+		//
+		// The logic for evaluating such expression is that for each word we
+		// find its first occurrence in the unprocessed part of 'leftElem'. If
+		// it is not found, then 'leftElem' doesn't match the pattern, if it is
+		// found, then we advance 'leftElem' right past that first occurrence.
+		makeSkeletonAssignFunc := func(targetElem, leftElem, rightElem, comparison string) string {
+			return fmt.Sprintf(`
+				{
+					var idx, skeletonIdx int
+					for skeletonIdx < len(%[3]s) {
+						idx = bytes.Index(%[2]s, %[3]s[skeletonIdx])
+						if idx < 0 {
+							break
+						}
+						%[2]s = %[2]s[idx+len(%[3]s[skeletonIdx]):]
+						skeletonIdx++
+					}
+					%[1]s = skeletonIdx %[4]s len(%[3]s)
+				}`, targetElem, leftElem, rightElem, comparison)
+		}
 		overloads := []*twoArgsResolvedOverload{
 			makeOverload("Prefix", bytesRepresentation, func(targetElem, leftElem, rightElem string) string {
 				return fmt.Sprintf("%s = bytes.HasPrefix(%s, %s)", targetElem, leftElem, rightElem)
@@ -121,6 +150,9 @@ func genLikeOps(
 			}),
 			makeOverload("Contains", bytesRepresentation, func(targetElem, leftElem, rightElem string) string {
 				return fmt.Sprintf("%s = bytes.Contains(%s, %s)", targetElem, leftElem, rightElem)
+			}),
+			makeOverload("Skeleton", "[][]byte", func(targetElem, leftElem, rightElem string) string {
+				return makeSkeletonAssignFunc(targetElem, leftElem, rightElem, "==")
 			}),
 			makeOverload("Regexp", "*regexp.Regexp", func(targetElem, leftElem, rightElem string) string {
 				return fmt.Sprintf("%s = %s.Match(%s)", targetElem, rightElem, leftElem)
@@ -133,6 +165,9 @@ func genLikeOps(
 			}),
 			makeOverload("NotContains", bytesRepresentation, func(targetElem, leftElem, rightElem string) string {
 				return fmt.Sprintf("%s = !bytes.Contains(%s, %s)", targetElem, leftElem, rightElem)
+			}),
+			makeOverload("NotSkeleton", "[][]byte", func(targetElem, leftElem, rightElem string) string {
+				return makeSkeletonAssignFunc(targetElem, leftElem, rightElem, "!=")
 			}),
 			makeOverload("NotRegexp", "*regexp.Regexp", func(targetElem, leftElem, rightElem string) string {
 				return fmt.Sprintf("%s = !%s.Match(%s)", targetElem, rightElem, leftElem)
@@ -147,6 +182,6 @@ func init() {
 		projTemplate := replaceProjConstTmplVariables(inputFileContents, false /* isConstLeft */)
 		return template.New("proj_like_ops").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(projTemplate)
 	}
-	registerGenerator(genLikeOps(getProjectionOpsTmpl, "proj"), "proj_like_ops.eg.go", projConstOpsTmpl)
-	registerGenerator(genLikeOps(getSelectionOpsTmpl, "sel"), "sel_like_ops.eg.go", selectionOpsTmpl)
+	registerGenerator(genLikeOps(getProjectionOpsTmpl, "projconst", "proj"), "proj_like_ops.eg.go", projConstOpsTmpl)
+	registerGenerator(genLikeOps(getSelectionOpsTmpl, "sel", "sel"), "sel_like_ops.eg.go", selectionOpsTmpl)
 }

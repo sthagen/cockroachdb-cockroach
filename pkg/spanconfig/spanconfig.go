@@ -18,7 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // KVAccessor mediates access to KV span configurations pertaining to a given
@@ -35,18 +38,23 @@ type KVAccessor interface {
 		ctx context.Context, id roachpb.TenantID,
 	) ([]roachpb.SpanConfig, error)
 
-	// UpdateSpanConfigRecords updates configurations for the given key targets.
-	// This is a "targeted" API: the exact targets being deleted are expected to
-	// have been present; if targets are being updated with new configs, they're
-	// expected to be present exactly as well.
+	// UpdateSpanConfigRecords updates configurations for the given targets. This
+	// is a "targeted" API: the targets being deleted are expected to have been
+	// present.
 	//
 	// Targets are not allowed to overlap with each other. When divvying up an
 	// existing target into multiple others with distinct configs, callers must
 	// issue deletes for the previous target and upserts for the new records.
+	// The updates are performed atomically and at a timestamp within
+	// [minCommitTS, maxCommitTS). Typically, this is the lease interval of the
+	// reconciliation job on behalf of which the KVAccessor is acting. If we're
+	// unable to commit within the interval, a commitTimestampOutOfBoundsError is
+	// returned.
 	UpdateSpanConfigRecords(
 		ctx context.Context,
 		toDelete []Target,
 		toUpsert []Record,
+		minCommitTS, maxCommitTS hlc.Timestamp,
 	) error
 
 	// WithTxn returns a KVAccessor that runs using the given transaction (with
@@ -182,11 +190,18 @@ type Reconciler interface {
 	// to reduce the amount of necessary work (provided the MVCC history is
 	// still available).
 	//
+	// Every reconciliation process is associated with an underlying sqlliveness
+	// session. Typically, this is the session associated with the auto span
+	// config job driving the entire reconciliation process. Any updates issued
+	// by the reconciliation process must be performed at a valid timestamp which
+	// is within the [start, expiration) of the session.
+	//
 	// [1]: It's possible for system.{zones,descriptor} to have been GC-ed away;
 	//      think suspended tenants.
 	Reconcile(
 		ctx context.Context,
 		startTS hlc.Timestamp,
+		session sqlliveness.Session,
 		onCheckpoint func() error,
 	) error
 
@@ -257,6 +272,15 @@ type StoreReader interface {
 	GetSpanConfigForKey(ctx context.Context, key roachpb.RKey) (roachpb.SpanConfig, error)
 }
 
+// Limiter is used to limit the number of span configs installed by secondary
+// tenants. It takes in a delta (typically the difference in span configs
+// between the committed and uncommitted state in the txn), uses it to maintain
+// an aggregate counter, and informs the caller if exceeding the prescribed
+// limit.
+type Limiter interface {
+	ShouldLimit(ctx context.Context, txn *kv.Txn, delta int) (bool, error)
+}
+
 // Splitter returns the number of split points for the given table descriptor.
 // It steps through every "unit" that we can apply configurations over (table,
 // indexes, partitions and sub-partitions) and figures out the actual key
@@ -286,6 +310,40 @@ type StoreReader interface {
 //
 type Splitter interface {
 	Splits(ctx context.Context, table catalog.TableDescriptor) (int, error)
+}
+
+// Delta considers both the committed and uncommitted state of a table
+// descriptor and computes the difference in the number of spans we can apply a
+// configuration over.
+func Delta(
+	ctx context.Context, s Splitter, committed, uncommitted catalog.TableDescriptor,
+) (int, error) {
+	if committed == nil && uncommitted == nil {
+		log.Fatalf(ctx, "unexpected: got two nil table descriptors")
+	}
+
+	var nonNilDesc catalog.TableDescriptor
+	if committed != nil {
+		nonNilDesc = committed
+	} else {
+		nonNilDesc = uncommitted
+	}
+	if nonNilDesc.GetParentID() == systemschema.SystemDB.GetID() {
+		return 0, nil // we don't count tables in the system database
+	}
+
+	uncommittedSplits, err := s.Splits(ctx, uncommitted)
+	if err != nil {
+		return 0, err
+	}
+
+	committedSplits, err := s.Splits(ctx, committed)
+	if err != nil {
+		return 0, err
+	}
+
+	delta := uncommittedSplits - committedSplits
+	return delta, nil
 }
 
 // SQLUpdate captures either a descriptor or a protected timestamp update.

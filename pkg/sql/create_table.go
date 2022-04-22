@@ -445,7 +445,10 @@ func (n *createTableNode) startExec(params runParams) error {
 			params.ctx,
 			params.p.txn,
 			desc.ParentID,
-			tree.DatabaseLookupFlags{Required: true},
+			tree.DatabaseLookupFlags{
+				Required:    true,
+				AvoidLeased: true,
+			},
 		)
 		if err != nil {
 			return errors.Wrap(err, "error resolving database for multi-region")
@@ -1547,6 +1550,7 @@ func NewTableDesc(
 				if err != nil {
 					return nil, err
 				}
+				primaryIndexColumnSet[shardCol.GetName()] = struct{}{}
 				checkConstraint, err := makeShardCheckConstraintDef(int(buckets), shardCol)
 				if err != nil {
 					return nil, err
@@ -1598,6 +1602,7 @@ func NewTableDesc(
 			if err := desc.AddPrimaryIndex(*implicitColumnDefIdx.idx); err != nil {
 				return nil, err
 			}
+			primaryIndexColumnSet[string(implicitColumnDefIdx.def.Name)] = struct{}{}
 		} else {
 			// If it is a non-primary index that is implicitly created, ensure
 			// partitioning for PARTITION ALL BY.
@@ -1975,6 +1980,14 @@ func NewTableDesc(
 
 	for i := range desc.Columns {
 		if _, ok := primaryIndexColumnSet[desc.Columns[i].Name]; ok {
+			if !st.Version.IsActive(ctx, clusterversion.Start22_1) {
+				if desc.Columns[i].Virtual {
+					return nil, pgerror.Newf(
+						pgcode.FeatureNotSupported,
+						"cannot use virtual column %q in primary key", desc.Columns[i].Name,
+					)
+				}
+			}
 			desc.Columns[i].Nullable = false
 		}
 	}
@@ -2345,11 +2358,6 @@ func newTableDesc(
 	return ret, nil
 }
 
-// defaultTTLScheduleCron is the default cron duration for row-level TTL.
-// defaultTTLScheduleCron cannot be a cluster setting as this would involve
-// changing all existing schedules to match the new setting.
-const defaultTTLScheduleCron = "@hourly"
-
 // newRowLevelTTLScheduledJob returns a *jobs.ScheduledJob for row level TTL
 // for a given table.
 func newRowLevelTTLScheduledJob(
@@ -2367,7 +2375,7 @@ func newRowLevelTTLScheduledJob(
 		OnError: jobspb.ScheduleDetails_RETRY_SCHED,
 	})
 
-	if err := sj.SetSchedule(rowLevelTTLSchedule(ttl)); err != nil {
+	if err := sj.SetSchedule(ttl.DeletionCronOrDefault()); err != nil {
 		return nil, err
 	}
 	args := &catpb.ScheduledRowLevelTTLArgs{
@@ -2382,13 +2390,6 @@ func newRowLevelTTLScheduledJob(
 		jobspb.ExecutionArguments{Args: any},
 	)
 	return sj, nil
-}
-
-func rowLevelTTLSchedule(ttl *catpb.RowLevelTTL) string {
-	if override := ttl.DeletionCron; override != "" {
-		return override
-	}
-	return defaultTTLScheduleCron
 }
 
 func checkTTLEnabledForCluster(ctx context.Context, st *cluster.Settings) error {

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -353,10 +354,10 @@ func rangeUsageInfoForRepl(repl *Replica) RangeUsageInfo {
 	info := RangeUsageInfo{
 		LogicalBytes: repl.GetMVCCStats().Total(),
 	}
-	if queriesPerSecond, dur := repl.leaseholderStats.avgQPS(); dur >= MinStatsDuration {
+	if queriesPerSecond, dur := repl.leaseholderStats.averageRatePerSecond(); dur >= MinStatsDuration {
 		info.QueriesPerSecond = queriesPerSecond
 	}
-	if writesPerSecond, dur := repl.writeStats.avgQPS(); dur >= MinStatsDuration {
+	if writesPerSecond, dur := repl.writeStats.averageRatePerSecond(); dur >= MinStatsDuration {
 		info.WritesPerSecond = writesPerSecond
 	}
 	return info
@@ -899,7 +900,7 @@ func (a *Allocator) allocateTarget(
 		conf,
 		existingVoters,
 		existingNonVoters,
-		a.scorerOptions(),
+		a.scorerOptions(ctx),
 		// When allocating a *new* replica, we explicitly disregard nodes with any
 		// existing replicas. This is important for multi-store scenarios as
 		// otherwise, stores on the nodes that have existing replicas are simply
@@ -1122,6 +1123,7 @@ func (a Allocator) removeTarget(
 
 	replicaSetForDiversityCalc := getReplicasForDiversityCalc(targetType, existingVoters, existingReplicas)
 	rankedCandidates := candidateListForRemoval(
+		ctx,
 		candidateStoreList,
 		constraintsChecker,
 		a.storePool.getLocalitiesByStore(replicaSetForDiversityCalc),
@@ -1451,16 +1453,18 @@ func (a Allocator) RebalanceNonVoter(
 	)
 }
 
-func (a *Allocator) scorerOptions() *rangeCountScorerOptions {
+func (a *Allocator) scorerOptions(ctx context.Context) *rangeCountScorerOptions {
 	return &rangeCountScorerOptions{
+		storeHealthOptions:      a.storeHealthOptions(ctx),
 		deterministic:           a.storePool.deterministic,
 		rangeRebalanceThreshold: rangeRebalanceThreshold.Get(&a.storePool.st.SV),
 	}
 }
 
-func (a *Allocator) scorerOptionsForScatter() *scatterScorerOptions {
+func (a *Allocator) scorerOptionsForScatter(ctx context.Context) *scatterScorerOptions {
 	return &scatterScorerOptions{
 		rangeCountScorerOptions: rangeCountScorerOptions{
+			storeHealthOptions:      a.storeHealthOptions(ctx),
 			deterministic:           a.storePool.deterministic,
 			rangeRebalanceThreshold: 0,
 		},
@@ -1586,6 +1590,24 @@ func (a *Allocator) leaseholderShouldMoveDueToPreferences(
 		}
 	}
 	return true
+}
+
+// storeHealthOptions returns the store health options, currently only
+// considering the threshold for L0 sub-levels. This threshold is not
+// considered in allocation or rebalancing decisions (excluding candidate
+// stores as targets) when enforcementLevel is set to storeHealthNoAction or
+// storeHealthLogOnly. By default storeHealthBlockRebalanceTo is the action taken. When
+// there is a mixed version cluster, storeHealthNoAction is set instead.
+func (a *Allocator) storeHealthOptions(ctx context.Context) storeHealthOptions {
+	enforcementLevel := storeHealthNoAction
+	if a.storePool.st.Version.IsActive(ctx, clusterversion.AutoStatsTableSettings) {
+		enforcementLevel = storeHealthEnforcement(l0SublevelsThresholdEnforce.Get(&a.storePool.st.SV))
+	}
+
+	return storeHealthOptions{
+		enforcementLevel:    enforcementLevel,
+		l0SublevelThreshold: l0SublevelsThreshold.Get(&a.storePool.st.SV),
+	}
 }
 
 // TransferLeaseTarget returns a suitable replica to transfer the range lease
@@ -1715,7 +1737,7 @@ func (a *Allocator) TransferLeaseTarget(
 		return candidates[a.randGen.Intn(len(candidates))]
 
 	case qpsConvergence:
-		leaseReplQPS, _ := stats.avgQPS()
+		leaseReplQPS, _ := stats.averageRatePerSecond()
 		candidates := make([]roachpb.StoreID, 0, len(existing)-1)
 		for _, repl := range existing {
 			if repl.StoreID != leaseRepl.StoreID() {
@@ -1735,11 +1757,14 @@ func (a *Allocator) TransferLeaseTarget(
 		// https://github.com/cockroachdb/cockroach/issues/75630.
 		bestStore, noRebalanceReason := bestStoreToMinimizeQPSDelta(
 			leaseReplQPS,
-			qpsRebalanceThreshold.Get(&a.storePool.st.SV),
-			minQPSDifferenceForTransfers.Get(&a.storePool.st.SV),
 			leaseRepl.StoreID(),
 			candidates,
 			storeDescMap,
+			&qpsScorerOptions{
+				storeHealthOptions:    a.storeHealthOptions(ctx),
+				qpsRebalanceThreshold: qpsRebalanceThreshold.Get(&a.storePool.st.SV),
+				minRequiredQPSDiff:    minQPSDifferenceForTransfers.Get(&a.storePool.st.SV),
+			},
 		)
 
 		switch noRebalanceReason {
@@ -1874,7 +1899,7 @@ func (a *Allocator) ShouldTransferLease(
 	sl, _, _ := a.storePool.getStoreList(storeFilterSuspect)
 	sl = sl.excludeInvalid(conf.Constraints)
 	sl = sl.excludeInvalid(conf.VoterConstraints)
-	log.VEventf(ctx, 3, "ShouldTransferLease (lease-holder=%d):\n%s", leaseRepl, sl)
+	log.VEventf(ctx, 3, "ShouldTransferLease (lease-holder=s%d):\n%s", leaseRepl.StoreID(), sl)
 
 	transferDec, _ := a.shouldTransferLeaseForAccessLocality(
 		ctx,
@@ -1945,7 +1970,7 @@ func (a Allocator) shouldTransferLeaseForAccessLocality(
 		}
 	}
 
-	qpsStats, qpsStatsDur := stats.perLocalityDecayingQPS()
+	qpsStats, qpsStatsDur := stats.perLocalityDecayingRate()
 
 	// If we haven't yet accumulated enough data, avoid transferring for now,
 	// unless we've been explicitly asked otherwise. Do not fall back to the

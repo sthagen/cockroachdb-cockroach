@@ -394,8 +394,7 @@ type UpdateSchemaChangerJob struct {
 	mutationOp
 	IsNonCancelable bool
 	JobID           jobspb.JobID
-
-	// TODO(ajwerner): Plumb and set RunningStatus.
+	RunningStatus   string
 }
 
 // CreateSchemaChangerJob constructs the job for the
@@ -410,6 +409,7 @@ type CreateSchemaChangerJob struct {
 	// NonCancelable maps to the job's property, but in the schema changer can
 	// be thought of as !Revertible.
 	NonCancelable bool
+	RunningStatus string
 }
 
 // RemoveAllTableComments is used to delete all comments associated with a
@@ -447,8 +447,9 @@ type RemoveIndexComment struct {
 // RemoveColumnComment is used to delete a comment associated with a column.
 type RemoveColumnComment struct {
 	mutationOp
-	TableID  descpb.ID
-	ColumnID descpb.ColumnID
+	TableID        descpb.ID
+	ColumnID       descpb.ColumnID
+	PgAttributeNum descpb.PGAttributeNum
 }
 
 // RemoveConstraintComment is used to delete a comment associated with a

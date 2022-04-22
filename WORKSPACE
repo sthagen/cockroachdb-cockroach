@@ -1,7 +1,7 @@
 # Define the top level namespace. This lets everything be addressable using
-# `@cockroach//...`.
+# `@com_github_cockroachdb_cockroach//...`.
 workspace(
-    name = "cockroach",
+    name = "com_github_cockroachdb_cockroach",
     managed_directories = {
         "@npm": ["pkg/ui/node_modules"],
     },
@@ -13,12 +13,12 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # Load go bazel tools. This gives us access to the go bazel SDK/toolchains.
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "a80c384a85ab9f6318419ed38a39b13e8481e9d2ea25a696ea9e25438e017b5f",
-    strip_prefix = "cockroachdb-rules_go-f96cc04",
+    sha256 = "8a993815a6a7cfe47e46238383f0e36a80b9ce0ac482f855c7288a31565b5661",
+    strip_prefix = "cockroachdb-rules_go-58cb947",
     urls = [
-        # cockroachdb/rules_go as of f96cc0445102a7b08bceeb0bba32b4d82467a065
+        # cockroachdb/rules_go as of 58cb94707783f529462d4c6d3c698933a1022942
         # (upstream release-0.29 plus a few patches).
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-54-gf96cc04.tar.gz",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-56-g58cb947.tar.gz",
     ],
 )
 
@@ -123,7 +123,7 @@ http_archive(
         "@io_bazel_rules_go//third_party:go_googleapis-deletebuild.patch",
         "@io_bazel_rules_go//third_party:go_googleapis-directives.patch",
         "@io_bazel_rules_go//third_party:go_googleapis-gazelle.patch",
-        "@cockroach//build/patches:go_googleapis.patch",
+        "@com_github_cockroachdb_cockroach//build/patches:go_googleapis.patch",
     ],
     sha256 = "a85c6a00e9cf0f004992ebea1d10688e3beea9f8e1a5a04ee53f367e72ee85af",
     strip_prefix = "googleapis-409e134ffaacc243052b08e6fb8e2d458014ed37",
@@ -168,7 +168,7 @@ go_download_sdk(
 
 go_rules_dependencies()
 
-go_register_toolchains(nogo = "@cockroach//:crdb_nogo")
+go_register_toolchains(nogo = "@com_github_cockroachdb_cockroach//:crdb_nogo")
 
 ###############################
 # end rules_go dependencies #

@@ -7,9 +7,8 @@ pkg/base/node_id.go | `*SQLIDContainer`
 pkg/base/node_id.go | `*StoreIDContainer`
 pkg/cli/exit/exit.go | `Code`
 pkg/jobs/jobspb/wrap.go | `Type`
-pkg/kv/bulk/sst_batcher.go | `sorted`
-pkg/kv/bulk/sst_batcher.go | `sz`
-pkg/kv/bulk/sst_batcher.go | `timing`
+pkg/kv/bulk/stats.go | `sz`
+pkg/kv/bulk/stats.go | `timing`
 pkg/kv/kvserver/closedts/ctpb/service.go | `LAI`
 pkg/kv/kvserver/closedts/ctpb/service.go | `SeqNum`
 pkg/kv/kvserver/concurrency/lock/locking.go | `Durability`
@@ -43,6 +42,7 @@ pkg/sql/sem/catid/ids.go | `ConstraintID`
 pkg/sql/sem/catid/ids.go | `DescID`
 pkg/sql/sem/catid/ids.go | `FamilyID`
 pkg/sql/sem/catid/ids.go | `IndexID`
+pkg/sql/sem/catid/ids.go | `PGAttributeNum`
 pkg/sql/sqlliveness/sqlliveness.go | `SessionID`
 pkg/storage/enginepb/mvcc.go | `TxnEpoch`
 pkg/storage/enginepb/mvcc.go | `TxnSeq`

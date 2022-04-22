@@ -8,7 +8,6 @@ go_library(
         "distinct.go",
         "fn_op.go",
         "ordinality.go",
-        "overloads_bin_util.go",
         "simple_project.go",
         ":gen-exec",  # keep
     ],
@@ -109,7 +108,9 @@ disallowed_imports_test(
         "//pkg/sql/colexec/colexechash",
         "//pkg/sql/colexec/colexecjoin",
         "//pkg/sql/colexec/colexecproj",
+        "//pkg/sql/colexec/colexecprojconst",
         "//pkg/sql/colexec/colexecsel",
         "//pkg/sql/colexec/colexecwindow",
+        "//pkg/sql/execinfra",
     ],
 )

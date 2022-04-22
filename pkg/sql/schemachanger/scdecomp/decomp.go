@@ -310,7 +310,7 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 		IsInaccessible:                    col.IsInaccessible(),
 		GeneratedAsIdentityType:           col.GetGeneratedAsIdentityType(),
 		GeneratedAsIdentitySequenceOption: col.GetGeneratedAsIdentitySequenceOption(),
-		PgAttributeNum:                    col.ColumnDesc().PGAttributeNum,
+		PgAttributeNum:                    col.GetPGAttributeNum(),
 	}
 	w.ev(maybeMutationStatus(col), column)
 	w.ev(scpb.Status_PUBLIC, &scpb.ColumnName{
@@ -363,9 +363,10 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 	}
 	// TODO(postamar): proper handling of comments
 	w.ev(scpb.Status_PUBLIC, &scpb.ColumnComment{
-		TableID:  tbl.GetID(),
-		ColumnID: col.GetID(),
-		Comment:  scpb.PlaceHolderComment,
+		TableID:        tbl.GetID(),
+		ColumnID:       col.GetID(),
+		PgAttributeNum: col.GetPGAttributeNum(),
+		Comment:        scpb.PlaceHolderComment,
 	})
 	owns := catalog.MakeDescriptorIDSet(col.ColumnDesc().OwnsSequenceIds...)
 	owns.Remove(catid.InvalidDescID)
@@ -389,14 +390,16 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 	{
 		cpy := idx.IndexDescDeepCopy()
 		index := scpb.Index{
-			TableID:            tbl.GetID(),
-			IndexID:            idx.GetID(),
-			IsUnique:           idx.IsUnique(),
-			KeyColumnIDs:       cpy.KeyColumnIDs,
-			KeySuffixColumnIDs: cpy.KeySuffixColumnIDs,
-			StoringColumnIDs:   cpy.StoreColumnIDs,
-			CompositeColumnIDs: cpy.CompositeColumnIDs,
-			IsInverted:         idx.GetType() == descpb.IndexDescriptor_INVERTED,
+			TableID:             tbl.GetID(),
+			IndexID:             idx.GetID(),
+			IsUnique:            idx.IsUnique(),
+			KeyColumnIDs:        cpy.KeyColumnIDs,
+			KeySuffixColumnIDs:  cpy.KeySuffixColumnIDs,
+			StoringColumnIDs:    cpy.StoreColumnIDs,
+			CompositeColumnIDs:  cpy.CompositeColumnIDs,
+			IsInverted:          idx.GetType() == descpb.IndexDescriptor_INVERTED,
+			IsCreatedExplicitly: idx.IsCreatedExplicitly(),
+			ConstraintID:        idx.GetConstraintID(),
 		}
 		index.KeyColumnDirections = make([]scpb.Index_Direction, len(index.KeyColumnIDs))
 		for i := 0; i < idx.NumKeyColumns(); i++ {

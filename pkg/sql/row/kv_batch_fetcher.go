@@ -186,6 +186,21 @@ func makeKVBatchFetcherDefaultSendFunc(txn *kv.Txn) sendFunc {
 	}
 }
 
+type kvBatchFetcherArgs struct {
+	sendFn                     sendFunc
+	spans                      roachpb.Spans
+	reverse                    bool
+	batchBytesLimit            rowinfra.BytesLimit
+	firstBatchKeyLimit         rowinfra.KeyLimit
+	lockStrength               descpb.ScanLockingStrength
+	lockWaitPolicy             descpb.ScanLockingWaitPolicy
+	lockTimeout                time.Duration
+	acc                        *mon.BoundAccount
+	forceProductionKVBatchSize bool
+	requestAdmissionHeader     roachpb.AdmissionHeader
+	responseAdmissionQ         *admission.WorkQueue
+}
+
 // makeKVBatchFetcher initializes a KVBatchFetcher for the given spans. If
 // useBatchLimit is true, the number of result keys per batch is limited; the
 // limit grows between subsequent batches, starting at firstBatchKeyLimit (if not
@@ -201,58 +216,44 @@ func makeKVBatchFetcherDefaultSendFunc(txn *kv.Txn) sendFunc {
 // The passed-in memory account is owned by the fetcher throughout its lifetime
 // but is **not** closed - it is the caller's responsibility to close acc if it
 // is non-nil.
-func makeKVBatchFetcher(
-	ctx context.Context,
-	sendFn sendFunc,
-	spans roachpb.Spans,
-	reverse bool,
-	batchBytesLimit rowinfra.BytesLimit,
-	firstBatchKeyLimit rowinfra.KeyLimit,
-	lockStrength descpb.ScanLockingStrength,
-	lockWaitPolicy descpb.ScanLockingWaitPolicy,
-	lockTimeout time.Duration,
-	acc *mon.BoundAccount,
-	forceProductionKVBatchSize bool,
-	requestAdmissionHeader roachpb.AdmissionHeader,
-	responseAdmissionQ *admission.WorkQueue,
-) (txnKVFetcher, error) {
-	if firstBatchKeyLimit < 0 || (batchBytesLimit == 0 && firstBatchKeyLimit != 0) {
+func makeKVBatchFetcher(ctx context.Context, args kvBatchFetcherArgs) (txnKVFetcher, error) {
+	if args.firstBatchKeyLimit < 0 || (args.batchBytesLimit == 0 && args.firstBatchKeyLimit != 0) {
 		// Passing firstBatchKeyLimit without batchBytesLimit doesn't make sense - the
 		// only reason to not set batchBytesLimit is in order to get DistSender-level
 		// parallelism, and setting firstBatchKeyLimit inhibits that.
 		return txnKVFetcher{}, errors.Errorf("invalid batch limit %d (batchBytesLimit: %d)",
-			firstBatchKeyLimit, batchBytesLimit)
+			args.firstBatchKeyLimit, args.batchBytesLimit)
 	}
 
-	if batchBytesLimit != 0 {
+	if args.batchBytesLimit != 0 {
 		// Verify the spans are ordered if a batch limit is used.
-		for i := 1; i < len(spans); i++ {
-			prevKey := spans[i-1].EndKey
+		for i := 1; i < len(args.spans); i++ {
+			prevKey := args.spans[i-1].EndKey
 			if prevKey == nil {
 				// This is the case of a GetRequest.
-				prevKey = spans[i-1].Key
+				prevKey = args.spans[i-1].Key
 			}
-			if spans[i].Key.Compare(prevKey) < 0 {
-				return txnKVFetcher{}, errors.Errorf("unordered spans (%s %s)", spans[i-1], spans[i])
+			if args.spans[i].Key.Compare(prevKey) < 0 {
+				return txnKVFetcher{}, errors.Errorf("unordered spans (%s %s)", args.spans[i-1], args.spans[i])
 			}
 		}
 	} else if util.RaceEnabled {
 		// Otherwise, just verify the spans don't contain consecutive overlapping
 		// spans.
-		for i := 1; i < len(spans); i++ {
-			prevEndKey := spans[i-1].EndKey
+		for i := 1; i < len(args.spans); i++ {
+			prevEndKey := args.spans[i-1].EndKey
 			if prevEndKey == nil {
-				prevEndKey = spans[i-1].Key
+				prevEndKey = args.spans[i-1].Key
 			}
-			curEndKey := spans[i].EndKey
+			curEndKey := args.spans[i].EndKey
 			if curEndKey == nil {
-				curEndKey = spans[i].Key
+				curEndKey = args.spans[i].Key
 			}
-			if spans[i].Key.Compare(prevEndKey) >= 0 {
+			if args.spans[i].Key.Compare(prevEndKey) >= 0 {
 				// Current span's start key is greater than or equal to the last span's
 				// end key - we're good.
 				continue
-			} else if curEndKey.Compare(spans[i-1].Key) <= 0 {
+			} else if curEndKey.Compare(args.spans[i-1].Key) <= 0 {
 				// Current span's end key is less than or equal to the last span's start
 				// key - also good.
 				continue
@@ -260,27 +261,27 @@ func makeKVBatchFetcher(
 			// Otherwise, the two spans overlap, which isn't allowed - it leaves us at
 			// risk of incorrect results, since the row fetcher can't distinguish
 			// between identical rows in two different batches.
-			return txnKVFetcher{}, errors.Errorf("overlapping neighbor spans (%s %s)", spans[i-1], spans[i])
+			return txnKVFetcher{}, errors.Errorf("overlapping neighbor spans (%s %s)", args.spans[i-1], args.spans[i])
 		}
 	}
 
 	f := txnKVFetcher{
-		sendFn:                     sendFn,
-		reverse:                    reverse,
-		batchBytesLimit:            batchBytesLimit,
-		firstBatchKeyLimit:         firstBatchKeyLimit,
-		lockStrength:               getKeyLockingStrength(lockStrength),
-		lockWaitPolicy:             GetWaitPolicy(lockWaitPolicy),
-		lockTimeout:                lockTimeout,
-		acc:                        acc,
-		forceProductionKVBatchSize: forceProductionKVBatchSize,
-		requestAdmissionHeader:     requestAdmissionHeader,
-		responseAdmissionQ:         responseAdmissionQ,
+		sendFn:                     args.sendFn,
+		reverse:                    args.reverse,
+		batchBytesLimit:            args.batchBytesLimit,
+		firstBatchKeyLimit:         args.firstBatchKeyLimit,
+		lockStrength:               getKeyLockingStrength(args.lockStrength),
+		lockWaitPolicy:             GetWaitPolicy(args.lockWaitPolicy),
+		lockTimeout:                args.lockTimeout,
+		acc:                        args.acc,
+		forceProductionKVBatchSize: args.forceProductionKVBatchSize,
+		requestAdmissionHeader:     args.requestAdmissionHeader,
+		responseAdmissionQ:         args.responseAdmissionQ,
 	}
 
 	// Account for the memory of the spans that we're taking the ownership of.
 	if f.acc != nil {
-		f.spansAccountedFor = spans.MemUsage()
+		f.spansAccountedFor = args.spans.MemUsage()
 		if err := f.acc.Grow(ctx, f.spansAccountedFor); err != nil {
 			return txnKVFetcher{}, err
 		}
@@ -290,11 +291,11 @@ func makeKVBatchFetcher(
 	// perform the deep copy. Notably, the spans might be modified (when the
 	// fetcher receives the resume spans), but the fetcher will always keep the
 	// memory accounting up to date.
-	f.spans = spans
-	if reverse {
+	f.spans = args.spans
+	if args.reverse {
 		// Reverse scans receive the spans in decreasing order. Note that we
 		// need to be this tricky since we're updating the spans slice in place.
-		i, j := 0, len(spans)-1
+		i, j := 0, len(args.spans)-1
 		for i < j {
 			f.spans[i], f.spans[j] = f.spans[j], f.spans[i]
 			i++
@@ -338,10 +339,10 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 		// could return. Most of the time, scans won't use this amount of memory,
 		// so it's unnecessary to reserve it all. We reserve something rather than
 		// nothing at all to preserve some accounting.
-		f.batchResponseAccountedFor = tokenFetchAllocation
-		if err := f.acc.Grow(ctx, f.batchResponseAccountedFor); err != nil {
+		if err := f.acc.Resize(ctx, f.batchResponseAccountedFor, tokenFetchAllocation); err != nil {
 			return err
 		}
+		f.batchResponseAccountedFor = tokenFetchAllocation
 	}
 
 	br, err := f.sendFn(ctx, ba)
@@ -373,9 +374,7 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 		// likely that we'll expose ourselves to OOM conditions, so that's the
 		// reasoning for why we never ratchet this account down past the maximum
 		// fetch size once it's exceeded.
-		used := f.acc.Used()
-		delta := returnedBytes - f.batchResponseAccountedFor
-		if err := f.acc.Resize(ctx, used, used+delta); err != nil {
+		if err := f.acc.Resize(ctx, f.batchResponseAccountedFor, returnedBytes); err != nil {
 			return err
 		}
 		f.batchResponseAccountedFor = returnedBytes
@@ -519,12 +518,11 @@ func (f *txnKVFetcher) nextBatch(
 		// We have some resume spans.
 		f.spans = f.spansScratch[:f.newFetchSpansIdx]
 		if f.acc != nil {
-			used := f.acc.Used()
-			delta := f.spans.MemUsage() - f.spansAccountedFor
-			if err := f.acc.Resize(ctx, used, used+delta); err != nil {
+			newSpansMemUsage := f.spans.MemUsage()
+			if err := f.acc.Resize(ctx, f.spansAccountedFor, newSpansMemUsage); err != nil {
 				return false, nil, nil, err
 			}
-			f.spansAccountedFor += delta
+			f.spansAccountedFor = newSpansMemUsage
 		}
 	}
 	// We have more work to do. Ask the KV layer to continue where it left off.
@@ -541,7 +539,8 @@ func (f *txnKVFetcher) close(ctx context.Context) {
 	f.remainingBatches = nil
 	f.spans = nil
 	f.spansScratch = nil
-	f.acc.Clear(ctx)
+	// Release only the allocations made by this fetcher.
+	f.acc.Shrink(ctx, f.batchResponseAccountedFor+f.spansAccountedFor)
 }
 
 // spansToRequests converts the provided spans to the corresponding requests. If

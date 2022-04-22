@@ -142,17 +142,24 @@ func restoreWithRetry(
 	var res roachpb.RowCount
 	var err error
 	for r := retry.StartWithCtx(restoreCtx, retryOpts); r.Next(); {
-		res, err = restore(
-			restoreCtx,
-			execCtx,
-			numNodes,
-			backupManifests,
-			backupLocalityInfo,
-			endTime,
-			dataToRestore,
-			job,
-			encryption,
-		)
+		// Re-plan inner loop (does not count as retries, done by outer loop).
+		for {
+			res, err = restore(
+				restoreCtx,
+				execCtx,
+				numNodes,
+				backupManifests,
+				backupLocalityInfo,
+				endTime,
+				dataToRestore,
+				job,
+				encryption,
+			)
+			if err == nil || !errors.Is(err, sql.ErrPlanChanged) {
+				break
+			}
+		}
+
 		if err == nil {
 			break
 		}
@@ -875,7 +882,11 @@ func createImportingDescriptors(
 							if err != nil {
 								return err
 							}
-							superRegions, err := t.SuperRegions()
+							superRegions, err := typeDesc.SuperRegions()
+							if err != nil {
+								return err
+							}
+							zoneCfgExtensions, err := typeDesc.ZoneConfigExtensions()
 							if err != nil {
 								return err
 							}
@@ -886,6 +897,7 @@ func createImportingDescriptors(
 								desc.RegionConfig.RegionEnumID,
 								desc.RegionConfig.Placement,
 								superRegions,
+								zoneCfgExtensions,
 							)
 							if err := sql.ApplyZoneConfigFromDatabaseRegionConfig(
 								ctx,
@@ -2084,9 +2096,6 @@ func (r *restoreResumer) dropDescriptors(
 		tableToDrop.DropTime = dropTime
 		b.Del(catalogkeys.EncodeNameKey(codec, tableToDrop))
 		descsCol.AddDeletedDescriptor(tableToDrop.GetID())
-		if err := descsCol.WriteDescToBatch(ctx, false /* kvTrace */, tableToDrop, b); err != nil {
-			return errors.Wrap(err, "writing dropping table to batch")
-		}
 	}
 
 	// Drop the type descriptors that this restore created.
@@ -2106,9 +2115,6 @@ func (r *restoreResumer) dropDescriptors(
 
 		b.Del(catalogkeys.EncodeNameKey(codec, typDesc))
 		mutType.SetDropped()
-		if err := descsCol.WriteDescToBatch(ctx, false /* kvTrace */, mutType, b); err != nil {
-			return errors.Wrap(err, "writing dropping type to batch")
-		}
 		// Remove the system.descriptor entry.
 		b.Del(catalogkeys.MakeDescMetadataKey(codec, typDesc.ID))
 		descsCol.AddDeletedDescriptor(mutType.GetID())
@@ -2264,6 +2270,16 @@ func (r *restoreResumer) dropDescriptors(
 		b.Del(nameKey)
 		descsCol.AddDeletedDescriptor(db.GetID())
 		deletedDBs[db.GetID()] = struct{}{}
+	}
+
+	// Avoid telling the descriptor collection about the mutated descriptors
+	// until after all relevant relations have been retrieved to avoid a
+	// scenario whereby we make a descriptor invalid too early.
+	const kvTrace = false
+	for _, t := range mutableTables {
+		if err := descsCol.WriteDescToBatch(ctx, kvTrace, t, b); err != nil {
+			return errors.Wrap(err, "writing dropping table to batch")
+		}
 	}
 
 	if err := txn.Run(ctx, b); err != nil {

@@ -19,7 +19,7 @@ import (
 )
 
 func initReplicationBuiltins() {
-	// Add all replicationBuiltins to the Builtins map after a sanity check.
+	// Add all replicationBuiltins to the builtins map after a sanity check.
 	for k, v := range replicationBuiltins {
 		if _, exists := builtins[k]; exists {
 			panic("duplicate builtin: " + k)
@@ -44,7 +44,7 @@ var replicationBuiltins = map[string]builtinDefinition{
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				mgr, err := streaming.GetReplicationStreamManager(evalCtx)
+				mgr, err := streaming.GetStreamIngestManager(evalCtx)
 				if err != nil {
 					return nil, err
 				}

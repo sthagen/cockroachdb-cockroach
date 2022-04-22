@@ -646,6 +646,25 @@ var charts = []sectionDescription{
 				Title:   "QPS",
 				Metrics: []string{"rebalancing.queriespersecond"},
 			},
+			{
+				Title:   "Requests Per Second",
+				Metrics: []string{"rebalancing.requestspersecond"},
+			},
+			{
+				Title:   "Keys Read Per Second",
+				Metrics: []string{"rebalancing.readspersecond"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{
+			{DistributionLayer, "Rebalancing"},
+		},
+		Charts: []chartDescription{
+			{
+				Title:   "L0 sub-level rebalancing",
+				Metrics: []string{"rebalancing.l0_sublevels_histogram"},
+			},
 		},
 	},
 	{
@@ -2268,6 +2287,13 @@ var charts = []sectionDescription{
 					"sql.conn.latency",
 				},
 				AxisLabel: "Latency",
+			},
+			{
+				Title: "Connection Failures",
+				Metrics: []string{
+					"sql.conn.failures",
+				},
+				AxisLabel: "Failures",
 			},
 			{
 				Title: "Open Transactions",

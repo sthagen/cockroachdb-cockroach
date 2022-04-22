@@ -847,7 +847,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 	mutationID := descpb.InvalidMutationID
 	if addedMutations {
-		mutationID = n.tableDesc.ClusterVersion.NextMutationID
+		mutationID = n.tableDesc.ClusterVersion().NextMutationID
 	}
 	if err := params.p.writeSchemaChange(
 		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
@@ -1829,7 +1829,7 @@ func handleTTLStorageParamChange(
 			if err != nil {
 				return err
 			}
-			if err := s.SetSchedule(rowLevelTTLSchedule(after)); err != nil {
+			if err := s.SetSchedule(after.DeletionCronOrDefault()); err != nil {
 				return err
 			}
 			if err := s.Update(params.ctx, params.ExecCfg().InternalExecutor, params.p.txn); err != nil {

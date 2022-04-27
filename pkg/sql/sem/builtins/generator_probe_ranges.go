@@ -23,7 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -71,7 +73,7 @@ var probeRangesGenerators = map[string]builtinDefinition{
 				Read probes are cheaper than write probes. If write probes have already ran, it's not necessary to also run a read probe.
 				A write probe will effectively probe reads as well.
 			`,
-			tree.VolatilityVolatile,
+			volatility.Volatile,
 		),
 	),
 }
@@ -121,7 +123,7 @@ type probeRangeGenerator struct {
 	ranges []kv.KeyValue
 }
 
-func makeProbeRangeGenerator(ctx *tree.EvalContext, args tree.Datums) (tree.ValueGenerator, error) {
+func makeProbeRangeGenerator(ctx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
 	// The user must be an admin to use this builtin.
 	isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
 	if err != nil {

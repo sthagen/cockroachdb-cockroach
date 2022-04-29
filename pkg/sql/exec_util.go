@@ -60,6 +60,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -195,7 +196,10 @@ var allowCrossDatabaseSeqReferences = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
-const secondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_for_secondary_tenant.enabled"
+// SecondaryTenantsZoneConfigsEnabledSettingName controls if secondary tenants
+// are allowed to set zone configurations. It has no effect for the system
+// tenant.
+const SecondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_for_secondary_tenant.enabled"
 
 // secondaryTenantZoneConfigsEnabled controls if secondary tenants are allowed
 // to set zone configurations. It has no effect for the system tenant.
@@ -203,7 +207,7 @@ const secondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_fo
 // This setting has no effect on zone configurations that have already been set.
 var secondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 	settings.TenantReadOnly,
-	secondaryTenantsZoneConfigsEnabledSettingName,
+	SecondaryTenantsZoneConfigsEnabledSettingName,
 	"allow secondary tenants to set zone configurations; does not affect the system tenant",
 	false,
 )
@@ -1309,6 +1313,13 @@ type ExecutorConfig struct {
 	// SessionData and other ExtraTxnState.
 	// This is currently only for builtin functions where we need to execute sql.
 	InternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
+
+	// ConsistencyChecker is to generate the results in calls to
+	// crdb_internal.check_consistency.
+	ConsistencyChecker eval.ConsistencyCheckRunner
+
+	// RangeProber is used in calls to crdb_internal.probe_ranges.
+	RangeProber eval.RangeProber
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1931,7 +1942,7 @@ type SessionArgs struct {
 // Use register() and deregister() to modify this registry.
 type SessionRegistry struct {
 	syncutil.Mutex
-	sessions            map[ClusterWideID]registrySession
+	sessions            map[clusterunique.ID]registrySession
 	sessionsByCancelKey map[pgwirecancel.BackendKeyData]registrySession
 }
 
@@ -1939,13 +1950,13 @@ type SessionRegistry struct {
 // of sessions.
 func NewSessionRegistry() *SessionRegistry {
 	return &SessionRegistry{
-		sessions:            make(map[ClusterWideID]registrySession),
+		sessions:            make(map[clusterunique.ID]registrySession),
 		sessionsByCancelKey: make(map[pgwirecancel.BackendKeyData]registrySession),
 	}
 }
 
 func (r *SessionRegistry) register(
-	id ClusterWideID, queryCancelKey pgwirecancel.BackendKeyData, s registrySession,
+	id clusterunique.ID, queryCancelKey pgwirecancel.BackendKeyData, s registrySession,
 ) {
 	r.Lock()
 	defer r.Unlock()
@@ -1953,7 +1964,9 @@ func (r *SessionRegistry) register(
 	r.sessionsByCancelKey[queryCancelKey] = s
 }
 
-func (r *SessionRegistry) deregister(id ClusterWideID, queryCancelKey pgwirecancel.BackendKeyData) {
+func (r *SessionRegistry) deregister(
+	id clusterunique.ID, queryCancelKey pgwirecancel.BackendKeyData,
+) {
 	r.Lock()
 	defer r.Unlock()
 	delete(r.sessions, id)
@@ -1962,7 +1975,7 @@ func (r *SessionRegistry) deregister(id ClusterWideID, queryCancelKey pgwirecanc
 
 type registrySession interface {
 	user() security.SQLUsername
-	cancelQuery(queryID ClusterWideID) bool
+	cancelQuery(queryID clusterunique.ID) bool
 	cancelCurrentQueries() bool
 	cancelSession()
 	// serialize serializes a Session into a serverpb.Session
@@ -1973,7 +1986,7 @@ type registrySession interface {
 // CancelQuery looks up the associated query in the session registry and cancels
 // it. The caller is responsible for all permission checks.
 func (r *SessionRegistry) CancelQuery(queryIDStr string) (bool, error) {
-	queryID, err := StringToClusterWideID(queryIDStr)
+	queryID, err := clusterunique.IDFromString(queryIDStr)
 	if err != nil {
 		return false, errors.Wrapf(err, "query ID %s malformed", queryID)
 	}
@@ -2014,7 +2027,7 @@ func (r *SessionRegistry) CancelSession(
 	if len(sessionIDBytes) != 16 {
 		return nil, errors.Errorf("invalid non-16-byte UUID %v", sessionIDBytes)
 	}
-	sessionID := BytesToClusterWideID(sessionIDBytes)
+	sessionID := clusterunique.IDFromBytes(sessionIDBytes)
 
 	r.Lock()
 	defer r.Unlock()

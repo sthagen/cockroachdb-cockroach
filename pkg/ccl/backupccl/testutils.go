@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/cockroachdb/errors"
@@ -504,25 +506,63 @@ func thresholdFromTrace(t *testing.T, traceString string) hlc.Timestamp {
 	return thresh
 }
 
-// runGCAndCheckTrace manually enqueues the replica corresponding to
-// `databaseName.tableName`, and runs `checkGCTrace` until it succeeds.
-func runGCAndCheckTrace(
+func setAndWaitForTenantReadOnlyClusterSetting(
+	t *testing.T,
+	setting string,
+	systemTenantRunner *sqlutils.SQLRunner,
+	tenantRunner *sqlutils.SQLRunner,
+	tenantID roachpb.TenantID,
+	val string,
+) {
+	t.Helper()
+	systemTenantRunner.Exec(
+		t,
+		fmt.Sprintf(
+			"ALTER TENANT $1 SET CLUSTER	SETTING %s = '%s'",
+			setting,
+			val,
+		),
+		tenantID.ToUint64(),
+	)
+
+	testutils.SucceedsSoon(t, func() error {
+		var currentVal string
+		tenantRunner.QueryRow(t,
+			fmt.Sprintf(
+				"SHOW CLUSTER SETTING %s", setting,
+			),
+		).Scan(&currentVal)
+
+		if currentVal != val {
+			return errors.Newf("waiting for cluster setting to be set to %q", val)
+		}
+		return nil
+	})
+}
+
+// runGCAndCheckTrace manually enqueues the replica with
+// start_pretty=startPretty and runs `checkGCTrace` until it succeeds.
+func runGCAndCheckTraceForSecondaryTenant(
 	ctx context.Context,
 	t *testing.T,
 	tc *testcluster.TestCluster,
-	conn *gosql.DB,
+	runner *sqlutils.SQLRunner,
 	skipShouldQueue bool,
-	tableName, databaseName string,
+	startPretty string,
 	checkGCTrace func(traceStr string) error,
 ) {
 	t.Helper()
 	var startKey roachpb.Key
-	err := conn.QueryRow("SELECT start_key"+
-		" FROM crdb_internal.ranges_no_leases"+
-		" WHERE table_name = $1"+
-		" AND database_name = $2"+
-		" ORDER BY start_key ASC", tableName, databaseName).Scan(&startKey)
-	require.NoError(t, err)
+	testutils.SucceedsSoon(t, func() error {
+		err := runner.DB.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT start_key FROM crdb_internal.ranges_no_leases
+WHERE start_pretty LIKE '%s' ORDER BY start_key ASC`, startPretty)).Scan(&startKey)
+		if err != nil {
+			return errors.Wrap(err, "failed to query start_key")
+		}
+		return nil
+	})
+
 	r := tc.LookupRangeOrFatal(t, startKey)
 	l, _, err := tc.FindRangeLease(r, nil)
 	require.NoError(t, err)
@@ -532,5 +572,75 @@ func runGCAndCheckTrace(
 		trace, _, err := s.ManuallyEnqueue(ctx, "mvccGC", repl, skipShouldQueue)
 		require.NoError(t, err)
 		return checkGCTrace(trace.String())
+	})
+}
+
+// runGCAndCheckTraceOnCluster manually enqueues the replica corresponding to
+// `databaseName.tableName` in the mvccGC queue, and runs `checkGCTrace` until
+// it succeeds.
+func runGCAndCheckTraceOnCluster(
+	ctx context.Context,
+	t *testing.T,
+	tc *testcluster.TestCluster,
+	runner *sqlutils.SQLRunner,
+	skipShouldQueue bool,
+	databaseName, tableName string,
+	checkGCTrace func(traceStr string) error,
+) {
+	t.Helper()
+	var startKey roachpb.Key
+	testutils.SucceedsSoon(t, func() error {
+		err := runner.DB.QueryRowContext(ctx, `
+SELECT start_key FROM crdb_internal.ranges_no_leases
+WHERE table_name = $1 AND database_name = $2
+ORDER BY start_key ASC`, tableName, databaseName).Scan(&startKey)
+		if err != nil {
+			return errors.Wrap(err, "failed to query start_key ")
+		}
+		return nil
+	})
+	r := tc.LookupRangeOrFatal(t, startKey)
+	l, _, err := tc.FindRangeLease(r, nil)
+	require.NoError(t, err)
+	lhServer := tc.ServerConn(int(l.Replica.NodeID) - 1)
+	lhSQLDB := sqlutils.MakeSQLRunner(lhServer)
+	testutils.SucceedsSoon(t, func() error {
+		trace := runGCWithTrace(t, lhSQLDB, skipShouldQueue, databaseName, tableName)
+		return checkGCTrace(trace)
+	})
+}
+
+func runGCWithTrace(
+	t *testing.T, sqlDB *sqlutils.SQLRunner, skipShouldQueue bool, databaseName, tableName string,
+) string {
+	// Grab the range ID of the table and manually enqueue it in the mvccGC queue.
+	var rangeID int
+	sqlDB.QueryRow(t, fmt.Sprintf(`SELECT range_id FROM [SHOW RANGES FROM TABLE %s.%s]`,
+		databaseName, tableName)).Scan(&rangeID)
+
+	var trace string
+	sqlDB.QueryRow(t, fmt.Sprintf(
+		`SELECT crdb_internal.kv_enqueue_replica(%d, 'mvccGC', %t, true)`, rangeID, skipShouldQueue)).Scan(&trace)
+	return trace
+}
+
+// upsertUntilBackpressure upserts data into a table until we see a
+// `backpressure` error. This is usually used to build up a long chain of
+// garbage revisions to make a range eligible for GC.
+func upsertUntilBackpressure(
+	t *testing.T, rRand *rand.Rand, conn *gosql.DB, database, table string,
+) {
+	t.Helper()
+	testutils.SucceedsSoon(t, func() error {
+		_, err := conn.Exec(fmt.Sprintf("UPSERT INTO %s.%s VALUES (1, $1)", database, table),
+			randutil.RandBytes(rRand, 1<<15))
+		if err == nil {
+			return errors.New("expected `backpressure` error")
+		}
+
+		if !testutils.IsError(err, "backpressure") {
+			return errors.NewAssertionErrorWithWrappedErrf(err, "expected `backpressure` error")
+		}
+		return nil
 	})
 }

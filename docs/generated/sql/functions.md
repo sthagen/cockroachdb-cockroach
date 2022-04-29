@@ -2203,6 +2203,10 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 </span></td></tr>
 <tr><td><a name="st_makebox2d"></a><code>st_makebox2d(geometry_a: geometry, geometry_b: geometry) &rarr; box2d</code></td><td><span class="funcdesc"><p>Creates a box2d from two points. Errors if arguments are not two non-empty points.</p>
 </span></td></tr>
+<tr><td><a name="st_makeenvelope"></a><code>st_makeenvelope(xmin: <a href="float.html">float</a>, ymin: <a href="float.html">float</a>, xmax: <a href="float.html">float</a>, ymax: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Creates a rectangular Polygon from the minimum and maximum values for X and Y with SRID 0.</p>
+</span></td></tr>
+<tr><td><a name="st_makeenvelope"></a><code>st_makeenvelope(xmin: <a href="float.html">float</a>, ymin: <a href="float.html">float</a>, xmax: <a href="float.html">float</a>, ymax: <a href="float.html">float</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Creates a rectangular Polygon from the minimum and maximum values for X and Y with the given SRID.</p>
+</span></td></tr>
 <tr><td><a name="st_makepoint"></a><code>st_makepoint(x: <a href="float.html">float</a>, y: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Point with the given X and Y coordinates.</p>
 </span></td></tr>
 <tr><td><a name="st_makepoint"></a><code>st_makepoint(x: <a href="float.html">float</a>, y: <a href="float.html">float</a>, z: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a new Point with the given X, Y, and Z coordinates.</p>
@@ -2570,7 +2574,23 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="st_x"></a><code>st_x(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the X coordinate of a geometry if it is a Point.</p>
 </span></td></tr>
+<tr><td><a name="st_xmax"></a><code>st_xmax(box2d: box2d) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the maximum X ordinate of a box2d.</p>
+</span></td></tr>
+<tr><td><a name="st_xmax"></a><code>st_xmax(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the maximum X ordinate of a geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_xmin"></a><code>st_xmin(box2d: box2d) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the minimum X ordinate of a box2d.</p>
+</span></td></tr>
+<tr><td><a name="st_xmin"></a><code>st_xmin(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the minimum X ordinate of a geometry.</p>
+</span></td></tr>
 <tr><td><a name="st_y"></a><code>st_y(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Y coordinate of a geometry if it is a Point.</p>
+</span></td></tr>
+<tr><td><a name="st_ymax"></a><code>st_ymax(box2d: box2d) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the maximum Y ordinate of a box2d.</p>
+</span></td></tr>
+<tr><td><a name="st_ymax"></a><code>st_ymax(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the maximum Y ordinate of a geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_ymin"></a><code>st_ymin(box2d: box2d) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the minimum Y ordinate of a box2d.</p>
+</span></td></tr>
+<tr><td><a name="st_ymin"></a><code>st_ymin(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the minimum Y ordinate of a geometry.</p>
 </span></td></tr>
 <tr><td><a name="st_z"></a><code>st_z(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Z coordinate of a geometry if it is a Point.</p>
 </span></td></tr>

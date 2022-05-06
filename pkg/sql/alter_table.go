@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -718,6 +718,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableSetStorageParams:
+			oldTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
 			var ttlBefore *catpb.RowLevelTTL
 			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
 				ttlBefore = protoutil.Clone(ttl).(*catpb.RowLevelTTL)
@@ -743,7 +744,15 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
+			newTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
+			if err := checkDisallowedAutoStatsSettingChange(
+				params, oldTableHasAutoStatsSettings, newTableHasAutoStatsSettings,
+			); err != nil {
+				return err
+			}
+
 		case *tree.AlterTableResetStorageParams:
+			oldTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
 			var ttlBefore *catpb.RowLevelTTL
 			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
 				ttlBefore = protoutil.Clone(ttl).(*catpb.RowLevelTTL)
@@ -764,6 +773,13 @@ func (n *alterTableNode) startExec(params runParams) error {
 				n.tableDesc,
 				ttlBefore,
 				n.tableDesc.GetRowLevelTTL(),
+			); err != nil {
+				return err
+			}
+
+			newTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
+			if err := checkDisallowedAutoStatsSettingChange(
+				params, oldTableHasAutoStatsSettings, newTableHasAutoStatsSettings,
 			); err != nil {
 				return err
 			}
@@ -1354,17 +1370,17 @@ func insertJSONStatistic(
 }
 
 func (p *planner) removeColumnComment(
-	ctx context.Context, tableID descpb.ID, columnID descpb.ColumnID,
+	ctx context.Context, tableID descpb.ID, pgAttributeNum descpb.PGAttributeNum,
 ) error {
 	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 		ctx,
 		"delete-column-comment",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
 		keys.ColumnCommentType,
 		tableID,
-		columnID)
+		pgAttributeNum)
 
 	return err
 }
@@ -1767,7 +1783,7 @@ func dropColumnImpl(
 		}
 	}
 
-	if err := params.p.removeColumnComment(params.ctx, tableDesc.ID, colToDrop.GetID()); err != nil {
+	if err := params.p.removeColumnComment(params.ctx, tableDesc.ID, colToDrop.GetPGAttributeNum()); err != nil {
 		return nil, err
 	}
 
@@ -1938,6 +1954,21 @@ func handleTTLStorageParamChange(
 			&descpb.ModifyRowLevelTTL{RowLevelTTL: before},
 			descpb.DescriptorMutation_DROP,
 		)
+	}
+
+	return nil
+}
+
+func checkDisallowedAutoStatsSettingChange(
+	params runParams, oldTableHasAutoStatsSettings, newTableHasAutoStatsSettings bool,
+) error {
+	if !oldTableHasAutoStatsSettings && !newTableHasAutoStatsSettings {
+		// Do not have to do anything here.
+		return nil
+	}
+
+	if err := checkAutoStatsTableSettingsEnabledForCluster(params.ctx, params.p.ExecCfg().Settings); err != nil {
+		return err
 	}
 
 	return nil

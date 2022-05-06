@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -153,7 +153,7 @@ func ReadBackupManifestFromURI(
 	ctx context.Context,
 	mem *mon.BoundAccount,
 	uri string,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
 	encryption *jobspb.BackupEncryptionOptions,
 ) (BackupManifest, int64, error) {
@@ -606,7 +606,7 @@ func loadBackupManifests(
 	ctx context.Context,
 	mem *mon.BoundAccount,
 	uris []string,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
 	encryption *jobspb.BackupEncryptionOptions,
 ) ([]BackupManifest, int64, error) {
@@ -658,6 +658,14 @@ func getLocalityInfo(
 		}
 		found := false
 		for i, store := range stores {
+			// Iterate through the available stores in case the user moved a locality
+			// partition, guarding against stale backup manifest info. In addition,
+			// two locality aware URIs may end up writing to the same location (e.g.
+			// in testing, 'nodelocal://0/foo?COCKROACH_LOCALITY=default' and
+			// 'nodelocal://1/foo?COCKROACH_LOCALITY=dc=d1' will write to the same
+			// tempdir), implying that it is possible for files that the manifest
+			// claims are stored in two different localities, are actually stored in
+			// the same place.
 			if desc, _, err := readBackupPartitionDescriptor(ctx, nil /*mem*/, store, filename, encryption); err == nil {
 				if desc.BackupID != mainBackupManifest.ID {
 					return info, errors.Errorf(
@@ -724,7 +732,7 @@ func resolveBackupManifestsExplicitIncrementals(
 	from [][]string,
 	endTime hlc.Timestamp,
 	encryption *jobspb.BackupEncryptionOptions,
-	user security.SQLUsername,
+	user username.SQLUsername,
 ) (
 	defaultURIs []string,
 	// mainBackupManifests contains the manifest located at each defaultURI in the backup chain.
@@ -804,7 +812,7 @@ func resolveBackupManifests(
 	fullyResolvedIncrementalsDirectory []string,
 	endTime hlc.Timestamp,
 	encryption *jobspb.BackupEncryptionOptions,
-	user security.SQLUsername,
+	user username.SQLUsername,
 ) (
 	defaultURIs []string,
 	// mainBackupManifests contains the manifest located at each defaultURI in the backup chain.

@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Constraint is used to constrain a lookup join. There are two types of
@@ -59,6 +58,11 @@ type Constraint struct {
 	// LookupExpr that are used to aid selectivity estimation. See
 	// memo.LookupJoinPrivate.ConstFilters.
 	ConstFilters memo.FiltersExpr
+
+	// RemainingFilters contains explicit ON filters that are not represented by
+	// KeyCols or LookupExpr. These filters must be included as ON filters in
+	// the lookup join.
+	RemainingFilters memo.FiltersExpr
 }
 
 // IsUnconstrained returns true if the constraint does not constrain a lookup
@@ -92,15 +96,24 @@ type ConstraintBuilder struct {
 
 // Init initializes a ConstraintBuilder. Once initialized, a ConstraintBuilder
 // can be reused to build lookup join constraints for all indexes in the given
-// table, as long as the join input and ON condition do not change.
+// table, as long as the join input and ON condition do not change. If no lookup
+// join can be built from the given filters and left/right columns, then
+// ok=false is returned.
 func (b *ConstraintBuilder) Init(
 	f *norm.Factory,
 	md *opt.Metadata,
 	evalCtx *eval.Context,
 	table opt.TableID,
 	leftCols, rightCols opt.ColSet,
-	leftEq, rightEq opt.ColList,
-) {
+	onFilters memo.FiltersExpr,
+) (ok bool) {
+	leftEq, rightEq := memo.ExtractJoinEqualityColumns(leftCols, rightCols, onFilters)
+	if len(leftEq) == 0 {
+		// Exploring a lookup join is only beneficial if there is at least one
+		// pair of equality columns.
+		return false
+	}
+
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*b = ConstraintBuilder{
@@ -114,6 +127,7 @@ func (b *ConstraintBuilder) Init(
 		rightEq:    rightEq,
 		rightEqSet: rightEq.ToSet(),
 	}
+	return true
 }
 
 // Build returns a Constraint that constrains a lookup join on the given index.
@@ -135,7 +149,7 @@ func (b *ConstraintBuilder) Build(
 	firstIdxCol := b.table.IndexColumnID(index, 0)
 	if _, ok := b.rightEq.Find(firstIdxCol); !ok {
 		if _, ok := b.findComputedColJoinEquality(b.table, firstIdxCol, b.rightEqSet); !ok {
-			if _, _, ok := b.findJoinFilterConstants(allFilters, firstIdxCol); !ok {
+			if _, _, ok := FindJoinFilterConstants(allFilters, firstIdxCol, b.evalCtx); !ok {
 				return Constraint{}
 			}
 		}
@@ -192,7 +206,7 @@ func (b *ConstraintBuilder) Build(
 		// constant values. We cannot use a NULL value because the lookup
 		// join implements logic equivalent to simple equality between
 		// columns (where NULL never equals anything).
-		foundVals, allIdx, ok := b.findJoinFilterConstants(allFilters, idxCol)
+		foundVals, allIdx, ok := FindJoinFilterConstants(allFilters, idxCol, b.evalCtx)
 		if ok && len(foundVals) == 1 {
 			// If a single constant value was found, project it in the input
 			// and use it as an equality column.
@@ -231,6 +245,7 @@ func (b *ConstraintBuilder) Build(
 		break
 	}
 
+	var c Constraint
 	if shouldBuildMultiSpanLookupJoin {
 		// Some of the index columns were constrained to multiple constant
 		// values or a range expression, so we cannot build a lookup join
@@ -261,21 +276,37 @@ func (b *ConstraintBuilder) Build(
 
 		// A multi-span lookup join with a lookup expression has no key columns
 		// and requires no projections on the input.
-		return Constraint{
+		c = Constraint{
 			RightSideCols: rightSideCols,
 			LookupExpr:    lookupExpr,
 			ConstFilters:  constFilters,
 		}
+	} else {
+		// If we did not build a lookup expression, use the key columns we
+		// found, if any.
+		c = Constraint{
+			KeyCols:          keyCols,
+			RightSideCols:    rightSideCols,
+			InputProjections: inputProjections,
+			ConstFilters:     constFilters,
+		}
 	}
 
-	// If we did not build a lookup expression, return the key columns we found,
-	// if any.
-	return Constraint{
-		KeyCols:          keyCols,
-		RightSideCols:    rightSideCols,
-		InputProjections: inputProjections,
-		ConstFilters:     constFilters,
+	// We have not found a valid constraint, so there is no need to calculate
+	// the remaining filters.
+	if c.IsUnconstrained() {
+		return c
 	}
+
+	// Reduce the remaining filters.
+	c.RemainingFilters = onFilters
+	if len(c.KeyCols) > 0 {
+		c.RemainingFilters = memo.ExtractRemainingJoinFilters(c.RemainingFilters, keyCols, rightSideCols)
+	}
+	c.RemainingFilters = c.RemainingFilters.Difference(lookupExpr)
+	c.RemainingFilters = c.RemainingFilters.Difference(constFilters)
+
+	return c
 }
 
 // findComputedColJoinEquality returns the computed column expression of col and
@@ -380,7 +411,7 @@ func (b *ConstraintBuilder) findFiltersForIndexLookup(
 		// constant values. We cannot use a NULL value because the lookup
 		// join implements logic equivalent to simple equality between
 		// columns (where NULL never equals anything).
-		values, allIdx, foundConstFilter := b.findJoinFilterConstants(filters, idxCol)
+		values, allIdx, foundConstFilter := FindJoinFilterConstants(filters, idxCol, b.evalCtx)
 		if !foundConstFilter {
 			// If there's no const filters look for an inequality range.
 			allIdx, foundRange = b.findJoinFilterRange(filters, idxCol)
@@ -399,7 +430,7 @@ func (b *ConstraintBuilder) findFiltersForIndexLookup(
 		if foundConstFilter {
 			constFilter := filters[allIdx]
 			if !isCanonicalFilter(constFilter) {
-				constFilter = b.makeConstFilter(idxCol, values)
+				constFilter = b.f.ConstructConstFilter(idxCol, values)
 			}
 			constFilters = append(constFilters, constFilter)
 		}
@@ -418,66 +449,6 @@ func (b *ConstraintBuilder) findFiltersForIndexLookup(
 	}
 
 	return eqFilters, constFilters, rightSideCols
-}
-
-// makeConstFilter builds a filter that constrains the given column to the given
-// set of constant values. This is performed by either constructing an equality
-// expression or an IN expression.
-func (b *ConstraintBuilder) makeConstFilter(col opt.ColumnID, values tree.Datums) memo.FiltersItem {
-	if len(values) == 1 {
-		return b.f.ConstructFiltersItem(b.f.ConstructEq(
-			b.f.ConstructVariable(col),
-			b.f.ConstructConstVal(values[0], values[0].ResolvedType()),
-		))
-	}
-	elems := make(memo.ScalarListExpr, len(values))
-	elemTypes := make([]*types.T, len(values))
-	for i := range values {
-		typ := values[i].ResolvedType()
-		elems[i] = b.f.ConstructConstVal(values[i], typ)
-		elemTypes[i] = typ
-	}
-	return b.f.ConstructFiltersItem(b.f.ConstructIn(
-		b.f.ConstructVariable(col),
-		b.f.ConstructTuple(elems, types.MakeTuple(elemTypes)),
-	))
-}
-
-// findJoinFilterConstants tries to find a filter that is exactly equivalent to
-// constraining the given column to a constant value or a set of constant
-// values. If successful, the constant values and the index of the constraining
-// FiltersItem are returned. If multiple filters match, the one that minimizes
-// the number of returned values is chosen. Note that the returned constant
-// values do not contain NULL.
-func (b *ConstraintBuilder) findJoinFilterConstants(
-	filters memo.FiltersExpr, col opt.ColumnID,
-) (values tree.Datums, filterIdx int, ok bool) {
-	var bestValues tree.Datums
-	var bestFilterIdx int
-	for filterIdx := range filters {
-		props := filters[filterIdx].ScalarProps()
-		if props.TightConstraints {
-			constCol, constVals, ok := props.Constraints.HasSingleColumnConstValues(b.evalCtx)
-			if !ok || constCol != col {
-				continue
-			}
-			hasNull := false
-			for i := range constVals {
-				if constVals[i] == tree.DNull {
-					hasNull = true
-					break
-				}
-			}
-			if !hasNull && (bestValues == nil || len(bestValues) > len(constVals)) {
-				bestValues = constVals
-				bestFilterIdx = filterIdx
-			}
-		}
-	}
-	if bestValues == nil {
-		return nil, -1, false
-	}
-	return bestValues, bestFilterIdx, true
 }
 
 // findJoinFilterRange tries to find an inequality range for this column.

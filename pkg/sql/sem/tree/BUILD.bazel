@@ -1,5 +1,6 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "tree",
@@ -53,7 +54,6 @@ go_library(
         "function_name.go",
         "grant.go",
         "hide_constants.go",
-        "hlc.go",
         "import.go",
         "indexed_vars.go",
         "insert.go",
@@ -119,10 +119,7 @@ go_library(
     deps = [
         "//pkg/geo",
         "//pkg/geo/geopb",
-        "//pkg/roachpb",
-        "//pkg/security",
         "//pkg/server/telemetry",
-        "//pkg/sql/catalog/catconstants",
         "//pkg/sql/lex",
         "//pkg/sql/lexbase",
         "//pkg/sql/pgwire/pgcode",
@@ -130,12 +127,12 @@ go_library(
         "//pkg/sql/privilege",
         "//pkg/sql/roleoption",
         "//pkg/sql/sem/cast",
+        "//pkg/sql/sem/catconstants",
         "//pkg/sql/sem/catid",
         "//pkg/sql/sem/tree/treebin",
         "//pkg/sql/sem/tree/treecmp",
         "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/sem/volatility",
-        "//pkg/sql/sessiondata",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/sqltelemetry",
         "//pkg/sql/types",
@@ -143,9 +140,10 @@ go_library(
         "//pkg/util/bitarray",
         "//pkg/util/cache",
         "//pkg/util/duration",
+        "//pkg/util/encoding",
         "//pkg/util/errorutil/unimplemented",
-        "//pkg/util/hlc",
         "//pkg/util/ipaddr",
+        "//pkg/util/iterutil",
         "//pkg/util/json",
         "//pkg/util/pretty",
         "//pkg/util/stringencoding",
@@ -180,7 +178,6 @@ go_test(
         "expr_test.go",
         "format_test.go",
         "function_name_test.go",
-        "hlc_test.go",
         "indexed_vars_test.go",
         "interval_test.go",
         "main_test.go",
@@ -192,10 +189,8 @@ go_test(
         "parse_tuple_test.go",
         "placeholders_test.go",
         "pretty_test.go",
-        "role_spec_test.go",
         "table_name_test.go",
         "time_test.go",
-        "timeconv_test.go",
         "type_check_internal_test.go",
         "type_check_test.go",
         "type_name_test.go",
@@ -206,16 +201,13 @@ go_test(
     deps = [
         "//pkg/build/bazel",
         "//pkg/internal/rsg",
-        "//pkg/kv",
-        "//pkg/roachpb",
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/settings/cluster",
         "//pkg/sql/parser",
-        "//pkg/sql/pgwire/pgcode",
-        "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/randgen",
         "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/cast",
         "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/normalize",
@@ -228,13 +220,11 @@ go_test(
         "//pkg/testutils",
         "//pkg/testutils/sqlutils",
         "//pkg/util/duration",
-        "//pkg/util/hlc",
         "//pkg/util/json",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/pretty",
         "//pkg/util/randutil",
-        "//pkg/util/stop",
         "//pkg/util/timeofday",
         "//pkg/util/timetz",
         "//pkg/util/timeutil",
@@ -282,5 +272,16 @@ genrule(
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",
+    ],
+)
+
+disallowed_imports_test(
+    "tree",
+    disallowed_list = [
+        "//pkg/sql/sessiondata",
+        "//pkg/security",
+    ],
+    disallowed_prefixes = [
+        "pkg/sql/catalog",
     ],
 )

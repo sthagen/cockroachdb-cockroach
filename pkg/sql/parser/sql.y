@@ -31,7 +31,7 @@ import (
 
     "github.com/cockroachdb/cockroach/pkg/geo/geopb"
     "github.com/cockroachdb/cockroach/pkg/roachpb"
-    "github.com/cockroachdb/cockroach/pkg/security"
+    "github.com/cockroachdb/cockroach/pkg/security/username"
     "github.com/cockroachdb/cockroach/pkg/sql/lexbase"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
     "github.com/cockroachdb/cockroach/pkg/sql/roleoption"
@@ -275,14 +275,14 @@ func (u *sqlSymUnion) roleSpec() tree.RoleSpec {
 func (u *sqlSymUnion) roleSpecList() tree.RoleSpecList {
     return u.val.(tree.RoleSpecList)
 }
-func (u *sqlSymUnion) user() security.SQLUsername {
-    return u.val.(security.SQLUsername)
+func (u *sqlSymUnion) user() username.SQLUsername {
+    return u.val.(username.SQLUsername)
 }
-func (u *sqlSymUnion) userPtr() *security.SQLUsername {
-    return u.val.(*security.SQLUsername)
+func (u *sqlSymUnion) userPtr() *username.SQLUsername {
+    return u.val.(*username.SQLUsername)
 }
-func (u *sqlSymUnion) users() []security.SQLUsername {
-    return u.val.([]security.SQLUsername)
+func (u *sqlSymUnion) users() []username.SQLUsername {
+    return u.val.([]username.SQLUsername)
 }
 func (u *sqlSymUnion) newTableIndexName() *tree.TableIndexName {
     tn := u.val.(tree.TableIndexName)
@@ -3213,7 +3213,7 @@ opt_as_tenant_clause:
     if tenID == 0 {
       return setErr(sqllex, errors.New("invalid tenant ID"))
     }
-    $$.val = tree.TenantID{Specified: true, TenantID: roachpb.MakeTenantID(tenID)}
+    $$.val = tree.TenantID{Specified: true, ID: tenID}
   }
 | AS TENANT IDENT
   {
@@ -6835,7 +6835,7 @@ targets:
     if tenID == 0 {
       return setErr(sqllex, errors.New("invalid tenant ID"))
     }
-    $$.val = tree.TargetList{TenantID: tree.TenantID{Specified: true, TenantID: roachpb.MakeTenantID(tenID)}}
+    $$.val = tree.TargetList{TenantID: tree.TenantID{Specified: true, ID: tenID}}
   }
 | TENANT IDENT
   {

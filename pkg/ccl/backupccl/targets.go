@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -370,11 +370,11 @@ func selectTargets(
 		for _, tenant := range lastBackupManifest.GetTenants() {
 			// TODO(dt): for now it is zero-or-one but when that changes, we should
 			// either keep it sorted or build a set here.
-			if tenant.ID == targets.TenantID.ToUint64() {
+			if tenant.ID == targets.TenantID.ID {
 				return nil, nil, []descpb.TenantInfoWithUsage{tenant}, nil
 			}
 		}
-		return nil, nil, nil, errors.Errorf("tenant %d not in backup", targets.TenantID.ToUint64())
+		return nil, nil, nil, errors.Errorf("tenant %d not in backup", targets.TenantID.ID)
 	}
 
 	matched, err := backupresolver.DescriptorsMatchingTargets(ctx,
@@ -417,7 +417,7 @@ func MakeBackupTableEntry(
 	fullyQualifiedTableName string,
 	backupManifests []BackupManifest,
 	endTime hlc.Timestamp,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	backupCodec keys.SQLCodec,
 ) (BackupTableEntry, error) {
 	var descName []string

@@ -13,6 +13,7 @@ package sql
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -35,13 +36,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -58,11 +58,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/outliers"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
@@ -138,6 +140,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalLocalTransactionsTableID:           crdbInternalLocalTxnsTable,
 		catconstants.CrdbInternalLocalSessionsTableID:               crdbInternalLocalSessionsTable,
 		catconstants.CrdbInternalLocalMetricsTableID:                crdbInternalLocalMetricsTable,
+		catconstants.CrdbInternalNodeExecutionOutliersTableID:       crdbInternalNodeExecutionOutliersTable,
 		catconstants.CrdbInternalNodeStmtStatsTableID:               crdbInternalNodeStmtStatsTable,
 		catconstants.CrdbInternalNodeTxnStatsTableID:                crdbInternalNodeTxnStatsTable,
 		catconstants.CrdbInternalPartitionsTableID:                  crdbInternalPartitionsTable,
@@ -221,7 +224,7 @@ CREATE TABLE crdb_internal.node_runtime_info (
 		node := p.ExecCfg().NodeInfo
 
 		nodeID, _ := node.NodeID.OptionalNodeID() // zero if not available
-		dbURL, err := node.PGURL(url.User(security.RootUser))
+		dbURL, err := node.PGURL(url.User(username.RootUser))
 		if err != nil {
 			return err
 		}
@@ -606,7 +609,7 @@ CREATE TABLE crdb_internal.table_row_statistics (
             GROUP BY s."tableID"`, statsAsOfTimeClusterMode.String(&p.ExecCfg().Settings.SV))
 		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBufferedEx(
 			ctx, "crdb-internal-statistics-table", nil,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			query)
 		if err != nil {
 			// This query is likely to cause errors due to SHOW TABLES being run less
@@ -808,7 +811,7 @@ CREATE TABLE crdb_internal.jobs (
 
 		it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 			ctx, "crdb-internal-jobs-table", p.txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			queryWithBackoff, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay())
 		if err != nil {
 			return nil, nil, err
@@ -872,7 +875,7 @@ CREATE TABLE crdb_internal.jobs (
 					instanceID = tree.NewDInt(tree.DInt(p.extendedEvalCtx.ExecCfg.JobRegistry.ID()))
 				}
 
-				var jobType, description, statement, username, descriptorIDs, started, runningStatus,
+				var jobType, description, statement, user, descriptorIDs, started, runningStatus,
 					finished, modified, fractionCompleted, highWaterTimestamp, errorStr, coordinatorID,
 					traceID, executionErrors, executionEvents = tree.DNull, tree.DNull, tree.DNull,
 					tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
@@ -884,7 +887,7 @@ CREATE TABLE crdb_internal.jobs (
 				// We filter out masked rows before we allocate all the
 				// datums. Needless allocate when not necessary.
 				ownedByAdmin := false
-				var sqlUsername security.SQLUsername
+				var sqlUsername username.SQLUsername
 				if payload != nil {
 					sqlUsername = payload.UsernameProto.Decode()
 					ownedByAdmin, err = p.UserHasAdminRole(ctx, sqlUsername)
@@ -918,7 +921,7 @@ CREATE TABLE crdb_internal.jobs (
 					jobType = tree.NewDString(payload.Type().String())
 					description = tree.NewDString(payload.Description)
 					statement = tree.NewDString(strings.Join(payload.Statement, "; "))
-					username = tree.NewDString(sqlUsername.Normalized())
+					user = tree.NewDString(sqlUsername.Normalized())
 					descriptorIDsArr := tree.NewDArray(types.Int)
 					for _, descID := range payload.DescriptorIDs {
 						if err := descriptorIDsArr.Append(tree.NewDInt(tree.DInt(int(descID)))); err != nil {
@@ -996,7 +999,7 @@ CREATE TABLE crdb_internal.jobs (
 					jobType,
 					description,
 					statement,
-					username,
+					user,
 					descriptorIDs,
 					status,
 					runningStatus,
@@ -4661,7 +4664,7 @@ func collectMarshaledJobMetadataMap(
 	query := `SELECT id, status, payload, progress FROM system.jobs`
 	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 		ctx, "crdb-internal-jobs-table", p.Txn(),
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		query)
 	if err != nil {
 		return nil, err
@@ -5228,7 +5231,7 @@ CREATE TABLE crdb_internal.default_privileges (
 								role,                                  // role
 								forAllRoles,                           // for_all_roles
 								tree.NewDString(tree.Types.String()),  // object_type
-								tree.NewDString(security.PublicRoleName().Normalized()), // grantee
+								tree.NewDString(username.PublicRoleName().Normalized()), // grantee
 								tree.NewDString(privilege.USAGE.String()),               // privilege_type
 							); err != nil {
 								return err
@@ -5253,9 +5256,9 @@ CREATE TABLE crdb_internal.default_privileges (
 				}
 
 				addRowsForSchema := func(defaultPrivilegeDescriptor catalog.DefaultPrivilegeDescriptor, schema tree.Datum) error {
-					if err := forEachRole(ctx, p, func(username security.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error {
+					if err := forEachRole(ctx, p, func(userName username.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error {
 						role := catpb.DefaultPrivilegesRole{
-							Role: username,
+							Role: userName,
 						}
 						return addRowsForRole(role, defaultPrivilegeDescriptor, schema)
 					}); err != nil {
@@ -5531,7 +5534,7 @@ CREATE TABLE crdb_internal.active_range_feeds (
 				return addRow(
 					tree.NewDInt(tree.DInt(rfCtx.ID)),
 					tree.NewDString(rfCtx.CtxTags),
-					tree.NewDString(rfCtx.StartFrom.AsOfSystemTime()),
+					tree.NewDString(rf.StartTS.AsOfSystemTime()),
 					tree.MakeDBool(tree.DBool(rfCtx.WithDiff)),
 					tree.NewDInt(tree.DInt(rf.NodeID)),
 					tree.NewDInt(tree.DInt(rf.RangeID)),
@@ -6074,5 +6077,26 @@ CREATE TABLE crdb_internal.cluster_locks (
 			}, nil
 
 		}, nil, nil
+	},
+}
+
+var crdbInternalNodeExecutionOutliersTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE crdb_internal.node_execution_outliers (
+	session_id     STRING NOT NULL,
+	transaction_id UUID NOT NULL,
+	statement_id   STRING NOT NULL
+);`,
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
+		p.extendedEvalCtx.statsProvider.IterateOutliers(ctx, func(
+			ctx context.Context, o *outliers.Outlier,
+		) {
+			err = errors.CombineErrors(err, addRow(
+				tree.NewDString(hex.EncodeToString(o.Session.ID)),
+				tree.NewDUuid(tree.DUuid{UUID: *o.Transaction.ID}),
+				tree.NewDString(hex.EncodeToString(o.Statement.ID)),
+			))
+		})
+		return err
 	},
 }

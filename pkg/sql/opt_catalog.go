@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -160,9 +160,9 @@ func (oc *optCatalog) ResolveSchema(
 ) (cat.Schema, cat.SchemaName, error) {
 	if flags.AvoidDescriptorCaches {
 		defer func(prev bool) {
-			oc.planner.avoidLeasedDescriptors = prev
-		}(oc.planner.avoidLeasedDescriptors)
-		oc.planner.avoidLeasedDescriptors = true
+			oc.planner.skipDescriptorCache = prev
+		}(oc.planner.skipDescriptorCache)
+		oc.planner.skipDescriptorCache = true
 	}
 
 	oc.tn.ObjectNamePrefix = *name
@@ -198,9 +198,9 @@ func (oc *optCatalog) ResolveDataSource(
 ) (cat.DataSource, cat.DataSourceName, error) {
 	if flags.AvoidDescriptorCaches {
 		defer func(prev bool) {
-			oc.planner.avoidLeasedDescriptors = prev
-		}(oc.planner.avoidLeasedDescriptors)
-		oc.planner.avoidLeasedDescriptors = true
+			oc.planner.skipDescriptorCache = prev
+		}(oc.planner.skipDescriptorCache)
+		oc.planner.skipDescriptorCache = true
 	}
 
 	oc.tn = *name
@@ -222,15 +222,58 @@ func (oc *optCatalog) ResolveDataSource(
 	return ds, oc.tn, nil
 }
 
+func (oc *optCatalog) ResolveIndex(
+	ctx context.Context, flags cat.Flags, name *tree.TableIndexName,
+) (cat.Index, cat.DataSourceName, error) {
+	var prefix catalog.ResolvedObjectPrefix
+	var tbl catalog.TableDescriptor
+	var idx catalog.Index
+	var err error
+	oc.planner.runWithOptions(resolveFlags{skipCache: flags.AvoidDescriptorCaches}, func() {
+		_, prefix, tbl, idx, err = resolver.ResolveIndex(
+			ctx,
+			oc.planner,
+			name,
+			oc.planner.Txn(),
+			oc.planner.EvalContext().Codec,
+			true, /* required */
+			true, /* requireActiveIndex */
+		)
+	})
+	if err != nil {
+		return nil, cat.DataSourceName{}, err
+	}
+	if err := oc.planner.canResolveDescUnderSchema(ctx, prefix.Schema, tbl); err != nil {
+		return nil, cat.DataSourceName{}, err
+	}
+
+	namePrefix := prefix.NamePrefix()
+	oc.tn = tree.MakeTableNameWithSchema(namePrefix.CatalogName, namePrefix.SchemaName, tree.Name(tbl.GetName()))
+
+	ds, err := oc.dataSourceForDesc(ctx, flags, tbl, &oc.tn)
+	if err != nil {
+		return nil, cat.DataSourceName{}, err
+	}
+
+	table, ok := ds.(cat.Table)
+	if !ok {
+		return nil, cat.DataSourceName{}, pgerror.Newf(
+			pgcode.InvalidParameterValue, "%q is not a table or materialized view", ds.Name(),
+		)
+	}
+
+	return table.Index(idx.Ordinal()), oc.tn, nil
+}
+
 // ResolveDataSourceByID is part of the cat.Catalog interface.
 func (oc *optCatalog) ResolveDataSourceByID(
 	ctx context.Context, flags cat.Flags, dataSourceID cat.StableID,
 ) (_ cat.DataSource, isAdding bool, _ error) {
 	if flags.AvoidDescriptorCaches {
 		defer func(prev bool) {
-			oc.planner.avoidLeasedDescriptors = prev
-		}(oc.planner.avoidLeasedDescriptors)
-		oc.planner.avoidLeasedDescriptors = true
+			oc.planner.skipDescriptorCache = prev
+		}(oc.planner.skipDescriptorCache)
+		oc.planner.skipDescriptorCache = true
 	}
 
 	tableLookup, err := oc.planner.LookupTableByID(ctx, descpb.ID(dataSourceID))
@@ -374,7 +417,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 }
 
 // RoleExists is part of the cat.Catalog interface.
-func (oc *optCatalog) RoleExists(ctx context.Context, role security.SQLUsername) (bool, error) {
+func (oc *optCatalog) RoleExists(ctx context.Context, role username.SQLUsername) (bool, error) {
 	return RoleExists(ctx, oc.planner.ExecCfg(), oc.planner.Txn(), role)
 }
 
@@ -1051,6 +1094,11 @@ func (ot *optTable) Name() tree.Name {
 // IsVirtualTable is part of the cat.Table interface.
 func (ot *optTable) IsVirtualTable() bool {
 	return false
+}
+
+// IsSystemTable is part of the cat.Table interface.
+func (ot *optTable) IsSystemTable() bool {
+	return catalog.IsSystemDescriptor(ot.desc)
 }
 
 // IsMaterializedView implements the cat.Table interface.
@@ -1970,6 +2018,11 @@ func (ot *optVirtualTable) Name() tree.Name {
 // IsVirtualTable is part of the cat.Table interface.
 func (ot *optVirtualTable) IsVirtualTable() bool {
 	return true
+}
+
+// IsSystemTable is part of the cat.Table interface.
+func (ot *optVirtualTable) IsSystemTable() bool {
+	return false
 }
 
 // IsMaterializedView implements the cat.Table interface.

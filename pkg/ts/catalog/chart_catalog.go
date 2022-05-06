@@ -654,6 +654,14 @@ var charts = []sectionDescription{
 				Title:   "Keys Read Per Second",
 				Metrics: []string{"rebalancing.readspersecond"},
 			},
+			{
+				Title:   "Bytes Read Per Second",
+				Metrics: []string{"rebalancing.readbytespersecond"},
+			},
+			{
+				Title:   "Bytes Written Per Second",
+				Metrics: []string{"rebalancing.writebytespersecond"},
+			},
 		},
 	},
 	{
@@ -2362,6 +2370,14 @@ var charts = []sectionDescription{
 					"sql.pgwire_cancel.successful",
 				},
 				AxisLabel: "Count",
+			},
+			{
+				Title: "SQL Transaction Contention",
+				Metrics: []string{
+					"sql.txn.contended.count",
+					"sql.txn.contended.count.internal",
+				},
+				AxisLabel: "Transactions",
 			},
 		},
 	},

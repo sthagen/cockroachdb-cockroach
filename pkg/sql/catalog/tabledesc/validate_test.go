@@ -18,15 +18,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -131,10 +131,8 @@ var validationMap = []struct {
 			"ExcludeDataFromBackup":         {status: thisFieldReferencesNoObjects},
 			"NextConstraintID":              {status: iSolemnlySwearThisFieldIsValidated},
 			"DeclarativeSchemaChangerState": {status: iSolemnlySwearThisFieldIsValidated},
-			"AutoStatsSettings": {
-				status: todoIAmKnowinglyAddingTechDebt,
-				reason: "initial import: TODO(msirek): add validation"},
-			"ForecastStats": {status: thisFieldReferencesNoObjects},
+			"AutoStatsSettings":             {status: iSolemnlySwearThisFieldIsValidated},
+			"ForecastStats":                 {status: thisFieldReferencesNoObjects},
 		},
 	},
 	{
@@ -294,13 +292,11 @@ var validationMap = []struct {
 		},
 	},
 	{
-		// TODO(msirek): These fields can't be set until #78110 merges. That PR
-		//               will add validation.
 		obj: catpb.AutoStatsSettings{},
 		fieldMap: map[string]validationStatusInfo{
-			"Enabled":           {status: thisFieldReferencesNoObjects},
-			"MinStaleRows":      {status: thisFieldReferencesNoObjects},
-			"FractionStaleRows": {status: thisFieldReferencesNoObjects},
+			"Enabled":           {status: iSolemnlySwearThisFieldIsValidated},
+			"MinStaleRows":      {status: iSolemnlySwearThisFieldIsValidated},
+			"FractionStaleRows": {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 }
@@ -346,6 +342,9 @@ func TestValidateTableDesc(t *testing.T) {
 
 	computedExpr := "1 + 1"
 	generatedAsIdentitySequenceOptionExpr := " START 2 INCREMENT 3 CACHE 10"
+	boolTrue := true
+	negativeOne := int64(-1)
+	negativeOneFloat := float64(-1)
 
 	testData := []struct {
 		err  string
@@ -1307,7 +1306,7 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID:     1,
 				NextIndexID:      5,
 				NextConstraintID: 2,
-				Privileges:       catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+				Privileges:       catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
 			}},
 		{`index "sec" cannot store virtual column "c3"`,
 			descpb.TableDescriptor{
@@ -1388,7 +1387,7 @@ func TestValidateTableDesc(t *testing.T) {
 				NextColumnID: 4,
 				NextFamilyID: 1,
 				NextIndexID:  5,
-				Privileges:   catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+				Privileges:   catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
 			}},
 		{`index "new_sec" cannot store virtual column "c3"`,
 			descpb.TableDescriptor{
@@ -1469,7 +1468,7 @@ func TestValidateTableDesc(t *testing.T) {
 				NextColumnID: 4,
 				NextFamilyID: 1,
 				NextIndexID:  5,
-				Privileges:   catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+				Privileges:   catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
 			}},
 		{`index "sec" cannot store virtual column "v"`,
 			descpb.TableDescriptor{
@@ -1886,10 +1885,99 @@ func TestValidateTableDesc(t *testing.T) {
 				},
 			},
 		},
+		{`Setting sql_stats_automatic_collection_enabled may not be set on virtual table`,
+			descpb.TableDescriptor{
+				ID:            catconstants.MinVirtualID,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				NextColumnID:      2,
+				AutoStatsSettings: &catpb.AutoStatsSettings{Enabled: &boolTrue},
+			}},
+		{`Setting sql_stats_automatic_collection_enabled may not be set on a view or sequence`,
+			descpb.TableDescriptor{
+				Name:                    "bar",
+				ID:                      52,
+				ParentID:                1,
+				FormatVersion:           descpb.InterleavedFormatVersion,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				ViewQuery:               "SELECT * FROM foo",
+				DependsOn:               []descpb.ID{51},
+				NextColumnID:            2,
+				Columns: []descpb.ColumnDescriptor{
+					{Name: "a", ID: 1, Type: types.Int},
+				},
+				Privileges:        catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
+				AutoStatsSettings: &catpb.AutoStatsSettings{Enabled: &boolTrue},
+			}},
+		{`Setting sql_stats_automatic_collection_enabled may not be set on a view or sequence`,
+			descpb.TableDescriptor{
+				ID:            51,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "a", Type: types.Int},
+				},
+				SequenceOpts: &descpb.TableDescriptor_SequenceOpts{
+					Increment: 1,
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:                  1,
+					Name:                "primary",
+					Unique:              true,
+					KeyColumnIDs:        []descpb.ColumnID{1},
+					KeyColumnNames:      []string{"a"},
+					KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
+					EncodingType:        descpb.PrimaryIndexEncoding,
+					ConstraintID:        1,
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"a"},
+					},
+				},
+				NextColumnID:      2,
+				NextFamilyID:      1,
+				NextIndexID:       5,
+				NextConstraintID:  2,
+				Privileges:        catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
+				AutoStatsSettings: &catpb.AutoStatsSettings{Enabled: &boolTrue},
+			},
+		},
+		{`invalid integer value for sql_stats_automatic_collection_min_stale_rows: cannot be set to a negative value: -1`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				NextColumnID:      2,
+				AutoStatsSettings: &catpb.AutoStatsSettings{MinStaleRows: &negativeOne},
+			}},
+		{`invalid float value for sql_stats_automatic_collection_fraction_stale_rows: cannot set to a negative value: -1.000000`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				NextColumnID:      2,
+				AutoStatsSettings: &catpb.AutoStatsSettings{FractionStaleRows: &negativeOneFloat},
+			}},
 	}
 	for i, d := range testData {
 		t.Run(d.err, func(t *testing.T) {
-			d.desc.Privileges = catpb.NewBasePrivilegeDescriptor(security.RootUserName())
+			d.desc.Privileges = catpb.NewBasePrivilegeDescriptor(username.RootUserName())
 			desc := NewBuilder(&d.desc).BuildImmutableTable()
 			expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), d.err)
 			err := validate.Self(clusterversion.TestingClusterVersion, desc)
@@ -1949,7 +2037,7 @@ func TestPrimaryKeyCannotBeVirtualBefore22_1(t *testing.T) {
 				NextColumnID: 4,
 				NextFamilyID: 1,
 				NextIndexID:  5,
-				Privileges:   catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+				Privileges:   catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
 			},
 		},
 		{
@@ -2032,13 +2120,13 @@ func TestPrimaryKeyCannotBeVirtualBefore22_1(t *testing.T) {
 				NextColumnID: 4,
 				NextFamilyID: 1,
 				NextIndexID:  5,
-				Privileges:   catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+				Privileges:   catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
 			},
 		},
 	}
 	for i, d := range testData {
 		t.Run(d.err, func(t *testing.T) {
-			d.desc.Privileges = catpb.NewBasePrivilegeDescriptor(security.RootUserName())
+			d.desc.Privileges = catpb.NewBasePrivilegeDescriptor(username.RootUserName())
 			desc := NewBuilder(&d.desc).BuildImmutableTable()
 			expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), d.err)
 			err := validate.Self(clusterversion.ClusterVersion{Version: clusterversion.ByKey(clusterversion.V21_2)}, desc)
@@ -2280,6 +2368,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 		},
 		// Views.
 		{ // 10
+			err: ``,
 			desc: descpb.TableDescriptor{
 				Name:                    "foo",
 				ID:                      51,
@@ -2409,7 +2498,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			var cb nstree.MutableCatalog
 			cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable())
 			for _, otherDesc := range test.otherDescs {
-				otherDesc.Privileges = catpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
+				otherDesc.Privileges = catpb.NewBasePrivilegeDescriptor(username.AdminRoleName())
 				cb.UpsertDescriptorEntry(NewBuilder(&otherDesc).BuildImmutable())
 			}
 			desc := NewBuilder(&test.desc).BuildImmutable()
@@ -2661,10 +2750,10 @@ func TestValidateConstraintID(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 				Privileges: catpb.NewPrivilegeDescriptor(
-					security.PublicRoleName(),
+					username.PublicRoleName(),
 					privilege.SchemaPrivileges,
 					privilege.List{},
-					security.RootUserName()),
+					username.RootUserName()),
 			}},
 		{`constraint id was missing for constraint: UNIQUE with name \"secondary\"`,
 			descpb.TableDescriptor{
@@ -2691,10 +2780,10 @@ func TestValidateConstraintID(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 				Privileges: catpb.NewPrivilegeDescriptor(
-					security.PublicRoleName(),
+					username.PublicRoleName(),
 					privilege.SchemaPrivileges,
 					privilege.List{},
-					security.RootUserName()),
+					username.RootUserName()),
 			}},
 		{`constraint id was missing for constraint: UNIQUE with name \"bad\"`,
 			descpb.TableDescriptor{
@@ -2717,10 +2806,10 @@ func TestValidateConstraintID(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 				Privileges: catpb.NewPrivilegeDescriptor(
-					security.PublicRoleName(),
+					username.PublicRoleName(),
 					privilege.SchemaPrivileges,
 					privilege.List{},
-					security.RootUserName()),
+					username.RootUserName()),
 			}},
 		{`constraint id was missing for constraint: CHECK with name \"bad\"`,
 			descpb.TableDescriptor{
@@ -2743,10 +2832,10 @@ func TestValidateConstraintID(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 				Privileges: catpb.NewPrivilegeDescriptor(
-					security.PublicRoleName(),
+					username.PublicRoleName(),
 					privilege.SchemaPrivileges,
 					privilege.List{},
-					security.RootUserName()),
+					username.RootUserName()),
 			}},
 	}
 	for i, test := range tests {

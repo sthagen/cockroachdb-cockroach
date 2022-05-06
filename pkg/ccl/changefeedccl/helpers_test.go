@@ -35,10 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -247,7 +247,7 @@ func parseTimeToHLC(t testing.TB, s string) hlc.Timestamp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts, err := tree.DecimalToHLC(d)
+	ts, err := hlc.DecimalToHLC(d)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +512,7 @@ func sinklessTestWithOptions(testFn cdcTestFn, opts feedTestOptions) func(*testi
 		s, db, stopServer := startTestServer(t, opts)
 		defer stopServer()
 
-		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 		defer cleanup()
 		f := makeSinklessFeedFactory(s, sink)
 		testFn(t, db, f)
@@ -545,7 +545,7 @@ func enterpriseTestWithOptions(testFn cdcTestFn, options feedTestOptions) func(*
 		s, db, stopServer := startTestServer(t, options)
 		defer stopServer()
 
-		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 		defer cleanup()
 		f := makeTableFeedFactory(s, db, sink)
 
@@ -638,7 +638,7 @@ func serverArgsRegion(args base.TestServerArgs) string {
 // a lot of cdc test framework, use with caution. Driver-agnostic tools don't
 // have clean ways of inspecting incoming notices.
 func expectNotice(t *testing.T, s serverutils.TestServerInterface, sql string, expected string) {
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	base, err := pq.NewConnector(url.String())
 	if err != nil {
@@ -770,4 +770,18 @@ func checkS3Credentials(t *testing.T) (bucket string, accessKey string, secretKe
 	}
 
 	return bucket, accessKey, secretKey
+}
+
+func waitForJobStatus(
+	runner *sqlutils.SQLRunner, t *testing.T, id jobspb.JobID, targetStatus jobs.Status,
+) {
+	testutils.SucceedsSoon(t, func() error {
+		var jobStatus string
+		query := `SELECT status FROM [SHOW CHANGEFEED JOB $1]`
+		runner.QueryRow(t, query, id).Scan(&jobStatus)
+		if targetStatus != jobs.Status(jobStatus) {
+			return errors.Errorf("Expected status:%s but found status:%s", targetStatus, jobStatus)
+		}
+		return nil
+	})
 }

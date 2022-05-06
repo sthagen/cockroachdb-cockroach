@@ -2216,6 +2216,10 @@ func (ex *connExecutor) recordTransactionFinish(
 	}
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 
+	if contentionDuration := ex.extraTxnState.accumulatedStats.ContentionTime.Nanoseconds(); contentionDuration > 0 {
+		ex.metrics.EngineMetrics.SQLContendedTxns.Inc(1)
+	}
+
 	ex.txnIDCacheWriter.Record(contentionpb.ResolvedTxnID{
 		TxnID:            ev.txnID,
 		TxnFingerprintID: transactionFingerprintID,
@@ -2234,6 +2238,8 @@ func (ex *connExecutor) recordTransactionFinish(
 	commitLat := ex.phaseTimes.GetCommitLatency()
 
 	recordedTxnStats := sqlstats.RecordedTxnStats{
+		SessionID:               ex.sessionID,
+		TransactionID:           ev.txnID,
 		TransactionTimeSec:      txnTime.Seconds(),
 		Committed:               ev.eventType == txnCommit,
 		ImplicitTxn:             implicit,

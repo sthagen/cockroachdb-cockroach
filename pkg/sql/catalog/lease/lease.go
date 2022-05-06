@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -90,7 +90,7 @@ func (m *Manager) WaitForNoVersion(
 			id)
 		values, err := m.storage.internalExecutor.QueryRowEx(
 			ctx, "count-leases", nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			stmt, now.GoTime(),
 		)
 		if err != nil {
@@ -1201,8 +1201,27 @@ func (m *Manager) refreshSomeLeases(ctx context.Context) {
 			},
 			func(ctx context.Context) {
 				defer wg.Done()
+
+				if evFunc := m.testingKnobs.TestingBeforeAcquireLeaseDuringRefresh; evFunc != nil {
+					if err := evFunc(id); err != nil {
+						log.Infof(ctx, "knob failed for desc (%v): %v", id, err)
+						return
+					}
+				}
+
 				if _, err := acquireNodeLease(ctx, m, id); err != nil {
 					log.Infof(ctx, "refreshing descriptor: %d lease failed: %s", id, err)
+
+					if errors.Is(err, catalog.ErrDescriptorNotFound) {
+						// Lease renewal failed due to removed descriptor; Remove this descriptor from cache.
+						if err := purgeOldVersions(ctx, m.DB(), id, true /* dropped */, 0 /* minVersion */, m); err != nil {
+							log.Warningf(ctx, "error purging leases for descriptor %d: %s",
+								id, err)
+						}
+						m.mu.Lock()
+						delete(m.mu.descriptors, id)
+						m.mu.Unlock()
+					}
 				}
 			}); err != nil {
 			log.Infof(ctx, "didnt refresh descriptor: %d lease: %s", id, err)

@@ -51,7 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -396,7 +396,7 @@ func TestChangefeedTenants(t *testing.T) {
 	})
 	t.Run("sinkless changefeed works", func(t *testing.T) {
 		sqlAddr := tenantServer.SQLAddr()
-		sink, cleanup := sqlutils.PGUrl(t, sqlAddr, t.Name(), url.User(security.RootUser))
+		sink, cleanup := sqlutils.PGUrl(t, sqlAddr, t.Name(), url.User(username.RootUser))
 		defer cleanup()
 
 		// kvServer is used here because we require a
@@ -1197,6 +1197,133 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 	}
 }
 
+// Test checkpointing when the highwater does not move due to some issues with
+// specific spans lagging behind
+func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	rnd, _ := randutil.NewPseudoRand()
+
+	s, db, stopServer := startTestServer(t, feedTestOptions{})
+	defer stopServer()
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	knobs := s.(*server.TestServer).Cfg.TestingKnobs.
+		DistSQL.(*execinfra.TestingKnobs).
+		Changefeed.(*TestingKnobs)
+
+	// Initialize table with multiple ranges.
+	sqlDB.Exec(t, `
+  CREATE TABLE foo (key INT PRIMARY KEY);
+  INSERT INTO foo (key) SELECT * FROM generate_series(1, 1000);
+  ALTER TABLE foo SPLIT AT (SELECT * FROM generate_series(1, 1000, 50));
+  `)
+
+	// Checkpoint progress frequently, allow a large enough checkpoint, and
+	// reduce the lag threshold to allow lag checkpointing to trigger
+	changefeedbase.FrontierCheckpointFrequency.Override(
+		context.Background(), &s.ClusterSettings().SV, 10*time.Millisecond)
+	changefeedbase.FrontierCheckpointMaxBytes.Override(
+		context.Background(), &s.ClusterSettings().SV, 100<<20)
+	changefeedbase.FrontierHighwaterLagCheckpointThreshold.Override(
+		context.Background(), &s.ClusterSettings().SV, 10*time.Millisecond)
+
+	// We'll start changefeed with the cursor.
+	var tsStr string
+	sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp() from foo`).Scan(&tsStr)
+	cursor := parseTimeToHLC(t, tsStr)
+
+	// Rangefeed will skip some of the checkpoints to simulate lagging spans.
+	var laggingSpans roachpb.SpanGroup
+	numLagging := 0
+	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *roachpb.RangeFeedCheckpoint) bool {
+		// Skip spans that were skipped before; otherwise skip some spans.
+		seenBefore := laggingSpans.Encloses(checkpoint.Span)
+		if seenBefore || (numLagging < 5 && rnd.Int()%3 == 0) {
+			if !seenBefore {
+				laggingSpans.Add(checkpoint.Span)
+				numLagging++
+			}
+			return true /* skip */
+		}
+		return false
+	}
+
+	var jobID jobspb.JobID
+	sqlDB.QueryRow(t,
+		`CREATE CHANGEFEED FOR foo INTO 'null://' WITH resolved='50ms', no_initial_scan, cursor=$1`, tsStr,
+	).Scan(&jobID)
+
+	// Helper to read job progress
+	jobRegistry := s.JobRegistry().(*jobs.Registry)
+	loadProgress := func() jobspb.Progress {
+		job, err := jobRegistry.LoadJob(context.Background(), jobID)
+		require.NoError(t, err)
+		return job.Progress()
+	}
+
+	// Should eventually checkpoint all spans around the lagging span
+	testutils.SucceedsSoon(t, func() error {
+		progress := loadProgress()
+		if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && !p.Checkpoint.Timestamp.IsEmpty() {
+			return nil
+		}
+		return errors.New("waiting for checkpoint")
+	})
+
+	sqlDB.Exec(t, "PAUSE JOB $1", jobID)
+	waitForJobStatus(sqlDB, t, jobID, jobs.StatusPaused)
+
+	// We expect highwater to be 0 (because we skipped some spans) or exactly cursor
+	// (this is mostly due to racy updates sent from aggregators to the frontier.
+	// However, the checkpoint timestamp should be at least at the cursor.
+	progress := loadProgress()
+	require.True(t, progress.GetHighWater().IsEmpty() || progress.GetHighWater().EqOrdering(cursor),
+		"expected empty highwater or %s,  found %s", cursor, progress.GetHighWater())
+	require.NotNil(t, progress.GetChangefeed().Checkpoint)
+	require.Less(t, 0, len(progress.GetChangefeed().Checkpoint.Spans))
+	checkpointTS := progress.GetChangefeed().Checkpoint.Timestamp
+	require.True(t, cursor.LessEq(checkpointTS))
+
+	var incorrectCheckpointErr error
+	knobs.FeedKnobs.OnRangeFeedStart = func(spans []kvcoord.SpanTimePair) {
+		setErr := func(stp kvcoord.SpanTimePair, expectedTS hlc.Timestamp) {
+			incorrectCheckpointErr = errors.Newf(
+				"rangefeed for span %s expected to start @%s, started @%s instead",
+				stp.Span, expectedTS, stp.TS)
+		}
+
+		for _, sp := range spans {
+			if laggingSpans.Encloses(sp.Span) {
+				if !sp.TS.Equal(cursor) {
+					setErr(sp, cursor)
+				}
+			} else {
+				if !sp.TS.Equal(checkpointTS) {
+					setErr(sp, checkpointTS)
+				}
+			}
+		}
+	}
+
+	sqlDB.Exec(t, "RESUME JOB $1", jobID)
+	waitForJobStatus(sqlDB, t, jobID, jobs.StatusRunning)
+
+	// Wait until highwater advances past cursor.
+	testutils.SucceedsSoon(t, func() error {
+		progress := loadProgress()
+		if hw := progress.GetHighWater(); hw != nil && cursor.LessEq(*hw) {
+			return nil
+		}
+		return errors.New("waiting for checkpoint advance")
+	})
+
+	sqlDB.Exec(t, "PAUSE JOB $1", jobID)
+	waitForJobStatus(sqlDB, t, jobID, jobs.StatusPaused)
+	// Verify we didn't see incorrect timestamps when resuming.
+	require.NoError(t, incorrectCheckpointErr)
+}
+
 // Test checkpointing during schema change backfills that can be paused and
 // resumed multiple times during execution
 func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
@@ -1257,7 +1384,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			return job.Progress()
 		}
 
-		// Ensure initial backfill completes
+		// Ensure the changefeed has begun normal execution
 		testutils.SucceedsSoon(t, func() error {
 			prog := loadProgress()
 			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() {
@@ -1304,6 +1431,8 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			// Check if we've set a checkpoint yet
 			progress := loadProgress()
 			if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
+				// Checkpoint timestamp should be the timestamp of the spans from the backfill
+				require.True(t, p.Checkpoint.Timestamp.Equal(backfillTimestamp.Next()))
 				initialCheckpoint.Add(p.Checkpoint.Spans...)
 				atomic.StoreInt32(&foundCheckpoint, 1)
 			}
@@ -2113,7 +2242,7 @@ func TestChangefeedOutputTopics(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		pgURL, cleanup := sqlutils.PGUrl(t, f.Server().ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		pgURL, cleanup := sqlutils.PGUrl(t, f.Server().ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 		defer cleanup()
 		pgBase, err := pq.NewConnector(pgURL.String())
 		if err != nil {
@@ -3979,7 +4108,7 @@ func TestChangefeedDescription(t *testing.T) {
 	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
 	sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
 
-	sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	sink.Scheme = changefeedbase.SinkSchemeExperimentalSQL
 	sink.Path = `d`
@@ -3993,7 +4122,7 @@ func TestChangefeedDescription(t *testing.T) {
 	sqlDB.QueryRow(t,
 		`SELECT description FROM [SHOW JOBS] WHERE job_id = $1`, jobID,
 	).Scan(&description)
-	redactedSink := strings.Replace(sink.String(), security.RootUser, `redacted`, 1)
+	redactedSink := strings.Replace(sink.String(), username.RootUser, `redacted`, 1)
 	expected := `CREATE CHANGEFEED FOR TABLE foo INTO '` + redactedSink +
 		`' WITH envelope = 'wrapped', updated`
 	require.Equal(t, expected, description)
@@ -4610,7 +4739,7 @@ func TestChangefeedNodeShutdown(t *testing.T) {
 	// Create a factory which uses server 1 as the output of the Sink, but
 	// executes the CREATE CHANGEFEED statement on server 0.
 	sink, cleanup := sqlutils.PGUrl(
-		t, tc.Server(0).ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		t, tc.Server(0).ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	f := makeTableFeedFactory(tc.Server(1), tc.ServerConn(0), sink)
 	foo := feed(t, f, "CREATE CHANGEFEED FOR foo")
@@ -6270,7 +6399,7 @@ func TestChangefeedCreateTelemetryLogs(t *testing.T) {
 	sqlDB.Exec(t, `INSERT INTO bar VALUES (0, 'initial')`)
 
 	t.Run(`core_sink_type`, func(t *testing.T) {
-		coreSink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		coreSink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 		defer cleanup()
 		coreFeedFactory := makeSinklessFeedFactory(s, coreSink)
 
@@ -6324,7 +6453,7 @@ func TestChangefeedFailedTelemetryLogs(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
 		sqlDB.Exec(t, `UPSERT INTO foo VALUES (0, 'updated')`)
 
-		coreSink, coreSinkCleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+		coreSink, coreSinkCleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 		coreFactory := makeSinklessFeedFactory(s, coreSink)
 		coreFeed := feed(t, coreFactory, `CREATE CHANGEFEED FOR foo`)
 		assertPayloads(t, coreFeed, []string{

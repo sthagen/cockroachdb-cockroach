@@ -16,8 +16,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -247,7 +247,7 @@ func EvalShardBucketCount(
 	const invalidBucketCountMsg = `hash sharded index bucket count must be in range [2, 2048], got %v`
 	// If shardBuckets is not specified, use default bucket count from cluster setting.
 	if legacyBucketNotGiven && paramVal == nil {
-		buckets = catconstants.DefaultHashShardedIndexBucketCount.Get(&evalCtx.Settings.SV)
+		buckets = DefaultHashShardedIndexBucketCount.Get(&evalCtx.Settings.SV)
 	} else {
 		if paramVal != nil {
 			shardBuckets = paramVal
@@ -273,6 +273,17 @@ func EvalShardBucketCount(
 	return int32(buckets), nil
 }
 
+// DefaultHashShardedIndexBucketCount is the cluster setting of default bucket
+// count for hash sharded index when bucket count is not specified in index
+// definition.
+var DefaultHashShardedIndexBucketCount = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"sql.defaults.default_hash_sharded_index_bucket_count",
+	"used as bucket count if bucket count is not specified in hash sharded index definition",
+	16,
+	settings.NonNegativeInt,
+).WithPublic()
+
 // GetShardColumnName generates a name for the hidden shard column to be used to create a
 // hash sharded index.
 func GetShardColumnName(colNames []string, buckets int32) string {
@@ -287,6 +298,22 @@ func GetShardColumnName(colNames []string, buckets int32) string {
 // GetConstraintInfo implements the TableDescriptor interface.
 func (desc *wrapper) GetConstraintInfo() (map[string]descpb.ConstraintDetail, error) {
 	return desc.collectConstraintInfo(nil)
+}
+
+// FindConstraintWithID implements the TableDescriptor interface.
+func (desc *wrapper) FindConstraintWithID(
+	id descpb.ConstraintID,
+) (*descpb.ConstraintDetail, error) {
+	constraintInfo, err := desc.GetConstraintInfo()
+	if err != nil {
+		return nil, err
+	}
+	for _, info := range constraintInfo {
+		if info.ConstraintID == id {
+			return &info, nil
+		}
+	}
+	return nil, nil
 }
 
 // GetConstraintInfoWithLookup implements the TableDescriptor interface.

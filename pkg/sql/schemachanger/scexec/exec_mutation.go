@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
@@ -435,6 +435,18 @@ func (mvs *mutationVisitorState) DeleteAllTableComments(id descpb.ID) {
 	mvs.tableCommentsToDelete.Add(id)
 }
 
+func (mvs *mutationVisitorState) AddComment(
+	id descpb.ID, subID int, commentType keys.CommentType, comment string,
+) {
+	mvs.commentsToUpdate = append(mvs.commentsToUpdate,
+		commentToUpdate{
+			id:          int64(id),
+			subID:       int64(subID),
+			commentType: commentType,
+			comment:     comment,
+		})
+}
+
 func (mvs *mutationVisitorState) DeleteComment(
 	id descpb.ID, subID int, commentType keys.CommentType,
 ) {
@@ -530,7 +542,7 @@ func MakeDeclarativeSchemaChangeJobRecord(
 		JobID:         jobID,
 		Description:   description,
 		Statements:    stmtStrs,
-		Username:      security.MakeSQLUsernameFromPreNormalizedString(auth.UserName),
+		Username:      username.MakeSQLUsernameFromPreNormalizedString(auth.UserName),
 		DescriptorIDs: descriptorIDs,
 		Details:       jobspb.NewSchemaChangeDetails{},
 		Progress:      jobspb.NewSchemaChangeProgress{},

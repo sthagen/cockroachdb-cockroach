@@ -214,19 +214,67 @@ func decodeTableStatisticsKV(
 func (sc *TableStatisticsCache) GetTableStats(
 	ctx context.Context, table catalog.TableDescriptor,
 ) ([]*TableStatistic, error) {
-	if !hasStatistics(table) {
+	if !statsUsageAllowed(table, sc.Settings) {
 		return nil, nil
 	}
 	return sc.getTableStatsFromCache(ctx, table.GetID())
 }
 
-// hasStatistics returns true if the table can have statistics collected for it.
-func hasStatistics(table catalog.TableDescriptor) bool {
-	if catalog.IsSystemDescriptor(table) {
-		// Don't try to get statistics for system tables (most importantly,
-		// for table_statistics itself).
-		return false
+func statsDisallowedSystemTable(tableID descpb.ID) bool {
+	switch tableID {
+	case keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID:
+		return true
 	}
+	return false
+}
+
+// statsUsageAllowed returns true if statistics on `table` are allowed to be
+// used by the query optimizer.
+func statsUsageAllowed(table catalog.TableDescriptor, clusterSettings *cluster.Settings) bool {
+	if catalog.IsSystemDescriptor(table) {
+		// Disable stats usage on system.table_statistics and system.lease. Looking
+		// up stats on system.lease is known to cause hangs, and the same could
+		// happen with system.table_statistics. Stats on system.jobs and
+		// system.scheduled_jobs are also disallowed because autostats are disabled
+		// on them.
+		if statsDisallowedSystemTable(table.GetID()) {
+			return false
+		}
+		// Return whether the optimizer is allowed to use stats on system tables.
+		return UseStatisticsOnSystemTables.Get(&clusterSettings.SV)
+	}
+	return tableTypeCanHaveStats(table)
+}
+
+// autostatsCollectionAllowed returns true if statistics are allowed to be
+// automatically collected on the table.
+func autostatsCollectionAllowed(
+	table catalog.TableDescriptor, clusterSettings *cluster.Settings,
+) bool {
+	if catalog.IsSystemDescriptor(table) {
+		// Disable autostats on system.table_statistics and system.lease. Looking
+		// up stats on system.lease is known to cause hangs, and the same could
+		// happen with system.table_statistics. No need to collect stats if we
+		// cannot use them. Stats on system.jobs and system.scheduled_jobs
+		// are also disallowed because they are mutated too frequently and would
+		// trigger too many stats collections. The potential benefit is not worth
+		// the potential performance hit.
+		if statsDisallowedSystemTable(table.GetID()) {
+			return false
+		}
+		// Return whether autostats collection is allowed on system tables,
+		// according to the cluster settings.
+		return AutomaticStatisticsOnSystemTables.Get(&clusterSettings.SV)
+	}
+	return tableTypeCanHaveStats(table)
+}
+
+// tableTypeCanHaveStats returns true if manual collection of statistics on the
+// table type via CREATE STATISTICS or ANALYZE is allowed. Note that specific
+// system tables may have stats collection disabled in create_stats.go. This
+// function just indicates if the type of table may have stats manually
+// collected.
+func tableTypeCanHaveStats(table catalog.TableDescriptor) bool {
 	if table.IsVirtualTable() {
 		// Don't try to get statistics for virtual tables.
 		return false

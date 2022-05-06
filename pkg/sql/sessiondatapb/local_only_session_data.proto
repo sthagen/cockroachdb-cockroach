@@ -169,7 +169,7 @@ message LocalOnlySessionData {
   // established the connection before SET ROLE was first performed.
   // This is only populated when SET ROLE is used, otherwise the session_user
   // is the same as the UserProto in SessionData.
-  string session_user_proto = 46 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto"];
+  string session_user_proto = 46 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
   // TxnRowsWrittenLog is the threshold for the number of rows written by a SQL
   // transaction which - once exceeded - will trigger a logging event to SQL_PERF
   // (or SQL_INTERNAL_PERF for internal transactions); 0 means disabled.
@@ -254,6 +254,10 @@ message LocalOnlySessionData {
   // CONSTRAINTS and pg_catalog.pg_constraint will include primary key
   // constraints that only include hidden columns.
   bool show_primary_key_constraint_on_not_visible_columns = 69;
+  // TestingOptimizerRandomCostSeed is non-zero when the coster should randomly
+  // perturb costs with an rng seeded to the given integer. This should only be
+  // used in test scenarios and is very much a non-production setting.
+  int64 testing_optimizer_random_cost_seed = 70;
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //

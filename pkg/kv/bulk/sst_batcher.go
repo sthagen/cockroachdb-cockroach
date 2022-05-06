@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -451,12 +451,10 @@ func (b *SSTBatcher) doFlush(ctx context.Context, reason int) error {
 					log.Warningf(ctx, "%s failed to scatter	: %v", b.name, err)
 				} else {
 					b.stats.scatters++
-					if resp.MVCCStats != nil {
-						moved := sz(resp.MVCCStats.Total())
-						b.stats.scatterMoved += moved
-						if moved > 0 {
-							log.VEventf(ctx, 1, "%s split scattered %s in non-empty range %s", b.name, moved, resp.RangeInfos[0].Desc.KeySpan().AsRawSpanWithNoLocals())
-						}
+					moved := sz(resp.ReplicasScatteredBytes)
+					b.stats.scatterMoved += moved
+					if moved > 0 {
+						log.VEventf(ctx, 1, "%s split scattered %s in non-empty range %s", b.name, moved, resp.RangeInfos[0].Desc.KeySpan().AsRawSpanWithNoLocals())
 					}
 				}
 			}
@@ -617,7 +615,7 @@ func (b *SSTBatcher) addSSTable(
 				ba := roachpb.BatchRequest{
 					Header: roachpb.Header{Timestamp: batchTS, ClientRangeInfo: roachpb.ClientRangeInfo{ExplicitlyRequested: true}},
 					AdmissionHeader: roachpb.AdmissionHeader{
-						Priority:                 int32(admission.BulkNormalPri),
+						Priority:                 int32(admissionpb.BulkNormalPri),
 						CreateTime:               timeutil.Now().UnixNano(),
 						Source:                   roachpb.AdmissionHeader_FROM_SQL,
 						NoMemoryReservedAtSource: true,

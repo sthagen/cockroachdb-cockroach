@@ -37,7 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -252,7 +253,7 @@ func (s *adminServer) Databases(
 func (s *adminServer) databasesHelper(
 	ctx context.Context,
 	req *serverpb.DatabasesRequest,
-	sessionUser security.SQLUsername,
+	sessionUser username.SQLUsername,
 	limit, offset int,
 ) (_ *serverpb.DatabasesResponse, retErr error) {
 	it, err := s.server.sqlServer.internalExecutor.QueryIteratorEx(
@@ -318,7 +319,7 @@ func (s *adminServer) DatabaseDetails(
 func (s *adminServer) getDatabaseGrants(
 	ctx context.Context,
 	req *serverpb.DatabaseDetailsRequest,
-	userName security.SQLUsername,
+	userName username.SQLUsername,
 	limit, offset int,
 ) (resp []serverpb.DatabaseDetailsResponse_Grant, retErr error) {
 	escDBName := tree.NameStringP(&req.Database)
@@ -390,7 +391,7 @@ func (s *adminServer) getDatabaseGrants(
 func (s *adminServer) getDatabaseTables(
 	ctx context.Context,
 	req *serverpb.DatabaseDetailsRequest,
-	userName security.SQLUsername,
+	userName username.SQLUsername,
 	limit, offset int,
 ) (resp []string, retErr error) {
 	query := makeSQLQuery()
@@ -448,7 +449,7 @@ WHERE table_catalog = $ AND table_type != 'SYSTEM VIEW'`, req.Database)
 func (s *adminServer) getMiscDatabaseDetails(
 	ctx context.Context,
 	req *serverpb.DatabaseDetailsRequest,
-	userName security.SQLUsername,
+	userName username.SQLUsername,
 	resp *serverpb.DatabaseDetailsResponse,
 ) (*serverpb.DatabaseDetailsResponse, error) {
 	if resp == nil {
@@ -483,7 +484,7 @@ func (s *adminServer) getMiscDatabaseDetails(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) databaseDetailsHelper(
-	ctx context.Context, req *serverpb.DatabaseDetailsRequest, userName security.SQLUsername,
+	ctx context.Context, req *serverpb.DatabaseDetailsRequest, userName username.SQLUsername,
 ) (_ *serverpb.DatabaseDetailsResponse, retErr error) {
 	var resp serverpb.DatabaseDetailsResponse
 	var err error
@@ -523,7 +524,7 @@ func (s *adminServer) databaseDetailsHelper(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) getDatabaseTableSpans(
-	ctx context.Context, userName security.SQLUsername, dbName string, tableNames []string,
+	ctx context.Context, userName username.SQLUsername, dbName string, tableNames []string,
 ) (map[string]roachpb.Span, error) {
 	tableSpans := make(map[string]roachpb.Span, len(tableNames))
 
@@ -680,7 +681,7 @@ func (s *adminServer) TableDetails(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) tableDetailsHelper(
-	ctx context.Context, req *serverpb.TableDetailsRequest, userName security.SQLUsername,
+	ctx context.Context, req *serverpb.TableDetailsRequest, userName username.SQLUsername,
 ) (_ *serverpb.TableDetailsResponse, retErr error) {
 	escQualTable, err := getFullyQualifiedTableName(req.Database, req.Table)
 	if err != nil {
@@ -1253,7 +1254,7 @@ func (s *adminServer) Users(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) usersHelper(
-	ctx context.Context, req *serverpb.UsersRequest, userName security.SQLUsername,
+	ctx context.Context, req *serverpb.UsersRequest, userName username.SQLUsername,
 ) (_ *serverpb.UsersResponse, retErr error) {
 	query := `SELECT username FROM system.users WHERE "isRole" = false`
 	it, err := s.server.sqlServer.internalExecutor.QueryIteratorEx(
@@ -1325,7 +1326,7 @@ func (s *adminServer) Events(
 func (s *adminServer) eventsHelper(
 	ctx context.Context,
 	req *serverpb.EventsRequest,
-	userName security.SQLUsername,
+	userName username.SQLUsername,
 	limit, offset int,
 	redactEvents bool,
 ) (_ *serverpb.EventsResponse, retErr error) {
@@ -1464,7 +1465,7 @@ func (s *adminServer) RangeLog(
 }
 
 func (s *adminServer) rangeLogHelper(
-	ctx context.Context, req *serverpb.RangeLogRequest, userName security.SQLUsername,
+	ctx context.Context, req *serverpb.RangeLogRequest, userName username.SQLUsername,
 ) (_ *serverpb.RangeLogResponse, retErr error) {
 	limit := req.Limit
 	if limit == 0 {
@@ -1591,7 +1592,7 @@ func (s *adminServer) rangeLogHelper(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) getUIData(
-	ctx context.Context, userName security.SQLUsername, keys []string,
+	ctx context.Context, userName username.SQLUsername, keys []string,
 ) (_ *serverpb.GetUIDataResponse, retErr error) {
 	if len(keys) == 0 {
 		return &serverpb.GetUIDataResponse{}, nil
@@ -1616,7 +1617,7 @@ func (s *adminServer) getUIData(
 	}
 	it, err := s.server.sqlServer.internalExecutor.QueryIteratorEx(
 		ctx, "admin-getUIData", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		query.String(), query.QueryArguments()...,
 	)
 	if err != nil {
@@ -1662,8 +1663,8 @@ func (s *adminServer) getUIData(
 // system.ui.
 // The username is combined to ensure that different users
 // can use different customizations.
-func makeUIKey(username security.SQLUsername, key string) string {
-	return username.Normalized() + "$" + key
+func makeUIKey(user username.SQLUsername, key string) string {
+	return user.Normalized() + "$" + key
 }
 
 // splitUIKey is the inverse of makeUIKey.
@@ -1696,7 +1697,7 @@ func (s *adminServer) SetUIData(
 		rowsAffected, err := s.server.sqlServer.internalExecutor.ExecEx(
 			ctx, "admin-set-ui-data", nil, /* txn */
 			sessiondata.InternalExecutorOverride{
-				User: security.RootUserName(),
+				User: username.RootUserName(),
 			},
 			query, makeUIKey(userName, key), val)
 		if err != nil {
@@ -1790,7 +1791,7 @@ func (s *adminServer) Settings(
 	alteredSettings := make(map[string]*time.Time)
 	if it, err := s.server.sqlServer.internalExecutor.QueryIteratorEx(
 		ctx, "read-setting", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		`SELECT name, "lastUpdated" FROM system.settings`,
 	); err != nil {
 		log.Warningf(ctx, "failed to read settings: %s", err)
@@ -1983,7 +1984,7 @@ func (s *adminServer) Jobs(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) jobsHelper(
-	ctx context.Context, req *serverpb.JobsRequest, userName security.SQLUsername,
+	ctx context.Context, req *serverpb.JobsRequest, userName username.SQLUsername,
 ) (_ *serverpb.JobsResponse, retErr error) {
 	retryRunningCondition := "status='running' AND next_run > now() AND num_runs > 1"
 	retryRevertingCondition := "status='reverting' AND next_run > now() AND num_runs > 1"
@@ -2095,7 +2096,7 @@ func scanRowIntoJob(scanner resultScanner, row tree.Datums, job *serverpb.JobRes
 		return errors.Wrap(err, "scan")
 	}
 	if highwaterOrNil != nil {
-		highwaterTimestamp, err := tree.DecimalToHLC(highwaterOrNil)
+		highwaterTimestamp, err := hlc.DecimalToHLC(highwaterOrNil)
 		if err != nil {
 			return errors.Wrap(err, "highwater timestamp had unexpected format")
 		}
@@ -2151,7 +2152,7 @@ func (s *adminServer) Job(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) jobHelper(
-	ctx context.Context, request *serverpb.JobRequest, userName security.SQLUsername,
+	ctx context.Context, request *serverpb.JobRequest, userName username.SQLUsername,
 ) (_ *serverpb.JobResponse, retErr error) {
 	const query = `
 	        SELECT job_id, job_type, description, statement, user_name, descriptor_ids, status,
@@ -2214,7 +2215,7 @@ func (s *adminServer) locationsHelper(
 	q.Append(`SELECT "localityKey", "localityValue", latitude, longitude FROM system.locations`)
 	it, err := s.server.sqlServer.internalExecutor.QueryIteratorEx(
 		ctx, "admin-locations", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		q.String(),
 	)
 	if err != nil {
@@ -2555,7 +2556,7 @@ func (s *adminServer) DataDistribution(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) dataDistributionHelper(
-	ctx context.Context, req *serverpb.DataDistributionRequest, userName security.SQLUsername,
+	ctx context.Context, req *serverpb.DataDistributionRequest, userName username.SQLUsername,
 ) (resp *serverpb.DataDistributionResponse, retErr error) {
 	resp = &serverpb.DataDistributionResponse{
 		DatabaseInfo: make(map[string]serverpb.DataDistributionResponse_DatabaseInfo),
@@ -3199,7 +3200,7 @@ func (rs resultScanner) Scan(row tree.Datums, colName string, dst interface{}) e
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) queryZone(
-	ctx context.Context, userName security.SQLUsername, id descpb.ID,
+	ctx context.Context, userName username.SQLUsername, id descpb.ID,
 ) (zonepb.ZoneConfig, bool, error) {
 	const query = `SELECT crdb_internal.get_zone_config($1)`
 	row, cols, err := s.server.sqlServer.internalExecutor.QueryRowExWithCols(
@@ -3245,7 +3246,7 @@ func (s *adminServer) queryZone(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) queryZonePath(
-	ctx context.Context, userName security.SQLUsername, path []descpb.ID,
+	ctx context.Context, userName username.SQLUsername, path []descpb.ID,
 ) (descpb.ID, zonepb.ZoneConfig, bool, error) {
 	for i := len(path) - 1; i >= 0; i-- {
 		zone, zoneExists, err := s.queryZone(ctx, userName, path[i])
@@ -3260,7 +3261,7 @@ func (s *adminServer) queryZonePath(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) queryDatabaseID(
-	ctx context.Context, userName security.SQLUsername, name string,
+	ctx context.Context, userName username.SQLUsername, name string,
 ) (descpb.ID, error) {
 	const query = `SELECT crdb_internal.get_database_id($1)`
 	row, cols, err := s.server.sqlServer.internalExecutor.QueryRowExWithCols(
@@ -3297,7 +3298,7 @@ func (s *adminServer) queryDatabaseID(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (s *adminServer) queryTableID(
-	ctx context.Context, username security.SQLUsername, database string, tableName string,
+	ctx context.Context, username username.SQLUsername, database string, tableName string,
 ) (descpb.ID, error) {
 	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "admin-resolve-name", nil,
@@ -3339,7 +3340,7 @@ type adminPrivilegeChecker struct {
 // requireAdminUser's error return is a gRPC error.
 func (c *adminPrivilegeChecker) requireAdminUser(
 	ctx context.Context,
-) (userName security.SQLUsername, err error) {
+) (userName username.SQLUsername, err error) {
 	userName, isAdmin, err := c.getUserAndRole(ctx)
 	if err != nil {
 		return userName, serverError(ctx, err)
@@ -3431,7 +3432,7 @@ func (c *adminPrivilegeChecker) requireViewActivityAndNoViewActivityRedactedPerm
 // responsibility to convert them to serverErrors.
 func (c *adminPrivilegeChecker) getUserAndRole(
 	ctx context.Context,
-) (userName security.SQLUsername, isAdmin bool, err error) {
+) (userName username.SQLUsername, isAdmin bool, err error) {
 	userName, err = userFromContext(ctx)
 	if err != nil {
 		return userName, false, err
@@ -3443,7 +3444,7 @@ func (c *adminPrivilegeChecker) getUserAndRole(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (c *adminPrivilegeChecker) hasAdminRole(
-	ctx context.Context, user security.SQLUsername,
+	ctx context.Context, user username.SQLUsername,
 ) (bool, error) {
 	if user.IsRootUser() {
 		// Shortcut.
@@ -3472,7 +3473,7 @@ func (c *adminPrivilegeChecker) hasAdminRole(
 // Note that the function returns plain errors, and it is the caller's
 // responsibility to convert them to serverErrors.
 func (c *adminPrivilegeChecker) hasRoleOption(
-	ctx context.Context, user security.SQLUsername, roleOption roleoption.Option,
+	ctx context.Context, user username.SQLUsername, roleOption roleoption.Option,
 ) (bool, error) {
 	if user.IsRootUser() {
 		// Shortcut.

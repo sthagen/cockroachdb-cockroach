@@ -40,14 +40,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
@@ -396,7 +397,7 @@ func TestStatusGetFiles(t *testing.T) {
 	ts := tsI.(*TestServer)
 	defer ts.Stopper().Stop(context.Background())
 
-	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := newRPCTestContext(context.Background(), ts, rootConfig)
 
 	url := ts.ServingRPCAddr()
@@ -1128,6 +1129,37 @@ func TestHotRanges2Response(t *testing.T) {
 	}
 }
 
+func TestHotRanges2ResponseWithViewActivityOptions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	db := sqlutils.MakeSQLRunner(sqlDB)
+
+	req := &serverpb.HotRangesRequest{}
+	var hotRangesResp serverpb.HotRangesResponseV2
+	if err := postStatusJSONProtoWithAdminOption(s, "v2/hotranges", req, &hotRangesResp, false); err != nil {
+		if !testutils.IsError(err, "status: 403") {
+			t.Fatalf("expected privilege error, got %v", err)
+		}
+	}
+
+	// Grant VIEWACTIVITY and all test should work.
+	db.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
+	if err := postStatusJSONProtoWithAdminOption(s, "v2/hotranges", req, &hotRangesResp, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Grant VIEWACTIVITYREDACTED and all test should get permission errors.
+	db.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", authenticatedUserNameNoAdmin().Normalized()))
+	if err := postStatusJSONProtoWithAdminOption(s, "v2/hotranges", req, &hotRangesResp, false); err != nil {
+		if !testutils.IsError(err, "status: 403") {
+			t.Fatalf("expected privilege error, got %v", err)
+		}
+	}
+}
+
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1408,7 +1440,7 @@ func TestNodesGRPCResponse(t *testing.T) {
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
-	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := newRPCTestContext(context.Background(), ts, rootConfig)
 	var request serverpb.NodesRequest
 
@@ -1572,7 +1604,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 
 	thirdServer := testCluster.Server(2)
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, thirdServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(security.RootUser))
+		t, thirdServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
 	defer cleanupGoDB()
 	firstServerProto := testCluster.Server(0)
 
@@ -1707,7 +1739,7 @@ func TestStatusAPITransactions(t *testing.T) {
 
 	thirdServer := testCluster.Server(2)
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, thirdServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(security.RootUser))
+		t, thirdServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
 	defer cleanupGoDB()
 	firstServerProto := testCluster.Server(0)
 
@@ -2384,8 +2416,8 @@ func TestListSessionsSecurity(t *testing.T) {
 				{"sessions", ""},
 				{fmt.Sprintf("local_sessions?username=%s", myUser.Normalized()), ""},
 				{fmt.Sprintf("sessions?username=%s", myUser.Normalized()), ""},
-				{"local_sessions?username=" + security.RootUser, expectedErrOnListingRootSessions},
-				{"sessions?username=" + security.RootUser, expectedErrOnListingRootSessions},
+				{"local_sessions?username=" + username.RootUser, expectedErrOnListingRootSessions},
+				{"sessions?username=" + username.RootUser, expectedErrOnListingRootSessions},
 			}
 			for _, tc := range testCases {
 				var response serverpb.ListSessionsResponse
@@ -2411,7 +2443,7 @@ func TestListSessionsSecurity(t *testing.T) {
 	}
 
 	// gRPC requests behave as root and thus are always allowed.
-	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := newRPCTestContext(ctx, ts, rootConfig)
 	url := ts.ServingRPCAddr()
 	nodeID := ts.NodeID()
@@ -2421,7 +2453,7 @@ func TestListSessionsSecurity(t *testing.T) {
 	}
 	client := serverpb.NewStatusClient(conn)
 
-	for _, user := range []string{"", authenticatedUser, security.RootUser} {
+	for _, user := range []string{"", authenticatedUser, username.RootUser} {
 		request := &serverpb.ListSessionsRequest{Username: user}
 		if resp, err := client.ListLocalSessions(ctx, request); err != nil || len(resp.Errors) > 0 {
 			t.Errorf("unexpected failure listing local sessions for %q; error: %v; response errors: %v",
@@ -2513,7 +2545,7 @@ func TestListActivitySecurity(t *testing.T) {
 	}
 
 	// gRPC requests behave as root and thus are always allowed.
-	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := newRPCTestContext(ctx, ts, rootConfig)
 	url := ts.ServingRPCAddr()
 	nodeID := ts.NodeID()
@@ -2887,7 +2919,7 @@ func TestJobStatusResponse(t *testing.T) {
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
-	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := newRPCTestContext(context.Background(), ts, rootConfig)
 
 	url := ts.ServingRPCAddr()
@@ -2910,7 +2942,7 @@ func TestJobStatusResponse(t *testing.T) {
 		jobs.Record{
 			Description: "testing",
 			Statements:  []string{"SELECT 1"},
-			Username:    security.RootUserName(),
+			Username:    username.RootUserName(),
 			Details: jobspb.ImportDetails{
 				Tables: []jobspb.ImportDetails_Table{
 					{
@@ -3106,6 +3138,9 @@ func TestStatusAPIContentionEvents(t *testing.T) {
 	server1Conn := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
 	server2Conn := sqlutils.MakeSQLRunner(testCluster.ServerConn(1))
 
+	contentionCountBefore := testCluster.Server(1).SQLServer().(*sql.Server).
+		Metrics.EngineMetrics.SQLContendedTxns.Count()
+
 	sqlutils.CreateTable(
 		t,
 		testCluster.ServerConn(0),
@@ -3182,6 +3217,13 @@ SET TRACING=off;
     (statistics -> 'execution_statistics' -> 'contentionTime' ->> 'mean')::FLOAT > 0
     AND app_name = 'contentionTest'
 `, [][]string{{"1"}})
+
+	contentionCountNow := testCluster.Server(1).SQLServer().(*sql.Server).
+		Metrics.EngineMetrics.SQLContendedTxns.Count()
+
+	require.Greaterf(t, contentionCountNow, contentionCountBefore,
+		"expected txn contention count to be more than %d, but it is %d",
+		contentionCountBefore, contentionCountNow)
 }
 
 func TestStatusCancelSessionGatewayMetadataPropagation(t *testing.T) {
@@ -3627,7 +3669,7 @@ func TestTransactionContentionEvents(t *testing.T) {
 					"test-contending-key-redaction",
 					nil, /* txn */
 					sessiondata.InternalExecutorOverride{
-						User: security.MakeSQLUsernameFromPreNormalizedString(tc.userName),
+						User: username.MakeSQLUsernameFromPreNormalizedString(tc.userName),
 					},
 					`
 				SELECT count(*)
@@ -3694,7 +3736,7 @@ func TestUnprivilegedUserResetIndexUsageStats(t *testing.T) {
 		"test-reset-index-usage-stats-as-non-admin-user",
 		nil, /* txn */
 		sessiondata.InternalExecutorOverride{
-			User: security.MakeSQLUsernameFromPreNormalizedString("nonAdminUser"),
+			User: username.MakeSQLUsernameFromPreNormalizedString("nonAdminUser"),
 		},
 		"SELECT crdb_internal.reset_index_usage_stats()",
 	)

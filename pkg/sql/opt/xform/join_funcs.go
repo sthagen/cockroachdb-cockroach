@@ -341,8 +341,18 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 	md := c.e.mem.Metadata()
 	inputProps := input.Relational()
 
-	leftEq, rightEq := memo.ExtractJoinEqualityColumns(inputProps.OutputCols, rightCols, on)
-	if len(leftEq) == 0 {
+	var cb lookupjoin.ConstraintBuilder
+	if ok := cb.Init(
+		c.e.f,
+		c.e.mem.Metadata(),
+		c.e.evalCtx,
+		scanPrivate.Table,
+		inputProps.OutputCols,
+		rightCols,
+		on,
+	); !ok {
+		// No lookup joins can be generated with the given filters and
+		// left/right columns.
 		return
 	}
 
@@ -354,9 +364,6 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 
 	var pkCols opt.ColList
 	var iter scanIndexIter
-	var cb lookupjoin.ConstraintBuilder
-	cb.Init(c.e.f, c.e.mem.Metadata(), c.e.evalCtx, scanPrivate.Table,
-		inputProps.OutputCols, rightCols, leftEq, rightEq)
 	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, on, rejectInvertedIndexes)
 	iter.ForEach(func(index cat.Index, onFilters memo.FiltersExpr, indexCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		// Skip indexes that do no cover all virtual projection columns, if
@@ -385,6 +392,8 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 		lookupJoin.Locking = scanPrivate.Locking
 		lookupJoin.KeyCols = lookupConstraint.KeyCols
 		lookupJoin.LookupExpr = lookupConstraint.LookupExpr
+		lookupJoin.On = lookupConstraint.RemainingFilters
+		lookupJoin.ConstFilters = lookupConstraint.ConstFilters
 
 		// Wrap the input in a Project if any projections are required. The
 		// lookup join will project away these synthesized columns.
@@ -400,16 +409,6 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 		// A lookup join will drop any input row which contains NULLs, so a lax key
 		// is sufficient.
 		lookupJoin.LookupColsAreTableKey = tableFDs.ColsAreLaxKey(lookupConstraint.RightSideCols.ToSet())
-
-		// Remove redundant filters from the ON condition if columns were
-		// constrained by equality filters or constant filters.
-		lookupJoin.On = onFilters
-		if len(lookupJoin.KeyCols) > 0 {
-			lookupJoin.On = memo.ExtractRemainingJoinFilters(lookupJoin.On, lookupJoin.KeyCols, lookupConstraint.RightSideCols)
-		}
-		lookupJoin.On = lookupJoin.On.Difference(lookupJoin.LookupExpr)
-		lookupJoin.On = lookupJoin.On.Difference(lookupConstraint.ConstFilters)
-		lookupJoin.ConstFilters = lookupConstraint.ConstFilters
 
 		// Add input columns and lookup expression columns, since these will be
 		// needed for all join types and cases.
@@ -606,29 +605,6 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 	})
 }
 
-// makeConstFilter builds a filter that constrains the given column to the given
-// set of constant values. This is performed by either constructing an equality
-// expression or an IN expression.
-func (c *CustomFuncs) makeConstFilter(col opt.ColumnID, values tree.Datums) memo.FiltersItem {
-	if len(values) == 1 {
-		return c.e.f.ConstructFiltersItem(c.e.f.ConstructEq(
-			c.e.f.ConstructVariable(col),
-			c.e.f.ConstructConstVal(values[0], values[0].ResolvedType()),
-		))
-	}
-	elems := make(memo.ScalarListExpr, len(values))
-	elemTypes := make([]*types.T, len(values))
-	for i := range values {
-		typ := values[i].ResolvedType()
-		elems[i] = c.e.f.ConstructConstVal(values[i], typ)
-		elemTypes[i] = typ
-	}
-	return c.e.f.ConstructFiltersItem(c.e.f.ConstructIn(
-		c.e.f.ConstructVariable(col),
-		c.e.f.ConstructTuple(elems, types.MakeTuple(elemTypes)),
-	))
-}
-
 // constructContinuationColumnForPairedJoin constructs a continuation column
 // ID for the paired-joiners used for left outer/semi/anti joins when the
 // first join generates false positives (due to an inverted index or
@@ -716,7 +692,7 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 			}
 
 			// Try to constrain prefixCol to constant, non-ranging values.
-			foundVals, allIdx, ok := c.findJoinFilterConstants(allFilters, prefixCol)
+			foundVals, allIdx, ok := lookupjoin.FindJoinFilterConstants(allFilters, prefixCol, c.e.evalCtx)
 			if !ok {
 				// Cannot constrain prefix column and therefore cannot generate
 				// an inverted join.
@@ -937,43 +913,6 @@ func (c *CustomFuncs) mapInvertedJoin(
 	invertedJoin.ConstFilters = *constFilters
 	on := c.e.f.RemapCols(&invertedJoin.On, srcColsToDstCols).(*memo.FiltersExpr)
 	invertedJoin.On = *on
-}
-
-// findJoinFilterConstants tries to find a filter that is exactly equivalent to
-// constraining the given column to a constant value or a set of constant
-// values. If successful, the constant values and the index of the constraining
-// FiltersItem are returned. If multiple filters match, the one that minimizes
-// the number of returned values is chosen. Note that the returned constant
-// values do not contain NULL.
-func (c *CustomFuncs) findJoinFilterConstants(
-	filters memo.FiltersExpr, col opt.ColumnID,
-) (values tree.Datums, filterIdx int, ok bool) {
-	var bestValues tree.Datums
-	var bestFilterIdx int
-	for filterIdx := range filters {
-		props := filters[filterIdx].ScalarProps()
-		if props.TightConstraints {
-			constCol, constVals, ok := props.Constraints.HasSingleColumnConstValues(c.e.evalCtx)
-			if !ok || constCol != col {
-				continue
-			}
-			hasNull := false
-			for i := range constVals {
-				if constVals[i] == tree.DNull {
-					hasNull = true
-					break
-				}
-			}
-			if !hasNull && (bestValues == nil || len(bestValues) > len(constVals)) {
-				bestValues = constVals
-				bestFilterIdx = filterIdx
-			}
-		}
-	}
-	if bestValues == nil {
-		return nil, -1, false
-	}
-	return bestValues, bestFilterIdx, true
 }
 
 // constructJoinWithConstants constructs a cross join that joins every row in
@@ -1281,11 +1220,11 @@ func (c *CustomFuncs) GetLocalityOptimizedLookupJoinExprs(
 	// partitions or only remote partitions.
 	localExpr = make(memo.FiltersExpr, len(private.LookupExpr))
 	copy(localExpr, private.LookupExpr)
-	localExpr[filterIdx] = c.makeConstFilter(col, localValues)
+	localExpr[filterIdx] = c.e.f.ConstructConstFilter(col, localValues)
 
 	remoteExpr = make(memo.FiltersExpr, len(private.LookupExpr))
 	copy(remoteExpr, private.LookupExpr)
-	remoteExpr[filterIdx] = c.makeConstFilter(col, remoteValues)
+	remoteExpr[filterIdx] = c.e.f.ConstructConstFilter(col, remoteValues)
 
 	return localExpr, remoteExpr, true
 }

@@ -430,6 +430,12 @@ type TableDescriptor interface {
 	// canonical order, see Index.Ordinal().
 	FindIndexWithName(name string) (Index, error)
 
+	// FindNonDropIndexWithName returns the first catalog.Index that matches the name in
+	// the set of all non-drp[ indexes, excluding the primary index of non-physical
+	// tables, or an error if none was found. The order of traversal is the
+	// canonical order, see catalog.Index.Ordinal().
+	FindNonDropIndexWithName(name string) (Index, error)
+
 	// GetNextIndexID returns the next unused index ID for the table. Index IDs
 	// are unique within a table, but not globally.
 	GetNextIndexID() descpb.IndexID
@@ -622,6 +628,8 @@ type TableDescriptor interface {
 	GetConstraintInfoWithLookup(fn TableLookupFn) (map[string]descpb.ConstraintDetail, error)
 	// GetConstraintInfo returns a summary of all constraints on the table.
 	GetConstraintInfo() (map[string]descpb.ConstraintDetail, error)
+	// FindConstraintWithID returns a constraint given a constraint id.
+	FindConstraintWithID(id descpb.ConstraintID) (*descpb.ConstraintDetail, error)
 
 	// GetUniqueWithoutIndexConstraints returns all the unique constraints defined
 	// on this table that are not enforced by an index.
@@ -684,6 +692,25 @@ type TableDescriptor interface {
 	GetExcludeDataFromBackup() bool
 	// GetStorageParams returns a list of storage parameters for the table.
 	GetStorageParams(spaceBetweenEqual bool) []string
+	// NoAutoStatsSettingsOverrides is true if no auto stats related settings are
+	// set at the table level for the given table.
+	NoAutoStatsSettingsOverrides() bool
+	// AutoStatsCollectionEnabled indicates if automatic statistics collection is
+	// explicitly enabled or disabled for this table.
+	AutoStatsCollectionEnabled() catpb.AutoStatsCollectionStatus
+	// AutoStatsMinStaleRows indicates the setting of
+	// sql_stats_automatic_collection_min_stale_rows for this table.
+	// If ok is true, then the minStaleRows value is valid, otherwise this has not
+	// been set at the table level.
+	AutoStatsMinStaleRows() (minStaleRows int64, ok bool)
+	// AutoStatsFractionStaleRows indicates the setting of
+	// sql_stats_automatic_collection_fraction_stale_rows for this table. If ok is
+	// true, then the fractionStaleRows value is valid, otherwise this has not
+	// been set at the table level.
+	AutoStatsFractionStaleRows() (fractionStaleRows float64, ok bool)
+	// GetAutoStatsSettings returns the table settings related to automatic
+	// statistics collection. May return nil if none are set.
+	GetAutoStatsSettings() *catpb.AutoStatsSettings
 }
 
 // TypeDescriptor will eventually be called typedesc.Descriptor.

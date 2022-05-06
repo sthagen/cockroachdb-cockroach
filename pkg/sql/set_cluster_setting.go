@@ -22,10 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
@@ -38,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -229,7 +229,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 	// Report tracked cluster settings via telemetry.
 	// TODO(justin): implement a more general mechanism for tracking these.
 	switch n.name {
-	case stats.AutoStatsClusterSettingName:
+	case catpb.AutoStatsEnabledSettingName:
 		switch expectedEncodedValue {
 		case "true":
 			telemetry.Inc(sqltelemetry.TurnAutoStatsOnUseCounter)
@@ -281,7 +281,7 @@ func writeSettingInternal(
 	execCfg *ExecutorConfig,
 	setting settings.NonMaskedSetting,
 	name string,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	st *cluster.Settings,
 	value tree.TypedExpr,
 	evalCtx *eval.Context,
@@ -336,7 +336,7 @@ func writeDefaultSettingValue(
 	expectedEncodedValue = setting.EncodedDefault()
 	_, err = execCfg.InternalExecutor.ExecEx(
 		ctx, "reset-setting", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		"DELETE FROM system.settings WHERE name = $1", name,
 	)
 	return reportedValue, expectedEncodedValue, err
@@ -350,7 +350,7 @@ func writeNonDefaultSettingValue(
 	setting settings.NonMaskedSetting,
 	name string,
 	txn *kv.Txn,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	st *cluster.Settings,
 	value tree.Datum,
 	forSystemTenant bool,
@@ -375,7 +375,7 @@ func writeNonDefaultSettingValue(
 		// Modifying another setting than the version.
 		if _, err = execCfg.InternalExecutor.ExecEx(
 			ctx, "update-setting", txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 			name, encoded, setting.Typ(),
 		); err != nil {
@@ -403,7 +403,7 @@ func setVersionSetting(
 	setting *settings.VersionSetting,
 	name string,
 	txn *kv.Txn,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	st *cluster.Settings,
 	value tree.Datum,
 	encoded string,
@@ -414,7 +414,7 @@ func setVersionSetting(
 	// value change is valid.
 	datums, err := execCfg.InternalExecutor.QueryRowEx(
 		ctx, "retrieve-prev-setting", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		"SELECT value FROM system.settings WHERE name = $1", name,
 	)
 	if err != nil {
@@ -468,7 +468,7 @@ func setVersionSetting(
 			// Confirm if the version has actually changed on us.
 			datums, err := execCfg.InternalExecutor.QueryRowEx(
 				ctx, "retrieve-prev-setting", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				"SELECT value FROM system.settings WHERE name = $1", name,
 			)
 			if err != nil {
@@ -496,7 +496,7 @@ func setVersionSetting(
 			// Only if the version has increased, alter the setting.
 			_, err = execCfg.InternalExecutor.ExecEx(
 				ctx, "update-setting", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 				name, string(rawValue), setting.Typ(),
 			)
@@ -550,7 +550,7 @@ func waitForSettingUpdate(
 func runMigrationsAndUpgradeVersion(
 	ctx context.Context,
 	execCfg *ExecutorConfig,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	prev tree.Datum,
 	value tree.Datum,
 	updateVersionSystemSetting UpdateVersionSystemSettingHook,

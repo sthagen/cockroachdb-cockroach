@@ -19,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -49,7 +49,7 @@ func WithBuilderDependenciesFromTestServer(
 	ip, cleanup := sql.NewInternalPlanner(
 		"test",
 		kv.NewTxn(context.Background(), s.DB(), s.NodeID()),
-		security.RootUserName(),
+		username.RootUserName(),
 		&sql.MemoryMetrics{},
 		&execCfg,
 		// Setting the database on the session data to "defaultdb" in the obvious
@@ -66,6 +66,9 @@ func WithBuilderDependenciesFromTestServer(
 		scbuild.AstFormatter
 		scbuild.FeatureChecker
 	})
+
+	// Use "defaultdb" as current database.
+	planner.SessionData().Database = "defaultdb"
 	// For setting up a builder inside tests we will ensure that the new schema
 	// changer will allow non-fully implemented operations.
 	planner.SessionData().NewSchemaChangerMode = sessiondatapb.UseNewSchemaChangerUnsafe
@@ -74,10 +77,10 @@ func WithBuilderDependenciesFromTestServer(
 		execCfg.Codec,
 		planner.Txn(),
 		planner.Descriptors(),
-		planner, /* schemaResolver */
-		planner, /* authAccessor */
-		planner, /* astFormatter */
-		planner, /* featureChecker */
+		sql.NewSkippingCacheSchemaResolver, /* schemaResolverFactory */
+		planner,                            /* authAccessor */
+		planner,                            /* astFormatter */
+		planner,                            /* featureChecker */
 		planner.SessionData(),
 		execCfg.Settings,
 		nil, /* statements */

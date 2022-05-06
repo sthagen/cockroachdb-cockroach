@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -1176,14 +1177,14 @@ var varGen = map[string]sessionVar{
 	`role`: {
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			if evalCtx.SessionData().SessionUserProto == "" {
-				return security.NoneRole, nil
+				return username.NoneRole, nil
 			}
 			return evalCtx.SessionData().User().Normalized(), nil
 		},
 		// SetWithPlanner is defined in init(), as otherwise there is a circular
 		// initialization loop with the planner.
 		GlobalDefault: func(sv *settings.Values) string {
-			return security.NoneRole
+			return username.NoneRole
 		},
 	},
 
@@ -2088,6 +2089,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalTrue,
 	},
+
+	// CockroachDB extension.
+	`testing_optimizer_random_cost_seed`: {
+		GetStringVal: makeIntGetStringValFn(`testing_optimizer_random_cost_seed`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			m.SetTestingOptimizerRandomCostSeed(i)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return strconv.FormatInt(evalCtx.SessionData().TestingOptimizerRandomCostSeed, 10), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatInt(0, 10)
+		},
+	},
 }
 
 const compatErrMsg = "this parameter is currently recognized only for compatibility and has no effect in CockroachDB."
@@ -2102,7 +2122,7 @@ func init() {
 		{
 			name: `role`,
 			fn: func(ctx context.Context, p *planner, local bool, s string) error {
-				u, err := security.MakeSQLUsernameFromUserInput(s, security.UsernameValidation)
+				u, err := username.MakeSQLUsernameFromUserInput(s, username.PurposeValidation)
 				if err != nil {
 					return err
 				}

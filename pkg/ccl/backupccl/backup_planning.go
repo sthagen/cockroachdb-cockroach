@@ -35,7 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -72,6 +72,7 @@ const (
 	defaultLocalityValue      = "default"
 	backupOptDebugMetadataSST = "debug_dump_metadata_sst"
 	backupOptEncDir           = "encryption_info_dir"
+	backupOptCheckFiles       = "check_files"
 )
 
 type tableAndIndex struct {
@@ -726,7 +727,7 @@ func backupPlanHook(
 			if !p.ExecCfg().Codec.ForSystemTenant() {
 				return pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can backup other tenants")
 			}
-			initialDetails.SpecificTenantIds = []roachpb.TenantID{backupStmt.Targets.TenantID.TenantID}
+			initialDetails.SpecificTenantIds = []roachpb.TenantID{roachpb.MakeTenantID(backupStmt.Targets.TenantID.ID)}
 		}
 
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
@@ -1044,7 +1045,7 @@ func writeBackupManifestCheckpoint(
 	encryption *jobspb.BackupEncryptionOptions,
 	desc *BackupManifest,
 	execCfg *sql.ExecutorConfig,
-	user security.SQLUsername,
+	user username.SQLUsername,
 ) error {
 	defaultStore, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, storageURI, user)
 	if err != nil {
@@ -1436,7 +1437,7 @@ func getBackupDetailAndManifest(
 	execCfg *sql.ExecutorConfig,
 	txn *kv.Txn,
 	initialDetails jobspb.BackupDetails,
-	user security.SQLUsername,
+	user username.SQLUsername,
 ) (jobspb.BackupDetails, BackupManifest, error) {
 	makeCloudStorage := execCfg.DistSQLSrv.ExternalStorageFromURI
 	// TODO(pbardea): Refactor (defaultURI and urisByLocalityKV) pairs into a

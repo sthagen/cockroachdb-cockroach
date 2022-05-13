@@ -12,6 +12,7 @@ package kvserver
 
 import (
 	"context"
+	"fmt"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
@@ -451,18 +452,41 @@ var (
 		Measurement: "SSTables",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaRdbL0Sublevels = metric.Metadata{
-		Name:        "storage.l0-sublevels",
-		Help:        "Number of Level 0 sublevels",
-		Measurement: "Storage",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaRdbL0NumFiles = metric.Metadata{
-		Name:        "storage.l0-num-files",
-		Help:        "Number of Level 0 files",
-		Measurement: "Storage",
-		Unit:        metric.Unit_COUNT,
-	}
+	// NB: bytes only ever get flushed into L0, so this metric does not
+	// exist for any other level.
+	metaRdbL0BytesFlushed = storageLevelMetricMetadata(
+		"bytes-flushed",
+		"Number of bytes flushed (from memtables) into Level %d",
+		"Bytes",
+		metric.Unit_BYTES,
+	)[0]
+
+	// NB: sublevels is trivial (zero or one) except on L0.
+	metaRdbL0Sublevels = storageLevelMetricMetadata(
+		"sublevels",
+		"Number of Level %d sublevels",
+		"Sublevels",
+		metric.Unit_COUNT,
+	)[0]
+
+	// NB: we only expose the file count in L0 because it matters for
+	// admission control. The other file counts are less interesting.
+	metaRdbL0NumFiles = storageLevelMetricMetadata(
+		"num-files",
+		"Number of SSTables in Level %d",
+		"SSTables",
+		metric.Unit_COUNT,
+	)[0]
+)
+
+var metaRdbBytesIngested = storageLevelMetricMetadata(
+	"bytes-ingested",
+	"Number of bytes ingested directly into Level %d",
+	"Bytes",
+	metric.Unit_BYTES,
+)
+
+var (
 	metaRdbWriteStalls = metric.Metadata{
 		Name:        "storage.write-stalls",
 		Help:        "Number of instances of intentional write stalls to backpressure incoming writes",
@@ -777,10 +801,37 @@ of processing.
 	}
 	metaRaftRcvdDropped = metric.Metadata{
 		Name:        "raft.rcvd.dropped",
-		Help:        "Number of dropped incoming Raft messages",
+		Help:        "Number of incoming Raft messages dropped (due to queue length or size)",
 		Measurement: "Messages",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRaftRcvdDroppedBytes = metric.Metadata{
+		Name:        "raft.rcvd.dropped_bytes",
+		Help:        "Bytes of dropped incoming Raft messages",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftRcvdQueuedBytes = metric.Metadata{
+		Name:        "raft.rcvd.queued_bytes",
+		Help:        "Number of bytes in messages currently waiting for raft processing",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftRcvdSteppedBytes = metric.Metadata{
+		Name: "raft.rcvd.stepped_bytes",
+		Help: `Number of bytes in messages processed by Raft.
+
+Messages reflected here have been handed to Raft (via RawNode.Step). This does not imply that the
+messages are no longer held in memory or that IO has been performed. Raft delegates IO activity to
+Raft ready handling, which occurs asynchronously. Since handing messages to Raft serializes with
+Raft ready handling and size the size of an entry is dominated by the contained pebble WriteBatch,
+on average the rate at which this metric increases is a good proxy for the rate at which Raft ready
+handling consumes writes.
+`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+
 	metaRaftEnqueuedPending = metric.Metadata{
 		Name: "raft.enqueued.pending",
 		Help: `Number of pending outgoing messages in the Raft Transport queue.
@@ -1416,7 +1467,13 @@ type StoreMetrics struct {
 	// Server-side transaction metrics.
 	CommitWaitsBeforeCommitTrigger *metric.Counter
 
-	// RocksDB metrics.
+	// Storage (pebble) metrics. Some are named RocksDB which is what we used
+	// before pebble, and this name is kept for backwards compatibility despite
+	// the backing metrics now originating from pebble.
+	//
+	// All of these are cumulative values. They are maintained by pebble and
+	// so we have to expose them as gauges (lest we start tracking deltas from
+	// the respective last stats we got from pebble).
 	RdbBlockCacheHits           *metric.Gauge
 	RdbBlockCacheMisses         *metric.Gauge
 	RdbBlockCacheUsage          *metric.Gauge
@@ -1435,8 +1492,10 @@ type StoreMetrics struct {
 	RdbNumSSTables              *metric.Gauge
 	RdbPendingCompaction        *metric.Gauge
 	RdbMarkedForCompactionFiles *metric.Gauge
+	RdbL0BytesFlushed           *metric.Gauge
 	RdbL0Sublevels              *metric.Gauge
 	RdbL0NumFiles               *metric.Gauge
+	RdbBytesIngested            [7]*metric.Gauge // idx = level
 	RdbWriteStalls              *metric.Gauge
 
 	// Disk health metrics.
@@ -1480,8 +1539,11 @@ type StoreMetrics struct {
 	// Raft message metrics.
 	//
 	// An array for conveniently finding the appropriate metric.
-	RaftRcvdMessages   [maxRaftMsgType + 1]*metric.Counter
-	RaftRcvdMsgDropped *metric.Counter
+	RaftRcvdMessages     [maxRaftMsgType + 1]*metric.Counter
+	RaftRcvdDropped      *metric.Counter
+	RaftRcvdDroppedBytes *metric.Counter
+	RaftRcvdQueuedBytes  *metric.Gauge
+	RaftRcvdSteppedBytes *metric.Counter
 
 	// Raft log metrics.
 	RaftLogFollowerBehindCount *metric.Gauge
@@ -1816,6 +1878,7 @@ func newTenantsStorageMetrics() *TenantsStorageMetrics {
 
 func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 	storeRegistry := metric.NewRegistry()
+	rdbBytesIngested := storageLevelGaugeSlice(metaRdbBytesIngested)
 	sm := &StoreMetrics{
 		registry:              storeRegistry,
 		TenantsStorageMetrics: newTenantsStorageMetrics(),
@@ -1856,6 +1919,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		// Rebalancing metrics.
 		AverageQueriesPerSecond: metric.NewGaugeFloat64(metaAverageQueriesPerSecond),
 		AverageWritesPerSecond:  metric.NewGaugeFloat64(metaAverageWritesPerSecond),
+		// TODO(tbg): this histogram seems bogus? What are we tracking here?
 		L0SubLevelsHistogram: metric.NewHistogram(
 			metaL0SubLevelHistogram,
 			allocatorimpl.L0SublevelInterval,
@@ -1892,8 +1956,10 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbNumSSTables:              metric.NewGauge(metaRdbNumSSTables),
 		RdbPendingCompaction:        metric.NewGauge(metaRdbPendingCompaction),
 		RdbMarkedForCompactionFiles: metric.NewGauge(metaRdbMarkedForCompactionFiles),
+		RdbL0BytesFlushed:           metric.NewGauge(metaRdbL0BytesFlushed),
 		RdbL0Sublevels:              metric.NewGauge(metaRdbL0Sublevels),
 		RdbL0NumFiles:               metric.NewGauge(metaRdbL0NumFiles),
+		RdbBytesIngested:            rdbBytesIngested,
 		RdbWriteStalls:              metric.NewGauge(metaRdbWriteStalls),
 
 		// Disk health metrics.
@@ -1945,7 +2011,10 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 			raftpb.MsgTransferLeader: metric.NewCounter(metaRaftRcvdTransferLeader),
 			raftpb.MsgTimeoutNow:     metric.NewCounter(metaRaftRcvdTimeoutNow),
 		},
-		RaftRcvdMsgDropped: metric.NewCounter(metaRaftRcvdDropped),
+		RaftRcvdDropped:      metric.NewCounter(metaRaftRcvdDropped),
+		RaftRcvdDroppedBytes: metric.NewCounter(metaRaftRcvdDroppedBytes),
+		RaftRcvdQueuedBytes:  metric.NewGauge(metaRaftRcvdQueuedBytes),
+		RaftRcvdSteppedBytes: metric.NewCounter(metaRaftRcvdSteppedBytes),
 
 		// Raft log metrics.
 		RaftLogFollowerBehindCount: metric.NewGauge(metaRaftLogFollowerBehindCount),
@@ -2124,13 +2193,18 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbReadAmplification.Update(int64(m.ReadAmp()))
 	sm.RdbPendingCompaction.Update(int64(m.Compact.EstimatedDebt))
 	sm.RdbMarkedForCompactionFiles.Update(int64(m.Compact.MarkedFiles))
-	sm.RdbL0Sublevels.Update(int64(m.Levels[0].Sublevels))
 	sm.L0SubLevelsHistogram.RecordValue(int64(m.Levels[0].Sublevels))
-	sm.RdbL0NumFiles.Update(m.Levels[0].NumFiles)
 	sm.RdbNumSSTables.Update(m.NumSSTables())
 	sm.RdbWriteStalls.Update(m.WriteStallCount)
 	sm.DiskSlow.Update(m.DiskSlowCount)
 	sm.DiskStalled.Update(m.DiskStallCount)
+
+	sm.RdbL0Sublevels.Update(int64(m.Levels[0].Sublevels))
+	sm.RdbL0NumFiles.Update(m.Levels[0].NumFiles)
+	sm.RdbL0BytesFlushed.Update(int64(m.Levels[0].BytesFlushed))
+	for level, stats := range m.Levels {
+		sm.RdbBytesIngested[level].Update(int64(stats.BytesIngested))
+	}
 }
 
 func (sm *StoreMetrics) updateEnvStats(stats storage.EnvStats) {
@@ -2160,4 +2234,27 @@ func (sm *StoreMetrics) handleMetricsResult(ctx context.Context, metric result.M
 	if metric != (result.Metrics{}) {
 		log.Fatalf(ctx, "unhandled fields in metrics result: %+v", metric)
 	}
+}
+
+func storageLevelMetricMetadata(
+	name, helpTpl, measurement string, unit metric.Unit,
+) [7]metric.Metadata {
+	var sl [7]metric.Metadata
+	for i := range sl {
+		sl[i] = metric.Metadata{
+			Name:        fmt.Sprintf("storage.l%d-%s", i, name),
+			Help:        fmt.Sprintf(helpTpl, i),
+			Measurement: measurement,
+			Unit:        unit,
+		}
+	}
+	return sl
+}
+
+func storageLevelGaugeSlice(sl [7]metric.Metadata) [7]*metric.Gauge {
+	var gs [7]*metric.Gauge
+	for i := range sl {
+		gs[i] = metric.NewGauge(sl[i])
+	}
+	return gs
 }

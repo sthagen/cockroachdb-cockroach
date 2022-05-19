@@ -43,7 +43,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -65,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -820,10 +820,11 @@ var logicTestConfigs = []testClusterConfig{
 		// logictest command.
 		// To run a logic test with this config as a directive, run:
 		// make test PKG=./pkg/ccl/logictestccl TESTS=TestTenantLogic//<test_name>
-		name:        threeNodeTenantConfigName,
-		numNodes:    3,
-		useTenant:   true,
-		isCCLConfig: true,
+		name:                threeNodeTenantConfigName,
+		numNodes:            3,
+		useTenant:           true,
+		isCCLConfig:         true,
+		overrideDistSQLMode: "on",
 	},
 	// Regions and zones below are named deliberately, and contain "-"'s to be reflective
 	// of the naming convention in public clouds.  "-"'s are handled differently in SQL
@@ -1749,10 +1750,10 @@ func (t *logicTest) newCluster(
 			from := clusterversion.ClusterVersion{Version: cfg.bootstrapVersion}
 			to := clusterversion.ClusterVersion{Version: cfg.binaryVersion}
 			if len(clusterversion.ListBetween(from, to)) == 0 {
-				mm, ok := nodeParams.Knobs.MigrationManager.(*migration.TestingKnobs)
+				mm, ok := nodeParams.Knobs.UpgradeManager.(*upgrade.TestingKnobs)
 				if !ok {
-					mm = &migration.TestingKnobs{}
-					nodeParams.Knobs.MigrationManager = mm
+					mm = &upgrade.TestingKnobs{}
+					nodeParams.Knobs.UpgradeManager = mm
 				}
 				mm.ListBetweenOverride = func(
 					from, to clusterversion.ClusterVersion,
@@ -3403,7 +3404,7 @@ func (t *logicTest) verifyError(
 		} else {
 			newErr := errors.Errorf("%s: %s\nexpected error code %q, but found success",
 				pos, sql, expectErrCode)
-			return (err != nil), newErr
+			return err != nil, newErr
 		}
 	}
 	return true, nil

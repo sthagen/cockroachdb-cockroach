@@ -99,14 +99,28 @@ func (p *planner) IncrementSequenceByID(ctx context.Context, seqID int64) (int64
 func incrementSequenceHelper(
 	ctx context.Context, p *planner, descriptor catalog.TableDescriptor,
 ) (int64, error) {
-	if err := p.CheckPrivilege(ctx, descriptor, privilege.UPDATE); err != nil {
-		return 0, err
+
+	requiredPrivileges := []privilege.Kind{privilege.USAGE, privilege.UPDATE}
+	hasRequiredPriviledge := false
+
+	for _, priv := range requiredPrivileges {
+		err := p.CheckPrivilege(ctx, descriptor, priv)
+		if err == nil {
+			hasRequiredPriviledge = true
+			break
+		}
+	}
+	if !hasRequiredPriviledge {
+
+		return 0, pgerror.Newf(pgcode.InsufficientPrivilege,
+			"user %s does not have UPDATE or USAGE privilege on %s %s",
+			p.User(), descriptor.DescriptorType(), descriptor.GetName())
 	}
 
+	var err error
 	seqOpts := descriptor.GetSequenceOpts()
 
 	var val int64
-	var err error
 	if seqOpts.Virtual {
 		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID.SQLInstanceID())
 		val = int64(rowid)
@@ -309,14 +323,14 @@ func (p *planner) SetSequenceValueByID(
 
 	createdInCurrentTxn := p.createdSequences.isCreatedSequence(descriptor.GetID())
 	if createdInCurrentTxn {
+		// The planner txn is only used if the sequence is accessed in the same
+		// transaction that it was created or restarted.
 		if err := p.txn.Put(ctx, seqValueKey, newVal); err != nil {
 			return err
 		}
 	} else {
-		// The planner txn is only used if the sequence is accessed in the same
-		// transaction that it was created. Otherwise, we *do not* use the planner
-		// txn here, since setval does not respect transaction boundaries.
-		// This matches the specification at
+		// Otherwise, we *do not* use the planner txn here, since setval does not
+		// respect transaction boundaries. This matches the specification at
 		// https://www.postgresql.org/docs/14/functions-sequence.html.
 		// TODO(vilterp): not supposed to mix usage of Inc and Put on a key,
 		// according to comments on Inc operation. Switch to Inc if `desired-current`
@@ -460,7 +474,6 @@ func assignSequenceOptions(
 	sequenceParentID descpb.ID,
 	existingType *types.T,
 ) error {
-
 	wasAscending := opts.Increment > 0
 
 	// Set the default integer type of a sequence.
@@ -532,6 +545,7 @@ func assignSequenceOptions(
 	}
 
 	// Fill in all other options.
+	var restartVal *int64
 	optionsSeen := map[string]bool{}
 	for _, option := range optsNode {
 		// Error on duplicate options.
@@ -568,6 +582,9 @@ func assignSequenceOptions(
 			}
 		case tree.SeqOptStart:
 			opts.Start = *option.IntVal
+		case tree.SeqOptRestart:
+			// The RESTART option does not get saved, but still gets validated below.
+			restartVal = option.IntVal
 		case tree.SeqOptVirtual:
 			opts.Virtual = true
 		case tree.SeqOptOwnedBy:
@@ -679,7 +696,24 @@ func assignSequenceOptions(
 			opts.MinValue,
 		)
 	}
-
+	if restartVal != nil {
+		if *restartVal > opts.MaxValue {
+			return pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"RESTART value (%d) cannot be greater than MAXVALUE (%d)",
+				*restartVal,
+				opts.MaxValue,
+			)
+		}
+		if *restartVal < opts.MinValue {
+			return pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"RESTART value (%d) cannot be less than MINVALUE (%d)",
+				*restartVal,
+				opts.MinValue,
+			)
+		}
+	}
 	return nil
 }
 

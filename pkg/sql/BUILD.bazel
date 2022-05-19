@@ -1,5 +1,6 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 load("//pkg/util/fsm/gen:REPORTS.bzl", "gen_reports")
 
 go_library(
@@ -216,6 +217,7 @@ go_library(
         "tablewriter_insert.go",
         "tablewriter_update.go",
         "tablewriter_upsert_opt.go",
+        "telemetry.go",
         "telemetry_logging.go",
         "temporary_schema.go",
         "tenant.go",
@@ -276,7 +278,6 @@ go_library(
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/protectedts",
-        "//pkg/migration",
         "//pkg/multitenant",
         "//pkg/roachpb",
         "//pkg/rpc",
@@ -416,6 +417,7 @@ go_library(
         "//pkg/sql/vtable",
         "//pkg/storage/enginepb",
         "//pkg/testutils/serverutils",
+        "//pkg/upgrade",
         "//pkg/util",
         "//pkg/util/admission",
         "//pkg/util/admission/admissionpb",
@@ -510,7 +512,6 @@ go_test(
         "create_test.go",
         "database_test.go",
         "delete_preserving_index_test.go",
-        "dep_test.go",
         "descriptor_mutation_test.go",
         "distsql_physical_planner_test.go",
         "distsql_plan_backfill_test.go",
@@ -669,6 +670,7 @@ go_test(
         "//pkg/sql/rowenc/valueside",
         "//pkg/sql/rowexec",
         "//pkg/sql/rowinfra",
+        "//pkg/sql/schemachanger/scexec",
         "//pkg/sql/scrub",
         "//pkg/sql/sem/builtins",
         "//pkg/sql/sem/catconstants",
@@ -690,7 +692,6 @@ go_test(
         "//pkg/startupmigrations",
         "//pkg/storage",
         "//pkg/testutils",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/jobutils",
         "//pkg/testutils/pgtest",
         "//pkg/testutils/serverutils",
@@ -784,4 +785,10 @@ gen_reports(
     dep = "//pkg/sql",
     starting_state_name = "stateNoTxn",
     transitions_variable = "TxnStateTransitions",
+)
+
+disallowed_imports_test(
+    "sql",
+    # TODO(#81380): This should be flipped to "True".
+    disallow_cdeps = False,
 )

@@ -61,7 +61,6 @@ go_library(
         "name_part.go",
         "name_resolution.go",
         "object_name.go",
-        "operators.go",
         "overload.go",
         "parse_array.go",
         "parse_string.go",  # keep
@@ -119,7 +118,6 @@ go_library(
     deps = [
         "//pkg/geo",
         "//pkg/geo/geopb",
-        "//pkg/server/telemetry",
         "//pkg/sql/lex",
         "//pkg/sql/lexbase",
         "//pkg/sql/pgwire/pgcode",
@@ -134,7 +132,6 @@ go_library(
         "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/sem/volatility",
         "//pkg/sql/sessiondatapb",
-        "//pkg/sql/sqltelemetry",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/bitarray",
@@ -278,8 +275,13 @@ genrule(
 disallowed_imports_test(
     "tree",
     disallowed_list = [
-        "//pkg/sql/sessiondata",
+        "//pkg/kv",
+        "//pkg/roachpb",
         "//pkg/security",
+        "//pkg/server",
+        "//pkg/sql/sessiondata",
+        "//pkg/storage",
+        "//pkg/util/log",
     ],
     disallowed_prefixes = [
         "pkg/sql/catalog",

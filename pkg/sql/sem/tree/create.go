@@ -24,12 +24,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
@@ -1703,6 +1701,19 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 			} else {
 				ctx.Printf("%d", *option.IntVal)
 			}
+		case SeqOptRestart:
+			ctx.WriteString(option.Name)
+			if option.IntVal != nil {
+				ctx.WriteByte(' ')
+				if option.OptionalWord {
+					ctx.WriteString("WITH ")
+				}
+				if ctx.flags.HasFlags(FmtHideConstants) {
+					ctx.WriteByte('0')
+				} else {
+					ctx.Printf("%d", *option.IntVal)
+				}
+			}
 		case SeqOptIncrement:
 			ctx.WriteString(option.Name)
 			ctx.WriteByte(' ')
@@ -1758,6 +1769,7 @@ const (
 	SeqOptMinValue  = "MINVALUE"
 	SeqOptMaxValue  = "MAXVALUE"
 	SeqOptStart     = "START"
+	SeqOptRestart   = "RESTART"
 	SeqOptVirtual   = "VIRTUAL"
 
 	// Avoid unused warning for constants.
@@ -1982,12 +1994,6 @@ type RefreshMaterializedView struct {
 	Name              *UnresolvedObjectName
 	Concurrently      bool
 	RefreshDataOption RefreshDataOption
-}
-
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *RefreshMaterializedView) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaRefreshMaterializedView
 }
 
 // RefreshDataOption corresponds to arguments for the REFRESH MATERIALIZED VIEW

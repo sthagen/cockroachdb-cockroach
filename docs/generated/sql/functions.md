@@ -378,6 +378,8 @@
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
+<tr><td><a name="crypt"></a><code>crypt(password: <a href="string.html">string</a>, salt: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Generates a hash based on a password and salt. The hash algorithm and number of rounds if applicable are encoded in the salt.</p>
+</span></td></tr>
 <tr><td><a name="digest"></a><code>digest(data: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Computes a binary hash of the given <code>data</code>. <code>type</code> is the algorithm to use (md5, sha1, sha224, sha256, sha384, or sha512).</p>
 </span></td></tr>
 <tr><td><a name="digest"></a><code>digest(data: <a href="string.html">string</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Computes a binary hash of the given <code>data</code>. <code>type</code> is the algorithm to use (md5, sha1, sha224, sha256, sha384, or sha512).</p>
@@ -2659,6 +2661,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <tr><td><a name="convert_from"></a><code>convert_from(str: <a href="bytes.html">bytes</a>, enc: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Decode the bytes in <code>str</code> into a string using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
 </span></td></tr>
 <tr><td><a name="convert_to"></a><code>convert_to(str: <a href="string.html">string</a>, enc: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encode the string <code>str</code> as a byte array using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.decode_external_plan_gist"></a><code>crdb_internal.decode_external_plan_gist(gist: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of output similar to EXPLAIN from a gist such as those found in planGists element of the statistics column of the statement_statistics table without attempting to resolve tables or indexes.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.decode_plan_gist"></a><code>crdb_internal.decode_plan_gist(gist: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of output similar to EXPLAIN from a gist such as those found in planGists element of the statistics column of the statement_statistics table.</p>
 </span></td></tr>

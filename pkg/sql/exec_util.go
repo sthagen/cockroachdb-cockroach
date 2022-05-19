@@ -43,7 +43,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
-	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -82,7 +81,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -96,6 +94,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -222,10 +221,12 @@ var secondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 var traceTxnThreshold = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"sql.trace.txn.enable_threshold",
-	"duration beyond which all transactions are traced (set to 0 to "+
-		"disable). This setting is coarser grained than"+
-		"sql.trace.stmt.enable_threshold because it applies to all statements "+
-		"within a transaction as well as client communication (e.g. retries).", 0,
+	"enables tracing on all transactions; transactions open for longer than "+
+		"this duration will have their trace logged (set to 0 to disable); "+
+		"note that enabling this may have a negative performance impact; "+
+		"this setting is coarser-grained than sql.trace.stmt.enable_threshold "+
+		"because it applies to all statements within a transaction as well as "+
+		"client communication (e.g. retries)", 0,
 ).WithPublic()
 
 // TraceStmtThreshold is identical to traceTxnThreshold except it applies to
@@ -235,9 +236,11 @@ var traceTxnThreshold = settings.RegisterDurationSetting(
 var TraceStmtThreshold = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"sql.trace.stmt.enable_threshold",
-	"duration beyond which all statements are traced (set to 0 to disable). "+
-		"This applies to individual statements within a transaction and is therefore "+
-		"finer-grained than sql.trace.txn.enable_threshold.",
+	"enables tracing on all statements; statements executing for longer than "+
+		"this duration will have their trace logged (set to 0 to disable); "+
+		"note that enabling this may have a negative performance impact; "+
+		"this setting applies to individual statements within a transaction and "+
+		"is therefore finer-grained than sql.trace.txn.enable_threshold",
 	0,
 ).WithPublic()
 
@@ -248,8 +251,8 @@ var TraceStmtThreshold = settings.RegisterDurationSetting(
 var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"sql.trace.session_eventlog.enabled",
-	"set to true to enable session tracing. "+
-		"Note that enabling this may have a non-trivial negative performance impact.",
+	"set to true to enable session tracing; "+
+		"note that enabling this may have a negative performance impact",
 	false,
 ).WithPublic()
 
@@ -1207,10 +1210,10 @@ type ExecutorConfig struct {
 	InternalRowMetrics   *rowinfra.Metrics
 
 	TestingKnobs                         ExecutorTestingKnobs
-	MigrationTestingKnobs                *migration.TestingKnobs
+	UpgradeTestingKnobs                  *upgrade.TestingKnobs
 	PGWireTestingKnobs                   *PGWireTestingKnobs
 	SchemaChangerTestingKnobs            *SchemaChangerTestingKnobs
-	DeclarativeSchemaChangerTestingKnobs *scrun.TestingKnobs
+	DeclarativeSchemaChangerTestingKnobs *scexec.TestingKnobs
 	TypeSchemaChangerTestingKnobs        *TypeSchemaChangerTestingKnobs
 	GCJobTestingKnobs                    *GCJobTestingKnobs
 	DistSQLRunTestingKnobs               *execinfra.TestingKnobs
@@ -1252,12 +1255,12 @@ type ExecutorConfig struct {
 	RangeFeedFactory *rangefeed.Factory
 
 	// VersionUpgradeHook is called after validating a `SET CLUSTER SETTING
-	// version` but before executing it. It can carry out arbitrary migrations
+	// version` but before executing it. It can carry out arbitrary upgrades
 	// that allow us to eventually remove legacy code.
 	VersionUpgradeHook VersionUpgradeHook
 
-	// MigrationJobDeps is used to drive migrations.
-	MigrationJobDeps migration.JobDeps
+	// UpgradeJobDeps is used to drive upgrades.
+	UpgradeJobDeps upgrade.JobDeps
 
 	// IndexBackfiller is used to backfill indexes. It is another rather circular
 	// object which mostly just holds on to an ExecConfig.
@@ -1301,10 +1304,10 @@ type ExecutorConfig struct {
 	SystemTableIDResolver catalog.SystemTableIDResolver
 
 	// SpanConfigReconciler is used to drive the span config reconciliation job
-	// and related migrations.
+	// and related upgrades.
 	SpanConfigReconciler spanconfig.Reconciler
 
-	// SpanConfigSplitter is used during migrations to seed system.span_count with
+	// SpanConfigSplitter is used during upgrades to seed system.span_count with
 	// the right number of tenant spans.
 	SpanConfigSplitter spanconfig.Splitter
 
@@ -1331,8 +1334,8 @@ type ExecutorConfig struct {
 // UpdateVersionSystemSettingHook provides a callback that allows us
 // update the cluster version inside the system.settings table. This hook
 // is aimed at mainly updating tenant pods, which will currently skip over
-// the existing migration logic for bumping version numbers (this logic is
-// stubbed out for them). As a result there is a potential danger of migrations
+// the existing upgrade logic for bumping version numbers (this logic is
+// stubbed out for them). As a result there is a potential danger of upgrades
 // partially being completed without the version number being persisted to storage
 // for tenants. This hook allows the version number to bumped and saved at
 // each step.
@@ -1341,7 +1344,7 @@ type UpdateVersionSystemSettingHook func(
 	version clusterversion.ClusterVersion,
 ) error
 
-// VersionUpgradeHook is used to run migrations starting in v21.1.
+// VersionUpgradeHook is used to run upgrades starting in v21.1.
 type VersionUpgradeHook func(
 	ctx context.Context,
 	user username.SQLUsername,
@@ -1628,9 +1631,6 @@ func getPlanDistribution(
 		return physicalplan.LocalPlan
 	}
 
-	if _, singleTenant := nodeID.OptionalNodeID(); !singleTenant {
-		return physicalplan.LocalPlan
-	}
 	if distSQLMode == sessiondatapb.DistSQLOff {
 		return physicalplan.LocalPlan
 	}

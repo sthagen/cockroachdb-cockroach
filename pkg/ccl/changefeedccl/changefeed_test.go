@@ -896,6 +896,7 @@ func TestChangefeedUserDefinedTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 		// Set up a type and table.
 		sqlDB.Exec(t, `CREATE TYPE t AS ENUM ('hello', 'howdy', 'hi')`)
 		sqlDB.Exec(t, `CREATE TABLE tt (x INT PRIMARY KEY, y t)`)
@@ -1011,6 +1012,7 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		// Schema changes that predate the changefeed.
 		t.Run(`historical`, func(t *testing.T) {
@@ -1340,6 +1342,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		knobs := f.Server().(*server.TestServer).Cfg.TestingKnobs.
 			DistSQL.(*execinfra.TestingKnobs).
@@ -1577,6 +1580,7 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		// Expected semantics:
 		//
@@ -1766,6 +1770,7 @@ func TestChangefeedSchemaChangeBackfillScope(t *testing.T) {
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		t.Run(`add column with default`, func(t *testing.T) {
 			sqlDB.Exec(t, `CREATE TABLE add_column_def (a INT PRIMARY KEY)`)
@@ -2050,6 +2055,7 @@ func TestChangefeedSingleColumnFamilySchemaChanges(t *testing.T) {
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		// Table with 2 column families.
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING, FAMILY most (a,b), FAMILY rest (c))`)
@@ -2091,6 +2097,7 @@ func TestChangefeedEachColumnFamilySchemaChanges(t *testing.T) {
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		// Table with 2 column families.
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING, FAMILY f1 (a,b), FAMILY f2 (c))`)
@@ -2737,6 +2744,7 @@ func TestChangefeedNoBackfill(t *testing.T) {
 	skip.UnderShort(t)
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
+		disableDeclarativeSchemaChangesForTest(t, sqlDB)
 		// Shorten the intervals so this test doesn't take so long. We need to wait
 		// for timestamps to get resolved.
 		sqlDB.Exec(t, "SET CLUSTER SETTING changefeed.experimental_poll_interval = '200ms'")
@@ -3258,6 +3266,58 @@ func TestChangefeedRetryableError(t *testing.T) {
 	t.Run(`pubsub`, pubsubTest(testFn))
 }
 
+func TestChangefeedJobRetryOnNoInboundStream(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t)
+	skip.UnderStress(t)
+
+	cluster, db, cleanup := startTestCluster(t)
+	defer cleanup()
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	// force fast "no inbound stream" error
+	var oldMaxRunningFlows int
+	var oldTimeout string
+	sqlDB.QueryRow(t, "SHOW CLUSTER SETTING sql.distsql.max_running_flows").Scan(&oldMaxRunningFlows)
+	sqlDB.QueryRow(t, "SHOW CLUSTER SETTING sql.distsql.flow_stream_timeout").Scan(&oldTimeout)
+	serverutils.SetClusterSetting(t, cluster, "sql.distsql.max_running_flows", 0)
+	serverutils.SetClusterSetting(t, cluster, "sql.distsql.flow_stream_timeout", "1s")
+
+	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
+
+	// Connect to a non-leaseholder node so that a DistSQL flow is required
+	var leaseHolder int
+	sqlDB.QueryRow(t, `SELECT lease_holder FROM [SHOW RANGES FROM TABLE foo] LIMIT 1`).Scan(&leaseHolder)
+	feedServerID := ((leaseHolder - 1) + 1) % 3
+	db = cluster.ServerConn(feedServerID)
+	sqlDB = sqlutils.MakeSQLRunner(db)
+	f := makeKafkaFeedFactoryForCluster(cluster, db)
+	foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+	defer closeFeed(t, foo)
+
+	// Verify job progress contains retryable error status.
+	registry := f.Server().JobRegistry().(*jobs.Registry)
+	jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
+	testutils.SucceedsSoon(t, func() error {
+		job, err := registry.LoadJob(context.Background(), jobID)
+		require.NoError(t, err)
+		if strings.Contains(job.Progress().RunningStatus, "retryable error") {
+			return nil
+		}
+		return errors.Newf("job status was %s", job.Progress().RunningStatus)
+	})
+
+	// Fix the error. Job should retry successfully.
+	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.max_running_flows=$1", oldMaxRunningFlows)
+	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.flow_stream_timeout=$1", oldTimeout)
+	assertPayloads(t, foo, []string{
+		`foo: [1]->{"after": {"a": 1}}`,
+	})
+
+}
+
 func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -3657,14 +3717,14 @@ func TestChangefeedErrors(t *testing.T) {
 	sqlDB.Exec(t, `CREATE TABLE dec (a DECIMAL PRIMARY KEY)`)
 	sqlDB.Exec(t, `INSERT INTO dec VALUES (1.0)`)
 	sqlDB.ExpectErr(
-		t, `pq: column a: decimal with no precision`,
+		t, `.*column a: decimal with no precision`,
 		`EXPERIMENTAL CHANGEFEED FOR dec WITH format=$1, confluent_schema_registry=$2`,
 		changefeedbase.OptFormatAvro, schemaReg.URL(),
 	)
 	sqlDB.Exec(t, `CREATE TABLE "oid" (a OID PRIMARY KEY)`)
 	sqlDB.Exec(t, `INSERT INTO "oid" VALUES (3::OID)`)
 	sqlDB.ExpectErr(
-		t, `pq: column a: type OID not yet supported with avro`,
+		t, `.*column a: type OID not yet supported with avro`,
 		`EXPERIMENTAL CHANGEFEED FOR "oid" WITH format=$1, confluent_schema_registry=$2`,
 		changefeedbase.OptFormatAvro, schemaReg.URL(),
 	)

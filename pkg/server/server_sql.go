@@ -34,9 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
-	"github.com/cockroachdb/cockroach/pkg/migration"
-	"github.com/cockroachdb/cockroach/pkg/migration/migrationcluster"
-	"github.com/cockroachdb/cockroach/pkg/migration/migrationmanager"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -79,7 +76,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rangeprober"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -95,6 +92,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradecluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrademanager"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -186,7 +186,7 @@ type sqlServerOptionalKVArgs struct {
 	// nodesStatusServer gives access to the NodesStatus service.
 	nodesStatusServer serverpb.OptionalNodesStatusServer
 	// Narrowed down version of *NodeLiveness. Used by jobs, DistSQLPlanner, and
-	// migration manager.
+	// upgrade manager.
 	nodeLiveness optionalnodeliveness.Container
 	// Gossip is relied upon by distSQLCfg (execinfra.ServerConfig), the executor
 	// config, the DistSQL planner, the table statistics cache, the statements
@@ -798,9 +798,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		execCfg.SchemaChangerTestingKnobs = new(sql.SchemaChangerTestingKnobs)
 	}
 	if declarativeSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLDeclarativeSchemaChanger; declarativeSchemaChangerTestingKnobs != nil {
-		execCfg.DeclarativeSchemaChangerTestingKnobs = declarativeSchemaChangerTestingKnobs.(*scrun.TestingKnobs)
+		execCfg.DeclarativeSchemaChangerTestingKnobs = declarativeSchemaChangerTestingKnobs.(*scexec.TestingKnobs)
 	} else {
-		execCfg.DeclarativeSchemaChangerTestingKnobs = new(scrun.TestingKnobs)
+		execCfg.DeclarativeSchemaChangerTestingKnobs = new(scexec.TestingKnobs)
 	}
 	if sqlTypeSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLTypeSchemaChanger; sqlTypeSchemaChangerTestingKnobs != nil {
 		execCfg.TypeSchemaChangerTestingKnobs = sqlTypeSchemaChangerTestingKnobs.(*sql.TypeSchemaChangerTestingKnobs)
@@ -938,36 +938,36 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		// We only need to attach a version upgrade hook if we're the system
 		// tenant. Regular tenants are disallowed from changing cluster
 		// versions.
-		var c migration.Cluster
-		var systemDeps migration.SystemDeps
+		var c upgrade.Cluster
+		var systemDeps upgrade.SystemDeps
 		if codec.ForSystemTenant() {
-			c = migrationcluster.New(migrationcluster.ClusterConfig{
+			c = upgradecluster.New(upgradecluster.ClusterConfig{
 				NodeLiveness: nodeLiveness,
 				Dialer:       cfg.nodeDialer,
 				DB:           cfg.db,
 			})
-			systemDeps = migration.SystemDeps{
+			systemDeps = upgrade.SystemDeps{
 				Cluster:    c,
 				DB:         cfg.db,
 				DistSender: cfg.distSender,
 				Stopper:    cfg.stopper,
 			}
 		} else {
-			c = migrationcluster.NewTenantCluster(cfg.db)
-			systemDeps = migration.SystemDeps{
+			c = upgradecluster.NewTenantCluster(cfg.db)
+			systemDeps = upgrade.SystemDeps{
 				Cluster: c,
 				DB:      cfg.db,
 			}
 		}
 
-		knobs, _ := cfg.TestingKnobs.MigrationManager.(*migration.TestingKnobs)
-		migrationMgr := migrationmanager.NewManager(
+		knobs, _ := cfg.TestingKnobs.UpgradeManager.(*upgrade.TestingKnobs)
+		migrationMgr := upgrademanager.NewManager(
 			systemDeps, leaseMgr, cfg.circularInternalExecutor, jobRegistry, codec,
 			cfg.Settings, knobs,
 		)
-		execCfg.MigrationJobDeps = migrationMgr
+		execCfg.UpgradeJobDeps = migrationMgr
 		execCfg.VersionUpgradeHook = migrationMgr.Migrate
-		execCfg.MigrationTestingKnobs = knobs
+		execCfg.UpgradeTestingKnobs = knobs
 	}
 
 	if !codec.ForSystemTenant() || !cfg.SpanConfigsDisabled {
@@ -1207,7 +1207,7 @@ func (s *SQLServer) preStart(
 		&sessiondata.SessionData{
 			LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
 				// Migrations need an executor with query distribution turned off. This is
-				// because the node crashes if migrations fail to execute, and query
+				// because the node crashes if upgrades fail to execute, and query
 				// distribution introduces more moving parts. Local execution is more
 				// robust; for example, the DistSender has retries if it can't connect to
 				// another node, but DistSQL doesn't. Also see #44101 for why DistSQL is
@@ -1259,9 +1259,9 @@ func (s *SQLServer) preStart(
 		// and pass a lower-bound on the bootstrap version. We know that no tenants
 		// could have been created before the start of the v20.2 dev cycle, so we
 		// pass Start20_2. bootstrapVersion is only used to avoid performing
-		// superfluous but necessarily idempotent SQL migrations, so at worst, we're
+		// superfluous but necessarily idempotent SQL upgrades, so at worst, we're
 		// doing more work than strictly necessary during the first time that the
-		// migrations are run.
+		// upgrades are run.
 		bootstrapVersion = roachpb.Version{Major: 20, Minor: 1, Internal: 1}
 	}
 
@@ -1272,7 +1272,7 @@ func (s *SQLServer) preStart(
 		return errors.Wrap(err, "initializing settings")
 	}
 
-	// Run startup migrations (note: these depend on jobs subsystem running).
+	// Run startup upgrades (note: these depend on jobs subsystem running).
 	if err := startupMigrationsMgr.EnsureMigrations(ctx, bootstrapVersion); err != nil {
 		return errors.Wrap(err, "ensuring SQL migrations")
 	}

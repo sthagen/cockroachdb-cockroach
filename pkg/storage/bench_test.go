@@ -494,8 +494,8 @@ func BenchmarkIntentResolution(b *testing.B) {
 	}
 }
 
-// BenchmarkIntentRangeResolution compares separated and interleaved intents,
-// when doing ranged intent resolution.
+// BenchmarkIntentRangeResolution benchmarks ranged intent resolution with
+// various counts of mvcc versions and sparseness of intents.
 func BenchmarkIntentRangeResolution(b *testing.B) {
 	skip.UnderShort(b, "setting up unflushed data takes too long")
 	defer log.Scope(b).Close(b)
@@ -1288,29 +1288,12 @@ func runClearRange(
 	})
 	defer eng.Close()
 
-	// It is not currently possible to ClearRange(NilKey, MVCCKeyMax) thanks to a
-	// variety of hacks inside of ClearRange that explode if provided the NilKey.
-	// So instead we start our ClearRange at the first key that actually exists.
-	//
-	// TODO(benesch): when those hacks are removed, don't bother computing the
-	// first key and simply ClearRange(NilKey, MVCCKeyMax).
-	//
-	// TODO(sumeer): we are now seeking starting at LocalMax, so the
-	// aforementioned issue is probably resolved. Clean this up.
-	iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: roachpb.KeyMax})
-	defer iter.Close()
-	iter.SeekGE(MVCCKey{Key: keys.LocalMax})
-	if ok, err := iter.Valid(); !ok {
-		b.Fatalf("unable to find first key (err: %v)", err)
-	}
-	firstKey := iter.Key()
-
 	b.SetBytes(rangeBytes)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		batch := eng.NewUnindexedBatch(true /* writeOnly */)
-		if err := clearRange(eng, batch, firstKey, MVCCKeyMax); err != nil {
+		batch := eng.NewUnindexedBatch(false /* writeOnly */)
+		if err := clearRange(eng, batch, MVCCKey{Key: keys.LocalMax}, MVCCKeyMax); err != nil {
 			b.Fatal(err)
 		}
 		// NB: We don't actually commit the batch here as we don't want to delete

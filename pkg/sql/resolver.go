@@ -447,12 +447,16 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		}
 		if targets.AllTablesInSchema || targets.AllSequencesInSchema {
 			// Get all the descriptors for the tables in the specified schemas.
-			db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, p.CurrentDatabase(), flags)
-			if err != nil {
-				return nil, err
-			}
 			var descs []catalog.Descriptor
 			for _, sc := range targets.Schemas {
+				dbName := p.CurrentDatabase()
+				if sc.ExplicitCatalog {
+					dbName = sc.Catalog()
+				}
+				db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName, flags)
+				if err != nil {
+					return nil, err
+				}
 				_, objectIDs, err := resolver.GetObjectNamesAndIDs(
 					ctx, p.txn, p, p.ExecCfg().Codec, db, sc.Schema(), true, /* explicitPrefix */
 				)
@@ -662,7 +666,7 @@ func expandMutableIndexName(
 func expandIndexName(
 	ctx context.Context,
 	txn *kv.Txn,
-	sc resolver.SchemaResolver,
+	p *planner,
 	codec keys.SQLCodec,
 	index *tree.TableIndexName,
 	requireTable bool,
@@ -670,7 +674,7 @@ func expandIndexName(
 	tn = &index.Table
 	if tn.Object() != "" {
 		// The index and its table prefix must exist already. Resolve the table.
-		_, desc, err = resolver.ResolveMutableExistingTableObject(ctx, sc, tn, requireTable, tree.ResolveRequireTableOrViewDesc)
+		_, desc, err = resolver.ResolveMutableExistingTableObject(ctx, p, tn, requireTable, tree.ResolveRequireTableOrViewDesc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -681,7 +685,7 @@ func expandIndexName(
 		return tn, desc, nil
 	}
 
-	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, sc, index, txn, codec, requireTable, false /*requireActiveIndex*/)
+	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, p, index, txn, codec, requireTable, false /*requireActiveIndex*/)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -698,7 +702,10 @@ func expandIndexName(
 	// Memoize the table name that was found. tn is a reference to the table name
 	// stored in index.Table.
 	*tn = tableName
-	tblMutable := tbl.NewBuilder().BuildExistingMutable().(*tabledesc.Mutable)
+	tblMutable, err := p.Descriptors().GetMutableTableVersionByID(ctx, tbl.GetID(), p.Txn())
+	if err != nil {
+		return nil, nil, err
+	}
 	return &tableName, tblMutable, nil
 }
 

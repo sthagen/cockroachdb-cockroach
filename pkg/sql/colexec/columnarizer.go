@@ -198,7 +198,8 @@ func (c *Columnarizer) Next() coldata.Batch {
 	switch c.mode {
 	case columnarizerBufferingMode:
 		c.batch, reallocated = c.allocator.ResetMaybeReallocate(
-			c.typs, c.batch, 1 /* minDesiredCapacity */, c.maxBatchMemSize,
+			c.typs, c.batch, 1, /* minDesiredCapacity */
+			c.maxBatchMemSize, false, /* desiredCapacitySufficient */
 		)
 	case columnarizerStreamingMode:
 		// Note that we're not using ResetMaybeReallocate because we will
@@ -261,10 +262,7 @@ func (c *Columnarizer) Next() coldata.Batch {
 	return c.batch
 }
 
-var (
-	_ colexecop.DrainableOperator = &Columnarizer{}
-	_ colexecop.Closer            = &Columnarizer{}
-)
+var _ colexecop.DrainableClosableOperator = &Columnarizer{}
 
 // DrainMeta is part of the colexecop.MetadataSource interface.
 func (c *Columnarizer) DrainMeta() []execinfrapb.ProducerMetadata {

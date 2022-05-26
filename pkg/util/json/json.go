@@ -898,11 +898,19 @@ func EncodeExistsInvertedIndexSpans(
 	// We pass end=true so that we don't get an extra separator at the end of the
 	// key, which would exclude keys that point to non-scalars like non-empty
 	// arrays or non-empty objects.
+	// However, if we don't limit the span we send, we'd also get all paths
+	// that have keys that begin with `s`, and not just keys that exactly equal
+	// `s`, so we have to explicitly define the span as being from `s` to the end
+	// of the`s+sep` prefix.
 	objectKey := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], s, true /* end */)
+	objectSpan := inverted.Span{
+		Start: objectKey,
+		End:   keysbase.PrefixEnd(encoding.AddJSONPathSeparator(objectKey)),
+	}
 	return inverted.Or(
 		inverted.Or(
 			inverted.ExprForSpan(inverted.MakeSingleValSpan(arrayKey), true /* tight */),
-			inverted.ExprForSpan(inverted.MakeSingleValSpan(objectKey), true /* tight */),
+			inverted.ExprForSpan(objectSpan, true /* tight */),
 		),
 		inverted.ExprForSpan(inverted.MakeSingleValSpan(scalarKey), true /* tight */),
 	), nil
@@ -2249,8 +2257,15 @@ func (j jsonString) Exists(s string) (bool, error) {
 
 func (j jsonArray) Exists(s string) (bool, error) {
 	for i := 0; i < len(j); i++ {
-		if elem, ok := j[i].(jsonString); ok && string(elem) == s {
-			return true, nil
+		switch elem := j[i].(type) {
+		case jsonString:
+			if string(elem) == s {
+				return true, nil
+			}
+		case *jsonEncoded:
+			if elem.typ == StringJSONType && string(elem.value) == s {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

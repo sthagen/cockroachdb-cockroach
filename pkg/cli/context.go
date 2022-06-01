@@ -26,9 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlshell"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -157,24 +158,16 @@ type cliContext struct {
 	// Commands that wish to use this must use cmdTimeoutContext().
 	cmdTimeout time.Duration
 
-	// clientConnHost is the hostname/address to use to connect to a server.
-	clientConnHost string
-
-	// clientConnPort is the port name/number to use to connect to a server.
-	clientConnPort string
-
 	// certPrincipalMap is the cert-principal:db-principal map.
 	// This configuration flag is only used for client commands that establish
 	// a connection to a server.
 	certPrincipalMap []string
 
-	// for CLI commands that use the SQL interface, these parameters
-	// determine how to connect to the server.
-	sqlConnUser, sqlConnDBName string
-
-	// sqlConnURL contains any additional query URL options
-	// specified in --url that do not have discrete equivalents.
-	sqlConnURL *pgurl.URL
+	// clientOpts is the set of client options to generate connection
+	// URLs. Note that the ClientSecurityOptions field in clientOpts is
+	// not used; it is populated by makeClientConnURL() from base.Config
+	// instead.
+	clientOpts clientsecopts.ClientOptions
 
 	// allowUnencryptedClientPassword enables the CLI commands to use
 	// password authentication over non-TLS TCP connections. This is
@@ -220,12 +213,12 @@ func setCliContextDefaults() {
 	cliCtx.IsInteractive = false
 	cliCtx.EmbeddedMode = false
 	cliCtx.cmdTimeout = 0 // no timeout
-	cliCtx.clientConnHost = ""
-	cliCtx.clientConnPort = base.DefaultPort
+	cliCtx.clientOpts.ServerHost = ""
+	cliCtx.clientOpts.ServerPort = base.DefaultPort
 	cliCtx.certPrincipalMap = nil
-	cliCtx.sqlConnURL = nil
-	cliCtx.sqlConnUser = username.RootUser
-	cliCtx.sqlConnDBName = ""
+	cliCtx.clientOpts.ExplicitURL = nil
+	cliCtx.clientOpts.User = username.RootUser
+	cliCtx.clientOpts.Database = ""
 	cliCtx.allowUnencryptedClientPassword = false
 	cliCtx.logConfigInput = settableString{s: ""}
 	cliCtx.logConfig = logconfig.Config{}
@@ -266,6 +259,10 @@ var certCtx struct {
 	// This configuration flag is only used for 'cert' commands
 	// that generate certificates.
 	certPrincipalMap []string
+	// tenantScope indicates a tenantID(s) that a certificate is being
+	// scoped to. By creating a tenant-scoped certicate, the usage of that certificate
+	// is restricted to a specific tenant.
+	tenantScope []roachpb.TenantID
 }
 
 func setCertContextDefaults() {
@@ -278,6 +275,7 @@ func setCertContextDefaults() {
 	certCtx.overwriteFiles = false
 	certCtx.generatePKCS8Key = false
 	certCtx.certPrincipalMap = nil
+	certCtx.tenantScope = []roachpb.TenantID{roachpb.SystemTenantID}
 }
 
 var sqlExecCtx = clisqlexec.Context{

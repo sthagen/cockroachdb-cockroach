@@ -2585,6 +2585,9 @@ func (ex *connExecutor) setTransactionModes(
 		return errors.AssertionFailedf("expected an evaluated AS OF timestamp")
 	}
 	if !asOfTs.IsEmpty() {
+		if err := ex.state.checkReadsAndWrites(); err != nil {
+			return err
+		}
 		if err := ex.state.setHistoricalTimestamp(ctx, asOfTs); err != nil {
 			return err
 		}
@@ -3052,6 +3055,13 @@ func (ex *connExecutor) serialize() serverpb.Session {
 
 	var activeTxnInfo *serverpb.TxnInfo
 	txn := ex.state.mu.txn
+
+	var autoRetryReasonStr string
+
+	if ex.extraTxnState.autoRetryReason != nil {
+		autoRetryReasonStr = ex.extraTxnState.autoRetryReason.Error()
+	}
+
 	if txn != nil {
 		id := txn.ID()
 		activeTxnInfo = &serverpb.TxnInfo{
@@ -3068,6 +3078,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			ReadOnly:              ex.state.readOnly,
 			Priority:              ex.state.priority.String(),
 			QualityOfService:      sessiondatapb.ToQoSLevelString(txn.AdmissionHeader().Priority),
+			LastAutoRetryReason:   autoRetryReasonStr,
 		}
 	}
 
@@ -3108,6 +3119,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			IsDistributed:  query.isDistributed,
 			Phase:          (serverpb.ActiveQuery_Phase)(query.phase),
 			Progress:       float32(progress),
+			IsFullScan:     query.isFullScan,
 		})
 	}
 	lastActiveQuery := ""

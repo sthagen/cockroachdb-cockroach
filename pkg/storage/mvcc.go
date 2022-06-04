@@ -101,6 +101,21 @@ type MVCCKeyValue struct {
 	Value []byte
 }
 
+// MVCCRangeKeyValue contains the raw bytes of the value for a key.
+type MVCCRangeKeyValue struct {
+	RangeKey MVCCRangeKey
+	Value    []byte
+}
+
+// Clone returns a copy of the MVCCRangeKeyValue.
+func (r MVCCRangeKeyValue) Clone() MVCCRangeKeyValue {
+	r.RangeKey = r.RangeKey.Clone()
+	if r.Value != nil {
+		r.Value = append([]byte{}, r.Value...)
+	}
+	return r
+}
+
 // optionalValue represents an optional roachpb.Value. It is preferred
 // over a *roachpb.Value to avoid the forced heap allocation.
 type optionalValue struct {
@@ -1615,7 +1630,8 @@ func mvccPutInternal(
 	versionValue := MVCCValue{}
 	versionValue.Value = value
 	versionValue.LocalTimestamp = localTimestamp
-	if !versionValue.LocalTimestampNeeded(versionKey) || !writer.ShouldWriteLocalTimestamps(ctx) {
+	if !versionValue.LocalTimestampNeeded(versionKey.Timestamp) ||
+		!writer.ShouldWriteLocalTimestamps(ctx) {
 		versionValue.LocalTimestamp = hlc.ClockTimestamp{}
 	}
 
@@ -2064,7 +2080,7 @@ func MVCCClearTimeRange(
 
 	flushClearedKeys := func(nonMatch MVCCKey) error {
 		if len(clearRangeStart.Key) != 0 {
-			if err := rw.ClearMVCCRange(clearRangeStart, nonMatch); err != nil {
+			if err := rw.ClearMVCCVersions(clearRangeStart, nonMatch); err != nil {
 				return err
 			}
 			batchByteSize += int64(clearRangeStart.EncodedSize() + nonMatch.EncodedSize())
@@ -2079,7 +2095,7 @@ func MVCCClearTimeRange(
 			// clearrange, the byte size of the keys we did get is now too large to
 			// encode them all within the byte size limit, so use clearrange anyway.
 			if batchByteSize+encodedBufSize >= maxBatchByteSize {
-				if err := rw.ClearMVCCRange(buf[0], nonMatch); err != nil {
+				if err := rw.ClearMVCCVersions(buf[0], nonMatch); err != nil {
 					return err
 				}
 				batchByteSize += int64(buf[0].EncodedSize() + nonMatch.EncodedSize())
@@ -3128,9 +3144,9 @@ func mvccResolveWriteIntent(
 			// while the transaction was still pending, in which case it can be advanced
 			// to the observed timestamp.
 			newValue := oldValue
-			newValue.LocalTimestamp = oldValue.GetLocalTimestamp(oldKey)
+			newValue.LocalTimestamp = oldValue.GetLocalTimestamp(oldKey.Timestamp)
 			newValue.LocalTimestamp.Forward(intent.ClockWhilePending.Timestamp)
-			if !newValue.LocalTimestampNeeded(newKey) || !rw.ShouldWriteLocalTimestamps(ctx) {
+			if !newValue.LocalTimestampNeeded(newKey.Timestamp) || !rw.ShouldWriteLocalTimestamps(ctx) {
 				newValue.LocalTimestamp = hlc.ClockTimestamp{}
 			}
 
@@ -3401,7 +3417,8 @@ func MVCCResolveWriteIntentRange(
 		mvccIter = rw.NewMVCCIterator(MVCCKeyIterKind, iterOpts)
 	} else {
 		// For correctness, we need mvccIter to be consistent with engineIter.
-		mvccIter = newPebbleIterator(nil, engineIter.GetRawIter(), iterOpts, StandardDurability)
+		mvccIter = newPebbleIterator(
+			nil, engineIter.GetRawIter(), iterOpts, StandardDurability, rw.SupportsRangeKeys())
 	}
 	iterAndBuf := GetBufUsingIter(mvccIter)
 	defer func() {

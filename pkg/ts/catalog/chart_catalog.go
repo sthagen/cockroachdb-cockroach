@@ -607,6 +607,12 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"range.snapshots.rcvd-bytes",
 					"range.snapshots.sent-bytes",
+					"range.snapshots.recovery.rcvd-bytes",
+					"range.snapshots.recovery.sent-bytes",
+					"range.snapshots.rebalancing.rcvd-bytes",
+					"range.snapshots.rebalancing.sent-bytes",
+					"range.snapshots.unknown.rcvd-bytes",
+					"range.snapshots.unknown.sent-bytes",
 				},
 			},
 		},
@@ -672,7 +678,6 @@ var charts = []sectionDescription{
 				Title: "Allocator Load-Based Lease Transfer Decisions",
 				Metrics: []string{
 					"kv.allocator.load_based_lease_transfers.should_transfer",
-					"kv.allocator.load_based_lease_transfers.significantly_switches_relative_disposition",
 					"kv.allocator.load_based_lease_transfers.missing_stats_for_existing_stores",
 					"kv.allocator.load_based_lease_transfers.delta_not_significant",
 					"kv.allocator.load_based_lease_transfers.existing_not_overfull",
@@ -691,7 +696,6 @@ var charts = []sectionDescription{
 				Title: "Allocator Load-Based Lease Transfer Decisions",
 				Metrics: []string{
 					"kv.allocator.load_based_replica_rebalancing.should_transfer",
-					"kv.allocator.load_based_replica_rebalancing.significantly_switches_relative_disposition",
 					"kv.allocator.load_based_replica_rebalancing.missing_stats_for_existing_store",
 					"kv.allocator.load_based_replica_rebalancing.delta_not_significant",
 					"kv.allocator.load_based_replica_rebalancing.existing_not_overfull",

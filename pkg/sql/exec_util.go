@@ -1525,6 +1525,10 @@ type TenantTestingKnobs struct {
 	// OverrideTokenBucketProvider allows a test-only TokenBucketProvider (which
 	// can optionally forward requests to the real provider).
 	OverrideTokenBucketProvider func(origProvider kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider
+
+	// AllowSplitAndScatter, if set, allows secondary tenants to execute ALTER
+	// TABLE ... SPLIT AT and SCATTER SQL commands.
+	AllowSplitAndScatter bool
 }
 
 var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
@@ -1896,6 +1900,12 @@ type queryMeta struct {
 	// this query will be distributed. Use the phase variable below
 	// to determine whether this query has entered execution yet.
 	isDistributed bool
+
+	// States whether this query is a full scan. As with isDistributed, this field
+	// will be set to false for all queries until the start of execution, at which
+	// point we can determine whether a full scan will occur. Use the phase variable
+	// to determine whether this query has entered execution.
+	isFullScan bool
 
 	// Current phase of execution of query.
 	phase queryPhase

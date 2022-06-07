@@ -1,4 +1,4 @@
-// Copyright 2022 The Cockroach Authors.
+// Copyright 2021 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -18,10 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 )
 
-func fixCastForStyleMigration(
+// removeGrantMigration removes the GRANT privilege bit if it is present
+func removeGrantMigration(
 	ctx context.Context, _ clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
 ) error {
-
 	return runPostDeserializationChangesOnAllDescriptors(ctx, d)
-
 }

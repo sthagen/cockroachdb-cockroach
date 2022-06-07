@@ -4877,21 +4877,14 @@ CREATE TABLE crdb_internal.cluster_database_privileges (
 				dbNameStr := tree.NewDString(db.GetName())
 				// TODO(knz): This should filter for the current user, see
 				// https://github.com/cockroachdb/cockroach/issues/35572
-				populateGrantOption := p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption)
 				for _, u := range privs {
 					userNameStr := tree.NewDString(u.User.Normalized())
 					for _, priv := range u.Privileges {
-						var isGrantable tree.Datum
-						if populateGrantOption {
-							isGrantable = yesOrNoDatum(priv.GrantOption)
-						} else {
-							isGrantable = tree.DNull
-						}
 						if err := addRow(
 							dbNameStr,                           // database_name
 							userNameStr,                         // grantee
 							tree.NewDString(priv.Kind.String()), // privilege_type
-							isGrantable,                         // is_grantable
+							yesOrNoDatum(priv.GrantOption),      // is_grantable
 						); err != nil {
 							return err
 						}
@@ -5204,7 +5197,7 @@ CREATE TABLE crdb_internal.default_privileges (
 					}
 
 					if schema == tree.DNull {
-						for _, objectType := range tree.GetAlterDefaultPrivilegesTargetObjects() {
+						for _, objectType := range privilege.GetTargetObjectTypes() {
 							if catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, objectType) {
 								if err := addRow(
 									tree.NewDString(descriptor.GetName()), // database_name
@@ -5225,7 +5218,7 @@ CREATE TABLE crdb_internal.default_privileges (
 								tree.DNull,                            // schema_name
 								role,                                  // role
 								forAllRoles,                           // for_all_roles
-								tree.NewDString(tree.Types.String()),  // object_type
+								tree.NewDString(privilege.Types.String()),               // object_type
 								tree.NewDString(username.PublicRoleName().Normalized()), // grantee
 								tree.NewDString(privilege.USAGE.String()),               // privilege_type
 							); err != nil {
@@ -5502,6 +5495,7 @@ GROUP BY
 
 var crdbInternalActiveRangeFeedsTable = virtualSchemaTable{
 	comment: `node-level table listing all currently running range feeds`,
+	// NB: startTS is exclusive; consider renaming to startAfter.
 	schema: `
 CREATE TABLE crdb_internal.active_range_feeds (
   id INT,
@@ -5529,7 +5523,7 @@ CREATE TABLE crdb_internal.active_range_feeds (
 				return addRow(
 					tree.NewDInt(tree.DInt(rfCtx.ID)),
 					tree.NewDString(rfCtx.CtxTags),
-					tree.NewDString(rf.StartTS.AsOfSystemTime()),
+					tree.NewDString(rf.StartAfter.AsOfSystemTime()),
 					tree.MakeDBool(tree.DBool(rfCtx.WithDiff)),
 					tree.NewDInt(tree.DInt(rf.NodeID)),
 					tree.NewDInt(tree.DInt(rf.RangeID)),

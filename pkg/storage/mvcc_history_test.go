@@ -63,13 +63,14 @@ import (
 // cput           [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw] [cond=<string>]
 // del            [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key>
 // del_range      [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [end=<key>] [max=<max>] [returnKeys]
+// del_range_ts   [ts=<int>[,<int>]] [localTs=<int>[,<int>]] k=<key> end=<key>
 // increment      [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [inc=<val>]
 // put            [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw]
 // put_rangekey   ts=<int>[,<int>] [localTS=<int>[,<int>]] k=<key> end=<key>
 // get            [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [inconsistent] [tombstones] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]]
 // scan           [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [avoidExcess] [allowEmpty]
 //
-// iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [maskBelow=<int>[,<int>]]
+// iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [pointSynthesis [emitOnSeekGE]] [maskBelow=<int>[,<int>]]
 // iter_seek_ge   k=<key> [ts=<int>[,<int>]]
 // iter_seek_lt   k=<key> [ts=<int>[,<int>]]
 // iter_seek_intent_ge k=<key> txn=<name>
@@ -108,7 +109,7 @@ import (
 func TestMVCCHistories(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	SkipIfSimpleValueEncodingDisabled(t)
+	DisableMetamorphicSimpleValueEncoding(t)
 
 	ctx := context.Background()
 
@@ -484,6 +485,7 @@ var commands = map[string]cmd{
 	"cput":           {typDataUpdate, cmdCPut},
 	"del":            {typDataUpdate, cmdDelete},
 	"del_range":      {typDataUpdate, cmdDeleteRange},
+	"del_range_ts":   {typDataUpdate, cmdDeleteRangeTombstone},
 	"get":            {typReadOnly, cmdGet},
 	"increment":      {typDataUpdate, cmdIncrement},
 	"merge":          {typDataUpdate, cmdMerge},
@@ -782,6 +784,16 @@ func cmdDeleteRange(e *evalCtx) error {
 	})
 }
 
+func cmdDeleteRangeTombstone(e *evalCtx) error {
+	key, endKey := e.getKeyRange()
+	ts := e.getTs(nil)
+	localTs := hlc.ClockTimestamp(e.getTsWithName("localTs"))
+
+	return e.withWriter("del_range_ts", func(rw ReadWriter) error {
+		return ExperimentalMVCCDeleteRangeUsingTombstone(e.ctx, rw, nil, key, endKey, ts, localTs, 0)
+	})
+}
+
 func cmdGet(e *evalCtx) error {
 	txn := e.getTxn(optional)
 	key := e.getKey()
@@ -1026,6 +1038,9 @@ func cmdIterNew(e *evalCtx) error {
 	e.iter = &iterWithCloseReader{
 		MVCCIterator: r.NewMVCCIterator(kind, opts),
 		closeReader:  closeReader,
+	}
+	if e.hasArg("pointSynthesis") {
+		e.iter = newPointSynthesizingIter(e.iter, e.hasArg("emitOnSeekGE"))
 	}
 	return nil
 }

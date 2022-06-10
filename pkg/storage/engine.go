@@ -178,8 +178,6 @@ type SimpleMVCCIterator interface {
 
 // IteratorStats is returned from {MVCCIterator,EngineIterator}.Stats.
 type IteratorStats struct {
-	TimeBoundNumSSTs int
-
 	// Iteration stats. We directly expose pebble.IteratorStats. Callers
 	// may want to aggregate and interpret these in the following manner:
 	// - Aggregate {Forward,Reverse}SeekCount, {Forward,Reverse}StepCount.
@@ -511,11 +509,6 @@ type ExportOptions struct {
 	// resources. Export queries limiter in its iteration loop to break out once
 	// resources are exhausted.
 	ResourceLimiter ResourceLimiter
-	// If UseTBI is true, the backing MVCCIncrementalIterator will initialize a
-	// time-bound iterator along with its regular iterator. The TBI will be used
-	// as an optimization to skip over swaths of uninteresting keys i.e. keys
-	// outside our time bounds, while locating the KVs to export.
-	UseTBI bool
 }
 
 // Reader is the read interface to an engine's data. Certain implementations

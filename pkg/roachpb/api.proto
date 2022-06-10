@@ -348,6 +348,18 @@ message DeleteRangeRequest {
   // Inline values cannot be deleted transactionally; a DeleteRange with
   // "inline" set to true will fail if it is executed within a transaction.
   bool inline = 4;
+  // If enabled, the range is deleted using an MVCC range tombstone, which is a
+  // cheaper constant-time write operation (but still requires a time-bounded
+  // scan to check for conflicts). This option cannot be used in a transaction,
+  // and it cannot be combined with Inline or ReturnKeys.
+  //
+  // The caller must check the MVCCRangeTombstones version gate before using
+  // this parameter, as it is new in 22.2.
+  //
+  // This parameter is EXPERIMENTAL: range tombstones are under active
+  // development, and have severe limitations including being ignored by all
+  // KV and MVCC APIs and only being stored in memory.
+  bool use_experimental_range_tombstone = 5;
 }
 
 // A DeleteRangeResponse is the return value from the DeleteRange()
@@ -403,6 +415,11 @@ message RevertRangeRequest {
   // for that time are still there — or the request will fail.
   util.hlc.Timestamp target_time = 2 [(gogoproto.nullable) = false];
 
+  // This parameter has no effect on 22.2, as TBI is always enabled. For
+  // compatibility with 22.1 nodes, callers must continue to set this as
+  // appropriate until 22.2.
+  //
+  // TODO(erikgrinaker): Remove this in 22.2.
   bool enable_time_bound_iterator_optimization = 3;
 
   // IgnoreGcThreshold can be set by a caller to ignore the target-time when
@@ -1511,18 +1528,11 @@ message ExportRequest {
   // Return the exported SST data in the response.
   bool return_sst = 5 [(gogoproto.customname) = "ReturnSST"];
 
-  // EnableTimeBoundIteratorOptimization, if true, enables a performance
-  // optimization that allows us to entirely skip over sstables in RocksDB that
-  // don't have data relevant to the time bounds in this request.
+  // This parameter has no effect on 22.2, as TBI is always enabled. For
+  // compatibility with 22.1 nodes, callers must continue to set this as
+  // appropriate until 22.2.
   //
-  // This can have a dramatic impact on performance, but we've seen a number of
-  // extremely subtle and hard to detect correctness issues with this (see
-  // #28358 #34819). As a result, we've decided to skip the optimization
-  // everywhere that it isn't absolutely necessary for the feature to work
-  // (leaving one place: poller-based changefeeds, which are being phased out
-  // anyway). This will both give increased confidence in correctness as well as
-  // eliminate any need to investigate time-bound iterators when/if someone hits
-  // a correctness bug.
+  // TODO(erikgrinaker): Remove this in 22.2.
   bool enable_time_bound_iterator_optimization = 7;
   // StorageByLocalityKV is a map of locality KVs to storage configurations. If
   // set, files will be written to the store that matches the most specific

@@ -194,7 +194,7 @@ func runTPCC(ctx context.Context, t test.Test, c cluster.Cluster, opts tpccOptio
 	}
 
 	var ep *tpccChaosEventProcessor
-	promCfg, cleanupFunc := setupPrometheus(ctx, t, c, opts, workloadInstances)
+	promCfg, cleanupFunc := setupPrometheusForTPCC(ctx, t, c, opts, workloadInstances)
 	defer cleanupFunc()
 	if opts.ChaosEventsProcessor != nil {
 		if promCfg == nil {
@@ -1413,13 +1413,13 @@ func makeWorkloadScrapeNodes(
 	return workloadScrapeNodes
 }
 
-// setupPrometheus initializes prometheus to run against the provided
+// setupPrometheusForTPCC initializes prometheus to run against the provided
 // PrometheusConfig. If no PrometheusConfig is provided, it creates a prometheus
 // scraper for all CockroachDB nodes in the TPC-C setup, as well as one for
 // each workloadInstance.
 // Returns the created PrometheusConfig if prometheus is initialized, as well
 // as a cleanup function which should be called in a defer statement.
-func setupPrometheus(
+func setupPrometheusForTPCC(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
@@ -1439,13 +1439,9 @@ func setupPrometheus(
 		cfg = &prometheus.Config{
 			PrometheusNode: workloadNode,
 			// Scrape each CockroachDB node and the workload node.
-			ScrapeConfigs: []prometheus.ScrapeConfig{
-				prometheus.MakeInsecureCockroachScrapeConfig(
-					"cockroach",
-					c.Range(1, c.Spec().NodeCount-1),
-				),
+			ScrapeConfigs: append(prometheus.MakeInsecureCockroachScrapeConfig(c.Range(1, c.Spec().NodeCount-1)),
 				prometheus.MakeWorkloadScrapeConfig("workload", makeWorkloadScrapeNodes(workloadNode, workloadInstances)),
-			},
+			),
 		}
 	}
 	if opts.DisablePrometheus {
@@ -1455,38 +1451,15 @@ func setupPrometheus(
 		t.Skip("skipping test as prometheus is needed, but prometheus does not yet work locally")
 		return nil, func() {}
 	}
-	p, err := prometheus.Init(
+	_, saveSnap, err := prometheus.Init(
 		ctx,
 		*cfg,
 		c,
 		t.L(),
-		func(ctx context.Context, nodes option.NodeListOption, operation string, args ...string) error {
-			return repeatRunE(
-				ctx,
-				t,
-				c,
-				nodes,
-				operation,
-				args...,
-			)
-		},
+		repeatRunner{C: c, T: t}.repeatRunE,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	return cfg, func() {
-		// Use a context that will not time out to avoid the issue where
-		// ctx gets canceled if t.Fatal gets called.
-		snapshotCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		if err := p.Snapshot(
-			snapshotCtx,
-			c,
-			t.L(),
-			t.ArtifactsDir(),
-		); err != nil {
-			t.L().Printf("failed to get prometheus snapshot: %v", err)
-		}
-	}
+	return cfg, func() { saveSnap(t.ArtifactsDir()) }
 }

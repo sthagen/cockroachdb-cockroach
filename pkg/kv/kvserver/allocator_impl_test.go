@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/tracker"
 )
@@ -171,6 +170,8 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	status := &raft.Status{
 		Progress: make(map[uint64]tracker.Progress),
 	}
+	status.Lead = 1
+	status.RaftState = raft.StateLeader
 	status.Commit = 10
 	for _, replica := range replicas {
 		status.Progress[uint64(replica.ReplicaID)] = tracker.Progress{
@@ -254,7 +255,7 @@ func TestAllocatorThrottled(t *testing.T) {
 
 	// First test to make sure we would send the replica to purgatory.
 	_, _, err := a.AllocateVoter(ctx, simpleSpanConfig, []roachpb.ReplicaDescriptor{}, nil)
-	if !errors.HasInterface(err, (*purgatoryError)(nil)) {
+	if _, ok := IsPurgatoryError(err); !ok {
 		t.Fatalf("expected a purgatory error, got: %+v", err)
 	}
 
@@ -278,7 +279,7 @@ func TestAllocatorThrottled(t *testing.T) {
 	storeDetail.ThrottledUntil = timeutil.Now().Add(24 * time.Hour)
 	a.StorePool.DetailsMu.Unlock()
 	_, _, err = a.AllocateVoter(ctx, simpleSpanConfig, []roachpb.ReplicaDescriptor{}, nil)
-	if errors.HasInterface(err, (*purgatoryError)(nil)) {
+	if _, ok := IsPurgatoryError(err); ok {
 		t.Fatalf("expected a non purgatory error, got: %+v", err)
 	}
 }

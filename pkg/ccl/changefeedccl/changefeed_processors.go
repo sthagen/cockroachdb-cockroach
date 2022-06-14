@@ -208,16 +208,13 @@ func (ca *changeAggregator) MustBeStreaming() bool {
 
 // Start is part of the RowSource interface.
 func (ca *changeAggregator) Start(ctx context.Context) {
+	// Derive a separate context so that we can shutdown the poller.
+	ctx, ca.cancel = ca.flowCtx.Stopper().WithCancelOnQuiesce(ctx)
+
 	if ca.spec.JobID != 0 {
 		ctx = logtags.AddTag(ctx, "job", ca.spec.JobID)
 	}
 	ctx = ca.StartInternal(ctx, changeAggregatorProcName)
-
-	// Derive a separate context so that we can shutdown the poller. Note that
-	// we need to update both ctx (used throughout this function) and
-	// ProcessorBase.Ctx (used in all other methods) to the new context.
-	ctx, ca.cancel = context.WithCancel(ctx)
-	ca.Ctx = ctx
 
 	spans, err := ca.setupSpansAndFrontier()
 
@@ -1388,7 +1385,7 @@ func (cf *changeFrontier) maybeLogBehindSpan(frontierChanged bool) {
 	if !cf.isSinkless() {
 		description = fmt.Sprintf("job %d", cf.spec.JobID)
 	}
-	if frontierChanged {
+	if frontierChanged && cf.slowLogEveryN.ShouldProcess(now) {
 		log.Infof(cf.Ctx, "%s new resolved timestamp %s is behind by %s",
 			description, frontier, resolvedBehind)
 	}

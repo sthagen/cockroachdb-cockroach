@@ -256,8 +256,8 @@ var opWeights = []int{
 	setColumnNotNull:        1,
 	setColumnType:           0, // Disabled and tracked with #66662.
 	survive:                 1,
-	insertRow:               1, // Temporarily reduced because of #80820
-	validate:                2, // validate twice more often
+	insertRow:               10, // Temporarily reduced because of #80820
+	validate:                2,  // validate twice more often
 }
 
 // adjustOpWeightsForActiveVersion adjusts the weights for the active cockroach
@@ -290,7 +290,6 @@ func adjustOpWeightsForCockroachVersion(
 // stochastic attempts and if verbosity is >= 2 the unsuccessful attempts are
 // recorded in `log` to help with debugging of the workload.
 func (og *operationGenerator) randOp(ctx context.Context, tx pgx.Tx) (stmt string, err error) {
-
 	for {
 		op := opType(og.params.ops.Int())
 		og.resetOpState()

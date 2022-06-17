@@ -687,7 +687,8 @@ func (c *clusterImpl) closeLogger() {
 }
 
 type clusterConfig struct {
-	spec spec.ClusterSpec
+	nameOverride string
+	spec         spec.ClusterSpec
 	// artifactsDir is the path where log file will be stored.
 	artifactsDir string
 	// username is the username passed via the --username argument
@@ -746,6 +747,9 @@ func (f *clusterFactory) releaseSem() {
 func (f *clusterFactory) genName(cfg clusterConfig) string {
 	if cfg.localCluster {
 		return "local" // The roachprod tool understands this magic name.
+	}
+	if cfg.nameOverride != "" {
+		return cfg.nameOverride
 	}
 	count := atomic.AddUint64(&f.counter, 1)
 	return makeClusterName(
@@ -841,7 +845,13 @@ func (f *clusterFactory) newCluster(
 
 	// Attempt to create a cluster several times to be able to move past
 	// temporary flakiness in the cloud providers.
-	const maxAttempts = 3
+	maxAttempts := 3
+	if cfg.nameOverride != "" {
+		// Usually when retrying we pick a new name (to avoid repeat failures due to
+		// partially created resources), but we were were asked to use a specific
+		// name. To keep things simple, disable retries in that case.
+		maxAttempts = 1
+	}
 	// loop assumes maxAttempts is atleast (1).
 	for i := 1; ; i++ {
 		c := &clusterImpl{
@@ -940,14 +950,14 @@ func attachToExistingCluster(
 		r: r,
 	}
 
-	if err := r.registerCluster(c); err != nil {
-		return nil, err
-	}
-
 	if !opt.skipValidation {
 		if err := c.validate(ctx, spec, l); err != nil {
 			return nil, err
 		}
+	}
+
+	if err := r.registerCluster(c); err != nil {
+		return nil, err
 	}
 
 	if !opt.skipStop {
@@ -983,20 +993,16 @@ func (c *clusterImpl) setTest(t test.Test) {
 func (c *clusterImpl) StopCockroachGracefullyOnNode(
 	ctx context.Context, l *logger.Logger, node int,
 ) error {
-	port := fmt.Sprintf("{pgport:%d}", node)
-	// Note that the following command line needs to run against both v2.1
-	// and the current branch. Do not change it in a manner that is
-	// incompatible with 2.1.
-	if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --port="+port); err != nil {
-		return err
-	}
-	// TODO (rohany): This comment below might be out of date.
+	// A graceful shutdown is sending SIGTERM to the node, then waiting
+	// some reasonable amount of time, then sending a non-graceful SIGKILL.
+	gracefulOpts := option.DefaultStopOpts()
+	gracefulOpts.RoachprodOpts.Sig = 15 // SIGTERM
+	gracefulOpts.RoachprodOpts.Wait = true
+	gracefulOpts.RoachprodOpts.MaxWait = 60
+	c.Stop(ctx, l, gracefulOpts, c.Node(node))
 	// NB: we still call Stop to make sure the process is dead when we try
 	// to restart it (or we'll catch an error from the RocksDB dir being
 	// locked). This won't happen unless run with --local due to timing.
-	// However, it serves as a reminder that `./cockroach quit` doesn't yet
-	// work well enough -- ideally all listeners and engines are closed by
-	// the time it returns to the client.
 	c.Stop(ctx, l, option.DefaultStopOpts(), c.Node(node))
 	// TODO(tschottdorf): should return an error. I doubt that we want to
 	//  call these *testing.T-style methods on goroutines.
@@ -1017,6 +1023,8 @@ func (c *clusterImpl) Save(ctx context.Context, msg string, l *logger.Logger) {
 	c.destroyState.mu.Unlock()
 }
 
+var errClusterNotFound = errors.New("cluster not found")
+
 // validateCluster takes a cluster and checks that the reality corresponds to
 // the cluster's spec. It's intended to be used with clusters created by
 // attachToExistingCluster(); otherwise, clusters create with newCluster() are
@@ -1033,7 +1041,7 @@ func (c *clusterImpl) validate(
 	}
 	cDetails, ok := cloudClusters.Clusters[c.name]
 	if !ok {
-		return fmt.Errorf("cluster %q not found", c.name)
+		return errors.Wrapf(errClusterNotFound, "%q", c.name)
 	}
 	if len(cDetails.VMs) < c.spec.NodeCount {
 		return fmt.Errorf("cluster has %d nodes, test requires at least %d", len(cDetails.VMs), c.spec.NodeCount)

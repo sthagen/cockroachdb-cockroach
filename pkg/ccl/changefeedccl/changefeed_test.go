@@ -2052,7 +2052,12 @@ func TestChangefeedAuthorization(t *testing.T) {
 		},
 		{name: `cloud`,
 			statement: `CREATE CHANGEFEED FOR d.table_a INTO 'nodelocal://12/nope/'`,
-			errMsg:    `connecting to node 12`,
+			// Ideally, this should be returning "connecting to node 12", but
+			// since (with #76582) we're using a local-only blob client by
+			// default for tenants, we get a different error message. This
+			// error message should be reverted when we generalize the blob
+			// client creation in tenants. Tracked with #76378.
+			errMsg: `connecting to remote node not supported`,
 		},
 		{name: `sinkless`,
 			statement: `EXPERIMENTAL CHANGEFEED FOR d.table_a WITH resolved='1'`,
@@ -3492,6 +3497,7 @@ func TestChangefeedErrors(t *testing.T) {
 		t, `time: invalid duration "bar"`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH resolved='bar'`,
 	)
+
 	sqlDB.ExpectErr(
 		t, `negative durations are not accepted: resolved='-1s'`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH resolved='-1s'`,
@@ -3710,7 +3716,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 	sqlDB.ExpectErr(
 		t, `this sink is incompatible with option webhook_client_timeout`,
-		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout=''`,
+		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='1s'`,
 		`kafka://nope/`,
 	)
 	// The avro format doesn't support key_in_value or topic_in_value yet.
@@ -3807,40 +3813,40 @@ func TestChangefeedErrors(t *testing.T) {
 
 	// WITH only_initial_scan and end_time disallowed
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and end_time`,
+		t, `cannot specify both initial_scan_only and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan_only, end_time = '1'`, `kafka://nope`,
 	)
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and end_time`,
+		t, `cannot specify both initial_scan_only and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH end_time = '1', initial_scan_only`, `kafka://nope`,
 	)
 
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and end_time`,
+		t, `cannot specify both initial_scan_only and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH end_time = '1', initial_scan = 'only'`, `kafka://nope`,
 	)
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and end_time`,
+		t, `cannot specify both initial_scan_only and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan = 'only', end_time = '1'`, `kafka://nope`,
 	)
 
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and resolved`,
+		t, `cannot specify both initial_scan_only and resolved`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH resolved, initial_scan = 'only'`, `kafka://nope`,
 	)
 
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and diff`,
+		t, `cannot specify both initial_scan_only and diff`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH diff, initial_scan = 'only'`, `kafka://nope`,
 	)
 
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and mvcc_timestamp`,
+		t, `cannot specify both initial_scan_only and mvcc_timestamp`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH mvcc_timestamp, initial_scan = 'only'`, `kafka://nope`,
 	)
 
 	sqlDB.ExpectErr(
-		t, `cannot specify both initial_scan='only' and updated`,
+		t, `cannot specify both initial_scan_only and updated`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH updated, initial_scan = 'only'`, `kafka://nope`,
 	)
 
@@ -3858,7 +3864,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 
 	sqlDB.ExpectErr(
-		t, `format=csv is only usable with initial_scan='only'`,
+		t, `format=csv is only usable with initial_scan_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH format = csv`, `kafka://nope`,
 	)
 
@@ -3910,11 +3916,11 @@ func TestChangefeedErrors(t *testing.T) {
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='not_an_integer'`, `webhook-https://fake-host`,
 	)
 	sqlDB.ExpectErr(
-		t, `option webhook_client_timeout must be a positive duration`,
+		t, `option webhook_client_timeout must be a duration greater than 0`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='0s'`, `webhook-https://fake-host`,
 	)
 	sqlDB.ExpectErr(
-		t, `option webhook_client_timeout must be a positive duration`,
+		t, `negative durations are not accepted: webhook_client_timeout='-500s'`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='-500s'`, `webhook-https://fake-host`,
 	)
 	sqlDB.ExpectErr(
@@ -4850,9 +4856,12 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 
 	tc := serverutils.StartNewTestCluster(t, 4, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			UseDatabase:   "test",
-			Knobs:         knobs,
-			ExternalIODir: sinkDir,
+			// Test uses SPLIT AT, which isn't currently supported for
+			// secondary tenants. Tracked with #76378.
+			DisableDefaultTestTenant: true,
+			UseDatabase:              "test",
+			Knobs:                    knobs,
+			ExternalIODir:            sinkDir,
 		}})
 	defer tc.Stopper().Stop(context.Background())
 
@@ -5992,7 +6001,7 @@ func TestChangefeedPrimaryKeyFilter(t *testing.T) {
 		sqlDB.Exec(t, "INSERT INTO foo SELECT * FROM generate_series(1, 20)")
 
 		sqlDB.ExpectErr(t, "can only be used with schema_change_policy=stop",
-			`CREATE CHANGEFEED FOR foo, bar WITH primary_key_filter='a < 5 OR a > 18'`)
+			`CREATE CHANGEFEED FOR foo WITH primary_key_filter='a < 5 OR a > 18'`)
 
 		sqlDB.ExpectErr(t, `option primary_key_filter can only be used with 1 changefeed target`,
 			`CREATE CHANGEFEED FOR foo, bar WITH schema_change_policy='stop', primary_key_filter='a < 5 OR a > 18'`)
@@ -6188,7 +6197,6 @@ func TestChangefeedMultiPodTenantPlanning(t *testing.T) {
 	tenant1Args := base.TestTenantArgs{
 		TenantID:     serverutils.TestTenantID(),
 		TestingKnobs: tenantKnobs,
-		Existing:     false,
 	}
 	tenant1Server, tenant1DB := serverutils.StartTenant(t, tc.Server(0), tenant1Args)
 	tenantRunner := sqlutils.MakeSQLRunner(tenant1DB)
@@ -6197,7 +6205,7 @@ func TestChangefeedMultiPodTenantPlanning(t *testing.T) {
 	defer tenant1DB.Close()
 
 	tenant2Args := tenant1Args
-	tenant2Args.Existing = true
+	tenant2Args.DisableCreateTenant = true
 	_, db2 := serverutils.StartTenant(t, tc.Server(1), tenant2Args)
 	defer db2.Close()
 

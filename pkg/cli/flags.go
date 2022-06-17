@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
@@ -301,7 +302,9 @@ func init() {
 			// Vitess registers flags directly.
 			flag.Hidden = true
 		}
-		if flag.Name == logflags.ShowLogsName || flag.Name == logflags.TestLogConfigName {
+		if flag.Name == logflags.ShowLogsName ||
+			flag.Name == logflags.TestLogConfigName ||
+			flag.Name == serverutils.TenantModeFlagName {
 			// test-only flag
 			flag.Hidden = true
 		}
@@ -579,7 +582,6 @@ func init() {
 		doctorRecreateClusterCmd,
 		genHAProxyCmd,
 		initCmd,
-		quitCmd,
 		sqlShellCmd,
 		/* StartCmds are covered above */
 	}
@@ -668,11 +670,11 @@ func init() {
 		cliflagcfg.BoolFlag(f, &nodeCtx.nodeDecommissionSelf, cliflags.NodeDecommissionSelf)
 	}
 
-	// Quit and node drain commands.
-	for _, cmd := range []*cobra.Command{quitCmd, drainNodeCmd} {
-		f := cmd.Flags()
-		cliflagcfg.DurationFlag(f, &quitCtx.drainWait, cliflags.DrainWait)
-		cliflagcfg.BoolFlag(f, &quitCtx.nodeDrainSelf, cliflags.NodeDrainSelf)
+	// node drain command.
+	{
+		f := drainNodeCmd.Flags()
+		cliflagcfg.DurationFlag(f, &drainCtx.drainWait, cliflags.DrainWait)
+		cliflagcfg.BoolFlag(f, &drainCtx.nodeDrainSelf, cliflags.NodeDrainSelf)
 	}
 
 	// Commands that establish a SQL connection.

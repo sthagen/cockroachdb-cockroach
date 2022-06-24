@@ -655,13 +655,7 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="to_char"></a><code>to_char(timestamp: <a href="timestamp.html">timestamp</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string assuming the ISO, MDY DateStyle.</p>
 </span></td></tr>
-<tr><td><a name="to_timestamp"></a><code>to_timestamp(timestamp: <a href="decimal.html">decimal</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.</p>
-</span></td></tr>
 <tr><td><a name="to_timestamp"></a><code>to_timestamp(timestamp: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.</p>
-</span></td></tr>
-<tr><td><a name="to_timestamp"></a><code>to_timestamp(timestamp: <a href="int.html">int</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.</p>
-</span></td></tr>
-<tr><td><a name="to_timestamp"></a><code>to_timestamp(timestamp: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.</p>
 </span></td></tr>
 <tr><td><a name="transaction_timestamp"></a><code>transaction_timestamp() &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Returns the time of the current transaction.</p>
 <p>The value is based on a timestamp picked when the transaction starts
@@ -3116,7 +3110,7 @@ table. Returns an error if validation fails.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.round_decimal_values"></a><code>crdb_internal.round_decimal_values(val: <a href="decimal.html">decimal</a>[], scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a>[]</code></td><td><span class="funcdesc"><p>This function is used internally to round decimal array values during mutations.</p>
 </span></td></tr>
-<tr><td><a name="crdb_internal.schedule_sql_stats_compaction"></a><code>crdb_internal.schedule_sql_stats_compaction(session: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to start a SQL stats compaction job.</p>
+<tr><td><a name="crdb_internal.schedule_sql_stats_compaction"></a><code>crdb_internal.schedule_sql_stats_compaction() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to start a SQL stats compaction job.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.serialize_session"></a><code>crdb_internal.serialize_session() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function serializes the variables in the current session.</p>
 </span></td></tr>

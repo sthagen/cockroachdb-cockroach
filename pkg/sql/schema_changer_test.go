@@ -1089,14 +1089,14 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 			// Run the column schema change in a separate goroutine.
 			var wg sync.WaitGroup
 			wg.Add(1)
-			go func() {
+			go func(sql string) {
 				// Start schema change that eventually runs a backfill.
-				if _, err := sqlDB.Exec(testCase.sql); err != nil {
+				if _, err := sqlDB.Exec(sql); err != nil {
 					t.Error(err)
 				}
 
 				wg.Done()
-			}()
+			}(testCase.sql)
 
 			// Wait until the schema change backfill has finished writing its
 			// intents.
@@ -6900,11 +6900,11 @@ func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
 				injectedError = false
 				sqlDB.Exec(t, tc.setupStmts)
 
-				go func() {
+				go func(scStmt string) {
 					// This transaction will not return until the server is shutdown. Therefore,
 					// we run it in a separate goroutine and don't check the returned error.
-					_, _ = db.Exec(tc.scStmt)
-				}()
+					_, _ = db.Exec(scStmt)
+				}(tc.scStmt)
 				// Verify that the job is in retry state while reverting.
 				const query = `SELECT num_runs > 3 FROM crdb_internal.jobs WHERE status = '` + string(jobs.StatusReverting) + `' AND description ~ '%s'`
 				sqlDB.CheckQueryResultsRetry(t, fmt.Sprintf(query, tc.jobRegex), [][]string{{"true"}})
@@ -6973,13 +6973,14 @@ func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
 		sqlDB.Exec(t, `SET use_declarative_schema_changer = 'off'`)
 
 		for _, tc := range testCases {
+			stmt := tc.scStmt
 			t.Run(tc.name, func(t *testing.T) {
 				beforeResumeNotification, continueNotification := initNotification()
 				sqlDB.Exec(t, tc.setupStmts)
 
 				g := ctxgroup.WithContext(ctx)
 				g.GoCtx(func(ctx context.Context) error {
-					_, err := db.ExecContext(ctx, tc.scStmt)
+					_, err := db.ExecContext(ctx, stmt)
 					assert.NoError(t, err)
 					return nil
 				})
@@ -7791,10 +7792,10 @@ CREATE TABLE t.test (x INT);`,
 
 			var wg sync.WaitGroup
 			wg.Add(1)
-			go func() {
-				sqlDB.Exec(t, tc.successfulChange)
+			go func(successfulChange string) {
+				sqlDB.Exec(t, successfulChange)
 				wg.Done()
-			}()
+			}(tc.successfulChange)
 
 			<-childJobStartNotification
 
@@ -8306,4 +8307,66 @@ func TestVirtualColumnNotAllowedInPkeyBefore22_1(t *testing.T) {
 	_, err = sqlDB.Exec(`ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (b)`)
 	require.Error(t, err)
 	require.Equal(t, "pq: cannot use virtual column \"b\" in primary key", err.Error())
+}
+
+// TestColumnBackfillProcessingDoesNotHoldLockOnJobsTable is a
+// regression test to ensure that when the column backfill progresses
+// to the next backfill chunk and it needs to update its progress, it
+// does not hold a lock on the jobs table for the duration of processing
+// the next chunk.
+func TestColumnBackfillProcessingDoesNotHoldLockOnJobsTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	params, _ := tests.CreateTestServerParams()
+	chCh := make(chan chan error)
+	params.Knobs.DistSQL = &execinfra.TestingKnobs{
+		RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+			ch := make(chan error)
+			chCh <- ch
+			return <-ch
+		},
+	}
+	params.Knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
+		BackfillChunkSize:       1,
+		WriteCheckpointInterval: time.Nanosecond,
+	}
+
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+	tdb.Exec(t, "INSERT INTO foo SELECT * FROM generate_series(1, 10)")
+	tdb.Exec(t, "ALTER TABLE foo SPLIT AT SELECT * FROM generate_series(1, 9)")
+	errCh := make(chan error)
+	go func() {
+		_, err := sqlDB.Exec(`
+SET use_declarative_schema_changer = 'off';
+ALTER TABLE foo ADD COLUMN j INT DEFAULT 42;
+`)
+		errCh <- err
+	}()
+	// Wait for one iteration.
+	close(<-chCh)
+	// Wait for another iteration.
+	ch := <-chCh
+	// Ensure that the progress has been set to something non-zero, and
+	// that a lock has not been held.
+	tdb.CheckQueryResults(t, `
+SELECT fraction_completed > 0
+  FROM crdb_internal.jobs
+ WHERE description LIKE '%ADD COLUMN j INT8 DEFAULT 42'`,
+		[][]string{{"true"}})
+	close(ch)
+	for {
+		select {
+		case ch := <-chCh:
+			close(ch)
+		case err := <-errCh:
+			require.NoError(t, err)
+			return
+		}
+	}
 }

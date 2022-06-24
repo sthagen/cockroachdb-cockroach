@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -39,8 +40,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/redact"
 )
+
+var sstIterVerify = util.ConstantWithMetamorphicTestBool("mvcc-histories-sst-iter-verify", false)
 
 // TestMVCCHistories verifies that sequences of MVCC reads and writes
 // perform properly.
@@ -72,6 +77,7 @@ import (
 // put_rangekey   ts=<int>[,<int>] [localTs=<int>[,<int>]] k=<key> end=<key>
 // get            [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [inconsistent] [tombstones] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]]
 // scan           [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [avoidExcess] [allowEmpty]
+// export         [k=<key>] [end=<key>] [ts=<int>[,<int>]] [kTs=<int>[,<int>]] [startTs=<int>[,<int>]] [maxIntents=<int>] [allRevisions] [targetSize=<int>] [maxSize=<int>] [stopMidKey]
 //
 // iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [pointSynthesis [emitOnSeekGE]] [maskBelow=<int>[,<int>]]
 // iter_new_incremental [k=<key>] [end=<key>] [startTs=<int>[,<int>]] [endTs=<int>[,<int>]] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [maskBelow=<int>[,<int>]] [intents=error|aggregate|emit]
@@ -89,6 +95,13 @@ import (
 // clear				  k=<key> [ts=<int>[,<int>]]
 // clear_range    k=<key> end=<key>
 // clear_rangekey k=<key> end=<key> ts=<int>[,<int>]
+//
+// sst_put            [ts=<int>[,<int>]] [localTs=<int>[,<int>]] k=<key> [v=<string>]
+// sst_put_rangekey   ts=<int>[,<int>] [localTS=<int>[,<int>]] k=<key> end=<key>
+// sst_clear_range    k=<key> end=<key>
+// sst_clear_rangekey k=<key> end=<key> ts=<int>[,<int>]
+// sst_finish
+// sst_iter_new
 //
 // Where `<key>` can be a simple string, or a string
 // prefixed by the following characters:
@@ -198,6 +211,104 @@ func TestMVCCHistories(t *testing.T) {
 			return err
 		}
 
+		// reportSSTEntries outputs entries from a raw SSTable. It uses a raw
+		// SST iterator in order to accurately represent the raw SST data.
+		reportSSTEntries := func(buf *redact.StringBuilder, name string, sst []byte) error {
+			r, err := sstable.NewMemReader(sst, sstable.ReaderOptions{
+				Comparer: EngineComparer,
+			})
+			if err != nil {
+				return err
+			}
+			buf.Printf(">> %s:\n", name)
+
+			// Dump point keys.
+			iter, err := r.NewIter(nil, nil)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = iter.Close() }()
+			for k, v := iter.SeekGE(nil, false); k != nil; k, v = iter.Next() {
+				if err := iter.Error(); err != nil {
+					return err
+				}
+				key, err := DecodeMVCCKey(k.UserKey)
+				if err != nil {
+					return err
+				}
+				value, err := DecodeMVCCValue(v)
+				if err != nil {
+					return err
+				}
+				buf.Printf("%s: %s -> %s\n", strings.ToLower(k.Kind().String()), key, value)
+			}
+
+			// Dump rangedels.
+			if rdIter, err := r.NewRawRangeDelIter(); err != nil {
+				return err
+			} else if rdIter != nil {
+				defer func() { _ = rdIter.Close() }()
+				for s := rdIter.SeekGE(nil); s != nil; s = rdIter.Next() {
+					if err := rdIter.Error(); err != nil {
+						return err
+					}
+					start, err := DecodeMVCCKey(s.Start)
+					if err != nil {
+						return err
+					}
+					end, err := DecodeMVCCKey(s.End)
+					if err != nil {
+						return err
+					}
+					for _, k := range s.Keys {
+						buf.Printf("%s: %s\n", strings.ToLower(k.Kind().String()),
+							roachpb.Span{Key: start.Key, EndKey: end.Key})
+					}
+				}
+			}
+
+			// Dump range keys.
+			if rkIter, err := r.NewRawRangeKeyIter(); err != nil {
+				return err
+			} else if rkIter != nil {
+				defer func() { _ = rkIter.Close() }()
+				for s := rkIter.SeekGE(nil); s != nil; s = rkIter.Next() {
+					if err := rkIter.Error(); err != nil {
+						return err
+					}
+					start, err := DecodeMVCCKey(s.Start)
+					if err != nil {
+						return err
+					}
+					end, err := DecodeMVCCKey(s.End)
+					if err != nil {
+						return err
+					}
+					for _, k := range s.Keys {
+						buf.Printf("%s: %s", strings.ToLower(k.Kind().String()),
+							roachpb.Span{Key: start.Key, EndKey: end.Key})
+						if k.Suffix != nil {
+							ts, err := decodeMVCCTimestampSuffix(k.Suffix)
+							if err != nil {
+								return err
+							}
+							buf.Printf("/%s", ts)
+						}
+						if k.Kind() == pebble.InternalKeyKindRangeKeySet {
+							value, err := DecodeMVCCValue(k.Value)
+							if err != nil {
+								return err
+							}
+							buf.Printf(" -> %s", value)
+						}
+						buf.Printf("\n")
+					}
+				}
+			}
+
+			return nil
+		}
+
 		e := newEvalCtx(ctx, engine)
 		defer e.close()
 
@@ -277,6 +388,17 @@ func TestMVCCHistories(t *testing.T) {
 								foundErr = err
 							} else {
 								buf.Printf("error reading data: (%T:) %v\n", err, err)
+							}
+						}
+						for i, sst := range e.ssts {
+							err = reportSSTEntries(&buf, fmt.Sprintf("sst-%d", i), sst)
+							if err != nil {
+								if foundErr == nil {
+									// Handle the error below.
+									foundErr = err
+								} else {
+									buf.Printf("error reading SST data: (%T:) %v\n", err, err)
+								}
 							}
 						}
 					}
@@ -403,6 +525,13 @@ func TestMVCCHistories(t *testing.T) {
 					foundErr = e.iterErr()
 				}
 
+				// Flush any unfinished SSTs.
+				if foundErr == nil {
+					foundErr = e.finishSST()
+				} else {
+					e.closeSST()
+				}
+
 				if !trace {
 					// If we were not tracing, no results were printed yet. Do it now.
 					if txnChange || dataChange {
@@ -496,6 +625,7 @@ var commands = map[string]cmd{
 	"del":            {typDataUpdate, cmdDelete},
 	"del_range":      {typDataUpdate, cmdDeleteRange},
 	"del_range_ts":   {typDataUpdate, cmdDeleteRangeTombstone},
+	"export":         {typReadOnly, cmdExport},
 	"get":            {typReadOnly, cmdGet},
 	"increment":      {typDataUpdate, cmdIncrement},
 	"initput":        {typDataUpdate, cmdInitPut},
@@ -514,6 +644,14 @@ var commands = map[string]cmd{
 	"iter_next_key":           {typReadOnly, cmdIterNextKey},
 	"iter_prev":               {typReadOnly, cmdIterPrev},
 	"iter_scan":               {typReadOnly, cmdIterScan},
+
+	"sst_put":            {typDataUpdate, cmdSSTPut},
+	"sst_put_rangekey":   {typDataUpdate, cmdSSTPutRangeKey},
+	"sst_clear_range":    {typDataUpdate, cmdSSTClearRange},
+	"sst_clear_rangekey": {typDataUpdate, cmdSSTClearRangeKey},
+	"sst_finish":         {typDataUpdate, cmdSSTFinish},
+	"sst_reset":          {typDataUpdate, cmdSSTReset},
+	"sst_iter_new":       {typReadOnly, cmdSSTIterNew},
 }
 
 func cmdTxnAdvance(e *evalCtx) error {
@@ -926,6 +1064,83 @@ func cmdPut(e *evalCtx) error {
 	})
 }
 
+func cmdExport(e *evalCtx) error {
+	key, endKey := e.getKeyRange()
+	opts := MVCCExportOptions{
+		StartKey:           MVCCKey{Key: key, Timestamp: e.getTsWithName("kTs")},
+		EndKey:             endKey,
+		StartTS:            e.getTsWithName("startTs"),
+		EndTS:              e.getTs(nil),
+		ExportAllRevisions: e.hasArg("allRevisions"),
+		StopMidKey:         e.hasArg("stopMidKey"),
+	}
+	if e.hasArg("maxIntents") {
+		e.scanArg("maxIntents", &opts.MaxIntents)
+	}
+	if e.hasArg("targetSize") {
+		e.scanArg("targetSize", &opts.TargetSize)
+	}
+	if e.hasArg("maxSize") {
+		e.scanArg("maxSize", &opts.MaxSize)
+	}
+
+	sstFile := &MemFile{}
+	summary, resume, err := MVCCExportToSST(e.ctx, e.st, e.engine, opts, sstFile)
+	if err != nil {
+		return err
+	}
+
+	e.results.buf.Printf("export: %s", &summary)
+	if resume.Key != nil {
+		e.results.buf.Printf(" resume=%s", resume)
+	}
+	e.results.buf.Printf("\n")
+
+	iter, err := NewPebbleMemSSTIterator(sstFile.Bytes(), false /* verify */)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	var rangeStart roachpb.Key
+	for iter.SeekGE(NilKey); ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
+		hasPoint, hasRange := iter.HasPointAndRange()
+		if hasRange {
+			if rangeBounds := iter.RangeBounds(); !rangeBounds.Key.Equal(rangeStart) {
+				rangeStart = append(rangeStart[:0], rangeBounds.Key...)
+				e.results.buf.Printf("export: %s/[", rangeBounds)
+				for i, rangeKV := range iter.RangeKeys() {
+					val, err := DecodeMVCCValue(rangeKV.Value)
+					if err != nil {
+						return err
+					}
+					if i > 0 {
+						e.results.buf.Printf(" ")
+					}
+					e.results.buf.Printf("%s=%s", rangeKV.RangeKey.Timestamp, val)
+				}
+				e.results.buf.Printf("]\n")
+			}
+		}
+		if hasPoint {
+			key := iter.UnsafeKey()
+			value := iter.UnsafeValue()
+			mvccValue, err := DecodeMVCCValue(value)
+			if err != nil {
+				return err
+			}
+			e.results.buf.Printf("export: %v -> %s\n", key, mvccValue)
+		}
+	}
+
+	return nil
+}
+
 func cmdScan(e *evalCtx) error {
 	txn := e.getTxn(optional)
 	key, endKey := e.getKeyRange()
@@ -1185,6 +1400,69 @@ func cmdIterScan(e *evalCtx) error {
 	}
 }
 
+func cmdSSTPut(e *evalCtx) error {
+	key := e.getKey()
+	ts := e.getTs(nil)
+	var val roachpb.Value
+	if e.hasArg("v") {
+		val = e.getVal()
+	}
+	return e.sst().PutMVCC(MVCCKey{Key: key, Timestamp: ts}, MVCCValue{Value: val})
+}
+
+func cmdSSTPutRangeKey(e *evalCtx) error {
+	var rangeKey MVCCRangeKey
+	rangeKey.StartKey, rangeKey.EndKey = e.getKeyRange()
+	rangeKey.Timestamp = e.getTs(nil)
+	var value MVCCValue
+	value.MVCCValueHeader.LocalTimestamp = hlc.ClockTimestamp(e.getTsWithName("localTs"))
+
+	return e.sst().ExperimentalPutMVCCRangeKey(rangeKey, value)
+}
+
+func cmdSSTClearRange(e *evalCtx) error {
+	start, end := e.getKeyRange()
+	return e.sst().ClearRawRange(start, end)
+}
+
+func cmdSSTClearRangeKey(e *evalCtx) error {
+	var rangeKey MVCCRangeKey
+	rangeKey.StartKey, rangeKey.EndKey = e.getKeyRange()
+	rangeKey.Timestamp = e.getTs(nil)
+
+	return e.sst().ExperimentalClearMVCCRangeKey(rangeKey)
+}
+
+func cmdSSTFinish(e *evalCtx) error {
+	return e.finishSST()
+}
+
+func cmdSSTReset(e *evalCtx) error {
+	if err := e.finishSST(); err != nil {
+		return err
+	}
+	e.ssts = nil
+	return nil
+}
+
+func cmdSSTIterNew(e *evalCtx) error {
+	if e.iter != nil {
+		e.iter.Close()
+	}
+	// Reverse the order of the SSTs, since earliers SSTs take precedence over
+	// later SSTs, and we want last-write-wins.
+	ssts := make([][]byte, len(e.ssts))
+	for i, sst := range e.ssts {
+		ssts[len(ssts)-i-1] = sst
+	}
+	iter, err := NewPebbleMultiMemSSTIterator(ssts, sstIterVerify)
+	if err != nil {
+		return err
+	}
+	e.iter = iter
+	return nil
+}
+
 func printIter(e *evalCtx) {
 	e.results.buf.Printf("%s:", e.td.Cmd)
 	defer e.results.buf.Printf("\n")
@@ -1294,6 +1572,7 @@ type evalCtx struct {
 		traceIntentWrites bool
 	}
 	ctx        context.Context
+	st         *cluster.Settings
 	engine     Engine
 	iter       SimpleMVCCIterator
 	t          *testing.T
@@ -1301,11 +1580,15 @@ type evalCtx struct {
 	txns       map[string]*roachpb.Transaction
 	txnCounter uint128.Uint128
 	ms         *enginepb.MVCCStats
+	sstWriter  *SSTWriter
+	sstFile    *MemFile
+	ssts       [][]byte
 }
 
 func newEvalCtx(ctx context.Context, engine Engine) *evalCtx {
 	return &evalCtx{
 		ctx:        ctx,
+		st:         cluster.MakeTestingClusterSettings(),
 		engine:     engine,
 		txns:       make(map[string]*roachpb.Transaction),
 		txnCounter: uint128.FromInts(0, 1),
@@ -1498,6 +1781,37 @@ func (e *evalCtx) newTxn(
 	e.txnCounter = e.txnCounter.Add(1)
 	e.txns[txnName] = txn
 	return txn, nil
+}
+
+func (e *evalCtx) sst() *SSTWriter {
+	if e.sstWriter == nil {
+		e.sstFile = &MemFile{}
+		w := MakeIngestionSSTWriter(e.ctx, e.st, e.sstFile)
+		e.sstWriter = &w
+	}
+	return e.sstWriter
+}
+
+func (e *evalCtx) finishSST() error {
+	if e.sstWriter == nil {
+		return nil
+	}
+	err := e.sstWriter.Finish()
+	if err == nil && e.sstWriter.DataSize > 0 {
+		e.ssts = append(e.ssts, e.sstFile.Bytes())
+	}
+	e.sstFile = nil
+	e.sstWriter = nil
+	return err
+}
+
+func (e *evalCtx) closeSST() {
+	if e.sstWriter == nil {
+		return
+	}
+	e.sstWriter.Close()
+	e.sstFile = nil
+	e.sstWriter = nil
 }
 
 func (e *evalCtx) lookupTxn(txnName string) (*roachpb.Transaction, error) {

@@ -25,8 +25,11 @@ export const rangeIDAttr = "range_id";
 export const statementAttr = "statement";
 export const sessionAttr = "session";
 export const tabAttr = "tab";
+export const schemaNameAttr = "schemaName";
 export const tableNameAttr = "table_name";
+export const indexNameAttr = "index_name";
 export const txnFingerprintIdAttr = "txn_fingerprint_id";
+export const unset = "(unset)";
 export const viewAttr = "view";
 
 export const REMOTE_DEBUGGING_ERROR_TEXT =

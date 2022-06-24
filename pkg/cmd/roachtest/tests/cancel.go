@@ -49,7 +49,9 @@ func registerCancel(r registry.Registry) {
 		m := c.NewMonitor(ctx, c.All())
 		m.Go(func(ctx context.Context) error {
 			t.Status("restoring TPCH dataset for Scale Factor 1")
-			if err := loadTPCHDataset(ctx, t, c, 1 /* sf */, c.NewMonitor(ctx), c.All()); err != nil {
+			if err := loadTPCHDataset(
+				ctx, t, c, 1 /* sf */, c.NewMonitor(ctx), c.All(), false, /* disableMergeQueue */
+			); err != nil {
 				t.Fatal(err)
 			}
 
@@ -69,8 +71,9 @@ func registerCancel(r registry.Registry) {
 				// Any error regarding the cancellation (or of its absence) will
 				// be sent on errCh.
 				errCh := make(chan error, 1)
-				go func(query string) {
+				go func(queryNum int) {
 					defer close(errCh)
+					query := tpch.QueriesByNumber[queryNum]
 					t.L().Printf("executing q%d\n", queryNum)
 					sem <- struct{}{}
 					close(sem)
@@ -85,7 +88,7 @@ func registerCancel(r registry.Registry) {
 							errCh <- errors.Wrap(err, "unexpected error")
 						}
 					}
-				}(tpch.QueriesByNumber[queryNum])
+				}(queryNum)
 
 				// Wait for the query-runner goroutine to start.
 				<-sem

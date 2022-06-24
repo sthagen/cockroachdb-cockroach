@@ -2117,6 +2117,47 @@ project
       ├── constraint: /6/1: [/'bar' - /'bas')
       └── key: (1)
 
+# Regression test for #81906. A constrained scan should be generated over a
+# partial index with a predicate that is normalized to true. In this case, the
+# predicate is normalized to true because the column is NOT NULL.
+exec-ddl
+CREATE TABLE t81906 (
+  k INT PRIMARY KEY,
+  a INT NOT NULL,
+  INDEX (a) WHERE a IS NOT NULL
+)
+----
+
+opt
+SELECT k FROM t81906 WHERE a = 1
+----
+project
+ ├── columns: k:1!null
+ ├── key: (1)
+ └── scan t81906@t81906_a_idx,partial
+      ├── columns: k:1!null a:2!null
+      ├── constraint: /2/1: [/1 - /1]
+      ├── key: (1)
+      └── fd: ()-->(2)
+
+# Regression test for #77364. Queries with filter in the form
+# <tuple> = ANY(ARRAY[<tuple>, ...]) should be index accelerated.
+opt expect=GenerateConstrainedScans
+SELECT * FROM e WHERE (u, w) = ANY(ARRAY[(1, 10), (2, 20), (3, 30)])
+----
+index-join e
+ ├── columns: k:1!null u:2!null v:3 w:4!null
+ ├── key: (1)
+ ├── fd: (1)-->(2-4)
+ └── scan e@uw
+      ├── columns: k:1!null u:2!null w:4!null
+      ├── constraint: /2/4/1
+      │    ├── [/1/10 - /1/10]
+      │    ├── [/2/20 - /2/20]
+      │    └── [/3/30 - /3/30]
+      ├── key: (1)
+      └── fd: (1)-->(2,4)
+
 # --------------------------------------------------
 # GenerateInvertedIndexScans
 # --------------------------------------------------

@@ -38,6 +38,7 @@ import {
   unique,
   containAny,
   syncHistory,
+  unset,
 } from "src/util";
 import {
   AggregateStatistics,
@@ -74,6 +75,7 @@ import {
   TimeScaleDropdown,
   TimeScale,
   toDateRange,
+  timeScaleToString,
 } from "../timeScaleDropdown";
 
 import { commonStyles } from "../common";
@@ -434,7 +436,7 @@ export class StatementsPage extends React.Component<
         : [];
     const databases =
       filters.database.length > 0 ? filters.database.split(",") : [];
-    if (databases.includes("(unset)")) {
+    if (databases.includes(unset)) {
       databases.push("");
     }
     const regions =
@@ -556,6 +558,8 @@ export class StatementsPage extends React.Component<
       isSelectedColumn(userSelectedColumnsToShow, c),
     );
 
+    const period = timeScaleToString(this.props.timeScale);
+
     return (
       <div>
         <section className={sortableTableCx("cl-table-container")}>
@@ -570,6 +574,7 @@ export class StatementsPage extends React.Component<
               totalCount={totalCount}
               arrayItemName="statements"
               activeFilters={activeFilters}
+              period={period}
               onClearFilters={this.onClearFilters}
             />
           </div>

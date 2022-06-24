@@ -1017,10 +1017,12 @@ func (sc *SchemaChanger) distIndexBackfill(
 		if meta.BulkProcessorProgress != nil {
 			todoSpans = roachpb.SubtractSpans(todoSpans,
 				meta.BulkProcessorProgress.CompletedSpans)
-			mu.Lock()
-			mu.updatedTodoSpans = make([]roachpb.Span, len(todoSpans))
-			copy(mu.updatedTodoSpans, todoSpans)
-			mu.Unlock()
+			func() {
+				mu.Lock()
+				defer mu.Unlock()
+				mu.updatedTodoSpans = make([]roachpb.Span, len(todoSpans))
+				copy(mu.updatedTodoSpans, todoSpans)
+			}()
 
 			if sc.testingKnobs.AlwaysUpdateIndexBackfillDetails {
 				if err := updateJobDetails(); err != nil {
@@ -1213,9 +1215,39 @@ func (sc *SchemaChanger) distColumnBackfill(
 	origNRanges := -1
 	origFractionCompleted := sc.job.FractionCompleted()
 	fractionLeft := 1 - origFractionCompleted
-	readAsOf := sc.clock.Now()
 	// Gather the initial resume spans for the table.
 	var todoSpans []roachpb.Span
+
+	maybeUpdateFractionProgressed := func() error {
+		// Report schema change progress. We define progress at this point
+		// as the fraction of fully-backfilled ranges of the primary index of
+		// the table being scanned. Since we may have already modified the
+		// fraction completed of our job from the 10% allocated to completing the
+		// schema change state machine or from a previous backfill attempt,
+		// we scale that fraction of ranges completed by the remaining fraction
+		// of the job's progress bar.
+		nRanges, err := numRangesInSpans(ctx, sc.db, sc.distSQLPlanner, todoSpans)
+		if err != nil {
+			return err
+		}
+		if origNRanges == -1 {
+			origNRanges = nRanges
+		}
+		if nRanges >= origNRanges {
+			return nil
+		}
+		fractionRangesFinished := float32(origNRanges-nRanges) / float32(origNRanges)
+		fractionCompleted := origFractionCompleted + fractionLeft*fractionRangesFinished
+		// Note that this explicitly uses a nil txn, which will lead to a new
+		// transaction being created as a part of this update. We want this
+		// update operation to be short and to not be coupled to any other
+		// backfill work, which may take much longer.
+		return sc.job.FractionProgressed(
+			ctx, nil /* txn */, jobs.FractionUpdater(fractionCompleted),
+		)
+	}
+
+	readAsOf := sc.clock.Now()
 	var mutationIdx int
 	if err := DescsTxn(ctx, sc.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
 		todoSpans, _, mutationIdx, err = rowexec.GetResumeSpans(
@@ -1227,6 +1259,9 @@ func (sc *SchemaChanger) distColumnBackfill(
 
 	for len(todoSpans) > 0 {
 		log.VEventf(ctx, 2, "backfill: process %+v spans", todoSpans)
+		if err := maybeUpdateFractionProgressed(); err != nil {
+			return err
+		}
 		// Make sure not to update todoSpans inside the transaction closure as it
 		// may not commit. Instead write the updated value for todoSpans to this
 		// variable and assign to todoSpans after committing.
@@ -1235,29 +1270,6 @@ func (sc *SchemaChanger) distColumnBackfill(
 			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 		) error {
 			updatedTodoSpans = todoSpans
-			// Report schema change progress. We define progress at this point
-			// as the fraction of fully-backfilled ranges of the primary index of
-			// the table being scanned. Since we may have already modified the
-			// fraction completed of our job from the 10% allocated to completing the
-			// schema change state machine or from a previous backfill attempt,
-			// we scale that fraction of ranges completed by the remaining fraction
-			// of the job's progress bar.
-			nRanges, err := numRangesInSpans(ctx, sc.db, sc.distSQLPlanner, todoSpans)
-			if err != nil {
-				return err
-			}
-			if origNRanges == -1 {
-				origNRanges = nRanges
-			}
-
-			if nRanges < origNRanges {
-				fractionRangesFinished := float32(origNRanges-nRanges) / float32(origNRanges)
-				fractionCompleted := origFractionCompleted + fractionLeft*fractionRangesFinished
-				if err := sc.job.FractionProgressed(ctx, txn, jobs.FractionUpdater(fractionCompleted)); err != nil {
-					return jobs.SimplifyInvalidStatusError(err)
-				}
-			}
-
 			tableDesc, err := sc.getTableVersion(ctx, txn, descriptors, version)
 			if err != nil {
 				return err
@@ -1868,7 +1880,24 @@ func countIndexRowsAndMaybeCheckUniqueness(
 		if err != nil {
 			return 0, err
 		}
-		desc = fakeDesc
+		// Mark all the columns accessible if they are not.
+		// This is to fix a bug when attempting to create a unique, expression
+		// index on a REGIONAL BY table -- the accompanying expression column
+		// is inaccessible, but later we check for uniqueness on this column
+		// via a SQL `SELECT` query, which then errors out.
+		// Such a fix is safe since this copy ('fakeDesc') is only used
+		// internally for validation.
+		// See https://github.com/cockroachdb/cockroach/issues/83076 for details.
+		mut, ok := fakeDesc.(*tabledesc.Mutable)
+		if !ok {
+			mut = tabledesc.NewBuilder(fakeDesc.TableDesc()).BuildCreatedMutableTable()
+		}
+		for i := range mut.Columns {
+			if col := &mut.Columns[i]; col.Inaccessible {
+				col.Inaccessible = false
+			}
+		}
+		desc = mut.ImmutableCopy().(catalog.TableDescriptor)
 	}
 
 	// Retrieve the row count in the index.

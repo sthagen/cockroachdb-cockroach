@@ -41,6 +41,7 @@ import {
 } from "src/redux/nodes";
 import { AdminUIState, AppDispatch } from "./state";
 import * as docsURL from "src/util/docs";
+import { getDataFromServer } from "../util/dataFromServer";
 
 export enum AlertLevel {
   NOTIFICATION,
@@ -147,13 +148,14 @@ export const staggeredVersionWarningSelector = createSelector(
       return undefined;
     }
     const versionsText = Array.from(versionsMap)
-      .map(([k, v]) => `${v} nodes are running on ${k}`)
-      .join(" and ")
+      .map(([k, v]) => (v === 1 ? `1 node on ${k}` : `${v} nodes on ${k}`))
+      .join(", ")
       .concat(". ");
     return {
       level: AlertLevel.WARNING,
       title: "Multiple versions of CockroachDB are running on this cluster.",
       text:
+        "Listed versions: " +
         versionsText +
         `You can see a list of all nodes and their versions below.
         This may be part of a normal rolling upgrade process, but should be investigated
@@ -536,6 +538,34 @@ export const panelAlertsSelector = createSelector(
 );
 
 /**
+ * dataFromServerAlertSelector returns an alert when the
+ * `dataFromServer` window variable is unset. This variable is retrieved
+ * prior to page render and contains some base metadata about the
+ * backing CRDB node.
+ */
+export const dataFromServerAlertSelector = createSelector(
+  () => {},
+  (): Alert => {
+    if (_.isEmpty(getDataFromServer())) {
+      return {
+        level: AlertLevel.CRITICAL,
+        title: "There was an error retrieving base DB Console configuration.",
+        text: "Please try refreshing the page. If the problem continues please reach out to customer support.",
+        showAsAlert: true,
+        dismiss: (_: Dispatch<Action>) => {
+          // Dismiss is a no-op here because the alert component itself
+          // is dismissable by default and because we do want to keep
+          // showing it if the metadata continues to be missing.
+          return Promise.resolve();
+        },
+      };
+    } else {
+      return null;
+    }
+  },
+);
+
+/**
  * Selector which returns an array of all active alerts which should be
  * displayed as a banner, which appears at the top of the page and overlaps
  * content in recognition of the severity of the alert; currently, this includes
@@ -548,6 +578,7 @@ export const bannerAlertsSelector = createSelector(
   cancelStatementDiagnosticsAlertSelector,
   terminateSessionAlertSelector,
   terminateQueryAlertSelector,
+  dataFromServerAlertSelector,
   (...alerts: Alert[]): Alert[] => {
     return _.without(alerts, null, undefined);
   },

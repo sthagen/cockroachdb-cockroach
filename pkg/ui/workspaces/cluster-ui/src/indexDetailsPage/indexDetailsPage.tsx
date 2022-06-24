@@ -15,10 +15,13 @@ import { SortSetting } from "src/sortedtable";
 import styles from "./indexDetailsPage.module.scss";
 import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
 import { CaretRight } from "../icon/caretRight";
-import { Breadcrumbs } from "../breadcrumbs";
+import { BreadcrumbItem, Breadcrumbs } from "../breadcrumbs";
 import { Caution, Search as IndexIcon } from "@cockroachlabs/icons";
 import { SqlBox } from "src/sql";
 import { Col, Row, Tooltip } from "antd";
+import "antd/lib/col/style";
+import "antd/lib/row/style";
+import "antd/lib/tooltip/style";
 import { SummaryCard } from "../summaryCard";
 import moment, { Moment } from "moment";
 import { Heading } from "@cockroachlabs/ui-components";
@@ -54,6 +57,7 @@ export interface IndexDetailsPageData {
   tableName: string;
   indexName: string;
   details: IndexDetails;
+  breadcrumbItems: BreadcrumbItem[];
 }
 
 interface IndexDetails {
@@ -131,7 +135,11 @@ export class IndexDetailsPage extends React.Component<
     indexRecommendations: IndexRecommendation[],
   ) {
     if (indexRecommendations.length === 0) {
-      return "None";
+      return (
+        <tr>
+          <td>None</td>
+        </tr>
+      );
     }
     return indexRecommendations.map(recommendation => {
       let recommendationType: string;
@@ -145,12 +153,11 @@ export class IndexDetailsPage extends React.Component<
       return (
         <tr
           key={recommendationType}
-          className={cx("summary-card--row", "table__row")}
+          className={cx("index-recommendations-rows")}
         >
           <td
             className={cx(
-              "table__cell",
-              "summary-card--label",
+              "index-recommendations-rows__header",
               "icon__container",
             )}
           >
@@ -159,7 +166,7 @@ export class IndexDetailsPage extends React.Component<
           </td>
           <td
             className={cx(
-              "summary-card--value",
+              "index-recommendations-rows__content",
               "index-recommendations__tooltip-anchor",
             )}
           >
@@ -174,31 +181,44 @@ export class IndexDetailsPage extends React.Component<
     });
   }
 
+  private renderBreadcrumbs() {
+    if (this.props.breadcrumbItems) {
+      return (
+        <Breadcrumbs
+          items={this.props.breadcrumbItems}
+          divider={<CaretRight className={cx("icon--xxs", "icon--primary")} />}
+        />
+      );
+    }
+    // If no props are passed, render db-console breadcrumb links by default.
+    return (
+      <Breadcrumbs
+        items={[
+          { link: "/databases", name: "Databases" },
+          {
+            link: `/database/${this.props.databaseName}`,
+            name: "Tables",
+          },
+          {
+            link: `/database/${this.props.databaseName}/table/${this.props.tableName}`,
+            name: `Table: ${this.props.tableName}`,
+          },
+          {
+            link: `/database/${this.props.databaseName}/table/${this.props.tableName}/index/${this.props.indexName}`,
+            name: `Index: ${this.props.indexName}`,
+          },
+        ]}
+        divider={<CaretRight className={cx("icon--xxs", "icon--primary")} />}
+      />
+    );
+  }
+
   render() {
     return (
       <div className={cx("page-container")}>
         <div className="root table-area">
           <section className={baseHeadingClasses.wrapper}>
-            <Breadcrumbs
-              items={[
-                { link: "/databases", name: "Databases" },
-                {
-                  link: `/database/${this.props.databaseName}`,
-                  name: "Tables",
-                },
-                {
-                  link: `/database/${this.props.databaseName}/table/${this.props.tableName}`,
-                  name: `Table: ${this.props.tableName}`,
-                },
-                {
-                  link: `/database/${this.props.databaseName}/table/${this.props.tableName}/index/${this.props.indexName}`,
-                  name: `Index: ${this.props.indexName}`,
-                },
-              ]}
-              divider={
-                <CaretRight className={cx("icon--xxs", "icon--primary")} />
-              }
-            />
+            {this.renderBreadcrumbs()}
           </section>
           <div className={cx("header-container")}>
             <h3
@@ -290,7 +310,7 @@ export class IndexDetailsPage extends React.Component<
               <Col className="gutter-row" span={18}>
                 <SummaryCard className={cx("summary-card--row")}>
                   <Heading type="h5">Index recommendations</Heading>
-                  <table className="table">
+                  <table>
                     <tbody>
                       {this.renderIndexRecommendations(
                         this.props.details.indexRecommendations,

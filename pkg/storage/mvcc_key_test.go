@@ -22,6 +22,7 @@ import (
 	"testing/quick"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -193,7 +194,7 @@ func TestEncodeDecodeMVCCKeyAndTimestampWithLength(t *testing.T) {
 			require.Equal(t, expect, encoded)
 			require.Equal(t, len(encoded), encodedMVCCKeyLength(mvccKey))
 			require.Equal(t, len(encoded),
-				encodedMVCCKeyPrefixLength(mvccKey.Key)+encodedMVCCTimestampSuffixLength(mvccKey.Timestamp))
+				EncodedMVCCKeyPrefixLength(mvccKey.Key)+EncodedMVCCTimestampSuffixLength(mvccKey.Timestamp))
 
 			decoded, err := DecodeMVCCKey(encoded)
 			require.NoError(t, err)
@@ -203,7 +204,7 @@ func TestEncodeDecodeMVCCKeyAndTimestampWithLength(t *testing.T) {
 			expectPrefix, err := hex.DecodeString(tc.encoded[:2*len(tc.key)+2])
 			require.NoError(t, err)
 			require.Equal(t, expectPrefix, EncodeMVCCKeyPrefix(roachpb.Key(tc.key)))
-			require.Equal(t, len(expectPrefix), encodedMVCCKeyPrefixLength(roachpb.Key(tc.key)))
+			require.Equal(t, len(expectPrefix), EncodedMVCCKeyPrefixLength(roachpb.Key(tc.key)))
 
 			// Test encode/decodeMVCCTimestampSuffix too, since we can trivially do so.
 			expectTS, err := hex.DecodeString(tc.encoded[2*len(tc.key)+2:])
@@ -214,7 +215,7 @@ func TestEncodeDecodeMVCCKeyAndTimestampWithLength(t *testing.T) {
 
 			encodedTS := EncodeMVCCTimestampSuffix(tc.ts)
 			require.Equal(t, expectTS, encodedTS)
-			require.Equal(t, len(encodedTS), encodedMVCCTimestampSuffixLength(tc.ts))
+			require.Equal(t, len(encodedTS), EncodedMVCCTimestampSuffixLength(tc.ts))
 
 			decodedTS, err := decodeMVCCTimestampSuffix(encodedTS)
 			require.NoError(t, err)
@@ -439,6 +440,31 @@ func TestMVCCRangeKeyCompare(t *testing.T) {
 	}
 }
 
+func TestMVCCRangeKeyEncodedSize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testcases := map[string]struct {
+		rk     MVCCRangeKey
+		expect int
+	}{
+		"empty":         {MVCCRangeKey{}, 2}, // sentinel byte for start and end
+		"only start":    {MVCCRangeKey{StartKey: roachpb.Key("foo")}, 5},
+		"only end":      {MVCCRangeKey{EndKey: roachpb.Key("foo")}, 5},
+		"only walltime": {MVCCRangeKey{Timestamp: hlc.Timestamp{WallTime: 1}}, 11},
+		"only logical":  {MVCCRangeKey{Timestamp: hlc.Timestamp{Logical: 1}}, 15},
+		"all": {MVCCRangeKey{
+			StartKey:  roachpb.Key("start"),
+			EndKey:    roachpb.Key("end"),
+			Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1, Synthetic: true},
+		}, 24},
+	}
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.expect, tc.rk.EncodedSize())
+		})
+	}
+}
+
 func TestMVCCRangeKeyValidate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -468,6 +494,80 @@ func TestMVCCRangeKeyValidate(t *testing.T) {
 			} else {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tc.expectErr)
+			}
+		})
+	}
+}
+
+func TestFirstRangeKeyAbove(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	rangeKVs := []MVCCRangeKeyValue{
+		rangeKV("a", "f", 6, MVCCValue{}),
+		rangeKV("a", "f", 4, MVCCValue{}),
+		rangeKV("a", "f", 3, MVCCValue{}),
+		rangeKV("a", "f", 1, MVCCValue{}),
+	}
+
+	testcases := []struct {
+		ts     int64
+		expect int64
+	}{
+		{0, 1},
+		{1, 1},
+		{2, 3},
+		{3, 3},
+		{4, 4},
+		{5, 6},
+		{6, 6},
+		{7, 0},
+	}
+	for _, tc := range testcases {
+		t.Run(fmt.Sprintf("%d", tc.ts), func(t *testing.T) {
+			rkv, ok := FirstRangeKeyAbove(rangeKVs, hlc.Timestamp{WallTime: tc.ts})
+			if tc.expect == 0 {
+				require.False(t, ok)
+				require.Empty(t, rkv)
+			} else {
+				require.True(t, ok)
+				require.Equal(t, rangeKV("a", "f", int(tc.expect), MVCCValue{}), rkv)
+			}
+		})
+	}
+}
+
+func TestHasRangeKeyBetween(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	rangeKVs := []MVCCRangeKeyValue{
+		rangeKV("a", "f", 5, MVCCValue{}),
+		rangeKV("a", "f", 1, MVCCValue{}),
+	}
+
+	testcases := []struct {
+		upper, lower int
+		expect       bool
+	}{
+		{0, 0, false},
+		{0, 1, false}, // wrong order
+		{1, 0, true},
+		{1, 1, true},
+		{0, 2, false}, // wrong order
+		{4, 6, false}, // wrong order
+		{6, 4, true},
+		{5, 5, true},
+		{4, 4, false},
+		{6, 6, false},
+		{4, 2, false},
+		{0, 9, false}, // wrong order
+		{9, 0, true},
+	}
+	for _, tc := range testcases {
+		t.Run(fmt.Sprintf("%d,%d", tc.upper, tc.lower), func(t *testing.T) {
+			if util.RaceEnabled && tc.upper < tc.lower {
+				require.Panics(t, func() { HasRangeKeyBetween(rangeKVs, wallTS(tc.upper), wallTS(tc.lower)) })
+			} else {
+				require.Equal(t, tc.expect, HasRangeKeyBetween(rangeKVs, wallTS(tc.upper), wallTS(tc.lower)))
 			}
 		})
 	}

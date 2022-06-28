@@ -138,7 +138,11 @@ CREATE VIEW crdb_internal.cluster_contended_keys (
   FROM
     crdb_internal.cluster_contention_events, crdb_internal.tables, crdb_internal.table_indexes
   WHERE
-    crdb_internal.cluster_contention_events.index_id = crdb_internal.table_indexes.index_id
+    (
+      crdb_internal.cluster_contention_events.index_id = crdb_internal.table_indexes.index_id
+      AND crdb_internal.cluster_contention_events.table_id
+        = crdb_internal.table_indexes.descriptor_id
+    )
     AND crdb_internal.cluster_contention_events.table_id = crdb_internal.tables.table_id
   GROUP BY
     database_name, schema_name, name, index_name, key  CREATE VIEW crdb_internal.cluster_contended_keys (
@@ -153,7 +157,11 @@ CREATE VIEW crdb_internal.cluster_contended_keys (
   FROM
     crdb_internal.cluster_contention_events, crdb_internal.tables, crdb_internal.table_indexes
   WHERE
-    crdb_internal.cluster_contention_events.index_id = crdb_internal.table_indexes.index_id
+    (
+      crdb_internal.cluster_contention_events.index_id = crdb_internal.table_indexes.index_id
+      AND crdb_internal.cluster_contention_events.table_id
+        = crdb_internal.table_indexes.descriptor_id
+    )
     AND crdb_internal.cluster_contention_events.table_id = crdb_internal.tables.table_id
   GROUP BY
     database_name, schema_name, name, index_name, key  {}  {}
@@ -326,6 +334,7 @@ CREATE TABLE crdb_internal.cluster_sessions (
    application_name STRING NULL,
    active_queries STRING NULL,
    last_active_query STRING NULL,
+   num_txns_executed INT8 NULL,
    session_start TIMESTAMP NULL,
    oldest_query_start TIMESTAMP NULL,
    kv_txn STRING NULL,
@@ -341,6 +350,7 @@ CREATE TABLE crdb_internal.cluster_sessions (
    application_name STRING NULL,
    active_queries STRING NULL,
    last_active_query STRING NULL,
+   num_txns_executed INT8 NULL,
    session_start TIMESTAMP NULL,
    oldest_query_start TIMESTAMP NULL,
    kv_txn STRING NULL,
@@ -964,6 +974,7 @@ CREATE TABLE crdb_internal.node_sessions (
    application_name STRING NULL,
    active_queries STRING NULL,
    last_active_query STRING NULL,
+   num_txns_executed INT8 NULL,
    session_start TIMESTAMP NULL,
    oldest_query_start TIMESTAMP NULL,
    kv_txn STRING NULL,
@@ -979,6 +990,7 @@ CREATE TABLE crdb_internal.node_sessions (
    application_name STRING NULL,
    active_queries STRING NULL,
    last_active_query STRING NULL,
+   num_txns_executed INT8 NULL,
    session_start TIMESTAMP NULL,
    oldest_query_start TIMESTAMP NULL,
    kv_txn STRING NULL,

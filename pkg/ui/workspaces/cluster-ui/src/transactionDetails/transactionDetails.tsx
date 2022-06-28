@@ -13,6 +13,7 @@ import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import classNames from "classnames/bind";
 import _ from "lodash";
 import { RouteComponentProps } from "react-router-dom";
+import { Helmet } from "react-helmet";
 
 import statementsStyles from "../statementsPage/statementsPage.module.scss";
 import {
@@ -60,7 +61,9 @@ import { Transaction } from "src/transactionsTable";
 import Long from "long";
 import { StatementsRequest } from "../api";
 import {
+  getValidOption,
   TimeScale,
+  timeScale1hMinOptions,
   TimeScaleDropdown,
   timeScaleToString,
   toDateRange,
@@ -134,6 +137,14 @@ export class TransactionDetails extends React.Component<
       },
       latestTransactionText: "",
     };
+
+    // In case the user selected a option not available on this page,
+    // force a selection of a valid option. This is necessary for the case
+    // where the value 10/30 min is selected on the Metrics page.
+    const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
+    if (ts !== this.props.timeScale) {
+      this.props.onTimeScaleChange(ts);
+    }
   }
 
   static defaultProps: Partial<TransactionDetailsProps> = {
@@ -216,7 +227,7 @@ export class TransactionDetails extends React.Component<
 
     // Get all the stmts matching the transaction's fingerprint ID. Then we filter
     // by those statements actually associated with the current transaction.
-    const stmts = getStatementsByFingerprintId(
+    return getStatementsByFingerprintId(
       statementFingerprintIds,
       statements,
     ).filter(
@@ -224,8 +235,6 @@ export class TransactionDetails extends React.Component<
         s.key.key_data.transaction_fingerprint_id.toString() ===
         this.props.transactionFingerprintId,
     );
-
-    return stmts;
   };
 
   render(): React.ReactElement {
@@ -237,6 +246,7 @@ export class TransactionDetails extends React.Component<
 
     return (
       <div>
+        <Helmet title={"Details | Transactions"} />
         <section className={baseHeadingClasses.wrapper}>
           <Button
             onClick={this.backToTransactionsClick}
@@ -253,6 +263,7 @@ export class TransactionDetails extends React.Component<
         <PageConfig>
           <PageConfigItem>
             <TimeScaleDropdown
+              options={timeScale1hMinOptions}
               currentScale={this.props.timeScale}
               setTimeScale={this.props.onTimeScaleChange}
             />

@@ -14,20 +14,10 @@ import { dateFormat, timeFormat } from "./timeScaleDropdown";
 import React from "react";
 
 /**
- * defaultTimeScaleOptions is a preconfigured set of time scales that can be
+ * timeScale1hMinOptions is a preconfigured set of time scales with 1h minimum that can be
  * selected by the user.
  */
-export const defaultTimeScaleOptions: TimeScaleOptions = {
-  "Past 10 Minutes": {
-    windowSize: moment.duration(10, "minutes"),
-    windowValid: moment.duration(10, "seconds"),
-    sampleSize: moment.duration(10, "seconds"),
-  },
-  "Past 30 Minutes": {
-    windowSize: moment.duration(30, "minutes"),
-    windowValid: moment.duration(30, "seconds"),
-    sampleSize: moment.duration(30, "seconds"),
-  },
+export const timeScale1hMinOptions: TimeScaleOptions = {
   "Past 1 Hour": {
     windowSize: moment.duration(1, "hour"),
     windowValid: moment.duration(1, "minute"),
@@ -75,18 +65,41 @@ export const defaultTimeScaleOptions: TimeScaleOptions = {
   },
 };
 
+/**
+ * defaultTimeScaleOptions is a preconfigured set of time scales that can be
+ * selected by the user.
+ */
+export const defaultTimeScaleOptions: TimeScaleOptions = {
+  "Past 10 Minutes": {
+    windowSize: moment.duration(10, "minutes"),
+    windowValid: moment.duration(10, "seconds"),
+    sampleSize: moment.duration(10, "seconds"),
+  },
+  "Past 30 Minutes": {
+    windowSize: moment.duration(30, "minutes"),
+    windowValid: moment.duration(30, "seconds"),
+    sampleSize: moment.duration(30, "seconds"),
+  },
+  ...timeScale1hMinOptions,
+};
+
 export const defaultTimeScaleSelected: TimeScale = {
   ...defaultTimeScaleOptions["Past 1 Hour"],
   key: "Past 1 Hour",
   fixedWindowEnd: false,
 };
 
+// toDateRange returns the actual value of start and end date, based on
+// the timescale.
+// Since this value is used on componentDidUpdate, we don't want a refresh
+// to happen every millisecond, so we set the millisecond value to 0.
 export const toDateRange = (ts: TimeScale): [moment.Moment, moment.Moment] => {
   const end = ts.fixedWindowEnd
     ? moment.utc(ts.fixedWindowEnd)
     : moment().utc();
-  const start = moment.utc(end).subtract(ts.windowSize);
-  return [start, end];
+  const endRounded = end.set({ millisecond: 0 });
+  const start = moment.utc(endRounded).subtract(ts.windowSize);
+  return [start, endRounded];
 };
 
 // toRoundedDateRange round the TimeScale selected, with the start

@@ -1921,6 +1921,7 @@ CREATE TABLE crdb_internal.%s (
   application_name   STRING,         -- the name of the application as per SET application_name
   active_queries     STRING,         -- the currently running queries as SQL
   last_active_query  STRING,         -- the query that finished last on this session as SQL
+  num_txns_executed  INT,            -- the number of transactions that were executed so far on this session
   session_start      TIMESTAMP,      -- the time when the session was opened
   oldest_query_start TIMESTAMP,      -- the time when the oldest query in the session was started
   kv_txn             STRING,         -- the ID of the current KV transaction
@@ -2022,6 +2023,7 @@ func populateSessionsTable(
 			tree.NewDString(session.ApplicationName),
 			tree.NewDString(activeQueries.String()),
 			tree.NewDString(session.LastActiveQuery),
+			tree.NewDInt(tree.DInt(session.NumTxnsExecuted)),
 			startTSDatum,
 			oldestStartDatum,
 			kvTxnIDDatum,
@@ -2047,6 +2049,7 @@ func populateSessionsTable(
 				tree.DNull,                             // application name
 				tree.NewDString("-- "+rpcErr.Message),  // active queries
 				tree.DNull,                             // last active query
+				tree.DNull,                             // num txns executed
 				tree.DNull,                             // session start
 				tree.DNull,                             // oldest_query_start
 				tree.DNull,                             // kv_txn
@@ -2162,6 +2165,8 @@ CREATE VIEW crdb_internal.cluster_contended_keys (
   WHERE
     crdb_internal.cluster_contention_events.index_id
     = crdb_internal.table_indexes.index_id
+    AND crdb_internal.cluster_contention_events.table_id
+      = crdb_internal.table_indexes.descriptor_id
     AND crdb_internal.cluster_contention_events.table_id
       = crdb_internal.tables.table_id
   GROUP BY
@@ -2847,9 +2852,9 @@ CREATE TABLE crdb_internal.index_columns (
 		storing := tree.NewDString("storing")
 		extra := tree.NewDString("extra")
 		composite := tree.NewDString("composite")
-		idxDirMap := map[descpb.IndexDescriptor_Direction]tree.Datum{
-			descpb.IndexDescriptor_ASC:  tree.NewDString(descpb.IndexDescriptor_ASC.String()),
-			descpb.IndexDescriptor_DESC: tree.NewDString(descpb.IndexDescriptor_DESC.String()),
+		idxDirMap := map[catpb.IndexColumn_Direction]tree.Datum{
+			catpb.IndexColumn_ASC:  tree.NewDString(catpb.IndexColumn_ASC.String()),
+			catpb.IndexColumn_DESC: tree.NewDString(catpb.IndexColumn_DESC.String()),
 		}
 
 		return forEachTableDescAll(ctx, p, dbContext, hideVirtual,

@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/echotest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -2694,11 +2695,11 @@ func TestReplicaLatchingSplitDeclaresWrites(t *testing.T) {
 	}
 }
 
-// TestReplicaLatchingOptimisticEvaluation verifies that limited scans
+// TestReplicaLatchingOptimisticEvaluationKeyLimit verifies that limited scans
 // evaluate optimistically without waiting for latches to be acquired. In some
 // cases, this allows them to avoid waiting on writes that their
 // over-estimated declared spans overlapped with.
-func TestReplicaLatchingOptimisticEvaluation(t *testing.T) {
+func TestReplicaLatchingOptimisticEvaluationKeyLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	testutils.RunTrueAndFalse(t, "point-reads", func(t *testing.T, pointReads bool) {
@@ -2817,6 +2818,138 @@ func TestReplicaLatchingOptimisticEvaluation(t *testing.T) {
 				}
 			})
 		}
+	})
+}
+
+// TestReplicaLatchingOptimisticEvaluationSkipLocked verifies that reads using
+// the SkipLocked wait policy evaluate optimistically without waiting for
+// latches to be acquired. In some cases, this allows them to avoid waiting on
+// latches that are touching the same keys but that the weaker isolation level
+// of SkipLocked allows the read to skip.
+func TestReplicaLatchingOptimisticEvaluationSkipLocked(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	testutils.RunTrueAndFalse(t, "point-reads", func(t *testing.T, pointReads bool) {
+		testutils.RunTrueAndFalse(t, "locking-reads", func(t *testing.T, lockingReads bool) {
+			var baRead roachpb.BatchRequest
+			baRead.WaitPolicy = lock.WaitPolicy_SkipLocked
+			if pointReads {
+				gArgs1, gArgs2 := getArgsString("a"), getArgsString("b")
+				gArgs3, gArgs4 := getArgsString("c"), getArgsString("d")
+				if lockingReads {
+					gArgs1.KeyLocking = lock.Exclusive
+					gArgs2.KeyLocking = lock.Exclusive
+					gArgs3.KeyLocking = lock.Exclusive
+					gArgs4.KeyLocking = lock.Exclusive
+				}
+				baRead.Add(gArgs1, gArgs2, gArgs3, gArgs4)
+			} else {
+				// Split into two back-to-back scans for better test coverage.
+				sArgs1 := scanArgsString("a", "c")
+				sArgs2 := scanArgsString("c", "e")
+				if lockingReads {
+					sArgs1.KeyLocking = lock.Exclusive
+					sArgs2.KeyLocking = lock.Exclusive
+				}
+				baRead.Add(sArgs1, sArgs2)
+			}
+			// The state that will block two writes while holding latches.
+			var blockWriters atomic.Value
+			blockKey1, blockKey2 := roachpb.Key("c"), roachpb.Key("d")
+			blockWriters.Store(false)
+			blockCh := make(chan struct{})
+			blockedCh := make(chan struct{}, 1)
+			// Setup filter to block the writes.
+			tc := testContext{}
+			tsc := TestStoreConfig(nil)
+			tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
+				func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+					// Make sure the direct GC path doesn't interfere with this test.
+					reqKey := filterArgs.Req.Header().Key
+					if !reqKey.Equal(blockKey1) && !reqKey.Equal(blockKey2) {
+						return nil
+					}
+					if filterArgs.Req.Method() == roachpb.Put && blockWriters.Load().(bool) {
+						blockedCh <- struct{}{}
+						<-blockCh
+					}
+					return nil
+				}
+			ctx := context.Background()
+			stopper := stop.NewStopper()
+			defer stopper.Stop(ctx)
+			tc.StartWithStoreConfig(ctx, t, stopper, tsc)
+			// Write initial keys on some, but not all keys.
+			for _, k := range []string{"a", "b", "c"} {
+				pArgs := putArgs([]byte(k), []byte("value"))
+				_, pErr := tc.SendWrapped(&pArgs)
+				require.Nil(t, pErr)
+			}
+
+			// Write #1: lock key "c" and then write to it again in the same txn. Since
+			// the key is locked at the time the write is blocked and the SkipLocked
+			// read evaluates, the read skips over the key and does not conflict with
+			// the write's latches.
+			txn := newTransaction("locker", blockKey1, 0, tc.Clock())
+			txnH := roachpb.Header{Txn: txn}
+			putArgs1 := putArgs(blockKey1, []byte("value"))
+			_, pErr := tc.SendWrappedWith(txnH, &putArgs1)
+			require.Nil(t, pErr)
+			// Write to the blocked key again, and this time stall. Note that this could
+			// also be the ResolveIntent request that's removing the lock, which is
+			// likely an even more common cause of blocking today. However, we use a Put
+			// here because we may stop acquiring latches during intent resolution in
+			// the future and don't want this test to break when we do.
+			errCh := make(chan *roachpb.Error, 3)
+			blockWriters.Store(true)
+			go func() {
+				_, pErr := tc.SendWrappedWith(txnH, &putArgs1)
+				errCh <- pErr
+			}()
+			<-blockedCh
+
+			// Write #2: perform an initial write on key "d". Since the key is missing
+			// at the time the write is blocked and the SkipLocked read evaluates, the
+			// read skips over the key and does not conflict with the write's latches.
+			putArgs2 := putArgs(blockKey2, []byte("value"))
+			go func() {
+				_, pErr := tc.SendWrappedWith(txnH, &putArgs2)
+				errCh <- pErr
+			}()
+			<-blockedCh
+
+			// The writes are now blocked while holding latches. Issue the read.
+			blockWriters.Store(false)
+			var respKeys []roachpb.Key
+			go func() {
+				errCh <- func() *roachpb.Error {
+					br, pErr := tc.Sender().Send(ctx, baRead)
+					if pErr != nil {
+						return pErr
+					}
+					for i, req := range baRead.Requests {
+						resp := br.Responses[i]
+						if err := roachpb.ResponseKeyIterate(req.GetInner(), resp.GetInner(), func(k roachpb.Key) {
+							respKeys = append(respKeys, k)
+						}); err != nil {
+							return roachpb.NewError(err)
+						}
+					}
+					return nil
+				}()
+			}()
+
+			// The read should complete first.
+			require.Nil(t, <-errCh)
+			// The writes should complete next, after they are unblocked.
+			close(blockCh)
+			require.Nil(t, <-errCh)
+			require.Nil(t, <-errCh)
+
+			// The read should have only returned the unlocked keys.
+			expRespKeys := []roachpb.Key{roachpb.Key("a"), roachpb.Key("b")}
+			require.Equal(t, expRespKeys, respKeys)
+		})
 	})
 }
 
@@ -7520,9 +7653,7 @@ func TestDiffRange(t *testing.T) {
 	// TODO(tschottdorf): this test should really pass the data through a
 	// RocksDB engine to verify that the original snapshots sort correctly.
 
-	if diff := diffRange(nil, nil); diff != nil {
-		t.Fatalf("diff of nils =  %v", diff)
-	}
+	require.Empty(t, diffRange(nil, nil))
 
 	timestamp := hlc.Timestamp{WallTime: 1729, Logical: 1}
 	value := []byte("foo")
@@ -7549,12 +7680,19 @@ func TestDiffRange(t *testing.T) {
 			{Key: []byte("zeroleft"), Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1}, Value: value},
 			{Key: []byte("zeroright"), Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1}, Value: value},
 		},
+		// Fragmented range keys.
+		RangeKV: []roachpb.RaftSnapshotData_RangeKeyValue{
+			{StartKey: []byte("A"), EndKey: []byte("C"), Timestamp: timestamp},
+			{StartKey: []byte("A"), EndKey: []byte("C"), Timestamp: timestamp.Add(0, -1)},
+			{StartKey: []byte("C"), EndKey: []byte("F"), Timestamp: timestamp},
+			{StartKey: []byte("P"), EndKey: []byte("R"), Timestamp: timestamp},
+			{StartKey: []byte("S"), EndKey: []byte("T"), Timestamp: timestamp, Value: []byte{1}},
+			{StartKey: []byte("X"), EndKey: []byte("Z"), Timestamp: timestamp},
+		},
 	}
 
 	// No diff works.
-	if diff := diffRange(leaderSnapshot, leaderSnapshot); diff != nil {
-		t.Fatalf("diff of equal snapshots = %v", diff)
-	}
+	require.Empty(t, diffRange(leaderSnapshot, leaderSnapshot))
 
 	replicaSnapshot := &roachpb.RaftSnapshotData{
 		KV: []roachpb.RaftSnapshotData_KeyValue{
@@ -7572,6 +7710,13 @@ func TestDiffRange(t *testing.T) {
 			{Key: []byte("zeroright"), Timestamp: hlc.Timestamp{}, Value: value},
 			{Key: []byte("zeroright"), Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1}, Value: value},
 		},
+		RangeKV: []roachpb.RaftSnapshotData_RangeKeyValue{
+			{StartKey: []byte("A"), EndKey: []byte("C"), Timestamp: timestamp},
+			{StartKey: []byte("E"), EndKey: []byte("G"), Timestamp: timestamp},
+			{StartKey: []byte("Q"), EndKey: []byte("R"), Timestamp: timestamp},
+			{StartKey: []byte("S"), EndKey: []byte("T"), Timestamp: timestamp, Value: []byte{2}},
+			{StartKey: []byte("X"), EndKey: []byte("Z"), Timestamp: timestamp.Add(0, 1)},
+		},
 	}
 
 	// The expected diff.
@@ -7588,48 +7733,23 @@ func TestDiffRange(t *testing.T) {
 		{LeaseHolder: false, Key: []byte("z"), Timestamp: timestamp, Value: value},
 		{LeaseHolder: true, Key: []byte("zeroleft"), Timestamp: hlc.Timestamp{}, Value: value},
 		{LeaseHolder: false, Key: []byte("zeroright"), Timestamp: hlc.Timestamp{}, Value: value},
-	}
 
+		{LeaseHolder: true, Key: []byte("A"), EndKey: []byte("C"), Timestamp: timestamp.Add(0, -1)},
+		{LeaseHolder: true, Key: []byte("C"), EndKey: []byte("F"), Timestamp: timestamp},
+		{LeaseHolder: false, Key: []byte("E"), EndKey: []byte("G"), Timestamp: timestamp},
+		{LeaseHolder: true, Key: []byte("P"), EndKey: []byte("R"), Timestamp: timestamp},
+		{LeaseHolder: false, Key: []byte("Q"), EndKey: []byte("R"), Timestamp: timestamp},
+		{LeaseHolder: true, Key: []byte("S"), EndKey: []byte("T"), Timestamp: timestamp, Value: []byte{1}},
+		{LeaseHolder: false, Key: []byte("S"), EndKey: []byte("T"), Timestamp: timestamp, Value: []byte{2}},
+		{LeaseHolder: false, Key: []byte("X"), EndKey: []byte("Z"), Timestamp: timestamp.Add(0, 1)},
+		{LeaseHolder: true, Key: []byte("X"), EndKey: []byte("Z"), Timestamp: timestamp},
+	}
 	diff := diffRange(leaderSnapshot, replicaSnapshot)
+	require.Equal(t, eDiff, diff)
 
-	for i, e := range eDiff {
-		v := diff[i]
-		if e.LeaseHolder != v.LeaseHolder || !bytes.Equal(e.Key, v.Key) || e.Timestamp != v.Timestamp || !bytes.Equal(e.Value, v.Value) {
-			t.Fatalf("diff varies at row %d, want %v and got %v\n\ngot:\n%s\nexpected:\n%s", i, e, v, diff, eDiff)
-		}
-	}
-
-	// Document the stringifed output. This is what the consistency checker
+	// Assert the stringifed output. This is what the consistency checker
 	// will actually print.
-	stringDiff := append(eDiff[:4],
-		ReplicaSnapshotDiff{Key: []byte("foo"), Value: value},
-	)
-
-	const expDiff = `--- leaseholder
-+++ follower
--0.000001729,1 "a"
--    ts:1970-01-01 00:00:00.000001729 +0000 UTC
--    value:"foo"
--    raw mvcc_key/value: 610000000000000006c1000000010d 666f6f
-+0.000001729,1 "ab"
-+    ts:1970-01-01 00:00:00.000001729 +0000 UTC
-+    value:"foo"
-+    raw mvcc_key/value: 61620000000000000006c1000000010d 666f6f
--0.000001729,1 "abcd"
--    ts:1970-01-01 00:00:00.000001729 +0000 UTC
--    value:"foo"
--    raw mvcc_key/value: 616263640000000000000006c1000000010d 666f6f
-+0.000001729,1 "abcdef"
-+    ts:1970-01-01 00:00:00.000001729 +0000 UTC
-+    value:"foo"
-+    raw mvcc_key/value: 6162636465660000000000000006c1000000010d 666f6f
-+0,0 "foo"
-+    ts:1970-01-01 00:00:00 +0000 UTC
-+    value:"foo"
-+    raw mvcc_key/value: 666f6f00 666f6f
-`
-
-	require.Equal(t, expDiff, stringDiff.String())
+	echotest.Require(t, diff.String(), testutils.TestDataPath(t, "replica_consistency_diff"))
 }
 
 func TestSyncSnapshot(t *testing.T) {
@@ -7983,7 +8103,7 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 		ba.Timestamp = tc.Clock().Now()
 		ba.Add(&roachpb.PutRequest{RequestHeader: roachpb.RequestHeader{Key: roachpb.Key(id)}})
 		st := r.CurrentLeaseStatus(ctx)
-		cmd, pErr := r.requestToProposal(ctx, kvserverbase.CmdIDKey(id), &ba, &st, uncertainty.Interval{}, allSpansGuard())
+		cmd, pErr := r.requestToProposal(ctx, kvserverbase.CmdIDKey(id), &ba, allSpansGuard(), &st, uncertainty.Interval{})
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -8106,7 +8226,7 @@ func TestReplicaRefreshMultiple(t *testing.T) {
 	incCmdID = makeIDKey()
 	atomic.StoreInt32(&filterActive, 1)
 	st := repl.CurrentLeaseStatus(ctx)
-	proposal, pErr := repl.requestToProposal(ctx, incCmdID, &ba, &st, uncertainty.Interval{}, allSpansGuard())
+	proposal, pErr := repl.requestToProposal(ctx, incCmdID, &ba, allSpansGuard(), &st, uncertainty.Interval{})
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -8811,7 +8931,7 @@ func TestReplicaEvaluationNotTxnMutation(t *testing.T) {
 	assignSeqNumsForReqs(txn, &txnPut, &txnPut2)
 	origTxn := txn.Clone()
 
-	batch, _, _, _, pErr := tc.repl.evaluateWriteBatch(ctx, makeIDKey(), &ba, nil, uncertainty.Interval{}, allSpansGuard())
+	batch, _, _, _, pErr := tc.repl.evaluateWriteBatch(ctx, makeIDKey(), &ba, allSpansGuard(), nil, uncertainty.Interval{})
 	defer batch.Close()
 	if pErr != nil {
 		t.Fatal(pErr)
@@ -13292,7 +13412,7 @@ func TestContainsEstimatesClampProposal(t *testing.T) {
 		req := putArgs(roachpb.Key("some-key"), []byte("some-value"))
 		ba.Add(&req)
 		st := tc.repl.CurrentLeaseStatus(ctx)
-		proposal, err := tc.repl.requestToProposal(ctx, cmdIDKey, &ba, &st, uncertainty.Interval{}, allSpansGuard())
+		proposal, err := tc.repl.requestToProposal(ctx, cmdIDKey, &ba, allSpansGuard(), &st, uncertainty.Interval{})
 		if err != nil {
 			t.Error(err)
 		}

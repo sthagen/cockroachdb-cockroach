@@ -3165,7 +3165,7 @@ restore_stmt:
 | RESTORE SYSTEM USERS FROM list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
   {
     $$.val = &tree.Restore{
-      SystemUsers: true,
+      DescriptorCoverage: tree.SystemUsers,
       From: $5.listOfStringOrPlaceholderOptList(),
       AsOf: $6.asOfClause(),
       Options: *($7.restoreOptions()),
@@ -3174,7 +3174,7 @@ restore_stmt:
 | RESTORE SYSTEM USERS FROM string_or_placeholder IN list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
   {
     $$.val = &tree.Restore{
-      SystemUsers: true,
+      DescriptorCoverage: tree.SystemUsers,
       Subdir: $5.expr(),
       From: $7.listOfStringOrPlaceholderOptList(),
       AsOf: $8.asOfClause(),
@@ -10123,7 +10123,7 @@ opt_locked_rels:
 
 opt_nowait_or_skip:
   /* EMPTY */ { $$.val = tree.LockWaitBlock }
-| SKIP LOCKED { $$.val = tree.LockWaitSkip }
+| SKIP LOCKED { $$.val = tree.LockWaitSkipLocked }
 | NOWAIT      { $$.val = tree.LockWaitError }
 
 select_clause:

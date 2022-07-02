@@ -8,15 +8,12 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package batcheval_test
+package builtins
 
-import "github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
+import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 
-type kvs = storageutils.KVs
-
-var (
-	pointKV            = storageutils.PointKV
-	pointKVWithLocalTS = storageutils.PointKVWithLocalTS
-	rangeKV            = storageutils.RangeKV
-	rangeKVWithLocalTS = storageutils.RangeKVWithLocalTS
-)
+func IterateGeoBuiltinOverloads(f func(builtinName string, ol []tree.Overload)) {
+	for k, builtin := range geoBuiltins {
+		f(k, builtin.overloads)
+	}
+}

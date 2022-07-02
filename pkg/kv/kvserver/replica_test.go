@@ -8692,15 +8692,9 @@ func TestRefreshFromBelowGCThreshold(t *testing.T) {
 func TestGCThresholdRacesWithRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 55293)
 
 	testutils.RunTrueAndFalse(t, "followerRead", func(t *testing.T, followerRead bool) {
 		testutils.RunTrueAndFalse(t, "thresholdFirst", func(t *testing.T, thresholdFirst bool) {
-			if !thresholdFirst {
-				skip.IgnoreLint(t, "the test fails, revealing that it is not safe "+
-					"to bump the GC threshold and to GC individual keys at the same time")
-			}
-
 			ctx := context.Background()
 			tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
 				ReplicationMode: base.ReplicationManual,

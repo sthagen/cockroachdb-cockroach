@@ -546,12 +546,11 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRecording tracingpb.Recordi
 		// records by falling through.
 		fallthrough
 	case tracingpb.RecordingStructured:
-		if len(childRecording) != 1 {
-			panic(fmt.Sprintf("RecordingStructured has %d recordings; expected 1", len(childRecording)))
-		}
-
-		for i := range rootChild.StructuredRecords {
-			s.recordInternalLocked(&rootChild.StructuredRecords[i], &s.mu.recording.structured)
+		for ci := range childRecording {
+			child := &childRecording[ci]
+			for i := range child.StructuredRecords {
+				s.recordInternalLocked(&child.StructuredRecords[i], &s.mu.recording.structured)
+			}
 		}
 	case tracingpb.RecordingOff:
 		break
@@ -678,10 +677,6 @@ func (s *crdbSpan) record(msg redact.RedactableString) {
 	logRecord := &tracingpb.LogRecord{
 		Time:    now,
 		Message: msg,
-		// Compatibility with 21.2.
-		DeprecatedFields: []tracingpb.LogRecord_Field{
-			{Key: tracingpb.LogMessageField, Value: msg},
-		},
 	}
 
 	s.recordInternal(logRecord, &s.mu.recording.logs)

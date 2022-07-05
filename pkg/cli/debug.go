@@ -439,22 +439,30 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	iter := rditer.NewReplicaEngineDataIterator(&desc, db, debugCtx.replicated)
+	snapshot := db.NewSnapshot()
+	defer snapshot.Close()
+
+	iter := rditer.NewReplicaEngineDataIterator(&desc, snapshot, debugCtx.replicated)
 	defer iter.Close()
 	results := 0
-	for ; ; iter.Next() {
-		if ok, err := iter.Valid(); err != nil {
-			return err
-		} else if !ok {
+	var ok bool
+	for ok, err = iter.SeekStart(); ok && err == nil; ok, err = iter.Next() {
+		if hasPoint, _ := iter.HasPointAndRange(); !hasPoint {
+			// TODO(erikgrinaker): For now, just skip range keys. We should print
+			// them.
+			continue
+		}
+		var key storage.EngineKey
+		if key, err = iter.UnsafeKey(); err != nil {
 			break
 		}
-		kvserver.PrintEngineKeyValue(iter.UnsafeKey(), iter.UnsafeValue())
+		kvserver.PrintEngineKeyValue(key, iter.UnsafeValue())
 		results++
 		if results == debugCtx.maxResults {
 			break
 		}
 	}
-	return nil
+	return err
 }
 
 var debugRangeDescriptorsCmd = &cobra.Command{
@@ -961,13 +969,13 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %v", key, desc))
-		} else if gossip.IsNodeIDKey(key) {
+		} else if gossip.IsNodeDescKey(key) {
 			var desc roachpb.NodeDescriptor
 			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
-		} else if strings.HasPrefix(key, gossip.KeyStorePrefix) {
+		} else if strings.HasPrefix(key, gossip.KeyStoreDescPrefix) {
 			var desc roachpb.StoreDescriptor
 			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)

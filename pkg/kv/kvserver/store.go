@@ -1716,10 +1716,7 @@ func IterateIDPrefixKeys(
 		}
 
 		if err := f(rangeID); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 		rangeID++
 	}
@@ -1727,7 +1724,7 @@ func IterateIDPrefixKeys(
 
 // IterateRangeDescriptorsFromDisk calls the provided function with each
 // descriptor from the provided Engine. The return values of this method and fn
-// have semantics similar to engine.MVCCIterate.
+// have semantics similar to storage.MVCCIterate.
 func IterateRangeDescriptorsFromDisk(
 	ctx context.Context, reader storage.Reader, fn func(desc roachpb.RangeDescriptor) error,
 ) error {
@@ -1755,7 +1752,11 @@ func IterateRangeDescriptorsFromDisk(
 			return err
 		}
 		matchCount++
-		if err := fn(desc); iterutil.Done(err) {
+		err = fn(desc)
+		if err == nil {
+			return nil
+		}
+		if iterutil.Map(err) == nil {
 			return iterutil.StopIteration()
 		}
 		return err
@@ -2533,7 +2534,7 @@ func (s *Store) GossipStore(ctx context.Context, useCached bool) error {
 	syncutil.StoreFloat64(&s.gossipWritesPerSecondVal, storeDesc.Capacity.WritesPerSecond)
 
 	// Unique gossip key per store.
-	gossipStoreKey := gossip.MakeStoreKey(storeDesc.StoreID)
+	gossipStoreKey := gossip.MakeStoreDescKey(storeDesc.StoreID)
 	// Gossip store descriptor.
 	return s.cfg.Gossip.AddInfoProto(gossipStoreKey, storeDesc, gossip.StoreTTL)
 }

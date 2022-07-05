@@ -2466,21 +2466,16 @@ func MVCCDeleteRange(
 	return keys, res.ResumeSpan, res.NumKeys, nil
 }
 
-// ExperimentalMVCCDeleteRangeUsingTombstone deletes the given MVCC keyspan at
-// the given timestamp using an MVCC range tombstone (rather than MVCC point
-// tombstones). This operation is non-transactional, but will check for
-// existing intents and return a WriteIntentError containing up to maxIntents
-// intents.
+// MVCCDeleteRangeUsingTombstone deletes the given MVCC keyspan at the given
+// timestamp using an MVCC range tombstone (rather than MVCC point tombstones).
+// This operation is non-transactional, but will check for existing intents and
+// return a WriteIntentError containing up to maxIntents intents.
 //
 // The leftPeekBound and rightPeekBound parameters are used when looking for
 // range tombstones that we'll merge or overlap with. These are provided to
 // prevent the command from reading outside of the CRDB range bounds and latch
 // bounds. nil means no bounds.
-//
-// This method is EXPERIMENTAL: range keys are under active development, and
-// have severe limitations including being ignored by all KV and MVCC APIs and
-// only being stored in memory.
-func ExperimentalMVCCDeleteRangeUsingTombstone(
+func MVCCDeleteRangeUsingTombstone(
 	ctx context.Context,
 	rw ReadWriter,
 	ms *enginepb.MVCCStats,
@@ -2763,7 +2758,7 @@ func ExperimentalMVCCDeleteRangeUsingTombstone(
 		}
 	}
 
-	if err := rw.ExperimentalPutMVCCRangeKey(rangeKey, value); err != nil {
+	if err := rw.PutMVCCRangeKey(rangeKey, value); err != nil {
 		return err
 	}
 
@@ -2923,7 +2918,7 @@ func buildScanIntents(data []byte) ([]roachpb.Intent, error) {
 		return nil, nil
 	}
 
-	reader, err := NewRocksDBBatchReader(data)
+	reader, err := NewPebbleBatchReader(data)
 	if err != nil {
 		return nil, err
 	}
@@ -3194,10 +3189,8 @@ func MVCCIterate(
 
 		for i := range res.KVs {
 			if err := f(res.KVs[i]); err != nil {
-				if iterutil.Done(err) {
-					return intents, nil
-				}
-				return nil, err
+				err = iterutil.Map(err)
+				return intents, err
 			}
 		}
 
@@ -4839,7 +4832,7 @@ func MVCCExportToSST(
 				}
 				// Export only the inner roachpb.Value, not the MVCCValue header.
 				mvccValue = MVCCValue{Value: mvccValue.Value}
-				if err := sstWriter.ExperimentalPutMVCCRangeKey(rkv.RangeKey, mvccValue); err != nil {
+				if err := sstWriter.PutMVCCRangeKey(rkv.RangeKey, mvccValue); err != nil {
 					return roachpb.BulkOpSummary{}, MVCCKey{}, err
 				}
 			}
@@ -5009,7 +5002,7 @@ func MVCCExportToSST(
 			}
 			// Export only the inner roachpb.Value, not the MVCCValue header.
 			mvccValue = MVCCValue{Value: mvccValue.Value}
-			if err := sstWriter.ExperimentalPutMVCCRangeKey(rkv.RangeKey, mvccValue); err != nil {
+			if err := sstWriter.PutMVCCRangeKey(rkv.RangeKey, mvccValue); err != nil {
 				return roachpb.BulkOpSummary{}, MVCCKey{}, err
 			}
 		}

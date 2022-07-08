@@ -221,6 +221,7 @@ type Streamer struct {
 	hints         Hints
 	maxKeysPerRow int32
 	budget        *budget
+	keyLocking    lock.Strength
 
 	streamerStatistics
 
@@ -229,6 +230,12 @@ type Streamer struct {
 	coordinatorCtxCancel context.CancelFunc
 
 	waitGroup sync.WaitGroup
+
+	truncationHelper *kvcoord.BatchTruncationHelper
+	// truncationHelperAccountedFor tracks how much space has been consumed from
+	// the budget in order to account for the memory usage of the truncation
+	// helper.
+	truncationHelperAccountedFor int64
 
 	// requestsToServe contains all single-range sub-requests that have yet
 	// to be served.
@@ -354,6 +361,7 @@ func NewStreamer(
 	limitBytes int64,
 	acc *mon.BoundAccount,
 	batchRequestsIssued *int64,
+	keyLocking lock.Strength,
 ) *Streamer {
 	if txn.Type() != kv.LeafTxn {
 		panic(errors.AssertionFailedf("RootTxn is given to the Streamer"))
@@ -362,6 +370,7 @@ func NewStreamer(
 		distSender: distSender,
 		stopper:    stopper,
 		budget:     newBudget(acc, limitBytes),
+		keyLocking: keyLocking,
 	}
 	if batchRequestsIssued == nil {
 		batchRequestsIssued = new(int64)
@@ -503,35 +512,51 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (re
 			s.mu.Unlock()
 		}
 	}()
-	// TODO(yuzefovich): reuse truncation helpers between different Enqueue()
-	// calls.
-	// TODO(yuzefovich): introduce a fast path when all requests are contained
-	// within a single range.
-	// The streamer can process the responses in an arbitrary order, so we don't
-	// require the helper to preserve the order of requests and allow it to
-	// reorder the reqs slice too.
-	const mustPreserveOrder = false
-	const canReorderRequestsSlice = true
-	truncationHelper, err := kvcoord.MakeBatchTruncationHelper(
-		scanDir, reqs, mustPreserveOrder, canReorderRequestsSlice,
-	)
-	if err != nil {
-		return err
+	allRequestsAreWithinSingleRange := !ri.NeedAnother(rs)
+	if !allRequestsAreWithinSingleRange {
+		// We only need the truncation helper if the requests span multiple
+		// ranges.
+		if s.truncationHelper == nil {
+			// The streamer can process the responses in an arbitrary order, so
+			// we don't require the helper to preserve the order of requests and
+			// allow it to reorder the reqs slice too.
+			const mustPreserveOrder = false
+			const canReorderRequestsSlice = true
+			s.truncationHelper, err = kvcoord.NewBatchTruncationHelper(
+				scanDir, reqs, mustPreserveOrder, canReorderRequestsSlice,
+			)
+		} else {
+			err = s.truncationHelper.Init(reqs)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	var reqsKeysScratch []roachpb.Key
 	var newNumRangesPerScanRequestMemoryUsage int64
 	for ; ri.Valid(); ri.Seek(ctx, seekKey, scanDir) {
-		// Truncate the request span to the current range.
-		singleRangeSpan, err := rs.Intersect(ri.Token().Desc())
-		if err != nil {
-			return err
-		}
 		// Find all requests that touch the current range.
 		var singleRangeReqs []roachpb.RequestUnion
 		var positions []int
-		singleRangeReqs, positions, seekKey, err = truncationHelper.Truncate(singleRangeSpan)
-		if err != nil {
-			return err
+		if allRequestsAreWithinSingleRange {
+			// All requests are within this range, so we can just use the
+			// enqueued requests directly.
+			singleRangeReqs = reqs
+			positions = make([]int, len(reqs))
+			for i := range positions {
+				positions[i] = i
+			}
+			seekKey = roachpb.RKeyMax
+		} else {
+			// Truncate the request span to the current range.
+			singleRangeSpan, err := rs.Intersect(ri.Token().Desc())
+			if err != nil {
+				return err
+			}
+			singleRangeReqs, positions, seekKey, err = s.truncationHelper.Truncate(singleRangeSpan)
+			if err != nil {
+				return err
+			}
 		}
 		rs.Key = seekKey
 		var subRequestIdx []int32
@@ -618,6 +643,11 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (re
 	}
 
 	toConsume := totalReqsMemUsage
+	if !allRequestsAreWithinSingleRange {
+		accountedFor := s.truncationHelperAccountedFor
+		s.truncationHelperAccountedFor = s.truncationHelper.MemUsage()
+		toConsume += s.truncationHelperAccountedFor - accountedFor
+	}
 	if newNumRangesPerScanRequestMemoryUsage != 0 && newNumRangesPerScanRequestMemoryUsage != s.numRangesPerScanRequestAccountedFor {
 		toConsume += newNumRangesPerScanRequestMemoryUsage - s.numRangesPerScanRequestAccountedFor
 		s.numRangesPerScanRequestAccountedFor = newNumRangesPerScanRequestMemoryUsage
@@ -1360,7 +1390,7 @@ func processSingleRangeResponse(
 ) {
 	processSingleRangeResults(ctx, s, req, br, fp)
 	if fp.hasIncomplete() {
-		resumeReq := buildResumeSingeRangeBatch(s, req, br, fp)
+		resumeReq := buildResumeSingleRangeBatch(s, req, br, fp)
 		s.requestsToServe.add(resumeReq)
 	}
 }
@@ -1428,9 +1458,9 @@ func processSingleRangeResults(
 			subRequestIdx = req.subRequestIdx[i]
 		}
 		reply := resp.GetInner()
-		switch req.reqs[i].GetInner().(type) {
-		case *roachpb.GetRequest:
-			get := reply.(*roachpb.GetResponse)
+		switch response := reply.(type) {
+		case *roachpb.GetResponse:
+			get := response
 			if get.ResumeSpan != nil {
 				// This Get wasn't completed.
 				continue
@@ -1454,8 +1484,8 @@ func processSingleRangeResults(
 			}
 			s.results.addLocked(result)
 
-		case *roachpb.ScanRequest:
-			scan := reply.(*roachpb.ScanResponse)
+		case *roachpb.ScanResponse:
+			scan := response
 			if len(scan.BatchResponses) == 0 && scan.ResumeSpan != nil {
 				// Only the first part of the conditional is true whenever we
 				// received an empty response for the Scan request (i.e. there
@@ -1521,7 +1551,7 @@ func processSingleRangeResults(
 //
 // Note that it should only be called if the response has any incomplete
 // requests.
-func buildResumeSingeRangeBatch(
+func buildResumeSingleRangeBatch(
 	s *Streamer,
 	req singleRangeBatch,
 	br *roachpb.BatchResponse,
@@ -1537,13 +1567,6 @@ func buildResumeSingeRangeBatch(
 	// requests with the ResumeSpans.
 	resumeReq.reqsReservedBytes = fp.resumeReqsMemUsage
 	resumeReq.overheadAccountedFor = req.overheadAccountedFor
-	// TODO(yuzefovich): for incomplete Get requests, the ResumeSpan should be
-	// exactly the same as the original span, so we might be able to reuse the
-	// original Get requests.
-	gets := make([]struct {
-		req   roachpb.GetRequest
-		union roachpb.RequestUnion_Get
-	}, fp.numIncompleteGets)
 	scans := make([]struct {
 		req   roachpb.ScanRequest
 		union roachpb.RequestUnion_Scan
@@ -1553,21 +1576,25 @@ func buildResumeSingeRangeBatch(
 	for i, resp := range br.Responses {
 		position := req.positions[i]
 		reply := resp.GetInner()
-		switch origRequest := req.reqs[i].GetInner().(type) {
-		case *roachpb.GetRequest:
-			get := reply.(*roachpb.GetResponse)
+		switch response := reply.(type) {
+		case *roachpb.GetResponse:
+			get := response
 			if get.ResumeSpan == nil {
 				emptyResponse = false
 				continue
 			}
-			// This Get wasn't completed - create a new request according to the
-			// ResumeSpan and include it into the batch.
-			newGet := gets[0]
-			gets = gets[1:]
-			newGet.req.SetSpan(*get.ResumeSpan)
-			newGet.req.KeyLocking = origRequest.KeyLocking
-			newGet.union.Get = &newGet.req
-			resumeReq.reqs[resumeReqIdx].Value = &newGet.union
+			// This Get wasn't completed - include it into the batch again (we
+			// can just reuse the original request since it hasn't been
+			// modified which is also asserted below).
+			if buildutil.CrdbTestBuild {
+				if origSpan := req.reqs[i].GetInner().Header().Span(); !get.ResumeSpan.Equal(origSpan) {
+					panic(errors.AssertionFailedf(
+						"unexpectedly the ResumeSpan %s on the GetResponse is different from the original span %s",
+						get.ResumeSpan, origSpan,
+					))
+				}
+			}
+			resumeReq.reqs[resumeReqIdx] = req.reqs[i]
 			resumeReq.positions = append(resumeReq.positions, position)
 			if req.subRequestIdx != nil {
 				resumeReq.subRequestIdx = append(resumeReq.subRequestIdx, req.subRequestIdx[i])
@@ -1577,8 +1604,8 @@ func buildResumeSingeRangeBatch(
 			}
 			resumeReqIdx++
 
-		case *roachpb.ScanRequest:
-			scan := reply.(*roachpb.ScanResponse)
+		case *roachpb.ScanResponse:
+			scan := response
 			if scan.ResumeSpan == nil {
 				emptyResponse = false
 				continue
@@ -1589,7 +1616,7 @@ func buildResumeSingeRangeBatch(
 			scans = scans[1:]
 			newScan.req.SetSpan(*scan.ResumeSpan)
 			newScan.req.ScanFormat = roachpb.BATCH_RESPONSE
-			newScan.req.KeyLocking = origRequest.KeyLocking
+			newScan.req.KeyLocking = s.keyLocking
 			newScan.union.Scan = &newScan.req
 			resumeReq.reqs[resumeReqIdx].Value = &newScan.union
 			resumeReq.positions = append(resumeReq.positions, position)

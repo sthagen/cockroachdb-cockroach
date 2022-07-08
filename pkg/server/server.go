@@ -1012,7 +1012,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// Initialize the external storage builders configuration params now that the
 	// engines have been created. The object can be used to create ExternalStorage
 	// objects hereafter.
-	fileTableInternalExecutor := sql.MakeInternalExecutor(ctx, s.PGServer().SQLServer, sql.MemoryMetrics{}, s.st)
+	ieMon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
+	ieMon.StartNoReserved(ctx, s.PGServer().SQLServer.GetBytesMonitor())
+	s.stopper.AddCloser(stop.CloserFn(func() { ieMon.Stop(ctx) }))
+	fileTableInternalExecutor := sql.MakeInternalExecutor(s.PGServer().SQLServer, sql.MemoryMetrics{}, ieMon)
 	s.externalStorageBuilder.init(
 		ctx,
 		s.cfg.ExternalIODirConfig,
@@ -1448,7 +1451,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// existing stores shouldn’t be able to acquire leases yet. Although, below
 	// Raft commands like log application and snapshot application may be able
 	// to bypass admission control.
-	s.storeGrantCoords.SetPebbleMetricsProvider(ctx, s.node)
+	s.storeGrantCoords.SetPebbleMetricsProvider(ctx, s.node, s.node)
 
 	// Once all stores are initialized, check if offline storage recovery
 	// was done prior to start and record any actions appropriately.

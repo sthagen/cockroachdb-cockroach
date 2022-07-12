@@ -1,4 +1,4 @@
-// Copyright 2019 The Cockroach Authors.
+// Copyright 2022 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -8,4 +8,14 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-export * from "./badge";
+package storage_test
+
+import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+)
+
+func init() {
+	storage.TestingUserDescID = bootstrap.TestingUserDescID
+	storage.TestingUserTableDataMin = bootstrap.TestingUserTableDataMin
+}

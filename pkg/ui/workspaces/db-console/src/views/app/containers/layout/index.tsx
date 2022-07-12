@@ -34,8 +34,8 @@ import {
   PageHeader,
   Text,
   TextTypes,
-  Badge,
 } from "src/components";
+import { Badge } from "@cockroachlabs/cluster-ui";
 
 import "./layout.styl";
 import "./layoutPanel.styl";
@@ -61,7 +61,9 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
     // AdminUI layout keeps left and top panels have fixed position on a screen and has internal scrolling for content div
     // element which has to be scrolled back on top with navigation change.
     if (this.props.location.pathname !== prevProps.location.pathname) {
-      this.contentRef.current.scrollTo(0, 0);
+      if (typeof this.contentRef.current.scrollTo === "function") {
+        this.contentRef.current.scrollTo(0, 0);
+      }
     }
   }
 

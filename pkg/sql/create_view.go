@@ -68,6 +68,9 @@ type createViewNode struct {
 	// depends on. This is collected during the construction of
 	// the view query's logical plan.
 	typeDeps typeDependencies
+	// withData indicates if a materialized view should be populated
+	// with data by executing the underlying query.
+	withData bool
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -240,6 +243,11 @@ func (n *createViewNode) startExec(params runParams) error {
 					//   the view query
 					// * use AllocateIDs to give the view descriptor a primary key
 					desc.IsMaterializedView = true
+					// If the materialized view has been created WITH NO DATA option, mark
+					// the table descriptor as requiring a REFRESH VIEW to indicate the view
+					// should only be accessed after a REFRESH VIEW operation has been called
+					// on it.
+					desc.RefreshViewRequired = !n.withData
 					desc.State = descpb.DescriptorState_ADD
 					version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
 					if err := desc.AllocateIDs(params.ctx, version); err != nil {
@@ -431,13 +439,13 @@ func replaceSeqNamesWithIDs(
 		if err != nil {
 			return false, expr, err
 		}
-		seqNameToID := make(map[string]descpb.ID)
+		seqNameToID := make(map[string]int64)
 		for _, seqIdentifier := range seqIdentifiers {
 			seqDesc, err := GetSequenceDescFromIdentifier(ctx, sc, seqIdentifier)
 			if err != nil {
 				return false, expr, err
 			}
-			seqNameToID[seqIdentifier.SeqName] = seqDesc.ID
+			seqNameToID[seqIdentifier.SeqName] = int64(seqDesc.ID)
 		}
 		newExpr, err = seqexpr.ReplaceSequenceNamesWithIDs(expr, seqNameToID, builtins.GetBuiltinProperties)
 		if err != nil {

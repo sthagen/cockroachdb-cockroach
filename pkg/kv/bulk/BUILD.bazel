@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -58,15 +59,20 @@ go_test(
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
+        "//pkg/storage",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/storageutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/limit",
+        "//pkg/util/log",
         "//pkg/util/mon",
         "//pkg/util/randutil",
         "//pkg/util/tracing",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

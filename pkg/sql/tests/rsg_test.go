@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -299,11 +300,13 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 					// Some spatial function are slow and testing them here
 					// is not worth it.
 					continue
-				case "crdb_internal.reset_sql_stats", "crdb_internal.check_consistency":
+				case "crdb_internal.reset_sql_stats",
+					"crdb_internal.check_consistency",
+					"crdb_internal.request_statement_bundle":
 					// Skipped due to long execution time.
 					continue
 				}
-				_, variations := builtins.GetBuiltinProperties(name)
+				_, variations := builtinsregistry.GetBuiltinProperties(name)
 				for _, builtin := range variations {
 					select {
 					case <-done:

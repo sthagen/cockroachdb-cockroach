@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -13,12 +14,13 @@ go_library(
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/schemaexpr",
         "//pkg/sql/catalog/seqexpr",
         "//pkg/sql/catalog/typedesc",
         "//pkg/sql/parser",
         "//pkg/sql/schemachanger/scerrors",
         "//pkg/sql/schemachanger/scpb",
-        "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/builtins/builtinsregistry",
         "//pkg/sql/sem/catconstants",
         "//pkg/sql/sem/catid",
         "//pkg/sql/sem/tree",
@@ -51,3 +53,5 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -328,7 +328,7 @@ func registerTPCC(r registry.Registry) {
 		// headroom, more closely mirroring a real production deployment than
 		// running with the max supported warehouses.
 		Name:              "tpcc/headroom/" + headroomSpec.String(),
-		Owner:             registry.OwnerKV,
+		Owner:             registry.OwnerTestEng,
 		Tags:              []string{`default`, `release_qualification`},
 		Cluster:           headroomSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
@@ -352,7 +352,7 @@ func registerTPCC(r registry.Registry) {
 		// migrations while TPCC runs. It simulates a real production
 		// deployment in the middle of the migration into a new cluster version.
 		Name:  "tpcc/mixed-headroom/" + mixedHeadroomSpec.String(),
-		Owner: registry.OwnerKV,
+		Owner: registry.OwnerTestEng,
 		// TODO(tbg): add release_qualification tag once we know the test isn't
 		// buggy.
 		Tags:              []string{`default`},
@@ -435,7 +435,7 @@ func registerTPCC(r registry.Registry) {
 	})
 	r.Add(registry.TestSpec{
 		Name:              "tpcc-nowait/nodes=3/w=1",
-		Owner:             registry.OwnerKV,
+		Owner:             registry.OwnerTestEng,
 		Cluster:           r.MakeClusterSpec(4, spec.CPU(16)),
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -449,7 +449,7 @@ func registerTPCC(r registry.Registry) {
 	})
 	r.Add(registry.TestSpec{
 		Name:    "weekly/tpcc/headroom",
-		Owner:   registry.OwnerKV,
+		Owner:   registry.OwnerTestEng,
 		Tags:    []string{`weekly`},
 		Cluster: r.MakeClusterSpec(4, spec.CPU(16)),
 		// Give the test a generous extra 10 hours to load the dataset and
@@ -662,7 +662,7 @@ func registerTPCC(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:              "tpcc/w=100/nodes=3/chaos=true",
-		Owner:             registry.OwnerKV,
+		Owner:             registry.OwnerTestEng,
 		Cluster:           r.MakeClusterSpec(4),
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -833,6 +833,7 @@ func (l tpccBenchLoadConfig) numLoadNodes(d tpccBenchDistribution) int {
 }
 
 type tpccBenchSpec struct {
+	Owner                    registry.Owner // defaults to Test-Eng
 	Nodes                    int
 	CPUs                     int
 	Chaos                    bool
@@ -885,6 +886,10 @@ func (s tpccBenchSpec) startOpts() (option.StartOpts, install.ClusterSettings) {
 }
 
 func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
+	owner := registry.OwnerTestEng
+	if b.Owner != "" {
+		owner = b.Owner
+	}
 	nameParts := []string{
 		"tpccbench",
 		fmt.Sprintf("nodes=%d", b.Nodes),
@@ -934,7 +939,7 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 
 	r.Add(registry.TestSpec{
 		Name:    name,
-		Owner:   registry.OwnerKV,
+		Owner:   owner,
 		Cluster: nodes,
 		Tags:    b.Tags,
 		// NB: intentionally not enabling encryption-at-rest to produce

@@ -42,7 +42,7 @@ import { Button } from "src/button";
 import { SqlBox, SqlBoxSize } from "src/sql";
 import { SortSetting } from "src/sortedtable";
 import { PlanDetails } from "./planDetails";
-import { SummaryCard } from "src/summaryCard";
+import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { DiagnosticsView } from "./diagnostics/diagnosticsView";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
 import timeScaleStyles from "src/timeScaleDropdown/timeScale.module.scss";
@@ -88,7 +88,7 @@ export type StatementDetailsProps = StatementDetailsOwnProps &
   RouteComponentProps<{ implicitTxn: string; statement: string }>;
 
 export interface StatementDetailsState {
-  sortSetting: SortSetting;
+  plansSortSetting: SortSetting;
   currentTab?: string;
 }
 
@@ -210,10 +210,9 @@ export class StatementDetails extends React.Component<
     super(props);
     const searchParams = new URLSearchParams(props.history.location.search);
     this.state = {
-      sortSetting: {
-        // Latency
+      plansSortSetting: {
         ascending: false,
-        columnTitle: "statementTime",
+        columnTitle: "lastExecTime",
       },
       currentTab: searchParams.get("tab") || "overview",
     };
@@ -345,6 +344,12 @@ export class StatementDetails extends React.Component<
     if (this.props.onBackToStatementsClick) {
       this.props.onBackToStatementsClick();
     }
+  };
+
+  onChangePlansSortSetting = (ss: SortSetting): void => {
+    this.setState({
+      plansSortSetting: ss,
+    });
   };
 
   render(): React.ReactElement {
@@ -593,59 +598,49 @@ export class StatementDetails extends React.Component<
             <Col className="gutter-row" span={12}>
               <SummaryCard className={cx("summary-card")}>
                 {!isTenant && (
-                  <div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Nodes</Text>
-                      <Text>
-                        {intersperse<ReactNode>(
-                          nodes.map(n => <NodeLink node={n} key={n} />),
-                          ", ",
-                        )}
-                      </Text>
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Regions</Text>
-                      <Text>{intersperse<ReactNode>(regions, ", ")}</Text>
-                    </div>
-                  </div>
+                  <>
+                    <SummaryCardItem
+                      label="Nodes"
+                      value={intersperse<ReactNode>(
+                        nodes.map(n => <NodeLink node={n} key={n} />),
+                        ", ",
+                      )}
+                    />
+                    <SummaryCardItem
+                      label="Regions"
+                      value={intersperse<ReactNode>(regions, ", ")}
+                    />
+                  </>
                 )}
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Database</Text>
-                  {db}
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>App</Text>
-                  <Text>
-                    {intersperse<ReactNode>(
-                      app_names.map(a => <AppLink app={a} key={a} />),
-                      ", ",
-                    )}
-                  </Text>
-                </div>
+                <SummaryCardItem label="Database" value={db} />
+                <SummaryCardItem
+                  label="App"
+                  value={intersperse<ReactNode>(
+                    app_names.map(a => <AppLink app={a} key={a} />),
+                    ", ",
+                  )}
+                />
               </SummaryCard>
             </Col>
             <Col className="gutter-row" span={12}>
               <SummaryCard className={cx("summary-card")}>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Failed?</Text>
-                  <Text>{RenderCount(failed_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Full scan?</Text>
-                  <Text>{RenderCount(full_scan_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Vectorized execution?</Text>
-                  <Text>{RenderCount(vec_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Transaction type</Text>
-                  <Text>{renderTransactionType(implicit_txn)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Last execution time</Text>
-                  <Text>{lastExec}</Text>
-                </div>
+                <SummaryCardItem
+                  label="Failed?"
+                  value={RenderCount(failed_count, total_count)}
+                />
+                <SummaryCardItem
+                  label="Full scan?"
+                  value={RenderCount(full_scan_count, total_count)}
+                />
+                <SummaryCardItem
+                  label="Vectorized execution?"
+                  value={RenderCount(vec_count, total_count)}
+                />
+                <SummaryCardItem
+                  label="Transaction type"
+                  value={renderTransactionType(implicit_txn)}
+                />
+                <SummaryCardItem label="Last execution time" value={lastExec} />
               </SummaryCard>
             </Col>
           </Row>
@@ -733,7 +728,11 @@ export class StatementDetails extends React.Component<
             </Col>
           </Row>
           <p className={summaryCardStylesCx("summary--card__divider")} />
-          <PlanDetails plans={statement_statistics_per_plan_hash} />
+          <PlanDetails
+            plans={statement_statistics_per_plan_hash}
+            sortSetting={this.state.plansSortSetting}
+            onChangeSortSetting={this.onChangePlansSortSetting}
+          />
         </section>
       </>
     );

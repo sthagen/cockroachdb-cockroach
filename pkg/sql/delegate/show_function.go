@@ -8,14 +8,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import assert from "assert";
+package delegate
 
-export function assertDeepStrictEqual<T>(expected: T, actual: T) {
-  assert.deepStrictEqual(actual, expected, errorMessage(expected, actual));
-}
+import (
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+)
 
-function errorMessage(expected: any, actual: any): string {
-  return `expected: ${JSON.stringify(expected)} but was ${JSON.stringify(
-    actual,
-  )}`;
+func (d *delegator) delegateShowCreateFunction(n *tree.ShowCreateFunction) (tree.Statement, error) {
+	return nil, unimplemented.New("SHOW CREATE FUNCTION", "this statement is not yet supported")
 }

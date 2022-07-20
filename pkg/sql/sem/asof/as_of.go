@@ -63,6 +63,11 @@ func resolveFuncType(asOf tree.AsOfClause, searchPath tree.SearchPath) funcType 
 	if !ok {
 		return funcTypeInvalid
 	}
+	// We don't need a resolver here because we do not allow user-defined
+	// functions to be called in AOST clauses. Only the limited set of functions
+	// with names matching below are allowed. If a user defined a user-defined
+	// function with the same name, we'll assume references to the function
+	// within an AOST clause refer to the built-in overload.
 	def, err := fe.Func.Resolve(searchPath, nil /* resolver */)
 	if err != nil {
 		return funcTypeInvalid
@@ -213,7 +218,7 @@ func DatumToHLC(
 			syn = true
 		}
 		// Attempt to parse as timestamp.
-		if dt, _, err := tree.ParseDTimestamp(evalCtx, s, time.Nanosecond); err == nil {
+		if dt, _, err := tree.ParseDTimestampTZ(evalCtx, s, time.Nanosecond); err == nil {
 			ts.WallTime = dt.Time.UnixNano()
 			ts.Synthetic = syn
 			break

@@ -254,20 +254,19 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 	url = fmt.Sprintf("postgres://bob@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
 	te.TestConnectErr(ctx, t, url, 0, "failed SASL auth")
 
-	url = fmt.Sprintf("postgres://bob:builder@toothless-28.blah:%s/defaultdb?sslmode=require", port)
-	te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "server error")
-
+	// SNI provides tenant ID.
 	url = fmt.Sprintf("postgres://bob:builder@tenant-cluster-28.blah:%s/defaultdb?sslmode=require", port)
-	te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "server error")
-
-	url = fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
 		require.NoError(t, runTestQuery(ctx, conn))
 	})
 
-	// SNI provides tenant ID.
-	url = fmt.Sprintf("postgres://bob:builder@serverless-28.blah:%s/defaultdb?sslmode=require", port)
+	// SNI tried but doesn't parse to valid tenant ID and DB/Options not provided
+	url = fmt.Sprintf("postgres://bob:builder@tenant_cluster_28.blah:%s/defaultdb?sslmode=require", port)
+	te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "missing cluster identifier")
+
+	// Database provides valid ID
+	url = fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
 		require.NoError(t, runTestQuery(ctx, conn))
@@ -275,22 +274,25 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 
 	// SNI and database provide tenant IDs that match.
 	url = fmt.Sprintf(
-		"postgres://bob:builder@serverless-28.blah:%s/tenant-cluster-28.defaultdb?sslmode=require", port,
+		"postgres://bob:builder@tenant-cluster-28.blah:%s/tenant-cluster-28.defaultdb?sslmode=require", port,
 	)
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
 		require.NoError(t, runTestQuery(ctx, conn))
 	})
 
-	// SNI and database provide tenant IDs that don't match.
+	// SNI and database provide tenant IDs that don't match. SNI is ignored.
 	url = fmt.Sprintf(
-		"postgres://bob:builder@serverless-28.blah:%s/tenant-cluster-29.defaultdb?sslmode=require", port,
+		"postgres://bob:builder@tick-data-28.blah:%s/tenant-cluster-29.defaultdb?sslmode=require", port,
 	)
-	te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "server error")
+	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
+		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
+		require.NoError(t, runTestQuery(ctx, conn))
+	})
 
-	require.Equal(t, int64(3), s.metrics.SuccessfulConnCount.Count())
+	require.Equal(t, int64(4), s.metrics.SuccessfulConnCount.Count())
 	require.Equal(t, int64(2), s.metrics.AuthFailedCount.Count())
-	require.Equal(t, int64(3), s.metrics.RoutingErrCount.Count())
+	require.Equal(t, int64(1), s.metrics.RoutingErrCount.Count())
 }
 
 func TestProxyTLSConf(t *testing.T) {
@@ -1480,7 +1482,7 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 		{
 			name: "invalid cluster identifier in database param",
 			params: map[string]string{
-				// Cluster names need to be between 6 to 20 alphanumeric characters.
+				// Cluster names need to be between 6 to 100 alphanumeric characters.
 				"database": "short-0.defaultdb",
 			},
 			expectedError: "invalid cluster identifier 'short-0'",
@@ -1489,11 +1491,18 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 		{
 			name: "invalid cluster identifier in options param",
 			params: map[string]string{
-				// Cluster names need to be between 6 to 20 alphanumeric characters.
-				"options": "--cluster=cockroachlabsdotcomfoobarbaz-0",
+				// Cluster names need to be between 6 to 100 alphanumeric characters.
+				"options": fmt.Sprintf("--cluster=%s-0", strings.Repeat("a", 101)),
 			},
-			expectedError: "invalid cluster identifier 'cockroachlabsdotcomfoobarbaz-0'",
-			expectedHint:  "Is 'cockroachlabsdotcomfoobarbaz' a valid cluster name?\n--\n" + clusterNameFormHint,
+			expectedError: fmt.Sprintf(
+				"invalid cluster identifier '%s-0'",
+				strings.Repeat("a", 101),
+			),
+			expectedHint: fmt.Sprintf(
+				"Is '%s' a valid cluster name?\n--\n%s",
+				strings.Repeat("a", 101),
+				clusterNameFormHint,
+			),
 		},
 		{
 			name:          "invalid database param (1)",
@@ -1574,10 +1583,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 		{
 			name: "cluster identifier in database param",
 			params: map[string]string{
-				"database": "happy-koala-7.defaultdb",
+				"database": fmt.Sprintf("%s-7.defaultdb", strings.Repeat("a", 100)),
 				"foo":      "bar",
 			},
-			expectedClusterName: "happy-koala",
+			expectedClusterName: strings.Repeat("a", 100),
 			expectedTenantID:    7,
 			expectedParams:      map[string]string{"database": "defaultdb", "foo": "bar"},
 		},
@@ -1793,6 +1802,7 @@ func (te *tester) TestConnectErr(
 	if err == nil {
 		_ = conn.Close(ctx)
 	}
+	require.NotNil(t, err)
 	require.Regexp(t, expErr, err.Error())
 	require.False(t, te.Authenticated())
 	if expCode != 0 {

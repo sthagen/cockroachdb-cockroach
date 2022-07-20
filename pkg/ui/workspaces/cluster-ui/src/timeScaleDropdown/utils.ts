@@ -11,14 +11,13 @@
 import moment from "moment";
 import { TimeScale, TimeScaleOption, TimeScaleOptions } from "./timeScaleTypes";
 import { dateFormat, timeFormat } from "./timeScaleDropdown";
-import React from "react";
 
 /**
  * timeScale1hMinOptions is a preconfigured set of time scales with 1h minimum that can be
  * selected by the user.
  */
 export const timeScale1hMinOptions: TimeScaleOptions = {
-  "Past 1 Hour": {
+  "Past Hour": {
     windowSize: moment.duration(1, "hour"),
     windowValid: moment.duration(1, "minute"),
     sampleSize: moment.duration(30, "seconds"),
@@ -28,7 +27,7 @@ export const timeScale1hMinOptions: TimeScaleOptions = {
     windowValid: moment.duration(5, "minutes"),
     sampleSize: moment.duration(1, "minutes"),
   },
-  "Past 1 Day": {
+  "Past Day": {
     windowSize: moment.duration(1, "day"),
     windowValid: moment.duration(10, "minutes"),
     sampleSize: moment.duration(5, "minutes"),
@@ -84,8 +83,8 @@ export const defaultTimeScaleOptions: TimeScaleOptions = {
 };
 
 export const defaultTimeScaleSelected: TimeScale = {
-  ...defaultTimeScaleOptions["Past 1 Hour"],
-  key: "Past 1 Hour",
+  ...defaultTimeScaleOptions["Past Hour"],
+  key: "Past Hour",
   fixedWindowEnd: false,
 };
 

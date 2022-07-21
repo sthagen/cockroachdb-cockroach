@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"regexp"
 	"sync/atomic"
 	"time"
 
@@ -41,13 +40,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	io_prometheus_client "github.com/prometheus/client_model/go"
 )
 
 var (
@@ -91,157 +87,6 @@ var (
 type rowLevelTTLResumer struct {
 	job *jobs.Job
 	st  *cluster.Settings
-}
-
-// RowLevelTTLAggMetrics are the row-level TTL job agg metrics.
-type RowLevelTTLAggMetrics struct {
-	RangeTotalDuration *aggmetric.AggHistogram
-	SelectDuration     *aggmetric.AggHistogram
-	DeleteDuration     *aggmetric.AggHistogram
-	RowSelections      *aggmetric.AggCounter
-	RowDeletions       *aggmetric.AggCounter
-	NumActiveRanges    *aggmetric.AggGauge
-	TotalRows          *aggmetric.AggGauge
-	TotalExpiredRows   *aggmetric.AggGauge
-
-	defaultRowLevelMetrics rowLevelTTLMetrics
-	mu                     struct {
-		syncutil.Mutex
-		m map[string]rowLevelTTLMetrics
-	}
-}
-
-type rowLevelTTLMetrics struct {
-	RangeTotalDuration *aggmetric.Histogram
-	SelectDuration     *aggmetric.Histogram
-	DeleteDuration     *aggmetric.Histogram
-	RowSelections      *aggmetric.Counter
-	RowDeletions       *aggmetric.Counter
-	NumActiveRanges    *aggmetric.Gauge
-	TotalRows          *aggmetric.Gauge
-	TotalExpiredRows   *aggmetric.Gauge
-}
-
-// MetricStruct implements the metric.Struct interface.
-func (m *RowLevelTTLAggMetrics) MetricStruct() {}
-
-func (m *RowLevelTTLAggMetrics) metricsWithChildren(children ...string) rowLevelTTLMetrics {
-	return rowLevelTTLMetrics{
-		RangeTotalDuration: m.RangeTotalDuration.AddChild(children...),
-		SelectDuration:     m.SelectDuration.AddChild(children...),
-		DeleteDuration:     m.DeleteDuration.AddChild(children...),
-		RowSelections:      m.RowSelections.AddChild(children...),
-		RowDeletions:       m.RowDeletions.AddChild(children...),
-		NumActiveRanges:    m.NumActiveRanges.AddChild(children...),
-		TotalRows:          m.TotalRows.AddChild(children...),
-		TotalExpiredRows:   m.TotalExpiredRows.AddChild(children...),
-	}
-}
-
-var invalidPrometheusRe = regexp.MustCompile(`[^a-zA-Z0-9_]`)
-
-func (m *RowLevelTTLAggMetrics) loadMetrics(labelMetrics bool, relation string) rowLevelTTLMetrics {
-	if !labelMetrics {
-		return m.defaultRowLevelMetrics
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	relation = invalidPrometheusRe.ReplaceAllString(relation, "_")
-	if ret, ok := m.mu.m[relation]; ok {
-		return ret
-	}
-	ret := m.metricsWithChildren(relation)
-	m.mu.m[relation] = ret
-	return ret
-}
-
-func makeRowLevelTTLAggMetrics(histogramWindowInterval time.Duration) metric.Struct {
-	sigFigs := 2
-	b := aggmetric.MakeBuilder("relation")
-	ret := &RowLevelTTLAggMetrics{
-		RangeTotalDuration: b.Histogram(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.range_total_duration",
-				Help:        "Duration for processing a range during row level TTL.",
-				Measurement: "nanoseconds",
-				Unit:        metric.Unit_NANOSECONDS,
-				MetricType:  io_prometheus_client.MetricType_HISTOGRAM,
-			},
-			histogramWindowInterval,
-			time.Hour.Nanoseconds(),
-			sigFigs,
-		),
-		SelectDuration: b.Histogram(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.select_duration",
-				Help:        "Duration for select requests during row level TTL.",
-				Measurement: "nanoseconds",
-				Unit:        metric.Unit_NANOSECONDS,
-				MetricType:  io_prometheus_client.MetricType_HISTOGRAM,
-			},
-			histogramWindowInterval,
-			time.Minute.Nanoseconds(),
-			sigFigs,
-		),
-		DeleteDuration: b.Histogram(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.delete_duration",
-				Help:        "Duration for delete requests during row level TTL.",
-				Measurement: "nanoseconds",
-				Unit:        metric.Unit_NANOSECONDS,
-				MetricType:  io_prometheus_client.MetricType_HISTOGRAM,
-			},
-			histogramWindowInterval,
-			time.Minute.Nanoseconds(),
-			sigFigs,
-		),
-		RowSelections: b.Counter(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.rows_selected",
-				Help:        "Number of rows selected for deletion by the row level TTL job.",
-				Measurement: "num_rows",
-				Unit:        metric.Unit_COUNT,
-				MetricType:  io_prometheus_client.MetricType_COUNTER,
-			},
-		),
-		RowDeletions: b.Counter(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.rows_deleted",
-				Help:        "Number of rows deleted by the row level TTL job.",
-				Measurement: "num_rows",
-				Unit:        metric.Unit_COUNT,
-				MetricType:  io_prometheus_client.MetricType_COUNTER,
-			},
-		),
-		NumActiveRanges: b.Gauge(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.num_active_ranges",
-				Help:        "Number of active workers attempting to delete for row level TTL.",
-				Measurement: "num_active_workers",
-				Unit:        metric.Unit_COUNT,
-			},
-		),
-		TotalRows: b.Gauge(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.total_rows",
-				Help:        "Approximate number of rows on the TTL table.",
-				Measurement: "total_rows",
-				Unit:        metric.Unit_COUNT,
-			},
-		),
-		TotalExpiredRows: b.Gauge(
-			metric.Metadata{
-				Name:        "jobs.row_level_ttl.total_expired_rows",
-				Help:        "Approximate number of rows that have expired the TTL on the TTL table.",
-				Measurement: "total_expired_rows",
-				Unit:        metric.Unit_COUNT,
-			},
-		),
-	}
-	ret.defaultRowLevelMetrics = ret.metricsWithChildren("default")
-	ret.mu.m = make(map[string]rowLevelTTLMetrics)
-	return ret
 }
 
 var _ jobs.Resumer = (*rowLevelTTLResumer)(nil)
@@ -335,7 +180,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		return err
 	}
 
-	var metrics = p.ExecCfg().JobRegistry.MetricsStruct().RowLevelTTL.(*RowLevelTTLAggMetrics).loadMetrics(
+	metrics := p.ExecCfg().JobRegistry.MetricsStruct().RowLevelTTL.(*RowLevelTTLAggMetrics).loadMetrics(
 		ttlSettings.LabelMetrics,
 		relationName,
 	)
@@ -364,7 +209,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 	statsCloseCh := make(chan struct{})
 	ch := make(chan rangeToProcess, rangeConcurrency)
 	rowCount := int64(0)
-	for i := 0; i < rangeConcurrency; i++ {
+	for i := int64(0); i < rangeConcurrency; i++ {
 		g.GoCtx(func(ctx context.Context) error {
 			for r := range ch {
 				start := timeutil.Now()
@@ -484,39 +329,40 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 	return nil
 }
 
-func getSelectBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int {
-	if bs := ttl.SelectBatchSize; bs != 0 {
-		return int(bs)
+func getSelectBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
+	bs := ttl.SelectBatchSize
+	if bs == 0 {
+		bs = defaultSelectBatchSize.Get(sv)
 	}
-	return int(defaultSelectBatchSize.Get(sv))
+	return bs
 }
 
-func getDeleteBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int {
-	if bs := ttl.DeleteBatchSize; bs != 0 {
-		return int(bs)
+func getDeleteBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
+	bs := ttl.DeleteBatchSize
+	if bs == 0 {
+		bs = defaultDeleteBatchSize.Get(sv)
 	}
-	return int(defaultDeleteBatchSize.Get(sv))
+	return bs
 }
 
-func getRangeConcurrency(sv *settings.Values, ttl catpb.RowLevelTTL) int {
-	if rc := ttl.RangeConcurrency; rc != 0 {
-		return int(rc)
+func getRangeConcurrency(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
+	rc := ttl.RangeConcurrency
+	if rc == 0 {
+		rc = defaultRangeConcurrency.Get(sv)
 	}
-	return int(defaultRangeConcurrency.Get(sv))
+	return rc
 }
 
 func getDeleteRateLimit(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
-	val := func() int64 {
-		if bs := ttl.DeleteRateLimit; bs != 0 {
-			return bs
-		}
-		return defaultDeleteRateLimit.Get(sv)
-	}()
-	// Put the maximum tokens possible if there is no rate limit.
-	if val == 0 {
-		return math.MaxInt64
+	rl := ttl.DeleteRateLimit
+	if rl == 0 {
+		rl = defaultDeleteRateLimit.Get(sv)
 	}
-	return val
+	// Put the maximum tokens possible if there is no rate limit.
+	if rl == 0 {
+		rl = math.MaxInt64
+	}
+	return rl
 }
 
 func fetchStatistics(
@@ -595,7 +441,7 @@ func runTTLOnRange(
 	endPK tree.Datums,
 	pkColumns []string,
 	relationName string,
-	selectBatchSize, deleteBatchSize int,
+	selectBatchSize, deleteBatchSize int64,
 	deleteRateLimiter *quotapool.RateLimiter,
 	aost tree.DTimestampTZ,
 	ttlExpression string,
@@ -652,14 +498,15 @@ func runTTLOnRange(
 		if err != nil {
 			return rangeRowCount, errors.Wrapf(err, "error selecting rows to delete")
 		}
-		metrics.RowSelections.Inc(int64(len(expiredRowsPKs)))
+		numExpiredRows := int64(len(expiredRowsPKs))
+		metrics.RowSelections.Inc(numExpiredRows)
 
 		// Step 2. Delete the rows which have expired.
 
-		for startRowIdx := 0; startRowIdx < len(expiredRowsPKs); startRowIdx += deleteBatchSize {
+		for startRowIdx := int64(0); startRowIdx < numExpiredRows; startRowIdx += deleteBatchSize {
 			until := startRowIdx + deleteBatchSize
-			if until > len(expiredRowsPKs) {
-				until = len(expiredRowsPKs)
+			if until > numExpiredRows {
+				until = numExpiredRows
 			}
 			deleteBatch := expiredRowsPKs[startRowIdx:until]
 			if err := db.TxnWithSteppingEnabled(ctx, sessiondatapb.TTLLow, func(ctx context.Context, txn *kv.Txn) error {
@@ -709,7 +556,7 @@ func runTTLOnRange(
 
 		// If we selected less than the select batch size, we have selected every
 		// row and so we end it here.
-		if len(expiredRowsPKs) < selectBatchSize {
+		if numExpiredRows < selectBatchSize {
 			break
 		}
 	}
@@ -778,5 +625,4 @@ func init() {
 			st:  settings,
 		}
 	}, jobs.UsesTenantCostControl)
-	jobs.MakeRowLevelTTLMetricsHook = makeRowLevelTTLAggMetrics
 }

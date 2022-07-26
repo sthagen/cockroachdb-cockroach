@@ -433,7 +433,7 @@ func (s *Server) Metrics() (res []interface{}) {
 		&s.SQLServer.InternalMetrics.GuardrailMetrics,
 		&s.SQLServer.ServerMetrics.StatsMetrics,
 		&s.SQLServer.ServerMetrics.ContentionSubsystemMetrics,
-		&s.SQLServer.ServerMetrics.OutliersMetrics,
+		&s.SQLServer.ServerMetrics.InsightsMetrics,
 	}
 }
 
@@ -730,7 +730,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	defer onCloseFn()
 
 	connDetails := eventpb.CommonConnectionDetails{
-		InstanceID:    int32(s.execCfg.NodeID.SQLInstanceID()),
+		InstanceID:    int32(s.execCfg.NodeInfo.NodeID.SQLInstanceID()),
 		Network:       conn.RemoteAddr().Network(),
 		RemoteAddress: conn.RemoteAddr().String(),
 	}

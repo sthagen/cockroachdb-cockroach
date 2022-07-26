@@ -37,7 +37,7 @@ type kvEventToRowConsumer struct {
 	frontier  *span.Frontier
 	encoder   Encoder
 	scratch   bufalloc.ByteAllocator
-	sink      Sink
+	sink      EventSink
 	cursor    hlc.Timestamp
 	knobs     TestingKnobs
 	decoder   cdcevent.Decoder
@@ -55,7 +55,7 @@ func newKVEventToRowConsumer(
 	evalCtx *eval.Context,
 	frontier *span.Frontier,
 	cursor hlc.Timestamp,
-	sink Sink,
+	sink EventSink,
 	encoder Encoder,
 	details ChangefeedConfig,
 	expr execinfrapb.Expression,
@@ -163,10 +163,14 @@ func (c *kvEventToRowConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Even
 		if err != nil {
 			return errors.Wrapf(err, "while matching filter: %s", c.safeExpr)
 		}
+
 		if !matches {
 			// TODO(yevgeniy): Add metrics
+			a := ev.DetachAlloc()
+			a.Release(ctx)
 			return nil
 		}
+
 		projection, err := c.evaluator.Projection(ctx, updatedRow, mvccTimestamp, prevRow)
 		if err != nil {
 			return errors.Wrapf(err, "while evaluating projection: %s", c.safeExpr)

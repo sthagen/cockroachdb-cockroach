@@ -420,7 +420,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		}
 		details = backupDetails
 		// Reset backupDetails so nobody accidentally uses it.
-		backupDetails = jobspb.BackupDetails{}
+		backupDetails = jobspb.BackupDetails{} //lint:ignore SA4006 intentionally clearing so no one uses this.
 		backupManifest = &m
 
 		// Now that we have resolved the details, and manifest, write a protected
@@ -493,7 +493,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 		// Collect telemetry, once per backup after resolving its destination.
 		lic := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, p.ExecCfg().LogicalClusterID(), p.ExecCfg().Organization(), "",
+			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(), "",
 		) != nil
 		collectTelemetry(m, details, details, lic)
 	}
@@ -762,10 +762,10 @@ func (b *backupResumer) readManifestOnResume(
 		}
 	}
 
-	if !desc.ClusterID.Equal(cfg.LogicalClusterID()) {
+	if !desc.ClusterID.Equal(cfg.NodeInfo.LogicalClusterID()) {
 		mem.Shrink(ctx, memSize)
 		return nil, 0, errors.Newf("cannot resume backup started on another cluster (%s != %s)",
-			desc.ClusterID, cfg.LogicalClusterID())
+			desc.ClusterID, cfg.NodeInfo.LogicalClusterID())
 	}
 	return &desc, memSize, nil
 }

@@ -492,7 +492,7 @@ func createChangefeedJobRecord(
 
 	if scope, ok := opts.GetMetricScope(); ok {
 		if err := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, p.ExecCfg().LogicalClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
+			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
 		); err != nil {
 			return nil, errors.Wrapf(err,
 				"use of %q option requires enterprise license.", changefeedbase.OptMetricsScope)
@@ -525,7 +525,7 @@ func createChangefeedJobRecord(
 	}
 
 	if err := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().LogicalClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
+		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
 	); err != nil {
 		return nil, err
 	}
@@ -975,7 +975,7 @@ func (b *changefeedResumer) resumeWithRetries(
 				// Instead, we want to make sure that the changefeed job is not marked failed
 				// due to a transient, retryable error.
 				err = jobs.MarkAsRetryJobError(err)
-				lastRunStatusUpdate = b.setJobRunningStatus(ctx, lastRunStatusUpdate, "retryable flow error: %s", err)
+				_ = b.setJobRunningStatus(ctx, lastRunStatusUpdate, "retryable flow error: %s", err)
 			}
 
 			log.Warningf(ctx, `CHANGEFEED job %d returning with error: %+v`, jobID, err)

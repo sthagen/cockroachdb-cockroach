@@ -97,6 +97,7 @@ func newPebbleIteratorByCloning(
 		RefreshBatchView: true,
 	})
 	if err != nil {
+		p.Close()
 		panic(err)
 	}
 	return p
@@ -124,7 +125,6 @@ func (p *pebbleIterator) init(
 ) {
 	*p = pebbleIterator{
 		iter:               iter,
-		inuse:              true,
 		keyBuf:             p.keyBuf,
 		lowerBoundBuf:      p.lowerBoundBuf,
 		upperBoundBuf:      p.upperBoundBuf,
@@ -133,6 +133,7 @@ func (p *pebbleIterator) init(
 		supportsRangeKeys:  supportsRangeKeys,
 	}
 	p.setOptions(opts, durability)
+	p.inuse = true // after setOptions(), so panic won't cause reader to panic too
 }
 
 // initReuseOrCreate is a convenience method that (re-)initializes an existing
@@ -164,6 +165,7 @@ func (p *pebbleIterator) initReuseOrCreate(
 			RefreshBatchView: true,
 		})
 		if err != nil {
+			p.Close()
 			panic(err)
 		}
 	}
@@ -884,17 +886,20 @@ func (p *pebbleIterator) destroy() {
 		// surfaced through Valid(), but wants to close the iterator (eg,
 		// potentially through a defer) and so we don't want to re-surface the
 		// error.
-		_ = p.iter.Close()
-
-		// TODO(jackson): In addition to errors accumulated during iteration,
-		// Close also returns errors encountered during the act of closing the
-		// iterator. Currently, these errors are swallowed. The error returned
-		// by iter.Close() may be an ephemeral error, or it may a misuse of the
+		//
+		// TODO(jackson): In addition to errors accumulated during iteration, Close
+		// also returns errors encountered during the act of closing the iterator.
+		// Currently, most of these errors are swallowed. The error returned by
+		// iter.Close() may be an ephemeral error, or it may a misuse of the
 		// Iterator or corruption. Only swallow ephemeral errors (eg,
-		// DeadlineExceeded, etc), panic-ing on Close errors that are not known
-		// to be ephemeral/retriable.
+		// DeadlineExceeded, etc), panic-ing on Close errors that are not known to
+		// be ephemeral/retriable. While these ephemeral error types are enumerated,
+		// we panic on the error types we know to be NOT ephemeral.
 		//
 		// See cockroachdb/pebble#1811.
+		if err := p.iter.Close(); errors.Is(err, pebble.ErrCorruption) {
+			panic(err)
+		}
 		p.iter = nil
 	}
 	// Reset all fields except for the key and option buffers. Holding onto their

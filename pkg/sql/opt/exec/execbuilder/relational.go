@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -274,6 +275,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 
 	case *memo.CreateViewExpr:
 		ep, err = b.buildCreateView(t)
+
+	case *memo.CreateFunctionExpr:
+		ep, err = b.buildCreateFunction(t)
 
 	case *memo.WithExpr:
 		ep, err = b.buildWith(t)
@@ -670,8 +674,8 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 
 	// Save if we planned a full table/index scan on the builder so that the
 	// planner can be made aware later. We only do this for non-virtual tables.
+	stats := scan.Relational().Stats
 	if !tab.IsVirtualTable() && isUnfiltered {
-		stats := scan.Relational().Stats
 		large := !stats.Available || stats.RowCount > b.evalCtx.SessionData().LargeFullScanRows
 		if scan.Index == cat.PrimaryIndex {
 			b.ContainsFullTableScan = true
@@ -679,6 +683,22 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		} else {
 			b.ContainsFullIndexScan = true
 			b.ContainsLargeFullIndexScan = b.ContainsLargeFullIndexScan || large
+		}
+		if stats.Available && stats.RowCount > b.MaxFullScanRows {
+			b.MaxFullScanRows = stats.RowCount
+		}
+	}
+
+	// Save the total estimated number of rows scanned and the time since stats
+	// were collected.
+	if stats.Available {
+		b.TotalScanRows += stats.RowCount
+		if tab.StatisticCount() > 0 {
+			// The first stat is the most recent one.
+			nanosSinceStatsCollected := timeutil.Since(tab.Statistic(0).CreatedAt())
+			if nanosSinceStatsCollected > b.NanosSinceStatsCollected {
+				b.NanosSinceStatsCollected = nanosSinceStatsCollected
+			}
 		}
 	}
 
@@ -942,8 +962,8 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	//
 	// Note: we put o outside of the function so we allocate it only once.
 	var o xform.Optimizer
-	planRightSideFn := func(ef exec.Factory, leftRow tree.Datums) (exec.Plan, error) {
-		o.Init(b.evalCtx, b.catalog)
+	planRightSideFn := func(ctx context.Context, ef exec.Factory, leftRow tree.Datums) (exec.Plan, error) {
+		o.Init(ctx, b.evalCtx, b.catalog)
 		f := o.Factory()
 
 		// Copy the right expression into a new memo, replacing each bound column

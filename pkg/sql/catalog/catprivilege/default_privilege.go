@@ -289,18 +289,13 @@ func foldPrivileges(
 ) {
 	if targetObject == privilege.Types &&
 		privileges.CheckPrivilege(username.PublicRoleName(), privilege.USAGE) {
-		publicUser, ok := privileges.FindUser(username.PublicRoleName())
-		if ok {
-			if !privilege.USAGE.IsSetIn(publicUser.WithGrantOption) {
-				setPublicHasUsageOnTypes(defaultPrivilegesForRole, true)
-				privileges.Revoke(
-					username.PublicRoleName(),
-					privilege.List{privilege.USAGE},
-					privilege.Type,
-					false, /* grantOptionFor */
-				)
-			}
-		}
+		setPublicHasUsageOnTypes(defaultPrivilegesForRole, true)
+		privileges.Revoke(
+			username.PublicRoleName(),
+			privilege.List{privilege.USAGE},
+			privilege.Type,
+			false, /* grantOptionFor */
+		)
 	}
 	// ForAllRoles cannot be a grantee, nothing left to do.
 	if role.ForAllRoles {
@@ -390,6 +385,8 @@ func GetRoleHasAllPrivilegesOnTargetObject(
 		return defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes
 	case privilege.Schemas:
 		return defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnSchemas
+	case privilege.Functions:
+		return defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnFunctions
 	default:
 		panic(fmt.Sprintf("unknown target object %s", targetObject))
 	}
@@ -470,6 +467,8 @@ func setRoleHasAllOnTargetObject(
 		defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes = roleHasAll
 	case privilege.Schemas:
 		defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnSchemas = roleHasAll
+	case privilege.Functions:
+		defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnFunctions = roleHasAll
 	default:
 		panic(fmt.Sprintf("unknown target object %s", targetObject))
 	}

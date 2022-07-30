@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -118,6 +119,7 @@ func (p *planner) createDatabase(
 		database.PrimaryRegion,
 		database.Regions,
 		database.Placement,
+		database.SecondaryRegion,
 	)
 	if err != nil {
 		return nil, false, err
@@ -243,12 +245,22 @@ func (p *planner) createDescriptorWithID(
 	// mimicry. In particular, we're only writing a single key per table, while
 	// perfect mimicry would involve writing a sentinel key for each row as well.
 
+	if len(idKey) == 0 && !descriptor.SkipNamespace() {
+		log.Fatalf(ctx, "%v", errors.AssertionFailedf("cannot insert namespace entry with zero id key"))
+	}
+	if len(idKey) > 0 && descriptor.SkipNamespace() {
+		log.Fatalf(ctx, "%v", errors.AssertionFailedf("id key must be zero for descriptors skipping namespace"))
+	}
+
 	b := &kv.Batch{}
 	descID := descriptor.GetID()
-	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
+
+	if !descriptor.SkipNamespace() {
+		if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
+			log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
+		}
+		b.CPut(idKey, descID, nil)
 	}
-	b.CPut(idKey, descID, nil)
 	if err := p.Descriptors().Direct().WriteNewDescToBatch(
 		ctx,
 		p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
@@ -266,7 +278,7 @@ func (p *planner) createDescriptorWithID(
 	isTable := false
 	addUncommitted := false
 	switch mutDesc.(type) {
-	case *dbdesc.Mutable, *schemadesc.Mutable, *typedesc.Mutable:
+	case *dbdesc.Mutable, *schemadesc.Mutable, *typedesc.Mutable, *funcdesc.Mutable:
 		addUncommitted = true
 	case *tabledesc.Mutable:
 		addUncommitted = true
@@ -346,6 +358,7 @@ var InitializeMultiRegionMetadataCCL = func(
 	primaryRegion catpb.RegionName,
 	regions []tree.Name,
 	dataPlacement tree.DataPlacement,
+	secondaryRegion catpb.RegionName,
 ) (*multiregion.RegionConfig, error) {
 	return nil, sqlerrors.NewCCLRequiredError(
 		errors.New("creating multi-region databases requires a CCL binary"),
@@ -393,6 +406,7 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 	primaryRegion tree.Name,
 	regions []tree.Name,
 	placement tree.DataPlacement,
+	secondaryRegion tree.Name,
 ) (*multiregion.RegionConfig, error) {
 	if !p.execCfg.Codec.ForSystemTenant() &&
 		!SecondaryTenantsMultiRegionAbstractionsEnabled.Get(&p.execCfg.Settings.SV) {
@@ -435,6 +449,7 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 		catpb.RegionName(primaryRegion),
 		regions,
 		placement,
+		catpb.RegionName(secondaryRegion),
 	)
 	if err != nil {
 		return nil, err

@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
@@ -220,8 +219,14 @@ func (b *Builder) buildScalar(
 		// select the right overload. The solution is to wrap any mismatched
 		// arguments with a CastExpr that preserves the static type.
 
-		left := reType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
-		right := reType(t.TypedRight(), t.ResolvedBinOp().RightType)
+		left := t.TypedLeft()
+		if left.ResolvedType() == types.Unknown {
+			left = reType(left, t.ResolvedBinOp().LeftType)
+		}
+		right := t.TypedRight()
+		if right.ResolvedType() == types.Unknown {
+			right = reType(right, t.ResolvedBinOp().RightType)
+		}
 		out = b.constructBinary(
 			treebin.MakeBinaryOperator(t.Operator.Symbol),
 			b.buildScalar(left, inScope, nil, nil, colRefs),
@@ -534,11 +539,11 @@ func (b *Builder) buildFunction(
 		return b.buildUDF(f, def, inScope, outScope, outCol)
 	}
 
-	if isAggregate(def) {
+	if f.ResolvedOverload().Class == tree.AggregateClass {
 		panic(errors.AssertionFailedf("aggregate function should have been replaced"))
 	}
 
-	if isWindow(def) {
+	if f.ResolvedOverload().Class == tree.WindowClass {
 		panic(errors.AssertionFailedf("window function should have been replaced"))
 	}
 
@@ -551,17 +556,17 @@ func (b *Builder) buildFunction(
 	out = b.factory.ConstructFunction(args, &memo.FunctionPrivate{
 		Name:       def.Name,
 		Typ:        f.ResolvedType(),
-		Properties: &def.FunctionProperties,
+		Properties: &f.ResolvedOverload().FunctionProperties,
 		Overload:   f.ResolvedOverload(),
 	})
 
-	if isGenerator(def) {
+	if f.ResolvedOverload().Class == tree.GeneratorClass {
 		return b.finishBuildGeneratorFunction(f, out, inScope, outScope, outCol)
 	}
 
 	// Add a dependency on sequences that are used as a string argument.
-	if b.trackViewDeps {
-		seqIdentifier, err := seqexpr.GetSequenceFromFunc(f, builtinsregistry.GetBuiltinProperties)
+	if b.trackSchemaDeps {
+		seqIdentifier, err := seqexpr.GetSequenceFromFunc(f)
 		if err != nil {
 			panic(err)
 		}
@@ -569,7 +574,7 @@ func (b *Builder) buildFunction(
 			var ds cat.DataSource
 			if seqIdentifier.IsByID() {
 				flags := cat.Flags{
-					AvoidDescriptorCaches: b.insideViewDef,
+					AvoidDescriptorCaches: b.insideViewDef || b.insideFuncDef,
 				}
 				ds, _, err = b.catalog.ResolveDataSourceByID(b.ctx, flags, cat.StableID(seqIdentifier.SeqID))
 				if err != nil {
@@ -579,7 +584,7 @@ func (b *Builder) buildFunction(
 				tn := tree.MakeUnqualifiedTableName(tree.Name(seqIdentifier.SeqName))
 				ds, _, _ = b.resolveDataSource(&tn, privilege.SELECT)
 			}
-			b.viewDeps = append(b.viewDeps, opt.ViewDep{
+			b.schemaDeps = append(b.schemaDeps, opt.SchemaDep{
 				DataSource: ds,
 			})
 		}
@@ -594,7 +599,8 @@ func (b *Builder) buildFunction(
 func (b *Builder) buildUDF(
 	f *tree.FuncExpr, def *tree.FunctionDefinition, inScope, outScope *scope, outCol *scopeColumn,
 ) (out opt.ScalarExpr) {
-	stmts, err := parser.Parse(f.ResolvedOverload().Body)
+	o := f.ResolvedOverload()
+	stmts, err := parser.Parse(o.Body)
 	if err != nil {
 		panic(err)
 	}
@@ -612,9 +618,10 @@ func (b *Builder) buildUDF(
 
 	out = b.factory.ConstructUDF(
 		&memo.UDFPrivate{
-			Name: def.Name,
-			Body: rels,
-			Typ:  f.ResolvedType(),
+			Name:       def.Name,
+			Body:       rels,
+			Typ:        f.ResolvedType(),
+			Volatility: o.Volatility,
 		},
 	)
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)

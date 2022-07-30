@@ -1568,28 +1568,26 @@ CREATE TABLE crdb_internal.cluster_settings (
 			return err
 		}
 		if !hasAdmin {
-			hasModify, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
-			if err != nil {
-				return err
+			hasModify := false
+			hasView := false
+			if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+				hasModify = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING) == nil
+				hasView = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING) == nil
 			}
-			hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
-			if err != nil {
-				return err
-			}
-			if !hasModify && !hasView {
-				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-					// We check for EITHER the MODIFYCLUSTERSETTING or VIEWCLUSTERSETTING
-					// role option OR the MODIFYCLUSTERSETTING system cluster privilege.
-					// We return the error for "system cluster privilege" due to
-					// the long term goal of moving away from coarse-grained role options.
-					if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING); err != nil {
-						return err
-					}
-				} else {
-					return pgerror.Newf(pgcode.InsufficientPrivilege,
 
-						"only users with either %s or %s privileges are allowed to read "+
-							"crdb_internal.cluster_settings", roleoption.MODIFYCLUSTERSETTING, roleoption.VIEWCLUSTERSETTING)
+			if !hasModify && !hasView {
+				hasModify, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
+				if err != nil {
+					return err
+				}
+				hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
+				if err != nil {
+					return err
+				}
+				if !hasModify && !hasView {
+					return pgerror.Newf(pgcode.InsufficientPrivilege,
+						"only users with either %s or %s system privileges are allowed to read "+
+							"crdb_internal.cluster_settings", privilege.MODIFYCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
 				}
 			}
 		}
@@ -5200,7 +5198,8 @@ CREATE TABLE crdb_internal.default_privileges (
 	for_all_roles   BOOL,
 	object_type     STRING NOT NULL,
 	grantee         STRING NOT NULL,
-	privilege_type  STRING NOT NULL
+	privilege_type  STRING NOT NULL,
+	is_grantable    BOOL
 );`,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
@@ -5226,8 +5225,9 @@ CREATE TABLE crdb_internal.default_privileges (
 									role,                                 // role
 									forAllRoles,                          // for_all_roles
 									tree.NewDString(objectType.String()), // object_type
-									tree.NewDString(userPrivs.User().Normalized()), // grantee
-									tree.NewDString(priv.String()),                 // privilege_type
+									tree.NewDString(userPrivs.User().Normalized()),                      // grantee
+									tree.NewDString(priv.String()),                                      // privilege_type
+									tree.MakeDBool(tree.DBool(priv.IsSetIn(userPrivs.WithGrantOption))), // is_grantable
 								); err != nil {
 									return err
 								}
@@ -5246,6 +5246,8 @@ CREATE TABLE crdb_internal.default_privileges (
 									tree.NewDString(objectType.String()),  // object_type
 									tree.NewDString(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized()), // grantee
 									tree.NewDString(privilege.ALL.String()),                                                     // privilege_type
+									tree.DBoolTrue,
+									// is_grantable
 								); err != nil {
 									return err
 								}
@@ -5260,6 +5262,7 @@ CREATE TABLE crdb_internal.default_privileges (
 								tree.NewDString(privilege.Types.String()),               // object_type
 								tree.NewDString(username.PublicRoleName().Normalized()), // grantee
 								tree.NewDString(privilege.USAGE.String()),               // privilege_type
+								tree.DBoolFalse, // is_grantable
 							); err != nil {
 								return err
 							}
@@ -6230,20 +6233,60 @@ func populateClusterLocksWithFilter(
 var crdbInternalNodeExecutionInsightsTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.node_execution_insights (
-	session_id               STRING NOT NULL,
-	transaction_id           UUID NOT NULL,
-	statement_id             STRING NOT NULL,
-	statement_fingerprint_id BYTES NOT NULL
+	session_id                 STRING NOT NULL,
+	txn_id                     UUID NOT NULL,
+	txn_fingerprint_id         BYTES NOT NULL,
+	stmt_id                    STRING NOT NULL,
+	stmt_fingerprint_id        BYTES NOT NULL,
+	query                      STRING NOT NULL,
+	status                     STRING NOT NULL,
+	start_time                 TIMESTAMP NOT NULL,
+	end_time                   TIMESTAMP NOT NULL,
+	full_scan                  BOOL NOT NULL,
+	user_name                  STRING NOT NULL,
+	app_name                   STRING NOT NULL,
+	database_name              STRING NOT NULL,
+	plan_gist                  STRING NOT NULL,
+	rows_read                  INT8 NOT NULL,
+	rows_written               INT8 NOT NULL,
+	priority                   FLOAT NOT NULL,
+	retries                    INT8 NOT NULL
 );`,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
 		p.extendedEvalCtx.statsProvider.IterateInsights(ctx, func(
-			ctx context.Context, o *insights.Insight,
+			ctx context.Context, insight *insights.Insight,
 		) {
+			startTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.StartTime, time.Nanosecond)
+			if errTimestamp != nil {
+				err = errors.CombineErrors(err, errTimestamp)
+				return
+			}
+
+			endTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.EndTime, time.Nanosecond)
+			if errTimestamp != nil {
+				err = errors.CombineErrors(err, errTimestamp)
+				return
+			}
+
 			err = errors.CombineErrors(err, addRow(
-				tree.NewDString(hex.EncodeToString(o.Session.ID.GetBytes())),
-				tree.NewDUuid(tree.DUuid{UUID: o.Transaction.ID}),
-				tree.NewDString(hex.EncodeToString(o.Statement.ID.GetBytes())),
-				tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(o.Statement.FingerprintID)))),
+				tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
+				tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
+				tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Transaction.FingerprintID)))),
+				tree.NewDString(hex.EncodeToString(insight.Statement.ID.GetBytes())),
+				tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Statement.FingerprintID)))),
+				tree.NewDString(insight.Statement.Query),
+				tree.NewDString(insight.Statement.Status),
+				startTimestamp,
+				endTimestamp,
+				tree.MakeDBool(tree.DBool(insight.Statement.FullScan)),
+				tree.NewDString(insight.Statement.User),
+				tree.NewDString(insight.Statement.ApplicationName),
+				tree.NewDString(insight.Statement.Database),
+				tree.NewDString(insight.Statement.PlanGist),
+				tree.NewDInt(tree.DInt(insight.Statement.RowsRead)),
+				tree.NewDInt(tree.DInt(insight.Statement.RowsWritten)),
+				tree.NewDFloat(tree.DFloat(insight.Transaction.UserPriority)),
+				tree.NewDInt(tree.DInt(insight.Statement.Retries)),
 			))
 		})
 		return err

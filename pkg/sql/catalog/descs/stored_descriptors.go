@@ -211,7 +211,7 @@ func (sd *storedDescriptors) add(
 			return nil, err
 		}
 	}
-	sd.descs.Upsert(uNew)
+	sd.descs.Upsert(uNew, mut.SkipNamespace())
 	return uNew.immutable, err
 }
 
@@ -247,7 +247,7 @@ func (sd *storedDescriptors) checkIn(mut catalog.MutableDescriptor) error {
 	if prev := sd.descs.GetByID(mut.GetID()); prev != nil {
 		return errors.AssertionFailedf("cannot check in a descriptor that has not been previously checked out")
 	}
-	sd.descs.Upsert(uNew)
+	sd.descs.Upsert(uNew, mut.SkipNamespace())
 	return err
 }
 
@@ -410,7 +410,7 @@ func (sd *storedDescriptors) getAllDescriptors(
 		return nstree.Catalog{}, err
 	}
 	// There could be tables with user defined types that need hydrating.
-	if err := HydrateGivenDescriptors(ctx, cat.OrderedDescriptors()); err != nil {
+	if err := hydrateCatalog(ctx, cat.Catalog); err != nil {
 		// If we ran into an error hydrating the types, that means that we
 		// have some sort of corrupted descriptor state. Rather than disable
 		// uses of getAllDescriptors, just log the error.
@@ -727,6 +727,6 @@ var systemStoredDatabase = &storedDescriptor{
 func (sd *storedDescriptors) maybeAddSystemDatabase() {
 	if !sd.addedSystemDatabase {
 		sd.addedSystemDatabase = true
-		sd.descs.Upsert(systemStoredDatabase)
+		sd.descs.Upsert(systemStoredDatabase, false /* skipNameMap */)
 	}
 }

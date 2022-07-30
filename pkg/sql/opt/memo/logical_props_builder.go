@@ -1485,6 +1485,12 @@ func (b *logicalPropsBuilder) buildCreateViewProps(cv *CreateViewExpr, rel *prop
 	BuildSharedProps(cv, &rel.Shared, b.evalCtx)
 }
 
+func (b *logicalPropsBuilder) buildCreateFunctionProps(
+	cv *CreateFunctionExpr, rel *props.Relational,
+) {
+	BuildSharedProps(cv, &rel.Shared, b.evalCtx)
+}
+
 func (b *logicalPropsBuilder) buildFiltersItemProps(item *FiltersItem, scalar *props.Scalar) {
 	BuildSharedProps(item.Condition, &scalar.Shared, b.evalCtx)
 
@@ -1625,6 +1631,9 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *eval.Context) {
 			panic(errors.AssertionFailedf("no volatility for cast %s::%s", from, to))
 		}
 		shared.VolatilitySet.Add(volatility)
+
+	case *UDFExpr:
+		shared.VolatilitySet.Add(t.Volatility)
 
 	default:
 		if opt.IsUnaryOp(e) {

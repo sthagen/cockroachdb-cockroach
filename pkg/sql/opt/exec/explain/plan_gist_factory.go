@@ -35,7 +35,7 @@ import (
 )
 
 func init() {
-	if numOperators != 58 {
+	if numOperators != 59 {
 		// This error occurs when an operator has been added or removed in
 		// pkg/sql/opt/exec/explain/factory.opt. If an operator is added at the
 		// end of factory.opt, simply adjust the hardcoded value above. If an
@@ -415,8 +415,10 @@ func (f *PlanGistFactory) decodeScanParams() exec.ScanParams {
 	if l > 0 {
 		idxConstraint = new(constraint.Constraint)
 		idxConstraint.Spans.Alloc(l)
-		var sp constraint.Span
-		idxConstraint.Spans.Append(&sp)
+		for i := 0; i < l; i++ {
+			var sp constraint.Span
+			idxConstraint.Spans.Append(&sp)
+		}
 	}
 
 	var invertedConstraint inverted.Spans

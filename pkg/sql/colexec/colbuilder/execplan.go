@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -62,12 +63,14 @@ func checkNumIn(inputs []colexecargs.OpWithMetaInfo, numIn int) error {
 // execution flow and returns toWrap's output as an Operator.
 // - materializerSafeToRelease indicates whether the materializers created in
 // order to row-sourcify the inputs are safe to be released on the flow cleanup.
+// - streamingMemAccFactory must be non-nil, and in the production setting must
+// return separate accounts on each invocation.
 func wrapRowSources(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	inputs []colexecargs.OpWithMetaInfo,
 	inputTypes [][]*types.T,
-	streamingMemAccount *mon.BoundAccount,
+	streamingMemAccFactory func() *mon.BoundAccount,
 	processorID int32,
 	newToWrap func([]execinfra.RowSource) (execinfra.RowSource, error),
 	materializerSafeToRelease bool,
@@ -87,6 +90,7 @@ func wrapRowSources(
 			toWrapInputs = append(toWrapInputs, c.Input())
 		} else {
 			toWrapInput := colexec.NewMaterializer(
+				colmem.NewAllocator(ctx, streamingMemAccFactory(), factory),
 				flowCtx,
 				processorID,
 				inputs[i],
@@ -118,11 +122,11 @@ func wrapRowSources(
 	var c *colexec.Columnarizer
 	if proc.MustBeStreaming() {
 		c = colexec.NewStreamingColumnarizer(
-			colmem.NewAllocator(ctx, streamingMemAccount, factory), flowCtx, processorID, toWrap,
+			colmem.NewAllocator(ctx, streamingMemAccFactory(), factory), flowCtx, processorID, toWrap,
 		)
 	} else {
 		c = colexec.NewBufferingColumnarizer(
-			colmem.NewAllocator(ctx, streamingMemAccount, factory), flowCtx, processorID, toWrap,
+			colmem.NewAllocator(ctx, streamingMemAccFactory(), factory), flowCtx, processorID, toWrap,
 		)
 	}
 	return c, releasables, nil
@@ -537,12 +541,18 @@ func (r opResult) createAndWrapRowSource(
 	// LocalPlanNode cores which is the case when we have non-empty
 	// LocalProcessors.
 	materializerSafeToRelease := len(args.LocalProcessors) == 0
+	streamingMemAccFactory := args.StreamingMemAccFactory
+	if streamingMemAccFactory == nil {
+		streamingMemAccFactory = func() *mon.BoundAccount {
+			return args.StreamingMemAccount
+		}
+	}
 	c, releasables, err := wrapRowSources(
 		ctx,
 		flowCtx,
 		inputs,
 		inputTypes,
-		args.StreamingMemAccount,
+		streamingMemAccFactory,
 		processorID,
 		func(inputs []execinfra.RowSource) (execinfra.RowSource, error) {
 			// We provide a slice with a single nil as 'outputs' parameter
@@ -1993,8 +2003,29 @@ func planProjectionOperators(
 		if err = checkSupportedBinaryExpr(t.TypedLeft(), t.TypedRight(), t.ResolvedType()); err != nil {
 			return op, resultIdx, typs, err
 		}
+		leftExpr, rightExpr := t.TypedLeft(), t.TypedRight()
+		if t.Operator.Symbol == treebin.Concat {
+			// Concat requires special handling since it has special rules when
+			// one of the arguments is an array or a string. We don't have
+			// native vectorized support for arrays yet, so we don't have to do
+			// anything extra for them, but we do need to handle the string
+			// case.
+			leftType, rightType := leftExpr.ResolvedType(), rightExpr.ResolvedType()
+			if t.Op.ReturnType == types.String && leftType.Family() != rightType.Family() {
+				// This is a special case of the STRING concatenation - we have
+				// to plan a cast of the non-string type to a STRING.
+				if leftType.Family() == types.StringFamily {
+					rightExpr = tree.NewTypedCastExpr(rightExpr, types.String)
+				} else if rightType.Family() == types.StringFamily {
+					leftExpr = tree.NewTypedCastExpr(leftExpr, types.String)
+				} else {
+					// This is unexpected.
+					return op, resultIdx, typs, errors.New("neither LHS or RHS of Concat operation is a STRING")
+				}
+			}
+		}
 		return planProjectionExpr(
-			ctx, evalCtx, t.Operator, t.ResolvedType(), t.TypedLeft(), t.TypedRight(),
+			ctx, evalCtx, t.Operator, t.ResolvedType(), leftExpr, rightExpr,
 			columnTypes, input, acc, factory, t.Op.EvalOp, nil /* cmpExpr */, releasables, t.Op.NullableArgs,
 		)
 	case *tree.CaseExpr:

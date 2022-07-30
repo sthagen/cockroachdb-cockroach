@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
@@ -590,7 +591,7 @@ func (h *hasher) HashUniqueOrdinals(val cat.UniqueOrdinals) {
 	h.hash = hash
 }
 
-func (h *hasher) HashViewDeps(val opt.ViewDeps) {
+func (h *hasher) HashSchemaDeps(val opt.SchemaDeps) {
 	// Hash the length and address of the first element.
 	h.HashInt(len(val))
 	if len(val) > 0 {
@@ -598,7 +599,7 @@ func (h *hasher) HashViewDeps(val opt.ViewDeps) {
 	}
 }
 
-func (h *hasher) HashViewTypeDeps(val opt.ViewTypeDeps) {
+func (h *hasher) HashSchemaTypeDeps(val opt.SchemaTypeDeps) {
 	hash := h.hash
 	val.ForEach(func(i int) {
 		hash ^= internHash(i)
@@ -750,6 +751,50 @@ func (h *hasher) HashMaterializeClause(val tree.MaterializeClause) {
 func (h *hasher) HashPersistence(val tree.Persistence) {
 	h.hash ^= internHash(val)
 	h.hash *= prime64
+}
+
+func (h *hasher) HashFuncArgs(val tree.FuncArgs) {
+	for _, arg := range val {
+		h.HashString(string(arg.Name))
+		h.HashUint64(uint64(reflect.ValueOf(arg.Type).Pointer()))
+		h.HashInt(int(arg.Class))
+		if arg.DefaultVal != nil {
+			h.HashUint64(uint64(reflect.ValueOf(arg.DefaultVal).Pointer()))
+		}
+	}
+}
+
+func (h *hasher) HashFuncReturnType(val tree.FuncReturnType) {
+	h.HashUint64(uint64(reflect.ValueOf(val.Type).Pointer()))
+	h.HashBool(val.IsSet)
+}
+
+func (h *hasher) HashFunctionOptions(val tree.FunctionOptions) {
+	// TODO (Chengxiong): break funcOptions into separate fields so that we can
+	// hash individual option specifically .
+	for _, opt := range val {
+		h.HashString(reflect.TypeOf(opt).Name())
+		switch t := opt.(type) {
+		case tree.FunctionNullInputBehavior:
+			h.HashInt(int(t))
+		case tree.FunctionVolatility:
+			h.HashInt(int(t))
+		case tree.FunctionLeakproof:
+			h.HashBool(bool(t))
+		case tree.FunctionBodyStr:
+			h.HashString(string(t))
+		case tree.FunctionLanguage:
+			h.HashInt(int(t))
+		}
+	}
+}
+
+func (h *hasher) HashFunctionBodyStr(val tree.FunctionBodyStr) {
+	h.HashString(string(val))
+}
+
+func (h *hasher) HashVolatility(val volatility.V) {
+	h.HashInt(int(val))
 }
 
 // ----------------------------------------------------------------------
@@ -1017,14 +1062,14 @@ func (h *hasher) IsUniqueOrdinalsEqual(l, r cat.UniqueOrdinals) bool {
 	return true
 }
 
-func (h *hasher) IsViewDepsEqual(l, r opt.ViewDeps) bool {
+func (h *hasher) IsSchemaDepsEqual(l, r opt.SchemaDeps) bool {
 	if len(l) != len(r) {
 		return false
 	}
 	return len(l) == 0 || &l[0] == &r[0]
 }
 
-func (h *hasher) IsViewTypeDepsEqual(l, r opt.ViewTypeDeps) bool {
+func (h *hasher) IsSchemaTypeDepsEqual(l, r opt.SchemaTypeDeps) bool {
 	return l.Equals(r)
 }
 
@@ -1206,6 +1251,46 @@ func (h *hasher) IsMaterializeClauseEqual(l, r tree.MaterializeClause) bool {
 }
 
 func (h *hasher) IsPersistenceEqual(l, r tree.Persistence) bool {
+	return l == r
+}
+
+func (h *hasher) IsFuncArgsEqual(l, r tree.FuncArgs) bool {
+	if len(l) != len(r) {
+		return false
+	}
+
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (h *hasher) IsFuncReturnTypeEqual(l, r tree.FuncReturnType) bool {
+	return l == r
+}
+
+func (h *hasher) IsFunctionOptionsEqual(l, r tree.FunctionOptions) bool {
+	if len(l) != len(r) {
+		return false
+	}
+
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (h *hasher) IsFunctionBodyStrEqual(l, r tree.FunctionBodyStr) bool {
+	return l == r
+}
+
+func (h *hasher) IsVolatilityEqual(l, r volatility.V) bool {
 	return l == r
 }
 

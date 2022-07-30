@@ -1204,7 +1204,7 @@ func (ot *OptTester) AssignPlaceholders(
 	if err != nil {
 		return nil, err
 	}
-	prepMemo := o.DetachMemo()
+	prepMemo := o.DetachMemo(ot.ctx)
 
 	// Construct placeholder values.
 	if exp := len(ot.semaCtx.Placeholders.Types); len(queryArgs) != exp {
@@ -1712,7 +1712,11 @@ func (ot *OptTester) optStepsDisplay(before string, after string, os *optSteps) 
 	}
 
 	if before == after {
-		altHeader("%s (no changes)\n", os.LastRuleName())
+		msg := "no changes"
+		if os.LastRuleName().IsNormalize() {
+			msg = "normalization of expression outside of memo"
+		}
+		altHeader("%s (%s)\n", os.LastRuleName(), msg)
 		return
 	}
 
@@ -2212,7 +2216,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 // notifier that updates ot.appliedRules.
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
-	o.Init(&ot.evalCtx, ot.catalog)
+	o.Init(ot.ctx, &ot.evalCtx, ot.catalog)
 	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
 		// Exploration rules are marked as "applied" if they generate one or
 		// more new expressions.

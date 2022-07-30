@@ -2090,7 +2090,7 @@ func fetchDescVersionModificationTime(
 			if err := value.GetProto(&desc); err != nil {
 				t.Fatal(err)
 			}
-			if tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, k.Timestamp); tableDesc != nil {
+			if tableDesc, _, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, k.Timestamp); tableDesc != nil {
 				if int(tableDesc.Version) == version {
 					return tableDesc.ModificationTime
 				}
@@ -6500,8 +6500,8 @@ func normalizeCDCExpression(t *testing.T, execCfgI interface{}, exprStr string) 
 	defer cleanup()
 
 	execCtx := p.(sql.JobExecContext)
-	_, err = cdceval.NormalizeAndValidateSelectForTarget(
-		context.Background(), execCtx, desc, target, sc, false,
+	_, _, err = cdceval.NormalizeAndValidateSelectForTarget(
+		context.Background(), execCtx, desc, target, sc, false, false,
 	)
 	require.NoError(t, err)
 	log.Infof(context.Background(), "PostNorm: %s", tree.StmtDebugString(sc))

@@ -64,6 +64,9 @@ func (b *Builder) expandStar(
 	if b.insideViewDef {
 		panic(unimplemented.NewWithIssue(10028, "views do not currently support * expressions"))
 	}
+	if b.insideFuncDef {
+		panic(unimplemented.NewWithIssue(10028, "functions do not currently support * expressions"))
+	}
 	switch t := expr.(type) {
 	case *tree.TupleStar:
 		texpr := inScope.resolveType(t.Expr, types.Any)
@@ -241,18 +244,29 @@ func (b *Builder) projectColumn(dst *scopeColumn, src *scopeColumn) {
 	dst.id = src.id
 }
 
-// shouldCreateDefaultColumn decides if we need to create a default
-// column and default label for a function expression.
-// Returns true if the function's return type is not an empty tuple and
-// doesn't declare any tuple labels.
+// shouldCreateDefaultColumn decides if we need to create a default column and
+// default label for a function expression. Returns true if the function's
+// return type is not an empty tuple and doesn't declare any tuple labels.
 func (b *Builder) shouldCreateDefaultColumn(texpr tree.TypedExpr) bool {
 	if texpr.ResolvedType() == types.EmptyTuple {
 		// This is only to support crdb_internal.unary_table().
 		return false
 	}
 
-	// We need to create a default column with a default name when
-	// the function return type doesn't declare any return labels.
+	if funcExpr, ok := texpr.(*tree.FuncExpr); ok {
+		if funcExpr.Func.FunctionReference.(*tree.FunctionDefinition).Name == "unnest" {
+			// Special case for unnest functions: we should create a default column in
+			// the case when there is one input argument, since this implies there
+			// will be one output column. This is necessary because the type of the
+			// single column output by unnest in this case may be a tuple with labels,
+			// which breaks the assumption made below.
+			return len(funcExpr.Exprs) == 1
+		}
+	}
+
+	// We need to create a default column with a default name when the function
+	// return type doesn't declare any return labels. This logic assumes that any
+	// SRF that has a labeled tuple as a return type returns multiple columns.
 	return len(texpr.ResolvedType().TupleLabels()) == 0
 }
 
@@ -455,12 +469,28 @@ func resolveTemporaryStatus(name *tree.TableName, persistence tree.Persistence) 
 	return name.SchemaName == catconstants.PgTempSchemaName || persistence.IsTemporary()
 }
 
+// resolveSchemaForCreateTable is the same as resolveSchemaForCreate but
+// specific for tables.
+func (b *Builder) resolveSchemaForCreateTable(name *tree.TableName) (cat.Schema, cat.SchemaName) {
+	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
+}
+
+// resolveSchemaForCreateFunction is the same as resolveSchemaForCreate but
+// specific for functions.
+func (b *Builder) resolveSchemaForCreateFunction(
+	name *tree.FunctionName,
+) (cat.Schema, cat.SchemaName) {
+	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
+}
+
 // resolveSchemaForCreate returns the schema that will contain a newly created
 // catalog object with the given name. If the current user does not have the
 // CREATE privilege, then resolveSchemaForCreate raises an error.
-func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.SchemaName) {
+func (b *Builder) resolveSchemaForCreate(
+	prefix *tree.ObjectNamePrefix, name tree.NodeFormatter,
+) (cat.Schema, cat.SchemaName) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.ObjectNamePrefix)
+	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, prefix)
 	if err != nil {
 		// Remap invalid schema name error text so that it references the catalog
 		// object that could not be created.
@@ -602,8 +632,8 @@ func (b *Builder) resolveDataSource(
 	tn *tree.TableName, priv privilege.Kind,
 ) (cat.DataSource, opt.MDDepName, cat.DataSourceName) {
 	var flags cat.Flags
-	if b.insideViewDef {
-		// Avoid taking table leases when we're creating a view.
+	if b.insideViewDef || b.insideFuncDef {
+		// Avoid taking descriptor leases when we're creating a view/function.
 		flags.AvoidDescriptorCaches = true
 	}
 	ds, resName, err := b.catalog.ResolveDataSource(b.ctx, flags, tn)
@@ -629,7 +659,7 @@ func (b *Builder) resolveDataSourceRef(
 	ref *tree.TableRef, priv privilege.Kind,
 ) (cat.DataSource, opt.MDDepName) {
 	var flags cat.Flags
-	if b.insideViewDef {
+	if b.insideViewDef || b.insideFuncDef {
 		// Avoid taking table leases when we're creating a view.
 		flags.AvoidDescriptorCaches = true
 	}

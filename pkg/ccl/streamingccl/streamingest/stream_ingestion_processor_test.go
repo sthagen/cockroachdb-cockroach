@@ -55,6 +55,7 @@ import (
 // partition addresses.
 type mockStreamClient struct {
 	partitionEvents map[string][]streamingccl.Event
+	doneCh          chan struct{}
 }
 
 var _ streamclient.Client = &mockStreamClient{}
@@ -63,6 +64,11 @@ var _ streamclient.Client = &mockStreamClient{}
 func (m *mockStreamClient) Create(
 	ctx context.Context, target roachpb.TenantID,
 ) (streaming.StreamID, error) {
+	panic("unimplemented")
+}
+
+// Dial implements the Client interface.
+func (m *mockStreamClient) Dial(ctx context.Context) error {
 	panic("unimplemented")
 }
 
@@ -109,7 +115,7 @@ func (m *mockStreamClient) Subscribe(
 	var events []streamingccl.Event
 	var ok bool
 	if events, ok = m.partitionEvents[string(token)]; !ok {
-		return nil, errors.Newf("no events found for paritition %s", string(token))
+		return nil, errors.Newf("no events found for partition %s", string(token))
 	}
 	log.Infof(ctx, "%q beginning subscription from time %v ", string(token), startTime)
 
@@ -120,12 +126,19 @@ func (m *mockStreamClient) Subscribe(
 		eventCh <- event
 	}
 	log.Infof(ctx, "%q done emitting %d events", string(token), len(events))
-	close(eventCh)
+	go func() {
+		if m.doneCh != nil {
+			log.Infof(ctx, "%q waiting for doneCh", string(token))
+			<-m.doneCh
+			log.Infof(ctx, "%q received event on doneCh", string(token))
+		}
+		close(eventCh)
+	}()
 	return &mockSubscription{eventsCh: eventCh}, nil
 }
 
 // Close implements the Client interface.
-func (m *mockStreamClient) Close() error {
+func (m *mockStreamClient) Close(ctx context.Context) error {
 	return nil
 }
 
@@ -324,7 +337,7 @@ func TestStreamIngestionProcessor(t *testing.T) {
 		sip, out, err := getStreamIngestionProcessor(ctx, t, registry, kvDB,
 			partitions, startTime, []jobspb.ResolvedSpan{} /* checkpoint */, nil /* interceptEvents */, tenantRekey, mockClient, nil /* cutoverProvider */, streamingTestingKnob)
 		defer func() {
-			require.NoError(t, sip.forceClientForTests.Close())
+			require.NoError(t, sip.forceClientForTests.Close(ctx))
 		}()
 		require.NoError(t, err)
 
@@ -482,7 +495,7 @@ func TestRandomClientGeneration(t *testing.T) {
 	streamAddr := getTestRandomClientURI(tenantID)
 
 	// The random client returns system and table data partitions.
-	streamClient, err := streamclient.NewStreamClient(streamingccl.StreamAddress(streamAddr))
+	streamClient, err := streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(streamAddr))
 	require.NoError(t, err)
 	id, err := streamClient.Create(ctx, roachpb.MakeTenantID(tenantID))
 	require.NoError(t, err)
@@ -592,7 +605,7 @@ func runStreamIngestionProcessor(
 	if !out.ProducerClosed() {
 		t.Fatalf("output RowReceiver not closed")
 	}
-	if err := sip.forceClientForTests.Close(); err != nil {
+	if err := sip.forceClientForTests.Close(ctx); err != nil {
 		return nil, err
 	}
 	return out, err

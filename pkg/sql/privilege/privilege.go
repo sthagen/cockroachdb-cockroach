@@ -47,6 +47,12 @@ const (
 	RULE                 Kind = 12
 	MODIFYCLUSTERSETTING Kind = 13
 	EXTERNALCONNECTION   Kind = 14
+	VIEWACTIVITY         Kind = 15
+	VIEWACTIVITYREDACTED Kind = 16
+	VIEWCLUSTERSETTING   Kind = 17
+	CANCELQUERY          Kind = 18
+	NOSQLLOGIN           Kind = 19
+	EXECUTE              Kind = 20
 )
 
 // Privilege represents a privilege parsed from an Access Privilege Inquiry
@@ -76,6 +82,8 @@ const (
 	Type ObjectType = "type"
 	// Sequence represents a sequence object.
 	Sequence ObjectType = "sequence"
+	// Function represent a function object.
+	Function ObjectType = "function"
 	// Global represents global privileges.
 	Global ObjectType = "global"
 )
@@ -86,24 +94,26 @@ var isDescriptorBacked = map[ObjectType]bool{
 	Table:    true,
 	Type:     true,
 	Sequence: true,
+	Function: true,
 	Global:   false,
 }
 
 // Predefined sets of privileges.
 var (
-	AllPrivileges    = List{ALL, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG}
-	ReadData         = List{SELECT}
-	ReadWriteData    = List{SELECT, INSERT, DELETE, UPDATE}
-	DBPrivileges     = List{ALL, CONNECT, CREATE, DROP, ZONECONFIG}
-	TablePrivileges  = List{ALL, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, ZONECONFIG}
-	SchemaPrivileges = List{ALL, CREATE, USAGE}
-	TypePrivileges   = List{ALL, USAGE}
+	AllPrivileges      = List{ALL, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE}
+	ReadData           = List{SELECT}
+	ReadWriteData      = List{SELECT, INSERT, DELETE, UPDATE}
+	DBPrivileges       = List{ALL, CONNECT, CREATE, DROP, ZONECONFIG}
+	TablePrivileges    = List{ALL, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, ZONECONFIG}
+	SchemaPrivileges   = List{ALL, CREATE, USAGE}
+	TypePrivileges     = List{ALL, USAGE}
+	FunctionPrivileges = List{ALL, EXECUTE}
 	// SequencePrivileges is appended with TablePrivileges as well. This is because
 	// before v22.2 we treated Sequences the same as Tables. This is to avoid making
 	// certain privileges unavailable after upgrade migration.
 	// Note that "CREATE, INSERT, DELETE, ZONECONFIG" are no-op privileges on sequences.
 	SequencePrivileges = List{ALL, USAGE, SELECT, UPDATE, CREATE, DROP, INSERT, DELETE, ZONECONFIG}
-	SystemPrivileges   = List{ALL, MODIFYCLUSTERSETTING, EXTERNALCONNECTION}
+	SystemPrivileges   = List{ALL, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN}
 )
 
 // Mask returns the bitmask for a given privilege.
@@ -118,7 +128,8 @@ func (k Kind) IsSetIn(bits uint32) bool {
 
 // ByValue is just an array of privilege kinds sorted by value.
 var ByValue = [...]Kind{
-	ALL, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, CONNECT, RULE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION,
+	ALL, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, CONNECT, RULE, MODIFYCLUSTERSETTING,
+	EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, EXECUTE,
 }
 
 // ByName is a map of string -> kind value.
@@ -136,6 +147,12 @@ var ByName = map[string]Kind{
 	"RULE":                 RULE,
 	"MODIFYCLUSTERSETTING": MODIFYCLUSTERSETTING,
 	"EXTERNALCONNECTION":   EXTERNALCONNECTION,
+	"VIEWACTIVITY":         VIEWACTIVITY,
+	"VIEWACTIVITYREDACTED": VIEWACTIVITYREDACTED,
+	"VIEWCLUSTERSETTING":   VIEWCLUSTERSETTING,
+	"CANCELQUERY":          CANCELQUERY,
+	"NOSQLLOGIN":           NOSQLLOGIN,
+	"EXECUTE":              EXECUTE,
 }
 
 // List is a list of privileges.
@@ -296,6 +313,8 @@ func GetValidPrivilegesForObject(objectType ObjectType) List {
 		return SequencePrivileges
 	case Any:
 		return AllPrivileges
+	case Function:
+		return FunctionPrivileges
 	case Global:
 		return SystemPrivileges
 	default:
@@ -312,10 +331,11 @@ var privToACL = map[Kind]string{
 	UPDATE:  "w",
 	USAGE:   "U",
 	CONNECT: "c",
+	EXECUTE: "X",
 }
 
-// orderedPrivs is the list of privileges sorted in alphanumeric order based on the ACL character -> CUacdrw
-var orderedPrivs = List{CREATE, USAGE, INSERT, CONNECT, DELETE, SELECT, UPDATE}
+// orderedPrivs is the list of privileges sorted in alphanumeric order based on the ACL character -> CUacdrwX
+var orderedPrivs = List{CREATE, USAGE, INSERT, CONNECT, DELETE, SELECT, UPDATE, EXECUTE}
 
 // ListToACL converts a list of privileges to a list of Postgres
 // ACL items.

@@ -49,6 +49,7 @@ type CreateDatabase struct {
 	SurvivalGoal    SurvivalGoal
 	Placement       DataPlacement
 	Owner           RoleSpec
+	SecondaryRegion Name
 }
 
 // Format implements the NodeFormatter interface.
@@ -119,6 +120,11 @@ func (node *CreateDatabase) Format(ctx *FmtCtx) {
 	if node.Owner.Name != "" {
 		ctx.WriteString(" OWNER = ")
 		ctx.FormatNode(&node.Owner)
+	}
+
+	if node.SecondaryRegion != "" {
+		ctx.WriteString(" SECONDARY REGION ")
+		ctx.FormatNode(&node.SecondaryRegion)
 	}
 }
 
@@ -232,6 +238,7 @@ type CreateIndex struct {
 	StorageParams    StorageParams
 	Predicate        Expr
 	Concurrently     bool
+	NotVisible       bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -282,6 +289,9 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
 		ctx.FormatNode(node.Predicate)
+	}
+	if node.NotVisible {
+		ctx.WriteString(" NOT VISIBLE")
 	}
 }
 
@@ -978,6 +988,7 @@ type IndexTableDef struct {
 	PartitionByIndex *PartitionByIndex
 	StorageParams    StorageParams
 	Predicate        Expr
+	NotVisible       bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -1012,6 +1023,9 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
 		ctx.FormatNode(node.Predicate)
+	}
+	if node.NotVisible {
+		ctx.WriteString(" NOT VISIBLE")
 	}
 }
 
@@ -1089,6 +1103,9 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
 		ctx.FormatNode(node.Predicate)
+	}
+	if node.NotVisible {
+		ctx.WriteString(" NOT VISIBLE")
 	}
 }
 

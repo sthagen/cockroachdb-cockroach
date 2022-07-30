@@ -136,7 +136,7 @@ func spansForAllTableIndexes(
 		// at least 2 revisions, and the first one should have the table in a PUBLIC
 		// state. We want (and do) ignore tables that have been dropped for the
 		// entire interval. DROPPED tables should never later become PUBLIC.
-		rawTbl, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		rawTbl, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
 		if rawTbl != nil && rawTbl.Public() {
 			forEachPublicIndexTableSpan(rawTbl, added, execCfg.Codec, insertSpan)
 		}
@@ -426,6 +426,18 @@ func backupPlanHook(
 		return nil, nil, nil, false, err
 	}
 
+	detached := false
+	if backupStmt.Options.Detached == tree.DBoolTrue {
+		detached = true
+	}
+	revisionHistoryFn := func() (bool, error) { return false, nil } // Defaults to false.
+	if backupStmt.Options.CaptureRevisionHistory != nil {
+		revisionHistoryFn, err = p.TypeAsBool(ctx, backupStmt.Options.CaptureRevisionHistory, "BACKUP")
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+	}
+
 	encryptionParams := jobspb.BackupEncryptionOptions{Mode: jobspb.EncryptionMode_None}
 
 	var pwFn func() (string, error)
@@ -464,7 +476,7 @@ func backupPlanHook(
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer span.Finish()
 
-		if !(p.ExtendedEvalContext().TxnIsSingleStmt || backupStmt.Options.Detached) {
+		if !(p.ExtendedEvalContext().TxnIsSingleStmt || detached) {
 			return errors.Errorf("BACKUP cannot be used inside a multi-statement transaction without DETACHED option")
 		}
 
@@ -529,12 +541,14 @@ func backupPlanHook(
 			}
 		}
 
-		var revisionHistory bool
-		if backupStmt.Options.CaptureRevisionHistory {
+		revisionHistory, err := revisionHistoryFn()
+		if err != nil {
+			return err
+		}
+		if revisionHistory {
 			if err := requireEnterprise(p.ExecCfg(), "revision_history"); err != nil {
 				return err
 			}
-			revisionHistory = true
 		}
 
 		var targetDescs []catalog.Descriptor
@@ -633,7 +647,7 @@ func backupPlanHook(
 		}
 		plannerTxn := p.Txn()
 
-		if backupStmt.Options.Detached {
+		if detached {
 			// When running inside an explicit transaction, we simply create the job
 			// record. We do not wait for the job to finish.
 			_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
@@ -674,7 +688,7 @@ func backupPlanHook(
 		return sj.ReportExecutionResults(ctx, resultsCh)
 	}
 
-	if backupStmt.Options.Detached {
+	if detached {
 		return fn, jobs.DetachedJobExecutionResultHeader, nil, false, nil
 	}
 	return fn, jobs.BulkJobExecutionResultHeader, nil, false, nil
@@ -882,7 +896,7 @@ func getReintroducedSpans(
 	for _, desc := range lastBackup.Descriptors {
 		// TODO(pbardea): Also check that lastWriteTime is set once those are
 		// populated on the table descriptor.
-		if table, _, _, _ := descpb.FromDescriptor(&desc); table != nil && table.Offline() {
+		if table, _, _, _, _ := descpb.FromDescriptor(&desc); table != nil && table.Offline() {
 			offlineInLastBackup[table.GetID()] = struct{}{}
 		}
 	}
@@ -902,7 +916,7 @@ func getReintroducedSpans(
 	// the time of the current backup, but may have been PUBLIC at some time in
 	// between.
 	for _, rev := range revs {
-		rawTable, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		rawTable, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
 		if rawTable == nil {
 			continue
 		}
@@ -917,7 +931,7 @@ func getReintroducedSpans(
 	// considered.
 	allRevs := make([]backuppb.BackupManifest_DescriptorRevision, 0, len(revs))
 	for _, rev := range revs {
-		rawTable, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		rawTable, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
 		if rawTable == nil {
 			continue
 		}
@@ -959,7 +973,7 @@ func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest
 	// timestamp record on each table being backed up.
 	tableIDs := make(descpb.IDs, 0)
 	for _, desc := range backupManifest.Descriptors {
-		t, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, hlc.Timestamp{})
+		t, _, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, hlc.Timestamp{})
 		if t != nil {
 			tableIDs = append(tableIDs, t.GetID())
 		}
@@ -1326,7 +1340,7 @@ func createBackupManifest(
 		dbsInPrev := make(map[descpb.ID]struct{})
 		rawDescs := prevBackups[len(prevBackups)-1].Descriptors
 		for i := range rawDescs {
-			if t, _, _, _ := descpb.FromDescriptor(&rawDescs[i]); t != nil {
+			if t, _, _, _, _ := descpb.FromDescriptor(&rawDescs[i]); t != nil {
 				tablesInPrev[t.ID] = struct{}{}
 			}
 		}

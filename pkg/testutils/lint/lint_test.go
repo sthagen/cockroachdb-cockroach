@@ -1365,7 +1365,7 @@ func TestLint(t *testing.T) {
 		if pkgSpecified {
 			skip.IgnoreLint(t, "PKG specified")
 		}
-		ignore := `\.(pb(\.gw)?)|(\.[eo]g)\.go|/testdata/|^sql/parser/sql\.go$|_generated(_test)?\.go$`
+		ignore := `\.(pb(\.gw)?)|(\.[eo]g)\.go|/testdata/|^sql/parser/sql\.go$|(_)?generated(_test)?\.go$`
 		cmd, stderr, filter, err := dirCmd(pkgDir, "crlfmt", "-fast", "-ignore", ignore, "-tab", "2", ".")
 		if err != nil {
 			t.Fatal(err)
@@ -2208,6 +2208,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`pkg/roachprod/logger/log\.go:.*format argument is not a constant expression`),
 			// We purposefully produce nil dereferences in this file to test crash conditions
 			stream.GrepNot(`pkg/util/log/logcrash/crash_reporting_test\.go:.*nil dereference in type assertion`),
+			// Temporarily copied code from google-cloud-go's retry predicate.
+			stream.GrepNot(`pkg/cloud/gcp/gcs_retry\.go:.*invalid direct cast on error object`),
 			// Spawning naked goroutines is ok when it's not as part of the main CRDB
 			// binary. This is for now - if we use #58164 to introduce more aggressive
 			// pooling, etc, then test code needs to adhere as well.

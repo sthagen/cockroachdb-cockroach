@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupencryption"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupinfo"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
@@ -36,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/ingesting"
@@ -131,6 +131,7 @@ func restoreWithRetry(
 	dataToRestore restorationData,
 	job *jobs.Job,
 	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
 ) (roachpb.RowCount, error) {
 	// We retry on pretty generic failures -- any rpc error. If a worker node were
 	// to restart, it would produce this kind of error, but there may be other
@@ -157,6 +158,7 @@ func restoreWithRetry(
 				dataToRestore,
 				job,
 				encryption,
+				kmsEnv,
 			)
 			if err == nil || !errors.Is(err, sql.ErrPlanChanged) {
 				break
@@ -227,6 +229,7 @@ func restore(
 	dataToRestore restorationData,
 	job *jobs.Job,
 	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
 ) (roachpb.RowCount, error) {
 	user := execCtx.User()
 	// A note about contexts and spans in this method: the top-level context
@@ -380,6 +383,7 @@ func restore(
 			importSpanChunks,
 			dataToRestore.getPKIDs(),
 			encryption,
+			kmsEnv,
 			dataToRestore.getRekeys(),
 			dataToRestore.getTenantRekeys(),
 			endTime,
@@ -413,9 +417,10 @@ func loadBackupSQLDescs(
 	p sql.JobExecContext,
 	details jobspb.RestoreDetails,
 	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
 ) ([]backuppb.BackupManifest, backuppb.BackupManifest, []catalog.Descriptor, int64, error) {
 	backupManifests, sz, err := backupinfo.LoadBackupManifests(ctx, mem, details.URIs,
-		p.User(), p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, encryption)
+		p.User(), p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, encryption, kmsEnv)
 	if err != nil {
 		return nil, backuppb.BackupManifest{}, nil, 0, err
 	}
@@ -1165,7 +1170,7 @@ func remapPublicSchemas(
 		// if the database does not have a public schema backed by a descriptor
 		// (meaning they were created before 22.1), we need to create a public
 		// schema descriptor for it.
-		id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		id, err := p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			return err
 		}
@@ -1239,8 +1244,10 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		return err
 	}
 
+	kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings, &p.ExecCfg().ExternalIODirConfig,
+		p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
 	backupManifests, latestBackupManifest, sqlDescs, memSize, err := loadBackupSQLDescs(
-		ctx, &mem, p, details, details.Encryption,
+		ctx, &mem, p, details, details.Encryption, &kmsEnv,
 	)
 	if err != nil {
 		return err
@@ -1325,7 +1332,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	}
 	var remappedStats []*stats.TableStatisticProto
 	backupStats, err := backupinfo.GetStatisticsFromBackup(ctx, defaultStore, details.Encryption,
-		latestBackupManifest)
+		&kmsEnv, latestBackupManifest)
 	if err == nil {
 		remappedStats = remapRelevantStatistics(ctx, backupStats, details.DescriptorRewrites,
 			details.TableDescs)
@@ -1397,6 +1404,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 			preData,
 			r.job,
 			details.Encryption,
+			&kmsEnv,
 		)
 		if err != nil {
 			return err
@@ -1432,6 +1440,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 			mainData,
 			r.job,
 			details.Encryption,
+			&kmsEnv,
 		)
 		if err != nil {
 			return err
@@ -1530,6 +1539,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 			telemetry.CountBucketed("restore.speed-mbps.over10mb", mbps)
 			telemetry.CountBucketed("restore.speed-mbps.over10mb.per-node", mbps/int64(numNodes))
 		}
+		logJobCompletion(ctx, restoreJobEventType, r.job.ID(), true, nil)
 	}
 	return nil
 }
@@ -1958,7 +1968,9 @@ func emitRestoreJobEvent(
 // has been committed from a restore that has failed or been canceled. It does
 // this by adding the table descriptors in DROP state, which causes the schema
 // change stuff to delete the keys in the background.
-func (r *restoreResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}) error {
+func (r *restoreResumer) OnFailOrCancel(
+	ctx context.Context, execCtx interface{}, jobErr error,
+) error {
 	p := execCtx.(sql.JobExecContext)
 	r.execCfg = p.ExecCfg()
 
@@ -1970,6 +1982,7 @@ func (r *restoreResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}
 		int64(timeutil.Since(timeutil.FromUnixMicros(r.job.Payload().StartedMicros)).Seconds()))
 
 	details := r.job.Details().(jobspb.RestoreDetails)
+	logJobCompletion(ctx, restoreJobEventType, r.job.ID(), false, jobErr)
 
 	execCfg := execCtx.(sql.JobExecContext).ExecCfg()
 	if err := sql.DescsTxn(ctx, execCfg, func(

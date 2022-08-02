@@ -529,14 +529,18 @@ type Reader interface {
 	//
 	// Deprecated: use MVCCIterator.ValueProto instead.
 	MVCCGetProto(key MVCCKey, msg protoutil.Message) (ok bool, keyBytes, valBytes int64, err error)
-	// MVCCIterate scans from the start key to the end key (exclusive), invoking the
-	// function f on each key value pair. If f returns an error or if the scan
-	// itself encounters an error, the iteration will stop and return the error.
-	// If the first result of f is true, the iteration stops and returns a nil
-	// error. Note that this method is not expected take into account the
-	// timestamp of the end key; all MVCCKeys at end.Key are considered excluded
-	// in the iteration.
-	MVCCIterate(start, end roachpb.Key, iterKind MVCCIterKind, f func(MVCCKeyValue) error) error
+	// MVCCIterate scans from the start key to the end key (exclusive), invoking
+	// the function f on each key value pair. The inputs are copies, and safe to
+	// retain beyond the function call. It supports interleaved iteration over
+	// point and/or range keys, providing any overlapping range keys for each
+	// point key if requested. If f returns an error or if the scan itself
+	// encounters an error, the iteration will stop and return the error.
+	//
+	// Note that this method is not expected take into account the timestamp of
+	// the end key; all MVCCKeys at end.Key are considered excluded in the
+	// iteration.
+	MVCCIterate(start, end roachpb.Key, iterKind MVCCIterKind, keyTypes IterKeyType,
+		f func(MVCCKeyValue, MVCCRangeKeyStack) error) error
 	// NewMVCCIterator returns a new instance of an MVCCIterator over this engine.
 	// The caller must invoke Close() on it when done to free resources.
 	//
@@ -636,25 +640,24 @@ type Writer interface {
 	// It is safe to modify the contents of the arguments after it returns.
 	ClearEngineKey(key EngineKey) error
 
-	// ClearRawRange removes both point keys and range keys from start (inclusive)
-	// to end (exclusive) using a Pebble range tombstone. It can be applied to a
-	// range consisting of MVCCKeys or the more general EngineKeys -- it simply
-	// uses the roachpb.Key parameters as the Key field of an EngineKey. This
-	// implies that it does not clear intents unless the intent lock table is
-	// targeted explicitly.
+	// ClearRawRange removes point and/or range keys from start (inclusive) to end
+	// (exclusive) using Pebble range tombstones. It can be applied to a range
+	// consisting of MVCCKeys or the more general EngineKeys -- it simply uses the
+	// roachpb.Key parameters as the Key field of an EngineKey. This implies that
+	// it does not clear intents unless the intent lock table is targeted
+	// explicitly.
 	//
 	// Similar to the other Clear* methods, this method actually removes entries
 	// from the storage engine. It is safe to modify the contents of the arguments
 	// after it returns.
-	ClearRawRange(start, end roachpb.Key) error
-	// ClearMVCCRange removes MVCC keys from start (inclusive) to end (exclusive)
-	// using a Pebble range tombstone. It will remove everything in the span,
-	// including intents and range keys.
+	ClearRawRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error
+	// ClearMVCCRange removes MVCC point and/or range keys (including intents)
+	// from start (inclusive) to end (exclusive) using Pebble range tombstones.
 	//
 	// Similar to the other Clear* methods, this method actually removes entries
 	// from the storage engine. It is safe to modify the contents of the arguments
 	// after it returns.
-	ClearMVCCRange(start, end roachpb.Key) error
+	ClearMVCCRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error
 	// ClearMVCCVersions removes MVCC point key versions from start (inclusive) to
 	// end (exclusive) using a Pebble range tombstone. It is meant for efficiently
 	// clearing a subset of versions of a key, since the parameters are MVCCKeys
@@ -665,27 +668,18 @@ type Writer interface {
 	// from the storage engine. It is safe to modify the contents of the arguments
 	// after it returns.
 	ClearMVCCVersions(start, end MVCCKey) error
-	// ClearMVCCIteratorRange removes all keys in the given span using an MVCC
-	// iterator, by clearing individual keys (including intents) with Pebble point
-	// tombstones. It will also clear all range keys in the span.
+	// ClearMVCCIteratorRange removes all point and/or range keys in the given
+	// span using an MVCC iterator, by clearing individual keys (including
+	// intents).
 	//
 	// Similar to the other Clear* methods, this method actually removes entries
 	// from the storage engine. It is safe to modify the contents of the arguments
 	// after it returns.
-	ClearMVCCIteratorRange(start, end roachpb.Key) error
-
-	// ClearAllRangeKeys deletes all range keys (and all versions) from start
-	// (inclusive) to end (exclusive). This can be used both for MVCC range keys
-	// or the more general engine range keys. For any range key that straddles the
-	// start and end boundaries, only the segments within the boundaries will be
-	// cleared. Clears are idempotent.
 	//
-	// This method is primarily intended for MVCC garbage collection and similar
-	// internal use. It will do an internal scan across the span first to check
-	// whether it contains any range keys at all, and clear the smallest single
-	// span that covers all range keys (if any), to avoid dropping Pebble range
-	// tombstones across unnecessary spans.
-	ClearAllRangeKeys(start, end roachpb.Key) error
+	// TODO(erikgrinaker): This should be a separate function rather than an
+	// interface method, but we keep it for now to make use of UnsafeRawKey() when
+	// clearing keys.
+	ClearMVCCIteratorRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error
 
 	// ClearMVCCRangeKey deletes an MVCC range key from start (inclusive) to end
 	// (exclusive) at the given timestamp. For any range key that straddles the
@@ -723,6 +717,13 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after it returns.
 	PutEngineRangeKey(start, end roachpb.Key, suffix, value []byte) error
+
+	// ClearEngineRangeKey clears the given range key. This is a general-purpose
+	// and low-level method that should be used sparingly, only when the other
+	// Clear* methods are not applicable.
+	//
+	// It is safe to modify the contents of the arguments after it returns.
+	ClearEngineRangeKey(start, end roachpb.Key, suffix []byte) error
 
 	// Merge is a high-performance write operation used for values which are
 	// accumulated over several writes. Multiple values can be merged
@@ -1118,13 +1119,14 @@ func GetIntent(reader Reader, key roachpb.Key) (*roachpb.Intent, error) {
 // declaration of intentInterleavingIter for details.
 func Scan(reader Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, error) {
 	var kvs []MVCCKeyValue
-	err := reader.MVCCIterate(start, end, MVCCKeyAndIntentsIterKind, func(kv MVCCKeyValue) error {
-		if max != 0 && int64(len(kvs)) >= max {
-			return iterutil.StopIteration()
-		}
-		kvs = append(kvs, kv)
-		return nil
-	})
+	err := reader.MVCCIterate(start, end, MVCCKeyAndIntentsIterKind, IterKeyTypePointsOnly,
+		func(kv MVCCKeyValue, _ MVCCRangeKeyStack) error {
+			if max != 0 && int64(len(kvs)) >= max {
+				return iterutil.StopIteration()
+			}
+			kvs = append(kvs, kv)
+			return nil
+		})
 	return kvs, err
 }
 
@@ -1194,79 +1196,124 @@ func WriteSyncNoop(eng Engine) error {
 }
 
 // ClearRangeWithHeuristic clears the keys from start (inclusive) to end
-// (exclusive), including any range keys. Depending on the number of keys, it
-// will either use ClearRawRange or clear individual keys. It works with
-// EngineKeys, so don't expect it to find and clear separated intents if
-// [start,end) refers to MVCC key space.
-func ClearRangeWithHeuristic(reader Reader, writer Writer, start, end roachpb.Key) error {
-	iter := reader.NewEngineIterator(IterOptions{UpperBound: end})
-	defer iter.Close()
+// (exclusive), including any range keys, but does not clear intents unless the
+// lock table is targeted explicitly. Depending on the number of keys, it will
+// either write a Pebble range tombstone or clear individual keys. If it uses
+// a range tombstone, it will tighten the span to the first encountered key.
+//
+// pointKeyThreshold and rangeKeyThreshold specify the number of point/range
+// keys respectively where it will switch from clearing individual keys to
+// Pebble range tombstones (RANGEDEL or RANGEKEYDEL respectively). A threshold
+// of 0 disables checking for and clearing that key type.
+//
+// NB: An initial scan will be done to determine the type of clear, so a large
+// threshold will potentially involve scanning a large number of keys twice.
+//
+// TODO(erikgrinaker): Consider tightening the end of the range tombstone span
+// too, by doing a SeekLT when we reach the threshold. It's unclear whether it's
+// really worth it.
+func ClearRangeWithHeuristic(
+	r Reader, w Writer, start, end roachpb.Key, pointKeyThreshold, rangeKeyThreshold int,
+) error {
+	clearPointKeys := func(r Reader, w Writer, start, end roachpb.Key, threshold int) error {
+		iter := r.NewEngineIterator(IterOptions{
+			KeyTypes:   IterKeyTypePointsOnly,
+			LowerBound: start,
+			UpperBound: end,
+		})
+		defer iter.Close()
 
-	// It is expensive for there to be many range deletion tombstones in the same
-	// sstable because all of the tombstones in an sstable are loaded whenever the
-	// sstable is accessed. So we avoid using range deletion unless there is some
-	// minimum number of keys. The value here was pulled out of thin air. It might
-	// be better to make this dependent on the size of the data being deleted. Or
-	// perhaps we should fix Pebble to handle large numbers of tombstones in an
-	// sstable better. Note that we are referring to storage-level tombstones here,
-	// and not MVCC tombstones.
-	const clearRangeMinKeys = 64
-	// Peek into the range to see whether it's large enough to justify
-	// ClearRawRange. Note that the work done here is bounded by
-	// clearRangeMinKeys, so it will be fairly cheap even for large
-	// ranges.
-	//
-	// TODO(sumeer): Could add the iterated keys to the batch, so we don't have
-	// to do the scan again. If there are too many keys, this will mean a mix of
-	// point tombstones and range tombstone.
-	count := 0
-	valid, err := iter.SeekEngineKeyGE(EngineKey{Key: start})
-	for valid {
-		count++
-		if count > clearRangeMinKeys {
-			return writer.ClearRawRange(start, end)
+		// Scan, and drop a RANGEDEL if we reach the threshold. We tighten the span
+		// to the first encountered key, since we can cheaply do so.
+		var ok bool
+		var err error
+		var count int
+		var firstKey roachpb.Key
+		for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: start}); ok; ok, err = iter.NextEngineKey() {
+			count++
+			if len(firstKey) == 0 {
+				key, err := iter.UnsafeEngineKey()
+				if err != nil {
+					return err
+				}
+				firstKey = key.Key.Clone()
+			}
+			if count >= threshold {
+				return w.ClearRawRange(firstKey, end, true /* pointKeys */, false /* rangeKeys */)
+			}
 		}
-		valid, err = iter.NextEngineKey()
-	}
-	if err != nil {
+		if err != nil || count == 0 {
+			return err
+		}
+		// Clear individual points.
+		for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: start}); ok; ok, err = iter.NextEngineKey() {
+			key, err := iter.UnsafeEngineKey()
+			if err != nil {
+				return err
+			}
+			if err = w.ClearEngineKey(key); err != nil {
+				return err
+			}
+		}
 		return err
 	}
-	valid, err = iter.SeekEngineKeyGE(EngineKey{Key: start})
-	for valid {
-		var k EngineKey
-		if k, err = iter.UnsafeEngineKey(); err != nil {
-			break
+
+	clearRangeKeys := func(r Reader, w Writer, start, end roachpb.Key, threshold int) error {
+		iter := r.NewEngineIterator(IterOptions{
+			KeyTypes:   IterKeyTypeRangesOnly,
+			LowerBound: start,
+			UpperBound: end,
+		})
+		defer iter.Close()
+
+		// Scan, and drop a RANGEKEYDEL if we reach the threshold.
+		var ok bool
+		var err error
+		var count int
+		var firstKey roachpb.Key
+		for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: start}); ok; ok, err = iter.NextEngineKey() {
+			count += len(iter.EngineRangeKeys())
+			if len(firstKey) == 0 {
+				bounds, err := iter.EngineRangeBounds()
+				if err != nil {
+					return err
+				}
+				firstKey = bounds.Key.Clone()
+			}
+			if count >= threshold {
+				return w.ClearRawRange(firstKey, end, false /* pointKeys */, true /* rangeKeys */)
+			}
 		}
-		if err = writer.ClearEngineKey(k); err != nil {
-			break
+		if err != nil || count == 0 {
+			return err
 		}
-		valid, err = iter.NextEngineKey()
-	}
-	if err != nil {
+		// Clear individual range keys.
+		for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: start}); ok; ok, err = iter.NextEngineKey() {
+			bounds, err := iter.EngineRangeBounds()
+			if err != nil {
+				return err
+			}
+			for _, v := range iter.EngineRangeKeys() {
+				if err := w.ClearEngineRangeKey(bounds.Key, bounds.EndKey, v.Version); err != nil {
+					return err
+				}
+			}
+		}
 		return err
 	}
 
-	// Use a separate iterator to look for any range keys, to avoid dropping
-	// unnecessary range keys. Pebble.ClearAllRangeKeys also checks this, but we
-	// may be writing to an SSTWriter here which can't know.
-	//
-	// TODO(erikgrinaker): Review the engine clear methods and heuristics to come
-	// up with a better scheme for avoiding dropping unnecessary range tombstones
-	// across range key spans.
-	iter = reader.NewEngineIterator(IterOptions{
-		KeyTypes:   IterKeyTypeRangesOnly,
-		LowerBound: start,
-		UpperBound: end,
-	})
-	defer iter.Close()
+	if pointKeyThreshold > 0 {
+		if err := clearPointKeys(r, w, start, end, pointKeyThreshold); err != nil {
+			return err
+		}
+	}
 
-	valid, err = iter.SeekEngineKeyGE(EngineKey{Key: start})
-	if err != nil {
-		return err
+	if rangeKeyThreshold > 0 {
+		if err := clearRangeKeys(r, w, start, end, rangeKeyThreshold); err != nil {
+			return err
+		}
 	}
-	if valid {
-		return writer.ClearAllRangeKeys(start, end)
-	}
+
 	return nil
 }
 
@@ -1335,7 +1382,11 @@ func calculatePreIngestDelay(settings *cluster.Settings, metrics *pebble.Metrics
 
 // Helper function to implement Reader.MVCCIterate().
 func iterateOnReader(
-	reader Reader, start, end roachpb.Key, iterKind MVCCIterKind, f func(MVCCKeyValue) error,
+	reader Reader,
+	start, end roachpb.Key,
+	iterKind MVCCIterKind,
+	keyTypes IterKeyType,
+	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
 ) error {
 	if reader.Closed() {
 		return errors.New("cannot call MVCCIterate on a closed batch")
@@ -1344,18 +1395,30 @@ func iterateOnReader(
 		return nil
 	}
 
-	it := reader.NewMVCCIterator(iterKind, IterOptions{UpperBound: end})
+	it := reader.NewMVCCIterator(iterKind, IterOptions{
+		KeyTypes:   keyTypes,
+		LowerBound: start,
+		UpperBound: end,
+	})
 	defer it.Close()
 
-	it.SeekGE(MakeMVCCMetadataKey(start))
-	for ; ; it.Next() {
-		ok, err := it.Valid()
-		if err != nil {
+	var rangeKeys MVCCRangeKeyStack // cached during iteration
+	for it.SeekGE(MakeMVCCMetadataKey(start)); ; it.Next() {
+		if ok, err := it.Valid(); err != nil {
 			return err
 		} else if !ok {
 			break
 		}
-		if err := f(MVCCKeyValue{Key: it.Key(), Value: it.Value()}); err != nil {
+
+		var kv MVCCKeyValue
+		if hasPoint, _ := it.HasPointAndRange(); hasPoint {
+			kv = MVCCKeyValue{Key: it.Key(), Value: it.Value()}
+		}
+		if !it.RangeBounds().Key.Equal(rangeKeys.Bounds.Key) {
+			rangeKeys = it.RangeKeys().Clone()
+		}
+
+		if err := f(kv, rangeKeys); err != nil {
 			return iterutil.Map(err)
 		}
 	}

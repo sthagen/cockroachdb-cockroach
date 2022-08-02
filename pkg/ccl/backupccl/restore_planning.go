@@ -40,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
@@ -153,7 +152,7 @@ func synthesizePGTempSchema(
 			return errors.Newf("attempted to synthesize temp schema during RESTORE but found"+
 				" another schema already using the same schema key %s", schemaName)
 		}
-		synthesizedSchemaID, err = descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		synthesizedSchemaID, err = p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			return err
 		}
@@ -517,7 +516,7 @@ func allocateDescriptorRewrites(
 			}
 		}
 
-		tempSysDBID, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		tempSysDBID, err := p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -874,7 +873,7 @@ func allocateDescriptorRewrites(
 		if descriptorCoverage == tree.AllDescriptors {
 			newID = db.GetID()
 		} else {
-			newID, err = descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+			newID, err = p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -945,7 +944,7 @@ func allocateDescriptorRewrites(
 	// Generate new IDs for the schemas, tables, and types that need to be
 	// remapped.
 	for _, desc := range descriptorsToRemap {
-		id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		id, err := p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1617,6 +1616,9 @@ func doRestorePlan(
 		defer store.Close()
 		baseStores[i] = store
 	}
+	ioConf := baseStores[0].ExternalIOConf()
+	kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings, &ioConf,
+		p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
 
 	var encryption *jobspb.BackupEncryptionOptions
 	if restoreStmt.Options.EncryptionPassphrase != nil {
@@ -1634,7 +1636,6 @@ func doRestorePlan(
 		if err != nil {
 			return err
 		}
-		ioConf := baseStores[0].ExternalIOConf()
 
 		// A backup could have been encrypted with multiple KMS keys that
 		// are stored across ENCRYPTION-INFO files. Iterate over all
@@ -1644,10 +1645,7 @@ func doRestorePlan(
 		for _, encFile := range opts {
 			defaultKMSInfo, err = backupencryption.ValidateKMSURIsAgainstFullBackup(ctx, kms,
 				backupencryption.NewEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID),
-				&backupencryption.BackupKMSEnv{
-					Settings: baseStores[0].Settings(),
-					Conf:     &ioConf,
-				})
+				&kmsEnv)
 			if err == nil {
 				break
 			}
@@ -1677,14 +1675,14 @@ func doRestorePlan(
 		// This could be either INTO-syntax, OR TO-syntax.
 		defaultURIs, mainBackupManifests, localityInfo, memReserved, err = backupdest.ResolveBackupManifests(
 			ctx, &mem, baseStores, mkStore, fullyResolvedBaseDirectory,
-			fullyResolvedIncrementalsDirectory, endTime, encryption, p.User(),
+			fullyResolvedIncrementalsDirectory, endTime, encryption, &kmsEnv, p.User(),
 		)
 	} else {
 		// Incremental layers are specified explicitly.
 		// This implies the old, deprecated TO-syntax.
 		defaultURIs, mainBackupManifests, localityInfo, memReserved, err =
 			backupdest.DeprecatedResolveBackupManifestsExplicitIncrementals(ctx, &mem, mkStore, from,
-				endTime, encryption, p.User())
+				endTime, encryption, &kmsEnv, p.User())
 	}
 
 	if err != nil {
@@ -1772,7 +1770,7 @@ func doRestorePlan(
 		}
 	}
 
-	sqlDescs, restoreDBs, tenants, err := selectTargets(
+	sqlDescs, restoreDBs, descsByTablePattern, tenants, err := selectTargets(
 		ctx, p, mainBackupManifests, restoreStmt.Targets, restoreStmt.DescriptorCoverage, endTime,
 	)
 	if err != nil {
@@ -1897,6 +1895,11 @@ func doRestorePlan(
 		}
 	}
 
+	var asOfInterval int64
+	if !endTime.IsEmpty() {
+		asOfInterval = endTime.WallTime - p.ExtendedEvalContext().StmtTimestamp.UnixNano()
+	}
+
 	filteredTablesByID, err := maybeFilterMissingViews(
 		tablesByID,
 		typesByID,
@@ -1996,22 +1999,34 @@ func doRestorePlan(
 		revalidateIndexes[i].TableID = descriptorRewrites[revalidateIndexes[i].TableID].ID
 	}
 
-	// Collect telemetry.
-	collectTelemetry := func() {
-		telemetry.Count("restore.total.started")
-		if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
-			telemetry.Count("restore.full-cluster")
-		}
-		if restoreStmt.Subdir == nil {
-			telemetry.Count("restore.deprecated-subdir-syntax")
-		} else {
-			telemetry.Count("restore.collection")
-		}
-	}
-
 	encodedTables := make([]*descpb.TableDescriptor, len(tables))
 	for i, table := range tables {
 		encodedTables[i] = table.TableDesc()
+	}
+
+	restoreDetails := jobspb.RestoreDetails{
+		EndTime:            endTime,
+		DescriptorRewrites: descriptorRewrites,
+		URIs:               defaultURIs,
+		BackupLocalityInfo: localityInfo,
+		TableDescs:         encodedTables,
+		Tenants:            tenants,
+		OverrideDB:         intoDB,
+		DescriptorCoverage: restoreStmt.DescriptorCoverage,
+		Encryption:         encryption,
+		RevalidateIndexes:  revalidateIndexes,
+		DatabaseModifiers:  databaseModifiers,
+		DebugPauseOn:       debugPauseOn,
+
+		// A RESTORE SYSTEM USERS planned on a 22.1 node will use the
+		// RestoreSystemUsers field in the job details to identify this flavour of
+		// RESTORE. We must continue to check this field for mixed-version
+		// compatability.
+		//
+		// TODO(msbutler): Delete in 23.1
+		RestoreSystemUsers: restoreStmt.DescriptorCoverage == tree.SystemUsers,
+		PreRewriteTenantId: oldTenantID,
+		Validation:         jobspb.RestoreValidation_DefaultRestore,
 	}
 
 	jr := jobs.Record{
@@ -2023,30 +2038,7 @@ func doRestorePlan(
 			}
 			return sqlDescIDs
 		}(),
-		Details: jobspb.RestoreDetails{
-			EndTime:            endTime,
-			DescriptorRewrites: descriptorRewrites,
-			URIs:               defaultURIs,
-			BackupLocalityInfo: localityInfo,
-			TableDescs:         encodedTables,
-			Tenants:            tenants,
-			OverrideDB:         intoDB,
-			DescriptorCoverage: restoreStmt.DescriptorCoverage,
-			Encryption:         encryption,
-			RevalidateIndexes:  revalidateIndexes,
-			DatabaseModifiers:  databaseModifiers,
-			DebugPauseOn:       debugPauseOn,
-
-			// A RESTORE SYSTEM USERS planned on a 22.1 node will use the
-			// RestoreSystemUsers field in the job details to identify this flavour of
-			// RESTORE. We must continue to check this field for mixed-version
-			// compatability.
-			//
-			// TODO(msbutler): Delete in 23.1
-			RestoreSystemUsers: restoreStmt.DescriptorCoverage == tree.SystemUsers,
-			PreRewriteTenantId: oldTenantID,
-			Validation:         jobspb.RestoreValidation_DefaultRestore,
-		},
+		Details:  restoreDetails,
 		Progress: jobspb.RestoreProgress{},
 	}
 
@@ -2060,7 +2052,8 @@ func doRestorePlan(
 			return err
 		}
 		resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(jobID))}
-		collectTelemetry()
+		collectRestoreTelemetry(ctx, jobID, restoreDetails, intoDB, newDBName, subdir, restoreStmt,
+			descsByTablePattern, restoreDBs, asOfInterval, debugPauseOn)
 		return nil
 	}
 
@@ -2093,7 +2086,8 @@ func doRestorePlan(
 	}(); err != nil {
 		return err
 	}
-	collectTelemetry()
+	collectRestoreTelemetry(ctx, sj.ID(), restoreDetails, intoDB, newDBName, subdir, restoreStmt,
+		descsByTablePattern, restoreDBs, asOfInterval, debugPauseOn)
 	if err := sj.Start(ctx); err != nil {
 		return err
 	}
@@ -2101,6 +2095,33 @@ func doRestorePlan(
 		return err
 	}
 	return sj.ReportExecutionResults(ctx, resultsCh)
+}
+
+func collectRestoreTelemetry(
+	ctx context.Context,
+	jobID jobspb.JobID,
+	details jobspb.RestoreDetails,
+	intoDB string,
+	newDBName string,
+	subdir string,
+	restoreStmt *tree.Restore,
+	descsByTablePattern map[tree.TablePattern]catalog.Descriptor,
+	restoreDBs []catalog.DatabaseDescriptor,
+	asOfInterval int64,
+	debugPauseOn string,
+) {
+	telemetry.Count("restore.total.started")
+	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
+		telemetry.Count("restore.full-cluster")
+	}
+	if restoreStmt.Subdir == nil {
+		telemetry.Count("restore.deprecated-subdir-syntax")
+	} else {
+		telemetry.Count("restore.collection")
+	}
+
+	logRestoreTelemetry(ctx, jobID, details, intoDB, newDBName, subdir, asOfInterval, restoreStmt.Options,
+		descsByTablePattern, restoreDBs, debugPauseOn)
 }
 
 func filteredUserCreatedDescriptors(
@@ -2218,7 +2239,9 @@ func planDatabaseModifiersForRestore(
 	if defaultPrimaryRegion == "" {
 		return nil, nil, nil
 	}
-	if err := multiregionccl.CheckClusterSupportsMultiRegion(p.ExecCfg()); err != nil {
+	if err := multiregionccl.CheckClusterSupportsMultiRegion(
+		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(),
+	); err != nil {
 		return nil, nil, errors.WithHintf(
 			err,
 			"try disabling the default PRIMARY REGION by using RESET CLUSTER SETTING %s",

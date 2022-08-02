@@ -177,7 +177,8 @@ func TestReadOnlyBasics(t *testing.T) {
 				func() { _, _ = ro.MVCCGet(a) },
 				func() { _, _, _, _ = ro.MVCCGetProto(a, getVal) },
 				func() {
-					_ = ro.MVCCIterate(a.Key, a.Key, MVCCKeyIterKind, func(MVCCKeyValue) error { return iterutil.StopIteration() })
+					_ = ro.MVCCIterate(a.Key, a.Key, MVCCKeyIterKind, IterKeyTypePointsOnly,
+						func(MVCCKeyValue, MVCCRangeKeyStack) error { return iterutil.StopIteration() })
 				},
 				func() { ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax}).Close() },
 				func() {
@@ -212,7 +213,7 @@ func TestReadOnlyBasics(t *testing.T) {
 				func() { _ = ro.ApplyBatchRepr(nil, false) },
 				func() { _ = ro.ClearUnversioned(a.Key) },
 				func() { _ = ro.SingleClearEngineKey(EngineKey{Key: a.Key}) },
-				func() { _ = ro.ClearRawRange(a.Key, a.Key) },
+				func() { _ = ro.ClearRawRange(a.Key, a.Key, true, true) },
 				func() { _ = ro.Merge(a, nil) },
 				func() { _ = ro.PutUnversioned(a.Key, nil) },
 			}
@@ -879,7 +880,7 @@ func TestUnindexedBatchThatDoesNotSupportReaderPanics(t *testing.T) {
 			testCases := []func(){
 				func() { _, _ = batch.MVCCGet(a) },
 				func() { _, _, _, _ = batch.MVCCGetProto(a, nil) },
-				func() { _ = batch.MVCCIterate(a.Key, b.Key, MVCCKeyIterKind, nil) },
+				func() { _ = batch.MVCCIterate(a.Key, b.Key, MVCCKeyIterKind, IterKeyTypePointsOnly, nil) },
 				func() { _ = batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax}) },
 			}
 			for i, f := range testCases {
@@ -1115,11 +1116,7 @@ func TestPebbleBatchReader(t *testing.T) {
 	eng := NewDefaultInMemForTesting()
 	defer eng.Close()
 
-	// TODO(erikgrinaker): We use an unindexed batch to force ClearRawRange to
-	// drop a Pebble range tombstone even if there are no range keys below it. It
-	// should unconditionally drop one. See:
-	// https://github.com/cockroachdb/cockroach/issues/83032
-	b := eng.NewUnindexedBatch(false)
+	b := eng.NewBatch()
 	defer b.Close()
 
 	// Write some basic data.
@@ -1131,7 +1128,7 @@ func TestPebbleBatchReader(t *testing.T) {
 	// Clear some already empty keys.
 	require.NoError(t, b.ClearMVCC(pointKey("mvccKey", 9)))
 	require.NoError(t, b.ClearMVCCRangeKey(rangeKey("rangeFrom", "rangeTo", 9)))
-	require.NoError(t, b.ClearRawRange(roachpb.Key("clearFrom"), roachpb.Key("clearTo"))) // both points and ranges
+	require.NoError(t, b.ClearRawRange(roachpb.Key("clearFrom"), roachpb.Key("clearTo"), true, true))
 
 	// Read it back.
 	expect := []struct {

@@ -73,7 +73,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
@@ -82,6 +81,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
@@ -94,6 +94,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -104,6 +105,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/proto"
 	pgx "github.com/jackc/pgx/v4"
 	"github.com/kr/pretty"
@@ -1633,7 +1635,8 @@ func TestBackupRestoreResume(t *testing.T) {
 		sqlDB.Exec(t, `BACKUP DATABASE DATA TO $1`, restoreDir)
 		sqlDB.Exec(t, `CREATE DATABASE restoredb`)
 		restoreDatabaseID := sqlutils.QueryDatabaseID(t, sqlDB.DB, "restoredb")
-		restoreTableID, err := descidgen.GenerateUniqueDescID(ctx, tc.Servers[0].DB(), keys.SystemSQLCodec)
+		restoreTableID, err := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).
+			DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -4345,6 +4348,9 @@ func TestRegionalKMSEncryptedBackup(t *testing.T) {
 type testKMSEnv struct {
 	settings         *cluster.Settings
 	externalIOConfig *base.ExternalIODirConfig
+	db               *kv.DB
+	user             username.SQLUsername
+	ie               sqlutil.InternalExecutor
 }
 
 var _ cloud.KMSEnv = &testKMSEnv{}
@@ -4355,6 +4361,18 @@ func (e *testKMSEnv) ClusterSettings() *cluster.Settings {
 
 func (e *testKMSEnv) KMSConfig() *base.ExternalIODirConfig {
 	return e.externalIOConfig
+}
+
+func (e *testKMSEnv) DBHandle() *kv.DB {
+	return e.db
+}
+
+func (e *testKMSEnv) User() username.SQLUsername {
+	return e.user
+}
+
+func (e *testKMSEnv) InternalExecutor() sqlutil.InternalExecutor {
+	return e.ie
 }
 
 type testKMS struct {
@@ -4466,9 +4484,15 @@ func TestValidateKMSURIsAgainstFullBackup(t *testing.T) {
 			}
 		}
 
+		kmsEnv := &testKMSEnv{
+			settings:         cluster.NoSettings,
+			externalIOConfig: &base.ExternalIODirConfig{},
+			db:               nil,
+			user:             username.RootUserName(),
+			ie:               nil,
+		}
 		kmsInfo, err := backupencryption.ValidateKMSURIsAgainstFullBackup(
-			ctx, tc.incrementalBackupURIs, masterKeyIDToDataKey,
-			&testKMSEnv{cluster.NoSettings, &base.ExternalIODirConfig{}})
+			ctx, tc.incrementalBackupURIs, masterKeyIDToDataKey, kmsEnv)
 		if tc.expectError {
 			require.Error(t, err)
 		} else {
@@ -5800,7 +5824,15 @@ func TestBackupRestoreCorruptedStatsIgnored(t *testing.T) {
 	statsTable := backuppb.StatsTable{
 		Statistics: []*stats.TableStatisticProto{{TableID: descpb.ID(tableID + 1), Name: "notbank"}},
 	}
-	require.NoError(t, backupinfo.WriteTableStatistics(ctx, store, nil /* encryption */, &statsTable))
+	kmsEnv := &testKMSEnv{
+		settings:         execCfg.Settings,
+		externalIOConfig: &execCfg.ExternalIODirConfig,
+		db:               execCfg.DB,
+		user:             username.RootUserName(),
+		ie:               execCfg.InternalExecutor,
+	}
+	require.NoError(t, backupinfo.WriteTableStatistics(ctx, store, nil, /* encryption */
+		kmsEnv, &statsTable))
 
 	sqlDB.Exec(t, `CREATE DATABASE "data 2"`)
 	sqlDB.Exec(t, fmt.Sprintf(`RESTORE data.bank FROM "%s" WITH skip_missing_foreign_keys, into_db = "%s"`,
@@ -8149,8 +8181,17 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 	for i := 0; i < magic; i++ {
 		desc.Files = append(desc.Files, backuppb.BackupManifest_File{Path: fmt.Sprintf("%d-file-%d", i, i)})
 	}
-	require.NoError(t, backupinfo.WriteBackupManifest(ctx, st, storage, "testmanifest", encOpts, desc))
-	_, sz, err := backupinfo.ReadBackupManifest(ctx, &mem, storage, "testmanifest", encOpts)
+	kmsEnv := testKMSEnv{
+		settings:         st,
+		externalIOConfig: &base.ExternalIODirConfig{},
+		db:               nil,
+		user:             username.RootUserName(),
+		ie:               nil,
+	}
+	require.NoError(t, backupinfo.WriteBackupManifest(ctx, storage, "testmanifest", encOpts,
+		&kmsEnv, desc))
+	_, sz, err := backupinfo.ReadBackupManifest(ctx, &mem, storage, "testmanifest",
+		encOpts, &kmsEnv)
 	require.NoError(t, err)
 	mem.Shrink(ctx, sz)
 	mem.Close(ctx)
@@ -8448,7 +8489,7 @@ func TestRestoreJobEventLogging(t *testing.T) {
 		&unused)
 
 	expectedStatus := []string{string(jobs.StatusSucceeded), string(jobs.StatusRunning)}
-	jobstest.CheckEmittedEvents(t, expectedStatus, beforeRestore.UnixNano(), jobID, "restore",
+	jobstest.CheckEmittedEvents(t, expectedStatus, beforeRestore.UnixNano(), jobID, `"EventType":"restore"`,
 		"RESTORE")
 
 	sqlDB.Exec(t, `DROP DATABASE r1`)
@@ -8466,7 +8507,7 @@ func TestRestoreJobEventLogging(t *testing.T) {
 		string(jobs.StatusRunning),
 	}
 	jobstest.CheckEmittedEvents(t, expectedStatus, beforeSecondRestore.UnixNano(), jobID,
-		"restore", "RESTORE")
+		`"EventType":"restore"`, "RESTORE")
 }
 
 func TestBackupOnlyPublicIndexes(t *testing.T) {
@@ -10167,4 +10208,127 @@ func TestBackupLatestInBaseDirectory(t *testing.T) {
 	// written by the old version in the base directory.
 	query = fmt.Sprintf("BACKUP INTO LATEST IN %s", userfile)
 	sqlDB.Exec(t, query)
+
+}
+
+// TestBackupRestoreTelemetryEvents tests that BACKUP and RESTORE correctly
+// publishes telemetry events.
+func TestBackupRestoreTelemetryEvents(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.ScopeWithoutShowLogs(t).Close(t)
+
+	defer jobs.TestingSetProgressThresholds()()
+
+	baseDir := "testdata"
+	args := base.TestServerArgs{ExternalIODir: baseDir, Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}}
+	params := base.TestClusterArgs{ServerArgs: args}
+	tc, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, 1,
+		InitManualReplication, params)
+	defer cleanupFn()
+
+	var forceFailure bool
+	for i := range tc.Servers {
+		tc.Servers[i].JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+			jobspb.TypeRestore: func(raw jobs.Resumer) jobs.Resumer {
+				r := raw.(*restoreResumer)
+				r.testingKnobs.beforePublishingDescriptors = func() error {
+					if forceFailure {
+						return errors.Newf("testing injected failure: %s", "sensitive text")
+					}
+					return nil
+				}
+				return r
+			},
+		}
+	}
+
+	sqlDB.Exec(t, `CREATE DATABASE r1`)
+	sqlDB.Exec(t, `CREATE TABLE r1.foo (id INT)`)
+	sqlDB.Exec(t, `CREATE DATABASE r2`)
+
+	// Execute a BACKUP and verify that the parameters in the statement were
+	// correctly logged in a telemetry event.
+	beforeBackup := timeutil.Now()
+	loc1 := "userfile:///eventlogging?COCKROACH_LOCALITY=default"
+	loc2 := "nodelocal://0/us-west-bucket?COCKROACH_LOCALITY=region%3Dus-west"
+	sqlDB.Exec(t, `BACKUP DATABASE r1, r2 INTO  ($1, $2) AS OF SYSTEM TIME '-1ms' WITH revision_history`, loc1, loc2)
+
+	expectedBackupEvent := eventpb.RecoveryEvent{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			EventType: "recovery_event",
+		},
+		RecoveryType:            backupEventType,
+		TargetScope:             databaseScope.String(),
+		TargetCount:             2,
+		DestinationSubdirType:   standardSubdirType,
+		DestinationStorageTypes: []string{"nodelocal", "userfile"},
+		DestinationAuthTypes:    []string{"specified"},
+		IsLocalityAware:         true,
+		AsOfInterval:            -1 * time.Millisecond.Nanoseconds(),
+		WithRevisionHistory:     true,
+	}
+
+	// Also verify that there's a telemetry event corresponding to the completion
+	// of the job.
+	expectedBackupJobEvent := eventpb.RecoveryEvent{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			EventType: "recovery_event",
+		},
+		RecoveryType: backupJobEventType,
+		ResultStatus: string(jobs.StatusSucceeded),
+	}
+
+	requireRecoveryEvent(t, beforeBackup.UnixNano(), backupEventType, expectedBackupEvent)
+	requireRecoveryEvent(t, beforeBackup.UnixNano(), backupJobEventType, expectedBackupJobEvent)
+
+	// Execute a RESTORE and verify that the parameters in the statement were
+	// correctly logged in a telemetry event.
+	beforeRestore := timeutil.Now()
+	restoreQuery := `RESTORE TABLE r1.foo FROM LATEST IN ($1, $2) WITH into_db = $3, skip_missing_foreign_keys`
+	sqlDB.Exec(t, restoreQuery, loc1, loc2, "r2")
+
+	expectedRestoreEvent := eventpb.RecoveryEvent{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			EventType: "recovery_event",
+		},
+		RecoveryType:            restoreEventType,
+		TargetScope:             tableScope.String(),
+		TargetCount:             1,
+		DestinationSubdirType:   latestSubdirType,
+		DestinationStorageTypes: []string{"nodelocal", "userfile"},
+		DestinationAuthTypes:    []string{"specified"},
+		IsLocalityAware:         true,
+		AsOfInterval:            0,
+		Options:                 []string{telemetryOptionIntoDB, telemetryOptionSkipMissingFK},
+	}
+
+	// Also verify that there's a telemetry event corresponding to the completion
+	// of the job.
+	expectedRestoreJobEvent := eventpb.RecoveryEvent{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			EventType: "recovery_event",
+		},
+		RecoveryType: restoreJobEventType,
+		ResultStatus: string(jobs.StatusSucceeded),
+	}
+
+	requireRecoveryEvent(t, beforeRestore.UnixNano(), restoreEventType, expectedRestoreEvent)
+	requireRecoveryEvent(t, beforeRestore.UnixNano(), restoreJobEventType, expectedRestoreJobEvent)
+
+	sqlDB.Exec(t, `DROP TABLE r2.foo`)
+
+	// Run RESTORE again but force it to fail. Verify that there is a telemetry
+	// event about the job failure.
+	forceFailure = true
+	beforeRestore = timeutil.Now()
+	sqlDB.ExpectErrSucceedsSoon(t, "testing injected failure", restoreQuery, loc1, loc2, "r2")
+	expectedRestoreFailEvent := eventpb.RecoveryEvent{
+		CommonEventDetails: eventpb.CommonEventDetails{
+			EventType: "recovery_event",
+		},
+		RecoveryType: restoreJobEventType,
+		ResultStatus: string(jobs.StatusFailed),
+		ErrorText:    redact.Sprintf("testing injected failure: %s", "sensitive text"),
+	}
+	requireRecoveryEvent(t, beforeRestore.UnixNano(), restoreJobEventType, expectedRestoreFailEvent)
 }

@@ -522,7 +522,7 @@ func prepareNewTablesForIngestion(
 	}
 	seqVals := make(map[descpb.ID]int64, len(importTables))
 	for _, tableDesc := range importTables {
-		id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		id, err := p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -637,7 +637,7 @@ func (r *importResumer) prepareSchemasForIngestion(
 		// Verification steps have passed, generate a new schema ID. We do this
 		// last because we want to avoid calling GenerateUniqueDescID if there's
 		// any kind of error in the prior stages of import.
-		id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		id, err := p.ExecCfg().DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1398,7 +1398,7 @@ func createNonDropDatabaseChangeJob(
 // been committed from a import that has failed or been canceled. It does this
 // by adding the table descriptors in DROP state, which causes the schema change
 // stuff to delete the keys in the background.
-func (r *importResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}) error {
+func (r *importResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}, _ error) error {
 	p := execCtx.(sql.JobExecContext)
 
 	// Emit to the event log that the job has started reverting.

@@ -961,6 +961,9 @@ func (s *Server) newConnExecutor(
 	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.MakeCollection(ctx, descs.NewTemporarySchemaProvider(sdMutIterator.sds), ex.sessionMon)
 	ex.extraTxnState.txnRewindPos = -1
 	ex.extraTxnState.schemaChangeJobRecords = make(map[descpb.ID]*jobs.Record)
+	ex.extraTxnState.schemaChangerState = SchemaChangerState{
+		mode: ex.sessionData().NewSchemaChangerMode,
+	}
 	ex.queryCancelKey = pgwirecancel.MakeBackendKeyData(ex.rng, ex.server.cfg.NodeInfo.NodeID.SQLInstanceID())
 	ex.mu.ActiveQueries = make(map[clusterunique.ID]*queryMeta)
 	ex.machine = fsm.MakeMachine(TxnStateTransitions, stateNoTxn{}, &ex.state)
@@ -3247,6 +3250,9 @@ func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
 // mutate descriptors prior to committing a SQL transaction.
 func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 	scs := &ex.extraTxnState.schemaChangerState
+	if len(scs.state.Targets) == 0 {
+		return nil
+	}
 	deps := newSchemaChangerTxnRunDependencies(
 		ex.planner.SessionData(),
 		ex.planner.User(),

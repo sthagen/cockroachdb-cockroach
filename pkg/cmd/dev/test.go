@@ -216,6 +216,22 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		testTargets = append(testTargets, target)
 	}
 
+	// Stressing is specifically for go tests. Take a second here to filter
+	// only the go_test targets so we don't end up stressing e.g. a
+	// disallowed_imports_test.
+	if stress {
+		query := fmt.Sprintf("kind('go_test', %s)", strings.Join(testTargets, " + "))
+		goTestLines, err := d.exec.CommandContextSilent(ctx, "bazel", "query", "--output=label", query)
+		if err != nil {
+			return err
+		}
+		testTargets = strings.Split(strings.TrimSpace(string(goTestLines)), "\n")
+		if len(testTargets) == 0 {
+			log.Printf("WARNING: no tests found")
+			return nil
+		}
+	}
+
 	args = append(args, testTargets...)
 	if ignoreCache {
 		args = append(args, "--nocache_test_results")
@@ -281,9 +297,17 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		args = append(args, "--test_arg", "-show-diff")
 	}
 	if timeout > 0 && !stress {
-		args = append(args, fmt.Sprintf("--test_timeout=%d", int(timeout.Seconds())))
+		// If stress is specified, we'll pad the timeout differently below.
 
-		// If stress is specified, we'll pad the timeout below.
+		// The bazel timeout should be higher than the timeout passed to the
+		// test binary (giving it ample time to clean up, 5 seconds is probably
+		// enough).
+		args = append(args, fmt.Sprintf("--test_timeout=%d", 5+int(timeout.Seconds())))
+		args = append(args, "--test_arg", fmt.Sprintf("-test.timeout=%s", timeout.String()))
+
+		// If --test-args '-test.timeout=X' is specified as well, or
+		// -- --test_arg '-test.timeout=X', that'll take precedence further
+		// below.
 	}
 
 	if stress {

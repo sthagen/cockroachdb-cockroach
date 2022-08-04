@@ -13,14 +13,18 @@ package cockroach.cloud.externalconn.connectionpb;
 option go_package = "connectionpb";
 
 import "gogoproto/gogo.proto";
-import "cloud/cloudpb/external_storage.proto";
 
 enum ConnectionProvider {
-  Unknown = 0;
-  nodelocal = 1;
-  gs_kms = 2;
+  Unknown = 0 [(gogoproto.enumvalue_customname) = "TypeUnspecified"];;
+
+  // External Storage providers.
+  nodelocal = 1 [(gogoproto.enumvalue_customname) = "TypeNodelocal"];;
+
+  // KMS providers.
+  gs_kms = 2 [(gogoproto.enumvalue_customname) = "TypeGSKMS"];;
 }
 
+// ConnectionType is the type of the External Connection object.
 enum ConnectionType {
   option (gogoproto.goproto_enum_prefix) = false;
 
@@ -29,19 +33,18 @@ enum ConnectionType {
   KMS = 2 [(gogoproto.enumvalue_customname) = "TypeKMS"];
 }
 
+// SimpleURI encapsulates the information that represents an External Connection
+// object that only relies on a URI to connect.
+message SimpleURI {
+  string uri = 1 [(gogoproto.customname) = "URI"];
+}
+
+// ConnectionsDetails is the byte representation of the resource represented by
+// an External Connection object.
 message ConnectionDetails {
   ConnectionProvider provider = 1;
 
   oneof details {
-    NodelocalConnectionDetails nodelocal = 2;
-    GCSKMSConnectionDetails gcs_kms = 3 [(gogoproto.customname) = "GCSKMS"];
+    SimpleURI simple_uri = 2 [(gogoproto.customname) = "SimpleURI"];
   }
-}
-
-message NodelocalConnectionDetails {
-  cloudpb.LocalFileConfig cfg = 1 [(gogoproto.nullable) = false];
-}
-
-message GCSKMSConnectionDetails {
-  string uri = 1 [(gogoproto.customname) = "URI"];
 }

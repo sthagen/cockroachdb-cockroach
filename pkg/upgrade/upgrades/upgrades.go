@@ -49,66 +49,16 @@ var registry = make(map[clusterversion.ClusterVersion]upgrade.Upgrade)
 
 var upgrades = []upgrade.Upgrade{
 	upgrade.NewTenantUpgrade(
-		"ensure preconditions are met before starting upgrading to v22.1",
-		toCV(clusterversion.Start22_1),
+		"ensure preconditions are met before starting upgrading to v22.2",
+		toCV(clusterversion.Start22_2),
 		preconditionBeforeStartingAnUpgrade,
 		NoTenantUpgradeFunc,
-	),
-	upgrade.NewTenantUpgrade(
-		"add column target to system.protected_ts_records",
-		toCV(clusterversion.AlterSystemProtectedTimestampAddColumn),
-		NoPrecondition,
-		alterTableProtectedTimestampRecords,
-	),
-	upgrade.NewTenantUpgrade("update synthetic public schemas to be backed by a descriptor",
-		toCV(clusterversion.PublicSchemasWithDescriptors),
-		NoPrecondition,
-		publicSchemaMigration,
-	),
-	upgrade.NewTenantUpgrade(
-		"enable span configs infrastructure",
-		toCV(clusterversion.EnsureSpanConfigReconciliation),
-		NoPrecondition,
-		ensureSpanConfigReconciliation,
-	),
-	upgrade.NewSystemUpgrade(
-		"enable span configs infrastructure",
-		toCV(clusterversion.EnsureSpanConfigSubscription),
-		ensureSpanConfigSubscription,
 	),
 	upgrade.NewTenantUpgrade(
 		"remove grant privilege from users",
 		toCV(clusterversion.RemoveGrantPrivilege),
 		NoPrecondition,
 		removeGrantMigration,
-	),
-	upgrade.NewTenantUpgrade(
-		"delete comments that belong to dropped indexes",
-		toCV(clusterversion.DeleteCommentsWithDroppedIndexes),
-		NoPrecondition,
-		ensureCommentsHaveNonDroppedIndexes,
-	),
-	upgrade.NewSystemUpgrade(
-		"populate RangeAppliedState.RaftAppliedIndexTerm for all ranges",
-		toCV(clusterversion.AddRaftAppliedIndexTermMigration),
-		raftAppliedIndexTermMigration,
-	),
-	upgrade.NewSystemUpgrade(
-		"purge all replicas not populating RangeAppliedState.RaftAppliedIndexTerm",
-		toCV(clusterversion.PostAddRaftAppliedIndexTermMigration),
-		postRaftAppliedIndexTermMigration,
-	),
-	upgrade.NewTenantUpgrade(
-		"add the system.span_count table",
-		toCV(clusterversion.SpanCountTable),
-		NoPrecondition,
-		spanCountTableMigration,
-	),
-	upgrade.NewTenantUpgrade(
-		"seed system.span_count with span count for existing tenants",
-		toCV(clusterversion.SeedSpanCountTable),
-		NoPrecondition,
-		seedSpanCountTableMigration,
 	),
 	upgrade.NewTenantUpgrade(
 		"upgrade sequences to be referenced by ID",

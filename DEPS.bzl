@@ -1431,10 +1431,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "8ff485ee42c3f339cddd9f89a72b414c366f7a34ffd8cae633b7583b6b163a11",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20220728172759-1b01c7357532",
+        sha256 = "c147ce5a0d4d67d96953381a21ae08fb2eb7102e8f42bd456cfaf107e19cefab",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20220802160152-a1e7a77e1845",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20220728172759-1b01c7357532.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20220802160152-a1e7a77e1845.zip",
         ],
     )
     go_repository(
@@ -1471,10 +1471,10 @@ def go_deps():
         name = "com_github_cockroachdb_stress",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/stress",
-        sha256 = "ccc4cb7543b7eba12ff82602c85a627a8dba8ecbda67a9a1bf05fb4c56895ba6",
-        strip_prefix = "github.com/cockroachdb/stress@v0.0.0-20220310203902-58fb4627376e",
+        sha256 = "3fda531795c600daf25532a4f98be2a1335cd1e5e182c72789bca79f5f69fcc1",
+        strip_prefix = "github.com/cockroachdb/stress@v0.0.0-20220803192808-1806698b1b7b",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/stress/com_github_cockroachdb_stress-v0.0.0-20220310203902-58fb4627376e.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/stress/com_github_cockroachdb_stress-v0.0.0-20220803192808-1806698b1b7b.zip",
         ],
     )
     go_repository(
@@ -5217,16 +5217,6 @@ def go_deps():
         strip_prefix = "github.com/lib/pq@v1.10.6",
         urls = [
             "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/lib/pq/com_github_lib_pq-v1.10.6.zip",
-        ],
-    )
-    go_repository(
-        name = "com_github_lib_pq_auth_kerberos",
-        build_file_proto_mode = "disable_global",
-        importpath = "github.com/lib/pq/auth/kerberos",
-        sha256 = "26113d1ad535ca1b52b9f093025ea658c6d3f14b617386a0c38115bfaceffdd4",
-        strip_prefix = "github.com/lib/pq/auth/kerberos@v0.0.0-20200720160335-984a6aa1ca46",
-        urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/lib/pq/auth/kerberos/com_github_lib_pq_auth_kerberos-v0.0.0-20200720160335-984a6aa1ca46.zip",
         ],
     )
     go_repository(

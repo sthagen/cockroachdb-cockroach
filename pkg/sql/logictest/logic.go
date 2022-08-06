@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -1611,8 +1612,19 @@ CREATE DATABASE test; USE test;
 		t.Fatal(err)
 	}
 
-	if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", username.TestUser)); err != nil {
-		t.Fatal(err)
+	if !t.cfg.BootstrapVersion.Equal(roachpb.Version{}) && t.cfg.BootstrapVersion.Less(roachpb.Version{Major: 22, Minor: 2}) {
+		// Hacky way to create user with an ID if we're on a
+		// bootstrapped binary less than 22.2. The version gate
+		// causes the regular CREATE USER to fail since it will not
+		// insert an ID.
+		if _, err := t.db.Exec(`INSERT INTO system.users VALUES ($1, '', false, $2);`,
+			username.TestUser, 100); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", username.TestUser)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	t.labelMap = make(map[string]string)
@@ -3606,6 +3618,19 @@ type TestServerArgs struct {
 	ForceProductionValues bool
 	// If set, then sql.distsql.temp_storage.workmem is not randomized.
 	DisableWorkmemRandomization bool
+}
+
+// RunLogicTests runs logic tests for all files matching the given glob.
+func RunLogicTests(
+	t *testing.T, serverArgs TestServerArgs, configIdx logictestbase.ConfigIdx, glob string,
+) {
+	paths, err := filepath.Glob(glob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		RunLogicTest(t, serverArgs, configIdx, p)
+	}
 }
 
 // RunLogicTest is the main entry point for the logic test.

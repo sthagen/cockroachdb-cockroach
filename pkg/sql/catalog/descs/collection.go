@@ -372,7 +372,6 @@ func (tc *Collection) GetObjectNamesAndIDs(
 		return nil, nil, err
 	}
 
-	alreadySeen := make(map[string]bool)
 	var tableNames tree.TableNames
 	var tableIDs descpb.IDs
 
@@ -382,7 +381,6 @@ func (tc *Collection) GetObjectNamesAndIDs(
 		if err != nil {
 			return nil, nil, err
 		}
-		alreadySeen[tableName] = true
 		tn := tree.MakeTableNameWithSchema(tree.Name(dbDesc.GetName()), tree.Name(scName), tree.Name(tableName))
 		tn.ExplicitCatalog = flags.ExplicitPrefix
 		tn.ExplicitSchema = flags.ExplicitPrefix
@@ -433,4 +431,14 @@ func (tc *Collection) AddDeletedDescriptor(id descpb.ID) {
 // should only be called in a multi-tenant environment.
 func (tc *Collection) SetSession(session sqlliveness.Session) {
 	tc.sqlLivenessSession = session
+}
+
+// MakeTestCollection makes a Collection that can be used for tests.
+func MakeTestCollection(ctx context.Context, leaseManager *lease.Manager) Collection {
+	settings := cluster.MakeTestingClusterSettings()
+	return Collection{
+		settings: settings,
+		version:  settings.Version.ActiveVersion(ctx),
+		leased:   makeLeasedDescriptors(leaseManager),
+	}
 }

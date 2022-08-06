@@ -93,6 +93,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -9574,7 +9575,7 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 
 		// Role 'app_role' and user 'app' will be added, and 'app' is granted with 'app_role'
 		// User test will remain untouched with no role granted
-		sqlDBRestore.CheckQueryResults(t, "SELECT * FROM system.users", [][]string{
+		sqlDBRestore.CheckQueryResults(t, "SELECT username, \"hashedPassword\", \"isRole\" FROM system.users", [][]string{
 			{"admin", "", "true"},
 			{"app", "NULL", "false"},
 			{"app_role", "NULL", "true"},
@@ -9607,17 +9608,16 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 	defer cleanupEmptyCluster1()
 	t.Run("restore-from-backup-with-no-system-role-members", func(t *testing.T) {
 		sqlDBRestore1.Exec(t, "RESTORE SYSTEM USERS FROM $1", localFoo+"/3")
-
-		sqlDBRestore1.CheckQueryResults(t, "SELECT * FROM system.users", [][]string{
-			{"admin", "", "true"},
-			{"app", "NULL", "false"},
-			{"app_role", "NULL", "true"},
-			{"root", "", "false"},
-			{"test", "NULL", "false"},
-			{"test_role", "NULL", "true"},
-		})
-		sqlDBRestore1.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{
+		sqlDBRestore1.CheckQueryResults(t, "SELECT \"role\", \"member\", \"isAdmin\" FROM system.role_members", [][]string{
 			{"admin", "root", "true"},
+		})
+		sqlDBRestore1.CheckQueryResults(t, "SELECT username, \"hashedPassword\", \"isRole\", \"user_id\" FROM system.users", [][]string{
+			{"admin", "", "true", "2"},
+			{"app", "NULL", "false", "100"},
+			{"app_role", "NULL", "true", "101"},
+			{"root", "", "false", "1"},
+			{"test", "NULL", "false", "102"},
+			{"test_role", "NULL", "true", "103"},
 		})
 		sqlDBRestore1.CheckQueryResults(t, "SHOW USERS", [][]string{
 			{"admin", "", "{}"},
@@ -9626,6 +9626,35 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 			{"root", "", "{admin}"},
 			{"test", "", "{}"},
 			{"test_role", "", "{}"},
+		})
+	})
+	_, sqlDBRestore2, cleanupEmptyCluster2 := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	defer cleanupEmptyCluster2()
+	t.Run("restore-from-backup-with-existing-user", func(t *testing.T) {
+		// Create testuser and verify that the system user ids are
+		// allocated properly in the restore.
+		sqlDBRestore2.Exec(t, "CREATE USER testuser")
+		sqlDBRestore2.Exec(t, "RESTORE SYSTEM USERS FROM $1", localFoo+"/3")
+		sqlDBRestore2.CheckQueryResults(t, "SELECT \"role\", \"member\", \"isAdmin\" FROM system.role_members", [][]string{
+			{"admin", "root", "true"},
+		})
+		sqlDBRestore2.CheckQueryResults(t, "SELECT username, \"hashedPassword\", \"isRole\", \"user_id\" FROM system.users", [][]string{
+			{"admin", "", "true", "2"},
+			{"app", "NULL", "false", "101"},
+			{"app_role", "NULL", "true", "102"},
+			{"root", "", "false", "1"},
+			{"test", "NULL", "false", "103"},
+			{"test_role", "NULL", "true", "104"},
+			{"testuser", "NULL", "false", "100"},
+		})
+		sqlDBRestore2.CheckQueryResults(t, "SHOW USERS", [][]string{
+			{"admin", "", "{}"},
+			{"app", "", "{}"},
+			{"app_role", "", "{}"},
+			{"root", "", "{admin}"},
+			{"test", "", "{}"},
+			{"test_role", "", "{}"},
+			{"testuser", "", "{}"},
 		})
 	})
 }
@@ -10191,7 +10220,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 	sqlDB.Exec(t, `BACKUP DATABASE r1, r2 INTO  ($1, $2) AS OF SYSTEM TIME '-1ms' WITH revision_history`, loc1, loc2)
 
 	expectedBackupEvent := eventpb.RecoveryEvent{
-		CommonEventDetails: eventpb.CommonEventDetails{
+		CommonEventDetails: logpb.CommonEventDetails{
 			EventType: "recovery_event",
 		},
 		RecoveryType:            backupEventType,
@@ -10208,7 +10237,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 	// Also verify that there's a telemetry event corresponding to the completion
 	// of the job.
 	expectedBackupJobEvent := eventpb.RecoveryEvent{
-		CommonEventDetails: eventpb.CommonEventDetails{
+		CommonEventDetails: logpb.CommonEventDetails{
 			EventType: "recovery_event",
 		},
 		RecoveryType: backupJobEventType,
@@ -10225,7 +10254,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 	sqlDB.Exec(t, restoreQuery, loc1, loc2, "r2")
 
 	expectedRestoreEvent := eventpb.RecoveryEvent{
-		CommonEventDetails: eventpb.CommonEventDetails{
+		CommonEventDetails: logpb.CommonEventDetails{
 			EventType: "recovery_event",
 		},
 		RecoveryType:            restoreEventType,
@@ -10242,7 +10271,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 	// Also verify that there's a telemetry event corresponding to the completion
 	// of the job.
 	expectedRestoreJobEvent := eventpb.RecoveryEvent{
-		CommonEventDetails: eventpb.CommonEventDetails{
+		CommonEventDetails: logpb.CommonEventDetails{
 			EventType: "recovery_event",
 		},
 		RecoveryType: restoreJobEventType,
@@ -10260,7 +10289,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 	beforeRestore = timeutil.Now()
 	sqlDB.ExpectErrSucceedsSoon(t, "testing injected failure", restoreQuery, loc1, loc2, "r2")
 	expectedRestoreFailEvent := eventpb.RecoveryEvent{
-		CommonEventDetails: eventpb.CommonEventDetails{
+		CommonEventDetails: logpb.CommonEventDetails{
 			EventType: "recovery_event",
 		},
 		RecoveryType: restoreJobEventType,

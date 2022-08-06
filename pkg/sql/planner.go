@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -352,6 +353,7 @@ func newInternalPlanner(
 	p.semaCtx = tree.MakeSemaContext()
 	p.semaCtx.SearchPath = &sd.SearchPath
 	p.semaCtx.TypeResolver = p
+	p.semaCtx.FunctionResolver = p
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
 
@@ -913,4 +915,9 @@ func (p *planner) QueryIteratorEx(
 	ie := p.ExecCfg().InternalExecutorFactory(ctx, p.SessionData())
 	rows, err := ie.QueryIteratorEx(ctx, opName, p.Txn(), override, stmt, qargs...)
 	return rows.(eval.InternalRows), err
+}
+
+// IsActive implements the Planner interface.
+func (p *planner) IsActive(ctx context.Context, key clusterversion.Key) bool {
+	return p.execCfg.Settings.Version.IsActive(ctx, key)
 }

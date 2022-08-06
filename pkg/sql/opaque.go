@@ -106,6 +106,16 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.AlterDatabaseDropSecondaryRegion(ctx, n)
 	case *tree.AlterDefaultPrivileges:
 		return p.alterDefaultPrivileges(ctx, n)
+	case *tree.AlterFunctionOptions:
+		return p.AlterFunctionOptions(ctx, n)
+	case *tree.AlterFunctionRename:
+		return p.AlterFunctionRename(ctx, n)
+	case *tree.AlterFunctionSetOwner:
+		return p.AlterFunctionSetOwner(ctx, n)
+	case *tree.AlterFunctionSetSchema:
+		return p.AlterFunctionSetSchema(ctx, n)
+	case *tree.AlterFunctionDepExtension:
+		return p.AlterFunctionDepExtension(ctx, n)
 	case *tree.AlterIndex:
 		return p.AlterIndex(ctx, n)
 	case *tree.AlterSchema:
@@ -168,6 +178,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.Discard(ctx, n)
 	case *tree.DropDatabase:
 		return p.DropDatabase(ctx, n)
+	case *tree.DropFunction:
+		return p.DropFunction(ctx, n)
 	case *tree.DropIndex:
 		return p.DropIndex(ctx, n)
 	case *tree.DropOwnedBy:
@@ -244,6 +256,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.ShowZoneConfig(ctx, n)
 	case *tree.ShowFingerprints:
 		return p.ShowFingerprints(ctx, n)
+	case *tree.ShowTransactionStatus:
+		return p.ShowVar(ctx, &tree.ShowVar{Name: "transaction_status"})
 	case *tree.Truncate:
 		return p.Truncate(ctx, n)
 	case tree.CCLOnlyStatement:
@@ -273,6 +287,11 @@ func init() {
 		&tree.AlterDatabaseSecondaryRegion{},
 		&tree.AlterDatabaseDropSecondaryRegion{},
 		&tree.AlterDefaultPrivileges{},
+		&tree.AlterFunctionOptions{},
+		&tree.AlterFunctionRename{},
+		&tree.AlterFunctionSetOwner{},
+		&tree.AlterFunctionSetSchema{},
+		&tree.AlterFunctionDepExtension{},
 		&tree.AlterIndex{},
 		&tree.AlterSchema{},
 		&tree.AlterTable{},
@@ -304,6 +323,7 @@ func init() {
 		&tree.Discard{},
 		&tree.DropDatabase{},
 		&tree.DropExternalConnection{},
+		&tree.DropFunction{},
 		&tree.DropIndex{},
 		&tree.DropOwnedBy{},
 		&tree.DropRole{},
@@ -342,6 +362,7 @@ func init() {
 		&tree.ShowZoneConfig{},
 		&tree.ShowFingerprints{},
 		&tree.ShowVar{},
+		&tree.ShowTransactionStatus{},
 		&tree.Truncate{},
 
 		// CCL statements (without Export which has an optimizer operator).

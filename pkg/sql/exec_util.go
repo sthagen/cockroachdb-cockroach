@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/cacheutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -532,6 +533,12 @@ var settingWorkMemBytes = settings.RegisterByteSizeSetting(
 	"sql.distsql.temp_storage.workmem",
 	"maximum amount of memory in bytes a processor can use before falling back to temp storage",
 	execinfra.DefaultMemoryLimit, /* 64MiB */
+	func(v int64) error {
+		if v <= 1 {
+			return errors.Errorf("can only be set to a value greater than 1: %d", v)
+		}
+		return nil
+	},
 ).WithPublic()
 
 // ExperimentalDistSQLPlanningClusterSettingName is the name for the cluster
@@ -1310,6 +1317,9 @@ type ExecutorConfig struct {
 
 	// DescIDGenerator generates unique descriptor IDs.
 	DescIDGenerator eval.DescIDGenerator
+
+	// SyntheticPrivilegeCache
+	SyntheticPrivilegeCache *cacheutil.Cache
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1715,6 +1725,14 @@ func golangFillQueryArguments(args ...interface{}) (tree.Datums, error) {
 					a := tree.NewDArray(types.String)
 					for v := 0; v < val.Len(); v++ {
 						if err := a.Append(tree.NewDString(val.Index(v).String())); err != nil {
+							return nil, err
+						}
+					}
+					d = a
+				case val.Type().Elem().Kind() == reflect.Int:
+					a := tree.NewDArray(types.Int)
+					for v := 0; v < val.Len(); v++ {
+						if err := a.Append(tree.NewDInt(tree.DInt(val.Index(v).Int()))); err != nil {
 							return nil, err
 						}
 					}

@@ -1431,10 +1431,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "c147ce5a0d4d67d96953381a21ae08fb2eb7102e8f42bd456cfaf107e19cefab",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20220802160152-a1e7a77e1845",
+        sha256 = "b512e5f3fb6982aa33c84203c3053ff698c76af14b657d8ada01d26cbf4b3d60",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20220805222512-eb306b9cf882",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20220802160152-a1e7a77e1845.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20220805222512-eb306b9cf882.zip",
         ],
     )
     go_repository(
@@ -6167,6 +6167,16 @@ def go_deps():
         strip_prefix = "github.com/niemeyer/pretty@v0.0.0-20200227124842-a10e7caefd8e",
         urls = [
             "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/niemeyer/pretty/com_github_niemeyer_pretty-v0.0.0-20200227124842-a10e7caefd8e.zip",
+        ],
+    )
+    go_repository(
+        name = "com_github_nightlyone_lockfile",
+        build_file_proto_mode = "disable_global",
+        importpath = "github.com/nightlyone/lockfile",
+        sha256 = "0abd22d55b704c18426167732414806b2a70d99bce65fa9f943cb88c185689ad",
+        strip_prefix = "github.com/nightlyone/lockfile@v1.0.0",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/nightlyone/lockfile/com_github_nightlyone_lockfile-v1.0.0.zip",
         ],
     )
     go_repository(

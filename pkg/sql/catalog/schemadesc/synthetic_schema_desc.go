@@ -17,8 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -130,8 +132,8 @@ func (p synthetic) GetName() string {
 }
 
 // GetObjectType implements the PrivilegeObject interface.
-func (p synthetic) GetObjectType() string {
-	return string(p.DescriptorType())
+func (p synthetic) GetObjectType() privilege.ObjectType {
+	return privilege.Schema
 }
 
 // GetPrivilegeDescriptor implements the PrivilegeObject interface.
@@ -146,10 +148,16 @@ func (p synthetic) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescr
 	return catprivilege.MakeDefaultPrivileges(catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_SCHEMA))
 }
 
+// GetFunction implements the SchemaDescriptor interface.
 func (p synthetic) GetFunction(name string) (descpb.SchemaDescriptor_Function, bool) {
 	return descpb.SchemaDescriptor_Function{}, false
 }
 
 func (p synthetic) ContainsUserDefinedTypes() bool {
 	return false
+}
+
+// GetResolvedFuncDefinition implements the SchemaDescriptor interface.
+func (p synthetic) GetResolvedFuncDefinition(name string) (*tree.ResolvedFunctionDefinition, bool) {
+	return nil, false
 }

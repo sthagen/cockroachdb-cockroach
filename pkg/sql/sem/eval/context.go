@@ -153,6 +153,8 @@ type Context struct {
 
 	JoinTokenCreator JoinTokenCreator
 
+	Gossip GossipOperator
+
 	PreparedStatementState PreparedStatementState
 
 	// The transaction in which the statement is executing.
@@ -188,6 +190,8 @@ type Context struct {
 	SQLLivenessReader sqlliveness.Reader
 
 	SQLStatsController SQLStatsController
+
+	SchemaTelemetryController SchemaTelemetryController
 
 	IndexUsageStatsController IndexUsageStatsController
 

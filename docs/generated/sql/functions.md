@@ -3023,6 +3023,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.create_session_revival_token"></a><code>crdb_internal.create_session_revival_token() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Generate a token that can be used to create a new session for the current user.</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.create_sql_schema_telemetry_job"></a><code>crdb_internal.create_sql_schema_telemetry_job() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used to create a schema telemetry job instance.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.decode_cluster_setting"></a><code>crdb_internal.decode_cluster_setting(setting: <a href="string.html">string</a>, value: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Decodes the given encoded value for a cluster setting.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.deserialize_session"></a><code>crdb_internal.deserialize_session(session: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function deserializes the serialized variables into the current session.</p>
@@ -3138,6 +3140,8 @@ table. Returns an error if validation fails.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.trim_tenant_prefix"></a><code>crdb_internal.trim_tenant_prefix(keys: <a href="bytes.html">bytes</a>[]) &rarr; <a href="bytes.html">bytes</a>[]</code></td><td><span class="funcdesc"><p>This function assumes the given bytes are a CockroachDB key and trims any tenant prefix from the key.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="crdb_internal.unsafe_clear_gossip_info"></a><code>crdb_internal.unsafe_clear_gossip_info(key: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.validate_session_revival_token"></a><code>crdb_internal.validate_session_revival_token(token: <a href="bytes.html">bytes</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Validate a token that was created by create_session_revival_token. Intended for testing.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.validate_ttl_scheduled_jobs"></a><code>crdb_internal.validate_ttl_scheduled_jobs() &rarr; void</code></td><td><span class="funcdesc"><p>Validate all TTL tables have a valid scheduled job attached.</p>

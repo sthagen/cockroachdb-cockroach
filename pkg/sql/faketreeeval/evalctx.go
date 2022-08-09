@@ -389,6 +389,13 @@ func (ep *DummyEvalPlanner) EvalSubquery(expr *tree.Subquery) (tree.Datum, error
 	return nil, errors.WithStack(errEvalPlanner)
 }
 
+// EvalRoutineExpr is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) EvalRoutineExpr(
+	ctx context.Context, expr *tree.RoutineExpr,
+) (tree.Datum, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
 // ResolveTypeByOID implements the tree.TypeReferenceResolver interface.
 func (ep *DummyEvalPlanner) ResolveTypeByOID(_ context.Context, _ oid.Oid) (*types.T, error) {
 	return nil, errors.WithStack(errEvalPlanner)
@@ -426,6 +433,20 @@ func (ep *DummyEvalPlanner) QueryIteratorEx(
 // IsActive is part of the Planner interface.
 func (ep *DummyEvalPlanner) IsActive(_ context.Context, _ clusterversion.Key) bool {
 	return true
+}
+
+// ResolveFunction implements FunctionReferenceResolver interface.
+func (ep *DummyEvalPlanner) ResolveFunction(
+	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
+) (*tree.ResolvedFunctionDefinition, error) {
+	return nil, errors.AssertionFailedf("ResolveFunction unimplemented")
+}
+
+// ResolveFunctionByOID implements FunctionReferenceResolver interface.
+func (ep *DummyEvalPlanner) ResolveFunctionByOID(
+	ctx context.Context, oid oid.Oid,
+) (string, *tree.Overload, error) {
+	return "", nil, errors.AssertionFailedf("ResolveFunctionByOID unimplemented")
 }
 
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.

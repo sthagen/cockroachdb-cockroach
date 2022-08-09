@@ -4988,6 +4988,27 @@ value if you rely on the HLC for accuracy.`,
 		},
 	),
 
+	"crdb_internal.unsafe_clear_gossip_info": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"key", types.String}},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				key, ok := tree.AsDString(args[0])
+				if !ok {
+					return nil, errors.Newf("expected string value, got %T", args[0])
+				}
+				ok, err := ctx.Gossip.TryClearGossipInfo(ctx.Context, string(key))
+				if err != nil {
+					return nil, err
+				}
+				return tree.MakeDBool(tree.DBool(ok)), nil
+			},
+			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility: volatility.Volatile,
+		},
+	),
+
 	"crdb_internal.encode_key": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
@@ -6814,6 +6835,41 @@ table's zone configuration this will return NULL.`,
 				return tree.DBoolTrue, nil
 			},
 			Info:       "This function is used to start a SQL stats compaction job.",
+			Volatility: volatility.Volatile,
+		},
+	),
+
+	builtinconstants.CreateSchemaTelemetryJobBuiltinName: makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if evalCtx.SchemaTelemetryController == nil {
+					return nil, errors.AssertionFailedf("schema telemetry controller not set")
+				}
+				ctx := evalCtx.Ctx()
+				// The user must be an admin to use this builtin.
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errInsufficientPriv
+				}
+				id, err := evalCtx.SchemaTelemetryController.CreateSchemaTelemetryJob(
+					ctx,
+					builtinconstants.CreateSchemaTelemetryJobBuiltinName,
+					int64(evalCtx.NodeID.SQLInstanceID()),
+				)
+				if err != nil {
+					return tree.DNull, err
+				}
+				return tree.NewDInt(tree.DInt(id)), nil
+			},
+			Info:       "This function is used to create a schema telemetry job instance.",
 			Volatility: volatility.Volatile,
 		},
 	),

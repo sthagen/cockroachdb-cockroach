@@ -190,6 +190,7 @@ type TypeResolver interface {
 type Planner interface {
 	DatabaseCatalog
 	TypeResolver
+	tree.FunctionReferenceResolver
 
 	// ExecutorConfig returns *ExecutorConfig
 	ExecutorConfig() interface{}
@@ -201,6 +202,9 @@ type Planner interface {
 
 	// EvalSubquery returns the Datum for the given subquery node.
 	EvalSubquery(expr *tree.Subquery) (tree.Datum, error)
+
+	// EvalRoutineExpr evaluates a routine and returns the resulting datum.
+	EvalRoutineExpr(ctx context.Context, expr *tree.RoutineExpr) (tree.Datum, error)
 
 	// UnsafeUpsertDescriptor is used to repair descriptors in dire
 	// circumstances. See the comment on the planner implementation.
@@ -531,12 +535,28 @@ type JoinTokenCreator interface {
 	CreateJoinToken(ctx context.Context) (string, error)
 }
 
+// GossipOperator is capable of manipulating the cluster's gossip network. The
+// methods will return errors when run by any tenant other than the system
+// tenant.
+type GossipOperator interface {
+	// TryClearGossipInfo attempts to clear an info object from the cluster's
+	// gossip network.
+	TryClearGossipInfo(ctx context.Context, key string) (bool, error)
+}
+
 // SQLStatsController is an interface embedded in EvalCtx which can be used by
 // the builtins to reset SQL stats in the cluster. This interface is introduced
 // to avoid circular dependency.
 type SQLStatsController interface {
 	ResetClusterSQLStats(ctx context.Context) error
 	CreateSQLStatsCompactionSchedule(ctx context.Context) error
+}
+
+// SchemaTelemetryController is an interface embedded in EvalCtx which can be
+// used by the builtins to create a job schedule for schema telemetry jobs.
+// This interface is introduced to avoid circular dependency.
+type SchemaTelemetryController interface {
+	CreateSchemaTelemetryJob(ctx context.Context, createdByName string, createdByID int64) (int64, error)
 }
 
 // IndexUsageStatsController is an interface embedded in EvalCtx which can be

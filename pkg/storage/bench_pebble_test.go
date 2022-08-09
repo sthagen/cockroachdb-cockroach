@@ -65,7 +65,7 @@ func BenchmarkMVCCScan_Pebble(b *testing.B) {
 				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
 					for _, valueSize := range []int{8, 64, 512} {
 						b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
-							for _, numRangeKeys := range []int{0, 1} { // TODO(erikgrinaker): 100
+							for _, numRangeKeys := range []int{0, 1, 100} {
 								b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
 									runMVCCScan(ctx, b, setupMVCCPebble, benchScanOptions{
 										benchDataOptions: benchDataOptions{
@@ -78,6 +78,32 @@ func BenchmarkMVCCScan_Pebble(b *testing.B) {
 									})
 								})
 							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkMVCCScanGarbage_Pebble(b *testing.B) {
+	skip.UnderShort(b)
+	ctx := context.Background()
+	for _, numRows := range []int{1, 10, 100, 1000, 10000, 50000} {
+		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
+			for _, numVersions := range []int{1, 2, 10, 100, 1000} {
+				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
+					for _, numRangeKeys := range []int{0, 1, 100} {
+						b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
+							runMVCCScan(ctx, b, setupMVCCPebble, benchScanOptions{
+								benchDataOptions: benchDataOptions{
+									numVersions:  numVersions,
+									numRangeKeys: numRangeKeys,
+									garbage:      true,
+								},
+								numRows: numRows,
+								reverse: false,
+							})
 						})
 					}
 				})
@@ -130,7 +156,7 @@ func BenchmarkMVCCReverseScan_Pebble(b *testing.B) {
 				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
 					for _, valueSize := range []int{8, 64, 512} {
 						b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
-							for _, numRangeKeys := range []int{0, 1} { // TODO(erikgrinaker): 100
+							for _, numRangeKeys := range []int{0, 1, 100} {
 								b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
 									runMVCCScan(ctx, b, setupMVCCPebble, benchScanOptions{
 										benchDataOptions: benchDataOptions{
@@ -172,7 +198,7 @@ func BenchmarkMVCCGet_Pebble(b *testing.B) {
 				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
 					for _, valueSize := range []int{8} {
 						b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
-							for _, numRangeKeys := range []int{0, 1} { // TODO(erikgrinaker): 100
+							for _, numRangeKeys := range []int{0, 1, 100} {
 								b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
 									runMVCCGet(ctx, b, setupMVCCPebble, benchDataOptions{
 										numVersions:  numVersions,
@@ -194,7 +220,7 @@ func BenchmarkMVCCComputeStats_Pebble(b *testing.B) {
 	ctx := context.Background()
 	for _, valueSize := range []int{8, 32, 256} {
 		b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
-			for _, numRangeKeys := range []int{0, 1} { // TODO(erikgrinaker): 100
+			for _, numRangeKeys := range []int{0, 1, 100} {
 				b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
 					runMVCCComputeStats(ctx, b, setupMVCCPebble, valueSize, numRangeKeys)
 				})
@@ -357,6 +383,24 @@ func BenchmarkMVCCDeleteRange_Pebble(b *testing.B) {
 	for _, valueSize := range []int{8, 32, 256} {
 		b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
 			runMVCCDeleteRange(ctx, b, setupMVCCPebble, valueSize)
+		})
+	}
+}
+
+func BenchmarkMVCCDeleteRangeUsingTombstone_Pebble(b *testing.B) {
+	skip.UnderShort(b)
+	ctx := context.Background()
+	for _, numKeys := range []int{1000, 10000, 100000} {
+		b.Run(fmt.Sprintf("numKeys=%d", numKeys), func(b *testing.B) {
+			for _, valueSize := range []int{64} {
+				b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
+					for _, entireRange := range []bool{false, true} {
+						b.Run(fmt.Sprintf("entireRange=%t", entireRange), func(b *testing.B) {
+							runMVCCDeleteRangeUsingTombstone(ctx, b, setupMVCCPebble, numKeys, valueSize, entireRange)
+						})
+					}
+				})
+			}
 		})
 	}
 }

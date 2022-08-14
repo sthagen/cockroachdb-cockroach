@@ -7,8 +7,10 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/cloud/amazon",
         "//pkg/cloud/gcp",
         "//pkg/cloud/nodelocal",
+        "//pkg/cloud/userfile",
     ],
 )
 

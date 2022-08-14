@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -386,6 +387,21 @@ var optUseMultiColStatsClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.optimizer_use_multicol_stats.enabled",
 	"default value for optimizer_use_multicol_stats session setting; enables usage of multi-column stats in the optimizer by default",
 	true,
+).WithPublic()
+
+// optUseNotVisibleIndexesClusterMode controls the cluster default for whether
+// not visible indexes can still be chosen by the optimizer for query plans. If
+// enabled, the optimizer will treat not visible indexes as they are visible.
+// Note that not visible indexes remain not visible, but the optimizer will
+// disable not visible index feature. If disabled, optimizer will ignore not
+// visible indexes unless it is explicitly selected with force index or for
+// constraint check.
+var optUseNotVisibleIndexesClusterMode = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.defaults.optimizer_use_not_visible_indexes.enabled",
+	"default value for optimizer_use_not_visible_indexes session setting; "+
+		"disable usage of not visible indexes in the optimizer by default",
+	false,
 ).WithPublic()
 
 // localityOptimizedSearchMode controls the cluster default for the use of
@@ -1212,6 +1228,7 @@ type ExecutorConfig struct {
 	SpanConfigTestingKnobs               *spanconfig.TestingKnobs
 	CaptureIndexUsageStatsKnobs          *scheduledlogging.CaptureIndexUsageStatsTestingKnobs
 	UnusedIndexRecommendationsKnobs      *idxusage.UnusedIndexRecommendationTestingKnobs
+	ExternalConnectionTestingKnobs       *externalconn.TestingKnobs
 
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
@@ -1306,7 +1323,7 @@ type ExecutorConfig struct {
 	// InternalExecutorFactory is used to create an InternalExecutor binded with
 	// SessionData and other ExtraTxnState.
 	// This is currently only for builtin functions where we need to execute sql.
-	InternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
+	InternalExecutorFactory sqlutil.InternalExecutorFactory
 
 	// ConsistencyChecker is to generate the results in calls to
 	// crdb_internal.check_consistency.
@@ -1485,6 +1502,10 @@ type ExecutorTestingKnobs struct {
 	// to use a transaction, and, in doing so, more deterministically allocate
 	// descriptor IDs at the cost of decreased parallelism.
 	UseTransactionalDescIDGenerator bool
+
+	// NoStatsCollectionWithVerboseTracing is used to disable the execution
+	// statistics collection in presence of the verbose tracing.
+	NoStatsCollectionWithVerboseTracing bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -3029,6 +3050,10 @@ func (m *sessionDataMutator) SetOptimizerUseHistograms(val bool) {
 
 func (m *sessionDataMutator) SetOptimizerUseMultiColStats(val bool) {
 	m.data.OptimizerUseMultiColStats = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseNotVisibleIndexes(val bool) {
+	m.data.OptimizerUseNotVisibleIndexes = val
 }
 
 func (m *sessionDataMutator) SetLocalityOptimizedSearch(val bool) {

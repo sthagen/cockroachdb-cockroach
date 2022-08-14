@@ -57,6 +57,12 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+var changefeedRetryOptions = retry.Options{
+	InitialBackoff: 5 * time.Millisecond,
+	Multiplier:     2,
+	MaxBackoff:     10 * time.Second,
+}
+
 // featureChangefeedEnabled is used to enable and disable the CHANGEFEED feature.
 var featureChangefeedEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
@@ -196,10 +202,38 @@ func changefeedPlanHook(
 
 			telemetry.Count(`changefeed.create.core`)
 			logChangefeedCreateTelemetry(ctx, jr)
-			err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh)
-			if err != nil {
-				telemetry.Count(`changefeed.core.error`)
+
+			var err error
+			for r := retry.StartWithCtx(ctx, changefeedRetryOptions); r.Next(); {
+				if err = distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh); err == nil {
+					return nil
+				}
+
+				if knobs, ok := p.ExecCfg().DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs); ok {
+					if knobs != nil && knobs.HandleDistChangefeedError != nil {
+						err = knobs.HandleDistChangefeedError(err)
+					}
+				}
+
+				if !changefeedbase.IsRetryableError(err) {
+					log.Warningf(ctx, `CHANGEFEED returning with error: %+v`, err)
+					return err
+				}
+
+				// Check for a schemachange boundary timestamp returned via a
+				// retryable error. Retrying without updating the changefeed progress
+				// will result in the changefeed performing the schema change again,
+				// causing an infinite loop.
+				if ts, ok := changefeedbase.MaybeGetRetryableErrorTimestamp(err); ok {
+					progress = jobspb.Progress{
+						Progress: &jobspb.Progress_HighWater{HighWater: &ts},
+						Details: &jobspb.Progress_Changefeed{
+							Changefeed: &jobspb.ChangefeedProgress{},
+						},
+					}
+				}
 			}
+			telemetry.Count(`changefeed.core.error`)
 			return changefeedbase.MaybeStripRetryableErrorMarker(err)
 		}
 
@@ -395,6 +429,15 @@ func createChangefeedJobRecord(
 		// TODO: Set the default envelope to row here when using a sink and format
 		// that support it.
 		details.Select = cdceval.AsStringUnredacted(normalized.Clause())
+
+		// TODO(#85143): do not enforce schema_change_policy='stop' for changefeed expressions.
+		schemachangeOptions, err := opts.GetSchemaChangeHandlingOptions()
+		if err != nil {
+			return nil, err
+		}
+		if schemachangeOptions.Policy != changefeedbase.OptSchemaChangePolicyStop {
+			return nil, errors.Errorf(`using "AS SELECT" requires option schema_change_policy='stop'`)
+		}
 	}
 
 	// TODO(dan): In an attempt to present the most helpful error message to the
@@ -934,15 +977,10 @@ func (b *changefeedResumer) resumeWithRetries(
 	// bubbles up to this level, we'd like to "retry" the flow if possible. This
 	// could be because the sink is down or because a cockroach node has crashed
 	// or for many other reasons.
-	opts := retry.Options{
-		InitialBackoff: 5 * time.Millisecond,
-		Multiplier:     2,
-		MaxBackoff:     10 * time.Second,
-	}
 	var err error
 	var lastRunStatusUpdate time.Time
 
-	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+	for r := retry.StartWithCtx(ctx, changefeedRetryOptions); r.Next(); {
 		// startedCh is normally used to signal back to the creator of the job that
 		// the job has started; however, in this case nothing will ever receive
 		// on the channel, causing the changefeed flow to block. Replace it with
@@ -959,7 +997,7 @@ func (b *changefeedResumer) resumeWithRetries(
 			}
 		}
 
-		// Retry changefeed is error is retryable.  In addition, we want to handle
+		// Retry changefeed if error is retryable.  In addition, we want to handle
 		// context cancellation as retryable, but only if the resumer context has not been cancelled.
 		// (resumer context is canceled by the jobs framework -- so we should respect it).
 		isRetryableErr := changefeedbase.IsRetryableError(err) ||
@@ -1104,7 +1142,7 @@ func getQualifiedTableName(
 func getQualifiedTableNameObj(
 	ctx context.Context, execCfg *sql.ExecutorConfig, txn *kv.Txn, desc catalog.TableDescriptor,
 ) (tree.TableName, error) {
-	col := execCfg.CollectionFactory.MakeCollection(ctx, nil /* TemporarySchemaProvider */, nil /* monitor */)
+	col := execCfg.CollectionFactory.NewCollection(ctx, nil /* TemporarySchemaProvider */, nil /* monitor */)
 	dbDesc, err := col.Direct().MustGetDatabaseDescByID(ctx, txn, desc.GetParentID())
 	if err != nil {
 		return tree.TableName{}, err

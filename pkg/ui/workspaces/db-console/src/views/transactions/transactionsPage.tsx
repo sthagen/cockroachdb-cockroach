@@ -31,14 +31,14 @@ import {
   TransactionsPageRootProps,
 } from "@cockroachlabs/cluster-ui";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
-import { globalTimeScaleLocalSetting } from "src/redux/globalTimeScale";
 import { setGlobalTimeScaleAction } from "src/redux/statements";
 import { LocalSetting } from "src/redux/localsettings";
 import { bindActionCreators } from "redux";
 import {
-  activeTransactionsPageActions,
+  activeTransactionsPageActionCreators,
   mapStateToActiveTransactionsPageProps,
 } from "./activeTransactionsSelectors";
+import { selectTimeScale } from "src/redux/timeScale";
 
 // selectStatements returns the array of AggregateStatistics to show on the
 // TransactionsPage, based on if the appAttr route parameter is set.
@@ -139,7 +139,7 @@ const TransactionsPageConnected = withRouter(
         ...props,
         columns: transactionColumnsLocalSetting.selectorToArray(state),
         data: selectData(state),
-        timeScale: globalTimeScaleLocalSetting.selector(state),
+        timeScale: selectTimeScale(state),
         error: selectLastError(state),
         filters: filtersLocalSetting.selector(state),
         lastReset: selectLastReset(state),
@@ -156,7 +156,7 @@ const TransactionsPageConnected = withRouter(
         dispatch,
       ),
       activePageProps: bindActionCreators(
-        activeTransactionsPageActions,
+        activeTransactionsPageActionCreators,
         dispatch,
       ),
     }),

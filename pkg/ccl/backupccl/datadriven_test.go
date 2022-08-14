@@ -13,6 +13,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
@@ -77,26 +76,24 @@ type sqlDBKey struct {
 }
 
 type datadrivenTestState struct {
-	servers map[string]serverutils.TestServerInterface
-	// tempObjectCleanupAndWait is a mapping from server name to a method that can
-	// be used to nudge and wait for temporary object cleanup.
-	tempObjectCleanupAndWait map[string]func()
-	dataDirs                 map[string]string
-	sqlDBs                   map[sqlDBKey]*gosql.DB
-	jobTags                  map[string]jobspb.JobID
-	clusterTimestamps        map[string]string
-	noticeBuffer             []string
-	cleanupFns               []func()
+	servers           map[string]serverutils.TestServerInterface
+	dataDirs          map[string]string
+	sqlDBs            map[sqlDBKey]*gosql.DB
+	jobTags           map[string]jobspb.JobID
+	clusterTimestamps map[string]string
+	noticeBuffer      []string
+	cleanupFns        []func()
+	vars              map[string]string
 }
 
 func newDatadrivenTestState() datadrivenTestState {
 	return datadrivenTestState{
-		servers:                  make(map[string]serverutils.TestServerInterface),
-		tempObjectCleanupAndWait: make(map[string]func()),
-		dataDirs:                 make(map[string]string),
-		sqlDBs:                   make(map[sqlDBKey]*gosql.DB),
-		jobTags:                  make(map[string]jobspb.JobID),
-		clusterTimestamps:        make(map[string]string),
+		servers:           make(map[string]serverutils.TestServerInterface),
+		dataDirs:          make(map[string]string),
+		sqlDBs:            make(map[sqlDBKey]*gosql.DB),
+		jobTags:           make(map[string]jobspb.JobID),
+		clusterTimestamps: make(map[string]string),
+		vars:              make(map[string]string),
 	}
 }
 
@@ -114,18 +111,12 @@ func (d *datadrivenTestState) cleanup(ctx context.Context) {
 }
 
 type serverCfg struct {
-	name  string
-	iodir string
-	// nudgeTempObjectsCleanup is a channel used to nudge the temporary object
-	// reconciliation job to run.
-	nudgeTempObjectsCleanup chan time.Time
-	// tempObjectCleanupDone is the channel used by the temporary object
-	// reconciliation job to signal it is done cleaning up.
-	tempObjectCleanupDone chan struct{}
-	nodes                 int
-	splits                int
-	ioConf                base.ExternalIODirConfig
-	localities            string
+	name       string
+	iodir      string
+	nodes      int
+	splits     int
+	ioConf     base.ExternalIODirConfig
+	localities string
 }
 
 func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
@@ -135,17 +126,6 @@ func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
 	params.ServerArgs.ExternalIODirConfig = cfg.ioConf
 	params.ServerArgs.Knobs = base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-	}
-
-	// If the server needs to control temporary object cleanup, let us set that up
-	// now.
-	if cfg.nudgeTempObjectsCleanup != nil && cfg.tempObjectCleanupDone != nil {
-		params.ServerArgs.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-			OnTempObjectsCleanupDone: func() {
-				cfg.tempObjectCleanupDone <- struct{}{}
-			},
-			TempObjectsCleanupCh: cfg.nudgeTempObjectsCleanup,
-		}
 	}
 
 	settings := cluster.MakeTestingClusterSettings()
@@ -175,24 +155,11 @@ func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
 			InitManualReplication, params)
 	}
 	cleanupFn := func() {
-		if cfg.nudgeTempObjectsCleanup != nil {
-			close(cfg.nudgeTempObjectsCleanup)
-		}
-		if cfg.tempObjectCleanupDone != nil {
-			close(cfg.tempObjectCleanupDone)
-		}
 		cleanup()
 	}
 	d.servers[cfg.name] = tc.Server(0)
 	d.dataDirs[cfg.name] = cfg.iodir
 	d.cleanupFns = append(d.cleanupFns, cleanupFn)
-
-	if cfg.nudgeTempObjectsCleanup != nil && cfg.tempObjectCleanupDone != nil {
-		d.tempObjectCleanupAndWait[cfg.name] = func() {
-			cfg.nudgeTempObjectsCleanup <- timeutil.Now()
-			<-cfg.tempObjectCleanupDone
-		}
-	}
 
 	return nil
 }
@@ -259,15 +226,14 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //
 //   + splits: specifies the number of ranges the bank table is split into.
 //
-//   + control-temp-object-cleanup: sets up the server in a way that the test
-//   can control when to run the temporary object reconciliation loop using
-//   nudge-and-wait-for-temp-cleanup
-//
 // - "exec-sql [server=<name>] [user=<name>] [args]"
 //   Executes the input SQL query on the target server. By default, server is
 //   the last created server.
 //
 //   Supported arguments:
+//
+//   + expect-error-regex=<regex>: expects the query to return an error with a string
+//   matching the provided regex
 //
 //   + expect-error-ignore: expects the query to return an error, but we will
 //   ignore it.
@@ -275,8 +241,11 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //   + ignore-notice: does not print out the notice that is buffered during
 //   query execution.
 //
-// - "query-sql [server=<name>] [user=<name>]"
+// - "query-sql [server=<name>] [user=<name>] [regex=<regex pattern>]"
 //   Executes the input SQL query and print the results.
+//
+//   + regex: return true if the query result matches the regex pattern and
+//   false otherwise.
 //
 // - "reset"
 //    Clear all state associated with the test.
@@ -286,8 +255,17 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //
 //   Supported arguments:
 //
+//   + resume=<tag>: resumes the job referenced by the tag, use in conjunction
+//   with wait-for-state.
+//
 //   + cancel=<tag>: cancels the job referenced by the tag and waits for it to
 //   reach a CANCELED state.
+//
+//   + wait-for-state=<succeeded|paused|failed|cancelled> tag=<tag>: wait for
+//   the job referenced by the tag to reach the specified state.
+//
+// - "let" [args]
+//   Assigns the returned value of the SQL query to the provided args as variables.
 //
 // - "save-cluster-ts" tag=<tag>
 //   Saves the `SELECT cluster_logical_timestamp()` with the tag. Can be used
@@ -336,8 +314,6 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //
 //   + target: SQL target. Currently, only table names are supported.
 //
-// - "nudge-and-wait-for-temp-cleanup"
-//    Nudges the temporary object reconciliation loop to run, and waits for completion.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -355,6 +331,10 @@ func TestDataDriven(t *testing.T) {
 		defer ds.cleanup(ctx)
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 
+			for v := range ds.vars {
+				d.Input = strings.Replace(d.Input, v, ds.vars[v], -1)
+				d.Expected = strings.Replace(d.Expected, v, ds.vars[v], -1)
+			}
 			switch d.Cmd {
 			case "reset":
 				ds.cleanup(ctx)
@@ -364,8 +344,6 @@ func TestDataDriven(t *testing.T) {
 			case "new-server":
 				var name, shareDirWith, iodir, localities string
 				var splits int
-				var nudgeTempObjectCleanup chan time.Time
-				var tempObjectCleanupDone chan struct{}
 				nodes := singleNode
 				var io base.ExternalIODirConfig
 				d.ScanArgs(t, "name", &name)
@@ -390,21 +368,15 @@ func TestDataDriven(t *testing.T) {
 				if d.HasArg("splits") {
 					d.ScanArgs(t, "splits", &splits)
 				}
-				if d.HasArg("control-temp-object-cleanup") {
-					nudgeTempObjectCleanup = make(chan time.Time)
-					tempObjectCleanupDone = make(chan struct{})
-				}
 
 				lastCreatedServer = name
 				cfg := serverCfg{
-					name:                    name,
-					iodir:                   iodir,
-					nudgeTempObjectsCleanup: nudgeTempObjectCleanup,
-					tempObjectCleanupDone:   tempObjectCleanupDone,
-					nodes:                   nodes,
-					splits:                  splits,
-					ioConf:                  io,
-					localities:              localities,
+					name:       name,
+					iodir:      iodir,
+					nodes:      nodes,
+					splits:     splits,
+					ioConf:     io,
+					localities: localities,
 				}
 				err := ds.addServer(t, cfg)
 				if err != nil {
@@ -462,6 +434,17 @@ func TestDataDriven(t *testing.T) {
 					return strings.Join(ret, "\n")
 				}
 
+				// Check if we are expecting an error, and want to match it against a
+				// regex.
+				if d.HasArg("expect-error-regex") {
+					require.NotNilf(t, err, "expected error")
+					var expectErrorRegex string
+					d.ScanArgs(t, "expect-error-regex", &expectErrorRegex)
+					testutils.IsError(err, expectErrorRegex)
+					ret = append(ret, "regex matches error")
+					return strings.Join(ret, "\n")
+				}
+
 				// Check for other errors.
 				if err != nil {
 					if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
@@ -493,12 +476,73 @@ func TestDataDriven(t *testing.T) {
 				}
 				output, err := sqlutils.RowsToDataDrivenOutput(rows)
 				require.NoError(t, err)
+				if d.HasArg("regex") {
+					var pattern string
+					d.ScanArgs(t, "regex", &pattern)
+					matched, err := regexp.MatchString(pattern, output)
+					require.NoError(t, err)
+					if matched {
+						return "true"
+					}
+					return "false"
+				}
 				return output
+
+			case "let":
+				server := lastCreatedServer
+				user := "root"
+				if len(d.CmdArgs) == 0 {
+					t.Fatalf("Must specify at least one variable name.")
+				}
+				rows, err := ds.getSQLDB(t, server, user).Query(d.Input)
+				if err != nil {
+					return err.Error()
+				}
+				output, err := sqlutils.RowsToDataDrivenOutput(rows)
+				output = strings.TrimSpace(output)
+				values := strings.Split(output, "\n")
+				if len(values) != len(d.CmdArgs) {
+					t.Fatalf("Expecting %d vars, found %d", len(d.CmdArgs), len(values))
+				}
+				for i := range values {
+					key := d.CmdArgs[i].Key
+					if !strings.HasPrefix(key, "$") {
+						t.Fatalf("Vars must start with `$`.")
+					}
+					ds.vars[key] = values[i]
+				}
+				require.NoError(t, err)
+
+				return ""
 
 			case "backup":
 				server := lastCreatedServer
 				user := "root"
 				jobType := "BACKUP"
+
+				// First, run the backup.
+				_, err := ds.getSQLDB(t, server, user).Exec(d.Input)
+
+				// Tag the job.
+				if d.HasArg("tag") {
+					tagJob(t, server, user, jobType, ds, d)
+				}
+
+				// Check if we expect a pausepoint error.
+				if d.HasArg("expect-pausepoint") {
+					expectPausepoint(t, err, jobType, server, user, ds)
+					ret := append(ds.noticeBuffer, "job paused at pausepoint")
+					return strings.Join(ret, "\n")
+				}
+
+				// All other errors are bad.
+				require.NoError(t, err)
+				return ""
+
+			case "import":
+				server := lastCreatedServer
+				user := "root"
+				jobType := "IMPORT"
 
 				// First, run the backup.
 				_, err := ds.getSQLDB(t, server, user).Exec(d.Input)
@@ -638,6 +682,39 @@ func TestDataDriven(t *testing.T) {
 					runner := sqlutils.MakeSQLRunner(ds.getSQLDB(t, server, user))
 					runner.Exec(t, `CANCEL JOB $1`, jobID)
 					jobutils.WaitForJobToCancel(t, runner, jobID)
+				} else if d.HasArg("resume") {
+					var resumeJobTag string
+					d.ScanArgs(t, "resume", &resumeJobTag)
+					var jobID jobspb.JobID
+					var ok bool
+					if jobID, ok = ds.jobTags[resumeJobTag]; !ok {
+						t.Fatalf("could not find job with tag %s", resumeJobTag)
+					}
+					runner := sqlutils.MakeSQLRunner(ds.getSQLDB(t, server, user))
+					runner.Exec(t, `RESUME JOB $1`, jobID)
+				} else if d.HasArg("wait-for-state") {
+					var tag string
+					d.ScanArgs(t, "tag", &tag)
+					var jobID jobspb.JobID
+					var ok bool
+					if jobID, ok = ds.jobTags[tag]; !ok {
+						t.Fatalf("could not find job with tag %s", tag)
+					}
+					runner := sqlutils.MakeSQLRunner(ds.getSQLDB(t, server, user))
+					var state string
+					d.ScanArgs(t, "wait-for-state", &state)
+					switch state {
+					case "succeeded":
+						jobutils.WaitForJobToSucceed(t, runner, jobID)
+					case "cancelled":
+						jobutils.WaitForJobToCancel(t, runner, jobID)
+					case "paused":
+						jobutils.WaitForJobToPause(t, runner, jobID)
+					case "failed":
+						jobutils.WaitForJobToFail(t, runner, jobID)
+					default:
+						t.Fatalf("unknown state %s", state)
+					}
 				}
 				return ""
 
@@ -664,15 +741,6 @@ func TestDataDriven(t *testing.T) {
 				ds.clusterTimestamps[timestampTag] = ts
 				return ""
 
-			case "nudge-and-wait-for-temp-cleanup":
-				server := lastCreatedServer
-				if nudgeAndWait, ok := ds.tempObjectCleanupAndWait[server]; !ok {
-					t.Fatalf("server %s was not configured with `control-temp-object-cleanup`", server)
-				} else {
-					nudgeAndWait()
-				}
-				return ""
-
 			case "create-dummy-system-table":
 				db := ds.servers[lastCreatedServer].DB()
 				codec := ds.servers[lastCreatedServer].ExecutorConfig().(sql.ExecutorConfig).Codec
@@ -685,8 +753,7 @@ func TestDataDriven(t *testing.T) {
 					}
 					mut := dummyTable.NewBuilder().BuildCreatedMutable().(*tabledesc.Mutable)
 					mut.ID = id
-					mut.Name = fmt.Sprintf("%s_%d",
-						catprivilege.RestoreCopySystemTablePrefix, id)
+					mut.Name = fmt.Sprintf("%s_%d", "crdb_internal_copy", id)
 					tKey := catalogkeys.EncodeNameKey(codec, mut)
 					b := txn.NewBatch()
 					b.CPut(tKey, mut.GetID(), nil)

@@ -165,16 +165,20 @@ type SimpleMVCCIterator interface {
 	// comment on SimpleMVCCIterator.
 	HasPointAndRange() (bool, bool)
 	// RangeBounds returns the range bounds for the current range key, or an
-	// empty span if there are none. The returned keys are only valid until the
-	// next iterator call.
+	// empty span if there are none. The returned keys are valid until the
+	// range key changes, see RangeKeyChanged().
 	RangeBounds() roachpb.Span
 	// RangeKeys returns a stack of all range keys (with different timestamps) at
 	// the current key position. When at a point key, it will return all range
-	// keys overlapping that point key. The stack is only valid until the next
-	// iterator operation. For details on range keys, see comment on
-	// SimpleMVCCIterator, or this tech note:
+	// keys overlapping that point key. The stack is valid until the range key
+	// changes, see RangeKeyChanged().
+	//
+	// For details on range keys, see SimpleMVCCIterator comment, or tech note:
 	// https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/mvcc-range-tombstones.md
 	RangeKeys() MVCCRangeKeyStack
+	// RangeKeyChanged returns true if the previous seek or step moved to a
+	// different range key (or none at all). This includes an exhausted iterator.
+	RangeKeyChanged() bool
 }
 
 // IteratorStats is returned from {MVCCIterator,EngineIterator}.Stats.
@@ -252,23 +256,6 @@ type MVCCIterator interface {
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
 	ValueProto(msg protoutil.Message) error
-	// ComputeStats scans the underlying engine from start to end keys and
-	// computes stats counters based on the values. This method is used after a
-	// range is split to recompute stats for each subrange. The nowNanos arg
-	// specifies the wall time in nanoseconds since the epoch and is used to
-	// compute the total age of intents and garbage.
-	//
-	// To properly account for intents and range keys, the iterator must be
-	// created with MVCCKeyAndIntentsIterKind and IterKeyTypePointsAndRanges,
-	// and the LowerBound and UpperBound must be set equal to start and end
-	// in order for range keys to be truncated to the bounds.
-	//
-	// TODO(erikgrinaker): This should be replaced by ComputeStatsForRange
-	// instead, which should set up its own iterator with appropriate options.
-	// This isn't currently done in order to do spanset assertions on it, but this
-	// could be better solved by checking the iterator bounds in NewMVCCIterator
-	// and requiring callers to set them appropriately.
-	ComputeStats(start, end roachpb.Key, nowNanos int64) (enginepb.MVCCStats, error)
 	// FindSplitKey finds a key from the given span such that the left side of
 	// the split is roughly targetSize bytes. The returned key will never be
 	// chosen from the key ranges listed in keys.NoSplitSpans and will always
@@ -316,6 +303,9 @@ type EngineIterator interface {
 	EngineRangeBounds() (roachpb.Span, error)
 	// EngineRangeKeys returns the engine range keys at the current position.
 	EngineRangeKeys() []EngineRangeKeyValue
+	// RangeKeyChanged returns true if the previous seek or step moved to a
+	// different range key (or none at all). This includes an exhausted iterator.
+	RangeKeyChanged() bool
 	// UnsafeEngineKey returns the same value as EngineKey, but the memory is
 	// invalidated on the next call to {Next,NextKey,Prev,SeekGE,SeekLT,Close}.
 	// REQUIRES: latest positioning function returned valid=true.
@@ -901,6 +891,10 @@ type Engine interface {
 	// IngestExternalFiles atomically links a slice of files into the RocksDB
 	// log-structured merge-tree.
 	IngestExternalFiles(ctx context.Context, paths []string) error
+	// IngestExternalFilesWithStats is a variant of IngestExternalFiles that
+	// additionally returns ingestion stats.
+	IngestExternalFilesWithStats(
+		ctx context.Context, paths []string) (pebble.IngestOperationStats, error)
 	// PreIngestDelay offers an engine the chance to backpressure ingestions.
 	// When called, it may choose to block if the engine determines that it is in
 	// or approaching a state where further ingestions may risk its health.

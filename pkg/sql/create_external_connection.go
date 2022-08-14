@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -102,7 +101,7 @@ func (p *planner) createExternalConnection(
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve External Connection endpoint")
 	}
-	exConn, err := externalconn.ExternalConnectionFromURI(params.ctx, as)
+	exConn, err := externalconn.ExternalConnectionFromURI(params.ctx, params.ExecCfg(), p.User(), as)
 	if err != nil {
 		return errors.Wrap(err, "failed to construct External Connection details")
 	}
@@ -111,9 +110,7 @@ func (p *planner) createExternalConnection(
 
 	// Create the External Connection and persist it in the
 	// `system.external_connections` table.
-	return params.ExecCfg().DB.Txn(params.ctx, func(ctx context.Context, txn *kv.Txn) error {
-		return ex.Create(params.ctx, params.ExecCfg().InternalExecutor, params.p.User(), txn)
-	})
+	return ex.Create(params.ctx, params.ExecCfg().InternalExecutor, params.p.User(), p.Txn())
 }
 
 func (c *createExternalConectionNode) Next(_ runParams) (bool, error) { return false, nil }

@@ -15,12 +15,12 @@ foo STORAGE {"provider": "nodelocal", "simpleUri": {"uri": "nodelocal://1/foo/ba
 exec-sql
 CREATE EXTERNAL CONNECTION "missing-node-id" AS 'nodelocal:///foo';
 ----
-pq: failed to construct External Connection details: invalid `nodelocal` URI: host component of nodelocal URI must be a node ID (use 'self' to specify each node should access its own local filesystem): nodelocal:///foo
+pq: failed to construct External Connection details: failed to create nodelocal external connection: invalid `nodelocal` URI: host component of nodelocal URI must be a node ID (use 'self' to specify each node should access its own local filesystem): nodelocal:///foo
 
 exec-sql
 CREATE EXTERNAL CONNECTION "invalid-nodeid-nodelocal" AS 'nodelocal://a/foo';
 ----
-pq: failed to construct External Connection details: invalid `nodelocal` URI: host component of nodelocal URI must be a node ID: nodelocal://a/foo
+pq: failed to construct External Connection details: failed to create nodelocal external connection: invalid `nodelocal` URI: host component of nodelocal URI must be a node ID: nodelocal://a/foo
 
 # Try to create another External Connection with the same name.
 exec-sql
@@ -98,21 +98,166 @@ pq: only users with the EXTERNALCONNECTION system privilege are allowed to CREAT
 
 subtest end
 
-subtest basic-gs-kms
+subtest drop-external-storage-privilege
 
 exec-sql
-CREATE EXTERNAL CONNECTION "foo-kms" AS 'gs:///cmk?AUTH=implicit&CREDENTIALS=baz&ASSUME_ROLE=ronaldo,rashford,bruno&BEARER_TOKEN=foo';
+CREATE EXTERNAL CONNECTION privileged AS 'nodelocal://1/foo'
+----
+
+# Create another External Connection.
+exec-sql
+CREATE EXTERNAL CONNECTION 'privileged-dup' AS 'nodelocal://1/foo'
+----
+
+exec-sql user=testuser
+DROP EXTERNAL CONNECTION privileged
+----
+pq: user testuser does not have DROP privilege on external_connection privileged
+
+inspect-system-table
+----
+privileged STORAGE {"provider": "nodelocal", "simpleUri": {"uri": "nodelocal://1/foo"}}
+privileged-dup STORAGE {"provider": "nodelocal", "simpleUri": {"uri": "nodelocal://1/foo"}}
+
+exec-sql
+GRANT DROP ON EXTERNAL CONNECTION privileged TO testuser;
+----
+
+exec-sql user=testuser
+DROP EXTERNAL CONNECTION privileged
+----
+
+# Try to drop the second external connection, testuser should be disallowed.
+exec-sql user=testuser
+DROP EXTERNAL CONNECTION 'privileged-dup'
+----
+pq: user testuser does not have DROP privilege on external_connection privileged-dup
+
+inspect-system-table
+----
+privileged-dup STORAGE {"provider": "nodelocal", "simpleUri": {"uri": "nodelocal://1/foo"}}
+
+exec-sql
+DROP EXTERNAL CONNECTION 'privileged-dup'
+----
+
+subtest end
+
+subtest basic-gs-kms
+
+disable-check-kms
+----
+
+exec-sql
+CREATE EXTERNAL CONNECTION "foo-kms" AS 'gcp-kms:///cmk?AUTH=implicit&CREDENTIALS=baz&ASSUME_ROLE=ronaldo,rashford,bruno&BEARER_TOKEN=foo';
 ----
 
 inspect-system-table
 ----
-foo-kms KMS {"provider": "gs_kms", "simpleUri": {"uri": "gs:///cmk?AUTH=implicit&CREDENTIALS=baz&ASSUME_ROLE=ronaldo,rashford,bruno&BEARER_TOKEN=foo"}}
+foo-kms KMS {"provider": "gcp_kms", "simpleUri": {"uri": "gcp-kms:///cmk?AUTH=implicit&CREDENTIALS=baz&ASSUME_ROLE=ronaldo,rashford,bruno&BEARER_TOKEN=foo"}}
 
 exec-sql
 DROP EXTERNAL CONNECTION "foo-kms";
 ----
 
 inspect-system-table
+----
+
+enable-check-kms
+----
+
+subtest end
+
+subtest basic-s3
+
+disable-check-external-storage
+----
+
+exec-sql
+CREATE EXTERNAL CONNECTION "foo-s3" AS 's3://foo/bar?AUTH=implicit&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&ASSUME_ROLE=ronaldo,rashford,bruno';
+----
+
+# Reject invalid S3 URIs.
+exec-sql
+CREATE EXTERNAL CONNECTION "missing-host-s3" AS 's3:///?AUTH=implicit';
+----
+pq: failed to construct External Connection details: failed to create s3 external connection: empty host component; s3 URI must specify a target bucket
+
+exec-sql
+CREATE EXTERNAL CONNECTION "invalid-params-s3" AS 's3://foo/bar?AUTH=implicit&INVALIDPARAM=baz';
+----
+pq: failed to construct External Connection details: failed to create s3 external connection: unknown S3 query parameters: INVALIDPARAM
+
+inspect-system-table
+----
+foo-s3 STORAGE {"provider": "s3", "simpleUri": {"uri": "s3://foo/bar?AUTH=implicit&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&ASSUME_ROLE=ronaldo,rashford,bruno"}}
+
+exec-sql
+DROP EXTERNAL CONNECTION "foo-s3";
+----
+
+inspect-system-table
+----
+
+enable-check-external-storage
+----
+
+subtest end
+
+subtest basic-kafka-sink
+
+exec-sql
+CREATE EXTERNAL CONNECTION "foo-kafka" AS 'kafka://broker.address.com:9092?topic_prefix=bar_&tls_enabled=true&ca_cert=Zm9vCg==&sasl_enabled=true&sasl_user={sasl user}&sasl_password={url-encoded password}&sasl_mechanism=SCRAM-SHA-256'
+----
+
+# Reject invalid kafka external connections.
+exec-sql
+CREATE EXTERNAL CONNECTION "invalid-param-kafka" AS 'kafka://broker.address.com:9092?INVALIDPARAM=baz'
+----
+pq: failed to construct External Connection details: invalid Kafka URI: unknown kafka sink query parameters: INVALIDPARAM
+
+exec-sql
+CREATE EXTERNAL CONNECTION "invalid-cert" AS 'kafka://broker.address.com?topic_prefix=bar_&tls_enabled=true&ca_cert=Zm9vCg=11'
+----
+pq: failed to construct External Connection details: invalid Kafka URI: param ca_cert must be base 64 encoded: illegal base64 data at input byte 6
+
+inspect-system-table
+----
+foo-kafka STORAGE {"provider": "kafka", "simpleUri": {"uri": "kafka://broker.address.com:9092?topic_prefix=bar_&tls_enabled=true&ca_cert=Zm9vCg==&sasl_enabled=true&sasl_user={sasl user}&sasl_password={url-encoded password}&sasl_mechanism=SCRAM-SHA-256"}}
+
+exec-sql
+DROP EXTERNAL CONNECTION "foo-kafka"
+----
+
+subtest end
+
+subtest basic-userfile
+
+exec-sql
+CREATE EXTERNAL CONNECTION "foo-userfile" AS 'userfile:///foo/bar';
+----
+
+inspect-system-table
+----
+foo-userfile STORAGE {"provider": "userfile", "simpleUri": {"uri": "userfile:///foo/bar"}}
+
+# Reject invalid userfile URIs.
+exec-sql
+CREATE EXTERNAL CONNECTION "path-clean-userfile" AS 'userfile:///foo/..';
+----
+pq: failed to construct External Connection details: failed to create userfile external connection: path /foo/.. changes after normalization to /. userfile upload does not permit such path constructs
+
+exec-sql
+CREATE EXTERNAL CONNECTION "invalid-param-userfile" AS 'userfile:///foo?INVALIDPARAM=param';
+----
+pq: failed to construct External Connection details: failed to create userfile external connection: unknown userfile query parameters: INVALIDPARAM
+
+inspect-system-table
+----
+foo-userfile STORAGE {"provider": "userfile", "simpleUri": {"uri": "userfile:///foo/bar"}}
+
+exec-sql
+DROP EXTERNAL CONNECTION "foo-userfile";
 ----
 
 subtest end

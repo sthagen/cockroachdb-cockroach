@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
@@ -102,7 +103,7 @@ var _ metric.Struct = GuardrailMetrics{}
 // MetricStruct is part of the metric.Struct interface.
 func (GuardrailMetrics) MetricStruct() {}
 
-// recordStatementSummery gathers various details pertaining to the
+// recordStatementSummary gathers various details pertaining to the
 // last executed statement/query and performs the associated
 // accounting in the passed-in EngineMetrics.
 // - distSQLUsed reports whether the query was distributed.
@@ -169,6 +170,7 @@ func (ex *connExecutor) recordStatementSummary(
 		PlanHash:     planner.instrumentation.planGist.Hash(),
 	}
 
+	idxRecommendations := idxrecommendations.FormatIdxRecommendations(planner.instrumentation.indexRecommendations)
 	recordedStmtStats := sqlstats.RecordedStmtStats{
 		SessionID:            ex.sessionID,
 		StatementID:          planner.stmt.QueryID,
@@ -188,7 +190,7 @@ func (ex *connExecutor) recordStatementSummary(
 		Plan:                 planner.instrumentation.PlanForStats(ctx),
 		PlanGist:             planner.instrumentation.planGist.String(),
 		StatementError:       stmtErr,
-		IndexRecommendations: planner.instrumentation.indexRecommendations,
+		IndexRecommendations: idxRecommendations,
 		Query:                stmt.StmtNoConstants,
 		StartTime:            phaseTimes.GetSessionPhaseTime(sessionphase.PlannerStartExecStmt),
 		EndTime:              phaseTimes.GetSessionPhaseTime(sessionphase.PlannerEndExecStmt),
@@ -204,6 +206,17 @@ func (ex *connExecutor) recordStatementSummary(
 			log.Warningf(ctx, "failed to record statement: %s", err)
 		}
 		ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
+	}
+
+	// Record statement execution statistics if span is recorded and no error was
+	// encountered while collecting query-level statistics.
+	if _, ok := planner.instrumentation.Tracing(); ok && planner.instrumentation.queryLevelStatsWithErr.Err == nil {
+		err = ex.statsCollector.RecordStatementExecStats(recordedStmtStatsKey, planner.instrumentation.queryLevelStatsWithErr.Stats)
+		if err != nil {
+			if log.V(2 /* level */) {
+				log.Warningf(ctx, "unable to record statement exec stats: %s", err)
+			}
+		}
 	}
 
 	// Do some transaction level accounting for the transaction this statement is
@@ -265,7 +278,7 @@ func shouldIncludeStmtInLatencyMetrics(stmt *Statement) bool {
 func getNodesFromPlanner(planner *planner) []int64 {
 	// Retrieve the list of all nodes which the statement was executed on.
 	var nodes []int64
-	if planner.instrumentation.sp != nil {
+	if _, ok := planner.instrumentation.Tracing(); !ok {
 		trace := planner.instrumentation.sp.GetRecording(tracingpb.RecordingStructured)
 		// ForEach returns nodes in order.
 		execinfrapb.ExtractNodesFromSpans(planner.EvalContext().Context, trace).ForEach(func(i int) {

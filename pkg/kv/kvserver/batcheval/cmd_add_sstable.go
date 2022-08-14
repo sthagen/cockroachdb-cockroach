@@ -125,7 +125,7 @@ func EvalAddSSTable(
 
 	var span *tracing.Span
 	var err error
-	ctx, span = tracing.ChildSpan(ctx, fmt.Sprintf("AddSSTable [%s,%s)", start.Key, end.Key))
+	ctx, span = tracing.ChildSpan(ctx, "AddSSTable")
 	defer span.Finish()
 	log.Eventf(ctx, "evaluating AddSSTable [%s,%s)", start.Key, end.Key)
 
@@ -205,7 +205,10 @@ func EvalAddSSTable(
 			// bounded with a small number on the SST side.
 			usePrefixSeek = usePrefixSeek || args.MVCCStats.KeyCount < 100
 		}
-		statsDelta, err = storage.CheckSSTConflicts(ctx, sst, readWriter, start, end,
+		desc := cArgs.EvalCtx.Desc()
+		leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
+			args.Key, args.EndKey, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
+		statsDelta, err = storage.CheckSSTConflicts(ctx, sst, readWriter, start, end, leftPeekBound, rightPeekBound,
 			args.DisallowShadowing, args.DisallowShadowingBelow, maxIntents, usePrefixSeek)
 		if err != nil {
 			return result.Result{}, errors.Wrap(err, "checking for key collisions")
@@ -228,6 +231,7 @@ func EvalAddSSTable(
 	// compute the expected MVCC stats delta of ingesting the SST.
 	sstIter, err := storage.NewPebbleMemSSTIterator(sst, true /* verify */, storage.IterOptions{
 		KeyTypes:   storage.IterKeyTypePointsAndRanges,
+		LowerBound: keys.MinKey,
 		UpperBound: keys.MaxKey,
 	})
 	if err != nil {
@@ -252,7 +256,7 @@ func EvalAddSSTable(
 		stats = *args.MVCCStats
 	} else {
 		log.VEventf(ctx, 2, "computing MVCCStats for SSTable [%s,%s)", start.Key, end.Key)
-		stats, err = storage.ComputeStatsForRange(sstIter, start.Key, end.Key, h.Timestamp.WallTime)
+		stats, err = storage.ComputeStatsForIter(sstIter, h.Timestamp.WallTime)
 		if err != nil {
 			return result.Result{}, errors.Wrap(err, "computing SSTable MVCC stats")
 		}
@@ -569,10 +573,10 @@ func assertSSTContents(sst []byte, sstTimestamp hlc.Timestamp, stats *enginepb.M
 			return err
 		}
 		defer iter.Close()
+		iter.SeekGE(storage.MVCCKey{Key: keys.MinKey})
 
 		given := *stats
-		actual, err := storage.ComputeStatsForRange(
-			iter, keys.MinKey, keys.MaxKey, given.LastUpdateNanos)
+		actual, err := storage.ComputeStatsForIter(iter, given.LastUpdateNanos)
 		if err != nil {
 			return errors.Wrap(err, "failed to compare stats: %w")
 		}

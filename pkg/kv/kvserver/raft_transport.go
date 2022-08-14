@@ -11,12 +11,9 @@
 package kvserver
 
 import (
-	"bytes"
 	"context"
-	"fmt"
 	"net"
-	"sort"
-	"sync/atomic"
+	"runtime/pprof"
 	"time"
 	"unsafe"
 
@@ -139,29 +136,6 @@ type RaftMessageHandler interface {
 	) error
 }
 
-// TODO(tbg): remove all of these metrics. The "NodeID" in this struct refers to the remote NodeID, i.e. when we send
-// a message it refers to the recipient and when we receive a message it refers to the sender. This doesn't map to
-// metrics well, where everyone should report on their local decisions. Instead have a *RaftTransportMetrics struct
-// that is per-Store and tracks metrics on behalf of that Store.
-//
-// See: https://github.com/cockroachdb/cockroach/issues/83917
-type raftTransportStats struct {
-	nodeID        roachpb.NodeID
-	queue         int
-	queueMax      int32
-	clientSent    int64
-	clientRecv    int64
-	clientDropped int64
-	serverSent    int64
-	serverRecv    int64
-}
-
-type raftTransportStatsSlice []*raftTransportStats
-
-func (s raftTransportStatsSlice) Len() int           { return len(s) }
-func (s raftTransportStatsSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s raftTransportStatsSlice) Less(i, j int) bool { return s[i].nodeID < s[j].nodeID }
-
 // RaftTransport handles the rpc messages for raft.
 //
 // The raft transport is asynchronous with respect to the caller, and
@@ -176,13 +150,12 @@ func (s raftTransportStatsSlice) Less(i, j int) bool { return s[i].nodeID < s[j]
 // which remote hung up.
 type RaftTransport struct {
 	log.AmbientContext
-	st     *cluster.Settings
-	tracer *tracing.Tracer
-
+	st      *cluster.Settings
+	tracer  *tracing.Tracer
 	stopper *stop.Stopper
+	metrics *RaftTransportMetrics
 
 	queues   [rpc.NumConnectionClasses]syncutil.IntMap // map[roachpb.NodeID]*chan *RaftMessageRequest
-	stats    [rpc.NumConnectionClasses]syncutil.IntMap // map[roachpb.NodeID]*raftTransportStats
 	dialer   *nodedialer.Dialer
 	handlers syncutil.IntMap // map[roachpb.StoreID]*RaftMessageHandler
 }
@@ -210,95 +183,19 @@ func NewRaftTransport(
 		AmbientContext: ambient,
 		st:             st,
 		tracer:         tracer,
-
-		stopper: stopper,
-		dialer:  dialer,
+		stopper:        stopper,
+		dialer:         dialer,
 	}
-
+	t.initMetrics()
 	if grpcServer != nil {
 		RegisterMultiRaftServer(grpcServer, t)
 	}
-	// statsMap is used to associate a queue with its raftTransportStats.
-	statsMap := make(map[roachpb.NodeID]*raftTransportStats)
-	clearStatsMap := func() {
-		for k := range statsMap {
-			delete(statsMap, k)
-		}
-	}
-	if t.stopper != nil && log.V(1) {
-		ctx := t.AnnotateCtx(context.Background())
-		_ = t.stopper.RunAsyncTask(ctx, "raft-transport", func(ctx context.Context) {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			lastStats := make(map[roachpb.NodeID]raftTransportStats)
-			lastTime := timeutil.Now()
-			var stats raftTransportStatsSlice
-			for {
-				select {
-				case <-ticker.C:
-					stats = stats[:0]
-					getStats := func(k int64, v unsafe.Pointer) bool {
-						s := (*raftTransportStats)(v)
-						// Clear the queue length stat. Note that this field is only
-						// mutated by this goroutine.
-						s.queue = 0
-						stats = append(stats, s)
-						statsMap[roachpb.NodeID(k)] = s
-						return true
-					}
-					setQueueLength := func(k int64, v unsafe.Pointer) bool {
-						ch := *(*chan *kvserverpb.RaftMessageRequest)(v)
-						if s, ok := statsMap[roachpb.NodeID(k)]; ok {
-							s.queue += len(ch)
-						}
-						return true
-					}
-					for c := range t.stats {
-						clearStatsMap()
-						t.stats[c].Range(getStats)
-						t.queues[c].Range(setQueueLength)
-					}
-					clearStatsMap() // no need to hold on to references to stats
-
-					now := timeutil.Now()
-					elapsed := now.Sub(lastTime).Seconds()
-					sort.Sort(stats)
-
-					var buf bytes.Buffer
-					// NB: The header is 80 characters which should display in a single
-					// line on most terminals.
-					fmt.Fprintf(&buf,
-						"         qlen   qmax   qdropped client-sent client-recv server-sent server-recv\n")
-					for _, s := range stats {
-						last := lastStats[s.nodeID]
-						cur := raftTransportStats{
-							nodeID:        s.nodeID,
-							queue:         s.queue,
-							queueMax:      atomic.LoadInt32(&s.queueMax),
-							clientDropped: atomic.LoadInt64(&s.clientDropped),
-							clientSent:    atomic.LoadInt64(&s.clientSent),
-							clientRecv:    atomic.LoadInt64(&s.clientRecv),
-							serverSent:    atomic.LoadInt64(&s.serverSent),
-							serverRecv:    atomic.LoadInt64(&s.serverRecv),
-						}
-						fmt.Fprintf(&buf, "  %3d: %6d %6d %10d %11.1f %11.1f %11.1f %11.1f\n",
-							cur.nodeID, cur.queue, cur.queueMax, cur.clientDropped,
-							float64(cur.clientSent-last.clientSent)/elapsed,
-							float64(cur.clientRecv-last.clientRecv)/elapsed,
-							float64(cur.serverSent-last.serverSent)/elapsed,
-							float64(cur.serverRecv-last.serverRecv)/elapsed)
-						lastStats[s.nodeID] = cur
-					}
-					lastTime = now
-					log.Infof(ctx, "stats:\n%s", buf.String())
-				case <-t.stopper.ShouldQuiesce():
-					return
-				}
-			}
-		})
-	}
-
 	return t
+}
+
+// Metrics returns metrics tracking this transport.
+func (t *RaftTransport) Metrics() *RaftTransportMetrics {
+	return t.metrics
 }
 
 func (t *RaftTransport) queuedMessageCount() int64 {
@@ -352,18 +249,6 @@ func newRaftMessageResponse(
 	return resp
 }
 
-func (t *RaftTransport) getStats(
-	nodeID roachpb.NodeID, class rpc.ConnectionClass,
-) *raftTransportStats {
-	statsMap := &t.stats[class]
-	value, ok := statsMap.Load(int64(nodeID))
-	if !ok {
-		stats := &raftTransportStats{nodeID: nodeID}
-		value, _ = statsMap.LoadOrStore(int64(nodeID), unsafe.Pointer(stats))
-	}
-	return (*raftTransportStats)(value)
-}
-
 // RaftMessageBatch proxies the incoming requests to the listening server interface.
 func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer) error {
 	errCh := make(chan error, 1)
@@ -378,7 +263,6 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 			SpanOpt:  stop.ChildSpan,
 		}, func(ctx context.Context) {
 			errCh <- func() error {
-				var stats *raftTransportStats
 				stream := &lockedRaftMessageResponseStream{wrapped: stream}
 				for {
 					batch, err := stream.Recv()
@@ -389,31 +273,14 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 						continue
 					}
 
-					// This code always uses the DefaultClass. Class is primarily a
-					// client construct and the server has no way to determine which
-					// class an inbound connection holds on the client side. Because of
-					// this we associate all server receives and sends with the
-					// DefaultClass. This data is exclusively used to print a debug
-					// log message periodically. Using this policy may lead to a
-					// DefaultClass log line showing a high rate of server recv but
-					// a low rate of client sends if most of the traffic is due to
-					// system ranges.
-					//
-					// TODO(ajwerner): consider providing transport metadata to inform
-					// the server of the connection class or keep shared stats for all
-					// connection with a host.
-					if stats == nil {
-						stats = t.getStats(batch.Requests[0].FromReplica.NodeID, rpc.DefaultClass)
-					}
-
 					for i := range batch.Requests {
 						req := &batch.Requests[i]
-						atomic.AddInt64(&stats.serverRecv, 1)
+						t.metrics.MessagesRcvd.Inc(1)
 						if pErr := t.handleRaftRequest(ctx, req, stream); pErr != nil {
-							atomic.AddInt64(&stats.serverSent, 1)
 							if err := stream.Send(newRaftMessageResponse(req, pErr)); err != nil {
 								return err
 							}
+							t.metrics.ReverseSent.Inc(1)
 						}
 					}
 				}
@@ -507,11 +374,7 @@ func (t *RaftTransport) Stop(storeID roachpb.StoreID) {
 // lost and a new instance of processQueue will be started by the next message
 // to be sent.
 func (t *RaftTransport) processQueue(
-	nodeID roachpb.NodeID,
-	ch chan *kvserverpb.RaftMessageRequest,
-	stats *raftTransportStats,
-	stream MultiRaft_RaftMessageBatchClient,
-	class rpc.ConnectionClass,
+	ch chan *kvserverpb.RaftMessageRequest, stream MultiRaft_RaftMessageBatchClient,
 ) error {
 	errCh := make(chan error, 1)
 
@@ -526,7 +389,7 @@ func (t *RaftTransport) processQueue(
 					if err != nil {
 						return err
 					}
-					atomic.AddInt64(&stats.clientRecv, 1)
+					t.metrics.ReverseRcvd.Inc(1)
 					handler, ok := t.getHandler(resp.ToReplica.StoreID)
 					if !ok {
 						log.Warningf(ctx, "no handler found for store %s in response %s",
@@ -575,6 +438,7 @@ func (t *RaftTransport) processQueue(
 			if err != nil {
 				return err
 			}
+			t.metrics.MessagesSent.Inc(int64(len(batch.Requests)))
 
 			// Reuse the Requests slice, but zero out the contents to avoid delaying
 			// GC of memory referenced from within.
@@ -582,8 +446,6 @@ func (t *RaftTransport) processQueue(
 				batch.Requests[i] = kvserverpb.RaftMessageRequest{}
 			}
 			batch.Requests = batch.Requests[:0]
-
-			atomic.AddInt64(&stats.clientSent, 1)
 		}
 	}
 }
@@ -611,10 +473,9 @@ func (t *RaftTransport) SendAsync(
 	req *kvserverpb.RaftMessageRequest, class rpc.ConnectionClass,
 ) (sent bool) {
 	toNodeID := req.ToReplica.NodeID
-	stats := t.getStats(toNodeID, class)
 	defer func() {
 		if !sent {
-			atomic.AddInt64(&stats.clientDropped, 1)
+			t.metrics.MessagesDropped.Inc(1)
 		}
 	}()
 
@@ -635,17 +496,13 @@ func (t *RaftTransport) SendAsync(
 	if !existingQueue {
 		// Note that startProcessNewQueue is in charge of deleting the queue.
 		ctx := t.AnnotateCtx(context.Background())
-		if !t.startProcessNewQueue(ctx, toNodeID, class, stats) {
+		if !t.startProcessNewQueue(ctx, toNodeID, class) {
 			return false
 		}
 	}
 
 	select {
 	case ch <- req:
-		l := int32(len(ch))
-		if v := atomic.LoadInt32(&stats.queueMax); v < l {
-			atomic.CompareAndSwapInt32(&stats.queueMax, v, l)
-		}
 		return true
 	default:
 		releaseRaftMessageRequest(req)
@@ -663,10 +520,7 @@ func (t *RaftTransport) SendAsync(
 //
 // Returns whether the worker was started (the queue is deleted either way).
 func (t *RaftTransport) startProcessNewQueue(
-	ctx context.Context,
-	toNodeID roachpb.NodeID,
-	class rpc.ConnectionClass,
-	stats *raftTransportStats,
+	ctx context.Context, toNodeID roachpb.NodeID, class rpc.ConnectionClass,
 ) (started bool) {
 	cleanup := func(ch chan *kvserverpb.RaftMessageRequest) {
 		// Account for the remainder of `ch` which was never sent.
@@ -678,7 +532,7 @@ func (t *RaftTransport) startProcessNewQueue(
 		for {
 			select {
 			case <-ch:
-				atomic.AddInt64(&stats.clientDropped, 1)
+				t.metrics.MessagesDropped.Inc(1)
 			default:
 				return
 			}
@@ -710,11 +564,14 @@ func (t *RaftTransport) startProcessNewQueue(
 			return
 		}
 
-		if err := t.processQueue(toNodeID, ch, stats, stream, class); err != nil {
+		if err := t.processQueue(ch, stream); err != nil {
 			log.Warningf(ctx, "while processing outgoing Raft queue to node %d: %s:", toNodeID, err)
 		}
 	}
-	err := t.stopper.RunAsyncTask(ctx, "storage.RaftTransport: sending messages", worker)
+	err := t.stopper.RunAsyncTask(ctx, "storage.RaftTransport: sending/receiving messages",
+		func(ctx context.Context) {
+			pprof.Do(ctx, pprof.Labels("remote_node_id", toNodeID.String()), worker)
+		})
 	if err != nil {
 		t.queues[class].Delete(int64(toNodeID))
 		return false

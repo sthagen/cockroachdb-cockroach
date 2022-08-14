@@ -652,6 +652,31 @@ An event of type `alter_index` is recorded when an index is altered.
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | no |
 | `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
+### `alter_index_visible`
+
+AlterIndex is recorded when an index visibility is altered.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `TableName` | The name of the table containing the affected index. | yes |
+| `IndexName` | The name of the affected index. | yes |
+| `NotVisible` | Set true if index is not visible. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | no |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
 ### `alter_sequence`
 
 An event of type `alter_sequence` is recorded when a sequence is altered.
@@ -1773,6 +1798,31 @@ added to / removed from a user for a database object.
 | `GrantedPrivileges` | The privileges being granted to the grantee. | no |
 | `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
 
+### `change_function_privilege`
+
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `FuncName` | The name of the affected function. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. Application names starting with a dollar sign (`$`) are not considered sensitive. | no |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `Grantee` | The user/role affected by the grant or revoke operation. | yes |
+| `GrantedPrivileges` | The privileges being granted to the grantee. | no |
+| `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
+
 ### `change_schema_privilege`
 
 An event of type `change_schema_privilege` is recorded when privileges are added to /
@@ -2553,6 +2603,7 @@ contains common SQL event/execution details.
 | `InvertedJoinCount` | The number of inverted joins in the query plan. | no |
 | `ApplyJoinCount` | The number of apply joins in the query plan. | no |
 | `ZigZagJoinCount` | The number of zig zag joins in the query plan. | no |
+| `ContentionNanos` | The duration of time in nanoseconds that the query experienced contention. | no |
 
 
 #### Common fields

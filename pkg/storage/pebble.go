@@ -295,6 +295,17 @@ var EngineComparer = &pebble.Comparer{
 		return append(dst, 0)
 	},
 
+	ImmediateSuccessor: func(dst, a []byte) []byte {
+		// The key `a` is guaranteed to be a bare prefix: It's a
+		// `engineKeyNoVersion` key without a version—just a trailing 0-byte to
+		// signify the length of the version. For example the user key "foo" is
+		// encoded as: "foo\0". We need to encode the immediate successor to
+		// "foo", which in the natural byte ordering is "foo\0".  Append a
+		// single additional zero, to encode the user key "foo\0" with a
+		// zero-length version.
+		return append(append(dst, a...), 0)
+	},
+
 	Split: func(k []byte) int {
 		key, ok := GetKeyPartFromEngineKey(k)
 		if !ok {
@@ -467,6 +478,27 @@ func (tc *pebbleDataBlockMVCCTimeIntervalCollector) UpdateKeySuffixes(
 }
 
 const mvccWallTimeIntervalCollector = "MVCCTimeInterval"
+
+var _ pebble.BlockPropertyFilterMask = (*mvccWallTimeIntervalRangeKeyMask)(nil)
+
+type mvccWallTimeIntervalRangeKeyMask struct {
+	sstable.BlockIntervalFilter
+}
+
+// SetSuffix implements the pebble.BlockPropertyFilterMask interface.
+func (m *mvccWallTimeIntervalRangeKeyMask) SetSuffix(suffix []byte) error {
+	if len(suffix) == 0 {
+		// This is currently impossible, because the only range key Cockroach
+		// writes today is the MVCC Delete Range that's always suffixed.
+		return nil
+	}
+	ts, err := DecodeMVCCTimestampSuffix(suffix)
+	if err != nil {
+		return err
+	}
+	m.BlockIntervalFilter.SetInterval(uint64(ts.WallTime), math.MaxUint64)
+	return nil
+}
 
 // PebbleBlockPropertyCollectors is the list of functions to construct
 // BlockPropertyCollectors.
@@ -1620,6 +1652,13 @@ func (p *Pebble) IngestExternalFiles(ctx context.Context, paths []string) error 
 	return p.db.Ingest(paths)
 }
 
+// IngestExternalFilesWithStats implements the Engine interface.
+func (p *Pebble) IngestExternalFilesWithStats(
+	ctx context.Context, paths []string,
+) (pebble.IngestOperationStats, error) {
+	return p.db.IngestWithStats(paths)
+}
+
 // PreIngestDelay implements the Engine interface.
 func (p *Pebble) PreIngestDelay(ctx context.Context) {
 	preIngestDelay(ctx, p, p.settings)
@@ -1784,21 +1823,21 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	formatVers := pebble.FormatMostCompatible
 	// Cases are ordered from newer to older versions.
 	switch {
+	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatPrePebblev1Marked)):
+		if formatVers < pebble.FormatPrePebblev1Marked {
+			formatVers = pebble.FormatPrePebblev1Marked
+		}
 	case !version.Less(clusterversion.ByKey(clusterversion.EnsurePebbleFormatVersionRangeKeys)):
 		if formatVers < pebble.FormatRangeKeys {
 			formatVers = pebble.FormatRangeKeys
 		}
 	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatSplitUserKeysMarkedCompacted)):
-		if formatVers < pebble.FormatMarkedCompacted {
-			formatVers = pebble.FormatMarkedCompacted
+		if formatVers < pebble.FormatSplitUserKeysMarkedCompacted {
+			formatVers = pebble.FormatSplitUserKeysMarkedCompacted
 		}
-	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatSplitUserKeysMarked)):
+	case !version.Less(clusterversion.ByKey(clusterversion.TODOPreV22_1)):
 		if formatVers < pebble.FormatSplitUserKeysMarked {
 			formatVers = pebble.FormatSplitUserKeysMarked
-		}
-	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatBlockPropertyCollector)):
-		if formatVers < pebble.FormatBlockPropertyCollector {
-			formatVers = pebble.FormatBlockPropertyCollector
 		}
 	case !version.Less(clusterversion.ByKey(clusterversion.TODOPreV21_2)):
 		if formatVers < pebble.FormatSetWithDelete {

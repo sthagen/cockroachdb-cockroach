@@ -29,6 +29,9 @@ const (
 	// AuthParamSpecified is the query parameter for the specified authentication
 	// mode in a URI.
 	AuthParamSpecified = cloudpb.ExternalStorageAuthSpecified
+	// LocalityURLParam is the parameter name used when specifying a locality tag
+	// in a locality aware backup/restore.
+	LocalityURLParam = "COCKROACH_LOCALITY"
 )
 
 // GetPrefixBeforeWildcard gets the prefix of a path that does not contain glob-
@@ -96,14 +99,16 @@ func ParseRoleString(roleString string) (assumeRole string, delegateRoles []stri
 	return assumeRole, delegateRoles
 }
 
-// consumeURL is a helper struct which for "consuming" URL query
+// ConsumeURL is a helper struct which for "consuming" URL query
 // parameters from the underlying URL.
-type consumeURL struct {
+type ConsumeURL struct {
 	*url.URL
 	q url.Values
 }
 
-func (u *consumeURL) consumeParam(p string) string {
+// ConsumeParam returns the value of the parameter p from the underlying URL,
+// and deletes the parameter from the URL.
+func (u *ConsumeURL) ConsumeParam(p string) string {
 	if u.q == nil {
 		u.q = u.Query()
 	}
@@ -112,11 +117,23 @@ func (u *consumeURL) consumeParam(p string) string {
 	return v
 }
 
-func (u *consumeURL) remainingQueryParams() (res []string) {
+// RemainingQueryParams returns the query parameters that have not been consumed
+// from the underlying URL.
+func (u *ConsumeURL) RemainingQueryParams() (res []string) {
 	if u.q == nil {
 		u.q = u.Query()
 	}
 	for p := range u.q {
+		// The `COCKROACH_LOCALITY` parameter is supported for all External Storage
+		// implementations and is not used when creating the External Storage, but
+		// instead during backup/restore resolution. So, this parameter is not
+		// "consumed" by the individual External Storage implementations in their
+		// parse functions and so it will always show up in this method. We should
+		// consider this param invisible when validating that all the passed in
+		// query parameters are supported for an External Storage URI.
+		if p == LocalityURLParam {
+			continue
+		}
 		res = append(res, p)
 	}
 	return
@@ -126,12 +143,12 @@ func (u *consumeURL) remainingQueryParams() (res []string) {
 // are not part of the supportedParameters.
 func ValidateQueryParameters(uri url.URL, supportedParameters []string) error {
 	u := uri
-	validateURL := consumeURL{URL: &u}
+	validateURL := ConsumeURL{URL: &u}
 	for _, option := range supportedParameters {
-		validateURL.consumeParam(option)
+		validateURL.ConsumeParam(option)
 	}
 
-	if unknownParams := validateURL.remainingQueryParams(); len(unknownParams) > 0 {
+	if unknownParams := validateURL.RemainingQueryParams(); len(unknownParams) > 0 {
 		return errors.Errorf(
 			`unknown query parameters: %s for %s URI`,
 			strings.Join(unknownParams, ", "), uri.Scheme)

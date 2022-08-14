@@ -64,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -638,6 +639,87 @@ ORDER BY table_name
 			query: map[string][][]string{
 				`SELECT * from t`: {{"NULL", "foop"}},
 			},
+		},
+		{
+			name: "zero string is the default for nullif with CSV",
+			create: `
+				i int primary key,
+        s string
+      `,
+			typ: "CSV",
+			data: `1,
+2,""`,
+			query: map[string][][]string{
+				`SELECT i, s from t`: {
+					{"1", "NULL"},
+					{"2", ""},
+				},
+			},
+		},
+		{
+			name: "zero string in not null",
+			create: `
+						i int primary key,
+		       s string,
+		       s2 string not null
+		     `,
+			typ: "CSV",
+			data: `1,,
+		2,"",""`,
+			err: "null value in column \"s2\" violates not-null constraint",
+		},
+		{
+			name: "quoted nullif is treated as a string",
+			create: `
+				i int primary key,
+        s string
+      `,
+			with: `WITH nullif = 'foo'`,
+			typ:  "CSV",
+			data: `1,foo
+2,"foo"`,
+			query: map[string][][]string{
+				`SELECT i, s from t`: {
+					{"1", "NULL"},
+					{"2", "foo"},
+				},
+			},
+		},
+		{
+			name: "quoted nullif is treated as a null if allow_quoted_null is used",
+			create: `
+				i int primary key,
+        s string
+      `,
+			with: `WITH nullif = 'foo', allow_quoted_null`,
+			typ:  "CSV",
+			data: `1,foo
+2,"foo"`,
+			query: map[string][][]string{
+				`SELECT i, s from t`: {
+					{"1", "NULL"},
+					{"2", "NULL"},
+				},
+			},
+		},
+		{
+			name:   "array",
+			create: `a string, b string[]`,
+			typ:    "CSV",
+			data:   `cat,"{somevalue,anothervalue,anothervalue123}"`,
+			query: map[string][][]string{
+				`SELECT * from t`: {
+					{"cat", "{somevalue,anothervalue,anothervalue123}"},
+				},
+			},
+		},
+		{
+			name:     "array",
+			create:   `a string, b string[]`,
+			typ:      "CSV",
+			data:     `dog,{some,thing}`,
+			err:      "error parsing row 1: expected 2 fields, got 3",
+			rejected: "dog,{some,thing}\n",
 		},
 
 		// PG COPY
@@ -2378,8 +2460,9 @@ func TestImportCSVStmt(t *testing.T) {
 					f STRING DEFAULT 's',
 					PRIMARY KEY (a, b, c)
 				)`
-			query  = `IMPORT INTO t CSV DATA ($1)`
-			nullif = ` WITH nullif=''`
+			query            = `IMPORT INTO t CSV DATA ($1)`
+			nullif           = ` WITH nullif=''`
+			allowQuotedNulls = `, allow_quoted_null`
 		)
 
 		sqlDB.Exec(t, create)
@@ -2387,12 +2470,31 @@ func TestImportCSVStmt(t *testing.T) {
 		data = ",5,e,7,,"
 		t.Run(data, func(t *testing.T) {
 			sqlDB.ExpectErr(
-				t, `row 1: parse "a" as INT8: could not parse ""`,
+				t, `row 1: generate insert row: null value in column "a" violates not-null constraint`,
 				query, srv.URL,
 			)
 			sqlDB.ExpectErr(
 				t, `row 1: generate insert row: null value in column "a" violates not-null constraint`,
 				query+nullif, srv.URL,
+			)
+			sqlDB.ExpectErr(
+				t, `row 1: generate insert row: null value in column "a" violates not-null constraint`,
+				query+nullif+allowQuotedNulls, srv.URL,
+			)
+		})
+		data = "\"\",5,e,7,,"
+		t.Run(data, func(t *testing.T) {
+			sqlDB.ExpectErr(
+				t, `row 1: parse "a" as INT8: could not parse ""`,
+				query, srv.URL,
+			)
+			sqlDB.ExpectErr(
+				t, `row 1: parse "a" as INT8: could not parse ""`,
+				query+nullif, srv.URL,
+			)
+			sqlDB.ExpectErr(
+				t, `row 1: generate insert row: null value in column "a" violates not-null constraint`,
+				query+nullif+allowQuotedNulls, srv.URL,
 			)
 		})
 		data = "2,5,e,,,"
@@ -2685,12 +2787,12 @@ func TestURIRequiresAdminRole(t *testing.T) {
 		},
 		{
 			name:          "s3-specified",
-			uri:           "s3://foo/bar?AUTH=specified",
+			uri:           "s3://foo/bar?AUTH=specified&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456",
 			requiresAdmin: false,
 		},
 		{
 			name:          "s3-custom",
-			uri:           "s3://foo/bar?AUTH=specified&AWS_ENDPOINT=baz",
+			uri:           "s3://foo/bar?AUTH=specified&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&AWS_ENDPOINT=baz",
 			requiresAdmin: true,
 		},
 		{
@@ -2736,7 +2838,7 @@ func TestURIRequiresAdminRole(t *testing.T) {
 		t.Run(tc.name+"-direct", func(t *testing.T) {
 			conf, err := cloud.ExternalStorageConfFromURI(tc.uri, username.RootUserName())
 			require.NoError(t, err)
-			require.Equal(t, conf.AccessIsWithExplicitAuth(), !tc.requiresAdmin)
+			require.Equal(t, !tc.requiresAdmin, conf.AccessIsWithExplicitAuth())
 		})
 	}
 }
@@ -3151,26 +3253,40 @@ func TestImportIntoCSV(t *testing.T) {
 
 	// Verify a failed IMPORT INTO won't prevent a subsequent IMPORT INTO.
 	t.Run("import-into-checkpoint-leftover", func(t *testing.T) {
-		sqlDB.Exec(t, `CREATE TABLE t (a INT PRIMARY KEY, b STRING)`)
-		defer sqlDB.Exec(t, `DROP TABLE t`)
 
-		// Insert the test data
-		insert := []string{"''", "'text'", "'a'", "'e'", "'l'", "'t'", "'z'"}
+		for _, emptyTable := range []bool{true, false} {
+			subtestName := "empty-table"
+			if emptyTable == true {
+				subtestName = "nonEmptyTable"
+			}
+			t.Run(subtestName, func(t *testing.T) {
+				sqlDB.Exec(t, `CREATE TABLE t (a INT PRIMARY KEY, b STRING)`)
+				defer sqlDB.Exec(t, `DROP TABLE t`)
 
-		for i, v := range insert {
-			sqlDB.Exec(t, "INSERT INTO t (a, b) VALUES ($1, $2)", i, v)
+				if emptyTable != false {
+					// Insert the test data
+					insert := []string{"''", "'text'", "'a'", "'e'", "'l'", "'t'", "'z'"}
+
+					for i, v := range insert {
+						sqlDB.Exec(t, "INSERT INTO t (a, b) VALUES ($1, $2)", i, v)
+					}
+				}
+				preImportData := sqlDB.QueryStr(t, `SELECT * FROM t`)
+
+				// Hit a failure during import.
+				forceFailure = true
+				sqlDB.ExpectErr(
+					t, `testing injected failure`,
+					fmt.Sprintf(`IMPORT INTO t (a, b) CSV DATA (%s)`, testFiles.files[1]),
+				)
+				forceFailure = false
+
+				sqlDB.CheckQueryResults(t, `SELECT * FROM t`, preImportData)
+
+				// Expect it to succeed on re-attempt.
+				sqlDB.Exec(t, fmt.Sprintf(`IMPORT INTO t (a, b) CSV DATA (%s)`, testFiles.files[1]))
+			})
 		}
-
-		// Hit a failure during import.
-		forceFailure = true
-		sqlDB.ExpectErr(
-			t, `testing injected failure`,
-			fmt.Sprintf(`IMPORT INTO t (a, b) CSV DATA (%s)`, testFiles.files[1]),
-		)
-		forceFailure = false
-
-		// Expect it to succeed on re-attempt.
-		sqlDB.Exec(t, fmt.Sprintf(`IMPORT INTO t (a, b) CSV DATA (%s)`, testFiles.files[1]))
 	})
 
 	// Verify that during IMPORT INTO the table is offline.
@@ -3558,10 +3674,12 @@ func TestImportIntoCSV(t *testing.T) {
 			fmt.Sprintf(`IMPORT INTO t (a, b) CSV DATA (%s)`, testFiles.files[0]),
 		)
 
+		preCollisionData := sqlDB.QueryStr(t, `SELECT * FROM t`)
 		sqlDB.ExpectErr(
 			t, `ingested key collides with an existing one: /Table/\d+/1/0/0`,
 			fmt.Sprintf(`IMPORT INTO t (a, b) CSV DATA (%s)`, testFiles.fileWithShadowKeys[0]),
 		)
+		sqlDB.CheckQueryResults(t, `SELECT * FROM t`, preCollisionData)
 	})
 
 	// Tests that IMPORT INTO invalidates FK and CHECK constraints.
@@ -3721,7 +3839,7 @@ func BenchmarkUserfileImport(b *testing.B) {
 type csvBenchmarkStream struct {
 	n    int
 	pos  int
-	data [][]string
+	data [][]csv.Record
 }
 
 func (s *csvBenchmarkStream) Progress() float32 {
@@ -3753,9 +3871,31 @@ func (s *csvBenchmarkStream) Read(buf []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		return copy(buf, strings.Join(r.([]string), "\t")+"\n"), nil
+		row := r.([]csv.Record)
+		if len(row) == 0 {
+			return copy(buf, "\n"), nil
+		}
+		var b strings.Builder
+		b.WriteString(row[0].String())
+		for _, v := range row[1:] {
+			b.WriteString("\t")
+			b.WriteString(v.String())
+		}
+		return copy(buf, b.String()+"\n"), nil
 	}
 	return 0, io.EOF
+}
+
+func toRecords(input [][]string) [][]csv.Record {
+	records := make([][]csv.Record, len(input))
+	for i := range input {
+		row := make([]csv.Record, len(input[i]))
+		for j := range input[i] {
+			row[j] = csv.Record{Quoted: false, Val: input[i][j]}
+		}
+		records[i] = row
+	}
+	return records
 }
 
 var _ importRowProducer = &csvBenchmarkStream{}
@@ -3849,7 +3989,7 @@ func BenchmarkCSVConvertRecord(b *testing.B) {
 	producer := &csvBenchmarkStream{
 		n:    b.N,
 		pos:  0,
-		data: tpchLineItemDataRows,
+		data: toRecords(tpchLineItemDataRows),
 	}
 	consumer := &csvRowConsumer{importCtx: importCtx, opts: &roachpb.CSVOptions{}}
 	b.ResetTimer()
@@ -4799,7 +4939,7 @@ func BenchmarkDelimitedConvertRecord(b *testing.B) {
 	producer := &csvBenchmarkStream{
 		n:    b.N,
 		pos:  0,
-		data: tpchLineItemDataRows,
+		data: toRecords(tpchLineItemDataRows),
 	}
 
 	delimited := &fileReader{Reader: producer}
@@ -4903,7 +5043,7 @@ func BenchmarkPgCopyConvertRecord(b *testing.B) {
 	producer := &csvBenchmarkStream{
 		n:    b.N,
 		pos:  0,
-		data: tpchLineItemDataRows,
+		data: toRecords(tpchLineItemDataRows),
 	}
 
 	pgCopyInput := &fileReader{Reader: producer}

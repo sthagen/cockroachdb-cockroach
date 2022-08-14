@@ -17,7 +17,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -40,6 +39,8 @@ type pebbleIterator struct {
 	lowerBoundBuf      []byte
 	upperBoundBuf      []byte
 	rangeKeyMaskingBuf []byte
+	// Filter to use if masking is enabled.
+	maskFilter mvccWallTimeIntervalRangeKeyMask
 
 	// True if the iterator's underlying reader supports range keys.
 	//
@@ -223,6 +224,8 @@ func (p *pebbleIterator) setOptions(opts IterOptions, durability DurabilityRequi
 		p.rangeKeyMaskingBuf = encodeMVCCTimestampSuffixToBuf(
 			p.rangeKeyMaskingBuf, opts.RangeKeyMaskingBelow)
 		p.options.RangeKeyMasking.Suffix = p.rangeKeyMaskingBuf
+		p.maskFilter.BlockIntervalFilter.Init(mvccWallTimeIntervalCollector, 0, math.MaxUint64)
+		p.options.RangeKeyMasking.Filter = &p.maskFilter
 	}
 
 	if opts.MaxTimestampHint.IsSet() {
@@ -685,6 +688,11 @@ func (p *pebbleIterator) RangeKeys() MVCCRangeKeyStack {
 	return stack
 }
 
+// RangeKeyChanged implements the MVCCIterator interface.
+func (p *pebbleIterator) RangeKeyChanged() bool {
+	return p.iter.RangeKeyChanged()
+}
+
 // EngineRangeKeys implements the EngineIterator interface.
 func (p *pebbleIterator) EngineRangeKeys() []EngineRangeKeyValue {
 	rangeKeys := p.iter.RangeKeys()
@@ -693,13 +701,6 @@ func (p *pebbleIterator) EngineRangeKeys() []EngineRangeKeyValue {
 		rkvs = append(rkvs, EngineRangeKeyValue{Version: rk.Suffix, Value: rk.Value})
 	}
 	return rkvs
-}
-
-// ComputeStats implements the MVCCIterator interface.
-func (p *pebbleIterator) ComputeStats(
-	start, end roachpb.Key, nowNanos int64,
-) (enginepb.MVCCStats, error) {
-	return ComputeStatsForRange(p, start, end, nowNanos)
 }
 
 // Go-only version of IsValidSplitKey. Checks if the specified key is in

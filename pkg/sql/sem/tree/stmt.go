@@ -171,6 +171,7 @@ type CCLOnlyStatement interface {
 }
 
 var _ CCLOnlyStatement = &AlterBackup{}
+var _ CCLOnlyStatement = &AlterBackupSchedule{}
 var _ CCLOnlyStatement = &Backup{}
 var _ CCLOnlyStatement = &ShowBackup{}
 var _ CCLOnlyStatement = &Restore{}
@@ -364,6 +365,17 @@ func (*AlterIndex) StatementTag() string { return "ALTER INDEX" }
 func (*AlterIndex) hiddenFromShowQueries() {}
 
 // StatementReturnType implements the Statement interface.
+func (*AlterIndexVisible) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*AlterIndexVisible) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterIndexVisible) StatementTag() string { return "ALTER INDEX" }
+
+func (*AlterIndexVisible) hiddenFromShowQueries() {}
+
+// StatementReturnType implements the Statement interface.
 func (*AlterTable) StatementReturnType() StatementReturnType { return DDL }
 
 // StatementType implements the Statement interface.
@@ -503,6 +515,19 @@ func (*ScheduledBackup) StatementTag() string { return "SCHEDULED BACKUP" }
 func (*ScheduledBackup) cclOnlyStatement() {}
 
 func (*ScheduledBackup) hiddenFromShowQueries() {}
+
+// StatementReturnType implements the Statement interface.
+func (*AlterBackupSchedule) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*AlterBackupSchedule) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterBackupSchedule) StatementTag() string { return "SCHEDULED BACKUP" }
+
+func (*AlterBackupSchedule) cclOnlyStatement() {}
+
+func (*AlterBackupSchedule) hiddenFromShowQueries() {}
 
 // StatementReturnType implements the Statement interface.
 func (*BeginTransaction) StatementReturnType() StatementReturnType { return Ack }
@@ -1923,7 +1948,10 @@ func (*AlterFunctionDepExtension) StatementTag() string { return "ALTER FUNCTION
 func (n *AlterChangefeed) String() string                     { return AsString(n) }
 func (n *AlterChangefeedCmds) String() string                 { return AsString(n) }
 func (n *AlterBackup) String() string                         { return AsString(n) }
+func (n *AlterBackupSchedule) String() string                 { return AsString(n) }
+func (n *AlterBackupScheduleCmds) String() string             { return AsString(n) }
 func (n *AlterIndex) String() string                          { return AsString(n) }
+func (n *AlterIndexVisible) String() string                   { return AsString(n) }
 func (n *AlterDatabaseOwner) String() string                  { return AsString(n) }
 func (n *AlterDatabaseAddRegion) String() string              { return AsString(n) }
 func (n *AlterDatabaseDropRegion) String() string             { return AsString(n) }

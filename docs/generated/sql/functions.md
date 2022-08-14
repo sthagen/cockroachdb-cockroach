@@ -637,6 +637,14 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="statement_timestamp"></a><code>statement_timestamp() &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Returns the start time of the current statement.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="strftime"></a><code>strftime(input: <a href="date.html">date</a>, extract_format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>From <code>input</code>, extracts and formats the time as identified in <code>extract_format</code> using standard <code>strftime</code> notation (though not all formatting is supported).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="strftime"></a><code>strftime(input: <a href="timestamp.html">timestamp</a>, extract_format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>From <code>input</code>, extracts and formats the time as identified in <code>extract_format</code> using standard <code>strftime</code> notation (though not all formatting is supported).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="strftime"></a><code>strftime(input: <a href="timestamp.html">timestamptz</a>, extract_format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>From <code>input</code>, extracts and formats the time as identified in <code>extract_format</code> using standard <code>strftime</code> notation (though not all formatting is supported).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="strptime"></a><code>strptime(input: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Returns <code>input</code> as a timestamptz using <code>format</code> (which uses standard <code>strptime</code> formatting).</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="timeofday"></a><code>timeofday() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current system time on one of the cluster nodes as a string.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="timezone"></a><code>timezone(timezone: <a href="string.html">string</a>, time: <a href="time.html">time</a>) &rarr; timetz</code></td><td><span class="funcdesc"><p>Treat given time without time zone as located in the specified time zone.</p>
@@ -862,6 +870,8 @@ available replica will error.</p>
 <tr><td><a name="tanh"></a><code>tanh(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the hyperbolic tangent of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="trunc"></a><code>trunc(val: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Truncates the decimal values of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="trunc"></a><code>trunc(val: <a href="decimal.html">decimal</a>, scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Truncate <code>val</code> to <code>scale</code> decimal places</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="trunc"></a><code>trunc(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Truncates the decimal values of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr></tbody>
@@ -2698,6 +2708,8 @@ The output can be used to recreate a database.’</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="encode"></a><code>encode(data: <a href="bytes.html">bytes</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Encodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="format"></a><code>format(<a href="string.html">string</a>, anyelement...) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Interprets the first argument as a format string similar to C sprintf and interpolates the remaining arguments.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="from_ip"></a><code>from_ip(val: <a href="bytes.html">bytes</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts the byte string representation of an IP to its character string representation.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="from_uuid"></a><code>from_uuid(val: <a href="bytes.html">bytes</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts the byte string representation of a UUID to its character string representation.</p>

@@ -401,6 +401,7 @@ crdb_internal       cluster_contended_tables
 crdb_internal       cluster_contention_events
 crdb_internal       cluster_database_privileges
 crdb_internal       cluster_distsql_flows
+crdb_internal       cluster_execution_insights
 crdb_internal       cluster_inflight_traces
 crdb_internal       cluster_locks
 crdb_internal       cluster_queries
@@ -726,6 +727,7 @@ cluster_contended_tables
 cluster_contention_events
 cluster_database_privileges
 cluster_distsql_flows
+cluster_execution_insights
 cluster_inflight_traces
 cluster_locks
 cluster_queries
@@ -1090,6 +1092,7 @@ system         crdb_internal       cluster_contended_tables               SYSTEM
 system         crdb_internal       cluster_contention_events              SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_database_privileges            SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_distsql_flows                  SYSTEM VIEW  NO                  1
+system         crdb_internal       cluster_execution_insights             SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_inflight_traces                SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_locks                          SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_queries                        SYSTEM VIEW  NO                  1
@@ -1576,6 +1579,7 @@ system              public             630200280_23_3_not_null                  
 system              public             primary                                                                                                         system         public        role_members                     PRIMARY KEY      NO             NO
 system              public             630200280_33_1_not_null                                                                                         system         public        role_options                     CHECK            NO             NO
 system              public             630200280_33_2_not_null                                                                                         system         public        role_options                     CHECK            NO             NO
+system              public             630200280_33_4_not_null                                                                                         system         public        role_options                     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        role_options                     PRIMARY KEY      NO             NO
 system              public             630200280_37_10_not_null                                                                                        system         public        scheduled_jobs                   CHECK            NO             NO
 system              public             630200280_37_1_not_null                                                                                         system         public        scheduled_jobs                   CHECK            NO             NO
@@ -1775,6 +1779,7 @@ system              public             630200280_32_6_not_null                  
 system              public             630200280_32_7_not_null                                                                                         verified IS NOT NULL
 system              public             630200280_33_1_not_null                                                                                         username IS NOT NULL
 system              public             630200280_33_2_not_null                                                                                         option IS NOT NULL
+system              public             630200280_33_4_not_null                                                                                         user_id IS NOT NULL
 system              public             630200280_34_1_not_null                                                                                         id IS NOT NULL
 system              public             630200280_34_3_not_null                                                                                         data IS NOT NULL
 system              public             630200280_35_1_not_null                                                                                         id IS NOT NULL
@@ -2151,6 +2156,7 @@ system         public        role_members                     isAdmin           
 system         public        role_members                     member                                                                                                    2
 system         public        role_members                     role                                                                                                      1
 system         public        role_options                     option                                                                                                    2
+system         public        role_options                     user_id                                                                                                   4
 system         public        role_options                     username                                                                                                  1
 system         public        role_options                     value                                                                                                     3
 system         public        scheduled_jobs                   created                                                                                                   3
@@ -2744,6 +2750,7 @@ NULL     public   system         crdb_internal       cluster_contended_tables   
 NULL     public   system         crdb_internal       cluster_contention_events              SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_database_privileges            SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_distsql_flows                  SELECT          NO            YES
+NULL     public   system         crdb_internal       cluster_execution_insights             SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_inflight_traces                SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_locks                          SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_queries                        SELECT          NO            YES
@@ -3315,6 +3322,7 @@ NULL     public   system         crdb_internal       cluster_contended_tables   
 NULL     public   system         crdb_internal       cluster_contention_events              SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_database_privileges            SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_distsql_flows                  SELECT          NO            YES
+NULL     public   system         crdb_internal       cluster_execution_insights             SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_inflight_traces                SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_locks                          SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_queries                        SELECT          NO            YES
@@ -4735,6 +4743,7 @@ opt_split_scan_limit                                  2048
 optimizer                                             on
 optimizer_use_histograms                              on
 optimizer_use_multicol_stats                          on
+optimizer_use_not_visible_indexes                     off
 override_multi_region_zone_config                     off
 parallelize_multi_key_lookup_joins_enabled            off
 password_encryption                                   scram-sha-256
@@ -4776,7 +4785,7 @@ transaction_rows_read_log                             0
 transaction_rows_written_err                          0
 transaction_rows_written_log                          0
 transaction_status                                    NoTxn
-troubleshooting_mode                          off
+troubleshooting_mode                                  off
 unconstrained_non_covering_index_scan_enabled         off
 xmloption                                             content
 

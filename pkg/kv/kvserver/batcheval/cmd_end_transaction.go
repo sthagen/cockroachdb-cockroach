@@ -629,7 +629,8 @@ func updateFinalizedTxn(
 			// BatchRequest writes.
 			return nil
 		}
-		return storage.MVCCDelete(ctx, readWriter, ms, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil)
+		_, err := storage.MVCCDelete(ctx, readWriter, ms, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil)
+		return err
 	}
 	txn.LockSpans = externalLocks
 	txn.InFlightWrites = nil
@@ -1205,14 +1206,7 @@ func mergeTrigger(
 
 	{
 		ridPrefix := keys.MakeRangeIDReplicatedPrefix(merge.RightDesc.RangeID)
-		// NB: Range-ID local keys have no versions and no intents.
-		iter := batch.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-			KeyTypes:   storage.IterKeyTypePointsAndRanges,
-			LowerBound: ridPrefix,
-			UpperBound: ridPrefix.PrefixEnd(),
-		})
-		defer iter.Close()
-		sysMS, err := iter.ComputeStats(ridPrefix, ridPrefix.PrefixEnd(), 0 /* nowNanos */)
+		sysMS, err := storage.ComputeStats(batch, ridPrefix, ridPrefix.PrefixEnd(), 0 /* nowNanos */)
 		if err != nil {
 			return result.Result{}, err
 		}

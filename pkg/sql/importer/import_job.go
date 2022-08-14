@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -256,8 +257,10 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		// will write.
 		details.Walltime = p.ExecCfg().Clock.Now().WallTime
 
-		// Check if the tables being imported into are starting empty, in which
-		// case we can cheaply clear-range instead of revert-range to cleanup.
+		// Check if the tables being imported into are starting empty, in which case
+		// we can cheaply clear-range instead of revert-range to cleanup (or if the
+		// cluster has finalized to 22.1, use DeleteRange without predicate
+		// filtering).
 		for i := range details.Tables {
 			if !details.Tables[i].IsNew {
 				tblDesc := tabledesc.NewBuilder(details.Tables[i].Desc).BuildImmutableTable()
@@ -267,6 +270,14 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 					return errors.Wrap(err, "checking if existing table is empty")
 				}
 				details.Tables[i].WasEmpty = len(res) == 0
+				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_1) {
+					// Update the descriptor in the job record and in the database with the ImportStartTime
+					details.Tables[i].Desc.ImportStartWallTime = details.Walltime
+					err := bindImportStartTime(ctx, p, tblDesc.GetID(), details.Walltime)
+					if err != nil {
+						return err
+					}
+				}
 			}
 		}
 
@@ -386,7 +397,8 @@ func (r *importResumer) prepareTablesForIngestion(
 				return importDetails, err
 			}
 			importDetails.Tables[i] = jobspb.ImportDetails_Table{
-				Desc: desc, Name: table.Name,
+				Desc:       desc,
+				Name:       table.Name,
 				SeqVal:     table.SeqVal,
 				IsNew:      table.IsNew,
 				TargetCols: table.TargetCols,
@@ -450,10 +462,10 @@ func (r *importResumer) prepareTablesForIngestion(
 	// wait for all nodes to see the same descriptor version before doing so.
 	if !hasExistingTables {
 		importDetails.Walltime = p.ExecCfg().Clock.Now().WallTime
+		// TODO(msbutler): add import start time to IMPORT PGDUMP/MYSQL descriptor
 	} else {
 		importDetails.Walltime = 0
 	}
-
 	return importDetails, nil
 }
 
@@ -676,6 +688,32 @@ func (r *importResumer) prepareSchemasForIngestion(
 	}
 
 	return schemaMetadata, err
+}
+
+// bindImportStarTime writes the ImportStarTime to the descriptor.
+func bindImportStartTime(
+	ctx context.Context, p sql.JobExecContext, id catid.DescID, startWallTime int64,
+) error {
+	if err := sql.DescsTxn(ctx, p.ExecCfg(), func(
+		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+	) error {
+		mutableDesc, err := descsCol.GetMutableTableVersionByID(ctx, id, txn)
+		if err != nil {
+			return err
+		}
+		if err := mutableDesc.InitializeImport(startWallTime); err != nil {
+			return err
+		}
+		if err := descsCol.WriteDesc(
+			ctx, false /* kvTrace */, mutableDesc, txn,
+		); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // createSchemaDescriptorWithID writes a schema descriptor with `id` to disk.
@@ -981,7 +1019,7 @@ func (r *importResumer) publishTables(
 					c.Validity = descpb.ConstraintValidity_Unvalidated
 				}
 			}
-
+			newTableDesc.FinalizeImport()
 			// TODO(dt): re-validate any FKs?
 			if err := descsCol.WriteDescToBatch(
 				ctx, false /* kvTrace */, newTableDesc, b,
@@ -1119,7 +1157,7 @@ func (r *importResumer) checkVirtualConstraints(
 		}
 
 		if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			ie := execCfg.InternalExecutorFactory(ctx, sql.NewFakeSessionData(execCfg.SV()))
+			ie := execCfg.InternalExecutorFactory.NewInternalExecutor(sql.NewFakeSessionData(execCfg.SV()))
 			return ie.WithSyntheticDescriptors([]catalog.Descriptor{desc}, func() error {
 				return sql.RevalidateUniqueConstraintsInTable(ctx, txn, user, ie, desc)
 			})
@@ -1461,6 +1499,11 @@ func (r *importResumer) dropTables(
 		return nil
 	}
 
+	// useDeleteRange indicates that the cluster has been finalized to 22.1 and
+	// can use MVCC compatible DeleteRange to with range tombstones during an import
+	// rollback.
+	useDeleteRange := r.settings.Version.IsActive(ctx, clusterversion.MVCCRangeTombstones)
+
 	var tableWasEmpty bool
 	var intoTable catalog.TableDescriptor
 	for _, tbl := range details.Tables {
@@ -1497,25 +1540,46 @@ func (r *importResumer) dropTables(
 		// it was rolled back to its pre-IMPORT state, and instead provide a manual
 		// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
 		ts := hlc.Timestamp{WallTime: details.Walltime}.Prev()
-
-		// disallowShadowingBelow=writeTS used to write means no existing keys could
-		// have been covered by a key imported and the table was offline to other
-		// writes, so even if GC has run it would not have GC'ed any keys to which
-		// we need to revert, so we can safely ignore the target-time GC check.
-		const ignoreGC = true
-		if err := sql.RevertTables(ctx, txn.DB(), execCfg, []catalog.TableDescriptor{intoTable}, ts, ignoreGC,
-			sql.RevertTableDefaultBatchSize); err != nil {
-			return errors.Wrap(err, "rolling back partially completed IMPORT")
+		if useDeleteRange {
+			predicates := roachpb.DeleteRangePredicates{StartTime: ts}
+			if err := sql.DeleteTableWithPredicate(
+				ctx,
+				execCfg.DB,
+				execCfg.Codec,
+				&execCfg.Settings.SV,
+				execCfg.DistSender,
+				intoTable,
+				predicates, sql.RevertTableDefaultBatchSize); err != nil {
+				return errors.Wrap(err, "rolling back IMPORT INTO in non empty table via DeleteRange")
+			}
+		} else {
+			// disallowShadowingBelow=writeTS used to write means no existing keys could
+			// have been covered by a key imported and the table was offline to other
+			// writes, so even if GC has run it would not have GC'ed any keys to which
+			// we need to revert, so we can safely ignore the target-time GC check.
+			const ignoreGC = true
+			if err := sql.RevertTables(ctx, txn.DB(), execCfg, []catalog.TableDescriptor{intoTable}, ts, ignoreGC,
+				sql.RevertTableDefaultBatchSize); err != nil {
+				return errors.Wrap(err, "rolling back partially completed IMPORT via RevertRange")
+			}
 		}
 	} else if tableWasEmpty {
-		// Set a DropTime on the table descriptor to differentiate it from an
-		// older-format (v1.1) descriptor. This enables ClearTableData to use a
-		// RangeClear for faster data removal, rather than removing by chunks.
-		intoTable.TableDesc().DropTime = int64(1)
-		if err := gcjob.ClearTableData(
-			ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, &execCfg.Settings.SV, intoTable,
-		); err != nil {
-			return errors.Wrapf(err, "clearing data for table %d", intoTable.GetID())
+		if useDeleteRange {
+			if err := gcjob.DeleteAllTableData(
+				ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, intoTable,
+			); err != nil {
+				return errors.Wrap(err, "rolling back IMPORT INTO in empty table via DeleteRange")
+			}
+		} else {
+			// Set a DropTime on the table descriptor to differentiate it from an
+			// older-format (v1.1) descriptor. This enables ClearTableData to use a
+			// RangeClear for faster data removal, rather than removing by chunks.
+			intoTable.TableDesc().DropTime = int64(1)
+			if err := gcjob.ClearTableData(
+				ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, &execCfg.Settings.SV, intoTable,
+			); err != nil {
+				return errors.Wrapf(err, "rolling back IMPORT INTO in empty table via ClearRange")
+			}
 		}
 	}
 
@@ -1526,6 +1590,7 @@ func (r *importResumer) dropTables(
 		return err
 	}
 	intoDesc.SetPublic()
+	intoDesc.FinalizeImport()
 	const kvTrace = false
 	if err := descsCol.WriteDescToBatch(ctx, kvTrace, intoDesc, b); err != nil {
 		return err

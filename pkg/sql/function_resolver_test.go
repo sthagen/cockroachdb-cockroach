@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -219,7 +220,7 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 			testName:    "unsupported builtin function",
 			funName:     tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{"querytree", "", "", ""}},
 			searchPath:  []string{"sc1", "sc2"},
-			expectedErr: "querytree(): unimplemented: this function is not yet supported",
+			expectedErr: `querytree\(\): unimplemented: this function is not yet supported`,
 		},
 		// TODO(Chengxiong): add test case for builtin function names when builtin
 		// OIDs are changed to fixed IDs.
@@ -248,7 +249,7 @@ CREATE FUNCTION sc1.lower() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 3 $$
 			path := sessiondata.MakeSearchPath(tc.searchPath)
 			funcDef, err := funcResolver.ResolveFunction(ctx, &tc.funName, &path)
 			if tc.expectedErr != "" {
-				require.Equal(t, tc.expectedErr, err.Error())
+				require.Regexp(t, tc.expectedErr, err.Error())
 				continue
 			}
 			require.NoError(t, err)
@@ -344,7 +345,6 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ 
 			testName:         "implicit pg_catalog schema in path",
 			exprStr:          "lower('HI')",
 			searchPath:       []string{"sc1", "sc2"},
-			expectedFuncOID:  825,
 			expectedFuncBody: "",
 			desiredType:      types.String,
 		},
@@ -391,7 +391,7 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ 
 				}
 				typeChecked, err := tree.TypeCheck(ctx, expr, &semaCtx, desired)
 				if tc.expectedErr != "" {
-					require.Equal(t, tc.expectedErr, err.Error())
+					require.Regexp(t, tc.expectedErr, err.Error())
 					return
 				}
 				require.NoError(t, err)
@@ -400,9 +400,15 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ 
 				require.Equal(t, tc.expectedFuncBody, funcExpr.ResolvedOverload().Body)
 				if tc.expectedFuncBody != "" {
 					require.True(t, funcExpr.ResolvedOverload().IsUDF)
+				} else {
+					require.False(t, funcExpr.ResolvedOverload().IsUDF)
 				}
 				require.False(t, funcExpr.ResolvedOverload().UDFContainsOnlySignature)
-				require.Equal(t, tc.expectedFuncOID, int(funcExpr.ResolvedOverload().Oid))
+				if tc.expectedFuncOID > 0 {
+					require.Equal(t, tc.expectedFuncOID, int(funcExpr.ResolvedOverload().Oid))
+				} else {
+					require.False(t, funcdesc.IsOIDUserDefinedFunc(funcExpr.ResolvedOverload().Oid))
+				}
 				require.Equal(t, tc.expectedFuncBody, funcExpr.ResolvedOverload().Body)
 			})
 		}

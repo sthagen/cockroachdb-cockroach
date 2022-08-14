@@ -2674,99 +2674,109 @@ func TestBackupRestoreDuringUserDefinedTypeChange(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Protects numTypeChangesStarted and numTypeChangesFinished.
-			var mu syncutil.Mutex
-			numTypeChangesStarted := 0
-			numTypeChangesFinished := 0
-			typeChangesStarted := make(chan struct{})
-			waitForBackup := make(chan struct{})
-			typeChangesFinished := make(chan struct{})
-			_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, 0, InitManualReplication, base.TestClusterArgs{
-				ServerArgs: base.TestServerArgs{
-					Knobs: base.TestingKnobs{
-						SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
-							RunBeforeEnumMemberPromotion: func(context.Context) error {
-								mu.Lock()
-								if numTypeChangesStarted < len(tc.queries) {
-									numTypeChangesStarted++
-									if numTypeChangesStarted == len(tc.queries) {
-										close(typeChangesStarted)
+		for _, isSchemaOnly := range []bool{true, false} {
+			suffix := ""
+			if isSchemaOnly {
+				suffix = "-schema-only"
+			}
+			t.Run(tc.name+suffix, func(t *testing.T) {
+				// Protects numTypeChangesStarted and numTypeChangesFinished.
+				var mu syncutil.Mutex
+				numTypeChangesStarted := 0
+				numTypeChangesFinished := 0
+				typeChangesStarted := make(chan struct{})
+				waitForBackup := make(chan struct{})
+				typeChangesFinished := make(chan struct{})
+				_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, 0, InitManualReplication, base.TestClusterArgs{
+					ServerArgs: base.TestServerArgs{
+						Knobs: base.TestingKnobs{
+							SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
+								RunBeforeEnumMemberPromotion: func(context.Context) error {
+									mu.Lock()
+									if numTypeChangesStarted < len(tc.queries) {
+										numTypeChangesStarted++
+										if numTypeChangesStarted == len(tc.queries) {
+											close(typeChangesStarted)
+										}
+										mu.Unlock()
+										<-waitForBackup
+									} else {
+										mu.Unlock()
 									}
-									mu.Unlock()
-									<-waitForBackup
-								} else {
-									mu.Unlock()
-								}
-								return nil
+									return nil
+								},
 							},
 						},
 					},
-				},
-			})
-			defer cleanupFn()
+				})
+				defer cleanupFn()
 
-			// Create a database with a type.
-			sqlDB.Exec(t, `
+				// Create a database with a type.
+				sqlDB.Exec(t, `
 CREATE DATABASE d;
 CREATE TYPE d.greeting AS ENUM ('hello', 'howdy', 'hi');
 `)
 
-			// Start ALTER TYPE statement(s) that will block.
-			for _, query := range tc.queries {
-				go func(query string, totalQueries int) {
-					// Note we don't use sqlDB.Exec here because we can't Fatal from within a goroutine.
-					if _, err := sqlDB.DB.ExecContext(context.Background(), query); err != nil {
-						t.Error(err)
-					}
-					mu.Lock()
-					numTypeChangesFinished++
-					if numTypeChangesFinished == totalQueries {
-						close(typeChangesFinished)
-					}
-					mu.Unlock()
-				}(query, len(tc.queries))
-			}
+				// Start ALTER TYPE statement(s) that will block.
+				for _, query := range tc.queries {
+					go func(query string, totalQueries int) {
+						// Note we don't use sqlDB.Exec here because we can't Fatal from within a goroutine.
+						if _, err := sqlDB.DB.ExecContext(context.Background(), query); err != nil {
+							t.Error(err)
+						}
+						mu.Lock()
+						numTypeChangesFinished++
+						if numTypeChangesFinished == totalQueries {
+							close(typeChangesFinished)
+						}
+						mu.Unlock()
+					}(query, len(tc.queries))
+				}
 
-			// Wait on the type changes to start.
-			<-typeChangesStarted
+				// Wait on the type changes to start.
+				<-typeChangesStarted
 
-			// Now create a backup while the type change job is blocked so that
-			// greeting is backed up with some enum members in READ_ONLY state.
-			sqlDB.Exec(t, `BACKUP DATABASE d TO 'nodelocal://0/test/'`)
+				// Now create a backup while the type change job is blocked so that
+				// greeting is backed up with some enum members in READ_ONLY state.
+				sqlDB.Exec(t, `BACKUP DATABASE d TO 'nodelocal://0/test/'`)
 
-			// Let the type change finish.
-			close(waitForBackup)
-			<-typeChangesFinished
+				// Let the type change finish.
+				close(waitForBackup)
+				<-typeChangesFinished
 
-			// Now drop the database and restore.
-			sqlDB.Exec(t, `DROP DATABASE d`)
-			sqlDB.Exec(t, `RESTORE DATABASE d FROM 'nodelocal://0/test/'`)
+				// Now drop the database and restore.
+				sqlDB.Exec(t, `DROP DATABASE d`)
+				restoreQuery := `RESTORE DATABASE d FROM 'nodelocal://0/test/'`
+				if isSchemaOnly {
+					restoreQuery = restoreQuery + " with schema_only"
+				}
+				sqlDB.Exec(t, restoreQuery)
 
-			// The type change job should be scheduled and finish. Note that we can't use
-			// sqlDB.CheckQueryResultsRetry as it Fatal's upon an error. The case below
-			// will error until the job completes.
-			for i, query := range tc.succeedAfter {
-				testutils.SucceedsSoon(t, func() error {
-					_, err := sqlDB.DB.ExecContext(context.Background(), query)
-					return err
-				})
-				sqlDB.CheckQueryResults(t, query, [][]string{{tc.expectedSuccess[i]}})
-			}
+				// The type change job should be scheduled and finish. Note that we can't use
+				// sqlDB.CheckQueryResultsRetry as it Fatal's upon an error. The case below
+				// will error until the job completes.
+				for i, query := range tc.succeedAfter {
+					testutils.SucceedsSoon(t, func() error {
+						_, err := sqlDB.DB.ExecContext(context.Background(), query)
+						return err
+					})
+					sqlDB.CheckQueryResults(t, query, [][]string{{tc.expectedSuccess[i]}})
+				}
 
-			for i, query := range tc.errorAfter {
-				testutils.SucceedsSoon(t, func() error {
-					_, err := sqlDB.DB.ExecContext(context.Background(), query)
-					if err == nil {
-						return errors.New("expected error, found none")
-					}
-					if !testutils.IsError(err, tc.expectedError[i]) {
-						return errors.Newf("expected error %q, found %v", tc.expectedError[i], pgerror.FullError(err))
-					}
-					return nil
-				})
-			}
-		})
+				for i, query := range tc.errorAfter {
+					testutils.SucceedsSoon(t, func() error {
+						_, err := sqlDB.DB.ExecContext(context.Background(), query)
+						if err == nil {
+							return errors.New("expected error, found none")
+						}
+						if !testutils.IsError(err, tc.expectedError[i]) {
+							return errors.Newf("expected error %q, found %v", tc.expectedError[i], pgerror.FullError(err))
+						}
+						return nil
+					})
+				}
+			})
+		}
 	}
 }
 
@@ -3467,10 +3477,10 @@ func TestBackupTenantsWithRevisionHistory(t *testing.T) {
 
 	const msg = "can not backup tenants with revision history"
 
-	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TENANT 10 TO 'nodelocal://0/' WITH revision_history`)
+	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TENANT 10 TO 'nodelocal://0/foo' WITH revision_history`)
 	require.Contains(t, fmt.Sprint(err), msg)
 
-	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TO 'nodelocal://0/' WITH revision_history`)
+	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TO 'nodelocal://0/bar' WITH revision_history`)
 	require.Contains(t, fmt.Sprint(err), msg)
 }
 
@@ -4006,28 +4016,28 @@ func TestTimestampMismatch(t *testing.T) {
 		sqlDB.ExpectErr(
 			t, "backups listed out of order",
 			`BACKUP DATABASE data TO $1 INCREMENTAL FROM $2`,
-			localFoo, incrementalT1FromFull,
+			localFoo+"/missing-initial", incrementalT1FromFull,
 		)
 
 		// Missing an intermediate incremental backup.
 		sqlDB.ExpectErr(
 			t, "backups listed out of order",
 			`BACKUP DATABASE data TO $1 INCREMENTAL FROM $2, $3`,
-			localFoo, fullBackup, incrementalT2FromT1,
+			localFoo+"/missing-incremental", fullBackup, incrementalT2FromT1,
 		)
 
 		// Backups specified out of order.
 		sqlDB.ExpectErr(
 			t, "out of order",
 			`BACKUP DATABASE data TO $1 INCREMENTAL FROM $2, $3`,
-			localFoo, incrementalT1FromFull, fullBackup,
+			localFoo+"/ooo", incrementalT1FromFull, fullBackup,
 		)
 
 		// Missing data for one table in the most recent backup.
 		sqlDB.ExpectErr(
 			t, "previous backup does not contain table",
 			`BACKUP DATABASE data TO $1 INCREMENTAL FROM $2, $3`,
-			localFoo, fullBackup, incrementalT3FromT1OneTable,
+			localFoo+"/missing-table-data", fullBackup, incrementalT3FromT1OneTable,
 		)
 	})
 
@@ -5953,7 +5963,7 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 
 		// Kickoff an incremental backup, but pause it just after it writes its
 		// protected timestamps.
-		runner.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'backup.before_flow'`)
+		runner.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'backup.before.flow'`)
 
 		var jobID int
 		runner.QueryRow(t,
@@ -6428,7 +6438,7 @@ func TestProtectedTimestampsFailDueToLimits(t *testing.T) {
 
 	// Creating the protected timestamp record should fail because there are too
 	// many spans. Ensure that we get the appropriate error.
-	_, err := db.Exec(`BACKUP TABLE foo, bar TO 'nodelocal://0/foo'`)
+	_, err := db.Exec(`BACKUP TABLE foo, bar TO 'nodelocal://0/foo/byte-limit'`)
 	require.EqualError(t, err, "pq: protectedts: limit exceeded: 0+30 > 1 bytes")
 
 	// TODO(adityamaru): Remove in 22.2 once no records protect spans.
@@ -6449,7 +6459,7 @@ func TestProtectedTimestampsFailDueToLimits(t *testing.T) {
 
 		// Creating the protected timestamp record should fail because there are too
 		// many spans. Ensure that we get the appropriate error.
-		_, err := db.Exec(`BACKUP TABLE foo, bar TO 'nodelocal://0/foo'`)
+		_, err := db.Exec(`BACKUP TABLE foo, bar TO 'nodelocal://0/foo/spans-limit'`)
 		require.EqualError(t, err, "pq: protectedts: limit exceeded: 0+2 > 1 spans")
 	})
 }
@@ -8308,143 +8318,6 @@ func flipBitInManifests(t *testing.T, rawDir string) {
 	}
 }
 
-func TestFullClusterTemporaryBackupAndRestore(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderRace(t, "times out under race cause it starts up two test servers")
-
-	numNodes := 4
-	// Start a new server that shares the data directory.
-	settings := cluster.MakeTestingClusterSettings()
-	sql.TempObjectWaitInterval.Override(context.Background(), &settings.SV, time.Microsecond*0)
-	dir, dirCleanupFn := testutils.TempDir(t)
-	defer dirCleanupFn()
-	params := base.TestClusterArgs{}
-	params.ServerArgs.ExternalIODir = dir
-	// This test fails when run within a tenant. Tracked with #76378.
-	params.ServerArgs.DisableDefaultTestTenant = true
-	params.ServerArgs.UseDatabase = "defaultdb"
-	params.ServerArgs.Settings = settings
-	knobs := base.TestingKnobs{
-		SQLExecutor: &sql.ExecutorTestingKnobs{
-			DisableTempObjectsCleanupOnSessionExit: true,
-		},
-	}
-	params.ServerArgs.Knobs = knobs
-	tc := serverutils.StartNewTestCluster(
-		t, numNodes, params,
-	)
-	defer tc.Stopper().Stop(context.Background())
-
-	// Start two temporary schemas and create a table in each. This table will
-	// have different pg_temp schemas but will be created in the same defaultdb.
-	comment := "never see this"
-	for _, connID := range []int{0, 1} {
-		conn := tc.ServerConn(connID)
-		sqlDB := sqlutils.MakeSQLRunner(conn)
-		sqlDB.Exec(t, `SET experimental_enable_temp_tables=true`)
-		sqlDB.Exec(t, `CREATE TEMP TABLE t (x INT)`)
-		sqlDB.Exec(t, fmt.Sprintf(`COMMENT ON TABLE t IS '%s'`, comment))
-		require.NoError(t, conn.Close())
-	}
-
-	// Create a third session where we have two temp tables which will be in the
-	// same pg_temp schema with the same name but in different DBs.
-	diffDBConn := tc.ServerConn(2)
-	diffDB := sqlutils.MakeSQLRunner(diffDBConn)
-	diffDB.Exec(t, `SET experimental_enable_temp_tables=true`)
-	diffDB.Exec(t, `CREATE DATABASE d1`)
-	diffDB.Exec(t, `USE d1`)
-	diffDB.Exec(t, `CREATE TEMP TABLE t (x INT)`)
-	diffDB.Exec(t, `CREATE DATABASE d2`)
-	diffDB.Exec(t, `USE d2`)
-	diffDB.Exec(t, `CREATE TEMP TABLE t (x INT)`)
-	require.NoError(t, diffDBConn.Close())
-
-	backupDBConn := tc.ServerConn(3)
-	backupDB := sqlutils.MakeSQLRunner(backupDBConn)
-	backupDB.Exec(t, `BACKUP TO 'nodelocal://0/full_cluster_backup'`)
-	require.NoError(t, backupDBConn.Close())
-
-	params = base.TestClusterArgs{}
-	ch := make(chan time.Time)
-	finishedCh := make(chan struct{})
-	knobs = base.TestingKnobs{
-		SQLExecutor: &sql.ExecutorTestingKnobs{
-			OnTempObjectsCleanupDone: func() {
-				finishedCh <- struct{}{}
-			},
-			TempObjectsCleanupCh: ch,
-		},
-	}
-	params.ServerArgs.Knobs = knobs
-	params.ServerArgs.Settings = settings
-	_, sqlDBRestore, cleanupRestore := backupRestoreTestSetupEmpty(t, singleNode, dir, InitManualReplication,
-		params)
-	defer cleanupRestore()
-	sqlDBRestore.Exec(t, `RESTORE FROM 'nodelocal://0/full_cluster_backup'`)
-
-	// Before the reconciliation job runs we should be able to see the following:
-	// - 2 synthesized pg_temp sessions in defaultdb and 1 each in db1 and db2.
-	// We synthesize a new temp schema for each unique backed-up schemaID
-	// of a temporary table descriptor.
-	// - All temp tables remapped to belong to the associated synthesized temp
-	// schema in the original db.
-	checkSchemasQuery := `SELECT count(*) FROM [SHOW SCHEMAS] WHERE schema_name LIKE 'pg_temp_%'`
-	sqlDBRestore.CheckQueryResults(t, checkSchemasQuery, [][]string{{"2"}})
-
-	checkTempTablesQuery := `SELECT table_name FROM [SHOW TABLES] ORDER BY table_name`
-	sqlDBRestore.CheckQueryResults(t, checkTempTablesQuery, [][]string{{"t"}, {"t"}})
-
-	// Sanity check that the databases the temporary tables originally belonged to
-	// are restored.
-	sqlDBRestore.CheckQueryResults(t,
-		`SELECT database_name FROM [SHOW DATABASES] ORDER BY database_name`,
-		[][]string{{"d1"}, {"d2"}, {"defaultdb"}, {"postgres"}, {"system"}})
-
-	// Check that we can see the comment on the temporary tables before the
-	// reconciliation job runs.
-	checkCommentQuery := fmt.Sprintf(`SELECT count(comment) FROM system.comments WHERE comment='%s'`,
-		comment)
-	var commentCount int
-	sqlDBRestore.QueryRow(t, checkCommentQuery).Scan(&commentCount)
-	require.Equal(t, commentCount, 2)
-
-	// Check that show tables in one of the restored DBs returns the temporary
-	// table.
-	sqlDBRestore.Exec(t, "USE d1")
-	sqlDBRestore.CheckQueryResults(t, checkTempTablesQuery, [][]string{
-		{"t"},
-	})
-	sqlDBRestore.CheckQueryResults(t, checkSchemasQuery, [][]string{{"1"}})
-
-	sqlDBRestore.Exec(t, "USE d2")
-	sqlDBRestore.CheckQueryResults(t, checkTempTablesQuery, [][]string{
-		{"t"},
-	})
-	sqlDBRestore.CheckQueryResults(t, checkSchemasQuery, [][]string{{"1"}})
-
-	testutils.SucceedsSoon(t, func() error {
-		ch <- timeutil.Now()
-		<-finishedCh
-
-		for _, database := range []string{"defaultdb", "d1", "d2"} {
-			sqlDBRestore.Exec(t, fmt.Sprintf("USE %s", database))
-			// Check that all the synthesized temp schemas have been wiped.
-			sqlDBRestore.CheckQueryResults(t, checkSchemasQuery, [][]string{{"0"}})
-
-			// Check that all the temp tables have been wiped.
-			sqlDBRestore.CheckQueryResults(t, checkTempTablesQuery, [][]string{})
-
-			// Check that all the temp table comments have been wiped.
-			sqlDBRestore.QueryRow(t, checkCommentQuery).Scan(&commentCount)
-			require.Equal(t, commentCount, 0)
-		}
-		return nil
-	})
-}
-
 func TestRestoreJobEventLogging(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.ScopeWithoutShowLogs(t).Close(t)
@@ -9427,7 +9300,7 @@ func TestExportRequestBelowGCThresholdOnDataExcludedFromBackup(t *testing.T) {
 			return nil
 		})
 
-	_, err = conn.Exec(fmt.Sprintf("BACKUP TABLE foo TO $1 AS OF SYSTEM TIME '%s'", tsBefore), localFoo)
+	_, err = conn.Exec(fmt.Sprintf("BACKUP TABLE foo TO $1 AS OF SYSTEM TIME '%s'", tsBefore), localFoo+"/fail")
 	testutils.IsError(err, "must be after replica GC threshold")
 
 	_, err = conn.Exec(`ALTER TABLE foo SET (exclude_data_from_backup = true)`)
@@ -9439,7 +9312,7 @@ func TestExportRequestBelowGCThresholdOnDataExcludedFromBackup(t *testing.T) {
 		return true, nil
 	})
 
-	_, err = conn.Exec(fmt.Sprintf("BACKUP TABLE foo TO $1 AS OF SYSTEM TIME '%s'", tsBefore), localFoo)
+	_, err = conn.Exec(fmt.Sprintf("BACKUP TABLE foo TO $1 AS OF SYSTEM TIME '%s'", tsBefore), localFoo+"/succeed")
 	require.NoError(t, err)
 }
 
@@ -9504,7 +9377,7 @@ func TestExcludeDataFromBackupDoesNotHoldupGC(t *testing.T) {
 		return true, nil
 	})
 
-	runner.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'backup.before_flow'`)
+	runner.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'backup.before.flow'`)
 	if _, err := conn.Exec(`BACKUP DATABASE test INTO $1`, localFoo); !testutils.IsError(err, "pause") {
 		t.Fatal(err)
 	}

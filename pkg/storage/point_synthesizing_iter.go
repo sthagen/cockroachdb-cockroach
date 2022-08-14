@@ -15,7 +15,6 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -636,11 +635,9 @@ func (i *pointSynthesizingIter) RangeKeys() MVCCRangeKeyStack {
 	return MVCCRangeKeyStack{}
 }
 
-// ComputeStats implements MVCCIterator.
-func (i *pointSynthesizingIter) ComputeStats(
-	start, end roachpb.Key, nowNanos int64,
-) (enginepb.MVCCStats, error) {
-	return i.iter.ComputeStats(start, end, nowNanos)
+// RangeKeyChanged implements MVCCIterator.
+func (i *pointSynthesizingIter) RangeKeyChanged() bool {
+	return false
 }
 
 // FindSplitKey implements MVCCIterator.

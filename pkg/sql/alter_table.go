@@ -18,14 +18,18 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -34,15 +38,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam/tablestorageparam"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -554,10 +561,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 						"constraint %q in the middle of being added, try again later", t.Constraint)
 				}
-				if err := validateCheckInTxn(
-					params.ctx, &params.p.semaCtx, params.ExecCfg().InternalExecutorFactory,
-					params.SessionData(), n.tableDesc, params.p.Txn(), ck.Expr,
-				); err != nil {
+				if err := params.p.WithInternalExecutor(params.ctx, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error {
+					return validateCheckInTxn(ctx, &params.p.semaCtx, params.p.SessionData(), n.tableDesc, txn, ie, ck.Expr)
+				}); err != nil {
 					return err
 				}
 				ck.Validity = descpb.ConstraintValidity_Validated
@@ -577,19 +583,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 						"constraint %q in the middle of being added, try again later", t.Constraint)
 				}
-				if err := validateFkInTxn(
-					params.ctx,
-					params.ExecCfg().InternalExecutorFactory,
-					params.p.SessionData(),
-					n.tableDesc,
-					params.p.Txn(),
-					params.p.Descriptors(),
-					name,
-				); err != nil {
+				if err := params.p.WithInternalExecutor(params.ctx, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error {
+					return validateFkInTxn(ctx, n.tableDesc, txn, ie, params.p.descCollection, name)
+				}); err != nil {
 					return err
 				}
 				foundFk.Validity = descpb.ConstraintValidity_Validated
-
 			case descpb.ConstraintTypeUnique:
 				if constraint.Index == nil {
 					var foundUnique *descpb.UniqueWithoutIndexConstraint
@@ -606,11 +605,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 						return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 							"constraint %q in the middle of being added, try again later", t.Constraint)
 					}
-					if err := validateUniqueWithoutIndexConstraintInTxn(
-						params.ctx, params.ExecCfg().InternalExecutorFactory(
-							params.ctx, params.SessionData(),
-						), n.tableDesc, params.p.Txn(), params.p.User(), name,
-					); err != nil {
+					if err := params.p.WithInternalExecutor(params.ctx, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error {
+						return validateUniqueWithoutIndexConstraintInTxn(
+							params.ctx,
+							n.tableDesc,
+							txn,
+							ie,
+							params.p.User(),
+							name,
+						)
+					}); err != nil {
 						return err
 					}
 					foundUnique.Validity = descpb.ConstraintValidity_Validated
@@ -836,7 +840,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			depViewRenameError := func(objType string, refTableID descpb.ID) error {
-				return params.p.dependentViewError(params.ctx,
+				return params.p.dependentError(params.ctx,
 					objType, tree.ErrString(&t.NewName), n.tableDesc.ParentID, refTableID, "rename",
 				)
 			}
@@ -907,9 +911,27 @@ func (p *planner) setAuditMode(
 	p.curPlan.auditEvents = append(p.curPlan.auditEvents,
 		auditEvent{desc: desc, writing: true})
 
-	// We require root for now. Later maybe use a different permission?
-	if err := p.RequireAdminRole(ctx, "change auditing settings on a table"); err != nil {
+	// Requires admin or MODIFYCLUSTERSETTING as of 22.2
+	hasAdmin, err := p.HasAdminRole(ctx)
+	if err != nil {
 		return false, err
+	}
+	if !hasAdmin {
+		// Check for system privilege first, otherwise fall back to role options.
+		hasModify := false
+		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+			hasModify = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING) == nil
+		}
+		if !hasModify {
+			hasModify, err = p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
+			if err != nil {
+				return false, err
+			}
+			if !hasModify {
+				return false, pgerror.Newf(pgcode.InsufficientPrivilege,
+					"only users with admin or %s system privilege are allowed to change audit settings on a table ", privilege.MODIFYCLUSTERSETTING.String())
+			}
+		}
 	}
 
 	telemetry.Inc(sqltelemetry.SchemaSetAuditModeCounter(auditMode.TelemetryName()))
@@ -1258,6 +1280,17 @@ func injectTableStats(
 		return err
 	}
 
+	// Check that we're not injecting any forecasted stats.
+	for i := range jsonStats {
+		if jsonStats[i].Name == jobspb.ForecastStatsName {
+			return errors.WithHintf(
+				pgerror.New(pgcode.InvalidName, "cannot inject forecasted statistics"),
+				"either remove forecasts from the statement, or rename them from %q to something else",
+				jobspb.ForecastStatsName,
+			)
+		}
+	}
+
 	// First, delete all statistics for the table.
 	if _ /* rows */, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 		params.ctx,
@@ -1589,9 +1622,6 @@ func dropColumnImpl(
 	// You can't drop a column depended on by a view unless CASCADE was
 	// specified.
 	for _, ref := range tableDesc.DependedOnBy {
-		if err := params.p.maybeFailOnDroppingFunction(params.ctx, ref.ID); err != nil {
-			return nil, err
-		}
 		found := false
 		for _, colID := range ref.ColumnIDs {
 			if colID == colToDrop.GetID() {
@@ -1602,31 +1632,38 @@ func dropColumnImpl(
 		if !found {
 			continue
 		}
-		err := params.p.canRemoveDependentViewGeneric(
+		err := params.p.canRemoveDependent(
 			params.ctx, "column", string(t.Column), tableDesc.ParentID, ref, t.DropBehavior,
 		)
 		if err != nil {
 			return nil, err
 		}
-		viewDesc, err := params.p.getViewDescForCascade(
+		depDesc, err := params.p.getDescForCascade(
 			params.ctx, "column", string(t.Column), tableDesc.ParentID, ref.ID, t.DropBehavior,
 		)
 		if err != nil {
 			return nil, err
 		}
-		jobDesc := fmt.Sprintf("removing view %q dependent on column %q which is being dropped",
-			viewDesc.Name, colToDrop.ColName())
-		cascadedViews, err := params.p.removeDependentView(params.ctx, tableDesc, viewDesc, jobDesc)
-		if err != nil {
-			return nil, err
-		}
-		qualifiedView, err := params.p.getQualifiedTableName(params.ctx, viewDesc)
-		if err != nil {
-			return nil, err
-		}
+		switch t := depDesc.(type) {
+		case *tabledesc.Mutable:
+			jobDesc := fmt.Sprintf("removing view %q dependent on column %q which is being dropped",
+				t.Name, colToDrop.ColName())
+			cascadedViews, err := params.p.removeDependentView(params.ctx, tableDesc, t, jobDesc)
+			if err != nil {
+				return nil, err
+			}
+			qualifiedView, err := params.p.getQualifiedTableName(params.ctx, t)
+			if err != nil {
+				return nil, err
+			}
 
-		droppedViews = append(droppedViews, cascadedViews...)
-		droppedViews = append(droppedViews, qualifiedView.FQString())
+			droppedViews = append(droppedViews, cascadedViews...)
+			droppedViews = append(droppedViews, qualifiedView.FQString())
+		case *funcdesc.Mutable:
+			if err := params.p.removeDependentFunction(params.ctx, tableDesc, t); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// We cannot remove this column if there are computed columns that use it.

@@ -65,7 +65,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
@@ -110,6 +109,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalClusterContendedTablesViewID:       crdbInternalClusterContendedTablesView,
 		catconstants.CrdbInternalClusterContentionEventsTableID:     crdbInternalClusterContentionEventsTable,
 		catconstants.CrdbInternalClusterDistSQLFlowsTableID:         crdbInternalClusterDistSQLFlowsTable,
+		catconstants.CrdbInternalClusterExecutionInsightsTableID:    crdbInternalClusterExecutionInsightsTable,
 		catconstants.CrdbInternalClusterLocksTableID:                crdbInternalClusterLocksTable,
 		catconstants.CrdbInternalClusterQueriesTableID:              crdbInternalClusterQueriesTable,
 		catconstants.CrdbInternalClusterTransactionsTableID:         crdbInternalClusterTxnsTable,
@@ -2591,44 +2591,61 @@ CREATE TABLE crdb_internal.create_function_statements (
 )
 `,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachSchema(ctx, p, db, func(sc catalog.SchemaDescriptor) error {
-			return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-				fnDesc, err := p.Descriptors().GetImmutableFunctionByID(ctx, p.txn, overload.ID, tree.ObjectLookupFlags{})
-				if err != nil {
-					return err
-				}
-				treeNode, err := fnDesc.ToCreateExpr()
-				treeNode.FuncName.ObjectNamePrefix = tree.ObjectNamePrefix{
-					ExplicitSchema: true,
-					SchemaName:     tree.Name(sc.GetName()),
-				}
-				if err != nil {
-					return err
-				}
-				for i := range treeNode.Options {
-					if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
-						stmtStrs := strings.Split(string(body), "\n")
-						for i := range stmtStrs {
-							stmtStrs[i] = "\t" + stmtStrs[i]
-						}
-
-						p := &treeNode.Options[i]
-						// Add two new lines just for better formatting.
-						*p = "\n" + tree.FunctionBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
+		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidLeased: true}}
+		var dbDescs []catalog.DatabaseDescriptor
+		if db == nil {
+			var err error
+			dbDescs, err = p.Descriptors().GetAllDatabaseDescriptors(ctx, p.Txn())
+			if err != nil {
+				return err
+			}
+		} else {
+			dbDescs = append(dbDescs, db)
+		}
+		for _, db := range dbDescs {
+			err := forEachSchema(ctx, p, db, func(sc catalog.SchemaDescriptor) error {
+				return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
+					fnDesc, err := p.Descriptors().GetImmutableFunctionByID(ctx, p.txn, overload.ID, flags)
+					if err != nil {
+						return err
 					}
-				}
+					treeNode, err := fnDesc.ToCreateExpr()
+					treeNode.FuncName.ObjectNamePrefix = tree.ObjectNamePrefix{
+						ExplicitSchema: true,
+						SchemaName:     tree.Name(sc.GetName()),
+					}
+					if err != nil {
+						return err
+					}
+					for i := range treeNode.Options {
+						if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
+							stmtStrs := strings.Split(string(body), "\n")
+							for i := range stmtStrs {
+								stmtStrs[i] = "\t" + stmtStrs[i]
+							}
 
-				return addRow(
-					tree.NewDInt(tree.DInt(db.GetID())),      // database_id
-					tree.NewDString(db.GetName()),            // database_name
-					tree.NewDInt(tree.DInt(sc.GetID())),      // schema_id
-					tree.NewDString(sc.GetName()),            // schema_name
-					tree.NewDInt(tree.DInt(fnDesc.GetID())),  // function_id
-					tree.NewDString(fnDesc.GetName()),        //function_name
-					tree.NewDString(tree.AsString(treeNode)), // create_statement
-				)
+							p := &treeNode.Options[i]
+							// Add two new lines just for better formatting.
+							*p = "\n" + tree.FunctionBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
+						}
+					}
+
+					return addRow(
+						tree.NewDInt(tree.DInt(db.GetID())),      // database_id
+						tree.NewDString(db.GetName()),            // database_name
+						tree.NewDInt(tree.DInt(sc.GetID())),      // schema_id
+						tree.NewDString(sc.GetName()),            // schema_name
+						tree.NewDInt(tree.DInt(fnDesc.GetID())),  // function_id
+						tree.NewDString(fnDesc.GetName()),        //function_name
+						tree.NewDString(tree.AsString(treeNode)), // create_statement
+					)
+				})
 			})
-		})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	},
 }
 
@@ -5555,7 +5572,7 @@ SELECT
   plan_hash,
   app_name,
   max(metadata) as metadata,
-  crdb_internal.merge_statement_stats(array_agg(statistics)),
+  crdb_internal.merge_statement_stats(array_agg(DISTINCT statistics)),
   max(sampled_plan),
   aggregation_interval,
   array_remove(array_agg(index_rec), NULL) AS index_recommendations
@@ -6291,9 +6308,9 @@ func populateClusterLocksWithFilter(
 	return matched, err
 }
 
-var crdbInternalNodeExecutionInsightsTable = virtualSchemaTable{
-	schema: `
-CREATE TABLE crdb_internal.node_execution_insights (
+// This is the table structure for both cluster_execution_insights and node_execution_insights.
+const executionInsightsSchemaPattern = `
+CREATE TABLE crdb_internal.%s (
 	session_id                 STRING NOT NULL,
 	txn_id                     UUID NOT NULL,
 	txn_fingerprint_id         BYTES NOT NULL,
@@ -6314,59 +6331,94 @@ CREATE TABLE crdb_internal.node_execution_insights (
 	retries                    INT8 NOT NULL,
 	last_retry_reason          STRING,
 	exec_node_ids              INT[] NOT NULL
-);`,
+)`
+
+var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
+	schema: fmt.Sprintf(executionInsightsSchemaPattern, "cluster_execution_insights"),
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
-		p.extendedEvalCtx.statsProvider.IterateInsights(ctx, func(
-			ctx context.Context, insight *insights.Insight,
-		) {
-			startTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.StartTime, time.Nanosecond)
-			if errTimestamp != nil {
-				err = errors.CombineErrors(err, errTimestamp)
-				return
-			}
-
-			endTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.EndTime, time.Nanosecond)
-			if errTimestamp != nil {
-				err = errors.CombineErrors(err, errTimestamp)
-				return
-			}
-
-			execNodeIDs := tree.NewDArray(types.Int)
-			for _, nodeID := range insight.Statement.Nodes {
-				if errNodeID := execNodeIDs.Append(tree.NewDInt(tree.DInt(nodeID))); errNodeID != nil {
-					err = errors.CombineErrors(err, errNodeID)
-					return
-				}
-			}
-
-			autoRetryReason := tree.DNull
-			if insight.Statement.AutoRetryReason != "" {
-				autoRetryReason = tree.NewDString(insight.Statement.AutoRetryReason)
-			}
-
-			err = errors.CombineErrors(err, addRow(
-				tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
-				tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
-				tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Transaction.FingerprintID)))),
-				tree.NewDString(hex.EncodeToString(insight.Statement.ID.GetBytes())),
-				tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Statement.FingerprintID)))),
-				tree.NewDString(insight.Statement.Query),
-				tree.NewDString(insight.Statement.Status),
-				startTimestamp,
-				endTimestamp,
-				tree.MakeDBool(tree.DBool(insight.Statement.FullScan)),
-				tree.NewDString(insight.Statement.User),
-				tree.NewDString(insight.Statement.ApplicationName),
-				tree.NewDString(insight.Statement.Database),
-				tree.NewDString(insight.Statement.PlanGist),
-				tree.NewDInt(tree.DInt(insight.Statement.RowsRead)),
-				tree.NewDInt(tree.DInt(insight.Statement.RowsWritten)),
-				tree.NewDFloat(tree.DFloat(insight.Transaction.UserPriority)),
-				tree.NewDInt(tree.DInt(insight.Statement.Retries)),
-				autoRetryReason,
-				execNodeIDs,
-			))
-		})
-		return err
+		return populateExecutionInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{})
 	},
+}
+
+var crdbInternalNodeExecutionInsightsTable = virtualSchemaTable{
+	schema: fmt.Sprintf(executionInsightsSchemaPattern, "node_execution_insights"),
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
+		return populateExecutionInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{NodeID: "local"})
+	},
+}
+
+func populateExecutionInsights(
+	ctx context.Context,
+	p *planner,
+	addRow func(...tree.Datum) error,
+	request *serverpb.ListExecutionInsightsRequest,
+) (err error) {
+	hasRoleOption, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+	if err != nil {
+		return err
+	}
+	if !hasRoleOption {
+		return pgerror.Newf(
+			pgcode.InsufficientPrivilege,
+			"user %s does not have %s or %s privilege",
+			p.User(),
+			roleoption.VIEWACTIVITY,
+			roleoption.VIEWACTIVITYREDACTED,
+		)
+	}
+
+	response, err := p.extendedEvalCtx.SQLStatusServer.ListExecutionInsights(ctx, request)
+	if err != nil {
+		return
+	}
+	for _, insight := range response.Insights {
+		startTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.StartTime, time.Nanosecond)
+		if errTimestamp != nil {
+			err = errors.CombineErrors(err, errTimestamp)
+			return
+		}
+
+		endTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.EndTime, time.Nanosecond)
+		if errTimestamp != nil {
+			err = errors.CombineErrors(err, errTimestamp)
+			return
+		}
+
+		execNodeIDs := tree.NewDArray(types.Int)
+		for _, nodeID := range insight.Statement.Nodes {
+			if errNodeID := execNodeIDs.Append(tree.NewDInt(tree.DInt(nodeID))); errNodeID != nil {
+				err = errors.CombineErrors(err, errNodeID)
+				return
+			}
+		}
+
+		autoRetryReason := tree.DNull
+		if insight.Statement.AutoRetryReason != "" {
+			autoRetryReason = tree.NewDString(insight.Statement.AutoRetryReason)
+		}
+
+		err = errors.CombineErrors(err, addRow(
+			tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
+			tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
+			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Transaction.FingerprintID)))),
+			tree.NewDString(hex.EncodeToString(insight.Statement.ID.GetBytes())),
+			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Statement.FingerprintID)))),
+			tree.NewDString(insight.Statement.Query),
+			tree.NewDString(insight.Statement.Status),
+			startTimestamp,
+			endTimestamp,
+			tree.MakeDBool(tree.DBool(insight.Statement.FullScan)),
+			tree.NewDString(insight.Statement.User),
+			tree.NewDString(insight.Statement.ApplicationName),
+			tree.NewDString(insight.Statement.Database),
+			tree.NewDString(insight.Statement.PlanGist),
+			tree.NewDInt(tree.DInt(insight.Statement.RowsRead)),
+			tree.NewDInt(tree.DInt(insight.Statement.RowsWritten)),
+			tree.NewDFloat(tree.DFloat(insight.Transaction.UserPriority)),
+			tree.NewDInt(tree.DInt(insight.Statement.Retries)),
+			autoRetryReason,
+			execNodeIDs,
+		))
+	}
+	return
 }

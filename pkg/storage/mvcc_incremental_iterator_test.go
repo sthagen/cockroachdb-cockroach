@@ -491,7 +491,7 @@ func TestMVCCIncrementalIteratorNextIgnoringTime(t *testing.T) {
 			})
 
 			// Exercise deletion.
-			if err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 			// Returns the kv_1_1_1 even though it is outside (startTime, endTime].
@@ -628,7 +628,7 @@ func TestMVCCIncrementalIteratorNextKeyIgnoringTime(t *testing.T) {
 			})
 
 			// Exercise deletion.
-			if err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 			// Returns the kv_1_1_1 even though it is outside (startTime, endTime].
@@ -975,7 +975,7 @@ func TestMVCCIncrementalIterator(t *testing.T) {
 			t.Run("kv [1-2)", assertEqualKVs(e, testKey1, testKey2, tsMin, tsMax, latest, kvs(kv1_2_2)))
 
 			// Exercise deletion.
-			if err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 			t.Run("del", assertEqualKVs(e, localMax, keyMax, ts1, tsMax, latest, kvs(kv1Deleted3, kv2_2_2)))
@@ -1043,7 +1043,7 @@ func TestMVCCIncrementalIterator(t *testing.T) {
 			t.Run("kv [1-2)", assertEqualKVs(e, testKey1, testKey2, tsMin, tsMax, all, kvs(kv1_2_2, kv1_1_1)))
 
 			// Exercise deletion.
-			if err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, e, nil, testKey1, ts3, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 			t.Run("del", assertEqualKVs(e, localMax, keyMax, ts1, tsMax, all, kvs(kv1Deleted3, kv1_2_2, kv2_2_2)))
@@ -1502,13 +1502,10 @@ func runIncrementalBenchmark(
 		// Pull all of the sstables into the cache.  This
 		// probably defeats a lot of the benefits of the
 		// time-based optimization.
-		iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
-			KeyTypes:   IterKeyTypePointsAndRanges,
-			LowerBound: roachpb.LocalMax,
-			UpperBound: roachpb.KeyMax,
-		})
-		_, _ = iter.ComputeStats(keys.LocalMax, roachpb.KeyMax, 0)
-		iter.Close()
+		_, err := ComputeStats(eng, keys.LocalMax, roachpb.KeyMax, 0)
+		if err != nil {
+			b.Fatalf("stats failed: %s", err)
+		}
 	}
 	defer eng.Close()
 

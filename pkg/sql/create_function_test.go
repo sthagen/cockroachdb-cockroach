@@ -16,12 +16,15 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -115,7 +118,7 @@ SELECT nextval(105:::REGCLASS);`,
 			seq.GetDependedOnBy(),
 		)
 
-		// Make sure sequence has correct back references.
+		// Make sure view has correct back references.
 		vn := tree.MakeTableNameWithSchema("defaultdb", "public", "v")
 		_, view, err := col.GetImmutableTableByName(ctx, txn, &vn, tree.ObjectLookupFlagsWithRequired())
 		require.NoError(t, err)
@@ -127,6 +130,7 @@ SELECT nextval(105:::REGCLASS);`,
 			view.GetDependedOnBy(),
 		)
 
+		// Make sure type has correct back references.
 		typn := tree.MakeQualifiedTypeName("defaultdb", "public", "notmyworkday")
 		_, typ, err := col.GetImmutableTypeByName(ctx, txn, &typn, tree.ObjectLookupFlagsWithRequired())
 		require.NoError(t, err)
@@ -139,85 +143,6 @@ SELECT nextval(105:::REGCLASS);`,
 		return nil
 	})
 	require.NoError(t, err)
-
-	// Test drop/rename behavior in legacy schema changer.
-	tDB.Exec(t, "SET use_declarative_schema_changer = off")
-
-	testCases := []struct {
-		stmt        string
-		expectedErr string
-	}{
-		{
-			stmt:        "DROP SEQUENCE sq1",
-			expectedErr: "pq: cannot drop sequence sq1 because other objects depend on it",
-		},
-		{
-			stmt:        "DROP SEQUENCE sq1 CASCADE",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER SEQUENCE sq1 RENAME TO sq1_new",
-			expectedErr: "",
-		},
-		{
-			stmt:        "DROP TABLE t",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "DROP TABLE t CASCADE",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER TABLE t RENAME TO t_new",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER TABLE t SET SCHEMA test_sc",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER TABLE t DROP COLUMN b",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER TABLE t DROP COLUMN b CASCADE",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER TABLE t RENAME COLUMN b TO bb",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER TABLE t ALTER COLUMN b TYPE STRING",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "DROP INDEX t@t_idx_b",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "DROP INDEX t@t_idx_b CASCADE",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-		{
-			stmt:        "ALTER INDEX t@t_idx_b RENAME TO t_idx_b_new",
-			expectedErr: "pq: unimplemented: drop function not supported",
-		},
-	}
-
-	for _, tc := range testCases {
-		_, err = sqlDB.Exec(tc.stmt)
-		if tc.expectedErr == "" {
-			require.NoError(t, err)
-			continue
-		}
-		require.Equal(t, tc.expectedErr, err.Error())
-	}
-
-	// Test drop/rename behavior in declarative schema changer.
-	tDB.Exec(t, "SET use_declarative_schema_changer = on")
-	_, err = sqlDB.Exec("DROP TABLE t CASCADE ")
-	require.Equal(t, "pq: unimplemented: function descriptor not supported in declarative schema changer", err.Error())
 }
 
 func TestCreateFunctionWithTableImplicitType(t *testing.T) {
@@ -259,4 +184,39 @@ $$`,
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestCreateFunctionGating(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
+		params, _ := tests.CreateTestServerParams()
+		// Override binary version to be older.
+		params.Knobs.Server = &server.TestingKnobs{
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.SchemaChangeSupportsCreateFunction),
+		}
+
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(context.Background())
+
+		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
+		require.NoError(t, err)
+	})
+
+	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
+		params, _ := tests.CreateTestServerParams()
+		// Override binary version to be older.
+		params.Knobs.Server = &server.TestingKnobs{
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.SchemaChangeSupportsCreateFunction - 1),
+		}
+
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(context.Background())
+
+		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
+		require.Error(t, err)
+		require.Equal(t, "pq: cannot run CREATE FUNCTION before system is fully upgraded to v22.2", err.Error())
+	})
 }

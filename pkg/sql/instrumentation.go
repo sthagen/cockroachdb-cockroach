@@ -25,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -101,12 +103,23 @@ type instrumentationHelper struct {
 	stmtDiagnosticsRecorder *stmtdiagnostics.Registry
 	withStatementTrace      func(trace tracingpb.Recording, stmt string)
 
+	// sp is always populated by the instrumentationHelper Setup method, except in
+	// the scenario where we do not need tracing information. This scenario occurs
+	// with the confluence of:
+	// - not collecting a bundle (collectBundle is false)
+	// - withStatementTrace is nil (only populated by testing knobs)
+	// - outputMode is unmodifiedOutput (i.e. outputMode not specified)
+	// - not collecting execution statistics (collectExecStats is false)
+	// TODO(yuzefovich): refactor statement span creation #85820
 	sp *tracing.Span
+
 	// shouldFinishSpan determines whether sp needs to be finished in
 	// instrumentationHelper.Finish.
 	shouldFinishSpan bool
 	origCtx          context.Context
 	evalCtx          *eval.Context
+
+	queryLevelStatsWithErr execstats.QueryLevelStatsWithErr
 
 	// If savePlanForStats is true, the explainPlan will be collected and returned
 	// via PlanForStats().
@@ -129,7 +142,7 @@ type instrumentationHelper struct {
 	costEstimate float64
 
 	// indexRecommendations is a string slice containing index recommendations for
-	// the planned statement. This is only set for EXPLAIN statements.
+	// the planned statement.
 	indexRecommendations []string
 
 	// maxFullScanRows is the maximum number of rows scanned by a full scan, as
@@ -171,6 +184,15 @@ const (
 	explainAnalyzePlanOutput
 	explainAnalyzeDistSQLOutput
 )
+
+// Tracing returns the current value of the instrumentation helper's span,
+// along with a boolean that determines whether the span is populated.
+func (ih *instrumentationHelper) Tracing() (sp *tracing.Span, ok bool) {
+	if ih.sp != nil {
+		return ih.sp, true
+	}
+	return nil, false
+}
 
 // SetOutputMode can be called before Setup, if we are running an EXPLAIN
 // ANALYZE variant.
@@ -222,7 +244,7 @@ func (ih *instrumentationHelper) Setup(
 		statsCollector.ShouldSaveLogicalPlanDesc(fingerprint, implicitTxn, p.SessionData().Database)
 
 	if sp := tracing.SpanFromContext(ctx); sp != nil {
-		if sp.IsVerbose() {
+		if sp.IsVerbose() && !cfg.TestingKnobs.NoStatsCollectionWithVerboseTracing {
 			// If verbose tracing was enabled at a higher level, stats
 			// collection is enabled so that stats are shown in the traces, but
 			// no extra work is needed by the instrumentationHelper.
@@ -284,13 +306,15 @@ func (ih *instrumentationHelper) Finish(
 	retErr error,
 ) error {
 	ctx := ih.origCtx
-	if ih.sp == nil {
+	if _, ok := ih.Tracing(); !ok {
 		return retErr
 	}
 
 	// Record the statement information that we've collected.
 	// Note that in case of implicit transactions, the trace contains the auto-commit too.
 	var trace tracingpb.Recording
+	queryLevelStatsWithErr := ih.queryLevelStatsWithErr
+
 	if ih.shouldFinishSpan {
 		trace = ih.sp.FinishAndGetConfiguredRecording()
 	} else {
@@ -310,41 +334,17 @@ func (ih *instrumentationHelper) Finish(
 		)
 	}
 
-	// Get the query-level stats.
-	var flowsMetadata []*execstats.FlowsMetadata
-	for _, flowInfo := range p.curPlan.distSQLFlowInfos {
-		flowsMetadata = append(flowsMetadata, flowInfo.flowsMetadata)
-	}
-	queryLevelStats, err := execstats.GetQueryLevelStats(trace, cfg.TestingKnobs.DeterministicExplain, flowsMetadata)
-	if err != nil {
-		const msg = "error getting query level stats for statement: %s: %+v"
-		if buildutil.CrdbTestBuild {
-			panic(fmt.Sprintf(msg, ih.fingerprint, err))
-		}
-		log.VInfof(ctx, 1, msg, ih.fingerprint, err)
-	} else {
-		stmtStatsKey := roachpb.StatementStatisticsKey{
-			Query:       ih.fingerprint,
-			ImplicitTxn: ih.implicitTxn,
-			Database:    p.SessionData().Database,
-			Failed:      retErr != nil,
-			PlanHash:    ih.planGist.Hash(),
-		}
-		err = statsCollector.RecordStatementExecStats(stmtStatsKey, queryLevelStats)
-		if err != nil {
-			if log.V(2 /* level */) {
-				log.Warningf(ctx, "unable to record statement exec stats: %s", err)
-			}
-		}
+	// Accumulate txn stats if no error was encountered while collecting
+	// query-level statistics.
+	if queryLevelStatsWithErr.Err == nil {
 		if collectExecStats || ih.implicitTxn {
-			txnStats.Accumulate(queryLevelStats)
+			txnStats.Accumulate(queryLevelStatsWithErr.Stats)
 		}
 	}
 
 	var bundle diagnosticsBundle
 	if ih.collectBundle {
-		ie := p.extendedEvalCtx.ExecCfg.InternalExecutorFactory(
-			p.EvalContext().Context,
+		ie := p.extendedEvalCtx.ExecCfg.InternalExecutorFactory.NewInternalExecutor(
 			p.SessionData(),
 		)
 		phaseTimes := statsCollector.PhaseTimes()
@@ -355,7 +355,7 @@ func (ih *instrumentationHelper) Finish(
 			ob := ih.emitExplainAnalyzePlanToOutputBuilder(
 				explain.Flags{Verbose: true, ShowTypes: true},
 				phaseTimes,
-				&queryLevelStats,
+				&queryLevelStatsWithErr.Stats,
 			)
 			bundle = buildStatementBundle(
 				ih.origCtx, cfg.DB, ie.(*InternalExecutor), &p.curPlan, ob.BuildString(), trace, placeholders,
@@ -381,7 +381,7 @@ func (ih *instrumentationHelper) Finish(
 		if ih.outputMode == explainAnalyzeDistSQLOutput {
 			flows = p.curPlan.distSQLFlowInfos
 		}
-		return ih.setExplainAnalyzeResult(ctx, res, statsCollector.PhaseTimes(), &queryLevelStats, flows, trace)
+		return ih.setExplainAnalyzeResult(ctx, res, statsCollector.PhaseTimes(), &queryLevelStatsWithErr.Stats, flows, trace)
 
 	default:
 		return nil
@@ -671,4 +671,62 @@ func (m execNodeTraceMetadata) annotateExplain(
 	}
 
 	return allRegions
+}
+
+// SetIndexRecommendations checks if we should generate a new index recommendation.
+// If true it will generate and update the idx recommendations cache,
+// if false, uses the value on index recommendations cache and updates its counter.
+func (ih *instrumentationHelper) SetIndexRecommendations(
+	ctx context.Context, idxRec *idxrecommendations.IndexRecCache, planner *planner, isInternal bool,
+) {
+	opc := planner.optPlanningCtx
+	opc.reset(ctx)
+	stmtType := opc.p.stmt.AST.StatementType()
+
+	reset := false
+	var recommendations []string
+	if idxRec.ShouldGenerateIndexRecommendation(
+		ih.fingerprint,
+		ih.planGist.Hash(),
+		planner.SessionData().Database,
+		stmtType,
+		isInternal,
+	) {
+		f := opc.optimizer.Factory()
+		// EvalContext() has the context with the already closed span, so we
+		// need to update with the current context.
+		// The replacement of the context here isn't ideal, but the current
+		// implementation of contexts would need to change
+		// significantly to accommodate this case.
+		evalCtx := opc.p.EvalContext()
+		oldCtx := evalCtx.Context
+		evalCtx.Context = ctx
+		defer func() {
+			evalCtx.Context = oldCtx
+		}()
+
+		f.Init(evalCtx, &opc.catalog)
+		f.FoldingControl().AllowStableFolds()
+		bld := optbuilder.New(ctx, &opc.p.semaCtx, evalCtx, &opc.catalog, f, opc.p.stmt.AST)
+		err := bld.Build()
+		if err != nil {
+			log.Warningf(ctx, "unable to build memo: %s", err)
+		} else {
+			err = opc.makeQueryIndexRecommendation(ctx)
+			if err != nil {
+				log.Warningf(ctx, "unable to generate index recommendations: %s", err)
+			}
+		}
+		reset = true
+		recommendations = ih.indexRecommendations
+	}
+	ih.indexRecommendations = idxRec.UpdateIndexRecommendations(
+		ih.fingerprint,
+		ih.planGist.Hash(),
+		planner.SessionData().Database,
+		stmtType,
+		isInternal,
+		recommendations,
+		reset,
+	)
 }

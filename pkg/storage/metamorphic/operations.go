@@ -333,7 +333,8 @@ func (m mvccDeleteRangeUsingRangeTombstoneOp) run(ctx context.Context) string {
 	}
 
 	err := storage.MVCCDeleteRangeUsingTombstone(ctx, writer, nil, m.key, m.endKey, m.ts,
-		hlc.ClockTimestamp{}, m.key, m.endKey, math.MaxInt64 /* maxIntents */, nil /* msCovered */)
+		hlc.ClockTimestamp{}, m.key, m.endKey, false /* idempotent */, math.MaxInt64, /* maxIntents */
+		nil /* msCovered */)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err)
 	}
@@ -355,7 +356,7 @@ func (m mvccClearTimeRangeOp) run(ctx context.Context) string {
 		return "no-op due to no non-conflicting key range"
 	}
 	span, err := storage.MVCCClearTimeRange(ctx, m.m.engine, &enginepb.MVCCStats{}, m.key, m.endKey,
-		m.startTime, m.endTime, math.MaxInt64, math.MaxInt64)
+		m.startTime, m.endTime, nil, nil, math.MaxInt64, math.MaxInt64, math.MaxInt64)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err)
 	}
@@ -374,7 +375,7 @@ func (m mvccDeleteOp) run(ctx context.Context) string {
 	writer := m.m.getReadWriter(m.writer)
 	txn.Sequence++
 
-	err := storage.MVCCDelete(ctx, writer, nil, m.key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn)
+	_, err := storage.MVCCDelete(ctx, writer, nil, m.key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn)
 	if err != nil {
 		if writeTooOldErr := (*roachpb.WriteTooOldError)(nil); errors.As(err, &writeTooOldErr) {
 			txn.WriteTimestamp.Forward(writeTooOldErr.ActualTimestamp)

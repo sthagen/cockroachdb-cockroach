@@ -1027,7 +1027,7 @@ func TestNoStopAfterNonTargetColumnDrop(t *testing.T) {
 		}
 	}
 
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless"))
+	cdcTest(t, testFn)
 }
 
 // If we drop columns which are not targeted by the changefeed, it should not backfill.
@@ -1060,7 +1060,7 @@ func TestNoBackfillAfterNonTargetColumnDrop(t *testing.T) {
 		})
 	}
 
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless"))
+	cdcTest(t, testFn)
 }
 
 func TestChangefeedColumnDropsWithFamilyAndNonFamilyTargets(t *testing.T) {
@@ -1105,7 +1105,7 @@ func TestChangefeedColumnDropsWithFamilyAndNonFamilyTargets(t *testing.T) {
 		})
 	}
 
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless"))
+	cdcTest(t, testFn)
 }
 
 func TestChangefeedColumnDropsOnMultipleFamiliesWithTheSameName(t *testing.T) {
@@ -1150,7 +1150,7 @@ func TestChangefeedColumnDropsOnMultipleFamiliesWithTheSameName(t *testing.T) {
 		})
 	}
 
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless"))
+	cdcTest(t, testFn)
 }
 
 func TestChangefeedColumnDropsOnTheSameTableWithMultipleFamilies(t *testing.T) {
@@ -1182,7 +1182,7 @@ func TestChangefeedColumnDropsOnTheSameTableWithMultipleFamilies(t *testing.T) {
 		})
 	}
 
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless"))
+	cdcTest(t, testFn)
 }
 
 func TestChangefeedExternalIODisabled(t *testing.T) {
@@ -4342,16 +4342,19 @@ func TestChangefeedDescription(t *testing.T) {
 			descr:  `CREATE CHANGEFEED FOR TABLE d.public.foo INTO '` + redactedSink + `' WITH envelope = 'wrapped', updated`,
 		},
 		{
-			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2 AS SELECT a FROM foo WHERE a % 2 = 0",
-			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', updated AS SELECT a FROM foo WHERE (a % 2) = 0`,
+			// TODO(#85143): remove schema_change_policy='stop' from this test.
+			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2, schema_change_policy='stop' AS SELECT a FROM foo WHERE a % 2 = 0",
+			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', schema_change_policy = 'stop', updated AS SELECT a FROM foo WHERE (a % 2) = 0`,
 		},
 		{
-			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2 AS SELECT a FROM public.foo AS bar WHERE a % 2 = 0",
-			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', updated AS SELECT a FROM public.foo AS bar WHERE (a % 2) = 0`,
+			// TODO(#85143): remove schema_change_policy='stop' from this test.
+			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2, schema_change_policy='stop' AS SELECT a FROM public.foo AS bar WHERE a % 2 = 0",
+			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', schema_change_policy = 'stop', updated AS SELECT a FROM public.foo AS bar WHERE (a % 2) = 0`,
 		},
 		{
-			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2 AS SELECT a FROM foo WHERE status IN ('open', 'closed')",
-			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', updated AS SELECT a FROM foo WHERE status IN ('open', 'closed')`,
+			// TODO(#85143): remove schema_change_policy='stop' from this test.
+			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2, schema_change_policy='stop' AS SELECT a FROM foo WHERE status IN ('open', 'closed')",
+			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', schema_change_policy = 'stop', updated AS SELECT a FROM foo WHERE status IN ('open', 'closed')`,
 		},
 	} {
 		t.Run(tc.create, func(t *testing.T) {
@@ -4579,7 +4582,8 @@ func TestCDCPrev(t *testing.T) {
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
 		sqlDB.Exec(t, `UPSERT INTO foo VALUES (0, 'updated')`)
-		foo := feed(t, f, `CREATE CHANGEFEED WITH envelope='row' AS SELECT cdc_prev()->'b' AS old FROM foo`)
+		// TODO(#85143): remove schema_change_policy='stop' from this test.
+		foo := feed(t, f, `CREATE CHANGEFEED WITH envelope='row', schema_change_policy='stop' AS SELECT cdc_prev()->'b' AS old FROM foo`)
 		defer closeFeed(t, foo)
 
 		// cdc_prev() values are null during initial scan
@@ -5294,36 +5298,6 @@ func TestChangefeedPrimaryKeyChangeWorks(t *testing.T) {
 		foo := feed(t, f, baseStmt)
 		defer closeFeed(t, foo)
 
-		// maybeHandleRestart deals with the fact that sinkless changefeeds don't
-		// gracefully handle primary index changes but rather force the client to
-		// deal with restarting the changefeed as of the last resolved timestamp.
-		//
-		// This ends up being pretty sane; sinkless changefeeds already require this
-		// behavior in the face of other transient failures so clients already need
-		// to implement this logic.
-		maybeHandleRestart := func(t *testing.T) (cleanup func()) {
-			return func() {}
-		}
-		if strings.HasSuffix(t.Name(), "sinkless") {
-			maybeHandleRestart = func(t *testing.T) func() {
-				var resolved hlc.Timestamp
-				for {
-					m, err := foo.Next()
-					if err != nil {
-						assert.Contains(t, err.Error(),
-							fmt.Sprintf("schema change occurred at %s", resolved.Next().AsOfSystemTime()))
-						break
-					}
-					resolved = extractResolvedTimestamp(t, m)
-				}
-				const restartStmt = baseStmt + ", cursor = $1"
-				foo = feed(t, f, restartStmt, resolved.AsOfSystemTime())
-				return func() {
-					closeFeed(t, foo)
-				}
-			}
-		}
-
 		// 'initial' is skipped because only the latest value ('updated') is
 		// emitted by the initial scan.
 		assertPayloads(t, foo, []string{
@@ -5337,7 +5311,6 @@ func TestChangefeedPrimaryKeyChangeWorks(t *testing.T) {
 		})
 
 		sqlDB.Exec(t, `ALTER TABLE foo ALTER PRIMARY KEY USING COLUMNS (b)`)
-		defer maybeHandleRestart(t)()
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (3, 'c'), (4, 'd')`)
 		assertPayloads(t, foo, []string{
 			`foo: ["c"]->{"after": {"a": 3, "b": "c"}}`,
@@ -5360,7 +5333,6 @@ INSERT INTO foo VALUES (1, 'f');
 			`foo: ["a"]->{"after": {"a": 6, "b": "a"}}`,
 			`foo: ["e"]->{"after": {"a": 5, "b": "e"}}`,
 		})
-		defer maybeHandleRestart(t)()
 		assertPayloads(t, foo, []string{
 			`foo: [1]->{"after": {"a": 1, "b": "f"}}`,
 		})
@@ -5405,24 +5377,6 @@ func TestChangefeedPrimaryKeyChangeWorksWithMultipleTables(t *testing.T) {
 		// to implement this logic.
 		maybeHandleRestart := func(t *testing.T) (cleanup func()) {
 			return func() {}
-		}
-		if strings.HasSuffix(t.Name(), "sinkless") {
-			maybeHandleRestart = func(t *testing.T) func() {
-				var resolvedTS hlc.Timestamp
-				for {
-					m, err := cf.Next()
-					if err != nil {
-						assert.Contains(t, err.Error(), fmt.Sprintf("schema change occurred at %s", resolvedTS.Next().AsOfSystemTime()))
-						break
-					}
-					resolvedTS = extractResolvedTimestamp(t, m)
-				}
-				const restartStmt = baseStmt + ", cursor = $1"
-				cf = feed(t, f, restartStmt, resolvedTS.AsOfSystemTime())
-				return func() {
-					closeFeed(t, cf)
-				}
-			}
 		}
 
 		// 'initial' is skipped because only the latest value ('updated') is
@@ -6372,6 +6326,7 @@ CREATE TABLE foo (
   PRIMARY KEY (a, b)
 )`)
 
+			// TODO(#85143): remove schema_change_policy='stop' from this test.
 			sqlDB.Exec(t, `
 INSERT INTO foo (a, b) VALUES (0, 'zero'), (1, 'one');
 INSERT INTO foo (a, b, e) VALUES (2, 'two', 'closed');
@@ -6382,6 +6337,7 @@ INSERT INTO foo (a, b, e) VALUES (2, 'two', 'closed');
 			}
 			feed := feed(t, f, `
 CREATE CHANGEFEED 
+WITH schema_change_policy='stop'
 AS SELECT * FROM `+fromClause+` 
 WHERE e IN ('open', 'closed') AND NOT cdc_is_delete()`)
 			defer closeFeed(t, feed)
@@ -6447,8 +6403,10 @@ INSERT INTO foo (a, b, e) VALUES (11, 'eleven', 'closed');
 			specs <- aggregatorSpecs
 		}
 
+		// TODO(#85143): remove schema_change_policy='stop' from this test.
 		feed := feed(t, f, `
 CREATE CHANGEFEED 
+WITH schema_change_policy='stop'
 AS SELECT * FROM foo
 WHERE a > 10 AND e IN ('open', 'closed') AND NOT cdc_is_delete()`)
 		defer closeFeed(t, feed)
@@ -6580,6 +6538,8 @@ func TestChangefeedPredicateWithSchemaChange(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "takes too long under race")
+	// TODO(#85143): remove this skip.
+	skip.WithIssue(t, 85143)
 
 	setupSQL := []string{
 		`CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`,
@@ -7109,4 +7069,33 @@ func TestChangefeedTestTimesOut(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
+}
+
+// Regression for #85008.
+func TestSchemachangeDoesNotBreakSinklessFeed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE mytable (id INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO mytable VALUES (0)`)
+
+		// Open up the changefeed.
+		cf := feed(t, f, `CREATE CHANGEFEED FOR TABLE mytable`)
+		defer closeFeed(t, cf)
+		assertPayloads(t, cf, []string{
+			`mytable: [0]->{"after": {"id": 0}}`,
+		})
+
+		sqlDB.Exec(t, `ALTER TABLE mytable ADD COLUMN val INT DEFAULT 0`)
+		assertPayloads(t, cf, []string{
+			`mytable: [0]->{"after": {"id": 0, "val": 0}}`,
+		})
+		sqlDB.Exec(t, `INSERT INTO mytable VALUES (1,1)`)
+		assertPayloads(t, cf, []string{
+			`mytable: [1]->{"after": {"id": 1, "val": 1}}`,
+		})
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("sinkless"))
 }

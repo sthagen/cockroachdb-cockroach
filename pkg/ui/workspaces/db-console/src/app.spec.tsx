@@ -23,6 +23,18 @@ stubComponentInModule(
 );
 stubComponentInModule("src/views/statements/statementsPage", "default");
 stubComponentInModule("src/views/transactions/transactionsPage", "default");
+stubComponentInModule(
+  "src/views/statements/activeStatementDetailsConnected",
+  "default",
+);
+stubComponentInModule(
+  "src/views/transactions/activeTransactionDetailsConnected",
+  "default",
+);
+stubComponentInModule(
+  "src/views/insights/workloadInsightsPageConnected",
+  "default",
+);
 
 import React from "react";
 import { Action, Store } from "redux";
@@ -44,8 +56,6 @@ const DATABASES_HEADER = "Databases";
 const SQL_ACTIVITY_HEADER = "SQL Activity";
 const STATEMENTS_DETAILS_HEADER = "Statement Fingerprint";
 const TRANSACTION_DETAILS_HEADER = "Transaction Details";
-const STATEMENT_EXECUTION_HEADER = /Statement Execution ID:.*/;
-const TRANSACTION_EXECUTION_HEADER = /Transaction Execution ID:.*/;
 const ADVANCED_DEBUG_HEADER = "Advanced Debugging";
 const REDUX_DEBUG_HEADER = "Redux State";
 const CUSTOM_METRICS_CHART_HEADER = "Custom Chart";
@@ -399,12 +409,21 @@ describe("Routing to", () => {
   describe("'/execution' path", () => {
     test("'/execution/statement/statementID' routes to <ActiveStatementDetails>", () => {
       navigateToPath("/execution/statement/stmtID");
-      screen.getByText(STATEMENT_EXECUTION_HEADER, { selector: "h3" });
+      screen.getByTestId("activeStatementDetailsConnected");
     });
 
     test("'/execution/transaction/transactionID' routes to <ActiveTransactionDetails>", () => {
       navigateToPath("/execution/transaction/transactionID");
-      screen.getByText(TRANSACTION_EXECUTION_HEADER, { selector: "h3" });
+      screen.getByTestId("activeTransactionDetailsConnected");
+    });
+  });
+  {
+    /* insights */
+  }
+  describe("'/insights' path", () => {
+    test("routes to <InsightsOverviewPage> component", () => {
+      navigateToPath("/insights");
+      screen.getByTestId("workloadInsightsPageConnected");
     });
   });
   {

@@ -58,15 +58,9 @@ func assertEqImpl(
 		keyMin = keys.LocalMax
 		keyMax = roachpb.KeyMax
 	}
-	it := rw.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
-		KeyTypes:   IterKeyTypePointsAndRanges,
-		LowerBound: keyMin,
-		UpperBound: keyMax,
-	})
-	defer it.Close()
 
 	for _, mvccStatsTest := range mvccStatsTests {
-		compMS, err := mvccStatsTest.fn(it, keyMin, keyMax, ms.LastUpdateNanos)
+		compMS, err := mvccStatsTest.fn(rw, keyMin, keyMax, ms.LastUpdateNanos)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -135,7 +129,7 @@ func TestMVCCStatsDeleteCommitMovesTimestamp(t *testing.T) {
 				TxnMeta:       enginepb.TxnMeta{ID: uuid.MakeV4(), WriteTimestamp: ts3},
 				ReadTimestamp: ts3,
 			}
-			if err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
 				t.Fatal(err)
 			}
 
@@ -467,7 +461,7 @@ func TestMVCCStatsDeleteMovesTimestamp(t *testing.T) {
 			}
 			require.EqualValues(t, m2ValSize, expM2ValSize)
 
-			if err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
 				t.Fatal(err)
 			}
 
@@ -525,7 +519,7 @@ func TestMVCCStatsPutMovesDeletionTimestamp(t *testing.T) {
 			}
 
 			// Write a deletion tombstone intent.
-			if err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
 				t.Fatal(err)
 			}
 
@@ -650,7 +644,7 @@ func TestMVCCStatsDelDelCommitMovesTimestamp(t *testing.T) {
 			ts3 := hlc.Timestamp{WallTime: 3e9}
 
 			// Write a non-transactional tombstone at t=1s.
-			if err := MVCCDelete(ctx, engine, aggMS, key, ts1, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, ts1, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -679,7 +673,7 @@ func TestMVCCStatsDelDelCommitMovesTimestamp(t *testing.T) {
 				TxnMeta:       enginepb.TxnMeta{ID: uuid.MakeV4(), WriteTimestamp: ts2},
 				ReadTimestamp: ts2,
 			}
-			if err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
 				t.Fatal(err)
 			}
 
@@ -839,7 +833,7 @@ func TestMVCCStatsPutDelPutMovesTimestamp(t *testing.T) {
 				TxnMeta:       enginepb.TxnMeta{ID: uuid.MakeV4(), WriteTimestamp: ts2},
 				ReadTimestamp: ts2,
 			}
-			if err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn); err != nil {
 				t.Fatal(err)
 			}
 
@@ -993,10 +987,10 @@ func TestMVCCStatsDelDelGC(t *testing.T) {
 			ts2 := hlc.Timestamp{WallTime: 2e9}
 
 			// Write tombstones at ts1 and ts2.
-			if err := MVCCDelete(ctx, engine, aggMS, key, ts1, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, ts1, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
-			if err := MVCCDelete(ctx, engine, aggMS, key, ts2, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, ts2, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1207,7 +1201,7 @@ func TestMVCCStatsPutWaitDeleteGC(t *testing.T) {
 
 			// Delete the value at ts5.
 
-			if err := MVCCDelete(ctx, engine, aggMS, key, ts2, hlc.ClockTimestamp{}, nil); err != nil {
+			if _, err := MVCCDelete(ctx, engine, aggMS, key, ts2, hlc.ClockTimestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1512,18 +1506,25 @@ func TestMVCCStatsSysPutPut(t *testing.T) {
 
 var mvccStatsTests = []struct {
 	name string
-	fn   func(MVCCIterator, roachpb.Key, roachpb.Key, int64) (enginepb.MVCCStats, error)
+	fn   func(Reader, roachpb.Key, roachpb.Key, int64) (enginepb.MVCCStats, error)
 }{
 	{
 		name: "ComputeStats",
-		fn: func(iter MVCCIterator, start, end roachpb.Key, nowNanos int64) (enginepb.MVCCStats, error) {
-			return iter.ComputeStats(start, end, nowNanos)
+		fn: func(r Reader, start, end roachpb.Key, nowNanos int64) (enginepb.MVCCStats, error) {
+			return ComputeStats(r, start, end, nowNanos)
 		},
 	},
 	{
-		name: "ComputeStatsForRange",
-		fn: func(iter MVCCIterator, start, end roachpb.Key, nowNanos int64) (enginepb.MVCCStats, error) {
-			return ComputeStatsForRange(iter, start, end, nowNanos)
+		name: "ComputeStatsForIter",
+		fn: func(r Reader, start, end roachpb.Key, nowNanos int64) (enginepb.MVCCStats, error) {
+			iter := r.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+				KeyTypes:   IterKeyTypePointsAndRanges,
+				LowerBound: start,
+				UpperBound: end,
+			})
+			defer iter.Close()
+			iter.SeekGE(MVCCKey{Key: start})
+			return ComputeStatsForIter(iter, nowNanos)
 		},
 	},
 }
@@ -1659,7 +1660,7 @@ func TestMVCCStatsRandomized(t *testing.T) {
 		return desc
 	}
 	actions["Del"] = func(s *state) string {
-		if err := MVCCDelete(ctx, s.eng, s.MS, s.key, s.TS, hlc.ClockTimestamp{}, s.Txn); err != nil {
+		if _, err := MVCCDelete(ctx, s.eng, s.MS, s.key, s.TS, hlc.ClockTimestamp{}, s.Txn); err != nil {
 			return err.Error()
 		}
 		return ""
@@ -1792,30 +1793,21 @@ func TestMVCCStatsRandomized(t *testing.T) {
 func TestMVCCComputeStatsError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	for _, engineImpl := range mvccEngineImpls {
-		t.Run(engineImpl.name, func(t *testing.T) {
-			engine := engineImpl.create()
-			defer engine.Close()
 
-			// Write a MVCC metadata key where the value is not an encoded MVCCMetadata
-			// protobuf.
-			if err := engine.PutUnversioned(roachpb.Key("garbage"), []byte("garbage")); err != nil {
-				t.Fatal(err)
-			}
+	engine := NewDefaultInMemForTesting()
+	defer engine.Close()
 
-			iter := engine.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
-				KeyTypes:   IterKeyTypePointsAndRanges,
-				LowerBound: roachpb.LocalMax,
-				UpperBound: roachpb.KeyMax,
-			})
-			defer iter.Close()
-			for _, mvccStatsTest := range mvccStatsTests {
-				t.Run(mvccStatsTest.name, func(t *testing.T) {
-					_, err := mvccStatsTest.fn(iter, keys.LocalMax, roachpb.KeyMax, 100)
-					if e := "unable to decode MVCCMetadata"; !testutils.IsError(err, e) {
-						t.Fatalf("expected %s, got %v", e, err)
-					}
-				})
+	// Write a MVCC metadata key where the value is not an encoded MVCCMetadata
+	// protobuf.
+	if err := engine.PutUnversioned(roachpb.Key("garbage"), []byte("garbage")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mvccStatsTest := range mvccStatsTests {
+		t.Run(mvccStatsTest.name, func(t *testing.T) {
+			_, err := mvccStatsTest.fn(engine, keys.LocalMax, roachpb.KeyMax, 100)
+			if e := "unable to decode MVCCMetadata"; !testutils.IsError(err, e) {
+				t.Fatalf("expected %s, got %v", e, err)
 			}
 		})
 	}

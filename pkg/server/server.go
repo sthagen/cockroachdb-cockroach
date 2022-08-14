@@ -467,6 +467,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	raftTransport := kvserver.NewRaftTransport(
 		cfg.AmbientCtx, st, cfg.AmbientCtx.Tracer, nodeDialer, grpcServer.Server, stopper,
 	)
+	registry.AddMetricStruct(raftTransport.Metrics())
 
 	ctSender := sidetransport.NewSender(stopper, st, clock, nodeDialer)
 	ctReceiver := sidetransport.NewReceiver(nodeIDContainer, stopper, stores, nil /* testingKnobs */)
@@ -802,6 +803,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		closedSessionCache:       closedSessionCache,
 		flowScheduler:            flowScheduler,
 		circularInternalExecutor: internalExecutor,
+		internalExecutorFactory:  nil, // will be initialized in server.newSQLServer.
 		circularJobRegistry:      jobRegistry,
 		jobAdoptionStopFile:      jobAdoptionStopFile,
 		protectedtsProvider:      protectedtsProvider,

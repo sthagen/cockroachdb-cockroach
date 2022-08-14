@@ -355,6 +355,7 @@ var charts = []sectionDescription{
 					"rpc.method.transferlease.recv",
 					"rpc.method.truncatelog.recv",
 					"rpc.method.writebatch.recv",
+					"rpc.method.isspanempty.recv",
 				},
 			},
 			{
@@ -409,6 +410,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.probe.sent",
 					"distsender.rpc.truncatelog.sent",
 					"distsender.rpc.writebatch.sent",
+					"distsender.rpc.isspanempty.sent",
 				},
 			},
 			{
@@ -1727,10 +1729,6 @@ var charts = []sectionDescription{
 				Metrics: []string{"raft.commandsapplied"},
 			},
 			{
-				Title:   "Enqueued",
-				Metrics: []string{"raft.enqueued.pending"},
-			},
-			{
 				Title:   "Keys/Sec Avg.",
 				Metrics: []string{"rebalancing.writespersecond"},
 			},
@@ -1881,6 +1879,35 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{ReplicationLayer, "Raft", "Transport"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Send Queue Messages Count",
+				Metrics: []string{"raft.transport.send-queue-size"},
+			},
+			{
+				Title:   "Raft Message Sends Dropped",
+				Metrics: []string{"raft.transport.sends-dropped"},
+			},
+			{
+				Title:   "Raft Messages Sent",
+				Metrics: []string{"raft.transport.sent"},
+			},
+			{
+				Title:   "Raft Messages Received",
+				Metrics: []string{"raft.transport.rcvd"},
+			},
+			{
+				Title:   "Reverse Messages Sent",
+				Metrics: []string{"raft.transport.reverse-sent"},
+			},
+			{
+				Title:   "Reverse Messages Received",
+				Metrics: []string{"raft.transport.reverse-rcvd"},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{ReplicationLayer, "Ranges"}},
 		Charts: []chartDescription{
 			{
@@ -1991,6 +2018,28 @@ var charts = []sectionDescription{
 					"queue.replicate.removedecommissioningreplica",
 					"queue.replicate.removedecommissioningvoterreplica",
 					"queue.replicate.removedecommissioningnonvoterreplica",
+				},
+			},
+			{
+				Title: "Successes by Action",
+				Metrics: []string{
+					"queue.replicate.addreplica.success",
+					"queue.replicate.removereplica.success",
+					"queue.replicate.replacedeadreplica.success",
+					"queue.replicate.removedeadreplica.success",
+					"queue.replicate.replacedecommissioningreplica.success",
+					"queue.replicate.removedecommissioningreplica.success",
+				},
+			},
+			{
+				Title: "Errors by Action",
+				Metrics: []string{
+					"queue.replicate.addreplica.error",
+					"queue.replicate.removereplica.error",
+					"queue.replicate.replacedeadreplica.error",
+					"queue.replicate.removedeadreplica.error",
+					"queue.replicate.replacedecommissioningreplica.error",
+					"queue.replicate.removedecommissioningreplica.error",
 				},
 			},
 			{
@@ -2225,16 +2274,16 @@ var charts = []sectionDescription{
 		Organization: [][]string{{SQLLayer, "SQL Stats", "Insights"}},
 		Charts: []chartDescription{
 			{
-				Title:   "Number of statement fingerprints being monitored for outlier detection",
-				Metrics: []string{"sql.stats.insights.latency_quantile_detector.fingerprints"},
+				Title:   "Current number of statement fingerprints being monitored for anomaly detection",
+				Metrics: []string{"sql.stats.insights.anomaly_detection.fingerprints"},
 			},
 			{
-				Title:   "Current memory used to support outlier detection",
-				Metrics: []string{"sql.stats.insights.latency_quantile_detector.memory"},
+				Title:   "Current memory used to support anomaly detection",
+				Metrics: []string{"sql.stats.insights.anomaly_detection.memory"},
 			},
 			{
 				Title:   "Evictions of fingerprint latency summaries due to memory pressure",
-				Metrics: []string{"sql.stats.insights.latency_quantile_detector.evictions"},
+				Metrics: []string{"sql.stats.insights.anomaly_detection.evictions"},
 			},
 		},
 	},

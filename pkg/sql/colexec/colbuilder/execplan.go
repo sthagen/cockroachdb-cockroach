@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
@@ -1495,7 +1496,7 @@ func NewColOperator(
 		Op:          result.Root,
 		ColumnTypes: result.ColumnTypes,
 	}
-	err = ppr.planPostProcessSpec(ctx, flowCtx, args, post, factory, &r.Releasables)
+	err = ppr.planPostProcessSpec(ctx, flowCtx, args, post, factory, &r.Releasables, args.Spec.EstimatedRowCount)
 	if err != nil {
 		err = result.wrapPostProcessSpec(ctx, flowCtx, args, post, spec.ProcessorID, factory, err)
 	} else {
@@ -1647,6 +1648,46 @@ func (r opResult) wrapPostProcessSpec(
 	)
 }
 
+// renderExprCountVisitor counts how many projection operators need to be
+// planned across render expressions.
+type renderExprCountVisitor struct {
+	renderCount int64
+}
+
+var _ tree.Visitor = &renderExprCountVisitor{}
+
+func (r *renderExprCountVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
+	if _, ok := expr.(*tree.IndexedVar); ok {
+		// IndexedVars don't get a projection operator (we just refer to the
+		// vector by index), so they don't contribute to the render count.
+		return false, expr
+	}
+	r.renderCount++
+	return true, expr
+}
+
+func (r *renderExprCountVisitor) VisitPost(expr tree.Expr) tree.Expr {
+	return expr
+}
+
+var renderWrappingRowCountThreshold = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"sql.distsql.vectorize_render_wrapping.max_row_count",
+	"determines the maximum number of estimated rows that flow through the render "+
+		"expressions up to which we handle those renders by wrapping a row-by-row processor",
+	128,
+	settings.NonNegativeInt,
+)
+
+var renderWrappingRenderCountThreshold = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"sql.distsql.vectorize_render_wrapping.min_render_count",
+	"determines the minimum number of render expressions for which we fall "+
+		"back to handling renders by wrapping a row-by-row processor",
+	16,
+	settings.NonNegativeInt,
+)
+
 // planPostProcessSpec plans the post processing stage specified in post on top
 // of r.Op.
 func (r *postProcessResult) planPostProcessSpec(
@@ -1656,16 +1697,42 @@ func (r *postProcessResult) planPostProcessSpec(
 	post *execinfrapb.PostProcessSpec,
 	factory coldata.ColumnFactory,
 	releasables *[]execreleasable.Releasable,
+	estimatedRowCount uint64,
 ) error {
 	if post.Projection {
 		r.Op, r.ColumnTypes = addProjection(r.Op, r.ColumnTypes, post.OutputColumns)
 	} else if post.RenderExprs != nil {
-		var renderedCols []uint32
-		for _, renderExpr := range post.RenderExprs {
-			expr, err := args.ExprHelper.ProcessExpr(renderExpr, flowCtx.EvalCtx, r.ColumnTypes)
+		// Deserialize expressions upfront.
+		exprs := make([]tree.TypedExpr, len(post.RenderExprs))
+		var err error
+		for i := range exprs {
+			exprs[i], err = args.ExprHelper.ProcessExpr(post.RenderExprs[i], flowCtx.EvalCtx, r.ColumnTypes)
 			if err != nil {
 				return err
 			}
+		}
+		// If we have an estimated row count and it doesn't exceed the wrapping
+		// row count threshold, we might need to fall back to wrapping a
+		// row-by-row processor to handle the render expressions (for better
+		// performance).
+		if estimatedRowCount != 0 &&
+			estimatedRowCount <= uint64(renderWrappingRowCountThreshold.Get(&flowCtx.Cfg.Settings.SV)) {
+			renderCountThreshold := renderWrappingRenderCountThreshold.Get(&flowCtx.Cfg.Settings.SV)
+			// Walk over all expressions and estimate how many projection
+			// operators will need to be created.
+			var v renderExprCountVisitor
+			for _, expr := range exprs {
+				tree.WalkExpr(&v, expr)
+				if v.renderCount >= renderCountThreshold {
+					return errors.Newf(
+						"falling back to wrapping a row-by-row processor for at least "+
+							"%d renders, estimated row count = %d", v.renderCount, estimatedRowCount,
+					)
+				}
+			}
+		}
+		var renderedCols []uint32
+		for _, expr := range exprs {
 			var outputIdx int
 			r.Op, outputIdx, r.ColumnTypes, err = planProjectionOperators(
 				ctx, flowCtx.EvalCtx, expr, r.ColumnTypes, r.Op, args.StreamingMemAccount, factory, releasables,
@@ -1795,6 +1862,12 @@ func addProjection(
 	return colexecbase.NewSimpleProjectOp(op, len(typs), projection), newTypes
 }
 
+func examineLikeOp(op treecmp.ComparisonOperator) (negate bool, caseInsensitive bool) {
+	negate = op.Symbol == treecmp.NotLike || op.Symbol == treecmp.NotILike
+	caseInsensitive = op.Symbol == treecmp.ILike || op.Symbol == treecmp.NotILike
+	return negate, caseInsensitive
+}
+
 func planSelectionOperators(
 	ctx context.Context,
 	evalCtx *eval.Context,
@@ -1842,10 +1915,11 @@ func planSelectionOperators(
 		lTyp := ct[leftIdx]
 		if constArg, ok := t.Right.(tree.Datum); ok {
 			switch cmpOp.Symbol {
-			case treecmp.Like, treecmp.NotLike:
-				negate := cmpOp.Symbol == treecmp.NotLike
+			case treecmp.Like, treecmp.NotLike, treecmp.ILike, treecmp.NotILike:
+				negate, caseInsensitive := examineLikeOp(cmpOp)
 				op, err = colexecsel.GetLikeOperator(
-					evalCtx, leftOp, leftIdx, string(tree.MustBeDString(constArg)), negate,
+					evalCtx, leftOp, leftIdx, string(tree.MustBeDString(constArg)),
+					negate, caseInsensitive,
 				)
 			case treecmp.In, treecmp.NotIn:
 				negate := cmpOp.Symbol == treecmp.NotIn
@@ -2370,7 +2444,8 @@ func planProjectionExpr(
 	var hasOptimizedOp bool
 	if isCmpProjOp {
 		switch cmpProjOp.Symbol {
-		case treecmp.Like, treecmp.NotLike, treecmp.In, treecmp.NotIn, treecmp.IsDistinctFrom, treecmp.IsNotDistinctFrom:
+		case treecmp.Like, treecmp.NotLike, treecmp.ILike, treecmp.NotILike,
+			treecmp.In, treecmp.NotIn, treecmp.IsDistinctFrom, treecmp.IsNotDistinctFrom:
 			hasOptimizedOp = true
 		}
 	}
@@ -2437,11 +2512,11 @@ func planProjectionExpr(
 			resultIdx = len(typs)
 			if isCmpProjOp {
 				switch cmpProjOp.Symbol {
-				case treecmp.Like, treecmp.NotLike:
-					negate := cmpProjOp.Symbol == treecmp.NotLike
+				case treecmp.Like, treecmp.NotLike, treecmp.ILike, treecmp.NotILike:
+					negate, caseInsensitive := examineLikeOp(cmpProjOp)
 					op, err = colexecprojconst.GetLikeProjectionOperator(
 						allocator, evalCtx, input, leftIdx, resultIdx,
-						string(tree.MustBeDString(rConstArg)), negate,
+						string(tree.MustBeDString(rConstArg)), negate, caseInsensitive,
 					)
 				case treecmp.In, treecmp.NotIn:
 					negate := cmpProjOp.Symbol == treecmp.NotIn

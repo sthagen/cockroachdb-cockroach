@@ -572,6 +572,12 @@ func (u *sqlSymUnion) alterBackupCmd() tree.AlterBackupCmd {
 func (u *sqlSymUnion) alterBackupCmds() tree.AlterBackupCmds {
     return u.val.(tree.AlterBackupCmds)
 }
+func (u *sqlSymUnion) alterBackupScheduleCmd() tree.AlterBackupScheduleCmd {
+    return u.val.(tree.AlterBackupScheduleCmd)
+}
+func (u *sqlSymUnion) alterBackupScheduleCmds() tree.AlterBackupScheduleCmds {
+    return u.val.(tree.AlterBackupScheduleCmds)
+}
 func (u *sqlSymUnion) alterTableCmd() tree.AlterTableCmd {
     return u.val.(tree.AlterTableCmd)
 }
@@ -883,7 +889,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 
 %token <str> KEY KEYS KMS KV
 
-%token <str> LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
+%token <str> LABEL LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
 %token <str> LEADING LEASE LEAST LEAKPROOF LEFT LESS LEVEL LIKE LIMIT
 %token <str> LINESTRING LINESTRINGM LINESTRINGZ LINESTRINGZM
 %token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGIN LOOKUP LOW LSHIFT
@@ -914,7 +920,8 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %token <str> RELEASE RESET RESTART RESTORE RESTRICT RESTRICTED RESUME RETURNING RETURN RETURNS RETRY REVISION_HISTORY
 %token <str> REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP ROUTINES ROW ROWS RSHIFT RULE RUNNING
 
-%token <str> SAVEPOINT SCANS SCATTER SCHEDULE SCHEDULES SCROLL SCHEMA SCHEMAS SCRUB SEARCH SECOND SECONDARY SECURITY SELECT SEQUENCE SEQUENCES
+%token <str> SAVEPOINT SCANS SCATTER SCHEDULE SCHEDULES SCROLL SCHEMA SCHEMA_ONLY SCHEMAS SCRUB
+%token <str> SEARCH SECOND SECONDARY SECURITY SELECT SEQUENCE SEQUENCES
 %token <str> SERIALIZABLE SERVER SESSION SESSIONS SESSION_USER SET SETOF SETS SETTING SETTINGS
 %token <str> SHARE SHOW SIMILAR SIMPLE SKIP SKIP_LOCALITIES_CHECK SKIP_MISSING_FOREIGN_KEYS
 %token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
@@ -932,8 +939,8 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %token <str> UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN UNLOGGED UNSPLIT
 %token <str> UPDATE UPSERT UNSET UNTIL USE USER USERS USING UUID
 
-%token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED
-%token <str> VIEWCLUSTERSETTING VIRTUAL VISIBLE VOLATILE VOTERS
+%token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
+%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE VOLATILE VOTERS
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1040,6 +1047,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> alter_rename_index_stmt
 %type <tree.Statement> alter_relocate_index_stmt
 %type <tree.Statement> alter_zone_index_stmt
+%type <tree.Statement> alter_index_visible_stmt
 
 // ALTER VIEW
 %type <tree.Statement> alter_rename_view_stmt
@@ -1092,6 +1100,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> create_index_stmt
 %type <tree.Statement> create_role_stmt
 %type <tree.Statement> create_schedule_for_backup_stmt
+%type <tree.Statement> alter_backup_schedule
 %type <tree.Statement> create_schema_stmt
 %type <tree.Statement> create_table_stmt
 %type <tree.Statement> create_table_as_stmt
@@ -1258,6 +1267,8 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 
 %type <tree.AlterChangefeedCmd> alter_changefeed_cmd
 %type <tree.AlterChangefeedCmds> alter_changefeed_cmds
+%type <tree.AlterBackupScheduleCmd> alter_backup_schedule_cmd
+%type <tree.AlterBackupScheduleCmds> alter_backup_schedule_cmds
 
 %type <tree.BackupKMS> backup_kms
 %type <tree.AlterBackupCmd> alter_backup_cmd
@@ -1378,7 +1389,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Expr> overlay_placing
 
 %type <bool> opt_unique opt_concurrently opt_cluster opt_without_index
-%type <bool> opt_index_access_method opt_index_visible
+%type <bool> opt_index_access_method opt_index_visible alter_index_visible
 
 %type <*tree.Limit> limit_clause offset_clause opt_limit_clause
 %type <tree.Expr> select_fetch_first_value
@@ -1698,6 +1709,7 @@ alter_ddl_stmt:
 | alter_changefeed_stmt         // EXTEND WITH HELP: ALTER CHANGEFEED
 | alter_backup_stmt             // EXTEND WITH HELP: ALTER BACKUP
 | alter_func_stmt
+| alter_backup_schedule  // EXTEND WITH HELP: ALTER BACKUP SCHEDULE
 
 // %Help: ALTER TABLE - change the definition of a table
 // %Category: DDL
@@ -2088,6 +2100,7 @@ alter_range_stmt:
 //   ALTER INDEX ... UNSPLIT ALL
 //   ALTER INDEX ... SCATTER [ FROM ( <exprs...> ) TO ( <exprs...> ) ]
 //   ALTER INDEX ... RELOCATE [ LEASE | VOTERS | NONVOTERS ] <selectclause>
+//   ALTER INDEX ... [VISIBLE | NOT VISIBLE]
 //
 // Zone configurations:
 //   DISCARD
@@ -2104,6 +2117,7 @@ alter_index_stmt:
 | alter_scatter_index_stmt
 | alter_rename_index_stmt
 | alter_zone_index_stmt
+| alter_index_visible_stmt
 // ALTER INDEX has its error help token here because the ALTER INDEX
 // prefix is spread over multiple non-terminals.
 | ALTER INDEX error // SHOW HELP: ALTER INDEX
@@ -2234,6 +2248,26 @@ alter_relocate_index_stmt:
       Rows: $6.slct(),
       SubjectReplicas: $5.relocateSubject(),
     }
+  }
+
+alter_index_visible_stmt:
+  ALTER INDEX table_index_name alter_index_visible
+  {
+    $$.val = &tree.AlterIndexVisible{Index: $3.tableIndexName(), NotVisible: $4.bool(), IfExists: false}
+  }
+| ALTER INDEX IF EXISTS table_index_name alter_index_visible
+  {
+    $$.val = &tree.AlterIndexVisible{Index: $5.tableIndexName(), NotVisible: $6.bool(), IfExists: true}
+  }
+
+alter_index_visible:
+  NOT VISIBLE
+  {
+    $$.val = true
+  }
+| VISIBLE
+  {
+    $$.val = false
   }
 
 // Note: even though the ALTER RANGE ... CONFIGURE ZONE syntax only
@@ -3198,6 +3232,87 @@ create_schedule_for_backup_stmt:
   }
  | CREATE SCHEDULE error  // SHOW HELP: CREATE SCHEDULE FOR BACKUP
 
+// %Help: ALTER BACKUP SCHEDULE - alter an existing backup schedule
+// %Category: CCL
+// %Text:
+// ALTER BACKUP SCHEDULE <id> <command> [, ...]
+//
+// Commands:
+//   ALTER BACKUP SCHEDULE ... SET LABEL <label>
+//   ALTER BACKUP SCHEDULE ... SET INTO <destination>
+//   ALTER BACKUP SCHEDULE ... SET WITH <option>
+//   ALTER BACKUP SCHEDULE ... SET RECURRING <crontab>
+//   ALTER BACKUP SCHEDULE ... SET FULL BACKUP <crontab|ALWAYS>
+//   ALTER BACKUP SCHEDULE ... SET SCHEDULE OPTION <option>
+//
+// See CREATE SCHEDULE FOR BACKUP for detailed option descriptions.
+// %SeeAlso: CREATE SCHEDULE FOR BACKUP
+alter_backup_schedule:
+  ALTER BACKUP SCHEDULE iconst64 alter_backup_schedule_cmds
+  {
+    $$.val = &tree.AlterBackupSchedule{
+			ScheduleID: uint64($4.int64()),
+			Cmds:       $5.alterBackupScheduleCmds(),
+    }
+  }
+  | ALTER BACKUP SCHEDULE error  // SHOW HELP: ALTER BACKUP SCHEDULE
+
+
+alter_backup_schedule_cmds:
+  alter_backup_schedule_cmd
+  {
+    $$.val = tree.AlterBackupScheduleCmds{$1.alterBackupScheduleCmd()}
+  }
+| alter_backup_schedule_cmds ',' alter_backup_schedule_cmd
+  {
+    $$.val = append($1.alterBackupScheduleCmds(), $3.alterBackupScheduleCmd())
+  }
+
+
+alter_backup_schedule_cmd:
+  SET LABEL string_or_placeholder
+	{
+		$$.val = &tree.AlterBackupScheduleSetLabel{
+		  Label: $3.expr(),
+		}
+	}
+|	SET INTO string_or_placeholder_opt_list
+  {
+		$$.val = &tree.AlterBackupScheduleSetInto{
+		  Into: $3.stringOrPlaceholderOptList(),
+		}
+  }
+| SET WITH backup_options
+	{
+		$$.val = &tree.AlterBackupScheduleSetWith{
+		  With: $3.backupOptions(),
+		}
+	}
+| SET cron_expr
+  {
+		$$.val = &tree.AlterBackupScheduleSetRecurring{
+		  Recurrence: $2.expr(),
+		}
+  }
+| SET FULL BACKUP ALWAYS
+  {
+		$$.val = &tree.AlterBackupScheduleSetFullBackup{
+		  FullBackup: tree.FullBackupClause{AlwaysFull: true},
+		}
+  }
+| SET FULL BACKUP sconst_or_placeholder
+  {
+    $$.val = &tree.AlterBackupScheduleSetFullBackup{
+		  FullBackup: tree.FullBackupClause{Recurrence: $4.expr()},
+		}
+  }
+| SET SCHEDULE OPTION kv_option
+  {
+		$$.val = &tree.AlterBackupScheduleSetScheduleOption{
+		  Option:  $4.kvOption(),
+		}
+  }
+
 // sconst_or_placeholder matches a simple string, or a placeholder.
 sconst_or_placeholder:
   SCONST
@@ -3530,7 +3645,10 @@ restore_options:
   {
     $$.val = &tree.RestoreOptions{AsTenant: $3.expr()}
   }
-
+| SCHEMA_ONLY
+	{
+		$$.val = &tree.RestoreOptions{SchemaOnly: true}
+	}
 import_format:
   name
   {
@@ -5328,6 +5446,18 @@ grant_stmt:
       WithGrantOption: $11.bool(),
     }
   }
+| GRANT privileges ON ALL FUNCTIONS IN SCHEMA schema_name_list TO role_spec_list opt_with_grant_option
+  {
+    $$.val = &tree.Grant{
+      Privileges: $2.privilegeList(),
+      Targets: tree.GrantTargetList{
+        Schemas: $8.objectNamePrefixList(),
+        AllFunctionsInSchema: true,
+      },
+      Grantees: $10.roleSpecList(),
+      WithGrantOption: $11.bool(),
+    }
+  }
 | GRANT SYSTEM privileges TO role_spec_list opt_with_grant_option
   {
     $$.val = &tree.Grant{
@@ -5438,6 +5568,30 @@ revoke_stmt:
       Targets: tree.GrantTargetList{
         Schemas: $11.objectNamePrefixList(),
         AllTablesInSchema: true,
+      },
+      Grantees: $13.roleSpecList(),
+      GrantOptionFor: true,
+    }
+  }
+| REVOKE privileges ON ALL FUNCTIONS IN SCHEMA schema_name_list FROM role_spec_list
+  {
+    $$.val = &tree.Revoke{
+      Privileges: $2.privilegeList(),
+      Targets: tree.GrantTargetList{
+        Schemas: $8.objectNamePrefixList(),
+        AllFunctionsInSchema: true,
+      },
+      Grantees: $10.roleSpecList(),
+      GrantOptionFor: false,
+    }
+  }
+| REVOKE GRANT OPTION FOR privileges ON ALL FUNCTIONS IN SCHEMA schema_name_list FROM role_spec_list
+  {
+    $$.val = &tree.Revoke{
+      Privileges: $5.privilegeList(),
+      Targets: tree.GrantTargetList{
+        Schemas: $11.objectNamePrefixList(),
+        AllFunctionsInSchema: true,
       },
       Grantees: $13.roleSpecList(),
       GrantOptionFor: true,
@@ -6342,16 +6496,25 @@ session_var_parts:
 // are encoded in JSON format.
 // %SeeAlso: SHOW HISTOGRAM
 show_stats_stmt:
-  SHOW STATISTICS FOR TABLE table_name
+  SHOW STATISTICS FOR TABLE table_name opt_with_options
   {
-    $$.val = &tree.ShowTableStats{Table: $5.unresolvedObjectName()}
+      $$.val = &tree.ShowTableStats{
+        Table:   $5.unresolvedObjectName(),
+        Options: $6.kvOptions(),
+      }
   }
-| SHOW STATISTICS USING JSON FOR TABLE table_name
+| SHOW STATISTICS USING JSON FOR TABLE table_name opt_with_options
   {
     /* SKIP DOC */
-    $$.val = &tree.ShowTableStats{Table: $7.unresolvedObjectName(), UsingJSON: true}
+    $$.val = &tree.ShowTableStats{
+      Table:     $7.unresolvedObjectName(),
+      UsingJSON: true,
+      Options:   $8.kvOptions(),
+    }
   }
 | SHOW STATISTICS error // SHOW HELP: SHOW STATISTICS
+
+
 
 // %Help: SHOW HISTOGRAM - display histogram (experimental)
 // %Category: Experimental
@@ -7524,6 +7687,10 @@ grant_targets:
 | EXTERNAL CONNECTION name_list
   {
     $$.val = tree.GrantTargetList{ExternalConnections: $3.nameList()}
+  }
+| FUNCTION function_with_argtypes_list
+  {
+    $$.val = tree.GrantTargetList{Functions: $2.functionObjs()}
   }
 
 // backup_targets is similar to grant_targets but used by backup and restore, and thus
@@ -9479,9 +9646,9 @@ opt_index_visible:
     $$.val = true
   }
 | VISIBLE
-   {
-     $$.val = false
-   }
+  {
+    $$.val = false
+  }
 | /* EMPTY */
   {
     $$.val = false
@@ -9894,7 +10061,7 @@ target_object_type:
   {
     $$.val = privilege.Schemas
   }
-| FUNCTIONS error
+| FUNCTIONS
   {
     $$.val = privilege.Functions
   }
@@ -14952,6 +15119,7 @@ unreserved_keyword:
 | KEYS
 | KMS
 | KV
+| LABEL
 | LANGUAGE
 | LAST
 | LATEST
@@ -15105,6 +15273,7 @@ unreserved_keyword:
 | RUNNING
 | SCHEDULE
 | SCHEDULES
+| SCHEMA_ONLY
 | SCROLL
 | SETTING
 | SETTINGS
@@ -15198,7 +15367,9 @@ unreserved_keyword:
 | VIEW
 | VIEWACTIVITY
 | VIEWACTIVITYREDACTED
+| VIEWCLUSTERMETADATA
 | VIEWCLUSTERSETTING
+| VIEWDEBUG
 | VISIBLE
 | VOLATILE
 | VOTERS

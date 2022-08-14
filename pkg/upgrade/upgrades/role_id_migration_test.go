@@ -70,9 +70,9 @@ func runTestRoleIDMigration(t *testing.T, numUsers int) {
 	tdb.Exec(t, `DROP SEQUENCE system.role_id_seq`)
 	tdb.Exec(t, `REVOKE node FROM root`)
 
-	err := tc.Servers[0].DB().Del(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.RoleIDSequenceID))
+	_, err := tc.Servers[0].DB().Del(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.RoleIDSequenceID))
 	require.NoError(t, err)
-	err = tc.Servers[0].DB().Del(ctx, keys.SystemSQLCodec.SequenceKey(uint32(keys.RoleIDSequenceID)))
+	_, err = tc.Servers[0].DB().Del(ctx, keys.SystemSQLCodec.SequenceKey(uint32(keys.RoleIDSequenceID)))
 	require.NoError(t, err)
 
 	// Remove entries from system.users.
@@ -106,9 +106,8 @@ func runTestRoleIDMigration(t *testing.T, numUsers int) {
 		numUsers += 1
 		var wg sync.WaitGroup
 		wg.Add(100)
-		// Make creating users faster.
+		// Parallelize user creation.
 		for i := 0; i < 100; i++ {
-			// Each goroutine creates 100 users.
 			go func(capI int) {
 				defer wg.Done()
 				// This is hacky but INSERT into is faster
@@ -143,11 +142,11 @@ func runTestRoleIDMigration(t *testing.T, numUsers int) {
 	require.NoError(t, err)
 
 	_, err = tc.Conns[0].ExecContext(ctx, `SET CLUSTER SETTING version = $1`,
-		clusterversion.ByKey(clusterversion.UsersHaveIDs).String())
+		clusterversion.ByKey(clusterversion.SystemUsersIDColumnIsBackfilled).String())
 	require.NoError(t, err)
 
 	_, err = tc.Conns[0].ExecContext(ctx, `SET CLUSTER SETTING version = $1`,
-		clusterversion.ByKey(clusterversion.SetUserIDNotNull).String())
+		clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull).String())
 	require.NoError(t, err)
 
 	tdb.CheckQueryResults(t, `SELECT * FROM system.users WHERE user_id IS NULL`, [][]string{})

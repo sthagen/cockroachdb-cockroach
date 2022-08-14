@@ -134,6 +134,7 @@ func restoreWithRetry(
 	encryption *jobspb.BackupEncryptionOptions,
 	kmsEnv cloud.KMSEnv,
 ) (roachpb.RowCount, error) {
+
 	// We retry on pretty generic failures -- any rpc error. If a worker node were
 	// to restart, it would produce this kind of error, but there may be other
 	// errors that are also rpc errors. Don't retry to aggressively.
@@ -579,13 +580,26 @@ func spansForAllRestoreTableIndexes(
 	codec keys.SQLCodec,
 	tables []catalog.TableDescriptor,
 	revs []backuppb.BackupManifest_DescriptorRevision,
+	schemaOnly bool,
 ) []roachpb.Span {
+
+	skipTableData := func(table catalog.TableDescriptor) bool {
+		// The only table data restored during a schemaOnly restore are from system tables,
+		// which only get covered during a cluster restore.
+		if table.GetParentID() != keys.SystemDatabaseID && schemaOnly {
+			return true
+		}
+		// We only import spans for physical tables.
+		if !table.IsPhysicalTable() {
+			return true
+		}
+		return false
+	}
 
 	added := make(map[tableAndIndex]bool, len(tables))
 	sstIntervalTree := interval.NewTree(interval.ExclusiveOverlapper)
 	for _, table := range tables {
-		// We only import spans for physical tables.
-		if !table.IsPhysicalTable() {
+		if skipTableData(table) {
 			continue
 		}
 		for _, index := range table.ActiveIndexes() {
@@ -608,8 +622,7 @@ func spansForAllRestoreTableIndexes(
 		rawTbl, _, _, _, _ := descpb.FromDescriptor(rev.Desc)
 		if rawTbl != nil && !rawTbl.Dropped() {
 			tbl := tabledesc.NewBuilder(rawTbl).BuildImmutableTable()
-			// We only import spans for physical tables.
-			if !tbl.IsPhysicalTable() {
+			if skipTableData(tbl) {
 				continue
 			}
 			for _, idx := range tbl.ActiveIndexes() {
@@ -705,7 +718,7 @@ func createImportingDescriptors(
 		}
 	}
 
-	tempSystemDBID := tempSystemDatabaseID(details)
+	tempSystemDBID := tempSystemDatabaseID(details, tables)
 	if tempSystemDBID != descpb.InvalidID {
 		tempSystemDB := dbdesc.NewInitial(tempSystemDBID, restoreTempSystemDB,
 			username.AdminRoleName(), dbdesc.WithPublicSchemaID(keys.SystemPublicSchemaID))
@@ -714,8 +727,8 @@ func createImportingDescriptors(
 
 	// We get the spans of the restoring tables _as they appear in the backup_,
 	// that is, in the 'old' keyspace, before we reassign the table IDs.
-	preRestoreSpans := spansForAllRestoreTableIndexes(backupCodec, preRestoreTables, nil)
-	postRestoreSpans := spansForAllRestoreTableIndexes(backupCodec, postRestoreTables, nil)
+	preRestoreSpans := spansForAllRestoreTableIndexes(backupCodec, preRestoreTables, nil, details.SchemaOnly)
+	postRestoreSpans := spansForAllRestoreTableIndexes(backupCodec, postRestoreTables, nil, details.SchemaOnly)
 
 	log.Eventf(ctx, "starting restore for %d tables", len(mutableTables))
 
@@ -1232,10 +1245,6 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	p := execCtx.(sql.JobExecContext)
 	r.execCfg = p.ExecCfg()
 
-	if details.Validation != jobspb.RestoreValidation_DefaultRestore {
-		return errors.Errorf("No restore validation tools are supported")
-	}
-
 	mem := p.ExecCfg().RootMemoryMonitor.MakeBoundAccount()
 	defer mem.Close(ctx)
 
@@ -1572,7 +1581,7 @@ func revalidateIndexes(
 	// since our table is offline.
 	var runner sqlutil.HistoricalInternalExecTxnRunner = func(ctx context.Context, fn sqlutil.InternalExecFn) error {
 		return execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			ie := job.MakeSessionBoundInternalExecutor(ctx, sql.NewFakeSessionData(execCfg.SV())).(*sql.InternalExecutor)
+			ie := job.MakeSessionBoundInternalExecutor(sql.NewFakeSessionData(execCfg.SV())).(*sql.InternalExecutor)
 			return fn(ctx, txn, ie)
 		})
 	}
@@ -1665,22 +1674,26 @@ func (r *restoreResumer) notifyStatsRefresherOfNewTables() {
 }
 
 // tempSystemDatabaseID returns the ID of the descriptor for the temporary
-// system database used in full cluster restores.
-// This is the last of the IDs pre-allocated by the restore planner.
-// TODO(postamar): Store it directly in the details instead? This is brittle.
-func tempSystemDatabaseID(details jobspb.RestoreDetails) descpb.ID {
+// system database used in full cluster restores, by finding a table in the
+// rewrites that had the static system database ID as its parent and returning
+// the new parent assigned in the rewrites during planning. Returns InvalidID if
+// no such table appears in the rewrites.
+func tempSystemDatabaseID(
+	details jobspb.RestoreDetails, tables []catalog.TableDescriptor,
+) descpb.ID {
 	if details.DescriptorCoverage != tree.AllDescriptors && !isSystemUserRestore(details) {
 		return descpb.InvalidID
 	}
-	var maxPreAllocatedID descpb.ID
-	for id := range details.DescriptorRewrites {
-		// This map is never empty in this case (full cluster restore),
-		// it contains at minimum the entry for the temporary system database.
-		if id > maxPreAllocatedID {
-			maxPreAllocatedID = id
+
+	for _, tbl := range tables {
+		if tbl.GetParentID() == keys.SystemDatabaseID {
+			if details.DescriptorRewrites[tbl.GetID()].ParentID != 0 {
+				return details.DescriptorRewrites[tbl.GetID()].ParentID
+			}
 		}
 	}
-	return maxPreAllocatedID
+
+	return descpb.InvalidID
 }
 
 // Insert stats re-inserts the table statistics stored in the backup manifest.
@@ -1845,7 +1858,7 @@ func (r *restoreResumer) publishDescriptors(
 		typ := all.LookupDescriptorEntry(details.TypeDescs[i].GetID()).(catalog.TypeDescriptor)
 		newTypes = append(newTypes, typ.TypeDesc())
 		if typ.GetDeclarativeSchemaChangerState() == nil &&
-			typ.HasPendingSchemaChanges() && details.DescriptorCoverage != tree.AllDescriptors {
+			typ.HasPendingSchemaChanges() {
 			if err := createTypeChangeJobFromDesc(
 				ctx, r.execCfg.JobRegistry, r.execCfg.Codec, txn, r.job.Payload().UsernameProto.Decode(), typ,
 			); err != nil {
@@ -2460,16 +2473,11 @@ func (r *restoreResumer) restoreSystemTables(
 	if details.SystemTablesMigrated == nil {
 		details.SystemTablesMigrated = make(map[string]bool)
 	}
-	tempSystemDBID := tempSystemDatabaseID(details)
-
 	// Iterate through all the tables that we're restoring, and if it was restored
 	// to the temporary system DB then populate the metadata required to restore
 	// to the real system table.
 	systemTablesToRestore := make([]systemTableNameWithConfig, 0)
 	for _, table := range tables {
-		if table.GetParentID() != tempSystemDBID {
-			continue
-		}
 		systemTableName := table.GetName()
 		stagingTableName := restoreTempSystemDB + "." + systemTableName
 

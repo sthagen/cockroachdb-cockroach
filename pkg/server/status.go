@@ -63,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -416,6 +417,19 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 		return bytes.Compare(response.Flows[i].FlowID.GetBytes(), response.Flows[j].FlowID.GetBytes()) < 0
 	})
 	return response, nil
+}
+
+func (b *baseStatusServer) localExecutionInsights(
+	ctx context.Context,
+) (*serverpb.ListExecutionInsightsResponse, error) {
+	var response serverpb.ListExecutionInsightsResponse
+
+	reader := b.sqlServer.pgServer.SQLServer.GetSQLStatsProvider()
+	reader.IterateInsights(ctx, func(ctx context.Context, insight *insights.Insight) {
+		response.Insights = append(response.Insights, *insight)
+	})
+
+	return &response, nil
 }
 
 func (b *baseStatusServer) localTxnIDResolution(
@@ -800,9 +814,8 @@ func (s *statusServer) AllocatorRange(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1453,7 +1466,7 @@ func (s *statusServer) Nodes(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	err := s.privilegeChecker.requireViewActivityPermission(ctx)
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1471,14 +1484,14 @@ func (s *statusServer) NodesUI(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	hasViewActivity := false
-	err := s.privilegeChecker.requireViewActivityPermission(ctx)
+	hasViewClusterMetadata := false
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
 	if err != nil {
 		if !grpcutil.IsAuthError(err) {
 			return nil, err
 		}
 	} else {
-		hasViewActivity = true
+		hasViewClusterMetadata = true
 	}
 
 	internalResp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
@@ -1490,13 +1503,13 @@ func (s *statusServer) NodesUI(
 		LivenessByNodeID: internalResp.LivenessByNodeID,
 	}
 	for i, nodeStatus := range internalResp.Nodes {
-		resp.Nodes[i] = nodeStatusToResp(&nodeStatus, hasViewActivity)
+		resp.Nodes[i] = nodeStatusToResp(&nodeStatus, hasViewClusterMetadata)
 	}
 
 	return resp, nil
 }
 
-func nodeStatusToResp(n *statuspb.NodeStatus, hasViewActivity bool) serverpb.NodeResponse {
+func nodeStatusToResp(n *statuspb.NodeStatus, hasViewClusterMetadata bool) serverpb.NodeResponse {
 	tiers := make([]serverpb.Tier, len(n.Desc.Locality.Tiers))
 	for j, t := range n.Desc.Locality.Tiers {
 		tiers[j] = serverpb.Tier{
@@ -1552,7 +1565,7 @@ func nodeStatusToResp(n *statuspb.NodeStatus, hasViewActivity bool) serverpb.Nod
 			sfsprops := &roachpb.FileStoreProperties{
 				FsType: fsprops.FsType,
 			}
-			if hasViewActivity {
+			if hasViewClusterMetadata {
 				sfsprops.Path = fsprops.Path
 				sfsprops.BlockDevice = fsprops.BlockDevice
 				sfsprops.MountPoint = fsprops.MountPoint
@@ -1577,7 +1590,7 @@ func nodeStatusToResp(n *statuspb.NodeStatus, hasViewActivity bool) serverpb.Nod
 		NumCpus:           n.NumCpus,
 	}
 
-	if hasViewActivity {
+	if hasViewClusterMetadata {
 		resp.Args = n.Args
 		resp.Env = n.Env
 		resp.Desc.Attrs = n.Desc.Attrs
@@ -1916,7 +1929,8 @@ func (s *statusServer) rangesHelper(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
 		return nil, 0, err
 	}
 
@@ -3103,6 +3117,66 @@ func mergeDistSQLRemoteFlows(a, b []serverpb.DistSQLRemoteFlows) []serverpb.Dist
 		result = append(result, b[bIter:]...)
 	}
 	return result
+}
+
+func (s *statusServer) ListExecutionInsights(
+	ctx context.Context, req *serverpb.ListExecutionInsightsRequest,
+) (*serverpb.ListExecutionInsightsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	// Check permissions early to avoid fan-out to all nodes.
+	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+		// NB: not using serverError() here since the priv checker
+		// already returns a proper gRPC error status.
+		return nil, err
+	}
+
+	localRequest := serverpb.ListExecutionInsightsRequest{NodeID: "local"}
+
+	if len(req.NodeID) > 0 {
+		requestedNodeID, local, err := s.parseNodeID(req.NodeID)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, err.Error())
+		}
+		if local {
+			return s.localExecutionInsights(ctx)
+		}
+		statusClient, err := s.dialNode(ctx, requestedNodeID)
+		if err != nil {
+			return nil, serverError(ctx, err)
+		}
+		return statusClient.ListExecutionInsights(ctx, &localRequest)
+	}
+
+	var response serverpb.ListExecutionInsightsResponse
+
+	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
+		return s.dialNode(ctx, nodeID)
+	}
+	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
+		statusClient := client.(serverpb.StatusClient)
+		resp, err := statusClient.ListExecutionInsights(ctx, &localRequest)
+		if err != nil {
+			return nil, err
+		}
+		return resp, nil
+	}
+	responseFn := func(nodeID roachpb.NodeID, nodeResponse interface{}) {
+		if nodeResponse == nil {
+			return
+		}
+		insightsResponse := nodeResponse.(*serverpb.ListExecutionInsightsResponse)
+		response.Insights = append(response.Insights, insightsResponse.Insights...)
+	}
+	errorFn := func(nodeID roachpb.NodeID, err error) {
+		response.Errors = append(response.Errors, errors.EncodeError(ctx, err))
+	}
+
+	if err := s.iterateNodes(ctx, "execution insights list", dialFn, nodeFn, responseFn, errorFn); err != nil {
+		return nil, serverError(ctx, err)
+	}
+	return &response, nil
 }
 
 // SpanStats requests the total statistics stored on a node for a given key

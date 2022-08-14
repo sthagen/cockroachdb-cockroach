@@ -64,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/pgformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -247,6 +248,8 @@ var regularBuiltins = map[string]builtinDefinition{
 			volatility.Immutable,
 		),
 	),
+
+	"format": formatImpls,
 
 	"octet_length": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		stringOverload1(
@@ -2403,84 +2406,11 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	// Timestamp/Date functions.
 
-	"experimental_strftime": makeBuiltin(
-		tree.FunctionProperties{
-			Category: builtinconstants.CategoryDateAndTime,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.Timestamp}, {"extract_format", types.String}},
-			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				fromTime := args[0].(*tree.DTimestamp).Time
-				format := string(tree.MustBeDString(args[1]))
-				t, err := strtime.Strftime(fromTime, format)
-				if err != nil {
-					return nil, err
-				}
-				return tree.NewDString(t), nil
-			},
-			Info: "From `input`, extracts and formats the time as identified in `extract_format` " +
-				"using standard `strftime` notation (though not all formatting is supported).",
-			Volatility: volatility.Immutable,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.Date}, {"extract_format", types.String}},
-			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				fromTime, err := args[0].(*tree.DDate).ToTime()
-				if err != nil {
-					return nil, err
-				}
-				format := string(tree.MustBeDString(args[1]))
-				t, err := strtime.Strftime(fromTime, format)
-				if err != nil {
-					return nil, err
-				}
-				return tree.NewDString(t), nil
-			},
-			Info: "From `input`, extracts and formats the time as identified in `extract_format` " +
-				"using standard `strftime` notation (though not all formatting is supported).",
-			Volatility: volatility.Immutable,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.TimestampTZ}, {"extract_format", types.String}},
-			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				fromTime := args[0].(*tree.DTimestampTZ).Time
-				format := string(tree.MustBeDString(args[1]))
-				t, err := strtime.Strftime(fromTime, format)
-				if err != nil {
-					return nil, err
-				}
-				return tree.NewDString(t), nil
-			},
-			Info: "From `input`, extracts and formats the time as identified in `extract_format` " +
-				"using standard `strftime` notation (though not all formatting is supported).",
-			Volatility: volatility.Immutable,
-		},
-	),
+	"strftime":              strftimeImpl(),
+	"experimental_strftime": strftimeImpl(),
 
-	"experimental_strptime": makeBuiltin(
-		tree.FunctionProperties{
-			Category: builtinconstants.CategoryDateAndTime,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.String}, {"format", types.String}},
-			ReturnType: tree.FixedReturnType(types.TimestampTZ),
-			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				toParse := string(tree.MustBeDString(args[0]))
-				format := string(tree.MustBeDString(args[1]))
-				t, err := strtime.Strptime(toParse, format)
-				if err != nil {
-					return nil, err
-				}
-				return tree.MakeDTimestampTZ(t.UTC(), time.Microsecond)
-			},
-			Info: "Returns `input` as a timestamptz using `format` (which uses standard " +
-				"`strptime` formatting).",
-			Volatility: volatility.Immutable,
-		},
-	),
+	"strptime":              strptimeImpl(),
+	"experimental_strptime": strptimeImpl(),
 
 	"to_char": makeBuiltin(
 		defProps(),
@@ -7458,6 +7388,27 @@ func makeSubStringImpls() builtinDefinition {
 	)
 }
 
+var formatImpls = makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
+	tree.Overload{
+		Types:      tree.VariadicType{FixedTypes: []*types.T{types.String}, VarType: types.Any},
+		ReturnType: tree.FixedReturnType(types.String),
+		Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+			if args[0] == tree.DNull {
+				return tree.DNull, nil
+			}
+			formatStr := tree.MustBeDString(args[0])
+			formatArgs := args[1:]
+			str, err := pgformat.Format(ctx, string(formatStr), formatArgs...)
+			if err != nil {
+				return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "error parsing format string")
+			}
+			return tree.NewDString(str), nil
+		},
+		Info:              "Interprets the first argument as a format string similar to C sprintf and interpolates the remaining arguments.",
+		Volatility:        volatility.Stable,
+		CalledOnNullInput: true,
+	})
+
 // Returns a substring of given string starting at given position.
 func getSubstringFromIndex(str string, start int) string {
 	runes := []rune(str)
@@ -7564,6 +7515,89 @@ func generateRandomUUID4Impl() builtinDefinition {
 			},
 			Info:       "Generates a random version 4 UUID, and returns it as a value of UUID type.",
 			Volatility: volatility.Volatile,
+		},
+	)
+}
+
+func strftimeImpl() builtinDefinition {
+	return makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategoryDateAndTime,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"input", types.Timestamp}, {"extract_format", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				fromTime := args[0].(*tree.DTimestamp).Time
+				format := string(tree.MustBeDString(args[1]))
+				t, err := strtime.Strftime(fromTime, format)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(t), nil
+			},
+			Info: "From `input`, extracts and formats the time as identified in `extract_format` " +
+				"using standard `strftime` notation (though not all formatting is supported).",
+			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"input", types.Date}, {"extract_format", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				fromTime, err := args[0].(*tree.DDate).ToTime()
+				if err != nil {
+					return nil, err
+				}
+				format := string(tree.MustBeDString(args[1]))
+				t, err := strtime.Strftime(fromTime, format)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(t), nil
+			},
+			Info: "From `input`, extracts and formats the time as identified in `extract_format` " +
+				"using standard `strftime` notation (though not all formatting is supported).",
+			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"input", types.TimestampTZ}, {"extract_format", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				fromTime := args[0].(*tree.DTimestampTZ).Time
+				format := string(tree.MustBeDString(args[1]))
+				t, err := strtime.Strftime(fromTime, format)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(t), nil
+			},
+			Info: "From `input`, extracts and formats the time as identified in `extract_format` " +
+				"using standard `strftime` notation (though not all formatting is supported).",
+			Volatility: volatility.Immutable,
+		},
+	)
+}
+
+func strptimeImpl() builtinDefinition {
+	return makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategoryDateAndTime,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"input", types.String}, {"format", types.String}},
+			ReturnType: tree.FixedReturnType(types.TimestampTZ),
+			Fn: func(_ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				toParse := string(tree.MustBeDString(args[0]))
+				format := string(tree.MustBeDString(args[1]))
+				t, err := strtime.Strptime(toParse, format)
+				if err != nil {
+					return nil, err
+				}
+				return tree.MakeDTimestampTZ(t.UTC(), time.Microsecond)
+			},
+			Info: "Returns `input` as a timestamptz using `format` (which uses standard " +
+				"`strptime` formatting).",
+			Volatility: volatility.Immutable,
 		},
 	)
 }

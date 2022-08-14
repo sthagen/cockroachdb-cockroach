@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/redact"
 )
 
@@ -1558,11 +1559,11 @@ type StoreWriteWorkInfo struct {
 
 // StoreWorkQueue is responsible for admission to a store.
 type StoreWorkQueue struct {
-	q WorkQueue
+	q [numWorkClasses]WorkQueue
 	// Only calls storeWriteDone. The rest of the interface is used by
 	// WorkQueue.
-	granter granterWithStoreWriteDone
-	mu      struct {
+	granters [numWorkClasses]granterWithStoreWriteDone
+	mu       struct {
 		syncutil.RWMutex
 		estimates storeRequestEstimates
 		stats     storeAdmissionStats
@@ -1576,6 +1577,7 @@ type StoreWorkHandle struct {
 	tenantID roachpb.TenantID
 	// The writeTokens acquired by this request. Must be > 0.
 	writeTokens      int64
+	workClass        workClass
 	admissionEnabled bool
 }
 
@@ -1592,15 +1594,21 @@ func (h StoreWorkHandle) AdmissionEnabled() bool {
 func (q *StoreWorkQueue) Admit(
 	ctx context.Context, info StoreWriteWorkInfo,
 ) (handle StoreWorkHandle, err error) {
+	// For now, we compute a workClass based on priority.
+	wc := regularWorkClass
+	if info.Priority < admissionpb.NormalPri {
+		wc = elasticWorkClass
+	}
 	h := StoreWorkHandle{
-		tenantID: info.TenantID,
+		tenantID:  info.TenantID,
+		workClass: wc,
 	}
 	q.mu.RLock()
 	estimates := q.mu.estimates
 	q.mu.RUnlock()
 	h.writeTokens = estimates.writeTokens
 	info.WorkInfo.requestedCount = h.writeTokens
-	enabled, err := q.q.Admit(ctx, info.WorkInfo)
+	enabled, err := q.q[wc].Admit(ctx, info.WorkInfo)
 	if err != nil {
 		return StoreWorkHandle{}, err
 	}
@@ -1615,13 +1623,6 @@ type StoreWorkDoneInfo struct {
 	// the write-batch is empty, which happens when all the bytes are being
 	// added via sstable ingestion. NB: it is possible for both WriteBytes and
 	// IngestedBytes to be 0 if nothing was actually written.
-	//
-	// TODO(sumeer): WriteBytes will under count the actual effect on the Pebble
-	// store shared by the raft log and the state machine, since this only
-	// reflects the changes to the raft log. We compensate for this with an
-	// additive adjustment which is the same across all writes regardless of
-	// bytes. We should consider using an adjustment that is proportional to the
-	// WriteBytes.
 	WriteBytes int64
 	// The size of the sstables, for ingests. Zero if there were no ingests.
 	IngestedBytes int64
@@ -1633,33 +1634,66 @@ func (q *StoreWorkQueue) AdmittedWorkDone(h StoreWorkHandle, doneInfo StoreWorkD
 	if !h.admissionEnabled {
 		return nil
 	}
-	{
-		q.mu.Lock()
-		q.mu.stats.admittedCount++
-		q.mu.stats.writeAccountedBytes += uint64(doneInfo.WriteBytes)
-		q.mu.stats.ingestedAccountedBytes += uint64(doneInfo.IngestedBytes)
-		q.mu.Unlock()
-	}
-	additionalTokens := q.granter.storeWriteDone(h.writeTokens, doneInfo)
-	q.q.adjustTenantTokens(h.tenantID, additionalTokens)
+	q.updateStoreAdmissionStats(1, doneInfo, false)
+	additionalTokens := q.granters[h.workClass].storeWriteDone(h.writeTokens, doneInfo)
+	q.q[h.workClass].adjustTenantTokens(h.tenantID, additionalTokens)
 	return nil
+}
+
+// BypassedWorkDone is called for follower writes, so that admission control
+// can (a) adjust remaining tokens, (b) account for this in the per-work token
+// estimation model.
+func (q *StoreWorkQueue) BypassedWorkDone(workCount int64, doneInfo StoreWorkDoneInfo) {
+	q.updateStoreAdmissionStats(uint64(workCount), doneInfo, true)
+	// Since we have no control over such work, we choose to count it as
+	// regularWorkClass.
+	_ = q.granters[regularWorkClass].storeWriteDone(0, doneInfo)
+}
+
+// StatsToIgnore is called for range snapshot ingestion -- see the comment in
+// storeAdmissionStats.
+func (q *StoreWorkQueue) StatsToIgnore(ingestStats pebble.IngestOperationStats) {
+	q.mu.Lock()
+	q.mu.stats.statsToIgnore.Bytes += ingestStats.Bytes
+	q.mu.stats.statsToIgnore.ApproxIngestedIntoL0Bytes += ingestStats.ApproxIngestedIntoL0Bytes
+	q.mu.Unlock()
+}
+
+func (q *StoreWorkQueue) updateStoreAdmissionStats(
+	workCount uint64, doneInfo StoreWorkDoneInfo, bypassed bool,
+) {
+	q.mu.Lock()
+	q.mu.stats.admittedCount += workCount
+	q.mu.stats.writeAccountedBytes += uint64(doneInfo.WriteBytes)
+	q.mu.stats.ingestedAccountedBytes += uint64(doneInfo.IngestedBytes)
+	if bypassed {
+		q.mu.stats.aux.bypassedCount += workCount
+		q.mu.stats.aux.writeBypassedAccountedBytes += uint64(doneInfo.WriteBytes)
+		q.mu.stats.aux.ingestedBypassedAccountedBytes += uint64(doneInfo.IngestedBytes)
+	}
+	q.mu.Unlock()
 }
 
 // SetTenantWeights passes through to WorkQueue.SetTenantWeights.
 func (q *StoreWorkQueue) SetTenantWeights(tenantWeights map[uint64]uint32) {
-	q.q.SetTenantWeights(tenantWeights)
+	for i := range q.q {
+		q.q[i].SetTenantWeights(tenantWeights)
+	}
 }
 
-func (q *StoreWorkQueue) hasWaitingRequests() bool {
-	return q.q.hasWaitingRequests()
-}
-
-func (q *StoreWorkQueue) granted(grantChainID grantChainID) int64 {
-	return q.q.granted(grantChainID)
+// getRequesters implements storeRequester.
+func (q *StoreWorkQueue) getRequesters() [numWorkClasses]requester {
+	var result [numWorkClasses]requester
+	for i := range q.q {
+		result[i] = &q.q[i]
+	}
+	return result
 }
 
 func (q *StoreWorkQueue) close() {
-	q.q.close()
+	for i := range q.q {
+		q.q[i].close()
+	}
 }
 
 func (q *StoreWorkQueue) getStoreAdmissionStats() storeAdmissionStats {
@@ -1676,14 +1710,16 @@ func (q *StoreWorkQueue) setStoreRequestEstimates(estimates storeRequestEstimate
 
 func makeStoreWorkQueue(
 	ambientCtx log.AmbientContext,
-	granter granterWithStoreWriteDone,
+	granters [numWorkClasses]granterWithStoreWriteDone,
 	settings *cluster.Settings,
 	opts workQueueOptions,
 ) storeRequester {
 	q := &StoreWorkQueue{
-		granter: granter,
+		granters: granters,
 	}
-	initWorkQueue(&q.q, ambientCtx, KVWork, granter, settings, opts)
+	for i := range q.q {
+		initWorkQueue(&q.q[i], ambientCtx, KVWork, granters[i], settings, opts)
+	}
 	// Arbitrary initial value. This will be replaced before any meaningful
 	// token constraints are enforced.
 	q.mu.estimates = storeRequestEstimates{

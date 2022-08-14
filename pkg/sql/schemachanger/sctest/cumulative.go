@@ -326,12 +326,10 @@ func Backup(t *testing.T, dir string, newCluster NewClusterFunc) {
 	)
 	testFunc := func(t *testing.T, _ string, _ bool, setup, stmts []parser.Statement) {
 		postCommit, nonRevertible := countStages(t, setup, stmts)
-		if nonRevertible > 0 {
-			postCommit++
-		}
-		n := postCommit
+		n := postCommit + nonRevertible
+
 		t.Logf("test case has %d revertible post-commit stages", n)
-		for i := 1; i <= n; i++ {
+		for i := postCommit; i <= n; i++ {
 			if !t.Run(
 				fmt.Sprintf("backup/restore stage %d of %d", i, n),
 				func(t *testing.T) { testBackupRestoreCase(t, setup, stmts, i) },
@@ -407,6 +405,7 @@ func Backup(t *testing.T, dir string, newCluster NewClusterFunc) {
 		var backups []backup
 		var done bool
 		var rollbackStage int
+		completedStages := make(map[int]struct{})
 		for i := 0; !done; i++ {
 			// We want to let the stages up to ord continue unscathed. Then, we'll
 			// start taking backups at ord. If ord corresponds to a revertible
@@ -422,6 +421,12 @@ func Backup(t *testing.T, dir string, newCluster NewClusterFunc) {
 			// stage and confirm that restoring them and letting the jobs run
 			// leaves the database in the right state.
 			s := <-stageChan
+			// Move the index backwards if we see the same stage repeat due to a txn
+			// retry error for example.
+			if _, ok := completedStages[s.stageIdx]; ok {
+				i--
+			}
+			completedStages[s.stageIdx] = struct{}{}
 			shouldFail := ord == i &&
 				s.p.Stages[s.stageIdx].Phase != scop.PostCommitNonRevertiblePhase &&
 				!s.p.InRollback
@@ -472,28 +477,38 @@ func Backup(t *testing.T, dir string, newCluster NewClusterFunc) {
 		t.Logf("finished")
 
 		for i, b := range backups {
-			t.Run("", func(t *testing.T) {
-				t.Logf("testing backup %d %v", i, b.isRollback)
-				tdb.Exec(t, fmt.Sprintf("DROP DATABASE IF EXISTS %q CASCADE", dbName))
-				tdb.Exec(t, "SET use_declarative_schema_changer = 'off'")
-				tdb.Exec(t, fmt.Sprintf("RESTORE DATABASE %s FROM LATEST IN '%s'", dbName, b.url))
-				tdb.Exec(t, fmt.Sprintf("USE %q", dbName))
-				waitForSchemaChangesToFinish(t, tdb)
-				afterRestore := tdb.QueryStr(t, fetchDescriptorStateQuery)
-				if b.isRollback {
-					require.Equal(t, before, afterRestore)
-				} else {
-					require.Equal(t, after, afterRestore)
+			for _, isSchemaOnly := range []bool{true, false} {
+				name := ""
+				if isSchemaOnly {
+					name = "schema-only"
 				}
-				// Hack to deal with corrupt userfiles tables due to #76764.
-				const validateQuery = `
+				t.Run(name, func(t *testing.T) {
+					t.Logf("testing backup %d %v", i, b.isRollback)
+					tdb.Exec(t, fmt.Sprintf("DROP DATABASE IF EXISTS %q CASCADE", dbName))
+					tdb.Exec(t, "SET use_declarative_schema_changer = 'off'")
+					restoreQuery := fmt.Sprintf("RESTORE DATABASE %s FROM LATEST IN '%s'", dbName, b.url)
+					if isSchemaOnly {
+						restoreQuery = restoreQuery + " with schema_only"
+					}
+					tdb.Exec(t, restoreQuery)
+					tdb.Exec(t, fmt.Sprintf("USE %q", dbName))
+					waitForSchemaChangesToFinish(t, tdb)
+					afterRestore := tdb.QueryStr(t, fetchDescriptorStateQuery)
+					if b.isRollback {
+						require.Equal(t, before, afterRestore)
+					} else {
+						require.Equal(t, after, afterRestore)
+					}
+					// Hack to deal with corrupt userfiles tables due to #76764.
+					const validateQuery = `
 SELECT * FROM crdb_internal.invalid_objects WHERE database_name != 'backups'
 `
-				tdb.CheckQueryResults(t, validateQuery, [][]string{})
-				tdb.Exec(t, fmt.Sprintf("DROP DATABASE %q CASCADE", dbName))
-				tdb.Exec(t, "USE backups")
-				tdb.CheckQueryResults(t, validateQuery, [][]string{})
-			})
+					tdb.CheckQueryResults(t, validateQuery, [][]string{})
+					tdb.Exec(t, fmt.Sprintf("DROP DATABASE %q CASCADE", dbName))
+					tdb.Exec(t, "USE backups")
+					tdb.CheckQueryResults(t, validateQuery, [][]string{})
+				})
+			}
 		}
 	}
 	cumulativeTest(t, dir, testFunc)

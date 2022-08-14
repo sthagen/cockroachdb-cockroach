@@ -213,8 +213,9 @@ CREATE TABLE db.t (
 				return []scop.Op{
 					&scop.MakeAddedTempIndexDeleteOnly{
 						Index: scpb.Index{
-							TableID: table.ID,
-							IndexID: indexToAdd.ID,
+							TableID:      table.ID,
+							IndexID:      indexToAdd.ID,
+							ConstraintID: indexToAdd.ConstraintID,
 						},
 						IsSecondaryIndex: true,
 					},
@@ -284,21 +285,10 @@ func TestSchemaChanger(t *testing.T) {
 			targets := []scpb.Target{
 				scpb.MakeTarget(
 					scpb.ToPublic,
-					&scpb.IndexColumn{
-						TableID:       fooTable.GetID(),
-						IndexID:       1,
-						ColumnID:      2,
-						OrdinalInKind: 0,
-						Kind:          scpb.IndexColumn_STORED,
-					},
-					metadata,
-				),
-				scpb.MakeTarget(
-					scpb.ToPublic,
-					&scpb.ColumnName{
-						TableID:  fooTable.GetID(),
-						ColumnID: 2,
-						Name:     "j",
+					&scpb.Column{
+						TableID:        fooTable.GetID(),
+						ColumnID:       2,
+						PgAttributeNum: 2,
 					},
 					metadata,
 				),
@@ -314,10 +304,21 @@ func TestSchemaChanger(t *testing.T) {
 				),
 				scpb.MakeTarget(
 					scpb.ToPublic,
-					&scpb.Column{
-						TableID:        fooTable.GetID(),
-						ColumnID:       2,
-						PgAttributeNum: 2,
+					&scpb.ColumnName{
+						TableID:  fooTable.GetID(),
+						ColumnID: 2,
+						Name:     "j",
+					},
+					metadata,
+				),
+				scpb.MakeTarget(
+					scpb.ToPublic,
+					&scpb.IndexColumn{
+						TableID:       fooTable.GetID(),
+						IndexID:       1,
+						ColumnID:      2,
+						OrdinalInKind: 0,
+						Kind:          scpb.IndexColumn_STORED,
 					},
 					metadata,
 				),

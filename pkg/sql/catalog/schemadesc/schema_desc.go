@@ -158,6 +158,12 @@ func (desc *immutable) ByteSize() int64 {
 	return int64(desc.Size())
 }
 
+// GetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	return desc.DeclarativeSchemaChangerState.Clone()
+}
+
 // NewBuilder implements the catalog.Descriptor interface.
 //
 // It overrides the wrapper's implementation to deal with the fact that
@@ -400,6 +406,22 @@ func (desc *Mutable) AddFunction(name string, f descpb.SchemaDescriptor_Function
 	} else {
 		newOverloads := append(overloads.Overloads, f)
 		desc.Functions[name] = descpb.SchemaDescriptor_Function{Overloads: newOverloads}
+	}
+}
+
+// RemoveFunction removes a UDF overload signature from the schema descriptor.
+func (desc *Mutable) RemoveFunction(name string, id descpb.ID) {
+	if fn, ok := desc.Functions[name]; ok {
+		updated := fn.Overloads[:0]
+		for _, ol := range fn.Overloads {
+			if ol.ID != id {
+				updated = append(updated, ol)
+			}
+		}
+		desc.Functions[name] = descpb.SchemaDescriptor_Function{
+			Name:      name,
+			Overloads: updated,
+		}
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -71,6 +72,10 @@ func TestAlreadyRunningJobsAreHandledProperly(t *testing.T) {
 					BinaryVersionOverride:          startCV.Version,
 					DisableAutomaticVersionUpgrade: make(chan struct{}),
 				},
+				SQLExecutor: &sql.ExecutorTestingKnobs{
+					// See the TODO below for why we need this.
+					NoStatsCollectionWithVerboseTracing: true,
+				},
 				UpgradeManager: &upgrade.TestingKnobs{
 					ListBetweenOverride: func(from, to clusterversion.ClusterVersion) []clusterversion.ClusterVersion {
 						return []clusterversion.ClusterVersion{to}
@@ -83,8 +88,17 @@ func TestAlreadyRunningJobsAreHandledProperly(t *testing.T) {
 							ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps, _ *jobs.Job,
 						) error {
 							canResume := make(chan error)
-							ch <- canResume
-							return <-canResume
+							select {
+							case ch <- canResume:
+							case <-ctx.Done():
+								return ctx.Err()
+							}
+							select {
+							case err := <-canResume:
+								return err
+							case <-ctx.Done():
+								return ctx.Err()
+							}
 						}), true
 					},
 				},
@@ -147,6 +161,10 @@ RETURNING id;`).Scan(&secondID))
 	fakeJobBlockChan <- jobs.MarkAsPermanentJobError(errors.New("boom"))
 	require.Regexp(t, "boom", <-runErr)
 
+	// See the TODO below for why we need this.
+	_, err = tc.Conns[0].ExecContext(ctx, `SET CLUSTER SETTING sql.txn_stats.sample_rate = 0`)
+	require.NoError(t, err)
+
 	// Launch a second upgrade which later we'll ensure does not kick off
 	// another job. We'll make sure this happens by polling the trace to see
 	// the log line indicating what we want.
@@ -171,9 +189,15 @@ RETURNING id;`).Scan(&secondID))
 		// message in the trace.
 		//
 		// At the moment it works in a very fragile manner (by making sure that
-		// no processors actually create their own spans). Instead, a different
-		// way to observe the status of the upgrade manager should be
-		// introduced and should be used here.
+		// no processors actually create their own spans). In particular, we
+		// make sure that the execution statistics are not being collected for
+		// the statement by:
+		// - disabling the stats collection in the presence of the verbose
+		// tracing
+		// - disabling the sampling altogether.
+		//
+		// Instead, a different way to observe the status of the upgrade manager
+		// should be introduced and should be used here.
 		rec := sp.GetConfiguredRecording()
 		if tracing.FindMsgInRecording(rec, "found existing migration job") > 0 {
 			return nil

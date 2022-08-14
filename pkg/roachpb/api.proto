@@ -193,6 +193,25 @@ message ProbeResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
+// IsSpanEmptyRequest is used to determine whether a span contains any keys,
+// garbage or otherwise. It is used to determine whether data deleted by a
+// DeleteRange tombstone has been fully removed.
+//
+// Generally, the caller should set the MaxSpanKeys header on the BatchRequest
+// to 1 so that the DistSender will process the overlapping ranges sequentially
+// and stop after the first non-empty range.
+message IsSpanEmptyRequest {
+  RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// IsSpanEmptyResponse is the response to an IsSpanEmptyRequest.
+// If there is any data in the queried span, the NumKeys field of the
+// ResponseHeader will have a positive value; if NumKeys is zero, then the
+// span is empty.
+message IsSpanEmptyResponse {
+  ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
 // A PutRequest is the argument to the Put() method.
 message PutRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
@@ -324,6 +343,9 @@ message DeleteRequest {
 // A DeleteResponse is the return value from the Delete() method.
 message DeleteResponse {
   ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // True if there was a key that got deleted. A tombstone is written
+  // unconditionally, regardless of whether the key is found.
+  bool found_key = 2;
 }
 
 // A DeleteRangeRequest is the argument to the DeleteRange() method. It
@@ -356,6 +378,12 @@ message DeleteRangeRequest {
   // The caller must check the MVCCRangeTombstones version gate before using
   // this parameter, as it is new in 22.2.
   bool use_range_tombstone = 5;
+  // If enabled together with UseRangeTombstone, the MVCC range tombstone will
+  // only be written if there exists point key/tombstones in the span that
+  // aren't already covered by an MVCC range tombstone. As a convenience, it
+  // considers empty spans equivalent to being covered by an MVCC range
+  // tombstone, so it will omit the write across an entirely empty span too.
+  bool idempotent_tombstone = 7;
 
   DeleteRangePredicates predicates = 6 [(gogoproto.nullable) = false];
 }
@@ -1726,8 +1754,6 @@ message AddSSTableRequest {
   // reader has already observed, changing the value at that timestamp and above
   // it. Use with SSTTimestampToRequestTimestamp to guarantee serializability.
   //
-  // MVCC range tombstones are not currently supported with DisallowConflicts.
-  //
   // Added in 22.1, so check the MVCCAddSSTable version gate before using.
   //
   // TODO(erikgrinaker): It might be possible to avoid this parameter if we
@@ -1739,8 +1765,6 @@ message AddSSTableRequest {
   // DisallowShadowing implies DisallowConflicts, and additionally rejects
   // writing above keys that have an existing/visible value (but will write
   // above tombstones).
-  //
-  // MVCC range tombstones are not currently supported with DisallowShadowing.
   //
   // TODO(erikgrinaker): Consider removing this in 22.1 if all callers have
   // been migrated to DisallowShadowingBelow.
@@ -1762,9 +1786,6 @@ message AddSSTableRequest {
   //
   // If this parameter is used, the value of DisallowShadowing is ignored, so
   // callers may pass both for forward and backwards compatibility.
-  //
-  // MVCC range tombstones are not currently supported with
-  // DisallowShadowingBelow.
   //
   // Added in 22.1, so check the MVCCAddSSTable version gate before using.
   util.hlc.Timestamp disallow_shadowing_below = 8 [(gogoproto.nullable) = false];
@@ -2144,6 +2165,7 @@ message RequestUnion {
     ScanInterleavedIntentsRequest scan_interleaved_intents = 52;
     BarrierRequest barrier = 53;
     ProbeRequest probe = 54;
+    IsSpanEmptyRequest is_span_empty = 56;
   }
   reserved 8, 15, 23, 25, 27, 31, 34;
 }
@@ -2199,6 +2221,7 @@ message ResponseUnion {
     ScanInterleavedIntentsResponse scan_interleaved_intents = 52;
     BarrierResponse barrier = 53;
     ProbeResponse probe = 54;
+    IsSpanEmptyResponse is_span_empty = 56;
   }
   reserved 8, 15, 23, 25, 27, 28, 31, 34;
 }
@@ -2233,6 +2256,12 @@ message Header {
   // reference to the initial timestamp, we ensure that a non-transactional
   // request's uncertainty interval remains fixed across retries.
   util.hlc.Timestamp timestamp_from_server_clock = 27 [
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+  // now is a clock reading from the sender of the request. It can be used by
+  // the receiver to update its local HLC, which can help stabilize HLCs across
+  // the cluster. The receiver is NOT required to use the timestamp to update
+  // its local clock, and the sender is NOT required to attach a timestamp.
+  util.hlc.Timestamp now = 28 [(gogoproto.nullable) = false,
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
   // replica specifies the destination of the request.
   ReplicaDescriptor replica = 2 [(gogoproto.nullable) = false];

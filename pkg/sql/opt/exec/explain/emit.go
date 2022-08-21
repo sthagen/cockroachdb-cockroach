@@ -475,10 +475,31 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 						}
 						duration = string(humanizeutil.LongDuration(timeSinceStats))
 					}
+
+					var forecastStr string
+					if s.Forecast {
+						if e.ob.flags.Redact.Has(RedactVolatile) {
+							forecastStr = "; using stats forecast"
+						} else {
+							timeSinceStats := timeutil.Since(s.ForecastAt)
+							if timeSinceStats >= 0 {
+								forecastStr = fmt.Sprintf(
+									"; using stats forecast for %s ago", humanizeutil.LongDuration(timeSinceStats),
+								)
+							} else {
+								timeSinceStats *= -1
+								forecastStr = fmt.Sprintf(
+									"; using stats forecast for %s in the future",
+									humanizeutil.LongDuration(timeSinceStats),
+								)
+							}
+						}
+					}
+
 					e.ob.AddField("estimated row count", fmt.Sprintf(
-						"%s (%s%% of the table; stats collected %s ago)",
+						"%s (%s%% of the table; stats collected %s ago%s)",
 						estimatedRowCountString, percentageStr,
-						duration,
+						duration, forecastStr,
 					))
 				} else {
 					e.ob.AddField("estimated row count", estimatedRowCountString)
@@ -525,7 +546,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		a := n.args.(*valuesArgs)
 		// Don't emit anything for the "norows" and "emptyrow" cases.
 		if len(a.Rows) > 0 && (len(a.Rows) > 1 || len(a.Columns) > 0) {
-			e.emitTuples(a.Rows, len(a.Columns))
+			e.emitTuples(tree.RawRows(a.Rows), len(a.Columns))
 		}
 
 	case filterOp:
@@ -786,7 +807,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			)
 		}
 		if len(a.Rows) > 0 {
-			e.emitTuples(a.Rows, len(a.Rows[0]))
+			e.emitTuples(tree.RawRows(a.Rows), len(a.Rows[0]))
 		}
 
 	case upsertOp:
@@ -982,15 +1003,16 @@ func (e *emitter) emitLockingPolicyWithPrefix(keyPrefix string, locking opt.Lock
 	}
 }
 
-func (e *emitter) emitTuples(rows [][]tree.TypedExpr, numColumns int) {
+func (e *emitter) emitTuples(rows tree.ExprContainer, numColumns int) {
 	e.ob.Attrf(
 		"size", "%d column%s, %d row%s",
 		numColumns, util.Pluralize(int64(numColumns)),
-		len(rows), util.Pluralize(int64(len(rows))),
+		rows.NumRows(), util.Pluralize(int64(rows.NumRows())),
 	)
 	if e.ob.flags.Verbose {
-		for i := range rows {
-			for j, expr := range rows[i] {
+		for i := 0; i < rows.NumRows(); i++ {
+			for j := 0; j < rows.NumCols(); j++ {
+				expr := rows.Get(i, j).(tree.TypedExpr)
 				e.ob.Expr(fmt.Sprintf("row %d, expr %d", i, j), expr, nil /* varColumns */)
 			}
 		}

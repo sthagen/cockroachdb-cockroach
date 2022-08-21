@@ -55,6 +55,7 @@ func executeDescriptorMutationOps(ctx context.Context, deps Dependencies, ops []
 	// scanned.
 	dbZoneConfigsToDelete, gcJobRecords := mvs.gcJobs.makeRecords(
 		deps.TransactionalJobRegistry().MakeJobID,
+		!deps.TransactionalJobRegistry().UseLegacyGCJob(ctx),
 	)
 	if err := performBatchedCatalogWrites(
 		ctx,
@@ -150,11 +151,13 @@ func logEvents(ctx context.Context, mvs *mutationVisitorState, el EventLogger) e
 			// TODO(postamar): batch these
 			switch e.event.(type) {
 			case eventpb.EventWithCommonSQLPayload:
-				if err := el.LogEvent(ctx, e.id, e.details, e.event); err != nil {
+				details := e.details
+				details.DescriptorID = uint32(e.id)
+				if err := el.LogEvent(ctx, details, e.event); err != nil {
 					return err
 				}
 			case eventpb.EventWithCommonSchemaChangePayload:
-				if err := el.LogEventForSchemaChange(ctx, e.id, e.event); err != nil {
+				if err := el.LogEventForSchemaChange(ctx, e.event); err != nil {
 					return err
 				}
 			}

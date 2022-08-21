@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -985,7 +986,7 @@ func (ti *Index) Table() cat.Table {
 }
 
 // Ordinal is part of the cat.Index interface.
-func (ti *Index) Ordinal() int {
+func (ti *Index) Ordinal() cat.IndexOrdinal {
 	return ti.ordinal
 }
 
@@ -1228,6 +1229,11 @@ func (ts *TableStat) HistogramType() *types.T {
 		panic(err)
 	}
 	return tree.MustBeStaticallyKnownType(colTypeRef)
+}
+
+// IsForecast is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsForecast() bool {
+	return ts.js.Name == jobspb.ForecastStatsName
 }
 
 // TableStats is a slice of TableStat pointers.

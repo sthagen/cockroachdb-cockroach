@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/schemafeed"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -613,29 +612,6 @@ func (ca *changeAggregator) flushFrontier() error {
 }
 
 func (ca *changeAggregator) emitResolved(batch jobspb.ResolvedSpans) error {
-	// TODO(smiskin): Remove post-22.2
-	if !ca.flowCtx.Cfg.Settings.Version.IsActive(ca.Ctx, clusterversion.ChangefeedIdleness) {
-		for _, resolved := range batch.ResolvedSpans {
-			resolvedBytes, err := protoutil.Marshal(&resolved)
-			if err != nil {
-				return err
-			}
-
-			// Enqueue a row to be returned that indicates some span-level resolved
-			// timestamp has advanced. If any rows were queued in `sink`, they must
-			// be emitted first.
-			ca.resolvedSpanBuf.Push(rowenc.EncDatumRow{
-				rowenc.EncDatum{Datum: tree.NewDBytes(tree.DBytes(resolvedBytes))},
-				rowenc.EncDatum{Datum: tree.DNull}, // topic
-				rowenc.EncDatum{Datum: tree.DNull}, // key
-				rowenc.EncDatum{Datum: tree.DNull}, // value
-			})
-			ca.metrics.ResolvedMessages.Inc(1)
-		}
-
-		return nil
-	}
-
 	progressUpdate := jobspb.ResolvedSpans{
 		ResolvedSpans: batch.ResolvedSpans,
 		Stats: jobspb.ResolvedSpans_Stats{
@@ -720,6 +696,8 @@ type changeFrontier struct {
 	// metricsID is used as the unique id of this changefeed in the
 	// metrics.MaxBehindNanos map.
 	metricsID int
+
+	knobs TestingKnobs
 }
 
 const (
@@ -729,7 +707,11 @@ const (
 
 // jobState encapsulates changefeed job state.
 type jobState struct {
-	job      *jobs.Job
+	// job is set for changefeeds other than core/sinkless changefeeds.
+	job *jobs.Job
+	// coreProgress is set for only core/sinkless changefeeds.
+	coreProgress *coreChangefeedProgress
+
 	settings *cluster.Settings
 	metrics  *Metrics
 	ts       timeutil.TimeSource
@@ -744,11 +726,36 @@ type jobState struct {
 	progressUpdatesSkipped bool
 }
 
+type coreChangefeedProgress struct {
+	progress jobspb.Progress
+}
+
+// SetHighwater implements the eval.ChangefeedState interface.
+func (cp *coreChangefeedProgress) SetHighwater(frontier *hlc.Timestamp) {
+	cp.progress.Progress = &jobspb.Progress_HighWater{
+		HighWater: frontier,
+	}
+}
+
+// SetCheckpoint implements the eval.ChangefeedState interface.
+func (cp *coreChangefeedProgress) SetCheckpoint(spans []roachpb.Span, timestamp hlc.Timestamp) {
+	changefeedProgress := cp.progress.Details.(*jobspb.Progress_Changefeed).Changefeed
+	changefeedProgress.Checkpoint = &jobspb.ChangefeedProgress_Checkpoint{
+		Spans:     spans,
+		Timestamp: timestamp,
+	}
+}
+
 func newJobState(
-	j *jobs.Job, st *cluster.Settings, metrics *Metrics, ts timeutil.TimeSource,
+	j *jobs.Job,
+	coreProgress *coreChangefeedProgress,
+	st *cluster.Settings,
+	metrics *Metrics,
+	ts timeutil.TimeSource,
 ) *jobState {
 	return &jobState{
 		job:                j,
+		coreProgress:       coreProgress,
 		settings:           st,
 		metrics:            metrics,
 		ts:                 ts,
@@ -830,6 +837,7 @@ func newChangeFrontierProcessor(
 	if err != nil {
 		return nil, err
 	}
+
 	cf := &changeFrontier{
 		flowCtx:       flowCtx,
 		spec:          spec,
@@ -838,6 +846,11 @@ func newChangeFrontierProcessor(
 		frontier:      sf,
 		slowLogEveryN: log.Every(slowSpanMaxFrequency),
 	}
+
+	if cfKnobs, ok := flowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok {
+		cf.knobs = *cfKnobs
+	}
+
 	if err := cf.Init(
 		cf,
 		post,
@@ -937,7 +950,7 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 			cf.MoveToDraining(err)
 			return
 		}
-		cf.js = newJobState(job, cf.flowCtx.Cfg.Settings, cf.metrics, timeutil.DefaultTimeSource{})
+		cf.js = newJobState(job, nil, cf.flowCtx.Cfg.Settings, cf.metrics, timeutil.DefaultTimeSource{})
 
 		if changefeedbase.FrontierCheckpointFrequency.Get(&cf.flowCtx.Cfg.Settings.SV) == 0 {
 			log.Warning(ctx,
@@ -968,6 +981,10 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 			// running status around for a while before we override it.
 			cf.js.lastRunStatusUpdate = timeutil.Now()
 		}
+	} else {
+		cf.js = newJobState(nil,
+			cf.EvalCtx.ChangefeedState.(*coreChangefeedProgress),
+			cf.flowCtx.Cfg.Settings, cf.metrics, timeutil.DefaultTimeSource{})
 	}
 
 	cf.metrics.mu.Lock()
@@ -1038,7 +1055,7 @@ func (cf *changeFrontier) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetad
 				// Detect whether this boundary should be used to kill or restart the
 				// changefeed.
 				if cf.frontier.boundaryType == jobspb.ResolvedSpan_RESTART {
-					err = changefeedbase.MarkRetryableErrorWithTimestamp(err, cf.frontier.boundaryTime)
+					err = changefeedbase.MarkRetryableError(err)
 				}
 			}
 
@@ -1087,24 +1104,12 @@ func (cf *changeFrontier) noteAggregatorProgress(d rowenc.EncDatum) error {
 	}
 
 	var resolvedSpans jobspb.ResolvedSpans
-	if cf.flowCtx.Cfg.Settings.Version.IsActive(cf.Ctx, clusterversion.ChangefeedIdleness) {
-		if err := protoutil.Unmarshal([]byte(*raw), &resolvedSpans); err != nil {
-			return errors.NewAssertionErrorWithWrappedErrf(err,
-				`unmarshalling aggregator progress update: %x`, raw)
-		}
-
-		cf.maybeMarkJobIdle(resolvedSpans.Stats.RecentKvCount)
-	} else { // TODO(smiskin): Remove post-22.2
-		// Progress used to be sent as individual ResolvedSpans
-		var resolved jobspb.ResolvedSpan
-		if err := protoutil.Unmarshal([]byte(*raw), &resolved); err != nil {
-			return errors.NewAssertionErrorWithWrappedErrf(err,
-				`unmarshalling resolved span: %x`, raw)
-		}
-		resolvedSpans = jobspb.ResolvedSpans{
-			ResolvedSpans: []jobspb.ResolvedSpan{resolved},
-		}
+	if err := protoutil.Unmarshal([]byte(*raw), &resolvedSpans); err != nil {
+		return errors.NewAssertionErrorWithWrappedErrf(err,
+			`unmarshalling aggregator progress update: %x`, raw)
 	}
+
+	cf.maybeMarkJobIdle(resolvedSpans.Stats.RecentKvCount)
 
 	for _, resolved := range resolvedSpans.ResolvedSpans {
 		// Inserting a timestamp less than the one the changefeed flow started at
@@ -1139,21 +1144,15 @@ func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
 	// If frontier changed, we emit resolved timestamp.
 	emitResolved := frontierChanged
 
-	// Checkpoint job record progress if needed.
-	// NB: Sinkless changefeeds will not have a job state (js). In fact, they
-	// have no distributed state whatsoever. Because of this they also do not
-	// use protected timestamps.
-	if cf.js != nil {
-		checkpointed, err := cf.maybeCheckpointJob(resolved, frontierChanged)
-		if err != nil {
-			return err
-		}
-
-		// Emit resolved timestamp only if we have checkpointed the job.
-		// Usually, this happens every time frontier changes, but we can skip some updates
-		// if we update frontier too rapidly.
-		emitResolved = checkpointed
+	checkpointed, err := cf.maybeCheckpointJob(resolved, frontierChanged)
+	if err != nil {
+		return err
 	}
+
+	// Emit resolved timestamp only if we have checkpointed the job.
+	// Usually, this happens every time frontier changes, but we can skip some updates
+	// if we update frontier too rapidly.
+	emitResolved = checkpointed
 
 	if emitResolved {
 		// Keeping this after the checkpointJobProgress call will avoid
@@ -1239,58 +1238,70 @@ func (cf *changeFrontier) checkpointJobProgress(
 	}
 	cf.metrics.FrontierUpdates.Inc(1)
 	var updateSkipped error
-	if err := cf.js.job.Update(cf.Ctx, nil, func(
-		txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
-	) error {
-		// If we're unable to update the job due to the job state, such as during
-		// pause-requested, simply skip the checkpoint
-		if err := md.CheckRunningOrReverting(); err != nil {
-			updateSkipped = err
+	if cf.js.job != nil {
+
+		if err := cf.js.job.Update(cf.Ctx, nil, func(
+			txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		) error {
+			// If we're unable to update the job due to the job state, such as during
+			// pause-requested, simply skip the checkpoint
+			if err := md.CheckRunningOrReverting(); err != nil {
+				updateSkipped = err
+				return nil
+			}
+
+			// Advance resolved timestamp.
+			progress := md.Progress
+			progress.Progress = &jobspb.Progress_HighWater{
+				HighWater: &frontier,
+			}
+
+			changefeedProgress := progress.Details.(*jobspb.Progress_Changefeed).Changefeed
+			changefeedProgress.Checkpoint = &checkpoint
+
+			timestampManager := cf.manageProtectedTimestamps
+			// TODO(samiskin): Remove this conditional and the associated deprecated
+			// methods once we're confident in ActiveProtectedTimestampsEnabled
+			if !changefeedbase.ActiveProtectedTimestampsEnabled.Get(&cf.flowCtx.Cfg.Settings.SV) {
+				timestampManager = cf.deprecatedManageProtectedTimestamps
+			}
+			if err := timestampManager(cf.Ctx, txn, changefeedProgress); err != nil {
+				log.Warningf(cf.Ctx, "error managing protected timestamp record: %v", err)
+				return err
+			}
+
+			if updateRunStatus {
+				md.Progress.RunningStatus = fmt.Sprintf("running: resolved=%s", frontier)
+			}
+
+			ju.UpdateProgress(progress)
+
+			// Reset RunStats.NumRuns to 1 since the changefeed is
+			// now running. By resetting the NumRuns, we avoid
+			// future job system level retries from having large
+			// backoffs because of past failures.
+			if md.RunStats != nil {
+				ju.UpdateRunStats(1, md.RunStats.LastRun)
+			}
+
 			return nil
+		}); err != nil {
+			return false, err
 		}
-
-		// Advance resolved timestamp.
-		progress := md.Progress
-		progress.Progress = &jobspb.Progress_HighWater{
-			HighWater: &frontier,
-		}
-
-		changefeedProgress := progress.Details.(*jobspb.Progress_Changefeed).Changefeed
-		changefeedProgress.Checkpoint = &checkpoint
-
-		timestampManager := cf.manageProtectedTimestamps
-		// TODO(samiskin): Remove this conditional and the associated deprecated
-		// methods once we're confident in ActiveProtectedTimestampsEnabled
-		if !changefeedbase.ActiveProtectedTimestampsEnabled.Get(&cf.flowCtx.Cfg.Settings.SV) {
-			timestampManager = cf.deprecatedManageProtectedTimestamps
-		}
-		if err := timestampManager(cf.Ctx, txn, changefeedProgress); err != nil {
-			log.Warningf(cf.Ctx, "error managing protected timestamp record: %v", err)
-			return err
-		}
-
-		if updateRunStatus {
-			md.Progress.RunningStatus = fmt.Sprintf("running: resolved=%s", frontier)
-		}
-
-		ju.UpdateProgress(progress)
-
-		// Reset RunStats.NumRuns to 1 since the changefeed is
-		// now running. By resetting the NumRuns, we avoid
-		// future job system level retries from having large
-		// backoffs because of past failures.
-		if md.RunStats != nil {
-			ju.UpdateRunStats(1, md.RunStats.LastRun)
-		}
-
-		return nil
-	}); err != nil {
-		return false, err
+	} else {
+		cf.js.coreProgress.SetHighwater(&frontier)
+		cf.js.coreProgress.SetCheckpoint(checkpoint.Spans, checkpoint.Timestamp)
 	}
 
 	if updateSkipped != nil {
 		log.Warningf(cf.Ctx, "skipping changefeed checkpoint: %s", updateSkipped)
 		return false, nil
+	}
+
+	if cf.knobs.RaiseRetryableError != nil {
+		if err := cf.knobs.RaiseRetryableError(); err != nil {
+			return false, changefeedbase.MarkRetryableError(errors.New("cf.knobs.RaiseRetryableError"))
+		}
 	}
 
 	return true, nil

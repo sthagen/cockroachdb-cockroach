@@ -57,6 +57,10 @@ func (n Node) RangeFeed(_ *roachpb.RangeFeedRequest, _ roachpb.Internal_RangeFee
 	panic("unimplemented")
 }
 
+func (n Node) MuxRangeFeed(server roachpb.Internal_MuxRangeFeedServer) error {
+	panic("unimplemented")
+}
+
 func (n Node) GossipSubscription(
 	_ *roachpb.GossipSubscriptionRequest, _ roachpb.Internal_GossipSubscriptionServer,
 ) error {
@@ -178,7 +182,8 @@ func (f *firstNErrorTransport) SkipReplica() {
 	panic("SkipReplica not supported")
 }
 
-func (*firstNErrorTransport) MoveToFront(roachpb.ReplicaDescriptor) {
+func (*firstNErrorTransport) MoveToFront(roachpb.ReplicaDescriptor) bool {
+	return true
 }
 
 // TestComplexScenarios verifies various complex success/failure scenarios by

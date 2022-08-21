@@ -19,12 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild/internal/scbuildstmt"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdecomp"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -108,6 +110,12 @@ func Build(
 	return scpb.CurrentState{TargetState: ts, Current: current}, nil
 }
 
+// CheckIfSupported returns if a statement is fully supported by the declarative
+// schema changer.
+func CheckIfSupported(statement tree.Statement) bool {
+	return scbuildstmt.CheckIfStmtIsSupported(statement, sessiondatapb.UseNewSchemaChangerOn)
+}
+
 // Export dependency interfaces.
 // These are defined in the scbuildstmts package instead of scbuild to avoid
 // circular import dependencies.
@@ -127,16 +135,17 @@ type elementState struct {
 // builderState is the backing struct for scbuildstmt.BuilderState interface.
 type builderState struct {
 	// Dependencies
-	ctx             context.Context
-	clusterSettings *cluster.Settings
-	evalCtx         *eval.Context
-	semaCtx         *tree.SemaContext
-	cr              CatalogReader
-	tr              TableReader
-	auth            AuthorizationAccessor
-	commentCache    CommentCache
-	createPartCCL   CreatePartitioningCCLCallback
-	hasAdmin        bool
+	ctx              context.Context
+	clusterSettings  *cluster.Settings
+	evalCtx          *eval.Context
+	semaCtx          *tree.SemaContext
+	cr               CatalogReader
+	tr               TableReader
+	auth             AuthorizationAccessor
+	commentCache     CommentCache
+	zoneConfigReader scdecomp.ZoneConfigGetter
+	createPartCCL    CreatePartitioningCCLCallback
+	hasAdmin         bool
 
 	// output contains the schema change targets that have been planned so far.
 	output []elementState
@@ -167,18 +176,19 @@ type cachedDesc struct {
 // newBuilderState constructs a builderState.
 func newBuilderState(ctx context.Context, d Dependencies, initial scpb.CurrentState) *builderState {
 	bs := builderState{
-		ctx:             ctx,
-		clusterSettings: d.ClusterSettings(),
-		evalCtx:         newEvalCtx(ctx, d),
-		semaCtx:         newSemaCtx(d),
-		cr:              d.CatalogReader(),
-		tr:              d.TableReader(),
-		auth:            d.AuthorizationAccessor(),
-		createPartCCL:   d.IndexPartitioningCCLCallback(),
-		output:          make([]elementState, 0, len(initial.Current)),
-		descCache:       make(map[catid.DescID]*cachedDesc),
-		tempSchemas:     make(map[catid.DescID]catalog.SchemaDescriptor),
-		commentCache:    d.DescriptorCommentCache(),
+		ctx:              ctx,
+		clusterSettings:  d.ClusterSettings(),
+		evalCtx:          newEvalCtx(ctx, d),
+		semaCtx:          newSemaCtx(d),
+		cr:               d.CatalogReader(),
+		tr:               d.TableReader(),
+		auth:             d.AuthorizationAccessor(),
+		createPartCCL:    d.IndexPartitioningCCLCallback(),
+		output:           make([]elementState, 0, len(initial.Current)),
+		descCache:        make(map[catid.DescID]*cachedDesc),
+		tempSchemas:      make(map[catid.DescID]catalog.SchemaDescriptor),
+		commentCache:     d.DescriptorCommentCache(),
+		zoneConfigReader: d.ZoneConfigGetter(),
 	}
 	var err error
 	bs.hasAdmin, err = bs.auth.HasAdminRole(ctx)

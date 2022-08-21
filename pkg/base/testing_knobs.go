@@ -52,4 +52,6 @@ type TestingKnobs struct {
 	AdmissionControl             ModuleTestingKnobs
 	UnusedIndexRecommendKnobs    ModuleTestingKnobs
 	ExternalConnection           ModuleTestingKnobs
+	EventExporter                ModuleTestingKnobs
+	EventLog                     ModuleTestingKnobs
 }

@@ -4150,7 +4150,7 @@ SELECT
 FROM
   pg_catalog.pg_settings
 WHERE
-  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem')
+  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem', 'copy_fast_path_enabled')
 ----
 name                                                  setting             category  short_desc  extra_desc  vartype
 alter_primary_region_super_region_override            off                 NULL      NULL        NULL        string
@@ -4276,7 +4276,7 @@ SELECT
 FROM
   pg_catalog.pg_settings
 WHERE
-  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem')
+  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem', 'copy_fast_path_enabled')
 ----
 name                                                  setting             unit  context  enumvals  boot_val            reset_val
 alter_primary_region_super_region_override            off                 NULL  user     NULL      off                 off
@@ -4407,6 +4407,7 @@ bytea_output                                          NULL    NULL     NULL     
 check_function_bodies                                 NULL    NULL     NULL     NULL        NULL
 client_encoding                                       NULL    NULL     NULL     NULL        NULL
 client_min_messages                                   NULL    NULL     NULL     NULL        NULL
+copy_fast_path_enabled                                NULL    NULL     NULL     NULL        NULL
 cost_scans_with_default_col_size                      NULL    NULL     NULL     NULL        NULL
 crdb_version                                          NULL    NULL     NULL     NULL        NULL
 database                                              NULL    NULL     NULL     NULL        NULL
@@ -4650,7 +4651,7 @@ FROM pg_proc p
 JOIN pg_type t ON t.typinput = p.oid
 WHERE t.typname = '_int4'
 ----
-2012  array_in  array_in
+2013  array_in  array_in
 
 ## #16285
 ## int2vectors should be 0-indexed
@@ -4688,7 +4689,7 @@ SELECT cur_max_builtin_oid FROM [SELECT max(oid) as cur_max_builtin_oid FROM pg_
 query TT
 SELECT proname, oid FROM pg_catalog.pg_proc WHERE oid = $cur_max_builtin_oid
 ----
-to_regtype  2032
+to_regtype  2033
 
 ## Ensure that unnest works with oid wrapper arrays
 
@@ -5946,3 +5947,41 @@ oid         castsource  casttarget  castfunc  castcontext  castmethod
 3922032069  18          1043        NULL      a            NULL
 3989142581  18          23          NULL      e            NULL
 3989142587  18          25          NULL      i            NULL
+
+subtest seq_bound_should_consistent_with_session_var
+
+statement ok
+DROP sequence serial
+
+statement ok
+set default_int_size=4
+
+statement ok
+CREATE SEQUENCE serial START 101 INCREMENT 5
+
+query TTTOIIIIBII colnames
+SELECT * FROM pg_sequences WHERE sequencename = 'serial'
+----
+schemaname  sequencename  sequenceowner  data_type  start_value  min_value  max_value   increment_by  cycle  cache_size  last_value
+public      serial        root           20         101          1          2147483647  5             false  1           NULL
+
+statement ok
+set default_int_size=8
+
+query TTTOIIIIBII colnames
+SELECT * FROM pg_sequences WHERE sequencename = 'serial'
+----
+schemaname  sequencename  sequenceowner  data_type  start_value  min_value  max_value   increment_by  cycle  cache_size  last_value
+public      serial        root           20         101          1          2147483647  5             false  1           NULL
+
+statement ok
+DROP sequence serial
+
+statement ok
+CREATE SEQUENCE serial START 101 INCREMENT 5
+
+query TTTOIIIIBII colnames
+SELECT * FROM pg_sequences WHERE sequencename = 'serial'
+----
+schemaname  sequencename  sequenceowner  data_type  start_value  min_value  max_value            increment_by  cycle  cache_size  last_value
+public      serial        root           20         101          1          9223372036854775807  5             false  1           NULL

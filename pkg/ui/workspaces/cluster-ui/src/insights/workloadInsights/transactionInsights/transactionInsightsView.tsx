@@ -22,7 +22,6 @@ import {
   calculateActiveFilters,
   defaultFilters,
   Filter,
-  Filters,
   getFullFiltersAsStringRecord,
 } from "src/queryFilter/filter";
 import { getInsightEventFiltersFromURL } from "src/queryFilter/utils";
@@ -37,13 +36,8 @@ import {
   getAppsFromTransactionInsights,
   getInsightsFromState,
   InsightEventFilters,
-  InsightExecOptions,
 } from "src/insights";
-import {
-  EmptyInsightsTablePlaceholder,
-  DropDownSelect,
-  WorkloadInsightsError,
-} from "../util";
+import { EmptyInsightsTablePlaceholder, WorkloadInsightsError } from "../util";
 import { TransactionInsightsTable } from "./transactionInsightsTable";
 
 import styles from "src/statementsPage/statementsPage.module.scss";
@@ -56,7 +50,6 @@ export type TransactionInsightsViewStateProps = {
   transactionsError: Error | null;
   filters: InsightEventFilters;
   sortSetting: SortSetting;
-  internalAppNamePrefix: string;
 };
 
 export type TransactionInsightsViewDispatchProps = {
@@ -69,6 +62,7 @@ export type TransactionInsightsViewProps = TransactionInsightsViewStateProps &
   TransactionInsightsViewDispatchProps;
 
 const INSIGHT_TXN_SEARCH_PARAM = "q";
+const INTERNAL_APP_NAME_PREFIX = "$ internal";
 
 export const TransactionInsightsView: React.FC<
   TransactionInsightsViewProps
@@ -77,7 +71,6 @@ export const TransactionInsightsView: React.FC<
   transactions,
   transactionsError,
   filters,
-  internalAppNamePrefix,
   refreshTransactionInsights,
   onFiltersChange,
   onSortChange,
@@ -178,13 +171,13 @@ export const TransactionInsightsView: React.FC<
 
   const apps = getAppsFromTransactionInsights(
     transactionInsights,
-    internalAppNamePrefix,
+    INTERNAL_APP_NAME_PREFIX,
   );
   const countActiveFilters = calculateActiveFilters(filters);
   const filteredTransactions = filterTransactionInsights(
     transactionInsights,
     filters,
-    internalAppNamePrefix,
+    INTERNAL_APP_NAME_PREFIX,
     search,
   );
 

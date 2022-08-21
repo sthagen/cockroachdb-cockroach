@@ -573,6 +573,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Paused Followers Dropped Messages",
+				Metrics: []string{
+					"admission.raft.paused_replicas_dropped_msgs",
+				},
+			},
+			{
 				Title: "Operations",
 				Metrics: []string{
 					"range.adds",
@@ -891,6 +897,13 @@ var charts = []sectionDescription{
 					"queue.gc.info.transactionspangccommitted",
 					"queue.gc.info.transactionspangcpending",
 					"queue.gc.info.transactionspangcstaging",
+				},
+			},
+			{
+				Title: "GC Clear Range",
+				Metrics: []string{
+					"queue.gc.info.clearrangesuccess",
+					"queue.gc.info.clearrangefailed",
 				},
 			},
 		},
@@ -2275,15 +2288,15 @@ var charts = []sectionDescription{
 		Charts: []chartDescription{
 			{
 				Title:   "Current number of statement fingerprints being monitored for anomaly detection",
-				Metrics: []string{"sql.stats.insights.anomaly_detection.fingerprints"},
+				Metrics: []string{"sql.insights.anomaly_detection.fingerprints"},
 			},
 			{
 				Title:   "Current memory used to support anomaly detection",
-				Metrics: []string{"sql.stats.insights.anomaly_detection.memory"},
+				Metrics: []string{"sql.insights.anomaly_detection.memory"},
 			},
 			{
 				Title:   "Evictions of fingerprint latency summaries due to memory pressure",
-				Metrics: []string{"sql.stats.insights.anomaly_detection.evictions"},
+				Metrics: []string{"sql.insights.anomaly_detection.evictions"},
 			},
 		},
 	},

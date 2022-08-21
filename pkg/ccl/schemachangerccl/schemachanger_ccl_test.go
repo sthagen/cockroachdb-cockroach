@@ -13,9 +13,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/sctest"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -28,57 +28,13 @@ func newCluster(t *testing.T, knobs *scexec.TestingKnobs) (*gosql.DB, func()) {
 		t, 3 /* numServers */, base.TestingKnobs{
 			SQLDeclarativeSchemaChanger: knobs,
 			JobsTestingKnobs:            jobs.NewTestingKnobsWithShortIntervals(),
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				StatementFilter:                 nil,
+				UseTransactionalDescIDGenerator: true,
+			},
 		},
 	)
 	return sqlDB, cleanup
-}
-
-func sharedTestdata(t *testing.T) string {
-	testdataDir := "../../sql/schemachanger/testdata/end_to_end"
-	if bazel.BuiltWithBazel() {
-		runfile, err := bazel.Runfile("pkg/sql/schemachanger/testdata/end_to_end")
-		if err != nil {
-			t.Fatal(err)
-		}
-		testdataDir = runfile
-	}
-	return testdataDir
-}
-
-func endToEndPath(t *testing.T) string {
-	return testutils.TestDataPath(t, "end_to_end")
-}
-
-func TestSchemaChangerSideEffects(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	sctest.EndToEndSideEffects(t, endToEndPath(t), newCluster)
-}
-
-func TestBackupRestoreCCL(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	sctest.Backup(t, endToEndPath(t), newCluster)
-}
-
-func TestBackupRestoreNonCCL(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	sctest.Backup(t, sharedTestdata(t), sctest.SingleNodeCluster)
-}
-
-func TestRollback(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sctest.Rollback(t, endToEndPath(t), newCluster)
-}
-
-func TestPause(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sctest.Pause(t, endToEndPath(t), newCluster)
 }
 
 func TestDecomposeToElements(t *testing.T) {

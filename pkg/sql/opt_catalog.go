@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -1540,7 +1541,7 @@ func (oi *optIndex) Table() cat.Table {
 }
 
 // Ordinal is part of the cat.Index interface.
-func (oi *optIndex) Ordinal() int {
+func (oi *optIndex) Ordinal() cat.IndexOrdinal {
 	return oi.indexOrdinal
 }
 
@@ -1683,6 +1684,11 @@ func (os *optTableStat) Histogram() []cat.HistogramBucket {
 // HistogramType is part of the cat.TableStatistic interface.
 func (os *optTableStat) HistogramType() *types.T {
 	return os.stat.HistogramData.ColumnType
+}
+
+// IsForecast is part of the cat.TableStatistic interface.
+func (os *optTableStat) IsForecast() bool {
+	return os.stat.Name == jobspb.ForecastStatsName
 }
 
 // optFamily is a wrapper around descpb.ColumnFamilyDescriptor that keeps a
@@ -2346,7 +2352,7 @@ func (oi *optVirtualIndex) Table() cat.Table {
 }
 
 // Ordinal is part of the cat.Index interface.
-func (oi *optVirtualIndex) Ordinal() int {
+func (oi *optVirtualIndex) Ordinal() cat.IndexOrdinal {
 	return oi.indexOrdinal
 }
 

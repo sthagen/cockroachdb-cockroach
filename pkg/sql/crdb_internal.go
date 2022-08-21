@@ -2591,7 +2591,6 @@ CREATE TABLE crdb_internal.create_function_statements (
 )
 `,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidLeased: true}}
 		var dbDescs []catalog.DatabaseDescriptor
 		if db == nil {
 			var err error
@@ -2602,45 +2601,68 @@ CREATE TABLE crdb_internal.create_function_statements (
 		} else {
 			dbDescs = append(dbDescs, db)
 		}
-		for _, db := range dbDescs {
-			err := forEachSchema(ctx, p, db, func(sc catalog.SchemaDescriptor) error {
+		var fnIDs []descpb.ID
+		fnIDToScName := make(map[descpb.ID]string)
+		fnIDToScID := make(map[descpb.ID]descpb.ID)
+		fnIDToDBName := make(map[descpb.ID]string)
+		fnIDToDBID := make(map[descpb.ID]descpb.ID)
+		for _, curDB := range dbDescs {
+			err := forEachSchema(ctx, p, curDB, func(sc catalog.SchemaDescriptor) error {
 				return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-					fnDesc, err := p.Descriptors().GetImmutableFunctionByID(ctx, p.txn, overload.ID, flags)
-					if err != nil {
-						return err
-					}
-					treeNode, err := fnDesc.ToCreateExpr()
-					treeNode.FuncName.ObjectNamePrefix = tree.ObjectNamePrefix{
-						ExplicitSchema: true,
-						SchemaName:     tree.Name(sc.GetName()),
-					}
-					if err != nil {
-						return err
-					}
-					for i := range treeNode.Options {
-						if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
-							stmtStrs := strings.Split(string(body), "\n")
-							for i := range stmtStrs {
-								stmtStrs[i] = "\t" + stmtStrs[i]
-							}
-
-							p := &treeNode.Options[i]
-							// Add two new lines just for better formatting.
-							*p = "\n" + tree.FunctionBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
-						}
-					}
-
-					return addRow(
-						tree.NewDInt(tree.DInt(db.GetID())),      // database_id
-						tree.NewDString(db.GetName()),            // database_name
-						tree.NewDInt(tree.DInt(sc.GetID())),      // schema_id
-						tree.NewDString(sc.GetName()),            // schema_name
-						tree.NewDInt(tree.DInt(fnDesc.GetID())),  // function_id
-						tree.NewDString(fnDesc.GetName()),        //function_name
-						tree.NewDString(tree.AsString(treeNode)), // create_statement
-					)
+					fnIDs = append(fnIDs, overload.ID)
+					fnIDToScName[overload.ID] = sc.GetName()
+					fnIDToScID[overload.ID] = sc.GetID()
+					fnIDToDBName[overload.ID] = curDB.GetName()
+					fnIDToDBID[overload.ID] = curDB.GetID()
+					return nil
 				})
 			})
+			if err != nil {
+				return err
+			}
+		}
+
+		fnDescs, err := p.Descriptors().GetImmutableDescriptorsByID(
+			ctx, p.txn, tree.CommonLookupFlags{Required: true, AvoidLeased: true}, fnIDs...,
+		)
+		if err != nil {
+			return err
+		}
+
+		for _, desc := range fnDescs {
+			fnDesc := desc.(catalog.FunctionDescriptor)
+			if err != nil {
+				return err
+			}
+			treeNode, err := fnDesc.ToCreateExpr()
+			treeNode.FuncName.ObjectNamePrefix = tree.ObjectNamePrefix{
+				ExplicitSchema: true,
+				SchemaName:     tree.Name(fnIDToScName[fnDesc.GetID()]),
+			}
+			if err != nil {
+				return err
+			}
+			for i := range treeNode.Options {
+				if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
+					stmtStrs := strings.Split(string(body), "\n")
+					for i := range stmtStrs {
+						stmtStrs[i] = "\t" + stmtStrs[i]
+					}
+					p := &treeNode.Options[i]
+					// Add two new lines just for better formatting.
+					*p = "\n" + tree.FunctionBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
+				}
+			}
+
+			err = addRow(
+				tree.NewDInt(tree.DInt(fnIDToDBID[fnDesc.GetID()])), // database_id
+				tree.NewDString(fnIDToDBName[fnDesc.GetID()]),       // database_name
+				tree.NewDInt(tree.DInt(fnIDToScID[fnDesc.GetID()])), // schema_id
+				tree.NewDString(fnIDToScName[fnDesc.GetID()]),       // schema_name
+				tree.NewDInt(tree.DInt(fnDesc.GetID())),             // function_id
+				tree.NewDString(fnDesc.GetName()),                   //function_name
+				tree.NewDString(tree.AsString(treeNode)),            // create_statement
+			)
 			if err != nil {
 				return err
 			}
@@ -6033,12 +6055,6 @@ func genClusterLocksGenerator(
 	filters clusterLocksFilters,
 ) func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 	return func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, _ *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
-		// TODO(sarkesian): remove gate for 22.2 release
-		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ClusterLocksVirtualTable) {
-			return nil, nil, pgerror.New(pgcode.FeatureNotSupported,
-				"table crdb_internal.cluster_locks is not supported on this version")
-		}
-
 		hasAdmin, err := p.HasAdminRole(ctx)
 		if err != nil {
 			return nil, nil, err
@@ -6316,6 +6332,7 @@ CREATE TABLE crdb_internal.%s (
 	txn_fingerprint_id         BYTES NOT NULL,
 	stmt_id                    STRING NOT NULL,
 	stmt_fingerprint_id        BYTES NOT NULL,
+	problems                   STRING[] NOT NULL,
 	query                      STRING NOT NULL,
 	status                     STRING NOT NULL,
 	start_time                 TIMESTAMP NOT NULL,
@@ -6330,7 +6347,9 @@ CREATE TABLE crdb_internal.%s (
 	priority                   FLOAT NOT NULL,
 	retries                    INT8 NOT NULL,
 	last_retry_reason          STRING,
-	exec_node_ids              INT[] NOT NULL
+	exec_node_ids              INT[] NOT NULL,
+	contention                 INTERVAL,
+	index_recommendations      STRING[] NOT NULL
 )`
 
 var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
@@ -6372,6 +6391,13 @@ func populateExecutionInsights(
 		return
 	}
 	for _, insight := range response.Insights {
+		problems := tree.NewDArray(types.String)
+		for _, problem := range insight.Problems {
+			if errProblem := problems.Append(tree.NewDString(problem.String())); err != nil {
+				err = errors.CombineErrors(err, errProblem)
+			}
+		}
+
 		startTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.StartTime, time.Nanosecond)
 		if errTimestamp != nil {
 			err = errors.CombineErrors(err, errTimestamp)
@@ -6397,14 +6423,30 @@ func populateExecutionInsights(
 			autoRetryReason = tree.NewDString(insight.Statement.AutoRetryReason)
 		}
 
+		contentionTime := tree.DNull
+		if insight.Statement.Contention != nil {
+			contentionTime = tree.NewDInterval(
+				duration.MakeDuration(insight.Statement.Contention.Nanoseconds(), 0, 0),
+				types.DefaultIntervalTypeMetadata,
+			)
+		}
+
+		indexRecommendations := tree.NewDArray(types.String)
+		for _, recommendation := range insight.Statement.IndexRecommendations {
+			if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
+				return err
+			}
+		}
+
 		err = errors.CombineErrors(err, addRow(
 			tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
 			tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
 			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Transaction.FingerprintID)))),
 			tree.NewDString(hex.EncodeToString(insight.Statement.ID.GetBytes())),
 			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Statement.FingerprintID)))),
+			problems,
 			tree.NewDString(insight.Statement.Query),
-			tree.NewDString(insight.Statement.Status),
+			tree.NewDString(insight.Statement.Status.String()),
 			startTimestamp,
 			endTimestamp,
 			tree.MakeDBool(tree.DBool(insight.Statement.FullScan)),
@@ -6418,6 +6460,8 @@ func populateExecutionInsights(
 			tree.NewDInt(tree.DInt(insight.Statement.Retries)),
 			autoRetryReason,
 			execNodeIDs,
+			contentionTime,
+			indexRecommendations,
 		))
 	}
 	return

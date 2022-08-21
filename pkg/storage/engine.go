@@ -267,6 +267,9 @@ type MVCCIterator interface {
 	FindSplitKey(start, end, minSplitKey roachpb.Key, targetSize int64) (MVCCKey, error)
 	// Stats returns statistics about the iterator.
 	Stats() IteratorStats
+	// IsPrefix returns true if the MVCCIterator is a prefix iterator, i.e.
+	// created with IterOptions.Prefix enabled.
+	IsPrefix() bool
 	// SupportsPrev returns true if MVCCIterator implementation supports reverse
 	// iteration with Prev() or SeekLT().
 	SupportsPrev() bool
@@ -397,6 +400,10 @@ type IterOptions struct {
 	// would return all keys in the old [3-7] SST but not take into account the
 	// separate [3-5] SST where foo@5 was removed or updated. See also:
 	// https://github.com/cockroachdb/pebble/issues/1786
+	//
+	// NB: Range keys are not currently subject to timestamp filtering due to
+	// complications with MVCCIncrementalIterator. See:
+	// https://github.com/cockroachdb/cockroach/issues/86260
 	//
 	// Currently, the only way to correctly use such an iterator is to use it in
 	// concert with an iterator without timestamp hints, as done by
@@ -942,6 +949,10 @@ type Engine interface {
 	// calls to this method. Hence, this should be used with care, with only one
 	// caller, which is currently the admission control subsystem.
 	GetInternalIntervalMetrics() *pebble.InternalIntervalMetrics
+
+	// SetCompactionConcurrency is used to set the engine's compaction
+	// concurrency. It returns the previous compaction concurrency.
+	SetCompactionConcurrency(n uint64) uint64
 }
 
 // Batch is the interface for batch specific operations.

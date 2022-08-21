@@ -105,13 +105,20 @@ func newPebbleIteratorByCloning(
 }
 
 // newPebbleSSTIterator creates a new Pebble iterator for the given SSTs.
-func newPebbleSSTIterator(files []sstable.ReadableFile, opts IterOptions) (*pebbleIterator, error) {
+func newPebbleSSTIterator(
+	files [][]sstable.ReadableFile, opts IterOptions, forwardOnly bool,
+) (*pebbleIterator, error) {
 	p := pebbleIterPool.Get().(*pebbleIterator)
 	p.reusable = false // defensive
 	p.init(nil, opts, StandardDurability, true /* supportsRangeKeys */)
 
+	var externalIterOpts []pebble.ExternalIterOption
+	if forwardOnly {
+		externalIterOpts = append(externalIterOpts, pebble.ExternalIterForwardOnly{})
+	}
+
 	var err error
-	if p.iter, err = pebble.NewExternalIter(DefaultPebbleOptions(), &p.options, files); err != nil {
+	if p.iter, err = pebble.NewExternalIter(DefaultPebbleOptions(), &p.options, files, externalIterOpts...); err != nil {
 		p.Close()
 		return nil, err
 	}
@@ -181,6 +188,9 @@ func (p *pebbleIterator) setOptions(opts IterOptions, durability DurabilityRequi
 	if opts.MinTimestampHint.IsSet() && opts.MaxTimestampHint.IsEmpty() {
 		panic("min timestamp hint set without max timestamp hint")
 	}
+	if opts.Prefix && opts.RangeKeyMaskingBelow.IsSet() {
+		panic("can't use range key masking with prefix iterators") // very high overhead
+	}
 
 	// If this Pebble database does not support range keys yet, fall back to
 	// only iterating over point keys to avoid panics. This is effectively the
@@ -225,7 +235,7 @@ func (p *pebbleIterator) setOptions(opts IterOptions, durability DurabilityRequi
 			p.rangeKeyMaskingBuf, opts.RangeKeyMaskingBelow)
 		p.options.RangeKeyMasking.Suffix = p.rangeKeyMaskingBuf
 		p.maskFilter.BlockIntervalFilter.Init(mvccWallTimeIntervalCollector, 0, math.MaxUint64)
-		p.options.RangeKeyMasking.Filter = &p.maskFilter
+		p.options.RangeKeyMasking.Filter = p.getBlockPropertyFilterMask
 	}
 
 	if opts.MaxTimestampHint.IsSet() {
@@ -256,11 +266,16 @@ func (p *pebbleIterator) setOptions(opts IterOptions, durability DurabilityRequi
 				uint64(opts.MinTimestampHint.WallTime),
 				uint64(opts.MaxTimestampHint.WallTime)+1),
 		}
-		p.options.RangeKeyFilters = []pebble.BlockPropertyFilter{
-			sstable.NewBlockIntervalFilter(mvccWallTimeIntervalCollector,
-				uint64(opts.MinTimestampHint.WallTime),
-				uint64(opts.MaxTimestampHint.WallTime)+1),
-		}
+		// NB: We disable range key block filtering because of complications in
+		// MVCCIncrementalIterator.maybeSkipKeys: the TBI may see different range
+		// key fragmentation than the main iterator due to the filtering. This would
+		// necessitate additional seeks/processing that likely negate the marginal
+		// benefit of the range key filters. See:
+		// https://github.com/cockroachdb/cockroach/issues/86260.
+		//
+		// However, we do collect block properties for range keys, in case we enable
+		// this later.
+		p.options.RangeKeyFilters = nil
 	}
 
 	// Set the new iterator options. We unconditionally do so, since Pebble will
@@ -863,6 +878,11 @@ func (p *pebbleIterator) Stats() IteratorStats {
 	}
 }
 
+// IsPrefix implements the MVCCIterator interface.
+func (p *pebbleIterator) IsPrefix() bool {
+	return p.prefix
+}
+
 // SupportsPrev implements the MVCCIterator interface.
 func (p *pebbleIterator) SupportsPrev() bool {
 	return true
@@ -871,6 +891,10 @@ func (p *pebbleIterator) SupportsPrev() bool {
 // GetRawIter is part of the EngineIterator interface.
 func (p *pebbleIterator) GetRawIter() *pebble.Iterator {
 	return p.iter
+}
+
+func (p *pebbleIterator) getBlockPropertyFilterMask() pebble.BlockPropertyFilterMask {
+	return &p.maskFilter
 }
 
 func (p *pebbleIterator) destroy() {

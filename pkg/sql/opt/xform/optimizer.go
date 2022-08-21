@@ -656,16 +656,15 @@ func (o *Optimizer) enforceProps(
 		memberProps := BuildChildPhysicalProps(o.mem, enforcer, 0, required)
 		fullyOptimized = o.optimizeEnforcer(state, enforcer, required, member, memberProps)
 
-		// Try Sort enforcer that requires a partial ordering from its input. Choose
-		// the interesting ordering that forms the longest common prefix with the
-		// required ordering. We do not need to add the enforcer if the required
-		// ordering is implied by the input ordering (in which case the returned
-		// prefix is nil).
+		// Try Sort enforcer that requires a partial ordering from its input.
+		// Choose the interesting ordering that forms the longest common prefix
+		// with the required ordering. We do not need to add the enforcer if
+		// there is no common prefix or if the required ordering is implied by
+		// the input ordering.
 		interestingOrderings := ordering.DeriveInterestingOrderings(member)
-		longestCommonPrefix := interestingOrderings.LongestCommonPrefix(&required.Ordering)
-		if longestCommonPrefix != nil {
+		if lcp, ok := interestingOrderings.LongestCommonPrefix(&required.Ordering); ok {
 			enforcer := &memo.SortExpr{Input: state.best}
-			enforcer.InputOrdering = *longestCommonPrefix
+			enforcer.InputOrdering = lcp
 			memberProps := BuildChildPhysicalProps(o.mem, enforcer, 0, required)
 			if o.optimizeEnforcer(state, enforcer, required, member, memberProps) {
 				fullyOptimized = true
@@ -1003,6 +1002,9 @@ func (o *Optimizer) disableRules(probability float64) {
 		// appearing consecutively in ordering columns, which can cause
 		// incorrect results until #84191 is addressed.
 		int(opt.SimplifyRootOrdering),
+		// Needed to prevent rule cycles that lead to timeouts and OOMs.
+		int(opt.EliminateProject),
+		int(opt.EliminateSelect),
 	)
 
 	for i := opt.RuleName(1); i < opt.NumRuleNames; i++ {

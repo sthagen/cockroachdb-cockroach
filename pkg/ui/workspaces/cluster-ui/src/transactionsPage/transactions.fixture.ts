@@ -15,7 +15,7 @@ import moment from "moment";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { SortSetting } from "../sortedtable";
 import { Filters } from "../queryFilter";
-import { TimeScale, defaultTimeScaleOptions } from "../timeScaleDropdown";
+import { TimeScale } from "../timeScaleDropdown";
 
 const history = createMemoryHistory({ initialEntries: ["/transactions"] });
 
@@ -66,6 +66,8 @@ export const filters: Filters = {
   regions: "",
   nodes: "",
 };
+
+export const lastUpdated = moment();
 
 export const data: cockroach.server.serverpb.IStatementsResponse = {
   statements: [

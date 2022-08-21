@@ -1,3 +1,5 @@
+# knob-opt: disable-corpus-generation sync-event-log
+
 subtest add_column
 
 statement ok

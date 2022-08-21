@@ -191,6 +191,11 @@ func changefeedPlanHook(
 		}
 
 		if details.SinkURI == `` {
+
+			p.ExtendedEvalContext().ChangefeedState = &coreChangefeedProgress{
+				progress: progress,
+			}
+
 			// If this is a sinkless changefeed, then we should not hold on to the
 			// descriptor leases accessed to plan the changefeed. If changes happen
 			// to descriptors, they will be addressed during the execution.
@@ -220,18 +225,7 @@ func changefeedPlanHook(
 					return err
 				}
 
-				// Check for a schemachange boundary timestamp returned via a
-				// retryable error. Retrying without updating the changefeed progress
-				// will result in the changefeed performing the schema change again,
-				// causing an infinite loop.
-				if ts, ok := changefeedbase.MaybeGetRetryableErrorTimestamp(err); ok {
-					progress = jobspb.Progress{
-						Progress: &jobspb.Progress_HighWater{HighWater: &ts},
-						Details: &jobspb.Progress_Changefeed{
-							Changefeed: &jobspb.ChangefeedProgress{},
-						},
-					}
-				}
+				progress = p.ExtendedEvalContext().ChangefeedState.(*coreChangefeedProgress).progress
 			}
 			telemetry.Count(`changefeed.core.error`)
 			return changefeedbase.MaybeStripRetryableErrorMarker(err)
@@ -319,10 +313,6 @@ func createChangefeedJobRecord(
 	telemetryPath string,
 ) (*jobs.Record, error) {
 	unspecifiedSink := changefeedStmt.SinkURI == nil
-
-	if err := opts.CheckVersionGates(ctx, p.ExecCfg().Settings.Version); err != nil {
-		return nil, err
-	}
 
 	for _, warning := range opts.DeprecationWarnings() {
 		p.BufferClientNotice(ctx, pgnotice.Newf("%s", warning))

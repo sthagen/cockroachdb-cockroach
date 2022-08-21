@@ -518,9 +518,6 @@ func (dsp *DistSQLPlanner) Run(
 	localState.IsLocal = planCtx.isLocal
 	localState.Txn = txn
 	localState.LocalProcs = plan.LocalProcessors
-	// If we need to perform some operation on the flow specs, we want to
-	// preserve the specs during the flow setup.
-	localState.PreserveFlowSpecs = planCtx.saveFlows != nil
 	// If we have access to a planner and are currently being used to plan
 	// statements in a user transaction, then take the descs.Collection to resolve
 	// types with during flow execution. This is necessary to do in the case of
@@ -1303,6 +1300,52 @@ func (r *DistSQLReceiver) ProducerDone() {
 		panic("double close")
 	}
 	r.closed = true
+}
+
+// PlanAndRunAll combines running the the main query, subqueries and cascades/checks.
+// If an error is returned, the connection needs to stop processing queries.
+// Query execution errors stored in recv; they are not returned.
+func (dsp *DistSQLPlanner) PlanAndRunAll(
+	ctx context.Context,
+	evalCtx *extendedEvalContext,
+	planCtx *PlanningCtx,
+	planner *planner,
+	recv *DistSQLReceiver,
+	evalCtxFactory func() *extendedEvalContext,
+) error {
+	if len(planner.curPlan.subqueryPlans) != 0 {
+		// Create a separate memory account for the results of the subqueries.
+		// Note that we intentionally defer the closure of the account until we
+		// return from this method (after the main query is executed).
+		subqueryResultMemAcc := planner.EvalContext().Mon.MakeBoundAccount()
+		defer subqueryResultMemAcc.Close(ctx)
+		if !dsp.PlanAndRunSubqueries(
+			ctx, planner, evalCtxFactory, planner.curPlan.subqueryPlans, recv, &subqueryResultMemAcc,
+			// Skip the diagram generation since on this "main" query path we
+			// can get it via the statement bundle.
+			true, /* skipDistSQLDiagramGeneration */
+		) {
+			return recv.commErr
+		}
+	}
+	recv.discardRows = planner.instrumentation.ShouldDiscardRows()
+	// We pass in whether or not we wanted to distribute this plan, which tells
+	// the planner whether or not to plan remote table readers.
+	cleanup := dsp.PlanAndRun(
+		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv,
+	)
+	// Note that we're not cleaning up right away because postqueries might
+	// need to have access to the main query tree.
+	defer cleanup()
+	if recv.commErr != nil || recv.resultWriter.Err() != nil {
+		return recv.commErr
+	}
+
+	dsp.PlanAndRunCascadesAndChecks(
+		ctx, planner, evalCtxFactory, &planner.curPlan.planComponents, recv,
+	)
+
+	return recv.commErr
 }
 
 // PlanAndRunSubqueries returns false if an error was encountered and sets that

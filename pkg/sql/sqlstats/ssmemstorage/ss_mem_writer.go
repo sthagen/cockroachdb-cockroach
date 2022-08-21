@@ -42,12 +42,12 @@ var timestampSize = int64(unsafe.Sizeof(time.Time{}))
 
 var _ sqlstats.Writer = &Container{}
 
-func getStatusString(statementError error) string {
+func getStatus(statementError error) insights.Statement_Status {
 	if statementError == nil {
-		return "completed"
+		return insights.Statement_Completed
 	}
 
-	return "failed"
+	return insights.Statement_Failed
 }
 
 // RecordStatement implements sqlstats.Writer interface.
@@ -121,6 +121,7 @@ func (s *Container) RecordStatement(
 	} else if int64(value.AutoRetryCount) > stats.mu.data.MaxRetries {
 		stats.mu.data.MaxRetries = int64(value.AutoRetryCount)
 	}
+
 	stats.mu.data.SQLType = value.StatementType.String()
 	stats.mu.data.NumRows.Record(stats.mu.data.Count, float64(value.RowsAffected))
 	stats.mu.data.ParseLat.Record(stats.mu.data.Count, value.ParseLatency)
@@ -175,24 +176,31 @@ func (s *Container) RecordStatement(
 		autoRetryReason = value.AutoRetryReason.Error()
 	}
 
-	s.outliersRegistry.ObserveStatement(value.SessionID, &insights.Statement{
-		ID:               value.StatementID,
-		FingerprintID:    stmtFingerprintID,
-		LatencyInSeconds: value.ServiceLatency,
-		Query:            value.Query,
-		Status:           getStatusString(value.StatementError),
-		StartTime:        value.StartTime,
-		EndTime:          value.EndTime,
-		FullScan:         value.FullScan,
-		User:             value.SessionData.User().Normalized(),
-		ApplicationName:  value.SessionData.ApplicationName,
-		Database:         value.SessionData.Database,
-		PlanGist:         value.PlanGist,
-		Retries:          int64(value.AutoRetryCount),
-		AutoRetryReason:  autoRetryReason,
-		RowsRead:         value.RowsRead,
-		RowsWritten:      value.RowsWritten,
-		Nodes:            value.Nodes,
+	var contention *time.Duration
+	if value.ExecStats != nil {
+		contention = &value.ExecStats.ContentionTime
+	}
+
+	s.insights.ObserveStatement(value.SessionID, &insights.Statement{
+		ID:                   value.StatementID,
+		FingerprintID:        stmtFingerprintID,
+		LatencyInSeconds:     value.ServiceLatency,
+		Query:                value.Query,
+		Status:               getStatus(value.StatementError),
+		StartTime:            value.StartTime,
+		EndTime:              value.EndTime,
+		FullScan:             value.FullScan,
+		User:                 value.SessionData.User().Normalized(),
+		ApplicationName:      value.SessionData.ApplicationName,
+		Database:             value.SessionData.Database,
+		PlanGist:             value.PlanGist,
+		Retries:              int64(value.AutoRetryCount),
+		AutoRetryReason:      autoRetryReason,
+		RowsRead:             value.RowsRead,
+		RowsWritten:          value.RowsWritten,
+		Nodes:                value.Nodes,
+		Contention:           contention,
+		IndexRecommendations: value.IndexRecommendations,
 	})
 
 	return stats.ID, nil
@@ -303,7 +311,7 @@ func (s *Container) RecordTransaction(
 		stats.mu.data.ExecStats.MaxDiskUsage.Record(stats.mu.data.ExecStats.Count, float64(value.ExecStats.MaxDiskUsage))
 	}
 
-	s.outliersRegistry.ObserveTransaction(value.SessionID, &insights.Transaction{
+	s.insights.ObserveTransaction(value.SessionID, &insights.Transaction{
 		ID:            value.TransactionID,
 		FingerprintID: key})
 

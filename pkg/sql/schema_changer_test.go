@@ -401,9 +401,16 @@ func runSchemaChangeWithOperations(
 	// validate schema change operations. We wait for any SCHEMA
 	// CHANGE GC jobs for temp indexes to show that the temp index
 	// has been cleared.
-	if _, err := sqlDB.Exec(`SHOW JOBS WHEN COMPLETE (SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC')`); err != nil {
-		t.Fatal(err)
-	}
+	sqlutils.MakeSQLRunner(sqlDB).CheckQueryResultsRetry(t, `
+SELECT count(*)
+  FROM (
+        SELECT job_id
+          FROM [SHOW JOBS]
+         WHERE job_type = 'SCHEMA CHANGE GC'
+               AND status != 'succeeded'
+               AND running_status != 'waiting for MVCC GC'
+       )`,
+		[][]string{{"0"}})
 	testutils.SucceedsSoon(t, func() error {
 		return sqltestutils.CheckTableKeyCount(ctx, kvDB, keyMultiple, maxValue+numInserts)
 	})
@@ -618,11 +625,11 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
+	tc.SplitTable(t, tableDesc, sps)
 
 	ctx := context.Background()
 
@@ -736,6 +743,7 @@ func TestDropWhileBackfill(t *testing.T) {
 		// We expect this to also reduce the memory footprint of the test.
 		maxValue = 200
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	params, _ := tests.CreateTestServerParams()
 	notifyBackfill := func() {
 		mu.Lock()
@@ -766,6 +774,13 @@ func TestDropWhileBackfill(t *testing.T) {
 		StartupMigrationManager: &startupmigrations.MigrationManagerTestingKnobs{
 			DisableBackfillMigrations: true,
 		},
+		// Prevent the GC job from running.
+		GCJob: &sql.GCJobTestingKnobs{
+			RunBeforeResume: func(_ jobspb.JobID) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		},
 	}
 
 	tc := serverutils.StartNewTestCluster(t, numNodes,
@@ -774,6 +789,7 @@ func TestDropWhileBackfill(t *testing.T) {
 			ServerArgs:      params,
 		})
 	defer tc.Stopper().Stop(context.Background())
+	defer cancel()
 	kvDB := tc.Server(0).DB()
 	sqlDB := tc.ServerConn(0)
 
@@ -798,13 +814,11 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	// Split the table into multiple ranges.
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
-
-	ctx := context.Background()
+	tc.SplitTable(t, tableDesc, sps)
 
 	// number of keys == 2 * number of rows; 1 column family and 1 index entry
 	// for each row.
@@ -821,7 +835,9 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	wg.Add(1)
 	go func() {
 		// Start schema change that eventually runs a partial backfill.
-		if _, err := sqlDB.Exec("CREATE UNIQUE INDEX bar ON t.test (v)"); err != nil && !testutils.IsError(err, "descriptor is being dropped") {
+		if _, err := sqlDB.Exec(
+			"CREATE UNIQUE INDEX bar ON t.test (v)",
+		); err != nil && !testutils.IsError(err, "descriptor is being dropped") {
 			t.Error(err)
 		}
 		wg.Done()
@@ -912,11 +928,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Split the table into multiple ranges.
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
+	tc.SplitTable(t, tableDesc, sps)
 
 	ctx := context.Background()
 
@@ -1346,6 +1362,7 @@ func TestSchemaChangeRetry(t *testing.T) {
 	}
 
 	const maxValue = 2000
+	ctx, cancel := context.WithCancel(context.Background())
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			WriteCheckpointInterval:          time.Nanosecond,
@@ -1363,10 +1380,17 @@ func TestSchemaChangeRetry(t *testing.T) {
 		},
 		// Decrease the adopt loop interval so that retries happen quickly.
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		GCJob: &sql.GCJobTestingKnobs{
+			RunBeforeResume: func(jobID jobspb.JobID) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		},
 	}
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
+	defer cancel()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -2531,7 +2555,7 @@ func TestPrimaryKeyChangeWithPrecedingIndexCreation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 
 	var chunkSize int64 = 100
 	var maxValue = 4000
@@ -2578,9 +2602,16 @@ func TestPrimaryKeyChangeWithPrecedingIndexCreation(t *testing.T) {
 		},
 		// Decrease the adopt loop interval so that retries happen quickly.
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		// Prevent the GC job from running so we ensure that all the keys
+		// which were written remain.
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(jobID jobspb.JobID) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
+	defer cancel()
 
 	if _, err := sqlDB.Exec(`CREATE DATABASE t`); err != nil {
 		t.Fatal(err)
@@ -3380,7 +3411,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 `)
 	require.NoError(t, err)
 
-	_, err = sqlDB.Exec(`SET use_declarative_schema_changer = off; 
+	_, err = sqlDB.Exec(`SET use_declarative_schema_changer = off;
 ALTER TABLE t.test ALTER PRIMARY KEY USING COLUMNS (k)`)
 	require.NoError(t, err)
 
@@ -3810,10 +3841,17 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 	// [0...maxValue], so that the backfill processing ends on
 	// a chunk boundary.
 	const maxValue = 3*chunkSize - 1
+	ctx, cancel := context.WithCancel(context.Background())
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: chunkSize,
+		},
+		GCJob: &sql.GCJobTestingKnobs{
+			RunBeforeResume: func(jobID jobspb.JobID) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
 		},
 	}
 
@@ -3823,6 +3861,7 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 			ServerArgs:      params,
 		})
 	defer tc.Stopper().Stop(context.Background())
+	defer cancel()
 	kvDB := tc.Server(0).DB()
 	sqlDB := tc.ServerConn(0)
 	// Declarative schema changer does not use then new MVCC backfiller, so
@@ -3845,11 +3884,11 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 
 	// Split the table into multiple ranges.
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
+	tc.SplitTable(t, tableDesc, sps)
 
 	// Run some schema changes.
 	testCases := []struct {
@@ -4146,11 +4185,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Split the table into multiple ranges.
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
+	tc.SplitTable(t, tableDesc, sps)
 
 	testCases := []struct {
 		sql    string
@@ -4860,12 +4899,12 @@ func TestCancelSchemaChange(t *testing.T) {
 
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// Split the table into multiple ranges.
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	const numSplits = numNodes * 2
 	for i := 1; i <= numSplits-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i % numNodes, Vals: []interface{}{maxValue / numSplits * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i % numNodes, Vals: []interface{}{maxValue / numSplits * i}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
+	tc.SplitTable(t, tableDesc, sps)
 
 	ctx := context.Background()
 	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
@@ -5945,11 +5984,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	var sps []sql.SplitPoint
+	var sps []serverutils.SplitPoint
 	for i := 1; i < numNodes-1; i++ {
-		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / 2}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / 2}})
 	}
-	sql.SplitTable(t, tc, tableDesc, sps)
+	tc.SplitTable(t, tableDesc, sps)
 
 	bg := ctxgroup.WithContext(ctx)
 	bg.Go(func() error {

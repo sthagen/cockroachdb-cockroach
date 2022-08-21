@@ -190,29 +190,9 @@ const (
 	// engine running at the required format major version, as do all other nodes
 	// in the cluster.
 	EnablePebbleFormatVersionBlockProperties
-	// EnableLeaseHolderRemoval enables removing a leaseholder and transferring the lease
-	// during joint configuration, including to VOTER_INCOMING replicas.
-	EnableLeaseHolderRemoval
-	// ChangefeedIdleness is the version where changefeed aggregators forward
-	// idleness-related information alnog with resolved spans to the frontier
-	ChangefeedIdleness
-	// RowLevelTTL is the version where we allow row level TTL tables.
-	RowLevelTTL
 	// EnableNewStoreRebalancer enables the new store rebalancer introduced in
 	// 22.1.
 	EnableNewStoreRebalancer
-	// ClusterLocksVirtualTable enables querying the crdb_internal.cluster_locks
-	// virtual table, which sends a QueryLocksRequest RPC to all cluster ranges.
-	ClusterLocksVirtualTable
-	// AutoStatsTableSettings is the version where we allow auto stats related
-	// table settings.
-	AutoStatsTableSettings
-	// SuperRegions enables the usage on super regions.
-	SuperRegions
-	// EnableNewChangefeedOptions enables the usage of new changefeed options
-	// such as end_time, initial_scan_only, and setting the value of initial_scan
-	// to 'yes|no|only'
-	EnableNewChangefeedOptions
 
 	// V22_1 is CockroachDB v22.1. It's used for all v22.1.x patch releases.
 	V22_1
@@ -310,6 +290,18 @@ const (
 	// options table id column cannot be null. This is the final step
 	// of the system.role_options table migration.
 	SetRoleOptionsUserIDColumnNotNull
+	// UseDelRangeInGCJob enables the use of the DelRange operation in the
+	// GC job. Before it is enabled, the GC job uses ClearRange operations
+	// after the job waits out the GC TTL. After it has been enabled, the
+	// job instead issues DelRange operations at the beginning of the job
+	// and then waits for the data to be removed automatically before removing
+	// the descriptor and zone configurations.
+	UseDelRangeInGCJob
+	// WaitedForDelRangeInGCJob corresponds to the migration which waits for
+	// the GC jobs to adopt the use of DelRange with tombstones.
+	WaitedForDelRangeInGCJob
+	// RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
+	RangefeedUseOneStreamPerNode
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -379,36 +371,8 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 64},
 	},
 	{
-		Key:     EnableLeaseHolderRemoval,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 70},
-	},
-	{
-		Key:     ChangefeedIdleness,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 82},
-	},
-	{
-		Key:     RowLevelTTL,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 88},
-	},
-	{
 		Key:     EnableNewStoreRebalancer,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 96},
-	},
-	{
-		Key:     ClusterLocksVirtualTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 98},
-	},
-	{
-		Key:     AutoStatsTableSettings,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 100},
-	},
-	{
-		Key:     SuperRegions,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 104},
-	},
-	{
-		Key:     EnableNewChangefeedOptions,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 106},
 	},
 	{
 		Key:     V22_1,
@@ -524,6 +488,19 @@ var versionsSingleton = keyedVersions{
 		Key:     SetRoleOptionsUserIDColumnNotNull,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 54},
 	},
+	{
+		Key:     UseDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 56},
+	},
+	{
+		Key:     WaitedForDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 58},
+	},
+	{
+		Key:     RangefeedUseOneStreamPerNode,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
+	},
+
 	// *************************************************
 	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.

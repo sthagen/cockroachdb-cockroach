@@ -19,7 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
@@ -1478,9 +1477,8 @@ func (a *Allocator) ValidLeaseTargets(
 ) []roachpb.ReplicaDescriptor {
 	candidates := make([]roachpb.ReplicaDescriptor, 0, len(existing))
 	replDescs := roachpb.MakeReplicaSet(existing)
-	lhRemovalAllowed := a.StorePool.St.Version.IsActive(ctx, clusterversion.EnableLeaseHolderRemoval)
 	for i := range existing {
-		if err := roachpb.CheckCanReceiveLease(existing[i], replDescs, lhRemovalAllowed); err != nil {
+		if err := roachpb.CheckCanReceiveLease(existing[i], replDescs, true /* lhRemovalAllowed */); err != nil {
 			continue
 		}
 		// If we're not allowed to include the current replica, remove it from
@@ -1605,12 +1603,8 @@ func (a *Allocator) leaseholderShouldMoveDueToPreferences(
 // stores as targets) when enforcementLevel is set to storeHealthNoAction or
 // storeHealthLogOnly. By default storeHealthBlockRebalanceTo is the action taken. When
 // there is a mixed version cluster, storeHealthNoAction is set instead.
-func (a *Allocator) StoreHealthOptions(ctx context.Context) StoreHealthOptions {
-	enforcementLevel := StoreHealthNoAction
-	if a.StorePool.St.Version.IsActive(ctx, clusterversion.AutoStatsTableSettings) {
-		enforcementLevel = StoreHealthEnforcement(l0SublevelsThresholdEnforce.Get(&a.StorePool.St.SV))
-	}
-
+func (a *Allocator) StoreHealthOptions(_ context.Context) StoreHealthOptions {
+	enforcementLevel := StoreHealthEnforcement(l0SublevelsThresholdEnforce.Get(&a.StorePool.St.SV))
 	return StoreHealthOptions{
 		EnforcementLevel:    enforcementLevel,
 		L0SublevelThreshold: l0SublevelsThreshold.Get(&a.StorePool.St.SV),

@@ -194,6 +194,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.ValuesExpr:
 		ep, err = b.buildValues(t)
 
+	case *memo.LiteralValuesExpr:
+		ep, err = b.buildLiteralValues(t)
+
 	case *memo.ScanExpr:
 		ep, err = b.buildScan(t)
 
@@ -400,6 +403,18 @@ func (b *Builder) maybeAnnotateWithEstimates(node exec.Node, e memo.RelExpr) {
 				}
 				val.TableStatsCreatedAt = stat.CreatedAt()
 				val.LimitHint = scan.RequiredPhysical().LimitHint
+				val.Forecast = stat.IsForecast()
+				if val.Forecast {
+					val.ForecastAt = stat.CreatedAt()
+					// Find the first non-forecast stat.
+					for i := 0; i < tab.StatisticCount(); i++ {
+						nextStat := tab.Statistic(i)
+						if !nextStat.IsForecast() {
+							val.TableStatsCreatedAt = nextStat.CreatedAt()
+							break
+						}
+					}
+				}
 			}
 		}
 		ef.AnnotateNode(node, exec.EstimatedStatsID, &val)
@@ -461,6 +476,26 @@ func (b *Builder) constructValues(rows [][]tree.TypedExpr, cols opt.ColList) (ex
 	}
 	ep := execPlan{root: node}
 	for i, col := range cols {
+		ep.outputCols.Set(int(col), i)
+	}
+
+	return ep, nil
+}
+
+func (b *Builder) buildLiteralValues(values *memo.LiteralValuesExpr) (execPlan, error) {
+	md := b.mem.Metadata()
+	resultCols := make(colinfo.ResultColumns, len(values.ColList()))
+	for i, col := range values.ColList() {
+		colMeta := md.ColumnMeta(col)
+		resultCols[i].Name = colMeta.Alias
+		resultCols[i].Typ = colMeta.Type
+	}
+	node, err := b.factory.ConstructLiteralValues(values.Rows.Rows, resultCols)
+	if err != nil {
+		return execPlan{}, err
+	}
+	ep := execPlan{root: node}
+	for i, col := range values.ColList() {
 		ep.outputCols.Set(int(col), i)
 	}
 

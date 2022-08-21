@@ -538,7 +538,11 @@ func DefaultPebbleOptions() *pebble.Options {
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
 	// activity on the database generating flushes.
-	opts.Experimental.DeleteRangeFlushDelay = 10 * time.Second
+	opts.FlushDelayDeleteRange = 10 * time.Second
+	// Automatically flush 10s after the first range key is added to a memtable.
+	// This ensures that range keys are quickly flushed, allowing use of lazy
+	// combined iteration within Pebble.
+	opts.FlushDelayRangeKey = 10 * time.Second
 	// Enable deletion pacing. This helps prevent disk slowness events on some
 	// SSDs, that kick off an expensive GC if a lot of files are deleted at
 	// once.
@@ -646,6 +650,17 @@ type EncryptionStatsHandler interface {
 
 // Pebble is a wrapper around a Pebble database instance.
 type Pebble struct {
+	atomic struct {
+		// compactionConcurrency is the current compaction concurrency set on
+		// the Pebble store. The compactionConcurrency option in the Pebble
+		// Options struct is a closure which will return
+		// Pebble.atomic.compactionConcurrency.
+		//
+		// This mechanism allows us to change the Pebble compactionConcurrency
+		// on the fly without restarting Pebble.
+		compactionConcurrency uint64
+	}
+
 	db *pebble.DB
 
 	closed      bool
@@ -725,6 +740,12 @@ type StoreIDSetter interface {
 	// id as a tag in the pebble logs. Once set, the store id will be visible
 	// in pebble logs in cockroach.
 	SetStoreID(ctx context.Context, storeID int32)
+}
+
+// SetCompactionConcurrency will return the previous compaction concurrency.
+func (p *Pebble) SetCompactionConcurrency(n uint64) uint64 {
+	prevConcurrency := atomic.SwapUint64(&p.atomic.compactionConcurrency, n)
+	return prevConcurrency
 }
 
 // SetStoreID adds the store id to pebble logs.
@@ -886,6 +907,19 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		storeIDPebbleLog: storeIDContainer,
 		closer:           filesystemCloser,
 	}
+
+	// MaxConcurrentCompactions can be set by multiple sources, but all the
+	// sources will eventually call NewPebble. So, we override
+	// Opts.MaxConcurrentCompactions to a closure which will return
+	// Pebble.atomic.compactionConcurrency. This will allow us to both honor
+	// the compactions concurrency which has already been set and allow us
+	// to update the compactionConcurrency on the fly by changing the
+	// Pebble.atomic.compactionConcurrency variable.
+	p.atomic.compactionConcurrency = uint64(cfg.Opts.MaxConcurrentCompactions())
+	cfg.Opts.MaxConcurrentCompactions = func() int {
+		return int(atomic.LoadUint64(&p.atomic.compactionConcurrency))
+	}
+
 	cfg.Opts.EventListener = pebble.TeeEventListener(
 		pebble.MakeLoggingEventListener(pebbleLogger{
 			ctx:   logCtx,

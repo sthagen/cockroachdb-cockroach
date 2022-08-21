@@ -249,6 +249,7 @@ CREATE TABLE crdb_internal.cluster_execution_insights (
    txn_fingerprint_id BYTES NOT NULL,
    stmt_id STRING NOT NULL,
    stmt_fingerprint_id BYTES NOT NULL,
+   problems STRING[] NOT NULL,
    query STRING NOT NULL,
    status STRING NOT NULL,
    start_time TIMESTAMP NOT NULL,
@@ -263,13 +264,16 @@ CREATE TABLE crdb_internal.cluster_execution_insights (
    priority FLOAT8 NOT NULL,
    retries INT8 NOT NULL,
    last_retry_reason STRING NULL,
-   exec_node_ids INT8[] NOT NULL
+   exec_node_ids INT8[] NOT NULL,
+   contention INTERVAL NULL,
+   index_recommendations STRING[] NOT NULL
 )  CREATE TABLE crdb_internal.cluster_execution_insights (
    session_id STRING NOT NULL,
    txn_id UUID NOT NULL,
    txn_fingerprint_id BYTES NOT NULL,
    stmt_id STRING NOT NULL,
    stmt_fingerprint_id BYTES NOT NULL,
+   problems STRING[] NOT NULL,
    query STRING NOT NULL,
    status STRING NOT NULL,
    start_time TIMESTAMP NOT NULL,
@@ -284,7 +288,9 @@ CREATE TABLE crdb_internal.cluster_execution_insights (
    priority FLOAT8 NOT NULL,
    retries INT8 NOT NULL,
    last_retry_reason STRING NULL,
-   exec_node_ids INT8[] NOT NULL
+   exec_node_ids INT8[] NOT NULL,
+   contention INTERVAL NULL,
+   index_recommendations STRING[] NOT NULL
 )  {}  {}
 CREATE TABLE crdb_internal.cluster_inflight_traces (
    trace_id INT8 NOT NULL,
@@ -959,6 +965,7 @@ CREATE TABLE crdb_internal.node_execution_insights (
    txn_fingerprint_id BYTES NOT NULL,
    stmt_id STRING NOT NULL,
    stmt_fingerprint_id BYTES NOT NULL,
+   problems STRING[] NOT NULL,
    query STRING NOT NULL,
    status STRING NOT NULL,
    start_time TIMESTAMP NOT NULL,
@@ -973,13 +980,16 @@ CREATE TABLE crdb_internal.node_execution_insights (
    priority FLOAT8 NOT NULL,
    retries INT8 NOT NULL,
    last_retry_reason STRING NULL,
-   exec_node_ids INT8[] NOT NULL
+   exec_node_ids INT8[] NOT NULL,
+   contention INTERVAL NULL,
+   index_recommendations STRING[] NOT NULL
 )  CREATE TABLE crdb_internal.node_execution_insights (
    session_id STRING NOT NULL,
    txn_id UUID NOT NULL,
    txn_fingerprint_id BYTES NOT NULL,
    stmt_id STRING NOT NULL,
    stmt_fingerprint_id BYTES NOT NULL,
+   problems STRING[] NOT NULL,
    query STRING NOT NULL,
    status STRING NOT NULL,
    start_time TIMESTAMP NOT NULL,
@@ -994,7 +1004,9 @@ CREATE TABLE crdb_internal.node_execution_insights (
    priority FLOAT8 NOT NULL,
    retries INT8 NOT NULL,
    last_retry_reason STRING NULL,
-   exec_node_ids INT8[] NOT NULL
+   exec_node_ids INT8[] NOT NULL,
+   contention INTERVAL NULL,
+   index_recommendations STRING[] NOT NULL
 )  {}  {}
 CREATE TABLE crdb_internal.node_inflight_trace_spans (
    trace_id INT8 NOT NULL,

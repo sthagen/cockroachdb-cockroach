@@ -119,6 +119,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.Tracer = execCfg.AmbientCtx.Tracer
 	evalCtx.SQLLivenessReader = execCfg.SQLLiveness
 	evalCtx.CompactEngineSpan = execCfg.CompactEngineSpanFunc
+	evalCtx.SetCompactionConcurrency = execCfg.CompactionConcurrencyFunc
 	evalCtx.TestingKnobs = execCfg.EvalContextTestingKnobs
 	evalCtx.ClusterID = execCfg.NodeInfo.LogicalClusterID()
 	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
@@ -372,7 +373,7 @@ func newInternalPlanner(
 		sessionDataMutatorBase: sessionDataMutatorBase{
 			defaults: SessionDefaults(map[string]string{
 				"application_name": "crdb-internal",
-				"database":         "system",
+				"database":         sd.SessionData.Database,
 			}),
 			settings: execCfg.Settings,
 		},
@@ -486,6 +487,7 @@ func internalExtendedEvalCtx(
 			SchemaTelemetryController:      schemaTelemetryController,
 			IndexUsageStatsController:      indexUsageStatsController,
 			StmtDiagnosticsRequestInserter: execCfg.StmtDiagnosticsRecorder.InsertRequest,
+			RangeStatsFetcher:              execCfg.RangeStatsFetcher,
 		},
 		Tracing:         &SessionTracing{},
 		Descs:           tables,

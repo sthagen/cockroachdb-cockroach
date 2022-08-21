@@ -9,6 +9,7 @@ go_library(
         "detector.go",
         "ingester.go",
         "insights.go",
+        "problems.go",
         "registry.go",
     ],
     embed = [":insights_go_proto"],
@@ -35,6 +36,7 @@ go_test(
         "detector_test.go",
         "ingester_test.go",
         "insights_test.go",
+        "problems_test.go",
         "registry_test.go",
     ],
     embed = [":insights"],
@@ -43,7 +45,6 @@ go_test(
         "//pkg/settings/cluster",
         "//pkg/sql/clusterunique",
         "//pkg/util/stop",
-        "//pkg/util/syncutil",
         "//pkg/util/uint128",
         "//pkg/util/uuid",
         "@com_github_stretchr_testify//require",
@@ -57,6 +58,7 @@ proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
+        "@com_google_protobuf//:duration_proto",
         "@com_google_protobuf//:timestamp_proto",
     ],
 )

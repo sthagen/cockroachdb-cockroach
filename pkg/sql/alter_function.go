@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -52,6 +51,14 @@ type alterFunctionDepExtensionNode struct {
 func (p *planner) AlterFunctionOptions(
 	ctx context.Context, n *tree.AlterFunctionOptions,
 ) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER FUNCTION",
+	); err != nil {
+		return nil, err
+	}
+
 	return &alterFunctionOptionsNode{n: n}, nil
 }
 
@@ -64,19 +71,20 @@ func (n *alterFunctionOptionsNode) startExec(params runParams) error {
 	// referenced by other objects. This is needed when want to allow function
 	// references. Need to think about in what condition a function can be altered
 	// or not.
-	options := make(map[string]struct{})
+	if err := tree.ValidateFuncOptions(n.n.Options); err != nil {
+		return err
+	}
 	for _, option := range n.n.Options {
-		optTypeName := reflect.TypeOf(option).Name()
-		if _, ok := options[optTypeName]; ok {
-			return pgerror.New(pgcode.Syntax, "conflicting or redundant options")
-		}
 		// Note that language and function body cannot be altered, and it's blocked
 		// from parser level with "common_func_opt_item" syntax.
 		err := setFuncOption(params, fnDesc, option)
 		if err != nil {
 			return err
 		}
-		options[optTypeName] = struct{}{}
+	}
+
+	if err := funcdesc.CheckLeakProofVolatility(fnDesc); err != nil {
+		return err
 	}
 
 	return params.p.writeFuncSchemaChange(params.ctx, fnDesc)
@@ -90,6 +98,14 @@ func (n *alterFunctionOptionsNode) Close(ctx context.Context)           {}
 func (p *planner) AlterFunctionRename(
 	ctx context.Context, n *tree.AlterFunctionRename,
 ) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER FUNCTION",
+	); err != nil {
+		return nil, err
+	}
+
 	return &alterFunctionRenameNode{n: n}, nil
 }
 
@@ -141,6 +157,14 @@ func (n *alterFunctionRenameNode) Close(ctx context.Context)           {}
 func (p *planner) AlterFunctionSetOwner(
 	ctx context.Context, n *tree.AlterFunctionSetOwner,
 ) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER FUNCTION",
+	); err != nil {
+		return nil, err
+	}
+
 	return &alterFunctionSetOwnerNode{n: n}, nil
 }
 
@@ -181,6 +205,14 @@ func (n *alterFunctionSetOwnerNode) Close(ctx context.Context)           {}
 func (p *planner) AlterFunctionSetSchema(
 	ctx context.Context, n *tree.AlterFunctionSetSchema,
 ) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER FUNCTION",
+	); err != nil {
+		return nil, err
+	}
+
 	return &alterFunctionSetSchemaNode{n: n}, nil
 }
 

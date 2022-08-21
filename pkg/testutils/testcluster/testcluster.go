@@ -32,6 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -1041,6 +1043,31 @@ func (tc *TestCluster) TransferRangeLeaseOrFatal(
 	}
 }
 
+// IncrClockForLeaseUpgrade run up the clock to force a lease renewal (and thus
+// the change in lease types).
+func (tc *TestCluster) IncrClockForLeaseUpgrade(t *testing.T, clock *hlc.HybridManualClock) {
+	clock.Increment(
+		tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().RangeLeaseRenewalDuration().Nanoseconds() +
+			time.Second.Nanoseconds(),
+	)
+}
+
+// WaitForLeaseUpgrade waits until the lease held for the given range descriptor
+// is upgraded to an epoch-based one.
+func (tc *TestCluster) WaitForLeaseUpgrade(
+	ctx context.Context, t *testing.T, desc roachpb.RangeDescriptor,
+) {
+	testutils.SucceedsSoon(t, func() error {
+		li, _, err := tc.FindRangeLeaseEx(ctx, desc, nil)
+		require.NoError(t, err)
+		if li.Current().Type() != roachpb.LeaseEpoch {
+			return errors.Errorf("lease still an expiration based lease")
+		}
+		require.Equal(t, int64(1), li.Current().Epoch)
+		return nil
+	})
+}
+
 // RemoveLeaseHolderOrFatal is a convenience version of TransferRangeLease and RemoveVoter
 func (tc *TestCluster) RemoveLeaseHolderOrFatal(
 	t testing.TB,
@@ -1693,6 +1720,64 @@ func (tc *TestCluster) GetStatusClient(
 		return nil, errors.Wrap(err, "failed to create a status client")
 	}
 	return serverpb.NewStatusClient(cc), nil
+}
+
+// SplitTable implements TestClusterInterface.
+func (tc *TestCluster) SplitTable(
+	t *testing.T, desc catalog.TableDescriptor, sps []serverutils.SplitPoint,
+) {
+	if tc.ReplicationMode() != base.ReplicationManual {
+		t.Fatal("SplitTable called on a test cluster that was not in manual replication mode")
+	}
+
+	rkts := make(map[roachpb.RangeID]rangeAndKT)
+	for _, sp := range sps {
+		pik, err := randgen.TestingMakePrimaryIndexKey(desc, sp.Vals...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, rightRange, err := tc.Server(0).SplitRange(pik)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rightRangeStartKey := rightRange.StartKey.AsRawKey()
+		target := tc.Target(sp.TargetNodeIdx)
+
+		rkts[rightRange.RangeID] = rangeAndKT{
+			rightRange,
+			serverutils.KeyAndTargets{StartKey: rightRangeStartKey, Targets: []roachpb.ReplicationTarget{target}}}
+	}
+
+	var kts []serverutils.KeyAndTargets
+	for _, rkt := range rkts {
+		kts = append(kts, rkt.kt)
+	}
+	descs, errs := tc.AddVotersMulti(kts...)
+	for _, err := range errs {
+		if err != nil && !testutils.IsError(err, "is already present") {
+			t.Fatal(err)
+		}
+	}
+
+	for _, desc := range descs {
+		rkt, ok := rkts[desc.RangeID]
+		if !ok {
+			continue
+		}
+
+		for _, target := range rkt.kt.Targets {
+			if err := tc.TransferRangeLease(desc, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+type rangeAndKT struct {
+	rangeDesc roachpb.RangeDescriptor
+	kt        serverutils.KeyAndTargets
 }
 
 type testClusterFactoryImpl struct{}

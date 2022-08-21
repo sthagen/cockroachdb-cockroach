@@ -73,14 +73,13 @@ type EventLogger interface {
 	// LogEvent writes to the event log.
 	LogEvent(
 		ctx context.Context,
-		descID descpb.ID,
 		details eventpb.CommonSQLEventDetails,
 		event logpb.EventPayload,
 	) error
 
 	// LogEventForSchemaChange write a schema change event entry into the event log.
 	LogEventForSchemaChange(
-		ctx context.Context, descID descpb.ID, event logpb.EventPayload,
+		ctx context.Context, event logpb.EventPayload,
 	) error
 }
 
@@ -138,6 +137,10 @@ type TransactionalJobRegistry interface {
 	//
 	// See (*jobs.Registry).CheckPausepoint
 	CheckPausepoint(name string) error
+
+	// UseLegacyGCJob indicate whether the legacy GC job should be used.
+	// This only matters for setting the initial RunningStatus.
+	UseLegacyGCJob(ctx context.Context) bool
 
 	// TODO(ajwerner): Deal with setting the running status to indicate
 	// validating, backfilling, or generally performing metadata changes

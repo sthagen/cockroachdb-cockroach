@@ -16,6 +16,7 @@ go_library(
         "schema_dependencies.go",
         "table_meta.go",
         "telemetry.go",
+        "values.go",
         ":gen-operator",  # keep
         ":gen-rulenames",  # keep
         ":gen-rulenames-stringer",  # keep
@@ -30,7 +31,6 @@ go_library(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",
-        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treebin",
         "//pkg/sql/sem/tree/treecmp",

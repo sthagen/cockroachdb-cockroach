@@ -616,7 +616,6 @@ SHOW CREATE t
 ----
 t  CREATE TABLE public.t (
    x INT8 NOT NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
    CONSTRAINT t_pkey PRIMARY KEY (x ASC)
 )
 
@@ -653,7 +652,6 @@ SHOW CREATE t
 ----
 t  CREATE TABLE public.t (
    x INT8 NOT NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
    CONSTRAINT my_pk PRIMARY KEY (x ASC)
 )
 
@@ -1742,3 +1740,31 @@ SELECT column_name FROM [SHOW COLUMNS FROM t_rowid] ORDER BY column_name;
 ----
 k
 v
+
+# The following subtest tests the case when the new primary key
+# intersects with the old primary key.
+subtest regression_85877
+
+statement ok
+CREATE TABLE t_85877(i INT NOT NULL, j INT NOT NULL, PRIMARY KEY (i))
+
+statement ok
+ALTER TABLE t_85877 ALTER PRIMARY KEY USING COLUMNS (i, j)
+
+statement ok
+DROP TABLE t_85877
+
+statement ok
+CREATE TABLE t_85877 (i INT NOT NULL, j INT NOT NULL, PRIMARY KEY (i, j))
+
+statement ok
+ALTER TABLE t_85877 ALTER PRIMARY KEY USING COLUMNS (i)
+
+statement ok
+DROP TABLE t_85877
+
+statement ok
+CREATE TABLE t_85877 (i INT NOT NULL, j INT NOT NULL, k INT NOT NULL, PRIMARY KEY (i, j))
+
+statement ok
+ALTER TABLE t_85877 ALTER PRIMARY KEY USING COLUMNS (j, k)

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
@@ -2601,12 +2600,15 @@ func (r *Replica) sendSnapshot(
 		return err
 	}
 
-	if ioThresh := r.store.ioOverloadedStores.Load()[recipient.StoreID]; ioThresh != nil && destPaused {
+	if destPaused {
 		// If the destination is paused, be more hesitant to send snapshots. The destination being
 		// paused implies that we have recently checked that it's not required for quorum, and that
 		// we wish to conserve I/O on that store, which sending a snapshot counteracts. So hold back on
 		// the snapshot as well.
-		return errors.Errorf("skipping snapshot; %s is overloaded: %s", recipient, ioThresh)
+		return errors.Errorf(
+			"skipping snapshot; %s is overloaded: %s",
+			recipient, r.store.ioThresholds.Current().IOThreshold(recipient.StoreID),
+		)
 	}
 
 	// Check follower snapshots cluster setting.
@@ -3319,8 +3321,7 @@ func (r *Replica) relocateOne(
 		}
 		// Determines whether we can remove the leaseholder without first
 		// transferring the lease away.
-		lhRemovalAllowed = len(args.votersToAdd) > 0 &&
-			r.store.cfg.Settings.Version.IsActive(ctx, clusterversion.EnableLeaseHolderRemoval)
+		lhRemovalAllowed = len(args.votersToAdd) > 0
 		curLeaseholder := b.RawResponse().Responses[0].GetLeaseInfo().Lease.Replica
 		shouldRemove = (curLeaseholder.StoreID != removalTarget.StoreID) || lhRemovalAllowed
 		if args.targetType == allocatorimpl.VoterTarget {

@@ -46,13 +46,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -153,6 +153,12 @@ var (
 		10*time.Second,
 		settings.NonNegativeDurationWithMaximum(maxGraphiteInterval),
 	).WithPublic()
+	redactServerTracesForSecondaryTenants = settings.RegisterBoolSetting(
+		settings.SystemOnly,
+		"server.secondary_tenants.redact_trace.enabled",
+		"controls if server side traces are redacted for tenant operations",
+		true,
+	).WithPublic()
 )
 
 type nodeMetrics struct {
@@ -212,7 +218,7 @@ type Node struct {
 	clusterID    *base.ClusterIDContainer // UUID for Cockroach cluster
 	Descriptor   roachpb.NodeDescriptor   // Node ID, network/physical topology
 	storeCfg     kvserver.StoreConfig     // Config to use and pass to stores
-	sqlExec      *sql.InternalExecutor    // For event logging
+	execCfg      *sql.ExecutorConfig      // For event logging
 	stores       *kvserver.Stores         // Access to node-local stores
 	metrics      nodeMetrics
 	recorder     *status.MetricsRecorder
@@ -368,7 +374,7 @@ func NewNode(
 		metrics:    makeNodeMetrics(reg, cfg.HistogramWindowInterval),
 		stores:     stores,
 		txnMetrics: txnMetrics,
-		sqlExec:    nil, // filled in later by InitLogger()
+		execCfg:    nil, // filled in later by InitLogger()
 		clusterID:  clusterID,
 		admissionController: kvserver.MakeKVAdmissionController(
 			kvAdmissionQ, storeGrantCoords, cfg.Settings),
@@ -385,7 +391,7 @@ func NewNode(
 // InitLogger connects the Node to the InternalExecutor to be used for event
 // logging.
 func (n *Node) InitLogger(execCfg *sql.ExecutorConfig) {
-	n.sqlExec = execCfg.InternalExecutor
+	n.execCfg = execCfg
 }
 
 // String implements fmt.Stringer.
@@ -407,9 +413,7 @@ func (n *Node) AnnotateCtxWithSpan(
 
 // start starts the node by registering the storage instance for the RPC
 // service "Node" and initializing stores for each specified engine.
-// Launches periodic store gossiping in a goroutine. A callback can
-// be optionally provided that will be invoked once this node's
-// NodeDescriptor is available, to help bootstrapping.
+// Launches periodic store gossiping in a goroutine.
 //
 // addr, sqlAddr, and httpAddr are used to populate the Address,
 // SQLAddress, and HTTPAddress fields respectively of the
@@ -426,7 +430,6 @@ func (n *Node) start(
 	attrs roachpb.Attributes,
 	locality roachpb.Locality,
 	localityAddress []roachpb.LocalityAddress,
-	nodeDescriptorCallback func(descriptor roachpb.NodeDescriptor),
 ) error {
 	n.initialStart = initialStart
 	n.startedAt = n.storeCfg.Clock.Now().WallTime
@@ -442,12 +445,6 @@ func (n *Node) start(
 		BuildTag:        build.GetInfo().Tag,
 		StartedAt:       n.startedAt,
 		HTTPAddress:     util.MakeUnresolvedAddr(httpAddr.Network(), httpAddr.String()),
-	}
-	// Invoke any passed in nodeDescriptorCallback as soon as it's available, to
-	// ensure that other components (currently the DistSQLPlanner) are initialized
-	// before store startup continues.
-	if nodeDescriptorCallback != nil {
-		nodeDescriptorCallback(n.Descriptor)
 	}
 
 	// Gossip the node descriptor to make this node addressable by node ID.
@@ -952,27 +949,11 @@ func (n *Node) recordJoinEvent(ctx context.Context) {
 		return
 	}
 
-	_ = n.stopper.RunAsyncTask(ctx, "record-join", func(bgCtx context.Context) {
-		ctx, span := n.AnnotateCtxWithSpan(bgCtx, "record-join-event")
-		defer span.Finish()
-		retryOpts := base.DefaultRetryOptions()
-		retryOpts.Closer = n.stopper.ShouldQuiesce()
-		for r := retry.Start(retryOpts); r.Next(); {
-			if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				return sql.InsertEventRecords(ctx, n.sqlExec,
-					txn,
-					int32(n.Descriptor.NodeID), /* reporting ID: the node where the event is logged */
-					sql.LogToSystemTable|sql.LogToDevChannelIfVerbose, /* LogEventDestination: we already call log.StructuredEvent above */
-					int32(n.Descriptor.NodeID),                        /* target ID: the node that is joining (ourselves) */
-					event,
-				)
-			}); err != nil {
-				log.Warningf(ctx, "%s: unable to log event %v: %v", n, event, err)
-			} else {
-				return
-			}
-		}
-	})
+	// InsertEventRecord processes the event asynchronously.
+	sql.InsertEventRecords(ctx, n.execCfg,
+		sql.LogToSystemTable|sql.LogToDevChannelIfVerbose, /* not LogExternally: we already call log.StructuredEvent above */
+		event,
+	)
 }
 
 // If we receive a (proto-marshaled) roachpb.BatchRequest whose Requests contain
@@ -1097,6 +1078,7 @@ type spanForRequest struct {
 	sp            *tracing.Span
 	needRecording bool
 	tenID         roachpb.TenantID
+	settings      *cluster.Settings
 }
 
 // finish finishes the span. If the span was recording and br is not nil, the
@@ -1114,17 +1096,15 @@ func (sp *spanForRequest) finish(ctx context.Context, br *roachpb.BatchResponse)
 
 	rec = sp.sp.FinishAndGetConfiguredRecording()
 	if rec != nil {
-		// Decide if the trace for this RPC, if any, will need to be redacted. It
-		// needs to be redacted if the response goes to a tenant. In case the request
-		// is local, then the trace might eventually go to a tenant (and tenID might
-		// be set), but it will go to the tenant only indirectly, through the response
-		// of a parent RPC. In that case, that parent RPC is responsible for the
-		// redaction.
+		// Decide if the trace for this RPC, if any, will need to be redacted. In
+		// general, responses sent to a tenant are redacted unless indicated
+		// otherwise by the cluster setting below.
 		//
-		// Tenants get a redacted recording, i.e. with anything
-		// sensitive stripped out of the verbose messages. However,
-		// structured payloads stay untouched.
-		needRedaction := sp.tenID != roachpb.SystemTenantID
+		// Even if the recording sent to a tenant is redacted (anything sensitive
+		// is stripped out of the verbose messages), structured payloads
+		// stay untouched.
+		needRedaction := sp.tenID != roachpb.SystemTenantID &&
+			redactServerTracesForSecondaryTenants.Get(&sp.settings.SV)
 		if needRedaction {
 			if err := redactRecordingForTenant(sp.tenID, rec); err != nil {
 				log.Errorf(ctx, "error redacting trace recording: %s", err)
@@ -1151,11 +1131,15 @@ func (sp *spanForRequest) finish(ctx context.Context, br *roachpb.BatchResponse)
 func (n *Node) setupSpanForIncomingRPC(
 	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest,
 ) (context.Context, spanForRequest) {
-	return setupSpanForIncomingRPC(ctx, tenID, ba, n.storeCfg.AmbientCtx.Tracer)
+	return setupSpanForIncomingRPC(ctx, tenID, ba, n.storeCfg.AmbientCtx.Tracer, n.storeCfg.Settings)
 }
 
 func setupSpanForIncomingRPC(
-	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest, tr *tracing.Tracer,
+	ctx context.Context,
+	tenID roachpb.TenantID,
+	ba *roachpb.BatchRequest,
+	tr *tracing.Tracer,
+	settings *cluster.Settings,
 ) (context.Context, spanForRequest) {
 	var newSpan *tracing.Span
 	parentSpan := tracing.SpanFromContext(ctx)
@@ -1199,6 +1183,7 @@ func setupSpanForIncomingRPC(
 		needRecording: needRecordingCollection,
 		tenID:         tenID,
 		sp:            newSpan,
+		settings:      settings,
 	}
 }
 
@@ -1237,6 +1222,12 @@ func (n *Node) RangeLookup(
 func (n *Node) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) error {
+	return n.singleRangeFeed(args, stream)
+}
+
+func (n *Node) singleRangeFeed(
+	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
+) error {
 	pErr := n.stores.RangeFeed(args, stream)
 	if pErr != nil {
 		var event roachpb.RangeFeedEvent
@@ -1246,6 +1237,78 @@ func (n *Node) RangeFeed(
 		return stream.Send(&event)
 	}
 	return nil
+}
+
+// setRangeIDEventSink annotates each response with range and stream IDs.
+// This is used by MuxRangeFeed.
+// TODO: This code can be removed in 22.2 once MuxRangeFeed is the default, and
+// the old style RangeFeed deprecated.
+type setRangeIDEventSink struct {
+	ctx      context.Context
+	rangeID  roachpb.RangeID
+	streamID int64
+	wrapped  *lockedMuxStream
+}
+
+func (s *setRangeIDEventSink) Context() context.Context {
+	return s.ctx
+}
+
+func (s *setRangeIDEventSink) Send(event *roachpb.RangeFeedEvent) error {
+	response := &roachpb.MuxRangeFeedEvent{
+		RangeFeedEvent: *event,
+		RangeID:        s.rangeID,
+		StreamID:       s.streamID,
+	}
+	return s.wrapped.Send(response)
+}
+
+var _ roachpb.RangeFeedEventSink = (*setRangeIDEventSink)(nil)
+
+// lockedMuxStream provides support for concurrent calls to Send.
+// The underlying MuxRangeFeedServer is not safe for concurrent calls to Send.
+type lockedMuxStream struct {
+	wrapped roachpb.Internal_MuxRangeFeedServer
+	sendMu  syncutil.Mutex
+}
+
+func (s *lockedMuxStream) Context() context.Context {
+	return s.wrapped.Context()
+}
+
+func (s *lockedMuxStream) Send(e *roachpb.MuxRangeFeedEvent) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.wrapped.Send(e)
+}
+
+// MuxRangeFeed implements the roachpb.InternalServer interface.
+func (n *Node) MuxRangeFeed(stream roachpb.Internal_MuxRangeFeedServer) error {
+	ctx, cancelFeeds := n.stopper.WithCancelOnQuiesce(stream.Context())
+	defer cancelFeeds()
+	rfGrp := ctxgroup.WithContext(ctx)
+
+	muxStream := &lockedMuxStream{wrapped: stream}
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			cancelFeeds()
+			return errors.CombineErrors(err, rfGrp.Wait())
+		}
+
+		rfGrp.GoCtx(func(ctx context.Context) error {
+			ctx, span := tracing.ForkSpan(logtags.AddTag(ctx, "r", req.RangeID), "mux-rf")
+			defer span.Finish()
+
+			sink := setRangeIDEventSink{
+				ctx:      ctx,
+				rangeID:  req.RangeID,
+				streamID: req.StreamID,
+				wrapped:  muxStream,
+			}
+			return n.singleRangeFeed(req, &sink)
+		})
+	}
 }
 
 // ResetQuorum implements the roachpb.InternalServer interface.

@@ -11,8 +11,6 @@
 package optbuilder
 
 import (
-	"reflect"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -33,6 +31,10 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 			panic(unimplemented.New("CREATE FUNCTION", "cross-db references not supported"))
 		}
 	}
+	if cf.ReturnType.IsSet {
+		panic(unimplemented.NewWithIssue(86391, "user-defined functions with SETOF return types are not supported"))
+	}
+
 	sch, resName := b.resolveSchemaForCreateFunction(&cf.FuncName)
 	schID := b.factory.Metadata().AddSchema(sch)
 	cf.FuncName.ObjectNamePrefix = resName
@@ -61,16 +63,16 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 		panic(unimplemented.New("CREATE FUNCTION sql_body", "CREATE FUNCTION...sql_body unimplemented"))
 	}
 
+	if err := tree.ValidateFuncOptions(cf.Options); err != nil {
+		panic(err)
+	}
+
 	// Look for function body string from function options.
 	// Note that function body can be an empty string.
 	funcBodyFound := false
 	languageFound := false
 	var funcBodyStr string
-	options := make(map[string]struct{})
 	for _, option := range cf.Options {
-		if _, ok := options[reflect.TypeOf(option).Name()]; ok {
-			panic(pgerror.New(pgcode.Syntax, "conflicting or redundant options"))
-		}
 		switch opt := option.(type) {
 		case tree.FunctionBodyStr:
 			funcBodyFound = true
@@ -95,8 +97,6 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 	// bodyScope is the base scope for each statement in the body. We add the
 	// named arguments to the scope so that references to them in the body can
 	// be resolved.
-	// TODO(mgartner): Support numeric argument references, like $1. We should
-	// error if there is a reference $n and less than n arguments.
 	bodyScope := b.allocScope()
 	for i := range cf.Args {
 		arg := &cf.Args[i]
@@ -104,14 +104,14 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 		if err != nil {
 			panic(err)
 		}
+		if err := maybeFailOnImplicitRecordType(typ); err != nil {
+			panic(err)
+		}
 
 		// Add the argument to the base scope of the body.
-		id := b.factory.Metadata().AddColumn(string(arg.Name), typ)
-		bodyScope.appendColumn(&scopeColumn{
-			name: scopeColName(arg.Name),
-			typ:  typ,
-			id:   id,
-		})
+		argColName := funcArgColName(arg.Name, i)
+		col := b.synthesizeColumn(bodyScope, argColName, typ, nil /* expr */, nil /* scalar */)
+		col.setArgOrd(i)
 
 		// Collect the user defined type dependencies.
 		typeIDs, err := typedesc.GetTypeDescriptorClosure(typ)
@@ -126,6 +126,9 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 	// Collect the user defined type dependency of the return type.
 	funcReturnType, err := tree.ResolveType(b.ctx, cf.ReturnType.Type, b.semaCtx.TypeResolver)
 	if err != nil {
+		panic(err)
+	}
+	if err := maybeFailOnImplicitRecordType(funcReturnType); err != nil {
 		panic(err)
 	}
 	typeIDs, err := typedesc.GetTypeDescriptorClosure(funcReturnType)
@@ -276,5 +279,15 @@ func validateReturnType(expected *types.T, cols []scopeColumn) error {
 		)
 	}
 
+	return nil
+}
+
+func maybeFailOnImplicitRecordType(t *types.T) error {
+	if types.IsOIDUserDefinedType(t.Oid()) && t.Family() == types.TupleFamily {
+		return unimplemented.NewWithIssue(
+			86393,
+			"implicit record types as argument or return types in user-defined functions are not supported",
+		)
+	}
 	return nil
 }

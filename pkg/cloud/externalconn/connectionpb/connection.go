@@ -15,13 +15,25 @@ import "github.com/cockroachdb/errors"
 // Type returns the ConnectionType of the receiver.
 func (d *ConnectionDetails) Type() ConnectionType {
 	switch d.Provider {
-	case ConnectionProvider_nodelocal, ConnectionProvider_s3, ConnectionProvider_userfile:
+	case ConnectionProvider_nodelocal, ConnectionProvider_s3, ConnectionProvider_userfile,
+		ConnectionProvider_gs, ConnectionProvider_azure_storage:
 		return TypeStorage
 	case ConnectionProvider_gcp_kms:
 		return TypeKMS
 	case ConnectionProvider_kafka:
 		return TypeStorage
 	default:
-		panic(errors.AssertionFailedf("ConnectionDetails.Type called on a details with an unknown type: %T", d.Provider.String()))
+		panic(errors.AssertionFailedf("ConnectionDetails.Type called on a details with an unknown type: %s", d.Provider.String()))
+	}
+}
+
+// UnredactedURI returns the unredacted URI of the resource represented by the
+// External Connection.
+func (d *ConnectionDetails) UnredactedURI() string {
+	switch c := d.Details.(type) {
+	case *ConnectionDetails_SimpleURI:
+		return c.SimpleURI.URI
+	default:
+		panic(errors.AssertionFailedf("ConnectionDetails.UnredactedURI called on details with an unknown type: %s", d.Provider.String()))
 	}
 }

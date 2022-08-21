@@ -282,7 +282,7 @@ type Server struct {
 	// reportedStatsController.
 	reportedStatsController *sslocal.Controller
 
-	insights insights.Registry
+	insights insights.Provider
 
 	reCache *tree.RegexpCache
 
@@ -358,14 +358,14 @@ type ServerMetrics struct {
 func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 	metrics := makeMetrics(false /* internal */)
 	serverMetrics := makeServerMetrics(cfg)
-	outliersRegistry := insights.New(cfg.Settings, serverMetrics.InsightsMetrics)
+	insightsProvider := insights.New(cfg.Settings, serverMetrics.InsightsMetrics)
 	reportedSQLStats := sslocal.New(
 		cfg.Settings,
 		sqlstats.MaxMemReportedSQLStatsStmtFingerprints,
 		sqlstats.MaxMemReportedSQLStatsTxnFingerprints,
 		serverMetrics.StatsMetrics.ReportedSQLStatsMemoryCurBytesCount,
 		serverMetrics.StatsMetrics.ReportedSQLStatsMemoryMaxBytesHist,
-		outliersRegistry,
+		insightsProvider.Writer(),
 		pool,
 		nil, /* reportedProvider */
 		cfg.SQLStatsTestingKnobs,
@@ -378,7 +378,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		sqlstats.MaxMemSQLStatsTxnFingerprints,
 		serverMetrics.StatsMetrics.SQLStatsMemoryCurBytesCount,
 		serverMetrics.StatsMetrics.SQLStatsMemoryMaxBytesHist,
-		outliersRegistry,
+		insightsProvider.Writer(),
 		pool,
 		reportedSQLStats,
 		cfg.SQLStatsTestingKnobs,
@@ -391,7 +391,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		pool:                    pool,
 		reportedStats:           reportedSQLStats,
 		reportedStatsController: reportedSQLStatsController,
-		insights:                outliersRegistry,
+		insights:                insightsProvider,
 		reCache:                 tree.NewRegexpCache(512),
 		indexUsageStats: idxusage.NewLocalIndexUsageStats(&idxusage.Config{
 			ChannelSize: idxusage.DefaultChannelSize,
@@ -545,6 +545,12 @@ func (s *Server) GetSchemaTelemetryController() *schematelemetrycontroller.Contr
 // sql.Server's index usage stats.
 func (s *Server) GetIndexUsageStatsController() *idxusage.Controller {
 	return s.indexUsageStatsController
+}
+
+// GetInsightsReader returns the insights.Reader for the current sql.Server's
+// detected execution insights.
+func (s *Server) GetInsightsReader() insights.Reader {
+	return s.insights.Reader()
 }
 
 // GetSQLStatsProvider returns the provider for the sqlstats subsystem.
@@ -986,6 +992,7 @@ func (s *Server) newConnExecutor(
 	}
 	ex.extraTxnState.prepStmtsNamespaceMemAcc = ex.sessionMon.MakeBoundAccount()
 	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(sdMutIterator.sds), ex.sessionMon)
+	ex.extraTxnState.jobs = new(jobsCollection)
 	ex.extraTxnState.txnRewindPos = -1
 	ex.extraTxnState.schemaChangeJobRecords = make(map[descpb.ID]*jobs.Record)
 	ex.extraTxnState.schemaChangerState = &SchemaChangerState{
@@ -1095,17 +1102,12 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 
 	ex.resetExtraTxnState(ctx, txnEvent{eventType: txnEvType})
 	if ex.hasCreatedTemporarySchema && !ex.server.cfg.TestingKnobs.DisableTempObjectsCleanupOnSessionExit {
-		ieMon := MakeInternalExecutorMemMonitor(MemoryMetrics{}, ex.server.cfg.Settings)
-		ieMon.StartNoReserved(ctx, ex.server.GetBytesMonitor())
-		defer ieMon.Stop(ctx)
-		ie := MakeInternalExecutor(ex.server, MemoryMetrics{}, ieMon)
 		err := cleanupSessionTempObjects(
 			ctx,
 			ex.server.cfg.Settings,
 			ex.server.cfg.CollectionFactory,
 			ex.server.cfg.DB,
 			ex.server.cfg.Codec,
-			&ie,
 			ex.sessionID,
 		)
 		if err != nil {
@@ -1243,7 +1245,7 @@ type connExecutor struct {
 		// job. The jobs are staged via the function QueueJob in
 		// pkg/sql/planner.go. The staged jobs are executed once the transaction
 		// that staged them commits.
-		jobs jobsCollection
+		jobs *jobsCollection
 
 		// schemaChangeJobRecords is a map of descriptor IDs to job Records.
 		// Used in createOrUpdateSchemaChangeJob so we can check if a job has been
@@ -1656,7 +1658,7 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 		for k := range ex.extraTxnState.schemaChangeJobRecords {
 			delete(ex.extraTxnState.schemaChangeJobRecords, k)
 		}
-		ex.extraTxnState.jobs = nil
+		ex.extraTxnState.jobs.reset()
 		ex.extraTxnState.schemaChangerState = &SchemaChangerState{
 			mode: ex.sessionData().NewSchemaChangerMode,
 		}
@@ -2335,7 +2337,7 @@ func isCopyToExternalStorage(cmd CopyIn) bool {
 // We handle the CopyFrom statement by creating a copyMachine and handing it
 // control over the connection until the copying is done. The contract is that,
 // when this is called, the pgwire.conn is not reading from the network
-// connection any more until this returns. The copyMachine will to the reading
+// connection any more until this returns. The copyMachine will do the reading
 // and writing up to the CommandComplete message.
 func (ex *connExecutor) execCopyIn(
 	ctx context.Context, cmd CopyIn,
@@ -2413,10 +2415,12 @@ func (ex *connExecutor) execCopyIn(
 	var cm copyMachineInterface
 	var err error
 	if isCopyToExternalStorage(cmd) {
-		cm, err = newFileUploadMachine(ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg)
+		cm, err = newFileUploadMachine(ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg, ex.state.mon)
 	} else {
+		// The planner will be prepared before use.
+		p := planner{execCfg: ex.server.cfg, alloc: &tree.DatumAlloc{}}
 		cm, err = newCopyMachine(
-			ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg,
+			ctx, cmd.Conn, cmd.Stmt, &p, txnOpt, ex.state.mon,
 			// execInsertPlan
 			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
 				_, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, DistributionTypeNone, nil /* progressAtomic */)
@@ -2429,7 +2433,11 @@ func (ex *connExecutor) execCopyIn(
 		payload := eventNonRetriableErrPayload{err: err}
 		return ev, payload, nil
 	}
-	if err := cm.run(ctx); err != nil {
+	defer cm.Close(ctx)
+
+	if err := ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
+		return cm.run(ctx)
+	}); err != nil {
 		// TODO(andrei): We don't have a retriable error story for the copy machine.
 		// When running outside of a txn, the copyMachine should probably do retries
 		// internally. When not, it's unclear what we should do. For now, we abort
@@ -2507,7 +2515,8 @@ var retriableMinTimestampBoundUnsatisfiableError = errors.Newf(
 func errIsRetriable(err error) bool {
 	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) ||
 		scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID ||
-		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError)
+		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
+		descs.IsTwoVersionInvariantViolationError(err)
 }
 
 // makeErrEvent takes an error and returns either an eventRetriableErr or an
@@ -2695,12 +2704,13 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			CatalogBuiltins:                &p.evalCatalogBuiltins,
 			QueryCancelKey:                 ex.queryCancelKey,
 			DescIDGenerator:                ex.getDescIDGenerator(),
+			RangeStatsFetcher:              p.execCfg.RangeStatsFetcher,
 		},
 		Tracing:                &ex.sessionTracing,
 		MemMetrics:             &ex.memMetrics,
 		Descs:                  ex.extraTxnState.descCollection,
 		TxnModesSetter:         ex,
-		Jobs:                   &ex.extraTxnState.jobs,
+		Jobs:                   ex.extraTxnState.jobs,
 		SchemaChangeJobRecords: ex.extraTxnState.schemaChangeJobRecords,
 		statsProvider:          ex.server.sqlStats,
 		indexUsageStats:        ex.indexUsageStats,
@@ -2738,6 +2748,7 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.PrepareOnly = false
 	evalCtx.SkipNormalize = false
 	evalCtx.SchemaChangerState = ex.extraTxnState.schemaChangerState
+	evalCtx.DescIDGenerator = ex.getDescIDGenerator()
 
 	// If we are retrying due to an unsatisfiable timestamp bound which is
 	// retriable, it means we were unable to serve the previous minimum timestamp
@@ -2969,7 +2980,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		if err := ex.server.cfg.JobRegistry.Run(
 			ex.ctxHolder.connCtx,
 			ex.server.cfg.InternalExecutor,
-			ex.extraTxnState.jobs,
+			*ex.extraTxnState.jobs,
 		); err != nil {
 			handleErr(err)
 		}

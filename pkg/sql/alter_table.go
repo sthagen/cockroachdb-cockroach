@@ -487,15 +487,17 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			if t.Column == colinfo.TTLDefaultExpirationColumnName && n.tableDesc.HasRowLevelTTL() {
-				return errors.WithHintf(
-					pgerror.Newf(
-						pgcode.InvalidTableDefinition,
-						`cannot drop column %s while row-level TTL is active`,
-						t.Column,
-					),
-					"use ALTER TABLE %s RESET (ttl) instead",
-					tree.Name(n.tableDesc.GetName()),
-				)
+				if ttlInfo := n.tableDesc.GetRowLevelTTL(); ttlInfo.DurationExpr != "" {
+					return errors.WithHintf(
+						pgerror.Newf(
+							pgcode.InvalidTableDefinition,
+							`cannot drop column %s while row-level TTL is active`,
+							t.Column,
+						),
+						"use ALTER TABLE %[1]s RESET (ttl) or ALTER TABLE %[1]s SET (ttl_expiration_expression = ...) instead",
+						tree.Name(n.tableDesc.GetName()),
+					)
+				}
 			}
 
 			colDroppedViews, err := dropColumnImpl(params, tn, n.tableDesc, t)
@@ -732,7 +734,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableSetStorageParams:
-			oldTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
 			var ttlBefore *catpb.RowLevelTTL
 			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
 				ttlBefore = protoutil.Clone(ttl).(*catpb.RowLevelTTL)
@@ -757,15 +758,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-			newTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
-			if err := checkDisallowedAutoStatsSettingChange(
-				params, oldTableHasAutoStatsSettings, newTableHasAutoStatsSettings,
-			); err != nil {
-				return err
-			}
-
 		case *tree.AlterTableResetStorageParams:
-			oldTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
 			var ttlBefore *catpb.RowLevelTTL
 			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
 				ttlBefore = protoutil.Clone(ttl).(*catpb.RowLevelTTL)
@@ -785,13 +778,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 				n.tableDesc,
 				ttlBefore,
 				n.tableDesc.GetRowLevelTTL(),
-			); err != nil {
-				return err
-			}
-
-			newTableHasAutoStatsSettings := n.tableDesc.GetAutoStatsSettings() != nil
-			if err := checkDisallowedAutoStatsSettingChange(
-				params, oldTableHasAutoStatsSettings, newTableHasAutoStatsSettings,
 			); err != nil {
 				return err
 			}
@@ -1666,8 +1652,12 @@ func dropColumnImpl(
 		}
 	}
 
-	// We cannot remove this column if there are computed columns that use it.
+	// We cannot remove this column if there are computed columns or a TTL
+	// expiration expression that use it.
 	if err := schemaexpr.ValidateColumnHasNoDependents(tableDesc, colToDrop); err != nil {
+		return nil, err
+	}
+	if err := schemaexpr.ValidateTTLExpressionDoesNotDependOnColumn(tableDesc, colToDrop); err != nil {
 		return nil, err
 	}
 
@@ -1859,13 +1849,6 @@ func handleTTLStorageParamChange(
 	tableDesc *tabledesc.Mutable,
 	before, after *catpb.RowLevelTTL,
 ) error {
-
-	if before == nil && after != nil {
-		if err := checkTTLEnabledForCluster(params.ctx, params.p.ExecCfg().Settings); err != nil {
-			return err
-		}
-	}
-
 	// update existing config
 	if before != nil && after != nil {
 
@@ -1976,8 +1959,6 @@ func handleTTLStorageParamChange(
 		if before.HasDurationExpr() {
 			// Keep the TTL from beforehand, but create the DROP COLUMN job and the
 			// associated mutation.
-			tableDesc.RowLevelTTL = before
-
 			droppedViews, err := dropColumnImpl(params, tn, tableDesc, &tree.AlterTableDropColumn{
 				Column: colinfo.TTLDefaultExpirationColumnName,
 			})
@@ -1988,6 +1969,7 @@ func handleTTLStorageParamChange(
 			if len(droppedViews) > 0 {
 				return pgerror.Newf(pgcode.InvalidParameterValue, "cannot drop TTL automatic column if it is depended on by a view")
 			}
+			tableDesc.RowLevelTTL = before
 
 			tableDesc.AddModifyRowLevelTTLMutation(
 				&descpb.ModifyRowLevelTTL{RowLevelTTL: before},
@@ -1996,19 +1978,11 @@ func handleTTLStorageParamChange(
 		}
 	}
 
-	return nil
-}
-
-func checkDisallowedAutoStatsSettingChange(
-	params runParams, oldTableHasAutoStatsSettings, newTableHasAutoStatsSettings bool,
-) error {
-	if !oldTableHasAutoStatsSettings && !newTableHasAutoStatsSettings {
-		// Do not have to do anything here.
-		return nil
-	}
-
-	if err := checkAutoStatsTableSettingsEnabledForCluster(params.ctx, params.p.ExecCfg().Settings); err != nil {
-		return err
+	// Validate the type and volatility of ttl_expiration_expression.
+	if after != nil && after.HasExpirationExpr() {
+		if err := schemaexpr.ValidateTTLExpirationExpression(params.ctx, tableDesc, params.p.SemaCtx(), tn); err != nil {
+			return err
+		}
 	}
 
 	return nil

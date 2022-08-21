@@ -92,7 +92,7 @@ var (
 // scan           [t=<name>] [ts=<int>[,<int>]]                         [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [skipLocked] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [allowEmpty]
 // export         [k=<key>] [end=<key>] [ts=<int>[,<int>]] [kTs=<int>[,<int>]] [startTs=<int>[,<int>]] [maxIntents=<int>] [allRevisions] [targetSize=<int>] [maxSize=<int>] [stopMidKey]
 //
-// iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [pointSynthesis [emitOnSeekGE]] [maskBelow=<int>[,<int>]]
+// iter_new       [k=<key>] [end=<key>] [prefix] [kind=key|keyAndIntents] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [pointSynthesis] [maskBelow=<int>[,<int>]]
 // iter_new_incremental [k=<key>] [end=<key>] [startTs=<int>[,<int>]] [endTs=<int>[,<int>]] [types=pointsOnly|pointsWithRanges|pointsAndRanges|rangesOnly] [maskBelow=<int>[,<int>]] [intents=error|aggregate|emit]
 // iter_seek_ge   k=<key> [ts=<int>[,<int>]]
 // iter_seek_lt   k=<key> [ts=<int>[,<int>]]
@@ -110,6 +110,8 @@ var (
 // clear_range    k=<key> end=<key>
 // clear_rangekey k=<key> end=<key> ts=<int>[,<int>]
 // clear_time_range k=<key> end=<key> ts=<int>[,<int>] targetTs=<int>[,<int>] [clearRangeThreshold=<int>] [maxBatchSize=<int>] [maxBatchByteSize=<int>]
+//
+// gc_clear_range k=<key> end=<key> startTs=<int>[,<int>] ts=<int>[,<int>]
 //
 // sst_put            [ts=<int>[,<int>]] [localTs=<int>[,<int>]] k=<key> [v=<string>]
 // sst_put_rangekey   ts=<int>[,<int>] [localTS=<int>[,<int>]] k=<key> end=<key>
@@ -668,6 +670,7 @@ var commands = map[string]cmd{
 	"del_range_pred":   {typDataUpdate, cmdDeleteRangePredicate},
 	"export":           {typReadOnly, cmdExport},
 	"get":              {typReadOnly, cmdGet},
+	"gc_clear_range":   {typDataUpdate, cmdGCClearRange},
 	"increment":        {typDataUpdate, cmdIncrement},
 	"initput":          {typDataUpdate, cmdInitPut},
 	"merge":            {typDataUpdate, cmdMerge},
@@ -946,6 +949,16 @@ func cmdClearTimeRange(e *evalCtx) error {
 		e.results.buf.Printf("clear_time_range: resume=%s\n", resume)
 	}
 	return nil
+}
+
+func cmdGCClearRange(e *evalCtx) error {
+	key, endKey := e.getKeyRange()
+	gcTs := e.getTs(nil)
+	return e.withWriter("gc_clear_range", func(rw ReadWriter) error {
+		cms, err := ComputeStats(rw, key, endKey, 100e9)
+		require.NoError(e.t, err, "failed to compute range stats")
+		return MVCCGarbageCollectWholeRange(e.ctx, rw, e.ms, key, endKey, gcTs, cms)
+	})
 }
 
 func cmdCPut(e *evalCtx) error {
@@ -1433,11 +1446,15 @@ func cmdIterNew(e *evalCtx) error {
 	}
 
 	r, closer := metamorphicReader(e)
-	e.iter = &iterWithCloser{r.NewMVCCIterator(kind, opts), closer}
-
+	iter := r.NewMVCCIterator(kind, opts)
 	if e.hasArg("pointSynthesis") {
-		e.iter = newPointSynthesizingIter(e.mvccIter(), e.hasArg("emitOnSeekGE"))
+		iter = newPointSynthesizingIter(iter)
 	}
+	if opts.Prefix != iter.IsPrefix() {
+		return errors.Errorf("prefix iterator returned IsPrefix=false")
+	}
+
+	e.iter = &iterWithCloser{iter, closer}
 	e.iterRangeKeys.Clear()
 	return nil
 }

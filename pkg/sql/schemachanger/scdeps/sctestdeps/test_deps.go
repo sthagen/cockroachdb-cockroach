@@ -859,6 +859,11 @@ func (s *TestState) CheckPausepoint(name string) error {
 	return nil
 }
 
+// UseLegacyGCJob is false.
+func (s *TestState) UseLegacyGCJob(ctx context.Context) bool {
+	return false
+}
+
 // UpdateSchemaChangeJob implements the scexec.TransactionalJobRegistry interface.
 func (s *TestState) UpdateSchemaChangeJob(
 	ctx context.Context, id jobspb.JobID, fn scexec.JobUpdateCallback,
@@ -995,22 +1000,15 @@ func (s *TestState) IndexValidator() scexec.IndexValidator {
 
 // LogEvent implements scexec.EventLogger.
 func (s *TestState) LogEvent(
-	_ context.Context,
-	descID descpb.ID,
-	details eventpb.CommonSQLEventDetails,
-	event logpb.EventPayload,
+	_ context.Context, details eventpb.CommonSQLEventDetails, event logpb.EventPayload,
 ) error {
-	s.LogSideEffectf("write %T to event log for descriptor #%d: %s",
-		event, descID, details.Statement)
+	s.LogSideEffectf("write %T to event log: %s", event, details.Statement)
 	return nil
 }
 
 // LogEventForSchemaChange implements scexec.EventLogger
-func (s *TestState) LogEventForSchemaChange(
-	ctx context.Context, descID descpb.ID, event logpb.EventPayload,
-) error {
-	s.LogSideEffectf("write %T to event log for descriptor %d",
-		event, descID)
+func (s *TestState) LogEventForSchemaChange(ctx context.Context, event logpb.EventPayload) error {
+	s.LogSideEffectf("write %T to event log", event)
 	return nil
 }
 
@@ -1043,7 +1041,7 @@ func (s *TestState) DeleteDescriptorComment(
 	return nil
 }
 
-//UpsertConstraintComment implements scexec.DescriptorMetadataUpdater.
+// UpsertConstraintComment implements scexec.DescriptorMetadataUpdater.
 func (s *TestState) UpsertConstraintComment(
 	tableID descpb.ID, constraintID descpb.ConstraintID, comment string,
 ) error {
@@ -1052,7 +1050,7 @@ func (s *TestState) UpsertConstraintComment(
 	return nil
 }
 
-//DeleteConstraintComment implements scexec.DescriptorMetadataUpdater.
+// DeleteConstraintComment implements scexec.DescriptorMetadataUpdater.
 func (s *TestState) DeleteConstraintComment(
 	tableID descpb.ID, constraintID descpb.ConstraintID,
 ) error {
@@ -1181,4 +1179,14 @@ func (s *TestState) ResolveFunctionByOID(
 		}
 	}
 	return "", nil, errors.Newf("function %d not found", oid)
+}
+
+// ZoneConfigGetter implement scexec.Dependencies.
+func (s *TestState) ZoneConfigGetter() scbuild.ZoneConfigGetter {
+	return s
+}
+
+// GetZoneConfig implements scexec.Dependencies.
+func (s *TestState) GetZoneConfig(ctx context.Context, id descpb.ID) (*zonepb.ZoneConfig, error) {
+	return s.zoneConfigs[id], nil
 }

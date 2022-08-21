@@ -52,6 +52,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/corpus"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -233,6 +236,19 @@ import (
 //  - awaitstatement <name>
 //    Completes a pending statement with the provided name, validating its
 //    results as expected per the given options to "statement async <name>...".
+//
+//  - copy,copy-error
+//    Runs a COPY FROM STDIN statement, because of the separate data chunk it requires
+//    special logictest support. Format is:
+//      copy
+//      COPY <table> FROM STDIN;
+//      <blankline>
+//      COPY DATA
+//      ----
+//      <NUMROWS>
+//
+//    copy-error is just like copy but an error is expected and results should be error
+//    string.
 //
 //  - query <typestring> <options> <label>
 //    Runs the query that follows and verifies the results (specified after the
@@ -510,6 +526,10 @@ var (
 		"optimizer-cost-perturbation", 0,
 		"randomly perturb the estimated cost of each expression in the query tree by at most the "+
 			"given fraction for the purpose of creating alternate query plans in the optimizer.")
+	saveDeclarativeCorpus = flag.String(
+		"declarative-corpus", "",
+		"enables generation and storage of a declarative schema changer	corpus",
+	)
 )
 
 const queryRewritePlaceholderPrefix = "__async_query_rewrite_placeholder"
@@ -721,28 +741,32 @@ func valueSort(numCols int, values []string) {
 // This is useful when comparing results for a statement that guarantees a
 // partial, but not a total order. Consider:
 //
-//   SELECT a, b FROM ab ORDER BY a
+//	SELECT a, b FROM ab ORDER BY a
 //
 // Some possible outputs for the same data:
-//   1 2        1 5        1 2
-//   1 5        1 4        1 4
-//   1 4   or   1 2   or   1 5
-//   2 3        2 2        2 3
-//   2 2        2 3        2 2
+//
+//	1 2        1 5        1 2
+//	1 5        1 4        1 4
+//	1 4   or   1 2   or   1 5
+//	2 3        2 2        2 3
+//	2 2        2 3        2 2
 //
 // After a partialSort with orderedCols = {0} all become:
-//   1 2
-//   1 4
-//   1 5
-//   2 2
-//   2 3
+//
+//	1 2
+//	1 4
+//	1 5
+//	2 2
+//	2 3
 //
 // An incorrect output like:
-//   1 5                          1 2
-//   1 2                          1 5
-//   2 3          becomes:        2 2
-//   2 2                          2 3
-//   1 4                          1 4
+//
+//	1 5                          1 2
+//	1 2                          1 5
+//	2 3          becomes:        2 2
+//	2 2                          2 3
+//	1 4                          1 4
+//
 // and it is detected as different.
 func partialSort(numCols int, orderedCols []int, values []string) {
 	// We use rowSorter here only as a container.
@@ -885,6 +909,8 @@ type logicTest struct {
 	// lifetime of the test and we should create all clusters with the same
 	// arguments.
 	clusterOpts []clusterOpt
+	// knobOpts are the options used to create testing knobs.
+	knobOpts []knobOpt
 	// tenantClusterSettingOverrideOpts are the options used by the host cluster
 	// to configure tenant setting overrides  during setup. They're persisted here
 	// because a cluster can be recreated throughout the lifetime of a test, and
@@ -966,6 +992,10 @@ type logicTest struct {
 	// entire test to be skipped and the below skippedOnRetry to be set to true.
 	skipOnRetry    bool
 	skippedOnRetry bool
+
+	// declarativeCorpusCollector used to save declarative schema changer state
+	// to disk.
+	declarativeCorpusCollector *corpus.Collector
 }
 
 func (t *logicTest) t() *testing.T {
@@ -1136,8 +1166,13 @@ func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
 func (t *logicTest) newCluster(
 	serverArgs TestServerArgs,
 	clusterOpts []clusterOpt,
+	knobOpts []knobOpt,
 	tenantClusterSettingOverrideOpts []tenantClusterSettingOverrideOpt,
 ) {
+	var corpusCollectionCallback func(p scplan.Plan, stageIdx int) error
+	if serverArgs.DeclarativeCorpusCollection && t.declarativeCorpusCollector != nil {
+		corpusCollectionCallback = t.declarativeCorpusCollector.GetBeforeStage(t.rootT.Name(), t.t())
+	}
 	// TODO(andrei): if createTestServerParams() is used here, the command filter
 	// it installs detects a transaction that doesn't have
 	// modifiedSystemConfigSpan set even though it should, for
@@ -1179,6 +1214,9 @@ func (t *logicTest) newCluster(
 				SQLStatsKnobs: &sqlstats.TestingKnobs{
 					AOSTClause: "AS OF SYSTEM TIME '-1us'",
 				},
+				SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+					BeforeStage: corpusCollectionCallback,
+				},
 			},
 			ClusterName:   "testclustername",
 			ExternalIODir: t.sharedIODir,
@@ -1210,7 +1248,12 @@ func (t *logicTest) newCluster(
 		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).DisableAutomaticVersionUpgrade = make(chan struct{})
 	}
 	for _, opt := range clusterOpts {
+		t.rootT.Logf("apply cluster opt %T", opt)
 		opt.apply(&params.ServerArgs)
+	}
+	for _, opt := range knobOpts {
+		t.rootT.Logf("apply knob opt %T", opt)
+		opt.apply(&params.ServerArgs.Knobs)
 	}
 
 	paramsPerNode := map[int]base.TestServerArgs{}
@@ -1301,6 +1344,11 @@ func (t *logicTest) newCluster(
 				TracingDefault:    params.ServerArgs.TracingDefault,
 				// Give every tenant its own ExternalIO directory.
 				ExternalIODir: path.Join(t.sharedIODir, strconv.Itoa(i)),
+			}
+
+			for _, opt := range knobOpts {
+				t.rootT.Logf("apply knob opt %T to tenant", opt)
+				opt.apply(&tenantArgs.TestingKnobs)
 			}
 
 			tenant, err := t.cluster.Server(i).StartTenant(context.Background(), tenantArgs)
@@ -1582,7 +1630,7 @@ func (t *logicTest) resetCluster() {
 		t.Fatal("resetting the cluster before server args were set")
 	}
 	serverArgs := *t.serverArgs
-	t.newCluster(serverArgs, t.clusterOpts, t.tenantClusterSettingOverrideOpts)
+	t.newCluster(serverArgs, t.clusterOpts, t.knobOpts, t.tenantClusterSettingOverrideOpts)
 }
 
 // setup creates the initial cluster for the logic test and populates the
@@ -1593,11 +1641,14 @@ func (t *logicTest) setup(
 	cfg logictestbase.TestClusterConfig,
 	serverArgs TestServerArgs,
 	clusterOpts []clusterOpt,
+	knobOpts []knobOpt,
 	tenantClusterSettingOverrideOpts []tenantClusterSettingOverrideOpt,
 ) {
 	t.cfg = cfg
 	t.serverArgs = &serverArgs
+	t.serverArgs.DeclarativeCorpusCollection = cfg.DeclarativeCorpusCollection
 	t.clusterOpts = clusterOpts[:]
+	t.knobOpts = knobOpts[:]
 	t.tenantClusterSettingOverrideOpts = tenantClusterSettingOverrideOpts[:]
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
@@ -1605,7 +1656,7 @@ func (t *logicTest) setup(
 	t.sharedIODir = tempExternalIODir
 	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
 
-	t.newCluster(serverArgs, t.clusterOpts, t.tenantClusterSettingOverrideOpts)
+	t.newCluster(serverArgs, t.clusterOpts, t.knobOpts, t.tenantClusterSettingOverrideOpts)
 
 	// Only create the test database on the initial cluster, since cluster restore
 	// expects an empty cluster.
@@ -1711,6 +1762,27 @@ func (c clusterOptTracingOff) apply(args *base.TestServerArgs) {
 	args.TracingDefault = tracing.TracingModeOnDemand
 }
 
+// knobOpt is implemented by options for configuring the testing knobs
+// for the cluster under which a test will run.
+type knobOpt interface {
+	apply(args *base.TestingKnobs)
+}
+
+// knobOptSynchronousEventLog corresponds to the sync write
+// event log testing knob.
+type knobOptSynchronousEventLog struct{}
+
+var _ knobOpt = knobOptSynchronousEventLog{}
+
+// apply implements the clusterOpt interface.
+func (c knobOptSynchronousEventLog) apply(args *base.TestingKnobs) {
+	_, ok := args.EventLog.(*sql.EventLogTestingKnobs)
+	if !ok {
+		args.EventLog = &sql.EventLogTestingKnobs{}
+	}
+	args.EventLog.(*sql.EventLogTestingKnobs).SyncWrites = true
+}
+
 // clusterOptIgnoreStrictGCForTenants corresponds to the
 // ignore-tenant-strict-gc-enforcement directive.
 type clusterOptIgnoreStrictGCForTenants struct{}
@@ -1726,6 +1798,16 @@ func (c clusterOptIgnoreStrictGCForTenants) apply(args *base.TestServerArgs) {
 	args.Knobs.Store.(*kvserver.StoreTestingKnobs).IgnoreStrictGCEnforcement = true
 }
 
+// knobOptDisableCorpusGeneration disables corpus generation for declarative
+// schema changer.
+type knobOptDisableCorpusGeneration struct{}
+
+var _ knobOpt = knobOptDisableCorpusGeneration{}
+
+func (c knobOptDisableCorpusGeneration) apply(args *base.TestingKnobs) {
+	args.SQLDeclarativeSchemaChanger = nil
+}
+
 // parseDirectiveOptions looks around the beginning of the file for a line
 // looking like:
 // # <directiveName>: opt1 opt2 ...
@@ -1733,7 +1815,7 @@ func (c clusterOptIgnoreStrictGCForTenants) apply(args *base.TestServerArgs) {
 // invoked with each option.
 func parseDirectiveOptions(t *testing.T, path string, directiveName string, f func(opt string)) {
 	switch directiveName {
-	case "cluster-opt", "tenant-cluster-setting-override-opt":
+	case "knob-opt", "cluster-opt", "tenant-cluster-setting-override-opt":
 		// Fallthrough.
 	default:
 		t.Fatalf("cannot parse unknown directive %s", directiveName)
@@ -1804,6 +1886,25 @@ func readTenantClusterSettingOverrideArgs(
 			res = append(res, tenantClusterSettingOverrideMultiTenantMultiRegionAbstractionsAllowed{})
 		default:
 			t.Fatalf("unrecognized cluster option: %s", opt)
+		}
+	})
+	return res
+}
+
+// readKnobOptions looks around the beginning of the file for a line looking like:
+// # knob-opt: opt1 opt2 ...
+// and parses that line into a set of knobOpts that need to be applied to the
+// TestServerArgs.Knobs before the cluster is started for the respective test file.
+func readKnobOptions(t *testing.T, path string) []knobOpt {
+	var res []knobOpt
+	parseDirectiveOptions(t, path, "knob-opt", func(opt string) {
+		switch opt {
+		case "disable-corpus-generation":
+			res = append(res, knobOptDisableCorpusGeneration{})
+		case "sync-event-log":
+			res = append(res, knobOptSynchronousEventLog{})
+		default:
+			t.Fatalf("unrecognized knob option: %s", opt)
 		}
 	})
 	return res
@@ -2259,6 +2360,63 @@ func (t *logicTest) processSubtest(
 			}
 
 			delete(t.pendingQueries, name)
+			t.success(path)
+
+		case "copy", "copy-error":
+			expectError := cmd == "copy-error"
+			var query logicQuery
+			query.pos = fmt.Sprintf("\n%s:%d", path, s.Line+subtest.lineLineIndexIntoFile)
+			gotsep, err := query.readSQL(t, s, true /* allowSeparator */)
+			if err != nil {
+				return err
+			}
+			if gotsep {
+				return errors.Errorf("%s: unexpected ---- separator, copy statement and data have to separated by empty line", query.pos)
+			}
+			var data bytes.Buffer
+			sep := false
+			for s.Scan() {
+				line := s.Text()
+				t.emit(line)
+				if line == "----" {
+					sep = true
+					break
+				}
+				fmt.Fprintln(&data, line)
+			}
+			if !sep {
+				return errors.Errorf("%s: expected ---- separator at end of copy data", query.pos)
+			}
+			// TODO(cucaroach): This is broken, t.cluster.Server(0) may not be
+			// the same tenant as t.db points to, for now the copy tests disable
+			// the 3node-tenant config but we should fix this. Also RunCopyFrom
+			// does an end run around the t.db connection entirely and runs
+			// copies w/o using the client protocol at all, not ideal but the go
+			// sql.DB interface doesn't support COPY so fixing it the right way
+			// that would require major surgery (ie making logictest use libpq
+			// or something low level like that).
+			rows, err := sql.RunCopyFrom(context.Background(), t.cluster.Server(0), "test", nil, query.sql, []string{data.String()})
+			result := fmt.Sprintf("%d", rows)
+			if err != nil {
+				if !expectError {
+					return err
+				}
+				result = err.Error()
+			} else if expectError {
+				return errors.Errorf("%s: copy-error expected error did not occur", query.pos)
+			}
+			if *rewriteResultsInTestfiles {
+				t.emit(result)
+			}
+			if s.Scan() {
+				exp := s.Text()
+				if !*rewriteResultsInTestfiles && result != exp {
+					return errors.Errorf("%s: got %s, expected %s", query.pos, result, exp)
+				}
+			} else if !*rewriteResultsInTestfiles {
+				return errors.Errorf("EOF looking for expected copy results")
+			}
+			t.finishOne("OK")
 			t.success(path)
 
 		case "query":
@@ -3539,9 +3697,6 @@ SELECT encode(descriptor, 'hex') AS descriptor
 }
 
 func (t *logicTest) maybeDropDatabases() error {
-	if t.cfg.SkipDropDatabases {
-		return nil
-	}
 	var dbNames pq.StringArray
 	if err := t.db.QueryRow(
 		`SELECT array_agg(database_name) FROM [SHOW DATABASES] WHERE database_name NOT IN ('system', 'postgres')`,
@@ -3621,6 +3776,9 @@ type TestServerArgs struct {
 	ForceProductionValues bool
 	// If set, then sql.distsql.temp_storage.workmem is not randomized.
 	DisableWorkmemRandomization bool
+	// DeclarativeCorpusCollection corpus will be collected for the declarative
+	// schema changer.
+	DeclarativeCorpusCollection bool
 }
 
 // RunLogicTests runs logic tests for all files matching the given glob.
@@ -3682,12 +3840,28 @@ func RunLogicTest(
 		skip.IgnoreLint(t, "config does not match env var")
 	}
 
+	var cc *corpus.Collector
+	if *saveDeclarativeCorpus != "" {
+		var err error
+		cc, err = corpus.NewCorpusCollector(*saveDeclarativeCorpus)
+		if err != nil {
+			t.Fatalf("failed to create collector %v", err)
+		}
+		defer func() {
+			err := cc.UpdateCorpus()
+			if err != nil {
+				t.Fatalf("failed writing decalarative schema changer corpus: %v", err)
+			}
+		}()
+	}
+
 	rng, _ := randutil.NewTestRand()
 	lt := logicTest{
-		rootT:           t,
-		verbose:         verbose,
-		perErrorSummary: make(map[string][]string),
-		rng:             rng,
+		rootT:                      t,
+		verbose:                    verbose,
+		perErrorSummary:            make(map[string][]string),
+		rng:                        rng,
+		declarativeCorpusCollector: cc,
 	}
 	if *printErrorSummary {
 		defer lt.printErrorSummary()
@@ -3696,7 +3870,7 @@ func RunLogicTest(
 	serverArgsCopy := serverArgs
 	serverArgsCopy.ForceProductionValues = serverArgs.ForceProductionValues || onlyNonMetamorphic
 	lt.setup(
-		config, serverArgsCopy, readClusterOptions(t, path), readTenantClusterSettingOverrideArgs(t, path),
+		config, serverArgsCopy, readClusterOptions(t, path), readKnobOptions(t, path), readTenantClusterSettingOverrideArgs(t, path),
 	)
 	lt.runFile(path, config)
 

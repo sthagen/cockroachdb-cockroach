@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
@@ -30,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -386,9 +384,7 @@ func (r *Replica) propose(
 		// will be used as a target for the lease transfer). Otherwise, the caller
 		// is expected to shed the lease before entering a joint configuration.
 		// See also https://github.com/cockroachdb/cockroach/issues/67740.
-		lhRemovalAllowed := r.store.cfg.Settings.Version.IsActive(
-			ctx, clusterversion.EnableLeaseHolderRemoval)
-		lhDescriptor, err := r.GetReplicaDescriptor()
+		lhDesc, err := r.GetReplicaDescriptor()
 		if err != nil {
 			return roachpb.NewError(err)
 		}
@@ -401,11 +397,11 @@ func (r *Replica) propose(
 		// transferred away. The previous leaseholder is a LEARNER in the target config,
 		// and therefore shouldn't continue holding the lease.
 		if err := roachpb.CheckCanReceiveLease(
-			lhDescriptor, proposedDesc.Replicas(), lhRemovalAllowed,
+			lhDesc, proposedDesc.Replicas(), true, /* lhRemovalAllowed */
 		); err != nil {
-			e := errors.Mark(errors.Wrapf(err, "received invalid ChangeReplicasTrigger %s to "+
-				"remove self (leaseholder); lhRemovalAllowed: %v; proposed descriptor: %v", crt,
-				lhRemovalAllowed, proposedDesc), errMarkInvalidReplicationChange)
+			e := errors.Mark(errors.Wrapf(err, "%v received invalid ChangeReplicasTrigger %s to "+
+				"remove self (leaseholder); lhRemovalAllowed: %v; current desc: %v; proposed desc: %v",
+				lhDesc, crt, true /* lhRemovalAllowed */, r.Desc(), proposedDesc), errMarkInvalidReplicationChange)
 			log.Errorf(p.ctx, "%v", e)
 			return roachpb.NewError(e)
 		}
@@ -1164,9 +1160,7 @@ func maybeFatalOnRaftReadyErr(ctx context.Context, expl string, err error) (remo
 // tick the Raft group, returning true if the raft group exists and should
 // be queued for Ready processing; false otherwise.
 func (r *Replica) tick(
-	ctx context.Context,
-	livenessMap liveness.IsLiveMap,
-	ioOverloadMap map[roachpb.StoreID]*admissionpb.IOThreshold,
+	ctx context.Context, livenessMap liveness.IsLiveMap, ioThresholdMap *ioThresholdMap,
 ) (bool, error) {
 	r.unreachablesMu.Lock()
 	remotes := r.unreachablesMu.remotes
@@ -1191,7 +1185,7 @@ func (r *Replica) tick(
 		return false, nil
 	}
 
-	r.updatePausedFollowersLocked(ctx, ioOverloadMap)
+	r.updatePausedFollowersLocked(ctx, ioThresholdMap)
 
 	now := r.store.Clock().NowAsClockTimestamp()
 	if r.maybeQuiesceRaftMuLockedReplicaMuLocked(ctx, now, livenessMap) {
@@ -1471,6 +1465,9 @@ func (r *Replica) sendRaftMessagesRaftMuLocked(
 	var lastAppResp raftpb.Message
 	for _, message := range messages {
 		_, drop := blocked[roachpb.ReplicaID(message.To)]
+		if drop {
+			r.store.Metrics().RaftPausedFollowerDroppedMsgs.Inc(1)
+		}
 		switch message.Type {
 		case raftpb.MsgApp:
 			if util.RaceEnabled {
@@ -1534,9 +1531,6 @@ func (r *Replica) sendRaftMessagesRaftMuLocked(
 			}
 		}
 
-		// TODO(tbg): record this to metrics.
-		//
-		// See: https://github.com/cockroachdb/cockroach/issues/83917
 		if !drop {
 			r.sendRaftMessageRaftMuLocked(ctx, message)
 		}
@@ -1881,8 +1875,8 @@ func shouldCampaignOnWake(
 	if raftStatus.Lead == raft.None {
 		return true
 	}
-	// Avoid a circular dependency on liveness and skip the is leader alive check for
-	// expiration based leases.
+	// Avoid a circular dependency on liveness and skip the is leader alive
+	// check for ranges that always use expiration based leases.
 	if requiresExpiringLease {
 		return false
 	}

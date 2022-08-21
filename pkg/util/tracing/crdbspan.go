@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -509,7 +510,11 @@ func (s *crdbSpan) recordFinishedChildren(childRecording tracingpb.Recording) {
 	// children being added to s.
 	for _, span := range childRecording {
 		for _, record := range span.StructuredRecords {
-			s.notifyEventListeners(record.Payload)
+			var d types.DynamicAny
+			if err := types.UnmarshalAny(record.Payload, &d); err != nil {
+				continue
+			}
+			s.notifyEventListeners(d.Message.(protoutil.Message))
 		}
 	}
 
@@ -918,31 +923,19 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 			// We encode the tag values as strings.
 			addTag(string(kv.Key), kv.Value.Emit())
 		}
-		for _, kv := range s.mu.lazyTags {
-			switch v := kv.Value.(type) {
-			case LazyTag:
-				var tagGroup *tracingpb.TagGroup
-				for _, tag := range v.Render() {
-					if tagGroup == nil {
-						// Only create the tag group if we have at least one child tag.
-						tagGroup = addTagGroup(kv.Key)
-					}
-					childKey := string(tag.Key)
-					childValue := tag.Value.Emit()
-
-					rs.Tags[childKey] = childValue
-
-					tagGroup.Tags = append(tagGroup.Tags,
-						tracingpb.Tag{
-							Key:   childKey,
-							Value: childValue,
-						},
-					)
+		for _, tg := range s.getLazyTagGroupsLocked() {
+			if tg.Name == tracingpb.AnonymousTagGroupName {
+				for _, tag := range tg.Tags {
+					addTag(tag.Key, tag.Value)
 				}
-			case fmt.Stringer:
-				addTag(kv.Key, v.String())
-			default:
-				addTag(kv.Key, fmt.Sprintf("<can't render %T>", kv.Value))
+			} else {
+				rs.TagGroups = append(rs.TagGroups, *tg)
+				if rs.Tags == nil {
+					rs.Tags = make(map[string]string)
+				}
+				for _, tag := range tg.Tags {
+					rs.Tags[tag.Key] = tag.Value
+				}
 			}
 		}
 
@@ -963,6 +956,59 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 	}
 
 	return rs
+}
+
+// getLazyTagGroupsLocked returns a list of lazy tags as a slice of
+// *tracingpb.TagGroup
+func (s *crdbSpan) getLazyTagGroupsLocked() []*tracingpb.TagGroup {
+	var lazyTags []*tracingpb.TagGroup
+	addTagGroup := func(name string) *tracingpb.TagGroup {
+		lazyTags = append(lazyTags,
+			&tracingpb.TagGroup{
+				Name: name,
+			})
+		return lazyTags[len(lazyTags)-1]
+	}
+
+	addTag := func(k, v string) {
+		var tagGroup *tracingpb.TagGroup
+		for _, tg := range lazyTags {
+			if tg.Name == tracingpb.AnonymousTagGroupName {
+				tagGroup = tg
+				break
+			}
+		}
+		if tagGroup == nil {
+			tagGroup = addTagGroup(tracingpb.AnonymousTagGroupName)
+		}
+		tagGroup.Tags = append(tagGroup.Tags, tracingpb.Tag{
+			Key:   k,
+			Value: v,
+		})
+	}
+	for _, kv := range s.mu.lazyTags {
+		switch v := kv.Value.(type) {
+		case LazyTag:
+			var tagGroup *tracingpb.TagGroup
+			for _, tag := range v.Render() {
+				if tagGroup == nil {
+					// Only create the tag group if we have at least one child tag.
+					tagGroup = addTagGroup(kv.Key)
+				}
+				tagGroup.Tags = append(tagGroup.Tags,
+					tracingpb.Tag{
+						Key:   string(tag.Key),
+						Value: tag.Value.Emit(),
+					},
+				)
+			}
+		case fmt.Stringer:
+			addTag(kv.Key, v.String())
+		default:
+			addTag(kv.Key, fmt.Sprintf("<can't render %T>", kv.Value))
+		}
+	}
+	return lazyTags
 }
 
 // addChildLocked adds a child to the receiver.

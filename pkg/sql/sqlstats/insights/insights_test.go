@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
@@ -43,8 +44,8 @@ func BenchmarkInsights(b *testing.B) {
 	// down, guiding us as we tune buffer sizes, etc.
 	for _, numSessions := range []int{1, 10, 100, 1000, 10000} {
 		b.Run(fmt.Sprintf("numSessions=%d", numSessions), func(b *testing.B) {
-			registry := insights.New(settings, insights.NewMetrics())
-			registry.Start(ctx, stopper)
+			provider := insights.New(settings, insights.NewMetrics())
+			provider.Start(ctx, stopper)
 
 			// Spread the b.N work across the simulated SQL sessions, so that we
 			// can make apples-to-apples comparisons in the benchmark reports:
@@ -53,15 +54,21 @@ func BenchmarkInsights(b *testing.B) {
 			numTransactionsPerSession := b.N / numSessions
 			var sessions sync.WaitGroup
 			sessions.Add(numSessions)
+			writer := provider.Writer()
 
 			for i := 0; i < numSessions; i++ {
 				sessionID := clusterunique.ID{Uint128: uint128.FromInts(0, uint64(i))}
-				statement := &insights.Statement{}
-				transaction := &insights.Transaction{}
 				go func() {
 					for j := 0; j < numTransactionsPerSession; j++ {
-						registry.ObserveStatement(sessionID, statement)
-						registry.ObserveTransaction(sessionID, transaction)
+						writer.ObserveStatement(sessionID, &insights.Statement{
+							// Spread across 6 different statement fingerprints.
+							FingerprintID: roachpb.StmtFingerprintID(j % 6),
+							// Choose latencies in 20ms, 40ms, 60ms, 80ms, 100ms, 120ms, 140ms.
+							// As configured above, only latencies >=100ms are noteworthy.
+							// Since 7 is relatively prime to 6, we'll spread these across all fingerprints.
+							LatencyInSeconds: float64(j%7+1) * 0.02,
+						})
+						writer.ObserveTransaction(sessionID, &insights.Transaction{})
 					}
 					sessions.Done()
 				}()

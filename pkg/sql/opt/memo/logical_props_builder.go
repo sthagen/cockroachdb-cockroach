@@ -169,6 +169,12 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		}
 		b.updateCardinalityFromTypes(rel.OutputCols, rel)
 	}
+	if scan.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter. The minimum cardinality of a scan
+		// should never exceed zero based on the logic above, but this provides
+		// extra safety.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
+	}
 
 	// Statistics
 	// ----------
@@ -509,6 +515,12 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 
 func (b *logicalPropsBuilder) buildLookupJoinProps(join *LookupJoinExpr, rel *props.Relational) {
 	b.buildJoinProps(join, rel)
+	if join.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter. The minimum cardinality of a scan
+		// should never exceed zero based on the logic in buildJoinProps, but
+		// this provides extra safety.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
+	}
 }
 
 func (b *logicalPropsBuilder) buildInvertedJoinProps(
@@ -795,33 +807,35 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	}
 }
 
-func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Relational) {
+func (b *logicalPropsBuilder) buildValuesProps(values ValuesContainer, rel *props.Relational) {
 	BuildSharedProps(values, &rel.Shared, b.evalCtx)
 
-	card := uint32(len(values.Rows))
+	card := uint32(values.Len())
 
 	// Output Columns
 	// --------------
 	// Use output columns that are attached to the values op.
-	rel.OutputCols = values.Cols.ToSet()
+	rel.OutputCols = values.ColList().ToSet()
 
 	// Not Null Columns
 	// ----------------
 	// All columns are assumed to be nullable, unless they contain only constant
 	// non-null values.
 
-	for colIdx, col := range values.Cols {
-		notNull := true
-		for rowIdx := range values.Rows {
-			val := values.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
-			if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
-				// Null or not a constant.
-				notNull = false
-				break
+	if v, ok := values.(*ValuesExpr); ok {
+		for colIdx, col := range v.ColList() {
+			notNull := true
+			for rowIdx := range v.Rows {
+				val := v.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
+				if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
+					// Null or not a constant.
+					notNull = false
+					break
+				}
 			}
-		}
-		if notNull {
-			rel.NotNullCols.Add(col)
+			if notNull {
+				rel.NotNullCols.Add(col)
+			}
 		}
 	}
 
@@ -845,6 +859,12 @@ func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Re
 	if !b.disableStats {
 		b.sb.buildValues(values, rel)
 	}
+}
+
+func (b *logicalPropsBuilder) buildLiteralValuesProps(
+	values ValuesContainer, rel *props.Relational,
+) {
+	b.buildValuesProps(values, rel)
 }
 
 func (b *logicalPropsBuilder) buildBasicProps(e opt.Expr, cols opt.ColList, rel *props.Relational) {

@@ -429,6 +429,13 @@ func TestLogic_connect_privilege(
 	runLogicTest(t, "connect_privilege")
 }
 
+func TestLogic_copyfrom(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "copyfrom")
+}
+
 func TestLogic_crdb_internal(
 	t *testing.T,
 ) {
@@ -2065,6 +2072,13 @@ func TestLogic_typing(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "typing")
+}
+
+func TestLogic_udf(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf")
 }
 
 func TestLogic_union(

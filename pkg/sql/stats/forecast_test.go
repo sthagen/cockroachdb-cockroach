@@ -18,10 +18,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -492,22 +490,22 @@ func TestForecastColumnStatistics(t *testing.T) {
 					hist: testHistogram{},
 				},
 				{
-					at: 2, row: 5, dist: 2, null: 3, size: 2,
+					at: 2, row: 5, dist: 3, null: 3, size: 2,
 					hist: testHistogram{{1, 0, 0, 200}, {0, 1, 1, 800}},
 				},
 				{
-					at: 3, row: 7, dist: 3, null: 3, size: 2,
+					at: 3, row: 7, dist: 4, null: 3, size: 2,
 					hist: testHistogram{{2, 0, 0, 200}, {0, 2, 2, 800}},
 				},
 				{
-					at: 4, row: 9, dist: 4, null: 3, size: 2,
+					at: 4, row: 9, dist: 5, null: 3, size: 2,
 					hist: testHistogram{{3, 0, 0, 200}, {0, 3, 3, 800}},
 				},
 			},
 			at: 5,
 			forecast: &testStat{
-				at: 5, row: 11, dist: 5, null: 3, size: 2,
-				hist: testHistogram{{4, 0, 0, 200}, {1, 3, 2, 800}},
+				at: 5, row: 11, dist: 6, null: 3, size: 2,
+				hist: testHistogram{{4, 0, 0, 200}, {0, 4, 4, 800}},
 			},
 		},
 		// Histogram, constant numbers but changing shape
@@ -581,7 +579,6 @@ func TestForecastColumnStatistics(t *testing.T) {
 		},
 	}
 	ctx := context.Background()
-	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	for i, tc := range testCases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 
@@ -593,7 +590,7 @@ func TestForecastColumnStatistics(t *testing.T) {
 			expected := tc.forecast.toTableStatistic(jobspb.ForecastStatsName, i)
 			at := testStatTime(tc.at)
 
-			forecast, err := forecastColumnStatistics(ctx, evalCtx, observed, at, 1)
+			forecast, err := forecastColumnStatistics(ctx, observed, at, 1)
 			if err != nil {
 				if !tc.err {
 					t.Errorf("test case %d unexpected forecastColumnStatistics err: %v", i, err)

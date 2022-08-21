@@ -9,5 +9,6 @@
 // licenses/APL.txt.
 
 export * from "./workloadInsights";
+export * from "./workloadInsightDetails";
 export * from "./utils";
 export * from "./types";

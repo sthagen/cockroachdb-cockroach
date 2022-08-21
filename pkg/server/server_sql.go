@@ -34,10 +34,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -104,7 +106,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -351,6 +352,9 @@ type sqlServerArgs struct {
 
 	// grpc is the RPC service.
 	grpc *grpcServer
+
+	// eventsServer communicates with the Observability Service.
+	eventsServer *obs.EventsServer
 }
 
 type monitorAndMetrics struct {
@@ -577,18 +581,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 
 	gcJobNotifier := gcjobnotifier.New(cfg.Settings, cfg.systemConfigWatcher, codec, cfg.stopper)
 
-	var compactEngineSpanFunc eval.CompactEngineSpanFunc
-	if !codec.ForSystemTenant() {
-		compactEngineSpanFunc = func(
-			ctx context.Context, nodeID, storeID int32, startKey, endKey []byte,
-		) error {
-			return errorutil.UnsupportedWithMultiTenancy(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
-		}
-	} else {
-		cli := kvserver.NewCompactEngineSpanClient(cfg.nodeDialer)
-		compactEngineSpanFunc = cli.CompactEngineSpan
-	}
-
 	spanConfig := struct {
 		manager              *spanconfigmanager.Manager
 		sqlTranslatorFactory *spanconfigsqltranslator.Factory
@@ -622,6 +614,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	clusterIDForSQL := cfg.rpcContext.LogicalClusterID
 
 	bulkSenderLimiter := bulk.MakeAndRegisterConcurrencyLimiter(&cfg.Settings.SV)
+
+	rangeStatsFetcher := rangestats.NewFetcher(cfg.db)
 
 	// Set up the DistSQL server.
 	distSQLCfg := execinfra.ServerConfig{
@@ -680,6 +674,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		SQLSQLResponseAdmissionQ: cfg.sqlSQLResponseAdmissionQ,
 		CollectionFactory:        collectionFactory,
 		ExternalIORecorder:       cfg.costController,
+		RangeStatsFetcher:        rangeStatsFetcher,
 	}
 	cfg.TempStorageConfig.Mon.SetMetrics(distSQLMetrics.CurDiskBytesCount, distSQLMetrics.MaxDiskBytesHist)
 	if distSQLTestingKnobs := cfg.TestingKnobs.DistSQL; distSQLTestingKnobs != nil {
@@ -757,43 +752,46 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	)
 	contentionRegistry.Start(ctx, cfg.stopper)
 
+	storageEngineClient := kvserver.NewStorageEngineClient(cfg.nodeDialer)
+
 	*execCfg = sql.ExecutorConfig{
-		Settings:                cfg.Settings,
-		NodeInfo:                nodeInfo,
-		Codec:                   codec,
-		DefaultZoneConfig:       &cfg.DefaultZoneConfig,
-		Locality:                cfg.Locality,
-		AmbientCtx:              cfg.AmbientCtx,
-		DB:                      cfg.db,
-		Gossip:                  cfg.gossip,
-		NodeLiveness:            cfg.nodeLiveness,
-		SystemConfig:            cfg.systemConfigWatcher,
-		MetricsRecorder:         cfg.recorder,
-		DistSender:              cfg.distSender,
-		RPCContext:              cfg.rpcContext,
-		LeaseManager:            leaseMgr,
-		TenantStatusServer:      cfg.tenantStatusServer,
-		Clock:                   cfg.clock,
-		DistSQLSrv:              distSQLServer,
-		NodesStatusServer:       cfg.nodesStatusServer,
-		SQLStatusServer:         cfg.sqlStatusServer,
-		RegionsServer:           cfg.regionsServer,
-		SessionRegistry:         cfg.sessionRegistry,
-		ClosedSessionCache:      cfg.closedSessionCache,
-		ContentionRegistry:      contentionRegistry,
-		SQLLiveness:             cfg.sqlLivenessProvider,
-		JobRegistry:             jobRegistry,
-		VirtualSchemas:          virtualSchemas,
-		HistogramWindowInterval: cfg.HistogramWindowInterval(),
-		RangeDescriptorCache:    cfg.distSender.RangeDescriptorCache(),
-		RoleMemberCache:         sql.NewMembershipCache(serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper),
-		SessionInitCache:        sessioninit.NewCache(serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper),
-		RootMemoryMonitor:       rootSQLMemoryMonitor,
-		TestingKnobs:            sqlExecutorTestingKnobs,
-		CompactEngineSpanFunc:   compactEngineSpanFunc,
-		TraceCollector:          traceCollector,
-		TenantUsageServer:       cfg.tenantUsageServer,
-		KVStoresIterator:        cfg.kvStoresIterator,
+		Settings:                  cfg.Settings,
+		NodeInfo:                  nodeInfo,
+		Codec:                     codec,
+		DefaultZoneConfig:         &cfg.DefaultZoneConfig,
+		Locality:                  cfg.Locality,
+		AmbientCtx:                cfg.AmbientCtx,
+		DB:                        cfg.db,
+		Gossip:                    cfg.gossip,
+		NodeLiveness:              cfg.nodeLiveness,
+		SystemConfig:              cfg.systemConfigWatcher,
+		MetricsRecorder:           cfg.recorder,
+		DistSender:                cfg.distSender,
+		RPCContext:                cfg.rpcContext,
+		LeaseManager:              leaseMgr,
+		TenantStatusServer:        cfg.tenantStatusServer,
+		Clock:                     cfg.clock,
+		DistSQLSrv:                distSQLServer,
+		NodesStatusServer:         cfg.nodesStatusServer,
+		SQLStatusServer:           cfg.sqlStatusServer,
+		RegionsServer:             cfg.regionsServer,
+		SessionRegistry:           cfg.sessionRegistry,
+		ClosedSessionCache:        cfg.closedSessionCache,
+		ContentionRegistry:        contentionRegistry,
+		SQLLiveness:               cfg.sqlLivenessProvider,
+		JobRegistry:               jobRegistry,
+		VirtualSchemas:            virtualSchemas,
+		HistogramWindowInterval:   cfg.HistogramWindowInterval(),
+		RangeDescriptorCache:      cfg.distSender.RangeDescriptorCache(),
+		RoleMemberCache:           sql.NewMembershipCache(serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper),
+		SessionInitCache:          sessioninit.NewCache(serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper),
+		RootMemoryMonitor:         rootSQLMemoryMonitor,
+		TestingKnobs:              sqlExecutorTestingKnobs,
+		CompactEngineSpanFunc:     storageEngineClient.CompactEngineSpan,
+		CompactionConcurrencyFunc: storageEngineClient.SetCompactionConcurrency,
+		TraceCollector:            traceCollector,
+		TenantUsageServer:         cfg.tenantUsageServer,
+		KVStoresIterator:          cfg.kvStoresIterator,
 		SyntheticPrivilegeCache: cacheutil.NewCache(
 			serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper, 1 /* numSystemTables */),
 
@@ -817,13 +815,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		),
 
 		TableStatsCache: stats.NewTableStatisticsCache(
-			ctx,
 			cfg.TableStatCacheSize,
 			cfg.db,
 			cfg.circularInternalExecutor,
-			codec,
 			cfg.Settings,
-			cfg.rangeFeedFactory,
 			collectionFactory,
 		),
 
@@ -835,10 +830,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		GCJobNotifier:              gcJobNotifier,
 		RangeFeedFactory:           cfg.rangeFeedFactory,
 		CollectionFactory:          collectionFactory,
-		SystemTableIDResolver:      descs.MakeSystemTableIDResolver(collectionFactory, cfg.circularInternalExecutor, cfg.db),
+		SystemTableIDResolver:      descs.MakeSystemTableIDResolver(collectionFactory, cfg.db),
 		ConsistencyChecker:         consistencychecker.NewConsistencyChecker(cfg.db),
 		RangeProber:                rangeprober.NewRangeProber(cfg.db),
 		DescIDGenerator:            descidgen.NewGenerator(codec, cfg.db),
+		RangeStatsFetcher:          rangeStatsFetcher,
+		EventsExporter:             cfg.eventsServer,
 	}
 
 	if sqlSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
@@ -892,6 +889,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	if sqlStatsKnobs := cfg.TestingKnobs.SQLStatsKnobs; sqlStatsKnobs != nil {
 		execCfg.SQLStatsTestingKnobs = sqlStatsKnobs.(*sqlstats.TestingKnobs)
+	}
+	if eventlogKnobs := cfg.TestingKnobs.EventLog; eventlogKnobs != nil {
+		execCfg.EventLogTestingKnobs = eventlogKnobs.(*sql.EventLogTestingKnobs)
 	}
 	if telemetryLoggingKnobs := cfg.TestingKnobs.TelemetryLoggingKnobs; telemetryLoggingKnobs != nil {
 		execCfg.TelemetryLoggingTestingKnobs = telemetryLoggingKnobs.(*sql.TelemetryLoggingTestingKnobs)
@@ -1079,7 +1079,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg.db,
 		codec,
 		cfg.registry,
-		distSQLServer.ServerConfig.InternalExecutorFactory,
 		cfg.sqlStatusServer,
 		cfg.isMeta1Leaseholder,
 		sqlExecutorTestingKnobs,
@@ -1212,8 +1211,8 @@ func (s *SQLServer) setInstanceID(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.execCfg.DistSQLPlanner.SetGatewaySQLInstanceID(instanceID)
 	s.sqlLivenessSessionID = sessionID
-	s.execCfg.DistSQLPlanner.SetSQLInstanceInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(instanceID)})
 	return nil
 }
 
@@ -1250,6 +1249,9 @@ func (s *SQLServer) preStart(
 		return err
 	}
 	s.stmtDiagnosticsRegistry.Start(ctx, stopper)
+	if err := s.execCfg.TableStatsCache.Start(ctx, s.execCfg.Codec, s.execCfg.RangeFeedFactory); err != nil {
+		return err
+	}
 
 	// Before serving SQL requests, we have to make sure the database is
 	// in an acceptable form for this version of the software.

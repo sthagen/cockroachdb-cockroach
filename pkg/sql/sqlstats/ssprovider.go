@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -170,8 +169,6 @@ type StatsCollector interface {
 type Storage interface {
 	Reader
 
-	insights.Reader
-
 	// GetLastReset returns the last time when the sqlstats is being reset.
 	GetLastReset() time.Time
 
@@ -217,6 +214,7 @@ type RecordedStmtStats struct {
 	EndTime              time.Time
 	FullScan             bool
 	SessionData          *sessiondata.SessionData
+	ExecStats            *execstats.QueryLevelStats
 }
 
 // RecordedTxnStats stores the statistics of a transaction to be recorded.

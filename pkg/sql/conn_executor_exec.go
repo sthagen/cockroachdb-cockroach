@@ -124,29 +124,10 @@ func (ex *connExecutor) execStmt(
 		ev, payload = ex.execStmtInNoTxnState(ctx, ast)
 
 	case stateOpen:
-		if ex.server.cfg.Settings.CPUProfileType() == cluster.CPUProfileWithLabels {
-			remoteAddr := "internal"
-			if rAddr := ex.sessionData().RemoteAddr; rAddr != nil {
-				remoteAddr = rAddr.String()
-			}
-			var stmtNoConstants string
-			if prepared != nil {
-				stmtNoConstants = prepared.StatementNoConstants
-			} else {
-				stmtNoConstants = formatStatementHideConstants(ast)
-			}
-			labels := pprof.Labels(
-				"appname", ex.sessionData().ApplicationName,
-				"addr", remoteAddr,
-				"stmt.tag", ast.StatementTag(),
-				"stmt.no.constants", stmtNoConstants,
-			)
-			pprof.Do(ctx, labels, func(ctx context.Context) {
-				ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res, canAutoCommit)
-			})
-		} else {
+		err = ex.execWithProfiling(ctx, ast, prepared, func(ctx context.Context) error {
 			ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res, canAutoCommit)
-		}
+			return err
+		})
 		switch ev.(type) {
 		case eventNonRetriableErr:
 			ex.recordFailure()
@@ -850,17 +831,7 @@ func (ex *connExecutor) checkDescriptorTwoVersionInvariant(ctx context.Context) 
 		inRetryBackoff = knobs.TwoVersionLeaseViolation
 	}
 
-	if err := descs.CheckSpanCountLimit(
-		ctx,
-		ex.extraTxnState.descCollection,
-		ex.server.cfg.SpanConfigSplitter,
-		ex.server.cfg.SpanConfigLimiter,
-		ex.state.mu.txn,
-	); err != nil {
-		return err
-	}
-
-	retryErr, err := descs.CheckTwoVersionInvariant(
+	return descs.CheckTwoVersionInvariant(
 		ctx,
 		ex.server.cfg.Clock,
 		ex.server.cfg.InternalExecutor,
@@ -868,12 +839,6 @@ func (ex *connExecutor) checkDescriptorTwoVersionInvariant(ctx context.Context) 
 		ex.state.mu.txn,
 		inRetryBackoff,
 	)
-	if retryErr {
-		if newTransactionErr := ex.resetTransactionOnSchemaChangeRetry(ctx); newTransactionErr != nil {
-			return newTransactionErr
-		}
-	}
-	return err
 }
 
 // Create a new transaction to retry with a higher timestamp than the timestamps
@@ -895,10 +860,19 @@ func (ex *connExecutor) resetTransactionOnSchemaChangeRetry(ctx context.Context)
 // transaction. commitFn is passed as a separate function, so that we avoid
 // executing transactional logic when handling COMMIT in the CommitWait state.
 func (ex *connExecutor) commitSQLTransaction(
-	ctx context.Context, ast tree.Statement, commitFn func(ctx context.Context) error,
+	ctx context.Context, ast tree.Statement, commitFn func(context.Context) error,
 ) (fsm.Event, fsm.EventPayload) {
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartTransactionCommit, timeutil.Now())
 	if err := commitFn(ctx); err != nil {
+		if descs.IsTwoVersionInvariantViolationError(err) {
+			if resetErr := ex.resetTransactionOnSchemaChangeRetry(ctx); resetErr != nil {
+				return ex.makeErrEvent(err, ast)
+			}
+			// Generating a forced retry error here, right after resetting the
+			// transaction is not exactly necessary, but it's a sound way to
+			// generate the only type of ClientVisibleRetryError we have.
+			err = ex.state.mu.txn.GenerateForcedRetryableError(ctx, err.Error())
+		}
 		return ex.makeErrEvent(err, ast)
 	}
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndTransactionCommit, timeutil.Now())
@@ -952,6 +926,18 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error 
 	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "commit sql txn")
 	defer sp.Finish()
 
+	// We need to step the transaction before committing if it has stepping
+	// enabled. If it doesn't have stepping enabled, then we just set the
+	// stepping mode back to what it was.
+	prevSteppingMode := ex.state.mu.txn.ConfigureStepping(ctx, kv.SteppingEnabled)
+	if prevSteppingMode == kv.SteppingEnabled {
+		if err := ex.state.mu.txn.Step(ctx); err != nil {
+			return err
+		}
+	} else {
+		ex.state.mu.txn.ConfigureStepping(ctx, prevSteppingMode)
+	}
+
 	if err := ex.createJobs(ctx); err != nil {
 		return err
 	}
@@ -963,6 +949,16 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error 
 	}
 
 	if err := ex.extraTxnState.descCollection.ValidateUncommittedDescriptors(ctx, ex.state.mu.txn); err != nil {
+		return err
+	}
+
+	if err := descs.CheckSpanCountLimit(
+		ctx,
+		ex.extraTxnState.descCollection,
+		ex.server.cfg.SpanConfigSplitter,
+		ex.server.cfg.SpanConfigLimiter,
+		ex.state.mu.txn,
+	); err != nil {
 		return err
 	}
 
@@ -978,9 +974,7 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error 
 	// to release the leases for them so that the schema change can proceed and
 	// we don't block the client.
 	if descs := ex.extraTxnState.descCollection.GetDescriptorsWithNewVersion(); descs != nil {
-		if !ex.extraTxnState.fromOuterTxn {
-			ex.extraTxnState.descCollection.ReleaseLeases(ctx)
-		}
+		ex.extraTxnState.descCollection.ReleaseLeases(ctx)
 	}
 	return nil
 }
@@ -1024,8 +1018,8 @@ func (ex *connExecutor) rollbackSQLTransaction(
 // dispatchToExecutionEngine executes the statement, writes the result to res
 // and returns an event for the connection's state machine.
 //
-// If an error is returned, the connection needs to stop processing queries.
-// Query execution errors are written to res; they are not returned; it is
+// If an error is returned, the connection needs to stop processing queries.`
+// Query execution errors are written to res; they are not returned; it is`
 // expected that the caller will inspect res and react to query errors by
 // producing an appropriate state machine event.
 func (ex *connExecutor) dispatchToExecutionEngine(
@@ -1245,7 +1239,8 @@ func populateQueryLevelStats(ctx context.Context, p *planner) {
 	var err error
 	queryLevelStats, err := execstats.GetQueryLevelStats(
 		trace, p.execCfg.TestingKnobs.DeterministicExplain, flowsMetadata)
-	ih.queryLevelStatsWithErr = execstats.MakeQueryLevelStatsWithErr(queryLevelStats, err)
+	queryLevelStatsWithErr := execstats.MakeQueryLevelStatsWithErr(queryLevelStats, err)
+	ih.queryLevelStatsWithErr = &queryLevelStatsWithErr
 	if err != nil {
 		const msg = "error getting query level stats for statement: %s: %+v"
 		if buildutil.CrdbTestBuild {
@@ -1525,40 +1520,8 @@ func (ex *connExecutor) execWithDistSQLEngine(
 			return &factoryEvalCtx
 		}
 	}
-
-	if len(planner.curPlan.subqueryPlans) != 0 {
-		// Create a separate memory account for the results of the subqueries.
-		// Note that we intentionally defer the closure of the account until we
-		// return from this method (after the main query is executed).
-		subqueryResultMemAcc := planner.EvalContext().Mon.MakeBoundAccount()
-		defer subqueryResultMemAcc.Close(ctx)
-		if !ex.server.cfg.DistSQLPlanner.PlanAndRunSubqueries(
-			ctx, planner, evalCtxFactory, planner.curPlan.subqueryPlans, recv, &subqueryResultMemAcc,
-			// Skip the diagram generation since on this "main" query path we
-			// can get it via the statement bundle.
-			true, /* skipDistSQLDiagramGeneration */
-		) {
-			return *recv.stats, recv.commErr
-		}
-	}
-	recv.discardRows = planner.instrumentation.ShouldDiscardRows()
-	// We pass in whether or not we wanted to distribute this plan, which tells
-	// the planner whether or not to plan remote table readers.
-	cleanup := ex.server.cfg.DistSQLPlanner.PlanAndRun(
-		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv,
-	)
-	// Note that we're not cleaning up right away because postqueries might
-	// need to have access to the main query tree.
-	defer cleanup()
-	if recv.commErr != nil || res.Err() != nil {
-		return *recv.stats, recv.commErr
-	}
-
-	ex.server.cfg.DistSQLPlanner.PlanAndRunCascadesAndChecks(
-		ctx, planner, evalCtxFactory, &planner.curPlan.planComponents, recv,
-	)
-
-	return *recv.stats, recv.commErr
+	err := ex.server.cfg.DistSQLPlanner.PlanAndRunAll(ctx, evalCtx, planCtx, planner, recv, evalCtxFactory)
+	return *recv.stats, err
 }
 
 // beginTransactionTimestampsAndReadMode computes the timestamps and
@@ -2367,4 +2330,37 @@ func logTraceAboveThreshold(
 	// Note that log lines larger than 65k are truncated in the debug zip (see
 	// #50166).
 	log.Infof(ctx, "%s took %s, exceeding threshold of %s:\n%s", opName, elapsed, threshold, dump)
+}
+
+func (ex *connExecutor) execWithProfiling(
+	ctx context.Context,
+	ast tree.Statement,
+	prepared *PreparedStatement,
+	op func(context.Context) error,
+) error {
+	var err error
+	if ex.server.cfg.Settings.CPUProfileType() == cluster.CPUProfileWithLabels {
+		remoteAddr := "internal"
+		if rAddr := ex.sessionData().RemoteAddr; rAddr != nil {
+			remoteAddr = rAddr.String()
+		}
+		var stmtNoConstants string
+		if prepared != nil {
+			stmtNoConstants = prepared.StatementNoConstants
+		} else {
+			stmtNoConstants = formatStatementHideConstants(ast)
+		}
+		labels := pprof.Labels(
+			"appname", ex.sessionData().ApplicationName,
+			"addr", remoteAddr,
+			"stmt.tag", ast.StatementTag(),
+			"stmt.no.constants", stmtNoConstants,
+		)
+		pprof.Do(ctx, labels, func(ctx context.Context) {
+			err = op(ctx)
+		})
+	} else {
+		err = op(ctx)
+	}
+	return err
 }

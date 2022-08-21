@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -592,15 +593,12 @@ func (b *Builder) buildScan(
 	}
 	if locking.isSet() {
 		private.Locking = locking.get()
-		if private.Locking.WaitPolicy == tree.LockWaitSkipLocked {
-			if tab.FamilyCount() > 1 {
-				// TODO(rytaft): We may be able to support this if enough columns are
-				// pruned that only a single family is scanned.
-				panic(pgerror.Newf(pgcode.FeatureNotSupported,
-					"SKIP LOCKED cannot be used for tables with multiple column families",
-				))
-			}
-			tabMeta.IsSkipLocked = true
+		if private.Locking.WaitPolicy == tree.LockWaitSkipLocked && tab.FamilyCount() > 1 {
+			// TODO(rytaft): We may be able to support this if enough columns are
+			// pruned that only a single family is scanned.
+			panic(pgerror.Newf(pgcode.FeatureNotSupported,
+				"SKIP LOCKED cannot be used for tables with multiple column families",
+			))
 		}
 	}
 	if b.evalCtx.AsOfSystemTime != nil && b.evalCtx.AsOfSystemTime.BoundedStaleness {
@@ -611,6 +609,7 @@ func (b *Builder) buildScan(
 
 	b.addCheckConstraintsForTable(tabMeta)
 	b.addComputedColsForTable(tabMeta)
+	b.addIndexPartitionLocalitiesForTable(tabMeta)
 
 	outScope.expr = b.factory.ConstructScan(&private)
 
@@ -787,6 +786,19 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 	}
 }
 
+// addIndexPartitionLocalitiesForTable caches locality prefix sorters in the
+// table metadata for indexes that have a mix of local and remote partitions.
+func (b *Builder) addIndexPartitionLocalitiesForTable(tabMeta *opt.TableMeta) {
+	tab := tabMeta.Table
+	for indexOrd, n := 0, tab.IndexCount(); indexOrd < n; indexOrd++ {
+		index := tab.Index(indexOrd)
+		if localPartitions, ok := partition.HasMixOfLocalAndRemotePartitions(b.evalCtx, index); ok {
+			ps := partition.GetSortedPrefixes(index, localPartitions, b.evalCtx)
+			tabMeta.AddIndexPartitionLocality(indexOrd, ps)
+		}
+	}
+}
+
 func (b *Builder) buildSequenceSelect(
 	seq cat.Sequence, seqName *tree.TableName, inScope *scope,
 ) (outScope *scope) {
@@ -852,6 +864,9 @@ func (b *Builder) buildSelectStmt(
 ) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
+	case *tree.LiteralValuesClause:
+		return b.buildLiteralValuesClause(stmt, desiredTypes, inScope)
+
 	case *tree.ParenSelect:
 		return b.buildSelect(stmt.Select, locking, desiredTypes, inScope)
 
@@ -941,6 +956,10 @@ func (b *Builder) buildSelectStmtWithoutParens(
 ) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch t := wrapped.(type) {
+	case *tree.LiteralValuesClause:
+		b.rejectIfLocking(locking, "VALUES")
+		outScope = b.buildLiteralValuesClause(t, desiredTypes, inScope)
+
 	case *tree.ParenSelect:
 		panic(errors.AssertionFailedf(
 			"%T in buildSelectStmtWithoutParens", wrapped))

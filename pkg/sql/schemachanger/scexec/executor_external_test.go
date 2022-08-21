@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -52,7 +51,6 @@ import (
 type testInfra struct {
 	tc       *testcluster.TestCluster
 	settings *cluster.Settings
-	ie       sqlutil.InternalExecutor
 	db       *kv.DB
 	lm       *lease.Manager
 	tsql     *sqlutils.SQLRunner
@@ -65,6 +63,7 @@ func (ti testInfra) newExecDeps(
 	const kvTrace = true
 	const schemaChangerJobID = 1
 	return scdeps.NewExecutorDependencies(
+		ti.settings,
 		ti.lm.Codec(),
 		&sessiondata.SessionData{},
 		txn,
@@ -92,7 +91,6 @@ func setupTestInfra(t testing.TB) *testInfra {
 	return &testInfra{
 		tc:       tc,
 		settings: tc.Server(0).ClusterSettings(),
-		ie:       tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
 		db:       tc.Server(0).DB(),
 		lm:       tc.Server(0).LeaseManager().(*lease.Manager),
 		cf:       tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory,
@@ -104,7 +102,7 @@ func (ti *testInfra) txn(
 	ctx context.Context,
 	f func(ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error,
 ) error {
-	return ti.cf.Txn(ctx, ti.ie, ti.db, f)
+	return ti.cf.Txn(ctx, ti.db, f)
 }
 
 func TestExecutorDescriptorMutationOps(t *testing.T) {
@@ -488,14 +486,12 @@ type noopEventLogger struct{}
 var _ scexec.EventLogger = noopEventLogger{}
 
 func (noopEventLogger) LogEvent(
-	_ context.Context, _ descpb.ID, _ eventpb.CommonSQLEventDetails, _ logpb.EventPayload,
+	_ context.Context, _ eventpb.CommonSQLEventDetails, _ logpb.EventPayload,
 ) error {
 	return nil
 }
 
-func (noopEventLogger) LogEventForSchemaChange(
-	_ context.Context, _ descpb.ID, _ logpb.EventPayload,
-) error {
+func (noopEventLogger) LogEventForSchemaChange(_ context.Context, _ logpb.EventPayload) error {
 	return nil
 }
 

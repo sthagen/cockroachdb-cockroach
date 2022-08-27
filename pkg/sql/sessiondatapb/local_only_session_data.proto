@@ -169,6 +169,8 @@ message LocalOnlySessionData {
   // established the connection before SET ROLE was first performed.
   // This is only populated when SET ROLE is used, otherwise the session_user
   // is the same as the UserProto in SessionData.
+  // Postgres allows the SessionUser to be changed with SET SESSION AUTHORIZATION
+  // but CockroachDB doesn't allow that at the time of this writing.
   string session_user_proto = 46 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
   // TxnRowsWrittenLog is the threshold for the number of rows written by a SQL
   // transaction which - once exceeded - will trigger a logging event to SQL_PERF
@@ -276,6 +278,19 @@ message LocalOnlySessionData {
   bool optimizer_use_not_visible_indexes = 74;
   // CopyFastPathEnabled controls whether the optimized copy mode is enabled.
   bool copy_fast_path_enabled = 75;
+  // disable_hoist_projection_in_join_limitation disables the restrictions
+  // placed on projection hoisting during query planning in the optimizer.
+  bool disable_hoist_projection_in_join_limitation = 76;
+  // CopyFromAtomicEnabled controls whether implicit txn copy from operations
+  // are atomic or segmented.
+  bool copy_from_atomic_enabled = 77;
+  // EnforceHomeRegion, when true, causes queries which scan rows from multiple
+  // regions, or which scan rows from a single home region, but initiated from
+  // a gateway region which differs from that home region, to error out.
+  bool enforce_home_region = 78;
+  // OptimizerUseForecasts indicates whether we should use statistics forecasts
+  // for cardinality estimation in the optimizer.
+  bool optimizer_use_forecasts = 79;
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //

@@ -714,9 +714,8 @@ func (ex *connExecutor) execStmtInOpenState(
 				IsCommit:     fsm.FromBool(isCommit(ast)),
 				CanAutoRetry: fsm.FromBool(canAutoRetry),
 			}
-			txn.ManualRestart(ctx, ex.server.cfg.Clock.Now())
 			payload := eventRetriableErrPayload{
-				err:    txn.PrepareRetryableError(ctx, "serializable transaction timestamp pushed (detected by connExecutor)"),
+				err:    txn.GenerateForcedRetryableError(ctx, "serializable transaction timestamp pushed (detected by connExecutor)"),
 				rewCap: rc,
 			}
 			return ev, payload, nil
@@ -803,7 +802,7 @@ func formatWithPlaceholders(ast tree.Statement, evalCtx *eval.Context) string {
 			fmtFlags,
 			tree.FmtPlaceholderFormat(func(ctx *tree.FmtCtx, placeholder *tree.Placeholder) {
 				d, err := eval.Expr(evalCtx, placeholder)
-				if err != nil {
+				if err != nil || d == nil {
 					// Fall back to the default behavior if something goes wrong.
 					ctx.Printf("$%d", placeholder.Idx+1)
 					return
@@ -1191,7 +1190,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.extraTxnState.bytesRead += stats.bytesRead
 	ex.extraTxnState.rowsWritten += stats.rowsWritten
 
-	populateQueryLevelStats(ctx, planner)
+	populateQueryLevelStatsAndRegions(ctx, planner, ex.server.cfg)
 
 	// The transaction (from planner.txn) may already have been committed at this point,
 	// due to one-phase commit optimization or an error. Since we use that transaction
@@ -1221,11 +1220,12 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	return err
 }
 
-// populateQueryLevelStats collects query-level execution statistics and
-// populates it in the instrumentationHelper's queryLevelStatsWithErr field.
+// populateQueryLevelStatsAndRegions collects query-level execution statistics
+// and populates it in the instrumentationHelper's queryLevelStatsWithErr field.
 // Query-level execution statistics are collected using the statement's trace
-// and the plan's flow metadata.
-func populateQueryLevelStats(ctx context.Context, p *planner) {
+// and the plan's flow metadata. It also populates the regions field and
+// annotates the explainPlan field of the instrumentationHelper.
+func populateQueryLevelStatsAndRegions(ctx context.Context, p *planner, cfg *ExecutorConfig) {
 	ih := &p.instrumentation
 	if _, ok := ih.Tracing(); !ok {
 		return
@@ -1247,6 +1247,14 @@ func populateQueryLevelStats(ctx context.Context, p *planner) {
 			panic(fmt.Sprintf(msg, ih.fingerprint, err))
 		}
 		log.VInfof(ctx, 1, msg, ih.fingerprint, err)
+	}
+	if ih.traceMetadata != nil && ih.explainPlan != nil {
+		ih.regions = ih.traceMetadata.annotateExplain(
+			ih.explainPlan,
+			trace,
+			cfg.TestingKnobs.DeterministicExplain,
+			p,
+		)
 	}
 }
 
@@ -2297,6 +2305,7 @@ func (ex *connExecutor) recordTransactionFinish(
 		RowsRead:                ex.extraTxnState.rowsRead,
 		RowsWritten:             ex.extraTxnState.rowsWritten,
 		BytesRead:               ex.extraTxnState.bytesRead,
+		Priority:                ex.state.priority,
 	}
 
 	if ex.server.cfg.TestingKnobs.OnRecordTxnFinish != nil {

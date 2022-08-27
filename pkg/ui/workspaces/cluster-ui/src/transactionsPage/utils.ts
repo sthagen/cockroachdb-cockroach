@@ -42,9 +42,13 @@ export const getTrxAppFilterOptions = (
   prefix: string,
 ): string[] => {
   const uniqueAppNames = new Set(
-    transactions
-      .filter(t => !t.stats_data.app.startsWith(prefix))
-      .map(t => (t.stats_data.app ? t.stats_data.app : unset)),
+    transactions.map(t =>
+      t.stats_data.app
+        ? t.stats_data.app.startsWith(prefix)
+          ? prefix
+          : t.stats_data.app
+        : unset,
+    ),
   );
 
   return Array.from(uniqueAppNames).sort();
@@ -98,6 +102,7 @@ export const aggregateStatements = (
     if (!(key in statsKey)) {
       statsKey[key] = {
         aggregatedFingerprintID: s.statement_fingerprint_id?.toString(),
+        aggregatedFingerprintHexID: s.statement_fingerprint_id.toString(16),
         label: s.statement,
         summary: s.statement_summary,
         aggregatedTs: s.aggregated_ts,
@@ -125,19 +130,29 @@ export const searchTransactionsData = (
     searchTerms = [search.substring(1, search.length - 1)];
   }
 
+  if (!search) {
+    return transactions;
+  }
+
   return transactions.filter((t: Transaction) =>
-    search
-      ? searchTerms.every(val =>
-          collectStatementsText(
-            getStatementsByFingerprintId(
-              t.stats_data.statement_fingerprint_ids,
-              statements,
-            ),
-          )
-            .toLowerCase()
-            .includes(val.toLowerCase()),
+    searchTerms.every(val => {
+      if (
+        collectStatementsText(
+          getStatementsByFingerprintId(
+            t.stats_data.statement_fingerprint_ids,
+            statements,
+          ),
         )
-      : true,
+          .toLowerCase()
+          .includes(val.toLowerCase())
+      ) {
+        return true;
+      }
+
+      return t.stats_data.transaction_fingerprint_id
+        ?.toString(16)
+        ?.includes(val);
+    }),
   );
 };
 

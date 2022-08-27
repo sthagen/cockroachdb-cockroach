@@ -712,6 +712,23 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`optimizer_use_forecasts`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_forecasts`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_forecasts", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseForecasts(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseForecasts), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
 	`optimizer_use_histograms`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_histograms`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
@@ -763,9 +780,7 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseNotVisibleIndexes), nil
 		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(optUseNotVisibleIndexesClusterMode.Get(sv))
-		},
+		GlobalDefault: globalFalse,
 	},
 
 	// CockroachDB extension.
@@ -1164,7 +1179,7 @@ var varGen = map[string]sessionVar{
 		// SetWithPlanner is defined in init(), as otherwise there is a circular
 		// initialization loop with the planner.
 		GlobalDefault: func(sv *settings.Values) string {
-			return ".3"
+			return "0.3"
 		},
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
 			f, err := strconv.ParseFloat(s, 64)
@@ -2034,7 +2049,6 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalFalse,
 	},
-
 	// CockroachDB extension.
 	`show_primary_key_constraint_on_not_visible_columns`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`show_primary_key_constraint_on_not_visible_columns`),
@@ -2159,6 +2173,57 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(copyFastPathDefault)
 		},
 	},
+
+	// CockroachDB extension.
+	`disable_hoist_projection_in_join_limitation`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`disable_hoist_projection_in_join_limitation`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("disable_hoist_projection_in_join_limitation", s)
+			if err != nil {
+				return err
+			}
+			m.SetDisableHoistProjectionInJoinLimitation(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DisableHoistProjectionInJoinLimitation), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`copy_from_atomic_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`copy_from_atomic_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("copy_from_atomic_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetCopyFromAtomicEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().CopyFromAtomicEnabled), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`enforce_home_region`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enforce_home_region`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enforce_home_region", s)
+			if err != nil {
+				return err
+			}
+			m.SetEnforceHomeRegion(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().EnforceHomeRegion), nil
+		},
+		GlobalDefault: globalFalse,
+	},
 }
 
 // We want test coverage for this on and off so make it metamorphic.
@@ -2209,6 +2274,34 @@ func init() {
 		sort.Strings(res)
 		return res
 	}()
+}
+
+// SetSessionVariable sets a new value for session setting `varName` in the
+// session settings owned by `evalCtx`, returning an error if not successful.
+// This function should only be used for testing. For general-purpose code,
+// please use SessionAccessor.SetSessionVar instead.
+func SetSessionVariable(
+	ctx context.Context, evalCtx eval.Context, varName, varValue string,
+) (err error) {
+	err = CheckSessionVariableValueValid(ctx, evalCtx.Settings, varName, varValue)
+	if err != nil {
+		return err
+	}
+	sdMutatorBase := sessionDataMutatorBase{
+		defaults: make(map[string]string),
+		settings: evalCtx.Settings,
+	}
+	sdMutator := sessionDataMutator{
+		data:                        evalCtx.SessionData(),
+		sessionDataMutatorBase:      sdMutatorBase,
+		sessionDataMutatorCallbacks: sessionDataMutatorCallbacks{},
+	}
+	_, sVar, err := getSessionVar(varName, false)
+	if err != nil {
+		return err
+	}
+
+	return sVar.Set(ctx, sdMutator, varValue)
 }
 
 // makePostgresBoolGetStringValFn returns a function that evaluates and returns

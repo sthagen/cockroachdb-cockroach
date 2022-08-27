@@ -15,7 +15,6 @@ import (
 	"math"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -550,7 +549,7 @@ func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (cat.Zone, err
 		return emptyZoneConfig, nil
 	}
 	zone, err := oc.cfg.GetZoneConfigForObject(
-		oc.codec(), oc.version(), config.ObjectID(desc.GetID()),
+		oc.codec(), config.ObjectID(desc.GetID()),
 	)
 	if err != nil {
 		return nil, err
@@ -564,12 +563,6 @@ func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (cat.Zone, err
 
 func (oc *optCatalog) codec() keys.SQLCodec {
 	return oc.planner.ExecCfg().Codec
-}
-
-func (oc *optCatalog) version() clusterversion.ClusterVersion {
-	return oc.planner.ExecCfg().Settings.Version.ActiveVersionOrEmpty(
-		oc.planner.EvalContext().Context,
-	)
 }
 
 // optView is a wrapper around catalog.TableDescriptor that implements
@@ -1254,6 +1247,70 @@ func (ot *optTable) Zone() cat.Zone {
 // IsPartitionAllBy is part of the cat.Table interface.
 func (ot *optTable) IsPartitionAllBy() bool {
 	return ot.desc.IsPartitionAllBy()
+}
+
+// HomeRegion is part of the cat.Table interface.
+func (ot *optTable) HomeRegion() (region string, ok bool) {
+	localityConfig := ot.desc.GetLocalityConfig()
+	if localityConfig == nil {
+		return "", false
+	}
+	regionalByTable := localityConfig.GetRegionalByTable()
+	if regionalByTable == nil {
+		return "", false
+	}
+	if regionalByTable.Region != nil {
+		return regionalByTable.Region.String(), true
+	}
+	if ot.zone.LeasePreferenceCount() != 1 {
+		return "", false
+	}
+	if ot.zone.LeasePreference(0).ConstraintCount() != 1 {
+		return "", false
+	}
+	if ot.zone.LeasePreference(0).Constraint(0).GetKey() != "region" {
+		return "", false
+	}
+	return ot.zone.LeasePreference(0).Constraint(0).GetValue(), true
+}
+
+// IsGlobalTable is part of the cat.Table interface.
+func (ot *optTable) IsGlobalTable() bool {
+	localityConfig := ot.desc.GetLocalityConfig()
+	if localityConfig == nil {
+		return false
+	}
+	return localityConfig.GetGlobal() != nil
+}
+
+// IsRegionalByRow is part of the cat.Table interface.
+func (ot *optTable) IsRegionalByRow() bool {
+	localityConfig := ot.desc.GetLocalityConfig()
+	if localityConfig == nil {
+		return false
+	}
+	return localityConfig.GetRegionalByRow() != nil
+}
+
+// HomeRegionColName is part of the cat.Table interface.
+func (ot *optTable) HomeRegionColName() (colName string, ok bool) {
+	localityConfig := ot.desc.GetLocalityConfig()
+	if localityConfig == nil {
+		return "", false
+	}
+	regionalByRowConfig := localityConfig.GetRegionalByRow()
+	if regionalByRowConfig == nil {
+		return "", false
+	}
+	if regionalByRowConfig.As == nil {
+		return "crdb_region", true
+	}
+	return *regionalByRowConfig.As, true
+}
+
+// GetDatabaseID is part of the cat.Table interface.
+func (ot *optTable) GetDatabaseID() descpb.ID {
+	return ot.desc.GetParentID()
 }
 
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
@@ -2194,6 +2251,31 @@ func (ot *optVirtualTable) Zone() cat.Zone {
 // IsPartitionAllBy is part of the cat.Table interface.
 func (ot *optVirtualTable) IsPartitionAllBy() bool {
 	return false
+}
+
+// HomeRegion is part of the cat.Table interface.
+func (ot *optVirtualTable) HomeRegion() (region string, ok bool) {
+	return "", false
+}
+
+// IsGlobalTable is part of the cat.Table interface.
+func (ot *optVirtualTable) IsGlobalTable() bool {
+	return false
+}
+
+// IsRegionalByRow is part of the cat.Table interface.
+func (ot *optVirtualTable) IsRegionalByRow() bool {
+	return false
+}
+
+// HomeRegionColName is part of the cat.Table interface.
+func (ot *optVirtualTable) HomeRegionColName() (colName string, ok bool) {
+	return "", false
+}
+
+// GetDatabaseID is part of the cat.Table interface.
+func (ot *optVirtualTable) GetDatabaseID() descpb.ID {
+	return 0
 }
 
 // CollectTypes is part of the cat.DataSource interface.

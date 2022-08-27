@@ -13,6 +13,7 @@ package scbuildstmt
 import (
 	"reflect"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -37,21 +38,24 @@ type supportedAlterTableCommand struct {
 	// extra round-trips to resolve the descriptor and its elements if we know
 	// that we cannot process the command.
 	extraChecks interface{}
+	// minSupportedClusterVersion is the minimal binary version that supports this
+	// ALTER TABLE command in the declarative schema changer.
+	minSupportedClusterVersion clusterversion.Key
 }
 
 // supportedAlterTableStatements tracks alter table operations fully supported by
 // declarative schema  changer. Operations marked as non-fully supported can
 // only be with the use_declarative_schema_changer session variable.
 var supportedAlterTableStatements = map[reflect.Type]supportedAlterTableCommand{
-	reflect.TypeOf((*tree.AlterTableAddColumn)(nil)):       {fn: alterTableAddColumn, on: true},
-	reflect.TypeOf((*tree.AlterTableDropColumn)(nil)):      {fn: alterTableDropColumn, on: true},
-	reflect.TypeOf((*tree.AlterTableAlterPrimaryKey)(nil)): {fn: alterTableAlterPrimaryKey, on: true},
+	reflect.TypeOf((*tree.AlterTableAddColumn)(nil)):       {fn: alterTableAddColumn, on: true, minSupportedClusterVersion: clusterversion.V22_1},
+	reflect.TypeOf((*tree.AlterTableDropColumn)(nil)):      {fn: alterTableDropColumn, on: true, minSupportedClusterVersion: clusterversion.Start22_2},
+	reflect.TypeOf((*tree.AlterTableAlterPrimaryKey)(nil)): {fn: alterTableAlterPrimaryKey, on: true, minSupportedClusterVersion: clusterversion.Start22_2},
 	reflect.TypeOf((*tree.AlterTableAddConstraint)(nil)): {fn: alterTableAddConstraint, on: true, extraChecks: func(
 		t *tree.AlterTableAddConstraint,
 	) bool {
 		d, ok := t.ConstraintDef.(*tree.UniqueConstraintTableDef)
 		return ok && d.PrimaryKey && t.ValidationBehavior == tree.ValidationDefault
-	}},
+	}, minSupportedClusterVersion: clusterversion.Start22_2},
 }
 
 func init() {
@@ -111,6 +115,18 @@ func alterTableIsSupported(n *tree.AlterTable, mode sessiondatapb.NewSchemaChang
 	return true
 }
 
+// alterTableAllCmdsSupportedInCurrentClusterVersion determines if all commands
+// in this `ALTER TABLE` statement are supported under the current cluster version.
+func alterTableAllCmdsSupportedInCurrentClusterVersion(b BuildCtx, n *tree.AlterTable) bool {
+	for _, cmd := range n.Cmds {
+		minSupportedClusterVersion := supportedAlterTableStatements[reflect.TypeOf(cmd)].minSupportedClusterVersion
+		if !b.EvalCtx().Settings.Version.IsActive(b, minSupportedClusterVersion) {
+			return false
+		}
+	}
+	return true
+}
+
 // AlterTable implements ALTER TABLE.
 func AlterTable(b BuildCtx, n *tree.AlterTable) {
 	// Hoist the constraints to separate clauses because other code assumes that
@@ -152,6 +168,7 @@ func AlterTable(b BuildCtx, n *tree.AlterTable) {
 		if !ok {
 			panic(scerrors.NotImplementedError(n))
 		}
+		b.IncrementSchemaChangeAlterCounter("table", cmd.TelemetryName())
 		// Invoke the callback function, with the concrete types.
 		fn := reflect.ValueOf(info.fn)
 		fn.Call([]reflect.Value{

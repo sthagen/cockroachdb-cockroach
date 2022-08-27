@@ -10,7 +10,6 @@ package streamproducer
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
@@ -213,7 +212,11 @@ func getReplicationStreamSpec(
 	planCtx := dsp.NewPlanningCtx(evalCtx.Ctx(), jobExecCtx.ExtendedEvalContext(),
 		nil /* planner */, noTxn, sql.DistributionTypeSystemTenantOnly)
 
-	replicatedSpans := j.Details().(jobspb.StreamReplicationDetails).Spans
+	details, ok := j.Details().(jobspb.StreamReplicationDetails)
+	if !ok {
+		return nil, errors.Errorf("job with id %d is not a replication stream job", streamID)
+	}
+	replicatedSpans := details.Spans
 	spans := make([]roachpb.Span, 0, len(replicatedSpans))
 	for _, span := range replicatedSpans {
 		spans = append(spans, *span)
@@ -264,7 +267,6 @@ func completeReplicationStream(
 					md.Progress.RunningStatus = "succeeding this producer job as the corresponding " +
 						"stream ingestion finished successfully"
 				} else {
-					fmt.Println("producer update stream ingestion status")
 					md.Progress.GetStreamReplication().StreamIngestionStatus =
 						jobspb.StreamReplicationProgress_FINISHED_UNSUCCESSFULLY
 					md.Progress.RunningStatus = "canceling this producer job as the corresponding " +

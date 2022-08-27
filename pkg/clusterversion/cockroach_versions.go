@@ -154,7 +154,7 @@ type Key int
 //
 //go:generate stringer -type=Key
 const (
-	_ Key = iota - 1 // want first named one to start at zero
+	invalidVersionKey Key = iota - 1 // want first named one to start at zero
 
 	// V21_2 is CockroachDB v21.2. It's used for all v21.2.x patch releases.
 	V21_2
@@ -168,28 +168,9 @@ const (
 	// This version must be active before any ProbeRequest is issued on the
 	// cluster.
 	ProbeRequest
-	// PublicSchemasWithDescriptors backs public schemas with descriptors.
-	PublicSchemasWithDescriptors
-	// EnsureSpanConfigReconciliation ensures that the host tenant has run its
-	// reconciliation process at least once.
-	EnsureSpanConfigReconciliation
-	// EnsureSpanConfigSubscription ensures that all KV nodes are subscribed to
-	// the global span configuration state, observing the entries installed as
-	// in EnsureSpanConfigReconciliation.
-	EnsureSpanConfigSubscription
 	// EnableSpanConfigStore enables the use of the span configs infrastructure
 	// in KV.
 	EnableSpanConfigStore
-	// EnablePebbleFormatVersionBlockProperties enables a new Pebble SSTable
-	// format version for block property collectors.
-	// NB: this cluster version is paired with PebbleFormatBlockPropertyCollector
-	// in a two-phase migration. The first cluster version acts as a gate for
-	// updating the format major version on all stores, while the second cluster
-	// version is used as a feature gate. A node in a cluster that sees the second
-	// version is guaranteed to have seen the first version, and therefore has an
-	// engine running at the required format major version, as do all other nodes
-	// in the cluster.
-	EnablePebbleFormatVersionBlockProperties
 	// EnableNewStoreRebalancer enables the new store rebalancer introduced in
 	// 22.1.
 	EnableNewStoreRebalancer
@@ -302,6 +283,17 @@ const (
 	WaitedForDelRangeInGCJob
 	// RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
 	RangefeedUseOneStreamPerNode
+	// NoNonMVCCAddSSTable adds a migration which waits for all
+	// schema changes to complete. After this point, no non-MVCC
+	// AddSSTable calls will be used outside of tenant streaming.
+	NoNonMVCCAddSSTable
+	// GCHintInReplicaState adds GC hint to replica state. When this version is
+	// enabled, replicas will populate GC hint and update them when necessary.
+	GCHintInReplicaState
+	// UpdateInvalidColumnIDsInSequenceBackReferences looks for invalid column
+	// ids in sequences' back references and attempts a best-effort-based matching
+	// to update those column IDs.
+	UpdateInvalidColumnIDsInSequenceBackReferences
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -317,8 +309,8 @@ const TODOPreV21_2 = V21_2
 // previously referenced a < 22.1 version until that check/gate can be removed.
 const TODOPreV22_1 = V22_1
 
-// versionsSingleton lists all historical versions here in chronological order,
-// with comments describing what backwards-incompatible features were
+// rawVersionsSingleton lists all historical versions here in chronological
+// order, with comments describing what backwards-incompatible features were
 // introduced.
 //
 // A roachpb.Version has the colloquial form MAJOR.MINOR[.PATCH][-INTERNAL],
@@ -334,7 +326,11 @@ const TODOPreV22_1 = V22_1
 // Such clusters would need to be wiped. As a result, do not bump the major or
 // minor version until we are absolutely sure that no new migrations will need
 // to be added (i.e., when cutting the final release candidate).
-var versionsSingleton = keyedVersions{
+//
+// rawVersionsSingleton is converted to versionsSingleton below, by adding a
+// large number to every major if building from master, so as to ensure that
+// master builds cannot be upgraded to release-branch builds.
+var rawVersionsSingleton = keyedVersions{
 	{
 		// V21_2 is CockroachDB v21.2. It's used for all v21.2.x patch releases.
 		Key:     V21_2,
@@ -351,24 +347,8 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 26},
 	},
 	{
-		Key:     PublicSchemasWithDescriptors,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 34},
-	},
-	{
-		Key:     EnsureSpanConfigReconciliation,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 36},
-	},
-	{
-		Key:     EnsureSpanConfigSubscription,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 38},
-	},
-	{
 		Key:     EnableSpanConfigStore,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 40},
-	},
-	{
-		Key:     EnablePebbleFormatVersionBlockProperties,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 64},
 	},
 	{
 		Key:     EnableNewStoreRebalancer,
@@ -500,12 +480,54 @@ var versionsSingleton = keyedVersions{
 		Key:     RangefeedUseOneStreamPerNode,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
 	},
+	{
+		Key:     NoNonMVCCAddSSTable,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 62},
+	},
+	{
+		Key:     GCHintInReplicaState,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 64},
+	},
+	{
+		Key:     UpdateInvalidColumnIDsInSequenceBackReferences,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 66},
+	},
 
 	// *************************************************
 	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 }
+
+const (
+	// unstableVersionsAbove is a cluster version Key above which any upgrades in
+	// this version are considered unstable development-only versions if it is not
+	// negative, and upgrading to them should permanently move a cluster to
+	// development versions. On master it should be the minted version of the last
+	// release, while on release branches it can be set to invalidVersionKey to
+	// disable marking any versions as development versions.
+	unstableVersionsAbove = V22_1
+
+	// finalVersion should be set on a release branch to the minted final cluster
+	// version key, e.g. to V22_2 on the release-22.2 branch once it is minted.
+	// Setting it has the effect of ensuring no versions are subsequently added.
+	finalVersion = invalidVersionKey
+)
+
+var versionsSingleton = func() keyedVersions {
+	if unstableVersionsAbove > invalidVersionKey {
+		const devOffset = 1000000
+		// Throw every version above the last release (which will be none on a release
+		// branch) 1 million major versions into the future, so any "upgrade" to a
+		// release branch build will be a downgrade and thus blocked.
+		for i := range rawVersionsSingleton {
+			if rawVersionsSingleton[i].Key > unstableVersionsAbove {
+				rawVersionsSingleton[i].Major += devOffset
+			}
+		}
+	}
+	return rawVersionsSingleton
+}()
 
 // TODO(irfansharif): clusterversion.binary{,MinimumSupported}Version
 // feels out of place. A "cluster version" and a "binary version" are two
@@ -525,11 +547,12 @@ var (
 )
 
 func init() {
-	const isReleaseBranch = false
-	if isReleaseBranch {
-		if binaryVersion != ByKey(V21_2) {
-			panic("unexpected cluster version greater than release's binary version")
+	if finalVersion > invalidVersionKey {
+		if binaryVersion != ByKey(finalVersion) {
+			panic("binary version does not match final version")
 		}
+	} else if binaryVersion.Internal == 0 {
+		panic("a non-upgrade cluster version must be the final version")
 	}
 }
 

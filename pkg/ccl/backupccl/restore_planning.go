@@ -653,12 +653,12 @@ func getDatabaseIDAndDesc(
 func dropDefaultUserDBs(ctx context.Context, execCfg *sql.ExecutorConfig) error {
 	return sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
 		ie := execCfg.InternalExecutor
-		_, err := ie.Exec(ctx, "drop-defaultdb", nil, "DROP DATABASE IF EXISTS defaultdb")
+		_, err := ie.Exec(ctx, "drop-defaultdb", txn, "DROP DATABASE IF EXISTS defaultdb")
 		if err != nil {
 			return err
 		}
 
-		_, err = ie.Exec(ctx, "drop-postgres", nil, "DROP DATABASE IF EXISTS postgres")
+		_, err = ie.Exec(ctx, "drop-postgres", txn, "DROP DATABASE IF EXISTS postgres")
 		if err != nil {
 			return err
 		}
@@ -787,6 +787,7 @@ func resolveOptionsForRestoreJobDescription(
 		SkipMissingViews:          opts.SkipMissingViews,
 		Detached:                  opts.Detached,
 		SchemaOnly:                opts.SchemaOnly,
+		VerifyData:                opts.VerifyData,
 	}
 
 	if opts.EncryptionPassphrase != nil {
@@ -879,6 +880,10 @@ func restorePlanHook(
 		!p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.Start22_2) {
 		return nil, nil, nil, false,
 			errors.New("cannot run RESTORE with schema_only until cluster has fully upgraded to 22.2")
+	}
+	if !restoreStmt.Options.SchemaOnly && restoreStmt.Options.VerifyData {
+		return nil, nil, nil, false,
+			errors.New("to set the verify_backup_table_data option, the schema_only option must be set")
 	}
 
 	fromFns := make([]func() ([]string, error), len(restoreStmt.From))
@@ -1694,6 +1699,7 @@ func doRestorePlan(
 		RestoreSystemUsers: restoreStmt.DescriptorCoverage == tree.SystemUsers,
 		PreRewriteTenantId: oldTenantID,
 		SchemaOnly:         restoreStmt.Options.SchemaOnly,
+		VerifyData:         restoreStmt.Options.VerifyData,
 	}
 
 	jr := jobs.Record{

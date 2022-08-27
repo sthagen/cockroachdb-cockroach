@@ -30,7 +30,7 @@ enum Problem {
   SuboptimalPlan = 2;
 
   // This statement was slow because of contention.
-  HighWaitTime = 3;
+  HighContentionTime = 3;
 
   // This statement was slow because of being retried multiple times, again due
   // to contention. The "high" threshold may be configured by the
@@ -56,7 +56,7 @@ message Transaction {
   [(gogoproto.customname) = "FingerprintID",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/roachpb.TransactionFingerprintID",
     (gogoproto.nullable) = false];
-  double user_priority = 3;
+  string user_priority = 3;
 }
 
 message Statement {

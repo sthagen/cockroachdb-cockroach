@@ -135,7 +135,7 @@ func (a *avgInt16WindowAgg) Compute(
 	}
 	newCurSumSize := a.curSum.Size()
 	if newCurSumSize != oldCurSumSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurSumSize - oldCurSumSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurSumSize - oldCurSumSize))
 	}
 }
 
@@ -150,7 +150,7 @@ func (a *avgInt16WindowAgg) Flush(outputIdx int) {
 
 		col[outputIdx].SetInt64(a.curCount)
 		if _, err := tree.DecimalCtx.Quo(&col[outputIdx], &a.curSum, &col[outputIdx]); err != nil {
-			colexecerror.InternalError(err)
+			colexecerror.ExpectedError(err)
 		}
 	}
 }
@@ -305,7 +305,7 @@ func (a *avgInt32WindowAgg) Compute(
 	}
 	newCurSumSize := a.curSum.Size()
 	if newCurSumSize != oldCurSumSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurSumSize - oldCurSumSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurSumSize - oldCurSumSize))
 	}
 }
 
@@ -320,7 +320,7 @@ func (a *avgInt32WindowAgg) Flush(outputIdx int) {
 
 		col[outputIdx].SetInt64(a.curCount)
 		if _, err := tree.DecimalCtx.Quo(&col[outputIdx], &a.curSum, &col[outputIdx]); err != nil {
-			colexecerror.InternalError(err)
+			colexecerror.ExpectedError(err)
 		}
 	}
 }
@@ -475,7 +475,7 @@ func (a *avgInt64WindowAgg) Compute(
 	}
 	newCurSumSize := a.curSum.Size()
 	if newCurSumSize != oldCurSumSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurSumSize - oldCurSumSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurSumSize - oldCurSumSize))
 	}
 }
 
@@ -490,7 +490,7 @@ func (a *avgInt64WindowAgg) Flush(outputIdx int) {
 
 		col[outputIdx].SetInt64(a.curCount)
 		if _, err := tree.DecimalCtx.Quo(&col[outputIdx], &a.curSum, &col[outputIdx]); err != nil {
-			colexecerror.InternalError(err)
+			colexecerror.ExpectedError(err)
 		}
 	}
 }
@@ -643,7 +643,7 @@ func (a *avgDecimalWindowAgg) Compute(
 	}
 	newCurSumSize := a.curSum.Size()
 	if newCurSumSize != oldCurSumSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurSumSize - oldCurSumSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurSumSize - oldCurSumSize))
 	}
 }
 
@@ -658,7 +658,7 @@ func (a *avgDecimalWindowAgg) Flush(outputIdx int) {
 
 		col[outputIdx].SetInt64(a.curCount)
 		if _, err := tree.DecimalCtx.Quo(&col[outputIdx], &a.curSum, &col[outputIdx]); err != nil {
-			colexecerror.InternalError(err)
+			colexecerror.ExpectedError(err)
 		}
 	}
 }
@@ -803,7 +803,7 @@ func (a *avgFloat64WindowAgg) Compute(
 	}
 	var newCurSumSize uintptr
 	if newCurSumSize != oldCurSumSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurSumSize - oldCurSumSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurSumSize - oldCurSumSize))
 	}
 }
 
@@ -943,7 +943,7 @@ func (a *avgIntervalWindowAgg) Compute(
 	}
 	var newCurSumSize uintptr
 	if newCurSumSize != oldCurSumSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurSumSize - oldCurSumSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurSumSize - oldCurSumSize))
 	}
 }
 

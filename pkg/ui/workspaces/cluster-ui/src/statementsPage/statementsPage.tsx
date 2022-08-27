@@ -166,16 +166,21 @@ export function filterBySearchQuery(
   search: string,
 ): boolean {
   const matchString = statement.label.toLowerCase();
+  const matchFingerPrintId = statement.aggregatedFingerprintHexID;
+
   // If search term is wrapped by quotes, do the exact search term.
   if (search.startsWith('"') && search.endsWith('"')) {
     search = search.substring(1, search.length - 1);
-    return matchString.includes(search);
+
+    return matchString.includes(search) || matchFingerPrintId.includes(search);
   }
 
   return search
     .toLowerCase()
     .split(" ")
-    .every(val => matchString.includes(val));
+    .every(
+      val => matchString.includes(val) || matchFingerPrintId.includes(val),
+    );
 }
 
 export class StatementsPage extends React.Component<
@@ -678,7 +683,7 @@ export class StatementsPage extends React.Component<
         <Delayed delay={moment.duration(2, "s")}>
           <InlineAlert
             intent="info"
-            title="If the selected time period contains a large amount of data, this page might take a few minutes to load."
+            title="If the selected time interval contains a large amount of data, this page might take a few minutes to load."
           />
         </Delayed>
       );

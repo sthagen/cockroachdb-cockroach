@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
@@ -50,9 +52,13 @@ import (
 type pgConnReplicationFeedSource struct {
 	t      *testing.T
 	conn   *pgx.Conn
-	rows   pgx.Rows
-	codec  pgConnEventDecoder
 	cancel func()
+	mu     struct {
+		syncutil.Mutex
+
+		rows  pgx.Rows
+		codec pgConnEventDecoder
+	}
 }
 
 var _ streamingtest.FeedSource = (*pgConnReplicationFeedSource)(nil)
@@ -68,7 +74,10 @@ type eventDecoderFactory func(t *testing.T, rows pgx.Rows) pgConnEventDecoder
 // sql connection.
 func (f *pgConnReplicationFeedSource) Close(ctx context.Context) {
 	f.cancel()
-	f.rows.Close()
+
+	f.mu.Lock()
+	f.mu.rows.Close()
+	f.mu.Unlock()
 	require.NoError(f.t, f.conn.Close(ctx))
 }
 
@@ -120,19 +129,30 @@ func (d *partitionStreamDecoder) decode() {
 
 // Next implements the streamingtest.FeedSource interface.
 func (f *pgConnReplicationFeedSource) Next() (streamingccl.Event, bool) {
-	if e := f.codec.pop(); e != nil {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.mu.codec.pop(); e != nil {
 		return e, true
 	}
 
-	if !f.rows.Next() {
+	if !f.mu.rows.Next() {
 		// The event doesn't matter since we always expect more rows.
 		return nil, false
 	}
 
-	f.codec.decode()
-	e := f.codec.pop()
+	f.mu.codec.decode()
+	e := f.mu.codec.pop()
 	require.NotNil(f.t, e)
 	return e, true
+}
+
+// Error implements the streamingtest.FeedSource interface.
+func (f *pgConnReplicationFeedSource) Error() error {
+	var err error
+	f.mu.Lock()
+	err = f.mu.rows.Err()
+	f.mu.Unlock()
+	return err
 }
 
 // startReplication starts replication stream, specified as query and its args.
@@ -167,10 +187,10 @@ func startReplication(
 	feedSource := &pgConnReplicationFeedSource{
 		t:      t,
 		conn:   conn,
-		rows:   rows,
-		codec:  codecFactory(t, rows),
 		cancel: cancel,
 	}
+	feedSource.mu.rows = rows
+	feedSource.mu.codec = codecFactory(t, rows)
 	return feedSource, streamingtest.MakeReplicationFeed(t, feedSource)
 }
 
@@ -315,7 +335,9 @@ func TestStreamPartition(t *testing.T) {
 	srcTenant.SQL.Exec(t, `
 CREATE DATABASE d;
 CREATE TABLE d.t1(i int primary key, a string, b string);
+CREATE TABLE d.t2(i int primary key, a string, b string);
 INSERT INTO d.t1 (i) VALUES (42);
+INSERT INTO d.t2 (i) VALUES (42);
 USE d;
 `)
 
@@ -325,6 +347,34 @@ USE d;
 
 	const streamPartitionQuery = `SELECT * FROM crdb_internal.stream_partition($1, $2)`
 	t1Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t1")
+	t2Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t2")
+
+	t.Run("stream-table-cursor-error", func(t *testing.T) {
+		_, feed := startReplication(t, h, makePartitionStreamDecoder,
+			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, hlc.Timestamp{}, "t2"))
+		defer feed.Close(ctx)
+
+		subscribedSpan := h.TableSpan(srcTenant.Codec, "t2")
+		// Send a ClearRange to trigger rows cursor to return internal error from rangefeed.
+		// Choose 't2' so that it doesn't trigger error on other registered span in rangefeeds,
+		// affecting other tests.
+		_, err := kv.SendWrapped(ctx, h.SysServer.DB().NonTransactionalSender(), &roachpb.ClearRangeRequest{
+			RequestHeader: roachpb.RequestHeader{
+				Key:    subscribedSpan.Key,
+				EndKey: subscribedSpan.EndKey,
+			},
+		})
+		require.Nil(t, err)
+
+		expected := streamingtest.EncodeKV(t, srcTenant.Codec, t2Descr, 42)
+		feed.ObserveKey(ctx, expected.Key)
+		feed.ObserveError(ctx, func(err error) bool {
+			return strings.Contains(err.Error(), "unexpected MVCC history mutation") ||
+				// TODO(casper): disabled this once we figured out why we have context cancellation
+				// emitted from ingestion side.
+				strings.Contains(err.Error(), "context canceled")
+		})
+	})
 
 	t.Run("stream-table", func(t *testing.T) {
 		_, feed := startReplication(t, h, makePartitionStreamDecoder,
@@ -373,7 +423,7 @@ USE d;
 
 	t.Run("stream-batches-events", func(t *testing.T) {
 		srcTenant.SQL.Exec(t, `
-CREATE TABLE t2(
+CREATE TABLE t3(
  i INT PRIMARY KEY, 
  a STRING, 
  b STRING,
@@ -384,7 +434,7 @@ CREATE TABLE t2(
 		addRows := func(start, n int) {
 			// Insert few more rows into the table.  We expect
 			for i := start; i < n; i++ {
-				srcTenant.SQL.Exec(t, "INSERT INTO t2 (i, a, b) VALUES ($1, $2, $3)",
+				srcTenant.SQL.Exec(t, "INSERT INTO t3 (i, a, b) VALUES ($1, $2, $3)",
 					i, fmt.Sprintf("i=%d", i), fmt.Sprintf("10-i=%d", 10-i))
 			}
 		}
@@ -402,10 +452,12 @@ CREATE TABLE t2(
 		// By default, we batch up to 1MB of data.
 		// Verify we see event batches w/ more than 1 message.
 		// TODO(yevgeniy): Extend testing libraries to support batch events and span checkpoints.
-		codec := source.codec.(*partitionStreamDecoder)
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		codec := source.mu.codec.(*partitionStreamDecoder)
 		for {
-			require.True(t, source.rows.Next())
-			source.codec.decode()
+			require.True(t, source.mu.rows.Next())
+			source.mu.codec.decode()
 			if codec.e.Batch != nil && len(codec.e.Batch.KeyValues) > 0 {
 				break
 			}
@@ -468,10 +520,12 @@ USE d;
 			srcTenant.SQL.Exec(t, fmt.Sprintf("IMPORT INTO %s CSV DATA ($1)", table), dataSrv.URL)
 		}
 
-		codec := source.codec.(*partitionStreamDecoder)
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		codec := source.mu.codec.(*partitionStreamDecoder)
 		for {
-			require.True(t, source.rows.Next())
-			source.codec.decode()
+			require.True(t, source.mu.rows.Next())
+			source.mu.codec.decode()
 			if codec.e.Batch != nil {
 				if len(codec.e.Batch.Ssts) > 0 {
 					require.Equal(t, 1, len(codec.e.Batch.Ssts))
@@ -615,13 +669,8 @@ USE d;
 	defer feed.Close(ctx)
 
 	// TODO(casper): Replace with DROP TABLE once drop table uses the MVCC-compatible DelRange
-	tableSpan := func(table string) roachpb.Span {
-		desc := desctestutils.TestingGetPublicTableDescriptor(
-			h.SysServer.DB(), srcTenant.Codec, "d", table)
-		return desc.PrimaryIndexSpan(srcTenant.Codec)
-	}
-
-	t1Span, t2Span, t3Span := tableSpan("t1"), tableSpan("t2"), tableSpan("t3")
+	t1Span, t2Span, t3Span := h.TableSpan(srcTenant.Codec, "t1"),
+		h.TableSpan(srcTenant.Codec, "t2"), h.TableSpan(srcTenant.Codec, "t3")
 	// Range deleted is outside the subscribed spans
 	require.NoError(t, h.SysServer.DB().DelRangeUsingTombstone(ctx, t2Span.EndKey, t3Span.Key))
 	// Range is t1s - t2e, emitting 2 events, t1s - t1e and t2s - t2e.
@@ -634,14 +683,16 @@ USE d;
 	expectedDelRangeSpan2 := roachpb.Span{Key: t2Span.Key, EndKey: t2Span.EndKey}
 	expectedDelRangeSpan3 := roachpb.Span{Key: t2Span.Key, EndKey: t2Span.Key.Next()}
 
-	codec := source.codec.(*partitionStreamDecoder)
+	codec := source.mu.codec.(*partitionStreamDecoder)
 	receivedDelRanges := make([]roachpb.RangeFeedDeleteRange, 0, 3)
 	for {
-		require.True(t, source.rows.Next())
-		source.codec.decode()
+		source.mu.Lock()
+		require.True(t, source.mu.rows.Next())
+		source.mu.codec.decode()
 		if codec.e.Batch != nil {
 			receivedDelRanges = append(receivedDelRanges, codec.e.Batch.DelRanges...)
 		}
+		source.mu.Unlock()
 		if len(receivedDelRanges) == 3 {
 			break
 		}
@@ -680,13 +731,15 @@ USE d;
 	receivedDelRanges = receivedDelRanges[:0]
 	receivedKVs := make([]roachpb.KeyValue, 0)
 	for {
-		require.True(t, source.rows.Next())
-		source.codec.decode()
+		source.mu.Lock()
+		require.True(t, source.mu.rows.Next())
+		source.mu.codec.decode()
 		if codec.e.Batch != nil {
 			require.Empty(t, codec.e.Batch.Ssts)
 			receivedKVs = append(receivedKVs, codec.e.Batch.KeyValues...)
 			receivedDelRanges = append(receivedDelRanges, codec.e.Batch.DelRanges...)
 		}
+		source.mu.Unlock()
 
 		if len(receivedDelRanges) == 2 && len(receivedKVs) == 1 {
 			break

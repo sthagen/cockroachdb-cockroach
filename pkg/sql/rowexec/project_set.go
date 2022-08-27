@@ -156,6 +156,13 @@ func (ps *projectSetProcessor) nextInputRow() (
 		if fn := ps.funcs[i]; fn != nil {
 			// A set-generating function. Prepare its ValueGenerator.
 
+			// First, make sure to close its ValueGenerator from the previous
+			// input row (if it exists).
+			if ps.gens[i] != nil {
+				ps.gens[i].Close(ps.Ctx)
+				ps.gens[i] = nil
+			}
+
 			// Set ExprHelper.row so that we can use it as an IndexedVarContainer.
 			ps.exprHelpers[i].Row = row
 
@@ -166,6 +173,11 @@ func (ps *projectSetProcessor) nextInputRow() (
 			}
 			if gen == nil {
 				gen = builtins.EmptyGenerator()
+			}
+			if aliasSetter, ok := gen.(eval.AliasAwareValueGenerator); ok {
+				if err := aliasSetter.SetAlias(ps.spec.GeneratedColumns, ps.spec.GeneratedColumnLabels); err != nil {
+					return nil, nil, err
+				}
 			}
 			if err := gen.Start(ps.Ctx, ps.FlowCtx.Txn); err != nil {
 				return nil, nil, err

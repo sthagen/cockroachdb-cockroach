@@ -1664,7 +1664,10 @@ func (s *statusServer) nodesHelper(
 	}
 
 	clock := s.admin.server.clock
-	resp.LivenessByNodeID = getLivenessStatusMap(s.nodeLiveness, clock.Now().GoTime(), s.st)
+	resp.LivenessByNodeID, err = getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, 0, err
+	}
 	return &resp, next, nil
 }
 
@@ -1681,7 +1684,10 @@ func (s *statusServer) nodesStatusWithLiveness(
 		return nil, err
 	}
 	clock := s.admin.server.clock
-	statusMap := getLivenessStatusMap(s.nodeLiveness, clock.Now().GoTime(), s.st)
+	statusMap, err := getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, err
+	}
 	ret := make(map[roachpb.NodeID]nodeStatusWithLiveness)
 	for _, node := range nodes.Nodes {
 		nodeID := node.Desc.NodeID
@@ -2045,6 +2051,7 @@ func (s *statusServer) rangesHelper(
 				QuiescentEqualsTicking: raftStatus != nil && metrics.Quiescent == metrics.Ticking,
 				RaftLogTooLarge:        metrics.RaftLogTooLarge,
 				CircuitBreakerError:    len(state.CircuitBreakerError) > 0,
+				PausedFollowers:        metrics.PausedFollowerCount > 0,
 			},
 			LeaseStatus:                 metrics.LeaseStatus,
 			Quiescent:                   metrics.Quiescent,

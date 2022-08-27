@@ -19,7 +19,10 @@ import {
   TimestampToMoment,
   RenderCount,
   DATE_FORMAT_24_UTC,
+  explainPlan,
+  limitText,
 } from "../../util";
+import { Anchor } from "../../anchor";
 
 export type PlanHashStats =
   cockroach.server.serverpb.StatementDetailsResponse.ICollectedStatementGroupedByPlanHash;
@@ -33,7 +36,7 @@ const planDetailsColumnLabels = {
   fullScan: "Full Scan",
   insights: "Insights",
   lastExecTime: "Last Execution Time",
-  planID: "Plan ID",
+  planGist: "Plan Gist",
   vectorized: "Vectorized",
 };
 export type PlanDetailsTableColumnKeys = keyof typeof planDetailsColumnLabels;
@@ -43,14 +46,21 @@ type PlanDetailsTableTitleType = {
 };
 
 export const planDetailsTableTitles: PlanDetailsTableTitleType = {
-  planID: () => {
+  planGist: () => {
     return (
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The ID of the Plan."}
+        content={
+          <p>
+            The Gist of the{" "}
+            <Anchor href={explainPlan} target="_blank">
+              Explain Plan.
+            </Anchor>
+          </p>
+        }
       >
-        {planDetailsColumnLabels.planID}
+        {planDetailsColumnLabels.planGist}
       </Tooltip>
     );
   },
@@ -59,7 +69,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The last time this Plan was executed."}
+        content={"The last time this Explain Plan was executed."}
       >
         {planDetailsColumnLabels.lastExecTime}
       </Tooltip>
@@ -70,7 +80,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The average execution time for this Plan."}
+        content={"The average execution time for this Explain Plan."}
       >
         {planDetailsColumnLabels.avgExecTime}
       </Tooltip>
@@ -81,7 +91,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The execution count for this Plan."}
+        content={"The execution count for this Explain Plan."}
       >
         {planDetailsColumnLabels.execCount}
       </Tooltip>
@@ -92,7 +102,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The average of rows read by this Plan."}
+        content={"The average of rows read by this Explain Plan."}
       >
         {planDetailsColumnLabels.avgRowsRead}
       </Tooltip>
@@ -103,7 +113,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"If the Plan executed a Full Scan."}
+        content={"If the Explain Plan executed a full scan."}
       >
         {planDetailsColumnLabels.fullScan}
       </Tooltip>
@@ -114,7 +124,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"If the Plan was distributed."}
+        content={"If the Explain Plan was distributed."}
       >
         {planDetailsColumnLabels.distSQL}
       </Tooltip>
@@ -125,7 +135,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"If the Plan was vectorized."}
+        content={"If the Explain Plan was vectorized."}
       >
         {planDetailsColumnLabels.vectorized}
       </Tooltip>
@@ -136,7 +146,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The amount of insights for the plan."}
+        content={"The amount of insights for the Explain Plan."}
       >
         {planDetailsColumnLabels.insights}
       </Tooltip>
@@ -161,12 +171,16 @@ export function makeExplainPlanColumns(
   const count = (v: number) => v.toFixed(1);
   return [
     {
-      name: "planID",
-      title: planDetailsTableTitles.planID(),
+      name: "planGist",
+      title: planDetailsTableTitles.planGist(),
       cell: (item: PlanHashStats) => (
-        <a onClick={() => handleDetails(item)}>{longToInt(item.plan_hash)}</a>
+        <Tooltip placement="bottom" content={item.stats.plan_gists[0]}>
+          <a onClick={() => handleDetails(item)}>
+            {limitText(item.stats.plan_gists[0], 25)}
+          </a>
+        </Tooltip>
       ),
-      sort: (item: PlanHashStats) => longToInt(item.plan_hash),
+      sort: (item: PlanHashStats) => item.stats.plan_gists[0],
       alwaysShow: true,
     },
     {

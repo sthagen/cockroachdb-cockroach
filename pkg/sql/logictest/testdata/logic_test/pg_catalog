@@ -4161,6 +4161,7 @@ bytea_output                                          hex                 NULL  
 check_function_bodies                                 on                  NULL      NULL        NULL        string
 client_encoding                                       UTF8                NULL      NULL        NULL        string
 client_min_messages                                   notice              NULL      NULL        NULL        string
+copy_from_atomic_enabled                              on                  NULL      NULL        NULL        string
 cost_scans_with_default_col_size                      off                 NULL      NULL        NULL        string
 database                                              test                NULL      NULL        NULL        string
 datestyle                                             ISO, MDY            NULL      NULL        NULL        string
@@ -4173,6 +4174,7 @@ default_transaction_quality_of_service                regular             NULL  
 default_transaction_read_only                         off                 NULL      NULL        NULL        string
 default_transaction_use_follower_reads                off                 NULL      NULL        NULL        string
 default_with_oids                                     off                 NULL      NULL        NULL        string
+disable_hoist_projection_in_join_limitation           off                 NULL      NULL        NULL        string
 disable_partially_distributed_plans                   off                 NULL      NULL        NULL        string
 disable_plan_gists                                    off                 NULL      NULL        NULL        string
 disallow_full_table_scans                             off                 NULL      NULL        NULL        string
@@ -4187,6 +4189,7 @@ enable_multiregion_placement_policy                   off                 NULL  
 enable_seqscan                                        on                  NULL      NULL        NULL        string
 enable_super_regions                                  off                 NULL      NULL        NULL        string
 enable_zigzag_join                                    on                  NULL      NULL        NULL        string
+enforce_home_region                                   off                 NULL      NULL        NULL        string
 escape_string_warning                                 on                  NULL      NULL        NULL        string
 expect_and_ignore_not_visible_columns_in_copy         off                 NULL      NULL        NULL        string
 experimental_distsql_planning                         off                 NULL      NULL        NULL        string
@@ -4222,6 +4225,7 @@ node_id                                               1                   NULL  
 null_ordered_last                                     off                 NULL      NULL        NULL        string
 on_update_rehome_row_enabled                          on                  NULL      NULL        NULL        string
 opt_split_scan_limit                                  2048                NULL      NULL        NULL        string
+optimizer_use_forecasts                               on                  NULL      NULL        NULL        string
 optimizer_use_histograms                              on                  NULL      NULL        NULL        string
 optimizer_use_multicol_stats                          on                  NULL      NULL        NULL        string
 optimizer_use_not_visible_indexes                     off                 NULL      NULL        NULL        string
@@ -4287,6 +4291,7 @@ bytea_output                                          hex                 NULL  
 check_function_bodies                                 on                  NULL  user     NULL      on                  on
 client_encoding                                       UTF8                NULL  user     NULL      UTF8                UTF8
 client_min_messages                                   notice              NULL  user     NULL      notice              notice
+copy_from_atomic_enabled                              on                  NULL  user     NULL      on                  on
 cost_scans_with_default_col_size                      off                 NULL  user     NULL      off                 off
 database                                              test                NULL  user     NULL      ·                   test
 datestyle                                             ISO, MDY            NULL  user     NULL      ISO, MDY            ISO, MDY
@@ -4299,6 +4304,7 @@ default_transaction_quality_of_service                regular             NULL  
 default_transaction_read_only                         off                 NULL  user     NULL      off                 off
 default_transaction_use_follower_reads                off                 NULL  user     NULL      off                 off
 default_with_oids                                     off                 NULL  user     NULL      off                 off
+disable_hoist_projection_in_join_limitation           off                 NULL  user     NULL      off                 off
 disable_partially_distributed_plans                   off                 NULL  user     NULL      off                 off
 disable_plan_gists                                    off                 NULL  user     NULL      off                 off
 disallow_full_table_scans                             off                 NULL  user     NULL      off                 off
@@ -4313,6 +4319,7 @@ enable_multiregion_placement_policy                   off                 NULL  
 enable_seqscan                                        on                  NULL  user     NULL      on                  on
 enable_super_regions                                  off                 NULL  user     NULL      off                 off
 enable_zigzag_join                                    on                  NULL  user     NULL      on                  on
+enforce_home_region                                   off                 NULL  user     NULL      off                 off
 escape_string_warning                                 on                  NULL  user     NULL      on                  on
 expect_and_ignore_not_visible_columns_in_copy         off                 NULL  user     NULL      off                 off
 experimental_distsql_planning                         off                 NULL  user     NULL      off                 off
@@ -4348,13 +4355,14 @@ node_id                                               1                   NULL  
 null_ordered_last                                     off                 NULL  user     NULL      off                 off
 on_update_rehome_row_enabled                          on                  NULL  user     NULL      on                  on
 opt_split_scan_limit                                  2048                NULL  user     NULL      2048                2048
+optimizer_use_forecasts                               on                  NULL  user     NULL      on                  on
 optimizer_use_histograms                              on                  NULL  user     NULL      on                  on
 optimizer_use_multicol_stats                          on                  NULL  user     NULL      on                  on
 optimizer_use_not_visible_indexes                     off                 NULL  user     NULL      off                 off
 override_multi_region_zone_config                     off                 NULL  user     NULL      off                 off
 parallelize_multi_key_lookup_joins_enabled            off                 NULL  user     NULL      false               false
 password_encryption                                   scram-sha-256       NULL  user     NULL      scram-sha-256       scram-sha-256
-pg_trgm.similarity_threshold                          0.3                 NULL  user     NULL      .3                  .3
+pg_trgm.similarity_threshold                          0.3                 NULL  user     NULL      0.3                 0.3
 prefer_lookup_joins_for_fks                           off                 NULL  user     NULL      off                 off
 propagate_input_ordering                              off                 NULL  user     NULL      off                 off
 reorder_joins_limit                                   8                   NULL  user     NULL      8                   8
@@ -4408,6 +4416,7 @@ check_function_bodies                                 NULL    NULL     NULL     
 client_encoding                                       NULL    NULL     NULL     NULL        NULL
 client_min_messages                                   NULL    NULL     NULL     NULL        NULL
 copy_fast_path_enabled                                NULL    NULL     NULL     NULL        NULL
+copy_from_atomic_enabled                              NULL    NULL     NULL     NULL        NULL
 cost_scans_with_default_col_size                      NULL    NULL     NULL     NULL        NULL
 crdb_version                                          NULL    NULL     NULL     NULL        NULL
 database                                              NULL    NULL     NULL     NULL        NULL
@@ -4421,6 +4430,7 @@ default_transaction_quality_of_service                NULL    NULL     NULL     
 default_transaction_read_only                         NULL    NULL     NULL     NULL        NULL
 default_transaction_use_follower_reads                NULL    NULL     NULL     NULL        NULL
 default_with_oids                                     NULL    NULL     NULL     NULL        NULL
+disable_hoist_projection_in_join_limitation           NULL    NULL     NULL     NULL        NULL
 disable_partially_distributed_plans                   NULL    NULL     NULL     NULL        NULL
 disable_plan_gists                                    NULL    NULL     NULL     NULL        NULL
 disallow_full_table_scans                             NULL    NULL     NULL     NULL        NULL
@@ -4436,6 +4446,7 @@ enable_multiregion_placement_policy                   NULL    NULL     NULL     
 enable_seqscan                                        NULL    NULL     NULL     NULL        NULL
 enable_super_regions                                  NULL    NULL     NULL     NULL        NULL
 enable_zigzag_join                                    NULL    NULL     NULL     NULL        NULL
+enforce_home_region                                   NULL    NULL     NULL     NULL        NULL
 escape_string_warning                                 NULL    NULL     NULL     NULL        NULL
 expect_and_ignore_not_visible_columns_in_copy         NULL    NULL     NULL     NULL        NULL
 experimental_distsql_planning                         NULL    NULL     NULL     NULL        NULL
@@ -4472,6 +4483,7 @@ null_ordered_last                                     NULL    NULL     NULL     
 on_update_rehome_row_enabled                          NULL    NULL     NULL     NULL        NULL
 opt_split_scan_limit                                  NULL    NULL     NULL     NULL        NULL
 optimizer                                             NULL    NULL     NULL     NULL        NULL
+optimizer_use_forecasts                               NULL    NULL     NULL     NULL        NULL
 optimizer_use_histograms                              NULL    NULL     NULL     NULL        NULL
 optimizer_use_multicol_stats                          NULL    NULL     NULL     NULL        NULL
 optimizer_use_not_visible_indexes                     NULL    NULL     NULL     NULL        NULL
@@ -4651,7 +4663,7 @@ FROM pg_proc p
 JOIN pg_type t ON t.typinput = p.oid
 WHERE t.typname = '_int4'
 ----
-2013  array_in  array_in
+2017  array_in  array_in
 
 ## #16285
 ## int2vectors should be 0-indexed
@@ -4689,7 +4701,7 @@ SELECT cur_max_builtin_oid FROM [SELECT max(oid) as cur_max_builtin_oid FROM pg_
 query TT
 SELECT proname, oid FROM pg_catalog.pg_proc WHERE oid = $cur_max_builtin_oid
 ----
-to_regtype  2033
+to_regtype  2037
 
 ## Ensure that unnest works with oid wrapper arrays
 

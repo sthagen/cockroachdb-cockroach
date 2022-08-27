@@ -375,8 +375,9 @@ message DeleteRangeRequest {
   // for conflicts and adjust MVCC stats). This option cannot be used in a
   // transaction, and it cannot be combined with Inline or ReturnKeys.
   //
-  // The caller must check the MVCCRangeTombstones version gate before using
-  // this parameter, as it is new in 22.2.
+  // The caller must check storage.CanUseMVCCRangeTombstones before using this
+  // parameter: it is new in 22.2, and controlled by the default-off cluster
+  // setting storage.mvcc.range_tombstones.enabled.
   bool use_range_tombstone = 5;
   // If enabled together with UseRangeTombstone, the MVCC range tombstone will
   // only be written if there exists point key/tombstones in the span that
@@ -384,6 +385,10 @@ message DeleteRangeRequest {
   // considers empty spans equivalent to being covered by an MVCC range
   // tombstone, so it will omit the write across an entirely empty span too.
   bool idempotent_tombstone = 7;
+  // If enabled and DeleteRangeRequest is deleting the whole range with a range
+  // tombstone, GCHint on replica will be updated to notify mvcc gc queue
+  // that this range would benefit from optimized GC process.
+  bool update_range_delete_gc_hint = 8 [(gogoproto.customname) = "UpdateRangeDeleteGCHint"];
 
   DeleteRangePredicates predicates = 6 [(gogoproto.nullable) = false];
 }

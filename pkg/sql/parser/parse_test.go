@@ -450,7 +450,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`DROP TRIGGER a`, 28296, `drop`, ``},
 
 		{`DISCARD PLANS`, 0, `discard plans`, ``},
-		{`DISCARD SEQUENCES`, 0, `discard sequences`, ``},
 		{`DISCARD TEMP`, 0, `discard temp`, ``},
 		{`DISCARD TEMPORARY`, 0, `discard temp`, ``},
 
@@ -523,8 +522,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE INDEX a ON b(a DESC NULLS FIRST)`, 6224, ``, ``},
 
 		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
-
-		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`, ``},
 
 		{`SELECT a(b) 'c'`, 0, `a(...) SCONST`, ``},
 		{`SELECT UNIQUE (SELECT b)`, 0, `UNIQUE predicate`, ``},

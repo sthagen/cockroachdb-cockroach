@@ -733,7 +733,7 @@ func TestMVCCRangeKeyStackExcise(t *testing.T) {
 	}
 }
 
-func TestMVCCRangeKeyStackFirstAbove(t *testing.T) {
+func TestMVCCRangeKeyStackFirstAtOrAbove(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	rangeKeys := rangeKeyStack("a", "f", map[int]MVCCValue{6: {}, 4: {}, 3: {}, 1: {}})
@@ -753,7 +753,7 @@ func TestMVCCRangeKeyStackFirstAbove(t *testing.T) {
 	}
 	for _, tc := range testcases {
 		t.Run(fmt.Sprintf("%d", tc.ts), func(t *testing.T) {
-			v, ok := rangeKeys.FirstAbove(wallTS(tc.ts))
+			v, ok := rangeKeys.FirstAtOrAbove(wallTS(tc.ts))
 			if tc.expect == 0 {
 				require.False(t, ok)
 				require.Empty(t, v)
@@ -765,7 +765,7 @@ func TestMVCCRangeKeyStackFirstAbove(t *testing.T) {
 	}
 }
 
-func TestMVCCRangeKeyStackFirstBelow(t *testing.T) {
+func TestMVCCRangeKeyStackFirstAtOrBelow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	rangeKeys := rangeKeyStack("a", "f", map[int]MVCCValue{6: {}, 4: {}, 3: {}, 1: {}})
@@ -785,7 +785,7 @@ func TestMVCCRangeKeyStackFirstBelow(t *testing.T) {
 	}
 	for _, tc := range testcases {
 		t.Run(fmt.Sprintf("%d", tc.ts), func(t *testing.T) {
-			v, ok := rangeKeys.FirstBelow(wallTS(tc.ts))
+			v, ok := rangeKeys.FirstAtOrBelow(wallTS(tc.ts))
 			if tc.expect == 0 {
 				require.False(t, ok)
 				require.Empty(t, v)
@@ -865,6 +865,27 @@ func TestMVCCRangeKeyStackRemove(t *testing.T) {
 			require.Equal(t, expect, rangeKeys)
 		})
 	}
+}
+
+func TestMVCCRangeKeyStackString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	DisableMetamorphicSimpleValueEncoding(t)
+
+	require.Equal(t, "{a-f}[]",
+		rangeKeyStack("a", "f", map[int]MVCCValue{}).String())
+
+	require.Equal(t, "aa{a-f}[]",
+		rangeKeyStack("aaa", "aaf", map[int]MVCCValue{}).String())
+
+	require.Equal(t, "{a-f}[0.000000001,0=]",
+		rangeKeyStack("a", "f", map[int]MVCCValue{1: {}}).String())
+
+	require.Equal(t, "{a-f}[0.000000007,0= 0.000000005,0= 0.000000003,0=]",
+		rangeKeyStack("a", "f", map[int]MVCCValue{7: {}, 5: {}, 3: {}}).String())
+
+	require.Equal(t, "{a-f}[0.000000007,0= 0.000000005,0=00000004650a020809 0.000000003,0=]",
+		rangeKeyStack("a", "f", map[int]MVCCValue{7: {}, 5: tombstoneLocalTS(9), 3: {}}).String())
 }
 
 func TestMVCCRangeKeyStackTrim(t *testing.T) {

@@ -390,21 +390,6 @@ var optUseMultiColStatsClusterMode = settings.RegisterBoolSetting(
 	true,
 ).WithPublic()
 
-// optUseNotVisibleIndexesClusterMode controls the cluster default for whether
-// not visible indexes can still be chosen by the optimizer for query plans. If
-// enabled, the optimizer will treat not visible indexes as they are visible.
-// Note that not visible indexes remain not visible, but the optimizer will
-// disable not visible index feature. If disabled, optimizer will ignore not
-// visible indexes unless it is explicitly selected with force index or for
-// constraint check.
-var optUseNotVisibleIndexesClusterMode = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"sql.defaults.optimizer_use_not_visible_indexes.enabled",
-	"default value for optimizer_use_not_visible_indexes session setting; "+
-		"disable usage of not visible indexes in the optimizer by default",
-	false,
-).WithPublic()
-
 // localityOptimizedSearchMode controls the cluster default for the use of
 // locality optimized search. If enabled, the optimizer will try to plan scans
 // and lookup joins in which local nodes (i.e., nodes in the gateway region) are
@@ -1617,6 +1602,9 @@ type BackupRestoreTestingKnobs struct {
 	// testing. This is typically the bulk mem monitor if not
 	// specified here.
 	BackupMemMonitor *mon.BytesMonitor
+
+	// RecoverFromIterClosePanic prevents the node from panicing during ReadAsOfIterator.Close
+	RecoverFromIterPanic bool
 }
 
 var _ base.ModuleTestingKnobs = &BackupRestoreTestingKnobs{}
@@ -3060,6 +3048,10 @@ func (m *sessionDataMutator) SetOptimizerFKCascadesLimit(val int) {
 	m.data.OptimizerFKCascadesLimit = int64(val)
 }
 
+func (m *sessionDataMutator) SetOptimizerUseForecasts(val bool) {
+	m.data.OptimizerUseForecasts = val
+}
+
 func (m *sessionDataMutator) SetOptimizerUseHistograms(val bool) {
 	m.data.OptimizerUseHistograms = val
 }
@@ -3333,12 +3325,24 @@ func (m *sessionDataMutator) SetUnconstrainedNonCoveringIndexScanEnabled(val boo
 	m.data.UnconstrainedNonCoveringIndexScanEnabled = val
 }
 
+func (m *sessionDataMutator) SetDisableHoistProjectionInJoinLimitation(val bool) {
+	m.data.DisableHoistProjectionInJoinLimitation = val
+}
+
 func (m *sessionDataMutator) SetTroubleshootingModeEnabled(val bool) {
 	m.data.TroubleshootingMode = val
 }
 
 func (m *sessionDataMutator) SetCopyFastPathEnabled(val bool) {
 	m.data.CopyFastPathEnabled = val
+}
+
+func (m *sessionDataMutator) SetCopyFromAtomicEnabled(val bool) {
+	m.data.CopyFromAtomicEnabled = val
+}
+
+func (m *sessionDataMutator) SetEnforceHomeRegion(val bool) {
+	m.data.EnforceHomeRegion = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

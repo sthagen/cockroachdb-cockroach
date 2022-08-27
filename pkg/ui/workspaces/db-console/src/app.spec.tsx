@@ -36,9 +36,19 @@ stubComponentInModule(
   "default",
 );
 stubComponentInModule(
-  "src/views/insights/workloadInsightDetailsPageConnected",
+  "src/views/insights/transactionInsightDetailsPageConnected",
   "default",
 );
+stubComponentInModule(
+  "src/views/insights/statementInsightDetailsPageConnected",
+  "default",
+);
+stubComponentInModule(
+  "src/views/insights/schemaInsightsPageConnected",
+  "default",
+);
+stubComponentInModule("src/views/schedules/schedulesPage", "default");
+stubComponentInModule("src/views/schedules/scheduleDetails", "default");
 
 import React from "react";
 import { Action, Store } from "redux";
@@ -244,6 +254,20 @@ describe("Routing to", () => {
     });
   });
 
+  describe("'/schedules' path", () => {
+    test("routes to <SchedulesPage> component", () => {
+      navigateToPath("/schedules");
+      screen.getByTestId("schedulesPage");
+    });
+  });
+
+  describe("'/schedules/:id' path", () => {
+    test("routes to <ScheduleDetails> component", () => {
+      navigateToPath("/schedules/12345");
+      screen.getByTestId("scheduleDetails");
+    });
+  });
+
   {
     /* databases */
   }
@@ -425,15 +449,25 @@ describe("Routing to", () => {
     /* insights */
   }
   describe("'/insights' path", () => {
-    test("routes to <InsightsOverviewPage> component", () => {
+    test("routes to <InsightsOverviewPage> component - workload insights page", () => {
       navigateToPath("/insights");
       screen.getByTestId("workloadInsightsPageConnected");
     });
+    test("routes to <InsightsOverviewPage> component - schema insights page", () => {
+      navigateToPath("/insights?tab=Schema+Insights");
+      screen.getByTestId("schemaInsightsPageConnected");
+    });
   });
-  describe("'/insights/insightID' path", () => {
-    test("routes to <WorkloadInsightDetailsPageConnected> component", () => {
-      navigateToPath("/insights/insightID");
-      screen.getByTestId("workloadInsightDetailsPageConnected");
+  describe("'/insights/transaction/insightID' path", () => {
+    test("routes to <TransactionInsightDetailsPageConnected> component", () => {
+      navigateToPath("/insights/transaction/insightID");
+      screen.getByTestId("transactionInsightDetailsPageConnected");
+    });
+  });
+  describe("'/insights/statement/insightID' path", () => {
+    test("routes to <StatementInsightDetailsPageConnected> component", () => {
+      navigateToPath("/insights/statement/insightID");
+      screen.getByTestId("statementInsightDetailsPageConnected");
     });
   });
   {

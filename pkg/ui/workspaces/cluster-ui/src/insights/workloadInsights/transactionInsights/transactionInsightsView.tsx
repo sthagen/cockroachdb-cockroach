@@ -37,11 +37,13 @@ import {
   getInsightsFromState,
   InsightEventFilters,
 } from "src/insights";
-import { EmptyInsightsTablePlaceholder, WorkloadInsightsError } from "../util";
+import { EmptyInsightsTablePlaceholder } from "../util";
 import { TransactionInsightsTable } from "./transactionInsightsTable";
+import { InsightsError } from "../../insightsErrorComponent";
 
 import styles from "src/statementsPage/statementsPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
+
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
 
@@ -50,6 +52,7 @@ export type TransactionInsightsViewStateProps = {
   transactionsError: Error | null;
   filters: InsightEventFilters;
   sortSetting: SortSetting;
+  dropDownSelect?: React.ReactElement;
 };
 
 export type TransactionInsightsViewDispatchProps = {
@@ -64,17 +67,20 @@ export type TransactionInsightsViewProps = TransactionInsightsViewStateProps &
 const INSIGHT_TXN_SEARCH_PARAM = "q";
 const INTERNAL_APP_NAME_PREFIX = "$ internal";
 
-export const TransactionInsightsView: React.FC<
-  TransactionInsightsViewProps
-> = ({
-  sortSetting,
-  transactions,
-  transactionsError,
-  filters,
-  refreshTransactionInsights,
-  onFiltersChange,
-  onSortChange,
-}: TransactionInsightsViewProps) => {
+export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
+  props: TransactionInsightsViewProps,
+) => {
+  const {
+    sortSetting,
+    transactions,
+    transactionsError,
+    filters,
+    refreshTransactionInsights,
+    onFiltersChange,
+    onSortChange,
+    dropDownSelect,
+  } = props;
+
   const [pagination, setPagination] = useState<ISortedTablePagination>({
     current: 1,
     pageSize: 10,
@@ -184,13 +190,7 @@ export const TransactionInsightsView: React.FC<
   return (
     <div className={cx("root")}>
       <PageConfig>
-        {/* TODO: Uncomment when statements data are added.
-        <PageConfigItem>
-          <DropDownSelect
-            label={InsightExecOptions[0].label}
-            options={InsightExecOptions}
-        </PageConfigItem>/>
-        */}
+        <PageConfigItem>{dropDownSelect}</PageConfigItem>
         <PageConfigItem>
           <Search
             placeholder="Search Transactions"
@@ -213,11 +213,7 @@ export const TransactionInsightsView: React.FC<
           loading={transactions == null}
           page="transaction insights"
           error={transactionsError}
-          renderError={() =>
-            WorkloadInsightsError({
-              execType: "transaction insights",
-            })
-          }
+          renderError={() => InsightsError()}
         >
           <div>
             <section className={sortableTableCx("cl-table-container")}>
@@ -238,7 +234,7 @@ export const TransactionInsightsView: React.FC<
                 renderNoResult={
                   <EmptyInsightsTablePlaceholder
                     isEmptySearchResults={
-                      search?.length > 0 && filteredTransactions?.length > 0
+                      search?.length > 0 && filteredTransactions?.length == 0
                     }
                   />
                 }

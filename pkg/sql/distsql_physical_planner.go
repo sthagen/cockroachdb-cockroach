@@ -277,6 +277,16 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 	case *tree.DOid:
 		v.err = newQueryNotSupportedError("OID expressions are not supported by distsql")
 		return false, expr
+	case *tree.Subquery:
+		if hasOidType(t.ResolvedType()) {
+			// If a subquery results in a DOid datum, the datum will get a type
+			// annotation (because DOids are ambiguous) when serializing the
+			// render expression involving the result of the subquery. As a
+			// result, we might need to perform a cast on a remote node which
+			// might fail, thus we prohibit the distribution of the main query.
+			v.err = newQueryNotSupportedError("OID expressions are not supported by distsql")
+			return false, expr
+		}
 	case *tree.CastExpr:
 		// TODO (rohany): I'm not sure why this CastExpr doesn't have a type
 		//  annotation at this stage of processing...
@@ -305,6 +315,23 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 }
 
 func (v *distSQLExprCheckVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr }
+
+// hasOidType returns whether t or its contents include an OID type.
+func hasOidType(t *types.T) bool {
+	switch t.Family() {
+	case types.OidFamily:
+		return true
+	case types.ArrayFamily:
+		return hasOidType(t.ArrayContents())
+	case types.TupleFamily:
+		for _, typ := range t.TupleContents() {
+			if hasOidType(typ) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // checkExpr verifies that an expression doesn't contain things that are not yet
 // supported by distSQL, like distSQL-blocklisted functions.
@@ -3558,9 +3585,10 @@ func createProjectSetSpec(
 	planCtx *PlanningCtx, n *projectSetPlanningInfo, indexVarMap []int,
 ) (*execinfrapb.ProjectSetSpec, error) {
 	spec := execinfrapb.ProjectSetSpec{
-		Exprs:            make([]execinfrapb.Expression, len(n.exprs)),
-		GeneratedColumns: make([]*types.T, len(n.columns)-n.numColsInSource),
-		NumColsPerGen:    make([]uint32, len(n.exprs)),
+		Exprs:                 make([]execinfrapb.Expression, len(n.exprs)),
+		GeneratedColumns:      make([]*types.T, len(n.columns)-n.numColsInSource),
+		GeneratedColumnLabels: make([]string, len(n.columns)-n.numColsInSource),
+		NumColsPerGen:         make([]uint32, len(n.exprs)),
 	}
 	for i, expr := range n.exprs {
 		var err error
@@ -3571,6 +3599,7 @@ func createProjectSetSpec(
 	}
 	for i, col := range n.columns[n.numColsInSource:] {
 		spec.GeneratedColumns[i] = col.Typ
+		spec.GeneratedColumnLabels[i] = col.Name
 	}
 	for i, n := range n.numColsPerGen {
 		spec.NumColsPerGen[i] = uint32(n)
@@ -4028,26 +4057,12 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 	}
 
 	// We definitely added new columns, so we need to update PlanToStreamColMap.
-	// We need to update the map before adding rendering or projection because
-	// it is used there.
 	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(plan.GetResultTypes()))
 
 	// windowers do not guarantee maintaining the order at the moment, so we
 	// reset MergeOrdering. There shouldn't be an ordering here, but we reset it
 	// defensively (see #35179).
 	plan.SetMergeOrdering(execinfrapb.Ordering{})
-
-	// After the window functions are computed, we need to add rendering or
-	// projection.
-	if err := addRenderingOrProjection(n, planCtx, plan); err != nil {
-		return nil, err
-	}
-
-	if len(plan.GetResultTypes()) != len(plan.PlanToStreamColMap) {
-		// We added/removed columns while rendering or projecting, so we need to
-		// update PlanToStreamColMap.
-		plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(plan.GetResultTypes()))
-	}
 
 	return plan, nil
 }

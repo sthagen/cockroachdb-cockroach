@@ -196,6 +196,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().ZigzagJoinEnabled = false
 	notStale()
 
+	// Stale optimizer forecast usage enable.
+	evalCtx.SessionData().OptimizerUseForecasts = true
+	stale()
+	evalCtx.SessionData().OptimizerUseForecasts = false
+	notStale()
+
 	// Stale optimizer histogram usage enable.
 	evalCtx.SessionData().OptimizerUseHistograms = true
 	stale()
@@ -278,6 +284,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled = true
 	stale()
 	evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled = false
+	notStale()
+
+	// Stale enforce home region.
+	evalCtx.SessionData().EnforceHomeRegion = true
+	stale()
+	evalCtx.SessionData().EnforceHomeRegion = false
 	notStale()
 
 	// Stale testing_optimizer_random_seed.

@@ -214,3 +214,11 @@ var ActiveProtectedTimestampsEnabled = settings.RegisterBoolSetting(
 	"if set, rather than only protecting changefeed targets from garbage collection during backfills, data will always be protected up to the changefeed's frontier",
 	true,
 )
+
+// UseMuxRangeFeed enables the use of MuxRangeFeed RPC.
+var UseMuxRangeFeed = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.mux_rangefeed.enabled",
+	"if true, changefeed uses multiplexing rangefeed RPC",
+	false,
+)

@@ -18,7 +18,7 @@ import "antd/lib/row/style";
 import moment from "moment";
 import { Button } from "src/button";
 import { Loading } from "src/loading";
-import { SqlBox } from "src/sql";
+import { SqlBox, SqlBoxSize } from "src/sql";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { Duration } from "src/util";
 import { DATE_FORMAT_24_UTC } from "src/util/format";
@@ -32,39 +32,44 @@ import {
   InsightEventDetailsResponse,
 } from "src/api";
 import {
-  InsightRecommendation,
   InsightsSortedTable,
   makeInsightsColumns,
 } from "src/insightsTable/insightsTable";
 import { WaitTimeDetailsTable } from "./insightDetailsTables";
 import { getInsightEventDetailsFromState } from "../utils";
-import { EventExecution } from "../types";
-import { WorkloadInsightsError } from "../workloadInsights/util";
+import {
+  EventExecution,
+  InsightNameEnum,
+  InsightRecommendation,
+} from "../types";
 
 import classNames from "classnames/bind";
 import { commonStyles } from "src/common";
 import insightTableStyles from "src/insightsTable/insightsTable.module.scss";
 import { CockroachCloudContext } from "../../contexts";
+import { InsightsError } from "../insightsErrorComponent";
 
 const tableCx = classNames.bind(insightTableStyles);
 
-export interface InsightDetailsStateProps {
+export interface TransactionInsightDetailsStateProps {
   insightEventDetails: InsightEventDetailsResponse;
   insightError: Error | null;
 }
 
-export interface InsightDetailsDispatchProps {
+export interface TransactionInsightDetailsDispatchProps {
   refreshInsightDetails: (req: InsightEventDetailsRequest) => void;
 }
 
-export type InsightDetailsProps = InsightDetailsStateProps &
-  InsightDetailsDispatchProps &
-  RouteComponentProps<unknown>;
+export type TransactionInsightDetailsProps =
+  TransactionInsightDetailsStateProps &
+    TransactionInsightDetailsDispatchProps &
+    RouteComponentProps<unknown>;
 
-export class InsightDetails extends React.Component<InsightDetailsProps> {
-  constructor(props: InsightDetailsProps) {
+export class TransactionInsightDetails extends React.Component<TransactionInsightDetailsProps> {
+  constructor(props: TransactionInsightDetailsProps) {
     super(props);
   }
+
   private refresh(): void {
     this.props.refreshInsightDetails({
       id: getMatchParamByName(this.props.match, "id"),
@@ -99,14 +104,15 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
       .toString();
     const isCockroachCloud = useContext(CockroachCloudContext);
     const insightsColumns = makeInsightsColumns(isCockroachCloud);
+
     function insightsTableData(): InsightRecommendation[] {
-      const recs = [];
+      const recs: InsightRecommendation[] = [];
       let rec: InsightRecommendation;
       insightDetails.insights.forEach(insight => {
-        switch (insight.name.toString()) {
-          case "HIGH_WAIT_TIME":
+        switch (insight.name) {
+          case InsightNameEnum.highContentionTime:
             rec = {
-              type: "HIGH_WAIT_TIME",
+              type: "HighContentionTime",
               details: {
                 duration: insightDetails.elapsedTime,
                 description: insight.description,
@@ -118,6 +124,7 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
       recs.push(rec);
       return recs;
     }
+
     const tableData = insightsTableData();
     const waitingExecutions: EventExecution[] = [
       {
@@ -131,10 +138,10 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
     ];
     return (
       <>
-        <section>
+        <section className={tableCx("section")}>
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
-              <SqlBox value={insightQueries} />
+              <SqlBox value={insightQueries} size={SqlBoxSize.custom} />
             </Col>
           </Row>
           <Row gutter={24}>
@@ -163,7 +170,7 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
             <InsightsSortedTable columns={insightsColumns} data={tableData} />
           </Row>
         </section>
-        <section>
+        <section className={tableCx("section")}>
           <WaitTimeInsightsPanel
             execType={insightDetails.execType}
             executionID={insightDetails.executionID}
@@ -185,7 +192,7 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
                     insightDetails.execType,
                   )}
                 </Heading>
-                <div>
+                <div className={tableCx("margin-bottom-large")}>
                   <WaitTimeDetailsTable
                     data={waitingExecutions}
                     execType={insightDetails.execType}
@@ -214,7 +221,9 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
           >
             Insights
           </Button>
-          <h3>{`Transaction Execution ID: ${String(
+          <h3
+            className={commonStyles("base-heading", "no-margin-bottom")}
+          >{`Transaction Execution ID: ${String(
             getMatchParamByName(this.props.match, "id"),
           )}`}</h3>
         </div>
@@ -224,11 +233,7 @@ export class InsightDetails extends React.Component<InsightDetailsProps> {
             page={"Transaction Insight details"}
             error={this.props.insightError}
             render={this.renderContent}
-            renderError={() =>
-              WorkloadInsightsError({
-                execType: "transaction insights",
-              })
-            }
+            renderError={() => InsightsError()}
           />
         </section>
       </div>

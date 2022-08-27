@@ -1036,9 +1036,11 @@ type StoreConfig struct {
 	// stores.
 	ScanMaxIdleTime time.Duration
 
-	// If LogRangeEvents is true, major changes to ranges will be logged into
-	// the range event log.
-	LogRangeEvents bool
+	// If LogRangeAndNodeEvents is true, major changes to ranges will be logged into
+	// the range event log (system.rangelog table) and node join and restart
+	// events will be logged into the event log (system.eventlog table).
+	// Note that node Decommissioning events are always logged.
+	LogRangeAndNodeEvents bool
 
 	// RaftEntryCacheSize is the size in bytes of the Raft log entry cache
 	// shared by all Raft groups managed by the store.
@@ -1096,6 +1098,23 @@ type StoreConfig struct {
 	// TODO(ajwerner): Remove in 22.2.
 	SystemConfigProvider config.SystemConfigProvider
 }
+
+// logRangeAndNodeEventsEnabled is used to enable or disable logging range events
+// (e.g., split, merge, add/remove voter/non-voter) into the system.rangelog
+// table and node join and restart events into system.eventolog table.
+// Decommissioning events are not controlled by this setting.
+var logRangeAndNodeEventsEnabled = func() *settings.BoolSetting {
+	s := settings.RegisterBoolSetting(
+		settings.TenantReadOnly,
+		"kv.log_range_and_node_events.enabled",
+		"set to true to transactionally log range events"+
+			" (e.g., split, merge, add/remove voter/non-voter) into system.rangelog"+
+			"and node join and restart events into system.eventolog",
+		true,
+	)
+	s.SetVisibility(settings.Public)
+	return s
+}()
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
 // behavior of the consistency checker for tests.
@@ -2184,29 +2203,6 @@ func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, erro
 		return nil, errSysCfgUnavailable
 	}
 
-	// We need a version gate here before switching over to the span configs
-	// infrastructure. In a mixed-version cluster we need to wait for
-	// the host tenant to have fully populated `system.span_configurations`
-	// (read: reconciled) at least once before using it as a view for all
-	// split/config decisions.
-	_ = clusterversion.EnsureSpanConfigReconciliation
-	//
-	// We also want to ensure that the KVSubscriber on each store is at least as
-	// up-to-date as some full reconciliation timestamp.
-	_ = clusterversion.EnsureSpanConfigSubscription
-	//
-	// Without a version gate, it would be possible for a replica on a
-	// new-binary-server to apply the static fallback config (assuming no
-	// entries in `system.span_configurations`), in violation of explicit
-	// configs directly set by the user. Though unlikely, it's also possible for
-	// us to merge all ranges into a single one -- with no entries in
-	// system.span_configurations, the infrastructure can erroneously conclude
-	// that there are zero split points.
-	//
-	// We achieve all this through a three-step migration process, culminating
-	// in the following cluster version gate:
-	_ = clusterversion.EnableSpanConfigStore
-
 	if s.cfg.SpanConfigsDisabled ||
 		!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) ||
 		s.TestingKnobs().UseSystemConfigSpanForQueues {
@@ -2395,8 +2391,7 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 		}
 
 		if s.cfg.SpanConfigsDisabled ||
-			!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) ||
-			!s.cfg.Settings.Version.IsActive(ctx, clusterversion.EnableSpanConfigStore) {
+			!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
 			repl.SetSpanConfig(conf)
 		}
 
@@ -3012,9 +3007,6 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		if wps, dur := r.loadStats.writeKeys.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
 			totalWritesPerSecond += wps
 			writesPerReplica = append(writesPerReplica, wps)
-		} else {
-			replCtx := r.AnnotateCtx(ctx)
-			log.Infof(replCtx, "xxx: dur=%s wps=%f", dur, wps)
 		}
 		rankingsAccumulator.addReplica(replicaWithStats{
 			repl: r,
@@ -3964,3 +3956,11 @@ func (n *KVAdmissionControllerImpl) FollowerStoreWriteBytes(
 	storeAdmissionQ.BypassedWorkDone(
 		followerWriteBytes.numEntries, followerWriteBytes.StoreWorkDoneInfo)
 }
+
+// ProvisionedBandwidthForAdmissionControl set a value of the provisioned
+// bandwidth for each store in the cluster.
+var ProvisionedBandwidthForAdmissionControl = settings.RegisterByteSizeSetting(
+	settings.SystemOnly, "kv.store.admission.provisioned_bandwidth",
+	"if set to a non-zero value, this is used as the provisioned bandwidth (in bytes/s), "+
+		"for each store. It can be over-ridden on a per-store basis using the --store flag",
+	0).WithPublic()

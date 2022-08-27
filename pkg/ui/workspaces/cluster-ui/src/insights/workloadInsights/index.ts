@@ -9,3 +9,5 @@
 // licenses/APL.txt.
 
 export * from "./transactionInsights";
+export * from "./statementInsights";
+export * from "./workloadInsightRootControl";

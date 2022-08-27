@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -103,7 +104,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 
 	details := t.job.Details().(jobspb.RowLevelTTLDetails)
 
-	aostDuration := -time.Second * 30
+	aostDuration := ttlbase.DefaultAOSTDuration
 	if knobs.AOSTDuration != nil {
 		aostDuration = *knobs.AOSTDuration
 	}
@@ -124,10 +125,11 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		}
 		// If the AOST timestamp is before the latest descriptor timestamp, exit
 		// early as the delete will not work.
-		if desc.GetModificationTime().GoTime().After(aost) {
+		modificationTime := desc.GetModificationTime().GoTime()
+		if modificationTime.After(aost) {
 			return errors.Newf(
 				"found a recent schema change on the table at %s, aborting",
-				desc.GetModificationTime().GoTime().Format(time.RFC3339),
+				modificationTime.Format(time.RFC3339),
 			)
 		}
 

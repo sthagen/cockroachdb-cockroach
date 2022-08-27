@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import React from "react";
-import { SortedTable, ColumnDescriptor } from "src/sortedtable";
+import { ColumnDescriptor, SortedTable } from "src/sortedtable";
 import { DATE_FORMAT, Duration } from "src/util";
 import { EventExecution, InsightExecEnum } from "../types";
 import { insightsTableTitles, QueriesCell } from "../workloadInsights/util";
@@ -22,7 +22,7 @@ interface InsightDetailsTableProps {
 export function makeInsightDetailsColumns(
   execType: InsightExecEnum,
 ): ColumnDescriptor<EventExecution>[] {
-  const columns: ColumnDescriptor<EventExecution>[] = [
+  return [
     {
       name: "executionID",
       title: insightsTableTitles.executionID(execType),
@@ -38,8 +38,7 @@ export function makeInsightDetailsColumns(
     {
       name: "query",
       title: insightsTableTitles.query(execType),
-      cell: (item: EventExecution) =>
-        QueriesCell({ transactionQueries: item.queries, textLimit: 50 }),
+      cell: (item: EventExecution) => QueriesCell(item.queries, 50),
       sort: (item: EventExecution) => item.queries.length,
     },
     {
@@ -55,7 +54,6 @@ export function makeInsightDetailsColumns(
       sort: (item: EventExecution) => item.elapsedTime,
     },
   ];
-  return columns;
 }
 
 export const WaitTimeDetailsTable: React.FC<

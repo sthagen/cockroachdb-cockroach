@@ -16,16 +16,15 @@ import React from "react";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 
 import { ContendedExecution, ExecutionType } from "src/activeExecutions";
-import { Duration } from "../util";
+import { capitalize, Duration } from "../util";
 
-import { Heading, Text } from "@cockroachlabs/ui-components";
+import { Heading } from "@cockroachlabs/ui-components";
 import { ExecutionContentionTable } from "../activeExecutions/activeTransactionsTable/execContentionTable";
 import styles from "../statementDetails/statementDetails.module.scss";
-import { capitalize } from "../activeExecutions/execTableCommon";
 const cx = classNames.bind(styles);
 
 export const WaitTimeInsightsLabels = {
-  SECTION_HEADING: "Wait Time Insights",
+  SECTION_HEADING: "Contention Time Insights",
   BLOCKED_SCHEMA: "Blocked Schema",
   BLOCKED_DATABASE: "Blocked Database",
   BLOCKED_TABLE: "Blocked Table",
@@ -67,7 +66,9 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
   const showWaitTimeInsightsDetails = waitTime != null;
 
   return (
-    <section className={cx("section", "section--container")}>
+    <section
+      className={cx("section", "section--container", "margin-bottom-large")}
+    >
       <Row gutter={24}>
         <Col>
           <Heading type="h5">{WaitTimeInsightsLabels.SECTION_HEADING}</Heading>
@@ -122,12 +123,12 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
           )}
           {blockingExecutions.length > 0 && (
             <Row>
-              <Text>
+              <Heading type="h5">
                 {WaitTimeInsightsLabels.BLOCKING_TXNS_TABLE_TITLE(
                   executionID,
                   execType,
                 )}
-              </Text>
+              </Heading>
               <div>
                 <ExecutionContentionTable
                   execType={execType}
@@ -138,12 +139,12 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
           )}
           {waitingExecutions.length > 0 && (
             <Row>
-              <Text>
+              <Heading type="h5">
                 {WaitTimeInsightsLabels.WAITING_TXNS_TABLE_TITLE(
                   executionID,
                   execType,
                 )}
-              </Text>
+              </Heading>
               <div>
                 <ExecutionContentionTable
                   execType={execType}

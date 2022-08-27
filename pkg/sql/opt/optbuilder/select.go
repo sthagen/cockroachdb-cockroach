@@ -13,6 +13,7 @@ package optbuilder
 import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -56,6 +58,8 @@ func (b *Builder) buildDataSource(
 			indexFlags = source.IndexFlags
 		}
 		if source.As.Alias != "" {
+			inScope = inScope.push()
+			inScope.alias = &source.As
 			locking = locking.filter(source.As.Alias)
 		}
 
@@ -333,7 +337,7 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 		// table name.
 		noColNameSpecified := len(colAlias) == 0
 		if scope.isAnonymousTable() && noColNameSpecified && scope.singleSRFColumn {
-			colAlias = tree.NameList{as.Alias}
+			colAlias = tree.ColumnDefList{tree.ColumnDef{Name: as.Alias}}
 		}
 
 		// If an alias was specified, use that to qualify the column names.
@@ -363,11 +367,11 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 				if col.visibility != visible {
 					continue
 				}
-				col.name = scopeColName(colAlias[aliasIdx])
+				col.name = scopeColName(colAlias[aliasIdx].Name)
 				if isScan {
 					// Override column metadata alias.
 					colMeta := b.factory.Metadata().ColumnMeta(col.id)
-					colMeta.Alias = string(colAlias[aliasIdx])
+					colMeta.Alias = string(colAlias[aliasIdx].Name)
 				}
 				aliasIdx++
 			}
@@ -420,6 +424,23 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 	md := b.factory.Metadata()
 	tabID := md.AddTable(tab, alias)
 	return md.TableMeta(tabID)
+}
+
+// errorOnInvalidMultiregionDB panics if the table described by tabMeta is owned
+// by a non-multiregion database or a multiregion database with SURVIVE REGION
+// FAILURE goal.
+func errorOnInvalidMultiregionDB(evalCtx *eval.Context, tabMeta *opt.TableMeta) {
+	survivalGoal, ok := tabMeta.GetDatabaseSurvivalGoal(evalCtx.Planner)
+	// non-multiregional database or SURVIVE REGION FAILURE option
+	if !ok {
+		err := pgerror.New(pgcode.QueryHasNoHomeRegion,
+			"Query has no home region. Try accessing only tables in multi-region databases with ZONE survivability.")
+		panic(err)
+	} else if survivalGoal == descpb.SurvivalGoal_REGION_FAILURE {
+		err := pgerror.New(pgcode.QueryHasNoHomeRegion,
+			"The enforce_home_region setting cannot be combined with REGION survivability. Try accessing only tables in multi-region databases with ZONE survivability.")
+		panic(err)
+	}
 }
 
 // buildScan builds a memo group for a ScanOp expression on the given table. If
@@ -515,6 +536,12 @@ func (b *Builder) buildScan(
 
 		// Note: virtual tables should not be collected as view dependencies.
 		return outScope
+	}
+
+	// Scanning tables in databases that don't use the SURVIVE ZONE FAILURE option
+	// is disallowed when EnforceHomeRegion is true.
+	if b.evalCtx.SessionData().EnforceHomeRegion {
+		errorOnInvalidMultiregionDB(b.evalCtx, tabMeta)
 	}
 
 	private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}

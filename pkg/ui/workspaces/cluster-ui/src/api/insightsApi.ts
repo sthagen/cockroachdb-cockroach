@@ -18,6 +18,7 @@ import {
   InsightEventDetails,
   InsightExecEnum,
   InsightNameEnum,
+  StatementInsightEvent,
 } from "src/insights";
 import moment from "moment";
 
@@ -30,99 +31,87 @@ export type InsightEventsResponse = InsightEventState[];
 type InsightQuery<ResponseColumnType, State> = {
   name: InsightNameEnum;
   query: string;
-  toState: (
-    response: SqlExecutionResponse<ResponseColumnType>,
-    results: Record<string, State>,
-  ) => State[];
+  toState: (response: SqlExecutionResponse<ResponseColumnType>) => State;
 };
-
-// The only insight we currently report is "High Wait Time", which is the insight
-// associated with each row in the crdb_internal.transaction_contention_events table.
-export const HIGH_WAIT_CONTENTION_THRESHOLD = moment.duration(
-  200,
-  "milliseconds",
-);
 
 type TransactionContentionResponseColumns = {
   blocking_txn_id: string;
+  blocking_txn_fingerprint_id: string;
   blocking_queries: string[];
   collection_ts: string;
   contention_duration: string;
+  threshold: string;
   app_name: string;
 };
 
 function transactionContentionResultsToEventState(
   response: SqlExecutionResponse<TransactionContentionResponseColumns>,
-  results: Record<string, InsightEventState>,
 ): InsightEventState[] {
-  response.execution.txn_results[0].rows.forEach(row => {
-    const key = row.blocking_txn_id;
-    if (!results[key]) {
-      results[key] = {
-        executionID: row.blocking_txn_id,
-        queries: row.blocking_queries,
-        startTime: moment(row.collection_ts),
-        elapsedTime: moment.duration(row.contention_duration).asMilliseconds(),
-        application: row.app_name,
-        insightName: highWaitTimeQuery.name,
-        execType: InsightExecEnum.TRANSACTION,
-      };
-    }
-  });
+  if (!response.execution.txn_results[0].rows) {
+    // No data.
+    return [];
+  }
 
-  return Object.values(results);
+  return response.execution.txn_results[0].rows.map(row => ({
+    transactionID: row.blocking_txn_id,
+    fingerprintID: row.blocking_txn_fingerprint_id,
+    queries: row.blocking_queries,
+    startTime: moment(row.collection_ts),
+    elapsedTimeMillis: moment
+      .duration(row.contention_duration)
+      .asMilliseconds(),
+    contentionThreshold: moment.duration(row.threshold).asMilliseconds(),
+    application: row.app_name,
+    insightName: highContentionTimeQuery.name,
+    execType: InsightExecEnum.TRANSACTION,
+  }));
 }
 
-const highWaitTimeQuery: InsightQuery<
+const highContentionTimeQuery: InsightQuery<
   TransactionContentionResponseColumns,
-  InsightEventState
+  InsightEventsResponse
 > = {
-  name: InsightNameEnum.highWaitTime,
-  query: `SELECT
-            blocking_txn_id,
-            blocking_queries,
-            collection_ts,
-            contention_duration,
-            app_name
-          FROM
-            crdb_internal.transaction_contention_events AS tce
-              JOIN (
-              SELECT
-                transaction_fingerprint_id,
-                app_name,
-                array_agg(metadata ->> 'query') AS blocking_queries
-              FROM
-                crdb_internal.statement_statistics
-              GROUP BY
-                transaction_fingerprint_id,
-                app_name
-            ) AS bqs ON bqs.transaction_fingerprint_id = tce.blocking_txn_fingerprint_id
-          WHERE
-            contention_duration > INTERVAL '${HIGH_WAIT_CONTENTION_THRESHOLD.toISOString()}'
-  `,
+  name: InsightNameEnum.highContentionTime,
+  query: `SELECT *
+          FROM (SELECT blocking_txn_id,
+                       encode(blocking_txn_fingerprint_id, 'hex') AS blocking_txn_fingerprint_id,
+                       blocking_queries,
+                       collection_ts,
+                       contention_duration,
+                       app_name,
+                       row_number()                                  over (
+    PARTITION BY
+    blocking_txn_fingerprint_id
+    ORDER BY collection_ts DESC ) AS rank, threshold
+                FROM (SELECT "sql.insights.latency_threshold"::INTERVAL as threshold
+                      FROM [SHOW CLUSTER SETTING sql.insights.latency_threshold]),
+                     crdb_internal.transaction_contention_events AS tce
+                       JOIN (SELECT transaction_fingerprint_id,
+                                    app_name,
+                                    array_agg(metadata ->> 'query') AS blocking_queries
+                             FROM crdb_internal.statement_statistics
+                             GROUP BY transaction_fingerprint_id,
+                                      app_name) AS bqs
+                            ON bqs.transaction_fingerprint_id = tce.blocking_txn_fingerprint_id
+                WHERE contention_duration > threshold)
+          WHERE rank = 1`,
   toState: transactionContentionResultsToEventState,
 };
 
-// getInsightEventState is currently hardcoded to use the High Wait Time insight type
+// getInsightEventState is currently hardcoded to use the High Contention Time insight type
 // for transaction contention events.
 export function getInsightEventState(): Promise<InsightEventsResponse> {
   const request: SqlExecutionRequest = {
     statements: [
       {
-        sql: `${highWaitTimeQuery.query}`,
+        sql: `${highContentionTimeQuery.query}`,
       },
     ],
     execute: true,
   };
   return executeSql<TransactionContentionResponseColumns>(request).then(
     result => {
-      if (!result.execution.txn_results[0].rows) {
-        // No data.
-        return [];
-      }
-
-      const results: Record<string, InsightEventState> = {};
-      return highWaitTimeQuery.toState(result, results);
+      return highContentionTimeQuery.toState(result);
     },
   );
 }
@@ -140,6 +129,7 @@ type TransactionContentionDetailsResponseColumns = {
   blocking_queries: string[];
   collection_ts: string;
   contention_duration: string;
+  threshold: string;
   app_name: string;
   blocking_txn_fingerprint_id: string;
   waiting_txn_id: string;
@@ -154,59 +144,57 @@ type TransactionContentionDetailsResponseColumns = {
 
 function transactionContentionDetailsResultsToEventState(
   response: SqlExecutionResponse<TransactionContentionDetailsResponseColumns>,
-  results: Record<string, InsightEventDetailsState>,
 ): InsightEventDetailsState[] {
-  response.execution.txn_results[0].rows.forEach(row => {
-    const key = row.blocking_txn_id;
-    if (!results[key]) {
-      results[key] = {
-        executionID: row.blocking_txn_id,
-        queries: row.blocking_queries,
-        startTime: moment(row.collection_ts),
-        elapsedTime: moment.duration(row.contention_duration).asMilliseconds(),
-        application: row.app_name,
-        fingerprintID: row.blocking_txn_fingerprint_id,
-        waitingExecutionID: row.waiting_txn_id,
-        waitingFingerprintID: row.waiting_txn_fingerprint_id,
-        waitingQueries: row.waiting_queries,
-        schemaName: row.schema_name,
-        databaseName: row.database_name,
-        tableName: row.table_name,
-        indexName: row.index_name,
-        contendedKey: row.key,
-        insightName: highWaitTimeQuery.name,
-        execType: InsightExecEnum.TRANSACTION,
-      };
-    }
-  });
-
-  return Object.values(results);
+  if (!response.execution.txn_results[0].rows) {
+    // No data.
+    return [];
+  }
+  return response.execution.txn_results[0].rows.map(row => ({
+    executionID: row.blocking_txn_id,
+    queries: row.blocking_queries,
+    startTime: moment(row.collection_ts),
+    elapsedTime: moment.duration(row.contention_duration).asMilliseconds(),
+    contentionThreshold: moment.duration(row.threshold).asMilliseconds(),
+    application: row.app_name,
+    fingerprintID: row.blocking_txn_fingerprint_id,
+    waitingExecutionID: row.waiting_txn_id,
+    waitingFingerprintID: row.waiting_txn_fingerprint_id,
+    waitingQueries: row.waiting_queries,
+    schemaName: row.schema_name,
+    databaseName: row.database_name,
+    tableName: row.table_name,
+    indexName: row.index_name,
+    contendedKey: row.key,
+    insightName: highContentionTimeQuery.name,
+    execType: InsightExecEnum.TRANSACTION,
+  }));
 }
 
-const highWaitTimeDetailsQuery = (
+const highContentionTimeDetailsQuery = (
   id: string,
 ): InsightQuery<
   TransactionContentionDetailsResponseColumns,
-  InsightEventDetailsState
+  InsightEventDetailsResponse
 > => {
   return {
-    name: InsightNameEnum.highWaitTime,
-    query: `SELECT
-  collection_ts, 
-  blocking_txn_id, 
-  blocking_txn_fingerprint_id, 
-  waiting_txn_id, 
-  waiting_txn_fingerprint_id, 
-  contention_duration, 
-  crdb_internal.pretty_key(contending_key, 0) as key, 
+    name: InsightNameEnum.highContentionTime,
+    query: `SELECT collection_ts,
+                   blocking_txn_id,
+                   encode(blocking_txn_fingerprint_id, 'hex') AS blocking_txn_fingerprint_id,
+                   waiting_txn_id,
+                   encode(waiting_txn_fingerprint_id, 'hex')  AS waiting_txn_fingerprint_id,
+                   contention_duration,
+                   crdb_internal.pretty_key(contending_key, 0) as key, 
   database_name, 
   schema_name, 
   table_name, 
   index_name,
   app_name, 
   blocking_queries, 
-  waiting_queries 
-FROM 
+  waiting_queries,
+  threshold
+            FROM
+  (SELECT "sql.insights.latency_threshold"::INTERVAL as threshold FROM [SHOW CLUSTER SETTING sql.insights.latency_threshold]),
   crdb_internal.transaction_contention_events AS tce 
   LEFT OUTER JOIN crdb_internal.ranges AS ranges ON tce.contending_key BETWEEN ranges.start_key 
   AND ranges.end_key 
@@ -230,17 +218,17 @@ FROM
       transaction_fingerprint_id,
       app_name
   ) AS bqs ON bqs.transaction_fingerprint_id = tce.blocking_txn_fingerprint_id
-    WHERE blocking_txn_id = '${id}'`,
+            WHERE blocking_txn_id = '${id}'`,
     toState: transactionContentionDetailsResultsToEventState,
   };
 };
 
-// getInsightEventState is currently hardcoded to use the High Wait Time insight type
+// getInsightEventState is currently hardcoded to use the High Contention Time insight type
 // for transaction contention events.
 export function getInsightEventDetailsState(
   req: InsightEventDetailsRequest,
 ): Promise<InsightEventDetailsResponse> {
-  const detailsQuery = highWaitTimeDetailsQuery(req.id);
+  const detailsQuery = highContentionTimeDetailsQuery(req.id);
   const request: SqlExecutionRequest = {
     statements: [
       {
@@ -251,12 +239,125 @@ export function getInsightEventDetailsState(
   };
   return executeSql<TransactionContentionDetailsResponseColumns>(request).then(
     result => {
-      if (!result.execution.txn_results[0].rows) {
-        // No data.
-        return [];
-      }
-      const results: Record<string, InsightEventDetailsState> = {};
-      return detailsQuery.toState(result, results);
+      return detailsQuery.toState(result);
     },
   );
+}
+
+type ExecutionInsightsResponseRow = {
+  session_id: string;
+  txn_id: string;
+  txn_fingerprint_id: string; // hex string
+  stmt_id: string;
+  stmt_fingerprint_id: string; // hex string
+  query: string;
+  start_time: string; // Timestamp
+  end_time: string; // Timestamp
+  full_scan: boolean;
+  user_name: string;
+  app_name: string;
+  database_name: string;
+  rows_read: number;
+  rows_written: number;
+  priority: string;
+  retries: number;
+  exec_node_ids: number[];
+  contention: string; // interval
+  last_retry_reason?: string;
+  problems: string[];
+  index_recommendations: string[];
+};
+
+export type StatementInsights = StatementInsightEvent[];
+
+function getStatementInsightsFromClusterExecutionInsightsResponse(
+  response: SqlExecutionResponse<ExecutionInsightsResponseRow>,
+): StatementInsights {
+  if (!response.execution.txn_results[0].rows) {
+    // No data.
+    return [];
+  }
+
+  return response.execution.txn_results[0].rows.map(row => {
+    const start = moment.utc(row.start_time);
+    const end = moment.utc(row.end_time);
+    return {
+      transactionID: row.txn_id,
+      transactionFingerprintID: row.txn_fingerprint_id,
+      query: row.query,
+      startTime: start,
+      endTime: end,
+      databaseName: row.database_name,
+      elapsedTimeMillis: end.diff(start, "milliseconds"),
+      application: row.app_name,
+      username: row.user_name,
+      statementID: row.stmt_id,
+      statementFingerprintID: row.stmt_fingerprint_id,
+      sessionID: row.session_id,
+      isFullScan: row.full_scan,
+      rowsRead: row.rows_read,
+      rowsWritten: row.rows_written,
+      priority: row.priority,
+      retries: row.retries,
+      lastRetryReason: row.last_retry_reason,
+      timeSpentWaiting: row.contention ? moment.duration(row.contention) : null,
+      problems: row.problems,
+      indexRecommendations: row.index_recommendations,
+      insights: null,
+    };
+  });
+}
+
+const statementInsightsQuery: InsightQuery<
+  ExecutionInsightsResponseRow,
+  StatementInsights
+> = {
+  name: InsightNameEnum.highContentionTime,
+  // We only surface the most recently observed problem for a given statement.
+  query: `SELECT * from (
+    SELECT
+      session_id,
+      txn_id,
+      encode(txn_fingerprint_id, 'hex')  AS txn_fingerprint_id,
+      stmt_id,
+      encode(stmt_fingerprint_id, 'hex') AS stmt_fingerprint_id,
+      query,
+      start_time,
+      end_time,
+      full_scan,
+      app_name,
+      database_name,
+      user_name,
+      rows_read,
+      rows_written,
+      priority,
+      retries,
+      contention,
+      last_retry_reason,
+      index_recommendations,
+      problems,
+      row_number()                          OVER (
+        PARTITION BY txn_fingerprint_id
+        ORDER BY end_time DESC
+      ) AS rank
+    FROM crdb_internal.cluster_execution_insights
+    WHERE array_length(problems, 1) > 0
+  ) WHERE rank = 1
+  `,
+  toState: getStatementInsightsFromClusterExecutionInsightsResponse,
+};
+
+export function getStatementInsightsApi(): Promise<StatementInsights> {
+  const request: SqlExecutionRequest = {
+    statements: [
+      {
+        sql: `${statementInsightsQuery.query}`,
+      },
+    ],
+    execute: true,
+    max_result_size: 50000, // 50 kib
+  };
+  return executeSql<ExecutionInsightsResponseRow>(request).then(result => {
+    return statementInsightsQuery.toState(result);
+  });
 }

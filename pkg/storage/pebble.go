@@ -16,7 +16,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -35,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -629,9 +627,6 @@ type PebbleConfig struct {
 	base.StorageConfig
 	// Pebble specific options.
 	Opts *pebble.Options
-	// Temporary option while there exist file descriptor leaks. See the
-	// DisableFilesystemMiddlewareTODO ConfigOption that sets this, and #81389.
-	DisableFilesystemMiddlewareTODO bool
 }
 
 // EncryptionStatsHandler provides encryption related stats.
@@ -814,15 +809,12 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 
 	// Initialize the FS, wrapping it with disk health-checking and
 	// ENOSPC-detection.
-	var filesystemCloser io.Closer
-	if !cfg.DisableFilesystemMiddlewareTODO {
-		filesystemCloser = wrapFilesystemMiddleware(cfg.Opts)
-		defer func() {
-			if err != nil {
-				filesystemCloser.Close()
-			}
-		}()
-	}
+	filesystemCloser := wrapFilesystemMiddleware(cfg.Opts)
+	defer func() {
+		if err != nil {
+			filesystemCloser.Close()
+		}
+	}()
 
 	cfg.Opts.EnsureDefaults()
 	cfg.Opts.ErrorIfNotExists = cfg.MustExist
@@ -1124,17 +1116,11 @@ func (p *Pebble) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIt
 		// Doing defer r.Free() does not inline.
 		iter := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter)
 	}
 
 	iter := newPebbleIterator(p.db, opts, StandardDurability, p.SupportsRangeKeys())
-	if util.RaceEnabled {
-		return wrapInUnsafeIter(iter)
-	}
-	return iter
+	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Engine interface.
@@ -1740,7 +1726,7 @@ func (p *Pebble) ReadFile(filename string) ([]byte, error) {
 	}
 	defer file.Close()
 
-	return ioutil.ReadAll(file)
+	return io.ReadAll(file)
 }
 
 // WriteFile writes data to a file in this RocksDB's env.
@@ -2049,10 +2035,7 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		// Doing defer r.Free() does not inline.
 		iter := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter)
 	}
 
 	iter := &p.normalIter
@@ -2077,11 +2060,7 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 	}
 
 	iter.inuse = true
-	var rv MVCCIterator = iter
-	if util.RaceEnabled {
-		rv = wrapInUnsafeIter(rv)
-	}
-	return rv
+	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Engine interface.
@@ -2322,18 +2301,12 @@ func (p *pebbleSnapshot) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		// Doing defer r.Free() does not inline.
 		iter := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter)
 	}
 
 	iter := MVCCIterator(newPebbleIterator(
 		p.snapshot, opts, StandardDurability, p.SupportsRangeKeys()))
-	if util.RaceEnabled {
-		iter = wrapInUnsafeIter(iter)
-	}
-	return iter
+	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Reader interface.

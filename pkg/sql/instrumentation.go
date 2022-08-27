@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/indexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -141,9 +142,11 @@ type instrumentationHelper struct {
 	// costEstimate is the cost of the query as estimated by the optimizer.
 	costEstimate float64
 
-	// indexRecommendations is a string slice containing index recommendations for
-	// the planned statement.
-	indexRecommendations []string
+	// indexRecs contains index recommendations for the planned statement. It
+	// will only be populated if the statement is an EXPLAIN statement, or if
+	// recommendations are requested for the statement for populating the
+	// statement_statistics table.
+	indexRecs []indexrec.Rec
 
 	// maxFullScanRows is the maximum number of rows scanned by a full scan, as
 	// estimated by the optimizer.
@@ -255,6 +258,12 @@ func (ih *instrumentationHelper) Setup(
 	ih.savePlanForStats =
 		statsCollector.ShouldSaveLogicalPlanDesc(fingerprint, implicitTxn, p.SessionData().Database)
 
+	if ih.ShouldBuildExplainPlan() {
+		// Populate traceMetadata early in case we short-circuit the execution
+		// before reaching the bottom of this method.
+		ih.traceMetadata = make(execNodeTraceMetadata)
+	}
+
 	if sp := tracing.SpanFromContext(ctx); sp != nil {
 		if sp.IsVerbose() && !cfg.TestingKnobs.NoStatsCollectionWithVerboseTracing {
 			// If verbose tracing was enabled at a higher level, stats
@@ -299,7 +308,9 @@ func (ih *instrumentationHelper) Setup(
 	}
 
 	ih.collectExecStats = true
-	ih.traceMetadata = make(execNodeTraceMetadata)
+	if ih.traceMetadata == nil {
+		ih.traceMetadata = make(execNodeTraceMetadata)
+	}
 	ih.evalCtx = p.EvalContext()
 	newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithRecording(tracingpb.RecordingVerbose))
 	ih.shouldFinishSpan = true
@@ -336,15 +347,6 @@ func (ih *instrumentationHelper) Finish(
 		ih.withStatementTrace(trace, stmtRawSQL)
 	}
 
-	if ih.traceMetadata != nil && ih.explainPlan != nil {
-		ih.regions = ih.traceMetadata.annotateExplain(
-			ih.explainPlan,
-			trace,
-			cfg.TestingKnobs.DeterministicExplain,
-			p,
-		)
-	}
-
 	queryLevelStats, ok := ih.GetQueryLevelStats()
 	// Accumulate txn stats if no error was encountered while collecting
 	// query-level statistics.
@@ -355,6 +357,7 @@ func (ih *instrumentationHelper) Finish(
 	}
 
 	var bundle diagnosticsBundle
+	var warnings []string
 	if ih.collectBundle {
 		ie := p.extendedEvalCtx.ExecCfg.InternalExecutorFactory.NewInternalExecutor(
 			p.SessionData(),
@@ -369,6 +372,7 @@ func (ih *instrumentationHelper) Finish(
 				phaseTimes,
 				queryLevelStats,
 			)
+			warnings = ob.GetWarnings()
 			bundle = buildStatementBundle(
 				ih.origCtx, cfg.DB, ie.(*InternalExecutor), &p.curPlan, ob.BuildString(), trace, placeholders,
 			)
@@ -386,7 +390,7 @@ func (ih *instrumentationHelper) Finish(
 
 	switch ih.outputMode {
 	case explainAnalyzeDebugOutput:
-		return setExplainBundleResult(ctx, res, bundle, cfg)
+		return setExplainBundleResult(ctx, res, bundle, cfg, warnings)
 
 	case explainAnalyzePlanOutput, explainAnalyzeDistSQLOutput:
 		var flows []flowInfo
@@ -698,7 +702,7 @@ func (ih *instrumentationHelper) SetIndexRecommendations(
 	stmtType := opc.p.stmt.AST.StatementType()
 
 	reset := false
-	var recommendations []string
+	var recommendations []indexrec.Rec
 	if idxRec.ShouldGenerateIndexRecommendation(
 		ih.fingerprint,
 		ih.planGist.Hash(),
@@ -732,9 +736,9 @@ func (ih *instrumentationHelper) SetIndexRecommendations(
 			}
 		}
 		reset = true
-		recommendations = ih.indexRecommendations
+		recommendations = ih.indexRecs
 	}
-	ih.indexRecommendations = idxRec.UpdateIndexRecommendations(
+	ih.indexRecs = idxRec.UpdateIndexRecommendations(
 		ih.fingerprint,
 		ih.planGist.Hash(),
 		planner.SessionData().Database,

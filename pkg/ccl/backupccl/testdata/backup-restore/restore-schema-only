@@ -142,3 +142,4 @@ pq: type "d2.public.greeting" already exists
 # into each of the restored tables.
 exec-sql
 INSERT INTO d2.t2 VALUES ('hi');
+----

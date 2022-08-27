@@ -24,7 +24,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"hash/fnv"
-	"io/ioutil"
+	"io"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -1269,7 +1269,7 @@ var regularBuiltins = map[string]builtinDefinition{
 						return nil, errors.Wrap(err, "failed to decompress")
 					}
 					defer r.Close()
-					decompressedBytes, err := ioutil.ReadAll(r)
+					decompressedBytes, err := io.ReadAll(r)
 					if err != nil {
 						return nil, err
 					}
@@ -2712,7 +2712,11 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				return withMinTimestamp(ctx, tree.MustBeDTimestampTZ(args[0]).Time)
+				ts, ok := tree.AsDTimestampTZ(args[0])
+				if !ok {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "expected timestamptz argument for min_timestamp")
+				}
+				return withMinTimestamp(ctx, ts.Time)
 			},
 			Info:       withMinTimestampInfo(false /* nearestOnly */),
 			Volatility: volatility.Volatile,
@@ -2724,7 +2728,11 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				return withMinTimestamp(ctx, tree.MustBeDTimestampTZ(args[0]).Time)
+				ts, ok := tree.AsDTimestampTZ(args[0])
+				if !ok {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "expected timestamptz argument for min_timestamp")
+				}
+				return withMinTimestamp(ctx, ts.Time)
 			},
 			Info:       withMinTimestampInfo(true /* nearestOnly */),
 			Volatility: volatility.Volatile,
@@ -2739,7 +2747,11 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				return withMaxStaleness(ctx, tree.MustBeDInterval(args[0]).Duration)
+				interval, ok := tree.AsDInterval(args[0])
+				if !ok {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "expected interval argument for max_staleness")
+				}
+				return withMaxStaleness(ctx, interval.Duration)
 			},
 			Info:       withMaxStalenessInfo(false /* nearestOnly */),
 			Volatility: volatility.Volatile,
@@ -2751,7 +2763,11 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				return withMaxStaleness(ctx, tree.MustBeDInterval(args[0]).Duration)
+				interval, ok := tree.AsDInterval(args[0])
+				if !ok {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "expected interval argument for max_staleness")
+				}
+				return withMaxStaleness(ctx, interval.Duration)
 			},
 			Info:       withMaxStalenessInfo(true /* nearestOnly */),
 			Volatility: volatility.Volatile,
@@ -3815,9 +3831,6 @@ value if you rely on the HLC for accuracy.`,
 	// JSON functions.
 	// The behavior of both the JSON and JSONB data types in CockroachDB is
 	// similar to the behavior of the JSONB data type in Postgres.
-
-	"json_to_recordset":  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 33285, Category: builtinconstants.CategoryJSON}),
-	"jsonb_to_recordset": makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 33285, Category: builtinconstants.CategoryJSON}),
 
 	"jsonb_path_exists":      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 22513, Category: builtinconstants.CategoryJSON}),
 	"jsonb_path_exists_opr":  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 22513, Category: builtinconstants.CategoryJSON}),
@@ -9621,13 +9634,13 @@ func asJSONBuildObjectKey(
 	d tree.Datum, dcc sessiondatapb.DataConversionConfig, loc *time.Location,
 ) (string, error) {
 	switch t := d.(type) {
-	case *tree.DJSON, *tree.DArray, *tree.DTuple:
+	case *tree.DArray, *tree.DJSON, *tree.DTuple:
 		return "", pgerror.New(pgcode.InvalidParameterValue,
 			"key value must be scalar, not array, tuple, or json")
-	case *tree.DString:
-		return string(*t), nil
 	case *tree.DCollatedString:
 		return t.Contents, nil
+	case *tree.DString:
+		return string(*t), nil
 	case *tree.DTimestampTZ:
 		ts, err := tree.MakeDTimestampTZ(t.Time.In(loc), time.Microsecond)
 		if err != nil {
@@ -9638,9 +9651,11 @@ func asJSONBuildObjectKey(
 			tree.FmtBareStrings,
 			tree.FmtDataConversionConfig(dcc),
 		), nil
-	case *tree.DBool, *tree.DInt, *tree.DFloat, *tree.DDecimal, *tree.DTimestamp,
-		*tree.DDate, *tree.DUuid, *tree.DInterval, *tree.DBytes, *tree.DIPAddr, *tree.DOid,
-		*tree.DTime, *tree.DTimeTZ, *tree.DBitArray, *tree.DGeography, *tree.DGeometry, *tree.DBox2D:
+	case *tree.DBitArray, *tree.DBool, *tree.DBox2D, *tree.DBytes, *tree.DDate,
+		*tree.DDecimal, *tree.DEnum, *tree.DFloat, *tree.DGeography,
+		*tree.DGeometry, *tree.DIPAddr, *tree.DInt, *tree.DInterval, *tree.DOid,
+		*tree.DOidWrapper, *tree.DTime, *tree.DTimeTZ, *tree.DTimestamp,
+		*tree.DUuid, *tree.DVoid:
 		return tree.AsStringWithFlags(d, tree.FmtBareStrings), nil
 	default:
 		return "", errors.AssertionFailedf("unexpected type %T for key value", d)

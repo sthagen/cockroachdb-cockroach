@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -461,13 +460,15 @@ func IP(
 }
 
 // Status retrieves the status of nodes in a cluster.
-func Status(ctx context.Context, l *logger.Logger, clusterName, processTag string) error {
+func Status(
+	ctx context.Context, l *logger.Logger, clusterName, processTag string,
+) ([]install.NodeStatus, error) {
 	if err := LoadClusters(); err != nil {
-		return err
+		return nil, err
 	}
 	c, err := newCluster(l, clusterName, install.TagOption(processTag))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return c.Status(ctx, l)
 }
@@ -997,7 +998,7 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 		}
 		outputFile := fmt.Sprintf("pprof-%s-%d-%s-%04d.out", profType, startTime, c.Name, node)
 		outputDir := filepath.Dir(outputFile)
-		file, err := ioutil.TempFile(outputDir, ".pprof")
+		file, err := os.CreateTemp(outputDir, ".pprof")
 		if err != nil {
 			return nil, errors.Wrap(err, "create tmpfile for pprof download")
 		}

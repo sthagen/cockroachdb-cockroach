@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -63,6 +62,7 @@ var (
 	local bool
 
 	cockroach        string
+	cockroachShort   string
 	libraryFilePaths []string
 	cloud            = spec.GCE
 	// encryptionProbability controls when encryption-at-rest is enabled
@@ -205,6 +205,15 @@ func initBinariesAndLibraries() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%+v\n", err)
 		os.Exit(1)
+	}
+
+	if cockroachShort != "" {
+		// defValue doesn't matter since cockroachShort is a non-empty string.
+		cockroachShort, err = findBinary(cockroachShort, "" /* defValue */)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%+v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	workload, err = findBinary(workload, "workload")
@@ -1226,10 +1235,10 @@ func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, t test.Test) erro
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		if err := ioutil.WriteFile(tsDumpGob+".yaml", buf.Bytes(), 0644); err != nil {
+		if err := os.WriteFile(tsDumpGob+".yaml", buf.Bytes(), 0644); err != nil {
 			return err
 		}
-		return ioutil.WriteFile(tsDumpGob+"-run.sh", []byte(`#!/usr/bin/env bash
+		return os.WriteFile(tsDumpGob+"-run.sh", []byte(`#!/usr/bin/env bash
 
 COCKROACH_DEBUG_TS_IMPORT_FILE=tsdump.gob cockroach start-single-node --insecure $*
 `), 0755)
@@ -1703,7 +1712,7 @@ func (c *clusterImpl) PutString(
 	c.status("uploading string")
 	defer c.status("")
 
-	temp, err := ioutil.TempFile("", filepath.Base(dest))
+	temp, err := os.CreateTemp("", filepath.Base(dest))
 	if err != nil {
 		return errors.Wrap(err, "cluster.PutString")
 	}
@@ -1823,7 +1832,7 @@ func (c *clusterImpl) StartE(
 
 func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error {
 	var err error
-	c.localCertsDir, err = ioutil.TempDir("", "roachtest-certs")
+	c.localCertsDir, err = os.MkdirTemp("", "roachtest-certs")
 	if err != nil {
 		return err
 	}

@@ -376,7 +376,7 @@ func (q *SpillingQueue) Dequeue(ctx context.Context) (coldata.Batch, error) {
 		// batch to Dequeue() from disk into it.
 		q.unlimitedAllocator.ReleaseMemory(q.lastDequeuedBatchMemUsage)
 		q.lastDequeuedBatchMemUsage = colmem.GetBatchMemSize(q.dequeueScratch)
-		q.unlimitedAllocator.AdjustMemoryUsage(q.lastDequeuedBatchMemUsage)
+		q.unlimitedAllocator.AdjustMemoryUsageAfterAllocation(q.lastDequeuedBatchMemUsage)
 		if q.rewindable {
 			q.rewindableState.numItemsDequeued++
 		} else {
@@ -429,7 +429,7 @@ func (q *SpillingQueue) maybeSpillToDisk(ctx context.Context) error {
 	// one for the read file.
 	if q.fdSemaphore != nil {
 		if err = q.fdSemaphore.Acquire(ctx, q.numFDsOpenAtAnyGivenTime()); err != nil {
-			return err
+			colexecerror.ExpectedError(err)
 		}
 	}
 	log.VEvent(ctx, 1, "spilled to disk")

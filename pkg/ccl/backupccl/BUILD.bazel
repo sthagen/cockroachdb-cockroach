@@ -147,6 +147,7 @@ go_test(
     name = "backupccl_test",
     size = "enormous",
     srcs = [
+        "alter_backup_schedule_test.go",
         "alter_backup_test.go",
         "backup_cloud_test.go",
         "backup_intents_test.go",
@@ -273,6 +274,7 @@ go_test(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
+        "//pkg/util/version",
         "//pkg/workload/bank",
         "//pkg/workload/workloadsql",
         "@com_github_aws_aws_sdk_go//aws/credentials",

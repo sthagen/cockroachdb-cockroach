@@ -54,7 +54,8 @@ var (
 		"mvcc-histories-deleterange-tombstome-known-stats", false)
 	iterReader = util.ConstantWithMetamorphicTestChoice("mvcc-histories-iter-reader",
 		"engine", "readonly", "batch", "snapshot").(string)
-	sstIterVerify = util.ConstantWithMetamorphicTestBool("mvcc-histories-sst-iter-verify", false)
+	sstIterVerify           = util.ConstantWithMetamorphicTestBool("mvcc-histories-sst-iter-verify", false)
+	metamorphicIteratorSeed = util.ConstantWithMetamorphicTestRange("mvcc-metamorphic-iterator-seed", 0, 0, 100000) // 0 = disabled
 )
 
 // TestMVCCHistories verifies that sequences of MVCC reads and writes
@@ -162,7 +163,7 @@ func TestMVCCHistories(t *testing.T) {
 		}
 		defer engine.Close()
 
-		if strings.HasSuffix(path, "_norace") {
+		if strings.Contains(path, "_norace") {
 			skip.UnderRace(t)
 		}
 
@@ -319,6 +320,9 @@ func TestMVCCHistories(t *testing.T) {
 
 		e := newEvalCtx(ctx, engine)
 		defer e.close()
+		if strings.Contains(path, "_nometamorphiciter") {
+			e.noMetamorphicIter = true
+		}
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			// We'll be overriding cmd/cmdargs below, because the
@@ -1450,6 +1454,7 @@ func cmdIterNew(e *evalCtx) error {
 	if e.hasArg("pointSynthesis") {
 		iter = newPointSynthesizingIter(iter)
 	}
+	iter = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), iter).(MVCCIterator)
 	if opts.Prefix != iter.IsPrefix() {
 		return errors.Errorf("prefix iterator returned IsPrefix=false")
 	}
@@ -1512,7 +1517,13 @@ func cmdIterNewIncremental(e *evalCtx) error {
 	}
 
 	r, closer := metamorphicReader(e)
-	e.iter = &iterWithCloser{NewMVCCIncrementalIterator(r, opts), closer}
+	it := SimpleMVCCIterator(NewMVCCIncrementalIterator(r, opts))
+	// Can't metamorphically move the iterator around since when intents get aggregated
+	// or emitted we can't undo that later at the level of the metamorphic iterator.
+	if opts.IntentPolicy == MVCCIncrementalIterIntentPolicyError {
+		it = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), it)
+	}
+	e.iter = &iterWithCloser{it, closer}
 	e.iterRangeKeys.Clear()
 	return nil
 }
@@ -1535,7 +1546,8 @@ func cmdIterNewReadAsOf(e *evalCtx) error {
 		opts.UpperBound = keys.MaxKey
 	}
 	r, closer := metamorphicReader(e)
-	iter := &iterWithCloser{r.NewMVCCIterator(MVCCKeyIterKind, opts), closer}
+	innerIter := newMetamorphicIterator(e.t, e.metamorphicIterSeed(), r.NewMVCCIterator(MVCCKeyIterKind, opts))
+	iter := &iterWithCloser{innerIter, closer}
 	e.iter = NewReadAsOfIterator(iter, asOf)
 	e.iterRangeKeys.Clear()
 	return nil
@@ -1605,16 +1617,15 @@ func cmdIterScan(e *evalCtx) error {
 	// adjust e.iterRangeKeys to comply with the previous positioning operation.
 	// The previous position already passed this check, so it doesn't matter that
 	// we're fudging e.rangeKeys.
-	if _, ok := e.bareIter().(*MVCCIncrementalIterator); !ok {
-		if e.iter.RangeKeyChanged() {
-			if e.iterRangeKeys.IsEmpty() {
-				e.iterRangeKeys = MVCCRangeKeyStack{
-					Bounds:   roachpb.Span{Key: keys.MinKey.Next(), EndKey: keys.MaxKey},
-					Versions: MVCCRangeKeyVersions{{Timestamp: hlc.MinTimestamp}},
-				}
-			} else {
-				e.iterRangeKeys.Clear()
+	if e.iter.RangeKeyChanged() {
+		if e.iterRangeKeys.IsEmpty() {
+			e.iterRangeKeys = MVCCRangeKeyStack{
+				// NB: Clone MinKey/MaxKey, since we write into these byte slices later.
+				Bounds:   roachpb.Span{Key: keys.MinKey.Next().Clone(), EndKey: keys.MaxKey.Clone()},
+				Versions: MVCCRangeKeyVersions{{Timestamp: hlc.MinTimestamp}},
 			}
+		} else {
+			e.iterRangeKeys.Clear()
 		}
 	}
 
@@ -1695,7 +1706,7 @@ func cmdSSTIterNew(e *evalCtx) error {
 	if err != nil {
 		return err
 	}
-	e.iter = iter
+	e.iter = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), iter)
 	e.iterRangeKeys.Clear()
 	return nil
 }
@@ -1703,6 +1714,8 @@ func cmdSSTIterNew(e *evalCtx) error {
 func printIter(e *evalCtx) {
 	e.results.buf.Printf("%s:", e.td.Cmd)
 	defer e.results.buf.Printf("\n")
+
+	ignoringTime := strings.HasSuffix(e.td.Cmd, "_ignoring_time")
 
 	ok, err := e.iter.Valid()
 	if err != nil {
@@ -1715,7 +1728,8 @@ func printIter(e *evalCtx) {
 		return
 	}
 	hasPoint, hasRange := e.iter.HasPointAndRange()
-	if !hasPoint && !hasRange {
+	maybeIIT := e.tryMVCCIncrementalIter()
+	if !hasPoint && !hasRange && (maybeIIT == nil || maybeIIT.RangeKeysIgnoringTime().IsEmpty()) {
 		e.t.Fatalf("valid iterator at %s without point nor range keys", e.iter.UnsafeKey())
 	}
 
@@ -1751,20 +1765,55 @@ func printIter(e *evalCtx) {
 		e.results.buf.Printf("]")
 	}
 
+	var rangeKeysIgnoringTime MVCCRangeKeyStack
+	if maybeIIT != nil {
+		rangeKeysIgnoringTime = maybeIIT.RangeKeysIgnoringTime()
+	}
+	if ignoringTime && !rangeKeysIgnoringTime.IsEmpty() && !rangeKeysIgnoringTime.Equal(e.iter.RangeKeys()) {
+		e.results.buf.Printf(" (+%s/[", rangeKeysIgnoringTime.Bounds)
+		for i, version := range rangeKeysIgnoringTime.Versions {
+			value, err := DecodeMVCCValue(version.Value)
+			if err != nil {
+				e.Fatalf("%v", err)
+			}
+			if i > 0 {
+				e.results.buf.Printf(" ")
+			}
+			e.results.buf.Printf("%s=%s", version.Timestamp, value)
+		}
+		e.results.buf.Printf("]")
+		if e.mvccIncrementalIter().RangeKeyChangedIgnoringTime() {
+			e.results.buf.Printf(" !")
+		}
+		e.results.buf.Printf(")")
+	}
+
 	if checkAndUpdateRangeKeyChanged(e) {
 		e.results.buf.Printf(" !")
 	}
 }
 
 func checkAndUpdateRangeKeyChanged(e *evalCtx) bool {
-	// MVCCIncrementalIterator does not yet support RangeKeyChanged().
-	if _, ok := e.bareIter().(*MVCCIncrementalIterator); ok {
-		return false
-	}
 	rangeKeyChanged := e.iter.RangeKeyChanged()
 	rangeKeys := e.iter.RangeKeys()
+
+	if incrIter := e.tryMVCCIncrementalIter(); incrIter != nil {
+		// For MVCCIncrementalIterator, make sure RangeKeyChangedIgnoringTime() fires
+		// whenever RangeKeyChanged() does. The inverse is not true.
+		rangeKeyChangedIgnoringTime := incrIter.RangeKeyChangedIgnoringTime()
+		if rangeKeyChanged && !rangeKeyChangedIgnoringTime {
+			e.t.Fatalf("RangeKeyChanged=%t but RangeKeyChangedIgnoringTime=%t",
+				rangeKeyChanged, rangeKeyChangedIgnoringTime)
+		}
+		// If RangeKeyChangedIgnoringTime() fires, and RangeKeyChanged() doesn't,
+		// then RangeKeys() must be empty.
+		if rangeKeyChangedIgnoringTime && !rangeKeyChanged && !rangeKeys.IsEmpty() {
+			e.t.Fatalf("RangeKeyChangedIgnoringTime without RangeKeyChanged, but RangeKeys not empty")
+		}
+	}
+
 	if rangeKeyChanged != !rangeKeys.Equal(e.iterRangeKeys) {
-		e.t.Fatalf("incorrect RangeKeyChanged=%t (was:%s is:%s) at %s\n",
+		e.t.Fatalf("incorrect RangeKeyChanged=%t (was:%s is:%s) at %s",
 			rangeKeyChanged, e.iterRangeKeys, rangeKeys, e.td.Pos)
 	}
 	rangeKeys.CloneInto(&e.iterRangeKeys)
@@ -1828,20 +1877,21 @@ type evalCtx struct {
 		txn               *roachpb.Transaction
 		traceIntentWrites bool
 	}
-	ctx           context.Context
-	st            *cluster.Settings
-	engine        Engine
-	iter          SimpleMVCCIterator
-	iterRangeKeys MVCCRangeKeyStack
-	t             *testing.T
-	td            *datadriven.TestData
-	txns          map[string]*roachpb.Transaction
-	txnCounter    uint128.Uint128
-	locks         map[string]*roachpb.Transaction
-	ms            *enginepb.MVCCStats
-	sstWriter     *SSTWriter
-	sstFile       *MemFile
-	ssts          [][]byte
+	ctx               context.Context
+	st                *cluster.Settings
+	engine            Engine
+	noMetamorphicIter bool // never instantiate metamorphicIterator
+	iter              SimpleMVCCIterator
+	iterRangeKeys     MVCCRangeKeyStack
+	t                 *testing.T
+	td                *datadriven.TestData
+	txns              map[string]*roachpb.Transaction
+	txnCounter        uint128.Uint128
+	locks             map[string]*roachpb.Transaction
+	ms                *enginepb.MVCCStats
+	sstWriter         *SSTWriter
+	sstFile           *MemFile
+	ssts              [][]byte
 }
 
 func newEvalCtx(ctx context.Context, engine Engine) *evalCtx {
@@ -1860,6 +1910,13 @@ func (e *evalCtx) close() {
 		e.iter.Close()
 	}
 	// engine is passed in, so it's the caller's responsibility to close it.
+}
+
+func (e *evalCtx) metamorphicIterSeed() int64 {
+	if e.noMetamorphicIter {
+		return 0
+	}
+	return int64(metamorphicIteratorSeed)
 }
 
 func (e *evalCtx) getTxnStatus() roachpb.TransactionStatus {
@@ -2109,51 +2166,83 @@ func (lt *mockLockTableView) IsKeyLockedByConflictingTxn(
 	return true, &holder.TxnMeta
 }
 
-func (e *evalCtx) bareIter() SimpleMVCCIterator {
-	iter, ok := e.tryBareIter()
-	if !ok {
-		e.t.Fatalf("no iterator")
+func (e *evalCtx) visitWrappedIters(fn func(it SimpleMVCCIterator) (done bool)) {
+	iter := e.iter
+	if iter == nil {
+		return
 	}
-	return iter
-}
-
-func (e *evalCtx) tryBareIter() (SimpleMVCCIterator, bool) {
-	if iter := e.iter; iter == nil {
-		return nil, false
-	} else if i, ok := iter.(*iterWithCloser); ok {
-		return i.SimpleMVCCIterator, true
-	} else {
-		return iter, true
+	for {
+		if fn(iter) {
+			return
+		}
+		if i, ok := iter.(*iterWithCloser); ok {
+			iter = i.SimpleMVCCIterator
+			continue
+		}
+		if i, ok := iter.(*metamorphicIterator); ok {
+			iter = i.it
+			continue
+		}
+		if i, ok := iter.(*metamorphicMVCCIterator); ok {
+			iter = i.it
+			continue
+		}
+		if i, ok := iter.(*metamorphicMVCCIncrementalIterator); ok {
+			iter = i.it
+			continue
+		}
+		return // unwrapped all we knew to unwrap
 	}
 }
 
 func (e *evalCtx) mvccIter() MVCCIterator {
-	iter := e.bareIter()
-	mvccIter, ok := iter.(MVCCIterator)
-	if !ok {
-		e.t.Fatalf("%T does not implement MVCCIterator", iter)
-	}
-	return mvccIter
+	var iter MVCCIterator
+	e.visitWrappedIters(func(it SimpleMVCCIterator) (done bool) {
+		iter, done = it.(MVCCIterator)
+		return done
+	})
+	require.NotNil(e.t, iter, "need an MVCC iterator")
+	return iter
 }
 
-func (e *evalCtx) mvccIncrementalIter() *MVCCIncrementalIterator {
-	iter := e.bareIter()
-	mvccIncrementalIter, ok := iter.(*MVCCIncrementalIterator)
-	if !ok {
-		e.t.Fatalf("%T is not MVCCIncrementalIterator", iter)
-	}
-	return mvccIncrementalIter
+func (e *evalCtx) mvccIncrementalIter() mvccIncrementalIteratorI {
+	iter := e.tryMVCCIncrementalIter()
+	require.NotNil(e.t, iter, "need an MVCCIncrementalIterator")
+	return iter
+}
+
+type mvccIncrementalIteratorI interface {
+	SimpleMVCCIterator
+	RangeKeysIgnoringTime() MVCCRangeKeyStack
+	RangeKeyChangedIgnoringTime() bool
+	NextIgnoringTime()
+	NextKeyIgnoringTime()
+	TryGetIntentError() error
+}
+
+var _ mvccIncrementalIteratorI = (*MVCCIncrementalIterator)(nil)
+
+// tryMVCCIncrementalIter unwraps an MVCCIncrementalIterator, if there is one.
+// This does not return the verbatim *MVCCIncrementalIterator but an interface,
+// since we are usually wrapping in a metamorphicIterator which injects extra
+// movement and thus needs to mask RangeKeyChanged{,IgnoringTime}.
+func (e *evalCtx) tryMVCCIncrementalIter() mvccIncrementalIteratorI {
+	var iter mvccIncrementalIteratorI
+	e.visitWrappedIters(func(it SimpleMVCCIterator) (done bool) {
+		iter, done = it.(mvccIncrementalIteratorI)
+		return done
+	})
+	return iter
 }
 
 func (e *evalCtx) iterErr() error {
-	iter, ok := e.tryBareIter()
-	if !ok {
+	if e.iter == nil {
 		return nil
 	}
-	if _, err := iter.Valid(); err != nil {
+	if _, err := e.iter.Valid(); err != nil {
 		return err
 	}
-	if mvccIncrementalIter, ok := iter.(*MVCCIncrementalIterator); ok {
+	if mvccIncrementalIter := e.tryMVCCIncrementalIter(); mvccIncrementalIter != nil {
 		if err := mvccIncrementalIter.TryGetIntentError(); err != nil {
 			return err
 		}

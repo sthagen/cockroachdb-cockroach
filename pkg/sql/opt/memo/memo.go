@@ -137,6 +137,7 @@ type Memo struct {
 	//       fields in explain_bundle.go.
 	reorderJoinsLimit                      int
 	zigzagJoinEnabled                      bool
+	useForecasts                           bool
 	useHistograms                          bool
 	useMultiColStats                       bool
 	useNotVisibleIndex                     bool
@@ -155,6 +156,7 @@ type Memo struct {
 	testingOptimizerRandomSeed             int64
 	testingOptimizerCostPerturbation       float64
 	testingOptimizerDisableRuleProbability float64
+	enforceHomeRegion                      bool
 
 	// curRank is the highest currently in-use scalar expression rank.
 	curRank opt.ScalarRank
@@ -187,6 +189,7 @@ func (m *Memo) Init(evalCtx *eval.Context) {
 		metadata:                               m.metadata,
 		reorderJoinsLimit:                      int(evalCtx.SessionData().ReorderJoinsLimit),
 		zigzagJoinEnabled:                      evalCtx.SessionData().ZigzagJoinEnabled,
+		useForecasts:                           evalCtx.SessionData().OptimizerUseForecasts,
 		useHistograms:                          evalCtx.SessionData().OptimizerUseHistograms,
 		useMultiColStats:                       evalCtx.SessionData().OptimizerUseMultiColStats,
 		useNotVisibleIndex:                     evalCtx.SessionData().OptimizerUseNotVisibleIndexes,
@@ -205,6 +208,7 @@ func (m *Memo) Init(evalCtx *eval.Context) {
 		testingOptimizerRandomSeed:             evalCtx.SessionData().TestingOptimizerRandomSeed,
 		testingOptimizerCostPerturbation:       evalCtx.SessionData().TestingOptimizerCostPerturbation,
 		testingOptimizerDisableRuleProbability: evalCtx.SessionData().TestingOptimizerDisableRuleProbability,
+		enforceHomeRegion:                      evalCtx.SessionData().EnforceHomeRegion,
 	}
 	m.metadata.Init()
 	m.logPropsBuilder.init(evalCtx, m)
@@ -321,6 +325,7 @@ func (m *Memo) IsStale(
 	// changed.
 	if m.reorderJoinsLimit != int(evalCtx.SessionData().ReorderJoinsLimit) ||
 		m.zigzagJoinEnabled != evalCtx.SessionData().ZigzagJoinEnabled ||
+		m.useForecasts != evalCtx.SessionData().OptimizerUseForecasts ||
 		m.useHistograms != evalCtx.SessionData().OptimizerUseHistograms ||
 		m.useMultiColStats != evalCtx.SessionData().OptimizerUseMultiColStats ||
 		m.useNotVisibleIndex != evalCtx.SessionData().OptimizerUseNotVisibleIndexes ||
@@ -338,7 +343,8 @@ func (m *Memo) IsStale(
 		m.allowUnconstrainedNonCoveringIndexScan != evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled ||
 		m.testingOptimizerRandomSeed != evalCtx.SessionData().TestingOptimizerRandomSeed ||
 		m.testingOptimizerCostPerturbation != evalCtx.SessionData().TestingOptimizerCostPerturbation ||
-		m.testingOptimizerDisableRuleProbability != evalCtx.SessionData().TestingOptimizerDisableRuleProbability {
+		m.testingOptimizerDisableRuleProbability != evalCtx.SessionData().TestingOptimizerDisableRuleProbability ||
+		m.enforceHomeRegion != evalCtx.SessionData().EnforceHomeRegion {
 		return true, nil
 	}
 
@@ -432,17 +438,15 @@ func (m *Memo) RequestColStat(
 	return nil, false
 }
 
-// RequestColStatTable calculates and returns the column statistic in table
-// tabId.
-func (m *Memo) RequestColStatTable(
-	tabID opt.TableID, colSet opt.ColSet,
-) (colStat *props.ColumnStatistic, ok bool) {
+// RequestColAvgSize calculates and returns the column's average size statistic.
+// The column must exist in the table with ID tabId.
+func (m *Memo) RequestColAvgSize(tabID opt.TableID, col opt.ColumnID) uint64 {
 	// When SetRoot is called, the statistics builder may have been cleared.
 	// If this happens, we can't serve the request anymore.
 	if m.logPropsBuilder.sb.md != nil {
-		return m.logPropsBuilder.sb.colStatTable(tabID, colSet), true
+		return m.logPropsBuilder.sb.colAvgSize(tabID, col)
 	}
-	return nil, false
+	return defaultColSize
 }
 
 // RowsProcessed calculates and returns the number of rows processed by the
@@ -494,6 +498,11 @@ func (m *Memo) Detach() {
 // CheckExpr is always a no-op, so DisableCheckExpr has no effect.
 func (m *Memo) DisableCheckExpr() {
 	m.disableCheckExpr = true
+}
+
+// EvalContext returns the eval.Context of the current SQL request.
+func (m *Memo) EvalContext() *eval.Context {
+	return m.logPropsBuilder.evalCtx
 }
 
 // ValuesContainer lets ValuesExpr and LiteralValuesExpr share code.

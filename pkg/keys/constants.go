@@ -92,6 +92,8 @@ var (
 	// LocalRaftTruncatedStateSuffix for the corresponding unreplicated
 	// RaftTruncatedState.
 	_ = []byte("rftt")
+	// LocalRangeGCHintSuffix is the suffix for the GC hint struct.
+	LocalRangeGCHintSuffix = []byte("rgch")
 	// LocalRangeLeaseSuffix is the suffix for a range lease.
 	LocalRangeLeaseSuffix = []byte("rll-")
 	// LocalRangePriorReadSummarySuffix is the suffix for a range's prior read
@@ -133,6 +135,10 @@ var (
 	// LocalRangeLastReplicaGCTimestampSuffix is the suffix for a range's last
 	// replica GC timestamp (for GC of old replicas).
 	LocalRangeLastReplicaGCTimestampSuffix = []byte("rlrt")
+	// LocalRangeMVCCRangeKeyGCLockSuffix is the suffix for a lock obtained
+	// by range tombstone operations to ensure they don't overlap with
+	// GC requests while allowing point traffic to go through unobstructed.
+	LocalRangeMVCCRangeKeyGCLockSuffix = []byte("rltu")
 	// localRangeLastVerificationTimestampSuffix is DEPRECATED and remains to
 	// prevent reuse.
 	localRangeLastVerificationTimestampSuffix = []byte("rlvt")

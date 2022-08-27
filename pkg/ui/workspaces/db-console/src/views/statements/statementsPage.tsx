@@ -81,6 +81,7 @@ type StatementStatistics = util.StatementStatistics;
 
 interface StatementsSummaryData {
   statementFingerprintID: string;
+  statementFingerprintHexID: string;
   statement: string;
   statementSummary: string;
   aggregatedTs: number;
@@ -140,6 +141,8 @@ export const selectStatements = createSelector(
       if (!(key in statsByStatementKey)) {
         statsByStatementKey[key] = {
           statementFingerprintID: stmt.statement_fingerprint_id?.toString(),
+          statementFingerprintHexID:
+            stmt.statement_fingerprint_id?.toString(16),
           statement: stmt.statement,
           statementSummary: stmt.statement_summary,
           aggregatedTs: stmt.aggregated_ts,
@@ -157,6 +160,7 @@ export const selectStatements = createSelector(
       const stmt = statsByStatementKey[key];
       return {
         aggregatedFingerprintID: stmt.statementFingerprintID,
+        aggregatedFingerprintHexID: stmt.statementFingerprintHexID,
         label: stmt.statement,
         summary: stmt.statementSummary,
         aggregatedTs: stmt.aggregatedTs,
@@ -181,27 +185,26 @@ export const selectApps = createSelector(
     }
 
     let sawBlank = false;
+    let sawInternal = false;
     const apps: { [app: string]: boolean } = {};
     state.data.statements.forEach(
       (statement: ICollectedStatementStatistics) => {
-        const isNotInternalApp =
-          state.data.internal_app_name_prefix &&
-          !statement.key.key_data.app.startsWith(
-            state.data.internal_app_name_prefix,
-          );
         if (
-          state.data.internal_app_name_prefix == undefined ||
-          isNotInternalApp
+          state.data.internal_app_name_prefix &&
+          statement.key.key_data.app.startsWith(
+            state.data.internal_app_name_prefix,
+          )
         ) {
-          if (statement.key.key_data.app) {
-            apps[statement.key.key_data.app] = true;
-          } else {
-            sawBlank = true;
-          }
+          sawInternal = true;
+        } else if (statement.key.key_data.app) {
+          apps[statement.key.key_data.app] = true;
+        } else {
+          sawBlank = true;
         }
       },
     );
     return []
+      .concat(sawInternal ? [state.data.internal_app_name_prefix] : [])
       .concat(sawBlank ? [unset] : [])
       .concat(Object.keys(apps))
       .sort();

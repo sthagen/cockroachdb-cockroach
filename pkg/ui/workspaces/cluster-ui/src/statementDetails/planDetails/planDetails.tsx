@@ -22,14 +22,13 @@ import { SortSetting } from "../../sortedtable";
 import { Row } from "antd";
 import "antd/lib/row/style";
 import {
-  InsightRecommendation,
   InsightsSortedTable,
-  InsightType,
   makeInsightsColumns,
 } from "../../insightsTable/insightsTable";
 import classNames from "classnames/bind";
 import styles from "../statementDetails.module.scss";
 import { CockroachCloudContext } from "../../contexts";
+import { InsightRecommendation, InsightType } from "../../insights";
 
 const cx = classNames.bind(styles);
 
@@ -121,7 +120,8 @@ function ExplainPlan({
   onChangeSortSetting,
 }: ExplainPlanProps): React.ReactElement {
   const explainPlan =
-    plan.explain_plan === "" ? "unavailable" : plan.explain_plan;
+    `Plan Gist: ${plan.stats.plan_gists[0]} \n\n` +
+    (plan.explain_plan === "" ? "unavailable" : plan.explain_plan);
   const hasInsights = plan.stats.index_recommendations?.length > 0;
   return (
     <div>
@@ -136,7 +136,7 @@ function ExplainPlan({
       >
         All Plans
       </Button>
-      <SqlBox value={explainPlan} size={SqlBoxSize.large} />
+      <SqlBox value={explainPlan} size={SqlBoxSize.custom} />
       {hasInsights && (
         <Insights
           idxRecommendations={plan.stats.index_recommendations}
@@ -174,8 +174,6 @@ function formatIdxRecommendations(
     const idxRec: InsightRecommendation = {
       type: idxType,
       database: plan.metadata.databases[0],
-      table: "",
-      index_id: 0,
       query: rec.split(" : ")[1],
       execution: {
         statement: plan.metadata.query,

@@ -12,7 +12,6 @@ package base_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -151,6 +150,14 @@ target_file_size=2097152`
 		{"path=/mnt/hda1,type=other", "other is not a valid store type", StoreSpec{}},
 		{"path=/mnt/hda1,type=mem,size=20GiB", "path specified for in memory store", StoreSpec{}},
 
+		// provisioned rate
+		{"path=/mnt/hda1,provisioned-rate=disk-name=nvme1n1:bandwidth=200MiB/s", "",
+			StoreSpec{Path: "/mnt/hda1", ProvisionedRateSpec: base.ProvisionedRateSpec{
+				DiskName: "nvme1n1", ProvisionedBandwidth: 200 << 20}}},
+		{"path=/mnt/hda1,provisioned-rate=disk-name=sdb", "", StoreSpec{
+			Path: "/mnt/hda1", ProvisionedRateSpec: base.ProvisionedRateSpec{
+				DiskName: "sdb", ProvisionedBandwidth: 0}}},
+
 		// RocksDB
 		{"path=/,rocksdb=key1=val1;key2=val2", "", StoreSpec{Path: "/", RocksDBOptions: "key1=val1;key2=val2"}},
 
@@ -287,7 +294,7 @@ func TestStoreSpecListPreventedStartupMessage(t *testing.T) {
 	err := ssl.PriorCriticalAlertError()
 	require.NoError(t, err)
 
-	require.NoError(t, ioutil.WriteFile(ssl.Specs[2].PreventedStartupFile(), []byte("boom"), 0644))
+	require.NoError(t, os.WriteFile(ssl.Specs[2].PreventedStartupFile(), []byte("boom"), 0644))
 
 	err = ssl.PriorCriticalAlertError()
 	require.Error(t, err)

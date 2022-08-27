@@ -60,6 +60,8 @@ export const statisticsColumnLabels = {
   transactions: "Transactions",
   workloadPct: "% of All Runtime",
   lastExecTimestamp: "Last Execution Time (UTC)",
+  statementFingerprintId: "Statement Fingerprint ID",
+  transactionFingerprintId: "Transaction Fingerprint ID",
 };
 
 export const contentModifiers = {
@@ -239,6 +241,32 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         content={"The application that ran the session."}
       >
         {getLabel("applicationName")}
+      </Tooltip>
+    );
+  },
+  statementFingerprintId: () => {
+    return (
+      <Tooltip
+        style="tableTitle"
+        placement="bottom"
+        content={
+          "The statement fingerprint id is the combination of the statement fingerprint, the database it was executed on, the transaction type (implicit or explicit) and whether execution has failed (true or false)."
+        }
+      >
+        {getLabel("statementFingerprintId")}
+      </Tooltip>
+    );
+  },
+  transactionFingerprintId: () => {
+    return (
+      <Tooltip
+        style="tableTitle"
+        placement="bottom"
+        content={
+          "The transaction fingerprint id represents the list of statement fingerprint ids in order of execution within that transaction."
+        }
+      >
+        {getLabel("transactionFingerprintId")}
       </Tooltip>
     );
   },
@@ -622,7 +650,8 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         content={
           <>
             <p>
-              {`Maximum memory used by a ${contentModifier} with this fingerprint${fingerprintModifier} at any time during its execution within the specified time interval.`}
+              {`Maximum memory used by a ${contentModifier} with this fingerprint${fingerprintModifier} at any time 
+              during its execution within the specified time interval. `}
             </p>
             <p>
               The gray bar indicates the average max memory usage. The blue bar

@@ -1270,6 +1270,10 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="json_populate_recordset"></a><code>json_populate_recordset(base: anyelement, from_json: jsonb) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Expands the outermost array of objects in from_json to a set of rows whose columns match the record type defined by base</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="json_to_record"></a><code>json_to_record(input: jsonb) &rarr; tuple</code></td><td><span class="funcdesc"><p>Builds an arbitrary record from a JSON object.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="json_to_recordset"></a><code>json_to_recordset(input: jsonb) &rarr; tuple</code></td><td><span class="funcdesc"><p>Builds an arbitrary set of records from a JSON array of objects.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="jsonb_array_elements"></a><code>jsonb_array_elements(input: jsonb) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Expands a JSON array to a set of JSON values.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="jsonb_array_elements_text"></a><code>jsonb_array_elements_text(input: jsonb) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Expands a JSON array to a set of text values.</p>
@@ -1283,6 +1287,10 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <tr><td><a name="jsonb_populate_record"></a><code>jsonb_populate_record(base: anyelement, from_json: jsonb) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Expands the object in from_json to a row whose columns match the record type defined by base.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="jsonb_populate_recordset"></a><code>jsonb_populate_recordset(base: anyelement, from_json: jsonb) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Expands the outermost array of objects in from_json to a set of rows whose columns match the record type defined by base</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="jsonb_to_record"></a><code>jsonb_to_record(input: jsonb) &rarr; tuple</code></td><td><span class="funcdesc"><p>Builds an arbitrary record from a JSON object.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="jsonb_to_recordset"></a><code>jsonb_to_recordset(input: jsonb) &rarr; tuple</code></td><td><span class="funcdesc"><p>Builds an arbitrary set of records from a JSON array of objects.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_keywords"></a><code>pg_get_keywords() &rarr; tuple{string AS word, string AS catcode, string AS catdesc}</code></td><td><span class="funcdesc"><p>Produces a virtual table containing the keywords known to the SQL parser.</p>
 </span></td><td>Immutable</td></tr>
@@ -3456,6 +3464,10 @@ A write probe will effectively probe reads as well.</p>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_viewdef"></a><code>pg_get_viewdef(view_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE statement for an existing view.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_viewdef"></a><code>pg_get_viewdef(view_oid: oid, pretty_bool: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE statement for an existing view.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_has_role"></a><code>pg_has_role(role: <a href="string.html">string</a>, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the current user has privileges for role.</p>
 </span></td><td>Stable</td></tr>

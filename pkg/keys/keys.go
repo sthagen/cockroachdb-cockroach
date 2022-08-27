@@ -279,6 +279,18 @@ func RangeGCThresholdKey(rangeID roachpb.RangeID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RangeGCThresholdKey()
 }
 
+// RangeGCHintKey returns a system-local key for GC hint data. This data is used
+// by GC queue to adjust how replicas are being queued for GC.
+func RangeGCHintKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).RangeGCHintKey()
+}
+
+// MVCCRangeKeyGCKey returns a range local key protecting range
+// tombstone mvcc stats calculations during range tombstone GC.
+func MVCCRangeKeyGCKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).MVCCRangeKeyGCKey()
+}
+
 // RangeVersionKey returns a system-local for the range version.
 func RangeVersionKey(rangeID roachpb.RangeID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RangeVersionKey()
@@ -1014,6 +1026,11 @@ func (b RangeIDPrefixBuf) RangeGCThresholdKey() roachpb.Key {
 	return append(b.replicatedPrefix(), LocalRangeGCThresholdSuffix...)
 }
 
+// RangeGCHintKey returns a range-local key for the GC hint data.
+func (b RangeIDPrefixBuf) RangeGCHintKey() roachpb.Key {
+	return append(b.replicatedPrefix(), LocalRangeGCHintSuffix...)
+}
+
 // RangeVersionKey returns a system-local key for the range version.
 func (b RangeIDPrefixBuf) RangeVersionKey() roachpb.Key {
 	return append(b.replicatedPrefix(), LocalRangeVersionSuffix...)
@@ -1054,4 +1071,10 @@ func (b RangeIDPrefixBuf) RaftReplicaIDKey() roachpb.Key {
 // the range's last replica GC timestamp.
 func (b RangeIDPrefixBuf) RangeLastReplicaGCTimestampKey() roachpb.Key {
 	return append(b.unreplicatedPrefix(), LocalRangeLastReplicaGCTimestampSuffix...)
+}
+
+// MVCCRangeKeyGCKey returns a range local key protecting range
+// tombstone mvcc stats calculations during range tombstone GC.
+func (b RangeIDPrefixBuf) MVCCRangeKeyGCKey() roachpb.Key {
+	return append(b.unreplicatedPrefix(), LocalRangeMVCCRangeKeyGCLockSuffix...)
 }

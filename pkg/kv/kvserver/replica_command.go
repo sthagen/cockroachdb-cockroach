@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
@@ -228,14 +229,17 @@ func splitTxnAttempt(
 		return err
 	}
 
+	gcHintsAllowed := store.ClusterSettings().Version.IsActive(ctx, clusterversion.GCHintInReplicaState)
+
 	// End the transaction manually, instead of letting RunTransaction
 	// loop do it, in order to provide a split trigger.
 	b.AddRawRequest(&roachpb.EndTxnRequest{
 		Commit: true,
 		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
 			SplitTrigger: &roachpb.SplitTrigger{
-				LeftDesc:  *leftDesc,
-				RightDesc: *rightDesc,
+				LeftDesc:    *leftDesc,
+				RightDesc:   *rightDesc,
+				WriteGCHint: gcHintsAllowed,
 			},
 		},
 	})
@@ -749,6 +753,8 @@ func (r *Replica) AdminMerge(
 			return errors.Wrap(err, "waiting for all right-hand replicas to catch up")
 		}
 
+		gcHintsAllowed := r.ClusterSettings().Version.IsActive(ctx, clusterversion.GCHintInReplicaState)
+
 		// Successful subsume, so we're guaranteed that the right-hand range will
 		// not serve another request unless this transaction aborts. End the
 		// transaction manually in order to provide a merge trigger.
@@ -763,6 +769,7 @@ func (r *Replica) AdminMerge(
 					FreezeStart:          rhsSnapshotRes.FreezeStart,
 					RightClosedTimestamp: rhsSnapshotRes.ClosedTimestamp,
 					RightReadSummary:     rhsSnapshotRes.ReadSummary,
+					WriteGCHint:          gcHintsAllowed,
 				},
 			},
 		})
@@ -981,13 +988,15 @@ func (r *Replica) ChangeReplicas(
 			return nil, errors.New("must disable replicate queue to use ChangeReplicas manually")
 		}
 	}
-	return r.changeReplicasImpl(ctx, desc, priority, reason, details, chgs)
+	return r.changeReplicasImpl(ctx, desc, priority, kvserverpb.SnapshotRequest_OTHER, 0.0, reason, details, chgs)
 }
 
 func (r *Replica) changeReplicasImpl(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority kvserverpb.SnapshotRequest_Priority,
+	senderName kvserverpb.SnapshotRequest_QueueName,
+	senderQueuePriority float64,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
@@ -1034,7 +1043,7 @@ func (r *Replica) changeReplicasImpl(
 	// here.
 	swaps := getInternalChangesForExplicitPromotionsAndDemotions(targets.voterDemotions, targets.nonVoterPromotions)
 	if len(swaps) > 0 {
-		desc, err = execChangeReplicasTxn(ctx, desc, reason, details, swaps, changeReplicasTxnArgs{
+		desc, err = execChangeReplicasTxn(ctx, r.store.cfg.Tracer(), desc, reason, details, swaps, changeReplicasTxnArgs{
 			db:                                   r.store.DB(),
 			liveAndDeadReplicas:                  r.store.cfg.StorePool.LiveAndDeadReplicas,
 			logChange:                            r.store.logChange,
@@ -1054,7 +1063,7 @@ func (r *Replica) changeReplicasImpl(
 		_ = roachpb.ReplicaSet.LearnerDescriptors
 		var err error
 		desc, err = r.initializeRaftLearners(
-			ctx, desc, priority, reason, details, adds, roachpb.LEARNER,
+			ctx, desc, priority, senderName, senderQueuePriority, reason, details, adds, roachpb.LEARNER,
 		)
 		if err != nil {
 			return nil, err
@@ -1100,7 +1109,7 @@ func (r *Replica) changeReplicasImpl(
 		// disruption to foreground traffic. See
 		// https://github.com/cockroachdb/cockroach/issues/63199 for an example.
 		desc, err = r.initializeRaftLearners(
-			ctx, desc, priority, reason, details, adds, roachpb.NON_VOTER,
+			ctx, desc, priority, senderName, senderQueuePriority, reason, details, adds, roachpb.NON_VOTER,
 		)
 		if err != nil {
 			return nil, err
@@ -1114,7 +1123,7 @@ func (r *Replica) changeReplicasImpl(
 		for _, rem := range removals {
 			iChgs := []internalReplicationChange{{target: rem, typ: internalChangeTypeRemoveNonVoter}}
 			var err error
-			desc, err = execChangeReplicasTxn(ctx, desc, reason, details, iChgs,
+			desc, err = execChangeReplicasTxn(ctx, r.store.cfg.Tracer(), desc, reason, details, iChgs,
 				changeReplicasTxnArgs{
 					db:                                   r.store.DB(),
 					liveAndDeadReplicas:                  r.store.cfg.StorePool.LiveAndDeadReplicas,
@@ -1256,7 +1265,7 @@ func (r *Replica) maybeLeaveAtomicChangeReplicas(
 	// TODO(tbg): reconsider this.
 	s := r.store
 	return execChangeReplicasTxn(
-		ctx, desc, kvserverpb.ReasonUnknown /* unused */, "", nil, /* iChgs */
+		ctx, s.cfg.Tracer(), desc, kvserverpb.ReasonUnknown /* unused */, "", nil, /* iChgs */
 		changeReplicasTxnArgs{
 			db:                                   s.DB(),
 			liveAndDeadReplicas:                  s.cfg.StorePool.LiveAndDeadReplicas,
@@ -1271,7 +1280,7 @@ func (r *Replica) TestingRemoveLearner(
 	ctx context.Context, beforeDesc *roachpb.RangeDescriptor, target roachpb.ReplicationTarget,
 ) (*roachpb.RangeDescriptor, error) {
 	desc, err := execChangeReplicasTxn(
-		ctx, beforeDesc, kvserverpb.ReasonAbandonedLearner, "",
+		ctx, r.store.cfg.Tracer(), beforeDesc, kvserverpb.ReasonAbandonedLearner, "",
 		[]internalReplicationChange{{target: target, typ: internalChangeTypeRemoveLearner}},
 		changeReplicasTxnArgs{
 			db:                                   r.store.DB(),
@@ -1348,7 +1357,7 @@ func (r *Replica) maybeLeaveAtomicChangeReplicasAndRemoveLearners(
 	for _, target := range targets {
 		var err error
 		desc, err = execChangeReplicasTxn(
-			ctx, desc, kvserverpb.ReasonAbandonedLearner, "",
+			ctx, store.cfg.Tracer(), desc, kvserverpb.ReasonAbandonedLearner, "",
 			[]internalReplicationChange{{target: target, typ: internalChangeTypeRemoveLearner}},
 			changeReplicasTxnArgs{db: store.DB(),
 				liveAndDeadReplicas:                  store.cfg.StorePool.LiveAndDeadReplicas,
@@ -1654,6 +1663,8 @@ func (r *Replica) initializeRaftLearners(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority kvserverpb.SnapshotRequest_Priority,
+	senderName kvserverpb.SnapshotRequest_QueueName,
+	senderQueuePriority float64,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 	targets []roachpb.ReplicationTarget,
@@ -1723,7 +1734,7 @@ func (r *Replica) initializeRaftLearners(
 		iChgs := []internalReplicationChange{{target: target, typ: iChangeType}}
 		var err error
 		desc, err = execChangeReplicasTxn(
-			ctx, desc, reason, details, iChgs, changeReplicasTxnArgs{
+			ctx, r.store.cfg.Tracer(), desc, reason, details, iChgs, changeReplicasTxnArgs{
 				db:                                   r.store.DB(),
 				liveAndDeadReplicas:                  r.store.cfg.StorePool.LiveAndDeadReplicas,
 				logChange:                            r.store.logChange,
@@ -1799,7 +1810,9 @@ func (r *Replica) initializeRaftLearners(
 		// orphaned learner. Second, this tickled some bugs in etcd/raft around
 		// switching between StateSnapshot and StateProbe. Even if we worked through
 		// these, it would be susceptible to future similar issues.
-		if err := r.sendSnapshot(ctx, rDesc, kvserverpb.SnapshotRequest_INITIAL, priority); err != nil {
+		if err := r.sendSnapshot(
+			ctx, rDesc, kvserverpb.SnapshotRequest_INITIAL, priority, senderName, senderQueuePriority,
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -1876,7 +1889,7 @@ func (r *Replica) execReplicationChangesForVoters(
 		iChgs = append(iChgs, internalReplicationChange{target: target, typ: typ})
 	}
 
-	desc, err = execChangeReplicasTxn(ctx, desc, reason, details, iChgs, changeReplicasTxnArgs{
+	desc, err = execChangeReplicasTxn(ctx, r.store.cfg.Tracer(), desc, reason, details, iChgs, changeReplicasTxnArgs{
 		db:                                   r.store.DB(),
 		liveAndDeadReplicas:                  r.store.cfg.StorePool.LiveAndDeadReplicas,
 		logChange:                            r.store.logChange,
@@ -1933,7 +1946,7 @@ func (r *Replica) tryRollbackRaftLearner(
 
 	rollbackFn := func(ctx context.Context) error {
 		_, err := execChangeReplicasTxn(
-			ctx, rangeDesc, reason, details,
+			ctx, r.store.cfg.Tracer(), rangeDesc, reason, details,
 			[]internalReplicationChange{{target: target, typ: removeChgType}},
 			changeReplicasTxnArgs{
 				db:                                   r.store.DB(),
@@ -2211,6 +2224,7 @@ type changeReplicasTxnArgs struct {
 // their expectations.
 func execChangeReplicasTxn(
 	ctx context.Context,
+	tracer *tracing.Tracer,
 	referenceDesc *roachpb.RangeDescriptor,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
@@ -2264,117 +2278,146 @@ func execChangeReplicasTxn(
 	if err := args.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		log.Event(ctx, "attempting txn")
 		txn.SetDebugName(replicaChangeTxnName)
-		desc, dbDescValue, skip, err := conditionalGetDescValueFromDB(
-			ctx, txn, referenceDesc.StartKey, false /* forUpdate */, check)
-		if err != nil {
-			return err
-		}
-		if skip {
-			// The new descriptor already reflects what we needed to get done.
-			returnDesc = desc
-			return nil
-		}
-		// Note that we are now using the descriptor from KV, not the one passed
-		// into this method.
-		crt, err := prepareChangeReplicasTrigger(ctx, desc, chgs, args.testForceJointConfig)
-		if err != nil {
-			return err
-		}
-		log.Infof(ctx, "change replicas (add %v remove %v): existing descriptor %s", crt.Added(), crt.Removed(), desc)
 
-		// NB: we haven't written any intents yet, so even in the unlikely case in which
-		// this is held up, we won't block anyone else.
-		if err := within10s(ctx, func() error {
-			if args.testAllowDangerousReplicationChanges {
+		var desc *roachpb.RangeDescriptor
+		var dbDescValue []byte
+		var crt *roachpb.ChangeReplicasTrigger
+		var err error
+
+		// The transaction uses child tracing spans so that low-level database
+		// traces from the operations within can be encapsulated. This way, they
+		// may be redacted when being logged during higher-level operations, such
+		// as replicate queue processing.
+		parentSp := tracing.SpanFromContext(ctx)
+		{
+			ctx, sp := tracer.StartSpanCtx(ctx, replicaChangeTxnGetDescOpName, tracing.WithParent(parentSp))
+
+			var skip bool
+			desc, dbDescValue, skip, err = conditionalGetDescValueFromDB(
+				ctx, txn, referenceDesc.StartKey, false /* forUpdate */, check)
+			if err != nil {
+				sp.Finish()
+				return err
+			}
+			if skip {
+				// The new descriptor already reflects what we needed to get done.
+				returnDesc = desc
+				sp.Finish()
 				return nil
 			}
-			// Run (and retry for a bit) a sanity check that the configuration
-			// resulting from this change is able to meet quorum. It's
-			// important to do this at this low layer as there are multiple
-			// entry points that are not generally too careful. For example,
-			// before the below check existed, the store rebalancer could
-			// carry out operations that would lead to a loss of quorum.
-			//
-			// See:
-			// https://github.com/cockroachdb/cockroach/issues/54444#issuecomment-707706553
-			replicas := crt.Desc.Replicas()
-			// We consider stores marked as "suspect" to be alive for the purposes of
-			// determining whether the range can achieve quorum since these stores are
-			// known to be currently live but have failed a liveness heartbeat in the
-			// recent past.
-			//
-			// Note that the allocator will avoid rebalancing to stores that are
-			// currently marked suspect. See uses of StorePool.getStoreList() in
-			// allocator.go.
-			liveReplicas, _ := args.liveAndDeadReplicas(replicas.Descriptors(), true /* includeSuspectAndDrainingStores */)
-			if !replicas.CanMakeProgress(
-				func(rDesc roachpb.ReplicaDescriptor) bool {
-					for _, inner := range liveReplicas {
-						if inner.ReplicaID == rDesc.ReplicaID {
-							return true
-						}
-					}
-					return false
-				}) {
-				// NB: we use newQuorumError which is recognized by the replicate queue.
-				return newQuorumError("range %s cannot make progress with proposed changes add=%v del=%v "+
-					"based on live replicas %v", crt.Desc, crt.Added(), crt.Removed(), liveReplicas)
+			// Note that we are now using the descriptor from KV, not the one passed
+			// into this method.
+			crt, err = prepareChangeReplicasTrigger(ctx, desc, chgs, args.testForceJointConfig)
+			if err != nil {
+				sp.Finish()
+				return err
 			}
-			return nil
-		}); err != nil {
-			return err
+
+			sp.Finish()
 		}
+
+		log.Infof(ctx, "change replicas (add %v remove %v): existing descriptor %s", crt.Added(), crt.Removed(), desc)
 
 		{
+			ctx, sp := tracer.StartSpanCtx(ctx, replicaChangeTxnUpdateDescOpName, tracing.WithParent(parentSp))
+			defer sp.Finish()
+
+			// NB: we haven't written any intents yet, so even in the unlikely case in which
+			// this is held up, we won't block anyone else.
+			if err := within10s(ctx, func() error {
+				if args.testAllowDangerousReplicationChanges {
+					return nil
+				}
+				// Run (and retry for a bit) a sanity check that the configuration
+				// resulting from this change is able to meet quorum. It's
+				// important to do this at this low layer as there are multiple
+				// entry points that are not generally too careful. For example,
+				// before the below check existed, the store rebalancer could
+				// carry out operations that would lead to a loss of quorum.
+				//
+				// See:
+				// https://github.com/cockroachdb/cockroach/issues/54444#issuecomment-707706553
+				replicas := crt.Desc.Replicas()
+				// We consider stores marked as "suspect" to be alive for the purposes of
+				// determining whether the range can achieve quorum since these stores are
+				// known to be currently live but have failed a liveness heartbeat in the
+				// recent past.
+				//
+				// Note that the allocator will avoid rebalancing to stores that are
+				// currently marked suspect. See uses of StorePool.getStoreList() in
+				// allocator.go.
+				liveReplicas, _ := args.liveAndDeadReplicas(replicas.Descriptors(),
+					true /* includeSuspectAndDrainingStores */)
+				if !replicas.CanMakeProgress(
+					func(rDesc roachpb.ReplicaDescriptor) bool {
+						for _, inner := range liveReplicas {
+							if inner.ReplicaID == rDesc.ReplicaID {
+								return true
+							}
+						}
+						return false
+					}) {
+					// NB: we use newQuorumError which is recognized by the replicate queue.
+					return newQuorumError("range %s cannot make progress with proposed changes add=%v del=%v "+
+						"based on live replicas %v", crt.Desc, crt.Added(), crt.Removed(), liveReplicas)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			{
+				b := txn.NewBatch()
+
+				// Important: the range descriptor must be the first thing touched in the transaction
+				// so the transaction record is co-located with the range being modified.
+				if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, crt.Desc); err != nil {
+					return err
+				}
+
+				// Run transaction up to this point to create txn record early (see #9265).
+				if err := txn.Run(ctx, b); err != nil {
+					return err
+				}
+			}
+
+			// Log replica change into range event log.
+			err = recordRangeEventsInLog(
+				ctx, txn, true /* added */, crt.Added(), crt.Desc, reason, details, args.logChange,
+			)
+			if err != nil {
+				return err
+			}
+			err = recordRangeEventsInLog(
+				ctx, txn, false /* added */, crt.Removed(), crt.Desc, reason, details, args.logChange,
+			)
+			if err != nil {
+				return err
+			}
+
+			// End the transaction manually instead of letting RunTransaction
+			// loop do it, in order to provide a commit trigger.
 			b := txn.NewBatch()
 
-			// Important: the range descriptor must be the first thing touched in the transaction
-			// so the transaction record is co-located with the range being modified.
-			if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, crt.Desc); err != nil {
+			// Update range descriptor addressing record(s).
+			if err := updateRangeAddressing(b, crt.Desc); err != nil {
 				return err
 			}
 
-			// Run transaction up to this point to create txn record early (see #9265).
+			b.AddRawRequest(&roachpb.EndTxnRequest{
+				Commit: true,
+				InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+					ChangeReplicasTrigger: crt,
+				},
+			})
 			if err := txn.Run(ctx, b); err != nil {
+				log.Eventf(ctx, "%v", err)
 				return err
 			}
-		}
 
-		// Log replica change into range event log.
-		err = recordRangeEventsInLog(
-			ctx, txn, true /* added */, crt.Added(), crt.Desc, reason, details, args.logChange,
-		)
-		if err != nil {
-			return err
+			returnDesc = crt.Desc
 		}
-		err = recordRangeEventsInLog(
-			ctx, txn, false /* added */, crt.Removed(), crt.Desc, reason, details, args.logChange,
-		)
-		if err != nil {
-			return err
-		}
-
-		// End the transaction manually instead of letting RunTransaction
-		// loop do it, in order to provide a commit trigger.
-		b := txn.NewBatch()
-
-		// Update range descriptor addressing record(s).
-		if err := updateRangeAddressing(b, crt.Desc); err != nil {
-			return err
-		}
-
-		b.AddRawRequest(&roachpb.EndTxnRequest{
-			Commit: true,
-			InternalCommitTrigger: &roachpb.InternalCommitTrigger{
-				ChangeReplicasTrigger: crt,
-			},
-		})
-		if err := txn.Run(ctx, b); err != nil {
-			log.Eventf(ctx, "%v", err)
-			return err
-		}
-
-		returnDesc = crt.Desc
+		log.Eventf(ctx, "change replicas updated descriptor %s", returnDesc)
 		return nil
 	}); err != nil {
 		log.Eventf(ctx, "%v", err)
@@ -2584,6 +2627,8 @@ func (r *Replica) sendSnapshot(
 	recipient roachpb.ReplicaDescriptor,
 	snapType kvserverpb.SnapshotRequest_Type,
 	priority kvserverpb.SnapshotRequest_Priority,
+	senderQueueName kvserverpb.SnapshotRequest_QueueName,
+	senderQueuePriority float64,
 ) (retErr error) {
 	defer func() {
 		// Report the snapshot status to Raft, which expects us to do this once we
@@ -2631,13 +2676,15 @@ func (r *Replica) sendSnapshot(
 
 	// Create new delegate snapshot request with only required metadata.
 	delegateRequest := &kvserverpb.DelegateSnapshotRequest{
-		RangeID:            r.RangeID,
-		CoordinatorReplica: sender,
-		RecipientReplica:   recipient,
-		Priority:           priority,
-		Type:               snapType,
-		Term:               status.Term,
-		DelegatedSender:    sender,
+		RangeID:             r.RangeID,
+		CoordinatorReplica:  sender,
+		RecipientReplica:    recipient,
+		Priority:            priority,
+		SenderQueueName:     senderQueueName,
+		SenderQueuePriority: senderQueuePriority,
+		Type:                snapType,
+		Term:                status.Term,
+		DelegatedSender:     sender,
 	}
 	err = contextutil.RunWithTimeout(
 		ctx, "delegate-snapshot", sendSnapshotTimeout, func(ctx context.Context) error {
@@ -2777,10 +2824,12 @@ func (r *Replica) followerSendSnapshot(
 				Snapshot: snap.RaftSnap,
 			},
 		},
-		RangeSize: rangeSize,
-		Priority:  req.Priority,
-		Strategy:  kvserverpb.SnapshotRequest_KV_BATCH,
-		Type:      req.Type,
+		RangeSize:           rangeSize,
+		Priority:            req.Priority,
+		SenderQueueName:     req.SenderQueueName,
+		SenderQueuePriority: req.SenderQueuePriority,
+		Strategy:            kvserverpb.SnapshotRequest_KV_BATCH,
+		Type:                req.Type,
 	}
 	newBatchFn := func() storage.Batch {
 		return r.store.Engine().NewUnindexedBatch(true /* writeOnly */)
@@ -3226,6 +3275,7 @@ func (r *Replica) relocateOne(
 			existingVoters,
 			existingNonVoters,
 			r.store.allocator.ScorerOptions(ctx),
+			r.store.allocator.NewBestCandidateSelector(),
 			// NB: Allow the allocator to return target stores that might be on the
 			// same node as an existing replica. This is to ensure that relocations
 			// that require "lateral" movement of replicas within a node can succeed.

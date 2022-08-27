@@ -68,7 +68,7 @@ const (
 	// the key space being written is starting out empty.
 	optimizePutThreshold = 10
 
-	// Transaction names used for range changes.
+	// Transaction names and operations used for range changes.
 	// Note that those names are used by tests to perform request filtering
 	// in absence of better criteria. If names are changed, tests should be
 	// updated accordingly to avoid flakiness.
@@ -76,6 +76,9 @@ const (
 	replicaChangeTxnName = "change-replica"
 	splitTxnName         = "split"
 	mergeTxnName         = "merge"
+
+	replicaChangeTxnGetDescOpName    = "change-replica-get-desc"
+	replicaChangeTxnUpdateDescOpName = "change-replica-update-desc"
 
 	defaultReplicaRaftMuWarnThreshold = 500 * time.Millisecond
 )
@@ -912,6 +915,13 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return *r.mu.state.GCThreshold
+}
+
+// GetGCHint returns the GC hint.
+func (r *Replica) GetGCHint() roachpb.GCHint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return *r.mu.state.GCHint
 }
 
 // ExcludeDataFromBackup returns whether the replica is to be excluded from a

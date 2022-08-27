@@ -715,7 +715,17 @@ func (s *Server) SetupConn(
 	sdMutIterator := s.makeSessionDataMutatorIterator(sds, args.SessionDefaults)
 	sdMutIterator.onDefaultIntSizeChange = onDefaultIntSizeChange
 	if err := sdMutIterator.applyOnEachMutatorError(func(m sessionDataMutator) error {
-		return resetSessionVars(ctx, m)
+		for varName, v := range varGen {
+			if v.Set != nil {
+				hasDefault, defVal := getSessionVarDefaultString(varName, v, m.sessionDataMutatorBase)
+				if hasDefault {
+					if err := v.Set(ctx, m, defVal); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
 	}); err != nil {
 		log.Errorf(ctx, "error setting up client session: %s", err)
 		return ConnectionHandler{}, err
@@ -2433,7 +2443,26 @@ func (ex *connExecutor) execCopyIn(
 		payload := eventNonRetriableErrPayload{err: err}
 		return ev, payload, nil
 	}
-	defer cm.Close(ctx)
+	defer func() {
+		cm.Close(ctx)
+
+		// These fields are not available in COPY, so use the empty value.
+		var stmtFingerprintID roachpb.StmtFingerprintID
+		var stats topLevelQueryStats
+		ex.planner.maybeLogStatement(
+			ctx,
+			ex.executorType,
+			int(ex.state.mu.autoRetryCounter),
+			ex.extraTxnState.txnCounter,
+			cm.numInsertedRows(),
+			retErr,
+			ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
+			&ex.extraTxnState.hasAdminRoleCache,
+			ex.server.TelemetryLoggingMetrics,
+			stmtFingerprintID,
+			&stats,
+		)
+	}()
 
 	if err := ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
 		return cm.run(ctx)
@@ -2810,31 +2839,8 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
-	p.txn = txn
-	p.stmt = Statement{}
-	p.instrumentation = instrumentationHelper{}
-
-	p.cancelChecker.Reset(ctx)
-
-	p.semaCtx = tree.MakeSemaContext()
-	p.semaCtx.SearchPath = &ex.sessionData().SearchPath
-	p.semaCtx.Annotations = nil
-	p.semaCtx.TypeResolver = p
-	p.semaCtx.FunctionResolver = p
-	p.semaCtx.TableNameResolver = p
-	p.semaCtx.DateStyle = ex.sessionData().GetDateStyle()
-	p.semaCtx.IntervalStyle = ex.sessionData().GetIntervalStyle()
-
+	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData())
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
-
-	p.autoCommit = false
-	p.isPreparing = false
-
-	p.schemaResolver.txn = txn
-	p.schemaResolver.sessionDataStack = p.EvalContext().SessionDataStack
-	p.evalCatalogBuiltins.Init(p.execCfg.Codec, txn, p.Descriptors())
-	p.skipDescriptorCache = false
-	p.typeResolutionDbID = descpb.InvalidID
 }
 
 // txnStateTransitionsApplyWrapper is a wrapper on top of Machine built with the

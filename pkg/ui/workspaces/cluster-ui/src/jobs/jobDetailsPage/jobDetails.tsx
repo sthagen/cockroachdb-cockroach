@@ -19,7 +19,7 @@ import { RouteComponentProps } from "react-router-dom";
 import { JobRequest, JobResponse } from "src/api/jobsApi";
 import { Button } from "src/button";
 import { Loading } from "src/loading";
-import { SqlBox } from "src/sql";
+import { SqlBox, SqlBoxSize } from "src/sql";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { TimestampToMoment } from "src/util";
 import { DATE_FORMAT_24_UTC } from "src/util/format";
@@ -76,11 +76,13 @@ export class JobDetails extends React.Component<JobDetailsProps> {
 
   renderContent = (): React.ReactElement => {
     const job = this.props.job;
+    const nextRun = TimestampToMoment(job.next_run);
+    const hasNextRun = nextRun.isAfter();
     return (
       <>
         <Row gutter={24}>
           <Col className="gutter-row" span={24}>
-            <SqlBox value={job.description} />
+            <SqlBox value={job.description} size={SqlBoxSize.custom} />
           </Col>
         </Row>
         <Row gutter={24}>
@@ -88,10 +90,14 @@ export class JobDetails extends React.Component<JobDetailsProps> {
             <SummaryCard>
               <h3 className={jobCx("summary--card--title")}>Status</h3>
               <JobStatusCell job={job} lineWidth={1.5} hideDuration={true} />
-              <h3 className={jobCx("summary--card--title", "secondary")}>
-                Next Planned Execution Time:
-              </h3>
-              {TimestampToMoment(job.next_run).format(DATE_FORMAT_24_UTC)}
+              {hasNextRun && (
+                <>
+                  <h3 className={jobCx("summary--card--title", "secondary")}>
+                    Next Planned Execution Time:
+                  </h3>
+                  {nextRun.format(DATE_FORMAT_24_UTC)}
+                </>
+              )}
             </SummaryCard>
           </Col>
           <Col className="gutter-row" span={12}>

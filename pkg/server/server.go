@@ -13,8 +13,8 @@ package server
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -656,7 +656,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		HistogramWindowInterval:  cfg.HistogramWindowInterval(),
 		StorePool:                storePool,
 		SQLExecutor:              internalExecutor,
-		LogRangeEvents:           cfg.EventLogEnabled,
+		LogRangeAndNodeEvents:    cfg.EventLogEnabled,
 		RangeDescriptorCache:     distSender.RangeDescriptorCache(),
 		TimeSeriesDataStore:      tsDB,
 		ClosedTimestampSender:    ctSender,
@@ -1241,7 +1241,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 		for name, val := range listenerFiles {
 			file := filepath.Join(storeSpec.Path, name)
-			if err := ioutil.WriteFile(file, []byte(val), 0644); err != nil {
+			if err := os.WriteFile(file, []byte(val), 0644); err != nil {
 				return errors.Wrapf(err, "failed to write %s", file)
 			}
 		}
@@ -1608,6 +1608,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 		orphanedLeasesTimeThresholdNanos,
 	); err != nil {
 		return err
+	}
+
+	if err := s.node.registerEnginesForDiskStatsMap(s.cfg.Stores.Specs, s.engines); err != nil {
+		return errors.Wrapf(err, "failed to register engines for the disk stats map")
 	}
 
 	if err := s.debug.RegisterEngines(s.cfg.Stores.Specs, s.engines); err != nil {

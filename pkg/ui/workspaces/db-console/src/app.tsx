@@ -65,6 +65,8 @@ import ProblemRanges from "src/views/reports/containers/problemRanges";
 import Range from "src/views/reports/containers/range";
 import ReduxDebug from "src/views/reports/containers/redux";
 import HotRanges from "src/views/reports/containers/hotranges";
+import SchedulesPage from "src/views/schedules/schedulesPage";
+import ScheduleDetails from "src/views/schedules/scheduleDetails";
 import Settings from "src/views/reports/containers/settings";
 import Stores from "src/views/reports/containers/stores";
 import SQLActivityPage from "src/views/sqlActivity/sqlActivityPage";
@@ -79,7 +81,8 @@ import ActiveTransactionDetails from "./views/transactions/activeTransactionDeta
 import "styl/app.styl";
 import { Tracez } from "src/views/tracez/tracez";
 import InsightsOverviewPage from "src/views/insights/insightsOverview";
-import WorkloadInsightDetailsPageConnected from "src/views/insights/workloadInsightDetailsPageConnected";
+import TransactionInsightDetailsPageConnected from "src/views/insights/transactionInsightDetailsPageConnected";
+import StatementInsightDetailsPageConnected from "src/views/insights/statementInsightDetailsPageConnected";
 import { CockroachCloudContext } from "@cockroachlabs/cluster-ui";
 
 // NOTE: If you are adding a new path to the router, and that path contains any
@@ -158,6 +161,9 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   <Route path="/events" component={EventPage} />
                   <Route exact path="/jobs" component={JobsPage} />
                   <Route path={"/jobs/:id"} component={JobDetails} />
+
+                  <Route exact path="/schedules" component={SchedulesPage} />
+                  <Route path={"/schedules/:id"} component={ScheduleDetails} />
 
                   {/* databases */}
                   <Route exact path="/databases" component={DatabasesPage} />
@@ -305,8 +311,12 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                     component={InsightsOverviewPage}
                   />
                   <Route
-                    path={"/insights/:id"}
-                    component={WorkloadInsightDetailsPageConnected}
+                    path={"/insights/transaction/:id"}
+                    component={TransactionInsightDetailsPageConnected}
+                  />
+                  <Route
+                    path={"/insights/statement/:id"}
+                    component={StatementInsightDetailsPageConnected}
                   />
 
                   {/* debug pages */}

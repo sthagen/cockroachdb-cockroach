@@ -14,8 +14,21 @@
 
 .description-item {
   margin-bottom: 5px;
+
+  .table-link {
+    color: $colors--link
+  }
 }
 
 .margin-bottom {
   margin-bottom: 20px;
+}
+
+.margin-bottom-large {
+  margin-bottom: 30px;
+}
+
+.section {
+  flex: 0 0 auto;
+  padding: 12px 24px 12px 0px;
 }

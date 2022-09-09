@@ -10,53 +10,58 @@
 
 import { unset } from "src/util";
 import {
-  InsightEventDetailsResponse,
-  InsightEventDetailsState,
-  InsightEventsResponse,
-  InsightEventState,
   StatementInsights,
+  TransactionInsightEventDetailsResponse,
+  TransactionInsightEventDetailsState,
+  TransactionInsightEventsResponse,
+  TransactionInsightEventState,
 } from "src/api/insightsApi";
 import {
   getInsightFromProblem,
   Insight,
-  InsightEvent,
-  InsightEventDetails,
-  InsightEventFilters,
   InsightExecEnum,
+  InsightNameEnum,
+  InsightRecommendation,
+  InsightType,
   InsightTypes,
   SchemaInsightEventFilters,
-  InsightType,
-  InsightRecommendation,
   StatementInsightEvent,
+  TransactionInsightEvent,
+  TransactionInsightEventDetails,
+  WorkloadInsightEventFilters,
 } from "./types";
 
-export const getInsights = (
-  eventState: InsightEventState | InsightEventDetailsState,
+export const getTransactionInsights = (
+  eventState:
+    | TransactionInsightEventState
+    | TransactionInsightEventDetailsState,
 ): Insight[] => {
   const insights: Insight[] = [];
-  InsightTypes.forEach(insight => {
-    if (
-      insight(eventState.execType, eventState.contentionThreshold).name ==
-      eventState.insightName
-    ) {
-      insights.push(
-        insight(eventState.execType, eventState.contentionThreshold),
-      );
-    }
-  });
+  if (eventState) {
+    InsightTypes.forEach(insight => {
+      if (
+        insight(eventState.execType, eventState.contentionThreshold).name ==
+        eventState.insightName
+      ) {
+        insights.push(
+          insight(eventState.execType, eventState.contentionThreshold),
+        );
+      }
+    });
+  }
   return insights;
 };
 
 export function getInsightsFromState(
-  insightEventsResponse: InsightEventsResponse,
-): InsightEvent[] {
-  const insightEvents: InsightEvent[] = [];
+  insightEventsResponse: TransactionInsightEventsResponse,
+): TransactionInsightEvent[] {
+  const insightEvents: TransactionInsightEvent[] = [];
   if (!insightEventsResponse || insightEventsResponse?.length < 0) {
     return insightEvents;
   }
 
   insightEventsResponse.forEach(e => {
-    const insightsForEvent = getInsights(e);
+    const insightsForEvent = getTransactionInsights(e);
     if (insightsForEvent.length < 1) {
       return;
     } else {
@@ -66,7 +71,7 @@ export function getInsightsFromState(
         queries: e.queries,
         insights: insightsForEvent,
         startTime: e.startTime,
-        elapsedTimeMillis: e.elapsedTimeMillis,
+        contentionDuration: e.contentionDuration,
         application: e.application,
         execType: InsightExecEnum.TRANSACTION,
         contentionThreshold: e.contentionThreshold,
@@ -77,15 +82,17 @@ export function getInsightsFromState(
   return insightEvents;
 }
 
-export function getInsightEventDetailsFromState(
-  insightEventDetailsResponse: InsightEventDetailsResponse,
-): InsightEventDetails {
-  let insightEventDetails: InsightEventDetails = null;
-  const insightsForEventDetails = getInsights(insightEventDetailsResponse[0]);
+export function getTransactionInsightEventDetailsFromState(
+  insightEventDetailsResponse: TransactionInsightEventDetailsResponse,
+): TransactionInsightEventDetails {
+  let insightEventDetails: TransactionInsightEventDetails = null;
+  const insightsForEventDetails = getTransactionInsights(
+    insightEventDetailsResponse,
+  );
   if (insightsForEventDetails.length > 0) {
-    delete insightEventDetailsResponse[0].insightName;
+    delete insightEventDetailsResponse.insightName;
     insightEventDetails = {
-      ...insightEventDetailsResponse[0],
+      ...insightEventDetailsResponse,
       insights: insightsForEventDetails,
     };
   }
@@ -93,32 +100,34 @@ export function getInsightEventDetailsFromState(
 }
 
 export const filterTransactionInsights = (
-  transactions: InsightEvent[] | null,
-  filters: InsightEventFilters,
+  transactions: TransactionInsightEvent[] | null,
+  filters: WorkloadInsightEventFilters,
   internalAppNamePrefix: string,
   search?: string,
-): InsightEvent[] => {
+): TransactionInsightEvent[] => {
   if (transactions == null) return [];
 
   let filteredTransactions = transactions;
 
-  const isInternal = (txn: InsightEvent) =>
+  const isInternal = (txn: TransactionInsightEvent) =>
     txn.application.startsWith(internalAppNamePrefix);
   if (filters.app) {
-    filteredTransactions = filteredTransactions.filter((txn: InsightEvent) => {
-      const apps = filters.app.toString().split(",");
-      let showInternal = false;
-      if (apps.includes(internalAppNamePrefix)) {
-        showInternal = true;
-      }
-      if (apps.includes(unset)) {
-        apps.push("");
-      }
+    filteredTransactions = filteredTransactions.filter(
+      (txn: TransactionInsightEvent) => {
+        const apps = filters.app.toString().split(",");
+        let showInternal = false;
+        if (apps.includes(internalAppNamePrefix)) {
+          showInternal = true;
+        }
+        if (apps.includes(unset)) {
+          apps.push("");
+        }
 
-      return (
-        (showInternal && isInternal(txn)) || apps.includes(txn.application)
-      );
-    });
+        return (
+          (showInternal && isInternal(txn)) || apps.includes(txn.application)
+        );
+      },
+    );
   } else {
     filteredTransactions = filteredTransactions.filter(txn => !isInternal(txn));
   }
@@ -135,7 +144,7 @@ export const filterTransactionInsights = (
 };
 
 export function getAppsFromTransactionInsights(
-  transactions: InsightEvent[] | null,
+  transactions: TransactionInsightEvent[] | null,
   internalAppNamePrefix: string,
 ): string[] {
   if (transactions == null) return [];
@@ -206,19 +215,23 @@ export const filterSchemaInsights = (
 
 export function insightType(type: InsightType): string {
   switch (type) {
-    case "CREATE_INDEX":
-      return "Create New Index";
-    case "DROP_INDEX":
+    case "CreateIndex":
+      return "Create Index";
+    case "DropIndex":
       return "Drop Unused Index";
-    case "REPLACE_INDEX":
+    case "ReplaceIndex":
       return "Replace Index";
-    case "HighContentionTime":
-      return "High Wait Time";
+    case "AlterIndex":
+      return "Alter Index";
+    case "HighContention":
+      return "High Contention";
     case "HighRetryCount":
       return "High Retry Counts";
     case "SuboptimalPlan":
-      return "Sub-Optimal Plan";
-    case "FAILED":
+      return "Suboptimal Plan";
+    case "PlanRegression":
+      return "Plan Regression";
+    case "FailedExecution":
       return "Failed Execution";
     default:
       return "Insight";
@@ -227,7 +240,7 @@ export function insightType(type: InsightType): string {
 
 export const filterStatementInsights = (
   statements: StatementInsights | null,
-  filters: InsightEventFilters,
+  filters: WorkloadInsightEventFilters,
   internalAppNamePrefix: string,
   search?: string,
 ): StatementInsights => {
@@ -290,16 +303,34 @@ export function getAppsFromStatementInsights(
   return Array.from(uniqueAppNames).sort();
 }
 
-export function populateStatementInsightsFromProblems(
+export function populateStatementInsightsFromProblemAndCauses(
   statements: StatementInsightEvent[],
 ): void {
   if (!statements || statements?.length === 0) {
     return;
   }
-
   statements.map(x => {
-    x.insights = x.problems?.map(x =>
-      getInsightFromProblem(x, InsightExecEnum.STATEMENT),
-    );
+    // TODO(ericharmeling,todd): Replace these strings when using the insights protos.
+    if (x.problem === "SlowExecution") {
+      if (x.causes?.length === 0) {
+        x.insights = [
+          getInsightFromProblem(
+            InsightNameEnum.slowExecution,
+            InsightExecEnum.STATEMENT,
+          ),
+        ];
+      } else {
+        x.insights = x.causes?.map(x =>
+          getInsightFromProblem(x, InsightExecEnum.STATEMENT),
+        );
+      }
+    } else if (x.problem === "FailedExecution") {
+      x.insights = [
+        getInsightFromProblem(
+          InsightNameEnum.failedExecution,
+          InsightExecEnum.STATEMENT,
+        ),
+      ];
+    }
   });
 }

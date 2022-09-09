@@ -151,9 +151,12 @@ type Index interface {
 	GetShardColumnName() string
 
 	IsValidOriginIndex(originColIDs descpb.ColumnIDs) bool
+	IsHelpfulOriginIndex(originColIDs descpb.ColumnIDs) bool
 	IsValidReferencedUniqueConstraint(referencedColIDs descpb.ColumnIDs) bool
 
 	GetPartitioning() Partitioning
+	PartitioningColumnCount() int
+	ImplicitPartitioningColumnCount() int
 
 	ExplicitColumnStartIdx() int
 

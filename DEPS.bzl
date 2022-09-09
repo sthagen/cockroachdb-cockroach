@@ -24,6 +24,10 @@ def go_deps():
         name = "co_honnef_go_tools",
         build_file_proto_mode = "disable_global",
         importpath = "honnef.co/go/tools",
+        patch_args = ["-p1"],
+        patches = [
+            "@com_github_cockroachdb_cockroach//build/patches:co_honnef_go_tools.patch",
+        ],
         sha256 = "9cc6be802987a1ad579e7a1d90bde4c50b9832ce9213eab302bf8916ab3dc2b7",
         strip_prefix = "honnef.co/go/tools@v0.3.2",
         urls = [
@@ -1421,10 +1425,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "4dc4a2931b55e1b4431aa9d10736dc1f4f9058af248235654833efd67c3d18c6",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20220823190348-4cc0974fdade",
+        sha256 = "6687f149d857c2610ca81eca3452ca34940580bb5ecd9e14084be218fc4de6fb",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20220907220441-20a40b515be9",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20220823190348-4cc0974fdade.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20220907220441-20a40b515be9.zip",
         ],
     )
     go_repository(

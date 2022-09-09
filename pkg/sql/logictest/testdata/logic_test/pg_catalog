@@ -4203,11 +4203,14 @@ foreign_key_cascades_limit                            10000               NULL  
 idle_in_session_timeout                               0                   NULL      NULL        NULL        string
 idle_in_transaction_session_timeout                   0                   NULL      NULL        NULL        string
 idle_session_timeout                                  0                   NULL      NULL        NULL        string
+index_join_streamer_batch_size                        8.0 MiB             NULL      NULL        NULL        string
 index_recommendations_enabled                         off                 NULL      NULL        NULL        string
 inject_retry_errors_enabled                           off                 NULL      NULL        NULL        string
 integer_datetimes                                     on                  NULL      NULL        NULL        string
 intervalstyle                                         postgres            NULL      NULL        NULL        string
 is_superuser                                          on                  NULL      NULL        NULL        string
+join_reader_index_join_strategy_batch_size            4.0 MiB             NULL      NULL        NULL        string
+join_reader_no_ordering_strategy_batch_size           2.0 MiB             NULL      NULL        NULL        string
 join_reader_ordering_strategy_batch_size              100 KiB             NULL      NULL        NULL        string
 large_full_scan_rows                                  1000                NULL      NULL        NULL        string
 lc_collate                                            C.UTF-8             NULL      NULL        NULL        string
@@ -4333,11 +4336,14 @@ foreign_key_cascades_limit                            10000               NULL  
 idle_in_session_timeout                               0                   NULL  user     NULL      0s                  0s
 idle_in_transaction_session_timeout                   0                   NULL  user     NULL      0s                  0s
 idle_session_timeout                                  0                   NULL  user     NULL      0s                  0s
+index_join_streamer_batch_size                        8.0 MiB             NULL  user     NULL      8.0 MiB             8.0 MiB
 index_recommendations_enabled                         off                 NULL  user     NULL      on                  on
 inject_retry_errors_enabled                           off                 NULL  user     NULL      off                 off
 integer_datetimes                                     on                  NULL  user     NULL      on                  on
 intervalstyle                                         postgres            NULL  user     NULL      postgres            postgres
 is_superuser                                          on                  NULL  user     NULL      on                  on
+join_reader_index_join_strategy_batch_size            4.0 MiB             NULL  user     NULL      4.0 MiB             4.0 MiB
+join_reader_no_ordering_strategy_batch_size           2.0 MiB             NULL  user     NULL      2.0 MiB             2.0 MiB
 join_reader_ordering_strategy_batch_size              100 KiB             NULL  user     NULL      100 KiB             100 KiB
 large_full_scan_rows                                  1000                NULL  user     NULL      1000                1000
 lc_collate                                            C.UTF-8             NULL  user     NULL      C.UTF-8             C.UTF-8
@@ -4460,11 +4466,14 @@ foreign_key_cascades_limit                            NULL    NULL     NULL     
 idle_in_session_timeout                               NULL    NULL     NULL     NULL        NULL
 idle_in_transaction_session_timeout                   NULL    NULL     NULL     NULL        NULL
 idle_session_timeout                                  NULL    NULL     NULL     NULL        NULL
+index_join_streamer_batch_size                        NULL    NULL     NULL     NULL        NULL
 index_recommendations_enabled                         NULL    NULL     NULL     NULL        NULL
 inject_retry_errors_enabled                           NULL    NULL     NULL     NULL        NULL
 integer_datetimes                                     NULL    NULL     NULL     NULL        NULL
 intervalstyle                                         NULL    NULL     NULL     NULL        NULL
 is_superuser                                          NULL    NULL     NULL     NULL        NULL
+join_reader_index_join_strategy_batch_size            NULL    NULL     NULL     NULL        NULL
+join_reader_no_ordering_strategy_batch_size           NULL    NULL     NULL     NULL        NULL
 join_reader_ordering_strategy_batch_size              NULL    NULL     NULL     NULL        NULL
 large_full_scan_rows                                  NULL    NULL     NULL     NULL        NULL
 lc_collate                                            NULL    NULL     NULL     NULL        NULL
@@ -4663,7 +4672,7 @@ FROM pg_proc p
 JOIN pg_type t ON t.typinput = p.oid
 WHERE t.typname = '_int4'
 ----
-2017  array_in  array_in
+2013  array_in  array_in
 
 ## #16285
 ## int2vectors should be 0-indexed
@@ -4701,7 +4710,7 @@ SELECT cur_max_builtin_oid FROM [SELECT max(oid) as cur_max_builtin_oid FROM pg_
 query TT
 SELECT proname, oid FROM pg_catalog.pg_proc WHERE oid = $cur_max_builtin_oid
 ----
-to_regtype  2037
+pg_get_functiondef  2035
 
 ## Ensure that unnest works with oid wrapper arrays
 
@@ -4728,6 +4737,34 @@ select name, statement, parameter_types, from_sql from pg_prepared_statements OR
 ----
 test_insert_statement  PREPARE test_insert_statement (int, timestamptz) AS INSERT INTO types VALUES ($2, $1)  {bigint,"'timestamp with time zone'"}  true
 test_select_statement  PREPARE test_select_statement AS SELECT * FROM types                                   {}                                     true
+
+subtest pg_catalog.pg_prepare_statement,with_possible_mismatch_num_types
+
+statement ok
+PREPARE args_test_many(int, int) as select $1
+
+statement ok
+PREPARE args_test_few(int) as select $1, $2::int
+
+statement ok
+DROP TABLE IF EXISTS t_prepare;
+
+statement ok
+CREATE TABLE t_prepare (x int, y varchar(10), z int2);
+
+statement ok
+PREPARE args_deduce_type(int, int, int, int) AS INSERT INTO t_prepare VALUES ($1, $2, $3);
+
+statement ok
+PREPARE args_deduce_type_1(int) AS SELECT $1::int, $2::varchar(10), $3::varchar(20);
+
+query TTTB
+SELECT name, statement, parameter_types, from_sql FROM pg_prepared_statements WHERE name LIKE 'args_%' ORDER BY 1,2
+----
+args_deduce_type    PREPARE args_deduce_type (int, varchar, int, int) AS INSERT INTO t_prepare VALUES ($1, $2, $3)                   {bigint,"'character varying'",bigint,bigint}          true
+args_deduce_type_1  PREPARE args_deduce_type_1 (int, varchar, varchar) AS SELECT $1::INT8, $2::VARCHAR(10), $3::VARCHAR(20)  {bigint,"'character varying'","'character varying'"}  true
+args_test_few       PREPARE args_test_few (int, int) AS SELECT $1, $2::INT8                                                  {bigint,bigint}                                       true
+args_test_many      PREPARE args_test_many (int, int) AS SELECT $1                                                           {bigint,bigint}                                       true
 
 statement ok
 DROP TABLE types
@@ -5130,13 +5167,13 @@ CREATE TABLE jt (a INT PRIMARY KEY); INSERT INTO jt VALUES(1); INSERT INTO jt VA
 query ITT
 SELECT a, oid, relname FROM jt INNER LOOKUP JOIN pg_class ON a::oid=oid
 ----
-167  167  jt
+168  168  jt
 
 query ITT
 SELECT a, oid, relname FROM jt LEFT OUTER LOOKUP JOIN pg_class ON a::oid=oid
 ----
 1    NULL  NULL
-167  167   jt
+168  168   jt
 
 subtest regression_49207
 statement ok

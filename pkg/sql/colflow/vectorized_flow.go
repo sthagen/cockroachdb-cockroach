@@ -594,7 +594,7 @@ type vectorizedFlowCreator struct {
 	recordingStats    bool
 	isGatewayNode     bool
 	waitGroup         *sync.WaitGroup
-	nodeDialer        *nodedialer.Dialer
+	podNodeDialer     *nodedialer.Dialer
 	flowID            execinfrapb.FlowID
 	exprHelper        *colexecargs.ExprHelper
 	typeResolver      descs.DistSQLTypeResolver
@@ -650,7 +650,7 @@ func newVectorizedFlowCreator(
 	waitGroup *sync.WaitGroup,
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
-	nodeDialer *nodedialer.Dialer,
+	podNodeDialer *nodedialer.Dialer,
 	flowID execinfrapb.FlowID,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
@@ -668,7 +668,7 @@ func newVectorizedFlowCreator(
 		waitGroup:              waitGroup,
 		rowReceiver:            rowSyncFlowConsumer,
 		batchReceiver:          batchSyncFlowConsumer,
-		nodeDialer:             nodeDialer,
+		podNodeDialer:          podNodeDialer,
 		flowID:                 flowID,
 		exprHelper:             creator.exprHelper,
 		typeResolver:           typeResolver,
@@ -751,7 +751,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	run := func(ctx context.Context, flowCtxCancel context.CancelFunc) {
 		outbox.Run(
 			ctx,
-			s.nodeDialer,
+			s.podNodeDialer,
 			stream.TargetNodeID,
 			s.flowID,
 			stream.StreamID,
@@ -794,7 +794,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 	}
 	mmName := "hash-router-[" + streamIDs + "]"
 
-	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccounts(ctx, flowCtx, mmName, len(output.Streams))
+	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccountsWithName(ctx, flowCtx, mmName, len(output.Streams))
 	allocators := make([]*colmem.Allocator, len(output.Streams))
 	for i := range allocators {
 		allocators[i] = colmem.NewAllocator(ctx, accounts[i], factory)
@@ -898,7 +898,7 @@ func (s *vectorizedFlowCreator) setupInput(
 
 			// Retrieve the latency from the origin node (the one that has the
 			// outbox).
-			latency, err := s.nodeDialer.Latency(roachpb.NodeID(inputStream.OriginNodeID))
+			latency, err := s.podNodeDialer.Latency(roachpb.NodeID(inputStream.OriginNodeID))
 			if err != nil {
 				// If an error occurred, latency's nil value of 0 is used. If latency is
 				// 0, it is not included in the displayed stats for EXPLAIN ANALYZE
@@ -1171,12 +1171,9 @@ func (s *vectorizedFlowCreator) setupFlow(
 			}
 
 			args := &colexecargs.NewColOperatorArgs{
-				Spec:                pspec,
-				Inputs:              inputs,
-				StreamingMemAccount: s.monitorRegistry.NewStreamingMemAccount(flowCtx),
-				StreamingMemAccFactory: func() *mon.BoundAccount {
-					return s.monitorRegistry.NewStreamingMemAccount(flowCtx)
-				},
+				Spec:                 pspec,
+				Inputs:               inputs,
+				StreamingMemAccount:  s.monitorRegistry.NewStreamingMemAccount(flowCtx),
 				ProcessorConstructor: rowexec.NewProcessor,
 				LocalProcessors:      localProcessors,
 				DiskQueueCfg:         s.diskQueueCfg,
@@ -1223,7 +1220,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 
 			if s.recordingStats {
 				newMonitors := s.monitorRegistry.GetMonitors()[numOldMonitors:]
-				if err := s.wrapWithVectorizedStatsCollectorBase(
+				if err = s.wrapWithVectorizedStatsCollectorBase(
 					&result.OpWithMetaInfo, result.KVReader, result.Columnarizer, inputs,
 					flowCtx.ProcessorComponentID(pspec.ProcessorID), newMonitors,
 				); err != nil {

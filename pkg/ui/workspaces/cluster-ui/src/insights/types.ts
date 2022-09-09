@@ -11,13 +11,14 @@
 import { Moment } from "moment";
 import { Filters } from "../queryFilter";
 
+// This enum corresponds to the string enum for `problems` in `cluster_execution_insights`
 export enum InsightNameEnum {
-  highContentionTime = "HighContentionTime",
-  unknown = "Unknown",
+  failedExecution = "FailedExecution",
+  highContention = "HighContention",
+  highRetryCount = "HighRetryCount",
   planRegression = "PlanRegression",
   suboptimalPlan = "SuboptimalPlan",
-  highRetryCount = "HighRetryCount",
-  failedExecution = "FailedExecution",
+  slowExecution = "SlowExecution",
 }
 
 export enum InsightExecEnum {
@@ -25,19 +26,19 @@ export enum InsightExecEnum {
   STATEMENT = "statement",
 }
 
-export type InsightEvent = {
+export type TransactionInsightEvent = {
   transactionID: string;
   fingerprintID: string;
   queries: string[];
   insights: Insight[];
   startTime: Moment;
-  elapsedTimeMillis: number;
+  contentionDuration: moment.Duration;
   contentionThreshold: number;
   application: string;
   execType: InsightExecEnum;
 };
 
-export type InsightEventDetails = {
+export type TransactionInsightEventDetails = {
   executionID: string;
   queries: string[];
   insights: Insight[];
@@ -46,9 +47,9 @@ export type InsightEventDetails = {
   contentionThreshold: number;
   application: string;
   fingerprintID: string;
-  waitingExecutionID: string;
-  waitingFingerprintID: string;
-  waitingQueries: string[];
+  blockingExecutionID: string;
+  blockingFingerprintID: string;
+  blockingQueries: string[];
   contendedKey: string;
   schemaName: string;
   databaseName: string;
@@ -76,7 +77,8 @@ export type StatementInsightEvent = {
   lastRetryReason?: string;
   priority: string;
   retries: number;
-  problems: string[];
+  causes: string[];
+  problem: string;
   query: string;
   application: string;
   insights: Insight[];
@@ -99,24 +101,29 @@ export type EventExecution = {
   execType: InsightExecEnum;
 };
 
-const highContentionTimeInsight = (
+const highContentionInsight = (
   execType: InsightExecEnum = InsightExecEnum.TRANSACTION,
   latencyThreshold: number,
 ): Insight => {
-  const description = `This ${execType} has been waiting for more than ${latencyThreshold}ms on other ${execType}s to execute.`;
+  let threshold = latencyThreshold + "ms";
+  if (!latencyThreshold) {
+    threshold =
+      "the value of the sql.insights.latency_threshold cluster setting";
+  }
+  const description = `This ${execType} has been waiting on other ${execType}s to execute for longer than ${threshold}.`;
   return {
-    name: InsightNameEnum.highContentionTime,
-    label: "High Contention Time",
+    name: InsightNameEnum.highContention,
+    label: "High Contention",
     description: description,
     tooltipDescription:
       description + ` Click the ${execType} execution ID to see more details.`,
   };
 };
 
-const unknownInsight = (execType: InsightExecEnum): Insight => {
+const slowExecutionInsight = (execType: InsightExecEnum): Insight => {
   const description = `Unable to identify a specific cause for this ${execType}.`;
   return {
-    name: InsightNameEnum.unknown,
+    name: InsightNameEnum.slowExecution,
     label: "Slow Execution",
     description: description,
     tooltipDescription:
@@ -178,16 +185,16 @@ const failedExecutionInsight = (execType: InsightExecEnum): Insight => {
   };
 };
 
-export const InsightTypes = [highContentionTimeInsight];
+export const InsightTypes = [highContentionInsight]; // only used by getTransactionInsights to iterate over txn insights
 
 export const getInsightFromProblem = (
-  problem: string,
+  cause: string,
   execOption: InsightExecEnum,
   latencyThreshold?: number,
 ): Insight => {
-  switch (problem) {
-    case InsightNameEnum.highContentionTime:
-      return highContentionTimeInsight(execOption, latencyThreshold);
+  switch (cause) {
+    case InsightNameEnum.highContention:
+      return highContentionInsight(execOption, latencyThreshold);
     case InsightNameEnum.failedExecution:
       return failedExecutionInsight(execOption);
     case InsightNameEnum.planRegression:
@@ -197,7 +204,7 @@ export const getInsightFromProblem = (
     case InsightNameEnum.highRetryCount:
       return highRetryCountInsight(execOption);
     default:
-      return unknownInsight(execOption);
+      return slowExecutionInsight(execOption);
   }
 };
 
@@ -206,19 +213,7 @@ export const InsightExecOptions = new Map<string, string>([
   [InsightExecEnum.STATEMENT.toString(), "Statement Executions"],
 ]);
 
-export type InsightEventFilters = Omit<
-  Filters,
-  | "database"
-  | "sqlType"
-  | "fullScan"
-  | "distributed"
-  | "regions"
-  | "nodes"
-  | "username"
-  | "sessionStatus"
-  | "timeNumber"
-  | "timeUnit"
->;
+export type WorkloadInsightEventFilters = Pick<Filters, "app">;
 
 export type SchemaInsightEventFilters = Pick<
   Filters,
@@ -226,14 +221,15 @@ export type SchemaInsightEventFilters = Pick<
 >;
 
 export type InsightType =
-  | "DROP_INDEX"
-  | "CREATE_INDEX"
-  | "REPLACE_INDEX"
-  | "HighContentionTime"
+  | "DropIndex"
+  | "CreateIndex"
+  | "ReplaceIndex"
+  | "AlterIndex"
+  | "HighContention"
   | "HighRetryCount"
   | "SuboptimalPlan"
   | "PlanRegression"
-  | "FAILED"
+  | "FailedExecution"
   | "Unknown";
 
 export interface InsightRecommendation {

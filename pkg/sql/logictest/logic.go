@@ -40,7 +40,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers" // imported to register ExternalConnection providers
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -67,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -530,6 +533,22 @@ var (
 		"declarative-corpus", "",
 		"enables generation and storage of a declarative schema changer	corpus",
 	)
+
+	// globalMVCCRangeTombstone will write a global MVCC range tombstone across
+	// the entire user keyspace during cluster bootstrapping. This should not
+	// semantically affect the test data written above it, but will activate MVCC
+	// range tombstone code paths in the storage layer for testing.
+	globalMVCCRangeTombstone = util.ConstantWithMetamorphicTestBool(
+		"logictest-global-mvcc-range-tombstone", false)
+
+	// useMVCCRangeTombstonesForPointDeletes will use point-sized MVCC range
+	// tombstones for point deletions, on a best-effort basis. These should be
+	// indistinguishable to a KV client, but activate MVCC range tombstone
+	// code paths in the storage/KV layer, for testing. This may result in
+	// incorrect MVCC stats for RangeKey* fields in rare cases, due to point
+	// writes not holding appropriate latches for range key stats update.
+	useMVCCRangeTombstonesForPointDeletes = util.ConstantWithMetamorphicTestBool(
+		"logictest-use-mvcc-range-tombstones-for-point-deletes", false)
 )
 
 const queryRewritePlaceholderPrefix = "__async_query_rewrite_placeholder"
@@ -1186,6 +1205,13 @@ func (t *logicTest) newCluster(
 	// when run with fakedist-disk config, so we'll use a larger limit here.
 	// There isn't really a downside to doing so.
 	tempStorageDiskLimit := int64(512 << 20) /* 512 MiB */
+	// MVCC range tombstones are only available in 22.2 or newer.
+	supportsMVCCRangeTombstones := (t.cfg.BootstrapVersion.Equal(roachpb.Version{}) ||
+		!t.cfg.BootstrapVersion.Less(clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull))) &&
+		(t.cfg.BinaryVersion.Equal(roachpb.Version{}) ||
+			!t.cfg.BinaryVersion.Less(clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull)))
+	ignoreMVCCRangeTombstoneErrors := supportsMVCCRangeTombstones &&
+		(globalMVCCRangeTombstone || useMVCCRangeTombstonesForPointDeletes)
 
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
@@ -1197,7 +1223,13 @@ func (t *logicTest) newCluster(
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
-					DisableConsistencyQueue: true,
+					DisableConsistencyQueue:  true,
+					GlobalMVCCRangeTombstone: supportsMVCCRangeTombstones && globalMVCCRangeTombstone,
+					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+						DisableInitPutFailOnTombstones: ignoreMVCCRangeTombstoneErrors,
+						UseRangeTombstonesForPointDeletes: supportsMVCCRangeTombstones &&
+							useMVCCRangeTombstonesForPointDeletes,
+					},
 				},
 				SQLEvalContext: &eval.TestingKnobs{
 					AssertBinaryExprReturnTypes:     true,
@@ -1216,6 +1248,9 @@ func (t *logicTest) newCluster(
 				},
 				SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 					BeforeStage: corpusCollectionCallback,
+				},
+				RangeFeed: &rangefeed.TestingKnobs{
+					IgnoreOnDeleteRangeError: ignoreMVCCRangeTombstoneErrors,
 				},
 			},
 			ClusterName:   "testclustername",
@@ -1337,6 +1372,7 @@ func (t *logicTest) newCluster(
 					TenantTestingKnobs: &sql.TenantTestingKnobs{
 						AllowSplitAndScatter: cfg.AllowSplitAndScatter,
 					},
+					RangeFeed: paramsPerNode[i].Knobs.RangeFeed,
 				},
 				MemoryPoolSize:    params.ServerArgs.SQLMemoryPoolSize,
 				TempStorageConfig: &params.ServerArgs.TempStorageConfig,
@@ -1378,6 +1414,12 @@ func (t *logicTest) newCluster(
 			t.Fatal(err)
 		}
 
+		// Reduce the schema GC job's MVCC polling interval for faster tests.
+		if _, err := conn.Exec(
+			"SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '3s'",
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// If we've created a tenant (either explicitly, or probabilistically and
@@ -1666,7 +1708,7 @@ CREATE DATABASE test; USE test;
 		t.Fatal(err)
 	}
 
-	if !t.cfg.BootstrapVersion.Equal(roachpb.Version{}) && t.cfg.BootstrapVersion.Less(roachpb.Version{Major: 22, Minor: 2}) {
+	if !t.cfg.BootstrapVersion.Equal(roachpb.Version{}) && t.cfg.BootstrapVersion.Less(clusterversion.ByKey(clusterversion.SetSystemUsersUserIDColumnNotNull)) {
 		// Hacky way to create user with an ID if we're on a
 		// bootstrapped binary less than 22.2. The version gate
 		// causes the regular CREATE USER to fail since it will not

@@ -95,7 +95,7 @@ var restoreStatsInsertBatchSize = 10
 func rewriteBackupSpanKey(
 	codec keys.SQLCodec, kr *KeyRewriter, key roachpb.Key,
 ) (roachpb.Key, error) {
-	newKey, rewritten, err := kr.RewriteKey(append([]byte(nil), key...))
+	newKey, rewritten, err := kr.RewriteKey(append([]byte(nil), key...), 0 /*wallTime*/)
 	if err != nil {
 		return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 			"could not rewrite span start key: %s", key)
@@ -275,7 +275,7 @@ func restore(
 	highWaterMark := job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater
 
 	importSpans := makeSimpleImportSpans(dataToRestore.getSpans(), backupManifests, backupLocalityMap,
-		highWaterMark)
+		highWaterMark, targetRestoreSpanSize)
 
 	if len(importSpans) == 0 {
 		// There are no files to restore.
@@ -660,20 +660,36 @@ func shouldPreRestore(table *tabledesc.Mutable) bool {
 	return ok
 }
 
+// backedUpDescriptorWithInProgressImportInto returns true if the backed up descriptor represents a table with an in
+// progress import that started in a cluster finalized to version 22.2.
+func backedUpDescriptorWithInProgressImportInto(
+	ctx context.Context, p sql.JobExecContext, desc catalog.Descriptor,
+) (bool, error) {
+	table, ok := desc.(catalog.TableDescriptor)
+	if !ok {
+		return false, nil
+	}
+
+	if table.GetInProgressImportStartTime() == 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
 // createImportingDescriptors creates the tables that we will restore into and returns up to three
 // configurations for separate restoration flows. The three restoration flows are
 //
-//   1. dataToPreRestore: a restoration flow cfg to ingest a subset of
-//   system tables (e.g. zone configs) during a cluster restore that are
-//   required to be set up before the rest of the data gets restored.
-//   This should be empty during non-cluster restores.
+//  1. dataToPreRestore: a restoration flow cfg to ingest a subset of
+//     system tables (e.g. zone configs) during a cluster restore that are
+//     required to be set up before the rest of the data gets restored.
+//     This should be empty during non-cluster restores.
 //
-//   2. preValidation: a restoration flow cfg to ingest the remainder of system tables,
-//   during a verify_backup_table_data, cluster level, restores. This should be empty otherwise.
+//  2. preValidation: a restoration flow cfg to ingest the remainder of system tables,
+//     during a verify_backup_table_data, cluster level, restores. This should be empty otherwise.
 //
-//   3. trackedRestore: a restoration flow cfg to ingest the remainder of
-//   restore targets. This flow should get executed last and should contain the
-//   bulk of the work, as it is used for job progress tracking.
+//  3. trackedRestore: a restoration flow cfg to ingest the remainder of
+//     restore targets. This flow should get executed last and should contain the
+//     bulk of the work, as it is used for job progress tracking.
 func createImportingDescriptors(
 	ctx context.Context,
 	p sql.JobExecContext,
@@ -702,12 +718,42 @@ func createImportingDescriptors(
 
 	oldTableIDs := make([]descpb.ID, 0)
 
+	// offlineSchemas is a slice of all the backed up schemas in a database that
+	// were in an offline state at the time of the backup. These offline schemas
+	// are not restored and need to be elided from the list of schemas when
+	// constructing the database descriptor.
+	offlineSchemas := make(map[descpb.ID]struct{})
+
 	tables := make([]catalog.TableDescriptor, 0)
 	postRestoreTables := make([]catalog.TableDescriptor, 0)
 
 	preRestoreTables := make([]catalog.TableDescriptor, 0)
 
 	for _, desc := range sqlDescs {
+		// Decide which offline tables to include in the restore:
+		//
+		// -  An offline table created by RESTORE or IMPORT PGDUMP is fully discarded.
+		//    The table will not exist in the restoring cluster.
+		//
+		// -  An offline table undergoing an IMPORT INTO has all importing data
+		//    elided in the restore processor and is restored online to its pre import
+		//    state.
+		//
+		// TODO (msbutler) remove the schema_change condition once the online schema changer
+		// doesn't rely on OFFLINE state (#86626, #86691)
+		if desc.Offline() && desc.GetDeclarativeSchemaChangerState() == nil {
+
+			if schema, ok := desc.(catalog.SchemaDescriptor); ok {
+				offlineSchemas[schema.GetID()] = struct{}{}
+			}
+
+			if eligible, err := backedUpDescriptorWithInProgressImportInto(ctx, p, desc); err != nil {
+				return nil, nil, nil, err
+			} else if !eligible {
+				continue
+			}
+		}
+
 		switch desc := desc.(type) {
 		case catalog.TableDescriptor:
 			mut := tabledesc.NewBuilder(desc.TableDesc()).BuildCreatedMutableTable()
@@ -759,7 +805,7 @@ func createImportingDescriptors(
 	log.Eventf(ctx, "starting restore for %d tables", len(mutableTables))
 
 	// Assign new IDs to the database descriptors.
-	if err := rewrite.DatabaseDescs(mutableDatabases, details.DescriptorRewrites); err != nil {
+	if err := rewrite.DatabaseDescs(mutableDatabases, details.DescriptorRewrites, offlineSchemas); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -1344,6 +1390,10 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		return err
 	}
 
+	if err := r.validateJobIsResumable(p.ExecCfg()); err != nil {
+		return err
+	}
+
 	kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings, &p.ExecCfg().ExternalIODirConfig,
 		p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
 	backupManifests, latestBackupManifest, sqlDescs, memSize, err := loadBackupSQLDescs(
@@ -1627,6 +1677,30 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 			telemetry.CountBucketed("restore.speed-mbps.over10mb.per-node", mbps/int64(numNodes))
 		}
 		logJobCompletion(ctx, restoreJobEventType, r.job.ID(), true, nil)
+	}
+	return nil
+}
+
+func clusterRestoreDuringUpgradeErr(
+	clusterVersion roachpb.Version, binaryVersion roachpb.Version,
+) error {
+	return errors.Errorf("cluster restore not supported during major version upgrade: restore started at cluster version %s but binary version is %s",
+		clusterVersion,
+		binaryVersion)
+}
+
+// validateJobDetails returns an error if this job cannot be resumed.
+func (r *restoreResumer) validateJobIsResumable(execConfig *sql.ExecutorConfig) error {
+	details := r.job.Details().(jobspb.RestoreDetails)
+
+	// Validate that we aren't in the middle of an upgrade. To avoid unforseen
+	// issues, we want to avoid full cluster restores if it is possible that an
+	// upgrade is in progress. We also check this during planning.
+	creationClusterVersion := r.job.Payload().CreationClusterVersion
+	binaryVersion := execConfig.Settings.Version.BinaryVersion()
+	isClusterRestore := details.DescriptorCoverage == tree.AllDescriptors
+	if isClusterRestore && creationClusterVersion.Less(binaryVersion) {
+		return clusterRestoreDuringUpgradeErr(creationClusterVersion, binaryVersion)
 	}
 	return nil
 }
@@ -2197,7 +2271,7 @@ func (r *restoreResumer) dropDescriptors(
 		// and so we don't need to preserve MVCC semantics.
 		tableToDrop.DropTime = dropTime
 		b.Del(catalogkeys.EncodeNameKey(codec, tableToDrop))
-		descsCol.AddDeletedDescriptor(tableToDrop.GetID())
+		descsCol.NotifyOfDeletedDescriptor(tableToDrop.GetID())
 	}
 
 	// Drop the type descriptors that this restore created.
@@ -2219,7 +2293,7 @@ func (r *restoreResumer) dropDescriptors(
 		mutType.SetDropped()
 		// Remove the system.descriptor entry.
 		b.Del(catalogkeys.MakeDescMetadataKey(codec, typDesc.ID))
-		descsCol.AddDeletedDescriptor(mutType.GetID())
+		descsCol.NotifyOfDeletedDescriptor(mutType.GetID())
 	}
 
 	// Queue a GC job.
@@ -2263,7 +2337,12 @@ func (r *restoreResumer) dropDescriptors(
 
 	// Delete any schema descriptors that this restore created. Also collect the
 	// descriptors so we can update their parent databases later.
-	dbsWithDeletedSchemas := make(map[descpb.ID][]catalog.Descriptor)
+	type dbWithDeletedSchemas struct {
+		db      *dbdesc.Mutable
+		schemas []catalog.Descriptor
+	}
+
+	dbsWithDeletedSchemas := make(map[descpb.ID]dbWithDeletedSchemas)
 	for _, schemaDesc := range details.SchemaDescs {
 		// We need to ignore descriptors we just added since we haven't committed the txn that deletes these.
 		isSchemaEmpty, err := isSchemaEmpty(ctx, txn, schemaDesc.GetID(), allDescs, ignoredChildDescIDs)
@@ -2280,49 +2359,53 @@ func (r *restoreResumer) dropDescriptors(
 		if err != nil {
 			return err
 		}
+		entry, hasEntry := dbsWithDeletedSchemas[schemaDesc.GetParentID()]
+		if !hasEntry {
+			mutParent, err := descsCol.GetMutableDescriptorByID(ctx, txn, schemaDesc.GetParentID())
+			if err != nil {
+				return err
+			}
+			entry.db = mutParent.(*dbdesc.Mutable)
+		}
 
-		// Mark schema as dropped and add uncommitted version to pass pre-txn
-		// descriptor validation.
+		// Delete schema entries in descriptor and namespace system tables.
+		b.Del(catalogkeys.EncodeNameKey(codec, mutSchema))
+		b.Del(catalogkeys.MakeDescMetadataKey(codec, mutSchema.GetID()))
+		descsCol.NotifyOfDeletedDescriptor(mutSchema.GetID())
+		// Add dropped descriptor as uncommitted to satisfy descriptor validation.
 		mutSchema.SetDropped()
 		mutSchema.MaybeIncrementVersion()
 		if err := descsCol.AddUncommittedDescriptor(ctx, mutSchema); err != nil {
 			return err
 		}
 
-		b.Del(catalogkeys.EncodeNameKey(codec, mutSchema))
-		b.Del(catalogkeys.MakeDescMetadataKey(codec, mutSchema.GetID()))
-		descsCol.AddDeletedDescriptor(mutSchema.GetID())
-		dbsWithDeletedSchemas[mutSchema.GetParentID()] = append(dbsWithDeletedSchemas[mutSchema.GetParentID()], mutSchema)
+		// Remove the back-reference to the deleted schema in the parent database.
+		if schemaInfo, ok := entry.db.Schemas[schemaDesc.GetName()]; !ok {
+			log.Warningf(ctx, "unexpected missing schema entry for %s from db %d; skipping deletion",
+				schemaDesc.GetName(), entry.db.GetID())
+		} else if schemaInfo.ID != schemaDesc.GetID() {
+			log.Warningf(ctx, "unexpected schema entry %d for %s from db %d, expecting %d; skipping deletion",
+				schemaInfo.ID, schemaDesc.GetName(), entry.db.GetID(), schemaDesc.GetID())
+		} else {
+			delete(entry.db.Schemas, schemaDesc.GetName())
+		}
+
+		entry.schemas = append(entry.schemas, mutSchema)
+		dbsWithDeletedSchemas[entry.db.GetID()] = entry
 	}
 
 	// For each database that had a child schema deleted (regardless of whether
 	// the db was created in the restore job), if it wasn't deleted just now,
-	// delete the now-deleted child schema from its schema map.
+	// write the updated descriptor with the now-deleted child schemas from its
+	// schema map.
 	//
 	// This cleanup must be done prior to dropping the database descriptors in the
 	// loop below so that we do not accidentally `b.Put` the descriptor with the
 	// modified schema slice after we have issued a `b.Del` to drop it.
-	for dbID, schemas := range dbsWithDeletedSchemas {
-		log.Infof(ctx, "deleting %d schema entries from database %d", len(schemas), dbID)
-		desc, err := descsCol.GetMutableDescriptorByID(ctx, txn, dbID)
-		if err != nil {
-			return err
-		}
-		db := desc.(*dbdesc.Mutable)
-		for _, sc := range schemas {
-			if schemaInfo, ok := db.Schemas[sc.GetName()]; !ok {
-				log.Warningf(ctx, "unexpected missing schema entry for %s from db %d; skipping deletion",
-					sc.GetName(), dbID)
-			} else if schemaInfo.ID != sc.GetID() {
-				log.Warningf(ctx, "unexpected schema entry %d for %s from db %d, expecting %d; skipping deletion",
-					schemaInfo.ID, sc.GetName(), dbID, sc.GetID())
-			} else {
-				delete(db.Schemas, sc.GetName())
-			}
-		}
-
+	for dbID, entry := range dbsWithDeletedSchemas {
+		log.Infof(ctx, "deleting %d schema entries from database %d", len(entry.schemas), dbID)
 		if err := descsCol.WriteDescToBatch(
-			ctx, false /* kvTrace */, db, b,
+			ctx, false /* kvTrace */, entry.db, b,
 		); err != nil {
 			return err
 		}
@@ -2370,7 +2453,7 @@ func (r *restoreResumer) dropDescriptors(
 
 		nameKey := catalogkeys.MakeDatabaseNameKey(codec, db.GetName())
 		b.Del(nameKey)
-		descsCol.AddDeletedDescriptor(db.GetID())
+		descsCol.NotifyOfDeletedDescriptor(db.GetID())
 		deletedDBs[db.GetID()] = struct{}{}
 	}
 

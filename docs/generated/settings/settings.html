@@ -198,13 +198,14 @@
 <tr><td><code>sql.stats.cleanup.recurrence</code></td><td>string</td><td><code>@hourly</code></td><td>cron-tab recurrence for SQL Stats cleanup job</td></tr>
 <tr><td><code>sql.stats.flush.enabled</code></td><td>boolean</td><td><code>true</code></td><td>if set, SQL execution statistics are periodically flushed to disk</td></tr>
 <tr><td><code>sql.stats.flush.interval</code></td><td>duration</td><td><code>10m0s</code></td><td>the interval at which SQL execution statistics are flushed to disk, this value must be less than or equal to sql.stats.aggregation.interval</td></tr>
+<tr><td><code>sql.stats.forecasts.enabled</code></td><td>boolean</td><td><code>true</code></td><td>when true, enables generation of statistics forecasts by default for all tables</td></tr>
 <tr><td><code>sql.stats.histogram_collection.enabled</code></td><td>boolean</td><td><code>true</code></td><td>histogram collection mode</td></tr>
 <tr><td><code>sql.stats.multi_column_collection.enabled</code></td><td>boolean</td><td><code>true</code></td><td>multi-column statistics collection mode</td></tr>
 <tr><td><code>sql.stats.non_default_columns.min_retention_period</code></td><td>duration</td><td><code>24h0m0s</code></td><td>minimum retention period for table statistics collected on non-default columns</td></tr>
 <tr><td><code>sql.stats.persisted_rows.max</code></td><td>integer</td><td><code>1000000</code></td><td>maximum number of rows of statement and transaction statistics that will be persisted in the system tables</td></tr>
 <tr><td><code>sql.stats.post_events.enabled</code></td><td>boolean</td><td><code>false</code></td><td>if set, an event is logged for every CREATE STATISTICS job</td></tr>
 <tr><td><code>sql.stats.response.max</code></td><td>integer</td><td><code>20000</code></td><td>the maximum number of statements and transaction stats returned in a CombinedStatements request</td></tr>
-<tr><td><code>sql.stats.response.show_internal.enabled</code></td><td>boolean</td><td><code>false</code></td><td>controls if statistics for internal executions should be returned by the CombinedStatements endpoint. This endpoint is used to display statistics on the Statement and Transaction fingerprint pages under SQL Activity</td></tr>
+<tr><td><code>sql.stats.response.show_internal.enabled</code></td><td>boolean</td><td><code>false</code></td><td>controls if statistics for internal executions should be returned by the CombinedStatements and if internal sessions should be returned by the ListSessions endpoints. These endpoints are used to display statistics on the SQL Activity pages</td></tr>
 <tr><td><code>sql.stats.system_tables.enabled</code></td><td>boolean</td><td><code>true</code></td><td>when true, enables use of statistics on system tables by the query optimizer</td></tr>
 <tr><td><code>sql.stats.system_tables_autostats.enabled</code></td><td>boolean</td><td><code>true</code></td><td>when true, enables automatic collection of statistics on system tables</td></tr>
 <tr><td><code>sql.telemetry.query_sampling.enabled</code></td><td>boolean</td><td><code>false</code></td><td>when set to true, executed queries will emit an event on the telemetry logging channel</td></tr>
@@ -228,6 +229,6 @@
 <tr><td><code>trace.opentelemetry.collector</code></td><td>string</td><td><code></code></td><td>address of an OpenTelemetry trace collector to receive traces using the otel gRPC protocol, as <host>:<port>. If no port is specified, 4317 will be used.</td></tr>
 <tr><td><code>trace.span_registry.enabled</code></td><td>boolean</td><td><code>true</code></td><td>if set, ongoing traces can be seen at https://<ui>/#/debug/tracez</td></tr>
 <tr><td><code>trace.zipkin.collector</code></td><td>string</td><td><code></code></td><td>the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.</td></tr>
-<tr><td><code>version</code></td><td>version</td><td><code>1000022.1-66</code></td><td>set the active cluster version in the format '<major>.<minor>'</td></tr>
+<tr><td><code>version</code></td><td>version</td><td><code>1000022.1-70</code></td><td>set the active cluster version in the format '<major>.<minor>'</td></tr>
 </tbody>
 </table>

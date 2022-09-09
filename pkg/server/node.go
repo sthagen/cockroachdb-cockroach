@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -173,7 +174,9 @@ type nodeMetrics struct {
 
 func makeNodeMetrics(reg *metric.Registry, histogramWindow time.Duration) nodeMetrics {
 	nm := nodeMetrics{
-		Latency:    metric.NewLatency(metaExecLatency, histogramWindow),
+		Latency: metric.NewHistogram(
+			metaExecLatency, histogramWindow, metric.IOLatencyBuckets,
+		),
 		Success:    metric.NewCounter(metaExecSuccess),
 		Err:        metric.NewCounter(metaExecError),
 		DiskStalls: metric.NewCounter(metaDiskStalls),
@@ -1237,7 +1240,7 @@ func setupSpanForIncomingRPC(
 		var remoteParent tracing.SpanMeta
 		if !ba.TraceInfo.Empty() {
 			ctx, newSpan = tr.StartSpanCtx(ctx, grpcinterceptor.BatchMethodName,
-				tracing.WithRemoteParentFromTraceInfo(&ba.TraceInfo),
+				tracing.WithRemoteParentFromTraceInfo(ba.TraceInfo),
 				tracing.WithServerSpanKind)
 		} else {
 			// For backwards compatibility with 21.2, if tracing info was passed as
@@ -1378,7 +1381,12 @@ func (n *Node) MuxRangeFeed(stream roachpb.Internal_MuxRangeFeedServer) error {
 		}
 
 		rfGrp.GoCtx(func(ctx context.Context) error {
-			ctx, span := tracing.ForkSpan(logtags.AddTag(ctx, "r", req.RangeID), "mux-rf")
+			ctx = n.AnnotateCtx(ctx)
+			ctx = logtags.AddTag(ctx, "r", req.RangeID)
+			ctx = logtags.AddTag(ctx, "s", req.Replica.StoreID)
+			ctx, restore := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+			defer restore()
+			ctx, span := tracing.ForkSpan(ctx, "mux-rf")
 			defer span.Finish()
 
 			sink := setRangeIDEventSink{

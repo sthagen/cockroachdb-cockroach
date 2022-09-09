@@ -13,7 +13,12 @@ import { Modal } from "../modal";
 import { Text, TextTypes } from "../text";
 import { Button } from "../button";
 import { executeIndexRecAction, IndexActionResponse } from "../api";
-import { createIndex, dropIndex, onlineSchemaChanges } from "../util";
+import {
+  alterIndex,
+  createIndex,
+  dropIndex,
+  onlineSchemaChanges,
+} from "../util";
 import { Anchor } from "../anchor";
 import { InlineAlert } from "@cockroachlabs/ui-components";
 import classNames from "classnames/bind";
@@ -67,7 +72,7 @@ const IdxRecAction = (props: idxRecProps): React.ReactElement => {
   let btnLAbel = "Update Index";
   let descriptionDocs = <></>;
   switch (props.actionType) {
-    case "CREATE_INDEX":
+    case "CreateIndex":
       title = "create a new index";
       btnLAbel = "Create Index";
       descriptionDocs = (
@@ -80,7 +85,7 @@ const IdxRecAction = (props: idxRecProps): React.ReactElement => {
         </>
       );
       break;
-    case "DROP_INDEX":
+    case "DropIndex":
       title = "drop the unused index";
       btnLAbel = "Drop Index";
       descriptionDocs = (
@@ -93,7 +98,7 @@ const IdxRecAction = (props: idxRecProps): React.ReactElement => {
         </>
       );
       break;
-    case "REPLACE_INDEX":
+    case "ReplaceIndex":
       title = "replace the index";
       btnLAbel = "Replace Index";
       descriptionDocs = (
@@ -107,6 +112,19 @@ const IdxRecAction = (props: idxRecProps): React.ReactElement => {
             DROP INDEX
           </Anchor>
           {" statements"}
+        </>
+      );
+      break;
+    case "AlterIndex":
+      title = "alter the index";
+      btnLAbel = "Alter Index";
+      descriptionDocs = (
+        <>
+          {"an "}
+          <Anchor href={alterIndex} target="_blank">
+            ALTER INDEX
+          </Anchor>
+          {" statement"}
         </>
       );
       break;
@@ -128,9 +146,7 @@ const IdxRecAction = (props: idxRecProps): React.ReactElement => {
       >
         <Text>
           This action will apply the single-statement index recommendation by
-          executing {descriptionDocs}. Schema changes consume additional
-          resources and can potentially negatively impact workload
-          responsiveness.{" "}
+          executing {descriptionDocs}.{" "}
           <Anchor href={onlineSchemaChanges} target="_blank">
             Learn more
           </Anchor>
@@ -138,6 +154,13 @@ const IdxRecAction = (props: idxRecProps): React.ReactElement => {
         <Text textType={TextTypes.Code} className={"code-area"}>
           {query}
         </Text>
+        <InlineAlert
+          intent="warning"
+          className={cx("alert-area")}
+          title={`Schema changes consume additional
+          resources and can potentially negatively impact workload
+          responsiveness.`}
+        />
         {error.length > 0 && (
           <InlineAlert
             intent="danger"
@@ -157,8 +180,8 @@ function addIdxName(statement: string): string {
   let result = "";
   const statements = statement.split(";");
   for (let i = 0; i < statements.length; i++) {
-    if (statements[i].toUpperCase().startsWith("CREATE INDEX ON ")) {
-      result = `${result}${createIdxName(statements[i])};`;
+    if (statements[i].trim().toUpperCase().startsWith("CREATE INDEX ON ")) {
+      result = `${result}${createIdxName(statements[i])}; `;
     } else if (statements[i].length != 0) {
       result = `${result}${statements[i]};`;
     }

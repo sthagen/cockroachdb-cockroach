@@ -88,10 +88,10 @@ import (
 const CrdbInternalName = catconstants.CRDBInternalSchemaName
 
 // Naming convention:
-// - if the response is served from memory, prefix with node_
-// - if the response is served via a kv request, prefix with kv_
-// - if the response is not from kv requests but is cluster-wide (i.e. the
-//    answer isn't specific to the sql connection being used, prefix with cluster_.
+//   - if the response is served from memory, prefix with node_
+//   - if the response is served via a kv request, prefix with kv_
+//   - if the response is not from kv requests but is cluster-wide (i.e. the
+//     answer isn't specific to the sql connection being used, prefix with cluster_.
 //
 // Adding something new here will require an update to `pkg/cli` for inclusion in
 // a `debug zip`; the unit tests will guide you.
@@ -277,6 +277,7 @@ CREATE TABLE crdb_internal.databases (
 	name STRING NOT NULL,
 	owner NAME NOT NULL,
 	primary_region STRING,
+	secondary_region STRING,
 	regions STRING[],
 	survival_goal STRING,
 	placement_policy STRING,
@@ -287,6 +288,7 @@ CREATE TABLE crdb_internal.databases (
 			func(db catalog.DatabaseDescriptor) error {
 				var survivalGoal tree.Datum = tree.DNull
 				var primaryRegion tree.Datum = tree.DNull
+				var secondaryRegion tree.Datum = tree.DNull
 				var placement tree.Datum = tree.DNull
 				regions := tree.NewDArray(types.String)
 
@@ -295,8 +297,9 @@ CREATE TABLE crdb_internal.databases (
 				createNode.Name = tree.Name(db.GetName())
 				if db.IsMultiRegion() {
 					primaryRegion = tree.NewDString(string(db.GetRegionConfig().PrimaryRegion))
-
 					createNode.PrimaryRegion = tree.Name(db.GetRegionConfig().PrimaryRegion)
+					secondaryRegion = tree.NewDString(string(db.GetRegionConfig().SecondaryRegion))
+					createNode.SecondaryRegion = tree.Name(db.GetRegionConfig().SecondaryRegion)
 
 					regionConfig, err := SynthesizeRegionConfig(ctx, p.txn, db.GetID(), p.Descriptors())
 					if err != nil {
@@ -345,6 +348,7 @@ CREATE TABLE crdb_internal.databases (
 					tree.NewDString(db.GetName()),        // name
 					tree.NewDName(owner.Normalized()),    // owner
 					primaryRegion,                        // primary_region
+					secondaryRegion,                      // secondary_region
 					regions,                              // regions
 					survivalGoal,                         // survival_goal
 					placement,                            // data_placement
@@ -1771,6 +1775,7 @@ func (p *planner) makeSessionsRequest(
 	req := serverpb.ListSessionsRequest{
 		Username:              p.SessionData().User().Normalized(),
 		ExcludeClosedSessions: excludeClosed,
+		IncludeInternal:       true,
 	}
 	hasAdmin, err := p.HasAdminRole(ctx)
 	if err != nil {
@@ -2423,7 +2428,7 @@ CREATE TABLE crdb_internal.builtin_functions (
   details   STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, _ *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		for _, name := range builtins.AllBuiltinNames {
+		for _, name := range builtins.AllBuiltinNames() {
 			props, overloads := builtinsregistry.GetBuiltinProperties(name)
 			for _, f := range overloads {
 				if err := addRow(
@@ -2644,7 +2649,15 @@ CREATE TABLE crdb_internal.create_function_statements (
 			}
 			for i := range treeNode.Options {
 				if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
-					stmtStrs := strings.Split(string(body), "\n")
+					typeReplacedBody, err := formatFunctionQueryTypesForDisplay(ctx, &p.semaCtx, p.SessionData(), string(body))
+					if err != nil {
+						return err
+					}
+					seqReplacedBody, err := formatQuerySequencesForDisplay(ctx, &p.semaCtx, typeReplacedBody, true /* multiStmt */)
+					if err != nil {
+						return err
+					}
+					stmtStrs := strings.Split(seqReplacedBody, "\n")
 					for i := range stmtStrs {
 						stmtStrs[i] = "\t" + stmtStrs[i]
 					}
@@ -2750,7 +2763,7 @@ CREATE TABLE crdb_internal.create_statements (
 			createNofk = stmt
 		}
 		hasPartitions := nil != catalog.FindIndex(table, catalog.IndexOpts{}, func(idx catalog.Index) bool {
-			return idx.GetPartitioning().NumColumns() != 0
+			return idx.PartitioningColumnCount() != 0
 		})
 		return addRow(
 			dbDescID,
@@ -6342,7 +6355,8 @@ CREATE TABLE crdb_internal.%s (
 	txn_fingerprint_id         BYTES NOT NULL,
 	stmt_id                    STRING NOT NULL,
 	stmt_fingerprint_id        BYTES NOT NULL,
-	problems                   STRING[] NOT NULL,
+	problem                    STRING NOT NULL,
+	causes                     STRING[] NOT NULL,
 	query                      STRING NOT NULL,
 	status                     STRING NOT NULL,
 	start_time                 TIMESTAMP NOT NULL,
@@ -6401,9 +6415,9 @@ func populateExecutionInsights(
 		return
 	}
 	for _, insight := range response.Insights {
-		problems := tree.NewDArray(types.String)
-		for _, problem := range insight.Problems {
-			if errProblem := problems.Append(tree.NewDString(problem.String())); err != nil {
+		causes := tree.NewDArray(types.String)
+		for _, cause := range insight.Causes {
+			if errProblem := causes.Append(tree.NewDString(cause.String())); err != nil {
 				err = errors.CombineErrors(err, errProblem)
 			}
 		}
@@ -6454,7 +6468,8 @@ func populateExecutionInsights(
 			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Transaction.FingerprintID)))),
 			tree.NewDString(hex.EncodeToString(insight.Statement.ID.GetBytes())),
 			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Statement.FingerprintID)))),
-			problems,
+			tree.NewDString(insight.Problem.String()),
+			causes,
 			tree.NewDString(insight.Statement.Query),
 			tree.NewDString(insight.Statement.Status.String()),
 			startTimestamp,

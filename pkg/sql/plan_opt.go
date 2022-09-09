@@ -47,10 +47,10 @@ var queryCacheEnabled = settings.RegisterBoolSetting(
 
 // prepareUsingOptimizer builds a memo for a prepared statement and populates
 // the following stmt.Prepared fields:
-//  - Columns
-//  - Types
-//  - AnonymizedStr
-//  - Memo (for reuse during exec, if appropriate).
+//   - Columns
+//   - Types
+//   - AnonymizedStr
+//   - Memo (for reuse during exec, if appropriate).
 func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) {
 	stmt := &p.stmt
 
@@ -185,6 +185,11 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 				resultCols[i].PGAttributeNum = uint32(tab.Column(colOrdinal).ColID())
 			}
 		}
+	}
+
+	if p.semaCtx.Placeholders.PlaceholderTypesInfo.FromSQLPrepare {
+		// Fill blank placeholder types with the type hints.
+		p.semaCtx.Placeholders.MaybeExtendTypes()
 	}
 
 	// Verify that all placeholder types have been set.

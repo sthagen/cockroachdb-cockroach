@@ -1668,6 +1668,20 @@ func TestLogic_show_fingerprints(
 	runLogicTest(t, "show_fingerprints")
 }
 
+func TestLogic_show_grants_on_virtual_table(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_grants_on_virtual_table")
+}
+
+func TestLogic_show_grants_synthetic(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_grants_synthetic")
+}
+
 func TestLogic_show_indexes(
 	t *testing.T,
 ) {
@@ -1759,6 +1773,13 @@ func TestLogic_subquery_correlated(
 	runLogicTest(t, "subquery_correlated")
 }
 
+func TestLogic_synthetic_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "synthetic_privileges")
+}
+
 func TestLogic_system(
 	t *testing.T,
 ) {
@@ -1778,13 +1799,6 @@ func TestLogic_system_namespace(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "system_namespace")
-}
-
-func TestLogic_system_privileges(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "system_privileges")
 }
 
 func TestLogic_table(

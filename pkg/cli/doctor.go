@@ -176,6 +176,7 @@ func runDoctorExamine(
 		descTable,
 		namespaceTable,
 		jobsTable,
+		true, /*validateJobs*/
 		debugCtx.verbose,
 		out)
 	if err != nil {
@@ -348,7 +349,7 @@ func fromZipDir(
 	retErr error,
 ) {
 	// To make parsing user functions code happy.
-	_ = builtins.AllBuiltinNames
+	_ = builtins.AllBuiltinNames()
 
 	descTable = make(doctor.DescriptorTable, 0)
 	if err := slurp(zipDirPath, "system.descriptor.txt", func(row string) error {

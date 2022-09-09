@@ -25,7 +25,6 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -43,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/replicastats"
@@ -254,6 +254,8 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 		ScanInterval:                10 * time.Minute,
 		HistogramWindowInterval:     metric.TestSampleInterval,
 		ProtectedTimestampReader:    spanconfig.EmptyProtectedTSReader(clock),
+		SnapshotSendLimit:           DefaultSnapshotSendLimit,
+		SnapshotApplyLimit:          DefaultSnapshotApplyLimit,
 
 		// Use a constant empty system config, which mirrors the previously
 		// existing logic to install an empty system config in gossip.
@@ -444,7 +446,7 @@ INVARIANT: the set of all Ranges (as determined by, e.g. a transactionally
 consistent scan of the meta index ranges) always exactly covers the addressable
 keyspace roachpb.KeyMin (inclusive) to roachpb.KeyMax (exclusive).
 
-Ranges
+# Ranges
 
 Each Replica is part of a Range, i.e. corresponds to what other systems would
 call a shard. A Range is a consensus group backed by Raft, i.e. each Replica is
@@ -461,7 +463,7 @@ these interact heavily with the Range as a consensus group (of which each
 Replica is a member). All of these intricacies are described at a high level in
 this comment.
 
-RangeDescriptor
+# RangeDescriptor
 
 A roachpb.RangeDescriptor is the configuration of a Range. It is an
 MVCC-backed key-value pair (where the key is derived from the StartKey via
@@ -479,8 +481,8 @@ these operations at some point will
 - update the RangeDescriptor (for example, to reflect a split, or a change
 to the Replicas comprising the members of the Range)
 
-- update the meta ranges (which form a search index used for request routing, see
-  kv.RangeLookup and updateRangeAddressing for details)
+  - update the meta ranges (which form a search index used for request routing, see
+    kv.RangeLookup and updateRangeAddressing for details)
 
 - commit with a roachpb.InternalCommitTrigger.
 
@@ -519,7 +521,7 @@ Replica for any given key, and ensure that no two Replicas on a Store operate on
 shared keyspace (as seen by the storage.Engine). Refer to the Replica Lifecycle
 diagram below for details on how this invariant is upheld.
 
-Replica Lifecycle
+# Replica Lifecycle
 
 A Replica should be thought of primarily as a State Machine applying commands
 from a replicated log (the log being replicated across the members of the
@@ -579,41 +581,41 @@ request a snapshot. See maybeDelaySplitToAvoidSnapshot.
 The diagram is a lot to take in. The various transitions are discussed in
 prose below, and the source .dot file is in store_doc_replica_lifecycle.dot.
 
-                                +---------------------+
-            +------------------ |       Absent        | ---------------------------------------------------------------------------------------------------+
-            |                   +---------------------+                                                                                                    |
-            |                     |                        Subsume              Crash          applySnapshot                                               |
-            |                     | Store.Start          +---------------+    +---------+    +---------------+                                             |
-            |                     v                      v               |    v         |    v               |                                             |
-            |                   +-----------------------------------------------------------------------------------------------------------------------+  |
-  +---------+------------------ |                                                                                                                       |  |
-  |         |                   |                                                      Initialized                                                      |  |
-  |         |                   |                                                                                                                       |  |
-  |    +----+------------------ |                                                                                                                       | -+----+
-  |    |    |                   +-----------------------------------------------------------------------------------------------------------------------+  |    |
-  |    |    |                     |                      ^                    ^                                   |              |                    |    |    |
-  |    |    | Raft msg            | Crash                | applySnapshot      | post-split                        |              |                    |    |    |
-  |    |    |                     v                      |                    |                                   |              |                    |    |    |
-  |    |    |                   +---------------------------------------------------------+  pre-split            |              |                    |    |    |
-  |    |    +-----------------> |                                                         | <---------------------+--------------+--------------------+----+    |
-  |    |                        |                                                         |                       |              |                    |         |
-  |    |                        |                      Uninitialized                      |   Raft msg            |              |                    |         |
-  |    |                        |                                                         | -----------------+    |              |                    |         |
-  |    |                        |                                                         |                  |    |              |                    |         |
-  |    |                        |                                                         | <----------------+    |              |                    |         |
-  |    |                        +---------------------------------------------------------+                       |              | apply removal      |         |
-  |    |                          |                      |                                                        |              |                    |         |
-  |    |                          | ReplicaTooOldError   | higher ReplicaID                                       | Replica GC   |                    |         |
-  |    |                          v                      v                                                        v              |                    |         |
-  |    |   Merged (snapshot)    +---------------------------------------------------------------------------------------------+  |                    |         |
-  |    +----------------------> |                                                                                             | <+                    |         |
-  |                             |                                                                                             |                       |         |
-  |        apply Merge          |                                                                                             |  ReplicaTooOld        |         |
-  +---------------------------> |                                           Removed                                           | <---------------------+         |
-                                |                                                                                             |                                 |
-                                |                                                                                             |  higher ReplicaID               |
-                                |                                                                                             | <-------------------------------+
-                                +---------------------------------------------------------------------------------------------+
+	                              +---------------------+
+	          +------------------ |       Absent        | ---------------------------------------------------------------------------------------------------+
+	          |                   +---------------------+                                                                                                    |
+	          |                     |                        Subsume              Crash          applySnapshot                                               |
+	          |                     | Store.Start          +---------------+    +---------+    +---------------+                                             |
+	          |                     v                      v               |    v         |    v               |                                             |
+	          |                   +-----------------------------------------------------------------------------------------------------------------------+  |
+	+---------+------------------ |                                                                                                                       |  |
+	|         |                   |                                                      Initialized                                                      |  |
+	|         |                   |                                                                                                                       |  |
+	|    +----+------------------ |                                                                                                                       | -+----+
+	|    |    |                   +-----------------------------------------------------------------------------------------------------------------------+  |    |
+	|    |    |                     |                      ^                    ^                                   |              |                    |    |    |
+	|    |    | Raft msg            | Crash                | applySnapshot      | post-split                        |              |                    |    |    |
+	|    |    |                     v                      |                    |                                   |              |                    |    |    |
+	|    |    |                   +---------------------------------------------------------+  pre-split            |              |                    |    |    |
+	|    |    +-----------------> |                                                         | <---------------------+--------------+--------------------+----+    |
+	|    |                        |                                                         |                       |              |                    |         |
+	|    |                        |                      Uninitialized                      |   Raft msg            |              |                    |         |
+	|    |                        |                                                         | -----------------+    |              |                    |         |
+	|    |                        |                                                         |                  |    |              |                    |         |
+	|    |                        |                                                         | <----------------+    |              |                    |         |
+	|    |                        +---------------------------------------------------------+                       |              | apply removal      |         |
+	|    |                          |                      |                                                        |              |                    |         |
+	|    |                          | ReplicaTooOldError   | higher ReplicaID                                       | Replica GC   |                    |         |
+	|    |                          v                      v                                                        v              |                    |         |
+	|    |   Merged (snapshot)    +---------------------------------------------------------------------------------------------+  |                    |         |
+	|    +----------------------> |                                                                                             | <+                    |         |
+	|                             |                                                                                             |                       |         |
+	|        apply Merge          |                                                                                             |  ReplicaTooOld        |         |
+	+---------------------------> |                                           Removed                                           | <---------------------+         |
+	                              |                                                                                             |                                 |
+	                              |                                                                                             |  higher ReplicaID               |
+	                              |                                                                                             | <-------------------------------+
+	                              +---------------------------------------------------------------------------------------------+
 
 When a Store starts, it iterates through all RangeDescriptors it can find on its
 Engine. Finding a RangeDescriptor by definition implies that the Replica is
@@ -770,12 +772,11 @@ type Store struct {
 	nodeDesc     *roachpb.NodeDescriptor
 	initComplete sync.WaitGroup // Signaled by async init tasks
 
-	// Semaphore to limit concurrent non-empty snapshot application.
-	snapshotApplySem chan struct{}
-	// Semaphore to limit concurrent non-empty snapshot sending.
-	initialSnapshotSendSem chan struct{}
-	// Semaphore to limit concurrent non-empty snapshot sending.
-	raftSnapshotSendSem chan struct{}
+	// Queue to limit concurrent non-empty snapshot application.
+	snapshotApplyQueue *multiqueue.MultiQueue
+
+	// Queue to limit concurrent non-empty snapshot sending.
+	snapshotSendQueue *multiqueue.MultiQueue
 
 	// Track newly-acquired expiration-based leases that we want to proactively
 	// renew. An object is sent on the signal whenever a new entry is added to
@@ -1054,21 +1055,17 @@ type StoreConfig struct {
 
 	TestingKnobs StoreTestingKnobs
 
-	// concurrentSnapshotApplyLimit specifies the maximum number of empty
+	// SnapshotApplyLimit specifies the maximum number of empty
 	// snapshots and the maximum number of non-empty snapshots that are permitted
 	// to be applied concurrently.
-	concurrentSnapshotApplyLimit int
+	SnapshotApplyLimit int64
 
-	// concurrentSnapshotSendLimit specifies the maximum number of each type of
+	// SnapshotSendLimit specifies the maximum number of each type of
 	// snapshot that are permitted to be sent concurrently.
-	concurrentSnapshotSendLimit int
+	SnapshotSendLimit int64
 
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval
 	HistogramWindowInterval time.Duration
-
-	// ExternalStorage creates ExternalStorage objects which allows access to external files
-	ExternalStorage        cloud.ExternalStorageFactory
-	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
 
 	// ProtectedTimestampReader provides a read-only view into the protected
 	// timestamp subsystem. It is queried during the GC process.
@@ -1149,16 +1146,6 @@ func (sc *StoreConfig) SetDefaults() {
 	}
 	if sc.RaftEntryCacheSize == 0 {
 		sc.RaftEntryCacheSize = defaultRaftEntryCacheSize
-	}
-	if sc.concurrentSnapshotApplyLimit == 0 {
-		// NB: setting this value higher than 1 is likely to degrade client
-		// throughput.
-		sc.concurrentSnapshotApplyLimit =
-			envutil.EnvOrDefaultInt("COCKROACH_CONCURRENT_SNAPSHOT_APPLY_LIMIT", 1)
-	}
-	if sc.concurrentSnapshotSendLimit == 0 {
-		sc.concurrentSnapshotSendLimit =
-			envutil.EnvOrDefaultInt("COCKROACH_CONCURRENT_SNAPSHOT_SEND_LIMIT", 1)
 	}
 
 	if sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction == 0 {
@@ -1261,9 +1248,8 @@ func NewStore(
 
 	s.txnWaitMetrics = txnwait.NewMetrics(cfg.HistogramWindowInterval)
 	s.metrics.registry.AddMetricStruct(s.txnWaitMetrics)
-	s.snapshotApplySem = make(chan struct{}, cfg.concurrentSnapshotApplyLimit)
-	s.initialSnapshotSendSem = make(chan struct{}, cfg.concurrentSnapshotSendLimit)
-	s.raftSnapshotSendSem = make(chan struct{}, cfg.concurrentSnapshotSendLimit)
+	s.snapshotApplyQueue = multiqueue.NewMultiQueue(int(cfg.SnapshotApplyLimit))
+	s.snapshotSendQueue = multiqueue.NewMultiQueue(int(cfg.SnapshotSendLimit))
 	if ch := s.cfg.TestingKnobs.LeaseRenewalSignalChan; ch != nil {
 		s.renewableLeasesSignal = ch
 	} else {
@@ -3141,6 +3127,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		overreplicatedRangeCount  int64
 		behindCount               int64
 		pausedFollowerCount       int64
+		slowRaftProposalCount     int64
 
 		locks                          int64
 		totalLockHoldDurationNanos     int64
@@ -3200,6 +3187,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 			}
 		}
 		pausedFollowerCount += metrics.PausedFollowerCount
+		slowRaftProposalCount += metrics.SlowRaftProposalCount
 		behindCount += metrics.BehindCount
 		if qps, dur := rep.loadStats.batchRequests.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
 			averageQueriesPerSecond += qps
@@ -3261,6 +3249,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.OverReplicatedRangeCount.Update(overreplicatedRangeCount)
 	s.metrics.RaftLogFollowerBehindCount.Update(behindCount)
 	s.metrics.RaftPausedFollowerCount.Update(pausedFollowerCount)
+	s.metrics.SlowRaftRequests.Update(slowRaftProposalCount)
 
 	var averageLockHoldDurationNanos int64
 	var averageLockWaitDurationNanos int64

@@ -36,26 +36,28 @@ const (
 	DROP   Kind = 3
 	// DEPRECATEDGRANT is a placeholder to make sure that 4 is not reused.
 	// It was previously used for the GRANT privilege that has been replaced with the more granular Privilege.GrantOption.
-	DEPRECATEDGRANT      Kind = 4 // GRANT
-	SELECT               Kind = 5
-	INSERT               Kind = 6
-	DELETE               Kind = 7
-	UPDATE               Kind = 8
-	USAGE                Kind = 9
-	ZONECONFIG           Kind = 10
-	CONNECT              Kind = 11
-	RULE                 Kind = 12
-	MODIFYCLUSTERSETTING Kind = 13
-	EXTERNALCONNECTION   Kind = 14
-	VIEWACTIVITY         Kind = 15
-	VIEWACTIVITYREDACTED Kind = 16
-	VIEWCLUSTERSETTING   Kind = 17
-	CANCELQUERY          Kind = 18
-	NOSQLLOGIN           Kind = 19
-	EXECUTE              Kind = 20
-	VIEWCLUSTERMETADATA  Kind = 21
-	VIEWDEBUG            Kind = 22
-	BACKUP               Kind = 23
+	DEPRECATEDGRANT          Kind = 4 // GRANT
+	SELECT                   Kind = 5
+	INSERT                   Kind = 6
+	DELETE                   Kind = 7
+	UPDATE                   Kind = 8
+	USAGE                    Kind = 9
+	ZONECONFIG               Kind = 10
+	CONNECT                  Kind = 11
+	RULE                     Kind = 12
+	MODIFYCLUSTERSETTING     Kind = 13
+	EXTERNALCONNECTION       Kind = 14
+	VIEWACTIVITY             Kind = 15
+	VIEWACTIVITYREDACTED     Kind = 16
+	VIEWCLUSTERSETTING       Kind = 17
+	CANCELQUERY              Kind = 18
+	NOSQLLOGIN               Kind = 19
+	EXECUTE                  Kind = 20
+	VIEWCLUSTERMETADATA      Kind = 21
+	VIEWDEBUG                Kind = 22
+	BACKUP                   Kind = 23
+	RESTORE                  Kind = 24
+	EXTERNALIOIMPLICITACCESS Kind = 25
 )
 
 // Privilege represents a privilege parsed from an Access Privilege Inquiry
@@ -109,11 +111,11 @@ var isDescriptorBacked = map[ObjectType]bool{
 
 // Predefined sets of privileges.
 var (
-	AllPrivileges         = List{ALL, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE, BACKUP}
+	AllPrivileges         = List{ALL, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE, BACKUP, RESTORE, EXTERNALIOIMPLICITACCESS}
 	ReadData              = List{SELECT}
 	ReadWriteData         = List{SELECT, INSERT, DELETE, UPDATE}
 	ReadWriteSequenceData = List{SELECT, UPDATE, USAGE}
-	DBPrivileges          = List{ALL, BACKUP, CONNECT, CREATE, DROP, ZONECONFIG}
+	DBPrivileges          = List{ALL, BACKUP, CONNECT, CREATE, DROP, RESTORE, ZONECONFIG}
 	TablePrivileges       = List{ALL, BACKUP, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, ZONECONFIG}
 	SchemaPrivileges      = List{ALL, CREATE, USAGE}
 	TypePrivileges        = List{ALL, USAGE}
@@ -123,7 +125,7 @@ var (
 	// certain privileges unavailable after upgrade migration.
 	// Note that "CREATE, INSERT, DELETE, ZONECONFIG" are no-op privileges on sequences.
 	SequencePrivileges           = List{ALL, USAGE, SELECT, UPDATE, CREATE, DROP, INSERT, DELETE, ZONECONFIG}
-	GlobalPrivileges             = List{ALL, BACKUP, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG}
+	GlobalPrivileges             = List{ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS}
 	VirtualTablePrivileges       = List{ALL, SELECT}
 	ExternalConnectionPrivileges = List{ALL, USAGE, DROP}
 )
@@ -147,28 +149,30 @@ var ByValue = [...]Kind{
 
 // ByName is a map of string -> kind value.
 var ByName = map[string]Kind{
-	"ALL":                  ALL,
-	"CONNECT":              CONNECT,
-	"CREATE":               CREATE,
-	"DROP":                 DROP,
-	"SELECT":               SELECT,
-	"INSERT":               INSERT,
-	"DELETE":               DELETE,
-	"UPDATE":               UPDATE,
-	"ZONECONFIG":           ZONECONFIG,
-	"USAGE":                USAGE,
-	"RULE":                 RULE,
-	"MODIFYCLUSTERSETTING": MODIFYCLUSTERSETTING,
-	"EXTERNALCONNECTION":   EXTERNALCONNECTION,
-	"VIEWACTIVITY":         VIEWACTIVITY,
-	"VIEWACTIVITYREDACTED": VIEWACTIVITYREDACTED,
-	"VIEWCLUSTERSETTING":   VIEWCLUSTERSETTING,
-	"CANCELQUERY":          CANCELQUERY,
-	"NOSQLLOGIN":           NOSQLLOGIN,
-	"EXECUTE":              EXECUTE,
-	"VIEWCLUSTERMETADATA":  VIEWCLUSTERMETADATA,
-	"VIEWDEBUG":            VIEWDEBUG,
-	"BACKUP":               BACKUP,
+	"ALL":                      ALL,
+	"CONNECT":                  CONNECT,
+	"CREATE":                   CREATE,
+	"DROP":                     DROP,
+	"SELECT":                   SELECT,
+	"INSERT":                   INSERT,
+	"DELETE":                   DELETE,
+	"UPDATE":                   UPDATE,
+	"ZONECONFIG":               ZONECONFIG,
+	"USAGE":                    USAGE,
+	"RULE":                     RULE,
+	"MODIFYCLUSTERSETTING":     MODIFYCLUSTERSETTING,
+	"EXTERNALCONNECTION":       EXTERNALCONNECTION,
+	"VIEWACTIVITY":             VIEWACTIVITY,
+	"VIEWACTIVITYREDACTED":     VIEWACTIVITYREDACTED,
+	"VIEWCLUSTERSETTING":       VIEWCLUSTERSETTING,
+	"CANCELQUERY":              CANCELQUERY,
+	"NOSQLLOGIN":               NOSQLLOGIN,
+	"EXECUTE":                  EXECUTE,
+	"VIEWCLUSTERMETADATA":      VIEWCLUSTERMETADATA,
+	"VIEWDEBUG":                VIEWDEBUG,
+	"BACKUP":                   BACKUP,
+	"RESTORE":                  RESTORE,
+	"EXTERNALIOIMPLICITACCESS": EXTERNALIOIMPLICITACCESS,
 }
 
 // List is a list of privileges.
@@ -360,7 +364,8 @@ var orderedPrivs = List{CREATE, USAGE, INSERT, CONNECT, DELETE, SELECT, UPDATE, 
 // ListToACL converts a list of privileges to a list of Postgres
 // ACL items.
 // See: https://www.postgresql.org/docs/13/ddl-priv.html#PRIVILEGE-ABBREVS-TABLE
-//     for privileges and their ACL abbreviations.
+//
+//	for privileges and their ACL abbreviations.
 func (pl List) ListToACL(grantOptions List, objectType ObjectType) string {
 	privileges := pl
 	// If ALL is present, explode ALL into the underlying privileges.

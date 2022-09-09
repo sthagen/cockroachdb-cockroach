@@ -20,7 +20,6 @@ import { Button } from "src/button";
 import { Loading } from "src/loading";
 import { SqlBox, SqlBoxSize } from "src/sql";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
-import { Duration } from "src/util";
 import { DATE_FORMAT_24_UTC } from "src/util/format";
 import { getMatchParamByName } from "src/util/query";
 import {
@@ -28,15 +27,15 @@ import {
   WaitTimeInsightsPanel,
 } from "src/detailsPanels/waitTimeInsightsPanel";
 import {
-  InsightEventDetailsRequest,
-  InsightEventDetailsResponse,
+  TransactionInsightEventDetailsRequest,
+  TransactionInsightEventDetailsResponse,
 } from "src/api";
 import {
   InsightsSortedTable,
   makeInsightsColumns,
 } from "src/insightsTable/insightsTable";
 import { WaitTimeDetailsTable } from "./insightDetailsTables";
-import { getInsightEventDetailsFromState } from "../utils";
+import { getTransactionInsightEventDetailsFromState } from "../utils";
 import {
   EventExecution,
   InsightNameEnum,
@@ -52,12 +51,14 @@ import { InsightsError } from "../insightsErrorComponent";
 const tableCx = classNames.bind(insightTableStyles);
 
 export interface TransactionInsightDetailsStateProps {
-  insightEventDetails: InsightEventDetailsResponse;
+  insightEventDetails: TransactionInsightEventDetailsResponse;
   insightError: Error | null;
 }
 
 export interface TransactionInsightDetailsDispatchProps {
-  refreshInsightDetails: (req: InsightEventDetailsRequest) => void;
+  refreshTransactionInsightDetails: (
+    req: TransactionInsightEventDetailsRequest,
+  ) => void;
 }
 
 export type TransactionInsightDetailsProps =
@@ -71,7 +72,7 @@ export class TransactionInsightDetails extends React.Component<TransactionInsigh
   }
 
   private refresh(): void {
-    this.props.refreshInsightDetails({
+    this.props.refreshTransactionInsightDetails({
       id: getMatchParamByName(this.props.match, "id"),
     });
   }
@@ -87,21 +88,13 @@ export class TransactionInsightDetails extends React.Component<TransactionInsigh
   prevPage = (): void => this.props.history.goBack();
 
   renderContent = (): React.ReactElement => {
-    const insightDetails = getInsightEventDetailsFromState(
+    const insightDetails = getTransactionInsightEventDetailsFromState(
       this.props.insightEventDetails,
     );
     if (!insightDetails) {
       return null;
     }
-    const insightQueries = insightDetails.queries
-      .map((query, idx) => {
-        if (idx != 0) {
-          return "\n" + query;
-        } else {
-          return query;
-        }
-      })
-      .toString();
+    const insightQueries = insightDetails.queries.join("");
     const isCockroachCloud = useContext(CockroachCloudContext);
     const insightsColumns = makeInsightsColumns(isCockroachCloud);
 
@@ -110,9 +103,9 @@ export class TransactionInsightDetails extends React.Component<TransactionInsigh
       let rec: InsightRecommendation;
       insightDetails.insights.forEach(insight => {
         switch (insight.name) {
-          case InsightNameEnum.highContentionTime:
+          case InsightNameEnum.highContention:
             rec = {
-              type: "HighContentionTime",
+              type: "HighContention",
               details: {
                 duration: insightDetails.elapsedTime,
                 description: insight.description,
@@ -126,11 +119,11 @@ export class TransactionInsightDetails extends React.Component<TransactionInsigh
     }
 
     const tableData = insightsTableData();
-    const waitingExecutions: EventExecution[] = [
+    const blockingExecutions: EventExecution[] = [
       {
-        executionID: insightDetails.waitingExecutionID,
-        fingerprintID: insightDetails.waitingFingerprintID,
-        queries: insightDetails.waitingQueries,
+        executionID: insightDetails.blockingExecutionID,
+        fingerprintID: insightDetails.blockingFingerprintID,
+        queries: insightDetails.blockingQueries,
         startTime: insightDetails.startTime,
         elapsedTime: insightDetails.elapsedTime,
         execType: insightDetails.execType,
@@ -150,10 +143,6 @@ export class TransactionInsightDetails extends React.Component<TransactionInsigh
                 <SummaryCardItem
                   label="Start Time"
                   value={insightDetails.startTime.format(DATE_FORMAT_24_UTC)}
-                />
-                <SummaryCardItem
-                  label="Elapsed Time"
-                  value={Duration(insightDetails.elapsedTime * 1e6)}
                 />
               </SummaryCard>
             </Col>
@@ -187,14 +176,14 @@ export class TransactionInsightDetails extends React.Component<TransactionInsigh
             <Col>
               <Row>
                 <Heading type="h5">
-                  {WaitTimeInsightsLabels.WAITING_TXNS_TABLE_TITLE(
+                  {WaitTimeInsightsLabels.BLOCKED_TXNS_TABLE_TITLE(
                     insightDetails.executionID,
                     insightDetails.execType,
                   )}
                 </Heading>
                 <div className={tableCx("margin-bottom-large")}>
                   <WaitTimeDetailsTable
-                    data={waitingExecutions}
+                    data={blockingExecutions}
                     execType={insightDetails.execType}
                   />
                 </div>

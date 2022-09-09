@@ -230,14 +230,6 @@ upsert descriptor #104
      families:
      - columnIds:
   ...
-     id: 104
-     indexes: []
-  -  modificationTime: {}
-  +  modificationTime:
-  +    wallTime: "1640995200000000001"
-     mutations:
-     - column:
-  ...
 create job #1 (non-cancelable: false): "ALTER TABLE defaultdb.public.t DROP COLUMN j CASCADE; CREATE UNIQUE INDEX idx ON defaultdb.public.t (k)"
   descriptor IDs: [104]
 # end PreCommitPhase
@@ -457,6 +449,7 @@ upsert descriptor #104
   +  - direction: ADD
   +    index:
   +      constraintId: 4
+  +      createdAtNanos: "1640998800000000000"
   +      createdExplicitly: true
   +      foreignKey: {}
   +      geoConfig: {}
@@ -670,6 +663,7 @@ upsert descriptor #104
   -    wallTime: "1640995200000000016"
   +  indexes:
   +  - constraintId: 4
+  +    createdAtNanos: "1640998800000000000"
   +    createdExplicitly: true
   +    foreignKey: {}
   +    geoConfig: {}
@@ -731,7 +725,8 @@ upsert descriptor #104
   +  - direction: DROP
        index:
          constraintId: 4
-  ...
+  -      createdAtNanos: "1640998800000000000"
+         createdExplicitly: true
          foreignKey: {}
          geoConfig: {}
   -      id: 5

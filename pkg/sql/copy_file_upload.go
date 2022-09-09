@@ -90,7 +90,7 @@ func newFileUploadMachine(
 	c := &copyMachine{
 		conn: conn,
 		// The planner will be prepared before use.
-		p: &planner{execCfg: execCfg, alloc: &tree.DatumAlloc{}},
+		p: &planner{execCfg: execCfg},
 	}
 	f = &fileUploadMachine{
 		c: c,
@@ -171,6 +171,9 @@ func CopyInFileStmt(destination, schema, table string) string {
 }
 
 func (f *fileUploadMachine) numInsertedRows() int {
+	if f == nil {
+		return 0
+	}
 	return f.c.numInsertedRows()
 }
 

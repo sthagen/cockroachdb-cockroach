@@ -8,7 +8,11 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { executeSql, SqlExecutionRequest, SqlTxnResult } from "./sqlApi";
+import {
+  SqlExecutionRequest,
+  SqlTxnResult,
+  executeInternalSql,
+} from "./sqlApi";
 import {
   InsightRecommendation,
   InsightType,
@@ -60,7 +64,7 @@ function clusterIndexUsageStatsToSchemaInsight(
       const key = row.table_id.toString() + row.index_id.toString();
       if (!results[key]) {
         results[key] = {
-          type: "DROP_INDEX",
+          type: "DropIndex",
           database: row.database_name,
           query: `DROP INDEX ${row.table_name}@${row.index_name};`,
           indexDetails: {
@@ -90,13 +94,16 @@ function createIndexRecommendationsToSchemaInsight(
       let idxType: InsightType;
       switch (recType) {
         case "creation":
-          idxType = "CREATE_INDEX";
+          idxType = "CreateIndex";
           break;
         case "replacement":
-          idxType = "REPLACE_INDEX";
+          idxType = "ReplaceIndex";
           break;
         case "drop":
-          idxType = "DROP_INDEX";
+          idxType = "DropIndex";
+          break;
+        case "alteration":
+          idxType = "AlterIndex";
           break;
       }
 
@@ -117,7 +124,7 @@ function createIndexRecommendationsToSchemaInsight(
 }
 
 const dropUnusedIndexQuery: SchemaInsightQuery<ClusterIndexUsageStatistic> = {
-  name: "DROP_INDEX",
+  name: "DropIndex",
   query: `SELECT
             us.table_id,
             us.index_id,
@@ -137,7 +144,7 @@ const dropUnusedIndexQuery: SchemaInsightQuery<ClusterIndexUsageStatistic> = {
 
 const createIndexRecommendationsQuery: SchemaInsightQuery<CreateIndexRecommendationsResponse> =
   {
-    name: "CREATE_INDEX",
+    name: "CreateIndex",
     query: `SELECT
        encode(fingerprint_id, 'hex') AS fingerprint_id,  
        metadata ->> 'db' AS db, 
@@ -175,7 +182,7 @@ export function getSchemaInsights(): Promise<InsightRecommendation[]> {
     })),
     execute: true,
   };
-  return executeSql<SchemaInsightResponse>(request).then(result => {
+  return executeInternalSql<SchemaInsightResponse>(request).then(result => {
     const results: InsightRecommendation[] = [];
     if (result.execution.txn_results.length === 0) {
       // No data.

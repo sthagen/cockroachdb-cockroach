@@ -23,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudprivilege"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -34,8 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/doctor"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
@@ -46,36 +47,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
-
-func checkShowBackupURIPrivileges(ctx context.Context, p sql.PlanHookState, uris []string) error {
-	for _, uri := range uris {
-		conf, err := cloud.ExternalStorageConfFromURI(uri, p.User())
-		if err != nil {
-			return err
-		}
-		if conf.AccessIsWithExplicitAuth() {
-			continue
-		}
-		if p.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound {
-			continue
-		}
-		hasAdmin, err := p.HasAdminRole(ctx)
-		if err != nil {
-			return err
-		}
-		if !hasAdmin {
-			return pgerror.Newf(
-				pgcode.InsufficientPrivilege,
-				"only users with the admin role are allowed to SHOW BACKUP from the specified %s URI",
-				conf.Provider.String())
-		}
-	}
-	return nil
-}
 
 type backupInfoReader interface {
 	showBackup(
@@ -112,6 +88,9 @@ func (m manifestInfoReader) showBackup(
 	kmsEnv cloud.KMSEnv,
 	resultsCh chan<- tree.Datums,
 ) error {
+	ctx, sp := tracing.ChildSpan(ctx, "backupccl.showBackup")
+	defer sp.Finish()
+
 	var memReserved int64
 
 	defer func() {
@@ -254,6 +233,9 @@ func showBackupPlanHook(
 			shower = backupShowerFileSetup(backup.InCollection)
 		case tree.BackupSchemaDetails:
 			shower = backupShowerDefault(p, true, opts)
+		case tree.BackupValidateDetails:
+			shower = backupShowerDoctor
+
 		default:
 			shower = backupShowerDefault(p, false, opts)
 		}
@@ -294,7 +276,7 @@ func showBackupPlanHook(
 					"https://www.cockroachlabs.com/docs/stable/show-backup.html"))
 		}
 
-		if err := checkShowBackupURIPrivileges(ctx, p, dest); err != nil {
+		if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, dest); err != nil {
 			return err
 		}
 
@@ -422,10 +404,20 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 		info.subdir = computedSubdir
 
 		mkStore := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI
+		incStores, cleanupFn, err := backupdest.MakeBackupDestinationStores(ctx, p.User(), mkStore,
+			fullyResolvedIncrementalsDirectory)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cleanupFn(); err != nil {
+				log.Warningf(ctx, "failed to close incremental store: %+v", err)
+			}
+		}()
 
 		info.defaultURIs, info.manifests, info.localityInfo, memReserved,
 			err = backupdest.ResolveBackupManifests(
-			ctx, &mem, baseStores, mkStore, fullyResolvedDest,
+			ctx, &mem, baseStores, incStores, mkStore, fullyResolvedDest,
 			fullyResolvedIncrementalsDirectory, hlc.Timestamp{}, encryption, &kmsEnv, p.User())
 		defer func() {
 			mem.Shrink(ctx, memReserved)
@@ -528,6 +520,10 @@ func checkBackupFiles(
 			backupinfo.MetadataSSTName,
 			backupbase.BackupManifestName + backupinfo.BackupManifestChecksumSuffix} {
 			if _, err := defaultStore.Size(ctx, metaFile); err != nil {
+				if metaFile == backupinfo.FileInfoPath || metaFile == backupinfo.MetadataSSTName {
+					log.Warningf(ctx, `%v not found. This is only relevant if kv.bulkio.write_metadata_sst.enabled = true`, metaFile)
+					continue
+				}
 				return nil, errors.Wrapf(err, "Error checking metadata file %s/%s",
 					info.defaultURIs[layer], metaFile)
 			}
@@ -666,6 +662,9 @@ func backupShowerDefault(
 	return backupShower{
 		header: backupShowerHeaders(showSchemas, opts),
 		fn: func(ctx context.Context, info backupInfo) ([]tree.Datums, error) {
+			ctx, sp := tracing.ChildSpan(ctx, "backupccl.backupShowerDefault.fn")
+			defer sp.Finish()
+
 			var rows []tree.Datums
 			for layer, manifest := range info.manifests {
 				// Map database ID to descriptor name.
@@ -1018,6 +1017,69 @@ var backupShowerRanges = backupShower{
 	},
 }
 
+var backupShowerDoctor = backupShower{
+	header: colinfo.ResultColumns{
+		{Name: "validation_status", Typ: types.String},
+	},
+
+	fn: func(ctx context.Context, info backupInfo) (rows []tree.Datums, err error) {
+		var descTable doctor.DescriptorTable
+		var namespaceTable doctor.NamespaceTable
+		// Extract all the descriptors from the given manifest and generate the
+		// namespace and descriptor tables needed by doctor.
+		descriptors, _ := backupinfo.LoadSQLDescsFromBackupsAtTime(info.manifests, hlc.Timestamp{})
+		for _, desc := range descriptors {
+			builder := desc.NewBuilder()
+			mutDesc := builder.BuildCreatedMutable()
+			bytes, err := protoutil.Marshal(mutDesc.DescriptorProto())
+			if err != nil {
+				return nil, err
+			}
+			descTable = append(descTable,
+				doctor.DescriptorTableRow{
+					ID:        int64(desc.GetID()),
+					DescBytes: bytes,
+					ModTime:   desc.GetModificationTime(),
+				})
+			namespaceTable = append(namespaceTable,
+				doctor.NamespaceTableRow{
+					ID: int64(desc.GetID()),
+					NameInfo: descpb.NameInfo{
+						Name:           desc.GetName(),
+						ParentID:       desc.GetParentID(),
+						ParentSchemaID: desc.GetParentSchemaID(),
+					},
+				})
+		}
+		validationMessages := strings.Builder{}
+		// We will intentionally not validate any jobs inside the manifest, since
+		// these will be synthesized by the restore process.
+		cv := clusterversion.DoctorBinaryVersion
+		if len(info.manifests) > 0 {
+			cv = info.manifests[len(info.manifests)-1].ClusterVersion
+		}
+		ok, err := doctor.Examine(ctx,
+			clusterversion.ClusterVersion{Version: cv},
+			descTable, namespaceTable,
+			nil,
+			false, /*validateJobs*/
+			false,
+			&validationMessages)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			validationMessages.WriteString("ERROR: validation failed\n")
+		} else {
+			validationMessages.WriteString("No problems found!\n")
+		}
+		rows = append(rows, tree.Datums{
+			tree.NewDString(validationMessages.String()),
+		})
+		return rows, nil
+	},
+}
+
 func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
 	return backupShower{header: colinfo.ResultColumns{
 		{Name: "path", Typ: types.String},
@@ -1199,7 +1261,7 @@ func showBackupsInCollectionPlanHook(
 			return err
 		}
 
-		if err := checkShowBackupURIPrivileges(ctx, p, collection); err != nil {
+		if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, collection); err != nil {
 			return err
 		}
 
@@ -1221,5 +1283,5 @@ func showBackupsInCollectionPlanHook(
 }
 
 func init() {
-	sql.AddPlanHook("show backup", showBackupPlanHook)
+	sql.AddPlanHook("backupccl.showBackupPlanHook", showBackupPlanHook)
 }

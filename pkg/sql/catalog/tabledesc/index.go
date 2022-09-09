@@ -130,6 +130,24 @@ func (w index) GetPartitioning() catalog.Partitioning {
 	return &partitioning{desc: &w.desc.Partitioning}
 }
 
+// PartitioningColumnCount is how large of a prefix of the columns in an index
+// are used in the function mapping column values to partitions. If this is a
+// subpartition, this is offset to start from the end of the parent partition's
+// columns. If PartitioningColumnCount is 0, then there is no partitioning.
+func (w index) PartitioningColumnCount() int {
+	return int(w.desc.Partitioning.NumColumns)
+}
+
+// ImplicitPartitioningColumnCount specifies the number of columns that
+// implicitly prefix a given index. This occurs if a user specifies a PARTITION
+// BY which is not a prefix of the given index, in which case the KeyColumnIDs
+// are added in front of the index and this field denotes the number of columns
+// added as a prefix. If ImplicitPartitioningColumnCount is 0, no implicit
+// columns are defined for the index.
+func (w index) ImplicitPartitioningColumnCount() int {
+	return int(w.desc.Partitioning.NumImplicitColumns)
+}
+
 // ExplicitColumnStartIdx returns the first index in which the column is
 // explicitly part of the index.
 func (w index) ExplicitColumnStartIdx() int {
@@ -140,6 +158,13 @@ func (w index) ExplicitColumnStartIdx() int {
 // a foreign key constraint with the provided set of originColIDs.
 func (w index) IsValidOriginIndex(originColIDs descpb.ColumnIDs) bool {
 	return w.desc.IsValidOriginIndex(originColIDs)
+}
+
+// IsHelpfulOriginIndex returns whether the index may be a helpful index for
+// performing foreign key checks and cascades for a foreign key with the given
+// origin columns.
+func (w index) IsHelpfulOriginIndex(originColIDs descpb.ColumnIDs) bool {
+	return w.desc.IsHelpfulOriginIndex(originColIDs)
 }
 
 // IsValidReferencedUniqueConstraint returns whether the index can serve as a
@@ -370,10 +395,9 @@ func (w index) UseDeletePreservingEncoding() bool {
 // ForcePut returns true if writes to the index should only use Put (rather than
 // CPut or InitPut). This is used by:
 //
-//  * indexes currently being built by the MVCC-compliant index backfiller, and
-//  * the temporary indexes that support that process, and
-//  * old primary indexes which are being dropped.
-//
+//   - indexes currently being built by the MVCC-compliant index backfiller, and
+//   - the temporary indexes that support that process, and
+//   - old primary indexes which are being dropped.
 func (w index) ForcePut() bool {
 	return w.Merging() || w.desc.UseDeletePreservingEncoding ||
 		w.Dropped() && w.IsUnique() && w.GetEncodingType() == descpb.PrimaryIndexEncoding

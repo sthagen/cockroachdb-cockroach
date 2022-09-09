@@ -433,7 +433,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 			evalCtx.Settings,
 			disallowShadowingBelow,
 			writeAtBatchTS,
-			false, /* splitFilledRanges */
+			false, /* scatterSplitRanges */
 			rd.flowCtx.Cfg.BackupMonitor.MakeBoundAccount(),
 			rd.flowCtx.Cfg.BulkSenderLimiter,
 		)
@@ -464,7 +464,15 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		valueScratch = append(valueScratch[:0], iter.UnsafeValue()...)
 		value := roachpb.Value{RawBytes: valueScratch}
 
-		key.Key, ok, err = kr.RewriteKey(key.Key)
+		key.Key, ok, err = kr.RewriteKey(key.Key, key.Timestamp.WallTime)
+
+		if errors.Is(err, ErrImportingKeyError) {
+			// The keyRewriter returns ErrImportingKeyError iff the key is part of an
+			// in-progress import. Keys from in-progress imports never get restored,
+			// since the key's table gets restored to its pre-import state. Therefore,
+			// elide ingesting this key.
+			continue
+		}
 		if err != nil {
 			return summary, err
 		}

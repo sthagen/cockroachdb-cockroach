@@ -2664,7 +2664,9 @@ func TestMVCCReverseScanSeeksOverRepeatedKeys(t *testing.T) {
 // The bug happened in this scenario.
 // (1) reverse scan is positioned at the range's smallest key and calls `prevKey()`
 // (2) `prevKey()` peeks and sees newer versions of the same logical key
-//     `iters_before_seek_-1` times, moving the iterator backwards each time
+//
+//	`iters_before_seek_-1` times, moving the iterator backwards each time
+//
 // (3) on the `iters_before_seek_`th peek, there are no previous keys found
 //
 // Then, the problem was `prevKey()` treated finding no previous key as if it had found a
@@ -4767,6 +4769,7 @@ func TestMVCCGarbageCollect(t *testing.T) {
 				{roachpb.Key("r-2"), []roachpb.Value{val1}, false},
 				{roachpb.Key("r-3"), []roachpb.Value{val1}, false},
 				{roachpb.Key("r-4"), []roachpb.Value{val1}, false},
+				{roachpb.Key("r-6"), []roachpb.Value{val1}, true},
 				{roachpb.Key("t"), []roachpb.Value{val1}, false},
 			}
 
@@ -4840,6 +4843,8 @@ func TestMVCCGarbageCollect(t *testing.T) {
 				// This is a non-existing key that needs to skip gracefully without
 				// distorting stats. Checking that absence of next key is handled.
 				{Key: roachpb.Key("r-5"), Timestamp: ts4},
+				// Delete key covered by range delete key.
+				{Key: roachpb.Key("r-6"), Timestamp: ts4},
 
 				{Key: roachpb.Key("t"), Timestamp: ts4},
 			}
@@ -5955,6 +5960,7 @@ func TestMVCCGarbageCollectClearRange(t *testing.T) {
 				LowerBound: rangeStart,
 				UpperBound: rangeEnd,
 			})
+			defer it.Close()
 			expMs, err := ComputeStatsForIter(it, tsMax.WallTime)
 			require.NoError(t, err, "failed to compute stats for range")
 			require.EqualValues(t, expMs, ms, "computed range stats vs gc'd")

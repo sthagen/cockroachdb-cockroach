@@ -243,6 +243,7 @@ go_library(
         "type_change.go",
         "unary.go",
         "union.go",
+        "unlisten.go",
         "unsplit.go",
         "unsupported_vars.go",
         "update.go",
@@ -341,6 +342,7 @@ go_library(
         "//pkg/sql/catalog/typedesc",
         "//pkg/sql/clusterunique",
         "//pkg/sql/colexec",
+        "//pkg/sql/colfetcher",
         "//pkg/sql/colflow",
         "//pkg/sql/contention",
         "//pkg/sql/contention/txnidcache",
@@ -632,6 +634,7 @@ go_test(
         "zone_config_test.go",
         "zone_test.go",
     ],
+    args = ["-test.timeout=3595s"],
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql:information_schema.go",

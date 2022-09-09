@@ -615,14 +615,14 @@ func (c *conn) serveImpl(
 //
 // Args:
 // ac: An interface used by the authentication process to receive password data
-//   and to ultimately declare the authentication successful.
+// and to ultimately declare the authentication successful.
 // reserved: Reserved memory. This method takes ownership and guarantees that it
-//   will be closed when this function returns.
+// will be closed when this function returns.
 // cancelConn: A function to be called when this goroutine exits. Its goal is to
-//   cancel the connection's context, thus stopping the connection's goroutine.
-//   The returned channel is also closed before this goroutine dies, but the
-//   connection's goroutine is not expected to be reading from that channel
-//   (instead, it's expected to always be monitoring the network connection).
+// cancel the connection's context, thus stopping the connection's goroutine.
+// The returned channel is also closed before this goroutine dies, but the
+// connection's goroutine is not expected to be reading from that channel
+// (instead, it's expected to always be monitoring the network connection).
 func (c *conn) processCommandsAsync(
 	ctx context.Context,
 	authOpt authOptions,
@@ -860,7 +860,18 @@ func (c *conn) handleSimpleQuery(
 			}
 			copyDone := sync.WaitGroup{}
 			copyDone.Add(1)
-			if err := c.stmtBuf.Push(ctx, sql.CopyIn{Conn: c, Stmt: cp, CopyDone: &copyDone}); err != nil {
+			if err := c.stmtBuf.Push(
+				ctx,
+				sql.CopyIn{
+					Conn:         c,
+					ParsedStmt:   stmts[i],
+					Stmt:         cp,
+					CopyDone:     &copyDone,
+					TimeReceived: timeReceived,
+					ParseStart:   startParse,
+					ParseEnd:     endParse,
+				},
+			); err != nil {
 				return err
 			}
 			copyDone.Wait()
@@ -1300,8 +1311,10 @@ func cookTag(
 		tag = strconv.AppendInt(tag, int64(rowsAffected), 10)
 
 	case tree.Rows:
-		tag = append(tag, ' ')
-		tag = strconv.AppendUint(tag, uint64(rowsAffected), 10)
+		if tagStr != "SHOW" {
+			tag = append(tag, ' ')
+			tag = strconv.AppendUint(tag, uint64(rowsAffected), 10)
+		}
 
 	case tree.Ack, tree.DDL:
 		if tagStr == "SELECT" {

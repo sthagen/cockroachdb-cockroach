@@ -48,8 +48,9 @@ type createIndexNode struct {
 
 // CreateIndex creates an index.
 // Privileges: CREATE on table.
-//   notes: postgres requires CREATE on the table.
-//          mysql requires INDEX on the table.
+//
+//	notes: postgres requires CREATE on the table.
+//	       mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
@@ -741,7 +742,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 	// Avoid the warning if we have PARTITION ALL BY as all indexes will implicitly
 	// have relevant partitioning columns prepended at the front.
 	if n.n.PartitionByIndex == nil &&
-		n.tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns() > 0 &&
+		n.tableDesc.GetPrimaryIndex().PartitioningColumnCount() > 0 &&
 		!n.tableDesc.IsPartitionAllBy() {
 		params.p.BufferClientNotice(
 			params.ctx,

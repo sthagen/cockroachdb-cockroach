@@ -21,6 +21,7 @@ go_library(
         "//pkg/cmd/roachtest/cluster",
         "//pkg/cmd/roachtest/option",
         "//pkg/cmd/roachtest/registry",
+        "//pkg/cmd/roachtest/roachtestutil",
         "//pkg/cmd/roachtest/spec",
         "//pkg/cmd/roachtest/test",
         "//pkg/cmd/roachtest/tests",
@@ -68,6 +69,7 @@ go_test(
         "test_registry_test.go",
         "test_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":roachtest_lib"],
     deps = [
         "//pkg/cmd/roachtest/cluster",

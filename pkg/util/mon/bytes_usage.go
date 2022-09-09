@@ -252,22 +252,23 @@ var DefaultPoolAllocationSize = envutil.EnvOrDefaultInt64("COCKROACH_ALLOCATION_
 
 // NewMonitor creates a new monitor.
 // Arguments:
-// - name is used to annotate log messages, can be used to distinguish
-//   monitors.
 //
-// - resource specifies what kind of resource the monitor is tracking
-//   allocations for (e.g. memory or disk).
+//   - name is used to annotate log messages, can be used to distinguish
+//     monitors.
 //
-// - curCount and maxHist are the metric objects to update with usage
-//   statistics. Can be nil.
+//   - resource specifies what kind of resource the monitor is tracking
+//     allocations for (e.g. memory or disk).
 //
-// - increment is the block size used for upstream allocations from
-//   the pool. Note: if set to 0 or lower, the default pool allocation
-//   size is used.
+//   - curCount and maxHist are the metric objects to update with usage
+//     statistics. Can be nil.
 //
-// - noteworthy determines the minimum total allocated size beyond
-//   which the monitor starts to log increases. Use 0 to always log
-//   or math.MaxInt64 to never log.
+//   - increment is the block size used for upstream allocations from
+//     the pool. Note: if set to 0 or lower, the default pool allocation
+//     size is used.
+//
+//   - noteworthy determines the minimum total allocated size beyond
+//     which the monitor starts to log increases. Use 0 to always log
+//     or math.MaxInt64 to never log.
 func NewMonitor(
 	name redact.RedactableString,
 	res Resource,
@@ -339,16 +340,20 @@ func NewMonitorInheritWithLimit(
 	)
 }
 
+// noReserved is safe to be used by multiple monitors as the "reserved" account
+// since only its 'used' field will ever be read.
+var noReserved = BoundAccount{}
+
 // StartNoReserved is the same as Start when there is no pre-reserved budget.
 func (mm *BytesMonitor) StartNoReserved(ctx context.Context, pool *BytesMonitor) {
-	mm.Start(ctx, pool, &BoundAccount{})
+	mm.Start(ctx, pool, &noReserved)
 }
 
 // Start begins a monitoring region.
 // Arguments:
-// - pool is the upstream monitor that provision allocations exceeding the
-//   pre-reserved budget. If pool is nil, no upstream allocations are possible
-//   and the pre-reserved budget determines the entire capacity of this monitor.
+//   - pool is the upstream monitor that provision allocations exceeding the
+//     pre-reserved budget. If pool is nil, no upstream allocations are possible
+//     and the pre-reserved budget determines the entire capacity of this monitor.
 //
 // - reserved is the pre-reserved budget (see above).
 func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved *BoundAccount) {
@@ -459,7 +464,9 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 	mm.mu.curBudget.mon = nil
 
 	// Release the reserved budget to its original pool, if any.
-	mm.reserved.Clear(ctx)
+	if mm.reserved != &noReserved {
+		mm.reserved.Clear(ctx)
+	}
 }
 
 // MaximumBytes returns the maximum number of bytes that were allocated by this

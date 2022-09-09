@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -154,6 +155,7 @@ var sqlPerfInternalLogger log.ChannelLogger = log.SqlInternalPerf
 func (p *planner) maybeLogStatement(
 	ctx context.Context,
 	execType executorType,
+	isCopy bool,
 	numRetries, txnCounter, rows int,
 	err error,
 	queryReceived time.Time,
@@ -162,12 +164,13 @@ func (p *planner) maybeLogStatement(
 	stmtFingerprintID roachpb.StmtFingerprintID,
 	queryStats *topLevelQueryStats,
 ) {
-	p.maybeLogStatementInternal(ctx, execType, numRetries, txnCounter, rows, err, queryReceived, hasAdminRoleCache, telemetryLoggingMetrics, stmtFingerprintID, queryStats)
+	p.maybeLogStatementInternal(ctx, execType, isCopy, numRetries, txnCounter, rows, err, queryReceived, hasAdminRoleCache, telemetryLoggingMetrics, stmtFingerprintID, queryStats)
 }
 
 func (p *planner) maybeLogStatementInternal(
 	ctx context.Context,
 	execType executorType,
+	isCopy bool,
 	numRetries, txnCounter, rows int,
 	err error,
 	startTime time.Time,
@@ -373,6 +376,7 @@ func (p *planner) maybeLogStatementInternal(
 				// see a copy of the execution on the DEV Channel.
 				dst:               LogExternally | LogToDevChannelIfVerbose,
 				verboseTraceLevel: execType.vLevel(),
+				isCopy:            isCopy,
 			},
 			&eventpb.QueryExecute{CommonSQLExecDetails: execDetails})
 	}
@@ -385,19 +389,19 @@ func (p *planner) maybeLogStatementInternal(
 		// We only log to the telemetry channel if enough time has elapsed from
 		// the last event emission.
 		requiredTimeElapsed := 1.0 / float64(maxEventFrequency)
-		_, tracingEnabled := p.curPlan.instrumentation.Tracing()
+		tracingEnabled := telemetryMetrics.isTracing(p.curPlan.instrumentation.Tracing())
 		// Always sample if the current statement is not of type DML or tracing
 		// is enabled for this statement.
 		if p.stmt.AST.StatementType() != tree.TypeDML || tracingEnabled {
 			requiredTimeElapsed = 0
 		}
 		if telemetryMetrics.maybeUpdateLastEmittedTime(telemetryMetrics.timeNow(), requiredTimeElapsed) {
-			var contentionNanos int64
+			var stats execstats.QueryLevelStats
 			if queryLevelStats, ok := p.instrumentation.GetQueryLevelStats(); ok {
-				contentionNanos = queryLevelStats.ContentionTime.Nanoseconds()
+				stats = *queryLevelStats
 			}
 
-			contentionNanos = telemetryMetrics.getContentionTime(contentionNanos)
+			stats = telemetryMetrics.getQueryLevelStats(stats)
 
 			skippedQueries := telemetryMetrics.resetSkippedQueryCount()
 			sampledQuery := eventpb.SampledQuery{
@@ -434,8 +438,14 @@ func (p *planner) maybeLogStatementInternal(
 				InvertedJoinCount:        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.InvertedJoin]),
 				ApplyJoinCount:           int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ApplyJoin]),
 				ZigZagJoinCount:          int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ZigZagJoin]),
-				ContentionNanos:          contentionNanos,
+				ContentionNanos:          stats.ContentionTime.Nanoseconds(),
 				Regions:                  p.curPlan.instrumentation.regions,
+				NetworkBytesSent:         stats.NetworkBytesSent,
+				MaxMemUsage:              stats.MaxMemUsage,
+				MaxDiskUsage:             stats.MaxDiskUsage,
+				KVBytesRead:              stats.KVBytesRead,
+				KVRowsRead:               stats.KVRowsRead,
+				NetworkMessages:          stats.NetworkMessages,
 			}
 			p.logOperationalEventsOnlyExternally(ctx, &sampledQuery)
 		} else {

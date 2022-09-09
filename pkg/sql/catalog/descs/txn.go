@@ -138,6 +138,10 @@ func (cf *CollectionFactory) TxnWithExecutor(
 				}
 			} else {
 				_, err := cf.leaseMgr.WaitForOneVersion(ctx, ld.ID, retryOpts)
+				// If the descriptor has been deleted, just wait for leases to drain.
+				if errors.Is(err, catalog.ErrDescriptorNotFound) {
+					err = cf.leaseMgr.WaitForNoVersion(ctx, ld.ID, retryOpts)
+				}
 				if err != nil {
 					return err
 				}
@@ -292,14 +296,9 @@ func CheckSpanCountLimit(
 	if !descsCol.codec().ForSystemTenant() {
 		var totalSpanCountDelta int
 		for _, ut := range descsCol.GetUncommittedTables() {
-			uncommittedMutTable, err := descsCol.GetUncommittedMutableTableByID(ut.GetID())
+			originalTableDesc, uncommittedMutTable, err := descsCol.GetUncommittedMutableTableByID(ut.GetID())
 			if err != nil {
 				return err
-			}
-
-			var originalTableDesc catalog.TableDescriptor
-			if originalDesc := uncommittedMutTable.OriginalDescriptor(); originalDesc != nil {
-				originalTableDesc = originalDesc.(catalog.TableDescriptor)
 			}
 			delta, err := spanconfig.Delta(ctx, splitter, originalTableDesc, uncommittedMutTable)
 			if err != nil {

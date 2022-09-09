@@ -26,7 +26,7 @@ import (
 // Catalog is used to store an in-memory copy of the whole catalog, or a portion
 // thereof.
 type Catalog struct {
-	underlying Map
+	underlying NameMap
 	byteSize   int64
 }
 
@@ -199,7 +199,7 @@ func (c Catalog) ValidateWithRecover(
 			ve = append(ve, err)
 		}
 	}()
-	return c.Validate(ctx, version, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, desc)
+	return c.Validate(ctx, version, catalog.NoValidationTelemetry, validate.Write, desc)
 }
 
 // ByteSize returns memory usage of the underlying map in bytes.

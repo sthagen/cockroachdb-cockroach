@@ -291,6 +291,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Stuck Rangefeeds",
+				Metrics: []string{
+					"distsender.rangefeed.restart_stuck",
+				},
+			},
+			{
 				Title: "RPCs",
 				Metrics: []string{
 					"distsender.rpc.sent.local",
@@ -1477,6 +1483,18 @@ var charts = []sectionDescription{
 					"changefeed.flush.messages_pushback_nanos",
 				},
 			},
+			{
+				Title: "Batching",
+				Metrics: []string{
+					"changefeed.batch_reduction_count",
+				},
+			},
+			{
+				Title: "Internal Retries",
+				Metrics: []string{
+					"changefeed.internal_retry_message_count",
+				},
+			},
 		},
 	},
 	{
@@ -1897,6 +1915,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Send Queue Messages Count",
 				Metrics: []string{"raft.transport.send-queue-size"},
+			},
+			{
+				Title:   "Send Queue Byte Size",
+				Metrics: []string{"raft.transport.send-queue-bytes"},
 			},
 			{
 				Title:   "Raft Message Sends Dropped",

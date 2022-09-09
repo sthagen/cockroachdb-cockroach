@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudprivilege"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -275,6 +275,9 @@ func allocateDescriptorRewrites(
 		}
 	}
 
+	var shouldBufferDeprecatedPrivilegeNotice bool
+	databasesWithDeprecatedPrivileges := make(map[string]struct{})
+
 	// Fail fast if the necessary databases don't exist or are otherwise
 	// incompatible with this restore.
 	if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
@@ -309,8 +312,11 @@ func allocateDescriptorRewrites(
 				if err != nil {
 					return err
 				}
-				if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
+				if usesDeprecatedPrivileges, err := checkRestorePrivilegesOnDatabase(ctx, p, parentDB); err != nil {
 					return err
+				} else if usesDeprecatedPrivileges {
+					shouldBufferDeprecatedPrivilegeNotice = true
+					databasesWithDeprecatedPrivileges[parentDB.GetName()] = struct{}{}
 				}
 
 				// See if there is an existing schema with the same name.
@@ -378,8 +384,11 @@ func allocateDescriptorRewrites(
 					return errors.Wrapf(err,
 						"failed to lookup parent DB %d", errors.Safe(parentID))
 				}
-				if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
+				if usesDeprecatedPrivileges, err := checkRestorePrivilegesOnDatabase(ctx, p, parentDB); err != nil {
 					return err
+				} else if usesDeprecatedPrivileges {
+					shouldBufferDeprecatedPrivilegeNotice = true
+					databasesWithDeprecatedPrivileges[parentDB.GetName()] = struct{}{}
 				}
 
 				// We're restoring a table and not its parent database. We may block
@@ -465,8 +474,11 @@ func allocateDescriptorRewrites(
 					// need to create the type.
 
 					// Ensure that the user has the correct privilege to create types.
-					if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
+					if usesDeprecatedPrivileges, err := checkRestorePrivilegesOnDatabase(ctx, p, parentDB); err != nil {
 						return err
+					} else if usesDeprecatedPrivileges {
+						shouldBufferDeprecatedPrivilegeNotice = true
+						databasesWithDeprecatedPrivileges[parentDB.GetName()] = struct{}{}
 					}
 
 					// Create a rewrite entry for the type.
@@ -529,6 +541,15 @@ func allocateDescriptorRewrites(
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+
+	if shouldBufferDeprecatedPrivilegeNotice {
+		dbNames := make([]string, 0, len(databasesWithDeprecatedPrivileges))
+		for dbName := range databasesWithDeprecatedPrivileges {
+			dbNames = append(dbNames, dbName)
+		}
+		p.BufferClientNotice(ctx, pgnotice.Newf("%s RESTORE TABLE, user %s will exclusively require the RESTORE privilege on databases %s",
+			deprecatedPrivilegesPreamble, p.User(), strings.Join(dbNames, ", ")))
 	}
 
 	// Allocate new IDs for each database and table.
@@ -1101,9 +1122,53 @@ func restorePlanHook(
 	return fn, jobs.BulkJobExecutionResultHeader, nil, false, nil
 }
 
+// checkRestoreDestinationPrivileges iterates over the External Storage URIs and
+// ensures the user has adequate privileges to use each of them.
+func checkRestoreDestinationPrivileges(
+	ctx context.Context, p sql.PlanHookState, from [][]string,
+) error {
+	// Check destination specific privileges.
+	for _, uris := range from {
+		uris := uris
+		if err := cloudprivilege.CheckDestinationPrivileges(ctx, p, uris); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkRestorePrivilegesOnDatabase check that the user has adequate privileges
+// on the parent database to restore schema objects into the database. This is
+// used to check the privileges required for a `RESTORE TABLE`.
+func checkRestorePrivilegesOnDatabase(
+	ctx context.Context, p sql.PlanHookState, parentDB catalog.DatabaseDescriptor,
+) (shouldBufferNotice bool, err error) {
+	if err := p.CheckPrivilege(ctx, parentDB, privilege.RESTORE); err == nil {
+		return false, nil
+	}
+
+	if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
+		notice := fmt.Sprintf("%s RESTORE TABLE, user %s will exclusively require the "+
+			"RESTORE privilege on database %s.", deprecatedPrivilegesPreamble, p.User().Normalized(), parentDB.GetName())
+		p.BufferClientNotice(ctx, pgnotice.Newf("%s", notice))
+		return false, errors.WithHint(err, notice)
+	}
+
+	return true, nil
+}
+
+// checkPrivilegesForRestore checks that the user has sufficient privileges to
+// run a cluster or a database restore. A table restore requires us to know the
+// parent database we will be writing to and so that happens at a later stage of
+// restore planning.
+//
+// This method is also responsible for checking the privileges on the
+// destination URIs the restore is reading from.
 func checkPrivilegesForRestore(
 	ctx context.Context, restoreStmt *tree.Restore, p sql.PlanHookState, from [][]string,
 ) error {
+	// If the user is admin no further checks need to be performed.
 	hasAdmin, err := p.HasAdminRole(ctx)
 	if err != nil {
 		return err
@@ -1111,68 +1176,74 @@ func checkPrivilegesForRestore(
 	if hasAdmin {
 		return nil
 	}
-	// Do not allow full cluster restores.
-	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
-		return pgerror.Newf(
-			pgcode.InsufficientPrivilege,
-			"only users with the admin role are allowed to restore full cluster backups")
+
+	{
+		// Cluster and tenant restores require the `RESTORE` system privilege for
+		// non-admin users.
+		requiresRestoreSystemPrivilege := restoreStmt.DescriptorCoverage == tree.AllDescriptors ||
+			restoreStmt.Targets.TenantID.IsSet()
+
+		var hasRestoreSystemPrivilege bool
+		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+			err := p.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject,
+				privilege.RESTORE, p.User())
+			hasRestoreSystemPrivilege = err == nil
+		}
+
+		if requiresRestoreSystemPrivilege && hasRestoreSystemPrivilege {
+			return checkRestoreDestinationPrivileges(ctx, p, from)
+		} else if requiresRestoreSystemPrivilege && !hasRestoreSystemPrivilege {
+			return pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the admin role or the RESTORE system privilege are allowed to perform"+
+					" a cluster restore")
+		}
 	}
-	// Do not allow tenant restores.
-	if restoreStmt.Targets.TenantID.IsSet() {
-		return pgerror.Newf(
-			pgcode.InsufficientPrivilege,
-			"only users with the admin role can perform RESTORE TENANT")
+
+	var hasRestoreSystemPrivilege bool
+	// If running a database restore, check that the user has the `RESTORE` system
+	// privilege.
+	//
+	// TODO(adityamaru): In 23.1 a missing `RESTORE` privilege should return an
+	// error. In 22.2 we continue to check for old style privileges and role
+	// options.
+	if len(restoreStmt.Targets.Databases) > 0 {
+		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+			err := p.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject,
+				privilege.RESTORE, p.User())
+			hasRestoreSystemPrivilege = err == nil
+		}
 	}
+
+	if hasRestoreSystemPrivilege {
+		return checkRestoreDestinationPrivileges(ctx, p, from)
+	}
+
+	// The following checks are to maintain compatability with pre-22.2 privilege
+	// requirements to run the backup. If we have failed to find the appropriate
+	// `RESTORE` privileges, we default to our old-style privilege checks and
+	// buffer a notice urging users to switch to `RESTORE` privileges.
+	//
+	// TODO(adityamaru): Delete deprecated privilege checks in 23.1. Users will be
+	// required to have the appropriate `RESTORE` privilege instead.
+	//
 	// Database restores require the CREATEDB privileges.
 	if len(restoreStmt.Targets.Databases) > 0 {
+		notice := fmt.Sprintf("%s RESTORE DATABASE, user %s will exclusively require the "+
+			"RESTORE system privilege.", deprecatedPrivilegesPreamble, p.User().Normalized())
+		p.BufferClientNotice(ctx, pgnotice.Newf("%s", notice))
+
 		hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
 		if err != nil {
 			return err
 		}
 		if !hasCreateDB {
-			return pgerror.Newf(
+			return errors.WithHint(pgerror.Newf(
 				pgcode.InsufficientPrivilege,
-				"only users with the CREATEDB privilege can restore databases")
+				"only users with the CREATEDB privilege can restore databases"), notice)
 		}
 	}
-	if p.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound {
-		return nil
-	}
 
-	// Check destination specific privileges.
-	for i := range from {
-		for j := range from[i] {
-			conf, err := cloud.ExternalStorageConfFromURI(from[i][j], p.User())
-			if err != nil {
-				return err
-			}
-
-			// Check if the destination requires the user to be an admin.
-			if !conf.AccessIsWithExplicitAuth() {
-				return pgerror.Newf(
-					pgcode.InsufficientPrivilege,
-					"only users with the admin role are allowed to RESTORE from the specified %s URI",
-					conf.Provider.String())
-			}
-
-			// If the restore is running to an External Connection, check that the user
-			// has adequate privileges.
-			if conf.Provider == cloudpb.ExternalStorageProvider_external {
-				if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemExternalConnectionsTable) {
-					return pgerror.Newf(pgcode.FeatureNotSupported,
-						"version %v must be finalized to restore from an External Connection",
-						clusterversion.ByKey(clusterversion.SystemExternalConnectionsTable))
-				}
-				ecPrivilege := &syntheticprivilege.ExternalConnectionPrivilege{
-					ConnectionName: conf.ExternalConnectionConfig.Name,
-				}
-				if err := p.CheckPrivilege(ctx, ecPrivilege, privilege.USAGE); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
+	return checkRestoreDestinationPrivileges(ctx, p, from)
 }
 
 func checkClusterRegions(
@@ -1289,15 +1360,29 @@ func doRestorePlan(
 	// vacuous, and we should proceed with restoring the base backup.
 	//
 	// Note that incremental _backup_ requests to this location will fail loudly instead.
-	baseStores := make([]cloud.ExternalStorage, len(fullyResolvedBaseDirectory))
-	for i := range fullyResolvedBaseDirectory {
-		store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, fullyResolvedBaseDirectory[i], p.User())
-		if err != nil {
-			return errors.Wrapf(err, "failed to open backup storage location")
-		}
-		defer store.Close()
-		baseStores[i] = store
+	mkStore := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI
+	baseStores, cleanupFn, err := backupdest.MakeBackupDestinationStores(ctx, p.User(), mkStore,
+		fullyResolvedBaseDirectory)
+	if err != nil {
+		return err
 	}
+	defer func() {
+		if err := cleanupFn(); err != nil {
+			log.Warningf(ctx, "failed to close incremental store: %+v", err)
+		}
+	}()
+
+	incStores, cleanupFn, err := backupdest.MakeBackupDestinationStores(ctx, p.User(), mkStore,
+		fullyResolvedIncrementalsDirectory)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := cleanupFn(); err != nil {
+			log.Warningf(ctx, "failed to close incremental store: %+v", err)
+		}
+	}()
+
 	ioConf := baseStores[0].ExternalIOConf()
 	kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings, &ioConf,
 		p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
@@ -1351,12 +1436,11 @@ func doRestorePlan(
 	var mainBackupManifests []backuppb.BackupManifest
 	var localityInfo []jobspb.RestoreDetails_BackupLocalityInfo
 	var memReserved int64
-	mkStore := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI
 	if len(from) <= 1 {
 		// Incremental layers are not specified explicitly. They will be searched for automatically.
 		// This could be either INTO-syntax, OR TO-syntax.
 		defaultURIs, mainBackupManifests, localityInfo, memReserved, err = backupdest.ResolveBackupManifests(
-			ctx, &mem, baseStores, mkStore, fullyResolvedBaseDirectory,
+			ctx, &mem, baseStores, incStores, mkStore, fullyResolvedBaseDirectory,
 			fullyResolvedIncrementalsDirectory, endTime, encryption, &kmsEnv, p.User(),
 		)
 	} else {
@@ -1386,13 +1470,22 @@ func doRestorePlan(
 		}
 	}
 
-	// Validate that the backup is a full cluster backup if a full cluster restore was requested.
-	if restoreStmt.DescriptorCoverage == tree.AllDescriptors && mainBackupManifests[0].DescriptorCoverage == tree.RequestedDescriptors {
-		return errors.Errorf("full cluster RESTORE can only be used on full cluster BACKUP files")
-	}
-
-	// Ensure that no user descriptors exist for a full cluster restore.
 	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
+		// Validate that the backup is a full cluster backup if a full cluster restore was requested.
+		if mainBackupManifests[0].DescriptorCoverage == tree.RequestedDescriptors {
+			return errors.Errorf("full cluster RESTORE can only be used on full cluster BACKUP files")
+		}
+
+		// Validate that we aren't in the middle of an upgrade. To avoid unforseen
+		// issues, we want to avoid full cluster restores if it is possible that an
+		// upgrade is in progress. We also check this during Resume.
+		binaryVersion := p.ExecCfg().Settings.Version.BinaryVersion()
+		clusterVersion := p.ExecCfg().Settings.Version.ActiveVersion(ctx).Version
+		if clusterVersion.Less(binaryVersion) {
+			return clusterRestoreDuringUpgradeErr(clusterVersion, binaryVersion)
+		}
+
+		// Ensure that no user descriptors exist for a full cluster restore.
 		var allDescs []catalog.Descriptor
 		if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
 			txn.SetDebugName("count-user-descs")
@@ -1658,7 +1751,7 @@ func doRestorePlan(
 	if err := rewrite.TableDescs(tables, descriptorRewrites, intoDB); err != nil {
 		return err
 	}
-	if err := rewrite.DatabaseDescs(databases, descriptorRewrites); err != nil {
+	if err := rewrite.DatabaseDescs(databases, descriptorRewrites, map[descpb.ID]struct{}{}); err != nil {
 		return err
 	}
 	if err := rewrite.SchemaDescs(schemas, descriptorRewrites); err != nil {

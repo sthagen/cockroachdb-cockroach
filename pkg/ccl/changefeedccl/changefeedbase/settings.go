@@ -98,8 +98,9 @@ var FrontierHighwaterLagCheckpointThreshold = settings.RegisterDurationSetting(
 // So, 1KB per span.  We could be looking at 10MB checkpoint record.
 //
 // The default for this setting was chosen as follows:
-//   * Assume a very long backfill, running for 25 hours (GC TTL default duration).
-//   * Assume we want to have at most 150MB worth of checkpoints in the job record.
+//   - Assume a very long backfill, running for 25 hours (GC TTL default duration).
+//   - Assume we want to have at most 150MB worth of checkpoints in the job record.
+//
 // Therefore, we should write at most 6 MB of checkpoint/hour; OR, based on the default
 // FrontierCheckpointFrequency setting, 1 MB per checkpoint.
 var FrontierCheckpointMaxBytes = settings.RegisterByteSizeSetting(
@@ -212,6 +213,14 @@ var ActiveProtectedTimestampsEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"changefeed.active_protected_timestamps.enabled",
 	"if set, rather than only protecting changefeed targets from garbage collection during backfills, data will always be protected up to the changefeed's frontier",
+	true,
+)
+
+// BatchReductionRetryEnabled enables the temporary reduction of batch sizes upon kafka message too large errors
+var BatchReductionRetryEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.batch_reduction_retry_enabled",
+	"if true, kafka changefeeds upon erroring on an oversized batch will attempt to resend the messages with progressively lower batch sizes",
 	true,
 )
 

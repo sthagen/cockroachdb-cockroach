@@ -1087,17 +1087,17 @@ func MVCCGetAsTxn(
 // A prefix scan using the iterator is performed, resulting in one of the
 // following successful outcomes:
 //
-// 1) iterator finds nothing; returns (false, 0, 0, nil).
-// 2) iterator finds an explicit meta key; unmarshals and returns its size.
-//    ok is set to true.
-// 3) iterator finds a value, i.e. the meta key is implicit.
-//    In this case, it accounts for the size of the key with the portion
-//    of the user key found which is not the MVCC timestamp suffix (since
-//    that is the usual contribution of the meta key). The value size returned
-//    will be zero, as there is no stored MVCCMetadata.
-//    ok is set to true.
-// 4) iterator finds an MVCC range tombstone above a value. In this case,
-//    metadata for a synthetic point tombstone is returned.
+//  1. iterator finds nothing; returns (false, 0, 0, nil).
+//  2. iterator finds an explicit meta key; unmarshals and returns its size.
+//     ok is set to true.
+//  3. iterator finds a value, i.e. the meta key is implicit.
+//     In this case, it accounts for the size of the key with the portion
+//     of the user key found which is not the MVCC timestamp suffix (since
+//     that is the usual contribution of the meta key). The value size returned
+//     will be zero, as there is no stored MVCCMetadata.
+//     ok is set to true.
+//  4. iterator finds an MVCC range tombstone above a value. In this case,
+//     metadata for a synthetic point tombstone is returned.
 //
 // The timestamp where the real point key last changed is also returned, if a
 // real point key was found. This may differ from the metadata timestamp when a
@@ -2878,7 +2878,8 @@ func MVCCDeleteRange(
 // t3
 // t2 a2 b2    d2 e2
 // t1    b1 c1
-//    a  b  c  d  e
+//
+//	a  b  c  d  e
 func MVCCPredicateDeleteRange(
 	ctx context.Context,
 	rw ReadWriter,
@@ -3187,7 +3188,7 @@ func MVCCDeleteRangeUsingTombstone(
 
 	// We currently don't allow MVCC range tombstones across the local keyspace,
 	// to be safe. This wouldn't handle MVCC stats (SysBytes) correctly either.
-	if keys.IsLocal(startKey) || keys.IsLocal(endKey) {
+	if startKey.Compare(keys.LocalMax) < 0 {
 		return errors.AssertionFailedf("can't write MVCC range tombstone across local keyspan %s",
 			rangeKey)
 	}
@@ -4082,12 +4083,12 @@ func mvccGetIntent(
 // Note that a transaction can "partially abort" and still commit due to nested
 // SAVEPOINTs, such as in the below example:
 //
-//   BEGIN;
-//     SAVEPOINT foo;
-//       INSERT INTO kv VALUES(1, 1);
-//     ROLLBACK TO SAVEPOINT foo;
-//     INSERT INTO kv VALUES(1, 2);
-//   COMMIT;
+//	BEGIN;
+//	  SAVEPOINT foo;
+//	    INSERT INTO kv VALUES(1, 1);
+//	  ROLLBACK TO SAVEPOINT foo;
+//	  INSERT INTO kv VALUES(1, 2);
+//	COMMIT;
 //
 // This would first remove the intent (1,1) during the ROLLBACK using a Del (the
 // anomaly below would occur the same if a SingleDel were used here), and thus
@@ -4103,12 +4104,12 @@ func mvccGetIntent(
 // However, this sequence could compact as follows (at the time of writing, bound
 // to change with #69891):
 //
-// - Set (Del Set') SingleDel
-//          ↓
-// - Set   Set'     SingleDel
-// - Set  (Set'     SingleDel)
-//               ↓
-// - Set
+//   - Set (Del Set') SingleDel
+//     ↓
+//   - Set   Set'     SingleDel
+//   - Set  (Set'     SingleDel)
+//     ↓
+//   - Set
 //
 // which means that a previously deleted intent metadata would erroneously
 // become visible again. So on top of restricting SingleDel to the COMMIT case,
@@ -4502,7 +4503,14 @@ func mvccResolveWriteIntent(
 			// If a non-tombstone point key is covered by a range tombstone, then
 			// synthesize a point tombstone at the lowest range tombstone covering it.
 			// This is where the point key ceases to exist, contributing to GCBytesAge.
-			if len(unsafeNextValueRaw) > 0 && hasRange {
+			unsafeNextValue, unsafeNextValueOK, err := tryDecodeSimpleMVCCValue(unsafeNextValueRaw)
+			if !unsafeNextValueOK && err == nil {
+				unsafeNextValue, err = decodeExtendedMVCCValue(unsafeNextValueRaw)
+			}
+			if err != nil {
+				return false, err
+			}
+			if !unsafeNextValue.IsTombstone() && hasRange {
 				if v, found := iter.RangeKeys().FirstAtOrAbove(unsafeNextKey.Timestamp); found {
 					unsafeNextKey.Timestamp = v.Timestamp
 					unsafeNextValueRaw = []byte{}
@@ -4810,16 +4818,16 @@ func MVCCGarbageCollect(
 
 		unsafeKey := iter.UnsafeKey()
 		implicitMeta := unsafeKey.IsValue()
-		// First check for the case of range tombstone covering keys when no
-		// metadata is available.
-		//
 		// Note that we naively can't terminate GC'ing keys loop early if we
 		// enter any of branches below, as it will update the stats under the
 		// provision that the (implicit or explicit) meta key (and thus all
 		// versions) are being removed. We had this faulty functionality at some
 		// point; it should no longer be necessary since the higher levels already
 		// make sure each individual GCRequest does bounded work.
-		if implicitMeta && meta.Deleted && !unsafeKey.Timestamp.Equal(realKeyChanged) {
+		//
+		// First check for the case of range tombstone covering keys when no
+		// metadata is available.
+		if implicitMeta && meta.Deleted && !meta.Timestamp.Equal(unsafeKey.Timestamp) {
 			// If we have implicit deletion meta, and realKeyChanged is not the first
 			// key in history, that means it is covered by a range tombstone (which
 			// was used to synthesize meta).
@@ -5125,6 +5133,11 @@ func MVCCGarbageCollectRangeKeys(
 
 			// If there's nothing to GC, keep moving.
 			if !rangeKeys.Oldest().LessEq(gcKey.Timestamp) {
+				// Even if we don't GC anything for this range fragment, we might have
+				// changed previous and it might become mergable as a result.
+				if ms != nil && lhs.CanMergeRight(rangeKeys) {
+					ms.Add(updateStatsOnRangeKeyMerge(rangeKeys.Bounds.Key, rangeKeys.Versions))
+				}
 				rangeKeys.CloneInto(&lhs)
 				continue
 			}
@@ -6142,7 +6155,9 @@ type MVCCIsSpanEmptyOptions struct {
 // with the (unsafe) range key stack:
 //
 // -1: range key to the left not touching the peek key, or no range key found.
-//  0: range key to the left ends at the peek key.
+//
+//	0: range key to the left ends at the peek key.
+//
 // +1: range key to the left overlaps with the peek key, extending to the right.
 func PeekRangeKeysLeft(iter MVCCIterator, peekKey roachpb.Key) (int, MVCCRangeKeyStack, error) {
 	iter.SeekLT(MVCCKey{Key: peekKey})
@@ -6162,7 +6177,9 @@ func PeekRangeKeysLeft(iter MVCCIterator, peekKey roachpb.Key) (int, MVCCRangeKe
 // with the (unsafe) range key stack:
 //
 // -1: range key to the right overlaps with the peek key, existing to the left.
-//  0: range key to the right starts at the peek key.
+//
+//	0: range key to the right starts at the peek key.
+//
 // +1: range key to the right not touching the peek key, or no range key found.
 func PeekRangeKeysRight(iter MVCCIterator, peekKey roachpb.Key) (int, MVCCRangeKeyStack, error) {
 	iter.SeekGE(MVCCKey{Key: peekKey})
@@ -6175,4 +6192,151 @@ func PeekRangeKeysRight(iter MVCCIterator, peekKey roachpb.Key) (int, MVCCRangeK
 	}
 	rangeKeys := iter.RangeKeys()
 	return rangeKeys.Bounds.Key.Compare(peekKey), rangeKeys, nil
+}
+
+// ReplacePointTombstonesWithRangeTombstones will replace existing point
+// tombstones with equivalent point-sized range tombstones in the given span,
+// updating stats as needed. Only the most recent version is considered.
+// If end is nil, start.Next() is assumed.
+//
+// NB: The caller must disable spanset assertions for the reader, since we'll
+// peek beyond the given bounds to adjust range key stats. We're not terribly
+// concerned about any stats mismatches caused by these missing latches.
+func ReplacePointTombstonesWithRangeTombstones(
+	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, start, end roachpb.Key,
+) error {
+	// We don't want to emit DeleteRange rangefeed events, since these may be
+	// below the resolved timestamp by now.
+	rw = DisableOpLogger(rw)
+
+	if keys.IsLocal(start) {
+		return nil
+	}
+	if len(end) == 0 {
+		end = start.Next()
+	}
+
+	iter := rw.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+		KeyTypes:   IterKeyTypePointsAndRanges,
+		Prefix:     end.Equal(start.Next()),
+		LowerBound: start,
+		UpperBound: end,
+	})
+	defer iter.Close()
+
+	var clearedKey MVCCKey
+	var rangeKeys MVCCRangeKeyStack
+	iter.SeekGE(MVCCKey{Key: start})
+	for {
+		if ok, err := iter.Valid(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
+
+		if iter.RangeKeyChanged() {
+			iter.RangeKeys().CloneInto(&rangeKeys)
+		}
+
+		// Skip bare range keys.
+		hasPoint, hasRange := iter.HasPointAndRange()
+		if !hasPoint {
+			iter.Next()
+			continue
+		}
+
+		key := iter.UnsafeKey()
+
+		// Skip intents and inline values.
+		if key.Timestamp.IsEmpty() {
+			iter.NextKey()
+			continue
+		}
+
+		// Skip non-tombstone values.
+		valueRaw := iter.UnsafeValue()
+		if value, err := DecodeMVCCValue(valueRaw); err != nil {
+			return err
+		} else if !value.IsTombstone() {
+			iter.NextKey()
+			continue
+		}
+
+		// Skip keys below range tombstones. We can't use range key masking because
+		// we may need to see older versions of point keys that are below a range
+		// tombstone.
+		if hasRange && key.Timestamp.LessEq(rangeKeys.Newest()) {
+			iter.NextKey()
+			continue
+		}
+
+		// Clear the point key, and construct a meta record for stats.
+		clearedMeta := &enginepb.MVCCMetadata{
+			KeyBytes:  MVCCVersionTimestampSize,
+			ValBytes:  int64(len(valueRaw)),
+			Deleted:   true,
+			Timestamp: key.Timestamp.ToLegacyTimestamp(),
+		}
+		clearedKey.Key = append(clearedKey.Key[:0], key.Key...)
+		clearedKey.Timestamp = key.Timestamp
+		clearedKeySize := int64(EncodedMVCCKeyPrefixLength(clearedKey.Key))
+		if err := rw.ClearMVCC(key); err != nil {
+			return err
+		}
+
+		// Step to the next key to look for an older version, and construct a meta
+		// record for stats.
+		var restoredMeta *enginepb.MVCCMetadata
+		iter.Next()
+		if ok, err := iter.Valid(); err != nil {
+			return err
+		} else if ok {
+			if key = iter.UnsafeKey(); key.Key.Equal(clearedKey.Key) {
+				valueRaw = iter.UnsafeValue()
+				value, err := DecodeMVCCValue(valueRaw)
+				if err != nil {
+					return err
+				}
+				restoredMeta = &enginepb.MVCCMetadata{
+					KeyBytes:  MVCCVersionTimestampSize,
+					ValBytes:  int64(len(valueRaw)),
+					Deleted:   value.IsTombstone(),
+					Timestamp: key.Timestamp.ToLegacyTimestamp(),
+				}
+				if _, hasRange := iter.HasPointAndRange(); hasRange {
+					if v, ok := iter.RangeKeys().FirstAtOrAbove(key.Timestamp); ok {
+						restoredMeta.Deleted = true
+						restoredMeta.KeyBytes = 0
+						restoredMeta.ValBytes = 0
+						restoredMeta.Timestamp = v.Timestamp.ToLegacyTimestamp()
+					}
+				}
+			}
+		}
+
+		if ms != nil {
+			var restoredKeySize, restoredNanos int64
+			if restoredMeta != nil {
+				restoredKeySize = clearedKeySize
+				restoredNanos = restoredMeta.Timestamp.WallTime
+			}
+			ms.Add(updateStatsOnClear(clearedKey.Key,
+				clearedKeySize, 0, restoredKeySize, 0, clearedMeta, restoredMeta, restoredNanos))
+		}
+
+		// Write the range tombstone, with proper stats.
+		if err := MVCCDeleteRangeUsingTombstone(ctx, rw, ms,
+			clearedKey.Key, clearedKey.Key.Next(), clearedKey.Timestamp, hlc.ClockTimestamp{},
+			start.Prevish(roachpb.PrevishKeyLength), end.Next(), false, 0, nil); err != nil {
+			return err
+		}
+
+		// If we restored a version at this key, step to the next key. Otherwise,
+		// we're already on the next key.
+		if restoredMeta != nil {
+			iter.NextKey()
+		}
+	}
+
+	return nil
 }

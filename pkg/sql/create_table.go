@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -403,7 +402,7 @@ func (n *createTableNode) startExec(params runParams) error {
 			}
 			var foundExternalReference bool
 			for id := range refs {
-				if t, err := params.p.Descriptors().GetUncommittedMutableTableByID(id); err != nil {
+				if _, t, err := params.p.Descriptors().GetUncommittedMutableTableByID(id); err != nil {
 					return err
 				} else if t == nil || !t.IsNew() {
 					foundExternalReference = true
@@ -533,7 +532,7 @@ func (n *createTableNode) startExec(params runParams) error {
 				params.ExecCfg().Codec,
 				desc.ImmutableCopy().(catalog.TableDescriptor),
 				desc.PublicColumns(),
-				params.p.alloc,
+				&tree.DatumAlloc{},
 				&params.ExecCfg().Settings.SV,
 				internal,
 				params.ExecCfg().GetRowMetrics(internal),
@@ -926,7 +925,7 @@ func ResolveFK(
 	referencedColNames := d.ToCols
 	// If no columns are specified, attempt to default to PK, ignoring implicit columns.
 	if len(referencedColNames) == 0 {
-		numImplicitCols := target.GetPrimaryIndex().GetPartitioning().NumImplicitColumns()
+		numImplicitCols := target.GetPrimaryIndex().ImplicitPartitioningColumnCount()
 		referencedColNames = make(
 			tree.NameList,
 			0,
@@ -1998,14 +1997,6 @@ func NewTableDesc(
 
 	for i := range desc.Columns {
 		if _, ok := primaryIndexColumnSet[desc.Columns[i].Name]; ok {
-			if !st.Version.IsActive(ctx, clusterversion.Start22_1) {
-				if desc.Columns[i].Virtual {
-					return nil, pgerror.Newf(
-						pgcode.FeatureNotSupported,
-						"cannot use virtual column %q in primary key", desc.Columns[i].Name,
-					)
-				}
-			}
 			desc.Columns[i].Nullable = false
 		}
 	}
@@ -2237,7 +2228,7 @@ func NewTableDesc(
 			if idx.NumKeyColumns() > 1 {
 				telemetry.Inc(sqltelemetry.MultiColumnInvertedIndexCounter)
 			}
-			if idx.GetPartitioning().NumColumns() != 0 {
+			if idx.PartitioningColumnCount() != 0 {
 				telemetry.Inc(sqltelemetry.PartitionedInvertedIndexCounter)
 			}
 		}

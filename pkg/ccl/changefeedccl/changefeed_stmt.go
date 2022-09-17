@@ -420,6 +420,8 @@ func createChangefeedJobRecord(
 		// that support it.
 		details.Select = cdceval.AsStringUnredacted(normalized.Clause())
 
+		opts.SetDefaultEnvelope(changefeedbase.OptEnvelopeBare)
+
 		// TODO(#85143): do not enforce schema_change_policy='stop' for changefeed expressions.
 		schemachangeOptions, err := opts.GetSchemaChangeHandlingOptions()
 		if err != nil {
@@ -610,14 +612,6 @@ func validateSettings(ctx context.Context, p sql.PlanHookState) error {
 			docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
 
-	ok, err := p.HasRoleOption(ctx, roleoption.CONTROLCHANGEFEED)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return pgerror.New(pgcode.InsufficientPrivilege, "current user must have a role WITH CONTROLCHANGEFEED")
-	}
-
 	return nil
 }
 
@@ -675,6 +669,18 @@ func getTargetsAndTables(
 	targets := make([]jobspb.ChangefeedTargetSpecification, len(rawTargets))
 	seen := make(map[jobspb.ChangefeedTargetSpecification]tree.ChangefeedTarget)
 
+	hasControlChangefeed, err := p.HasRoleOption(ctx, roleoption.CONTROLCHANGEFEED)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var requiredPrivilegePerTable privilege.Kind
+	if hasControlChangefeed {
+		requiredPrivilegePerTable = privilege.SELECT
+	} else {
+		requiredPrivilegePerTable = privilege.CHANGEFEED
+	}
+
 	for i, ct := range rawTargets {
 		desc, ok := targetDescs[ct.TableName]
 		if !ok {
@@ -685,8 +691,8 @@ func getTargetsAndTables(
 			return nil, nil, errors.Errorf(`CHANGEFEED cannot target %s`, tree.AsString(&ct))
 		}
 
-		if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
-			return nil, nil, err
+		if err := p.CheckPrivilege(ctx, desc, requiredPrivilegePerTable); err != nil {
+			return nil, nil, errors.WithHint(err, `Users with CONTROLCHANGEFEED need SELECT, other users need CHANGEFEED.`)
 		}
 
 		if spec, ok := originalSpecs[ct]; ok {

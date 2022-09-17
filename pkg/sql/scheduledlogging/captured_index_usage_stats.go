@@ -39,7 +39,7 @@ var telemetryCaptureIndexUsageStatsEnabled = settings.RegisterBoolSetting(
 )
 
 var telemetryCaptureIndexUsageStatsInterval = settings.RegisterDurationSetting(
-	settings.SystemOnly,
+	settings.TenantReadOnly,
 	"sql.telemetry.capture_index_usage_stats.interval",
 	"the scheduled interval time between capturing index usage statistics when capturing index usage statistics is enabled",
 	8*time.Hour,
@@ -47,7 +47,7 @@ var telemetryCaptureIndexUsageStatsInterval = settings.RegisterDurationSetting(
 )
 
 var telemetryCaptureIndexUsageStatsStatusCheckEnabledInterval = settings.RegisterDurationSetting(
-	settings.SystemOnly,
+	settings.TenantReadOnly,
 	"sql.telemetry.capture_index_usage_stats.check_enabled_interval",
 	"the scheduled interval time between checks to see if index usage statistics has been enabled",
 	10*time.Minute,
@@ -55,7 +55,7 @@ var telemetryCaptureIndexUsageStatsStatusCheckEnabledInterval = settings.Registe
 )
 
 var telemetryCaptureIndexUsageStatsLoggingDelay = settings.RegisterDurationSetting(
-	settings.SystemOnly,
+	settings.TenantReadOnly,
 	"sql.telemetry.capture_index_usage_stats.logging_delay",
 	"the time delay between emitting individual index usage stats logs, this is done to "+
 		"mitigate the log-line limit of 10 logs per second on the telemetry pipeline",
@@ -138,13 +138,23 @@ func Start(
 func (s *CaptureIndexUsageStatsLoggingScheduler) start(ctx context.Context, stopper *stop.Stopper) {
 	_ = stopper.RunAsyncTask(ctx, "capture-index-usage-stats", func(ctx context.Context) {
 		// Start the scheduler immediately.
-		for timer := time.NewTimer(0 * time.Second); ; timer.Reset(s.durationUntilNextInterval()) {
+		timer := time.NewTimer(0 * time.Second)
+		defer timer.Stop()
+
+		for {
 			select {
 			case <-stopper.ShouldQuiesce():
-				timer.Stop()
 				return
 			case <-timer.C:
 				s.currentCaptureStartTime = timeutil.Now()
+				dur := s.durationUntilNextInterval()
+				if dur < time.Second {
+					// Avoid intervals that are too short, to prevent a hot
+					// spot on this task.
+					dur = time.Second
+				}
+				timer.Reset(dur)
+
 				if !telemetryCaptureIndexUsageStatsEnabled.Get(&s.st.SV) {
 					continue
 				}
@@ -180,26 +190,25 @@ func captureIndexUsageStats(
 			continue
 		}
 		stmt := fmt.Sprintf(`
-		SELECT
-		 ti.descriptor_name as table_name,
-		 ti.descriptor_id as table_id,
-		 ti.index_name,
-		 ti.index_id,
-		 ti.index_type,
-		 ti.is_unique,
-		 ti.is_inverted,
-		 total_reads,
-		 last_read,
-		 ti.created_at,
-     t.schema_name
-		FROM %s.crdb_internal.index_usage_statistics AS us
-		JOIN %s.crdb_internal.table_indexes ti
-		ON us.index_id = ti.index_id
-		 AND us.table_id = ti.descriptor_id
-    JOIN %s.crdb_internal.tables t 
-    ON ti.descriptor_id = t.table_id
-		ORDER BY total_reads ASC;
-	`, databaseName, databaseName, databaseName)
+  SELECT ti.descriptor_name as table_name,
+         ti.descriptor_id as table_id,
+         ti.index_name,
+         ti.index_id,
+         ti.index_type,
+         ti.is_unique,
+         ti.is_inverted,
+         total_reads,
+         last_read,
+         ti.created_at,
+         t.schema_name
+    FROM %[1]s.crdb_internal.index_usage_statistics us
+    JOIN %[1]s.crdb_internal.table_indexes ti
+      ON us.index_id = ti.index_id
+     AND us.table_id = ti.descriptor_id
+    JOIN %[1]s.crdb_internal.tables t
+      ON ti.descriptor_id = t.table_id
+ORDER BY total_reads ASC;`,
+			databaseName.String())
 
 		it, err := ie.QueryIteratorEx(
 			ctx,
@@ -248,7 +257,7 @@ func captureIndexUsageStats(
 				IndexID:        uint32(roachpb.IndexID(indexID)),
 				TotalReadCount: uint64(totalReads),
 				LastRead:       lastRead.String(),
-				DatabaseName:   databaseName,
+				DatabaseName:   databaseName.String(),
 				TableName:      string(tableName),
 				IndexName:      string(indexName),
 				IndexType:      string(indexType),
@@ -276,13 +285,12 @@ func captureIndexUsageStats(
 func logIndexUsageStatsWithDelay(
 	ctx context.Context, events []logpb.EventPayload, stopper *stop.Stopper, delay time.Duration,
 ) {
-
 	// Log the first event immediately.
 	timer := time.NewTimer(0 * time.Second)
+	defer timer.Stop()
 	for len(events) > 0 {
 		select {
 		case <-stopper.ShouldQuiesce():
-			timer.Stop()
 			return
 		case <-timer.C:
 			event := events[0]
@@ -292,11 +300,10 @@ func logIndexUsageStatsWithDelay(
 			timer.Reset(delay)
 		}
 	}
-	timer.Stop()
 }
 
-func getAllDatabaseNames(ctx context.Context, ie sqlutil.InternalExecutor) ([]string, error) {
-	var allDatabaseNames []string
+func getAllDatabaseNames(ctx context.Context, ie sqlutil.InternalExecutor) (tree.NameList, error) {
+	var allDatabaseNames tree.NameList
 	var ok bool
 	var expectedNumDatums = 1
 
@@ -308,7 +315,7 @@ func getAllDatabaseNames(ctx context.Context, ie sqlutil.InternalExecutor) ([]st
 		`SELECT database_name FROM [SHOW DATABASES]`,
 	)
 	if err != nil {
-		return []string{}, err
+		return tree.NameList{}, err
 	}
 
 	// We have to make sure to close the iterator since we might return from the
@@ -317,13 +324,13 @@ func getAllDatabaseNames(ctx context.Context, ie sqlutil.InternalExecutor) ([]st
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		var row tree.Datums
 		if row = it.Cur(); row == nil {
-			return []string{}, errors.New("unexpected null row while capturing index usage stats")
+			return tree.NameList{}, errors.New("unexpected null row while capturing index usage stats")
 		}
 		if row.Len() != expectedNumDatums {
-			return []string{}, errors.Newf("expected %d columns, received %d while capturing index usage stats", expectedNumDatums, row.Len())
+			return tree.NameList{}, errors.Newf("expected %d columns, received %d while capturing index usage stats", expectedNumDatums, row.Len())
 		}
 
-		databaseName := string(tree.MustBeDString(row[0]))
+		databaseName := tree.Name(tree.MustBeDString(row[0]))
 		allDatabaseNames = append(allDatabaseNames, databaseName)
 	}
 	return allDatabaseNames, nil

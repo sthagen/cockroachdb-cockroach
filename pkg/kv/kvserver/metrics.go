@@ -550,6 +550,20 @@ var metaRdbBytesIngested = storageLevelMetricMetadata(
 	metric.Unit_BYTES,
 )
 
+var metaRdbLevelSize = storageLevelMetricMetadata(
+	"level-size",
+	"Size of the SSTables in level %d",
+	"Bytes",
+	metric.Unit_BYTES,
+)
+
+var metaRdbLevelScores = storageLevelMetricMetadata(
+	"level-score",
+	"Compaction score of level %d",
+	"Score",
+	metric.Unit_COUNT,
+)
+
 var (
 	metaRdbWriteStalls = metric.Metadata{
 		Name:        "storage.write-stalls",
@@ -817,25 +831,22 @@ commandcommit.latency for a complete batch).
 		Name: "raft.process.handleready.latency",
 		Help: `Latency histogram for handling a Raft ready.
 
-This measures the end-to-end-latency of the Raft state advancement loop, and
-in particular includes:
+This measures the end-to-end-latency of the Raft state advancement loop, including:
 - snapshot application
 - SST ingestion
 - durably appending to the Raft log (i.e. includes fsync)
 - entry application (incl. replicated side effects, notably log truncation)
-as well as updates to in-memory structures.
 
-The above steps include the work measured in 'raft.process.commandcommit.latency',
-as well as 'raft.process.applycommitted.latency'. Note that matching percentiles
-of these metrics may nevertheless be *higher* than that of the handlready latency.
-This is because not every handleready cycle leads to an update to the applycommitted
-and commandcommit latencies. For example, under tpcc-100 on a single node, the
-handleready count is approximately twice the logcommit count (and logcommit count
-tracks closely with applycommitted count).
+These include work measured in 'raft.process.commandcommit.latency' and
+'raft.process.applycommitted.latency'. However, matching percentiles of these
+metrics may be *higher* than handleready, since not every handleready cycle
+leads to an update of the others. For example, under tpcc-100 on a single node,
+the handleready count is approximately twice the logcommit count (and logcommit
+count tracks closely with applycommitted count).
 
 High percentile outliers can be caused by individual large Raft commands or
-storage layer blips. An increase in lower (say the 50th) percentile is often
-driven by either CPU exhaustion or a slowdown at the storage layer.
+storage layer blips. Lower percentile (e.g. 50th) increases are often driven by
+CPU exhaustion or storage layer slowdowns.
 `,
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
@@ -1020,6 +1031,18 @@ The count is emitted by the leaseholder of each range.`,
 
 The messages are dropped to help these replicas to recover from I/O overload.`,
 		Measurement: "Messages",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	metaIOOverload = metric.Metadata{
+		Name: "admission.io.overload",
+		Help: `1-normalized float to pause replication to raft group followers if its value exceeds a given threshold.
+
+This threshold is the admission.kv.pause_replication_io_threshold cluster setting
+(pause replication feature is disabled if this setting is 0, feature is disabled by default);
+see pkg/kv/kvserver/replica_raft_overload.go for more details. Composed of LSM L0
+sub-level and file counts.`,
+		Measurement: "Threshold",
 		Unit:        metric.Unit_COUNT,
 	}
 
@@ -1374,6 +1397,12 @@ The messages are dropped to help these replicas to recover from I/O overload.`,
 		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaGCEnqueueHighPriority = metric.Metadata{
+		Name:        "queue.gc.info.enqueuehighpriority",
+		Help:        "Number of replicas enqueued for GC with high priority",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Slow request metrics.
 	metaLatchRequests = metric.Metadata{
@@ -1699,7 +1728,9 @@ type StoreMetrics struct {
 	RdbL0BytesFlushed           *metric.Gauge
 	RdbL0Sublevels              *metric.Gauge
 	RdbL0NumFiles               *metric.Gauge
-	RdbBytesIngested            [7]*metric.Gauge // idx = level
+	RdbBytesIngested            [7]*metric.Gauge        // idx = level
+	RdbLevelSize                [7]*metric.Gauge        // idx = level
+	RdbLevelScore               [7]*metric.GaugeFloat64 // idx = level
 	RdbWriteStalls              *metric.Gauge
 	RdbWriteStallNanos          *metric.Gauge
 
@@ -1770,6 +1801,7 @@ type StoreMetrics struct {
 
 	RaftPausedFollowerCount       *metric.Gauge
 	RaftPausedFollowerDroppedMsgs *metric.Counter
+	IOOverload                    *metric.GaugeFloat64
 
 	RaftCoalescedHeartbeatsPending *metric.Gauge
 
@@ -1836,6 +1868,7 @@ type StoreMetrics struct {
 	GCTxnIntentsResolveFailed *metric.Counter
 	GCUsedClearRange          *metric.Counter
 	GCFailedClearRange        *metric.Counter
+	GCEnqueueHighPriority     *metric.Counter
 
 	// Slow request counts.
 	SlowLatchRequests *metric.Gauge
@@ -2127,6 +2160,8 @@ func newTenantsStorageMetrics() *TenantsStorageMetrics {
 func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 	storeRegistry := metric.NewRegistry()
 	rdbBytesIngested := storageLevelGaugeSlice(metaRdbBytesIngested)
+	rdbLevelSize := storageLevelGaugeSlice(metaRdbLevelSize)
+	rdbLevelScore := storageLevelGaugeFloat64Slice(metaRdbLevelScores)
 
 	sm := &StoreMetrics{
 		registry:              storeRegistry,
@@ -2209,6 +2244,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbL0Sublevels:              metric.NewGauge(metaRdbL0Sublevels),
 		RdbL0NumFiles:               metric.NewGauge(metaRdbL0NumFiles),
 		RdbBytesIngested:            rdbBytesIngested,
+		RdbLevelSize:                rdbLevelSize,
+		RdbLevelScore:               rdbLevelScore,
 		RdbWriteStalls:              metric.NewGauge(metaRdbWriteStalls),
 		RdbWriteStallNanos:          metric.NewGauge(metaRdbWriteStallNanos),
 
@@ -2293,6 +2330,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 
 		RaftPausedFollowerCount:       metric.NewGauge(metaRaftFollowerPaused),
 		RaftPausedFollowerDroppedMsgs: metric.NewCounter(metaRaftPausedFollowerDroppedMsgs),
+		IOOverload:                    metric.NewGaugeFloat64(metaIOOverload),
 
 		// This Gauge measures the number of heartbeats queued up just before
 		// the queue is cleared, to avoid flapping wildly.
@@ -2359,6 +2397,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		GCTxnIntentsResolveFailed:    metric.NewCounter(metaGCTxnIntentsResolveFailed),
 		GCUsedClearRange:             metric.NewCounter(metaGCUsedClearRange),
 		GCFailedClearRange:           metric.NewCounter(metaGCFailedClearRange),
+		GCEnqueueHighPriority:        metric.NewCounter(metaGCEnqueueHighPriority),
 
 		// Wedge request counters.
 		SlowLatchRequests: metric.NewGauge(metaLatchRequests),
@@ -2512,6 +2551,8 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbL0BytesFlushed.Update(int64(m.Levels[0].BytesFlushed))
 	for level, stats := range m.Levels {
 		sm.RdbBytesIngested[level].Update(int64(stats.BytesIngested))
+		sm.RdbLevelSize[level].Update(stats.Size)
+		sm.RdbLevelScore[level].Update(stats.Score)
 	}
 }
 
@@ -2563,6 +2604,14 @@ func storageLevelGaugeSlice(sl [7]metric.Metadata) [7]*metric.Gauge {
 	var gs [7]*metric.Gauge
 	for i := range sl {
 		gs[i] = metric.NewGauge(sl[i])
+	}
+	return gs
+}
+
+func storageLevelGaugeFloat64Slice(sl [7]metric.Metadata) [7]*metric.GaugeFloat64 {
+	var gs [7]*metric.GaugeFloat64
+	for i := range sl {
+		gs[i] = metric.NewGaugeFloat64(sl[i])
 	}
 	return gs
 }

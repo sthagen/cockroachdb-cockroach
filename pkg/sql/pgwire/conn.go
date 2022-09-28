@@ -937,19 +937,17 @@ func (c *conn) handleParse(
 	}
 	// len(stmts) == 0 results in a nil (empty) statement.
 
-	if len(inTypeHints) > stmt.NumPlaceholders {
-		err := pgwirebase.NewProtocolViolationErrorf(
-			"received too many type hints: %d vs %d placeholders in query",
-			len(inTypeHints), stmt.NumPlaceholders,
-		)
-		return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
+	// We take max(len(s.Types), stmt.NumPlaceHolders) as the length of types.
+	numParams := len(inTypeHints)
+	if stmt.NumPlaceholders > numParams {
+		numParams = stmt.NumPlaceholders
 	}
 
 	var sqlTypeHints tree.PlaceholderTypes
 	if len(inTypeHints) > 0 {
 		// Prepare the mapping of SQL placeholder names to types. Pre-populate it with
 		// the type hints received from the client, if any.
-		sqlTypeHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
+		sqlTypeHints = make(tree.PlaceholderTypes, numParams)
 		for i, t := range inTypeHints {
 			if t == 0 {
 				continue
@@ -958,6 +956,13 @@ func (c *conn) handleParse(
 			// hints and let the consumer of the PrepareStmt resolve the types.
 			if t == oid.T_unknown || types.IsOIDUserDefinedType(t) {
 				sqlTypeHints[i] = nil
+				continue
+			}
+			if t == oid.T_json {
+				// This special case is here so we can support decoding parameters
+				// with oid=json without adding full support for the JSON type.
+				// TODO(sql-exp): Remove this if we support JSON.
+				sqlTypeHints[i] = types.Json
 				continue
 			}
 			v, ok := types.OidToType[t]
@@ -1011,7 +1016,7 @@ func (c *conn) handleDescribe(ctx context.Context, buf *pgwirebase.ReadBuffer) e
 	return c.stmtBuf.Push(
 		ctx,
 		sql.DescribeStmt{
-			Name: name,
+			Name: tree.Name(name),
 			Type: typ,
 		})
 }

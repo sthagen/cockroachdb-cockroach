@@ -184,27 +184,13 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 
 		shouldInit := !c.useStartSingleNode()
 		if shouldInit {
-			l.Printf("%s: initializing cluster", c.Name)
-			initOut, err := c.initializeCluster(ctx, node)
-			if err != nil {
-				return nil, errors.WithDetail(err, "unable to initialize cluster")
-			}
-
-			if initOut != "" {
-				l.Printf(initOut)
+			if err := c.initializeCluster(ctx, l, node); err != nil {
+				return nil, errors.Wrap(err, "failed to initialize cluster")
 			}
 		}
 
-		// We're sure to set cluster settings after having initialized the
-		// cluster.
-
-		l.Printf("%s: setting cluster settings", c.Name)
-		clusterSettingsOut, err := c.setClusterSettings(ctx, l, node)
-		if err != nil {
-			return nil, errors.Wrap(err, "unable to set cluster settings")
-		}
-		if clusterSettingsOut != "" {
-			l.Printf(clusterSettingsOut)
+		if err := c.setClusterSettings(ctx, l, node); err != nil {
+			return nil, errors.Wrap(err, "failed to set cluster settings")
 		}
 		return nil, nil
 	})
@@ -608,38 +594,45 @@ func (c *SyncedCluster) maybeScaleMem(val int) int {
 	return val
 }
 
-func (c *SyncedCluster) initializeCluster(ctx context.Context, node Node) (string, error) {
+func (c *SyncedCluster) initializeCluster(ctx context.Context, l *logger.Logger, node Node) error {
+	l.Printf("%s: initializing cluster\n", c.Name)
 	initCmd := c.generateInitCmd(node)
 
 	sess, err := c.newSession(node)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer sess.Close()
 
 	out, err := sess.CombinedOutput(ctx, initCmd)
 	if err != nil {
-		return "", errors.Wrapf(err, "~ %s\n%s", initCmd, out)
+		return errors.Wrapf(err, "~ %s\n%s", initCmd, out)
 	}
-	return strings.TrimSpace(string(out)), nil
+
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
-func (c *SyncedCluster) setClusterSettings(
-	ctx context.Context, l *logger.Logger, node Node,
-) (string, error) {
+func (c *SyncedCluster) setClusterSettings(ctx context.Context, l *logger.Logger, node Node) error {
+	l.Printf("%s: setting cluster settings", c.Name)
 	clusterSettingCmd := c.generateClusterSettingCmd(l, node)
 
 	sess, err := c.newSession(node)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer sess.Close()
 
 	out, err := sess.CombinedOutput(ctx, clusterSettingCmd)
 	if err != nil {
-		return "", errors.Wrapf(err, "~ %s\n%s", clusterSettingCmd, out)
+		return errors.Wrapf(err, "~ %s\n%s", clusterSettingCmd, out)
 	}
-	return strings.TrimSpace(string(out)), nil
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
 func (c *SyncedCluster) generateClusterSettingCmd(l *logger.Logger, node Node) string {

@@ -10,6 +10,7 @@ package backupccl
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/doctor"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -629,6 +631,7 @@ func backupShowerHeaders(showSchemas bool, opts map[string]string) colinfo.Resul
 		{Name: "size_bytes", Typ: types.Int},
 		{Name: "rows", Typ: types.Int},
 		{Name: "is_full_cluster", Typ: types.Bool},
+		{Name: "regions", Typ: types.String},
 	}
 	if showSchemas {
 		baseHeaders = append(baseHeaders, colinfo.ResultColumn{Name: "create_statement", Typ: types.String})
@@ -667,27 +670,36 @@ func backupShowerDefault(
 
 			var rows []tree.Datums
 			for layer, manifest := range info.manifests {
+				ctx, sp := tracing.ChildSpan(ctx, "backupccl.backupShowerDefault.fn.layer")
+
 				// Map database ID to descriptor name.
 				dbIDToName := make(map[descpb.ID]string)
 				schemaIDToName := make(map[descpb.ID]string)
+				typeIDToTypeDescriptor := make(map[descpb.ID]catalog.TypeDescriptor)
 				schemaIDToName[keys.PublicSchemaIDForBackup] = catconstants.PublicSchemaName
 				for i := range manifest.Descriptors {
-					_, db, _, schema, _ := descpb.FromDescriptor(&manifest.Descriptors[i])
-					if db != nil {
+					_, db, typ, schema, _ := descpb.FromDescriptor(&manifest.Descriptors[i])
+					switch {
+					case db != nil:
 						if _, ok := dbIDToName[db.ID]; !ok {
 							dbIDToName[db.ID] = db.Name
 						}
-					} else if schema != nil {
+					case typ != nil:
+						if _, ok := schemaIDToName[typ.ID]; !ok {
+							typeIDToTypeDescriptor[typ.ID] = typedesc.NewBuilder(typ).BuildImmutableType()
+						}
+					case schema != nil:
 						if _, ok := schemaIDToName[schema.ID]; !ok {
 							schemaIDToName[schema.ID] = schema.Name
 						}
 					}
 				}
+
 				var fileSizes []int64
 				if len(info.fileSizes) > 0 {
 					fileSizes = info.fileSizes[layer]
 				}
-				tableSizes, err := getTableSizes(manifest.Files, fileSizes)
+				tableSizes, err := getTableSizes(ctx, manifest.Files, fileSizes)
 				if err != nil {
 					return nil, err
 				}
@@ -721,6 +733,7 @@ func backupShowerDefault(
 					dataSizeDatum := tree.DNull
 					rowCountDatum := tree.DNull
 					fileSizeDatum := tree.DNull
+					regionsDatum := tree.DNull
 
 					desc := descbuilder.NewBuilder(descriptor).BuildExistingMutable()
 
@@ -728,6 +741,13 @@ func backupShowerDefault(
 					switch desc := desc.(type) {
 					case catalog.DatabaseDescriptor:
 						descriptorType = "database"
+						if desc.IsMultiRegion() {
+							regions, err := showRegions(typeIDToTypeDescriptor[desc.GetRegionConfig().RegionEnumID], desc.GetName())
+							if err != nil {
+								return nil, errors.Wrapf(err, "cannot generate regions column")
+							}
+							regionsDatum = nullIfEmpty(regions)
+						}
 					case catalog.SchemaDescriptor:
 						descriptorType = "schema"
 						dbName = dbIDToName[desc.GetParentID()]
@@ -755,18 +775,23 @@ func backupShowerDefault(
 						rowCountDatum = tree.NewDInt(tree.DInt(tableSize.rowCount.Rows))
 						fileSizeDatum = tree.NewDInt(tree.DInt(tableSize.fileSize))
 
-						displayOptions := sql.ShowCreateDisplayOptions{
-							FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
-							IgnoreComments: true,
+						// Only resolve the table schemas if running `SHOW BACKUP SCHEMAS`.
+						// In all other cases we discard these results and so it is wasteful
+						// to construct the SQL representation of the table's schema.
+						if showSchemas {
+							displayOptions := sql.ShowCreateDisplayOptions{
+								FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
+								IgnoreComments: true,
+							}
+							createStmt, err := p.ShowCreate(ctx, dbName, manifest.Descriptors,
+								tabledesc.NewBuilder(desc.TableDesc()).BuildImmutableTable(), displayOptions)
+							if err != nil {
+								// We expect that we might get an error here due to X-DB
+								// references, which were possible on 20.2 betas and rcs.
+								log.Errorf(ctx, "error while generating create statement: %+v", err)
+							}
+							createStmtDatum = nullIfEmpty(createStmt)
 						}
-						createStmt, err := p.ShowCreate(ctx, dbName, manifest.Descriptors,
-							tabledesc.NewBuilder(desc.TableDesc()).BuildImmutableTable(), displayOptions)
-						if err != nil {
-							// We expect that we might get an error here due to X-DB
-							// references, which were possible on 20.2 betas and rcs.
-							log.Errorf(ctx, "error while generating create statement: %+v", err)
-						}
-						createStmtDatum = nullIfEmpty(createStmt)
 					default:
 						descriptorType = "unknown"
 					}
@@ -782,12 +807,13 @@ func backupShowerDefault(
 						dataSizeDatum,
 						rowCountDatum,
 						tree.MakeDBool(manifest.DescriptorCoverage == tree.AllDescriptors),
+						regionsDatum,
 					}
 					if showSchemas {
 						row = append(row, createStmtDatum)
 					}
 					if _, shouldShowPrivileges := opts[backupOptWithPrivileges]; shouldShowPrivileges {
-						row = append(row, tree.NewDString(showPrivileges(descriptor)))
+						row = append(row, tree.NewDString(showPrivileges(ctx, descriptor)))
 						owner := desc.GetPrivileges().Owner().SQLIdentifier()
 						row = append(row, tree.NewDString(owner))
 					}
@@ -822,6 +848,7 @@ func backupShowerDefault(
 						tree.DNull, // DataSize
 						tree.DNull, // RowCount
 						tree.DNull, // Descriptor Coverage
+						tree.DNull, // Regions
 					}
 					if showSchemas {
 						row = append(row, tree.DNull)
@@ -848,6 +875,7 @@ func backupShowerDefault(
 					}
 					rows = append(rows, row)
 				}
+				sp.Finish()
 			}
 			return rows, nil
 		},
@@ -862,7 +890,11 @@ type descriptorSize struct {
 // getLogicalSSTSize gets the total logical bytes stored in each SST. Note that a
 // BackupManifest_File identifies a span in an SST and there can be multiple
 // spans stored in an SST.
-func getLogicalSSTSize(files []backuppb.BackupManifest_File) map[string]int64 {
+func getLogicalSSTSize(ctx context.Context, files []backuppb.BackupManifest_File) map[string]int64 {
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.getLogicalSSTSize")
+	defer span.Finish()
+	_ = ctx
+
 	sstDataSize := make(map[string]int64)
 	for _, file := range files {
 		sstDataSize[file.Path] += file.EntryCounts.DataSize
@@ -879,8 +911,11 @@ func approximateSpanPhysicalSize(
 
 // getTableSizes gathers row and size count for each table in the manifest
 func getTableSizes(
-	files []backuppb.BackupManifest_File, fileSizes []int64,
+	ctx context.Context, files []backuppb.BackupManifest_File, fileSizes []int64,
 ) (map[descpb.ID]descriptorSize, error) {
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.getTableSizes")
+	defer span.Finish()
+
 	tableSizes := make(map[descpb.ID]descriptorSize)
 	if len(files) == 0 {
 		return tableSizes, nil
@@ -891,7 +926,7 @@ func getTableSizes(
 	}
 	showCodec := keys.MakeSQLCodec(tenantID)
 
-	logicalSSTSize := getLogicalSSTSize(files)
+	logicalSSTSize := getLogicalSSTSize(ctx, files)
 
 	for i, file := range files {
 		// TODO(dan): This assumes each file in the backup only
@@ -932,7 +967,45 @@ func nullIfZero(i descpb.ID) tree.Datum {
 	return tree.NewDInt(tree.DInt(i))
 }
 
-func showPrivileges(descriptor *descpb.Descriptor) string {
+// showRegions constructs a string containing the ALTER DATABASE
+// commands that create the multi region specifications for a backed up database.
+func showRegions(typeDesc catalog.TypeDescriptor, dbname string) (string, error) {
+	var regionsStringBuilder strings.Builder
+	if typeDesc == nil {
+		return "", fmt.Errorf("type descriptor for %s is nil", dbname)
+	}
+
+	primaryRegionName, err := typeDesc.PrimaryRegionName()
+	if err != nil {
+		return "", err
+	}
+	regionsStringBuilder.WriteString("ALTER DATABASE ")
+	regionsStringBuilder.WriteString(dbname)
+	regionsStringBuilder.WriteString(" SET PRIMARY REGION ")
+	regionsStringBuilder.WriteString("\"" + primaryRegionName.String() + "\"")
+	regionsStringBuilder.WriteString(";")
+
+	regionNames, err := typeDesc.RegionNames()
+	if err != nil {
+		return "", err
+	}
+	for _, regionName := range regionNames {
+		if regionName != primaryRegionName {
+			regionsStringBuilder.WriteString(" ALTER DATABASE ")
+			regionsStringBuilder.WriteString(dbname)
+			regionsStringBuilder.WriteString(" ADD REGION ")
+			regionsStringBuilder.WriteString("\"" + regionName.String() + "\"")
+			regionsStringBuilder.WriteString(";")
+		}
+	}
+	return regionsStringBuilder.String(), nil
+}
+
+func showPrivileges(ctx context.Context, descriptor *descpb.Descriptor) string {
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.showPrivileges")
+	defer span.Finish()
+	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
+
 	var privStringBuilder strings.Builder
 
 	b := descbuilder.NewBuilder(descriptor)
@@ -1120,7 +1193,7 @@ func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
 					backupType = "incremental"
 				}
 
-				logicalSSTSize := getLogicalSSTSize(manifest.Files)
+				logicalSSTSize := getLogicalSSTSize(ctx, manifest.Files)
 				for j, file := range manifest.Files {
 					filePath := file.Path
 					if inCol != nil {

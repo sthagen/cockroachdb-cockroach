@@ -267,6 +267,11 @@ func restore(
 		return emptyRowCount, errors.Wrap(err, "resolving locality locations")
 	}
 
+	introducedSpanFrontier, err := createIntroducedSpanFrontier(backupManifests, endTime)
+	if err != nil {
+		return emptyRowCount, err
+	}
+
 	if err := checkCoverage(restoreCtx, dataToRestore.getSpans(), backupManifests); err != nil {
 		return emptyRowCount, err
 	}
@@ -275,8 +280,8 @@ func restore(
 	// which are grouped by keyrange.
 	highWaterMark := job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater
 
-	importSpans := makeSimpleImportSpans(dataToRestore.getSpans(), backupManifests, backupLocalityMap,
-		highWaterMark, targetRestoreSpanSize.Get(execCtx.ExecCfg().SV()))
+	importSpans := makeSimpleImportSpans(dataToRestore.getSpans(), backupManifests,
+		backupLocalityMap, introducedSpanFrontier, highWaterMark, targetRestoreSpanSize.Get(execCtx.ExecCfg().SV()))
 
 	if len(importSpans) == 0 {
 		// There are no files to restore.
@@ -741,11 +746,7 @@ func createImportingDescriptors(
 		// -  An offline table undergoing an IMPORT INTO has all importing data
 		//    elided in the restore processor and is restored online to its pre import
 		//    state.
-		//
-		// TODO (msbutler) remove the schema_change condition once the online schema changer
-		// doesn't rely on OFFLINE state (#86626, #86691)
-		if desc.Offline() && desc.GetDeclarativeSchemaChangerState() == nil {
-
+		if desc.Offline() {
 			if schema, ok := desc.(catalog.SchemaDescriptor); ok {
 				offlineSchemas[schema.GetID()] = struct{}{}
 			}
@@ -1182,8 +1183,18 @@ func createImportingDescriptors(
 					return err
 				}
 				for _, tenant := range details.Tenants {
-					// Mark the tenant info as adding.
-					tenant.State = descpb.TenantInfo_ADD
+					switch tenant.State {
+					case descpb.TenantInfo_ACTIVE:
+						// If the tenant was backed up in an `ACTIVE` state then we create
+						// the restored record in an `ADDING` state and mark it `ACTIVE` at
+						// the end of the restore.
+						tenant.State = descpb.TenantInfo_ADD
+					case descpb.TenantInfo_DROP, descpb.TenantInfo_ADD:
+					// If the tenant was backed up in a `DROP` or `ADD` state then we must
+					// create the restored tenant record in that state as well.
+					default:
+						return errors.AssertionFailedf("unknown tenant state %v", tenant)
+					}
 					if err := sql.CreateTenantRecord(ctx, p.ExecCfg(), txn, &tenant, initialTenantZoneConfig); err != nil {
 						return err
 					}
@@ -1465,9 +1476,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	if err != nil {
 		return err
 	}
-
-	preData, preValidateData, mainData, err := createImportingDescriptors(ctx, p, backupCodec,
-		sqlDescs, r)
+	preData, preValidateData, mainData, err := createImportingDescriptors(ctx, p, backupCodec, sqlDescs, r)
 	if err != nil {
 		return err
 	}
@@ -1659,7 +1668,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		// Reload the details as we may have updated the job.
 		details = r.job.Details().(jobspb.RestoreDetails)
 
-		if err := r.cleanupTempSystemTables(ctx, nil /* txn */); err != nil {
+		if err := r.cleanupTempSystemTables(ctx); err != nil {
 			return err
 		}
 	} else if isSystemUserRestore(details) {
@@ -1668,7 +1677,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		}
 		details = r.job.Details().(jobspb.RestoreDetails)
 
-		if err := r.cleanupTempSystemTables(ctx, nil /* txn */); err != nil {
+		if err := r.cleanupTempSystemTables(ctx); err != nil {
 			return err
 		}
 	}
@@ -2085,8 +2094,19 @@ func (r *restoreResumer) publishDescriptors(
 	}
 
 	for _, tenant := range details.Tenants {
-		if err := sql.ActivateTenant(ctx, r.execCfg, txn, tenant.ID); err != nil {
-			return err
+		switch tenant.State {
+		case descpb.TenantInfo_ACTIVE:
+			// If the tenant was backed up in an `ACTIVE` state then we must activate
+			// the tenant as the final step of the restore. The tenant has already
+			// been created at an earlier stage in the restore in an `ADD` state.
+			if err := sql.ActivateTenant(ctx, r.execCfg, txn, tenant.ID); err != nil {
+				return err
+			}
+		case descpb.TenantInfo_DROP, descpb.TenantInfo_ADD:
+		// If the tenant was backed up in a `DROP` or `ADD` state then we do not
+		// want to activate the tenant.
+		default:
+			return errors.AssertionFailedf("unknown tenant state %v", tenant)
 		}
 	}
 
@@ -2193,8 +2213,8 @@ func (r *restoreResumer) OnFailOrCancel(
 	logJobCompletion(ctx, restoreJobEventType, r.job.ID(), false, jobErr)
 
 	execCfg := execCtx.(sql.JobExecContext).ExecCfg()
-	if err := sql.DescsTxn(ctx, execCfg, func(
-		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+	if err := execCfg.CollectionFactory.TxnWithExecutor(ctx, execCfg.DB, p.SessionData(), func(
+		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection, ie sqlutil.InternalExecutor,
 	) error {
 		for _, tenant := range details.Tenants {
 			tenant.State = descpb.TenantInfo_DROP
@@ -2212,7 +2232,6 @@ func (r *restoreResumer) OnFailOrCancel(
 		if details.DescriptorCoverage == tree.AllDescriptors {
 			// We've dropped defaultdb and postgres in the planning phase, we must
 			// recreate them now if the full cluster restore failed.
-			ie := p.ExecCfg().InternalExecutor
 			_, err := ie.Exec(ctx, "recreate-defaultdb", txn, "CREATE DATABASE IF NOT EXISTS defaultdb")
 			if err != nil {
 				return err
@@ -2231,7 +2250,7 @@ func (r *restoreResumer) OnFailOrCancel(
 	if details.DescriptorCoverage == tree.AllDescriptors {
 		// The temporary system table descriptors should already have been dropped
 		// in `dropDescriptors` but we still need to drop the temporary system db.
-		if err := execCfg.DB.Txn(ctx, r.cleanupTempSystemTables); err != nil {
+		if err := r.cleanupTempSystemTables(ctx); err != nil {
 			return err
 		}
 	}
@@ -2780,12 +2799,12 @@ func (r *restoreResumer) restoreSystemTables(
 	return nil
 }
 
-func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context, txn *kv.Txn) error {
+func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context) error {
 	executor := r.execCfg.InternalExecutor
 	// Check if the temp system database has already been dropped. This can happen
 	// if the restore job fails after the system database has cleaned up.
 	checkIfDatabaseExists := "SELECT database_name FROM [SHOW DATABASES] WHERE database_name=$1"
-	if row, err := executor.QueryRow(ctx, "checking-for-temp-system-db" /* opName */, txn, checkIfDatabaseExists, restoreTempSystemDB); err != nil {
+	if row, err := executor.QueryRow(ctx, "checking-for-temp-system-db" /* opName */, nil /* txn */, checkIfDatabaseExists, restoreTempSystemDB); err != nil {
 		return errors.Wrap(err, "checking for temporary system db")
 	} else if row == nil {
 		// Temporary system DB might already have been dropped by the restore job.
@@ -2795,11 +2814,11 @@ func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context, txn *kv.Tx
 	// After restoring the system tables, drop the temporary database holding the
 	// system tables.
 	gcTTLQuery := fmt.Sprintf("ALTER DATABASE %s CONFIGURE ZONE USING gc.ttlseconds=1", restoreTempSystemDB)
-	if _, err := executor.Exec(ctx, "altering-gc-ttl-temp-system" /* opName */, txn, gcTTLQuery); err != nil {
+	if _, err := executor.Exec(ctx, "altering-gc-ttl-temp-system" /* opName */, nil /* txn */, gcTTLQuery); err != nil {
 		log.Errorf(ctx, "failed to update the GC TTL of %q: %+v", restoreTempSystemDB, err)
 	}
 	dropTableQuery := fmt.Sprintf("DROP DATABASE %s CASCADE", restoreTempSystemDB)
-	if _, err := executor.Exec(ctx, "drop-temp-system-db" /* opName */, txn, dropTableQuery); err != nil {
+	if _, err := executor.Exec(ctx, "drop-temp-system-db" /* opName */, nil /* txn */, dropTableQuery); err != nil {
 		return errors.Wrap(err, "dropping temporary system db")
 	}
 	return nil

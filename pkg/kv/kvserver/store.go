@@ -70,6 +70,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -98,9 +99,11 @@ const (
 	// store's Raft log entry cache.
 	defaultRaftEntryCacheSize = 1 << 24 // 16M
 
-	// replicaRequestQueueSize specifies the maximum number of requests to queue
-	// for a replica.
-	replicaRequestQueueSize = 100
+	// replicaQueueExtraSize is the number of requests that a replica's incoming
+	// message queue can keep over RaftConfig.RaftMaxInflightMsgs. When the leader
+	// maxes out RaftMaxInflightMsgs, we want the receiving replica to still have
+	// some buffer for other messages, primarily heartbeats.
+	replicaQueueExtraSize = 10
 
 	defaultGossipWhenCapacityDeltaExceedsFraction = 0.01
 
@@ -124,6 +127,13 @@ var storeSchedulerConcurrency = envutil.EnvOrDefaultInt(
 
 var logSSTInfoTicks = envutil.EnvOrDefaultInt(
 	"COCKROACH_LOG_SST_INFO_TICKS_INTERVAL", 60)
+
+// By default, telemetry events are emitted once per hour, per store:
+// (10s tick interval) * 6 * 60 = 3600s = 1h.
+var logStoreTelemetryTicks = envutil.EnvOrDefaultInt(
+	"COCKROACH_LOG_STORE_TELEMETRY_TICKS_INTERVAL",
+	6*60,
+)
 
 // bulkIOWriteLimit is defined here because it is used by BulkIOWriteLimiter.
 var bulkIOWriteLimit = settings.RegisterByteSizeSetting(
@@ -717,7 +727,7 @@ type Store struct {
 	engine          storage.Engine          // The underlying key-value store
 	tsCache         tscache.Cache           // Most recent timestamps for keys / key ranges
 	allocator       allocatorimpl.Allocator // Makes allocation decisions
-	replRankings    *replicaRankings
+	replRankings    *ReplicaRankings
 	storeRebalancer *StoreRebalancer
 	rangeIDAlloc    *idalloc.Allocator // Range ID allocator
 	mvccGCQueue     *mvccGCQueue       // MVCC GC queue
@@ -734,7 +744,6 @@ type Store struct {
 	scanner            *replicaScanner             // Replica scanner
 	consistencyQueue   *consistencyQueue           // Replica consistency check queue
 	consistencyLimiter *quotapool.RateLimiter      // Rate limits consistency checks
-	consistencySem     *quotapool.IntPool          // Limit concurrent consistency checks
 	metrics            *StoreMetrics
 	intentResolver     *intentresolver.IntentResolver
 	recoveryMgr        txnrecovery.Manager
@@ -1211,7 +1220,7 @@ func NewStore(
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedLeaseTransferMetrics)
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedReplicaRebalanceMetrics)
 	}
-	s.replRankings = newReplicaRankings()
+	s.replRankings = NewReplicaRankings()
 
 	s.raftRecvQueues.mon = mon.NewUnlimitedMonitor(
 		ctx,
@@ -1545,10 +1554,7 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString), v
 					// manually to a non-draining replica.
 
 					if !needsLeaseTransfer {
-						if verbose || log.V(1) {
-							// This logging is useful to troubleshoot incomplete drains.
-							log.Info(ctx, "not moving out")
-						}
+						// Skip this replica.
 						atomic.AddInt32(&numTransfersAttempted, -1)
 						return
 					}
@@ -2083,9 +2089,6 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		rate := consistencyCheckRate.Get(&s.ClusterSettings().SV)
 		s.consistencyLimiter.UpdateLimit(quotapool.Limit(rate), rate*consistencyCheckRateBurstFactor)
 	})
-	s.consistencySem = quotapool.NewIntPool("concurrent async consistency checks",
-		consistencyCheckAsyncConcurrency)
-	s.stopper.AddCloser(s.consistencySem.Closer("stopper"))
 
 	// Set the started flag (for unittests).
 	atomic.StoreInt32(&s.started, 1)
@@ -2983,7 +2986,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	replicaCount := s.metrics.ReplicaCount.Value()
 	bytesPerReplica := make([]float64, 0, replicaCount)
 	writesPerReplica := make([]float64, 0, replicaCount)
-	rankingsAccumulator := s.replRankings.newAccumulator()
+	rankingsAccumulator := s.replRankings.NewAccumulator()
 
 	// Query the current L0 sublevels and record the updated maximum to metrics.
 	l0SublevelsMax = int64(syncutil.LoadFloat64(&s.metrics.l0SublevelsWindowedMax))
@@ -3009,9 +3012,9 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 			totalWritesPerSecond += wps
 			writesPerReplica = append(writesPerReplica, wps)
 		}
-		rankingsAccumulator.addReplica(replicaWithStats{
-			repl: r,
-			qps:  qps,
+		rankingsAccumulator.AddReplica(candidateReplica{
+			Replica: r,
+			qps:     qps,
 		})
 		return true
 	})
@@ -3029,7 +3032,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	capacity.BytesPerReplica = roachpb.PercentilesFromData(bytesPerReplica)
 	capacity.WritesPerReplica = roachpb.PercentilesFromData(writesPerReplica)
 	s.recordNewPerSecondStats(totalQueriesPerSecond, totalWritesPerSecond)
-	s.replRankings.update(rankingsAccumulator)
+	s.replRankings.Update(rankingsAccumulator)
 
 	s.cachedCapacity.Lock()
 	s.cachedCapacity.StoreCapacity = capacity
@@ -3142,6 +3145,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		overreplicatedRangeCount  int64
 		behindCount               int64
 		pausedFollowerCount       int64
+		ioOverload                float64
 		slowRaftProposalCount     int64
 
 		locks                          int64
@@ -3166,6 +3170,12 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.mu.RLock()
 	uninitializedCount = int64(len(s.mu.uninitReplicas))
 	s.mu.RUnlock()
+
+	// TODO(kaisun314,kvoli): move this to a per-store admission control metrics
+	// struct when available. See pkg/util/admission/granter.go.
+	s.ioThreshold.Lock()
+	ioOverload, _ = s.ioThreshold.t.Score()
+	s.ioThreshold.Unlock()
 
 	newStoreReplicaVisitor(s).Visit(func(rep *Replica) bool {
 		metrics := rep.Metrics(ctx, now, livenessMap, clusterNodes)
@@ -3264,6 +3274,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.OverReplicatedRangeCount.Update(overreplicatedRangeCount)
 	s.metrics.RaftLogFollowerBehindCount.Update(behindCount)
 	s.metrics.RaftPausedFollowerCount.Update(pausedFollowerCount)
+	s.metrics.IOOverload.Update(ioOverload)
 	s.metrics.SlowRaftRequests.Update(slowRaftProposalCount)
 
 	var averageLockHoldDurationNanos int64
@@ -3342,6 +3353,18 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 		// will not contain the log prefix.
 		log.Infof(ctx, "\n%s", m.Metrics)
 	}
+	// Periodically emit a store stats structured event to the TELEMETRY channel,
+	// if reporting is enabled. These events are intended to be emitted at low
+	// frequency. Trigger on every (N-1)-th tick to avoid spamming the telemetry
+	// channel if crash-looping.
+	if logcrash.DiagnosticsReportingEnabled.Get(&s.ClusterSettings().SV) &&
+		tick%logStoreTelemetryTicks == logStoreTelemetryTicks-1 {
+		// The stats event is populated from a subset of the Metrics.
+		e := m.AsStoreStatsEvent()
+		e.NodeId = int32(s.NodeID())
+		e.StoreId = int32(s.StoreID())
+		log.StructuredEvent(ctx, &e)
+	}
 	return nil
 }
 
@@ -3372,16 +3395,16 @@ type HotReplicaInfo struct {
 // Note that this uses cached information, so it's cheap but may be slightly
 // out of date.
 func (s *Store) HottestReplicas() []HotReplicaInfo {
-	topQPS := s.replRankings.topQPS()
+	topQPS := s.replRankings.TopQPS()
 	hotRepls := make([]HotReplicaInfo, len(topQPS))
 	for i := range topQPS {
-		hotRepls[i].Desc = topQPS[i].repl.Desc()
-		hotRepls[i].QPS = topQPS[i].qps
-		hotRepls[i].RequestsPerSecond = topQPS[i].repl.RequestsPerSecond()
-		hotRepls[i].WriteKeysPerSecond = topQPS[i].repl.WritesPerSecond()
-		hotRepls[i].ReadKeysPerSecond = topQPS[i].repl.ReadsPerSecond()
-		hotRepls[i].WriteBytesPerSecond = topQPS[i].repl.WriteBytesPerSecond()
-		hotRepls[i].ReadBytesPerSecond = topQPS[i].repl.ReadBytesPerSecond()
+		hotRepls[i].Desc = topQPS[i].Desc()
+		hotRepls[i].QPS = topQPS[i].QPS()
+		hotRepls[i].RequestsPerSecond = topQPS[i].Repl().RequestsPerSecond()
+		hotRepls[i].WriteKeysPerSecond = topQPS[i].Repl().WritesPerSecond()
+		hotRepls[i].ReadKeysPerSecond = topQPS[i].Repl().ReadsPerSecond()
+		hotRepls[i].WriteBytesPerSecond = topQPS[i].Repl().WriteBytesPerSecond()
+		hotRepls[i].ReadBytesPerSecond = topQPS[i].Repl().ReadBytesPerSecond()
 	}
 	return hotRepls
 }

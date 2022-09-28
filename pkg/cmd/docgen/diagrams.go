@@ -370,6 +370,11 @@ var specs = []stmtSpec{
 		unlink: []string{"subdirectory", "collectionURI", "kmsURI"},
 	},
 	{
+		name:    "alter_backup_schedule",
+		replace: map[string]string{"iconst64": "schedule_id", "alter_backup_schedule_cmds": "options ( ',' options )*", "options": "'SET' ( 'LABEL' schedule_label | 'INTO' collectionURI | 'WITH' option | 'RECURRING' crontab | 'FULL BACKUP' ( crontab | 'ALWAYS' ) | 'SCHEDULE OPTION' schedule_option )"},
+		unlink:  []string{"schedule_id", "options", "option", "schedule_label", "collectionURI", "crontab", "schedule_option"},
+	},
+	{
 		name:    "alter_changefeed",
 		stmt:    "alter_changefeed_stmt",
 		replace: map[string]string{"a_expr": "job_id", "alter_changefeed_cmds": "( 'ADD' target ( ( ',' target ) )* ( 'WITH' ( initial_scan | no_initial_scan ) )? | 'DROP' target ( ( ',' target ) )* | ( 'SET' | 'UNSET' ) option ( ( ',' option ) )* )+"},
@@ -472,6 +477,12 @@ var specs = []stmtSpec{
 			"relation_expr":                  "table_name",
 			"opt_hash_sharded_bucket_count ": "",
 		},
+	},
+	{
+		name:    "alter_func_stmt",
+		inline:  []string{"alter_func_options_stmt", "alter_func_rename_stmt", "alter_func_owner_stmt", "alter_func_set_schema_stmt", "alter_func_dep_extension_stmt", "alter_func_opt_list", "common_func_opt_item", "opt_restrict", "opt_no"},
+		unlink:  []string{"alter_func_options_stmt", "alter_func_rename_stmt", "alter_func_owner_stmt", "alter_func_set_schema_stmt", "alter_func_dep_extension_stmt", "alter_func_opt_list", "common_func_opt_item", "opt_restrict", "opt_no"},
+		nosplit: true,
 	},
 	{
 		name:   "alter_role_stmt",
@@ -719,9 +730,12 @@ var specs = []stmtSpec{
 		name:   "create_schedule_for_backup_stmt",
 		inline: []string{"string_or_placeholder_opt_list", "string_or_placeholder_list", "opt_with_backup_options", "cron_expr", "opt_full_backup_clause", "opt_with_schedule_options", "opt_backup_targets"},
 		replace: map[string]string{
-			"string_or_placeholder 'FOR'":       "label 'FOR'",
-			"'RECURRING' sconst_or_placeholder": "'RECURRING' cronexpr",
-			"backup_targets":                    "( | ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )"},
+			"string_or_placeholder": "collectionURI",
+			"sconst_or_placeholder": "crontab",
+			"schedule_label_spec":   "( 'IF NOT EXISTS' | )  schedule_label",
+			"backup_targets":        "( | ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )",
+			"kv_option_list":        "schedule_option"},
+		unlink: []string{"schedule_label", "collection_URI", "crontab", "schedule_option"},
 	},
 	{
 		name:    "create_schema_stmt",
@@ -747,6 +761,19 @@ var specs = []stmtSpec{
 	{
 		name:    "create_table_stmt",
 		inline:  []string{"opt_table_elem_list", "table_elem_list", "table_elem", "opt_table_with", "opt_create_table_on_commit"},
+		nosplit: true,
+	},
+	{
+		name:   "create_func_stmt",
+		inline: []string{"opt_or_replace", "opt_func_arg_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "common_func_opt_item", "create_func_opt_item", "routine_return_stmt", "func_arg_with_default_list", "func_arg_with_default", "func_as"},
+		unlink: []string{"opt_or_replace", "opt_func_arg_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "create_func_opt_item", "common_func_opt_item", "routine_return_stmt", "non_reserved_word_or_sconst", "func_arg_with_default_list", "func_arg_with_default", "a_expr", "func_as"},
+		replace: map[string]string{
+			"func_as":                     "'SCONST'",
+			"non_reserved_word_or_sconst": "'SQL'",
+			"'DEFAULT'":                   "",
+			"'SETOF'":                     "",
+			"'='":                         "",
+			"a_expr":                      ""},
 		nosplit: true,
 	},
 	{
@@ -830,6 +857,12 @@ var specs = []stmtSpec{
 		stmt:   "drop_database_stmt",
 		inline: []string{"opt_drop_behavior"},
 		match:  []*regexp.Regexp{regexp.MustCompile("'DROP' 'DATABASE'")},
+	},
+	{
+		name:    "drop_func_stmt",
+		inline:  []string{"opt_drop_behavior", "function_with_argtypes_list", "function_with_argtypes", "func_args"},
+		unlink:  []string{"func_name"},
+		replace: map[string]string{"db_object_name": "func_name"},
 	},
 	{
 		name:    "drop_external_connection_stmt",
@@ -1325,7 +1358,7 @@ var specs = []stmtSpec{
 			"'BACKUP' string_or_placeholder 'IN' string_or_placeholder": "'BACKUP' subdirectory 'IN' location",
 			"'BACKUP' 'SCHEMAS' string_or_placeholder":                  "'BACKUP' 'SCHEMAS' location",
 		},
-		unlink: []string{"subdirectory", "location"},
+		unlink: []string{"subdirectory", "location", "location_opt_list"},
 	},
 	{
 		name:    "show_jobs",

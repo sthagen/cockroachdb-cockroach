@@ -72,6 +72,7 @@ var typeBuiltinsHaveUnderscore = map[oid.Oid]struct{}{
 	types.TimeTZ.Oid():      {},
 	types.Decimal.Oid():     {},
 	types.Interval.Oid():    {},
+	types.Json.Oid():        {},
 	types.Jsonb.Oid():       {},
 	types.Uuid.Oid():        {},
 	types.VarBit.Oid():      {},
@@ -264,8 +265,15 @@ func makePGGetViewDef(argTypes tree.ArgTypes) tree.Overload {
 			r, err := ctx.Planner.QueryRowEx(
 				ctx.Ctx(), "pg_get_viewdef",
 				sessiondata.NoSessionDataOverride,
-				"SELECT definition FROM pg_catalog.pg_views v JOIN pg_catalog.pg_class c ON "+
-					"c.relname=v.viewname WHERE oid=$1", args[0])
+				`SELECT definition
+ FROM pg_catalog.pg_views v
+ JOIN pg_catalog.pg_class c ON c.relname=v.viewname
+WHERE c.oid=$1
+UNION ALL
+SELECT definition
+ FROM pg_catalog.pg_matviews v
+ JOIN pg_catalog.pg_class c ON c.relname=v.matviewname
+WHERE c.oid=$1`, args[0])
 			if err != nil {
 				return nil, err
 			}
@@ -2169,6 +2177,8 @@ func getCatalogOidForComments(catalogName string) (id int, ok bool) {
 		return catconstants.PgCatalogDescriptionTableID, true
 	case "pg_constraint":
 		return catconstants.PgCatalogConstraintTableID, true
+	case "pg_namespace":
+		return catconstants.PgCatalogNamespaceTableID, true
 	default:
 		// We currently only support comments on pg_class objects
 		// (columns, tables) in this context.

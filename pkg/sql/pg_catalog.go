@@ -1145,7 +1145,9 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 					h := makeOidHasher()
 					scResolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
 					sc, err := p.Descriptors().GetImmutableSchemaByID(
-						ctx, p.txn, table.GetParentSchemaID(), tree.SchemaLookupFlags{})
+						ctx, p.txn, table.GetParentSchemaID(), tree.SchemaLookupFlags{
+							Required: true,
+						})
 					if err != nil {
 						return false, err
 					}
@@ -2422,7 +2424,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 		if err != nil {
 			return err
 		}
-		return forEachDatabaseDesc(ctx, p, nil /* dbContext */, false, /* requiresPrivileges */
+		return forEachDatabaseDesc(ctx, p, dbContext, false, /* requiresPrivileges */
 			func(dbDesc catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, dbDesc, func(scDesc catalog.SchemaDescriptor) error {
 					return scDesc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
@@ -3776,12 +3778,12 @@ https://www.postgresql.org/docs/14/view-pg-cursors.html`,
 				return err
 			}
 			if err := addRow(
-				tree.NewDString(name),        /* name */
-				tree.NewDString(c.statement), /* statement */
-				tree.DBoolFalse,              /* is_holdable */
-				tree.DBoolFalse,              /* is_binary */
-				tree.DBoolFalse,              /* is_scrollable */
-				tz,                           /* creation_date */
+				tree.NewDString(string(name)), /* name */
+				tree.NewDString(c.statement),  /* statement */
+				tree.DBoolFalse,               /* is_holdable */
+				tree.DBoolFalse,               /* is_binary */
+				tree.DBoolFalse,               /* is_scrollable */
+				tz,                            /* creation_date */
 			); err != nil {
 				return err
 			}

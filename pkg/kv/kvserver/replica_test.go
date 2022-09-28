@@ -1351,127 +1351,6 @@ func TestReplicaLeaseRejectUnknownRaftNodeID(t *testing.T) {
 	}
 }
 
-// Test that draining nodes only take the lease if they're the leader.
-func TestReplicaDrainLease(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	clusterArgs := base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				NodeLiveness: NodeLivenessTestingKnobs{
-					// This test waits for an epoch-based lease to expire, so we're setting the
-					// liveness duration as low as possible while still keeping the test stable.
-					LivenessDuration: 2000 * time.Millisecond,
-					RenewalDuration:  1000 * time.Millisecond,
-				},
-				Store: &StoreTestingKnobs{
-					// We eliminate clock offsets in order to eliminate the stasis period of
-					// leases. Otherwise we'd need to make leases longer.
-					MaxOffset: time.Nanosecond,
-				},
-			},
-		},
-	}
-	tc := serverutils.StartNewTestCluster(t, 2, clusterArgs)
-	defer tc.Stopper().Stop(ctx)
-	rngKey := tc.ScratchRange(t)
-	tc.AddVotersOrFatal(t, rngKey, tc.Target(1))
-
-	s1 := tc.Server(0)
-	s2 := tc.Server(1)
-	store1, err := s1.GetStores().(*Stores).GetStore(s1.GetFirstStoreID())
-	require.NoError(t, err)
-	store2, err := s2.GetStores().(*Stores).GetStore(s2.GetFirstStoreID())
-	require.NoError(t, err)
-
-	rd := tc.LookupRangeOrFatal(t, rngKey)
-	r1, err := store1.GetReplica(rd.RangeID)
-	require.NoError(t, err)
-	status := r1.CurrentLeaseStatus(ctx)
-	require.True(t, status.Lease.OwnedBy(store1.StoreID()), "someone else got the lease: %s", status)
-	// We expect the lease to be valid, but don't check that because, under race, it might have
-	// expired already.
-
-	// Stop n1's heartbeats and wait for the lease to expire.
-	log.Infof(ctx, "test: suspending heartbeats for n1")
-	cleanup := s1.NodeLiveness().(*liveness.NodeLiveness).PauseAllHeartbeatsForTest()
-	defer cleanup()
-
-	testutils.SucceedsSoon(t, func() error {
-		status := r1.CurrentLeaseStatus(ctx)
-		require.True(t, status.Lease.OwnedBy(store1.StoreID()), "someone else got the lease: %s", status)
-		if status.State == kvserverpb.LeaseState_VALID {
-			return errors.New("lease still valid")
-		}
-		// We need to wait for the stasis state to pass too; during stasis other
-		// replicas can't take the lease.
-		if status.State == kvserverpb.LeaseState_UNUSABLE {
-			return errors.New("lease still in stasis")
-		}
-		return nil
-	})
-
-	require.Equal(t, r1.RaftStatus().Lead, uint64(r1.ReplicaID()),
-		"expected leadership to still be on the first replica")
-
-	// Wait until n1 has heartbeat its liveness record (epoch >= 1) and n2
-	// knows about it. Otherwise, the following could occur:
-	//
-	// - n1's heartbeats to epoch 1 and acquires lease
-	// - n2 doesn't receive this yet (gossip)
-	// - when n2 is asked to acquire the lease, it uses a lease with epoch 1
-	//   but the liveness record with epoch zero
-	// - lease status is ERROR, lease acquisition (and thus test) fails.
-	testutils.SucceedsSoon(t, func() error {
-		nl, ok := s2.NodeLiveness().(*liveness.NodeLiveness).GetLiveness(s1.NodeID())
-		if !ok {
-			return errors.New("no liveness record for n1")
-		}
-		if nl.Epoch < 1 {
-			return errors.New("epoch for n1 still zero")
-		}
-		return nil
-	})
-
-	// Mark the stores as draining. We'll then start checking how acquiring leases
-	// behaves while draining.
-	store1.draining.Store(true)
-	store2.draining.Store(true)
-
-	r2, err := store2.GetReplica(rd.RangeID)
-	require.NoError(t, err)
-	// Check that a draining replica that's not the leader does NOT take the
-	// lease.
-	_, pErr := r2.redirectOnOrAcquireLease(ctx)
-	require.NotNil(t, pErr)
-	require.IsType(t, &roachpb.NotLeaseHolderError{}, pErr.GetDetail())
-
-	// Now transfer the leadership from r1 to r2 and check that r1 can now acquire
-	// the lease.
-
-	// Initiate the leadership transfer.
-	r1.mu.Lock()
-	r1.mu.internalRaftGroup.TransferLeader(uint64(r2.ReplicaID()))
-	r1.mu.Unlock()
-	// Run the range through the Raft scheduler, otherwise the leadership messages
-	// doesn't get sent because the range is quiesced.
-	store1.EnqueueRaftUpdateCheck(r1.RangeID)
-
-	// Wait for the leadership transfer to happen.
-	testutils.SucceedsSoon(t, func() error {
-		if r2.RaftStatus().SoftState.RaftState != raft.StateLeader {
-			return errors.Newf("r1 not yet leader")
-		}
-		return nil
-	})
-
-	// Check that r2 can now acquire the lease.
-	_, pErr = r2.redirectOnOrAcquireLease(ctx)
-	require.NoError(t, pErr.GoError())
-}
-
 // TestReplicaGossipFirstRange verifies that the first range gossips its
 // location and the cluster ID.
 func TestReplicaGossipFirstRange(t *testing.T) {
@@ -1771,12 +1650,13 @@ func TestOptimizePuts(t *testing.T) {
 
 	testCases := []struct {
 		exKey    roachpb.Key
+		exEndKey roachpb.Key // MVCC range key
 		reqs     []roachpb.Request
 		expBlind []bool
 	}{
 		// No existing keys, single put.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0],
 			},
@@ -1786,7 +1666,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// No existing keys, nine puts.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8],
 			},
@@ -1796,7 +1676,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// No existing keys, ten puts.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
 			},
@@ -1806,7 +1686,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at "0", ten conditional puts.
 		{
-			roachpb.Key("0"),
+			roachpb.Key("0"), nil,
 			[]roachpb.Request{
 				&cpArgs[0], &cpArgs[1], &cpArgs[2], &cpArgs[3], &cpArgs[4], &cpArgs[5], &cpArgs[6], &cpArgs[7], &cpArgs[8], &cpArgs[9],
 			},
@@ -1816,7 +1696,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at "0", ten init puts.
 		{
-			roachpb.Key("0"),
+			roachpb.Key("0"), nil,
 			[]roachpb.Request{
 				&ipArgs[0], &ipArgs[1], &ipArgs[2], &ipArgs[3], &ipArgs[4], &ipArgs[5], &ipArgs[6], &ipArgs[7], &ipArgs[8], &ipArgs[9],
 			},
@@ -1826,7 +1706,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at 11, mixed put types.
 		{
-			roachpb.Key("11"),
+			roachpb.Key("11"), nil,
 			[]roachpb.Request{
 				&pArgs[0], &cpArgs[1], &pArgs[2], &cpArgs[3], &ipArgs[4], &ipArgs[5], &pArgs[6], &cpArgs[7], &pArgs[8], &ipArgs[9],
 			},
@@ -1836,7 +1716,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at 00, ten puts, expect nothing blind.
 		{
-			roachpb.Key("00"),
+			roachpb.Key("00"), nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
 			},
@@ -1846,7 +1726,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at 00, ten puts in reverse order, expect nothing blind.
 		{
-			roachpb.Key("00"),
+			roachpb.Key("00"), nil,
 			[]roachpb.Request{
 				&pArgs[9], &pArgs[8], &pArgs[7], &pArgs[6], &pArgs[5], &pArgs[4], &pArgs[3], &pArgs[2], &pArgs[1], &pArgs[0],
 			},
@@ -1856,7 +1736,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at 05, ten puts, expect first five puts are blind.
 		{
-			roachpb.Key("05"),
+			roachpb.Key("05"), nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
 			},
@@ -1866,7 +1746,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Existing key at 09, ten puts, expect first nine puts are blind.
 		{
-			roachpb.Key("09"),
+			roachpb.Key("09"), nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
 			},
@@ -1876,7 +1756,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// No existing key, ten puts + inc + ten cputs.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
 				incArgs, &cpArgs[0], &cpArgs[1], &cpArgs[2], &cpArgs[3], &cpArgs[4], &cpArgs[5], &cpArgs[6], &cpArgs[7], &cpArgs[8], &cpArgs[9],
@@ -1888,7 +1768,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Duplicate put at 11th key; should see ten puts.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9], &pArgs[9],
 			},
@@ -1898,7 +1778,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Duplicate cput at 11th key; should see ten puts.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9], &cpArgs[9],
 			},
@@ -1908,7 +1788,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Duplicate iput at 11th key; should see ten puts.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9], &ipArgs[9],
 			},
@@ -1918,7 +1798,7 @@ func TestOptimizePuts(t *testing.T) {
 		},
 		// Duplicate cput at 10th key; should see ten cputs.
 		{
-			nil,
+			nil, nil,
 			[]roachpb.Request{
 				&cpArgs[0], &cpArgs[1], &cpArgs[2], &cpArgs[3], &cpArgs[4], &cpArgs[5], &cpArgs[6], &cpArgs[7], &cpArgs[8], &cpArgs[9], &cpArgs[9],
 			},
@@ -1926,14 +1806,45 @@ func TestOptimizePuts(t *testing.T) {
 				true, true, true, true, true, true, true, true, true, true, false,
 			},
 		},
+		// Existing range key at 00-20, ten puts, expect no blind.
+		{
+			roachpb.Key("00"), roachpb.Key("20"),
+			[]roachpb.Request{
+				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
+			},
+			[]bool{
+				false, false, false, false, false, false, false, false, false, false,
+			},
+		},
+		// Existing range key at 05-08, ten puts, expect first five puts are blind.
+		{
+			roachpb.Key("05"), roachpb.Key("08"),
+			[]roachpb.Request{
+				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
+			},
+			[]bool{
+				true, true, true, true, true, false, false, false, false, false,
+			},
+		},
+		// Existing range key at 20-21, ten puts, expect all blind.
+		{
+			roachpb.Key("20"), roachpb.Key("21"),
+			[]roachpb.Request{
+				&pArgs[0], &pArgs[1], &pArgs[2], &pArgs[3], &pArgs[4], &pArgs[5], &pArgs[6], &pArgs[7], &pArgs[8], &pArgs[9],
+			},
+			[]bool{
+				true, true, true, true, true, true, true, true, true, true,
+			},
+		},
 	}
 
 	for i, c := range testCases {
-		if c.exKey != nil {
-			if err := storage.MVCCPut(context.Background(), tc.engine, nil, c.exKey,
-				hlc.Timestamp{}, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("foo"), nil); err != nil {
-				t.Fatal(err)
-			}
+		if c.exEndKey != nil {
+			require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, tc.engine, nil,
+				c.exKey, c.exEndKey, hlc.MinTimestamp, hlc.ClockTimestamp{}, nil, nil, false, 0, nil))
+		} else if c.exKey != nil {
+			require.NoError(t, storage.MVCCPut(ctx, tc.engine, nil, c.exKey,
+				hlc.Timestamp{}, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("foo"), nil))
 		}
 		batch := roachpb.BatchRequest{}
 		for _, r := range c.reqs {
@@ -1976,10 +1887,11 @@ func TestOptimizePuts(t *testing.T) {
 		if !reflect.DeepEqual(blind, c.expBlind) {
 			t.Errorf("%d: expected %+v; got %+v", i, c.expBlind, blind)
 		}
-		if c.exKey != nil {
-			if err := tc.engine.ClearUnversioned(c.exKey); err != nil {
-				t.Fatal(err)
-			}
+		if c.exEndKey != nil {
+			require.NoError(t, tc.engine.ClearMVCCRangeKey(storage.MVCCRangeKey{
+				StartKey: c.exKey, EndKey: c.exEndKey, Timestamp: hlc.MinTimestamp}))
+		} else if c.exKey != nil {
+			require.NoError(t, tc.engine.ClearUnversioned(c.exKey))
 		}
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -127,6 +128,9 @@ func (b *Builder) buildCTEs(
 ) (outScope *scope, correlatedCTEs cteSources) {
 	if with == nil {
 		return inScope, nil
+	}
+	if b.insideFuncDef {
+		panic(unimplemented.New("user-defined functions", "CTE usage inside a function definition"))
 	}
 
 	outScope = inScope.push()
@@ -290,11 +294,11 @@ func (b *Builder) buildCTE(
 	bindingProps.Cardinality = props.AnyCardinality.AtLeast(props.OneCardinality)
 	// We don't really know the input row count, except for the first time we run
 	// the recursive query. We don't have anything better though.
-	bindingProps.Stats.RowCount = initialScope.expr.Relational().Stats.RowCount
+	bindingProps.Statistics().RowCount = initialScope.expr.Relational().Statistics().RowCount
 	// Row count must be greater than 0 or the stats code will throw an error.
 	// Set it to 1 to match the cardinality.
-	if bindingProps.Stats.RowCount < 1 {
-		bindingProps.Stats.RowCount = 1
+	if bindingProps.Statistics().RowCount < 1 {
+		bindingProps.Statistics().RowCount = 1
 	}
 	cteSrc.expr = b.factory.ConstructFakeRel(&memo.FakeRelPrivate{
 		Props: bindingProps,

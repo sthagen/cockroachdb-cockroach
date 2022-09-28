@@ -3031,6 +3031,9 @@ type DInterval struct {
 	duration.Duration
 }
 
+// DZeroInterval is the zero-valued DTimestamp.
+var DZeroInterval = &DInterval{}
+
 // AsDInterval attempts to retrieve a DInterval from an Expr, panicking if the
 // assertion fails.
 func AsDInterval(e Expr) (*DInterval, bool) {
@@ -5608,12 +5611,12 @@ func MaxDistinctCount(evalCtx CompareContext, first, last Datum) (_ int64, ok bo
 		return 0, false
 	}
 
-	delta := end - start
-	if delta < 0 {
+	delta := (end - start) + 1
+	if delta <= 0 {
 		// Overflow or underflow.
 		return 0, false
 	}
-	return delta + 1, true
+	return delta, true
 }
 
 // ParsePath splits a string of the form "/foo/bar" into strings ["foo", "bar"].

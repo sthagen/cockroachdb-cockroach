@@ -572,7 +572,11 @@ func TestBackupRestoreAppend(t *testing.T) {
 				tc.Servers[0].ClusterSettings(),
 				blobs.TestEmptyBlobClientFactory,
 				username.RootUserName(),
-				tc.Servers[0].InternalExecutor().(*sql.InternalExecutor), tc.Servers[0].DB(), nil)
+				tc.Servers[0].InternalExecutor().(*sql.InternalExecutor),
+				tc.Servers[0].CollectionFactory().(*descs.CollectionFactory),
+				tc.Servers[0].DB(),
+				nil, /* limiters */
+			)
 			require.NoError(t, err)
 			defer store.Close()
 			var files []string
@@ -5999,7 +6003,7 @@ func getMockTableDesc(
 	for _, addingIndex := range addingIndexes {
 		mutationID++
 		mockTableDescriptor.Mutations = append(mockTableDescriptor.Mutations, descpb.DescriptorMutation{
-			State:       descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
+			State:       descpb.DescriptorMutation_WRITE_ONLY,
 			Direction:   descpb.DescriptorMutation_ADD,
 			Descriptor_: &descpb.DescriptorMutation_Index{Index: &addingIndex},
 			MutationID:  mutationID,
@@ -6008,7 +6012,7 @@ func getMockTableDesc(
 	for _, droppingIndex := range droppingIndexes {
 		mutationID++
 		mockTableDescriptor.Mutations = append(mockTableDescriptor.Mutations, descpb.DescriptorMutation{
-			State:       descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
+			State:       descpb.DescriptorMutation_WRITE_ONLY,
 			Direction:   descpb.DescriptorMutation_DROP,
 			Descriptor_: &descpb.DescriptorMutation_Index{Index: &droppingIndex},
 			MutationID:  mutationID,
@@ -8021,7 +8025,12 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 		base.ExternalIODirConfig{},
 		st,
 		blobs.TestBlobServiceClient(dir),
-		username.RootUserName(), nil, nil, nil)
+		username.RootUserName(),
+		nil, /* ie */
+		nil, /* cf */
+		nil, /* kvDB */
+		nil, /* limiters */
+	)
 	require.NoError(t, err)
 
 	m := mon.NewMonitor("test-monitor", mon.MemoryResource, nil, nil, 0, 0, st)
@@ -9926,6 +9935,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 		}
 	}
 
+	sqlDB.Exec(t, `SET application_name = 'backup_test'`)
 	sqlDB.Exec(t, `CREATE DATABASE r1`)
 	sqlDB.Exec(t, `CREATE TABLE r1.foo (id INT)`)
 	sqlDB.Exec(t, `CREATE DATABASE r2`)
@@ -9950,6 +9960,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 		IsLocalityAware:         true,
 		AsOfInterval:            -1 * time.Millisecond.Nanoseconds(),
 		WithRevisionHistory:     true,
+		ApplicationName:         "backup_test",
 	}
 
 	// Also verify that there's a telemetry event corresponding to the completion
@@ -9984,6 +9995,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 		IsLocalityAware:         true,
 		AsOfInterval:            0,
 		Options:                 []string{telemetryOptionIntoDB, telemetryOptionSkipMissingFK},
+		ApplicationName:         "backup_test",
 	}
 
 	// Also verify that there's a telemetry event corresponding to the completion

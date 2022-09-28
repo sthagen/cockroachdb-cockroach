@@ -5303,8 +5303,9 @@ func CanGCEntireRange(
 }
 
 // MVCCFindSplitKey finds a key from the given span such that the left side of
-// the split is roughly targetSize bytes. The returned key will never be chosen
-// from the key ranges listed in keys.NoSplitSpans.
+// the split is roughly targetSize bytes. It only considers MVCC point keys, not
+// range keys. The returned key will never be chosen from the key ranges listed
+// in keys.NoSplitSpans.
 func MVCCFindSplitKey(
 	_ context.Context, reader Reader, key, endKey roachpb.RKey, targetSize int64,
 ) (roachpb.Key, error) {
@@ -5712,19 +5713,31 @@ func computeStatsForIterWithVisitors(
 	return ms, nil
 }
 
-// MVCCIsSpanEmpty returns true if there are no MVCC keys whatsoever in the
-// key span in the requested time interval.
+// MVCCIsSpanEmpty returns true if there are no MVCC keys whatsoever in the key
+// span in the requested time interval. If a time interval is given and any
+// inline values are encountered, an error may be returned.
 func MVCCIsSpanEmpty(
 	ctx context.Context, reader Reader, opts MVCCIsSpanEmptyOptions,
 ) (isEmpty bool, _ error) {
-	iter := NewMVCCIncrementalIterator(reader, MVCCIncrementalIterOptions{
-		KeyTypes:     IterKeyTypePointsAndRanges,
-		StartKey:     opts.StartKey,
-		EndKey:       opts.EndKey,
-		StartTime:    opts.StartTS,
-		EndTime:      opts.EndTS,
-		IntentPolicy: MVCCIncrementalIterIntentPolicyEmit,
-	})
+	// Only use an MVCCIncrementalIterator if time bounds are given, since it will
+	// error on any inline values, and the caller may want to respect them instead.
+	var iter SimpleMVCCIterator
+	if opts.StartTS.IsEmpty() && opts.EndTS.IsEmpty() {
+		iter = reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+			KeyTypes:   IterKeyTypePointsAndRanges,
+			LowerBound: opts.StartKey,
+			UpperBound: opts.EndKey,
+		})
+	} else {
+		iter = NewMVCCIncrementalIterator(reader, MVCCIncrementalIterOptions{
+			KeyTypes:     IterKeyTypePointsAndRanges,
+			StartKey:     opts.StartKey,
+			EndKey:       opts.EndKey,
+			StartTime:    opts.StartTS,
+			EndTime:      opts.EndTS,
+			IntentPolicy: MVCCIncrementalIterIntentPolicyEmit,
+		})
+	}
 	defer iter.Close()
 	iter.SeekGE(MVCCKey{Key: opts.StartKey})
 	valid, err := iter.Valid()
@@ -6256,8 +6269,9 @@ func ReplacePointTombstonesWithRangeTombstones(
 
 		key := iter.UnsafeKey()
 
-		// Skip intents and inline values.
-		if key.Timestamp.IsEmpty() {
+		// Skip intents and inline values, and system table keys which
+		// might be watched by rangefeeds.
+		if key.Timestamp.IsEmpty() || isWatchedSystemTable(key.Key) {
 			iter.NextKey()
 			continue
 		}
@@ -6348,4 +6362,30 @@ func ReplacePointTombstonesWithRangeTombstones(
 	}
 
 	return nil
+}
+
+// In order to test the correctness of range deletion tombstones, we added a
+// testing knob to replace point deletions with range deletion tombstones in
+// some tests. Unfortuantely, doing so affects the correctness of rangefeeds.
+// The tests in question do not use rangefeeds, but some system functionality
+// does use rangefeeds internally. The primary impact is that catch-up scans
+// will miss deletes. That makes these issues rare and hard to detect. In order
+// to deflake these tests, we avoid rewriting deletes on relevant system
+// tables.
+func isWatchedSystemTable(key roachpb.Key) bool {
+	rem, _, err := keys.DecodeTenantPrefix(key)
+	if err != nil { // allow unprefixed keys to pass through
+		return false
+	}
+	_, tableID, _, err := keys.DecodeTableIDIndexID(rem)
+	if err != nil { // allow keys which do not correspond to sql tables
+		return false
+	}
+	switch tableID {
+	case keys.SettingsTableID, keys.SpanConfigurationsTableID,
+		keys.SQLInstancesTableID, keys.DescriptorTableID, keys.ZonesTableID:
+		return true
+	default:
+		return false
+	}
 }

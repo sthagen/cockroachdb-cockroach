@@ -48,12 +48,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -63,7 +65,13 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3"
+)
+
+var transferExpirationLeasesFirstEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.transfer_expiration_leases_first.enabled",
+	"controls whether we transfer expiration-based leases that are later upgraded to epoch-based ones",
+	true,
 )
 
 var leaseStatusLogLimiter = func() *log.EveryN {
@@ -247,7 +255,10 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 		ProposedTS: &status.Now,
 	}
 
-	if p.repl.requiresExpiringLeaseRLocked() || transfer {
+	if p.repl.requiresExpiringLeaseRLocked() ||
+		(transfer &&
+			transferExpirationLeasesFirstEnabled.Get(&p.repl.store.ClusterSettings().SV) &&
+			p.repl.store.ClusterSettings().Version.IsActive(ctx, clusterversion.EnableLeaseUpgrade)) {
 		// In addition to ranges that unconditionally require expiration-based
 		// leases (node liveness and earlier), we also use them during lease
 		// transfers for all other ranges. After acquiring these expiration
@@ -798,30 +809,6 @@ func (r *Replica) requestLeaseLocked(
 	}
 	if pErr := r.store.TestingKnobs().PinnedLeases.rejectLeaseIfPinnedElsewhere(r); pErr != nil {
 		return r.mu.pendingLeaseRequest.newResolvedHandle(pErr)
-	}
-
-	// If we're draining, we'd rather not take any new leases (since we're also
-	// trying to move leases away elsewhere). But if we're the leader, we don't
-	// really have a choice and we take the lease - there might not be any other
-	// replica available to take this lease (perhaps they're all draining).
-	if r.store.IsDraining() {
-		// NB: Replicas that are not the Raft leader will not take leases anyway
-		// (see the check inside propBuf.FlushLockedWithRaftGroup()), so we don't
-		// really need any special behavior for draining nodes here. This check
-		// serves mostly as a means to get more granular logging and as a defensive
-		// precaution.
-		if r.raftBasicStatusRLocked().RaftState != raft.StateLeader {
-			log.VEventf(ctx, 2, "refusing to take the lease because we're draining")
-			return r.mu.pendingLeaseRequest.newResolvedHandle(
-				roachpb.NewError(
-					newNotLeaseHolderError(
-						roachpb.Lease{}, r.store.StoreID(), r.mu.state.Desc,
-						"refusing to take the lease; node is draining",
-					),
-				),
-			)
-		}
-		log.Info(ctx, "trying to take the lease while we're draining since we're the raft leader")
 	}
 
 	// Propose a Raft command to get a lease for this replica.
@@ -1508,25 +1495,25 @@ func (r *Replica) maybeExtendLeaseAsyncLocked(ctx context.Context, st kvserverpb
 	_ = r.requestLeaseLocked(ctx, st)
 }
 
-// checkLeaseRespectsPreferences checks if current replica owns the lease and
-// if it respects the lease preferences defined in the span config. If there are no
-// preferences defined then it will return true and consider that to be in-conformance.
-func (r *Replica) checkLeaseRespectsPreferences(ctx context.Context) (bool, error) {
-	if !r.OwnsValidLease(ctx, r.store.cfg.Clock.NowAsClockTimestamp()) {
-		return false, errors.Errorf("replica %s is not the leaseholder, cannot check lease preferences", r)
+// leaseViolatesPreferences checks if current replica owns the lease and if it
+// violates the lease preferences defined in the span config. If there is an
+// error or no preferences defined then it will return false and consider that
+// to be in-conformance.
+func (r *Replica) leaseViolatesPreferences(ctx context.Context) bool {
+	storeDesc, err := r.store.Descriptor(ctx, true /* useCached */)
+	if err != nil {
+		log.Infof(ctx, "Unable to load the descriptor %v: cannot check if lease violates preference", err)
+		return false
 	}
 	conf := r.SpanConfig()
 	if len(conf.LeasePreferences) == 0 {
-		return true, nil
-	}
-	storeDesc, err := r.store.Descriptor(ctx, false /* useCached */)
-	if err != nil {
-		return false, err
+		return false
 	}
 	for _, preference := range conf.LeasePreferences {
 		if constraint.ConjunctionsCheck(*storeDesc, preference.Constraints) {
-			return true, nil
+			return false
 		}
 	}
-	return false, nil
+	// We have at lease one preference set up, but we don't satisfy any.
+	return true
 }

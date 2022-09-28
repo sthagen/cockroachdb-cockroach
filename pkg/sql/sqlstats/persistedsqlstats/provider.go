@@ -93,6 +93,9 @@ func New(cfg *Config, memSQLStats *sslocal.SQLStats) *PersistedSQLStats {
 		scanInterval: defaultScanInterval,
 		jitterFn:     p.jitterInterval,
 	}
+	if cfg.Knobs != nil {
+		p.jobMonitor.testingKnobs.updateCheckInterval = cfg.Knobs.JobMonitorUpdateCheckInterval
+	}
 
 	return p
 }
@@ -160,6 +163,20 @@ func (s *PersistedSQLStats) GetLocalMemProvider() sqlstats.Provider {
 // GetNextFlushAt returns the time next flush is going to happen.
 func (s *PersistedSQLStats) GetNextFlushAt() time.Time {
 	return s.atomic.nextFlushAt.Load().(time.Time)
+}
+
+// GetSQLInstanceID returns the SQLInstanceID.
+func (s *PersistedSQLStats) GetSQLInstanceID() base.SQLInstanceID {
+	return s.cfg.SQLIDContainer.SQLInstanceID()
+}
+
+// GetEnabledSQLInstanceID returns the SQLInstanceID when gateway node is enabled,
+// and zero otherwise.
+func (s *PersistedSQLStats) GetEnabledSQLInstanceID() base.SQLInstanceID {
+	if sqlstats.GatewayNodeEnabled.Get(&s.cfg.Settings.SV) {
+		return s.cfg.SQLIDContainer.SQLInstanceID()
+	}
+	return 0
 }
 
 // nextFlushInterval calculates the wait interval that is between:

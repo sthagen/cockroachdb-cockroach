@@ -65,7 +65,7 @@ var SampleLogicalPlans = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"sql.metrics.statement_details.plan_collection.enabled",
 	"periodically save a logical plan for each fingerprint",
-	true,
+	false,
 ).WithPublic()
 
 // LogicalPlanCollectionPeriod specifies the interval between collections of
@@ -176,4 +176,14 @@ var MaxMemReportedSampleIndexRecommendations = settings.RegisterIntSetting(
 	"sql.metrics.statement_details.max_mem_reported_idx_recommendations",
 	"the maximum number of reported index recommendation info stored in memory",
 	5000,
+).WithPublic()
+
+// GatewayNodeEnabled specifies whether we save the gateway node id for each fingerprint
+// during sql stats collection, otherwise the value will be set to 0.
+var GatewayNodeEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.metrics.statement_details.gateway_node.enabled",
+	"save the gateway node for each statement fingerprint. If false, the value will "+
+		"be stored as 0.",
+	true,
 ).WithPublic()

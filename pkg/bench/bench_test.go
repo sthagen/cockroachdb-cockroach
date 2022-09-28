@@ -376,6 +376,34 @@ func runBenchmarkInsertSecondaryIndex(b *testing.B, db *sqlutils.SQLRunner, coun
 	b.StopTimer()
 }
 
+// runBenchmarkInsertReturning benchmarks inserting count rows into a table
+// while performing rendering for the RETURNING clause.
+func runBenchmarkInsertReturning(b *testing.B, db *sqlutils.SQLRunner, count int) {
+	defer func() {
+		db.Exec(b, `DROP TABLE IF EXISTS bench.insert`)
+	}()
+
+	db.Exec(b, `CREATE TABLE bench.insert (k INT PRIMARY KEY)`)
+
+	b.ResetTimer()
+	var buf bytes.Buffer
+	val := 0
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		buf.WriteString(`INSERT INTO bench.insert VALUES `)
+		for j := 0; j < count; j++ {
+			if j > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, "(%d)", val)
+			val++
+		}
+		buf.WriteString(` RETURNING k + 1, k - 1, k * 2, k / 2`)
+		db.Exec(b, buf.String())
+	}
+	b.StopTimer()
+}
+
 func BenchmarkSQL(b *testing.B) {
 	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
@@ -386,8 +414,10 @@ func BenchmarkSQL(b *testing.B) {
 			runBenchmarkInsertDistinct,
 			runBenchmarkInsertFK,
 			runBenchmarkInsertSecondaryIndex,
+			runBenchmarkInsertReturning,
 			runBenchmarkTrackChoices,
 			runBenchmarkUpdate,
+			runBenchmarkUpdateWithAssignmentCast,
 			runBenchmarkUpsert,
 		} {
 			fnName := runtime.FuncForPC(reflect.ValueOf(runFn).Pointer()).Name()
@@ -560,6 +590,44 @@ func runBenchmarkUpdate(b *testing.B, db *sqlutils.SQLRunner, count int) {
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
 		buf.WriteString(`UPDATE bench.update SET v = v + 1 WHERE k IN (`)
+		for j := 0; j < count; j++ {
+			if j > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, `%d`, s.Intn(rows))
+		}
+		buf.WriteString(`)`)
+		db.Exec(b, buf.String())
+	}
+	b.StopTimer()
+}
+
+// runBenchmarkUpdateWithAssignmentCast benchmarks updating count random rows in
+// a table where we need to perform an assigment cast to get the updated values.
+func runBenchmarkUpdateWithAssignmentCast(b *testing.B, db *sqlutils.SQLRunner, count int) {
+	defer func() {
+		db.Exec(b, `DROP TABLE IF EXISTS bench.update`)
+	}()
+
+	const rows = 10000
+	db.Exec(b, `CREATE TABLE bench.update (k INT PRIMARY KEY, v INT)`)
+
+	var buf bytes.Buffer
+	buf.WriteString(`INSERT INTO bench.update VALUES `)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		fmt.Fprintf(&buf, "(%d, %d)", i, i)
+	}
+	db.Exec(b, buf.String())
+
+	s := rand.New(rand.NewSource(5432))
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		buf.WriteString(`UPDATE bench.update SET v = (v + 1.0)::FLOAT WHERE k IN (`)
 		for j := 0; j < count; j++ {
 			if j > 0 {
 				buf.WriteString(", ")

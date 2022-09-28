@@ -394,8 +394,9 @@ var generators = map[string]builtinDefinition{
 
 	"crdb_internal.check_consistency": makeBuiltin(
 		tree.FunctionProperties{
-			Class:    tree.GeneratorClass,
-			Category: builtinconstants.CategorySystemInfo,
+			Class:            tree.GeneratorClass,
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // see #88222
 		},
 		makeGeneratorOverload(
 			tree.ArgTypes{
@@ -1887,6 +1888,13 @@ func makeCheckConsistencyGenerator(
 	mode := roachpb.ChecksumMode_CHECK_FULL
 	if statsOnly := bool(*args[0].(*tree.DBool)); statsOnly {
 		mode = roachpb.ChecksumMode_CHECK_STATS
+	}
+
+	if ctx.ConsistencyChecker == nil {
+		return nil, errors.WithIssueLink(
+			errors.AssertionFailedf("no consistency checker configured"),
+			errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/88222"},
+		)
 	}
 
 	return &checkConsistencyGenerator{

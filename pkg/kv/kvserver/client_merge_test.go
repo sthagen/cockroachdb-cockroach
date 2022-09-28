@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -539,6 +540,9 @@ func mergeCheckingTimestampCaches(
 			if !rhsRepl.OwnsValidLease(ctx, tc.Servers[1].Clock().NowAsClockTimestamp()) {
 				return errors.New("rhs store does not own valid lease for rhs range")
 			}
+			if rhsRepl.CurrentLeaseStatus(ctx).Lease.Type() != roachpb.LeaseEpoch {
+				return errors.Errorf("lease still an expiration based lease")
+			}
 			return nil
 		})
 	}
@@ -1004,6 +1008,9 @@ func TestStoreRangeMergeTimestampCacheCausality(t *testing.T) {
 		}
 		if !lhsRepl1.OwnsValidLease(ctx, tc.Servers[1].Clock().NowAsClockTimestamp()) {
 			return errors.New("s2 does not own valid lease for lhs range")
+		}
+		if lhsRepl1.CurrentLeaseStatus(ctx).Lease.Type() != roachpb.LeaseEpoch {
+			return errors.Errorf("lease still an expiration based lease")
 		}
 		return nil
 	})
@@ -3874,7 +3881,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		var mismatchedSstsIdx []int
 		// Iterate over all the tested SSTs and check that they're byte-by-byte equal.
 		for i := range sstNamesSubset {
-			actualSST, err := receivingEng.ReadFile(sstNamesSubset[i])
+			actualSST, err := fs.ReadFile(receivingEng, sstNamesSubset[i])
 			if err != nil {
 				return err
 			}
@@ -5118,69 +5125,124 @@ func TestStoreMergeGCHint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			Store: &kvserver.StoreTestingKnobs{
-				DisableMergeQueue: true,
-				DisableSplitQueue: true,
-			},
+	for _, d := range []struct {
+		name                string
+		dataLeft, dataRight bool
+		delLeft, delRight   bool
+		expectHint          bool
+	}{
+		{
+			name:       "merge similar ranges",
+			dataLeft:   true,
+			dataRight:  true,
+			delLeft:    true,
+			delRight:   true,
+			expectHint: true,
 		},
-	})
-	s := serv.(*server.TestServer)
-	defer s.Stopper().Stop(ctx)
-	store, err := s.Stores().GetStore(s.GetFirstStoreID())
-	require.NoError(t, err)
+		{
+			name:       "merge with data on right",
+			dataLeft:   true,
+			dataRight:  true,
+			delLeft:    true,
+			expectHint: false,
+		},
+		{
+			name:       "merge with data on left",
+			dataLeft:   true,
+			dataRight:  true,
+			delRight:   true,
+			expectHint: false,
+		},
+		{
+			name:       "merge with empty on left",
+			dataRight:  true,
+			delRight:   true,
+			expectHint: true,
+		},
+		{
+			name:       "merge with empty on right",
+			dataLeft:   true,
+			delLeft:    true,
+			expectHint: true,
+		},
+	} {
+		t.Run(d.name, func(t *testing.T) {
+			ctx := context.Background()
+			serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						DisableMergeQueue: true,
+						DisableSplitQueue: true,
+					},
+				},
+			})
+			s := serv.(*server.TestServer)
+			defer s.Stopper().Stop(ctx)
+			store, err := s.Stores().GetStore(s.GetFirstStoreID())
+			require.NoError(t, err)
 
-	leftKey := roachpb.Key("a")
-	splitKey := roachpb.Key("b")
-	rightKey := roachpb.Key("c")
-	content := []byte("test")
+			leftKey := roachpb.Key("a")
+			splitKey := roachpb.Key("b")
+			rightKey := roachpb.Key("c")
+			content := []byte("test")
 
-	put := func(key roachpb.Key) {
-		pArgs := putArgs(key, content)
-		_, pErr := kv.SendWrapped(ctx, store.TestSender(), pArgs)
-		require.NoError(t, pErr.GoError(), "failed to put value")
+			put := func(key roachpb.Key) {
+				pArgs := putArgs(key, content)
+				_, pErr := kv.SendWrapped(ctx, store.TestSender(), pArgs)
+				require.NoError(t, pErr.GoError(), "failed to put value")
+			}
+
+			delRange := func(key roachpb.Key) (wallTime int64) {
+				repl := store.LookupReplica(roachpb.RKey(key))
+				gcHint := repl.GetGCHint()
+				require.True(t, gcHint.IsEmpty(), "GC hint is not empty by default")
+
+				drArgs := &roachpb.DeleteRangeRequest{
+					UpdateRangeDeleteGCHint: true,
+					UseRangeTombstone:       true,
+					RequestHeader: roachpb.RequestHeader{
+						Key:    repl.Desc().StartKey.AsRawKey(),
+						EndKey: repl.Desc().EndKey.AsRawKey(),
+					},
+				}
+				_, pErr := kv.SendWrapped(ctx, store.TestSender(), drArgs)
+				require.NoError(t, pErr.GoError(), "failed to send delete range request")
+
+				return timeutil.Now().UnixNano()
+			}
+
+			splitArgs := adminSplitArgs(splitKey)
+			_, pErr := kv.SendWrapped(ctx, store.TestSender(), splitArgs)
+			require.NoError(t, pErr.GoError(), "failed to send admin split")
+
+			if d.dataLeft {
+				put(leftKey)
+			}
+			if d.dataRight {
+				put(rightKey)
+			}
+			var beforeSecondDel int64
+			if d.delLeft {
+				beforeSecondDel = delRange(leftKey)
+			}
+			if d.delRight {
+				delRange(rightKey)
+			}
+
+			r, err := s.LookupRange(leftKey)
+			require.NoError(t, err, "failed to lookup range")
+			mergeArgs := adminMergeArgs(r.StartKey.AsRawKey())
+			_, pErr = kv.SendWrapped(ctx, store.TestSender(), mergeArgs)
+			require.NoError(t, pErr.GoError(), "failed to send admin merge")
+
+			repl := store.LookupReplica(roachpb.RKey(leftKey))
+			gcHint := repl.GetGCHint()
+			require.Equal(t, d.expectHint, !gcHint.IsEmpty(), "GC hint is empty after range delete")
+			if d.expectHint && d.delLeft && d.delRight {
+				require.Greater(t, gcHint.LatestRangeDeleteTimestamp.WallTime, beforeSecondDel,
+					"highest timestamp wasn't picked up")
+			}
+			repl.AssertState(ctx, store.Engine())
+		})
 	}
-
-	delRange := func(key roachpb.Key) (wallTime int64) {
-		repl := store.LookupReplica(roachpb.RKey(key))
-		gcHint := repl.GetGCHint()
-		require.True(t, gcHint.IsEmpty(), "GC hint is not empty by default")
-
-		drArgs := &roachpb.DeleteRangeRequest{
-			UpdateRangeDeleteGCHint: true,
-			UseRangeTombstone:       true,
-			RequestHeader: roachpb.RequestHeader{
-				Key:    repl.Desc().StartKey.AsRawKey(),
-				EndKey: repl.Desc().EndKey.AsRawKey(),
-			},
-		}
-		_, pErr := kv.SendWrapped(ctx, store.TestSender(), drArgs)
-		require.NoError(t, pErr.GoError(), "failed to send delete range request")
-
-		return timeutil.Now().UnixNano()
-	}
-
-	splitArgs := adminSplitArgs(splitKey)
-	_, pErr := kv.SendWrapped(ctx, store.TestSender(), splitArgs)
-	require.NoError(t, pErr.GoError(), "failed to send admin split")
-
-	put(leftKey)
-	put(rightKey)
-	beforeSecondDel := delRange(leftKey)
-	delRange(rightKey)
-
-	r, err := s.LookupRange(leftKey)
-	require.NoError(t, err, "failed to lookup range")
-	mergeArgs := adminMergeArgs(r.StartKey.AsRawKey())
-	_, pErr = kv.SendWrapped(ctx, store.TestSender(), mergeArgs)
-	require.NoError(t, pErr.GoError(), "failed to send admin merge")
-
-	repl := store.LookupReplica(roachpb.RKey(leftKey))
-	gcHint := repl.GetGCHint()
-	require.False(t, gcHint.IsEmpty(), "GC hint is empty after range delete")
-	require.Greater(t, gcHint.LatestRangeDeleteTimestamp.WallTime, beforeSecondDel, "highest timestamp wasn't picked up")
-
-	repl.AssertState(ctx, store.Engine())
 }

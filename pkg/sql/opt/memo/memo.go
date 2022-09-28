@@ -466,6 +466,12 @@ func (m *Memo) NextWithID() opt.WithID {
 	return m.curWithID
 }
 
+// MaxWithID returns the current maximum assigned identifier for a WITH
+// expression.
+func (m *Memo) MaxWithID() opt.WithID {
+	return m.curWithID
+}
+
 // Detach is used when we detach a memo that is to be reused later (either for
 // execbuilding or with AssignPlaceholders). New expressions should no longer be
 // constructed in this memo.
@@ -487,7 +493,7 @@ func (m *Memo) Detach() {
 
 		switch t := parent.(type) {
 		case RelExpr:
-			t.Relational().Stats.ColStats = props.ColStatsMap{}
+			t.Relational().Statistics().ColStats = props.ColStatsMap{}
 		}
 	}
 	clearColStats(m.RootExpr())

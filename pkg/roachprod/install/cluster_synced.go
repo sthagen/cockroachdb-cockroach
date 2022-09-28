@@ -2290,29 +2290,19 @@ func (c *SyncedCluster) ParallelE(
 
 // Init initializes the cluster. It does it through node 1 (as per TargetNodes)
 // to maintain parity with auto-init behavior of `roachprod start` (when
-// --skip-init) is not specified. The implementation should be kept in
-// sync with Start().
+// --skip-init) is not specified.
 func (c *SyncedCluster) Init(ctx context.Context, l *logger.Logger) error {
-	// See Start(). We reserve a few special operations for the first node, so we
+	// We reserve a few special operations for the first node, so we
 	// strive to maintain the same here for interoperability.
-	const firstNodeIdx = 0
+	const firstNodeIdx = 1
 
-	l.Printf("%s: initializing cluster\n", c.Name)
-	initOut, err := c.initializeCluster(ctx, firstNodeIdx)
-	if err != nil {
+	if err := c.initializeCluster(ctx, l, firstNodeIdx); err != nil {
 		return errors.WithDetail(err, "install.Init() failed: unable to initialize cluster.")
 	}
-	if initOut != "" {
-		l.Printf(initOut)
-	}
 
-	l.Printf("%s: setting cluster settings", c.Name)
-	clusterSettingsOut, err := c.setClusterSettings(ctx, l, firstNodeIdx)
-	if err != nil {
+	if err := c.setClusterSettings(ctx, l, firstNodeIdx); err != nil {
 		return errors.WithDetail(err, "install.Init() failed: unable to set cluster settings.")
 	}
-	if clusterSettingsOut != "" {
-		l.Printf(clusterSettingsOut)
-	}
+
 	return nil
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type createFunctionNode struct {
@@ -65,14 +66,13 @@ func (n *createFunctionNode) startExec(params runParams) error {
 		}
 	}
 
-	scDesc, err := params.p.descCollection.GetMutableSchemaByName(
-		params.ctx, params.p.Txn(), n.dbDesc, n.scDesc.GetName(),
-		tree.SchemaLookupFlags{Required: true, RequireMutable: true},
+	mutFlags := tree.SchemaLookupFlags{Required: true, RequireMutable: true}
+	mutScDesc, err := params.p.descCollection.GetMutableSchemaByName(
+		params.ctx, params.p.Txn(), n.dbDesc, n.scDesc.GetName(), mutFlags,
 	)
 	if err != nil {
 		return err
 	}
-	mutScDesc := scDesc.(*schemadesc.Mutable)
 
 	var retErr error
 	params.p.runWithOptions(resolveFlags{contextDatabaseID: n.dbDesc.GetID()}, func() {
@@ -82,10 +82,20 @@ func (n *createFunctionNode) startExec(params runParams) error {
 				return err
 			}
 
-			if isNew {
-				return n.createNewFunction(udfMutableDesc, mutScDesc, params)
+			fnName := tree.MakeQualifiedFunctionName(n.dbDesc.GetName(), n.scDesc.GetName(), n.cf.FuncName.String())
+			event := eventpb.CreateFunction{
+				FunctionName: fnName.FQString(),
+				IsReplace:    !isNew,
 			}
-			return n.replaceFunction(udfMutableDesc, params)
+			if isNew {
+				err = n.createNewFunction(udfMutableDesc, mutScDesc, params)
+			} else {
+				err = n.replaceFunction(udfMutableDesc, params)
+			}
+			if err != nil {
+				return err
+			}
+			return params.p.logEvent(params.ctx, udfMutableDesc.GetID(), &event)
 		}()
 	})
 

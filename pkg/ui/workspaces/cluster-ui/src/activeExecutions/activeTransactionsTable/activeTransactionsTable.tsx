@@ -23,7 +23,7 @@ import { Tooltip } from "@cockroachlabs/ui-components";
 import { limitText } from "../../util";
 
 export function makeActiveTransactionsColumns(
-  isCockroachCloud: boolean,
+  isTenant: boolean,
 ): ColumnDescriptor<ActiveTransaction>[] {
   const execType: ExecutionType = "transaction";
   return [
@@ -31,21 +31,26 @@ export function makeActiveTransactionsColumns(
     {
       name: "mostRecentStatement",
       title: executionsTableTitles.mostRecentStatement(execType),
-      cell: (item: ActiveTransaction) => (
-        <Tooltip placement="bottom" content={item.query}>
-          <Link to={`/execution/statement/${item.statementID}`}>
-            {limitText(item.query || "", 70)}
-          </Link>
-        </Tooltip>
-      ),
+      cell: (item: ActiveTransaction) => {
+        const queryText = limitText(item.query || "", 70);
+        return (
+          <Tooltip placement="bottom" content={item.query}>
+            {item.statementID ? (
+              <Link to={`/execution/statement/${item.statementID}`}>
+                {queryText}
+              </Link>
+            ) : (
+              queryText
+            )}
+          </Tooltip>
+        );
+      },
       sort: (item: ActiveTransaction) => item.query,
     },
     activeTransactionColumnsFromCommon.status,
     activeTransactionColumnsFromCommon.startTime,
     activeTransactionColumnsFromCommon.elapsedTime,
-    !isCockroachCloud
-      ? activeTransactionColumnsFromCommon.timeSpentWaiting
-      : null,
+    !isTenant ? activeTransactionColumnsFromCommon.timeSpentWaiting : null,
     {
       name: "statementCount",
       title: executionsTableTitles.statementCount(execType),

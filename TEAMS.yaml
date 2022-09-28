@@ -36,6 +36,7 @@ cockroachdb/sql-observability:
   triage_column_id: 12618343
 cockroachdb/kv:
   aliases:
+    cockroachdb/admission-control: other
     cockroachdb/kv-triage: roachtest
     cockroachdb/kv-prs: other
   triage_column_id: 14242655
@@ -53,7 +54,7 @@ cockroachdb/security:
   triage_column_id: 0 # TODO
 cockroachdb/prodsec:
   triage_column_id: 0 # TODO as well
-cockroachdb/bulk-io:
+cockroachdb/disaster-recovery:
   triage_column_id: 3097123
 cockroachdb/cdc:
   aliases:
@@ -79,6 +80,8 @@ cockroachdb/jobs:
   aliases:
     cockroachdb/jobs-prs: other
   triage_column_id: 16360666
+cockroachdb/cloud-identity:
+  triage_column_id: 18588697
 cockroachdb/unowned:
   aliases:
     cockroachdb/rfc-prs: other

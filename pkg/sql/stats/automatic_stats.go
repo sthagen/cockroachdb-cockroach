@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -25,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -388,14 +388,20 @@ func (r *Refresher) Start(
 		// once on startup.
 		const initialTableCollectionDelay = time.Second
 		initialTableCollection := time.After(initialTableCollectionDelay)
+		var ensuringAllTables bool
 
 		for {
 			select {
 			case <-initialTableCollection:
 				r.ensureAllTables(ctx, &r.st.SV, initialTableCollectionDelay)
+				if len(r.mutationCounts) > 0 {
+					ensuringAllTables = true
+				}
 
 			case <-timer.C:
 				mutationCounts := r.mutationCounts
+				refreshingAllTables := ensuringAllTables
+				ensuringAllTables = false
 
 				var settingOverrides map[descpb.ID]catpb.AutoStatsSettings
 				// For each mutation count, look up auto stats setting overrides using
@@ -436,7 +442,7 @@ func (r *Refresher) Start(
 							// processing the current table longer than the refresh
 							// interval, look up the table descriptor to ensure we don't
 							// have stale table settings.
-							if elapsed > DefaultRefreshInterval {
+							if elapsed > DefaultRefreshInterval || refreshingAllTables {
 								desc = r.getTableDescriptor(ctx, tableID)
 								if desc != nil {
 									if !r.autoStatsEnabled(desc) {
@@ -518,7 +524,7 @@ FROM
 		AS OF SYSTEM TIME '-%s'
 WHERE
 	tbl.database_name IS NOT NULL
-	AND tbl.database_name <> '%s'
+	AND tbl.table_id NOT IN (%d, %d, %d, %d)  -- excluded system tables
 	AND tbl.drop_time IS NULL
 	AND (
 			crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', d.descriptor, false)->'table'->>'viewQuery'
@@ -588,7 +594,7 @@ func (r *Refresher) ensureAllTables(
 		getTablesWithAutoStatsExplicitlyEnabledQuery := fmt.Sprintf(
 			getAllTablesTemplateSQL,
 			initialTableCollectionDelay,
-			systemschema.SystemDatabaseName,
+			keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID,
 			explicitlyEnabledTablesPredicate,
 		)
 		r.getApplicableTables(ctx, getTablesWithAutoStatsExplicitlyEnabledQuery,
@@ -602,7 +608,7 @@ func (r *Refresher) ensureAllTables(
 	getAllTablesQuery := fmt.Sprintf(
 		getAllTablesTemplateSQL,
 		initialTableCollectionDelay,
-		systemschema.SystemDatabaseName,
+		keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID,
 		autoStatsEnabledOrNotSpecifiedPredicate,
 	)
 	r.getApplicableTables(ctx, getAllTablesQuery,

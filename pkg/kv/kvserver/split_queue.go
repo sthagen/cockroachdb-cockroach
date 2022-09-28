@@ -56,6 +56,8 @@ type splitQueue struct {
 	loadBasedCount telemetry.Counter
 }
 
+var _ queueImpl = &splitQueue{}
+
 // newSplitQueue returns a new instance of splitQueue.
 func newSplitQueue(store *Store, db *kv.DB) *splitQueue {
 	var purgChan <-chan time.Time
@@ -167,7 +169,7 @@ func (sq *splitQueue) process(
 		// attempts because splits can race with other descriptor modifications.
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be split.
-		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying")
+		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying; err: %v", err)
 		sq.MaybeAddAsync(ctx, r, sq.store.Clock().NowAsClockTimestamp())
 		return false, nil
 	}
@@ -263,6 +265,11 @@ func (sq *splitQueue) processAttempt(
 		return true, nil
 	}
 	return false, nil
+}
+
+func (*splitQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 // timer returns interval between processing successive queued splits.

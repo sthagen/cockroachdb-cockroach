@@ -687,6 +687,13 @@ func TestTenantLogic_drop_table(
 	runLogicTest(t, "drop_table")
 }
 
+func TestTenantLogic_drop_temp(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "drop_temp")
+}
+
 func TestTenantLogic_drop_type(
 	t *testing.T,
 ) {
@@ -1749,6 +1756,13 @@ func TestTenantLogic_statement_statistics(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "statement_statistics")
+}
+
+func TestTenantLogic_stats(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "stats")
 }
 
 func TestTenantLogic_storing(

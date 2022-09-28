@@ -2000,8 +2000,7 @@ func TestFailedImportGC(t *testing.T) {
 		ExternalIODir:            baseDir,
 		Knobs: base.TestingKnobs{
 			GCJob: &sql.GCJobTestingKnobs{
-				RunBeforeResume:      func(_ jobspb.JobID) error { <-blockGC; return nil },
-				SkipWaitingForMVCCGC: true,
+				RunBeforeResume: func(_ jobspb.JobID) error { <-blockGC; return nil },
 			},
 		},
 	}})
@@ -2027,6 +2026,9 @@ func TestFailedImportGC(t *testing.T) {
 	kvDB := tc.Server(0).DB()
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
+	// The test assumes we'll use the MVCC range tombstone in the GC job. We need
+	// to set this cluster setting to make that true.
+	sqlDB.Exec(t, `SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true`)
 
 	forceFailure = true
 	defer func() { forceFailure = false }()
@@ -2700,8 +2702,9 @@ func TestImportObjectLevelRBAC(t *testing.T) {
 	writeToUserfile := func(filename, data string) {
 		// Write to userfile storage now that testuser has CREATE privileges.
 		ie := tc.Server(0).InternalExecutor().(*sql.InternalExecutor)
+		cf := tc.Server(0).CollectionFactory().(*descs.CollectionFactory)
 		fileTableSystem1, err := cloud.ExternalStorageFromURI(ctx, dest, base.ExternalIODirConfig{},
-			cluster.NoSettings, blobs.TestEmptyBlobClientFactory, username.TestUserName(), ie, tc.Server(0).DB(), nil)
+			cluster.NoSettings, blobs.TestEmptyBlobClientFactory, username.TestUserName(), ie, cf, tc.Server(0).DB(), nil)
 		require.NoError(t, err)
 		require.NoError(t, cloud.WriteFile(ctx, fileTableSystem1, filename, bytes.NewReader([]byte(data))))
 	}
@@ -5848,7 +5851,11 @@ func TestImportPgDumpIgnoredStmts(t *testing.T) {
 			tc.Server(0).ClusterSettings(),
 			blobs.TestEmptyBlobClientFactory,
 			username.RootUserName(),
-			tc.Server(0).InternalExecutor().(*sql.InternalExecutor), tc.Server(0).DB(), nil)
+			tc.Server(0).InternalExecutor().(*sql.InternalExecutor),
+			tc.Server(0).CollectionFactory().(*descs.CollectionFactory),
+			tc.Server(0).DB(),
+			nil,
+		)
 		require.NoError(t, err)
 		defer store.Close()
 

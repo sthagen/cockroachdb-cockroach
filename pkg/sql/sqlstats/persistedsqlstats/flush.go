@@ -12,8 +12,10 @@ package persistedsqlstats
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -324,6 +326,7 @@ DO NOTHING
 	}
 	statistics := tree.NewDJSON(statisticsJSON)
 
+	nodeID := s.GetEnabledSQLInstanceID()
 	rowsAffected, err = s.cfg.InternalExecutor.ExecEx(
 		ctx,
 		"insert-txn-stats",
@@ -332,13 +335,13 @@ DO NOTHING
 			User: username.NodeUserName(),
 		},
 		insertStmt,
-		aggregatedTs,                         // aggregated_ts
-		serializedFingerprintID,              // fingerprint_id
-		stats.App,                            // app_name
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
-		aggInterval,                          // agg_interval
-		metadata,                             // metadata
-		statistics,                           // statistics
+		aggregatedTs,            // aggregated_ts
+		serializedFingerprintID, // fingerprint_id
+		stats.App,               // app_name
+		nodeID,                  // node_id
+		aggInterval,             // agg_interval
+		metadata,                // metadata
+		statistics,              // statistics
 	)
 
 	return rowsAffected, err
@@ -365,6 +368,7 @@ WHERE fingerprint_id = $2
 	}
 	statistics := tree.NewDJSON(statisticsJSON)
 
+	nodeID := s.GetEnabledSQLInstanceID()
 	rowsAffected, err := s.cfg.InternalExecutor.ExecEx(
 		ctx,
 		"update-stmt-stats",
@@ -373,11 +377,11 @@ WHERE fingerprint_id = $2
 			User: username.NodeUserName(),
 		},
 		updateStmt,
-		statistics,                           // statistics
-		serializedFingerprintID,              // fingerprint_id
-		aggregatedTs,                         // aggregated_ts
-		stats.App,                            // app_name
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		statistics,              // statistics
+		serializedFingerprintID, // fingerprint_id
+		aggregatedTs,            // aggregated_ts
+		stats.App,               // app_name
+		nodeID,                  // node_id
 	)
 
 	if err != nil {
@@ -386,8 +390,7 @@ WHERE fingerprint_id = $2
 
 	if rowsAffected == 0 {
 		return errors.AssertionFailedf("failed to update transaction statistics for  fingerprint_id: %s, app: %s, aggregated_ts: %s, node_id: %d",
-			serializedFingerprintID, stats.App, aggregatedTs,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			serializedFingerprintID, stats.App, aggregatedTs, nodeID)
 	}
 
 	return nil
@@ -413,7 +416,6 @@ WHERE fingerprint_id = $3
   AND plan_hash = $7
   AND node_id = $8
 `
-
 	statisticsJSON, err := sqlstatsutil.BuildStmtStatisticsJSON(&stats.Stats)
 	if err != nil {
 		return err
@@ -426,6 +428,7 @@ WHERE fingerprint_id = $3
 		}
 	}
 
+	nodeID := s.GetEnabledSQLInstanceID()
 	rowsAffected, err := s.cfg.InternalExecutor.ExecEx(
 		ctx,
 		"update-stmt-stats",
@@ -434,14 +437,14 @@ WHERE fingerprint_id = $3
 			User: username.NodeUserName(),
 		},
 		updateStmt,
-		statistics,                           // statistics
-		indexRecommendations,                 // index_recommendations
-		serializedFingerprintID,              // fingerprint_id
-		serializedTransactionFingerprintID,   // transaction_fingerprint_id
-		aggregatedTs,                         // aggregated_ts
-		stats.Key.App,                        // app_name
-		serializedPlanHash,                   // plan_hash
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		statistics,                         // statistics
+		indexRecommendations,               // index_recommendations
+		serializedFingerprintID,            // fingerprint_id
+		serializedTransactionFingerprintID, // transaction_fingerprint_id
+		aggregatedTs,                       // aggregated_ts
+		stats.Key.App,                      // app_name
+		serializedPlanHash,                 // plan_hash
+		nodeID,                             // node_id
 	)
 
 	if err != nil {
@@ -457,7 +460,7 @@ WHERE fingerprint_id = $3
 			"plan_hash: %d, "+
 			"node_id: %d",
 			serializedFingerprintID, serializedTransactionFingerprintID, stats.Key.App,
-			aggregatedTs, serializedPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
+			aggregatedTs, serializedPlanHash, nodeID)
 	}
 
 	return nil
@@ -472,13 +475,7 @@ func (s *PersistedSQLStats) insertStatementStats(
 	serializedPlanHash []byte,
 	stats *roachpb.CollectedStatementStatistics,
 ) (rowsAffected int, err error) {
-	insertStmt := `
-INSERT INTO system.statement_statistics
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-ON CONFLICT (crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8,
-             aggregated_ts, fingerprint_id, transaction_fingerprint_id, app_name, plan_hash, node_id)
-DO NOTHING
-`
+
 	aggInterval := s.GetAggregationInterval()
 
 	// Prepare data for insertion.
@@ -495,13 +492,39 @@ DO NOTHING
 	statistics := tree.NewDJSON(statisticsJSON)
 
 	plan := tree.NewDJSON(sqlstatsutil.ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription))
-	indexRecommendations := tree.NewDArray(types.String)
-	for _, recommendation := range stats.Stats.IndexRecommendations {
-		if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
-			return 0, err
+	nodeID := s.GetEnabledSQLInstanceID()
+
+	values := "$1 ,$2, $3, $4, $5, $6, $7, $8, $9, $10"
+	args := append(make([]interface{}, 0, 11),
+		aggregatedTs,                       // aggregated_ts
+		serializedFingerprintID,            // fingerprint_id
+		serializedTransactionFingerprintID, // transaction_fingerprint_id
+		serializedPlanHash,                 // plan_hash
+		stats.Key.App,                      // app_name
+		nodeID,                             // node_id
+		aggInterval,                        // agg_interval
+		metadata,                           // metadata
+		statistics,                         // statistics
+		plan,                               // plan
+	)
+	if s.cfg.Settings.Version.IsActive(ctx, clusterversion.AlterSystemStatementStatisticsAddIndexRecommendations) {
+		values = values + ", $11"
+		indexRecommendations := tree.NewDArray(types.String)
+		for _, recommendation := range stats.Stats.IndexRecommendations {
+			if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
+				return 0, err
+			}
 		}
+		args = append(args, indexRecommendations)
 	}
 
+	insertStmt := fmt.Sprintf(`
+INSERT INTO system.statement_statistics
+VALUES (%s)
+ON CONFLICT (crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8,
+             aggregated_ts, fingerprint_id, transaction_fingerprint_id, app_name, plan_hash, node_id)
+DO NOTHING
+`, values)
 	rowsAffected, err = s.cfg.InternalExecutor.ExecEx(
 		ctx,
 		"insert-stmt-stats",
@@ -510,17 +533,7 @@ DO NOTHING
 			User: username.NodeUserName(),
 		},
 		insertStmt,
-		aggregatedTs,                         // aggregated_ts
-		serializedFingerprintID,              // fingerprint_id
-		serializedTransactionFingerprintID,   // transaction_fingerprint_id
-		serializedPlanHash,                   // plan_hash
-		stats.Key.App,                        // app_name
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
-		aggInterval,                          // agg_interval
-		metadata,                             // metadata
-		statistics,                           // statistics
-		plan,                                 // plan
-		indexRecommendations,                 // index_recommendations
+		args...,
 	)
 
 	return rowsAffected, err
@@ -548,6 +561,7 @@ WHERE fingerprint_id = $1
 FOR UPDATE
 `
 
+	nodeID := s.GetEnabledSQLInstanceID()
 	row, err := s.cfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"fetch-txn-stats",
@@ -555,11 +569,11 @@ FOR UPDATE
 		sessiondata.InternalExecutorOverride{
 			User: username.NodeUserName(),
 		},
-		readStmt,                             // stmt
-		serializedFingerprintID,              // fingerprint_id
-		appName,                              // app_name
-		aggregatedTs,                         // aggregated_ts
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		readStmt,                // stmt
+		serializedFingerprintID, // fingerprint_id
+		appName,                 // app_name
+		aggregatedTs,            // aggregated_ts
+		nodeID,                  // node_id
 	)
 
 	if err != nil {
@@ -569,13 +583,13 @@ FOR UPDATE
 	if row == nil {
 		return errors.AssertionFailedf("transaction statistics not found for fingerprint_id: %s, app: %s, aggregated_ts: %s, node_id: %d",
 			serializedFingerprintID, appName, aggregatedTs,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			nodeID)
 	}
 
 	if len(row) != 1 {
 		return errors.AssertionFailedf("unexpectedly found %d returning columns for fingerprint_id: %s, app: %s, aggregated_ts: %s, node_id: %d",
 			len(row), serializedFingerprintID, appName, aggregatedTs,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			nodeID)
 	}
 
 	statistics := tree.MustBeDJSON(row[0])
@@ -605,6 +619,7 @@ WHERE fingerprint_id = $1
     AND node_id = $6
 FOR UPDATE
 `
+	nodeID := s.GetEnabledSQLInstanceID()
 	row, err := s.cfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"fetch-stmt-stats",
@@ -612,13 +627,13 @@ FOR UPDATE
 		sessiondata.InternalExecutorOverride{
 			User: username.NodeUserName(),
 		},
-		readStmt,                             // stmt
-		serializedFingerprintID,              // fingerprint_id
-		serializedTransactionFingerprintID,   // transaction_fingerprint_id
-		key.App,                              // app_name
-		aggregatedTs,                         // aggregated_ts
-		serializedPlanHash,                   // plan_hash
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		readStmt,                           // stmt
+		serializedFingerprintID,            // fingerprint_id
+		serializedTransactionFingerprintID, // transaction_fingerprint_id
+		key.App,                            // app_name
+		aggregatedTs,                       // aggregated_ts
+		serializedPlanHash,                 // plan_hash
+		nodeID,                             // node_id
 	)
 
 	if err != nil {
@@ -628,13 +643,12 @@ FOR UPDATE
 	if row == nil {
 		return errors.AssertionFailedf(
 			"statement statistics not found fingerprint_id: %s, app: %s, aggregated_ts: %s, plan_hash: %d, node_id: %d",
-			serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
+			serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, nodeID)
 	}
 
 	if len(row) != 1 {
 		return errors.AssertionFailedf("unexpectedly found %d returning columns for fingerprint_id: %s, app: %s, aggregated_ts: %s, plan_hash %d, node_id: %d",
-			len(row), serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			len(row), serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, nodeID)
 	}
 
 	statistics := tree.MustBeDJSON(row[0])

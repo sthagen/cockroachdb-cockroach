@@ -64,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigptsreader"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/catalog/schematelemetry" // register schedules declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -218,8 +219,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	if opts, ok := cfg.TestingKnobs.AdmissionControl.(*admission.Options); ok {
 		admissionOptions.Override(opts)
 	}
-	admissionOptions.Settings = st
-	gcoords, metrics := admission.NewGrantCoordinators(cfg.AmbientCtx, admissionOptions)
+	gcoords := admission.NewGrantCoordinators(cfg.AmbientCtx, st, admissionOptions, registry)
 	ssg, err := admission.MakeSoftSlotGranter(gcoords.Regular)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to soft slot granter")
@@ -391,9 +391,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	tcsFactory := kvcoord.NewTxnCoordSenderFactory(txnCoordSenderFactoryCfg, distSender)
 
-	for i := range metrics {
-		registry.AddMetricStruct(metrics[i])
-	}
 	cbID := goschedstats.RegisterRunnableCountCallback(gcoords.Regular.CPULoad)
 	stopper.AddCloser(stop.CloserFn(func() {
 		goschedstats.UnregisterRunnableCountCallback(cbID)
@@ -487,6 +484,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// InternalExecutor uses this one instance.
 	internalExecutor := &sql.InternalExecutor{}
 	jobRegistry := &jobs.Registry{} // ditto
+	collectionFactory := &descs.CollectionFactory{}
 
 	// Create an ExternalStorageBuilder. This is only usable after Start() where
 	// we initialize all the configuration params.
@@ -836,6 +834,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		closedSessionCache:       closedSessionCache,
 		flowScheduler:            flowScheduler,
 		circularInternalExecutor: internalExecutor,
+		collectionFactory:        collectionFactory,
 		internalExecutorFactory:  nil, // will be initialized in server.newSQLServer.
 		circularJobRegistry:      jobRegistry,
 		jobAdoptionStopFile:      jobAdoptionStopFile,
@@ -1083,6 +1082,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		s.nodeDialer,
 		s.cfg.TestingKnobs,
 		&fileTableInternalExecutor,
+		s.sqlServer.execCfg.CollectionFactory,
 		s.db,
 		nil, /* TenantExternalIORecorder */
 	)
@@ -1399,7 +1399,9 @@ func (s *Server) PreStart(ctx context.Context) error {
 		}
 	})
 
-	if err := schedulerlatency.StartSampler(ctx, s.st, s.stopper); err != nil {
+	if err := schedulerlatency.StartSampler(
+		ctx, s.st, s.stopper, s.registry, base.DefaultMetricsSampleInterval,
+	); err != nil {
 		return err
 	}
 

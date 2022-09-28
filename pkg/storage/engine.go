@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -265,10 +266,11 @@ type MVCCIterator interface {
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
 	ValueProto(msg protoutil.Message) error
-	// FindSplitKey finds a key from the given span such that the left side of
-	// the split is roughly targetSize bytes. The returned key will never be
-	// chosen from the key ranges listed in keys.NoSplitSpans and will always
-	// sort equal to or after minSplitKey.
+	// FindSplitKey finds a key from the given span such that the left side of the
+	// split is roughly targetSize bytes. It only considers MVCC point keys, not
+	// range keys. The returned key will never be chosen from the key ranges
+	// listed in keys.NoSplitSpans and will always sort equal to or after
+	// minSplitKey.
 	//
 	// DO NOT CALL directly (except in wrapper MVCCIterator implementations). Use the
 	// package-level MVCCFindSplitKey instead. For correct operation, the caller
@@ -905,13 +907,6 @@ type Engine interface {
 	// CompactRange ensures that the specified range of key value pairs is
 	// optimized for space efficiency.
 	CompactRange(start, end roachpb.Key) error
-	// InMem returns true if the receiver is an in-memory engine and false
-	// otherwise.
-	//
-	// TODO(peter): This is a bit of a wart in the interface. It is used by
-	// addSSTablePreApply to select alternate code paths, but really there should
-	// be a unified code path there.
-	InMem() bool
 	// RegisterFlushCompletedCallback registers a callback that will be run for
 	// every successful flush. Only one callback can be registered at a time, so
 	// registering again replaces the previous callback. The callback must
@@ -921,10 +916,6 @@ type Engine interface {
 	RegisterFlushCompletedCallback(cb func())
 	// Filesystem functionality.
 	fs.FS
-	// ReadFile reads the content from the file with the given filename int this RocksDB's env.
-	ReadFile(filename string) ([]byte, error)
-	// WriteFile writes data to a file in this RocksDB's env.
-	WriteFile(filename string, data []byte) error
 	// CreateCheckpoint creates a checkpoint of the engine in the given directory,
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used.
@@ -1024,6 +1015,65 @@ func (m *Metrics) CompactedBytes() (read, written uint64) {
 	return read, written
 }
 
+// AsStoreStatsEvent converts a Metrics struct into an eventpb.StoreStats event,
+// suitable for logging to the telemetry channel.
+func (m *Metrics) AsStoreStatsEvent() eventpb.StoreStats {
+	e := eventpb.StoreStats{
+		CacheSize:                  m.BlockCache.Size,
+		CacheCount:                 m.BlockCache.Count,
+		CacheHits:                  m.BlockCache.Hits,
+		CacheMisses:                m.BlockCache.Misses,
+		CompactionCountDefault:     m.Compact.DefaultCount,
+		CompactionCountDeleteOnly:  m.Compact.DeleteOnlyCount,
+		CompactionCountElisionOnly: m.Compact.ElisionOnlyCount,
+		CompactionCountMove:        m.Compact.MoveCount,
+		CompactionCountRead:        m.Compact.ReadCount,
+		CompactionCountRewrite:     m.Compact.RewriteCount,
+		CompactionNumInProgress:    m.Compact.NumInProgress,
+		CompactionMarkedFiles:      int64(m.Compact.MarkedFiles),
+		FlushCount:                 m.Flush.Count,
+		MemtableSize:               m.MemTable.Size,
+		MemtableCount:              m.MemTable.Count,
+		MemtableZombieCount:        m.MemTable.ZombieCount,
+		MemtableZombieSize:         m.MemTable.ZombieSize,
+		WalLiveCount:               m.WAL.Files,
+		WalLiveSize:                m.WAL.Size,
+		WalObsoleteCount:           m.WAL.ObsoleteFiles,
+		WalObsoleteSize:            m.WAL.ObsoletePhysicalSize,
+		WalPhysicalSize:            m.WAL.PhysicalSize,
+		WalBytesIn:                 m.WAL.BytesIn,
+		WalBytesWritten:            m.WAL.BytesWritten,
+		TableObsoleteCount:         m.Table.ObsoleteCount,
+		TableObsoleteSize:          m.Table.ObsoleteSize,
+		TableZombieCount:           m.Table.ZombieCount,
+		TableZombieSize:            m.Table.ZombieSize,
+		RangeKeySetsCount:          m.Keys.RangeKeySetsCount,
+	}
+	for i, l := range m.Levels {
+		if l.NumFiles == 0 {
+			continue
+		}
+		e.Levels = append(e.Levels, eventpb.LevelStats{
+			Level:           uint32(i),
+			NumFiles:        l.NumFiles,
+			SizeBytes:       l.Size,
+			Score:           float32(l.Score),
+			BytesIn:         l.BytesIn,
+			BytesIngested:   l.BytesIngested,
+			BytesMoved:      l.BytesMoved,
+			BytesRead:       l.BytesRead,
+			BytesCompacted:  l.BytesCompacted,
+			BytesFlushed:    l.BytesFlushed,
+			TablesCompacted: l.TablesCompacted,
+			TablesFlushed:   l.TablesFlushed,
+			TablesIngested:  l.TablesIngested,
+			TablesMoved:     l.TablesMoved,
+			NumSublevels:    l.Sublevels,
+		})
+	}
+	return e
+}
+
 // EnvStats is a set of RocksDB env stats, including encryption status.
 type EnvStats struct {
 	// TotalFiles is the total number of files reported by rocksdb.
@@ -1111,11 +1161,13 @@ func GetIntent(reader Reader, key roachpb.Key) (*roachpb.Intent, error) {
 	return &intent, nil
 }
 
-// Scan returns up to max key/value objects starting from start (inclusive)
-// and ending at end (non-inclusive). Specify max=0 for unbounded scans. Since
-// this code may use an intentInterleavingIter, the caller should not attempt
-// a single scan to span local and global keys. See the comment in the
-// declaration of intentInterleavingIter for details.
+// Scan returns up to max point key/value objects from start (inclusive) to end
+// (non-inclusive). Specify max=0 for unbounded scans. Since this code may use
+// an intentInterleavingIter, the caller should not attempt a single scan to
+// span local and global keys. See the comment in the declaration of
+// intentInterleavingIter for details.
+//
+// NB: This function ignores MVCC range keys. It should only be used for tests.
 func Scan(reader Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, error) {
 	var kvs []MVCCKeyValue
 	err := reader.MVCCIterate(start, end, MVCCKeyAndIntentsIterKind, IterKeyTypePointsOnly,

@@ -666,6 +666,7 @@ func TestChangefeedCursor(t *testing.T) {
 		// 'after', throw a couple sleeps around them. We round timestamps to
 		// Microsecond granularity for Postgres compatibility, so make the
 		// sleeps 10x that.
+		beforeInsert := s.Server.Clock().Now()
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'before')`)
 		time.Sleep(10 * time.Microsecond)
 
@@ -676,6 +677,32 @@ func TestChangefeedCursor(t *testing.T) {
 
 		time.Sleep(10 * time.Microsecond)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (2, 'after')`)
+
+		// The below function is currently used to test negative timestamp in cursor i.e of the form
+		// "-3us".
+		// Using this function we can calculate the difference with the time that was before
+		// the insert statement, which is set as the new cursor value inside createChangefeedJobRecord
+		calculateCursor := func(currentTime *hlc.Timestamp) string {
+			//  Should convert to microseconds as that is the maximum precision we support
+			diff := (beforeInsert.WallTime - currentTime.WallTime) / 1000
+			diffStr := strconv.FormatInt(diff, 10) + "us"
+			return diffStr
+		}
+
+		knobs := s.TestingKnobs.DistSQL.(*execinfra.TestingKnobs).Changefeed.(*TestingKnobs)
+		knobs.OverrideCursor = calculateCursor
+
+		// The "-3 days" is a placeholder here - it will be replaced with actual difference
+		// in createChangefeedJobRecord
+		fooInterval := feed(t, f, `CREATE CHANGEFEED FOR foo WITH cursor=$1`, "-3 days")
+		defer closeFeed(t, fooInterval)
+		assertPayloads(t, fooInterval, []string{
+			`foo: [1]->{"after": {"a": 1, "b": "before"}}`,
+			`foo: [2]->{"after": {"a": 2, "b": "after"}}`,
+		})
+
+		// We do not need to override for the remaining cases
+		knobs.OverrideCursor = nil
 
 		fooLogical := feed(t, f, `CREATE CHANGEFEED FOR foo WITH cursor=$1`, tsLogical)
 		defer closeFeed(t, fooLogical)
@@ -1057,6 +1084,26 @@ func TestNoStopAfterNonTargetColumnDrop(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
+}
+
+func TestChangefeedProjectionDelete(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE foo (id int primary key, a string)`)
+		sqlDB.Exec(t, `INSERT INTO foo values (0, 'a')`)
+		foo := feed(t, f, `CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT * FROM foo`)
+		defer closeFeed(t, foo)
+		assertPayloads(t, foo, []string{
+			`foo: [0]->{"a": "a", "id": 0}`,
+		})
+		sqlDB.Exec(t, `DELETE FROM foo WHERE id = 0`)
+		assertPayloads(t, foo, []string{
+			`foo: [0]->{}`,
+		})
+	}
+	cdcTest(t, testFn, feedTestForceSink("cloudstorage"))
 }
 
 // If we drop columns which are not targeted by the changefeed, it should not backfill.
@@ -2482,9 +2529,7 @@ func TestChangefeedBareJSON(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO foo values (0, 'dog')`)
 		foo := feed(t, f, `CREATE CHANGEFEED WITH schema_change_policy=stop AS SELECT * FROM foo`)
 		defer closeFeed(t, foo)
-		assertPayloads(t, foo, []string{
-			`foo: [0]->{"a": 0, "b": "dog"}`,
-		})
+		assertPayloads(t, foo, []string{`foo: [0]->{"a": 0, "b": "dog"}`})
 	}
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 	cdcTest(t, testFn, feedTestForceSink("enterprise"))
@@ -6314,28 +6359,28 @@ func TestChangefeedOnlyInitialScanCSV(t *testing.T) {
 		`initial scan only with csv`: {
 			changefeedStmt: `CREATE CHANGEFEED FOR foo WITH initial_scan_only, format = csv`,
 			expectedPayload: []string{
-				`1,'Alice'`,
-				`2,'Bob'`,
-				`3,'Carol'`,
+				`1,Alice`,
+				`2,Bob`,
+				`3,Carol`,
 			},
 		},
 		`initial backfill only with csv`: {
 			changefeedStmt: `CREATE CHANGEFEED FOR foo WITH initial_scan = 'only', format = csv`,
 			expectedPayload: []string{
-				`1,'Alice'`,
-				`2,'Bob'`,
-				`3,'Carol'`,
+				`1,Alice`,
+				`2,Bob`,
+				`3,Carol`,
 			},
 		},
 		`initial backfill only with csv multiple tables`: {
 			changefeedStmt: `CREATE CHANGEFEED FOR foo, bar WITH initial_scan = 'only', format = csv`,
 			expectedPayload: []string{
-				`1,'a'`,
-				`2,'b'`,
-				`3,'c'`,
-				`1,'Alice'`,
-				`2,'Bob'`,
-				`3,'Carol'`,
+				`1,a`,
+				`2,b`,
+				`3,c`,
+				`1,Alice`,
+				`2,Bob`,
+				`3,Carol`,
 			},
 		},
 	}
@@ -6413,9 +6458,9 @@ func TestChangefeedOnlyInitialScanCSVSinkless(t *testing.T) {
 				sqlDB.Exec(t, "INSERT INTO foo VALUES (4, 'Doug'), (5, 'Elaine'), (6, 'Fred')")
 
 				expectedMessages := []string{
-					`1,'Alice'`,
-					`2,'Bob'`,
-					`3,'Carol'`,
+					`1,Alice`,
+					`2,Bob`,
+					`3,Carol`,
 				}
 				var actualMessages []string
 
@@ -7377,4 +7422,112 @@ func TestChangefeedKafkaMessageTooLarge(t *testing.T) {
 	}
 
 	cdcTest(t, testFn, feedTestForceSink(`kafka`))
+}
+
+// Regression for #85902.
+func TestRedactedSchemaRegistry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE test_table (id INT PRIMARY KEY, i int, j int)`)
+
+		userInfoToRedact := "7JHKUXMWYD374NV:secret-key"
+		registryURI := fmt.Sprintf("https://%s@psrc-x77pq.us-central1.gcp.confluent.cloud:443", userInfoToRedact)
+
+		changefeedDesc := fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE test_table WITH updated,
+					confluent_schema_registry =
+					"%s";`, registryURI)
+		registryURIWithRedaction := strings.Replace(registryURI, userInfoToRedact, "redacted", 1)
+		cf := feed(t, f, changefeedDesc)
+		defer closeFeed(t, cf)
+
+		var description string
+		sqlDB.QueryRow(t, "SELECT description from [SHOW CHANGEFEED JOBS]").Scan(&description)
+
+		assert.Contains(t, description, registryURIWithRedaction)
+	}
+
+	// kafka supports the confluent_schema_registry option.
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
+type echoResolver struct {
+	result []roachpb.Spans
+	pos    int
+}
+
+func (r *echoResolver) getRangesForSpans(
+	_ context.Context, _ []roachpb.Span,
+) (spans []roachpb.Span, _ error) {
+	spans = r.result[r.pos]
+	r.pos++
+	return spans, nil
+}
+
+func TestPartitionSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	partitions := func(p ...sql.SpanPartition) []sql.SpanPartition {
+		return p
+	}
+	mkPart := func(n base.SQLInstanceID, spans ...roachpb.Span) sql.SpanPartition {
+		return sql.SpanPartition{SQLInstanceID: n, Spans: spans}
+	}
+	mkSpan := func(start, end string) roachpb.Span {
+		return roachpb.Span{Key: []byte(start), EndKey: []byte(end)}
+	}
+	spans := func(s ...roachpb.Span) roachpb.Spans {
+		return s
+	}
+	const sensitivity = 0.01
+
+	for i, tc := range []struct {
+		input   []sql.SpanPartition
+		resolve []roachpb.Spans
+		expect  []sql.SpanPartition
+	}{
+		{
+			input: partitions(
+				mkPart(1, mkSpan("a", "j")),
+				mkPart(2, mkSpan("j", "q")),
+				mkPart(3, mkSpan("q", "z")),
+			),
+			// 6 total ranges, 2 per node.
+			resolve: []roachpb.Spans{
+				spans(mkSpan("a", "c"), mkSpan("c", "e"), mkSpan("e", "j")),
+				spans(mkSpan("j", "q")),
+				spans(mkSpan("q", "y"), mkSpan("y", "z")),
+			},
+			expect: partitions(
+				mkPart(1, mkSpan("a", "e")),
+				mkPart(2, mkSpan("e", "q")),
+				mkPart(3, mkSpan("q", "z")),
+			),
+		},
+		{
+			input: partitions(
+				mkPart(1, mkSpan("a", "c"), mkSpan("e", "p"), mkSpan("r", "z")),
+				mkPart(2),
+				mkPart(3, mkSpan("c", "e"), mkSpan("p", "r")),
+			),
+			// 5 total ranges -- on 2 nodes; target should be 1 per node.
+			resolve: []roachpb.Spans{
+				spans(mkSpan("a", "c"), mkSpan("e", "p"), mkSpan("r", "z")),
+				spans(),
+				spans(mkSpan("c", "e"), mkSpan("p", "r")),
+			},
+			expect: partitions(
+				mkPart(1, mkSpan("a", "c"), mkSpan("e", "p")),
+				mkPart(2, mkSpan("r", "z")),
+				mkPart(3, mkSpan("c", "e"), mkSpan("p", "r")),
+			),
+		},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			sp, err := rebalanceSpanPartitions(context.Background(),
+				&echoResolver{result: tc.resolve}, sensitivity, tc.input)
+			require.NoError(t, err)
+			require.Equal(t, tc.expect, sp)
+		})
+	}
 }

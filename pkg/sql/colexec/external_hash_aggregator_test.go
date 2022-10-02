@@ -43,6 +43,7 @@ func TestExternalHashAggregator(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -100,7 +101,7 @@ func TestExternalHashAggregator(t *testing.T) {
 			}
 			log.Infof(ctx, "diskSpillingEnabled=%t/spillForced=%t/memoryLimitBytes=%d/numRepartitions=%d/%s", cfg.diskSpillingEnabled, cfg.spillForced, cfg.memoryLimitBytes, numForcedRepartitions, tc.name)
 			constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-				&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+				ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 			)
 			require.NoError(t, err)
 			verifier := colexectestutils.OrderedVerifier
@@ -171,6 +172,7 @@ func BenchmarkExternalHashAggregator(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},

@@ -73,6 +73,7 @@ const sortedDistinctProcName = "sorted distinct"
 
 // newDistinct instantiates a new Distinct processor.
 func newDistinct(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.DistinctSpec,
@@ -98,8 +99,7 @@ func newDistinct(
 		}
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
-	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "distinct-mem")
+	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, "distinct-mem")
 	d := &distinct{
 		input:            input,
 		memAcc:           memMonitor.MakeBoundAccount(),
@@ -118,7 +118,7 @@ func newDistinct(
 	}
 
 	if err := d.Init(
-		d, post, d.types, flowCtx, processorID, output, memMonitor, /* memMonitor */
+		ctx, d, post, d.types, flowCtx, processorID, output, memMonitor, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{d.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -128,7 +128,7 @@ func newDistinct(
 		}); err != nil {
 		return nil, err
 	}
-	d.lastGroupKey = d.OutputHelper.RowAlloc.AllocRow(len(d.types))
+	d.lastGroupKey = make(rowenc.EncDatumRow, len(d.types))
 	d.haveLastGroupKey = false
 	// If we set up the arena when d is created, the pointer to the memAcc
 	// will be changed because the sortedDistinct case makes a copy of d.

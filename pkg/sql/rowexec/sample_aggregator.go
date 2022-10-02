@@ -85,6 +85,7 @@ const sampleAggregatorProcName = "sample aggregator"
 var SampleAggregatorProgressInterval = 5 * time.Second
 
 func newSampleAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.SampleAggregatorSpec,
@@ -107,11 +108,10 @@ func newSampleAggregator(
 		}
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will disable histogram collection if this limit is not
 	// enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "sample-aggregator-mem")
+	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "sample-aggregator-mem")
 	rankCol := len(input.OutputTypes()) - 8
 	s := &sampleAggregator{
 		spec:         spec,
@@ -170,7 +170,7 @@ func newSampleAggregator(
 	}
 
 	if err := s.Init(
-		nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
+		ctx, nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()

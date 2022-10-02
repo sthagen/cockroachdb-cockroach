@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -172,6 +173,7 @@ func (n *dropSchemaNode) startExec(params runParams) error {
 
 	// Create the job to drop the schema.
 	if err := p.createDropSchemaJob(
+		params.ctx,
 		schemaIDs,
 		n.d.getDroppedTableDetails(),
 		n.d.typesToDelete,
@@ -209,6 +211,12 @@ func (p *planner) dropSchemaImpl(
 	// Update parent database schemas mapping.
 	delete(parentDB.Schemas, sc.GetName())
 
+	// Exit early with an error if the schema is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(sc) {
+		return scerrors.ConcurrentSchemaChangeError(sc)
+	}
+
 	// Update the schema descriptor as dropped.
 	sc.SetDropped()
 
@@ -231,6 +239,7 @@ func (p *planner) dropSchemaImpl(
 }
 
 func (p *planner) createDropSchemaJob(
+	ctx context.Context,
 	schemas []descpb.ID,
 	tableDropDetails []jobspb.DroppedTableDetails,
 	typesToDrop []*typedesc.Mutable,
@@ -241,7 +250,7 @@ func (p *planner) createDropSchemaJob(
 		typeIDs = append(typeIDs, t.ID)
 	}
 
-	_, err := p.extendedEvalCtx.QueueJob(p.EvalContext().Ctx(), jobs.Record{
+	_, err := p.extendedEvalCtx.QueueJob(ctx, jobs.Record{
 		Description:   jobDesc,
 		Username:      p.User(),
 		DescriptorIDs: schemas,

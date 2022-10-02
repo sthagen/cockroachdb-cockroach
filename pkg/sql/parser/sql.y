@@ -4283,7 +4283,7 @@ func_arg_class:
 | OUT { return unimplemented(sqllex, "create function with 'OUT' argument class") }
 | INOUT { return unimplemented(sqllex, "create function with 'INOUT' argument class") }
 | IN OUT { return unimplemented(sqllex, "create function with 'IN OUT' argument class") }
-| VARIADIC { return unimplemented(sqllex, "create function with 'VARIADIC' argument class") }
+| VARIADIC { return unimplementedWithIssueDetail(sqllex, 88947, "variadic user-defined functions") }
 
 func_arg_type:
   typename
@@ -7310,6 +7310,7 @@ show_transfer_stmt:
 // %Category: DDL
 // %Text:
 // SHOW CREATE [ TABLE | SEQUENCE | VIEW | DATABASE ] <object_name>
+// SHOW CREATE [ SECONDARY ] INDEXES FROM <table_name>
 // SHOW CREATE ALL SCHEMAS
 // SHOW CREATE ALL TABLES
 // SHOW CREATE ALL TYPES
@@ -7339,6 +7340,16 @@ show_create_stmt:
     /* SKIP DOC */
     $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeDatabase, Name: $4.unresolvedObjectName()}
 	}
+| SHOW CREATE INDEXES FROM table_name
+  {
+    /* SKIP DOC */
+    $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeIndexes, Name: $5.unresolvedObjectName()}
+  }
+| SHOW CREATE SECONDARY INDEXES FROM table_name
+  {
+    /* SKIP DOC */
+    $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeSecondaryIndexes, Name: $6.unresolvedObjectName()}
+  }
 | SHOW CREATE FUNCTION db_object_name
   {
     /* SKIP DOC */
@@ -12380,8 +12391,6 @@ simple_typename:
     $$.val = $1.typeReference()
   }
 | const_typename
-| bit_with_length
-| character_with_length
 | interval_type
 | POINT error { return unimplementedWithIssueDetail(sqllex, 21286, "point") } // needed or else it generates a syntax error.
 | POLYGON error { return unimplementedWithIssueDetail(sqllex, 21286, "polygon") } // needed or else it generates a syntax error.
@@ -12449,19 +12458,21 @@ const_geo:
     $$.val = types.MakeGeography($3.geoShapeType(), geopb.SRID(val))
   }
 
-// We have a separate const_typename to allow defaulting fixed-length types
-// such as CHAR() and BIT() to an unspecified length. SQL9x requires that these
+// We have a separate const_typename to allow defaulting fixed-length types such
+// as CHAR() and BIT() to an unspecified length. SQL9x requires that these
 // default to a length of one, but this makes no sense for constructs like CHAR
-// 'hi' and BIT '0101', where there is an obvious better choice to make. Note
-// that interval_type is not included here since it must be pushed up higher
-// in the rules to accommodate the postfix options (e.g. INTERVAL '1'
-// YEAR). Likewise, we have to handle the generic-type-name case in
-// a_expr_const to avoid premature reduce/reduce conflicts against function
-// names.
+// 'hi' and BIT '0101', where there is an obvious better choice to make. This
+// rule *also* supports length-specified types like BIT(1), CHAR(3), etc. Note
+// that interval_type is not included here since it must be pushed up higher in
+// the rules to accommodate the postfix options (e.g. INTERVAL '1' YEAR).
+// Likewise, we have to handle the generic-type-name case in a_expr_const to
+// avoid premature reduce/reduce conflicts against function names.
 const_typename:
   numeric
 | bit_without_length
+| bit_with_length
 | character_without_length
+| character_with_length
 | const_datetime
 | const_geo
 

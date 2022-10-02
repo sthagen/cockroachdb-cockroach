@@ -431,6 +431,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 	schemaTelemetryIE := MakeInternalExecutor(s, MemoryMetrics{}, schemaTelemetryIEMonitor)
 	s.schemaTelemetryController = schematelemetrycontroller.NewController(
 		s.cfg.DB, &schemaTelemetryIE, schemaTelemetryIEMonitor, s.cfg.Settings, s.cfg.JobRegistry,
+		s.cfg.NodeInfo.LogicalClusterID,
 	)
 	s.indexUsageStatsController = idxusage.NewController(cfg.SQLStatusServer)
 	return s
@@ -2814,7 +2815,6 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.IVarContainer = nil
 	evalCtx.Context.Context = ex.Ctx()
 	evalCtx.Txn = txn
-	evalCtx.Mon = ex.state.mon
 	evalCtx.PrepareOnly = false
 	evalCtx.SkipNormalize = false
 	evalCtx.SchemaChangerState = ex.extraTxnState.schemaChangerState
@@ -2880,7 +2880,7 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
-	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData())
+	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData(), ex.state.mon)
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 }
 
@@ -3194,6 +3194,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			Phase:          (serverpb.ActiveQuery_Phase)(query.phase),
 			Progress:       float32(progress),
 			IsFullScan:     query.isFullScan,
+			PlanGist:       query.planGist,
 		})
 	}
 	lastActiveQuery := ""
@@ -3293,6 +3294,7 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 		return nil
 	}
 	deps := newSchemaChangerTxnRunDependencies(
+		ctx,
 		ex.planner.SessionData(),
 		ex.planner.User(),
 		ex.server.cfg,

@@ -77,6 +77,7 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 			BulkSenderLimiter: limit.MakeConcurrentRequestLimiter("test", math.MaxInt),
 		},
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 		DiskMonitor: testDiskMonitor,
 	}
 
@@ -239,7 +240,7 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 			}
 			spec.StartTime = tc.frontierStartTime
 			spec.Checkpoint.ResolvedSpans = tc.jobCheckpoint
-			proc, err := newStreamIngestionDataProcessor(&flowCtx, 0 /* processorID */, spec, &post, out)
+			proc, err := newStreamIngestionDataProcessor(ctx, &flowCtx, 0 /* processorID */, spec, &post, out)
 			require.NoError(t, err)
 			sip, ok := proc.(*streamIngestionProcessor)
 			if !ok {
@@ -290,8 +291,10 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 
 			frontierPost := execinfrapb.PostProcessSpec{}
 			frontierOut := distsqlutils.RowBuffer{}
-			frontierProc, err := newStreamIngestionFrontierProcessor(&flowCtx, 0, /* processorID*/
-				frontierSpec, sip, &frontierPost, &frontierOut)
+			frontierProc, err := newStreamIngestionFrontierProcessor(
+				ctx, &flowCtx, 0, /* processorID*/
+				frontierSpec, sip, &frontierPost, &frontierOut,
+			)
 			require.NoError(t, err)
 			fp, ok := frontierProc.(*streamIngestionFrontier)
 			if !ok {

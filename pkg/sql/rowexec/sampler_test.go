@@ -67,6 +67,7 @@ func runSampler(
 	flowCtx := execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	// Override the default memory limit. If memLimitBytes is small but
 	// non-zero, the processor will hit this limit and disable sampling.
@@ -84,7 +85,7 @@ func runSampler(
 		MinSampleSize: uint32(minNumSamples),
 	}
 	p, err := newSamplerProcessor(
-		&flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out,
+		context.Background(), &flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +357,7 @@ func TestSamplerSketch(t *testing.T) {
 				Settings: st,
 			},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 		}
 
 		spec := &execinfrapb.SamplerSpec{
@@ -381,7 +383,7 @@ func TestSamplerSketch(t *testing.T) {
 				},
 			},
 		}
-		p, err := newSamplerProcessor(&flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out)
+		p, err := newSamplerProcessor(context.Background(), &flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -133,7 +133,7 @@ func TestDefaultAggregateFunc(t *testing.T) {
 
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
-	aggMemAcc := evalCtx.Mon.MakeBoundAccount()
+	aggMemAcc := evalCtx.TestingMon.MakeBoundAccount()
 	defer aggMemAcc.Close(context.Background())
 	evalCtx.SingleDatumAggMemAccount = &aggMemAcc
 	semaCtx := tree.MakeSemaContext()
@@ -144,7 +144,7 @@ func TestDefaultAggregateFunc(t *testing.T) {
 					t.Fatal(err)
 				}
 				constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-					&evalCtx, &semaCtx, tc.spec.Aggregations, tc.typs,
+					context.Background(), &evalCtx, &semaCtx, tc.spec.Aggregations, tc.typs,
 				)
 				require.NoError(t, err)
 				colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.input}, [][]*types.T{tc.typs}, tc.expected, colexectestutils.UnorderedVerifier, func(input []colexecop.Operator) (colexecop.Operator, error) {

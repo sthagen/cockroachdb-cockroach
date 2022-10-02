@@ -53,6 +53,7 @@ func TestWindowFunctions(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -1054,7 +1055,7 @@ func TestWindowFunctions(t *testing.T) {
 						ColIdx: argIdxs,
 					}}
 					_, _, outputTypes, err :=
-						colexecagg.ProcessAggregations(&evalCtx, &semaCtx, aggregations, ct)
+						colexecagg.ProcessAggregations(ctx, &evalCtx, &semaCtx, aggregations, ct)
 					require.NoError(t, err)
 					resultType = outputTypes[0]
 				}
@@ -1218,7 +1219,7 @@ func BenchmarkWindowFunctions(b *testing.B) {
 				ColIdx: colIdxs,
 			}}
 			aggArgs.Constructors, aggArgs.ConstArguments, aggArgs.OutputTypes, err =
-				colexecagg.ProcessAggregations(&evalCtx, &semaCtx, aggregations, sourceTypes)
+				colexecagg.ProcessAggregations(ctx, &evalCtx, &semaCtx, aggregations, sourceTypes)
 			require.NoError(b, err)
 			aggFnsAlloc, _, toClose, err := colexecagg.NewAggregateFuncsAlloc(
 				&aggArgs, aggregations, 1 /* allocSize */, colexecagg.WindowAggKind,

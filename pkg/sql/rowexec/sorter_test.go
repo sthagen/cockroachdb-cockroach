@@ -277,6 +277,7 @@ func TestSorter(t *testing.T) {
 					defer diskMonitor.Stop(ctx)
 					flowCtx := execinfra.FlowCtx{
 						EvalCtx: &evalCtx,
+						Mon:     evalCtx.TestingMon,
 						Cfg: &execinfra.ServerConfig{
 							Settings:    cluster.MakeTestingClusterSettings(),
 							TempStorage: tempEngine,
@@ -351,6 +352,7 @@ func TestSortInvalidLimit(t *testing.T) {
 		defer diskMonitor.Stop(ctx)
 		flowCtx := execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -375,7 +377,7 @@ func TestSortInvalidLimit(t *testing.T) {
 		var k uint64
 		// All arguments apart from spec and post are not necessary.
 		if _, err := newSortTopKProcessor(
-			nil, 0, &spec, nil, nil, nil, k,
+			context.Background(), nil, 0, &spec, nil, nil, nil, k,
 		); !testutils.IsError(err, errSortTopKZeroK.Error()) {
 			t.Fatalf("unexpected error %v, expected %v", err, errSortTopKZeroK)
 		}
@@ -400,6 +402,7 @@ func BenchmarkSortAll(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -443,6 +446,7 @@ func BenchmarkSortLimit(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -491,6 +495,7 @@ func BenchmarkSortChunks(b *testing.B) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},

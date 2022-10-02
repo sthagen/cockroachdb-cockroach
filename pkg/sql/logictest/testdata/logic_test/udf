@@ -889,6 +889,85 @@ test           public         100140       test_priv_f1()      root     EXECUTE 
 test           public         100143       test_priv_f2(int8)  root     EXECUTE         true
 test           test_priv_sc1  100144       test_priv_f3()      root     EXECUTE         true
 
+# Make sure has_function_privilege works.
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+true
+
+user testuser
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+false
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+false
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+false
+
+user root
+
+statement ok
+GRANT EXECUTE ON FUNCTION test_priv_f1(), test_priv_f2(int), test_priv_sc1.test_priv_f3 TO testuser WITH GRANT OPTION;
+
+user testuser
+
+query B retry
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+true
+
+user root
+
+statement ok
+REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION test_priv_f1(), test_priv_f2(int), test_priv_sc1.test_priv_f3 FROM testuser;
+
+user testuser
+
+query B retry
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE WITH GRANT OPTION')
+----
+false
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE')
+----
+true
+
+query B
+SELECT has_function_privilege('test_priv_f2(INT)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
+true
+
+user root
+
 statement ok
 SET search_path = public;
 
@@ -1946,6 +2025,37 @@ SELECT one_nth(0)
 statement error pgcode 22012 division by zero
 SELECT int_identity((1/0)::INT)
 
+# Test that tracing spans are created for each UDF invocation and for each
+# statement in the UDF body.
+statement ok
+CREATE TABLE trace_tab (
+  a INT PRIMARY KEY
+);
+INSERT INTO trace_tab VALUES (1), (2), (3);
+CREATE FUNCTION trace_fn(i INT) RETURNS INT LANGUAGE SQL AS $$
+  SELECT 'no-op';
+  SELECT i;
+$$
+
+statement ok
+SET tracing = on
+
+statement ok
+SELECT trace_fn(a) FROM trace_tab
+
+statement ok
+SET tracing = off
+
+query T
+SELECT message FROM [SHOW TRACE FOR SESSION] WHERE message ~ 'udf'
+----
+=== SPAN START: udf-stmt-trace_fn-0 ===
+=== SPAN START: udf-stmt-trace_fn-1 ===
+=== SPAN START: udf-stmt-trace_fn-0 ===
+=== SPAN START: udf-stmt-trace_fn-1 ===
+=== SPAN START: udf-stmt-trace_fn-0 ===
+=== SPAN START: udf-stmt-trace_fn-1 ===
+
 
 subtest args
 
@@ -2384,3 +2494,10 @@ subtest subqueries
 # UDFs with subqueries are not currently supported.
 statement error pgcode 0A000 unimplemented: subquery usage inside a function definition
 CREATE FUNCTION rec(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT * FROM t WHERE a = (SELECT max(i) FROM s)'
+
+
+subtest variadic
+
+# Variadic UDFS are not currently supported.
+statement error pgcode 0A000 unimplemented: this syntax\nHINT.*\n.*88947
+CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS '1'

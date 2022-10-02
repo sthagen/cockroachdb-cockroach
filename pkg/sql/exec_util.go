@@ -1960,6 +1960,10 @@ type queryMeta struct {
 	hidden bool
 
 	progressAtomic uint64
+
+	// The compressed plan for this query. This can converted  back into the
+	// logical plan. This field will only be populated in the EXECUTING phase.
+	planGist string
 }
 
 // cancel cancels the query associated with this queryMeta, by closing the
@@ -3336,6 +3340,10 @@ func (m *sessionDataMutator) SetCopyFromAtomicEnabled(val bool) {
 
 func (m *sessionDataMutator) SetEnforceHomeRegion(val bool) {
 	m.data.EnforceHomeRegion = val
+}
+
+func (m *sessionDataMutator) SetVariableInequalityLookupJoinEnabled(val bool) {
+	m.data.VariableInequalityLookupJoinEnabled = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

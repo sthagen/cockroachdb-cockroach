@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/lib/pq/oid"
 )
 
@@ -161,6 +162,11 @@ type HasPrivilegeSpecifier struct {
 	// Only one of ColumnName, ColumnAttNum is filled.
 	ColumnName   *tree.Name
 	ColumnAttNum *uint32
+
+	// Function privilege
+	// This needs to be a user-defined function OID. Builtin function OIDs won't
+	// work since they're not descriptors based.
+	FunctionOID *oid.Oid
 }
 
 // TypeResolver is an interface for resolving types and type OIDs.
@@ -193,6 +199,9 @@ type Planner interface {
 	DatabaseCatalog
 	TypeResolver
 	tree.FunctionReferenceResolver
+
+	// Mon returns the Planner's monitor.
+	Mon() *mon.BytesMonitor
 
 	// ExecutorConfig returns *ExecutorConfig
 	ExecutorConfig() interface{}
@@ -275,7 +284,7 @@ type Planner interface {
 
 	// DeserializeSessionState deserializes the state as serialized variables
 	// into the current session.
-	DeserializeSessionState(state *tree.DBytes) (*tree.DBool, error)
+	DeserializeSessionState(ctx context.Context, state *tree.DBytes) (*tree.DBool, error)
 
 	// CreateSessionRevivalToken creates a token that can be used to log in
 	// as the current user, in bytes form.
@@ -353,7 +362,7 @@ type Planner interface {
 	// the multiregion properties of the database identified via databaseID. The
 	// second return value is false if the database doesn't exist or is not
 	// multiregion.
-	GetMultiregionConfig(databaseID descpb.ID) (interface{}, bool)
+	GetMultiregionConfig(ctx context.Context, databaseID descpb.ID) (interface{}, bool)
 }
 
 // InternalRows is an iterator interface that's exposed by the internal

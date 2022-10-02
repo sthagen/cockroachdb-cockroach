@@ -636,6 +636,7 @@ func TestInvertedJoiner(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -688,6 +689,7 @@ func TestInvertedJoiner(t *testing.T) {
 				}
 
 				ij, err := newInvertedJoiner(
+					ctx,
 					&flowCtx,
 					0, /* processorID */
 					&execinfrapb.InvertedJoinerSpec{
@@ -776,6 +778,7 @@ func TestInvertedJoinerDrain(t *testing.T) {
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -795,6 +798,7 @@ func TestInvertedJoinerDrain(t *testing.T) {
 			t.Fatal(err)
 		}
 		return newInvertedJoiner(
+			ctx,
 			&flowCtx,
 			0, /* processorID */
 			&execinfrapb.InvertedJoinerSpec{

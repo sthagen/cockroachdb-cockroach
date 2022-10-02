@@ -4273,6 +4273,7 @@ transaction_status                                    NoTxn               NULL  
 troubleshooting_mode                                  off                 NULL      NULL        NULL        string
 unconstrained_non_covering_index_scan_enabled         off                 NULL      NULL        NULL        string
 use_declarative_schema_changer                        on                  NULL      NULL        NULL        string
+variable_inequality_lookup_join_enabled               on                  NULL      NULL        NULL        string
 vectorize                                             on                  NULL      NULL        NULL        string
 xmloption                                             content             NULL      NULL        NULL        string
 
@@ -4406,6 +4407,7 @@ transaction_status                                    NoTxn               NULL  
 troubleshooting_mode                                  off                 NULL  user     NULL      off                 off
 unconstrained_non_covering_index_scan_enabled         off                 NULL  user     NULL      off                 off
 use_declarative_schema_changer                        on                  NULL  user     NULL      on                  on
+variable_inequality_lookup_join_enabled               on                  NULL  user     NULL      on                  on
 vectorize                                             on                  NULL  user     NULL      on                  on
 xmloption                                             content             NULL  user     NULL      content             content
 
@@ -4538,6 +4540,7 @@ transaction_status                                    NULL    NULL     NULL     
 troubleshooting_mode                                  NULL    NULL     NULL     NULL        NULL
 unconstrained_non_covering_index_scan_enabled         NULL    NULL     NULL     NULL        NULL
 use_declarative_schema_changer                        NULL    NULL     NULL     NULL        NULL
+variable_inequality_lookup_join_enabled               NULL    NULL     NULL     NULL        NULL
 vectorize                                             NULL    NULL     NULL     NULL        NULL
 xmloption                                             NULL    NULL     NULL     NULL        NULL
 
@@ -4696,21 +4699,6 @@ ORDER BY id
 query T
 SELECT proname FROM pg_catalog.pg_proc WHERE oid = 0
 ----
-
-let $cur_max_builtin_oid
-SELECT cur_max_builtin_oid FROM [SELECT max(oid) as cur_max_builtin_oid FROM pg_catalog.pg_proc]
-
-## If this test failed (proname is the same, but oid increased), it's likely that a
-## new builtin function is implemented and  it's somewhere in the middle of the
-## existing functions at init time. Though the changes to builtin function OID is
-## generally ok, it's still better if we could move the new implement to end of the
-## list at init time (see all_builtins.go)
-## TODO(chengxiong): consider to have a deterministic list of builtin function oids
-## so that new implementations can just be added to it.
-query TT
-SELECT proname, oid FROM pg_catalog.pg_proc WHERE oid = $cur_max_builtin_oid
-----
-pg_get_functiondef  2035
 
 ## Ensure that unnest works with oid wrapper arrays
 

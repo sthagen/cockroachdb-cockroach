@@ -551,6 +551,10 @@ var (
 	useMVCCRangeTombstonesForPointDeletes = util.ConstantWithMetamorphicTestBool(
 		"logictest-use-mvcc-range-tombstones-for-point-deletes", false)
 
+	// smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
+	// bugs in time-bound iterators.
+	smallEngineBlocks = util.ConstantWithMetamorphicTestBool("logictest-small-engine-blocks", false)
+
 	// BackupRestoreProbability is the environment variable for `3node-backup` config.
 	backupRestoreProbability = envutil.EnvOrDefaultFloat64("COCKROACH_LOGIC_TEST_BACKUP_RESTORE_PROBABILITY", 0.0)
 )
@@ -1023,6 +1027,11 @@ type logicTest struct {
 	// declarativeCorpusCollector used to save declarative schema changer state
 	// to disk.
 	declarativeCorpusCollector *corpus.Collector
+
+	// forceBackupAndRestore is set to true if the user wants to run a cluster
+	// backup and restore before running the next SQL statement. This can be set
+	// to true using the `force-backup-restore` directive.
+	forceBackupAndRestore bool
 }
 
 func (t *logicTest) t() *testing.T {
@@ -1238,6 +1247,7 @@ func (t *logicTest) newCluster(
 						UseRangeTombstonesForPointDeletes: supportsMVCCRangeTombstones &&
 							useMVCCRangeTombstonesForPointDeletes,
 					},
+					SmallEngineBlocks: smallEngineBlocks,
 				},
 				SQLEvalContext: &eval.TestingKnobs{
 					AssertBinaryExprReturnTypes:     true,
@@ -2071,9 +2081,13 @@ func (t *logicTest) hasOpenTxns(ctx context.Context) bool {
 func (t *logicTest) maybeBackupRestore(
 	rng *rand.Rand, config logictestbase.TestClusterConfig,
 ) error {
+	defer func() {
+		t.forceBackupAndRestore = false
+	}()
+
 	// We decide if we want to take a backup here based on a probability
 	// specified in the logic test config.
-	if rng.Float64() > config.BackupRestoreProbability {
+	if rng.Float64() > config.BackupRestoreProbability && !t.forceBackupAndRestore {
 		return nil
 	}
 
@@ -2854,6 +2868,10 @@ func (t *logicTest) processSubtest(
 				reason = fields[1]
 			}
 			skip.IgnoreLint(t.t(), reason)
+
+		case "force-backup-restore":
+			t.forceBackupAndRestore = true
+			continue
 
 		case "skipif":
 			if len(fields) < 2 {

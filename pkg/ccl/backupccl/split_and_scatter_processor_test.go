@@ -237,6 +237,7 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 					Stopper:  tc.Stopper(),
 				},
 				EvalCtx:     &evalCtx,
+				Mon:         evalCtx.TestingMon,
 				DiskMonitor: testDiskMonitor,
 			}
 
@@ -246,7 +247,7 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 			require.NoError(t, err)
 
 			post := execinfrapb.PostProcessSpec{}
-			proc, err := newSplitAndScatterProcessor(&flowCtx, 0 /* processorID */, c.procSpec, &post, out)
+			proc, err := newSplitAndScatterProcessor(ctx, &flowCtx, 0 /* processorID */, c.procSpec, &post, out)
 			require.NoError(t, err)
 			ssp, ok := proc.(*splitAndScatterProcessor)
 			if !ok {

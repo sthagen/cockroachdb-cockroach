@@ -35,19 +35,19 @@ const (
 	Any DescriptorType = "any"
 
 	// Database is for database descriptors.
-	Database = "database"
+	Database DescriptorType = "database"
 
 	// Table is for table descriptors.
-	Table = "relation"
+	Table DescriptorType = "relation"
 
 	// Type is for type descriptors.
-	Type = "type"
+	Type DescriptorType = "type"
 
 	// Schema is for schema descriptors.
-	Schema = "schema"
+	Schema DescriptorType = "schema"
 
 	// Function is for function descriptors.
-	Function = "function"
+	Function DescriptorType = "function"
 )
 
 // MutationPublicationFilter is used by MakeFirstMutationPublic to filter the
@@ -986,4 +986,17 @@ func IsSystemDescriptor(desc Descriptor) bool {
 		return true
 	}
 	return false
+}
+
+// HasConcurrentDeclarativeSchemaChange returns true iff the descriptors has
+// a concurrent declarative schema change. This declarative schema changer is
+// extremely disciplined and only writes state information during the pre-commit
+// phase, so if a descriptor has a declarative state, we know an ongoing
+// declarative schema change active. The legacy schema changer will tag descriptors
+// with job IDs even during the statement phase, so we cannot rely on similar
+// checks to block concurrent schema changes. Hence, Descriptor.HasConcurrentSchemaChanges
+// is not equivalent to this operation (the former can lead to false positives
+// for the legacy schema changer).
+func HasConcurrentDeclarativeSchemaChange(desc Descriptor) bool {
+	return desc.GetDeclarativeSchemaChangerState() != nil
 }

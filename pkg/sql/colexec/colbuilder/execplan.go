@@ -576,6 +576,9 @@ func (r opResult) createAndWrapRowSource(
 				)
 			}
 			r.ColumnTypes = rs.OutputTypes()
+			if releasable, ok := rs.(execreleasable.Releasable); ok {
+				r.Releasables = append(r.Releasables, releasable)
+			}
 			return rs, nil
 		},
 		materializerSafeToRelease,
@@ -593,6 +596,7 @@ func (r opResult) createAndWrapRowSource(
 	r.MetadataSources = append(r.MetadataSources, r.Root.(colexecop.MetadataSource))
 	r.ToClose = append(r.ToClose, r.Root.(colexecop.Closer))
 	r.Releasables = append(r.Releasables, releasables...)
+	r.Releasables = append(r.Releasables, c)
 	return nil
 }
 
@@ -831,7 +835,7 @@ func NewColOperator(
 				EvalCtx:    evalCtx,
 			}
 			newAggArgs.Constructors, newAggArgs.ConstArguments, newAggArgs.OutputTypes, err = colexecagg.ProcessAggregations(
-				evalCtx, args.ExprHelper.SemaCtx, aggSpec.Aggregations, inputTypes,
+				ctx, evalCtx, args.ExprHelper.SemaCtx, aggSpec.Aggregations, inputTypes,
 			)
 			if err != nil {
 				return r, err
@@ -1415,7 +1419,7 @@ func NewColOperator(
 							ColIdx: colIdx,
 						}}
 						aggArgs.Constructors, aggArgs.ConstArguments, aggArgs.OutputTypes, err =
-							colexecagg.ProcessAggregations(flowCtx.EvalCtx, args.ExprHelper.SemaCtx, aggregations, argTypes)
+							colexecagg.ProcessAggregations(ctx, flowCtx.EvalCtx, args.ExprHelper.SemaCtx, aggregations, argTypes)
 						var toClose colexecop.Closers
 						var aggFnsAlloc *colexecagg.AggregateFuncsAlloc
 						if (aggType != execinfrapb.Min && aggType != execinfrapb.Max) ||
@@ -1689,7 +1693,7 @@ func (r *postProcessResult) planPostProcessSpec(
 		exprs := make([]tree.TypedExpr, len(post.RenderExprs))
 		var err error
 		for i := range exprs {
-			exprs[i], err = args.ExprHelper.ProcessExpr(post.RenderExprs[i], flowCtx.EvalCtx, r.ColumnTypes)
+			exprs[i], err = args.ExprHelper.ProcessExpr(ctx, post.RenderExprs[i], flowCtx.EvalCtx, r.ColumnTypes)
 			if err != nil {
 				return err
 			}
@@ -1806,7 +1810,7 @@ func planFilterExpr(
 	helper *colexecargs.ExprHelper,
 	releasables *[]execreleasable.Releasable,
 ) (colexecop.Operator, error) {
-	expr, err := helper.ProcessExpr(filter, flowCtx.EvalCtx, columnTypes)
+	expr, err := helper.ProcessExpr(ctx, filter, flowCtx.EvalCtx, columnTypes)
 	if err != nil {
 		return nil, err
 	}

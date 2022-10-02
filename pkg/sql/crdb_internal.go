@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -1519,7 +1520,8 @@ CREATE TABLE crdb_internal.node_inflight_trace_spans (
 				"only users with the admin role are allowed to read crdb_internal.node_inflight_trace_spans")
 		}
 		return p.ExecCfg().AmbientCtx.Tracer.VisitSpans(func(span tracing.RegistrySpan) error {
-			for _, rec := range span.GetFullRecording(tracingpb.RecordingVerbose) {
+			trace := span.GetFullRecording(tracingpb.RecordingVerbose)
+			for _, rec := range trace.Flatten() {
 				traceID := rec.TraceID
 				parentSpanID := rec.ParentSpanID
 				spanID := rec.SpanID
@@ -1767,7 +1769,8 @@ CREATE TABLE crdb_internal.%s (
   application_name STRING,         -- the name of the application as per SET application_name
   distributed      BOOL,           -- whether the query is running distributed
   phase            STRING,         -- the current execution phase
-  full_scan        BOOL            -- whether the query contains a full table or index scan
+  full_scan        BOOL,           -- whether the query contains a full table or index scan
+  plan_gist        STRING          -- Compressed logical plan.
 )`
 
 func (p *planner) makeSessionsRequest(
@@ -1896,6 +1899,12 @@ func populateQueriesTable(
 			if err != nil {
 				return err
 			}
+
+			planGistDatum := tree.DNull
+			if len(query.PlanGist) > 0 {
+				planGistDatum = tree.NewDString(query.PlanGist)
+			}
+
 			if err := addRow(
 				tree.NewDString(query.ID),
 				txnID,
@@ -1909,6 +1918,7 @@ func populateQueriesTable(
 				isDistributedDatum,
 				tree.NewDString(phase),
 				isFullScanDatum,
+				planGistDatum,
 			); err != nil {
 				return err
 			}
@@ -1933,6 +1943,7 @@ func populateQueriesTable(
 				tree.DNull,                             // distributed
 				tree.DNull,                             // phase
 				tree.DNull,                             // full_scan
+				tree.DNull,                             // plan_gist
 			); err != nil {
 				return err
 			}
@@ -2902,16 +2913,18 @@ CREATE TABLE crdb_internal.table_indexes (
   is_sharded          BOOL NOT NULL,
   is_visible          BOOL NOT NULL,
   shard_bucket_count  INT,
-  created_at          TIMESTAMP
+  created_at          TIMESTAMP,
+  create_statement    STRING NOT NULL
 )
 `,
 	generator: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		primary := tree.NewDString("primary")
 		secondary := tree.NewDString("secondary")
-		row := make(tree.Datums, 7)
+		var row []tree.Datum
 		worker := func(ctx context.Context, pusher rowPusher) error {
+			alloc := &tree.DatumAlloc{}
 			return forEachTableDescAll(ctx, p, dbContext, hideVirtual,
-				func(db catalog.DatabaseDescriptor, _ string, table catalog.TableDescriptor) error {
+				func(db catalog.DatabaseDescriptor, scName string, table catalog.TableDescriptor) error {
 					tableID := tree.NewDInt(tree.DInt(table.GetID()))
 					tableName := tree.NewDString(table.GetName())
 					// We report the primary index of non-physical tables here. These
@@ -2937,6 +2950,35 @@ CREATE TABLE crdb_internal.table_indexes (
 						if idx.IsSharded() {
 							shardBucketCnt = tree.NewDInt(tree.DInt(idx.GetSharded().ShardBuckets))
 						}
+						namePrefix := tree.ObjectNamePrefix{SchemaName: tree.Name(scName), ExplicitSchema: true}
+						fullTableName := tree.MakeTableNameFromPrefix(namePrefix, tree.Name(table.GetName()))
+						var partitionBuf bytes.Buffer
+						if err := ShowCreatePartitioning(
+							alloc,
+							p.ExecCfg().Codec,
+							table,
+							idx,
+							idx.GetPartitioning(),
+							&partitionBuf,
+							0, /* indent */
+							0, /* colOffset */
+						); err != nil {
+							return err
+						}
+						createIndexStmt, err := catformat.IndexForDisplay(
+							ctx,
+							table,
+							&fullTableName,
+							idx,
+							partitionBuf.String(),
+							tree.FmtSimple,
+							p.SemaCtx(),
+							p.SessionData(),
+							catformat.IndexDisplayShowCreate,
+						)
+						if err != nil {
+							return err
+						}
 						row = append(row,
 							tableID,
 							tableName,
@@ -2949,6 +2991,7 @@ CREATE TABLE crdb_internal.table_indexes (
 							tree.MakeDBool(tree.DBool(!idx.IsNotVisible())),
 							shardBucketCnt,
 							createdAt,
+							tree.NewDString(createIndexStmt),
 						)
 						return pusher.pushRow(row...)
 					})
@@ -4890,7 +4933,7 @@ CREATE TABLE crdb_internal.invalid_objects (
 		}
 		descs := c.OrderedDescriptors()
 		// Collect all marshaled job metadata and account for its memory usage.
-		acct := p.EvalContext().Mon.MakeBoundAccount()
+		acct := p.Mon().MakeBoundAccount()
 		defer acct.Close(ctx)
 		jmg, err := collectMarshaledJobMetadataMap(ctx, p, &acct, descs)
 		if err != nil {
@@ -5505,7 +5548,7 @@ CREATE TABLE crdb_internal.cluster_statement_statistics (
 	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		// TODO(azhng): we want to eventually implement memory accounting within the
 		//  RPC handlers. See #69032.
-		acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
+		acc := p.Mon().MakeBoundAccount()
 		defer acc.Close(ctx)
 
 		// Perform RPC fanout.
@@ -5736,7 +5779,7 @@ CREATE TABLE crdb_internal.cluster_transaction_statistics (
 	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		// TODO(azhng): we want to eventually implement memory accounting within the
 		//  RPC handlers. See #69032.
-		acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
+		acc := p.Mon().MakeBoundAccount()
 		defer acc.Close(ctx)
 
 		// Perform RPC fanout.
@@ -5944,7 +5987,7 @@ CREATE TABLE crdb_internal.transaction_contention_events (
 		}
 
 		// Account for memory used by the RPC fanout.
-		acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
+		acc := p.Mon().MakeBoundAccount()
 		defer acc.Close(ctx)
 
 		resp, err := p.extendedEvalCtx.SQLStatusServer.TransactionContentionEvents(

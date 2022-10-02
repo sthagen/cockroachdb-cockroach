@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -157,7 +158,9 @@ func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
 
 // DummyEvalPlanner implements the eval.Planner interface by returning
 // errors.
-type DummyEvalPlanner struct{}
+type DummyEvalPlanner struct {
+	Monitor *mon.BytesMonitor
+}
 
 // ResolveOIDFromString is part of the Planner interface.
 func (ep *DummyEvalPlanner) ResolveOIDFromString(
@@ -241,7 +244,9 @@ func (*DummyEvalPlanner) SerializeSessionState() (*tree.DBytes, error) {
 }
 
 // DeserializeSessionState is part of the Planner interface.
-func (*DummyEvalPlanner) DeserializeSessionState(token *tree.DBytes) (*tree.DBool, error) {
+func (*DummyEvalPlanner) DeserializeSessionState(
+	ctx context.Context, token *tree.DBytes,
+) (*tree.DBool, error) {
 	return nil, errors.WithStack(errEvalPlanner)
 }
 
@@ -289,6 +294,11 @@ func (*DummyEvalPlanner) ValidateTTLScheduledJobsInCurrentDB(ctx context.Context
 // RepairTTLScheduledJobForTable is part of the Planner interface.
 func (*DummyEvalPlanner) RepairTTLScheduledJobForTable(ctx context.Context, tableID int64) error {
 	return errors.WithStack(errEvalPlanner)
+}
+
+// Mon is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) Mon() *mon.BytesMonitor {
+	return ep.Monitor
 }
 
 // ExecutorConfig is part of the Planner interface.
@@ -451,7 +461,9 @@ func (ep *DummyEvalPlanner) ResolveFunctionByOID(
 }
 
 // GetMultiregionConfig is part of the eval.Planner interface.
-func (ep *DummyEvalPlanner) GetMultiregionConfig(databaseID descpb.ID) (interface{}, bool) {
+func (ep *DummyEvalPlanner) GetMultiregionConfig(
+	ctx context.Context, databaseID descpb.ID,
+) (interface{}, bool) {
 	return nil /* regionConfig */, false
 }
 

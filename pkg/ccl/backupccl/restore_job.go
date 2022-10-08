@@ -499,6 +499,13 @@ type restoreResumer struct {
 	}
 }
 
+var _ jobs.TraceableJob = &restoreResumer{}
+
+// ForceRealSpan implements the TraceableJob interface.
+func (r *restoreResumer) ForceRealSpan() bool {
+	return true
+}
+
 // remapRelevantStatistics changes the table ID references in the stats
 // from those they had in the backed up database to what they should be
 // in the restored database.
@@ -1656,6 +1663,17 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	if err := sql.DescsTxn(ctx, p.ExecCfg(), publishDescriptors); err != nil {
 		return err
 	}
+
+	if err := p.ExecCfg().JobRegistry.CheckPausepoint(
+		"restore.after_publishing_descriptors"); err != nil {
+		return err
+	}
+	if fn := r.testingKnobs.afterPublishingDescriptors; fn != nil {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+
 	// Reload the details as we may have updated the job.
 	details = r.job.Details().(jobspb.RestoreDetails)
 	p.ExecCfg().JobRegistry.NotifyToAdoptJobs()
@@ -1681,16 +1699,6 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		details = r.job.Details().(jobspb.RestoreDetails)
 
 		if err := r.cleanupTempSystemTables(ctx); err != nil {
-			return err
-		}
-	}
-
-	if err := p.ExecCfg().JobRegistry.CheckPausepoint(
-		"restore.after_publishing_descriptors"); err != nil {
-		return err
-	}
-	if fn := r.testingKnobs.afterPublishingDescriptors; fn != nil {
-		if err := fn(); err != nil {
 			return err
 		}
 	}
@@ -2216,7 +2224,7 @@ func (r *restoreResumer) OnFailOrCancel(
 	logJobCompletion(ctx, restoreJobEventType, r.job.ID(), false, jobErr)
 
 	execCfg := execCtx.(sql.JobExecContext).ExecCfg()
-	if err := execCfg.CollectionFactory.TxnWithExecutor(ctx, execCfg.DB, p.SessionData(), func(
+	if err := execCfg.InternalExecutorFactory.DescsTxnWithExecutor(ctx, execCfg.DB, p.SessionData(), func(
 		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection, ie sqlutil.InternalExecutor,
 	) error {
 		for _, tenant := range details.Tenants {

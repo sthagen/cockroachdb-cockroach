@@ -1158,7 +1158,7 @@ func getFinalSourceQuery(
 	ctx := evalCtx.FmtCtx(
 		tree.FmtSerializable,
 		tree.FmtPlaceholderFormat(func(ctx *tree.FmtCtx, placeholder *tree.Placeholder) {
-			d, err := eval.Expr(evalCtx, placeholder)
+			d, err := eval.Expr(params.ctx, evalCtx, placeholder)
 			if err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "failed to serialize placeholder"))
 			}
@@ -2561,8 +2561,8 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 		if opts.Has(tree.LikeTableOptConstraints) {
 			for _, c := range td.Checks {
 				def := tree.CheckConstraintTableDef{
-					Name:   tree.Name(c.Name),
-					Hidden: c.Hidden,
+					Name:                  tree.Name(c.Name),
+					FromHashShardedColumn: c.FromHashShardedColumn,
 				}
 				def.Expr, err = parser.ParseExpr(c.Expr)
 				if err != nil {
@@ -2703,7 +2703,7 @@ func makeShardCheckConstraintDef(
 			},
 			Right: values,
 		},
-		Hidden: true,
+		FromHashShardedColumn: true,
 	}, nil
 }
 

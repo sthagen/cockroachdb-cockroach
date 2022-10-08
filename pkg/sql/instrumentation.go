@@ -265,7 +265,7 @@ func (ih *instrumentationHelper) Setup(
 			ih.traceMetadata = make(execNodeTraceMetadata)
 		}
 		// Make sure that the builtins use the correct context.
-		ih.evalCtx.Context = newCtx
+		ih.evalCtx.SetDeprecatedContext(newCtx)
 	}()
 
 	if sp := tracing.SpanFromContext(ctx); sp != nil {
@@ -363,9 +363,8 @@ func (ih *instrumentationHelper) Finish(
 			p.SessionData(),
 		)
 		phaseTimes := statsCollector.PhaseTimes()
-		if ih.stmtDiagnosticsRecorder.IsExecLatencyConditionMet(
-			ih.diagRequestID, ih.diagRequest, phaseTimes.GetServiceLatencyNoOverhead(),
-		) {
+		execLatency := phaseTimes.GetServiceLatencyNoOverhead()
+		if ih.stmtDiagnosticsRecorder.IsConditionSatisfied(ih.diagRequest, execLatency) {
 			placeholders := p.extendedEvalCtx.Placeholders
 			ob := ih.emitExplainAnalyzePlanToOutputBuilder(
 				explain.Flags{Verbose: true, ShowTypes: true},
@@ -377,9 +376,9 @@ func (ih *instrumentationHelper) Finish(
 				ctx, cfg.DB, ie.(*InternalExecutor), &p.curPlan, ob.BuildString(), trace, placeholders,
 			)
 			bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID, ih.diagRequest)
-			ih.stmtDiagnosticsRecorder.RemoveOngoing(ih.diagRequestID, ih.diagRequest)
 			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
 		}
+		ih.stmtDiagnosticsRecorder.MaybeRemoveRequest(ih.diagRequestID, ih.diagRequest, execLatency)
 	}
 
 	// If there was a communication error already, no point in setting any
@@ -713,7 +712,7 @@ func (ih *instrumentationHelper) SetIndexRecommendations(
 	) {
 		f := opc.optimizer.Factory()
 		evalCtx := opc.p.EvalContext()
-		f.Init(evalCtx, &opc.catalog)
+		f.Init(ctx, evalCtx, &opc.catalog)
 		f.FoldingControl().AllowStableFolds()
 		bld := optbuilder.New(ctx, &opc.p.semaCtx, evalCtx, &opc.catalog, f, opc.p.stmt.AST)
 		err := bld.Build()

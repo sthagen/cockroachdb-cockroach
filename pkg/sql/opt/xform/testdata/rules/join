@@ -6066,7 +6066,6 @@ anti-join (lookup virt@l_v1)
  └── filters (true)
 
 # Anti-join with multiple constant values for the leading lookup column.
-# TODO
 # opt expect=GenerateLookupJoinsWithVirtualColsAndFilter
 opt
 SELECT m FROM small WHERE NOT EXISTS (SELECT * FROM virt WHERE virt.l IN (1, 2, 3) AND m = virt.v1)
@@ -10067,6 +10066,8 @@ with &1
  │    │    │    ├── "?column?":19 => abc.a:7
  │    │    │    ├── b_default:20 => abc.b:8
  │    │    │    ├── b_default:20 => abc.c:9
+ │    │    │    └── rowid_default:21 => abc.rowid:10
+ │    │    ├── return-mapping:
  │    │    │    └── rowid_default:21 => abc.rowid:10
  │    │    ├── volatile, mutations
  │    │    └── project

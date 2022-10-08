@@ -47,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -721,7 +722,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		datum1, err := eval.Expr(&ec, typed1)
+		datum1, err := eval.Expr(ctx, &ec, typed1)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -735,7 +736,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		datum2, err := eval.Expr(&ec, typed2)
+		datum2, err := eval.Expr(ctx, &ec, typed2)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -778,6 +779,8 @@ func testRandomSyntax(
 	s, rawDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	db := &verifyFormatDB{db: rawDB}
+	err := db.exec(t, ctx, "SET CLUSTER SETTING schemachanger.job.max_retry_backoff='1s'")
+	require.NoError(t, err)
 
 	yBytes, err := os.ReadFile(testutils.TestDataPath(t, "rsg", "sql.y"))
 	if err != nil {

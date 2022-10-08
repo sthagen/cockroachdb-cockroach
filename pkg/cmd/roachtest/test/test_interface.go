@@ -35,8 +35,10 @@ type Test interface {
 	// through all registered roachtests to change how they register the test.
 	Spec() interface{}
 	VersionsBinaryOverride() map[string]string
+	SkipInit() bool
 	Skip(args ...interface{})
 	Skipf(format string, args ...interface{})
+	Error(args ...interface{})
 	Errorf(string, ...interface{})
 	FailNow()
 	Fatal(args ...interface{})

@@ -68,6 +68,14 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
+var schemaChangeJobMaxRetryBackoff = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"schemachanger.job.max_retry_backoff",
+	"the exponential back off when retrying jobs for schema changes",
+	20*time.Second,
+	settings.PositiveDuration,
+)
+
 const (
 	// RunningStatusWaitingForMVCCGC is used for the GC job when it has cleared
 	// the data but is waiting for MVCC GC to remove the data.
@@ -1337,7 +1345,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 	var didUpdate bool
 	var depMutationJobs []jobspb.JobID
 	var otherJobIDs []jobspb.JobID
-	err := sc.execCfg.CollectionFactory.Txn(ctx, sc.db, func(
+	err := sc.execCfg.InternalExecutorFactory.DescsTxn(ctx, sc.db, func(
 		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
 	) error {
 		depMutationJobs = depMutationJobs[:0]
@@ -2453,7 +2461,7 @@ func (sc *SchemaChanger) txn(
 			return err
 		}
 	}
-	return sc.execCfg.CollectionFactory.Txn(ctx, sc.db, f)
+	return sc.execCfg.InternalExecutorFactory.DescsTxn(ctx, sc.db, f)
 }
 
 // txnWithExecutor is to run internal executor within a txn.
@@ -2467,7 +2475,7 @@ func (sc *SchemaChanger) txnWithExecutor(
 			return err
 		}
 	}
-	return sc.execCfg.CollectionFactory.TxnWithExecutor(ctx, sc.db, sd, f)
+	return sc.execCfg.InternalExecutorFactory.DescsTxnWithExecutor(ctx, sc.db, sd, f)
 }
 
 // createSchemaChangeEvalCtx creates an extendedEvalContext() to be used for backfills.
@@ -2492,10 +2500,7 @@ func createSchemaChangeEvalCtx(
 		ExecCfg: execCfg,
 		Descs:   descriptors,
 		Context: eval.Context{
-			SessionDataStack: sessiondata.NewStack(sd),
-			// TODO(andrei): This is wrong (just like on the main code path on
-			// setupFlow). Each processor should override Ctx with its own context.
-			Context:            ctx,
+			SessionDataStack:   sessiondata.NewStack(sd),
 			Planner:            &faketreeeval.DummyEvalPlanner{},
 			PrivilegedAccessor: &faketreeeval.DummyPrivilegedAccessor{},
 			SessionAccessor:    &faketreeeval.DummySessionAccessor{},
@@ -2513,6 +2518,9 @@ func createSchemaChangeEvalCtx(
 			Tracer:             execCfg.AmbientCtx.Tracer,
 		},
 	}
+	// TODO(andrei): This is wrong (just like on the main code path on
+	// setupFlow). Each processor should override Ctx with its own context.
+	evalCtx.SetDeprecatedContext(ctx)
 	// The backfill is going to use the current timestamp for the various
 	// functions, like now(), that need it.  It's possible that the backfill has
 	// been partially performed already by another SchemaChangeManager with
@@ -2594,7 +2602,7 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 		}
 		opts := retry.Options{
 			InitialBackoff: 20 * time.Millisecond,
-			MaxBackoff:     20 * time.Second,
+			MaxBackoff:     schemaChangeJobMaxRetryBackoff.Get(p.ExecCfg().SV()),
 			Multiplier:     1.5,
 		}
 

@@ -1119,7 +1119,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		err := cleanupSessionTempObjects(
 			ctx,
 			ex.server.cfg.Settings,
-			ex.server.cfg.CollectionFactory,
+			ex.server.cfg.InternalExecutorFactory,
 			ex.server.cfg.DB,
 			ex.server.cfg.Codec,
 			ex.sessionID,
@@ -1850,6 +1850,7 @@ func (ex *connExecutor) run(
 			return err
 		}
 	}
+
 }
 
 // errDrainingComplete is returned by execCmd when the connExecutor previously got
@@ -1920,6 +1921,7 @@ func (ex *connExecutor) execCmd() error {
 			ev, payload, err = ex.execStmt(
 				ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes, canAutoCommit,
 			)
+
 			return err
 		}()
 		// Note: we write to ex.statsCollector.PhaseTimes, instead of ex.phaseTimes,
@@ -2813,7 +2815,7 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.Placeholders = nil
 	evalCtx.Annotations = nil
 	evalCtx.IVarContainer = nil
-	evalCtx.Context.Context = ex.Ctx()
+	evalCtx.SetDeprecatedContext(ex.Ctx())
 	evalCtx.Txn = txn
 	evalCtx.PrepareOnly = false
 	evalCtx.SkipNormalize = false

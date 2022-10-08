@@ -356,7 +356,6 @@ var charts = []sectionDescription{
 					"rpc.method.reversescan.recv",
 					"rpc.method.revertrange.recv",
 					"rpc.method.scan.recv",
-					"rpc.method.scaninterleavedintents.recv",
 					"rpc.method.subsume.recv",
 					"rpc.method.transferlease.recv",
 					"rpc.method.truncatelog.recv",
@@ -410,7 +409,6 @@ var charts = []sectionDescription{
 					"distsender.rpc.reversescan.sent",
 					"distsender.rpc.revertrange.sent",
 					"distsender.rpc.scan.sent",
-					"distsender.rpc.scaninterleavedintents.sent",
 					"distsender.rpc.subsume.sent",
 					"distsender.rpc.transferlease.sent",
 					"distsender.rpc.probe.sent",
@@ -731,6 +729,18 @@ var charts = []sectionDescription{
 					"kv.allocator.load_based_replica_rebalancing.delta_not_significant",
 					"kv.allocator.load_based_replica_rebalancing.existing_not_overfull",
 					"kv.allocator.load_based_replica_rebalancing.cannot_find_better_candidate",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{DistributionLayer, "Load", "Splitter"}},
+		Charts: []chartDescription{
+			{
+				Title: "Load Splitter",
+				Metrics: []string{
+					"kv.loadsplitter.popularkey",
+					"kv.loadsplitter.nosplitkey",
 				},
 			},
 		},

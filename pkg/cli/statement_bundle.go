@@ -160,7 +160,7 @@ func runBundleRecreate(cmd *cobra.Command, args []string) (resErr error) {
 				}
 				placeholderToColMap[n] = pair[1]
 			}
-			inputs, outputs, err := getExplainCombinations(conn, explainPrefix, placeholderToColMap, bundle)
+			inputs, outputs, err := getExplainCombinations(ctx, conn, explainPrefix, placeholderToColMap, bundle)
 			if err != nil {
 				return err
 			}
@@ -205,6 +205,7 @@ type bucketKey struct {
 // Columns are linked to placeholders by the --placeholder=n=schema.table.col
 // commandline flags.
 func getExplainCombinations(
+	ctx context.Context,
 	conn clisqlclient.Conn,
 	explainPrefix string,
 	placeholderToColMap map[int]string,
@@ -292,6 +293,12 @@ func getExplainCombinations(
 				return nil, nil, errors.Wrapf(err, "unable to parse type %s for col %s", typ, col)
 			}
 			colType := tree.MustBeStaticallyKnownType(colTypeRef)
+			if stat["histo_buckets"] == nil {
+				// There might not be any histogram buckets if the stats were
+				// collected when the table was empty or all values in the
+				// column were NULL.
+				continue
+			}
 			buckets := stat["histo_buckets"].([]interface{})
 			var maxUpperBound tree.Datum
 			for _, b := range buckets {
@@ -304,7 +311,7 @@ func getExplainCombinations(
 				}
 				upperBound := bucket["upper_bound"].(string)
 				bucketMap[key] = []string{upperBound}
-				datum, err := rowenc.ParseDatumStringAs(colType, upperBound, &evalCtx)
+				datum, err := rowenc.ParseDatumStringAs(ctx, colType, upperBound, &evalCtx)
 				if err != nil {
 					panic("failed parsing datum string as " + datum.String() + " " + err.Error())
 				}

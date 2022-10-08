@@ -1350,14 +1350,6 @@ func (dsp *DistSQLPlanner) PlanAndRunSubqueries(
 			skipDistSQLDiagramGeneration,
 		); err != nil {
 			recv.SetError(err)
-			// Usually we leave the closure of subqueries to occur when the
-			// whole plan is being closed (i.e. planTop.close); however, since
-			// we've encountered an error, we might never get to the point of
-			// closing the whole plan, so we choose to defensively close the
-			// subqueries here.
-			for i := range subqueryPlans {
-				subqueryPlans[i].plan.Close(ctx)
-			}
 			return false
 		}
 	}
@@ -1618,7 +1610,7 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 		}
 
 		evalCtx := evalCtxFactory()
-		execFactory := newExecFactory(planner)
+		execFactory := newExecFactory(ctx, planner)
 		// The cascading query is allowed to autocommit only if it is the last
 		// cascade and there are no check queries to run.
 		allowAutoCommit := planner.autoCommit

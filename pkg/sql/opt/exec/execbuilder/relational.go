@@ -724,6 +724,12 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		}
 	}
 
+	idx := tab.Index(scan.Index)
+	if idx.IsInverted() && len(scan.InvertedConstraint) == 0 {
+		return execPlan{},
+			errors.AssertionFailedf("expected inverted index scan to have an inverted constraint")
+	}
+
 	// Save if we planned a full table/index scan on the builder so that the
 	// planner can be made aware later. We only do this for non-virtual tables.
 	stats := scan.Relational().Statistics()
@@ -806,7 +812,7 @@ func (b *Builder) buildPlaceholderScan(scan *memo.PlaceholderScanExpr) (execPlan
 	for i, expr := range scan.Span {
 		// The expression is either a placeholder or a constant.
 		if p, ok := expr.(*memo.PlaceholderExpr); ok {
-			val, err := eval.Expr(b.evalCtx, p.Value)
+			val, err := eval.Expr(b.ctx, b.evalCtx, p.Value)
 			if err != nil {
 				return execPlan{}, err
 			}
@@ -1096,7 +1102,7 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 			return nil, err
 		}
 
-		eb := New(ef, &o, f.Memo(), b.catalog, newRightSide, b.evalCtx, false /* allowAutoCommit */)
+		eb := New(ctx, ef, &o, f.Memo(), b.catalog, newRightSide, b.evalCtx, false /* allowAutoCommit */)
 		eb.disableTelemetry = true
 		eb.withExprs = withExprs
 		plan, err := eb.Build()
@@ -2653,6 +2659,7 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 	// To implement exec.RecursiveCTEIterationFn, we create a special Builder.
 
 	innerBldTemplate := &Builder{
+		ctx:     b.ctx,
 		mem:     b.mem,
 		catalog: b.catalog,
 		evalCtx: b.evalCtx,

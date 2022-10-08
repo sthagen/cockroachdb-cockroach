@@ -1603,9 +1603,6 @@ CREATE TABLE crdb_internal.cluster_settings (
 			}
 		}
 		for _, k := range settings.Keys(p.ExecCfg().Codec.ForSystemTenant()) {
-			if !hasAdmin && settings.AdminOnly(k) {
-				continue
-			}
 			setting, _ := settings.Lookup(
 				k, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant(),
 			)
@@ -4754,6 +4751,9 @@ CREATE TABLE crdb_internal.predefined_comments (
 	populate: func(
 		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
 	) error {
+		// NB if ever anyone were to extend this table to carry column
+		// comments, make sure to update pg_catalog.col_description to
+		// retrieve those comments.
 		tableCommentKey := tree.NewDInt(tree.DInt(keys.TableCommentType))
 		vt := p.getVirtualTabler()
 		vEntries := vt.getSchemas()

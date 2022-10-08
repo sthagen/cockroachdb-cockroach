@@ -174,17 +174,6 @@ var concurrentRangefeedItersLimit = settings.RegisterIntSetting(
 	settings.PositiveInt,
 )
 
-// concurrentscanInterleavedIntentsLimit is the number of concurrent
-// ScanInterleavedIntents requests that will be run on a store. Used as part
-// of pre-evaluation throttling.
-var concurrentscanInterleavedIntentsLimit = settings.RegisterIntSetting(
-	settings.TenantWritable,
-	"kv.migration.concurrent_scan_interleaved_intents",
-	"number of scan interleaved intents requests a store will handle concurrently before queueing",
-	1,
-	settings.PositiveInt,
-)
-
 // Minimum time interval between system config updates which will lead to
 // enqueuing replicas.
 var queueAdditionOnSystemConfigUpdateRate = settings.RegisterFloatSetting(
@@ -1133,9 +1122,7 @@ type ConsistencyTestingKnobs struct {
 	// If non-nil, OnBadChecksumFatal is called by CheckConsistency() (instead of
 	// calling log.Fatal) on a checksum mismatch.
 	OnBadChecksumFatal func(roachpb.StoreIdent)
-	// If non-nil, BadChecksumReportDiff is called by CheckConsistency() on a
-	// checksum mismatch to report the diff between snapshots.
-	BadChecksumReportDiff      func(roachpb.StoreIdent, ReplicaSnapshotDiffSlice)
+
 	ConsistencyQueueResultHook func(response roachpb.CheckConsistencyResponse)
 }
 
@@ -1280,11 +1267,6 @@ func NewStore(
 	s.limiters.ConcurrentExportRequests = limit.MakeConcurrentRequestLimiter(
 		"exportRequestLimiter", int(ExportRequestsLimit.Get(&cfg.Settings.SV)),
 	)
-	s.limiters.ConcurrentScanInterleavedIntents = limit.MakeConcurrentRequestLimiter(
-		"scanInterleavedIntentsLimiter", int(concurrentscanInterleavedIntentsLimit.Get(&cfg.Settings.SV)))
-	concurrentscanInterleavedIntentsLimit.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
-		s.limiters.ConcurrentScanInterleavedIntents.SetLimit(int(concurrentscanInterleavedIntentsLimit.Get(&cfg.Settings.SV)))
-	})
 
 	// The snapshot storage is usually empty at this point since it is cleared
 	// after each snapshot application, except when the node crashed right before

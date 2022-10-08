@@ -58,15 +58,18 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+type importTestingKnobs struct {
+	afterImport            func(summary roachpb.RowCount) error
+	beforeRunDSP           func() error
+	alwaysFlushJobProgress bool
+}
+
 type importResumer struct {
 	job      *jobs.Job
 	settings *cluster.Settings
 	res      roachpb.RowCount
 
-	testingKnobs struct {
-		afterImport            func(summary roachpb.RowCount) error
-		alwaysFlushJobProgress bool
-	}
+	testingKnobs importTestingKnobs
 }
 
 func (r *importResumer) TestingSetAfterImportKnob(fn func(summary roachpb.RowCount) error) {
@@ -281,7 +284,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	procsPerNode := int(processorsPerNode.Get(&p.ExecCfg().Settings.SV))
 
 	res, err := ingestWithRetry(ctx, p, r.job, tables, typeDescs, files, format, details.Walltime,
-		r.testingKnobs.alwaysFlushJobProgress, procsPerNode)
+		r.testingKnobs, procsPerNode)
 	if err != nil {
 		return err
 	}
@@ -1005,7 +1008,11 @@ func (r *importResumer) publishTables(
 
 				// Set CHECK constraints to unvalidated before publishing the table imported into.
 				for _, c := range newTableDesc.AllActiveAndInactiveChecks() {
-					c.Validity = descpb.ConstraintValidity_Unvalidated
+					// We only "unvalidate" constraints that are not hash-sharded column
+					// check constraints.
+					if !c.FromHashShardedColumn {
+						c.Validity = descpb.ConstraintValidity_Unvalidated
+					}
 				}
 			}
 			newTableDesc.FinalizeImport()
@@ -1260,7 +1267,7 @@ func ingestWithRetry(
 	from []string,
 	format roachpb.IOFileFormat,
 	walltime int64,
-	alwaysFlushProgress bool,
+	testingKnobs importTestingKnobs,
 	procsPerNode int,
 ) (roachpb.BulkOpSummary, error) {
 	resumerSpan := tracing.SpanFromContext(ctx)
@@ -1288,7 +1295,7 @@ func ingestWithRetry(
 				RetryError:    tracing.RedactAndTruncateError(err),
 			})
 			res, err = distImport(ctx, execCtx, job, tables, typeDescs, from, format, walltime,
-				alwaysFlushProgress, procsPerNode)
+				testingKnobs, procsPerNode)
 			// Replanning errors should not count towards retry limits.
 			if err == nil || !errors.Is(err, sql.ErrPlanChanged) {
 				break
@@ -1371,7 +1378,7 @@ func writeNonDropDatabaseChange(
 ) ([]jobspb.JobID, error) {
 	var job *jobs.Job
 	var err error
-	if job, err = createNonDropDatabaseChangeJob(p.User(), desc.ID, jobDesc, p, txn); err != nil {
+	if job, err = createNonDropDatabaseChangeJob(ctx, p.User(), desc.ID, jobDesc, p, txn); err != nil {
 		return nil, err
 	}
 
@@ -1390,6 +1397,7 @@ func writeNonDropDatabaseChange(
 }
 
 func createNonDropDatabaseChangeJob(
+	ctx context.Context,
 	user username.SQLUsername,
 	databaseID descpb.ID,
 	jobDesc string,
@@ -1409,7 +1417,7 @@ func createNonDropDatabaseChangeJob(
 
 	jobID := p.ExecCfg().JobRegistry.MakeJobID()
 	return p.ExecCfg().JobRegistry.CreateJobWithTxn(
-		p.ExtendedEvalContext().Ctx(),
+		ctx,
 		jobRecord,
 		jobID,
 		txn,

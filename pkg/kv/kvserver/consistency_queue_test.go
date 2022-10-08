@@ -11,7 +11,6 @@
 package kvserver_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	io "io"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -113,11 +111,7 @@ func TestCheckConsistencyMultiStore(t *testing.T) {
 	)
 
 	defer tc.Stopper().Stop(context.Background())
-	ts := tc.Servers[0]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
+	store := tc.GetFirstStoreFromServer(t, 0)
 
 	// Write something to the DB.
 	putArgs := putArgs([]byte("a"), []byte("b"))
@@ -199,11 +193,7 @@ func TestCheckConsistencyReplay(t *testing.T) {
 
 	defer tc.Stopper().Stop(context.Background())
 
-	ts := tc.Servers[0]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
+	store := tc.GetFirstStoreFromServer(t, 0)
 	checkArgs := roachpb.CheckConsistencyRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key:    []byte("a"),
@@ -247,147 +237,67 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
 
+	// The cluster has 3 node, with 1 store per node. The test writes a few KVs to
+	// a range, which gets replicated to all 3 stores. Then it manually replaces
+	// an entry in s2. The consistency check must detect this and terminate n2/s2.
 	const numStores = 3
-	testKnobs := kvserver.StoreTestingKnobs{
-		DisableConsistencyQueue: true,
-	}
-
+	testKnobs := kvserver.StoreTestingKnobs{DisableConsistencyQueue: true}
 	var tc *testcluster.TestCluster
 
-	// s1 will report a diff with inconsistent key "e", and only s2 has that
-	// write (s3 agrees with s1).
-	diffKey := []byte("e")
-	var diffTimestamp hlc.Timestamp
-	notifyReportDiff := make(chan struct{}, 1)
-	testKnobs.ConsistencyTestingKnobs.BadChecksumReportDiff =
-		func(s roachpb.StoreIdent, diff kvserver.ReplicaSnapshotDiffSlice) {
-			rangeDesc := tc.LookupRangeOrFatal(t, diffKey)
-			repl, pErr := tc.FindRangeLeaseHolder(rangeDesc, nil)
-			if pErr != nil {
-				t.Fatal(pErr)
-			}
-			// Servers start at 0, but NodeID starts at 1.
-			store, pErr := tc.Servers[repl.NodeID-1].Stores().GetStore(repl.StoreID)
-			if pErr != nil {
-				t.Fatal(pErr)
-			}
-			if s != *store.Ident {
-				t.Errorf("BadChecksumReportDiff called from follower (StoreIdent = %v)", s)
-				return
-			}
-			if len(diff) != 1 {
-				t.Errorf("diff length = %d, diff = %v", len(diff), diff)
-				return
-			}
-			d := diff[0]
-			if d.LeaseHolder || !bytes.Equal(diffKey, d.Key) || diffTimestamp != d.Timestamp {
-				t.Errorf("diff = %v", d)
-			}
-
-			// mock this out for a consistent string below.
-			diff[0].Timestamp = hlc.Timestamp{Logical: 987, WallTime: 123}
-
-			act := diff.String()
-
-			exp := `--- leaseholder
-+++ follower
-+0.000000123,987 "e"
-+    ts:1970-01-01 00:00:00.000000123 +0000 UTC
-+    value:"\x00\x00\x00\x00\x01T"
-+    raw mvcc_key/value: 6500000000000000007b000003db0d 000000000154
-`
-			if act != exp {
-				// We already logged the actual one above.
-				t.Errorf("expected:\n%s\ngot:\n%s", exp, act)
-			}
-
-			notifyReportDiff <- struct{}{}
-		}
-	// s2 (index 1) will panic.
-	notifyFatal := make(chan struct{}, 1)
+	notifyFatal := make(chan struct{})
 	testKnobs.ConsistencyTestingKnobs.OnBadChecksumFatal = func(s roachpb.StoreIdent) {
-		ts := tc.Servers[1]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		if s != *store.Ident {
-			t.Errorf("OnBadChecksumFatal called from %v", s)
-			return
-		}
-		notifyFatal <- struct{}{}
+		store := tc.GetFirstStoreFromServer(t, 1) // only s2 must terminate
+		require.Equal(t, *store.Ident, s)
+		close(notifyFatal)
 	}
 
-	serverArgsPerNode := make(map[int]base.TestServerArgs)
+	serverArgsPerNode := make(map[int]base.TestServerArgs, numStores)
 	for i := 0; i < numStores; i++ {
-		testServerArgs := base.TestServerArgs{
+		serverArgsPerNode[i] = base.TestServerArgs{
 			Knobs: base.TestingKnobs{
-				Store: &testKnobs,
-				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-				},
+				Store:  &testKnobs,
+				Server: &server.TestingKnobs{StickyEngineRegistry: stickyEngineRegistry},
 			},
-			StoreSpecs: []base.StoreSpec{
-				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
-				},
-			},
+			StoreSpecs: []base.StoreSpec{{
+				InMemory:               true,
+				StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+			}},
 		}
-		serverArgsPerNode[i] = testServerArgs
 	}
 
-	tc = testcluster.StartTestCluster(t, numStores,
-		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationAuto,
-			ServerArgsPerNode: serverArgsPerNode,
-		},
-	)
+	tc = testcluster.StartTestCluster(t, numStores, base.TestClusterArgs{
+		ReplicationMode:   base.ReplicationAuto,
+		ServerArgsPerNode: serverArgsPerNode,
+	})
 	defer tc.Stopper().Stop(context.Background())
 
-	ts := tc.Servers[0]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
 	// Write something to the DB.
-	pArgs := putArgs([]byte("a"), []byte("b"))
-	if _, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), pArgs); err != nil {
-		t.Fatal(err)
-	}
-	pArgs = putArgs([]byte("c"), []byte("d"))
-	if _, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), pArgs); err != nil {
-		t.Fatal(err)
+	store := tc.GetFirstStoreFromServer(t, 0)
+	for k, v := range map[string]string{"a": "b", "c": "d"} {
+		_, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(),
+			putArgs([]byte(k), []byte(v)))
+		require.NoError(t, err.GoError())
 	}
 
 	runConsistencyCheck := func() *roachpb.CheckConsistencyResponse {
-		checkArgs := roachpb.CheckConsistencyRequest{
-			RequestHeader: roachpb.RequestHeader{
-				// span of keys that include "a" & "c".
+		req := roachpb.CheckConsistencyRequest{
+			RequestHeader: roachpb.RequestHeader{ // keys span that includes "a" & "c"
 				Key:    []byte("a"),
 				EndKey: []byte("z"),
 			},
 			Mode: roachpb.ChecksumMode_CHECK_VIA_QUEUE,
 		}
-		resp, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), &checkArgs)
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), &req)
+		require.NoError(t, err.GoError())
 		return resp.(*roachpb.CheckConsistencyResponse)
 	}
 
 	onDiskCheckpointPaths := func(nodeIdx int) []string {
-		testServer := tc.Servers[nodeIdx]
-		fs, pErr := stickyEngineRegistry.GetUnderlyingFS(
+		fs, err := stickyEngineRegistry.GetUnderlyingFS(
 			base.StoreSpec{StickyInMemoryEngineID: strconv.FormatInt(int64(nodeIdx), 10)})
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		testStore, pErr := testServer.Stores().GetStore(testServer.GetFirstStoreID())
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		checkpointPath := filepath.Join(testStore.Engine().GetAuxiliaryDir(), "checkpoints")
+		require.NoError(t, err)
+		store := tc.GetFirstStoreFromServer(t, nodeIdx)
+		checkpointPath := filepath.Join(store.Engine().GetAuxiliaryDir(), "checkpoints")
 		checkpoints, _ := fs.List(checkpointPath)
 		var checkpointPaths []string
 		for _, cpDirName := range checkpoints {
@@ -397,55 +307,50 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	}
 
 	// Run the check the first time, it shouldn't find anything.
-	respOK := runConsistencyCheck()
-	assert.Len(t, respOK.Result, 1)
-	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT, respOK.Result[0].Status)
+	resp := runConsistencyCheck()
+	require.Len(t, resp.Result, 1)
+	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT, resp.Result[0].Status)
 	select {
-	case <-notifyReportDiff:
-		t.Fatal("unexpected diff")
 	case <-notifyFatal:
 		t.Fatal("unexpected panic")
-	default:
+	case <-time.After(time.Second): // the panic may come asynchronously
+		// TODO(pavelkalinnikov): track the full lifecycle of the check in testKnobs
+		// on each replica, to make checks more reliable. E.g., instead of waiting
+		// for panic, ensure the task has started, wait until it exits, and only
+		// then check whether it panicked.
 	}
-
 	// No checkpoints should have been created.
 	for i := 0; i < numStores; i++ {
 		assert.Empty(t, onDiskCheckpointPaths(i))
 	}
 
 	// Write some arbitrary data only to store 1. Inconsistent key "e"!
-	ts1 := tc.Servers[1]
-	store1, pErr := ts1.Stores().GetStore(ts1.GetFirstStoreID())
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
+	store1 := tc.GetFirstStoreFromServer(t, 1)
 	var val roachpb.Value
 	val.SetInt(42)
-	diffTimestamp = ts.Clock().Now()
-	if err := storage.MVCCPut(
-		context.Background(), store1.Engine(), nil, diffKey, diffTimestamp, hlc.ClockTimestamp{}, val, nil,
-	); err != nil {
-		t.Fatal(err)
-	}
+	// Put an inconsistent key "e" to s2, and have s1 and s3 still agree.
+	require.NoError(t, storage.MVCCPut(context.Background(), store1.Engine(), nil,
+		roachpb.Key("e"), tc.Server(0).Clock().Now(), hlc.ClockTimestamp{}, val, nil))
 
 	// Run consistency check again, this time it should find something.
-	resp := runConsistencyCheck()
-
-	select {
-	case <-notifyReportDiff:
-	case <-time.After(5 * time.Second):
-		t.Fatal("CheckConsistency() failed to report a diff as expected")
-	}
+	resp = runConsistencyCheck()
 	select {
 	case <-notifyFatal:
 	case <-time.After(5 * time.Second):
 		t.Fatal("CheckConsistency() failed to panic as expected")
 	}
 
-	// Checkpoints should have been created on all stores and they're not empty.
+	require.Len(t, resp.Result, 1)
+	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_INCONSISTENT, resp.Result[0].Status)
+	assert.Contains(t, resp.Result[0].Detail, `[minority]`)
+	assert.Contains(t, resp.Result[0].Detail, `stats`)
+
+	// Checkpoints should have been created on all stores. Load replica snapshots
+	// from them.
+	snaps := make([]roachpb.RaftSnapshotData, numStores)
 	for i := 0; i < numStores; i++ {
 		cps := onDiskCheckpointPaths(i)
-		assert.Len(t, cps, 1)
+		require.Len(t, cps, 1)
 		metric := tc.GetFirstStoreFromServer(t, i).Metrics().RdbCheckpoints
 		testutils.SucceedsSoon(t, func() error {
 			if got, want := metric.Value(), int64(1); got != want {
@@ -454,25 +359,41 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 			return nil
 		})
 
-		// Create a new store on top of checkpoint location inside existing in mem
+		// Create a new store on top of checkpoint location inside existing in-mem
 		// VFS to verify its contents.
 		fs, err := stickyEngineRegistry.GetUnderlyingFS(base.StoreSpec{StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10)})
 		assert.NoError(t, err)
 		cpEng := storage.InMemFromFS(context.Background(), fs, cps[0], storage.CacheSize(1<<20))
 		defer cpEng.Close()
 
-		// The range is specified using only global keys, since the implementation
-		// may use an intentInterleavingIter.
-		ms, err := storage.ComputeStats(cpEng, keys.LocalMax, roachpb.KeyMax, 0 /* nowNanos */)
-		assert.NoError(t, err)
+		// Find the problematic range in the storage.
+		var desc *roachpb.RangeDescriptor
+		require.NoError(t, kvserver.IterateRangeDescriptorsFromDisk(context.Background(), cpEng,
+			func(rd roachpb.RangeDescriptor) error {
+				if rd.RangeID == resp.Result[0].RangeID {
+					desc = &rd
+				}
+				return nil
+			}))
+		require.NotNil(t, desc)
 
-		assert.NotZero(t, ms.KeyBytes)
+		// Load the content of the problematic range.
+		snap, err := kvserver.LoadRaftSnapshotDataForTesting(context.Background(), *desc, cpEng)
+		require.NoError(t, err)
+		snaps[i] = snap
 	}
 
-	assert.Len(t, resp.Result, 1)
-	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_INCONSISTENT, resp.Result[0].Status)
-	assert.Contains(t, resp.Result[0].Detail, `[minority]`)
-	assert.Contains(t, resp.Result[0].Detail, `stats`)
+	assert.Empty(t, kvserver.DiffRange(&snaps[0], &snaps[2])) // s1 and s3 agree
+	diff := kvserver.DiffRange(&snaps[0], &snaps[1])
+	diff[0].Timestamp = hlc.Timestamp{Logical: 987, WallTime: 123} // for determinism
+	wantDiff := `--- leaseholder
++++ follower
++0.000000123,987 "e"
++    ts:1970-01-01 00:00:00.000000123 +0000 UTC
++    value:"\x00\x00\x00\x00\x01T"
++    raw mvcc_key/value: 6500000000000000007b000003db0d 000000000154
+`
+	assert.Equal(t, wantDiff, diff.String())
 
 	// A death rattle should have been written on s2 (store index 1).
 	eng := store1.Engine()
@@ -549,9 +470,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 			RequestHeader: roachpb.RequestHeader{Key: key},
 			DryRun:        true,
 		})
-		if err := db.Run(ctx, &b); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, db.Run(ctx, &b))
 		resp := b.RawResponse().Responses[0].GetInner().(*roachpb.RecomputeStatsResponse)
 		delta := enginepb.MVCCStats(resp.AddedDelta)
 		delta.AgeTo(0)
@@ -567,9 +486,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		// Split off a range so that we get away from the timeseries writes, which
 		// pollute the stats with ContainsEstimates=true. Note that the split clears
 		// the right hand side (which is what we operate on) from that flag.
-		if err := db0.AdminSplit(ctx, key, hlc.MaxTimestamp /* expirationTime */); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, db0.AdminSplit(ctx, key, hlc.MaxTimestamp /* expirationTime */))
 
 		delta := computeDelta(db0)
 
@@ -578,9 +495,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		}
 
 		rangeDesc, err := tc.LookupRange(key)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 
 		return rangeDesc.RangeID
 	}()
@@ -592,16 +507,12 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 			storage.Filesystem(path),
 			storage.CacheSize(1<<20 /* 1 MiB */),
 			storage.MustExist)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		defer eng.Close()
 
 		rsl := stateloader.Make(rangeID)
 		ms, err := rsl.LoadMVCCStats(ctx, eng)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 
 		// Put some garbage in the stats that we're hoping the consistency queue will
 		// trigger a removal of via RecomputeStats. SysCount was chosen because it is
@@ -616,9 +527,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		// Overwrite with the new stats; remember that this range hasn't upreplicated,
 		// so the consistency checker won't see any replica divergence when it runs,
 		// but it should definitely see that its recomputed stats mismatch.
-		if err := rsl.SetMVCCStats(ctx, eng, &ms); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, rsl.SetMVCCStats(ctx, eng, &ms))
 	}()
 
 	// Now that we've tampered with the stats, restart the cluster and extend it
@@ -649,10 +558,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 			// can starve the actual work to be done.
 			done := time.After(5 * time.Second)
 			for {
-				if err := db0.Put(ctx, fmt.Sprintf("%s%d", key, rand.Int63()), "ballast"); err != nil {
-					t.Error(err)
-				}
-
+				require.NoError(t, db0.Put(ctx, fmt.Sprintf("%s%d", key, rand.Int63()), "ballast"))
 				select {
 				case <-ctx.Done():
 					return
@@ -674,21 +580,13 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 	}
 
 	// Force a run of the consistency queue, otherwise it might take a while.
-	ts := tc.Servers[0]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-	if err := store.ForceConsistencyQueueProcess(); err != nil {
-		t.Fatal(err)
-	}
+	store := tc.GetFirstStoreFromServer(t, 0)
+	require.NoError(t, store.ForceConsistencyQueueProcess())
 
 	// The stats should magically repair themselves. We'll first do a quick check
 	// and then a full recomputation.
-	repl, _, err := ts.Stores().GetReplicaForRangeID(ctx, rangeID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repl, _, err := tc.Servers[0].Stores().GetReplicaForRangeID(ctx, rangeID)
+	require.NoError(t, err)
 	ms := repl.GetMVCCStats()
 	if ms.SysCount >= sysCountGarbage {
 		t.Fatalf("still have a SysCount of %d", ms.SysCount)

@@ -131,6 +131,7 @@ func TestRunNewVsOld(t *testing.T) {
 
 			tc.ds.dist(N, rng).setupTest(t, eng, *tc.ds.desc())
 			snap := eng.NewSnapshot()
+			defer snap.Close()
 
 			oldGCer := makeFakeGCer()
 			ttl := time.Duration(tc.ttlSec) * time.Second
@@ -174,6 +175,7 @@ func BenchmarkRun(b *testing.B) {
 			runGCFunc = runGCOld
 		}
 		snap := eng.NewSnapshot()
+		defer snap.Close()
 		ttl := time.Duration(spec.ttlSec) * time.Second
 		intentThreshold := intentAgeThreshold
 		if spec.intentAgeSec > 0 {
@@ -283,6 +285,7 @@ func TestNewVsInvariants(t *testing.T) {
 
 			sortedDistribution(tc.ds.dist(N, rng)).setupTest(t, eng, *desc)
 			beforeGC := eng.NewSnapshot()
+			defer beforeGC.Close()
 
 			// Run GCer over snapshot.
 			ttl := time.Duration(tc.ttlSec) * time.Second
@@ -557,6 +560,8 @@ func getExpectationsGenerator(
 				}
 
 				// Apply GC checks to produce expected state.
+				v, err := storage.DecodeMVCCValue(history[i].Value)
+				require.NoError(t, err)
 				switch {
 				case gcThreshold.Less(history[i].Key.Timestamp):
 					// Any value above threshold including intents that have no timestamp.
@@ -564,14 +569,14 @@ func getExpectationsGenerator(
 						pending = append(pending, history[i].MVCCKeyValue)
 					}
 					i++
-				case history[i].Key.Timestamp.LessEq(gcThreshold) && len(history[i].Value) > 0:
+				case history[i].Key.Timestamp.LessEq(gcThreshold) && !v.IsTombstone():
 					// First value on or under threshold should be preserved, but the rest
 					// of history should be skipped.
 					pending = append(pending, history[i].MVCCKeyValue)
 					i++
 					stop = true
 				default:
-					// This is ts <= threshold and v == nil
+					// This is ts <= threshold and v.IsTombstone().
 					stop = true
 				}
 			}

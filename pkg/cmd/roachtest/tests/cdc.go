@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -309,6 +310,9 @@ func cdcBasicTest(ctx context.Context, t test.Test, c cluster.Cluster, args cdcT
 }
 
 func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("Skipping cdc/bank under ARM64.")
+	}
 	// Make the logs dir on every node to work around the `roachprod get logs`
 	// spam.
 	c.Run(ctx, c.All(), `mkdir -p logs`)
@@ -413,7 +417,7 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 			return errors.Wrap(err, "CREATE TABLE failed")
 		}
 
-		fprintV, err := cdctest.NewFingerprintValidator(db, `bank.bank`, `fprint`, tc.partitions, 0, false)
+		fprintV, err := cdctest.NewFingerprintValidator(db, `bank.bank`, `fprint`, tc.partitions, 0)
 		if err != nil {
 			return errors.Wrap(err, "error creating validator")
 		}

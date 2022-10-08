@@ -14,6 +14,7 @@ require (
 	github.com/BurntSushi/toml v0.4.1
 	github.com/Masterminds/semver/v3 v3.1.1
 	github.com/MichaelTJones/walk v0.0.0-20161122175330-4748e29d5718
+	github.com/NYTimes/gziphandler v0.0.0-20170623195520-56545f4a5d46
 	github.com/PuerkitoBio/goquery v1.5.1
 	github.com/Shopify/sarama v1.29.0
 	github.com/VividCortex/ewma v1.1.1
@@ -47,7 +48,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.13.0
 	github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f
-	github.com/cockroachdb/pebble v0.0.0-20220930163150-781ebeecebd2
+	github.com/cockroachdb/pebble v0.0.0-20221005185728-eec7375f9c44
 	github.com/cockroachdb/redact v1.1.3
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -69,6 +70,7 @@ require (
 	github.com/fsnotify/fsnotify v1.5.1
 	github.com/getsentry/sentry-go v0.12.0
 	github.com/ghemawat/stream v0.0.0-20171120220530-696b145b53b9
+	github.com/go-openapi/strfmt v0.20.2
 	github.com/go-sql-driver/mysql v1.6.0
 	github.com/go-swagger/go-swagger v0.26.1
 	github.com/gogo/protobuf v1.3.2
@@ -238,7 +240,6 @@ require (
 	github.com/go-openapi/loads v0.20.2 // indirect
 	github.com/go-openapi/runtime v0.19.29 // indirect
 	github.com/go-openapi/spec v0.20.3 // indirect
-	github.com/go-openapi/strfmt v0.20.2 // indirect
 	github.com/go-openapi/swag v0.19.15 // indirect
 	github.com/go-openapi/validate v0.20.2 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect

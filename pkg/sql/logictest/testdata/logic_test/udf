@@ -454,7 +454,7 @@ $$
 statement ok
 DROP FUNCTION f_test_drop(INT), f_test_drop(INT);
 
-statement error pq: function public.f_test_drop does not exist
+statement error pq: unknown function: public.f_test_drop\(\): function undefined
 SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
 
 query T
@@ -473,7 +473,7 @@ $$
 statement ok
 DROP FUNCTION f_test_drop(INT);
 
-statement error pq: function sc1.f_test_drop does not exist
+statement error pq: unknown function: sc1.f_test_drop\(\): function undefined
 SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 
 # If there are identical function signatures in different schemas, multiple drop
@@ -514,10 +514,10 @@ DROP FUNCTION f_test_drop();
 DROP FUNCTION f_test_drop();
 COMMIT;
 
-statement error pq: function public.f_test_drop does not exist
+statement error pq: unknown function: public.f_test_drop\(\): function undefined
 SELECT @2 FROM [SHOW CREATE FUNCTION public.f_test_drop];
 
-statement error pq: function sc1.f_test_drop does not exist
+statement error pq: unknown function: sc1.f_test_drop\(\): function undefined
 SELECT @2 FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
 
 statement ok
@@ -1044,7 +1044,7 @@ ALTER FUNCTION f_test_alter_name RENAME TO f_test_alter_name_same_in
 statement ok
 ALTER FUNCTION f_test_alter_name RENAME TO f_test_alter_name_new
 
-statement error pq: function f_test_alter_name does not exist
+statement error pq: unknown function: f_test_alter_name\(\): function undefined
 SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name];
 
 query T
@@ -1063,7 +1063,7 @@ $$
 statement ok
 ALTER FUNCTION f_test_alter_name_new RENAME to f_test_alter_name_diff_in
 
-statement error pq: function f_test_alter_name_new does not exist
+statement error pq: unknown function: f_test_alter_name_new\(\): function undefined
 SELECT @2 FROM [SHOW CREATE FUNCTION f_test_alter_name_new];
 
 query T
@@ -1849,6 +1849,28 @@ test           sc_test_show_grants  f_test_show_grants(int8, text, oid)  u_test_
 statement ok
 SET search_path = public;
 
+subtest udf_create_privilege
+
+statement ok
+CREATE SCHEMA sc_test_priv;
+
+user testuser
+
+statement error pq: user testuser does not have CREATE privilege on schema sc_test_priv
+CREATE FUNCTION sc_test_priv.f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+user root
+
+statement ok
+GRANT CREATE ON SCHEMA sc_test_priv TO testuser
+
+user testuser
+
+statement ok
+CREATE FUNCTION sc_test_priv.f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+user root
+
 subtest execution
 
 statement ok
@@ -2501,3 +2523,19 @@ subtest variadic
 # Variadic UDFS are not currently supported.
 statement error pgcode 0A000 unimplemented: this syntax\nHINT.*\n.*88947
 CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS '1'
+
+subtest execute_dropped_function
+
+statement ok
+CREATE FUNCTION f_test_exec_dropped(a int) RETURNS INT LANGUAGE SQL AS $$ SELECT a $$;
+
+query I
+SELECT f_test_exec_dropped(123);
+----
+123
+
+statement ok
+DROP FUNCTION f_test_exec_dropped;
+
+statement error pq: unknown function: f_test_exec_dropped\(\): function undefined
+SELECT f_test_exec_dropped(321);

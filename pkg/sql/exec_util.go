@@ -91,7 +91,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -1311,10 +1310,9 @@ type ExecutorConfig struct {
 	// records.
 	SpanConfigKVAccessor spanconfig.KVAccessor
 
-	// InternalExecutorFactory is used to create an InternalExecutor binded with
+	// InternalExecutorFactory is used to create an InternalExecutor bound with
 	// SessionData and other ExtraTxnState.
-	// This is currently only for builtin functions where we need to execute sql.
-	InternalExecutorFactory sqlutil.InternalExecutorFactory
+	InternalExecutorFactory descs.TxnManager
 
 	// ConsistencyChecker is to generate the results in calls to
 	// crdb_internal.check_consistency.
@@ -3121,6 +3119,10 @@ func (m *sessionDataMutator) SetIdleInTransactionSessionTimeout(timeout time.Dur
 	m.data.IdleInTransactionSessionTimeout = timeout
 }
 
+func (m *sessionDataMutator) SetTransactionTimeout(timeout time.Duration) {
+	m.data.TransactionTimeout = timeout
+}
+
 func (m *sessionDataMutator) SetAllowPrepareAsOptPlan(val bool) {
 	m.data.AllowPrepareAsOptPlan = val
 }
@@ -3452,7 +3454,7 @@ func DescsTxn(
 	execCfg *ExecutorConfig,
 	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
 ) error {
-	return execCfg.CollectionFactory.Txn(ctx, execCfg.DB, f)
+	return execCfg.InternalExecutorFactory.DescsTxn(ctx, execCfg.DB, f)
 }
 
 // TestingDescsTxn is a convenience function for running a transaction on

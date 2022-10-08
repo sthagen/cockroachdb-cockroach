@@ -37,6 +37,10 @@ import (
 // (key/value/timestamp), for backwards compatibility. If disallowShadowingBelow
 // is non-empty, disallowShadowing is ignored.
 //
+// sstTimestamp, if non-zero, represents the timestamp that all keys in the SST
+// are expected to be at. This method can make performance optimizations with
+// the expectation that no SST keys will be at any other timestamp.
+//
 // The given SST and reader cannot contain intents or inline values (i.e. zero
 // timestamps), but this is only checked for keys that exist in both sides, for
 // performance.
@@ -52,6 +56,7 @@ func CheckSSTConflicts(
 	leftPeekBound, rightPeekBound roachpb.Key,
 	disallowShadowing bool,
 	disallowShadowingBelow hlc.Timestamp,
+	sstTimestamp hlc.Timestamp,
 	maxIntents int64,
 	usePrefixSeek bool,
 ) (enginepb.MVCCStats, error) {
@@ -69,6 +74,30 @@ func CheckSSTConflicts(
 	}
 	if rightPeekBound == nil {
 		rightPeekBound = keys.MaxKey
+	}
+
+	// In some iterations below, we try to call Next() instead of SeekGE() for a
+	// few iterations, as nexts are more performant. If `numNextsBeforeSeek` nexts
+	// are not sufficient to land at or after a desired SeekGE key, we fall back to
+	// a seek.
+	const numNextsBeforeSeek = 5
+	var statsDiff enginepb.MVCCStats
+	var intents []roachpb.Intent
+	if usePrefixSeek {
+		// If we're going to be using a prefix iterator, check for the fast path
+		// first, where there are no keys in the reader between the sstable's start
+		// and end keys. We use a non-prefix iterator for this search, and reopen a
+		// prefix one if there are engine keys in the span.
+		nonPrefixIter := reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+			KeyTypes:   IterKeyTypePointsAndRanges,
+			UpperBound: end.Key,
+		})
+		nonPrefixIter.SeekGE(start)
+		valid, err := nonPrefixIter.Valid()
+		nonPrefixIter.Close()
+		if !valid {
+			return statsDiff, err
+		}
 	}
 
 	// Check for any range keys.
@@ -112,29 +141,28 @@ func CheckSSTConflicts(
 	}
 	rkIter.Close()
 
-	var statsDiff enginepb.MVCCStats
-	var intents []roachpb.Intent
-
 	if usePrefixSeek {
-		// If we're going to be using a prefix iterator, check for the fast path
-		// first, where there are no keys in the reader between the sstable's start
-		// and end keys. We use a non-prefix iterator for this search, and reopen a
-		// prefix one if there are engine keys in the span.
-		nonPrefixIter := reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: end.Key})
-		nonPrefixIter.SeekGE(start)
-		valid, err := nonPrefixIter.Valid()
-		nonPrefixIter.Close()
-		if !valid {
-			return statsDiff, err
-		}
+		// Prefix iteration and range key masking don't work together. See the
+		// comment on the panic inside pebbleIterator.setOptions.
+		sstTimestamp = hlc.Timestamp{}
 	}
-
 	extIter := reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
-		KeyTypes:     IterKeyTypePointsAndRanges,
-		LowerBound:   leftPeekBound,
-		UpperBound:   rightPeekBound,
-		Prefix:       usePrefixSeek,
-		useL6Filters: true,
+		KeyTypes:   IterKeyTypePointsAndRanges,
+		LowerBound: leftPeekBound,
+		UpperBound: rightPeekBound,
+		// NB: Range key masking is performant, but it skips instances where we need
+		// to adjust GCBytesAge in the returned stats diff. Consider an example
+		// where a point key is masked by a range tombstone, and we added a new
+		// revision of that key above the range tombstone in the SST. The GCBytesAge
+		// contribution of that range tombstone on the point key's key (as opposed
+		// to the version contribution) needs to be un-done as that key is now being
+		// used by the live key.
+		//
+		// TODO(bilal): Add tests that test for this case, and close this gap in
+		// GCBytesAge calculation.
+		RangeKeyMaskingBelow: sstTimestamp,
+		Prefix:               usePrefixSeek,
+		useL6Filters:         true,
 	})
 	defer extIter.Close()
 
@@ -309,6 +337,12 @@ func CheckSSTConflicts(
 				continue
 			}
 
+			// TODO(sumeer): extValueRaw is not always needed below. In many cases
+			// MVCCValueLenAndIsTombstone() suffices. This will require some
+			// rearrangement of the logic in compareForCollision. This is not a
+			// pressing optimization since currently the value is cheap to retrieve
+			// for the latest version of a key, and we are seeing the latest version
+			// because of the extIter.SeekGE call above.
 			extKey, extValueRaw := extIter.UnsafeKey(), extIter.UnsafeValue()
 			sstKey, sstValueRaw := sstIter.UnsafeKey(), sstIter.UnsafeValue()
 
@@ -399,10 +433,7 @@ func CheckSSTConflicts(
 			sstBottomTombstone := sstRangeKeys.Versions[len(sstRangeKeys.Versions)-1]
 			sstTopTombstone := sstRangeKeys.Versions[0]
 			extKey := extIter.UnsafeKey()
-			extValue, ok, err := tryDecodeSimpleMVCCValue(extIter.UnsafeValue())
-			if !ok && err == nil {
-				extValue, err = decodeExtendedMVCCValue(extIter.UnsafeValue())
-			}
+			extValueLen, extValueIsTombstone, err := extIter.MVCCValueLenAndIsTombstone()
 			if err != nil {
 				return enginepb.MVCCStats{}, err
 			}
@@ -416,7 +447,7 @@ func CheckSSTConflicts(
 				// Check if shadowing a live key is allowed. Deleting a live key counts
 				// as a shadow.
 				extValueDeleted := extHasRange && extRangeKeys.Covers(extKey)
-				if !extValue.IsTombstone() && !extValueDeleted && (!disallowShadowingBelow.IsEmpty() || disallowShadowing) {
+				if !extValueIsTombstone && !extValueDeleted && (!disallowShadowingBelow.IsEmpty() || disallowShadowing) {
 					// Note that we don't check for value equality here, unlike in the
 					// point key shadow case. This is because a range key and a point key
 					// by definition have different values.
@@ -430,12 +461,14 @@ func CheckSSTConflicts(
 					}
 					sstPointShadowsExtPoint := sstHasPoint && sstIter.UnsafeKey().Key.Equal(extKey.Key)
 					if (extKeyChanged || sstRangeKeysChanged) && !sstPointShadowsExtPoint {
-						statsDiff.Add(updateStatsOnRangeKeyCover(sstRangeKeyVersion.Timestamp, extKey, extIter.UnsafeValue()))
+						statsDiff.Add(updateStatsOnRangeKeyCover(
+							sstRangeKeyVersion.Timestamp, extKey, extValueLen, extValueIsTombstone))
 					} else if !extKeyChanged && sstPointShadowsExtPoint {
 						// This is either a conflict, shadow, or idempotent operation.
 						// Subtract the RangeKeyCover stats diff from the last iteration, as
 						// compareForCollision will account for the shadow.
-						statsDiff.Subtract(updateStatsOnRangeKeyCover(sstRangeKeyVersion.Timestamp, extKey, extIter.UnsafeValue()))
+						statsDiff.Subtract(updateStatsOnRangeKeyCover(
+							sstRangeKeyVersion.Timestamp, extKey, extValueLen, extValueIsTombstone))
 					}
 				}
 			}
@@ -697,7 +730,7 @@ func CheckSSTConflicts(
 			extPrevRangeKeys = extRangeKeys.Clone()
 		}
 
-		extKey, extValueRaw := extIter.UnsafeKey(), extIter.UnsafeValue()
+		extKey := extIter.UnsafeKey()
 		sstKey, sstValueRaw := sstIter.UnsafeKey(), sstIter.UnsafeValue()
 
 		// Keep seeking the iterators until both keys are equal.
@@ -712,7 +745,20 @@ func CheckSSTConflicts(
 			sstIter.SeekGE(MVCCKey{Key: extKey.Key})
 			sstOK, sstErr = sstIter.Valid()
 			if sstOK {
-				extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+				// Seeks on the engine are expensive. Try Next()ing if we're very close
+				// to the sst key (which we might be).
+				nextsUntilSeek := numNextsBeforeSeek
+				for extOK && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
+					extIter.NextKey()
+					extOK, _ = extIter.Valid()
+					nextsUntilSeek--
+					if nextsUntilSeek <= 0 {
+						break
+					}
+				}
+				if extOK && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
+					extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+				}
 			}
 			extOK, extErr = extIter.Valid()
 			continue
@@ -720,6 +766,10 @@ func CheckSSTConflicts(
 
 		extValueDeletedByRange := extHasRange && extHasPoint && extRangeKeys.Covers(extKey)
 		if sstHasPoint && extHasPoint && !extValueDeletedByRange {
+			// TODO(sumeer): extValueRaw is not always needed below. In many cases
+			// MVCCValueLenAndIsTombstone() suffices. This will require some
+			// rearrangement of the logic in compareForCollision.
+			extValueRaw := extIter.UnsafeValue()
 			if err := compareForCollision(sstKey, extKey, sstValueRaw, extValueRaw); err != nil {
 				return enginepb.MVCCStats{}, err
 			}
@@ -731,6 +781,42 @@ func CheckSSTConflicts(
 			statsDiff.KeyBytes -= int64(len(extKey.Key) + 1)
 		}
 
+		// Fast path with sstTimestamp set and a common case of import cancellation.
+		// Since we use range key masking, we can just Next() the ext iterator
+		// past its range key.
+		if sstTimestamp.IsSet() && extHasRange && !extHasPoint && !sstHasRange {
+			if vers, ok := extRangeKeys.FirstAtOrAbove(sstTimestamp); !ok || vers.Timestamp.Equal(sstTimestamp) {
+				// All range key versions are below the request timestamp. We can seek
+				// past the range key, as all SST points/ranges are going to be above
+				// this range key.
+				extIter.Next()
+				extOK, extErr = extIter.Valid()
+				if !extOK {
+					break
+				}
+
+				sstIter.SeekGE(MVCCKey{Key: extIter.UnsafeKey().Key})
+				sstOK, sstErr = sstIter.Valid()
+				if sstOK {
+					// Seeks on the engine are expensive. Try Next()ing if we're very close
+					// to the sst key (which we might be).
+					nextsUntilSeek := numNextsBeforeSeek
+					for extOK && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
+						extIter.NextKey()
+						extOK, _ = extIter.Valid()
+						nextsUntilSeek--
+						if nextsUntilSeek <= 0 {
+							break
+						}
+					}
+					if extOK && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
+						extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+					}
+				}
+				extOK, extErr = extIter.Valid()
+				continue
+			}
+		}
 		steppedExtIter := false
 		// Before Next-ing the SST iter, if it contains any range keys, check if both:
 		// 1) the next SST key takes us outside the current SST range key

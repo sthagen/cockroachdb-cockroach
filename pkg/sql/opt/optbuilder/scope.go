@@ -1534,6 +1534,9 @@ func (s *scope) replaceCount(
 	}
 	f.Exprs[0] = vn
 
+	// It is ok to use string equality here, even if there is a UDF named
+	// "count" because UDFs cannot be aggregate functions. This code path is
+	// only executed for aggregate functions.
 	if strings.EqualFold(def.Name, "count") && f.Type == 0 {
 		if _, ok := vn.(tree.UnqualifiedStar); ok {
 			if f.Filter != nil {
@@ -1548,9 +1551,6 @@ func (s *scope) replaceCount(
 				e := &cpy
 				e.Exprs = tree.Exprs{tree.DBoolTrue}
 
-				// TODO(mgartner): What happens if a user defines a UDF named
-				// "count"? We might need to resolve the function first, not
-				// just rely on string equality to "count" above.
 				newDef, err := e.Func.Resolve(s.builder.ctx, s.builder.semaCtx.SearchPath, nil /* resolver */)
 				if err != nil {
 					panic(err)
@@ -1577,9 +1577,6 @@ func (s *scope) replaceCount(
 			if _, err := e.TypeCheck(s.builder.ctx, &semaCtx, types.Any); err != nil {
 				panic(err)
 			}
-			// TODO(mgartner): What happens if a user defines a UDF named
-			// "count"? We might need to resolve the function first, not just
-			// rely on string equality to "count" above.
 			newDef, err := e.Func.Resolve(s.builder.ctx, s.builder.semaCtx.SearchPath, nil /* resolver */)
 			if err != nil {
 				panic(err)
@@ -1633,10 +1630,12 @@ func (*scope) VisitPost(expr tree.Expr) tree.Expr {
 // scope implements the IndexedVarContainer interface so it can be used as
 // semaCtx.IVarContainer. This allows tree.TypeCheck to determine the correct
 // type for any IndexedVars.
-var _ tree.IndexedVarContainer = &scope{}
+var _ eval.IndexedVarContainer = &scope{}
 
-// IndexedVarEval is part of the IndexedVarContainer interface.
-func (s *scope) IndexedVarEval(idx int, e tree.ExprEvaluator) (tree.Datum, error) {
+// IndexedVarEval is part of the eval.IndexedVarContainer interface.
+func (s *scope) IndexedVarEval(
+	ctx context.Context, idx int, e tree.ExprEvaluator,
+) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("unimplemented: scope.IndexedVarEval"))
 }
 

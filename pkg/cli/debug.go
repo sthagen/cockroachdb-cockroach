@@ -524,11 +524,15 @@ func loadRangeDescriptor(
 			// doesn't parse as a range descriptor just skip it.
 			return nil //nolint:returnerrcheck
 		}
-		if len(kv.Value) == 0 {
+		v, err := storage.DecodeMVCCValue(kv.Value)
+		if err != nil {
+			log.Warningf(context.Background(), "ignoring range descriptor due to error %s: %+v", err, kv)
+		}
+		if v.IsTombstone() {
 			// RangeDescriptor was deleted (range merged away).
 			return nil
 		}
-		if err := (roachpb.Value{RawBytes: kv.Value}).GetProto(&desc); err != nil {
+		if err := v.Value.GetProto(&desc); err != nil {
 			log.Warningf(context.Background(), "ignoring range descriptor due to error %s: %+v", err, kv)
 			return nil
 		}
@@ -1191,9 +1195,8 @@ var debugIntentCount = &cobra.Command{
 	Use:   "intent-count <store directory>",
 	Short: "return a count of intents in directory",
 	Long: `
-Returns a count of interleaved and separated intents in the store directory.
-Used to investigate stores with lots of unresolved intents, or to confirm
-if the migration away from interleaved intents was successful.
+Returns a count of intents in the store directory. Used to investigate stores
+with lots of unresolved intents.
 `,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runDebugIntentCount,
@@ -1210,7 +1213,7 @@ func runDebugIntentCount(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	var interleavedIntentCount, separatedIntentCount int
+	var intentCount int
 	var keysCount uint64
 	var wg sync.WaitGroup
 	closer := make(chan bool)
@@ -1235,48 +1238,29 @@ func runDebugIntentCount(cmd *cobra.Command, args []string) error {
 	})
 
 	iter := db.NewEngineIterator(storage.IterOptions{
-		LowerBound: roachpb.KeyMin,
-		UpperBound: roachpb.KeyMax,
+		LowerBound: keys.LockTableSingleKeyStart,
+		UpperBound: keys.LockTableSingleKeyEnd,
 	})
 	defer iter.Close()
-	valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
-	var meta enginepb.MVCCMetadata
-	for ; valid && err == nil; valid, err = iter.NextEngineKey() {
+	seekKey := storage.EngineKey{Key: keys.LockTableSingleKeyStart}
+
+	var valid bool
+	for valid, err = iter.SeekEngineKeyGE(seekKey); valid && err == nil; valid, err = iter.NextEngineKey() {
 		key, err := iter.EngineKey()
 		if err != nil {
 			return err
 		}
 		atomic.AddUint64(&keysCount, 1)
 		if key.IsLockTableKey() {
-			separatedIntentCount++
-			continue
+			intentCount++
 		}
-		if !key.IsMVCCKey() {
-			continue
-		}
-		mvccKey, err := key.ToMVCCKey()
-		if err != nil {
-			return err
-		}
-		if !mvccKey.Timestamp.IsEmpty() {
-			continue
-		}
-		val := iter.UnsafeValue()
-		if err := protoutil.Unmarshal(val, &meta); err != nil {
-			return err
-		}
-		if meta.IsInline() {
-			continue
-		}
-		interleavedIntentCount++
 	}
 	if err != nil {
 		return err
 	}
 	close(closer)
 	wg.Wait()
-	fmt.Printf("interleaved intents: %d\nseparated intents: %d\n",
-		interleavedIntentCount, separatedIntentCount)
+	fmt.Printf("intents: %d\n", intentCount)
 	return nil
 }
 

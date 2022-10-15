@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/unique"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 )
 
@@ -253,6 +254,8 @@ func TestJSONErrors(t *testing.T) {
 		{`true false`, `trailing characters after JSON document`},
 		{`trues`, `trailing characters after JSON document`},
 		{`1 2 3`, `trailing characters after JSON document`},
+		{`[1, 2, 3]]`, `trailing characters after JSON document`},
+		{`[1, 2, 3]} do not ignore`, `trailing characters after JSON document`},
 		// Here the decoder just grabs the 0 and leaves the 1. JSON numbers can't have
 		// leading 0s.
 		{`01`, `trailing characters after JSON document`},
@@ -1321,7 +1324,9 @@ func TestEncodeDecodeJSONInvertedIndex(t *testing.T) {
 		}
 
 		for j, path := range enc {
-			str := encoding.PrettyPrintValue(nil, path, "/")
+			var buf redact.StringBuilder
+			encoding.PrettyPrintValue(&buf, nil, path, "/")
+			str := buf.String()
 			if str != c.expEnc[j] {
 				t.Errorf("unexpected encoding mismatch for %v. expected [%s], got [%s]",
 					c.value, c.expEnc[j], str)
@@ -1388,7 +1393,7 @@ func TestEncodeJSONInvertedIndex(t *testing.T) {
 			nil)}},
 		{`[["a"]]`, [][]byte{bytes.Join([][]byte{jsonPrefix, arrayPrefix, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "a")},
 			nil)}},
-		{`{"a":["b","c"]}]`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "b")}, nil),
+		{`{"a":["b","c"]}`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "b")}, nil),
 			bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "c")}, nil)}},
 		{`[]`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, emptyArrayEncoding},
 			nil)}},

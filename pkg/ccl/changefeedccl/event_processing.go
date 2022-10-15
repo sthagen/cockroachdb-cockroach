@@ -12,6 +12,7 @@ import (
 	"context"
 	"hash"
 	"hash/crc32"
+	"runtime"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
@@ -103,6 +104,10 @@ func newEventConsumer(
 
 	// TODO (jayshrivastava) enable parallel consumers for sinkless changefeeds
 	numWorkers := changefeedbase.EventConsumerWorkers.Get(&cfg.Settings.SV)
+	if numWorkers == 0 {
+		// Pick a reasonable default.
+		numWorkers = defaultNumWorkers()
+	}
 	if numWorkers <= 1 || isSinkless {
 		c, err := makeConsumer(sink, spanFrontier)
 		if err != nil {
@@ -132,6 +137,17 @@ func newEventConsumer(
 		return nil, nil, err
 	}
 	return c, ss, nil
+}
+
+func defaultNumWorkers() int64 {
+	idealNumber := runtime.GOMAXPROCS(0) >> 2
+	if idealNumber < 1 {
+		return 1
+	}
+	if idealNumber > 8 {
+		return 8
+	}
+	return int64(idealNumber)
 }
 
 func makeHasher() hash.Hash32 {
@@ -402,7 +418,7 @@ func (c *parallelEventConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Eve
 	startTime := timeutil.Now().UnixNano()
 	defer func() {
 		time := timeutil.Now().UnixNano()
-		c.metrics.ParallelConsumerConsumeNanos.Inc(time - startTime)
+		c.metrics.ParallelConsumerConsumeNanos.RecordValue(time - startTime)
 	}()
 
 	bucket := c.getBucketForEvent(ev)
@@ -486,14 +502,13 @@ func (c *parallelEventConsumer) workerLoop(
 func (c *parallelEventConsumer) incInFlight() {
 	c.mu.Lock()
 	c.mu.inFlight++
+	c.metrics.ParallelConsumerInFlightEvents.Update(int64(c.mu.inFlight))
 	c.mu.Unlock()
-	c.metrics.ParallelConsumerInFlightEvents.Inc(1)
 }
 
 func (c *parallelEventConsumer) decInFlight() {
 	c.mu.Lock()
 	c.mu.inFlight--
-	c.metrics.ParallelConsumerInFlightEvents.Dec(1)
 	notifyFlush := c.mu.waiting && c.mu.inFlight == 0
 	c.mu.Unlock()
 
@@ -521,7 +536,7 @@ func (c *parallelEventConsumer) Flush(ctx context.Context) error {
 	startTime := timeutil.Now().UnixNano()
 	defer func() {
 		time := timeutil.Now().UnixNano()
-		c.metrics.ParallelConsumerFlushNanos.Inc(time - startTime)
+		c.metrics.ParallelConsumerFlushNanos.RecordValue(time - startTime)
 	}()
 
 	needFlush := func() bool {

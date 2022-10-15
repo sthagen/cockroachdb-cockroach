@@ -856,17 +856,15 @@ func (n *Node) GetPebbleMetrics() []admission.StoreMetrics {
 	var metrics []admission.StoreMetrics
 	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
 		m := store.Engine().GetMetrics()
-		im := store.Engine().GetInternalIntervalMetrics()
 		diskStats := admission.DiskStats{ProvisionedBandwidth: clusterProvisionedBandwidth}
 		if s, ok := storeIDToDiskStats[store.StoreID()]; ok {
 			diskStats = s
 		}
 		metrics = append(metrics, admission.StoreMetrics{
-			StoreID:                 int32(store.StoreID()),
-			Metrics:                 m.Metrics,
-			WriteStallCount:         m.WriteStallCount,
-			InternalIntervalMetrics: im,
-			DiskStats:               diskStats})
+			StoreID:         int32(store.StoreID()),
+			Metrics:         m.Metrics,
+			WriteStallCount: m.WriteStallCount,
+			DiskStats:       diskStats})
 		return nil
 	})
 	return metrics
@@ -1066,7 +1064,15 @@ func (n *Node) batchInternal(
 	var reqSp spanForRequest
 	ctx, reqSp = n.setupSpanForIncomingRPC(ctx, tenID, args)
 	// NB: wrapped to delay br evaluation to its value when returning.
-	defer func() { reqSp.finish(br) }()
+	defer func() {
+		var redact redactOpt
+		if redactServerTracesForSecondaryTenants.Get(&n.storeCfg.Settings.SV) {
+			redact = redactIfTenantRequest
+		} else {
+			redact = dontRedactEvenIfTenantRequest
+		}
+		reqSp.finish(br, redact)
+	}()
 	if log.HasSpanOrEvent(ctx) {
 		log.Eventf(ctx, "node received request: %s", args.Summary())
 	}
@@ -1165,12 +1171,18 @@ type spanForRequest struct {
 	sp            *tracing.Span
 	needRecording bool
 	tenID         roachpb.TenantID
-	settings      *cluster.Settings
 }
+
+type redactOpt bool
+
+const (
+	redactIfTenantRequest         redactOpt = true
+	dontRedactEvenIfTenantRequest redactOpt = false
+)
 
 // finish finishes the span. If the span was recording and br is not nil, the
 // recording is written to br.CollectedSpans.
-func (sp *spanForRequest) finish(br *roachpb.BatchResponse) {
+func (sp *spanForRequest) finish(br *roachpb.BatchResponse, redactOpt redactOpt) {
 	var rec tracingpb.Recording
 	// If we don't have a response, there's nothing to attach a trace to.
 	// Nothing more for us to do.
@@ -1190,8 +1202,7 @@ func (sp *spanForRequest) finish(br *roachpb.BatchResponse) {
 		// Even if the recording sent to a tenant is redacted (anything sensitive
 		// is stripped out of the verbose messages), structured payloads
 		// stay untouched.
-		needRedaction := sp.tenID != roachpb.SystemTenantID &&
-			redactServerTracesForSecondaryTenants.Get(&sp.settings.SV)
+		needRedaction := sp.tenID != roachpb.SystemTenantID && redactOpt == redactIfTenantRequest
 		if needRedaction {
 			redactRecording(rec)
 		}
@@ -1215,15 +1226,11 @@ func (sp *spanForRequest) finish(br *roachpb.BatchResponse) {
 func (n *Node) setupSpanForIncomingRPC(
 	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest,
 ) (context.Context, spanForRequest) {
-	return setupSpanForIncomingRPC(ctx, tenID, ba, n.storeCfg.AmbientCtx.Tracer, n.storeCfg.Settings)
+	return setupSpanForIncomingRPC(ctx, tenID, ba, n.storeCfg.AmbientCtx.Tracer)
 }
 
 func setupSpanForIncomingRPC(
-	ctx context.Context,
-	tenID roachpb.TenantID,
-	ba *roachpb.BatchRequest,
-	tr *tracing.Tracer,
-	settings *cluster.Settings,
+	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest, tr *tracing.Tracer,
 ) (context.Context, spanForRequest) {
 	var newSpan *tracing.Span
 	parentSpan := tracing.SpanFromContext(ctx)
@@ -1267,7 +1274,6 @@ func setupSpanForIncomingRPC(
 		needRecording: needRecordingCollection,
 		tenID:         tenID,
 		sp:            newSpan,
-		settings:      settings,
 	}
 }
 

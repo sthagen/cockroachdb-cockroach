@@ -12,7 +12,7 @@ bulkio.backup.read_with_priority_after	duration	1m0s	amount of time since the re
 bulkio.stream_ingestion.minimum_flush_interval	duration	5s	the minimum timestamp between flushes; flushes may still occur if internal buffers fill up
 changefeed.balance_range_distribution.enable	boolean	false	if enabled, the ranges are balanced equally among all nodes
 changefeed.event_consumer_worker_queue_size	integer	16	if changefeed.event_consumer_workers is enabled, this setting sets the maxmimum number of eventswhich a worker can buffer
-changefeed.event_consumer_workers	integer	8	the number of workers to use when processing events; 0 or 1 disables
+changefeed.event_consumer_workers	integer	0	the number of workers to use when processing events: <0 disables, 0 assigns a reasonable default, >0 assigns the setting value
 changefeed.fast_gzip.enabled	boolean	true	use fast gzip implementation
 changefeed.node_throttle_config	string		specifies node level throttling configuration for all changefeeeds
 changefeed.schema_feed.read_with_priority_after	duration	1m0s	retry with high priority if we were not able to read descriptors for too long; 0 disables
@@ -87,7 +87,7 @@ server.user_login.password_hashes.default_cost.scram_sha_256	integer	119680	the 
 server.user_login.timeout	duration	10s	timeout after which client authentication times out if some system range is unavailable (0 = no timeout)
 server.user_login.upgrade_bcrypt_stored_passwords_to_scram.enabled	boolean	true	whether to automatically re-encode stored passwords using crdb-bcrypt to scram-sha-256
 server.web_session.auto_logout.timeout	duration	168h0m0s	the duration that web sessions will survive before being periodically purged, since they were last used
-server.web_session.purge.max_deletions_per_cycle	integer	10	the maximum number of old sessions to delete for each purge
+server.web_session.purge.max_deletions_per_cycle	integer	1000	the maximum number of old sessions to delete for each purge
 server.web_session.purge.period	duration	1h0m0s	the time until old sessions are deleted
 server.web_session.purge.ttl	duration	1h0m0s	if nonzero, entries in system.web_sessions older than this duration are periodically purged
 server.web_session_timeout	duration	168h0m0s	the duration that a newly created web session will be valid
@@ -253,7 +253,7 @@ sql.metrics.statement_details.enabled	boolean	true	collect per-statement query s
 sql.metrics.statement_details.gateway_node.enabled	boolean	true	save the gateway node for each statement fingerprint. If false, the value will be stored as 0.
 sql.metrics.statement_details.index_recommendation_collection.enabled	boolean	true	generate an index recommendation for each fingerprint ID
 sql.metrics.statement_details.max_mem_reported_idx_recommendations	integer	5000	the maximum number of reported index recommendation info stored in memory
-sql.metrics.statement_details.plan_collection.enabled	boolean	true	periodically save a logical plan for each fingerprint
+sql.metrics.statement_details.plan_collection.enabled	boolean	false	periodically save a logical plan for each fingerprint
 sql.metrics.statement_details.plan_collection.period	duration	5m0s	the time until a new logical plan is collected
 sql.metrics.statement_details.threshold	duration	0s	minimum execution time to cause statement statistics to be collected. If configured, no transaction stats are collected.
 sql.metrics.transaction_details.enabled	boolean	true	collect per-application transaction statistics

@@ -1425,10 +1425,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "11f8da00b0b17fc086174d57fc1cd5e098ab0d62b752fd0c6db755873c3fe133",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20221005185728-eec7375f9c44",
+        sha256 = "a1a2227e4b2869e50bc5aad003f1d4757ae5594ed00e3b45b2619aa0d878c532",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20221014163543-7e037ade079a",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20221005185728-eec7375f9c44.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20221014163543-7e037ade079a.zip",
         ],
     )
     go_repository(
@@ -4489,10 +4489,10 @@ def go_deps():
         name = "com_github_jackc_pgconn",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/jackc/pgconn",
-        sha256 = "48d34064a1facff7766713d9224502e7376a5d90c1506f99a37c57bfceaf9636",
-        strip_prefix = "github.com/jackc/pgconn@v1.12.1",
+        sha256 = "4d9bf1309f5cdbd589d60a485fb5d5d7333edf9652c2dd47b7dd31b12dda887e",
+        strip_prefix = "github.com/jackc/pgconn@v1.13.1-0.20221001150415-49cbf4659151",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/jackc/pgconn/com_github_jackc_pgconn-v1.12.1.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/jackc/pgconn/com_github_jackc_pgconn-v1.13.1-0.20221001150415-49cbf4659151.zip",
         ],
     )
     go_repository(
@@ -4539,10 +4539,10 @@ def go_deps():
         name = "com_github_jackc_pgproto3_v2",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/jackc/pgproto3/v2",
-        sha256 = "6b702c372e13520636243d3be58922968f0630b67e23ba77326ef6ee4cada463",
-        strip_prefix = "github.com/jackc/pgproto3/v2@v2.3.0",
+        sha256 = "57884e299825af31fd01268659f1e671883b73b708a51230da14d6f8ee0e4e36",
+        strip_prefix = "github.com/jackc/pgproto3/v2@v2.3.1",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/jackc/pgproto3/v2/com_github_jackc_pgproto3_v2-v2.3.0.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/jackc/pgproto3/v2/com_github_jackc_pgproto3_v2-v2.3.1.zip",
         ],
     )
     go_repository(

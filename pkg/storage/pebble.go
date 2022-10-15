@@ -157,7 +157,8 @@ func EngineKeyEqual(a, b []byte) bool {
 	// need to split the "user key" from the version suffix before comparing to
 	// compute equality. Instead, we can check for byte equality immediately.
 	const withWall = mvccEncodedTimeSentinelLen + mvccEncodedTimeWallLen
-	if aVerLen <= withWall && bVerLen <= withWall {
+	const withLockTableLen = mvccEncodedTimeSentinelLen + engineKeyVersionLockTableLen
+	if (aVerLen <= withWall && bVerLen <= withWall) || (aVerLen == withLockTableLen && bVerLen == withLockTableLen) {
 		return bytes.Equal(a, b)
 	}
 
@@ -846,11 +847,11 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	// The context dance here is done so that we have a clean context without
 	// timeouts that has a copy of the log tags.
 	logCtx := logtags.WithTags(context.Background(), logtags.FromContext(ctx))
-	logCtx = logtags.AddTag(logCtx, "pebble", nil)
 	// The store id, could not necessarily be determined when this function
 	// is called. Therefore, we use a container for the store id.
 	storeIDContainer := &base.StoreIDContainer{}
 	logCtx = logtags.AddTag(logCtx, "s", storeIDContainer)
+	logCtx = logtags.AddTag(logCtx, "pebble", nil)
 
 	if cfg.Opts.Logger == nil {
 		cfg.Opts.Logger = pebbleLogger{
@@ -1526,11 +1527,6 @@ func (p *Pebble) GetMetrics() Metrics {
 		DiskSlowCount:      atomic.LoadInt64(&p.diskSlowCount),
 		DiskStallCount:     atomic.LoadInt64(&p.diskStallCount),
 	}
-}
-
-// GetInternalIntervalMetrics implements the Engine interface.
-func (p *Pebble) GetInternalIntervalMetrics() *pebble.InternalIntervalMetrics {
-	return p.db.InternalIntervalMetrics()
 }
 
 // GetEncryptionRegistries implements the Engine interface.

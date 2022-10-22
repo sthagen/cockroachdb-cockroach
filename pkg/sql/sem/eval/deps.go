@@ -132,6 +132,10 @@ type CatalogBuiltins interface {
 
 	// PGRelationIsUpdatable returns the update events the relation supports.
 	PGRelationIsUpdatable(ctx context.Context, oid *tree.DOid) (*tree.DInt, error)
+
+	// RedactDescriptor expects an encoded protobuf descriptor, decodes it,
+	// redacts its expressions, and re-encodes it.
+	RedactDescriptor(ctx context.Context, encodedDescriptor []byte) ([]byte, error)
 }
 
 // HasPrivilegeSpecifier specifies an object to lookup privilege for.
@@ -362,6 +366,11 @@ type Planner interface {
 	// second return value is false if the database doesn't exist or is not
 	// multiregion.
 	GetMultiregionConfig(ctx context.Context, databaseID descpb.ID) (interface{}, bool)
+
+	// IsANSIDML returns true if the statement being planned is one of the 4 DML
+	// statements, SELECT, UPDATE, INSERT, DELETE, or an EXPLAIN of one of these
+	// statements.
+	IsANSIDML() bool
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
@@ -536,7 +545,11 @@ type TenantOperator interface {
 	// CreateTenant attempts to install a new tenant in the system. It returns
 	// an error if the tenant already exists. The new tenant is created at the
 	// current active version of the cluster performing the create.
-	CreateTenant(ctx context.Context, tenantID uint64) error
+	CreateTenant(ctx context.Context, tenantID uint64, tenantName string) error
+
+	// RenameTenant renames the specified tenant. An error is returned if
+	// the tenant does not exist or the name is already taken.
+	RenameTenant(ctx context.Context, tenantID uint64, tenantName string) error
 
 	// DestroyTenant attempts to uninstall an existing tenant from the system.
 	// It returns an error if the tenant does not exist. If synchronous is true

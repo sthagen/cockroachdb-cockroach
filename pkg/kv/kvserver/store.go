@@ -1118,8 +1118,8 @@ var logRangeAndNodeEventsEnabled = func() *settings.BoolSetting {
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
 // behavior of the consistency checker for tests.
 type ConsistencyTestingKnobs struct {
-	// If non-nil, OnBadChecksumFatal is called by CheckConsistency() (instead of
-	// calling log.Fatal) on a checksum mismatch.
+	// If non-nil, OnBadChecksumFatal is called on a replica with a mismatching
+	// checksum, instead of log.Fatal.
 	OnBadChecksumFatal func(roachpb.StoreIdent)
 
 	ConsistencyQueueResultHook func(response roachpb.CheckConsistencyResponse)
@@ -1534,23 +1534,64 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString), v
 						break
 					}
 
+					// Is the lease owned by this store?
+					leaseLocallyOwned := drainingLeaseStatus.OwnedBy(s.StoreID())
+
+					// Is there some other replica that we can transfer the lease to?
 					// Learner replicas aren't allowed to become the leaseholder or raft
-					// leader, so only consider the `Voters` replicas.
-					needsLeaseTransfer := len(r.Desc().Replicas().VoterDescriptors()) > 1 &&
-						drainingLeaseStatus.IsValid() &&
-						drainingLeaseStatus.OwnedBy(s.StoreID())
+					// leader, so only consider the Voters replicas.
+					transferTargetAvailable := len(r.Desc().Replicas().VoterDescriptors()) > 1
+
+					// If so, and the lease is proscribed, we have to reacquire it so that
+					// we can transfer it away. Other replicas won't know that this lease
+					// is proscribed and not usable by this replica, so failing to
+					// transfer the lease away could cause temporary unavailability.
+					needsLeaseReacquisition := leaseLocallyOwned && transferTargetAvailable &&
+						drainingLeaseStatus.State == kvserverpb.LeaseState_PROSCRIBED
+
+					// Otherwise, if the lease is locally owned and valid, transfer it.
+					needsLeaseTransfer := leaseLocallyOwned && transferTargetAvailable &&
+						drainingLeaseStatus.State == kvserverpb.LeaseState_VALID
+
+					if !needsLeaseTransfer && !needsLeaseReacquisition {
+						// Skip this replica.
+						atomic.AddInt32(&numTransfersAttempted, -1)
+						return
+					}
+
+					if needsLeaseReacquisition {
+						// Re-acquire the proscribed lease for this replica so that we can
+						// transfer it away during a later iteration.
+						desc := r.Desc()
+						if verbose || log.V(1) {
+							// This logging is useful to troubleshoot incomplete drains.
+							log.Infof(ctx, "attempting to acquire proscribed lease %v for range %s",
+								drainingLeaseStatus.Lease, desc)
+						}
+
+						_, pErr := r.redirectOnOrAcquireLease(ctx)
+						if pErr != nil {
+							const failFormat = "failed to acquire proscribed lease %s for range %s when draining: %v"
+							infoArgs := []interface{}{drainingLeaseStatus.Lease, desc, pErr}
+							if verbose {
+								log.Dev.Infof(ctx, failFormat, infoArgs...)
+							} else {
+								log.VErrEventf(ctx, 1 /* level */, failFormat, infoArgs...)
+							}
+							// The lease reacquisition failed. Either we no longer hold the
+							// lease or we will need to attempt to reacquire it again. Either
+							// way, handle this on a future iteration.
+							return
+						}
+
+						// The lease reacquisition succeeded. Proceed to the lease transfer.
+					}
 
 					// Note that this code doesn't deal with transferring the Raft
 					// leadership. Leadership tries to follow the lease, so when leases
 					// are transferred, leadership will be transferred too. For ranges
 					// without leases we probably should try to move the leadership
 					// manually to a non-draining replica.
-
-					if !needsLeaseTransfer {
-						// Skip this replica.
-						atomic.AddInt32(&numTransfersAttempted, -1)
-						return
-					}
 
 					desc, conf := r.DescAndSpanConfig()
 
@@ -2354,7 +2395,7 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 		// Metrics depend in part on the system config. Compute them as soon as we
 		// get the first system config, then periodically in the background
 		// (managed by the Node).
-		if err := s.ComputeMetrics(ctx, -1); err != nil {
+		if err := s.ComputeMetrics(ctx); err != nil {
 			log.Infof(ctx, "%s: failed initial metrics computation: %s", s, err)
 		}
 		log.Event(ctx, "computed initial metrics")
@@ -3315,29 +3356,25 @@ func (s *Store) checkpoint(ctx context.Context, tag string) (string, error) {
 	return checkpointDir, nil
 }
 
-// ComputeMetrics immediately computes the current value of store metrics which
-// cannot be computed incrementally. This method should be invoked periodically
-// by a higher-level system which records store metrics.
-//
-// The tick argument should increment across repeated calls to this
-// method. It is used to compute some metrics less frequently than others.
-func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
+// computeMetrics is a common metric computation that is used by
+// ComputeMetricsPeriodically and ComputeMetrics to compute metrics
+func (s *Store) computeMetrics(ctx context.Context) (m storage.Metrics, err error) {
 	ctx = s.AnnotateCtx(ctx)
-	if err := s.updateCapacityGauges(ctx); err != nil {
-		return err
+	if err = s.updateCapacityGauges(ctx); err != nil {
+		return m, err
 	}
-	if err := s.updateReplicationGauges(ctx); err != nil {
-		return err
+	if err = s.updateReplicationGauges(ctx); err != nil {
+		return m, err
 	}
 
 	// Get the latest engine metrics.
-	m := s.engine.GetMetrics()
+	m = s.engine.GetMetrics()
 	s.metrics.updateEngineMetrics(m)
 
 	// Get engine Env stats.
 	envStats, err := s.engine.GetEnvStats()
 	if err != nil {
-		return err
+		return m, err
 	}
 	s.metrics.updateEnvStats(*envStats)
 
@@ -3348,6 +3385,29 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 		}
 		s.metrics.RdbCheckpoints.Update(int64(len(dirs)))
 	}
+
+	return m, nil
+}
+
+// ComputeMetricsPeriodically computes metrics that need to be computed
+// periodically along with the regular metrics
+func (s *Store) ComputeMetricsPeriodically(
+	ctx context.Context, prevMetrics *storage.Metrics, tick int,
+) (m storage.Metrics, err error) {
+	m, err = s.computeMetrics(ctx)
+	if err != nil {
+		return m, err
+	}
+	wt := m.Flush.WriteThroughput
+
+	if prevMetrics != nil {
+		wt.Subtract(prevMetrics.Flush.WriteThroughput)
+	}
+	flushUtil := 0.0
+	if wt.WorkDuration > 0 {
+		flushUtil = float64(wt.WorkDuration) / float64(wt.WorkDuration+wt.IdleDuration)
+	}
+	s.metrics.FlushUtilization.Update(flushUtil)
 
 	// Log this metric infrequently (with current configurations,
 	// every 10 minutes). Trigger on tick 1 instead of tick 0 so that
@@ -3370,7 +3430,15 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 		e.StoreId = int32(s.StoreID())
 		log.StructuredEvent(ctx, &e)
 	}
-	return nil
+	return m, nil
+}
+
+// ComputeMetrics immediately computes the current value of store metrics which
+// cannot be computed incrementally. This method should be invoked periodically
+// by a higher-level system which records store metrics.
+func (s *Store) ComputeMetrics(ctx context.Context) error {
+	_, err := s.computeMetrics(ctx)
+	return err
 }
 
 // ClusterNodeCount returns this store's view of the number of nodes in the

@@ -464,6 +464,11 @@ func (ep *DummyEvalPlanner) GetMultiregionConfig(
 	return nil /* regionConfig */, false
 }
 
+// IsANSIDML is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) IsANSIDML() bool {
+	return false
+}
+
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.
 type DummyPrivilegedAccessor struct{}
 
@@ -537,7 +542,12 @@ var errEvalTenant = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessio
 	"cannot evaluate tenant operation in this context")
 
 // CreateTenant is part of the tree.TenantOperator interface.
-func (c *DummyTenantOperator) CreateTenant(_ context.Context, _ uint64) error {
+func (c *DummyTenantOperator) CreateTenant(_ context.Context, _ uint64, _ string) error {
+	return errors.WithStack(errEvalTenant)
+}
+
+// RenameTenant is part of the tree.TenantOperator interface.
+func (c *DummyTenantOperator) RenameTenant(_ context.Context, _ uint64, _ string) error {
 	return errors.WithStack(errEvalTenant)
 }
 

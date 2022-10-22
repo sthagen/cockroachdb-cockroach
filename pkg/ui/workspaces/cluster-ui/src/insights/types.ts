@@ -70,6 +70,7 @@ export type StatementInsightEvent = {
   transactionID: string;
   statementFingerprintID: string;
   transactionFingerprintID: string;
+  implicitTxn: boolean;
   startTime: Moment;
   elapsedTimeMillis: number;
   sessionID: string;
@@ -89,6 +90,7 @@ export type StatementInsightEvent = {
   application: string;
   insights: Insight[];
   indexRecommendations: string[];
+  planGist: string;
 };
 
 export type Insight = {

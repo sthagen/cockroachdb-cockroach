@@ -10,6 +10,7 @@ package changefeedccl
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strconv"
 	"sync"
@@ -77,16 +78,27 @@ func (p *syncProducerMock) SendMessage(
 	msg *sarama.ProducerMessage,
 ) (partition int32, offset int64, err error) {
 	if p.overrideSend != nil {
-		return 0, 0, p.overrideSend(msg)
+		if err := p.overrideSend(msg); err != nil {
+			return 0, 0, sarama.ProducerError{Msg: msg, Err: err}
+		}
 	}
 	return 0, 0, nil
 }
 func (p *syncProducerMock) SendMessages(msgs []*sarama.ProducerMessage) error {
+	var errs sarama.ProducerErrors = nil
 	for _, msg := range msgs {
 		_, _, err := p.SendMessage(msg)
 		if err != nil {
-			return err
+			// nolint:errcmp
+			if producerErr, ok := err.(sarama.ProducerError); ok {
+				errs = append(errs, &producerErr)
+			} else {
+				return err
+			}
 		}
+	}
+	if len(errs) > 0 {
+		return errs
 	}
 	return nil
 }
@@ -664,6 +676,21 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		err = cfg.Apply(saramaCfg)
 		require.Error(t, err)
 
+	})
+	t.Run("compression options validation", func(t *testing.T) {
+		for option := range saramaCompressionCodecOptions {
+			opts := changefeedbase.SinkSpecificJSONConfig(fmt.Sprintf(`{"Compression": "%s"}`, option))
+			cfg, err := getSaramaConfig(opts)
+			require.NoError(t, err)
+
+			saramaCfg := &sarama.Config{}
+			err = cfg.Apply(saramaCfg)
+			require.NoError(t, err)
+		}
+
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Compression": "invalid"}`)
+		_, err := getSaramaConfig(opts)
+		require.Error(t, err)
 	})
 }
 

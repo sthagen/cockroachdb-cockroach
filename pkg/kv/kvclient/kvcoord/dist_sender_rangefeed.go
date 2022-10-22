@@ -22,11 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -69,10 +71,10 @@ var catchupScanConcurrency = settings.RegisterIntSetting(
 var rangefeedRangeStuckThreshold = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"kv.rangefeed.range_stuck_threshold",
-	"restart rangefeeds if they appear to be stuck for the specified threshold; 0 disables",
+	"restart rangefeeds if they don't emit anything for the specified threshold; 0 disables (kv.closed_timestamp.side_transport_interval takes precedence)",
 	time.Minute,
 	settings.NonNegativeDuration,
-)
+).WithPublic()
 
 func maxConcurrentCatchupScans(sv *settings.Values) int {
 	l := catchupScanConcurrency.Get(sv)
@@ -506,6 +508,14 @@ func (ds *DistSender) singleRangeFeed(
 			RangeID:   desc.RangeID,
 		},
 		WithDiff: withDiff,
+		AdmissionHeader: roachpb.AdmissionHeader{
+			// NB: AdmissionHeader is used only at the start of the range feed
+			// stream since the initial catch-up scan is expensive.
+			Priority:                 int32(admissionpb.BulkNormalPri),
+			CreateTime:               timeutil.Now().UnixNano(),
+			Source:                   roachpb.AdmissionHeader_FROM_SQL,
+			NoMemoryReservedAtSource: true,
+		},
 	}
 
 	var latencyFn LatencyFunc
@@ -543,7 +553,18 @@ func (ds *DistSender) singleRangeFeed(
 	defer finishCatchupScan()
 
 	stuckWatcher := newStuckRangeFeedCanceler(cancelFeed, func() time.Duration {
-		return rangefeedRangeStuckThreshold.Get(&ds.st.SV)
+		// Before the introduction of kv.rangefeed.range_stuck_threshold = 1m,
+		// clusters may already have kv.closed_timestamp.side_transport_interval set
+		// to >1m. This would cause rangefeeds to continually restart. We therefore
+		// conservatively use the highest value.
+		threshold := rangefeedRangeStuckThreshold.Get(&ds.st.SV)
+		if threshold > 0 {
+			if t := time.Duration(math.Round(
+				1.2 * float64(closedts.SideTransportCloseInterval.Get(&ds.st.SV)))); t > threshold {
+				threshold = t
+			}
+		}
+		return threshold
 	})
 	defer stuckWatcher.stop()
 

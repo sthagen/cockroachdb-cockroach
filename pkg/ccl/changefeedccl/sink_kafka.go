@@ -134,6 +134,37 @@ type kafkaSink struct {
 	disableInternalRetry bool
 }
 
+var saramaCompressionCodecOptions = map[string]sarama.CompressionCodec{
+	"NONE":   sarama.CompressionNone,
+	"GZIP":   sarama.CompressionGZIP,
+	"SNAPPY": sarama.CompressionSnappy,
+	"LZ4":    sarama.CompressionLZ4,
+	"ZSTD":   sarama.CompressionZSTD,
+}
+
+func validateCompressionCodec(s string) (sarama.CompressionCodec, error) {
+	codec, ok := saramaCompressionCodecOptions[s]
+	if !ok {
+		return -1, errors.Newf("could not validate compression codec '%s'", s)
+	}
+	return codec, nil
+}
+
+type compressionCodec sarama.CompressionCodec
+
+func (j *compressionCodec) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	codec, err := validateCompressionCodec(s)
+	if err != nil {
+		return err
+	}
+	*j = compressionCodec(codec)
+	return nil
+}
+
 type saramaConfig struct {
 	// These settings mirror ones in sarama config.
 	// We just tag them w/ JSON annotations.
@@ -145,6 +176,8 @@ type saramaConfig struct {
 		Frequency   jsonDuration `json:",omitempty"`
 		MaxMessages int          `json:",omitempty"`
 	}
+
+	Compression compressionCodec `json:",omitempty"`
 
 	RequiredAcks string `json:",omitempty"`
 
@@ -181,6 +214,10 @@ func defaultSaramaConfig() *saramaConfig {
 	config.Flush.Messages = 0
 	config.Flush.Frequency = jsonDuration(0)
 	config.Flush.Bytes = 0
+
+	// The default compression protocol is sarama.CompressionNone,
+	// which is 0.
+	config.Compression = 0
 
 	// This works around what seems to be a bug in sarama where it isn't
 	// computing the right value to compare against `Producer.MaxMessageBytes`
@@ -400,6 +437,10 @@ func (s *kafkaSink) startInflightMessage(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.mu.flushErr != nil {
+		return s.mu.flushErr
+	}
+
 	s.mu.inflight++
 	if log.V(2) {
 		log.Infof(ctx, "emitting %d inflight records to kafka", s.mu.inflight)
@@ -601,6 +642,15 @@ func (s *kafkaSink) handleBufferedRetries(msgs []*sarama.ProducerMessage, retryE
 		// SendMessages will attempt to send all messages into an AsyncProducer with
 		// the client's config and then block until the results come in.
 		lastSendErr = newProducer.SendMessages(msgs)
+		if lastSendErr != nil {
+			// nolint:errcmp
+			if sendErrs, ok := lastSendErr.(sarama.ProducerErrors); ok && len(sendErrs) > 0 {
+				// Just check the first error since all these messages being retried
+				// were likely from a single partition and therefore would've been
+				// marked with the same error.
+				lastSendErr = sendErrs[0].Err
+			}
+		}
 
 		if err := newProducer.Close(); err != nil {
 			log.Errorf(s.ctx, "closing of previous sarama producer for retry failed with: %s", err.Error())
@@ -709,6 +759,7 @@ func (c *saramaConfig) Apply(kafka *sarama.Config) error {
 		}
 		kafka.Producer.RequiredAcks = parsedAcks
 	}
+	kafka.Producer.Compression = sarama.CompressionCodec(c.Compression)
 	return nil
 }
 

@@ -6348,40 +6348,45 @@ func TestChangefeedOnlyInitialScan(t *testing.T) {
 
 		for testName, changefeedStmt := range initialScanOnlyTests {
 			t.Run(testName, func(t *testing.T) {
-				sqlDB.Exec(t, "CREATE TABLE foo (a INT PRIMARY KEY)")
-				sqlDB.Exec(t, "INSERT INTO foo VALUES (1), (2), (3)")
+				sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+				sqlDB.Exec(t, `INSERT INTO foo (a) SELECT * FROM generate_series(1, 5000);`)
 
 				feed := feed(t, f, changefeedStmt)
 
-				sqlDB.Exec(t, "INSERT INTO foo VALUES (4), (5), (6)")
+				sqlDB.Exec(t, "INSERT INTO foo VALUES (5005), (5007), (5009)")
 
-				seenMoreMessages := false
 				g := ctxgroup.WithContext(context.Background())
+				var expectedMessages []string
+				for i := 1; i <= 5000; i++ {
+					expectedMessages = append(expectedMessages, fmt.Sprintf(
+						`foo: [%d]->{"after": {"a": %d}}`, i, i,
+					))
+				}
+				var seenMessages []string
 				g.Go(func() error {
-					assertPayloads(t, feed, []string{
-						`foo: [1]->{"after": {"a": 1}}`,
-						`foo: [2]->{"after": {"a": 2}}`,
-						`foo: [3]->{"after": {"a": 3}}`,
-					})
 					for {
-						_, err := feed.Next()
+						m, err := feed.Next()
 						if err != nil {
 							return err
 						}
-						seenMoreMessages = true
+						seenMessages = append(seenMessages, fmt.Sprintf(`%s: %s->%s`, m.Topic, m.Key, m.Value))
 					}
 				})
-				defer func() {
-					closeFeed(t, feed)
-					sqlDB.Exec(t, `DROP TABLE foo`)
-					_ = g.Wait()
-					require.False(t, seenMoreMessages)
-				}()
 
 				jobFeed := feed.(cdctest.EnterpriseTestFeed)
 				require.NoError(t, jobFeed.WaitForStatus(func(s jobs.Status) bool {
 					return s == jobs.StatusSucceeded
 				}))
+
+				closeFeed(t, feed)
+				sqlDB.Exec(t, `DROP TABLE foo`)
+				_ = g.Wait()
+				require.Equal(t, len(expectedMessages), len(seenMessages))
+				sort.Strings(expectedMessages)
+				sort.Strings(seenMessages)
+				for i := range expectedMessages {
+					require.Equal(t, expectedMessages[i], seenMessages[i])
+				}
 			})
 		}
 	}
@@ -7328,6 +7333,9 @@ func TestChangefeedKafkaMessageTooLarge(t *testing.T) {
 	defer utilccl.TestingEnableEnterprise()()
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		changefeedbase.BatchReductionRetryEnabled.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, true)
+
 		knobs := f.(*kafkaFeedFactory).knobs
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)

@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
@@ -742,11 +743,12 @@ func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.
 	_ = stopper.RunAsyncTask(ctx, "compute-metrics", func(ctx context.Context) {
 		// Compute periodic stats at the same frequency as metrics are sampled.
 		ticker := time.NewTicker(interval)
+		previousMetrics := make(map[*kvserver.Store]*storage.Metrics)
 		defer ticker.Stop()
 		for tick := 0; ; tick++ {
 			select {
 			case <-ticker.C:
-				if err := n.computePeriodicMetrics(ctx, tick); err != nil {
+				if err := n.computeMetricsPeriodically(ctx, previousMetrics, tick); err != nil {
 					log.Errorf(ctx, "failed computing periodic metrics: %s", err)
 				}
 			case <-stopper.ShouldQuiesce():
@@ -756,12 +758,20 @@ func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.
 	})
 }
 
-// computePeriodicMetrics instructs each store to compute the value of
+// computeMetricsPeriodically instructs each store to compute the value of
 // complicated metrics.
-func (n *Node) computePeriodicMetrics(ctx context.Context, tick int) error {
+func (n *Node) computeMetricsPeriodically(
+	ctx context.Context, storeToMetrics map[*kvserver.Store]*storage.Metrics, tick int,
+) error {
 	return n.stores.VisitStores(func(store *kvserver.Store) error {
-		if err := store.ComputeMetrics(ctx, tick); err != nil {
+		if newMetrics, err := store.ComputeMetricsPeriodically(ctx, storeToMetrics[store], tick); err != nil {
 			log.Warningf(ctx, "%s: unable to compute metrics: %s", store, err)
+		} else {
+			if storeToMetrics[store] == nil {
+				storeToMetrics[store] = &newMetrics
+			} else {
+				*storeToMetrics[store] = newMetrics
+			}
 		}
 		return nil
 	})
@@ -1751,7 +1761,7 @@ func (n *Node) TokenBucket(
 var NewTenantUsageServer = func(
 	settings *cluster.Settings,
 	db *kv.DB,
-	executor *sql.InternalExecutor,
+	ief sqlutil.InternalExecutorFactory,
 ) multitenant.TenantUsageServer {
 	return dummyTenantUsageServer{}
 }
@@ -1773,6 +1783,7 @@ func (dummyTenantUsageServer) TokenBucketRequest(
 func (dummyTenantUsageServer) ReconfigureTokenBucket(
 	ctx context.Context,
 	txn *kv.Txn,
+	ie sqlutil.InternalExecutor,
 	tenantID roachpb.TenantID,
 	availableRU float64,
 	refillRate float64,

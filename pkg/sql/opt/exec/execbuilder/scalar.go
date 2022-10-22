@@ -316,6 +316,7 @@ func (b *Builder) buildCase(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 	}
 
 	// Extract the list of WHEN ... THEN ... clauses.
+	whensVals := make([]tree.When, len(cas.Whens))
 	whens := make([]*tree.When, len(cas.Whens))
 	for i, expr := range cas.Whens {
 		whenExpr := expr.(*memo.WhenExpr)
@@ -327,7 +328,8 @@ func (b *Builder) buildCase(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 		if err != nil {
 			return nil, err
 		}
-		whens[i] = &tree.When{Cond: cond, Val: val}
+		whensVals[i] = tree.When{Cond: cond, Val: val}
+		whens[i] = &whensVals[i]
 	}
 
 	elseExpr, err := b.buildScalar(ctx, cas.OrElse)
@@ -721,7 +723,7 @@ func (b *Builder) buildUDF(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 		// TODO(mgartner): Add support for WITH expressions inside UDF bodies.
 		// TODO(mgartner): Add support for subqueries inside UDF bodies.
 		ef := ref.(exec.Factory)
-		eb := New(ctx, ef, &o, f.Memo(), b.catalog, newRightSide, b.evalCtx, false /* allowAutoCommit */)
+		eb := New(ctx, ef, &o, f.Memo(), b.catalog, newRightSide, b.evalCtx, false /* allowAutoCommit */, b.IsANSIDML)
 		eb.disableTelemetry = true
 		plan, err := eb.Build()
 		if err != nil {

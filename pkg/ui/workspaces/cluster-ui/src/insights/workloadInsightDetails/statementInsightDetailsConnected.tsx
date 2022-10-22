@@ -8,9 +8,11 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 import { connect } from "react-redux";
+import { Dispatch } from "redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import {
   StatementInsightDetails,
+  StatementInsightDetailsDispatchProps,
   StatementInsightDetailsStateProps,
 } from "./statementInsightDetails";
 import { AppState } from "src/store";
@@ -18,6 +20,9 @@ import {
   selectStatementInsightDetails,
   selectStatementInsightsError,
 } from "src/store/insights/statementInsights";
+import { selectIsTenant } from "src/store/uiConfig";
+import { TimeScale } from "../../timeScaleDropdown";
+import { actions as sqlStatsActions } from "../../store/sqlStats";
 
 const mapStateToProps = (
   state: AppState,
@@ -28,11 +33,29 @@ const mapStateToProps = (
   return {
     insightEventDetails: insightStatements,
     insightError: insightError,
+    isTenant: selectIsTenant(state),
   };
 };
 
+const mapDispatchToProps = (
+  dispatch: Dispatch,
+): StatementInsightDetailsDispatchProps => ({
+  setTimeScale: (ts: TimeScale) => {
+    dispatch(
+      sqlStatsActions.updateTimeScale({
+        ts: ts,
+      }),
+    );
+  },
+});
+
 export const StatementInsightDetailsConnected = withRouter(
-  connect<StatementInsightDetailsStateProps, RouteComponentProps>(
+  connect<
+    StatementInsightDetailsStateProps,
+    StatementInsightDetailsDispatchProps,
+    RouteComponentProps
+  >(
     mapStateToProps,
+    mapDispatchToProps,
   )(StatementInsightDetails),
 );

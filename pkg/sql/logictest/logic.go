@@ -291,7 +291,7 @@ import (
 //            duration. If the test succeeds at any time during that period, it
 //            is considered successful. Otherwise, it is a failure. See
 //            testutils.SucceedsSoon for more information. If run with the
-//            -rewrite flag, inserts a 500ms sleep before executing the query
+//            -rewrite flag, inserts a 2s sleep before executing the query
 //            once.
 //      - async: runs the query asynchronously, marking it as a pending
 //            query using the label parameter as a unique name, to be completed
@@ -894,9 +894,9 @@ type logicQuery struct {
 	// messages.
 	rawOpts string
 
-	// roundFloatsInStrings can be set to use a regular expression to find floats
-	// that may be embedded in strings and replace them with rounded versions.
-	roundFloatsInStrings bool
+	// roundFloatsInStringsSigFigs specifies the number of significant figures
+	// to round floats embedded in strings to where zero means do not round.
+	roundFloatsInStringsSigFigs int
 }
 
 var allowedKVOpTypes = []string{
@@ -1494,8 +1494,13 @@ func (t *logicTest) newCluster(
 	var randomWorkmem int
 	if t.rng.Float64() < 0.5 && !serverArgs.DisableWorkmemRandomization {
 		// Randomize sql.distsql.temp_storage.workmem cluster setting in
-		// [10KiB, 100KiB) range.
-		randomWorkmem = 10<<10 + t.rng.Intn(90<<10)
+		// [10KiB, 100KiB) range for normal tests and even bigger for sqlite
+		// tests.
+		if *Bigtest {
+			randomWorkmem = 100<<10 + t.rng.Intn(90<<10)
+		} else {
+			randomWorkmem = 10<<10 + t.rng.Intn(90<<10)
+		}
 	}
 
 	// Set cluster settings.
@@ -2546,13 +2551,19 @@ func (t *logicTest) processSubtest(
 						case "noticetrace":
 							query.noticetrace = true
 
-						case "round-in-strings":
-							query.roundFloatsInStrings = true
-
 						case "async":
 							query.expectAsync = true
 
 						default:
+							if strings.HasPrefix(opt, "round-in-strings") {
+								significantFigures, err := floatcmp.ParseRoundInStringsDirective(opt)
+								if err != nil {
+									return err
+								}
+								query.roundFloatsInStringsSigFigs = significantFigures
+								break
+							}
+
 							if strings.HasPrefix(opt, "nodeidx=") {
 								idx, err := strconv.ParseInt(strings.SplitN(opt, "=", 2)[1], 10, 64)
 								if err != nil {
@@ -2722,9 +2733,9 @@ func (t *logicTest) processSubtest(
 							t.purgeZoneConfig()
 							// The presence of the retry flag indicates that we expect this
 							// query may need some time to succeed. If we are rewriting, wait
-							// 500ms before executing the query.
+							// 2s before executing the query.
 							// TODO(rytaft): We may want to make this sleep time configurable.
-							time.Sleep(time.Millisecond * 500)
+							time.Sleep(time.Second * 2)
 						}
 						if err := t.execQuery(query); err != nil {
 							t.Error(err)
@@ -3307,8 +3318,8 @@ func (t *logicTest) finishExecQuery(query logicQuery, rows *gosql.Rows, err erro
 							val = "·"
 						}
 						s := fmt.Sprint(val)
-						if query.roundFloatsInStrings {
-							s = roundFloatsInString(s)
+						if query.roundFloatsInStringsSigFigs > 0 {
+							s = floatcmp.RoundFloatsInString(s, query.roundFloatsInStringsSigFigs)
 						}
 						actualResultsRaw = append(actualResultsRaw, s)
 					} else {
@@ -4116,14 +4127,4 @@ func (t *logicTest) printCompletion(path string, config logictestbase.TestCluste
 	}
 	t.outf("--- done: %s with config %s: %d tests, %d failures%s", path, config.Name,
 		t.progress, t.failures, unsupportedMsg)
-}
-
-func roundFloatsInString(s string) string {
-	return string(regexp.MustCompile(`(\d+\.\d+)`).ReplaceAllFunc([]byte(s), func(x []byte) []byte {
-		f, err := strconv.ParseFloat(string(x), 64)
-		if err != nil {
-			return []byte(err.Error())
-		}
-		return []byte(fmt.Sprintf("%.6g", f))
-	}))
 }

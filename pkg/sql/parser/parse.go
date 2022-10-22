@@ -63,6 +63,24 @@ type Statement struct {
 	NumAnnotations tree.AnnotationIdx
 }
 
+// IsANSIDML returns true if the AST is one of the 4 DML statements,
+// SELECT, UPDATE, INSERT, DELETE, or an EXPLAIN of one of these statements.
+func (stmt Statement) IsANSIDML() bool {
+	return IsANSIDML(stmt.AST)
+}
+
+// IsANSIDML returns true if the AST is one of the 4 DML statements,
+// SELECT, UPDATE, INSERT, DELETE, or an EXPLAIN of one of these statements.
+func IsANSIDML(stmt tree.Statement) bool {
+	switch t := stmt.(type) {
+	case *tree.Select, *tree.ParenSelect, *tree.Delete, *tree.Insert, *tree.Update:
+		return true
+	case *tree.Explain:
+		return IsANSIDML(t.Statement)
+	}
+	return false
+}
+
 // Statements is a list of parsed statements.
 type Statements []Statement
 
@@ -134,12 +152,13 @@ func (p *Parser) parseOneWithInt(sql string, nakedIntType *types.T) (Statement, 
 }
 
 func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
-	var lval sqlSymType
 	tokens = p.tokBuf[:0]
+	tokens = append(tokens, sqlSymType{})
+	lval := &p.tokBuf[0]
 
 	// Scan the first token.
 	for {
-		p.scanner.Scan(&lval)
+		p.scanner.Scan(lval)
 		if lval.id == 0 {
 			return "", nil, true
 		}
@@ -151,7 +170,6 @@ func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
 	startPos := lval.pos
 	// We make the resulting token positions match the returned string.
 	lval.pos = 0
-	tokens = append(tokens, lval)
 	var preValID int32
 	// This is used to track the degree of nested `BEGIN ATOMIC ... END` function
 	// body context. When greater than zero, it means that we're scanning through
@@ -165,7 +183,9 @@ func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
 		}
 		preValID = lval.id
 		posBeforeScan := p.scanner.Pos()
-		p.scanner.Scan(&lval)
+		tokens = append(tokens, sqlSymType{})
+		lval = &tokens[len(tokens)-1]
+		p.scanner.Scan(lval)
 
 		if preValID == BEGIN && lval.id == ATOMIC {
 			curFuncBodyCnt++
@@ -174,10 +194,10 @@ func (p *Parser) scanOneStmt() (sql string, tokens []sqlSymType, done bool) {
 			curFuncBodyCnt--
 		}
 		if lval.id == 0 || (curFuncBodyCnt == 0 && lval.id == ';') {
+			tokens = tokens[:len(tokens)-1]
 			return p.scanner.In()[startPos:posBeforeScan], tokens, (lval.id == 0)
 		}
 		lval.pos -= startPos
-		tokens = append(tokens, lval)
 	}
 }
 

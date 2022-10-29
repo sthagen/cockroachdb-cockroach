@@ -853,7 +853,11 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	logCtx = logtags.AddTag(logCtx, "s", storeIDContainer)
 	logCtx = logtags.AddTag(logCtx, "pebble", nil)
 
-	if cfg.Opts.Logger == nil {
+	// If no logger was passed, the previous call to `EnsureDefaults` on
+	// `cfg.Opts` will set the logger to pebble's `DefaultLogger`. In
+	// crdb, we want pebble-related logs to go to the storage channel,
+	// so we update the logger here accordingly.
+	if cfg.Opts.Logger == nil || cfg.Opts.Logger == pebble.DefaultLogger {
 		cfg.Opts.Logger = pebbleLogger{
 			ctx:   logCtx,
 			depth: 1,
@@ -1375,7 +1379,7 @@ func shouldWriteLocalTimestamps(ctx context.Context, settings *cluster.Settings)
 		// is safe to write local timestamps.
 		return true
 	}
-	return ver.IsActive(clusterversion.LocalTimestamps)
+	return ver.IsActive(clusterversion.V22_2LocalTimestamps)
 }
 
 // ShouldWriteLocalTimestamps implements the Writer interface.
@@ -1795,15 +1799,15 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	formatVers := pebble.FormatMostCompatible
 	// Cases are ordered from newer to older versions.
 	switch {
-	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatPrePebblev1Marked)):
+	case !version.Less(clusterversion.ByKey(clusterversion.V22_2PebbleFormatPrePebblev1Marked)):
 		if formatVers < pebble.FormatPrePebblev1Marked {
 			formatVers = pebble.FormatPrePebblev1Marked
 		}
-	case !version.Less(clusterversion.ByKey(clusterversion.EnsurePebbleFormatVersionRangeKeys)):
+	case !version.Less(clusterversion.ByKey(clusterversion.V22_2EnsurePebbleFormatVersionRangeKeys)):
 		if formatVers < pebble.FormatRangeKeys {
 			formatVers = pebble.FormatRangeKeys
 		}
-	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatSplitUserKeysMarkedCompacted)):
+	case !version.Less(clusterversion.ByKey(clusterversion.V22_2PebbleFormatSplitUserKeysMarkedCompacted)):
 		if formatVers < pebble.FormatSplitUserKeysMarkedCompacted {
 			formatVers = pebble.FormatSplitUserKeysMarkedCompacted
 		}

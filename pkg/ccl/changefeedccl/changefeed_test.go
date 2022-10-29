@@ -1263,6 +1263,46 @@ func TestChangefeedColumnDropsOnTheSameTableWithMultipleFamilies(t *testing.T) {
 	cdcTest(t, testFn)
 }
 
+func TestNoStopAfterNonTargetAddColumnWithBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE hasfams (id INT PRIMARY KEY, a STRING, b STRING, c STRING, FAMILY id_a (id, a), FAMILY b_and_c (b, c))`)
+		sqlDB.Exec(t, `INSERT INTO hasfams values (0, 'a', 'b', 'c')`)
+
+		// Open up the changefeed.
+		cf := feed(t, f, `CREATE CHANGEFEED FOR TABLE hasfams FAMILY b_and_c WITH schema_change_policy='stop'`)
+
+		defer closeFeed(t, cf)
+		assertPayloads(t, cf, []string{
+			`hasfams.b_and_c: [0]->{"after": {"b": "b", "c": "c"}}`,
+		})
+
+		// Adding a column with a backfill to the default column family does not stop the changefeed.
+		sqlDB.Exec(t, `ALTER TABLE hasfams ADD COLUMN d STRING DEFAULT 'default'`)
+		sqlDB.Exec(t, `INSERT INTO hasfams VALUES (1, 'a1', 'b1', 'c1', 'd1')`)
+		assertPayloads(t, cf, []string{
+			`hasfams.b_and_c: [1]->{"after": {"b": "b1", "c": "c1"}}`,
+		})
+
+		// Adding a column with a backfill to a non-target column family does not stop the changefeed.
+		sqlDB.Exec(t, `ALTER TABLE hasfams ADD COLUMN e STRING DEFAULT 'default' FAMILY id_a`)
+		sqlDB.Exec(t, `INSERT INTO hasfams VALUES (2, 'a2', 'b2', 'c2', 'd2', 'e2')`)
+		assertPayloads(t, cf, []string{
+			`hasfams.b_and_c: [2]->{"after": {"b": "b2", "c": "c2"}}`,
+		})
+
+		// Check that adding a column to a watched family stops the changefeed.
+		sqlDB.Exec(t, `ALTER TABLE hasfams ADD COLUMN f INT DEFAULT 0 FAMILY b_and_c`)
+		if _, err := cf.Next(); !testutils.IsError(err, `schema change occurred at`) {
+			t.Errorf(`expected "schema change occurred at ..." got: %+v`, err.Error())
+		}
+	}
+
+	cdcTest(t, testFn)
+}
+
 func TestChangefeedExternalIODisabled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -2126,7 +2166,6 @@ func fetchDescVersionModificationTime(
 		RequestHeader: header,
 		MVCCFilter:    roachpb.MVCCFilter_All,
 		StartTime:     hlc.Timestamp{},
-		ReturnSST:     true,
 	}
 	clock := hlc.NewClockWithSystemTimeSource(time.Minute /* maxOffset */)
 	hh := roachpb.Header{Timestamp: clock.Now()}
@@ -3586,59 +3625,6 @@ func TestChangefeedRetryableError(t *testing.T) {
 	cdcTest(t, testFn, feedTestEnterpriseSinks)
 }
 
-func TestChangefeedJobRetryOnNoInboundStream(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderRace(t)
-	skip.UnderStress(t)
-
-	cluster, db, cleanup := startTestCluster(t)
-	defer cleanup()
-	sqlDB := sqlutils.MakeSQLRunner(db)
-
-	// force fast "no inbound stream" error
-	var oldMaxRunningFlows int
-	var oldTimeout string
-	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.flow_scheduler_queueing.enabled = true")
-	sqlDB.QueryRow(t, "SHOW CLUSTER SETTING sql.distsql.max_running_flows").Scan(&oldMaxRunningFlows)
-	sqlDB.QueryRow(t, "SHOW CLUSTER SETTING sql.distsql.flow_stream_timeout").Scan(&oldTimeout)
-	serverutils.SetClusterSetting(t, cluster, "sql.distsql.max_running_flows", 0)
-	serverutils.SetClusterSetting(t, cluster, "sql.distsql.flow_stream_timeout", "1s")
-
-	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
-	sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
-
-	// Connect to a non-leaseholder node so that a DistSQL flow is required
-	var leaseHolder int
-	sqlDB.QueryRow(t, `SELECT lease_holder FROM [SHOW RANGES FROM TABLE foo] LIMIT 1`).Scan(&leaseHolder)
-	feedServerID := ((leaseHolder - 1) + 1) % 3
-	db = cluster.ServerConn(feedServerID)
-	sqlDB = sqlutils.MakeSQLRunner(db)
-	f := makeKafkaFeedFactoryForCluster(cluster, db)
-	foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
-	defer closeFeed(t, foo)
-
-	// Verify job progress contains retryable error status.
-	registry := cluster.Server(feedServerID).JobRegistry().(*jobs.Registry)
-	jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
-	testutils.SucceedsSoon(t, func() error {
-		job, err := registry.LoadJob(context.Background(), jobID)
-		require.NoError(t, err)
-		if strings.Contains(job.Progress().RunningStatus, "retryable error") {
-			return nil
-		}
-		return errors.Newf("job status was %s", job.Progress().RunningStatus)
-	})
-
-	// Fix the error. Job should retry successfully.
-	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.max_running_flows=$1", oldMaxRunningFlows)
-	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.flow_stream_timeout=$1", oldTimeout)
-	assertPayloads(t, foo, []string{
-		`foo: [1]->{"after": {"a": 1}}`,
-	})
-
-}
-
 func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -4533,6 +4519,55 @@ func TestChangefeedDescription(t *testing.T) {
 		})
 	}
 
+}
+
+func TestChangefeedPanicRecovery(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	// Panics can mess with the test setup so run these each in their own test.
+
+	prep := func(t *testing.T, sqlDB *sqlutils.SQLRunner) {
+		cdceval.TestingEnableVolatileFunction(`crdb_internal.force_panic`)
+		sqlDB.Exec(t, `CREATE TABLE foo(id int primary key, s string)`)
+		sqlDB.Exec(t, `INSERT INTO foo(id, s) VALUES (0, 'hello'), (1, null)`)
+	}
+
+	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		prep(t, sqlDB)
+		// Check that disallowed expressions have a good error message.
+		// Also regression test for https://github.com/cockroachdb/cockroach/issues/90416
+		sqlDB.ExpectErr(t, "syntax is unsupported in CREATE CHANGEFEED",
+			`CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT 1 FROM foo WHERE EXISTS (SELECT true)`)
+	})
+
+	// Check that all panics while evaluating the WHERE clause in an expression are recovered from.
+	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		prep(t, sqlDB)
+		foo := feed(t, f,
+			`CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT 1 FROM foo WHERE crdb_internal.force_panic('wat') IS NULL`)
+		defer closeFeed(t, foo)
+		var err error
+		for err == nil {
+			_, err = foo.Next()
+		}
+		require.Error(t, err, "error while evaluating WHERE clause")
+	})
+
+	// Check that all panics while evaluating the SELECT clause in an expression are recovered from.
+	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		prep(t, sqlDB)
+		foo := feed(t, f,
+			`CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT crdb_internal.force_panic('wat') FROM foo`)
+		defer closeFeed(t, foo)
+		var err error
+		for err == nil {
+			_, err = foo.Next()
+		}
+		require.Error(t, err, "error while evaluating SELECT clause")
+	})
 }
 
 func TestChangefeedPauseUnpause(t *testing.T) {
@@ -6687,7 +6722,7 @@ func normalizeCDCExpression(t *testing.T, execCfgI interface{}, exprStr string) 
 
 	execCtx := p.(sql.JobExecContext)
 	_, _, err = cdceval.NormalizeAndValidateSelectForTarget(
-		context.Background(), execCtx, desc, target, sc, false, false,
+		context.Background(), execCtx, desc, target, sc, false, false, false,
 	)
 	require.NoError(t, err)
 	log.Infof(context.Background(), "PostNorm: %s", tree.StmtDebugString(sc))

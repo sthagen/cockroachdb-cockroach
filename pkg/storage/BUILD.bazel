@@ -93,6 +93,7 @@ go_library(
         "@com_github_dustin_go_humanize//:go-humanize",
         "@com_github_elastic_gosigar//:gosigar",
         "@com_github_gogo_protobuf//proto",
+        "@com_github_prometheus_client_model//go",
         "@io_etcd_go_etcd_raft_v3//raftpb",
     ],
 )
@@ -103,6 +104,7 @@ go_test(
     srcs = [
         "ballast_test.go",
         "batch_test.go",
+        "bench_data_test.go",
         "bench_pebble_test.go",
         "bench_test.go",
         "disk_map_test.go",
@@ -158,7 +160,6 @@ go_test(
         "//pkg/util",
         "//pkg/util/admission",
         "//pkg/util/encoding",
-        "//pkg/util/fileutil",
         "//pkg/util/hlc",
         "//pkg/util/iterutil",
         "//pkg/util/leaktest",

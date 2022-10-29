@@ -1965,7 +1965,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				// PostgreSQL specifies that this variant first casts to the SQL string type,
 				// and only then quotes. We can't use (Datum).String() directly.
-				d := eval.UnwrapDatum(evalCtx, args[0])
+				d := eval.UnwrapDatum(ctx, evalCtx, args[0])
 				strD, err := eval.PerformCast(ctx, evalCtx, d, types.String)
 				if err != nil {
 					return nil, err
@@ -2006,7 +2006,7 @@ var regularBuiltins = map[string]builtinDefinition{
 				}
 				// PostgreSQL specifies that this variant first casts to the SQL string type,
 				// and only then quotes. We can't use (Datum).String() directly.
-				d := eval.UnwrapDatum(evalCtx, args[0])
+				d := eval.UnwrapDatum(ctx, evalCtx, args[0])
 				strD, err := eval.PerformCast(ctx, evalCtx, d, types.String)
 				if err != nil {
 					return nil, err
@@ -5277,8 +5277,10 @@ value if you rely on the HLC for accuracy.`,
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				key := tree.MustBeDBytes(args[0])
-				remainder, _, err := keys.DecodeTenantPrefix([]byte(key))
-				if err != nil {
+				remainder, _, err := keys.DecodeTenantPrefixE([]byte(key))
+				if errors.Is(err, roachpb.ErrInvalidTenantID) {
+					return tree.NewDBytes(key), nil
+				} else if err != nil {
 					return nil, err
 				}
 				return tree.NewDBytes(tree.DBytes(remainder)), nil
@@ -8956,6 +8958,11 @@ type ProcessUniqueID int32
 func GenerateUniqueInt(instanceID ProcessUniqueID) tree.DInt {
 	const precision = uint64(10 * time.Microsecond)
 
+	// TODO(andrei): For tenants we need to validate that the current time is
+	// within the validity of the sqlliveness session to which the instanceID is
+	// bound. Without this validation, two different nodes might be calling this
+	// function with the same instanceID at the same time, and both would generate
+	// the same unique int. See #90459.
 	nowNanos := timeutil.Now().UnixNano()
 	// Paranoia: nowNanos should never be less than uniqueIntEpoch.
 	if nowNanos < uniqueIntEpoch {

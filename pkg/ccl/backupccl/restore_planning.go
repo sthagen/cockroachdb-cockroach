@@ -970,7 +970,7 @@ func restorePlanHook(
 	}
 
 	if restoreStmt.Options.SchemaOnly &&
-		!p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.Start22_2) {
+		!p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2Start) {
 		return nil, nil, nil, false,
 			errors.New("cannot run RESTORE with schema_only until cluster has fully upgraded to 22.2")
 	}
@@ -1208,7 +1208,7 @@ func checkPrivilegesForRestore(
 			restoreStmt.Targets.TenantID.IsSet()
 
 		var hasRestoreSystemPrivilege bool
-		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
 			err := p.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject,
 				privilege.RESTORE, p.User())
 			hasRestoreSystemPrivilege = err == nil
@@ -1231,7 +1231,7 @@ func checkPrivilegesForRestore(
 	// error. In 22.2 we continue to check for old style privileges and role
 	// options.
 	if len(restoreStmt.Targets.Databases) > 0 {
-		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
 			err := p.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject,
 				privilege.RESTORE, p.User())
 			hasRestoreSystemPrivilege = err == nil
@@ -1519,6 +1519,11 @@ func doRestorePlan(
 		}
 	}
 
+	backupCodec, err := backupinfo.MakeBackupCodec(mainBackupManifests[0])
+	if err != nil {
+		return err
+	}
+
 	// wasOffline tracks which tables were in an offline or adding state at some
 	// point in the incremental chain, meaning their spans would be seeing
 	// non-transactional bulk-writes. If that backup exported those spans, then it
@@ -1540,7 +1545,7 @@ func doRestorePlan(
 			if err := catalog.ForEachNonDropIndex(
 				tabledesc.NewBuilder(table).BuildImmutable().(catalog.TableDescriptor),
 				func(index catalog.Index) error {
-					if index.Adding() && spans.ContainsKey(p.ExecCfg().Codec.IndexPrefix(uint32(table.ID), uint32(index.GetID()))) {
+					if index.Adding() && spans.ContainsKey(backupCodec.IndexPrefix(uint32(table.ID), uint32(index.GetID()))) {
 						k := tableAndIndex{tableID: table.ID, indexID: index.GetID()}
 						if _, ok := wasOffline[k]; !ok {
 							wasOffline[k] = m.EndTime
@@ -1562,8 +1567,7 @@ func doRestorePlan(
 				"use SHOW BACKUP to find correct targets")
 	}
 
-	if err := checkMissingIntroducedSpans(sqlDescs, mainBackupManifests, endTime,
-		p.ExecCfg().Codec); err != nil {
+	if err := checkMissingIntroducedSpans(sqlDescs, mainBackupManifests, endTime, backupCodec); err != nil {
 		return err
 	}
 

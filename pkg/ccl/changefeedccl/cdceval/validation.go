@@ -42,14 +42,20 @@ func NormalizeAndValidateSelectForTarget(
 	target jobspb.ChangefeedTargetSpecification,
 	sc *tree.SelectClause,
 	includeVirtual bool,
+	keyOnly bool,
 	splitColFams bool,
-) (n NormalizedSelectClause, _ jobspb.ChangefeedTargetSpecification, _ error) {
+) (n NormalizedSelectClause, _ jobspb.ChangefeedTargetSpecification, retErr error) {
+	defer func() {
+		if pan := recover(); pan != nil {
+			retErr = errors.Newf("low-level error while normalizing expression, probably syntax is unsupported in CREATE CHANGEFEED: %s", pan)
+		}
+	}()
 	execCtx.SemaCtx()
 	execCfg := execCtx.ExecCfg()
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.EnablePredicateProjectionChangefeed) {
+	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2EnablePredicateProjectionChangefeed) {
 		return n, target, errors.Newf(
 			`filters and projections not supported until upgrade to version %s or higher is finalized`,
-			clusterversion.EnablePredicateProjectionChangefeed.String())
+			clusterversion.V22_2EnablePredicateProjectionChangefeed.String())
 	}
 
 	// This really shouldn't happen as it's enforced by sql.y.
@@ -93,7 +99,7 @@ func NormalizeAndValidateSelectForTarget(
 		return n, target, err
 	}
 
-	ed, err := newEventDescriptorForTarget(desc, target, schemaTS(execCtx), includeVirtual)
+	ed, err := newEventDescriptorForTarget(desc, target, schemaTS(execCtx), includeVirtual, keyOnly)
 	if err != nil {
 		return n, target, err
 	}
@@ -187,12 +193,13 @@ func newEventDescriptorForTarget(
 	target jobspb.ChangefeedTargetSpecification,
 	schemaTS hlc.Timestamp,
 	includeVirtual bool,
+	keyOnly bool,
 ) (*cdcevent.EventDescriptor, error) {
 	family, err := getTargetFamilyDescriptor(desc, target)
 	if err != nil {
 		return nil, err
 	}
-	return cdcevent.NewEventDescriptor(desc, family, includeVirtual, schemaTS)
+	return cdcevent.NewEventDescriptor(desc, family, includeVirtual, keyOnly, schemaTS)
 }
 
 func getTargetFamilyDescriptor(

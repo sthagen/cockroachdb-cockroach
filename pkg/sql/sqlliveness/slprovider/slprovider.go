@@ -28,6 +28,8 @@ import (
 )
 
 // New constructs a new Provider.
+//
+// sessionEvents, if not nil, gets notified of some session state transitions.
 func New(
 	ambientCtx log.AmbientContext,
 	stopper *stop.Stopper,
@@ -36,14 +38,22 @@ func New(
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
 	testingKnobs *sqlliveness.TestingKnobs,
+	sessionEvents slinstance.SessionEventListener,
 ) sqlliveness.Provider {
 	storage := slstorage.NewStorage(ambientCtx, stopper, clock, db, codec, settings)
-	instance := slinstance.NewSQLInstance(stopper, clock, storage, settings, testingKnobs)
+	instance := slinstance.NewSQLInstance(stopper, clock, storage, settings, testingKnobs, sessionEvents)
 	return &provider{
 		Storage:  storage,
 		Instance: instance,
 	}
 }
+
+type provider struct {
+	*slstorage.Storage
+	*slinstance.Instance
+}
+
+var _ sqlliveness.Provider = &provider{}
 
 func (p *provider) Start(ctx context.Context) {
 	p.Storage.Start(ctx)
@@ -52,9 +62,4 @@ func (p *provider) Start(ctx context.Context) {
 
 func (p *provider) Metrics() metric.Struct {
 	return p.Storage.Metrics()
-}
-
-type provider struct {
-	*slstorage.Storage
-	*slinstance.Instance
 }

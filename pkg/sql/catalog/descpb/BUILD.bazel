@@ -96,7 +96,7 @@ stringer(
 )
 
 disallowed_imports_test(
-    "catalog",
+    "descpb",
     disallowed_list = ["//pkg/sql/parser"],
 )
 

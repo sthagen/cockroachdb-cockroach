@@ -1119,6 +1119,7 @@ func TestShowLastQueryStatisticsUnknown(t *testing.T) {
 //     min(sqlliveness.Session expiry, lease descriptor expiration).
 func TestTransactionDeadline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var mu struct {
@@ -1814,9 +1815,6 @@ type fakeSession struct{ exp hlc.Timestamp }
 func (f fakeSession) ID() sqlliveness.SessionID { return "foo" }
 func (f fakeSession) Expiration() hlc.Timestamp { return f.exp }
 func (f fakeSession) Start() hlc.Timestamp      { panic("unimplemented") }
-func (f fakeSession) RegisterCallbackForSessionExpiry(func(ctx context.Context)) {
-	panic("unimplemented")
-}
 
 var _ sqlliveness.Session = (*fakeSession)(nil)
 

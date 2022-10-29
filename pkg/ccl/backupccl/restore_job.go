@@ -1459,21 +1459,10 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	defer func() {
 		mem.Shrink(ctx, memSize)
 	}()
-	// backupCodec is the codec that was used to encode the keys in the backup. It
-	// is the tenant in which the backup was taken.
-	backupCodec := keys.SystemSQLCodec
-	if len(sqlDescs) != 0 {
-		if len(latestBackupManifest.Spans) != 0 && !latestBackupManifest.HasTenants() {
-			// If there are no tenant targets, then the entire keyspace covered by
-			// Spans must lie in 1 tenant.
-			_, backupTenantID, err := keys.DecodeTenantPrefix(latestBackupManifest.Spans[0].Key)
-			if err != nil {
-				return err
-			}
-			backupCodec = keys.MakeSQLCodec(backupTenantID)
-		}
+	backupCodec, err := backupinfo.MakeBackupCodec(latestBackupManifest)
+	if err != nil {
+		return err
 	}
-
 	lastBackupIndex, err := backupinfo.GetBackupIndexAtTime(backupManifests, details.EndTime)
 	if err != nil {
 		return err
@@ -1785,12 +1774,12 @@ func revalidateIndexes(
 
 	// We don't actually need the 'historical' read the way the schema change does
 	// since our table is offline.
-	var runner descs.HistoricalInternalExecTxnRunner = func(ctx context.Context, fn descs.InternalExecFn) error {
+	runner := descs.NewHistoricalInternalExecTxnRunner(hlc.Timestamp{}, func(ctx context.Context, fn descs.InternalExecFn) error {
 		return execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			ie := job.MakeSessionBoundInternalExecutor(sql.NewFakeSessionData(execCfg.SV())).(*sql.InternalExecutor)
 			return fn(ctx, txn, ie, nil /* descriptors */)
 		})
-	}
+	})
 
 	invalidIndexes := make(map[descpb.ID][]descpb.IndexID)
 
@@ -1815,12 +1804,17 @@ func revalidateIndexes(
 		if len(forward) > 0 {
 			if err := sql.ValidateForwardIndexes(
 				ctx,
+				job.ID(),
+				execCfg.Codec,
+				execCfg.DB,
 				tableDesc.MakePublic(),
 				forward,
 				runner,
 				false, /* withFirstMutationPublic */
 				true,  /* gatherAllInvalid */
 				sessiondata.InternalExecutorOverride{},
+				execCfg.ProtectedTimestampProvider,
+				execCfg.SystemConfig,
 			); err != nil {
 				if invalid := (sql.InvalidIndexesError{}); errors.As(err, &invalid) {
 					invalidIndexes[tableDesc.ID] = invalid.Indexes
@@ -1832,13 +1826,17 @@ func revalidateIndexes(
 		if len(inverted) > 0 {
 			if err := sql.ValidateInvertedIndexes(
 				ctx,
+				job.ID(),
 				execCfg.Codec,
+				execCfg.DB,
 				tableDesc.MakePublic(),
 				inverted,
 				runner,
 				false, /* withFirstMutationPublic */
 				true,  /* gatherAllInvalid */
 				sessiondata.InternalExecutorOverride{},
+				execCfg.ProtectedTimestampProvider,
+				execCfg.SystemConfig,
 			); err != nil {
 				if invalid := (sql.InvalidIndexesError{}); errors.As(err, &invalid) {
 					invalidIndexes[tableDesc.ID] = append(invalidIndexes[tableDesc.ID], invalid.Indexes...)
@@ -2673,7 +2671,7 @@ func (r *restoreResumer) restoreSystemUsers(
 		}
 
 		insertUser := `INSERT INTO system.users ("username", "hashedPassword", "isRole") VALUES ($1, $2, $3)`
-		if r.execCfg.Settings.Version.IsActive(ctx, clusterversion.AddSystemUserIDColumn) {
+		if r.execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2AddSystemUserIDColumn) {
 			insertUser = `INSERT INTO system.users ("username", "hashedPassword", "isRole", "user_id") VALUES ($1, $2, $3, $4)`
 		}
 		newUsernames := make(map[string]bool)
@@ -2683,7 +2681,7 @@ func (r *restoreResumer) restoreSystemUsers(
 			args[0] = user[0]
 			args[1] = user[1]
 			args[2] = user[2]
-			if r.execCfg.Settings.Version.IsActive(ctx, clusterversion.AddSystemUserIDColumn) {
+			if r.execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2AddSystemUserIDColumn) {
 				id, err := descidgen.GenerateUniqueRoleID(ctx, r.execCfg.DB, r.execCfg.Codec)
 				if err != nil {
 					return err

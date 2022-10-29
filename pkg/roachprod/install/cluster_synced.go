@@ -23,7 +23,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -642,7 +641,7 @@ func runCmdOnSingleNode(
 		detailMsg := fmt.Sprintf("Node %d. Command with error:\n```\n%s\n```\n", node, cmd)
 		err = errors.WithDetail(err, detailMsg)
 		err = rperrors.ClassifyCmdError(err)
-		if reflect.TypeOf(err) == reflect.TypeOf(rperrors.SSH{}) {
+		if errors.Is(err, rperrors.ErrSSH255) {
 			result.RemoteExitStatus = "255"
 		}
 		result.Err = err
@@ -2291,16 +2290,12 @@ func (c *SyncedCluster) ParallelE(
 // Init initializes the cluster. It does it through node 1 (as per TargetNodes)
 // to maintain parity with auto-init behavior of `roachprod start` (when
 // --skip-init) is not specified.
-func (c *SyncedCluster) Init(ctx context.Context, l *logger.Logger) error {
-	// We reserve a few special operations for the first node, so we
-	// strive to maintain the same here for interoperability.
-	const firstNodeIdx = 1
-
-	if err := c.initializeCluster(ctx, l, firstNodeIdx); err != nil {
+func (c *SyncedCluster) Init(ctx context.Context, l *logger.Logger, node Node) error {
+	if err := c.initializeCluster(ctx, l, node); err != nil {
 		return errors.WithDetail(err, "install.Init() failed: unable to initialize cluster.")
 	}
 
-	if err := c.setClusterSettings(ctx, l, firstNodeIdx); err != nil {
+	if err := c.setClusterSettings(ctx, l, node); err != nil {
 		return errors.WithDetail(err, "install.Init() failed: unable to set cluster settings.")
 	}
 

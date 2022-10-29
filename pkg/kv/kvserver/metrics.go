@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/slidingwindow"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/pebble"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -313,37 +314,37 @@ var (
 	// Metrics used by the rebalancing logic that aren't already captured elsewhere.
 	metaAverageQueriesPerSecond = metric.Metadata{
 		Name:        "rebalancing.queriespersecond",
-		Help:        "Number of kv-level requests received per second by the store, averaged over a large time period as used in rebalancing decisions",
+		Help:        "Number of kv-level requests received per second by the store, considering the last 30 minutes, as used in rebalancing decisions.",
 		Measurement: "Keys/Sec",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaAverageWritesPerSecond = metric.Metadata{
 		Name:        "rebalancing.writespersecond",
-		Help:        "Number of keys written (i.e. applied by raft) per second to the store, averaged over a large time period as used in rebalancing decisions",
+		Help:        "Number of keys written (i.e. applied by raft) per second to the store, considering the last 30 minutes.",
 		Measurement: "Keys/Sec",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaAverageRequestsPerSecond = metric.Metadata{
 		Name:        "rebalancing.requestspersecond",
-		Help:        "Average number of requests received recently per second.",
+		Help:        "Number of requests received recently per second, considering the last 30 minutes.",
 		Measurement: "Requests/Sec",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaAverageReadsPerSecond = metric.Metadata{
 		Name:        "rebalancing.readspersecond",
-		Help:        "Average number of keys read recently per second.",
+		Help:        "Number of keys read recently per second, considering the last 30 minutes.",
 		Measurement: "Keys/Sec",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaAverageWriteBytesPerSecond = metric.Metadata{
 		Name:        "rebalancing.writebytespersecond",
-		Help:        "Average number of bytes read recently per second.",
+		Help:        "Number of bytes read recently per second, considering the last 30 minutes.",
 		Measurement: "Bytes/Sec",
 		Unit:        metric.Unit_BYTES,
 	}
 	metaAverageReadBytesPerSecond = metric.Metadata{
 		Name:        "rebalancing.readbytespersecond",
-		Help:        "Average number of bytes written recently per second.",
+		Help:        "Number of bytes written per second, considering the last 30 minutes.",
 		Measurement: "Bytes/Sec",
 		Unit:        metric.Unit_BYTES,
 	}
@@ -1056,15 +1057,10 @@ The messages are dropped to help these replicas to recover from I/O overload.`,
 	}
 
 	metaIOOverload = metric.Metadata{
-		Name: "admission.io.overload",
-		Help: `1-normalized float to pause replication to raft group followers if its value exceeds a given threshold.
-
-This threshold is the admission.kv.pause_replication_io_threshold cluster setting
-(pause replication feature is disabled if this setting is 0, feature is disabled by default);
-see pkg/kv/kvserver/replica_raft_overload.go for more details. Composed of LSM L0
-sub-level and file counts.`,
+		Name:        "admission.io.overload",
+		Help:        `1-normalized float indicating whether IO admission control considers the store as overloaded with respect to compaction out of L0 (considers sub-level and file counts).`,
 		Measurement: "Threshold",
-		Unit:        metric.Unit_COUNT,
+		Unit:        metric.Unit_PERCENT,
 	}
 
 	// Replica queue metrics.
@@ -1670,6 +1666,13 @@ Note that the measurement does not include the duration for replicating the eval
 		Measurement: "Flush Utilization",
 		Unit:        metric.Unit_PERCENT,
 	}
+
+	metaStorageFsyncLatency = metric.Metadata{
+		Name:        "storage.wal.fsync.latency",
+		Help:        "The write ahead log fsync latency",
+		Measurement: "Fsync Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 )
 
 // StoreMetrics is the set of metrics for a given store.
@@ -1966,6 +1969,7 @@ type StoreMetrics struct {
 	ReplicaWriteBatchEvaluationLatency *metric.Histogram
 
 	FlushUtilization *metric.GaugeFloat64
+	FsyncLatency     *metric.ManualWindowHistogram
 }
 
 type tenantMetricsRef struct {
@@ -2504,6 +2508,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 			metaReplicaWriteBatchEvaluationLatency, histogramWindow, metric.IOLatencyBuckets,
 		),
 		FlushUtilization: metric.NewGaugeFloat64(metaStorageFlushUtilization),
+		FsyncLatency:     metric.NewManualWindowHistogram(metaStorageFsyncLatency, pebble.FsyncLatencyBuckets),
 	}
 
 	{

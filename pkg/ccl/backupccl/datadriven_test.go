@@ -78,7 +78,7 @@ var localityCfgs = map[string]roachpb.Locality{
 }
 
 var clusterVersionKeys = map[string]clusterversion.Key{
-	"Start22_2": clusterversion.Start22_2,
+	"Start22_2": clusterversion.V22_2Start,
 }
 
 type sqlDBKey struct {
@@ -142,7 +142,7 @@ func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
 	var cleanup func()
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODirConfig = cfg.ioConf
-	params.ServerArgs.DisableDefaultTestTenant = true
+	params.ServerArgs.DisableDefaultTestTenant = cfg.disableTenant
 	params.ServerArgs.Knobs = base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}

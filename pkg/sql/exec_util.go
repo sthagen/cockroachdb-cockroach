@@ -1928,10 +1928,11 @@ type queryMeta struct {
 	// The timestamp when this query began execution.
 	start time.Time
 
-	// The string of the SQL statement being executed. This string may
-	// contain sensitive information, so it must be converted back into
-	// an AST and dumped before use in logging.
-	rawStmt string
+	// The SQL statement being executed.
+	stmt parser.Statement
+
+	// The placeholders that the query was executed with if any.
+	placeholders *tree.PlaceholderInfo
 
 	// States whether this query is distributed. Note that all queries,
 	// including those that are distributed, have this field set to false until
@@ -1970,16 +1971,6 @@ func (q *queryMeta) cancel() {
 	q.cancelQuery()
 }
 
-// getStatement returns a cleaned version of the query associated
-// with this queryMeta.
-func (q *queryMeta) getStatement() (tree.Statement, error) {
-	parsed, err := parser.ParseOne(q.rawStmt)
-	if err != nil {
-		return nil, err
-	}
-	return parsed.AST, nil
-}
-
 // SessionDefaults mirrors fields in Session, for restoring default
 // configuration values in SET ... TO DEFAULT (or RESET ...) statements.
 type SessionDefaults map[string]string
@@ -1988,6 +1979,7 @@ type SessionDefaults map[string]string
 type SessionArgs struct {
 	User                        username.SQLUsername
 	IsSuperuser                 bool
+	SystemIdentity              username.SQLUsername
 	SessionDefaults             SessionDefaults
 	CustomOptionSessionDefaults SessionDefaults
 	// RemoteAddr is the client's address. This is nil iff this is an internal

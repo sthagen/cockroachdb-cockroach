@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
@@ -131,7 +130,7 @@ func newParquetExporter(sp execinfrapb.ExportSpec, typs []*types.T) (*parquetExp
 	if err != nil {
 		return nil, err
 	}
-	schema := newParquetSchema(parquetColumns)
+	schema := NewParquetSchema(parquetColumns)
 
 	exporter = &parquetExporter{
 		buf:            buf,
@@ -157,6 +156,14 @@ type ParquetColumn struct {
 	// DecodeFn converts a native go type, created by the parquet vendor while
 	// reading a parquet file, into a crdb column value
 	DecodeFn func(interface{}) (tree.Datum, error)
+}
+
+// GetEncoder gets (exports) the encoder for a ParquetColumn.
+func (pc *ParquetColumn) GetEncoder() (func(datum tree.Datum) (interface{}, error), error) {
+	if pc.encodeFn == nil {
+		return nil, errors.Errorf("Parquet column does not have an encode function")
+	}
+	return pc.encodeFn, nil
 }
 
 // newParquetColumns creates a list of parquet columns, given the input relation's column types.
@@ -657,15 +664,14 @@ func NewParquetColumn(typ *types.T, name string, nullable bool) (ParquetColumn, 
 	return col, nil
 }
 
-// newParquetSchema creates the schema for the parquet file,
-// see example schema:
+// NewParquetSchema creates the schema for the parquet file, see example schema:
 //
 //	https://github.com/fraugster/parquet-go/issues/18#issuecomment-946013210
 //
 // see docs here:
 //
 //	https://pkg.go.dev/github.com/fraugster/parquet-go/parquetschema#SchemaDefinition
-func newParquetSchema(parquetFields []ParquetColumn) *parquetschema.SchemaDefinition {
+func NewParquetSchema(parquetFields []ParquetColumn) *parquetschema.SchemaDefinition {
 	schemaDefinition := new(parquetschema.SchemaDefinition)
 	schemaDefinition.RootColumn = new(parquetschema.ColumnDefinition)
 	schemaDefinition.RootColumn.SchemaElement = parquet.NewSchemaElement()
@@ -776,10 +782,11 @@ func (sp *parquetWriterProcessor) Run(ctx context.Context) {
 							return err
 						}
 
-						// If we're encoding a DOidWrapper, then we want to cast the wrapped datum.
-						// Note that we pass in nil as the first argument since we're not interested
-						// in evaluating the evalCtx's placeholders.
-						edNative, err := exporter.parquetColumns[i].encodeFn(eval.UnwrapDatum(nil, ed.Datum))
+						// If we're encoding a DOidWrapper, then we want to cast
+						// the wrapped datum. Note that we don't use
+						// eval.UnwrapDatum since we're not interested in
+						// evaluating the placeholders.
+						edNative, err := exporter.parquetColumns[i].encodeFn(tree.UnwrapDOidWrapper(ed.Datum))
 						if err != nil {
 							return err
 						}

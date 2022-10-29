@@ -152,7 +152,7 @@ type baseStatusServer struct {
 	privilegeChecker   *adminPrivilegeChecker
 	sessionRegistry    *sql.SessionRegistry
 	closedSessionCache *sql.ClosedSessionCache
-	flowScheduler      *flowinfra.FlowScheduler
+	remoteFlowRunner   *flowinfra.RemoteFlowRunner
 	st                 *cluster.Settings
 	sqlServer          *SQLServer
 	rpcCtx             *rpc.Context
@@ -336,7 +336,7 @@ func (b *baseStatusServer) checkCancelPrivilege(
 			// Must have CANCELQUERY privilege to cancel other users'
 			// sessions/queries.
 			hasCancelQuery := false
-			if b.privilegeChecker.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
+			if b.privilegeChecker.st.Version.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
 				hasCancelQuery = b.privilegeChecker.checkHasGlobalPrivilege(ctx, reqUser, privilege.CANCELQUERY)
 			}
 			if !hasCancelQuery {
@@ -395,28 +395,17 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 
 	nodeIDOrZero, _ := b.sqlServer.sqlIDContainer.OptionalNodeID()
 
-	running, queued := b.flowScheduler.Serialize()
+	flows := b.remoteFlowRunner.Serialize()
 	response := &serverpb.ListDistSQLFlowsResponse{
-		Flows: make([]serverpb.DistSQLRemoteFlows, 0, len(running)+len(queued)),
+		Flows: make([]serverpb.DistSQLRemoteFlows, 0, len(flows)),
 	}
-	for _, f := range running {
+	for _, f := range flows {
 		response.Flows = append(response.Flows, serverpb.DistSQLRemoteFlows{
 			FlowID: f.FlowID,
 			Infos: []serverpb.DistSQLRemoteFlows_Info{{
 				NodeID:    nodeIDOrZero,
 				Timestamp: f.Timestamp,
 				Status:    serverpb.DistSQLRemoteFlows_RUNNING,
-				Stmt:      f.StatementSQL,
-			}},
-		})
-	}
-	for _, f := range queued {
-		response.Flows = append(response.Flows, serverpb.DistSQLRemoteFlows{
-			FlowID: f.FlowID,
-			Infos: []serverpb.DistSQLRemoteFlows_Info{{
-				NodeID:    nodeIDOrZero,
-				Timestamp: f.Timestamp,
-				Status:    serverpb.DistSQLRemoteFlows_QUEUED,
 				Stmt:      f.StatementSQL,
 			}},
 		})
@@ -567,7 +556,7 @@ func newStatusServer(
 	stopper *stop.Stopper,
 	sessionRegistry *sql.SessionRegistry,
 	closedSessionCache *sql.ClosedSessionCache,
-	flowScheduler *flowinfra.FlowScheduler,
+	remoteFlowRunner *flowinfra.RemoteFlowRunner,
 	internalExecutor *sql.InternalExecutor,
 ) *statusServer {
 	ambient.AddLogTag("status", nil)
@@ -577,7 +566,7 @@ func newStatusServer(
 			privilegeChecker:   adminAuthzCheck,
 			sessionRegistry:    sessionRegistry,
 			closedSessionCache: closedSessionCache,
-			flowScheduler:      flowScheduler,
+			remoteFlowRunner:   remoteFlowRunner,
 			st:                 st,
 			rpcCtx:             rpcCtx,
 			stopper:            stopper,

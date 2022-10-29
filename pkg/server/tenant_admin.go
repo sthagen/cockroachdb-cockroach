@@ -59,17 +59,9 @@ func (t *tenantAdminServer) RegisterGateway(
 
 var _ grpcGatewayServer = &tenantAdminServer{}
 
-func newTenantAdminServer(
-	ambientCtx log.AmbientContext,
-	sqlServer *SQLServer,
-	status *tenantStatusServer,
-	drain *drainServer,
-) *tenantAdminServer {
+func newTenantAdminServer(ambientCtx log.AmbientContext) *tenantAdminServer {
 	return &tenantAdminServer{
 		AmbientContext: ambientCtx,
-		sqlServer:      sqlServer,
-		drain:          drain,
-		status:         status,
 	}
 }
 
@@ -128,7 +120,7 @@ func (t *tenantAdminServer) Drain(
 		return status.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
-		instance, err := t.sqlServer.sqlInstanceProvider.GetInstance(ctx, parsedInstanceID)
+		instance, err := t.sqlServer.sqlInstanceReader.GetInstance(ctx, parsedInstanceID)
 		if err != nil {
 			return err
 		}

@@ -30,8 +30,7 @@ import moment from "moment";
 // Transaction insight events.
 
 // There are three transaction contention event insight queries:
-// 1. A query that selects transaction contention events from crdb_internal.transaction_contention_events
-// and joins on transaction ids from crdb_internal.cluster_execution_insights.
+// 1. A query that selects transaction contention events from crdb_internal.transaction_contention_events.
 // 2. A query that selects statement fingerprint IDS from crdb_internal.transaction_statistics, filtering on the
 // fingerprint IDs recorded in the contention events.
 // 3. A query that selects statement queries from crdb_internal.statement_statistics, filtering on the fingerprint IDs
@@ -75,12 +74,10 @@ const txnContentionQuery = `SELECT *
                                                waiting_txn_fingerprint_id,
                                                max(collection_ts)       AS collection_ts,
                                                sum(contention_duration) AS total_contention_duration
-                                        FROM crdb_internal.transaction_contention_events tce
-                                        WHERE waiting_txn_fingerprint_id != '\x0000000000000000'
-                                        GROUP BY waiting_txn_id, waiting_txn_fingerprint_id),
-                                       (SELECT txn_id FROM crdb_internal.cluster_execution_insights)
-                                  WHERE total_contention_duration > threshold
-                                     OR waiting_txn_id = txn_id)
+                                        FROM crdb_internal.transaction_contention_events
+                                        WHERE encode(waiting_txn_fingerprint_id, 'hex') != '0000000000000000'
+                                        GROUP BY waiting_txn_id, waiting_txn_fingerprint_id)
+                                  WHERE total_contention_duration > threshold)
                             WHERE rank = 1`;
 
 type TransactionContentionResponseColumns = {
@@ -102,7 +99,7 @@ function transactionContentionResultsToEventState(
   return response.execution.txn_results[0].rows.map(row => ({
     transactionID: row.waiting_txn_id,
     fingerprintID: row.waiting_txn_fingerprint_id,
-    startTime: moment(row.collection_ts),
+    startTime: moment(row.collection_ts).utc(),
     contentionDuration: moment.duration(row.contention_duration),
     contentionThreshold: moment.duration(row.threshold).asMilliseconds(),
     insightName: InsightNameEnum.highContention,
@@ -379,7 +376,7 @@ function transactionContentionDetailsResultsToEventState(
       blockingExecutionID: value.blocking_txn_id,
       blockingFingerprintID: value.blocking_txn_fingerprint_id,
       blockingQueries: null,
-      collectionTimeStamp: moment(value.collection_ts),
+      collectionTimeStamp: moment(value.collection_ts).utc(),
       contentionTimeMs: contentionTimeInMs,
       contendedKey: value.key,
       schemaName: value.schema_name,
@@ -396,7 +393,7 @@ function transactionContentionDetailsResultsToEventState(
   return {
     executionID: row.waiting_txn_id,
     fingerprintID: row.waiting_txn_fingerprint_id,
-    startTime: moment(row.collection_ts),
+    startTime: moment(row.collection_ts).utc(),
     totalContentionTime: totalContentionTime,
     blockingContentionDetails: blockingContentionDetails,
     contentionThreshold: moment.duration(row.threshold).asMilliseconds(),

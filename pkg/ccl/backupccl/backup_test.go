@@ -70,6 +70,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -104,7 +105,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/proto"
 	pgx "github.com/jackc/pgx/v4"
@@ -580,6 +580,7 @@ func TestBackupRestoreAppend(t *testing.T) {
 				tc.Servers[0].InternalExecutorFactory().(sqlutil.InternalExecutorFactory),
 				tc.Servers[0].DB(),
 				nil, /* limiters */
+				cloud.NilMetrics,
 			)
 			require.NoError(t, err)
 			defer store.Close()
@@ -834,7 +835,6 @@ func backupAndRestore(
 	restoreURIs []string,
 	numAccounts int,
 ) {
-	ctx = logtags.AddTag(ctx, "backup-client", nil)
 	conn := tc.Conns[0]
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 	storageConn := tc.StorageClusterConn()
@@ -857,7 +857,7 @@ func backupAndRestore(
 		}
 
 		backupURIFmtString, backupURIArgs := uriFmtStringAndArgs(backupURIs)
-		backupQuery := fmt.Sprintf("BACKUP DATABASE data TO %s", backupURIFmtString)
+		backupQuery := fmt.Sprintf("BACKUP DATABASE data INTO %s", backupURIFmtString)
 		sqlDB.QueryRow(t, backupQuery, backupURIArgs...).Scan(
 			&unused, &unused, &unused, &exported.rows, &exported.idx, &exported.bytes,
 		)
@@ -909,51 +909,27 @@ func backupAndRestore(
 		if !found {
 			t.Fatal("scanned job rows did not contain a backup!")
 		}
+
+		// Create an incremental backup to exercise incremental destination code that captures a new
+		// table
+		sqlDB.Exec(t, `CREATE TABLE data.empty (a INT PRIMARY KEY)`)
+		sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data INTO LATEST IN %s`, backupURIFmtString),
+			backupURIArgs...)
 	}
 
-	uri, err := url.Parse(backupURIs[0])
-	require.NoError(t, err)
-	if uri.Scheme == "userfile" {
-		sqlDB.Exec(t, `CREATE DATABASE foo`)
-		sqlDB.Exec(t, `USE foo`)
-		sqlDB.Exec(t, `DROP DATABASE data CASCADE`)
-		restoreURIFmtString, restoreURIArgs := uriFmtStringAndArgs(restoreURIs)
-		restoreQuery := fmt.Sprintf("RESTORE DATABASE DATA FROM %s", restoreURIFmtString)
-		verifyRestoreData(t, sqlDB, storageSQLDB, restoreQuery, restoreURIArgs, numAccounts)
-	} else {
-		// Start a new cluster to restore into.
-		// If the backup is on nodelocal, we need to determine which node it's on.
-		// Othewise, default to 0.
-		backupNodeID := 0
-		if err != nil {
-			t.Fatal(err)
-		}
-		if uri.Scheme == "nodelocal" && uri.Host != "" {
-			// If the backup is on nodelocal and has specified a host, expect it to
-			// be an integer.
-			var err error
-			backupNodeID, err = strconv.Atoi(uri.Host)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		args := base.TestServerArgs{
-			ExternalIODir: tc.Servers[backupNodeID].ClusterSettings().ExternalIODir,
-		}
-		tcRestore := testcluster.StartTestCluster(t, singleNode, base.TestClusterArgs{ServerArgs: args})
-		defer tcRestore.Stopper().Stop(ctx)
-		sqlDBRestore := sqlutils.MakeSQLRunner(tcRestore.Conns[0])
-		storageSQLDBRestore := sqlutils.MakeSQLRunner(tcRestore.StorageClusterConn())
+	sqlDB.Exec(t, `DROP DATABASE data CASCADE`)
 
-		// Create some other descriptors to change up IDs
-		sqlDBRestore.Exec(t, `CREATE DATABASE other`)
-		// Force the ID of the restored bank table to be different.
-		sqlDBRestore.Exec(t, `CREATE TABLE other.empty (a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `CREATE DATABASE foo`)
+	sqlDB.Exec(t, `USE defaultdb`)
 
-		restoreURIFmtString, restoreURIArgs := uriFmtStringAndArgs(restoreURIs)
-		restoreQuery := fmt.Sprintf("RESTORE DATABASE DATA FROM %s", restoreURIFmtString)
-		verifyRestoreData(t, sqlDBRestore, storageSQLDBRestore, restoreQuery, restoreURIArgs, numAccounts)
-	}
+	// Create some other descriptors to change up IDs
+	sqlDB.Exec(t, `CREATE DATABASE other`)
+	// Force the ID of the restored bank table to be different.
+	sqlDB.Exec(t, `CREATE TABLE other.empty (a INT PRIMARY KEY)`)
+
+	restoreURIFmtString, restoreURIArgs := uriFmtStringAndArgs(restoreURIs)
+	restoreQuery := fmt.Sprintf("RESTORE DATABASE DATA FROM LATEST IN %s", restoreURIFmtString)
+	verifyRestoreData(t, sqlDB, storageSQLDB, restoreQuery, restoreURIArgs, numAccounts)
 }
 
 func verifyRestoreData(
@@ -1677,11 +1653,13 @@ func TestBackupRestoreControlJob(t *testing.T) {
 	// than make a huge table, dial down the zone config for the bank table.
 	init := func(tc *testcluster.TestCluster) {
 		config.TestingSetupZoneConfigHook(tc.Stopper())
-		v, err := tc.Servers[0].DB().Get(context.Background(), keys.SystemSQLCodec.DescIDSequenceKey())
+		s := tc.Servers[0]
+		idgen := descidgen.NewGenerator(s.ClusterSettings(), keys.SystemSQLCodec, s.DB())
+		v, err := idgen.PeekNextUniqueDescID(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
-		last := config.ObjectID(v.ValueInt())
+		last := config.ObjectID(v)
 		zoneConfig := zonepb.DefaultZoneConfig()
 		zoneConfig.RangeMaxBytes = proto.Int64(5000)
 		config.TestingSetZoneConfig(last+1, zoneConfig)
@@ -6170,7 +6148,7 @@ func TestRestoreErrorPropagates(t *testing.T) {
 	jobsTableKey := keys.SystemSQLCodec.TablePrefix(uint32(systemschema.JobsTable.GetID()))
 	var shouldFail, failures int64
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
 			// Intercept Put and ConditionalPut requests to the jobs table
 			// and, if shouldFail is positive, increment failures and return an
 			// injected error.
@@ -6298,7 +6276,7 @@ func TestPaginatedBackupTenant(t *testing.T) {
 			r.EndKey.Equal(r.Key.PrefixEnd())
 	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, request *roachpb.BatchRequest) *roachpb.Error {
 			for _, ru := range request.Requests {
 				if exportRequest, ok := ru.GetInner().(*roachpb.ExportRequest); ok &&
 					!isLeasingExportRequest(exportRequest) {
@@ -6316,7 +6294,7 @@ func TestPaginatedBackupTenant(t *testing.T) {
 			}
 			return nil
 		},
-		TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+		TestingResponseFilter: func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 			for i, ru := range br.Responses {
 				if exportRequest, ok := ba.Requests[i].GetInner().(*roachpb.ExportRequest); ok &&
 					!isLeasingExportRequest(exportRequest) {
@@ -7156,7 +7134,7 @@ func TestClientDisconnect(t *testing.T) {
 					blockBackupOrRestore(ctx)
 				}}},
 				Store: &kvserver.StoreTestingKnobs{
-					TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+					TestingResponseFilter: func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 						for _, ru := range br.Responses {
 							switch ru.GetInner().(type) {
 							case *roachpb.ExportResponse:
@@ -8075,6 +8053,7 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 		nil, /* ief */
 		nil, /* kvDB */
 		nil, /* limiters */
+		cloud.NilMetrics,
 	)
 	require.NoError(t, err)
 

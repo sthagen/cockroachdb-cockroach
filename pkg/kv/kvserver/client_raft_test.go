@@ -1287,6 +1287,140 @@ func TestRequestsOnLaggingReplica(t *testing.T) {
 	require.Equal(t, leaderReplicaID, nlhe.Lease.Replica.ReplicaID)
 }
 
+// TestRequestsOnFollowerWithNonLiveLeaseholder tests the availability of a
+// range that has an expired epoch-based lease and a live Raft leader that is
+// unable to heartbeat its liveness record. Such a range should recover once
+// Raft leadership moves off the partitioned Raft leader to one of the followers
+// that can reach node liveness.
+//
+// This test relies on follower replicas campaigning for Raft leadership in
+// certain cases when refusing to forward lease acquisition requests to the
+// leader. In these cases where they determine that the leader is non-live
+// according to node liveness, they will attempt to steal Raft leadership and,
+// if successful, will be able to perform future lease acquisition attempts.
+func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	var installPartition int32
+	partitionFilter := func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+		if atomic.LoadInt32(&installPartition) == 0 {
+			return nil
+		}
+		if ba.GatewayNodeID == 1 && ba.Replica.NodeID == 4 {
+			return roachpb.NewError(context.Canceled)
+		}
+		return nil
+	}
+
+	clusterArgs := base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			// Reduce the election timeout some to speed up the test.
+			RaftConfig: base.RaftConfig{RaftElectionTimeoutTicks: 10},
+			Knobs: base.TestingKnobs{
+				NodeLiveness: kvserver.NodeLivenessTestingKnobs{
+					// This test waits for an epoch-based lease to expire, so we're
+					// setting the liveness duration as low as possible while still
+					// keeping the test stable.
+					LivenessDuration: 3000 * time.Millisecond,
+					RenewalDuration:  1500 * time.Millisecond,
+				},
+				Store: &kvserver.StoreTestingKnobs{
+					// We eliminate clock offsets in order to eliminate the stasis period
+					// of leases, in order to speed up the test.
+					MaxOffset:            time.Nanosecond,
+					TestingRequestFilter: partitionFilter,
+				},
+			},
+		},
+	}
+
+	tc := testcluster.StartTestCluster(t, 4, clusterArgs)
+	defer tc.Stopper().Stop(ctx)
+
+	{
+		// Move the liveness range to node 4.
+		desc := tc.LookupRangeOrFatal(t, keys.NodeLivenessPrefix)
+		tc.RebalanceVoterOrFatal(ctx, t, desc.StartKey.AsRawKey(), tc.Target(0), tc.Target(3))
+	}
+
+	// Create a new range.
+	_, rngDesc, err := tc.Servers[0].ScratchRangeEx()
+	require.NoError(t, err)
+	key := rngDesc.StartKey.AsRawKey()
+	// Add replicas on all the stores.
+	tc.AddVotersOrFatal(t, rngDesc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
+
+	// Store 0 holds the lease.
+	store0 := tc.GetFirstStoreFromServer(t, 0)
+	store0Repl, err := store0.GetReplica(rngDesc.RangeID)
+	require.NoError(t, err)
+	leaseStatus := store0Repl.CurrentLeaseStatus(ctx)
+	require.True(t, leaseStatus.OwnedBy(store0.StoreID()))
+
+	{
+		// Write a value so that the respective key is present in all stores and we
+		// can increment it again later.
+		_, err := tc.Server(0).DB().Inc(ctx, key, 1)
+		require.NoError(t, err)
+		log.Infof(ctx, "test: waiting for initial values...")
+		tc.WaitForValues(t, key, []int64{1, 1, 1, 0})
+		log.Infof(ctx, "test: waiting for initial values... done")
+	}
+
+	// Begin dropping all node liveness heartbeats from the original raft leader
+	// while allowing the leader to maintain Raft leadership and otherwise behave
+	// normally. This mimics cases where the raft leader is partitioned away from
+	// the liveness range but can otherwise reach its followers. In these cases,
+	// it is still possible that the followers can reach the liveness range and
+	// see that the leader becomes non-live. For example, the configuration could
+	// look like:
+	//
+	//          [0]       raft leader
+	//           ^
+	//          / \
+	//         /   \
+	//        v     v
+	//      [1]<--->[2]   raft followers
+	//        ^     ^
+	//         \   /
+	//          \ /
+	//           v
+	//          [3]       liveness range
+	//
+	log.Infof(ctx, "test: partitioning node")
+	atomic.StoreInt32(&installPartition, 1)
+
+	// Wait until the lease expires.
+	log.Infof(ctx, "test: waiting for lease expiration")
+	testutils.SucceedsSoon(t, func() error {
+		leaseStatus = store0Repl.CurrentLeaseStatus(ctx)
+		if leaseStatus.IsValid() {
+			return errors.New("lease still valid")
+		}
+		return nil
+	})
+	log.Infof(ctx, "test: lease expired")
+
+	{
+		// Increment the initial value again, which requires range availability. To
+		// get there, the request will need to trigger a lease request on a follower
+		// replica, which will call a Raft election, acquire Raft leadership, then
+		// acquire the range lease.
+		_, err := tc.Server(0).DB().Inc(ctx, key, 1)
+		require.NoError(t, err)
+		log.Infof(ctx, "test: waiting for new lease...")
+		tc.WaitForValues(t, key, []int64{2, 2, 2, 0})
+		log.Infof(ctx, "test: waiting for new lease... done")
+	}
+
+	// Store 0 no longer holds the lease.
+	leaseStatus = store0Repl.CurrentLeaseStatus(ctx)
+	require.False(t, leaseStatus.OwnedBy(store0.StoreID()))
+}
+
 type fakeSnapshotStream struct {
 	nextReq *kvserverpb.SnapshotRequest
 	nextErr error
@@ -2248,7 +2382,7 @@ func TestQuotaPool(t *testing.T) {
 		// to be the same as what we started with.
 		keyToWrite := key.Next()
 		value := bytes.Repeat([]byte("v"), (3*quota)/4)
-		var ba roachpb.BatchRequest
+		ba := &roachpb.BatchRequest{}
 		ba.Add(putArgs(keyToWrite, value))
 		if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 			t.Fatal(err)
@@ -2269,7 +2403,7 @@ func TestQuotaPool(t *testing.T) {
 		})
 
 		go func() {
-			var ba roachpb.BatchRequest
+			ba := &roachpb.BatchRequest{}
 			ba.Add(putArgs(keyToWrite, value))
 			if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 				ch <- roachpb.NewError(err)
@@ -2359,7 +2493,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	// Send a request to the leader replica. followerRepl is locked so it will
 	// not respond.
 	value := []byte("value")
-	var ba roachpb.BatchRequest
+	ba := &roachpb.BatchRequest{}
 	ba.Add(putArgs(key, value))
 	if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 		t.Fatal(err)
@@ -2669,7 +2803,7 @@ func TestReplicaRemovalCampaign(t *testing.T) {
 			replica2 := store0.LookupReplica(roachpb.RKey(key2))
 
 			rg2 := func(s *kvserver.Store) kv.Sender {
-				return kv.Wrap(s, func(ba roachpb.BatchRequest) roachpb.BatchRequest {
+				return kv.Wrap(s, func(ba *roachpb.BatchRequest) *roachpb.BatchRequest {
 					if ba.RangeID == 0 {
 						ba.RangeID = replica2.RangeID
 					}
@@ -4279,7 +4413,7 @@ func TestFailedConfChange(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingApplyFilter: testingApplyFilter,
+						TestingApplyCalledTwiceFilter: testingApplyFilter,
 					},
 				},
 			},
@@ -4353,7 +4487,7 @@ func TestStoreRangeWaitForApplication(t *testing.T) {
 	var filterRangeIDAtomic int64
 
 	ctx := context.Background()
-	testingRequestFilter := func(_ context.Context, ba roachpb.BatchRequest) (retErr *roachpb.Error) {
+	testingRequestFilter := func(_ context.Context, ba *roachpb.BatchRequest) (retErr *roachpb.Error) {
 		if rangeID := roachpb.RangeID(atomic.LoadInt64(&filterRangeIDAtomic)); rangeID != ba.RangeID {
 			return nil
 		}
@@ -4823,11 +4957,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 		repls            int
 		expAckBeforeAppl bool
 	}{
-		// In a single-replica Range, each handleRaftReady iteration will append
-		// new entries to the Raft log and immediately apply them. This prevents
-		// "early acknowledgement" from being possible or useful. See the comment
-		// on apply.Task.AckCommittedEntriesBeforeApplication.
-		{1, false},
+
 		// In a three-replica Range, each handleRaftReady iteration will append
 		// a set of entries to the Raft log and then apply the previous set of
 		// entries. This makes "early acknowledgement" a major optimization, as
@@ -4835,6 +4965,9 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 		// to the Raft log out of the client-perceived latency of the previous
 		// set of entries.
 		{3, true},
+		// In the past, single-replica groups behaved differently but as of #89632
+		// they too rely on early-acks as a major performance improvement.
+		{1, true},
 	} {
 		t.Run(fmt.Sprintf("numRepls=%d", testcase.repls), func(t *testing.T) {
 			var filterActive int32
@@ -4856,8 +4989,8 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 					ServerArgs: base.TestServerArgs{
 						Knobs: base.TestingKnobs{
 							Store: &kvserver.StoreTestingKnobs{
-								TestingApplyFilter:     applyFilterFn(blockPreApplication),
-								TestingPostApplyFilter: applyFilterFn(blockPostApplication),
+								TestingApplyCalledTwiceFilter: applyFilterFn(blockPreApplication),
+								TestingPostApplyFilter:        applyFilterFn(blockPostApplication),
 							},
 						},
 					},
@@ -4886,7 +5019,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 			expResult := func() {
 				t.Helper()
 				if pErr := <-ch; pErr != nil {
-					t.Fatalf("unexpected proposal result error: %v", pErr)
+					t.Errorf("unexpected proposal result error: %v", pErr)
 				}
 			}
 			dontExpResult := func() {
@@ -4895,7 +5028,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 				case <-time.After(10 * time.Millisecond):
 					// Expected.
 				case pErr := <-ch:
-					t.Fatalf("unexpected proposal acknowledged before TestingApplyFilter: %v", pErr)
+					t.Errorf("unexpected proposal acknowledged before TestingApplyCalledTwiceFilter: %v", pErr)
 				}
 			}
 
@@ -5449,14 +5582,14 @@ func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 				DisableReplicaGCQueue: true,
-				TestingRequestFilter: kvserverbase.ReplicaRequestFilter(func(_ context.Context, r roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, r *roachpb.BatchRequest) *roachpb.Error {
 					if r.RangeID == roachpb.RangeID(atomic.LoadInt64(&rangeID)) {
 						if _, isPut := r.GetArg(roachpb.Put); isPut {
 							atomic.AddInt64(&putRequestCount, 1)
 						}
 					}
 					return nil
-				}),
+				},
 			}},
 			RaftConfig: base.RaftConfig{
 				// Set the proposal quota to a tiny amount so that each write will

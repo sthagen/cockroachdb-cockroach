@@ -1632,7 +1632,7 @@ func TestAddSSTableIntentResolution(t *testing.T) {
 		pointKV("b", 1, "2"),
 		pointKV("c", 1, "3"),
 	})
-	ba := roachpb.BatchRequest{
+	ba := &roachpb.BatchRequest{
 		Header: roachpb.Header{UserPriority: roachpb.MaxUserPriority},
 	}
 	ba.Add(&roachpb.AddSSTableRequest{
@@ -1676,7 +1676,7 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsTSCache(t *testing.T) {
 		MVCCStats:                      storageutils.SSTStats(t, sst, 0),
 		SSTTimestampToRequestTimestamp: hlc.Timestamp{WallTime: 1},
 	}
-	ba := roachpb.BatchRequest{
+	ba := &roachpb.BatchRequest{
 		Header: roachpb.Header{Timestamp: txnTS.Prev()},
 	}
 	ba.Add(sstReq)
@@ -1691,7 +1691,7 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsTSCache(t *testing.T) {
 
 	// Adding the SST again and reading results in the new value, because the
 	// tscache pushed the SST forward.
-	ba = roachpb.BatchRequest{
+	ba = &roachpb.BatchRequest{
 		Header: roachpb.Header{Timestamp: txnTS.Prev()},
 	}
 	ba.Add(sstReq)
@@ -1711,7 +1711,11 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsClosedTS(t *testing.T) 
 
 	ctx := context.Background()
 	si, _, db := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{},
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableCanAckBeforeApplication: true,
+			},
+		},
 	})
 	defer si.Stopper().Stop(ctx)
 	s := si.(*server.TestServer)
@@ -1736,7 +1740,7 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsClosedTS(t *testing.T) 
 		MVCCStats:                      storageutils.SSTStats(t, sst, 0),
 		SSTTimestampToRequestTimestamp: hlc.Timestamp{WallTime: 1},
 	}
-	ba := roachpb.BatchRequest{
+	ba := &roachpb.BatchRequest{
 		Header: roachpb.Header{Timestamp: reqTS},
 	}
 	ba.Add(sstReq)

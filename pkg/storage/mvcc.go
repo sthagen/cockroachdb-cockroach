@@ -83,8 +83,8 @@ var minWALSyncInterval = settings.RegisterDurationSetting(
 var MVCCRangeTombstonesEnabled = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"storage.mvcc.range_tombstones.enabled",
-	"if true, enable the use of MVCC range tombstones",
-	false)
+	"enables the use of MVCC range tombstones",
+	true)
 
 // CanUseMVCCRangeTombstones returns true if the caller can begin writing
 // MVCC range tombstones, by setting DeleteRangeRequest.UseRangeTombstone.
@@ -863,12 +863,14 @@ func MVCCBlindPutProto(
 // table (i.e. unreplicated locks) and locks only stored in the persistent lock
 // table keyspace (i.e. replicated locks that have yet to be "discovered").
 type LockTableView interface {
-	// IsKeyLockedByConflictingTxn returns whether the specified key is locked by
-	// a conflicting transaction, given the caller's own desired locking strength.
-	// If so, the lock holder is returned. A transaction's own lock does not
-	// appear to be locked to itself (false is returned). The method is used by
-	// requests in conjunction with the SkipLocked wait policy to determine which
-	// keys they should skip over during evaluation.
+	// IsKeyLockedByConflictingTxn returns whether the specified key is locked or
+	// reserved (see lockTable "reservations") by a conflicting transaction, given
+	// the caller's own desired locking strength. If so, true is returned. If the
+	// key is locked, the lock holder is also returned. Otherwise, if the key is
+	// reserved, nil is also returned. A transaction's own lock or reservation
+	// does not appear to be locked to itself (false is returned). The method is
+	// used by requests in conjunction with the SkipLocked wait policy to
+	// determine which keys they should skip over during evaluation.
 	IsKeyLockedByConflictingTxn(roachpb.Key, lock.Strength) (bool, *enginepb.TxnMeta)
 }
 
@@ -1163,11 +1165,8 @@ func mvccGetMetadata(
 	}
 
 	// We're now on a point key. Decode its value.
-	var unsafeVal MVCCValue
 	unsafeValRaw := iter.UnsafeValue()
-	if unsafeVal, ok, err = tryDecodeSimpleMVCCValue(unsafeValRaw); !ok && err == nil {
-		unsafeVal, err = decodeExtendedMVCCValue(unsafeValRaw)
-	}
+	isTombstone, err := EncodedMVCCValueIsTombstone(unsafeValRaw)
 	if err != nil {
 		return false, 0, 0, hlc.Timestamp{}, err
 	}
@@ -1183,7 +1182,7 @@ func mvccGetMetadata(
 			meta.Deleted = true
 			meta.Timestamp = rangeKeys.Versions[0].Timestamp.ToLegacyTimestamp()
 			keyLastSeen := v.Timestamp
-			if unsafeVal.IsTombstone() {
+			if isTombstone {
 				keyLastSeen = unsafeKey.Timestamp
 			}
 			return true, int64(EncodedMVCCKeyPrefixLength(metaKey.Key)), 0, keyLastSeen, nil
@@ -1192,7 +1191,7 @@ func mvccGetMetadata(
 
 	// Synthesize metadata for a regular point key.
 	meta.ValBytes = int64(len(unsafeValRaw))
-	meta.Deleted = unsafeVal.IsTombstone()
+	meta.Deleted = isTombstone
 	meta.Timestamp = unsafeKey.Timestamp.ToLegacyTimestamp()
 
 	return true, int64(EncodedMVCCKeyPrefixLength(metaKey.Key)), 0, unsafeKey.Timestamp, nil
@@ -2998,11 +2997,11 @@ func MVCCPredicateDeleteRange(
 			return false, false, false, roachpb.NewWriteTooOldError(endTime, k.Timestamp.Next(),
 				k.Key.Clone())
 		}
-		v, err := DecodeMVCCValue(vRaw)
+		isTombstone, err := EncodedMVCCValueIsTombstone(vRaw)
 		if err != nil {
 			return false, false, false, err
 		}
-		if v.IsTombstone() {
+		if isTombstone {
 			// The latest version of the key is a point tombstone.
 			return true, true, false, nil
 		}
@@ -3616,6 +3615,9 @@ func buildScanIntents(data []byte) ([]roachpb.Intent, error) {
 		}
 		if err := protoutil.Unmarshal(reader.Value(), &meta); err != nil {
 			return nil, err
+		}
+		if meta.Txn == nil {
+			return nil, errors.AssertionFailedf("unexpected nil MVCCMetadata.Txn: %v", meta)
 		}
 		intents = append(intents, roachpb.MakeIntent(meta.Txn, key.Key))
 	}

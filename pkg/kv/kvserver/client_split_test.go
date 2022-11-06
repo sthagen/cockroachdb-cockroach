@@ -599,8 +599,9 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				DisableMergeQueue: true,
-				DisableSplitQueue: true,
+				DisableMergeQueue:              true,
+				DisableSplitQueue:              true,
+				DisableCanAckBeforeApplication: true,
 			},
 		},
 	})
@@ -760,8 +761,9 @@ func TestStoreRangeSplitMergeStats(t *testing.T) {
 	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				DisableMergeQueue: true,
-				DisableSplitQueue: true,
+				DisableMergeQueue:              true,
+				DisableSplitQueue:              true,
+				DisableCanAckBeforeApplication: true,
 			},
 		},
 	})
@@ -843,7 +845,8 @@ func TestStoreRangeSplitMergeStats(t *testing.T) {
 
 	// Merge the ranges back together, and assert that the merged stats
 	// agree with the pre-split stats.
-	_, pErr = kv.SendWrapped(ctx, store.TestSender(), adminMergeArgs(repl.Desc().StartKey.AsRawKey()))
+	mergeKey := repl.Desc().StartKey.AsRawKey()
+	_, pErr = kv.SendWrapped(ctx, store.TestSender(), adminMergeArgs(mergeKey))
 	require.NoError(t, pErr.GoError())
 
 	repl = store.LookupReplica(roachpb.RKey(keyPrefix))
@@ -1226,7 +1229,7 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 			zoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
 
 			testingRequestFilter :=
-				func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+				func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
 					for _, req := range ba.Requests {
 						if cPut, ok := req.GetInner().(*roachpb.ConditionalPutRequest); ok {
 							if cPut.Key.Equal(keys.RangeDescriptorKey(splitKey)) {
@@ -1250,10 +1253,11 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 						DefaultZoneConfigOverride: &zoneConfig,
 					},
 					Store: &kvserver.StoreTestingKnobs{
-						DisableGCQueue:       true,
-						DisableMergeQueue:    true,
-						DisableSplitQueue:    true,
-						TestingRequestFilter: testingRequestFilter,
+						DisableCanAckBeforeApplication: true,
+						DisableGCQueue:                 true,
+						DisableMergeQueue:              true,
+						DisableSplitQueue:              true,
+						TestingRequestFilter:           testingRequestFilter,
 					},
 				},
 			})
@@ -1793,7 +1797,7 @@ func TestStoreSplitOnRemovedReplica(t *testing.T) {
 	inFilter := make(chan struct{}, 1)
 	beginBlockingSplit := make(chan struct{})
 	finishBlockingSplit := make(chan struct{})
-	filter := func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	filter := func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
 		// Block replica 1's attempt to perform the AdminSplit. We detect the
 		// split's range descriptor update and block until the rest of the test
 		// is ready. We then return a ConditionFailedError, simulating a
@@ -2483,7 +2487,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 				// This simulates txn deadlock or a max priority txn aborting a
 				// normal or min priority txn.
 				if force {
-					ba := roachpb.BatchRequest{}
+					ba := &roachpb.BatchRequest{}
 					ba.Timestamp = store.Clock().Now()
 					ba.RangeID = lhs.RangeID
 					ba.Add(&roachpb.PushTxnRequest{
@@ -2505,7 +2509,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 				return errors.New("forced abort")
 			}
 			if err := txnFn(ctx, txn); err != nil {
-				txn.CleanupOnError(ctx, err)
+				require.NoError(t, txn.Rollback(ctx))
 				if !force && commit {
 					t.Fatalf("expected success with commit == true; got %v", err)
 				}
@@ -2558,6 +2562,9 @@ func TestUnsplittableRange(t *testing.T) {
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue:       true,
 				SplitQueuePurgatoryChan: splitQueuePurgatoryChan,
+				// Without this, the test is flaky: the range does not end up in
+				// purgatory "synchronously".
+				DisableCanAckBeforeApplication: true,
 			},
 			Server: &server.TestingKnobs{
 				WallClock:                       manualClock,
@@ -2768,6 +2775,9 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
 						WallClock: manualClock,
+					},
+					Store: &kvserver.StoreTestingKnobs{
+						DisableCanAckBeforeApplication: true,
 					},
 				},
 			},
@@ -3022,7 +3032,7 @@ func TestStoreSplitRangeLookupRace(t *testing.T) {
 	blockedRangeLookups := int32(0)
 	rangeLookupIsBlocked := make(chan struct{}, 1)
 	unblockRangeLookups := make(chan struct{})
-	respFilter := func(ctx context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+	respFilter := func(ctx context.Context, ba *roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
 		select {
 		case <-blockRangeLookups:
 			if kv.TestingIsRangeLookup(ba) &&
@@ -3555,7 +3565,7 @@ func TestStoreRangeSplitAndMergeWithGlobalReads(t *testing.T) {
 	// necessary, see maybeCommitWaitBeforeCommitTrigger.
 	var clock atomic.Value
 	var splitsWithSyntheticTS, mergesWithSyntheticTS int64
-	respFilter := func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+	respFilter := func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 		if req, ok := ba.GetArg(roachpb.EndTxn); ok {
 			endTxn := req.(*roachpb.EndTxnRequest)
 			if br.Txn.Status == roachpb.COMMITTED && br.Txn.WriteTimestamp.Synthetic {

@@ -802,7 +802,9 @@ func (r *Replica) AdminMerge(
 		err := runMergeTxn(txn)
 		if err != nil {
 			log.VEventf(ctx, 2, "merge txn failed: %s", err)
-			txn.CleanupOnError(ctx, err)
+			if rollbackErr := txn.Rollback(ctx); rollbackErr != nil {
+				log.VEventf(ctx, 2, "merge txn rollback failed: %s", rollbackErr)
+			}
 		}
 		if !errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) {
 			if err != nil {
@@ -2723,11 +2725,12 @@ func (r *Replica) sendSnapshot(
 			)
 		},
 	)
-
-	if err != nil {
-		return errors.Mark(err, errMarkSnapshotError)
+	// Only mark explicitly as snapshot error (which is retriable) if we timed out.
+	// Otherwise, it's up to the remote to add this mark where appropriate.
+	if errors.HasType(err, (*contextutil.TimeoutError)(nil)) {
+		err = errors.Mark(err, errMarkSnapshotError)
 	}
-	return nil
+	return err
 }
 
 // followerSnapshotsEnabled is used to enable or disable follower snapshots.
@@ -2882,7 +2885,7 @@ func (r *Replica) followerSendSnapshot(
 		}
 	}
 
-	err = contextutil.RunWithTimeout(
+	return contextutil.RunWithTimeout(
 		ctx, "send-snapshot", sendSnapshotTimeout, func(ctx context.Context) error {
 			return r.store.cfg.Transport.SendSnapshot(
 				ctx,
@@ -2895,20 +2898,6 @@ func (r *Replica) followerSendSnapshot(
 			)
 		},
 	)
-	if err != nil {
-		if errors.Is(err, errMalformedSnapshot) {
-			tag := fmt.Sprintf("r%d_%s", r.RangeID, snap.SnapUUID.Short())
-			if dir, err := r.store.checkpoint(ctx, tag); err != nil {
-				log.Warningf(ctx, "unable to create checkpoint %s: %+v", dir, err)
-			} else {
-				log.Warningf(ctx, "created checkpoint %s", dir)
-			}
-
-			log.Fatal(ctx, "malformed snapshot generated")
-		}
-		return errors.Mark(err, errMarkSnapshotError)
-	}
-	return nil
 }
 
 // replicasCollocated is used in AdminMerge to ensure that the ranges are

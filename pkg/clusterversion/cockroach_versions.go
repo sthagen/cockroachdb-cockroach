@@ -302,7 +302,6 @@ const (
 	// V22_2SupportAssumeRoleAuth is the version where assume role authorization is
 	// supported in cloud storage and KMS.
 	V22_2SupportAssumeRoleAuth
-
 	// V22_2FixUserfileRelatedDescriptorCorruption adds a migration which uses
 	// heuristics to identify invalid table descriptors for userfile-related
 	// descriptors.
@@ -317,6 +316,11 @@ const (
 
 	// TenantNames adds a name column to system.tenants.
 	V23_1TenantNames
+
+	// V23_1DescIDSequenceForSystemTenant migrates the descriptor ID generator
+	// counter from a meta key to the system.descriptor_id_seq sequence for the
+	// system tenant.
+	V23_1DescIDSequenceForSystemTenant
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -519,6 +523,10 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     V23_1TenantNames,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 4},
+	},
+	{
+		Key:     V23_1DescIDSequenceForSystemTenant,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 6},
 	},
 
 	// *************************************************

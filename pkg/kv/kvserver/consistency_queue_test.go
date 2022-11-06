@@ -158,7 +158,7 @@ func TestCheckConsistencyReplay(t *testing.T) {
 	}
 	// Arrange to count the number of times each checksum command applies to each
 	// store.
-	testKnobs.TestingApplyFilter = func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+	testKnobs.TestingPostApplyFilter = func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
 		state.Lock()
 		defer state.Unlock()
 		if ccr := args.ComputeChecksum; ccr != nil {
@@ -169,7 +169,7 @@ func TestCheckConsistencyReplay(t *testing.T) {
 
 	// Arrange to trigger a retry when a ComputeChecksum request arrives.
 	testKnobs.TestingResponseFilter = func(
-		ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse,
+		ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse,
 	) *roachpb.Error {
 		state.Lock()
 		defer state.Unlock()
@@ -480,7 +480,12 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		// Split off a range so that we get away from the timeseries writes, which
 		// pollute the stats with ContainsEstimates=true. Note that the split clears
 		// the right hand side (which is what we operate on) from that flag.
-		require.NoError(t, db0.AdminSplit(ctx, key, hlc.MaxTimestamp /* expirationTime */))
+		require.NoError(t, db0.AdminSplit(
+			ctx,
+			key,              /* splitKey */
+			hlc.MaxTimestamp, /* expirationTime */
+			roachpb.AdminSplitRequest_INGESTION,
+		))
 
 		delta := computeDelta(db0)
 

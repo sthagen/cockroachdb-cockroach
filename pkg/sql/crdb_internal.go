@@ -416,131 +416,217 @@ CREATE TABLE crdb_internal.super_regions (
 	},
 }
 
+func makeCrdbInternalTablesAddRowFn(
+	p *planner, pusher func(...tree.Datum) error,
+) func(table catalog.TableDescriptor, dbName tree.Datum, scName string) error {
+	row := make(tree.Datums, 14)
+	return func(table catalog.TableDescriptor, dbName tree.Datum, scName string) (err error) {
+		dropTimeDatum := tree.DNull
+		if dropTime := table.GetDropTime(); dropTime != 0 {
+			dropTimeDatum, err = tree.MakeDTimestamp(
+				timeutil.Unix(0, dropTime), time.Nanosecond,
+			)
+			if err != nil {
+				return err
+			}
+		}
+		locality := tree.DNull
+		if c := table.GetLocalityConfig(); c != nil {
+			f := p.EvalContext().FmtCtx(tree.FmtSimple)
+			if err := multiregion.FormatTableLocalityConfig(c, f); err != nil {
+				return err
+			}
+			locality = tree.NewDString(f.String())
+		}
+		row = row[:0]
+		row = append(row,
+			tree.NewDInt(tree.DInt(int64(table.GetID()))),
+			tree.NewDInt(tree.DInt(int64(table.GetParentID()))),
+			tree.NewDString(table.GetName()),
+			dbName,
+			tree.NewDInt(tree.DInt(int64(table.GetVersion()))),
+			eval.TimestampToInexactDTimestamp(table.GetModificationTime()),
+			eval.TimestampToDecimalDatum(table.GetModificationTime()),
+			tree.NewDString(table.GetFormatVersion().String()),
+			tree.NewDString(table.GetState().String()),
+			tree.DNull, // sc_lease_node_id is deprecated
+			tree.DNull, // sc_lease_expiration_time is deprecated
+			dropTimeDatum,
+			tree.NewDString(table.GetAuditMode().String()),
+			tree.NewDString(scName),
+			tree.NewDInt(tree.DInt(int64(table.GetParentSchemaID()))),
+			locality,
+		)
+		return pusher(row...)
+	}
+}
+
 // TODO(tbg): prefix with kv_.
 var crdbInternalTablesTable = virtualSchemaTable{
 	comment: `table descriptors accessible by current user, including non-public and virtual (KV scan; expensive!)`,
 	schema: `
 CREATE TABLE crdb_internal.tables (
-  table_id                 INT NOT NULL,
-  parent_id                INT NOT NULL,
-  name                     STRING NOT NULL,
-  database_name            STRING,
-  version                  INT NOT NULL,
-  mod_time                 TIMESTAMP NOT NULL,
-  mod_time_logical         DECIMAL NOT NULL,
-  format_version           STRING NOT NULL,
-  state                    STRING NOT NULL,
-  sc_lease_node_id         INT,
-  sc_lease_expiration_time TIMESTAMP,
-  drop_time                TIMESTAMP,
-  audit_mode               STRING NOT NULL,
-  schema_name              STRING NOT NULL,
-  parent_schema_id         INT NOT NULL,
-  locality                 TEXT
-)`,
-	generator: func(ctx context.Context, p *planner, dbDesc catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
-		row := make(tree.Datums, 14)
-		worker := func(ctx context.Context, pusher rowPusher) error {
-			all, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
-			if err != nil {
+    table_id                 INT8 NOT NULL,
+    parent_id                INT8 NOT NULL,
+    name                     STRING NOT NULL,
+    database_name            STRING,
+    version                  INT8 NOT NULL,
+    mod_time                 TIMESTAMP NOT NULL,
+    mod_time_logical         DECIMAL NOT NULL,
+    format_version           STRING NOT NULL,
+    state                    STRING NOT NULL,
+    sc_lease_node_id         INT8,
+    sc_lease_expiration_time TIMESTAMP,
+    drop_time                TIMESTAMP,
+    audit_mode               STRING NOT NULL,
+    schema_name              STRING NOT NULL,
+    parent_schema_id         INT8 NOT NULL,
+    locality                 STRING,
+    INDEX (parent_id) WHERE drop_time IS NULL,
+    INDEX (database_name) WHERE drop_time IS NULL
+);`,
+	indexes: []virtualIndex{
+		{
+			// INDEX(parent_id) WHERE drop_time IS NULL
+			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
+				dbID := descpb.ID(tree.MustBeDInt(unwrappedConstraint))
+				flags := p.CommonLookupFlagsRequired()
+				flags.Required = false
+				flags.IncludeOffline = true
+				ok, db, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.Txn(), dbID, flags)
+				if !ok || err != nil {
+					return false, err
+				}
+				return crdbInternalTablesDatabaseLookupFunc(ctx, p, db, addRow)
+			},
+		},
+		{
+			// INDEX(database_name) WHERE drop_time IS NULL
+			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
+				dbName := string(tree.MustBeDString(unwrappedConstraint))
+				flags := p.CommonLookupFlagsRequired()
+				flags.Required = false
+				flags.IncludeOffline = true
+				db, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.Txn(), dbName, flags)
+				if db == nil || err != nil {
+					return false, err
+				}
+				return crdbInternalTablesDatabaseLookupFunc(ctx, p, db, addRow)
+			},
+		},
+	},
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		all, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
+		if err != nil {
+			return err
+		}
+		descs := all.OrderedDescriptors()
+		dbNames := make(map[descpb.ID]string)
+		scNames := make(map[descpb.ID]string)
+		// TODO(richardjcai): Remove this case for keys.PublicSchemaID in 22.2.
+		scNames[keys.PublicSchemaID] = catconstants.PublicSchemaName
+		// Record database descriptors for name lookups.
+		for _, desc := range descs {
+			if dbDesc, ok := desc.(catalog.DatabaseDescriptor); ok {
+				dbNames[dbDesc.GetID()] = dbDesc.GetName()
+			}
+			if scDesc, ok := desc.(catalog.SchemaDescriptor); ok {
+				scNames[scDesc.GetID()] = scDesc.GetName()
+			}
+		}
+		addDesc := makeCrdbInternalTablesAddRowFn(p, addRow)
+
+		// Note: we do not use forEachTableDesc() here because we want to
+		// include added and dropped descriptors.
+		for _, desc := range descs {
+			table, ok := desc.(catalog.TableDescriptor)
+			if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
+				continue
+			}
+			dbName := dbNames[table.GetParentID()]
+			if dbName == "" {
+				// The parent database was deleted. This is possible e.g. when
+				// a database is dropped with CASCADE, and someone queries
+				// this virtual table before the dropped table descriptors are
+				// effectively deleted.
+				dbName = fmt.Sprintf("[%d]", table.GetParentID())
+			}
+			schemaName := scNames[table.GetParentSchemaID()]
+			if schemaName == "" {
+				// The parent schema was deleted, possibly due to reasons mentioned above.
+				schemaName = fmt.Sprintf("[%d]", table.GetParentSchemaID())
+			}
+			if err := addDesc(table, tree.NewDString(dbName), schemaName); err != nil {
 				return err
 			}
-			descs := all.OrderedDescriptors()
-			dbNames := make(map[descpb.ID]string)
-			scNames := make(map[descpb.ID]string)
-			// TODO(richardjcai): Remove this case for keys.PublicSchemaID in 22.2.
-			scNames[keys.PublicSchemaID] = catconstants.PublicSchemaName
-			// Record database descriptors for name lookups.
-			for _, desc := range descs {
-				if dbDesc, ok := desc.(catalog.DatabaseDescriptor); ok {
-					dbNames[dbDesc.GetID()] = dbDesc.GetName()
-				}
-				if scDesc, ok := desc.(catalog.SchemaDescriptor); ok {
-					scNames[scDesc.GetID()] = scDesc.GetName()
-				}
-			}
+		}
 
-			addDesc := func(table catalog.TableDescriptor, dbName tree.Datum, scName string) error {
-				dropTimeDatum := tree.DNull
-				if dropTime := table.GetDropTime(); dropTime != 0 {
-					dropTimeDatum, err = tree.MakeDTimestamp(
-						timeutil.Unix(0, dropTime), time.Nanosecond,
-					)
-					if err != nil {
-						return err
-					}
-				}
-				locality := tree.DNull
-				if c := table.GetLocalityConfig(); c != nil {
-					f := p.EvalContext().FmtCtx(tree.FmtSimple)
-					if err := multiregion.FormatTableLocalityConfig(c, f); err != nil {
-						return err
-					}
-					locality = tree.NewDString(f.String())
-				}
-				row = row[:0]
-				row = append(row,
-					tree.NewDInt(tree.DInt(int64(table.GetID()))),
-					tree.NewDInt(tree.DInt(int64(table.GetParentID()))),
-					tree.NewDString(table.GetName()),
-					dbName,
-					tree.NewDInt(tree.DInt(int64(table.GetVersion()))),
-					eval.TimestampToInexactDTimestamp(table.GetModificationTime()),
-					eval.TimestampToDecimalDatum(table.GetModificationTime()),
-					tree.NewDString(table.GetFormatVersion().String()),
-					tree.NewDString(table.GetState().String()),
-					tree.DNull, // deprecated leaseNode
-					tree.DNull, // deprecated leaseExp
-					dropTimeDatum,
-					tree.NewDString(table.GetAuditMode().String()),
-					tree.NewDString(scName),
-					tree.NewDInt(tree.DInt(int64(table.GetParentSchemaID()))),
-					locality,
-				)
-				return pusher.pushRow(row...)
-			}
-
-			// Note: we do not use forEachTableDesc() here because we want to
-			// include added and dropped descriptors.
-			for _, desc := range descs {
-				table, ok := desc.(catalog.TableDescriptor)
-				if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
-					continue
-				}
-				dbName := dbNames[table.GetParentID()]
-				if dbName == "" {
-					// The parent database was deleted. This is possible e.g. when
-					// a database is dropped with CASCADE, and someone queries
-					// this virtual table before the dropped table descriptors are
-					// effectively deleted.
-					dbName = fmt.Sprintf("[%d]", table.GetParentID())
-				}
-				schemaName := scNames[table.GetParentSchemaID()]
-				if schemaName == "" {
-					// The parent schema was deleted, possibly due to reasons mentioned above.
-					schemaName = fmt.Sprintf("[%d]", table.GetParentSchemaID())
-				}
-				if err := addDesc(table, tree.NewDString(dbName), schemaName); err != nil {
+		// Also add all the virtual descriptors.
+		vt := p.getVirtualTabler()
+		vSchemas := vt.getSchemas()
+		for _, virtSchemaName := range vt.getSchemaNames() {
+			e := vSchemas[virtSchemaName]
+			for _, tName := range e.orderedDefNames {
+				vTableEntry := e.defs[tName]
+				if err := addDesc(vTableEntry.desc, tree.DNull, virtSchemaName); err != nil {
 					return err
 				}
 			}
+		}
+		return nil
+	},
+}
 
-			// Also add all the virtual descriptors.
-			vt := p.getVirtualTabler()
-			vSchemas := vt.getSchemas()
-			for _, virtSchemaName := range vt.getSchemaNames() {
-				e := vSchemas[virtSchemaName]
-				for _, tName := range e.orderedDefNames {
-					vTableEntry := e.defs[tName]
-					if err := addDesc(vTableEntry.desc, tree.DNull, virtSchemaName); err != nil {
-						return err
-					}
-				}
-			}
+func crdbInternalTablesDatabaseLookupFunc(
+	ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
+) (bool, error) {
+	var descs nstree.Catalog
+	var err error
+	if useIndexLookupForDescriptorsInDatabase.Get(&p.EvalContext().Settings.SV) {
+		descs, err = p.Descriptors().GetAllDescriptorsForDatabase(ctx, p.Txn(), db)
+	} else {
+		descs, err = p.Descriptors().GetAllDescriptors(ctx, p.Txn())
+	}
+	if err != nil {
+		return false, err
+	}
+
+	scNames := make(map[descpb.ID]string)
+	// TODO(richardjcai): Remove this case for keys.PublicSchemaID in 22.2.
+	scNames[keys.PublicSchemaID] = catconstants.PublicSchemaName
+	// Record database descriptors for name lookups.
+	dbID := db.GetID()
+	_ = descs.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+		if desc.GetParentID() != dbID {
 			return nil
 		}
-		return setupGenerator(ctx, worker, stopper)
-	},
+		if scDesc, ok := desc.(catalog.SchemaDescriptor); ok {
+			scNames[scDesc.GetID()] = scDesc.GetName()
+		}
+		return nil
+	})
+	rf := makeCrdbInternalTablesAddRowFn(p, addRow)
+	var seenAny bool
+	if err := descs.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+		if desc.GetParentID() != dbID {
+			return nil
+		}
+		table, ok := desc.(catalog.TableDescriptor)
+		if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
+			return nil
+		}
+		seenAny = true
+		schemaName := scNames[table.GetParentSchemaID()]
+		if schemaName == "" {
+			// The parent schema was deleted, possibly due to reasons mentioned above.
+			schemaName = fmt.Sprintf("[%d]", table.GetParentSchemaID())
+		}
+		return rf(table, tree.NewDString(db.GetName()), schemaName)
+	}); err != nil {
+		return false, err
+	}
+
+	return seenAny, nil
 }
 
 var crdbInternalPgCatalogTableIsImplementedTable = virtualSchemaTable{
@@ -762,6 +848,15 @@ func tsOrNull(micros int64) (tree.Datum, error) {
 	return tree.MakeDTimestamp(ts, time.Microsecond)
 }
 
+const (
+	jobsQSelect      = `SELECT id, status, created, payload, progress, claim_session_id, claim_instance_id`
+	jobsQFrom        = ` FROM system.jobs`
+	jobsBackoffArgs  = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
+	jobsStatusFilter = ` WHERE status = $3`
+	jobsQuery        = jobsQSelect + `, last_run, COALESCE(num_runs, 0), ` + jobs.NextRunClause +
+		` as next_run` + jobsQFrom + ", " + jobsBackoffArgs
+)
+
 // TODO(tbg): prefix with kv_.
 var crdbInternalJobsTable = virtualSchemaTable{
 	schema: `
@@ -787,243 +882,256 @@ CREATE TABLE crdb_internal.jobs (
   next_run              TIMESTAMP,
   num_runs              INT,
   execution_errors      STRING[],
-  execution_events      JSONB
+  execution_events      JSONB,
+  INDEX(status)
 )`,
 	comment: `decoded job metadata from system.jobs (KV scan)`,
-	generator: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, _ *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
-		currentUser := p.SessionData().User()
-		isAdmin, err := p.HasAdminRole(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		hasControlJob, err := p.HasRoleOption(ctx, roleoption.CONTROLJOB)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Beware: we're querying system.jobs as root; we need to be careful to filter
-		// out results that the current user is not able to see.
-		const (
-			qSelect          = `SELECT id, status, created, payload, progress, claim_session_id, claim_instance_id`
-			qFrom            = ` FROM system.jobs`
-			backoffArgs      = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
-			queryWithBackoff = qSelect + `, last_run, COALESCE(num_runs, 0), ` + jobs.NextRunClause + ` as next_run` + qFrom + ", " + backoffArgs
-		)
-
-		it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
-			ctx, "crdb-internal-jobs-table", p.txn,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-			queryWithBackoff, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay())
-		if err != nil {
-			return nil, nil, err
-		}
-
-		cleanup := func(ctx context.Context) {
-			if err := it.Close(); err != nil {
-				// TODO(yuzefovich): this error should be propagated further up
-				// and not simply being logged. Fix it (#61123).
-				//
-				// Doing that as a return parameter would require changes to
-				// `planNode.Close` signature which is a bit annoying. One other
-				// possible solution is to panic here and catch the error
-				// somewhere.
-				log.Warningf(ctx, "error closing an iterator: %v", err)
-			}
-		}
-
-		// We'll reuse this container on each loop.
-		container := make(tree.Datums, 0, 21)
-		sessionJobs := make([]*jobs.Record, 0, len(p.extendedEvalCtx.SchemaChangeJobRecords))
-		uniqueJobs := make(map[*jobs.Record]struct{})
-		for _, job := range p.extendedEvalCtx.SchemaChangeJobRecords {
-			if _, ok := uniqueJobs[job]; ok {
-				continue
-			}
-			sessionJobs = append(sessionJobs, job)
-			uniqueJobs[job] = struct{}{}
-		}
-		return func() (datums tree.Datums, e error) {
-			// Loop while we need to skip a row.
-			for {
-				ok, err := it.Next(ctx)
-				if err != nil {
-					return nil, err
-				}
-				var id, status, created, payloadBytes, progressBytes, sessionIDBytes,
-					instanceID tree.Datum
-				lastRun, nextRun, numRuns := tree.DNull, tree.DNull, tree.DNull
-				if ok {
-					r := it.Cur()
-					id, status, created, payloadBytes, progressBytes, sessionIDBytes, instanceID =
-						r[0], r[1], r[2], r[3], r[4], r[5], r[6]
-					lastRun, numRuns, nextRun = r[7], r[8], r[9]
-				} else if !ok {
-					if len(sessionJobs) == 0 {
-						return nil, nil
-					}
-					job := sessionJobs[len(sessionJobs)-1]
-					sessionJobs = sessionJobs[:len(sessionJobs)-1]
-					// Convert the job into datums, where protobufs will be intentionally,
-					// marshalled.
-					id = tree.NewDInt(tree.DInt(job.JobID))
-					status = tree.NewDString(string(jobs.StatusPending))
-					created = eval.TimestampToInexactDTimestamp(p.txn.ReadTimestamp())
-					progressBytes, payloadBytes, err = getPayloadAndProgressFromJobsRecord(p, job)
-					if err != nil {
-						return nil, err
-					}
-					sessionIDBytes = tree.NewDBytes(tree.DBytes(p.extendedEvalCtx.SessionID.GetBytes()))
-					instanceID = tree.NewDInt(tree.DInt(p.extendedEvalCtx.ExecCfg.JobRegistry.ID()))
-				}
-
-				var jobType, description, statement, user, descriptorIDs, started, runningStatus,
-					finished, modified, fractionCompleted, highWaterTimestamp, errorStr, coordinatorID,
-					traceID, executionErrors, executionEvents = tree.DNull, tree.DNull, tree.DNull,
-					tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
-					tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull
-
-				// Extract data from the payload.
-				payload, err := jobs.UnmarshalPayload(payloadBytes)
-
-				// We filter out masked rows before we allocate all the
-				// datums. Needless allocate when not necessary.
-				ownedByAdmin := false
-				var sqlUsername username.SQLUsername
-				if payload != nil {
-					sqlUsername = payload.UsernameProto.Decode()
-					ownedByAdmin, err = p.UserHasAdminRole(ctx, sqlUsername)
-					if err != nil {
-						errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
-					}
-				}
-				if sessionID, ok := sessionIDBytes.(*tree.DBytes); ok {
-					if isAlive, err := p.EvalContext().SQLLivenessReader.IsAlive(
-						ctx, sqlliveness.SessionID(*sessionID),
-					); err != nil {
-						// Silently swallow the error for checking for liveness.
-					} else if instanceID, ok := instanceID.(*tree.DInt); ok && isAlive {
-						coordinatorID = instanceID
-					}
-				}
-
-				sameUser := payload != nil && sqlUsername == currentUser
-				// The user can access the row if the meet one of the conditions:
-				//  1. The user is an admin.
-				//  2. The job is owned by the user.
-				//  3. The user has CONTROLJOB privilege and the job is not owned by
-				//      an admin.
-				if canAccess := isAdmin || !ownedByAdmin && hasControlJob || sameUser; !canAccess {
-					continue
-				}
-
-				if err != nil {
-					errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
-				} else {
-					jobType = tree.NewDString(payload.Type().String())
-					description = tree.NewDString(payload.Description)
-					statement = tree.NewDString(strings.Join(payload.Statement, "; "))
-					user = tree.NewDString(sqlUsername.Normalized())
-					descriptorIDsArr := tree.NewDArray(types.Int)
-					for _, descID := range payload.DescriptorIDs {
-						if err := descriptorIDsArr.Append(tree.NewDInt(tree.DInt(int(descID)))); err != nil {
-							return nil, err
-						}
-					}
-					descriptorIDs = descriptorIDsArr
-					started, err = tsOrNull(payload.StartedMicros)
-					if err != nil {
-						return nil, err
-					}
-					finished, err = tsOrNull(payload.FinishedMicros)
-					if err != nil {
-						return nil, err
-					}
-					errorStr = tree.NewDString(payload.Error)
-				}
-
-				// Extract data from the progress field.
-				if progressBytes != tree.DNull {
-					progress, err := jobs.UnmarshalProgress(progressBytes)
-					if err != nil {
-						baseErr := ""
-						if s, ok := errorStr.(*tree.DString); ok {
-							baseErr = string(*s)
-							if baseErr != "" {
-								baseErr += "\n"
-							}
-						}
-						errorStr = tree.NewDString(fmt.Sprintf("%serror decoding progress: %v", baseErr, err))
-					} else {
-						// Progress contains either fractionCompleted for traditional jobs,
-						// or the highWaterTimestamp for change feeds.
-						if highwater := progress.GetHighWater(); highwater != nil {
-							highWaterTimestamp = eval.TimestampToDecimalDatum(*highwater)
-						} else {
-							fractionCompleted = tree.NewDFloat(tree.DFloat(progress.GetFractionCompleted()))
-						}
-						modified, err = tsOrNull(progress.ModifiedMicros)
-						if err != nil {
-							return nil, err
-						}
-
-						if s, ok := status.(*tree.DString); ok {
-							if jobs.Status(*s) == jobs.StatusRunning && len(progress.RunningStatus) > 0 {
-								runningStatus = tree.NewDString(progress.RunningStatus)
-							} else if jobs.Status(*s) == jobs.StatusPaused && payload != nil && payload.PauseReason != "" {
-								errorStr = tree.NewDString(fmt.Sprintf("%s: %s", jobs.PauseRequestExplained, payload.PauseReason))
-							}
-						}
-						traceID = tree.NewDInt(tree.DInt(progress.TraceID))
-					}
-				}
-				if payload != nil {
-					executionErrors = jobs.FormatRetriableExecutionErrorLogToStringArray(
-						ctx, payload.RetriableExecutionFailureLog,
-					)
-					// It's not clear why we'd ever see an error here,
-					var err error
-					executionEvents, err = jobs.FormatRetriableExecutionErrorLogToJSON(
-						ctx, payload.RetriableExecutionFailureLog,
-					)
-					if err != nil {
-						if errorStr == tree.DNull {
-							errorStr = tree.NewDString(errors.Wrap(err, "failed to marshal execution error log").Error())
-						} else {
-							executionEvents = tree.DNull
-						}
-					}
-				}
-
-				container = container[:0]
-				container = append(container,
-					id,
-					jobType,
-					description,
-					statement,
-					user,
-					descriptorIDs,
-					status,
-					runningStatus,
-					created,
-					started,
-					finished,
-					modified,
-					fractionCompleted,
-					highWaterTimestamp,
-					errorStr,
-					coordinatorID,
-					traceID,
-					lastRun,
-					nextRun,
-					numRuns,
-					executionErrors,
-					executionEvents,
-				)
-				return container, nil
-			}
-		}, cleanup, nil
+	indexes: []virtualIndex{{
+		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
+			q := jobsQuery + jobsStatusFilter
+			targetStatus := tree.MustBeDString(unwrappedConstraint)
+			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetStatus)
+		},
+	}},
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		_, err := makeJobsTableRows(ctx, p, addRow, jobsQuery, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay())
+		return err
 	},
+}
+
+// makeJobsTableRows calls addRow for each job. It returns true if addRow was called
+// successfully at least once.
+func makeJobsTableRows(
+	ctx context.Context,
+	p *planner,
+	addRow func(...tree.Datum) error,
+	query string,
+	params ...interface{},
+) (matched bool, err error) {
+	// Beware: we're querying system.jobs as root; we need to be careful to filter
+	// out results that the current user is not able to see.
+	currentUser := p.SessionData().User()
+	isAdmin, err := p.HasAdminRole(ctx)
+	if err != nil {
+		return matched, err
+	}
+
+	hasControlJob, err := p.HasRoleOption(ctx, roleoption.CONTROLJOB)
+	if err != nil {
+		return matched, err
+	}
+
+	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
+		ctx, "crdb-internal-jobs-table", p.txn,
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		query, params...)
+	if err != nil {
+		return matched, err
+	}
+
+	cleanup := func(ctx context.Context) {
+		if err := it.Close(); err != nil {
+			// TODO(yuzefovich): this error should be propagated further up
+			// and not simply being logged. Fix it (#61123).
+			//
+			// Doing that as a return parameter would require changes to
+			// `planNode.Close` signature which is a bit annoying. One other
+			// possible solution is to panic here and catch the error
+			// somewhere.
+			log.Warningf(ctx, "error closing an iterator: %v", err)
+		}
+	}
+	defer cleanup(ctx)
+
+	sessionJobs := make([]*jobs.Record, 0, len(p.extendedEvalCtx.SchemaChangeJobRecords))
+	uniqueJobs := make(map[*jobs.Record]struct{})
+	for _, job := range p.extendedEvalCtx.SchemaChangeJobRecords {
+		if _, ok := uniqueJobs[job]; ok {
+			continue
+		}
+		sessionJobs = append(sessionJobs, job)
+		uniqueJobs[job] = struct{}{}
+	}
+
+	// Loop while we need to skip a row.
+	for {
+		ok, err := it.Next(ctx)
+		if err != nil {
+			return matched, err
+		}
+		var id, status, created, payloadBytes, progressBytes, sessionIDBytes,
+			instanceID tree.Datum
+		lastRun, nextRun, numRuns := tree.DNull, tree.DNull, tree.DNull
+		if ok {
+			r := it.Cur()
+			id, status, created, payloadBytes, progressBytes, sessionIDBytes, instanceID =
+				r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+			lastRun, numRuns, nextRun = r[7], r[8], r[9]
+		} else if !ok {
+			if len(sessionJobs) == 0 {
+				return matched, nil
+			}
+			job := sessionJobs[len(sessionJobs)-1]
+			sessionJobs = sessionJobs[:len(sessionJobs)-1]
+			// Convert the job into datums, where protobufs will be intentionally,
+			// marshalled.
+			id = tree.NewDInt(tree.DInt(job.JobID))
+			status = tree.NewDString(string(jobs.StatusPending))
+			created = eval.TimestampToInexactDTimestamp(p.txn.ReadTimestamp())
+			progressBytes, payloadBytes, err = getPayloadAndProgressFromJobsRecord(p, job)
+			if err != nil {
+				return matched, err
+			}
+			sessionIDBytes = tree.NewDBytes(tree.DBytes(p.extendedEvalCtx.SessionID.GetBytes()))
+			instanceID = tree.NewDInt(tree.DInt(p.extendedEvalCtx.ExecCfg.JobRegistry.ID()))
+		}
+
+		var jobType, description, statement, user, descriptorIDs, started, runningStatus,
+			finished, modified, fractionCompleted, highWaterTimestamp, errorStr, coordinatorID,
+			traceID, executionErrors, executionEvents = tree.DNull, tree.DNull, tree.DNull,
+			tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
+			tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull
+
+		// Extract data from the payload.
+		payload, err := jobs.UnmarshalPayload(payloadBytes)
+
+		// We filter out masked rows before we allocate all the
+		// datums. Needless allocate when not necessary.
+		ownedByAdmin := false
+		var sqlUsername username.SQLUsername
+		if payload != nil {
+			sqlUsername = payload.UsernameProto.Decode()
+			ownedByAdmin, err = p.UserHasAdminRole(ctx, sqlUsername)
+			if err != nil {
+				errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
+			}
+		}
+		if sessionID, ok := sessionIDBytes.(*tree.DBytes); ok {
+			if isAlive, err := p.EvalContext().SQLLivenessReader.IsAlive(
+				ctx, sqlliveness.SessionID(*sessionID),
+			); err != nil {
+				// Silently swallow the error for checking for liveness.
+			} else if instanceID, ok := instanceID.(*tree.DInt); ok && isAlive {
+				coordinatorID = instanceID
+			}
+		}
+
+		sameUser := payload != nil && sqlUsername == currentUser
+		// The user can access the row if the meet one of the conditions:
+		//  1. The user is an admin.
+		//  2. The job is owned by the user.
+		//  3. The user has CONTROLJOB privilege and the job is not owned by
+		//      an admin.
+		if canAccess := isAdmin || !ownedByAdmin && hasControlJob || sameUser; !canAccess {
+			continue
+		}
+
+		if err != nil {
+			errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
+		} else {
+			jobType = tree.NewDString(payload.Type().String())
+			description = tree.NewDString(payload.Description)
+			statement = tree.NewDString(strings.Join(payload.Statement, "; "))
+			user = tree.NewDString(sqlUsername.Normalized())
+			descriptorIDsArr := tree.NewDArray(types.Int)
+			for _, descID := range payload.DescriptorIDs {
+				if err := descriptorIDsArr.Append(tree.NewDInt(tree.DInt(int(descID)))); err != nil {
+					return matched, err
+				}
+			}
+			descriptorIDs = descriptorIDsArr
+			started, err = tsOrNull(payload.StartedMicros)
+			if err != nil {
+				return matched, err
+			}
+			finished, err = tsOrNull(payload.FinishedMicros)
+			if err != nil {
+				return matched, err
+			}
+			errorStr = tree.NewDString(payload.Error)
+		}
+
+		// Extract data from the progress field.
+		if progressBytes != tree.DNull {
+			progress, err := jobs.UnmarshalProgress(progressBytes)
+			if err != nil {
+				baseErr := ""
+				if s, ok := errorStr.(*tree.DString); ok {
+					baseErr = string(*s)
+					if baseErr != "" {
+						baseErr += "\n"
+					}
+				}
+				errorStr = tree.NewDString(fmt.Sprintf("%serror decoding progress: %v", baseErr, err))
+			} else {
+				// Progress contains either fractionCompleted for traditional jobs,
+				// or the highWaterTimestamp for change feeds.
+				if highwater := progress.GetHighWater(); highwater != nil {
+					highWaterTimestamp = eval.TimestampToDecimalDatum(*highwater)
+				} else {
+					fractionCompleted = tree.NewDFloat(tree.DFloat(progress.GetFractionCompleted()))
+				}
+				modified, err = tsOrNull(progress.ModifiedMicros)
+				if err != nil {
+					return matched, err
+				}
+
+				if s, ok := status.(*tree.DString); ok {
+					if jobs.Status(*s) == jobs.StatusRunning && len(progress.RunningStatus) > 0 {
+						runningStatus = tree.NewDString(progress.RunningStatus)
+					} else if jobs.Status(*s) == jobs.StatusPaused && payload != nil && payload.PauseReason != "" {
+						errorStr = tree.NewDString(fmt.Sprintf("%s: %s", jobs.PauseRequestExplained, payload.PauseReason))
+					}
+				}
+				traceID = tree.NewDInt(tree.DInt(progress.TraceID))
+			}
+		}
+		if payload != nil {
+			executionErrors = jobs.FormatRetriableExecutionErrorLogToStringArray(
+				ctx, payload.RetriableExecutionFailureLog,
+			)
+			// It's not clear why we'd ever see an error here,
+			var err error
+			executionEvents, err = jobs.FormatRetriableExecutionErrorLogToJSON(
+				ctx, payload.RetriableExecutionFailureLog,
+			)
+			if err != nil {
+				if errorStr == tree.DNull {
+					errorStr = tree.NewDString(errors.Wrap(err, "failed to marshal execution error log").Error())
+				} else {
+					executionEvents = tree.DNull
+				}
+			}
+		}
+
+		if err = addRow(
+			id,
+			jobType,
+			description,
+			statement,
+			user,
+			descriptorIDs,
+			status,
+			runningStatus,
+			created,
+			started,
+			finished,
+			modified,
+			fractionCompleted,
+			highWaterTimestamp,
+			errorStr,
+			coordinatorID,
+			traceID,
+			lastRun,
+			nextRun,
+			numRuns,
+			executionErrors,
+			executionEvents,
+		); err != nil {
+			return matched, err
+		}
+		matched = true
+	}
 }
 
 // execStatAvg is a helper for execution stats shown in virtual tables. Returns
@@ -5327,16 +5435,14 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 		INTEGER NOT NULL
 );`,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		maxDescIDKeyVal, err := p.execCfg.DB.Get(context.Background(), p.extendedEvalCtx.Codec.DescIDSequenceKey())
-		if err != nil {
-			return err
-		}
-		descIDCounter, err := maxDescIDKeyVal.Value.GetInt()
-		if err != nil {
-			return err
-		}
 		minID := descpb.ID(keys.MaxReservedDescID + 1)
-		maxID := descpb.ID(descIDCounter)
+		maxID, err := p.ExecCfg().DescIDGenerator.PeekNextUniqueDescID(ctx)
+		if err != nil {
+			return err
+		}
+		if err != nil {
+			return err
+		}
 		if minID >= maxID {
 			return nil
 		}
@@ -6476,6 +6582,7 @@ CREATE TABLE crdb_internal.%s (
 	last_retry_reason          STRING,
 	exec_node_ids              INT[] NOT NULL,
 	contention                 INTERVAL,
+	contention_events          JSONB,
 	index_recommendations      STRING[] NOT NULL,
 	implicit_txn               BOOL NOT NULL
 )`
@@ -6516,33 +6623,32 @@ func populateExecutionInsights(
 
 	response, err := p.extendedEvalCtx.SQLStatusServer.ListExecutionInsights(ctx, request)
 	if err != nil {
-		return
+		return err
 	}
 	for _, insight := range response.Insights {
 		causes := tree.NewDArray(types.String)
 		for _, cause := range insight.Causes {
-			if errProblem := causes.Append(tree.NewDString(cause.String())); err != nil {
-				err = errors.CombineErrors(err, errProblem)
+			if err = causes.Append(tree.NewDString(cause.String())); err != nil {
+				return err
 			}
 		}
 
-		startTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.StartTime, time.Nanosecond)
-		if errTimestamp != nil {
-			err = errors.CombineErrors(err, errTimestamp)
-			return
+		var startTimestamp *tree.DTimestamp
+		startTimestamp, err = tree.MakeDTimestamp(insight.Statement.StartTime, time.Nanosecond)
+		if err != nil {
+			return err
 		}
 
-		endTimestamp, errTimestamp := tree.MakeDTimestamp(insight.Statement.EndTime, time.Nanosecond)
-		if errTimestamp != nil {
-			err = errors.CombineErrors(err, errTimestamp)
-			return
+		var endTimestamp *tree.DTimestamp
+		endTimestamp, err = tree.MakeDTimestamp(insight.Statement.EndTime, time.Nanosecond)
+		if err != nil {
+			return err
 		}
 
 		execNodeIDs := tree.NewDArray(types.Int)
 		for _, nodeID := range insight.Statement.Nodes {
-			if errNodeID := execNodeIDs.Append(tree.NewDInt(tree.DInt(nodeID))); errNodeID != nil {
-				err = errors.CombineErrors(err, errNodeID)
-				return
+			if err = execNodeIDs.Append(tree.NewDInt(tree.DInt(nodeID))); err != nil {
+				return err
 			}
 		}
 
@@ -6559,9 +6665,20 @@ func populateExecutionInsights(
 			)
 		}
 
+		contentionEvents := tree.DNull
+		if len(insight.Statement.ContentionEvents) > 0 {
+			var contentionEventsJSON json.JSON
+			contentionEventsJSON, err = sqlstatsutil.BuildContentionEventsJSON(insight.Statement.ContentionEvents)
+			if err != nil {
+				return err
+			}
+
+			contentionEvents = tree.NewDJSON(contentionEventsJSON)
+		}
+
 		indexRecommendations := tree.NewDArray(types.String)
 		for _, recommendation := range insight.Statement.IndexRecommendations {
-			if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
+			if err = indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
 				return err
 			}
 		}
@@ -6590,9 +6707,14 @@ func populateExecutionInsights(
 			autoRetryReason,
 			execNodeIDs,
 			contentionTime,
+			contentionEvents,
 			indexRecommendations,
 			tree.MakeDBool(tree.DBool(insight.Transaction.ImplicitTxn)),
 		))
+
+		if err != nil {
+			return err
+		}
 	}
 	return
 }

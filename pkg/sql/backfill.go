@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/oppurpose"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -1089,7 +1090,6 @@ func (sc *SchemaChanger) distIndexBackfill(
 		sc.clock,
 		evalCtx.Tracing,
 		sc.execCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -1335,7 +1335,6 @@ func (sc *SchemaChanger) distColumnBackfill(
 				sc.clock,
 				evalCtx.Tracing,
 				sc.execCfg.ContentionRegistry,
-				nil, /* testingPushCallback */
 			)
 			defer recv.Release()
 
@@ -1697,7 +1696,7 @@ func ValidateInvertedIndexes(
 			span := tableDesc.IndexSpan(codec, idx.GetID())
 			key := span.Key
 			endKey := span.EndKey
-			if err = runHistoricalTxn.Exec(ctx, func(
+			if err := runHistoricalTxn.Exec(ctx, func(
 				ctx context.Context, txn *kv.Txn, _ sqlutil.InternalExecutor, _ *descs.Collection,
 			) error {
 				for {
@@ -2266,7 +2265,7 @@ func (sc *SchemaChanger) backfillIndexes(
 	if sc.execCfg.Codec.ForSystemTenant() {
 		expirationTime := sc.db.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
 		for _, span := range addingSpans {
-			if err := sc.db.AdminSplit(ctx, span.Key, expirationTime); err != nil {
+			if err := sc.db.AdminSplit(ctx, span.Key, expirationTime, oppurpose.SplitImport); err != nil {
 				return err
 			}
 		}

@@ -122,6 +122,12 @@ type PointSynthesizingIter struct {
 	// It is reset to false on every call to updateRangeKeys(), and accumulates
 	// changes during intermediate positioning operations.
 	rangeKeyChanged bool
+
+	// seekKeyBuf is used to clone seek keys.
+	seekKeyBuf roachpb.Key
+
+	// rawKeyBuf is used by UnsafeRaw(MVCC)Key.
+	rawKeyBuf []byte
 }
 
 var _ MVCCIterator = (*PointSynthesizingIter)(nil)
@@ -137,19 +143,71 @@ func NewPointSynthesizingIter(parent MVCCIterator) *PointSynthesizingIter {
 		rangeKeysBuf:   iter.rangeKeysBuf,
 		rangeKeysPos:   iter.rangeKeysPos,
 		rangeKeysStart: iter.rangeKeysStart,
+		seekKeyBuf:     iter.seekKeyBuf,
+		rawKeyBuf:      iter.rawKeyBuf,
 	}
 	return iter
 }
 
 // NewPointSynthesizingIterAtParent creates a new pointSynthesizingIter and
 // loads the position from the parent iterator.
-func NewPointSynthesizingIterAtParent(parent MVCCIterator) *PointSynthesizingIter {
+//
+// If reverse is true, the point synthesizing iterator will reposition on
+// a synthetic point tombstone after the current position if appropriate.
+// Consider the following dataset:
+//
+//	2    a2  b2
+//	1    [---)
+//	     a   b
+//
+// If the caller was positioned on b@2, then called Prev() and landed on a@2,
+// where it detected the [a-b)@2 range key and enabled point synthesis, it would
+// appear to have skipped over the synthetic point tombstone at a@1. Setting
+// reverse=true in this case will position the iterator on the synthetic point
+// tombstone a@1.
+//
+// However, the above assumes that the previous positioning operation was from a
+// different key -- if it was e.g. a SeekLT(a@1) then this repositioning will be
+// incorrect. The caller must take care to use reverse only when appropriate.
+func NewPointSynthesizingIterAtParent(
+	parent MVCCIterator, reverse bool,
+) (*PointSynthesizingIter, error) {
 	iter := NewPointSynthesizingIter(parent)
 	iter.rangeKeyChanged = true // force range key detection
-	if ok, err := iter.updateIter(); ok && err == nil {
-		iter.updateSeekGEPosition(parent.UnsafeKey())
+	if ok, _ := iter.updateIter(); ok {
+		// updateSeekGEPosition may step parent and then compare against seekKey, so
+		// we need to clone it.
+		seekKey := parent.UnsafeKey()
+		iter.seekKeyBuf = append(iter.seekKeyBuf[:0], seekKey.Key...)
+		seekKey.Key = iter.seekKeyBuf
+		iter.updateSeekGEPosition(seekKey)
+		if err := iter.iterErr; err != nil {
+			iter.release()
+			return nil, err
+		}
+
+		// If we're on the start key of a range key in the reverse direction, we
+		// must take care not to skip any synthetic point tombstones that the caller
+		// would have expected to be emitted. This essentially means switching the
+		// iterator to reverse iteration and repositioning on the oldest version
+		// (real or synthetic).
+		if reverse && len(iter.rangeKeys) > 0 && iter.rangeKeysPos.Equal(iter.rangeKeysStart) {
+			if !iter.atPoint {
+				if _, err := iter.iterPrev(); err != nil {
+					iter.release()
+					return nil, err
+				}
+			}
+			iter.reverse = true
+			iter.rangeKeysIdx = iter.rangeKeysEnd - 1
+			iter.updateAtPoint()
+		}
 	}
-	return iter
+	if err := iter.iterErr; err != nil {
+		iter.release()
+		return nil, err
+	}
+	return iter, nil
 }
 
 // Close implements MVCCIterator.
@@ -168,6 +226,8 @@ func (i *PointSynthesizingIter) release() {
 		rangeKeysBuf:   i.rangeKeysBuf[:0],
 		rangeKeysPos:   i.rangeKeysPos[:0],
 		rangeKeysStart: i.rangeKeysStart[:0],
+		seekKeyBuf:     i.seekKeyBuf[:0],
+		rawKeyBuf:      i.rawKeyBuf[:0],
 	}
 	pointSynthesizingIterPool.Put(i)
 }
@@ -350,6 +410,12 @@ func (i *PointSynthesizingIter) clearRangeKeys() {
 
 // SeekGE implements MVCCIterator.
 func (i *PointSynthesizingIter) SeekGE(seekKey MVCCKey) {
+	// The seek key may originate from UnsafeKey (see pebbleMVCCScanner), in which
+	// case it would be invalidated when we seek the parent iter below, so we have
+	// to clone it. We could be clever and try to detect if the backing array is
+	// the same as i.iterKey, but let's be obviously correct instead.
+	i.seekKeyBuf = append(i.seekKeyBuf[:0], seekKey.Key...)
+	seekKey.Key = i.seekKeyBuf
 	i.reverse = false
 	i.iter.SeekGE(seekKey)
 	if ok, _ := i.updateIter(); !ok {
@@ -361,6 +427,8 @@ func (i *PointSynthesizingIter) SeekGE(seekKey MVCCKey) {
 
 // SeekIntentGE implements MVCCIterator.
 func (i *PointSynthesizingIter) SeekIntentGE(seekKey roachpb.Key, txnUUID uuid.UUID) {
+	i.seekKeyBuf = append(i.seekKeyBuf[:0], seekKey...)
+	seekKey = i.seekKeyBuf
 	i.reverse = false
 	i.iter.SeekIntentGE(seekKey, txnUUID)
 	if ok, _ := i.updateIter(); !ok {
@@ -482,6 +550,8 @@ func (i *PointSynthesizingIter) NextKey() {
 
 // SeekLT implements MVCCIterator.
 func (i *PointSynthesizingIter) SeekLT(seekKey MVCCKey) {
+	i.seekKeyBuf = append(i.seekKeyBuf[:0], seekKey.Key...)
+	seekKey.Key = i.seekKeyBuf
 	i.reverse = true
 	i.iter.SeekLT(seekKey)
 	if ok, _ := i.updateIter(); !ok {
@@ -613,7 +683,8 @@ func (i *PointSynthesizingIter) UnsafeRawKey() []byte {
 	if i.atPoint {
 		return i.iter.UnsafeRawKey()
 	}
-	return EncodeMVCCKey(i.UnsafeKey())
+	i.rawKeyBuf = EncodeMVCCKeyToBuf(i.rawKeyBuf[:0], i.UnsafeKey())
+	return i.rawKeyBuf
 }
 
 // UnsafeRawMVCCKey implements MVCCIterator.
@@ -621,7 +692,8 @@ func (i *PointSynthesizingIter) UnsafeRawMVCCKey() []byte {
 	if i.atPoint {
 		return i.iter.UnsafeRawMVCCKey()
 	}
-	return EncodeMVCCKey(i.UnsafeKey())
+	i.rawKeyBuf = EncodeMVCCKeyToBuf(i.rawKeyBuf[:0], i.UnsafeKey())
+	return i.rawKeyBuf
 }
 
 // Value implements MVCCIterator.

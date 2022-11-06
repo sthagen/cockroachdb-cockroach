@@ -179,12 +179,17 @@ ElementState:
     - 5
     constraintId: 2
     expr: s::STRING = name
+    fromHashShardedColumn: false
     referencedColumnIds:
     - 3
     - 5
     tableId: 108
     usesSequenceIds: []
     usesTypeIds: []
+  Status: PUBLIC
+- TableData:
+    databaseId: 100
+    tableId: 108
   Status: PUBLIC
 - ColumnName:
     columnId: 1
@@ -497,6 +502,14 @@ ElementState:
     indexId: 1
     kind: STORED
     ordinalInKind: 2
+    tableId: 108
+  Status: PUBLIC
+- IndexData:
+    indexId: 1
+    tableId: 108
+  Status: PUBLIC
+- IndexData:
+    indexId: 2
     tableId: 108
   Status: PUBLIC
 - ConstraintName:

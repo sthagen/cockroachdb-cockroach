@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -39,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -1006,7 +1008,10 @@ func (s *Server) newConnExecutor(
 		portals:   make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceMemAcc = ex.sessionMon.MakeBoundAccount()
-	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(sdMutIterator.sds), ex.sessionMon)
+	dsdp := catsessiondata.NewDescriptorSessionDataStackProvider(sdMutIterator.sds)
+	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.NewCollection(
+		ctx, descs.WithDescriptorSessionDataProvider(dsdp), descs.WithMonitor(ex.sessionMon),
+	)
 	ex.extraTxnState.jobs = new(jobsCollection)
 	ex.extraTxnState.txnRewindPos = -1
 	ex.extraTxnState.schemaChangeJobRecords = make(map[descpb.ID]*jobs.Record)
@@ -2590,6 +2595,7 @@ func errIsRetriable(err error) bool {
 	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) ||
 		scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID ||
 		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
+		errors.Is(err, descidgen.ErrDescIDSequenceMigrationInProgress) ||
 		descs.IsTwoVersionInvariantViolationError(err)
 }
 
@@ -2927,6 +2933,13 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 				return advanceInfo{}, err
 			}
 		}
+		// Similarly, if the descriptor ID generator is not available because of
+		// an ongoing migration, wait for the migration to complete first.
+		if errors.Is(p.errorCause(), descidgen.ErrDescIDSequenceMigrationInProgress) {
+			if err := ex.handleWaitingForDescriptorIDGeneratorMigration(ex.Ctx()); err != nil {
+				return advanceInfo{}, err
+			}
+		}
 	}
 
 	// Handle transaction events which cause updates to txnState.
@@ -3057,6 +3070,13 @@ func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
 	return ex.resetTransactionOnSchemaChangeRetry(ctx)
 }
 
+func (ex *connExecutor) handleWaitingForDescriptorIDGeneratorMigration(ctx context.Context) error {
+	if err := ex.planner.waitForDescriptorIDGeneratorMigration(ctx); err != nil {
+		return err
+	}
+	return ex.resetTransactionOnSchemaChangeRetry(ctx)
+}
+
 // initStatementResult initializes res according to a query.
 //
 // cols represents the columns of the result rows. Should be nil if
@@ -3177,7 +3197,22 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		if query.hidden {
 			continue
 		}
-		sqlNoConstants := truncateSQL(formatStatementHideConstants(query.stmt.AST))
+		// Note: while it may seem tempting to just use query.stmt.AST instead of
+		// re-parsing the original SQL, it's unfortunately NOT SAFE to do so because
+		// the AST is currently not immutable - doing so will produce data races.
+		// See issue https://github.com/cockroachdb/cockroach/issues/90965 for the
+		// last time this was hit.
+		// This can go away if we resolve https://github.com/cockroachdb/cockroach/issues/22847.
+		parsed, err := parser.ParseOne(query.stmt.SQL)
+		if err != nil {
+			// This shouldn't happen, but might as well not completely give up if we
+			// fail to parse a parseable sql for some reason. We unfortunately can't
+			// just log the SQL either as it could contain sensitive information.
+			log.Warningf(ex.Ctx(), "failed to re-parse sql during session "+
+				"serialization")
+			continue
+		}
+		sqlNoConstants := truncateSQL(formatStatementHideConstants(parsed.AST))
 		nPlaceholders := 0
 		if query.placeholders != nil {
 			nPlaceholders = len(query.placeholders.Values)
@@ -3196,7 +3231,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			ElapsedTime:    timeNow.Sub(queryStart),
 			Sql:            sql,
 			SqlNoConstants: sqlNoConstants,
-			SqlSummary:     formatStatementSummary(query.stmt.AST),
+			SqlSummary:     formatStatementSummary(parsed.AST),
 			Placeholders:   placeholders,
 			IsDistributed:  query.isDistributed,
 			Phase:          (serverpb.ActiveQuery_Phase)(query.phase),
@@ -3332,7 +3367,9 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 func (ex *connExecutor) getDescIDGenerator() eval.DescIDGenerator {
 	if ex.server.cfg.TestingKnobs.UseTransactionalDescIDGenerator &&
 		ex.state.mu.txn != nil {
-		return descidgen.NewTransactionalGenerator(ex.server.cfg.Codec, ex.state.mu.txn)
+		return descidgen.NewTransactionalGenerator(
+			ex.server.cfg.Settings, ex.server.cfg.Codec, ex.state.mu.txn,
+		)
 	}
 	return ex.server.cfg.DescIDGenerator
 }

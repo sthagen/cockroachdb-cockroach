@@ -21,7 +21,47 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/vfs"
 )
+
+// NewSSTIterator returns an MVCCIterator for the provided "levels" of
+// SST files. The SSTs are merged during iteration. Each subslice's sstables
+// must have non-overlapping point keys, and be ordered by point key in
+// ascending order. Range keys may overlap arbitrarily, including within a
+// subarray. The outer slice of levels must be sorted in reverse chronological
+// order: a key in a file in a level at a lower index will shadow the same key
+// contained within a file in a level at a higher index.
+//
+// If the iterator is only going to be used for forward iteration, the caller
+// may pass forwardOnly=true for better performance.
+func NewSSTIterator(
+	files [][]sstable.ReadableFile, opts IterOptions, forwardOnly bool,
+) (MVCCIterator, error) {
+	return newPebbleSSTIterator(files, opts, forwardOnly)
+}
+
+// NewMemSSTIterator returns an MVCCIterator for the provided SST data,
+// similarly to NewSSTIterator().
+func NewMemSSTIterator(sst []byte, verify bool, opts IterOptions) (MVCCIterator, error) {
+	return NewMultiMemSSTIterator([][]byte{sst}, verify, opts)
+}
+
+// NewMultiMemSSTIterator returns an MVCCIterator for the provided SST data,
+// similarly to NewSSTIterator().
+func NewMultiMemSSTIterator(ssts [][]byte, verify bool, opts IterOptions) (MVCCIterator, error) {
+	files := make([]sstable.ReadableFile, 0, len(ssts))
+	for _, sst := range ssts {
+		files = append(files, vfs.NewMemFile(sst))
+	}
+	iter, err := NewSSTIterator([][]sstable.ReadableFile{files}, opts, false /* forwardOnly */)
+	if err != nil {
+		return nil, err
+	}
+	if verify {
+		iter = newVerifyingMVCCIterator(iter.(*pebbleIterator))
+	}
+	return iter, nil
+}
 
 // CheckSSTConflicts iterates over an SST and a Reader in lockstep and errors
 // out if it finds any conflicts. This includes intents and existing keys with a
@@ -182,10 +222,7 @@ func CheckSSTConflicts(
 		if !sstKey.IsValue() {
 			return errors.New("SST keys must have timestamps")
 		}
-		sstValue, ok, err := tryDecodeSimpleMVCCValue(sstValueRaw)
-		if !ok && err == nil {
-			sstValue, err = decodeExtendedMVCCValue(sstValueRaw)
-		}
+		sstValueIsTombstone, err := EncodedMVCCValueIsTombstone(sstValueRaw)
 		if err != nil {
 			return err
 		}
@@ -211,10 +248,7 @@ func CheckSSTConflicts(
 				return nil
 			}
 		}
-		extValue, ok, err := tryDecodeSimpleMVCCValue(extValueRaw)
-		if !ok && err == nil {
-			extValue, err = decodeExtendedMVCCValue(extValueRaw)
-		}
+		extValueIsTombstone, err := EncodedMVCCValueIsTombstone(extValueRaw)
 		if err != nil {
 			return err
 		}
@@ -240,7 +274,7 @@ func CheckSSTConflicts(
 			// that exists in the SST stats.
 			statsDiff.AgeTo(extKey.Timestamp.WallTime)
 			// Update the skipped stats to account for the skipped meta key.
-			if !sstValue.IsTombstone() {
+			if !sstValueIsTombstone {
 				statsDiff.LiveBytes -= totalBytes
 				statsDiff.LiveCount--
 			}
@@ -250,7 +284,7 @@ func CheckSSTConflicts(
 
 			// Update the stats to account for the skipped versioned key/value.
 			totalBytes = int64(len(sstValueRaw)) + MVCCVersionTimestampSize
-			if !sstValue.IsTombstone() {
+			if !sstValueIsTombstone {
 				statsDiff.LiveBytes -= totalBytes
 			}
 			statsDiff.KeyBytes -= MVCCVersionTimestampSize
@@ -265,7 +299,7 @@ func CheckSSTConflicts(
 		// a WriteTooOldError -- that error implies that the client should
 		// retry at a higher timestamp, but we already know that such a retry
 		// would fail (because it will shadow an existing key).
-		if !extValue.IsTombstone() && (!disallowShadowingBelow.IsEmpty() || disallowShadowing) {
+		if !extValueIsTombstone && (!disallowShadowingBelow.IsEmpty() || disallowShadowing) {
 			allowShadow := !disallowShadowingBelow.IsEmpty() &&
 				disallowShadowingBelow.LessEq(extKey.Timestamp) && bytes.Equal(extValueRaw, sstValueRaw)
 			if !allowShadow {
@@ -286,14 +320,14 @@ func CheckSSTConflicts(
 
 		// If we are shadowing an existing key, we must update the stats accordingly
 		// to take into account the existing KV pair.
-		if extValue.IsTombstone() {
+		if extValueIsTombstone {
 			statsDiff.AgeTo(extKey.Timestamp.WallTime)
 		} else {
 			statsDiff.AgeTo(sstKey.Timestamp.WallTime)
 		}
 		statsDiff.KeyCount--
 		statsDiff.KeyBytes -= int64(len(extKey.Key) + 1)
-		if !extValue.IsTombstone() {
+		if !extValueIsTombstone {
 			statsDiff.LiveCount--
 			statsDiff.LiveBytes -= int64(len(extKey.Key) + 1)
 			statsDiff.LiveBytes -= int64(len(extValueRaw)) + MVCCVersionTimestampSize

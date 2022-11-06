@@ -100,9 +100,9 @@ type Txn struct {
 // Note: for KV usage that should be subject to admission control, prefer
 // NewTxnRootKV() below.
 //
-// If the transaction is used to send any operations, CommitOrCleanup() or
-// CleanupOnError() should eventually be called to commit/rollback the
-// transaction (including stopping the heartbeat loop).
+// If the transaction is used to send any operations, Commit() or Rollback()
+// should eventually be called to commit/rollback the transaction (including
+// stopping the heartbeat loop).
 //
 // gatewayNodeID: If != 0, this is the ID of the node on whose behalf this
 //
@@ -679,7 +679,7 @@ func (txn *Txn) commit(ctx context.Context) error {
 	// will be subject to admission control, and the zero CreateTime will give
 	// it preference within the tenant.
 	et := endTxnReq(true, txn.deadline())
-	ba := roachpb.BatchRequest{Requests: et.unionArr[:]}
+	ba := &roachpb.BatchRequest{Requests: et.unionArr[:]}
 	_, pErr := txn.Send(ctx, ba)
 	if pErr == nil {
 		for _, t := range txn.commitTriggers {
@@ -689,27 +689,7 @@ func (txn *Txn) commit(ctx context.Context) error {
 	return pErr.GoError()
 }
 
-// CleanupOnError cleans up the transaction as a result of an error.
-func (txn *Txn) CleanupOnError(ctx context.Context, err error) {
-	if txn.typ != RootTxn {
-		panic(errors.WithContextTags(errors.AssertionFailedf("CleanupOnError() called on leaf txn"), ctx))
-	}
-
-	if err == nil {
-		panic(errors.WithContextTags(errors.AssertionFailedf("CleanupOnError() called with nil error"), ctx))
-	}
-	if replyErr := txn.rollback(ctx); replyErr != nil {
-		if _, ok := replyErr.GetDetail().(*roachpb.TransactionStatusError); ok || txn.IsAborted() {
-			log.Eventf(ctx, "failure aborting transaction: %s; abort caused by: %s", replyErr, err)
-		} else {
-			log.Warningf(ctx, "failure aborting transaction: %s; abort caused by: %s", replyErr, err)
-		}
-	}
-}
-
-// Commit is the same as CommitOrCleanup but will not attempt to clean
-// up on failure. This can be used when the caller is prepared to do proper
-// cleanup.
+// Commit sends an EndTxnRequest with Commit=true.
 func (txn *Txn) Commit(ctx context.Context) error {
 	if txn.typ != RootTxn {
 		return errors.WithContextTags(errors.AssertionFailedf("Commit() called on leaf txn"), ctx)
@@ -739,21 +719,6 @@ func (txn *Txn) CommitInBatch(ctx context.Context, b *Batch) error {
 	b.reqs[len(b.reqs)-1].Value = &et.union
 	b.initResult(1 /* calls */, 0, b.raw, nil)
 	return txn.Run(ctx, b)
-}
-
-// CommitOrCleanup sends an EndTxnRequest with Commit=true.
-// If that fails, an attempt to rollback is made.
-// txn should not be used to send any more commands after this call.
-func (txn *Txn) CommitOrCleanup(ctx context.Context) error {
-	if txn.typ != RootTxn {
-		return errors.WithContextTags(errors.AssertionFailedf("CommitOrCleanup() called on leaf txn"), ctx)
-	}
-
-	err := txn.commit(ctx)
-	if err != nil {
-		txn.CleanupOnError(ctx, err)
-	}
-	return err
 }
 
 // UpdateDeadline sets the transactions deadline to the passed deadline.
@@ -853,7 +818,7 @@ func (txn *Txn) rollback(ctx context.Context) *roachpb.Error {
 		// settings, it will be subject to admission control, and the zero
 		// CreateTime will give it preference within the tenant.
 		et := endTxnReq(false, hlc.Timestamp{} /* deadline */)
-		ba := roachpb.BatchRequest{Requests: et.unionArr[:]}
+		ba := &roachpb.BatchRequest{Requests: et.unionArr[:]}
 		_, pErr := txn.Send(ctx, ba)
 		if pErr == nil {
 			return nil
@@ -879,7 +844,7 @@ func (txn *Txn) rollback(ctx context.Context) *roachpb.Error {
 		// settings, it will be subject to admission control, and the zero
 		// CreateTime will give it preference within the tenant.
 		et := endTxnReq(false, hlc.Timestamp{} /* deadline */)
-		ba := roachpb.BatchRequest{Requests: et.unionArr[:]}
+		ba := &roachpb.BatchRequest{Requests: et.unionArr[:]}
 		_ = contextutil.RunWithTimeout(ctx, "async txn rollback", asyncRollbackTimeout,
 			func(ctx context.Context) error {
 				if _, pErr := txn.Send(ctx, ba); pErr != nil {
@@ -1060,7 +1025,7 @@ func (txn *Txn) IsRetryableErrMeantForTxn(
 // commit or clean-up explicitly even when that may not be required
 // (or even erroneous). Returns (nil, nil) for an empty batch.
 func (txn *Txn) Send(
-	ctx context.Context, ba roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	// Fill in the GatewayNodeID on the batch if the txn knows it.
 	// NOTE(andrei): It seems a bit ugly that we're filling in the batches here as
@@ -1152,7 +1117,7 @@ func (txn *Txn) handleRetryableErrLocked(
 // and perform the read. Callers can use this flexibility to trade off increased
 // staleness for reduced latency.
 func (txn *Txn) NegotiateAndSend(
-	ctx context.Context, ba roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	if err := txn.checkNegotiateAndSendPreconditions(ctx, ba); err != nil {
 		return nil, roachpb.NewError(err)
@@ -1215,7 +1180,7 @@ func (txn *Txn) NegotiateAndSend(
 
 // checks preconditions on BatchRequest and Txn for NegotiateAndSend.
 func (txn *Txn) checkNegotiateAndSendPreconditions(
-	ctx context.Context, ba roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) (err error) {
 	assert := func(b bool, s string) {
 		if !b {

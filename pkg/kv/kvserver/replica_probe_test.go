@@ -62,7 +62,7 @@ func TestReplicaProbeRequest(t *testing.T) {
 		// We set an ApplyFilter even though the probe should never
 		// show up there (since it always catches a forced error),
 		// precisely to ensure that it doesn't.
-		TestingApplyFilter: filter,
+		TestingApplyCalledTwiceFilter: filter,
 		// This is the main workhorse that counts probes and injects
 		// errors.
 		TestingApplyForcedErrFilter: filter,
@@ -125,7 +125,7 @@ func TestReplicaProbeRequest(t *testing.T) {
 	for _, srv := range tc.Servers {
 		repl, _, err := srv.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
 		require.NoError(t, err)
-		var ba roachpb.BatchRequest
+		ba := &roachpb.BatchRequest{}
 		ba.Add(probeReq)
 		ba.Timestamp = srv.Clock().Now()
 		_, pErr := repl.Send(ctx, ba)
@@ -143,7 +143,7 @@ func TestReplicaProbeRequest(t *testing.T) {
 	for _, srv := range tc.Servers {
 		repl, _, err := srv.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
 		require.NoError(t, err)
-		var ba roachpb.BatchRequest
+		ba := &roachpb.BatchRequest{}
 		ba.Timestamp = srv.Clock().Now()
 		ba.Add(probeReq)
 		_, pErr := repl.Send(ctx, ba)

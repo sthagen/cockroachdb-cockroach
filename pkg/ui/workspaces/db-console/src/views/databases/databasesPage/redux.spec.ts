@@ -104,6 +104,7 @@ describe("Databases Page", function () {
     driver.assertProperties({
       loading: false,
       loaded: false,
+      lastError: undefined,
       databases: [],
       sortSetting: { ascending: true, columnTitle: "name" },
       automaticStatsCollectionEnabled: true,
@@ -112,9 +113,7 @@ describe("Databases Page", function () {
   });
 
   it("makes a row for each database", async function () {
-    fakeApi.stubDatabases({
-      databases: ["system", "test"],
-    });
+    fakeApi.stubDatabases(["system", "test"]);
     fakeApi.stubClusterSettings({
       key_values: {
         "sql.stats.automatic_collection.enabled": { value: "true" },
@@ -127,10 +126,12 @@ describe("Databases Page", function () {
     driver.assertProperties({
       loading: false,
       loaded: true,
+      lastError: null,
       databases: [
         {
           loading: false,
           loaded: false,
+          lastError: undefined,
           name: "system",
           sizeInBytes: 0,
           tableCount: 0,
@@ -142,6 +143,7 @@ describe("Databases Page", function () {
         {
           loading: false,
           loaded: false,
+          lastError: undefined,
           name: "test",
           sizeInBytes: 0,
           tableCount: 0,
@@ -158,9 +160,7 @@ describe("Databases Page", function () {
   });
 
   it("fills in database details", async function () {
-    fakeApi.stubDatabases({
-      databases: ["system", "test"],
-    });
+    fakeApi.stubDatabases(["system", "test"]);
 
     fakeApi.stubDatabaseDetails("system", {
       table_names: ["foo", "bar"],
@@ -187,6 +187,7 @@ describe("Databases Page", function () {
     driver.assertDatabaseProperties("system", {
       loading: false,
       loaded: true,
+      lastError: null,
       name: "system",
       sizeInBytes: 7168,
       tableCount: 2,
@@ -199,6 +200,7 @@ describe("Databases Page", function () {
     driver.assertDatabaseProperties("test", {
       loading: false,
       loaded: true,
+      lastError: null,
       name: "test",
       sizeInBytes: 1234,
       tableCount: 1,
@@ -212,9 +214,7 @@ describe("Databases Page", function () {
   describe("fallback cases", function () {
     describe("missing tables", function () {
       it("exposes them so the component can refresh them", async function () {
-        fakeApi.stubDatabases({
-          databases: ["system"],
-        });
+        fakeApi.stubDatabases(["system"]);
 
         fakeApi.stubDatabaseDetails("system", {
           table_names: ["foo", "bar"],
@@ -231,6 +231,7 @@ describe("Databases Page", function () {
         driver.assertDatabaseProperties("system", {
           loading: false,
           loaded: true,
+          lastError: null,
           name: "system",
           sizeInBytes: 7168,
           tableCount: 2,
@@ -242,9 +243,7 @@ describe("Databases Page", function () {
       });
 
       it("merges available individual stats into the totals", async function () {
-        fakeApi.stubDatabases({
-          databases: ["system"],
-        });
+        fakeApi.stubDatabases(["system"]);
 
         fakeApi.stubDatabaseDetails("system", {
           table_names: ["foo", "bar"],
@@ -267,6 +266,7 @@ describe("Databases Page", function () {
         driver.assertDatabaseProperties("system", {
           loading: false,
           loaded: true,
+          lastError: null,
           name: "system",
           sizeInBytes: 8192,
           tableCount: 2,
@@ -280,9 +280,7 @@ describe("Databases Page", function () {
 
     describe("missing stats", function () {
       it("builds a list of missing tables", async function () {
-        fakeApi.stubDatabases({
-          databases: ["system"],
-        });
+        fakeApi.stubDatabases(["system"]);
 
         fakeApi.stubDatabaseDetails("system", {
           table_names: ["foo", "bar"],
@@ -294,6 +292,7 @@ describe("Databases Page", function () {
         driver.assertDatabaseProperties("system", {
           loading: false,
           loaded: true,
+          lastError: null,
           name: "system",
           sizeInBytes: 0,
           tableCount: 2,
@@ -308,9 +307,7 @@ describe("Databases Page", function () {
       });
 
       it("merges individual stats into the totals", async function () {
-        fakeApi.stubDatabases({
-          databases: ["system"],
-        });
+        fakeApi.stubDatabases(["system"]);
 
         fakeApi.stubDatabaseDetails("system", {
           table_names: ["foo", "bar"],
@@ -333,6 +330,7 @@ describe("Databases Page", function () {
         driver.assertDatabaseProperties("system", {
           loading: false,
           loaded: true,
+          lastError: null,
           name: "system",
           sizeInBytes: 7168,
           tableCount: 2,
@@ -347,6 +345,7 @@ describe("Databases Page", function () {
         driver.assertDatabaseProperties("system", {
           loading: false,
           loaded: true,
+          lastError: null,
           name: "system",
           sizeInBytes: 8192,
           tableCount: 2,

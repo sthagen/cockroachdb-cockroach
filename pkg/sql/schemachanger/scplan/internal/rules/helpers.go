@@ -255,7 +255,7 @@ func isSubjectTo2VersionInvariant(e scpb.Element) bool {
 	// TODO(ajwerner): This should include constraints and enum values but it
 	// currently does not because we do not support dropping them unless we're
 	// dropping the descriptor and we do not support adding them.
-	return isIndex(e) || isColumn(e)
+	return isIndex(e) || isColumn(e) || isSupportedNonIndexBackedConstraint(e)
 }
 
 func isIndex(e scpb.Element) bool {
@@ -267,15 +267,12 @@ func isIndex(e scpb.Element) bool {
 }
 
 func isColumn(e scpb.Element) bool {
-	switch e.(type) {
-	case *scpb.Column:
-		return true
-	}
-	return false
+	_, ok := e.(*scpb.Column)
+	return ok
 }
 
 func isSimpleDependent(e scpb.Element) bool {
-	return !IsDescriptor(e) && !isSubjectTo2VersionInvariant(e)
+	return !IsDescriptor(e) && !isSubjectTo2VersionInvariant(e) && !isData(e)
 }
 
 func getTypeT(element scpb.Element) (*scpb.TypeT, error) {
@@ -372,6 +369,15 @@ func isIndexDependent(e scpb.Element) bool {
 	return false
 }
 
+// A non-index-backed constraint is one of {Check, FK, UniqueWithoutIndex}. We only
+// support Check for now.
+// TODO (xiang): Expand this predicate to include other non-index-backed constraints
+// when we properly support adding/dropping them in the new schema changer.
+func isSupportedNonIndexBackedConstraint(e scpb.Element) bool {
+	_, ok := e.(*scpb.CheckConstraint)
+	return ok
+}
+
 func isConstraint(e scpb.Element) bool {
 	switch e.(type) {
 	case *scpb.PrimaryIndex, *scpb.SecondaryIndex, *scpb.TemporaryIndex:
@@ -392,6 +398,18 @@ func isConstraintDependent(e scpb.Element) bool {
 	return false
 }
 
+func isData(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.DatabaseData:
+		return true
+	case *scpb.TableData:
+		return true
+	case *scpb.IndexData:
+		return true
+	}
+	return false
+}
+
 type elementTypePredicate = func(e scpb.Element) bool
 
 func or(predicates ...elementTypePredicate) elementTypePredicate {
@@ -402,12 +420,6 @@ func or(predicates ...elementTypePredicate) elementTypePredicate {
 			}
 		}
 		return false
-	}
-}
-
-func not(predicate elementTypePredicate) elementTypePredicate {
-	return func(e scpb.Element) bool {
-		return !predicate(e)
 	}
 }
 

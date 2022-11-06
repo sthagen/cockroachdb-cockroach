@@ -23,7 +23,7 @@ import classNames from "classnames/bind";
 import { sessionsTable } from "src/util/docs";
 
 import emptyTableResultsIcon from "../assets/emptyState/empty-table-results.svg";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 import { Pagination } from "src/pagination";
 import {
   SortSetting,
@@ -389,7 +389,6 @@ export class SessionsPage extends React.Component<
         }),
       );
 
-    const timeLabel = "Session duration runs longer than";
     const displayColumns = columns.filter(c => isColumnSelected(c));
 
     return (
@@ -404,10 +403,10 @@ export class SessionsPage extends React.Component<
             sessionStatuses={sessionStatuses}
             activeFilters={activeFilters}
             filters={filters}
-            timeLabel={timeLabel}
+            timeLabel={"Session duration"}
           />
         </div>
-        <section>
+        <section className={sessionsPageCx("sessions-table-area")}>
           <div className={statementsPageCx("cl-table-statistic")}>
             <div className={"session-column-selector"}>
               <ColumnsSelector
@@ -464,7 +463,7 @@ export class SessionsPage extends React.Component<
           error={this.props.sessionsError}
           render={this.renderSessions}
           renderError={() =>
-            SQLActivityError({
+            LoadingError({
               statsType: "sessions",
             })
           }

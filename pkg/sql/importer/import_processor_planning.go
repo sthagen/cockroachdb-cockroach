@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/oppurpose"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -67,6 +68,8 @@ func distImport(
 	testingKnobs importTestingKnobs,
 	procsPerNode int,
 ) (roachpb.BulkOpSummary, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "importer.distImport")
+	defer sp.Finish()
 
 	dsp := execCtx.DistSQLPlanner()
 	makePlan := func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
@@ -223,7 +226,6 @@ func distImport(
 		nil, /* clockUpdater */
 		evalCtx.Tracing,
 		evalCtx.ExecCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -352,7 +354,7 @@ func presplitTableBoundaries(
 		// TODO(ajwerner): Consider passing in the wrapped descriptors.
 		tblDesc := tabledesc.NewBuilder(tbl.Desc).BuildImmutableTable()
 		for _, span := range tblDesc.AllIndexSpans(cfg.Codec) {
-			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime); err != nil {
+			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime, oppurpose.SplitImport); err != nil {
 				return err
 			}
 		}

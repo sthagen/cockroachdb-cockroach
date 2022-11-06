@@ -1538,6 +1538,11 @@ type TenantTestingKnobs struct {
 	// AllowSplitAndScatter, if set, allows secondary tenants to execute ALTER
 	// TABLE ... SPLIT AT and SCATTER SQL commands.
 	AllowSplitAndScatter bool
+
+	// BeforeCheckingForDescriptorIDSequence, if set, is called before
+	// the connExecutor checks for the presence of system.descriptor_id_seq after
+	// handling a system tenant descriptor ID generator migration error.
+	BeforeCheckingForDescriptorIDSequence func(ctx context.Context)
 }
 
 var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
@@ -3171,6 +3176,12 @@ func (m *sessionDataMutator) SetUniqueWithoutIndexConstraints(val bool) {
 
 func (m *sessionDataMutator) SetUseNewSchemaChanger(val sessiondatapb.NewSchemaChangerMode) {
 	m.data.NewSchemaChangerMode = val
+}
+
+func (m *sessionDataMutator) SetDescriptorValidationMode(
+	val sessiondatapb.DescriptorValidationMode,
+) {
+	m.data.DescriptorValidationMode = val
 }
 
 func (m *sessionDataMutator) SetQualityOfService(val sessiondatapb.QoSLevel) {

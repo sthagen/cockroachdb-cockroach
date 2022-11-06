@@ -129,7 +129,8 @@ type MakePublicPrimaryIndexWriteOnly struct {
 // CreateGCJobForTable creates a GC job for a given table, when necessary.
 type CreateGCJobForTable struct {
 	mutationOp
-	TableID descpb.ID
+	TableID    descpb.ID
+	DatabaseID descpb.ID
 	StatementForDropJob
 }
 
@@ -286,6 +287,33 @@ type RemoveSequenceOwner struct {
 
 // RemoveCheckConstraint removes a check constraint from a table.
 type RemoveCheckConstraint struct {
+	mutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// MakeAbsentCheckConstraintWriteOnly adds a non-existent check constraint
+// to the table in the WRITE_ONLY state.
+type MakeAbsentCheckConstraintWriteOnly struct {
+	mutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+	ColumnIDs    []descpb.ColumnID
+	scpb.Expression
+	FromHashShardedColumn bool
+}
+
+// MakePublicCheckConstraintValidated moves a public
+// check constraint to VALIDATED.
+type MakePublicCheckConstraintValidated struct {
+	mutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// MakeValidatedCheckConstraintPublic moves a new, validated check
+// constraint from mutation to public.
+type MakeValidatedCheckConstraintPublic struct {
 	mutationOp
 	TableID      descpb.ID
 	ConstraintID descpb.ConstraintID

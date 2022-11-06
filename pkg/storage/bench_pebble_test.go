@@ -114,15 +114,20 @@ func BenchmarkMVCCScanGarbage_Pebble(b *testing.B) {
 				b.Run(fmt.Sprintf("versions=%d", numVersions), func(b *testing.B) {
 					for _, numRangeKeys := range []int{0, 1, 100} {
 						b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
-							runMVCCScan(ctx, b, benchScanOptions{
-								mvccBenchData: mvccBenchData{
-									numVersions:  numVersions,
-									numRangeKeys: numRangeKeys,
-									garbage:      true,
-								},
-								numRows: numRows,
-								reverse: false,
-							})
+							for _, tombstones := range []bool{false, true} {
+								b.Run(fmt.Sprintf("tombstones=%t", tombstones), func(b *testing.B) {
+									runMVCCScan(ctx, b, benchScanOptions{
+										mvccBenchData: mvccBenchData{
+											numVersions:  numVersions,
+											numRangeKeys: numRangeKeys,
+											garbage:      true,
+										},
+										numRows:    numRows,
+										tombstones: tombstones,
+										reverse:    false,
+									})
+								})
+							}
 						})
 					}
 				})
@@ -537,13 +542,9 @@ func BenchmarkSSTIterator(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	for _, numKeys := range []int{1, 100, 10000} {
 		b.Run(fmt.Sprintf("keys=%d", numKeys), func(b *testing.B) {
-			for _, variant := range []string{"legacy", "pebble"} {
-				b.Run(fmt.Sprintf("variant=%s", variant), func(b *testing.B) {
-					for _, verify := range []bool{false, true} {
-						b.Run(fmt.Sprintf("verify=%t", verify), func(b *testing.B) {
-							runSSTIterator(b, variant, numKeys, verify)
-						})
-					}
+			for _, verify := range []bool{false, true} {
+				b.Run(fmt.Sprintf("verify=%t", verify), func(b *testing.B) {
+					runSSTIterator(b, numKeys, verify)
 				})
 			}
 		})

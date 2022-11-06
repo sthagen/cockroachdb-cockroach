@@ -205,7 +205,7 @@ func TestPriorityRatchetOnAbortOrPush(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s := createTestDBWithKnobs(t, &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
 			// Reject transaction heartbeats, which can make the test flaky when they
 			// detect an aborted transaction before the Get operation does. See #68584
 			// for an explanation.
@@ -429,7 +429,12 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 		}
 		s.Manual.Advance(time.Second)
 		// Split range by keyB.
-		if err := s.DB.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+		if err := s.DB.AdminSplit(
+			context.Background(),
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+			roachpb.AdminSplitRequest_INGESTION,
+		); err != nil {
 			t.Fatal(err)
 		}
 		// Wait till split complete.
@@ -634,7 +639,7 @@ func TestTxnCommitTimestampAdvancedByRefresh(t *testing.T) {
 	var refreshTS hlc.Timestamp
 	errKey := roachpb.Key("inject_err")
 	s := createTestDBWithKnobs(t, &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
 			if g, ok := ba.GetArg(roachpb.Get); ok && g.(*roachpb.GetRequest).Key.Equal(errKey) {
 				if injected {
 					return nil

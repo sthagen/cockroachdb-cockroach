@@ -656,14 +656,25 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
 			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 			cfg.TestingKnobs.DontCloseTimestamps = true
+			// Make sure commands are visible by the time they are applied. Otherwise
+			// this test can be flaky because we might have a lease applied index
+			// assigned to a command that is committed but not applied yet. When we
+			// then "commit" a command out of band, and the stored command gets
+			// applied, their indexes will clash and cause a fatal error.
+			cfg.TestingKnobs.DisableCanAckBeforeApplication = true
 			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 			// Write an intent.
 			txn := roachpb.MakeTransaction("test", intentKey, 0, intentTS, 0, 0)
-			pArgs := putArgs(intentKey, []byte("val"))
-			assignSeqNumsForReqs(&txn, &pArgs)
-			_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{Txn: &txn}, &pArgs)
-			require.Nil(t, pErr)
+			{
+				pArgs := putArgs(intentKey, []byte("val"))
+				assignSeqNumsForReqs(&txn, &pArgs)
+				_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{Txn: &txn}, &pArgs)
+				require.Nil(t, pErr)
+			}
+
+			// NB: the put is now visible, in particular it has applied, thanks
+			// to the testing knobs in this test.
 
 			// Inject a closed timestamp.
 			tc.repl.mu.Lock()
@@ -958,6 +969,7 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 				tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
 				cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 				cfg.TestingKnobs.DontCloseTimestamps = true
+				cfg.TestingKnobs.DisableCanAckBeforeApplication = true
 				tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 				// Write an intent.
@@ -973,7 +985,7 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 				tc.repl.mu.Unlock()
 
 				// Construct and issue the request.
-				var ba roachpb.BatchRequest
+				ba := &roachpb.BatchRequest{}
 				ba.RangeID = tc.rangeID
 				ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
 					MinTimestampBound:       test.minTSBound,
@@ -1077,7 +1089,8 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 	//  get:  [g]
 	//  get:  [h]
 	//
-	makeReq := func(maxKeys int) (ba roachpb.BatchRequest) {
+	makeReq := func(maxKeys int) *roachpb.BatchRequest {
+		ba := &roachpb.BatchRequest{}
 		ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
 			MinTimestampBound: makeTS(5),
 		}
@@ -1135,6 +1148,7 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
 			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 			cfg.TestingKnobs.DontCloseTimestamps = true
+			cfg.TestingKnobs.DisableCanAckBeforeApplication = true
 			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 			// Set up the test.

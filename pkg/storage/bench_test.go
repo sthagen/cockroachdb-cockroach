@@ -725,9 +725,10 @@ func loadTestData(dir string, numKeys, numBatches, batchTimeSpan, valueBytes int
 
 type benchScanOptions struct {
 	mvccBenchData
-	numRows   int
-	reverse   bool
-	wholeRows bool
+	numRows    int
+	reverse    bool
+	wholeRows  bool
+	tombstones bool
 }
 
 // runMVCCScan first creates test data (and resets the benchmarking
@@ -792,6 +793,7 @@ func runMVCCScan(ctx context.Context, b *testing.B, opts benchScanOptions) {
 			WholeRowsOfSize: wholeRowsOfSize,
 			AllowEmpty:      wholeRowsOfSize != 0,
 			Reverse:         opts.reverse,
+			Tombstones:      opts.tombstones,
 		})
 		if err != nil {
 			b.Fatalf("failed scan: %+v", err)
@@ -803,7 +805,7 @@ func runMVCCScan(ctx context.Context, b *testing.B, opts benchScanOptions) {
 		if !opts.garbage && len(res.KVs) != expectKVs {
 			b.Fatalf("failed to scan: %d != %d", len(res.KVs), expectKVs)
 		}
-		if opts.garbage && len(res.KVs) != 0 {
+		if opts.garbage && !opts.tombstones && len(res.KVs) != 0 {
 			b.Fatalf("failed to scan garbage: found %d keys", len(res.KVs))
 		}
 	}
@@ -1749,7 +1751,7 @@ func runCheckSSTConflicts(
 	}
 }
 
-func runSSTIterator(b *testing.B, variant string, numKeys int, verify bool) {
+func runSSTIterator(b *testing.B, numKeys int, verify bool) {
 	keyBuf := append(make([]byte, 0, 64), []byte("key-")...)
 	value := MVCCValue{Value: roachpb.MakeValueFromBytes(bytes.Repeat([]byte("a"), 128))}
 
@@ -1765,27 +1767,13 @@ func runSSTIterator(b *testing.B, variant string, numKeys int, verify bool) {
 	}
 	sstWriter.Close()
 
-	var makeSSTIterator func(data []byte, verify bool) (SimpleMVCCIterator, error)
-	switch variant {
-	case "legacy":
-		makeSSTIterator = func(data []byte, verify bool) (SimpleMVCCIterator, error) {
-			return NewLegacyMemSSTIterator(data, verify)
-		}
-	case "pebble":
-		makeSSTIterator = func(data []byte, verify bool) (SimpleMVCCIterator, error) {
-			return NewMemSSTIterator(data, verify, IterOptions{
-				KeyTypes:   IterKeyTypePointsAndRanges,
-				LowerBound: keys.MinKey,
-				UpperBound: keys.MaxKey,
-			})
-		}
-	default:
-		b.Fatalf("unknown variant %q", variant)
-	}
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		iter, err := makeSSTIterator(sstFile.Bytes(), verify)
+		iter, err := NewMemSSTIterator(sstFile.Bytes(), verify, IterOptions{
+			KeyTypes:   IterKeyTypePointsAndRanges,
+			LowerBound: keys.MinKey,
+			UpperBound: keys.MaxKey,
+		})
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"testing"
+	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -37,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -70,8 +71,7 @@ func TestCollectionWriteDescToBatch(t *testing.T) {
 	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
 
 	db := s0.DB()
-	descriptors := s0.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.
-		NewCollection(ctx, nil /* TemporarySchemaProvider */, nil /* Monitor */)
+	descriptors := s0.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(ctx)
 
 	// Note this transaction abuses the mechanisms normally required for updating
 	// tables and is just for testing what this test intends to exercise.
@@ -156,7 +156,7 @@ func TestTxnClearsCollectionOnRetry(t *testing.T) {
 	var serverArgs base.TestServerArgs
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, r roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, r *roachpb.BatchRequest) *roachpb.Error {
 			if r.Txn == nil || r.Txn.Name != txnName {
 				return nil
 			}
@@ -653,8 +653,9 @@ func TestCollectionProperlyUsesMemoryMonitoring(t *testing.T) {
 	monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 
 	// Create a `Collection` with monitor hooked up.
-	col := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.
-		NewCollection(ctx, nil /* temporarySchemaProvider */, monitor)
+	col := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(
+		ctx, descs.WithMonitor(monitor),
+	)
 	require.Equal(t, int64(0), monitor.AllocBytes())
 
 	// Read all the descriptors into `col` and assert this read will finish without error.
@@ -672,8 +673,9 @@ func TestCollectionProperlyUsesMemoryMonitoring(t *testing.T) {
 	require.Equal(t, int64(0), monitor.AllocBytes())
 
 	// Repeat the process again and assert this time memory allocation will err out.
-	col = tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.
-		NewCollection(ctx, nil /* temporarySchemaProvider */, monitor)
+	col = tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(
+		ctx, descs.WithMonitor(monitor),
+	)
 	_, err2 := col.GetAllDescriptors(ctx, txn)
 	require.Error(t, err2)
 
@@ -816,6 +818,116 @@ func TestDescriptorCache(t *testing.T) {
 	})
 }
 
+// TestAllDescriptorsInDatabase ensures that the appropriate descriptors
+// are returned from GetAllDescriptorsInDatabase.
+func TestGetAllDescriptorsInDatabase(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb.Exec(t, `CREATE DATABASE db`)
+	tdb.Exec(t, `USE db`)
+	tdb.Exec(t, `CREATE SCHEMA schema`)
+	tdb.Exec(t, `CREATE TABLE db.public.table()`)
+	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
+
+	s0 := tc.Server(0)
+	tm := s0.InternalExecutorFactory().(descs.TxnManager)
+
+	sd := sql.NewFakeSessionData(&s0.ClusterSettings().SV)
+	sd.Database = "db"
+	require.NoError(t, tm.DescsTxnWithExecutor(ctx, s0.DB(), sd, func(
+		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection, ie sqlutil.InternalExecutor,
+	) error {
+		dbDesc, err := descriptors.GetImmutableDatabaseByName(ctx, txn, "db", tree.DatabaseLookupFlags{AvoidLeased: true})
+		if err != nil {
+			return err
+		}
+		allDescs, err := descriptors.GetAllDescriptorsForDatabase(ctx, txn, dbDesc)
+		if err != nil {
+			return err
+		}
+		require.Equal(t, `
+parent schema name   id  kind     version dropped public
+0      0      db     104 database 2       false   true
+104    0      public 105 schema   1       false   true
+104    0      schema 106 schema   1       false   true
+104    105    table  107 relation 1       false   true
+104    106    table  108 relation 1       false   true
+`, formatCatalog(allDescs.OrderedDescriptors()))
+		for _, stmt := range []string{
+			`ALTER SCHEMA schema RENAME TO sc`,
+			`CREATE SCHEMA sc_foo`,
+			`DROP TABLE public.table`,
+			`CREATE TABLE sc.foo()`,
+			`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL IMMUTABLE AS $$ SELECT 1 $$`,
+			`CREATE FUNCTION sc_foo.f() RETURNS INT LANGUAGE SQL IMMUTABLE AS $$ SELECT 1 $$`,
+		} {
+			if _, err = ie.Exec(ctx, "test", txn, stmt); err != nil {
+				return err
+			}
+		}
+		allDescs, err = descriptors.GetAllDescriptorsForDatabase(ctx, txn, dbDesc)
+		if err != nil {
+			return err
+		}
+		require.Equal(t, `
+parent schema name   id  kind     version dropped public
+0      0      db     104 database 3       false   true
+104    0      public 105 schema   2       false   true
+104    0      sc     106 schema   2       false   true
+104    0      sc_foo 109 schema   1       false   true
+104    105    f      111 function 1       false   true
+104    105    table  107 relation 2       true    false
+104    106    foo    110 relation 1       false   true
+104    106    table  108 relation 1       false   true
+104    109    f      112 function 1       false   true
+`, formatCatalog(allDescs.OrderedDescriptors()))
+		return nil
+	}))
+}
+
+// formatDescriptors formats descriptors into a text string
+// for testing.
+func formatCatalog(descs []catalog.Descriptor) string {
+	sort.Slice(descs, func(i, j int) bool {
+		return nameEntryLess(descs[i], descs[j])
+	})
+	var buf strings.Builder
+	_ = buf.WriteByte('\n')
+	tr := tabwriter.NewWriter(&buf, 3, 2, 1, ' ', 0)
+	_, _ = fmt.Fprint(tr,
+		"parent\tschema\tname\tid\tkind\tversion\tdropped\tpublic\n",
+	)
+	for _, d := range descs {
+		_, _ = fmt.Fprintf(tr,
+			"%d\t%d\t%s\t%d\t%s\t%d\t%v\t%v\n",
+			d.GetParentID(), d.GetParentSchemaID(), d.GetName(),
+			d.GetID(), d.DescriptorType(), d.GetVersion(),
+			d.Dropped(), d.Public(),
+		)
+	}
+	_ = tr.Flush()
+	return buf.String()
+}
+
+func nameEntryLess(di, dj catalog.NameEntry) bool {
+	if pi, pj := di.GetParentID(), dj.GetParentID(); pi != pj {
+		return pi < pj
+	}
+	if psi, psj := di.GetParentSchemaID(), dj.GetParentSchemaID(); psi != psj {
+		return psi < psj
+	}
+	if ni, nj := di.GetName(), dj.GetName(); ni != nj {
+		return ni < nj
+	}
+	return di.GetID() < dj.GetID()
+}
+
 // TestCollectionTimeTravelLookingTooFarBack encodes expected behavior from the
 // Collection when performing historical queries.
 func TestCollectionTimeTravelLookingTooFarBack(t *testing.T) {
@@ -862,30 +974,6 @@ func TestCollectionTimeTravelLookingTooFarBack(t *testing.T) {
 				return err
 			}
 			require.Empty(t, c)
-			return nil
-		}))
-	})
-	t.Run("system db lookup by name works", func(t *testing.T) {
-		require.NoError(t, goFarBackInTime(func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-			db, err := col.GetImmutableDatabaseByName(
-				ctx, txn, catconstants.SystemDatabaseName, tree.DatabaseLookupFlags{},
-			)
-			if err != nil {
-				return err
-			}
-			require.NotNil(t, db)
-			return nil
-		}))
-	})
-	t.Run("system db lookup by ID works", func(t *testing.T) {
-		require.NoError(t, goFarBackInTime(func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-			db, err := col.GetImmutableDescriptorByID(
-				ctx, txn, keys.SystemDatabaseID, tree.CommonLookupFlags{AvoidLeased: true},
-			)
-			if err != nil {
-				return err
-			}
-			require.NotNil(t, db)
 			return nil
 		}))
 	})

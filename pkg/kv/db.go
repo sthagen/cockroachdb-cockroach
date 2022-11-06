@@ -214,7 +214,7 @@ var _ Sender = &CrossRangeTxnWrapperSender{}
 
 // Send implements the Sender interface.
 func (s *CrossRangeTxnWrapperSender) Send(
-	ctx context.Context, ba roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	if ba.Txn != nil {
 		log.Fatalf(ctx, "CrossRangeTxnWrapperSender can't handle transactional requests")
@@ -590,10 +590,11 @@ func (db *DB) AdminSplit(
 	ctx context.Context,
 	splitKey interface{},
 	expirationTime hlc.Timestamp,
+	class roachpb.AdminSplitRequest_Class,
 	predicateKeys ...roachpb.Key,
 ) error {
 	b := &Batch{}
-	b.adminSplit(splitKey, expirationTime, predicateKeys)
+	b.adminSplit(splitKey, expirationTime, class, predicateKeys)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -824,7 +825,7 @@ func sendAndFill(ctx context.Context, send SenderFunc, b *Batch) error {
 	// fails. But send() also returns its own errors, so there's some dancing
 	// here to do because we want to run fillResults() so that the individual
 	// result gets initialized with an error from the corresponding call.
-	var ba roachpb.BatchRequest
+	ba := &roachpb.BatchRequest{}
 	ba.Requests = b.reqs
 	ba.Header = b.Header
 	ba.AdmissionHeader = b.AdmissionHeader
@@ -888,6 +889,11 @@ func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 // is marked as poisoned and all future ops fail fast until the retry. The
 // callback may return either nil or the retryable error. Txn is responsible for
 // resetting the transaction and retrying the callback.
+//
+// TODO(irfansharif): Audit uses of this since API since it bypasses AC. Make
+// the other variant (TxnWithAdmissionControl) the default, or maybe rename this
+// to be more explicit (TxnWithoutAdmissionControl) so new callers have to be
+// conscious about what they want.
 func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) error) error {
 	return db.TxnWithAdmissionControl(
 		ctx, roachpb.AdmissionHeader_OTHER, admissionpb.NormalPri, retryable)
@@ -951,7 +957,9 @@ func runTxn(ctx context.Context, txn *Txn, retryable func(context.Context, *Txn)
 		return retryable(ctx, txn)
 	})
 	if err != nil {
-		txn.CleanupOnError(ctx, err)
+		if rollbackErr := txn.Rollback(ctx); rollbackErr != nil {
+			log.Eventf(ctx, "failure aborting transaction: %s; abort caused by: %s", rollbackErr, err)
+		}
 	}
 	// Terminate TransactionRetryWithProtoRefreshError here, so it doesn't cause a higher-level
 	// txn to be retried. We don't do this in any of the other functions in DB; I
@@ -965,14 +973,14 @@ func runTxn(ctx context.Context, txn *Txn, retryable func(context.Context, *Txn)
 // send runs the specified calls synchronously in a single batch and returns
 // any errors. Returns (nil, nil) for an empty batch.
 func (db *DB) send(
-	ctx context.Context, ba roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	return db.sendUsingSender(ctx, ba, db.NonTransactionalSender())
 }
 
 // sendUsingSender uses the specified sender to send the batch request.
 func (db *DB) sendUsingSender(
-	ctx context.Context, ba roachpb.BatchRequest, sender Sender,
+	ctx context.Context, ba *roachpb.BatchRequest, sender Sender,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, nil

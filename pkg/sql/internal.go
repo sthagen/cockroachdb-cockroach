@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -813,9 +814,8 @@ func (ie *InternalExecutor) execInternal(
 	// If the caller has injected a mapping to temp schemas, install it, and
 	// leave it installed for the rest of the transaction.
 	if ie.extraTxnState != nil && sd.DatabaseIDToTempSchemaID != nil {
-		ie.extraTxnState.descCollection.SetTemporaryDescriptors(
-			descs.NewTemporarySchemaProvider(sessiondata.NewStack(sd)),
-		)
+		p := catsessiondata.NewDescriptorSessionDataStackProvider(sessiondata.NewStack(sd))
+		ie.extraTxnState.descCollection.SetDescriptorSessionDataProvider(p)
 	}
 
 	// The returned span is finished by this function in all error paths, but if
@@ -1043,6 +1043,9 @@ func (ie *InternalExecutor) commitTxn(ctx context.Context) error {
 // TODO (janexing): this will be deprecate soon since it's not a good idea
 // to have `extraTxnState` to store the info from a outer txn.
 func (ie *InternalExecutor) checkIfStmtIsAllowed(stmt tree.Statement, txn *kv.Txn) error {
+	if stmt == nil {
+		return nil
+	}
 	if tree.CanModifySchema(stmt) && txn != nil && ie.extraTxnState == nil {
 		return errors.New("DDL statement is disallowed if internal " +
 			"executor is not bound with txn metadata")
@@ -1371,32 +1374,34 @@ func (ief *InternalExecutorFactory) DescsTxnWithExecutor(
 ) error {
 	run := ApplyTxnOptions(db, opts...)
 
-	// Waits for descriptors that were modified, skipping
-	// over ones that had their descriptor wiped.
-	waitForDescriptors := func(modifiedDescriptors []lease.IDVersion, deletedDescs catalog.DescriptorIDSet) error {
-		// Wait for a single version on leased descriptors.
+	// Wait for descriptors that were modified or dropped. If the descriptor
+	// was not dropped, wait for one version. Otherwise, wait for no versions.
+	waitForDescriptors := func(
+		modifiedDescriptors []lease.IDVersion,
+		deletedDescs catalog.DescriptorIDSet,
+	) error {
+		retryOpts := retry.Options{
+			InitialBackoff: time.Millisecond,
+			Multiplier:     1.5,
+			MaxBackoff:     time.Second,
+		}
+		lm := ief.server.cfg.LeaseManager
 		for _, ld := range modifiedDescriptors {
-			waitForNoVersion := deletedDescs.Contains(ld.ID)
-			retryOpts := retry.Options{
-				InitialBackoff: time.Millisecond,
-				Multiplier:     1.5,
-				MaxBackoff:     time.Second,
+			if deletedDescs.Contains(ld.ID) { // we'll wait below
+				continue
 			}
-			// Detect unpublished ones.
-			if waitForNoVersion {
-				err := ief.server.cfg.LeaseManager.WaitForNoVersion(ctx, ld.ID, retryOpts)
-				if err != nil {
-					return err
-				}
-			} else {
-				_, err := ief.server.cfg.LeaseManager.WaitForOneVersion(ctx, ld.ID, retryOpts)
-				// If the descriptor has been deleted, just wait for leases to drain.
-				if errors.Is(err, catalog.ErrDescriptorNotFound) {
-					err = ief.server.cfg.LeaseManager.WaitForNoVersion(ctx, ld.ID, retryOpts)
-				}
-				if err != nil {
-					return err
-				}
+			_, err := lm.WaitForOneVersion(ctx, ld.ID, retryOpts)
+			// If the descriptor has been deleted, just wait for leases to drain.
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
+				err = lm.WaitForNoVersion(ctx, ld.ID, retryOpts)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		for _, id := range deletedDescs.Ordered() {
+			if err := lm.WaitForNoVersion(ctx, id, retryOpts); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -1408,10 +1413,7 @@ func (ief *InternalExecutorFactory) DescsTxnWithExecutor(
 		var deletedDescs catalog.DescriptorIDSet
 		if err := run(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
 			withNewVersion, deletedDescs = nil, catalog.DescriptorIDSet{}
-			descsCol := cf.NewCollection(
-				ctx, nil, /* temporarySchemaProvider */
-				ief.monitor,
-			)
+			descsCol := cf.NewCollection(ctx, descs.WithMonitor(ief.monitor))
 			defer descsCol.ReleaseAll(ctx)
 			ie, commitTxnFn := ief.newInternalExecutorWithTxn(sd, &cf.GetClusterSettings().SV, txn, descsCol)
 			if err := f(ctx, txn, descsCol, ie); err != nil {

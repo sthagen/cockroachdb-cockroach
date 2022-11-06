@@ -953,6 +953,10 @@ func applyColumnMutation(
 		); err != nil {
 			return err
 		}
+		if col.HasNullDefault() {
+			// `SET DEFAULT NULL` means a nil default expression.
+			col.ColumnDesc().DefaultExpr = nil
+		}
 
 	case *tree.AlterTableSetOnUpdate:
 		// We want to reject uses of ON UPDATE where there is also a foreign key ON
@@ -1445,7 +1449,7 @@ func validateConstraintNameIsNotUsed(
 			// If there is no active primary key, then adding one with the exact
 			// same name is allowed.
 			if !tableDesc.HasPrimaryKey() &&
-				tableDesc.PrimaryIndex.Name == name.String() {
+				tableDesc.PrimaryIndex.Name == string(name) {
 				return false, nil
 			}
 		}

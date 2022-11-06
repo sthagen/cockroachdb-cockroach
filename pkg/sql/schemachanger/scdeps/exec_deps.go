@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/oppurpose"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/scmutationexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -323,7 +324,7 @@ func (d *txnDeps) MaybeSplitIndexSpans(
 	span := table.IndexSpan(d.codec, indexToBackfill.GetID())
 	const backfillSplitExpiration = time.Hour
 	expirationTime := d.txn.DB().Clock().Now().Add(backfillSplitExpiration.Nanoseconds(), 0)
-	return d.txn.DB().AdminSplit(ctx, span.Key, expirationTime)
+	return d.txn.DB().AdminSplit(ctx, span.Key, expirationTime, oppurpose.SplitSchema)
 }
 
 // GetResumeSpans implements the scexec.BackfillerTracker interface.
@@ -417,6 +418,11 @@ func (d *execDeps) Statements() []string {
 // User implements the scexec.Dependencies interface.
 func (d *execDeps) User() username.SQLUsername {
 	return d.user
+}
+
+// ClusterSettings implements the scexec.Dependencies interface.
+func (d *execDeps) ClusterSettings() *cluster.Settings {
+	return d.settings
 }
 
 // DescriptorMetadataUpdater implements the scexec.Dependencies interface.

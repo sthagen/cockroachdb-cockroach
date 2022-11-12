@@ -811,7 +811,11 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 	ctx context.Context, err error, evalCtx *extendedEvalContext,
 ) error {
-
+	// Clean up any protected timestamps as a last resort, in case the job
+	// execution never did itself.
+	if err := sc.execCfg.ProtectedTimestampManager.Unprotect(ctx, sc.job.ID()); err != nil {
+		log.Warningf(ctx, "unexpected error cleaning up protected timestamp %v", err)
+	}
 	// Ensure that this is a table descriptor and that the mutation is first in
 	// line prior to reverting.
 	{
@@ -2456,27 +2460,34 @@ func (*SchemaChangerTestingKnobs) ModuleTestingKnobs() {}
 func (sc *SchemaChanger) txn(
 	ctx context.Context, f func(context.Context, *kv.Txn, *descs.Collection) error,
 ) error {
-	if fn := sc.testingKnobs.RunBeforeDescTxn; fn != nil {
-		if err := fn(sc.job.ID()); err != nil {
-			return err
-		}
-	}
-	return sc.execCfg.InternalExecutorFactory.DescsTxn(ctx, sc.db, f)
+	return sc.txnWithExecutor(ctx, func(
+		ctx context.Context, txn *kv.Txn, _ *sessiondata.SessionData,
+		collection *descs.Collection, _ sqlutil.InternalExecutor,
+	) error {
+		return f(ctx, txn, collection)
+	})
 }
 
 // txnWithExecutor is to run internal executor within a txn.
 func (sc *SchemaChanger) txnWithExecutor(
 	ctx context.Context,
-	sd *sessiondata.SessionData,
-	f func(context.Context, *kv.Txn, *descs.Collection, sqlutil.InternalExecutor) error,
+	f func(
+		context.Context, *kv.Txn, *sessiondata.SessionData,
+		*descs.Collection, sqlutil.InternalExecutor,
+	) error,
 ) error {
 	if fn := sc.testingKnobs.RunBeforeDescTxn; fn != nil {
 		if err := fn(sc.job.ID()); err != nil {
 			return err
 		}
 	}
-	return sc.execCfg.InternalExecutorFactory.
-		DescsTxnWithExecutor(ctx, sc.db, sd, f)
+	sd := NewFakeSessionData(sc.execCfg.SV())
+	return sc.execCfg.InternalExecutorFactory.DescsTxnWithExecutor(ctx, sc.db, sd, func(
+		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ie sqlutil.InternalExecutor,
+	) error {
+		return f(ctx, txn, sd, descriptors, ie)
+	})
 }
 
 // createSchemaChangeEvalCtx creates an extendedEvalContext() to be used for backfills.
@@ -2501,22 +2512,23 @@ func createSchemaChangeEvalCtx(
 		ExecCfg: execCfg,
 		Descs:   descriptors,
 		Context: eval.Context{
-			SessionDataStack:   sessiondata.NewStack(sd),
-			Planner:            &faketreeeval.DummyEvalPlanner{},
-			PrivilegedAccessor: &faketreeeval.DummyPrivilegedAccessor{},
-			SessionAccessor:    &faketreeeval.DummySessionAccessor{},
-			ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
-			Sequence:           &faketreeeval.DummySequenceOperators{},
-			Tenant:             &faketreeeval.DummyTenantOperator{},
-			Regions:            &faketreeeval.DummyRegionOperator{},
-			Settings:           execCfg.Settings,
-			TestingKnobs:       execCfg.EvalContextTestingKnobs,
-			ClusterID:          execCfg.NodeInfo.LogicalClusterID(),
-			ClusterName:        execCfg.RPCContext.ClusterName(),
-			NodeID:             execCfg.NodeInfo.NodeID,
-			Codec:              execCfg.Codec,
-			Locality:           execCfg.Locality,
-			Tracer:             execCfg.AmbientCtx.Tracer,
+			SessionDataStack:     sessiondata.NewStack(sd),
+			Planner:              &faketreeeval.DummyEvalPlanner{},
+			StreamManagerFactory: &faketreeeval.DummyStreamManagerFactory{},
+			PrivilegedAccessor:   &faketreeeval.DummyPrivilegedAccessor{},
+			SessionAccessor:      &faketreeeval.DummySessionAccessor{},
+			ClientNoticeSender:   &faketreeeval.DummyClientNoticeSender{},
+			Sequence:             &faketreeeval.DummySequenceOperators{},
+			Tenant:               &faketreeeval.DummyTenantOperator{},
+			Regions:              &faketreeeval.DummyRegionOperator{},
+			Settings:             execCfg.Settings,
+			TestingKnobs:         execCfg.EvalContextTestingKnobs,
+			ClusterID:            execCfg.NodeInfo.LogicalClusterID(),
+			ClusterName:          execCfg.RPCContext.ClusterName(),
+			NodeID:               execCfg.NodeInfo.NodeID,
+			Codec:                execCfg.Codec,
+			Locality:             execCfg.Locality,
+			Tracer:               execCfg.AmbientCtx.Tracer,
 		},
 	}
 	// TODO(andrei): This is wrong (just like on the main code path on
@@ -3176,7 +3188,7 @@ func splitAndScatter(
 	if err := db.AdminSplit(ctx, key, expirationTime, oppurpose.SplitSchema); err != nil {
 		return err
 	}
-	_, err := db.AdminScatter(ctx, key, 0 /* maxSize */)
+	_, err := db.AdminScatter(ctx, key, 0 /* maxSize */, oppurpose.ScatterSchema)
 	return err
 }
 

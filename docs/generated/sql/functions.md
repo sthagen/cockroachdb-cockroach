@@ -661,8 +661,14 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(interval: <a href="interval.html">interval</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string assuming the Postgres IntervalStyle.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(interval: <a href="interval.html">interval</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(timestamp: <a href="timestamp.html">timestamp</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string assuming the ISO, MDY DateStyle.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(timestamp: <a href="timestamp.html">timestamp</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(timestamptz: <a href="timestamp.html">timestamptz</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a timestamp with time zone to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="to_timestamp"></a><code>to_timestamp(timestamp: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="transaction_timestamp"></a><code>transaction_timestamp() &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Returns the time of the current transaction.</p>
@@ -2682,7 +2688,7 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="chr"></a><code>chr(val: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the character with the code given in <code>val</code>. Inverse function of <code>ascii()</code>.</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="compress"></a><code>compress(data: <a href="bytes.html">bytes</a>, codec: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Compress <code>data</code> with the specified <code>codec</code> (<code>gzip</code>).</p>
+<tr><td><a name="compress"></a><code>compress(data: <a href="bytes.html">bytes</a>, codec: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Compress <code>data</code> with the specified <code>codec</code> (<code>gzip</code>, ‘lz4’, ‘snappy’, 'zstd).</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="concat"></a><code>concat(<a href="string.html">string</a>...) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Concatenates a comma-separated list of strings.</p>
 </span></td><td>Immutable</td></tr>
@@ -2713,7 +2719,7 @@ The output can be used to recreate a database.’</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="decode"></a><code>decode(text: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="decompress"></a><code>decompress(data: <a href="bytes.html">bytes</a>, codec: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decompress <code>data</code> with the specified <code>codec</code> (<code>gzip</code>).</p>
+<tr><td><a name="decompress"></a><code>decompress(data: <a href="bytes.html">bytes</a>, codec: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decompress <code>data</code> with the specified <code>codec</code> (<code>gzip</code>, ‘lz4’, ‘snappy’, 'zstd).</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="difference"></a><code>difference(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert two strings to their Soundex codes and then reports the number of matching code positions.</p>
 </span></td><td>Immutable</td></tr>

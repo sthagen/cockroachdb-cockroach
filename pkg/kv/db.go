@@ -605,12 +605,13 @@ func (db *DB) AdminSplit(
 // to scatter that is conditional on it not resulting in excessive data movement
 // if the range is large.
 func (db *DB) AdminScatter(
-	ctx context.Context, key roachpb.Key, maxSize int64,
+	ctx context.Context, key roachpb.Key, maxSize int64, class roachpb.AdminScatterRequest_Class,
 ) (*roachpb.AdminScatterResponse, error) {
 	scatterReq := &roachpb.AdminScatterRequest{
 		RequestHeader:   roachpb.RequestHeaderFromSpan(roachpb.Span{Key: key, EndKey: key.Next()}),
 		RandomizeLeases: true,
 		MaxSize:         maxSize,
+		Class:           class,
 	}
 	raw, pErr := SendWrapped(ctx, db.NonTransactionalSender(), scatterReq)
 	if pErr != nil {
@@ -630,9 +631,11 @@ func (db *DB) AdminScatter(
 // If splitKey is not the start key of a range, then this method will throw an
 // error. If the range specified by splitKey does not have a sticky bit set,
 // then this method will not throw an error and is a no-op.
-func (db *DB) AdminUnsplit(ctx context.Context, splitKey interface{}) error {
+func (db *DB) AdminUnsplit(
+	ctx context.Context, splitKey interface{}, class roachpb.AdminUnsplitRequest_Class,
+) error {
 	b := &Batch{}
-	b.adminUnsplit(splitKey)
+	b.adminUnsplit(splitKey, class)
 	return getOneErr(db.Run(ctx, b), b)
 }
 

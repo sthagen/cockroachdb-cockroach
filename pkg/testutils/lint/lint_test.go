@@ -1196,6 +1196,7 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!*.pb.go",
 			":!*.pb.gw.go",
+			":!ccl/changefeedccl/changefeedbase/errors.go",
 			":!kv/kvclient/kvcoord/lock_spans_over_budget_error.go",
 			":!spanconfig/errors.go",
 			":!roachpb/replica_unavailable_error.go",
@@ -1671,52 +1672,6 @@ func TestLint(t *testing.T) {
 		}
 	})
 
-	t.Run("TestGolint", func(t *testing.T) {
-		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(crdb.Dir, "golint", pkgScope)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := stream.ForEach(
-			stream.Sequence(
-				filter,
-				stream.GrepNot("migration/.*exported func TestingNewCluster returns unexported type"),
-				stream.GrepNot("sql/.*exported func .* returns unexported type sql.planNode"),
-				stream.GrepNot("pkg/sql/types/types.go.* var Uuid should be UUID"),
-				stream.GrepNot("pkg/sql/oidext/oidext.go.*don't use underscores in Go names; const T_"),
-				stream.GrepNot("server/api_v2.go.*package comment should be of the form"),
-				stream.GrepNot("pkg/util/timeutil/time_zone_util.go.*error strings should not be capitalized or end with punctuation or a newline"),
-
-				// The Observability Service doesn't want this blunt rule.
-				stream.GrepNot("pkg/obsservice.*error strings should not be capitalized or end with punctuation or a newline"),
-
-				stream.GrepNot("pkg/sql/job_exec_context_test_util.go.*exported method ExtendedEvalContext returns unexported type"),
-				stream.GrepNot("pkg/sql/job_exec_context_test_util.go.*exported method SessionDataMutatorIterator returns unexported type"),
-
-				stream.GrepNot("type name will be used as password.PasswordHash by other packages, and that stutters; consider calling this Hash"),
-				stream.GrepNot("type name will be used as ptp.PTPClock by other packages, and that stutters; consider calling this Limit"),
-				stream.GrepNot("type name will be used as row.RowLimit by other packages, and that stutters; consider calling this Limit"),
-				stream.GrepNot("type name will be used as tracing.TracingMode by other packages, and that stutters; consider calling this Mode"),
-				stream.GrepNot("pkg/build/bazel/bes/.*empty.go.*don't use an underscore in package name"),
-				stream.GrepNot("pkg/sql/types/types.go.*var Json should be JSON"),
-			), func(s string) {
-				t.Errorf("\n%s", s)
-			}); err != nil {
-			t.Error(err)
-		}
-
-		if err := cmd.Wait(); err != nil {
-			if out := stderr.String(); len(out) > 0 {
-				t.Fatalf("err=%s, stderr=%s", err, out)
-			}
-		}
-	})
-
 	t.Run("TestStaticCheck", func(t *testing.T) {
 		// staticcheck uses 2.4GB of ram (as of 2019-05-10), so don't parallelize it.
 		skip.UnderShort(t)
@@ -2036,14 +1991,15 @@ func TestLint(t *testing.T) {
 	})
 
 	t.Run("TestGCAssert", func(t *testing.T) {
-		skip.WithIssue(t, 86714)
 		skip.UnderShort(t)
 		skip.UnderBazelWithIssue(t, 65485, "Doesn't work in Bazel -- not really sure why yet")
 
 		t.Parallel()
-		var buf strings.Builder
-		if err := gcassert.GCAssert(&buf,
+
+		gcassertPaths := []string{
 			"../../col/coldata",
+			"../../kv/kvclient/rangecache",
+			"../../sql/catalog/descs",
 			"../../sql/colcontainer",
 			"../../sql/colconv",
 			"../../sql/colexec",
@@ -2059,9 +2015,62 @@ func TestLint(t *testing.T) {
 			"../../sql/colfetcher",
 			"../../sql/opt",
 			"../../sql/row",
-			"../../kv/kvclient/rangecache",
 			"../../storage",
-		); err != nil {
+			"../../storage/enginepb",
+			"../../util",
+			"../../util/hlc",
+		}
+
+		// Ensure that all packages that have '//gcassert' or '// gcassert'
+		// assertions are included into gcassertPaths.
+		t.Run("Coverage", func(t *testing.T) {
+			t.Parallel()
+			cmd, stderr, filter, err := dirCmd(
+				pkgDir,
+				"git",
+				"grep",
+				"-nE",
+				`// ?gcassert`,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := stream.ForEach(stream.Sequence(
+				filter,
+				stream.GrepNot("sql/colexec/execgen/cmd/execgen/*"),
+				stream.GrepNot("sql/colexec/execgen/testdata/*"),
+				stream.GrepNot("testutils/lint/lint_test.go"),
+			), func(s string) {
+				// s here is of the form
+				//   util/hlc/timestamp.go:203:// gcassert:inline
+				// and we want to extract the package path.
+				filePath := s[:strings.Index(s, ":")]                  // up to the line number
+				pkgPath := filePath[:strings.LastIndex(filePath, "/")] // up to the file name
+				gcassertPath := "../../" + pkgPath
+				for i := range gcassertPaths {
+					if gcassertPath == gcassertPaths[i] {
+						return
+					}
+				}
+				t.Errorf("\n%s <- is not enforced, include %q into gcassertPaths", s, gcassertPath)
+			}); err != nil {
+				t.Error(err)
+			}
+
+			if err := cmd.Wait(); err != nil {
+				if out := stderr.String(); len(out) > 0 {
+					t.Fatalf("err=%s, stderr=%s", err, out)
+				}
+			}
+		})
+
+		var buf strings.Builder
+		if err := gcassert.GCAssert(&buf, gcassertPaths...); err != nil {
 			t.Fatal(err)
 		}
 		output := buf.String()

@@ -332,7 +332,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	// Tables introduced in 20.2.
 
 	target.AddDescriptor(systemschema.ScheduledJobsTable)
-	target.AddDescriptor(systemschema.SqllivenessTable)
+	target.AddDescriptor(systemschema.SqllivenessTable())
 	target.AddDescriptor(systemschema.MigrationsTable)
 
 	// Tables introduced in 21.1.
@@ -489,7 +489,7 @@ func addSystemTenantEntry(target *MetadataSchema) {
 		tree.NewDInt(tree.DInt(roachpb.SystemTenantID.ToUint64())),
 		tree.MakeDBool(true),
 		tree.NewDBytes(tree.DBytes(infoBytes)),
-		tree.NewDString(info.Name),
+		tree.NewDString(string(info.Name)),
 	)
 	if err != nil {
 		panic(err)

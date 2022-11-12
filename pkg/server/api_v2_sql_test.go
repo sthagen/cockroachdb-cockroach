@@ -29,9 +29,9 @@ import (
 
 func TestExecSQL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	sqlAPIClock = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
+	SQLAPIClock = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
 	defer func() {
-		sqlAPIClock = timeutil.DefaultTimeSource{}
+		SQLAPIClock = timeutil.DefaultTimeSource{}
 	}()
 
 	server, _, _ := serverutils.StartServer(t, base.TestServerArgs{})

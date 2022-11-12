@@ -498,16 +498,16 @@ query TT
 SHOW CREATE TABLE delivery
 ----
 delivery  CREATE TABLE public.delivery (
-          ts TIMESTAMP NULL DEFAULT now():::TIMESTAMP,
-          "order" INT8 NULL,
-          shipment INT8 NULL,
-          item STRING NULL,
-          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-          CONSTRAINT delivery_pkey PRIMARY KEY (rowid ASC),
-          CONSTRAINT delivery_order_shipment_fkey FOREIGN KEY ("order", shipment) REFERENCES public.orders(id, shipment),
-          CONSTRAINT delivery_item_fkey FOREIGN KEY (item) REFERENCES public.products(upc),
-          INDEX delivery_item_idx (item ASC)
-)
+            ts TIMESTAMP NULL DEFAULT now():::TIMESTAMP,
+            "order" INT8 NULL,
+            shipment INT8 NULL,
+            item STRING NULL,
+            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+            CONSTRAINT delivery_pkey PRIMARY KEY (rowid ASC),
+            CONSTRAINT delivery_order_shipment_fkey FOREIGN KEY ("order", shipment) REFERENCES public.orders(id, shipment),
+            CONSTRAINT delivery_item_fkey FOREIGN KEY (item) REFERENCES public.products(upc),
+            INDEX delivery_item_idx (item ASC)
+          )
 
 statement ok
 INSERT INTO delivery ("order", shipment, item) VALUES
@@ -837,14 +837,14 @@ query TT
 SHOW CREATE TABLE refpairs
 ----
 refpairs  CREATE TABLE public.refpairs (
-          a INT8 NULL,
-          b STRING NULL,
-          c INT8 NULL,
-          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-          CONSTRAINT refpairs_pkey PRIMARY KEY (rowid ASC),
-          CONSTRAINT refpairs_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.pairs(src, dest) ON UPDATE RESTRICT,
-          INDEX refpairs_a_b_c_idx (a ASC, b ASC, c ASC)
-)
+            a INT8 NULL,
+            b STRING NULL,
+            c INT8 NULL,
+            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+            CONSTRAINT refpairs_pkey PRIMARY KEY (rowid ASC),
+            CONSTRAINT refpairs_a_b_fkey FOREIGN KEY (a, b) REFERENCES public.pairs(src, dest) ON UPDATE RESTRICT,
+            INDEX refpairs_a_b_c_idx (a ASC, b ASC, c ASC)
+          )
 
 statement error pgcode 23503 insert on table "refpairs" violates foreign key constraint "refpairs_a_b_fkey"\nDETAIL: Key \(a, b\)=\(100, 'two'\) is not present in table "pairs".
 INSERT INTO refpairs VALUES (100, 'two'), (200, 'two')
@@ -1056,14 +1056,14 @@ query TT
 SHOW CREATE TABLE refers
 ----
 refers  CREATE TABLE public.refers (
-        a INT8 NULL,
-        b INT8 NULL,
-        rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-        CONSTRAINT refers_pkey PRIMARY KEY (rowid ASC),
-        CONSTRAINT refers_a_fkey FOREIGN KEY (a) REFERENCES public.referee(id),
-        INDEX another_idx (b ASC),
-        INDEX foo (a ASC)
-)
+          a INT8 NULL,
+          b INT8 NULL,
+          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+          CONSTRAINT refers_pkey PRIMARY KEY (rowid ASC),
+          CONSTRAINT refers_a_fkey FOREIGN KEY (a) REFERENCES public.referee(id),
+          INDEX another_idx (b ASC),
+          INDEX foo (a ASC)
+        )
 
 statement ok
 DROP INDEX refers@another_idx
@@ -1139,10 +1139,10 @@ query TT
 SHOW CREATE TABLE pkref_b
 ----
 pkref_b  CREATE TABLE public.pkref_b (
-         b INT8 NOT NULL,
-         CONSTRAINT pkref_b_pkey PRIMARY KEY (b ASC),
-         CONSTRAINT pkref_b_b_fkey FOREIGN KEY (b) REFERENCES public.pkref_a(a) ON DELETE RESTRICT
-)
+           b INT8 NOT NULL,
+           CONSTRAINT pkref_b_pkey PRIMARY KEY (b ASC),
+           CONSTRAINT pkref_b_b_fkey FOREIGN KEY (b) REFERENCES public.pkref_a(a) ON DELETE RESTRICT
+         )
 
 subtest 20042
 
@@ -3075,14 +3075,14 @@ SELECT * FROM good_users ORDER BY id ASC
 20  20
 30  30
 
-query IIIT
-SELECT * FROM messages ORDER BY message_id ASC
+query IIT
+SELECT user_id_1, user_id_2, text FROM messages ORDER BY message_id ASC
 ----
-1  10  20  hi jordan
-2  20  10  hi oliver
-3  10  20  you are a good user jordan
-4  10  30  you are a good user too rohan
-5  30  10  lucy is a good user
+10  20  hi jordan
+20  10  hi oliver
+10  20  you are a good user jordan
+10  30  you are a good user too rohan
+30  10  lucy is a good user
 
 # Delete from users should work as well
 statement ok
@@ -3101,12 +3101,12 @@ SELECT * FROM good_users ORDER BY id ASC
 10  10
 20  20
 
-query IIIT
-SELECT * FROM messages ORDER BY message_id ASC
+query IIT
+SELECT user_id_1, user_id_2, text FROM messages ORDER BY message_id ASC
 ----
-1  10  20  hi jordan
-2  20  10  hi oliver
-3  10  20  you are a good user jordan
+10  20  hi jordan
+20  10  hi oliver
+10  20  you are a good user jordan
 
 # Add a foreign key on id2, which is a different column.
 # This one is restrictive on updates and deletes.
@@ -3137,24 +3137,24 @@ INSERT INTO messages (user_id_1, user_id_2, text) VALUES
   (999, 40, 'johnny is my best friend')
 
 # And sanity check everything.
-query IIIT
-SELECT * FROM messages ORDER BY message_id ASC
+query IIT
+SELECT user_id_1, user_id_2, text FROM messages ORDER BY message_id ASC
 ----
-1  10  20  hi jordan
-2  20  10  hi oliver
-3  10  20  you are a good user jordan
-7  10  40  oh hi mark
-8  40  10  youre tearing me apart lisa!
+10  20  hi jordan
+20  10  hi oliver
+10  20  you are a good user jordan
+10  40  oh hi mark
+40  10  youre tearing me apart lisa!
 
 # Delete should still be okay since the cascade from id1 should "win".
 statement ok
 DELETE FROM users WHERE id = 20
 
-query IIIT
-SELECT * FROM messages ORDER BY message_id ASC
+query IIT
+SELECT user_id_1, user_id_2, text FROM messages ORDER BY message_id ASC
 ----
-7  10  40  oh hi mark
-8  40  10  youre tearing me apart lisa!
+10  40  oh hi mark
+40  10  youre tearing me apart lisa!
 
 # Drop everything.
 statement ok

@@ -12,7 +12,7 @@ import { SqlExecutionRequest, executeInternalSql } from "./sqlApi";
 
 export type DecodePlanGistResponse = {
   explainPlan?: string;
-  error?: string;
+  error?: Error;
 };
 
 export type DecodePlanGistRequest = {
@@ -38,7 +38,7 @@ export function getExplainPlanFromGist(
       },
     ],
     execute: true,
-    timeout: "10s",
+    timeout: "30s",
   };
 
   return executeInternalSql<DecodePlanGistColumns>(request).then(result => {
@@ -48,20 +48,20 @@ export function getExplainPlanFromGist(
     ) {
       return {
         error: result.execution.txn_results
-          ? result.execution.txn_results[0].error?.message
+          ? result.execution.txn_results[0].error
           : null,
       };
     }
 
     if (result.execution.txn_results[0].error) {
       return {
-        error: result.execution.txn_results[0].error.message,
+        error: result.execution.txn_results[0].error,
       };
     }
 
-    const explainPlan = result.execution.txn_results[0].rows
-      .map(col => col.plan_row)
-      .join("\n");
+    const explainPlan =
+      `Plan Gist: ${req.planGist} \n\n` +
+      result.execution.txn_results[0].rows.map(col => col.plan_row).join("\n");
 
     return { explainPlan };
   });

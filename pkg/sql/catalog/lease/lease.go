@@ -502,7 +502,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		lt := logtags.FromContext(ctx)
 		ctx, cancel := m.stopper.WithCancelOnQuiesce(logtags.AddTags(m.ambientCtx.AnnotateCtx(context.Background()), lt))
 		defer cancel()
-		if m.isDraining() {
+		if m.IsDraining() {
 			return nil, errors.New("cannot acquire lease when draining")
 		}
 		newest := m.findNewest(id)
@@ -545,7 +545,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 
 // releaseLease from store.
 func releaseLease(ctx context.Context, lease *storedLease, m *Manager) {
-	if m.isDraining() {
+	if m.IsDraining() {
 		// Release synchronously to guarantee release before exiting.
 		m.storage.release(ctx, m.stopper, lease)
 		return
@@ -1011,10 +1011,11 @@ func (m *Manager) Acquire(
 func (m *Manager) removeOnceDereferenced() bool {
 	return m.storage.testingKnobs.RemoveOnceDereferenced ||
 		// Release from the store if the Manager is draining.
-		m.isDraining()
+		m.IsDraining()
 }
 
-func (m *Manager) isDraining() bool {
+// IsDraining returns true if this node's lease manager is draining.
+func (m *Manager) IsDraining() bool {
 	return m.draining.Load().(bool)
 }
 
@@ -1035,7 +1036,7 @@ func (m *Manager) SetDraining(
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for id, t := range m.mu.descriptors {
+	for _, t := range m.mu.descriptors {
 		leases := func() []*storedLease {
 			t.mu.Lock()
 			defer t.mu.Unlock()
@@ -1044,7 +1045,6 @@ func (m *Manager) SetDraining(
 		for _, l := range leases {
 			releaseLease(ctx, l, m)
 		}
-		delete(m.mu.descriptors, id)
 		if reporter != nil {
 			// Report progress through the Drain RPC.
 			reporter(len(leases), "descriptor leases")

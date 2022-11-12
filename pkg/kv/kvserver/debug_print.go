@@ -16,8 +16,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -63,6 +63,23 @@ func SprintEngineKey(key storage.EngineKey) string {
 	return fmt.Sprintf("%s %x (%#x): ", key.Key, key.Version, key.Encode())
 }
 
+// SprintEngineRangeKey pretty-prints the specified engine range key. All range
+// keys are currently MVCC range keys, so it will utilize SprintMVCCRangeKey for
+// proper MVCC formatting.
+func SprintEngineRangeKey(s roachpb.Span, suffix []byte) string {
+	if ts, err := storage.DecodeMVCCTimestampSuffix(suffix); err == nil {
+		rk := storage.MVCCRangeKey{StartKey: s.Key, EndKey: s.EndKey, Timestamp: ts}
+		return SprintMVCCRangeKey(rk)
+	}
+	return fmt.Sprintf("%s %x (%#x-%#x)", s, suffix, s.Key, s.EndKey)
+}
+
+// SprintKeySpan pretty-prints a key span.
+func SprintKeySpan(s roachpb.Span) string {
+	return fmt.Sprintf("%s (%#x-%#x)", s, storage.EncodeMVCCKeyPrefix(s.Key),
+		storage.EncodeMVCCKeyPrefix(s.EndKey))
+}
+
 // SprintMVCCKey pretty-prints the specified MVCCKey.
 func SprintMVCCKey(key storage.MVCCKey) string {
 	return fmt.Sprintf("%s %s (%#x): ", key.Timestamp, key.Key, storage.EncodeMVCCKey(key))
@@ -70,7 +87,7 @@ func SprintMVCCKey(key storage.MVCCKey) string {
 
 // SprintMVCCRangeKey pretty-prints the specified MVCCRangeKey.
 func SprintMVCCRangeKey(rangeKey storage.MVCCRangeKey) string {
-	return fmt.Sprintf("%s %s (%#x-%#x): ", rangeKey.Timestamp, rangeKey.Bounds(),
+	return fmt.Sprintf("%s %s (%#x-%#x)", rangeKey.Timestamp, rangeKey.Bounds(),
 		storage.EncodeMVCCKeyPrefix(rangeKey.StartKey), storage.EncodeMVCCKeyPrefix(rangeKey.EndKey))
 }
 
@@ -153,7 +170,7 @@ func SprintMVCCKeyValue(kv storage.MVCCKeyValue, printKey bool) string {
 func SprintMVCCRangeKeyValue(rkv storage.MVCCRangeKeyValue, printKey bool) string {
 	var sb strings.Builder
 	if printKey {
-		sb.WriteString(SprintMVCCRangeKey(rkv.RangeKey))
+		sb.WriteString(SprintMVCCRangeKey(rkv.RangeKey) + ": ")
 	}
 
 	decoders := append(DebugSprintMVCCRangeKeyValueDecoders,
@@ -265,6 +282,57 @@ func decodeWriteBatch(writeBatch *kvserverpb.WriteBatch) (string, error) {
 			sb.WriteString(fmt.Sprintf(
 				"Delete Range: [%s, %s)\n", SprintEngineKey(engineStartKey), SprintEngineKey(engineEndKey),
 			))
+		case storage.BatchTypeRangeKeySet:
+			engineStartKey, err := r.EngineKey()
+			if err != nil {
+				return sb.String(), err
+			}
+			engineEndKey, err := r.EngineEndKey()
+			if err != nil {
+				return sb.String(), err
+			}
+			rangeKeys, err := r.EngineRangeKeys()
+			if err != nil {
+				return sb.String(), err
+			}
+			span := roachpb.Span{Key: engineStartKey.Key, EndKey: engineEndKey.Key}
+			for _, rangeKey := range rangeKeys {
+				sb.WriteString(fmt.Sprintf(
+					"Set Range Key: %s\n", SprintEngineRangeKeyValue(span, rangeKey),
+				))
+			}
+		case storage.BatchTypeRangeKeyUnset:
+			engineStartKey, err := r.EngineKey()
+			if err != nil {
+				return sb.String(), err
+			}
+			engineEndKey, err := r.EngineEndKey()
+			if err != nil {
+				return sb.String(), err
+			}
+			rangeKeys, err := r.EngineRangeKeys()
+			if err != nil {
+				return sb.String(), err
+			}
+			span := roachpb.Span{Key: engineStartKey.Key, EndKey: engineEndKey.Key}
+			for _, rangeKey := range rangeKeys {
+				sb.WriteString(fmt.Sprintf(
+					"Unset Range Key: %s\n", SprintEngineRangeKey(span, rangeKey.Version),
+				))
+			}
+		case storage.BatchTypeRangeKeyDelete:
+			engineStartKey, err := r.EngineKey()
+			if err != nil {
+				return sb.String(), err
+			}
+			engineEndKey, err := r.EngineEndKey()
+			if err != nil {
+				return sb.String(), err
+			}
+			sb.WriteString(fmt.Sprintf(
+				"Delete Range Keys: %s\n",
+				SprintKeySpan(roachpb.Span{Key: engineStartKey.Key, EndKey: engineEndKey.Key}),
+			))
 		default:
 			sb.WriteString(fmt.Sprintf("unsupported batch type: %d\n", r.BatchType()))
 		}
@@ -273,52 +341,21 @@ func decodeWriteBatch(writeBatch *kvserverpb.WriteBatch) (string, error) {
 }
 
 func tryRaftLogEntry(kv storage.MVCCKeyValue) (string, error) {
-	var ent raftpb.Entry
-	if err := maybeUnmarshalInline(kv.Value, &ent); err != nil {
+	e, err := raftlog.NewEntryFromRawValue(kv.Value)
+	if err != nil {
 		return "", err
 	}
+	defer e.Release()
 
-	var cmd kvserverpb.RaftCommand
-	switch ent.Type {
-	case raftpb.EntryNormal:
-		if len(ent.Data) == 0 {
-			return fmt.Sprintf("%s: EMPTY\n", &ent), nil
-		}
-		_, cmdData := kvserverbase.DecodeRaftCommand(ent.Data)
-		if err := protoutil.Unmarshal(cmdData, &cmd); err != nil {
-			return "", err
-		}
-	case raftpb.EntryConfChange, raftpb.EntryConfChangeV2:
-		var c raftpb.ConfChangeI
-		if ent.Type == raftpb.EntryConfChange {
-			var cc raftpb.ConfChange
-			if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
-				return "", err
-			}
-			c = cc
-		} else {
-			var cc raftpb.ConfChangeV2
-			if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
-				return "", err
-			}
-			c = cc
-		}
-
-		var ctx kvserverpb.ConfChangeContext
-		if err := protoutil.Unmarshal(c.AsV2().Context, &ctx); err != nil {
-			return "", err
-		}
-		if err := protoutil.Unmarshal(ctx.Payload, &cmd); err != nil {
-			return "", err
-		}
-	default:
-		return "", fmt.Errorf("unknown log entry type: %s", &ent)
+	if len(e.Data) == 0 {
+		return fmt.Sprintf("%s: EMPTY\n", &e.Entry), nil
 	}
-	ent.Data = nil
+	e.Data = nil
+	cmd := e.Cmd
 
 	var leaseStr string
 	if l := cmd.DeprecatedProposerLease; l != nil {
-		leaseStr = l.String() // use full lease, if available
+		leaseStr = l.String() // use the full lease, if available
 	} else {
 		leaseStr = fmt.Sprintf("lease #%d", cmd.ProposerLeaseSequence)
 	}
@@ -329,7 +366,7 @@ func tryRaftLogEntry(kv storage.MVCCKeyValue) (string, error) {
 	}
 	cmd.WriteBatch = nil
 
-	return fmt.Sprintf("%s by %s\n%s\nwrite batch:\n%s", &ent, leaseStr, &cmd, wbStr), nil
+	return fmt.Sprintf("%s by %s\n%s\nwrite batch:\n%s", &e.Entry, leaseStr, &cmd, wbStr), nil
 }
 
 func tryTxn(kv storage.MVCCKeyValue) (string, error) {
@@ -457,14 +494,4 @@ func maybeUnmarshalInline(v []byte, dest protoutil.Message) error {
 		RawBytes: meta.RawBytes,
 	}
 	return value.GetProto(dest)
-}
-
-type stringifyWriteBatch kvserverpb.WriteBatch
-
-func (s *stringifyWriteBatch) String() string {
-	wbStr, err := decodeWriteBatch((*kvserverpb.WriteBatch)(s))
-	if err == nil {
-		return wbStr
-	}
-	return fmt.Sprintf("failed to stringify write batch (%x): %s", s.Data, err)
 }

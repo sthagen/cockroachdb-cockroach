@@ -30,6 +30,11 @@ import "antd/lib/tabs/style";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
 import styles from "./statementDetails.module.scss";
+import LoadingError from "../sqlActivity/errorComponent";
+import { Loading } from "../loading";
+import { Insights } from "./planDetails";
+import { getIdxRecommendationsFromExecution } from "../api/idxRecForStatementApi";
+import { SortSetting } from "../sortedtable";
 const cx = classNames.bind(styles);
 
 export type ActiveStatementDetailsStateProps = {
@@ -48,6 +53,12 @@ enum TabKeysEnum {
   EXPLAIN = "explain",
 }
 
+type ExplainPlanState = {
+  explainPlan: string;
+  loaded: boolean;
+  error: Error;
+};
+
 export type ActiveStatementDetailsProps = ActiveStatementDetailsStateProps &
   ActiveStatementDetailsDispatchProps;
 
@@ -60,7 +71,16 @@ export const ActiveStatementDetails: React.FC<ActiveStatementDetailsProps> = ({
 }) => {
   const history = useHistory();
   const executionID = getMatchParamByName(match, executionIdAttr);
-  const [explain, setExplain] = useState<string>(null);
+  const [explainPlanState, setExplainPlanState] = useState<ExplainPlanState>({
+    explainPlan: null,
+    loaded: false,
+    error: null,
+  });
+  const [indexRecommendations, setIndexRecommendations] = useState<string[]>();
+  const [insightsSortSetting, setInsightsSortSetting] = useState<SortSetting>({
+    ascending: false,
+    columnTitle: "insights",
+  });
 
   useEffect(() => {
     if (statement == null) {
@@ -74,11 +94,22 @@ export const ActiveStatementDetails: React.FC<ActiveStatementDetailsProps> = ({
       !isTenant &&
       key === TabKeysEnum.EXPLAIN &&
       statement?.planGist &&
-      !explain
+      !explainPlanState.loaded
     ) {
       // Get the explain plan.
       getExplainPlanFromGist({ planGist: statement.planGist }).then(res => {
-        setExplain(res.explainPlan || res.error);
+        setExplainPlanState({
+          explainPlan: res.explainPlan,
+          loaded: true,
+          error: res.error,
+        });
+      });
+      getIdxRecommendationsFromExecution({
+        planGist: statement.planGist,
+        query: statement.stmtNoConstants,
+        appName: statement.application,
+      }).then(res => {
+        setIndexRecommendations(res.recommendations);
       });
     }
   };
@@ -87,6 +118,7 @@ export const ActiveStatementDetails: React.FC<ActiveStatementDetailsProps> = ({
     history.push("/sql-activity?tab=Statements&view=active");
   };
 
+  const hasInsights = indexRecommendations?.length > 0;
   return (
     <div className={cx("root")}>
       <Helmet title={`Details`} />
@@ -129,10 +161,39 @@ export const ActiveStatementDetails: React.FC<ActiveStatementDetailsProps> = ({
         </Tabs.TabPane>
         {!isTenant && (
           <Tabs.TabPane tab="Explain Plan" key={TabKeysEnum.EXPLAIN}>
-            <SqlBox
-              value={explain || "Not available."}
-              size={SqlBoxSize.custom}
-            />
+            <Row gutter={24} className={cx("margin-right")}>
+              <Col className="gutter-row" span={24}>
+                <Loading
+                  loading={
+                    !explainPlanState.loaded && statement?.planGist?.length > 0
+                  }
+                  page={"stmt_insight_details"}
+                  error={explainPlanState.error}
+                  renderError={() =>
+                    LoadingError({
+                      statsType: "explain plan",
+                      timeout: explainPlanState.error?.name
+                        ?.toLowerCase()
+                        .includes("timeout"),
+                    })
+                  }
+                >
+                  <SqlBox
+                    value={explainPlanState.explainPlan || "Not available."}
+                    size={SqlBoxSize.custom}
+                  />
+                  {hasInsights && (
+                    <Insights
+                      idxRecommendations={indexRecommendations}
+                      query={statement.stmtNoConstants}
+                      database={statement.database}
+                      sortSetting={insightsSortSetting}
+                      onChangeSortSetting={setInsightsSortSetting}
+                    />
+                  )}
+                </Loading>
+              </Col>
+            </Row>
           </Tabs.TabPane>
         )}
       </Tabs>

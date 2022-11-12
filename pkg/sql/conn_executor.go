@@ -2763,6 +2763,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 	*evalCtx = extendedEvalContext{
 		Context: eval.Context{
 			Planner:                        p,
+			StreamManagerFactory:           p,
 			PrivilegedAccessor:             p,
 			SessionAccessor:                p,
 			JobExecContext:                 p,
@@ -3238,6 +3239,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			Progress:       float32(progress),
 			IsFullScan:     query.isFullScan,
 			PlanGist:       query.planGist,
+			Database:       query.database,
 		})
 	}
 	lastActiveQuery := ""

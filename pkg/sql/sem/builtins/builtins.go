@@ -12,7 +12,6 @@ package builtins
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/md5"
 	cryptorand "crypto/rand"
@@ -24,7 +23,6 @@ import (
 	"hash"
 	"hash/crc32"
 	"hash/fnv"
-	"io"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -87,6 +85,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/tochar"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/trigram"
@@ -1210,23 +1209,13 @@ var regularBuiltins = map[string]builtinDefinition{
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				uncompressedData := []byte(tree.MustBeDBytes(args[0]))
 				codec := string(tree.MustBeDString(args[1]))
-				switch strings.ToUpper(codec) {
-				case "GZIP":
-					gzipBuf := bytes.NewBuffer([]byte{})
-					gz := gzip.NewWriter(gzipBuf)
-					if _, err := gz.Write(uncompressedData); err != nil {
-						return nil, err
-					}
-					if err := gz.Close(); err != nil {
-						return nil, err
-					}
-					return tree.NewDBytes(tree.DBytes(gzipBuf.Bytes())), nil
-				default:
-					return nil, pgerror.New(pgcode.InvalidParameterValue,
-						"only 'gzip' codec is supported for compress()")
+				compressedBytes, err := compress(uncompressedData, codec)
+				if err != nil {
+					return nil, err
 				}
+				return tree.NewDBytes(tree.DBytes(compressedBytes)), nil
 			},
-			Info:       "Compress `data` with the specified `codec` (`gzip`).",
+			Info:       "Compress `data` with the specified `codec` (`gzip`, 'lz4', 'snappy', 'zstd).",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -1238,24 +1227,13 @@ var regularBuiltins = map[string]builtinDefinition{
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				compressedData := []byte(tree.MustBeDBytes(args[0]))
 				codec := string(tree.MustBeDString(args[1]))
-				switch strings.ToUpper(codec) {
-				case "GZIP":
-					r, err := gzip.NewReader(bytes.NewBuffer(compressedData))
-					if err != nil {
-						return nil, errors.Wrap(err, "failed to decompress")
-					}
-					defer r.Close()
-					decompressedBytes, err := io.ReadAll(r)
-					if err != nil {
-						return nil, err
-					}
-					return tree.NewDBytes(tree.DBytes(decompressedBytes)), nil
-				default:
-					return nil, pgerror.New(pgcode.InvalidParameterValue,
-						"only 'gzip' codec is supported for decompress()")
+				decompressedBytes, err := decompress(compressedData, codec)
+				if err != nil {
+					return nil, err
 				}
+				return tree.NewDBytes(tree.DBytes(decompressedBytes)), nil
 			},
-			Info:       "Decompress `data` with the specified `codec` (`gzip`).",
+			Info:       "Decompress `data` with the specified `codec` (`gzip`, 'lz4', 'snappy', 'zstd).",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -2413,6 +2391,42 @@ var regularBuiltins = map[string]builtinDefinition{
 			},
 			Info:       "Convert an timestamp to a string assuming the ISO, MDY DateStyle.",
 			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"interval", types.Interval}, {"format", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				d := tree.MustBeDInterval(args[0])
+				f := tree.MustBeDString(args[1])
+				s, err := tochar.DurationToChar(d.Duration, string(f))
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert an interval to a string using the given format.",
+			Volatility: volatility.Stable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"timestamp", types.Timestamp}, {"format", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				ts := tree.MustBeDTimestamp(args[0])
+				f := tree.MustBeDString(args[1])
+				s, err := tochar.TimeToChar(ts.Time, string(f))
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert an timestamp to a string using the given format.",
+			Volatility: volatility.Stable,
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"timestamptz", types.TimestampTZ}, {"format", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				ts := tree.MustBeDTimestampTZ(args[0])
+				f := tree.MustBeDString(args[1])
+				s, err := tochar.TimeToChar(ts.Time, string(f))
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert a timestamp with time zone to a string using the given format.",
+			Volatility: volatility.Stable,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{{"date", types.Date}},
@@ -4816,7 +4830,7 @@ value if you rely on the HLC for accuracy.`,
 				if err != nil {
 					return nil, err
 				}
-				if err := evalCtx.Tenant.CreateTenant(ctx, uint64(sTenID), ""); err != nil {
+				if err := evalCtx.Tenant.CreateTenantWithID(ctx, uint64(sTenID), ""); err != nil {
 					return nil, err
 				}
 				return args[0], nil
@@ -4836,12 +4850,29 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				tenantName := tree.MustBeDString(args[1])
-				if err := evalCtx.Tenant.CreateTenant(ctx, uint64(sTenID), string(tenantName)); err != nil {
+				if err := evalCtx.Tenant.CreateTenantWithID(ctx, uint64(sTenID), roachpb.TenantName(tenantName)); err != nil {
 					return nil, err
 				}
 				return args[0], nil
 			},
-			Info:       "Creates a new tenant with the provided ID. Must be run by the System tenant.",
+			Info:       "Creates a new tenant with the provided ID and name. Must be run by the System tenant.",
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"name", types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				tenantName := tree.MustBeDString(args[0])
+				var tenantID roachpb.TenantID
+				var err error
+				if tenantID, err = evalCtx.Tenant.CreateTenant(ctx, roachpb.TenantName(tenantName)); err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(tenantID.ToUint64())), nil
+			},
+			Info:       "Creates a new tenant with the provided name. Must be run by the System tenant.",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -4863,7 +4894,7 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				tenantName := tree.MustBeDString(args[1])
-				if err := evalCtx.Tenant.RenameTenant(ctx, uint64(sTenID), string(tenantName)); err != nil {
+				if err := evalCtx.Tenant.RenameTenant(ctx, uint64(sTenID), roachpb.TenantName(tenantName)); err != nil {
 					return nil, err
 				}
 				return args[0], nil
@@ -9199,24 +9230,6 @@ func extractTimeSpanFromTimeOfDay(t timeofday.TimeOfDay, timeSpan string) (tree.
 	}
 }
 
-// dateToJulianDay is based on the date2j function in PostgreSQL 10.5.
-func dateToJulianDay(year int, month int, day int) int {
-	if month > 2 {
-		month++
-		year += 4800
-	} else {
-		month += 13
-		year += 4799
-	}
-
-	century := year / 100
-	jd := year*365 - 32167
-	jd += year/4 - century + century/4
-	jd += 7834*month/256 + day
-
-	return jd
-}
-
 func extractTimeSpanFromTimestampTZ(
 	evalCtx *eval.Context, fromTime time.Time, timeSpan string,
 ) (tree.Datum, error) {
@@ -9343,7 +9356,7 @@ func extractTimeSpanFromTimestamp(
 		return tree.NewDFloat(tree.DFloat(fromTime.YearDay())), nil
 
 	case "julian":
-		julianDay := float64(dateToJulianDay(fromTime.Year(), int(fromTime.Month()), fromTime.Day())) +
+		julianDay := float64(pgdate.DateToJulianDay(fromTime.Year(), int(fromTime.Month()), fromTime.Day())) +
 			(float64(fromTime.Hour()*duration.SecsPerHour+fromTime.Minute()*duration.SecsPerMinute+fromTime.Second())+
 				float64(fromTime.Nanosecond())/float64(time.Second))/duration.SecsPerDay
 		return tree.NewDFloat(tree.DFloat(julianDay)), nil

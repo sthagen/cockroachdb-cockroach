@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -154,6 +155,24 @@ func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
 	_ context.Context, id int64,
 ) error {
 	return errors.WithStack(errRegionOperator)
+}
+
+// DummyStreamManagerFactory implements the eval.StreamManagerFactory interface by
+// returning errors.
+type DummyStreamManagerFactory struct{}
+
+// GetReplicationStreamManager implements the eval.StreamManagerFactory interface.
+func (smf *DummyStreamManagerFactory) GetReplicationStreamManager(
+	ctx context.Context,
+) (eval.ReplicationStreamManager, error) {
+	return nil, errors.WithStack(errors.New("Stream manager factory not implemented"))
+}
+
+// GetStreamIngestManager implements the eval.StreamManagerFactory interface.
+func (smf *DummyStreamManagerFactory) GetStreamIngestManager(
+	ctx context.Context,
+) (eval.StreamIngestManager, error) {
+	return nil, errors.WithStack(errors.New("Stream manager factory not implemented"))
 }
 
 // DummyEvalPlanner implements the eval.Planner interface by returning
@@ -541,13 +560,24 @@ var _ eval.TenantOperator = &DummyTenantOperator{}
 var errEvalTenant = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessionContext,
 	"cannot evaluate tenant operation in this context")
 
-// CreateTenant is part of the tree.TenantOperator interface.
-func (c *DummyTenantOperator) CreateTenant(_ context.Context, _ uint64, _ string) error {
+// CreateTenantWithID is part of the tree.TenantOperator interface.
+func (c *DummyTenantOperator) CreateTenantWithID(
+	ctx context.Context, tenantID uint64, tenantName roachpb.TenantName,
+) error {
 	return errors.WithStack(errEvalTenant)
 }
 
+// CreateTenant is part of the tree.TenantOperator interface.
+func (c *DummyTenantOperator) CreateTenant(
+	ctx context.Context, tenantName roachpb.TenantName,
+) (roachpb.TenantID, error) {
+	return roachpb.MakeTenantID(0), errors.WithStack(errEvalTenant)
+}
+
 // RenameTenant is part of the tree.TenantOperator interface.
-func (c *DummyTenantOperator) RenameTenant(_ context.Context, _ uint64, _ string) error {
+func (c *DummyTenantOperator) RenameTenant(
+	ctx context.Context, tenantID uint64, tenantName roachpb.TenantName,
+) error {
 	return errors.WithStack(errEvalTenant)
 }
 

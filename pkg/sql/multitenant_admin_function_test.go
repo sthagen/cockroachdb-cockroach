@@ -24,6 +24,7 @@ import (
 )
 
 const createTable = "CREATE TABLE t(i int PRIMARY KEY);"
+const rangeErrorMessage = "RangeIterator failed to seek"
 
 func createTestServer(t *testing.T) (serverutils.TestServerInterface, func()) {
 	testCluster := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
@@ -43,13 +44,17 @@ func createSystemTenantDB(t *testing.T, testServer serverutils.TestServerInterfa
 }
 
 func createSecondaryTenantDB(
-	t *testing.T, testServer serverutils.TestServerInterface, allowSplitAndScatter bool,
+	t *testing.T,
+	testServer serverutils.TestServerInterface,
+	allowSplitAndScatter bool,
+	skipSQLSystemTenantCheck bool,
 ) *gosql.DB {
 	_, db := serverutils.StartTenant(
 		t, testServer, base.TestTenantArgs{
 			TestingKnobs: base.TestingKnobs{
 				TenantTestingKnobs: &TenantTestingKnobs{
-					AllowSplitAndScatter: allowSplitAndScatter,
+					AllowSplitAndScatter:      allowSplitAndScatter,
+					SkipSQLSystemTentantCheck: skipSQLSystemTenantCheck,
 				},
 			},
 			TenantID: serverutils.TestTenantID(),
@@ -63,32 +68,63 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		desc                 string
-		setup                string
-		setups               []string
-		query                string
-		errorMessage         string
-		allowSplitAndScatter bool
+		desc                     string
+		setup                    string
+		setups                   []string
+		query                    string
+		errorMessage             string
+		allowSplitAndScatter     bool
+		skipSQLSystemTenantCheck bool
 	}{
 		{
 			desc:  "ALTER RANGE x RELOCATE LEASE",
 			query: "ALTER RANGE (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]) RELOCATE LEASE TO 1;",
 		},
 		{
+			desc:                     "ALTER RANGE x RELOCATE LEASE SkipSQLSystemTenantCheck",
+			query:                    "ALTER RANGE (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]) RELOCATE LEASE TO 1;",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
+		},
+		{
 			desc:  "ALTER RANGE RELOCATE LEASE",
 			query: "ALTER RANGE RELOCATE LEASE TO 1 FOR (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]);",
+		},
+		{
+			desc:                     "ALTER RANGE RELOCATE LEASE SkipSQLSystemTenantCheck",
+			query:                    "ALTER RANGE RELOCATE LEASE TO 1 FOR (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]);",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
 		},
 		{
 			desc:  "ALTER RANGE x RELOCATE VOTERS",
 			query: "ALTER RANGE (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]) RELOCATE VOTERS FROM 1 TO 1;",
 		},
 		{
+			desc:                     "ALTER RANGE x RELOCATE VOTERS SkipSQLSystemTenantCheck",
+			query:                    "ALTER RANGE (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]) RELOCATE VOTERS FROM 1 TO 1;",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
+		},
+		{
 			desc:  "ALTER RANGE RELOCATE VOTERS",
 			query: "ALTER RANGE RELOCATE VOTERS FROM 1 TO 1 FOR (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]);",
 		},
 		{
+			desc:                     "ALTER RANGE RELOCATE VOTERS SkipSQLSystemTenantCheck",
+			query:                    "ALTER RANGE RELOCATE VOTERS FROM 1 TO 1 FOR (SELECT min(range_id) FROM [SHOW RANGES FROM TABLE t]);",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
+		},
+		{
 			desc:  "ALTER TABLE x EXPERIMENTAL_RELOCATE LEASE",
 			query: "ALTER TABLE t EXPERIMENTAL_RELOCATE LEASE SELECT 1, 1;",
+		},
+		{
+			desc:                     "ALTER TABLE x EXPERIMENTAL_RELOCATE LEASE SkipSQLSystemTenantCheck",
+			query:                    "ALTER TABLE t EXPERIMENTAL_RELOCATE LEASE SELECT 1, 1;",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
 		},
 		{
 			desc:  "ALTER TABLE x EXPERIMENTAL_RELOCATE VOTERS",
@@ -109,6 +145,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 			desc:                 "ALTER TABLE x UNSPLIT AT",
 			setup:                "ALTER TABLE t SPLIT AT VALUES (1);",
 			query:                "ALTER TABLE t UNSPLIT AT VALUES (1);",
+			errorMessage:         "request [1 AdmUnsplit] not permitted",
 			allowSplitAndScatter: true,
 		},
 		{
@@ -119,6 +156,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 				"ALTER INDEX t@idx SPLIT AT VALUES (1);",
 			},
 			query:                "ALTER INDEX t@idx UNSPLIT AT VALUES (1);",
+			errorMessage:         "request [1 AdmUnsplit] not permitted",
 			allowSplitAndScatter: true,
 		},
 		{
@@ -126,18 +164,33 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 			query: "ALTER TABLE t UNSPLIT ALL;",
 		},
 		{
+			desc:                     "ALTER TABLE x UNSPLIT ALL SkipSQLSystemTenantCheck",
+			query:                    "ALTER TABLE t UNSPLIT ALL;",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
+		},
+		{
 			desc:  "ALTER INDEX x UNSPLIT ALL",
 			setup: "CREATE INDEX idx on t(i);",
 			query: "ALTER INDEX t@idx UNSPLIT ALL;",
 		},
 		{
-			desc:  "ALTER TABLE x SCATTER",
-			query: "ALTER TABLE t SCATTER;",
+			desc:                     "ALTER INDEX x UNSPLIT ALL SkipSQLSystemTenantCheck",
+			setup:                    "CREATE INDEX idx on t(i);",
+			query:                    "ALTER INDEX t@idx UNSPLIT ALL;",
+			errorMessage:             rangeErrorMessage,
+			skipSQLSystemTenantCheck: true,
 		},
 		{
-			desc:  "ALTER INDEX x SCATTER",
-			setup: "CREATE INDEX idx on t(i);",
-			query: "ALTER INDEX t@idx SCATTER;",
+			desc:         "ALTER TABLE x SCATTER",
+			query:        "ALTER TABLE t SCATTER;",
+			errorMessage: "request [1 AdmScatter] not permitted",
+		},
+		{
+			desc:         "ALTER INDEX x SCATTER",
+			setup:        "CREATE INDEX idx on t(i);",
+			query:        "ALTER INDEX t@idx SCATTER;",
+			errorMessage: "request [1 AdmScatter] not permitted",
 		},
 		{
 			desc:  "CONFIGURE ZONE",
@@ -178,7 +231,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 			func() {
 				testServer, cleanup := createTestServer(t)
 				defer cleanup()
-				db := createSecondaryTenantDB(t, testServer, tc.allowSplitAndScatter)
+				db := createSecondaryTenantDB(t, testServer, tc.allowSplitAndScatter, tc.skipSQLSystemTenantCheck)
 				err := execQueries(db)
 				require.Error(t, err)
 				errorMessage := tc.errorMessage
@@ -221,8 +274,14 @@ func TestTruncateTable(t *testing.T) {
 	func() {
 		testServer, cleanup := createTestServer(t)
 		defer cleanup()
-		db := createSecondaryTenantDB(t, testServer, true /* allowSplitAndScatter */)
+		db := createSecondaryTenantDB(
+			t,
+			testServer,
+			true,  /* allowSplitAndScatter */
+			false, /* skipSQLSystemTenantCheck */
+		)
 		err := execQueries(db)
 		require.Error(t, err)
+		require.Contains(t, err.Error(), rangeErrorMessage)
 	}()
 }

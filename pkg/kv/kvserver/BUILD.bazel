@@ -8,6 +8,7 @@ go_library(
     name = "kvserver",
     srcs = [
         "addressing.go",
+        "allocation_op.go",
         "consistency_queue.go",
         "debug_print.go",
         "doc.go",
@@ -138,6 +139,7 @@ go_library(
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/multiqueue",
         "//pkg/kv/kvserver/raftentry",
+        "//pkg/kv/kvserver/raftlog",
         "//pkg/kv/kvserver/raftutil",
         "//pkg/kv/kvserver/rangefeed",
         "//pkg/kv/kvserver/rditer",
@@ -356,6 +358,7 @@ go_test(
         "//pkg/kv/kvserver/protectedts/ptstorage",
         "//pkg/kv/kvserver/protectedts/ptutil",
         "//pkg/kv/kvserver/raftentry",
+        "//pkg/kv/kvserver/raftlog",
         "//pkg/kv/kvserver/raftutil",
         "//pkg/kv/kvserver/rditer",
         "//pkg/kv/kvserver/readsummary/rspb",

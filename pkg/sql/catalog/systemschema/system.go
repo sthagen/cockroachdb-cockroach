@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -243,18 +244,19 @@ CREATE TABLE system.web_sessions (
 	// average size of the column group in bytes.
 	TableStatisticsTableSchema = `
 CREATE TABLE system.table_statistics (
-	"tableID"       INT8       NOT NULL,
-	"statisticID"   INT8       NOT NULL DEFAULT unique_rowid(),
-	name            STRING,
-	"columnIDs"     INT8[]     NOT NULL,
-	"createdAt"     TIMESTAMP  NOT NULL DEFAULT now(),
-	"rowCount"      INT8       NOT NULL,
-	"distinctCount" INT8       NOT NULL,
-	"nullCount"     INT8       NOT NULL,
-	histogram       BYTES,
-	"avgSize"       INT8       NOT NULL DEFAULT 0,
+	"tableID"            INT8       NOT NULL,
+	"statisticID"        INT8       NOT NULL DEFAULT unique_rowid(),
+	name                 STRING,
+	"columnIDs"          INT8[]     NOT NULL,
+	"createdAt"          TIMESTAMP  NOT NULL DEFAULT now(),
+	"rowCount"           INT8       NOT NULL,
+	"distinctCount"      INT8       NOT NULL,
+	"nullCount"          INT8       NOT NULL,
+	histogram            BYTES,
+	"avgSize"            INT8       NOT NULL DEFAULT 0,
+	"partialPredicate"   STRING,
 	CONSTRAINT "primary" PRIMARY KEY ("tableID", "statisticID"),
-	FAMILY "fam_0_tableID_statisticID_name_columnIDs_createdAt_rowCount_distinctCount_nullCount_histogram" ("tableID", "statisticID", name, "columnIDs", "createdAt", "rowCount", "distinctCount", "nullCount", histogram, "avgSize")
+	FAMILY "fam_0_tableID_statisticID_name_columnIDs_createdAt_rowCount_distinctCount_nullCount_histogram" ("tableID", "statisticID", name, "columnIDs", "createdAt", "rowCount", "distinctCount", "nullCount", histogram, "avgSize", "partialPredicate")
 );`
 
 	// locations are used to map a locality specified by a node to geographic
@@ -460,9 +462,20 @@ CREATE TABLE system.sqlliveness (
     session_id       BYTES NOT NULL,
     expiration       DECIMAL NOT NULL,
     CONSTRAINT "primary" PRIMARY KEY (session_id),
-  	FAMILY fam0_session_id_expiration (session_id, expiration)
+    FAMILY fam0_session_id_expiration (session_id, expiration)
 )`
 
+	MrSqllivenessTableSchema = `
+CREATE TABLE system.sqlliveness (
+    session_uuid         BYTES NOT NULL,
+    expiration           DECIMAL NOT NULL,
+    crdb_region          BYTES NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (crdb_region, session_uuid),
+    FAMILY "primary" (crdb_region, session_uuid, expiration)
+)`
+
+	// system.migrations stores completion records for upgrades performed by the
+	// upgrade package. Only completed upgrades have a row in this table.
 	MigrationsTableSchema = `
 CREATE TABLE system.migrations (
     major        INT8 NOT NULL,
@@ -811,13 +824,19 @@ func systemTable(
 	return tbl
 }
 
-func registerSystemTable(
+// SystemTable wraps the catalog descriptor with extra fields that are used to
+// validate the descriptor.
+type SystemTable struct {
+	catalog.TableDescriptor
+
+	// Schema is a CREATE TABLE string that would create the sytem database.
+	Schema string
+}
+
+func makeSystemTable(
 	createTableStmt string, tbl descpb.TableDescriptor, fns ...func(tbl *descpb.TableDescriptor),
-) catalog.TableDescriptor {
+) SystemTable {
 	ctx := context.Background()
-	if _, alreadyExists := SystemTableDescriptors[createTableStmt]; alreadyExists {
-		log.Fatalf(ctx, "system table %q cannot be registered, existing entry for %s", tbl.Name, createTableStmt)
-	}
 	{
 		nameInfo := descpb.NameInfo{
 			ParentID:       tbl.ParentID,
@@ -840,21 +859,64 @@ func registerSystemTable(
 			tbl.Name, err,
 		)
 	}
-	desc := b.BuildImmutableTable()
-	SystemTableDescriptors[createTableStmt] = desc
-	return desc
+	return SystemTable{
+		Schema:          createTableStmt,
+		TableDescriptor: b.BuildImmutableTable(),
+	}
 }
 
 var (
 	// SystemDB is the descriptor for the system database.
 	SystemDB = MakeSystemDatabaseDesc()
-
-	// SystemTableDescriptors contains the registered table descriptors for each
-	// system table. The map is populated by calling registerSystemTable and is
-	// keyed by the CREATE TABLE statements with which these descriptors are
-	// tested against in TestSystemTableLiterals.
-	SystemTableDescriptors = make(map[string]catalog.TableDescriptor)
 )
+
+// MakeSystemTables produces a list of all tables in the system database.
+func MakeSystemTables() []SystemTable {
+	return []SystemTable{
+		NamespaceTable,
+		DescriptorTable,
+		UsersTable,
+		ZonesTable,
+		SettingsTable,
+		DescIDSequence,
+		RoleIDSequence,
+		TenantsTable,
+		LeaseTable,
+		EventLogTable,
+		RangeEventTable,
+		UITable,
+		JobsTable,
+		WebSessionsTable,
+		TableStatisticsTable,
+		LocationsTable,
+		RoleMembersTable,
+		CommentsTable,
+		ReportsMetaTable,
+		ReplicationConstraintStatsTable,
+		ReplicationCriticalLocalitiesTable,
+		ReplicationStatsTable,
+		ProtectedTimestampsMetaTable,
+		ProtectedTimestampsRecordsTable,
+		RoleOptionsTable,
+		StatementBundleChunksTable,
+		StatementDiagnosticsRequestsTable,
+		StatementDiagnosticsTable,
+		ScheduledJobsTable,
+		SqllivenessTable(),
+		MigrationsTable,
+		JoinTokensTable,
+		StatementStatisticsTable,
+		TransactionStatisticsTable,
+		DatabaseRoleSettingsTable,
+		TenantUsageTable,
+		SQLInstancesTable,
+		SpanConfigurationsTable,
+		TenantSettingsTable,
+		SpanCountTable,
+		SystemPrivilegeTable,
+		SystemExternalConnectionsTable,
+	}
+}
 
 // These system config descpb.TableDescriptor literals should match the descriptor
 // that would be produced by evaluating one of the above `CREATE TABLE`
@@ -866,7 +928,7 @@ var (
 	// table should only be written to via KV puts, not via the SQL layer. Some
 	// code assumes that it only has KV entries for column family 4, not the
 	// "sentinel" column family 0 which would be written by SQL.
-	NamespaceTable = registerSystemTable(
+	NamespaceTable = makeSystemTable(
 		NamespaceTableSchema,
 		systemTable(
 			catconstants.NamespaceTableName,
@@ -892,7 +954,7 @@ var (
 		))
 
 	// DescriptorTable is the descriptor for the descriptor table.
-	DescriptorTable = registerSystemTable(
+	DescriptorTable = makeSystemTable(
 		DescriptorTableSchema,
 		systemTable(
 			catconstants.DescriptorTableName,
@@ -919,7 +981,7 @@ var (
 	zeroIntString   = "0:::INT8"
 
 	// UsersTable is the descriptor for the users table.
-	UsersTable = registerSystemTable(
+	UsersTable = makeSystemTable(
 		UsersTableSchema,
 		systemTable(
 			catconstants.UsersTableName,
@@ -949,7 +1011,7 @@ var (
 		))
 
 	// ZonesTable is the descriptor for the zones table.
-	ZonesTable = registerSystemTable(
+	ZonesTable = makeSystemTable(
 		ZonesTableSchema,
 		systemTable(
 			catconstants.ZonesTableName,
@@ -975,7 +1037,7 @@ var (
 
 	// SettingsTable is the descriptor for the settings table.
 	// It contains all cluster settings for which a value has been set.
-	SettingsTable = registerSystemTable(
+	SettingsTable = makeSystemTable(
 		SettingsTableSchema,
 		systemTable(
 			catconstants.SettingsTableName,
@@ -998,7 +1060,7 @@ var (
 		))
 
 	// DescIDSequence is the descriptor for the descriptor ID sequence.
-	DescIDSequence = registerSystemTable(
+	DescIDSequence = makeSystemTable(
 		DescIDSequenceSchema,
 		systemTable(
 			catconstants.DescIDSequenceTableName,
@@ -1042,7 +1104,7 @@ var (
 	)
 
 	// RoleIDSequence is the descriptor for the role id sequence.
-	RoleIDSequence = registerSystemTable(
+	RoleIDSequence = makeSystemTable(
 		RoleIDSequenceSchema,
 		systemTable(
 			catconstants.RoleIDSequenceName,
@@ -1086,7 +1148,7 @@ var (
 		},
 	)
 
-	TenantsTable = registerSystemTable(
+	TenantsTable = makeSystemTable(
 		TenantsTableSchema,
 		systemTable(
 			catconstants.TenantsTableName,
@@ -1126,7 +1188,7 @@ var (
 // suggestions on writing and maintaining them.
 var (
 	// LeaseTable is the descriptor for the leases table.
-	LeaseTable = registerSystemTable(
+	LeaseTable = makeSystemTable(
 		LeaseTableSchema,
 		systemTable(
 			catconstants.LeaseTableName,
@@ -1153,7 +1215,7 @@ var (
 	uuidV4String = "uuid_v4()"
 
 	// EventLogTable is the descriptor for the event log table.
-	EventLogTable = registerSystemTable(
+	EventLogTable = makeSystemTable(
 		EventLogTableSchema,
 		systemTable(
 			catconstants.EventLogTableName,
@@ -1189,7 +1251,7 @@ var (
 	uniqueRowIDString = "unique_rowid()"
 
 	// RangeEventTable is the descriptor for the range log table.
-	RangeEventTable = registerSystemTable(
+	RangeEventTable = makeSystemTable(
 		RangeEventTableSchema,
 		systemTable(
 			catconstants.RangeEventTableName,
@@ -1222,7 +1284,7 @@ var (
 		))
 
 	// UITable is the descriptor for the ui table.
-	UITable = registerSystemTable(
+	UITable = makeSystemTable(
 		UITableSchema,
 		systemTable(
 			catconstants.UITableName,
@@ -1243,7 +1305,7 @@ var (
 	nowString = "now():::TIMESTAMP"
 
 	// JobsTable is the descriptor for the jobs table.
-	JobsTable = registerSystemTable(
+	JobsTable = makeSystemTable(
 		JobsTableSchema,
 		systemTable(
 			catconstants.JobsTableName,
@@ -1324,7 +1386,7 @@ var (
 		))
 
 	// WebSessions table to authenticate sessions over stateless connections.
-	WebSessionsTable = registerSystemTable(
+	WebSessionsTable = makeSystemTable(
 		WebSessionsTableSchema,
 		systemTable(
 			catconstants.WebSessionsTableName,
@@ -1400,7 +1462,7 @@ var (
 		))
 
 	// TableStatistics table to hold statistics about columns and column groups.
-	TableStatisticsTable = registerSystemTable(
+	TableStatisticsTable = makeSystemTable(
 		TableStatisticsTableSchema,
 		systemTable(
 			catconstants.TableStatisticsTableName,
@@ -1416,6 +1478,7 @@ var (
 				{Name: "nullCount", ID: 8, Type: types.Int},
 				{Name: "histogram", ID: 9, Type: types.Bytes, Nullable: true},
 				{Name: "avgSize", ID: 10, Type: types.Int, DefaultExpr: &zeroIntString},
+				{Name: "partialPredicate", ID: 11, Type: types.String, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -1432,8 +1495,9 @@ var (
 						"nullCount",
 						"histogram",
 						"avgSize",
+						"partialPredicate",
 					},
-					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -1449,7 +1513,7 @@ var (
 	latLonDecimal = types.MakeDecimal(18, 15)
 
 	// LocationsTable is the descriptor for the locations table.
-	LocationsTable = registerSystemTable(
+	LocationsTable = makeSystemTable(
 		LocationsTableSchema,
 		systemTable(
 			catconstants.LocationsTableName,
@@ -1479,7 +1543,7 @@ var (
 		))
 
 	// RoleMembersTable is the descriptor for the role_members table.
-	RoleMembersTable = registerSystemTable(
+	RoleMembersTable = makeSystemTable(
 		RoleMembersTableSchema,
 		systemTable(
 			catconstants.RoleMembersTableName,
@@ -1535,7 +1599,7 @@ var (
 		))
 
 	// CommentsTable is the descriptor for the comments table.
-	CommentsTable = registerSystemTable(
+	CommentsTable = makeSystemTable(
 		CommentsTableSchema,
 		systemTable(
 			catconstants.CommentsTableName,
@@ -1571,7 +1635,7 @@ var (
 		},
 	)
 
-	ReportsMetaTable = registerSystemTable(
+	ReportsMetaTable = makeSystemTable(
 		ReportsMetaTableSchema,
 		systemTable(
 			catconstants.ReportsMetaTableName,
@@ -1605,7 +1669,7 @@ var (
 	// TODO(andrei): In 20.1 we should add a foreign key reference to the
 	// reports_meta table. Until then, it would cost us having to create an index
 	// on report_id.
-	ReplicationConstraintStatsTable = registerSystemTable(
+	ReplicationConstraintStatsTable = makeSystemTable(
 		ReplicationConstraintStatsTableSchema,
 		systemTable(
 			catconstants.ReplicationConstraintStatsTableName,
@@ -1650,7 +1714,7 @@ var (
 	// TODO(andrei): In 20.1 we should add a foreign key reference to the
 	// reports_meta table. Until then, it would cost us having to create an index
 	// on report_id.
-	ReplicationCriticalLocalitiesTable = registerSystemTable(
+	ReplicationCriticalLocalitiesTable = makeSystemTable(
 		ReplicationCriticalLocalitiesTableSchema,
 		systemTable(
 			catconstants.ReplicationCriticalLocalitiesTableName,
@@ -1692,7 +1756,7 @@ var (
 	// TODO(andrei): In 20.1 we should add a foreign key reference to the
 	// reports_meta table. Until then, it would cost us having to create an index
 	// on report_id.
-	ReplicationStatsTable = registerSystemTable(
+	ReplicationStatsTable = makeSystemTable(
 		ReplicationStatsTableSchema,
 		systemTable(
 			"replication_stats",
@@ -1732,7 +1796,7 @@ var (
 			},
 		))
 
-	ProtectedTimestampsMetaTable = registerSystemTable(
+	ProtectedTimestampsMetaTable = makeSystemTable(
 		ProtectedTimestampsMetaTableSchema,
 		systemTable(
 			catconstants.ProtectedTimestampsMetaTableName,
@@ -1776,7 +1840,7 @@ var (
 		},
 	)
 
-	ProtectedTimestampsRecordsTable = registerSystemTable(
+	ProtectedTimestampsRecordsTable = makeSystemTable(
 		ProtectedTimestampsRecordsTableSchema,
 		systemTable(
 			catconstants.ProtectedTimestampsRecordsTableName,
@@ -1814,7 +1878,7 @@ var (
 		))
 
 	// RoleOptionsTable is the descriptor for the role_options table.
-	RoleOptionsTable = registerSystemTable(
+	RoleOptionsTable = makeSystemTable(
 		RoleOptionsTableSchema,
 		systemTable(
 			catconstants.RoleOptionsTableName,
@@ -1852,7 +1916,7 @@ var (
 			},
 		))
 
-	StatementBundleChunksTable = registerSystemTable(
+	StatementBundleChunksTable = makeSystemTable(
 		StatementBundleChunksTableSchema,
 		systemTable(
 			catconstants.StatementBundleChunksTableName,
@@ -1874,7 +1938,7 @@ var (
 
 	// TODO(andrei): Add a foreign key reference to the statement_diagnostics table when
 	// it no longer requires us to create an index on statement_diagnostics_id.
-	StatementDiagnosticsRequestsTable = registerSystemTable(
+	StatementDiagnosticsRequestsTable = makeSystemTable(
 		StatementDiagnosticsRequestsTableSchema,
 		systemTable(
 			catconstants.StatementDiagnosticsRequestsTableName,
@@ -1919,7 +1983,7 @@ var (
 		},
 	)
 
-	StatementDiagnosticsTable = registerSystemTable(
+	StatementDiagnosticsTable = makeSystemTable(
 		StatementDiagnosticsTableSchema,
 		systemTable(
 			catconstants.StatementDiagnosticsTableName,
@@ -1948,7 +2012,7 @@ var (
 	nowTZString = "now():::TIMESTAMPTZ"
 
 	// ScheduledJobsTable is the descriptor for the scheduled jobs table.
-	ScheduledJobsTable = registerSystemTable(
+	ScheduledJobsTable = makeSystemTable(
 		ScheduledJobsTableSchema,
 		systemTable(
 			"scheduled_jobs",
@@ -1996,31 +2060,66 @@ var (
 		))
 
 	// SqllivenessTable is the descriptor for the sqlliveness table.
-	SqllivenessTable = registerSystemTable(
-		SqllivenessTableSchema,
-		systemTable(
-			catconstants.SqllivenessTableName,
-			keys.SqllivenessID,
-			[]descpb.ColumnDescriptor{
-				{Name: "session_id", ID: 1, Type: types.Bytes, Nullable: false},
-				{Name: "expiration", ID: 2, Type: types.Decimal, Nullable: false},
-			},
-			[]descpb.ColumnFamilyDescriptor{
-				{
-					Name:            "fam0_session_id_expiration",
-					ID:              0,
-					ColumnNames:     []string{"session_id", "expiration"},
-					ColumnIDs:       []descpb.ColumnID{1, 2},
-					DefaultColumnID: 2,
+	//
+	// TODO(jeffswenson): remove the function wrapper around the
+	// SqllivenessTable descriptor. See TestSupportMultiRegion for context.
+	SqllivenessTable = func() SystemTable {
+		if TestSupportMultiRegion() {
+			return makeSystemTable(
+				MrSqllivenessTableSchema,
+				systemTable(
+					catconstants.SqllivenessTableName,
+					keys.SqllivenessID,
+					[]descpb.ColumnDescriptor{
+						{Name: "crdb_region", ID: 4, Type: types.Bytes, Nullable: false},
+						{Name: "session_uuid", ID: 3, Type: types.Bytes, Nullable: false},
+						{Name: "expiration", ID: 2, Type: types.Decimal, Nullable: false},
+					},
+					[]descpb.ColumnFamilyDescriptor{
+						{
+							Name:            "primary",
+							ID:              0,
+							ColumnNames:     []string{"crdb_region", "session_uuid", "expiration"},
+							ColumnIDs:       []descpb.ColumnID{4, 3, 2},
+							DefaultColumnID: 2,
+						},
+					},
+					descpb.IndexDescriptor{
+						Name:                "primary",
+						ID:                  2,
+						Unique:              true,
+						KeyColumnNames:      []string{"crdb_region", "session_uuid"},
+						KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC, catpb.IndexColumn_ASC},
+						KeyColumnIDs:        []descpb.ColumnID{4, 3},
+					},
+				))
+		}
+		return makeSystemTable(
+			SqllivenessTableSchema,
+			systemTable(
+				catconstants.SqllivenessTableName,
+				keys.SqllivenessID,
+				[]descpb.ColumnDescriptor{
+					{Name: "session_id", ID: 1, Type: types.Bytes, Nullable: false},
+					{Name: "expiration", ID: 2, Type: types.Decimal, Nullable: false},
 				},
-			},
-			pk("session_id"),
-		))
+				[]descpb.ColumnFamilyDescriptor{
+					{
+						Name:            "fam0_session_id_expiration",
+						ID:              0,
+						ColumnNames:     []string{"session_id", "expiration"},
+						ColumnIDs:       []descpb.ColumnID{1, 2},
+						DefaultColumnID: 2,
+					},
+				},
+				pk("session_id"),
+			))
+	}
 
 	// MigrationsTable is the descriptor for the migrations table. It stores facts
 	// about the completion state of long-running migrations. It is used to
 	// prevent migrations from running again after they have been completed.
-	MigrationsTable = registerSystemTable(
+	MigrationsTable = makeSystemTable(
 		MigrationsTableSchema,
 		systemTable(
 			catconstants.MigrationsTableName,
@@ -2057,7 +2156,7 @@ var (
 		))
 
 	// JoinTokensTable is the descriptor for the join tokens table.
-	JoinTokensTable = registerSystemTable(
+	JoinTokensTable = makeSystemTable(
 		JoinTokensTableSchema,
 		systemTable(
 			catconstants.JoinTokensTableName,
@@ -2092,7 +2191,7 @@ var (
 
 	// StatementStatisticsTable is the descriptor for the SQL statement stats table.
 	// It stores statistics for statement fingerprints.
-	StatementStatisticsTable = registerSystemTable(
+	StatementStatisticsTable = makeSystemTable(
 		StatementStatisticsTableSchema,
 		systemTable(
 			catconstants.StatementStatisticsTableName,
@@ -2200,7 +2299,7 @@ var (
 
 	// TransactionStatisticsTable is the descriptor for the SQL transaction stats
 	// table. It stores statistics for transaction fingerprints.
-	TransactionStatisticsTable = registerSystemTable(
+	TransactionStatisticsTable = makeSystemTable(
 		TransactionStatisticsTableSchema,
 		systemTable(
 			catconstants.TransactionStatisticsTableName,
@@ -2300,7 +2399,7 @@ var (
 	// have stable OIDs associated with them, so this table continues the
 	// convention of keying based on the role name (which is how privileges
 	// work also).
-	DatabaseRoleSettingsTable = registerSystemTable(
+	DatabaseRoleSettingsTable = makeSystemTable(
 		DatabaseRoleSettingsTableSchema,
 		systemTable(
 			catconstants.DatabaseRoleSettingsTableName,
@@ -2336,7 +2435,7 @@ var (
 	TenantUsageTableTTL = 2 * time.Hour
 	// TenantUsageTable is the descriptor for the tenant_usage table. It is used
 	// to coordinate throttling of tenant SQL pods and to track consumption.
-	TenantUsageTable = registerSystemTable(
+	TenantUsageTable = makeSystemTable(
 		TenantUsageTableSchema,
 		systemTable(
 			catconstants.TenantUsageTableName,
@@ -2386,7 +2485,7 @@ var (
 	// SQLInstancesTable is the descriptor for the sqlinstances table
 	// It stores information about all the SQL instances for a tenant
 	// and their associated session, locality, and address information.
-	SQLInstancesTable = registerSystemTable(
+	SQLInstancesTable = makeSystemTable(
 		SQLInstancesTableSchema,
 		systemTable(
 			catconstants.SQLInstancesTableName,
@@ -2411,7 +2510,7 @@ var (
 
 	// SpanConfigurationsTable is the descriptor for the system tenant's span
 	// configurations table.
-	SpanConfigurationsTable = registerSystemTable(
+	SpanConfigurationsTable = makeSystemTable(
 		SpanConfigurationsTableSchema,
 		systemTable(
 			catconstants.SpanConfigurationsTableName,
@@ -2449,7 +2548,7 @@ var (
 
 	// TenantSettingsTable is the descriptor for the tenant settings table.
 	// It contains overrides for cluster settings for tenants.
-	TenantSettingsTable = registerSystemTable(
+	TenantSettingsTable = makeSystemTable(
 		TenantSettingsTableSchema,
 		systemTable(
 			catconstants.TenantSettingsTableName,
@@ -2485,7 +2584,7 @@ var (
 		))
 
 	// SpanCountTable is the descriptor for the split count table.
-	SpanCountTable = registerSystemTable(
+	SpanCountTable = makeSystemTable(
 		SpanCountTableSchema,
 		systemTable(
 			catconstants.SpanCountTableName,
@@ -2514,7 +2613,7 @@ var (
 		},
 	)
 
-	SystemPrivilegeTable = registerSystemTable(
+	SystemPrivilegeTable = makeSystemTable(
 		SystemPrivilegeTableSchema,
 		systemTable(
 			catconstants.SystemPrivilegeTableName,
@@ -2544,7 +2643,7 @@ var (
 		),
 	)
 
-	SystemExternalConnectionsTable = registerSystemTable(
+	SystemExternalConnectionsTable = makeSystemTable(
 		SystemExternalConnectionsTableSchema,
 		systemTable(
 			catconstants.SystemExternalConnectionsTableName,
@@ -2579,3 +2678,14 @@ var (
 
 // SpanConfigurationsTableName represents system.span_configurations.
 var SpanConfigurationsTableName = tree.NewTableNameWithSchema("system", tree.PublicSchemaName, tree.Name(catconstants.SpanConfigurationsTableName))
+
+// TestSupportMultiRegion returns true if the cluster should support multi-region
+// optimized system databases.
+//
+// TODO(jeffswenson): remove TestSupportMultiRegion after implementing
+// migrations and version gates to migrate to the new regional by row
+// compatible schemas. The helper exists to allow e2e testing of the in
+// development multi-region system database features.
+func TestSupportMultiRegion() bool {
+	return envutil.EnvOrDefaultBool("COCKROACH_MR_SYSTEM_DATABASE", false)
+}

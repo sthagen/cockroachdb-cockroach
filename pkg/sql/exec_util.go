@@ -1260,6 +1260,10 @@ type ExecutorConfig struct {
 	// Validator is used to validate indexes and check constraints.
 	Validator scexec.Validator
 
+	// ProtectedTimestampManager provides protected timestamp
+	// for jobs only installed after some percentage of the GC interval passes.
+	ProtectedTimestampManager scexec.ProtectedTimestampManager
+
 	// ContentionRegistry is a node-level registry of contention events used for
 	// contention observability.
 	ContentionRegistry *contention.Registry
@@ -1522,10 +1526,6 @@ func (*PGWireTestingKnobs) ModuleTestingKnobs() {}
 
 // TenantTestingKnobs contains knobs for tenant behavior.
 type TenantTestingKnobs struct {
-	// ClusterSettingsUpdater is a field that if set, allows the tenant to set
-	// in-memory cluster settings. SQL tenants are otherwise prohibited from
-	// setting cluster settings.
-	ClusterSettingsUpdater settings.Updater
 
 	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
 	// server's codec, but nothing else (e.g. its certs).
@@ -1538,6 +1538,10 @@ type TenantTestingKnobs struct {
 	// AllowSplitAndScatter, if set, allows secondary tenants to execute ALTER
 	// TABLE ... SPLIT AT and SCATTER SQL commands.
 	AllowSplitAndScatter bool
+
+	// SkipSQLSystemTentantCheck is a temporary knob to test which admin functions fail for secondary tenants.
+	// TODO(ewall): Remove when https://github.com/cockroachdb/cockroach/issues/91434 is fixed.
+	SkipSQLSystemTentantCheck bool
 
 	// BeforeCheckingForDescriptorIDSequence, if set, is called before
 	// the connExecutor checks for the presence of system.descriptor_id_seq after
@@ -1968,6 +1972,9 @@ type queryMeta struct {
 	// The compressed plan for this query. This can converted  back into the
 	// logical plan. This field will only be populated in the EXECUTING phase.
 	planGist string
+
+	// The database the statement was executed on.
+	database string
 }
 
 // cancel cancels the query associated with this queryMeta, by closing the
@@ -3487,4 +3494,14 @@ func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *rowinfra.Metrics {
 		return cfg.InternalRowMetrics
 	}
 	return cfg.RowMetrics
+}
+
+// IsSystemTenant returns true either if TenantTestingKnobs.SkipSQLSystemTentantCheck is true
+// or if the ExecutorConfig tenant is the system tenant.
+func (cfg *ExecutorConfig) IsSystemTenant() bool {
+	knobs := cfg.TenantTestingKnobs
+	if knobs != nil && knobs.SkipSQLSystemTentantCheck {
+		return true
+	}
+	return cfg.Codec.ForSystemTenant()
 }

@@ -1182,6 +1182,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   last_error          STRING,
   rows_avg            FLOAT NOT NULL,
   rows_var            FLOAT NOT NULL,
+  idle_lat_avg        FLOAT NOT NULL,
+  idle_lat_var        FLOAT NOT NULL,
   parse_lat_avg       FLOAT NOT NULL,
   parse_lat_var       FLOAT NOT NULL,
   plan_lat_avg        FLOAT NOT NULL,
@@ -1285,6 +1287,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				errString, // last_error
 				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                               // rows_avg
 				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),     // rows_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                               // idle_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.GetVariance(stats.Stats.Count))),     // idle_lat_var
 				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.Mean)),                              // parse_lat_avg
 				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.GetVariance(stats.Stats.Count))),    // parse_lat_var
 				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.Mean)),                               // plan_lat_avg
@@ -6671,7 +6675,7 @@ func populateExecutionInsights(
 		contentionEvents := tree.DNull
 		if len(insight.Statement.ContentionEvents) > 0 {
 			var contentionEventsJSON json.JSON
-			contentionEventsJSON, err = sqlstatsutil.BuildContentionEventsJSON(insight.Statement.ContentionEvents)
+			contentionEventsJSON, err = convertContentionEventsToJSON(ctx, p, insight.Statement.ContentionEvents)
 			if err != nil {
 				return err
 			}
@@ -6720,4 +6724,63 @@ func populateExecutionInsights(
 		}
 	}
 	return
+}
+
+func convertContentionEventsToJSON(
+	ctx context.Context, p *planner, contentionEvents []roachpb.ContentionEvent,
+) (json json.JSON, err error) {
+
+	eventWithNames := make([]sqlstatsutil.ContentionEventWithNames, len(contentionEvents))
+	for i, contentionEvent := range contentionEvents {
+		_, tableID, err := p.ExecCfg().Codec.DecodeTablePrefix(contentionEvent.Key)
+		if err != nil {
+			return nil, err
+		}
+		_, _, indexID, err := p.ExecCfg().Codec.DecodeIndexPrefix(contentionEvent.Key)
+		if err != nil {
+			return nil, err
+		}
+
+		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
+			Required: true,
+		}}
+
+		desc := p.Descriptors()
+		var tableDesc catalog.TableDescriptor
+		tableDesc, err = desc.GetImmutableTableByID(ctx, p.txn, descpb.ID(tableID), flags)
+		if err != nil {
+			return nil, err
+		}
+
+		idxDesc, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
+		if err != nil {
+			return nil, err
+		}
+
+		ok, dbDesc, err := desc.GetImmutableDatabaseByID(ctx, p.txn, tableDesc.GetParentID(), tree.DatabaseLookupFlags{})
+		if err != nil || !ok {
+			return nil, err
+		}
+
+		schemaDesc, err := desc.GetImmutableSchemaByID(ctx, p.txn, tableDesc.GetParentSchemaID(), tree.SchemaLookupFlags{})
+		if err != nil {
+			return nil, err
+		}
+
+		var idxName string
+		if idxDesc != nil {
+			idxName = idxDesc.GetName()
+		}
+
+		eventWithNames[i] = sqlstatsutil.ContentionEventWithNames{
+			BlockingTransactionID: contentionEvent.TxnMeta.ID.String(),
+			SchemaName:            schemaDesc.GetName(),
+			DatabaseName:          dbDesc.GetName(),
+			TableName:             tableDesc.GetName(),
+			IndexName:             idxName,
+			DurationInMs:          float64(contentionEvent.Duration) / float64(time.Millisecond),
+		}
+	}
+
+	return sqlstatsutil.BuildContentionEventsJSON(eventWithNames)
 }

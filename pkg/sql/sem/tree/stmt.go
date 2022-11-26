@@ -180,7 +180,7 @@ var _ CCLOnlyStatement = &AlterChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
-var _ CCLOnlyStatement = &StreamIngestion{}
+var _ CCLOnlyStatement = &CreateTenantFromReplication{}
 
 // StatementReturnType implements the Statement interface.
 func (*AlterChangefeed) StatementReturnType() StatementReturnType { return Rows }
@@ -743,6 +743,17 @@ func (*CreateTenant) StatementType() StatementType { return TypeDDL }
 func (*CreateTenant) StatementTag() string { return "CREATE TENANT" }
 
 // StatementReturnType implements the Statement interface.
+func (*CreateTenantFromReplication) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*CreateTenantFromReplication) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CreateTenantFromReplication) StatementTag() string { return "CREATE TENANT FROM REPLICATION" }
+
+func (*CreateTenantFromReplication) cclOnlyStatement() {}
+
+// StatementReturnType implements the Statement interface.
 func (*DropExternalConnection) StatementReturnType() StatementReturnType { return Ack }
 
 // StatementType implements the Statement interface.
@@ -961,6 +972,15 @@ func (*DropSchema) StatementType() StatementType { return TypeDDL }
 
 // StatementTag implements the Statement interface.
 func (*DropSchema) StatementTag() string { return "DROP SCHEMA" }
+
+// StatementReturnType implements the Statement interface.
+func (*DropTenant) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*DropTenant) StatementType() StatementType { return TypeDDL }
+
+// StatementTag implements the Statement interface.
+func (*DropTenant) StatementTag() string { return "DROP TENANT" }
 
 // StatementReturnType implements the Statement interface.
 func (*Execute) StatementReturnType() StatementReturnType { return Unknown }
@@ -1771,6 +1791,15 @@ func (*ShowTables) StatementType() StatementType { return TypeDML }
 func (*ShowTables) StatementTag() string { return "SHOW TABLES" }
 
 // StatementReturnType implements the Statement interface.
+func (*ShowTenant) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*ShowTenant) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowTenant) StatementTag() string { return "SHOW TENANT" }
+
+// StatementReturnType implements the Statement interface.
 func (*ShowFunctions) StatementReturnType() StatementReturnType { return Rows }
 
 // StatementType implements the Statement interface.
@@ -1850,6 +1879,17 @@ func (*ShowCreateExternalConnections) StatementTag() string {
 }
 
 // StatementReturnType implements the Statement interface.
+func (*ShowCommitTimestamp) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*ShowCommitTimestamp) StatementType() StatementType { return TypeTCL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowCommitTimestamp) StatementTag() string {
+	return "SHOW COMMIT TIMESTAMP"
+}
+
+// StatementReturnType implements the Statement interface.
 func (*Split) StatementReturnType() StatementReturnType { return Rows }
 
 // StatementType implements the Statement interface.
@@ -1857,17 +1897,6 @@ func (*Split) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Split) StatementTag() string { return "SPLIT" }
-
-// StatementReturnType implements the Statement interface.
-func (*StreamIngestion) StatementReturnType() StatementReturnType { return Rows }
-
-// StatementType implements the Statement interface.
-func (*StreamIngestion) StatementType() StatementType { return TypeDML }
-
-// StatementTag returns a short string identifying the type of statement.
-func (*StreamIngestion) StatementTag() string { return "RESTORE FROM REPLICATION STREAM" }
-
-func (*StreamIngestion) cclOnlyStatement() {}
 
 // StatementReturnType implements the Statement interface.
 func (*Unsplit) StatementReturnType() StatementReturnType { return Rows }
@@ -2071,6 +2100,7 @@ func (n *CreateIndex) String() string                         { return AsString(
 func (n *CreateRole) String() string                          { return AsString(n) }
 func (n *CreateTable) String() string                         { return AsString(n) }
 func (n *CreateTenant) String() string                        { return AsString(n) }
+func (n *CreateTenantFromReplication) String() string         { return AsString(n) }
 func (n *CreateSchema) String() string                        { return AsString(n) }
 func (n *CreateSequence) String() string                      { return AsString(n) }
 func (n *CreateStats) String() string                         { return AsString(n) }
@@ -2088,6 +2118,7 @@ func (n *DropTable) String() string                           { return AsString(
 func (n *DropType) String() string                            { return AsString(n) }
 func (n *DropView) String() string                            { return AsString(n) }
 func (n *DropRole) String() string                            { return AsString(n) }
+func (n *DropTenant) String() string                          { return AsString(n) }
 func (n *Execute) String() string                             { return AsString(n) }
 func (n *Explain) String() string                             { return AsString(n) }
 func (n *ExplainAnalyze) String() string                      { return AsString(n) }
@@ -2173,6 +2204,7 @@ func (n *ShowSurvivalGoal) String() string                    { return AsString(
 func (n *ShowSyntax) String() string                          { return AsString(n) }
 func (n *ShowTableStats) String() string                      { return AsString(n) }
 func (n *ShowTables) String() string                          { return AsString(n) }
+func (n *ShowTenant) String() string                          { return AsString(n) }
 func (n *ShowTypes) String() string                           { return AsString(n) }
 func (n *ShowTraceForSession) String() string                 { return AsString(n) }
 func (n *ShowTransactionStatus) String() string               { return AsString(n) }
@@ -2184,8 +2216,8 @@ func (n *ShowZoneConfig) String() string                      { return AsString(
 func (n *ShowFingerprints) String() string                    { return AsString(n) }
 func (n *ShowDefaultPrivileges) String() string               { return AsString(n) }
 func (n *ShowCompletions) String() string                     { return AsString(n) }
+func (n *ShowCommitTimestamp) String() string                 { return AsString(n) }
 func (n *Split) String() string                               { return AsString(n) }
-func (n *StreamIngestion) String() string                     { return AsString(n) }
 func (n *Unsplit) String() string                             { return AsString(n) }
 func (n *Truncate) String() string                            { return AsString(n) }
 func (n *UnionClause) String() string                         { return AsString(n) }

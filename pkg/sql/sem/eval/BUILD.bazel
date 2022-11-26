@@ -37,7 +37,6 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/streamingccl/streampb",
         "//pkg/clusterversion",
         "//pkg/geo",
         "//pkg/geo/geopb",
@@ -45,6 +44,7 @@ go_library(
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvserver/kvserverbase",
+        "//pkg/repstream/streampb",
         "//pkg/roachpb",
         "//pkg/security/username",
         "//pkg/server/telemetry",
@@ -101,6 +101,7 @@ go_test(
         "eval_internal_test.go",
         "eval_test.go",
         "like_test.go",
+        "match_test.go",
         "parse_doid_test.go",
         "timeconv_test.go",
         "window_funcs_test.go",

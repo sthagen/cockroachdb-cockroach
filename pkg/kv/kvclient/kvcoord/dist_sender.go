@@ -190,8 +190,9 @@ var CanSendToFollower = func(
 const (
 	// The default limit for asynchronous senders.
 	defaultSenderConcurrency = 1024
-	// The maximum number of range descriptors to prefetch during range lookups.
-	rangeLookupPrefetchCount = 8
+	// RangeLookupPrefetchCount is the maximum number of range descriptors to prefetch
+	// during range lookups.
+	RangeLookupPrefetchCount = 8
 	// The maximum number of times a replica is retried when it repeatedly returns
 	// stale lease info.
 	sameReplicaRetryLimit = 10
@@ -531,24 +532,36 @@ func (ds *DistSender) RangeDescriptorCache() *rangecache.RangeCache {
 // DistSender itself as the client.Sender. This means that the scan will recurse
 // into DistSender, which will in turn use the RangeDescriptorCache again to
 // lookup the RangeDescriptor necessary to perform the scan.
+//
+// The client has some control over the consistency of the lookup. The
+// acceptable values for the consistency argument are INCONSISTENT
+// or READ_UNCOMMITTED. We use INCONSISTENT for an optimistic lookup
+// pass. If we don't fine a new enough descriptor, we do a leaseholder
+// read at READ_UNCOMMITTED in order to read intents as well as committed
+// values. The reason for this is that it's not clear whether the intent
+// or the previous value points to the correct location of the Range. It gets
+// even more complicated when there are split-related intents or a txn record
+// co-located with a replica involved in the split. Since we cannot know the
+// correct answer, we look up both the pre- and post- transaction values.
+//
+// Note that consistency levels CONSISTENT or INCONSISTENT will result in an
+// assertion failed error. See the commentary on kv.RangeLookup for more
+// details.
 func (ds *DistSender) RangeLookup(
-	ctx context.Context, key roachpb.RKey, useReverseScan bool,
+	ctx context.Context, key roachpb.RKey, rc rangecache.RangeLookupConsistency, useReverseScan bool,
 ) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
 	ds.metrics.RangeLookups.Inc(1)
-	// We perform the range lookup scan with a READ_UNCOMMITTED consistency
-	// level because we want the scan to return intents as well as committed
-	// values. The reason for this is because it's not clear whether the intent
-	// or the previous value points to the correct location of the Range. It
-	// gets even more complicated when there are split-related intents or a txn
-	// record co-located with a replica involved in the split. Since we cannot
-	// know the correct answer, we lookup both the pre- and post- transaction
-	// values.
-	rc := roachpb.READ_UNCOMMITTED
+	switch rc {
+	case roachpb.INCONSISTENT, roachpb.READ_UNCOMMITTED:
+	default:
+		return nil, nil, errors.AssertionFailedf("invalid consistency level %v", rc)
+	}
+
 	// By using DistSender as the sender, we guarantee that even if the desired
 	// RangeDescriptor is not on the first range we send the lookup too, we'll
 	// still find it when we scan to the next range. This addresses the issue
 	// described in #18032 and #16266, allowing us to support meta2 splits.
-	return kv.RangeLookup(ctx, ds, key.AsRawKey(), rc, rangeLookupPrefetchCount, useReverseScan)
+	return kv.RangeLookup(ctx, ds, key.AsRawKey(), rc, RangeLookupPrefetchCount, useReverseScan)
 }
 
 // FirstRange implements the RangeDescriptorDB interface.
@@ -1369,7 +1382,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 		responseChs = append(responseChs, responseCh)
 
 		// Truncate the request to range descriptor.
-		curRangeRS, err := rs.Intersect(ri.Token().Desc())
+		curRangeRS, err := rs.Intersect(ri.Token().Desc().RSpan())
 		if err != nil {
 			responseCh <- response{pErr: roachpb.NewError(err)}
 			return
@@ -1591,6 +1604,17 @@ func (ds *DistSender) sendPartialBatch(
 			} else {
 				descKey = rs.Key
 			}
+			// If prevTok is Valid, then we know that it corresponded to a view of
+			// a range descriptor for the range being queried. In all other cases
+			// where a valid eviction token is passed to getRoutingInfo, and on
+			// to RangeCache.LookupWithEvictionToken will be searching for a key
+			// which is not equal to the bound of the token's descriptor. In this
+			// way, we can use the eviction token as a lower-bound in terms of
+			// generation when doing the lookup. This fact enables the RangeCache
+			// to optimistically look up the range addressing from a follower
+			// replica, while detecting hazardous cases where the follower does
+			// not have the latest information and the current descriptor did
+			// not result in a successful send.
 			routingTok, err = ds.getRoutingInfo(ctx, descKey, prevTok, isReverse)
 			if err != nil {
 				log.VErrEventf(ctx, 1, "range descriptor re-lookup failed: %s", err)
@@ -1608,7 +1632,7 @@ func (ds *DistSender) sendPartialBatch(
 			// batch, so that we know that the response to it matches the positions
 			// into our batch (using the full batch here would give a potentially
 			// larger response slice with unknown mapping to our truncated reply).
-			intersection, err := rs.Intersect(routingTok.Desc())
+			intersection, err := rs.Intersect(routingTok.Desc().RSpan())
 			if err != nil {
 				return response{pErr: roachpb.NewError(err)}
 			}

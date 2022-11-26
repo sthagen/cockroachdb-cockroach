@@ -473,16 +473,19 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// TODO(adityamaru: Break this code block into helper methods.
 	if details.URI == "" {
 		initialDetails := details
-		backupDetails, m, err := getBackupDetailAndManifest(
-			ctx, p.ExecCfg(), p.Txn(), details, p.User(), backupDest,
-		)
-		if err != nil {
+		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			backupDetails, m, err := getBackupDetailAndManifest(
+				ctx, p.ExecCfg(), txn, details, p.User(), backupDest,
+			)
+			if err != nil {
+				return err
+			}
+			details = backupDetails
+			backupManifest = &m
+			return nil
+		}); err != nil {
 			return err
 		}
-		details = backupDetails
-		// Reset backupDetails so nobody accidentally uses it.
-		backupDetails = jobspb.BackupDetails{} //lint:ignore SA4006 intentionally clearing so no one uses this.
-		backupManifest = &m
 
 		// Now that we have resolved the details, and manifest, write a protected
 		// timestamp record on the backup's target spans/schema object.
@@ -497,7 +500,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			if details.ProtectedTimestampRecord != nil {
 				if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 					return protectTimestampForBackup(
-						ctx, p.ExecCfg(), txn, b.job.ID(), m, details,
+						ctx, p.ExecCfg(), txn, b.job.ID(), backupManifest, details,
 					)
 				}); err != nil {
 					return err
@@ -561,9 +564,9 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 		// Collect telemetry, once per backup after resolving its destination.
 		lic := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(), "",
+			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "",
 		) != nil
-		collectTelemetry(ctx, m, initialDetails, details, lic, b.job.ID())
+		collectTelemetry(ctx, backupManifest, initialDetails, details, lic, b.job.ID())
 	}
 
 	// For all backups, partitioned or not, the main BACKUP manifest is stored at
@@ -800,15 +803,25 @@ func getBackupDetailAndManifest(
 	mem := execCfg.RootMemoryMonitor.MakeBoundAccount()
 	defer mem.Close(ctx)
 
-	prevBackups, encryptionOptions, memSize, err := backupinfo.FetchPreviousBackups(ctx, &mem, user,
-		makeCloudStorage, backupDestination.PrevBackupURIs, *initialDetails.EncryptionOptions, &kmsEnv)
+	var prevBackups []backuppb.BackupManifest
+	var baseEncryptionOptions *jobspb.BackupEncryptionOptions
+	if len(backupDestination.PrevBackupURIs) != 0 {
+		var err error
+		baseEncryptionOptions, err = backupencryption.GetEncryptionFromBase(ctx, user, makeCloudStorage,
+			backupDestination.PrevBackupURIs[0], *initialDetails.EncryptionOptions, &kmsEnv)
+		if err != nil {
+			return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
+		}
 
-	if err != nil {
-		return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
+		var memSize int64
+		prevBackups, memSize, err = backupinfo.GetBackupManifests(ctx, &mem, user,
+			makeCloudStorage, backupDestination.PrevBackupURIs, baseEncryptionOptions, &kmsEnv)
+
+		if err != nil {
+			return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
+		}
+		defer mem.Shrink(ctx, memSize)
 	}
-	defer func() {
-		mem.Shrink(ctx, memSize)
-	}()
 
 	if len(prevBackups) > 0 {
 		baseManifest := prevBackups[0]
@@ -881,7 +894,7 @@ func getBackupDetailAndManifest(
 		backupDestination.ChosenSubdir,
 		backupDestination.URIsByLocalityKV,
 		prevBackups,
-		encryptionOptions,
+		baseEncryptionOptions,
 		&kmsEnv)
 	if err != nil {
 		return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err

@@ -457,8 +457,8 @@ func refreshTenant(
 		return true, time.Time{}, nil
 	}
 
-	// Read the tenant's GC TTL to check if the tenant's data has expired.
 	tenID := details.Tenant.ID
+	// Read the tenant's GC TTL to check if the tenant's data has expired.
 	cfg := execCfg.SystemConfig.GetSystemConfig()
 	tenantTTLSeconds := execCfg.DefaultZoneConfig.GC.TTLSeconds
 	zoneCfg, err := cfg.GetZoneConfigForObject(keys.SystemSQLCodec, keys.TenantsRangesID)
@@ -474,7 +474,7 @@ func refreshTenant(
 		// If the tenant's GC TTL has elapsed, check if there are any protected timestamp records
 		// that apply to the tenant keyspace.
 		atTime := hlc.Timestamp{WallTime: dropTime}
-		isProtected, err := isTenantProtected(ctx, atTime, roachpb.MakeTenantID(tenID), execCfg)
+		isProtected, err := isTenantProtected(ctx, atTime, roachpb.MustMakeTenantID(tenID), execCfg)
 		if err != nil {
 			return false, time.Time{}, err
 		}

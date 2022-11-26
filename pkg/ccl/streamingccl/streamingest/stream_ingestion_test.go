@@ -58,13 +58,14 @@ func getHighWaterMark(ingestionJobID int, sqlDB *gosql.DB) (*hlc.Timestamp, erro
 	return payload.GetHighWater(), nil
 }
 
-func getTestRandomClientURI(tenantID int) string {
+func getTestRandomClientURI(tenantID roachpb.TenantID, tenantName roachpb.TenantName) string {
 	valueRange := 100
 	kvsPerResolved := 200
 	kvFrequency := 50 * time.Nanosecond
 	numPartitions := 2
 	dupProbability := 0.2
-	return makeTestStreamURI(valueRange, kvsPerResolved, numPartitions, kvFrequency, dupProbability, tenantID)
+	return makeTestStreamURI(valueRange, kvsPerResolved, numPartitions, kvFrequency,
+		dupProbability, tenantID, tenantName)
 }
 
 func sstMaker(t *testing.T, keyValues []roachpb.KeyValue) roachpb.RangeFeedSSTable {
@@ -120,11 +121,13 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	// Register interceptors on the random stream client, which will be used by
 	// the processors.
 	const oldTenantID = 10
-	const newTenantID = 30
-	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(roachpb.MakeTenantID(oldTenantID)),
+	oldTenantName := roachpb.TenantName("10")
+	// The destination tenant is going to be assigned ID 2.
+	const newTenantID = 2
+	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(roachpb.MustMakeTenantID(oldTenantID)),
 		nil /* tableRekeys */, []execinfrapb.TenantRekey{{
-			OldID: roachpb.MakeTenantID(oldTenantID),
-			NewID: roachpb.MakeTenantID(newTenantID),
+			OldID: roachpb.MustMakeTenantID(oldTenantID),
+			NewID: roachpb.MustMakeTenantID(newTenantID),
 		}}, true /* restoreTenantFromStream */)
 	require.NoError(t, err)
 	streamValidator := newStreamClientValidator(rekeyer)
@@ -177,9 +180,8 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	require.NoError(t, err)
 	_, err = conn.Exec(`SET CLUSTER SETTING bulkio.stream_ingestion.cutover_signal_poll_interval='1s'`)
 	require.NoError(t, err)
-	streamAddr := getTestRandomClientURI(oldTenantID)
-	query := fmt.Sprintf(`RESTORE TENANT %d FROM REPLICATION STREAM FROM '%s' AS TENANT %d`,
-		oldTenantID, streamAddr, newTenantID)
+	streamAddr := getTestRandomClientURI(roachpb.MustMakeTenantID(oldTenantID), oldTenantName)
+	query := fmt.Sprintf(`CREATE TENANT "30" FROM REPLICATION OF "10" ON '%s'`, streamAddr)
 
 	// Attempt to run the ingestion job without enabling the experimental setting.
 	_, err = conn.Exec(query)
@@ -235,7 +237,7 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(uint64(newTenantID)))
+	tenantPrefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(uint64(newTenantID)))
 	t.Logf("counting kvs in span %v", tenantPrefix)
 	maxIngestedTS := assertExactlyEqualKVs(t, tc, streamValidator, revertRangeTargetTime, tenantPrefix)
 	// Sanity check that the max ts in the store is less than the revert range

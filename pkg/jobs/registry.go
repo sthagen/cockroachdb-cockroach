@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -726,6 +726,10 @@ func (r *Registry) withSession(ctx context.Context, f withSessionFunc) {
 // jobs if it observes a failure. Otherwise it starts all the main daemons of
 // registry that poll the jobs table and start/cancel/gc jobs.
 func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
+	if r.knobs.DisableRegistryLifecycleManagent {
+		return nil
+	}
+
 	// Since the job polling system is outside user control, exclude it from cost
 	// accounting and control. Individual jobs are not part of this exclusion.
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
@@ -1101,6 +1105,23 @@ func (r *Registry) Unpause(ctx context.Context, txn *kv.Txn, id jobspb.JobID) er
 // Resumers are created through registered Constructor functions.
 type Resumer interface {
 	// Resume is called when a job is started or resumed. execCtx is a sql.JobExecCtx.
+	//
+	// The jobs infrastructure will react to the return value. If no error is
+	// returned, the job is marked as successful. If an error is returned, the
+	// handling depends on the type of the error and whether this job is
+	// cancelable or not:
+	// - if ctx has been canceled, the job record is not updated in any way. It
+	//   will be retried later.
+	// - a "pause request error" (see MarkPauseRequestError), the job moves to the
+	//   paused status.
+	// - retriable errors (see MarkAsRetryJobError) cause the job execution to be
+	//   retried; Resume() will eventually be called again (perhaps on a different
+	//   node).
+	// - if the job is cancelable, all other errors cause the job to go through
+	//   the reversion process.
+	// - if the job is non-cancelable, "permanent errors" (see
+	//   MarkAsPermanentJobError) cause the job to go through the reversion
+	//   process. Other errors are treated as retriable.
 	Resume(ctx context.Context, execCtx interface{}) error
 
 	// OnFailOrCancel is called when a job fails or is cancel-requested.
@@ -1254,8 +1275,12 @@ func (r *Registry) stepThroughStateMachine(
 			return errors.NewAssertionErrorWithWrappedErrf(jobErr,
 				"job %d: resuming with non-nil error", job.ID())
 		}
-		resumeCtx := logtags.AddTag(ctx, "job", job.ID())
-		labels := pprof.Labels("job", fmt.Sprintf("%s id=%d", jobType, job.ID()))
+		resumeCtx := logtags.AddTag(ctx, "job",
+			fmt.Sprintf("%s id=%d", jobType, job.ID()))
+		// Adding all tags as pprof labels (including the one we just added for job
+		// type and id).
+		resumeCtx, undo := pprofutil.SetProfilerLabelsFromCtxTags(resumeCtx)
+		defer undo()
 
 		if err := job.started(ctx, nil /* txn */); err != nil {
 			return err
@@ -1269,9 +1294,7 @@ func (r *Registry) stepThroughStateMachine(
 				jm.CurrentlyRunning.Dec(1)
 				r.metrics.RunningNonIdleJobs.Dec(1)
 			}()
-			pprof.Do(resumeCtx, labels, func(ctx context.Context) {
-				err = resumer.Resume(ctx, execCtx)
-			})
+			err = resumer.Resume(resumeCtx, execCtx)
 		}()
 
 		r.MarkIdle(job, false)
@@ -1487,12 +1510,14 @@ func (r *Registry) unregister(jobID jobspb.JobID) {
 	}
 }
 
-func (r *Registry) cancelRegisteredJobContext(jobID jobspb.JobID) {
+func (r *Registry) cancelRegisteredJobContext(jobID jobspb.JobID) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if aj, ok := r.mu.adoptedJobs[jobID]; ok {
+	aj, ok := r.mu.adoptedJobs[jobID]
+	if ok {
 		aj.cancel()
 	}
+	return ok
 }
 
 func (r *Registry) getClaimedJob(jobID jobspb.JobID) (*Job, error) {
@@ -1559,7 +1584,7 @@ func (r *Registry) maybeRecordExecutionFailure(ctx context.Context, err error, j
 		return
 	}
 	if updateErr != nil {
-		log.Warningf(ctx, "failed to record error for job %d: %v: %v", j.ID(), err, err)
+		log.Warningf(ctx, "failed to record error for job %d: %v: %v", j.ID(), err, updateErr)
 	}
 }
 

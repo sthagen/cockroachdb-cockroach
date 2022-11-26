@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -103,7 +103,7 @@ func TestTenantCanUseEnterpriseFeatures(t *testing.T) {
 		Type: licenseccl.License_Enterprise,
 	}).Encode()
 
-	defer utilccl.TestingDisableEnterprise()()
+	defer ccl.TestingDisableEnterprise()()
 	defer envutil.TestSetEnv(t, "COCKROACH_TENANT_LICENSE", license)()
 
 	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
@@ -128,11 +128,11 @@ func TestTenantUnauthenticatedAccess(t *testing.T) {
 
 	_, err := tc.Server(0).StartTenant(ctx,
 		base.TestTenantArgs{
-			TenantID: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[0]),
+			TenantID: roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[0]),
 			TestingKnobs: base.TestingKnobs{
 				TenantTestingKnobs: &sql.TenantTestingKnobs{
 					// Configure the SQL server to access the wrong tenant keyspace.
-					TenantIDCodecOverride: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[1]),
+					TenantIDCodecOverride: roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[1]),
 				},
 			},
 		})
@@ -198,8 +198,7 @@ func TestNonExistentTenant(t *testing.T) {
 			DisableCreateTenant: true,
 			SkipTenantCheck:     true,
 		})
-	require.Error(t, err)
-	require.Equal(t, "system DB uninitialized, check if tenant is non existent", err.Error())
+	require.EqualError(t, err, `database "[1]" does not exist`)
 }
 
 // TestTenantRowIDs confirms `unique_rowid()` works as expected in a

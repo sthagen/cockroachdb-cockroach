@@ -51,9 +51,11 @@ func (r *Replica) addToTSCacheChecked(
 	r.store.tsCache.Add(start, end, ts, txnID)
 }
 
-// updateTimestampCache updates the timestamp cache in order to set a low water
-// mark for the timestamp at which mutations to keys overlapping the provided
-// request can write, such that they don't re-write history.
+// updateTimestampCache updates the timestamp cache in order to set a low
+// watermark for the timestamp at which mutations to keys overlapping the
+// provided request can write, such that they don't re-write history. It can be
+// called before or after a batch is done evaluating. A nil `br` indicates that
+// this method is being called before the batch is done evaluating.
 func (r *Replica) updateTimestampCache(
 	ctx context.Context,
 	st *kvserverpb.LeaseStatus,
@@ -75,6 +77,7 @@ func (r *Replica) updateTimestampCache(
 	if ba.Txn != nil {
 		txnID = ba.Txn.ID
 	}
+	beforeEval := br == nil && pErr == nil
 	for i, union := range ba.Requests {
 		req := union.GetInner()
 		if !roachpb.UpdatesTimestampCache(req) {
@@ -220,13 +223,14 @@ func (r *Replica) updateTimestampCache(
 				addToTSCache(start, end, ts, txnID)
 			}
 		case *roachpb.GetRequest:
-			if resume := resp.(*roachpb.GetResponse).ResumeSpan; resume != nil {
+			if !beforeEval && resp.(*roachpb.GetResponse).ResumeSpan != nil {
 				// The request did not evaluate. Ignore it.
 				continue
 			}
 			addToTSCache(start, end, ts, txnID)
 		case *roachpb.ScanRequest:
-			if resume := resp.(*roachpb.ScanResponse).ResumeSpan; resume != nil {
+			if !beforeEval && resp.(*roachpb.ScanResponse).ResumeSpan != nil {
+				resume := resp.(*roachpb.ScanResponse).ResumeSpan
 				if start.Equal(resume.Key) {
 					// The request did not evaluate. Ignore it.
 					continue
@@ -238,7 +242,8 @@ func (r *Replica) updateTimestampCache(
 			}
 			addToTSCache(start, end, ts, txnID)
 		case *roachpb.ReverseScanRequest:
-			if resume := resp.(*roachpb.ReverseScanResponse).ResumeSpan; resume != nil {
+			if !beforeEval && resp.(*roachpb.ReverseScanResponse).ResumeSpan != nil {
+				resume := resp.(*roachpb.ReverseScanResponse).ResumeSpan
 				if end.Equal(resume.EndKey) {
 					// The request did not evaluate. Ignore it.
 					continue
@@ -574,6 +579,14 @@ func (r *Replica) CanCreateTxnRecord(
 	return true, minCommitTS, 0
 }
 
+// Pseudo range local key suffixes used to construct "marker" keys for use
+// with the timestamp cache. These must not collide with a real range local
+// key suffix defined in pkg/keys/constants.go.
+var (
+	localTxnTombstoneMarkerSuffix = roachpb.RKey("tmbs")
+	localTxnPushMarkerSuffix      = roachpb.RKey("push")
+)
+
 // transactionTombstoneMarker returns the key used as a marker indicating that a
 // particular txn has written a transaction record (which may or may not still
 // exist). It serves as a guard against recreating a transaction record after it
@@ -582,7 +595,7 @@ func (r *Replica) CanCreateTxnRecord(
 // for existing txn records when considering 1PC evaluation without hitting
 // disk.
 func transactionTombstoneMarker(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
-	return append(keys.TransactionKey(key, txnID), []byte("-tmbs")...)
+	return keys.MakeRangeKey(keys.MustAddr(key), localTxnTombstoneMarkerSuffix, txnID.GetBytes())
 }
 
 // transactionPushMarker returns the key used as a marker indicating that a
@@ -590,7 +603,7 @@ func transactionTombstoneMarker(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
 // as a marker in the timestamp cache indicating that the transaction was pushed
 // in case the push happens before there's a transaction record.
 func transactionPushMarker(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
-	return append(keys.TransactionKey(key, txnID), []byte("-push")...)
+	return keys.MakeRangeKey(keys.MustAddr(key), localTxnPushMarkerSuffix, txnID.GetBytes())
 }
 
 // GetCurrentReadSummary returns a new ReadSummary reflecting all reads served

@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -98,6 +99,10 @@ type TestTenantInterface interface {
 	// interface{}.
 	SpanConfigKVAccessor() interface{}
 
+	// SpanConfigReporter returns the underlying spanconfig.Reporter as an
+	// interface{}.
+	SpanConfigReporter() interface{}
+
 	// SpanConfigReconciler returns the underlying spanconfig.Reconciler as an
 	// interface{}.
 	SpanConfigReconciler() interface{}
@@ -146,6 +151,10 @@ type TestTenantInterface interface {
 	// MustGetSQLCounter returns the value of a counter metric from the server's
 	// SQL Executor. Runs in O(# of metrics) time, which is fine for test code.
 	MustGetSQLCounter(name string) int64
+
+	// Codec returns this tenant's codec (or keys.SystemSQLCodec if this is the
+	// system tenant).
+	Codec() keys.SQLCodec
 
 	// TODO(irfansharif): We'd benefit from an API to construct a *gosql.DB, or
 	// better yet, a *sqlutils.SQLRunner. We use it all the time, constructing

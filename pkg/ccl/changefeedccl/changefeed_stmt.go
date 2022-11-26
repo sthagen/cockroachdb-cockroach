@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // featureChangefeedEnabled is used to enable and disable the CHANGEFEED feature.
@@ -334,7 +335,7 @@ func createChangefeedJobRecord(
 		p.BufferClientNotice(ctx, pgnotice.Newf("%s", warning))
 	}
 
-	jobDescription, err := changefeedJobDescription(changefeedStmt.CreateChangefeed, sinkURI, opts)
+	jobDescription, err := changefeedJobDescription(ctx, changefeedStmt.CreateChangefeed, sinkURI, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +554,7 @@ func createChangefeedJobRecord(
 
 	if scope, ok := opts.GetMetricScope(); ok {
 		if err := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
+			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
 		); err != nil {
 			return nil, errors.Wrapf(err,
 				"use of %q option requires enterprise license.", changefeedbase.OptMetricsScope)
@@ -586,7 +587,7 @@ func createChangefeedJobRecord(
 	}
 
 	if err := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
+		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
 	); err != nil {
 		return nil, err
 	}
@@ -811,7 +812,10 @@ func validateSink(
 }
 
 func changefeedJobDescription(
-	changefeed *tree.CreateChangefeed, sinkURI string, opts changefeedbase.StatementOptions,
+	ctx context.Context,
+	changefeed *tree.CreateChangefeed,
+	sinkURI string,
+	opts changefeedbase.StatementOptions,
 ) (string, error) {
 	cleanedSinkURI, err := cloud.SanitizeExternalStorageURI(sinkURI, []string{
 		changefeedbase.SinkParamSASLPassword,
@@ -826,6 +830,8 @@ func changefeedJobDescription(
 	if err != nil {
 		return "", err
 	}
+
+	logSanitizedChangefeedDestination(ctx, cleanedSinkURI)
 
 	c := &tree.CreateChangefeed{
 		Targets: changefeed.Targets,
@@ -843,6 +849,10 @@ func changefeedJobDescription(
 	}
 	sort.Slice(c.Options, func(i, j int) bool { return c.Options[i].Key < c.Options[j].Key })
 	return tree.AsString(c), nil
+}
+
+func logSanitizedChangefeedDestination(ctx context.Context, destination string) {
+	log.Ops.Infof(ctx, "changefeed planning to connect to destination %v", redact.Safe(destination))
 }
 
 func validateDetailsAndOptions(
@@ -887,7 +897,7 @@ func validateDetailsAndOptions(
 // This method modifies passed in select clause to reflect normalization step.
 func validateAndNormalizeChangefeedExpression(
 	ctx context.Context,
-	execCtx sql.JobExecContext,
+	execCtx sql.PlanHookState,
 	sc *tree.SelectClause,
 	descriptors map[tree.TablePattern]catalog.Descriptor,
 	targets []jobspb.ChangefeedTargetSpecification,
@@ -967,7 +977,7 @@ func (b *changefeedResumer) handleChangefeedError(
 		const errorFmt = "job failed (%v) but is being paused because of %s=%s"
 		errorMessage := fmt.Sprintf(errorFmt, changefeedErr,
 			changefeedbase.OptOnError, changefeedbase.OptOnErrorPause)
-		return b.job.PauseRequested(ctx, jobExec.Txn(), func(ctx context.Context,
+		return b.job.PauseRequested(ctx, nil /* txn */, func(ctx context.Context,
 			planHookState interface{}, txn *kv.Txn, progress *jobspb.Progress) error {
 			err := b.OnPauseRequest(ctx, jobExec, txn, progress)
 			if err != nil {

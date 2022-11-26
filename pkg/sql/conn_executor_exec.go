@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -122,7 +123,7 @@ func (ex *connExecutor) execStmt(
 		// Note: when not using explicit transactions, we go through this transition
 		// for every statement. It is important to minimize the amount of work and
 		// allocations performed up to this point.
-		ev, payload = ex.execStmtInNoTxnState(ctx, ast)
+		ev, payload = ex.execStmtInNoTxnState(ctx, ast, res)
 
 	case stateOpen:
 		err = ex.execWithProfiling(ctx, ast, prepared, func(ctx context.Context) error {
@@ -589,6 +590,10 @@ func (ex *connExecutor) execStmtInOpenState(
 		ev, payload := ex.execRollbackToSavepointInOpenState(ctx, s, res)
 		return ev, payload, nil
 
+	case *tree.ShowCommitTimestamp:
+		ev, payload := ex.execShowCommitTimestampInOpenState(ctx, s, res, canAutoCommit)
+		return ev, payload, nil
+
 	case *tree.Prepare:
 		// This is handling the SQL statement "PREPARE". See execPrepare for
 		// handling of the protocol-level command for preparing statements.
@@ -776,6 +781,9 @@ func (ex *connExecutor) execStmtInOpenState(
 // the timestamps of the transaction accordingly.
 func (ex *connExecutor) handleAOST(ctx context.Context, stmt tree.Statement) error {
 	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
+		if _, ok := stmt.(*tree.ShowCommitTimestamp); ok {
+			return nil
+		}
 		return errors.AssertionFailedf(
 			"cannot handle AOST clause without a transaction",
 		)
@@ -1079,6 +1087,11 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.sessionTracing.TracePlanStart(ctx, stmt.AST.StatementTag())
 	ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.PlannerStartLogicalPlan, timeutil.Now())
 
+	if server := ex.server.cfg.DistSQLSrv; server != nil {
+		// Begin measuring CPU usage for tenants. This is a no-op for non-tenants.
+		ex.cpuStatsCollector.StartCollection(ctx, server.TenantCostController)
+	}
+
 	// If adminAuditLogging is enabled, we want to check for HasAdminRole
 	// before the deferred maybeLogStatement.
 	// We must check prior to execution in the case the txn is aborted due to
@@ -1104,8 +1117,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	// include gist in error reports
 	ctx = withPlanGist(ctx, planner.instrumentation.planGist.String())
-
-	if planner.autoCommit {
+	if planner.extendedEvalCtx.TxnImplicit {
 		planner.curPlan.flags.Set(planFlagImplicitTxn)
 	}
 
@@ -1244,7 +1256,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.extraTxnState.bytesRead += stats.bytesRead
 	ex.extraTxnState.rowsWritten += stats.rowsWritten
 
-	populateQueryLevelStatsAndRegions(ctx, planner, ex.server.cfg)
+	populateQueryLevelStatsAndRegions(ctx, planner, ex.server.cfg, &stats, &ex.cpuStatsCollector)
 
 	// The transaction (from planner.txn) may already have been committed at this point,
 	// due to one-phase commit optimization or an error. Since we use that transaction
@@ -1279,7 +1291,13 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 // Query-level execution statistics are collected using the statement's trace
 // and the plan's flow metadata. It also populates the regions field and
 // annotates the explainPlan field of the instrumentationHelper.
-func populateQueryLevelStatsAndRegions(ctx context.Context, p *planner, cfg *ExecutorConfig) {
+func populateQueryLevelStatsAndRegions(
+	ctx context.Context,
+	p *planner,
+	cfg *ExecutorConfig,
+	topLevelStats *topLevelQueryStats,
+	cpuStats *multitenantcpu.CPUUsageHelper,
+) {
 	ih := &p.instrumentation
 	if _, ok := ih.Tracing(); !ok {
 		return
@@ -1301,6 +1319,18 @@ func populateQueryLevelStatsAndRegions(ctx context.Context, p *planner, cfg *Exe
 			panic(fmt.Sprintf(msg, ih.fingerprint, err))
 		}
 		log.VInfof(ctx, 1, msg, ih.fingerprint, err)
+	} else {
+		// If this query is being run by a tenant, record the RUs consumed by CPU
+		// usage and network egress to the client.
+		if cfg.DistSQLSrv != nil {
+			if costController := cfg.DistSQLSrv.TenantCostController; costController != nil {
+				if costCfg := costController.GetCostConfig(); costCfg != nil {
+					networkEgressRUEstimate := costCfg.PGWireEgressCost(topLevelStats.networkEgressEstimate)
+					ih.queryLevelStatsWithErr.Stats.RUEstimate += int64(networkEgressRUEstimate)
+					ih.queryLevelStatsWithErr.Stats.RUEstimate += int64(cpuStats.EndCollection(ctx))
+				}
+			}
+		}
 	}
 	if ih.traceMetadata != nil && ih.explainPlan != nil {
 		ih.regions = ih.traceMetadata.annotateExplain(
@@ -1518,6 +1548,9 @@ type topLevelQueryStats struct {
 	rowsRead int64
 	// rowsWritten is the number of rows written.
 	rowsWritten int64
+	// networkEgressEstimate is an estimate for the number of bytes sent to the
+	// client. It is used for estimating the number of RUs consumed by a query.
+	networkEgressEstimate int64
 }
 
 // execWithDistSQLEngine converts a plan to a distributed SQL physical plan and
@@ -1643,7 +1676,7 @@ var eventStartExplicitTxn fsm.Event = eventTxnStart{ImplicitTxn: fsm.False}
 // the cursor is not advanced. This means that the statement will run again in
 // stateOpen, at each point its results will also be flushed.
 func (ex *connExecutor) execStmtInNoTxnState(
-	ctx context.Context, ast tree.Statement,
+	ctx context.Context, ast tree.Statement, res RestrictedCommandResult,
 ) (_ fsm.Event, payload fsm.EventPayload) {
 	switch s := ast.(type) {
 	case *tree.BeginTransaction:
@@ -1666,6 +1699,8 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				historicalTs,
 				ex.transitionCtx,
 				ex.QualityOfService())
+	case *tree.ShowCommitTimestamp:
+		return ex.execShowCommitTimestampInNoTxnState(ctx, s, res)
 	case *tree.CommitTransaction, *tree.ReleaseSavepoint,
 		*tree.RollbackTransaction, *tree.SetTransaction, *tree.Savepoint:
 		return ex.makeErrEvent(errNoTransactionInProgress, ast)
@@ -1788,7 +1823,15 @@ func (ex *connExecutor) execStmtInCommitWaitState(
 			ex.incrementExecutedStmtCounter(ast)
 		}
 	}()
-	switch ast.(type) {
+	switch s := ast.(type) {
+	case *tree.ReleaseSavepoint:
+		if ex.extraTxnState.shouldAcceptReleaseCockroachRestartInCommitWait &&
+			s.Savepoint == commitOnReleaseSavepointName {
+			ex.extraTxnState.shouldAcceptReleaseCockroachRestartInCommitWait = false
+			return nil, nil
+		}
+	case *tree.ShowCommitTimestamp:
+		return ex.execShowCommitTimestampInCommitWaitState(ctx, s, res)
 	case *tree.CommitTransaction, *tree.RollbackTransaction:
 		// Reply to a rollback with the COMMIT tag, by analogy to what we do when we
 		// get a COMMIT in state Aborted.
@@ -1801,13 +1844,11 @@ func (ex *connExecutor) execStmtInCommitWaitState(
 				return nil
 			},
 		)
-	default:
-		ev = eventNonRetriableErr{IsCommit: fsm.False}
-		payload = eventNonRetriableErrPayload{
+	}
+	return eventNonRetriableErr{IsCommit: fsm.False},
+		eventNonRetriableErrPayload{
 			err: sqlerrors.NewTransactionCommittedError(),
 		}
-		return ev, payload
-	}
 }
 
 // runObserverStatement executes the given observer statement.
@@ -2230,6 +2271,8 @@ func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent) {
 			}
 			ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
 		}
+		// If we have a commitTimestamp, we should use it.
+		ex.previousTransactionCommitTimestamp.Forward(ev.commitTimestamp)
 	}
 }
 
@@ -2293,6 +2336,8 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 	ex.extraTxnState.shouldExecuteOnTxnRestart = true
 
 	ex.statsCollector.StartTransaction()
+
+	ex.previousTransactionCommitTimestamp = hlc.Timestamp{}
 }
 
 func (ex *connExecutor) recordTransactionFinish(

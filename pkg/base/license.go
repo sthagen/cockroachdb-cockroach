@@ -28,8 +28,15 @@ var errEnterpriseNotEnabled = errors.New("OSS binaries do not include enterprise
 // enable it.
 //
 // This function is overridden by an init hook in CCL builds.
-var CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, org, feature string) error {
+var CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, feature string) error {
 	return errEnterpriseNotEnabled // nb: this is squarely in the hot path on OSS builds
+}
+
+// CCLDistributionAndEnterpriseEnabled is a simpler version of
+// CheckEnterpriseEnabled which doesn't take in feature-related info and doesn't
+// return an error with a nice message.
+var CCLDistributionAndEnterpriseEnabled = func(st *cluster.Settings, clusterID uuid.UUID) bool {
+	return CheckEnterpriseEnabled(st, clusterID, "" /* feature */) == nil
 }
 
 var licenseTTLMetadata = metric.Metadata{

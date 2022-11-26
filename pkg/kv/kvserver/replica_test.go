@@ -40,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -606,6 +605,7 @@ func TestReplicaReadConsistency(t *testing.T) {
 // transfer might still apply.
 func TestBehaviorDuringLeaseTransfer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 91948, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	testutils.RunTrueAndFalse(t, "transferSucceeds", func(t *testing.T, transferSucceeds bool) {
@@ -2132,8 +2132,8 @@ func TestReplicaLatching(t *testing.T) {
 	}{
 		// Read/read doesn't wait.
 		{true, true, false, false},
-		// A write doesn't wait for an earlier read (except for local keys).
-		{true, false, false, true},
+		// A write doesn't wait for an earlier read.
+		{true, false, false, false},
 		// A read must wait for an earlier write.
 		{false, true, true, true},
 		// Writes always wait for other writes.
@@ -2457,7 +2457,7 @@ func TestReplicaLatchingTimestampNonInterference(t *testing.T) {
 	blockReader.Store(false)
 	blockWriter.Store(false)
 	blockCh := make(chan struct{}, 1)
-	blockedCh := make(chan struct{}, 1)
+	waitForRequestBlocked := make(chan struct{}, 1)
 
 	tc := testContext{}
 	tsc := TestStoreConfig(nil)
@@ -2468,10 +2468,10 @@ func TestReplicaLatchingTimestampNonInterference(t *testing.T) {
 				return nil
 			}
 			if filterArgs.Req.Method() == roachpb.Get && blockReader.Load().(bool) {
-				blockedCh <- struct{}{}
+				waitForRequestBlocked <- struct{}{}
 				<-blockCh
 			} else if filterArgs.Req.Method() == roachpb.Put && blockWriter.Load().(bool) {
-				blockedCh <- struct{}{}
+				waitForRequestBlocked <- struct{}{}
 				<-blockCh
 			}
 			return nil
@@ -2489,17 +2489,79 @@ func TestReplicaLatchingTimestampNonInterference(t *testing.T) {
 		interferes  bool
 	}{
 		// Reader & writer have same timestamps.
-		{makeTS(1, 0), makeTS(1, 0), roachpb.Key("a"), true, true},
-		{makeTS(1, 0), makeTS(1, 0), roachpb.Key("b"), false, true},
-		// Reader has earlier timestamp.
-		{makeTS(1, 0), makeTS(1, 1), roachpb.Key("c"), true, false},
-		{makeTS(1, 0), makeTS(1, 1), roachpb.Key("d"), false, false},
-		// Writer has earlier timestamp.
-		{makeTS(1, 1), makeTS(1, 0), roachpb.Key("e"), true, true},
-		{makeTS(1, 1), makeTS(1, 0), roachpb.Key("f"), false, true},
-		// Local keys always interfere.
-		{makeTS(1, 0), makeTS(1, 1), keys.RangeDescriptorKey(roachpb.RKey("a")), true, true},
-		{makeTS(1, 0), makeTS(1, 1), keys.RangeDescriptorKey(roachpb.RKey("b")), false, true},
+		//
+		// Reader goes first, but the reader does not need to hold latches during
+		// evaluation, so we expect no interference.
+		{
+			readerTS:    makeTS(1, 0),
+			writerTS:    makeTS(1, 0),
+			key:         roachpb.Key("a"),
+			readerFirst: true,
+			interferes:  false,
+		},
+		// Writer goes first, but the writer does need to hold latches during
+		// evaluation, so it should block the reader.
+		{
+			readerTS:    makeTS(1, 0),
+			writerTS:    makeTS(1, 0),
+			key:         roachpb.Key("b"),
+			readerFirst: false,
+			interferes:  true,
+		},
+		// Reader has earlier timestamp, so it doesn't interfere with the write
+		// that's in its future.
+		{
+			readerTS:    makeTS(1, 0),
+			writerTS:    makeTS(1, 1),
+			key:         roachpb.Key("c"),
+			readerFirst: true,
+			interferes:  false,
+		},
+		{
+			readerTS:    makeTS(1, 0),
+			writerTS:    makeTS(1, 1),
+			key:         roachpb.Key("d"),
+			readerFirst: false,
+			interferes:  false,
+		},
+		// Writer has an earlier timestamp. We expect no interference for the writer
+		// as the reader will be evaluating over a pebble snapshot. We'd expect the
+		// writer to be able to continue without interference but to get bumped by
+		// the timestamp cache.
+		{
+			readerTS:    makeTS(1, 1),
+			writerTS:    makeTS(1, 0),
+			key:         roachpb.Key("e"),
+			readerFirst: true,
+			interferes:  false,
+		},
+		// We expect the reader to block for the writer that's writing in the
+		// reader's past.
+		{
+			readerTS:    makeTS(1, 1),
+			writerTS:    makeTS(1, 0),
+			key:         roachpb.Key("f"),
+			readerFirst: false,
+			interferes:  true,
+		},
+		// Even though local key accesses are NonMVCC, the reader should not block
+		// the writer because it should not need to hold its latches during
+		// evaluation.
+		{
+			readerTS:    makeTS(1, 0),
+			writerTS:    makeTS(1, 1),
+			key:         keys.RangeDescriptorKey(roachpb.RKey("a")),
+			readerFirst: true,
+			interferes:  false,
+		},
+		// The writer will block the reader since it holds NonMVCC latches during
+		// evaluation.
+		{
+			readerTS:   makeTS(1, 0),
+			writerTS:   makeTS(1, 1),
+			key:        keys.RangeDescriptorKey(roachpb.RKey("b")),
+			interferes: true,
+		},
 	}
 	for _, test := range testCases {
 		t.Run(fmt.Sprintf("%+v", test), func(t *testing.T) {
@@ -2523,7 +2585,8 @@ func TestReplicaLatchingTimestampNonInterference(t *testing.T) {
 					_, pErr := tc.Sender().Send(context.Background(), baR)
 					errCh <- pErr
 				}()
-				<-blockedCh
+				// Wait for the above read to get blocked on blockCh.
+				<-waitForRequestBlocked
 				go func() {
 					_, pErr := tc.Sender().Send(context.Background(), baW)
 					errCh <- pErr
@@ -2534,7 +2597,9 @@ func TestReplicaLatchingTimestampNonInterference(t *testing.T) {
 					_, pErr := tc.Sender().Send(context.Background(), baW)
 					errCh <- pErr
 				}()
-				<-blockedCh
+				// Wait for the above write to get blocked on blockCh while it's holding
+				// latches.
+				<-waitForRequestBlocked
 				go func() {
 					_, pErr := tc.Sender().Send(context.Background(), baR)
 					errCh <- pErr
@@ -7094,11 +7159,11 @@ func TestQuotaPoolAccessOnDestroyedReplica(t *testing.T) {
 		}
 	}()
 
-	if _, _, err := repl.handleRaftReady(ctx, noSnap); err != nil {
+	if _, err := repl.handleRaftReady(ctx, noSnap); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, _, err := repl.handleRaftReady(ctx, noSnap); err != nil {
+	if _, err := repl.handleRaftReady(ctx, noSnap); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -8969,10 +9034,10 @@ func TestReplicaMetrics(t *testing.T) {
 		}
 		return d
 	}
-	live := func(ids ...roachpb.NodeID) liveness.IsLiveMap {
-		m := liveness.IsLiveMap{}
+	live := func(ids ...roachpb.NodeID) livenesspb.IsLiveMap {
+		m := livenesspb.IsLiveMap{}
 		for _, id := range ids {
-			m[id] = liveness.IsLiveMapEntry{IsLive: true}
+			m[id] = livenesspb.IsLiveMapEntry{IsLive: true}
 		}
 		return m
 	}
@@ -8989,7 +9054,7 @@ func TestReplicaMetrics(t *testing.T) {
 		storeID     roachpb.StoreID
 		desc        roachpb.RangeDescriptor
 		raftStatus  *raft.Status
-		liveness    liveness.IsLiveMap
+		liveness    livenesspb.IsLiveMap
 		raftLogSize int64
 		expected    ReplicaMetrics
 	}{
@@ -9576,10 +9641,10 @@ func TestCommandTooLarge(t *testing.T) {
 
 	st := tc.store.cfg.Settings
 	st.Manual.Store(true)
-	MaxCommandSize.Override(ctx, &st.SV, 1024)
+	kvserverbase.MaxCommandSize.Override(ctx, &st.SV, 1024)
 
 	args := putArgs(roachpb.Key("k"),
-		[]byte(strings.Repeat("a", int(MaxCommandSize.Get(&st.SV)))))
+		[]byte(strings.Repeat("a", int(kvserverbase.MaxCommandSize.Get(&st.SV)))))
 	if _, pErr := tc.SendWrapped(&args); !testutils.IsPError(pErr, "command is too large") {
 		t.Fatalf("did not get expected error: %v", pErr)
 	}
@@ -9920,7 +9985,7 @@ type testQuiescer struct {
 	isDestroyed     bool
 
 	// Not used to implement quiescer, but used by tests.
-	livenessMap liveness.IsLiveMap
+	livenessMap livenesspb.IsLiveMap
 	paused      map[roachpb.ReplicaID]struct{}
 }
 
@@ -10007,7 +10072,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 				lastIndex:      logIndex,
 				raftReady:      false,
 				ownsValidLease: true,
-				livenessMap: liveness.IsLiveMap{
+				livenessMap: livenesspb.IsLiveMap{
 					1: {IsLive: true},
 					2: {IsLive: true},
 					3: {IsLive: true},
@@ -10113,7 +10178,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 	for _, i := range []uint64{1, 2, 3} {
 		test(true, func(q *testQuiescer) *testQuiescer {
 			nodeID := roachpb.NodeID(i)
-			q.livenessMap[nodeID] = liveness.IsLiveMapEntry{
+			q.livenessMap[nodeID] = livenesspb.IsLiveMapEntry{
 				Liveness: livenesspb.Liveness{NodeID: nodeID},
 				IsLive:   false,
 			}
@@ -10170,7 +10235,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 						},
 					},
 				},
-				livenessMap: liveness.IsLiveMap{
+				livenessMap: livenesspb.IsLiveMap{
 					1: {IsLive: true},
 					2: {IsLive: true},
 					3: {IsLive: true},
@@ -10221,7 +10286,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 			Epoch:      7,
 			Expiration: hlc.LegacyTimestamp{WallTime: 8},
 		}
-		q.livenessMap[l.NodeID] = liveness.IsLiveMapEntry{
+		q.livenessMap[l.NodeID] = livenesspb.IsLiveMapEntry{
 			Liveness: l,
 			IsLive:   false,
 		}
@@ -10235,7 +10300,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 			Epoch:      7,
 			Expiration: hlc.LegacyTimestamp{WallTime: 8},
 		}
-		q.livenessMap[l.NodeID] = liveness.IsLiveMapEntry{
+		q.livenessMap[l.NodeID] = livenesspb.IsLiveMapEntry{
 			Liveness: l,
 			IsLive:   false,
 		}
@@ -10250,7 +10315,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 			Epoch:      7,
 			Expiration: hlc.LegacyTimestamp{WallTime: 8},
 		}
-		q.livenessMap[l.NodeID] = liveness.IsLiveMapEntry{
+		q.livenessMap[l.NodeID] = livenesspb.IsLiveMapEntry{
 			Liveness: l,
 			IsLive:   false,
 		}
@@ -10266,7 +10331,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 			Epoch:      7,
 			Expiration: hlc.LegacyTimestamp{WallTime: 8},
 		}
-		q.livenessMap[l.NodeID] = liveness.IsLiveMapEntry{
+		q.livenessMap[l.NodeID] = livenesspb.IsLiveMapEntry{
 			Liveness: l,
 			IsLive:   false,
 		}
@@ -10281,7 +10346,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 			Epoch:      7,
 			Expiration: hlc.LegacyTimestamp{WallTime: 8},
 		}
-		q.livenessMap[l.NodeID] = liveness.IsLiveMapEntry{
+		q.livenessMap[l.NodeID] = livenesspb.IsLiveMapEntry{
 			Liveness: l,
 			IsLive:   false,
 		}
@@ -11380,10 +11445,10 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 		},
 		NextReplicaID: 4,
 	}
-	livenessMap := liveness.IsLiveMap{
-		1: liveness.IsLiveMapEntry{IsLive: true},
-		2: liveness.IsLiveMapEntry{IsLive: false},
-		4: liveness.IsLiveMapEntry{IsLive: false},
+	livenessMap := livenesspb.IsLiveMap{
+		1: livenesspb.IsLiveMapEntry{IsLive: true},
+		2: livenesspb.IsLiveMapEntry{IsLive: false},
+		4: livenesspb.IsLiveMapEntry{IsLive: false},
 	}
 
 	myLease := roachpb.Lease{
@@ -11449,7 +11514,7 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 	tests := []struct {
 		leaseStatus           kvserverpb.LeaseStatus
 		raftStatus            raft.BasicStatus
-		livenessMap           liveness.IsLiveMap
+		livenessMap           livenesspb.IsLiveMap
 		desc                  *roachpb.RangeDescriptor
 		requiresExpiringLease bool
 		exp                   bool
@@ -11518,12 +11583,12 @@ func TestReplicaShouldCampaignOnLeaseRequestRedirect(t *testing.T) {
 	}
 
 	now := hlc.Timestamp{WallTime: 100}
-	livenessMap := liveness.IsLiveMap{
-		1: liveness.IsLiveMapEntry{
+	livenessMap := livenesspb.IsLiveMap{
+		1: livenesspb.IsLiveMapEntry{
 			IsLive:   true,
 			Liveness: livenesspb.Liveness{Expiration: now.Add(1, 0).ToLegacyTimestamp()},
 		},
-		2: liveness.IsLiveMapEntry{
+		2: livenesspb.IsLiveMapEntry{
 			// NOTE: we purposefully set IsLive to true in disagreement with the
 			// Liveness expiration to ensure that we're only looking at node liveness
 			// in shouldCampaignOnLeaseRequestRedirect and not at whether this node is
@@ -13858,7 +13923,7 @@ func TestRangeInfoReturned(t *testing.T) {
 func tenantsWithMetrics(m *StoreMetrics) map[roachpb.TenantID]struct{} {
 	metricsTenants := map[roachpb.TenantID]struct{}{}
 	m.tenants.Range(func(tenID int64, _ unsafe.Pointer) bool {
-		metricsTenants[roachpb.MakeTenantID(uint64(tenID))] = struct{}{}
+		metricsTenants[roachpb.MustMakeTenantID(uint64(tenID))] = struct{}{}
 		return true // more
 	})
 	return metricsTenants
@@ -13910,7 +13975,7 @@ func TestStoreTenantMetricsAndRateLimiterRefcount(t *testing.T) {
 	)
 
 	// A range for tenant 123 appears via a split.
-	ten123 := roachpb.MakeTenantID(123)
+	ten123 := roachpb.MustMakeTenantID(123)
 	splitKey := keys.MustAddr(keys.MakeSQLCodec(ten123).TenantPrefix())
 	leftRepl := tc.store.LookupReplica(splitKey)
 	require.NotNil(t, leftRepl)

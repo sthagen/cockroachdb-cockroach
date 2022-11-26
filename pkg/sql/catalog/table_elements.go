@@ -11,6 +11,7 @@
 package catalog
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
@@ -71,9 +72,9 @@ type Mutation interface {
 	// nil otherwise.
 	AsIndex() Index
 
-	// AsConstraint returns the corresponding ConstraintToUpdate if the mutation
+	// AsConstraint returns the corresponding Constraint if the mutation
 	// is on a constraint, nil otherwise.
-	AsConstraint() ConstraintToUpdate
+	AsConstraint() Constraint
 
 	// AsPrimaryKeySwap returns the corresponding PrimaryKeySwap if the mutation
 	// is a primary key swap, nil otherwise.
@@ -396,44 +397,41 @@ type Column interface {
 	GetGeneratedAsIdentitySequenceOption(defaultIntSize int32) (*descpb.TableDescriptor_SequenceOpts, error)
 }
 
-// ConstraintToUpdate is an interface around a constraint mutation.
-type ConstraintToUpdate interface {
+// Constraint is an interface around a constraint.
+type Constraint interface {
 	TableElementMaybeMutation
+	fmt.Stringer
 
-	// ConstraintToUpdateDesc returns the underlying protobuf descriptor.
-	ConstraintToUpdateDesc() *descpb.ConstraintToUpdate
+	// GetConstraintID returns the ID for the constraint.
+	GetConstraintID() descpb.ConstraintID
+
+	// GetConstraintValidity returns the validity of this constraint.
+	GetConstraintValidity() descpb.ConstraintValidity
 
 	// GetName returns the name of this constraint update mutation.
 	GetName() string
 
-	// IsCheck returns true iff this is an update for a check constraint.
-	IsCheck() bool
-
-	// IsForeignKey returns true iff this is an update for a fk constraint.
-	IsForeignKey() bool
-
-	// IsNotNull returns true iff this is an update for a not-null constraint.
-	IsNotNull() bool
-
-	// IsUniqueWithoutIndex returns true iff this is an update for a unique
-	// without index constraint.
-	IsUniqueWithoutIndex() bool
-
-	// Check returns the underlying check constraint, if there is one.
-	Check() descpb.TableDescriptor_CheckConstraint
-
-	// ForeignKey returns the underlying fk constraint, if there is one.
-	ForeignKey() descpb.ForeignKeyConstraint
-
 	// NotNullColumnID returns the underlying not-null column ID, if there is one.
 	NotNullColumnID() descpb.ColumnID
 
-	// UniqueWithoutIndex returns the underlying unique without index constraint, if
-	// there is one.
-	UniqueWithoutIndex() descpb.UniqueWithoutIndexConstraint
+	// AsCheck returns the underlying check constraint, if there is one.
+	AsCheck() *descpb.TableDescriptor_CheckConstraint
 
-	// GetConstraintID returns the ID for the constraint.
-	GetConstraintID() descpb.ConstraintID
+	// AsForeignKey returns the underlying foreign key constraint, if there is
+	// one.
+	AsForeignKey() *descpb.ForeignKeyConstraint
+
+	// AsUniqueWithoutIndex returns the underlying unique without index
+	// constraint, if there is one.
+	AsUniqueWithoutIndex() *descpb.UniqueWithoutIndexConstraint
+
+	// AsPrimaryKey returns the index descriptor backing the PRIMARY KEY
+	// constraint, if there is one.
+	AsPrimaryKey() Index
+
+	// AsUnique returns the index descriptor backing the UNIQUE constraint,
+	// if there is one.
+	AsUnique() Index
 }
 
 // PrimaryKeySwap is an interface around a primary key swap mutation.

@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -41,7 +42,7 @@ func gcTenant(
 		)
 	}
 
-	info, err := sql.GetTenantRecord(ctx, execCfg, nil /* txn */, tenID)
+	info, err := sql.GetTenantRecordByID(ctx, execCfg, nil /* txn */, roachpb.MustMakeTenantID(tenID))
 	if err != nil {
 		if pgerror.GetPGCode(err) == pgcode.UndefinedObject {
 			// The tenant row is deleted only after its data is cleared so there is
@@ -55,7 +56,7 @@ func gcTenant(
 			}
 			return nil
 		}
-		return errors.Wrapf(err, "fetching tenant %d", info.ID)
+		return errors.Wrapf(err, "fetching tenant %d", tenID)
 	}
 
 	// This case should never happen.

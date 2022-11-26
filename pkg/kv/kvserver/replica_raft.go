@@ -24,11 +24,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -253,7 +253,7 @@ func (r *Replica) evalAndPropose(
 	// commands can evaluate but then be blocked on quota, which has worse memory
 	// behavior.
 	quotaSize := uint64(proposal.command.Size())
-	if maxSize := uint64(MaxCommandSize.Get(&r.store.cfg.Settings.SV)); quotaSize > maxSize {
+	if maxSize := uint64(kvserverbase.MaxCommandSize.Get(&r.store.cfg.Settings.SV)); quotaSize > maxSize {
 		return nil, nil, "", nil, roachpb.NewError(errors.Errorf(
 			"command is too large: %d bytes (max: %d)", quotaSize, maxSize,
 		))
@@ -576,35 +576,27 @@ type handleSnapshotStats struct {
 type handleRaftReadyStats struct {
 	tBegin, tEnd time.Time
 
+	append logstore.AppendStats
+
 	tApplicationBegin, tApplicationEnd time.Time
 	apply                              applyCommittedEntriesStats
 
-	tAppendBegin, tAppendEnd time.Time
-	appendedRegularCount     int
-	appendedSideloadedCount  int
-	appendedSideloadedBytes  int64
-	appendedRegularBytes     int64
-
-	tPebbleCommitBegin, tPebbleCommitEnd time.Time
-	pebbleBatchBytes                     int64
-
 	tSnapBegin, tSnapEnd time.Time
 	snap                 handleSnapshotStats
-	sync                 bool
 }
 
 // SafeFormat implements redact.SafeFormatter
 func (s handleRaftReadyStats) SafeFormat(p redact.SafePrinter, _ rune) {
 	dTotal := s.tEnd.Sub(s.tBegin)
-	dAppend := s.tAppendEnd.Sub(s.tAppendBegin)
+	dAppend := s.append.End.Sub(s.append.Begin)
 	dApply := s.tApplicationEnd.Sub(s.tApplicationBegin)
-	dPebble := s.tPebbleCommitEnd.Sub(s.tPebbleCommitBegin)
+	dPebble := s.append.PebbleEnd.Sub(s.append.PebbleBegin)
 	dSnap := s.tSnapEnd.Sub(s.tSnapBegin)
 	dUnaccounted := dTotal - dSnap - dAppend - dApply - dPebble
 
 	{
 		var sync redact.SafeString
-		if s.sync {
+		if s.append.Sync {
 			sync = "-sync"
 		}
 		p.Printf("raft ready handling: %.2fs [append=%.2fs, apply=%.2fs, commit-batch%s=%.2fs",
@@ -616,17 +608,17 @@ func (s handleRaftReadyStats) SafeFormat(p redact.SafePrinter, _ rune) {
 	p.Printf(", other=%.2fs]", dUnaccounted.Seconds())
 
 	p.Printf(", wrote %s",
-		humanizeutil.IBytes(s.pebbleBatchBytes),
+		humanizeutil.IBytes(s.append.PebbleBytes),
 	)
-	if s.sync {
+	if s.append.Sync {
 		p.SafeString(" sync")
 	}
 	p.SafeString(" [")
 
-	if b, n := s.appendedRegularBytes, s.appendedRegularCount; n > 0 || b > 0 {
+	if b, n := s.append.RegularBytes, s.append.RegularEntries; n > 0 || b > 0 {
 		p.Printf("append-ent=%s (%d), ", humanizeutil.IBytes(b), n)
 	}
-	if b, n := s.appendedSideloadedBytes, s.appendedSideloadedCount; n > 0 || b > 0 {
+	if b, n := s.append.SideloadedBytes, s.append.SideloadedEntries; n > 0 || b > 0 {
 		p.Printf("append-sst=%s (%d), ", humanizeutil.IBytes(b), n)
 	}
 	if b, n := s.apply.entriesProcessedBytes, s.apply.entriesProcessed; n > 0 || b > 0 {
@@ -666,7 +658,7 @@ var noSnap IncomingSnapshot
 // non-sensitive cue as to what happened.
 func (r *Replica) handleRaftReady(
 	ctx context.Context, inSnap IncomingSnapshot,
-) (handleRaftReadyStats, string, error) {
+) (handleRaftReadyStats, error) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
 	return r.handleRaftReadyRaftMuLocked(ctx, inSnap)
@@ -679,15 +671,15 @@ func (r *Replica) handleRaftReady(
 // non-sensitive cue as to what happened.
 func (r *Replica) handleRaftReadyRaftMuLocked(
 	ctx context.Context, inSnap IncomingSnapshot,
-) (stats handleRaftReadyStats, _ string, _ error) {
+) (handleRaftReadyStats, error) {
 	// handleRaftReadyRaftMuLocked is not prepared to handle context cancellation,
 	// so assert that it's given a non-cancellable context.
 	if ctx.Done() != nil {
-		return handleRaftReadyStats{}, "", errors.AssertionFailedf(
+		return handleRaftReadyStats{}, errors.AssertionFailedf(
 			"handleRaftReadyRaftMuLocked cannot be called with a cancellable context")
 	}
 
-	stats = handleRaftReadyStats{
+	stats := handleRaftReadyStats{
 		tBegin: timeutil.Now(),
 	}
 	defer func() {
@@ -703,10 +695,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	var hasReady bool
 	var rd raft.Ready
 	r.mu.Lock()
-	state := raftLogState{ // used for append below
-		lastIndex: r.mu.lastIndex,
-		lastTerm:  r.mu.lastTerm,
-		byteSize:  r.mu.raftLogSize,
+	state := logstore.RaftState{ // used for append below
+		LastIndex: r.mu.lastIndex,
+		LastTerm:  r.mu.lastTerm,
+		ByteSize:  r.mu.raftLogSize,
 	}
 	leaderID := r.mu.leaderID
 	lastLeaderID := leaderID
@@ -738,10 +730,9 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	r.mu.Unlock()
 	if errors.Is(err, errRemoved) {
 		// If we've been removed then just return.
-		return stats, "", nil
+		return stats, nil
 	} else if err != nil {
-		const expl = "while checking raft group for Ready"
-		return stats, expl, errors.Wrap(err, expl)
+		return stats, errors.Wrap(err, "checking raft group for Ready")
 	}
 	if !hasReady {
 		// We must update the proposal quota even if we don't have a ready.
@@ -753,7 +744,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		// replica has caught up, we can release
 		// some quota back to the pool.
 		r.updateProposalQuotaRaftMuLocked(ctx, lastLeaderID)
-		return stats, "", nil
+		return stats, nil
 	}
 
 	logRaftReady(ctx, rd)
@@ -780,8 +771,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		if !raft.IsEmptySnap(rd.Snapshot) {
 			snapUUID, err := uuid.FromBytes(rd.Snapshot.Data)
 			if err != nil {
-				const expl = "invalid snapshot id"
-				return stats, expl, errors.Wrap(err, expl)
+				return stats, errors.Wrap(err, "invalid snapshot id")
 			}
 			if inSnap.SnapUUID == (uuid.UUID{}) {
 				log.Fatalf(ctx, "programming error: a snapshot application was attempted outside of the streaming snapshot codepath")
@@ -800,8 +790,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 
 			stats.tSnapBegin = timeutil.Now()
 			if err := r.applySnapshot(ctx, inSnap, rd.Snapshot, rd.HardState, subsumedRepls); err != nil {
-				const expl = "while applying snapshot"
-				return stats, expl, errors.Wrap(err, expl)
+				return stats, errors.Wrap(err, "while applying snapshot")
 			}
 			stats.tSnapEnd = timeutil.Now()
 			stats.snap.applied = true
@@ -810,10 +799,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			// applySnapshot, but we also want to make sure we reflect these changes in
 			// the local variables we're tracking here.
 			r.mu.RLock()
-			state = raftLogState{
-				lastIndex: r.mu.lastIndex,
-				lastTerm:  r.mu.lastTerm,
-				byteSize:  r.mu.raftLogSize,
+			state = logstore.RaftState{
+				LastIndex: r.mu.lastIndex,
+				LastTerm:  r.mu.lastTerm,
+				ByteSize:  r.mu.raftLogSize,
 			}
 			r.mu.RUnlock()
 
@@ -832,11 +821,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		// If we didn't expect Raft to have a snapshot but it has one
 		// regardless, that is unexpected and indicates a programming
 		// error.
-		err := makeNonDeterministicFailure(
+		return stats, errors.AssertionFailedf(
 			"have inSnap=nil, but raft has a snapshot %s",
 			raft.DescribeSnapshot(rd.Snapshot),
 		)
-		return stats, getNonDeterministicFailureExplanation(err), err
 	}
 
 	// If the ready struct includes entries that have been committed, these
@@ -863,11 +851,11 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	appTask.SetMaxBatchSize(r.store.TestingKnobs().MaxApplicationBatchSize)
 	defer appTask.Close()
 	if err := appTask.Decode(ctx, rd.CommittedEntries); err != nil {
-		return stats, getNonDeterministicFailureExplanation(err), err
+		return stats, err
 	}
 	if knobs := r.store.TestingKnobs(); knobs == nil || !knobs.DisableCanAckBeforeApplication {
-		if err := appTask.AckCommittedEntriesBeforeApplication(ctx, state.lastIndex); err != nil {
-			return stats, getNonDeterministicFailureExplanation(err), err
+		if err := appTask.AckCommittedEntriesBeforeApplication(ctx, state.LastIndex); err != nil {
+			return stats, err
 		}
 	}
 
@@ -928,8 +916,6 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	r.traceMessageSends(msgApps, "sending msgApp")
 	r.sendRaftMessagesRaftMuLocked(ctx, msgApps, pausedFollowers)
 
-	prevLastIndex := state.lastIndex
-
 	// TODO(pavelkalinnikov): find a way to move it to storeEntries.
 	if !raft.IsEmptyHardState(rd.HardState) {
 		if !r.IsInitialized() && rd.HardState.Commit != 0 {
@@ -937,46 +923,26 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 	}
 	// TODO(pavelkalinnikov): construct and store this in Replica.
-	s := logStore{
-		engine:      r.store.engine,
-		sideload:    r.raftMu.sideloaded,
-		stateLoader: r.raftMu.stateLoader,
-		settings:    r.store.cfg.Settings,
-		metrics:     r.store.metrics,
+	s := logstore.LogStore{
+		Engine:      r.store.engine,
+		Sideload:    r.raftMu.sideloaded,
+		StateLoader: r.raftMu.stateLoader,
+		Settings:    r.store.cfg.Settings,
+		Metrics: logstore.Metrics{
+			RaftLogCommitLatency: r.store.metrics.RaftLogCommitLatency,
+		},
 	}
-	if state, err = s.storeEntries(ctx, state, rd, &stats); err != nil {
-		const expl = "while storing log entries"
-		return stats, expl, err
-	}
-
-	if len(rd.Entries) > 0 {
-		// We may have just overwritten parts of the log which contain
-		// sideloaded SSTables from a previous term (and perhaps discarded some
-		// entries that we didn't overwrite). Remove any such leftover on-disk
-		// payloads (we can do that now because we've committed the deletion
-		// just above).
-		firstPurge := rd.Entries[0].Index // first new entry written
-		purgeTerm := rd.Entries[0].Term - 1
-		lastPurge := prevLastIndex // old end of the log, include in deletion
-		purgedSize, err := maybePurgeSideloaded(ctx, r.raftMu.sideloaded, firstPurge, lastPurge, purgeTerm)
-		if err != nil {
-			const expl = "while purging sideloaded storage"
-			return stats, expl, err
-		}
-		state.byteSize -= purgedSize
-		if state.byteSize < 0 {
-			// Might have gone negative if node was recently restarted.
-			state.byteSize = 0
-		}
+	if state, err = s.StoreEntries(ctx, state, logstore.MakeReady(rd), &stats.append); err != nil {
+		return stats, errors.Wrap(err, "while storing log entries")
 	}
 
 	// Update protected state - last index, last term, raft log size, and raft
 	// leader ID.
 	r.mu.Lock()
-	// TODO(pavelkalinnikov): put raftLogState to r.mu directly instead of fields.
-	r.mu.lastIndex = state.lastIndex
-	r.mu.lastTerm = state.lastTerm
-	r.mu.raftLogSize = state.byteSize
+	// TODO(pavelkalinnikov): put logstore.RaftState to r.mu directly.
+	r.mu.lastIndex = state.LastIndex
+	r.mu.lastTerm = state.LastTerm
+	r.mu.raftLogSize = state.ByteSize
 	var becameLeader bool
 	if r.mu.leaderID != leaderID {
 		r.mu.leaderID = leaderID
@@ -1003,14 +969,16 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	if len(rd.CommittedEntries) > 0 {
 		err := appTask.ApplyCommittedEntries(ctx)
 		stats.apply = sm.moveStats()
-		if errors.Is(err, apply.ErrRemoved) {
-			// We know that our replica has been removed. All future calls to
-			// r.withRaftGroup() will return errRemoved so no future Ready objects
-			// will be processed by this Replica.
-			return stats, "", err
-		} else if err != nil {
-			return stats, getNonDeterministicFailureExplanation(err), err
+		if err != nil {
+			// NB: this branch will be hit when the replica has been removed,
+			// in which case errors.Is(err, apply.ErrRemoved). Our callers
+			// special-case this.
+			//
+			// No future Ready objects will be processed by this Replica since
+			// it is now marked as destroyed.
+			return stats, err
 		}
+
 		if r.store.cfg.KVAdmissionController != nil &&
 			stats.apply.followerStoreWriteBytes.NumEntries > 0 {
 			r.store.cfg.KVAdmissionController.FollowerStoreWriteBytes(
@@ -1051,7 +1019,6 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// raft group we will early return before this point. This, combined with
 	// the fact that we'll refuse to process messages intended for a higher
 	// replica ID ensures that our replica ID could not have changed.
-	const expl = "during advance"
 
 	r.mu.Lock()
 	err = r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
@@ -1078,7 +1045,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	r.mu.applyingEntries = false
 	r.mu.Unlock()
 	if err != nil {
-		return stats, expl, errors.Wrap(err, expl)
+		return stats, errors.Wrap(err, "during advance")
 	}
 
 	// NB: All early returns other than the one due to not having a ready
@@ -1092,100 +1059,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// quota back at the end of handleRaftReadyRaftMuLocked, the next write will
 	// get blocked.
 	r.updateProposalQuotaRaftMuLocked(ctx, lastLeaderID)
-	return stats, "", nil
-}
-
-// logStore is a stub of a separated Raft log storage.
-//
-// TODO(pavelkalinnikov): move to its own package.
-type logStore struct {
-	engine      storage.Engine
-	sideload    SideloadStorage
-	stateLoader stateloader.StateLoader
-	settings    *cluster.Settings
-	metrics     *StoreMetrics
-}
-
-// storeEntries persists newly appended Raft log Entries to the log storage.
-// Accepts the state of the log before the operation, returns the state after.
-// Persists HardState atomically with, or strictly after Entries.
-//
-// TODO(pavelkalinnikov): raft.Ready combines multiple roles. For a stricter
-// separation between log and state storage, introduce a log-specific Ready,
-// consisting of committed Entries, HardState, and MustSync.
-func (s *logStore) storeEntries(
-	ctx context.Context, state raftLogState, rd raft.Ready, stats *handleRaftReadyStats,
-) (raftLogState, error) {
-	// TODO(pavelkalinnikov): Doesn't this comment contradict the code?
-	// Use a more efficient write-only batch because we don't need to do any
-	// reads from the batch. Any reads are performed on the underlying DB.
-	batch := s.engine.NewUnindexedBatch(false /* writeOnly */)
-	defer batch.Close()
-
-	if len(rd.Entries) > 0 {
-		stats.tAppendBegin = timeutil.Now()
-		// All of the entries are appended to distinct keys, returning a new
-		// last index.
-		thinEntries, numSideloaded, sideLoadedEntriesSize, otherEntriesSize, err := maybeSideloadEntries(ctx, rd.Entries, s.sideload)
-		if err != nil {
-			const expl = "during sideloading"
-			return raftLogState{}, errors.Wrap(err, expl)
-		}
-		state.byteSize += sideLoadedEntriesSize
-		if state, err = logAppend(
-			ctx, s.stateLoader.RaftLogPrefix(), batch, state, thinEntries,
-		); err != nil {
-			const expl = "during append"
-			return raftLogState{}, errors.Wrap(err, expl)
-		}
-		stats.appendedRegularCount += len(thinEntries) - numSideloaded
-		stats.appendedRegularBytes += otherEntriesSize
-		stats.appendedSideloadedCount += numSideloaded
-		stats.appendedSideloadedBytes += sideLoadedEntriesSize
-		stats.tAppendEnd = timeutil.Now()
-	}
-
-	if !raft.IsEmptyHardState(rd.HardState) {
-		// NB: Note that without additional safeguards, it's incorrect to write
-		// the HardState before appending rd.Entries. When catching up, a follower
-		// will receive Entries that are immediately Committed in the same
-		// Ready. If we persist the HardState but happen to lose the Entries,
-		// assertions can be tripped.
-		//
-		// We have both in the same batch, so there's no problem. If that ever
-		// changes, we must write and sync the Entries before the HardState.
-		if err := s.stateLoader.SetHardState(ctx, batch, rd.HardState); err != nil {
-			const expl = "during setHardState"
-			return raftLogState{}, errors.Wrap(err, expl)
-		}
-	}
-	// Synchronously commit the batch with the Raft log entries and Raft hard
-	// state as we're promising not to lose this data.
-	//
-	// Note that the data is visible to other goroutines before it is synced to
-	// disk. This is fine. The important constraints are that these syncs happen
-	// before Raft messages are sent and before the call to RawNode.Advance. Our
-	// regular locking is sufficient for this and if other goroutines can see the
-	// data early, that's fine. In particular, snapshots are not a problem (I
-	// think they're the only thing that might access log entries or HardState
-	// from other goroutines). Snapshots do not include either the HardState or
-	// uncommitted log entries, and even if they did include log entries that
-	// were not persisted to disk, it wouldn't be a problem because raft does not
-	// infer the that entries are persisted on the node that sends a snapshot.
-	stats.tPebbleCommitBegin = timeutil.Now()
-	stats.pebbleBatchBytes = int64(batch.Len())
-	sync := rd.MustSync && !disableSyncRaftLog.Get(&s.settings.SV)
-	if err := batch.Commit(sync); err != nil {
-		const expl = "while committing batch"
-		return raftLogState{}, errors.Wrap(err, expl)
-	}
-	stats.sync = sync
-	stats.tPebbleCommitEnd = timeutil.Now()
-	if rd.MustSync {
-		s.metrics.RaftLogCommitLatency.RecordValue(
-			stats.tPebbleCommitEnd.Sub(stats.tPebbleCommitBegin).Nanoseconds())
-	}
-	return state, nil
+	return stats, nil
 }
 
 // splitMsgApps splits the Raft message slice into two slices, one containing
@@ -1204,14 +1078,14 @@ func splitMsgApps(msgs []raftpb.Message) (msgApps, otherMsgs []raftpb.Message) {
 
 // maybeFatalOnRaftReadyErr will fatal if err is neither nil nor
 // apply.ErrRemoved.
-func maybeFatalOnRaftReadyErr(ctx context.Context, expl string, err error) (removed bool) {
+func maybeFatalOnRaftReadyErr(ctx context.Context, err error) (removed bool) {
 	switch {
 	case err == nil:
 		return false
 	case errors.Is(err, apply.ErrRemoved):
 		return true
 	default:
-		log.FatalfDepth(ctx, 1, "%s: %+v", redact.Safe(expl), err)
+		log.FatalfDepth(ctx, 1, "%+v", err)
 		panic("unreachable")
 	}
 }
@@ -1219,7 +1093,7 @@ func maybeFatalOnRaftReadyErr(ctx context.Context, expl string, err error) (remo
 // tick the Raft group, returning true if the raft group exists and should
 // be queued for Ready processing; false otherwise.
 func (r *Replica) tick(
-	ctx context.Context, livenessMap liveness.IsLiveMap, ioThresholdMap *ioThresholdMap,
+	ctx context.Context, livenessMap livenesspb.IsLiveMap, ioThresholdMap *ioThresholdMap,
 ) (bool, error) {
 	r.unreachablesMu.Lock()
 	remotes := r.unreachablesMu.remotes
@@ -1551,7 +1425,7 @@ func (r *Replica) sendRaftMessagesRaftMuLocked(
 				prevIndex := message.Index  // index of entry preceding the append
 				for j := range message.Entries {
 					ent := &message.Entries[j]
-					assertSideloadedRaftCommandInlined(ctx, ent)
+					logstore.AssertSideloadedRaftCommandInlined(ctx, ent)
 
 					if prevIndex+1 != ent.Index {
 						log.Fatalf(ctx,
@@ -1930,7 +1804,7 @@ func shouldCampaignOnWake(
 	leaseStatus kvserverpb.LeaseStatus,
 	storeID roachpb.StoreID,
 	raftStatus raft.BasicStatus,
-	livenessMap liveness.IsLiveMap,
+	livenessMap livenesspb.IsLiveMap,
 	desc *roachpb.RangeDescriptor,
 	requiresExpiringLease bool,
 ) bool {
@@ -1989,7 +1863,7 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 
 	leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
-	livenessMap, _ := r.store.livenessMap.Load().(liveness.IsLiveMap)
+	livenessMap, _ := r.store.livenessMap.Load().(livenesspb.IsLiveMap)
 	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus, livenessMap, r.descRLocked(), r.requiresExpiringLeaseRLocked()) {
 		r.campaignLocked(ctx)
 	}
@@ -2013,7 +1887,7 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 // become leader and can proceed with a future attempt to acquire the lease.
 func shouldCampaignOnLeaseRequestRedirect(
 	raftStatus raft.BasicStatus,
-	livenessMap liveness.IsLiveMap,
+	livenessMap livenesspb.IsLiveMap,
 	desc *roachpb.RangeDescriptor,
 	requiresExpiringLease bool,
 	now hlc.Timestamp,
@@ -2333,7 +2207,10 @@ func handleTruncatedStateBelowRaftPreApply(
 //
 // The sideloaded storage may be nil, in which case it is treated as empty.
 func ComputeRaftLogSize(
-	ctx context.Context, rangeID roachpb.RangeID, reader storage.Reader, sideloaded SideloadStorage,
+	ctx context.Context,
+	rangeID roachpb.RangeID,
+	reader storage.Reader,
+	sideloaded logstore.SideloadStorage,
 ) (int64, error) {
 	prefix := keys.RaftLogPrefix(rangeID)
 	prefixEnd := prefix.PrefixEnd()
@@ -2388,13 +2265,6 @@ func shouldCampaignAfterConfChange(
 		return true
 	}
 	return false
-}
-
-func getNonDeterministicFailureExplanation(err error) string {
-	if nd := (*nonDeterministicFailure)(nil); errors.As(err, &nd) {
-		return nd.safeExpl
-	}
-	return "???"
 }
 
 // printRaftTail pretty-prints the tail of the log and returns it as a string,

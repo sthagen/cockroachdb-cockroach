@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
@@ -51,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/ts"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -385,14 +387,6 @@ func (ts *TestServer) JobRegistry() interface{} {
 	return nil
 }
 
-// StartupMigrationsManager returns the *startupmigrations.Manager as an interface{}.
-func (ts *TestServer) StartupMigrationsManager() interface{} {
-	if ts != nil {
-		return ts.sqlServer.startupMigrationsMgr
-	}
-	return nil
-}
-
 // NodeLiveness exposes the NodeLiveness instance used by the TestServer as an
 // interface{}.
 func (ts *TestServer) NodeLiveness() interface{} {
@@ -514,9 +508,8 @@ func (ts *TestServer) TestTenants() []serverutils.TestTenantInterface {
 // enterprise enabled build. This is due to licensing restrictions on the MT
 // capabilities.
 func (ts *TestServer) maybeStartDefaultTestTenant(ctx context.Context) error {
-	org := sql.ClusterOrganization.Get(&ts.st.SV)
 	clusterID := ts.sqlServer.execCfg.NodeInfo.LogicalClusterID
-	if err := base.CheckEnterpriseEnabled(ts.st, clusterID(), org, "SQL servers"); err != nil {
+	if err := base.CheckEnterpriseEnabled(ts.st, clusterID(), "SQL servers"); err != nil {
 		// If not enterprise enabled, we won't be able to use SQL Servers so eat
 		// the error and return without creating/starting a SQL server.
 		ts.cfg.DisableDefaultTestTenant = true
@@ -732,6 +725,11 @@ func (t *TestTenant) SpanConfigKVAccessor() interface{} {
 	return t.SQLServer.tenantConnect
 }
 
+// SpanConfigReporter is part TestTenantInterface.
+func (t *TestTenant) SpanConfigReporter() interface{} {
+	return t.SQLServer.tenantConnect
+}
+
 // SpanConfigReconciler is part TestTenantInterface.
 func (t *TestTenant) SpanConfigReconciler() interface{} {
 	return t.SQLServer.spanconfigMgr.Reconciler
@@ -762,6 +760,11 @@ func (t *TestTenant) MustGetSQLCounter(name string) int64 {
 	return mustGetSQLCounterForRegistry(t.metricsRegistry, name)
 }
 
+// Codec is part of the TestTenantInterface.
+func (t *TestTenant) Codec() keys.SQLCodec {
+	return t.execCfg.Codec
+}
+
 // StartTenant starts a SQL tenant communicating with this TestServer.
 func (ts *TestServer) StartTenant(
 	ctx context.Context, params base.TestTenantArgs,
@@ -779,22 +782,41 @@ func (ts *TestServer) StartTenant(
 		if rowCount == 0 {
 			// Tenant doesn't exist. Create it.
 			if _, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
-				ctx, "testserver-create-tenant", nil /* txn */, "SELECT crdb_internal.create_tenant($1)", params.TenantID.ToUint64(),
+				ctx, "testserver-create-tenant", nil /* txn */, "SELECT crdb_internal.create_tenant($1, $2)",
+				params.TenantID.ToUint64(), params.TenantName,
 			); err != nil {
+				return nil, err
+			}
+		} else if params.TenantName != "" {
+			_, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(ctx, "rename-test-tenant", nil,
+				`SELECT crdb_internal.rename_tenant($1, $2)`, params.TenantID, params.TenantName)
+			if err != nil {
 				return nil, err
 			}
 		}
 	} else if !params.SkipTenantCheck {
-		rowCount, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
+		row, err := ts.InternalExecutor().(*sql.InternalExecutor).QueryRow(
 			ctx, "testserver-check-tenant-active", nil,
-			"SELECT 1 FROM system.tenants WHERE id=$1 AND active=true",
+			"SELECT name FROM system.tenants WHERE id=$1 AND active=true",
 			params.TenantID.ToUint64(),
 		)
 		if err != nil {
 			return nil, err
 		}
-		if rowCount == 0 {
+		if row == nil {
 			return nil, errors.New("not found")
+		}
+		// Check that the name passed in via params matches the name persisted in
+		// the system.tenants table.
+		if row[0] != tree.DNull {
+			actualName := (*string)(row[0].(*tree.DString))
+			if *actualName != string(params.TenantName) {
+				return nil, errors.Newf("name mismatch; tenant %d has name %s, but params specifies name %s",
+					params.TenantID.ToUint64(), *actualName, params.TenantName)
+			}
+		} else if params.TenantName != "" {
+			return nil, errors.Newf("name mismatch; tenant %d has no name, but params specifies name %s",
+				params.TenantID.ToUint64(), params.TenantName)
 		}
 	}
 
@@ -1144,6 +1166,11 @@ func (ts *TestServer) SpanConfigKVAccessor() interface{} {
 	return ts.Server.node.spanConfigAccessor
 }
 
+// SpanConfigReporter is part of TestServerInterface.
+func (ts *TestServer) SpanConfigReporter() interface{} {
+	return ts.Server.node.spanConfigReporter
+}
+
 // SpanConfigReconciler is part of TestServerInterface.
 func (ts *TestServer) SpanConfigReconciler() interface{} {
 	if ts.sqlServer.spanconfigMgr == nil {
@@ -1408,20 +1435,6 @@ func (ts *TestServer) Tracer() *tracing.Tracer {
 	return ts.node.storeCfg.AmbientCtx.Tracer
 }
 
-// GCSystemLog deletes entries in the given system log table between
-// timestamp and timestampUpperBound if the server is the lease holder
-// for range 1.
-// Leaseholder constraint is present so that only one node in the cluster
-// performs gc.
-// The system log table is expected to have a "timestamp" column.
-// It returns the timestampLowerBound to be used in the next iteration, number
-// of rows affected and error (if any).
-func (ts *TestServer) GCSystemLog(
-	ctx context.Context, table string, timestampLowerBound, timestampUpperBound time.Time,
-) (time.Time, int64, error) {
-	return ts.gcSystemLog(ctx, table, timestampLowerBound, timestampUpperBound)
-}
-
 // ForceTableGC is part of TestServerInterface.
 func (ts *TestServer) ForceTableGC(
 	ctx context.Context, database, table string, timestamp hlc.Timestamp,
@@ -1521,6 +1534,10 @@ func (ts *TestServer) SystemConfigProvider() config.SystemConfigProvider {
 	return ts.node.storeCfg.SystemConfigProvider
 }
 
+func (ts *TestServer) Codec() keys.SQLCodec {
+	return ts.ExecutorConfig().(sql.ExecutorConfig).Codec
+}
+
 type testServerFactoryImpl struct{}
 
 // TestServerFactory can be passed to serverutils.InitTestServerFactory
@@ -1528,6 +1545,14 @@ var TestServerFactory = testServerFactoryImpl{}
 
 // New is part of TestServerFactory interface.
 func (testServerFactoryImpl) New(params base.TestServerArgs) (interface{}, error) {
+	if params.Knobs.JobsTestingKnobs != nil {
+		if params.Knobs.JobsTestingKnobs.(*jobs.TestingKnobs).DisableAdoptions {
+			if params.Knobs.UpgradeManager == nil || !params.Knobs.UpgradeManager.(*upgradebase.TestingKnobs).DontUseJobs {
+				return nil, errors.AssertionFailedf("DontUseJobs needs to be set when DisableAdoptions is set")
+			}
+		}
+	}
+
 	cfg := makeTestConfigFromParams(params)
 	ts := &TestServer{Cfg: &cfg, params: params}
 

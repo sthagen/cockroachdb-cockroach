@@ -37,7 +37,6 @@ if [[ -z "${DRY_RUN}" ]] ; then
   gcr_repository="us-docker.pkg.dev/cockroach-cloud-images/cockroachdb/cockroach"
   # Used for docker login for gcloud
   gcr_hostname="us-docker.pkg.dev"
-  s3_download_hostname="${bucket}"
   git_repo_for_tag="cockroachdb/cockroach"
 else
   bucket="cockroach-builds-test"
@@ -48,7 +47,6 @@ else
   dockerhub_repository="docker.io/cockroachdb/cockroach-misc"
   gcr_repository="us.gcr.io/cockroach-release/cockroach-test"
   gcr_hostname="us.gcr.io"
-  s3_download_hostname="${bucket}.s3.amazonaws.com"
   git_repo_for_tag="cockroachlabs/release-staging"
   if [[ -z "$(echo ${build_name} | grep -E -o '^v[0-9]+\.[0-9]+\.[0-9]+$')" ]] ; then
     # Using `.` to match how we usually format the pre-release portion of the
@@ -62,6 +60,7 @@ else
   fi
 fi
 
+download_prefix="https://storage.googleapis.com/$gcs_bucket"
 tc_end_block "Variable Setup"
 
 
@@ -119,7 +118,7 @@ for platform_name in "${platform_names[@]}"; do
     --silent \
     --show-error \
     --output /dev/stdout \
-    --url "https://${s3_download_hostname}/cockroach-${build_name}.${linux_platform}-${tarball_arch}.tgz" \
+    --url "${download_prefix}/cockroach-${build_name}.${linux_platform}-${tarball_arch}.tgz" \
     | tar \
     --directory="build/deploy-${docker_arch}" \
     --extract \
@@ -183,7 +182,7 @@ tc_start_block "Publish S3 binaries and archive as latest"
 # Only push the "latest" for our most recent release branch.
 # https://github.com/cockroachdb/cockroach/issues/41067
 if [[ -n "${PUBLISH_LATEST}" && -z "${PRE_RELEASE}" ]]; then
-    BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e TC_BUILDTYPE_ID -e TC_BUILD_BRANCH=$build_name -e bucket -e gcs_credentials -e gcs_bucket" run_bazel << 'EOF'
+    BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e TC_BUILDTYPE_ID -e TC_BUILD_BRANCH=$build_name -e bucket=$bucket -e gcs_credentials -e gcs_bucket=$gcs_bucket" run_bazel << 'EOF'
 bazel build --config ci //pkg/cmd/publish-provisional-artifacts
 BAZEL_BIN=$(bazel info bazel-bin --config ci)
 $BAZEL_BIN/pkg/cmd/publish-provisional-artifacts/publish-provisional-artifacts_/publish-provisional-artifacts -bless -release -bucket "$bucket" --gcs-bucket="$gcs_bucket"

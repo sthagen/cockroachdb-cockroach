@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -1205,7 +1204,7 @@ func createImportingDescriptors(
 					default:
 						return errors.AssertionFailedf("unknown tenant state %v", tenant)
 					}
-					if err := sql.CreateTenantRecord(ctx, p.ExecCfg(), txn, &tenant, initialTenantZoneConfig); err != nil {
+					if _, err := sql.CreateTenantRecord(ctx, p.ExecCfg(), txn, &tenant, initialTenantZoneConfig); err != nil {
 						return err
 					}
 				}
@@ -1533,7 +1532,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	}
 
 	for _, tenant := range details.Tenants {
-		to := roachpb.MakeTenantID(tenant.ID)
+		to := roachpb.MustMakeTenantID(tenant.ID)
 		from := to
 		if details.PreRewriteTenantId != nil {
 			from = *details.PreRewriteTenantId
@@ -2741,10 +2740,7 @@ func (r *restoreResumer) restoreSystemUsers(
 			return err
 		}
 
-		insertUser := `INSERT INTO system.users ("username", "hashedPassword", "isRole") VALUES ($1, $2, $3)`
-		if r.execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2AddSystemUserIDColumn) {
-			insertUser = `INSERT INTO system.users ("username", "hashedPassword", "isRole", "user_id") VALUES ($1, $2, $3, $4)`
-		}
+		insertUser := `INSERT INTO system.users ("username", "hashedPassword", "isRole", "user_id") VALUES ($1, $2, $3, $4)`
 		newUsernames := make(map[string]bool)
 		args := make([]interface{}, 4)
 		for _, user := range users {
@@ -2752,13 +2748,11 @@ func (r *restoreResumer) restoreSystemUsers(
 			args[0] = user[0]
 			args[1] = user[1]
 			args[2] = user[2]
-			if r.execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2AddSystemUserIDColumn) {
-				id, err := descidgen.GenerateUniqueRoleID(ctx, r.execCfg.DB, r.execCfg.Codec)
-				if err != nil {
-					return err
-				}
-				args[3] = id
+			id, err := descidgen.GenerateUniqueRoleID(ctx, r.execCfg.DB, r.execCfg.Codec)
+			if err != nil {
+				return err
 			}
+			args[3] = id
 			if _, err = executor.Exec(ctx, "insert-non-existent-users", txn, insertUser,
 				args...); err != nil {
 				return err

@@ -15,11 +15,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/logtags"
 )
@@ -106,10 +106,11 @@ type Cluster interface {
 // SystemDeps are the dependencies of upgrades which perform actions at the
 // KV layer on behalf of the system tenant.
 type SystemDeps struct {
-	Cluster    Cluster
-	DB         *kv.DB
-	DistSender *kvcoord.DistSender
-	Stopper    *stop.Stopper
+	Cluster          Cluster
+	DB               *kv.DB
+	InternalExecutor sqlutil.InternalExecutor
+	DistSender       *kvcoord.DistSender
+	Stopper          *stop.Stopper
 }
 
 // SystemUpgrade is an implementation of Upgrade for system-level
@@ -122,25 +123,37 @@ type SystemUpgrade struct {
 
 // SystemUpgradeFunc is used to perform kv-level upgrades. It should only be
 // run from the system tenant.
-type SystemUpgradeFunc func(context.Context, clusterversion.ClusterVersion, SystemDeps, *jobs.Job) error
+type SystemUpgradeFunc func(context.Context, clusterversion.ClusterVersion, SystemDeps) error
 
 // NewSystemUpgrade constructs a SystemUpgrade.
-func NewSystemUpgrade(
-	description string, cv clusterversion.ClusterVersion, fn SystemUpgradeFunc,
+func NewSystemUpgrade(description string, v roachpb.Version, fn SystemUpgradeFunc) *SystemUpgrade {
+	return &SystemUpgrade{
+		upgrade: upgrade{
+			description: description,
+			v:           v,
+		},
+		fn: fn,
+	}
+}
+
+// NewPermanentSystemUpgrade constructs a SystemUpgrade that is marked as
+// "permanent": an upgrade that will run regardless of the cluster's bootstrap
+// version.
+func NewPermanentSystemUpgrade(
+	description string, v roachpb.Version, fn SystemUpgradeFunc,
 ) *SystemUpgrade {
 	return &SystemUpgrade{
 		upgrade: upgrade{
 			description: description,
-			cv:          cv,
+			v:           v,
+			permanent:   true,
 		},
 		fn: fn,
 	}
 }
 
 // Run kickstarts the actual upgrade process for system-level upgrades.
-func (m *SystemUpgrade) Run(
-	ctx context.Context, cv clusterversion.ClusterVersion, d SystemDeps, job *jobs.Job,
-) error {
-	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s", cv), nil)
-	return m.fn(ctx, cv, d, job)
+func (m *SystemUpgrade) Run(ctx context.Context, v roachpb.Version, d SystemDeps) error {
+	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s", v), nil)
+	return m.fn(ctx, clusterversion.ClusterVersion{Version: v}, d)
 }

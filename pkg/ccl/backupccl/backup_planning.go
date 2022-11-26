@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	pbtypes "github.com/gogo/protobuf/types"
 )
 
@@ -485,7 +486,7 @@ func checkPrivilegesForBackup(
 
 func requireEnterprise(execCfg *sql.ExecutorConfig, feature string) error {
 	if err := utilccl.CheckEnterpriseEnabled(
-		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), execCfg.Organization(),
+		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(),
 		fmt.Sprintf("BACKUP with %s", feature),
 	); err != nil {
 		return err
@@ -618,6 +619,9 @@ func backupPlanHook(
 			return nil, nil, nil, false, err
 		}
 		encryptionParams.Mode = jobspb.EncryptionMode_KMS
+		if err = logAndSanitizeKmsURIs(ctx, kms...); err != nil {
+			return nil, nil, nil, false, err
+		}
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -659,7 +663,7 @@ func backupPlanHook(
 			if err := requireEnterprise(p.ExecCfg(), "encryption"); err != nil {
 				return err
 			}
-			encryptionParams.RawPassphrae = pw
+			encryptionParams.RawPassphrase = pw
 		case jobspb.EncryptionMode_KMS:
 			encryptionParams.RawKmsUris = kms
 			if err := requireEnterprise(p.ExecCfg(), "encryption"); err != nil {
@@ -753,10 +757,14 @@ func backupPlanHook(
 			if !p.ExecCfg().Codec.ForSystemTenant() {
 				return pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can backup other tenants")
 			}
-			initialDetails.SpecificTenantIds = []roachpb.TenantID{roachpb.MakeTenantID(backupStmt.Targets.TenantID.ID)}
+			initialDetails.SpecificTenantIds = []roachpb.TenantID{roachpb.MustMakeTenantID(backupStmt.Targets.TenantID.ID)}
 		}
 
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
+
+		if err := logAndSanitizeBackupDestinations(ctx, append(to, incrementalFrom...)...); err != nil {
+			return errors.Wrap(err, "logging backup destinations")
+		}
 
 		description, err := backupJobDescription(p,
 			backupStmt.Backup, to, incrementalFrom,
@@ -829,9 +837,31 @@ func backupPlanHook(
 	return fn, jobs.BulkJobExecutionResultHeader, nil, false, nil
 }
 
+func logAndSanitizeKmsURIs(ctx context.Context, kmsURIs ...string) error {
+	for _, dest := range kmsURIs {
+		clean, err := cloud.RedactKMSURI(dest)
+		if err != nil {
+			return err
+		}
+		log.Ops.Infof(ctx, "backup planning to connect to KMS destination %v", redact.Safe(clean))
+	}
+	return nil
+}
+
+func logAndSanitizeBackupDestinations(ctx context.Context, backupDestinations ...string) error {
+	for _, dest := range backupDestinations {
+		clean, err := cloud.SanitizeExternalStorageURI(dest, nil)
+		if err != nil {
+			return err
+		}
+		log.Ops.Infof(ctx, "backup planning to connect to destination %v", redact.Safe(clean))
+	}
+	return nil
+}
+
 func collectTelemetry(
 	ctx context.Context,
-	backupManifest backuppb.BackupManifest,
+	backupManifest *backuppb.BackupManifest,
 	initialDetails, backupDetails jobspb.BackupDetails,
 	licensed bool,
 	jobID jobspb.JobID,
@@ -1126,7 +1156,7 @@ func getReintroducedSpans(
 	return tableSpans, nil
 }
 
-func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest) *ptpb.Target {
+func getProtectedTimestampTargetForBackup(backupManifest *backuppb.BackupManifest) *ptpb.Target {
 	if backupManifest.DescriptorCoverage == tree.AllDescriptors {
 		return ptpb.MakeClusterTarget()
 	}
@@ -1134,7 +1164,7 @@ func getProtectedTimestampTargetForBackup(backupManifest backuppb.BackupManifest
 	if len(backupManifest.Tenants) > 0 {
 		tenantID := make([]roachpb.TenantID, 0)
 		for _, tenant := range backupManifest.Tenants {
-			tenantID = append(tenantID, roachpb.MakeTenantID(tenant.ID))
+			tenantID = append(tenantID, roachpb.MustMakeTenantID(tenant.ID))
 		}
 		return ptpb.MakeTenantsTarget(tenantID)
 	}
@@ -1165,7 +1195,7 @@ func protectTimestampForBackup(
 	execCfg *sql.ExecutorConfig,
 	txn *kv.Txn,
 	jobID jobspb.JobID,
-	backupManifest backuppb.BackupManifest,
+	backupManifest *backuppb.BackupManifest,
 	backupDetails jobspb.BackupDetails,
 ) error {
 	tsToProtect := backupManifest.EndTime
@@ -1297,7 +1327,7 @@ func getTenantInfo(
 		)
 	}
 	for i := range tenants {
-		prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenants[i].ID))
+		prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenants[i].ID))
 		spans = append(spans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
 	}
 	return spans, tenants, nil

@@ -775,6 +775,17 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 	}
 }
 
+// ShowTenant represents a SHOW TENANT statement.
+type ShowTenant struct {
+	Name Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowTenant) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW TENANT ")
+	ctx.FormatNode(&node.Name)
+}
+
 // ShowHistogram represents a SHOW HISTOGRAM statement.
 type ShowHistogram struct {
 	HistogramID int64
@@ -1018,3 +1029,23 @@ func (node *ShowCreateExternalConnections) Format(ctx *FmtCtx) {
 }
 
 var _ Statement = &ShowCreateExternalConnections{}
+
+// ShowCommitTimestamp represents a SHOW COMMIT TIMESTAMP statement.
+//
+// If the current session is in an open transaction state, this statement will
+// implicitly commit the underlying kv transaction and return the HLC timestamp
+// at which it committed. The transaction state machine will be left in a state
+// such that only COMMIT or RELEASE cockroach_savepoint; COMMIT are acceptable.
+// The statement may also be sent after RELEASE cockroach_savepoint; and before
+// COMMIT.
+//
+// If the current session is not in an open transaction state, this statement
+// will return the commit timestamp of the previous transaction, assuming there
+// was one.
+type ShowCommitTimestamp struct{}
+
+func (s ShowCommitTimestamp) Format(ctx *FmtCtx) {
+	ctx.Printf("SHOW COMMIT TIMESTAMP")
+}
+
+var _ Statement = (*ShowCommitTimestamp)(nil)

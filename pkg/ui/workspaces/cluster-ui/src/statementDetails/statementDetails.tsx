@@ -30,6 +30,7 @@ import { AlignedData, Options } from "uplot";
 import {
   appAttr,
   appNamesAttr,
+  FixFingerprintHexValue,
   DATE_FORMAT_24_UTC,
   intersperse,
   queryByName,
@@ -72,7 +73,6 @@ import {
 import { Delayed } from "../delayed";
 import moment from "moment";
 import {
-  CancelStmtDiagnosticRequest,
   InsertStmtDiagnosticRequest,
   StatementDiagnosticsReport,
 } from "../api";
@@ -514,6 +514,7 @@ export class StatementDetails extends React.Component<
     const {
       app_names,
       databases,
+      fingerprint_id,
       failed_count,
       full_scan_count,
       vec_count,
@@ -562,7 +563,12 @@ export class StatementDetails extends React.Component<
       generateExecuteAndPlanningTimeseries(statsPerAggregatedTs);
     const executionAndPlanningOps: Partial<Options> = {
       axes: [{}, { label: "Time Spent" }],
-      series: [{}, { label: "Execution" }, { label: "Planning" }],
+      series: [
+        {},
+        { label: "Execution" },
+        { label: "Planning" },
+        { label: "Idle" },
+      ],
       width: cardWidth,
     };
 
@@ -650,6 +656,10 @@ export class StatementDetails extends React.Component<
                     app_names.map(a => <AppLink app={a} key={a} />),
                     ", ",
                   )}
+                />
+                <SummaryCardItem
+                  label="Fingerprint ID"
+                  value={FixFingerprintHexValue(fingerprint_id)}
                 />
               </SummaryCard>
             </Col>

@@ -19,13 +19,12 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl" // Ensure we can start tenant.
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingtest"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamproducer" // Ensure we can start replication stream.
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
@@ -77,7 +76,8 @@ func TestPartitionedStreamReplicationClient(t *testing.T) {
 
 	defer cleanup()
 
-	tenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID())
+	testTenantName := roachpb.TenantName("test-tenant")
+	tenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
 	defer cleanupTenant()
 
 	ctx := context.Background()
@@ -98,20 +98,20 @@ INSERT INTO d.t2 VALUES (2);
 		require.NoError(t, client.Close(ctx))
 	}()
 	require.NoError(t, err)
-	expectStreamState := func(streamID streaming.StreamID, status jobs.Status) {
+	expectStreamState := func(streamID streampb.StreamID, status jobs.Status) {
 		h.SysSQL.CheckQueryResultsRetry(t, fmt.Sprintf("SELECT status FROM system.jobs WHERE id = %d", streamID),
 			[][]string{{string(status)}})
 	}
 
-	streamID, err := client.Create(ctx, tenant.ID)
+	streamID, err := client.Create(ctx, testTenantName)
 	require.NoError(t, err)
 	// We can create multiple replication streams for the same tenant.
-	_, err = client.Create(ctx, tenant.ID)
+	_, err = client.Create(ctx, testTenantName)
 	require.NoError(t, err)
 
 	top, err := client.Plan(ctx, streamID)
 	require.NoError(t, err)
-	require.Equal(t, 1, len(top))
+	require.Equal(t, 1, len(top.Partitions))
 	// Plan for a non-existent stream
 	_, err = client.Plan(ctx, 999)
 	require.True(t, testutils.IsError(err, fmt.Sprintf("job with ID %d does not exist", 999)), err)
@@ -165,8 +165,8 @@ INSERT INTO d.t2 VALUES (2);
 	}
 
 	// Ignore table t2 and only subscribe to the changes to table t1.
-	require.Equal(t, len(top), 1)
-	url, err := streamingccl.StreamAddress(top[0].SrcAddr).URL()
+	require.Equal(t, len(top.Partitions), 1)
+	url, err := streamingccl.StreamAddress(top.Partitions[0].SrcAddr).URL()
 	require.NoError(t, err)
 	// Create a new stream client with the given partition address.
 	subClient, err := newPartitionedStreamClient(ctx, url)
@@ -212,14 +212,14 @@ INSERT INTO d.t2 VALUES (2);
 	})
 
 	// Testing client.Complete()
-	err = client.Complete(ctx, streaming.StreamID(999), true)
+	err = client.Complete(ctx, streampb.StreamID(999), true)
 	require.True(t, testutils.IsError(err, fmt.Sprintf("job %d: not found in system.jobs table", 999)), err)
 
 	// Makes producer job exit quickly.
 	h.SysSQL.Exec(t, `
 SET CLUSTER SETTING stream_replication.stream_liveness_track_frequency = '200ms';
 `)
-	streamID, err = client.Create(ctx, tenant.ID)
+	streamID, err = client.Create(ctx, testTenantName)
 	require.NoError(t, err)
 	require.NoError(t, client.Complete(ctx, streamID, true))
 	h.SysSQL.CheckQueryResultsRetry(t,

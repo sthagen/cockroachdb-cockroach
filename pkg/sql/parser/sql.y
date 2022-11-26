@@ -1139,6 +1139,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> drop_view_stmt
 %type <tree.Statement> drop_sequence_stmt
 %type <tree.Statement> drop_func_stmt
+%type <tree.Statement> drop_tenant_stmt
 
 %type <tree.Statement> analyze_stmt
 %type <tree.Statement> explain_stmt
@@ -1184,6 +1185,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> show_stmt
 %type <tree.Statement> show_backup_stmt
 %type <tree.Statement> show_columns_stmt
+%type <tree.Statement> show_commit_timestamp_stmt
 %type <tree.Statement> show_constraints_stmt
 %type <tree.Statement> show_create_stmt
 %type <tree.Statement> show_create_schedules_stmt
@@ -1215,6 +1217,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> show_syntax_stmt
 %type <tree.Statement> show_last_query_stats_stmt
 %type <tree.Statement> show_tables_stmt
+%type <tree.Statement> show_tenant_stmt
 %type <tree.Statement> show_trace_stmt
 %type <tree.Statement> show_transaction_stmt
 %type <tree.Statement> show_transactions_stmt
@@ -1676,29 +1679,30 @@ stmt:
   }
 
 stmt_without_legacy_transaction:
-  preparable_stmt           // help texts in sub-rule
-| analyze_stmt              // EXTEND WITH HELP: ANALYZE
+  preparable_stmt            // help texts in sub-rule
+| analyze_stmt               // EXTEND WITH HELP: ANALYZE
 | copy_from_stmt
 | comment_stmt
-| execute_stmt              // EXTEND WITH HELP: EXECUTE
-| deallocate_stmt           // EXTEND WITH HELP: DEALLOCATE
-| discard_stmt              // EXTEND WITH HELP: DISCARD
-| grant_stmt                // EXTEND WITH HELP: GRANT
-| prepare_stmt              // EXTEND WITH HELP: PREPARE
-| revoke_stmt               // EXTEND WITH HELP: REVOKE
-| savepoint_stmt            // EXTEND WITH HELP: SAVEPOINT
-| reassign_owned_by_stmt    // EXTEND WITH HELP: REASSIGN OWNED BY
-| drop_owned_by_stmt        // EXTEND WITH HELP: DROP OWNED BY
-| release_stmt              // EXTEND WITH HELP: RELEASE
-| refresh_stmt              // EXTEND WITH HELP: REFRESH
-| nonpreparable_set_stmt    // help texts in sub-rule
-| transaction_stmt          // help texts in sub-rule
-| close_cursor_stmt         // EXTEND WITH HELP: CLOSE
-| declare_cursor_stmt       // EXTEND WITH HELP: DECLARE
-| fetch_cursor_stmt         // EXTEND WITH HELP: FETCH
-| move_cursor_stmt          // EXTEND WITH HELP: MOVE
+| execute_stmt               // EXTEND WITH HELP: EXECUTE
+| deallocate_stmt            // EXTEND WITH HELP: DEALLOCATE
+| discard_stmt               // EXTEND WITH HELP: DISCARD
+| grant_stmt                 // EXTEND WITH HELP: GRANT
+| prepare_stmt               // EXTEND WITH HELP: PREPARE
+| revoke_stmt                // EXTEND WITH HELP: REVOKE
+| savepoint_stmt             // EXTEND WITH HELP: SAVEPOINT
+| reassign_owned_by_stmt     // EXTEND WITH HELP: REASSIGN OWNED BY
+| drop_owned_by_stmt         // EXTEND WITH HELP: DROP OWNED BY
+| release_stmt               // EXTEND WITH HELP: RELEASE
+| refresh_stmt               // EXTEND WITH HELP: REFRESH
+| nonpreparable_set_stmt     // help texts in sub-rule
+| transaction_stmt           // help texts in sub-rule
+| close_cursor_stmt          // EXTEND WITH HELP: CLOSE
+| declare_cursor_stmt        // EXTEND WITH HELP: DECLARE
+| fetch_cursor_stmt          // EXTEND WITH HELP: FETCH
+| move_cursor_stmt           // EXTEND WITH HELP: MOVE
 | reindex_stmt
 | unlisten_stmt
+| show_commit_timestamp_stmt // EXTEND WITH HELP: SHOW COMMIT TIMESTAMP
 
 // %Help: ALTER
 // %Category: Group
@@ -3554,14 +3558,6 @@ restore_stmt:
       Options: *($9.restoreOptions()),
     }
   }
-| RESTORE backup_targets FROM REPLICATION STREAM FROM string_or_placeholder_opt_list opt_as_tenant_clause
-  {
-   $$.val = &tree.StreamIngestion{
-     Targets: $2.backupTargetList(),
-     From: $7.stringOrPlaceholderOptList(),
-     AsTenant: $8.asTenantClause(),
-   }
-  }
 | RESTORE error // SHOW HELP: RESTORE
 
 string_or_placeholder_opt_list:
@@ -4161,6 +4157,14 @@ create_tenant_stmt:
   CREATE TENANT name
   {
     $$.val = &tree.CreateTenant{Name: tree.Name($3)}
+  }
+| CREATE TENANT name FROM REPLICATION OF name ON string_or_placeholder
+  {
+    $$.val = &tree.CreateTenantFromReplication{
+      Name: tree.Name($3),
+      ReplicationSourceTenantName: tree.Name($7),
+      ReplicationSourceAddress: $9.expr(),
+    }
   }
 | CREATE TENANT error // SHOW HELP: CREATE TENANT
 
@@ -4909,6 +4913,7 @@ drop_stmt:
 | drop_role_stmt     // EXTEND WITH HELP: DROP ROLE
 | drop_schedule_stmt // EXTEND WITH HELP: DROP SCHEDULES
 | drop_external_connection_stmt // EXTEND WITH HELP: DROP EXTERNAL CONNECTION
+| drop_tenant_stmt              // EXTEND WITH HELP: DROP TENANT
 | drop_unsupported   {}
 | DROP error         // SHOW HELP: DROP
 
@@ -5054,6 +5059,26 @@ drop_type_stmt:
     }
   }
 | DROP TYPE error // SHOW HELP: DROP TYPE
+
+// %Help: DROP TENANT - remove a tenant
+// %Category: DDL
+// %Text: DROP TENANT [IF EXISTS] <name>
+drop_tenant_stmt:
+  DROP TENANT name
+  {
+    $$.val = &tree.DropTenant{
+      Name: tree.Name($3),
+      IfExists: false,
+    }
+  }
+| DROP TENANT IF EXISTS name
+  {
+    $$.val = &tree.DropTenant{
+      Name: tree.Name($5),
+      IfExists: true,
+    }
+  }
+| DROP TENANT error // SHOW HELP: DROP TENANT
 
 target_types:
   type_name_list
@@ -5392,6 +5417,16 @@ backup_kms:
       OldKMSURI:	$7.stringOrPlaceholderOptList(),
     }
 	}
+
+// %Help: SHOW TENANT - display tenant information
+// %Category: Misc
+// %Text: SHOW TENANT
+show_tenant_stmt:
+  SHOW TENANT name
+  {
+   $$.val = &tree.ShowTenant{Name: tree.Name($3)}
+  }
+| SHOW TENANT error // SHOW HELP: SHOW TENANT
 
 // %Help: PREPARE - prepare a statement for later execution
 // %Category: Misc
@@ -6264,8 +6299,8 @@ zone_value:
 // SHOW ROLES, SHOW SCHEMAS, SHOW SEQUENCES, SHOW SESSION, SHOW SESSIONS,
 // SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES, SHOW TRACE, SHOW TRANSACTION,
 // SHOW TRANSACTIONS, SHOW TRANSFER, SHOW TYPES, SHOW USERS, SHOW LAST QUERY STATISTICS,
-// SHOW SCHEDULES, SHOW LOCALITY, SHOW ZONE CONFIGURATION, SHOW FULL TABLE SCANS,
-// SHOW CREATE EXTERNAL CONNECTIONS
+// SHOW SCHEDULES, SHOW LOCALITY, SHOW ZONE CONFIGURATION, SHOW COMMIT TIMESTAMP,
+// SHOW FULL TABLE SCANS, SHOW CREATE EXTERNAL CONNECTIONS, SHOW TENANT
 show_stmt:
   show_backup_stmt           // EXTEND WITH HELP: SHOW BACKUP
 | show_columns_stmt          // EXTEND WITH HELP: SHOW COLUMNS
@@ -6300,6 +6335,7 @@ show_stmt:
 | show_stats_stmt            // EXTEND WITH HELP: SHOW STATISTICS
 | show_syntax_stmt           // EXTEND WITH HELP: SHOW SYNTAX
 | show_tables_stmt           // EXTEND WITH HELP: SHOW TABLES
+| show_tenant_stmt           // EXTEND WITH HELP: SHOW TENANT
 | show_trace_stmt            // EXTEND WITH HELP: SHOW TRACE
 | show_transaction_stmt      // EXTEND WITH HELP: SHOW TRANSACTION
 | show_transactions_stmt     // EXTEND WITH HELP: SHOW TRANSACTIONS
@@ -6964,6 +7000,22 @@ show_indexes_stmt:
     $$.val = &tree.ShowDatabaseIndexes{Database: tree.Name($5), WithComment: $6.bool()}
   }
 | SHOW KEYS error // SHOW HELP: SHOW INDEXES
+
+// %Help: SHOW COMMIT TIMESTAMP - show timestamp commit timestamp of last transaction
+// %Category: Misc
+// %Text: SHOW COMMIT TIMESTAMP
+//
+// Shows the commit timestamp of the last committed transaction if not currently
+// in a transaction. If currently in a transaction, implicitly commits the
+// transaction, returning any errors which may have occurred during the commit.
+// The transaction state will remain open from the perspective of the client,
+// meaning that a COMMIT must be issued to move the connection back to a state
+// where new statements may be issued.
+show_commit_timestamp_stmt:
+  SHOW COMMIT TIMESTAMP
+  {
+    $$.val = &tree.ShowCommitTimestamp{}
+  }
 
 // %Help: SHOW CONSTRAINTS - list constraints
 // %Category: DDL

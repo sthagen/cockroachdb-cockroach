@@ -11,15 +11,18 @@
 package tabledesc
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/errors"
 )
 
 var _ catalog.TableElementMaybeMutation = maybeMutation{}
-var _ catalog.TableElementMaybeMutation = constraintToUpdate{}
+var _ catalog.TableElementMaybeMutation = constraint{}
 var _ catalog.TableElementMaybeMutation = primaryKeySwap{}
 var _ catalog.TableElementMaybeMutation = computedColumnSwap{}
 var _ catalog.TableElementMaybeMutation = materializedViewRefresh{}
@@ -85,78 +88,91 @@ func (mm maybeMutation) Dropped() bool {
 	return mm.mutationDirection == descpb.DescriptorMutation_DROP
 }
 
-// constraintToUpdate implements the catalog.ConstraintToUpdate interface.
-// It also
-type constraintToUpdate struct {
+// constraint implements the catalog.Constraint interface by wrapping
+// the protobuf descriptor (*descpb.ConstraintToUpdate) along with
+// some metadata if this constraint is a mutation.
+// N.B. This struct is intended for non-index-backed-constraints.
+type constraint struct {
 	maybeMutation
 	desc *descpb.ConstraintToUpdate
 }
 
-// ConstraintToUpdateDesc returns the underlying protobuf descriptor.
-func (c constraintToUpdate) ConstraintToUpdateDesc() *descpb.ConstraintToUpdate {
-	return c.desc
-}
-
-// GetName returns the name of this constraint update mutation.
-func (c constraintToUpdate) GetName() string {
+// GetName implements the catalog.Constraint interface.
+func (c constraint) GetName() string {
 	return c.desc.Name
 }
 
-// IsCheck returns true iff this is an update for a check constraint.
-func (c constraintToUpdate) IsCheck() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_CHECK
-}
-
-// Check returns the underlying check constraint, if there is one.
-func (c constraintToUpdate) Check() descpb.TableDescriptor_CheckConstraint {
-	return c.desc.Check
-}
-
-// IsForeignKey returns true iff this is an update for a fk constraint.
-func (c constraintToUpdate) IsForeignKey() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_FOREIGN_KEY
-}
-
-// ForeignKey returns the underlying fk constraint, if there is one.
-func (c constraintToUpdate) ForeignKey() descpb.ForeignKeyConstraint {
-	return c.desc.ForeignKey
-}
-
-// IsNotNull returns true iff this is an update for a not-null constraint.
-func (c constraintToUpdate) IsNotNull() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_NOT_NULL
-}
-
-// NotNullColumnID returns the underlying not-null column ID, if there is one.
-func (c constraintToUpdate) NotNullColumnID() descpb.ColumnID {
+// NotNullColumnID implements the catalog.Constraint interface.
+func (c constraint) NotNullColumnID() descpb.ColumnID {
 	return c.desc.NotNullColumn
 }
 
-// IsUniqueWithoutIndex returns true iff this is an update for a unique without
-// index constraint.
-func (c constraintToUpdate) IsUniqueWithoutIndex() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX
-}
-
-// UniqueWithoutIndex returns the underlying unique without index constraint, if
-// there is one.
-func (c constraintToUpdate) UniqueWithoutIndex() descpb.UniqueWithoutIndexConstraint {
-	return c.desc.UniqueWithoutIndexConstraint
-}
-
-// GetConstraintID returns the ID for the constraint.
-func (c constraintToUpdate) GetConstraintID() descpb.ConstraintID {
+// AsCheck implements the catalog.Constraint interface.
+func (c constraint) AsCheck() *descpb.TableDescriptor_CheckConstraint {
 	switch c.desc.ConstraintType {
-	case descpb.ConstraintToUpdate_CHECK:
+	case descpb.ConstraintToUpdate_CHECK, descpb.ConstraintToUpdate_NOT_NULL:
+		return &c.desc.Check
+	}
+	return nil
+}
+
+// AsForeignKey implements the catalog.Constraint interface.
+func (c constraint) AsForeignKey() *descpb.ForeignKeyConstraint {
+	switch c.desc.ConstraintType {
+	case descpb.ConstraintToUpdate_FOREIGN_KEY:
+		return &c.desc.ForeignKey
+	}
+	return nil
+}
+
+// AsUniqueWithoutIndex implements the catalog.Constraint interface.
+func (c constraint) AsUniqueWithoutIndex() *descpb.UniqueWithoutIndexConstraint {
+	switch c.desc.ConstraintType {
+	case descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX:
+		return &c.desc.UniqueWithoutIndexConstraint
+	}
+	return nil
+}
+
+// AsPrimaryKey implements the catalog.Constraint interface.
+func (c constraint) AsPrimaryKey() catalog.Index {
+	return nil
+}
+
+// AsUnique implements the catalog.Constraint interface.
+func (c constraint) AsUnique() catalog.Index {
+	return nil
+}
+
+// String implements the catalog.Constraint interface.
+func (c constraint) String() string {
+	return fmt.Sprintf("%v", c.desc)
+}
+
+// GetConstraintID implements the catalog.Constraint interface.
+func (c constraint) GetConstraintID() descpb.ConstraintID {
+	switch c.desc.ConstraintType {
+	case descpb.ConstraintToUpdate_CHECK, descpb.ConstraintToUpdate_NOT_NULL:
 		return c.desc.Check.ConstraintID
 	case descpb.ConstraintToUpdate_FOREIGN_KEY:
-		return c.ForeignKey().ConstraintID
-	case descpb.ConstraintToUpdate_NOT_NULL:
-		return 0
+		return c.desc.ForeignKey.ConstraintID
 	case descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX:
-		return c.UniqueWithoutIndex().ConstraintID
+		return c.desc.UniqueWithoutIndexConstraint.ConstraintID
 	}
-	panic("unknown constraint type")
+	panic(errors.AssertionFailedf("unknown constraint type %v", c.desc.ConstraintType))
+}
+
+// GetConstraintValidity implements the catalog.Constraint interface.
+func (c constraint) GetConstraintValidity() descpb.ConstraintValidity {
+	switch c.desc.ConstraintType {
+	case descpb.ConstraintToUpdate_CHECK, descpb.ConstraintToUpdate_NOT_NULL:
+		return c.desc.Check.Validity
+	case descpb.ConstraintToUpdate_FOREIGN_KEY:
+		return c.desc.ForeignKey.Validity
+	case descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX:
+		return c.desc.UniqueWithoutIndexConstraint.Validity
+	}
+	panic(errors.AssertionFailedf("unknown constraint type %v", c.desc.ConstraintType))
 }
 
 // modifyRowLevelTTL implements the catalog.ModifyRowLevelTTL interface.
@@ -295,7 +311,7 @@ type mutation struct {
 	maybeMutation
 	column            catalog.Column
 	index             catalog.Index
-	constraint        catalog.ConstraintToUpdate
+	constraint        catalog.Constraint
 	pkSwap            catalog.PrimaryKeySwap
 	ccSwap            catalog.ComputedColumnSwap
 	mvRefresh         catalog.MaterializedViewRefresh
@@ -315,9 +331,9 @@ func (m mutation) AsIndex() catalog.Index {
 	return m.index
 }
 
-// AsConstraint returns the corresponding ConstraintToUpdate if the
+// AsConstraint returns the corresponding Constraint if the
 // mutation is on a constraint, nil otherwise.
-func (m mutation) AsConstraint() catalog.ConstraintToUpdate {
+func (m mutation) AsConstraint() catalog.Constraint {
 	return m.constraint
 }
 
@@ -370,7 +386,7 @@ func newMutationCache(desc *descpb.TableDescriptor) *mutationCache {
 	backingStructs := make([]mutation, len(desc.Mutations))
 	var columns []column
 	var indexes []index
-	var constraints []constraintToUpdate
+	var constraints []constraint
 	var pkSwaps []primaryKeySwap
 	var ccSwaps []computedColumnSwap
 	var mvRefreshes []materializedViewRefresh
@@ -401,7 +417,7 @@ func newMutationCache(desc *descpb.TableDescriptor) *mutationCache {
 			})
 			backingStructs[i].index = &indexes[len(indexes)-1]
 		} else if pb := m.GetConstraint(); pb != nil {
-			constraints = append(constraints, constraintToUpdate{
+			constraints = append(constraints, constraint{
 				maybeMutation: mm,
 				desc:          pb,
 			})

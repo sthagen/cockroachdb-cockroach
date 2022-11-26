@@ -15,13 +15,13 @@ import (
 	"math"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -420,6 +420,14 @@ func NewTestingEvalContext(st *cluster.Settings) *Context {
 }
 
 // Stop closes out the EvalContext and must be called once it is no longer in use.
+//
+// Note: Stop is intended to gracefully handle panics. For this to work
+// properly, use `defer evalctx.Stop()`, i.e. have `Stop` be called by `defer` directly.
+//
+// If `Stop()` is called via an intermediate function (e.g. `defer
+// func() { ... evalCtx.Stop() ... }`) the panic will not be handled
+// gracefully and some memory monitors may complain that they are being shut down
+// with some allocated bytes remaining.
 func (ec *Context) Stop(c context.Context) {
 	if r := recover(); r != nil {
 		ec.TestingMon.EmergencyStop(c)
@@ -701,11 +709,9 @@ type StreamManagerFactory interface {
 // ReplicationStreamManager represents a collection of APIs that streaming replication supports
 // on the production side.
 type ReplicationStreamManager interface {
-	// StartReplicationStream starts a stream replication job for the specified tenant on the producer side.
-	StartReplicationStream(
-		ctx context.Context,
-		tenantID uint64,
-	) (streampb.StreamID, error)
+	// StartReplicationStream starts a stream replication job for the specified
+	// tenant on the producer side.
+	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName) (streampb.StreamID, error)
 
 	// HeartbeatReplicationStream sends a heartbeat to the replication stream producer, indicating
 	// consumer has consumed until the given 'frontier' timestamp. This updates the producer job

@@ -36,6 +36,109 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type clusterInfo struct {
+	// name is the name of the tenant
+	name string
+
+	// ID is the id of the tenant
+	ID int
+
+	// pgurl is a connection string to the host cluster
+	pgURL string
+
+	// tenant provides a handler to the tenant
+	tenant *tenantNode
+
+	// db provides a connection to the host cluster
+	db *gosql.DB
+
+	// sql provides a sql connection to the host cluster
+	sql *sqlutils.SQLRunner
+
+	// sqlNode indicates the roachprod node running a single sql server
+	sqlNode int
+
+	// kvNodes indicates the roachprod nodes running the cluster's kv nodes
+	kvNodes option.NodeListOption
+}
+
+type c2cSetup struct {
+	src clusterInfo
+	dst clusterInfo
+}
+
+func setupC2C(ctx context.Context, t test.Test, c cluster.Cluster) (*c2cSetup, func()) {
+	c.Put(ctx, t.Cockroach(), "./cockroach")
+	srcCluster := c.Range(1, 3)
+	dstCluster := c.Range(4, 6)
+	srcTenantNode := 7
+	c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(srcTenantNode))
+
+	srcStartOps := option.DefaultStartOpts()
+	srcStartOps.RoachprodOpts.InitTarget = 1
+	srcClusterSetting := install.MakeClusterSettings(install.SecureOption(true))
+	c.Start(ctx, t.L(), srcStartOps, srcClusterSetting, srcCluster)
+
+	dstStartOps := option.DefaultStartOpts()
+	dstStartOps.RoachprodOpts.InitTarget = 4
+	dstClusterSetting := install.MakeClusterSettings(install.SecureOption(true))
+	c.Start(ctx, t.L(), dstStartOps, dstClusterSetting, dstCluster)
+
+	srcNode := srcCluster.RandNode()
+	destNode := dstCluster.RandNode()
+
+	addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode)
+	require.NoError(t, err)
+
+	srcDB := c.Conn(ctx, t.L(), srcNode[0])
+	srcSQL := sqlutils.MakeSQLRunner(srcDB)
+	destDB := c.Conn(ctx, t.L(), destNode[0])
+	destSQL := sqlutils.MakeSQLRunner(destDB)
+
+	srcClusterSettings(t, srcSQL)
+	destClusterSettings(t, destSQL)
+
+	srcTenantID, destTenantID := 2, 2
+	srcTenantName := "src-tenant"
+	destTenantName := "destination-tenant"
+	srcSQL.Exec(t, fmt.Sprintf(`CREATE TENANT %q`, srcTenantName))
+
+	pgURL, pgCleanup, err := copyPGCertsAndMakeURL(ctx, t, c, srcNode, dstCluster,
+		srcClusterSetting.PGUrlCertsDir, addr[0])
+	require.NoError(t, err)
+
+	const (
+		tenantHTTPPort = 8081
+		tenantSQLPort  = 30258
+	)
+	t.Status("creating tenant node")
+	srcTenant := createTenantNode(ctx, t, c, srcCluster, srcTenantID, srcTenantNode, tenantHTTPPort, tenantSQLPort)
+	srcTenant.start(ctx, t, c, "./cockroach")
+	cleanup := func() {
+		srcTenant.stop(ctx, t, c)
+		pgCleanup()
+	}
+	srcTenantInfo := clusterInfo{
+		name:    srcTenantName,
+		ID:      srcTenantID,
+		pgURL:   pgURL,
+		tenant:  srcTenant,
+		sql:     srcSQL,
+		db:      srcDB,
+		sqlNode: srcTenantNode,
+		kvNodes: srcCluster}
+	destTenantInfo := clusterInfo{
+		name:    destTenantName,
+		ID:      destTenantID,
+		sql:     destSQL,
+		db:      destDB,
+		kvNodes: dstCluster}
+
+	return &c2cSetup{
+		src: srcTenantInfo,
+		dst: destTenantInfo}, cleanup
+}
+
 func registerClusterToCluster(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:            "c2c/kv0",
@@ -43,50 +146,8 @@ func registerClusterToCluster(r registry.Registry) {
 		Cluster:         r.MakeClusterSpec(7),
 		RequiresLicense: true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			srcCluster := c.Range(1, 3)
-			dstCluster := c.Range(4, 6)
-			srcTenantNode := 7
-			c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(srcTenantNode))
-
-			srcStartOps := option.DefaultStartOpts()
-			srcStartOps.RoachprodOpts.InitTarget = 1
-			srcClusterSetting := install.MakeClusterSettings(install.SecureOption(true))
-			c.Start(ctx, t.L(), srcStartOps, srcClusterSetting, srcCluster)
-
-			dstStartOps := option.DefaultStartOpts()
-			dstStartOps.RoachprodOpts.InitTarget = 4
-			dstClusterSetting := install.MakeClusterSettings(install.SecureOption(true))
-			c.Start(ctx, t.L(), dstStartOps, dstClusterSetting, dstCluster)
-
-			srcNode := srcCluster.RandNode()
-			destNode := dstCluster.RandNode()
-
-			addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode)
-			require.NoError(t, err)
-
-			srcSQL := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), srcNode[0]))
-			destDB := c.Conn(ctx, t.L(), destNode[0])
-			destSQL := sqlutils.MakeSQLRunner(destDB)
-
-			srcClusterSettings(t, srcSQL)
-			destClusterSettings(t, destSQL)
-
-			srcTenantID, destTenantID := 10, 20
-			srcSQL.Exec(t, `SELECT crdb_internal.create_tenant($1::int)`, srcTenantID)
-			pgURL, cleanup, err := copyPGCertsAndMakeURL(ctx, t, c, srcNode, dstCluster, srcClusterSetting.PGUrlCertsDir, addr[0])
+			setup, cleanup := setupC2C(ctx, t, c)
 			defer cleanup()
-			require.NoError(t, err)
-
-			const (
-				tenantHTTPPort = 8081
-				tenantSQLPort  = 30258
-			)
-			t.Status("creating tenant node")
-			srcTenant := createTenantNode(ctx, t, c, srcCluster, srcTenantID, srcTenantNode, tenantHTTPPort, tenantSQLPort)
-			srcTenant.start(ctx, t, c, "./cockroach")
-			defer srcTenant.stop(ctx, t, c)
-
 			var (
 				kvWorkloadDuration = "15m"
 				kvWorkloadReadPerc = 0
@@ -98,15 +159,16 @@ func registerClusterToCluster(r registry.Registry) {
 				cmd := fmt.Sprintf("./workload run kv --tolerate-errors --init --duration %s --read-percent %d '%s'",
 					kvWorkloadDuration,
 					kvWorkloadReadPerc,
-					srcTenant.secureURL())
-				c.Run(ctx, c.Node(srcTenantNode), cmd)
+					setup.src.tenant.secureURL())
+				c.Run(ctx, c.Node(setup.src.sqlNode), cmd)
 				return nil
 			})
 
 			t.Status("starting replication stream")
-			streamReplStmt := fmt.Sprintf("RESTORE TENANT %d FROM REPLICATION STREAM FROM '%s' AS TENANT %d", srcTenantID, pgURL, destTenantID)
+			streamReplStmt := fmt.Sprintf("CREATE TENANT %q FROM REPLICATION OF %q ON '%s'",
+				setup.dst.name, setup.src.name, setup.src.pgURL)
 			var ingestionJobID, streamProducerJobID int
-			destSQL.QueryRow(t, streamReplStmt).Scan(&ingestionJobID, &streamProducerJobID)
+			setup.dst.sql.QueryRow(t, streamReplStmt).Scan(&ingestionJobID, &streamProducerJobID)
 
 			// TODO(ssd): The job doesn't record the initial
 			// statement time, so we can't correctly measure the
@@ -115,16 +177,22 @@ func registerClusterToCluster(r registry.Registry) {
 			defer lv.maybeLogLatencyHist()
 
 			m.Go(func(ctx context.Context) error {
-				return lv.pollLatency(ctx, destDB, ingestionJobID, time.Second, workloadDoneCh)
+				return lv.pollLatency(ctx, setup.dst.db, ingestionJobID, time.Second, workloadDoneCh)
 			})
 
 			t.Status("waiting for replication stream to return high watermark")
-			waitForHighWatermark(t, destDB, ingestionJobID)
+			waitForHighWatermark(t, setup.dst.db, ingestionJobID)
 			m.Wait()
 
 			t.Status("waiting for replication stream to cutover")
-			cutoverTime := stopReplicationStream(t, destSQL, ingestionJobID)
-			compareTenantFingerprintsAtTimestamp(t, srcSQL, destSQL, srcTenantID, destTenantID, hlc.Timestamp{WallTime: cutoverTime.UnixNano()})
+			cutoverTime := stopReplicationStream(t, setup.dst.sql, ingestionJobID)
+			compareTenantFingerprintsAtTimestamp(
+				t,
+				setup.src.sql,
+				setup.dst.sql,
+				setup.src.ID,
+				setup.dst.ID,
+				hlc.Timestamp{WallTime: cutoverTime.UnixNano()})
 			lv.assertValid(t)
 		},
 	})
@@ -155,11 +223,13 @@ type streamIngesitonJobInfo struct {
 	status        string
 	errMsg        string
 	highwaterTime time.Time
+	finishedTime  time.Time
 }
 
-func (c *streamIngesitonJobInfo) GetHighWater() time.Time { return c.highwaterTime }
-func (c *streamIngesitonJobInfo) GetStatus() string       { return c.status }
-func (c *streamIngesitonJobInfo) GetError() string        { return c.status }
+func (c *streamIngesitonJobInfo) GetHighWater() time.Time    { return c.highwaterTime }
+func (c *streamIngesitonJobInfo) GetFinishedTime() time.Time { return c.finishedTime }
+func (c *streamIngesitonJobInfo) GetStatus() string          { return c.status }
+func (c *streamIngesitonJobInfo) GetError() string           { return c.status }
 
 var _ jobInfo = (*streamIngesitonJobInfo)(nil)
 
@@ -189,6 +259,7 @@ func getStreamIngestionJobInfo(db *gosql.DB, jobID int) (jobInfo, error) {
 		status:        status,
 		errMsg:        payload.Error,
 		highwaterTime: highwaterTime,
+		finishedTime:  time.UnixMicro(payload.FinishedMicros),
 	}, nil
 }
 
@@ -213,7 +284,8 @@ func stopReplicationStream(t test.Test, destSQL *sqlutils.SQLRunner, ingestionJo
 	err := retry.ForDuration(time.Minute*5, func() error {
 		var status string
 		var payloadBytes []byte
-		destSQL.QueryRow(t, `SELECT status, payload FROM system.jobs WHERE id = $1`, ingestionJob).Scan(&status, &payloadBytes)
+		destSQL.QueryRow(t, `SELECT status, payload FROM system.jobs WHERE id = $1`,
+			ingestionJob).Scan(&status, &payloadBytes)
 		if jobs.Status(status) == jobs.StatusFailed {
 			payload := &jobspb.Payload{}
 			if err := protoutil.Unmarshal(payloadBytes, payload); err == nil {
@@ -268,13 +340,15 @@ func copyPGCertsAndMakeURL(
 
 	dir := "."
 	if c.IsLocal() {
-		dir = local.VMDir(c.Name(), destNode[0])
+		dir = filepath.Join(local.VMDir(c.Name(), destNode[0]), "src-cluster-certs")
+	} else {
+		dir = "./src-cluster-certs/certs"
 	}
 	options := pgURL.Query()
 	options.Set("sslmode", "verify-full")
-	options.Set("sslrootcert", filepath.Join(dir, "src-cluster-certs", "ca.crt"))
-	options.Set("sslcert", filepath.Join(dir, "src-cluster-certs", "client.root.crt"))
-	options.Set("sslkey", filepath.Join(dir, "src-cluster-certs", "client.root.key"))
+	options.Set("sslrootcert", filepath.Join(dir, "ca.crt"))
+	options.Set("sslcert", filepath.Join(dir, "client.root.crt"))
+	options.Set("sslkey", filepath.Join(dir, "client.root.key"))
 	pgURL.RawQuery = options.Encode()
 	return pgURL.String(), cleanup, err
 }

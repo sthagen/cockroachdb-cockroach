@@ -15,7 +15,6 @@ go_library(
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
-        "//pkg/sql",
         "//pkg/sql/pgwire",
         "//pkg/sql/pgwire/identmap",
         "//pkg/util/log",
@@ -39,7 +38,7 @@ go_test(
     embed = [":jwtauthccl"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/utilccl",
+        "//pkg/ccl",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",

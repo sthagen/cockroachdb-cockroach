@@ -14,8 +14,9 @@ import (
 	"context"
 	gojson "encoding/json"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -160,7 +161,7 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ArgTypes{
-				{"tenant_id", types.Int},
+				{"tenant_name", types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -168,11 +169,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 				if err != nil {
 					return nil, err
 				}
-				tenantID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				jobID, err := mgr.StartReplicationStream(ctx, uint64(tenantID))
+				tenantName := string(tree.MustBeDString(args[0]))
+				jobID, err := mgr.StartReplicationStream(ctx, roachpb.TenantName(tenantName))
 				if err != nil {
 					return nil, err
 				}

@@ -49,11 +49,11 @@ func tkey(tableID uint32, chunks ...string) []byte {
 }
 
 func tenantPrefix(tenID uint64) []byte {
-	return keys.MakeTenantPrefix(roachpb.MakeTenantID(tenID))
+	return keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenID))
 }
 
 func tenantTkey(tenID uint64, tableID uint32, chunks ...string) []byte {
-	key := keys.MakeSQLCodec(roachpb.MakeTenantID(tenID)).TablePrefix(tableID)
+	key := keys.MakeSQLCodec(roachpb.MustMakeTenantID(tenID)).TablePrefix(tableID)
 	for _, c := range chunks {
 		key = append(key, []byte(c)...)
 	}
@@ -80,7 +80,7 @@ func descriptor(descID uint32) roachpb.KeyValue {
 }
 
 func tenant(tenID uint64) roachpb.KeyValue {
-	k := keys.SystemSQLCodec.TenantMetadataKey(roachpb.MakeTenantID(tenID))
+	k := keys.SystemSQLCodec.TenantMetadataKey(roachpb.MustMakeTenantID(tenID))
 	return kv(k, nil)
 }
 
@@ -317,12 +317,6 @@ func TestComputeSplitKeySystemRanges(t *testing.T) {
 		{roachpb.RKey(keys.NodeLivenessPrefix), roachpb.RKey(keys.NodeLivenessKeyMax), nil},
 		{roachpb.RKey(keys.NodeLivenessPrefix), roachpb.RKeyMax, keys.NodeLivenessKeyMax},
 		{roachpb.RKey(keys.NodeLivenessKeyMax), roachpb.RKeyMax, keys.TimeseriesPrefix},
-		{roachpb.RKey(keys.StartupMigrationPrefix), roachpb.RKey(keys.NodeLivenessPrefix), nil},
-		{roachpb.RKey(keys.StartupMigrationPrefix), roachpb.RKey(keys.NodeLivenessKeyMax), nil},
-		{roachpb.RKey(keys.StartupMigrationPrefix), roachpb.RKey(keys.StoreIDGenerator), nil},
-		{roachpb.RKey(keys.StartupMigrationPrefix), roachpb.RKey(keys.TimeseriesPrefix), nil},
-		{roachpb.RKey(keys.StartupMigrationPrefix), roachpb.RKey(keys.TimeseriesPrefix.Next()), keys.TimeseriesPrefix},
-		{roachpb.RKey(keys.StartupMigrationPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix},
 		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKey(keys.TimeseriesPrefix.Next()), nil},
 		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), nil},
 		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix.PrefixEnd()},
@@ -559,7 +553,6 @@ func TestGetZoneConfigForKey(t *testing.T) {
 		{roachpb.RKey(keys.MetaMax), keys.SystemRangesID},
 		{roachpb.RKey(keys.SystemPrefix), keys.SystemRangesID},
 		{roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemRangesID},
-		{roachpb.RKey(keys.StartupMigrationLease), keys.SystemRangesID},
 		{roachpb.RKey(keys.NodeLivenessPrefix), keys.LivenessRangesID},
 		{roachpb.RKey(keys.LegacyDescIDGenerator), keys.SystemRangesID},
 		{roachpb.RKey(keys.NodeIDGenerator), keys.SystemRangesID},

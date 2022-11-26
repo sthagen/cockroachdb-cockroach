@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -203,6 +204,10 @@ func createPartitioningImpl(
 				"declared partition columns (%s) do not match first %d columns in index being partitioned (%s)",
 				partitioningString(), n, strings.Join(newIdxColumnNames[:n], ", "))
 		}
+		if col.GetType().Family() == types.ArrayFamily {
+			return partDesc, unimplemented.NewWithIssuef(91766, "partitioning by array column (%s) not supported",
+				col.GetName())
+		}
 	}
 
 	for _, l := range partBy.List {
@@ -346,8 +351,7 @@ func createPartitioning(
 	allowedNewColumnNames []tree.Name,
 	allowImplicitPartitioning bool,
 ) (newImplicitCols []catalog.Column, newPartitioning catpb.PartitioningDescriptor, err error) {
-	org := sql.ClusterOrganization.Get(&st.SV)
-	if err := utilccl.CheckEnterpriseEnabled(st, evalCtx.ClusterID, org, "partitions"); err != nil {
+	if err := utilccl.CheckEnterpriseEnabled(st, evalCtx.ClusterID, "partitions"); err != nil {
 		return nil, newPartitioning, err
 	}
 

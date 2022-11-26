@@ -84,6 +84,12 @@ func BuildStmtMetadataJSON(statistics *roachpb.CollectedStatementStatistics) (js
 //	      },
 //	      "required": ["mean", "sqDiff"]
 //	    },
+//	    "indexes": {
+//	      "type": "array",
+//	      "items": {
+//	        "type": "string",
+//	      },
+//	    },
 //	    "node_ids": {
 //	      "type": "array",
 //	      "items": {
@@ -103,10 +109,11 @@ func BuildStmtMetadataJSON(statistics *roachpb.CollectedStatementStatistics) (js
 //	        "svcLat":            { "$ref": "#/definitions/numeric_stats" },
 //	        "ovhLat":            { "$ref": "#/definitions/numeric_stats" },
 //	        "bytesRead":         { "$ref": "#/definitions/numeric_stats" },
-//	        "rowsRead":          { "$ref": "#/definitions/numeric_stats" }
+//	        "rowsRead":          { "$ref": "#/definitions/numeric_stats" },
 //	        "firstExecAt":       { "type": "string" },
 //	        "lastExecAt":        { "type": "string" },
 //	        "nodes":             { "type": "node_ids" },
+//	        "indexes":           { "type": "indexes" },
 //	      },
 //	      "required": [
 //	        "firstAttemptCnt",
@@ -120,7 +127,8 @@ func BuildStmtMetadataJSON(statistics *roachpb.CollectedStatementStatistics) (js
 //	        "ovhLat",
 //	        "bytesRead",
 //	        "rowsRead",
-//	        "nodes"
+//	        "nodes",
+//	        "indexes
 //	      ]
 //	    },
 //	    "execution_statistics": {
@@ -267,7 +275,9 @@ func BuildTxnStatisticsJSON(statistics *roachpb.CollectedTransactionStatistics) 
 //	  "properties": {
 //	    "stmtType":             { "type": "string" },
 //	    "query":                { "type": "string" },
+//	    "fingerprintID":        { "type": "string" },
 //	    "querySummary":         { "type": "string" },
+//	    "formattedQuery":       { "type": "string" },
 //	    "implicitTxn":          { "type": "boolean" },
 //	    "distSQLCount":         { "type": "number" },
 //	    "failedCount":          { "type": "number" },
@@ -275,6 +285,12 @@ func BuildTxnStatisticsJSON(statistics *roachpb.CollectedTransactionStatistics) 
 //	    "fullScanCount":        { "type": "number" },
 //	    "totalCount":           { "type": "number" },
 //	    "db":                   {
+//	   		"type": "array",
+//	   		"items": {
+//	   		  "type": "string"
+//	   		}
+//	  	},
+//	    "appNames":             {
 //	   		"type": "array",
 //	   		"items": {
 //	   		  "type": "string"
@@ -298,12 +314,14 @@ func BuildStmtDetailsMetadataJSON(
 //	  "type": "object",
 //	  [{
 //	    "blockingTxnID": { "type": "string" },
-//	    "durationMs":    { "type": "number" },
-//	    "indexID":       { "type": "number" },
-//	    "tableID":       { "type": "number" }
+//	    "durationInMs":  { "type": "number" },
+//	    "schemaName":    { "type": "string" },
+//	    "databaseName":  { "type": "string" },
+//	    "tableName":     { "type": "string" },
+//	    "indexName":     { "type": "string" }
 //	  }]
 //	}
-func BuildContentionEventsJSON(events []roachpb.ContentionEvent) (json.JSON, error) {
+func BuildContentionEventsJSON(events []ContentionEventWithNames) (json.JSON, error) {
 	return (*contentionEvents)(&events).encodeJSON()
 }
 

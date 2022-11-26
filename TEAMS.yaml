@@ -25,6 +25,7 @@ cockroachdb/sql-experience:
     cockroachdb/sqlproxy-prs: other
     cockroachdb/sql-api-prs: other
   triage_column_id: 7259065
+  label: T-sql-experience
 cockroachdb/sql-schema:
   triage_column_id: 8946818
 cockroachdb/sql-queries:
@@ -40,6 +41,10 @@ cockroachdb/kv:
     cockroachdb/kv-triage: roachtest
     cockroachdb/kv-prs: other
   triage_column_id: 14242655
+cockroachdb/replication:
+  aliases:
+    cockroachdb/repl-prs: other
+  label: T-kv-replication
 cockroachdb/geospatial:
   triage_column_id: 9487269
 cockroachdb/dev-inf:
@@ -75,7 +80,7 @@ cockroachdb/cluster-ui:
 cockroachdb/obs-inf-prs:
   triage_column_id: 14196277
 cockroachdb/multi-tenant:
-  triage_column_id: 16575985
+  label: T-multitenant
 cockroachdb/jobs:
   aliases:
     cockroachdb/jobs-prs: other

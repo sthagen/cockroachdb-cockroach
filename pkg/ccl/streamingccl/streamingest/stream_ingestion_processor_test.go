@@ -21,11 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
@@ -62,8 +61,8 @@ var _ streamclient.Client = &mockStreamClient{}
 
 // Create implements the Client interface.
 func (m *mockStreamClient) Create(
-	ctx context.Context, target roachpb.TenantID,
-) (streaming.StreamID, error) {
+	_ context.Context, _ roachpb.TenantName,
+) (streampb.StreamID, error) {
 	panic("unimplemented")
 }
 
@@ -74,14 +73,14 @@ func (m *mockStreamClient) Dial(ctx context.Context) error {
 
 // Heartbeat implements the Client interface.
 func (m *mockStreamClient) Heartbeat(
-	ctx context.Context, ID streaming.StreamID, _ hlc.Timestamp,
+	ctx context.Context, ID streampb.StreamID, _ hlc.Timestamp,
 ) (streampb.StreamReplicationStatus, error) {
 	panic("unimplemented")
 }
 
 // Plan implements the Client interface.
 func (m *mockStreamClient) Plan(
-	ctx context.Context, _ streaming.StreamID,
+	ctx context.Context, _ streampb.StreamID,
 ) (streamclient.Topology, error) {
 	panic("unimplemented mock method")
 }
@@ -108,7 +107,7 @@ func (m *mockSubscription) Err() error {
 // Subscribe implements the Client interface.
 func (m *mockStreamClient) Subscribe(
 	ctx context.Context,
-	stream streaming.StreamID,
+	stream streampb.StreamID,
 	token streamclient.SubscriptionToken,
 	startTime hlc.Timestamp,
 ) (streamclient.Subscription, error) {
@@ -144,7 +143,7 @@ func (m *mockStreamClient) Close(ctx context.Context) error {
 
 // Complete implements the streamclient.Client interface.
 func (m *mockStreamClient) Complete(
-	ctx context.Context, streamID streaming.StreamID, successfulIngestion bool,
+	ctx context.Context, streamID streampb.StreamID, successfulIngestion bool,
 ) error {
 	return nil
 }
@@ -157,7 +156,7 @@ var _ streamclient.Client = &errorStreamClient{}
 // ConsumePartition implements the streamclient.Client interface.
 func (m *errorStreamClient) Subscribe(
 	ctx context.Context,
-	stream streaming.StreamID,
+	stream streampb.StreamID,
 	spec streamclient.SubscriptionToken,
 	checkpoint hlc.Timestamp,
 ) (streamclient.Subscription, error) {
@@ -166,7 +165,7 @@ func (m *errorStreamClient) Subscribe(
 
 // Complete implements the streamclient.Client interface.
 func (m *errorStreamClient) Complete(
-	ctx context.Context, streamID streaming.StreamID, successfulIngestion bool,
+	ctx context.Context, streamID streampb.StreamID, successfulIngestion bool,
 ) error {
 	return nil
 }
@@ -183,8 +182,8 @@ func TestStreamIngestionProcessor(t *testing.T) {
 	registry := tc.Server(0).JobRegistry().(*jobs.Registry)
 	const tenantID = 20
 	tenantRekey := execinfrapb.TenantRekey{
-		OldID: roachpb.MakeTenantID(tenantID),
-		NewID: roachpb.MakeTenantID(tenantID + 10),
+		OldID: roachpb.MustMakeTenantID(tenantID),
+		NewID: roachpb.MustMakeTenantID(tenantID + 10),
 	}
 
 	p1 := streamclient.SubscriptionToken("p1")
@@ -198,7 +197,7 @@ func TestStreamIngestionProcessor(t *testing.T) {
 
 	sampleKV := func() roachpb.KeyValue {
 		key, err := keys.RewriteKeyToTenantPrefix(p1Key,
-			keys.MakeTenantPrefix(roachpb.MakeTenantID(tenantID)))
+			keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantID)))
 		require.NoError(t, err)
 		return roachpb.KeyValue{Key: key, Value: v}
 	}
@@ -247,8 +246,11 @@ func TestStreamIngestionProcessor(t *testing.T) {
 			{ID: "1", SubscriptionToken: p1, Spans: []roachpb.Span{p1Span}},
 			{ID: "2", SubscriptionToken: p2, Spans: []roachpb.Span{p2Span}},
 		}
+		topology := streamclient.Topology{
+			Partitions: partitions,
+		}
 		out, err := runStreamIngestionProcessor(ctx, t, registry, kvDB,
-			partitions, startTime, []jobspb.ResolvedSpan{}, tenantRekey,
+			topology, startTime, []jobspb.ResolvedSpan{}, tenantRekey,
 			mockClient, nil /* cutoverProvider */, nil /* streamingTestingKnobs */)
 		require.NoError(t, err)
 
@@ -282,6 +284,9 @@ func TestStreamIngestionProcessor(t *testing.T) {
 			{ID: "1", SubscriptionToken: p1, Spans: []roachpb.Span{p1Span}},
 			{ID: "2", SubscriptionToken: p2, Spans: []roachpb.Span{p2Span}},
 		}
+		topology := streamclient.Topology{
+			Partitions: partitions,
+		}
 		checkpoint := []jobspb.ResolvedSpan{
 			{Span: p1Span, Timestamp: hlc.Timestamp{WallTime: 4}},
 			{Span: p2Span, Timestamp: hlc.Timestamp{WallTime: 5}},
@@ -292,7 +297,7 @@ func TestStreamIngestionProcessor(t *testing.T) {
 			lastClientStart[token] = clientStartTime
 		}}
 		out, err := runStreamIngestionProcessor(ctx, t, registry, kvDB,
-			partitions, startTime, checkpoint, tenantRekey, mockClient,
+			topology, startTime, checkpoint, tenantRekey, mockClient,
 			nil /* cutoverProvider */, streamingTestingKnobs)
 		require.NoError(t, err)
 
@@ -315,8 +320,11 @@ func TestStreamIngestionProcessor(t *testing.T) {
 			{SubscriptionToken: streamclient.SubscriptionToken("1")},
 			{SubscriptionToken: streamclient.SubscriptionToken("2")},
 		}
+		topology := streamclient.Topology{
+			Partitions: partitions,
+		}
 		out, err := runStreamIngestionProcessor(ctx, t, registry, kvDB,
-			partitions, startTime, []jobspb.ResolvedSpan{}, tenantRekey, &errorStreamClient{},
+			topology, startTime, []jobspb.ResolvedSpan{}, tenantRekey, &errorStreamClient{},
 			nil /* cutoverProvider */, nil /* streamingTestingKnobs */)
 		require.NoError(t, err)
 
@@ -415,14 +423,16 @@ func makeTestStreamURI(
 	valueRange, kvsPerResolved, numPartitions int,
 	kvFrequency time.Duration,
 	dupProbability float64,
-	tenantID int,
+	tenantID roachpb.TenantID,
+	tenantName roachpb.TenantName,
 ) string {
 	return streamclient.RandomGenScheme + ":///" + "?VALUE_RANGE=" + strconv.Itoa(valueRange) +
 		"&EVENT_FREQUENCY=" + strconv.Itoa(int(kvFrequency)) +
 		"&KVS_PER_CHECKPOINT=" + strconv.Itoa(kvsPerResolved) +
 		"&NUM_PARTITIONS=" + strconv.Itoa(numPartitions) +
 		"&DUP_PROBABILITY=" + strconv.FormatFloat(dupProbability, 'f', -1, 32) +
-		"&TENANT_ID=" + strconv.Itoa(tenantID)
+		"&TENANT_ID=" + strconv.Itoa(int(tenantID.ToUint64())) +
+		"&TENANT_NAME=" + string(tenantName)
 }
 
 type noCutover struct{}
@@ -443,8 +453,9 @@ func TestRandomClientGeneration(t *testing.T) {
 	kvDB := tc.Server(0).DB()
 
 	// TODO: Consider testing variations on these parameters.
-	const tenantID = 20
-	streamAddr := getTestRandomClientURI(tenantID)
+	tenantID := roachpb.MustMakeTenantID(20)
+	tenantName := roachpb.TenantName("20")
+	streamAddr := getTestRandomClientURI(tenantID, tenantName)
 
 	// The random client returns system and table data partitions.
 	streamClient, err := streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(streamAddr))
@@ -452,13 +463,13 @@ func TestRandomClientGeneration(t *testing.T) {
 
 	randomStreamClient, ok := streamClient.(*streamclient.RandomStreamClient)
 	require.True(t, ok)
-	id, err := randomStreamClient.Create(ctx, roachpb.MakeTenantID(tenantID))
+	id, err := randomStreamClient.Create(ctx, tenantName)
 	require.NoError(t, err)
 
 	topo, err := randomStreamClient.Plan(ctx, id)
 	require.NoError(t, err)
 	// One system and two table data partitions.
-	require.Equal(t, 2 /* numPartitions */, len(topo))
+	require.Equal(t, 2 /* numPartitions */, len(topo.Partitions))
 
 	startTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 
@@ -467,10 +478,10 @@ func TestRandomClientGeneration(t *testing.T) {
 	mu := syncutil.Mutex{}
 	cancelAfterCheckpoints := makeCheckpointEventCounter(&mu, 1000, cancel)
 	tenantRekey := execinfrapb.TenantRekey{
-		OldID: roachpb.MakeTenantID(tenantID),
-		NewID: roachpb.MakeTenantID(tenantID + 10),
+		OldID: tenantID,
+		NewID: roachpb.MustMakeTenantID(tenantID.ToUint64() + 10),
 	}
-	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(roachpb.MakeTenantID(tenantID)),
+	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(tenantID),
 		nil /* tableRekeys */, []execinfrapb.TenantRekey{tenantRekey}, true /* restoreTenantFromStream */)
 	require.NoError(t, err)
 	streamValidator := newStreamClientValidator(rekeyer)
@@ -487,7 +498,7 @@ func TestRandomClientGeneration(t *testing.T) {
 		randomStreamClient, noCutover{}, nil /* streamingTestingKnobs*/)
 	require.NoError(t, err)
 
-	partitionSpanToTableID := getPartitionSpanToTableID(t, topo)
+	partitionSpanToTableID := getPartitionSpanToTableID(t, topo.Partitions)
 	numResolvedEvents := 0
 	maxResolvedTimestampPerPartition := make(map[string]hlc.Timestamp)
 	for {
@@ -613,7 +624,7 @@ func getStreamIngestionProcessor(
 	spec.StreamAddress = "http://unused"
 	spec.TenantRekey = tenantRekey
 	spec.PartitionSpecs = make(map[string]execinfrapb.StreamIngestionPartitionSpec)
-	for _, pa := range partitions {
+	for _, pa := range partitions.Partitions {
 		spec.PartitionSpecs[pa.ID] = execinfrapb.StreamIngestionPartitionSpec{
 			PartitionID:       pa.ID,
 			Address:           string(pa.SrcAddr),

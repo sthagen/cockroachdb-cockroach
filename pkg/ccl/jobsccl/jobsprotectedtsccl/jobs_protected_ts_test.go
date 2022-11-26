@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -132,6 +133,8 @@ WHERE
 func TestJobsProtectedTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	skip.WithIssue(t, 91865) // flaky test
+
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
@@ -159,7 +162,7 @@ func TestJobsProtectedTimestamp(t *testing.T) {
 		WHERE name IN ('kv.closed_timestamp.target_duration', 'kv.protectedts.reconciliation.interval')`)
 
 	t.Run("secondary-tenant", func(t *testing.T) {
-		ten10, conn10 := serverutils.StartTenant(t, s0, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+		ten10, conn10 := serverutils.StartTenant(t, s0, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 		defer conn10.Close()
 		ptp := ten10.ExecutorConfig().(sql.ExecutorConfig).ProtectedTimestampProvider
 		execCfg := ten10.ExecutorConfig().(sql.ExecutorConfig)
@@ -280,7 +283,7 @@ func TestSchedulesProtectedTimestamp(t *testing.T) {
 		WHERE name IN ('kv.closed_timestamp.target_duration', 'kv.protectedts.reconciliation.interval')`)
 
 	t.Run("secondary-tenant", func(t *testing.T) {
-		ten10, conn10 := serverutils.StartTenant(t, s0, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+		ten10, conn10 := serverutils.StartTenant(t, s0, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 		defer conn10.Close()
 		ptp := ten10.ExecutorConfig().(sql.ExecutorConfig).ProtectedTimestampProvider
 		execCfg := ten10.ExecutorConfig().(sql.ExecutorConfig)

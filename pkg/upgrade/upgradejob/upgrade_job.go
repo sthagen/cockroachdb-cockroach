@@ -15,21 +15,20 @@ package upgradejob
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/migrationstable"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,13 +42,11 @@ func init() {
 }
 
 // NewRecord constructs a new jobs.Record for this upgrade.
-func NewRecord(
-	version clusterversion.ClusterVersion, user username.SQLUsername, name string,
-) jobs.Record {
+func NewRecord(version roachpb.Version, user username.SQLUsername, name string) jobs.Record {
 	return jobs.Record{
 		Description: name,
 		Details: jobspb.MigrationDetails{
-			ClusterVersion: &version,
+			ClusterVersion: &clusterversion.ClusterVersion{Version: version},
 		},
 		Username:      user,
 		Progress:      jobspb.MigrationProgress{},
@@ -66,15 +63,19 @@ var _ jobs.Resumer = (*resumer)(nil)
 func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 	execCtx := execCtxI.(sql.JobExecContext)
 	pl := r.j.Payload()
-	cv := *pl.GetMigration().ClusterVersion
+	v := pl.GetMigration().ClusterVersion.Version
 	ie := execCtx.ExecCfg().InternalExecutor
 
-	alreadyCompleted, err := CheckIfMigrationCompleted(ctx, nil /* txn */, ie, cv)
+	enterpriseEnabled := base.CCLDistributionAndEnterpriseEnabled(
+		execCtx.ExecCfg().Settings, execCtx.ExecCfg().NodeInfo.LogicalClusterID())
+	alreadyCompleted, err := migrationstable.CheckIfMigrationCompleted(
+		ctx, v, nil /* txn */, ie, enterpriseEnabled, migrationstable.ConsistentRead,
+	)
 	if alreadyCompleted || err != nil {
-		return errors.Wrapf(err, "checking migration completion for %v", cv)
+		return errors.Wrapf(err, "checking migration completion for %v", v)
 	}
 	mc := execCtx.MigrationJobDeps()
-	m, ok := mc.GetUpgrade(cv)
+	m, ok := mc.GetUpgrade(v)
 	if !ok {
 		// TODO(ajwerner): Consider treating this as an assertion failure. Jobs
 		// should only be created for a cluster version if there is an associated
@@ -86,7 +87,7 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 	}
 	switch m := m.(type) {
 	case *upgrade.SystemUpgrade:
-		err = m.Run(ctx, cv, mc.SystemDeps(), r.j)
+		err = m.Run(ctx, v, mc.SystemDeps())
 	case *upgrade.TenantUpgrade:
 		tenantDeps := upgrade.TenantDeps{
 			DB:                      execCtx.ExecCfg().DB,
@@ -122,78 +123,20 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 			return sr, cleanup, nil
 		}
 
-		err = m.Run(ctx, cv, tenantDeps, r.j)
+		err = m.Run(ctx, v, tenantDeps)
 	default:
 		return errors.AssertionFailedf("unknown migration type %T", m)
 	}
 	if err != nil {
-		return errors.Wrapf(err, "running migration for %v", cv)
+		return errors.Wrapf(err, "running migration for %v", v)
 	}
 
 	// Mark the upgrade as having been completed so that subsequent iterations
 	// no-op and new jobs are not created.
-	if err := markMigrationCompleted(ctx, ie, cv); err != nil {
-		return errors.Wrapf(err, "marking migration complete for %v", cv)
+	if err := migrationstable.MarkMigrationCompleted(ctx, ie, v); err != nil {
+		return errors.Wrapf(err, "marking migration complete for %v", v)
 	}
 	return nil
-}
-
-// CheckIfMigrationCompleted queries the system.migrations table to determine
-// if the upgrade associated with this version has already been completed.
-// The txn may be nil, in which case the check will be run in its own
-// transaction.
-func CheckIfMigrationCompleted(
-	ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor, cv clusterversion.ClusterVersion,
-) (alreadyCompleted bool, _ error) {
-	row, err := ie.QueryRow(
-		ctx,
-		"migration-job-find-already-completed",
-		txn,
-		`
-SELECT EXISTS(
-        SELECT *
-          FROM system.migrations
-         WHERE major = $1
-           AND minor = $2
-           AND patch = $3
-           AND internal = $4
-       );
-`,
-		cv.Major,
-		cv.Minor,
-		cv.Patch,
-		cv.Internal)
-	if err != nil {
-		return false, err
-	}
-	return bool(*row[0].(*tree.DBool)), nil
-}
-
-func markMigrationCompleted(
-	ctx context.Context, ie sqlutil.InternalExecutor, cv clusterversion.ClusterVersion,
-) error {
-	_, err := ie.ExecEx(
-		ctx,
-		"migration-job-mark-job-succeeded",
-		nil, /* txn */
-		sessiondata.NodeUserSessionDataOverride,
-		`
-INSERT
-  INTO system.migrations
-        (
-            major,
-            minor,
-            patch,
-            internal,
-            completed_at
-        )
-VALUES ($1, $2, $3, $4, $5)`,
-		cv.Major,
-		cv.Minor,
-		cv.Patch,
-		cv.Internal,
-		timeutil.Now())
-	return err
 }
 
 // The long-running upgrade resumer has no reverting logic.

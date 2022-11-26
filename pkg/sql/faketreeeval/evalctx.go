@@ -562,27 +562,41 @@ var errEvalTenant = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessio
 
 // CreateTenantWithID is part of the tree.TenantOperator interface.
 func (c *DummyTenantOperator) CreateTenantWithID(
-	ctx context.Context, tenantID uint64, tenantName roachpb.TenantName,
+	_ context.Context, _ uint64, _ roachpb.TenantName,
 ) error {
 	return errors.WithStack(errEvalTenant)
 }
 
 // CreateTenant is part of the tree.TenantOperator interface.
 func (c *DummyTenantOperator) CreateTenant(
-	ctx context.Context, tenantName roachpb.TenantName,
+	_ context.Context, _ roachpb.TenantName,
 ) (roachpb.TenantID, error) {
-	return roachpb.MakeTenantID(0), errors.WithStack(errEvalTenant)
+	return roachpb.TenantID{}, errors.WithStack(errEvalTenant)
 }
 
 // RenameTenant is part of the tree.TenantOperator interface.
 func (c *DummyTenantOperator) RenameTenant(
-	ctx context.Context, tenantID uint64, tenantName roachpb.TenantName,
+	_ context.Context, _ uint64, _ roachpb.TenantName,
 ) error {
 	return errors.WithStack(errEvalTenant)
 }
 
+// GetTenantInfo is part of the tree.TenantOperator interface.
+func (c *DummyTenantOperator) GetTenantInfo(
+	ctx context.Context, tenantName roachpb.TenantName,
+) (*descpb.TenantInfo, error) {
+	return nil, errors.WithStack(errEvalTenant)
+}
+
 // DestroyTenant is part of the tree.TenantOperator interface.
 func (c *DummyTenantOperator) DestroyTenant(
+	ctx context.Context, tenantName roachpb.TenantName, synchronous bool,
+) error {
+	return errors.WithStack(errEvalTenant)
+}
+
+// DestroyTenantByID is part of the tree.TenantOperator interface.
+func (c *DummyTenantOperator) DestroyTenantByID(
 	ctx context.Context, tenantID uint64, synchronous bool,
 ) error {
 	return errors.WithStack(errEvalTenant)

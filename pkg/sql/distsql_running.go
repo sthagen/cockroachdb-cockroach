@@ -55,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	pbtypes "github.com/gogo/protobuf/types"
 )
 
@@ -395,13 +396,27 @@ func (dsp *DistSQLPlanner) setupFlows(
 	if len(statementSQL) > setupFlowRequestStmtMaxLength {
 		statementSQL = statementSQL[:setupFlowRequestStmtMaxLength]
 	}
+	getJobTag := func(ctx context.Context) string {
+		tags := logtags.FromContext(ctx)
+		if tags != nil {
+			for _, tag := range tags.Get() {
+				if tag.Key() == "job" {
+					return tag.ValueStr()
+				}
+			}
+		}
+		return ""
+	}
 	setupReq := execinfrapb.SetupFlowRequest{
+		// TODO(yuzefovich): avoid populating some fields of the SetupFlowRequest
+		// for local plans.
 		LeafTxnInputState: leafInputState,
 		Version:           execinfra.Version,
 		EvalContext:       execinfrapb.MakeEvalContext(&evalCtx.Context),
 		TraceKV:           evalCtx.Tracing.KVTracingEnabled(),
 		CollectStats:      planCtx.collectExecStats,
 		StatementSQL:      statementSQL,
+		JobTag:            getJobTag(ctx),
 	}
 
 	var isVectorized bool
@@ -474,14 +489,25 @@ func (dsp *DistSQLPlanner) setupFlows(
 	//   the tracing span;
 	// - now the client-side goroutine of the RPC is scheduled, and it attempts
 	//   to use the span from the context, but it has already been finished.
-	//
-	// We still want to be able to cancel the RPCs when either the local flow
-	// finishes or the local node is quiescing, so we derive a separate context
-	// with the cancellation ability.
-	runnerCtx, cancelRunnerCtx := dsp.stopper.WithCancelOnQuiesce(context.Background())
+	runnerCtx, cancelRunnerCtx := context.WithCancel(origCtx)
+	var runnerSpan *tracing.Span
+	// This span is necessary because it can outlive its parent.
+	runnerCtx, runnerSpan = tracing.ChildSpan(runnerCtx, "setup-flow-async" /* opName */)
+	runnerCleanup := func() {
+		cancelRunnerCtx()
+		runnerSpan.Finish()
+	}
+	// Make sure that we call runnerCleanup unless a new goroutine takes that
+	// responsibility.
+	var listenerGoroutineWillCleanup bool
+	defer func() {
+		if !listenerGoroutineWillCleanup {
+			runnerCleanup()
+		}
+	}()
 	for nodeID, flowSpec := range flows {
 		if nodeID == thisNodeID {
-			// Skip this node.
+			// Skip this node since we already handled the local flow above.
 			continue
 		}
 		req := setupReq
@@ -500,11 +526,9 @@ func (dsp *DistSQLPlanner) setupFlows(
 		case dsp.runnerCoordinator.runnerChan <- runReq:
 			usedWorker = true
 		default:
-			// We can just use the "parent" context since we're executing the
-			// request in a blocking fashion in the current goroutine. This
-			// allows for the cancellation of the "parent" context be noticed
-			// sooner.
-			runReq.ctx = origCtx
+			// Use the context of the local flow since we're executing this
+			// SetupFlow RPC synchronously.
+			runReq.ctx = ctx
 			if err = runReq.run(); err != nil {
 				return ctx, flow, err
 			}
@@ -543,17 +567,19 @@ func (dsp *DistSQLPlanner) setupFlows(
 		// DistSQLReceiver by the listener goroutine below.
 		cancelRunnerCtx()
 	})
-	_ = dsp.stopper.RunAsyncTask(origCtx, "distsql-remote-flows-setup-listener", func(ctx context.Context) {
+	err = dsp.stopper.RunAsyncTask(origCtx, "distsql-remote-flows-setup-listener", func(ctx context.Context) {
+		defer runnerCleanup()
+		var seenError bool
 		for i := 0; i < len(flows)-1; i++ {
 			res := <-resultChan
-			if res.err != nil {
+			if res.err != nil && !seenError {
+				seenError = true
 				// The setup of at least one remote flow failed.
 				cleanupCalledMu.Lock()
-				defer cleanupCalledMu.Unlock()
-				if cleanupCalledMu.called {
-					// We no longer care about the error nor do we need to
-					// cancel the flow.
-					return
+				skipCancel := cleanupCalledMu.called
+				cleanupCalledMu.Unlock()
+				if skipCancel {
+					continue
 				}
 				// First, we update the DistSQL receiver with the error to be
 				// returned to the client eventually.
@@ -565,12 +591,15 @@ func (dsp *DistSQLPlanner) setupFlows(
 				recv.setErrorWithoutStatusUpdate(res.err)
 				// Now explicitly cancel the local flow.
 				flow.Cancel()
-				// resultChan is buffered, so we can just ignore the remaining
-				// results of the RPCs.
-				return
 			}
 		}
 	})
+	if err != nil {
+		return ctx, flow, err
+	}
+	// Now the responsibility of calling runnerCleanup is passed on to the new
+	// goroutine.
+	listenerGoroutineWillCleanup = true
 	return ctx, flow, nil
 }
 
@@ -720,6 +749,13 @@ func (dsp *DistSQLPlanner) Run(
 
 	recv.outputTypes = plan.GetResultTypes()
 	recv.contendedQueryMetric = dsp.distSQLSrv.Metrics.ContendedQueriesCount
+	if dsp.distSQLSrv.TenantCostController != nil && planCtx.planner != nil {
+		if instrumentation := planCtx.planner.curPlan.instrumentation; instrumentation != nil {
+			// Only collect the network egress estimate for a tenant that is running
+			// EXPLAIN ANALYZE, since the overhead is non-negligible.
+			recv.isTenantExplainAnalyze = instrumentation.outputMode != unmodifiedOutput
+		}
+	}
 
 	if len(flows) == 1 {
 		// We ended up planning everything locally, regardless of whether we
@@ -845,6 +881,13 @@ type DistSQLReceiver struct {
 
 	stats *topLevelQueryStats
 
+	// isTenantExplainAnalyze is used to indicate that network egress should be
+	// collected in order to estimate RU consumption for a tenant that is running
+	// a query with EXPLAIN ANALYZE.
+	isTenantExplainAnalyze bool
+
+	egressCounter TenantNetworkEgressCounter
+
 	expectedRowsRead int64
 	progressAtomic   *uint64
 
@@ -883,6 +926,21 @@ type batchResultWriter interface {
 type MetadataResultWriter interface {
 	AddMeta(ctx context.Context, meta *execinfrapb.ProducerMetadata)
 }
+
+// TenantNetworkEgressCounter is used by tenants running EXPLAIN ANALYZE to
+// measure the number of bytes that would be sent over the network if the
+// query result was returned to the client. Its implementation lives in the
+// pgwire package, in conn.go.
+type TenantNetworkEgressCounter interface {
+	// GetRowNetworkEgress estimates network egress for a row.
+	GetRowNetworkEgress(ctx context.Context, row tree.Datums, typs []*types.T) int64
+	// GetBatchNetworkEgress estimates network egress for a batch.
+	GetBatchNetworkEgress(ctx context.Context, batch coldata.Batch) int64
+}
+
+// NewTenantNetworkEgressCounter is used to create a tenantNetworkEgressCounter.
+// It hooks into pgwire code.
+var NewTenantNetworkEgressCounter func() TenantNetworkEgressCounter
 
 // MetadataCallbackWriter wraps a rowResultWriter to stream metadata in a
 // DistSQL flow. It executes a given callback when metadata is added.
@@ -1308,6 +1366,35 @@ func (r *DistSQLReceiver) Push(
 		return r.status
 	}
 
+	ensureDecodedRow := func() error {
+		if r.row == nil {
+			r.row = make(tree.Datums, len(row))
+		}
+		for i, encDatum := range row {
+			err := encDatum.EnsureDecoded(r.outputTypes[i], &r.alloc)
+			if err != nil {
+				return err
+			}
+			r.row[i] = encDatum.Datum
+		}
+		return nil
+	}
+
+	if r.isTenantExplainAnalyze {
+		if err := ensureDecodedRow(); err != nil {
+			r.SetError(err)
+			return r.status
+		}
+		if len(r.row) != len(r.outputTypes) {
+			r.SetError(errors.Errorf("expected number of columns and output types to be the same"))
+			return r.status
+		}
+		if r.egressCounter == nil {
+			r.egressCounter = NewTenantNetworkEgressCounter()
+		}
+		r.stats.networkEgressEstimate += r.egressCounter.GetRowNetworkEgress(r.ctx, r.row, r.outputTypes)
+	}
+
 	if r.discardRows {
 		// Discard rows.
 		return r.status
@@ -1320,16 +1407,9 @@ func (r *DistSQLReceiver) Push(
 		log.VEvent(r.ctx, 2, `a row is pushed in "exists" mode, so transition to draining`)
 		r.status = execinfra.DrainRequested
 	} else {
-		if r.row == nil {
-			r.row = make(tree.Datums, len(row))
-		}
-		for i, encDatum := range row {
-			err := encDatum.EnsureDecoded(r.outputTypes[i], &r.alloc)
-			if err != nil {
-				r.SetError(err)
-				return r.status
-			}
-			r.row[i] = encDatum.Datum
+		if err := ensureDecodedRow(); err != nil {
+			r.SetError(err)
+			return r.status
 		}
 	}
 	r.tracing.TraceExecRowsResult(r.ctx, r.row)
@@ -1364,6 +1444,13 @@ func (r *DistSQLReceiver) PushBatch(
 		// row with the row count in it, so just grab that and exit.
 		r.resultWriterMu.row.IncrementRowsAffected(r.ctx, int(batch.ColVec(0).Int64()[0]))
 		return r.status
+	}
+
+	if r.isTenantExplainAnalyze {
+		if r.egressCounter == nil {
+			r.egressCounter = NewTenantNetworkEgressCounter()
+		}
+		r.stats.networkEgressEstimate += r.egressCounter.GetBatchNetworkEgress(r.ctx, batch)
 	}
 
 	if r.discardRows {

@@ -481,11 +481,11 @@ func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 	flowCtx *execinfra.FlowCtx,
 	statsCollectors []colexecop.VectorizedStatsCollector,
 	originSQLInstanceID base.SQLInstanceID,
-) func() []*execinfrapb.ComponentStats {
+) func(context.Context) []*execinfrapb.ComponentStats {
 	if !s.recordingStats {
 		return nil
 	}
-	return func() []*execinfrapb.ComponentStats {
+	return func(ctx context.Context) []*execinfrapb.ComponentStats {
 		lastOutboxOnRemoteNode := atomic.AddInt32(&s.numOutboxesDrained, 1) == atomic.LoadInt32(&s.numOutboxes) && !s.isGatewayNode
 		numResults := len(statsCollectors)
 		if lastOutboxOnRemoteNode {
@@ -504,6 +504,7 @@ func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 				FlowStats: execinfrapb.FlowStats{
 					MaxMemUsage:  optional.MakeUint(uint64(flowCtx.Mon.MaximumBytes())),
 					MaxDiskUsage: optional.MakeUint(uint64(flowCtx.DiskMonitor.MaximumBytes())),
+					ConsumedRU:   optional.MakeUint(uint64(flowCtx.TenantCPUMonitor.EndCollection(ctx))),
 				},
 			})
 		}
@@ -547,7 +548,7 @@ type remoteComponentCreator interface {
 		allocator *colmem.Allocator,
 		input colexecargs.OpWithMetaInfo,
 		typs []*types.T,
-		getStats func() []*execinfrapb.ComponentStats,
+		getStats func(context.Context) []*execinfrapb.ComponentStats,
 	) (*colrpc.Outbox, error)
 	newInbox(
 		allocator *colmem.Allocator,
@@ -564,7 +565,7 @@ func (vectorizedRemoteComponentCreator) newOutbox(
 	allocator *colmem.Allocator,
 	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
-	getStats func() []*execinfrapb.ComponentStats,
+	getStats func(context.Context) []*execinfrapb.ComponentStats,
 ) (*colrpc.Outbox, error) {
 	return colrpc.NewOutbox(allocator, input, typs, getStats)
 }
@@ -748,7 +749,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	outputTyps []*types.T,
 	stream *execinfrapb.StreamEndpointSpec,
 	factory coldata.ColumnFactory,
-	getStats func() []*execinfrapb.ComponentStats,
+	getStats func(context.Context) []*execinfrapb.ComponentStats,
 ) (execopnode.OpNode, error) {
 	outbox, err := s.remoteComponentCreator.newOutbox(
 		colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),

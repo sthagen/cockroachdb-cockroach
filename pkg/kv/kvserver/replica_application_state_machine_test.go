@@ -85,29 +85,30 @@ func TestReplicaStateMachineChangeReplicas(t *testing.T) {
 		}
 
 		// Create a new application batch.
-		b := sm.NewBatch(false /* ephemeral */).(*replicaAppBatch)
+		b := sm.NewBatch().(*replicaAppBatch)
 		defer b.Close()
 
 		// Stage a command with the ChangeReplicas trigger.
-		cmd := &replicatedCmd{
-			ctx: ctx,
-			Entry: &raftlog.Entry{
-				Entry: raftpb.Entry{
-					Index: r.mu.state.RaftAppliedIndex + 1,
-					Type:  raftpb.EntryConfChange,
-				},
-				ID: makeIDKey(),
-				Cmd: kvserverpb.RaftCommand{
-					ProposerLeaseSequence: r.mu.state.Lease.Sequence,
-					MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
-					ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
-						State:          &kvserverpb.ReplicaState{Desc: &newDesc},
-						ChangeReplicas: &kvserverpb.ChangeReplicas{ChangeReplicasTrigger: trigger},
-						WriteTimestamp: r.mu.state.GCThreshold.Add(1, 0),
-					},
-				},
-				ConfChangeV1: &confChange,
+		ent := &raftlog.Entry{
+			Entry: raftpb.Entry{
+				Index: r.mu.state.RaftAppliedIndex + 1,
+				Type:  raftpb.EntryConfChange,
 			},
+			ID: makeIDKey(),
+			Cmd: kvserverpb.RaftCommand{
+				ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+				MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+				ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+					State:          &kvserverpb.ReplicaState{Desc: &newDesc},
+					ChangeReplicas: &kvserverpb.ChangeReplicas{ChangeReplicasTrigger: trigger},
+					WriteTimestamp: r.mu.state.GCThreshold.Add(1, 0),
+				},
+			},
+			ConfChangeV1: &confChange,
+		}
+		cmd := &replicatedCmd{
+			ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
+			ctx:           ctx,
 		}
 
 		checkedCmd, err := b.Stage(cmd.ctx, cmd)
@@ -166,7 +167,7 @@ func TestReplicaStateMachineRaftLogTruncationStronglyCoupled(t *testing.T) {
 		sm := r.getStateMachine()
 
 		// Create a new application batch.
-		b := sm.NewBatch(false /* ephemeral */).(*replicaAppBatch)
+		b := sm.NewBatch().(*replicaAppBatch)
 		defer b.Close()
 
 		r.mu.Lock()
@@ -184,29 +185,30 @@ func TestReplicaStateMachineRaftLogTruncationStronglyCoupled(t *testing.T) {
 		}
 		// Stage a command that truncates one raft log entry which we pretend has a
 		// byte size of 1.
-		cmd := &replicatedCmd{
-			ctx: ctx,
-			Entry: &raftlog.Entry{
-				Entry: raftpb.Entry{
-					Index: raftAppliedIndex + 1,
-					Type:  raftpb.EntryNormal,
-				},
-				ID: makeIDKey(),
-				Cmd: kvserverpb.RaftCommand{
-					ProposerLeaseSequence: r.mu.state.Lease.Sequence,
-					MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
-					ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
-						State: &kvserverpb.ReplicaState{
-							TruncatedState: &roachpb.RaftTruncatedState{
-								Index: truncatedIndex + 1,
-							},
+		ent := &raftlog.Entry{
+			Entry: raftpb.Entry{
+				Index: raftAppliedIndex + 1,
+				Type:  raftpb.EntryNormal,
+			},
+			ID: makeIDKey(),
+			Cmd: kvserverpb.RaftCommand{
+				ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+				MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+				ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+					State: &kvserverpb.ReplicaState{
+						TruncatedState: &roachpb.RaftTruncatedState{
+							Index: truncatedIndex + 1,
 						},
-						RaftLogDelta:           -1,
-						RaftExpectedFirstIndex: expectedFirstIndex,
-						WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 					},
+					RaftLogDelta:           -1,
+					RaftExpectedFirstIndex: expectedFirstIndex,
+					WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 				},
 			},
+		}
+		cmd := &replicatedCmd{
+			ctx:           ctx,
+			ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
 		}
 
 		checkedCmd, err := b.Stage(cmd.ctx, cmd)
@@ -291,33 +293,34 @@ func TestReplicaStateMachineRaftLogTruncationLooselyCoupled(t *testing.T) {
 			sm := r.getStateMachine()
 
 			// Create a new application batch.
-			b := sm.NewBatch(false /* ephemeral */).(*replicaAppBatch)
+			b := sm.NewBatch().(*replicaAppBatch)
 			defer b.Close()
 			// Stage a command that truncates one raft log entry which we pretend has a
 			// byte size of 1.
-			cmd := &replicatedCmd{
-				ctx: ctx,
-				Entry: &raftlog.Entry{
-					Entry: raftpb.Entry{
-						Index: raftAppliedIndex + 1,
-						Type:  raftpb.EntryNormal,
-					},
-					ID: makeIDKey(),
-					Cmd: kvserverpb.RaftCommand{
-						ProposerLeaseSequence: r.mu.state.Lease.Sequence,
-						MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
-						ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
-							State: &kvserverpb.ReplicaState{
-								TruncatedState: &roachpb.RaftTruncatedState{
-									Index: truncatedIndex + 1,
-								},
+			ent := &raftlog.Entry{
+				Entry: raftpb.Entry{
+					Index: raftAppliedIndex + 1,
+					Type:  raftpb.EntryNormal,
+				},
+				ID: makeIDKey(),
+				Cmd: kvserverpb.RaftCommand{
+					ProposerLeaseSequence: r.mu.state.Lease.Sequence,
+					MaxLeaseIndex:         r.mu.state.LeaseAppliedIndex + 1,
+					ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+						State: &kvserverpb.ReplicaState{
+							TruncatedState: &roachpb.RaftTruncatedState{
+								Index: truncatedIndex + 1,
 							},
-							RaftLogDelta:           -1,
-							RaftExpectedFirstIndex: expectedFirstIndex,
-							WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 						},
+						RaftLogDelta:           -1,
+						RaftExpectedFirstIndex: expectedFirstIndex,
+						WriteTimestamp:         r.mu.state.GCThreshold.Add(1, 0),
 					},
 				},
+			}
+			cmd := &replicatedCmd{
+				ctx:           ctx,
+				ReplicatedCmd: raftlog.ReplicatedCmd{Entry: ent},
 			}
 
 			checkedCmd, err := b.Stage(cmd.ctx, cmd)

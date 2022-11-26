@@ -26,9 +26,12 @@ export enum InsightExecEnum {
   STATEMENT = "statement",
 }
 
-export type TransactionInsightEvent = {
+// What we store in redux for txn contention insight events in
+// the overview page.  It is missing information such as the
+// blocking txn information.
+export type TxnContentionInsightEvent = {
   transactionID: string;
-  fingerprintID: string;
+  transactionFingerprintID: string;
   queries: string[];
   insights: Insight[];
   startTime: Moment;
@@ -38,10 +41,11 @@ export type TransactionInsightEvent = {
   execType: InsightExecEnum;
 };
 
+// Information about the blocking transaction and schema.
 export type BlockedContentionDetails = {
   collectionTimeStamp: Moment;
   blockingExecutionID: string;
-  blockingFingerprintID: string;
+  blockingTxnFingerprintID: string;
   blockingQueries: string[];
   contendedKey: string;
   schemaName: string;
@@ -51,46 +55,108 @@ export type BlockedContentionDetails = {
   contentionTimeMs: number;
 };
 
-export type TransactionInsightEventDetails = {
-  executionID: string;
+// TODO (xinhaoz) these fields should be placed into TxnInsightEvent
+// once they are available for contention insights.  MergedTxnInsightEvent,
+// (which marks these fields as optional) can then be deleted.
+type UnavailableForTxnContention = {
+  databaseName: string;
+  username: string;
+  priority: string;
+  retries: number;
+  implicitTxn: boolean;
+  sessionID: string;
+};
+
+export type TxnInsightEvent = UnavailableForTxnContention & {
+  transactionExecutionID: string;
+  transactionFingerprintID: string;
+  application: string;
+  lastRetryReason?: string;
+  contention?: moment.Duration;
+
+  // The full list of statements in this txn, with their stmt
+  // level insights (not all stmts in the txn may have one).
+  // Ordered by startTime.
+  statementInsights: StatementInsightEvent[];
+
+  insights: Insight[]; // De-duplicated list of insights from statement level.
+  queries: string[]; // We bubble this up from statementinsights for easy access, since txn contention details dont have stmt insights.
+  startTime?: Moment; // TODO (xinhaoz) not currently available
+  elapsedTimeMillis?: number; // TODO (xinhaoz) not currently available
+  endTime?: Moment; // TODO (xinhaoz) not currently available
+};
+
+export type MergedTxnInsightEvent = Omit<
+  TxnInsightEvent,
+  keyof UnavailableForTxnContention
+> &
+  Partial<UnavailableForTxnContention>;
+
+export type TxnContentionInsightDetails = {
+  transactionExecutionID: string;
   queries: string[];
   insights: Insight[];
   startTime: Moment;
-  totalContentionTime: number;
+  totalContentionTimeMs: number;
   contentionThreshold: number;
   application: string;
-  fingerprintID: string;
+  transactionFingerprintID: string;
   blockingContentionDetails: BlockedContentionDetails[];
+  execType: InsightExecEnum;
+  insightName: string;
+};
+
+export type TxnInsightDetails = Omit<MergedTxnInsightEvent, "contention"> & {
+  totalContentionTimeMs?: number;
+  contentionThreshold?: number;
+  blockingContentionDetails?: BlockedContentionDetails[];
   execType: InsightExecEnum;
 };
 
-export type StatementInsightEvent = {
-  // Some of these can be moved to a common InsightEvent type if txn query is updated.
-  statementID: string;
-  transactionID: string;
-  statementFingerprintID: string;
-  transactionFingerprintID: string;
-  implicitTxn: boolean;
-  startTime: Moment;
-  elapsedTimeMillis: number;
-  sessionID: string;
-  timeSpentWaiting?: moment.Duration;
-  isFullScan: boolean;
-  endTime: Moment;
+export type BlockedStatementContentionDetails = {
+  blockingTxnID: string;
+  durationInMs: number;
+  schemaName: string;
   databaseName: string;
-  username: string;
+  tableName: string;
+  indexName: string;
+};
+
+// Does not contain transaction information.
+// This is what is stored at the transaction insight level, shown
+// on the txn insights overview page.
+export type StatementInsightEvent = {
+  statementExecutionID: string;
+  statementFingerprintID: string;
+  startTime: Moment;
+  isFullScan: boolean;
+  elapsedTimeMillis: number;
+  totalContentionTime?: moment.Duration;
+  contentionEvents?: BlockedStatementContentionDetails[];
+  endTime: Moment;
   rowsRead: number;
   rowsWritten: number;
-  lastRetryReason?: string;
-  priority: string;
-  retries: number;
   causes: string[];
   problem: string;
   query: string;
-  application: string;
   insights: Insight[];
   indexRecommendations: string[];
   planGist: string;
+};
+
+// StatementInsightEvent with their transaction level information.
+// What we show in the stmt insights overview and details pages.
+export type FlattenedStmtInsightEvent = StatementInsightEvent & {
+  transactionExecutionID: string;
+  transactionFingerprintID: string;
+  implicitTxn: boolean;
+  sessionID: string;
+  databaseName: string;
+  username: string;
+  lastRetryReason?: string;
+  priority: string;
+  retries: number;
+  application: string;
 };
 
 export type Insight = {
@@ -100,7 +166,7 @@ export type Insight = {
   tooltipDescription: string;
 };
 
-export type EventExecution = {
+export type ContentionEvent = {
   executionID: string;
   fingerprintID: string;
   queries: string[];
@@ -113,8 +179,8 @@ export type EventExecution = {
   execType: InsightExecEnum;
 };
 
-const highContentionInsight = (
-  execType: InsightExecEnum = InsightExecEnum.TRANSACTION,
+export const highContentionInsight = (
+  execType: InsightExecEnum,
   latencyThreshold?: number,
   contentionDuration?: number,
 ): Insight => {
@@ -141,9 +207,9 @@ const highContentionInsight = (
   };
 };
 
-const slowExecutionInsight = (
+export const slowExecutionInsight = (
   execType: InsightExecEnum,
-  latencyThreshold: number,
+  latencyThreshold?: number,
 ): Insight => {
   let threshold = latencyThreshold + "ms";
   if (!latencyThreshold) {
@@ -160,7 +226,7 @@ const slowExecutionInsight = (
   };
 };
 
-const planRegressionInsight = (execType: InsightExecEnum): Insight => {
+export const planRegressionInsight = (execType: InsightExecEnum): Insight => {
   const description =
     `This ${execType} was slow because we picked the wrong plan, ` +
     `possibly due to outdated statistics, the statement using different literals or ` +
@@ -174,7 +240,7 @@ const planRegressionInsight = (execType: InsightExecEnum): Insight => {
   };
 };
 
-const suboptimalPlanInsight = (execType: InsightExecEnum): Insight => {
+export const suboptimalPlanInsight = (execType: InsightExecEnum): Insight => {
   const description =
     `This ${execType} was slow because a good plan was not available, whether ` +
     `due to outdated statistics or missing indexes.`;
@@ -187,7 +253,7 @@ const suboptimalPlanInsight = (execType: InsightExecEnum): Insight => {
   };
 };
 
-const highRetryCountInsight = (execType: InsightExecEnum): Insight => {
+export const highRetryCountInsight = (execType: InsightExecEnum): Insight => {
   const description =
     `This ${execType} has being retried more times than the value of the ` +
     `'sql.insights.high_retry_count.threshold' cluster setting.`;
@@ -200,7 +266,7 @@ const highRetryCountInsight = (execType: InsightExecEnum): Insight => {
   };
 };
 
-const failedExecutionInsight = (execType: InsightExecEnum): Insight => {
+export const failedExecutionInsight = (execType: InsightExecEnum): Insight => {
   const description =
     `This ${execType} execution failed completely, due to contention, resource ` +
     `saturation, or syntax errors.`;
@@ -213,9 +279,7 @@ const failedExecutionInsight = (execType: InsightExecEnum): Insight => {
   };
 };
 
-export const InsightTypes = [highContentionInsight]; // only used by getTransactionInsights to iterate over txn insights
-
-export const getInsightFromProblem = (
+export const getInsightFromCause = (
   cause: string,
   execOption: InsightExecEnum,
   latencyThreshold?: number,
@@ -270,7 +334,7 @@ export interface InsightRecommendation {
   database?: string;
   query?: string;
   indexDetails?: indexDetails;
-  execution?: executionDetails;
+  execution?: ExecutionDetails;
   details?: insightDetails;
 }
 
@@ -281,13 +345,17 @@ export interface indexDetails {
   lastUsed?: string;
 }
 
-export interface executionDetails {
-  statement?: string;
-  summary?: string;
+// These are the fields used for workload insight recommendations.
+export interface ExecutionDetails {
+  databaseName?: string;
+  elapsedTimeMillis?: number;
+  contentionTime?: number;
   fingerprintID?: string;
   implicit?: boolean;
-  retries?: number;
   indexRecommendations?: string[];
+  retries?: number;
+  statement?: string;
+  summary?: string;
 }
 
 export interface insightDetails {

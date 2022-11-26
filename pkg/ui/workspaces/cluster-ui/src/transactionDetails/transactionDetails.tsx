@@ -39,6 +39,7 @@ import { SummaryCard, SummaryCardItem } from "../summaryCard";
 import {
   Bytes,
   calculateTotalWorkload,
+  FixFingerprintHexValue,
   Duration,
   formatNumberForDisplay,
   unset,
@@ -410,6 +411,14 @@ export class TransactionDetails extends React.Component<
                               : unset
                           }
                         />
+                        <SummaryCardItem
+                          label="Fingerprint ID"
+                          value={FixFingerprintHexValue(
+                            transaction?.stats_data.transaction_fingerprint_id.toString(
+                              16,
+                            ),
+                          )}
+                        />
                         <p
                           className={summaryCardStylesCx(
                             "summary--card__divider",
@@ -463,7 +472,6 @@ export class TransactionDetails extends React.Component<
                         aggregatedStatements,
                         [],
                         calculateTotalWorkload(aggregatedStatements),
-                        nodeRegions,
                         "transactionDetails",
                         isTenant,
                         hasViewActivityRedactedRole,

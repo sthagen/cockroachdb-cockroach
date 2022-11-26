@@ -23,7 +23,6 @@ import (
 	"flag"
 	"math/rand"
 	"net/url"
-	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -48,14 +47,6 @@ import (
 // TenantModeFlagName is the exported name of the tenantMode flag, for use
 // in other packages.
 const TenantModeFlagName = "tenantMode"
-
-// TenantSkipCCLBinaryMessage is the message we return any time we need to
-// skip a test due to the lack of a CCL binary.
-const TenantSkipCCLBinaryMessage = "skipping due to lack of CCL binary"
-
-// RequiresCCLBinaryMessage is the message we look for to determine if we've
-// encountered an error due to the lack of a CCL binary.
-const RequiresCCLBinaryMessage = "requires a CCL binary"
 
 var tenantModeFlag = flag.String(
 	TenantModeFlagName, tenantModeDefault,
@@ -169,9 +160,6 @@ type TestServerInterface interface {
 
 	// SQLLivenessProvider returns the sqlliveness.Provider as an interface{}.
 	SQLLivenessProvider() interface{}
-
-	// StartupMigrationsManager returns the *startupmigrations.Manager as an interface{}.
-	StartupMigrationsManager() interface{}
 
 	// NodeLiveness exposes the NodeLiveness instance used by the TestServer as an
 	// interface{}.
@@ -316,9 +304,6 @@ func StartServer(
 	}
 
 	if err := server.Start(context.Background()); err != nil {
-		if strings.Contains(err.Error(), RequiresCCLBinaryMessage) {
-			skip.IgnoreLint(t, TenantSkipCCLBinaryMessage)
-		}
 		t.Fatalf("%+v", err)
 	}
 	goDB := OpenDBConn(
@@ -421,7 +406,7 @@ func StartTenant(
 // starting a test Tenant. The returned tenant IDs match those built
 // into the test certificates.
 func TestTenantID() roachpb.TenantID {
-	return roachpb.MakeTenantID(security.EmbeddedTenantIDs()[0])
+	return roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[0])
 }
 
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters

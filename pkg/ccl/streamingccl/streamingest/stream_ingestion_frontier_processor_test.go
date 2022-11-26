@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
@@ -52,6 +53,10 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 					// We create a job record to track persistence but we don't want it to
 					// be adopted as the processors are being manually executed in the test.
 					DisableAdoptions: true,
+				},
+				// DisableAdoptions needs this.
+				UpgradeManager: &upgradebase.TestingKnobs{
+					DontUseJobs: true,
 				},
 			},
 		},
@@ -102,7 +107,7 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 	const tenantID = 20
 	sampleKV := func() roachpb.KeyValue {
 		key, err := keys.RewriteKeyToTenantPrefix(roachpb.Key("key_1"),
-			keys.MakeTenantPrefix(roachpb.MakeTenantID(tenantID)))
+			keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantID)))
 		require.NoError(t, err)
 		return roachpb.KeyValue{Key: key, Value: v}
 	}
@@ -211,22 +216,24 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			topology := streamclient.Topology{
-				{
-					ID:                pa1,
-					SubscriptionToken: []byte(pa1),
-					SrcAddr:           streamingccl.PartitionAddress(pa1),
-					Spans:             []roachpb.Span{pa1Span},
-				},
-				{
-					ID:                pa2,
-					SubscriptionToken: []byte(pa2),
-					SrcAddr:           streamingccl.PartitionAddress(pa2),
-					Spans:             []roachpb.Span{pa2Span},
+				Partitions: []streamclient.PartitionInfo{
+					{
+						ID:                pa1,
+						SubscriptionToken: []byte(pa1),
+						SrcAddr:           streamingccl.PartitionAddress(pa1),
+						Spans:             []roachpb.Span{pa1Span},
+					},
+					{
+						ID:                pa2,
+						SubscriptionToken: []byte(pa2),
+						SrcAddr:           streamingccl.PartitionAddress(pa2),
+						Spans:             []roachpb.Span{pa2Span},
+					},
 				},
 			}
 
 			spec.PartitionSpecs = map[string]execinfrapb.StreamIngestionPartitionSpec{}
-			for _, partition := range topology {
+			for _, partition := range topology.Partitions {
 				spec.PartitionSpecs[partition.ID] = execinfrapb.StreamIngestionPartitionSpec{
 					PartitionID:       partition.ID,
 					SubscriptionToken: string(partition.SubscriptionToken),
@@ -235,8 +242,8 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 				}
 			}
 			spec.TenantRekey = execinfrapb.TenantRekey{
-				OldID: roachpb.MakeTenantID(tenantID),
-				NewID: roachpb.MakeTenantID(tenantID + 10),
+				OldID: roachpb.MustMakeTenantID(tenantID),
+				NewID: roachpb.MustMakeTenantID(tenantID + 10),
 			}
 			spec.StartTime = tc.frontierStartTime
 			spec.Checkpoint.ResolvedSpans = tc.jobCheckpoint

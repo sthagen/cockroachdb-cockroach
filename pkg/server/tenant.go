@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/obsservice/obspb"
@@ -552,11 +553,8 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 
 	log.Event(ctx, "accepting connections")
 
-	// TODO(knz): Missing call here to startSystemLogsGC().
-	// See: https://github.com/cockroachdb/cockroach/issues/90521
-
-	// Begin an async task to periodically purge old sessions in the system.web_sessions table.
-	if err := startPurgeOldSessions(workersCtx, s.authentication); err != nil {
+	// Start garbage collecting system events.
+	if err := startSystemLogsGC(workersCtx, s.sqlServer); err != nil {
 		return err
 	}
 
@@ -572,7 +570,6 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		s.debug,           /* handleDebugUnauthenticated */
 		newAPIV2Server(workersCtx, &apiV2ServerOpts{
 			sqlServer: s.sqlServer,
-			tenantID:  s.sqlCfg.TenantID,
 			db:        s.db,
 		}), /* apiServer */
 	); err != nil {
@@ -616,12 +613,8 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	// externalUsageFn measures the CPU time, for use by tenant
 	// resource usage accounting in costController.Start below.
 	externalUsageFn := func(ctx context.Context) multitenant.ExternalUsage {
-		userTimeMillis, sysTimeMillis, err := status.GetCPUTime(ctx)
-		if err != nil {
-			log.Ops.Errorf(ctx, "unable to get cpu usage: %v", err)
-		}
 		return multitenant.ExternalUsage{
-			CPUSecs:           float64(userTimeMillis+sysTimeMillis) * 1e-3,
+			CPUSecs:           multitenantcpu.GetCPUSeconds(ctx),
 			PGWireEgressBytes: s.sqlServer.pgServer.BytesOut(),
 		}
 	}
@@ -1010,4 +1003,12 @@ func (noopTenantSideCostController) OnExternalIOWait(
 func (noopTenantSideCostController) OnExternalIO(
 	ctx context.Context, usage multitenant.ExternalIOUsage,
 ) {
+}
+
+func (noopTenantSideCostController) GetCPUMovingAvg() float64 {
+	return 0
+}
+
+func (noopTenantSideCostController) GetCostConfig() *tenantcostmodel.Config {
+	return nil
 }

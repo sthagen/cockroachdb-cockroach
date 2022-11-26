@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -490,6 +491,9 @@ UPDATE system.namespace SET id = %d WHERE id = %d;
 					` referenced table ID %d: referenced descriptor not found`,
 				tableTblID, tableFkTblID, tableFkTblID),
 		},
+		{fmt.Sprintf("%d", tableNoJobID), "defaultdb", "public", "nojob",
+			fmt.Sprintf(`relation "nojob" (%d): unknown mutation ID 0 associated with job ID 123456`, tableNoJobID),
+		},
 		{fmt.Sprintf("%d", tableNoJobID), "defaultdb", "public", "nojob", `mutation job 123456: job not found`},
 		{fmt.Sprintf("%d", schemaID), fmt.Sprintf("[%d]", databaseID), "public", "",
 			fmt.Sprintf(`schema "public" (%d): referenced database ID %d: referenced descriptor not found`, schemaID, databaseID),
@@ -794,6 +798,10 @@ func TestInternalJobsTableRetryColumns(t *testing.T) {
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: &jobs.TestingKnobs{
 						DisableAdoptions: true,
+					},
+					// DisableAdoptions needs this.
+					UpgradeManager: &upgradebase.TestingKnobs{
+						DontUseJobs: true,
 					},
 				},
 			})

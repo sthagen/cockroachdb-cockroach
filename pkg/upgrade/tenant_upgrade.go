@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/logtags"
 )
 
@@ -47,7 +48,7 @@ type TenantDeps struct {
 		Default roachpb.SpanConfig
 	}
 
-	TestingKnobs              *TestingKnobs
+	TestingKnobs              *upgradebase.TestingKnobs
 	SchemaResolverConstructor func( // A constructor that returns a schema resolver for `descriptors` in `currDb`.
 		txn *kv.Txn, descriptors *descs.Collection, currDb string,
 	) (resolver.SchemaResolver, func(), error)
@@ -55,7 +56,13 @@ type TenantDeps struct {
 
 // TenantUpgradeFunc is used to perform sql-level upgrades. It may be run from
 // any tenant.
-type TenantUpgradeFunc func(context.Context, clusterversion.ClusterVersion, TenantDeps, *jobs.Job) error
+//
+// NOTE: The upgrade func runs inside a job, and the job can in principle be
+// used to checkpoint the upgrade's progress ergonomically. The tenant func used
+// to take a reference to the job running it for this purpose, but it was
+// removed because it was no longer used and because of testing complications.
+// It can be added back, though, if some upgrade needs it again.
+type TenantUpgradeFunc func(context.Context, clusterversion.ClusterVersion, TenantDeps) error
 
 // PreconditionFunc is a function run without isolation before attempting an
 // upgrade that includes this upgrade. It is used to verify that the
@@ -69,23 +76,27 @@ type PreconditionFunc func(context.Context, clusterversion.ClusterVersion, Tenan
 // sql. It includes the system tenant.
 type TenantUpgrade struct {
 	upgrade
-	fn           TenantUpgradeFunc
+	fn TenantUpgradeFunc
+	// precondition is executed before fn. Note that permanent upgrades (see
+	// upgrade.permanent) cannot have preconditions.
 	precondition PreconditionFunc
 }
 
-var _ Upgrade = (*TenantUpgrade)(nil)
+var _ upgradebase.Upgrade = (*TenantUpgrade)(nil)
+
+// NoPrecondition can be used with NewTenantUpgrade to signify that the
+// respective upgrade does not need any preconditions checked.
+var NoPrecondition PreconditionFunc = nil
 
 // NewTenantUpgrade constructs a TenantUpgrade.
 func NewTenantUpgrade(
-	description string,
-	cv clusterversion.ClusterVersion,
-	precondition PreconditionFunc,
-	fn TenantUpgradeFunc,
+	description string, v roachpb.Version, precondition PreconditionFunc, fn TenantUpgradeFunc,
 ) *TenantUpgrade {
 	m := &TenantUpgrade{
 		upgrade: upgrade{
 			description: description,
-			cv:          cv,
+			v:           v,
+			permanent:   false,
 		},
 		fn:           fn,
 		precondition: precondition,
@@ -93,12 +104,27 @@ func NewTenantUpgrade(
 	return m
 }
 
+// NewPermanentTenantUpgrade constructs a TenantUpgrade marked as "permanent":
+// an upgrade that will run regardless of the cluster's bootstrap version.
+func NewPermanentTenantUpgrade(
+	description string, v roachpb.Version, fn TenantUpgradeFunc,
+) *TenantUpgrade {
+	m := &TenantUpgrade{
+		upgrade: upgrade{
+			description: description,
+			v:           v,
+			permanent:   true,
+		},
+		fn:           fn,
+		precondition: nil,
+	}
+	return m
+}
+
 // Run kick-starts the actual upgrade process for tenant-level upgrades.
-func (m *TenantUpgrade) Run(
-	ctx context.Context, cv clusterversion.ClusterVersion, d TenantDeps, job *jobs.Job,
-) error {
-	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s", cv), nil)
-	return m.fn(ctx, cv, d, job)
+func (m *TenantUpgrade) Run(ctx context.Context, v roachpb.Version, d TenantDeps) error {
+	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s", v), nil)
+	return m.fn(ctx, clusterversion.ClusterVersion{Version: v}, d)
 }
 
 // Precondition runs the precondition check if there is one and reports
@@ -107,5 +133,8 @@ func (m *TenantUpgrade) Precondition(
 	ctx context.Context, cv clusterversion.ClusterVersion, d TenantDeps,
 ) error {
 	ctx = logtags.AddTag(ctx, fmt.Sprintf("upgrade=%s,precondition", cv), nil)
-	return m.precondition(ctx, cv, d)
+	if m.precondition != nil {
+		return m.precondition(ctx, cv, d)
+	}
+	return nil
 }

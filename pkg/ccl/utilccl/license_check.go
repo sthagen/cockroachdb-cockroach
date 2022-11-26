@@ -15,11 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -70,7 +69,23 @@ var errEnterpriseRequired = pgerror.New(pgcode.CCLValidLicenseRequired,
 type licenseCacheKey string
 
 // TestingEnableEnterprise allows overriding the license check in tests.
+//
+// Prefer using ccl.TestingEnableEnterprise instead when that's possible without
+// introducing a dependency cycle. This function is useful for packages that
+// can't import `ccl` without introducing a dependency cycle. However, it panics
+// if package `ccl` (which, in turn, imports all the other ccl/... packages)
+// wasn't linked into the binary. In tests, generally the right thing to do is
+// to import `ccl` from a file in the `foo_test` pkg (for example,
+// main_test.go). Frequently, calling ccl.TestingEnableEnterprise in TestMain is
+// used to enable the license for the tests in a whole package, so this
+// utilccl.TestingEnableEnterprise is not frequently used. Even if this function
+// didn't panic, CheckEnterpriseEnabled will panic if not all the CCL code is
+// linked in, so callers of this function would likely just have the panic
+// kicked down the road to the check call.
 func TestingEnableEnterprise() func() {
+	if !AllCCLCodeImported {
+		panic("not all ccl code imported")
+	}
 	before := atomic.LoadInt32(&enterpriseStatus)
 	atomic.StoreInt32(&enterpriseStatus, enterpriseEnabled)
 	return func() {
@@ -112,10 +127,11 @@ func ApplyTenantLicense() error {
 // IsEnterpriseEnabled() instead.
 //
 // The ClusterID argument should be the tenant-specific logical
-// cluster ID. is not used for the check itself; it is merely embedded
+// cluster ID.
+// `feature` is not used for the check itself; it is merely embedded
 // in the URL displayed in the error message.
-func CheckEnterpriseEnabled(st *cluster.Settings, cluster uuid.UUID, org, feature string) error {
-	return checkEnterpriseEnabledAt(st, timeutil.Now(), cluster, org, feature, true /* withDetails */)
+func CheckEnterpriseEnabled(st *cluster.Settings, cluster uuid.UUID, feature string) error {
+	return checkEnterpriseEnabledAt(st, timeutil.Now(), cluster, feature, true /* withDetails */)
 }
 
 // IsEnterpriseEnabled returns whether the requested enterprise feature is
@@ -124,18 +140,12 @@ func CheckEnterpriseEnabled(st *cluster.Settings, cluster uuid.UUID, org, featur
 // hot paths.
 //
 // The ClusterID argument should be the tenant-specific logical
-// cluster ID. is not used for the check itself; it is merely embedded
+// cluster ID.
+// `feature` is not used for the check itself; it is merely embedded
 // in the URL displayed in the error message.
-func IsEnterpriseEnabled(st *cluster.Settings, cluster uuid.UUID, org, feature string) bool {
+func IsEnterpriseEnabled(st *cluster.Settings, cluster uuid.UUID, feature string) bool {
 	return checkEnterpriseEnabledAt(
-		st, timeutil.Now(), cluster, org, feature, false /* withDetails */) == nil
-}
-
-func init() {
-	base.CheckEnterpriseEnabled = CheckEnterpriseEnabled
-	base.LicenseType = getLicenseType
-	base.UpdateMetricOnLicenseChange = UpdateMetricOnLicenseChange
-	server.ApplyTenantLicense = ApplyTenantLicense
+		st, timeutil.Now(), cluster, feature, false /* withDetails */) == nil
 }
 
 var licenseMetricUpdateFrequency = 1 * time.Minute
@@ -183,8 +193,12 @@ func updateMetricWithLicenseTTL(
 	metric.Update(int64(sec))
 }
 
+// AllCCLCodeImported is set by the `ccl` pkg in an init(), thereby
+// demonstrating that we're in a binary that has all off the CCL code linked in.
+var AllCCLCodeImported = false
+
 func checkEnterpriseEnabledAt(
-	st *cluster.Settings, at time.Time, cluster uuid.UUID, org, feature string, withDetails bool,
+	st *cluster.Settings, at time.Time, cluster uuid.UUID, feature string, withDetails bool,
 ) error {
 	if atomic.LoadInt32(&enterpriseStatus) == enterpriseEnabled {
 		return nil
@@ -193,7 +207,31 @@ func checkEnterpriseEnabledAt(
 	if err != nil {
 		return err
 	}
-	return check(license, at, cluster, org, feature, withDetails)
+	org := sql.ClusterOrganization.Get(&st.SV)
+	if err := check(license, at, cluster, org, feature, withDetails); err != nil {
+		return err
+	}
+
+	// Make sure all CCL code was imported.
+	if !AllCCLCodeImported {
+		// In production, this shouldn't happen: a binary that has `utilccl` linked
+		// in will also have `ccl` linked in - which imports all the other ccl/...
+		// packages and sets AllCCLCodeImported. However, in tests, one can write a
+		// test that imports `utilccl`, without the broader `ccl`. In that case, we
+		// panic here, forcing the test to link `ccl` in the binary (for example,
+		// through importing `ccl` in the `foo_test` pkg, perhaps in
+		// `main_test.go`). Declaring that "enterprise is enabled" when some CCL
+		// functionality is not linked in would be very confusing - the server code
+		// can try to use CCL features that are not available.
+		//
+		// Since this function cannot be used if `ccl` was not imported, the
+		// function should arguably live in the `ccl` pkg. However, `ccl` imports
+		// everything, and this function must be used from different packages that,
+		// thus, cannot depend on `ccl`. AllCCLCodeImported is used to break the
+		// dependency cycle.
+		panic("not all ccl imported, but license checked")
+	}
+	return nil
 }
 
 // getLicense fetches the license from the given settings, using Settings.Cache
@@ -216,7 +254,7 @@ func getLicense(st *cluster.Settings) (*licenseccl.License, error) {
 	return license, nil
 }
 
-func getLicenseType(st *cluster.Settings) (string, error) {
+func GetLicenseType(st *cluster.Settings) (string, error) {
 	license, err := getLicense(st)
 	if err != nil {
 		return "", err

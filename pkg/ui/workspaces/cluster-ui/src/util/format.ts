@@ -225,7 +225,17 @@ export const limitStringArray = (arr: string[], limit: number): string => {
     return limitText(arr[0], limit);
   }
 
-  return arr[0].concat("...");
+  let str = arr[0];
+  for (let next = 1; next < arr.length; ++next) {
+    const charsLeft = limit - str.length;
+    if (charsLeft < arr[next].length) {
+      str += arr[next].substring(0, charsLeft).concat("...");
+      break;
+    }
+    str += arr[next];
+  }
+
+  return str;
 };
 
 function add(a: string, b: string): string {
@@ -254,6 +264,21 @@ export function HexStringToInt64String(s: string): string {
     }
   });
   return dec;
+}
+
+// FixFingerprintHexValue adds the leading 0 on strings with hex value that
+// have a length < 16. This can occur because it was returned like this from the DB
+// or because the hex value was generated using `.toString(16)` (which removes the
+// leading zeros).
+// The zeros need to be added back to match the value on our sql stats tables.
+export function FixFingerprintHexValue(s: string): string {
+  if (s === undefined || s === null || s.length === 0) {
+    return "";
+  }
+  while (s.length < 16) {
+    s = `0${s}`;
+  }
+  return s;
 }
 
 // capitalize capitalizes a string.

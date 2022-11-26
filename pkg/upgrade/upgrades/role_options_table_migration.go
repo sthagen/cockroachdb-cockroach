@@ -13,12 +13,9 @@ package upgrades
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -39,14 +36,14 @@ ALTER TABLE system.role_options ALTER COLUMN "user_id" SET NOT NULL
 `
 
 func alterSystemRoleOptionsAddUserIDColumnWithIndex(
-	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
+	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps,
 ) error {
 	for _, op := range []operation{
 		{
 			name:           "add-system-role-options-user-id-column",
 			schemaList:     []string{"user_id"},
 			query:          addUserIDColumnToRoleOptions,
-			schemaExistsFn: hasColumn,
+			schemaExistsFn: columnExists,
 		},
 		{
 			name:           "alter-system-role-options-add-index",
@@ -64,7 +61,7 @@ func alterSystemRoleOptionsAddUserIDColumnWithIndex(
 }
 
 func backfillSystemRoleOptionsIDColumn(
-	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
+	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps,
 ) error {
 	row, err := d.InternalExecutor.QueryRowEx(ctx, `get-num-null-user-ids`, nil, sessiondata.NodeUserSessionDataOverride,
 		`SELECT count(1) FROM system.role_options WHERE user_id IS NULL`)
@@ -98,22 +95,13 @@ UPDATE system.role_options
 }
 
 func setSystemRoleOptionsUserIDColumnNotNull(
-	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
+	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps,
 ) error {
 	op := operation{
-		name:       "alter-system-role-options-user-id-column-not-null",
-		schemaList: []string{"user_id"},
-		query:      updateUserIDColumnRoleOptionsSetNotNull,
-		schemaExistsFn: func(storedTable, _ catalog.TableDescriptor, colName string) (bool, error) {
-			storedCol, err := storedTable.FindColumnWithName(tree.Name(colName))
-			if err != nil {
-				if strings.Contains(err.Error(), "does not exist") {
-					return false, nil
-				}
-				return false, err
-			}
-			return !storedCol.IsNullable(), nil
-		},
+		name:           "alter-system-role-options-user-id-column-not-null",
+		schemaList:     []string{"user_id"},
+		query:          updateUserIDColumnRoleOptionsSetNotNull,
+		schemaExistsFn: columnExistsAndIsNotNull,
 	}
 	return migrateTable(ctx, cs, d, op, keys.RoleOptionsTableID, systemschema.RoleOptionsTable)
 }

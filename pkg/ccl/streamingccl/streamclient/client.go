@@ -12,9 +12,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -41,14 +40,14 @@ type CheckpointToken []byte
 
 // Client provides a way for the stream ingestion job to consume a
 // specified stream.
-// TODO(57427): The stream client does not yet support the concept of
 //
-//	generations in a stream.
+// TODO(57427): The stream client does not yet support the concept of
+// generations in a stream.
 type Client interface {
 	// Create initializes a stream with the source, potentially reserving any
 	// required resources, such as protected timestamps, and returns an ID which
 	// can be used to interact with this stream in the future.
-	Create(ctx context.Context, tenantID roachpb.TenantID) (streaming.StreamID, error)
+	Create(ctx context.Context, tenant roachpb.TenantName) (streampb.StreamID, error)
 
 	// Dial checks if the source is able to be connected to for queries
 	Dial(ctx context.Context) error
@@ -63,13 +62,13 @@ type Client interface {
 	// TODO(dt): ts -> checkpointToken.
 	Heartbeat(
 		ctx context.Context,
-		streamID streaming.StreamID,
+		streamID streampb.StreamID,
 		consumed hlc.Timestamp,
 	) (streampb.StreamReplicationStatus, error)
 
 	// Plan returns a Topology for this stream.
 	// TODO(dt): separate target argument from address argument.
-	Plan(ctx context.Context, streamID streaming.StreamID) (Topology, error)
+	Plan(ctx context.Context, streamID streampb.StreamID) (Topology, error)
 
 	// Subscribe opens and returns a subscription for the specified partition from
 	// the specified remote address. This is used by each consumer processor to
@@ -77,7 +76,7 @@ type Client interface {
 	// TODO(dt): ts -> checkpointToken.
 	Subscribe(
 		ctx context.Context,
-		streamID streaming.StreamID,
+		streamID streampb.StreamID,
 		spec SubscriptionToken,
 		checkpoint hlc.Timestamp,
 	) (Subscription, error)
@@ -86,17 +85,23 @@ type Client interface {
 	Close(ctx context.Context) error
 
 	// Complete completes a replication stream consumption.
-	Complete(ctx context.Context, streamID streaming.StreamID, successfulIngestion bool) error
+	Complete(ctx context.Context, streamID streampb.StreamID, successfulIngestion bool) error
 }
 
 // Topology is a configuration of stream partitions. These are particular to a
 // stream. It specifies the number and addresses of partitions of the stream.
-type Topology []PartitionInfo
+//
+// The topology also contains the tenant ID of the tenant whose keys are being
+// streamed over the partitions.
+type Topology struct {
+	Partitions     []PartitionInfo
+	SourceTenantID roachpb.TenantID
+}
 
 // StreamAddresses returns the list of source addresses in a topology
 func (t Topology) StreamAddresses() []string {
 	var addresses []string
-	for _, partition := range t {
+	for _, partition := range t.Partitions {
 		addresses = append(addresses, string(partition.SrcAddr))
 	}
 	return addresses
@@ -105,6 +110,7 @@ func (t Topology) StreamAddresses() []string {
 // PartitionInfo describes a partition of a replication stream, i.e. a set of key
 // spans in a source cluster in which changes will be emitted.
 type PartitionInfo struct {
+	// ID is the stringified source instance ID.
 	ID string
 	SubscriptionToken
 	SrcInstanceID int

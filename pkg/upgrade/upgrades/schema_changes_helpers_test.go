@@ -15,13 +15,14 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 )
+
+type SchemaChangeTestMigrationFunc func() (m upgrade.TenantUpgradeFunc, expectedTableDescriptor *atomic.Value)
 
 const (
 	// TestingAddColsQuery is used by TestMigrationWithFailures.
@@ -46,7 +47,7 @@ func MakeFakeMigrationForTestMigrationWithFailures() (
 ) {
 	expectedTableDescriptor = &atomic.Value{}
 	return func(
-		ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
+		ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps,
 	) error {
 		row, err := d.InternalExecutor.QueryRow(ctx, "look-up-id", nil, /* txn */
 			`select id from system.namespace where name = $1`, "test_table")
@@ -76,3 +77,60 @@ func MakeFakeMigrationForTestMigrationWithFailures() (
 		return nil
 	}, expectedTableDescriptor
 }
+
+var _ SchemaChangeTestMigrationFunc = MakeFakeMigrationForTestMigrationWithFailures
+
+const (
+	// TestingAddNewColStmt is used by TestMigrationWithFailuresMultipleAltersOnSameColumn.
+	TestingAddNewColStmt = `
+ALTER TABLE test.test_table
+ADD COLUMN user_id OID
+`
+
+	// TestingAlterNewColStmt is used by TestMigrationWithFailuresMultipleAltersOnSameColumn.
+	TestingAlterNewColStmt = `
+ALTER TABLE test.test_table
+ALTER COLUMN user_id SET NOT NULL
+`
+)
+
+// MakeFakeMigrationForTestMigrationWithFailuresMultipleAltersOnSameColumn makes the
+// migration function used in TestMigrationWithFailuresMultipleAltersOnSameColumn.
+func MakeFakeMigrationForTestMigrationWithFailuresMultipleAltersOnSameColumn() (
+	m upgrade.TenantUpgradeFunc,
+	expectedTableDescriptor *atomic.Value,
+) {
+	expectedTableDescriptor = &atomic.Value{}
+	return func(
+		ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps,
+	) error {
+		row, err := d.InternalExecutor.QueryRow(ctx, "look-up-id", nil, /* txn */
+			`select id from system.namespace where name = $1`, "test_table")
+		if err != nil {
+			return err
+		}
+		tableID := descpb.ID(tree.MustBeDInt(row[0]))
+		for _, op := range []operation{
+			{
+				name:           "add-user-id-column",
+				schemaList:     []string{"user_id"},
+				query:          TestingAddNewColStmt,
+				schemaExistsFn: columnExists,
+			},
+			{
+				name:           "alter-user-id-column",
+				schemaList:     []string{"user_id"},
+				query:          TestingAlterNewColStmt,
+				schemaExistsFn: columnExistsAndIsNotNull,
+			},
+		} {
+			expected := expectedTableDescriptor.Load().(catalog.TableDescriptor)
+			if err := migrateTable(ctx, cs, d, op, tableID, expected); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, expectedTableDescriptor
+}
+
+var _ SchemaChangeTestMigrationFunc = MakeFakeMigrationForTestMigrationWithFailuresMultipleAltersOnSameColumn

@@ -101,7 +101,8 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
            "sqDiff": {{.Float}}
          },
          "nodes": [{{joinInts .IntArray}}],
-         "planGists": [{{joinStrings .StringArray}}]
+         "planGists": [{{joinStrings .StringArray}}],
+         "indexes": [{{joinStrings .StringArray}}]
        },
        "execution_statistics": {
          "cnt": {{.Int64}},
@@ -395,7 +396,8 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
   "fullScanCount": {{.Int64}},
   "totalCount": {{.Int64}},
   "db": [{{joinStrings .StringArray}}],
-  "appNames": [{{joinStrings .StringArray}}]
+  "appNames": [{{joinStrings .StringArray}}],
+  "fingerprintID": "{{.String}}"
 }
 		 `
 		expectedAggregatedMetadataStr := fillTemplate(t, expectedAggregatedMetadataStrTemplate, data)

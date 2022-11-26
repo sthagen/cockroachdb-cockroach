@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-import React, { useContext, useMemo } from "react";
+import React, { useContext, useMemo, useState } from "react";
 import { Col, Row } from "antd";
 import {
   InsightsSortedTable,
@@ -16,13 +16,7 @@ import {
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { capitalize, Duration } from "src/util";
 import { DATE_FORMAT_24_UTC } from "src/util/format";
-import {
-  executionDetails,
-  InsightNameEnum,
-  InsightRecommendation,
-  StatementInsightEvent,
-} from "../types";
-import { populateStatementInsightsFromProblemAndCauses } from "../utils";
+import { FlattenedStmtInsightEvent } from "../types";
 import classNames from "classnames/bind";
 import { CockroachCloudContext } from "../../contexts";
 
@@ -37,88 +31,18 @@ import {
   TransactionDetailsLink,
 } from "../workloadInsights/util";
 import { TimeScale } from "../../timeScaleDropdown";
+import { getStmtInsightRecommendations } from "../utils";
+import { ContentionStatementDetailsTable } from "./insightDetailsTables";
+import { WaitTimeInsightsLabels } from "../../detailsPanels/waitTimeInsightsPanel";
+import { Heading } from "@cockroachlabs/ui-components";
+import { SortSetting } from "../../sortedtable";
 
 const cx = classNames.bind(insightsDetailsStyles);
 const tableCx = classNames.bind(insightTableStyles);
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 
-const insightsTableData = (
-  insightDetails: StatementInsightEvent | null,
-): InsightRecommendation[] => {
-  if (!insightDetails) return [];
-
-  const recs: InsightRecommendation[] = [];
-  let rec: InsightRecommendation;
-  const execDetails: executionDetails = {
-    statement: insightDetails.query,
-    fingerprintID: insightDetails.statementFingerprintID,
-    retries: insightDetails.retries,
-  };
-  insightDetails.insights.forEach(insight => {
-    switch (insight.name) {
-      case InsightNameEnum.highContention:
-        rec = {
-          type: "HighContention",
-          execution: execDetails,
-          details: {
-            duration: insightDetails.elapsedTimeMillis,
-            description: insight.description,
-          },
-        };
-        break;
-      case InsightNameEnum.failedExecution:
-        rec = {
-          type: "FailedExecution",
-        };
-        break;
-      case InsightNameEnum.highRetryCount:
-        rec = {
-          type: "HighRetryCount",
-          execution: execDetails,
-          details: {
-            description: insight.description,
-          },
-        };
-        break;
-      case InsightNameEnum.planRegression:
-        rec = {
-          type: "PlanRegression",
-          execution: execDetails,
-          details: {
-            description: insight.description,
-          },
-        };
-        break;
-      case InsightNameEnum.suboptimalPlan:
-        rec = {
-          type: "SuboptimalPlan",
-          database: insightDetails.databaseName,
-          execution: {
-            ...execDetails,
-            indexRecommendations: insightDetails.indexRecommendations,
-          },
-          details: {
-            description: insight.description,
-          },
-        };
-        break;
-      default:
-        rec = {
-          type: "Unknown",
-          details: {
-            duration: insightDetails.elapsedTimeMillis,
-            description: insight.description,
-          },
-        };
-        break;
-    }
-    recs.push(rec);
-  });
-  return recs;
-};
-
 export interface StatementInsightDetailsOverviewTabProps {
-  insightEventDetails: StatementInsightEvent;
+  insightEventDetails: FlattenedStmtInsightEvent;
   setTimeScale: (ts: TimeScale) => void;
 }
 
@@ -132,12 +56,41 @@ export const StatementInsightDetailsOverviewTab: React.FC<
     [isCockroachCloud],
   );
 
-  const insightDetailsArr = useMemo(
-    () => populateStatementInsightsFromProblemAndCauses([insightEventDetails]),
-    [insightEventDetails],
-  );
-  const insightDetails = insightDetailsArr.length ? insightDetailsArr[0] : null;
-  const tableData = insightsTableData(insightDetails);
+  const insightDetails = insightEventDetails;
+  const tableData = getStmtInsightRecommendations(insightDetails);
+
+  const [
+    insightsDetailsContentionSortSetting,
+    setDetailsContentionSortSetting,
+  ] = useState<SortSetting>({
+    ascending: false,
+    columnTitle: "duration",
+  });
+  let contentionTable: JSX.Element = null;
+  if (insightDetails.contentionEvents != null) {
+    contentionTable = (
+      <Row gutter={24} className={tableCx("margin-bottom")}>
+        <Col className="gutter-row">
+          <Heading type="h5">
+            {WaitTimeInsightsLabels.BLOCKED_TXNS_TABLE_TITLE(
+              insightDetails.statementExecutionID,
+              "statement",
+            )}
+          </Heading>
+          <ContentionStatementDetailsTable
+            data={insightDetails.contentionEvents}
+            sortSetting={insightsDetailsContentionSortSetting}
+            onChangeSortSetting={setDetailsContentionSortSetting}
+          />
+        </Col>
+      </Row>
+    );
+  }
+
+  const [insightsSortSetting, setInsightsSortSetting] = useState<SortSetting>({
+    ascending: false,
+    columnTitle: "Insights",
+  });
 
   return (
     <section className={cx("section")}>
@@ -201,7 +154,7 @@ export const StatementInsightDetailsOverviewTab: React.FC<
             />
             <SummaryCardItem
               label="Transaction Execution ID"
-              value={String(insightDetails.transactionID)}
+              value={String(insightDetails.transactionExecutionID)}
             />
             <SummaryCardItem
               label="Statement Fingerprint ID"
@@ -212,9 +165,15 @@ export const StatementInsightDetailsOverviewTab: React.FC<
       </Row>
       <Row gutter={24} className={tableCx("margin-bottom")}>
         <Col>
-          <InsightsSortedTable columns={insightsColumns} data={tableData} />
+          <InsightsSortedTable
+            sortSetting={insightsSortSetting}
+            onChangeSortSetting={setInsightsSortSetting}
+            columns={insightsColumns}
+            data={tableData}
+          />
         </Col>
       </Row>
+      {contentionTable}
     </section>
   );
 };

@@ -76,8 +76,8 @@ import TransactionDetails from "src/views/transactions/transactionDetails";
 import StatementsDiagnosticsHistoryView from "src/views/reports/containers/statementDiagnosticsHistory";
 import { RedirectToStatementDetails } from "src/routes/RedirectToStatementDetails";
 import HotRangesPage from "src/views/hotRanges/index";
-import ActiveStatementDetails from "./views/statements/activeStatementDetailsConnected";
-import ActiveTransactionDetails from "./views/transactions/activeTransactionDetailsConnected";
+import RecentStatementDetails from "./views/statements/recentStatementDetailsConnected";
+import RecentTransactionDetails from "./views/transactions/recentTransactionDetailsConnected";
 import "styl/app.styl";
 import { Tracez } from "src/views/tracez/tracez";
 import SnapshotPage from "src/views/tracez_v2/snapshotPage";
@@ -220,13 +220,13 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   <Route
                     exact
                     path={`/execution/statement/:${executionIdAttr}`}
-                    component={ActiveStatementDetails}
+                    component={RecentStatementDetails}
                   />
 
                   <Route
                     exact
                     path={`/execution/transaction/:${executionIdAttr}`}
-                    component={ActiveTransactionDetails}
+                    component={RecentTransactionDetails}
                   />
 
                   {/* statement statistics */}
@@ -312,11 +312,11 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                     component={InsightsOverviewPage}
                   />
                   <Route
-                    path={"/insights/transaction/:id"}
+                    path={`/insights/transaction/:${executionIdAttr}`}
                     component={TransactionInsightDetailsPage}
                   />
                   <Route
-                    path={"/insights/statement/:id"}
+                    path={`/insights/statement/:${executionIdAttr}`}
                     component={StatementInsightDetailsPage}
                   />
 
@@ -330,7 +330,12 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                   />
                   <Route
                     exact
-                    path="/debug/tracez_v2/snapshot/:snapshotID"
+                    path="/debug/tracez_v2/node/:nodeID"
+                    component={SnapshotPage}
+                  />
+                  <Route
+                    exact
+                    path="/debug/tracez_v2/node/:nodeID/snapshot/:snapshotID"
                     component={SnapshotPage}
                   />
                   <Route exact path="/debug/redux" component={ReduxDebug} />

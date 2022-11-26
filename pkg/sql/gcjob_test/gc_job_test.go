@@ -344,7 +344,7 @@ func TestGCResumer(t *testing.T) {
 		job, err := jobRegistry.LoadJob(ctx, sj.ID())
 		require.NoError(t, err)
 		require.Equal(t, jobs.StatusSucceeded, job.Status())
-		_, err = sql.GetTenantRecord(ctx, &execCfg, nil /* txn */, tenID)
+		_, err = sql.GetTenantRecordByID(ctx, &execCfg, nil /* txn */, roachpb.MustMakeTenantID(tenID))
 		require.EqualError(t, err, `tenant "10" does not exist`)
 		progress := job.Progress()
 		require.Equal(t, jobspb.SchemaChangeGCProgress_CLEARED, progress.GetSchemaChangeGC().Tenant.Status)
@@ -372,7 +372,7 @@ func TestGCResumer(t *testing.T) {
 		job, err := jobRegistry.LoadJob(ctx, sj.ID())
 		require.NoError(t, err)
 		require.Equal(t, jobs.StatusSucceeded, job.Status())
-		_, err = sql.GetTenantRecord(ctx, &execCfg, nil /* txn */, tenID)
+		_, err = sql.GetTenantRecordByID(ctx, &execCfg, nil /* txn */, roachpb.MustMakeTenantID(tenID))
 		require.EqualError(t, err, `tenant "10" does not exist`)
 		progress := job.Progress()
 		require.Equal(t, jobspb.SchemaChangeGCProgress_CLEARED, progress.GetSchemaChangeGC().Tenant.Status)
@@ -421,14 +421,14 @@ func TestGCTenant(t *testing.T) {
 		dropTenID        = 11
 		nonexistentTenID = 12
 	)
-	require.NoError(t, sql.CreateTenantRecord(ctx, &execCfg, nil, &descpb.TenantInfoWithUsage{
+	_, err := sql.CreateTenantRecord(ctx, &execCfg, nil, &descpb.TenantInfoWithUsage{
 		TenantInfo: descpb.TenantInfo{ID: activeTenID},
-	}, execCfg.DefaultZoneConfig),
-	)
-	require.NoError(t, sql.CreateTenantRecord(ctx, &execCfg, nil, &descpb.TenantInfoWithUsage{
+	}, execCfg.DefaultZoneConfig)
+	require.NoError(t, err)
+	_, err = sql.CreateTenantRecord(ctx, &execCfg, nil, &descpb.TenantInfoWithUsage{
 		TenantInfo: descpb.TenantInfo{ID: dropTenID, State: descpb.TenantInfo_DROP},
-	}, execCfg.DefaultZoneConfig),
-	)
+	}, execCfg.DefaultZoneConfig)
+	require.NoError(t, err)
 
 	t.Run("unexpected progress state", func(t *testing.T) {
 		progress := &jobspb.SchemaChangeGCProgress{
@@ -463,7 +463,7 @@ func TestGCTenant(t *testing.T) {
 		require.EqualError(
 			t,
 			gcClosure(dropTenID, progress),
-			`GC state for tenant id:11 state:DROP name:"" is DELETED yet the tenant row still exists`,
+			`GC state for tenant id:11 state:DROP name:"" dropped_name:"" tenant_replication_job_id:0 is DELETED yet the tenant row still exists`,
 		)
 	})
 
@@ -488,7 +488,7 @@ func TestGCTenant(t *testing.T) {
 		}
 
 		descKey := catalogkeys.MakeDescMetadataKey(
-			keys.MakeSQLCodec(roachpb.MakeTenantID(dropTenID)), keys.NamespaceTableID,
+			keys.MakeSQLCodec(roachpb.MustMakeTenantID(dropTenID)), keys.NamespaceTableID,
 		)
 		require.NoError(t, kvDB.Put(ctx, descKey, "foo"))
 
@@ -500,7 +500,7 @@ func TestGCTenant(t *testing.T) {
 
 		require.NoError(t, gcClosure(dropTenID, progress))
 		require.Equal(t, jobspb.SchemaChangeGCProgress_CLEARED, progress.Tenant.Status)
-		_, err = sql.GetTenantRecord(ctx, &execCfg, nil /* txn */, dropTenID)
+		_, err = sql.GetTenantRecordByID(ctx, &execCfg, nil /* txn */, roachpb.MustMakeTenantID(dropTenID))
 		require.EqualError(t, err, `tenant "11" does not exist`)
 		require.NoError(t, gcClosure(dropTenID, progress))
 

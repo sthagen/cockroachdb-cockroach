@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -64,6 +65,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigptsreader"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigreporter"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/catalog/schematelemetry" // register schedules declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
@@ -87,6 +89,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesciter"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/schedulerlatency"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -535,7 +538,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 				if !serverrangefeed.RangefeedBudgetsEnabled.Get(&st.SV) {
 					return 0
 				}
-				if raftCmdLimit := kvserver.MaxCommandSize.Get(&st.SV); raftCmdLimit > limit {
+				if raftCmdLimit := kvserverbase.MaxCommandSize.Get(&st.SV); raftCmdLimit > limit {
 					return raftCmdLimit
 				}
 				return limit
@@ -570,6 +573,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		// kvAccessor powers the span configuration RPCs and the host tenant's
 		// reconciliation job.
 		kvAccessor spanconfig.KVAccessor
+		// reporter is used to report over span config conformance.
+		reporter spanconfig.Reporter
 		// subscriber is used by stores to subscribe to span configuration updates.
 		subscriber spanconfig.KVSubscriber
 		// kvAccessorForTenantRecords is when creating/destroying secondary
@@ -620,12 +625,23 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			spanConfigKnobs,
 		)
 		spanConfig.kvAccessor, spanConfig.kvAccessorForTenantRecords = scKVAccessor, scKVAccessor
+		spanConfig.reporter = spanconfigreporter.New(
+			nodeLiveness,
+			storePool,
+			spanConfig.subscriber,
+			rangedesciter.New(db),
+			cfg.Settings,
+			spanConfigKnobs,
+		)
 	} else {
 		// If the spanconfigs infrastructure is disabled, there should be no
 		// reconciliation jobs or RPCs issued against the infrastructure. Plug
 		// in a disabled spanconfig.KVAccessor that would error out for
 		// unexpected use.
 		spanConfig.kvAccessor = spanconfigkvaccessor.DisabledKVAccessor
+
+		// Ditto for the spanconfig.Reporter.
+		spanConfig.reporter = spanconfigreporter.DisabledReporter
 
 		// Use a no-op accessor where tenant records are created/destroyed.
 		spanConfig.kvAccessorForTenantRecords = spanconfigkvaccessor.NoopKVAccessor
@@ -726,6 +742,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		tenantUsage,
 		tenantSettingsWatcher,
 		spanConfig.kvAccessor,
+		spanConfig.reporter,
 	)
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
@@ -803,6 +820,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		closedSessionCache,
 		remoteFlowRunner,
 		internalExecutor,
+		spanConfig.reporter,
 	)
 
 	// Instantiate the KV prober.
@@ -1637,15 +1655,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		}
 	}
 	// Start garbage collecting system events.
-	//
-	// NB: As written, this falls awkwardly between SQL and KV. KV is used only
-	// to make sure this runs only on one node. SQL is used to actually GC. We
-	// count it as a KV operation since it grooms cluster-wide data, not
-	// something associated to SQL tenants.
-	s.startSystemLogsGC(workersCtx)
-
-	// Begin an async task to periodically purge old sessions in the system.web_sessions table.
-	if err = startPurgeOldSessions(workersCtx, s.authentication); err != nil {
+	if err := startSystemLogsGC(workersCtx, s.sqlServer); err != nil {
 		return err
 	}
 
@@ -1663,7 +1673,6 @@ func (s *Server) PreStart(ctx context.Context) error {
 			admin:            s.admin,
 			status:           s.status,
 			promRuleExporter: s.promRuleExporter,
-			tenantID:         roachpb.SystemTenantID,
 			sqlServer:        s.sqlServer,
 			db:               s.db,
 		}), /* apiServer */
@@ -1723,8 +1732,9 @@ func (s *Server) PreStart(ctx context.Context) error {
 	s.ctSender.Run(workersCtx, state.nodeID)
 
 	// Attempt to upgrade cluster version now that the sql server has been
-	// started. At this point we know that all startupmigrations have successfully
-	// been run so it is safe to upgrade to the binary's current version.
+	// started. At this point we know that all startupmigrations and permanent
+	// upgrades have successfully been run so it is safe to upgrade to the
+	// binary's current version.
 	//
 	// NB: We run this under the startup ctx (not workersCtx) so as to ensure
 	// all the upgrade steps are traced, for use during troubleshooting.

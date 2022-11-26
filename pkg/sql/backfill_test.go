@@ -22,21 +22,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// constraintToUpdateForTest implements the catalog.ConstraintToUpdate interface.
+// constraintToUpdateForTest implements the catalog.Constraint interface.
 // It's only used for testing
 type constraintToUpdateForTest struct {
-	catalog.ConstraintToUpdate
+	catalog.Constraint
 	desc *descpb.ConstraintToUpdate
 }
 
-// IsCheck returns true iff this is an update for a check constraint.
-func (c constraintToUpdateForTest) IsCheck() bool {
-	return c.desc.ConstraintType == descpb.ConstraintToUpdate_CHECK
-}
-
 // Check returns the underlying check constraint, if there is one.
-func (c constraintToUpdateForTest) Check() descpb.TableDescriptor_CheckConstraint {
-	return c.desc.Check
+func (c constraintToUpdateForTest) AsCheck() *descpb.TableDescriptor_CheckConstraint {
+	return &c.desc.Check
 }
 
 func TestShouldSkipConstraintValidation(t *testing.T) {

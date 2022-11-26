@@ -401,9 +401,14 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 	var g *concurrency.Guard
 	defer func() {
 		// Handle load-based splitting, if necessary.
-		if pErr == nil {
-			spansRead, _, _ := r.collectSpansRead(ba, br)
-			r.recordBatchForLoadBasedSplitting(ctx, ba, spansRead)
+		if pErr == nil && br != nil {
+			if len(ba.Requests) != len(br.Responses) {
+				log.KvDistribution.Errorf(ctx,
+					"Requests and responses should be equal lengths: # of requests = %d, # of responses = %d",
+					len(ba.Requests), len(br.Responses))
+			} else {
+				r.recordBatchForLoadBasedSplitting(ctx, ba, br)
+			}
 		}
 
 		// NB: wrapped to delay g evaluation to its value when returning.
@@ -487,10 +492,22 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 			return nil, nil, pErr
 		}
 
-		// The batch execution func returned a server-side concurrency retry
-		// error. It must have also handed back ownership of the concurrency
-		// guard without having already released the guard's latches.
-		g.AssertLatches()
+		// The batch execution func returned a server-side concurrency retry error.
+		// It may have either handed back ownership of the concurrency guard without
+		// having already released the guard's latches, or in case of certain types
+		// of read-only requests (see `canReadOnlyRequestDropLatchesBeforeEval`), it
+		// may have released the guard's latches.
+		dropLatchesAndLockWaitQueues := func(reuseLatchAndLockSpans bool) {
+			if g != nil {
+				latchSpans, lockSpans = nil, nil
+				if reuseLatchAndLockSpans {
+					latchSpans, lockSpans = g.TakeSpanSets()
+				}
+				r.concMgr.FinishReq(g)
+				g = nil
+			}
+		}
+
 		if filter := r.store.cfg.TestingKnobs.TestingConcurrencyRetryFilter; filter != nil {
 			filter(ctx, ba, pErr)
 		}
@@ -505,19 +522,18 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 		switch t := pErr.GetDetail().(type) {
 		case *roachpb.WriteIntentError:
 			// Drop latches, but retain lock wait-queues.
+			g.AssertLatches()
 			if g, pErr = r.handleWriteIntentError(ctx, ba, g, pErr, t); pErr != nil {
 				return nil, nil, pErr
 			}
 		case *roachpb.TransactionPushError:
 			// Drop latches, but retain lock wait-queues.
+			g.AssertLatches()
 			if g, pErr = r.handleTransactionPushError(ctx, ba, g, pErr, t); pErr != nil {
 				return nil, nil, pErr
 			}
 		case *roachpb.IndeterminateCommitError:
-			// Drop latches and lock wait-queues.
-			latchSpans, lockSpans = g.TakeSpanSets()
-			r.concMgr.FinishReq(g)
-			g = nil
+			dropLatchesAndLockWaitQueues(true /* reuseLatchAndLockSpans */)
 			// Then launch a task to handle the indeterminate commit error. No error
 			// is returned if the transaction is recovered successfully to either a
 			// COMMITTED or ABORTED state.
@@ -525,13 +541,10 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 				return nil, nil, pErr
 			}
 		case *roachpb.ReadWithinUncertaintyIntervalError:
-			// Drop latches and lock wait-queues.
-			r.concMgr.FinishReq(g)
-			g = nil
 			// If the batch is able to perform a server-side retry in order to avoid
 			// the uncertainty error, it will have a new timestamp. Force a refresh of
 			// the latch and lock spans.
-			latchSpans, lockSpans = nil, nil
+			dropLatchesAndLockWaitQueues(false /* reuseLatchAndLockSpans */)
 			// Attempt to adjust the batch's timestamp to avoid the uncertainty error
 			// and allow for a server-side retry. For transactional requests, there
 			// are strict conditions that must be met for this to be permitted. For
@@ -544,10 +557,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 				return nil, nil, pErr
 			}
 		case *roachpb.InvalidLeaseError:
-			// Drop latches and lock wait-queues.
-			latchSpans, lockSpans = g.TakeSpanSets()
-			r.concMgr.FinishReq(g)
-			g = nil
+			dropLatchesAndLockWaitQueues(true /* reuseLatchAndLockSpans */)
 			// Then attempt to acquire the lease if not currently held by any
 			// replica or redirect to the current leaseholder if currently held
 			// by a different replica.
@@ -555,10 +565,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 				return nil, nil, pErr
 			}
 		case *roachpb.MergeInProgressError:
-			// Drop latches and lock wait-queues.
-			latchSpans, lockSpans = g.TakeSpanSets()
-			r.concMgr.FinishReq(g)
-			g = nil
+			dropLatchesAndLockWaitQueues(true /* reuseLatchAndLockSpans */)
 			// Then listen for the merge to complete.
 			if pErr = r.handleMergeInProgressError(ctx, ba, pErr, t); pErr != nil {
 				return nil, nil, pErr
@@ -1255,7 +1262,9 @@ func (ec *endCmds) poison() {
 }
 
 // done releases the latches acquired by the command and updates the timestamp
-// cache using the final timestamp of each command.
+// cache using the final timestamp of each command. If `br` is nil, it is
+// assumed that `done` is being called by a request that's dropping its latches
+// before evaluation.
 //
 // No-op if the receiver has been zeroed out by a call to move. Idempotent and
 // is safe to call more than once.
@@ -1268,10 +1277,10 @@ func (ec *endCmds) done(
 	}
 	defer ec.move() // clear
 
-	// Update the timestamp cache. Each request within the batch is considered
-	// in turn; only those marked as affecting the cache are processed. However,
-	// only do so if the request is consistent and was operating on the
-	// leaseholder under a valid range lease.
+	// Update the timestamp cache. Each request within the batch is considered in
+	// turn; only those marked as affecting the cache are processed. However, only
+	// do so if the request is consistent and was operating on the leaseholder
+	// under a valid range lease.
 	if ba.ReadConsistency == roachpb.CONSISTENT && ec.st.State == kvserverpb.LeaseState_VALID {
 		ec.repl.updateTimestampCache(ctx, &ec.st, ba, br, pErr)
 	}

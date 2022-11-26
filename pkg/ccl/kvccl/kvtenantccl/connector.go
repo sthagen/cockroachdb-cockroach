@@ -129,6 +129,10 @@ var _ serverpb.TenantStatusServer = (*Connector)(nil)
 // Connector is capable of accessing span configurations for secondary tenants.
 var _ spanconfig.KVAccessor = (*Connector)(nil)
 
+// Reporter is capable of generating span configuration conformance reports for
+// secondary tenants.
+var _ spanconfig.Reporter = (*Connector)(nil)
+
 // NewConnector creates a new Connector.
 // NOTE: Calling Start will set cfg.RPCContext.ClusterID.
 func NewConnector(cfg kvtenant.ConnectorConfig, addrs []string) *Connector {
@@ -374,7 +378,7 @@ func (c *Connector) RegisterSystemConfigChannel() (_ <-chan struct{}, unregister
 
 // RangeLookup implements the kvcoord.RangeDescriptorDB interface.
 func (c *Connector) RangeLookup(
-	ctx context.Context, key roachpb.RKey, useReverseScan bool,
+	ctx context.Context, key roachpb.RKey, rc rangecache.RangeLookupConsistency, useReverseScan bool,
 ) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
 	// Proxy range lookup requests through the Internal service.
 	ctx = c.AnnotateCtx(ctx)
@@ -385,19 +389,11 @@ func (c *Connector) RangeLookup(
 		}
 		resp, err := client.RangeLookup(ctx, &roachpb.RangeLookupRequest{
 			Key: key,
-			// We perform the range lookup scan with a READ_UNCOMMITTED consistency
-			// level because we want the scan to return intents as well as committed
-			// values. The reason for this is because it's not clear whether the
-			// intent or the previous value points to the correct location of the
-			// Range. It gets even more complicated when there are split-related
-			// intents or a txn record co-located with a replica involved in the
-			// split. Since we cannot know the correct answer, we lookup both the
-			// pre- and post- transaction values.
-			ReadConsistency: roachpb.READ_UNCOMMITTED,
-			// Until we add protection in the Internal service implementation to
-			// prevent prefetching from traversing into RangeDescriptors owned by
-			// other tenants, we must disable prefetching.
-			PrefetchNum:     0,
+			// See the comment on (*kvcoord.DistSender).RangeLookup or kv.RangeLookup
+			// for more discussion on the choice of ReadConsistency and its
+			// implications.
+			ReadConsistency: rc,
+			PrefetchNum:     kvcoord.RangeLookupPrefetchCount,
 			PrefetchReverse: useReverseScan,
 		})
 		if err != nil {
@@ -532,6 +528,27 @@ func (c *Connector) UpdateSpanConfigRecords(
 		}
 		return nil
 	})
+}
+
+// SpanConfigConformance implements the spanconfig.Reporter interface.
+func (c *Connector) SpanConfigConformance(
+	ctx context.Context, spans []roachpb.Span,
+) (roachpb.SpanConfigConformanceReport, error) {
+	var report roachpb.SpanConfigConformanceReport
+	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
+		resp, err := c.SpanConfigConformance(ctx, &roachpb.SpanConfigConformanceRequest{
+			Spans: spans,
+		})
+		if err != nil {
+			return err
+		}
+
+		report = resp.Report
+		return nil
+	}); err != nil {
+		return roachpb.SpanConfigConformanceReport{}, err
+	}
+	return report, nil
 }
 
 // GetAllSystemSpanConfigsThatApply implements the spanconfig.KVAccessor

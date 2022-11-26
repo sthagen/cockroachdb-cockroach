@@ -90,10 +90,12 @@ func runSqliteLogicTest(t *testing.T, file string) {
 	// SQLLite logic tests can be very memory intensive, so we give them larger
 	// limit than other logic tests get. Also some of the 'delete' files become
 	// extremely slow when MVCC range tombstones are enabled for point deletes,
-	// so we disable that.
+	// so we disable that. Similarly, some of the 'view' files are too slow
+	// when small engine blocks are enabled.
 	serverArgs := logictest.TestServerArgs{
 		MaxSQLMemoryLimit: 512 << 20, // 512 MiB
 		DisableUseMVCCRangeTombstonesForPointDeletes: true,
+		DisableSmallEngineBlocks:                     true,
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(sqliteLogicTestDir, file))
 }
@@ -167,8 +169,7 @@ import ({{ if .SqliteLogicTest }}
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"{{ if .Ccl }}
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"{{ end }}
+	"github.com/cockroachdb/cockroach/pkg/ccl"{{ end }}
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"{{ if .ExecBuildLogicTest }}
@@ -204,7 +205,7 @@ func TestMain(m *testing.M) {
 			}
 		}
 	}
-{{ end }}{{ if .Ccl }}	defer utilccl.TestingEnableEnterprise()()
+{{ end }}{{ if .Ccl }}	defer ccl.TestingEnableEnterprise()()
 {{ end }}	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
@@ -255,7 +256,8 @@ go_test(
     args = ["-test.timeout=3595s"],{{ end }}
     data = [
         "//c-deps:libgeos",  # keep{{ if .SqliteLogicTest }}
-        "@com_github_cockroachdb_sqllogictest//:testfiles",  # keep{{ end }}{{ if .CclLogicTest }}
+        "@com_github_cockroachdb_sqllogictest//:testfiles",  # keep{{ end }}{{ if .CockroachGoTestserverTest }}
+        "//pkg/cmd/cockroach-short",  # keep{{ end }}{{ if .CclLogicTest }}
         "//pkg/ccl/logictestccl:testdata",  # keep{{ end }}{{ if .LogicTest }}
         "//pkg/sql/logictest:testdata",  # keep{{ end }}{{ if .ExecBuildLogicTest }}
         "//pkg/sql/opt/exec/execbuilder:testdata",  # keep{{ end }}
@@ -264,8 +266,7 @@ go_test(
     tags = ["cpu:{{ if gt .NumCPU 4 }}4{{ else }}{{ .NumCPU }}{{ end }}"],
     deps = [
         "//pkg/build/bazel",{{ if .Ccl }}
-        "//pkg/ccl",
-        "//pkg/ccl/utilccl",{{ end }}
+        "//pkg/ccl",{{ end }}
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",{{ if .ExecBuildLogicTest }}

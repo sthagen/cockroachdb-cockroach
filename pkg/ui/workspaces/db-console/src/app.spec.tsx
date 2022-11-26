@@ -9,6 +9,8 @@
 // licenses/APL.txt.
 
 import { stubComponentInModule } from "./test-utils/mockComponent";
+stubComponentInModule("src/views/cluster/containers/nodeGraphs", "default");
+stubComponentInModule("src/views/cluster/containers/events", "EventPage");
 stubComponentInModule("src/views/databases/databasesPage", "DatabasesPage");
 stubComponentInModule(
   "src/views/databases/databaseDetailsPage",
@@ -26,11 +28,11 @@ stubComponentInModule("src/views/statements/statementsPage", "default");
 stubComponentInModule("src/views/statements/statementDetails", "default");
 stubComponentInModule("src/views/transactions/transactionsPage", "default");
 stubComponentInModule(
-  "src/views/statements/activeStatementDetailsConnected",
+  "src/views/statements/recentStatementDetailsConnected",
   "default",
 );
 stubComponentInModule(
-  "src/views/transactions/activeTransactionDetailsConnected",
+  "src/views/transactions/recentTransactionDetailsConnected",
   "default",
 );
 stubComponentInModule("src/views/insights/workloadInsightsPage", "default");
@@ -57,11 +59,9 @@ import { AdminUIState, createAdminUIStore } from "src/redux/state";
 
 const CLUSTER_OVERVIEW_CAPACITY_LABEL = "Capacity Usage";
 const CLUSTER_VIZ_NODE_MAP_LABEL = "Node Map";
-const METRICS_HEADER = "Metrics";
 const NODE_LIST_LABEL = /Nodes \([\d]\)/;
 const LOADING_CLUSTER_STATUS = /Loading cluster status.*/;
 const NODE_LOG_HEADER = /Logs Node.*/;
-const EVENTS_HEADER = "Events";
 const JOBS_HEADER = "Jobs";
 const SQL_ACTIVITY_HEADER = "SQL Activity";
 const TRANSACTION_DETAILS_HEADER = "Transaction Details";
@@ -142,7 +142,7 @@ describe("Routing to", () => {
   describe("'/metrics' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
 
     test("redirected to '/metrics/overview/cluster'", () => {
@@ -154,21 +154,21 @@ describe("Routing to", () => {
   describe("'/metrics/overview/cluster' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/overview/cluster");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
   describe("'/metrics/overview/node' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/overview/node");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
   describe("'/metrics/:dashboardNameAttr' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
 
     test("redirected to '/metrics/:${dashboardNameAttr}/cluster'", () => {
@@ -180,14 +180,14 @@ describe("Routing to", () => {
   describe("'/metrics/:dashboardNameAttr/cluster' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard/cluster");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
   describe("'/metrics/:dashboardNameAttr/node' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard/node");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
 
     test("redirected to '/metrics/:${dashboardNameAttr}/cluster'", () => {
@@ -199,7 +199,7 @@ describe("Routing to", () => {
   describe("'/metrics/:dashboardNameAttr/node/:nodeIDAttr' path", () => {
     test("routes to <NodeGraphs> component", () => {
       navigateToPath("/metrics/some-dashboard/node/123");
-      screen.getByText(METRICS_HEADER, { selector: "h3" });
+      screen.getByTestId("nodeGraphs");
     });
   });
 
@@ -238,7 +238,7 @@ describe("Routing to", () => {
   describe("'/events' path", () => {
     test("routes to <EventPageUnconnected> component", () => {
       navigateToPath("/events");
-      screen.getByText(EVENTS_HEADER, { selector: "h1" });
+      screen.getByTestId("EventPage");
     });
   });
 
@@ -394,7 +394,7 @@ describe("Routing to", () => {
       screen.getByRole("tab", { name: "Statements", selected: true });
     });
 
-    test("routes to <ActiveStatementsView> component with view=active", () => {
+    test("routes to <RecentStatementsView> component with view=active", () => {
       navigateToPath("/sql-activity?tab=Statements&view=active");
       screen.getByRole("tab", { name: "Statements", selected: true });
     });
@@ -414,7 +414,7 @@ describe("Routing to", () => {
       screen.getByRole("tab", { name: "Transactions", selected: true });
     });
 
-    test("routes to <ActiveTransactionsView> component with view=active", () => {
+    test("routes to <RecentTransactionsView> component with view=active", () => {
       navigateToPath("/sql-activity?tab=Transactions&view=active");
       screen.getByRole("tab", { name: "Transactions", selected: true });
     });
@@ -430,14 +430,14 @@ describe("Routing to", () => {
   // Active execution details.
 
   describe("'/execution' path", () => {
-    test("'/execution/statement/statementID' routes to <ActiveStatementDetails>", () => {
+    test("'/execution/statement/statementID' routes to <RecentStatementDetails>", () => {
       navigateToPath("/execution/statement/stmtID");
-      screen.getByTestId("activeStatementDetailsConnected");
+      screen.getByTestId("recentStatementDetailsConnected");
     });
 
-    test("'/execution/transaction/transactionID' routes to <ActiveTransactionDetails>", () => {
+    test("'/execution/transaction/transactionID' routes to <RecentTransactionDetails>", () => {
       navigateToPath("/execution/transaction/transactionID");
-      screen.getByTestId("activeTransactionDetailsConnected");
+      screen.getByTestId("recentTransactionDetailsConnected");
     });
   });
   {
@@ -498,9 +498,9 @@ describe("Routing to", () => {
     });
   });
 
-  describe("'/debug/tracez_v2/snapshot/:id' path", () => {
-    test("routes to <ScheduleDetails> component", () => {
-      navigateToPath("/debug/tracez_v2/snapshot/12345");
+  describe("'/debug/tracez_v2/node/:nodeID/snapshot/:snapshotID' path", () => {
+    test("routes to <SnapshotPage> component", () => {
+      navigateToPath("/debug/tracez_v2/node/1/snapshot/12345");
       screen.getByTestId("snapshotPage");
     });
   });

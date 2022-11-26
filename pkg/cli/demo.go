@@ -64,15 +64,6 @@ const defaultGeneratorName = "movr"
 
 var defaultGenerator workload.Generator
 
-var demoNodeCacheSizeValue = newBytesOrPercentageValue(
-	&demoCtx.CacheSize,
-	memoryPercentResolver,
-)
-var demoNodeSQLMemSizeValue = newBytesOrPercentageValue(
-	&demoCtx.SQLPoolMemorySize,
-	memoryPercentResolver,
-)
-
 func init() {
 	for _, meta := range workload.Registered() {
 		gen := meta.New()
@@ -367,6 +358,13 @@ func runDemoInternal(
 
 	if err := extraInit(ctx, conn); err != nil {
 		return err
+	}
+
+	// Enable the latency as late in the process of starting the cluster as we
+	// can to minimize the startup time.
+	if demoCtx.SimulateLatency {
+		c.SetSimulatedLatency(true /* on */)
+		defer c.SetSimulatedLatency(false /* on */)
 	}
 
 	return sqlCtx.Run(ctx, conn)

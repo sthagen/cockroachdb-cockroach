@@ -18,9 +18,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,7 +32,7 @@ import (
 
 func TestWorkload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 	skip.UnderRace(t, "test connections can be too slow under race option.")
 
 	dir := t.TempDir()
@@ -90,7 +89,7 @@ func TestWorkload(t *testing.T) {
 	ql, err := wl.Ops(ctx, []string{pgURL.String()}, reg)
 	require.NoError(t, err)
 
-	const N = 800
+	const N = 100
 	workerFn := func(ctx context.Context, fn func(ctx context.Context) error) func() error {
 		return func() error {
 			for i := 0; i < N; i++ {

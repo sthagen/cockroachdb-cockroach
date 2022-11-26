@@ -44,9 +44,10 @@ type wrapper struct {
 	// to a struct containing precomputed catalog.Mutation, catalog.Index or
 	// catalog.Column slices.
 	// Those can therefore only be set when creating an immutable.
-	mutationCache *mutationCache
-	indexCache    *indexCache
-	columnCache   *columnCache
+	mutationCache   *mutationCache
+	indexCache      *indexCache
+	columnCache     *columnCache
+	constraintCache *constraintCache
 
 	changes catalog.PostDeserializationChanges
 
@@ -74,7 +75,7 @@ func (desc *wrapper) GetPostDeserializationChanges() catalog.PostDeserialization
 func (desc *wrapper) HasConcurrentSchemaChanges() bool {
 	return (desc.DeclarativeSchemaChangerState != nil &&
 		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID) ||
-		(len(desc.Mutations) > 0 && len(desc.MutationJobs) > 0)
+		len(desc.MutationJobs) > 0
 }
 
 // SkipNamespace implements the descriptor interface.

@@ -110,6 +110,11 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		}
 		stmt.Prepared.Columns = colinfo.ExplainPlanColumns
 		return opc.flags, nil
+
+	case *tree.ShowCommitTimestamp:
+		stmt.Prepared.Columns = colinfo.ShowCommitTimestampColumns
+		return opc.flags, nil
+
 	case *tree.DeclareCursor:
 		// Build memo for the purposes of typing placeholders.
 		// TODO(jordan): converting DeclareCursor to not be an opaque statement
@@ -645,6 +650,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 	planTop.instrumentation.joinTypeCounts = bld.JoinTypeCounts
 	planTop.instrumentation.joinAlgorithmCounts = bld.JoinAlgorithmCounts
 	planTop.instrumentation.scanCounts = bld.ScanCounts
+	planTop.instrumentation.indexesUsed = bld.IndexesUsed
 
 	if gf != nil {
 		planTop.instrumentation.planGist = gf.PlanGist()

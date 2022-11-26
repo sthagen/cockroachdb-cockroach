@@ -51,7 +51,7 @@ message BackupEncryptionOptions {
   // encryption or decryption when mode == KMS.
   KMSInfo kms_info  = 3 [(gogoproto.customname) = "KMSInfo"];
 
-  string raw_passphrae = 4;
+  string raw_passphrase = 4;
   repeated string raw_kms_uris = 5;
 }
 
@@ -86,11 +86,35 @@ message StreamIngestionDetails {
   // this span.
   roachpb.Span span = 2 [(gogoproto.nullable) = false];
   
-  reserved 5;
-  roachpb.TenantID tenant_id = 6 [(gogoproto.customname) = "TenantID", (gogoproto.nullable) = false];
-
   // Stream of tenant data will be ingested as a new tenant with 'new_tenant_id'.
-  roachpb.TenantID new_tenant_id = 7 [(gogoproto.customname) = "NewTenantID", (gogoproto.nullable) = false];
+  roachpb.TenantID destination_tenant_id = 7 [(gogoproto.customname) = "DestinationTenantID", (gogoproto.nullable) = false];
+
+  string source_tenant_name = 8 [
+    (gogoproto.nullable) = false,
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/roachpb.TenantName"];
+
+  string destination_tenant_name = 9 [
+    (gogoproto.nullable) = false,
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/roachpb.TenantName"];
+
+  // ID of the protected timestamp record that protects the destination tenant's
+  // keyspan from GC while it is being replicated into.
+  bytes protected_timestamp_record_id = 10 [
+    (gogoproto.customname) = "ProtectedTimestampRecordID",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
+  ];
+
+  // ReplicationTTLSeconds specifies the maximum age of a value relative to the
+  // replication job's frontier timestamp, before the value is made eligible for
+  // garbage collection. Note, only older versions of values are eligible for
+  // GC. All values newer than this maximum age will be protected from GC by a
+  // protected timestamp record managed by the replication job.
+  //
+  // In other words, the `replication job's frontier timestamp - ReplicationTTLSeconds`
+  // is the earliest timestamp that the replication job can be cut-over to.
+  int32 replication_ttl_seconds = 11 [(gogoproto.customname) = "ReplicationTTLSeconds"];
+
+  reserved 5, 6;
 }
 
 message StreamIngestionCheckpoint {
@@ -141,6 +165,9 @@ message StreamReplicationDetails {
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
     (gogoproto.nullable) = false
   ];
+
+  // TenantID is the ID of the source tenant being streamed.
+  roachpb.TenantID tenant_id = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "TenantID"];
 }
 
 message StreamReplicationProgress {
@@ -992,6 +1019,9 @@ message CreateStatsDetails {
 
   // If true, delete old stats for columns not included in this message.
   bool delete_other_stats = 8;
+
+  // If true, will collect partial table statistics at extreme values.
+  bool using_extremes = 9;
 }
 
 message CreateStatsProgress {

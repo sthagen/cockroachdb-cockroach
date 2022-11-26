@@ -11,14 +11,15 @@ package streamproducer
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/repstream"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -29,9 +30,9 @@ type replicationStreamManagerImpl struct {
 
 // StartReplicationStream implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) StartReplicationStream(
-	ctx context.Context, tenantID uint64,
+	ctx context.Context, tenantName roachpb.TenantName,
 ) (streampb.StreamID, error) {
-	return startReplicationStreamJob(ctx, r.evalCtx, r.txn, tenantID)
+	return startReplicationStreamJob(ctx, r.evalCtx, r.txn, tenantName)
 }
 
 // HeartbeatReplicationStream implements streaming.ReplicationStreamManager interface.
@@ -78,7 +79,7 @@ func newReplicationStreamManagerWithPrivilegesCheck(
 	execCfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
 
 	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), execCfg.Organization(), "REPLICATION")
+		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), "REPLICATION")
 	if enterpriseCheckErr != nil {
 		return nil, pgerror.Wrap(enterpriseCheckErr,
 			pgcode.InsufficientPrivilege, "replication requires enterprise license")
@@ -88,5 +89,5 @@ func newReplicationStreamManagerWithPrivilegesCheck(
 }
 
 func init() {
-	streaming.GetReplicationStreamManagerHook = newReplicationStreamManagerWithPrivilegesCheck
+	repstream.GetReplicationStreamManagerHook = newReplicationStreamManagerWithPrivilegesCheck
 }

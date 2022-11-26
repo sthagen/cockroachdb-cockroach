@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -178,7 +177,7 @@ func parseRandomStreamConfig(streamURL *url.URL) (randomStreamConfig, error) {
 		if err != nil {
 			return c, err
 		}
-		c.tenantID = roachpb.MakeTenantID(uint64(id))
+		c.tenantID = roachpb.MustMakeTenantID(uint64(id))
 	}
 	return c, nil
 }
@@ -351,8 +350,11 @@ func (m *RandomStreamClient) Dial(ctx context.Context) error {
 }
 
 // Plan implements the Client interface.
-func (m *RandomStreamClient) Plan(ctx context.Context, id streaming.StreamID) (Topology, error) {
-	topology := make(Topology, 0, m.config.numPartitions)
+func (m *RandomStreamClient) Plan(ctx context.Context, _ streampb.StreamID) (Topology, error) {
+	topology := Topology{
+		Partitions:     make([]PartitionInfo, 0, m.config.numPartitions),
+		SourceTenantID: m.config.tenantID,
+	}
 	log.Infof(ctx, "planning random stream for tenant %d", m.config.tenantID)
 
 	// Allocate table IDs and return one per partition address in the topology.
@@ -360,13 +362,13 @@ func (m *RandomStreamClient) Plan(ctx context.Context, id streaming.StreamID) (T
 		tableID := m.getNextTableID()
 		tableDesc, err := m.tableDescForID(tableID)
 		if err != nil {
-			return nil, err
+			return Topology{}, err
 		}
 
 		partitionURI := m.config.URL(tableID)
 		log.Infof(ctx, "planning random stream partition %d for tenant %d: %q", i, m.config.tenantID, partitionURI)
 
-		topology = append(topology,
+		topology.Partitions = append(topology.Partitions,
 			PartitionInfo{
 				ID:                strconv.Itoa(i),
 				SrcAddr:           streamingccl.PartitionAddress(partitionURI),
@@ -380,16 +382,15 @@ func (m *RandomStreamClient) Plan(ctx context.Context, id streaming.StreamID) (T
 
 // Create implements the Client interface.
 func (m *RandomStreamClient) Create(
-	ctx context.Context, target roachpb.TenantID,
-) (streaming.StreamID, error) {
-	log.Infof(ctx, "creating random stream for tenant %d", target.ToUint64())
-	m.config.tenantID = target
-	return streaming.StreamID(target.ToUint64()), nil
+	ctx context.Context, tenantName roachpb.TenantName,
+) (streampb.StreamID, error) {
+	log.Infof(ctx, "creating random stream for tenant %s", tenantName)
+	return streampb.StreamID(1), nil
 }
 
 // Heartbeat implements the Client interface.
 func (m *RandomStreamClient) Heartbeat(
-	ctx context.Context, _ streaming.StreamID, ts hlc.Timestamp,
+	ctx context.Context, _ streampb.StreamID, ts hlc.Timestamp,
 ) (streampb.StreamReplicationStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -451,13 +452,13 @@ func getDescriptorAndNamespaceKVForTableID(
 }
 
 // Close implements the Client interface.
-func (m *RandomStreamClient) Close(ctx context.Context) error {
+func (m *RandomStreamClient) Close(_ context.Context) error {
 	return nil
 }
 
 // Subscribe implements the Client interface.
 func (m *RandomStreamClient) Subscribe(
-	ctx context.Context, stream streaming.StreamID, spec SubscriptionToken, checkpoint hlc.Timestamp,
+	ctx context.Context, stream streampb.StreamID, spec SubscriptionToken, checkpoint hlc.Timestamp,
 ) (Subscription, error) {
 	partitionURL, err := url.Parse(string(spec))
 	if err != nil {
@@ -530,9 +531,7 @@ func (m *RandomStreamClient) Subscribe(
 }
 
 // Complete implements the streamclient.Client interface.
-func (m *RandomStreamClient) Complete(
-	ctx context.Context, streamID streaming.StreamID, successfulIngestion bool,
-) error {
+func (m *RandomStreamClient) Complete(_ context.Context, _ streampb.StreamID, _ bool) error {
 	return nil
 }
 

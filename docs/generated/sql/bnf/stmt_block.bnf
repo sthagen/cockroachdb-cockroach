@@ -30,6 +30,7 @@ stmt_without_legacy_transaction ::=
 	| fetch_cursor_stmt
 	| move_cursor_stmt
 	| unlisten_stmt
+	| show_commit_timestamp_stmt
 
 legacy_transaction_stmt ::=
 	legacy_begin_stmt
@@ -160,6 +161,9 @@ unlisten_stmt ::=
 	'UNLISTEN' type_name
 	| 'UNLISTEN' '*'
 
+show_commit_timestamp_stmt ::=
+	'SHOW' 'COMMIT' 'TIMESTAMP'
+
 legacy_begin_stmt ::=
 	'BEGIN' opt_transaction begin_transaction
 
@@ -201,6 +205,7 @@ drop_stmt ::=
 	| drop_role_stmt
 	| drop_schedule_stmt
 	| drop_external_connection_stmt
+	| drop_tenant_stmt
 
 explain_stmt ::=
 	'EXPLAIN' explainable_stmt
@@ -236,7 +241,6 @@ restore_stmt ::=
 	| 'RESTORE' backup_targets 'FROM' string_or_placeholder 'IN' list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
 	| 'RESTORE' 'SYSTEM' 'USERS' 'FROM' list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
 	| 'RESTORE' 'SYSTEM' 'USERS' 'FROM' string_or_placeholder 'IN' list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
-	| 'RESTORE' backup_targets 'FROM' 'REPLICATION' 'STREAM' 'FROM' string_or_placeholder_opt_list opt_as_tenant_clause
 
 resume_stmt ::=
 	resume_jobs_stmt
@@ -291,6 +295,7 @@ show_stmt ::=
 	| show_sessions_stmt
 	| show_stats_stmt
 	| show_tables_stmt
+	| show_tenant_stmt
 	| show_trace_stmt
 	| show_transactions_stmt
 	| show_transfer_stmt
@@ -591,6 +596,7 @@ create_external_connection_stmt ::=
 
 create_tenant_stmt ::=
 	'CREATE' 'TENANT' name
+	| 'CREATE' 'TENANT' name 'FROM' 'REPLICATION' 'OF' name 'ON' string_or_placeholder
 
 opt_with_clause ::=
 	with_clause
@@ -638,6 +644,10 @@ drop_schedule_stmt ::=
 
 drop_external_connection_stmt ::=
 	'DROP' 'EXTERNAL' 'CONNECTION' string_or_placeholder
+
+drop_tenant_stmt ::=
+	'DROP' 'TENANT' name
+	| 'DROP' 'TENANT' 'IF' 'EXISTS' name
 
 explainable_stmt ::=
 	preparable_stmt
@@ -720,11 +730,6 @@ backup_targets ::=
 	| 'TENANT' iconst64
 	| 'TENANT' 'identifier'
 	| 'DATABASE' name_list
-
-opt_as_tenant_clause ::=
-	'AS' 'TENANT' iconst64
-	| 'AS' 'TENANT' 'identifier'
-	| 
 
 resume_jobs_stmt ::=
 	'RESUME' 'JOB' a_expr
@@ -915,6 +920,9 @@ show_tables_stmt ::=
 	'SHOW' 'TABLES' 'FROM' name '.' name with_comment
 	| 'SHOW' 'TABLES' 'FROM' name with_comment
 	| 'SHOW' 'TABLES' with_comment
+
+show_tenant_stmt ::=
+	'SHOW' 'TENANT' name
 
 show_trace_stmt ::=
 	'SHOW' opt_compact 'TRACE' 'FOR' 'SESSION'

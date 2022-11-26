@@ -213,6 +213,10 @@ func TestContextualHelp(t *testing.T) {
 
 		{`DROP SCHEMA ??`, `DROP SCHEMA`},
 
+		{`DROP TENANT ??`, `DROP TENANT`},
+		{`DROP TENANT IF ??`, `DROP TENANT`},
+		{`DROP TENANT IF EXISTS ??`, `DROP TENANT`},
+
 		{`EXPLAIN (??`, `EXPLAIN`},
 		{`EXPLAIN SELECT 1 ??`, `SELECT`},
 		{`EXPLAIN INSERT INTO xx (SELECT 1) ??`, `INSERT`},
@@ -351,6 +355,8 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW COLUMNS FROM ??`, `SHOW COLUMNS`},
 		{`SHOW COLUMNS FROM foo ??`, `SHOW COLUMNS`},
 
+		{`SHOW COMMIT TIMESTAMP ??`, `SHOW COMMIT TIMESTAMP`},
+
 		{`SHOW CONSTRAINTS FROM ??`, `SHOW CONSTRAINTS`},
 		{`SHOW CONSTRAINTS FROM foo ??`, `SHOW CONSTRAINTS`},
 
@@ -403,6 +409,8 @@ func TestContextualHelp(t *testing.T) {
 
 		{`SHOW TABLES FROM ??`, `SHOW TABLES`},
 		{`SHOW TABLES FROM blah ??`, `SHOW TABLES`},
+
+		{`SHOW TENANT ??`, `SHOW TENANT`},
 
 		{`SHOW TRANSACTION PRIORITY ??`, `SHOW TRANSACTION`},
 		{`SHOW TRANSACTION STATUS ??`, `SHOW TRANSACTION`},

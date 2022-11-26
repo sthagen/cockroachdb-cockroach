@@ -15,7 +15,6 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -40,7 +39,7 @@ import (
 // To fix the table, we remove the mutation as the FK constraint is unnecessary
 // in the current implementation.
 func fixInvalidObjectsThatLookLikeBadUserfileConstraint(
-	ctx context.Context, _ clusterversion.ClusterVersion, d upgrade.TenantDeps, _ *jobs.Job,
+	ctx context.Context, _ clusterversion.ClusterVersion, d upgrade.TenantDeps,
 ) error {
 	return d.InternalExecutorFactory.DescsTxnWithExecutor(ctx, d.DB, nil,
 		func(ctx context.Context, txn *kv.Txn, descriptors *descs.Collection, ie sqlutil.InternalExecutor) error {
@@ -141,8 +140,7 @@ func mutationsLookLikeuserfilePayloadCorruption(
 	mutation := tableDesc.AllMutations()[0]
 	if mutation.Adding() && mutation.DeleteOnly() {
 		if constraintMutation := mutation.AsConstraint(); constraintMutation != nil {
-			if constraintMutation.IsForeignKey() {
-				fkConstraint := constraintMutation.ForeignKey()
+			if fkConstraint := constraintMutation.AsForeignKey(); fkConstraint != nil {
 				targetTableDesc, err := descriptors.GetImmutableTableByID(ctx, txn, fkConstraint.ReferencedTableID, tree.ObjectLookupFlags{
 					CommonLookupFlags: tree.CommonLookupFlags{
 						IncludeOffline: true,

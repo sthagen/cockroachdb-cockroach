@@ -16,12 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/logtags"
 )
@@ -33,16 +33,16 @@ func distStreamIngestionPlanSpecs(
 	initialHighWater hlc.Timestamp,
 	checkpoint jobspb.StreamIngestionCheckpoint,
 	jobID jobspb.JobID,
-	streamID streaming.StreamID,
-	oldTenantID roachpb.TenantID,
-	newTenantID roachpb.TenantID,
+	streamID streampb.StreamID,
+	sourceTenantID roachpb.TenantID,
+	destinationTenantID roachpb.TenantID,
 ) ([]*execinfrapb.StreamIngestionDataSpec, *execinfrapb.StreamIngestionFrontierSpec, error) {
 	// For each stream partition in the topology, assign it to a node.
 	streamIngestionSpecs := make([]*execinfrapb.StreamIngestionDataSpec, 0, len(sqlInstanceIDs))
 
 	trackedSpans := make([]roachpb.Span, 0)
 	subscribingSQLInstances := make(map[string]uint32)
-	for i, partition := range topology {
+	for i, partition := range topology.Partitions {
 		// Round robin assign the stream partitions to nodes. Partitions 0 through
 		// len(nodes) - 1 creates the spec. Future partitions just add themselves to
 		// the partition addresses.
@@ -55,8 +55,8 @@ func distStreamIngestionPlanSpecs(
 				StreamAddress:  string(streamAddress),
 				PartitionSpecs: make(map[string]execinfrapb.StreamIngestionPartitionSpec),
 				TenantRekey: execinfrapb.TenantRekey{
-					OldID: oldTenantID,
-					NewID: newTenantID,
+					OldID: sourceTenantID,
+					NewID: destinationTenantID,
 				},
 			}
 			streamIngestionSpecs = append(streamIngestionSpecs, spec)
@@ -93,7 +93,6 @@ func distStreamIngest(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
 	sqlInstanceIDs []base.SQLInstanceID,
-	jobID jobspb.JobID,
 	planCtx *sql.PlanningCtx,
 	dsp *sql.DistSQLPlanner,
 	streamIngestionSpecs []*execinfrapb.StreamIngestionDataSpec,

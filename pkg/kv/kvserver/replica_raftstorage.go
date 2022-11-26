@@ -17,18 +17,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -124,7 +124,7 @@ func entries(
 	reader storage.Reader,
 	rangeID roachpb.RangeID,
 	eCache *raftentry.Cache,
-	sideloaded SideloadStorage,
+	sideloaded logstore.SideloadStorage,
 	lo, hi, maxBytes uint64,
 ) ([]raftpb.Entry, error) {
 	if lo > hi {
@@ -160,10 +160,10 @@ func entries(
 		}
 		expectedIndex++
 
-		if sniffSideloadedRaftCommand(ent.Data) {
+		if logstore.SniffSideloadedRaftCommand(ent.Data) {
 			canCache = canCache && sideloaded != nil
 			if sideloaded != nil {
-				newEnt, err := maybeInlineSideloadedRaftCommand(
+				newEnt, err := logstore.MaybeInlineSideloadedRaftCommand(
 					ctx, rangeID, ent, sideloaded, eCache,
 				)
 				if err != nil {
@@ -193,7 +193,7 @@ func entries(
 		return nil
 	}
 
-	if err := iterateEntries(ctx, reader, rangeID, expectedIndex, hi, scanFunc); err != nil {
+	if err := raftlog.Visit(reader, rangeID, expectedIndex, hi, scanFunc); err != nil {
 		return nil, err
 	}
 	// Cache the fetched entries, if we may.
@@ -242,48 +242,6 @@ func entries(
 	}
 	// The requested lo index does not yet exist.
 	return nil, raft.ErrUnavailable
-}
-
-// iterateEntries iterates over each of the Raft log entries in the range
-// [lo,hi). At each step of the iteration, f() is invoked with the current log
-// entry.
-//
-// The function does not accept a maximum number of entries or bytes. Instead,
-// callers should enforce any limits by returning iterutil.StopIteration from
-// the iteration function to terminate iteration early, if necessary.
-func iterateEntries(
-	ctx context.Context,
-	reader storage.Reader,
-	rangeID roachpb.RangeID,
-	lo, hi uint64,
-	f func(raftpb.Entry) error,
-) error {
-	key := keys.RaftLogKey(rangeID, lo)
-	endKey := keys.RaftLogKey(rangeID, hi)
-	iter := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-		UpperBound: endKey,
-	})
-	defer iter.Close()
-
-	var meta enginepb.MVCCMetadata
-	var ent raftpb.Entry
-
-	iter.SeekGE(storage.MakeMVCCMetadataKey(key))
-	for ; ; iter.Next() {
-		if ok, err := iter.Valid(); err != nil || !ok {
-			return err
-		}
-
-		if err := protoutil.Unmarshal(iter.UnsafeValue(), &meta); err != nil {
-			return errors.Wrap(err, "unable to decode MVCCMetadata")
-		}
-		if err := storage.MakeValue(meta).GetProto(&ent); err != nil {
-			return errors.Wrap(err, "unable to unmarshal raft Entry")
-		}
-		if err := f(ent); err != nil {
-			return iterutil.Map(err)
-		}
-	}
 }
 
 // invalidLastTerm is an out-of-band value for r.mu.lastTerm that
@@ -486,18 +444,11 @@ func (r *Replica) GetSnapshot(
 	// Delegate to a static function to make sure that we do not depend
 	// on any indirect calls to r.store.Engine() (or other in-memory
 	// state of the Replica). Everything must come from the snapshot.
-	withSideloaded := func(fn func(SideloadStorage) error) error {
-		r.raftMu.Lock()
-		defer r.raftMu.Unlock()
-		return fn(r.raftMu.sideloaded)
-	}
+	//
 	// NB: We have Replica.mu read-locked, but we need it write-locked in order
 	// to use Replica.mu.stateLoader. This call is not performance sensitive, so
 	// create a new state loader.
-	snapData, err := snapshot(
-		ctx, snapUUID, stateloader.Make(rangeID), snapType,
-		snap, rangeID, r.store.raftEntryCache, withSideloaded, startKey,
-	)
+	snapData, err := snapshot(ctx, snapUUID, stateloader.Make(rangeID), snapType, snap, startKey)
 	if err != nil {
 		log.Errorf(ctx, "error generating snapshot: %+v", err)
 		return nil, err
@@ -516,15 +467,9 @@ type OutgoingSnapshot struct {
 	// The Pebble snapshot that will be streamed from.
 	EngineSnap storage.Reader
 	// The replica state within the snapshot.
-	State kvserverpb.ReplicaState
-	// Allows access the original Replica's sideloaded storage. Note that
-	// this isn't a snapshot of the sideloaded storage congruent with EngineSnap
-	// or RaftSnap -- a log truncation could have removed files from the
-	// sideloaded storage in the meantime.
-	WithSideloaded func(func(SideloadStorage) error) error
-	RaftEntryCache *raftentry.Cache
-	snapType       kvserverpb.SnapshotRequest_Type
-	onClose        func()
+	State    kvserverpb.ReplicaState
+	snapType kvserverpb.SnapshotRequest_Type
+	onClose  func()
 }
 
 func (s OutgoingSnapshot) String() string {
@@ -577,9 +522,6 @@ func snapshot(
 	rsl stateloader.StateLoader,
 	snapType kvserverpb.SnapshotRequest_Type,
 	snap storage.Reader,
-	rangeID roachpb.RangeID,
-	eCache *raftentry.Cache,
-	withSideloaded func(func(SideloadStorage) error) error,
 	startKey roachpb.RKey,
 ) (OutgoingSnapshot, error) {
 	var desc roachpb.RangeDescriptor
@@ -601,11 +543,9 @@ func snapshot(
 	}
 
 	return OutgoingSnapshot{
-		RaftEntryCache: eCache,
-		WithSideloaded: withSideloaded,
-		EngineSnap:     snap,
-		State:          state,
-		SnapUUID:       snapUUID,
+		EngineSnap: snap,
+		State:      state,
+		SnapUUID:   snapUUID,
 		RaftSnap: raftpb.Snapshot{
 			Data: snapUUID.GetBytes(),
 			Metadata: raftpb.SnapshotMetadata{
@@ -616,72 +556,6 @@ func snapshot(
 			},
 		},
 		snapType: snapType,
-	}, nil
-}
-
-// raftLogState stores information about the last entry and the size of the log.
-type raftLogState struct {
-	lastIndex uint64
-	lastTerm  uint64
-	byteSize  int64
-}
-
-// logAppend adds the given entries to the raft log. Takes the previous log
-// state, and returns the updated state. It's the caller's responsibility to
-// maintain exclusive access to the raft log for the duration of the method
-// call.
-//
-// logAppend is intentionally oblivious to the existence of sideloaded
-// proposals. They are managed by the caller, including cleaning up obsolete
-// on-disk payloads in case the log tail is replaced.
-func logAppend(
-	ctx context.Context,
-	raftLogPrefix roachpb.Key,
-	rw storage.ReadWriter,
-	prev raftLogState,
-	entries []raftpb.Entry,
-) (raftLogState, error) {
-	if len(entries) == 0 {
-		return prev, nil
-	}
-	var diff enginepb.MVCCStats
-	var value roachpb.Value
-	for i := range entries {
-		ent := &entries[i]
-		key := keys.RaftLogKeyFromPrefix(raftLogPrefix, ent.Index)
-
-		if err := value.SetProto(ent); err != nil {
-			return raftLogState{}, err
-		}
-		value.InitChecksum(key)
-		var err error
-		if ent.Index > prev.lastIndex {
-			err = storage.MVCCBlindPut(ctx, rw, &diff, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, value, nil /* txn */)
-		} else {
-			err = storage.MVCCPut(ctx, rw, &diff, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, value, nil /* txn */)
-		}
-		if err != nil {
-			return raftLogState{}, err
-		}
-	}
-
-	newLastIndex := entries[len(entries)-1].Index
-	// Delete any previously appended log entries which never committed.
-	if prev.lastIndex > 0 {
-		for i := newLastIndex + 1; i <= prev.lastIndex; i++ {
-			// Note that the caller is in charge of deleting any sideloaded payloads
-			// (which they must only do *after* the batch has committed).
-			_, err := storage.MVCCDelete(ctx, rw, &diff, keys.RaftLogKeyFromPrefix(raftLogPrefix, i),
-				hlc.Timestamp{}, hlc.ClockTimestamp{}, nil)
-			if err != nil {
-				return raftLogState{}, err
-			}
-		}
-	}
-	return raftLogState{
-		lastIndex: newLastIndex,
-		lastTerm:  entries[len(entries)-1].Term,
-		byteSize:  prev.byteSize + diff.SysBytes,
 	}, nil
 }
 

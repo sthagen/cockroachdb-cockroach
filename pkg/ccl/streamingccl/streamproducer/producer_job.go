@@ -29,7 +29,7 @@ import (
 )
 
 func makeTenantSpan(tenantID uint64) *roachpb.Span {
-	prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenantID))
+	prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantID))
 	return &roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
@@ -47,6 +47,7 @@ func makeProducerJobRecord(
 		Details: jobspb.StreamReplicationDetails{
 			ProtectedTimestampRecordID: ptsID,
 			Spans:                      []*roachpb.Span{makeTenantSpan(tenantID)},
+			TenantID:                   roachpb.MustMakeTenantID(tenantID),
 		},
 		Progress: jobspb.StreamReplicationProgress{
 			Expiration: timeutil.Now().Add(timeout),

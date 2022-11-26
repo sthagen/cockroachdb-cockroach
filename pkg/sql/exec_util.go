@@ -96,6 +96,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -201,11 +202,11 @@ var allowCrossDatabaseSeqReferences = settings.RegisterBoolSetting(
 // tenant.
 const SecondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_for_secondary_tenant.enabled"
 
-// secondaryTenantZoneConfigsEnabled controls if secondary tenants are allowed
+// SecondaryTenantZoneConfigsEnabled controls if secondary tenants are allowed
 // to set zone configurations. It has no effect for the system tenant.
 //
 // This setting has no effect on zone configurations that have already been set.
-var secondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
+var SecondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 	settings.TenantReadOnly,
 	SecondaryTenantsZoneConfigsEnabledSettingName,
 	"allow secondary tenants to set zone configurations; does not affect the system tenant",
@@ -1195,7 +1196,7 @@ type ExecutorConfig struct {
 	InternalRowMetrics   *rowinfra.Metrics
 
 	TestingKnobs                         ExecutorTestingKnobs
-	UpgradeTestingKnobs                  *upgrade.TestingKnobs
+	UpgradeTestingKnobs                  *upgradebase.TestingKnobs
 	PGWireTestingKnobs                   *PGWireTestingKnobs
 	SchemaChangerTestingKnobs            *SchemaChangerTestingKnobs
 	DeclarativeSchemaChangerTestingKnobs *scexec.TestingKnobs
@@ -1625,6 +1626,10 @@ type StreamingTestingKnobs struct {
 	// BeforeIngestionStart allows blocking the stream ingestion job
 	// before a stream ingestion happens.
 	BeforeIngestionStart func(ctx context.Context) error
+
+	// OverrideReplicationTTLSeconds will override the default value of the
+	// `ReplicationTTLSeconds` field on the StreamIngestion job details.
+	OverrideReplicationTTLSeconds int
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}

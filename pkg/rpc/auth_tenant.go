@@ -70,6 +70,9 @@ func (a tenantAuthorizer) authorize(
 	case "/cockroach.server.serverpb.Status/Regions":
 		return nil // no restriction to usage of this endpoint by tenants
 
+	case "/cockroach.server.serverpb.Status/NodeLocality":
+		return nil // no restriction to usage of this endpoint by tenants
+
 	case "/cockroach.server.serverpb.Status/Statements":
 		return a.authTenant(tenID)
 
@@ -124,6 +127,9 @@ func (a tenantAuthorizer) authorize(
 	case "/cockroach.roachpb.Internal/UpdateSpanConfigs":
 		return a.authUpdateSpanConfigs(tenID, req.(*roachpb.UpdateSpanConfigsRequest))
 
+	case "/cockroach.roachpb.Internal/GetRangeDescriptors":
+		return a.authGetRangeDescriptors(tenID, req.(*roachpb.GetRangeDescriptorsRequest))
+
 	default:
 		return authErrorf("unknown method %q", fullMethod)
 	}
@@ -152,6 +158,12 @@ func (a tenantAuthorizer) authBatch(tenID roachpb.TenantID, args *roachpb.BatchR
 	return nil
 }
 
+func (a tenantAuthorizer) authGetRangeDescriptors(
+	tenID roachpb.TenantID, args *roachpb.GetRangeDescriptorsRequest,
+) error {
+	return validateSpan(tenID, args.Span)
+}
+
 func reqAllowed(r roachpb.Request, tenID roachpb.TenantID) bool {
 	switch t := r.(type) {
 	case *roachpb.GetRequest,
@@ -174,7 +186,9 @@ func reqAllowed(r roachpb.Request, tenID roachpb.TenantID) bool {
 		*roachpb.AddSSTableRequest,
 		*roachpb.RefreshRequest,
 		*roachpb.RefreshRangeRequest,
-		*roachpb.IsSpanEmptyRequest:
+		*roachpb.IsSpanEmptyRequest,
+		*roachpb.LeaseInfoRequest,
+		*roachpb.RangeStatsRequest:
 		return true
 	case *roachpb.AdminScatterRequest:
 		return t.Class != roachpb.AdminScatterRequest_ARBITRARY || tenID.IsSystem()

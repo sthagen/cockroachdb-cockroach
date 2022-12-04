@@ -170,8 +170,6 @@ const (
 	VPrimordial4
 	VPrimordial5
 	VPrimordial6
-	VPrimordial7
-	VPrimordial8
 	VPrimordialMax
 
 	// V22_1 is CockroachDB v22.1. It's used for all v22.1.x patch releases.
@@ -337,6 +335,9 @@ const (
 	// for a partial statistics collection.
 	V23_1AddPartialStatisticsPredicateCol
 
+	// V23_1_CreateSystemJobInfoTable creates the system.job_info table.
+	V23_1CreateSystemJobInfoTable
+
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -396,14 +397,6 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     VPrimordial6,
 		Version: roachpb.Version{Major: 0, Minor: 0, Internal: 12},
-	},
-	{
-		Key:     VPrimordial7,
-		Version: roachpb.Version{Major: 0, Minor: 0, Internal: 14},
-	},
-	{
-		Key:     VPrimordial8,
-		Version: roachpb.Version{Major: 0, Minor: 0, Internal: 16},
 	},
 	{
 		Key:     VPrimordialMax,
@@ -586,6 +579,10 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     V23_1AddPartialStatisticsPredicateCol,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 8},
+	},
+	{
+		Key:     V23_1CreateSystemJobInfoTable,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 10},
 	},
 
 	// *************************************************

@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
@@ -1198,6 +1199,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   bytes_read_var      FLOAT NOT NULL,
   rows_read_avg       FLOAT NOT NULL,
   rows_read_var       FLOAT NOT NULL,
+  rows_written_avg    FLOAT NOT NULL,
+  rows_written_var    FLOAT NOT NULL,
   network_bytes_avg   FLOAT,
   network_bytes_var   FLOAT,
   network_msgs_avg    FLOAT,
@@ -1303,6 +1306,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.GetVariance(stats.Stats.Count))),   // bytes_read_var
 				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.Mean)),                              // rows_read_avg
 				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.GetVariance(stats.Stats.Count))),    // rows_read_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsWritten.Mean)),                           // rows_written_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsWritten.GetVariance(stats.Stats.Count))), // rows_written_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),        // network_bytes_avg
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),        // network_bytes_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),     // network_msgs_avg
@@ -1356,6 +1361,8 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
   retry_lat_var       FLOAT NOT NULL,
   commit_lat_avg      FLOAT NOT NULL,
   commit_lat_var      FLOAT NOT NULL,
+  idle_lat_avg        FLOAT NOT NULL,
+  idle_lat_var        FLOAT NOT NULL,
   rows_read_avg       FLOAT NOT NULL,
   rows_read_var       FLOAT NOT NULL,
   network_bytes_avg   FLOAT,
@@ -1408,6 +1415,8 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.GetVariance(stats.Stats.Count))),   // retry_lat_var
 				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.Mean)),                            // commit_lat_avg
 				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.GetVariance(stats.Stats.Count))),  // commit_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                              // idle_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.GetVariance(stats.Stats.Count))),    // idle_lat_var
 				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                              // rows_read_avg
 				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),    // rows_read_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),       // network_bytes_avg
@@ -1515,7 +1524,9 @@ CREATE TABLE crdb_internal.session_trace (
 }
 
 // crdbInternalClusterInflightTracesTable exposes cluster-wide inflight spans
-// for a trace_id.
+// for a trace_id. The spans returned are restricted to the tenant querying the
+// table; the system tenant will not get span belonging to other tenants
+// (although perhaps it should).
 //
 // crdbInternalClusterInflightTracesTable is an indexed, virtual table that only
 // returns rows when accessed with an index constraint specifying the trace_id
@@ -1556,14 +1567,9 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 				"unexpected type %T for trace_id column in virtual table crdb_internal.cluster_inflight_traces", unwrappedConstraint)
 		}
 
-		if !p.ExecCfg().Codec.ForSystemTenant() {
-			// Tenant nodes doesn't have trace collector so can't serve this table.
-			return false, pgerror.New(pgcode.FeatureNotSupported,
-				"table crdb_internal.cluster_inflight_traces is not implemented on tenants")
-		}
 		traceCollector := p.ExecCfg().TraceCollector
 		var iter *collector.Iterator
-		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next() {
+		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next(ctx) {
 			nodeID, recording := iter.Value()
 			traceString := recording.String()
 			traceJaegerJSON, err := recording.ToJaegerJSON("", "", fmt.Sprintf("node %d", nodeID))
@@ -2817,7 +2823,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 				tree.NewDInt(tree.DInt(fnIDToScID[fnDesc.GetID()])), // schema_id
 				tree.NewDString(fnIDToScName[fnDesc.GetID()]),       // schema_name
 				tree.NewDInt(tree.DInt(fnDesc.GetID())),             // function_id
-				tree.NewDString(fnDesc.GetName()),                   //function_name
+				tree.NewDString(fnDesc.GetName()),                   // function_name
 				tree.NewDString(tree.AsString(treeNode)),            // create_statement
 			)
 			if err != nil {
@@ -2938,12 +2944,12 @@ func showAlterStatement(
 	alterStmts *tree.DArray,
 	validateStmts *tree.DArray,
 ) error {
-	return table.ForeachOutboundFK(func(fk *descpb.ForeignKeyConstraint) error {
+	for _, fk := range table.OutboundForeignKeys() {
 		f := tree.NewFmtCtx(tree.FmtSimple)
 		f.WriteString("ALTER TABLE ")
 		f.FormatNode(tn)
 		f.WriteString(" ADD CONSTRAINT ")
-		f.FormatNameP(&fk.Name)
+		f.FormatName(fk.GetName())
 		f.WriteByte(' ')
 		// Passing in EmptySearchPath causes the schema name to show up in the
 		// constraint definition, which we need for `cockroach dump` output to be
@@ -2952,7 +2958,7 @@ func showAlterStatement(
 			&f.Buffer,
 			contextName,
 			table,
-			fk,
+			fk.ForeignKeyDesc(),
 			lCtx,
 			sessiondata.EmptySearchPath,
 		); err != nil {
@@ -2966,10 +2972,13 @@ func showAlterStatement(
 		f.WriteString("ALTER TABLE ")
 		f.FormatNode(tn)
 		f.WriteString(" VALIDATE CONSTRAINT ")
-		f.FormatNameP(&fk.Name)
+		f.FormatName(fk.GetName())
 
-		return validateStmts.Append(tree.NewDString(f.CloseAndGetString()))
-	})
+		if err := validateStmts.Append(tree.NewDString(f.CloseAndGetString())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // crdbInternalTableColumnsTable exposes the column descriptors.
@@ -3285,31 +3294,31 @@ CREATE TABLE crdb_internal.backward_dependencies (
 			tableID := tree.NewDInt(tree.DInt(table.GetID()))
 			tableName := tree.NewDString(table.GetName())
 
-			if err := table.ForeachOutboundFK(func(fk *descpb.ForeignKeyConstraint) error {
-				refTbl, err := tableLookup.getTableByID(fk.ReferencedTableID)
+			for _, fk := range table.OutboundForeignKeys() {
+				refTbl, err := tableLookup.getTableByID(fk.GetReferencedTableID())
 				if err != nil {
 					return err
 				}
-				refConstraint, err := tabledesc.FindFKReferencedUniqueConstraint(refTbl, fk.ReferencedColumnIDs)
+				refConstraint, err := tabledesc.FindFKReferencedUniqueConstraint(refTbl, fk)
 				if err != nil {
 					return err
 				}
 				var refIdxID descpb.IndexID
-				if refIdx, ok := refConstraint.(*descpb.IndexDescriptor); ok {
-					refIdxID = refIdx.ID
+				if refIdx := refConstraint.AsUniqueWithIndex(); refIdx != nil {
+					refIdxID = refIdx.GetID()
 				}
-				return addRow(
+				if err := addRow(
 					tableID, tableName,
 					tree.DNull,
 					tree.DNull,
-					tree.NewDInt(tree.DInt(fk.ReferencedTableID)),
+					tree.NewDInt(tree.DInt(fk.GetReferencedTableID())),
 					fkDep,
 					tree.NewDInt(tree.DInt(refIdxID)),
-					tree.NewDString(fk.Name),
+					tree.NewDString(fk.GetName()),
 					tree.DNull,
-				)
-			}); err != nil {
-				return err
+				); err != nil {
+					return err
+				}
 			}
 
 			// Record the view dependencies.
@@ -3417,19 +3426,18 @@ CREATE TABLE crdb_internal.forward_dependencies (
 			func(db catalog.DatabaseDescriptor, _ catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
 				tableID := tree.NewDInt(tree.DInt(table.GetID()))
 				tableName := tree.NewDString(table.GetName())
-
-				if err := table.ForeachInboundFK(func(fk *descpb.ForeignKeyConstraint) error {
-					return addRow(
+				for _, fk := range table.InboundForeignKeys() {
+					if err := addRow(
 						tableID, tableName,
 						tree.DNull,
-						tree.NewDInt(tree.DInt(fk.OriginTableID)),
+						tree.NewDInt(tree.DInt(fk.GetOriginTableID())),
 						fkDep,
 						tree.DNull,
 						tree.DNull,
 						tree.DNull,
-					)
-				}); err != nil {
-					return err
+					); err != nil {
+						return err
+					}
 				}
 
 				reportDependedOnBy := func(
@@ -3660,16 +3668,6 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 			return nil, nil, err
 		}
 
-		// Map node descriptors to localities
-		descriptors, err := getAllNodeDescriptors(p)
-		if err != nil {
-			return nil, nil, err
-		}
-		nodeIDToLocality := make(map[roachpb.NodeID]roachpb.Locality)
-		for _, desc := range descriptors {
-			nodeIDToLocality[desc.NodeID] = desc.Locality
-		}
-
 		var desc roachpb.RangeDescriptor
 
 		i := 0
@@ -3723,8 +3721,12 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 
 			replicaLocalityArr := tree.NewDArray(types.String)
 			for _, replica := range votersAndNonVoters {
-				replicaLocality := nodeIDToLocality[replica.NodeID].String()
-				if err := replicaLocalityArr.Append(tree.NewDString(replicaLocality)); err != nil {
+				nodeDesc, err := p.ExecCfg().NodeDescs.GetNodeDescriptor(replica.NodeID)
+				if err != nil {
+					return nil, err
+				}
+				replicaLocality := tree.NewDString(nodeDesc.Locality.String())
+				if err := replicaLocalityArr.Append(replicaLocality); err != nil {
 					return nil, err
 				}
 			}
@@ -4592,7 +4594,7 @@ CREATE TABLE crdb_internal.regions (
 )
 	`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		resp, err := p.extendedEvalCtx.RegionsServer.Regions(ctx, &serverpb.RegionsRequest{})
+		resp, err := p.extendedEvalCtx.TenantStatusServer.Regions(ctx, &serverpb.RegionsRequest{})
 		if err != nil {
 			return err
 		}
@@ -4890,7 +4892,7 @@ CREATE TABLE crdb_internal.predefined_comments (
 		// NB if ever anyone were to extend this table to carry column
 		// comments, make sure to update pg_catalog.col_description to
 		// retrieve those comments.
-		tableCommentKey := tree.NewDInt(tree.DInt(keys.TableCommentType))
+		tableCommentKey := tree.NewDInt(tree.DInt(catalogkeys.TableCommentType))
 		vt := p.getVirtualTabler()
 		vEntries := vt.getSchemas()
 		vSchemaNames := vt.getSchemaNames()
@@ -5290,33 +5292,28 @@ CREATE TABLE crdb_internal.cross_db_references (
 				// references to a different database.
 				if table.IsTable() {
 					objectDatabaseName := lookupFn.getDatabaseName(table)
-					err := table.ForeachOutboundFK(
-						func(fk *descpb.ForeignKeyConstraint) error {
-							referencedTable, err := lookupFn.getTableByID(fk.ReferencedTableID)
+					for _, fk := range table.OutboundForeignKeys() {
+						referencedTable, err := lookupFn.getTableByID(fk.GetReferencedTableID())
+						if err != nil {
+							return err
+						}
+						if referencedTable.GetParentID() != table.GetParentID() {
+							refSchemaName, err := lookupFn.getSchemaNameByID(referencedTable.GetParentSchemaID())
 							if err != nil {
 								return err
 							}
-							if referencedTable.GetParentID() != table.GetParentID() {
-								refSchemaName, err := lookupFn.getSchemaNameByID(referencedTable.GetParentSchemaID())
-								if err != nil {
-									return err
-								}
-								refDatabaseName := lookupFn.getDatabaseName(referencedTable)
+							refDatabaseName := lookupFn.getDatabaseName(referencedTable)
 
-								if err := addRow(tree.NewDString(objectDatabaseName),
-									tree.NewDString(sc.GetName()),
-									tree.NewDString(table.GetName()),
-									tree.NewDString(refDatabaseName),
-									tree.NewDString(refSchemaName),
-									tree.NewDString(referencedTable.GetName()),
-									tree.NewDString("table foreign key reference")); err != nil {
-									return err
-								}
+							if err := addRow(tree.NewDString(objectDatabaseName),
+								tree.NewDString(sc.GetName()),
+								tree.NewDString(table.GetName()),
+								tree.NewDString(refDatabaseName),
+								tree.NewDString(refSchemaName),
+								tree.NewDString(referencedTable.GetName()),
+								tree.NewDString("table foreign key reference")); err != nil {
+								return err
 							}
-							return nil
-						})
-					if err != nil {
-						return err
+						}
 					}
 
 					// Check for sequence dependencies

@@ -157,6 +157,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.SocketFile = params.SocketFile
 	cfg.RetryOptions = params.RetryOptions
 	cfg.Locality = params.Locality
+	cfg.StartDiagnosticsReporting = params.StartDiagnosticsReporting
 	if params.TraceDir != "" {
 		if err := initTraceDir(params.TraceDir); err == nil {
 			cfg.InflightTraceDirName = params.TraceDir
@@ -526,16 +527,17 @@ func (ts *TestServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 	params := base.TestTenantArgs{
 		// Currently, all the servers leverage the same tenant ID. We may
 		// want to change this down the road, for more elaborate testing.
-		TenantID:            serverutils.TestTenantID(),
-		MemoryPoolSize:      ts.params.SQLMemoryPoolSize,
-		TempStorageConfig:   &tempStorageConfig,
-		Locality:            ts.params.Locality,
-		ExternalIODir:       ts.params.ExternalIODir,
-		ExternalIODirConfig: ts.params.ExternalIODirConfig,
-		ForceInsecure:       ts.Insecure(),
-		UseDatabase:         ts.params.UseDatabase,
-		SSLCertsDir:         ts.params.SSLCertsDir,
-		TestingKnobs:        ts.params.Knobs,
+		TenantID:                  serverutils.TestTenantID(),
+		MemoryPoolSize:            ts.params.SQLMemoryPoolSize,
+		TempStorageConfig:         &tempStorageConfig,
+		Locality:                  ts.params.Locality,
+		ExternalIODir:             ts.params.ExternalIODir,
+		ExternalIODirConfig:       ts.params.ExternalIODirConfig,
+		ForceInsecure:             ts.Insecure(),
+		UseDatabase:               ts.params.UseDatabase,
+		SSLCertsDir:               ts.params.SSLCertsDir,
+		TestingKnobs:              ts.params.Knobs,
+		StartDiagnosticsReporting: ts.params.StartDiagnosticsReporting,
 	}
 
 	// Since we're creating a tenant, it doesn't make sense to pass through the
@@ -760,9 +762,19 @@ func (t *TestTenant) MustGetSQLCounter(name string) int64 {
 	return mustGetSQLCounterForRegistry(t.metricsRegistry, name)
 }
 
+// RangeDescIteratorFactory implements the TestTenantInterface.
+func (t *TestTenant) RangeDescIteratorFactory() interface{} {
+	return t.SQLServer.execCfg.RangeDescIteratorFactory
+}
+
 // Codec is part of the TestTenantInterface.
 func (t *TestTenant) Codec() keys.SQLCodec {
 	return t.execCfg.Codec
+}
+
+// Tracer is part of the TestTenantInterface.
+func (t *TestTenant) Tracer() *tracing.Tracer {
+	return t.SQLServer.ambientCtx.Tracer
 }
 
 // StartTenant starts a SQL tenant communicating with this TestServer.
@@ -870,6 +882,7 @@ func (ts *TestServer) StartTenant(
 	baseCfg.HeapProfileDirName = params.HeapProfileDirName
 	baseCfg.GoroutineDumpDirName = params.GoroutineDumpDirName
 	baseCfg.ClusterName = ts.Cfg.ClusterName
+	baseCfg.StartDiagnosticsReporting = params.StartDiagnosticsReporting
 
 	// For now, we don't support split RPC/SQL ports for secondary tenants
 	// in test servers.
@@ -1536,6 +1549,11 @@ func (ts *TestServer) SystemConfigProvider() config.SystemConfigProvider {
 
 func (ts *TestServer) Codec() keys.SQLCodec {
 	return ts.ExecutorConfig().(sql.ExecutorConfig).Codec
+}
+
+// RangeDescIteratorFactory is part of the TestServerInterface.
+func (ts *TestServer) RangeDescIteratorFactory() interface{} {
+	return ts.sqlServer.execCfg.RangeDescIteratorFactory
 }
 
 type testServerFactoryImpl struct{}

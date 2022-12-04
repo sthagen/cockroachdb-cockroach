@@ -392,7 +392,7 @@ func NewNode(
 		testingErrorEvent:     cfg.TestingKnobs.TestingResponseErrorEvent,
 	}
 	n.storeCfg.KVAdmissionController = kvadmission.MakeController(
-		kvAdmissionQ, elasticCPUGrantCoord.ElasticCPUWorkQueue, storeGrantCoords, cfg.Settings,
+		kvAdmissionQ, elasticCPUGrantCoord, storeGrantCoords, cfg.Settings,
 	)
 	n.storeCfg.SchedulerLatencyListener = elasticCPUGrantCoord.SchedulerLatencyListener
 	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
@@ -1922,4 +1922,24 @@ func (n *Node) SpanConfigConformance(
 		return nil, err
 	}
 	return &roachpb.SpanConfigConformanceResponse{Report: report}, nil
+}
+
+// GetRangeDescriptors implements the roachpb.InternalServer interface.
+func (n *Node) GetRangeDescriptors(
+	args *roachpb.GetRangeDescriptorsRequest, stream roachpb.Internal_GetRangeDescriptorsServer,
+) error {
+	iter, err := n.execCfg.RangeDescIteratorFactory.NewIterator(stream.Context(), args.Span)
+	if err != nil {
+		return err
+	}
+
+	var rangeDescriptors []roachpb.RangeDescriptor
+	for iter.Valid() {
+		rangeDescriptors = append(rangeDescriptors, iter.CurRangeDescriptor())
+		iter.Next()
+	}
+
+	return stream.Send(&roachpb.GetRangeDescriptorsResponse{
+		RangeDescriptors: rangeDescriptors,
+	})
 }

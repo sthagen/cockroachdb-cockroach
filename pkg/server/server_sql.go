@@ -113,7 +113,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
-	"github.com/cockroachdb/cockroach/pkg/util/rangedesciter"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -178,9 +178,6 @@ type SQLServer struct {
 
 	// pgL is the shared RPC/SQL listener, opened when RPC was initialized.
 	pgL net.Listener
-	// connManager is the connection manager to use to set up additional
-	// SQL listeners in AcceptClients().
-	connManager netutil.Server
 
 	// isReady is the health status of the node. When true, the node is healthy;
 	// load balancers and connection management tools treat the node as "ready".
@@ -340,9 +337,6 @@ type sqlServerArgs struct {
 	// Used to watch settings and descriptor changes.
 	rangeFeedFactory *rangefeed.Factory
 
-	// Used to query valid regions on the server.
-	regionsServer serverpb.RegionsServer
-
 	// Used to query status information useful for debugging on the server.
 	tenantStatusServer serverpb.TenantStatusServer
 
@@ -368,6 +362,14 @@ type sqlServerArgs struct {
 	// externalStorageBuilder is the constructor for accesses to external
 	// storage.
 	externalStorageBuilder *externalStorageBuilder
+
+	// admissionPacerFactory is used for elastic CPU control when performing
+	// CPU intensive operations, such as CDC event encoding/decoding.
+	admissionPacerFactory admission.PacerFactory
+
+	// rangeDescIteratorFactory is used to construct iterators over range
+	// descriptors.
+	rangeDescIteratorFactory rangedesc.IteratorFactory
 }
 
 type monitorAndMetrics struct {
@@ -746,6 +748,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		ExternalIORecorder:       cfg.costController,
 		TenantCostController:     cfg.costController,
 		RangeStatsFetcher:        rangeStatsFetcher,
+		AdmissionPacerFactory:    cfg.admissionPacerFactory,
+		ExecutorConfig:           execCfg,
 	}
 	cfg.TempStorageConfig.Mon.SetMetrics(distSQLMetrics.CurDiskBytesCount, distSQLMetrics.MaxDiskBytesHist)
 	if distSQLTestingKnobs := cfg.TestingKnobs.DistSQL; distSQLTestingKnobs != nil {
@@ -811,10 +815,39 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	// all nodes in the cluster.
 	// The collector requires nodeliveness to get a list of all the nodes in the
 	// cluster.
-	var traceCollector *collector.TraceCollector
-	if hasNodeLiveness {
-		traceCollector = collector.New(cfg.nodeDialer, nodeLiveness, cfg.Tracer)
+	var getNodes func(ctx context.Context) ([]roachpb.NodeID, error)
+	var nodeDialer *nodedialer.Dialer
+	if !isSQLPod {
+		nodeDialer = cfg.nodeDialer
+		getNodes = func(ctx context.Context) ([]roachpb.NodeID, error) {
+			var ns []roachpb.NodeID
+			ls, err := nodeLiveness.GetLivenessesFromKV(ctx)
+			if err != nil {
+				return nil, err
+			}
+			for _, l := range ls {
+				if l.Membership.Decommissioned() {
+					continue
+				}
+				ns = append(ns, l.NodeID)
+			}
+			return ns, nil
+		}
+	} else {
+		nodeDialer = cfg.podNodeDialer
+		getNodes = func(ctx context.Context) ([]roachpb.NodeID, error) {
+			instances, err := cfg.sqlInstanceReader.GetAllInstances(ctx)
+			if err != nil {
+				return nil, err
+			}
+			instanceIDs := make([]roachpb.NodeID, len(instances))
+			for i, instance := range instances {
+				instanceIDs[i] = roachpb.NodeID(instance.InstanceID)
+			}
+			return instanceIDs, err
+		}
 	}
+	traceCollector := collector.New(cfg.Tracer, getNodes, nodeDialer)
 	contentionMetrics := contention.NewMetrics()
 	cfg.registry.AddMetricStruct(contentionMetrics)
 
@@ -847,7 +880,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		DistSQLSrv:                distSQLServer,
 		NodesStatusServer:         cfg.nodesStatusServer,
 		SQLStatusServer:           cfg.sqlStatusServer,
-		RegionsServer:             cfg.regionsServer,
 		SessionRegistry:           cfg.sessionRegistry,
 		ClosedSessionCache:        cfg.closedSessionCache,
 		ContentionRegistry:        contentionRegistry,
@@ -865,6 +897,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		TraceCollector:            traceCollector,
 		TenantUsageServer:         cfg.tenantUsageServer,
 		KVStoresIterator:          cfg.kvStoresIterator,
+		RangeDescIteratorFactory:  cfg.rangeDescIteratorFactory,
 		SyntheticPrivilegeCache: cacheutil.NewCache(
 			serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper, 1 /* numSystemTables */),
 
@@ -909,6 +942,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		DescIDGenerator:            descidgen.NewGenerator(cfg.Settings, codec, cfg.db),
 		RangeStatsFetcher:          rangeStatsFetcher,
 		EventsExporter:             cfg.eventsServer,
+		NodeDescs:                  cfg.nodeDescs,
 	}
 
 	if sqlSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
@@ -1088,10 +1122,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		var systemDeps upgrade.SystemDeps
 		if codec.ForSystemTenant() {
 			c = upgradecluster.New(upgradecluster.ClusterConfig{
-				NodeLiveness:      nodeLiveness,
-				Dialer:            cfg.nodeDialer,
-				RangeDescIterator: rangedesciter.New(cfg.db),
-				DB:                cfg.db,
+				NodeLiveness:     nodeLiveness,
+				Dialer:           cfg.nodeDialer,
+				RangeDescScanner: rangedesc.NewScanner(cfg.db),
+				DB:               cfg.db,
 			})
 			systemDeps = upgrade.SystemDeps{
 				Cluster:          c,
@@ -1278,7 +1312,6 @@ func (s *SQLServer) preStart(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	knobs base.TestingKnobs,
-	connManager netutil.Server,
 	pgL net.Listener,
 	orphanedLeasesTimeThresholdNanos int64,
 ) error {
@@ -1318,8 +1351,8 @@ func (s *SQLServer) preStart(
 		); err != nil {
 			return err
 		}
-		// Acquire our instance ID.
-		instanceID, err := s.sqlInstanceStorage.CreateInstance(
+		// Acquire our instance row.
+		instance, err := s.sqlInstanceStorage.CreateInstance(
 			ctx, session.ID(), session.Expiration(), s.cfg.AdvertiseAddr, s.distSQLServer.Locality)
 		if err != nil {
 			return err
@@ -1333,19 +1366,18 @@ func (s *SQLServer) preStart(
 		// Hand the instance ID to everybody who needs it, unless the sqlIDContainer
 		// has already been initialized with a node ID. IN that case we don't need to
 		// initialize a SQL instance ID in this case as this is not a SQL pod server.
-		if err := s.setInstanceID(ctx, instanceID, session.ID()); err != nil {
+		log.Infof(ctx, "bound sqlinstance: %v", instance)
+		if err := s.setInstanceID(ctx, instance.InstanceID, session.ID()); err != nil {
 			return err
 		}
 		// Start the instance provider. This needs to come after we've allocated our
 		// instance ID because the instances reader needs to see our own instance;
-		// we might be the only SQL server available, and if the reader doesn't see
+		// we might be the only SQL server available, especially when we have not
+		// received data from the rangefeed yet, and if the reader doesn't see
 		// it, we'd be unable to plan any queries.
-		if err := s.sqlInstanceReader.Start(ctx); err != nil {
-			return err
-		}
+		s.sqlInstanceReader.Start(ctx, instance)
 	}
 
-	s.connManager = connManager
 	s.pgL = pgL
 	s.execCfg.GCJobNotifier.Start(ctx)
 	s.temporaryObjectCleaner.Start(ctx, stopper)
@@ -1505,11 +1537,7 @@ func (s *SQLServer) AnnotateCtx(ctx context.Context) context.Context {
 // startServeSQL starts accepting incoming SQL connections over TCP.
 // It also starts listening on the Unix socket, if that was configured.
 func (s *SQLServer) startServeSQL(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	connManager netutil.Server,
-	pgL net.Listener,
-	socketFileCfg *string,
+	ctx context.Context, stopper *stop.Stopper, pgL net.Listener, socketFileCfg *string,
 ) error {
 	log.Ops.Info(ctx, "serving sql connections")
 	// Start servicing SQL connections.
@@ -1517,10 +1545,14 @@ func (s *SQLServer) startServeSQL(
 	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
 	tcpKeepAlive := makeTCPKeepAliveManager()
 
+	// The connManager is responsible for tearing down the net.Conn
+	// objects when the stopper tells us to shut down.
+	connManager := netutil.MakeTCPServer(ctx, stopper)
+
 	_ = stopper.RunAsyncTaskEx(pgCtx,
 		stop.TaskOpts{TaskName: "pgwire-listener", SpanOpt: stop.SterileRootSpan},
 		func(ctx context.Context) {
-			err := connManager.ServeWith(ctx, stopper, pgL, func(ctx context.Context, conn net.Conn) {
+			err := connManager.ServeWith(ctx, pgL, func(ctx context.Context, conn net.Conn) {
 				connCtx := s.pgServer.AnnotateCtxForIncomingConn(ctx, conn)
 				tcpKeepAlive.configure(connCtx, conn)
 
@@ -1572,7 +1604,7 @@ func (s *SQLServer) startServeSQL(
 		if err := stopper.RunAsyncTaskEx(pgCtx,
 			stop.TaskOpts{TaskName: "unix-listener", SpanOpt: stop.SterileRootSpan},
 			func(ctx context.Context) {
-				err := connManager.ServeWith(ctx, stopper, unixLn, func(ctx context.Context, conn net.Conn) {
+				err := connManager.ServeWith(ctx, unixLn, func(ctx context.Context, conn net.Conn) {
 					connCtx := s.pgServer.AnnotateCtxForIncomingConn(ctx, conn)
 					if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
 						log.Ops.Errorf(connCtx, "%v", err)

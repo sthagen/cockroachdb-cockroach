@@ -104,6 +104,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -1177,7 +1178,6 @@ type ExecutorConfig struct {
 	// available when not running as a system tenant.
 	SQLStatusServer    serverpb.SQLStatusServer
 	TenantStatusServer serverpb.TenantStatusServer
-	RegionsServer      serverpb.RegionsServer
 	MetricsRecorder    nodeStatusGenerator
 	SessionRegistry    *SessionRegistry
 	ClosedSessionCache *ClosedSessionCache
@@ -1294,6 +1294,10 @@ type ExecutorConfig struct {
 	// access stores on this node.
 	KVStoresIterator kvserverbase.StoresIterator
 
+	// RangeDescIteratorFactory is used to construct Iterators over range
+	// descriptors.
+	RangeDescIteratorFactory rangedesc.IteratorFactory
+
 	// CollectionFactory is used to construct a descs.Collection.
 	CollectionFactory *descs.CollectionFactory
 
@@ -1329,7 +1333,7 @@ type ExecutorConfig struct {
 	// DescIDGenerator generates unique descriptor IDs.
 	DescIDGenerator eval.DescIDGenerator
 
-	// SyntheticPrivilegeCache
+	// SyntheticPrivilegeCache stores synthetic privileges in an in-memory cache.
 	SyntheticPrivilegeCache *cacheutil.Cache
 
 	// RangeStatsFetcher is used to fetch RangeStats.
@@ -1337,6 +1341,9 @@ type ExecutorConfig struct {
 
 	// EventsExporter is the client for the Observability Service.
 	EventsExporter obs.EventsExporter
+
+	// NodeDescs stores node descriptors in an in-memory cache.
+	NodeDescs kvcoord.NodeDescStore
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1817,6 +1824,8 @@ func checkResultType(typ *types.T) error {
 	case types.TimeFamily:
 	case types.TimeTZFamily:
 	case types.TimestampTZFamily:
+	case types.TSQueryFamily:
+	case types.TSVectorFamily:
 	case types.IntervalFamily:
 	case types.JsonFamily:
 	case types.UuidFamily:

@@ -231,7 +231,16 @@ func TestBackupRestoreJobTagAndLabel(t *testing.T) {
 	}
 	found := false
 	var mu syncutil.Mutex
-	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, multiNode, numAccounts, InitManualReplication,
+	// backupRestoreTestSetupWithParams() writes some data and then, within
+	// workloadsql.Setup() it splits and scatters the ranges. When using 3 nodes
+	// scatter means we only move leases which is usually enough. During stress or
+	// race we see that the leases may not be scattered because the other 2
+	// replicas are not yet initialized. In those cases the leases all stay on
+	// node 1 and therefore the flows run locally and the test fails (because
+	// 'found' stays false). The simple solution here is to use 4 nodes where
+	// scatter moves replicas in addition to leases.
+	numNodes := 4
+	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, numNodes, numAccounts, InitManualReplication,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				DisableDefaultTestTenant: true,
@@ -8395,6 +8404,10 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 	//  7. Drop index
 	//  8. Inc 4
 
+	// Disable declarative schema changer for this test, until the knobs are updated.
+	sqlDB.Exec(t, "SET use_declarative_schema_changer='off';")
+	sqlDB.Exec(t, "SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer='off';")
+
 	// First take a full backup.
 	fullBackup := localFoo + "/full"
 	sqlDB.Exec(t, `BACKUP DATABASE data TO $1 WITH revision_history`, fullBackup)
@@ -10281,7 +10294,7 @@ $$;
 		require.Equal(t, 104, int(fnDesc.GetParentID()))
 		require.Equal(t, 106, int(fnDesc.GetParentSchemaID()))
 		require.Equal(t, "SELECT a FROM db1.sc1.tbl1;\nSELECT nextval(110:::REGCLASS);", fnDesc.GetFunctionBody())
-		require.Equal(t, 100108, int(fnDesc.GetArgs()[0].Type.Oid()))
+		require.Equal(t, 100108, int(fnDesc.GetParams()[0].Type.Oid()))
 		require.Equal(t, []descpb.ID{107, 110}, fnDesc.GetDependsOn())
 		require.Equal(t, []descpb.ID{108, 109}, fnDesc.GetDependsOnTypes())
 
@@ -10338,7 +10351,7 @@ $$;
 		require.Equal(t, 114, int(fnDesc.GetParentSchemaID()))
 		// Make sure db name and IDs are rewritten in function body.
 		require.Equal(t, "SELECT a FROM db1_new.sc1.tbl1;\nSELECT nextval(118:::REGCLASS);", fnDesc.GetFunctionBody())
-		require.Equal(t, 100116, int(fnDesc.GetArgs()[0].Type.Oid()))
+		require.Equal(t, 100116, int(fnDesc.GetParams()[0].Type.Oid()))
 		require.Equal(t, []descpb.ID{115, 118}, fnDesc.GetDependsOn())
 		require.Equal(t, []descpb.ID{116, 117}, fnDesc.GetDependsOnTypes())
 
@@ -10428,7 +10441,7 @@ $$;
 		require.Equal(t, 104, int(fnDesc.GetParentID()))
 		require.Equal(t, 106, int(fnDesc.GetParentSchemaID()))
 		require.Equal(t, "SELECT a FROM db1.sc1.tbl1;\nSELECT nextval(110:::REGCLASS);", fnDesc.GetFunctionBody())
-		require.Equal(t, 100108, int(fnDesc.GetArgs()[0].Type.Oid()))
+		require.Equal(t, 100108, int(fnDesc.GetParams()[0].Type.Oid()))
 		require.Equal(t, []descpb.ID{107, 110}, fnDesc.GetDependsOn())
 		require.Equal(t, []descpb.ID{108, 109}, fnDesc.GetDependsOnTypes())
 
@@ -10487,7 +10500,7 @@ $$;
 		require.Equal(t, 125, int(fnDesc.GetParentSchemaID()))
 		// Make sure db name and IDs are rewritten in function body.
 		require.Equal(t, "SELECT a FROM db1.sc1.tbl1;\nSELECT nextval(129:::REGCLASS);", fnDesc.GetFunctionBody())
-		require.Equal(t, 100127, int(fnDesc.GetArgs()[0].Type.Oid()))
+		require.Equal(t, 100127, int(fnDesc.GetParams()[0].Type.Oid()))
 		require.Equal(t, []descpb.ID{126, 129}, fnDesc.GetDependsOn())
 		require.Equal(t, []descpb.ID{127, 128}, fnDesc.GetDependsOnTypes())
 

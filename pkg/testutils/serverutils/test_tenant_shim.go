@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // TestTenantInterface defines SQL-only tenant functionality that tests need; it
@@ -155,6 +156,13 @@ type TestTenantInterface interface {
 	// Codec returns this tenant's codec (or keys.SystemSQLCodec if this is the
 	// system tenant).
 	Codec() keys.SQLCodec
+
+	// RangeDescIteratorFactory returns the underlying rangedesc.IteratorFactory
+	// as an interface{}.
+	RangeDescIteratorFactory() interface{}
+
+	// !!!
+	Tracer() *tracing.Tracer
 
 	// TODO(irfansharif): We'd benefit from an API to construct a *gosql.DB, or
 	// better yet, a *sqlutils.SQLRunner. We use it all the time, constructing

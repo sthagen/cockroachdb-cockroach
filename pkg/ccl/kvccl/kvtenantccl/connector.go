@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
@@ -115,11 +116,6 @@ var _ rangecache.RangeDescriptorDB = (*Connector)(nil)
 // the need for SQL-only tenant processes to join the cluster-wide gossip
 // network.
 var _ config.SystemConfigProvider = (*Connector)(nil)
-
-// Connector is capable of find the region of every node in the cluster.
-// This is necessary for region validation for zone configurations and
-// multi-region primitives.
-var _ serverpb.RegionsServer = (*Connector)(nil)
 
 // Connector is capable of finding debug information about the current
 // tenant within the cluster. This is necessary for things such as
@@ -415,39 +411,76 @@ func (c *Connector) RangeLookup(
 	return nil, nil, ctx.Err()
 }
 
-// Regions implements the serverpb.RegionsServer interface.
+// Regions implements the serverpb.TenantStatusServer interface
 func (c *Connector) Regions(
 	ctx context.Context, req *serverpb.RegionsRequest,
-) (resp *serverpb.RegionsResponse, _ error) {
-	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
-		var err error
-		resp, err = c.Regions(ctx, req)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+) (resp *serverpb.RegionsResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.Regions(ctx, req)
+		return
+	})
+	return
 }
 
 // TenantRanges implements the serverpb.TenantStatusServer interface
 func (c *Connector) TenantRanges(
 	ctx context.Context, req *serverpb.TenantRangesRequest,
-) (resp *serverpb.TenantRangesResponse, _ error) {
-	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
-		var err error
-		resp, err = c.TenantRanges(ctx, req)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+) (resp *serverpb.TenantRangesResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.TenantRanges(ctx, req)
+		return
+	})
+	return
 }
 
 // FirstRange implements the kvcoord.RangeDescriptorDB interface.
 func (c *Connector) FirstRange() (*roachpb.RangeDescriptor, error) {
 	return nil, status.Error(codes.Unauthenticated, "kvtenant.Proxy does not have access to FirstRange")
+}
+
+// NewIterator implements the rangedesc.IteratorFactory interface.
+func (c *Connector) NewIterator(
+	ctx context.Context, span roachpb.Span,
+) (rangedesc.Iterator, error) {
+	var rangeDescriptors []roachpb.RangeDescriptor
+	for ctx.Err() == nil {
+		rangeDescriptors = rangeDescriptors[:0] // clear out.
+		client, err := c.getClient(ctx)
+		if err != nil {
+			continue
+		}
+		stream, err := client.GetRangeDescriptors(ctx, &roachpb.GetRangeDescriptorsRequest{
+			Span: span,
+		})
+		if err != nil {
+			// TODO(arul): We probably don't want to treat all errors here as "soft".
+			// for example, it doesn't make much sense to retry the request if it fails
+			// the keybounds check.
+			// Soft RPC error. Drop client and retry.
+			log.Warningf(ctx, "error issuing GetRangeDescriptors RPC: %v", err)
+			c.tryForgetClient(ctx, client)
+			continue
+		}
+
+		for ctx.Err() == nil {
+			e, err := stream.Recv()
+			if err != nil {
+				if err == io.EOF {
+					return &rangeDescIterator{
+						rangeDescs: rangeDescriptors,
+						curIdx:     0,
+					}, nil
+				}
+				// TODO(arul): We probably don't want to treat all errors here as "soft".
+				// Soft RPC error. Drop client and retry.
+				log.Warningf(ctx, "error consuming GetRangeDescriptors RPC: %v", err)
+				c.tryForgetClient(ctx, client)
+				break
+			}
+			rangeDescriptors = append(rangeDescriptors, e.RangeDescriptors...)
+		}
+	}
+	return nil, ctx.Err()
 }
 
 // TokenBucket implements the kvtenant.TokenBucketProvider interface.

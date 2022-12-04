@@ -164,34 +164,29 @@ func (p *Manager) Protect(
 	if readAsOf.IsEmpty() {
 		return nil, nil
 	}
-	var protectedtsID *uuid.UUID
-	err := p.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		details := job.Details()
-		protectedtsID = getProtectedTSOnJob(details)
-		// Check if there is an existing protected timestamp ID on the job,
-		// in which case we can only need to update it.
+	// Set up a new protected timestamp ID and install it on the job.
+	err := job.Update(ctx, nil, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		// Check if the protected timestamp is visible in the txn.
+		protectedtsID := getProtectedTSOnJob(md.Payload.UnwrapDetails())
+		// If it's been removed lets create a new one.
 		if protectedtsID == nil {
 			newID := uuid.MakeV4()
 			protectedtsID = &newID
-			// Set up a new protected timestamp ID and install it on the job.
-			return job.Update(ctx, txn, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-				details = job.Details()
-				details = setProtectedTSOnJob(details, protectedtsID)
-				md.Payload.Details = jobspb.WrapPayloadDetails(details)
-				ju.UpdatePayload(md.Payload)
-
-				rec := MakeRecord(*protectedtsID,
-					int64(job.ID()), readAsOf, nil, Jobs, target)
-				return p.protectedTSProvider.Protect(ctx, txn, rec)
-			})
+			details := setProtectedTSOnJob(md.Payload.UnwrapDetails(), protectedtsID)
+			md.Payload.Details = jobspb.WrapPayloadDetails(details)
+			ju.UpdatePayload(md.Payload)
+			rec := MakeRecord(*protectedtsID,
+				int64(job.ID()), readAsOf, nil, Jobs, target)
+			return p.protectedTSProvider.Protect(ctx, txn, rec)
 		}
-		// Refresh the existing timestamp.
+		// Refresh the existing timestamp, otherwise.
 		return p.protectedTSProvider.UpdateTimestamp(ctx, txn, *protectedtsID, readAsOf)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return func(ctx context.Context) error {
+		// Remove the protected timestamp.
 		return p.Unprotect(ctx, job)
 	}, nil
 }
@@ -201,19 +196,23 @@ func (p *Manager) Protect(
 // record. Note: This should only be used for job cleanup if is not currently,
 // executing.
 func (p *Manager) Unprotect(ctx context.Context, job *jobs.Job) error {
-	return p.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		// Fetch the protected timestamp UUID from the job, if one exists.
-		protectedtsID := getProtectedTSOnJob(job.Details())
+	// Fetch the protected timestamp UUID from the job, if one exists.
+	if getProtectedTSOnJob(job.Details()) == nil {
+		return nil
+	}
+	// If we do find one then we need to clean up the protected timestamp,
+	// and remove it from the job.
+	return job.Update(ctx, nil, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		// The job will get refreshed, so check one more time the protected
+		// timestamp still exists. The callback returned from Protect works
+		// on a previously cached copy.
+		protectedtsID := getProtectedTSOnJob(md.Payload.UnwrapDetails())
 		if protectedtsID == nil {
 			return nil
 		}
-		// If we do find one then we need to clean up the protected timestamp,
-		// and remove it from the job.
-		return job.Update(ctx, txn, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-			updatedDetails := setProtectedTSOnJob(job.Details(), nil)
-			md.Payload.Details = jobspb.WrapPayloadDetails(updatedDetails)
-			ju.UpdatePayload(md.Payload)
-			return p.protectedTSProvider.Release(ctx, txn, *protectedtsID)
-		})
+		updatedDetails := setProtectedTSOnJob(md.Payload.UnwrapDetails(), nil)
+		md.Payload.Details = jobspb.WrapPayloadDetails(updatedDetails)
+		ju.UpdatePayload(md.Payload)
+		return p.protectedTSProvider.Release(ctx, txn, *protectedtsID)
 	})
 }

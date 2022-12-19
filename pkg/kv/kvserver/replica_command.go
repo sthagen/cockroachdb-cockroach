@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
@@ -137,8 +136,6 @@ func splitSnapshotWarningStr(rangeID roachpb.RangeID, status *raft.Status) strin
 // right side is assigned rightRangeID and starts at splitKey. The supplied
 // expiration is the "sticky bit" stored on the right descriptor.
 func prepareSplitDescs(
-	ctx context.Context,
-	st *cluster.Settings,
 	rightRangeID roachpb.RangeID,
 	splitKey roachpb.RKey,
 	expiration hlc.Timestamp,
@@ -187,8 +184,7 @@ func splitTxnAttempt(
 	desc := oldDesc
 	oldDesc = nil // prevent accidental use
 
-	leftDesc, rightDesc := prepareSplitDescs(
-		ctx, store.ClusterSettings(), rightRangeID, splitKey, expiration, desc)
+	leftDesc, rightDesc := prepareSplitDescs(rightRangeID, splitKey, expiration, desc)
 
 	// Update existing range descriptor for left hand side of
 	// split. Note that we mutate the descriptor for the left hand
@@ -196,7 +192,7 @@ func splitTxnAttempt(
 	{
 		b := txn.NewBatch()
 		leftDescKey := keys.RangeDescriptorKey(leftDesc.StartKey)
-		if err := updateRangeDescriptor(ctx, b, leftDescKey, dbDescValue, leftDesc); err != nil {
+		if err := updateRangeDescriptor(b, leftDescKey, dbDescValue, leftDesc); err != nil {
 			return err
 		}
 		// Commit this batch first to ensure that the transaction record
@@ -220,7 +216,7 @@ func splitTxnAttempt(
 
 	// Write range descriptor for right hand side of the split.
 	rightDescKey := keys.RangeDescriptorKey(rightDesc.StartKey)
-	if err := updateRangeDescriptor(ctx, b, rightDescKey, nil, rightDesc); err != nil {
+	if err := updateRangeDescriptor(b, rightDescKey, nil, rightDesc); err != nil {
 		return err
 	}
 
@@ -262,7 +258,7 @@ func splitTxnStickyUpdateAttempt(
 
 	b := txn.NewBatch()
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, &newDesc); err != nil {
+	if err := updateRangeDescriptor(b, descKey, dbDescValue, &newDesc); err != nil {
 		return err
 	}
 	if err := updateRangeAddressing(b, &newDesc); err != nil {
@@ -480,7 +476,7 @@ func (r *Replica) adminUnsplitWithDescriptor(
 		descKey := keys.RangeDescriptorKey(newDesc.StartKey)
 
 		b := txn.NewBatch()
-		if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, &newDesc); err != nil {
+		if err := updateRangeDescriptor(b, descKey, dbDescValue, &newDesc); err != nil {
 			return err
 		}
 		if err := updateRangeAddressing(b, &newDesc); err != nil {
@@ -658,26 +654,31 @@ func (r *Replica) AdminMerge(
 			return errors.Errorf("ranges not collocated; %s != %s", lReplicas, rReplicas)
 		}
 
-		// Ensure that every current replica of the LHS has been initialized.
-		// Otherwise there is a rare race where the replica GC queue can GC a
-		// replica of the RHS too early. The comment on
-		// TestStoreRangeMergeUninitializedLHSFollower explains the situation in full.
-		if err := waitForReplicasInit(
-			ctx, r.store.cfg.NodeDialer, origLeftDesc.RangeID, origLeftDesc.Replicas().Descriptors(),
-		); err != nil {
-			return errors.Wrap(err, "waiting for all left-hand replicas to initialize")
-		}
-		// Out of an abundance of caution, also ensure that replicas of the RHS have
-		// all been initialized. If for whatever reason the initial upreplication
-		// snapshot for a NON_VOTER on the RHS fails, it will have to get picked up
-		// by the raft snapshot queue to upreplicate and may be uninitialized at
-		// this point. As such, if we send a subsume request to the RHS in this sort
-		// of state, we will wastefully and unintentionally block all traffic on it
-		// for 5 seconds.
-		if err := waitForReplicasInit(
-			ctx, r.store.cfg.NodeDialer, rightDesc.RangeID, rightDesc.Replicas().Descriptors(),
-		); err != nil {
-			return errors.Wrap(err, "waiting for all right-hand replicas to initialize")
+		disableWaitForReplicasInTesting := r.store.TestingKnobs() != nil &&
+			r.store.TestingKnobs().DisableMergeWaitForReplicasInit
+
+		if !disableWaitForReplicasInTesting {
+			// Ensure that every current replica of the LHS has been initialized.
+			// Otherwise there is a rare race where the replica GC queue can GC a
+			// replica of the RHS too early. The comment on
+			// TestStoreRangeMergeUninitializedLHSFollower explains the situation in full.
+			if err := waitForReplicasInit(
+				ctx, r.store.cfg.NodeDialer, origLeftDesc.RangeID, origLeftDesc.Replicas().Descriptors(),
+			); err != nil {
+				return errors.Wrap(err, "waiting for all left-hand replicas to initialize")
+			}
+			// Out of an abundance of caution, also ensure that replicas of the RHS have
+			// all been initialized. If for whatever reason the initial upreplication
+			// snapshot for a NON_VOTER on the RHS fails, it will have to get picked up
+			// by the raft snapshot queue to upreplicate and may be uninitialized at
+			// this point. As such, if we send a subsume request to the RHS in this sort
+			// of state, we will wastefully and unintentionally block all traffic on it
+			// for 5 seconds.
+			if err := waitForReplicasInit(
+				ctx, r.store.cfg.NodeDialer, rightDesc.RangeID, rightDesc.Replicas().Descriptors(),
+			); err != nil {
+				return errors.Wrap(err, "waiting for all right-hand replicas to initialize")
+			}
 		}
 
 		mergeReplicas := lReplicas.Descriptors()
@@ -710,7 +711,7 @@ func (r *Replica) AdminMerge(
 
 		// Update the range descriptor for the receiving range.
 		leftDescKey := keys.RangeDescriptorKey(updatedLeftDesc.StartKey)
-		if err := updateRangeDescriptor(ctx, b, leftDescKey,
+		if err := updateRangeDescriptor(b, leftDescKey,
 			dbOrigLeftDescValue, /* oldValue */
 			&updatedLeftDesc,    /* newDesc */
 		); err != nil {
@@ -718,7 +719,7 @@ func (r *Replica) AdminMerge(
 		}
 
 		// Remove the range descriptor for the deleted range.
-		if err := updateRangeDescriptor(ctx, b, rightDescKey,
+		if err := updateRangeDescriptor(b, rightDescKey,
 			dbRightDescKV.Value.TagAndDataBytes(), /* oldValue */
 			nil,                                   /* newDesc */
 		); err != nil {
@@ -750,6 +751,9 @@ func (r *Replica) AdminMerge(
 
 		err = contextutil.RunWithTimeout(ctx, "waiting for merge application", mergeApplicationTimeout,
 			func(ctx context.Context) error {
+				if disableWaitForReplicasInTesting {
+					return nil
+				}
 				return waitForApplication(ctx, r.store.cfg.NodeDialer, rightDesc.RangeID, mergeReplicas,
 					rhsSnapshotRes.LeaseAppliedIndex)
 			})
@@ -822,11 +826,6 @@ func waitForApplication(
 	replicas []roachpb.ReplicaDescriptor,
 	leaseIndex uint64,
 ) error {
-	if dialer == nil && len(replicas) == 1 {
-		// This early return supports unit tests (testContext{}) that also
-		// want to perform merges.
-		return nil
-	}
 	g := ctxgroup.WithContext(ctx)
 	for _, repl := range replicas {
 		repl := repl // copy for goroutine
@@ -856,11 +855,6 @@ func waitForReplicasInit(
 	rangeID roachpb.RangeID,
 	replicas []roachpb.ReplicaDescriptor,
 ) error {
-	if dialer == nil && len(replicas) == 1 {
-		// This early return supports unit tests (testContext{}) that also
-		// want to perform merges.
-		return nil
-	}
 	return contextutil.RunWithTimeout(ctx, "wait for replicas init", 5*time.Second, func(ctx context.Context) error {
 		g := ctxgroup.WithContext(ctx)
 		for _, repl := range replicas {
@@ -2392,7 +2386,7 @@ func execChangeReplicasTxn(
 
 				// Important: the range descriptor must be the first thing touched in the transaction
 				// so the transaction record is co-located with the range being modified.
-				if err := updateRangeDescriptor(ctx, b, descKey, dbDescValue, crt.Desc); err != nil {
+				if err := updateRangeDescriptor(b, descKey, dbDescValue, crt.Desc); err != nil {
 					return err
 				}
 
@@ -2853,7 +2847,7 @@ func (r *Replica) followerSendSnapshot(
 				From:     uint64(req.CoordinatorReplica.ReplicaID),
 				To:       uint64(req.RecipientReplica.ReplicaID),
 				Term:     req.Term,
-				Snapshot: snap.RaftSnap,
+				Snapshot: &snap.RaftSnap,
 			},
 		},
 		RangeSize:           rangeSize,
@@ -3014,11 +3008,7 @@ func conditionalGetDescValueFromDB(
 // descriptor, a CommitTrigger must be used to update the in-memory
 // descriptor; it will not automatically be copied from newDesc.
 func updateRangeDescriptor(
-	ctx context.Context,
-	b *kv.Batch,
-	descKey roachpb.Key,
-	oldValue []byte,
-	newDesc *roachpb.RangeDescriptor,
+	b *kv.Batch, descKey roachpb.Key, oldValue []byte, newDesc *roachpb.RangeDescriptor,
 ) error {
 	// This is subtle: []byte(nil) != interface{}(nil). A []byte(nil) refers to
 	// an empty value. An interface{}(nil) refers to a non-existent value. So

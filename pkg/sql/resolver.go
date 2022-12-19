@@ -16,7 +16,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -34,12 +33,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
-	"github.com/lib/pq/oid"
 )
 
 var _ resolver.SchemaResolver = &planner{}
@@ -138,98 +134,6 @@ func (p *planner) SchemaExists(ctx context.Context, dbName, scName string) (foun
 	return found, err
 }
 
-// IsTableVisible is part of the eval.DatabaseCatalog interface.
-func (p *planner) IsTableVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-) (isVisible, exists bool, err error) {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.Txn(), curDB,
-		tree.DatabaseLookupFlags{
-			Required:    true,
-			AvoidLeased: p.skipDescriptorCache,
-		})
-	if err != nil {
-		return false, false, err
-	}
-	// It is critical that we set ParentID on the flags in order to ensure that
-	// we do not do a very expensive, and ultimately fruitless lookup for an
-	// OID which definitely does not exist. Only OIDs corresponding to relations
-	// in the current database are relevant for this function. If we have already
-	// fetched all the tables in the current database, then we can use that
-	// fact to avoid a KV lookup. The descs layer relies on our setting this
-	// field in the flags to avoid that lookup.
-	flags := p.ObjectLookupFlags(true /* required */, false /* requireMutable */)
-	flags.ParentID = dbDesc.GetID()
-	tableDesc, err := p.Descriptors().GetImmutableTableByID(ctx, p.Txn(), descpb.ID(tableID), flags)
-	if err != nil {
-		// If a "not found" error happened here, we return "not exists" rather than
-		// the error.
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			errors.Is(err, catalog.ErrDescriptorDropped) ||
-			pgerror.GetPGCode(err) == pgcode.UndefinedTable ||
-			pgerror.GetPGCode(err) == pgcode.UndefinedObject {
-			return false, false, nil //nolint:returnerrcheck
-		}
-		return false, false, err
-	}
-	schemaID := tableDesc.GetParentSchemaID()
-	schemaDesc, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.Txn(), schemaID,
-		tree.SchemaLookupFlags{
-			Required:    true,
-			AvoidLeased: p.skipDescriptorCache})
-	if err != nil {
-		return false, false, err
-	}
-	iter := searchPath.Iter()
-	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
-		if schemaDesc.GetName() == scName {
-			return true, true, nil
-		}
-	}
-	return false, true, nil
-}
-
-// IsTypeVisible is part of the eval.DatabaseCatalog interface.
-func (p *planner) IsTypeVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-) (isVisible bool, exists bool, err error) {
-	// Check builtin types first. They are always globally visible.
-	if _, ok := types.OidToType[typeID]; ok {
-		return true, true, nil
-	}
-
-	if !types.IsOIDUserDefinedType(typeID) {
-		return false, false, nil //nolint:returnerrcheck
-	}
-
-	id, err := typedesc.UserDefinedTypeOIDToID(typeID)
-	if err != nil {
-		return false, false, err
-	}
-	typName, _, err := p.GetTypeDescriptor(ctx, id)
-	if err != nil {
-		// If a "not found" error happened here, we return "not exists" rather than
-		// the error.
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			errors.Is(err, catalog.ErrDescriptorDropped) ||
-			pgerror.GetPGCode(err) == pgcode.UndefinedObject {
-			return false, false, nil //nolint:returnerrcheck
-		}
-		return false, false, err
-	}
-	if typName.CatalogName.String() != curDB {
-		// If the type is in a different database, then it's considered to be
-		// "not existing" instead of just "not visible"; this matches PostgreSQL.
-		return false, false, nil
-	}
-	iter := searchPath.Iter()
-	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
-		if typName.SchemaName.String() == scName {
-			return true, true, nil
-		}
-	}
-	return false, true, nil
-}
-
 // HasAnyPrivilege is part of the eval.DatabaseCatalog interface.
 func (p *planner) HasAnyPrivilege(
 	ctx context.Context,
@@ -265,11 +169,14 @@ func (p *planner) HasAnyPrivilege(
 		}
 
 		if priv.GrantOption {
-			if err := p.CheckGrantOptionsForUser(ctx, desc.GetPrivileges(), desc, []privilege.Kind{priv.Kind}, user, true /* isGrant */); err != nil {
-				if pgerror.GetPGCode(err) == pgcode.WarningPrivilegeNotGranted {
-					continue
-				}
+			isGrantable, err := p.CheckGrantOptionsForUser(
+				ctx, desc.GetPrivileges(), desc, []privilege.Kind{priv.Kind}, user,
+			)
+			if err != nil {
 				return eval.HasNoPrivilege, err
+			}
+			if !isGrantable {
+				continue
 			}
 		}
 		return eval.HasPrivilege, nil
@@ -495,18 +402,22 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 		if targets.AllTablesInSchema || targets.AllSequencesInSchema {
 			// Get all the descriptors for the tables in the specified schemas.
 			var descs []DescriptorWithObjectType
-			for _, sc := range targets.Schemas {
+			for _, scName := range targets.Schemas {
 				dbName := p.CurrentDatabase()
-				if sc.ExplicitCatalog {
-					dbName = sc.Catalog()
+				if scName.ExplicitCatalog {
+					dbName = scName.Catalog()
 				}
 				db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName, flags)
 				if err != nil {
 					return nil, err
 				}
-				_, objectIDs, err := resolver.GetObjectNamesAndIDs(
-					ctx, p.txn, p, p.ExecCfg().Codec, db, sc.Schema(), true, /* explicitPrefix */
+				sc, err := p.Descriptors().GetImmutableSchemaByName(
+					ctx, p.txn, db, scName.Schema(), p.CommonLookupFlagsRequired(),
 				)
+				if err != nil {
+					return nil, err
+				}
+				_, objectIDs, err := p.GetObjectNamesAndIDs(ctx, db, sc)
 				if err != nil {
 					return nil, err
 				}
@@ -782,18 +693,13 @@ func expandMutableIndexName(
 	ctx context.Context, p *planner, index *tree.TableIndexName, requireTable bool,
 ) (tn *tree.TableName, desc *tabledesc.Mutable, err error) {
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		tn, desc, err = expandIndexName(ctx, p.txn, p, p.ExecCfg().Codec, index, requireTable)
+		tn, desc, err = expandIndexName(ctx, p, index, requireTable)
 	})
 	return tn, desc, err
 }
 
 func expandIndexName(
-	ctx context.Context,
-	txn *kv.Txn,
-	p *planner,
-	codec keys.SQLCodec,
-	index *tree.TableIndexName,
-	requireTable bool,
+	ctx context.Context, p *planner, index *tree.TableIndexName, requireTable bool,
 ) (tn *tree.TableName, desc *tabledesc.Mutable, err error) {
 	tn = &index.Table
 	if tn.Object() != "" {
@@ -809,7 +715,7 @@ func expandIndexName(
 		return tn, desc, nil
 	}
 
-	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, p, index, txn, codec, requireTable, false /*requireActiveIndex*/)
+	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, p, index, requireTable, false /*requireActiveIndex*/)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -853,7 +759,7 @@ func (p *planner) getTableAndIndexImpl(
 	ctx context.Context, tableWithIndex *tree.TableIndexName, privilege privilege.Kind,
 ) (catalog.ResolvedObjectPrefix, *tabledesc.Mutable, catalog.Index, error) {
 	_, resolvedPrefix, tbl, idx, err := resolver.ResolveIndex(
-		ctx, p, tableWithIndex, p.Txn(), p.EvalContext().Codec, true /* required */, true, /* requireActiveIndex */
+		ctx, p, tableWithIndex, true /* required */, true, /* requireActiveIndex */
 	)
 	if err != nil {
 		return catalog.ResolvedObjectPrefix{}, nil, nil, err

@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -65,9 +67,41 @@ type schemaResolver struct {
 	typeResolutionDbID descpb.ID
 }
 
-// Accessor implements the resolver.SchemaResolver interface.
-func (sr *schemaResolver) Accessor() catalog.Accessor {
-	return sr.descCollection
+// GetObjectNamesAndIDs implements the resolver.SchemaResolver interface.
+func (sr *schemaResolver) GetObjectNamesAndIDs(
+	ctx context.Context, db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor,
+) (objectNames tree.TableNames, objectIDs descpb.IDs, _ error) {
+	c, err := sr.descCollection.GetAllObjectsInSchema(ctx, sr.txn, db, sc)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mc nstree.MutableCatalog
+	_ = c.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if !desc.SkipNamespace() && !desc.Dropped() {
+			mc.UpsertNamespaceEntry(desc, desc.GetID(), hlc.Timestamp{})
+		}
+		return nil
+	})
+	_ = mc.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
+		tn := tree.MakeTableNameWithSchema(
+			tree.Name(db.GetName()), tree.Name(sc.GetName()), tree.Name(e.GetName()),
+		)
+		objectNames = append(objectNames, tn)
+		objectIDs = append(objectIDs, e.GetID())
+		return nil
+	})
+	return objectNames, objectIDs, nil
+}
+
+// MustGetCurrentSessionDatabase implements the resolver.SchemaResolver interface.
+func (sr *schemaResolver) MustGetCurrentSessionDatabase(
+	ctx context.Context,
+) (catalog.DatabaseDescriptor, error) {
+	flags := tree.DatabaseLookupFlags{
+		AvoidLeased: true,
+		Required:    true,
+	}
+	return sr.descCollection.GetImmutableDatabaseByName(ctx, sr.txn, sr.CurrentDatabase(), flags)
 }
 
 // CurrentSearchPath implements the resolver.SchemaResolver interface.
@@ -75,7 +109,8 @@ func (sr *schemaResolver) CurrentSearchPath() sessiondata.SearchPath {
 	return sr.sessionDataStack.Top().SearchPath
 }
 
-// CommonLookupFlagsRequired implements the resolver.SchemaResolver interface.
+// CommonLookupFlagsRequired is a convenience method for returning a
+// default set of tree.CommonLookupFlags.
 func (sr *schemaResolver) CommonLookupFlagsRequired() tree.CommonLookupFlags {
 	return tree.CommonLookupFlags{
 		Required:    true,

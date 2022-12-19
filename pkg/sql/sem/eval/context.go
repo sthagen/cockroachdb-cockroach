@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/tochar"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -167,7 +168,8 @@ type Context struct {
 	// The transaction in which the statement is executing.
 	Txn *kv.Txn
 
-	ReCache *tree.RegexpCache
+	ReCache           *tree.RegexpCache
+	ToCharFormatCache *tochar.FormatCache
 
 	// TODO(mjibson): remove prepareOnly in favor of a 2-step prepare-exec solution
 	// that is also able to save the plan to skip work during the exec step.
@@ -719,7 +721,7 @@ type StreamManagerFactory interface {
 type ReplicationStreamManager interface {
 	// StartReplicationStream starts a stream replication job for the specified
 	// tenant on the producer side.
-	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName) (streampb.StreamID, error)
+	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName) (streampb.ReplicationProducerSpec, error)
 
 	// HeartbeatReplicationStream sends a heartbeat to the replication stream producer, indicating
 	// consumer has consumed until the given 'frontier' timestamp. This updates the producer job
@@ -768,6 +770,7 @@ type StreamIngestManager interface {
 	// GetStreamIngestionStats gets a statistics summary for a stream ingestion job.
 	GetStreamIngestionStats(
 		ctx context.Context,
-		ingestionJobID jobspb.JobID,
+		streamIngestionDetails jobspb.StreamIngestionDetails,
+		jobProgress jobspb.Progress,
 	) (*streampb.StreamIngestionStats, error)
 }

@@ -258,6 +258,7 @@ var validationMap = []struct {
 			"OfflineReason":                 {status: thisFieldReferencesNoObjects},
 			"RegionConfig":                  {status: iSolemnlySwearThisFieldIsValidated},
 			"DeclarativeSchemaChangerState": {status: thisFieldReferencesNoObjects},
+			"Composite":                     {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 	{
@@ -2835,18 +2836,41 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				DependsOn:               []descpb.ID{100},
 			},
 		},
+		// Composite types.
+		{ // 17
+			err: `referenced type ID 500: referenced descriptor not found`,
+			desc: descpb.TableDescriptor{
+				Name:                    "foo",
+				ID:                      51,
+				ParentID:                1,
+				UnexposedParentSchemaID: keys.PublicSchemaID,
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:             1,
+					Name:           "bar",
+					KeyColumnIDs:   []descpb.ColumnID{1},
+					KeyColumnNames: []string{"a"},
+				},
+				Columns: []descpb.ColumnDescriptor{
+					{
+						Name: "a",
+						ID:   1,
+						Type: types.MakeCompositeType(catid.TypeIDToOID(500), catid.TypeIDToOID(100500), nil, nil),
+					},
+				},
+			},
+		},
 	}
 
 	for i, test := range tests {
 		t.Run(test.err, func(t *testing.T) {
 			var cb nstree.MutableCatalog
-			cb.UpsertDescriptorEntry(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable())
+			cb.UpsertDescriptor(dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable())
 			for _, otherDesc := range test.otherDescs {
 				otherDesc.Privileges = catpb.NewBasePrivilegeDescriptor(username.AdminRoleName())
-				cb.UpsertDescriptorEntry(NewBuilder(&otherDesc).BuildImmutable())
+				cb.UpsertDescriptor(NewBuilder(&otherDesc).BuildImmutable())
 			}
 			desc := NewBuilder(&test.desc).BuildImmutable()
-			cb.UpsertDescriptorEntry(funcdesc.NewBuilder(&descpb.FunctionDescriptor{ID: 100, Name: "f"}).BuildImmutable())
+			cb.UpsertDescriptor(funcdesc.NewBuilder(&descpb.FunctionDescriptor{ID: 100, Name: "f"}).BuildImmutable())
 			expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
 			const validateCrossReferencesOnly = catalog.ValidationLevelBackReferences &^ catalog.ValidationLevelSelfOnly
 			results := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, validateCrossReferencesOnly, desc)

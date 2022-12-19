@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -33,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
@@ -46,7 +44,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 )
 
 // MembershipCache is a shared cache for role membership information.
@@ -58,15 +55,16 @@ type MembershipCache struct {
 	userCache map[username.SQLUsername]userRoleMembership
 	// populateCacheGroup ensures that there is at most one request in-flight
 	// for each key.
-	populateCacheGroup singleflight.Group
+	populateCacheGroup *singleflight.Group
 	stopper            *stop.Stopper
 }
 
 // NewMembershipCache initializes a new MembershipCache.
 func NewMembershipCache(account mon.BoundAccount, stopper *stop.Stopper) *MembershipCache {
 	return &MembershipCache{
-		boundAccount: account,
-		stopper:      stopper,
+		boundAccount:       account,
+		populateCacheGroup: singleflight.NewGroup("lookup role membership", "key"),
+		stopper:            stopper,
 	}
 }
 
@@ -77,14 +75,14 @@ type userRoleMembership map[username.SQLUsername]bool
 type AuthorizationAccessor interface {
 	// CheckPrivilege verifies that the user has `privilege` on `descriptor`.
 	CheckPrivilegeForUser(
-		ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind, user username.SQLUsername,
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind, user username.SQLUsername,
 	) error
 
 	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
-	CheckPrivilege(ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind) error
+	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error
 
 	// CheckAnyPrivilege returns nil if user has any privileges at all.
-	CheckAnyPrivilege(ctx context.Context, descriptor catalog.PrivilegeObject) error
+	CheckAnyPrivilege(ctx context.Context, descriptor privilege.Object) error
 
 	// UserHasAdminRole returns tuple of bool and error:
 	// (true, nil) means that the user has an admin role (i.e. root or node)
@@ -121,7 +119,7 @@ var _ AuthorizationAccessor = &planner{}
 // Requires a valid transaction to be open.
 func (p *planner) CheckPrivilegeForUser(
 	ctx context.Context,
-	privilegeObject catalog.PrivilegeObject,
+	privilegeObject privilege.Object,
 	privilegeKind privilege.Kind,
 	user username.SQLUsername,
 ) error {
@@ -156,7 +154,7 @@ func (p *planner) CheckPrivilegeForUser(
 	// permission check).
 	p.maybeAudit(privilegeObject, privilegeKind)
 
-	privs, err := privilegeObject.GetPrivilegeDescriptor(ctx, p)
+	privs, err := p.getPrivilegeDescriptor(ctx, privilegeObject)
 	if err != nil {
 		return err
 	}
@@ -167,7 +165,7 @@ func (p *planner) CheckPrivilegeForUser(
 	}
 
 	hasPriv, err := p.checkRolePredicate(ctx, user, func(role username.SQLUsername) (bool, error) {
-		isOwner, err := IsOwner(ctx, p, privilegeObject, role)
+		isOwner, err := isOwner(ctx, p, privilegeObject, role)
 		return isOwner || privs.CheckPrivilege(role, privilegeKind), err
 	})
 	if err != nil {
@@ -185,42 +183,28 @@ func (p *planner) CheckPrivilegeForUser(
 // it should be probably be called CheckPrivilegesOrOwnership and return
 // a better error.
 func (p *planner) CheckPrivilege(
-	ctx context.Context, object catalog.PrivilegeObject, privilege privilege.Kind,
+	ctx context.Context, object privilege.Object, privilege privilege.Kind,
 ) error {
 	return p.CheckPrivilegeForUser(ctx, object, privilege, p.User())
 }
 
-// CheckGrantOptionsForUser calls PrivilegeDescriptor.CheckGrantOptions, which
+// MustCheckGrantOptionsForUser calls PrivilegeDescriptor.CheckGrantOptions, which
 // will return an error if a user tries to grant a privilege it does not have
 // grant options for. Owners implicitly have all grant options, and also grant
 // options are inherited from parent roles.
-func (p *planner) CheckGrantOptionsForUser(
+func (p *planner) MustCheckGrantOptionsForUser(
 	ctx context.Context,
 	privs *catpb.PrivilegeDescriptor,
-	privilegeObject catalog.PrivilegeObject,
+	privilegeObject privilege.Object,
 	privList privilege.List,
 	user username.SQLUsername,
 	isGrant bool,
 ) error {
-	// Always allow the command to go through if performed by a superuser or the
-	// owner of the object
-	if isAdmin, err := p.UserHasAdminRole(ctx, user); err != nil {
-		return err
-	} else if isAdmin {
-		return nil
-	}
-
-	hasPriv, err := p.checkRolePredicate(ctx, user, func(role username.SQLUsername) (bool, error) {
-		isOwner, err := IsOwner(ctx, p, privilegeObject, role)
-		return privs.CheckGrantOptions(role, privList) || isOwner, err
-	})
-	if err != nil {
+	if hasPriv, err := p.CheckGrantOptionsForUser(
+		ctx, privs, privilegeObject, privList, user,
+	); hasPriv || err != nil {
 		return err
 	}
-	if hasPriv {
-		return nil
-	}
-
 	code := pgcode.WarningPrivilegeNotGranted
 	if !isGrant {
 		code = pgcode.WarningPrivilegeNotRevoked
@@ -237,10 +221,36 @@ func (p *planner) CheckGrantOptionsForUser(
 	)
 }
 
-func getOwnerOfPrivilegeObject(
-	ctx context.Context, p eval.Planner, privilegeObject catalog.PrivilegeObject,
+// CheckGrantOptionsForUser is like MustCheckGrantOptionsForUser but does not
+// return an error if the check does not succeed due to privileges. It only
+// returns an error if there is a runtime problem calculating whether the
+// user has the priviliges in question.
+func (p *planner) CheckGrantOptionsForUser(
+	ctx context.Context,
+	privs *catpb.PrivilegeDescriptor,
+	privilegeObject privilege.Object,
+	privList privilege.List,
+	user username.SQLUsername,
+) (isGrantable bool, _ error) {
+	// Always allow the command to go through if performed by a superuser or the
+	// owner of the object
+	isAdmin, err := p.UserHasAdminRole(ctx, user)
+	if err != nil {
+		return false, err
+	}
+	if isAdmin {
+		return true, nil
+	}
+	return p.checkRolePredicate(ctx, user, func(role username.SQLUsername) (bool, error) {
+		isOwner, err := isOwner(ctx, p, privilegeObject, role)
+		return privs.CheckGrantOptions(role, privList) || isOwner, err
+	})
+}
+
+func (p *planner) getOwnerOfPrivilegeObject(
+	ctx context.Context, privilegeObject privilege.Object,
 ) (username.SQLUsername, error) {
-	privDesc, err := privilegeObject.GetPrivilegeDescriptor(ctx, p)
+	privDesc, err := p.getPrivilegeDescriptor(ctx, privilegeObject)
 	if err != nil {
 		return username.SQLUsername{}, err
 	}
@@ -260,14 +270,11 @@ func getOwnerOfPrivilegeObject(
 	return owner, nil
 }
 
-// IsOwner returns if the role has ownership on the privilege object.
-func IsOwner(
-	ctx context.Context,
-	p eval.Planner,
-	privilegeObject catalog.PrivilegeObject,
-	role username.SQLUsername,
+// isOwner returns if the role has ownership on the privilege object.
+func isOwner(
+	ctx context.Context, p *planner, privilegeObject privilege.Object, role username.SQLUsername,
 ) (bool, error) {
-	owner, err := getOwnerOfPrivilegeObject(ctx, p, privilegeObject)
+	owner, err := p.getOwnerOfPrivilegeObject(ctx, privilegeObject)
 	if err != nil {
 		return false, err
 	}
@@ -279,12 +286,12 @@ func IsOwner(
 // TODO(richardjcai): SUPERUSER has implicit ownership.
 // We do not have SUPERUSER privilege yet but should we consider root a superuser?
 func (p *planner) HasOwnership(
-	ctx context.Context, privilegeObject catalog.PrivilegeObject,
+	ctx context.Context, privilegeObject privilege.Object,
 ) (bool, error) {
 	user := p.SessionData().User()
 
 	return p.checkRolePredicate(ctx, user, func(role username.SQLUsername) (bool, error) {
-		return IsOwner(ctx, p, privilegeObject, role)
+		return isOwner(ctx, p, privilegeObject, role)
 	})
 }
 
@@ -321,9 +328,7 @@ func (p *planner) checkRolePredicate(
 
 // CheckAnyPrivilege implements the AuthorizationAccessor interface.
 // Requires a valid transaction to be open.
-func (p *planner) CheckAnyPrivilege(
-	ctx context.Context, privilegeObject catalog.PrivilegeObject,
-) error {
+func (p *planner) CheckAnyPrivilege(ctx context.Context, privilegeObject privilege.Object) error {
 	// Verify that the txn is valid in any case, so that
 	// we don't get the risk to say "OK" to root requests
 	// with an invalid API usage.
@@ -338,7 +343,7 @@ func (p *planner) CheckAnyPrivilege(
 		return nil
 	}
 
-	privs, err := privilegeObject.GetPrivilegeDescriptor(ctx, p)
+	privs, err := p.getPrivilegeDescriptor(ctx, privilegeObject)
 	if err != nil {
 		return err
 	}
@@ -504,31 +509,24 @@ func MemberOfWithAdminOption(
 	// in-flight for each user. The role_memberships table version is also part
 	// of the request key so that we don't read data from an old version of the
 	// table.
-	ch, _ := roleMembersCache.populateCacheGroup.DoChan(
+	future, _ := roleMembersCache.populateCacheGroup.DoChan(ctx,
 		fmt.Sprintf("%s-%d", member.Normalized(), tableVersion),
-		func() (interface{}, error) {
-			// Use a different context to fetch, so that it isn't possible for
-			// one query to timeout and cause all the goroutines that are waiting
-			// to get a timeout error.
-			ctx, cancel := roleMembersCache.stopper.WithCancelOnQuiesce(
-				logtags.WithTags(context.Background(), logtags.FromContext(ctx)))
-			defer cancel()
+		singleflight.DoOpts{
+			Stop:               roleMembersCache.stopper,
+			InheritCancelation: false,
+		},
+		func(ctx context.Context) (interface{}, error) {
 			return resolveMemberOfWithAdminOption(
 				ctx, member, ie, txn,
 				useSingleQueryForRoleMembershipCache.Get(execCfg.SV()),
 			)
-		},
-	)
+		})
 	var memberships map[username.SQLUsername]bool
-	select {
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		memberships = res.Val.(map[username.SQLUsername]bool)
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	res := future.WaitForResult(ctx)
+	if res.Err != nil {
+		return nil, res.Err
 	}
+	memberships = res.Val.(map[username.SQLUsername]bool)
 
 	func() {
 		// Update membership if the table version hasn't changed.
@@ -675,7 +673,7 @@ func (p *planner) HasRoleOption(ctx context.Context, roleOption roleoption.Optio
 
 	hasRolePrivilege, err := p.ExecCfg().InternalExecutor.QueryRowEx(
 		ctx, "has-role-option", p.Txn(),
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		fmt.Sprintf(
 			`SELECT 1 from %s WHERE option = '%s' AND username = $1 LIMIT 1`,
 			sessioninit.RoleOptionsTableName, roleOption.String()), user.Normalized())
@@ -888,12 +886,8 @@ func (p *planner) HasViewActivityOrViewActivityRedactedRole(ctx context.Context)
 		return hasAdmin, err
 	}
 	if !hasAdmin {
-		hasView := false
-		hasViewRedacted := false
-		if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
-			hasView = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITY) == nil
-			hasViewRedacted = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITYREDACTED) == nil
-		}
+		hasView := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITY) == nil
+		hasViewRedacted := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITYREDACTED) == nil
 		if !hasView && !hasViewRedacted {
 			hasView, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITY)
 			if err != nil {
@@ -913,7 +907,7 @@ func (p *planner) HasViewActivityOrViewActivityRedactedRole(ctx context.Context)
 }
 
 func insufficientPrivilegeError(
-	user username.SQLUsername, kind privilege.Kind, object catalog.PrivilegeObject,
+	user username.SQLUsername, kind privilege.Kind, object privilege.Object,
 ) error {
 	// For consistency Postgres, we report the error message as not
 	// having a privilege on the object type "relation".

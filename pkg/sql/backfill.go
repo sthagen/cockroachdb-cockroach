@@ -1379,7 +1379,13 @@ func (sc *SchemaChanger) updateJobRunningStatus(
 ) (tableDesc catalog.TableDescriptor, err error) {
 	err = DescsTxn(ctx, sc.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
 		// Read table descriptor without holding a lease.
-		tableDesc, err = col.Direct().MustGetTableDescByID(ctx, txn, sc.descID)
+		tableDesc, err = col.GetImmutableTableByID(ctx, txn, sc.descID, tree.ObjectLookupFlags{
+			CommonLookupFlags: tree.CommonLookupFlags{
+				AvoidLeased:    true,
+				IncludeDropped: true,
+				IncludeOffline: true,
+			},
+		})
 		if err != nil {
 			return err
 		}
@@ -1518,11 +1524,12 @@ func (e InvalidIndexesError) Error() string {
 }
 
 // ValidateCheckConstraint validates the check constraint against all rows
-// in the table.
+// in index `indexIDForValidation` in table `tableDesc`.
 func ValidateCheckConstraint(
 	ctx context.Context,
 	tableDesc catalog.TableDescriptor,
 	checkConstraint catalog.CheckConstraint,
+	indexIDForValidation descpb.IndexID,
 	sessionData *sessiondata.SessionData,
 	runHistoricalTxn descs.HistoricalInternalExecTxnRunner,
 	execOverride sessiondata.InternalExecutorOverride,
@@ -1537,15 +1544,16 @@ func ValidateCheckConstraint(
 	return runHistoricalTxn.Exec(ctx, func(
 		ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor, descriptors *descs.Collection,
 	) error {
-		// Use the DistSQLTypeResolver because we need to resolve types by ID.
-		resolver := descs.NewDistSQLTypeResolver(descriptors, txn)
+		// Use a schema resolver because we need to resolve types by ID and table by name.
+		resolver := NewSkippingCacheSchemaResolver(descriptors, sessiondata.NewStack(sessionData), txn, nil /* authAccessor */)
 		semaCtx := tree.MakeSemaContext()
-		semaCtx.TypeResolver = &resolver
+		semaCtx.TypeResolver = resolver
+		semaCtx.TableNameResolver = resolver
 		defer func() { descriptors.ReleaseAll(ctx) }()
 
 		return ie.WithSyntheticDescriptors([]catalog.Descriptor{tableDesc}, func() error {
 			return validateCheckExpr(ctx, &semaCtx, txn, sessionData, checkConstraint.GetExpr(),
-				tableDesc.(*tabledesc.Mutable), ie)
+				tableDesc.(*tabledesc.Mutable), ie, indexIDForValidation)
 		})
 	})
 }
@@ -2603,7 +2611,7 @@ func validateCheckInTxn(
 	return ie.WithSyntheticDescriptors(
 		syntheticDescs,
 		func() error {
-			return validateCheckExpr(ctx, semaCtx, txn, sessionData, checkExpr, tableDesc, ie)
+			return validateCheckExpr(ctx, semaCtx, txn, sessionData, checkExpr, tableDesc, ie, 0 /* indexIDForValidation */)
 		})
 }
 
@@ -2633,7 +2641,13 @@ func getTargetTablesAndFk(
 	if fk == nil {
 		return nil, nil, nil, errors.AssertionFailedf("foreign key %s does not exist", fkName)
 	}
-	targetTable, err = descsCol.Direct().MustGetTableDescByID(ctx, txn, fk.ReferencedTableID)
+	targetTable, err = descsCol.GetImmutableTableByID(ctx, txn, fk.ReferencedTableID, tree.ObjectLookupFlags{
+		CommonLookupFlags: tree.CommonLookupFlags{
+			AvoidLeased:    true,
+			IncludeDropped: true,
+			IncludeOffline: true,
+		},
+	})
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -925,12 +925,11 @@ func urlGenerator(
 			config.path = "/" + config.path
 		}
 		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, config.port, config.path)
+		urls = append(urls, url)
 		if config.openInBrowser {
 			if err := exec.Command("python", "-m", "webbrowser", url).Run(); err != nil {
 				return nil, err
 			}
-		} else {
-			urls = append(urls, url)
 		}
 	}
 	return urls, nil
@@ -1407,6 +1406,10 @@ func StartGrafana(
 		// Configure scraping on all nodes in the cluster
 		promCfg.WithCluster(nodes)
 		promCfg.WithNodeExporter(nodes)
+		// Scrape all workload prometheus ports, just in case.
+		for _, i := range nodes {
+			promCfg.WithWorkload(fmt.Sprintf("workload_on_n%d", i), i, 0 /* use default port */)
+		}
 
 		// By default, spin up a grafana server
 		promCfg.Grafana.Enabled = true

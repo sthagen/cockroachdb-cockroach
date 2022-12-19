@@ -57,26 +57,33 @@ var upgrades = []upgradebase.Upgrade{
 		"add users and roles",
 		toCV(clusterversion.VPrimordial1),
 		addRootUser,
+		// v22_2StartupMigrationName - this upgrade corresponds to 3 old
+		// startupmigrations, out of which "make root a member..." is the last one.
+		"make root a member of the admin role",
 	),
 	upgrade.NewPermanentTenantUpgrade(
 		"enable diagnostics reporting",
 		toCV(clusterversion.VPrimordial2),
 		optInToDiagnosticsStatReporting,
+		"enable diagnostics reporting", // v22_2StartupMigrationName
 	),
 	upgrade.NewPermanentSystemUpgrade(
 		"populate initial version cluster setting table entry",
 		toCV(clusterversion.VPrimordial3),
 		populateVersionSetting,
+		"populate initial version cluster setting table entry", // v22_2StartupMigrationName
 	),
 	upgrade.NewPermanentTenantUpgrade(
 		"initialize the cluster.secret setting",
 		toCV(clusterversion.VPrimordial4),
 		initializeClusterSecret,
+		"initialize cluster.secret", // v22_2StartupMigrationName
 	),
 	upgrade.NewPermanentTenantUpgrade(
 		"update system.locations with default location data",
 		toCV(clusterversion.VPrimordial5),
 		updateSystemLocationData,
+		"update system.locations with default location data", // v22_2StartupMigrationName
 	),
 	// Introduced in v2.1.
 	// TODO(knz): bake this migration into v19.1.
@@ -84,6 +91,7 @@ var upgrades = []upgradebase.Upgrade{
 		"create default databases",
 		toCV(clusterversion.VPrimordial6),
 		createDefaultDbs,
+		"create default databases", // v22_2StartupMigrationName
 	),
 	upgrade.NewTenantUpgrade(
 		"ensure preconditions are met before starting upgrading to v22.2",
@@ -102,12 +110,6 @@ var upgrades = []upgradebase.Upgrade{
 		toCV(clusterversion.V22_2SampledStmtDiagReqs),
 		upgrade.NoPrecondition,
 		sampledStmtDiagReqsMigration,
-	),
-	upgrade.NewTenantUpgrade(
-		"add the system.privileges table",
-		toCV(clusterversion.V22_2SystemPrivilegesTable),
-		upgrade.NoPrecondition,
-		systemPrivilegesTableMigration,
 	),
 	upgrade.NewTenantUpgrade(
 		"add column locality to table system.sql_instances",
@@ -205,16 +207,38 @@ var upgrades = []upgradebase.Upgrade{
 		upgrade.NoPrecondition,
 		descIDSequenceForSystemTenant,
 	),
-	upgrade.NewTenantUpgrade("add a partial predicate column to system.table_statistics",
-		toCV(clusterversion.V23_1AddPartialStatisticsPredicateCol),
+	upgrade.NewTenantUpgrade("add a partial predicate and full statistics ID columns to system.table_statistics",
+		toCV(clusterversion.V23_1AddPartialStatisticsColumns),
 		upgrade.NoPrecondition,
-		alterSystemTableStatisticsAddPartialPredicate,
+		alterSystemTableStatisticsAddPartialPredicateAndID,
 	),
 	upgrade.NewTenantUpgrade(
 		"create system.job_info table",
 		toCV(clusterversion.V23_1CreateSystemJobInfoTable),
 		upgrade.NoPrecondition,
 		systemJobInfoTableMigration,
+	),
+	upgrade.NewTenantUpgrade("add role_id and member_id columns to system.role_members",
+		toCV(clusterversion.V23_1RoleMembersTableHasIDColumns),
+		upgrade.NoPrecondition,
+		alterSystemRoleMembersAddIDColumns,
+	),
+	upgrade.NewTenantUpgrade("backfill role_id and member_id columns in system.role_members",
+		toCV(clusterversion.V23_1RoleMembersIDColumnsBackfilled),
+		upgrade.NoPrecondition,
+		backfillSystemRoleMembersIDColumns,
+	),
+	upgrade.NewTenantUpgrade(
+		"add job_type column to system.jobs table",
+		toCV(clusterversion.V23_1AddTypeColumnToJobsTable),
+		upgrade.NoPrecondition,
+		alterSystemJobsAddJobType,
+	),
+	upgrade.NewTenantUpgrade(
+		"backfill job_type column in system.jobs table",
+		toCV(clusterversion.V23_1BackfillTypeColumnInJobsTable),
+		upgrade.NoPrecondition,
+		backfillJobTypeColumn,
 	),
 }
 

@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl"
 	"github.com/cockroachdb/cockroach/pkg/cli/clicfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
@@ -64,8 +63,6 @@ func initCLIDefaults() {
 	setStmtDiagContextDefaults()
 	setAuthContextDefaults()
 	setImportContextDefaults()
-	setProxyContextDefaults()
-	setTestDirectorySvrContextDefaults()
 	setUserfileContextDefaults()
 	setCertContextDefaults()
 	setDebugRecoverContextDefaults()
@@ -171,10 +168,9 @@ type cliContext struct {
 	// before exiting the process. This may block until all buffered log sinks
 	// are shutdown, if any are enabled, or until a timeout is triggered.
 	logShutdownFn func()
-	// deprecatedLogOverrides is the legacy pre-v21.1 discrete flag
-	// overrides for the logging configuration.
-	// TODO(knz): Deprecated in v21.1. Remove this.
-	deprecatedLogOverrides *logConfigFlags
+	// logOverrides encodes discrete flag overrides for the logging
+	// configuration. They are provided for convenience.
+	logOverrides *logConfigFlags
 	// ambiguousLogDir is populated during setupLogging() to indicate
 	// that no log directory was specified and there were multiple
 	// on-disk stores.
@@ -187,9 +183,8 @@ type cliContext struct {
 // cliCtx captures the command-line parameters common to most CLI utilities.
 // See below for defaults.
 var cliCtx = cliContext{
-	Config: baseCfg,
-	// TODO(knz): Deprecated in v21.1. Remove this.
-	deprecatedLogOverrides: newLogConfigOverrides(),
+	Config:       baseCfg,
+	logOverrides: newLogConfigOverrides(),
 }
 
 // setCliContextDefaults set the default values in cliCtx.  This
@@ -214,8 +209,7 @@ func setCliContextDefaults() {
 	cliCtx.logConfig = logconfig.Config{}
 	cliCtx.logShutdownFn = func() {}
 	cliCtx.ambiguousLogDir = false
-	// TODO(knz): Deprecated in v21.1. Remove this.
-	cliCtx.deprecatedLogOverrides.reset()
+	cliCtx.logOverrides.reset()
 	cliCtx.showVersionUsingOnlyBuildTag = false
 }
 
@@ -594,6 +588,7 @@ func setConvContextDefaults() {
 var demoCtx = struct {
 	democluster.Context
 	disableEnterpriseFeatures bool
+	pidFile                   string
 
 	demoNodeCacheSizeValue  bytesOrPercentageValue
 	demoNodeSQLMemSizeValue bytesOrPercentageValue
@@ -610,7 +605,7 @@ func setDemoContextDefaults() {
 	demoCtx.NumNodes = 1
 	demoCtx.SQLPoolMemorySize = 128 << 20 // 128MB, chosen to fit 9 nodes on 2GB machine.
 	demoCtx.CacheSize = 64 << 20          // 64MB, chosen to fit 9 nodes on 2GB machine.
-	demoCtx.NoExampleDatabase = false
+	demoCtx.UseEmptyDatabase = false
 	demoCtx.SimulateLatency = false
 	demoCtx.RunWorkload = false
 	demoCtx.Localities = nil
@@ -625,6 +620,7 @@ func setDemoContextDefaults() {
 	demoCtx.Multitenant = true
 	demoCtx.DefaultEnableRangefeeds = true
 
+	demoCtx.pidFile = ""
 	demoCtx.disableEnterpriseFeatures = false
 
 	demoCtx.demoNodeCacheSizeValue = makeBytesOrPercentageValue(
@@ -662,37 +658,6 @@ func setImportContextDefaults() {
 	importCtx.ignoreUnsupported = false
 	importCtx.ignoreUnsupportedLog = ""
 	importCtx.rowLimit = 0
-}
-
-// proxyContext captures the command-line parameters of the `mt start-proxy` command.
-var proxyContext sqlproxyccl.ProxyOptions
-
-func setProxyContextDefaults() {
-	proxyContext.Denylist = ""
-	proxyContext.ListenAddr = "127.0.0.1:46257"
-	proxyContext.ListenCert = ""
-	proxyContext.ListenKey = ""
-	proxyContext.MetricsAddress = "0.0.0.0:8080"
-	proxyContext.RoutingRule = ""
-	proxyContext.DirectoryAddr = ""
-	proxyContext.SkipVerify = false
-	proxyContext.Insecure = false
-	proxyContext.RatelimitBaseDelay = 50 * time.Millisecond
-	proxyContext.ValidateAccessInterval = 30 * time.Second
-	proxyContext.PollConfigInterval = 30 * time.Second
-	proxyContext.ThrottleBaseDelay = time.Second
-	proxyContext.DisableConnectionRebalancing = false
-}
-
-var testDirectorySvrContext struct {
-	port          int
-	certsDir      string
-	kvAddrs       string
-	tenantBaseDir string
-}
-
-func setTestDirectorySvrContextDefaults() {
-	testDirectorySvrContext.port = 36257
 }
 
 // userfileCtx captures the command-line parameters of the

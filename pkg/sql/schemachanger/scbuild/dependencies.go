@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild/internal/scbuildstmt"
@@ -133,17 +134,14 @@ type CatalogReader interface {
 		found bool, prefix catalog.ResolvedObjectPrefix, tbl catalog.TableDescriptor, idx catalog.Index,
 	)
 
-	// ReadObjectNamesAndIDs looks up the namespace entries for a schema.
-	ReadObjectNamesAndIDs(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) (tree.TableNames, descpb.IDs)
+	// GetAllSchemasInDatabase gets all schemas in a database.
+	GetAllSchemasInDatabase(ctx context.Context, database catalog.DatabaseDescriptor) nstree.Catalog
+
+	// GetAllObjectsInSchema gets all non-dropped objects in a schema.
+	GetAllObjectsInSchema(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) nstree.Catalog
 
 	// MustReadDescriptor looks up a descriptor by ID.
 	MustReadDescriptor(ctx context.Context, id descpb.ID) catalog.Descriptor
-
-	// MustGetSchemasForDatabase gets schemas associated with
-	// a database.
-	MustGetSchemasForDatabase(
-		ctx context.Context, database catalog.DatabaseDescriptor,
-	) map[descpb.ID]string
 }
 
 // TableReader implements functions for inspecting tables during the build phase,
@@ -158,7 +156,7 @@ type AuthorizationAccessor interface {
 	// CheckPrivilege verifies that the current user has `privilege` on
 	// `descriptor`.
 	CheckPrivilege(
-		ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind,
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind,
 	) error
 
 	// HasAdminRole verifies if a user has an admin role.
@@ -166,11 +164,11 @@ type AuthorizationAccessor interface {
 
 	// HasOwnership returns true iff the role, or any role the role is a member
 	// of, has ownership privilege of the desc.
-	HasOwnership(ctx context.Context, privilegeObject catalog.PrivilegeObject) (bool, error)
+	HasOwnership(ctx context.Context, privilegeObject privilege.Object) (bool, error)
 
 	// CheckPrivilegeForUser verifies that the user has `privilege` on `descriptor`.
 	CheckPrivilegeForUser(
-		ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind, user username.SQLUsername,
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind, user username.SQLUsername,
 	) error
 
 	// MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct

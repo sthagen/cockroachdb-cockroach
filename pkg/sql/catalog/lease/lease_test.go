@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -42,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
@@ -79,6 +79,25 @@ type leaseTest struct {
 	kvDB                     *kv.DB
 	nodes                    map[uint32]*lease.Manager
 	leaseManagerTestingKnobs lease.ManagerTestingKnobs
+}
+
+func init() {
+	lease.MoveTablePrimaryIndexIDto2 = func(
+		ctx context.Context, t *testing.T, s serverutils.TestServerInterface, id descpb.ID,
+	) {
+		require.NoError(t, sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+			t, err := col.GetMutableTableByID(
+				ctx, txn, id, tree.ObjectLookupFlagsWithRequired(),
+			)
+			if err != nil {
+				return err
+			}
+			t.PrimaryIndex.ID = 2
+			t.NextIndexID++
+			return col.WriteDesc(ctx, false /* kvTrace */, t, txn)
+		}))
+	}
+
 }
 
 func newLeaseTest(tb testing.TB, params base.TestServerArgs) *leaseTest {
@@ -2841,7 +2860,7 @@ CREATE TABLE d1.t2 (name int);
 
 			// Select from an unrelated table
 			_, err = s.InternalExecutor().(sqlutil.InternalExecutor).ExecEx(ctx, "inline-exec", txn,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				"insert into d1.t2 values (10);")
 			return err
 
@@ -3078,7 +3097,7 @@ func TestLeaseBulkInsertWithImplicitTxn(t *testing.T) {
 		// The before execute hook will be to set up to pause
 		// the beforeExecuteStmt, which will then be resumed
 		// when the beforeExecuteResumeStmt statement is observed.
-		BeforeExecute: func(ctx context.Context, stmt string) {
+		BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 			beforeExecute.Lock()
 			if stmt == beforeExecuteStmt {
 				tableID := descpb.ID(atomic.LoadUint64(&leaseTableID))
@@ -3229,7 +3248,7 @@ func TestAmbiguousResultIsRetried(t *testing.T) {
 
 	tableID := sqlutils.QueryTableID(t, sqlDB, "defaultdb", "public", "foo")
 
-	indexPrefix := keys.SystemSQLCodec.IndexPrefix(keys.LeaseTableID, 1)
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(keys.LeaseTableID)
 	var txnID atomic.Value
 	txnID.Store(uuid.UUID{})
 
@@ -3239,12 +3258,23 @@ func TestAmbiguousResultIsRetried(t *testing.T) {
 	f.Store(filter(func(ctx context.Context, request *roachpb.BatchRequest, response *roachpb.BatchResponse) *roachpb.Error {
 		switch r := request.Requests[0].GetInner().(type) {
 		case *roachpb.ConditionalPutRequest:
-			if !bytes.HasPrefix(r.Key, indexPrefix) {
+			if !bytes.HasPrefix(r.Key, tablePrefix) {
 				return nil
 			}
+			in, _, _, err := keys.DecodeTableIDIndexID(r.Key)
+			if err != nil {
+				return roachpb.NewError(errors.WithAssertionFailure(err))
+			}
 			var a tree.DatumAlloc
+			if systemschema.TestSupportMultiRegion() {
+				var err error
+				_, in, err = keyside.Decode(&a, types.Bytes, in, encoding.Ascending)
+				if !assert.NoError(t, err) {
+					return roachpb.NewError(err)
+				}
+			}
 			id, _, err := keyside.Decode(
-				&a, types.Int, bytes.TrimPrefix(r.Key, indexPrefix), encoding.Ascending,
+				&a, types.Int, in, encoding.Ascending,
 			)
 			assert.NoError(t, err)
 			if tree.MustBeDInt(id) == tree.DInt(tableID) {

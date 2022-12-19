@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -70,7 +71,7 @@ type Connector struct {
 	rpcContext      *rpc.Context
 	rpcRetryOptions retry.Options
 	rpcDialTimeout  time.Duration // for testing
-	rpcDial         singleflight.Group
+	rpcDial         *singleflight.Group
 	defaultZoneCfg  *zonepb.ZoneConfig
 	addrs           []string
 
@@ -78,6 +79,7 @@ type Connector struct {
 		syncutil.RWMutex
 		client               *client
 		nodeDescs            map[roachpb.NodeID]*roachpb.NodeDescriptor
+		storeDescs           map[roachpb.StoreID]*roachpb.StoreDescriptor
 		systemConfig         *config.SystemConfig
 		systemConfigChannels map[chan<- struct{}]struct{}
 	}
@@ -140,12 +142,14 @@ func NewConnector(cfg kvtenant.ConnectorConfig, addrs []string) *Connector {
 		tenantID:        cfg.TenantID,
 		AmbientContext:  cfg.AmbientCtx,
 		rpcContext:      cfg.RPCContext,
+		rpcDial:         singleflight.NewGroup("dial tenant connector", singleflight.NoTags),
 		rpcRetryOptions: cfg.RPCRetryOptions,
 		defaultZoneCfg:  cfg.DefaultZoneConfig,
 		addrs:           addrs,
 	}
 
 	c.mu.nodeDescs = make(map[roachpb.NodeID]*roachpb.NodeDescriptor)
+	c.mu.storeDescs = make(map[roachpb.StoreID]*roachpb.StoreDescriptor)
 	c.mu.systemConfigChannels = make(map[chan<- struct{}]struct{})
 	c.settingsMu.allTenantOverrides = make(map[string]settings.EncodedValue)
 	c.settingsMu.specificOverrides = make(map[string]settings.EncodedValue)
@@ -259,6 +263,8 @@ var gossipSubsHandlers = map[string]func(*Connector, context.Context, string, ro
 	gossip.KeyClusterID: (*Connector).updateClusterID,
 	// Subscribe to all *NodeDescriptor updates.
 	gossip.MakePrefixPattern(gossip.KeyNodeDescPrefix): (*Connector).updateNodeAddress,
+	// Subscribe to all *StoreDescriptor updates.
+	gossip.MakePrefixPattern(gossip.KeyStoreDescPrefix): (*Connector).updateStoreMap,
 	// Subscribe to a filtered view of *SystemConfig updates.
 	gossip.KeyDeprecatedSystemConfig: (*Connector).updateSystemConfig,
 }
@@ -308,13 +314,47 @@ func (c *Connector) updateNodeAddress(ctx context.Context, key string, content r
 	c.mu.nodeDescs[desc.NodeID] = desc
 }
 
+// updateStoreMap handles updates to "store" gossip keys, performing the
+// corresponding update to the Connector's cached StoreDescriptor set.
+func (c *Connector) updateStoreMap(ctx context.Context, key string, content roachpb.Value) {
+	desc := new(roachpb.StoreDescriptor)
+	if err := content.GetProto(desc); err != nil {
+		log.Errorf(ctx, "could not unmarshal store descriptor: %v", err)
+		return
+	}
+
+	// TODO(nvanbenschoten): this doesn't handle StoreDescriptor removal from the
+	// gossip network. See comment in updateNodeAddress.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.storeDescs[desc.StoreID] = desc
+}
+
 // GetNodeDescriptor implements the kvcoord.NodeDescStore interface.
 func (c *Connector) GetNodeDescriptor(nodeID roachpb.NodeID) (*roachpb.NodeDescriptor, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	desc, ok := c.mu.nodeDescs[nodeID]
 	if !ok {
-		return nil, errors.Errorf("unable to look up descriptor for n%d", nodeID)
+		return nil, errorutil.NewNodeNotFoundError(nodeID)
+	}
+	return desc, nil
+}
+
+// GetNodeDescriptorCount implements the kvcoord.NodeDescStore interface.
+func (c *Connector) GetNodeDescriptorCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.mu.nodeDescs)
+}
+
+// GetStoreDescriptor implements the kvcoord.NodeDescStore interface.
+func (c *Connector) GetStoreDescriptor(storeID roachpb.StoreID) (*roachpb.StoreDescriptor, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	desc, ok := c.mu.storeDescs[storeID]
+	if !ok {
+		return nil, errorutil.NewStoreNotFoundError(storeID)
 	}
 	return desc, nil
 }
@@ -634,41 +674,41 @@ func (c *Connector) withClient(
 // blocks until either a connection is successfully established or the provided
 // context is canceled.
 func (c *Connector) getClient(ctx context.Context) (*client, error) {
+	ctx = c.AnnotateCtx(ctx)
 	c.mu.RLock()
 	if client := c.mu.client; client != nil {
 		c.mu.RUnlock()
 		return client, nil
 	}
-	ch, _ := c.rpcDial.DoChan("dial", func() (interface{}, error) {
-		dialCtx := c.AnnotateCtx(context.Background())
-		dialCtx, cancel := c.rpcContext.Stopper.WithCancelOnQuiesce(dialCtx)
-		defer cancel()
-		var client *client
-		err := c.rpcContext.Stopper.RunTaskWithErr(dialCtx, "kvtenant.Connector: dial",
-			func(ctx context.Context) error {
-				var err error
-				client, err = c.dialAddrs(ctx)
-				return err
-			})
-		if err != nil {
-			return nil, err
-		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.mu.client = client
-		return client, nil
-	})
+	future, _ := c.rpcDial.DoChan(ctx,
+		"dial",
+		singleflight.DoOpts{
+			Stop:               c.rpcContext.Stopper,
+			InheritCancelation: false,
+		},
+		func(ctx context.Context) (interface{}, error) {
+			var client *client
+			err := c.rpcContext.Stopper.RunTaskWithErr(ctx, "kvtenant.Connector: dial",
+				func(ctx context.Context) error {
+					var err error
+					client, err = c.dialAddrs(ctx)
+					return err
+				})
+			if err != nil {
+				return nil, err
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.mu.client = client
+			return client, nil
+		})
 	c.mu.RUnlock()
 
-	select {
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		return res.Val.(*client), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	res := future.WaitForResult(ctx)
+	if res.Err != nil {
+		return nil, res.Err
 	}
+	return res.Val.(*client), nil
 }
 
 // dialAddrs attempts to dial each of the configured addresses in a retry loop.

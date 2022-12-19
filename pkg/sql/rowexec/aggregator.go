@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -265,7 +266,18 @@ func newAggregator(
 	if len(spec.OrderedGroupCols) == len(spec.GroupCols) {
 		return newOrderedAggregator(ctx, flowCtx, processorID, spec, input, post, output)
 	}
+	return newHashAggregator(ctx, flowCtx, processorID, spec, input, post, output)
+}
 
+func newHashAggregator(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	spec *execinfrapb.AggregatorSpec,
+	input execinfra.RowSource,
+	post *execinfrapb.PostProcessSpec,
+	output execinfra.RowReceiver,
+) (*hashAggregator, error) {
 	ag := &hashAggregator{
 		buckets:                 make(map[string]aggregateFuncs),
 		bucketsLenGrowThreshold: hashAggregatorBucketsInitialLen,
@@ -343,7 +355,7 @@ func (ag *orderedAggregator) Start(ctx context.Context) {
 func (ag *aggregatorBase) start(ctx context.Context, procName string) {
 	ctx = ag.StartInternal(ctx, procName)
 	ag.input.Start(ctx)
-	ag.cancelChecker.Reset(ctx)
+	ag.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 	ag.runningState = aggAccumulating
 }
 

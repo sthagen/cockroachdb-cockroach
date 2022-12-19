@@ -427,6 +427,10 @@ crdb_internal       index_columns
 crdb_internal       index_usage_statistics
 crdb_internal       invalid_objects
 crdb_internal       jobs
+crdb_internal       kv_catalog_comments
+crdb_internal       kv_catalog_descriptor
+crdb_internal       kv_catalog_namespace
+crdb_internal       kv_catalog_zones
 crdb_internal       kv_node_liveness
 crdb_internal       kv_node_status
 crdb_internal       kv_store_status
@@ -447,7 +451,6 @@ crdb_internal       node_transactions
 crdb_internal       node_txn_stats
 crdb_internal       partitions
 crdb_internal       pg_catalog_table_is_implemented
-crdb_internal       predefined_comments
 crdb_internal       ranges
 crdb_internal       ranges_no_leases
 crdb_internal       regions
@@ -753,6 +756,10 @@ index_columns
 index_usage_statistics
 invalid_objects
 jobs
+kv_catalog_comments
+kv_catalog_descriptor
+kv_catalog_namespace
+kv_catalog_zones
 kv_node_liveness
 kv_node_status
 kv_store_status
@@ -773,7 +780,6 @@ node_transactions
 node_txn_stats
 partitions
 pg_catalog_table_is_implemented
-predefined_comments
 ranges
 ranges_no_leases
 regions
@@ -1118,6 +1124,10 @@ system         crdb_internal       index_columns                          SYSTEM
 system         crdb_internal       index_usage_statistics                 SYSTEM VIEW  NO                  1
 system         crdb_internal       invalid_objects                        SYSTEM VIEW  NO                  1
 system         crdb_internal       jobs                                   SYSTEM VIEW  NO                  1
+system         crdb_internal       kv_catalog_comments                    SYSTEM VIEW  NO                  1
+system         crdb_internal       kv_catalog_descriptor                  SYSTEM VIEW  NO                  1
+system         crdb_internal       kv_catalog_namespace                   SYSTEM VIEW  NO                  1
+system         crdb_internal       kv_catalog_zones                       SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_node_liveness                       SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_node_status                         SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_store_status                        SYSTEM VIEW  NO                  1
@@ -1138,7 +1148,6 @@ system         crdb_internal       node_transactions                      SYSTEM
 system         crdb_internal       node_txn_stats                         SYSTEM VIEW  NO                  1
 system         crdb_internal       partitions                             SYSTEM VIEW  NO                  1
 system         crdb_internal       pg_catalog_table_is_implemented        SYSTEM VIEW  NO                  1
-system         crdb_internal       predefined_comments                    SYSTEM VIEW  NO                  1
 system         crdb_internal       ranges                                 SYSTEM VIEW  NO                  1
 system         crdb_internal       ranges_no_leases                       SYSTEM VIEW  NO                  1
 system         crdb_internal       regions                                SYSTEM VIEW  NO                  1
@@ -1585,6 +1594,7 @@ system              public             29_23_1_not_null                         
 system              public             29_23_2_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
 system              public             29_23_3_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        role_members                     PRIMARY KEY      NO             NO
+system              public             role_members_role_id_member_id_key                                                                              system         public        role_members                     UNIQUE           NO             NO
 system              public             29_33_1_not_null                                                                                                system         public        role_options                     CHECK            NO             NO
 system              public             29_33_2_not_null                                                                                                system         public        role_options                     CHECK            NO             NO
 system              public             29_33_4_not_null                                                                                                system         public        role_options                     CHECK            NO             NO
@@ -1933,7 +1943,9 @@ system         public        replication_stats                zone_id           
 system         public        reports_meta                     id                                                                                                        system              public             primary
 system         public        role_id_seq                      value                                                                                                     system              public             primary
 system         public        role_members                     member                                                                                                    system              public             primary
+system         public        role_members                     member_id                                                                                                 system              public             role_members_role_id_member_id_key
 system         public        role_members                     role                                                                                                      system              public             primary
+system         public        role_members                     role_id                                                                                                   system              public             role_members_role_id_member_id_key
 system         public        role_options                     option                                                                                                    system              public             primary
 system         public        role_options                     username                                                                                                  system              public             primary
 system         public        scheduled_jobs                   schedule_id                                                                                               system              public             primary
@@ -2106,6 +2118,7 @@ system         public        jobs                             created           
 system         public        jobs                             created_by_id                                                                                             7
 system         public        jobs                             created_by_type                                                                                           6
 system         public        jobs                             id                                                                                                        1
+system         public        jobs                             job_type                                                                                                  12
 system         public        jobs                             last_run                                                                                                  11
 system         public        jobs                             num_runs                                                                                                  10
 system         public        jobs                             payload                                                                                                   4
@@ -2179,7 +2192,9 @@ system         public        reports_meta                     id                
 system         public        role_id_seq                      value                                                                                                     1
 system         public        role_members                     isAdmin                                                                                                   3
 system         public        role_members                     member                                                                                                    2
+system         public        role_members                     member_id                                                                                                 5
 system         public        role_members                     role                                                                                                      1
+system         public        role_members                     role_id                                                                                                   4
 system         public        role_options                     option                                                                                                    2
 system         public        role_options                     user_id                                                                                                   4
 system         public        role_options                     username                                                                                                  1
@@ -2246,6 +2261,7 @@ system         public        table_statistics                 avgSize           
 system         public        table_statistics                 columnIDs                                                                                                 4
 system         public        table_statistics                 createdAt                                                                                                 5
 system         public        table_statistics                 distinctCount                                                                                             7
+system         public        table_statistics                 fullStatisticID                                                                                          12
 system         public        table_statistics                 histogram                                                                                                 9
 system         public        table_statistics                 name                                                                                                      3
 system         public        table_statistics                 nullCount                                                                                                 8
@@ -2803,6 +2819,10 @@ NULL     public   system         crdb_internal       index_columns              
 NULL     public   system         crdb_internal       index_usage_statistics                 SELECT          NO            YES
 NULL     public   system         crdb_internal       invalid_objects                        SELECT          NO            YES
 NULL     public   system         crdb_internal       jobs                                   SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_comments                    SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_descriptor                  SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_namespace                   SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_zones                       SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_liveness                       SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_status                         SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_store_status                        SELECT          NO            YES
@@ -2823,7 +2843,6 @@ NULL     public   system         crdb_internal       node_transactions          
 NULL     public   system         crdb_internal       node_txn_stats                         SELECT          NO            YES
 NULL     public   system         crdb_internal       partitions                             SELECT          NO            YES
 NULL     public   system         crdb_internal       pg_catalog_table_is_implemented        SELECT          NO            YES
-NULL     public   system         crdb_internal       predefined_comments                    SELECT          NO            YES
 NULL     public   system         crdb_internal       ranges                                 SELECT          NO            YES
 NULL     public   system         crdb_internal       ranges_no_leases                       SELECT          NO            YES
 NULL     public   system         crdb_internal       regions                                SELECT          NO            YES
@@ -3385,6 +3404,10 @@ NULL     public   system         crdb_internal       index_columns              
 NULL     public   system         crdb_internal       index_usage_statistics                 SELECT          NO            YES
 NULL     public   system         crdb_internal       invalid_objects                        SELECT          NO            YES
 NULL     public   system         crdb_internal       jobs                                   SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_comments                    SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_descriptor                  SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_namespace                   SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_catalog_zones                       SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_liveness                       SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_status                         SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_store_status                        SELECT          NO            YES
@@ -3405,7 +3428,6 @@ NULL     public   system         crdb_internal       node_transactions          
 NULL     public   system         crdb_internal       node_txn_stats                         SELECT          NO            YES
 NULL     public   system         crdb_internal       partitions                             SELECT          NO            YES
 NULL     public   system         crdb_internal       pg_catalog_table_is_implemented        SELECT          NO            YES
-NULL     public   system         crdb_internal       predefined_comments                    SELECT          NO            YES
 NULL     public   system         crdb_internal       ranges                                 SELECT          NO            YES
 NULL     public   system         crdb_internal       ranges_no_leases                       SELECT          NO            YES
 NULL     public   system         crdb_internal       regions                                SELECT          NO            YES
@@ -4768,6 +4790,7 @@ experimental_enable_hash_sharded_indexes              on
 experimental_enable_implicit_column_partitioning      off
 experimental_enable_temp_tables                       off
 experimental_enable_unique_without_index_constraints  on
+experimental_hash_group_join_enabled                  off
 extra_float_digits                                    1
 force_savepoint_restart                               off
 foreign_key_cascades_limit                            10000

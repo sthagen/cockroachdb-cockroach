@@ -394,6 +394,13 @@ func TestLogic_collatedstring_uniqueindex2(
 	runLogicTest(t, "collatedstring_uniqueindex2")
 }
 
+func TestLogic_composite_types(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "composite_types")
+}
+
 func TestLogic_computed(
 	t *testing.T,
 ) {
@@ -840,6 +847,13 @@ func TestLogic_grant_schema(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "grant_schema")
+}
+
+func TestLogic_group_join(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "group_join")
 }
 
 func TestLogic_hash_join(

@@ -25,10 +25,7 @@ import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
 } from "../store/uiConfig";
-import {
-  nodeDisplayNameByIDSelector,
-  nodeRegionsByIDSelector,
-} from "../store/nodes";
+import { nodeRegionsByIDSelector } from "../store/nodes";
 import { actions as sqlDetailsStatsActions } from "src/store/statementDetails";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
 import {
@@ -62,8 +59,7 @@ const mapStateToProps = (state: AppState, props: RouteComponentProps) => {
     isLoading: isLoading,
     statementsError: lastError,
     timeScale: selectTimeScale(state),
-    nodeNames: selectIsTenant(state) ? {} : nodeDisplayNameByIDSelector(state),
-    nodeRegions: selectIsTenant(state) ? {} : nodeRegionsByIDSelector(state),
+    nodeRegions: nodeRegionsByIDSelector(state),
     diagnosticsReports:
       selectIsTenant(state) || selectHasViewActivityRedactedRole(state)
         ? []

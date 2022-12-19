@@ -162,6 +162,7 @@ func (tc *testContext) Start(ctx context.Context, t testing.TB, stopper *stop.St
 	// testContext tests like to move the manual clock around and assume that they can write at past
 	// timestamps.
 	cfg.TestingKnobs.DontCloseTimestamps = true
+	cfg.TestingKnobs.DisableMergeWaitForReplicasInit = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 }
 
@@ -285,7 +286,7 @@ func (tc *testContext) addBogusReplicaToRangeDesc(
 		Header: roachpb.Header{Timestamp: tc.Clock().Now()},
 	}
 	descKey := keys.RangeDescriptorKey(oldDesc.StartKey)
-	if err := updateRangeDescriptor(ctx, &ba, descKey, dbDescKV.Value.TagAndDataBytes(), &newDesc); err != nil {
+	if err := updateRangeDescriptor(&ba, descKey, dbDescKV.Value.TagAndDataBytes(), &newDesc); err != nil {
 		return roachpb.ReplicaDescriptor{}, err
 	}
 	if err := tc.store.DB().Run(ctx, &ba); err != nil {
@@ -14008,7 +14009,7 @@ func TestStoreTenantMetricsAndRateLimiterRefcount(t *testing.T) {
 			Key: leftRepl.Desc().StartKey.AsRawKey(),
 		},
 	}, "testing")
-	require.Nil(t, pErr)
+	require.NoError(t, pErr.GoError())
 
 	// The store metrics no longer track tenant 123.
 	require.Equal(t,

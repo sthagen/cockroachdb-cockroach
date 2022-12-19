@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -175,14 +175,22 @@ func cleanupSessionTempObjects(
 				return err
 			}
 			for _, dbDesc := range allDbDescs {
-				if err := cleanupSchemaObjects(
+				flags := tree.CommonLookupFlags{AvoidLeased: true}
+				tempSchema, err := descsCol.GetImmutableSchemaByName(ctx, txn, dbDesc, tempSchemaName, flags)
+				if err != nil {
+					return err
+				}
+				if tempSchema == nil {
+					continue
+				}
+				if err := cleanupTempSchemaObjects(
 					ctx,
 					txn,
 					descsCol,
 					codec,
 					ie,
 					dbDesc,
-					tempSchemaName,
+					tempSchema,
 				); err != nil {
 					return err
 				}
@@ -205,29 +213,23 @@ func cleanupSessionTempObjects(
 		})
 }
 
-// cleanupSchemaObjects removes all objects that is located within a dbID and schema.
+// cleanupTempSchemaObjects removes all objects that is located within a dbID and schema.
 //
 // TODO(postamar): properly use descsCol
 // We're currently unable to leverage descsCol properly because we run DROP
 // statements in the transaction which cause descsCol's cached state to become
 // invalid. We should either drop all objects programmatically via descsCol's
 // API or avoid it entirely.
-func cleanupSchemaObjects(
+func cleanupTempSchemaObjects(
 	ctx context.Context,
 	txn *kv.Txn,
 	descsCol *descs.Collection,
 	codec keys.SQLCodec,
 	ie sqlutil.InternalExecutor,
-	dbDesc catalog.DatabaseDescriptor,
-	schemaName string,
+	db catalog.DatabaseDescriptor,
+	sc catalog.SchemaDescriptor,
 ) error {
-	tbNames, tbIDs, err := descsCol.GetObjectNamesAndIDs(
-		ctx,
-		txn,
-		dbDesc,
-		schemaName,
-		tree.DatabaseListFlags{CommonLookupFlags: tree.CommonLookupFlags{Required: false}},
-	)
+	objects, err := descsCol.GetAllObjectsInSchema(ctx, txn, db, sc)
 	if err != nil {
 		return err
 	}
@@ -242,34 +244,36 @@ func cleanupSchemaObjects(
 	var views descpb.IDs
 	var sequences descpb.IDs
 
-	tblDescsByID := make(map[descpb.ID]catalog.TableDescriptor, len(tbNames))
-	tblNamesByID := make(map[descpb.ID]tree.TableName, len(tbNames))
-	for i, tbName := range tbNames {
-		desc, err := descsCol.Direct().MustGetTableDescByID(ctx, txn, tbIDs[i])
-		if err != nil {
-			return err
+	tblDescsByID := make(map[descpb.ID]catalog.TableDescriptor)
+	tblNamesByID := make(map[descpb.ID]tree.TableName)
+	_ = objects.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		tbl, ok := desc.(catalog.TableDescriptor)
+		if !ok || desc.Dropped() {
+			return nil
 		}
-
-		tblDescsByID[desc.GetID()] = desc
-		tblNamesByID[desc.GetID()] = tbName
+		tblDescsByID[desc.GetID()] = tbl
+		tblNamesByID[desc.GetID()] = tree.MakeTableNameWithSchema(
+			tree.Name(db.GetName()), tree.Name(sc.GetName()), tree.Name(tbl.GetName()),
+		)
 
 		databaseIDToTempSchemaID[uint32(desc.GetParentID())] = uint32(desc.GetParentSchemaID())
 
 		// If a sequence is owned by a table column, it is dropped when the owner
 		// table/column is dropped. So here we want to only drop sequences not
 		// owned.
-		if desc.IsSequence() &&
-			desc.GetSequenceOpts().SequenceOwner.OwnerColumnID == 0 &&
-			desc.GetSequenceOpts().SequenceOwner.OwnerTableID == 0 {
+		if tbl.IsSequence() &&
+			tbl.GetSequenceOpts().SequenceOwner.OwnerColumnID == 0 &&
+			tbl.GetSequenceOpts().SequenceOwner.OwnerTableID == 0 {
 			sequences = append(sequences, desc.GetID())
-		} else if desc.GetViewQuery() != "" {
+		} else if tbl.GetViewQuery() != "" {
 			views = append(views, desc.GetID())
-		} else if !desc.IsSequence() {
+		} else if !tbl.IsSequence() {
 			tables = append(tables, desc.GetID())
 		}
-	}
+		return nil
+	})
 
-	searchPath := sessiondata.DefaultSearchPathForUser(username.RootUserName()).WithTemporarySchemaName(schemaName)
+	searchPath := sessiondata.DefaultSearchPathForUser(username.RootUserName()).WithTemporarySchemaName(sc.GetName())
 	override := sessiondata.InternalExecutorOverride{
 		SearchPath:               &searchPath,
 		User:                     username.RootUserName(),
@@ -303,21 +307,17 @@ func cleanupSchemaObjects(
 					if _, ok := tblDescsByID[d.ID]; ok {
 						return nil
 					}
-					dTableDesc, err := descsCol.Direct().MustGetTableDescByID(ctx, txn, d.ID)
+					flags := tree.CommonLookupFlags{AvoidLeased: true}
+					dTableDesc, err := descsCol.GetImmutableTableByID(
+						ctx, txn, d.ID, tree.ObjectLookupFlags{CommonLookupFlags: flags})
 					if err != nil {
 						return err
 					}
-					db, err := descsCol.Direct().MustGetDatabaseDescByID(ctx, txn, dTableDesc.GetParentID())
+					_, db, err := descsCol.GetImmutableDatabaseByID(ctx, txn, dTableDesc.GetParentID(), flags)
 					if err != nil {
 						return err
 					}
-					schema, err := resolver.ResolveSchemaNameByID(
-						ctx,
-						txn,
-						codec,
-						db,
-						dTableDesc.GetParentSchemaID(),
-					)
+					sc, err := descsCol.GetImmutableSchemaByID(ctx, txn, dTableDesc.GetParentSchemaID(), flags)
 					if err != nil {
 						return err
 					}
@@ -329,7 +329,7 @@ func cleanupSchemaObjects(
 						if dependentColIDs.Contains(int(col.GetID())) {
 							tbName := tree.MakeTableNameWithSchema(
 								tree.Name(db.GetName()),
-								tree.Name(schema),
+								tree.Name(sc.GetName()),
 								tree.Name(dTableDesc.GetName()),
 							)
 							_, err = ie.ExecEx(
@@ -401,6 +401,12 @@ type TemporaryObjectCleaner struct {
 	metrics                 *temporaryObjectCleanerMetrics
 	collectionFactory       *descs.CollectionFactory
 	internalExecutorFactory sqlutil.InternalExecutorFactory
+
+	// waitForInstances is a function to ensure that the status server will know
+	// about the set of live instances at least as of the time of startup. This
+	// primarily matters during tests of the temp table infrastructure in
+	// secondary tenants.
+	waitForInstances func(ctx context.Context) error
 }
 
 // temporaryObjectCleanerMetrics are the metrics for TemporaryObjectCleaner
@@ -428,6 +434,7 @@ func NewTemporaryObjectCleaner(
 	testingKnobs ExecutorTestingKnobs,
 	ief sqlutil.InternalExecutorFactory,
 	cf *descs.CollectionFactory,
+	waitForInstances func(ctx context.Context) error,
 ) *TemporaryObjectCleaner {
 	metrics := makeTemporaryObjectCleanerMetrics()
 	registry.AddMetricStruct(metrics)
@@ -441,6 +448,7 @@ func NewTemporaryObjectCleaner(
 		metrics:                 metrics,
 		internalExecutorFactory: ief,
 		collectionFactory:       cf,
+		waitForInstances:        waitForInstances,
 	}
 }
 
@@ -497,6 +505,16 @@ func (c *TemporaryObjectCleaner) doTemporaryObjectCleanup(
 			return nil
 		}
 	}
+	// We need to make sure that we have a somewhat up-to-date view of the
+	// set of live instances. If not, we might delete a relatively new
+	// table. In general this shouldn't be necessary because our wait interval
+	// is extremely conservative at 30 minutes by default, but under tests,
+	// it comes up.
+	if c.waitForInstances != nil {
+		if err := c.waitForInstances(ctx); err != nil {
+			return err
+		}
+	}
 
 	c.metrics.ActiveCleaners.Inc(1)
 	defer c.metrics.ActiveCleaners.Dec(1)
@@ -508,43 +526,48 @@ func (c *TemporaryObjectCleaner) doTemporaryObjectCleanup(
 	// Only see temporary schemas after some delay as safety
 	// mechanism.
 	waitTimeForCreation := TempObjectWaitInterval.Get(&c.settings.SV)
-	// Build a set of all databases with temporary objects.
-	var allDbDescs []catalog.DatabaseDescriptor
 	descsCol := c.collectionFactory.NewCollection(ctx)
-	if err := retryFunc(ctx, func() error {
-		var err error
-		allDbDescs, err = descsCol.GetAllDatabaseDescriptors(ctx, txn)
+	// Build a set of all databases with temporary objects.
+	var dbs nstree.Catalog
+	if err := retryFunc(ctx, func() (err error) {
+		dbs, err = descsCol.GetAllDatabases(ctx, txn)
 		return err
 	}); err != nil {
 		return err
 	}
 
 	sessionIDs := make(map[clusterunique.ID]struct{})
-	for _, dbDesc := range allDbDescs {
-		var schemaEntries map[descpb.ID]resolver.SchemaEntryForDB
-		if err := retryFunc(ctx, func() error {
-			var err error
-			schemaEntries, err = resolver.GetForDatabase(ctx, txn, c.codec, dbDesc)
+	if err := dbs.ForEachDescriptor(func(dbDesc catalog.Descriptor) error {
+		db, err := catalog.AsDatabaseDescriptor(dbDesc)
+		if err != nil {
+			return err
+		}
+		var schemas nstree.Catalog
+		if err := retryFunc(ctx, func() (err error) {
+			schemas, err = descsCol.GetAllSchemasInDatabase(ctx, txn, db)
 			return err
 		}); err != nil {
 			return err
 		}
-		for _, scEntry := range schemaEntries {
+		return schemas.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
+			if e.GetParentSchemaID() != descpb.InvalidID {
+				return nil
+			}
 			// Skip over any temporary objects that are not old enough,
 			// we intentionally use a delay to avoid problems.
-			if !scEntry.Timestamp.Less(txn.ReadTimestamp().Add(-waitTimeForCreation.Nanoseconds(), 0)) {
-				continue
+			if !e.GetMVCCTimestamp().Less(txn.ReadTimestamp().Add(-waitTimeForCreation.Nanoseconds(), 0)) {
+				return nil
 			}
-			isTempSchema, sessionID, err := temporarySchemaSessionID(scEntry.Name)
-			if err != nil {
+			if isTempSchema, sessionID, err := temporarySchemaSessionID(e.GetName()); err != nil {
 				// This should not cause an error.
-				log.Warningf(ctx, "could not parse %q as temporary schema name", scEntry)
-				continue
-			}
-			if isTempSchema {
+				log.Warningf(ctx, "could not parse %q as temporary schema name", e.GetName())
+			} else if isTempSchema {
 				sessionIDs[sessionID] = struct{}{}
 			}
-		}
+			return nil
+		})
+	}); err != nil {
+		return err
 	}
 	log.Infof(ctx, "found %d temporary schemas", len(sessionIDs))
 

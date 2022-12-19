@@ -16,11 +16,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -53,11 +54,6 @@ func (so *DummySequenceOperators) GetSerialSequenceNameFromColumn(
 	return nil, errors.WithStack(errSequenceOperators)
 }
 
-// ParseQualifiedTableName is part of the eval.DatabaseCatalog interface.
-func (so *DummySequenceOperators) ParseQualifiedTableName(sql string) (*tree.TableName, error) {
-	return nil, errors.WithStack(errSequenceOperators)
-}
-
 // ResolveTableName is part of the eval.DatabaseCatalog interface.
 func (so *DummySequenceOperators) ResolveTableName(
 	ctx context.Context, tn *tree.TableName,
@@ -70,20 +66,6 @@ func (so *DummySequenceOperators) SchemaExists(
 	ctx context.Context, dbName, scName string,
 ) (bool, error) {
 	return false, errors.WithStack(errSequenceOperators)
-}
-
-// IsTableVisible is part of the eval.DatabaseCatalog interface.
-func (so *DummySequenceOperators) IsTableVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-) (bool, bool, error) {
-	return false, false, errors.WithStack(errSequenceOperators)
-}
-
-// IsTypeVisible is part of the eval.DatabaseCatalog interface.
-func (so *DummySequenceOperators) IsTypeVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-) (bool, bool, error) {
-	return false, false, errors.WithStack(errEvalPlanner)
 }
 
 // HasAnyPrivilege is part of the eval.DatabaseCatalog interface.
@@ -154,6 +136,12 @@ func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForTable(
 func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
 	_ context.Context, id int64,
 ) error {
+	return errors.WithStack(errRegionOperator)
+}
+
+// OptimizeSystemDatabase is part of the eval.RegionOperator
+// interface.
+func (so *DummyRegionOperator) OptimizeSystemDatabase(_ context.Context) error {
 	return errors.WithStack(errRegionOperator)
 }
 
@@ -365,28 +353,9 @@ func (ep *DummyEvalPlanner) ValidateAllMultiRegionZoneConfigsInCurrentDatabase(
 	return errors.WithStack(errEvalPlanner)
 }
 
-// ParseQualifiedTableName is part of the eval.DatabaseCatalog interface.
-func (ep *DummyEvalPlanner) ParseQualifiedTableName(sql string) (*tree.TableName, error) {
-	return parser.ParseQualifiedTableName(sql)
-}
-
 // SchemaExists is part of the eval.DatabaseCatalog interface.
 func (ep *DummyEvalPlanner) SchemaExists(ctx context.Context, dbName, scName string) (bool, error) {
 	return false, errors.WithStack(errEvalPlanner)
-}
-
-// IsTableVisible is part of the eval.DatabaseCatalog interface.
-func (ep *DummyEvalPlanner) IsTableVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-) (bool, bool, error) {
-	return false, false, errors.WithStack(errEvalPlanner)
-}
-
-// IsTypeVisible is part of the eval.DatabaseCatalog interface.
-func (ep *DummyEvalPlanner) IsTypeVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-) (bool, bool, error) {
-	return false, false, errors.WithStack(errEvalPlanner)
 }
 
 // HasAnyPrivilege is part of the eval.DatabaseCatalog interface.
@@ -585,6 +554,12 @@ func (c *DummyTenantOperator) RenameTenant(
 func (c *DummyTenantOperator) GetTenantInfo(
 	ctx context.Context, tenantName roachpb.TenantName,
 ) (*descpb.TenantInfo, error) {
+	return nil, errors.WithStack(errEvalTenant)
+}
+
+func (p *DummyTenantOperator) GetTenantReplicationInfo(
+	ctx context.Context, replicationJobId jobspb.JobID,
+) (*streampb.StreamIngestionStats, error) {
 	return nil, errors.WithStack(errEvalTenant)
 }
 

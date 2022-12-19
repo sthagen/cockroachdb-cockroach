@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -403,6 +404,12 @@ type StoreTestingKnobs struct {
 	// renewing expiration based leases.
 	LeaseRenewalDurationOverride time.Duration
 
+	// RangefeedValueHeaderFilter, if set, is invoked before each value emitted on
+	// the rangefeed, be it in steady state or during the catch-up scan.
+	//
+	// TODO(before merge): plumb the seqno through the rangefeed.
+	RangefeedValueHeaderFilter func(key, endKey roachpb.Key, ts hlc.Timestamp, vh enginepb.MVCCValueHeader)
+
 	// MakeSystemConfigSpanUnavailableToQueues makes the system config span
 	// unavailable to queues that ask for it.
 	MakeSystemConfigSpanUnavailableToQueues bool
@@ -466,6 +473,10 @@ type StoreTestingKnobs struct {
 	// Replica.executeReadOnlyBatch after checks have successfully determined
 	// execution can proceed but a storage snapshot has not been acquired.
 	PreStorageSnapshotButChecksCompleteInterceptor func(replica *Replica)
+
+	// DisableMergeWaitForReplicasInit skips the waitForReplicasInit calls
+	// during merges. Useful for testContext tests that want to use merges.
+	DisableMergeWaitForReplicasInit bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

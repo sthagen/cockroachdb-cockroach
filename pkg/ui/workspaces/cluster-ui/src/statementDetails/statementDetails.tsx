@@ -133,7 +133,6 @@ export interface StatementDetailsStateProps {
   isLoading: boolean;
   statementsError: Error | null;
   timeScale: TimeScale;
-  nodeNames: { [nodeId: string]: string };
   nodeRegions: { [nodeId: string]: string };
   diagnosticsReports: StatementDiagnosticsReport[];
   uiConfig?: UIConfigState["pages"]["statementDetails"];
@@ -635,20 +634,18 @@ export class StatementDetails extends React.Component<
             <Col className="gutter-row" span={12}>
               <SummaryCard id="first-card" className={cx("summary-card")}>
                 {!isTenant && (
-                  <>
-                    <SummaryCardItem
-                      label="Nodes"
-                      value={intersperse<ReactNode>(
-                        nodes.map(n => <NodeLink node={n} key={n} />),
-                        ", ",
-                      )}
-                    />
-                    <SummaryCardItem
-                      label="Regions"
-                      value={intersperse<ReactNode>(regions, ", ")}
-                    />
-                  </>
+                  <SummaryCardItem
+                    label="Nodes"
+                    value={intersperse<ReactNode>(
+                      nodes.map(n => <NodeLink node={n} key={n} />),
+                      ", ",
+                    )}
+                  />
                 )}
+                <SummaryCardItem
+                  label="Regions"
+                  value={intersperse<ReactNode>(regions, ", ")}
+                />
                 <SummaryCardItem label="Database" value={db} />
                 <SummaryCardItem
                   label="Application Name"

@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -567,6 +566,10 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 		if desc.GetArrayTypeID() != descpb.InvalidID {
 			vea.Report(errors.AssertionFailedf("ALIAS type desc has array type ID %d", desc.GetArrayTypeID()))
 		}
+	case descpb.TypeDescriptor_COMPOSITE:
+		if desc.Composite == nil {
+			vea.Report(errors.AssertionFailedf("COMPOSITE type desc has nil composite type"))
+		}
 	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
 		vea.Report(errors.AssertionFailedf("invalid type descriptor: kind %s should never be serialized or validated", desc.Kind.String()))
 	default:
@@ -679,6 +682,20 @@ func (desc *immutable) ValidateForwardReferences(
 			vea.Report(errors.AssertionFailedf("aliased type %q (%d) is dropped", typ.GetName(), typ.GetID()))
 		}
 	}
+
+	if desc.GetKind() == descpb.TypeDescriptor_COMPOSITE {
+		for _, e := range desc.Composite.Elements {
+			t := e.ElementType
+			if t.UserDefined() {
+				// User-defined type references within user-defined types are currently
+				// not supported, but this should be validated elsewhere.
+				// See issue https://github.com/cockroachdb/cockroach/issues/91779.
+				vea.Report(errors.AssertionFailedf("invalid reference to user-defined type %q from composite type %q",
+					t.String(), desc.GetName(),
+				))
+			}
+		}
+	}
 }
 
 // ValidateBackReferences implements the catalog.Descriptor interface.
@@ -708,7 +725,7 @@ func (desc *immutable) ValidateBackReferences(
 			continue
 		}
 		switch depDesc.DescriptorType() {
-		case catalog.Table, catalog.Function:
+		case catalog.Table, catalog.Function, catalog.Type:
 			if depDesc.Dropped() {
 				vea.Report(errors.AssertionFailedf(
 					"referencing %s %d was dropped without dependency unlinking", depDesc.DescriptorType(), id))
@@ -826,6 +843,20 @@ func (desc *immutable) MakeTypesT(
 			return nil, err
 		}
 		return desc.Alias, nil
+	case descpb.TypeDescriptor_COMPOSITE:
+		contents := make([]*types.T, len(desc.Composite.Elements))
+		labels := make([]string, len(desc.Composite.Elements))
+		for i, e := range desc.Composite.Elements {
+			contents[i] = e.ElementType
+			labels[i] = e.ElementLabel
+		}
+		typ := types.MakeCompositeType(catid.TypeIDToOID(desc.GetID()), catid.TypeIDToOID(desc.ArrayTypeID),
+			contents, labels)
+		// Hydrate the composite type and return it.
+		if err := desc.HydrateTypeInfoWithName(ctx, typ, name, res); err != nil {
+			return nil, err
+		}
+		return typ, nil
 	default:
 		return nil, errors.AssertionFailedf("unknown type kind %s", t.String())
 	}
@@ -947,6 +978,12 @@ func (desc *immutable) HydrateTypeInfoWithName(
 				}
 			default:
 				return errors.AssertionFailedf("unhandled alias type family %s", typ.Family())
+			}
+		}
+	case descpb.TypeDescriptor_COMPOSITE:
+		for _, e := range desc.Composite.Elements {
+			if err := EnsureTypeIsHydrated(ctx, e.ElementType, res); err != nil {
+				return err
 			}
 		}
 	default:
@@ -1091,7 +1128,8 @@ func (desc *immutable) GetIDClosure() (map[descpb.ID]struct{}, error) {
 	ret := make(map[descpb.ID]struct{})
 	// Collect the descriptor's own ID.
 	ret[desc.ID] = struct{}{}
-	if desc.Kind == descpb.TypeDescriptor_ALIAS {
+	switch desc.Kind {
+	case descpb.TypeDescriptor_ALIAS:
 		// If this descriptor is an alias for another type, then get collect the
 		// closure for alias.
 		children, err := GetTypeDescriptorClosure(desc.Alias)
@@ -1101,23 +1139,26 @@ func (desc *immutable) GetIDClosure() (map[descpb.ID]struct{}, error) {
 		for id := range children {
 			ret[id] = struct{}{}
 		}
-	} else {
+	case descpb.TypeDescriptor_COMPOSITE:
+		for _, e := range desc.Composite.Elements {
+			children, err := GetTypeDescriptorClosure(e.ElementType)
+			if err != nil {
+				return nil, err
+			}
+			for id := range children {
+				ret[id] = struct{}{}
+			}
+		}
+	default:
 		// Otherwise, take the array type ID.
 		ret[desc.ArrayTypeID] = struct{}{}
 	}
 	return ret, nil
 }
 
-// GetObjectType implements the PrivilegeObject interface.
+// GetObjectType implements the Object interface.
 func (desc *immutable) GetObjectType() privilege.ObjectType {
 	return privilege.Type
-}
-
-// GetPrivilegeDescriptor implements the PrivilegeObject interface.
-func (desc *immutable) GetPrivilegeDescriptor(
-	ctx context.Context, planner eval.Planner,
-) (*catpb.PrivilegeDescriptor, error) {
-	return desc.GetPrivileges(), nil
 }
 
 // GetTypeDescriptorClosure returns all type descriptor IDs that are

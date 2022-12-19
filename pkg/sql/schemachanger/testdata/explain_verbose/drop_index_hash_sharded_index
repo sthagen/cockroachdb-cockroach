@@ -34,17 +34,17 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │       │   │   └── • PreviousTransactionPrecedence dependency from PUBLIC SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
 │       │   │         rule: "SecondaryIndex transitions to ABSENT uphold 2-version invariant: PUBLIC->VALIDATED"
 │       │   │
-│       │   ├── • IndexName:{DescID: 104, Name: idx, IndexID: 2}
-│       │   │   │ PUBLIC → ABSENT
+│       │   ├── • CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
+│       │   │   │ PUBLIC → VALIDATED
 │       │   │   │
-│       │   │   └── • Precedence dependency from VALIDATED SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
-│       │   │         rule: "index no longer public before dependents"
+│       │   │   └── • PreviousTransactionPrecedence dependency from PUBLIC CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
+│       │   │         rule: "CheckConstraint transitions to ABSENT uphold 2-version invariant: PUBLIC->VALIDATED"
 │       │   │
-│       │   └── • CheckConstraint:{DescID: 104, ConstraintID: 2}
-│       │       │ PUBLIC → VALIDATED
+│       │   └── • ConstraintWithoutIndexName:{DescID: 104, Name: check_crdb_internal_j_shard_16, ConstraintID: 2}
+│       │       │ PUBLIC → ABSENT
 │       │       │
-│       │       └── • PreviousTransactionPrecedence dependency from PUBLIC CheckConstraint:{DescID: 104, ConstraintID: 2}
-│       │             rule: "CheckConstraint transitions to ABSENT uphold 2-version invariant: PUBLIC->VALIDATED"
+│       │       └── • Precedence dependency from VALIDATED CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
+│       │             rule: "constraint no longer public before dependents"
 │       │
 │       └── • 6 Mutation operations
 │           │
@@ -52,13 +52,13 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │           │     IndexID: 2
 │           │     TableID: 104
 │           │
-│           ├── • SetIndexName
-│           │     IndexID: 2
-│           │     Name: crdb_internal_index_2_name_placeholder
-│           │     TableID: 104
-│           │
 │           ├── • MakePublicCheckConstraintValidated
 │           │     ConstraintID: 2
+│           │     TableID: 104
+│           │
+│           ├── • SetConstraintName
+│           │     ConstraintID: 2
+│           │     Name: crdb_internal_constraint_2_name_placeholder
 │           │     TableID: 104
 │           │
 │           ├── • MakePublicColumnWriteOnly
@@ -78,7 +78,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │           │       Statement: DROP INDEX ‹defaultdb›.‹public›.‹t›@‹idx› CASCADE
 │           │       StatementTag: DROP INDEX
 │           │       TargetMetadata:
-│           │         SourceElementID: 1
+│           │         SourceElementID: 2
 │           │         SubWorkID: 1
 │           │     TargetStatus: 1
 │           │
@@ -91,7 +91,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │   │
 │   └── • Stage 1 of 1 in PreCommitPhase
 │       │
-│       ├── • 4 elements transitioning toward ABSENT
+│       ├── • 3 elements transitioning toward ABSENT
 │       │   │
 │       │   ├── • IndexColumn:{DescID: 104, ColumnID: 3, IndexID: 2}
 │       │   │   │ PUBLIC → ABSENT
@@ -114,25 +114,16 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │       │   │   └── • skip PUBLIC → ABSENT operations
 │       │   │         rule: "skip index-column removal ops on index removal"
 │       │   │
-│       │   ├── • IndexColumn:{DescID: 104, ColumnID: 1, IndexID: 2}
-│       │   │   │ PUBLIC → ABSENT
-│       │   │   │
-│       │   │   ├── • Precedence dependency from VALIDATED SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
-│       │   │   │     rule: "index no longer public before dependents"
-│       │   │   │
-│       │   │   └── • skip PUBLIC → ABSENT operations
-│       │   │         rule: "skip index-column removal ops on index removal"
-│       │   │
-│       │   └── • ConstraintName:{DescID: 104, Name: check_crdb_internal_j_shard_16, ConstraintID: 2}
+│       │   └── • IndexColumn:{DescID: 104, ColumnID: 1, IndexID: 2}
 │       │       │ PUBLIC → ABSENT
 │       │       │
-│       │       └── • Precedence dependency from VALIDATED CheckConstraint:{DescID: 104, ConstraintID: 2}
-│       │             rule: "constraint no longer public before dependents"
+│       │       ├── • Precedence dependency from VALIDATED SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
+│       │       │     rule: "index no longer public before dependents"
+│       │       │
+│       │       └── • skip PUBLIC → ABSENT operations
+│       │             rule: "skip index-column removal ops on index removal"
 │       │
-│       └── • 3 Mutation operations
-│           │
-│           ├── • NotImplemented
-│           │     ElementType: scpb.ConstraintName
+│       └── • 2 Mutation operations
 │           │
 │           ├── • SetJobStateOnDescriptor
 │           │     DescriptorID: 104
@@ -145,7 +136,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │                 - 104
 │                 JobID: 1
 │                 NonCancelable: true
-│                 RunningStatus: PostCommitNonRevertiblePhase stage 1 of 2 with 3 MutationType ops pending
+│                 RunningStatus: PostCommitNonRevertiblePhase stage 1 of 2 with 5 MutationType ops pending
 │                 Statements:
 │                 - statement: DROP INDEX idx CASCADE
 │                   redactedstatement: DROP INDEX ‹defaultdb›.‹public›.‹t›@‹idx› CASCADE
@@ -155,7 +146,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
     │
     ├── • Stage 1 of 2 in PostCommitNonRevertiblePhase
     │   │
-    │   ├── • 3 elements transitioning toward ABSENT
+    │   ├── • 4 elements transitioning toward ABSENT
     │   │   │
     │   │   ├── • Column:{DescID: 104, ColumnID: 3}
     │   │   │   │ WRITE_ONLY → DELETE_ONLY
@@ -169,16 +160,25 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
     │   │   │   └── • PreviousTransactionPrecedence dependency from VALIDATED SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
     │   │   │         rule: "SecondaryIndex transitions to ABSENT uphold 2-version invariant: VALIDATED->WRITE_ONLY"
     │   │   │
-    │   │   └── • CheckConstraint:{DescID: 104, ConstraintID: 2}
+    │   │   ├── • IndexName:{DescID: 104, Name: idx, IndexID: 2}
+    │   │   │   │ PUBLIC → ABSENT
+    │   │   │   │
+    │   │   │   ├── • Precedence dependency from DELETE_ONLY SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
+    │   │   │   │     rule: "index no longer public before index name"
+    │   │   │   │
+    │   │   │   └── • Precedence dependency from VALIDATED SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
+    │   │   │         rule: "index no longer public before dependents"
+    │   │   │
+    │   │   └── • CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
     │   │       │ VALIDATED → ABSENT
     │   │       │
-    │   │       ├── • PreviousTransactionPrecedence dependency from VALIDATED CheckConstraint:{DescID: 104, ConstraintID: 2}
+    │   │       ├── • PreviousTransactionPrecedence dependency from VALIDATED CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
     │   │       │     rule: "CheckConstraint transitions to ABSENT uphold 2-version invariant: VALIDATED->ABSENT"
     │   │       │
-    │   │       └── • Precedence dependency from ABSENT ConstraintName:{DescID: 104, Name: check_crdb_internal_j_shard_16, ConstraintID: 2}
+    │   │       └── • Precedence dependency from ABSENT ConstraintWithoutIndexName:{DescID: 104, Name: check_crdb_internal_j_shard_16, ConstraintID: 2}
     │   │             rule: "dependents removed before constraint"
     │   │
-    │   └── • 5 Mutation operations
+    │   └── • 7 Mutation operations
     │       │
     │       ├── • MakeWriteOnlyColumnDeleteOnly
     │       │     ColumnID: 3
@@ -188,8 +188,35 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
     │       │     ConstraintID: 2
     │       │     TableID: 104
     │       │
+    │       ├── • LogEvent
+    │       │     Element:
+    │       │       SecondaryIndex:
+    │       │         indexId: 2
+    │       │         isCreatedExplicitly: true
+    │       │         sharding:
+    │       │           columnNames:
+    │       │           - j
+    │       │           isSharded: true
+    │       │           name: crdb_internal_j_shard_16
+    │       │           shardBuckets: 16
+    │       │         tableId: 104
+    │       │     EventBase:
+    │       │       Authorization:
+    │       │         UserName: root
+    │       │       Statement: DROP INDEX ‹defaultdb›.‹public›.‹t›@‹idx› CASCADE
+    │       │       StatementTag: DROP INDEX
+    │       │       TargetMetadata:
+    │       │         SourceElementID: 1
+    │       │         SubWorkID: 1
+    │       │     TargetStatus: 1
+    │       │
     │       ├── • MakeWriteOnlyIndexDeleteOnly
     │       │     IndexID: 2
+    │       │     TableID: 104
+    │       │
+    │       ├── • SetIndexName
+    │       │     IndexID: 2
+    │       │     Name: crdb_internal_index_2_name_placeholder
     │       │     TableID: 104
     │       │
     │       ├── • SetJobStateOnDescriptor
@@ -198,7 +225,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
     │       └── • UpdateSchemaChangerJob
     │             IsNonCancelable: true
     │             JobID: 1
-    │             RunningStatus: PostCommitNonRevertiblePhase stage 2 of 2 with 4 MutationType ops pending
+    │             RunningStatus: PostCommitNonRevertiblePhase stage 2 of 2 with 3 MutationType ops pending
     │
     └── • Stage 2 of 2 in PostCommitNonRevertiblePhase
         │
@@ -253,29 +280,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
         │       └── • Precedence dependency from ABSENT SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 0}
         │             rule: "index removed before garbage collection"
         │
-        └── • 6 Mutation operations
-            │
-            ├── • LogEvent
-            │     Element:
-            │       SecondaryIndex:
-            │         indexId: 2
-            │         isCreatedExplicitly: true
-            │         sharding:
-            │           columnNames:
-            │           - j
-            │           isSharded: true
-            │           name: crdb_internal_j_shard_16
-            │           shardBuckets: 16
-            │         tableId: 104
-            │     EventBase:
-            │       Authorization:
-            │         UserName: root
-            │       Statement: DROP INDEX ‹defaultdb›.‹public›.‹t›@‹idx› CASCADE
-            │       StatementTag: DROP INDEX
-            │       TargetMetadata:
-            │         SourceElementID: 1
-            │         SubWorkID: 1
-            │     TargetStatus: 1
+        └── • 5 Mutation operations
             │
             ├── • MakeIndexAbsent
             │     IndexID: 2
@@ -295,7 +300,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
             │       Statement: DROP INDEX ‹defaultdb›.‹public›.‹t›@‹idx› CASCADE
             │       StatementTag: DROP INDEX
             │       TargetMetadata:
-            │         SourceElementID: 1
+            │         SourceElementID: 2
             │         SubWorkID: 1
             │     TableID: 104
             │

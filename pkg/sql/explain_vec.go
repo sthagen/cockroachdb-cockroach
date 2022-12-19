@@ -35,8 +35,6 @@ type explainVecNode struct {
 		lines []string
 		// The current row returned by the node.
 		values tree.Datums
-		// cleanup will be called after closing the input tree.
-		cleanup func()
 	}
 }
 
@@ -52,7 +50,8 @@ func (n *explainVecNode) startExec(params runParams) error {
 	defer func() {
 		planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 	}()
-	physPlan, err := newPhysPlanForExplainPurposes(params.ctx, planCtx, distSQLPlanner, n.plan.main)
+	physPlan, cleanup, err := newPhysPlanForExplainPurposes(params.ctx, planCtx, distSQLPlanner, n.plan.main)
+	defer cleanup()
 	if err != nil {
 		if len(n.plan.subqueryPlans) > 0 {
 			return errors.New("running EXPLAIN (VEC) on this query is " +
@@ -77,7 +76,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	}
 	verbose := n.options.Flags[tree.ExplainFlagVerbose]
 	willDistribute := physPlan.Distribution.WillDistribute()
-	n.run.lines, n.run.cleanup, err = colflow.ExplainVec(
+	n.run.lines, err = colflow.ExplainVec(
 		params.ctx, flowCtx, flows, physPlan.LocalProcessors, nil, /* opChains */
 		distSQLPlanner.gatewaySQLInstanceID, verbose, willDistribute,
 	)
@@ -152,7 +151,4 @@ func (n *explainVecNode) Next(runParams) (bool, error) {
 func (n *explainVecNode) Values() tree.Datums { return n.run.values }
 func (n *explainVecNode) Close(ctx context.Context) {
 	n.plan.close(ctx)
-	if n.run.cleanup != nil {
-		n.run.cleanup()
-	}
 }

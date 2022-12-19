@@ -198,6 +198,16 @@ var ShowFingerprintsColumns = ResultColumns{
 	{Name: "fingerprint", Typ: types.String},
 }
 
+// ShowCompletionsColumns are the result columns of a
+// SHOW COMPLETIONS statement.
+var ShowCompletionsColumns = ResultColumns{
+	{Name: "completion", Typ: types.String},
+	{Name: "category", Typ: types.String},
+	{Name: "description", Typ: types.String},
+	{Name: "start", Typ: types.Int},
+	{Name: "end", Typ: types.Int},
+}
+
 // AlterTableSplitColumns are the result columns of an
 // ALTER TABLE/INDEX .. SPLIT AT statement.
 var AlterTableSplitColumns = ResultColumns{
@@ -267,4 +277,19 @@ var TenantColumns = ResultColumns{
 	{Name: "id", Typ: types.Int},
 	{Name: "name", Typ: types.String},
 	{Name: "status", Typ: types.String},
+}
+
+var TenantColumnsWithReplication = ResultColumns{
+	{Name: "id", Typ: types.Int},
+	{Name: "name", Typ: types.String},
+	{Name: "status", Typ: types.String},
+	{Name: "source_tenant_name", Typ: types.String},
+	{Name: "source_cluster_uri", Typ: types.String},
+	{Name: "replication_job_id", Typ: types.Int},
+	// The latest fully replicated time.
+	{Name: "replicated_time", Typ: types.Timestamp},
+	// The protected timestamp on the destination cluster, meaning we cannot
+	// cutover to before this time.
+	{Name: "retained_time", Typ: types.Timestamp},
+	{Name: "replication_start_time", Typ: types.Timestamp},
 }

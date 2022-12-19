@@ -153,9 +153,12 @@ var retiredSettings = map[string]struct{}{
 	"server.web_session.auto_logout.timeout":           {},
 
 	// removed as of 23.1.
-	"sql.catalog.descs.validate_on_write.enabled": {},
-	"sql.distsql.max_running_flows":               {},
-	"sql.distsql.flow_scheduler_queueing.enabled": {},
+	"sql.catalog.descs.validate_on_write.enabled":    {},
+	"sql.distsql.max_running_flows":                  {},
+	"sql.distsql.flow_scheduler_queueing.enabled":    {},
+	"sql.distsql.drain.cancel_after_wait.enabled":    {},
+	"changefeed.active_protected_timestamps.enabled": {},
+	"jobs.scheduler.single_node_scheduler.enabled":   {},
 }
 
 // sqlDefaultSettings is the list of "grandfathered" existing sql.defaults

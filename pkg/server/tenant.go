@@ -89,8 +89,8 @@ type SQLServerWrapper struct {
 
 	http            *httpServer
 	adminAuthzCheck *adminPrivilegeChecker
-	tenantAdmin     *tenantAdminServer
-	tenantStatus    *tenantStatusServer
+	tenantAdmin     *adminServer
+	tenantStatus    *statusServer
 	drainServer     *drainServer
 	authentication  *authenticationServer
 	// The Observability Server, used by the Observability Service to subscribe to
@@ -108,6 +108,9 @@ type SQLServerWrapper struct {
 
 	// Used for multi-tenant cost control (on the tenant side).
 	costController multitenant.TenantSideCostController
+
+	// promRuleExporter is used by the tenant to expose the prometheus rules.
+	promRuleExporter *metric.PrometheusRuleExporter
 }
 
 // Drain idempotently activates the draining mode.
@@ -170,9 +173,6 @@ func NewTenantServer(
 		makePlanner: nil,
 	}
 
-	// Instantiate the admin API server.
-	sAdmin := newTenantAdminServer(baseCfg.AmbientCtx)
-
 	// Instantiate the HTTP server.
 	// These callbacks help us avoid a dependency on gossip in httpServer.
 	parseNodeIDFn := func(s string) (roachpb.NodeID, bool, error) {
@@ -192,29 +192,37 @@ func NewTenantServer(
 		baseCfg.Settings, args.monitorAndMetrics.rootSQLMemoryMonitor, time.Now)
 	args.closedSessionCache = closedSessionCache
 
-	// Instantiate the status API server.
-	// The tenantStatusServer needs access to the sqlServer,
-	// but we also need the same object to set up the sqlServer.
-	// So construct the tenant status server with a nil sqlServer,
-	// and then assign it once an SQL server gets created. We are
-	// going to assume that the tenant status server won't require
-	// the SQL server object until later.
-	sStatus := newTenantStatusServer(
+	// Instantiate the serverIterator to provide fanout to SQL instances. The
+	// serverIterator needs access to sqlServer which is assigned below once we
+	// have an instance.
+	serverIterator := &tenantFanoutClient{
+		sqlServer: nil,
+		rpcCtx:    args.rpcContext,
+		stopper:   args.stopper,
+	}
+
+	// Instantiate the status API server. The statusServer needs access to the
+	// sqlServer, but we also need the same object to set up the sqlServer. So
+	// construct the status server with a nil sqlServer, and then assign it once
+	// an SQL server gets created. We are going to assume that the status server
+	// won't require the SQL server object until later.
+	sStatus := newStatusServer(
 		baseCfg.AmbientCtx,
-		adminAuthzCheck,
-		args.sessionRegistry,
-		args.closedSessionCache,
-		args.remoteFlowRunner,
 		baseCfg.Settings,
+		baseCfg.Config,
+		adminAuthzCheck,
+		args.db,
+		args.recorder,
 		args.rpcContext,
-		args.stopper,
+		stopper,
+		args.sessionRegistry,
+		closedSessionCache,
+		args.remoteFlowRunner,
+		args.circularInternalExecutor,
+		serverIterator,
+		args.clock,
 	)
 	args.sqlStatusServer = sStatus
-	// Connect the admin server to the status service.
-	//
-	// TODO(knz): This would not be necessary if we could use the
-	// adminServer directly.
-	sAdmin.status = sStatus
 
 	// This is the location in NewServer() where we would be configuring
 	// the path to the special file that blocks background jobs.
@@ -249,6 +257,26 @@ func NewTenantServer(
 	// Create the authentication RPC server (login/logout).
 	sAuth := newAuthenticationServer(baseCfg.Config, sqlServer)
 
+	// Create a drain server.
+	drainServer := newDrainServer(baseCfg, args.stopper, args.stopTrigger, args.grpc, sqlServer)
+
+	// Instantiate the admin API server.
+	sAdmin := newAdminServer(
+		sqlServer,
+		args.Settings,
+		adminAuthzCheck,
+		sqlServer.internalExecutor,
+		args.BaseConfig.AmbientCtx,
+		args.recorder,
+		args.db,
+		args.rpcContext,
+		serverIterator,
+		args.clock,
+		args.distSender,
+		args.grpc,
+		drainServer,
+	)
+
 	// Connect the various servers to RPC.
 	for _, gw := range []grpcGatewayServer{sAdmin, sStatus, sAuth} {
 		gw.RegisterService(args.grpc.Server)
@@ -259,6 +287,7 @@ func NewTenantServer(
 	// TODO(knz): If/when we want to support statement diagnostic requests
 	// in secondary tenants, this is where we would call setStmtDiagnosticsRequester(),
 	// like in NewServer().
+	serverIterator.sqlServer = sqlServer
 	sStatus.baseStatusServer.sqlServer = sqlServer
 	sAdmin.sqlServer = sqlServer
 
@@ -270,14 +299,6 @@ func NewTenantServer(
 		sqlServer.execCfg.SQLStatusServer,
 		nil, /* serverTickleFn */
 	)
-
-	// Create a drain server.
-	drainServer := newDrainServer(baseCfg, args.stopper, args.stopTrigger, args.grpc, sqlServer)
-	// Connect the admin server to the drain service.
-	//
-	// TODO(knz): This would not be necessary if we could use the
-	// adminServer directly.
-	sAdmin.drain = drainServer
 
 	return &SQLServerWrapper{
 		clock:      args.clock,
@@ -306,6 +327,7 @@ func NewTenantServer(
 
 		externalStorageBuilder: args.externalStorageBuilder,
 		costController:         args.costController,
+		promRuleExporter:       args.promRuleExporter,
 	}, nil
 }
 
@@ -374,10 +396,13 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	// and dispatches the server worker for the RPC.
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
-	pgL, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, *s.sqlServer.cfg, s.stopper, s.grpc)
+	pgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, *s.sqlServer.cfg, s.stopper, s.grpc)
 	if err != nil {
 		return err
 	}
+
+	// Tell the RPC context how to connect in-memory.
+	s.rpcContext.SetLoopbackDialer(rpcLoopbackDialFn)
 
 	// NB: This is where (*Server).PreStart() reports the listener readiness
 	// via testing knobs: PauseAfterGettingRPCAddress, SignalAfterGettingRPCAddress.
@@ -563,8 +588,11 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		gwMux,             /* handleRequestsUnauthenticated */
 		s.debug,           /* handleDebugUnauthenticated */
 		newAPIV2Server(workersCtx, &apiV2ServerOpts{
-			sqlServer: s.sqlServer,
-			db:        s.db,
+			admin:            s.tenantAdmin,
+			status:           s.tenantStatus,
+			promRuleExporter: s.promRuleExporter,
+			sqlServer:        s.sqlServer,
+			db:               s.db,
 		}), /* apiServer */
 	); err != nil {
 		return err
@@ -582,7 +610,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	}
 
 	// If enabled, start reporting diagnostics.
-	if s.sqlServer.cfg.StartDiagnosticsReporting && !cluster.TelemetryOptOut() {
+	if s.sqlServer.cfg.StartDiagnosticsReporting && !cluster.TelemetryOptOut {
 		s.startDiagnostics(workersCtx)
 	}
 
@@ -712,6 +740,8 @@ func makeTenantSQLServerArgs(
 	clock := hlc.NewClockWithSystemTimeSource(time.Duration(baseCfg.MaxOffset))
 
 	registry := metric.NewRegistry()
+	ruleRegistry := metric.NewRuleRegistry()
+	promRuleExporter := metric.NewPrometheusRuleExporter(ruleRegistry)
 
 	var rpcTestingKnobs rpc.ContextTestingKnobs
 	if p, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
@@ -889,7 +919,8 @@ func makeTenantSQLServerArgs(
 			kvStoresIterator:     kvserverbase.UnsupportedStoresIterator{},
 		},
 		sqlServerOptionalTenantArgs: sqlServerOptionalTenantArgs{
-			tenantConnect: tenantConnect,
+			tenantConnect:    tenantConnect,
+			promRuleExporter: promRuleExporter,
 		},
 		SQLConfig:                &sqlCfg,
 		BaseConfig:               &baseCfg,

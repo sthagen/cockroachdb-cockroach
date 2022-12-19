@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -158,7 +159,7 @@ func (h *testHelper) createBackupSchedule(
 		// Query system.scheduled_job table and load those schedules.
 		datums, cols, err := h.cfg.InternalExecutor.QueryRowExWithCols(
 			context.Background(), "sched-load", nil,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			"SELECT * FROM system.scheduled_jobs WHERE schedule_id = $1",
 			id,
 		)
@@ -900,7 +901,7 @@ func TestCreateBackupScheduleIfNotExists(t *testing.T) {
 
 	rows, err := th.cfg.InternalExecutor.QueryBufferedEx(
 		context.Background(), "check-sched", nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		selectQuery)
 
 	require.NoError(t, err)
@@ -913,7 +914,7 @@ func TestCreateBackupScheduleIfNotExists(t *testing.T) {
 
 	rows, err = th.cfg.InternalExecutor.QueryBufferedEx(
 		context.Background(), "check-sched2", nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		selectQuery)
 
 	require.NoError(t, err)
@@ -1154,9 +1155,9 @@ func constructExpectedScheduledBackupNode(
 	require.NoError(t, err)
 	firstRun, err := tree.MakeDTimestampTZ(sj.ScheduledRunTime(), time.Microsecond)
 	require.NoError(t, err)
-	wait, err := parseOnPreviousRunningOption(sj.ScheduleDetails().Wait)
+	wait, err := schedulebase.ParseOnPreviousRunningOption(sj.ScheduleDetails().Wait)
 	require.NoError(t, err)
-	onError, err := parseOnErrorOption(sj.ScheduleDetails().OnError)
+	onError, err := schedulebase.ParseOnErrorOption(sj.ScheduleDetails().OnError)
 	require.NoError(t, err)
 	scheduleOptions := tree.KVOptions{
 		tree.KVOption{

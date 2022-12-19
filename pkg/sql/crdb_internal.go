@@ -24,14 +24,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
@@ -51,13 +49,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
@@ -108,6 +109,10 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalBackwardDependenciesTableID:        crdbInternalBackwardDependenciesTable,
 		catconstants.CrdbInternalBuildInfoTableID:                   crdbInternalBuildInfoTable,
 		catconstants.CrdbInternalBuiltinFunctionsTableID:            crdbInternalBuiltinFunctionsTable,
+		catconstants.CrdbInternalCatalogCommentsTableID:             crdbInternalCatalogCommentsTable,
+		catconstants.CrdbInternalCatalogDescriptorTableID:           crdbInternalCatalogDescriptorTable,
+		catconstants.CrdbInternalCatalogNamespaceTableID:            crdbInternalCatalogNamespaceTable,
+		catconstants.CrdbInternalCatalogZonesTableID:                crdbInternalCatalogZonesTable,
 		catconstants.CrdbInternalClusterContendedIndexesViewID:      crdbInternalClusterContendedIndexesView,
 		catconstants.CrdbInternalClusterContendedKeysViewID:         crdbInternalClusterContendedKeysView,
 		catconstants.CrdbInternalClusterContendedTablesViewID:       crdbInternalClusterContendedTablesView,
@@ -151,7 +156,6 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalNodeStmtStatsTableID:               crdbInternalNodeStmtStatsTable,
 		catconstants.CrdbInternalNodeTxnStatsTableID:                crdbInternalNodeTxnStatsTable,
 		catconstants.CrdbInternalPartitionsTableID:                  crdbInternalPartitionsTable,
-		catconstants.CrdbInternalPredefinedCommentsTableID:          crdbInternalPredefinedCommentsTable,
 		catconstants.CrdbInternalRangesNoLeasesTableID:              crdbInternalRangesNoLeasesTable,
 		catconstants.CrdbInternalRangesViewID:                       crdbInternalRangesView,
 		catconstants.CrdbInternalRuntimeInfoTableID:                 crdbInternalRuntimeInfoTable,
@@ -343,7 +347,7 @@ CREATE TABLE crdb_internal.databases (
 						return errors.Newf("unknown survival goal: %d", db.GetRegionConfig().SurvivalGoal)
 					}
 				}
-				owner, err := getOwnerOfPrivilegeObject(ctx, p, db)
+				owner, err := p.getOwnerOfPrivilegeObject(ctx, db)
 				if err != nil {
 					return err
 				}
@@ -597,7 +601,7 @@ func crdbInternalTablesDatabaseLookupFunc(
 	scNames[keys.PublicSchemaID] = catconstants.PublicSchemaName
 	// Record database descriptors for name lookups.
 	dbID := db.GetID()
-	_ = descs.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+	_ = descs.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		if desc.GetParentID() != dbID {
 			return nil
 		}
@@ -608,7 +612,7 @@ func crdbInternalTablesDatabaseLookupFunc(
 	})
 	rf := makeCrdbInternalTablesAddRowFn(p, addRow)
 	var seenAny bool
-	if err := descs.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+	if err := descs.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		if desc.GetParentID() != dbID {
 			return nil
 		}
@@ -631,7 +635,7 @@ func crdbInternalTablesDatabaseLookupFunc(
 }
 
 var crdbInternalPgCatalogTableIsImplementedTable = virtualSchemaTable{
-	comment: `table descriptors accessible by current user, including non-public and virtual (KV scan; expensive!)`,
+	comment: `which entries of pg_catalog are implemented in this version of CockroachDB`,
 	schema: `
 CREATE TABLE crdb_internal.pg_catalog_table_is_implemented (
   name                     STRING NOT NULL,
@@ -698,7 +702,7 @@ CREATE TABLE crdb_internal.table_row_statistics (
             GROUP BY s."tableID"`, statsAsOfTimeClusterMode.String(&p.ExecCfg().Settings.SV))
 		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBufferedEx(
 			ctx, "crdb-internal-statistics-table", nil,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			query)
 		if err != nil {
 			// This query is likely to cause errors due to SHOW TABLES being run less
@@ -924,7 +928,7 @@ func makeJobsTableRows(
 
 	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 		ctx, "crdb-internal-jobs-table", p.txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		query, params...)
 	if err != nil {
 		return matched, err
@@ -1687,12 +1691,8 @@ CREATE TABLE crdb_internal.cluster_settings (
 			return err
 		}
 		if !hasAdmin {
-			hasModify := false
-			hasView := false
-			if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
-				hasModify = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING) == nil
-				hasView = p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING) == nil
-			}
+			hasModify := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING) == nil
+			hasView := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING) == nil
 
 			if !hasModify && !hasView {
 				hasModify, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
@@ -2596,8 +2596,10 @@ CREATE TABLE crdb_internal.builtin_functions (
 }
 
 func writeCreateTypeDescRow(
+	ctx context.Context,
 	db catalog.DatabaseDescriptor,
 	sc catalog.SchemaDescriptor,
+	resolver tree.TypeReferenceResolver,
 	typeDesc catalog.TypeDescriptor,
 	addRow func(...tree.Datum) error,
 ) (written bool, err error) {
@@ -2634,6 +2636,36 @@ func writeCreateTypeDescRow(
 		// Multi-region enums are created implicitly, so we don't have create
 		// statements for them.
 		return false, nil
+	case descpb.TypeDescriptor_COMPOSITE:
+		name, err := tree.NewUnresolvedObjectName(2, [3]string{typeDesc.GetName(), sc.GetName()}, 0)
+		if err != nil {
+			return false, err
+		}
+		composite := typeDesc.TypeDesc().Composite
+		typeList := make([]tree.CompositeTypeElem, len(composite.Elements))
+		for i := range composite.Elements {
+			if err := typedesc.EnsureTypeIsHydrated(
+				ctx, composite.Elements[i].ElementType, resolver.(catalog.TypeDescriptorResolver),
+			); err != nil {
+				return false, err
+			}
+			typeList[i].Type = composite.Elements[i].ElementType
+			typeList[i].Label = tree.Name(composite.Elements[i].ElementLabel)
+		}
+		node := &tree.CreateType{
+			Variety:           tree.Composite,
+			TypeName:          name,
+			CompositeTypeList: typeList,
+		}
+		return true, addRow(
+			tree.NewDInt(tree.DInt(db.GetID())),       // database_id
+			tree.NewDString(db.GetName()),             // database_name
+			tree.NewDString(sc.GetName()),             // schema_name
+			tree.NewDInt(tree.DInt(typeDesc.GetID())), // descriptor_id
+			tree.NewDString(typeDesc.GetName()),       // descriptor_name
+			tree.NewDString(tree.AsString(node)),      // create_statement
+			tree.DNull,                                // enum_members
+		)
 	case descpb.TypeDescriptor_ALIAS:
 		// Alias types are created implicitly, so we don't have create
 		// statements for them.
@@ -2659,7 +2691,7 @@ CREATE TABLE crdb_internal.create_type_statements (
 `,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachTypeDesc(ctx, p, db, func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, typeDesc catalog.TypeDescriptor) error {
-			_, err := writeCreateTypeDescRow(db, sc, typeDesc, addRow)
+			_, err := writeCreateTypeDescRow(ctx, db, sc, p.semaCtx.TypeResolver, typeDesc, addRow)
 			return err
 		})
 	},
@@ -2677,7 +2709,7 @@ CREATE TABLE crdb_internal.create_type_statements (
 				if err != nil || typDesc == nil {
 					return false, err
 				}
-				return writeCreateTypeDescRow(db, scName, typDesc, addRow)
+				return writeCreateTypeDescRow(ctx, db, scName, p.semaCtx.TypeResolver, typDesc, addRow)
 			},
 		},
 	},
@@ -2706,7 +2738,7 @@ CREATE TABLE crdb_internal.create_schema_statements (
 			dbDescs = append(dbDescs, db)
 		}
 		for _, db := range dbDescs {
-			return forEachSchema(ctx, p, db, func(schemaDesc catalog.SchemaDescriptor) error {
+			return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(schemaDesc catalog.SchemaDescriptor) error {
 				switch schemaDesc.SchemaKind() {
 				case catalog.SchemaUserDefined:
 					node := &tree.CreateSchema{
@@ -2762,7 +2794,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 		fnIDToDBName := make(map[descpb.ID]string)
 		fnIDToDBID := make(map[descpb.ID]descpb.ID)
 		for _, curDB := range dbDescs {
-			err := forEachSchema(ctx, p, curDB, func(sc catalog.SchemaDescriptor) error {
+			err := forEachSchema(ctx, p, curDB, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
 				return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
 					fnIDs = append(fnIDs, overload.ID)
 					fnIDToScName[overload.ID] = sc.GetName()
@@ -3660,34 +3692,27 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 		if !hasPermission {
 			return nil, nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only users with the ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases")
 		}
-		ranges, err := kvclient.ScanMetaKVs(ctx, p.txn, roachpb.Span{
-			Key:    keys.MinKey,
-			EndKey: keys.MaxKey,
-		})
+
+		execCfg := p.ExecCfg()
+		rangeDescIterator, err := execCfg.RangeDescIteratorFactory.NewIterator(ctx, execCfg.Codec.TenantSpan())
 		if err != nil {
 			return nil, nil, err
 		}
 
-		var desc roachpb.RangeDescriptor
-
-		i := 0
-
 		return func() (tree.Datums, error) {
-			if i >= len(ranges) {
+			if !rangeDescIterator.Valid() {
 				return nil, nil
 			}
 
-			r := ranges[i]
-			i++
+			rangeDesc := rangeDescIterator.CurRangeDescriptor()
 
-			if err := r.ValueProto(&desc); err != nil {
-				return nil, err
-			}
+			rangeDescIterator.Next()
 
+			replicas := rangeDesc.Replicas()
 			votersAndNonVoters := append([]roachpb.ReplicaDescriptor(nil),
-				desc.Replicas().VoterAndNonVoterDescriptors()...)
+				replicas.VoterAndNonVoterDescriptors()...)
 			var learnerReplicaStoreIDs []int
-			for _, rd := range desc.Replicas().LearnerDescriptors() {
+			for _, rd := range replicas.LearnerDescriptors() {
 				learnerReplicaStoreIDs = append(learnerReplicaStoreIDs, int(rd.StoreID))
 			}
 			sort.Slice(votersAndNonVoters, func(i, j int) bool {
@@ -3701,13 +3726,13 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				}
 			}
 			votersArr := tree.NewDArray(types.Int)
-			for _, replica := range desc.Replicas().VoterDescriptors() {
+			for _, replica := range replicas.VoterDescriptors() {
 				if err := votersArr.Append(tree.NewDInt(tree.DInt(replica.StoreID))); err != nil {
 					return nil, err
 				}
 			}
 			nonVotersArr := tree.NewDArray(types.Int)
-			for _, replica := range desc.Replicas().NonVoterDescriptors() {
+			for _, replica := range replicas.NonVoterDescriptors() {
 				if err := nonVotersArr.Append(tree.NewDInt(tree.DInt(replica.StoreID))); err != nil {
 					return nil, err
 				}
@@ -3721,32 +3746,39 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 
 			replicaLocalityArr := tree.NewDArray(types.String)
 			for _, replica := range votersAndNonVoters {
+				// The table should still be rendered even if node locality is unavailable,
+				// so use NULL if nodeDesc is not found.
+				// See https://github.com/cockroachdb/cockroach/issues/92915.
+				replicaLocalityDatum := tree.DNull
 				nodeDesc, err := p.ExecCfg().NodeDescs.GetNodeDescriptor(replica.NodeID)
 				if err != nil {
-					return nil, err
+					if !errorutil.IsDescriptorNotFoundError(err) {
+						return nil, err
+					}
+				} else {
+					replicaLocalityDatum = tree.NewDString(nodeDesc.Locality.String())
 				}
-				replicaLocality := tree.NewDString(nodeDesc.Locality.String())
-				if err := replicaLocalityArr.Append(replicaLocality); err != nil {
+				if err := replicaLocalityArr.Append(replicaLocalityDatum); err != nil {
 					return nil, err
 				}
 			}
 
 			tableID, dbName, schemaName, tableName, indexName := lookupNamesByKey(
-				p, desc.StartKey.AsRawKey(), dbNames, tableNames, schemaNames,
+				p, rangeDesc.StartKey.AsRawKey(), dbNames, tableNames, schemaNames,
 				indexNames, schemaParents, parents,
 			)
 
 			splitEnforcedUntil := tree.DNull
-			if !desc.StickyBit.IsEmpty() {
-				splitEnforcedUntil = eval.TimestampToInexactDTimestamp(desc.StickyBit)
+			if !rangeDesc.StickyBit.IsEmpty() {
+				splitEnforcedUntil = eval.TimestampToInexactDTimestamp(rangeDesc.StickyBit)
 			}
 
 			return tree.Datums{
-				tree.NewDInt(tree.DInt(desc.RangeID)),
-				tree.NewDBytes(tree.DBytes(desc.StartKey)),
-				tree.NewDString(keys.PrettyPrint(nil /* valDirs */, desc.StartKey.AsRawKey())),
-				tree.NewDBytes(tree.DBytes(desc.EndKey)),
-				tree.NewDString(keys.PrettyPrint(nil /* valDirs */, desc.EndKey.AsRawKey())),
+				tree.NewDInt(tree.DInt(rangeDesc.RangeID)),
+				tree.NewDBytes(tree.DBytes(rangeDesc.StartKey)),
+				tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rangeDesc.StartKey.AsRawKey())),
+				tree.NewDBytes(tree.DBytes(rangeDesc.EndKey)),
+				tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rangeDesc.EndKey.AsRawKey())),
 				tree.NewDInt(tree.DInt(tableID)),
 				tree.NewDString(dbName),
 				tree.NewDString(schemaName),
@@ -3848,14 +3880,6 @@ CREATE TABLE crdb_internal.zones (
 				"object with ID %d does not exist", errors.Safe(id))
 		}
 
-		getKey := func(key roachpb.Key) (*roachpb.Value, error) {
-			kv, err := p.txn.Get(ctx, key)
-			if err != nil {
-				return nil, err
-			}
-			return kv.Value, nil
-		}
-
 		// For some reason, if we use the iterator API here, "concurrent txn use
 		// detected" error might occur, so we buffer up all zones first.
 		rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBuffered(
@@ -3888,7 +3912,7 @@ CREATE TABLE crdb_internal.zones (
 			// Inherit full information about this zone.
 			fullZone := configProto
 			if err := completeZoneConfig(
-				&fullZone, p.ExecCfg().Codec, descpb.ID(tree.MustBeDInt(r[0])), getKey,
+				ctx, &fullZone, p.Txn(), p.Descriptors(), descpb.ID(tree.MustBeDInt(r[0])),
 			); err != nil {
 				return err
 			}
@@ -4458,7 +4482,7 @@ func addPartitioningRows(
 
 		// Figure out which zone and subzone this partition should correspond to.
 		zoneID, zone, subzone, err := GetZoneConfigInTxn(
-			ctx, p.txn, p.ExecCfg().Codec, table.GetID(), index, name, false /* getInheritedDefault */)
+			ctx, p.txn, p.Descriptors(), table.GetID(), index, name, false /* getInheritedDefault */)
 		if err != nil {
 			return err
 		}
@@ -4514,7 +4538,7 @@ func addPartitioningRows(
 
 		// Figure out which zone and subzone this partition should correspond to.
 		zoneID, zone, subzone, err := GetZoneConfigInTxn(
-			ctx, p.txn, p.ExecCfg().Codec, table.GetID(), index, name, false /* getInheritedDefault */)
+			ctx, p.txn, p.Descriptors(), table.GetID(), index, name, false /* getInheritedDefault */)
 		if err != nil {
 			return err
 		}
@@ -4871,51 +4895,154 @@ CREATE TABLE crdb_internal.kv_store_status (
 	},
 }
 
-// crdbInternalPredefinedComments exposes the predefined
-// comments for virtual tables. This is used by SHOW TABLES WITH COMMENT
-// as fall-back when system.comments is silent.
-// TODO(knz): extend this with vtable column comments.
-//
-// TODO(tbg): prefix with node_.
-var crdbInternalPredefinedCommentsTable = virtualSchemaTable{
-	comment: `comments for predefined virtual tables (RAM/static)`,
+var crdbInternalCatalogDescriptorTable = virtualSchemaTable{
+	comment: `like system.descriptor but overlaid with in-txn in-memory changes and including virtual objects`,
 	schema: `
-CREATE TABLE crdb_internal.predefined_comments (
-	TYPE      INT,
-	OBJECT_ID INT,
-	SUB_ID    INT,
-	COMMENT   STRING
+CREATE TABLE crdb_internal.kv_catalog_descriptor (
+  id            INT NOT NULL,
+  descriptor    JSON NOT NULL
 )`,
 	populate: func(
 		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
 	) error {
+		all, err := p.Descriptors().GetAll(ctx, p.Txn())
+		if err != nil {
+			return err
+		}
+		// Delegate privilege check to system table.
+		{
+			sysTable := all.LookupDescriptor(systemschema.DescriptorTable.GetID())
+			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+				return nil
+			}
+		}
+		return all.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			j, err := protoreflect.MessageToJSON(desc.DescriptorProto(), protoreflect.FmtFlags{})
+			if err != nil {
+				return err
+			}
+			return addRow(
+				tree.NewDInt(tree.DInt(int64(desc.GetID()))),
+				tree.NewDJSON(j),
+			)
+		})
+	},
+}
+
+var crdbInternalCatalogZonesTable = virtualSchemaTable{
+	comment: `like system.zones but overlaid with in-txn in-memory changes`,
+	schema: `
+CREATE TABLE crdb_internal.kv_catalog_zones (
+  id        INT NOT NULL,
+  config    JSON NOT NULL
+)`,
+	populate: func(
+		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
+	) error {
+		all, err := p.Descriptors().GetAll(ctx, p.Txn())
+		if err != nil {
+			return err
+		}
+		// Delegate privilege check to system table.
+		{
+			sysTable := all.LookupDescriptor(systemschema.ZonesTable.GetID())
+			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+				return nil
+			}
+		}
+		// Loop over all zone configs.
+		return all.ForEachZoneConfig(func(id descpb.ID, zc catalog.ZoneConfig) error {
+			j, err := protoreflect.MessageToJSON(zc.ZoneConfigProto(), protoreflect.FmtFlags{})
+			if err != nil {
+				return err
+			}
+			return addRow(
+				tree.NewDInt(tree.DInt(int64(id))),
+				tree.NewDJSON(j),
+			)
+		})
+	},
+}
+
+var crdbInternalCatalogNamespaceTable = virtualSchemaTable{
+	comment: `like system.namespace but overlaid with in-txn in-memory changes`,
+	schema: `
+CREATE TABLE crdb_internal.kv_catalog_namespace (
+  parent_id        INT NOT NULL,
+  parent_schema_id INT NOT NULL,
+  name             STRING NOT NULL,
+  id               INT NOT NULL
+)`,
+	populate: func(
+		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
+	) error {
+		all, err := p.Descriptors().GetAll(ctx, p.Txn())
+		if err != nil {
+			return err
+		}
+		// Delegate privilege check to system table.
+		{
+			sysTable := all.LookupDescriptor(systemschema.NamespaceTable.GetID())
+			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+				return nil
+			}
+		}
+		// Loop over all namespace entries.
+		return all.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
+			return addRow(
+				tree.NewDInt(tree.DInt(int64(e.GetParentID()))),
+				tree.NewDInt(tree.DInt(int64(e.GetParentSchemaID()))),
+				tree.NewDString(e.GetName()),
+				tree.NewDInt(tree.DInt(int64(e.GetID()))),
+			)
+		})
+	},
+}
+
+var crdbInternalCatalogCommentsTable = virtualSchemaTable{
+	comment: `like system.comments but overlaid with in-txn in-memory changes and including virtual objects`,
+	schema: `
+CREATE TABLE crdb_internal.kv_catalog_comments (
+  type        STRING NOT NULL,
+  object_id   INT NOT NULL,
+  sub_id      INT NOT NULL,
+  comment     STRING NOT NULL
+)`,
+	populate: func(
+		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
+	) error {
+		all, err := p.Descriptors().GetAll(ctx, p.Txn())
+		if err != nil {
+			return err
+		}
+		// Delegate privilege check to system table.
+		{
+			sysTable := all.LookupDescriptor(systemschema.CommentsTable.GetID())
+			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+				return nil
+			}
+		}
+		// Loop over all comment entries.
 		// NB if ever anyone were to extend this table to carry column
 		// comments, make sure to update pg_catalog.col_description to
 		// retrieve those comments.
-		tableCommentKey := tree.NewDInt(tree.DInt(catalogkeys.TableCommentType))
-		vt := p.getVirtualTabler()
-		vEntries := vt.getSchemas()
-		vSchemaNames := vt.getSchemaNames()
-
-		for _, virtSchemaName := range vSchemaNames {
-			e := vEntries[virtSchemaName]
-
-			for _, tName := range e.orderedDefNames {
-				vTableEntry := e.defs[tName]
-				table := vTableEntry.desc
-
-				if vTableEntry.comment != "" {
-					if err := addRow(
-						tableCommentKey,
-						tree.NewDInt(tree.DInt(table.GetID())),
-						zeroVal,
-						tree.NewDString(vTableEntry.comment)); err != nil {
-						return err
-					}
+		// TODO(knz): extend this with vtable column comments.
+		for _, ct := range catalogkeys.AllCommentTypes {
+			dct := tree.NewDString(ct.String())
+			if err := all.ForEachComment(func(key catalogkeys.CommentKey, cmt string) error {
+				if ct != key.CommentType {
+					return nil
 				}
+				return addRow(
+					dct,
+					tree.NewDInt(tree.DInt(int64(key.ObjectID))),
+					tree.NewDInt(tree.DInt(int64(key.SubID))),
+					tree.NewDString(cmt),
+				)
+			}); err != nil {
+				return err
 			}
 		}
-
 		return nil
 	},
 }
@@ -5003,7 +5130,7 @@ func collectMarshaledJobMetadataMap(
 	query := `SELECT id, status, payload, progress FROM system.jobs`
 	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 		ctx, "crdb-internal-jobs-table", p.Txn(),
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		query)
 	if err != nil {
 		return nil, err
@@ -5065,7 +5192,7 @@ CREATE TABLE crdb_internal.invalid_objects (
 	) error {
 		// The internalLookupContext will only have descriptors in the current
 		// database. To deal with this, we fall through.
-		c, err := p.Descriptors().Direct().GetCatalogUnvalidated(ctx, p.txn)
+		c, err := p.Descriptors().GetAllFromStorageUnvalidated(ctx, p.txn)
 		if err != nil {
 			return err
 		}
@@ -5152,7 +5279,7 @@ CREATE TABLE crdb_internal.invalid_objects (
 		{
 			lCtx := newInternalLookupCtx(c.OrderedDescriptors(), dbContext)
 
-			if err := c.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+			if err := c.ForEachDescriptor(func(desc catalog.Descriptor) error {
 				switch d := desc.(type) {
 				case catalog.DatabaseDescriptor:
 					if dbContext != nil && d.GetID() != dbContext.GetID() {
@@ -5248,14 +5375,17 @@ func makeClusterDatabasePrivilegesFromDescriptor(
 			for _, priv := range u.Privileges {
 				// We use this function to check for the grant option so that the
 				// object owner also gets is_grantable=true.
-				grantOptionErr := p.CheckGrantOptionsForUser(
-					ctx, db.GetPrivileges(), db, []privilege.Kind{priv.Kind}, u.User, true, /* isGrant */
+				isGrantable, err := p.CheckGrantOptionsForUser(
+					ctx, db.GetPrivileges(), db, []privilege.Kind{priv.Kind}, u.User,
 				)
+				if err != nil {
+					return err
+				}
 				if err := addRow(
 					dbNameStr,                           // database_name
 					userNameStr,                         // grantee
 					tree.NewDString(priv.Kind.String()), // privilege_type
-					yesOrNoDatum(grantOptionErr == nil), // is_grantable
+					yesOrNoDatum(isGrantable),
 				); err != nil {
 					return err
 				}
@@ -5452,14 +5582,14 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 		}
 		// Get all descriptors which will be used to determine
 		// which ones are missing.
-		c, err := p.Descriptors().Direct().GetCatalogUnvalidated(ctx, p.txn)
+		c, err := p.Descriptors().GetAllFromStorageUnvalidated(ctx, p.txn)
 		if err != nil {
 			return err
 		}
 		// shouldCheck returns true iff we expect no data to exist with that
 		// table ID prefix.
 		shouldCheck := func(id descpb.ID) bool {
-			return minID <= id && id < maxID && c.LookupDescriptorEntry(id) == nil
+			return minID <= id && id < maxID && c.LookupDescriptor(id) == nil
 		}
 		// hasData returns true iff there exists at least one row with a prefix for
 		// a table ID in [startID, endID[.
@@ -5634,7 +5764,7 @@ CREATE TABLE crdb_internal.default_privileges (
 					return err
 				}
 
-				return forEachSchema(ctx, p, descriptor, func(schema catalog.SchemaDescriptor) error {
+				return forEachSchema(ctx, p, descriptor, true /* requiresPrivileges */, func(schema catalog.SchemaDescriptor) error {
 					return addRowsForSchema(schema.GetDefaultPrivilegeDescriptor(), tree.NewDString(schema.GetName()))
 				})
 			})
@@ -6700,8 +6830,8 @@ func populateExecutionInsights(
 			startTimestamp,
 			endTimestamp,
 			tree.MakeDBool(tree.DBool(insight.Statement.FullScan)),
-			tree.NewDString(insight.Statement.User),
-			tree.NewDString(insight.Statement.ApplicationName),
+			tree.NewDString(insight.Transaction.User),
+			tree.NewDString(insight.Transaction.ApplicationName),
 			tree.NewDString(insight.Statement.Database),
 			tree.NewDString(insight.Statement.PlanGist),
 			tree.NewDInt(tree.DInt(insight.Statement.RowsRead)),

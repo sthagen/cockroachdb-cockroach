@@ -210,11 +210,14 @@ func (s *monitorBuildServer) handleBuildEvent(
 				if testResult.run > 1 {
 					outputDir = filepath.Join(outputDir, fmt.Sprintf("run_%d", testResult.run))
 				}
-				if summary.ShardCount > 1 {
+				if summary != nil && summary.ShardCount > 1 {
 					outputDir = filepath.Join(outputDir, fmt.Sprintf("shard_%d_of_%d", testResult.shard, summary.ShardCount))
 				}
 				if testResult.attempt > 1 {
 					outputDir = filepath.Join(outputDir, fmt.Sprintf("attempt_%d", testResult.attempt))
+				}
+				if testResult.testResult == nil {
+					continue
 				}
 				for _, output := range testResult.testResult.TestActionOutput {
 					if output.Name == "test.log" || output.Name == "test.xml" {
@@ -333,6 +336,18 @@ func bazciImpl(cmd *cobra.Command, args []string) error {
 	}
 	args = append(args, fmt.Sprintf("--build_event_binary_file=%s", bepLoc))
 	args = append(args, fmt.Sprintf("--bes_backend=grpc://127.0.0.1:%d", port))
+	// Insert `--config ci` if it's not already in the args list.
+	hasCiConfig := false
+	for idx, arg := range args {
+		if arg == "--config=ci" || arg == "--config=cinolint" ||
+			(arg == "--config" && idx < len(args)-1 && (args[idx+1] == "ci" || args[idx+1] == "cinolint")) {
+			hasCiConfig = true
+			break
+		}
+	}
+	if !hasCiConfig {
+		args = append(args, "--config", "ci")
+	}
 	fmt.Println("running bazel w/ args: ", shellescape.QuoteCommand(args))
 	bazelCmd := exec.Command("bazel", args...)
 	bazelCmd.Stdout = os.Stdout

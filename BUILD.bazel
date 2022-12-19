@@ -119,6 +119,7 @@ exports_files([
 # gazelle:exclude pkg/sql/lexbase/keywords.go
 # gazelle:exclude pkg/sql/lexbase/tokens.go
 # gazelle:exclude pkg/sql/lexbase/reserved_keywords.go
+# gazelle:exclude pkg/sql/scanner/token_names_test.go
 # gazelle:exclude pkg/sql/schemachanger/scexec/mocks_generated_test.go
 # gazelle:exclude pkg/cmd/prereqs/testdata
 # gazelle:exclude pkg/testutils/**/testdata/**
@@ -188,7 +189,6 @@ nogo(
             "//pkg/testutils/lint/passes/errcmp",
             "//pkg/testutils/lint/passes/errwrap",
             "//pkg/testutils/lint/passes/fmtsafe",
-            "//pkg/testutils/lint/passes/generics",
             "//pkg/testutils/lint/passes/grpcclientconnclose",
             "//pkg/testutils/lint/passes/grpcstatuswithdetails",
             "//pkg/testutils/lint/passes/hash",
@@ -196,6 +196,7 @@ nogo(
             "//pkg/testutils/lint/passes/loopvarcapture",
             "//pkg/testutils/lint/passes/nilness",
             "//pkg/testutils/lint/passes/nocopy",
+            "//pkg/testutils/lint/passes/redactcheck",
             "//pkg/testutils/lint/passes/returncheck",
             "//pkg/testutils/lint/passes/returnerrcheck",
             "//pkg/testutils/lint/passes/shadow",

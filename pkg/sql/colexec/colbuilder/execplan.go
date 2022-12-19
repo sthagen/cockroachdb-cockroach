@@ -100,7 +100,6 @@ func wrapRowSources(
 			// able to pool the underlying slices.
 			inputs[i].StatsCollectors = nil
 			inputs[i].MetadataSources = nil
-			inputs[i].ToClose = nil
 			toWrapInputs = append(toWrapInputs, toWrapInput)
 			*releasables = append(*releasables, toWrapInput)
 		}
@@ -211,6 +210,9 @@ func supportedNatively(core *execinfrapb.ProcessorCoreUnion) error {
 		}
 		return nil
 
+	case core.HashGroupJoiner != nil:
+		return nil
+
 	case core.Sorter != nil:
 		return nil
 
@@ -306,6 +308,7 @@ func canWrap(mode sessiondatapb.VectorizeExecMode, core *execinfrapb.ProcessorCo
 	case core.Filterer != nil:
 	case core.StreamIngestionData != nil:
 	case core.StreamIngestionFrontier != nil:
+	case core.HashGroupJoiner != nil:
 	default:
 		return errors.AssertionFailedf("unexpected processor core %q", core)
 	}
@@ -413,7 +416,7 @@ func (r opResult) createDiskBackedSort(
 	// sorter regardless of which sorter variant we have instantiated (i.e.
 	// we don't take advantage of the limits and of partial ordering). We
 	// could improve this.
-	return colexecdisk.NewOneInputDiskSpiller(
+	diskSpiller := colexecdisk.NewOneInputDiskSpiller(
 		input, inMemorySorter.(colexecop.BufferingInMemoryOperator),
 		sorterMemMonitorName,
 		func(input colexecop.Operator) colexecop.Operator {
@@ -448,6 +451,8 @@ func (r opResult) createDiskBackedSort(
 		},
 		args.TestingKnobs.SpillingCallbackFn,
 	)
+	r.ToClose = append(r.ToClose, diskSpiller)
+	return diskSpiller
 }
 
 // makeDiskBackedSorterConstructor creates a colexec.DiskBackedSorterConstructor
@@ -493,10 +498,8 @@ func takeOverMetaInfo(target *colexecargs.OpWithMetaInfo, inputs []colexecargs.O
 	for i := range inputs {
 		target.StatsCollectors = append(target.StatsCollectors, inputs[i].StatsCollectors...)
 		target.MetadataSources = append(target.MetadataSources, inputs[i].MetadataSources...)
-		target.ToClose = append(target.ToClose, inputs[i].ToClose...)
 		inputs[i].MetadataSources = nil
 		inputs[i].StatsCollectors = nil
-		inputs[i].ToClose = nil
 	}
 }
 
@@ -599,10 +602,10 @@ func MaybeRemoveRootColumnarizer(r colexecargs.OpWithMetaInfo) execinfra.RowSour
 		return nil
 	}
 	// We have the columnarizer as the root, and it must be included into the
-	// MetadataSources and ToClose slices, so if we don't see any other objects,
-	// then the responsibility over other meta components has been claimed by
-	// the children of the columnarizer.
-	if len(r.StatsCollectors) != 0 || len(r.MetadataSources) != 1 || len(r.ToClose) != 1 {
+	// MetadataSources slice, so if we don't see any other objects, then the
+	// responsibility over other meta components has been claimed by the
+	// children of the columnarizer.
+	if len(r.StatsCollectors) != 0 || len(r.MetadataSources) != 1 {
 		return nil
 	}
 	c.MarkAsRemovedFromFlow()
@@ -613,6 +616,106 @@ func getStreamingAllocator(
 	ctx context.Context, args *colexecargs.NewColOperatorArgs,
 ) *colmem.Allocator {
 	return colmem.NewAllocator(ctx, args.StreamingMemAccount, args.Factory)
+}
+
+func makeNewHashJoinerArgs(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	args *colexecargs.NewColOperatorArgs,
+	opName redact.RedactableString,
+	core *execinfrapb.HashJoinerSpec,
+	factory coldata.ColumnFactory,
+) (colexecjoin.NewHashJoinerArgs, redact.RedactableString) {
+	leftTypes := make([]*types.T, len(args.Spec.Input[0].ColumnTypes))
+	copy(leftTypes, args.Spec.Input[0].ColumnTypes)
+	rightTypes := make([]*types.T, len(args.Spec.Input[1].ColumnTypes))
+	copy(rightTypes, args.Spec.Input[1].ColumnTypes)
+	hashJoinerMemAccount, hashJoinerMemMonitorName := args.MonitorRegistry.CreateMemAccountForSpillStrategy(
+		ctx, flowCtx, opName, args.Spec.ProcessorID,
+	)
+	// Create two unlimited memory accounts (one for the output batch and
+	// another for the "overdraft" accounting when spilling to disk occurs).
+	accounts := args.MonitorRegistry.CreateUnlimitedMemAccounts(
+		ctx, flowCtx, opName, args.Spec.ProcessorID, 2, /* numAccounts */
+	)
+	spec := colexecjoin.MakeHashJoinerSpec(
+		core.Type,
+		core.LeftEqColumns,
+		core.RightEqColumns,
+		leftTypes,
+		rightTypes,
+		core.RightEqColumnsAreKey,
+	)
+	return colexecjoin.NewHashJoinerArgs{
+		BuildSideAllocator:       colmem.NewLimitedAllocator(ctx, hashJoinerMemAccount, accounts[0], factory),
+		OutputUnlimitedAllocator: colmem.NewAllocator(ctx, accounts[1], factory),
+		Spec:                     spec,
+		LeftSource:               args.Inputs[0].Root,
+		RightSource:              args.Inputs[1].Root,
+		InitialNumBuckets:        colexecjoin.HashJoinerInitialNumBuckets,
+	}, hashJoinerMemMonitorName
+}
+
+func makeNewHashAggregatorArgs(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	args *colexecargs.NewColOperatorArgs,
+	opName redact.RedactableString,
+	newAggArgs *colexecagg.NewAggregatorArgs,
+	factory coldata.ColumnFactory,
+) (
+	*colexecagg.NewHashAggregatorArgs,
+	*colexecutils.NewSpillingQueueArgs,
+	redact.RedactableString,
+) {
+	// We will divide the available memory equally between the two usages - the
+	// hash aggregation itself and the input tuples tracking.
+	totalMemLimit := execinfra.GetWorkMemLimit(flowCtx)
+	// We will give 20% of the hash aggregation budget to the output batch.
+	maxOutputBatchMemSize := totalMemLimit / 10
+	hashAggregationMemLimit := totalMemLimit/2 - maxOutputBatchMemSize
+	inputTuplesTrackingMemLimit := totalMemLimit / 2
+	if totalMemLimit == 1 {
+		// If total memory limit is 1, we're likely in a "force disk spill"
+		// scenario, so we'll set all internal limits to 1 too (if we don't,
+		// they will end up as 0 which is treated as "no limit").
+		maxOutputBatchMemSize = 1
+		hashAggregationMemLimit = 1
+		inputTuplesTrackingMemLimit = 1
+	}
+	hashAggregatorMemAccount, hashAggregatorMemMonitorName := args.MonitorRegistry.CreateMemAccountForSpillStrategyWithLimit(
+		ctx, flowCtx, hashAggregationMemLimit, opName, args.Spec.ProcessorID,
+	)
+	hashTableMemAccount := args.MonitorRegistry.CreateExtraMemAccountForSpillStrategy(
+		string(hashAggregatorMemMonitorName),
+	)
+	// We need to create four unlimited memory accounts so that each component
+	// could track precisely its own usage. The components are
+	// - the hash aggregator
+	// - the hash table
+	// - output batch of the hash aggregator
+	// - the spilling queue for the input tuples tracking.
+	accounts := args.MonitorRegistry.CreateUnlimitedMemAccounts(
+		ctx, flowCtx, opName, args.Spec.ProcessorID, 4, /* numAccounts */
+	)
+	newAggArgs.Allocator = colmem.NewLimitedAllocator(ctx, hashAggregatorMemAccount, accounts[0], factory)
+	newAggArgs.MemAccount = hashAggregatorMemAccount
+	return &colexecagg.NewHashAggregatorArgs{
+			NewAggregatorArgs:        newAggArgs,
+			HashTableAllocator:       colmem.NewLimitedAllocator(ctx, hashTableMemAccount, accounts[1], factory),
+			OutputUnlimitedAllocator: colmem.NewAllocator(ctx, accounts[2], factory),
+			MaxOutputBatchMemSize:    maxOutputBatchMemSize,
+		},
+		&colexecutils.NewSpillingQueueArgs{
+			UnlimitedAllocator: colmem.NewAllocator(ctx, accounts[3], factory),
+			MemoryLimit:        inputTuplesTrackingMemLimit,
+			DiskQueueCfg:       args.DiskQueueCfg,
+			FDSemaphore:        args.FDSemaphore,
+			DiskAcc: args.MonitorRegistry.CreateDiskAccount(
+				ctx, flowCtx, hashAggregatorMemMonitorName+"-spilling-queue", args.Spec.ProcessorID,
+			),
+		},
+		hashAggregatorMemMonitorName
 }
 
 // NOTE: throughout this file we do not append an output type of a projecting
@@ -849,69 +952,25 @@ func NewColOperator(
 					)
 					newAggArgs.MemAccount = hashAggregatorUnlimitedMemAccount
 					evalCtx.SingleDatumAggMemAccount = hashAggregatorUnlimitedMemAccount
-					hashTableAllocator := colmem.NewAllocator(ctx, accounts[1], factory)
-					outputUnlimitedAllocator := colmem.NewAllocator(ctx, accounts[2], factory)
-					maxOutputBatchMemSize := execinfra.GetWorkMemLimit(flowCtx)
-					// The second argument is nil because we disable the
-					// tracking of the input tuples.
-					result.Root = colexec.NewHashAggregator(
-						ctx, newAggArgs, nil, /* newSpillingQueueArgs */
-						hashTableAllocator, outputUnlimitedAllocator, maxOutputBatchMemSize,
-					)
-				} else {
-					// We will divide the available memory equally between the
-					// two usages - the hash aggregation itself and the input
-					// tuples tracking.
-					totalMemLimit := execinfra.GetWorkMemLimit(flowCtx)
-					// We will give 20% of the hash aggregation budget to the
-					// output batch.
-					maxOutputBatchMemSize := totalMemLimit / 10
-					hashAggregationMemLimit := totalMemLimit/2 - maxOutputBatchMemSize
-					inputTuplesTrackingMemLimit := totalMemLimit / 2
-					if totalMemLimit == 1 {
-						// If total memory limit is 1, we're likely in a "force
-						// disk spill" scenario, so we'll set all internal
-						// limits to 1 too (if we don't, they will end up as 0
-						// which is treated as "no limit").
-						maxOutputBatchMemSize = 1
-						hashAggregationMemLimit = 1
-						inputTuplesTrackingMemLimit = 1
+					newHashAggArgs := &colexecagg.NewHashAggregatorArgs{
+						NewAggregatorArgs:        newAggArgs,
+						HashTableAllocator:       colmem.NewAllocator(ctx, accounts[1], factory),
+						OutputUnlimitedAllocator: colmem.NewAllocator(ctx, accounts[2], factory),
+						MaxOutputBatchMemSize:    execinfra.GetWorkMemLimit(flowCtx),
 					}
-					hashAggregatorMemAccount, hashAggregatorMemMonitorName := args.MonitorRegistry.CreateMemAccountForSpillStrategyWithLimit(
-						ctx, flowCtx, hashAggregationMemLimit, opName, spec.ProcessorID,
+					// The third argument is nil because we disable the tracking
+					// of the input tuples.
+					result.Root = colexec.NewHashAggregator(
+						ctx, newHashAggArgs, nil, /* newSpillingQueueArgs */
 					)
-					hashTableMemAccount := args.MonitorRegistry.CreateExtraMemAccountForSpillStrategy(
-						string(hashAggregatorMemMonitorName),
+					result.ToClose = append(result.ToClose, result.Root.(colexecop.Closer))
+				} else {
+					newHashAggArgs, sqArgs, hashAggregatorMemMonitorName := makeNewHashAggregatorArgs(
+						ctx, flowCtx, args, opName, newAggArgs, factory,
 					)
-					// We need to create four unlimited memory accounts so that
-					// each component could track precisely its own usage. The
-					// components are
-					// - the hash aggregator
-					// - the hash table
-					// - output batch of the hash aggregator
-					// - the spilling queue for the input tuples tracking.
-					accounts := args.MonitorRegistry.CreateUnlimitedMemAccounts(
-						ctx, flowCtx, opName, spec.ProcessorID, 4, /* numAccounts */
-					)
-					newAggArgs.Allocator = colmem.NewLimitedAllocator(ctx, hashAggregatorMemAccount, accounts[0], factory)
-					newAggArgs.MemAccount = hashAggregatorMemAccount
-					hashTableAllocator := colmem.NewLimitedAllocator(ctx, hashTableMemAccount, accounts[1], factory)
+					sqArgs.Types = inputTypes
 					inMemoryHashAggregator := colexec.NewHashAggregator(
-						ctx,
-						newAggArgs,
-						&colexecutils.NewSpillingQueueArgs{
-							UnlimitedAllocator: colmem.NewAllocator(ctx, accounts[2], factory),
-							Types:              inputTypes,
-							MemoryLimit:        inputTuplesTrackingMemLimit,
-							DiskQueueCfg:       args.DiskQueueCfg,
-							FDSemaphore:        args.FDSemaphore,
-							DiskAcc: args.MonitorRegistry.CreateDiskAccount(
-								ctx, flowCtx, hashAggregatorMemMonitorName+"-spilling-queue", spec.ProcessorID,
-							),
-						},
-						hashTableAllocator,
-						colmem.NewAllocator(ctx, accounts[3], factory),
-						maxOutputBatchMemSize,
+						ctx, newHashAggArgs, sqArgs,
 					)
 					ehaOpName := redact.RedactableString("external-hash-aggregator")
 					ehaAccounts := args.MonitorRegistry.CreateUnlimitedMemAccounts(
@@ -925,7 +984,7 @@ func NewColOperator(
 					// case, the wrapped aggregate functions might hit a memory
 					// error even when used by the external hash aggregator).
 					evalCtx.SingleDatumAggMemAccount = ehaMemAccount
-					result.Root = colexecdisk.NewOneInputDiskSpiller(
+					diskSpiller := colexecdisk.NewOneInputDiskSpiller(
 						inputs[0].Root, inMemoryHashAggregator.(colexecop.BufferingInMemoryOperator),
 						hashAggregatorMemMonitorName,
 						func(input colexecop.Operator) colexecop.Operator {
@@ -937,31 +996,35 @@ func NewColOperator(
 							newAggArgs.Allocator = colmem.NewAllocator(ctx, ehaMemAccount, factory)
 							newAggArgs.MemAccount = ehaMemAccount
 							newAggArgs.Input = input
-							ehaHashTableAllocator := colmem.NewAllocator(ctx, ehaAccounts[1], factory)
 							eha, toClose := colexecdisk.NewExternalHashAggregator(
 								ctx,
 								flowCtx,
 								args,
-								&newAggArgs,
+								&colexecagg.NewHashAggregatorArgs{
+									NewAggregatorArgs:        &newAggArgs,
+									HashTableAllocator:       colmem.NewAllocator(ctx, ehaAccounts[1], factory),
+									OutputUnlimitedAllocator: colmem.NewAllocator(ctx, ehaAccounts[2], factory),
+									MaxOutputBatchMemSize:    newHashAggArgs.MaxOutputBatchMemSize,
+								},
 								result.makeDiskBackedSorterConstructor(ctx, flowCtx, args, ehaOpName, factory),
 								args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, ehaOpName, spec.ProcessorID),
-								ehaHashTableAllocator,
-								colmem.NewAllocator(ctx, ehaAccounts[2], factory),
-								maxOutputBatchMemSize,
+								spec.Core.Aggregator.OutputOrdering,
 							)
 							result.ToClose = append(result.ToClose, toClose)
 							return eha
 						},
 						args.TestingKnobs.SpillingCallbackFn,
 					)
+					result.Root = diskSpiller
+					result.ToClose = append(result.ToClose, diskSpiller)
 				}
 			} else {
 				evalCtx.SingleDatumAggMemAccount = args.StreamingMemAccount
 				newAggArgs.Allocator = getStreamingAllocator(ctx, args)
 				newAggArgs.MemAccount = args.StreamingMemAccount
 				result.Root = colexec.NewOrderedAggregator(ctx, newAggArgs)
+				result.ToClose = append(result.ToClose, result.Root.(colexecop.Closer))
 			}
-			result.ToClose = append(result.ToClose, result.Root.(colexecop.Closer))
 
 		case core.Distinct != nil:
 			if err := checkNumIn(inputs, 1); err != nil {
@@ -996,7 +1059,7 @@ func NewColOperator(
 				)
 				edOpName := redact.RedactableString("external-distinct")
 				diskAccount := args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, edOpName, spec.ProcessorID)
-				result.Root = colexecdisk.NewOneInputDiskSpiller(
+				diskSpiller := colexecdisk.NewOneInputDiskSpiller(
 					inputs[0].Root, inMemoryUnorderedDistinct.(colexecop.BufferingInMemoryOperator),
 					distinctMemMonitorName,
 					func(input colexecop.Operator) colexecop.Operator {
@@ -1018,7 +1081,8 @@ func NewColOperator(
 					},
 					args.TestingKnobs.SpillingCallbackFn,
 				)
-				result.ToClose = append(result.ToClose, result.Root.(colexecop.Closer))
+				result.Root = diskSpiller
+				result.ToClose = append(result.ToClose, diskSpiller)
 			}
 
 		case core.Ordinality != nil:
@@ -1035,12 +1099,7 @@ func NewColOperator(
 			if err := checkNumIn(inputs, 2); err != nil {
 				return r, err
 			}
-			leftTypes := make([]*types.T, len(spec.Input[0].ColumnTypes))
-			copy(leftTypes, spec.Input[0].ColumnTypes)
-			rightTypes := make([]*types.T, len(spec.Input[1].ColumnTypes))
-			copy(rightTypes, spec.Input[1].ColumnTypes)
 
-			memoryLimit := execinfra.GetWorkMemLimit(flowCtx)
 			if len(core.HashJoiner.LeftEqColumns) == 0 {
 				// We are performing a cross-join, so we need to plan a
 				// specialized operator.
@@ -1048,9 +1107,13 @@ func NewColOperator(
 				crossJoinerMemAccount := args.MonitorRegistry.CreateUnlimitedMemAccount(ctx, flowCtx, opName, spec.ProcessorID)
 				crossJoinerDiskAcc := args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, opName, spec.ProcessorID)
 				unlimitedAllocator := colmem.NewAllocator(ctx, crossJoinerMemAccount, factory)
+				leftTypes := make([]*types.T, len(spec.Input[0].ColumnTypes))
+				copy(leftTypes, spec.Input[0].ColumnTypes)
+				rightTypes := make([]*types.T, len(spec.Input[1].ColumnTypes))
+				copy(rightTypes, spec.Input[1].ColumnTypes)
 				result.Root = colexecjoin.NewCrossJoiner(
 					unlimitedAllocator,
-					memoryLimit,
+					execinfra.GetWorkMemLimit(flowCtx),
 					args.DiskQueueCfg,
 					args.FDSemaphore,
 					core.HashJoiner.Type,
@@ -1061,30 +1124,15 @@ func NewColOperator(
 				result.ToClose = append(result.ToClose, result.Root.(colexecop.Closer))
 			} else {
 				opName := redact.RedactableString("hash-joiner")
-				hashJoinerMemAccount, hashJoinerMemMonitorName := args.MonitorRegistry.CreateMemAccountForSpillStrategy(
-					ctx, flowCtx, opName, spec.ProcessorID,
+				hjArgs, hashJoinerMemMonitorName := makeNewHashJoinerArgs(
+					ctx,
+					flowCtx,
+					args,
+					opName,
+					core.HashJoiner,
+					factory,
 				)
-				// Create two unlimited memory accounts (one for the output
-				// batch and another for the "overdraft" accounting when
-				// spilling to disk occurs).
-				accounts := args.MonitorRegistry.CreateUnlimitedMemAccounts(
-					ctx, flowCtx, opName, spec.ProcessorID, 2, /* numAccounts */
-				)
-				outputUnlimitedAllocator := colmem.NewAllocator(ctx, accounts[0], factory)
-				hjSpec := colexecjoin.MakeHashJoinerSpec(
-					core.HashJoiner.Type,
-					core.HashJoiner.LeftEqColumns,
-					core.HashJoiner.RightEqColumns,
-					leftTypes,
-					rightTypes,
-					core.HashJoiner.RightEqColumnsAreKey,
-				)
-
-				inMemoryHashJoiner := colexecjoin.NewHashJoiner(
-					colmem.NewLimitedAllocator(ctx, hashJoinerMemAccount, accounts[1], factory),
-					outputUnlimitedAllocator, hjSpec, inputs[0].Root, inputs[1].Root,
-					colexecjoin.HashJoinerInitialNumBuckets,
-				)
+				inMemoryHashJoiner := colexecjoin.NewHashJoiner(hjArgs)
 				if args.TestingKnobs.DiskSpillingDisabled {
 					// We will not be creating a disk-backed hash joiner because
 					// we're running a test that explicitly asked for only
@@ -1093,9 +1141,9 @@ func NewColOperator(
 				} else {
 					opName := redact.RedactableString("external-hash-joiner")
 					diskAccount := args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, opName, spec.ProcessorID)
-					result.Root = colexecdisk.NewTwoInputDiskSpiller(
+					diskSpiller := colexecdisk.NewTwoInputDiskSpiller(
 						inputs[0].Root, inputs[1].Root, inMemoryHashJoiner.(colexecop.BufferingInMemoryOperator),
-						hashJoinerMemMonitorName,
+						[]redact.RedactableString{hashJoinerMemMonitorName},
 						func(inputOne, inputTwo colexecop.Operator) colexecop.Operator {
 							unlimitedAllocator := colmem.NewAllocator(
 								ctx, args.MonitorRegistry.CreateUnlimitedMemAccount(ctx, flowCtx, opName, spec.ProcessorID), factory,
@@ -1104,7 +1152,7 @@ func NewColOperator(
 								unlimitedAllocator,
 								flowCtx,
 								args,
-								hjSpec,
+								hjArgs.Spec,
 								inputOne, inputTwo,
 								result.makeDiskBackedSorterConstructor(ctx, flowCtx, args, opName, factory),
 								diskAccount,
@@ -1114,10 +1162,14 @@ func NewColOperator(
 						},
 						args.TestingKnobs.SpillingCallbackFn,
 					)
+					result.Root = diskSpiller
+					result.ToClose = append(result.ToClose, diskSpiller)
 				}
 			}
 
-			result.ColumnTypes = core.HashJoiner.Type.MakeOutputTypes(leftTypes, rightTypes)
+			// MakeOutputTypes makes a copy, so we can just use the types
+			// directly from the input specs.
+			result.ColumnTypes = core.HashJoiner.Type.MakeOutputTypes(spec.Input[0].ColumnTypes, spec.Input[1].ColumnTypes)
 
 			if !core.HashJoiner.OnExpr.Empty() && core.HashJoiner.Type == descpb.InnerJoin {
 				if err = result.planAndMaybeWrapFilter(
@@ -1177,6 +1229,143 @@ func NewColOperator(
 					return r, err
 				}
 			}
+
+		case core.HashGroupJoiner != nil:
+			if err := checkNumIn(inputs, 2); err != nil {
+				return r, err
+			}
+
+			hgjSpec := core.HashGroupJoiner
+			hjSpec, aggSpec := &hgjSpec.HashJoinerSpec, &hgjSpec.AggregatorSpec
+			opName := redact.RedactableString("hash-group-joiner")
+			hjArgs, hashJoinerMemMonitorName := makeNewHashJoinerArgs(
+				ctx, flowCtx, args, opName, hjSpec, factory,
+			)
+			// MakeOutputTypes makes a copy, so we can just use the types
+			// directly from the input specs.
+			hjOutputTypes := hjSpec.Type.MakeOutputTypes(spec.Input[0].ColumnTypes, spec.Input[1].ColumnTypes)
+			joinOutputTypes := hjOutputTypes
+			if len(hgjSpec.JoinOutputColumns) > 0 {
+				joinOutputTypes = make([]*types.T, len(hgjSpec.JoinOutputColumns))
+				for i, hjIdx := range hgjSpec.JoinOutputColumns {
+					joinOutputTypes[i] = hjOutputTypes[hjIdx]
+				}
+			}
+
+			// TODO(yuzefovich): implement the optimized version if the
+			// aggregation is a simple row count.
+
+			// Make a copy of the evalCtx since we're modifying it below.
+			evalCtx := flowCtx.NewEvalCtx()
+			newAggArgs := &colexecagg.NewAggregatorArgs{
+				InputTypes: joinOutputTypes,
+				Spec:       aggSpec,
+				EvalCtx:    evalCtx,
+			}
+			newAggArgs.Constructors, newAggArgs.ConstArguments, newAggArgs.OutputTypes, err = colexecagg.ProcessAggregations(
+				ctx, evalCtx, args.ExprHelper.SemaCtx, aggSpec.Aggregations, joinOutputTypes,
+			)
+			if err != nil {
+				return r, err
+			}
+			result.ColumnTypes = newAggArgs.OutputTypes
+
+			// Note that we already gave full workmem limit to the hash joiner
+			// above and now are using another workmem limit here. This seems
+			// reasonable given that the hash group-join operation is a
+			// "composite" one. The second workmem limit usage here will be
+			// split for two use cases: one half will go to the hash aggregator,
+			// and another half will be used for tracking the input tuples from
+			// the left input (which is needed to spill to disk when the memory
+			// limit is reached during the aggregation).
+			newHashAggArgs, sqArgs, hashAggregatorMemMonitorName := makeNewHashAggregatorArgs(
+				ctx, flowCtx, args, opName, newAggArgs, factory,
+			)
+			// Spilling queue is needed for the left input to the hash
+			// group-join.
+			sqArgs.Types = make([]*types.T, len(args.Spec.Input[0].ColumnTypes))
+			copy(sqArgs.Types, args.Spec.Input[0].ColumnTypes)
+
+			hgj := colexec.NewHashGroupJoiner(
+				ctx,
+				args.Inputs[0].Root,
+				args.Inputs[1].Root,
+				func(leftSource colexecop.Operator) colexecop.BufferingInMemoryOperator {
+					hjArgs.LeftSource = leftSource
+					return colexecjoin.NewHashJoiner(hjArgs).(colexecop.BufferingInMemoryOperator)
+				},
+				len(hjOutputTypes),
+				hgjSpec.JoinOutputColumns,
+				newHashAggArgs,
+				sqArgs,
+			)
+			result.ToClose = append(result.ToClose, hgj.(colexecop.Closer))
+
+			ehgjOpName := redact.RedactableString("external-hash-group-joiner")
+			ehgjAccounts := args.MonitorRegistry.CreateUnlimitedMemAccounts(
+				ctx, flowCtx, ehgjOpName, spec.ProcessorID, 4, /* numAccounts */
+			)
+			ehjMemAccount := ehgjAccounts[0]
+			ehaMemAccount := ehgjAccounts[1]
+			// Note that we will use an unlimited memory account here even for
+			// the in-memory hash aggregator since it is easier to do so than to
+			// try to replace the memory account if the spilling to disk occurs
+			// (if we don't replace it in such case, the wrapped aggregate
+			// functions might hit a memory error even when used by the external
+			// hash aggregator).
+			evalCtx.SingleDatumAggMemAccount = ehaMemAccount
+			diskSpiller := colexecdisk.NewTwoInputDiskSpiller(
+				inputs[0].Root, inputs[1].Root, hgj,
+				[]redact.RedactableString{hashJoinerMemMonitorName, hashAggregatorMemMonitorName},
+				func(inputOne, inputTwo colexecop.Operator) colexecop.Operator {
+					// When we spill to disk, we just use a combo of an external
+					// hash join followed by an external hash aggregation.
+					ehj := colexecdisk.NewExternalHashJoiner(
+						colmem.NewAllocator(ctx, ehjMemAccount, factory),
+						flowCtx,
+						args,
+						hjArgs.Spec,
+						inputOne, inputTwo,
+						result.makeDiskBackedSorterConstructor(ctx, flowCtx, args, ehgjOpName+"-join", factory),
+						args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, ehgjOpName+"-join", spec.ProcessorID),
+					)
+					result.ToClose = append(result.ToClose, ehj)
+
+					aggInput := ehj.(colexecop.Operator)
+					if len(hgjSpec.JoinOutputColumns) > 0 {
+						aggInput = colexecbase.NewSimpleProjectOp(ehj, len(hjOutputTypes), hgjSpec.JoinOutputColumns)
+					}
+
+					newAggArgs := *newAggArgs
+					// Note that the hash-based partitioner will make sure that
+					// partitions to process using the in-memory hash aggregator
+					// fit under the limit, so we use an unlimited allocator.
+					newAggArgs.Allocator = colmem.NewAllocator(ctx, ehaMemAccount, factory)
+					newAggArgs.MemAccount = ehaMemAccount
+					newAggArgs.Input = aggInput
+					eha, toClose := colexecdisk.NewExternalHashAggregator(
+						ctx,
+						flowCtx,
+						args,
+						&colexecagg.NewHashAggregatorArgs{
+							NewAggregatorArgs:        &newAggArgs,
+							HashTableAllocator:       colmem.NewAllocator(ctx, ehgjAccounts[2], factory),
+							OutputUnlimitedAllocator: colmem.NewAllocator(ctx, ehgjAccounts[3], factory),
+							MaxOutputBatchMemSize:    newHashAggArgs.MaxOutputBatchMemSize,
+						},
+						result.makeDiskBackedSorterConstructor(ctx, flowCtx, args, ehgjOpName+"-agg", factory),
+						args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, ehgjOpName+"-agg", spec.ProcessorID),
+						// TODO(yuzefovich): think through whether the hash
+						// group-join needs to maintain the ordering.
+						execinfrapb.Ordering{}, /* outputOrdering */
+					)
+					result.ToClose = append(result.ToClose, toClose)
+					return eha
+				},
+				args.TestingKnobs.SpillingCallbackFn,
+			)
+			result.Root = diskSpiller
+			result.ToClose = append(result.ToClose, diskSpiller)
 
 		case core.Sorter != nil:
 			if err := checkNumIn(inputs, 1); err != nil {

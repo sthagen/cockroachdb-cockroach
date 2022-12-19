@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -89,7 +88,7 @@ func loadCandidateScheduleForExecution(
 	row, cols, err := ie.QueryRowExWithCols(
 		ctx, "find-scheduled-jobs-exec",
 		txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		lookupStmt)
 	if err != nil {
 		return nil, err
@@ -119,7 +118,7 @@ func lookupNumRunningJobs(
 	row, err := ie.QueryRowEx(
 		ctx, "lookup-num-running",
 		/*txn=*/ nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		lookupStmt)
 	if err != nil {
 		return 0, err
@@ -325,7 +324,7 @@ func (s *jobScheduler) executeSchedules(ctx context.Context, maxSchedules int64)
 	it, err := s.InternalExecutor.QueryIteratorEx(
 		ctx, "find-scheduled-jobs",
 		/*txn=*/ nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		findSchedulesStmt)
 
 	if err != nil {
@@ -350,30 +349,6 @@ func (s *jobScheduler) executeSchedules(ctx context.Context, maxSchedules int64)
 	}
 
 	return err
-}
-
-// An internal, safety valve setting to revert scheduler execution to distributed mode.
-// This setting should be removed once scheduled job system no longer locks tables for excessive
-// periods of time.
-var schedulerRunsOnSingleNode = settings.RegisterBoolSetting(
-	settings.TenantReadOnly,
-	"jobs.scheduler.single_node_scheduler.enabled",
-	"execute scheduler on a single node in a cluster",
-	false,
-)
-
-func (s *jobScheduler) schedulerEnabledOnThisNode(ctx context.Context) bool {
-	if s.ShouldRunScheduler == nil || !schedulerRunsOnSingleNode.Get(&s.Settings.SV) {
-		return true
-	}
-
-	enabled, err := s.ShouldRunScheduler(ctx, s.DB.Clock().NowAsClockTimestamp())
-	if err != nil {
-		log.Errorf(ctx, "error determining if the scheduler enabled: %v; will recheck after %s",
-			err, recheckEnabledAfterPeriod)
-		return false
-	}
-	return enabled
 }
 
 type syncCancelFunc struct {
@@ -439,12 +414,12 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 		whenDisabled := newCancelWhenDisabled(&s.Settings.SV)
 
 		for timer := time.NewTimer(initialDelay); ; timer.Reset(
-			getWaitPeriod(ctx, &s.Settings.SV, s.schedulerEnabledOnThisNode, jitter, s.TestingKnobs)) {
+			getWaitPeriod(ctx, &s.Settings.SV, jitter, s.TestingKnobs)) {
 			select {
 			case <-stopper.ShouldQuiesce():
 				return
 			case <-timer.C:
-				if !schedulerEnabledSetting.Get(&s.Settings.SV) || !s.schedulerEnabledOnThisNode(ctx) {
+				if !schedulerEnabledSetting.Get(&s.Settings.SV) {
 					continue
 				}
 
@@ -509,21 +484,13 @@ type jitterFn func(duration time.Duration) time.Duration
 
 // Returns duration to wait before scanning system.scheduled_jobs.
 func getWaitPeriod(
-	ctx context.Context,
-	sv *settings.Values,
-	enabledOnThisNode func(ctx context.Context) bool,
-	jitter jitterFn,
-	knobs base.ModuleTestingKnobs,
+	ctx context.Context, sv *settings.Values, jitter jitterFn, knobs base.ModuleTestingKnobs,
 ) time.Duration {
 	if k, ok := knobs.(*TestingKnobs); ok && k.SchedulerDaemonScanDelay != nil {
 		return k.SchedulerDaemonScanDelay()
 	}
 
 	if !schedulerEnabledSetting.Get(sv) {
-		return recheckEnabledAfterPeriod
-	}
-
-	if enabledOnThisNode != nil && !enabledOnThisNode(ctx) {
 		return recheckEnabledAfterPeriod
 	}
 

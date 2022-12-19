@@ -19,7 +19,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
@@ -44,8 +43,8 @@ import (
 // enabling tracing, capturing the physical plan of a test statement, and
 // constructing a TraceAnalyzer from the resulting trace and physical plan.
 func TestTraceAnalyzer(t *testing.T) {
-	defer log.Scope(t).Close(t)
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const (
 		testStmt = "SELECT * FROM test.foo ORDER BY v"
@@ -121,7 +120,7 @@ func TestTraceAnalyzer(t *testing.T) {
 			execCtx,
 			t.Name(),
 			nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			testStmt,
 		)
 		require.NoError(t, err)

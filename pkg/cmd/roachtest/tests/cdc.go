@@ -483,7 +483,7 @@ func newCDCTester(ctx context.Context, t test.Test, c cluster.Cluster) cdcTester
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 
 	settings := install.MakeClusterSettings()
-	settings.Env = append(settings.Env, "COCKROACH_EXPERIMENTAL_ENABLE_PER_CHANGEFEED_METRICS=true")
+	settings.Env = append(settings.Env, "COCKROACH_CHANGEFEED_TESTING_FAST_RETRY=true")
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, tester.crdbNodes)
 
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", tester.workloadNode)
@@ -547,7 +547,11 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 	crdbNodes, workloadNode, kafkaNode := c.Range(1, c.Spec().NodeCount-1), c.Node(c.Spec().NodeCount), c.Node(c.Spec().NodeCount)
 	c.Put(ctx, t.Cockroach(), "./cockroach", crdbNodes)
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
+	startOpts := option.DefaultStartOpts()
+	startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs,
+		"--vmodule=changefeed=2",
+	)
+	c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), crdbNodes)
 
 	kafka, cleanup := setupKafka(ctx, t, c, kafkaNode)
 	defer cleanup()
@@ -567,7 +571,7 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 		// we need to set a min_checkpoint_frequency here because if we
 		// use the default 30s duration, the test will likely not be able
 		// to finish within 30 minutes
-		"min_checkpoint_frequency": "'10s'",
+		"min_checkpoint_frequency": "'2s'",
 		"diff":                     "",
 	}
 	_, err := newChangefeedCreator(db, "bank.bank", kafka.sinkURL(ctx)).
@@ -660,6 +664,10 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 			baV,
 		}
 		v := cdctest.MakeCountValidator(validators)
+
+		timeSpentValidatingRows := 0 * time.Second
+		numRowsValidated := 0
+
 		for {
 			m, ok := <-messageBuf
 			if !ok {
@@ -672,16 +680,25 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 			partitionStr := strconv.Itoa(int(m.Partition))
 			if len(m.Key) > 0 {
+				startTime := timeutil.Now()
 				if err := v.NoteRow(partitionStr, string(m.Key), string(m.Value), updated); err != nil {
 					return err
 				}
+				timeSpentValidatingRows += timeutil.Since(startTime)
+				numRowsValidated++
 			} else {
+				noteResolvedStartTime := timeutil.Now()
 				if err := v.NoteResolved(partitionStr, resolved); err != nil {
 					return err
 				}
 				l.Printf("%d of %d resolved timestamps validated, latest is %s behind realtime",
 					v.NumResolvedWithRows, requestedResolved, timeutil.Since(resolved.GoTime()))
 
+				l.Printf("%s was spent validating this resolved timestamp: %s", timeutil.Since(noteResolvedStartTime))
+				l.Printf("%s was spent validating %d rows", timeSpentValidatingRows, numRowsValidated)
+
+				numRowsValidated = 0
+				timeSpentValidatingRows = 0
 			}
 		}
 		if failures := v.Failures(); len(failures) > 0 {

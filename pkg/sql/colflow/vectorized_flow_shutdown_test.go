@@ -41,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -58,16 +57,6 @@ var (
 	testScenarios    = []testScenario{consumerDone, consumerClosed, useBatchReceiver}
 )
 
-type callbackCloser struct {
-	closeCb func(context.Context) error
-}
-
-var _ colexecop.Closer = callbackCloser{}
-
-func (c callbackCloser) Close(ctx context.Context) error {
-	return c.closeCb(ctx)
-}
-
 // TestVectorizedFlowShutdown tests that closing the FlowCoordinator correctly
 // closes all the infrastructure corresponding to the flow ending in that
 // FlowCoordinator. Namely:
@@ -77,41 +66,37 @@ func (c callbackCloser) Close(ctx context.Context) error {
 // synchronizer which then outputs all the data into a materializer.
 // The resulting scheme looks as follows:
 //
-//	Remote Node             |                  Local Node
-//	                        |
-//	 -> output -> Outbox -> | -> Inbox -> |
-//	|                       |
-//
-// Hash Router -> output -> Outbox -> | -> Inbox -> |
-//
-//	|                       |
-//	 -> output -> Outbox -> | -> Inbox -> |
-//	                        |              -> Synchronizer -> materializer -> FlowCoordinator
-//	              Outbox -> | -> Inbox -> |
-//	                        |
-//	              Outbox -> | -> Inbox -> |
-//	                        |
-//	              Outbox -> | -> Inbox -> |
+// |            Remote Node             |                  Local Node
+// |                                    |
+// |             -> output -> Outbox -> | -> Inbox -> |
+// |            |                       |
+// | Hash Router -> output -> Outbox -> | -> Inbox -> |
+// |            |                       |
+// |             -> output -> Outbox -> | -> Inbox -> |
+// |                                    |              -> Synchronizer -> materializer -> FlowCoordinator
+// |                          Outbox -> | -> Inbox -> |
+// |                                    |
+// |                          Outbox -> | -> Inbox -> |
+// |                                    |
+// |                          Outbox -> | -> Inbox -> |
 //
 // Also, with 50% probability, another remote node with the chain of an Outbox
 // and Inbox is placed between the synchronizer and materializer. The resulting
 // scheme then looks as follows:
 //
-//	Remote Node             |            Another Remote Node             |         Local Node
-//	                        |                                            |
-//	 -> output -> Outbox -> | -> Inbox ->                                |
-//	|                       |             |                              |
-//
-// Hash Router -> output -> Outbox -> | -> Inbox ->                                |
-//
-//	|                       |             |                              |
-//	 -> output -> Outbox -> | -> Inbox ->                                |
-//	                        |             | -> Synchronizer -> Outbox -> | -> Inbox -> materializer -> FlowCoordinator
-//	              Outbox -> | -> Inbox ->                                |
-//	                        |             |                              |
-//	              Outbox -> | -> Inbox ->                                |
-//	                        |             |                              |
-//	              Outbox -> | -> Inbox ->                                |
+// |            Remote Node             |            Another Remote Node             |         Local Node
+// |                                    |                                            |
+// |             -> output -> Outbox -> | -> Inbox ->                                |
+// |            |                       |             |                              |
+// | Hash Router -> output -> Outbox -> | -> Inbox ->                                |
+// |            |                       |             |                              |
+// |             -> output -> Outbox -> | -> Inbox ->                                |
+// |                                    |             | -> Synchronizer -> Outbox -> | -> Inbox -> materializer -> FlowCoordinator
+// |                          Outbox -> | -> Inbox ->                                |
+// |                                    |             |                              |
+// |                          Outbox -> | -> Inbox ->                                |
+// |                                    |             |                              |
+// |                          Outbox -> | -> Inbox ->                                |
 //
 // Remote nodes are simulated by having separate contexts and separate outbox
 // registries.
@@ -159,10 +144,10 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 				rng, _ := randutil.NewTestRand()
 				var (
-					err             error
-					wg              sync.WaitGroup
-					typs            = []*types.T{types.Int}
-					hashRouterInput = coldatatestutils.NewRandomDataOp(
+					err                error
+					wg                 sync.WaitGroup
+					typs               = []*types.T{types.Int}
+					hashRouterInput, _ = coldatatestutils.NewRandomDataOp(
 						testAllocator,
 						rng,
 						coldatatestutils.RandomDataOpArgs{
@@ -245,12 +230,6 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				inputMetadataSource := colexecop.MetadataSource(synchronizer)
 				flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 
-				// idToClosed keeps track of whether Close was called for a given id.
-				idToClosed := struct {
-					syncutil.Mutex
-					mapping map[int]bool
-				}{}
-				idToClosed.mapping = make(map[int]bool)
 				runOutboxInbox := func(
 					outboxCtx context.Context,
 					flowCtxCancel context.CancelFunc,
@@ -260,20 +239,11 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					id int,
 					outboxMetadataSources []colexecop.MetadataSource,
 				) {
-					idToClosed.Lock()
-					idToClosed.mapping[id] = false
-					idToClosed.Unlock()
 					outbox, err := colrpc.NewOutbox(
 						colmem.NewAllocator(outboxCtx, outboxMemAcc, testColumnFactory),
 						colexecargs.OpWithMetaInfo{
 							Root:            outboxInput,
 							MetadataSources: outboxMetadataSources,
-							ToClose: []colexecop.Closer{callbackCloser{closeCb: func(context.Context) error {
-								idToClosed.Lock()
-								idToClosed.mapping[id] = true
-								idToClosed.Unlock()
-								return nil
-							}}},
 						},
 						typs,
 						nil, /* getStats */
@@ -365,14 +335,9 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					input = synchronizer
 				}
 
-				closeCalled := false
 				inputInfo := colexecargs.OpWithMetaInfo{
 					Root:            input,
 					MetadataSources: colexecop.MetadataSources{inputMetadataSource},
-					ToClose: colexecop.Closers{callbackCloser{closeCb: func(context.Context) error {
-						closeCalled = true
-						return nil
-					}}},
 				}
 
 				// runFlowCoordinator creates a pair of a materializer and a
@@ -468,11 +433,6 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					}
 				}
 				wg.Wait()
-				// Ensure all the outboxes called Close.
-				for id, closed := range idToClosed.mapping {
-					require.True(t, closed, "outbox with ID %d did not call Close on closers", id)
-				}
-				require.True(t, closeCalled)
 			})
 		}
 	}

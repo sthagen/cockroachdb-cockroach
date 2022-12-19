@@ -1155,6 +1155,9 @@ func (n *Node) Batch(
 	tenantID, ok := roachpb.TenantFromContext(ctx)
 	if !ok {
 		tenantID = roachpb.SystemTenantID
+	} else {
+		// We had this tag before the ResetAndAnnotateCtx() call above.
+		ctx = logtags.AddTag(ctx, "tenant", tenantID.String())
 	}
 
 	// Requests from tenants don't have gateway node id set but are required for
@@ -1294,7 +1297,7 @@ func setupSpanForIncomingRPC(
 			tracing.WithServerSpanKind)
 	}
 
-	newSpan.SetLazyTag("request", ba)
+	newSpan.SetLazyTag("request", ba.ShallowCopy())
 	return ctx, spanForRequest{
 		needRecording: needRecordingCollection,
 		tenID:         tenID,

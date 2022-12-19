@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -55,11 +54,6 @@ const (
 // and is to be used from Context.
 type DatabaseCatalog interface {
 
-	// ParseQualifiedTableName parses a SQL string of the form
-	// `[ database_name . ] [ schema_name . ] table_name`.
-	// NB: this is deprecated! Use parser.ParseQualifiedTableName when possible.
-	ParseQualifiedTableName(sql string) (*tree.TableName, error)
-
 	// ResolveTableName expands the given table name and
 	// makes it point to a valid object.
 	// If the database name is not given, it uses the search path to find it, and
@@ -70,18 +64,6 @@ type DatabaseCatalog interface {
 	// SchemaExists looks up the schema with the given name and determines
 	// whether it exists.
 	SchemaExists(ctx context.Context, dbName, scName string) (found bool, err error)
-
-	// IsTableVisible checks if the table with the given ID belongs to a schema
-	// on the given sessiondata.SearchPath.
-	IsTableVisible(
-		ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-	) (isVisible bool, exists bool, err error)
-
-	// IsTypeVisible checks if the type with the given ID belongs to a schema
-	// on the given sessiondata.SearchPath.
-	IsTypeVisible(
-		ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-	) (isVisible bool, exists bool, err error)
 
 	// HasAnyPrivilege returns whether the current user has privilege to access
 	// the given object.
@@ -359,15 +341,6 @@ type Planner interface {
 	// IsActive returns if the version specified by key is active.
 	IsActive(ctx context.Context, key clusterversion.Key) bool
 
-	// SynthesizePrivilegeDescriptor synthesizes a
-	// PrivilegeDescriptor given a SyntheticPrivilegeObject's path
-	// from system.privileges.
-	SynthesizePrivilegeDescriptor(
-		ctx context.Context,
-		privilegeObjectPath string,
-		privilegeObjectType privilege.ObjectType,
-	) (*catpb.PrivilegeDescriptor, error)
-
 	// GetMultiregionConfig synthesizes a new multiregion.RegionConfig describing
 	// the multiregion properties of the database identified via databaseID. The
 	// second return value is false if the database doesn't exist or is not
@@ -505,6 +478,14 @@ type RegionOperator interface {
 	// ResetMultiRegionZoneConfigsForDatabase resets the given database's zone
 	// configuration to its multi-region default.
 	ResetMultiRegionZoneConfigsForDatabase(ctx context.Context, id int64) error
+
+	// OptimizeSystemDatabase configures some tables in the system data as
+	// global and regional by row. The locality changes reduce how long it
+	// takes a server to start up in a multi-region deployment.
+	//
+	// TODO(jeffswenson): remove OptimizeSystemDatabase after cleaning up the
+	// unsafe_optimize_system_database built in.
+	OptimizeSystemDatabase(ctx context.Context) error
 }
 
 // SequenceOperators is used for various sql related functions that can
@@ -574,9 +555,6 @@ type TenantOperator interface {
 	// It returns an error if the tenant does not exist. If synchronous is true
 	// the gc job will not wait for a GC ttl.
 	DestroyTenant(ctx context.Context, tenantName roachpb.TenantName, synchronous bool) error
-
-	// GetTenantInfo returns information about the specified tenant.
-	GetTenantInfo(ctx context.Context, tenantName roachpb.TenantName) (*descpb.TenantInfo, error)
 
 	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
 	// success it also removes the tenant record.

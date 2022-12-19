@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -142,7 +143,7 @@ var _ scbuild.AuthorizationAccessor = (*TestState)(nil)
 
 // CheckPrivilege implements the scbuild.AuthorizationAccessor interface.
 func (s *TestState) CheckPrivilege(
-	ctx context.Context, privilegeObject catalog.PrivilegeObject, privilege privilege.Kind,
+	ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind,
 ) error {
 	return nil
 }
@@ -154,7 +155,7 @@ func (s *TestState) HasAdminRole(ctx context.Context) (bool, error) {
 
 // HasOwnership implements the scbuild.AuthorizationAccessor interface.
 func (s *TestState) HasOwnership(
-	ctx context.Context, privilegeObject catalog.PrivilegeObject,
+	ctx context.Context, privilegeObject privilege.Object,
 ) (bool, error) {
 	return true, nil
 }
@@ -162,7 +163,7 @@ func (s *TestState) HasOwnership(
 // CheckPrivilegeForUser implements the scbuild.AuthorizationAccessor interface.
 func (s *TestState) CheckPrivilegeForUser(
 	ctx context.Context,
-	privilegeObject catalog.PrivilegeObject,
+	privilegeObject privilege.Object,
 	privilege privilege.Kind,
 	user username.SQLUsername,
 ) error {
@@ -302,30 +303,39 @@ func (s *TestState) MayResolveIndex(
 	idx catalog.Index,
 ) {
 	if tableIndexName.Table.Object() != "" {
-		prefix, tbl := s.MayResolveTable(ctx, *tableIndexName.Table.ToUnresolvedObjectName())
+		prefix, tbl = s.MayResolveTable(ctx, *tableIndexName.Table.ToUnresolvedObjectName())
 		if tbl == nil {
 			return false, catalog.ResolvedObjectPrefix{}, nil, nil
 		}
-		idx, err := tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
-		if err != nil {
-			return false, catalog.ResolvedObjectPrefix{}, nil, nil
+		idx, _ = tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
+	} else {
+		db, schema := s.mayResolvePrefix(tableIndexName.Table.ObjectNamePrefix)
+		prefix = catalog.ResolvedObjectPrefix{
+			ExplicitDatabase: true,
+			ExplicitSchema:   true,
+			Database:         db.(catalog.DatabaseDescriptor),
+			Schema:           schema.(catalog.SchemaDescriptor),
 		}
+		var objects nstree.Catalog
+		if db != nil && schema != nil {
+			objects = s.GetAllObjectsInSchema(ctx, prefix.Database, prefix.Schema)
+		}
+		_ = objects.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			var ok bool
+			tbl, ok = desc.(catalog.TableDescriptor)
+			if !ok {
+				return nil
+			}
+			idx, _ = tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
+			if idx != nil {
+				return iterutil.StopIteration()
+			}
+			return nil
+		})
+	}
+	if idx != nil {
 		return true, prefix, tbl, idx
 	}
-
-	db, schema := s.mayResolvePrefix(tableIndexName.Table.ObjectNamePrefix)
-	dsNames, _ := s.ReadObjectNamesAndIDs(ctx, db.(catalog.DatabaseDescriptor), schema.(catalog.SchemaDescriptor))
-	for _, dsName := range dsNames {
-		prefix, tbl := s.MayResolveTable(ctx, *dsName.ToUnresolvedObjectName())
-		if tbl == nil {
-			continue
-		}
-		idx, err := tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
-		if err == nil {
-			return true, prefix, tbl, idx
-		}
-	}
-
 	return false, catalog.ResolvedObjectPrefix{}, nil, nil
 }
 
@@ -431,29 +441,18 @@ func (s *TestState) mayGetByName(
 	return desc
 }
 
-// ReadObjectNamesAndIDs implements the scbuild.CatalogReader interface.
-func (s *TestState) ReadObjectNamesAndIDs(
+// GetAllObjectsInSchema implements the scbuild.CatalogReader interface.
+func (s *TestState) GetAllObjectsInSchema(
 	ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor,
-) (names tree.TableNames, ids descpb.IDs) {
-	m := make(map[string]descpb.ID)
-	_ = s.uncommitted.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
-		if e.GetParentID() == db.GetID() && e.GetParentSchemaID() == schema.GetID() {
-			m[e.GetName()] = e.GetID()
-			names = append(names, tree.MakeTableNameWithSchema(
-				tree.Name(db.GetName()),
-				tree.Name(schema.GetName()),
-				tree.Name(e.GetName()),
-			))
+) nstree.Catalog {
+	var ret nstree.MutableCatalog
+	_ = s.uncommitted.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if desc.GetParentSchemaID() == schema.GetID() {
+			ret.UpsertDescriptor(desc)
 		}
 		return nil
 	})
-	sort.Slice(names, func(i, j int) bool {
-		return names[i].Object() < names[j].Object()
-	})
-	for _, name := range names {
-		ids = append(ids, m[name.Object()])
-	}
-	return names, ids
+	return ret.Catalog
 }
 
 // ResolveType implements the scbuild.CatalogReader interface.
@@ -537,19 +536,18 @@ func (s *TestState) CurrentDatabase() string {
 	return s.currentDatabase
 }
 
-// MustGetSchemasForDatabase implements the scbuild.CatalogReader interface.
-func (s *TestState) MustGetSchemasForDatabase(
-	ctx context.Context, database catalog.DatabaseDescriptor,
-) map[descpb.ID]string {
-	schemas := make(map[descpb.ID]string)
-	err := database.ForEachSchema(func(id descpb.ID, name string) error {
-		schemas[id] = name
+// GetAllSchemasInDatabase implements the scbuild.CatalogReader interface.
+func (s *TestState) GetAllSchemasInDatabase(
+	_ context.Context, database catalog.DatabaseDescriptor,
+) nstree.Catalog {
+	var ret nstree.MutableCatalog
+	_ = s.uncommitted.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if desc.GetParentID() == database.GetID() && desc.GetParentSchemaID() == descpb.InvalidID {
+			ret.UpsertDescriptor(desc)
+		}
 		return nil
 	})
-	if err != nil {
-		panic(err)
-	}
-	return schemas
+	return ret.Catalog
 }
 
 // MustReadDescriptor implements the scbuild.CatalogReader interface.
@@ -585,11 +583,11 @@ func (s *TestState) mustReadImmutableDescriptor(id descpb.ID) (catalog.Descripto
 // mustReadMutableDescriptor looks up a descriptor and returns a mutable
 // deep copy.
 func (s *TestState) mustReadMutableDescriptor(id descpb.ID) (catalog.MutableDescriptor, error) {
-	u := s.uncommitted.LookupDescriptorEntry(id)
+	u := s.uncommitted.LookupDescriptor(id)
 	if u == nil {
 		return nil, errors.Wrapf(catalog.ErrDescriptorNotFound, "reading mutable descriptor #%d", id)
 	}
-	c := s.committed.LookupDescriptorEntry(id)
+	c := s.committed.LookupDescriptor(id)
 	return descbuilder.BuildMutable(c, u.DescriptorProto(), s.mvccTimestamp())
 }
 
@@ -780,18 +778,18 @@ func (b *testCatalogChangeBatcher) ValidateAndRun(ctx context.Context) error {
 			}
 		}
 		b.s.LogSideEffectf("delete %s namespace entry %v -> %d", nameType, nameInfo, expectedID)
-		b.s.uncommitted.DeleteNamespaceEntry(nameInfo)
+		b.s.uncommitted.DeleteByName(nameInfo)
 	}
 	for _, desc := range b.descs {
 		mut := desc.NewBuilder().BuildCreatedMutable()
 		mut.ResetModificationTime()
 		desc = mut.ImmutableCopy()
 		b.s.LogSideEffectf("upsert descriptor #%d\n%s", desc.GetID(), b.s.descriptorDiff(desc))
-		b.s.uncommitted.UpsertDescriptorEntry(desc)
+		b.s.uncommitted.UpsertDescriptor(desc)
 	}
 	for _, deletedID := range b.descriptorsToDelete.Ordered() {
 		b.s.LogSideEffectf("delete descriptor #%d", deletedID)
-		b.s.uncommitted.DeleteDescriptorEntry(deletedID)
+		b.s.uncommitted.DeleteByID(deletedID)
 	}
 	for _, deletedID := range b.zoneConfigsToDelete.Ordered() {
 		b.s.LogSideEffectf("deleting zone config for #%d", deletedID)
@@ -1014,6 +1012,7 @@ func (s *TestState) ValidateCheckConstraint(
 	ctx context.Context,
 	tbl catalog.TableDescriptor,
 	constraint catalog.CheckConstraint,
+	indexIDForValidation descpb.IndexID,
 	override sessiondata.InternalExecutorOverride,
 ) error {
 	s.LogSideEffectf("validate check constraint %v in table #%d", constraint.GetName(), tbl.GetID())

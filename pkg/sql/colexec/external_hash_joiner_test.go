@@ -81,21 +81,16 @@ func TestExternalHashJoiner(t *testing.T) {
 					sem := colexecop.NewTestingSemaphore(colexecop.ExternalHJMinPartitions)
 					semsToCheck = append(semsToCheck, sem)
 					spec := createSpecForHashJoiner(tc)
-					// TODO(asubiotto): Pass in the testing.T of the caller to this
-					//  function and do substring matching on the test name to
-					//  conditionally explicitly call Close() on the hash joiner
-					//  (through result.ToClose) in cases where it is known the sorter
-					//  will not be drained.
 					hjOp, closers, err := createDiskBackedHashJoiner(
 						ctx, flowCtx, spec, sources, func() {}, queueCfg,
 						numForcedRepartitions, delegateFDAcquisitions, sem,
 						&monitorRegistry,
 					)
-					// Expect three closers. These are the external hash joiner, and
-					// one external sorter for each input.
-					// TODO(asubiotto): Explicitly Close when testing.T is passed into
-					//  this constructor and we do a substring match.
-					require.Equal(t, 3, len(closers))
+					// Expect six closers:
+					// - 1 for the disk spiller
+					// - 1 for the external hash joiner
+					// - 2 for each of the external sorts (4 total here).
+					require.Equal(t, 6, len(closers))
 					return hjOp, err
 				})
 				for i, sem := range semsToCheck {

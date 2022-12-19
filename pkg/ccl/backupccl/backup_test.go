@@ -41,7 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupencryption"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupinfo"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
-	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuptestutils"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl"
@@ -63,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -134,7 +135,7 @@ func TestBackupRestoreStatementResult(t *testing.T) {
 	_, sqlDB, dir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
-	if err := backuputils.VerifyBackupRestoreStatementResult(
+	if err := backuptestutils.VerifyBackupRestoreStatementResult(
 		t, sqlDB, "BACKUP DATABASE data TO $1", localFoo,
 	); err != nil {
 		t.Fatal(err)
@@ -153,7 +154,7 @@ func TestBackupRestoreStatementResult(t *testing.T) {
 
 	sqlDB.Exec(t, "CREATE DATABASE data2")
 
-	if err := backuputils.VerifyBackupRestoreStatementResult(
+	if err := backuptestutils.VerifyBackupRestoreStatementResult(
 		t, sqlDB, "RESTORE data.* FROM $1 WITH OPTIONS (into_db='data2')", localFoo,
 	); err != nil {
 		t.Fatal(err)
@@ -9338,6 +9339,103 @@ func TestExcludeDataFromBackupDoesNotHoldupGC(t *testing.T) {
 		})
 }
 
+// TestProtectRestoreTargets ensures that a protected timestamp is issued before
+// the restore flow begins on the correct target and is released when the restore ends.
+func TestProtectRestoreTargets(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	numAccounts := 100
+	params := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
+		},
+	}
+	tc, sqlDB, tempDir, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode,
+		numAccounts,
+		InitManualReplication, params)
+	_, emptyDB, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir,
+		InitManualReplication, params)
+	defer cleanupEmptyCluster()
+	defer cleanupFn()
+
+	ctx := context.Background()
+	if !tc.StartedDefaultTestTenant() {
+		_, err := tc.Servers[0].StartTenant(ctx, base.TestTenantArgs{TenantID: roachpb.
+			MustMakeTenantID(10)})
+		require.NoError(t, err)
+	}
+	sqlDB.Exec(t, `BACKUP INTO $1`, localFoo)
+
+	for _, subtest := range []struct {
+		name        string
+		restoreStmt string
+	}{
+		{
+			name:        "tenant",
+			restoreStmt: `RESTORE TENANT 10 FROM LATEST IN $1 WITH detached, tenant = '20'`,
+		},
+		{
+			name:        "database",
+			restoreStmt: `RESTORE DATABASE data FROM LATEST IN $1 WITH detached, new_db_name=data2`,
+		},
+		{
+			name:        "table",
+			restoreStmt: `RESTORE TABLE bank FROM LATEST IN $1 WITH detached, into_db='defaultdb'`,
+		},
+		{
+			name:        "cluster",
+			restoreStmt: `RESTORE FROM LATEST IN $1 WITH detached`,
+		},
+	} {
+		if tc.StartedDefaultTestTenant() && subtest.name == "tenant" {
+			// Cannot run a restore of a tenant within a tenant
+			continue
+		}
+		t.Run(subtest.name, func(t *testing.T) {
+			if subtest.name == "cluster" {
+				// Use the empty cluster for cluster restore
+				sqlDB = emptyDB
+				sqlDB.Exec(t, "USE system")
+			}
+			// Begin a Restore and assert that PTS with the correct target was persisted
+			sqlDB.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'restore.before_flow'`)
+			var jobId jobspb.JobID
+			sqlDB.QueryRow(t, subtest.restoreStmt, localFoo).Scan(&jobId)
+			jobutils.WaitForJobToPause(t, sqlDB, jobId)
+
+			restoreDetails := jobutils.GetJobPayload(t, sqlDB, jobId).GetRestore()
+			require.NotNil(t, restoreDetails.ProtectedTimestampRecord)
+
+			target := ptutil.GetPTSTarget(t, sqlDB, restoreDetails.ProtectedTimestampRecord)
+			switch subtest.name {
+			case "cluster":
+				// The target cluster object doesn't have any info,
+				// so just assert that the right type was instantiated.
+				require.NotNil(t, target.GetCluster())
+			case "tenant":
+				targetIDs := target.GetTenants()
+				require.Equal(t, roachpb.TenantID{InternalValue: 20}, targetIDs.IDs[0])
+			case "database":
+				targetIDs := target.GetSchemaObjects()
+				require.Equal(t, restoreDetails.DatabaseDescs[0].GetID(), targetIDs.IDs[0])
+			case "table":
+				targetIDs := target.GetSchemaObjects()
+				require.Equal(t, restoreDetails.TableDescs[0].GetID(), targetIDs.IDs[0])
+			}
+			// Finish the restore and ensure the PTS record was removed
+			sqlDB.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = ''`)
+			sqlDB.Exec(t, `RESUME JOB $1`, jobId)
+			jobutils.WaitForJobToSucceed(t, sqlDB, jobId)
+
+			var count int
+			sqlDB.QueryRow(t, `SELECT count(*) FROM system.protected_ts_records WHERE id = $1`,
+				restoreDetails.ProtectedTimestampRecord).Scan(&count)
+			require.Equal(t, 0, count)
+		})
+	}
+}
+
 // TestBackupRestoreSystemUsers tests RESTORE SYSTEM USERS feature which allows user to
 // restore users from a backup into current cluster and regrant roles.
 func TestBackupRestoreSystemUsers(t *testing.T) {
@@ -9370,19 +9468,19 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 
 		// Role 'app_role' and user 'app' will be added, and 'app' is granted with 'app_role'
 		// User test will remain untouched with no role granted
-		sqlDBRestore.CheckQueryResults(t, "SELECT username, \"hashedPassword\", \"isRole\" FROM system.users", [][]string{
-			{"admin", "", "true"},
-			{"app", "NULL", "false"},
-			{"app_role", "NULL", "true"},
-			{"root", "", "false"},
-			{"test", "NULL", "false"},
-			{"test_role", "NULL", "true"},
+		sqlDBRestore.CheckQueryResults(t, "SELECT * FROM system.users", [][]string{
+			{"admin", "", "true", "2"},
+			{"app", "NULL", "false", "101"},
+			{"app_role", "NULL", "true", "102"},
+			{"root", "", "false", "1"},
+			{"test", "NULL", "false", "100"},
+			{"test_role", "NULL", "true", "103"},
 		})
 		sqlDBRestore.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{
-			{"admin", "app", "false"},
-			{"admin", "root", "true"},
-			{"app_role", "app", "false"},
-			{"app_role", "test_role", "false"},
+			{"admin", "app", "false", "NULL", "NULL"},
+			{"admin", "root", "true", "2", "1"},
+			{"app_role", "app", "false", "NULL", "NULL"},
+			{"app_role", "test_role", "false", "NULL", "NULL"},
 		})
 		sqlDBRestore.CheckQueryResults(t, "SHOW USERS", [][]string{
 			{"admin", "", "{}"},
@@ -9403,10 +9501,10 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 	defer cleanupEmptyCluster1()
 	t.Run("restore-from-backup-with-no-system-role-members", func(t *testing.T) {
 		sqlDBRestore1.Exec(t, "RESTORE SYSTEM USERS FROM $1", localFoo+"/3")
-		sqlDBRestore1.CheckQueryResults(t, "SELECT \"role\", \"member\", \"isAdmin\" FROM system.role_members", [][]string{
-			{"admin", "root", "true"},
+		sqlDBRestore1.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{
+			{"admin", "root", "true", "2", "1"},
 		})
-		sqlDBRestore1.CheckQueryResults(t, "SELECT username, \"hashedPassword\", \"isRole\", \"user_id\" FROM system.users", [][]string{
+		sqlDBRestore1.CheckQueryResults(t, "SELECT * FROM system.users", [][]string{
 			{"admin", "", "true", "2"},
 			{"app", "NULL", "false", "100"},
 			{"app_role", "NULL", "true", "101"},
@@ -9430,10 +9528,10 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 		// allocated properly in the restore.
 		sqlDBRestore2.Exec(t, "CREATE USER testuser")
 		sqlDBRestore2.Exec(t, "RESTORE SYSTEM USERS FROM $1", localFoo+"/3")
-		sqlDBRestore2.CheckQueryResults(t, "SELECT \"role\", \"member\", \"isAdmin\" FROM system.role_members", [][]string{
-			{"admin", "root", "true"},
+		sqlDBRestore2.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{
+			{"admin", "root", "true", "2", "1"},
 		})
-		sqlDBRestore2.CheckQueryResults(t, "SELECT username, \"hashedPassword\", \"isRole\", \"user_id\" FROM system.users", [][]string{
+		sqlDBRestore2.CheckQueryResults(t, "SELECT * FROM system.users", [][]string{
 			{"admin", "", "true", "2"},
 			{"app", "NULL", "false", "101"},
 			{"app_role", "NULL", "true", "102"},

@@ -286,9 +286,6 @@ func dumpBuildDirectivesForRepo(repoName string) {
 		directives = append(directives, protoDirectives...)
 		directives = append(directives,
 			"gazelle:proto_import_prefix etcd/raft/v3")
-		directives = append(directives,
-			"gazelle:resolve proto proto etcd/api/versionpb/version.proto @io_etcd_go_etcd_api_v3//versionpb:versionpb_proto",
-			"gazelle:resolve proto go etcd/api/versionpb/version.proto @io_etcd_go_etcd_api_v3//versionpb:versionpb")
 
 	} else if repoName == "io_opentelemetry_go_proto_otlp" {
 		directives = append(directives,
@@ -340,7 +337,7 @@ func dumpNewDepsBzl(
 
 # PRO-TIP: You can inject temorary changes to any of these dependencies by
 # by pointing to an alternate remote to clone from. Delete the ` + "`sha256`" + `,
-# ` + "`strip_prefix`, and ` + `urls`" + ` parameters, and add ` + "`vcs = \"git\"`" + ` as well as a
+# ` + "`strip_prefix`, and `urls` parameters, and add `vcs = \"git\"`" + ` as well as a
 # custom ` + "`remote` and `commit`" + `. For example:
 #     go_repository(
 #        name = "com_github_cockroachdb_sentry_go",

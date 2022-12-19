@@ -170,6 +170,10 @@ const (
 	VPrimordial4
 	VPrimordial5
 	VPrimordial6
+	// NOTE(andrei): Do not introduce new upgrades corresponding to VPrimordial
+	// versions. Old-version nodes might try to run the jobs created for such
+	// upgrades, but they won't know about the respective upgrade, causing the job
+	// to succeed without actually performing the update.
 	VPrimordialMax
 
 	// V22_1 is CockroachDB v22.1. It's used for all v22.1.x patch releases.
@@ -331,12 +335,33 @@ const (
 	// system tenant.
 	V23_1DescIDSequenceForSystemTenant
 
-	// V23_1AddPartialStatisticsPredicateCol adds a column to store the predicate
-	// for a partial statistics collection.
-	V23_1AddPartialStatisticsPredicateCol
+	// V23_1AddPartialStatisticsColumns adds two columns: one to store the predicate
+	// for a partial statistics collection, and another to refer to the full statistic
+	// it was collected from.
+	V23_1AddPartialStatisticsColumns
 
 	// V23_1_CreateSystemJobInfoTable creates the system.job_info table.
 	V23_1CreateSystemJobInfoTable
+
+	// V23_1RoleMembersTableHasIDColumns is the version where the role_members
+	// system table has columns for ids.
+	V23_1RoleMembersTableHasIDColumns
+
+	// V23_1RoleMembersIDColumnsBackfilled is the version where the columns for
+	// ids in the role_members system table have been backfilled.
+	V23_1RoleMembersIDColumnsBackfilled
+
+	// V23_1ScheduledChangefeeds is the version where scheduled changefeeds are
+	// supported through `CREATE SCHEDULE FOR CHANGEFEED` statement.
+	V23_1ScheduledChangefeeds
+
+	// V23_1AddTypeColumnToJobsTable adds the nullable job_type
+	// column to the system.jobs table.
+	V23_1AddTypeColumnToJobsTable
+
+	// V23_1BackfillTypeColumnInJobsTable backfills the job_type
+	// column in the system.jobs table.
+	V23_1BackfillTypeColumnInJobsTable
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -577,12 +602,32 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 6},
 	},
 	{
-		Key:     V23_1AddPartialStatisticsPredicateCol,
+		Key:     V23_1AddPartialStatisticsColumns,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 8},
 	},
 	{
 		Key:     V23_1CreateSystemJobInfoTable,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 10},
+	},
+	{
+		Key:     V23_1RoleMembersTableHasIDColumns,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 12},
+	},
+	{
+		Key:     V23_1RoleMembersIDColumnsBackfilled,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 14},
+	},
+	{
+		Key:     V23_1ScheduledChangefeeds,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 16},
+	},
+	{
+		Key:     V23_1AddTypeColumnToJobsTable,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 18},
+	},
+	{
+		Key:     V23_1BackfillTypeColumnInJobsTable,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 20},
 	},
 
 	// *************************************************
@@ -604,6 +649,8 @@ const (
 	// Setting it has the effect of ensuring no versions are subsequently added.
 	finalVersion = invalidVersionKey
 )
+
+var allowUpgradeToDev = envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false)
 
 var versionsSingleton = func() keyedVersions {
 	if developmentBranch {
@@ -629,7 +676,7 @@ var versionsSingleton = func() keyedVersions {
 		// renumber only 2-4 to be +1M. It would then step from 3 "up" to 1000002 --
 		// which conceptually is actually back down to 2 -- then back to to 1000003,
 		// then on to 1000004, etc.
-		skipFirst := envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false)
+		skipFirst := allowUpgradeToDev
 		const devOffset = 1000000
 		first := true
 		for i := range rawVersionsSingleton {

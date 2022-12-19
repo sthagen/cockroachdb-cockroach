@@ -305,6 +305,9 @@ func (u *sqlSymUnion) nameList() tree.NameList {
 func (u *sqlSymUnion) enumValueList() tree.EnumValueList {
     return u.val.(tree.EnumValueList)
 }
+func (u *sqlSymUnion) compositeTypeList() []tree.CompositeTypeElem {
+    return u.val.([]tree.CompositeTypeElem)
+}
 func (u *sqlSymUnion) unresolvedName() *tree.UnresolvedName {
     return u.val.(*tree.UnresolvedName)
 }
@@ -949,7 +952,7 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %token <str> UPDATE UPSERT UNSET UNTIL USE USER USERS USING UUID
 
 %token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VERIFY_BACKUP_TABLE_DATA VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
-%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE VOLATILE VOTERS
+%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE INVISIBLE VOLATILE VOTERS
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1025,7 +1028,9 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> alter_table_owner_stmt
 
 // ALTER TENANT CLUSTER SETTINGS
+%type <tree.Statement> alter_tenant_stmt
 %type <tree.Statement> alter_tenant_csetting_stmt
+%type <tree.Statement> alter_tenant_replication_stmt
 
 // ALTER PARTITION
 %type <tree.Statement> alter_zone_partition_stmt
@@ -1101,7 +1106,8 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.Statement> copy_from_stmt
 
 %type <tree.Statement> create_stmt
-%type <tree.Statement> create_changefeed_stmt
+%type <tree.Statement> create_schedule_stmt
+%type <tree.Statement> create_changefeed_stmt create_schedule_for_changefeed_stmt
 %type <tree.Statement> create_ddl_stmt
 %type <tree.Statement> create_database_stmt
 %type <tree.Statement> create_extension_stmt
@@ -1459,11 +1465,12 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.SelectExpr> target_elem
 %type <*tree.UpdateExpr> single_set_clause
 %type <tree.AsOfClause> as_of_clause opt_as_of_clause
-%type <tree.Expr> opt_changefeed_sink
+%type <tree.Expr> opt_changefeed_sink changefeed_sink
 %type <str> opt_changefeed_family
 
 %type <str> explain_option_name
 %type <[]string> explain_option_list opt_enum_val_list enum_val_list
+%type <[]tree.CompositeTypeElem> composite_type_list opt_composite_type_list
 
 %type <tree.ResolvableTypeReference> typename simple_typename cast_target
 %type <*types.T> const_typename
@@ -1572,7 +1579,6 @@ func (u *sqlSymUnion) functionObjs() tree.FuncObjs {
 %type <tree.NameList> opt_for_roles
 %type <tree.ObjectNamePrefixList>  opt_in_schemas
 %type <privilege.TargetObjectType> target_object_type
-%type <tree.TenantID> opt_as_tenant_clause
 
 // User defined function relevant components.
 %type <bool> opt_or_replace opt_return_set opt_no
@@ -1710,7 +1716,7 @@ stmt_without_legacy_transaction:
 alter_stmt:
   alter_ddl_stmt      // help texts in sub-rule
 | alter_role_stmt     // EXTEND WITH HELP: ALTER ROLE
-| alter_tenant_csetting_stmt  // EXTEND WITH HELP: ALTER TENANT
+| alter_tenant_stmt   /* SKIP DOC */
 | alter_unsupported_stmt
 | ALTER error         // SHOW HELP: ALTER
 
@@ -2147,7 +2153,7 @@ alter_range_stmt:
 //   ALTER INDEX ... UNSPLIT ALL
 //   ALTER INDEX ... SCATTER [ FROM ( <exprs...> ) TO ( <exprs...> ) ]
 //   ALTER INDEX ... RELOCATE [ LEASE | VOTERS | NONVOTERS ] <selectclause>
-//   ALTER INDEX ... [VISIBLE | NOT VISIBLE]
+//   ALTER INDEX ... [VISIBLE | NOT VISIBLE | INVISIBLE]
 //
 // Zone configurations:
 //   DISCARD
@@ -2309,6 +2315,10 @@ alter_index_visible_stmt:
 
 alter_index_visible:
   NOT VISIBLE
+  {
+    $$.val = true
+  }
+| INVISIBLE
   {
     $$.val = true
   }
@@ -3277,7 +3287,7 @@ create_schedule_for_backup_stmt:
         ScheduleOptions:      $12.kvOptions(),
       }
   }
- | CREATE SCHEDULE error  // SHOW HELP: CREATE SCHEDULE FOR BACKUP
+ | CREATE SCHEDULE schedule_label_spec FOR BACKUP error // SHOW HELP: CREATE SCHEDULE FOR BACKUP
 
 // %Help: ALTER BACKUP SCHEDULE - alter an existing backup schedule
 // %Category: CCL
@@ -3578,28 +3588,6 @@ list_of_string_or_placeholder_opt_list:
 | list_of_string_or_placeholder_opt_list ',' string_or_placeholder_opt_list
   {
     $$.val = append($1.listOfStringOrPlaceholderOptList(), $3.stringOrPlaceholderOptList())
-  }
-
-// Optional AS TENANT clause.
-opt_as_tenant_clause:
-  AS TENANT iconst64
-  {
-    tenID := uint64($3.int64())
-    if tenID == 0 {
-      return setErr(sqllex, errors.New("invalid tenant ID"))
-    }
-    $$.val = tree.TenantID{Specified: true, ID: tenID}
-  }
-| AS TENANT IDENT
-  {
-    if $3 != "_" {
-       return setErr(sqllex, errors.New("invalid syntax"))
-    }
-    $$.val = tree.TenantID{Specified: true}
-  }
-| /* EMPTY */
-  {
-    $$.val = tree.TenantID{Specified: false}
   }
 
 // Optional restore options.
@@ -4137,16 +4125,16 @@ comment_text:
 // %Text:
 // CREATE DATABASE, CREATE TABLE, CREATE INDEX, CREATE TABLE AS,
 // CREATE USER, CREATE VIEW, CREATE SEQUENCE, CREATE STATISTICS,
-// CREATE ROLE, CREATE TYPE, CREATE EXTENSION, CREATE TENANT
+// CREATE ROLE, CREATE TYPE, CREATE EXTENSION, CREATE TENANT, CREATE SCHEDULE
 create_stmt:
   create_role_stmt     // EXTEND WITH HELP: CREATE ROLE
 | create_ddl_stmt      // help texts in sub-rule
 | create_stats_stmt    // EXTEND WITH HELP: CREATE STATISTICS
-| create_schedule_for_backup_stmt   // EXTEND WITH HELP: CREATE SCHEDULE FOR BACKUP
 | create_changefeed_stmt
 | create_extension_stmt  // EXTEND WITH HELP: CREATE EXTENSION
 | create_external_connection_stmt // EXTEND WITH HELP: CREATE EXTERNAL CONNECTION
 | create_tenant_stmt // EXTEND WITH HELP: CREATE TENANT
+| create_schedule_stmt
 | create_unsupported   {}
 | CREATE error         // SHOW HELP: CREATE
 
@@ -4167,6 +4155,16 @@ create_tenant_stmt:
     }
   }
 | CREATE TENANT error // SHOW HELP: CREATE TENANT
+
+// %Help: CREATE SCHEDULE
+// %Category: Group
+// %Text:
+// CREATE SCHEDULE FOR BACKUP,
+// CREATE SCHEDULE FOR CHANGEFEED
+create_schedule_stmt:
+  create_schedule_for_changefeed_stmt // EXTEND WITH HELP: CREATE SCHEDULE FOR CHANGEFEED
+| create_schedule_for_backup_stmt   // EXTEND WITH HELP: CREATE SCHEDULE FOR BACKUP
+| CREATE SCHEDULE error // SHOW HELP: CREATE SCHEDULE
 
 // %Help: CREATE EXTENSION - pseudo-statement for PostgreSQL compatibility
 // %Category: Cfg
@@ -4798,6 +4796,76 @@ create_changefeed_stmt:
     }
   }
 
+// %Help: CREATE SCHEDULE FOR CHANGEFEED - create changefeed periodically
+// %Category: CCL
+// %Text:
+// CREATE SCHEDULE [IF NOT EXISTS]
+// [<description>]
+// FOR CHANGEFEED
+// <targets> INTO <sink> [WITH <options>]
+// RECURRING [crontab|NEVER]
+// [WITH EXPERIMENTAL SCHEDULE OPTIONS <schedule_option>[= <value>] [, ...] ]
+//
+// All changefeeds run in UTC timezone.
+//
+// Description:
+//   Optional description (or name) for this schedule
+//
+// RECURRING <crontab>:
+//   The RECURRING expression specifies when export runs
+//   Schedule specified as a string in crontab format.
+//   All times in UTC.
+//     "5 0 * * *": run schedule 5 minutes past midnight.
+//     "@daily": run daily, at midnight
+//   See https://en.wikipedia.org/wiki/Cron
+//
+// sink: data capture stream destination (Enterprise only)
+// %SeeAlso: CREATE CHANGEFEED
+create_schedule_for_changefeed_stmt:
+  CREATE SCHEDULE /*$3=*/schedule_label_spec FOR CHANGEFEED
+  /* $6=*/changefeed_targets /*$7=*/changefeed_sink
+  /*$8=*/opt_with_options /*$9=*/cron_expr /*$10=*/opt_with_schedule_options
+  {
+     $$.val = &tree.ScheduledChangefeed{
+        CreateChangefeed:   &tree.CreateChangefeed{
+          Targets:    $6.changefeedTargets(),
+          SinkURI:    $7.expr(),
+          Options:    $8.kvOptions(),
+        },
+        ScheduleLabelSpec:  *($3.scheduleLabelSpec()),
+        Recurrence:         $9.expr(),
+				ScheduleOptions:    $10.kvOptions(),
+     }
+  }
+| CREATE SCHEDULE /*$3=*/schedule_label_spec FOR CHANGEFEED /*$6=*/changefeed_sink
+  /*$7=*/opt_with_options AS SELECT /*$10=*/target_list FROM /*$12=*/changefeed_target_expr /*$13=*/opt_where_clause
+  /*$14=*/cron_expr /*$15=*/opt_with_schedule_options
+  {
+    target, err := tree.ChangefeedTargetFromTableExpr($12.tblExpr())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+
+    createChangefeedNode := &tree.CreateChangefeed{
+      SinkURI: $6.expr(),
+      Options: $7.kvOptions(),
+      Targets: tree.ChangefeedTargets{target},
+      Select:  &tree.SelectClause{
+         Exprs: $10.selExprs(),
+         From:  tree.From{Tables: tree.TableExprs{$12.tblExpr()}},
+         Where: tree.NewWhere(tree.AstWhere, $13.expr()),
+      },
+    }
+
+    $$.val = &tree.ScheduledChangefeed{
+			CreateChangefeed:  	createChangefeedNode,
+			ScheduleLabelSpec:  *($3.scheduleLabelSpec()),
+			Recurrence:         $14.expr(),
+			ScheduleOptions:    $15.kvOptions(),
+	 }
+  }
+ | CREATE SCHEDULE schedule_label_spec FOR CHANGEFEED error  // SHOW HELP: CREATE SCHEDULE FOR CHANGEFEED
+
 changefeed_targets:
   changefeed_target
   {
@@ -4846,6 +4914,11 @@ opt_changefeed_sink:
     $$.val = nil
   }
 
+changefeed_sink:
+  INTO string_or_placeholder
+  {
+    $$.val = $2.expr()
+  }
 // %Help: DELETE - delete rows from a table
 // %Category: DML
 // %Text: DELETE FROM <tablename> [WHERE <expr>]
@@ -5420,11 +5493,21 @@ backup_kms:
 
 // %Help: SHOW TENANT - display tenant information
 // %Category: Misc
-// %Text: SHOW TENANT
+// %Text: SHOW TENANT <tenant_name> [WITH REPLICATION STATUS]
 show_tenant_stmt:
-  SHOW TENANT name
+  SHOW TENANT d_expr
   {
-   $$.val = &tree.ShowTenant{Name: tree.Name($3)}
+   $$.val = &tree.ShowTenant{
+     Name: $3.expr(),
+     WithReplication: false,
+   }
+  }
+| SHOW TENANT d_expr WITH REPLICATION STATUS
+  {
+   $$.val = &tree.ShowTenant{
+     Name: $3.expr(),
+     WithReplication: true,
+   }
   }
 | SHOW TENANT error // SHOW HELP: SHOW TENANT
 
@@ -5983,7 +6066,61 @@ set_csetting_stmt:
   }
 | SET CLUSTER error // SHOW HELP: SET CLUSTER SETTING
 
+
 // %Help: ALTER TENANT - alter tenant configuration
+// %Category: Group
+// %SeeAlso: ALTER TENANT REPLICATION, ALTER TENANT CLUSTER SETTING
+alter_tenant_stmt:
+  alter_tenant_replication_stmt // EXTEND WITH HELP: ALTER TENANT REPLICATION
+| alter_tenant_csetting_stmt    // EXTEND WITH HELP: ALTER TENANT CLUSTER SETTING
+| ALTER TENANT error            // SHOW HELP: ALTER TENANT
+
+// %Help: ALTER TENANT REPLICATION - alter tenant replication stream
+// %Category: Group
+// %Text:
+// ALTER TENANT '<tenant_name>' PAUSE REPLICATION
+// ALTER TENANT '<tenant_name>' RESUME REPLICATION
+// ALTER TENANT '<tenant_name>' COMPLETE REPLICATION TO LATEST
+// ALTER TENANT '<tenant_name>' COMPLETE REPLICATION TO SYSTEM TIME 'time'
+alter_tenant_replication_stmt:
+  ALTER TENANT d_expr PAUSE REPLICATION
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterTenantReplication{
+      TenantName: $3.expr(),
+      Command: tree.PauseJob,
+    }
+  }
+| ALTER TENANT d_expr RESUME REPLICATION
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterTenantReplication{
+      TenantName: $3.expr(),
+      Command: tree.ResumeJob,
+    }
+  }
+| ALTER TENANT d_expr COMPLETE REPLICATION TO SYSTEM TIME a_expr
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterTenantReplication{
+      TenantName: $3.expr(),
+      Cutover: &tree.ReplicationCutoverTime{
+        Timestamp: $9.expr(),
+      },
+    }
+  }
+| ALTER TENANT d_expr COMPLETE REPLICATION TO LATEST
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterTenantReplication{
+      TenantName: $3.expr(),
+      Cutover: &tree.ReplicationCutoverTime{
+        Latest: true,
+      },
+    }
+  }
+
+// %Help: ALTER TENANT CLUSTER SETTING - alter tenant cluster settings
 // %Category: Group
 // %Text:
 // ALTER TENANT { <tenant_id> | ALL } SET CLUSTER SETTING <var> { TO | = } <value>
@@ -5992,6 +6129,7 @@ set_csetting_stmt:
 alter_tenant_csetting_stmt:
   ALTER TENANT d_expr set_or_reset_csetting_stmt
   {
+    /* SKIP DOC */
     csettingStmt := $4.stmt().(*tree.SetClusterSetting)
     $$.val = &tree.AlterTenantSetClusterSetting{
       SetClusterSetting: *csettingStmt,
@@ -6000,14 +6138,14 @@ alter_tenant_csetting_stmt:
   }
 | ALTER TENANT_ALL ALL set_or_reset_csetting_stmt
   {
+    /* SKIP DOC */
     csettingStmt := $4.stmt().(*tree.SetClusterSetting)
     $$.val = &tree.AlterTenantSetClusterSetting{
       SetClusterSetting: *csettingStmt,
       TenantAll: true,
     }
   }
-| ALTER TENANT error // SHOW HELP: ALTER TENANT
-| ALTER TENANT_ALL ALL error // SHOW HELP: ALTER TENANT
+| ALTER TENANT_ALL ALL error // SHOW HELP: ALTER TENANT CLUSTER SETTING
 
 set_or_reset_csetting_stmt:
   reset_csetting_stmt
@@ -7186,6 +7324,10 @@ opt_schedule_executor_type:
   {
     $$.val = tree.ScheduledSQLStatsCompactionExecutor
   }
+| FOR CHANGEFEED
+	{
+		$$.val = tree.ScheduledChangefeedExecutor
+	}
 
 // %Help: SHOW TRACE - display an execution trace
 // %Category: Misc
@@ -9674,7 +9816,23 @@ create_type_stmt:
   }
 | CREATE TYPE error // SHOW HELP: CREATE TYPE
   // Record/Composite types.
-| CREATE TYPE type_name AS '(' error      { return unimplementedWithIssue(sqllex, 27792) }
+| CREATE TYPE type_name AS '(' opt_composite_type_list ')'
+  {
+    $$.val = &tree.CreateType{
+      TypeName: $3.unresolvedObjectName(),
+      Variety: tree.Composite,
+      CompositeTypeList: $6.compositeTypeList(),
+    }
+  }
+| CREATE TYPE IF NOT EXISTS type_name AS '(' opt_composite_type_list ')'
+  {
+    $$.val = &tree.CreateType{
+      TypeName: $6.unresolvedObjectName(),
+      Variety: tree.Composite,
+      IfNotExists: true,
+      CompositeTypeList: $9.compositeTypeList(),
+    }
+  }
   // Range types.
 | CREATE TYPE type_name AS RANGE error    { return unimplementedWithIssue(sqllex, 27791) }
   // Base (primitive) types.
@@ -9702,6 +9860,36 @@ enum_val_list:
 | enum_val_list ',' SCONST
   {
     $$.val = append($1.enumValueList(), tree.EnumValue($3))
+  }
+
+opt_composite_type_list:
+  composite_type_list
+  {
+    $$.val = $1.compositeTypeList()
+  }
+| /* EMPTY */
+  {
+    $$.val = []tree.CompositeTypeElem{}
+  }
+
+composite_type_list:
+  name simple_typename
+  {
+    $$.val = []tree.CompositeTypeElem{
+        tree.CompositeTypeElem{
+            Label: tree.Name($1),
+            Type: $2.typeReference(),
+        },
+    }
+  }
+| composite_type_list ',' name simple_typename
+  {
+    $$.val = append($1.compositeTypeList(),
+        tree.CompositeTypeElem{
+            Label: tree.Name($3),
+            Type: $4.typeReference(),
+        },
+    )
   }
 
 // %Help: CREATE INDEX - create a new index
@@ -9907,6 +10095,10 @@ opt_asc_desc:
 
 opt_index_visible:
   NOT VISIBLE
+  {
+    $$.val = true
+  }
+| INVISIBLE
   {
     $$.val = true
   }
@@ -14961,7 +15153,7 @@ interval_value:
     $$.val = &tree.CastExpr{
       Expr: tree.NewStrVal($2),
       Type: t,
-      // TODO(#sql-experience): This should be CastPrepend, but
+      // TODO(#sql-sessions): This should be CastPrepend, but
       // that does not work with parenthesized expressions
       // (using FmtAlwaysGroupExprs).
       SyntaxMode: tree.CastShort,
@@ -14979,7 +15171,7 @@ interval_value:
       Type: types.MakeInterval(
         types.IntervalTypeMetadata{Precision: prec, PrecisionIsSet: true},
       ),
-      // TODO(#sql-experience): This should be CastPrepend, but
+      // TODO(#sql-sessions): This should be CastPrepend, but
       // that does not work with parenthesized expressions
       // (using FmtAlwaysGroupExprs).
       SyntaxMode: tree.CastShort,
@@ -15461,6 +15653,7 @@ unreserved_keyword:
 | INSERT
 | INTO_DB
 | INVERTED
+| INVISIBLE
 | ISOLATION
 | INVOKER
 | JOB

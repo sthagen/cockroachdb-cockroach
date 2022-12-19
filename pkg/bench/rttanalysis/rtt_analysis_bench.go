@@ -33,8 +33,17 @@ import (
 // Reset must drop any remaining objects after the current database is dropped
 // so Setup and Stmt can be run again.
 type RoundTripBenchTestCase struct {
-	Name      string
-	Setup     string
+	Name string
+	// Setup runs before Stmt. The round-trips are not counted. It can consist of
+	// multiple semicolon-separated statements, and they'll all be executed in a
+	// transaction.
+	Setup string
+	// SetupEx is like Setup, but allows the test to separate different statements
+	// in different transactions. This is commonly used to lease descriptors on
+	// new tables so that the test is not bothered by the lease acquisition. The
+	// lease acquisition cannot be done in the same transaction as the one
+	// creating the table.
+	SetupEx   []string
 	Stmt      string
 	Reset     string
 	SkipIssue int
@@ -43,6 +52,9 @@ type RoundTripBenchTestCase struct {
 func runRoundTripBenchmark(b testingB, tests []RoundTripBenchTestCase, cc ClusterConstructor) {
 	for _, tc := range tests {
 		b.Run(tc.Name, func(b testingB) {
+			if tc.SkipIssue != 0 {
+				skip.WithIssue(b, tc.SkipIssue)
+			}
 			executeRoundTripTest(b, tc, cc)
 		})
 	}
@@ -133,8 +145,19 @@ func executeRoundTripTest(b testingB, tc RoundTripBenchTestCase, cc ClusterConst
 	// Do an extra iteration and don't record it in order to deal with effects of
 	// running it the first time.
 	for i := 0; i < b.N()+1; i++ {
-		sql.Exec(b, "CREATE DATABASE bench;")
+		sql.Exec(b, "CREATE DATABASE bench")
+		// Make sure the database descriptor is leased, so that tests don't count
+		// the leasing.
+		sql.Exec(b, "USE bench")
+		// Also force a lease on the "public" schema too.
+		sql.Exec(b, "CREATE TABLE bench.public.__dummy__()")
+		sql.Exec(b, "SELECT 1 FROM bench.public.__dummy__")
+		sql.Exec(b, "DROP TABLE bench.public.__dummy__")
+
 		sql.Exec(b, tc.Setup)
+		for _, s := range tc.SetupEx {
+			sql.Exec(b, s)
+		}
 		for _, statement := range statements {
 			cluster.clearStatementTrace(statement.SQL)
 		}
@@ -175,14 +198,18 @@ func executeRoundTripTest(b testingB, tc RoundTripBenchTestCase, cc ClusterConst
 
 	res := float64(roundTrips) / float64(b.N())
 
+	reportf := b.Errorf
+	if b.isBenchmark() {
+		reportf = b.Logf
+	}
 	if haveExp && !exp.matches(int(res)) && !*rewriteFlag {
-		b.Errorf(`%s: got %v, expected %v`, b.Name(), res, exp)
+		reportf(`%s: got %v, expected %v`, b.Name(), res, exp)
 		dir := getDir()
 		jaegerJSON, err := r.ToJaegerJSON(tc.Stmt, "", "n0")
 		require.NoError(b, err)
 		path := filepath.Join(dir, strings.Replace(b.Name(), "/", "_", -1)) + ".jaeger.json"
 		require.NoError(b, os.WriteFile(path, []byte(jaegerJSON), 0666))
-		b.Errorf("wrote jaeger trace to %s", path)
+		reportf("wrote jaeger trace to %s", path)
 	}
 	b.ReportMetric(res, roundTripsMetric)
 }

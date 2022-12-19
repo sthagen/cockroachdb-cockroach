@@ -13,9 +13,13 @@ package descs
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
@@ -27,7 +31,7 @@ func makeVirtualDescriptors(schemas catalog.VirtualSchemas) virtualDescriptors {
 	return virtualDescriptors{vs: schemas}
 }
 
-func (tc *virtualDescriptors) getSchemaByName(schemaName string) catalog.SchemaDescriptor {
+func (tc virtualDescriptors) getSchemaByName(schemaName string) catalog.SchemaDescriptor {
 	if tc.vs == nil {
 		return nil
 	}
@@ -37,7 +41,7 @@ func (tc *virtualDescriptors) getSchemaByName(schemaName string) catalog.SchemaD
 	return nil
 }
 
-func (tc *virtualDescriptors) getObjectByName(
+func (tc virtualDescriptors) getObjectByName(
 	schema string, object string, flags tree.ObjectLookupFlags,
 ) (isVirtual bool, _ catalog.Descriptor, _ error) {
 	if tc.vs == nil {
@@ -99,26 +103,27 @@ func (tc virtualDescriptors) getSchemaByID(
 	}
 }
 
-func (tc virtualDescriptors) maybeGetObjectNamesAndIDs(
-	scName string, dbDesc catalog.DatabaseDescriptor, flags tree.DatabaseListFlags,
-) (isVirtual bool, _ tree.TableNames, _ descpb.IDs) {
-	if tc.vs == nil {
-		return false, nil, nil
-	}
-	entry, ok := tc.vs.GetVirtualSchema(scName)
-	if !ok {
-		return false, nil, nil
-	}
-	names := make(tree.TableNames, 0, entry.NumTables())
-	IDs := make(descpb.IDs, 0, entry.NumTables())
-	schemaDesc := entry.Desc()
-	entry.VisitTables(func(table catalog.VirtualObject) {
-		name := tree.MakeTableNameWithSchema(
-			tree.Name(dbDesc.GetName()), tree.Name(schemaDesc.GetName()), tree.Name(table.Desc().GetName()))
-		name.ExplicitCatalog = flags.ExplicitPrefix
-		name.ExplicitSchema = flags.ExplicitPrefix
-		names = append(names, name)
-		IDs = append(IDs, table.Desc().GetID())
+func (tc virtualDescriptors) addAllToCatalog(mc nstree.MutableCatalog) {
+	_ = tc.vs.Visit(func(vd catalog.Descriptor, comment string) error {
+		mc.UpsertDescriptor(vd)
+		if vd.GetID() != keys.PublicSchemaID && !vd.Dropped() && !vd.SkipNamespace() {
+			mc.UpsertNamespaceEntry(vd, vd.GetID(), hlc.Timestamp{})
+		}
+		if comment == "" {
+			return nil
+		}
+		ck := catalogkeys.CommentKey{ObjectID: uint32(vd.GetID())}
+		switch vd.DescriptorType() {
+		case catalog.Database:
+			ck.CommentType = catalogkeys.DatabaseCommentType
+		case catalog.Schema:
+			ck.CommentType = catalogkeys.SchemaCommentType
+		case catalog.Table:
+			ck.CommentType = catalogkeys.TableCommentType
+		default:
+			return nil
+		}
+		mc.UpsertComment(ck, comment)
+		return nil
 	})
-	return true, names, IDs
 }

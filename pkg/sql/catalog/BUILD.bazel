@@ -5,14 +5,12 @@ load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 go_library(
     name = "catalog",
     srcs = [
-        "accessor.go",
         "catalog.go",
         "descriptor.go",
         "descriptor_id_set.go",
         "errors.go",
         "metadata.go",
         "post_deserialization_changes.go",
-        "privilege_object.go",
         "schema.go",
         "system_table.go",
         "table_col_map.go",
@@ -36,7 +34,6 @@ go_library(
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",
         "//pkg/sql/schemachanger/scpb",
-        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util",
@@ -75,6 +72,9 @@ go_test(
 disallowed_imports_test(
     "catalog",
     disallow_cdeps = True,
+    disallowed_list = [
+        "//pkg/sql/sem/eval",
+    ],
 )
 
 get_x_data(name = "get_x_data")

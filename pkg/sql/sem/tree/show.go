@@ -777,13 +777,18 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 
 // ShowTenant represents a SHOW TENANT statement.
 type ShowTenant struct {
-	Name Name
+	Name            Expr
+	WithReplication bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowTenant) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW TENANT ")
-	ctx.FormatNode(&node.Name)
+	ctx.FormatNode(node.Name)
+
+	if node.WithReplication {
+		ctx.WriteString(" WITH REPLICATION STATUS")
+	}
 }
 
 // ShowHistogram represents a SHOW HISTOGRAM statement.
@@ -845,6 +850,10 @@ const (
 	// ScheduledSchemaTelemetryExecutor is an executor responsible for the logging
 	// of schema telemetry.
 	ScheduledSchemaTelemetryExecutor
+
+	// ScheduledChangefeedExecutor is an executor responsible for
+	// the execution of the scheduled changefeeds.
+	ScheduledChangefeedExecutor
 )
 
 var scheduleExecutorInternalNames = map[ScheduledJobExecutorType]string{
@@ -853,6 +862,7 @@ var scheduleExecutorInternalNames = map[ScheduledJobExecutorType]string{
 	ScheduledSQLStatsCompactionExecutor: "scheduled-sql-stats-compaction-executor",
 	ScheduledRowLevelTTLExecutor:        "scheduled-row-level-ttl-executor",
 	ScheduledSchemaTelemetryExecutor:    "scheduled-schema-telemetry-executor",
+	ScheduledChangefeedExecutor:         "scheduled-changefeed-executor",
 }
 
 // InternalName returns an internal executor name.
@@ -872,6 +882,8 @@ func (t ScheduledJobExecutorType) UserName() string {
 		return "ROW LEVEL TTL"
 	case ScheduledSchemaTelemetryExecutor:
 		return "SCHEMA TELEMETRY"
+	case ScheduledChangefeedExecutor:
+		return "CHANGEFEED"
 	}
 	return "unsupported-executor"
 }

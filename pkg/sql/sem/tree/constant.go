@@ -64,6 +64,11 @@ func isConstant(expr Expr) bool {
 	return ok
 }
 
+func isPlaceholder(expr Expr) bool {
+	_, isPlaceholder := StripParens(expr).(*Placeholder)
+	return isPlaceholder
+}
+
 func typeCheckConstant(
 	ctx context.Context, semaCtx *SemaContext, c Constant, desired *types.T,
 ) (ret TypedExpr, err error) {
@@ -340,7 +345,7 @@ func (expr *NumVal) ResolveAsType(
 			if strings.EqualFold(expr.origString, "NaN") {
 				// We need to check NaN separately since expr.value is
 				// unknownVal for NaN.
-				// TODO(sql-experience): unknownVal is also used for +Inf and
+				// TODO(sql-sessions): unknownVal is also used for +Inf and
 				// -Inf, so we may need to handle those in the future too.
 				expr.resFloat = DFloat(math.NaN())
 			} else {
@@ -604,7 +609,11 @@ func (expr *StrVal) ResolveAsType(
 			expr.resBytes = DBytes(expr.s)
 			return &expr.resBytes, nil
 		case types.EnumFamily:
-			return MakeDEnumFromPhysicalRepresentation(typ, []byte(expr.s))
+			e, err := MakeDEnumFromPhysicalRepresentation(typ, []byte(expr.s))
+			if err != nil {
+				return nil, err
+			}
+			return NewDEnum(e), nil
 		case types.UuidFamily:
 			return ParseDUuidFromBytes([]byte(expr.s))
 		case types.StringFamily:

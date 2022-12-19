@@ -3712,7 +3712,8 @@ func AsJSON(
 	case *DTimestamp:
 		// This is RFC3339Nano, but without the TZ fields.
 		return json.FromString(formatTime(t.UTC(), "2006-01-02T15:04:05.999999999")), nil
-	case *DDate, *DUuid, *DOid, *DInterval, *DBytes, *DIPAddr, *DTime, *DTimeTZ, *DBitArray, *DBox2D:
+	case *DDate, *DUuid, *DOid, *DInterval, *DBytes, *DIPAddr, *DTime, *DTimeTZ, *DBitArray, *DBox2D,
+		*DTSVector, *DTSQuery:
 		return json.FromString(AsStringWithFlags(t, FmtBareStrings, FmtDataConversionConfig(dcc))), nil
 	case *DGeometry:
 		return json.FromSpatialObject(t.Geometry.SpatialObject(), geo.DefaultGeoJSONDecimalDigits)
@@ -4935,18 +4936,35 @@ func GetEnumComponentsFromPhysicalRep(typ *types.T, rep []byte) ([]byte, string,
 	return meta.PhysicalRepresentations[idx], meta.LogicalRepresentations[idx], nil
 }
 
+// GetEnumComponentsFromLogicalRep returns the physical and logical components
+// for an enum of the requested type. It returns an error if it cannot find a
+// matching logical representation.
+func GetEnumComponentsFromLogicalRep(typ *types.T, rep string) ([]byte, string, error) {
+	idx, err := typ.EnumGetIdxOfLogical(rep)
+	if err != nil {
+		return nil, "", err
+	}
+	meta := typ.TypeMeta.EnumData
+	return meta.PhysicalRepresentations[idx], meta.LogicalRepresentations[idx], nil
+}
+
+// NewDEnum initializes a new DEnum from its argument.
+func NewDEnum(e DEnum) *DEnum {
+	return &e
+}
+
 // MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
 // and the input physical representation.
-func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) (*DEnum, error) {
+func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) (DEnum, error) {
 	// Return a nice error if the input requested type is types.AnyEnum.
 	if typ.Oid() == oid.T_anyenum {
-		return nil, errors.New("cannot create enum of unspecified type")
+		return DEnum{}, errors.New("cannot create enum of unspecified type")
 	}
 	phys, log, err := GetEnumComponentsFromPhysicalRep(typ, rep)
 	if err != nil {
-		return nil, err
+		return DEnum{}, err
 	}
-	return &DEnum{
+	return DEnum{
 		EnumTyp:     typ,
 		PhysicalRep: phys,
 		LogicalRep:  log,
@@ -4956,24 +4974,18 @@ func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) (*DEnum, erro
 // MakeDEnumFromLogicalRepresentation creates a DEnum of the input type
 // and input logical representation. It returns an error if the input
 // logical representation is invalid.
-func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error) {
+func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (DEnum, error) {
 	// Return a nice error if the input requested type is types.AnyEnum.
 	if typ.Oid() == oid.T_anyenum {
-		return nil, errors.New("cannot create enum of unspecified type")
+		return DEnum{}, errors.New("cannot create enum of unspecified type")
 	}
 	// Take a pointer into the enum metadata rather than holding on
 	// to a pointer to the input string.
 	idx, err := typ.EnumGetIdxOfLogical(rep)
 	if err != nil {
-		return nil, err
+		return DEnum{}, err
 	}
-	// If this enum member is read only, we cannot construct it from the logical
-	// representation. This is to ensure that it will not be written until all
-	// nodes in the cluster are able to decode the physical representation.
-	if typ.TypeMeta.EnumData.IsMemberReadOnly[idx] {
-		return nil, errors.Newf("enum value %q is not yet public", rep)
-	}
-	return &DEnum{
+	return DEnum{
 		EnumTyp:     typ,
 		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
 		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
@@ -5668,8 +5680,11 @@ func NewDefaultDatum(collationEnv *CollationEnvironment, t *types.T) (d Datum, e
 			)
 		}
 		// We fall back to using the smallest enum value during the dropping period.
-		return MakeDEnumFromPhysicalRepresentation(t,
-			t.TypeMeta.EnumData.PhysicalRepresentations[0])
+		e, err := MakeDEnumFromPhysicalRepresentation(t, t.TypeMeta.EnumData.PhysicalRepresentations[0])
+		if err != nil {
+			return nil, err
+		}
+		return NewDEnum(e), nil
 	default:
 		return nil, errors.AssertionFailedf("unhandled type %v", t.SQLString())
 	}

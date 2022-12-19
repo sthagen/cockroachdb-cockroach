@@ -727,7 +727,7 @@ func TestDescriptorCache(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			found := cat.LookupDescriptorEntry(mut.ID)
+			found := cat.LookupDescriptor(mut.ID)
 			require.NotEmpty(t, found)
 			require.Equal(t, mut.ImmutableCopy().DescriptorProto(), found.DescriptorProto())
 			return nil
@@ -898,6 +898,10 @@ func formatCatalog(descs []catalog.Descriptor) string {
 		"parent\tschema\tname\tid\tkind\tversion\tdropped\tpublic\n",
 	)
 	for _, d := range descs {
+		if d.DescriptorType() != catalog.Database && d.GetParentID() == descpb.InvalidID {
+			// Skip virtual schemas and virtual tables.
+			continue
+		}
 		_, _ = fmt.Fprintf(tr,
 			"%d\t%d\t%s\t%d\t%s\t%d\t%v\t%v\n",
 			d.GetParentID(), d.GetParentSchemaID(), d.GetName(),
@@ -990,7 +994,8 @@ func TestHydrateCatalog(t *testing.T) {
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
 	tdb.Exec(t, `CREATE TYPE db.schema.typ AS ENUM ('a', 'b')`)
-	tdb.Exec(t, `CREATE TABLE db.schema.table(x db.schema.typ)`)
+	tdb.Exec(t, `CREATE TYPE db.schema.ctyp AS (a INT, b TEXT)`)
+	tdb.Exec(t, `CREATE TABLE db.schema.table(x db.schema.typ, y db.schema.ctyp)`)
 
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	t.Run("invalid catalog", func(t *testing.T) {
@@ -998,30 +1003,32 @@ func TestHydrateCatalog(t *testing.T) {
 		deleteDescriptor := func(name string) catalogTamperFn {
 			return func(cat nstree.Catalog) nstree.Catalog {
 				var descToDelete catid.DescID
-				_ = cat.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+				_ = cat.ForEachDescriptor(func(desc catalog.Descriptor) error {
 					if desc.GetName() == name {
 						descToDelete = desc.GetID()
 					}
 					return nil
 				})
 				mutCat := nstree.MutableCatalog{Catalog: cat}
-				mutCat.DeleteDescriptorEntry(descToDelete)
+				mutCat.DeleteByID(descToDelete)
 				return mutCat.Catalog
 			}
 		}
-		replaceTypeDescWithNonTypeDesc := func(cat nstree.Catalog) nstree.Catalog {
-			var typeDescID catid.DescID
-			_ = cat.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
-				if desc.GetName() == "typ" {
-					typeDescID = desc.GetID()
-				}
-				return nil
-			})
-			// Make a dummy database descriptor to replace the type descriptor.
-			dbDesc := dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: typeDescID}).BuildImmutable()
-			mutCat := nstree.MutableCatalog{Catalog: cat}
-			mutCat.UpsertDescriptorEntry(dbDesc)
-			return mutCat.Catalog
+		replaceTypeDescWithNonTypeDesc := func(name string) catalogTamperFn {
+			return func(cat nstree.Catalog) nstree.Catalog {
+				var typeDescID catid.DescID
+				_ = cat.ForEachDescriptor(func(desc catalog.Descriptor) error {
+					if desc.GetName() == name {
+						typeDescID = desc.GetID()
+					}
+					return nil
+				})
+				// Make a dummy database descriptor to replace the type descriptor.
+				dbDesc := dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: typeDescID}).BuildImmutable()
+				mutCat := nstree.MutableCatalog{Catalog: cat}
+				mutCat.UpsertDescriptor(dbDesc)
+				return mutCat.Catalog
+			}
 		}
 		type testCase struct {
 			tamper        catalogTamperFn
@@ -1029,14 +1036,16 @@ func TestHydrateCatalog(t *testing.T) {
 		}
 		for _, tc := range []testCase{
 			{deleteDescriptor("typ"), "type \"[107]\" does not exist"},
+			{deleteDescriptor("ctyp"), "type \"[109]\" does not exist"},
 			{deleteDescriptor("db"), "database \"[104]\" does not exist"},
 			{deleteDescriptor("schema"), "unknown schema \"[106]\""},
-			{replaceTypeDescWithNonTypeDesc, "referenced type ID 107: descriptor is a *dbdesc.immutable: unexpected descriptor type"},
+			{replaceTypeDescWithNonTypeDesc("typ"), "referenced type ID 107: descriptor is a *dbdesc." + "immutable: unexpected descriptor type"},
+			{replaceTypeDescWithNonTypeDesc("ctyp"), "referenced type ID 109: descriptor is a *dbdesc." + "" + "immutable: unexpected descriptor type"},
 		} {
 			require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 				ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 			) error {
-				cat, err := descriptors.Direct().GetCatalogUnvalidated(ctx, txn)
+				cat, err := descriptors.GetAllFromStorageUnvalidated(ctx, txn)
 				if err != nil {
 					return err
 				}
@@ -1052,15 +1061,15 @@ func TestHydrateCatalog(t *testing.T) {
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 		) error {
-			cat, err := descriptors.Direct().GetCatalogUnvalidated(ctx, txn)
+			cat, err := descriptors.GetAllFromStorageUnvalidated(ctx, txn)
 			if err != nil {
 				return err
 			}
 			mc := nstree.MutableCatalog{Catalog: cat}
 			require.NoError(t, descs.HydrateCatalog(ctx, mc))
 			tbl := desctestutils.TestingGetTableDescriptor(txn.DB(), keys.SystemSQLCodec, "db", "schema", "table")
-			tblDesc := cat.LookupDescriptorEntry(tbl.GetID()).(catalog.TableDescriptor)
-			expected := types.UserDefinedTypeMetadata{
+			tblDesc := cat.LookupDescriptor(tbl.GetID()).(catalog.TableDescriptor)
+			expectedEnum := types.UserDefinedTypeMetadata{
 				Name: &types.UserDefinedTypeName{
 					Catalog:        "db",
 					ExplicitSchema: true,
@@ -1074,9 +1083,22 @@ func TestHydrateCatalog(t *testing.T) {
 					IsMemberReadOnly:        []bool{false, false},
 				},
 			}
-			actual := tblDesc.UserDefinedTypeColumns()[0].GetType().TypeMeta
+			expectedComposite := types.UserDefinedTypeMetadata{
+				Name: &types.UserDefinedTypeName{
+					Catalog:        "db",
+					ExplicitSchema: true,
+					Schema:         "schema",
+					Name:           "ctyp",
+				},
+				Version: 2,
+			}
+			actualEnum := tblDesc.UserDefinedTypeColumns()[0].GetType().TypeMeta
+			actualComposite := tblDesc.UserDefinedTypeColumns()[1].GetType()
 			// Verify that the table descriptor was hydrated.
-			require.Equal(t, expected, actual)
+			require.Equal(t, expectedEnum, actualEnum)
+			require.Equal(t, expectedComposite, actualComposite.TypeMeta)
+			require.Equal(t, []*types.T{types.Int, types.String}, actualComposite.TupleContents())
+			require.Equal(t, []string{"a", "b"}, actualComposite.TupleLabels())
 			return nil
 		}))
 	})
@@ -1134,7 +1156,7 @@ SELECT id
 			if err != nil {
 				return err
 			}
-			require.Equal(t, tabImm, all.LookupDescriptorEntry(tabImm.GetID()))
+			require.Equal(t, tabImm, all.LookupDescriptor(tabImm.GetID()))
 			return nil
 		}
 

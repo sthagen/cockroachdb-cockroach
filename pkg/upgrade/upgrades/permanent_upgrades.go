@@ -52,39 +52,24 @@ func addRootUser(
 
 	// Upsert the role membership into the table. We intentionally override any existing entry.
 	const upsertMembership = `
-          UPSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, true)
+          UPSERT INTO system.role_members ("role", "member", "isAdmin", role_id, member_id) VALUES ($1, $2, true, $3, $4)
           `
 	_, err = deps.InternalExecutor.Exec(
-		ctx, "addRootToAdminRole", nil /* txn */, upsertMembership, username.AdminRole, username.RootUser)
-	return err
+		ctx, "addRootToAdminRole", nil /* txn */, upsertMembership, username.AdminRole, username.RootUser, username.AdminRoleID, username.RootUserID)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func optInToDiagnosticsStatReporting(
 	ctx context.Context, _ clusterversion.ClusterVersion, deps upgrade.TenantDeps,
 ) error {
 	// We're opting-out of the automatic opt-in. See discussion in updates.go.
-	if cluster.TelemetryOptOut() {
+	if cluster.TelemetryOptOut {
 		return nil
 	}
-
-	// Check whether this is a cluster upgraded from a pre-23.1 version and the
-	// old startupmigration dealing with enabling diagnostics has already run. If
-	// it did, there's nothing for us to do - in particular, we don't want to
-	// enable diagnostics if the cluster was created with the TelemetryOptOut()
-	// env var.
-	{
-		codec := deps.Codec
-		oldMigrationName := "enable diagnostics reporting"
-		migrationKey := append(codec.StartupMigrationKeyPrefix(), roachpb.RKey(oldMigrationName)...)
-		kv, err := deps.DB.Get(ctx, migrationKey)
-		if err != nil {
-			return err
-		}
-		if kv.Exists() {
-			return nil
-		}
-	}
-
 	_, err := deps.InternalExecutor.Exec(
 		ctx, "optInToDiagnosticsStatReporting", nil, /* txn */
 		`SET CLUSTER SETTING diagnostics.reporting.enabled = true`)
@@ -156,7 +141,7 @@ func updateSystemLocationData(
 	// If so, we don't want to do anything.
 	row, err := deps.InternalExecutor.QueryRowEx(ctx, "update-system-locations",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		`SELECT count(*) FROM system.locations`)
 	if err != nil {
 		return err

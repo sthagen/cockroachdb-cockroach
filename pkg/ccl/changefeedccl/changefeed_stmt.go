@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -80,6 +79,7 @@ type annotatedChangefeedStatement struct {
 	*tree.CreateChangefeed
 	originalSpecs       map[tree.ChangefeedTarget]jobspb.ChangefeedTargetSpecification
 	alterChangefeedAsOf hlc.Timestamp
+	CreatedByInfo       *jobs.CreatedByInfo
 }
 
 func getChangefeedStatement(stmt tree.Statement) *annotatedChangefeedStatement {
@@ -262,18 +262,43 @@ func changefeedPlanHook(
 		{
 			var ptr *ptpb.Record
 			codec := p.ExecCfg().Codec
-
-			activeTimestampProtection := changefeedbase.ActiveProtectedTimestampsEnabled.Get(&p.ExecCfg().Settings.SV)
-			initialScanType, err := opts.GetInitialScanType()
-			if err != nil {
-				return err
-			}
-			shouldProtectTimestamp := activeTimestampProtection || (initialScanType != changefeedbase.NoInitialScan)
-			if shouldProtectTimestamp {
-				ptr = createProtectedTimestampRecord(ctx, codec, jobID, AllTargets(details), details.StatementTime, progress.GetChangefeed())
-			}
+			ptr = createProtectedTimestampRecord(
+				ctx,
+				codec,
+				jobID,
+				AllTargets(details),
+				details.StatementTime,
+				progress.GetChangefeed(),
+			)
 
 			jr.Progress = *progress.GetChangefeed()
+
+			if changefeedStmt.CreatedByInfo != nil {
+				// This changefeed statement invoked by the scheduler.  As such, the scheduler
+				// must have specified transaction to use, and is responsible for committing
+				// transaction.
+
+				txn := p.ExtendedEvalContext().Txn
+				_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(ctx, *jr, jobID, txn)
+				if err != nil {
+					return err
+				}
+
+				if ptr != nil {
+					if err := p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, ptr); err != nil {
+						return err
+					}
+				}
+
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case resultsCh <- tree.Datums{
+					tree.NewDInt(tree.DInt(jobID)),
+				}:
+					return nil
+				}
+			}
 
 			if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, *jr); err != nil {
@@ -603,7 +628,8 @@ func createChangefeedJobRecord(
 			}
 			return sqlDescIDs
 		}(),
-		Details: details,
+		Details:   details,
+		CreatedBy: changefeedStmt.CreatedByInfo,
 	}
 
 	return jr, err
@@ -1151,18 +1177,22 @@ func getQualifiedTableNameObj(
 	ctx context.Context, execCfg *sql.ExecutorConfig, txn *kv.Txn, desc catalog.TableDescriptor,
 ) (tree.TableName, error) {
 	col := execCfg.CollectionFactory.NewCollection(ctx)
-	dbDesc, err := col.Direct().MustGetDatabaseDescByID(ctx, txn, desc.GetParentID())
+	flags := tree.CommonLookupFlags{
+		AvoidLeased:    true,
+		IncludeDropped: true,
+		IncludeOffline: true,
+	}
+	_, db, err := col.GetImmutableDatabaseByID(ctx, txn, desc.GetParentID(), flags)
 	if err != nil {
 		return tree.TableName{}, err
 	}
-	schemaID := desc.GetParentSchemaID()
-	schemaName, err := resolver.ResolveSchemaNameByID(ctx, txn, execCfg.Codec, dbDesc, schemaID)
+	sc, err := col.GetImmutableSchemaByID(ctx, txn, desc.GetParentSchemaID(), flags)
 	if err != nil {
 		return tree.TableName{}, err
 	}
 	tbName := tree.MakeTableNameWithSchema(
-		tree.Name(dbDesc.GetName()),
-		tree.Name(schemaName),
+		tree.Name(db.GetName()),
+		tree.Name(sc.GetName()),
 		tree.Name(desc.GetName()),
 	)
 	return tbName, nil

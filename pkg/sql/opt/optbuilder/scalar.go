@@ -539,7 +539,7 @@ func (b *Builder) buildFunction(
 	}
 
 	overload := f.ResolvedOverload()
-	if overload.Body != "" {
+	if overload.IsUDF {
 		return b.buildUDF(f, def, inScope, outScope, outCol, colRefs)
 	}
 
@@ -694,7 +694,7 @@ func (b *Builder) buildUDF(
 			// its type matches the function return type.
 			returnCol := physProps.Presentation[0].ID
 			returnColMeta := b.factory.Metadata().ColumnMeta(returnCol)
-			if returnColMeta.Type != f.ResolvedType() {
+			if !returnColMeta.Type.Identical(f.ResolvedType()) {
 				if !cast.ValidCast(returnColMeta.Type, f.ResolvedType(), cast.ContextAssignment) {
 					panic(sqlerrors.NewInvalidAssignmentCastError(
 						returnColMeta.Type, f.ResolvedType(), returnColMeta.Alias))

@@ -55,7 +55,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/sql/cacheutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -93,6 +92,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilegecache"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
@@ -1334,7 +1334,7 @@ type ExecutorConfig struct {
 	DescIDGenerator eval.DescIDGenerator
 
 	// SyntheticPrivilegeCache stores synthetic privileges in an in-memory cache.
-	SyntheticPrivilegeCache *cacheutil.Cache
+	SyntheticPrivilegeCache *syntheticprivilegecache.Cache
 
 	// RangeStatsFetcher is used to fetch RangeStats.
 	RangeStatsFetcher eval.RangeStatsFetcher
@@ -1342,7 +1342,7 @@ type ExecutorConfig struct {
 	// EventsExporter is the client for the Observability Service.
 	EventsExporter obs.EventsExporter
 
-	// NodeDescs stores node descriptors in an in-memory cache.
+	// NodeDescs stores {Store,Node}Descriptors in an in-memory cache.
 	NodeDescs kvcoord.NodeDescStore
 }
 
@@ -1405,7 +1405,7 @@ type ExecutorTestingKnobs struct {
 
 	// BeforeExecute is called by the Executor before plan execution. It is useful
 	// for synchronizing statement execution.
-	BeforeExecute func(ctx context.Context, stmt string)
+	BeforeExecute func(ctx context.Context, stmt string, descriptors *descs.Collection)
 
 	// AfterExecute is like StatementFilter, but it runs in the same goroutine of the
 	// statement.
@@ -1633,6 +1633,11 @@ type StreamingTestingKnobs struct {
 	// BeforeIngestionStart allows blocking the stream ingestion job
 	// before a stream ingestion happens.
 	BeforeIngestionStart func(ctx context.Context) error
+
+	// AfterReplicationFlowPlan allows the caller to inspect the ingestion and
+	// frontier specs generated for the replication job.
+	AfterReplicationFlowPlan func([]*execinfrapb.StreamIngestionDataSpec,
+		*execinfrapb.StreamIngestionFrontierSpec)
 
 	// OverrideReplicationTTLSeconds will override the default value of the
 	// `ReplicationTTLSeconds` field on the StreamIngestion job details.
@@ -3370,6 +3375,10 @@ func (m *sessionDataMutator) SetEnforceHomeRegion(val bool) {
 
 func (m *sessionDataMutator) SetVariableInequalityLookupJoinEnabled(val bool) {
 	m.data.VariableInequalityLookupJoinEnabled = val
+}
+
+func (m *sessionDataMutator) SetExperimentalHashGroupJoinEnabled(val bool) {
+	m.data.ExperimentalHashGroupJoinEnabled = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

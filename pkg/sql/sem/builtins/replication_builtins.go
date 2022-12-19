@@ -12,7 +12,6 @@ package builtins
 
 import (
 	"context"
-	gojson "encoding/json"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
@@ -46,8 +45,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"job_id", types.Int},
-				{"cutover_ts", types.TimestampTZ},
+				{Name: "job_id", Typ: types.Int},
+				{Name: "cutover_ts", Typ: types.TimestampTZ},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -85,34 +84,14 @@ var replicationBuiltins = map[string]builtinDefinition{
 
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"job_id", types.Int},
+				{Name: "job_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				if args[0] == tree.DNull {
-					return tree.DNull, errors.New("job_id cannot be specified with null argument")
-				}
-				mgr, err := evalCtx.StreamManagerFactory.GetStreamIngestManager(ctx)
-				if err != nil {
-					return nil, err
-				}
-				ingestionJobID := int64(tree.MustBeDInt(args[0]))
-				stats, err := mgr.GetStreamIngestionStats(ctx, jobspb.JobID(ingestionJobID))
-				if err != nil {
-					return nil, err
-				}
-				jsonStats, err := gojson.Marshal(stats)
-				if err != nil {
-					return nil, err
-				}
-				jsonDatum, err := tree.ParseDJSON(string(jsonStats))
-				if err != nil {
-					return nil, err
-				}
-				return jsonDatum, nil
+				// Keeping this builtin as 'unimplemented' in order to reserve the oid.
+				return tree.DNull, errors.New("unimplemented")
 			},
-			Info: "This function can be used on the ingestion side to get a statistics summary " +
-				"of a stream ingestion job in json format.",
+			Info:       "DEPRECATED, consider using `SHOW TENANT name WITH REPLICATION STATUS`",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -125,30 +104,14 @@ var replicationBuiltins = map[string]builtinDefinition{
 
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"job_id", types.Int},
+				{Name: "job_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				if args[0] == tree.DNull {
-					return tree.DNull, errors.New("job_id cannot be specified with null argument")
-				}
-				mgr, err := evalCtx.StreamManagerFactory.GetStreamIngestManager(ctx)
-				if err != nil {
-					return nil, err
-				}
-				ingestionJobID := int64(tree.MustBeDInt(args[0]))
-				stats, err := mgr.GetStreamIngestionStats(ctx, jobspb.JobID(ingestionJobID))
-				if err != nil {
-					return nil, err
-				}
-				rawStatus, err := protoutil.Marshal(stats)
-				if err != nil {
-					return nil, err
-				}
-				return tree.NewDBytes(tree.DBytes(rawStatus)), nil
+				// Keeping this builtin as 'unimplemented' in order to reserve the oid.
+				return tree.DNull, errors.New("unimplemented")
 			},
-			Info: "This function can be used on the ingestion side to get a statistics summary " +
-				"of a stream ingestion job in protobuf format.",
+			Info:       "DEPRECATED, consider using `SHOW TENANT name WITH REPLICATION STATUS`",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -161,20 +124,24 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"tenant_name", types.String},
+				{Name: "tenant_name", Typ: types.String},
 			},
-			ReturnType: tree.FixedReturnType(types.Int),
+			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				mgr, err := evalCtx.StreamManagerFactory.GetReplicationStreamManager(ctx)
 				if err != nil {
 					return nil, err
 				}
 				tenantName := string(tree.MustBeDString(args[0]))
-				jobID, err := mgr.StartReplicationStream(ctx, roachpb.TenantName(tenantName))
+				replicationProducerSpec, err := mgr.StartReplicationStream(ctx, roachpb.TenantName(tenantName))
 				if err != nil {
 					return nil, err
 				}
-				return tree.NewDInt(tree.DInt(jobID)), err
+				rawReplicationProducerSpec, err := protoutil.Marshal(&replicationProducerSpec)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDBytes(tree.DBytes(rawReplicationProducerSpec)), err
 			},
 			Info: "This function can be used on the producer side to start a replication stream for " +
 				"the specified tenant. The returned stream ID uniquely identifies created stream. " +
@@ -191,8 +158,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"stream_id", types.Int},
-				{"frontier_ts", types.String},
+				{Name: "stream_id", Typ: types.Int},
+				{Name: "frontier_ts", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -233,8 +200,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		makeGeneratorOverload(
 			tree.ParamTypes{
-				{"stream_id", types.Int},
-				{"partition_spec", types.Bytes},
+				{Name: "stream_id", Typ: types.Int},
+				{Name: "partition_spec", Typ: types.Bytes},
 			},
 			types.MakeLabeledTuple(
 				[]*types.T{types.Bytes},
@@ -262,7 +229,7 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"stream_id", types.Int},
+				{Name: "stream_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -296,8 +263,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"stream_id", types.Int},
-				{"successful_ingestion", types.Bool},
+				{Name: "stream_id", Typ: types.Int},
+				{Name: "successful_ingestion", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {

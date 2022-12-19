@@ -133,8 +133,8 @@ type Server struct {
 
 	http            *httpServer
 	adminAuthzCheck *adminPrivilegeChecker
-	admin           *adminServer
-	status          *statusServer
+	admin           *systemAdminServer
+	status          *systemStatusServer
 	drain           *drainServer
 	decomNodeMap    *decommissioningNodeMap
 	authentication  *authenticationServer
@@ -781,11 +781,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		makePlanner: nil,
 	}
 
-	// Instantiate the admin API server.
-	sAdmin := newAdminServer(
-		lateBoundServer, cfg.Settings, adminAuthzCheck, internalExecutor,
-	)
-
 	// Instantiate the HTTP server.
 	// These callbacks help us avoid a dependency on gossip in httpServer.
 	parseNodeIDFn := func(s string) (roachpb.NodeID, bool, error) {
@@ -806,13 +801,22 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	remoteFlowRunnerAcc := sqlMonitorAndMetrics.rootSQLMemoryMonitor.MakeBoundAccount()
 	remoteFlowRunner := flowinfra.NewRemoteFlowRunner(cfg.AmbientCtx, stopper, &remoteFlowRunnerAcc)
 
+	serverIterator := &kvFanoutClient{
+		gossip:       g,
+		rpcCtx:       rpcContext,
+		db:           db,
+		nodeLiveness: nodeLiveness,
+		clock:        clock,
+		st:           st,
+		ambientCtx:   cfg.AmbientCtx,
+	}
+
 	// Instantiate the status API server.
-	sStatus := newStatusServer(
+	sStatus := newSystemStatusServer(
 		cfg.AmbientCtx,
 		st,
 		cfg.Config,
 		adminAuthzCheck,
-		sAdmin,
 		db,
 		g,
 		recorder,
@@ -825,7 +829,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		closedSessionCache,
 		remoteFlowRunner,
 		internalExecutor,
+		serverIterator,
 		spanConfig.reporter,
+		clock,
 	)
 
 	// Instantiate the KV prober.
@@ -926,6 +932,29 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Create the authentication RPC server (login/logout).
 	sAuth := newAuthenticationServer(cfg.Config, sqlServer)
 
+	// Create a drain server.
+	drain := newDrainServer(cfg.BaseConfig, stopper, stopTrigger, grpcServer, sqlServer)
+	drain.setNode(node, nodeLiveness)
+
+	// Instantiate the admin API server.
+	sAdmin := newSystemAdminServer(
+		sqlServer,
+		cfg.Settings,
+		adminAuthzCheck,
+		internalExecutor,
+		cfg.BaseConfig.AmbientCtx,
+		recorder,
+		db,
+		nodeLiveness,
+		rpcContext,
+		serverIterator,
+		clock,
+		distSender,
+		grpcServer,
+		drain,
+		lateBoundServer,
+	)
+
 	// Connect the various servers to RPC.
 	for i, gw := range []grpcGatewayServer{sAdmin, sStatus, sAuth, &sTS} {
 		if reflect.ValueOf(gw).IsNil() {
@@ -963,10 +992,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			return errors.Newf("server found with type %T", d)
 		},
 	)
-
-	// Create a drain server.
-	drain := newDrainServer(cfg.BaseConfig, stopper, stopTrigger, grpcServer, sqlServer)
-	drain.setNode(node, nodeLiveness)
 
 	*lateBoundServer = Server{
 		nodeIDContainer:        nodeIDContainer,
@@ -1175,12 +1200,8 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// startRPCServer (and for the loopback grpc-gw connection).
 	var initServer *initServer
 	{
-		dialOpts, err := s.rpcContext.GRPCDialOptions()
-		if err != nil {
-			return err
-		}
-
-		initConfig := newInitServerConfig(ctx, s.cfg, dialOpts)
+		getDialOpts := s.rpcContext.GRPCDialOptions
+		initConfig := newInitServerConfig(ctx, s.cfg, getDialOpts)
 		inspectedDiskState, err := inspectEngines(
 			ctx,
 			s.engines,
@@ -1254,10 +1275,13 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// and dispatches the server worker for the RPC.
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
-	pgL, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, s.cfg.BaseConfig, s.stopper, s.grpc)
+	pgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, s.cfg.BaseConfig, s.stopper, s.grpc)
 	if err != nil {
 		return err
 	}
+
+	// Tell the RPC context how to connect in-memory.
+	s.rpcContext.SetLoopbackDialer(rpcLoopbackDialFn)
 
 	if s.cfg.TestingKnobs.Server != nil {
 		knobs := s.cfg.TestingKnobs.Server.(*TestingKnobs)
@@ -1724,7 +1748,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	}
 
 	// If enabled, start reporting diagnostics.
-	if s.cfg.StartDiagnosticsReporting && !cluster.TelemetryOptOut() {
+	if s.cfg.StartDiagnosticsReporting && !cluster.TelemetryOptOut {
 		s.startDiagnostics(workersCtx)
 	}
 

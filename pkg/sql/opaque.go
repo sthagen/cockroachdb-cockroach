@@ -385,10 +385,12 @@ func init() {
 		// CCL statements (without Export which has an optimizer operator).
 		&tree.AlterBackup{},
 		&tree.AlterBackupSchedule{},
+		&tree.AlterTenantReplication{},
 		&tree.Backup{},
 		&tree.ShowBackup{},
 		&tree.Restore{},
 		&tree.CreateChangefeed{},
+		&tree.ScheduledChangefeed{},
 		&tree.Import{},
 		&tree.ScheduledBackup{},
 		&tree.CreateTenantFromReplication{},

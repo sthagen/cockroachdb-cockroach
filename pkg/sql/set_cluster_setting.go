@@ -68,19 +68,17 @@ func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, act
 	// First check system privileges.
 	hasModify := false
 	hasView := false
-	if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
-		if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING); err == nil {
-			hasModify = true
+	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING); err == nil {
+		hasModify = true
+		hasView = true
+	} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
+		return err
+	}
+	if !hasView {
+		if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING); err == nil {
 			hasView = true
 		} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
 			return err
-		}
-		if !hasView {
-			if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING); err == nil {
-				hasView = true
-			} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
-				return err
-			}
 		}
 	}
 
@@ -384,7 +382,7 @@ func writeDefaultSettingValue(
 	expectedEncodedValue = setting.EncodedDefault()
 	_, err = execCfg.InternalExecutor.ExecEx(
 		ctx, "reset-setting", txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		"DELETE FROM system.settings WHERE name = $1", name,
 	)
 	return reportedValue, expectedEncodedValue, err
@@ -426,7 +424,7 @@ func writeNonDefaultSettingValue(
 		// Modifying another setting than the version.
 		if _, err = execCfg.InternalExecutor.ExecEx(
 			ctx, "update-setting", txn,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 			name, encoded, setting.Typ(),
 		); err != nil {
@@ -457,7 +455,7 @@ func setVersionSetting(
 	// value change is valid.
 	datums, err := execCfg.InternalExecutor.QueryRowEx(
 		ctx, "retrieve-prev-setting", txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		"SELECT value FROM system.settings WHERE name = $1", name,
 	)
 	if err != nil {
@@ -511,7 +509,7 @@ func setVersionSetting(
 			// Confirm if the version has actually changed on us.
 			datums, err := execCfg.InternalExecutor.QueryRowEx(
 				ctx, "retrieve-prev-setting", txn,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				"SELECT value FROM system.settings WHERE name = $1", name,
 			)
 			if err != nil {
@@ -539,7 +537,7 @@ func setVersionSetting(
 			// Only if the version has increased, alter the setting.
 			if _, err = execCfg.InternalExecutor.ExecEx(
 				ctx, "update-setting", txn,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 				name, string(rawValue), setting.Typ(),
 			); err != nil {
@@ -551,7 +549,7 @@ func setVersionSetting(
 			if forSystemTenant {
 				if _, err = execCfg.InternalExecutor.ExecEx(
 					ctx, "update-setting", txn,
-					sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+					sessiondata.RootUserSessionDataOverride,
 					`UPSERT INTO system.tenant_settings (tenant_id, name, value, "last_updated", "value_type") VALUES ($1, $2, $3, now(), $4)`,
 					tree.NewDInt(0), name, string(rawValue), setting.Typ(),
 				); err != nil {

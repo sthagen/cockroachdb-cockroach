@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
@@ -40,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tochar"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
 	"github.com/cockroachdb/errors"
@@ -63,10 +63,11 @@ var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY
 // ServerImpl implements the server for the distributed SQL APIs.
 type ServerImpl struct {
 	execinfra.ServerConfig
-	flowRegistry     *flowinfra.FlowRegistry
-	remoteFlowRunner *flowinfra.RemoteFlowRunner
-	memMonitor       *mon.BytesMonitor
-	regexpCache      *tree.RegexpCache
+	flowRegistry      *flowinfra.FlowRegistry
+	remoteFlowRunner  *flowinfra.RemoteFlowRunner
+	memMonitor        *mon.BytesMonitor
+	regexpCache       *tree.RegexpCache
+	toCharFormatCache *tochar.FormatCache
 }
 
 var _ execinfrapb.DistSQLServer = &ServerImpl{}
@@ -76,10 +77,11 @@ func NewServer(
 	ctx context.Context, cfg execinfra.ServerConfig, remoteFlowRunner *flowinfra.RemoteFlowRunner,
 ) *ServerImpl {
 	ds := &ServerImpl{
-		ServerConfig:     cfg,
-		regexpCache:      tree.NewRegexpCache(512),
-		flowRegistry:     flowinfra.NewFlowRegistry(),
-		remoteFlowRunner: remoteFlowRunner,
+		ServerConfig:      cfg,
+		regexpCache:       tree.NewRegexpCache(512),
+		toCharFormatCache: tochar.NewFormatCache(512),
+		flowRegistry:      flowinfra.NewFlowRegistry(),
+		remoteFlowRunner:  remoteFlowRunner,
 		memMonitor: mon.NewMonitor(
 			"distsql",
 			mon.MemoryResource,
@@ -136,15 +138,6 @@ func (ds *ServerImpl) NumRemoteRunningFlows() int {
 	return ds.remoteFlowRunner.NumRunningFlows()
 }
 
-// TODO(yuzefovich): remove this setting in 23.1.
-var cancelRunningQueriesAfterFlowDrainWait = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"sql.distsql.drain.cancel_after_wait.enabled",
-	"determines whether queries that are still running on a node being drained "+
-		"are forcefully canceled after waiting the 'server.shutdown.query_wait' period",
-	true,
-)
-
 // Drain changes the node's draining state through gossip and drains the
 // server's flowRegistry. See flowRegistry.Drain for more details.
 func (ds *ServerImpl) Drain(
@@ -164,8 +157,7 @@ func (ds *ServerImpl) Drain(
 		// wait a minimum time for the draining state to be gossiped.
 		minWait = 0
 	}
-	cancelStillRunning := cancelRunningQueriesAfterFlowDrainWait.Get(&ds.Settings.SV)
-	ds.flowRegistry.Drain(flowWait, minWait, reporter, cancelStillRunning)
+	ds.flowRegistry.Drain(flowWait, minWait, reporter)
 }
 
 // setDraining changes the node's draining state through gossip to the provided
@@ -224,9 +216,7 @@ func (ds *ServerImpl) setupFlow(
 ) (retCtx context.Context, _ flowinfra.Flow, _ execopnode.OpChains, retErr error) {
 	var sp *tracing.Span          // will be Finish()ed by Flow.Cleanup()
 	var monitor *mon.BytesMonitor // will be closed in Flow.Cleanup()
-	onFlowCleanup := func() {
-		reserved.Close(retCtx)
-	}
+	var onFlowCleanup func()
 	// Make sure that we clean up all resources (which in the happy case are
 	// cleaned up in Flow.Cleanup()) if an error is encountered.
 	defer func() {
@@ -234,7 +224,11 @@ func (ds *ServerImpl) setupFlow(
 			if monitor != nil {
 				monitor.Stop(ctx)
 			}
-			onFlowCleanup()
+			if onFlowCleanup != nil {
+				onFlowCleanup()
+			} else {
+				reserved.Close(ctx)
+			}
 			// We finish the span after performing other cleanup in case that
 			// cleanup accesses the context with the span.
 			if sp != nil {
@@ -313,10 +307,9 @@ func (ds *ServerImpl) setupFlow(
 		// the whole evalContext, but that isn't free, so we choose to restore
 		// the original state in order to avoid performance regressions.
 		origTxn := evalCtx.Txn
-		oldOnFlowCleanup := onFlowCleanup
 		onFlowCleanup = func() {
 			evalCtx.Txn = origTxn
-			oldOnFlowCleanup()
+			reserved.Close(ctx)
 		}
 		if localState.MustUseLeafTxn() {
 			var err error
@@ -329,6 +322,9 @@ func (ds *ServerImpl) setupFlow(
 			evalCtx.Txn = leafTxn
 		}
 	} else {
+		onFlowCleanup = func() {
+			reserved.Close(ctx)
+		}
 		if localState.IsLocal {
 			return nil, nil, nil, errors.AssertionFailedf(
 				"EvalContext expected to be populated when IsLocal is set")
@@ -354,6 +350,7 @@ func (ds *ServerImpl) setupFlow(
 			NodeID:                    ds.ServerConfig.NodeID,
 			Codec:                     ds.ServerConfig.Codec,
 			ReCache:                   ds.regexpCache,
+			ToCharFormatCache:         ds.toCharFormatCache,
 			Locality:                  ds.ServerConfig.Locality,
 			Tracer:                    ds.ServerConfig.Tracer,
 			Planner:                   &faketreeeval.DummyEvalPlanner{Monitor: monitor},
@@ -407,6 +404,16 @@ func (ds *ServerImpl) setupFlow(
 		flowCtx.AmbientContext.AddLogTag("f", flowCtx.ID.Short())
 		if req.JobTag != "" {
 			flowCtx.AmbientContext.AddLogTag("job", req.JobTag)
+		}
+		if req.StatementSQL != "" {
+			flowCtx.AmbientContext.AddLogTag("distsql.stmt", req.StatementSQL)
+		}
+		flowCtx.AmbientContext.AddLogTag("distsql.gateway", req.Flow.Gateway)
+		if req.EvalContext.SessionData.ApplicationName != "" {
+			flowCtx.AmbientContext.AddLogTag("distsql.appname", req.EvalContext.SessionData.ApplicationName)
+		}
+		if leafTxn != nil {
+			flowCtx.AmbientContext.AddLogTag("distsql.txn", leafTxn.ID())
 		}
 		ctx = flowCtx.AmbientContext.AnnotateCtx(ctx)
 		telemetry.Inc(sqltelemetry.DistSQLExecCounter)

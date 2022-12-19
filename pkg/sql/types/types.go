@@ -195,8 +195,13 @@ type UserDefinedTypeMetadata struct {
 	// this version of the type metadata.
 	Version uint32
 
-	// enumData is non-nil iff the metadata is for an ENUM type.
+	// EnumData is non-nil iff the metadata is for an ENUM type.
 	EnumData *EnumMetadata
+
+	// ImplicitRecordType is true if the metadata is for an implicit record type
+	// for a table. Note: this can be deleted if we migrate implicit record types
+	// to ordinary persisted composite types.
+	ImplicitRecordType bool
 }
 
 // EnumMetadata is metadata about an ENUM needed for evaluation.
@@ -1171,6 +1176,25 @@ func MakeLabeledTuple(contents []*T, labels []string) *T {
 		TupleContents: contents,
 		TupleLabels:   labels,
 		Locale:        &emptyLocale,
+	}}
+}
+
+// MakeCompositeType constructs a new instance of a TupleFamily type with the
+// given field types and labels, and the given user-defined type OIDs.
+func MakeCompositeType(typeOID, arrayTypeOID oid.Oid, contents []*T, labels []string) *T {
+	if len(contents) != len(labels) && labels != nil {
+		panic(errors.AssertionFailedf(
+			"tuple contents and labels must be of same length: %v, %v", contents, labels))
+	}
+	return &T{InternalType: InternalType{
+		Family:        TupleFamily,
+		Oid:           typeOID,
+		TupleContents: contents,
+		TupleLabels:   labels,
+		Locale:        &emptyLocale,
+		UDTMetadata: &PersistentUserDefinedTypeMetadata{
+			ArrayTypeOID: arrayTypeOID,
+		},
 	}}
 }
 
@@ -2590,6 +2614,13 @@ func (t *T) EnumGetIdxOfLogical(logical string) (int, error) {
 	reps := t.TypeMeta.EnumData.LogicalRepresentations
 	for i := range reps {
 		if reps[i] == logical {
+			// If this enum member is read only, we cannot construct it from the
+			// logical representation. This is to ensure that it will not be
+			// written until all nodes in the cluster are able to decode the
+			// physical representation.
+			if t.TypeMeta.EnumData.IsMemberReadOnly[i] {
+				return 0, errors.Newf("enum value %q is not yet public", logical)
+			}
 			return i, nil
 		}
 	}

@@ -13,12 +13,8 @@ package resolver
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -28,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -46,10 +41,18 @@ type SchemaResolver interface {
 	tree.TypeReferenceResolver
 	tree.FunctionReferenceResolver
 
-	// Accessor is a crufty name and interface that wraps the *descs.Collection.
-	Accessor() catalog.Accessor
+	// GetObjectNamesAndIDs returns the names and IDs of the objects in the
+	// schema.
+	GetObjectNamesAndIDs(
+		ctx context.Context, db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor,
+	) (tree.TableNames, descpb.IDs, error)
+
+	// MustGetCurrentSessionDatabase returns the database descriptor for the
+	// current session database.
+	MustGetCurrentSessionDatabase(ctx context.Context) (catalog.DatabaseDescriptor, error)
+
+	// CurrentSearchPath returns the current search path.
 	CurrentSearchPath() sessiondata.SearchPath
-	CommonLookupFlagsRequired() tree.CommonLookupFlags
 }
 
 // ObjectNameExistingResolver is the helper interface to resolve table
@@ -84,25 +87,6 @@ type ObjectNameTargetResolver interface {
 // AllowWithoutPrimaryKey flag is not set.
 var ErrNoPrimaryKey = pgerror.Newf(pgcode.NoPrimaryKey,
 	"requested table does not have a primary key")
-
-// GetObjectNamesAndIDs retrieves the names and IDs of all objects in the
-// target database/schema. If explicitPrefix is set, the returned
-// table names will have an explicit schema and catalog name.
-func GetObjectNamesAndIDs(
-	ctx context.Context,
-	txn *kv.Txn,
-	sr SchemaResolver,
-	codec keys.SQLCodec,
-	dbDesc catalog.DatabaseDescriptor,
-	scName string,
-	explicitPrefix bool,
-) (tree.TableNames, descpb.IDs, error) {
-	flags := tree.DatabaseListFlags{
-		CommonLookupFlags: sr.CommonLookupFlagsRequired(),
-		ExplicitPrefix:    explicitPrefix,
-	}
-	return sr.Accessor().GetObjectNamesAndIDs(ctx, txn, dbDesc, scName, flags)
-}
 
 // ResolveExistingTableObject looks up an existing object.
 // If required is true, an error is returned if the object does not exist.
@@ -294,68 +278,11 @@ func ResolveTargetObject(
 	return scInfo, prefix, nil
 }
 
-// ResolveSchemaNameByID resolves a schema's name based on db and schema id.
-// Instead, we have to rely on a scan of the kv table.
-// TODO (SQLSchema): The remaining uses of this should be plumbed through
-//
-//	the desc.Collection's ResolveSchemaByID.
-func ResolveSchemaNameByID(
-	ctx context.Context,
-	txn *kv.Txn,
-	codec keys.SQLCodec,
-	db catalog.DatabaseDescriptor,
-	schemaID descpb.ID,
-) (string, error) {
-	// Fast-path for public schema and virtual schemas, to avoid hot lookups.
-	staticSchemaMap := catconstants.GetStaticSchemaIDMap()
-	if schemaName, ok := staticSchemaMap[uint32(schemaID)]; ok {
-		return schemaName, nil
-	}
-	schemas, err := GetForDatabase(ctx, txn, codec, db)
-	if err != nil {
-		return "", err
-	}
-	if schema, ok := schemas[schemaID]; ok {
-		return schema.Name, nil
-	}
-	return "", errors.Newf("unable to resolve schema id %d for db %d", schemaID, db.GetID())
-}
-
 // SchemaEntryForDB entry for an individual schema,
 // which includes the name and modification timestamp.
 type SchemaEntryForDB struct {
 	Name      string
 	Timestamp hlc.Timestamp
-}
-
-// GetForDatabase looks up and returns all available
-// schema ids to SchemaEntryForDB structures for a
-// given database.
-func GetForDatabase(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, db catalog.DatabaseDescriptor,
-) (map[descpb.ID]SchemaEntryForDB, error) {
-	log.Eventf(ctx, "fetching all schema descriptor IDs for database %q (%d)", db.GetName(), db.GetID())
-	cr := catkv.NewUncachedCatalogReader(codec)
-	c, err := cr.ScanNamespaceForDatabaseSchemas(ctx, txn, db)
-	if err != nil {
-		return nil, err
-	}
-	ret := make(map[descpb.ID]SchemaEntryForDB)
-	// This is needed at least for the temp system db during restores.
-	if !db.HasPublicSchemaWithDescriptor() {
-		ret[keys.PublicSchemaIDForBackup] = SchemaEntryForDB{
-			Name:      catconstants.PublicSchemaName,
-			Timestamp: txn.ReadTimestamp(),
-		}
-	}
-	_ = c.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
-		ret[e.GetID()] = SchemaEntryForDB{
-			Name:      e.GetName(),
-			Timestamp: e.GetMVCCTimestamp(),
-		}
-		return nil
-	})
-	return ret, nil
 }
 
 // ResolveExisting performs name resolution for an object name when
@@ -556,8 +483,6 @@ func ResolveIndex(
 	ctx context.Context,
 	schemaResolver SchemaResolver,
 	tableIndexName *tree.TableIndexName,
-	txn *kv.Txn,
-	codec keys.SQLCodec,
 	required bool,
 	requireActiveIndex bool,
 ) (
@@ -624,7 +549,7 @@ func ResolveIndex(
 		}
 
 		tblFound, tbl, idx, err := findTableContainingIndex(
-			ctx, tree.Name(tableIndexName.Index), resolvedPrefix, txn, codec, schemaResolver, requireActiveIndex,
+			ctx, tree.Name(tableIndexName.Index), resolvedPrefix, schemaResolver, requireActiveIndex,
 		)
 		if err != nil {
 			return false, catalog.ResolvedObjectPrefix{}, nil, nil, err
@@ -667,7 +592,7 @@ func ResolveIndex(
 		schemaFound = true
 
 		candidateFound, tbl, idx, curErr := findTableContainingIndex(
-			ctx, tree.Name(tableIndexName.Index), candidateResolvedPrefix, txn, codec, schemaResolver, requireActiveIndex,
+			ctx, tree.Name(tableIndexName.Index), candidateResolvedPrefix, schemaResolver, requireActiveIndex,
 		)
 		if curErr != nil {
 			return false, catalog.ResolvedObjectPrefix{}, nil, nil, curErr
@@ -777,14 +702,10 @@ func findTableContainingIndex(
 	ctx context.Context,
 	indexName tree.Name,
 	resolvedPrefix catalog.ResolvedObjectPrefix,
-	txn *kv.Txn,
-	codec keys.SQLCodec,
 	schemaResolver SchemaResolver,
 	requireActiveIndex bool,
 ) (found bool, tblDesc catalog.TableDescriptor, idxDesc catalog.Index, err error) {
-	dsNames, _, err := GetObjectNamesAndIDs(
-		ctx, txn, schemaResolver, codec, resolvedPrefix.Database, resolvedPrefix.Schema.GetName(), true,
-	)
+	dsNames, _, err := schemaResolver.GetObjectNamesAndIDs(ctx, resolvedPrefix.Database, resolvedPrefix.Schema)
 
 	if err != nil {
 		return false, nil, nil, err

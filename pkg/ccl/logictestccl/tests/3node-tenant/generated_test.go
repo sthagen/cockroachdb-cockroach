@@ -427,6 +427,13 @@ func TestTenantLogic_column_families(
 	runLogicTest(t, "column_families")
 }
 
+func TestTenantLogic_composite_types(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "composite_types")
+}
+
 func TestTenantLogic_computed(
 	t *testing.T,
 ) {
@@ -887,6 +894,13 @@ func TestTenantLogic_grant_schema(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "grant_schema")
+}
+
+func TestTenantLogic_group_join(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "group_join")
 }
 
 func TestTenantLogic_hash_join(

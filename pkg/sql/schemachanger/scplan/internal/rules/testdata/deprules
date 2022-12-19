@@ -1438,8 +1438,9 @@ deprules
     - $column[Type] = '*scpb.Column'
     - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
     - joinOnColumnID($column, $dependent, $table-id, $col-id)
-    - transient($column-target, $dependent-target)
-    - $column-node[CurrentStatus] = TRANSIENT_WRITE_ONLY
+    - $column-target[TargetStatus] = ABSENT
+    - $column-node[CurrentStatus] = WRITE_ONLY
+    - $dependent-target[TargetStatus] = TRANSIENT_ABSENT
     - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($column, $column-target, $column-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
@@ -1464,10 +1465,9 @@ deprules
     - $column[Type] = '*scpb.Column'
     - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
     - joinOnColumnID($column, $dependent, $table-id, $col-id)
-    - $column-target[TargetStatus] = TRANSIENT_ABSENT
+    - transient($column-target, $dependent-target)
     - $column-node[CurrentStatus] = TRANSIENT_WRITE_ONLY
-    - $dependent-target[TargetStatus] = ABSENT
-    - $dependent-node[CurrentStatus] = ABSENT
+    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($column, $column-target, $column-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
 - name: column no longer public before dependents
@@ -1478,10 +1478,10 @@ deprules
     - $column[Type] = '*scpb.Column'
     - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
     - joinOnColumnID($column, $dependent, $table-id, $col-id)
-    - $column-target[TargetStatus] = ABSENT
-    - $column-node[CurrentStatus] = WRITE_ONLY
-    - $dependent-target[TargetStatus] = TRANSIENT_ABSENT
-    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $column-target[TargetStatus] = TRANSIENT_ABSENT
+    - $column-node[CurrentStatus] = TRANSIENT_WRITE_ONLY
+    - $dependent-target[TargetStatus] = ABSENT
+    - $dependent-node[CurrentStatus] = ABSENT
     - joinTargetNode($column, $column-target, $column-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
 - name: column type dependents removed right before column type
@@ -1512,52 +1512,25 @@ deprules
     - joinTargetNode($column-type, $column-type-target, $column-type-node)
     - joinTargetNode($column, $column-target, $column-node)
 - name: constraint dependent public right before constraint
-  from: constraint-node
+  from: dependent-node
   kind: SameStagePrecedence
-  to: dependent-node
+  to: constraint-node
   query:
+    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
     - $constraint[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint']
-    - $dependent[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
-    - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
-    - toPublicOrTransient($constraint-target, $dependent-target)
-    - $constraint-node[CurrentStatus] = PUBLIC
+    - joinOnConstraintID($dependent, $constraint, $table-id, $constraint-id)
+    - toPublicOrTransient($dependent-target, $constraint-target)
     - $dependent-node[CurrentStatus] = PUBLIC
-    - joinTargetNode($constraint, $constraint-target, $constraint-node)
+    - $constraint-node[CurrentStatus] = PUBLIC
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
+    - joinTargetNode($constraint, $constraint-target, $constraint-node)
 - name: constraint no longer public before dependents
   from: constraint-node
   kind: Precedence
   to: dependent-node
   query:
     - $constraint[Type] = '*scpb.CheckConstraint'
-    - $dependent[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
-    - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
-    - transient($constraint-target, $dependent-target)
-    - $constraint-node[CurrentStatus] = TRANSIENT_VALIDATED
-    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
-    - joinTargetNode($constraint, $constraint-target, $constraint-node)
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-- name: constraint no longer public before dependents
-  from: constraint-node
-  kind: Precedence
-  to: dependent-node
-  query:
-    - $constraint[Type] = '*scpb.CheckConstraint'
-    - $dependent[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
-    - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
-    - $constraint-target[TargetStatus] = TRANSIENT_ABSENT
-    - $constraint-node[CurrentStatus] = TRANSIENT_VALIDATED
-    - $dependent-target[TargetStatus] = ABSENT
-    - $dependent-node[CurrentStatus] = ABSENT
-    - joinTargetNode($constraint, $constraint-target, $constraint-node)
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-- name: constraint no longer public before dependents
-  from: constraint-node
-  kind: Precedence
-  to: dependent-node
-  query:
-    - $constraint[Type] = '*scpb.CheckConstraint'
-    - $dependent[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
+    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - $constraint-target[TargetStatus] = ABSENT
     - $constraint-node[CurrentStatus] = VALIDATED
@@ -1571,13 +1544,174 @@ deprules
   to: dependent-node
   query:
     - $constraint[Type] = '*scpb.CheckConstraint'
-    - $dependent[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
+    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - toAbsent($constraint-target, $dependent-target)
     - $constraint-node[CurrentStatus] = VALIDATED
     - $dependent-node[CurrentStatus] = ABSENT
     - joinTargetNode($constraint, $constraint-target, $constraint-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
+- name: constraint no longer public before dependents
+  from: constraint-node
+  kind: Precedence
+  to: dependent-node
+  query:
+    - $constraint[Type] = '*scpb.CheckConstraint'
+    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
+    - $constraint-target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $dependent-target[TargetStatus] = ABSENT
+    - $dependent-node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint, $constraint-target, $constraint-node)
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+- name: constraint no longer public before dependents
+  from: constraint-node
+  kind: Precedence
+  to: dependent-node
+  query:
+    - $constraint[Type] = '*scpb.CheckConstraint'
+    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
+    - transient($constraint-target, $dependent-target)
+    - $constraint-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint, $constraint-target, $constraint-node)
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+- name: dependent view absent before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - transient($view-target, $index-target)
+    - $view-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view absent before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - toAbsent($view-target, $index-target)
+    - $view-node[CurrentStatus] = ABSENT
+    - $index-node[CurrentStatus] = ABSENT
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view absent before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - $view-target[TargetStatus] = ABSENT
+    - $view-node[CurrentStatus] = ABSENT
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view absent before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - $view-target[TargetStatus] = TRANSIENT_ABSENT
+    - $view-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $index-target[TargetStatus] = ABSENT
+    - $index-node[CurrentStatus] = ABSENT
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view no longer public before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - $view-target[TargetStatus] = ABSENT
+    - $view-node[CurrentStatus] = DROPPED
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view no longer public before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - toAbsent($view-target, $index-target)
+    - $view-node[CurrentStatus] = DROPPED
+    - $index-node[CurrentStatus] = VALIDATED
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view no longer public before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - $view-target[TargetStatus] = TRANSIENT_ABSENT
+    - $view-node[CurrentStatus] = TRANSIENT_DROPPED
+    - $index-target[TargetStatus] = ABSENT
+    - $index-node[CurrentStatus] = VALIDATED
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependent view no longer public before secondary index
+  from: view-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $view[Type] = '*scpb.View'
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - viewReferencesIndex(*scpb.View, *scpb.SecondaryIndex)($view, $index)
+    - transient($view-target, $index-target)
+    - $view-node[CurrentStatus] = TRANSIENT_DROPPED
+    - $index-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - joinTargetNode($view, $view-target, $view-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependents removed before column
+  from: dependent-node
+  kind: Precedence
+  to: column-node
+  query:
+    - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
+    - $column[Type] = '*scpb.Column'
+    - joinOnColumnID($dependent, $column, $table-id, $col-id)
+    - toAbsent($dependent-target, $column-target)
+    - $dependent-node[CurrentStatus] = ABSENT
+    - $column-node[CurrentStatus] = ABSENT
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+    - joinTargetNode($column, $column-target, $column-node)
+- name: dependents removed before column
+  from: dependent-node
+  kind: Precedence
+  to: column-node
+  query:
+    - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
+    - $column[Type] = '*scpb.Column'
+    - joinOnColumnID($dependent, $column, $table-id, $col-id)
+    - transient($dependent-target, $column-target)
+    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $column-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+    - joinTargetNode($column, $column-target, $column-node)
 - name: dependents removed before column
   from: dependent-node
   kind: Precedence
@@ -1606,56 +1740,17 @@ deprules
     - $column-node[CurrentStatus] = ABSENT
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
     - joinTargetNode($column, $column-target, $column-node)
-- name: dependents removed before column
-  from: dependent-node
-  kind: Precedence
-  to: column-node
-  query:
-    - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
-    - $column[Type] = '*scpb.Column'
-    - joinOnColumnID($dependent, $column, $table-id, $col-id)
-    - transient($dependent-target, $column-target)
-    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
-    - $column-node[CurrentStatus] = TRANSIENT_ABSENT
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-    - joinTargetNode($column, $column-target, $column-node)
-- name: dependents removed before column
-  from: dependent-node
-  kind: Precedence
-  to: column-node
-  query:
-    - $dependent[Type] IN ['*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexColumn']
-    - $column[Type] = '*scpb.Column'
-    - joinOnColumnID($dependent, $column, $table-id, $col-id)
-    - toAbsent($dependent-target, $column-target)
-    - $dependent-node[CurrentStatus] = ABSENT
-    - $column-node[CurrentStatus] = ABSENT
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-    - joinTargetNode($column, $column-target, $column-node)
 - name: dependents removed before constraint
   from: dependents-node
   kind: Precedence
   to: constraint-node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
+    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
     - $constraint[Type] = '*scpb.CheckConstraint'
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
-    - $dependents-target[TargetStatus] = ABSENT
-    - $dependents-node[CurrentStatus] = ABSENT
-    - $constraint-target[TargetStatus] = TRANSIENT_ABSENT
-    - $constraint-node[CurrentStatus] = TRANSIENT_ABSENT
-    - joinTargetNode($dependents, $dependents-target, $dependents-node)
-    - joinTargetNode($constraint, $constraint-target, $constraint-node)
-- name: dependents removed before constraint
-  from: dependents-node
-  kind: Precedence
-  to: constraint-node
-  query:
-    - $dependents[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
-    - $constraint[Type] = '*scpb.CheckConstraint'
-    - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
-    - toAbsent($dependents-target, $constraint-target)
-    - $dependents-node[CurrentStatus] = ABSENT
+    - $dependents-target[TargetStatus] = TRANSIENT_ABSENT
+    - $dependents-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $constraint-target[TargetStatus] = ABSENT
     - $constraint-node[CurrentStatus] = ABSENT
     - joinTargetNode($dependents, $dependents-target, $dependents-node)
     - joinTargetNode($constraint, $constraint-target, $constraint-node)
@@ -1664,7 +1759,7 @@ deprules
   kind: Precedence
   to: constraint-node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
+    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
     - $constraint[Type] = '*scpb.CheckConstraint'
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - transient($dependents-target, $constraint-target)
@@ -1677,42 +1772,28 @@ deprules
   kind: Precedence
   to: constraint-node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintName', '*scpb.ConstraintComment']
+    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
     - $constraint[Type] = '*scpb.CheckConstraint'
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
-    - $dependents-target[TargetStatus] = TRANSIENT_ABSENT
-    - $dependents-node[CurrentStatus] = TRANSIENT_ABSENT
-    - $constraint-target[TargetStatus] = ABSENT
+    - toAbsent($dependents-target, $constraint-target)
+    - $dependents-node[CurrentStatus] = ABSENT
     - $constraint-node[CurrentStatus] = ABSENT
     - joinTargetNode($dependents, $dependents-target, $dependents-node)
     - joinTargetNode($constraint, $constraint-target, $constraint-node)
-- name: dependents removed before index
-  from: dependent-node
+- name: dependents removed before constraint
+  from: dependents-node
   kind: Precedence
-  to: index-node
+  to: constraint-node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
-    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - joinOnIndexID($dependent, $index, $table-id, $index-id)
-    - toAbsent($dependent-target, $index-target)
-    - $dependent-node[CurrentStatus] = ABSENT
-    - $index-node[CurrentStatus] = ABSENT
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-    - joinTargetNode($index, $index-target, $index-node)
-- name: dependents removed before index
-  from: dependent-node
-  kind: Precedence
-  to: index-node
-  query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
-    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - joinOnIndexID($dependent, $index, $table-id, $index-id)
-    - $dependent-target[TargetStatus] = ABSENT
-    - $dependent-node[CurrentStatus] = ABSENT
-    - $index-target[TargetStatus] = TRANSIENT_ABSENT
-    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-    - joinTargetNode($index, $index-target, $index-node)
+    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $constraint[Type] = '*scpb.CheckConstraint'
+    - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
+    - $dependents-target[TargetStatus] = ABSENT
+    - $dependents-node[CurrentStatus] = ABSENT
+    - $constraint-target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($dependents, $dependents-target, $dependents-node)
+    - joinTargetNode($constraint, $constraint-target, $constraint-node)
 - name: dependents removed before index
   from: dependent-node
   kind: Precedence
@@ -1734,10 +1815,37 @@ deprules
     - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
+    - toAbsent($dependent-target, $index-target)
+    - $dependent-node[CurrentStatus] = ABSENT
+    - $index-node[CurrentStatus] = ABSENT
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependents removed before index
+  from: dependent-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
+    - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - $dependent-target[TargetStatus] = TRANSIENT_ABSENT
     - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
     - $index-target[TargetStatus] = ABSENT
     - $index-node[CurrentStatus] = ABSENT
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: dependents removed before index
+  from: dependent-node
+  kind: Precedence
+  to: index-node
+  query:
+    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
+    - joinOnIndexID($dependent, $index, $table-id, $index-id)
+    - $dependent-target[TargetStatus] = ABSENT
+    - $dependent-node[CurrentStatus] = ABSENT
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
     - joinTargetNode($index, $index-target, $index-node)
 - name: descriptor DROPPED in transaction before removal
@@ -1772,7 +1880,7 @@ deprules
   to: dependent-node
   query:
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType']
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraint', '*scpb.ForeignKeyConstraint', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraint', '*scpb.ForeignKeyConstraint', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue']
     - joinOnDescID($descriptor, $dependent, $desc-id)
     - toAbsent($descriptor-target, $dependent-target)
     - $descriptor-node[CurrentStatus] = DROPPED
@@ -1786,7 +1894,7 @@ deprules
   to: referencing-via-attr-node
   query:
     - $referenced-descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType']
-    - $referencing-via-attr[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraint', '*scpb.ForeignKeyConstraint', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue']
+    - $referencing-via-attr[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraint', '*scpb.ForeignKeyConstraint', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue']
     - joinReferencedDescID($referencing-via-attr, $referenced-descriptor, $desc-id)
     - toAbsent($referenced-descriptor-target, $referencing-via-attr-target)
     - $referenced-descriptor-node[CurrentStatus] = DROPPED
@@ -1888,6 +1996,21 @@ deprules
     - $dependent-node[CurrentStatus] = PUBLIC
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
+- name: index is ready to be validated before we validate constraint on it
+  from: index-node
+  kind: Precedence
+  to: constraint-node
+  query:
+    - $index[Type] = '*scpb.PrimaryIndex'
+    - $constraint[Type] = '*scpb.CheckConstraint'
+    - joinOnDescID($index, $constraint, $table-id)
+    - $index[IndexID] = $index-id-for-validation
+    - $constraint[IndexID] = $index-id-for-validation
+    - toPublicOrTransient($index-target, $constraint-target)
+    - $index-node[CurrentStatus] = VALIDATED
+    - $constraint-node[CurrentStatus] = VALIDATED
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($constraint, $constraint-target, $constraint-node)
 - name: index no longer public before dependents
   from: index-node
   kind: Precedence
@@ -1898,20 +2021,6 @@ deprules
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - transient($index-target, $dependent-target)
     - $index-node[CurrentStatus] = TRANSIENT_VALIDATED
-    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
-    - joinTargetNode($index, $index-target, $index-node)
-    - joinTargetNode($dependent, $dependent-target, $dependent-node)
-- name: index no longer public before dependents
-  from: index-node
-  kind: Precedence
-  to: dependent-node
-  query:
-    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
-    - joinOnIndexID($index, $dependent, $table-id, $index-id)
-    - $index-target[TargetStatus] = ABSENT
-    - $index-node[CurrentStatus] = VALIDATED
-    - $dependent-target[TargetStatus] = TRANSIENT_ABSENT
     - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
@@ -1936,26 +2045,80 @@ deprules
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
+    - $index-target[TargetStatus] = ABSENT
+    - $index-node[CurrentStatus] = VALIDATED
+    - $dependent-target[TargetStatus] = TRANSIENT_ABSENT
+    - $dependent-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($dependent, $dependent-target, $dependent-node)
+- name: index no longer public before dependents
+  from: index-node
+  kind: Precedence
+  to: dependent-node
+  query:
+    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
+    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - $index-target[TargetStatus] = TRANSIENT_ABSENT
     - $index-node[CurrentStatus] = TRANSIENT_VALIDATED
     - $dependent-target[TargetStatus] = ABSENT
     - $dependent-node[CurrentStatus] = ABSENT
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($dependent, $dependent-target, $dependent-node)
-- name: index removed before garbage collection
+- name: index no longer public before index name
   from: index-node
   kind: Precedence
-  to: index-data-node
+  to: name-node
   query:
-    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $index-data[Type] = '*scpb.IndexData'
-    - joinOnIndexID($index, $index-data, $table-id, $index-id)
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $name[Type] = '*scpb.IndexName'
+    - joinOnIndexID($index, $name, $table-id, $index-id)
     - $index-target[TargetStatus] = ABSENT
-    - $index-node[CurrentStatus] = ABSENT
-    - $index-data-target[TargetStatus] = TRANSIENT_ABSENT
-    - $index-data-node[CurrentStatus] = TRANSIENT_DROPPED
+    - $index-node[CurrentStatus] = DELETE_ONLY
+    - $name-target[TargetStatus] = TRANSIENT_ABSENT
+    - $name-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($index, $index-target, $index-node)
-    - joinTargetNode($index-data, $index-data-target, $index-data-node)
+    - joinTargetNode($name, $name-target, $name-node)
+- name: index no longer public before index name
+  from: index-node
+  kind: Precedence
+  to: name-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $name[Type] = '*scpb.IndexName'
+    - joinOnIndexID($index, $name, $table-id, $index-id)
+    - toAbsent($index-target, $name-target)
+    - $index-node[CurrentStatus] = DELETE_ONLY
+    - $name-node[CurrentStatus] = ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($name, $name-target, $name-node)
+- name: index no longer public before index name
+  from: index-node
+  kind: Precedence
+  to: name-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $name[Type] = '*scpb.IndexName'
+    - joinOnIndexID($index, $name, $table-id, $index-id)
+    - transient($index-target, $name-target)
+    - $index-node[CurrentStatus] = TRANSIENT_DELETE_ONLY
+    - $name-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($name, $name-target, $name-node)
+- name: index no longer public before index name
+  from: index-node
+  kind: Precedence
+  to: name-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $name[Type] = '*scpb.IndexName'
+    - joinOnIndexID($index, $name, $table-id, $index-id)
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_DELETE_ONLY
+    - $name-target[TargetStatus] = ABSENT
+    - $name-node[CurrentStatus] = ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($name, $name-target, $name-node)
 - name: index removed before garbage collection
   from: index-node
   kind: Precedence
@@ -1964,8 +2127,9 @@ deprules
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - $index-data[Type] = '*scpb.IndexData'
     - joinOnIndexID($index, $index-data, $table-id, $index-id)
-    - toAbsent($index-target, $index-data-target)
-    - $index-node[CurrentStatus] = ABSENT
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $index-data-target[TargetStatus] = ABSENT
     - $index-data-node[CurrentStatus] = DROPPED
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($index-data, $index-data-target, $index-data-node)
@@ -1990,10 +2154,23 @@ deprules
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - $index-data[Type] = '*scpb.IndexData'
     - joinOnIndexID($index, $index-data, $table-id, $index-id)
-    - $index-target[TargetStatus] = TRANSIENT_ABSENT
-    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
-    - $index-data-target[TargetStatus] = ABSENT
+    - toAbsent($index-target, $index-data-target)
+    - $index-node[CurrentStatus] = ABSENT
     - $index-data-node[CurrentStatus] = DROPPED
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($index-data, $index-data-target, $index-data-node)
+- name: index removed before garbage collection
+  from: index-node
+  kind: Precedence
+  to: index-data-node
+  query:
+    - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
+    - $index-data[Type] = '*scpb.IndexData'
+    - joinOnIndexID($index, $index-data, $table-id, $index-id)
+    - $index-target[TargetStatus] = ABSENT
+    - $index-node[CurrentStatus] = ABSENT
+    - $index-data-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-data-node[CurrentStatus] = TRANSIENT_DROPPED
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($index-data, $index-data-target, $index-data-node)
 - name: index-column added to index before index is backfilled
@@ -2032,10 +2209,10 @@ deprules
     - columnInIndex($index-column, $index, $table-id, $column-id, $index-id)
     - joinOnColumnID($index-column, $column, $table-id, $column-id)
     - descriptorIsNotBeingDropped($index-column)
-    - $index-target[TargetStatus] = ABSENT
-    - $index-node[CurrentStatus] = ABSENT
-    - $column-target[TargetStatus] = TRANSIENT_ABSENT
-    - $column-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $column-target[TargetStatus] = ABSENT
+    - $column-node[CurrentStatus] = ABSENT
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($column, $column-target, $column-node)
 - name: indexes containing column reach absent before column
@@ -2048,9 +2225,8 @@ deprules
     - columnInIndex($index-column, $index, $table-id, $column-id, $index-id)
     - joinOnColumnID($index-column, $column, $table-id, $column-id)
     - descriptorIsNotBeingDropped($index-column)
-    - $index-target[TargetStatus] = TRANSIENT_ABSENT
-    - $index-node[CurrentStatus] = TRANSIENT_ABSENT
-    - $column-target[TargetStatus] = ABSENT
+    - toAbsent($index-target, $column-target)
+    - $index-node[CurrentStatus] = ABSENT
     - $column-node[CurrentStatus] = ABSENT
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($column, $column-target, $column-node)
@@ -2079,9 +2255,10 @@ deprules
     - columnInIndex($index-column, $index, $table-id, $column-id, $index-id)
     - joinOnColumnID($index-column, $column, $table-id, $column-id)
     - descriptorIsNotBeingDropped($index-column)
-    - toAbsent($index-target, $column-target)
+    - $index-target[TargetStatus] = ABSENT
     - $index-node[CurrentStatus] = ABSENT
-    - $column-node[CurrentStatus] = ABSENT
+    - $column-target[TargetStatus] = TRANSIENT_ABSENT
+    - $column-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($index, $index-target, $index-node)
     - joinTargetNode($column, $column-target, $column-node)
 - name: old index absent before new index public when swapping with transient
@@ -2113,24 +2290,8 @@ deprules
     - descriptorIsNotBeingDropped($partial-predicate)
     - $index[Type] = '*scpb.SecondaryIndex'
     - joinOnIndexID($partial-predicate, $index, $table-id, $index-id)
-    - $partial-predicate-target[TargetStatus] = TRANSIENT_ABSENT
+    - transient($partial-predicate-target, $index-target)
     - $partial-predicate-node[CurrentStatus] = TRANSIENT_ABSENT
-    - $index-target[TargetStatus] = ABSENT
-    - $index-node[CurrentStatus] = ABSENT
-    - joinTargetNode($partial-predicate, $partial-predicate-target, $partial-predicate-node)
-    - joinTargetNode($index, $index-target, $index-node)
-- name: partial predicate removed right before secondary index when not dropping relation
-  from: partial-predicate-node
-  kind: SameStagePrecedence
-  to: index-node
-  query:
-    - $partial-predicate[Type] = '*scpb.SecondaryIndexPartial'
-    - descriptorIsNotBeingDropped($partial-predicate)
-    - $index[Type] = '*scpb.SecondaryIndex'
-    - joinOnIndexID($partial-predicate, $index, $table-id, $index-id)
-    - $partial-predicate-target[TargetStatus] = ABSENT
-    - $partial-predicate-node[CurrentStatus] = ABSENT
-    - $index-target[TargetStatus] = TRANSIENT_ABSENT
     - $index-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($partial-predicate, $partial-predicate-target, $partial-predicate-node)
     - joinTargetNode($index, $index-target, $index-node)
@@ -2157,8 +2318,24 @@ deprules
     - descriptorIsNotBeingDropped($partial-predicate)
     - $index[Type] = '*scpb.SecondaryIndex'
     - joinOnIndexID($partial-predicate, $index, $table-id, $index-id)
-    - transient($partial-predicate-target, $index-target)
+    - $partial-predicate-target[TargetStatus] = TRANSIENT_ABSENT
     - $partial-predicate-node[CurrentStatus] = TRANSIENT_ABSENT
+    - $index-target[TargetStatus] = ABSENT
+    - $index-node[CurrentStatus] = ABSENT
+    - joinTargetNode($partial-predicate, $partial-predicate-target, $partial-predicate-node)
+    - joinTargetNode($index, $index-target, $index-node)
+- name: partial predicate removed right before secondary index when not dropping relation
+  from: partial-predicate-node
+  kind: SameStagePrecedence
+  to: index-node
+  query:
+    - $partial-predicate[Type] = '*scpb.SecondaryIndexPartial'
+    - descriptorIsNotBeingDropped($partial-predicate)
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - joinOnIndexID($partial-predicate, $index, $table-id, $index-id)
+    - $partial-predicate-target[TargetStatus] = ABSENT
+    - $partial-predicate-node[CurrentStatus] = ABSENT
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
     - $index-node[CurrentStatus] = TRANSIENT_ABSENT
     - joinTargetNode($partial-predicate, $partial-predicate-target, $partial-predicate-node)
     - joinTargetNode($index, $index-target, $index-node)
@@ -2185,8 +2362,8 @@ deprules
     - joinOnDescID($old-index, $new-index, $table-id)
     - $old-index[IndexID] = $old-index-id
     - $new-index[SourceIndexID] = $old-index-id
-    - $old-index-target[TargetStatus] = TRANSIENT_ABSENT
-    - $old-index-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $old-index-target[TargetStatus] = ABSENT
+    - $old-index-node[CurrentStatus] = VALIDATED
     - $new-index-target[TargetStatus] IN [PUBLIC, TRANSIENT_ABSENT]
     - $new-index-node[CurrentStatus] = PUBLIC
     - joinTargetNode($old-index, $old-index-target, $old-index-node)
@@ -2217,8 +2394,8 @@ deprules
     - joinOnDescID($old-index, $new-index, $table-id)
     - $old-index[IndexID] = $old-index-id
     - $new-index[SourceIndexID] = $old-index-id
-    - $old-index-target[TargetStatus] = ABSENT
-    - $old-index-node[CurrentStatus] = VALIDATED
+    - $old-index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $old-index-node[CurrentStatus] = TRANSIENT_VALIDATED
     - $new-index-target[TargetStatus] IN [PUBLIC, TRANSIENT_ABSENT]
     - $new-index-node[CurrentStatus] = PUBLIC
     - joinTargetNode($old-index, $old-index-target, $old-index-node)
@@ -2316,6 +2493,21 @@ deprules
     - $data-b[Type] IN ['*scpb.TableData', '*scpb.IndexData', '*scpb.DatabaseData']
     - joinOnDescID($data-a, $data-b, $desc-id)
     - SmallerIDsFirst(scpb.Element, scpb.Element)($data-a, $data-b)
+    - $data-a-target[TargetStatus] = ABSENT
+    - $data-a-node[CurrentStatus] = DROPPED
+    - $data-b-target[TargetStatus] = TRANSIENT_ABSENT
+    - $data-b-node[CurrentStatus] = TRANSIENT_DROPPED
+    - joinTargetNode($data-a, $data-a-target, $data-a-node)
+    - joinTargetNode($data-b, $data-b-target, $data-b-node)
+- name: schedule all GC jobs for a descriptor in the same stage
+  from: data-a-node
+  kind: SameStagePrecedence
+  to: data-b-node
+  query:
+    - $data-a[Type] IN ['*scpb.TableData', '*scpb.IndexData', '*scpb.DatabaseData']
+    - $data-b[Type] IN ['*scpb.TableData', '*scpb.IndexData', '*scpb.DatabaseData']
+    - joinOnDescID($data-a, $data-b, $desc-id)
+    - SmallerIDsFirst(scpb.Element, scpb.Element)($data-a, $data-b)
     - toAbsent($data-a-target, $data-b-target)
     - $data-a-node[CurrentStatus] = DROPPED
     - $data-b-node[CurrentStatus] = DROPPED
@@ -2345,21 +2537,6 @@ deprules
     - $data-b[Type] IN ['*scpb.TableData', '*scpb.IndexData', '*scpb.DatabaseData']
     - joinOnDescID($data-a, $data-b, $desc-id)
     - SmallerIDsFirst(scpb.Element, scpb.Element)($data-a, $data-b)
-    - $data-a-target[TargetStatus] = ABSENT
-    - $data-a-node[CurrentStatus] = DROPPED
-    - $data-b-target[TargetStatus] = TRANSIENT_ABSENT
-    - $data-b-node[CurrentStatus] = TRANSIENT_DROPPED
-    - joinTargetNode($data-a, $data-a-target, $data-a-node)
-    - joinTargetNode($data-b, $data-b-target, $data-b-node)
-- name: schedule all GC jobs for a descriptor in the same stage
-  from: data-a-node
-  kind: SameStagePrecedence
-  to: data-b-node
-  query:
-    - $data-a[Type] IN ['*scpb.TableData', '*scpb.IndexData', '*scpb.DatabaseData']
-    - $data-b[Type] IN ['*scpb.TableData', '*scpb.IndexData', '*scpb.DatabaseData']
-    - joinOnDescID($data-a, $data-b, $desc-id)
-    - SmallerIDsFirst(scpb.Element, scpb.Element)($data-a, $data-b)
     - transient($data-a-target, $data-b-target)
     - $data-a-node[CurrentStatus] = TRANSIENT_DROPPED
     - $data-b-node[CurrentStatus] = TRANSIENT_DROPPED
@@ -2378,6 +2555,60 @@ deprules
     - $index-node[CurrentStatus] = VALIDATED
     - joinTargetNode($index-name, $index-name-target, $index-name-node)
     - joinTargetNode($index, $index-target, $index-node)
+- name: secondary index should be validated before dependent view can be absent
+  from: index-node
+  kind: Precedence
+  to: view-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $view[Type] = '*scpb.View'
+    - viewReferencesIndex(*scpb.SecondaryIndex, *scpb.View)($index, $view)
+    - $index-target[TargetStatus] = ABSENT
+    - $index-node[CurrentStatus] = VALIDATED
+    - $view-target[TargetStatus] = TRANSIENT_ABSENT
+    - $view-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($view, $view-target, $view-node)
+- name: secondary index should be validated before dependent view can be absent
+  from: index-node
+  kind: Precedence
+  to: view-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $view[Type] = '*scpb.View'
+    - viewReferencesIndex(*scpb.SecondaryIndex, *scpb.View)($index, $view)
+    - toAbsent($index-target, $view-target)
+    - $index-node[CurrentStatus] = VALIDATED
+    - $view-node[CurrentStatus] = ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($view, $view-target, $view-node)
+- name: secondary index should be validated before dependent view can be absent
+  from: index-node
+  kind: Precedence
+  to: view-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $view[Type] = '*scpb.View'
+    - viewReferencesIndex(*scpb.SecondaryIndex, *scpb.View)($index, $view)
+    - transient($index-target, $view-target)
+    - $index-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $view-node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($view, $view-target, $view-node)
+- name: secondary index should be validated before dependent view can be absent
+  from: index-node
+  kind: Precedence
+  to: view-node
+  query:
+    - $index[Type] = '*scpb.SecondaryIndex'
+    - $view[Type] = '*scpb.View'
+    - viewReferencesIndex(*scpb.SecondaryIndex, *scpb.View)($index, $view)
+    - $index-target[TargetStatus] = TRANSIENT_ABSENT
+    - $index-node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $view-target[TargetStatus] = ABSENT
+    - $view-node[CurrentStatus] = ABSENT
+    - joinTargetNode($index, $index-target, $index-node)
+    - joinTargetNode($view, $view-target, $view-node)
 - name: secondary indexes containing column as key reach write-only before column
   from: index-node
   kind: Precedence

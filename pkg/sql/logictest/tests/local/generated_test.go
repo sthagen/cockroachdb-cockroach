@@ -408,6 +408,13 @@ func TestLogic_column_families(
 	runLogicTest(t, "column_families")
 }
 
+func TestLogic_composite_types(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "composite_types")
+}
+
 func TestLogic_computed(
 	t *testing.T,
 ) {
@@ -434,6 +441,13 @@ func TestLogic_crdb_internal(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "crdb_internal")
+}
+
+func TestLogic_crdb_internal_catalog(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "crdb_internal_catalog")
 }
 
 func TestLogic_crdb_internal_default_privileges(
@@ -931,6 +945,13 @@ func TestLogic_grant_type(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "grant_type")
+}
+
+func TestLogic_group_join(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "group_join")
 }
 
 func TestLogic_hash_join(

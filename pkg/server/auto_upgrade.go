@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -72,7 +71,7 @@ func (s *Server) startAttemptUpgrade(ctx context.Context) {
 			for ur := retry.StartWithCtx(ctx, upgradeRetryOpts); ur.Next(); {
 				if _, err := s.sqlServer.internalExecutor.ExecEx(
 					ctx, "set-version", nil, /* txn */
-					sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+					sessiondata.RootUserSessionDataOverride,
 					"SET CLUSTER SETTING version = crdb_internal.node_executable_version();",
 				); err != nil {
 					log.Errorf(ctx, "error when finalizing cluster version upgrade: %v", err)
@@ -100,26 +99,39 @@ func (s *Server) upgradeStatus(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	nodesWithLiveness, err := s.status.nodesStatusWithLiveness(ctx)
+	nodes, err := s.status.ListNodesInternal(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	clock := s.admin.server.clock
+	statusMap, err := getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
 	if err != nil {
 		return false, err
 	}
 
 	var newVersion string
 	var notRunningErr error
-	for nodeID, st := range nodesWithLiveness {
-		if st.livenessStatus != livenesspb.NodeLivenessStatus_LIVE &&
-			st.livenessStatus != livenesspb.NodeLivenessStatus_DECOMMISSIONING {
+	for _, node := range nodes.Nodes {
+		nodeID := node.Desc.NodeID
+		st := statusMap[nodeID]
+
+		// Skip over removed nodes.
+		if st == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
+			continue
+		}
+
+		if st != livenesspb.NodeLivenessStatus_LIVE &&
+			st != livenesspb.NodeLivenessStatus_DECOMMISSIONING {
 			// We definitely won't be able to upgrade, but defer this error as
 			// we may find out that we are already at the latest version (the
-			// cluster may be up to date, but a node is down).
+			// cluster may be up-to-date, but a node is down).
 			if notRunningErr == nil {
-				notRunningErr = errors.Errorf("node %d not running (%s), cannot determine version", nodeID, st.livenessStatus)
+				notRunningErr = errors.Errorf("node %d not running (%s), cannot determine version", nodeID, st)
 			}
 			continue
 		}
 
-		version := st.NodeStatus.Desc.ServerVersion.String()
+		version := node.Desc.ServerVersion.String()
 		if newVersion == "" {
 			newVersion = version
 		} else if version != newVersion {
@@ -145,7 +157,7 @@ func (s *Server) upgradeStatus(ctx context.Context) (bool, error) {
 	// SET CLUSTER SETTING.
 	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "read-downgrade", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		"SELECT value FROM system.settings WHERE name = 'cluster.preserve_downgrade_option';",
 	)
 	if err != nil {
@@ -169,7 +181,7 @@ func (s *Server) upgradeStatus(ctx context.Context) (bool, error) {
 func (s *Server) clusterVersion(ctx context.Context) (string, error) {
 	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "show-version", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		"SHOW CLUSTER SETTING version;",
 	)
 	if err != nil {

@@ -88,6 +88,11 @@ func CreateTenantRecord(
 	if err := rejectIfSystemTenant(info.ID, op); err != nil {
 		return roachpb.TenantID{}, err
 	}
+	if info.Name != "" {
+		if err := info.Name.IsValid(); err != nil {
+			return roachpb.TenantID{}, pgerror.WithCandidateCode(err, pgcode.Syntax)
+		}
+	}
 
 	tenID := info.ID
 	if tenID == 0 {
@@ -352,7 +357,7 @@ func (p *planner) CreateTenantWithID(
 		},
 	}
 
-	initialTenantZoneConfig, err := GetHydratedZoneConfigForTenantsRange(ctx, p.Txn())
+	initialTenantZoneConfig, err := GetHydratedZoneConfigForTenantsRange(ctx, p.Txn(), p.Descriptors())
 	if err != nil {
 		return err
 	}
@@ -789,6 +794,10 @@ func TestingUpdateTenantRecord(
 func (p *planner) RenameTenant(
 	ctx context.Context, tenantID uint64, tenantName roachpb.TenantName,
 ) error {
+	if err := tenantName.IsValid(); err != nil {
+		return pgerror.WithCandidateCode(err, pgcode.Syntax)
+	}
+
 	if err := p.RequireAdminRole(ctx, "rename tenant"); err != nil {
 		return err
 	}
@@ -818,19 +827,4 @@ WHERE id = $1`, tenantID, tenantName); err != nil {
 	}
 
 	return nil
-}
-
-// GetTenantInfo implements the tree.TenantOperator interface.
-func (p *planner) GetTenantInfo(
-	ctx context.Context, tenantName roachpb.TenantName,
-) (*descpb.TenantInfo, error) {
-	if err := p.RequireAdminRole(ctx, "show tenant"); err != nil {
-		return nil, err
-	}
-
-	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "show"); err != nil {
-		return nil, err
-	}
-
-	return GetTenantRecordByName(ctx, p.execCfg, p.Txn(), tenantName)
 }

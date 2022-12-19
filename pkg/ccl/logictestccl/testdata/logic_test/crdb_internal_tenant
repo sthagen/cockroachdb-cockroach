@@ -57,6 +57,10 @@ crdb_internal  index_columns                    table  admin  NULL  NULL
 crdb_internal  index_usage_statistics           table  admin  NULL  NULL
 crdb_internal  invalid_objects                  table  admin  NULL  NULL
 crdb_internal  jobs                             table  admin  NULL  NULL
+crdb_internal  kv_catalog_comments              table  admin  NULL  NULL
+crdb_internal  kv_catalog_descriptor            table  admin  NULL  NULL
+crdb_internal  kv_catalog_namespace             table  admin  NULL  NULL
+crdb_internal  kv_catalog_zones                 table  admin  NULL  NULL
 crdb_internal  kv_node_liveness                 table  admin  NULL  NULL
 crdb_internal  kv_node_status                   table  admin  NULL  NULL
 crdb_internal  kv_store_status                  table  admin  NULL  NULL
@@ -77,7 +81,6 @@ crdb_internal  node_transactions                table  admin  NULL  NULL
 crdb_internal  node_txn_stats                   table  admin  NULL  NULL
 crdb_internal  partitions                       table  admin  NULL  NULL
 crdb_internal  pg_catalog_table_is_implemented  table  admin  NULL  NULL
-crdb_internal  predefined_comments              table  admin  NULL  NULL
 crdb_internal  ranges                           view   admin  NULL  NULL
 crdb_internal  ranges_no_leases                 table  admin  NULL  NULL
 crdb_internal  regions                          table  admin  NULL  NULL
@@ -301,11 +304,15 @@ SELECT * FROM crdb_internal.node_inflight_trace_spans WHERE span_id < 0
 ----
 trace_id  parent_span_id  span_id  goroutine_id  finished  start_time  duration  operation
 
-statement error not fully contained in tenant keyspace
-SELECT * FROM crdb_internal.ranges WHERE range_id < 0
+query ITTI
+SELECT range_id, start_pretty, end_pretty, lease_holder FROM crdb_internal.ranges
+----
+55  /Tenant/10  /Max  1
 
-statement error not fully contained in tenant keyspace
-SELECT * FROM crdb_internal.ranges_no_leases WHERE range_id < 0
+query ITT
+SELECT range_id, start_pretty, end_pretty FROM crdb_internal.ranges_no_leases
+----
+55  /Tenant/10  /Max
 
 query IT
 SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1

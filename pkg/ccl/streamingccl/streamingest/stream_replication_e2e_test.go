@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
-	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -42,8 +41,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -150,11 +149,45 @@ func (c *tenantStreamingClusters) waitUntilHighWatermark(
 	})
 }
 
+// Waits for the ingestion job high watermark to reach the recorded start time of the job.
+func (c *tenantStreamingClusters) waitUntilStartTimeReached(ingestionJobID jobspb.JobID) {
+	waitUntilStartTimeReached(c.t, c.destSysSQL, ingestionJobID)
+}
+
+func waitUntilStartTimeReached(t *testing.T, db *sqlutils.SQLRunner, ingestionJobID jobspb.JobID) {
+	testutils.SucceedsSoon(t, func() error {
+		payload := jobutils.GetJobPayload(t, db, ingestionJobID)
+		details, ok := payload.Details.(*jobspb.Payload_StreamIngestion)
+		if !ok {
+			return errors.New("job does not appear to be a stream ingestion job")
+		}
+		if details.StreamIngestion == nil {
+			return errors.New("no stream ingestion details")
+		}
+		startTime := details.StreamIngestion.ReplicationStartTime
+		if startTime.IsEmpty() {
+			return errors.New("ingestion start time not yet recorded")
+		}
+
+		progress := jobutils.GetJobProgress(t, db, ingestionJobID)
+		if progress.GetHighWater() == nil {
+			return errors.Newf("stream ingestion has not recorded any progress yet, waiting to advance pos %s",
+				startTime.String())
+		}
+		highwater := *progress.GetHighWater()
+		if highwater.Less(startTime) {
+			return errors.Newf("waiting for stream ingestion job progress %s to advance beyond %s",
+				highwater.String(), startTime.String())
+		}
+		return nil
+	})
+}
+
 func (c *tenantStreamingClusters) cutover(
 	producerJobID, ingestionJobID int, cutoverTime time.Time,
 ) {
 	// Cut over the ingestion job and the job will stop eventually.
-	c.destSysSQL.Exec(c.t, `SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`, ingestionJobID, cutoverTime)
+	c.destSysSQL.Exec(c.t, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`, c.args.destTenantName, cutoverTime)
 	jobutils.WaitForJobToSucceed(c.t, c.destSysSQL, jobspb.JobID(ingestionJobID))
 	jobutils.WaitForJobToSucceed(c.t, c.srcSysSQL, jobspb.JobID(producerJobID))
 }
@@ -312,16 +345,6 @@ func configureClusterSettings(setting map[string]string) []string {
 	return res
 }
 
-func streamIngestionStats(
-	t *testing.T, sqlRunner *sqlutils.SQLRunner, ingestionJobID int,
-) *streampb.StreamIngestionStats {
-	stats, rawStats := &streampb.StreamIngestionStats{}, make([]byte, 0)
-	row := sqlRunner.QueryRow(t, "SELECT crdb_internal.stream_ingestion_stats_pb($1)", ingestionJobID)
-	row.Scan(&rawStats)
-	require.NoError(t, protoutil.Unmarshal(rawStats, stats))
-	return stats
-}
-
 func runningStatus(t *testing.T, sqlRunner *sqlutils.SQLRunner, ingestionJobID int) string {
 	p := jobutils.GetJobProgress(t, sqlRunner, jobspb.JobID(ingestionJobID))
 	return p.RunningStatus
@@ -355,6 +378,8 @@ func TestTenantStreamingSuccessfulIngestion(t *testing.T) {
 		tenantSQL.Exec(t, "IMPORT INTO d.x CSV DATA ($1)", dataSrv.URL)
 	})
 
+	c.waitUntilStartTimeReached(jobspb.JobID(ingestionJobID))
+
 	var cutoverTime time.Time
 	c.srcExec(func(t *testing.T, sysSQL *sqlutils.SQLRunner, tenantSQL *sqlutils.SQLRunner) {
 		sysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
@@ -365,9 +390,6 @@ func TestTenantStreamingSuccessfulIngestion(t *testing.T) {
 	// <-time.NewTimer(2 * time.Second).C
 	// _, err := c.destSysServer.StartTenant(context.Background(), base.TestTenantArgs{TenantID: c.args.destTenantID, DisableCreateTenant: true, SkipTenantCheck: true})
 	// require.Error(t, err)
-	require.Equal(t, "running the SQL flow for the stream ingestion job",
-		runningStatus(t, c.destSysSQL, ingestionJobID))
-
 	c.cutover(producerJobID, ingestionJobID, cutoverTime)
 
 	require.Equal(t, "stream ingestion finished successfully",
@@ -419,7 +441,7 @@ func TestTenantStreamingProducerJobTimedOut(t *testing.T) {
 	c.compareResult("SELECT * FROM d.t1")
 	c.compareResult("SELECT * FROM d.t2")
 
-	stats := streamIngestionStats(t, c.destSysSQL, ingestionJobID)
+	stats := streamIngestionStats(t, ctx, c.destSysSQL, ingestionJobID)
 
 	require.NotNil(t, stats.ReplicationLagInfo)
 	require.True(t, srcTime.LessEq(stats.ReplicationLagInfo.MinIngestedTimestamp))
@@ -483,7 +505,7 @@ func TestTenantStreamingPauseResumeIngestion(t *testing.T) {
 	// Pause ingestion.
 	c.destSysSQL.Exec(t, fmt.Sprintf("PAUSE JOB %d", ingestionJobID))
 	jobutils.WaitForJobToPause(t, c.destSysSQL, jobspb.JobID(ingestionJobID))
-	pausedCheckpoint := streamIngestionStats(t, c.destSysSQL, ingestionJobID).
+	pausedCheckpoint := streamIngestionStats(t, ctx, c.destSysSQL, ingestionJobID).
 		ReplicationLagInfo.MinIngestedTimestamp
 	// Check we paused at a timestamp greater than the previously reached high watermark
 	require.True(t, srcTime.LessEq(pausedCheckpoint))
@@ -494,7 +516,7 @@ func TestTenantStreamingPauseResumeIngestion(t *testing.T) {
 	// to src cluster checkpoints events, the job high watermark may change.
 	<-time.NewTimer(3 * time.Second).C
 	require.Equal(t, pausedCheckpoint,
-		streamIngestionStats(t, c.destSysSQL, ingestionJobID).ReplicationLagInfo.MinIngestedTimestamp)
+		streamIngestionStats(t, ctx, c.destSysSQL, ingestionJobID).ReplicationLagInfo.MinIngestedTimestamp)
 
 	// Resume ingestion.
 	c.destSysSQL.Exec(t, fmt.Sprintf("RESUME JOB %d", ingestionJobID))
@@ -504,9 +526,6 @@ func TestTenantStreamingPauseResumeIngestion(t *testing.T) {
 	srcTime = c.srcCluster.Server(0).Clock().Now()
 	c.waitUntilHighWatermark(srcTime, jobspb.JobID(ingestionJobID))
 	c.compareResult("SELECT * FROM d.t2")
-	// Confirm this new run resumed from the previous checkpoint.
-	require.Equal(t, pausedCheckpoint,
-		streamIngestionStats(t, c.destSysSQL, ingestionJobID).IngestionProgress.StartTime)
 }
 
 func TestTenantStreamingPauseOnPermanentJobError(t *testing.T) {
@@ -548,7 +567,7 @@ func TestTenantStreamingPauseOnPermanentJobError(t *testing.T) {
 	require.Equal(t, 2, ingestionStarts)
 
 	// Check we didn't make any progress.
-	require.Nil(t, streamIngestionStats(t, c.destSysSQL, ingestionJobID).ReplicationLagInfo)
+	require.Nil(t, streamIngestionStats(t, ctx, c.destSysSQL, ingestionJobID).ReplicationLagInfo)
 
 	// Resume ingestion.
 	c.destSysSQL.Exec(t, fmt.Sprintf("RESUME JOB %d", ingestionJobID))
@@ -568,10 +587,6 @@ func TestTenantStreamingPauseOnPermanentJobError(t *testing.T) {
 
 	// Ingestion happened one more time after resuming the ingestion job.
 	require.Equal(t, 3, ingestionStarts)
-
-	// Confirm this new run resumed from the empty checkpoint.
-	require.True(t,
-		streamIngestionStats(t, c.destSysSQL, ingestionJobID).IngestionProgress.StartTime.IsEmpty())
 }
 
 func TestTenantStreamingCheckpoint(t *testing.T) {
@@ -659,11 +674,9 @@ func TestTenantStreamingCheckpoint(t *testing.T) {
 	c.destSysSQL.Exec(t, `RESUME JOB $1`, ingestionJobID)
 	jobutils.WaitForJobToRun(t, c.destSysSQL, jobspb.JobID(ingestionJobID))
 
-	var cutoverTime time.Time
-	c.srcExec(func(t *testing.T, sysSQL *sqlutils.SQLRunner, tenantSQL *sqlutils.SQLRunner) {
-		sysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
-	})
-	c.cutover(producerJobID, ingestionJobID, cutoverTime)
+	cutoverTime := c.destSysServer.Clock().Now()
+	c.waitUntilHighWatermark(cutoverTime, jobspb.JobID(ingestionJobID))
+	c.cutover(producerJobID, ingestionJobID, cutoverTime.GoTime())
 
 	// Clients should never be started prior to a checkpointed timestamp
 	for _, clientStartTime := range lastClientStart {
@@ -719,7 +732,7 @@ func TestTenantStreamingCancelIngestion(t *testing.T) {
 		jobutils.WaitForJobToCancel(c.t, c.srcSysSQL, jobspb.JobID(producerJobID))
 
 		// Check if the producer job has released protected timestamp.
-		stats := streamIngestionStats(t, c.destSysSQL, ingestionJobID)
+		stats := streamIngestionStats(t, ctx, c.destSysSQL, ingestionJobID)
 		require.NotNil(t, stats.ProducerStatus)
 		require.Nil(t, stats.ProducerStatus.ProtectedTimestamp)
 
@@ -789,7 +802,7 @@ func TestTenantStreamingDropTenantCancelsStream(t *testing.T) {
 		jobutils.WaitForJobToCancel(c.t, c.srcSysSQL, jobspb.JobID(producerJobID))
 
 		// Check if the producer job has released protected timestamp.
-		stats := streamIngestionStats(t, c.destSysSQL, ingestionJobID)
+		stats := streamIngestionStats(t, ctx, c.destSysSQL, ingestionJobID)
 		require.NotNil(t, stats.ProducerStatus)
 		require.Nil(t, stats.ProducerStatus.ProtectedTimestamp)
 
@@ -887,7 +900,7 @@ func TestTenantStreamingUnavailableStreamAddress(t *testing.T) {
 	var cutoverTime time.Time
 	alternateSrcSysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
 
-	c.destSysSQL.Exec(c.t, `SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`, ingestionJobID, cutoverTime)
+	c.destSysSQL.Exec(c.t, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`, c.args.destTenantName, cutoverTime)
 	jobutils.WaitForJobToSucceed(c.t, c.destSysSQL, jobspb.JobID(ingestionJobID))
 
 	// The destroyed address should have been removed from the topology
@@ -922,6 +935,8 @@ func TestTenantStreamingCutoverOnSourceFailure(t *testing.T) {
 
 	c.srcTenantSQL.Exec(t, "INSERT INTO d.t2 VALUES (3);")
 
+	c.waitUntilStartTimeReached(jobspb.JobID(ingestionJobID))
+
 	cutoverTime := c.srcCluster.Server(0).Clock().Now()
 	c.waitUntilHighWatermark(cutoverTime, jobspb.JobID(ingestionJobID))
 
@@ -932,7 +947,7 @@ func TestTenantStreamingCutoverOnSourceFailure(t *testing.T) {
 	// Destroy the source cluster
 	c.srcCleanup()
 
-	c.destSysSQL.Exec(c.t, `SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`, ingestionJobID, cutoverTime.GoTime())
+	c.destSysSQL.Exec(c.t, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`, c.args.destTenantName, cutoverTime.AsOfSystemTime())
 
 	// Resume ingestion.
 	c.destSysSQL.Exec(t, fmt.Sprintf("RESUME JOB %d", ingestionJobID))
@@ -1058,12 +1073,10 @@ func TestTenantStreamingMultipleNodes(t *testing.T) {
 		tenantSQL.Exec(t, "INSERT INTO d.x VALUES (3, 3)")
 	})
 
-	var cutoverTime time.Time
-	c.srcExec(func(t *testing.T, sysSQL *sqlutils.SQLRunner, tenantSQL *sqlutils.SQLRunner) {
-		sysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
-	})
+	c.waitUntilStartTimeReached(jobspb.JobID(ingestionJobID))
 
-	c.cutover(producerJobID, ingestionJobID, cutoverTime)
+	cutoverTime := c.destSysServer.Clock().Now()
+	c.cutover(producerJobID, ingestionJobID, cutoverTime.GoTime())
 
 	cleanupTenant := c.createDestTenantSQL(ctx)
 	defer func() {
@@ -1103,7 +1116,7 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 		// greater or equal to the frontier we know we have replicated up until.
 		waitForProducerProtection := func(c *tenantStreamingClusters, frontier hlc.Timestamp, replicationJobID int) {
 			testutils.SucceedsSoon(t, func() error {
-				stats := streamIngestionStats(t, c.destSysSQL, replicationJobID)
+				stats := streamIngestionStats(t, ctx, c.destSysSQL, replicationJobID)
 				if stats.ProducerStatus == nil {
 					return errors.New("nil ProducerStatus")
 				}
@@ -1215,7 +1228,7 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 		}
 
 		// Check if the producer job has released protected timestamp.
-		stats := streamIngestionStats(t, c.destSysSQL, replicationJobID)
+		stats := streamIngestionStats(t, ctx, c.destSysSQL, replicationJobID)
 		require.NotNil(t, stats.ProducerStatus)
 		require.Nil(t, stats.ProducerStatus.ProtectedTimestamp)
 
@@ -1243,4 +1256,52 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 			testProtectedTimestampManagement(t, pauseBeforeTerminal, completeReplication)
 		})
 	})
+}
+
+// TODO(lidor): consider rewriting this test as a data driven test when #92609 is merged.
+func TestTenantStreamingShowTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	args := defaultTenantStreamingClustersArgs
+
+	c, cleanup := createTenantStreamingClusters(ctx, t, args)
+	defer cleanup()
+	producerJobID, ingestionJobID := c.startStreamReplication()
+
+	jobutils.WaitForJobToRun(c.t, c.srcSysSQL, jobspb.JobID(producerJobID))
+	jobutils.WaitForJobToRun(c.t, c.destSysSQL, jobspb.JobID(ingestionJobID))
+	highWatermark := c.srcCluster.Server(0).Clock().Now()
+	c.waitUntilHighWatermark(highWatermark, jobspb.JobID(ingestionJobID))
+	destRegistry := c.destCluster.Server(0).JobRegistry().(*jobs.Registry)
+	details, err := destRegistry.LoadJob(ctx, jobspb.JobID(ingestionJobID))
+	require.NoError(t, err)
+	replicationDetails := details.Details().(jobspb.StreamIngestionDetails)
+
+	var (
+		id                   int
+		dest                 string
+		status               string
+		source               string
+		sourceUri            string
+		jobId                int
+		maxReplTime          time.Time
+		protectedTime        time.Time
+		replicationStartTime time.Time
+	)
+	row := c.destSysSQL.QueryRow(t, fmt.Sprintf("SHOW TENANT %s WITH REPLICATION STATUS", args.destTenantName))
+	row.Scan(&id, &dest, &status, &source, &sourceUri, &jobId, &maxReplTime, &protectedTime, &replicationStartTime)
+	require.Equal(t, 2, id)
+	require.Equal(t, "destination", dest)
+	require.Equal(t, "REPLICATING", status)
+	require.Equal(t, "source", source)
+	require.Equal(t, c.srcURL.String(), sourceUri)
+	require.Equal(t, ingestionJobID, jobId)
+	require.Less(t, maxReplTime, timeutil.Now())
+	require.Less(t, protectedTime, timeutil.Now())
+	require.GreaterOrEqual(t, maxReplTime, highWatermark.GoTime())
+	require.GreaterOrEqual(t, protectedTime, replicationDetails.ReplicationStartTime.GoTime())
+	require.Equal(t, replicationStartTime.UnixMicro(),
+		timeutil.Unix(0, replicationDetails.ReplicationStartTime.WallTime).UnixMicro())
 }

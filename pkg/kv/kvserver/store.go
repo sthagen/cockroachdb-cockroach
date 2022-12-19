@@ -80,6 +80,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/shuffle"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -106,7 +107,11 @@ const (
 	// some buffer for other messages, primarily heartbeats.
 	replicaQueueExtraSize = 10
 
-	defaultGossipWhenCapacityDeltaExceedsFraction = 0.01
+	// GossipWhenCapacityDeltaExceedsFraction specifies the fraction from the
+	// last gossiped store capacity values which need be exceeded before the
+	// store will gossip immediately without waiting for the periodic gossip
+	// interval.
+	defaultGossipWhenCapacityDeltaExceedsFraction = 0.05
 
 	// systemDataGossipInterval is the interval at which range lease
 	// holders verify that the most recent system data is gossiped.
@@ -735,21 +740,22 @@ increasing over time (see Replica.setTombstoneKey).
 NOTE: to the best of our knowledge, we don't rely on this invariant.
 */
 type Store struct {
-	Ident           *roachpb.StoreIdent // pointer to catch access before Start() is called
-	cfg             StoreConfig
-	db              *kv.DB
-	engine          storage.Engine          // The underlying key-value store
-	tsCache         tscache.Cache           // Most recent timestamps for keys / key ranges
-	allocator       allocatorimpl.Allocator // Makes allocation decisions
-	replRankings    *ReplicaRankings
-	storeRebalancer *StoreRebalancer
-	rangeIDAlloc    *idalloc.Allocator // Range ID allocator
-	mvccGCQueue     *mvccGCQueue       // MVCC GC queue
-	mergeQueue      *mergeQueue        // Range merging queue
-	splitQueue      *splitQueue        // Range splitting queue
-	replicateQueue  *replicateQueue    // Replication queue
-	replicaGCQueue  *replicaGCQueue    // Replica GC queue
-	raftLogQueue    *raftLogQueue      // Raft log truncation queue
+	Ident                *roachpb.StoreIdent // pointer to catch access before Start() is called
+	cfg                  StoreConfig
+	db                   *kv.DB
+	engine               storage.Engine          // The underlying key-value store
+	tsCache              tscache.Cache           // Most recent timestamps for keys / key ranges
+	allocator            allocatorimpl.Allocator // Makes allocation decisions
+	replRankings         *ReplicaRankings
+	replRankingsByTenant *ReplicaRankingMap
+	storeRebalancer      *StoreRebalancer
+	rangeIDAlloc         *idalloc.Allocator // Range ID allocator
+	mvccGCQueue          *mvccGCQueue       // MVCC GC queue
+	mergeQueue           *mergeQueue        // Range merging queue
+	splitQueue           *splitQueue        // Range splitting queue
+	replicateQueue       *replicateQueue    // Replication queue
+	replicaGCQueue       *replicaGCQueue    // Replica GC queue
+	raftLogQueue         *raftLogQueue      // Raft log truncation queue
 	// Carries out truncations proposed by the raft log queue, and "replicated"
 	// via raft, when they are safe. Created in Store.Start.
 	raftTruncator      *raftLogTruncator
@@ -993,6 +999,8 @@ type Store struct {
 	computeInitialMetrics              sync.Once
 	systemConfigUpdateQueueRateLimiter *quotapool.RateLimiter
 	spanConfigUpdateQueueRateLimiter   *quotapool.RateLimiter
+
+	rangeFeedSlowClosedTimestampNudge *singleflight.Group
 }
 
 var _ kv.Sender = &Store{}
@@ -1213,13 +1221,14 @@ func NewStore(
 	iot := ioThresholds{}
 	iot.Replace(nil, 1.0) // init as empty
 	s := &Store{
-		cfg:          cfg,
-		db:           cfg.DB, // TODO(tschottdorf): remove redundancy.
-		engine:       eng,
-		nodeDesc:     nodeDesc,
-		metrics:      newStoreMetrics(cfg.HistogramWindowInterval),
-		ctSender:     cfg.ClosedTimestampSender,
-		ioThresholds: &iot,
+		cfg:                               cfg,
+		db:                                cfg.DB, // TODO(tschottdorf): remove redundancy.
+		engine:                            eng,
+		nodeDesc:                          nodeDesc,
+		metrics:                           newStoreMetrics(cfg.HistogramWindowInterval),
+		ctSender:                          cfg.ClosedTimestampSender,
+		ioThresholds:                      &iot,
+		rangeFeedSlowClosedTimestampNudge: singleflight.NewGroup("rangfeed-ct-nudge", "range"),
 	}
 	s.ioThreshold.t = &admissionpb.IOThreshold{}
 	var allocatorStorePool storepool.AllocatorStorePool
@@ -1238,6 +1247,8 @@ func NewStore(
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedReplicaRebalanceMetrics)
 	}
 	s.replRankings = NewReplicaRankings()
+
+	s.replRankingsByTenant = NewReplicaRankingsMap()
 
 	s.raftRecvQueues.mon = mon.NewUnlimitedMonitor(
 		ctx,
@@ -2607,14 +2618,20 @@ func (s *Store) GossipStore(ctx context.Context, useCached bool) error {
 		return errors.Wrapf(err, "problem getting store descriptor for store %+v", s.Ident)
 	}
 
-	// Set countdown target for re-gossiping capacity earlier than
-	// the usual periodic interval. Re-gossip more rapidly for RangeCount
-	// changes because allocators with stale information are much more
-	// likely to make bad decisions.
+	// Set countdown target for re-gossiping capacity to be large enough that
+	// it would only occur when there has been significant changes. We
+	// currently gossip every 10 seconds, meaning that unless significant
+	// redistribution occurs we do not wish to gossip again to avoid wasting
+	// bandwidth and racing with local storepool estimations.
+	// TODO(kvoli): Reconsider what triggers gossip here and possibly limit to
+	// only significant workload changes (load), rather than lease or range
+	// count. Previoulsy, this was not as much as an issue as the gossip
+	// interval was 60 seconds, such that gossiping semi-frequently on changes
+	// was required.
 	rangeCountdown := float64(storeDesc.Capacity.RangeCount) * s.cfg.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction
-	atomic.StoreInt32(&s.gossipRangeCountdown, int32(math.Ceil(math.Min(rangeCountdown, 3))))
+	atomic.StoreInt32(&s.gossipRangeCountdown, int32(math.Ceil(math.Max(rangeCountdown, 10))))
 	leaseCountdown := float64(storeDesc.Capacity.LeaseCount) * s.cfg.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction
-	atomic.StoreInt32(&s.gossipLeaseCountdown, int32(math.Ceil(math.Max(leaseCountdown, 1))))
+	atomic.StoreInt32(&s.gossipLeaseCountdown, int32(math.Ceil(math.Max(leaseCountdown, 10))))
 	syncutil.StoreFloat64(&s.gossipQueriesPerSecondVal, storeDesc.Capacity.QueriesPerSecond)
 	syncutil.StoreFloat64(&s.gossipWritesPerSecondVal, storeDesc.Capacity.WritesPerSecond)
 
@@ -3057,6 +3074,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	bytesPerReplica := make([]float64, 0, replicaCount)
 	writesPerReplica := make([]float64, 0, replicaCount)
 	rankingsAccumulator := s.replRankings.NewAccumulator()
+	rankingsByTenantAccumulator := s.replRankingsByTenant.NewAccumulator()
 
 	// Query the current L0 sublevels and record the updated maximum to metrics.
 	l0SublevelsMax = int64(syncutil.LoadFloat64(&s.metrics.l0SublevelsWindowedMax))
@@ -3082,10 +3100,12 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 			totalWritesPerSecond += wps
 			writesPerReplica = append(writesPerReplica, wps)
 		}
-		rankingsAccumulator.AddReplica(candidateReplica{
+		cr := candidateReplica{
 			Replica: r,
 			qps:     qps,
-		})
+		}
+		rankingsAccumulator.AddReplica(cr)
+		rankingsByTenantAccumulator.AddReplica(cr)
 		return true
 	})
 	capacity.RangeCount = rangeCount
@@ -3103,6 +3123,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	capacity.WritesPerReplica = roachpb.PercentilesFromData(writesPerReplica)
 	s.recordNewPerSecondStats(totalQueriesPerSecond, totalWritesPerSecond)
 	s.replRankings.Update(rankingsAccumulator)
+	s.replRankingsByTenant.Update(rankingsByTenantAccumulator)
 
 	s.cachedCapacity.Lock()
 	s.cachedCapacity.StoreCapacity = capacity
@@ -3212,6 +3233,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		averageWritesPerSecond        float64
 		averageReadBytesPerSecond     float64
 		averageWriteBytesPerSecond    float64
+		averageCPUNanosPerSecond      float64
 
 		rangeCount                int64
 		unavailableRangeCount     int64
@@ -3309,6 +3331,8 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		if wbps, dur := rep.loadStats.writeBytes.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
 			averageWriteBytesPerSecond += wbps
 		}
+		averageCPUNanosPerSecond += rep.CPUNanosPerSecond()
+
 		locks += metrics.LockTableMetrics.Locks
 		totalLockHoldDurationNanos += metrics.LockTableMetrics.TotalLockHoldDurationNanos
 		locksWithWaitQueues += metrics.LockTableMetrics.LocksWithWaitQueues
@@ -3344,6 +3368,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.AverageReadsPerSecond.Update(averageReadsPerSecond)
 	s.metrics.AverageReadBytesPerSecond.Update(averageReadBytesPerSecond)
 	s.metrics.AverageWriteBytesPerSecond.Update(averageWriteBytesPerSecond)
+	s.metrics.AverageCPUNanosPerSecond.Update(averageCPUNanosPerSecond)
 	s.recordNewPerSecondStats(averageQueriesPerSecond, averageWritesPerSecond)
 
 	s.metrics.RangeCount.Update(rangeCount)
@@ -3547,6 +3572,7 @@ type HotReplicaInfo struct {
 	WriteKeysPerSecond  float64
 	WriteBytesPerSecond float64
 	ReadBytesPerSecond  float64
+	CPUNanosPerSecond   float64
 }
 
 // HottestReplicas returns the hottest replicas on a store, sorted by their
@@ -3556,15 +3582,27 @@ type HotReplicaInfo struct {
 // out of date.
 func (s *Store) HottestReplicas() []HotReplicaInfo {
 	topQPS := s.replRankings.TopQPS()
-	hotRepls := make([]HotReplicaInfo, len(topQPS))
-	for i := range topQPS {
-		hotRepls[i].Desc = topQPS[i].Desc()
-		hotRepls[i].QPS = topQPS[i].QPS()
-		hotRepls[i].RequestsPerSecond = topQPS[i].Repl().RequestsPerSecond()
-		hotRepls[i].WriteKeysPerSecond = topQPS[i].Repl().WritesPerSecond()
-		hotRepls[i].ReadKeysPerSecond = topQPS[i].Repl().ReadsPerSecond()
-		hotRepls[i].WriteBytesPerSecond = topQPS[i].Repl().WriteBytesPerSecond()
-		hotRepls[i].ReadBytesPerSecond = topQPS[i].Repl().ReadBytesPerSecond()
+	return mapToHotReplicasInfo(topQPS)
+}
+
+// HottestReplicasByTenant returns the hottest replicas on a store for specified
+// tenant ID. It works identically as HottestReplicas func with only exception that
+// hottest replicas are grouped by tenant ID.
+func (s *Store) HottestReplicasByTenant(tenantID roachpb.TenantID) []HotReplicaInfo {
+	topQPS := s.replRankingsByTenant.TopQPS(tenantID)
+	return mapToHotReplicasInfo(topQPS)
+}
+
+func mapToHotReplicasInfo(repls []CandidateReplica) []HotReplicaInfo {
+	hotRepls := make([]HotReplicaInfo, len(repls))
+	for i := range repls {
+		hotRepls[i].Desc = repls[i].Desc()
+		hotRepls[i].QPS = repls[i].QPS()
+		hotRepls[i].RequestsPerSecond = repls[i].Repl().RequestsPerSecond()
+		hotRepls[i].WriteKeysPerSecond = repls[i].Repl().WritesPerSecond()
+		hotRepls[i].ReadKeysPerSecond = repls[i].Repl().ReadsPerSecond()
+		hotRepls[i].WriteBytesPerSecond = repls[i].Repl().WriteBytesPerSecond()
+		hotRepls[i].ReadBytesPerSecond = repls[i].Repl().ReadBytesPerSecond()
 	}
 	return hotRepls
 }

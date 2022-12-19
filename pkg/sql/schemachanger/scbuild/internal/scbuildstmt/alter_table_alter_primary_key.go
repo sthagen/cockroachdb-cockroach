@@ -513,7 +513,7 @@ func checkIfConstraintNameAlreadyExists(b BuildCtx, tbl *scpb.Table, t alterPrim
 	}
 	// Check explicit constraint names.
 	publicTableElts := b.QueryByID(tbl.TableID).Filter(publicTargetFilter)
-	scpb.ForEachConstraintName(publicTableElts, func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.ConstraintName) {
+	scpb.ForEachConstraintWithoutIndexName(publicTableElts, func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.ConstraintWithoutIndexName) {
 		if e.Name == string(t.Name) {
 			panic(pgerror.Newf(pgcode.DuplicateObject, "constraint with name %q already exists", t.Name))
 		}
@@ -784,7 +784,7 @@ func addIndexColumnsForNewUniqueSecondaryIndexAndTempIndex(
 // addIndexNameForNewUniqueSecondaryIndex constructs and adds an IndexName
 // element for the new, unique secondary index on the old primary key.
 func addIndexNameForNewUniqueSecondaryIndex(b BuildCtx, tbl *scpb.Table, indexID catid.IndexID) {
-	indexName := getImplicitSecondaryIndexName(b, tbl, indexID, 0 /* numImplicitColumns */)
+	indexName := getImplicitSecondaryIndexName(b, tbl.TableID, indexID, 0 /* numImplicitColumns */)
 	b.Add(&scpb.IndexName{
 		TableID: tbl.TableID,
 		IndexID: indexID,

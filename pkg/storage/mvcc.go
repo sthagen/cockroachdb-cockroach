@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -991,6 +993,15 @@ func newMVCCIterator(
 func MVCCGet(
 	ctx context.Context, reader Reader, key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
 ) (*roachpb.Value, *roachpb.Intent, error) {
+	value, intent, _, err := MVCCGetWithValueHeader(ctx, reader, key, timestamp, opts)
+	return value, intent, err
+}
+
+// MVCCGetWithValueHeader is like MVCCGet, but in addition returns the
+// MVCCValueHeader for the value.
+func MVCCGetWithValueHeader(
+	ctx context.Context, reader Reader, key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
+) (*roachpb.Value, *roachpb.Intent, enginepb.MVCCValueHeader, error) {
 	iter := newMVCCIterator(
 		reader, timestamp, false /* rangeKeyMasking */, opts.DontInterleaveIntents, IterOptions{
 			KeyTypes: IterKeyTypePointsAndRanges,
@@ -998,10 +1009,11 @@ func MVCCGet(
 		},
 	)
 	defer iter.Close()
-	value, intent, err := mvccGet(ctx, iter, key, timestamp, opts)
-	return value.ToPointer(), intent, err
+	value, intent, vh, err := mvccGetWithValueHeader(ctx, iter, key, timestamp, opts)
+	return value.ToPointer(), intent, vh, err
 }
 
+// gcassert:inline
 func mvccGet(
 	ctx context.Context,
 	iter MVCCIterator,
@@ -1009,17 +1021,28 @@ func mvccGet(
 	timestamp hlc.Timestamp,
 	opts MVCCGetOptions,
 ) (value optionalValue, intent *roachpb.Intent, err error) {
+	value, intent, _, err = mvccGetWithValueHeader(ctx, iter, key, timestamp, opts)
+	return value, intent, err
+}
+
+func mvccGetWithValueHeader(
+	ctx context.Context,
+	iter MVCCIterator,
+	key roachpb.Key,
+	timestamp hlc.Timestamp,
+	opts MVCCGetOptions,
+) (value optionalValue, intent *roachpb.Intent, vh enginepb.MVCCValueHeader, err error) {
 	if len(key) == 0 {
-		return optionalValue{}, nil, emptyKeyError()
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, emptyKeyError()
 	}
 	if timestamp.WallTime < 0 {
-		return optionalValue{}, nil, errors.Errorf("cannot write to %q at timestamp %s", key, timestamp)
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, errors.Errorf("cannot write to %q at timestamp %s", key, timestamp)
 	}
 	if util.RaceEnabled && !iter.IsPrefix() {
-		return optionalValue{}, nil, errors.AssertionFailedf("mvccGet called with non-prefix iterator")
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, errors.AssertionFailedf("mvccGet called with non-prefix iterator")
 	}
 	if err := opts.validate(); err != nil {
-		return optionalValue{}, nil, err
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, err
 	}
 
 	mvccScanner := pebbleMVCCScannerPool.Get().(*pebbleMVCCScanner)
@@ -1049,36 +1072,39 @@ func mvccGet(
 	recordIteratorStats(ctx, mvccScanner.parent)
 
 	if mvccScanner.err != nil {
-		return optionalValue{}, nil, mvccScanner.err
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, mvccScanner.err
 	}
 	intents, err := buildScanIntents(mvccScanner.intentsRepr())
 	if err != nil {
-		return optionalValue{}, nil, err
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, err
 	}
 	if opts.errOnIntents() && len(intents) > 0 {
-		return optionalValue{}, nil, &roachpb.WriteIntentError{Intents: intents}
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, &roachpb.WriteIntentError{Intents: intents}
 	}
 
 	if len(intents) > 1 {
-		return optionalValue{}, nil, errors.Errorf("expected 0 or 1 intents, got %d", len(intents))
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, errors.Errorf("expected 0 or 1 intents, got %d", len(intents))
 	} else if len(intents) == 1 {
 		intent = &intents[0]
 	}
 
 	if len(mvccScanner.results.repr) == 0 {
-		return optionalValue{}, intent, nil
+		return optionalValue{}, intent, enginepb.MVCCValueHeader{}, nil
 	}
 
 	mvccKey, rawValue, _, err := MVCCScanDecodeKeyValue(mvccScanner.results.repr)
 	if err != nil {
-		return optionalValue{}, nil, err
+		return optionalValue{}, nil, enginepb.MVCCValueHeader{}, err
 	}
 
 	value = makeOptionalValue(roachpb.Value{
 		RawBytes:  rawValue,
 		Timestamp: mvccKey.Timestamp,
 	})
-	return value, intent, nil
+	// NB: we may return MVCCValueHeader out of curUnsafeValue because that
+	// type does not contain any pointers. A comment on MVCCValueHeader ensures
+	// that this stays true.
+	return value, intent, mvccScanner.curUnsafeValue.MVCCValueHeader, nil
 }
 
 // MVCCGetAsTxn constructs a temporary transaction from the given transaction
@@ -2003,6 +2029,13 @@ func mvccPutInternal(
 	versionValue := MVCCValue{}
 	versionValue.Value = value
 	versionValue.LocalTimestamp = localTimestamp
+
+	if buildutil.CrdbTestBuild {
+		if seq, seqOK := kvnemesisutil.FromContext(ctx); seqOK {
+			versionValue.KVNemesisSeq.Set(seq)
+		}
+	}
+
 	if !versionValue.LocalTimestampNeeded(versionKey.Timestamp) ||
 		!writer.ShouldWriteLocalTimestamps(ctx) {
 		versionValue.LocalTimestamp = hlc.ClockTimestamp{}
@@ -3262,6 +3295,11 @@ func MVCCDeleteRangeUsingTombstone(
 	value.LocalTimestamp = localTimestamp
 	if !value.LocalTimestampNeeded(timestamp) || !rw.ShouldWriteLocalTimestamps(ctx) {
 		value.LocalTimestamp = hlc.ClockTimestamp{}
+	}
+	if buildutil.CrdbTestBuild {
+		if seq, ok := kvnemesisutil.FromContext(ctx); ok {
+			value.KVNemesisSeq.Set(seq)
+		}
 	}
 	valueRaw, err := EncodeMVCCValue(value)
 	if err != nil {
@@ -5866,9 +5904,14 @@ func MVCCExportToSST(
 	}
 
 	if summary.DataSize == 0 {
-		// If no records were added to the sstable, skip completing it and return a
-		// nil slice – the export code will discard it anyway (based on 0 DataSize).
-		return roachpb.BulkOpSummary{}, MVCCKey{}, nil
+		// If no records were added to the sstable, skip
+		// completing it and return an empty summary.
+		//
+		// We still propogate the resumeKey because our
+		// iteration may have been halted because of resource
+		// limitiations before any keys were added to the
+		// returned SST.
+		return roachpb.BulkOpSummary{}, resumeKey, nil
 	}
 
 	return summary, resumeKey, sstWriter.Finish()
@@ -5939,6 +5982,7 @@ func mvccExportToWriter(
 		rangeKeyMasking = opts.EndTS
 	}
 
+	elasticCPUHandle := admission.ElasticCPUWorkHandleFromContext(ctx)
 	iter := NewMVCCIncrementalIterator(reader, MVCCIncrementalIterOptions{
 		KeyTypes:             IterKeyTypePointsAndRanges,
 		StartKey:             opts.StartKey.Key,
@@ -5951,12 +5995,33 @@ func mvccExportToWriter(
 	defer iter.Close()
 
 	paginated := opts.TargetSize > 0
-	trackKeyBoundary := paginated || opts.ResourceLimiter != nil
+	hasElasticCPULimiter := elasticCPUHandle != nil
+	hasTimeBasedResourceLimiter := opts.ResourceLimiter != nil
+
+	// trackKeyBoundary is true if we need to know whether the
+	// iteration has proceeded to a new key.
+	//
+	// If opts.ExportAllRevisions is false, then our iteration loop
+	// will use NextKey() and thus will always be on a new key.
+	//
+	// If opts.ExportAllRevisions is true, we only need to track
+	// key boundaries if we may return from our iteration before
+	// the EndKey. This can happen if the user has requested
+	// paginated results, or if we hit a resource limit.
+	trackKeyBoundary := opts.ExportAllRevisions && (paginated || hasTimeBasedResourceLimiter || hasElasticCPULimiter)
+
 	firstIteration := true
+	// skipTombstones controls whether we include tombstones.
+	//
+	// We want tombstones if we are exporting all reivions or if
+	// we have a StartTS. A non-empty StartTS is used by
+	// incremental backups and thus needs to see tombstones if
+	// that happens to be the latest value.
 	skipTombstones := !opts.ExportAllRevisions && opts.StartTS.IsEmpty()
 
 	var rows RowCounter
-	var curKey roachpb.Key // only used if exportAllRevisions
+	// Only used if trackKeyBoundary is true.
+	var curKey roachpb.Key
 	var resumeKey MVCCKey
 	var rangeKeys MVCCRangeKeyStack
 	var rangeKeysSize int64
@@ -5993,7 +6058,6 @@ func mvccExportToWriter(
 		return maxSize
 	}
 
-	elasticCPUHandle := admission.ElasticCPUWorkHandleFromContext(ctx)
 	iter.SeekGE(opts.StartKey)
 	for {
 		if ok, err := iter.Valid(); err != nil {
@@ -6006,20 +6070,24 @@ func mvccExportToWriter(
 
 		unsafeKey := iter.UnsafeKey()
 
-		isNewKey := !opts.ExportAllRevisions || !unsafeKey.Key.Equal(curKey)
-		if trackKeyBoundary && opts.ExportAllRevisions && isNewKey {
+		// isNewKey is true when we aren't tracking key
+		// boundaries because either we are not exporting all
+		// revisions or because we know we won't stop before a
+		// key boundary anyway.
+		isNewKey := !trackKeyBoundary || !unsafeKey.Key.Equal(curKey)
+		if trackKeyBoundary && isNewKey {
 			curKey = append(curKey[:0], unsafeKey.Key...)
 		}
 
-		// TODO(irfansharif): Remove this time-based resource limiter once
-		// enabling elastic CPU limiting by default. There needs to be a
-		// compelling reason to need two mechanisms.
-		if opts.ResourceLimiter != nil {
+		if firstIteration {
 			// Don't check resources on first iteration to ensure we can make some progress regardless
 			// of starvation. Otherwise operations could spin indefinitely.
-			if firstIteration {
-				firstIteration = false
-			} else {
+			firstIteration = false
+		} else {
+			// TODO(irfansharif): Remove this time-based resource limiter once
+			// enabling elastic CPU limiting by default. There needs to be a
+			// compelling reason to need two mechanisms.
+			if opts.ResourceLimiter != nil {
 				// In happy day case we want to only stop at key boundaries as it allows callers to use
 				// produced sst's directly. But if we can't find key boundary within reasonable number of
 				// iterations we would split mid key.
@@ -6039,16 +6107,19 @@ func mvccExportToWriter(
 					break
 				}
 			}
-		}
 
-		// Check if we're over our allotted CPU time + on a key boundary (we
-		// prefer callers being able to use SSTs directly). Going over limit is
-		// accounted for in admission control by penalizing the subsequent
-		// request, so doing it slightly is fine.
-		if overLimit, _ := elasticCPUHandle.OverLimit(); overLimit && isNewKey {
-			resumeKey = unsafeKey.Clone()
-			resumeKey.Timestamp = hlc.Timestamp{}
-			break
+			// Check if we're over our allotted CPU time + on a key boundary (we
+			// prefer callers being able to use SSTs directly). Going over limit is
+			// accounted for in admission control by penalizing the subsequent
+			// request, so doing it slightly is fine.
+			stopAllowed := isNewKey || opts.StopMidKey
+			if overLimit, _ := elasticCPUHandle.OverLimit(); overLimit && stopAllowed {
+				resumeKey = unsafeKey.Clone()
+				if isNewKey {
+					resumeKey.Timestamp = hlc.Timestamp{}
+				}
+				break
+			}
 		}
 
 		// When we encounter an MVCC range tombstone stack, we buffer it in
@@ -6106,7 +6177,7 @@ func mvccExportToWriter(
 				reachedTargetSize := opts.TargetSize > 0 && uint64(curSize) >= opts.TargetSize
 				newSize := curSize + maxRangeKeysSizeIfTruncated(rangeKeys.Bounds.Key)
 				reachedMaxSize := opts.MaxSize > 0 && newSize > int64(opts.MaxSize)
-				if paginated && (reachedTargetSize || reachedMaxSize) {
+				if curSize > 0 && paginated && (reachedTargetSize || reachedMaxSize) {
 					rangeKeys.Clear()
 					rangeKeysSize = 0
 					resumeKey = unsafeKey.Clone()
@@ -6268,9 +6339,8 @@ type MVCCExportOptions struct {
 	ExportAllRevisions bool
 	// If TargetSize is positive, it indicates that the export should produce SSTs
 	// which are roughly target size. Specifically, it will return an SST such that
-	// the last key is responsible for meeting or exceeding the targetSize. If the
-	// resumeKey is non-nil then the data size of the returned sst will be greater
-	// than or equal to the targetSize.
+	// the last key is responsible for meeting or exceeding the targetSize, unless the
+	// iteration has been stopped because of resource limitations.
 	TargetSize uint64
 	// If MaxSize is positive, it is an absolute maximum on byte size for the
 	// returned sst. If it is the case that the versions of the last key will lead
@@ -6543,4 +6613,68 @@ func isWatchedSystemTable(key roachpb.Key) bool {
 	default:
 		return false
 	}
+}
+
+// MVCCLookupRangeKeyValue reads the value header for a range deletion on
+// [key,endKey) at the specified timestamp. The range deletion is allowed to be
+// fragmented (with identical value) and is allowed to extend out of
+// [key,endKey). An error is returned if a matching range deletion cannot be
+// found.
+func MVCCLookupRangeKeyValue(
+	reader Reader, key, endKey roachpb.Key, ts hlc.Timestamp,
+) ([]byte, error) {
+	it := reader.NewMVCCIterator(MVCCKeyIterKind, IterOptions{
+		LowerBound: key,
+		UpperBound: endKey,
+		KeyTypes:   IterKeyTypeRangesOnly,
+	})
+	defer it.Close()
+
+	it.SeekGE(MVCCKey{Key: key})
+
+	// Start by assuming that we've already seen [min, key) and now we're iterating
+	// to fill this up to [min, endKey).
+	span := roachpb.Span{
+		Key:    roachpb.KeyMin,
+		EndKey: append([]byte(nil), key...), // copy since we'll mutate this memory
+	}
+	first := true
+	var val []byte
+	for ; ; it.Next() {
+		ok, err := it.Valid()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		rkv, ok := it.RangeKeys().FirstAtOrAbove(ts)
+		if !ok || rkv.Timestamp != ts {
+			return nil, errors.Errorf(
+				"gap [%s,...) in expected range deletion [%s,%s)", span.EndKey, key, endKey)
+		}
+
+		unsafeBounds := it.RangeBounds() // only valid until next call to iterator
+		if !span.EndKey.Equal(unsafeBounds.Key) {
+			return nil, errors.Errorf(
+				"gap [%s,%s) in expected range deletion [%s,%s)", span.EndKey, unsafeBounds.Key, key, endKey,
+			)
+		}
+
+		if first {
+			val = append(val, rkv.Value...)
+			first = false
+		} else if !bytes.Equal(val, rkv.Value) {
+			return nil, errors.Errorf(
+				"value change at %s in expected range deletion [%s,%s)", unsafeBounds.Key, key, endKey)
+		}
+
+		span.EndKey = append(span.EndKey[:0], unsafeBounds.EndKey...)
+	}
+	if !span.EndKey.Equal(endKey) {
+		return nil, errors.Errorf(
+			"gap [%s,...) in expected range deletion [%s,%s)", span.EndKey, key, endKey)
+	}
+	// Made it!
+	return val, nil
 }

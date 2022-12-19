@@ -25,7 +25,6 @@ import {
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import LoginIndicator from "src/views/app/components/loginIndicator";
-import FeedbackSurveyLink from "src/views/app/components/feedbackSurveyLink/feedbackSurveyLink";
 import {
   GlobalNavigation,
   CockroachLabsLockupIcon,
@@ -40,6 +39,7 @@ import { Badge } from "@cockroachlabs/cluster-ui";
 import "./layout.styl";
 import "./layoutPanel.styl";
 import { getDataFromServer } from "src/util/dataFromServer";
+import TenantDropdown from "../../components/tenantDropdown/tenantDropdown";
 
 export interface LayoutProps {
   clusterName: string;
@@ -85,7 +85,6 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
                 <CockroachLabsLockupIcon height={26} />
               </Left>
               <Right>
-                <FeedbackSurveyLink />
                 <LoginIndicator />
               </Right>
             </GlobalNavigation>
@@ -99,6 +98,7 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
                 {clusterName || `Cluster id: ${clusterId || ""}`}
               </Text>
               <Badge text={clusterVersion} />
+              <TenantDropdown />
             </PageHeader>
           </div>
           <div className="layout-panel__body">

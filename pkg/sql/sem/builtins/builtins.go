@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -86,6 +87,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -317,10 +319,10 @@ var regularBuiltins = map[string]builtinDefinition{
 		),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"statement", types.String},
-				{"line_width", types.Int},
-				{"align_mode", types.Int},
-				{"case_mode", types.Int},
+				{Name: "statement", Typ: types.String},
+				{Name: "line_width", Typ: types.Int},
+				{Name: "align_mode", Typ: types.Int},
+				{Name: "case_mode", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -425,7 +427,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/10/static/functions-string.html#FUNCTIONS-STRING-OTHER
 	"convert_from": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"str", types.Bytes}, {"enc", types.String}},
+			Types:      tree.ParamTypes{{Name: "str", Typ: types.Bytes}, {Name: "enc", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				str := []byte(tree.MustBeDBytes(args[0]))
@@ -458,7 +460,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/10/static/functions-string.html#FUNCTIONS-STRING-OTHER
 	"convert_to": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"str", types.String}, {"enc", types.String}},
+			Types:      tree.ParamTypes{{Name: "str", Typ: types.String}, {Name: "enc", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				str := string(tree.MustBeDString(args[0]))
@@ -491,7 +493,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.0/functions-binarystring.html#FUNCTIONS-BINARYSTRING-OTHER
 	"get_bit": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"bit_string", types.VarBit}, {"index", types.Int}},
+			Types:      tree.ParamTypes{{Name: "bit_string", Typ: types.VarBit}, {Name: "index", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				bitString := tree.MustBeDBitArray(args[0])
@@ -506,7 +508,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"byte_string", types.Bytes}, {"index", types.Int}},
+			Types:      tree.ParamTypes{{Name: "byte_string", Typ: types.Bytes}, {Name: "index", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				byteString := []byte(*args[0].(*tree.DBytes))
@@ -531,7 +533,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.0/functions-binarystring.html#FUNCTIONS-BINARYSTRING-OTHER
 	"get_byte": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"byte_string", types.Bytes}, {"index", types.Int}},
+			Types:      tree.ParamTypes{{Name: "byte_string", Typ: types.Bytes}, {Name: "index", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				byteString := []byte(*args[0].(*tree.DBytes))
@@ -551,9 +553,9 @@ var regularBuiltins = map[string]builtinDefinition{
 	"set_bit": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"bit_string", types.VarBit},
-				{"index", types.Int},
-				{"to_set", types.Int},
+				{Name: "bit_string", Typ: types.VarBit},
+				{Name: "index", Typ: types.Int},
+				{Name: "to_set", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.VarBit),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -577,9 +579,9 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"byte_string", types.Bytes},
-				{"index", types.Int},
-				{"to_set", types.Int},
+				{Name: "byte_string", Typ: types.Bytes},
+				{Name: "index", Typ: types.Int},
+				{Name: "to_set", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -613,9 +615,9 @@ var regularBuiltins = map[string]builtinDefinition{
 	"set_byte": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"byte_string", types.Bytes},
-				{"index", types.Int},
-				{"to_set", types.Int},
+				{Name: "byte_string", Typ: types.Bytes},
+				{Name: "index", Typ: types.Int},
+				{Name: "to_set", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -703,7 +705,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Category: builtinconstants.CategoryIDGeneration,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"namespace", types.Uuid}, {"name", types.String}},
+			Types:      tree.ParamTypes{{Name: "namespace", Typ: types.Uuid}, {Name: "name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Uuid),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				namespace := tree.MustBeDUuid(args[0])
@@ -723,7 +725,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Category: builtinconstants.CategoryIDGeneration,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"namespace", types.Uuid}, {"name", types.String}},
+			Types:      tree.ParamTypes{{Name: "namespace", Typ: types.Uuid}, {Name: "name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Uuid),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				namespace := tree.MustBeDUuid(args[0])
@@ -739,7 +741,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"to_uuid": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.String}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -757,7 +759,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"from_uuid": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				b := []byte(*args[0].(*tree.DBytes))
@@ -792,7 +794,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"uuid_to_ulid": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Uuid}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Uuid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				b := (*args[0].(*tree.DUuid)).GetBytes()
@@ -809,7 +811,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"ulid_to_uuid": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.String}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Uuid),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := tree.MustBeDString(args[0])
@@ -848,7 +850,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"abbrev": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -863,7 +865,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"broadcast": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.INet),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -878,7 +880,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"family": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -895,7 +897,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"host": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -913,7 +915,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"hostmask": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.INet),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -928,7 +930,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"masklen": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -942,7 +944,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"netmask": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.INet),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -958,8 +960,8 @@ var regularBuiltins = map[string]builtinDefinition{
 	"set_masklen": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.INet},
-				{"prefixlen", types.Int},
+				{Name: "val", Typ: types.INet},
+				{Name: "prefixlen", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.INet),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -980,7 +982,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"text": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.INet}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				dIPAddr := tree.MustBeDIPAddr(args[0])
@@ -999,8 +1001,8 @@ var regularBuiltins = map[string]builtinDefinition{
 	"inet_same_family": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.INet},
-				{"val", types.INet},
+				{Name: "val", Typ: types.INet},
+				{Name: "val", Typ: types.INet},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1016,8 +1018,8 @@ var regularBuiltins = map[string]builtinDefinition{
 	"inet_contained_by_or_equals": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.INet},
-				{"container", types.INet},
+				{Name: "val", Typ: types.INet},
+				{Name: "container", Typ: types.INet},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1034,8 +1036,8 @@ var regularBuiltins = map[string]builtinDefinition{
 	"inet_contains_or_equals": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"container", types.INet},
-				{"val", types.INet},
+				{Name: "container", Typ: types.INet},
+				{Name: "val", Typ: types.INet},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1051,7 +1053,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"inet": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.String}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.INet),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				inet, err := eval.PerformCast(ctx, evalCtx, args[0], types.INet)
@@ -1067,7 +1069,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"from_ip": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ipstr := args[0].(*tree.DBytes)
@@ -1087,7 +1089,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"to_ip": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.String}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ipdstr := tree.MustBeDString(args[0])
@@ -1109,9 +1111,9 @@ var regularBuiltins = map[string]builtinDefinition{
 	"split_part": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"delimiter", types.String},
-				{"return_index_pos", types.Int},
+				{Name: "input", Typ: types.String},
+				{Name: "delimiter", Typ: types.String},
+				{Name: "return_index_pos", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1139,7 +1141,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"repeat": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.String}, {"repeat_counter", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.String}, {Name: "repeat_counter", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -1168,7 +1170,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/10/static/functions-binarystring.html
 	"encode": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"data", types.Bytes}, {"format", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.Bytes}, {Name: "format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				data, format := *args[0].(*tree.DBytes), string(tree.MustBeDString(args[1]))
@@ -1187,7 +1189,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"decode": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"text", types.String}, {"format", types.String}},
+			Types:      tree.ParamTypes{{Name: "text", Typ: types.String}, {Name: "format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				data, format := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
@@ -1209,7 +1211,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"compress": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"data", types.Bytes}, {"codec", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.Bytes}, {Name: "codec", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				uncompressedData := []byte(tree.MustBeDBytes(args[0]))
@@ -1227,7 +1229,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"decompress": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"data", types.Bytes}, {"codec", types.String}},
+			Types:      tree.ParamTypes{{Name: "data", Typ: types.Bytes}, {Name: "codec", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (_ tree.Datum, err error) {
 				compressedData := []byte(tree.MustBeDBytes(args[0]))
@@ -1258,7 +1260,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"chr": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Int}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				x := tree.MustBeDInt(args[0])
@@ -1341,7 +1343,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"to_hex": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Int}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				val := tree.MustBeDInt(args[0])
@@ -1355,7 +1357,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return tree.NewDString(fmt.Sprintf("%x", tree.MustBeDBytes(args[0]))), nil
@@ -1364,7 +1366,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.String}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return tree.NewDString(fmt.Sprintf("%x", tree.MustBeDString(args[0]))), nil
@@ -1377,7 +1379,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"to_english": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Int}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				val := int(*args[0].(*tree.DInt))
@@ -1460,9 +1462,9 @@ var regularBuiltins = map[string]builtinDefinition{
 	"overlay": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"overlay_val", types.String},
-				{"start_pos", types.Int},
+				{Name: "input", Typ: types.String},
+				{Name: "overlay_val", Typ: types.String},
+				{Name: "start_pos", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1479,10 +1481,10 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"overlay_val", types.String},
-				{"start_pos", types.Int},
-				{"end_pos", types.Int},
+				{Name: "input", Typ: types.String},
+				{Name: "overlay_val", Typ: types.String},
+				{Name: "start_pos", Typ: types.Int},
+				{Name: "end_pos", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1501,7 +1503,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"lpad": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"length", types.Int}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "length", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -1517,7 +1519,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"length", types.Int}, {"fill", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "length", Typ: types.Int}, {Name: "fill", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -1538,7 +1540,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"rpad": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"length", types.Int}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "length", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -1554,7 +1556,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"length", types.Int}, {"fill", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "length", Typ: types.Int}, {Name: "fill", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -1729,7 +1731,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"regexp_extract": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.String}, {"regex", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.String}, {Name: "regex", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -1744,9 +1746,9 @@ var regularBuiltins = map[string]builtinDefinition{
 	"regexp_replace": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"regex", types.String},
-				{"replace", types.String},
+				{Name: "input", Typ: types.String},
+				{Name: "regex", Typ: types.String},
+				{Name: "replace", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1765,10 +1767,10 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"regex", types.String},
-				{"replace", types.String},
-				{"flags", types.String},
+				{Name: "input", Typ: types.String},
+				{Name: "regex", Typ: types.String},
+				{Name: "replace", Typ: types.String},
+				{Name: "flags", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1792,8 +1794,8 @@ var regularBuiltins = map[string]builtinDefinition{
 		defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"string", types.String},
-				{"pattern", types.String},
+				{Name: "string", Typ: types.String},
+				{Name: "pattern", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.MakeArray(types.String)),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1804,9 +1806,9 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"string", types.String},
-				{"pattern", types.String},
-				{"flags", types.String},
+				{Name: "string", Typ: types.String},
+				{Name: "pattern", Typ: types.String},
+				{Name: "flags", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.MakeArray(types.String)),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1932,7 +1934,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"quote_literal": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:             tree.ParamTypes{{"val", types.String}},
+			Types:             tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType:        tree.FixedReturnType(types.String),
 			PreferredOverload: true,
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1943,7 +1945,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Any}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Any}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				// PostgreSQL specifies that this variant first casts to the SQL string type,
@@ -1966,7 +1968,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Category: builtinconstants.CategoryString,
 		},
 		tree.Overload{
-			Types:             tree.ParamTypes{{"val", types.String}},
+			Types:             tree.ParamTypes{{Name: "val", Typ: types.String}},
 			ReturnType:        tree.FixedReturnType(types.String),
 			PreferredOverload: true,
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -1981,7 +1983,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Any}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Any}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -2004,7 +2006,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"left": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.Bytes}, {"return_set", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.Bytes}, {Name: "return_set", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				bytes := []byte(*args[0].(*tree.DBytes))
@@ -2023,7 +2025,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.String}, {"return_set", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.String}, {Name: "return_set", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				runes := []rune(string(tree.MustBeDString(args[0])))
@@ -2045,7 +2047,7 @@ var regularBuiltins = map[string]builtinDefinition{
 
 	"right": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.Bytes}, {"return_set", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.Bytes}, {Name: "return_set", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				bytes := []byte(*args[0].(*tree.DBytes))
@@ -2064,7 +2066,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.String}, {"return_set", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.String}, {Name: "return_set", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				runes := []rune(string(tree.MustBeDString(args[0])))
@@ -2147,7 +2149,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			HasSequenceArguments: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{builtinconstants.SequenceNameArg, types.String}},
+			Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -2165,7 +2167,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{builtinconstants.SequenceNameArg, types.RegClass}},
+			Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.RegClass}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				oid := tree.MustBeDOid(args[0])
@@ -2187,7 +2189,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			HasSequenceArguments: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{builtinconstants.SequenceNameArg, types.String}},
+			Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -2205,7 +2207,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{builtinconstants.SequenceNameArg, types.RegClass}},
+			Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.RegClass}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				oid := tree.MustBeDOid(args[0])
@@ -2248,7 +2250,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			HasSequenceArguments: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{builtinconstants.SequenceNameArg, types.String}, {"value", types.Int}},
+			Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.String}, {Name: "value", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -2269,7 +2271,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{builtinconstants.SequenceNameArg, types.RegClass}, {"value", types.Int}},
+			Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.RegClass}, {Name: "value", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				oid := tree.MustBeDOid(args[0])
@@ -2286,7 +2288,7 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{builtinconstants.SequenceNameArg, types.String}, {"value", types.Int}, {"is_called", types.Bool},
+				{Name: builtinconstants.SequenceNameArg, Typ: types.String}, {Name: "value", Typ: types.Int}, {Name: "is_called", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -2310,7 +2312,7 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{builtinconstants.SequenceNameArg, types.RegClass}, {"value", types.Int}, {"is_called", types.Bool},
+				{Name: builtinconstants.SequenceNameArg, Typ: types.RegClass}, {Name: "value", Typ: types.Int}, {Name: "is_called", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -2376,7 +2378,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"to_char": makeBuiltin(
 		defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"interval", types.Interval}},
+			Types:      tree.ParamTypes{{Name: "interval", Typ: types.Interval}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				d := tree.MustBeDInterval(args[0]).Duration
@@ -2388,7 +2390,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"timestamp", types.Timestamp}},
+			Types:      tree.ParamTypes{{Name: "timestamp", Typ: types.Timestamp}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := tree.MustBeDTimestamp(args[0])
@@ -2398,43 +2400,43 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"interval", types.Interval}, {"format", types.String}},
+			Types:      tree.ParamTypes{{Name: "interval", Typ: types.Interval}, {Name: "format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				d := tree.MustBeDInterval(args[0])
 				f := tree.MustBeDString(args[1])
-				s, err := tochar.DurationToChar(d.Duration, string(f))
+				s, err := tochar.DurationToChar(d.Duration, ctx.ToCharFormatCache, string(f))
 				return tree.NewDString(s), err
 			},
 			Info:       "Convert an interval to a string using the given format.",
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"timestamp", types.Timestamp}, {"format", types.String}},
+			Types:      tree.ParamTypes{{Name: "timestamp", Typ: types.Timestamp}, {Name: "format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := tree.MustBeDTimestamp(args[0])
 				f := tree.MustBeDString(args[1])
-				s, err := tochar.TimeToChar(ts.Time, string(f))
+				s, err := tochar.TimeToChar(ts.Time, ctx.ToCharFormatCache, string(f))
 				return tree.NewDString(s), err
 			},
 			Info:       "Convert an timestamp to a string using the given format.",
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"timestamptz", types.TimestampTZ}, {"format", types.String}},
+			Types:      tree.ParamTypes{{Name: "timestamptz", Typ: types.TimestampTZ}, {Name: "format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := tree.MustBeDTimestampTZ(args[0])
 				f := tree.MustBeDString(args[1])
-				s, err := tochar.TimeToChar(ts.Time, string(f))
+				s, err := tochar.TimeToChar(ts.Time, ctx.ToCharFormatCache, string(f))
 				return tree.NewDString(s), err
 			},
 			Info:       "Convert a timestamp with time zone to a string using the given format.",
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"date", types.Date}},
+			Types:      tree.ParamTypes{{Name: "date", Typ: types.Date}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := tree.MustBeDDate(args[0])
@@ -2448,7 +2450,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"to_char_with_style": makeBuiltin(
 		defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"interval", types.Interval}, {"style", types.String}},
+			Types:      tree.ParamTypes{{Name: "interval", Typ: types.Interval}, {Name: "style", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				d := tree.MustBeDInterval(args[0]).Duration
@@ -2469,7 +2471,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"timestamp", types.Timestamp}, {"datestyle", types.String}},
+			Types:      tree.ParamTypes{{Name: "timestamp", Typ: types.Timestamp}, {Name: "datestyle", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := tree.MustBeDTimestamp(args[0])
@@ -2487,7 +2489,7 @@ var regularBuiltins = map[string]builtinDefinition{
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"date", types.Date}, {"datestyle", types.String}},
+			Types:      tree.ParamTypes{{Name: "date", Typ: types.Date}, {Name: "datestyle", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := tree.MustBeDDate(args[0])
@@ -2565,7 +2567,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"to_timestamp": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryDateAndTime},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"timestamp", types.Float}},
+			Types:      tree.ParamTypes{{Name: "timestamp", Typ: types.Float}},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ts := float64(tree.MustBeDFloat(args[0]))
@@ -2589,7 +2591,7 @@ var regularBuiltins = map[string]builtinDefinition{
 	"age": makeBuiltin(
 		defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.TimestampTZ}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.TimestampTZ}},
 			ReturnType: tree.FixedReturnType(types.Interval),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return &tree.DInterval{
@@ -2607,7 +2609,7 @@ months and years, use ` + "`now() - timestamptz`" + `.`,
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"end", types.TimestampTZ}, {"begin", types.TimestampTZ}},
+			Types:      tree.ParamTypes{{Name: "end", Typ: types.TimestampTZ}, {Name: "begin", Typ: types.TimestampTZ}},
 			ReturnType: tree.FixedReturnType(types.Interval),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return &tree.DInterval{
@@ -2705,7 +2707,7 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 		defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"min_timestamp", types.TimestampTZ},
+				{Name: "min_timestamp", Typ: types.TimestampTZ},
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -2720,8 +2722,8 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"min_timestamp", types.TimestampTZ},
-				{"nearest_only", types.Bool},
+				{Name: "min_timestamp", Typ: types.TimestampTZ},
+				{Name: "nearest_only", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -2740,7 +2742,7 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 		defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"max_staleness", types.Interval},
+				{Name: "max_staleness", Typ: types.Interval},
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -2755,8 +2757,8 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"max_staleness", types.Interval},
-				{"nearest_only", types.Bool},
+				{Name: "max_staleness", Typ: types.Interval},
+				{Name: "nearest_only", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -2793,7 +2795,7 @@ may increase either contention or retry errors, or both.`,
 	"hlc_to_timestamp": makeBuiltin(
 		defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"hlc", types.Decimal}},
+			Types:      tree.ParamTypes{{Name: "hlc", Typ: types.Decimal}},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				d := tree.MustBeDDecimal(args[0])
@@ -2854,7 +2856,7 @@ value if you rely on the HLC for accuracy.`,
 	"extract_duration": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryDateAndTime},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Interval}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Interval}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				// extract timeSpan fromTime.
@@ -2927,7 +2929,7 @@ value if you rely on the HLC for accuracy.`,
 	"date_trunc": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryDateAndTime},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Timestamp}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Timestamp}},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				timeSpan := strings.ToLower(string(tree.MustBeDString(args[0])))
@@ -2945,7 +2947,7 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Date}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Date}},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				timeSpan := strings.ToLower(string(tree.MustBeDString(args[0])))
@@ -2964,7 +2966,7 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Time}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Time}},
 			ReturnType: tree.FixedReturnType(types.Interval),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				timeSpan := strings.ToLower(string(tree.MustBeDString(args[0])))
@@ -2981,7 +2983,7 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.TimestampTZ}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.TimestampTZ}},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTSTZ := args[1].(*tree.DTimestampTZ)
@@ -2995,7 +2997,7 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Interval}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Interval}},
 			ReturnType: tree.FixedReturnType(types.Interval),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromInterval := args[1].(*tree.DInterval)
@@ -3012,7 +3014,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"row_to_json": makeBuiltin(jsonProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"row", types.AnyTuple}},
+			Types:      tree.ParamTypes{{Name: "row", Typ: types.AnyTuple}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				tuple := args[0].(*tree.DTuple)
@@ -3050,8 +3052,8 @@ value if you rely on the HLC for accuracy.`,
 		// function overload promoting the string to timestamptz.
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"timezone", types.String},
-				{"timestamptz_string", types.String},
+				{Name: "timezone", Typ: types.String},
+				{Name: "timestamptz_string", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3072,8 +3074,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"timezone", types.String},
-				{"timestamp", types.Timestamp},
+				{Name: "timezone", Typ: types.String},
+				{Name: "timestamp", Typ: types.Timestamp},
 			},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3096,8 +3098,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"timezone", types.String},
-				{"timestamptz", types.TimestampTZ},
+				{Name: "timezone", Typ: types.String},
+				{Name: "timestamptz", Typ: types.TimestampTZ},
 			},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3117,8 +3119,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"timezone", types.String},
-				{"time", types.Time},
+				{Name: "timezone", Typ: types.String},
+				{Name: "time", Typ: types.Time},
 			},
 			ReturnType: tree.FixedReturnType(types.TimeTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3144,8 +3146,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"timezone", types.String},
-				{"timetz", types.TimeTZ},
+				{Name: "timezone", Typ: types.String},
+				{Name: "timetz", Typ: types.TimeTZ},
 			},
 			ReturnType: tree.FixedReturnType(types.TimeTZ),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3167,6 +3169,58 @@ value if you rely on the HLC for accuracy.`,
 			// This overload's volatility does not match Postgres. See
 			// https://github.com/cockroachdb/cockroach/pull/51037 for details.
 			IgnoreVolatilityCheck: true,
+		},
+	),
+
+	"parse_ident": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "qualified_identifier", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.StringArray),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				s := tree.MustBeDString(args[0])
+				idents, err := parseIdent(string(s), true /* strict */)
+				if err != nil {
+					return nil, pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
+				}
+				arr := tree.NewDArray(types.String)
+				for _, ident := range idents {
+					if err := arr.Append(tree.NewDString(ident)); err != nil {
+						return nil, err
+					}
+				}
+				return arr, nil
+			},
+			Info: "Splits qualified_identifier into an array of identifiers, " +
+				"removing any quoting of individual identifiers. " +
+				"Extra characters after the last identifier are considered an error",
+			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "qualified_identifier", Typ: types.String},
+				{Name: "strict", Typ: types.Bool},
+			},
+			ReturnType: tree.FixedReturnType(types.StringArray),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				s := tree.MustBeDString(args[0])
+				strict := tree.MustBeDBool(args[1])
+				idents, err := parseIdent(string(s), bool(strict))
+				if err != nil {
+					return nil, pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
+				}
+				arr := tree.NewDArray(types.String)
+				for _, ident := range idents {
+					if err := arr.Append(tree.NewDString(ident)); err != nil {
+						return nil, err
+					}
+				}
+				return arr, nil
+			},
+			Info: "Splits `qualified_identifier` into an array of identifiers, " +
+				"removing any quoting of individual identifiers. " +
+				"If `strict` is false, then extra characters after the last identifier are ignored.",
+			Volatility: volatility.Immutable,
 		},
 	),
 
@@ -3200,7 +3254,7 @@ value if you rely on the HLC for accuracy.`,
 			volatility.Immutable,
 		),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"datestyle", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "datestyle", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arg := string(tree.MustBeDString(args[0]))
@@ -3254,7 +3308,7 @@ value if you rely on the HLC for accuracy.`,
 			volatility.Immutable,
 		),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"datestyle", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "datestyle", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Date),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arg := string(tree.MustBeDString(args[0]))
@@ -3305,7 +3359,7 @@ value if you rely on the HLC for accuracy.`,
 			volatility.Immutable,
 		),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"timestyle", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "timestyle", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Time),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arg := string(tree.MustBeDString(args[0]))
@@ -3342,7 +3396,7 @@ value if you rely on the HLC for accuracy.`,
 			volatility.Immutable,
 		),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"style", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "style", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Interval),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -3387,7 +3441,7 @@ value if you rely on the HLC for accuracy.`,
 			volatility.Immutable,
 		),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"string", types.String}, {"timestyle", types.String}},
+			Types:      tree.ParamTypes{{Name: "string", Typ: types.String}, {Name: "timestyle", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.TimeTZ),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arg := string(tree.MustBeDString(args[0]))
@@ -3417,7 +3471,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"string_to_array": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"str", types.String}, {"delimiter", types.String}},
+			Types:      tree.ParamTypes{{Name: "str", Typ: types.String}, {Name: "delimiter", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.StringArray),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -3432,7 +3486,7 @@ value if you rely on the HLC for accuracy.`,
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"str", types.String}, {"delimiter", types.String}, {"null", types.String}},
+			Types:      tree.ParamTypes{{Name: "str", Typ: types.String}, {Name: "delimiter", Typ: types.String}, {Name: "null", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.StringArray),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -3451,7 +3505,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_to_string": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.AnyArray}, {"delim", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "delim", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull || args[1] == tree.DNull {
@@ -3466,7 +3520,7 @@ value if you rely on the HLC for accuracy.`,
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.AnyArray}, {"delimiter", types.String}, {"null", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "delimiter", Typ: types.String}, {Name: "null", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull || args[1] == tree.DNull {
@@ -3485,7 +3539,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_length": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.AnyArray}, {"array_dimension", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "array_dimension", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -3501,7 +3555,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"cardinality": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.AnyArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -3514,7 +3568,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_lower": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.AnyArray}, {"array_dimension", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "array_dimension", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -3530,7 +3584,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_upper": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.AnyArray}, {"array_dimension", types.Int}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "array_dimension", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -3546,7 +3600,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_append": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types: tree.ParamTypes{{"array", types.MakeArray(typ)}, {"elem", typ}},
+			Types: tree.ParamTypes{{Name: "array", Typ: types.MakeArray(typ)}, {Name: "elem", Typ: typ}},
 			ReturnType: func(args []tree.TypedExpr) *types.T {
 				if len(args) > 0 {
 					if argTyp := args[0].ResolvedType(); argTyp.Family() != types.UnknownFamily {
@@ -3566,7 +3620,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_prepend": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types: tree.ParamTypes{{"elem", typ}, {"array", types.MakeArray(typ)}},
+			Types: tree.ParamTypes{{Name: "elem", Typ: typ}, {Name: "array", Typ: types.MakeArray(typ)}},
 			ReturnType: func(args []tree.TypedExpr) *types.T {
 				if len(args) > 1 {
 					if argTyp := args[1].ResolvedType(); argTyp.Family() != types.UnknownFamily {
@@ -3586,7 +3640,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_cat": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types: tree.ParamTypes{{"left", types.MakeArray(typ)}, {"right", types.MakeArray(typ)}},
+			Types: tree.ParamTypes{{Name: "left", Typ: types.MakeArray(typ)}, {Name: "right", Typ: types.MakeArray(typ)}},
 			ReturnType: func(args []tree.TypedExpr) *types.T {
 				if len(args) > 1 {
 					if argTyp := args[1].ResolvedType(); argTyp.Family() != types.UnknownFamily {
@@ -3611,7 +3665,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_remove": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types:      tree.ParamTypes{{"array", types.MakeArray(typ)}, {"elem", typ}},
+			Types:      tree.ParamTypes{{Name: "array", Typ: types.MakeArray(typ)}, {Name: "elem", Typ: typ}},
 			ReturnType: tree.IdentityReturnType(0),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -3639,7 +3693,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_replace": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types:      tree.ParamTypes{{"array", types.MakeArray(typ)}, {"toreplace", typ}, {"replacewith", typ}},
+			Types:      tree.ParamTypes{{Name: "array", Typ: types.MakeArray(typ)}, {Name: "toreplace", Typ: typ}, {Name: "replacewith", Typ: typ}},
 			ReturnType: tree.IdentityReturnType(0),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -3671,7 +3725,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_position": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types:      tree.ParamTypes{{"array", types.MakeArray(typ)}, {"elem", typ}},
+			Types:      tree.ParamTypes{{Name: "array", Typ: types.MakeArray(typ)}, {Name: "elem", Typ: typ}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -3696,7 +3750,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"array_positions": setProps(arrayProps(), arrayBuiltin(func(typ *types.T) tree.Overload {
 		return tree.Overload{
-			Types:      tree.ParamTypes{{"array", types.MakeArray(typ)}, {"elem", typ}},
+			Types:      tree.ParamTypes{{Name: "array", Typ: types.MakeArray(typ)}, {Name: "elem", Typ: typ}},
 			ReturnType: tree.FixedReturnType(types.IntArray),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -3757,7 +3811,7 @@ value if you rely on the HLC for accuracy.`,
 	"soundex": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryFuzzyStringMatching},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"source", types.String}},
+			Types:      tree.ParamTypes{{Name: "source", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s := string(tree.MustBeDString(args[0]))
@@ -3774,7 +3828,7 @@ value if you rely on the HLC for accuracy.`,
 	"difference": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"source", types.String}, {"target", types.String}},
+			Types:      tree.ParamTypes{{Name: "source", Typ: types.String}, {Name: "target", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, t := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
@@ -3788,7 +3842,7 @@ value if you rely on the HLC for accuracy.`,
 	"levenshtein": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryFuzzyStringMatching},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"source", types.String}, {"target", types.String}},
+			Types:      tree.ParamTypes{{Name: "source", Typ: types.String}, {Name: "target", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, t := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
@@ -3804,8 +3858,8 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types: tree.ParamTypes{{"source", types.String}, {"target", types.String},
-				{"ins_cost", types.Int}, {"del_cost", types.Int}, {"sub_cost", types.Int}},
+			Types: tree.ParamTypes{{Name: "source", Typ: types.String}, {Name: "target", Typ: types.String},
+				{Name: "ins_cost", Typ: types.Int}, {Name: "del_cost", Typ: types.Int}, {Name: "sub_cost", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, t := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
@@ -3840,7 +3894,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"json_remove_path": makeBuiltin(jsonProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Jsonb}, {"path", types.StringArray}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Jsonb}, {Name: "path", Typ: types.StringArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				ary := *tree.MustBeDArray(args[1])
@@ -3875,7 +3929,7 @@ value if you rely on the HLC for accuracy.`,
 
 	"jsonb_pretty": makeBuiltin(jsonProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Jsonb}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Jsonb}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, err := json.Pretty(tree.MustBeDJSON(args[0]).JSON)
@@ -3923,8 +3977,8 @@ value if you rely on the HLC for accuracy.`,
 		jsonProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"json", types.Jsonb},
-				{"array", types.StringArray},
+				{Name: "json", Typ: types.Jsonb},
+				{Name: "array", Typ: types.StringArray},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3939,7 +3993,7 @@ value if you rely on the HLC for accuracy.`,
 		jsonProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"string", types.String},
+				{Name: "string", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3973,8 +4027,8 @@ value if you rely on the HLC for accuracy.`,
 					Info:       info,
 					Volatility: volatility,
 					Types: tree.ParamTypes{
-						{"pbname", types.String},
-						{"data", types.Bytes},
+						{Name: "pbname", Typ: types.String},
+						{Name: "data", Typ: types.Bytes},
 					},
 					ReturnType: returnType,
 					Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -3989,9 +4043,9 @@ value if you rely on the HLC for accuracy.`,
 					Info:       info,
 					Volatility: volatility,
 					Types: tree.ParamTypes{
-						{"pbname", types.String},
-						{"data", types.Bytes},
-						{"emit_defaults", types.Bool},
+						{Name: "pbname", Typ: types.String},
+						{Name: "data", Typ: types.Bytes},
+						{Name: "emit_defaults", Typ: types.Bool},
 					},
 					ReturnType: returnType,
 					Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4009,10 +4063,10 @@ value if you rely on the HLC for accuracy.`,
 					Info:       info,
 					Volatility: volatility,
 					Types: tree.ParamTypes{
-						{"pbname", types.String},
-						{"data", types.Bytes},
-						{"emit_defaults", types.Bool},
-						{"emit_redacted", types.Bool},
+						{Name: "pbname", Typ: types.String},
+						{Name: "data", Typ: types.Bytes},
+						{Name: "emit_defaults", Typ: types.Bool},
+						{Name: "emit_redacted", Typ: types.Bool},
 					},
 					ReturnType: returnType,
 					Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4029,12 +4083,41 @@ value if you rely on the HLC for accuracy.`,
 			}
 		}()...),
 
+	"crdb_internal.job_payload_type": makeBuiltin(
+		jsonProps(),
+		func() []tree.Overload {
+			returnType := tree.FixedReturnType(types.String)
+			getJobPayloadType := func(data []byte) (tree.Datum, error) {
+				var msg jobspb.Payload
+				if err := protoutil.Unmarshal(data, &msg); err != nil {
+					return nil, err
+				}
+				return tree.NewDString(msg.Type().String()), nil
+			}
+
+			return []tree.Overload{
+				{
+					Info:       "Reads the type from the jobspb.Payload protocol message.",
+					Volatility: volatility.Immutable,
+					Types: tree.ParamTypes{
+						{Name: "data", Typ: types.Bytes},
+					},
+					ReturnType: returnType,
+					Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+						return getJobPayloadType(
+							[]byte(tree.MustBeDBytes(args[0])),
+						)
+					},
+				},
+			}
+		}()...),
+
 	"crdb_internal.json_to_pb": makeBuiltin(
 		jsonProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"pbname", types.String},
-				{"json", types.Jsonb},
+				{Name: "pbname", Typ: types.String},
+				{Name: "json", Typ: types.Jsonb},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4056,7 +4139,7 @@ value if you rely on the HLC for accuracy.`,
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"uri", types.String},
+				{Name: "uri", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4072,8 +4155,8 @@ value if you rely on the HLC for accuracy.`,
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"data", types.Bytes},
-				{"uri", types.String},
+				{Name: "data", Typ: types.Bytes},
+				{Name: "uri", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4121,7 +4204,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_statement_stats": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -4152,7 +4235,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_transaction_stats": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -4186,7 +4269,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_stats_metadata": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -4239,7 +4322,7 @@ value if you rely on the HLC for accuracy.`,
 	"enum_first": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryEnum},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.AnyEnum}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.AnyEnum}},
 			ReturnType: tree.IdentityReturnType(0),
 			FnWithExprs: makeEnumTypeFunc(func(enumType *types.T) (tree.Datum, error) {
 				enum := tree.DEnum{EnumTyp: enumType}
@@ -4258,7 +4341,7 @@ value if you rely on the HLC for accuracy.`,
 	"enum_last": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryEnum},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.AnyEnum}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.AnyEnum}},
 			ReturnType: tree.IdentityReturnType(0),
 			FnWithExprs: makeEnumTypeFunc(func(enumType *types.T) (tree.Datum, error) {
 				enum := tree.DEnum{EnumTyp: enumType}
@@ -4277,7 +4360,7 @@ value if you rely on the HLC for accuracy.`,
 	"enum_range": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryEnum},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.AnyEnum}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.AnyEnum}},
 			ReturnType: tree.ArrayOfFirstNonNullReturnType(),
 			FnWithExprs: makeEnumTypeFunc(func(enumType *types.T) (tree.Datum, error) {
 				arr := tree.NewDArray(enumType)
@@ -4302,7 +4385,7 @@ value if you rely on the HLC for accuracy.`,
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"lower", types.AnyEnum}, {"upper", types.AnyEnum}},
+			Types:      tree.ParamTypes{{Name: "lower", Typ: types.AnyEnum}, {Name: "upper", Typ: types.AnyEnum}},
 			ReturnType: tree.ArrayOfFirstNonNullReturnType(),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull && args[1] == tree.DNull {
@@ -4453,7 +4536,7 @@ value if you rely on the HLC for accuracy.`,
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"include_pg_catalog", types.Bool}},
+			Types:      tree.ParamTypes{{Name: "include_pg_catalog", Typ: types.Bool}},
 			ReturnType: tree.FixedReturnType(types.StringArray),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				curDb := evalCtx.SessionData().Database
@@ -4556,8 +4639,8 @@ value if you rely on the HLC for accuracy.`,
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"trace_id", types.Int},
-				{"verbosity", types.Bool},
+				{Name: "trace_id", Typ: types.Int},
+				{Name: "verbosity", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4607,7 +4690,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.locality_value": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"key", types.String}},
+			Types:      tree.ParamTypes{{Name: "key", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -4631,7 +4714,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.cluster_setting_encoded_default": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"setting", types.String}},
+			Types:      tree.ParamTypes{{Name: "setting", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -4663,8 +4746,8 @@ value if you rely on the HLC for accuracy.`,
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"setting", types.String},
-				{"value", types.String},
+				{Name: "setting", Typ: types.String},
+				{Name: "value", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4739,7 +4822,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.is_at_least_version": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"version", types.String}},
+			Types:      tree.ParamTypes{{Name: "version", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -4767,7 +4850,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.approximate_timestamp": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"timestamp", types.Decimal}},
+			Types:      tree.ParamTypes{{Name: "timestamp", Typ: types.Decimal}},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return eval.DecimalToInexactDTimestamp(args[0].(*tree.DDecimal))
@@ -4827,7 +4910,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
+				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4845,8 +4928,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
-				{"name", types.String},
+				{Name: "id", Typ: types.Int},
+				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4865,7 +4948,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"name", types.String},
+				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4889,8 +4972,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
-				{"name", types.String},
+				{Name: "id", Typ: types.Int},
+				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4926,6 +5009,22 @@ value if you rely on the HLC for accuracy.`,
 		},
 	),
 
+	"crdb_internal.unsafe_optimize_system_database": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     builtinconstants.CategoryMultiRegion,
+			Undocumented: true,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				return tree.MakeDBool(tree.DBool(true)), evalCtx.Regions.OptimizeSystemDatabase(ctx)
+			},
+			Info:       "Configures the sytem database to reduce latency during start up",
+			Volatility: volatility.Volatile,
+		},
+	),
+
 	"crdb_internal.destroy_tenant": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategoryMultiTenancy,
@@ -4933,7 +5032,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
+				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4953,8 +5052,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
-				{"synchronous", types.Bool},
+				{Name: "id", Typ: types.Int},
+				{Name: "synchronous", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -4979,7 +5078,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.unsafe_clear_gossip_info": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"key", types.String}},
+			Types:      tree.ParamTypes{{Name: "key", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				key, ok := tree.AsDString(args[0])
@@ -5001,9 +5100,9 @@ value if you rely on the HLC for accuracy.`,
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"table_id", types.Int},
-				{"index_id", types.Int},
-				{"row_tuple", types.Any},
+				{Name: "table_id", Typ: types.Int},
+				{Name: "index_id", Typ: types.Int},
+				{Name: "row_tuple", Typ: types.Any},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5041,7 +5140,7 @@ value if you rely on the HLC for accuracy.`,
 			Undocumented:     true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"descriptor", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "descriptor", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDBytes(args[0])
@@ -5065,7 +5164,7 @@ value if you rely on the HLC for accuracy.`,
 			Undocumented:     true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"descriptor", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "descriptor", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDBytes(args[0])
@@ -5088,7 +5187,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"errorCode", types.String}, {"msg", types.String}},
+			Types:      tree.ParamTypes{{Name: "errorCode", Typ: types.String}, {Name: "msg", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -5118,7 +5217,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"msg", types.String}},
+			Types:      tree.ParamTypes{{Name: "msg", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -5132,7 +5231,7 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"severity", types.String}, {"msg", types.String}},
+			Types:      tree.ParamTypes{{Name: "severity", Typ: types.String}, {Name: "msg", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -5160,7 +5259,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"msg", types.String}},
+			Types:      tree.ParamTypes{{Name: "msg", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -5195,7 +5294,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"msg", types.String}},
+			Types:      tree.ParamTypes{{Name: "msg", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
@@ -5228,7 +5327,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"msg", types.String}},
+			Types:      tree.ParamTypes{{Name: "msg", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
@@ -5261,7 +5360,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Interval}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Interval}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				minDuration := args[0].(*tree.DInterval).Duration
@@ -5283,7 +5382,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"key", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "key", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				key := []byte(tree.MustBeDBytes(args[0]))
@@ -5315,7 +5414,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.Any}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.Any}},
 			ReturnType: tree.IdentityReturnType(0),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return args[0], nil
@@ -5332,7 +5431,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"key", types.Bytes},
+				{Name: "key", Typ: types.Bytes},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5350,7 +5449,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"keys", types.BytesArray},
+				{Name: "keys", Typ: types.BytesArray},
 			},
 			ReturnType: tree.FixedReturnType(types.BytesArray),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5380,7 +5479,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"tenant_id", types.Int},
+				{Name: "tenant_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.BytesArray),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5412,7 +5511,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"table_id", types.Int},
+				{Name: "table_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.BytesArray),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5442,8 +5541,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"table_id", types.Int},
-				{"index_id", types.Int},
+				{Name: "table_id", Typ: types.Int},
+				{Name: "index_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.BytesArray),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5478,8 +5577,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"raw_key", types.Bytes},
-				{"skip_fields", types.Int},
+				{Name: "raw_key", Typ: types.Bytes},
+				{Name: "skip_fields", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5501,9 +5600,9 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"raw_key_start", types.Bytes},
-				{"raw_key_end", types.Bytes},
-				{"skip_fields", types.Int},
+				{Name: "raw_key_start", Typ: types.Bytes},
+				{Name: "raw_key_end", Typ: types.Bytes},
+				{Name: "skip_fields", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5526,7 +5625,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"key", types.Bytes},
+				{Name: "key", Typ: types.Bytes},
 			},
 			SpecializedVecBuiltin: tree.CrdbInternalRangeStats,
 			ReturnType:            tree.FixedReturnType(types.Jsonb),
@@ -5562,7 +5661,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.get_namespace_id": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"parent_id", types.Int}, {"name", types.String}},
+			Types:      tree.ParamTypes{{Name: "parent_id", Typ: types.Int}, {Name: "name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				parentID := tree.MustBeDInt(args[0])
@@ -5585,9 +5684,9 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"parent_id", types.Int},
-				{"parent_schema_id", types.Int},
-				{"name", types.String}},
+				{Name: "parent_id", Typ: types.Int},
+				{Name: "parent_schema_id", Typ: types.Int},
+				{Name: "name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				parentID := tree.MustBeDInt(args[0])
@@ -5619,7 +5718,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.get_database_id": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"name", types.String}},
+			Types:      tree.ParamTypes{{Name: "name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -5647,7 +5746,7 @@ value if you rely on the HLC for accuracy.`,
 	"crdb_internal.get_zone_config": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"namespace_id", types.Int}},
+			Types:      tree.ParamTypes{{Name: "namespace_id", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				id := tree.MustBeDInt(args[0])
@@ -5672,7 +5771,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"vmodule_string", types.String}},
+			Types:      tree.ParamTypes{{Name: "vmodule_string", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
@@ -5730,9 +5829,9 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"table_id", types.Int},
-				{"index_id", types.Int},
-				{"val", types.Geography},
+				{Name: "table_id", Typ: types.Int},
+				{Name: "index_id", Typ: types.Int},
+				{Name: "val", Typ: types.Geography},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5754,9 +5853,9 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"table_id", types.Int},
-				{"index_id", types.Int},
-				{"val", types.Geometry},
+				{Name: "table_id", Typ: types.Int},
+				{Name: "index_id", Typ: types.Int},
+				{Name: "val", Typ: types.Geometry},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5783,7 +5882,7 @@ value if you rely on the HLC for accuracy.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.Jsonb}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Jsonb}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return jsonNumInvertedIndexEntries(evalCtx, args[0])
@@ -5793,7 +5892,7 @@ value if you rely on the HLC for accuracy.`,
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.AnyArray}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.AnyArray}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return arrayNumInvertedIndexEntries(evalCtx, args[0], tree.DNull)
@@ -5804,8 +5903,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.Jsonb},
-				{"version", types.Int},
+				{Name: "val", Typ: types.Jsonb},
+				{Name: "version", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5822,8 +5921,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.String},
-				{"version", types.Int},
+				{Name: "val", Typ: types.String},
+				{Name: "version", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5843,8 +5942,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.AnyArray},
-				{"version", types.Int},
+				{Name: "val", Typ: types.AnyArray},
+				{Name: "version", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5890,7 +5989,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"option", types.String},
+				{Name: "option", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5919,8 +6018,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.Any},
-				{"type", types.Any},
+				{Name: "val", Typ: types.Any},
+				{Name: "type", Typ: types.Any},
 			},
 			ReturnType: tree.IdentityReturnType(1),
 			FnWithExprs: eval.FnWithExprsOverload(func(
@@ -5949,8 +6048,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.Decimal},
-				{"scale", types.Int},
+				{Name: "val", Typ: types.Decimal},
+				{Name: "scale", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Decimal),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -5963,8 +6062,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"val", types.DecimalArray},
-				{"scale", types.Int},
+				{Name: "val", Typ: types.DecimalArray},
+				{Name: "scale", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.DecimalArray),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6012,8 +6111,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
-				{"desc", types.Bytes},
+				{Name: "id", Typ: types.Int},
+				{Name: "desc", Typ: types.Bytes},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6030,9 +6129,9 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
-				{"desc", types.Bytes},
-				{"force", types.Bool},
+				{Name: "id", Typ: types.Int},
+				{Name: "desc", Typ: types.Bytes},
+				{Name: "force", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6056,7 +6155,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
+				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6073,8 +6172,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
-				{"force", types.Bool},
+				{Name: "id", Typ: types.Int},
+				{Name: "force", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6098,11 +6197,11 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"parent_id", types.Int},
-				{"parent_schema_id", types.Int},
-				{"name", types.String},
-				{"desc_id", types.Int},
-				{"force", types.Bool},
+				{Name: "parent_id", Typ: types.Int},
+				{Name: "parent_schema_id", Typ: types.Int},
+				{Name: "name", Typ: types.String},
+				{Name: "desc_id", Typ: types.Int},
+				{Name: "force", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6123,10 +6222,10 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"parent_id", types.Int},
-				{"parent_schema_id", types.Int},
-				{"name", types.String},
-				{"desc_id", types.Int},
+				{Name: "parent_id", Typ: types.Int},
+				{Name: "parent_schema_id", Typ: types.Int},
+				{Name: "name", Typ: types.String},
+				{Name: "desc_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6154,10 +6253,10 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"parent_id", types.Int},
-				{"parent_schema_id", types.Int},
-				{"name", types.String},
-				{"desc_id", types.Int},
+				{Name: "parent_id", Typ: types.Int},
+				{Name: "parent_schema_id", Typ: types.Int},
+				{Name: "name", Typ: types.String},
+				{Name: "desc_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6178,11 +6277,11 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"parent_id", types.Int},
-				{"parent_schema_id", types.Int},
-				{"name", types.String},
-				{"desc_id", types.Int},
-				{"force", types.Bool},
+				{Name: "parent_id", Typ: types.Int},
+				{Name: "parent_schema_id", Typ: types.Int},
+				{Name: "name", Typ: types.String},
+				{Name: "desc_id", Typ: types.Int},
+				{Name: "force", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6210,7 +6309,7 @@ value if you rely on the HLC for accuracy.`,
 			Undocumented: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"session_id", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "session_id", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				sid := sqlliveness.SessionID(*(args[0].(*tree.DBytes)))
@@ -6234,7 +6333,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"id", types.Int},
+				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6260,12 +6359,12 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"tenant_id", types.Int},
-				{"available_request_units", types.Float},
-				{"refill_rate", types.Float},
-				{"max_burst_request_units", types.Float},
-				{"as_of", types.Timestamp},
-				{"as_of_consumed_request_units", types.Float},
+				{Name: "tenant_id", Typ: types.Int},
+				{Name: "available_request_units", Typ: types.Float},
+				{Name: "refill_rate", Typ: types.Float},
+				{Name: "max_burst_request_units", Typ: types.Float},
+				{Name: "as_of", Typ: types.Timestamp},
+				{Name: "as_of_consumed_request_units", Typ: types.Float},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6305,10 +6404,10 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"node_id", types.Int},
-				{"store_id", types.Int},
-				{"start_key", types.Bytes},
-				{"end_key", types.Bytes},
+				{Name: "node_id", Typ: types.Int},
+				{Name: "store_id", Typ: types.Int},
+				{Name: "start_key", Typ: types.Bytes},
+				{Name: "end_key", Typ: types.Bytes},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -6347,7 +6446,7 @@ value if you rely on the HLC for accuracy.`,
 			Undocumented: true,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"feature", types.String}},
+			Types:      tree.ParamTypes{{Name: "feature", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				s, ok := tree.AsDString(args[0])
@@ -6534,7 +6633,7 @@ the locality flag on node startup. Returns an error if no region is set.`,
 			DistsqlBlocklist: true, // applicable only on the gateway
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"id", types.Int}},
+			Types:      tree.ParamTypes{{Name: "id", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				id := int64(*args[0].(*tree.DInt))
@@ -6559,7 +6658,7 @@ table.`,
 			DistsqlBlocklist: true, // applicable only on the gateway
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"id", types.Int}},
+			Types:      tree.ParamTypes{{Name: "id", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				id := int64(*args[0].(*tree.DInt))
@@ -6681,7 +6780,7 @@ table's zone configuration this will return NULL.`,
 			Category: builtinconstants.CategorySystemRepair,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"id", types.Int}},
+			Types:      tree.ParamTypes{{Name: "id", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				id := int64(*args[0].(*tree.DInt))
@@ -6717,7 +6816,7 @@ table's zone configuration this will return NULL.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"session", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "session", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				state := tree.MustBeDBytes(args[0])
@@ -6747,7 +6846,7 @@ table's zone configuration this will return NULL.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"token", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "token", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				token := tree.MustBeDBytes(args[0])
@@ -6785,7 +6884,7 @@ table's zone configuration this will return NULL.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"oid", types.Oid}},
+			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Void),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
@@ -6811,7 +6910,7 @@ table's zone configuration this will return NULL.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"password", types.Bytes}},
+			Types:      tree.ParamTypes{{Name: "password", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arg := []byte(tree.MustBeDBytes(args[0]))
@@ -6909,7 +7008,7 @@ in the current database. Returns an error if validation fails.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"table_name", types.String}},
+			Types:      tree.ParamTypes{{Name: "table_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Void),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -6933,7 +7032,7 @@ table. Returns an error if validation fails.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"table_name", types.String}, {"constraint_name", types.String}},
+			Types:      tree.ParamTypes{{Name: "table_name", Typ: types.String}, {Name: "constraint_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Void),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				tableName := tree.MustBeDString(args[0])
@@ -6959,7 +7058,7 @@ table. Returns an error if validation fails.`,
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"table_name", types.String}, {"constraint_name", types.String}},
+			Types:      tree.ParamTypes{{Name: "table_name", Typ: types.String}, {Name: "constraint_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				tableName := tree.MustBeDString(args[0])
@@ -6993,8 +7092,8 @@ active for the current transaction.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"queue_name", types.String},
-				{"active", types.Bool},
+				{Name: "queue_name", Typ: types.String},
+				{Name: "active", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7024,9 +7123,9 @@ One of 'mvccGC', 'merge', 'split', 'replicate', 'replicaGC', 'raftlog',
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"queue_name", types.String},
-				{"active", types.Bool},
-				{"store_id", types.Int},
+				{Name: "queue_name", Typ: types.String},
+				{Name: "active", Typ: types.Bool},
+				{Name: "store_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7073,9 +7172,9 @@ run from. One of 'mvccGC', 'merge', 'split', 'replicate', 'replicaGC',
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"range_id", types.Int},
-				{"queue_name", types.String},
-				{"skip_should_queue", types.Bool},
+				{Name: "range_id", Typ: types.Int},
+				{Name: "queue_name", Typ: types.String},
+				{Name: "skip_should_queue", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7122,10 +7221,10 @@ store housing the range on the node it's run from. One of 'mvccGC', 'merge', 'sp
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"range_id", types.Int},
-				{"queue_name", types.String},
-				{"skip_should_queue", types.Bool},
-				{"should_return_trace", types.Bool},
+				{Name: "range_id", Typ: types.Int},
+				{Name: "queue_name", Typ: types.String},
+				{Name: "skip_should_queue", Typ: types.Bool},
+				{Name: "should_return_trace", Typ: types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7178,10 +7277,10 @@ store housing the range on the node it's run from. One of 'mvccGC', 'merge', 'sp
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"range_id", types.Int},
-				{"queue_name", types.String},
-				{"skip_should_queue", types.Bool},
-				{"store_id", types.Int},
+				{Name: "range_id", Typ: types.Int},
+				{Name: "queue_name", Typ: types.String},
+				{Name: "skip_should_queue", Typ: types.Bool},
+				{Name: "store_id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7230,10 +7329,10 @@ specified store on the node it's run from. One of 'mvccGC', 'merge', 'split',
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"stmtFingerprint", types.String},
-				{"samplingProbability", types.Float},
-				{"minExecutionLatency", types.Interval},
-				{"expiresAfter", types.Interval},
+				{Name: "stmtFingerprint", Typ: types.String},
+				{Name: "samplingProbability", Typ: types.Float},
+				{Name: "minExecutionLatency", Typ: types.Interval},
+				{Name: "expiresAfter", Typ: types.Interval},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7297,9 +7396,9 @@ expires until the statement bundle is collected`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"node_id", types.Int},
-				{"store_id", types.Int},
-				{"compaction_concurrency", types.Int},
+				{Name: "node_id", Typ: types.Int},
+				{Name: "store_id", Typ: types.Int},
+				{Name: "compaction_concurrency", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7338,9 +7437,9 @@ expires until the statement bundle is collected`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"span", types.BytesArray},
-				{"start_time", types.TimestampTZ},
-				{"all_revisions", types.Bool},
+				{Name: "span", Typ: types.BytesArray},
+				{Name: "start_time", Typ: types.TimestampTZ},
+				{Name: "all_revisions", Typ: types.Bool},
 				// NB: The function can be called with an AOST clause that will be used
 				// as the `end_time` when issuing the ExportRequests for the purposes of
 				// fingerprinting.
@@ -7493,7 +7592,7 @@ expires until the statement bundle is collected`,
 			Volatility: volatility.Immutable,
 		},
 	),
-	"crdb_internal.anonymize_sql_constants": makeBuiltin(tree.FunctionProperties{
+	"crdb_internal.hide_sql_constants": makeBuiltin(tree.FunctionProperties{
 		Category:     builtinconstants.CategoryString,
 		Undocumented: true,
 	},
@@ -7516,7 +7615,7 @@ expires until the statement bundle is collected`,
 			volatility.Immutable,
 		),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"val", types.StringArray}},
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.StringArray}},
 			ReturnType: tree.FixedReturnType(types.StringArray),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -7593,8 +7692,8 @@ func makeSubStringImpls() builtinDefinition {
 	return makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"start_pos", types.Int},
+				{Name: "input", Typ: types.String},
+				{Name: "start_pos", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7606,9 +7705,9 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"start_pos", types.Int},
-				{"length", types.Int},
+				{Name: "input", Typ: types.String},
+				{Name: "start_pos", Typ: types.Int},
+				{Name: "length", Typ: types.Int},
 			},
 			SpecializedVecBuiltin: tree.SubstringStringIntInt,
 			ReturnType:            tree.FixedReturnType(types.String),
@@ -7629,8 +7728,8 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"regex", types.String},
+				{Name: "input", Typ: types.String},
+				{Name: "regex", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7643,9 +7742,9 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.String},
-				{"regex", types.String},
-				{"escape_char", types.String},
+				{Name: "input", Typ: types.String},
+				{Name: "regex", Typ: types.String},
+				{Name: "escape_char", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7660,8 +7759,8 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.VarBit},
-				{"start_pos", types.Int},
+				{Name: "input", Typ: types.VarBit},
+				{Name: "start_pos", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.VarBit),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7675,9 +7774,9 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.VarBit},
-				{"start_pos", types.Int},
-				{"length", types.Int},
+				{Name: "input", Typ: types.VarBit},
+				{Name: "start_pos", Typ: types.Int},
+				{Name: "length", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.VarBit),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7697,8 +7796,8 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.Bytes},
-				{"start_pos", types.Int},
+				{Name: "input", Typ: types.Bytes},
+				{Name: "start_pos", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7712,9 +7811,9 @@ func makeSubStringImpls() builtinDefinition {
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{"input", types.Bytes},
-				{"start_pos", types.Int},
-				{"length", types.Int},
+				{Name: "input", Typ: types.Bytes},
+				{Name: "start_pos", Typ: types.Int},
+				{Name: "length", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -7872,7 +7971,7 @@ func strftimeImpl() builtinDefinition {
 			Category: builtinconstants.CategoryDateAndTime,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.Timestamp}, {"extract_format", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.Timestamp}, {Name: "extract_format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTime := args[0].(*tree.DTimestamp).Time
@@ -7888,7 +7987,7 @@ func strftimeImpl() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.Date}, {"extract_format", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.Date}, {Name: "extract_format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTime, err := args[0].(*tree.DDate).ToTime()
@@ -7907,7 +8006,7 @@ func strftimeImpl() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.TimestampTZ}, {"extract_format", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.TimestampTZ}, {Name: "extract_format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTime := args[0].(*tree.DTimestampTZ).Time
@@ -7931,7 +8030,7 @@ func strptimeImpl() builtinDefinition {
 			Category: builtinconstants.CategoryDateAndTime,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"input", types.String}, {"format", types.String}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.String}, {Name: "format", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.TimestampTZ),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				toParse := string(tree.MustBeDString(args[0]))
@@ -8041,7 +8140,7 @@ func txnTSWithPrecisionOverloads(preferTZOverload bool) []tree.Overload {
 	return append(
 		[]tree.Overload{
 			{
-				Types:             tree.ParamTypes{{"precision", types.Int}},
+				Types:             tree.ParamTypes{{Name: "precision", Typ: types.Int}},
 				ReturnType:        tree.FixedReturnType(types.TimestampTZ),
 				PreferredOverload: preferTZOverload,
 				Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8055,7 +8154,7 @@ func txnTSWithPrecisionOverloads(preferTZOverload bool) []tree.Overload {
 				Volatility: volatility.Stable,
 			},
 			{
-				Types:             tree.ParamTypes{{"precision", types.Int}},
+				Types:             tree.ParamTypes{{Name: "precision", Typ: types.Int}},
 				ReturnType:        tree.FixedReturnType(types.Timestamp),
 				PreferredOverload: !preferTZOverload,
 				Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8069,7 +8168,7 @@ func txnTSWithPrecisionOverloads(preferTZOverload bool) []tree.Overload {
 				Volatility: volatility.Stable,
 			},
 			{
-				Types:      tree.ParamTypes{{"precision", types.Int}},
+				Types:      tree.ParamTypes{{Name: "precision", Typ: types.Int}},
 				ReturnType: tree.FixedReturnType(types.Date),
 				Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 					prec := int32(tree.MustBeDInt(args[0]))
@@ -8129,7 +8228,7 @@ func txnTimeWithPrecisionBuiltin(preferTZOverload bool) builtinDefinition {
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:             tree.ParamTypes{{"precision", types.Int}},
+			Types:             tree.ParamTypes{{Name: "precision", Typ: types.Int}},
 			ReturnType:        tree.FixedReturnType(types.TimeTZ),
 			PreferredOverload: preferTZOverload,
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8143,7 +8242,7 @@ func txnTimeWithPrecisionBuiltin(preferTZOverload bool) builtinDefinition {
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:             tree.ParamTypes{{"precision", types.Int}},
+			Types:             tree.ParamTypes{{Name: "precision", Typ: types.Int}},
 			ReturnType:        tree.FixedReturnType(types.Time),
 			PreferredOverload: !preferTZOverload,
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8266,9 +8365,9 @@ func checkHasNulls(ary tree.DArray) error {
 
 var jsonSetImpl = tree.Overload{
 	Types: tree.ParamTypes{
-		{"val", types.Jsonb},
-		{"path", types.StringArray},
-		{"to", types.Jsonb},
+		{Name: "val", Typ: types.Jsonb},
+		{Name: "path", Typ: types.StringArray},
+		{Name: "to", Typ: types.Jsonb},
 	},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8280,10 +8379,10 @@ var jsonSetImpl = tree.Overload{
 
 var jsonSetWithCreateMissingImpl = tree.Overload{
 	Types: tree.ParamTypes{
-		{"val", types.Jsonb},
-		{"path", types.StringArray},
-		{"to", types.Jsonb},
-		{"create_missing", types.Bool},
+		{Name: "val", Typ: types.Jsonb},
+		{Name: "path", Typ: types.StringArray},
+		{Name: "to", Typ: types.Jsonb},
+		{Name: "create_missing", Typ: types.Bool},
 	},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8317,9 +8416,9 @@ func jsonDatumSet(
 
 var jsonInsertImpl = tree.Overload{
 	Types: tree.ParamTypes{
-		{"target", types.Jsonb},
-		{"path", types.StringArray},
-		{"new_val", types.Jsonb},
+		{Name: "target", Typ: types.Jsonb},
+		{Name: "path", Typ: types.StringArray},
+		{Name: "new_val", Typ: types.Jsonb},
 	},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8331,10 +8430,10 @@ var jsonInsertImpl = tree.Overload{
 
 var jsonInsertWithInsertAfterImpl = tree.Overload{
 	Types: tree.ParamTypes{
-		{"target", types.Jsonb},
-		{"path", types.StringArray},
-		{"new_val", types.Jsonb},
-		{"insert_after", types.Bool},
+		{Name: "target", Typ: types.Jsonb},
+		{Name: "path", Typ: types.StringArray},
+		{Name: "new_val", Typ: types.Jsonb},
+		{Name: "insert_after", Typ: types.Bool},
 	},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
@@ -8367,7 +8466,7 @@ func insertToJSONDatum(
 }
 
 var jsonTypeOfImpl = tree.Overload{
-	Types:      tree.ParamTypes{{"val", types.Jsonb}},
+	Types:      tree.ParamTypes{{Name: "val", Typ: types.Jsonb}},
 	ReturnType: tree.FixedReturnType(types.String),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 		t := tree.MustBeDJSON(args[0]).JSON.Type()
@@ -8442,7 +8541,7 @@ var jsonBuildObjectImpl = tree.Overload{
 }
 
 var toJSONImpl = tree.Overload{
-	Types:      tree.ParamTypes{{"val", types.Any}},
+	Types:      tree.ParamTypes{{Name: "val", Typ: types.Any}},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 		return toJSONObject(evalCtx, args[0])
@@ -8455,14 +8554,14 @@ var prettyPrintNotSupportedError = pgerror.Newf(pgcode.FeatureNotSupported, "pre
 
 var arrayToJSONImpls = makeBuiltin(jsonProps(),
 	tree.Overload{
-		Types:      tree.ParamTypes{{"array", types.AnyArray}},
+		Types:      tree.ParamTypes{{Name: "array", Typ: types.AnyArray}},
 		ReturnType: tree.FixedReturnType(types.Jsonb),
 		Fn:         toJSONImpl.Fn,
 		Info:       "Returns the array as JSON or JSONB.",
 		Volatility: volatility.Stable,
 	},
 	tree.Overload{
-		Types:      tree.ParamTypes{{"array", types.AnyArray}, {"pretty_bool", types.Bool}},
+		Types:      tree.ParamTypes{{Name: "array", Typ: types.AnyArray}, {Name: "pretty_bool", Typ: types.Bool}},
 		ReturnType: tree.FixedReturnType(types.Jsonb),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			prettyPrint := bool(tree.MustBeDBool(args[1]))
@@ -8502,7 +8601,7 @@ var jsonBuildArrayImpl = tree.Overload{
 func jsonObjectImpls() builtinDefinition {
 	return makeBuiltin(jsonProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{"texts", types.StringArray}},
+			Types:      tree.ParamTypes{{Name: "texts", Typ: types.StringArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -8536,8 +8635,8 @@ func jsonObjectImpls() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types: tree.ParamTypes{{"keys", types.StringArray},
-				{"values", types.StringArray}},
+			Types: tree.ParamTypes{{Name: "keys", Typ: types.StringArray},
+				{Name: "values", Typ: types.StringArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				keys := tree.MustBeDArray(args[0])
@@ -8575,7 +8674,7 @@ func jsonObjectImpls() builtinDefinition {
 }
 
 var jsonStripNullsImpl = tree.Overload{
-	Types:      tree.ParamTypes{{"from_json", types.Jsonb}},
+	Types:      tree.ParamTypes{{Name: "from_json", Typ: types.Jsonb}},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 		j, _, err := tree.MustBeDJSON(args[0]).StripNulls()
@@ -8586,7 +8685,7 @@ var jsonStripNullsImpl = tree.Overload{
 }
 
 var jsonArrayLengthImpl = tree.Overload{
-	Types:      tree.ParamTypes{{"json", types.Jsonb}},
+	Types:      tree.ParamTypes{{Name: "json", Typ: types.Jsonb}},
 	ReturnType: tree.FixedReturnType(types.Int),
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 		j := tree.MustBeDJSON(args[0])
@@ -8608,7 +8707,7 @@ var jsonArrayLengthImpl = tree.Overload{
 func similarOverloads(calledOnNullInput bool) []tree.Overload {
 	return []tree.Overload{
 		{
-			Types:      tree.ParamTypes{{"pattern", types.String}},
+			Types:      tree.ParamTypes{{Name: "pattern", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -8622,7 +8721,7 @@ func similarOverloads(calledOnNullInput bool) []tree.Overload {
 			CalledOnNullInput: calledOnNullInput,
 		},
 		{
-			Types:      tree.ParamTypes{{"pattern", types.String}, {"escape", types.String}},
+			Types:      tree.ParamTypes{{Name: "pattern", Typ: types.String}, {Name: "escape", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				if args[0] == tree.DNull {
@@ -8671,7 +8770,7 @@ func jsonOverload1(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{"val", types.Jsonb}},
+		Types:      tree.ParamTypes{{Name: "val", Typ: types.Jsonb}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, tree.MustBeDJSON(args[0]).JSON)
@@ -8688,7 +8787,7 @@ func stringOverload1(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{"val", types.String}},
+		Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, string(tree.MustBeDString(args[0])))
@@ -8706,7 +8805,7 @@ func stringOverload2(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{a, types.String}, {b, types.String}},
+		Types:      tree.ParamTypes{{Name: a, Typ: types.String}, {Name: b, Typ: types.String}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1])))
@@ -8724,7 +8823,7 @@ func stringOverload3(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{a, types.String}, {b, types.String}, {c, types.String}},
+		Types:      tree.ParamTypes{{Name: a, Typ: types.String}, {Name: b, Typ: types.String}, {Name: c, Typ: types.String}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1])), string(tree.MustBeDString(args[2])))
@@ -8741,7 +8840,7 @@ func bytesOverload1(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{"val", types.Bytes}},
+		Types:      tree.ParamTypes{{Name: "val", Typ: types.Bytes}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, string(*args[0].(*tree.DBytes)))
@@ -8759,7 +8858,7 @@ func bytesOverload2(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{a, types.Bytes}, {b, types.Bytes}},
+		Types:      tree.ParamTypes{{Name: a, Typ: types.Bytes}, {Name: b, Typ: types.Bytes}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, string(*args[0].(*tree.DBytes)), string(*args[1].(*tree.DBytes)))
@@ -8776,7 +8875,7 @@ func bitsOverload1(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{"val", types.VarBit}},
+		Types:      tree.ParamTypes{{Name: "val", Typ: types.VarBit}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, args[0].(*tree.DBitArray))
@@ -8794,7 +8893,7 @@ func bitsOverload2(
 	volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ParamTypes{{a, types.VarBit}, {b, types.VarBit}},
+		Types:      tree.ParamTypes{{Name: a, Typ: types.VarBit}, {Name: b, Typ: types.VarBit}},
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 			return f(ctx, evalCtx, args[0].(*tree.DBitArray), args[1].(*tree.DBitArray))
@@ -9289,7 +9388,7 @@ func extractBuiltin() builtinDefinition {
 	return makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryDateAndTime},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Timestamp}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Timestamp}},
 			ReturnType: tree.FixedReturnType(types.Float),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				// extract timeSpan fromTime.
@@ -9304,7 +9403,7 @@ func extractBuiltin() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Interval}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Interval}},
 			ReturnType: tree.FixedReturnType(types.Float),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromInterval := args[1].(*tree.DInterval)
@@ -9317,7 +9416,7 @@ func extractBuiltin() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Date}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Date}},
 			ReturnType: tree.FixedReturnType(types.Float),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				timeSpan := strings.ToLower(string(tree.MustBeDString(args[0])))
@@ -9335,7 +9434,7 @@ func extractBuiltin() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.TimestampTZ}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.TimestampTZ}},
 			ReturnType: tree.FixedReturnType(types.Float),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTSTZ := args[1].(*tree.DTimestampTZ)
@@ -9350,7 +9449,7 @@ func extractBuiltin() builtinDefinition {
 			Volatility: volatility.Stable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.Time}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.Time}},
 			ReturnType: tree.FixedReturnType(types.Float),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTime := args[1].(*tree.DTime)
@@ -9362,7 +9461,7 @@ func extractBuiltin() builtinDefinition {
 			Volatility: volatility.Immutable,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{"element", types.String}, {"input", types.TimeTZ}},
+			Types:      tree.ParamTypes{{Name: "element", Typ: types.String}, {Name: "input", Typ: types.TimeTZ}},
 			ReturnType: tree.FixedReturnType(types.Float),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				fromTime := args[1].(*tree.DTimeTZ)

@@ -1,3 +1,6 @@
+skip issue-num=93731
+----
+
 # This test ensures that table, database and cluster backups properly backup and
 # restore (i.e. capture) an in progress database or table RESTORE. The
 # in-progress restore may take other kinds of descriptors offline (e.g. type,
@@ -16,7 +19,7 @@
 # offline tables.
 
 
-new-server name=s1
+new-cluster name=s1
 ----
 
 exec-sql
@@ -116,7 +119,7 @@ b2 baz table 3 incremental
 
 # Ensure the restored cluster contains nothing from the in-progress restoring database as of system
 # time t0
-new-server name=s2 share-io-dir=s1 allow-implicit-access
+new-cluster name=s2 share-io-dir=s1 allow-implicit-access
 ----
 
 
@@ -131,7 +134,7 @@ SELECT database_name FROM [SHOW DATABASES] WHERE database_name = 'b2';
 
 
 # Ensure restored cluster contains the restored database as of latest time
-new-server name=s3 share-io-dir=s1 allow-implicit-access
+new-cluster name=s3 share-io-dir=s1 allow-implicit-access
 ----
 
 

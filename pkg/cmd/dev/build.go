@@ -122,7 +122,7 @@ var allBuildTargets = func() []string {
 
 func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 	var tmpDir string
-	if buildutil.CrdbTestBuild {
+	if !buildutil.CrdbTestBuild {
 		// tmpDir will contain the build event binary file if produced.
 		var err error
 		tmpDir, err = os.MkdirTemp("", "")
@@ -134,7 +134,7 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 		if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
 			// Retry.
 			if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
-				log.Printf("Sending BEP file to beaver hub failed - %v", err)
+				log.Printf("Internal Error: Sending BEP file to beaver hub failed - %v", err)
 			}
 		}
 		if !buildutil.CrdbTestBuild {
@@ -167,14 +167,16 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 		return err
 	}
 	args = append(args, additionalBazelArgs...)
-	if buildutil.CrdbTestBuild {
-		args = append(args, "--build_event_binary_file=/tmp/path")
-	} else {
-		args = append(args, fmt.Sprintf("--build_event_binary_file=%s", filepath.Join(tmpDir, bepFileBasename)))
-	}
 
 	if cross == "" {
+		// Do not log --build_event_binary_file=... because it is not relevant to the actual call
+		// from the user perspective.
 		logCommand("bazel", args...)
+		if buildutil.CrdbTestBuild {
+			args = append(args, "--build_event_binary_file=/tmp/path")
+		} else {
+			args = append(args, fmt.Sprintf("--build_event_binary_file=%s", filepath.Join(tmpDir, bepFileBasename)))
+		}
 		if err := d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...); err != nil {
 			return err
 		}

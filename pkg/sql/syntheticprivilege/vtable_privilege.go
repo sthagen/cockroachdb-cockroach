@@ -11,14 +11,11 @@
 package syntheticprivilege
 
 import (
-	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 )
 
 // VirtualTablePrivilege represents privileges on virtual tables such as
@@ -32,29 +29,32 @@ type VirtualTablePrivilege struct {
 // VirtualTablePrivilege.
 const VirtualTablePrivilegeType = "VirtualTable"
 
+var _ Object = &VirtualTablePrivilege{}
+
+// VirtualTablePathPrefix is the prefix used for virtual table privileges in system.privileges.
+const VirtualTablePathPrefix = "vtable"
+
 // GetPath implements the Object interface.
 func (p *VirtualTablePrivilege) GetPath() string {
-	return fmt.Sprintf("/vtable/%s/%s", p.SchemaName, p.TableName)
+	return fmt.Sprintf("/%s/%s/%s", VirtualTablePathPrefix, p.SchemaName, p.TableName)
 }
 
-// GetPrivilegeDescriptor implements the PrivilegeObject interface.
-func (p *VirtualTablePrivilege) GetPrivilegeDescriptor(
-	ctx context.Context, planner eval.Planner,
-) (*catpb.PrivilegeDescriptor, error) {
-	if planner.IsActive(ctx, clusterversion.V22_2SystemPrivilegesTable) {
-		return planner.SynthesizePrivilegeDescriptor(ctx, p.GetPath(), p.GetObjectType())
-	}
+// GetFallbackPrivileges implements the Object interface.
+func (e *VirtualTablePrivilege) GetFallbackPrivileges() *catpb.PrivilegeDescriptor {
 	return catpb.NewPrivilegeDescriptor(
-		username.PublicRoleName(), privilege.List{privilege.SELECT}, privilege.List{}, username.NodeUserName(),
-	), nil
+		username.PublicRoleName(),
+		privilege.List{privilege.SELECT},
+		privilege.List{},
+		username.NodeUserName(),
+	)
 }
 
-// GetObjectType implements the PrivilegeObject interface.
+// GetObjectType implements the Object interface.
 func (p *VirtualTablePrivilege) GetObjectType() privilege.ObjectType {
 	return privilege.VirtualTable
 }
 
-// GetName implements the PrivilegeObject interface.
+// GetName implements the Object interface.
 func (p *VirtualTablePrivilege) GetName() string {
 	return fmt.Sprintf("%s.%s", p.SchemaName, p.TableName)
 }

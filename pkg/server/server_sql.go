@@ -64,7 +64,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqlwatcher"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/cacheutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
@@ -98,6 +97,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilegecache"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
@@ -237,7 +237,8 @@ type sqlServerOptionalKVArgs struct {
 // sqlServerOptionalTenantArgs are the arguments supplied to newSQLServer which
 // are only available if the SQL server runs as part of a standalone SQL node.
 type sqlServerOptionalTenantArgs struct {
-	tenantConnect kvtenant.Connector
+	tenantConnect    kvtenant.Connector
+	promRuleExporter *metric.PrometheusRuleExporter
 }
 
 type sqlServerArgs struct {
@@ -514,7 +515,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		addressResolver := func(nodeID roachpb.NodeID) (net.Addr, error) {
 			info, err := cfg.sqlInstanceReader.GetInstance(cfg.rpcContext.MasterCtx, base.SQLInstanceID(nodeID))
 			if err != nil {
-				return nil, errors.Wrapf(err, "unable to look up descriptor for nsql%d", nodeID)
+				return nil, errors.Wrapf(err, "unable to look up descriptor for n%d", nodeID)
 			}
 			return &util.UnresolvedAddr{AddressField: info.InstanceAddr}, nil
 		}
@@ -898,9 +899,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		TenantUsageServer:         cfg.tenantUsageServer,
 		KVStoresIterator:          cfg.kvStoresIterator,
 		RangeDescIteratorFactory:  cfg.rangeDescIteratorFactory,
-		SyntheticPrivilegeCache: cacheutil.NewCache(
-			serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper, 1 /* numSystemTables */),
-
+		SyntheticPrivilegeCache: syntheticprivilegecache.New(
+			cfg.Settings, cfg.stopper, cfg.db,
+			serverCacheMemoryMonitor.MakeBoundAccount(),
+			virtualSchemas, cfg.internalExecutorFactory,
+		),
 		DistSQLPlanner: sql.NewDistSQLPlanner(
 			ctx,
 			execinfra.Version,
@@ -1196,6 +1199,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	execCfg.SpanConfigLimiter = spanConfig.limiter
 	execCfg.SpanConfigSplitter = spanConfig.splitter
 
+	var waitForInstanceReaderStarted func(context.Context) error
+	if cfg.sqlInstanceReader != nil {
+		waitForInstanceReaderStarted = cfg.sqlInstanceReader.WaitForStarted
+	}
 	temporaryObjectCleaner := sql.NewTemporaryObjectCleaner(
 		cfg.Settings,
 		cfg.db,
@@ -1206,6 +1213,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sqlExecutorTestingKnobs,
 		ieFactory,
 		collectionFactory,
+		waitForInstanceReaderStarted,
 	)
 
 	reporter := &diagnostics.Reporter{
@@ -1334,6 +1342,8 @@ func (s *SQLServer) preStart(
 		return err
 	}
 
+	s.leaseMgr.SetRegionPrefix(regionPhysicalRep)
+
 	// Start the sql liveness subsystem. We'll need it to get a session.
 	s.sqlLivenessProvider.Start(ctx, regionPhysicalRep)
 
@@ -1347,7 +1357,7 @@ func (s *SQLServer) preStart(
 		}
 		// Start instance ID reclaim loop.
 		if err := s.sqlInstanceStorage.RunInstanceIDReclaimLoop(
-			ctx, stopper, timeutil.DefaultTimeSource{}, session.Expiration,
+			ctx, stopper, timeutil.DefaultTimeSource{}, s.internalExecutorFactory, session.Expiration,
 		); err != nil {
 			return err
 		}
@@ -1501,17 +1511,12 @@ func (s *SQLServer) preStart(
 					sessiondatapb.SessionData{},
 				)
 			},
-			ShouldRunScheduler: func(ctx context.Context, ts hlc.ClockTimestamp) (bool, error) {
-				if s.execCfg.Codec.ForSystemTenant() {
-					return s.isMeta1Leaseholder(ctx, ts)
-				}
-				return true, nil
-			},
 		},
 		scheduledjobs.ProdJobSchedulerEnv,
 	)
 
 	scheduledlogging.Start(ctx, stopper, s.execCfg.DB, s.execCfg.Settings, s.internalExecutor, s.execCfg.CaptureIndexUsageStatsKnobs)
+	s.execCfg.SyntheticPrivilegeCache.Start(ctx)
 	return nil
 }
 
@@ -1541,7 +1546,6 @@ func (s *SQLServer) startServeSQL(
 ) error {
 	log.Ops.Info(ctx, "serving sql connections")
 	// Start servicing SQL connections.
-
 	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
 	tcpKeepAlive := makeTCPKeepAliveManager()
 

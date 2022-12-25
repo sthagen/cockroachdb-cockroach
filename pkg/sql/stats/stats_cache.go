@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -192,7 +192,7 @@ func decodeTableStatisticsKV(
 ) (tableDesc descpb.ID, err error) {
 	// The primary key of table_statistics is (tableID INT, statisticID INT).
 	types := []*types.T{types.Int, types.Int}
-	dirs := []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC, catpb.IndexColumn_ASC}
+	dirs := []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC}
 	keyVals := make([]rowenc.EncDatum, 2)
 	if _, _, err := rowenc.DecodeIndexKey(codec, types, keyVals, dirs, kv.Key); err != nil {
 		return 0, err
@@ -782,7 +782,8 @@ ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
 		return nil, err
 	}
 
-	var statsList []*TableStatistic
+	var fullStatsList []*TableStatistic
+	var partialStatsList []*TableStatistic
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		stats, err := sc.parseStats(ctx, it.Cur(), partialStatisticsColumnsVerActive)
@@ -790,16 +791,27 @@ ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
 			log.Warningf(ctx, "could not decode statistic for table %d: %v", tableID, err)
 			continue
 		}
-		statsList = append(statsList, stats)
+		if stats.PartialPredicate != "" {
+			partialStatsList = append(partialStatsList, stats)
+		} else {
+			fullStatsList = append(fullStatsList, stats)
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	if forecast {
-		forecasts := ForecastTableStatistics(ctx, statsList)
-		statsList = append(forecasts, statsList...)
+	// TODO(faizaanmadhani): Wrap merging behind a boolean so
+	// that it can be turned off.
+	if len(partialStatsList) > 0 {
+		mergedStats := MergedStatistics(ctx, partialStatsList, fullStatsList)
+		fullStatsList = append(mergedStats, fullStatsList...)
 	}
 
-	return statsList, nil
+	if forecast {
+		forecasts := ForecastTableStatistics(ctx, fullStatsList)
+		fullStatsList = append(forecasts, fullStatsList...)
+	}
+
+	return fullStatsList, nil
 }

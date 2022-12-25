@@ -268,8 +268,8 @@ export class StatementDetails extends React.Component<
       this.props.location,
     );
     this.props.refreshUserSQLRoles();
+    this.props.refreshNodes();
     if (!this.props.isTenant) {
-      this.props.refreshNodes();
       this.props.refreshNodesLiveness();
       if (!this.props.hasViewActivityRedactedRole) {
         this.props.refreshStatementDiagnosticsRequests();
@@ -291,8 +291,8 @@ export class StatementDetails extends React.Component<
       );
     }
 
+    this.props.refreshNodes();
     if (!this.props.isTenant) {
-      this.props.refreshNodes();
       this.props.refreshNodesLiveness();
       if (!this.props.hasViewActivityRedactedRole) {
         this.props.refreshStatementDiagnosticsRequests();
@@ -527,7 +527,9 @@ export class StatementDetails extends React.Component<
       (stats.nodes || []).map(node => node.toString()),
     ).sort();
     const regions = unique(
-      (stats.nodes || []).map(node => nodeRegions[node.toString()]),
+      (stats.nodes || [])
+        .map(node => nodeRegions[node.toString()])
+        .filter(r => r), // Remove undefined / unknown regions.
     ).sort();
 
     const lastExec =

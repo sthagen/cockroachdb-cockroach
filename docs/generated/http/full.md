@@ -1246,7 +1246,7 @@ Support status: [reserved](#support-status)
 #### RaftState
 
 RaftState gives internal details about a Raft group's state.
-Closely mirrors the upstream definitions in github.com/etcd-io/etcd/raft.
+Closely mirrors the upstream definitions in github.com/etcd-io/raft.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
@@ -1492,7 +1492,7 @@ Support status: [reserved](#support-status)
 #### RaftState
 
 RaftState gives internal details about a Raft group's state.
-Closely mirrors the upstream definitions in github.com/etcd-io/etcd/raft.
+Closely mirrors the upstream definitions in github.com/etcd-io/raft.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
@@ -2142,6 +2142,10 @@ ActiveQuery represents a query in flight on some Session.
 | plan_gist | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The compressed plan that can be converted back into the statement's logical plan. Empty if the statement is in the PREPARING state. | [reserved](#support-status) |
 | placeholders | [string](#cockroach.server.serverpb.ListSessionsResponse-string) | repeated | The placeholders if any. | [reserved](#support-status) |
 | database | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The database the statement was executed on. | [reserved](#support-status) |
+| session_id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | The ID for the session that the statement was executed on (uint128 represented as raw bytes). | [reserved](#support-status) |
+| app_name | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The application name for the session that the statement was executed on. | [reserved](#support-status) |
+| username | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The user name for the session that the statement was executed on. | [reserved](#support-status) |
+| client_address | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The client address for the session that the statement was executed on. | [reserved](#support-status) |
 
 
 
@@ -2287,6 +2291,10 @@ ActiveQuery represents a query in flight on some Session.
 | plan_gist | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The compressed plan that can be converted back into the statement's logical plan. Empty if the statement is in the PREPARING state. | [reserved](#support-status) |
 | placeholders | [string](#cockroach.server.serverpb.ListSessionsResponse-string) | repeated | The placeholders if any. | [reserved](#support-status) |
 | database | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The database the statement was executed on. | [reserved](#support-status) |
+| session_id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | The ID for the session that the statement was executed on (uint128 represented as raw bytes). | [reserved](#support-status) |
+| app_name | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The application name for the session that the statement was executed on. | [reserved](#support-status) |
+| username | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The user name for the session that the statement was executed on. | [reserved](#support-status) |
+| client_address | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The client address for the session that the statement was executed on. | [reserved](#support-status) |
 
 
 
@@ -3710,7 +3718,7 @@ Support status: [reserved](#support-status)
 #### RaftState
 
 RaftState gives internal details about a Raft group's state.
-Closely mirrors the upstream definitions in github.com/etcd-io/etcd/raft.
+Closely mirrors the upstream definitions in github.com/etcd-io/raft.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |

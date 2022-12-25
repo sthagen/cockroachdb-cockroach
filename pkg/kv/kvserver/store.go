@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
@@ -74,7 +75,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/shuffle"
@@ -89,7 +89,7 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	prometheusgo "github.com/prometheus/client_model/go"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 	"golang.org/x/time/rate"
 )
 
@@ -343,15 +343,6 @@ func verifyKeys(start, end roachpb.Key, checkEndKey bool) error {
 	}
 
 	return nil
-}
-
-// A NotBootstrappedError indicates that an engine has not yet been
-// bootstrapped due to a store identifier not being present.
-type NotBootstrappedError struct{}
-
-// Error formats error.
-func (e *NotBootstrappedError) Error() string {
-	return "store has not been bootstrapped"
 }
 
 // A storeReplicaVisitor calls a visitor function for each of a store's
@@ -1232,15 +1223,29 @@ func NewStore(
 	}
 	s.ioThreshold.t = &admissionpb.IOThreshold{}
 	var allocatorStorePool storepool.AllocatorStorePool
+	var storePoolIsDeterministic bool
 	if cfg.StorePool != nil {
+		// There are number of test cases that make a test store but don't add
+		// gossip or a store pool. So we can't rely on the existence of the
+		// store pool in those cases.
 		allocatorStorePool = cfg.StorePool
+		storePoolIsDeterministic = allocatorStorePool.IsDeterministic()
 	}
 	if cfg.RPCContext != nil {
-		s.allocator = allocatorimpl.MakeAllocator(cfg.Settings, allocatorStorePool, cfg.RPCContext.RemoteClocks.Latency, cfg.TestingKnobs.AllocatorKnobs)
+		s.allocator = allocatorimpl.MakeAllocator(
+			cfg.Settings,
+			storePoolIsDeterministic,
+			cfg.RPCContext.RemoteClocks.Latency,
+			cfg.TestingKnobs.AllocatorKnobs,
+		)
 	} else {
-		s.allocator = allocatorimpl.MakeAllocator(cfg.Settings, allocatorStorePool, func(string) (time.Duration, bool) {
-			return 0, false
-		}, cfg.TestingKnobs.AllocatorKnobs)
+		s.allocator = allocatorimpl.MakeAllocator(
+			cfg.Settings,
+			storePoolIsDeterministic,
+			func(string) (time.Duration, bool) {
+				return 0, false
+			}, cfg.TestingKnobs.AllocatorKnobs,
+		)
 	}
 	if s.metrics != nil {
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedLeaseTransferMetrics)
@@ -1756,152 +1761,13 @@ func (s *Store) IsStarted() bool {
 	return atomic.LoadInt32(&s.started) == 1
 }
 
-// IterateIDPrefixKeys helps visit system keys that use RangeID prefixing (such
-// as RaftHardStateKey, RangeTombstoneKey, and many others). Such keys could in
-// principle exist at any RangeID, and this helper efficiently discovers all the
-// keys of the desired type (as specified by the supplied `keyFn`) and, for each
-// key-value pair discovered, unmarshals it into `msg` and then invokes `f`.
-//
-// Iteration stops on the first error (and will pass through that error).
-func IterateIDPrefixKeys(
-	ctx context.Context,
-	reader storage.Reader,
-	keyFn func(roachpb.RangeID) roachpb.Key,
-	msg protoutil.Message,
-	f func(_ roachpb.RangeID) error,
-) error {
-	rangeID := roachpb.RangeID(1)
-	// NB: Range-ID local keys have no versions and no intents.
-	iter := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-		UpperBound: keys.LocalRangeIDPrefix.PrefixEnd().AsRawKey(),
-	})
-	defer iter.Close()
-
-	for {
-		bumped := false
-		mvccKey := storage.MakeMVCCMetadataKey(keyFn(rangeID))
-		iter.SeekGE(mvccKey)
-
-		if ok, err := iter.Valid(); !ok {
-			return err
-		}
-
-		unsafeKey := iter.UnsafeKey()
-
-		if !bytes.HasPrefix(unsafeKey.Key, keys.LocalRangeIDPrefix) {
-			// Left the local keyspace, so we're done.
-			return nil
-		}
-
-		curRangeID, _, _, _, err := keys.DecodeRangeIDKey(unsafeKey.Key)
-		if err != nil {
-			return err
-		}
-
-		if curRangeID > rangeID {
-			// `bumped` is always `false` here, but let's be explicit.
-			if !bumped {
-				rangeID = curRangeID
-				bumped = true
-			}
-			mvccKey = storage.MakeMVCCMetadataKey(keyFn(rangeID))
-		}
-
-		if !unsafeKey.Key.Equal(mvccKey.Key) {
-			if !bumped {
-				// Don't increment the rangeID if it has already been incremented
-				// above, or we could skip past a value we ought to see.
-				rangeID++
-				bumped = true // for completeness' sake; continuing below anyway
-			}
-			continue
-		}
-
-		ok, err := storage.MVCCGetProto(
-			ctx, reader, unsafeKey.Key, hlc.Timestamp{}, msg, storage.MVCCGetOptions{})
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.Errorf("unable to unmarshal %s into %T", unsafeKey.Key, msg)
-		}
-
-		if err := f(rangeID); err != nil {
-			return iterutil.Map(err)
-		}
-		rangeID++
-	}
-}
-
-// IterateRangeDescriptorsFromDisk calls the provided function with each
-// descriptor from the provided Engine. The return values of this method and fn
-// have semantics similar to storage.MVCCIterate.
-func IterateRangeDescriptorsFromDisk(
-	ctx context.Context, reader storage.Reader, fn func(desc roachpb.RangeDescriptor) error,
-) error {
-	log.Event(ctx, "beginning range descriptor iteration")
-	// MVCCIterator over all range-local key-based data.
-	start := keys.RangeDescriptorKey(roachpb.RKeyMin)
-	end := keys.RangeDescriptorKey(roachpb.RKeyMax)
-
-	allCount := 0
-	matchCount := 0
-	bySuffix := make(map[string]int)
-	kvToDesc := func(kv roachpb.KeyValue) error {
-		allCount++
-		// Only consider range metadata entries; ignore others.
-		_, suffix, _, err := keys.DecodeRangeKey(kv.Key)
-		if err != nil {
-			return err
-		}
-		bySuffix[string(suffix)]++
-		if !bytes.Equal(suffix, keys.LocalRangeDescriptorSuffix) {
-			return nil
-		}
-		var desc roachpb.RangeDescriptor
-		if err := kv.Value.GetProto(&desc); err != nil {
-			return err
-		}
-		matchCount++
-		err = fn(desc)
-		if err == nil {
-			return nil
-		}
-		if iterutil.Map(err) == nil {
-			return iterutil.StopIteration()
-		}
-		return err
-	}
-
-	_, err := storage.MVCCIterate(ctx, reader, start, end, hlc.MaxTimestamp,
-		storage.MVCCScanOptions{Inconsistent: true}, kvToDesc)
-	log.Eventf(ctx, "iterated over %d keys to find %d range descriptors (by suffix: %v)",
-		allCount, matchCount, bySuffix)
-	return err
-}
-
-// ReadStoreIdent reads the StoreIdent from the store.
-// It returns *NotBootstrappedError if the ident is missing (meaning that the
-// store needs to be bootstrapped).
-func ReadStoreIdent(ctx context.Context, eng storage.Engine) (roachpb.StoreIdent, error) {
-	var ident roachpb.StoreIdent
-	ok, err := storage.MVCCGetProto(
-		ctx, eng, keys.StoreIdentKey(), hlc.Timestamp{}, &ident, storage.MVCCGetOptions{})
-	if err != nil {
-		return roachpb.StoreIdent{}, err
-	} else if !ok {
-		return roachpb.StoreIdent{}, &NotBootstrappedError{}
-	}
-	return ident, err
-}
-
 // Start the engine, set the GC and read the StoreIdent.
 func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	s.stopper = stopper
 
 	// Populate the store ident. If not bootstrapped, ReadStoreIntent will
 	// return an error.
-	ident, err := ReadStoreIdent(ctx, s.engine)
+	ident, err := kvstorage.ReadStoreIdent(ctx, s.engine)
 	if err != nil {
 		return err
 	}
@@ -1995,82 +1861,49 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// (consistent=false). Uncommitted intents which have been abandoned
 	// due to a split crashing halfway will simply be resolved on the
 	// next split attempt. They can otherwise be ignored.
-
+	//
+	// Note that we do not create raft groups at this time; they will be created
+	// on-demand the first time they are needed. This helps reduce the amount of
+	// election-related traffic in a cold start.
+	// Raft initialization occurs when we propose a command on this range or
+	// receive a raft message addressed to it.
+	// TODO(bdarnell): Also initialize raft groups when read leases are needed.
+	// TODO(bdarnell): Scan all ranges at startup for unapplied log entries
+	// and initialize those groups.
+	//
 	// TODO(peter): While we have to iterate to find the replica descriptors
 	// serially, we can perform the migrations and replica creation
 	// concurrently. Note that while we can perform this initialization
 	// concurrently, all of the initialization must be performed before we start
 	// listening for Raft messages and starting the process Raft loop.
-	err = IterateRangeDescriptorsFromDisk(ctx, s.engine,
-		func(desc roachpb.RangeDescriptor) error {
-			if !desc.IsInitialized() {
-				return errors.Errorf("found uninitialized RangeDescriptor: %+v", desc)
-			}
-			replicaDesc, found := desc.GetReplicaDescriptor(s.StoreID())
-			if !found {
-				// This is a pre-emptive snapshot. It's also possible that this is a
-				// range which has processed a raft command to remove itself (which is
-				// possible prior to 19.2 or if the DisableEagerReplicaRemoval is
-				// enabled) and has not yet been removed by the replica gc queue.
-				// We treat both cases the same way. These should no longer exist in
-				// 20.2 or after as there was a migration in 20.1 to remove them and
-				// no pre-emptive snapshot should have been sent since 19.2 was
-				// finalized.
-				return errors.AssertionFailedf(
-					"found RangeDescriptor for range %d at generation %d which does not"+
-						" contain this store %d",
-					redact.Safe(desc.RangeID),
-					redact.Safe(desc.Generation),
-					redact.Safe(s.StoreID()))
-			}
-
-			rep, err := newReplica(ctx, &desc, s, replicaDesc.ReplicaID)
-			if err != nil {
-				return err
-			}
-
-			// We can't lock s.mu across NewReplica due to the lock ordering
-			// constraint (*Replica).raftMu < (*Store).mu. See the comment on
-			// (Store).mu.
-			s.mu.Lock()
-			err = s.addReplicaInternalLocked(rep)
-			s.mu.Unlock()
-			if err != nil {
-				return err
-			}
-
-			// Add this range and its stats to our counter.
-			s.metrics.ReplicaCount.Inc(1)
-			if _, ok := rep.TenantID(); ok {
-				// TODO(tbg): why the check? We're definitely an initialized range so
-				// we have a tenantID.
-				s.metrics.addMVCCStats(ctx, rep.tenantMetricsRef, rep.GetMVCCStats())
-			} else {
-				return errors.AssertionFailedf("found newly constructed replica"+
-					" for range %d at generation %d with an invalid tenant ID in store %d",
-					redact.Safe(desc.RangeID),
-					redact.Safe(desc.Generation),
-					redact.Safe(s.StoreID()))
-			}
-
-			if _, ok := desc.GetReplicaDescriptor(s.StoreID()); !ok {
-				// We are no longer a member of the range, but we didn't GC the replica
-				// before shutting down. Add the replica to the GC queue.
-				s.replicaGCQueue.AddAsync(ctx, rep, replicaGCPriorityRemoved)
-			}
-
-			// Note that we do not create raft groups at this time; they will be created
-			// on-demand the first time they are needed. This helps reduce the amount of
-			// election-related traffic in a cold start.
-			// Raft initialization occurs when we propose a command on this range or
-			// receive a raft message addressed to it.
-			// TODO(bdarnell): Also initialize raft groups when read leases are needed.
-			// TODO(bdarnell): Scan all ranges at startup for unapplied log entries
-			// and initialize those groups.
-			return nil
-		})
+	engRepls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.engine)
 	if err != nil {
 		return err
+	}
+	for fullID, desc := range engRepls.Initialized {
+		rep, err := newReplica(ctx, desc, s, fullID.ReplicaID)
+		if err != nil {
+			return err
+		}
+
+		// We can't lock s.mu across NewReplica due to the lock ordering
+		// constraint (*Replica).raftMu < (*Store).mu. See the comment on
+		// (Store).mu.
+		s.mu.Lock()
+		err = s.addReplicaInternalLocked(rep)
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+
+		// Add this range and its stats to our counter.
+		s.metrics.ReplicaCount.Inc(1)
+		// INVARIANT: each initialized Replica is associated to a tenant.
+		if _, ok := rep.TenantID(); ok {
+			s.metrics.addMVCCStats(ctx, rep.tenantMetricsRef, rep.GetMVCCStats())
+		} else {
+			return errors.AssertionFailedf("no tenantID for initialized replica %s", rep)
+		}
 	}
 
 	// Start Raft processing goroutines.
@@ -2861,10 +2694,10 @@ func ReadMaxHLCUpperBound(ctx context.Context, engines []storage.Engine) (int64,
 // cluster version, which must be present.
 func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 	// See if this is an already-bootstrapped store.
-	ident, err := ReadStoreIdent(ctx, eng)
+	ident, err := kvstorage.ReadStoreIdent(ctx, eng)
 	if err == nil {
 		return errors.Errorf("engine already initialized as %s", ident.String())
-	} else if !errors.HasType(err, (*NotBootstrappedError)(nil)) {
+	} else if !errors.HasType(err, (*kvstorage.NotBootstrappedError)(nil)) {
 		return errors.Wrap(err, "unable to read store ident")
 	}
 	// Engine is not bootstrapped yet (i.e. no StoreIdent). Does it contain a

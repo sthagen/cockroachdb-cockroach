@@ -40,8 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -251,8 +251,12 @@ func TestReplicaRangefeed(t *testing.T) {
 						break
 					}
 
-					expKey, expValue := expIter.UnsafeKey(), expIter.UnsafeValue()
-					sstKey, sstValue := sstIter.UnsafeKey(), sstIter.UnsafeValue()
+					checkValErr := func(v []byte, err error) []byte {
+						require.NoError(t, err)
+						return v
+					}
+					expKey, expValue := expIter.UnsafeKey(), checkValErr(expIter.UnsafeValue())
+					sstKey, sstValue := sstIter.UnsafeKey(), checkValErr(sstIter.UnsafeValue())
 					require.Equal(t, expKey.Key, sstKey.Key)
 					require.Equal(t, expValue, sstValue)
 					// We don't compare expKey.Timestamp and sstKey.Timestamp, because the

@@ -49,7 +49,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 // TestCluster represents a set of TestServers. The hope is that it can be used
@@ -85,6 +85,15 @@ func (tc *TestCluster) NumServers() int {
 // Server is part of TestClusterInterface.
 func (tc *TestCluster) Server(idx int) serverutils.TestServerInterface {
 	return tc.Servers[idx]
+}
+
+// NodeIDs is part of TestClusterInterface.
+func (tc *TestCluster) NodeIDs() []roachpb.NodeID {
+	nodeIds := make([]roachpb.NodeID, len(tc.Servers))
+	for i, s := range tc.Servers {
+		nodeIds[i] = s.NodeID()
+	}
+	return nodeIds
 }
 
 // ServerTyped is like Server, but returns the right type.

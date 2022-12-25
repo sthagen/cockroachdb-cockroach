@@ -62,8 +62,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	raft "go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	raft "go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 )
 
@@ -5750,7 +5750,7 @@ func TestElectionAfterRestart(t *testing.T) {
 
 		testutils.SucceedsSoon(t, func() error {
 			for _, row := range sqlutils.MakeSQLRunner(tc.Conns[0]).QueryStr(
-				t, `SELECT range_id FROM crdb_internal.ranges_no_leases WHERE table_name = 't';`,
+				t, `SELECT range_id FROM [SHOW RANGES FROM TABLE t]`,
 			) {
 				n, err := strconv.Atoi(row[0])
 				require.NoError(t, err)

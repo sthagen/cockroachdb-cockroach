@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/pebble"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 var (
@@ -1416,13 +1416,13 @@ The messages are dropped to help these replicas to recover from I/O overload.`,
 	}
 	metaGCUsedClearRange = metric.Metadata{
 		Name:        "queue.gc.info.clearrangesuccess",
-		Help:        "Number of successful ClearRange operation during GC",
+		Help:        "Number of successful ClearRange operations during GC",
 		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaGCFailedClearRange = metric.Metadata{
 		Name:        "queue.gc.info.clearrangefailed",
-		Help:        "Number of failed ClearRange operation during GC",
+		Help:        "Number of failed ClearRange operations during GC",
 		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -2394,7 +2394,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftTimeoutCampaign: metric.NewCounter(metaRaftTimeoutCampaign),
 
 		// Raft message metrics.
-		RaftRcvdMessages: [...]*metric.Counter{
+		RaftRcvdMessages: [maxRaftMsgType + 1]*metric.Counter{
 			raftpb.MsgProp:           metric.NewCounter(metaRaftRcvdProp),
 			raftpb.MsgApp:            metric.NewCounter(metaRaftRcvdApp),
 			raftpb.MsgAppResp:        metric.NewCounter(metaRaftRcvdAppResp),

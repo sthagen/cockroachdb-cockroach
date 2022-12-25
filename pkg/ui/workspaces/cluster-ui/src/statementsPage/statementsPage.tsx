@@ -81,7 +81,9 @@ import { isSelectedColumn } from "src/columnsSelector/utils";
 import { StatementViewType } from "./statementPageTypes";
 import moment from "moment";
 import {
+  databasesRequest,
   InsertStmtDiagnosticRequest,
+  SqlExecutionRequest,
   StatementDiagnosticsReport,
 } from "../api";
 
@@ -94,6 +96,7 @@ const sortableTableCx = classNames.bind(sortableTableStyles);
 // provide convenient definitions for `mapDispatchToProps`, `mapStateToProps` and props that
 // have to be provided by parent component.
 export interface StatementsPageDispatchProps {
+  refreshDatabases: (timeout?: moment.Duration) => void;
   refreshStatements: (req: StatementsRequest) => void;
   refreshStatementDiagnosticsRequests: () => void;
   refreshNodes: () => void;
@@ -313,6 +316,11 @@ export class StatementsPage extends React.Component<
     this.resetPolling(this.props.timeScale.key);
   };
 
+  refreshDatabases = (): void => {
+    this.props.refreshDatabases();
+    this.resetPolling(this.props.timeScale.key);
+  };
+
   resetSQLStats = (): void => {
     const req = statementsRequestFromProps(this.props);
     this.props.resetSQLStats(req);
@@ -342,12 +350,12 @@ export class StatementsPage extends React.Component<
       );
     }
 
+    this.refreshDatabases();
+
     this.props.refreshUserSQLRoles();
-    if (!this.props.isTenant) {
-      this.props.refreshNodes();
-      if (!this.props.hasViewActivityRedactedRole) {
-        this.props.refreshStatementDiagnosticsRequests();
-      }
+    this.props.refreshNodes();
+    if (!this.props.isTenant && !this.props.hasViewActivityRedactedRole) {
+      this.props.refreshStatementDiagnosticsRequests();
     }
   }
 
@@ -385,11 +393,9 @@ export class StatementsPage extends React.Component<
 
   componentDidUpdate = (): void => {
     this.updateQueryParams();
-    if (!this.props.isTenant) {
-      this.props.refreshNodes();
-      if (!this.props.hasViewActivityRedactedRole) {
-        this.props.refreshStatementDiagnosticsRequests();
-      }
+    this.props.refreshNodes();
+    if (!this.props.isTenant && !this.props.hasViewActivityRedactedRole) {
+      this.props.refreshStatementDiagnosticsRequests();
     }
   };
 

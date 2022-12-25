@@ -14,14 +14,14 @@ import (
 	"context"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func (r *Replica) quiesceLocked(ctx context.Context, lagging laggingReplicaSet) {
@@ -87,7 +87,7 @@ func (r *Replica) maybeUnquiesceAndWakeLeaderLocked() bool {
 	r.store.unquiescedReplicas.Unlock()
 	r.maybeCampaignOnWakeLocked(ctx)
 	// Propose an empty command which will wake the leader.
-	data := kvserverbase.EncodeRaftCommand(kvserverbase.RaftVersionStandard, makeIDKey(), nil)
+	data := raftlog.EncodeRaftCommand(raftlog.EntryEncodingStandardPrefixByte, makeIDKey(), nil)
 	_ = r.mu.internalRaftGroup.Propose(data)
 	return true
 }

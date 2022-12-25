@@ -19,14 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -310,9 +309,7 @@ func (r *Registry) insertRequestInternal(
 	err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Check if there's already a pending request for this fingerprint.
 		row, err := r.ie.QueryRowEx(ctx, "stmt-diag-check-pending", txn,
-			sessiondata.InternalExecutorOverride{
-				User: username.RootUserName(),
-			},
+			sessiondata.RootUserSessionDataOverride,
 			`SELECT count(1) FROM system.statement_diagnostics_requests
 				WHERE
 					completed = false AND
@@ -391,9 +388,7 @@ func (r *Registry) insertRequestInternal(
 // CancelRequest is part of the server.StmtDiagnosticsRequester interface.
 func (r *Registry) CancelRequest(ctx context.Context, requestID int64) error {
 	row, err := r.ie.QueryRowEx(ctx, "stmt-diag-cancel-request", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.RootUserName(),
-		},
+		sessiondata.RootUserSessionDataOverride,
 		// Rather than deleting the row from the table, we choose to mark the
 		// request as "expired" by setting `expires_at` into the past. This will
 		// allow any queries that are currently being traced for this request to
@@ -668,9 +663,7 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 			extraColumns = ", sampling_probability"
 		}
 		it, err := r.ie.QueryIteratorEx(ctx, "stmt-diag-poll", nil, /* txn */
-			sessiondata.InternalExecutorOverride{
-				User: username.RootUserName(),
-			},
+			sessiondata.RootUserSessionDataOverride,
 			fmt.Sprintf(`SELECT id, statement_fingerprint, min_execution_latency, expires_at%s
 				FROM system.statement_diagnostics_requests
 				WHERE completed = false AND (expires_at IS NULL OR expires_at > now())`, extraColumns),
@@ -700,7 +693,7 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 	defer r.mu.Unlock()
 
 	now := timeutil.Now()
-	var ids util.FastIntSet
+	var ids intsets.Fast
 	for _, row := range rows {
 		id := RequestID(*row[0].(*tree.DInt))
 		stmtFingerprint := string(*row[1].(*tree.DString))

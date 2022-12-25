@@ -40,7 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
@@ -585,7 +585,11 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 					if err != nil {
 						return err
 					}
-					if err = b.PutEngineKey(key, iter.UnsafeValue()); err != nil {
+					v, err := iter.UnsafeValue()
+					if err != nil {
+						return err
+					}
+					if err = b.PutEngineKey(key, v); err != nil {
 						return err
 					}
 					if err = maybeFlushBatch(); err != nil {

@@ -33,7 +33,6 @@ go_library(
         "point_synthesizing_iter.go",
         "read_as_of_iterator.go",
         "replicas_storage.go",
-        "resource_limiter.go",
         "row_counter.go",
         "slice.go",
         "slice_go1.9.go",
@@ -42,7 +41,6 @@ go_library(
         "store_properties.go",
         "temp_engine.go",
         "verifying_iterator.go",
-        ":gen-resourcelimitreached-stringer",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/storage",
     visibility = ["//visibility:public"],
@@ -86,6 +84,7 @@ go_library(
         "@com_github_cockroachdb_pebble//bloom",
         "@com_github_cockroachdb_pebble//rangekey",
         "@com_github_cockroachdb_pebble//record",
+        "@com_github_cockroachdb_pebble//replay",
         "@com_github_cockroachdb_pebble//sstable",
         "@com_github_cockroachdb_pebble//vfs",
         "@com_github_cockroachdb_pebble//vfs/atomicfs",
@@ -94,7 +93,7 @@ go_library(
         "@com_github_elastic_gosigar//:gosigar",
         "@com_github_gogo_protobuf//proto",
         "@com_github_prometheus_client_model//go",
-        "@io_etcd_go_etcd_raft_v3//raftpb",
+        "@io_etcd_go_raft_v3//raftpb",
     ],
 )
 
@@ -128,7 +127,6 @@ go_test(
         "pebble_mvcc_scanner_test.go",
         "pebble_test.go",
         "read_as_of_iterator_test.go",
-        "resource_limiter_test.go",
         "sst_test.go",
         "sst_writer_test.go",
         "temp_engine_test.go",
@@ -185,12 +183,6 @@ go_test(
         "@org_golang_google_protobuf//proto",
         "@org_golang_x_sync//errgroup",
     ],
-)
-
-stringer(
-    name = "gen-resourcelimitreached-stringer",
-    src = "resource_limiter.go",
-    typ = "ResourceLimitReached",
 )
 
 get_x_data(name = "get_x_data")

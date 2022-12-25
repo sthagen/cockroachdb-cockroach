@@ -15,16 +15,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 // replica_application_*.go files provide concrete implementations of
@@ -43,13 +43,10 @@ import (
 //
 // TODO(ajwerner): add metrics to go with these stats.
 type applyCommittedEntriesStats struct {
-	batchesProcessed        int
-	entriesProcessed        int
-	entriesProcessedBytes   int64
-	stateAssertions         int
-	numEmptyEntries         int
-	numConfChangeEntries    int
-	followerStoreWriteBytes kvadmission.FollowerStoreWriteBytes
+	appBatchStats
+	numBatchesProcessed  int // TODO(sep-raft-log): numBatches
+	stateAssertions      int
+	numConfChangeEntries int
 }
 
 // replicaStateMachine implements the apply.StateMachine interface.
@@ -68,7 +65,14 @@ type replicaStateMachine struct {
 	// ephemeralBatch is returned from NewEphemeralBatch.
 	ephemeralBatch ephemeralReplicaAppBatch
 	// stats are updated during command application and reset by moveStats.
-	stats applyCommittedEntriesStats
+	applyStats applyCommittedEntriesStats
+
+	// stats backs the currently open replicaAppBatch's view of the State field of
+	// kvserverpb.ReplicaState (which is otherwise backed directly by the
+	// Replica's in-memory state). This avoids an allocation per Stage() call as
+	// Stage() is now alloed to update this memory directly, whereas all other
+	// mutations need to copy-on-write.
+	stats enginepb.MVCCStats
 }
 
 // getStateMachine returns the Replica's apply.StateMachine. The Replica's
@@ -79,43 +83,40 @@ func (r *Replica) getStateMachine() *replicaStateMachine {
 	return sm
 }
 
-// shouldApplyCommand determines whether or not a command should be applied to
-// the replicated state machine after it has been committed to the Raft log. It
-// then sets the provided command's LeaseIndex, Rejection, and ForcedErr
-// fields and returns whether command should be applied or rejected.
-func (r *Replica) shouldApplyCommand(
-	ctx context.Context, cmd *replicatedCmd, replicaState *kvserverpb.ReplicaState,
-) bool {
-	cmd.LeaseIndex, cmd.Rejection, cmd.ForcedErr = kvserverbase.CheckForcedErr(
-		ctx, cmd.ID, &cmd.Cmd, cmd.IsLocal(), replicaState,
-	)
-	// Consider testing-only filters.
-	if filter := r.store.cfg.TestingKnobs.TestingApplyCalledTwiceFilter; cmd.ForcedErr != nil || filter != nil {
+// TODO(tbg): move this to replica_app_batch.go.
+func replicaApplyTestingFilters(
+	ctx context.Context, r *Replica, cmd *replicatedCmd, fr kvserverbase.ForcedErrResult,
+) kvserverbase.ForcedErrResult {
+	// By default, output is input.
+	newFR := fr
+
+	// Filters may change that.
+	if filter := r.store.cfg.TestingKnobs.TestingApplyCalledTwiceFilter; fr.ForcedError != nil || filter != nil {
 		args := kvserverbase.ApplyFilterArgs{
 			CmdID:                cmd.ID,
 			ReplicatedEvalResult: *cmd.ReplicatedResult(),
 			StoreID:              r.store.StoreID(),
 			RangeID:              r.RangeID,
-			ForcedError:          cmd.ForcedErr,
+			ForcedError:          fr.ForcedError,
 		}
-		if cmd.ForcedErr == nil {
+		if fr.ForcedError == nil {
 			if cmd.IsLocal() {
 				args.Req = cmd.proposal.Request
 			}
-			newPropRetry, newForcedErr := filter(args)
-			cmd.ForcedErr = newForcedErr
-			if cmd.Rejection == 0 {
-				cmd.Rejection = kvserverbase.ProposalRejectionType(newPropRetry)
+			var newRej int
+			newRej, newFR.ForcedError = filter(args)
+			if fr.Rejection == 0 {
+				newFR.Rejection = kvserverbase.ProposalRejectionType(newRej)
 			}
 		} else if feFilter := r.store.cfg.TestingKnobs.TestingApplyForcedErrFilter; feFilter != nil {
-			newPropRetry, newForcedErr := filter(args)
-			cmd.ForcedErr = newForcedErr
-			if cmd.Rejection == 0 {
-				cmd.Rejection = kvserverbase.ProposalRejectionType(newPropRetry)
+			var newRej int
+			newRej, newFR.ForcedError = feFilter(args)
+			if fr.Rejection == 0 {
+				newFR.Rejection = kvserverbase.ProposalRejectionType(newRej)
 			}
 		}
 	}
-	return cmd.ForcedErr == nil
+	return newFR
 }
 
 // NewEphemeralBatch implements the apply.StateMachine interface.
@@ -134,11 +135,11 @@ func (sm *replicaStateMachine) NewBatch() apply.Batch {
 	r := sm.r
 	b := &sm.batch
 	b.r = r
-	b.sm = sm
+	b.applyStats = &sm.applyStats
 	b.batch = r.store.engine.NewBatch()
 	r.mu.RLock()
 	b.state = r.mu.state
-	b.state.Stats = &b.stats
+	b.state.Stats = &sm.stats
 	*b.state.Stats = *r.mu.state.Stats
 	b.closedTimestampSetter = r.mu.closedTimestampSetter
 	r.mu.RUnlock()
@@ -196,7 +197,7 @@ func (sm *replicaStateMachine) ApplySideEffects(
 			sm.r.mu.RLock()
 			sm.r.assertStateRaftMuLockedReplicaMuRLocked(ctx, sm.r.store.Engine())
 			sm.r.mu.RUnlock()
-			sm.stats.stateAssertions++
+			sm.applyStats.stateAssertions++
 		}
 	} else if res := cmd.ReplicatedResult(); !res.IsZero() {
 		log.Fatalf(ctx, "failed to handle all side-effects of ReplicatedEvalResult: %v", res)
@@ -283,6 +284,12 @@ func (sm *replicaStateMachine) handleNonTrivialReplicatedEvalResult(
 			sm.r.handleVersionResult(ctx, newVersion)
 			rResult.State.Version = nil
 		}
+
+		if rResult.State.GCHint != nil {
+			sm.r.handleGCHintResult(ctx, rResult.State.GCHint)
+			rResult.State.GCHint = nil
+		}
+
 		if (*rResult.State == kvserverpb.ReplicaState{}) {
 			rResult.State = nil
 		}
@@ -349,7 +356,7 @@ func (sm *replicaStateMachine) maybeApplyConfChange(ctx context.Context, cmd *re
 	if cc == nil {
 		return nil
 	}
-	sm.stats.numConfChangeEntries++
+	sm.applyStats.numConfChangeEntries++
 	if cmd.Rejected() {
 		// The command was rejected. There is no need to report a ConfChange
 		// to raft.
@@ -416,8 +423,8 @@ func (sm *replicaStateMachine) maybeApplyConfChange(ctx context.Context, cmd *re
 }
 
 func (sm *replicaStateMachine) moveStats() applyCommittedEntriesStats {
-	stats := sm.stats
-	sm.stats = applyCommittedEntriesStats{}
+	stats := sm.applyStats
+	sm.applyStats = applyCommittedEntriesStats{}
 	return stats
 }
 

@@ -3732,9 +3732,12 @@ func checkEngineEquality(
 		if !iter1.UnsafeKey().Equal(iter2.UnsafeKey()) {
 			t.Fatalf("keys not equal %s, %s", iter1.UnsafeKey().String(), iter2.UnsafeKey().String())
 		}
-		if !bytes.Equal(iter1.UnsafeValue(), iter2.UnsafeValue()) {
-			t.Fatalf("key %s has different values: %x, %x", iter1.UnsafeKey().String(),
-				iter1.UnsafeValue(), iter2.UnsafeValue())
+		v1, err := iter1.UnsafeValue()
+		require.NoError(t, err)
+		v2, err := iter2.UnsafeValue()
+		require.NoError(t, err)
+		if !bytes.Equal(v1, v2) {
+			t.Fatalf("key %s has different values: %x, %x", iter1.UnsafeKey().String(), v1, v2)
 		}
 		if debug {
 			log.Infof(ctx, "key: %s", iter1.UnsafeKey().String())
@@ -4986,6 +4989,11 @@ func pt(key roachpb.Key, ts hlc.Timestamp) rangeTestDataItem {
 // values.
 var inlineValue hlc.Timestamp
 
+// tb creates a point tombstone.
+func tb(key roachpb.Key, ts hlc.Timestamp) rangeTestDataItem {
+	return rangeTestDataItem{point: MVCCKeyValue{Key: mvccVersionKey(key, ts)}}
+}
+
 // txn wraps point update and adds transaction to it for intent creation.
 func txn(d rangeTestDataItem) rangeTestDataItem {
 	ts := d.point.Key.Timestamp
@@ -5648,8 +5656,8 @@ func TestMVCCGarbageCollectClearRange(t *testing.T) {
 	tsGC := mkTs(5)
 	tsMax := mkTs(9)
 
-	mkGCReq := func(start roachpb.Key, end roachpb.Key) roachpb.GCRequest_GCClearRangeKey {
-		return roachpb.GCRequest_GCClearRangeKey{
+	mkGCReq := func(start roachpb.Key, end roachpb.Key) roachpb.GCRequest_GCClearRange {
+		return roachpb.GCRequest_GCClearRange{
 			StartKey: start,
 			EndKey:   end,
 		}
@@ -5711,8 +5719,8 @@ func TestMVCCGarbageCollectClearRangeInlinedValue(t *testing.T) {
 
 	tsGC := mkTs(5)
 
-	mkGCReq := func(start roachpb.Key, end roachpb.Key) roachpb.GCRequest_GCClearRangeKey {
-		return roachpb.GCRequest_GCClearRangeKey{
+	mkGCReq := func(start roachpb.Key, end roachpb.Key) roachpb.GCRequest_GCClearRange {
+		return roachpb.GCRequest_GCClearRange{
 			StartKey: start,
 			EndKey:   end,
 		}
@@ -5737,6 +5745,106 @@ func TestMVCCGarbageCollectClearRangeInlinedValue(t *testing.T) {
 	require.Errorf(t, err, "expected error '%s' but found none", expectedError)
 	require.True(t, testutils.IsError(err, expectedError),
 		"expected error '%s' found '%s'", expectedError, err)
+}
+
+func TestMVCCGarbageCollectClearPointsInRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	mkKey := func(k string) roachpb.Key {
+		return append(keys.SystemSQLCodec.TablePrefix(42), k...)
+	}
+	rangeStart := mkKey("")
+	rangeEnd := rangeStart.PrefixEnd()
+
+	// Note we use keys of different lengths so that stats accounting errors
+	// would not obviously cancel out if right and left bounds are used
+	// incorrectly.
+	keyA := mkKey("a")
+	keyB := mkKey("bb")
+	keyC := mkKey("ccc")
+	keyD := mkKey("dddd")
+
+	mkTs := func(wallTimeSec int64) hlc.Timestamp {
+		return hlc.Timestamp{WallTime: time.Second.Nanoseconds() * wallTimeSec}
+	}
+
+	ts1 := mkTs(1)
+	ts2 := mkTs(2)
+	ts3 := mkTs(3)
+	ts4 := mkTs(4)
+	tsMax := mkTs(9)
+
+	engine := NewDefaultInMemForTesting()
+	defer engine.Close()
+
+	var ms enginepb.MVCCStats
+	rangeTestData{
+		pt(keyB, ts1),
+		pt(keyB, ts2),
+		tb(keyB, ts3),
+		tb(keyB, ts4),
+		pt(keyC, ts1),
+		tb(keyC, ts2),
+		pt(keyC, ts3),
+		tb(keyC, ts4),
+	}.populateEngine(t, engine, &ms)
+
+	require.NoError(t,
+		MVCCGarbageCollectPointsWithClearRange(ctx, engine, &ms, keyA, keyD, hlc.Timestamp{}, tsMax),
+		"failed to run mvcc range tombstone garbage collect")
+
+	expected := NewDefaultInMemForTesting()
+	defer expected.Close()
+	var expMs enginepb.MVCCStats
+
+	rks := scanRangeKeys(t, engine)
+	expRks := scanRangeKeys(t, expected)
+	require.EqualValues(t, expRks, rks)
+
+	ks := scanPointKeys(t, engine)
+	expKs := scanPointKeys(t, expected)
+	require.EqualValues(t, expKs, ks)
+
+	ms.AgeTo(tsMax.WallTime)
+	expMs, err := ComputeStats(engine, rangeStart, rangeEnd, tsMax.WallTime)
+	require.NoError(t, err, "failed to compute stats for range")
+	require.EqualValues(t, expMs, ms, "computed range stats vs gc'd")
+}
+
+func TestMVCCGarbageCollectClearRangeFailure(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	mkKey := func(k string) roachpb.Key {
+		return append(keys.SystemSQLCodec.TablePrefix(42), k...)
+	}
+
+	// Note we use keys of different lengths so that stats accounting errors
+	// would not obviously cancel out if right and left bounds are used
+	// incorrectly.
+	keyA := mkKey("a")
+	keyD := mkKey("dddd")
+
+	mkTs := func(wallTimeSec int64) hlc.Timestamp {
+		return hlc.Timestamp{WallTime: time.Second.Nanoseconds() * wallTimeSec}
+	}
+
+	engine := NewDefaultInMemForTesting()
+	defer engine.Close()
+
+	var ms enginepb.MVCCStats
+	rangeTestData{
+		pt(keyA, mkTs(1)),
+	}.populateEngine(t, engine, &ms)
+
+	err := MVCCGarbageCollectPointsWithClearRange(ctx, engine, &ms, keyA, keyD, mkTs(1), mkTs(5))
+	errMsg := `attempt to GC data /Table/42/"a"/1.000000000,0 still visible at GC threshold 5.000000000,0 with clear range`
+	require.Errorf(t, err, "expected error '%s' but found none", errMsg)
+	require.True(t, testutils.IsError(err, errMsg),
+		"expected error '%s' found '%s'", errMsg, err)
 }
 
 // TestResolveIntentWithLowerEpoch verifies that trying to resolve
@@ -5894,81 +6002,6 @@ func TestWillOverflow(t *testing.T) {
 	}
 }
 
-func TestMVCCExportToSSTResourceLimits(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	engine := createTestPebbleEngine()
-	defer engine.Close()
-
-	limits := dataLimits{
-		minKey:          0,
-		maxKey:          1000,
-		minTimestamp:    hlc.Timestamp{WallTime: 100000},
-		maxTimestamp:    hlc.Timestamp{WallTime: 200000},
-		tombstoneChance: 0.01,
-	}
-	generateData(t, engine, limits, (limits.maxKey-limits.minKey)*10)
-
-	// Outer loop runs tests on subsets of mvcc dataset.
-	for _, query := range []queryLimits{
-		{
-			minKey:       0,
-			maxKey:       1000,
-			minTimestamp: hlc.Timestamp{WallTime: 100000},
-			maxTimestamp: hlc.Timestamp{WallTime: 200000},
-			latest:       false,
-		},
-		{
-			minKey:       200,
-			maxKey:       800,
-			minTimestamp: hlc.Timestamp{WallTime: 100000},
-			maxTimestamp: hlc.Timestamp{WallTime: 200000},
-			latest:       false,
-		},
-		{
-			minKey:       0,
-			maxKey:       1000,
-			minTimestamp: hlc.Timestamp{WallTime: 150000},
-			maxTimestamp: hlc.Timestamp{WallTime: 175000},
-			latest:       false,
-		},
-		{
-			minKey:       0,
-			maxKey:       1000,
-			minTimestamp: hlc.Timestamp{WallTime: 100000},
-			maxTimestamp: hlc.Timestamp{WallTime: 200000},
-			latest:       true,
-		},
-	} {
-		t.Run(fmt.Sprintf("minKey=%d,maxKey=%d,minTs=%v,maxTs=%v,latest=%t", query.minKey, query.maxKey, query.minTimestamp, query.maxTimestamp, query.latest),
-			func(t *testing.T) {
-				matchingData := exportAllData(t, engine, query)
-				// Inner loop exercises various thresholds to see that we always progress and respect soft
-				// and hard limits.
-				for _, resources := range []resourceLimits{
-					// soft threshold under version count, high threshold above
-					{softThreshold: 5, hardThreshold: 20},
-					// soft threshold above version count
-					{softThreshold: 15, hardThreshold: 30},
-					// low threshold to check we could always progress
-					{softThreshold: 0, hardThreshold: 0},
-					// equal thresholds to check we force breaks mid keys
-					{softThreshold: 15, hardThreshold: 15},
-					// very high hard thresholds to eliminate mid key breaking completely
-					{softThreshold: 5, hardThreshold: math.MaxInt64},
-					// very high thresholds to eliminate breaking completely
-					{softThreshold: math.MaxInt64, hardThreshold: math.MaxInt64},
-				} {
-					t.Run(fmt.Sprintf("softThreshold=%d,hardThreshold=%d", resources.softThreshold, resources.hardThreshold),
-						func(t *testing.T) {
-							assertDataEqual(t, engine, matchingData, query, resources)
-						})
-				}
-			})
-	}
-}
-
 // TestMVCCExportToSSTExhaustedAtStart is a regression test for a bug
 // in which mis-handling of resume spans would cause MVCCExportToSST
 // to return an empty resume key in cases where the resource limiters
@@ -6113,7 +6146,6 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 				StartTS:            minTimestamp,
 				EndTS:              maxTimestamp,
 				ExportAllRevisions: true,
-				ResourceLimiter:    nil,
 				StopMidKey:         false,
 			}
 
@@ -6150,89 +6182,7 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 			require.Equal(t, 3, len(chunk))
 
 		})
-	t.Run("resource limit exhausted",
-		func(t *testing.T) {
-			engine := createTestPebbleEngine()
-			defer engine.Close()
-
-			// Construct a data set that contains 4
-			// tombstones followed by 1 non-tombstone.
-			//
-			// We expect that MVCCExportToSST with
-			// ExportAllRevisions set to false and with no
-			// start timestamp will elide the tombstones.
-			rng := rand.New(rand.NewSource(timeutil.Now().Unix()))
-			timestamp := minTimestamp.Add(rand.Int63n(maxTimestamp.WallTime-minTimestamp.WallTime), 0)
-			require.NoError(t, engine.PutMVCC(MVCCKey{Key: testKey(6), Timestamp: timestamp}, MVCCValue{}), "write data to test storage")
-			require.NoError(t, engine.PutMVCC(MVCCKey{Key: testKey(7), Timestamp: timestamp}, MVCCValue{}), "write data to test storage")
-			require.NoError(t, engine.PutMVCC(MVCCKey{Key: testKey(8), Timestamp: timestamp}, MVCCValue{}), "write data to test storage")
-			value := MVCCValue{Value: roachpb.MakeValueFromBytes(randutil.RandBytes(rng, 256))}
-			require.NoError(t, engine.PutMVCC(MVCCKey{Key: testKey(9), Timestamp: timestamp}, value), "write data to test storage")
-			require.NoError(t, engine.Flush(), "Flush engine data")
-
-			data := exportAllData(t, engine, queryLimits{
-				minKey: minKey,
-				maxKey: maxKey,
-				// Tombstones are only elided when
-				// StartTS isn't set on the export
-				// request.
-				minTimestamp: hlc.Timestamp{},
-				maxTimestamp: maxTimestamp,
-				latest:       true,
-			})
-
-			firstCall := true
-			assertExportEqualWithOptions(t, context.Background(), engine, data, MVCCExportOptions{
-				StartKey: MVCCKey{Key: testKey(minKey), Timestamp: minTimestamp},
-				EndKey:   testKey(maxKey),
-				// No StartTS to ensure that
-				// tombstones are elided.
-				EndTS:              maxTimestamp,
-				ExportAllRevisions: false,
-				// The ResourceLimiter will
-				// return ResourceLimitReached
-				// on the very first call.
-				ResourceLimiter: &callbackResourceLimiter{
-					func() ResourceLimitReached {
-						if firstCall {
-							firstCall = false
-							return ResourceLimitReachedHard
-						}
-						return ResourceLimitNotReached
-					},
-				},
-			})
-		})
 }
-
-type callbackResourceLimiter struct {
-	cb func() ResourceLimitReached
-}
-
-func (c *callbackResourceLimiter) IsExhausted() ResourceLimitReached {
-	return c.cb()
-}
-
-var _ ResourceLimiter = &callbackResourceLimiter{}
-
-type countingResourceLimiter struct {
-	softCount int64
-	hardCount int64
-	count     int64
-}
-
-func (l *countingResourceLimiter) IsExhausted() ResourceLimitReached {
-	l.count++
-	if l.count > l.hardCount {
-		return ResourceLimitReachedHard
-	}
-	if l.count > l.softCount {
-		return ResourceLimitReachedSoft
-	}
-	return ResourceLimitNotReached
-}
-
-var _ ResourceLimiter = &countingResourceLimiter{}
 
 type queryLimits struct {
 	minKey       int64
@@ -6252,11 +6202,6 @@ type dataLimits struct {
 	minTimestamp    hlc.Timestamp
 	maxTimestamp    hlc.Timestamp
 	tombstoneChance float64
-}
-
-type resourceLimits struct {
-	softThreshold int64
-	hardThreshold int64
 }
 
 func exportAllData(t *testing.T, engine Engine, limits queryLimits) []MVCCKey {
@@ -6294,50 +6239,6 @@ func sstToKeys(t *testing.T, data []byte) []MVCCKey {
 		it.Next()
 	}
 	return results
-}
-
-func assertDataEqual(
-	t *testing.T, engine Engine, data []MVCCKey, query queryLimits, resources resourceLimits,
-) {
-	var (
-		err       error
-		key       = MVCCKey{Key: testKey(query.minKey), Timestamp: query.minTimestamp}
-		dataIndex = 0
-	)
-	for {
-		// Export chunk
-		limiter := countingResourceLimiter{softCount: resources.softThreshold, hardCount: resources.hardThreshold}
-		sstFile := &MemFile{}
-		st := cluster.MakeTestingClusterSettings()
-		_, key, err = MVCCExportToSST(context.Background(), st, engine, MVCCExportOptions{
-			StartKey:           key,
-			EndKey:             testKey(query.maxKey),
-			StartTS:            query.minTimestamp,
-			EndTS:              query.maxTimestamp,
-			ExportAllRevisions: !query.latest,
-			StopMidKey:         true,
-			ResourceLimiter:    &limiter,
-		}, sstFile)
-		require.NoError(t, err, "Failed to export to Sst")
-
-		chunk := sstToKeys(t, sstFile.Data())
-		require.LessOrEqual(t, len(chunk), len(data)-dataIndex, "Remaining test data")
-		for _, key := range chunk {
-			require.True(t, key.Equal(data[dataIndex]), "Returned key is not equal")
-			dataIndex++
-		}
-		require.LessOrEqual(t, limiter.count-1, resources.hardThreshold, "Fragment size")
-
-		// Last chunk check.
-		if len(key.Key) == 0 {
-			break
-		}
-		require.GreaterOrEqual(t, limiter.count-1, resources.softThreshold, "Fragment size")
-		if resources.hardThreshold == math.MaxInt64 {
-			require.True(t, key.Timestamp.IsEmpty(), "Should never break mid key on high hard thresholds")
-		}
-	}
-	require.Equal(t, dataIndex, len(data), "Not all expected data was consumed")
 }
 
 func generateData(t *testing.T, engine Engine, limits dataLimits, totalEntries int64) {
@@ -6808,7 +6709,9 @@ func (f *fingerprintOracle) fingerprintPointKeys(t *testing.T, dataSST []byte) u
 		if k.Timestamp.IsEmpty() {
 			_, err := hasher.Write(k.Key)
 			require.NoError(t, err)
-			_, err = hasher.Write(iter.UnsafeValue())
+			v, err := iter.UnsafeValue()
+			require.NoError(t, err)
+			_, err = hasher.Write(v)
 			require.NoError(t, err)
 		} else {
 			_, err := hasher.Write(k.Key)
@@ -6819,7 +6722,9 @@ func (f *fingerprintOracle) fingerprintPointKeys(t *testing.T, dataSST []byte) u
 			encodeMVCCTimestampToBuf(timestampBuf, k.Timestamp)
 			_, err = hasher.Write(timestampBuf)
 			require.NoError(t, err)
-			_, err = hasher.Write(iter.UnsafeValue())
+			v, err := iter.UnsafeValue()
+			require.NoError(t, err)
+			_, err = hasher.Write(v)
 			require.NoError(t, err)
 		}
 		xorAgg = xorAgg ^ hasher.Sum64()
@@ -6868,7 +6773,7 @@ func mvccGetRawWithError(t *testing.T, r Reader, key MVCCKey) ([]byte, error) {
 	if ok, err := iter.Valid(); err != nil || !ok {
 		return nil, err
 	}
-	return iter.Value(), nil
+	return iter.Value()
 }
 
 func TestMVCCLookupRangeKeyValue(t *testing.T) {

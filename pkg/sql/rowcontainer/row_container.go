@@ -15,8 +15,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -372,7 +372,7 @@ type DiskBackedRowContainer struct {
 	// Encoding helpers for de-duplication:
 	// encodings keeps around the DatumEncoding equivalents of the encoding
 	// directions in ordering to avoid conversions in hot paths.
-	encodings  []descpb.DatumEncoding
+	encodings  []catenumpb.DatumEncoding
 	datumAlloc tree.DatumAlloc
 	scratchKey []byte
 
@@ -413,7 +413,7 @@ func (f *DiskBackedRowContainer) Init(
 	f.src = &mrc
 	f.engine = engine
 	f.diskMonitor = diskMonitor
-	f.encodings = make([]descpb.DatumEncoding, len(ordering))
+	f.encodings = make([]catenumpb.DatumEncoding, len(ordering))
 	for i, orderInfo := range ordering {
 		f.encodings[i] = rowenc.EncodingDirToDatumEncoding(orderInfo.Direction)
 	}
@@ -650,7 +650,7 @@ type DiskBackedIndexedRowContainer struct {
 	firstCachedRowPos int
 	nextPosToCache    int
 	// indexedRowsCache is the cache of up to maxCacheSize contiguous rows.
-	indexedRowsCache ring.Buffer
+	indexedRowsCache ring.Buffer[eval.IndexedRow]
 	// maxCacheSize indicates the maximum number of rows to be cached. It is
 	// initialized to maxIndexedRowsCacheSize and dynamically adjusted if OOM
 	// error is encountered.
@@ -783,7 +783,7 @@ func (f *DiskBackedIndexedRowContainer) GetRow(
 		if pos >= f.firstCachedRowPos && pos < f.nextPosToCache {
 			requestedRowCachePos := pos - f.firstCachedRowPos
 			f.hitCount++
-			return f.indexedRowsCache.Get(requestedRowCachePos).(eval.IndexedRow), nil
+			return f.indexedRowsCache.Get(requestedRowCachePos), nil
 		}
 		f.missCount++
 		if f.diskRowIter == nil {
@@ -860,7 +860,7 @@ func (f *DiskBackedIndexedRowContainer) GetRow(
 					return nil, errors.Errorf("unexpected last column type: should be DInt but found %T", idx)
 				}
 				if f.idxRowIter == pos {
-					return f.indexedRowsCache.GetLast().(eval.IndexedRow), nil
+					return f.indexedRowsCache.GetLast(), nil
 				}
 			}
 			f.idxRowIter++

@@ -37,6 +37,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
@@ -65,8 +67,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
@@ -416,7 +418,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 		return nil
 	}
 
-	if err := IterateIDPrefixKeys(ctx, eng, keys.RangeTombstoneKey, &tombstone, handleTombstone); err != nil {
+	if err := kvstorage.IterateIDPrefixKeys(ctx, eng, keys.RangeTombstoneKey, &tombstone, handleTombstone); err != nil {
 		t.Fatal(err)
 	}
 	placeholder := seenT{
@@ -451,7 +453,7 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 	store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{}, &cfg)
 	defer stopper.Stop(ctx)
 
-	if _, err := ReadStoreIdent(ctx, store.Engine()); err != nil {
+	if _, err := kvstorage.ReadStoreIdent(ctx, store.Engine()); err != nil {
 		t.Fatalf("unable to read store ident: %+v", err)
 	}
 
@@ -498,7 +500,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 
 	// Can't init as haven't bootstrapped.
 	err = store.Start(ctx, stopper)
-	require.ErrorIs(t, err, &NotBootstrappedError{})
+	require.ErrorIs(t, err, &kvstorage.NotBootstrappedError{})
 
 	// Bootstrap should fail on non-empty engine.
 	err = InitEngine(ctx, eng, testIdent)
@@ -521,6 +523,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 // deprecated; new tests should create replicas by splitting from a
 // properly-bootstrapped initial range.
 func createReplica(s *Store, rangeID roachpb.RangeID, start, end roachpb.RKey) *Replica {
+	ctx := context.Background()
 	desc := &roachpb.RangeDescriptor{
 		RangeID:  rangeID,
 		StartKey: start,
@@ -532,9 +535,15 @@ func createReplica(s *Store, rangeID roachpb.RangeID, start, end roachpb.RKey) *
 		}},
 		NextReplicaID: 2,
 	}
-	r, err := newReplica(context.Background(), desc, s, 1)
+	const replicaID = 1
+	if err := stateloader.WriteInitialRangeState(
+		ctx, s.engine, *desc, replicaID, clusterversion.TestingClusterVersion.Version,
+	); err != nil {
+		panic(err)
+	}
+	r, err := newReplica(ctx, desc, s, replicaID)
 	if err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		panic(err)
 	}
 	return r
 }
@@ -825,7 +834,10 @@ func TestMaybeMarkReplicaInitialized(t *testing.T) {
 		RangeID: newRangeID,
 	}
 
-	r, err := newReplica(ctx, desc, store, 1)
+	const replicaID = 1
+	require.NoError(t,
+		logstore.NewStateLoader(desc.RangeID).SetRaftReplicaID(ctx, store.engine, replicaID))
+	r, err := newReplica(ctx, desc, store, replicaID)
 	if err != nil {
 		t.Fatal(err)
 	}

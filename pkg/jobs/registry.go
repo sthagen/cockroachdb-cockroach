@@ -288,20 +288,27 @@ func (r *Registry) MakeJobID() jobspb.JobID {
 }
 
 // newJob creates a new Job.
-func (r *Registry) newJob(ctx context.Context, record Record) *Job {
+func (r *Registry) newJob(ctx context.Context, record Record) (*Job, error) {
 	job := &Job{
 		id:        record.JobID,
 		registry:  r,
 		createdBy: record.CreatedBy,
 	}
-	job.mu.payload = r.makePayload(ctx, &record)
+	payload, err := r.makePayload(ctx, &record)
+	if err != nil {
+		return nil, err
+	}
+	job.mu.payload = payload
 	job.mu.progress = r.makeProgress(&record)
 	job.mu.status = StatusRunning
-	return job
+	return job, nil
 }
 
 // makePayload creates a Payload structure based on the given Record.
-func (r *Registry) makePayload(ctx context.Context, record *Record) jobspb.Payload {
+func (r *Registry) makePayload(ctx context.Context, record *Record) (jobspb.Payload, error) {
+	if record.Username.Undefined() {
+		return jobspb.Payload{}, errors.AssertionFailedf("job record missing username; could not make payload")
+	}
 	return jobspb.Payload{
 		Description:            record.Description,
 		Statement:              record.Statements,
@@ -311,7 +318,7 @@ func (r *Registry) makePayload(ctx context.Context, record *Record) jobspb.Paylo
 		Noncancelable:          record.NonCancelable,
 		CreationClusterVersion: r.settings.Version.ActiveVersion(ctx).Version,
 		CreationClusterID:      r.clusterID.Get(),
-	}
+	}, nil
 }
 
 // makeProgress creates a Progress structure based on the given Record.
@@ -394,26 +401,30 @@ func (r *Registry) batchJobInsertStmt(
 		return "", nil, nil, errors.NewAssertionErrorWithWrappedErrf(err, "failed to make timestamp for creation of job")
 	}
 
-	valueFns := map[string]func(*Record) interface{}{
-		`id`:                func(rec *Record) interface{} { return rec.JobID },
-		`created`:           func(rec *Record) interface{} { return created },
-		`status`:            func(rec *Record) interface{} { return StatusRunning },
-		`claim_session_id`:  func(rec *Record) interface{} { return sessionID.UnsafeBytes() },
-		`claim_instance_id`: func(rec *Record) interface{} { return instanceID },
-		`payload`: func(rec *Record) interface{} {
-			payload := r.makePayload(ctx, rec)
-			return marshalPanic(&payload)
+	valueFns := map[string]func(*Record) (interface{}, error){
+		`id`:                func(rec *Record) (interface{}, error) { return rec.JobID, nil },
+		`created`:           func(rec *Record) (interface{}, error) { return created, nil },
+		`status`:            func(rec *Record) (interface{}, error) { return StatusRunning, nil },
+		`claim_session_id`:  func(rec *Record) (interface{}, error) { return sessionID.UnsafeBytes(), nil },
+		`claim_instance_id`: func(rec *Record) (interface{}, error) { return instanceID, nil },
+		`payload`: func(rec *Record) (interface{}, error) {
+			payload, err := r.makePayload(ctx, rec)
+			if err != nil {
+				return []byte{}, err
+			}
+			return marshalPanic(&payload), nil
 		},
-		`progress`: func(rec *Record) interface{} {
+		`progress`: func(rec *Record) (interface{}, error) {
 			progress := r.makeProgress(rec)
 			progress.ModifiedMicros = modifiedMicros
-			return marshalPanic(&progress)
+			return marshalPanic(&progress), nil
 		},
-		`job_type`: func(rec *Record) interface{} {
-			return (&jobspb.Payload{Details: jobspb.WrapPayloadDetails(rec.Details)}).Type().String()
+		`job_type`: func(rec *Record) (interface{}, error) {
+			return (&jobspb.Payload{Details: jobspb.WrapPayloadDetails(rec.Details)}).Type().String(), nil
 		},
 	}
 
+	// TODO(jayant): remove this version gate in 24.1
 	// To run the upgrade below, migration and schema change jobs will need to be
 	// created using the old schema, which does not have the job_type column.
 	if !r.settings.Version.IsActive(ctx, clusterversion.V23_1AddTypeColumnToJobsTable) {
@@ -432,7 +443,11 @@ func (r *Registry) batchJobInsertStmt(
 		}()
 		for j := 0; j < numColumns; j++ {
 			c := columns[j]
-			*vals = append(*vals, valueFns[c](rec))
+			val, err := valueFns[c](rec)
+			if err != nil {
+				return err
+			}
+			*vals = append(*vals, val)
 		}
 		return nil
 	}
@@ -474,7 +489,10 @@ func (r *Registry) CreateJobWithTxn(
 	// TODO(sajjad): Clean up the interface - remove jobID from the params as
 	// Record now has JobID field.
 	record.JobID = jobID
-	j := r.newJob(ctx, record)
+	j, err := r.newJob(ctx, record)
+	if err != nil {
+		return nil, err
+	}
 
 	s, err := r.sqlInstance.Session(ctx)
 	if err != nil {
@@ -510,6 +528,7 @@ func (r *Registry) CreateJobWithTxn(
 		}
 		return p.String()
 	}
+	// TODO(jayant): remove this version gate in 24.1
 	// To run the upgrade below, migration and schema change jobs will need
 	// to be created using the old schema of the jobs table.
 	if !r.settings.Version.IsActive(ctx, clusterversion.V23_1AddTypeColumnToJobsTable) {
@@ -531,7 +550,10 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 	// TODO(sajjad): Clean up the interface - remove jobID from the params as
 	// Record now has JobID field.
 	record.JobID = jobID
-	j := r.newJob(ctx, record)
+	j, err := r.newJob(ctx, record)
+	if err != nil {
+		return nil, err
+	}
 	if err := j.runInTxn(ctx, txn, func(ctx context.Context, txn *kv.Txn) error {
 		// Note: although the following uses ReadTimestamp and
 		// ReadTimestamp can diverge from the value of now() throughout a
@@ -699,7 +721,7 @@ func (r *Registry) GetJobInfo(
 ) ([]byte, bool, error) {
 	row, err := r.ex.QueryRowEx(
 		ctx, "job-info-get", txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT value FROM system.job_info WHERE job_id = $1 AND info_key = $2 ORDER BY written DESC LIMIT 1",
 		jobID, infoKey,
 	)
@@ -732,7 +754,7 @@ func (r *Registry) IterateJobInfo(
 	// TODO(dt): verify this predicate hits the index.
 	rows, err := r.ex.QueryIteratorEx(
 		ctx, "job-info-iter", txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		`SELECT info_key, value 
 		FROM system.job_info 
 		WHERE job_id = $1 AND substring(info_key for $2) = $3 
@@ -789,7 +811,7 @@ func (r *Registry) WriteJobInfo(
 	// First clear out any older revisions of this info.
 	_, err := r.ex.ExecEx(
 		ctx, "job-info-write", txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		"DELETE FROM system.job_info WHERE job_id = $1 AND info_key = $2",
 		jobID, infoKey,
 	)
@@ -800,7 +822,7 @@ func (r *Registry) WriteJobInfo(
 	// Write the new info, using the same transaction.
 	_, err = r.ex.ExecEx(
 		ctx, "job-info-write", txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		`INSERT INTO system.job_info (job_id, info_key, written, value) VALUES ($1, $2, now(), $3)`,
 		jobID, infoKey, value,
 	)

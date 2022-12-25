@@ -477,10 +477,7 @@ func initFollowerReadsDB(
 		q1 := fmt.Sprintf(`
 			SELECT
 				%s, %s
-			FROM
-				crdb_internal.ranges_no_leases
-			WHERE
-				table_name = 'test'`, votersCol, nonVotersCol)
+			FROM [SHOW RANGES FROM TABLE test.test]`, votersCol, nonVotersCol)
 
 		var voters, nonVoters int
 		err := db.QueryRowContext(ctx, q1).Scan(&voters, &nonVoters)
@@ -515,10 +512,7 @@ func initFollowerReadsDB(
 			const q2 = `
 			SELECT
 				count(distinct substring(unnest(replica_localities), 'region=([^,]*)'))
-			FROM
-				crdb_internal.ranges_no_leases
-			WHERE
-				table_name = 'test'`
+			FROM [SHOW RANGES FROM TABLE test]`
 
 			var distinctRegions int
 			require.NoError(t, db.QueryRowContext(ctx, q2).Scan(&distinctRegions))
@@ -641,8 +635,9 @@ func verifySQLLatency(
 		// Ask for 10s intervals.
 		SampleNanos: (10 * time.Second).Nanoseconds(),
 		Queries: []tspb.Query{{
-			Name:    "cr.node.sql.service.latency-p90",
-			Sources: sources,
+			Name:             "cr.node.sql.service.latency-p90",
+			Sources:          sources,
+			SourceAggregator: tspb.TimeSeriesQueryAggregator_MAX.Enum(),
 		}},
 	}
 	var response tspb.TimeSeriesQueryResponse

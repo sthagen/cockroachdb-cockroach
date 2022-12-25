@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -29,9 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -658,7 +659,7 @@ func (desc *wrapper) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 
 	// Validate mutations and exit early if any of these are deeply corrupted.
 	{
-		var mutationIDs util.FastIntSet
+		var mutationIDs intsets.Fast
 		mutationsHaveErrs := false
 		for _, m := range desc.Mutations {
 			mutationIDs.Add(int(m.MutationID))
@@ -1161,7 +1162,7 @@ func (desc *wrapper) validateUniqueWithoutIndexConstraints(
 		}
 
 		// Verify that the constraint's column IDs are valid and unique.
-		var seen util.FastIntSet
+		var seen intsets.Fast
 		for i, n := 0, c.NumKeyColumns(); i < n; i++ {
 			colID := c.GetKeyColumnID(i)
 			_, ok := columnsByID[colID]
@@ -1282,7 +1283,7 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 				return errors.Newf("index %q key column ID %d should have name %q, but found name %q",
 					idx.GetName(), colID, col.ColName(), inIndexColName)
 			}
-			if col.Dropped() && idx.GetEncodingType() != descpb.PrimaryIndexEncoding {
+			if col.Dropped() && idx.GetEncodingType() != catenumpb.PrimaryIndexEncoding {
 				return errors.Newf("secondary index %q contains dropped key column %q", idx.GetName(), col.ColName())
 			}
 			if validateIndexDup.Contains(colID) {
@@ -1305,7 +1306,7 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 				return errors.Newf("index %q key suffix column ID %d is invalid",
 					idx.GetName(), colID)
 			}
-			if idx.GetEncodingType() == descpb.PrimaryIndexEncoding {
+			if idx.GetEncodingType() == catenumpb.PrimaryIndexEncoding {
 				return errors.Newf("primary-encoded index %q unexpectedly contains key suffix columns, for instance %q",
 					idx.GetName(), col.ColName())
 			}
@@ -1323,7 +1324,7 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 				return errors.Newf("index %q stored column ID %d should have name %q, but found name %q",
 					idx.GetName(), colID, col.ColName(), inIndexColName)
 			}
-			if col.Dropped() && idx.GetEncodingType() != descpb.PrimaryIndexEncoding {
+			if col.Dropped() && idx.GetEncodingType() != catenumpb.PrimaryIndexEncoding {
 				return errors.Newf("secondary index %q contains dropped stored column %q", idx.GetName(), col.ColName())
 			}
 		}
@@ -1379,7 +1380,7 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 			// as SUFFIX columns in other indexes, even if they are virtual.
 			for _, mut := range desc.Mutations {
 				if pidx := mut.GetIndex(); pidx != nil &&
-					pidx.EncodingType == descpb.PrimaryIndexEncoding &&
+					pidx.EncodingType == catenumpb.PrimaryIndexEncoding &&
 					mut.Direction == descpb.DescriptorMutation_ADD &&
 					!mut.Rollback {
 					newPKColIDs.UnionWith(catalog.MakeTableColSet(pidx.KeyColumnIDs...))
@@ -1426,9 +1427,9 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 				return errors.AssertionFailedf("primary index %q has invalid version %d, expected at least %d",
 					idx.GetName(), idx.GetVersion(), descpb.PrimaryIndexWithStoredColumnsVersion)
 			}
-			if idx.IndexDesc().EncodingType != descpb.PrimaryIndexEncoding {
+			if idx.IndexDesc().EncodingType != catenumpb.PrimaryIndexEncoding {
 				return errors.AssertionFailedf("primary index %q has invalid encoding type %d in proto, expected %d",
-					idx.GetName(), idx.IndexDesc().EncodingType, descpb.PrimaryIndexEncoding)
+					idx.GetName(), idx.IndexDesc().EncodingType, catenumpb.PrimaryIndexEncoding)
 			}
 			if idx.IsNotVisible() {
 				return errors.Newf("primary index %q cannot be not visible", idx.GetName())

@@ -237,9 +237,7 @@ export class TransactionsPage extends React.Component<
       );
     }
 
-    if (!this.props.isTenant) {
-      this.props.refreshNodes();
-    }
+    this.props.refreshNodes();
   }
 
   componentWillUnmount(): void {
@@ -280,9 +278,7 @@ export class TransactionsPage extends React.Component<
 
   componentDidUpdate(): void {
     this.updateQueryParams();
-    if (!this.props.isTenant) {
-      this.props.refreshNodes();
-    }
+    this.props.refreshNodes();
   }
 
   onChangeSortSetting = (ss: SortSetting): void => {
@@ -408,8 +404,6 @@ export class TransactionsPage extends React.Component<
     const statements = data?.statements || [];
     const { filters } = this.state;
 
-    // If the cluster is a tenant cluster we don't show info
-    // about nodes/regions.
     const nodes = Object.keys(nodeRegions)
       .map(n => Number(n))
       .sort();

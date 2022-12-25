@@ -25,10 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -48,8 +50,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 	"golang.org/x/text/collate"
@@ -1868,7 +1872,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 						// Currently, nulls always appear first if the order is ascending,
 						// and always appear last if the order is descending.
 						var thisIndOption tree.DInt
-						if index.GetKeyColumnDirection(i) == catpb.IndexColumn_ASC {
+						if index.GetKeyColumnDirection(i) == catenumpb.IndexColumn_ASC {
 							thisIndOption = indoptionNullsFirst
 						} else {
 							thisIndOption = indoptionDesc
@@ -1915,6 +1919,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 						tableOid,                                     // indrelid
 						tree.NewDInt(tree.DInt(indnatts)),            // indnatts
 						tree.MakeDBool(tree.DBool(index.IsUnique())), // indisunique
+						tree.DBoolFalse,                              // indnullsnotdistinct
 						tree.MakeDBool(tree.DBool(index.Primary())),  // indisprimary
 						tree.DBoolFalse,                              // indisexclusion
 						tree.MakeDBool(tree.DBool(index.IsUnique())), // indimmediate
@@ -3529,8 +3534,12 @@ var pgCatalogStatisticExtTable = virtualSchemaTable{
 	comment: `pg_statistic_ext has the statistics objects created with CREATE STATISTICS
 https://www.postgresql.org/docs/13/catalog-pg-statistic-ext.html`,
 	schema: vtable.PgCatalogStatisticExt,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		query := `SELECT "statisticID", name, "tableID", "columnIDs" FROM system.table_statistics;`
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+
+		//  '{d}' refers to Postgres code for n-distinct statistics or multi-column
+		//  statistics.
+		query := `SELECT "tableID", name, "columnIDs", "statisticID", '{d}'::"char"[] FROM system.table_statistics;`
+
 		rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBuffered(
 			ctx, "read-statistics-objects", p.txn, query,
 		)
@@ -3538,26 +3547,35 @@ https://www.postgresql.org/docs/13/catalog-pg-statistic-ext.html`,
 			return err
 		}
 		h := makeOidHasher()
+		statTgt := tree.NewDInt(-1)
 
 		for _, row := range rows {
-			statisticsID := tree.MustBeDInt(row[0])
-			name := tree.MustBeDString(row[1])
-			tableID := tree.MustBeDInt(row[2])
-			columnIDs := tree.MustBeDArray(row[3])
+			tableID := tree.MustBeDInt(row[0])
+			columnIDs := tree.MustBeDArray(row[2])
+			statisticsID := tree.MustBeDInt(row[3])
+			statisticsKind := tree.MustBeDArray(row[4])
 
 			// The statisticsID is generated from unique_rowid() so it won't fit in a
 			// uint32.
 			h.writeUInt64(uint64(statisticsID))
 			statisticsOID := h.getOid()
+
+			tn, err := descs.GetTableNameByID(ctx, p.Txn(), p.descCollection, descpb.ID(tableID))
+			if err != nil {
+				return err
+			}
+
+			statSchema := db.GetSchemaID(tn.Schema())
+
 			if err := addRow(
 				statisticsOID,                // oid
 				tableOid(descpb.ID(tableID)), // stxrelid
-				&name,                        // stxname
-				tree.DNull,                   // stxnamespace
+				row[1],                       // stxname
+				schemaOid(statSchema),        // stxnamespace
 				tree.DNull,                   // stxowner
-				tree.DNull,                   // stxstattarget
+				statTgt,                      // stxstattarget
 				columnIDs,                    // stxkeys
-				tree.DNull,                   // stxkind
+				statisticsKind,               // stxkind
 			); err != nil {
 				return err
 			}
@@ -4102,12 +4120,45 @@ var pgCatalogStatioUserTablesTable = virtualSchemaTable{
 }
 
 var pgCatalogTimezoneNamesTable = virtualSchemaTable{
-	comment: "pg_timezone_names was created for compatibility and is currently unimplemented",
+	comment: "pg_timezone_names lists all the timezones that are supported by SET timezone",
 	schema:  vtable.PgCatalogTimezoneNames,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		for _, tz := range timeutil.TimeZones() {
+			loc, err := timeutil.LoadLocation(tz)
+			if err != nil {
+				return err
+			}
+			if err := addRowForTimezoneNames(tz, p.extendedEvalCtx.StmtTimestamp.In(loc), addRow); err != nil {
+				return err
+			}
+		}
 		return nil
 	},
-	unimplemented: true,
+	indexes: []virtualIndex{
+		{
+			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, db catalog.DatabaseDescriptor,
+				addRow func(...tree.Datum) error,
+			) (bool, error) {
+				tz := string(tree.MustBeDString(unwrappedConstraint))
+				loc, err := timeutil.LoadLocation(tz)
+				if err != nil {
+					return false, nil //nolint:returnerrcheck
+				}
+				return true, addRowForTimezoneNames(tz, p.extendedEvalCtx.StmtTimestamp.In(loc), addRow)
+			},
+		},
+	},
+}
+
+func addRowForTimezoneNames(tz string, t time.Time, addRow func(...tree.Datum) error) error {
+	abbrev, offset := t.Zone()
+	utcOffsetInterval := duration.MakeDuration(int64(offset)*int64(time.Second), 0, 0)
+	return addRow(
+		tree.NewDString(tz),     // name
+		tree.NewDString(abbrev), // abbrev
+		tree.NewDInterval(utcOffsetInterval, types.DefaultIntervalTypeMetadata), // utc_offset
+		tree.MakeDBool(tree.DBool(t.IsDST())),                                   // is_dst
+	)
 }
 
 var pgCatalogTsDictTable = virtualSchemaTable{

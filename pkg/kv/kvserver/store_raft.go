@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 var (
@@ -783,7 +783,7 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 
 func (s *Store) updateIOThresholdMap() {
 	ioThresholdMap := map[roachpb.StoreID]*admissionpb.IOThreshold{}
-	for _, sd := range s.allocator.StorePool.GetStores() {
+	for _, sd := range s.cfg.StorePool.GetStores() {
 		ioThreshold := sd.Capacity.IOThreshold // need a copy
 		ioThresholdMap[sd.StoreID] = &ioThreshold
 	}

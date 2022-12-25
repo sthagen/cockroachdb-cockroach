@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/google/btree"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 type state struct {
@@ -760,12 +760,17 @@ func (s *state) NodeCountFn() storepool.NodeCountFunc {
 func (s *state) MakeAllocator(storeID StoreID) allocatorimpl.Allocator {
 	return allocatorimpl.MakeAllocator(
 		s.stores[storeID].settings,
-		s.stores[storeID].storepool,
+		s.stores[storeID].storepool.IsDeterministic(),
 		func(addr string) (time.Duration, bool) { return 0, true },
 		&allocator.TestingKnobs{
 			AllowLeaseTransfersToReplicasNeedingSnapshots: true,
 		},
 	)
+}
+
+// StorePool returns the store pool for the given storeID.
+func (s *state) StorePool(storeID StoreID) storepool.AllocatorStorePool {
+	return s.stores[storeID].storepool
 }
 
 // LeaseHolderReplica returns the replica which holds a lease for the range

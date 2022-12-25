@@ -21,9 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -1085,7 +1085,7 @@ func (expr *FuncExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
 	}
 
-	var calledOnNullInputFns, notCalledOnNullInputFns util.FastIntSet
+	var calledOnNullInputFns, notCalledOnNullInputFns intsets.Fast
 	for _, idx := range s.overloadIdxs {
 		if def.Overloads[idx].CalledOnNullInput {
 			calledOnNullInputFns.Add(int(idx))
@@ -1107,7 +1107,7 @@ func (expr *FuncExpr) TypeCheck(
 	if funcCls == AggregateClass {
 		for i := range s.typedExprs {
 			if s.typedExprs[i].ResolvedType().Family() == types.UnknownFamily {
-				var filtered util.FastIntSet
+				var filtered intsets.Fast
 				for j, ok := notCalledOnNullInputFns.Next(0); ok; j, ok = notCalledOnNullInputFns.Next(j + 1) {
 					if def.Overloads[j].params().GetAt(i).Equivalent(types.String) {
 						filtered.Add(j)
@@ -2356,9 +2356,9 @@ type typeCheckExprsState struct {
 
 	exprs           []Expr
 	typedExprs      []TypedExpr
-	constIdxs       util.FastIntSet // index into exprs/typedExprs
-	placeholderIdxs util.FastIntSet // index into exprs/typedExprs
-	resolvableIdxs  util.FastIntSet // index into exprs/typedExprs
+	constIdxs       intsets.Fast // index into exprs/typedExprs
+	placeholderIdxs intsets.Fast // index into exprs/typedExprs
+	resolvableIdxs  intsets.Fast // index into exprs/typedExprs
 }
 
 // typeCheckSameTypedExprs type checks a list of expressions, asserting that all
@@ -2407,10 +2407,11 @@ func typeCheckSameTypedExprs(
 
 	switch {
 	case resolvableIdxs.Empty() && constIdxs.Empty():
-		if err := typeCheckSameTypedPlaceholders(s, desired); err != nil {
+		typ, err := typeCheckSameTypedPlaceholders(s, desired)
+		if err != nil {
 			return nil, nil, err
 		}
-		return typedExprs, desired, nil
+		return typedExprs, typ, nil
 	case resolvableIdxs.Empty():
 		return typeCheckConstsAndPlaceholdersWithDesired(s, desired)
 	default:
@@ -2435,9 +2436,11 @@ func typeCheckSameTypedExprs(
 			case !constIdxs.Empty():
 				return typeCheckConstsAndPlaceholdersWithDesired(s, desired)
 			case !placeholderIdxs.Empty():
-				next, _ := placeholderIdxs.Next(0)
-				p := s.exprs[next].(*Placeholder)
-				return nil, nil, placeholderTypeAmbiguityError(p.Idx)
+				typ, err := typeCheckSameTypedPlaceholders(s, desired)
+				if err != nil {
+					return nil, nil, err
+				}
+				return typedExprs, typ, nil
 			default:
 				if desired != types.Any {
 					return typedExprs, desired, nil
@@ -2464,7 +2467,7 @@ func typeCheckSameTypedExprs(
 			}
 		}
 		if !placeholderIdxs.Empty() {
-			if err := typeCheckSameTypedPlaceholders(s, firstValidType); err != nil {
+			if _, err := typeCheckSameTypedPlaceholders(s, firstValidType); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -2473,15 +2476,16 @@ func typeCheckSameTypedExprs(
 }
 
 // Used to set placeholders to the desired typ.
-func typeCheckSameTypedPlaceholders(s typeCheckExprsState, typ *types.T) error {
+func typeCheckSameTypedPlaceholders(s typeCheckExprsState, typ *types.T) (*types.T, error) {
 	for i, ok := s.placeholderIdxs.Next(0); ok; i, ok = s.placeholderIdxs.Next(i + 1) {
 		typedExpr, err := typeCheckAndRequire(s.ctx, s.semaCtx, s.exprs[i], typ, "placeholder")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		s.typedExprs[i] = typedExpr
+		typ = typedExpr.ResolvedType()
 	}
-	return nil
+	return typ, nil
 }
 
 // Used to type check constants to the same type. An optional typ can be
@@ -2575,7 +2579,8 @@ func typeCheckConstsAndPlaceholdersWithDesired(
 		return nil, nil, err
 	}
 	if !s.placeholderIdxs.Empty() {
-		if err := typeCheckSameTypedPlaceholders(s, typ); err != nil {
+		typ, err = typeCheckSameTypedPlaceholders(s, typ)
+		if err != nil {
 			return nil, nil, err
 		}
 	}
@@ -2588,7 +2593,7 @@ func typeCheckConstsAndPlaceholdersWithDesired(
 // - All other Exprs
 func typeCheckSplitExprs(
 	exprs []Expr,
-) (constIdxs util.FastIntSet, placeholderIdxs util.FastIntSet, resolvableIdxs util.FastIntSet) {
+) (constIdxs intsets.Fast, placeholderIdxs intsets.Fast, resolvableIdxs intsets.Fast) {
 	for i, expr := range exprs {
 		switch {
 		case isConstant(expr):

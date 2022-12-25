@@ -53,7 +53,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
-	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/raft/v3"
 )
 
 const (
@@ -1327,6 +1327,16 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 		if replDesc.ReplicaID != r.replicaID {
 			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.replicaID, r.mu.state.Desc)
 		}
+	}
+	diskReplID, found, err := r.mu.stateLoader.LoadRaftReplicaID(ctx, reader)
+	if err != nil {
+		log.Fatalf(ctx, "%s", err)
+	}
+	if !found {
+		log.Fatalf(ctx, "no replicaID persisted")
+	}
+	if diskReplID.ReplicaID != r.replicaID {
+		log.Fatalf(ctx, "disk replicaID %d does not match in-mem %d", diskReplID, r.replicaID)
 	}
 }
 

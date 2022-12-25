@@ -14,19 +14,18 @@ package raftlog
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func TestLoadInvalidEntry(t *testing.T) {
 	invalidEnt := raftpb.Entry{
 		Term:  1,
 		Index: 1,
-		Data: kvserverbase.EncodeRaftCommand(
+		Data: EncodeRaftCommand(
 			// It would be nice to have an "even more invalid" command here but it
 			// turns out that DecodeRaftCommand "handles" errors via panic().
-			kvserverbase.RaftVersionStandard, "foobarzz", []byte("definitely not a protobuf"),
+			EntryEncodingStandardPrefixByte, "foobarzz", []byte("definitely not a protobuf"),
 		),
 	}
 	ent, err := NewEntry(invalidEnt)

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -43,7 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -323,7 +324,7 @@ CREATE UNIQUE INDEX test_index_to_mutate ON t.test (y) STORING (z, a);
 		// index for a new primary index during the
 		// MVCC-compatible index backfilling process.
 		idx.UseDeletePreservingEncoding = true
-		idx.EncodingType = descpb.PrimaryIndexEncoding
+		idx.EncodingType = catenumpb.PrimaryIndexEncoding
 		idx.StoreColumnNames = []string{"x", "z", "a"}
 		idx.StoreColumnIDs = []catid.ColumnID{0x1, 0x3, 0x4}
 		idx.KeySuffixColumnIDs = nil
@@ -740,7 +741,7 @@ func fetchIndex(
 	idx, err := table.FindIndexWithName(indexName)
 	require.NoError(t, err)
 	colIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
-	var valsNeeded util.FastIntSet
+	var valsNeeded intsets.Fast
 	{
 		colIDsNeeded := idx.CollectKeyColumnIDs()
 		if idx.Primary() {

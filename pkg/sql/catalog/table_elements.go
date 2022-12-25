@@ -15,12 +15,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 )
 
@@ -171,7 +172,7 @@ type Index interface {
 	GetType() descpb.IndexDescriptor_Type
 	GetGeoConfig() geoindex.Config
 	GetVersion() descpb.IndexDescriptorVersion
-	GetEncodingType() descpb.IndexDescriptorEncodingType
+	GetEncodingType() catenumpb.IndexDescriptorEncodingType
 
 	GetSharded() catpb.ShardedDescriptor
 	GetShardColumnName() string
@@ -189,7 +190,7 @@ type Index interface {
 	NumKeyColumns() int
 	GetKeyColumnID(columnOrdinal int) descpb.ColumnID
 	GetKeyColumnName(columnOrdinal int) string
-	GetKeyColumnDirection(columnOrdinal int) catpb.IndexColumn_Direction
+	GetKeyColumnDirection(columnOrdinal int) catenumpb.IndexColumn_Direction
 
 	CollectKeyColumnIDs() TableColSet
 	CollectKeySuffixColumnIDs() TableColSet
@@ -930,7 +931,7 @@ func UserDefinedTypeColsInFamilyHaveSameVersion(
 		return false, err
 	}
 
-	familyCols := util.FastIntSet{}
+	familyCols := intsets.Fast{}
 	for _, colID := range family.ColumnIDs {
 		familyCols.Add(int(colID))
 	}

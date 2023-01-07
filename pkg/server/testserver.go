@@ -108,8 +108,6 @@ func makeTestBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 	baseCfg.HTTPAddr = util.TestAddr.String()
 	// Set standard user for intra-cluster traffic.
 	baseCfg.User = username.NodeUserName()
-	// Enable web session authentication.
-	baseCfg.EnableWebSessionAuthentication = true
 	return baseCfg
 }
 
@@ -217,6 +215,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.SQLAdvertiseAddr = util.IsolatedTestAddr.String()
 		cfg.HTTPAddr = util.IsolatedTestAddr.String()
 	}
+	if params.SecondaryTenantPortOffset != 0 {
+		cfg.SecondaryTenantPortOffset = params.SecondaryTenantPortOffset
+	}
 	if params.Addr != "" {
 		cfg.Addr = params.Addr
 		cfg.AdvertiseAddr = params.Addr
@@ -230,9 +231,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.HTTPAddr = params.HTTPAddr
 	}
 	cfg.DisableTLSForHTTP = params.DisableTLSForHTTP
-	if params.DisableWebSessionAuthentication {
-		cfg.EnableWebSessionAuthentication = false
-	}
+	cfg.TestingInsecureWebAccess = params.InsecureWebAccess
 	if params.EnableDemoLoginEndpoint {
 		cfg.EnableDemoLoginEndpoint = true
 	}
@@ -801,7 +800,7 @@ func (ts *TestServer) StartTenant(
 			}
 		} else if params.TenantName != "" {
 			_, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(ctx, "rename-test-tenant", nil,
-				`SELECT crdb_internal.rename_tenant($1, $2)`, params.TenantID, params.TenantName)
+				`SELECT crdb_internal.rename_tenant($1, $2)`, params.TenantID.ToUint64(), params.TenantName)
 			if err != nil {
 				return nil, err
 			}
@@ -830,6 +829,26 @@ func (ts *TestServer) StartTenant(
 			return nil, errors.Newf("name mismatch; tenant %d has no name, but params specifies name %s",
 				params.TenantID.ToUint64(), params.TenantName)
 		}
+	}
+
+	if params.UseServerController {
+		onDemandServer, err := ts.serverController.getOrCreateServer(ctx, params.TenantName)
+		if err != nil {
+			return nil, err
+		}
+		sw := onDemandServer.(*tenantServerWrapper)
+
+		hts := &httpTestServer{}
+		hts.t.authentication = sw.server.authentication
+		hts.t.sqlServer = sw.server.sqlServer
+		hts.t.tenantName = params.TenantName
+
+		return &TestTenant{
+			SQLServer:      sw.server.sqlServer,
+			Cfg:            sw.server.sqlServer.cfg,
+			httpTestServer: hts,
+			drain:          sw.server.drainServer,
+		}, err
 	}
 
 	st := params.Settings
@@ -883,6 +902,8 @@ func (ts *TestServer) StartTenant(
 	baseCfg.GoroutineDumpDirName = params.GoroutineDumpDirName
 	baseCfg.ClusterName = ts.Cfg.ClusterName
 	baseCfg.StartDiagnosticsReporting = params.StartDiagnosticsReporting
+	baseCfg.DisableTLSForHTTP = params.DisableTLSForHTTP
+	baseCfg.EnableDemoLoginEndpoint = params.EnableDemoLoginEndpoint
 
 	// For now, we don't support split RPC/SQL ports for secondary tenants
 	// in test servers.
@@ -929,6 +950,7 @@ func (ts *TestServer) StartTenant(
 		baseCfg.HTTPAddr = newAddr
 		baseCfg.HTTPAdvertiseAddr = newAddr
 	}
+
 	sw, err := NewTenantServer(
 		ctx,
 		stopper,

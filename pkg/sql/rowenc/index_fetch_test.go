@@ -19,9 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
@@ -39,7 +40,7 @@ func TestInitIndexFetchSpec(t *testing.T) {
 	}
 
 	datadriven.RunTest(
-		t, testutils.TestDataPath(t, "index-fetch"),
+		t, datapathutils.TestDataPath(t, "index-fetch"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "exec":
@@ -72,7 +73,7 @@ func TestInitIndexFetchSpec(t *testing.T) {
 					fetchColumnIDs[i] = col.GetID()
 				}
 
-				var spec descpb.IndexFetchSpec
+				var spec fetchpb.IndexFetchSpec
 				if err := rowenc.InitIndexFetchSpec(&spec, keys.SystemSQLCodec, table, index, fetchColumnIDs); err != nil {
 					d.Fatalf(t, "%+v", err)
 				}

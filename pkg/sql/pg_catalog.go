@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -1063,9 +1064,7 @@ type oneAtATimeSchemaResolver struct {
 func (r oneAtATimeSchemaResolver) getDatabaseByID(
 	id descpb.ID,
 ) (catalog.DatabaseDescriptor, error) {
-	_, desc, err := r.p.Descriptors().GetImmutableDatabaseByID(
-		r.ctx, r.p.txn, id, tree.DatabaseLookupFlags{Required: true},
-	)
+	desc, err := r.p.Descriptors().ByIDWithLeased(r.p.txn).WithoutNonPublic().Get().Database(r.ctx, id)
 	return desc, err
 }
 
@@ -1078,11 +1077,7 @@ func (r oneAtATimeSchemaResolver) getTableByID(id descpb.ID) (catalog.TableDescr
 }
 
 func (r oneAtATimeSchemaResolver) getSchemaByID(id descpb.ID) (catalog.SchemaDescriptor, error) {
-	return r.p.Descriptors().GetImmutableSchemaByID(r.ctx, r.p.txn, id, tree.SchemaLookupFlags{
-		AvoidLeased:    true,
-		IncludeDropped: true,
-		IncludeOffline: true,
-	})
+	return r.p.Descriptors().ByID(r.p.txn).Get().Schema(r.ctx, id)
 }
 
 // makeAllRelationsVirtualTableWithDescriptorIDIndex creates a virtual table that searches through
@@ -1150,10 +1145,7 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 					}
 					h := makeOidHasher()
 					scResolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
-					sc, err := p.Descriptors().GetImmutableSchemaByID(
-						ctx, p.txn, table.GetParentSchemaID(), tree.SchemaLookupFlags{
-							Required: true,
-						})
+					sc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, table.GetParentSchemaID())
 					if err != nil {
 						return false, err
 					}
@@ -1605,21 +1597,11 @@ https://www.postgresql.org/docs/9.5/catalog-pg-description.html`,
 				objID = tree.NewDOid(oid.Oid(tree.MustBeDInt(objID)))
 				classOid = tree.NewDOid(catconstants.PgCatalogClassTableID)
 			case catalogkeys.ConstraintCommentType:
-				tableDesc, err := p.Descriptors().GetImmutableTableByID(
-					ctx,
-					p.txn,
-					descpb.ID(tree.MustBeDInt(objID)),
-					tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireTableDesc))
+				tableDesc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(tree.MustBeDInt(objID)))
 				if err != nil {
 					return err
 				}
-				schema, err := p.Descriptors().GetImmutableSchemaByID(
-					ctx,
-					p.txn,
-					tableDesc.GetParentSchemaID(),
-					tree.CommonLookupFlags{
-						Required: true,
-					})
+				schema, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, tableDesc.GetParentSchemaID())
 				if err != nil {
 					return err
 				}
@@ -2112,9 +2094,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-namespace.html`,
 					if sc, ok := schemadesc.GetVirtualSchemaByID(descpb.ID(ooid)); ok {
 						return sc, true, nil
 					}
-					if sc, err := p.Descriptors().GetImmutableSchemaByID(
-						ctx, p.Txn(), descpb.ID(ooid), tree.SchemaLookupFlags{Required: true},
-					); err == nil {
+					if sc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Schema(ctx, descpb.ID(ooid)); err == nil {
 						return sc, true, nil
 					} else if !sqlerrors.IsUndefinedSchemaError(err) {
 						return nil, false, err
@@ -2569,12 +2549,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 			func(dbDesc catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, dbDesc, true /* requiresPrivileges */, func(scDesc catalog.SchemaDescriptor) error {
 					return scDesc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-						fnDesc, err := p.Descriptors().GetImmutableFunctionByID(
-							ctx, p.Txn(), overload.ID,
-							tree.ObjectLookupFlags{
-								CommonLookupFlags: tree.CommonLookupFlags{AvoidLeased: true},
-							},
-						)
+						fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, overload.ID)
 						if err != nil {
 							return err
 						}
@@ -2601,22 +2576,18 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 					return false, err
 				}
 
-				if overload.IsUDF {
-					fnDesc, err := p.Descriptors().GetImmutableFunctionByID(
-						ctx, p.Txn(), descpb.ID(overload.Oid),
-						tree.ObjectLookupFlags{
-							CommonLookupFlags: tree.CommonLookupFlags{AvoidLeased: true},
-						},
-					)
+				if funcdesc.IsOIDUserDefinedFunc(ooid) {
+					fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, descpb.ID(overload.Oid))
 					if err != nil {
 						return false, err
 					}
 
-					scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-						ctx, p.Txn(), descpb.ID(ooid), tree.SchemaLookupFlags{Required: true},
-					)
+					scDesc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Schema(ctx, descpb.ID(ooid))
 					if err != nil {
 						return false, err
+					}
+					if fnDesc.Dropped() || fnDesc.GetParentID() != dbContext.GetID() {
+						return false, nil
 					}
 
 					err = addPgProcUDFRow(h, scDesc, fnDesc, addRow)
@@ -3211,7 +3182,7 @@ func addPGTypeRow(
 func getSchemaAndTypeByTypeID(
 	ctx context.Context, p *planner, id descpb.ID,
 ) (catalog.SchemaDescriptor, catalog.TypeDescriptor, error) {
-	typDesc, err := p.Descriptors().GetImmutableTypeByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
+	typDesc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Type(ctx, id)
 	if err != nil {
 		// If the type was not found, it may be a table.
 		if !(errors.Is(err, catalog.ErrDescriptorNotFound) || pgerror.GetPGCode(err) == pgcode.UndefinedObject) {
@@ -3220,12 +3191,7 @@ func getSchemaAndTypeByTypeID(
 		return nil, nil, nil
 	}
 
-	sc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx,
-		p.txn,
-		typDesc.GetParentSchemaID(),
-		tree.SchemaLookupFlags{Required: true},
-	)
+	sc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, typDesc.GetParentSchemaID())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3269,7 +3235,8 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 					db,
 					func(_ catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, typDesc catalog.TypeDescriptor) error {
 						nspOid := schemaOid(sc.GetID())
-						typ, err := typDesc.MakeTypesT(ctx, tree.NewQualifiedTypeName(db.GetName(), sc.GetName(), typDesc.GetName()), p)
+						tn := tree.NewQualifiedTypeName(db.GetName(), sc.GetName(), typDesc.GetName())
+						typ, err := typedesc.HydratedTFromDesc(ctx, tn, typDesc, p)
 						if err != nil {
 							return err
 						}
@@ -3313,20 +3280,21 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 					return false, nil
 				}
 
-				id, err := typedesc.UserDefinedTypeOIDToID(ooid)
-				if err != nil {
-					return false, err
-				}
+				id := typedesc.UserDefinedTypeOIDToID(ooid)
 
 				sc, typDesc, err := getSchemaAndTypeByTypeID(ctx, p, id)
 				if err != nil || typDesc == nil {
 					return false, err
 				}
 
+				if typDesc.Dropped() {
+					return false, nil
+				}
+
 				// It's an entry for the implicit record type created on behalf of each
 				// table. We have special logic for this case.
 				if typDesc.GetKind() == descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE {
-					table, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, id, tree.ObjectLookupFlags{})
+					table, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, id)
 					if err != nil {
 						if errors.Is(err, catalog.ErrDescriptorNotFound) ||
 							pgerror.GetPGCode(err) == pgcode.UndefinedObject ||
@@ -3334,6 +3302,12 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 							return false, nil
 						}
 						return false, err
+					}
+					if !table.IsVirtualTable() && table.GetParentID() != db.GetID() {
+						// If we're looking an implicit record type for a virtual table, we
+						// always return the row regardless of the parent DB. But for real
+						// tables, we only return a row if we're in the same DB as the table.
+						return false, nil
 					}
 					if err := addPGTypeRowForTable(
 						ctx,
@@ -3349,8 +3323,13 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 					return true, nil
 				}
 
+				if typDesc.GetParentID() != db.GetID() {
+					// Don't return types that aren't in our database.
+					return false, nil
+				}
+
 				nspOid = schemaOid(sc.GetID())
-				typ, err = typDesc.MakeTypesT(ctx, tree.NewUnqualifiedTypeName(typDesc.GetName()), p)
+				typ, err = typedesc.HydratedTFromDesc(ctx, tree.NewUnqualifiedTypeName(typDesc.GetName()), typDesc, p)
 				if err != nil {
 					return false, err
 				}
@@ -3560,7 +3539,11 @@ https://www.postgresql.org/docs/13/catalog-pg-statistic-ext.html`,
 			h.writeUInt64(uint64(statisticsID))
 			statisticsOID := h.getOid()
 
-			tn, err := descs.GetTableNameByID(ctx, p.Txn(), p.descCollection, descpb.ID(tableID))
+			tbl, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
+			if err != nil {
+				return err
+			}
+			tn, err := descs.GetObjectName(ctx, p.Txn(), p.Descriptors(), tbl)
 			if err != nil {
 				return err
 			}

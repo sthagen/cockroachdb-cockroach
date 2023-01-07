@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -76,9 +77,27 @@ func (desc *immutable) GetRawBytesInStorage() []byte {
 	return desc.rawBytesInStorage
 }
 
-// GetRawBytesInStorage implements the catalog.Descriptor interface.
-func (desc *Mutable) GetRawBytesInStorage() []byte {
-	return desc.rawBytesInStorage
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *immutable) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	for _, f := range desc.Functions {
+		for _, fo := range f.Overloads {
+			for _, typ := range fo.ArgTypes {
+				if !catid.IsOIDUserDefined(typ.Oid()) {
+					continue
+				}
+				if err := fn(typ); err != nil {
+					return iterutil.Map(err)
+				}
+			}
+			if !catid.IsOIDUserDefined(fo.ReturnType.Oid()) {
+				continue
+			}
+			if err := fn(fo.ReturnType); err != nil {
+				return iterutil.Map(err)
+			}
+		}
+	}
+	return nil
 }
 
 // SafeMessage makes Mutable a SafeMessager.
@@ -98,7 +117,7 @@ func formatSafeMessage(typeName string, desc catalog.SchemaDescriptor) string {
 //
 // Note: Today this isn't actually ever mutated but rather exists for a future
 // where we anticipate having a mutable copy of Schema descriptors. There's a
-// large amount of space to question this `Mutable|ImmutableCopy` version of each
+// large amount of space to question this version of each
 // descriptor type. Maybe it makes no sense but we're running with it for the
 // moment. This is an intermediate state on the road to descriptors being
 // handled outside of the catalog entirely as interfaces.
@@ -459,23 +478,6 @@ func (desc *Mutable) RemoveFunction(name string, id descpb.ID) {
 // GetObjectType implements the Object interface.
 func (desc *immutable) GetObjectType() privilege.ObjectType {
 	return privilege.Schema
-}
-
-// ContainsUserDefinedTypes implements the HydratableDescriptor interface.
-func (desc *immutable) ContainsUserDefinedTypes() bool {
-	for _, fn := range desc.Functions {
-		for i := range fn.Overloads {
-			for _, t := range fn.Overloads[i].ArgTypes {
-				if t.UserDefined() {
-					return true
-				}
-			}
-			if fn.Overloads[i].ReturnType.UserDefined() {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // GetResolvedFuncDefinition implements the SchemaDescriptor interface.

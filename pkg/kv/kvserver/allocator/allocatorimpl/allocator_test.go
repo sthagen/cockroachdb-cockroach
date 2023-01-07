@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
@@ -42,7 +43,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
@@ -102,6 +102,10 @@ var multiDCConfigVoterAndNonVoter = roachpb.SpanConfig{
 // emptySpanConfig returns the empty span configuration.
 func emptySpanConfig() roachpb.SpanConfig {
 	return roachpb.SpanConfig{}
+}
+
+func testingStartTime() time.Time {
+	return time.Date(2022, 12, 16, 11, 0, 0, 0, time.UTC)
 }
 
 var singleStore = []*roachpb.StoreDescriptor{
@@ -1527,6 +1531,7 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 	}
 
 	type testCase struct {
+		desc                                    string
 		testStores                              []*roachpb.StoreDescriptor
 		expectRebalance                         bool
 		expectedAddTarget, expectedRemoveTarget roachpb.StoreID
@@ -1535,18 +1540,21 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 		{
 			// We don't expect any QPS based rebalancing when all stores are serving
 			// the same QPS.
+			desc:            "no rebalancing, all stores equal",
 			testStores:      allStoresEqual,
 			expectRebalance: false,
 		},
 		{
 			// We don't expect any QPS based rebalancing when all stores are "close
 			// enough" to the mean.
+			desc:            "no rebalancing, all stores around the mean",
 			testStores:      allStoresAroundTheMean,
 			expectRebalance: false,
 		},
 		{
 			// When one store is overfull and another is underfull, we expect a QPS
 			// based rebalance from the overfull store to the underfull store.
+			desc:                 "rebalancing, one underfull and one overfull",
 			testStores:           oneOverfullAndOneUnderfull,
 			expectRebalance:      true,
 			expectedRemoveTarget: roachpb.StoreID(1),
@@ -1555,50 +1563,50 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 	}
 
 	for _, subtest := range tests {
-		ctx := context.Background()
-		stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
-		defer stopper.Stop(ctx)
-		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
-		var rangeUsageInfo allocator.RangeUsageInfo
-		options := &QPSScorerOptions{
-			StoreHealthOptions:    StoreHealthOptions{EnforcementLevel: StoreHealthNoAction},
-			QPSPerReplica:         100,
-			QPSRebalanceThreshold: 0.2,
-		}
-		add, remove, _, ok := a.RebalanceVoter(
-			ctx,
-			sp,
-			emptySpanConfig(),
-			nil,
-			[]roachpb.ReplicaDescriptor{{StoreID: subtest.testStores[0].StoreID}},
-			nil,
-			rangeUsageInfo,
-			storepool.StoreFilterThrottled,
-			options,
-		)
-		if subtest.expectRebalance {
-			require.True(t, ok)
-			require.Equal(t, subtest.expectedAddTarget, add.StoreID)
-			require.Equal(t, subtest.expectedRemoveTarget, remove.StoreID)
-			// Verify shouldRebalanceBasedOnThresholds results.
-			if desc, descOk := sp.GetStoreDescriptor(remove.StoreID); descOk {
-				sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
-				eqClass := equivalenceClass{
-					existing:    desc,
-					candidateSL: sl,
+		t.Run(subtest.desc, func(t *testing.T) {
+			ctx := context.Background()
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+			defer stopper.Stop(ctx)
+			gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
+			var rangeUsageInfo allocator.RangeUsageInfo
+			options := TestingQPSLoadScorerOptions(100, 0.2)
+			options.StoreHealthOptions = StoreHealthOptions{EnforcementLevel: StoreHealthNoAction}
+			add, remove, _, ok := a.RebalanceVoter(
+				ctx,
+				sp,
+				emptySpanConfig(),
+				nil,
+				[]roachpb.ReplicaDescriptor{{StoreID: subtest.testStores[0].StoreID}},
+				nil,
+				rangeUsageInfo,
+				storepool.StoreFilterThrottled,
+				options,
+			)
+			if subtest.expectRebalance {
+				require.True(t, ok)
+				require.Equal(t, subtest.expectedAddTarget, add.StoreID)
+				require.Equal(t, subtest.expectedRemoveTarget, remove.StoreID)
+				// Verify shouldRebalanceBasedOnThresholds results.
+				if desc, descOk := sp.GetStoreDescriptor(remove.StoreID); descOk {
+					sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
+					eqClass := equivalenceClass{
+						existing:    desc,
+						candidateSL: sl,
+					}
+					result := options.shouldRebalanceBasedOnThresholds(
+						ctx,
+						eqClass,
+						a.Metrics,
+					)
+					require.True(t, result)
+				} else {
+					t.Fatalf("unable to get store %d descriptor", remove.StoreID)
 				}
-				result := options.shouldRebalanceBasedOnThresholds(
-					ctx,
-					eqClass,
-					a.Metrics,
-				)
-				require.True(t, result)
 			} else {
-				t.Fatalf("unable to get store %d descriptor", remove.StoreID)
+				require.False(t, ok)
 			}
-		} else {
-			require.False(t, ok)
-		}
+
+		})
 	}
 }
 
@@ -1675,10 +1683,8 @@ func TestAllocatorRemoveBasedOnQPS(t *testing.T) {
 		stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 		defer stopper.Stop(ctx)
 		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
-		options := &QPSScorerOptions{
-			StoreHealthOptions:    StoreHealthOptions{EnforcementLevel: StoreHealthNoAction},
-			QPSRebalanceThreshold: 0.1,
-		}
+		options := TestingQPSLoadScorerOptions(0, 0.1)
+		options.StoreHealthOptions = StoreHealthOptions{EnforcementLevel: StoreHealthNoAction}
 		remove, _, err := a.RemoveVoter(
 			ctx,
 			sp,
@@ -1872,8 +1878,8 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
-				false, /* forceDecisionWithoutStats */
+				allocator.RangeUsageInfo{}, /* stats */
+				false,                      /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       c.excludeLeaseRepl,
 					CheckCandidateFullness: true,
@@ -1986,7 +1992,7 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 				emptySpanConfig(),
 				c.existing,
 				repl,
-				nil,
+				allocator.RangeUsageInfo{},
 				false, /* alwaysAllowDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       c.excludeLeaseRepl,
@@ -2081,7 +2087,7 @@ func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       false,
@@ -2193,7 +2199,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       c.excludeLeaseRepl,
@@ -2477,7 +2483,7 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 					storeID:           c.leaseholder,
 					replicationFactor: int32(len(c.existing)),
 				},
-				nil, /* replicaStats */
+				allocator.RangeUsageInfo{},
 			)
 			if c.expected != result {
 				t.Fatalf("expected %v, but found %v", c.expected, result)
@@ -2545,7 +2551,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 					storeID:           c.leaseholder,
 					replicationFactor: int32(len(c.existing)),
 				},
-				nil, /* replicaStats */
+				allocator.RangeUsageInfo{},
 			)
 			if c.expected != result {
 				t.Fatalf("expected %v, but found %v", c.expected, result)
@@ -2589,7 +2595,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 			emptySpanConfig(),
 			replicas(1, 2, 3),
 			&mockRepl{storeID: 2, replicationFactor: 3},
-			nil, /* replicaStats */
+			allocator.RangeUsageInfo{},
 		)
 		require.Equal(t, expected, result)
 	}
@@ -2733,7 +2739,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 					storeID:           c.leaseholder,
 					replicationFactor: int32(len(c.existing)),
 				},
-				nil, /* replicaStats */
+				allocator.RangeUsageInfo{},
 			)
 			expectTransfer := c.expectAllowLeaseRepl != 0
 			if expectTransfer != result {
@@ -2748,7 +2754,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 					replicationFactor: 5,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       false,
@@ -2767,7 +2773,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 					replicationFactor: 5,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       true,
@@ -2860,7 +2866,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 					replicationFactor: 6,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       false,
@@ -2880,7 +2886,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 					replicationFactor: 6,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       true,
@@ -5393,27 +5399,26 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	localityFn := func(nodeID roachpb.NodeID) string {
 		return localities[nodeID]
 	}
-	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
-	clock := hlc.NewClock(manual, time.Nanosecond /* maxOffset */)
+	now := testingStartTime()
 
 	// Set up four different load distributions. Record a bunch of requests to
 	// the unknown node 99 in evenlyBalanced to verify that requests from
 	// unknown localities don't affect the algorithm.
-	evenlyBalanced := replicastats.NewReplicaStats(clock, localityFn)
-	evenlyBalanced.RecordCount(1, 1)
-	evenlyBalanced.RecordCount(1, 2)
-	evenlyBalanced.RecordCount(1, 3)
-	imbalanced1 := replicastats.NewReplicaStats(clock, localityFn)
-	imbalanced2 := replicastats.NewReplicaStats(clock, localityFn)
-	imbalanced3 := replicastats.NewReplicaStats(clock, localityFn)
+	evenlyBalanced := replicastats.NewReplicaStats(now, localityFn)
+	evenlyBalanced.RecordCount(now, 1, 1)
+	evenlyBalanced.RecordCount(now, 1, 2)
+	evenlyBalanced.RecordCount(now, 1, 3)
+	imbalanced1 := replicastats.NewReplicaStats(now, localityFn)
+	imbalanced2 := replicastats.NewReplicaStats(now, localityFn)
+	imbalanced3 := replicastats.NewReplicaStats(now, localityFn)
 	for i := 0; i < 100*int(MinLeaseTransferStatsDuration.Seconds()); i++ {
-		evenlyBalanced.RecordCount(1, 99)
-		imbalanced1.RecordCount(1, 1)
-		imbalanced2.RecordCount(1, 2)
-		imbalanced3.RecordCount(1, 3)
+		evenlyBalanced.RecordCount(now, 1, 99)
+		imbalanced1.RecordCount(now, 1, 1)
+		imbalanced3.RecordCount(now, 1, 3)
+		imbalanced2.RecordCount(now, 1, 2)
 	}
 
-	manual.Advance(MinLeaseTransferStatsDuration)
+	now = now.Add(MinLeaseTransferStatsDuration)
 
 	noLatency := map[string]time.Duration{}
 	highLatency := map[string]time.Duration{
@@ -5499,6 +5504,13 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 			a := MakeAllocator(st, true /* deterministic */, func(addr string) (time.Duration, bool) {
 				return c.latency[addr], true
 			}, nil)
+			localitySummary := c.stats.SnapshotRatedSummary(now)
+			usage := allocator.RangeUsageInfo{}
+			usage.RequestLocality = &allocator.RangeRequestLocalityInfo{
+				Counts:   localitySummary.LocalityCounts,
+				Duration: localitySummary.Duration,
+			}
+
 			target := a.TransferLeaseTarget(
 				ctx,
 				storePool,
@@ -5508,7 +5520,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				c.stats.SnapshotRatedSummary(),
+				usage,
 				false,
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       c.excludeLeaseRepl,
@@ -8442,11 +8454,10 @@ func qpsBasedRebalanceFn(
 ) {
 	avgQPS := candidate.Capacity.QueriesPerSecond / float64(candidate.Capacity.RangeCount)
 	jitteredQPS := avgQPS * (1 + alloc.randGen.Float64())
-	opts := &QPSScorerOptions{
-		StoreHealthOptions:    StoreHealthOptions{EnforcementLevel: StoreHealthNoAction},
-		QPSPerReplica:         jitteredQPS,
-		QPSRebalanceThreshold: 0.2,
-	}
+
+	opts := TestingQPSLoadScorerOptions(jitteredQPS, 0.2)
+	opts.StoreHealthOptions = StoreHealthOptions{EnforcementLevel: StoreHealthNoAction}
+	opts.Deterministic = false
 	var rangeUsageInfo allocator.RangeUsageInfo
 	add, remove, details, ok := alloc.RebalanceVoter(
 		ctx,
@@ -8874,4 +8885,18 @@ func TestNonVoterPrioritizationInVoterAdditions(t *testing.T) {
 		result, _, _ := a.AllocateVoter(ctx, sp, tc.spanConfig, tc.existingVoters, tc.existingNonVoters, Alive)
 		assert.Equal(t, tc.expectedTargetAllocate, result, "Unexpected replication target returned by allocate voter in test %d", i)
 	}
+}
+
+func TestingQPSLoadScorerOptions(
+	qpsPerReplica float64, qpsRebalanceThreshold float64,
+) *LoadScorerOptions {
+	options := &LoadScorerOptions{
+		Deterministic:                true,
+		LoadDims:                     []load.Dimension{load.Queries},
+		LoadThreshold:                MakeQPSOnlyDim(qpsRebalanceThreshold),
+		MinLoadThreshold:             LoadMinThresholds(load.Queries),
+		MinRequiredRebalanceLoadDiff: MakeQPSOnlyDim(0),
+		RebalanceImpact:              MakeQPSOnlyDim(qpsPerReplica),
+	}
+	return options
 }

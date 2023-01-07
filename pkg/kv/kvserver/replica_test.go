@@ -9010,8 +9010,8 @@ func TestReplicaMetrics(t *testing.T) {
 		}
 		return m
 	}
-	status := func(lead uint64, progress map[uint64]tracker.Progress) *raft.Status {
-		status := &raft.Status{
+	status := func(lead uint64, progress map[uint64]tracker.Progress) *raftSparseStatus {
+		status := &raftSparseStatus{
 			Progress: progress,
 		}
 		// The commit index is set so that a progress.Match value of 1 is behind
@@ -9055,7 +9055,7 @@ func TestReplicaMetrics(t *testing.T) {
 		replicas    int32
 		storeID     roachpb.StoreID
 		desc        roachpb.RangeDescriptor
-		raftStatus  *raft.Status
+		raftStatus  *raftSparseStatus
 		liveness    livenesspb.IsLiveMap
 		raftLogSize int64
 		expected    ReplicaMetrics
@@ -9979,7 +9979,7 @@ type testQuiescer struct {
 	desc            roachpb.RangeDescriptor
 	numProposals    int
 	pendingQuota    bool
-	status          *raft.Status
+	status          *raftSparseStatus
 	lastIndex       uint64
 	raftReady       bool
 	ownsValidLease  bool
@@ -9995,7 +9995,11 @@ func (q *testQuiescer) descRLocked() *roachpb.RangeDescriptor {
 	return &q.desc
 }
 
-func (q *testQuiescer) raftStatusRLocked() *raft.Status {
+func (q *testQuiescer) isRaftLeaderRLocked() bool {
+	return q.status != nil && q.status.RaftState == raft.StateLeader
+}
+
+func (q *testQuiescer) raftSparseStatusRLocked() *raftSparseStatus {
 	return q.status
 }
 
@@ -10053,7 +10057,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 						{NodeID: 3, ReplicaID: 3},
 					},
 				},
-				status: &raft.Status{
+				status: &raftSparseStatus{
 					BasicStatus: raft.BasicStatus{
 						ID: 1,
 						HardState: raftpb.HardState{
@@ -10225,7 +10229,7 @@ func TestFollowerQuiesceOnNotify(t *testing.T) {
 	) {
 		t.Run("", func(t *testing.T) {
 			q := &testQuiescer{
-				status: &raft.Status{
+				status: &raftSparseStatus{
 					BasicStatus: raft.BasicStatus{
 						ID: 2,
 						HardState: raftpb.HardState{

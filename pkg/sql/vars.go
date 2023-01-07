@@ -291,9 +291,7 @@ var varGen = map[string]sessionVar{
 
 			if len(dbName) != 0 {
 				// Verify database descriptor exists.
-				if _, err := evalCtx.Descs.GetImmutableDatabaseByName(
-					ctx, txn, dbName, tree.DatabaseLookupFlags{Required: true},
-				); err != nil {
+				if _, err := evalCtx.Descs.ByNameWithLeased(txn).Get().Database(ctx, dbName); err != nil {
 					return "", err
 				}
 			}
@@ -2388,6 +2386,38 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().AllowOrdinalColumnReferences), nil
 		},
 		GlobalDefault: globalFalse,
+	},
+	`optimizer_use_improved_disjunction_stats`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_improved_disjunction_stats`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_improved_disjunction_stats", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseImprovedDisjunctionStats(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_limit_ordering_for_streaming_group_by`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_limit_ordering_for_streaming_group_by`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_limit_ordering_for_streaming_group_by", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseLimitOrderingForStreamingGroupBy(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy), nil
+		},
+		GlobalDefault: globalTrue,
 	},
 }
 

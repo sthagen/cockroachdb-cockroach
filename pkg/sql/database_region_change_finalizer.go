@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -61,15 +60,7 @@ func newDatabaseRegionChangeFinalizer(
 
 	var regionalByRowTables []*tabledesc.Mutable
 	if err := func() error {
-		_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-			ctx,
-			txn,
-			dbID,
-			tree.DatabaseLookupFlags{
-				Required:    true,
-				AvoidLeased: true,
-			},
-		)
+		dbDesc, err := descsCol.ByID(txn).WithoutNonPublic().Get().Database(ctx, dbID)
 		if err != nil {
 			return err
 		}
@@ -173,15 +164,7 @@ func (r *databaseRegionChangeFinalizer) updateGlobalTablesZoneConfig(
 
 	descsCol := r.localPlanner.Descriptors()
 
-	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-		ctx,
-		txn,
-		r.dbID,
-		tree.DatabaseLookupFlags{
-			Required:    true,
-			AvoidLeased: true,
-		},
-	)
+	dbDesc, err := descsCol.ByID(txn).WithoutNonPublic().Get().Database(ctx, r.dbID)
 	if err != nil {
 		return err
 	}
@@ -249,19 +232,14 @@ func (r *databaseRegionChangeFinalizer) repartitionRegionalByRowTables(
 		for i := range tableDesc.Columns {
 			col := &tableDesc.Columns[i]
 			if col.Type.UserDefined() {
-				tid, err := typedesc.UserDefinedTypeOIDToID(col.Type.Oid())
-				if err != nil {
-					return nil, nil, err
-				}
+				tid := typedesc.UserDefinedTypeOIDToID(col.Type.Oid())
 				if tid == r.typeID {
 					col.Type.TypeMeta = types.UserDefinedTypeMetadata{}
 				}
 			}
 		}
-		if err := typedesc.HydrateTypesInTableDescriptor(
-			ctx,
-			tableDesc.TableDesc(),
-			r.localPlanner,
+		if err := typedesc.HydrateTypesInDescriptor(
+			ctx, tableDesc, r.localPlanner,
 		); err != nil {
 			return nil, nil, err
 		}

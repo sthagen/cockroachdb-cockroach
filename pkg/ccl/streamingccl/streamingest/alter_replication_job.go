@@ -10,13 +10,18 @@ package streamingest
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -31,8 +36,42 @@ import (
 
 const alterReplicationJobOp = "ALTER TENANT REPLICATION"
 
-var alterReplicationJobHeader = colinfo.ResultColumns{
-	{Name: "replication_job_id", Typ: types.Int},
+var alterReplicationCutoverHeader = colinfo.ResultColumns{
+	{Name: "cutover_time", Typ: types.Decimal},
+}
+
+// ResolvedTenantReplicationOptions represents options from an
+// evaluated CREATE TENANT FROM REPLICATION command.
+type resolvedTenantReplicationOptions struct {
+	retention *int32
+}
+
+func evalTenantReplicationOptions(
+	ctx context.Context, options tree.TenantReplicationOptions, eval exprutil.Evaluator,
+) (*resolvedTenantReplicationOptions, error) {
+	r := &resolvedTenantReplicationOptions{}
+	if options.Retention != nil {
+		retentionStr, err := eval.String(ctx, options.Retention)
+		if err != nil {
+			return nil, err
+		}
+		if retentionStr != "" {
+			retDuration, err := time.ParseDuration(retentionStr)
+			if err != nil {
+				return nil, err
+			}
+			retSeconds := int32(retDuration.Seconds())
+			r.retention = &retSeconds
+		}
+	}
+	return r, nil
+}
+
+func (r *resolvedTenantReplicationOptions) GetRetention() (int32, bool) {
+	if r == nil || r.retention == nil {
+		return 0, false
+	}
+	return *r.retention, true
 }
 
 func alterReplicationJobTypeCheck(
@@ -44,7 +83,7 @@ func alterReplicationJobTypeCheck(
 	}
 	tenantNameStrVal := paramparse.UnresolvedNameToStrVal(alterStmt.TenantName)
 	if err := exprutil.TypeCheck(
-		ctx, alterReplicationJobOp, p.SemaCtx(), exprutil.Strings{tenantNameStrVal},
+		ctx, alterReplicationJobOp, p.SemaCtx(), exprutil.Strings{tenantNameStrVal, alterStmt.Options.Retention},
 	); err != nil {
 		return false, nil, err
 	}
@@ -57,8 +96,10 @@ func alterReplicationJobTypeCheck(
 				return false, nil, err
 			}
 		}
+		return true, alterReplicationCutoverHeader, nil
 	}
-	return true, alterReplicationJobHeader, nil
+
+	return true, nil, nil
 }
 
 func alterReplicationJobHook(
@@ -101,6 +142,12 @@ func alterReplicationJobHook(
 			cutoverTime = ct
 		}
 	}
+
+	options, err := evalTenantReplicationOptions(ctx, alterTenantStmt.Options, exprEval)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		if err := utilccl.CheckEnterpriseEnabled(
 			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(),
@@ -118,46 +165,13 @@ func alterReplicationJobHook(
 		}
 		jobRegistry := p.ExecCfg().JobRegistry
 		if alterTenantStmt.Cutover != nil {
-			job, err := jobRegistry.LoadJobWithTxn(ctx, tenInfo.TenantReplicationJobID, p.Txn())
-			if err != nil {
+			if err := alterTenantJobCutover(ctx, p.Txn(), jobRegistry,
+				p.ExecCfg().ProtectedTimestampProvider, alterTenantStmt, tenInfo, cutoverTime); err != nil {
 				return err
 			}
-			details, ok := job.Details().(jobspb.StreamIngestionDetails)
-			if !ok {
-				return errors.Newf("job with id %d is not a stream ingestion job", job.ID())
-			}
-			progress := job.Progress()
-			if alterTenantStmt.Cutover.Latest {
-				ts := progress.GetHighWater()
-				if ts == nil || ts.IsEmpty() {
-					return errors.Newf("replicated tenant %q has not yet recorded a safe replication time", tenantName)
-				}
-				cutoverTime = *ts
-			}
-			// TODO(ssd): We could use the replication manager here, but that embeds a priviledge check which is already completed.
-
-			// Check that the timestamp is above our retained timestamp.
-			stats, err := replicationutils.GetStreamIngestionStatsNoHeartbeat(ctx, details, progress)
-			if err != nil {
-				return err
-			}
-			if stats.IngestionDetails.ProtectedTimestampRecordID == nil {
-				return errors.Newf("replicated tenant %q has not yet recorded a retained timestamp", tenantName)
-			} else {
-				ptp := p.ExecCfg().ProtectedTimestampProvider
-				record, err := ptp.GetRecord(ctx, p.Txn(), *stats.IngestionDetails.ProtectedTimestampRecordID)
-				if err != nil {
-					return err
-				}
-				if cutoverTime.Less(record.Timestamp) {
-					return errors.Newf("cutover time %s is before earliest safe cutover time %s", cutoverTime, record.Timestamp)
-				}
-			}
-			if err := completeStreamIngestion(ctx, jobRegistry, p.Txn(), tenInfo.TenantReplicationJobID, cutoverTime); err != nil {
-				return err
-			}
-			// Unpause the job if it is paused
-			if err := jobRegistry.Unpause(ctx, p.Txn(), tenInfo.TenantReplicationJobID); err != nil {
+			resultsCh <- tree.Datums{eval.TimestampToDecimalDatum(cutoverTime)}
+		} else if !alterTenantStmt.Options.IsDefault() {
+			if err := alterTenantOptions(ctx, p.Txn(), jobRegistry, options, tenInfo); err != nil {
 				return err
 			}
 		} else {
@@ -175,10 +189,92 @@ func alterReplicationJobHook(
 				return errors.New("unsupported job command in ALTER TENANT REPLICATION")
 			}
 		}
-		resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(tenInfo.TenantReplicationJobID))}
 		return nil
 	}
-	return fn, alterReplicationJobHeader, nil, false, nil
+	if alterTenantStmt.Cutover != nil {
+		return fn, alterReplicationCutoverHeader, nil, false, nil
+	}
+	return fn, nil, nil, false, nil
+}
+
+func alterTenantJobCutover(
+	ctx context.Context,
+	txn *kv.Txn,
+	jobRegistry *jobs.Registry,
+	ptp protectedts.Provider,
+	alterTenantStmt *tree.AlterTenantReplication,
+	tenInfo *descpb.TenantInfo,
+	cutoverTime hlc.Timestamp,
+) error {
+	if alterTenantStmt == nil || alterTenantStmt.Cutover == nil {
+		return errors.AssertionFailedf("unexpected nil ALTER TENANT cutover expression")
+	}
+
+	tenantName := tenInfo.Name
+	job, err := jobRegistry.LoadJobWithTxn(ctx, tenInfo.TenantReplicationJobID, txn)
+	if err != nil {
+		return err
+	}
+	details, ok := job.Details().(jobspb.StreamIngestionDetails)
+	if !ok {
+		return errors.Newf("job with id %d is not a stream ingestion job", job.ID())
+	}
+	progress := job.Progress()
+	if alterTenantStmt.Cutover.Latest {
+		ts := progress.GetHighWater()
+		if ts == nil || ts.IsEmpty() {
+			return errors.Newf("replicated tenant %q has not yet recorded a safe replication time", tenantName)
+		}
+		cutoverTime = *ts
+	}
+
+	// TODO(ssd): We could use the replication manager here, but
+	// that embeds a priviledge check which is already completed.
+	//
+	// Check that the timestamp is above our retained timestamp.
+	stats, err := replicationutils.GetStreamIngestionStatsNoHeartbeat(ctx, details, progress)
+	if err != nil {
+		return err
+	}
+	if stats.IngestionDetails.ProtectedTimestampRecordID == nil {
+		return errors.Newf("replicated tenant %q has not yet recorded a retained timestamp", tenantName)
+	} else {
+		record, err := ptp.GetRecord(ctx, txn, *stats.IngestionDetails.ProtectedTimestampRecordID)
+		if err != nil {
+			return err
+		}
+		if cutoverTime.Less(record.Timestamp) {
+			return errors.Newf("cutover time %s is before earliest safe cutover time %s", cutoverTime, record.Timestamp)
+		}
+	}
+	if err := completeStreamIngestion(ctx, jobRegistry, txn, tenInfo.TenantReplicationJobID, cutoverTime); err != nil {
+		return err
+	}
+	// Unpause the job if it is paused.
+	if err := jobRegistry.Unpause(ctx, txn, tenInfo.TenantReplicationJobID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func alterTenantOptions(
+	ctx context.Context,
+	txn *kv.Txn,
+	jobRegistry *jobs.Registry,
+	options *resolvedTenantReplicationOptions,
+	tenInfo *descpb.TenantInfo,
+) error {
+	return jobRegistry.UpdateJobWithTxn(ctx, tenInfo.TenantReplicationJobID, txn, false, /* useReadLock */
+		func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+			streamIngestionDetails := md.Payload.GetStreamIngestion()
+			if ret, ok := options.GetRetention(); ok {
+				streamIngestionDetails.ReplicationTTLSeconds = ret
+			}
+			ju.UpdatePayload(md.Payload)
+			return nil
+		})
+
 }
 
 func typeCheckCutoverTime(

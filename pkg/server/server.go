@@ -75,7 +75,6 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/importer" // register jobs/planHooks declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
-	"github.com/cockroachdb/cockroach/pkg/sql/recent"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -796,9 +795,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Instantiate the SQL session registry.
 	sessionRegistry := sql.NewSessionRegistry()
 
-	// Instantiate the cache of recent statements.
-	recentStatementsCache := recent.NewStatementsCache(st, sqlMonitorAndMetrics.rootSQLMemoryMonitor, time.Now)
-
 	// Instantiate the cache of closed SQL sessions.
 	closedSessionCache := sql.NewClosedSessionCache(cfg.Settings, sqlMonitorAndMetrics.rootSQLMemoryMonitor, time.Now)
 
@@ -901,7 +897,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		sessionRegistry:          sessionRegistry,
 		closedSessionCache:       closedSessionCache,
 		remoteFlowRunner:         remoteFlowRunner,
-		recentStatementsCache:    recentStatementsCache,
 		circularInternalExecutor: internalExecutor,
 		internalExecutorFactory:  internalExecutorFactory,
 		circularJobRegistry:      jobRegistry,
@@ -990,7 +985,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		// TODO(knz): Remove this once
 		// https://github.com/cockroachdb/cockroach/issues/84585 is
 		// implemented.
-		func(ctx context.Context, name string) error {
+		func(ctx context.Context, name roachpb.TenantName) error {
 			d, err := sc.getOrCreateServer(ctx, name)
 			if err != nil {
 				return err
@@ -1790,7 +1785,9 @@ func (s *Server) PreStart(ctx context.Context) error {
 	//
 	// NB: We run this under the startup ctx (not workersCtx) so as to ensure
 	// all the upgrade steps are traced, for use during troubleshooting.
-	s.startAttemptUpgrade(ctx)
+	if err := s.startAttemptUpgrade(ctx); err != nil {
+		return errors.Wrap(err, "cannot start upgrade task")
+	}
 
 	if err := s.node.tenantSettingsWatcher.Start(workersCtx, s.sqlServer.execCfg.SystemTableIDResolver); err != nil {
 		return errors.Wrap(err, "failed to initialize the tenant settings watcher")

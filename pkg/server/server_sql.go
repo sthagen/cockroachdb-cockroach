@@ -68,7 +68,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesccache"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/consistencychecker"
@@ -83,7 +83,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/rangeprober"
-	"github.com/cockroachdb/cockroach/pkg/sql/recent"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
@@ -305,9 +304,6 @@ type sqlServerArgs struct {
 	// Used to track the DistSQL flows currently running on this node but
 	// initiated on behalf of other nodes.
 	remoteFlowRunner *flowinfra.RemoteFlowRunner
-
-	// Used to store recent statements.
-	recentStatementsCache *recent.StatementsCache
 
 	// KV depends on the internal executor, so we pass a pointer to an empty
 	// struct in this configuration, which newSQLServer fills.
@@ -653,7 +649,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		return nil, errors.Wrap(err, "creating virtual schema holder")
 	}
 
-	hydratedDescCache := hydrateddesc.NewCache(cfg.Settings)
+	hydratedDescCache := hydrateddesccache.NewCache(cfg.Settings)
 	cfg.registry.AddMetricStruct(hydratedDescCache.Metrics())
 
 	gcJobNotifier := gcjobnotifier.New(cfg.Settings, cfg.systemConfigWatcher, codec, cfg.stopper)
@@ -887,7 +883,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		SQLStatusServer:           cfg.sqlStatusServer,
 		SessionRegistry:           cfg.sessionRegistry,
 		ClosedSessionCache:        cfg.closedSessionCache,
-		RecentStatementsCache:     cfg.recentStatementsCache,
 		ContentionRegistry:        contentionRegistry,
 		SQLLiveness:               cfg.sqlLivenessProvider,
 		JobRegistry:               jobRegistry,

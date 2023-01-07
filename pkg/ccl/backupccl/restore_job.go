@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -47,10 +48,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/rewrite"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbackup"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -1070,7 +1073,7 @@ func createImportingDescriptors(
 			// Write the updated databases.
 			for dbID, schemas := range existingDBsWithNewSchemas {
 				log.Infof(ctx, "writing %d schema entries to database %d", len(schemas), dbID)
-				desc, err := descsCol.GetMutableDescriptorByID(ctx, txn, dbID)
+				desc, err := descsCol.MutableByID(txn).Desc(ctx, dbID)
 				if err != nil {
 					return err
 				}
@@ -1090,12 +1093,7 @@ func createImportingDescriptors(
 			// to the new tables being restored.
 			for _, table := range mutableTables {
 				// Collect all types used by this table.
-				_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-					ctx, txn, table.GetParentID(), tree.DatabaseLookupFlags{
-						Required:       true,
-						AvoidLeased:    true,
-						IncludeOffline: true,
-					})
+				dbDesc, err := descsCol.ByID(txn).WithoutDropped().Get().Database(ctx, table.GetParentID())
 				if err != nil {
 					return err
 				}
@@ -1117,7 +1115,7 @@ func createImportingDescriptors(
 						continue
 					}
 					// Otherwise, add a backreference to this table.
-					typDesc, err := descsCol.GetMutableTypeVersionByID(ctx, txn, id)
+					typDesc, err := descsCol.MutableByID(txn).Type(ctx, id)
 					if err != nil {
 						return err
 					}
@@ -1141,16 +1139,7 @@ func createImportingDescriptors(
 			if details.DescriptorCoverage != tree.AllDescriptors {
 				for _, table := range tableDescs {
 					if lc := table.GetLocalityConfig(); lc != nil {
-						_, desc, err := descsCol.GetImmutableDatabaseByID(
-							ctx,
-							txn,
-							table.ParentID,
-							tree.DatabaseLookupFlags{
-								Required:       true,
-								AvoidLeased:    true,
-								IncludeOffline: true,
-							},
-						)
+						desc, err := descsCol.ByID(txn).WithoutDropped().Get().Database(ctx, table.ParentID)
 						if err != nil {
 							return err
 						}
@@ -1160,7 +1149,7 @@ func createImportingDescriptors(
 								table.ID, table.ParentID)
 						}
 
-						mutTable, err := descsCol.GetMutableTableVersionByID(ctx, table.GetID(), txn)
+						mutTable, err := descsCol.MutableByID(txn).Table(ctx, table.GetID())
 						if err != nil {
 							return err
 						}
@@ -2239,7 +2228,7 @@ func prefetchDescriptors(
 	// and we're going to write them to KV very soon as part of a
 	// single batch).
 	ids := allDescIDs.Ordered()
-	got, err := descsCol.GetMutableDescriptorsByID(ctx, txn, ids...)
+	got, err := descsCol.MutableByID(txn).Descs(ctx, ids)
 	if err != nil {
 		return nstree.Catalog{}, errors.Wrap(err, "prefetch descriptors")
 	}
@@ -2371,7 +2360,7 @@ func (r *restoreResumer) dropDescriptors(
 	mutableTables := make([]*tabledesc.Mutable, len(details.TableDescs))
 	for i := range details.TableDescs {
 		var err error
-		mutableTables[i], err = descsCol.GetMutableTableVersionByID(ctx, details.TableDescs[i].ID, txn)
+		mutableTables[i], err = descsCol.MutableByID(txn).Table(ctx, details.TableDescs[i].ID)
 		if err != nil {
 			return err
 		}
@@ -2450,12 +2439,7 @@ func (r *restoreResumer) dropDescriptors(
 		// TypeDescriptors don't have a GC job process, so we can just write them
 		// as dropped here.
 		typDesc := details.TypeDescs[i]
-		mutType, err := descsCol.GetMutableTypeByID(ctx, txn, typDesc.ID, tree.ObjectLookupFlags{
-			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidLeased:    true,
-				IncludeOffline: true,
-			},
-		})
+		mutType, err := descsCol.MutableByID(txn).Type(ctx, typDesc.ID)
 		if err != nil {
 			return err
 		}
@@ -2471,12 +2455,7 @@ func (r *restoreResumer) dropDescriptors(
 
 	for i := range details.FunctionDescs {
 		fnDesc := details.FunctionDescs[i]
-		mutFn, err := descsCol.GetMutableFunctionByID(ctx, txn, fnDesc.ID, tree.ObjectLookupFlags{
-			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidLeased:    true,
-				IncludeOffline: true,
-			},
-		})
+		mutFn, err := descsCol.MutableByID(txn).Function(ctx, fnDesc.ID)
 		if err != nil {
 			return err
 		}
@@ -2548,13 +2527,13 @@ func (r *restoreResumer) dropDescriptors(
 			continue
 		}
 
-		mutSchema, err := descsCol.GetMutableDescriptorByID(ctx, txn, schemaDesc.GetID())
+		mutSchema, err := descsCol.MutableByID(txn).Desc(ctx, schemaDesc.GetID())
 		if err != nil {
 			return err
 		}
 		entry, hasEntry := dbsWithDeletedSchemas[schemaDesc.GetParentID()]
 		if !hasEntry {
-			mutParent, err := descsCol.GetMutableDescriptorByID(ctx, txn, schemaDesc.GetParentID())
+			mutParent, err := descsCol.MutableByID(txn).Desc(ctx, schemaDesc.GetParentID())
 			if err != nil {
 				return err
 			}
@@ -2625,7 +2604,7 @@ func (r *restoreResumer) dropDescriptors(
 			continue
 		}
 
-		db, err := descsCol.GetMutableDescriptorByID(ctx, txn, dbDesc.GetID())
+		db, err := descsCol.MutableByID(txn).Desc(ctx, dbDesc.GetID())
 		if err != nil {
 			return err
 		}
@@ -2679,24 +2658,12 @@ func setGCTTLForDroppingTable(
 	log.VInfof(ctx, 2, "lowering TTL for table %q (%d)", tableToDrop.GetName(), tableToDrop.GetID())
 	// We get a mutable descriptor here because we are going to construct a
 	// synthetic descriptor collection in which they are online.
-	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, tableToDrop.GetParentID(),
-		tree.DatabaseLookupFlags{
-			Required:       true,
-			IncludeOffline: true,
-			IncludeDropped: true,
-			AvoidLeased:    true,
-		})
+	dbDesc, err := descsCol.ByID(txn).Get().Database(ctx, tableToDrop.GetParentID())
 	if err != nil {
 		return err
 	}
 
-	schemaDesc, err := descsCol.GetImmutableSchemaByID(ctx, txn, tableToDrop.GetParentSchemaID(),
-		tree.SchemaLookupFlags{
-			Required:       true,
-			IncludeDropped: true,
-			IncludeOffline: true,
-			AvoidLeased:    true,
-		})
+	schemaDesc, err := descsCol.ByID(txn).Get().Schema(ctx, tableToDrop.GetParentSchemaID())
 	if err != nil {
 		return err
 	}
@@ -2755,7 +2722,7 @@ func (r *restoreResumer) removeExistingTypeBackReferences(
 				return restored, nil
 			}
 			// Finally, look it up using the transaction.
-			typ, err := descsCol.GetMutableTypeVersionByID(ctx, txn, id)
+			typ, err := descsCol.MutableByID(txn).Type(ctx, id)
 			if err != nil {
 				return nil, err
 			}
@@ -2763,12 +2730,7 @@ func (r *restoreResumer) removeExistingTypeBackReferences(
 			return typ, nil
 		}
 
-		_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-			ctx, txn, tbl.GetParentID(), tree.DatabaseLookupFlags{
-				Required:       true,
-				AvoidLeased:    true,
-				IncludeOffline: true,
-			})
+		dbDesc, err := descsCol.ByID(txn).WithoutDropped().Get().Database(ctx, tbl.GetParentID())
 		if err != nil {
 			return err
 		}
@@ -2831,10 +2793,9 @@ func (r *restoreResumer) restoreSystemUsers(
 		}
 
 		insertUser := `INSERT INTO system.users ("username", "hashedPassword", "isRole", "user_id") VALUES ($1, $2, $3, $4)`
-		newUsernames := make(map[string]bool)
+		newUsernames := make(map[string]catid.RoleID)
 		args := make([]interface{}, 4)
 		for _, user := range users {
-			newUsernames[user[0].String()] = true
 			args[0] = user[0]
 			args[1] = user[1]
 			args[2] = user[2]
@@ -2847,33 +2808,78 @@ func (r *restoreResumer) restoreSystemUsers(
 				args...); err != nil {
 				return err
 			}
+			newUsernames[user[0].String()] = id
 		}
 
 		// We skip granting roles if the backup does not contain system.role_members.
-		if len(systemTables) == 1 {
-			return nil
-		}
+		if hasSystemRoleMembersTable(systemTables) {
+			selectNonExistentRoleMembers := "SELECT * FROM crdb_temp_system.role_members temp_rm WHERE " +
+				"NOT EXISTS (SELECT * FROM system.role_members rm WHERE temp_rm.role = rm.role AND temp_rm.member = rm.member)"
+			roleMembers, err := executor.QueryBuffered(ctx, "get-role-members",
+				txn, selectNonExistentRoleMembers)
+			if err != nil {
+				return err
+			}
 
-		selectNonExistentRoleMembers := "SELECT * FROM crdb_temp_system.role_members temp_rm WHERE " +
-			"NOT EXISTS (SELECT * FROM system.role_members rm WHERE temp_rm.role = rm.role AND temp_rm.member = rm.member)"
-		roleMembers, err := executor.QueryBuffered(ctx, "get-role-members",
-			txn, selectNonExistentRoleMembers)
-		if err != nil {
-			return err
-		}
-
-		insertRoleMember := `INSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, $3)`
-		for _, roleMember := range roleMembers {
-			// Only grant roles to users that don't currently exist, i.e., new users we just added
-			if _, ok := newUsernames[roleMember[1].String()]; ok {
-				if _, err = executor.Exec(ctx, "insert-non-existent-role-members", txn, insertRoleMember,
-					roleMember[0], roleMember[1], roleMember[2]); err != nil {
-					return err
+			insertRoleMember := `INSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, $3)`
+			for _, roleMember := range roleMembers {
+				// Only grant roles to users that don't currently exist, i.e., new users we just added
+				if _, ok := newUsernames[roleMember[1].String()]; ok {
+					if _, err = executor.Exec(ctx, "insert-non-existent-role-members", txn, insertRoleMember,
+						roleMember[0], roleMember[1], roleMember[2]); err != nil {
+						return err
+					}
 				}
 			}
 		}
+
+		if hasSystemRoleOptionsTable(systemTables) {
+			selectNonExistentRoleOptions := "SELECT * FROM crdb_temp_system.role_options temp_ro WHERE " +
+				"NOT EXISTS (SELECT * FROM system.role_options ro WHERE temp_ro.username = ro.username AND temp_ro.option = ro.option)"
+			roleOptions, err := executor.QueryBuffered(ctx, "get-role-options", txn, selectNonExistentRoleOptions)
+			if err != nil {
+				return err
+			}
+
+			roleOptionsHasIDColumn := r.execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2RoleOptionsTableHasIDColumn)
+			insertRoleOption := `INSERT INTO system.role_options ("username", "option", "value", "user_id") VALUES ($1, $2, $3, $4)`
+			if !roleOptionsHasIDColumn {
+				insertRoleOption = `INSERT INTO system.role_options ("username", "option", "value") VALUES ($1, $2, $3)`
+			}
+
+			for _, roleOption := range roleOptions {
+				if roleID, ok := newUsernames[roleOption[0].String()]; ok {
+					args := []interface{}{roleOption[0], roleOption[1], roleOption[2]}
+					if roleOptionsHasIDColumn {
+						args = append(args, roleID)
+					}
+					if _, err = executor.Exec(ctx, "insert-non-existent-role-options", txn,
+						insertRoleOption, args...); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
 		return nil
 	})
+}
+
+func hasSystemRoleMembersTable(systemTables []catalog.TableDescriptor) bool {
+	return hasSystemTableByName(systemschema.RoleMembersTable.GetName(), systemTables)
+}
+
+func hasSystemRoleOptionsTable(systemTables []catalog.TableDescriptor) bool {
+	return hasSystemTableByName(systemschema.RoleOptionsTable.GetName(), systemTables)
+}
+
+func hasSystemTableByName(name string, systemTables []catalog.TableDescriptor) bool {
+	for _, t := range systemTables {
+		if t.GetName() == name {
+			return true
+		}
+	}
+	return false
 }
 
 // restoreSystemTables atomically replaces the contents of the system tables

@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
@@ -54,6 +55,7 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 const (
@@ -148,6 +150,13 @@ func (c *atomicConnectionClass) set(cc rpc.ConnectionClass) {
 	atomic.StoreUint32((*uint32)(c), uint32(cc))
 }
 
+// raftSparseStatus is a variant of raft.Status without Config and
+// Progress.Inflights, which are expensive to copy.
+type raftSparseStatus struct {
+	raft.BasicStatus
+	Progress map[uint64]tracker.Progress
+}
+
 // A Replica is a contiguous keyspace with writes managed via an
 // instance of the Raft consensus algorithm. Many ranges may exist
 // in a store and they are unlikely to be contiguous. Ranges are
@@ -193,7 +202,7 @@ type Replica struct {
 	// Multiple types of throughput are accounted for. Where the localities of
 	// requests are tracked in order in addition to the aggregate, in order to
 	// inform load based lease and replica rebalancing decisions.
-	loadStats *ReplicaLoad
+	loadStats *load.ReplicaLoad
 
 	// Held in read mode during read-only commands. Held in exclusive mode to
 	// prevent read-only commands from executing. Acquired before the embedded
@@ -331,6 +340,9 @@ type Replica struct {
 		// scheduled for destruction or has been GCed.
 		// destroyStatus should only be set while also holding the raftMu and
 		// readOnlyCmdMu.
+		//
+		// When this replica is being removed, the destroyStatus is updated and
+		// RangeTombstone is written in the same raftMu critical section.
 		destroyStatus
 		// Is the range quiescent? Quiescent ranges are not Tick()'d and unquiesce
 		// whenever a Raft operation is performed.
@@ -486,12 +498,10 @@ type Replica struct {
 		applyingEntries bool
 		// The replica's Raft group "node".
 		internalRaftGroup *raft.RawNode
-		// The minimum allowed ID for this replica. Initialized from
-		// RangeTombstone.NextReplicaID.
-		tombstoneMinReplicaID roachpb.ReplicaID
 
-		// The ID of the leader replica within the Raft group. Used to determine
-		// when the leadership changes.
+		// The ID of the leader replica within the Raft group. NB: this is updated
+		// in a separate critical section from the Raft group, and can therefore
+		// briefly be out of sync with the Raft status.
 		leaderID roachpb.ReplicaID
 		// The most recently added replica for the range and when it was added.
 		// Used to determine whether a replica is new enough that we shouldn't
@@ -1189,12 +1199,37 @@ func (r *Replica) RaftStatus() *raft.Status {
 	return r.raftStatusRLocked()
 }
 
+// raftStatusRLocked returns the current raft status of the replica, or
+// nil if the Raft group has not been initialized yet.
+//
+// NB: This incurs deep copies of Status.Config and Status.Progress.Inflights
+// and is not suitable for use in hot paths. See raftSparseStatusRLocked().
 func (r *Replica) raftStatusRLocked() *raft.Status {
 	if rg := r.mu.internalRaftGroup; rg != nil {
 		s := rg.Status()
 		return &s
 	}
 	return nil
+}
+
+// raftSparseStatusRLocked returns a sparse Raft status without Config and
+// Progress.Inflights which are expensive to copy, or nil if the Raft group has
+// not been initialized yet. Progress is only populated on the leader.
+func (r *Replica) raftSparseStatusRLocked() *raftSparseStatus {
+	rg := r.mu.internalRaftGroup
+	if rg == nil {
+		return nil
+	}
+	status := &raftSparseStatus{
+		BasicStatus: rg.BasicStatus(),
+	}
+	if status.RaftState == raft.StateLeader {
+		status.Progress = map[uint64]tracker.Progress{}
+		rg.WithProgress(func(id uint64, _ raft.ProgressType, pr tracker.Progress) {
+			status.Progress[id] = pr
+		})
+	}
+	return status
 }
 
 func (r *Replica) raftBasicStatusRLocked() raft.BasicStatus {
@@ -1556,11 +1591,6 @@ func (r *Replica) checkExecutionCanProceedForRangeFeed(
 		return err
 	} else if err := r.checkTSAboveGCThresholdRLocked(ts, status, false /* isAdmin */); err != nil {
 		return err
-	} else if r.requiresExpiringLeaseRLocked() {
-		// Ensure that the range does not require an expiration-based lease. If it
-		// does, it will never get closed timestamp updates and the rangefeed will
-		// never be able to advance its resolved timestamp.
-		return errors.New("expiration-based leases are incompatible with rangefeeds")
 	}
 	return nil
 }
@@ -1705,8 +1735,7 @@ func (r *Replica) shouldWaitForPendingMergeRLocked(
 // have been removed from this store after the split.
 //
 // TODO(tbg): the below is true as of 22.2: we persist any Replica's ReplicaID
-// under RaftReplicaIDKey, so the below caveats should be addressed now and we
-// should be able to simplify isNewerThanSplit to just compare replicaIDs.
+// under RaftReplicaIDKey, so the below caveats should be addressed now.
 //
 // TODO(ajwerner):  There is one false negative where false will be returned but
 // the hard state may be due to a newer replica which is outlined below. It
@@ -1734,21 +1763,12 @@ func (r *Replica) shouldWaitForPendingMergeRLocked(
 //
 // See TestProcessSplitAfterRightHandSideHasBeenRemoved.
 func (r *Replica) isNewerThanSplit(split *roachpb.SplitTrigger) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.isNewerThanSplitRLocked(split)
-}
-
-func (r *Replica) isNewerThanSplitRLocked(split *roachpb.SplitTrigger) bool {
 	rightDesc, _ := split.RightDesc.GetReplicaDescriptor(r.StoreID())
-	// If we have written a tombstone for this range then we know that the RHS
-	// must have already been removed at the split replica ID.
-	return r.mu.tombstoneMinReplicaID != 0 ||
-		// If the first raft message we received for the RHS range was for a replica
-		// ID which is above the replica ID of the split then we would not have
-		// written a tombstone but we will have a replica ID that will exceed the
-		// split replica ID.
-		r.replicaID > rightDesc.ReplicaID
+	// If the first raft message we received for the RHS range was for a replica
+	// ID which is above the replica ID of the split then we would not have
+	// written a tombstone but we will have a replica ID that will exceed the
+	// split replica ID.
+	return r.replicaID > rightDesc.ReplicaID
 }
 
 // WatchForMerge is like maybeWatchForMergeLocked, except it expects a merge to
@@ -1963,11 +1983,14 @@ func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
 	}
+	if !r.isRaftLeaderRLocked() { // fast path
+		return
+	}
 	status := r.leaseStatusAtRLocked(ctx, now)
 	if !status.IsValid() || status.OwnedBy(r.StoreID()) {
 		return
 	}
-	raftStatus := r.raftStatusRLocked()
+	raftStatus := r.raftSparseStatusRLocked()
 	if raftStatus == nil || raftStatus.RaftState != raft.StateLeader {
 		return
 	}
@@ -2067,7 +2090,7 @@ func init() {
 // requests.
 func (r *Replica) MeasureReqCPUNanos(start time.Duration) {
 	r.measureNanosRunning(start, func(dur float64) {
-		r.loadStats.reqCPUNanos.RecordCount(dur, 0 /* nodeID */)
+		r.loadStats.RecordReqCPUNanos(dur)
 	})
 }
 
@@ -2075,7 +2098,7 @@ func (r *Replica) MeasureReqCPUNanos(start time.Duration) {
 // raft work.
 func (r *Replica) MeasureRaftCPUNanos(start time.Duration) {
 	r.measureNanosRunning(start, func(dur float64) {
-		r.loadStats.raftCPUNanos.RecordCount(dur, 0 /* nodeID */)
+		r.loadStats.RecordRaftCPUNanos(dur)
 	})
 }
 
@@ -2086,6 +2109,12 @@ func (r *Replica) measureNanosRunning(start time.Duration, f func(float64)) {
 	end := grunning.Time()
 	dur := grunning.Difference(start, end).Nanoseconds()
 	f(float64(dur))
+}
+
+// GetLoadStatsForTesting is for use only by tests to read the Replicas' load
+// tracker state.
+func (r *Replica) GetLoadStatsForTesting() *load.ReplicaLoad {
+	return r.loadStats
 }
 
 // ReadProtectedTimestampsForTesting is for use only by tests to read and update

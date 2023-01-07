@@ -320,7 +320,7 @@ func runDemoInternal(
 # Reminder: your changes to data stored in the demo session will not be saved!`)
 
 		var nodeList strings.Builder
-		c.ListDemoNodes(&nodeList, stderr, true /* justOne */)
+		c.ListDemoNodes(&nodeList, stderr, true /* justOne */, false /* verbose */)
 		cliCtx.PrintlnUnlessEmbedded(
 			// Only print the server details when the shell is not embedded;
 			// if embedded, the embedding platform owns the network
@@ -338,6 +338,8 @@ func runDemoInternal(
 
 			fmt.Printf(`#   - Username: %q, password: %q
 #   - Directory with certificate files (for certain SQL drivers/tools): %s
+#
+# You can enter \info to print these details again.
 #
 `,
 				adminUser,
@@ -372,6 +374,9 @@ func runDemoInternal(
 		c.SetSimulatedLatency(true /* on */)
 		defer c.SetSimulatedLatency(false /* on */)
 	}
+
+	// Ensure the last few entries in the log files are flushed at the end.
+	defer log.Flush()
 
 	return sqlCtx.Run(ctx, conn)
 }

@@ -69,12 +69,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 	var pkTypes []*types.T
 	var labelMetrics bool
 	if err := serverCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		desc, err := descsCol.GetImmutableTableByID(
-			ctx,
-			txn,
-			details.TableID,
-			tree.ObjectLookupFlagsWithRequired(),
-		)
+		desc, err := descsCol.ByIDWithLeased(txn).WithoutNonPublic().Get().Table(ctx, details.TableID)
 		if err != nil {
 			return err
 		}
@@ -96,7 +91,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 		rowLevelTTL := desc.GetRowLevelTTL()
 		labelMetrics = rowLevelTTL.LabelMetrics
 
-		tn, err := descs.GetTableNameByDesc(ctx, txn, descsCol, desc)
+		tn, err := descs.GetObjectName(ctx, txn, descsCol, desc)
 		if err != nil {
 			return errors.Wrapf(err, "error fetching table relation name for TTL")
 		}
@@ -302,12 +297,7 @@ func (t *ttlProcessor) runTTLOnSpan(
 			if err := serverCfg.DB.TxnWithSteppingEnabled(ctx, sessiondatapb.TTLLow, func(ctx context.Context, txn *kv.Txn) error {
 				// If we detected a schema change here, the DELETE will not succeed
 				// (the SELECT still will because of the AOST). Early exit here.
-				desc, err := flowCtx.Descriptors.GetImmutableTableByID(
-					ctx,
-					txn,
-					details.TableID,
-					tree.ObjectLookupFlagsWithRequired(),
-				)
+				desc, err := flowCtx.Descriptors.ByIDWithLeased(txn).WithoutNonPublic().Get().Table(ctx, details.TableID)
 				if err != nil {
 					return err
 				}

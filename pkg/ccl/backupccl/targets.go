@@ -425,7 +425,7 @@ func checkMissingIntroducedSpans(
 				table.Name, mainBackupManifests[i].StartTime.GoTime().String(), table.Name)
 			return errors.WithIssueLink(tableError, errors.IssueLink{
 				IssueURL: "https://www.cockroachlabs.com/docs/advisories/a88042",
-				Detail: `An incremental database backup with revision history can incorrectly backup data for a table 
+				Detail: `An incremental database backup with revision history can incorrectly backup data for a table
 that was running an IMPORT at the time of the previous incremental in this chain of backups.`,
 			})
 		}
@@ -502,7 +502,8 @@ func selectTargets(
 					systemTables = append(systemTables, desc)
 				case systemschema.RoleMembersTable.GetName():
 					systemTables = append(systemTables, desc)
-					// TODO(casper): should we handle role_options table?
+				case systemschema.RoleOptionsTable.GetName():
+					systemTables = append(systemTables, desc)
 				}
 			}
 		}
@@ -594,13 +595,7 @@ func checkMultiRegionCompatible(
 		// For REGION BY TABLE IN <region> tables, allow the restore if the
 		// database has the region.
 		regionEnumID := database.GetRegionConfig().RegionEnumID
-		regionEnum, err := col.GetImmutableTypeByID(ctx, txn, regionEnumID, tree.ObjectLookupFlags{
-			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidLeased:    true,
-				IncludeDropped: true,
-				IncludeOffline: true,
-			},
-		})
+		regionEnum, err := col.ByID(txn).Get().Type(ctx, regionEnumID)
 		if err != nil {
 			return err
 		}

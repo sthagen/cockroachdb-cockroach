@@ -20,7 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -71,12 +72,15 @@ import (
 // - query-sql as=<source-system | source-tenant | destination-system | destination-tenant>
 // Executes the specified SQL query as the specified tenant, and prints the
 // results.
+//
+// - skip issue-num=N
+// Skips the test.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		ds := newDatadrivenTestState()
 		defer ds.cleanup(t)
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
@@ -85,6 +89,12 @@ func TestDataDriven(t *testing.T) {
 			}
 
 			switch d.Cmd {
+			case "skip":
+				var issue int
+				d.ScanArgs(t, "issue-num", &issue)
+				skip.WithIssue(t, issue)
+				return ""
+
 			case "create-replication-clusters":
 				args := replicationtestutils.DefaultTenantStreamingClustersArgs
 				var cleanup func()
@@ -95,7 +105,7 @@ func TestDataDriven(t *testing.T) {
 				})
 
 			case "start-replication-stream":
-				ds.producerJobID, ds.replicationJobID = ds.replicationClusters.StartStreamReplication()
+				ds.producerJobID, ds.replicationJobID = ds.replicationClusters.StartStreamReplication(ctx)
 
 			case "wait-until-high-watermark":
 				var highWaterMark string

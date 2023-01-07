@@ -454,9 +454,6 @@ func (p *pebbleIterator) NextEngineKeyWithLimit(
 
 // NextKey implements the MVCCIterator interface.
 func (p *pebbleIterator) NextKey() {
-	// Even though NextKey() is not allowed for switching direction by the
-	// MVCCIterator interface, pebbleIterator works correctly even when
-	// switching direction. So we set mvccDirIsReverse = false.
 	if p.mvccDirIsReverse {
 		// Switching directions.
 		p.mvccDirIsReverse = false
@@ -468,49 +465,10 @@ func (p *pebbleIterator) NextKey() {
 	if valid, err := p.Valid(); err != nil || !valid {
 		return
 	}
-	p.keyBuf = append(p.keyBuf[:0], p.UnsafeKey().Key...)
-	if !p.iter.Next() {
-		return
-	}
 
-	// Prefix iterators can't move onto a separate key by definition, so we
-	// exhaust the iterator. We could just set mvccDone, but that wouldn't
-	// propagate RangeKeyChanged() correctly.
-	if p.prefix {
-		// Seek to the latest possible key for this prefix, exhausting iter.
-		seekKey := append(p.keyBuf,
-			append([]byte{0}, EncodeMVCCTimestampSuffix(hlc.MinTimestamp)...)...)
-		if p.iter.SeekPrefixGE(seekKey) {
-			// In practice we'll never hit this loop. It's included for completeness.
-			for p.iter.Next() {
-			}
-		}
-		return
-	}
-
-	// If the Next() call above didn't move to a different key, seek to it.
-	if p.UnsafeKey().Key.Equal(p.keyBuf) {
-		// This is equivalent to:
-		// p.iter.SeekGE(EncodeKey(MVCCKey{p.UnsafeKey().Key.Next(), hlc.Timestamp{}}))
-		seekKey := append(p.keyBuf, 0, 0)
-		p.iter.SeekGE(seekKey)
-		// If there's a range key straddling the seek point (e.g. a-c when seeking
-		// to b), it will be surfaced first as a bare range key. However, unless it
-		// started exactly at the seek key then it has already been emitted, so we
-		// step past it to the next key, which may be either a point key or range
-		// key starting past the seek key.
-		//
-		// NB: We have to be careful to use p.iter methods below, rather than
-		// pebbleIterator methods, since seekKey is an already-encoded roachpb.Key
-		// in raw Pebble key form.
-		if p.iter.Valid() {
-			if hasPoint, hasRange := p.iter.HasPointAndRange(); !hasPoint && hasRange {
-				if startKey, _ := p.iter.RangeBounds(); bytes.Compare(startKey, seekKey) < 0 {
-					p.iter.Next()
-				}
-			}
-		}
-	}
+	// NB: If p.prefix, iterators can't move onto a separate key by definition,
+	// so the below call to NextPrefix will exhaust the iterator.
+	p.iter.NextPrefix()
 }
 
 // UnsafeKey implements the MVCCIterator interface.
@@ -554,17 +512,34 @@ func (p *pebbleIterator) UnsafeValue() ([]byte, error) {
 	return p.iter.ValueAndErr()
 }
 
+// UnsafeLazyValue implements the MVCCIterator interface.
+func (p *pebbleIterator) UnsafeLazyValue() pebble.LazyValue {
+	if ok := p.iter.Valid(); !ok {
+		panic(errors.AssertionFailedf("UnsafeLazyValue called on !Valid iterator"))
+	}
+	return p.iter.LazyValue()
+}
+
 // MVCCValueLenAndIsTombstone implements the MVCCIterator interface.
 func (p *pebbleIterator) MVCCValueLenAndIsTombstone() (int, bool, error) {
 	lv := p.iter.LazyValue()
-	// TODO(sumeer): fix this to use LazyValue.TryGetShortAttribute when
-	// https://github.com/cockroachdb/pebble/pull/2142 is merged.
-	val := lv.InPlaceValue()
-	isTombstone, err := EncodedMVCCValueIsTombstone(val)
-	if err != nil {
-		return 0, false, err
+	attr, ok := lv.TryGetShortAttribute()
+	var isTombstone bool
+	var valLen int
+	if ok {
+		isTombstone = attr != 0
+		valLen = lv.Len()
+	} else {
+		// Must be an in-place value, since it did not have a short attribute.
+		val := lv.InPlaceValue()
+		var err error
+		isTombstone, err = EncodedMVCCValueIsTombstone(val)
+		if err != nil {
+			return 0, false, err
+		}
+		valLen = len(val)
 	}
-	return len(val), isTombstone, nil
+	return valLen, isTombstone, nil
 }
 
 // ValueLen implements the MVCCIterator interface.

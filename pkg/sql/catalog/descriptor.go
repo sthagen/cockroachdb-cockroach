@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -234,17 +236,11 @@ type Descriptor interface {
 	// GetRawBytesInStorage returns the raw bytes (tag + data) of the descriptor in storage.
 	// It is exclusively used in the CPut when persisting an updated descriptor to storage.
 	GetRawBytesInStorage() []byte
-}
 
-// HydratableDescriptor represent a Descriptor which needs user-define type
-// hydration if it contains any UDT.
-type HydratableDescriptor interface {
-	Descriptor
-
-	// ContainsUserDefinedTypes returns whether or not this descriptor uses any
-	// user defined types. For example, a table column table can use user defined
-	// type and a function can use user defined type as an argument type.
-	ContainsUserDefinedTypes() bool
+	// ForEachUDTDependentForHydration iterates over all the user-defined types.T
+	// referenced by this descriptor which must be hydrated prior to using it.
+	// iterutil.StopIteration is supported.
+	ForEachUDTDependentForHydration(func(t *types.T) error) error
 }
 
 // DatabaseDescriptor encapsulates the concept of a database.
@@ -283,7 +279,7 @@ type DatabaseDescriptor interface {
 
 // TableDescriptor is an interface around the table descriptor types.
 type TableDescriptor interface {
-	HydratableDescriptor
+	Descriptor
 
 	// TableDesc returns the backing protobuf for this database.
 	TableDesc() *descpb.TableDescriptor
@@ -539,8 +535,8 @@ type TableDescriptor interface {
 	IndexKeysPerRow(idx Index) int
 
 	// IndexFetchSpecKeyAndSuffixColumns returns information about the key and
-	// suffix columns, suitable for populating a descpb.IndexFetchSpec.
-	IndexFetchSpecKeyAndSuffixColumns(idx Index) []descpb.IndexFetchSpec_KeyColumn
+	// suffix columns, suitable for populating a fetchpb.IndexFetchSpec.
+	IndexFetchSpecKeyAndSuffixColumns(idx Index) []fetchpb.IndexFetchSpec_KeyColumn
 
 	// FindColumnWithID returns the first column found whose ID matches the
 	// provided target ID, in the canonical order.
@@ -590,18 +586,18 @@ type TableDescriptor interface {
 
 	// FamilyDefaultColumns returns the default column IDs for families with a
 	// default column. See IndexFetchSpec.FamilyDefaultColumns.
-	FamilyDefaultColumns() []descpb.IndexFetchSpec_FamilyDefaultColumn
+	FamilyDefaultColumns() []fetchpb.IndexFetchSpec_FamilyDefaultColumn
 
 	// HasColumnBackfillMutation returns whether the table has any queued column
 	// mutations that require a backfill.
 	HasColumnBackfillMutation() bool
-	// MakeFirstMutationPublic creates a Mutable from the
-	// immutable by making the first mutation public.
+	// MakeFirstMutationPublic creates a descriptor by making the first
+	// mutation public.
 	// This is super valuable when trying to run SQL over data associated
 	// with a schema mutation that is still not yet public: Data validation,
 	// error reporting.
 	MakeFirstMutationPublic(...MutationPublicationFilter) (TableDescriptor, error)
-	// MakePublic creates a Mutable from the immutable by making the it public.
+	// MakePublic creates a descriptor by making the state public.
 	MakePublic() TableDescriptor
 	// AllMutations returns all of the table descriptor's mutations.
 	AllMutations() []Mutation
@@ -778,15 +774,6 @@ type TypeDescriptor interface {
 	Descriptor
 	// TypeDesc returns the backing descriptor for this type, if one exists.
 	TypeDesc() *descpb.TypeDescriptor
-	// HydrateTypeInfoWithName fills in user defined type metadata for
-	// a type and also sets the name in the metadata to the passed in name.
-	// This is used when hydrating a type with a known qualified name.
-	//
-	// Note that if the passed type is already hydrated, regardless of the version
-	// with which it has been hydrated, this is a no-op.
-	HydrateTypeInfoWithName(ctx context.Context, typ *types.T, name *tree.TypeName, res TypeDescriptorResolver) error
-	// MakeTypesT creates a types.T from the input type descriptor.
-	MakeTypesT(ctx context.Context, name *tree.TypeName, res TypeDescriptorResolver) (*types.T, error)
 	// HasPendingSchemaChanges returns whether or not this descriptor has schema
 	// changes that need to be completed.
 	HasPendingSchemaChanges() bool
@@ -801,7 +788,10 @@ type TypeDescriptor interface {
 	// array type for this type. It is only set when the type descriptor points to
 	// a non-array type.
 	GetArrayTypeID() descpb.ID
-
+	// AsTypesT returns a reference to a types.T corresponding to this type
+	// descriptor. No guarantees are provided as to whether this object is a
+	// singleton or not, or whether it's hydrated or not.
+	AsTypesT() *types.T
 	// GetKind returns the kind of this type.
 	GetKind() descpb.TypeDescriptor_Kind
 
@@ -883,7 +873,7 @@ type DefaultPrivilegeDescriptor interface {
 
 // FunctionDescriptor is an interface around the function descriptor types.
 type FunctionDescriptor interface {
-	HydratableDescriptor
+	Descriptor
 
 	// GetReturnType returns the function's return type.
 	GetReturnType() descpb.FunctionDescriptor_ReturnType
@@ -927,46 +917,38 @@ type FunctionDescriptor interface {
 	ToCreateExpr() (*tree.CreateFunction, error)
 }
 
-// FilterDescriptorState inspects the state of a given descriptor and returns an
-// error if the state is anything but public. The error describes the state of
-// the descriptor.
-func FilterDescriptorState(desc Descriptor, flags tree.CommonLookupFlags) error {
-	if flags.ParentID != 0 {
-		parent := desc.GetParentID()
-		if parent != 0 && parent != flags.ParentID {
-			return ErrDescriptorNotFound
-		}
-	}
+// FilterDroppedDescriptor returns an error if the descriptor state is DROP.
+func FilterDroppedDescriptor(desc Descriptor) error {
+	if !desc.Dropped() {
+		return nil
 
-	switch {
-	case desc.Dropped() && !flags.IncludeDropped:
-		return NewInactiveDescriptorError(ErrDescriptorDropped)
-	case desc.Offline() && !flags.IncludeOffline:
-		err := errors.Errorf("%s %q is offline", desc.DescriptorType(), desc.GetName())
-		if desc.GetOfflineReason() != "" {
-			err = errors.Errorf("%s %q is offline: %s", desc.DescriptorType(), desc.GetName(), desc.GetOfflineReason())
-		}
-		return NewInactiveDescriptorError(err)
-	case desc.Adding() &&
-		// The ADD state is special.
-		// We don't want adding descriptors to be visible to DML queries, but we
-		// want them to be visible to schema changes:
-		//   - when uncommitted we want them to be accessible by name for other
-		//     schema changes, e.g.
-		//       BEGIN; CREATE TABLE t ... ; ALTER TABLE t RENAME TO ...;
-		//     should be possible.
-		//   - when committed we want them to be accessible to their own schema
-		//     change job, where they're referenced by ID.
-		//
-		// The AvoidCommittedAdding is set if and only if the lookup is by-name
-		// and prevents them from seeing committed adding descriptors.
-		!(flags.AvoidCommittedAdding && desc.IsUncommittedVersion() && (flags.AvoidLeased || flags.RequireMutable)) &&
-		!(!flags.AvoidCommittedAdding && (desc.IsUncommittedVersion() || flags.AvoidLeased || flags.RequireMutable)):
-		// For the time being, only table descriptors can be in the adding state.
-		return pgerror.WithCandidateCode(newAddingTableError(desc.(TableDescriptor)),
-			pgcode.ObjectNotInPrerequisiteState)
 	}
-	return nil
+	return NewInactiveDescriptorError(ErrDescriptorDropped)
+}
+
+// FilterOfflineDescriptor returns an error if the descriptor state is OFFLINE.
+func FilterOfflineDescriptor(desc Descriptor) error {
+	if !desc.Offline() {
+		return nil
+	}
+	err := errors.Errorf("%s %q is offline", desc.DescriptorType(), desc.GetName())
+	if desc.GetOfflineReason() != "" {
+		err = errors.Errorf("%s %q is offline: %s", desc.DescriptorType(), desc.GetName(), desc.GetOfflineReason())
+	}
+	return NewInactiveDescriptorError(err)
+}
+
+// FilterAddingDescriptor returns an error if the descriptor state is ADD.
+func FilterAddingDescriptor(desc Descriptor) error {
+	if !desc.Adding() {
+		return nil
+	}
+	// For the time being, only table descriptors can be in the adding state.
+	tbl, err := AsTableDescriptor(desc)
+	if err != nil {
+		return errors.HandleAsAssertionFailure(err)
+	}
+	return pgerror.WithCandidateCode(newAddingTableError(tbl), pgcode.ObjectNotInPrerequisiteState)
 }
 
 // TableLookupFn is used to resolve a table from an ID, particularly when
@@ -1039,4 +1021,14 @@ func IsSystemDescriptor(desc Descriptor) bool {
 // for the legacy schema changer).
 func HasConcurrentDeclarativeSchemaChange(desc Descriptor) bool {
 	return desc.GetDeclarativeSchemaChangerState() != nil
+}
+
+// MaybeRequiresHydration returns false if the descriptor definitely does not
+// depend on any types.T being hydrated.
+func MaybeRequiresHydration(desc Descriptor) (ret bool) {
+	_ = desc.ForEachUDTDependentForHydration(func(t *types.T) error {
+		ret = true
+		return iterutil.StopIteration()
+	})
+	return ret
 }

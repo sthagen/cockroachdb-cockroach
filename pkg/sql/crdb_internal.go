@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
@@ -393,11 +394,7 @@ CREATE TABLE crdb_internal.super_regions (
 				if err != nil {
 					return err
 				}
-				typeDesc, err := p.Descriptors().GetImmutableTypeByID(ctx, p.txn, typeID,
-					tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
-						Required: true,
-					}},
-				)
+				typeDesc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Type(ctx, typeID)
 				if err != nil {
 					return err
 				}
@@ -502,11 +499,8 @@ CREATE TABLE crdb_internal.tables (
 			// INDEX(parent_id) WHERE drop_time IS NULL
 			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
 				dbID := descpb.ID(tree.MustBeDInt(unwrappedConstraint))
-				flags := p.CommonLookupFlagsRequired()
-				flags.Required = false
-				flags.IncludeOffline = true
-				ok, db, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.Txn(), dbID, flags)
-				if !ok || err != nil {
+				db, err := p.byIDGetterBuilder().WithoutDropped().Get().Database(ctx, dbID)
+				if err != nil {
 					return false, err
 				}
 				return crdbInternalTablesDatabaseLookupFunc(ctx, p, db, addRow)
@@ -516,10 +510,7 @@ CREATE TABLE crdb_internal.tables (
 			// INDEX(database_name) WHERE drop_time IS NULL
 			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
 				dbName := string(tree.MustBeDString(unwrappedConstraint))
-				flags := p.CommonLookupFlagsRequired()
-				flags.Required = false
-				flags.IncludeOffline = true
-				db, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.Txn(), dbName, flags)
+				db, err := p.byNameGetterBuilder().WithOffline().MaybeGet().Database(ctx, dbName)
 				if db == nil || err != nil {
 					return false, err
 				}
@@ -2964,9 +2955,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 			}
 		}
 
-		fnDescs, err := p.Descriptors().GetImmutableDescriptorsByID(
-			ctx, p.txn, tree.CommonLookupFlags{Required: true, AvoidLeased: true}, fnIDs...,
-		)
+		fnDescs, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Descs(ctx, fnIDs)
 		if err != nil {
 			return err
 		}
@@ -4031,18 +4020,16 @@ CREATE TABLE crdb_internal.zones (
 
 			// Inherit full information about this zone.
 			fullZone := configProto
+			zcHelper := descs.AsZoneConfigHydrationHelper(p.Descriptors())
 			if err := completeZoneConfig(
-				ctx, &fullZone, p.Txn(), p.Descriptors(), descpb.ID(tree.MustBeDInt(r[0])),
+				ctx, &fullZone, p.Txn(), zcHelper, descpb.ID(tree.MustBeDInt(r[0])),
 			); err != nil {
 				return err
 			}
 
 			var table catalog.TableDescriptor
 			if zs.Database != "" {
-				_, database, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, descpb.ID(id), tree.DatabaseLookupFlags{
-					Required:    true,
-					AvoidLeased: true,
-				})
+				database, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, descpb.ID(id))
 				if err != nil {
 					return err
 				}
@@ -5444,10 +5431,7 @@ CREATE TABLE crdb_internal.cluster_database_privileges (
 				return false, nil
 			}
 
-			flags := tree.CommonLookupFlags{
-				AvoidLeased: true,
-			}
-			dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.Txn(), dbName, flags)
+			dbDesc, err := p.Descriptors().ByName(p.Txn()).MaybeGet().Database(ctx, dbName)
 			if err != nil || dbDesc == nil {
 				return false, err
 			}
@@ -5765,113 +5749,109 @@ CREATE TABLE crdb_internal.default_privileges (
 	is_grantable    BOOL
 );`,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+
+		// Cache roles ahead of time to avoid role lookup inside loop.
+		var roles []catpb.DefaultPrivilegesRole
+		if err := forEachRole(ctx, p, func(userName username.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error {
+			roles = append(roles, catpb.DefaultPrivilegesRole{
+				Role: userName,
+			})
+			return nil
+		}); err != nil {
+			return err
+		}
+		// Handle ForAllRoles outside forEachRole since it is a pseudo role.
+		roles = append(roles, catpb.DefaultPrivilegesRole{
+			ForAllRoles: true,
+		})
+
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
-			func(descriptor catalog.DatabaseDescriptor) error {
-				addRowsHelper := func(defaultPrivilegesForRole catpb.DefaultPrivilegesForRole, schema tree.Datum) error {
-					role := tree.DNull
-					forAllRoles := tree.DBoolTrue
-					if defaultPrivilegesForRole.IsExplicitRole() {
-						role = tree.NewDString(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized())
-						forAllRoles = tree.DBoolFalse
-					}
-
-					for objectType, privs := range defaultPrivilegesForRole.DefaultPrivilegesPerObject {
-						privilegeObjectType := targetObjectToPrivilegeObject[objectType]
-						for _, userPrivs := range privs.Users {
-							privList := privilege.ListFromBitField(userPrivs.Privileges, privilegeObjectType)
-							for _, priv := range privList {
-								if err := addRow(
-									tree.NewDString(descriptor.GetName()), // database_name
-									// When the schema_name is NULL, that means the default
-									// privileges are defined at the database level.
-									schema,                               // schema_name
-									role,                                 // role
-									forAllRoles,                          // for_all_roles
-									tree.NewDString(objectType.String()), // object_type
-									tree.NewDString(userPrivs.User().Normalized()),                      // grantee
-									tree.NewDString(priv.String()),                                      // privilege_type
-									tree.MakeDBool(tree.DBool(priv.IsSetIn(userPrivs.WithGrantOption))), // is_grantable
-								); err != nil {
-									return err
-								}
-							}
-						}
-					}
-
-					if schema == tree.DNull {
-						for _, objectType := range privilege.GetTargetObjectTypes() {
-							if catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, objectType) {
-								if err := addRow(
-									tree.NewDString(descriptor.GetName()), // database_name
-									tree.DNull,                            // schema_name
-									role,                                  // role
-									forAllRoles,                           // for_all_roles
-									tree.NewDString(objectType.String()),  // object_type
-									tree.NewDString(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized()), // grantee
-									tree.NewDString(privilege.ALL.String()),                                                     // privilege_type
-									tree.DBoolTrue,
-									// is_grantable
-								); err != nil {
-									return err
-								}
-							}
-						}
-						if catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) {
-							if err := addRow(
-								tree.NewDString(descriptor.GetName()), // database_name
-								tree.DNull,                            // schema_name
-								role,                                  // role
-								forAllRoles,                           // for_all_roles
-								tree.NewDString(privilege.Types.String()),               // object_type
-								tree.NewDString(username.PublicRoleName().Normalized()), // grantee
-								tree.NewDString(privilege.USAGE.String()),               // privilege_type
-								tree.DBoolFalse, // is_grantable
-							); err != nil {
-								return err
-							}
-						}
-					}
-					return nil
-				}
-
-				addRowsForRole := func(role catpb.DefaultPrivilegesRole, defaultPrivilegeDescriptor catalog.DefaultPrivilegeDescriptor, schema tree.Datum) error {
-					defaultPrivilegesForRole, found := defaultPrivilegeDescriptor.GetDefaultPrivilegesForRole(role)
-					if !found {
-						// If an entry is not found for the role, the role still has
-						// the default set of default privileges.
-						newDefaultPrivilegesForRole := catpb.InitDefaultPrivilegesForRole(role, defaultPrivilegeDescriptor.GetDefaultPrivilegeDescriptorType())
-						defaultPrivilegesForRole = &newDefaultPrivilegesForRole
-					}
-					if err := addRowsHelper(*defaultPrivilegesForRole, schema); err != nil {
-						return err
-					}
-					return nil
-				}
-
+			func(databaseDesc catalog.DatabaseDescriptor) error {
+				database := tree.NewDString(databaseDesc.GetName())
 				addRowsForSchema := func(defaultPrivilegeDescriptor catalog.DefaultPrivilegeDescriptor, schema tree.Datum) error {
-					if err := forEachRole(ctx, p, func(userName username.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error {
-						role := catpb.DefaultPrivilegesRole{
-							Role: userName,
+					for _, role := range roles {
+						defaultPrivilegesForRole, found := defaultPrivilegeDescriptor.GetDefaultPrivilegesForRole(role)
+						if !found {
+							// If an entry is not found for the role, the role still has
+							// the default set of default privileges.
+							newDefaultPrivilegesForRole := catpb.InitDefaultPrivilegesForRole(role, defaultPrivilegeDescriptor.GetDefaultPrivilegeDescriptorType())
+							defaultPrivilegesForRole = &newDefaultPrivilegesForRole
 						}
-						return addRowsForRole(role, defaultPrivilegeDescriptor, schema)
-					}); err != nil {
-						return err
-					}
+						role := tree.DNull
+						forAllRoles := tree.DBoolTrue
+						if defaultPrivilegesForRole.IsExplicitRole() {
+							role = tree.NewDString(defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized())
+							forAllRoles = tree.DBoolFalse
+						}
 
-					// Handle ForAllRoles outside of forEachRole since it is a pseudo role.
-					role := catpb.DefaultPrivilegesRole{
-						ForAllRoles: true,
+						for objectType, privs := range defaultPrivilegesForRole.DefaultPrivilegesPerObject {
+							objectTypeDatum := tree.NewDString(objectType.String())
+							privilegeObjectType := targetObjectToPrivilegeObject[objectType]
+							for _, userPrivs := range privs.Users {
+								grantee := tree.NewDString(userPrivs.User().Normalized())
+								privList := privilege.ListFromBitField(userPrivs.Privileges, privilegeObjectType)
+								for _, priv := range privList {
+									if err := addRow(
+										database, // database_name
+										// When the schema_name is NULL, that means the default
+										// privileges are defined at the database level.
+										schema,                         // schema_name
+										role,                           // role
+										forAllRoles,                    // for_all_roles
+										objectTypeDatum,                // object_type
+										grantee,                        // grantee
+										tree.NewDString(priv.String()), // privilege_type
+										tree.MakeDBool(tree.DBool(priv.IsSetIn(userPrivs.WithGrantOption))), // is_grantable
+									); err != nil {
+										return err
+									}
+								}
+							}
+						}
+
+						if schema == tree.DNull {
+							for _, objectType := range privilege.GetTargetObjectTypes() {
+								if catprivilege.GetRoleHasAllPrivilegesOnTargetObject(defaultPrivilegesForRole, objectType) {
+									if err := addRow(
+										database,                                // database_name
+										schema,                                  // schema_name
+										role,                                    // role
+										forAllRoles,                             // for_all_roles
+										tree.NewDString(objectType.String()),    // object_type
+										role,                                    // grantee
+										tree.NewDString(privilege.ALL.String()), // privilege_type
+										tree.DBoolTrue,                          // is_grantable
+									); err != nil {
+										return err
+									}
+								}
+							}
+							if catprivilege.GetPublicHasUsageOnTypes(defaultPrivilegesForRole) {
+								if err := addRow(
+									database,    // database_name
+									schema,      // schema_name
+									role,        // role
+									forAllRoles, // for_all_roles
+									tree.NewDString(privilege.Types.String()),               // object_type
+									tree.NewDString(username.PublicRoleName().Normalized()), // grantee
+									tree.NewDString(privilege.USAGE.String()),               // privilege_type
+									tree.DBoolFalse, // is_grantable
+								); err != nil {
+									return err
+								}
+							}
+						}
 					}
-					return addRowsForRole(role, defaultPrivilegeDescriptor, schema)
+					return nil
 				}
 
 				// Add default privileges for default privileges defined on the
 				// database.
-				if err := addRowsForSchema(descriptor.GetDefaultPrivilegeDescriptor(), tree.DNull); err != nil {
+				if err := addRowsForSchema(databaseDesc.GetDefaultPrivilegeDescriptor(), tree.DNull); err != nil {
 					return err
 				}
 
-				return forEachSchema(ctx, p, descriptor, true /* requiresPrivileges */, func(schema catalog.SchemaDescriptor) error {
+				return forEachSchema(ctx, p, databaseDesc, true /* requiresPrivileges */, func(schema catalog.SchemaDescriptor) error {
 					return addRowsForSchema(schema.GetDefaultPrivilegeDescriptor(), tree.NewDString(schema.GetName()))
 				})
 			})
@@ -6476,11 +6456,7 @@ CREATE TABLE crdb_internal.index_spans (
 				// forEachTableDescAll() below. So we can't use p.LookupByID()
 				// which only considers online tables.
 				p.runWithOptions(resolveFlags{skipCache: true}, func() {
-					cflags := p.CommonLookupFlagsRequired()
-					cflags.IncludeOffline = true
-					cflags.IncludeDropped = true
-					flags := tree.ObjectLookupFlags{CommonLookupFlags: cflags}
-					table, err = p.Descriptors().GetImmutableTableByID(ctx, p.txn, descID, flags)
+					table, err = p.byIDGetterBuilder().Get().Table(ctx, descID)
 				})
 				if err != nil {
 					return false, err
@@ -6532,11 +6508,7 @@ CREATE TABLE crdb_internal.table_spans (
 				// forEachTableDescAll() below. So we can't use p.LookupByID()
 				// which only considers online tables.
 				p.runWithOptions(resolveFlags{skipCache: true}, func() {
-					cflags := p.CommonLookupFlagsRequired()
-					cflags.IncludeOffline = true
-					cflags.IncludeDropped = true
-					flags := tree.ObjectLookupFlags{CommonLookupFlags: cflags}
-					table, err = p.Descriptors().GetImmutableTableByID(ctx, p.txn, descID, flags)
+					table, err = p.byIDGetterBuilder().Get().Table(ctx, descID)
 				})
 				if err != nil {
 					return false, err
@@ -7084,13 +7056,9 @@ func convertContentionEventsToJSON(
 			return nil, err
 		}
 
-		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
-			Required: true,
-		}}
-
 		desc := p.Descriptors()
 		var tableDesc catalog.TableDescriptor
-		tableDesc, err = desc.GetImmutableTableByID(ctx, p.txn, descpb.ID(tableID), flags)
+		tableDesc, err = desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 		if err != nil {
 			return nil, err
 		}
@@ -7100,12 +7068,12 @@ func convertContentionEventsToJSON(
 			return nil, err
 		}
 
-		ok, dbDesc, err := desc.GetImmutableDatabaseByID(ctx, p.txn, tableDesc.GetParentID(), tree.DatabaseLookupFlags{})
-		if err != nil || !ok {
+		dbDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Database(ctx, tableDesc.GetParentID())
+		if err != nil {
 			return nil, err
 		}
 
-		schemaDesc, err := desc.GetImmutableSchemaByID(ctx, p.txn, tableDesc.GetParentSchemaID(), tree.SchemaLookupFlags{})
+		schemaDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, tableDesc.GetParentSchemaID())
 		if err != nil {
 			return nil, err
 		}

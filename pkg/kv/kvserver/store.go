@@ -49,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/replicastats"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnrecovery"
@@ -2906,8 +2905,9 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	replicaCount := s.metrics.ReplicaCount.Value()
 	bytesPerReplica := make([]float64, 0, replicaCount)
 	writesPerReplica := make([]float64, 0, replicaCount)
-	rankingsAccumulator := s.replRankings.NewAccumulator()
-	rankingsByTenantAccumulator := s.replRankingsByTenant.NewAccumulator()
+	rankingsAccumulator := NewReplicaAccumulator(
+		LBRebalancingDimension(LoadBasedRebalancingDimension.Get(&s.ClusterSettings().SV)).ToDimension())
+	rankingsByTenantAccumulator := NewTenantReplicaAccumulator()
 
 	// Query the current L0 sublevels and record the updated maximum to metrics.
 	l0SublevelsMax = int64(syncutil.LoadFloat64(&s.metrics.l0SublevelsWindowedMax))
@@ -2916,26 +2916,20 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		if r.OwnsValidLease(ctx, now) {
 			leaseCount++
 		}
-		mvccStats := r.GetMVCCStats()
-		logicalBytes += mvccStats.Total()
-		bytesPerReplica = append(bytesPerReplica, float64(mvccStats.Total()))
+		usage := RangeUsageInfoForRepl(r)
+		logicalBytes += usage.LogicalBytes
+		bytesPerReplica = append(bytesPerReplica, float64(usage.LogicalBytes))
 		// TODO(a-robinson): How dangerous is it that these numbers will be
 		// incorrectly low the first time or two it gets gossiped when a store
 		// starts? We can't easily have a countdown as its value changes like for
 		// leases/replicas.
-		var qps float64
-		if avgQPS, dur := r.loadStats.batchRequests.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			qps = avgQPS
-			totalQueriesPerSecond += avgQPS
-			// TODO(a-robinson): Calculate percentiles for qps? Get rid of other percentiles?
-		}
-		if wps, dur := r.loadStats.writeKeys.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			totalWritesPerSecond += wps
-			writesPerReplica = append(writesPerReplica, wps)
-		}
+		// TODO(a-robinson): Calculate percentiles for qps? Get rid of other percentiles?
+		totalQueriesPerSecond += usage.QueriesPerSecond
+		totalWritesPerSecond += usage.WritesPerSecond
+		writesPerReplica = append(writesPerReplica, usage.WritesPerSecond)
 		cr := candidateReplica{
 			Replica: r,
-			qps:     qps,
+			usage:   usage,
 		}
 		rankingsAccumulator.AddReplica(cr)
 		rankingsByTenantAccumulator.AddReplica(cr)
@@ -3146,25 +3140,14 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		pausedFollowerCount += metrics.PausedFollowerCount
 		slowRaftProposalCount += metrics.SlowRaftProposalCount
 		behindCount += metrics.BehindCount
-		if qps, dur := rep.loadStats.batchRequests.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			averageQueriesPerSecond += qps
-		}
-		if rqps, dur := rep.loadStats.requests.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			averageRequestsPerSecond += rqps
-		}
-		if wps, dur := rep.loadStats.writeKeys.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			averageWritesPerSecond += wps
-		}
-		if rps, dur := rep.loadStats.readKeys.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			averageReadsPerSecond += rps
-		}
-		if rbps, dur := rep.loadStats.readBytes.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			averageReadBytesPerSecond += rbps
-		}
-		if wbps, dur := rep.loadStats.writeBytes.AverageRatePerSecond(); dur >= replicastats.MinStatsDuration {
-			averageWriteBytesPerSecond += wbps
-		}
-		averageCPUNanosPerSecond += rep.CPUNanosPerSecond()
+		loadStats := rep.loadStats.Stats()
+		averageQueriesPerSecond += loadStats.QueriesPerSecond
+		averageRequestsPerSecond += loadStats.RequestsPerSecond
+		averageWritesPerSecond += loadStats.WriteKeysPerSecond
+		averageReadsPerSecond += loadStats.ReadKeysPerSecond
+		averageReadBytesPerSecond += loadStats.ReadBytesPerSecond
+		averageWriteBytesPerSecond += loadStats.WriteBytesPerSecond
+		averageCPUNanosPerSecond += loadStats.CPUNanosPerSecond
 
 		locks += metrics.LockTableMetrics.Locks
 		totalLockHoldDurationNanos += metrics.LockTableMetrics.TotalLockHoldDurationNanos
@@ -3414,8 +3397,8 @@ type HotReplicaInfo struct {
 // Note that this uses cached information, so it's cheap but may be slightly
 // out of date.
 func (s *Store) HottestReplicas() []HotReplicaInfo {
-	topQPS := s.replRankings.TopQPS()
-	return mapToHotReplicasInfo(topQPS)
+	topLoad := s.replRankings.TopLoad()
+	return mapToHotReplicasInfo(topLoad)
 }
 
 // HottestReplicasByTenant returns the hottest replicas on a store for specified
@@ -3429,13 +3412,14 @@ func (s *Store) HottestReplicasByTenant(tenantID roachpb.TenantID) []HotReplicaI
 func mapToHotReplicasInfo(repls []CandidateReplica) []HotReplicaInfo {
 	hotRepls := make([]HotReplicaInfo, len(repls))
 	for i := range repls {
+		loadStats := repls[i].Repl().LoadStats()
 		hotRepls[i].Desc = repls[i].Desc()
-		hotRepls[i].QPS = repls[i].QPS()
-		hotRepls[i].RequestsPerSecond = repls[i].Repl().RequestsPerSecond()
-		hotRepls[i].WriteKeysPerSecond = repls[i].Repl().WritesPerSecond()
-		hotRepls[i].ReadKeysPerSecond = repls[i].Repl().ReadsPerSecond()
-		hotRepls[i].WriteBytesPerSecond = repls[i].Repl().WriteBytesPerSecond()
-		hotRepls[i].ReadBytesPerSecond = repls[i].Repl().ReadBytesPerSecond()
+		hotRepls[i].QPS = loadStats.QueriesPerSecond
+		hotRepls[i].RequestsPerSecond = loadStats.RequestsPerSecond
+		hotRepls[i].WriteKeysPerSecond = loadStats.WriteKeysPerSecond
+		hotRepls[i].ReadKeysPerSecond = loadStats.ReadKeysPerSecond
+		hotRepls[i].WriteBytesPerSecond = loadStats.WriteBytesPerSecond
+		hotRepls[i].ReadBytesPerSecond = loadStats.ReadBytesPerSecond
 	}
 	return hotRepls
 }

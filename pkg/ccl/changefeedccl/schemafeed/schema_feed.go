@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -197,27 +196,18 @@ func (t *typeDependencyTracker) removeDependency(typeID, tableID descpb.ID) {
 	}
 }
 
-func (t *typeDependencyTracker) purgeTable(tbl catalog.TableDescriptor) error {
+func (t *typeDependencyTracker) purgeTable(tbl catalog.TableDescriptor) {
 	for _, col := range tbl.UserDefinedTypeColumns() {
-		id, err := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
-		if err != nil {
-			return err
-		}
+		id := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
 		t.removeDependency(id, tbl.GetID())
 	}
-
-	return nil
 }
 
-func (t *typeDependencyTracker) ingestTable(tbl catalog.TableDescriptor) error {
+func (t *typeDependencyTracker) ingestTable(tbl catalog.TableDescriptor) {
 	for _, col := range tbl.UserDefinedTypeColumns() {
-		id, err := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
-		if err != nil {
-			return err
-		}
+		id := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
 		t.addDependency(id, tbl.GetID())
 	}
-	return nil
 }
 
 func (t *typeDependencyTracker) containsType(id descpb.ID) bool {
@@ -282,9 +272,7 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 		}
 		// Note that all targets are currently guaranteed to be tables.
 		return tf.targets.EachTableID(func(id descpb.ID) error {
-			flags := tree.ObjectLookupFlagsWithRequired()
-			flags.AvoidLeased = true
-			tableDesc, err := descriptors.GetImmutableTableByID(ctx, txn, id, flags)
+			tableDesc, err := descriptors.ByID(txn).WithoutNonPublic().Get().Table(ctx, id)
 			if err != nil {
 				return err
 			}
@@ -301,10 +289,7 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 	// Register all types used by the initial set of tables.
 	for _, desc := range initialDescs {
 		tbl := desc.(catalog.TableDescriptor)
-		if err := tf.mu.typeDeps.ingestTable(tbl); err != nil {
-			tf.mu.Unlock()
-			return err
-		}
+		tf.mu.typeDeps.ingestTable(tbl)
 	}
 	tf.mu.Unlock()
 
@@ -548,9 +533,7 @@ func (tf *schemaFeed) validateDescriptor(
 			}
 
 			// Purge the old version of the table from the type mapping.
-			if err := tf.mu.typeDeps.purgeTable(lastVersion); err != nil {
-				return err
-			}
+			tf.mu.typeDeps.purgeTable(lastVersion)
 
 			e := TableEvent{
 				Before: lastVersion,
@@ -576,9 +559,7 @@ func (tf *schemaFeed) validateDescriptor(
 			}
 		}
 		// Add the types used by the table into the dependency tracker.
-		if err := tf.mu.typeDeps.ingestTable(desc); err != nil {
-			return err
-		}
+		tf.mu.typeDeps.ingestTable(desc)
 		tf.mu.previousTableVersion[desc.GetID()] = desc
 		return nil
 	default:

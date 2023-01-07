@@ -17,12 +17,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -90,11 +93,6 @@ type immutable struct {
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
 	isUncommittedVersion bool
-}
-
-// GetRawBytesInStorage implements the catalog.Descriptor interface.
-func (desc *immutable) GetRawBytesInStorage() []byte {
-	return desc.rawBytesInStorage
 }
 
 // IsUncommittedVersion implements the Descriptor interface.
@@ -476,7 +474,7 @@ func (desc *wrapper) SystemColumns() []catalog.Column {
 }
 
 // FamilyDefaultColumns implements the TableDescriptor interface.
-func (desc *wrapper) FamilyDefaultColumns() []descpb.IndexFetchSpec_FamilyDefaultColumn {
+func (desc *wrapper) FamilyDefaultColumns() []fetchpb.IndexFetchSpec_FamilyDefaultColumn {
 	return desc.getExistingOrNewColumnCache().familyDefaultColumns
 }
 
@@ -605,7 +603,7 @@ func (desc *wrapper) UniqueWithoutIndexColumns(
 // IndexFetchSpecKeyAndSuffixColumns implements the TableDescriptor interface.
 func (desc *wrapper) IndexFetchSpecKeyAndSuffixColumns(
 	idx catalog.Index,
-) []descpb.IndexFetchSpec_KeyColumn {
+) []fetchpb.IndexFetchSpec_KeyColumn {
 	if ic := desc.getExistingOrNewIndexColumnCache(idx); ic != nil {
 		return ic.keyAndSuffix
 	}
@@ -712,4 +710,14 @@ func (desc *wrapper) GetObjectType() privilege.ObjectType {
 // GetInProgressImportStartTime returns the start wall time of the import if there's one in progress
 func (desc *wrapper) GetInProgressImportStartTime() int64 {
 	return desc.ImportStartWallTime
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *wrapper) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	for _, c := range desc.UserDefinedTypeColumns() {
+		if err := fn(c.GetType()); err != nil {
+			return iterutil.Map(err)
+		}
+	}
+	return nil
 }

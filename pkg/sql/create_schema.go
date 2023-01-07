@@ -82,12 +82,7 @@ func CreateUserDefinedSchemaDescriptor(
 			// and can't be in a dropping state.
 			if schemaID != descpb.InvalidID {
 				// Check if the object already exists in a dropped state
-				sc, err := descriptors.GetImmutableSchemaByID(ctx, txn, schemaID, tree.SchemaLookupFlags{
-					Required:       true,
-					AvoidLeased:    true,
-					IncludeOffline: true,
-					IncludeDropped: true,
-				})
+				sc, err := descriptors.ByID(txn).Get().Schema(ctx, schemaID)
 				if err != nil || sc.SchemaKind() != catalog.SchemaUserDefined {
 					return nil, nil, err
 				}
@@ -114,8 +109,7 @@ func CreateUserDefinedSchemaDescriptor(
 			return nil, nil, err
 		}
 		if !exists {
-			return nil, nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist",
-				n.AuthRole)
+			return nil, nil, sqlerrors.NewUndefinedUserError(authRole)
 		}
 		owner = authRole
 	}
@@ -193,8 +187,7 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		dbName = n.Schema.Catalog()
 	}
 
-	db, err := p.Descriptors().GetMutableDatabaseByName(params.ctx, p.txn, dbName,
-		tree.DatabaseLookupFlags{Required: true})
+	db, err := p.Descriptors().MutableByName(p.txn).Database(params.ctx, dbName)
 	if err != nil {
 		return err
 	}

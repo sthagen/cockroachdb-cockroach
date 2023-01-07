@@ -1279,8 +1279,11 @@ func (t *logicTest) newTestServerCluster(bootstrapBinaryPath string, upgradeBina
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ts.WaitForInit(); err != nil {
-		t.Fatal(err)
+	for i := 0; i < t.cfg.NumNodes; i++ {
+		// Wait for each node to be reachable.
+		if err := ts.WaitForInitFinishForNode(i); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	t.testserverCluster = ts
@@ -1815,9 +1818,12 @@ func (t *logicTest) setup(
 	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
 
 	if cfg.UseCockroachGoTestserver {
-		skip.WithIssue(t.t(), 92637)
+		skip.UnderStress(t.t(), "test takes a long time and downloads release artifacts")
 		if !bazel.BuiltWithBazel() {
 			skip.IgnoreLint(t.t(), "cockroach-go/testserver can only be uzed in bazel builds")
+		}
+		if runtime.GOARCH == "arm64" {
+			skip.IgnoreLint(t.t(), "Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/94658")
 		}
 		if cfg.NumNodes != 3 {
 			t.Fatal("cockroach-go testserver tests must use 3 nodes")

@@ -1402,10 +1402,10 @@ def go_deps():
         name = "com_github_cockroachdb_cockroach_go_v2",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/cockroach-go/v2",
-        sha256 = "54ce3a52f7971a1f5b69a766a45688d77fd9118f815ac5839a4f2477df498b06",
-        strip_prefix = "github.com/cockroachdb/cockroach-go/v2@v2.2.19",
+        sha256 = "c754ddca015e733515210f650389dd25f9efb3acc0a8309a6161474f5a1ac5eb",
+        strip_prefix = "github.com/cockroachdb/cockroach-go/v2@v2.2.20",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/cockroach-go/v2/com_github_cockroachdb_cockroach_go_v2-v2.2.19.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/cockroach-go/v2/com_github_cockroachdb_cockroach_go_v2-v2.2.20.zip",
         ],
     )
     go_repository(
@@ -1485,10 +1485,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "1bc07fb5a406d3f408e7a58ce0186ff40fc0dc5d996773f465cd593d22e6ce51",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20221221181305-caecab07d786",
+        sha256 = "ff67b88929caeb1da76ab0c286a4837c51e86723d1d56bdb6150c329f436457f",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20230105164919-10bdef44ad7c",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20221221181305-caecab07d786.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20230105164919-10bdef44ad7c.zip",
         ],
     )
     go_repository(
@@ -6221,6 +6221,26 @@ def go_deps():
         strip_prefix = "github.com/mozilla/tls-observatory@v0.0.0-20190404164649-a3c1b6cfecfd",
         urls = [
             "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/mozilla/tls-observatory/com_github_mozilla_tls_observatory-v0.0.0-20190404164649-a3c1b6cfecfd.zip",
+        ],
+    )
+    go_repository(
+        name = "com_github_mozillazg_go_slugify",
+        build_file_proto_mode = "disable_global",
+        importpath = "github.com/mozillazg/go-slugify",
+        sha256 = "06949c23c6eafacfab588c17df0302f1374a35ddcfb8c4fb6aa7efa916a2ca43",
+        strip_prefix = "github.com/mozillazg/go-slugify@v0.2.0",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/mozillazg/go-slugify/com_github_mozillazg_go_slugify-v0.2.0.zip",
+        ],
+    )
+    go_repository(
+        name = "com_github_mozillazg_go_unidecode",
+        build_file_proto_mode = "disable_global",
+        importpath = "github.com/mozillazg/go-unidecode",
+        sha256 = "6f8673fc37505ecac2f2506db75ac8841404a85bb587e04597f99778148c76fd",
+        strip_prefix = "github.com/mozillazg/go-unidecode@v0.2.0",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/mozillazg/go-unidecode/com_github_mozillazg_go_unidecode-v0.2.0.zip",
         ],
     )
     go_repository(

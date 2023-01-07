@@ -59,6 +59,15 @@ type TestServerArgs struct {
 	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
 	DisableTLSForHTTP bool
 
+	// SecondaryTenantPortOffset if non-zero forces the network addresses
+	// generated for servers started by the serverController to be offset
+	// from the base addressed by the specified amount.
+	SecondaryTenantPortOffset int
+
+	// SecondaryTenantKnobs contains the testing knobs to use
+	// for tenant servers started by the serverController.
+	SecondaryTenantKnobs TestingKnobs
+
 	// JoinAddr is the address of a node we are joining.
 	//
 	// If left empty and the TestServer is being added to a nonempty cluster, this
@@ -124,7 +133,7 @@ type TestServerArgs struct {
 
 	// If set, web session authentication will be disabled, even if the server
 	// is running in secure mode.
-	DisableWebSessionAuthentication bool
+	InsecureWebAccess bool
 
 	// IF set, the demo login endpoint will be enabled.
 	EnableDemoLoginEndpoint bool
@@ -294,6 +303,13 @@ type TestTenantArgs struct {
 	// embedded certs.
 	SSLCertsDir string
 
+	// DisableTLSForHTTP, if set, disables TLS for the HTTP listener.
+	DisableTLSForHTTP bool
+
+	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
+	// which a feature unique to the demo shell.
+	EnableDemoLoginEndpoint bool
+
 	// StartingRPCAndSQLPort, if it is non-zero, is added to the tenant ID in order to
 	// determine the tenant's SQL+RPC port.
 	// If set, force disables SplitListenSQL.
@@ -323,4 +339,8 @@ type TestTenantArgs struct {
 	// CockroachDB upgrades and periodically reports diagnostics to
 	// Cockroach Labs. Should remain disabled during unit testing.
 	StartDiagnosticsReporting bool
+
+	// UseServerController tells testserver.StartTenant() to use
+	// its serverController to start the secondary tenant.
+	UseServerController bool
 }

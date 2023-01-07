@@ -520,9 +520,21 @@ func (r *Replica) hasPendingProposalsRLocked() bool {
 // unquiescing (leading to deadlock). See #46699.
 func (r *Replica) hasPendingProposalQuotaRLocked() bool {
 	if r.mu.proposalQuota == nil {
-		return true
+		return false
 	}
 	return !r.mu.proposalQuota.Full()
+}
+
+// isRaftLeader returns true if this replica believes it is the current
+// Raft leader.
+//
+// NB: This can race with Raft ready processing, where the Raft group has
+// processed a leader change before updating the replica state in a separate
+// critical section. The caller should always verify this against the Raft
+// status where necessary.
+func (r *Replica) isRaftLeaderRLocked() bool {
+	// Defensively check replicaID != 0.
+	return r.replicaID != 0 && r.replicaID == r.mu.leaderID
 }
 
 var errRemoved = errors.New("replica removed")
@@ -1141,7 +1153,7 @@ func (r *Replica) tick(
 	//
 	// This is likely unintentional, and the leader should likely consider itself
 	// live even when quiesced.
-	if r.replicaID == r.mu.leaderID {
+	if r.isRaftLeaderRLocked() {
 		r.mu.lastUpdateTimes.update(r.replicaID, timeutil.Now())
 	}
 
@@ -1693,10 +1705,6 @@ func (r *Replica) hasOutstandingLearnerSnapshotInFlight() bool {
 // flight from this replica to the store with the given ID.
 func (r *Replica) hasOutstandingSnapshotInFlightToStore(storeID roachpb.StoreID) bool {
 	return r.getSnapshotLogTruncationConstraints(storeID) > 0
-}
-
-func isRaftLeader(raftStatus *raft.Status) bool {
-	return raftStatus != nil && raftStatus.SoftState.RaftState == raft.StateLeader
 }
 
 // HasRaftLeader returns true if the raft group has a raft leader currently.

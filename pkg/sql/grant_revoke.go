@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -545,7 +546,7 @@ func (p *planner) getTablePatternsComposition(
 		if err != nil {
 			return unknownComposition, err
 		}
-		_, objectIDs, err := expandTableGlob(ctx, p, tableGlob)
+		_, objectIDs, err := p.ExpandTableGlob(ctx, tableGlob)
 		if err != nil {
 			return unknownComposition, err
 		}
@@ -586,7 +587,7 @@ func (p *planner) getTablePatternsComposition(
 	}
 	// Note that part of the reason the code is structured this way is that
 	// resolving mutable descriptors for virtual table IDs results in an error.
-	muts, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.txn, nonVirtualIDs...)
+	muts, err := p.Descriptors().MutableByID(p.txn).Descs(ctx, nonVirtualIDs)
 	if err != nil {
 		return unknownComposition, err
 	}
@@ -619,8 +620,7 @@ func (p *planner) validateRoles(
 	}
 	for i, grantee := range roles {
 		if _, ok := users[grantee]; !ok {
-			sqlName := tree.Name(roles[i].Normalized())
-			return errors.Errorf("user or role %s does not exist", &sqlName)
+			return sqlerrors.NewUndefinedUserError(roles[i])
 		}
 	}
 

@@ -104,14 +104,14 @@ require (
 	github.com/cockroachdb/apd/v3 v3.1.2
 	github.com/cockroachdb/circuitbreaker v2.2.2-0.20190114160014-a614b14ccf63+incompatible
 	github.com/cockroachdb/cmux v0.0.0-20170110192607-30d10be49292
-	github.com/cockroachdb/cockroach-go/v2 v2.2.19
+	github.com/cockroachdb/cockroach-go/v2 v2.2.20
 	github.com/cockroachdb/crlfmt v0.0.0-20221214225007-b2fc5c302548
 	github.com/cockroachdb/datadriven v1.0.2
 	github.com/cockroachdb/errors v1.9.0
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f
-	github.com/cockroachdb/pebble v0.0.0-20221221181305-caecab07d786
+	github.com/cockroachdb/pebble v0.0.0-20230105164919-10bdef44ad7c
 	github.com/cockroachdb/redact v1.1.3
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -177,6 +177,7 @@ require (
 	github.com/mitchellh/reflectwalk v1.0.0
 	github.com/mmatczuk/go_generics v0.0.0-20181212143635-0aaa050f9bab
 	github.com/montanaflynn/stats v0.6.3
+	github.com/mozillazg/go-slugify v0.2.0
 	github.com/nightlyone/lockfile v1.0.0
 	github.com/olekukonko/tablewriter v0.0.5-0.20200416053754-163badb3bac6
 	github.com/opencontainers/image-spec v1.0.2
@@ -328,6 +329,7 @@ require (
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/morikuni/aec v1.0.0 // indirect
 	github.com/mostynb/go-grpc-compression v1.1.12 // indirect
+	github.com/mozillazg/go-unidecode v0.2.0 // indirect
 	github.com/muesli/termenv v0.13.0 // indirect
 	github.com/mwitkow/go-proto-validators v0.0.0-20180403085117-0950a7990007 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect

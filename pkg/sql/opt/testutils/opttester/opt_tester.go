@@ -61,7 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/floatcmp"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -292,6 +292,8 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData().InsertFastPath = true
 	ot.evalCtx.SessionData().OptSplitScanLimit = tabledesc.MaxBucketAllowed
 	ot.evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	ot.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
 
 	return ot
 }
@@ -1819,7 +1821,7 @@ func (ot *OptTester) Import(tb testing.TB) {
 // testFixturePath returns the path of a fixture inside opttester/testfixtures.
 func (ot *OptTester) testFixturePath(tb testing.TB, file string) string {
 	if bazel.BuiltWithBazel() {
-		runfile := testutils.RewritableDataPath(tb, "pkg", "sql", "opt", "testutils", "opttester", "testfixtures", file)
+		runfile := datapathutils.RewritableDataPath(tb, "pkg", "sql", "opt", "testutils", "opttester", "testfixtures", file)
 		if _, err := os.Stat(runfile); oserror.IsNotExist(err) {
 			tb.Fatalf("%s; is your package missing a dependency on \"//pkg/sql/opt/testutils/opttester:testfixtures\"?", err)
 		}

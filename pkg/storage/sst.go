@@ -497,9 +497,24 @@ func CheckSSTConflicts(
 			sstBottomTombstone := sstRangeKeys.Versions[len(sstRangeKeys.Versions)-1]
 			sstTopTombstone := sstRangeKeys.Versions[0]
 			extKey := extIter.UnsafeKey()
-			extValueLen, extValueIsTombstone, err := extIter.MVCCValueLenAndIsTombstone()
-			if err != nil {
-				return enginepb.MVCCStats{}, err
+			extValueLen, extValueIsTombstone := 0, false
+			if extKey.IsValue() {
+				extValueLen, extValueIsTombstone, err = extIter.MVCCValueLenAndIsTombstone()
+				if err != nil {
+					return enginepb.MVCCStats{}, err
+				}
+			} else {
+				// extIter is at an intent. Save it to the intents list and Next().
+				var mvccMeta enginepb.MVCCMetadata
+				if err = extIter.ValueProto(&mvccMeta); err != nil {
+					return enginepb.MVCCStats{}, err
+				}
+				intents = append(intents, roachpb.MakeIntent(mvccMeta.Txn, extIter.Key().Key))
+				if int64(len(intents)) >= maxIntents {
+					return statsDiff, &roachpb.WriteIntentError{Intents: intents}
+				}
+				extIter.Next()
+				continue
 			}
 
 			if sstBottomTombstone.Timestamp.LessEq(extKey.Timestamp) {
@@ -820,16 +835,13 @@ func CheckSSTConflicts(
 				for extOK && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
 					extIter.NextKey()
 					extOK, _ = extIter.Valid()
-					rangeKeyChanged = rangeKeyChanged || extIter.RangeKeyChanged()
+					rangeKeyChanged = rangeKeyChanged || (extOK && extIter.RangeKeyChanged())
 					nextsUntilSeek--
 					if nextsUntilSeek <= 0 {
 						break
 					}
 				}
-				// TODO(erikgrinaker): NextKey() may not trigger `RangeKeyChanged()`
-				// on an exhausted iterator, so we check the case where we stepped
-				// from an initial range key onto an exhausted iterator. See:
-				// https://github.com/cockroachdb/cockroach/issues/94041
+				// Handle moving from a range key to an exhausted iterator.
 				rangeKeyChanged = rangeKeyChanged || (!extOK && !extPrevRangeKeys.IsEmpty())
 				// If we havent't reached the SST key yet, seek to it. Otherwise, if we
 				// stepped past it but the range key changed we have to seek back to it,
@@ -899,16 +911,13 @@ func CheckSSTConflicts(
 					for extOK && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
 						extIter.NextKey()
 						extOK, _ = extIter.Valid()
-						rangeKeyChanged = rangeKeyChanged || extIter.RangeKeyChanged()
+						rangeKeyChanged = rangeKeyChanged || (extOK && extIter.RangeKeyChanged())
 						nextsUntilSeek--
 						if nextsUntilSeek <= 0 {
 							break
 						}
 					}
-					// TODO(erikgrinaker): NextKey() may not trigger `RangeKeyChanged()`
-					// on an exhausted iterator, so we check the case where we stepped
-					// from an initial range key onto an exhausted iterator. See:
-					// https://github.com/cockroachdb/cockroach/issues/94041
+					// Handle moving from a range key to an exhausted iterator.
 					rangeKeyChanged = rangeKeyChanged || (!extOK && !extPrevRangeKeys.IsEmpty())
 					// If we havent't reached the SST key yet, seek to it. Otherwise, if we
 					// stepped past it but the range key changed we have to seek back to it,
@@ -1062,11 +1071,13 @@ func CheckSSTConflicts(
 					sstIter.SeekGE(MVCCKey{Key: extIter.UnsafeKey().Key})
 					sstOK, sstErr = sstIter.Valid()
 				}
-				if extChangedKeys && !sstChangedKeys {
-					extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
-					extOK, extErr = extIter.Valid()
-				}
-				if extChangedKeys && sstChangedKeys && !extOK && sstOK {
+				// Re-seek the ext iterator if the ext iterator changed keys and:
+				// 1) the SST iterator did not change keys, and we need to bring the ext
+				//    iterator back.
+				// 2) the ext iterator became invalid
+				// 3) both iterators changed keys and the sst iterator's key is further
+				//    ahead.
+				if extChangedKeys && (!sstChangedKeys || (!extOK && sstOK) || extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0) {
 					extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
 					extOK, extErr = extIter.Valid()
 				}

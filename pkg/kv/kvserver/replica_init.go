@@ -13,7 +13,6 @@ package kvserver
 import (
 	"bytes"
 	"context"
-	"math/rand"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -21,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
@@ -95,7 +95,7 @@ func newUnloadedReplica(
 	r.mu.stateLoader = stateloader.Make(desc.RangeID)
 	r.mu.quiescent = true
 	r.mu.conf = store.cfg.DefaultSpanConfig
-	split.Init(&r.loadBasedSplitter, rand.Intn, func() float64 {
+	split.Init(&r.loadBasedSplitter, store.cfg.Settings, split.GlobalRandSource(), func() float64 {
 		return float64(SplitByLoadQPSThreshold.Get(&store.cfg.Settings.SV))
 	}, func() time.Duration {
 		return kvserverbase.SplitByLoadMergeDelay.Get(&store.cfg.Settings.SV)
@@ -111,7 +111,7 @@ func newUnloadedReplica(
 		r.leaseHistory = newLeaseHistory()
 	}
 	if store.cfg.StorePool != nil {
-		r.loadStats = NewReplicaLoad(store.Clock(), store.cfg.StorePool.GetNodeLocalityString)
+		r.loadStats = load.NewReplicaLoad(store.Clock(), store.cfg.StorePool.GetNodeLocalityString)
 	}
 
 	// Init rangeStr with the range ID.
@@ -220,17 +220,13 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 		r.mu.minLeaseProposedTS = r.Clock().NowAsClockTimestamp()
 	}
 
-	ssBase := r.Engine().GetAuxiliaryDir()
-	if r.raftMu.sideloaded, err = logstore.NewDiskSideloadStorage(
+	r.raftMu.sideloaded = logstore.NewDiskSideloadStorage(
 		r.store.cfg.Settings,
 		desc.RangeID,
-		replicaID,
-		ssBase,
+		r.Engine().GetAuxiliaryDir(),
 		r.store.limiters.BulkIOWriteRate,
 		r.store.engine,
-	); err != nil {
-		return errors.Wrap(err, "while initializing sideloaded storage")
-	}
+	)
 	r.assertStateRaftMuLockedReplicaMuRLocked(ctx, r.store.Engine())
 
 	r.sideTransportClosedTimestamp.init(r.store.cfg.ClosedTimestampReceiver, desc.RangeID)

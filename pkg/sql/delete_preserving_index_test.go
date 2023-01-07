@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -676,7 +677,7 @@ func TestMergeProcessor(t *testing.T) {
 
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
-			mut, err := descriptors.GetMutableTableByID(ctx, txn, tableDesc.GetID(), tree.ObjectLookupFlags{})
+			mut, err := descriptors.MutableByID(txn).Table(ctx, tableDesc.GetID())
 			if err != nil {
 				return err
 			}
@@ -709,7 +710,7 @@ func TestMergeProcessor(t *testing.T) {
 
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
-			mut, err := descriptors.GetMutableTableByID(ctx, txn, tableDesc.GetID(), tree.ObjectLookupFlags{})
+			mut, err := descriptors.MutableByID(txn).Table(ctx, tableDesc.GetID())
 			if err != nil {
 				return err
 			}
@@ -766,7 +767,7 @@ func fetchIndex(
 		}
 	}
 
-	var spec descpb.IndexFetchSpec
+	var spec fetchpb.IndexFetchSpec
 	require.NoError(t, rowenc.InitIndexFetchSpec(&spec, keys.SystemSQLCodec, table, idx, columns))
 
 	spans := []roachpb.Span{table.IndexSpan(keys.SystemSQLCodec, idx.GetID())}

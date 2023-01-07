@@ -40,9 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -649,9 +648,6 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Flaky test.
-	skip.WithIssue(t, 91828)
-
 	defer setImportReaderParallelism(1)()
 	const batchSize = 5
 	defer TestingSetParallelImporterReaderBatchSize(batchSize)()
@@ -674,6 +670,7 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	setSmallIngestBufferSizes(t, sqlDB)
 	sqlDB.Exec(t, `CREATE DATABASE d`)
 	sqlDB.Exec(t, "CREATE TABLE t (id INT, data STRING)")
 	defer sqlDB.Exec(t, `DROP TABLE t`)
@@ -1001,7 +998,7 @@ func avroFormat(t *testing.T, format roachpb.AvroOptions_Format) roachpb.IOFileF
 
 	if format != roachpb.AvroOptions_OCF {
 		// Need to load schema for record specific inputs.
-		bytes, err := os.ReadFile(testutils.TestDataPath(t, "avro", "simple-schema.json"))
+		bytes, err := os.ReadFile(datapathutils.TestDataPath(t, "avro", "simple-schema.json"))
 		require.NoError(t, err)
 		avro.SchemaJSON = string(bytes)
 		avro.RecordSeparator = '\n'

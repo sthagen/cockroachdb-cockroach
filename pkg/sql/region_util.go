@@ -30,9 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/zone"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -1197,14 +1199,7 @@ func partitionByForRegionalByRow(
 
 // ValidateAllMultiRegionZoneConfigsInCurrentDatabase is part of the eval.DatabaseCatalog interface.
 func (p *planner) ValidateAllMultiRegionZoneConfigsInCurrentDatabase(ctx context.Context) error {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(
-		ctx,
-		p.txn,
-		p.CurrentDatabase(),
-		tree.DatabaseLookupFlags{
-			Required: true,
-		},
-	)
+	dbDesc, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, p.CurrentDatabase())
 	if err != nil {
 		return err
 	}
@@ -1241,7 +1236,7 @@ func (p *planner) ValidateAllMultiRegionZoneConfigsInCurrentDatabase(ctx context
 // zone configurations to match what would have originally been set by the
 // multi-region syntax.
 func (p *planner) ResetMultiRegionZoneConfigsForTable(ctx context.Context, id int64) error {
-	desc, err := p.Descriptors().GetMutableTableVersionByID(ctx, descpb.ID(id), p.txn)
+	desc, err := p.Descriptors().MutableByID(p.txn).Table(ctx, descpb.ID(id))
 	if err != nil {
 		return errors.Wrapf(err, "error resolving referenced table ID %d", id)
 	}
@@ -1276,15 +1271,7 @@ func (p *planner) ResetMultiRegionZoneConfigsForTable(ctx context.Context, id in
 // database's zone configuration to match what would have originally been set by
 // the multi-region syntax.
 func (p *planner) ResetMultiRegionZoneConfigsForDatabase(ctx context.Context, id int64) error {
-	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
-		ctx,
-		p.txn,
-		descpb.ID(id),
-		tree.DatabaseLookupFlags{
-			Required:    true,
-			AvoidLeased: true,
-		},
-	)
+	dbDesc, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, descpb.ID(id))
 	if err != nil {
 		return err
 	}
@@ -1378,14 +1365,7 @@ func (p *planner) validateAllMultiRegionZoneConfigsInDatabase(
 func (p *planner) CurrentDatabaseRegionConfig(
 	ctx context.Context,
 ) (eval.DatabaseRegionConfig, error) {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(
-		ctx,
-		p.txn,
-		p.CurrentDatabase(),
-		tree.DatabaseLookupFlags{
-			Required: true,
-		},
-	)
+	dbDesc, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, p.CurrentDatabase())
 	if err != nil {
 		return nil, err
 	}
@@ -1590,11 +1570,17 @@ func getDBAndRegionEnumDescs(
 	useCache bool,
 	includeOffline bool,
 ) (dbDesc catalog.DatabaseDescriptor, regionEnumDesc catalog.TypeDescriptor, _ error) {
-	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, dbID, tree.DatabaseLookupFlags{
-		AvoidLeased:    !useCache,
-		Required:       true,
-		IncludeOffline: includeOffline,
-	})
+	var b descs.ByIDGetterBuilder
+	if useCache {
+		b = descsCol.ByIDWithLeased(txn)
+	} else {
+		b = descsCol.ByID(txn)
+	}
+	if !includeOffline {
+		b = b.WithoutOffline()
+	}
+	g := b.Get()
+	dbDesc, err := g.Database(ctx, dbID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1605,18 +1591,7 @@ func getDBAndRegionEnumDescs(
 	if err != nil {
 		return nil, nil, err
 	}
-	regionEnumDesc, err = descsCol.GetImmutableTypeByID(
-		ctx,
-		txn,
-		regionEnumID,
-		tree.ObjectLookupFlags{
-			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidLeased:    !useCache,
-				Required:       true,
-				IncludeOffline: includeOffline,
-			},
-		},
-	)
+	regionEnumDesc, err = g.Type(ctx, regionEnumID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1701,12 +1676,7 @@ func (p *planner) CheckZoneConfigChangePermittedForMultiRegion(
 	// Check if what we're altering is a multi-region entity.
 	if zs.Database != "" {
 		isDB = true
-		dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(
-			ctx,
-			p.txn,
-			string(zs.Database),
-			tree.DatabaseLookupFlags{Required: true},
-		)
+		dbDesc, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, string(zs.Database))
 		if err != nil {
 			return err
 		}
@@ -2476,11 +2446,7 @@ func (p *planner) OptimizeSystemDatabase(ctx context.Context) error {
 
 	// Retrieve the system database descriptor and ensure it supports
 	// multi-region
-	options := tree.CommonLookupFlags{
-		AvoidLeased: true,
-		Required:    true,
-	}
-	_, systemDB, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, keys.SystemDatabaseID, options)
+	systemDB, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, keys.SystemDatabaseID)
 	if err != nil {
 		return err
 	}
@@ -2488,22 +2454,24 @@ func (p *planner) OptimizeSystemDatabase(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "system database is not multi-region")
 	}
-	enumTypeDesc, err := p.Descriptors().GetMutableTypeByID(ctx, p.txn, regionEnumID, tree.ObjectLookupFlags{
-		CommonLookupFlags: options,
-	})
+	enumTypeDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, regionEnumID)
 	if err != nil {
 		return err
 	}
 
 	// Convert the enum descriptor into a type
-	enumName := tree.MakeQualifiedTypeName(systemDB.GetName(), "public", enumTypeDesc.GetName())
-	enumType, err := enumTypeDesc.MakeTypesT(ctx, &enumName, nil)
+	enumTypeName := tree.MakeQualifiedTypeName(
+		catconstants.SystemDatabaseName, catconstants.PublicSchemaName, enumTypeDesc.GetName(),
+	)
+	enumType, err := typedesc.HydratedTFromDesc(ctx, &enumTypeName, enumTypeDesc, p)
 	if err != nil {
 		return err
 	}
 
 	getDescriptor := func(name string) (*tabledesc.Mutable, error) {
-		tableName := tree.MakeTableNameWithSchema(tree.Name("system"), tree.Name("public"), tree.Name(name))
+		tableName := tree.MakeTableNameWithSchema(
+			catconstants.SystemDatabaseName, catconstants.PublicSchemaName, tree.Name(name),
+		)
 		required := true
 		_, desc, err := resolver.ResolveMutableExistingTableObject(
 			ctx, p, &tableName, required, tree.ResolveRequireTableDesc)

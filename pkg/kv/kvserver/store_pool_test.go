@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/replicastats"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -86,16 +87,17 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 		ValBytes: 4,
 	}
 	replica.mu.Unlock()
-	replica.loadStats = NewReplicaLoad(clock, nil)
+	replica.loadStats = load.NewReplicaLoad(clock, nil)
 	for _, store := range stores {
-		replica.loadStats.batchRequests.RecordCount(1, store.Node.NodeID)
-		replica.loadStats.writeKeys.RecordCount(1, store.Node.NodeID)
+		replica.loadStats.RecordBatchRequests(1, store.Node.NodeID)
+		replica.loadStats.RecordWriteKeys(1)
 	}
 	manual.Advance(replicastats.MinStatsDuration + time.Second)
 
-	rangeUsageInfo := rangeUsageInfoForRepl(&replica)
-	QPS, _ := replica.loadStats.batchRequests.AverageRatePerSecond()
-	WPS, _ := replica.loadStats.writeKeys.AverageRatePerSecond()
+	rangeUsageInfo := RangeUsageInfoForRepl(&replica)
+	stats := replica.LoadStats()
+	QPS := stats.QueriesPerSecond
+	WPS := stats.WriteKeysPerSecond
 
 	sp.UpdateLocalStoreAfterRebalance(roachpb.StoreID(1), rangeUsageInfo, roachpb.ADD_VOTER)
 	desc, ok := sp.GetStoreDescriptor(roachpb.StoreID(1))
@@ -139,7 +141,7 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 		t.Errorf("expected L0 Sub-Levels %d, but got %d", expectedL0Sublevels, desc.Capacity.L0Sublevels)
 	}
 
-	sp.UpdateLocalStoresAfterLeaseTransfer(roachpb.StoreID(1), roachpb.StoreID(2), rangeUsageInfo.QueriesPerSecond)
+	sp.UpdateLocalStoresAfterLeaseTransfer(roachpb.StoreID(1), roachpb.StoreID(2), rangeUsageInfo)
 	desc, ok = sp.GetStoreDescriptor(roachpb.StoreID(1))
 	if !ok {
 		t.Fatalf("couldn't find StoreDescriptor for Store ID %d", 1)
@@ -164,7 +166,7 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 	sp.UpdateLocalStoreAfterRelocate(
 		[]roachpb.ReplicationTarget{{StoreID: roachpb.StoreID(1)}}, []roachpb.ReplicationTarget{},
 		[]roachpb.ReplicaDescriptor{{StoreID: roachpb.StoreID(2)}}, []roachpb.ReplicaDescriptor{},
-		roachpb.StoreID(2), rangeUsageInfo.QueriesPerSecond)
+		roachpb.StoreID(2), rangeUsageInfo)
 
 	desc, ok = sp.GetStoreDescriptor(roachpb.StoreID(1))
 	require.True(t, ok)
@@ -225,9 +227,9 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("make replica error : %+v", err)
 	}
-	replica.loadStats = NewReplicaLoad(store.Clock(), nil)
+	replica.loadStats = load.NewReplicaLoad(store.Clock(), nil)
 
-	rangeUsageInfo := rangeUsageInfoForRepl(replica)
+	rangeUsageInfo := RangeUsageInfoForRepl(replica)
 
 	// Update StorePool, which should be a no-op.
 	storeID := roachpb.StoreID(1)

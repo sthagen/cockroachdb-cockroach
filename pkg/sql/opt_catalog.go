@@ -791,6 +791,7 @@ func newOptTable(
 		// "stored" from the perspective of the optimizer because they are
 		// written to the primary index and all secondary indexes.
 		if !col.IsVirtual() || pkCols.Contains(col.GetID()) {
+			cd := col.ColumnDesc()
 			ot.columns[col.Ordinal()].Init(
 				col.Ordinal(),
 				cat.StableID(col.GetID()),
@@ -799,11 +800,11 @@ func newOptTable(
 				col.GetType(),
 				col.IsNullable(),
 				visibility,
-				col.ColumnDesc().DefaultExpr,
-				col.ColumnDesc().ComputeExpr,
-				col.ColumnDesc().OnUpdateExpr,
+				cd.DefaultExpr,
+				cd.ComputeExpr,
+				cd.OnUpdateExpr,
 				mapGeneratedAsIdentityType(col.GetGeneratedAsIdentityType()),
-				col.ColumnDesc().GeneratedAsIdentitySequenceOption,
+				cd.GeneratedAsIdentitySequenceOption,
 			)
 		} else {
 			// We need to propagate the mutation state for computed columns, so that
@@ -838,6 +839,7 @@ func newOptTable(
 		found, _ := desc.FindColumnWithName(sysCol.ColName())
 		if found == nil || found.IsSystemColumn() {
 			col, ord := newColumn()
+			cd := sysCol.ColumnDesc()
 			col.Init(
 				ord,
 				cat.StableID(sysCol.GetID()),
@@ -846,11 +848,11 @@ func newOptTable(
 				sysCol.GetType(),
 				sysCol.IsNullable(),
 				cat.MaybeHidden(sysCol.IsHidden()),
-				sysCol.ColumnDesc().DefaultExpr,
-				sysCol.ColumnDesc().ComputeExpr,
-				sysCol.ColumnDesc().OnUpdateExpr,
+				cd.DefaultExpr,
+				cd.ComputeExpr,
+				cd.OnUpdateExpr,
 				mapGeneratedAsIdentityType(sysCol.GetGeneratedAsIdentityType()),
-				sysCol.ColumnDesc().GeneratedAsIdentitySequenceOption,
+				cd.GeneratedAsIdentitySequenceOption,
 			)
 		}
 	}
@@ -972,9 +974,9 @@ func newOptTable(
 			referencedTable:   cat.StableID(fk.GetReferencedTableID()),
 			referencedColumns: fk.ForeignKeyDesc().ReferencedColumnIDs,
 			validity:          fk.GetConstraintValidity(),
-			match:             fk.Match(),
-			deleteAction:      fk.OnDelete(),
-			updateAction:      fk.OnUpdate(),
+			match:             tree.CompositeKeyMatchMethodType[fk.Match()],
+			deleteAction:      tree.ForeignKeyReferenceActionType[fk.OnDelete()],
+			updateAction:      tree.ForeignKeyReferenceActionType[fk.OnUpdate()],
 		})
 	}
 	for _, fk := range ot.desc.InboundForeignKeys() {
@@ -985,9 +987,9 @@ func newOptTable(
 			referencedTable:   ot.ID(),
 			referencedColumns: fk.ForeignKeyDesc().ReferencedColumnIDs,
 			validity:          fk.GetConstraintValidity(),
-			match:             fk.Match(),
-			deleteAction:      fk.OnDelete(),
-			updateAction:      fk.OnUpdate(),
+			match:             tree.CompositeKeyMatchMethodType[fk.Match()],
+			deleteAction:      tree.ForeignKeyReferenceActionType[fk.OnDelete()],
+			updateAction:      tree.ForeignKeyReferenceActionType[fk.OnUpdate()],
 		})
 	}
 
@@ -1900,9 +1902,9 @@ type optForeignKeyConstraint struct {
 	referencedColumns []descpb.ColumnID
 
 	validity     descpb.ConstraintValidity
-	match        descpb.ForeignKeyReference_Match
-	deleteAction catpb.ForeignKeyAction
-	updateAction catpb.ForeignKeyAction
+	match        tree.CompositeKeyMatchMethod
+	deleteAction tree.ReferenceAction
+	updateAction tree.ReferenceAction
 }
 
 var _ cat.ForeignKeyConstraint = &optForeignKeyConstraint{}
@@ -1961,17 +1963,17 @@ func (fk *optForeignKeyConstraint) Validated() bool {
 
 // MatchMethod is part of the cat.ForeignKeyConstraint interface.
 func (fk *optForeignKeyConstraint) MatchMethod() tree.CompositeKeyMatchMethod {
-	return descpb.ForeignKeyReferenceMatchValue[fk.match]
+	return fk.match
 }
 
 // DeleteReferenceAction is part of the cat.ForeignKeyConstraint interface.
 func (fk *optForeignKeyConstraint) DeleteReferenceAction() tree.ReferenceAction {
-	return descpb.ForeignKeyReferenceActionType[fk.deleteAction]
+	return fk.deleteAction
 }
 
 // UpdateReferenceAction is part of the cat.ForeignKeyConstraint interface.
 func (fk *optForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
-	return descpb.ForeignKeyReferenceActionType[fk.updateAction]
+	return fk.updateAction
 }
 
 // optVirtualTable is similar to optTable but is used with virtual tables.
@@ -2065,6 +2067,7 @@ func newOptVirtualTable(
 		nil, /* generatedAsIdentitySequenceOption */
 	)
 	for i, d := range desc.PublicColumns() {
+		cd := d.ColumnDesc()
 		ot.columns[i+1].Init(
 			i+1,
 			cat.StableID(d.GetID()),
@@ -2073,11 +2076,11 @@ func newOptVirtualTable(
 			d.GetType(),
 			d.IsNullable(),
 			cat.MaybeHidden(d.IsHidden()),
-			d.ColumnDesc().DefaultExpr,
-			d.ColumnDesc().ComputeExpr,
-			d.ColumnDesc().OnUpdateExpr,
+			cd.DefaultExpr,
+			cd.ComputeExpr,
+			cd.OnUpdateExpr,
 			mapGeneratedAsIdentityType(d.GetGeneratedAsIdentityType()),
-			d.ColumnDesc().GeneratedAsIdentitySequenceOption,
+			cd.GeneratedAsIdentitySequenceOption,
 		)
 	}
 

@@ -140,15 +140,27 @@ func backup(
 	var lastCheckpoint time.Time
 
 	var completedSpans, completedIntroducedSpans []roachpb.Span
+	kmsEnv := backupencryption.MakeBackupKMSEnv(execCtx.ExecCfg().Settings,
+		&execCtx.ExecCfg().ExternalIODirConfig, execCtx.ExecCfg().DB, execCtx.User(),
+		execCtx.ExecCfg().InternalExecutor)
 	// TODO(benesch): verify these files, rather than accepting them as truth
 	// blindly.
 	// No concurrency yet, so these assignments are safe.
-	for _, file := range backupManifest.Files {
-		if file.StartTime.IsEmpty() && !file.EndTime.IsEmpty() {
-			completedIntroducedSpans = append(completedIntroducedSpans, file.Span)
+	it, err := makeBackupManifestFileIterator(ctx, execCtx.ExecCfg().DistSQLSrv.ExternalStorage,
+		*backupManifest, encryption, &kmsEnv)
+	if err != nil {
+		return roachpb.RowCount{}, err
+	}
+	defer it.close()
+	for f, hasNext := it.next(); hasNext; f, hasNext = it.next() {
+		if f.StartTime.IsEmpty() && !f.EndTime.IsEmpty() {
+			completedIntroducedSpans = append(completedIntroducedSpans, f.Span)
 		} else {
-			completedSpans = append(completedSpans, file.Span)
+			completedSpans = append(completedSpans, f.Span)
 		}
+	}
+	if it.err() != nil {
+		return roachpb.RowCount{}, it.err()
 	}
 
 	// Subtract out any completed spans.
@@ -171,10 +183,6 @@ func backup(
 	if err != nil {
 		return roachpb.RowCount{}, errors.Wrap(err, "failed to determine nodes on which to run")
 	}
-
-	kmsEnv := backupencryption.MakeBackupKMSEnv(execCtx.ExecCfg().Settings,
-		&execCtx.ExecCfg().ExternalIODirConfig, execCtx.ExecCfg().DB, execCtx.User(),
-		execCtx.ExecCfg().InternalExecutor)
 
 	backupSpecs, err := distBackupPlanSpecs(
 		ctx,
@@ -319,45 +327,36 @@ func backup(
 		}
 	}
 
-	resumerSpan.RecordStructured(&types.StringValue{Value: "writing backup manifest"})
+	// Write a `BACKUP_MANIFEST` file to support backups in mixed-version clusters
+	// with 22.2 nodes.
+	//
+	// TODO(adityamaru): We can stop writing `BACKUP_MANIFEST` in 23.2
+	// because a mixed-version cluster with 23.1 nodes will read the
+	// `BACKUP_METADATA` instead.
 	if err := backupinfo.WriteBackupManifest(ctx, defaultStore, backupbase.BackupManifestName,
 		encryption, &kmsEnv, backupManifest); err != nil {
 		return roachpb.RowCount{}, err
 	}
-	var tableStatistics []*stats.TableStatisticProto
-	for i := range backupManifest.Descriptors {
-		if tbl, _, _, _, _ := descpb.GetDescriptors(&backupManifest.Descriptors[i]); tbl != nil {
-			tableDesc := tabledesc.NewBuilder(tbl).BuildImmutableTable()
-			// Collect all the table stats for this table.
-			tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc)
-			if err != nil {
-				// Successfully backed up data is more valuable than table stats that can
-				// be recomputed after restore, and so if we fail to collect the stats of a
-				// table we do not want to mark the job as failed.
-				// The lack of stats on restore could lead to suboptimal performance when
-				// reading/writing to this table until the stats have been recomputed.
-				log.Warningf(ctx, "failed to collect stats for table: %s, "+
-					"table ID: %d during a backup: %s", tableDesc.GetName(), tableDesc.GetID(),
-					err.Error())
-				continue
-			}
-			for _, stat := range tableStatisticsAcc {
-				tableStatistics = append(tableStatistics, &stat.TableStatisticProto)
-			}
-		}
-	}
-	statsTable := backuppb.StatsTable{
-		Statistics: tableStatistics,
+
+	// Write a `BACKUP_METADATA` file along with SSTs for all the alloc heavy
+	// fields elided from the `BACKUP_MANIFEST`.
+	//
+	// TODO(adityamaru,rhu713): Once backup/restore switches from writing and
+	// reading backup manifests to `metadata.sst` we can stop writing the slim
+	// manifest.
+	if err := backupinfo.WriteFilesListMetadataWithSSTs(ctx, defaultStore, encryption,
+		&kmsEnv, backupManifest); err != nil {
+		return roachpb.RowCount{}, err
 	}
 
-	resumerSpan.RecordStructured(&types.StringValue{Value: "writing backup table statistics"})
+	statsTable := getTableStatsForBackup(ctx, statsCache, backupManifest.Descriptors)
 	if err := backupinfo.WriteTableStatistics(ctx, defaultStore, encryption, &kmsEnv, &statsTable); err != nil {
 		return roachpb.RowCount{}, err
 	}
 
 	if backupinfo.WriteMetadataSST.Get(&settings.SV) {
 		if err := backupinfo.WriteBackupMetadataSST(ctx, defaultStore, encryption, &kmsEnv, backupManifest,
-			tableStatistics); err != nil {
+			statsTable.Statistics); err != nil {
 			err = errors.Wrap(err, "writing forward-compat metadata sst")
 			if !build.IsRelease() {
 				return roachpb.RowCount{}, err
@@ -384,6 +383,47 @@ func releaseProtectedTimestamp(
 		err = nil
 	}
 	return err
+}
+
+// getTableStatsForBackup collects all stats for tables found in descs.
+//
+// We do not fail if we can't retrieve statistiscs. Successfully
+// backed up data is more valuable than table stats that can be
+// recomputed after restore. The lack of stats on restore could lead
+// to suboptimal performance when reading/writing to this table until
+// the stats have been recomputed.
+func getTableStatsForBackup(
+	ctx context.Context, statsCache *stats.TableStatisticsCache, descs []descpb.Descriptor,
+) backuppb.StatsTable {
+	var tableStatistics []*stats.TableStatisticProto
+	for i := range descs {
+		if tbl, _, _, _, _ := descpb.GetDescriptors(&descs[i]); tbl != nil {
+			tableDesc := tabledesc.NewBuilder(tbl).BuildImmutableTable()
+			tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc)
+			if err != nil {
+				log.Warningf(ctx, "failed to collect stats for table: %s, "+
+					"table ID: %d during a backup: %s", tableDesc.GetName(), tableDesc.GetID(),
+					err.Error())
+				continue
+			}
+
+			for _, stat := range tableStatisticsAcc {
+				if statShouldBeIncludedInBackupRestore(&stat.TableStatisticProto) {
+					tableStatistics = append(tableStatistics, &stat.TableStatisticProto)
+				}
+			}
+		}
+	}
+	return backuppb.StatsTable{
+		Statistics: tableStatistics,
+	}
+}
+
+func statShouldBeIncludedInBackupRestore(stat *stats.TableStatisticProto) bool {
+	// Forecasts and merged stats are computed from the persisted
+	// stats on demand and do not need to be backed up or
+	// restored.
+	return stat.Name != jobspb.ForecastStatsName && stat.Name != jobspb.MergedStatsName
 }
 
 type backupResumer struct {

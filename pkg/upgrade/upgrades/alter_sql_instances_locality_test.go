@@ -60,7 +60,6 @@ func TestAlterSystemSqlInstancesTable(t *testing.T) {
 	var (
 		validationSchemas = []upgrades.Schema{
 			{Name: "locality", ValidationFn: upgrades.HasColumn},
-			{Name: "primary", ValidationFn: upgrades.HasColumnFamily},
 		}
 	)
 

@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/oppurpose"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -225,7 +224,6 @@ func distImport(
 		nil, /* txn - the flow does not read or write the database */
 		nil, /* clockUpdater */
 		evalCtx.Tracing,
-		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 
@@ -354,7 +352,7 @@ func presplitTableBoundaries(
 		// TODO(ajwerner): Consider passing in the wrapped descriptors.
 		tblDesc := tabledesc.NewBuilder(tbl.Desc).BuildImmutableTable()
 		for _, span := range tblDesc.AllIndexSpans(cfg.Codec) {
-			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime, oppurpose.SplitImport); err != nil {
+			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime); err != nil {
 				return err
 			}
 		}

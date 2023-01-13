@@ -45,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -468,6 +469,15 @@ func (ts *TestServer) PGServer() interface{} {
 	return nil
 }
 
+// PGPreServer exposes the pgwire.PreServeConnHandler instance used by
+// the TestServer.
+func (ts *TestServer) PGPreServer() *pgwire.PreServeConnHandler {
+	if ts != nil {
+		return ts.pgPreServer
+	}
+	return nil
+}
+
 // RaftTransport returns the RaftTransport used by the TestServer.
 func (ts *TestServer) RaftTransport() *kvserver.RaftTransport {
 	if ts != nil {
@@ -625,6 +635,10 @@ type TestTenant struct {
 	Cfg *BaseConfig
 	*httpTestServer
 	drain *drainServer
+
+	// pgPreServer handles SQL connections prior to routing them to a
+	// specific tenant.
+	pgPreServer *pgwire.PreServeConnHandler
 }
 
 var _ serverutils.TestTenantInterface = &TestTenant{}
@@ -644,9 +658,23 @@ func (t *TestTenant) RPCAddr() string {
 	return t.Cfg.Addr
 }
 
+// DB is part of the TestTenantInterface.
+func (t *TestTenant) DB() *kv.DB {
+	return t.execCfg.DB
+}
+
 // PGServer is part of TestTenantInterface.
 func (t *TestTenant) PGServer() interface{} {
 	return t.pgServer
+}
+
+// PGPreServer exposes the pgwire.PreServeConnHandler instance used by
+// the TestServer.
+func (ts *TestTenant) PGPreServer() *pgwire.PreServeConnHandler {
+	if ts != nil {
+		return ts.pgPreServer
+	}
+	return nil
 }
 
 // DiagnosticsReporter is part of TestTenantInterface.
@@ -846,6 +874,7 @@ func (ts *TestServer) StartTenant(
 		return &TestTenant{
 			SQLServer:      sw.server.sqlServer,
 			Cfg:            sw.server.sqlServer.cfg,
+			pgPreServer:    sw.server.pgPreServer,
 			httpTestServer: hts,
 			drain:          sw.server.drainServer,
 		}, err
@@ -907,8 +936,7 @@ func (ts *TestServer) StartTenant(
 
 	// For now, we don't support split RPC/SQL ports for secondary tenants
 	// in test servers.
-	// TODO(knz): Lift this limitation. It seems arbitrary.
-	baseCfg.SplitListenSQL = false
+	baseCfg.SplitListenSQL = true
 
 	localNodeIDContainer := &base.NodeIDContainer{}
 	localNodeIDContainer.Set(ctx, ts.NodeID())
@@ -930,6 +958,7 @@ func (ts *TestServer) StartTenant(
 		baseCfg.SSLCertsDir = params.SSLCertsDir
 	}
 	if params.StartingRPCAndSQLPort > 0 {
+		log.Infof(ctx, "computing tenant server sql/rpc addr from %d", params.StartingRPCAndSQLPort)
 		baseCfg.SplitListenSQL = false
 		addr, _, err := addrutil.SplitHostPort(baseCfg.Addr, strconv.Itoa(params.StartingRPCAndSQLPort))
 		if err != nil {
@@ -942,6 +971,7 @@ func (ts *TestServer) StartTenant(
 		baseCfg.SQLAdvertiseAddr = newAddr
 	}
 	if params.StartingHTTPPort > 0 {
+		log.Infof(ctx, "computing tenant server http addr from %d", params.StartingHTTPPort)
 		addr, _, err := addrutil.SplitHostPort(baseCfg.HTTPAddr, strconv.Itoa(params.StartingHTTPPort))
 		if err != nil {
 			return nil, err
@@ -951,6 +981,11 @@ func (ts *TestServer) StartTenant(
 		baseCfg.HTTPAdvertiseAddr = newAddr
 	}
 
+	log.Infof(ctx, "tenant server configuration (no controller): rpc %v/%v sql %v/%v http %v/%v",
+		baseCfg.Addr, baseCfg.AdvertiseAddr,
+		baseCfg.SQLAddr, baseCfg.SQLAdvertiseAddr,
+		baseCfg.HTTPAddr, baseCfg.HTTPAdvertiseAddr,
+	)
 	sw, err := NewTenantServer(
 		ctx,
 		stopper,
@@ -981,6 +1016,7 @@ func (ts *TestServer) StartTenant(
 	return &TestTenant{
 		SQLServer:      sw.sqlServer,
 		Cfg:            &baseCfg,
+		pgPreServer:    sw.pgPreServer,
 		httpTestServer: hts,
 		drain:          sw.drainServer,
 	}, err

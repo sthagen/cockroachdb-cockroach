@@ -2422,6 +2422,9 @@ func (ex *connExecutor) execCopyIn(
 		if retErr == nil && !payloadHasError(retPayload) {
 			ex.incrementExecutedStmtCounter(cmd.Stmt)
 		}
+		if p, ok := retPayload.(payloadWithError); ok {
+			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, p.errorCause())
+		}
 		if retErr != nil {
 			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, retErr)
 		}
@@ -3440,6 +3443,13 @@ type StatementCounters struct {
 	// CopyCount counts all COPY statements.
 	CopyCount telemetry.CounterWithMetric
 
+	// CopyNonAtomicCount counts all non-atomic COPY statements (prior to 22.2
+	// non-atomic was the default, in 22.2 COPY became atomic by default
+	// but we want to know if there's customers using the
+	// 'CopyFromAtomicEnabled' session variable to go back to non-atomic
+	// COPYs.
+	CopyNonAtomicCount telemetry.CounterWithMetric
+
 	// DdlCount counts all statements whose StatementReturnType is DDL.
 	DdlCount telemetry.CounterWithMetric
 
@@ -3479,6 +3489,8 @@ func makeStartedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDdlStarted, internal)),
 		CopyCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaCopyStarted, internal)),
+		CopyNonAtomicCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyNonAtomicStarted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscStarted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3518,6 +3530,8 @@ func makeExecutedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDdlExecuted, internal)),
 		CopyCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaCopyExecuted, internal)),
+		CopyNonAtomicCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyNonAtomicExecuted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscExecuted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3568,6 +3582,9 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 		}
 	case *tree.CopyFrom:
 		sc.CopyCount.Inc()
+		if !ex.sessionData().CopyFromAtomicEnabled {
+			sc.CopyNonAtomicCount.Inc()
+		}
 	default:
 		if tree.CanModifySchema(stmt) {
 			sc.DdlCount.Inc()

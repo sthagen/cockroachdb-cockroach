@@ -58,7 +58,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -494,6 +493,23 @@ type statusServer struct {
 	si                       systemInfoOnce
 	stmtDiagnosticsRequester StmtDiagnosticsRequester
 	internalExecutor         *sql.InternalExecutor
+
+	// cancelSemaphore is a semaphore that limits the number of
+	// concurrent calls to the pgwire query cancellation endpoint. This
+	// is needed to avoid the risk of a DoS attack by malicious users
+	// that attempts to cancel random queries by spamming the request.
+	//
+	// See CancelQueryByKey() for details.
+	//
+	// The semaphore is initialized with a hard-coded limit of 256
+	// concurrent pgwire cancel requests (per node). We also add a
+	// 1-second penalty for failed cancellation requests in
+	// CancelQueryByKey, meaning that an attacker needs 1 second per
+	// guess. With an attacker randomly guessing a 32-bit secret, it
+	// would take 2^24 seconds to hit one query. If we suppose there are
+	// 256 concurrent queries actively running on a node, then it would
+	// take 2^16 seconds (18 hours) to hit any one of them.
+	cancelSemaphore *quotapool.IntPool
 }
 
 // systemStatusServer is an extension of the standard
@@ -570,7 +586,9 @@ func newStatusServer(
 	clock *hlc.Clock,
 ) *statusServer {
 	ambient.AddLogTag("status", nil)
-	ambient.AddLogTag("tenant", rpcCtx.TenantID)
+	if !rpcCtx.TenantID.IsSystem() {
+		ambient.AddLogTag("tenant", rpcCtx.TenantID)
+	}
 
 	server := &statusServer{
 		baseStatusServer: &baseStatusServer{
@@ -589,6 +607,9 @@ func newStatusServer(
 		db:               db,
 		metricSource:     metricSource,
 		internalExecutor: internalExecutor,
+
+		// See the docstring on cancelSemaphore for details about this initialization.
+		cancelSemaphore: quotapool.NewIntPool("pgwire-cancel", 256),
 	}
 
 	return server
@@ -616,25 +637,22 @@ func newSystemStatusServer(
 	spanConfigReporter spanconfig.Reporter,
 	clock *hlc.Clock,
 ) *systemStatusServer {
-	ambient.AddLogTag("status", nil)
-	server := &statusServer{
-		baseStatusServer: &baseStatusServer{
-			AmbientContext:     ambient,
-			privilegeChecker:   adminAuthzCheck,
-			sessionRegistry:    sessionRegistry,
-			closedSessionCache: closedSessionCache,
-			remoteFlowRunner:   remoteFlowRunner,
-			st:                 st,
-			rpcCtx:             rpcCtx,
-			stopper:            stopper,
-			serverIterator:     serverIterator,
-			clock:              clock,
-		},
-		cfg:              cfg,
-		db:               db,
-		metricSource:     metricSource,
-		internalExecutor: internalExecutor,
-	}
+	server := newStatusServer(
+		ambient,
+		st,
+		cfg,
+		adminAuthzCheck,
+		db,
+		metricSource,
+		rpcCtx,
+		stopper,
+		sessionRegistry,
+		closedSessionCache,
+		remoteFlowRunner,
+		internalExecutor,
+		serverIterator,
+		clock,
+	)
 
 	return &systemStatusServer{
 		statusServer:       server,
@@ -798,7 +816,7 @@ func (s *systemStatusServer) Allocator(
 						return true // continue.
 					}
 					var allocatorSpans tracingpb.Recording
-					allocatorSpans, err = store.AllocatorDryRun(ctx, rep)
+					allocatorSpans, err = store.ReplicateQueueDryRun(ctx, rep)
 					if err != nil {
 						return false // break and bubble up the error.
 					}
@@ -823,7 +841,7 @@ func (s *systemStatusServer) Allocator(
 			if !rep.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 				continue
 			}
-			allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+			allocatorSpans, err := store.ReplicateQueueDryRun(ctx, rep)
 			if err != nil {
 				return err
 			}
@@ -1239,6 +1257,13 @@ func (s *statusServer) LogFile(
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
+	// Unless we're the system tenant, clients should only be able
+	// to view logs that pertain to their own tenant. Set the filter
+	// accordingly.
+	tenantIDFilter := ""
+	if s.rpcCtx.TenantID != roachpb.SystemTenantID {
+		tenantIDFilter = s.rpcCtx.TenantID.String()
+	}
 	for {
 		var entry logpb.Entry
 		if err := decoder.Decode(&entry); err != nil {
@@ -1246,6 +1271,9 @@ func (s *statusServer) LogFile(
 				break
 			}
 			return nil, serverError(ctx, err)
+		}
+		if tenantIDFilter != "" && entry.TenantID != tenantIDFilter {
+			continue
 		}
 		resp.Entries = append(resp.Entries, entry)
 	}
@@ -1354,7 +1382,22 @@ func (s *statusServer) Logs(
 		return nil, serverError(ctx, err)
 	}
 
-	return &serverpb.LogEntriesResponse{Entries: entries}, nil
+	out := &serverpb.LogEntriesResponse{}
+	// Unless we're the system tenant, clients should only be able
+	// to view logs that pertain to their own tenant. Set the filter
+	// accordingly.
+	tenantIDFilter := ""
+	if s.rpcCtx.TenantID != roachpb.SystemTenantID {
+		tenantIDFilter = s.rpcCtx.TenantID.String()
+	}
+	for _, e := range entries {
+		if tenantIDFilter != "" && e.TenantID != tenantIDFilter {
+			continue
+		}
+		out.Entries = append(out.Entries, e)
+	}
+
+	return out, nil
 }
 
 // Stacks returns goroutine or thread stack traces.
@@ -2356,7 +2399,7 @@ func (s *systemStatusServer) HotRanges(
 
 		// Only hot ranges from the local node.
 		if local {
-			response.HotRangesByNodeID[requestedNodeID] = s.localHotRanges(ctx)
+			response.HotRangesByNodeID[requestedNodeID] = s.localHotRanges(ctx, roachpb.TenantID{})
 			return response, nil
 		}
 
@@ -2402,13 +2445,30 @@ type tableMeta struct {
 	indexName  string
 }
 
-// HotRangesV2 returns hot ranges from all stores on requested node or all nodes in case
-// request message doesn't include specific node ID.
-func (s *statusServer) HotRangesV2(
+func (t *statusServer) HotRangesV2(
 	ctx context.Context, req *serverpb.HotRangesRequest,
 ) (*serverpb.HotRangesResponseV2, error) {
-	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
+	return t.sqlServer.tenantConnect.HotRangesV2(ctx, req)
+}
+
+// HotRangesV2 returns hot ranges from all stores on requested node or all nodes for specified tenant
+// in case request message doesn't include specific node ID.
+func (s *systemStatusServer) HotRangesV2(
+	ctx context.Context, req *serverpb.HotRangesRequest,
+) (*serverpb.HotRangesResponseV2, error) {
+	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
+
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
 		return nil, err
+	}
+
+	var tenantID roachpb.TenantID
+	if len(req.TenantID) > 0 {
+		tenantID, err = roachpb.TenantIDFromString(req.TenantID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	size := int(req.PageSize)
@@ -2428,27 +2488,14 @@ func (s *statusServer) HotRangesV2(
 
 	var requestedNodes []roachpb.NodeID
 	if len(req.NodeID) > 0 {
-		requestedNodeID, _, err := s.parseNodeID(req.NodeID)
+		requestedNodeID, local, err := s.parseNodeID(req.NodeID)
 		if err != nil {
 			return nil, err
 		}
-		requestedNodes = []roachpb.NodeID{requestedNodeID}
-	}
-
-	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
-		client, err := s.dialNode(ctx, nodeID)
-		return client, err
-	}
-	remoteRequest := serverpb.HotRangesRequest{NodeID: "local"}
-	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
-		status := client.(serverpb.StatusClient)
-		resp, err := status.HotRanges(ctx, &remoteRequest)
-		if err != nil || resp == nil {
-			return nil, err
-		}
-		var ranges []*serverpb.HotRangesResponseV2_HotRange
-		for nodeID, hr := range resp.HotRangesByNodeID {
-			for _, store := range hr.Stores {
+		if local {
+			resp := s.localHotRanges(ctx, tenantID)
+			var ranges []*serverpb.HotRangesResponseV2_HotRange
+			for _, store := range resp.Stores {
 				for _, r := range store.HotRanges {
 					var (
 						dbName, tableName, indexName, schemaName string
@@ -2514,7 +2561,7 @@ func (s *statusServer) HotRangesV2(
 
 					ranges = append(ranges, &serverpb.HotRangesResponseV2_HotRange{
 						RangeID:           r.Desc.RangeID,
-						NodeID:            nodeID,
+						NodeID:            requestedNodeID,
 						QPS:               r.QueriesPerSecond,
 						TableName:         tableName,
 						SchemaName:        schemaName,
@@ -2526,8 +2573,25 @@ func (s *statusServer) HotRangesV2(
 					})
 				}
 			}
+			response.Ranges = ranges
+			response.ErrorsByNodeID[requestedNodeID] = resp.ErrorMessage
+			return response, nil
 		}
-		return ranges, nil
+		requestedNodes = []roachpb.NodeID{requestedNodeID}
+	}
+
+	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
+		client, err := s.dialNode(ctx, nodeID)
+		return client, err
+	}
+	remoteRequest := serverpb.HotRangesRequest{NodeID: "local", TenantID: req.TenantID}
+	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
+		status := client.(serverpb.StatusClient)
+		nodeResp, err := status.HotRangesV2(ctx, &remoteRequest)
+		if err != nil {
+			return nil, err
+		}
+		return nodeResp.Ranges, nil
 	}
 	responseFn := func(nodeID roachpb.NodeID, resp interface{}) {
 		if resp == nil {
@@ -2573,11 +2637,16 @@ func decodeTableID(codec keys.SQLCodec, key roachpb.Key) (roachpb.Key, uint32, b
 }
 
 func (s *systemStatusServer) localHotRanges(
-	ctx context.Context,
+	ctx context.Context, tenantID roachpb.TenantID,
 ) serverpb.HotRangesResponse_NodeResponse {
 	var resp serverpb.HotRangesResponse_NodeResponse
 	err := s.stores.VisitStores(func(store *kvserver.Store) error {
-		ranges := store.HottestReplicas()
+		var ranges []kvserver.HotReplicaInfo
+		if tenantID.IsSet() {
+			ranges = store.HottestReplicasByTenant(tenantID)
+		} else {
+			ranges = store.HottestReplicas()
+		}
 		storeResp := &serverpb.HotRangesResponse_StoreResponse{
 			StoreID:   store.StoreID(),
 			HotRanges: make([]serverpb.HotRangesResponse_HotRange, len(ranges)),
@@ -3030,7 +3099,7 @@ func (s *statusServer) CancelQueryByKey(
 	// second. But if an attacker crafts the CancelRequests to all target the
 	// same SQLInstance, then that one instance would have to process 100*X
 	// requests per second.
-	alloc, err := pgwirecancel.CancelSemaphore.TryAcquire(ctx, 1)
+	alloc, err := s.cancelSemaphore.TryAcquire(ctx, 1)
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "exceeded rate limit of pgwire cancellation requests")
 	}

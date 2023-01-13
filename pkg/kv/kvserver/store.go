@@ -916,6 +916,9 @@ type Store struct {
 		// INVARIANT: Any ReplicaPlaceholder in this map is also in replicaPlaceholders.
 		// INVARIANT: Any Replica with Replica.IsInitialized()==true is also in replicasByRangeID.
 		replicasByKey *storeReplicaBTree
+		// creatingReplicas stores IDs of all ranges for which there is an ongoing
+		// attempt to create a replica.
+		creatingReplicas map[roachpb.RangeID]struct{}
 		// All *Replica objects for which Replica.IsInitialized is false.
 		//
 		// INVARIANT: any entry in this map is also in replicasByRangeID.
@@ -1290,6 +1293,7 @@ func NewStore(
 	s.mu.Lock()
 	s.mu.replicaPlaceholders = map[roachpb.RangeID]*ReplicaPlaceholder{}
 	s.mu.replicasByKey = newStoreReplicaBTree()
+	s.mu.creatingReplicas = map[roachpb.RangeID]struct{}{}
 	s.mu.uninitReplicas = map[roachpb.RangeID]*Replica{}
 	s.mu.Unlock()
 
@@ -1889,7 +1893,11 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		// constraint (*Replica).raftMu < (*Store).mu. See the comment on
 		// (Store).mu.
 		s.mu.Lock()
-		err = s.addReplicaInternalLocked(rep)
+		// TODO(pavelkalinnikov): hide these in Store's replica create functions.
+		err = s.addToReplicasByRangeIDLocked(rep)
+		if err == nil {
+			err = s.addToReplicasByKeyLocked(rep)
+		}
 		s.mu.Unlock()
 		if err != nil {
 			return err
@@ -3451,11 +3459,16 @@ func (s *Store) ComputeStatsForKeySpan(startKey, endKey roachpb.RKey) (StoreKeyS
 	return result, err
 }
 
-// AllocatorDryRun runs the given replica through the allocator without actually
-// carrying out any changes, returning all trace messages collected along the way.
+// ReplicateQueueDryRun runs the given replica through the replicate queue
+// (using the allocator) without actually carrying out any changes, returning
+// all trace messages collected along the way.
 // Intended to help power a debug endpoint.
-func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracingpb.Recording, error) {
-	ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx, s.cfg.AmbientCtx.Tracer, "allocator dry run")
+func (s *Store) ReplicateQueueDryRun(
+	ctx context.Context, repl *Replica,
+) (tracingpb.Recording, error) {
+	ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx,
+		s.cfg.AmbientCtx.Tracer, "replicate queue dry run",
+	)
 	defer collectAndFinish()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
@@ -3465,6 +3478,99 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracingpb.R
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}
 	return collectAndFinish(), nil
+}
+
+// AllocatorCheckRange takes a range descriptor and a node liveness override (or
+// nil, to use the configured StorePool's), looks up the configuration of
+// range, and utilizes the allocator to get the action needed to repair the
+// range, as well as any upreplication target if needed, returning along with
+// any encountered errors as well as the collected tracing spans.
+//
+// This functionality is similar to ReplicateQueueDryRun, but operates on the
+// basis of a range, evaluating the action and target determined by the allocator.
+// The range does not need to have a replica on the store in order to check the
+// needed allocator action and target. The store pool, if provided, will be
+// used, otherwise it will fall back to the store's configured store pool.
+//
+// Assuming the span config is available, a valid allocator action should
+// always be returned, even in case of errors.
+//
+// NB: In the case of removal or rebalance actions, a target cannot be
+// evaluated, as a leaseholder is required for evaluation.
+func (s *Store) AllocatorCheckRange(
+	ctx context.Context,
+	desc *roachpb.RangeDescriptor,
+	overrideStorePool storepool.AllocatorStorePool,
+) (allocatorimpl.AllocatorAction, roachpb.ReplicationTarget, tracingpb.Recording, error) {
+	ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx,
+		s.cfg.AmbientCtx.Tracer, "allocator check range",
+	)
+	defer collectAndFinish()
+
+	confReader, err := s.GetConfReader(ctx)
+	if err == nil {
+		err = s.WaitForSpanConfigSubscription(ctx)
+	}
+	if err != nil {
+		log.Eventf(ctx, "span configs unavailable: %s", err)
+		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, collectAndFinish(), err
+	}
+
+	conf, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
+	if err != nil {
+		log.Eventf(ctx, "error retrieving span config for range %s: %s", desc, err)
+		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, collectAndFinish(), err
+	}
+
+	// If a store pool was provided, use that, otherwise use the store's
+	// configured store pool.
+	var storePool storepool.AllocatorStorePool
+	if overrideStorePool != nil {
+		storePool = overrideStorePool
+	} else if s.cfg.StorePool != nil {
+		storePool = s.cfg.StorePool
+	}
+
+	action, _ := s.allocator.ComputeAction(ctx, storePool, conf, desc)
+
+	// In the case that the action does not require a target, return immediately.
+	if !(action.Add() || action.Replace()) {
+		return action, roachpb.ReplicationTarget{}, collectAndFinish(), err
+	}
+
+	liveVoters, liveNonVoters, isReplacement, nothingToDo, err :=
+		allocatorimpl.FilterReplicasForAction(storePool, desc, action)
+
+	if nothingToDo || err != nil {
+		return action, roachpb.ReplicationTarget{}, collectAndFinish(), err
+	}
+
+	target, _, err := s.allocator.AllocateTarget(ctx, storePool, conf,
+		liveVoters, liveNonVoters, action.ReplicaStatus(), action.TargetReplicaType(),
+	)
+	if err == nil {
+		log.Eventf(ctx, "found valid allocation of %s target %v", action.TargetReplicaType(), target)
+
+		// Ensure that if we are upreplicating, we are avoiding a state in which we
+		// have a fragile quorum that we cannot avoid by allocating more voters.
+		fragileQuorumErr := s.allocator.CheckAvoidsFragileQuorum(
+			ctx,
+			storePool,
+			conf,
+			desc.Replicas().VoterDescriptors(),
+			liveNonVoters,
+			action.ReplicaStatus(),
+			action.TargetReplicaType(),
+			target,
+			isReplacement,
+		)
+
+		if fragileQuorumErr != nil {
+			err = errors.Wrap(fragileQuorumErr, "avoid up-replicating to fragile quorum")
+		}
+	}
+
+	return action, target, collectAndFinish(), err
 }
 
 // Enqueue runs the given replica through the requested queue. If `async` is

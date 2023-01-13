@@ -674,6 +674,17 @@ var charts = []sectionDescription{
 		},
 		Charts: []chartDescription{
 			{
+				Title:   "Rebalancing Exhausted Options",
+				Metrics: []string{"rebalancing.state.imbalanced_overfull_options_exhausted"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{
+			{DistributionLayer, "Rebalancing"},
+		},
+		Charts: []chartDescription{
+			{
 				Title:   "QPS",
 				Metrics: []string{"rebalancing.queriespersecond"},
 			},
@@ -1388,6 +1399,12 @@ var charts = []sectionDescription{
 				Title: "Emitted Messages",
 				Metrics: []string{
 					"changefeed.emitted_messages",
+				},
+			},
+			{
+				Title: "Filtered Messages",
+				Metrics: []string{
+					"changefeed.filtered_messages",
 				},
 			},
 			{
@@ -2563,6 +2580,43 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "SQL, Prior to tenant selection"}},
+		Charts: []chartDescription{
+			{
+				Title: "New Connections",
+				Metrics: []string{
+					"sql.pre_serve.new_conns",
+				},
+			},
+			{
+				Title: "Connection Failures",
+				Metrics: []string{
+					"sql.pre_serve.conn.failures",
+				},
+				AxisLabel: "Failures",
+			},
+			{
+				Title: "Byte I/O",
+				Metrics: []string{
+					"sql.pre_serve.bytesin",
+					"sql.pre_serve.bytesout",
+				},
+			},
+			{
+				Title: "Memory usage, Current",
+				Metrics: []string{
+					"sql.pre_serve.mem.cur",
+				},
+			},
+			{
+				Title: "Memory usage, Max",
+				Metrics: []string{
+					"sql.pre_serve.mem.max",
+				},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{SQLLayer, "SQL"}},
 		Charts: []chartDescription{
 			{
@@ -2704,6 +2758,7 @@ var charts = []sectionDescription{
 					"sql.insert.count",
 					"sql.misc.count",
 					"sql.copy.count",
+					"sql.copy.nonatomic.count",
 					"sql.query.count",
 					"sql.select.count",
 					"sql.update.count",
@@ -2718,6 +2773,7 @@ var charts = []sectionDescription{
 					"sql.insert.started.count",
 					"sql.misc.started.count",
 					"sql.copy.started.count",
+					"sql.copy.nonatomic.started.count",
 					"sql.query.started.count",
 					"sql.select.started.count",
 					"sql.update.started.count",
@@ -2730,6 +2786,7 @@ var charts = []sectionDescription{
 					"sql.insert.count.internal",
 					"sql.misc.count.internal",
 					"sql.copy.count.internal",
+					"sql.copy.nonatomic.count.internal",
 					"sql.query.count.internal",
 					"sql.select.count.internal",
 					"sql.update.count.internal",
@@ -2743,6 +2800,7 @@ var charts = []sectionDescription{
 					"sql.insert.started.count.internal",
 					"sql.misc.started.count.internal",
 					"sql.copy.started.count.internal",
+					"sql.copy.nonatomic.started.count.internal",
 					"sql.query.started.count.internal",
 					"sql.select.started.count.internal",
 					"sql.update.started.count.internal",

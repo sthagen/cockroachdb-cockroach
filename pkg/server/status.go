@@ -52,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
@@ -63,7 +64,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -77,6 +77,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -212,30 +213,27 @@ func (b *baseStatusServer) getLocalSessions(
 	showAll := reqUsername.Undefined()
 	showInternal := SQLStatsShowInternal.Get(&b.st.SV) || req.IncludeInternal
 
-	// In order to avoid duplicate sessions showing up as both open and closed,
-	// we lock the session registry to prevent any changes to it while we
-	// serialize the sessions from the session registry and the closed session
-	// cache.
-	b.sessionRegistry.Lock()
-	sessions := b.sessionRegistry.SerializeAllLocked()
-
+	sessions := b.sessionRegistry.SerializeAll()
 	var closedSessions []serverpb.Session
+	var closedSessionIDs map[uint128.Uint128]struct{}
 	if !req.ExcludeClosedSessions {
 		closedSessions = b.closedSessionCache.GetSerializedSessions()
+		closedSessionIDs = make(map[uint128.Uint128]struct{}, len(closedSessions))
+		for _, closedSession := range closedSessions {
+			closedSessionIDs[uint128.FromBytes(closedSession.ID)] = struct{}{}
+		}
 	}
-	b.sessionRegistry.Unlock()
-
-	userSessions := make([]serverpb.Session, 0)
-	sessions = append(sessions, closedSessions...)
 
 	reqUserNameNormalized := reqUsername.Normalized()
-	for _, session := range sessions {
+
+	userSessions := make([]serverpb.Session, 0, len(sessions)+len(closedSessions))
+	addUserSession := func(session serverpb.Session) {
 		// We filter based on the session name instead of the executor type because we
 		// may want to surface certain internal sessions, such as those executed by
 		// the SQL over HTTP api, as non-internal.
 		if (reqUserNameNormalized != session.Username && !showAll) ||
 			(!showInternal && isInternalAppName(session.ApplicationName)) {
-			continue
+			return
 		}
 
 		if !isAdmin && hasViewActivityRedacted && (reqUserNameNormalized != session.Username) {
@@ -247,8 +245,21 @@ func (b *baseStatusServer) getLocalSessions(
 			}
 			session.LastActiveQuery = session.LastActiveQueryNoConstants
 		}
-
 		userSessions = append(userSessions, session)
+	}
+	for _, session := range sessions {
+		// The same session can appear as both open and closed because reading the
+		// open and closed sessions is not synchronized. Prefer the closed session
+		// over the open one if the same session appears as both because it was
+		// closed in between reading the open sessions and reading the closed ones.
+		_, ok := closedSessionIDs[uint128.FromBytes(session.ID)]
+		if ok {
+			continue
+		}
+		addUserSession(session)
+	}
+	for _, session := range closedSessions {
+		addUserSession(session)
 	}
 
 	sort.Slice(userSessions, func(i, j int) bool {
@@ -336,7 +347,10 @@ func (b *baseStatusServer) checkCancelPrivilege(
 		if sessionUser != reqUser {
 			// Must have CANCELQUERY privilege to cancel other users'
 			// sessions/queries.
-			hasCancelQuery := b.privilegeChecker.checkHasGlobalPrivilege(ctx, reqUser, privilege.CANCELQUERY)
+			hasCancelQuery, err := b.privilegeChecker.hasGlobalPrivilege(ctx, reqUser, privilege.CANCELQUERY)
+			if err != nil {
+				return serverError(ctx, err)
+			}
 			if !hasCancelQuery {
 				ok, err := b.privilegeChecker.hasRoleOption(ctx, reqUser, roleoption.CANCELQUERY)
 				if err != nil {
@@ -1596,6 +1610,15 @@ func (s *systemStatusServer) Nodes(
 	return resp, nil
 }
 
+func (s *statusServer) NodesUI(
+	ctx context.Context, req *serverpb.NodesRequest,
+) (*serverpb.NodesResponseExternal, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	return s.sqlServer.tenantConnect.NodesUI(ctx, req)
+}
+
 func (s *systemStatusServer) NodesUI(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponseExternal, error) {
@@ -2233,7 +2256,7 @@ func (s *systemStatusServer) TenantRanges(
 		return nil, err
 	}
 
-	tID, ok := roachpb.TenantFromContext(ctx)
+	tID, ok := roachpb.ClientTenantFromContext(ctx)
 	if !ok {
 		return nil, status.Error(codes.Internal, "no tenant ID found in context")
 	}
@@ -2514,9 +2537,10 @@ func (s *systemStatusServer) HotRangesV2(
 						schemaName = meta.(tableMeta).schemaName
 						indexName = meta.(tableMeta).indexName
 					} else {
-						if err = s.sqlServer.distSQLServer.InternalExecutorFactory.DescsTxnWithExecutor(
-							ctx, s.db, nil, func(ctx context.Context, txn *kv.Txn, col *descs.Collection, ie sqlutil.InternalExecutor) error {
-								desc, err := col.ByID(txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
+						if err = s.sqlServer.distSQLServer.DB.DescsTxn(
+							ctx, func(ctx context.Context, txn descs.Txn) error {
+								col := txn.Descriptors()
+								desc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 								if err != nil {
 									return errors.Wrapf(err, "cannot get table descriptor with tableID: %d, %s", tableID, r.Desc)
 								}
@@ -2526,21 +2550,21 @@ func (s *systemStatusServer) HotRangesV2(
 									if _, _, idxID, err := s.sqlServer.execCfg.Codec.DecodeIndexPrefix(r.Desc.StartKey.AsRawKey()); err != nil {
 										log.Warningf(ctx, "cannot decode index prefix for range descriptor: %s: %v", r.Desc, err)
 									} else {
-										if index, err := desc.FindIndexWithID(descpb.IndexID(idxID)); err != nil {
-											log.Warningf(ctx, "cannot get index name for range descriptor: %s: %v", r.Desc, err)
+										if index := catalog.FindIndexByID(desc, descpb.IndexID(idxID)); index == nil {
+											log.Warningf(ctx, "cannot get index name for range descriptor: %s: index with ID %d not found", r.Desc, idxID)
 										} else {
 											indexName = index.GetName()
 										}
 									}
 								}
 
-								if dbDesc, err := col.ByID(txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID()); err != nil {
+								if dbDesc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Database(ctx, desc.GetParentID()); err != nil {
 									log.Warningf(ctx, "cannot get database by descriptor ID: %s: %v", r.Desc, err)
 								} else {
 									dbName = dbDesc.GetName()
 								}
 
-								if schemaDesc, err := col.ByID(txn).WithoutNonPublic().Get().Schema(ctx, desc.GetParentSchemaID()); err != nil {
+								if schemaDesc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Schema(ctx, desc.GetParentSchemaID()); err != nil {
 									log.Warningf(ctx, "cannot get schema name for range descriptor: %s: %v", r.Desc, err)
 								} else {
 									schemaName = schemaDesc.GetName()

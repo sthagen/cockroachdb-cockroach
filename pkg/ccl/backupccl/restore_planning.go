@@ -51,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -58,8 +59,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -76,7 +77,8 @@ const (
 	restoreOptSkipMissingViews          = "skip_missing_views"
 	restoreOptSkipLocalitiesCheck       = "skip_localities_check"
 	restoreOptDebugPauseOn              = "debug_pause_on"
-	restoreOptAsTenant                  = "tenant"
+	restoreOptAsTenant                  = "tenant_name"
+	restoreOptForceTenantID             = "tenant"
 
 	// The temporary database system tables will be restored into for full
 	// cluster backups.
@@ -282,10 +284,12 @@ func allocateDescriptorRewrites(
 
 	// Fail fast if the necessary databases don't exist or are otherwise
 	// incompatible with this restore.
-	if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
+	if err := func() error {
+		txn := p.InternalSQLTxn()
+		col := txn.Descriptors()
 		// Check that any DBs being restored do _not_ exist.
 		for name := range restoreDBNames {
-			dbID, err := col.LookupDatabaseID(ctx, txn, name)
+			dbID, err := col.LookupDatabaseID(ctx, txn.KV(), name)
 			if err != nil {
 				return err
 			}
@@ -301,7 +305,7 @@ func allocateDescriptorRewrites(
 				continue
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage, sc)
+			targetDB, err := resolveTargetDB(ctx, databasesByID, intoDB, descriptorCoverage, sc)
 			if err != nil {
 				return err
 			}
@@ -310,7 +314,7 @@ func allocateDescriptorRewrites(
 				needsNewParentIDs[targetDB] = append(needsNewParentIDs[targetDB], sc.ID)
 			} else {
 				// Look up the parent database's ID.
-				parentID, parentDB, err := getDatabaseIDAndDesc(ctx, txn, col, targetDB)
+				parentID, parentDB, err := getDatabaseIDAndDesc(ctx, txn.KV(), col, targetDB)
 				if err != nil {
 					return err
 				}
@@ -322,7 +326,7 @@ func allocateDescriptorRewrites(
 				}
 
 				// See if there is an existing schema with the same name.
-				id, err := col.LookupSchemaID(ctx, txn, parentID, sc.Name)
+				id, err := col.LookupSchemaID(ctx, txn.KV(), parentID, sc.Name)
 				if err != nil {
 					return err
 				}
@@ -332,7 +336,7 @@ func allocateDescriptorRewrites(
 				} else {
 					// If we found an existing schema, then we need to remap all references
 					// to this schema to the existing one.
-					desc, err := col.ByID(txn).Get().Schema(ctx, id)
+					desc, err := col.ByID(txn.KV()).Get().Schema(ctx, id)
 					if err != nil {
 						return err
 					}
@@ -351,8 +355,7 @@ func allocateDescriptorRewrites(
 				continue
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage,
-				table)
+			targetDB, err := resolveTargetDB(ctx, databasesByID, intoDB, descriptorCoverage, table)
 			if err != nil {
 				return err
 			}
@@ -362,7 +365,7 @@ func allocateDescriptorRewrites(
 			} else {
 				var parentID descpb.ID
 				{
-					newParentID, err := col.LookupDatabaseID(ctx, txn, targetDB)
+					newParentID, err := col.LookupDatabaseID(ctx, txn.KV(), targetDB)
 					if err != nil {
 						return err
 					}
@@ -375,13 +378,13 @@ func allocateDescriptorRewrites(
 				// Check that the table name is _not_ in use.
 				// This would fail the CPut later anyway, but this yields a prettier error.
 				tableName := tree.NewUnqualifiedTableName(tree.Name(table.GetName()))
-				err := descs.CheckObjectNameCollision(ctx, col, txn, parentID, table.GetParentSchemaID(), tableName)
+				err := descs.CheckObjectNameCollision(ctx, col, txn.KV(), parentID, table.GetParentSchemaID(), tableName)
 				if err != nil {
 					return err
 				}
 
 				// Check privileges.
-				parentDB, err := col.ByID(txn).Get().Database(ctx, parentID)
+				parentDB, err := col.ByID(txn.KV()).Get().Database(ctx, parentID)
 				if err != nil {
 					return errors.Wrapf(err,
 						"failed to lookup parent DB %d", errors.Safe(parentID))
@@ -396,7 +399,7 @@ func allocateDescriptorRewrites(
 				// We're restoring a table and not its parent database. We may block
 				// restoring multi-region tables to multi-region databases since
 				// regions may mismatch.
-				if err := checkMultiRegionCompatible(ctx, txn, col, table, parentDB); err != nil {
+				if err := checkMultiRegionCompatible(ctx, txn.KV(), col, table, parentDB); err != nil {
 					return pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
 				}
 
@@ -422,7 +425,7 @@ func allocateDescriptorRewrites(
 				continue
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage, typ)
+			targetDB, err := resolveTargetDB(ctx, databasesByID, intoDB, descriptorCoverage, typ)
 			if err != nil {
 				return err
 			}
@@ -432,12 +435,12 @@ func allocateDescriptorRewrites(
 			} else {
 				// The remapping logic for a type will perform the remapping for a type's
 				// array type, so don't perform this logic for the array type itself.
-				if typ.Kind == descpb.TypeDescriptor_ALIAS {
+				if typ.AsAliasTypeDescriptor() != nil {
 					continue
 				}
 
 				// Look up the parent database's ID.
-				parentID, err := col.LookupDatabaseID(ctx, txn, targetDB)
+				parentID, err := col.LookupDatabaseID(ctx, txn.KV(), targetDB)
 				if err != nil {
 					return err
 				}
@@ -446,7 +449,7 @@ func allocateDescriptorRewrites(
 						targetDB, typ.Name)
 				}
 				// Check privileges on the parent DB.
-				parentDB, err := col.ByID(txn).Get().Database(ctx, parentID)
+				parentDB, err := col.ByID(txn.KV()).Get().Database(ctx, parentID)
 				if err != nil {
 					return errors.Wrapf(err,
 						"failed to lookup parent DB %d", errors.Safe(parentID))
@@ -464,7 +467,7 @@ func allocateDescriptorRewrites(
 				desc, err := descs.GetDescriptorCollidingWithObjectName(
 					ctx,
 					col,
-					txn,
+					txn.KV(),
 					parentID,
 					getParentSchemaID(typ),
 					typ.Name,
@@ -490,7 +493,7 @@ func allocateDescriptorRewrites(
 					// Ensure that there isn't a collision with the array type name.
 					arrTyp := typesByID[typ.ArrayTypeID]
 					typeName := tree.NewUnqualifiedTypeName(arrTyp.GetName())
-					err = descs.CheckObjectNameCollision(ctx, col, txn, parentID, getParentSchemaID(typ), typeName)
+					err = descs.CheckObjectNameCollision(ctx, col, txn.KV(), parentID, getParentSchemaID(typ), typeName)
 					if err != nil {
 						return errors.Wrapf(err, "name collision for %q's array type", typ.Name)
 					}
@@ -525,7 +528,7 @@ func allocateDescriptorRewrites(
 					}
 					descriptorRewrites[typ.ArrayTypeID] = &jobspb.DescriptorRewrite{
 						ParentID:   existingType.GetParentID(),
-						ID:         existingType.GetArrayTypeID(),
+						ID:         existingType.TypeDesc().ArrayTypeID,
 						ToExisting: true,
 					}
 				}
@@ -553,7 +556,7 @@ func allocateDescriptorRewrites(
 				return errors.AssertionFailedf("function descriptors seen when restoring tables")
 			}
 
-			targetDB, err := resolveTargetDB(ctx, txn, p, databasesByID, intoDB, descriptorCoverage, function)
+			targetDB, err := resolveTargetDB(ctx, databasesByID, intoDB, descriptorCoverage, function)
 			if err != nil {
 				return err
 			}
@@ -565,7 +568,7 @@ func allocateDescriptorRewrites(
 			}
 		}
 		return nil
-	}); err != nil {
+	}(); err != nil {
 		return nil, err
 	}
 
@@ -705,27 +708,24 @@ func getDatabaseIDAndDesc(
 // If we're doing a full cluster restore - to treat defaultdb and postgres
 // as regular databases, we drop them before restoring them again in the
 // restore.
-func dropDefaultUserDBs(ctx context.Context, execCfg *sql.ExecutorConfig) error {
-	return execCfg.InternalExecutorFactory.DescsTxnWithExecutor(ctx, execCfg.DB, nil /* session data */, func(
-		ctx context.Context, txn *kv.Txn, _ *descs.Collection, ie sqlutil.InternalExecutor,
-	) error {
-		_, err := ie.Exec(ctx, "drop-defaultdb", txn, "DROP DATABASE IF EXISTS defaultdb")
-		if err != nil {
-			return err
-		}
-
-		_, err = ie.Exec(ctx, "drop-postgres", txn, "DROP DATABASE IF EXISTS postgres")
-		if err != nil {
-			return err
-		}
-		return nil
-	})
+func dropDefaultUserDBs(ctx context.Context, txn isql.Txn) error {
+	if _, err := txn.ExecEx(
+		ctx, "drop-defaultdb", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
+		"DROP DATABASE IF EXISTS defaultdb",
+	); err != nil {
+		return err
+	}
+	_, err := txn.ExecEx(
+		ctx, "drop-postgres", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
+		"DROP DATABASE IF EXISTS postgres",
+	)
+	return err
 }
 
 func resolveTargetDB(
 	ctx context.Context,
-	txn *kv.Txn,
-	p sql.PlanHookState,
 	databasesByID map[descpb.ID]*dbdesc.Mutable,
 	intoDB string,
 	descriptorCoverage tree.DescriptorCoverage,
@@ -949,6 +949,7 @@ func restoreTypeCheck(
 			restoreStmt.Options.EncryptionPassphrase,
 			restoreStmt.Options.IntoDB,
 			restoreStmt.Options.NewDBName,
+			restoreStmt.Options.ForceTenantID,
 			restoreStmt.Options.AsTenant,
 			restoreStmt.Options.DebugPauseOn,
 		},
@@ -1096,32 +1097,58 @@ func restorePlanHook(
 	}
 
 	var newTenantID *roachpb.TenantID
-	if restoreStmt.Options.AsTenant != nil {
+	var newTenantName *roachpb.TenantName
+	if restoreStmt.Options.AsTenant != nil || restoreStmt.Options.ForceTenantID != nil {
 		if restoreStmt.DescriptorCoverage == tree.AllDescriptors || !restoreStmt.Targets.TenantID.IsSet() {
-			err := errors.Errorf("%q can only be used when running RESTORE TENANT for a single tenant", restoreOptAsTenant)
+			err := errors.Errorf("options %q/%q can only be used when running RESTORE TENANT for a single tenant",
+				restoreOptAsTenant, restoreOptForceTenantID)
 			return nil, nil, nil, false, err
 		}
-		// TODO(dt): it'd be nice to have TypeAsInt or TypeAsTenantID and then in
-		// sql.y an int_or_placeholder, but right now the hook view of planner only
-		// has TypeAsString so we'll just atoi it.
-		var err error
-		newTenantID, err = func() (*roachpb.TenantID, error) {
-			s, err := exprEval.String(ctx, restoreStmt.Options.AsTenant)
+
+		if restoreStmt.Options.ForceTenantID != nil {
+			var err error
+			newTenantID, err = func() (*roachpb.TenantID, error) {
+				s, err := exprEval.String(ctx, restoreStmt.Options.ForceTenantID)
+				if err != nil {
+					return nil, err
+				}
+				id, err := strconv.ParseUint(s, 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				tid, err := roachpb.MakeTenantID(id)
+				if err != nil {
+					return nil, err
+				}
+				return &tid, err
+			}()
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, false, err
 			}
-			x, err := strconv.Atoi(s)
+		}
+		if restoreStmt.Options.AsTenant != nil {
+			var err error
+			newTenantName, err = func() (*roachpb.TenantName, error) {
+				s, err := exprEval.String(ctx, restoreStmt.Options.AsTenant)
+				if err != nil {
+					return nil, err
+				}
+				tn := roachpb.TenantName(s)
+				if err := tn.IsValid(); err != nil {
+					return nil, err
+				}
+				return &tn, nil
+			}()
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, false, err
 			}
-			if x < int(roachpb.MinTenantID.ToUint64()) {
-				return nil, errors.New("invalid tenant ID value")
+		}
+		if newTenantID == nil && newTenantName != nil {
+			id, err := p.GetAvailableTenantID(ctx, *newTenantName)
+			if err != nil {
+				return nil, nil, nil, false, err
 			}
-			id := roachpb.MustMakeTenantID(uint64(x))
-			return &id, nil
-		}()
-		if err != nil {
-			return nil, nil, nil, false, err
+			newTenantID = &id
 		}
 	}
 
@@ -1156,7 +1183,7 @@ func restorePlanHook(
 
 		return doRestorePlan(
 			ctx, restoreStmt, &exprEval, p, from, incStorage, pw, kms, intoDB,
-			newDBName, newTenantID, endTime, resultsCh, subdir,
+			newDBName, newTenantID, newTenantName, endTime, resultsCh, subdir,
 		)
 	}
 
@@ -1188,7 +1215,9 @@ func checkRestoreDestinationPrivileges(
 func checkRestorePrivilegesOnDatabase(
 	ctx context.Context, p sql.PlanHookState, parentDB catalog.DatabaseDescriptor,
 ) (shouldBufferNotice bool, err error) {
-	if err := p.CheckPrivilege(ctx, parentDB, privilege.RESTORE); err == nil {
+	if ok, err := p.HasPrivilege(ctx, parentDB, privilege.RESTORE, p.User()); err != nil {
+		return false, err
+	} else if ok {
 		return false, nil
 	}
 
@@ -1248,7 +1277,12 @@ func checkPrivilegesForRestore(
 	// error. In 22.2 we continue to check for old style privileges and role
 	// options.
 	if len(restoreStmt.Targets.Databases) > 0 {
-		hasRestoreSystemPrivilege := p.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.RESTORE, p.User()) == nil
+		var hasRestoreSystemPrivilege bool
+		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.RESTORE, p.User()); err != nil {
+			return err
+		} else {
+			hasRestoreSystemPrivilege = ok
+		}
 		if hasRestoreSystemPrivilege {
 			return checkRestoreDestinationPrivileges(ctx, p, from)
 		}
@@ -1287,18 +1321,16 @@ func checkClusterRegions(
 ) error {
 	regionSet := make(map[catpb.RegionName]struct{})
 	for _, typ := range typesByID {
-		typeDesc := typedesc.NewBuilder(typ.TypeDesc()).BuildImmutableType()
-		if typeDesc.GetKind() == descpb.TypeDescriptor_MULTIREGION_ENUM {
-			regionNames, err := typeDesc.RegionNames()
-			if err != nil {
-				return err
-			}
-			for _, region := range regionNames {
-				if _, ok := regionSet[region]; !ok {
-					regionSet[region] = struct{}{}
-				}
-			}
+		regionTypeDesc := typedesc.NewBuilder(typ.TypeDesc()).BuildImmutableType().AsRegionEnumTypeDescriptor()
+		if regionTypeDesc == nil {
+			continue
 		}
+		_ = regionTypeDesc.ForEachPublicRegion(func(name catpb.RegionName) error {
+			if _, ok := regionSet[name]; !ok {
+				regionSet[name] = struct{}{}
+			}
+			return nil
+		})
 	}
 
 	if len(regionSet) == 0 {
@@ -1344,6 +1376,7 @@ func doRestorePlan(
 	intoDB string,
 	newDBName string,
 	newTenantID *roachpb.TenantID,
+	newTenantName *roachpb.TenantName,
 	endTime hlc.Timestamp,
 	resultsCh chan<- tree.Datums,
 	subdir string,
@@ -1359,7 +1392,7 @@ func doRestorePlan(
 	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
 		// We do this before resolving the backup manifest since resolving the
 		// backup manifest can take a while.
-		if err := checkForConflictingDescriptors(ctx, p.ExecCfg()); err != nil {
+		if err := checkForConflictingDescriptors(ctx, p.InternalSQLTxn()); err != nil {
 			return err
 		}
 	}
@@ -1429,8 +1462,9 @@ func doRestorePlan(
 	}()
 
 	ioConf := baseStores[0].ExternalIOConf()
-	kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings, &ioConf,
-		p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
+	kmsEnv := backupencryption.MakeBackupKMSEnv(
+		p.ExecCfg().Settings, &ioConf, p.ExecCfg().InternalDB, p.User(),
+	)
 
 	var encryption *jobspb.BackupEncryptionOptions
 	if restoreStmt.Options.EncryptionPassphrase != nil {
@@ -1629,8 +1663,9 @@ func doRestorePlan(
 			if len(tenants) != 1 {
 				return errors.Errorf("%q option can only be used when restoring a single tenant", restoreOptAsTenant)
 			}
-			res, err := p.ExecCfg().InternalExecutor.QueryRow(
+			res, err := p.InternalSQLTxn().QueryRowEx(
 				ctx, "restore-lookup-tenant", p.Txn(),
+				sessiondata.NodeUserSessionDataOverride,
 				`SELECT active FROM system.tenants WHERE id = $1`, newTenantID.ToUint64(),
 			)
 			if err != nil {
@@ -1641,11 +1676,15 @@ func doRestorePlan(
 			}
 			old := roachpb.MustMakeTenantID(tenants[0].ID)
 			tenants[0].ID = newTenantID.ToUint64()
+			if newTenantName != nil {
+				tenants[0].Name = *newTenantName
+			}
 			oldTenantID = &old
 		} else {
 			for _, i := range tenants {
-				res, err := p.ExecCfg().InternalExecutor.QueryRow(
+				res, err := p.InternalSQLTxn().QueryRowEx(
 					ctx, "restore-lookup-tenant", p.Txn(),
+					sessiondata.NodeUserSessionDataOverride,
 					`SELECT active FROM system.tenants WHERE id = $1`, i.ID,
 				)
 				if err != nil {
@@ -1716,7 +1755,7 @@ func doRestorePlan(
 	// This is done so that they can be restored the same way any other user
 	// defined database would be restored from the backup.
 	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
-		if err := dropDefaultUserDBs(ctx, p.ExecCfg()); err != nil {
+		if err := dropDefaultUserDBs(ctx, p.InternalSQLTxn()); err != nil {
 			return err
 		}
 	}
@@ -1854,7 +1893,8 @@ func doRestorePlan(
 		// We do not wait for the job to finish.
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
 		_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
-			ctx, jr, jobID, p.Txn())
+			ctx, jr, jobID, p.InternalSQLTxn(),
+		)
 		if err != nil {
 			return err
 		}
@@ -1881,7 +1921,7 @@ func doRestorePlan(
 			}
 		}()
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
-		if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, plannerTxn, jr); err != nil {
+		if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, p.InternalSQLTxn(), jr); err != nil {
 			return err
 		}
 
@@ -1893,6 +1933,19 @@ func doRestorePlan(
 	}(); err != nil {
 		return err
 	}
+	// Release all descriptor leases here. We need to do this because we're
+	// about to kick off a job which is going to potentially rewrite every
+	// descriptor. Note that we committed the underlying transaction in the
+	// above closure -- so we're not using any leases anymore, but we might
+	// be holding some because some sql queries might have been executed by
+	// this transaction (indeed some certainly were when we created the job
+	// we're going to run).
+	//
+	// This is all a bit of a hack to deal with the fact that we want to
+	// return results as part of this statement and the usual machinery for
+	// releasing leases assumes that that does not happen during statement
+	// execution.
+	p.InternalSQLTxn().Descriptors().ReleaseAll(ctx)
 	collectRestoreTelemetry(ctx, sj.ID(), restoreDetails, intoDB, newDBName, subdir, restoreStmt,
 		descsByTablePattern, restoreDBs, asOfInterval, debugPauseOn, p.SessionData().ApplicationName)
 	if err := sj.Start(ctx); err != nil {
@@ -1936,19 +1989,13 @@ func collectRestoreTelemetry(
 // create a conflict when doing a full cluster restore.
 //
 // Because we remap all descriptors, we only care about namespace conflicts.
-func checkForConflictingDescriptors(ctx context.Context, execCfg *sql.ExecutorConfig) error {
+func checkForConflictingDescriptors(ctx context.Context, txn descs.Txn) error {
 	var allDescs []catalog.Descriptor
-	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-		txn.SetDebugName("count-user-descs")
-		all, err := col.GetAllDescriptors(ctx, txn)
-		if err != nil {
-			return err
-		}
-		allDescs = all.OrderedDescriptors()
-		return err
-	}); err != nil {
+	all, err := txn.Descriptors().GetAllDescriptors(ctx, txn.KV())
+	if err != nil {
 		return errors.Wrap(err, "looking up user descriptors during restore")
 	}
+	allDescs = all.OrderedDescriptors()
 	if allUserDescs := filteredUserCreatedDescriptors(allDescs); len(allUserDescs) > 0 {
 		userDescriptorNames := make([]string, 0, 20)
 		for i, desc := range allUserDescs {

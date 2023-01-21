@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -119,6 +120,8 @@ type SQLServerWrapper struct {
 
 	// promRuleExporter is used by the tenant to expose the prometheus rules.
 	promRuleExporter *metric.PrometheusRuleExporter
+
+	tenantTimeSeries *ts.TenantServer
 }
 
 // Drain idempotently activates the draining mode.
@@ -148,7 +151,12 @@ func (s *SQLServerWrapper) Drain(
 // The caller is responsible for listening to the server's ShutdownRequested()
 // channel and stopping cfg.stopper when signaled.
 func NewTenantServer(
-	ctx context.Context, stopper *stop.Stopper, baseCfg BaseConfig, sqlCfg SQLConfig,
+	ctx context.Context,
+	stopper *stop.Stopper,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	parentRecorder *status.MetricsRecorder,
+	tenantNameContainer *roachpb.TenantNameContainer,
 ) (*SQLServerWrapper, error) {
 	// TODO(knz): Make the license application a per-server thing
 	// instead of a global thing.
@@ -161,7 +169,7 @@ func NewTenantServer(
 	// for a tenant server.
 	baseCfg.idProvider.SetTenant(sqlCfg.TenantID)
 
-	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg)
+	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +313,7 @@ func NewTenantServer(
 	)
 
 	// Connect the various servers to RPC.
-	for _, gw := range []grpcGatewayServer{sAdmin, sStatus, sAuth} {
+	for _, gw := range []grpcGatewayServer{sAdmin, sStatus, sAuth, args.tenantTimeSeriesServer} {
 		gw.RegisterService(args.grpc.Server)
 	}
 
@@ -357,6 +365,7 @@ func NewTenantServer(
 		externalStorageBuilder: args.externalStorageBuilder,
 		costController:         args.costController,
 		promRuleExporter:       args.promRuleExporter,
+		tenantTimeSeries:       args.tenantTimeSeriesServer,
 	}, nil
 }
 
@@ -401,7 +410,6 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	ieMon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
 	ieMon.StartNoReserved(ctx, s.PGServer().SQLServer.GetBytesMonitor())
 	s.stopper.AddCloser(stop.CloserFn(func() { ieMon.Stop(ctx) }))
-	fileTableInternalExecutor := sql.MakeInternalExecutor(s.PGServer().SQLServer, sql.MemoryMetrics{}, ieMon)
 	s.externalStorageBuilder.init(
 		ctx,
 		s.sqlCfg.ExternalIODirConfig,
@@ -409,9 +417,8 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		s.sqlServer.cfg.IDContainer,
 		s.nodeDialer,
 		s.sqlServer.cfg.TestingKnobs,
-		&fileTableInternalExecutor,
-		s.sqlServer.execCfg.InternalExecutorFactory,
-		s.db,
+		s.sqlServer.execCfg.InternalDB.
+			CloneWithMemoryMonitor(sql.MemoryMetrics{}, ieMon),
 		s.costController,
 		s.registry,
 	)
@@ -459,7 +466,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	}
 
 	// Connect the various RPC handlers to the gRPC gateway.
-	for _, gw := range []grpcGatewayServer{s.tenantAdmin, s.tenantStatus, s.authentication} {
+	for _, gw := range []grpcGatewayServer{s.tenantAdmin, s.tenantStatus, s.authentication, s.tenantTimeSeries} {
 		if err := gw.RegisterGateway(gwCtx, gwMux, conn); err != nil {
 			return err
 		}
@@ -781,7 +788,12 @@ func (s *SQLServerWrapper) ShutdownRequested() <-chan ShutdownRequest {
 }
 
 func makeTenantSQLServerArgs(
-	startupCtx context.Context, stopper *stop.Stopper, baseCfg BaseConfig, sqlCfg SQLConfig,
+	startupCtx context.Context,
+	stopper *stop.Stopper,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	parentRecorder *status.MetricsRecorder,
+	tenantNameContainer *roachpb.TenantNameContainer,
 ) (sqlServerArgs, error) {
 	st := baseCfg.Settings
 
@@ -811,6 +823,15 @@ func makeTenantSQLServerArgs(
 		Settings:         st,
 		Knobs:            rpcTestingKnobs,
 	})
+	// If there is a local KV server, hook this SQLServer to it so that the
+	// SQLServer can perform some RPCs directly, without going through gRPC.
+	if lsi := sqlCfg.LocalKVServerInfo; lsi != nil {
+		rpcContext.SetLocalInternalServer(
+			lsi.InternalServer,
+			true, // tenant
+			lsi.ServerInterceptors,
+			rpcContext.ClientInterceptors())
+	}
 
 	var dsKnobs kvcoord.ClientTestingKnobs
 	if dsKnobsP, ok := baseCfg.TestingKnobs.KVClient.(*kvcoord.ClientTestingKnobs); ok {
@@ -884,37 +905,49 @@ func makeTenantSQLServerArgs(
 		return sqlServerArgs{}, err
 	}
 
+	sTS := ts.MakeTenantServer(baseCfg.AmbientCtx, tenantConnect)
+
 	systemConfigWatcher := systemconfigwatcher.NewWithAdditionalProvider(
 		keys.MakeSQLCodec(sqlCfg.TenantID), clock, rangeFeedFactory, &baseCfg.DefaultZoneConfig,
 		tenantConnect,
 	)
 
+	// Define structures which have circular dependencies. The underlying structures
+	// will be filled in during the construction of the sql server.
 	circularInternalExecutor := &sql.InternalExecutor{}
-	internalExecutorFactory := &sql.InternalExecutorFactory{}
+	internalExecutorFactory := sql.NewShimInternalDB(db)
 	circularJobRegistry := &jobs.Registry{}
 
 	// Initialize the protectedts subsystem in multi-tenant clusters.
 	var protectedTSProvider protectedts.Provider
 	protectedtsKnobs, _ := baseCfg.TestingKnobs.ProtectedTS.(*protectedts.TestingKnobs)
 	pp, err := ptprovider.New(ptprovider.Config{
-		DB:               db,
-		InternalExecutor: circularInternalExecutor,
-		Settings:         st,
-		Knobs:            protectedtsKnobs,
+		DB:       internalExecutorFactory,
+		Settings: st,
+		Knobs:    protectedtsKnobs,
 		ReconcileStatusFuncs: ptreconcile.StatusFuncs{
 			jobsprotectedts.GetMetaType(jobsprotectedts.Jobs): jobsprotectedts.MakeStatusFunc(
-				circularJobRegistry, circularInternalExecutor, jobsprotectedts.Jobs),
+				circularJobRegistry, jobsprotectedts.Jobs,
+			),
 			jobsprotectedts.GetMetaType(jobsprotectedts.Schedules): jobsprotectedts.MakeStatusFunc(
-				circularJobRegistry, circularInternalExecutor, jobsprotectedts.Schedules),
+				circularJobRegistry, jobsprotectedts.Schedules,
+			),
 		},
 	})
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
 	registry.AddMetricStruct(pp.Metrics())
-	protectedTSProvider = tenantProtectedTSProvider{Provider: pp, st: st}
+	protectedTSProvider = pp
 
-	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st)
+	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st, tenantNameContainer)
+	// Note: If the tenant is in-process, we attach this tenant's metric
+	// recorder to the parentRecorder held by the system tenant. This
+	// ensures that generated Prometheus metrics from the system tenant
+	// include metrics from this in-process tenant.
+	if parentRecorder != nil {
+		parentRecorder.AddTenantRecorder(recorder)
+	}
 
 	runtime := status.NewRuntimeStatSampler(startupCtx, clock)
 	registry.AddMetricStruct(runtime)
@@ -993,7 +1026,7 @@ func makeTenantSQLServerArgs(
 		sessionRegistry:          sessionRegistry,
 		remoteFlowRunner:         remoteFlowRunner,
 		circularInternalExecutor: circularInternalExecutor,
-		internalExecutorFactory:  internalExecutorFactory,
+		internalDB:               internalExecutorFactory,
 		circularJobRegistry:      circularJobRegistry,
 		protectedtsProvider:      protectedTSProvider,
 		rangeFeedFactory:         rangeFeedFactory,
@@ -1005,6 +1038,7 @@ func makeTenantSQLServerArgs(
 		externalStorageBuilder:   esb,
 		admissionPacerFactory:    noopElasticCPUGrantCoord,
 		rangeDescIteratorFactory: tenantConnect,
+		tenantTimeSeriesServer:   sTS,
 	}, nil
 }
 

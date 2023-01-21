@@ -32,7 +32,7 @@ type walkCtx struct {
 	desc                 catalog.Descriptor
 	ev                   ElementVisitor
 	lookupFn             func(id catid.DescID) catalog.Descriptor
-	cachedTypeIDClosures map[catid.DescID]map[catid.DescID]struct{}
+	cachedTypeIDClosures map[catid.DescID]catalog.DescriptorIDSet
 	backRefs             catalog.DescriptorIDSet
 	commentReader        CommentGetter
 	zoneConfigReader     ZoneConfigGetter
@@ -70,7 +70,7 @@ func WalkDescriptor(
 		desc:                 desc,
 		ev:                   ev,
 		lookupFn:             lookupFn,
-		cachedTypeIDClosures: make(map[catid.DescID]map[catid.DescID]struct{}),
+		cachedTypeIDClosures: make(map[catid.DescID]catalog.DescriptorIDSet),
 		commentReader:        commentReader,
 		zoneConfigReader:     zoneConfigReader,
 	}
@@ -166,52 +166,42 @@ func (w *walkCtx) walkSchema(sc catalog.SchemaDescriptor) {
 }
 
 func (w *walkCtx) walkType(typ catalog.TypeDescriptor) {
-	switch typ.GetKind() {
-	case descpb.TypeDescriptor_ALIAS:
-		typeT, err := newTypeT(typ.TypeDesc().Alias)
-		if err != nil {
-			panic(errors.NewAssertionErrorWithWrappedErrf(err, "alias type %q (%d)",
-				typ.GetName(), typ.GetID()))
-		}
+	if alias := typ.AsAliasTypeDescriptor(); alias != nil {
+		typeT := newTypeT(alias.Aliased())
 		w.ev(descriptorStatus(typ), &scpb.AliasType{
 			TypeID: typ.GetID(),
 			TypeT:  *typeT,
 		})
-	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
-		w.ev(descriptorStatus(typ), &scpb.EnumType{
-			TypeID:        typ.GetID(),
-			ArrayTypeID:   typ.GetArrayTypeID(),
-			IsMultiRegion: typ.GetKind() == descpb.TypeDescriptor_MULTIREGION_ENUM,
+	} else if enum := typ.AsEnumTypeDescriptor(); enum != nil {
+		w.ev(descriptorStatus(enum), &scpb.EnumType{
+			TypeID:        enum.GetID(),
+			ArrayTypeID:   enum.GetArrayTypeID(),
+			IsMultiRegion: enum.AsRegionEnumTypeDescriptor() != nil,
 		})
-		for ord := 0; ord < typ.NumEnumMembers(); ord++ {
-			w.ev(descriptorStatus(typ), &scpb.EnumTypeValue{
-				TypeID:                 typ.GetID(),
-				PhysicalRepresentation: typ.GetMemberPhysicalRepresentation(ord),
-				LogicalRepresentation:  typ.GetMemberLogicalRepresentation(ord),
+		for ord := 0; ord < enum.NumEnumMembers(); ord++ {
+			w.ev(descriptorStatus(enum), &scpb.EnumTypeValue{
+				TypeID:                 enum.GetID(),
+				PhysicalRepresentation: enum.GetMemberPhysicalRepresentation(ord),
+				LogicalRepresentation:  enum.GetMemberLogicalRepresentation(ord),
 			})
 		}
-	case descpb.TypeDescriptor_COMPOSITE:
+	} else if comp := typ.AsCompositeTypeDescriptor(); comp != nil {
 		w.ev(descriptorStatus(typ), &scpb.CompositeType{
-			TypeID:      typ.GetID(),
-			ArrayTypeID: typ.GetArrayTypeID(),
+			TypeID:      comp.GetID(),
+			ArrayTypeID: comp.GetArrayTypeID(),
 		})
-		composite := typ.TypeDesc().Composite
-		for _, e := range composite.Elements {
-			typeT, err := newTypeT(e.ElementType)
-			if err != nil {
-				panic(errors.NewAssertionErrorWithWrappedErrf(err, "alias type %q (%d)",
-					typ.GetName(), typ.GetID()))
-			}
+		for i := 0; i < comp.NumElements(); i++ {
+			typeT := newTypeT(comp.GetElementType(i))
 			w.ev(descriptorStatus(typ), &scpb.CompositeTypeAttrType{
 				CompositeTypeID: typ.GetID(),
 				TypeT:           *typeT,
 			})
 			w.ev(descriptorStatus(typ), &scpb.CompositeTypeAttrName{
 				CompositeTypeID: typ.GetID(),
-				Name:            e.ElementLabel,
+				Name:            comp.GetElementLabel(i),
 			})
 		}
-	default:
+	} else {
 		panic(errors.AssertionFailedf("unsupported type kind %q", typ.GetKind()))
 	}
 	w.ev(scpb.Status_PUBLIC, &scpb.ObjectParent{
@@ -440,8 +430,7 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 			}
 			return nil
 		})
-		typeT, err := newTypeT(col.GetType())
-		onErrPanic(err)
+		typeT := newTypeT(col.GetType())
 		columnType.TypeT = *typeT
 
 		if col.IsComputed() {

@@ -16,8 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedvalidators"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -81,8 +82,6 @@ func alterChangefeedPlanHook(
 		return nil, nil, nil, false, nil
 	}
 
-	lockForUpdate := false
-
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		if err := validateSettings(ctx, p); err != nil {
 			return err
@@ -94,9 +93,15 @@ func alterChangefeedPlanHook(
 		}
 		jobID := jobspb.JobID(tree.MustBeDInt(typedExpr))
 
-		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.Txn())
+		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.InternalSQLTxn())
 		if err != nil {
 			err = errors.Wrapf(err, `could not load job with job id %d`, jobID)
+			return err
+		}
+
+		jobPayload := job.Payload()
+
+		if err := jobsauth.Authorize(ctx, p, jobID, &jobPayload, jobsauth.ControlAccess); err != nil {
 			return err
 		}
 
@@ -123,11 +128,12 @@ func alterChangefeedPlanHook(
 			return err
 		}
 
-		newTargets, newProgress, newStatementTime, originalSpecs, err := generateNewTargets(
+		newTargets, newProgress, newStatementTime, originalSpecs, err := generateAndValidateNewTargets(
 			ctx, exprEval, p,
 			alterChangefeedStmt.Cmds,
 			newOptions.AsMap(), // TODO: Remove .AsMap()
 			prevDetails, job.Progress(),
+			newSinkURI,
 		)
 		if err != nil {
 			return err
@@ -187,17 +193,19 @@ func alterChangefeedPlanHook(
 		newPayload.Description = jobRecord.Description
 		newPayload.DescriptorIDs = jobRecord.DescriptorIDs
 
-		err = p.ExecCfg().JobRegistry.UpdateJobWithTxn(ctx, jobID, p.Txn(), lockForUpdate, func(
-			txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		j, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.InternalSQLTxn())
+		if err != nil {
+			return err
+		}
+		if err := j.WithTxn(p.InternalSQLTxn()).Update(ctx, func(
+			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 		) error {
 			ju.UpdatePayload(&newPayload)
 			if newProgress != nil {
 				ju.UpdateProgress(newProgress)
 			}
 			return nil
-		})
-
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 
@@ -320,7 +328,7 @@ func generateNewOpts(
 	return changefeedbase.MakeStatementOptions(newOptions), sinkURI, nil
 }
 
-func generateNewTargets(
+func generateAndValidateNewTargets(
 	ctx context.Context,
 	exprEval exprutil.Evaluator,
 	p sql.PlanHookState,
@@ -328,6 +336,7 @@ func generateNewTargets(
 	opts map[string]string,
 	prevDetails jobspb.ChangefeedDetails,
 	prevProgress jobspb.Progress,
+	sinkURI string,
 ) (
 	tree.ChangefeedTargets,
 	*jobspb.Progress,
@@ -490,6 +499,7 @@ func generateNewTargets(
 			existingTargetSpans := fetchSpansForDescs(p, existingTargetDescs)
 			var newTargetDescs []catalog.Descriptor
 			for _, target := range v.Targets {
+
 				desc, found, err := getTargetDesc(ctx, p, descResolver, target.TableName)
 				if err != nil {
 					return nil, nil, hlc.Timestamp{}, nil, err
@@ -501,6 +511,7 @@ func generateNewTargets(
 						tree.ErrString(&target),
 					)
 				}
+
 				k := targetKey{TableID: desc.GetID(), FamilyName: target.FamilyName}
 				newTargets[k] = target
 				newTableDescs[desc.GetID()] = desc
@@ -546,6 +557,7 @@ func generateNewTargets(
 						tree.ErrString(&target),
 					)
 				}
+				newTableDescs[desc.GetID()] = desc
 				delete(newTargets, k)
 			}
 			telemetry.CountBucketed(telemetryPath+`.dropped_targets`, int64(len(v.Targets)))
@@ -578,6 +590,20 @@ func generateNewTargets(
 
 	for _, target := range newTargets {
 		newTargetList = append(newTargetList, target)
+	}
+
+	hasSelectPrivOnAllTables := true
+	hasChangefeedPrivOnAllTables := true
+	for _, desc := range newTableDescs {
+		hasSelect, hasChangefeed, err := checkPrivilegesForDescriptor(ctx, p, desc)
+		if err != nil {
+			return nil, nil, hlc.Timestamp{}, nil, err
+		}
+		hasSelectPrivOnAllTables = hasSelectPrivOnAllTables && hasSelect
+		hasChangefeedPrivOnAllTables = hasChangefeedPrivOnAllTables && hasChangefeed
+	}
+	if err := authorizeUserToCreateChangefeed(ctx, p, sinkURI, hasSelectPrivOnAllTables, hasChangefeedPrivOnAllTables); err != nil {
+		return nil, nil, hlc.Timestamp{}, nil, err
 	}
 
 	if err := validateNewTargets(ctx, p, newTargetList, newJobProgress, newJobStatementTime); err != nil {

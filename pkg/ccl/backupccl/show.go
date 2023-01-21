@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -317,8 +318,12 @@ func showBackupPlanHook(
 			defer encStore.Close()
 		}
 		var encryption *jobspb.BackupEncryptionOptions
-		kmsEnv := backupencryption.MakeBackupKMSEnv(p.ExecCfg().Settings,
-			&p.ExecCfg().ExternalIODirConfig, p.ExecCfg().DB, p.User(), p.ExecCfg().InternalExecutor)
+		kmsEnv := backupencryption.MakeBackupKMSEnv(
+			p.ExecCfg().Settings,
+			&p.ExecCfg().ExternalIODirConfig,
+			p.ExecCfg().InternalDB,
+			p.User(),
+		)
 		showEncErr := `If you are running SHOW BACKUP exclusively on an incremental backup, 
 you must pass the 'encryption_info_dir' parameter that points to the directory of your full backup`
 		if passphrase, ok := opts[backupencryption.BackupOptEncPassphrase]; ok {
@@ -1060,30 +1065,27 @@ func showRegions(typeDesc catalog.TypeDescriptor, dbname string) (string, error)
 	if typeDesc == nil {
 		return "", fmt.Errorf("type descriptor for %s is nil", dbname)
 	}
-
-	primaryRegionName, err := typeDesc.PrimaryRegionName()
-	if err != nil {
-		return "", err
+	r := typeDesc.AsRegionEnumTypeDescriptor()
+	if r == nil {
+		return "", fmt.Errorf("type descriptor for %s is of kind %s", dbname, typeDesc.GetKind())
 	}
+
 	regionsStringBuilder.WriteString("ALTER DATABASE ")
 	regionsStringBuilder.WriteString(dbname)
 	regionsStringBuilder.WriteString(" SET PRIMARY REGION ")
-	regionsStringBuilder.WriteString("\"" + primaryRegionName.String() + "\"")
+	regionsStringBuilder.WriteString("\"" + r.PrimaryRegion().String() + "\"")
 	regionsStringBuilder.WriteString(";")
 
-	regionNames, err := typeDesc.RegionNames()
-	if err != nil {
-		return "", err
-	}
-	for _, regionName := range regionNames {
-		if regionName != primaryRegionName {
+	_ = r.ForEachPublicRegion(func(regionName catpb.RegionName) error {
+		if regionName != r.PrimaryRegion() {
 			regionsStringBuilder.WriteString(" ALTER DATABASE ")
 			regionsStringBuilder.WriteString(dbname)
 			regionsStringBuilder.WriteString(" ADD REGION ")
 			regionsStringBuilder.WriteString("\"" + regionName.String() + "\"")
 			regionsStringBuilder.WriteString(";")
 		}
-	}
+		return nil
+	})
 	return regionsStringBuilder.String(), nil
 }
 

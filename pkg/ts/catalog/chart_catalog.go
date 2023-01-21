@@ -1624,6 +1624,10 @@ var charts = []sectionDescription{
 				Metrics: []string{"streaming.frontier_checkpoint_span_count"},
 			},
 			{
+				Title:   "Frontier Lag",
+				Metrics: []string{"streaming.frontier_lag_seconds"},
+			},
+			{
 				Title:   "Job Progress Updates",
 				Metrics: []string{"streaming.job_progress_updates"},
 			},
@@ -3730,6 +3734,21 @@ var charts = []sectionDescription{
 					"admission.granter.used_soft_slots.kv",
 					"admission.granter.used_slots.sql-leaf-start",
 					"admission.granter.used_slots.sql-root-start",
+				},
+			},
+			{
+				Title: "Granter Slot Counters",
+				Metrics: []string{
+					"admission.granter.slot_adjuster_increments.kv",
+					"admission.granter.slot_adjuster_decrements.kv",
+				},
+			},
+			{
+				Title: "Granter Slot Durations",
+				Metrics: []string{
+					"admission.granter.slots_exhausted_duration.kv",
+					"admission.granter.cpu_load_short_period_duration.kv",
+					"admission.granter.cpu_load_long_period_duration.kv",
 				},
 			},
 			{

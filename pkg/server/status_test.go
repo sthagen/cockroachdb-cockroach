@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -675,14 +676,14 @@ func TestStatusLocalLogsTenantFilter(t *testing.T) {
 	defer ts.Stopper().Stop(context.Background())
 
 	ctxSysTenant := context.Background()
-	ctxSysTenant = context.WithValue(ctxSysTenant, log.ServerIdentificationContextKey{}, &idProvider{
+	ctxSysTenant = context.WithValue(ctxSysTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
 		tenantID:  roachpb.SystemTenantID,
 		clusterID: &base.ClusterIDContainer{},
 		serverID:  &base.NodeIDContainer{},
 	})
 	appTenantID := roachpb.MustMakeTenantID(uint64(2))
 	ctxAppTenant := context.Background()
-	ctxAppTenant = context.WithValue(ctxAppTenant, log.ServerIdentificationContextKey{}, &idProvider{
+	ctxAppTenant = context.WithValue(ctxAppTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
 		tenantID:  appTenantID,
 		clusterID: &base.ClusterIDContainer{},
 		serverID:  &base.NodeIDContainer{},
@@ -1309,20 +1310,20 @@ func TestStatusVarsTxnMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_begin_count 1")) {
-		t.Errorf("expected `sql_txn_begin_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_begin_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_txn_begin_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_count 1")) {
-		t.Errorf("expected `sql_restart_savepoint_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count 1")) {
-		t.Errorf("expected `sql_restart_savepoint_release_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_release_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_commit_count 1")) {
-		t.Errorf("expected `sql_txn_commit_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_commit_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_txn_commit_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_rollback_count 0")) {
-		t.Errorf("expected `sql_txn_rollback_count 0`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_rollback_count{tenant=\"system\"} 0")) {
+		t.Errorf("expected `sql_txn_rollback_count{tenant=\"system\"} 0`, got: %s", body)
 	}
 }
 

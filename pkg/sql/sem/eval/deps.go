@@ -65,9 +65,9 @@ type DatabaseCatalog interface {
 	// whether it exists.
 	SchemaExists(ctx context.Context, dbName, scName string) (found bool, err error)
 
-	// HasAnyPrivilege returns whether the current user has privilege to access
-	// the given object.
-	HasAnyPrivilege(ctx context.Context, specifier HasPrivilegeSpecifier, user username.SQLUsername, privs []privilege.Privilege) (HasAnyPrivilegeResult, error)
+	// HasAnyPrivilegeForSpecifier returns whether the current user has privilege
+	// to access the given object.
+	HasAnyPrivilegeForSpecifier(ctx context.Context, specifier HasPrivilegeSpecifier, user username.SQLUsername, privs []privilege.Privilege) (HasAnyPrivilegeResult, error)
 }
 
 // CastFunc is a function which cases a datum to a given type.
@@ -357,13 +357,16 @@ type Planner interface {
 	// statements, SELECT, UPDATE, INSERT, DELETE, or an EXPLAIN of one of these
 	// statements.
 	IsANSIDML() bool
+
+	// GetRangeDescByID gets the RangeDescriptor by the specified RangeID.
+	GetRangeDescByID(context.Context, roachpb.RangeID) (roachpb.RangeDescriptor, error)
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
 // executor. It provides access to the rows from a query.
 // InternalRows is a copy of the one in sql/internal.go excluding the
 // Types function - we don't need the Types function for use cases where
-// QueryIteratorEx is used from the InternalExecutor on the Planner.
+// QueryIteratorEx is used from the Executor on the Planner.
 // Furthermore, we cannot include the Types function due to a cyclic
 // dependency on colinfo.ResultColumns - we cannot import colinfo in tree.
 type InternalRows interface {
@@ -536,39 +539,21 @@ type ChangefeedState interface {
 // builtin functions to create, configure, and destroy tenants. The methods will
 // return errors when run by any tenant other than the system tenant.
 type TenantOperator interface {
-	// CreateTenantWithID attempts to install a new tenant in the system, with the
-	// provided tenantID. It returns an error if the tenant already exists. The
-	// new tenant is created at the current active version of the cluster
-	// performing the create.
-	CreateTenantWithID(ctx context.Context, tenantID uint64, tenantName roachpb.TenantName) error
+	// CreateTenant attempts to create a new secondary tenant.
+	CreateTenant(ctx context.Context, parameters string) (roachpb.TenantID, error)
 
-	// CreateTenant attempts to install a new tenant in the system and returns the
-	// ID that is assigned to the tenant. It returns an error if another tenant
-	// with `tenantName` already exists. The new tenant is created at the current
-	// active version of the cluster performing the create.
-	CreateTenant(ctx context.Context, tenantName roachpb.TenantName) (roachpb.TenantID, error)
-
-	// RenameTenant renames the specified tenant. An error is returned if
-	// the tenant does not exist or the name is already taken.
-	RenameTenant(ctx context.Context, tenantID uint64, tenantName roachpb.TenantName) error
-
-	// DestroyTenantByID attempts to uninstall an existing tenant from the system.
+	// DropTenantByID attempts to uninstall an existing tenant from the system.
 	// It returns an error if the tenant does not exist. If synchronous is true
 	// the gc job will not wait for a GC ttl.
-	DestroyTenantByID(ctx context.Context, tenantID uint64, synchronous bool) error
-
-	// DestroyTenant attempts to uninstall an existing tenant from the system.
-	// It returns an error if the tenant does not exist. If synchronous is true
-	// the gc job will not wait for a GC ttl.
-	DestroyTenant(ctx context.Context, tenantName roachpb.TenantName, synchronous bool) error
+	DropTenantByID(ctx context.Context, tenantID uint64, synchronous bool) error
 
 	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
 	// success it also removes the tenant record.
 	// It returns an error if the tenant does not exist.
 	GCTenant(ctx context.Context, tenantID uint64) error
 
-	// GetTenantInfo returns information about the specified tenant.
-	GetTenantInfo(ctx context.Context, tenantName roachpb.TenantName) (*descpb.TenantInfo, error)
+	// LookupTenantID returns the ID for the given tenant name.o
+	LookupTenantID(ctx context.Context, tenantName roachpb.TenantName) (roachpb.TenantID, error)
 
 	// UpdateTenantResourceLimits reconfigures the tenant resource limits.
 	// See multitenant.TenantUsageServer for more details on the arguments.

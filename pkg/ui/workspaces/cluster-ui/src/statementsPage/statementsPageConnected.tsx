@@ -28,6 +28,7 @@ import {
   selectDatabases,
   selectLastReset,
   selectStatements,
+  selectStatementsDataValid,
   selectStatementsLastError,
   selectTotalFingerprints,
   selectColumns,
@@ -40,6 +41,7 @@ import { selectTimeScale } from "../store/utils/selectors";
 import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
 } from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
 import { StatementsRequest } from "src/api/statementsApi";
@@ -58,7 +60,6 @@ import {
 } from "./recentStatementsPage.selectors";
 import {
   InsertStmtDiagnosticRequest,
-  SqlExecutionRequest,
   StatementDiagnosticsReport,
 } from "../api";
 
@@ -89,11 +90,13 @@ export const ConnectedStatementsPage = withRouter(
         filters: selectFilters(state),
         isTenant: selectIsTenant(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+        hasAdminRole: selectHasAdminRole(state),
         lastReset: selectLastReset(state),
         nodeRegions: nodeRegionsByIDSelector(state),
         search: selectSearch(state),
         sortSetting: selectSortSetting(state),
         statements: selectStatements(state, props),
+        isDataValid: selectStatementsDataValid(state),
         lastUpdated: selectStatementsLastUpdated(state),
         statementsError: selectStatementsLastError(state),
         totalFingerprints: selectTotalFingerprints(state),

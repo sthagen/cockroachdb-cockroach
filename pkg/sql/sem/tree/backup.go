@@ -137,6 +137,7 @@ type RestoreOptions struct {
 	NewDBName                 Expr
 	IncrementalStorage        StringOrPlaceholderOptList
 	AsTenant                  Expr
+	ForceTenantID             Expr
 	SchemaOnly                bool
 	VerifyData                bool
 }
@@ -272,9 +273,12 @@ func (o *BackupOptions) Format(ctx *FmtCtx) {
 		}
 	}
 
-	if o.Detached == DBoolTrue {
+	if o.Detached != nil {
 		maybeAddSep()
 		ctx.WriteString("detached")
+		if o.Detached != DBoolTrue {
+			ctx.WriteString(" = FALSE")
+		}
 	}
 
 	if o.EncryptionKMSURI != nil {
@@ -334,7 +338,8 @@ func (o *BackupOptions) CombineWith(other *BackupOptions) error {
 func (o BackupOptions) IsDefault() bool {
 	options := BackupOptions{}
 	return o.CaptureRevisionHistory == options.CaptureRevisionHistory &&
-		o.Detached == options.Detached && cmp.Equal(o.EncryptionKMSURI, options.EncryptionKMSURI) &&
+		o.Detached == options.Detached &&
+		cmp.Equal(o.EncryptionKMSURI, options.EncryptionKMSURI) &&
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
 		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage)
 }
@@ -416,9 +421,16 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 
 	if o.AsTenant != nil {
 		maybeAddSep()
-		ctx.WriteString("tenant = ")
+		ctx.WriteString("tenant_name = ")
 		ctx.FormatNode(o.AsTenant)
 	}
+
+	if o.ForceTenantID != nil {
+		maybeAddSep()
+		ctx.WriteString("tenant = ")
+		ctx.FormatNode(o.ForceTenantID)
+	}
+
 	if o.SchemaOnly {
 		maybeAddSep()
 		ctx.WriteString("schema_only")
@@ -519,6 +531,12 @@ func (o *RestoreOptions) CombineWith(other *RestoreOptions) error {
 	if o.AsTenant == nil {
 		o.AsTenant = other.AsTenant
 	} else if other.AsTenant != nil {
+		return errors.New("tenant_name option specified multiple times")
+	}
+
+	if o.ForceTenantID == nil {
+		o.ForceTenantID = other.ForceTenantID
+	} else if other.ForceTenantID != nil {
 		return errors.New("tenant option specified multiple times")
 	}
 
@@ -555,6 +573,7 @@ func (o RestoreOptions) IsDefault() bool {
 		o.NewDBName == options.NewDBName &&
 		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage) &&
 		o.AsTenant == options.AsTenant &&
+		o.ForceTenantID == options.ForceTenantID &&
 		o.SchemaOnly == options.SchemaOnly &&
 		o.VerifyData == options.VerifyData
 }

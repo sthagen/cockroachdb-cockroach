@@ -264,7 +264,7 @@ func createTestStoreWithoutStart(
 		cv = clusterversion.ClusterVersion{Version: opts.bootstrapVersion}
 	}
 	require.NoError(t, WriteClusterVersion(ctx, eng, cv))
-	if err := InitEngine(
+	if err := kvstorage.InitEngine(
 		ctx, eng, storeIdent,
 	); err != nil {
 		t.Fatal(err)
@@ -490,7 +490,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 	stopper.AddCloser(eng)
 
 	// Bootstrap should fail if engine has no cluster version yet.
-	err := InitEngine(ctx, eng, testIdent)
+	err := kvstorage.InitEngine(ctx, eng, testIdent)
 	require.ErrorContains(t, err, "no cluster version")
 
 	require.NoError(t, WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
@@ -507,7 +507,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 	require.ErrorIs(t, err, &kvstorage.NotBootstrappedError{})
 
 	// Bootstrap should fail on non-empty engine.
-	err = InitEngine(ctx, eng, testIdent)
+	err = kvstorage.InitEngine(ctx, eng, testIdent)
 	require.ErrorContains(t, err, "cannot be bootstrapped")
 
 	// Bootstrap should fail on MVCC range key in engine.
@@ -517,7 +517,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 		Timestamp: hlc.MinTimestamp,
 	}, storage.MVCCValue{}))
 
-	err = InitEngine(ctx, eng, testIdent)
+	err = kvstorage.InitEngine(ctx, eng, testIdent)
 	require.ErrorContains(t, err, "found mvcc range key")
 }
 
@@ -3404,7 +3404,9 @@ func TestAllocatorCheckRangeUnconfigured(t *testing.T) {
 		tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 		s := tc.store
 
-		action, _, _, err := s.AllocatorCheckRange(ctx, tc.repl.Desc(), nil /* overrideStorePool */)
+		action, _, _, err := s.AllocatorCheckRange(ctx, tc.repl.Desc(),
+			false /* collectTraces */, nil, /* overrideStorePool */
+		)
 		require.Error(t, err)
 
 		if confAvailable {
@@ -3554,7 +3556,9 @@ func TestAllocatorCheckRange(t *testing.T) {
 			}
 
 			// Execute actual allocator range repair check.
-			action, target, recording, err := s.AllocatorCheckRange(ctx, desc, storePoolOverride)
+			action, target, recording, err := s.AllocatorCheckRange(ctx, desc,
+				true /* collectTraces */, storePoolOverride,
+			)
 
 			// Validate expectations from test case.
 			if tc.expectErr || tc.expectAllocatorErr {

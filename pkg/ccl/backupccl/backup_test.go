@@ -80,11 +80,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
@@ -643,9 +643,7 @@ func TestBackupRestoreAppend(t *testing.T) {
 				tc.Servers[0].ClusterSettings(),
 				blobs.TestEmptyBlobClientFactory,
 				username.RootUserName(),
-				tc.Servers[0].InternalExecutor().(*sql.InternalExecutor),
-				tc.Servers[0].InternalExecutorFactory().(sqlutil.InternalExecutorFactory),
-				tc.Servers[0].DB(),
+				tc.Servers[0].InternalDB().(isql.DB),
 				nil, /* limiters */
 				cloud.NilMetrics,
 			)
@@ -4361,9 +4359,8 @@ func TestRegionalKMSEncryptedBackup(t *testing.T) {
 type testKMSEnv struct {
 	settings         *cluster.Settings
 	externalIOConfig *base.ExternalIODirConfig
-	db               *kv.DB
+	db               isql.DB
 	user             username.SQLUsername
-	ie               sqlutil.InternalExecutor
 }
 
 var _ cloud.KMSEnv = &testKMSEnv{}
@@ -4376,16 +4373,12 @@ func (e *testKMSEnv) KMSConfig() *base.ExternalIODirConfig {
 	return e.externalIOConfig
 }
 
-func (e *testKMSEnv) DBHandle() *kv.DB {
+func (e *testKMSEnv) DBHandle() isql.DB {
 	return e.db
 }
 
 func (e *testKMSEnv) User() username.SQLUsername {
 	return e.user
-}
-
-func (e *testKMSEnv) InternalExecutor() sqlutil.InternalExecutor {
-	return e.ie
 }
 
 type testKMS struct {
@@ -4502,7 +4495,6 @@ func TestValidateKMSURIsAgainstFullBackup(t *testing.T) {
 			externalIOConfig: &base.ExternalIODirConfig{},
 			db:               nil,
 			user:             username.RootUserName(),
-			ie:               nil,
 		}
 		kmsInfo, err := backupencryption.ValidateKMSURIsAgainstFullBackup(
 			ctx, tc.incrementalBackupURIs, masterKeyIDToDataKey, kmsEnv)
@@ -5841,9 +5833,8 @@ func TestBackupRestoreCorruptedStatsIgnored(t *testing.T) {
 	kmsEnv := &testKMSEnv{
 		settings:         execCfg.Settings,
 		externalIOConfig: &execCfg.ExternalIODirConfig,
-		db:               execCfg.DB,
+		db:               execCfg.InternalDB,
 		user:             username.RootUserName(),
-		ie:               execCfg.InternalExecutor,
 	}
 	require.NoError(t, backupinfo.WriteTableStatistics(ctx, store, nil, /* encryption */
 		kmsEnv, &statsTable))
@@ -6910,8 +6901,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-10`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 			},
 		)
@@ -6937,7 +6928,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreConn10 = nil
 
 		// Mark tenant as DROP.
-		restoreDB.Exec(t, `SELECT crdb_internal.destroy_tenant(10)`)
+		restoreDB.Exec(t, `DROP TENANT [10]`)
 		restoreDB.CheckQueryResults(t,
 			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
 			[][]string{
@@ -6951,12 +6942,12 @@ func TestBackupRestoreTenant(t *testing.T) {
 					`10`,
 					`false`,
 					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "", "state": "DROP", "tenantReplicationJobId": "0"}`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "tenant-10", "id": "10", "name": "", "state": "DROP", "tenantReplicationJobId": "0"}`,
 				},
 			},
 		)
 
-		// Make GC job scheduled by destroy_tenant run in 1 second.
+		// Make GC job scheduled by DROP TENANT run in 1 second.
 		restoreDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue_enabled = false")
 		restoreDB.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
 		// Wait for tenant GC job to complete.
@@ -6985,8 +6976,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-10`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 			},
 		)
@@ -7000,7 +6991,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreTenant10.CheckQueryResults(t, `select * from foo.bar`, tenant10.QueryStr(t, `select * from foo.bar`))
 		restoreTenant10.CheckQueryResults(t, `select * from foo.bar2`, tenant10.QueryStr(t, `select * from foo.bar2`))
 
-		restoreDB.Exec(t, `SELECT crdb_internal.destroy_tenant(10)`)
+		restoreDB.Exec(t, `DROP TENANT [10]`)
 		// Wait for tenant GC job to complete.
 		restoreDB.CheckQueryResultsRetry(
 			t,
@@ -7031,8 +7022,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-10`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 			},
 		)
@@ -7075,8 +7066,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-10`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 			},
 		)
@@ -7129,20 +7120,20 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-10`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 				{
 					`11`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "11", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-11`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "11", "name": "tenant-11", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 				{
 					`20`,
 					`true`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "20", "name": "", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`tenant-20`,
+					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "20", "name": "tenant-20", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
 				},
 			},
 		)
@@ -7171,11 +7162,11 @@ func TestBackupRestoreTenant(t *testing.T) {
 		// Check the all-tenant override.
 		restoreTenant11.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.read_payload_cost_per_mebibyte`, [][]string{{"123"}})
 
-		restoreDB.Exec(t, `SELECT crdb_internal.destroy_tenant(20, true)`)
+		restoreDB.Exec(t, `DROP TENANT [20] IMMEDIATE`)
 
-		restoreDB.Exec(t, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH tenant = '20'`)
+		restoreDB.Exec(t, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH tenant_name = 'tenant-20'`)
 		_, restoreConn20 := serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(20), DisableCreateTenant: true},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantName: "tenant-20", DisableCreateTenant: true},
 		)
 		defer restoreConn20.Close()
 		restoreTenant20 := sqlutils.MakeSQLRunner(restoreConn20)
@@ -7186,8 +7177,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreTenant20.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.read_payload_cost_per_mebibyte`, [][]string{{"123"}})
 
 		// Remove tenant 11, then confirm restoring 11 over 10 fails.
-		restoreDB.Exec(t, `SELECT crdb_internal.destroy_tenant(11, true)`)
-		restoreDB.ExpectErr(t, `exists`, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH tenant = '10'`)
+		restoreDB.Exec(t, `DROP TENANT [11] IMMEDIATE`)
+		restoreDB.ExpectErr(t, `exists`, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH tenant_name = 'tenant-10'`)
 
 		// Verify tenant 20 is still unaffected.
 		restoreTenant20.CheckQueryResults(t, `select * from foo.baz`, tenant11.QueryStr(t, `select * from foo.baz`))
@@ -8205,9 +8196,7 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 		st,
 		blobs.TestBlobServiceClient(dir),
 		username.RootUserName(),
-		nil, /* ie */
-		nil, /* ief */
-		nil, /* kvDB */
+		nil, /* db */
 		nil, /* limiters */
 		cloud.NilMetrics,
 	)
@@ -8230,7 +8219,6 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 		externalIOConfig: &base.ExternalIODirConfig{},
 		db:               nil,
 		user:             username.RootUserName(),
-		ie:               nil,
 	}
 	require.NoError(t, backupinfo.WriteBackupManifest(ctx, storage, "testmanifest", encOpts,
 		&kmsEnv, desc))
@@ -9263,17 +9251,21 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 	// Set foo to exclude_data_from_backup and back it up. The ExportRequest
 	// should be a noop and backup no data.
 	sqlDB.Exec(t, `ALTER TABLE data.foo SET (exclude_data_from_backup = true)`)
-	waitForTableSplit(t, conn, "foo", "data")
 	waitForReplicaFieldToBeSet(t, tc, conn, "foo", "data", func(r *kvserver.Replica) (bool, error) {
 		if !r.ExcludeDataFromBackup() {
-			return false, errors.New("waiting for exclude_data_from_backup to be applied")
+			return false, errors.New("waiting for the range containing table data.foo to split")
 		}
 		return true, nil
 	})
-	waitForTableSplit(t, conn, "bar", "data")
-	sqlDB.Exec(t, `BACKUP DATABASE data TO $1`, localFoo)
+	waitForReplicaFieldToBeSet(t, tc, conn, "bar", "data", func(r *kvserver.Replica) (bool, error) {
+		if r.ExcludeDataFromBackup() {
+			return false, errors.New("waiting for the range containing table data.bar to split")
+		}
+		return true, nil
+	})
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, localFoo)
 
-	restoreDB.Exec(t, `RESTORE DATABASE data FROM $1`, localFoo)
+	restoreDB.Exec(t, `RESTORE DATABASE data FROM LATEST IN $1`, localFoo)
 	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.foo`), 0)
 	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.bar`), 10)
 }
@@ -9507,7 +9499,11 @@ func TestProtectRestoreTargets(t *testing.T) {
 	}{
 		{
 			name:        "tenant",
-			restoreStmt: `RESTORE TENANT 10 FROM LATEST IN $1 WITH detached, tenant = '20'`,
+			restoreStmt: `RESTORE TENANT 10 FROM LATEST IN $1 WITH detached, tenant_name = 'tenant-20'`,
+		},
+		{
+			name:        "tenantid",
+			restoreStmt: `RESTORE TENANT 10 FROM LATEST IN $1 WITH detached, tenant = '20', tenant_name = 'othername'`,
 		},
 		{
 			name:        "database",
@@ -9522,7 +9518,7 @@ func TestProtectRestoreTargets(t *testing.T) {
 			restoreStmt: `RESTORE FROM LATEST IN $1 WITH detached`,
 		},
 	} {
-		if tc.StartedDefaultTestTenant() && subtest.name == "tenant" {
+		if tc.StartedDefaultTestTenant() && strings.HasPrefix(subtest.name, "tenant") {
 			// Cannot run a restore of a tenant within a tenant
 			continue
 		}
@@ -9548,6 +9544,9 @@ func TestProtectRestoreTargets(t *testing.T) {
 				// so just assert that the right type was instantiated.
 				require.NotNil(t, target.GetCluster())
 			case "tenant":
+				targetIDs := target.GetTenants()
+				require.Equal(t, roachpb.TenantID{InternalValue: 2}, targetIDs.IDs[0])
+			case "tenantid":
 				targetIDs := target.GetTenants()
 				require.Equal(t, roachpb.TenantID{InternalValue: 20}, targetIDs.IDs[0])
 			case "database":
@@ -9611,10 +9610,10 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 			{"test_role", "NULL", "true", "103"},
 		})
 		sqlDBRestore.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{
-			{"admin", "app", "false", "NULL", "NULL"},
+			{"admin", "app", "false", "2", "101"},
 			{"admin", "root", "true", "2", "1"},
-			{"app_role", "app", "false", "NULL", "NULL"},
-			{"app_role", "test_role", "false", "NULL", "NULL"},
+			{"app_role", "app", "false", "102", "101"},
+			{"app_role", "test_role", "false", "102", "103"},
 		})
 		sqlDBRestore.CheckQueryResults(t, "SHOW USERS", [][]string{
 			{"admin", "", "{}"},
@@ -10492,31 +10491,31 @@ $$;
 	require.Equal(t, 1, len(rows[0]))
 	udfID, err := strconv.Atoi(rows[0][0])
 	require.NoError(t, err)
-	err = sql.TestingDescsTxn(ctx, srcServer, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		dbDesc, err := col.ByNameWithLeased(txn).Get().Database(ctx, "db1")
+	err = sql.TestingDescsTxn(ctx, srcServer, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		dbDesc, err := col.ByNameWithLeased(txn.KV()).Get().Database(ctx, "db1")
 		require.NoError(t, err)
 		require.Equal(t, 104, int(dbDesc.GetID()))
 
-		scDesc, err := col.ByNameWithLeased(txn).Get().Schema(ctx, dbDesc, "sc1")
+		scDesc, err := col.ByNameWithLeased(txn.KV()).Get().Schema(ctx, dbDesc, "sc1")
 		require.NoError(t, err)
 		require.Equal(t, 106, int(scDesc.GetID()))
 
 		tbName := tree.MakeTableNameWithSchema("db1", "sc1", "tbl1")
-		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 107, int(tbDesc.GetID()))
 
 		typName := tree.MakeQualifiedTypeName("db1", "sc1", "enum1")
-		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn).Get(), &typName)
+		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typName)
 		require.NoError(t, err)
 		require.Equal(t, 108, int(typDesc.GetID()))
 
 		tbName = tree.MakeTableNameWithSchema("db1", "sc1", "sq1")
-		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 110, int(tbDesc.GetID()))
 
-		fnDesc, err := col.ByIDWithLeased(txn).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
+		fnDesc, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
 		require.NoError(t, err)
 		require.Equal(t, 111, int(fnDesc.GetID()))
 		require.Equal(t, 104, int(fnDesc.GetParentID()))
@@ -10544,31 +10543,31 @@ $$;
 	require.Equal(t, 1, len(rows[0]))
 	udfID, err = strconv.Atoi(rows[0][0])
 	require.NoError(t, err)
-	err = sql.TestingDescsTxn(ctx, srcServer, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		dbDesc, err := col.ByNameWithLeased(txn).Get().Database(ctx, "db1_new")
+	err = sql.TestingDescsTxn(ctx, srcServer, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		dbDesc, err := col.ByNameWithLeased(txn.KV()).Get().Database(ctx, "db1_new")
 		require.NoError(t, err)
 		require.Equal(t, 112, int(dbDesc.GetID()))
 
-		scDesc, err := col.ByNameWithLeased(txn).Get().Schema(ctx, dbDesc, "sc1")
+		scDesc, err := col.ByNameWithLeased(txn.KV()).Get().Schema(ctx, dbDesc, "sc1")
 		require.NoError(t, err)
 		require.Equal(t, 114, int(scDesc.GetID()))
 
 		tbName := tree.MakeTableNameWithSchema("db1_new", "sc1", "tbl1")
-		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 115, int(tbDesc.GetID()))
 
 		typName := tree.MakeQualifiedTypeName("db1_new", "sc1", "enum1")
-		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn).Get(), &typName)
+		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typName)
 		require.NoError(t, err)
 		require.Equal(t, 116, int(typDesc.GetID()))
 
 		tbName = tree.MakeTableNameWithSchema("db1_new", "sc1", "sq1")
-		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 118, int(tbDesc.GetID()))
 
-		fnDesc, err := col.ByIDWithLeased(txn).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
+		fnDesc, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
 		require.NoError(t, err)
 		require.Equal(t, 119, int(fnDesc.GetID()))
 		require.Equal(t, 112, int(fnDesc.GetParentID()))
@@ -10631,31 +10630,31 @@ $$;
 	require.Equal(t, 1, len(rows[0]))
 	udfID, err := strconv.Atoi(rows[0][0])
 	require.NoError(t, err)
-	err = sql.TestingDescsTxn(ctx, srcServer, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		dbDesc, err := col.ByNameWithLeased(txn).Get().Database(ctx, "db1")
+	err = sql.TestingDescsTxn(ctx, srcServer, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		dbDesc, err := col.ByNameWithLeased(txn.KV()).Get().Database(ctx, "db1")
 		require.NoError(t, err)
 		require.Equal(t, 104, int(dbDesc.GetID()))
 
-		scDesc, err := col.ByNameWithLeased(txn).Get().Schema(ctx, dbDesc, "sc1")
+		scDesc, err := col.ByNameWithLeased(txn.KV()).Get().Schema(ctx, dbDesc, "sc1")
 		require.NoError(t, err)
 		require.Equal(t, 106, int(scDesc.GetID()))
 
 		tbName := tree.MakeTableNameWithSchema("db1", "sc1", "tbl1")
-		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 107, int(tbDesc.GetID()))
 
 		typName := tree.MakeQualifiedTypeName("db1", "sc1", "enum1")
-		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn).Get(), &typName)
+		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typName)
 		require.NoError(t, err)
 		require.Equal(t, 108, int(typDesc.GetID()))
 
 		tbName = tree.MakeTableNameWithSchema("db1", "sc1", "sq1")
-		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 110, int(tbDesc.GetID()))
 
-		fnDesc, err := col.ByIDWithLeased(txn).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
+		fnDesc, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
 		require.NoError(t, err)
 		require.Equal(t, 111, int(fnDesc.GetID()))
 		require.Equal(t, 104, int(fnDesc.GetParentID()))
@@ -10685,31 +10684,31 @@ $$;
 	require.Equal(t, 1, len(rows[0]))
 	udfID, err = strconv.Atoi(rows[0][0])
 	require.NoError(t, err)
-	err = sql.TestingDescsTxn(ctx, tgtServer, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		dbDesc, err := col.ByNameWithLeased(txn).Get().Database(ctx, "db1")
+	err = sql.TestingDescsTxn(ctx, tgtServer, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		dbDesc, err := col.ByNameWithLeased(txn.KV()).Get().Database(ctx, "db1")
 		require.NoError(t, err)
 		require.Equal(t, 107, int(dbDesc.GetID()))
 
-		scDesc, err := col.ByNameWithLeased(txn).Get().Schema(ctx, dbDesc, "sc1")
+		scDesc, err := col.ByNameWithLeased(txn.KV()).Get().Schema(ctx, dbDesc, "sc1")
 		require.NoError(t, err)
 		require.Equal(t, 125, int(scDesc.GetID()))
 
 		tbName := tree.MakeTableNameWithSchema("db1", "sc1", "tbl1")
-		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 126, int(tbDesc.GetID()))
 
 		typName := tree.MakeQualifiedTypeName("db1", "sc1", "enum1")
-		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn).Get(), &typName)
+		_, typDesc, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typName)
 		require.NoError(t, err)
 		require.Equal(t, 127, int(typDesc.GetID()))
 
 		tbName = tree.MakeTableNameWithSchema("db1", "sc1", "sq1")
-		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tbName)
+		_, tbDesc, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tbName)
 		require.NoError(t, err)
 		require.Equal(t, 129, int(tbDesc.GetID()))
 
-		fnDesc, err := col.ByIDWithLeased(txn).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
+		fnDesc, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, descpb.ID(udfID))
 		require.NoError(t, err)
 		require.Equal(t, 130, int(fnDesc.GetID()))
 		require.Equal(t, 107, int(fnDesc.GetParentID()))

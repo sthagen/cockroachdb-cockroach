@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
@@ -32,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -46,7 +46,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
@@ -64,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -398,7 +398,13 @@ func (ex *connExecutor) execStmtInOpenState(
 		switch e.Mode {
 		case tree.ExplainDebug:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeDebugUseCounter)
-			ih.SetOutputMode(explainAnalyzeDebugOutput, explain.Flags{})
+			flags := explain.MakeFlags(&e.ExplainOptions)
+			flags.Verbose = true
+			flags.ShowTypes = true
+			if ex.server.cfg.TestingKnobs.DeterministicExplain {
+				flags.Redact = explain.RedactAll
+			}
+			ih.SetOutputMode(explainAnalyzeDebugOutput, flags)
 
 		case tree.ExplainPlan:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeUseCounter)
@@ -836,7 +842,7 @@ func (ex *connExecutor) handleAOST(ctx context.Context, stmt tree.Statement) err
 	}
 	// If we're in an explicit txn, we allow AOST but only if it matches with
 	// the transaction's timestamp. This is useful for running AOST statements
-	// using the InternalExecutor inside an external transaction; one might want
+	// using the Executor inside an external transaction; one might want
 	// to do that to force p.avoidLeasedDescriptors to be set below.
 	if asOf.BoundedStaleness {
 		return pgerror.Newf(
@@ -894,7 +900,7 @@ func (ex *connExecutor) checkDescriptorTwoVersionInvariant(ctx context.Context) 
 	return descs.CheckTwoVersionInvariant(
 		ctx,
 		ex.server.cfg.Clock,
-		ex.server.cfg.InternalExecutor,
+		ex.server.cfg.InternalDB.Executor(),
 		ex.extraTxnState.descCollection,
 		ex.state.mu.txn,
 		inRetryBackoff,
@@ -934,7 +940,7 @@ func (ex *connExecutor) commitSQLTransaction(
 			// Generating a forced retry error here, right after resetting the
 			// transaction is not exactly necessary, but it's a sound way to
 			// generate the only type of ClientVisibleRetryError we have.
-			err = ex.state.mu.txn.GenerateForcedRetryableError(ctx, err.Error())
+			err = ex.state.mu.txn.GenerateForcedRetryableError(ctx, redact.Sprint(err))
 		}
 		return ex.makeErrEvent(err, ast)
 	}
@@ -1015,22 +1021,24 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error 
 		}
 	}
 
-	if err := ex.extraTxnState.descCollection.ValidateUncommittedDescriptors(ctx, ex.state.mu.txn); err != nil {
-		return err
-	}
+	if ex.extraTxnState.descCollection.HasUncommittedDescriptors() {
+		if err := ex.extraTxnState.descCollection.ValidateUncommittedDescriptors(ctx, ex.state.mu.txn); err != nil {
+			return err
+		}
 
-	if err := descs.CheckSpanCountLimit(
-		ctx,
-		ex.extraTxnState.descCollection,
-		ex.server.cfg.SpanConfigSplitter,
-		ex.server.cfg.SpanConfigLimiter,
-		ex.state.mu.txn,
-	); err != nil {
-		return err
-	}
+		if err := descs.CheckSpanCountLimit(
+			ctx,
+			ex.extraTxnState.descCollection,
+			ex.server.cfg.SpanConfigSplitter,
+			ex.server.cfg.SpanConfigLimiter,
+			ex.state.mu.txn,
+		); err != nil {
+			return err
+		}
 
-	if err := ex.checkDescriptorTwoVersionInvariant(ctx); err != nil {
-		return err
+		if err := ex.checkDescriptorTwoVersionInvariant(ctx); err != nil {
+			return err
+		}
 	}
 
 	if err := ex.state.mu.txn.Commit(ctx); err != nil {
@@ -1058,12 +1066,10 @@ func (ex *connExecutor) createJobs(ctx context.Context) error {
 	for _, record := range ex.extraTxnState.schemaChangeJobRecords {
 		records = append(records, record)
 	}
-	var jobIDs []jobspb.JobID
-	var err error
-	if err := ex.planner.WithInternalExecutor(ctx, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error {
-		jobIDs, err = ex.server.cfg.JobRegistry.CreateJobsWithTxn(ctx, ex.planner.Txn(), ie, records)
-		return err
-	}); err != nil {
+	jobIDs, err := ex.server.cfg.JobRegistry.CreateJobsWithTxn(
+		ctx, ex.planner.InternalSQLTxn(), records,
+	)
+	if err != nil {
 		return err
 	}
 	ex.planner.extendedEvalCtx.Jobs.add(jobIDs...)
@@ -2023,7 +2029,6 @@ func (ex *connExecutor) runShowCompletions(
 ) error {
 	res.SetColumns(ctx, colinfo.ShowCompletionsColumns)
 	log.Warningf(ctx, "COMPLETION GENERATOR FOR: %+v", *n)
-	ie := ex.server.cfg.InternalExecutor
 	sd := ex.planner.SessionData()
 	override := sessiondata.InternalExecutorOverride{
 		SearchPath: &sd.SearchPath,
@@ -2035,12 +2040,12 @@ func (ex *connExecutor) runShowCompletions(
 	//
 	// TODO(janexing): better bind the internal executor with the txn.
 	var txn *kv.Txn
+	var ie isql.Executor
 	if _, ok := ex.machine.CurState().(stateOpen); ok {
-		txn = func() *kv.Txn {
-			ex.state.mu.RLock()
-			defer ex.state.mu.RUnlock()
-			return ex.state.mu.txn
-		}()
+		ie = ex.planner.InternalSQLTxn()
+		txn = ex.planner.Txn()
+	} else {
+		ie = ex.server.cfg.InternalDB.Executor()
 	}
 	queryIterFn := func(ctx context.Context, opName string, stmt string, args ...interface{}) (eval.InternalRows, error) {
 		return ie.QueryIteratorEx(ctx, opName, txn,

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/hintdetail"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // confirmActionFlag defines a pflag to parse a confirm option.
@@ -165,6 +167,13 @@ Now the cluster could be started again.
 	RunE: UsageAndErr,
 }
 
+var recoverCommands = []*cobra.Command{
+	debugRecoverCollectInfoCmd,
+	debugRecoverPlanCmd,
+	//debugRecoverStagePlan,
+	//debugRecoverVerify,
+}
+
 func init() {
 	debugRecoverCmd.AddCommand(
 		debugRecoverCollectInfoCmd,
@@ -174,17 +183,27 @@ func init() {
 
 var debugRecoverCollectInfoCmd = &cobra.Command{
 	Use:   "collect-info [destination-file]",
-	Short: "collect replica information from the given stores",
+	Short: "collect replica information from a cluster",
 	Long: `
-Collect information about replicas by reading data from underlying stores. Store
-locations must be provided using --store flags.
+Collect information about replicas in the cluster.
+
+The command can collect data from an online or an offline cluster.
+
+In the first case, the address of a single healthy cluster node must be provided
+using the --host flag. This designated node will handle collection of data from
+all surviving nodes.
+
+In the second case data is read directly from local stores on each node.
+CockroachDB must not be running on any node. The location of each store must be
+provided using the --store flag. The command must be executed for all surviving
+stores.
+
+Multiple store locations can be provided to the command to collect all info
+from all stores on a node at once. It is also possible to call it per store, in
+that case all resulting files should be fed to the plan subcommand.
 
 Collected information is written to a destination file if file name is provided,
 or to stdout.
-
-Multiple store locations could be provided to the command to collect all info from
-node at once. It is also possible to call it per store, in that case all resulting
-files should be fed to plan subcommand.
 
 See debug recover command help for more details on how to use this command.
 `,
@@ -197,28 +216,49 @@ var debugRecoverCollectInfoOpts struct {
 }
 
 func runDebugDeadReplicaCollect(cmd *cobra.Command, args []string) error {
+	// We must have cancellable context here to obtain grpc client connection.
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(cmd.Context())
+	defer stopper.Stop(ctx)
 
-	var stores []storage.Engine
-	for _, storeSpec := range debugRecoverCollectInfoOpts.Stores.Specs {
-		db, err := OpenEngine(storeSpec.Path, stopper, storage.MustExist, storage.ReadOnly)
+	var replicaInfo loqrecoverypb.ClusterReplicaInfo
+	var stats loqrecovery.CollectionStats
+
+	if len(debugRecoverCollectInfoOpts.Stores.Specs) == 0 {
+		c, finish, err := getAdminClient(ctx, serverCfg)
 		if err != nil {
-			return errors.Wrapf(err, "failed to open store at path %q, ensure that store path is "+
-				"correct and that it is not used by another process", storeSpec.Path)
+			return errors.Wrapf(err, "failed to get admin connection to cluster")
 		}
-		stores = append(stores, db)
-	}
-
-	replicaInfo, err := loqrecovery.CollectReplicaInfo(cmd.Context(), stores)
-	if err != nil {
-		return err
+		defer finish()
+		replicaInfo, stats, err = loqrecovery.CollectRemoteReplicaInfo(ctx, c)
+		if err != nil {
+			return errors.WithHint(errors.Wrap(err,
+				"failed to retrieve replica info from cluster"),
+				"Check cluster health and retry the operation.")
+		}
+	} else {
+		var stores []storage.Engine
+		for _, storeSpec := range debugRecoverCollectInfoOpts.Stores.Specs {
+			db, err := OpenEngine(storeSpec.Path, stopper, storage.MustExist, storage.ReadOnly)
+			if err != nil {
+				return errors.WithHint(errors.Wrapf(err,
+					"failed to open store at path %q", storeSpec.Path),
+					"Ensure that store path is correct and that it is not used by another process.")
+			}
+			stores = append(stores, db)
+		}
+		var err error
+		replicaInfo, stats, err = loqrecovery.CollectStoresReplicaInfo(ctx, stores)
+		if err != nil {
+			return errors.Wrapf(err, "failed to collect replica info from local stores")
+		}
 	}
 
 	var writer io.Writer = os.Stdout
 	if len(args) > 0 {
 		filename := args[0]
-		if _, err = os.Stat(filename); err == nil {
+		if _, err := os.Stat(filename); err == nil {
 			return errors.Newf("file %q already exists", filename)
 		}
 
@@ -230,14 +270,20 @@ func runDebugDeadReplicaCollect(cmd *cobra.Command, args []string) error {
 		writer = outFile
 	}
 	jsonpb := protoutil.JSONPb{Indent: "  "}
-	var out []byte
-	if out, err = jsonpb.Marshal(replicaInfo); err != nil {
+	out, err := jsonpb.Marshal(&replicaInfo)
+	if err != nil {
 		return errors.Wrap(err, "failed to marshal collected replica info")
 	}
-	if _, err = writer.Write(out); err != nil {
+	if _, err := writer.Write(out); err != nil {
 		return errors.Wrap(err, "failed to write collected replica info")
 	}
-	_, _ = fmt.Fprintf(stderr, "Collected info about %d replicas.\n", len(replicaInfo.Replicas))
+	_, _ = fmt.Fprintf(stderr, `Collected recovery info from:
+nodes             %d
+stores            %d
+Collected info:
+replicas          %d
+range descriptors %d
+`, stats.Nodes, stats.Stores, replicaInfo.ReplicaCount(), stats.Descriptors)
 	return nil
 }
 
@@ -247,30 +293,70 @@ var debugRecoverPlanCmd = &cobra.Command{
 	Long: `
 Devise a plan to restore ranges that lost a quorum.
 
-This command will read files with information about replicas collected from all
-surviving nodes of a cluster and make a decision which replicas should be survivors
-for the ranges where quorum was lost.
-Decision is then written into a file or stdout.
+The command analyzes information about replicas from all surviving nodes of a
+cluster, finds ranges that lost quorum and makes decisions about which replicas
+should act as survivors to restore quorum.
+
+Information about replicas could be collected directly by connecting to the
+cluster or from files generated by the collect-info command. In former case,
+cluster connection parameters must be specified. If latter case, file names
+should be provided as arguments. 
+
+After the data is analyzed, a recovery plan is written into a file or stdout.
 
 This command only creates a plan and doesn't change any data.'
 
 See debug recover command help for more details on how to use this command.
 `,
-	Args: cobra.MinimumNArgs(1),
+	Args: cobra.MinimumNArgs(0),
 	RunE: runDebugPlanReplicaRemoval,
 }
 
 var debugRecoverPlanOpts struct {
 	outputFileName string
 	deadStoreIDs   []int
+	deadNodeIDs    []int
 	confirmAction  confirmActionFlag
 	force          bool
 }
 
+var planSpecificFlags = map[string]struct{}{
+	"plan":           {},
+	"dead-store-ids": {},
+	"dead-node-ids":  {},
+	"force":          {},
+	"confirm":        {},
+}
+
 func runDebugPlanReplicaRemoval(cmd *cobra.Command, args []string) error {
-	replicas, err := readReplicaInfoData(args)
-	if err != nil {
-		return err
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	var replicas loqrecoverypb.ClusterReplicaInfo
+	var err error
+
+	if debugRecoverPlanOpts.deadStoreIDs != nil && debugRecoverPlanOpts.deadNodeIDs != nil {
+		return errors.New("debug recover make-plan command accepts either --dead-node-ids or --dead-store-ids")
+	}
+
+	var stats loqrecovery.CollectionStats
+	if len(args) == 0 {
+		// If no replica info is provided, try to connect to a cluster default or
+		// explicitly provided to retrieve replica info.
+		c, finish, err := getAdminClient(ctx, serverCfg)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get admin connection to cluster")
+		}
+		defer finish()
+		replicas, stats, err = loqrecovery.CollectRemoteReplicaInfo(ctx, c)
+		if err != nil {
+			return errors.Wrapf(err, "failed to retrieve replica info from cluster")
+		}
+	} else {
+		replicas, err = readReplicaInfoData(args)
+		if err != nil {
+			return err
+		}
 	}
 
 	var deadStoreIDs []roachpb.StoreID
@@ -278,30 +364,46 @@ func runDebugPlanReplicaRemoval(cmd *cobra.Command, args []string) error {
 		deadStoreIDs = append(deadStoreIDs, roachpb.StoreID(id))
 	}
 
-	plan, report, err := loqrecovery.PlanReplicas(cmd.Context(), replicas, deadStoreIDs)
+	var deadNodeIDs []roachpb.NodeID
+	for _, id := range debugRecoverPlanOpts.deadNodeIDs {
+		deadNodeIDs = append(deadNodeIDs, roachpb.NodeID(id))
+	}
+
+	plan, report, err := loqrecovery.PlanReplicas(
+		ctx,
+		replicas,
+		deadStoreIDs,
+		deadNodeIDs)
 	if err != nil {
 		return err
 	}
 
+	if stats.Nodes > 0 {
+		_, _ = fmt.Fprintf(stderr, `Nodes scanned:           %d
+`, stats.Nodes)
+	}
 	_, _ = fmt.Fprintf(stderr, `Total replicas analyzed: %d
 Ranges without quorum:   %d
 Discarded live replicas: %d
 
 `, report.TotalReplicas, len(report.PlannedUpdates), report.DiscardedNonSurvivors)
+	_, _ = fmt.Fprintf(stderr, "Proposed changes:\n")
 	for _, r := range report.PlannedUpdates {
-		_, _ = fmt.Fprintf(stderr, "Recovering range r%d:%s updating replica %s to %s. "+
+		_, _ = fmt.Fprintf(stderr, "  range r%d:%s updating replica %s to %s. "+
 			"Discarding available replicas: [%s], discarding dead replicas: [%s].\n",
-			r.RangeID, r.StartKey, r.OldReplica, r.Replica,
+			r.RangeID, r.StartKey, r.OldReplica, r.NewReplica,
 			r.DiscardedAvailableReplicas, r.DiscardedDeadReplicas)
 	}
 
-	deadStoreMsg := fmt.Sprintf("\nDiscovered dead stores from provided files: %s",
-		joinStoreIDs(report.MissingStores))
+	argStoresMsg := ""
 	if len(deadStoreIDs) > 0 {
-		_, _ = fmt.Fprintf(stderr, "%s, (matches --dead-store-ids)\n\n", deadStoreMsg)
-	} else {
-		_, _ = fmt.Fprintf(stderr, "%s\n\n", deadStoreMsg)
+		argStoresMsg = ", (matches --dead-store-ids)"
 	}
+	if len(deadNodeIDs) > 0 {
+		argStoresMsg = ", (matches --dead-node-ids)"
+	}
+	_, _ = fmt.Fprintf(stderr, "\nDiscovered dead nodes, will be marked as decommissioned:\n%s\n%s\n\n",
+		formatNodeStores(report.MissingNodes, "  "), argStoresMsg)
 
 	planningErr := report.Error()
 	if planningErr != nil {
@@ -362,6 +464,7 @@ Discarded live replicas: %d
 		return nil
 	}
 
+	planFile := "<plan file>"
 	var writer io.Writer = os.Stdout
 	if len(debugRecoverPlanOpts.outputFileName) > 0 {
 		if _, err = os.Stat(debugRecoverPlanOpts.outputFileName); err == nil {
@@ -373,40 +476,58 @@ Discarded live replicas: %d
 		}
 		defer outFile.Close()
 		writer = outFile
+		planFile = path.Base(debugRecoverPlanOpts.outputFileName)
 	}
 
 	jsonpb := protoutil.JSONPb{Indent: "  "}
 	var out []byte
-	if out, err = jsonpb.Marshal(plan); err != nil {
+	if out, err = jsonpb.Marshal(&plan); err != nil {
 		return errors.Wrap(err, "failed to marshal recovery plan")
 	}
 	if _, err = writer.Write(out); err != nil {
 		return errors.Wrap(err, "failed to write recovery plan")
 	}
 
-	_, _ = fmt.Fprint(stderr, "Plan created\nTo complete recovery, distribute the plan to the"+
-		" below nodes and invoke `debug recover apply-plan` on:\n")
-	for node, stores := range report.UpdatedNodes {
-		_, _ = fmt.Fprintf(stderr, "- node n%d, store(s) %s\n", node, joinStoreIDs(stores))
+	// No args means we collected connection info from cluster and need to
+	// preserve flags for subsequent invocation.
+	remoteArgs := getCLIClusterFlags(len(args) == 0, cmd, func(flag string) bool {
+		_, filter := planSpecificFlags[flag]
+		return filter
+	})
+
+	_, _ = fmt.Fprintf(stderr, `Plan created.
+To stage recovery application in half-online mode invoke:
+
+'cockroach debug recover apply-plan %s %s'
+
+Alternatively distribute plan to below nodes and invoke 'debug recover apply-plan --store=<store-dir> %s' on:
+`, remoteArgs, planFile, planFile)
+	for _, node := range report.UpdatedNodes {
+		_, _ = fmt.Fprintf(stderr, "- node n%d, store(s) %s\n", node.NodeID, joinStoreIDs(node.StoreIDs))
 	}
 
 	return nil
 }
 
-func readReplicaInfoData(fileNames []string) ([]loqrecoverypb.NodeReplicaInfo, error) {
-	var replicas []loqrecoverypb.NodeReplicaInfo
+func readReplicaInfoData(fileNames []string) (loqrecoverypb.ClusterReplicaInfo, error) {
+	var replicas loqrecoverypb.ClusterReplicaInfo
 	for _, filename := range fileNames {
 		data, err := os.ReadFile(filename)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to read replica info file %q", filename)
+			return loqrecoverypb.ClusterReplicaInfo{}, errors.Wrapf(err, "failed to read replica info file %q", filename)
 		}
 
-		var nodeReplicas loqrecoverypb.NodeReplicaInfo
+		var nodeReplicas loqrecoverypb.ClusterReplicaInfo
 		jsonpb := protoutil.JSONPb{}
 		if err = jsonpb.Unmarshal(data, &nodeReplicas); err != nil {
-			return nil, errors.Wrapf(err, "failed to unmarshal replica info from file %q", filename)
+			return loqrecoverypb.ClusterReplicaInfo{}, errors.WithHint(errors.Wrapf(err,
+				"failed to unmarshal replica info from file %q", filename),
+				"Ensure that replica info file is generated with the same binary version and file is not corrupted.")
 		}
-		replicas = append(replicas, nodeReplicas)
+		if err = replicas.Merge(nodeReplicas); err != nil {
+			return loqrecoverypb.ClusterReplicaInfo{}, errors.Wrapf(err,
+				"failed to merge replica info from file %q", filename)
+		}
 	}
 	return replicas, nil
 }
@@ -544,12 +665,49 @@ func joinStoreIDs(storeIDs []roachpb.StoreID) string {
 	return strings.Join(storeNames, ", ")
 }
 
+func formatNodeStores(locations []loqrecovery.NodeStores, indent string) string {
+	hasMultiStore := false
+	for _, v := range locations {
+		hasMultiStore = hasMultiStore || len(v.StoreIDs) > 1
+	}
+	if !hasMultiStore {
+		// we only have a single store per node, no need to list stores.
+		nodeNames := make([]string, 0, len(locations))
+		for _, node := range locations {
+			nodeNames = append(nodeNames, fmt.Sprintf("n%d", node.NodeID))
+		}
+		return indent + strings.Join(nodeNames, ", ")
+	}
+	nodeDetails := make([]string, 0, len(locations))
+	for _, node := range locations {
+		nodeDetails = append(nodeDetails,
+			indent+fmt.Sprintf("n%d: store(s): %s", node.NodeID, joinStoreIDs(node.StoreIDs)))
+	}
+	return strings.Join(nodeDetails, "\n")
+}
+
+// getCLIClusterFlags recreates command line flags from current command
+// discarding any flags that filter returns true for.
+func getCLIClusterFlags(fromCfg bool, cmd *cobra.Command, filter func(flag string) bool) string {
+	if !fromCfg {
+		return " --host <node-hostname>[:<port>] [--certs-dir <certificates-dir>|--insecure]"
+	}
+	var buf strings.Builder
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if f.Changed && !filter(f.Name) {
+			_, _ = fmt.Fprintf(&buf, " --%s=%v", f.Name, f.Value.String())
+		}
+	})
+	return buf.String()
+}
+
 // setDebugRecoverContextDefaults resets values of command line flags to
 // their default values to ensure tests don't interfere with each other.
 func setDebugRecoverContextDefaults() {
 	debugRecoverCollectInfoOpts.Stores.Specs = nil
 	debugRecoverPlanOpts.outputFileName = ""
 	debugRecoverPlanOpts.confirmAction = prompt
+	debugRecoverPlanOpts.deadStoreIDs = nil
 	debugRecoverPlanOpts.deadStoreIDs = nil
 	debugRecoverExecuteOpts.Stores.Specs = nil
 	debugRecoverExecuteOpts.confirmAction = prompt

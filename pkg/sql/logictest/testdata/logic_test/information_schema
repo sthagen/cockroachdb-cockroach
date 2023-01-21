@@ -344,10 +344,10 @@ table_type          STRING     false        NULL            ·                  
 is_insertable_into  STRING     false        NULL            ·                      {}       false
 version             INT8       true         NULL            ·                      {}       false
 
-query TTBITTBBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM information_schema.tables
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit  visible
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
 
 query TTTTB colnames
 SHOW CONSTRAINTS FROM information_schema.tables
@@ -410,6 +410,7 @@ crdb_internal       cluster_settings
 crdb_internal       cluster_statement_statistics
 crdb_internal       cluster_transaction_statistics
 crdb_internal       cluster_transactions
+crdb_internal       cluster_txn_execution_insights
 crdb_internal       create_function_statements
 crdb_internal       create_schema_statements
 crdb_internal       create_statements
@@ -449,6 +450,7 @@ crdb_internal       node_sessions
 crdb_internal       node_statement_statistics
 crdb_internal       node_transaction_statistics
 crdb_internal       node_transactions
+crdb_internal       node_txn_execution_insights
 crdb_internal       node_txn_stats
 crdb_internal       partitions
 crdb_internal       pg_catalog_table_is_implemented
@@ -742,6 +744,7 @@ cluster_settings
 cluster_statement_statistics
 cluster_transaction_statistics
 cluster_transactions
+cluster_txn_execution_insights
 create_function_statements
 create_schema_statements
 create_statements
@@ -781,6 +784,7 @@ node_sessions
 node_statement_statistics
 node_transaction_statistics
 node_transactions
+node_txn_execution_insights
 node_txn_stats
 partitions
 pg_catalog_table_is_implemented
@@ -1114,6 +1118,7 @@ system         crdb_internal       cluster_settings                       SYSTEM
 system         crdb_internal       cluster_statement_statistics           SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_transaction_statistics         SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_transactions                   SYSTEM VIEW  NO                  1
+system         crdb_internal       cluster_txn_execution_insights         SYSTEM VIEW  NO                  1
 system         crdb_internal       create_function_statements             SYSTEM VIEW  NO                  1
 system         crdb_internal       create_schema_statements               SYSTEM VIEW  NO                  1
 system         crdb_internal       create_statements                      SYSTEM VIEW  NO                  1
@@ -1153,6 +1158,7 @@ system         crdb_internal       node_sessions                          SYSTEM
 system         crdb_internal       node_statement_statistics              SYSTEM VIEW  NO                  1
 system         crdb_internal       node_transaction_statistics            SYSTEM VIEW  NO                  1
 system         crdb_internal       node_transactions                      SYSTEM VIEW  NO                  1
+system         crdb_internal       node_txn_execution_insights            SYSTEM VIEW  NO                  1
 system         crdb_internal       node_txn_stats                         SYSTEM VIEW  NO                  1
 system         crdb_internal       partitions                             SYSTEM VIEW  NO                  1
 system         crdb_internal       pg_catalog_table_is_implemented        SYSTEM VIEW  NO                  1
@@ -1603,6 +1609,8 @@ system              public             primary                                  
 system              public             29_23_1_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
 system              public             29_23_2_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
 system              public             29_23_3_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
+system              public             29_23_4_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
+system              public             29_23_5_not_null                                                                                                system         public        role_members                     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        role_members                     PRIMARY KEY      NO             NO
 system              public             role_members_role_id_member_id_key                                                                              system         public        role_members                     UNIQUE           NO             NO
 system              public             29_33_1_not_null                                                                                                system         public        role_options                     CHECK            NO             NO
@@ -1768,6 +1776,8 @@ system              public             29_21_4_not_null                         
 system              public             29_23_1_not_null                                                                                                role IS NOT NULL
 system              public             29_23_2_not_null                                                                                                member IS NOT NULL
 system              public             29_23_3_not_null                                                                                                isAdmin IS NOT NULL
+system              public             29_23_4_not_null                                                                                                role_id IS NOT NULL
+system              public             29_23_5_not_null                                                                                                member_id IS NOT NULL
 system              public             29_24_1_not_null                                                                                                type IS NOT NULL
 system              public             29_24_2_not_null                                                                                                object_id IS NOT NULL
 system              public             29_24_3_not_null                                                                                                sub_id IS NOT NULL
@@ -2814,6 +2824,7 @@ NULL     public   system         crdb_internal       cluster_settings           
 NULL     public   system         crdb_internal       cluster_statement_statistics           SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_transaction_statistics         SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_transactions                   SELECT          NO            YES
+NULL     public   system         crdb_internal       cluster_txn_execution_insights         SELECT          NO            YES
 NULL     public   system         crdb_internal       create_function_statements             SELECT          NO            YES
 NULL     public   system         crdb_internal       create_schema_statements               SELECT          NO            YES
 NULL     public   system         crdb_internal       create_statements                      SELECT          NO            YES
@@ -2853,6 +2864,7 @@ NULL     public   system         crdb_internal       node_sessions              
 NULL     public   system         crdb_internal       node_statement_statistics              SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transaction_statistics            SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transactions                      SELECT          NO            YES
+NULL     public   system         crdb_internal       node_txn_execution_insights            SELECT          NO            YES
 NULL     public   system         crdb_internal       node_txn_stats                         SELECT          NO            YES
 NULL     public   system         crdb_internal       partitions                             SELECT          NO            YES
 NULL     public   system         crdb_internal       pg_catalog_table_is_implemented        SELECT          NO            YES
@@ -3402,6 +3414,7 @@ NULL     public   system         crdb_internal       cluster_settings           
 NULL     public   system         crdb_internal       cluster_statement_statistics           SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_transaction_statistics         SELECT          NO            YES
 NULL     public   system         crdb_internal       cluster_transactions                   SELECT          NO            YES
+NULL     public   system         crdb_internal       cluster_txn_execution_insights         SELECT          NO            YES
 NULL     public   system         crdb_internal       create_function_statements             SELECT          NO            YES
 NULL     public   system         crdb_internal       create_schema_statements               SELECT          NO            YES
 NULL     public   system         crdb_internal       create_statements                      SELECT          NO            YES
@@ -3441,6 +3454,7 @@ NULL     public   system         crdb_internal       node_sessions              
 NULL     public   system         crdb_internal       node_statement_statistics              SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transaction_statistics            SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transactions                      SELECT          NO            YES
+NULL     public   system         crdb_internal       node_txn_execution_insights            SELECT          NO            YES
 NULL     public   system         crdb_internal       node_txn_stats                         SELECT          NO            YES
 NULL     public   system         crdb_internal       partitions                             SELECT          NO            YES
 NULL     public   system         crdb_internal       pg_catalog_table_is_implemented        SELECT          NO            YES
@@ -4770,6 +4784,7 @@ check_function_bodies                                 on
 client_encoding                                       UTF8
 client_min_messages                                   notice
 copy_from_atomic_enabled                              on
+copy_from_retries_enabled                             off
 cost_scans_with_default_col_size                      off
 database                                              test
 datestyle                                             ISO, MDY

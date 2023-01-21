@@ -267,8 +267,10 @@ func initBinariesAndLibraries() {
 }
 
 // execCmd is like execCmdEx, but doesn't return the command's output.
-func execCmd(ctx context.Context, l *logger.Logger, clusterName string, args ...string) error {
-	return execCmdEx(ctx, l, clusterName, args...).err
+func execCmd(
+	ctx context.Context, l *logger.Logger, clusterName string, secure bool, args ...string,
+) error {
+	return execCmdEx(ctx, l, clusterName, secure, args...).err
 }
 
 type cmdRes struct {
@@ -283,7 +285,9 @@ type cmdRes struct {
 // Note that the output is truncated; only a tail is returned.
 // Also note that if the command exits with an error code, its output is also
 // included in cmdRes.err.
-func execCmdEx(ctx context.Context, l *logger.Logger, clusterName string, args ...string) cmdRes {
+func execCmdEx(
+	ctx context.Context, l *logger.Logger, clusterName string, secure bool, args ...string,
+) cmdRes {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -380,7 +384,7 @@ func execCmdEx(ctx context.Context, l *logger.Logger, clusterName string, args .
 		}
 	}
 
-	err := roachprod.Run(ctx, l, clusterName, "" /* SSHOptions */, "" /* processTag */, false /* secure */, roachprodRunStdout, roachprodRunStderr, args)
+	err := roachprod.Run(ctx, l, clusterName, "" /* SSHOptions */, "" /* processTag */, secure, roachprodRunStdout, roachprodRunStderr, args)
 	closePipes(ctx)
 	wg.Wait()
 
@@ -1950,7 +1954,7 @@ func (c *clusterImpl) RunE(ctx context.Context, node option.NodeListOption, args
 	if err := errors.Wrap(ctx.Err(), "cluster.RunE"); err != nil {
 		return err
 	}
-	err = execCmd(ctx, l, c.MakeNodes(node), args...)
+	err = execCmd(ctx, l, c.MakeNodes(node), c.IsSecure(), args...)
 
 	l.Printf("> result: %+v", err)
 	if err := ctx.Err(); err != nil {
@@ -2071,29 +2075,13 @@ func (c *clusterImpl) Install(
 	return errors.Wrap(roachprod.Install(ctx, l, c.MakeNodes(nodes), software), "cluster.Install")
 }
 
-var reOnlyAlphanumeric = regexp.MustCompile(`[^a-zA-Z0-9]+`)
-
 // cmdLogFileName comes up with a log file to use for the given argument string.
 func cmdLogFileName(t time.Time, nodes option.NodeListOption, args ...string) string {
-	// Make sure we treat {"./cockroach start"} like {"./cockroach", "start"}.
-	args = strings.Split(strings.Join(args, " "), " ")
-	prefix := []string{reOnlyAlphanumeric.ReplaceAllString(args[0], "")}
-	for _, arg := range args[1:] {
-		if s := reOnlyAlphanumeric.ReplaceAllString(arg, ""); s != arg {
-			break
-		}
-		prefix = append(prefix, arg)
-	}
-	s := strings.Join(prefix, "_")
-	const maxLen = 70
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
 	logFile := fmt.Sprintf(
 		"run_%s_n%s_%s",
 		t.Format(`150405.000000000`),
 		nodes.String()[1:],
-		s,
+		install.GenFilenameFromArgs(20, args...),
 	)
 	return logFile
 }
@@ -2119,7 +2107,9 @@ func (c *clusterImpl) loggerForCmd(
 func (c *clusterImpl) pgURLErr(
 	ctx context.Context, l *logger.Logger, node option.NodeListOption, external bool,
 ) ([]string, error) {
-	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(node), c.localCertsDir, external, c.localCertsDir != "" /* secure */)
+	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(node), c.localCertsDir, roachprod.PGURLOptions{
+		External: external,
+		Secure:   c.localCertsDir != ""})
 	if err != nil {
 		return nil, err
 	}

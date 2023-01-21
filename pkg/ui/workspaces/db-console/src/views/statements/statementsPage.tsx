@@ -30,7 +30,10 @@ import {
   createStatementDiagnosticsAlertLocalSetting,
   cancelStatementDiagnosticsAlertLocalSetting,
 } from "src/redux/alerts";
-import { selectHasViewActivityRedactedRole } from "src/redux/user";
+import {
+  selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
+} from "src/redux/user";
 import { queryByName } from "src/util/query";
 
 import {
@@ -64,7 +67,10 @@ import {
   mapStateToRecentStatementViewProps,
 } from "./recentStatementsSelectors";
 import { selectTimeScale } from "src/redux/timeScale";
-import { selectStatementsLastUpdated } from "src/selectors/executionFingerprintsSelectors";
+import {
+  selectStatementsLastUpdated,
+  selectStatementsDataValid,
+} from "src/selectors/executionFingerprintsSelectors";
 import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
 type ICollectedStatementStatistics =
@@ -376,10 +382,12 @@ export default withRouter(
         search: searchLocalSetting.selector(state),
         sortSetting: sortSettingLocalSetting.selector(state),
         statements: selectStatements(state, props),
+        isDataValid: selectStatementsDataValid(state),
         lastUpdated: selectStatementsLastUpdated(state),
         statementsError: state.cachedData.statements.lastError,
         totalFingerprints: selectTotalFingerprints(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+        hasAdminRole: selectHasAdminRole(state),
       },
       activePageProps: mapStateToRecentStatementViewProps(state),
     }),

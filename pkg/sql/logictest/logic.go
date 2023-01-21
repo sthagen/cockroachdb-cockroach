@@ -1264,6 +1264,7 @@ func (t *logicTest) newTestServerCluster(bootstrapBinaryPath string, upgradeBina
 		testserver.StoreOnDiskOpt(),
 		testserver.CockroachBinaryPathOpt(bootstrapBinaryPath),
 		testserver.UpgradeCockroachBinaryPathOpt(upgradeBinaryPath),
+		testserver.PollListenURLTimeoutOpt(120),
 		testserver.AddListenAddrPortOpt(ports[0]),
 		testserver.AddListenAddrPortOpt(ports[1]),
 		testserver.AddListenAddrPortOpt(ports[2]),
@@ -1502,6 +1503,9 @@ func (t *logicTest) newCluster(
 			if err != nil {
 				t.rootT.Fatalf("%+v", err)
 			}
+			if err := tenant.WaitForTenantEndKeySplit(context.Background()); err != nil {
+				t.rootT.Fatalf("%+v", err)
+			}
 			t.tenantAddrs[i] = tenant.SQLAddr()
 		}
 
@@ -1561,7 +1565,7 @@ func (t *logicTest) newCluster(
 			// indicates as such. As this is a tenant read-only cluster setting, only
 			// the operator is allowed to set it.
 			if _, err := conn.Exec(
-				"ALTER TENANT $1 SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true",
+				"ALTER TENANT [$1] SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true",
 				serverutils.TestTenantID().ToUint64(),
 			); err != nil {
 				t.Fatal(err)
@@ -1574,7 +1578,7 @@ func (t *logicTest) newCluster(
 			// setting, only the operator is allowed to set it.
 			if _, err := conn.Exec(
 				fmt.Sprintf(
-					"ALTER TENANT $1 SET CLUSTER SETTING %s = true",
+					"ALTER TENANT [$1] SET CLUSTER SETTING %s = true",
 					sql.SecondaryTenantsMultiRegionAbstractionsEnabledSettingName,
 				),
 				serverutils.TestTenantID().ToUint64(),
@@ -1586,7 +1590,7 @@ func (t *logicTest) newCluster(
 		if clusterSettingOverrideArgs.overrideMultiTenantSplitAtAllowed {
 			if _, err := conn.Exec(
 				fmt.Sprintf(
-					"ALTER TENANT $1 SET CLUSTER SETTING %s = true",
+					"ALTER TENANT [$1] SET CLUSTER SETTING %s = true",
 					sql.SecondaryTenantSplitAtEnabled.Key(),
 				),
 				serverutils.TestTenantID().ToUint64(),

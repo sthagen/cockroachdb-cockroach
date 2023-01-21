@@ -301,6 +301,13 @@ func TestTenantLogic_as_of(
 	runLogicTest(t, "as_of")
 }
 
+func TestTenantLogic_asyncpg(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "asyncpg")
+}
+
 func TestTenantLogic_auto_span_config_reconciliation_job(
 	t *testing.T,
 ) {
@@ -1741,6 +1748,13 @@ func TestTenantLogic_span_builtins(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "span_builtins")
+}
+
+func TestTenantLogic_sql_keys(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "sql_keys")
 }
 
 func TestTenantLogic_sqllite(

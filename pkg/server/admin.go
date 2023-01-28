@@ -2634,7 +2634,92 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 func (s *systemAdminServer) DecommissionPreCheck(
 	ctx context.Context, req *serverpb.DecommissionPreCheckRequest,
 ) (*serverpb.DecommissionPreCheckResponse, error) {
-	return nil, grpcstatus.Errorf(codes.Unimplemented, "method DecommissionPreCheck not implemented")
+	var collectTraces bool
+	if s := tracing.SpanFromContext(ctx); (s != nil && s.RecordingType() != tracingpb.RecordingOff) || req.CollectTraces {
+		collectTraces = true
+	}
+
+	// Initially evaluate node liveness status, so we filter the nodes to check.
+	var nodesToCheck []roachpb.NodeID
+	livenessStatusByNodeID, err := getLivenessStatusMap(ctx, s.nodeLiveness, s.clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, serverError(ctx, err)
+	}
+
+	resp := &serverpb.DecommissionPreCheckResponse{}
+	resultsByNodeID := make(map[roachpb.NodeID]serverpb.DecommissionPreCheckResponse_NodeCheckResult)
+
+	// Any nodes that are already decommissioned or have unknown liveness should
+	// not be checked, and are added to response without replica counts or errors.
+	for _, nID := range req.NodeIDs {
+		livenessStatus := livenessStatusByNodeID[nID]
+		if livenessStatus == livenesspb.NodeLivenessStatus_UNKNOWN {
+			resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+				NodeID:                nID,
+				DecommissionReadiness: serverpb.DecommissionPreCheckResponse_UNKNOWN,
+				LivenessStatus:        livenessStatus,
+			}
+		} else if livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
+			resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+				NodeID:                nID,
+				DecommissionReadiness: serverpb.DecommissionPreCheckResponse_ALREADY_DECOMMISSIONED,
+				LivenessStatus:        livenessStatus,
+			}
+		} else {
+			nodesToCheck = append(nodesToCheck, nID)
+		}
+	}
+
+	results, err := s.server.DecommissionPreCheck(ctx, nodesToCheck, req.StrictReadiness, collectTraces, int(req.NumReplicaReport))
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect ranges that encountered errors by the nodes on which their replicas
+	// exist. Ranges with replicas on multiple checked nodes will result in the
+	// error being reported for each nodeID.
+	rangeCheckErrsByNode := make(map[roachpb.NodeID][]serverpb.DecommissionPreCheckResponse_RangeCheckResult)
+	for _, rangeWithErr := range results.rangesNotReady {
+		rangeCheckResult := serverpb.DecommissionPreCheckResponse_RangeCheckResult{
+			RangeID: rangeWithErr.desc.RangeID,
+			Action:  rangeWithErr.action,
+			Events:  recordedSpansToTraceEvents(rangeWithErr.tracingSpans),
+			Error:   rangeWithErr.err.Error(),
+		}
+
+		for _, nID := range nodesToCheck {
+			if rangeWithErr.desc.Replicas().HasReplicaOnNode(nID) {
+				rangeCheckErrsByNode[nID] = append(rangeCheckErrsByNode[nID], rangeCheckResult)
+			}
+		}
+	}
+
+	// Evaluate readiness for each node to check based on how many ranges have
+	// replicas on the node that did not pass checks.
+	for _, nID := range nodesToCheck {
+		numReplicas := len(results.replicasByNode[nID])
+		var readiness serverpb.DecommissionPreCheckResponse_NodeReadiness
+		if len(rangeCheckErrsByNode[nID]) > 0 {
+			readiness = serverpb.DecommissionPreCheckResponse_ALLOCATION_ERRORS
+		} else {
+			readiness = serverpb.DecommissionPreCheckResponse_READY
+		}
+
+		resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+			NodeID:                nID,
+			DecommissionReadiness: readiness,
+			LivenessStatus:        livenessStatusByNodeID[nID],
+			ReplicaCount:          int64(numReplicas),
+			CheckedRanges:         rangeCheckErrsByNode[nID],
+		}
+	}
+
+	// Reorder checked nodes to match request order.
+	for _, nID := range req.NodeIDs {
+		resp.CheckedNodes = append(resp.CheckedNodes, resultsByNodeID[nID])
+	}
+
+	return resp, nil
 }
 
 // DecommissionStatus returns the DecommissionStatus for all or the given nodes.
@@ -3259,19 +3344,38 @@ func (s *systemAdminServer) RecoveryCollectLocalReplicaInfo(
 func (s *systemAdminServer) RecoveryStagePlan(
 	ctx context.Context, request *serverpb.RecoveryStagePlanRequest,
 ) (*serverpb.RecoveryStagePlanResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93044")
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Ops.Info(ctx, "staging recovery plan")
+	return s.server.recoveryServer.StagePlan(ctx, request)
 }
 
 func (s *systemAdminServer) RecoveryNodeStatus(
 	ctx context.Context, request *serverpb.RecoveryNodeStatusRequest,
 ) (*serverpb.RecoveryNodeStatusResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.server.recoveryServer.NodeStatus(ctx, request)
 }
 
 func (s *systemAdminServer) RecoveryVerify(
 	ctx context.Context, request *serverpb.RecoveryVerifyRequest,
 ) (*serverpb.RecoveryVerifyResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.server.recoveryServer.Verify(ctx, request)
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses
@@ -4200,33 +4304,27 @@ func (s *adminServer) RecoveryVerify(
 	return nil, errors.AssertionFailedf("To be implemented by #93043")
 }
 
-// ListTenants returns a list of active tenants in the cluster. Calling this
-// function will start in-process tenants if they are not already running.
+// ListTenants returns a list of tenants that are served
+// by shared-process services in this server.
 func (s *systemAdminServer) ListTenants(
 	ctx context.Context, _ *serverpb.ListTenantsRequest,
 ) (*serverpb.ListTenantsResponse, error) {
-	ie := s.internalExecutor
-	rowIter, err := ie.QueryIterator(ctx, "list-tenants", nil, /* txn */
-		`SELECT name FROM system.tenants WHERE active = true AND name IS NOT NULL`)
+	tenantNames, err := s.server.serverController.getExpectedRunningTenants(ctx, s.internalExecutor)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rowIter.Close() }()
 
-	var tenantNames []roachpb.TenantName
-	var hasNext bool
-	for hasNext, err = rowIter.Next(ctx); hasNext && err == nil; hasNext, err = rowIter.Next(ctx) {
-		row := rowIter.Cur()
-		tenantName := tree.MustBeDString(row[0])
-		tenantNames = append(tenantNames, roachpb.TenantName(tenantName))
-	}
-
-	var tenantList []*serverpb.Tenant
+	tenantList := make([]*serverpb.Tenant, 0, len(tenantNames))
 	for _, tenantName := range tenantNames {
-		server, err := s.server.serverController.getOrCreateServer(ctx, tenantName)
+		server, err := s.server.serverController.getServer(ctx, tenantName)
 		if err != nil {
-			log.Errorf(ctx, "unable to get or create a tenant server: %v", err)
-			continue
+			if errors.Is(err, errNoTenantServerRunning) {
+				// The service for this tenant is not started yet. This is not
+				// an error - the services are started asynchronously. The
+				// client can try again later.
+				continue
+			}
+			return nil, err
 		}
 		tenantID := server.getTenantID()
 		tenantList = append(tenantList, &serverpb.Tenant{

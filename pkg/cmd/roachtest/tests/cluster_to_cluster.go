@@ -26,10 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -208,7 +208,7 @@ func setupC2C(
 	srcNode := srcCluster.RandNode()
 	destNode := dstCluster.RandNode()
 
-	addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode)
+	addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode, "")
 	require.NoError(t, err)
 
 	srcDB := c.Conn(ctx, t.L(), srcNode[0])
@@ -248,8 +248,11 @@ func setupC2C(
 10000000000, now(), 0);`, srcTenantInfo.ID)
 
 	createSystemRole(t, srcTenantInfo.name+" system tenant", srcTenantInfo.sql)
-	createSystemRole(t, destTenantInfo.name+" system tenant", destTenantInfo.sql)
+	createSystemRole(t, srcTenantInfo.name+" system tenant", destTenantInfo.sql)
 
+	srcTenantDB := c.Conn(ctx, t.L(), srcNode[0], option.TenantName(srcTenantName))
+	srcTenantSQL := sqlutils.MakeSQLRunner(srcTenantDB)
+	createSystemRole(t, destTenantInfo.name+" app tenant", srcTenantSQL)
 	return &c2cSetup{
 		src:          srcTenantInfo,
 		dst:          destTenantInfo,
@@ -484,7 +487,7 @@ func registerClusterToCluster(r registry.Registry) {
 }
 func getIngestionJobID(t test.Test, dstSQL *sqlutils.SQLRunner, dstTenantName string) int {
 	var tenantInfoBytes []byte
-	var tenantInfo descpb.TenantInfo
+	var tenantInfo mtinfopb.ProtoInfo
 	dstSQL.QueryRow(t, "SELECT info FROM system.tenants WHERE name=$1",
 		dstTenantName).Scan(&tenantInfoBytes)
 	require.NoError(t, protoutil.Unmarshal(tenantInfoBytes, &tenantInfo))

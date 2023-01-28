@@ -47,7 +47,7 @@ type decommissioningNodeMap struct {
 // and target for a single range that has an extant replica on a node targeted
 // for decommission.
 type decommissionRangeCheckResult struct {
-	desc         *roachpb.RangeDescriptor
+	desc         roachpb.RangeDescriptor
 	action       string
 	tracingSpans tracingpb.Recording
 	err          error
@@ -223,7 +223,12 @@ func (s *Server) DecommissionPreCheck(
 	overrideNodeLivenessFn := storepool.OverrideNodeLivenessFunc(
 		decommissionCheckNodeIDs, existingStorePool.NodeLivenessFn,
 	)
-	overrideStorePool := storepool.NewOverrideStorePool(existingStorePool, overrideNodeLivenessFn)
+	overrideNodeCount := storepool.OverrideNodeCountFunc(
+		decommissionCheckNodeIDs, evalStore.GetStoreConfig().NodeLiveness,
+	)
+	overrideStorePool := storepool.NewOverrideStorePool(
+		existingStorePool, overrideNodeLivenessFn, overrideNodeCount,
+	)
 
 	// Define our replica filter to only look at the replicas on the checked nodes.
 	predHasDecommissioningReplica := func(rDesc roachpb.ReplicaDescriptor) bool {
@@ -295,7 +300,7 @@ func evaluateRangeCheckResult(
 	rErr error,
 ) (passed bool, _ decommissionRangeCheckResult) {
 	checkResult := decommissionRangeCheckResult{
-		desc:   desc,
+		desc:   *desc,
 		action: action.String(),
 		err:    rErr,
 	}

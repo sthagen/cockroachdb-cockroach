@@ -1111,14 +1111,17 @@ func makeJobsTableRows(
 	}
 	defer cleanup(ctx)
 
-	sessionJobs := make([]*jobs.Record, 0, len(p.extendedEvalCtx.SchemaChangeJobRecords))
+	sessionJobs := make([]*jobs.Record, 0, p.extendedEvalCtx.jobs.numToCreate())
 	uniqueJobs := make(map[*jobs.Record]struct{})
-	for _, job := range p.extendedEvalCtx.SchemaChangeJobRecords {
+	if err := p.extendedEvalCtx.jobs.forEachToCreate(func(job *jobs.Record) error {
 		if _, ok := uniqueJobs[job]; ok {
-			continue
+			return nil
 		}
 		sessionJobs = append(sessionJobs, job)
 		uniqueJobs[job] = struct{}{}
+		return nil
+	}); err != nil {
+		return matched, err
 	}
 
 	// Loop while we need to skip a row.
@@ -1362,6 +1365,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   max_disk_usage_var  FLOAT,
   contention_time_avg FLOAT,
   contention_time_var FLOAT,
+  cpu_nanos_avg       FLOAT,
+  cpu_nanos_var       FLOAT,
   implicit_txn        BOOL NOT NULL,
   full_scan           BOOL NOT NULL,
   sample_plan         JSONB,
@@ -1469,6 +1474,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),        // max_disk_usage_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_avg
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUNanos),            // cpu_nanos_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUNanos),            // cpu_nanos_var
 				tree.MakeDBool(tree.DBool(stats.Key.ImplicitTxn)),                                   // implicit_txn
 				tree.MakeDBool(tree.DBool(stats.Key.FullScan)),                                      // full_scan
 				tree.NewDJSON(samplePlan),           // sample_plan
@@ -1525,7 +1532,9 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
   max_disk_usage_avg  FLOAT,
   max_disk_usage_var  FLOAT,
   contention_time_avg FLOAT,
-  contention_time_var FLOAT
+  contention_time_var FLOAT,
+  cpu_nanos_avg       FLOAT,
+  cpu_nanos_var       FLOAT
 )
 `,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -1580,6 +1589,8 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),       // max_disk_usage_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_avg
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUNanos),           // cpu_nanos_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUNanos),           // cpu_nanos_var
 			)
 
 			if err != nil {
@@ -5292,10 +5303,10 @@ func collectMarshaledJobMetadataMap(
 	if err := it.Close(); err != nil {
 		return nil, err
 	}
-	for _, record := range p.ExtendedEvalContext().SchemaChangeJobRecords {
+	if err := p.ExtendedEvalContext().jobs.forEachToCreate(func(record *jobs.Record) error {
 		progressBytes, payloadBytes, err := getPayloadAndProgressFromJobsRecord(p, record)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		mj := marshaledJobMetadata{
 			status:        tree.NewDString(string(record.RunningStatus)),
@@ -5303,6 +5314,9 @@ func collectMarshaledJobMetadataMap(
 			progressBytes: progressBytes,
 		}
 		m[record.JobID] = mj
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return m, nil
 }

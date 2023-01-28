@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -53,8 +54,15 @@ func (b *builderState) QueryByID(id catid.DescID) scbuildstmt.ElementResultSet {
 }
 
 // Ensure implements the scbuildstmt.BuilderState interface.
-func (b *builderState) Ensure(
-	current scpb.Status, target scpb.TargetStatus, e scpb.Element, meta scpb.TargetMetadata,
+func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scpb.TargetMetadata) {
+	b.ensure(e, scpb.Status_UNKNOWN, scpb.InvalidTarget, target, meta)
+}
+
+// ensure is a helper function that ensures the presence of a target.
+// The target may be newly defined via Ensure or may be re-used from
+// a previous state and imported via newBuilderState.
+func (b *builderState) ensure(
+	e scpb.Element, current scpb.Status, previous, target scpb.TargetStatus, meta scpb.TargetMetadata,
 ) {
 	if e == nil {
 		panic(errors.AssertionFailedf("cannot define target for nil element"))
@@ -72,6 +80,9 @@ func (b *builderState) Ensure(
 		if current != scpb.Status_UNKNOWN {
 			es.current = current
 		}
+		if previous != scpb.InvalidTarget {
+			es.previous = previous
+		}
 		es.target = target
 		es.element = e
 		es.metadata = meta
@@ -86,12 +97,33 @@ func (b *builderState) Ensure(
 		c.elementIndexMap[key] = len(b.output)
 		b.output = append(b.output, elementState{
 			element:  e,
+			previous: previous,
 			target:   target,
 			current:  current,
 			metadata: meta,
 		})
 	}
+}
 
+// LogEventForExistingTarget implements the scbuildstmt.BuilderState interface.
+func (b *builderState) LogEventForExistingTarget(e scpb.Element) {
+	id := screl.GetDescID(e)
+	key := screl.ElementString(e)
+
+	c, ok := b.descCache[id]
+	if !ok {
+		panic(errors.AssertionFailedf(
+			"elements for descriptor ID %d not found in builder state, %s expected", id, key))
+	}
+	i, ok := c.elementIndexMap[key]
+	if !ok {
+		panic(errors.AssertionFailedf("element %s expected in builder state but not found", key))
+	}
+	es := &b.output[i]
+	if es.target == scpb.InvalidTarget {
+		panic(errors.AssertionFailedf("no target set for element %s in builder state", key))
+	}
+	es.withLogEvent = true
 }
 
 // ForEachElementStatus implements the scpb.ElementStatusIterator interface.
@@ -928,6 +960,44 @@ func (b *builderState) ResolveConstraint(
 	})
 }
 
+func (b *builderState) ResolveUDF(
+	fnObj *tree.FuncObj, p scbuildstmt.ResolveParams,
+) scbuildstmt.ElementResultSet {
+	fd, err := b.cr.ResolveFunction(b.ctx, fnObj.FuncName.ToUnresolvedObjectName().ToUnresolvedName(), b.semaCtx.SearchPath)
+	if err != nil {
+		if p.IsExistenceOptional && errors.Is(err, tree.ErrFunctionUndefined) {
+			return nil
+		}
+		panic(err)
+	}
+
+	paramTypes, err := fnObj.ParamTypes(b.ctx, b.cr)
+	if err != nil {
+		return nil
+	}
+	ol, err := fd.MatchOverload(paramTypes, fnObj.FuncName.Schema(), b.semaCtx.SearchPath)
+	if err != nil {
+		if p.IsExistenceOptional && errors.Is(err, tree.ErrFunctionUndefined) {
+			return nil
+		}
+		panic(err)
+	}
+
+	if !ol.IsUDF {
+		panic(
+			errors.Errorf(
+				"cannot perform schema change on function %s%s because it is required by the database system",
+				fnObj.FuncName.Object(), ol.Signature(true),
+			),
+		)
+	}
+
+	fnID := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
+	b.mustOwn(fnID)
+	b.ensureDescriptor(fnID)
+	return b.descCache[fnID].ers
+}
+
 func (b *builderState) ensureDescriptor(id catid.DescID) {
 	if _, found := b.descCache[id]; found {
 		return
@@ -963,7 +1033,8 @@ func (b *builderState) ensureDescriptor(id catid.DescID) {
 		})
 	}
 
-	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn, b.commentGetter, b.zoneConfigReader)
+	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn,
+		b.commentGetter, b.zoneConfigReader, b.evalCtx.Settings.Version.ActiveVersion(b.ctx))
 	// Name prefix and namespace lookups.
 	switch d := c.desc.(type) {
 	case catalog.DatabaseDescriptor:

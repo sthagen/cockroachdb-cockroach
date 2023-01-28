@@ -13,12 +13,12 @@ package scdecomp
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
@@ -36,6 +36,7 @@ type walkCtx struct {
 	backRefs             catalog.DescriptorIDSet
 	commentReader        CommentGetter
 	zoneConfigReader     ZoneConfigGetter
+	clusterVersion       clusterversion.ClusterVersion
 }
 
 // WalkDescriptor walks through the elements which are implicitly defined in
@@ -64,6 +65,7 @@ func WalkDescriptor(
 	ev ElementVisitor,
 	commentReader CommentGetter,
 	zoneConfigReader ZoneConfigGetter,
+	clusterVersion clusterversion.ClusterVersion,
 ) (backRefs catalog.DescriptorIDSet) {
 	w := walkCtx{
 		ctx:                  ctx,
@@ -73,6 +75,7 @@ func WalkDescriptor(
 		cachedTypeIDClosures: make(map[catid.DescID]catalog.DescriptorIDSet),
 		commentReader:        commentReader,
 		zoneConfigReader:     zoneConfigReader,
+		clusterVersion:       clusterVersion,
 	}
 	w.walkRoot()
 	w.backRefs.Remove(catid.InvalidDescID)
@@ -81,12 +84,14 @@ func WalkDescriptor(
 
 func (w *walkCtx) walkRoot() {
 	// Common elements.
-	w.ev(scpb.Status_PUBLIC, &scpb.Namespace{
-		DatabaseID:   w.desc.GetParentID(),
-		SchemaID:     w.desc.GetParentSchemaID(),
-		DescriptorID: w.desc.GetID(),
-		Name:         w.desc.GetName(),
-	})
+	if !w.desc.SkipNamespace() {
+		w.ev(scpb.Status_PUBLIC, &scpb.Namespace{
+			DatabaseID:   w.desc.GetParentID(),
+			SchemaID:     w.desc.GetParentSchemaID(),
+			DescriptorID: w.desc.GetID(),
+			Name:         w.desc.GetName(),
+		})
+	}
 	privileges := w.desc.GetPrivileges()
 	w.ev(scpb.Status_PUBLIC, &scpb.Owner{
 		DescriptorID: w.desc.GetID(),
@@ -110,10 +115,7 @@ func (w *walkCtx) walkRoot() {
 	case catalog.TableDescriptor:
 		w.walkRelation(d)
 	case catalog.FunctionDescriptor:
-		// TODO (Chengxiong) #83235 implement DROP FUNCTION.
-		// Fall back to legacy schema changer if there is any function descriptor in
-		// the drop cascade dependency graph.
-		panic(scerrors.NotImplementedErrorf(nil, "function descriptor not supported in declarative schema changer"))
+		w.walkFunction(d)
 	default:
 		panic(errors.AssertionFailedf("unexpected descriptor type %T: %+v",
 			w.desc, w.desc))
@@ -418,10 +420,11 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 	})
 	{
 		columnType := &scpb.ColumnType{
-			TableID:    tbl.GetID(),
-			ColumnID:   col.GetID(),
-			IsNullable: col.IsNullable(),
-			IsVirtual:  col.IsVirtual(),
+			TableID:                 tbl.GetID(),
+			ColumnID:                col.GetID(),
+			IsNullable:              col.IsNullable(),
+			IsVirtual:               col.IsVirtual(),
+			ElementCreationMetadata: NewElementCreationMetadata(w.clusterVersion),
 		}
 		_ = tbl.ForeachFamily(func(family *descpb.ColumnFamilyDescriptor) error {
 			if catalog.MakeTableColSet(family.ColumnIDs...).Contains(col.GetID()) {
@@ -439,6 +442,12 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 			columnType.ComputeExpr = expr
 		}
 		w.ev(scpb.Status_PUBLIC, columnType)
+	}
+	if !col.IsNullable() {
+		w.ev(scpb.Status_PUBLIC, &scpb.ColumnNotNull{
+			TableID:  tbl.GetID(),
+			ColumnID: col.GetID(),
+		})
 	}
 	if col.HasDefault() {
 		expr, err := w.newExpression(col.GetDefaultExpr())
@@ -666,4 +675,108 @@ func (w *walkCtx) walkForeignKeyConstraint(
 			Comment:      comment,
 		})
 	}
+}
+
+func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
+	typeT := newTypeT(fnDesc.GetReturnType().Type)
+	fn := &scpb.Function{
+		FunctionID: fnDesc.GetID(),
+		ReturnSet:  fnDesc.GetReturnType().ReturnSet,
+		ReturnType: *typeT,
+		Params:     make([]scpb.Function_Parameter, len(fnDesc.GetParams())),
+	}
+	for i, param := range fnDesc.GetParams() {
+		typeT := newTypeT(param.Type)
+		fn.Params[i] = scpb.Function_Parameter{
+			Name:  param.Name,
+			Class: catpb.FunctionParamClass{Class: param.Class},
+			Type:  *typeT,
+		}
+		if param.DefaultExpr != nil {
+			expr, err := w.newExpression(*param.DefaultExpr)
+			if err != nil {
+				panic(err)
+			}
+			w.ev(scpb.Status_PUBLIC, &scpb.FunctionParamDefaultExpression{
+				FunctionID: fnDesc.GetID(),
+				Ordinal:    uint32(i),
+				Expression: *expr,
+			})
+		}
+	}
+
+	w.ev(descriptorStatus(fnDesc), fn)
+	w.ev(scpb.Status_PUBLIC, &scpb.ObjectParent{
+		ObjectID:       fnDesc.GetID(),
+		ParentSchemaID: fnDesc.GetParentSchemaID(),
+	})
+	w.ev(scpb.Status_PUBLIC, &scpb.FunctionName{
+		FunctionID: fnDesc.GetID(),
+		Name:       fnDesc.GetName(),
+	})
+	w.ev(scpb.Status_PUBLIC, &scpb.FunctionVolatility{
+		FunctionID: fnDesc.GetID(),
+		Volatility: catpb.FunctionVolatility{Volatility: fnDesc.GetVolatility()},
+	})
+	w.ev(scpb.Status_PUBLIC, &scpb.FunctionLeakProof{
+		FunctionID: fnDesc.GetID(),
+		LeakProof:  fnDesc.GetLeakProof(),
+	})
+	w.ev(scpb.Status_PUBLIC, &scpb.FunctionNullInputBehavior{
+		FunctionID:        fnDesc.GetID(),
+		NullInputBehavior: catpb.FunctionNullInputBehavior{NullInputBehavior: fnDesc.GetNullInputBehavior()},
+	})
+
+	fnBody := &scpb.FunctionBody{
+		FunctionID:  fnDesc.GetID(),
+		Body:        fnDesc.GetFunctionBody(),
+		Lang:        catpb.FunctionLanguage{Lang: fnDesc.GetLanguage()},
+		UsesTypeIDs: fnDesc.GetDependsOnTypes(),
+		// TODO(chengxiong): add UsesFunctionIDs
+	}
+	dedupeColIDs := func(colIDs []catid.ColumnID) []catid.ColumnID {
+		ret := catalog.MakeTableColSet()
+		for _, id := range colIDs {
+			ret.Add(id)
+		}
+		return ret.Ordered()
+	}
+	for _, toID := range fnDesc.GetDependsOn() {
+		to := w.lookupFn(toID)
+		toDesc, err := catalog.AsTableDescriptor(to)
+		if err != nil {
+			panic(err)
+		}
+		if toDesc.IsSequence() {
+			fnBody.UsesSequenceIDs = append(fnBody.UsesSequenceIDs, toDesc.GetID())
+		} else if toDesc.IsView() {
+			if err := toDesc.ForeachDependedOnBy(func(dep *descpb.TableDescriptor_Reference) error {
+				if dep.ID != fnDesc.GetID() {
+					return nil
+				}
+				fnBody.UsesViews = append(fnBody.UsesViews, scpb.FunctionBody_ViewReference{
+					ViewID:    toDesc.GetID(),
+					ColumnIDs: dedupeColIDs(dep.ColumnIDs),
+				})
+				return nil
+			}); err != nil {
+				panic(err)
+			}
+		} else {
+			if err := toDesc.ForeachDependedOnBy(func(dep *descpb.TableDescriptor_Reference) error {
+				if dep.ID != fnDesc.GetID() {
+					return nil
+				}
+				fnBody.UsesTables = append(fnBody.UsesTables, scpb.FunctionBody_TableReference{
+					TableID:   toDesc.GetID(),
+					IndexID:   dep.IndexID,
+					ColumnIDs: dedupeColIDs(dep.ColumnIDs),
+				})
+				return nil
+			}); err != nil {
+				panic(err)
+			}
+		}
+	}
+	w.ev(scpb.Status_PUBLIC, fnBody)
 }

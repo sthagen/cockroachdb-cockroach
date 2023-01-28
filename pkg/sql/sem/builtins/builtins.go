@@ -3235,7 +3235,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				ts, dependsOnContext, err := tree.ParseDTimestamp(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 					time.Microsecond,
 				)
@@ -3290,7 +3290,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				ts, dependsOnContext, err := tree.ParseDDate(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 				)
 				if err != nil {
@@ -3340,7 +3340,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				t, dependsOnContext, err := tree.ParseDTime(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 					time.Microsecond,
 				)
@@ -3422,7 +3422,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				t, dependsOnContext, err := tree.ParseDTimeTZ(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 					time.Microsecond,
 				)
@@ -4931,16 +4931,20 @@ value if you rely on the HLC for accuracy.`,
 				`Must be run by the system tenant.`,
 			Volatility: volatility.Volatile,
 		},
+		// This overload is provided for compatibility with CC Serverless
+		// v22.2 and previous versions.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			IsUDF:      true,
-			Body:       `SELECT crdb_internal.create_tenant(json_build_object('id', $1))`,
-			Info:       `create_tenant(id) is an alias for create_tenant('{"id": id}'::jsonb)`,
+			Body: `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'service_mode',
+ 'external'))`,
+			Info:       `create_tenant(id) is an alias for create_tenant('{"id": id, "service_mode": "external"}'::jsonb)`,
 			Volatility: volatility.Volatile,
 		},
+		// This overload is provided for use in tests.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "id", Typ: types.Int},
@@ -4952,6 +4956,7 @@ value if you rely on the HLC for accuracy.`,
 			Info:       `create_tenant(id, name) is an alias for create_tenant('{"id": id, "name": name}'::jsonb)`,
 			Volatility: volatility.Volatile,
 		},
+		// This overload is deprecated. Use CREATE TENANT instead.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "name", Typ: types.String},
@@ -4959,7 +4964,8 @@ value if you rely on the HLC for accuracy.`,
 			ReturnType: tree.FixedReturnType(types.Int),
 			IsUDF:      true,
 			Body:       `SELECT crdb_internal.create_tenant(json_build_object('name', $1))`,
-			Info:       `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb)`,
+			Info: `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb).
+DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -5026,8 +5032,11 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				synchronous := tree.MustBeDBool(args[1])
+
+				// Note: we pass true to ignoreServiceMode for compatibility
+				// with CC Serverless pre-v23.1.
 				if err := evalCtx.Tenant.DropTenantByID(
-					ctx, uint64(sTenID), bool(synchronous),
+					ctx, uint64(sTenID), bool(synchronous), true, /* ignoreServiceMode */
 				); err != nil {
 					return nil, err
 				}
@@ -5940,6 +5949,23 @@ value if you rely on the HLC for accuracy.`,
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				return arrayNumInvertedIndexEntries(evalCtx, args[0], args[1])
+			},
+			Info:              "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility:        volatility.Stable,
+			CalledOnNullInput: true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "val", Typ: types.TSVector},
+				{Name: "version", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DZero, nil
+				}
+				val := args[0].(*tree.DTSVector)
+				return tree.NewDInt(tree.DInt(len(val.TSVector))), nil
 			},
 			Info:              "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility:        volatility.Stable,
@@ -9843,6 +9869,13 @@ func arrayToString(
 	evalCtx *eval.Context, arr *tree.DArray, delim string, nullStr *string,
 ) (tree.Datum, error) {
 	f := evalCtx.FmtCtx(tree.FmtArrayToString)
+	arrayToStringHelper(evalCtx, arr, delim, nullStr, f)
+	return tree.NewDString(f.CloseAndGetString()), nil
+}
+
+func arrayToStringHelper(
+	evalCtx *eval.Context, arr *tree.DArray, delim string, nullStr *string, f *tree.FmtCtx,
+) {
 
 	for i := range arr.Array {
 		if arr.Array[i] == tree.DNull {
@@ -9851,13 +9884,17 @@ func arrayToString(
 			}
 			f.WriteString(*nullStr)
 		} else {
-			f.FormatNode(arr.Array[i])
+			if nestedArray, ok := arr.Array[i].(*tree.DArray); ok {
+				// "Unpack" nested arrays to be consistent with postgres.
+				arrayToStringHelper(evalCtx, nestedArray, delim, nullStr, f)
+			} else {
+				f.FormatNode(arr.Array[i])
+			}
 		}
 		if i < len(arr.Array)-1 {
 			f.WriteString(delim)
 		}
 	}
-	return tree.NewDString(f.CloseAndGetString()), nil
 }
 
 // encodeEscape implements the encode(..., 'escape') Postgres builtin. It's
@@ -10381,7 +10418,7 @@ func arrayNumInvertedIndexEntries(
 
 func parseContextFromDateStyle(
 	evalCtx *eval.Context, dateStyleStr string,
-) (tree.ParseTimeContext, error) {
+) (tree.ParseContext, error) {
 	ds, err := pgdate.ParseDateStyle(dateStyleStr, pgdate.DefaultDateStyle())
 	if err != nil {
 		return nil, err
@@ -10389,9 +10426,9 @@ func parseContextFromDateStyle(
 	if ds.Style != pgdate.Style_ISO {
 		return nil, unimplemented.NewWithIssue(41773, "only ISO style is supported")
 	}
-	return tree.NewParseTimeContext(
+	return tree.NewParseContext(
 		evalCtx.GetTxnTimestamp(time.Microsecond).Time,
-		tree.NewParseTimeContextOptionDateStyle(ds),
+		tree.NewParseContextOptionDateStyle(ds),
 	), nil
 }
 

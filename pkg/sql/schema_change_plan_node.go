@@ -64,19 +64,7 @@ func (p *planner) SchemaChange(ctx context.Context, stmt tree.Statement) (planNo
 	}
 	scs := p.extendedEvalCtx.SchemaChangerState
 	scs.stmts = append(scs.stmts, p.stmt.SQL)
-	deps := scdeps.NewBuilderDependencies(
-		p.ExecCfg().NodeInfo.LogicalClusterID(),
-		p.ExecCfg().Codec,
-		p.InternalSQLTxn(),
-		NewSkippingCacheSchemaResolver, /* schemaResolverFactory */
-		p,                              /* authAccessor */
-		p,                              /* astFormatter */
-		p,                              /* featureChecker */
-		p.SessionData(),
-		p.ExecCfg().Settings,
-		scs.stmts,
-		p,
-	)
+	deps := p.newSchemaChangeBuilderDependencies(scs.stmts)
 	state, err := scbuild.Build(ctx, deps, scs.state, stmt)
 	if scerrors.HasNotImplemented(err) &&
 		mode != sessiondatapb.UseNewSchemaChangerUnsafeAlways {
@@ -96,6 +84,23 @@ func (p *planner) SchemaChange(ctx context.Context, stmt tree.Statement) (planNo
 		lastState:    scs.state,
 		plannedState: state,
 	}, nil
+}
+
+func (p *planner) newSchemaChangeBuilderDependencies(statements []string) scbuild.Dependencies {
+	return scdeps.NewBuilderDependencies(
+		p.ExecCfg().NodeInfo.LogicalClusterID(),
+		p.ExecCfg().Codec,
+		p.InternalSQLTxn(),
+		NewSkippingCacheSchemaResolver, /* schemaResolverFactory */
+		p,                              /* authAccessor */
+		p,                              /* astFormatter */
+		p,                              /* featureChecker */
+		p.SessionData(),
+		p.ExecCfg().Settings,
+		statements,
+		p,
+		NewSchemaChangerBuildEventLogger(p.InternalSQLTxn(), p.ExecCfg()),
+	)
 }
 
 // waitForDescriptorIDGeneratorMigration polls the system.descriptor table (in
@@ -242,19 +247,7 @@ func (s *schemaChangePlanNode) startExec(params runParams) error {
 	// to re-plan the state to include the current statement since the statement
 	// phase was not executed.
 	if !reflect.DeepEqual(s.lastState.Current, scs.state.Current) {
-		deps := scdeps.NewBuilderDependencies(
-			p.ExecCfg().NodeInfo.LogicalClusterID(),
-			p.ExecCfg().Codec,
-			p.InternalSQLTxn(),
-			NewSkippingCacheSchemaResolver,
-			p,
-			p,
-			p,
-			p.SessionData(),
-			p.ExecCfg().Settings,
-			scs.stmts,
-			p,
-		)
+		deps := p.newSchemaChangeBuilderDependencies(scs.stmts)
 		state, err := scbuild.Build(params.ctx, deps, scs.state, s.stmt)
 		if err != nil {
 			return err
@@ -314,6 +307,7 @@ func newSchemaChangerTxnRunDependencies(
 		descriptors,
 		execCfg.JobRegistry,
 		execCfg.IndexBackfiller,
+		execCfg.IndexSpanSplitter,
 		execCfg.IndexMerger,
 		// Use a no-op tracker and flusher because while backfilling in a
 		// transaction because we know there's no existing progress and there's
@@ -323,7 +317,6 @@ func newSchemaChangerTxnRunDependencies(
 		execCfg.Validator,
 		scdeps.NewConstantClock(evalContext.GetTxnTimestamp(time.Microsecond).Time),
 		metaDataUpdater,
-		NewSchemaChangerEventLogger(txn, execCfg, 1),
 		execCfg.StatsRefresher,
 		execCfg.DeclarativeSchemaChangerTestingKnobs,
 		kvTrace,

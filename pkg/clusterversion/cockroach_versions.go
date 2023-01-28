@@ -327,8 +327,8 @@ const (
 	// the process of upgrading from 22.2 to 23.1.
 	V23_1Start
 
-	// V23_1TenantNames adds a name column to system.tenants.
-	V23_1TenantNames
+	// V23_1TenantNamesStateAndServiceMode adds columns to system.tenants.
+	V23_1TenantNamesStateAndServiceMode
 
 	// V23_1DescIDSequenceForSystemTenant migrates the descriptor ID generator
 	// counter from a meta key to the system.descriptor_id_seq sequence for the
@@ -400,6 +400,13 @@ const (
 	// as production ready.  This gate functions as a signal to attempt to upgrade
 	// chagnefeeds created prior to this version.
 	V23_1_ChangefeedExpressionProductionReady
+
+	// V23_1KeyVisualizerTablesAndJobs adds the system tables that support the key visualizer.
+	V23_1KeyVisualizerTablesAndJobs
+
+	// V23_1_KVDirectColumnarScans introduces the support of the "direct"
+	// columnar scans in the KV layer.
+	V23_1_KVDirectColumnarScans
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -632,7 +639,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 2},
 	},
 	{
-		Key:     V23_1TenantNames,
+		Key:     V23_1TenantNamesStateAndServiceMode,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 4},
 	},
 	{
@@ -686,6 +693,14 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     V23_1_ChangefeedExpressionProductionReady,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 30},
+	},
+	{
+		Key:     V23_1KeyVisualizerTablesAndJobs,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 32},
+	},
+	{
+		Key:     V23_1_KVDirectColumnarScans,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 34},
 	},
 
 	// *************************************************

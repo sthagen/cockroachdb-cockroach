@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -450,6 +451,10 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 
 	// Tables introduced in 23.1.
 	target.AddDescriptor(systemschema.SystemJobInfoTable)
+	target.AddDescriptor(systemschema.SpanStatsUniqueKeysTable)
+	target.AddDescriptor(systemschema.SpanStatsBucketsTable)
+	target.AddDescriptor(systemschema.SpanStatsSamplesTable)
+	target.AddDescriptor(systemschema.SpanStatsTenantBoundariesTable)
 
 	// Adding a new system table? It should be added here to the metadata schema,
 	// and also created as a migration for older clusters.
@@ -461,7 +466,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 // NumSystemTablesForSystemTenant is the number of system tables defined on
 // the system tenant. This constant is only defined to avoid having to manually
 // update auto stats tests every time a new system table is added.
-const NumSystemTablesForSystemTenant = 42
+const NumSystemTablesForSystemTenant = 46
 
 // addSplitIDs adds a split point for each of the PseudoTableIDs to the supplied
 // MetadataSchema.
@@ -560,10 +565,9 @@ func addSystemDatabaseToSchema(
 // addSystemTenantEntry adds a kv pair to system.tenants to define the initial
 // system tenant entry.
 func addSystemTenantEntry(target *MetadataSchema) {
-	info := descpb.TenantInfo{
-		ID:    roachpb.SystemTenantID.ToUint64(),
-		Name:  catconstants.SystemTenantName,
-		State: descpb.TenantInfo_ACTIVE,
+	info := mtinfopb.ProtoInfo{
+		DeprecatedID:        roachpb.SystemTenantID.ToUint64(),
+		DeprecatedDataState: mtinfopb.ProtoInfo_READY,
 	}
 	infoBytes, err := protoutil.Marshal(&info)
 	if err != nil {
@@ -579,10 +583,18 @@ func addSystemTenantEntry(target *MetadataSchema) {
 	}
 	tenantsTableWriter := MakeKVWriter(target.codec, desc.(catalog.TableDescriptor))
 	kvs, err := tenantsTableWriter.RecordToKeyValues(
+		// ID
 		tree.NewDInt(tree.DInt(roachpb.SystemTenantID.ToUint64())),
+		// active -- deprecated.
 		tree.MakeDBool(true),
+		// info.
 		tree.NewDBytes(tree.DBytes(infoBytes)),
-		tree.NewDString(string(info.Name)),
+		// name.
+		tree.NewDString(catconstants.SystemTenantName),
+		// data_state.
+		tree.NewDInt(tree.DInt(mtinfopb.DataStateReady)),
+		// service_mode.
+		tree.NewDInt(tree.DInt(mtinfopb.ServiceModeShared)),
 	)
 	if err != nil {
 		panic(err)

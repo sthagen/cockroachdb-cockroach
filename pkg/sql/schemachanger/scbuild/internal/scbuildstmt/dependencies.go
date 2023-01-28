@@ -79,8 +79,13 @@ type BuilderState interface {
 	QueryByID(descID catid.DescID) ElementResultSet
 
 	// Ensure ensures the presence of the given element in the BuilderState with
-	// the given statuses and metadata.
-	Ensure(current scpb.Status, target scpb.TargetStatus, elem scpb.Element, meta scpb.TargetMetadata)
+	// the given target status and metadata.
+	Ensure(elem scpb.Element, target scpb.TargetStatus, meta scpb.TargetMetadata)
+
+	// LogEventForExistingTarget tells the builder to write an entry in the event
+	// log for the existing target corresponding to the provided element.
+	// An error is thrown if no such target exists.
+	LogEventForExistingTarget(element scpb.Element)
 }
 
 // EventLogState encapsulates the state of the metadata to decorate the eventlog
@@ -304,6 +309,9 @@ type NameResolver interface {
 
 	// ResolveIndex retrieves an index by name and returns its elements.
 	ResolveIndex(relationID catid.DescID, indexName tree.Name, p ResolveParams) ElementResultSet
+
+	// ResolveUDF retrieves a user defined function and returns its elements.
+	ResolveUDF(fnObj *tree.FuncObj, p ResolveParams) ElementResultSet
 
 	// ResolveIndexByName retrieves a table which contains the target
 	// index and returns its elements. Name of database, schema or table may be

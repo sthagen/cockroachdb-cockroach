@@ -172,6 +172,7 @@ func alterPrimaryKey(b BuildCtx, tn *tree.TableName, tbl *scpb.Table, t alterPri
 		newPrimaryIndexElem = in.primary
 		sourcePrimaryIndexElem = union.primary
 	}
+	b.LogEventForExistingTarget(newPrimaryIndexElem)
 
 	// Recreate all secondary indexes.
 	recreateAllSecondaryIndexes(b, tbl, newPrimaryIndexElem, sourcePrimaryIndexElem)
@@ -249,12 +250,7 @@ func checkForEarlyExit(b BuildCtx, tbl *scpb.Table, t alterPrimaryKeySpec) {
 			panic(pgerror.Newf(pgcode.InvalidSchemaDefinition, "cannot use inaccessible "+
 				"column %q in primary key", col.Column))
 		}
-		_, _, colTypeElem := scpb.FindColumnType(colElems)
-		if colTypeElem == nil {
-			panic(errors.AssertionFailedf("programming error: resolving column %v does not give a "+
-				"ColumnType element.", col.Column))
-		}
-		if colTypeElem.IsNullable {
+		if !isColNotNull(b, tbl.TableID, colElem.ColumnID) {
 			panic(pgerror.Newf(pgcode.InvalidSchemaDefinition, "cannot use nullable column "+
 				"%q in primary key", col.Column))
 		}

@@ -29,7 +29,7 @@ func init() {
 		func(from, to NodeVars) rel.Clauses {
 			return rel.Clauses{
 				from.Type((*scpb.Column)(nil)),
-				to.TypeFilter(IsColumnDependent),
+				to.TypeFilter(rulesVersionKey, isColumnDependent),
 				JoinOnColumnID(from, to, "table-id", "col-id"),
 				StatusesToPublicOrTransient(from, scpb.Status_DELETE_ONLY, to, scpb.Status_PUBLIC),
 			}
@@ -42,7 +42,7 @@ func init() {
 		"dependent", "column",
 		func(from, to NodeVars) rel.Clauses {
 			return rel.Clauses{
-				from.TypeFilter(IsColumnDependent),
+				from.TypeFilter(rulesVersionKey, isColumnDependent),
 				to.Type((*scpb.Column)(nil)),
 				JoinOnColumnID(from, to, "table-id", "col-id"),
 				StatusesToPublicOrTransient(from, scpb.Status_PUBLIC, to, scpb.Status_PUBLIC),
@@ -86,6 +86,30 @@ func init() {
 			}
 		},
 	)
+
+	// Column becomes writable in the same stage as column constraint is enforced.
+	//
+	// This rule exists to prevent the case that the constraint becomes enforced
+	// (which means writes need to honor it) when the column itself is still
+	// in DELETE_ONLY and thus not visible to writes.
+	//
+	// N.B. It's essentially the same rule as "column constraint removed right
+	// before column reaches delete only" but on the adding path.
+	// N.B. SameStage is enough; which transition happens first won't matter.
+	registerDepRule(
+		"column writable right before column constraint is enforced.",
+		scgraph.SameStagePrecedence,
+		"column", "column-constraint",
+		func(from, to NodeVars) rel.Clauses {
+			return rel.Clauses{
+				from.Type((*scpb.Column)(nil)),
+				to.Type((*scpb.ColumnNotNull)(nil)),
+				JoinOnColumnID(from, to, "table-id", "col-id"),
+				StatusesToPublicOrTransient(from, scpb.Status_WRITE_ONLY, to, scpb.Status_WRITE_ONLY),
+			}
+		},
+	)
+
 }
 
 // This rule ensures that columns depend on each other in increasing order.
@@ -98,6 +122,17 @@ func init() {
 			status := rel.Var("status")
 			return rel.Clauses{
 				from.Type((*scpb.Column)(nil)),
+				// Join first on the target and node to only explore all columns
+				// which are being added as opposed to all columns. If we joined
+				// first on the columns, we'd be filtering the cross product of
+				// table columns. If a relation has a lot of columns, this can hurt.
+				// It's less likely that we have a very large number of columns which
+				// are being added. We'll want to do something else here when we start
+				// creating tables and all the columns are being added.
+				//
+				// The "right" answer is to push ordering predicates into rel; it also
+				// is maintaining sorted data structures.
+				from.JoinTargetNode(),
 				to.Type((*scpb.Column)(nil)),
 				JoinOnDescID(from, to, "table-id"),
 				ToPublicOrTransient(from, to),

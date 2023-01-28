@@ -149,7 +149,7 @@ func (ex *connExecutor) execStmt(
 		// Cancel the session if the idle time exceeds the idle in session timeout.
 		ex.mu.IdleInSessionTimeout = timeout{time.AfterFunc(
 			ex.sessionData().IdleInSessionTimeout,
-			ex.cancelSession,
+			ex.CancelSession,
 		)}
 	}
 
@@ -162,7 +162,7 @@ func (ex *connExecutor) execStmt(
 			default:
 				ex.mu.IdleInTransactionSessionTimeout = timeout{time.AfterFunc(
 					ex.sessionData().IdleInTransactionSessionTimeout,
-					ex.cancelSession,
+					ex.CancelSession,
 				)}
 			}
 		}
@@ -1059,12 +1059,15 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error 
 // createJobs creates jobs for the records cached in schemaChangeJobRecords
 // during this transaction.
 func (ex *connExecutor) createJobs(ctx context.Context) error {
-	if len(ex.extraTxnState.schemaChangeJobRecords) == 0 {
+	if !ex.extraTxnState.jobs.hasAnyToCreate() {
 		return nil
 	}
 	var records []*jobs.Record
-	for _, record := range ex.extraTxnState.schemaChangeJobRecords {
-		records = append(records, record)
+	if err := ex.extraTxnState.jobs.forEachToCreate(func(jobRecord *jobs.Record) error {
+		records = append(records, jobRecord)
+		return nil
+	}); err != nil {
+		return err
 	}
 	jobIDs, err := ex.server.cfg.JobRegistry.CreateJobsWithTxn(
 		ctx, ex.planner.InternalSQLTxn(), records,
@@ -1072,7 +1075,7 @@ func (ex *connExecutor) createJobs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ex.planner.extendedEvalCtx.Jobs.add(jobIDs...)
+	ex.planner.extendedEvalCtx.jobs.addCreatedJobID(jobIDs...)
 	return nil
 }
 

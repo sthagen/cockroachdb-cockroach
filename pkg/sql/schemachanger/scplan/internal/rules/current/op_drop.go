@@ -130,7 +130,7 @@ func init() {
 				(*scpb.Table)(nil),
 				(*scpb.View)(nil),
 			),
-			index.TypeFilter(IsIndex),
+			index.TypeFilter(rulesVersionKey, isIndex),
 			dep.Type(
 				(*scpb.IndexName)(nil),
 				(*scpb.IndexPartitioning)(nil),
@@ -168,11 +168,7 @@ func init() {
 				(*scpb.Table)(nil),
 				(*scpb.View)(nil),
 			),
-			constraint.Type(
-				(*scpb.CheckConstraint)(nil),
-				(*scpb.ForeignKeyConstraint)(nil),
-				(*scpb.UniqueWithoutIndexConstraint)(nil),
-			),
+			constraint.TypeFilter(rulesVersionKey, isSupportedNonIndexBackedConstraint),
 
 			JoinOnDescID(relation, constraint, relationID),
 
@@ -234,13 +230,17 @@ func init() {
 		"skip element removal ops on descriptor drop",
 		dep.Node,
 		screl.MustQuery(
-			desc.TypeFilter(IsDescriptor),
+			desc.TypeFilter(rulesVersionKey, isDescriptor),
 			dep.Type(
 				(*scpb.ColumnFamily)(nil),
 				(*scpb.Owner)(nil),
 				(*scpb.UserPrivileges)(nil),
 				(*scpb.EnumTypeValue)(nil),
 				(*scpb.TablePartitioning)(nil),
+				(*scpb.FunctionName)(nil),
+				(*scpb.FunctionVolatility)(nil),
+				(*scpb.FunctionLeakProof)(nil),
+				(*scpb.FunctionNullInputBehavior)(nil),
 			),
 
 			JoinOnDescID(desc, dep, descID),

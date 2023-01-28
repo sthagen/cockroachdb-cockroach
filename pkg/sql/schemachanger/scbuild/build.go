@@ -61,8 +61,8 @@ func Build(
 	}
 	scbuildstmt.Process(b, an.GetStatement())
 	an.ValidateAnnotations()
-	els.statements[len(els.statements)-1].RedactedStatement =
-		string(els.astFormatter.FormatAstAsRedactableString(an.GetStatement(), &an.annotation))
+	els.statements[len(els.statements)-1].RedactedStatement = string(
+		dependencies.AstFormatter().FormatAstAsRedactableString(an.GetStatement(), &an.annotation))
 	ts := scpb.TargetState{
 		Targets:       make([]scpb.Target, 0, len(bs.output)),
 		Statements:    els.statements,
@@ -70,19 +70,40 @@ func Build(
 	}
 	current := make([]scpb.Status, 0, len(bs.output))
 	version := dependencies.ClusterSettings().Version.ActiveVersion(ctx)
+	withLogEvent := make([]scpb.Target, 0, len(bs.output))
 	for _, e := range bs.output {
 		if e.metadata.Size() == 0 {
 			// Exclude targets which weren't explicitly set.
 			// Explicitly-set targets have non-zero values in the target metadata.
 			continue
 		}
-		// Exclude targets which are not yet usable in the currently active
-		// cluster version.
 		if !version.IsActive(screl.MinVersion(e.element)) {
+			// Exclude targets which are not yet usable in the currently active
+			// cluster version.
 			continue
 		}
-		ts.Targets = append(ts.Targets, scpb.MakeTarget(e.target, e.element, &e.metadata))
+		if e.previous == scpb.InvalidTarget {
+			// The target was newly-defined by this build.
+			if e.target.Status() == e.current {
+				// Discard it if it's already fulfilled.
+				continue
+			}
+		} else if e.previous.InitialStatus() == scpb.Status_ABSENT && e.target == scpb.ToAbsent {
+			// The target was defined as an adding target by a previous build.
+			// This build redefines it as a dropping target.
+			// As far as the schema change is concerned, this is a no-op, so we
+			// discard this target.
+			// TODO(postamar): this might be too crude, the target's absence might
+			//   cause necessary statement-phase ops to be omitted, leading to
+			//   incorrect in-txn behaviour.
+			continue
+		}
+		t := scpb.MakeTarget(e.target, e.element, &e.metadata)
+		ts.Targets = append(ts.Targets, t)
 		current = append(current, e.current)
+		if e.withLogEvent {
+			withLogEvent = append(withLogEvent, t)
+		}
 	}
 	// Ensure that no concurrent schema change are on going on any targets.
 	descSet := screl.AllTargetDescIDs(ts)
@@ -93,6 +114,8 @@ func Build(
 			panic(scerrors.ConcurrentSchemaChangeError(desc))
 		}
 	})
+	// Write to event log and return.
+	logEvents(b, ts, withLogEvent)
 	return scpb.CurrentState{TargetState: ts, Current: current}, nil
 }
 
@@ -112,10 +135,20 @@ type (
 )
 
 type elementState struct {
-	element  scpb.Element
-	current  scpb.Status
-	target   scpb.TargetStatus
+	// element is the element which identifies this structure.
+	element scpb.Element
+	// current is the current status of the element.
+	current scpb.Status
+	// target is the target to be fulfilled by the element status, if applicable,
+	// while previous is the target for this element as defined by an earlier call
+	// to scbuild.Build in the same transaction, if applicable.
+	previous, target scpb.TargetStatus
+	// metadata contains the target metadata to store in the resulting
+	// scpb.TargetState produced by the current call to scbuild.Build.
 	metadata scpb.TargetMetadata
+	// withLogEvent is true iff an event should be written to the event log
+	// based on this element.
+	withLogEvent bool
 }
 
 // builderState is the backing struct for scbuildstmt.BuilderState interface.
@@ -185,7 +218,8 @@ func newBuilderState(ctx context.Context, d Dependencies, initial scpb.CurrentSt
 		bs.ensureDescriptor(screl.GetDescID(t.Element()))
 	}
 	for i, t := range initial.TargetState.Targets {
-		bs.Ensure(initial.Current[i], scpb.AsTargetStatus(t.TargetStatus), t.Element(), t.Metadata)
+		ts := scpb.AsTargetStatus(t.TargetStatus)
+		bs.ensure(t.Element(), initial.Current[i], ts, ts, t.Metadata)
 	}
 	return &bs
 }
@@ -207,9 +241,6 @@ type eventLogState struct {
 	// for any new elements added. This is used for detailed
 	// tracking during cascade operations.
 	sourceElementID *scpb.SourceElementID
-
-	// astFormatter used to format AST elements as redactable strings.
-	astFormatter AstFormatter
 }
 
 // newEventLogState constructs an eventLogState.
@@ -230,7 +261,6 @@ func newEventLogState(d Dependencies, initial scpb.CurrentState, n tree.Statemen
 			SubWorkID:       1,
 			SourceElementID: 1,
 		},
-		astFormatter: d.AstFormatter(),
 	}
 	*els.sourceElementID = 1
 	return &els
@@ -252,16 +282,16 @@ var _ scbuildstmt.BuildCtx = buildCtx{}
 
 // Add implements the scbuildstmt.BuildCtx interface.
 func (b buildCtx) Add(element scpb.Element) {
-	b.Ensure(scpb.Status_UNKNOWN, scpb.ToPublic, element, b.TargetMetadata())
+	b.Ensure(element, scpb.ToPublic, b.TargetMetadata())
 }
 
 func (b buildCtx) AddTransient(element scpb.Element) {
-	b.Ensure(scpb.Status_UNKNOWN, scpb.Transient, element, b.TargetMetadata())
+	b.Ensure(element, scpb.Transient, b.TargetMetadata())
 }
 
 // Drop implements the scbuildstmt.BuildCtx interface.
 func (b buildCtx) Drop(element scpb.Element) {
-	b.Ensure(scpb.Status_UNKNOWN, scpb.ToAbsent, element, b.TargetMetadata())
+	b.Ensure(element, scpb.ToAbsent, b.TargetMetadata())
 }
 
 // WithNewSourceElementID implements the scbuildstmt.BuildCtx interface.

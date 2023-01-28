@@ -34,9 +34,10 @@ func NewJobRunDependencies(
 	collectionFactory *descs.CollectionFactory,
 	db descs.DB,
 	backfiller scexec.Backfiller,
+	spanSplitter scexec.IndexSpanSplitter,
 	merger scexec.Merger,
 	rangeCounter backfiller.RangeCounter,
-	eventLoggerFactory EventLoggerFactory,
+	eventLoggerFactory func(isql.Txn) scrun.EventLogger,
 	jobRegistry *jobs.Registry,
 	job *jobs.Job,
 	codec keys.SQLCodec,
@@ -53,6 +54,7 @@ func NewJobRunDependencies(
 		collectionFactory:     collectionFactory,
 		db:                    db,
 		backfiller:            backfiller,
+		spanSplitter:          spanSplitter,
 		merger:                merger,
 		rangeCounter:          rangeCounter,
 		eventLoggerFactory:    eventLoggerFactory,
@@ -73,12 +75,13 @@ func NewJobRunDependencies(
 type jobExecutionDeps struct {
 	collectionFactory     *descs.CollectionFactory
 	db                    descs.DB
-	eventLoggerFactory    func(txn isql.Txn) scexec.EventLogger
 	statsRefresher        scexec.StatsRefresher
 	backfiller            scexec.Backfiller
+	spanSplitter          scexec.IndexSpanSplitter
 	merger                scexec.Merger
 	commentUpdaterFactory MetadataUpdaterFactory
 	rangeCounter          backfiller.RangeCounter
+	eventLoggerFactory    func(isql.Txn) scrun.EventLogger
 	jobRegistry           *jobs.Registry
 	job                   *jobs.Job
 	kvTrace               bool
@@ -114,15 +117,15 @@ func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc
 				descsCollection:    txn.Descriptors(),
 				jobRegistry:        d.jobRegistry,
 				validator:          d.indexValidator,
-				eventLogger:        d.eventLoggerFactory(txn),
 				statsRefresher:     d.statsRefresher,
 				schemaChangerJobID: d.job.ID(),
 				schemaChangerJob:   d.job,
 				kvTrace:            d.kvTrace,
 				settings:           d.settings,
 			},
-			backfiller: d.backfiller,
-			merger:     d.merger,
+			backfiller:   d.backfiller,
+			merger:       d.merger,
+			spanSplitter: d.spanSplitter,
 			backfillerTracker: backfiller.NewTracker(
 				d.codec,
 				d.rangeCounter,
@@ -138,11 +141,11 @@ func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc
 			sessionData:             d.sessionData,
 			testingKnobs:            d.testingKnobs,
 		}
-		if err := fn(ctx, ed); err != nil {
+		if err := fn(ctx, ed, d.eventLoggerFactory(txn)); err != nil {
 			return err
 		}
 		createdJobs = ed.CreatedJobs()
-		tableStatsToRefresh = ed.getTablesForStatsRefresh()
+		tableStatsToRefresh = ed.tableStatsToRefresh
 		return nil
 	})
 	if err != nil {

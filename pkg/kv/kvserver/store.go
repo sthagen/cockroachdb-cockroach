@@ -538,7 +538,7 @@ Store.HandleRaftRequest (which is part of the RaftMessageHandler interface),
 ultimately resulting in a call to Replica.handleRaftReadyRaftMuLocked, which
 houses the integration with the etcd/raft library (raft.RawNode). This may
 generate Raft messages to be sent to other Stores; these are handed to
-Replica.sendRaftMessagesRaftMuLocked which ultimately hands them to the Store's
+Replica.sendRaftMessages which ultimately hands them to the Store's
 RaftTransport.SendAsync method. Raft uses message passing (not
 request-response), and outgoing messages will use a gRPC stream that differs
 from that used for incoming messages (which makes asymmetric partitions more
@@ -1209,7 +1209,7 @@ func NewStore(
 		s.allocator = allocatorimpl.MakeAllocator(
 			cfg.Settings,
 			storePoolIsDeterministic,
-			func(string) (time.Duration, bool) {
+			func(id roachpb.NodeID) (time.Duration, bool) {
 				return 0, false
 			}, cfg.TestingKnobs.AllocatorKnobs,
 		)
@@ -3032,7 +3032,7 @@ type HotReplicaInfo struct {
 	WriteKeysPerSecond  float64
 	WriteBytesPerSecond float64
 	ReadBytesPerSecond  float64
-	CPUNanosPerSecond   float64
+	CPUTimePerSecond    float64
 }
 
 // HottestReplicas returns the hottest replicas on a store, sorted by their
@@ -3064,6 +3064,7 @@ func mapToHotReplicasInfo(repls []CandidateReplica) []HotReplicaInfo {
 		hotRepls[i].ReadKeysPerSecond = loadStats.ReadKeysPerSecond
 		hotRepls[i].WriteBytesPerSecond = loadStats.WriteBytesPerSecond
 		hotRepls[i].ReadBytesPerSecond = loadStats.ReadBytesPerSecond
+		hotRepls[i].CPUTimePerSecond = loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond
 	}
 	return hotRepls
 }
@@ -3141,7 +3142,7 @@ func (s *Store) AllocatorCheckRange(
 ) (allocatorimpl.AllocatorAction, roachpb.ReplicationTarget, tracingpb.Recording, error) {
 	var spanOptions []tracing.SpanOption
 	if collectTraces {
-		spanOptions = append(spanOptions, tracing.WithRecording(tracingpb.RecordingStructured))
+		spanOptions = append(spanOptions, tracing.WithRecording(tracingpb.RecordingVerbose))
 	}
 	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.AmbientCtx.Tracer, "allocator check range", spanOptions...)
 

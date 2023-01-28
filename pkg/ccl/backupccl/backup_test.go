@@ -64,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -1225,19 +1226,16 @@ func TestEncryptedBackupRestoreSystemJobs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var encryptionOption string
-			var sanitizedEncryptionOption1 string
-			var sanitizedEncryptionOption2 string
+			var sanitizedEncryptionOption string
 			if tc.useKMS {
 				correctKMSURI, _ := getAWSKMSURI(t, regionEnvVariable, keyIDEnvVariable)
 				encryptionOption = fmt.Sprintf("kms = '%s'", correctKMSURI)
 				sanitizedURI, err := redactTestKMSURI(correctKMSURI)
 				require.NoError(t, err)
-				sanitizedEncryptionOption1 = fmt.Sprintf("kms = '%s'", sanitizedURI)
-				sanitizedEncryptionOption2 = sanitizedEncryptionOption1
+				sanitizedEncryptionOption = fmt.Sprintf("kms = '%s'", sanitizedURI)
 			} else {
 				encryptionOption = "encryption_passphrase = 'abcdefg'"
-				sanitizedEncryptionOption1 = "encryption_passphrase = '*****'"
-				sanitizedEncryptionOption2 = "encryption_passphrase = 'redacted'"
+				sanitizedEncryptionOption = "encryption_passphrase = '*****'"
 			}
 			_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, multiNode, 3, InitManualReplication)
 			conn := sqlDB.DB.(*gosql.DB)
@@ -1260,7 +1258,7 @@ func TestEncryptedBackupRestoreSystemJobs(t *testing.T) {
 					Username: username.RootUserName(),
 					Description: fmt.Sprintf(
 						`BACKUP DATABASE data TO '%s' WITH %s`,
-						backupLoc1, sanitizedEncryptionOption1),
+						backupLoc1, sanitizedEncryptionOption),
 					DescriptorIDs: descpb.IDs{
 						descpb.ID(backupDatabaseID),
 						descpb.ID(backupSchemaID),
@@ -1279,7 +1277,7 @@ into_db='restoredb', %s)`, encryptionOption), backupLoc1)
 				Username: username.RootUserName(),
 				Description: fmt.Sprintf(
 					`RESTORE TABLE data.bank FROM '%s' WITH %s, into_db = 'restoredb'`,
-					backupLoc1, sanitizedEncryptionOption2,
+					backupLoc1, sanitizedEncryptionOption,
 				),
 				DescriptorIDs: descpb.IDs{
 					descpb.ID(restoreDatabaseID + 1),
@@ -4255,9 +4253,8 @@ func TestEncryptedBackup(t *testing.T) {
 
 			sqlDB.Exec(t, fmt.Sprintf(`SHOW BACKUP $1 WITH %s`, encryptionOption), backupLoc1)
 
-			sqlDB.Exec(t, fmt.Sprintf(`SHOW BACKUP $1 WITH %s,encryption_info_dir='%s'`,
-				encryptionOption,
-				backupLoc1),
+			sqlDB.Exec(t, fmt.Sprintf(`SHOW BACKUP $1 WITH %s, encryption_info_dir = '%s'`,
+				encryptionOption, backupLoc1),
 				backupLoc1inc)
 
 			var expectedShowError string
@@ -4329,7 +4326,7 @@ func TestRegionalKMSEncryptedBackup(t *testing.T) {
 		backupLoc1 := localFoo + "/x?COCKROACH_LOCALITY=default"
 		backupLoc2 := localFoo + "/x2?COCKROACH_LOCALITY=" + url.QueryEscape("dc=dc1")
 
-		sqlDB.Exec(t, fmt.Sprintf(`BACKUP TO ($1, $2) WITH %s`,
+		sqlDB.Exec(t, fmt.Sprintf(`BACKUP INTO ($1, $2) WITH %s`,
 			concatMultiRegionKMSURIs(multiRegionKMSURIs)), backupLoc1,
 			backupLoc2)
 
@@ -4341,14 +4338,18 @@ func TestRegionalKMSEncryptedBackup(t *testing.T) {
 
 		checkBackupFilesEncrypted(t, rawDir)
 
-		sqlDB.Exec(t, fmt.Sprintf(`SHOW BACKUP $1 WITH KMS='%s'`, multiRegionKMSURIs[0]),
+		// check that SHOW BACKUP is valid when a single kms uri is provided and when multiple are
+		sqlDB.Exec(t, fmt.Sprintf(`SHOW BACKUP FROM LATEST IN $1 WITH KMS='%s'`, multiRegionKMSURIs[0]),
 			backupLoc1)
+
+		sqlDB.Exec(t, fmt.Sprintf(`SHOW BACKUP FROM LATEST IN ($1, $2) WITH %s`,
+			concatMultiRegionKMSURIs(multiRegionKMSURIs)), backupLoc1, backupLoc2)
 
 		// Attempt to RESTORE using each of the regional KMSs independently.
 		for _, uri := range multiRegionKMSURIs {
 			sqlDB.Exec(t, `DROP DATABASE neverappears CASCADE`)
 
-			sqlDB.Exec(t, fmt.Sprintf(`RESTORE DATABASE neverappears FROM ($1, $2) WITH %s`,
+			sqlDB.Exec(t, fmt.Sprintf(`RESTORE DATABASE neverappears FROM LATEST IN ($1, $2) WITH %s`,
 				concatMultiRegionKMSURIs([]string{uri})), backupLoc1, backupLoc2)
 
 			sqlDB.CheckQueryResults(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE neverappears.neverappears`, before)
@@ -6881,28 +6882,29 @@ func TestBackupRestoreTenant(t *testing.T) {
 		defer restoreTC.Stopper().Stop(ctx)
 		restoreDB := sqlutils.MakeSQLRunner(restoreTC.Conns[0])
 
-		restoreDB.CheckQueryResults(t, `select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`, [][]string{
-			{`1`,
-				`true`,
-				`system`,
-				`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+		restoreDB.CheckQueryResults(t, `select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`, [][]string{
+			{
+				`1`, `true`, `system`,
+				strconv.Itoa(int(mtinfopb.DataStateReady)),
+				strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+				`{"capabilities": {}, "deprecatedId": "1"}`,
 			},
 		})
 		restoreDB.Exec(t, `RESTORE TENANT 10 FROM 'nodelocal://1/t10'`)
 		restoreDB.CheckQueryResults(t,
-			`SELECT id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) FROM system.tenants`,
+			`SELECT id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) FROM system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 				{
-					`10`,
-					`true`,
-					`tenant-10`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`10`, `true`, `tenant-10`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "10"}`,
 				},
 			},
 		)
@@ -6930,19 +6932,19 @@ func TestBackupRestoreTenant(t *testing.T) {
 		// Mark tenant as DROP.
 		restoreDB.Exec(t, `DROP TENANT [10]`)
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 				{
-					`10`,
-					`false`,
-					`NULL`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "tenant-10", "id": "10", "name": "", "state": "DROP", "tenantReplicationJobId": "0"}`,
+					`10`, `false`, `NULL`,
+					strconv.Itoa(int(mtinfopb.DataStateDrop)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedDataState": "DROP", "deprecatedId": "10", "droppedName": "tenant-10"}`,
 				},
 			},
 		)
@@ -6965,19 +6967,19 @@ func TestBackupRestoreTenant(t *testing.T) {
 
 		restoreDB.Exec(t, `RESTORE TENANT 10 FROM 'nodelocal://1/t10'`)
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 				{
-					`10`,
-					`true`,
-					`tenant-10`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`10`, `true`, `tenant-10`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "10"}`,
 				},
 			},
 		)
@@ -7000,30 +7002,30 @@ func TestBackupRestoreTenant(t *testing.T) {
 		)
 
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 			})
 		restoreDB.Exec(t, `RESTORE TENANT 10 FROM 'nodelocal://1/t10'`)
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 				{
-					`10`,
-					`true`,
-					`tenant-10`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`10`, `true`, `tenant-10`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "10"}`,
 				},
 			},
 		)
@@ -7044,30 +7046,30 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreDB := sqlutils.MakeSQLRunner(restoreTC.Conns[0])
 
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 			})
 		restoreDB.Exec(t, `RESTORE TENANT 10 FROM 'nodelocal://1/clusterwide'`)
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 				{
-					`10`,
-					`true`,
-					`tenant-10`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`10`, `true`, `tenant-10`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "10"}`,
 				},
 			},
 		)
@@ -7099,41 +7101,42 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreDB := sqlutils.MakeSQLRunner(restoreTC.Conns[0])
 
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`,
-					`system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 			})
 		restoreDB.Exec(t, `RESTORE FROM 'nodelocal://1/clusterwide'`)
 		restoreDB.CheckQueryResults(t,
-			`select id, active, name, crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo', info, true) from system.tenants`,
+			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
 				{
-					`1`,
-					`true`, `system`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "1", "name": "system", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`1`, `true`, `system`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeShared)),
+					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 				{
-					`10`,
-					`true`,
-					`tenant-10`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "10", "name": "tenant-10", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`10`, `true`, `tenant-10`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "10"}`,
 				},
 				{
-					`11`,
-					`true`,
-					`tenant-11`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "11", "name": "tenant-11", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`11`, `true`, `tenant-11`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "11"}`,
 				},
 				{
-					`20`,
-					`true`,
-					`tenant-20`,
-					`{"capabilities": {"canAdminSplit": false}, "droppedName": "", "id": "20", "name": "tenant-20", "state": "ACTIVE", "tenantReplicationJobId": "0"}`,
+					`20`, `true`, `tenant-20`,
+					strconv.Itoa(int(mtinfopb.DataStateReady)),
+					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					`{"capabilities": {}, "deprecatedId": "20"}`,
 				},
 			},
 		)
@@ -9896,18 +9899,13 @@ func TestBackupRestoreSeparateExplicitIsDefault(t *testing.T) {
 			sqlDB.Exec(t, fmt.Sprintf("SHOW BACKUPS IN %s", dest))
 			sqlDB.Exec(t, fmt.Sprintf("SHOW BACKUP FROM LATEST IN %s", dest))
 
+			// Locality aware show backups will eventually fail if not all localities are provided,
+			// but for now, they're ok.
 			if len(br.dest) > 1 {
-				// Locality aware show backups will eventually fail if not all localities are provided,
-				// but for now, they're ok.
 				sqlDB.Exec(t, fmt.Sprintf("SHOW BACKUP FROM LATEST IN %s", br.dest[1]))
-
-				errorMsg := "SHOW BACKUP on locality aware backups using incremental_location is not" +
-					" supported yet"
-				sqlDB.ExpectErr(t, errorMsg, fmt.Sprintf("SHOW BACKUP FROM LATEST IN %s WITH incremental_location= %s", dest, br.inc[0]))
-			} else {
-				// non locality aware show backup with incremental_location should work!
-				sqlDB.Exec(t, fmt.Sprintf("SHOW BACKUP FROM LATEST IN %s WITH incremental_location= %s", dest, inc))
 			}
+
+			sqlDB.Exec(t, fmt.Sprintf("SHOW BACKUP FROM LATEST IN %s WITH incremental_location= %s", dest, inc))
 		}
 		sir := fmt.Sprintf("RESTORE DATABASE fkdb FROM LATEST IN %s WITH new_db_name = 'inc_fkdb', incremental_location = %s", dest, inc)
 		sqlDB.Exec(t, sir)

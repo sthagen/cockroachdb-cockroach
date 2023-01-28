@@ -1329,6 +1329,7 @@ only.
 | reads_per_second | [double](#cockroach.server.serverpb.RaftDebugResponse-double) |  | Reads per second served is the number of keys read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | write_bytes_per_second | [double](#cockroach.server.serverpb.RaftDebugResponse-double) |  | Writes (bytes) per second is the number of bytes written to this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | read_bytes_per_second | [double](#cockroach.server.serverpb.RaftDebugResponse-double) |  | Reads (bytes) per second is the number of bytes read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
+| cpu_time_per_second | [double](#cockroach.server.serverpb.RaftDebugResponse-double) |  | CPU time (ns) per second is the cpu usage of this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 
 
 
@@ -1575,6 +1576,7 @@ only.
 | reads_per_second | [double](#cockroach.server.serverpb.RangesResponse-double) |  | Reads per second served is the number of keys read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | write_bytes_per_second | [double](#cockroach.server.serverpb.RangesResponse-double) |  | Writes (bytes) per second is the number of bytes written to this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | read_bytes_per_second | [double](#cockroach.server.serverpb.RangesResponse-double) |  | Reads (bytes) per second is the number of bytes read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
+| cpu_time_per_second | [double](#cockroach.server.serverpb.RangesResponse-double) |  | CPU time (ns) per second is the cpu usage of this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 
 
 
@@ -1784,6 +1786,7 @@ only.
 | reads_per_second | [double](#cockroach.server.serverpb.TenantRangesResponse-double) |  | Reads per second served is the number of keys read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | write_bytes_per_second | [double](#cockroach.server.serverpb.TenantRangesResponse-double) |  | Writes (bytes) per second is the number of bytes written to this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | read_bytes_per_second | [double](#cockroach.server.serverpb.TenantRangesResponse-double) |  | Reads (bytes) per second is the number of bytes read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
+| cpu_time_per_second | [double](#cockroach.server.serverpb.TenantRangesResponse-double) |  | CPU time (ns) per second is the cpu usage of this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 
 
 
@@ -3495,6 +3498,7 @@ target node(s) selected in a HotRangesRequest.
 | reads_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  | Reads per second is the recent number of keys read per second on this range. | [reserved](#support-status) |
 | write_bytes_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  | Write bytes per second is the recent number of bytes written per second on this range. | [reserved](#support-status) |
 | read_bytes_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  | Read bytes per second is the recent number of bytes read per second on this range. | [reserved](#support-status) |
+| cpu_time_per_second | [double](#cockroach.server.serverpb.HotRangesResponse-double) |  | CPU time per second is the recent cpu usage in nanoseconds of this range. | [reserved](#support-status) |
 
 
 
@@ -3567,6 +3571,11 @@ HotRange message describes a single hot range, ie its QPS, node ID it belongs to
 | leaseholder_node_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | leaseholder_node_id indicates the Node ID that is the current leaseholder for the given range. | [reserved](#support-status) |
 | schema_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | schema_name provides the name of schema (if exists) for table in current range. | [reserved](#support-status) |
 | store_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | store_id indicates the Store ID where range is stored. | [reserved](#support-status) |
+| writes_per_second | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | writes_per_second is the recent number of keys written per second on this range. | [reserved](#support-status) |
+| reads_per_second | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | reads_per_second is the recent number of keys read per second on this range. | [reserved](#support-status) |
+| write_bytes_per_second | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | write_bytes_per_second is the recent number of bytes written per second on this range. | [reserved](#support-status) |
+| read_bytes_per_second | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | read_bytes_per_second is the recent number of bytes read per second on this range. | [reserved](#support-status) |
+| cpu_time_per_second | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | CPU time (ns) per second is the recent cpu usage per second on this range. | [reserved](#support-status) |
 
 
 
@@ -3581,6 +3590,92 @@ HotRange message describes a single hot range, ie its QPS, node ID it belongs to
 | ----- | ---- | ----- | ----------- | -------------- |
 | key | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  |  |  |
 | value | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  |  |  |
+
+
+
+
+
+
+## KeyVisSamples
+
+`POST /_status/keyvissamples`
+
+
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+KeyVisSamplesResponse returns a space-efficient representation of
+key visualizer samples. Spans are deduplicated, and are referenced by uuid.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| pretty_key_for_uuid | [KeyVisSamplesResponse.PrettyKeyForUuidEntry](#cockroach.server.serverpb.KeyVisSamplesResponse-cockroach.server.serverpb.KeyVisSamplesResponse.PrettyKeyForUuidEntry) | repeated | pretty_key_for_uuid is a mapping of hex-encoded UUIDs to pretty keys. | [reserved](#support-status) |
+| sorted_pretty_keys | [string](#cockroach.server.serverpb.KeyVisSamplesResponse-string) | repeated |  | [reserved](#support-status) |
+| samples | [KeyVisSamplesResponse.KeyVisSample](#cockroach.server.serverpb.KeyVisSamplesResponse-cockroach.server.serverpb.KeyVisSamplesResponse.KeyVisSample) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.KeyVisSamplesResponse-cockroach.server.serverpb.KeyVisSamplesResponse.PrettyKeyForUuidEntry"></a>
+#### KeyVisSamplesResponse.PrettyKeyForUuidEntry
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| key | [string](#cockroach.server.serverpb.KeyVisSamplesResponse-string) |  |  |  |
+| value | [string](#cockroach.server.serverpb.KeyVisSamplesResponse-string) |  |  |  |
+
+
+
+
+
+<a name="cockroach.server.serverpb.KeyVisSamplesResponse-cockroach.server.serverpb.KeyVisSamplesResponse.KeyVisSample"></a>
+#### KeyVisSamplesResponse.KeyVisSample
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.KeyVisSamplesResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+| buckets | [KeyVisSamplesResponse.Bucket](#cockroach.server.serverpb.KeyVisSamplesResponse-cockroach.server.serverpb.KeyVisSamplesResponse.Bucket) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.KeyVisSamplesResponse-cockroach.server.serverpb.KeyVisSamplesResponse.Bucket"></a>
+#### KeyVisSamplesResponse.Bucket
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| start_key_id | [bytes](#cockroach.server.serverpb.KeyVisSamplesResponse-bytes) |  |  | [reserved](#support-status) |
+| end_key_id | [bytes](#cockroach.server.serverpb.KeyVisSamplesResponse-bytes) |  |  | [reserved](#support-status) |
+| requests | [uint64](#cockroach.server.serverpb.KeyVisSamplesResponse-uint64) |  |  | [reserved](#support-status) |
 
 
 
@@ -3795,6 +3890,7 @@ only.
 | reads_per_second | [double](#cockroach.server.serverpb.RangeResponse-double) |  | Reads per second served is the number of keys read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | write_bytes_per_second | [double](#cockroach.server.serverpb.RangeResponse-double) |  | Writes (bytes) per second is the number of bytes written to this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 | read_bytes_per_second | [double](#cockroach.server.serverpb.RangeResponse-double) |  | Reads (bytes) per second is the number of bytes read from this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
+| cpu_time_per_second | [double](#cockroach.server.serverpb.RangeResponse-double) |  | CPU time (ns) per second is the cpu usage of this range per second, averaged over the last 30 minute period. | [reserved](#support-status) |
 
 
 
@@ -7535,7 +7631,7 @@ Support status: [reserved](#support-status)
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | statuses | [cockroach.kv.kvserver.loqrecovery.loqrecoverypb.NodeRecoveryStatus](#cockroach.server.serverpb.RecoveryVerifyResponse-cockroach.kv.kvserver.loqrecovery.loqrecoverypb.NodeRecoveryStatus) | repeated | Statuses contain a list of recovery statuses of nodes updated during recovery. It also contains nodes that were expected to be live (not decommissioned by recovery) but failed to return status response. | [reserved](#support-status) |
-| unavailable_ranges | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.RecoveryVerifyResponse-cockroach.roachpb.RangeDescriptor) | repeated | Unavailable ranges contains descriptors of ranges that failed health checks. | [reserved](#support-status) |
+| unavailable_ranges | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.RecoveryVerifyResponse-cockroach.roachpb.RangeDescriptor) | repeated | UnavailableRanges contains descriptors of ranges that failed health checks. | [reserved](#support-status) |
 | decommissioned_node_ids | [int32](#cockroach.server.serverpb.RecoveryVerifyResponse-int32) | repeated | DecommissionedNodeIDs contains list of decommissioned node id's. Only nodes that were decommissioned by the plan would be listed here, not all historically decommissioned ones. | [reserved](#support-status) |
 
 

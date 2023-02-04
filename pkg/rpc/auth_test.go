@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"io"
 	"testing"
 
@@ -90,32 +91,81 @@ func TestWrappedServerStream(t *testing.T) {
 	require.Equal(t, 3, recv)
 }
 
-func TestTenantFromCert(t *testing.T) {
+func TestAuthenticateTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	correctOU := []string{security.TenantsOU}
+	stid := roachpb.SystemTenantID
+	tenTen := roachpb.MustMakeTenantID(10)
 	for _, tc := range []struct {
-		ous         []string
-		commonName  string
-		expTenID    roachpb.TenantID
-		expErr      string
-		tenantScope uint64
+		systemID         roachpb.TenantID
+		ous              []string
+		commonName       string
+		expTenID         roachpb.TenantID
+		expErr           string
+		tenantScope      uint64
+		clientTenantInMD string
 	}{
-		{ous: correctOU, commonName: "10", expTenID: roachpb.MustMakeTenantID(10)},
-		{ous: correctOU, commonName: roachpb.MinTenantID.String(), expTenID: roachpb.MinTenantID},
-		{ous: correctOU, commonName: roachpb.MaxTenantID.String(), expTenID: roachpb.MaxTenantID},
-		{ous: correctOU, commonName: roachpb.SystemTenantID.String() /* "system" */, expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: correctOU, commonName: "-1", expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: correctOU, commonName: "0", expErr: `invalid tenant ID 0 in Common Name \(CN\)`},
-		{ous: correctOU, commonName: "1", expErr: `invalid tenant ID 1 in Common Name \(CN\)`},
-		{ous: correctOU, commonName: "root", expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: correctOU, commonName: "other", expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: []string{"foo"}, commonName: "other", expErr: `client certificate CN=other,OU=foo cannot be used to perform RPC on tenant {1}`},
-		{ous: nil, commonName: "other", expErr: `client certificate CN=other cannot be used to perform RPC on tenant {1}`},
-		{ous: append([]string{"foo"}, correctOU...), commonName: "other", expErr: `could not parse tenant ID from Common Name`},
-		{ous: nil, commonName: "root"},
-		{ous: nil, commonName: "root", tenantScope: 10, expErr: "client certificate CN=root cannot be used to perform RPC on tenant {1}"},
+		{systemID: stid, ous: correctOU, commonName: "10", expTenID: tenTen},
+		{systemID: stid, ous: correctOU, commonName: roachpb.MinTenantID.String(), expTenID: roachpb.MinTenantID},
+		{systemID: stid, ous: correctOU, commonName: roachpb.MaxTenantID.String(), expTenID: roachpb.MaxTenantID},
+		{systemID: stid, ous: correctOU, commonName: roachpb.SystemTenantID.String() /* "system" */, expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "-1", expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "0", expErr: `invalid tenant ID 0 in Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "1", expErr: `invalid tenant ID 1 in Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "root", expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "other", expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: []string{"foo"}, commonName: "other",
+			expErr: `need root or node client cert to perform RPCs on this server \(this is tenant system; cert is valid for "other" on all tenants\)`},
+		{systemID: stid, ous: nil, commonName: "other",
+			expErr: `need root or node client cert to perform RPCs on this server \(this is tenant system; cert is valid for "other" on all tenants\)`},
+		{systemID: stid, ous: append([]string{"foo"}, correctOU...), commonName: "other", expErr: `could not parse tenant ID from Common Name`},
+		{systemID: stid, ous: nil, commonName: "root"},
+		{systemID: stid, ous: nil, commonName: "node"},
+		{systemID: stid, ous: nil, commonName: "root", tenantScope: 10,
+			expErr: `need root or node client cert to perform RPCs on this server \(this is tenant system; cert is valid for "root" on tenant 10\)`},
+		{systemID: tenTen, ous: correctOU, commonName: "10", expTenID: roachpb.TenantID{}},
+		{systemID: tenTen, ous: correctOU, commonName: "123", expErr: `client tenant identity \(123\) does not match server`},
+		{systemID: tenTen, ous: correctOU, commonName: "1", expErr: `invalid tenant ID 1 in Common Name \(CN\)`},
+		{systemID: tenTen, ous: nil, commonName: "root"},
+		{systemID: tenTen, ous: nil, commonName: "node"},
+
+		// Passing a client ID in metadata instead of relying only on the TLS cert.
+		{clientTenantInMD: "invalid", expErr: `could not parse tenant ID from gRPC metadata`},
+		{clientTenantInMD: "1", expErr: `invalid tenant ID 1 in gRPC metadata`},
+		{clientTenantInMD: "-1", expErr: `could not parse tenant ID from gRPC metadata`},
+
+		// tenant ID in MD matches that in client cert.
+		// Server is KV node: expect tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: correctOU, commonName: "10", expTenID: tenTen},
+		// tenant ID in MD doesn't match that in client cert.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: correctOU, commonName: "123",
+			expErr: `client wants to authenticate as tenant 10, but is using TLS cert for tenant 123`},
+		// tenant ID present in MD, but not in client cert. However,
+		// client cert is valid. Use MD tenant ID.
+		// Server is KV node: expect tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: nil, commonName: "root", expTenID: tenTen},
+		// tenant ID present in MD, but not in client cert. However,
+		// client cert is valid. Use MD tenant ID.
+		// Server is KV node: expect tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: nil, commonName: "node", expTenID: tenTen},
+		// tenant ID present in MD, but not in client cert. However,
+		// client cert is valid. Use MD tenant ID.
+		// Server is secondary tenant: do not do additional tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: tenTen, ous: nil, commonName: "root", expTenID: roachpb.TenantID{}},
+		{clientTenantInMD: "10",
+			systemID: tenTen, ous: nil, commonName: "node", expTenID: roachpb.TenantID{}},
+		// tenant ID present in MD, but not in client cert. Use MD tenant ID.
+		// Server tenant ID does not match client tenant ID.
+		{clientTenantInMD: "123",
+			systemID: tenTen, ous: nil, commonName: "root",
+			expErr: `client tenant identity \(123\) does not match server`},
 	} {
-		t.Run(tc.commonName, func(t *testing.T) {
+		t.Run(fmt.Sprintf("from %v to %v (md %q)", tc.commonName, tc.systemID, tc.clientTenantInMD), func(t *testing.T) {
 			cert := &x509.Certificate{
 				Subject: pkix.Name{
 					CommonName:         tc.commonName,
@@ -123,7 +173,9 @@ func TestTenantFromCert(t *testing.T) {
 				},
 			}
 			if tc.tenantScope > 0 {
-				tenantSANs, err := security.MakeTenantURISANs(username.MakeSQLUsernameFromPreNormalizedString(tc.commonName), []roachpb.TenantID{roachpb.MustMakeTenantID(tc.tenantScope)})
+				tenantSANs, err := security.MakeTenantURISANs(
+					username.MakeSQLUsernameFromPreNormalizedString(tc.commonName),
+					[]roachpb.TenantID{roachpb.MustMakeTenantID(tc.tenantScope)})
 				require.NoError(t, err)
 				cert.URIs = append(cert.URIs, tenantSANs...)
 			}
@@ -135,7 +187,12 @@ func TestTenantFromCert(t *testing.T) {
 			p := peer.Peer{AuthInfo: tlsInfo}
 			ctx := peer.NewContext(context.Background(), &p)
 
-			tenID, err := rpc.TestingAuthenticateTenant(ctx)
+			if tc.clientTenantInMD != "" {
+				md := metadata.MD{"client-tid": []string{tc.clientTenantInMD}}
+				ctx = metadata.NewIncomingContext(ctx, md)
+			}
+
+			tenID, err := rpc.TestingAuthenticateTenant(ctx, tc.systemID)
 
 			if tc.expErr == "" {
 				require.Equal(t, tc.expTenID, tenID)

@@ -44,7 +44,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -1643,7 +1645,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -1778,7 +1780,7 @@ func TestStatusAPITransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -2167,7 +2169,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 		thirdServerSQL.Exec(t, stmt)
 	}
 	query := `INSERT INTO posts VALUES (_, '_')`
-	fingerprintID := roachpb.ConstructStatementFingerprintID(query,
+	fingerprintID := appstatspb.ConstructStatementFingerprintID(query,
 		false, true, `roachblog`)
 	path := fmt.Sprintf(`stmtdetails/%v`, fingerprintID)
 
@@ -2361,7 +2363,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	}
 
 	selectQuery := "SELECT _, _, _, _"
-	fingerprintID = roachpb.ConstructStatementFingerprintID(selectQuery, false,
+	fingerprintID = appstatspb.ConstructStatementFingerprintID(selectQuery, false,
 		true, "defaultdb")
 
 	testPath(
@@ -3733,6 +3735,9 @@ func TestTransactionContentionEvents(t *testing.T) {
 				}
 
 				for _, event := range resp.Events {
+					require.NotEqual(t, event.WaitingStmtFingerprintID, 0)
+					require.NotEqual(t, event.WaitingStmtID.String(), clusterunique.ID{}.String())
+
 					require.Equal(t, tc.canViewContendingKey, len(event.BlockingEvent.Key) > 0,
 						"expected to %s, but the contending key has length of %d",
 						expectationStr,

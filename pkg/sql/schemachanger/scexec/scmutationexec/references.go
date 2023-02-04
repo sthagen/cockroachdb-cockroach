@@ -15,10 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
-	"github.com/cockroachdb/errors"
 )
 
 func (i *immediateVisitor) RemoveSchemaParent(
@@ -72,29 +73,6 @@ func (i *immediateVisitor) RemoveForeignKeyBackReference(
 		// Exit early if the foreign key back-reference holder is getting dropped.
 		return err
 	}
-	// Retrieve foreign key name in origin table to identify it in the referenced
-	// table.
-	var name string
-	{
-		out, err := i.getDescriptor(ctx, op.OriginTableID)
-		if err != nil {
-			return err
-		}
-		tbl, err := catalog.AsTableDescriptor(out)
-		if err != nil {
-			return err
-		}
-		for _, fk := range tbl.OutboundForeignKeys() {
-			if fk.GetConstraintID() == op.OriginConstraintID {
-				name = fk.GetName()
-				break
-			}
-		}
-		if name == "" {
-			return errors.AssertionFailedf("foreign key with ID %d not found in origin table %q (%d)",
-				op.OriginConstraintID, out.GetName(), out.GetID())
-		}
-	}
 	// Attempt to remove back reference.
 	// Note how we
 	//  1. only check to remove from `in.InboundFKs` but not from `in.Mutations`:
@@ -104,9 +82,9 @@ func (i *immediateVisitor) RemoveForeignKeyBackReference(
 	//  2. only attempt to remove (i.e. we do not panic when it's not found):
 	//  this is because if we roll back before the adding FK is published in `out`,
 	//  such a back-reference won't exist in `in` yet.
-	for i, fk := range in.InboundFKs {
-		if fk.OriginTableID == op.OriginTableID && fk.Name == name {
-			in.InboundFKs = append(in.InboundFKs[:i], in.InboundFKs[i+1:]...)
+	for idx, fk := range in.InboundFKs {
+		if fk.OriginTableID == op.OriginTableID && fk.ConstraintID == op.OriginConstraintID {
+			in.InboundFKs = append(in.InboundFKs[:idx], in.InboundFKs[idx+1:]...)
 			if len(in.InboundFKs) == 0 {
 				in.InboundFKs = nil
 			}
@@ -158,6 +136,9 @@ func (i *immediateVisitor) RemoveBackReferenceInTypes(
 	return updateBackReferencesInTypes(ctx, i, op.TypeIDs, op.BackReferencedDescriptorID, catalog.DescriptorIDSet{})
 }
 
+// updateBackReferencesInTypes updates back references to `backReferencedDescID`
+// in types represented by `typeIDs`, given the expected forward references from
+// the object represented by `backReferencedDescID`.
 func updateBackReferencesInTypes(
 	ctx context.Context,
 	m *immediateVisitor,
@@ -206,8 +187,8 @@ func (i *immediateVisitor) UpdateTypeBackReferencesInTypes(
 	return updateBackReferencesInTypes(ctx, i, op.TypeIDs, op.BackReferencedTypeID, forwardRefs)
 }
 
-func (i *immediateVisitor) UpdateBackReferencesInSequences(
-	ctx context.Context, op scop.UpdateBackReferencesInSequences,
+func (i *immediateVisitor) UpdateTableBackReferencesInSequences(
+	ctx context.Context, op scop.UpdateTableBackReferencesInSequences,
 ) error {
 	var forwardRefs catalog.DescriptorIDSet
 	if desc, err := i.getDescriptor(ctx, op.BackReferencedTableID); err != nil {
@@ -281,7 +262,7 @@ func updateBackReferencesInSequences(
 			updated.Add(colID)
 		}
 	} else {
-		if !current.Contains(colID) {
+		if !current.Contains(colID) && colID != 0 {
 			return nil
 		}
 		current.ForEach(func(id descpb.ColumnID) {
@@ -337,6 +318,128 @@ func (i *immediateVisitor) RemoveObjectParent(
 			return err
 		}
 		sc.RemoveFunction(obj.GetName(), obj.GetID())
+	}
+	return nil
+}
+
+func (i *immediateVisitor) UpdateFunctionTypeReferences(
+	ctx context.Context, op scop.UpdateFunctionTypeReferences,
+) error {
+	fn, err := i.checkOutFunction(ctx, op.FunctionID)
+	if err != nil {
+		return err
+	}
+
+	newForwardRefs := catalog.MakeDescriptorIDSet(op.TypeIDs...)
+	currentForwardRefs := catalog.MakeDescriptorIDSet(fn.DependsOnTypes...)
+	typeIDsToUpdate := newForwardRefs.Union(currentForwardRefs)
+	if err := updateBackReferencesInTypes(ctx, i, typeIDsToUpdate.Ordered(), op.FunctionID, newForwardRefs); err != nil {
+		return err
+	}
+
+	fn.DependsOnTypes = op.TypeIDs
+	return nil
+}
+
+func (i *immediateVisitor) UpdateFunctionRelationReferences(
+	ctx context.Context, op scop.UpdateFunctionRelationReferences,
+) error {
+	fn, err := i.checkOutFunction(ctx, op.FunctionID)
+	if err != nil {
+		return err
+	}
+	relIDs := catalog.DescriptorIDSet{}
+	relIDToReferences := make(map[descpb.ID][]descpb.TableDescriptor_Reference)
+
+	for _, ref := range op.TableReferences {
+		relIDs.Add(ref.TableID)
+		dep := descpb.TableDescriptor_Reference{
+			ID:        op.FunctionID,
+			IndexID:   ref.IndexID,
+			ColumnIDs: ref.ColumnIDs,
+		}
+		relIDToReferences[ref.TableID] = append(relIDToReferences[ref.TableID], dep)
+	}
+
+	for _, ref := range op.ViewReferences {
+		relIDs.Add(ref.ViewID)
+		dep := descpb.TableDescriptor_Reference{
+			ID:        op.FunctionID,
+			ColumnIDs: ref.ColumnIDs,
+		}
+		relIDToReferences[ref.ViewID] = append(relIDToReferences[ref.ViewID], dep)
+	}
+
+	for _, seqID := range op.SequenceIDs {
+		relIDs.Add(seqID)
+		dep := descpb.TableDescriptor_Reference{
+			ID:   op.FunctionID,
+			ByID: true,
+		}
+		relIDToReferences[seqID] = append(relIDToReferences[seqID], dep)
+	}
+
+	for relID, refs := range relIDToReferences {
+		if err := updateBackReferencesInRelation(ctx, i, relID, op.FunctionID, refs); err != nil {
+			return err
+		}
+	}
+
+	fn.DependsOn = relIDs.Ordered()
+	return nil
+}
+
+func updateBackReferencesInRelation(
+	ctx context.Context,
+	i *immediateVisitor,
+	relID descpb.ID,
+	backReferencedID descpb.ID,
+	backRefs []descpb.TableDescriptor_Reference,
+) error {
+	rel, err := i.checkOutTable(ctx, relID)
+	if err != nil {
+		return err
+	}
+	newRefs := rel.DependedOnBy[:0]
+	for _, ref := range rel.DependedOnBy {
+		if ref.ID != backReferencedID {
+			newRefs = append(newRefs, ref)
+		}
+	}
+
+	newRefs = append(newRefs, backRefs...)
+	rel.DependedOnBy = newRefs
+	return nil
+}
+
+func (i *immediateVisitor) SetObjectParentID(ctx context.Context, op scop.SetObjectParentID) error {
+	sc, err := i.checkOutSchema(ctx, op.ObjParent.ParentSchemaID)
+	if err != nil {
+		return err
+	}
+
+	obj, err := i.checkOutDescriptor(ctx, op.ObjParent.ObjectID)
+	if err != nil {
+		return err
+	}
+	switch t := obj.(type) {
+	case *funcdesc.Mutable:
+		if t.ParentSchemaID != descpb.InvalidID {
+			sc.RemoveFunction(t.GetName(), t.GetID())
+		}
+		t.ParentID = sc.GetParentID()
+		t.ParentSchemaID = sc.GetID()
+
+		ol := descpb.SchemaDescriptor_FunctionSignature{
+			ID:         obj.GetID(),
+			ArgTypes:   make([]*types.T, len(t.GetParams())),
+			ReturnType: t.GetReturnType().Type,
+			ReturnSet:  t.GetReturnType().ReturnSet,
+		}
+		for i := range t.Params {
+			ol.ArgTypes[i] = t.Params[i].Type
+		}
+		sc.AddFunction(obj.GetName(), ol)
 	}
 	return nil
 }

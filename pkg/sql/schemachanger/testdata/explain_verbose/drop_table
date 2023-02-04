@@ -55,8 +55,9 @@ EXPLAIN (ddl, verbose) DROP TABLE db.sc.t;
 │       │   ├── • ObjectParent:{DescID: 107, ReferencedDescID: 106}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
-│       │   │   └── • Precedence dependency from DROPPED Table:{DescID: 107}
+│       │   │   └── • SameStagePrecedence dependency from DROPPED Table:{DescID: 107}
 │       │   │         rule: "descriptor dropped before dependent element removal"
+│       │   │         rule: "descriptor dropped right before removing back-reference in its parent descriptor"
 │       │   │
 │       │   ├── • TableComment:{DescID: 107, Comment: t has a comment}
 │       │   │   │ PUBLIC → ABSENT
@@ -168,6 +169,9 @@ EXPLAIN (ddl, verbose) DROP TABLE db.sc.t;
 │       │   │
 │       │   ├── • ColumnNotNull:{DescID: 107, ColumnID: 3, IndexID: 0}
 │       │   │   │ PUBLIC → VALIDATED
+│       │   │   │
+│       │   │   ├── • Precedence dependency from DROPPED Table:{DescID: 107}
+│       │   │   │     rule: "relation dropped before dependent constraint"
 │       │   │   │
 │       │   │   └── • skip PUBLIC → VALIDATED operations
 │       │   │         rule: "skip constraint removal ops on relation drop"
@@ -477,8 +481,9 @@ EXPLAIN (ddl, verbose) DROP TABLE db.sc.t;
 │       │   ├── • ObjectParent:{DescID: 107, ReferencedDescID: 106}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
-│       │   │   └── • Precedence dependency from DROPPED Table:{DescID: 107}
+│       │   │   └── • SameStagePrecedence dependency from DROPPED Table:{DescID: 107}
 │       │   │         rule: "descriptor dropped before dependent element removal"
+│       │   │         rule: "descriptor dropped right before removing back-reference in its parent descriptor"
 │       │   │
 │       │   ├── • TableComment:{DescID: 107, Comment: t has a comment}
 │       │   │   │ PUBLIC → ABSENT
@@ -635,6 +640,9 @@ EXPLAIN (ddl, verbose) DROP TABLE db.sc.t;
 │       │   │
 │       │   ├── • ColumnNotNull:{DescID: 107, ColumnID: 3, IndexID: 0}
 │       │   │   │ PUBLIC → ABSENT
+│       │   │   │
+│       │   │   ├── • Precedence dependency from DROPPED Table:{DescID: 107}
+│       │   │   │     rule: "relation dropped before dependent constraint"
 │       │   │   │
 │       │   │   ├── • Precedence dependency from WRITE_ONLY Column:{DescID: 107, ColumnID: 3}
 │       │   │   │     rule: "column no longer public before dependents"
@@ -892,8 +900,95 @@ EXPLAIN (ddl, verbose) DROP TABLE db.sc.t;
         │   ├── • Table:{DescID: 107}
         │   │   │ DROPPED → ABSENT
         │   │   │
-        │   │   └── • PreviousStagePrecedence dependency from DROPPED Table:{DescID: 107}
-        │   │         rule: "descriptor dropped in transaction before removal"
+        │   │   ├── • Precedence dependency from ABSENT Namespace:{DescID: 107, Name: t, ReferencedDescID: 104}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT Owner:{DescID: 107}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT UserPrivileges:{DescID: 107, Name: admin}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT UserPrivileges:{DescID: 107, Name: root}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • PreviousStagePrecedence dependency from DROPPED Table:{DescID: 107}
+        │   │   │     rule: "descriptor dropped in transaction before removal"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 107, ReferencedDescID: 106}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT TableComment:{DescID: 107, Comment: t has a comment}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnFamily:{DescID: 107, Name: primary, ColumnFamilyID: 0}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT Column:{DescID: 107, ColumnID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnName:{DescID: 107, Name: k, ColumnID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 107, ColumnFamilyID: 0, ColumnID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT Column:{DescID: 107, ColumnID: 2}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnName:{DescID: 107, Name: v, ColumnID: 2}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 107, ColumnFamilyID: 0, ColumnID: 2}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT Column:{DescID: 107, ColumnID: 3}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnName:{DescID: 107, Name: rowid, ColumnID: 3}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 107, ColumnFamilyID: 0, ColumnID: 3}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnNotNull:{DescID: 107, ColumnID: 3, IndexID: 0}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnDefaultExpression:{DescID: 107, ColumnID: 3}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT Column:{DescID: 107, ColumnID: 4294967295}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnName:{DescID: 107, Name: crdb_internal_mvcc_timestamp, ColumnID: 4294967295}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 107, ColumnFamilyID: 0, ColumnID: 4294967295}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT Column:{DescID: 107, ColumnID: 4294967294}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnName:{DescID: 107, Name: tableoid, ColumnID: 4294967294}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 107, ColumnFamilyID: 0, ColumnID: 4294967294}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT IndexColumn:{DescID: 107, ColumnID: 3, IndexID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT IndexColumn:{DescID: 107, ColumnID: 1, IndexID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT IndexColumn:{DescID: 107, ColumnID: 2, IndexID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   ├── • Precedence dependency from ABSENT PrimaryIndex:{DescID: 107, IndexID: 1, ConstraintID: 1}
+        │   │   │     rule: "non-data dependents removed before descriptor"
+        │   │   │
+        │   │   └── • Precedence dependency from ABSENT IndexName:{DescID: 107, Name: t_pkey, IndexID: 1}
+        │   │         rule: "non-data dependents removed before descriptor"
         │   │
         │   ├── • IndexData:{DescID: 107, IndexID: 1}
         │   │   │ PUBLIC → ABSENT

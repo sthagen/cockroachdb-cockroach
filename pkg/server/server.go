@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery"
@@ -260,6 +261,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	stopper.AddCloser(&engines)
 
+	// Loss of quorum recovery store is created and pending plan is applied to
+	// engines as soon as engines are created and before any data is read in a
+	// way similar to offline engine content patching.
+	planStore, err := newPlanStore(cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create loss of quorum plan store")
+	}
+	if err := loqrecovery.MaybeApplyPendingRecoveryPlan(ctx, planStore, engines, timeutil.DefaultTimeSource{}); err != nil {
+		return nil, errors.Wrap(err, "failed to apply loss of quorum recovery plan")
+	}
+
 	nodeTombStorage, checkPingFor := getPingCheckDecommissionFn(engines)
 
 	g := gossip.New(
@@ -329,7 +341,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		cm.RegisterSignalHandler(stopper)
+		// Expose cert expirations in metrics.
 		registry.AddMetricStruct(cm.Metrics())
 	}
 
@@ -340,7 +352,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// and after ValidateAddrs().
 	rpcContext.CheckCertificateAddrs(ctx)
 
-	grpcServer := newGRPCServer(rpcContext)
+	grpcServer, err := newGRPCServer(rpcContext)
+	if err != nil {
+		return nil, err
+	}
 	gossip.RegisterGossipServer(grpcServer.Server, g)
 
 	var dialerKnobs nodedialer.DialerTestingKnobs
@@ -353,6 +368,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	runtimeSampler := status.NewRuntimeStatSampler(ctx, clock)
 	registry.AddMetricStruct(runtimeSampler)
+	// Save a reference to this sampler for use by additional servers
+	// started via the server controller.
+	cfg.RuntimeStatSampler = runtimeSampler
 
 	registry.AddMetric(base.LicenseTTL)
 
@@ -897,7 +915,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// Initialize the pgwire pre-server, which initializes connections,
 	// sets up TLS and reads client status parameters.
-	pgPreServer := pgwire.MakePreServeConnHandler(
+	pgPreServer := pgwire.NewPreServeConnHandler(
 		cfg.AmbientCtx,
 		cfg.Config,
 		cfg.Settings,
@@ -1023,7 +1041,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	sc := newServerController(ctx,
 		node, cfg.BaseConfig.IDContainer,
 		stopper, st,
-		lateBoundServer, &systemServerWrapper{server: lateBoundServer}, systemTenantNameContainer)
+		lateBoundServer,
+		&systemServerWrapper{server: lateBoundServer},
+		systemTenantNameContainer,
+		pgPreServer.SendRoutingError,
+	)
 
 	// Create the debug API server.
 	debugServer := debug.NewServer(
@@ -1043,13 +1065,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		},
 	)
 
-	// TODO(oleg): plan store creation needs to move to the start of this method
-	// right after stores are created. We need it to retrieve pending plan and
-	// patch replicas before any initialization occurs.
-	planStore, err := newPlanStore(cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create loss of quorum recovery server")
-	}
 	recoveryServer := loqrecovery.NewServer(
 		nodeIDContainer,
 		stores,
@@ -1106,7 +1121,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		protectedtsProvider:    protectedtsProvider,
 		spanConfigSubscriber:   spanConfig.subscriber,
 		spanConfigReporter:     spanConfig.reporter,
-		pgPreServer:            &pgPreServer,
+		pgPreServer:            pgPreServer,
 		sqlServer:              sqlServer,
 		serverController:       sc,
 		externalStorageBuilder: externalStorageBuilder,
@@ -1221,6 +1236,18 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// Start a context for the asynchronous network workers.
 	workersCtx := s.AnnotateCtx(context.Background())
 
+	if !s.cfg.Insecure {
+		cm, err := s.rpcContext.GetCertificateManager()
+		if err != nil {
+			return err
+		}
+		// Ensure that SIGHUP will make this cert manager reload its certs
+		// from disk.
+		if err := cm.RegisterSignalHandler(workersCtx, s.stopper); err != nil {
+			return err
+		}
+	}
+
 	// Start the time sanity checker.
 	s.startTime = timeutil.Now()
 	if err := s.startMonitoringForwardClockJumps(workersCtx); err != nil {
@@ -1231,7 +1258,6 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// local node.
 	s.rpcContext.SetLocalInternalServer(
 		s.node,
-		false, // tenant
 		s.grpc.serverInterceptorsInfo, s.rpcContext.ClientInterceptors())
 
 	// Load the TLS configuration for the HTTP server.
@@ -1307,7 +1333,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		// now, or if the process crashed earlier half-way through the callback,
 		// that version won't be on all engines. For that reason, we backfill
 		// once.
-		if err := kvserver.WriteClusterVersionToEngines(
+		if err := kvstorage.WriteClusterVersionToEngines(
 			ctx, s.engines, initialDiskClusterVersion,
 		); err != nil {
 			return err
@@ -1513,7 +1539,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		// Either way, we'll do so by first persisting the cluster version
 		// itself, and then informing the version setting about it (an invariant
 		// we must up hold whenever setting a new active version).
-		if err := kvserver.WriteClusterVersionToEngines(
+		if err := kvstorage.WriteClusterVersionToEngines(
 			ctx, s.engines, state.clusterVersion,
 		); err != nil {
 			return err
@@ -1888,16 +1914,15 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to start KV prober")
 	}
 
-	// As final stage of loss of quorum recovery, write events into corresponding
-	// range logs. We do it as a separate stage to log events early just in case
-	// startup fails, and write to range log once the server is running as we need
-	// to run sql statements to update rangelog.
-	publishPendingLossOfQuorumRecoveryEvents(
-		workersCtx,
+	// Perform loss of quorum recovery cleanup if any actions were scheduled.
+	// Cleanup actions rely on node being connected to the cluster and hopefully
+	// in a healthy or healthier stats to update node liveness records.
+	maybeRunLossOfQuorumRecoveryCleanup(
+		ctx,
 		s.node.execCfg.InternalDB.Executor(),
 		s.node.stores,
-		s.stopper,
-	)
+		s,
+		s.stopper)
 
 	// Let the server controller start watching tenant service mode changes.
 	if err := s.serverController.start(workersCtx,

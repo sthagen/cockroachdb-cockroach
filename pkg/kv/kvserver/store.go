@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
@@ -270,6 +271,7 @@ func newRaftConfig(
 	return &raft.Config{
 		ID:                        id,
 		Applied:                   appliedIndex,
+		AsyncStorageWrites:        true,
 		ElectionTick:              storeCfg.RaftElectionTimeoutTicks,
 		HeartbeatTick:             storeCfg.RaftHeartbeatIntervalTicks,
 		MaxUncommittedEntriesSize: storeCfg.RaftMaxUncommittedEntriesSize,
@@ -745,6 +747,7 @@ type Store struct {
 	metrics            *StoreMetrics
 	intentResolver     *intentresolver.IntentResolver
 	recoveryMgr        txnrecovery.Manager
+	syncWaiter         *logstore.SyncWaiterLoop
 	raftEntryCache     *raftentry.Cache
 	limiters           batcheval.Limiters
 	txnWaitMetrics     *txnwait.Metrics
@@ -1247,6 +1250,8 @@ func NewStore(
 	// unnecessary elections when ticks are temporarily delayed and piled up.
 	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s, storeSchedulerConcurrency,
 		cfg.RaftElectionTimeoutTicks)
+
+	s.syncWaiter = logstore.NewSyncWaiterLoop()
 
 	s.raftEntryCache = raftentry.NewCache(cfg.RaftEntryCacheSize)
 	s.metrics.registry.AddMetricStruct(s.raftEntryCache.Metrics())
@@ -3438,57 +3443,6 @@ func (s *storeForTruncatorImpl) releaseReplicaForTruncator(r replicaForTruncator
 
 func (s *storeForTruncatorImpl) getEngine() storage.Engine {
 	return (*Store)(s).engine
-}
-
-// WriteClusterVersion writes the given cluster version to the store-local
-// cluster version key. We only accept a raw engine to ensure we're persisting
-// the write durably.
-func WriteClusterVersion(
-	ctx context.Context, eng storage.Engine, cv clusterversion.ClusterVersion,
-) error {
-	err := storage.MVCCPutProto(
-		ctx,
-		eng,
-		nil,
-		keys.StoreClusterVersionKey(),
-		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
-		&cv,
-	)
-	if err != nil {
-		return err
-	}
-
-	// The storage engine sometimes must make backwards incompatible
-	// changes. However, the store cluster version key is a key stored
-	// within the storage engine, so it's unavailable when the store is
-	// opened.
-	//
-	// The storage engine maintains its own minimum version on disk that
-	// it may consult it before opening the Engine. This version is
-	// stored in a separate file on the filesystem. For now, write to
-	// this file in combination with the store cluster version key.
-	//
-	// This parallel version state is a bit of a wart and an eventual
-	// goal is to replace the store cluster version key with the storage
-	// engine's flat file. This requires that there are no writes to the
-	// engine until either bootstrapping or joining an existing cluster.
-	// Writing the version to this file would happen before opening the
-	// engine for completing the rest of bootstrapping/joining the
-	// cluster.
-	return eng.SetMinVersion(cv.Version)
-}
-
-// ReadClusterVersion reads the cluster version from the store-local version
-// key. Returns an empty version if the key is not found.
-func ReadClusterVersion(
-	ctx context.Context, reader storage.Reader,
-) (clusterversion.ClusterVersion, error) {
-	var cv clusterversion.ClusterVersion
-	_, err := storage.MVCCGetProto(ctx, reader, keys.StoreClusterVersionKey(), hlc.Timestamp{},
-		&cv, storage.MVCCGetOptions{})
-	return cv, err
 }
 
 func init() {

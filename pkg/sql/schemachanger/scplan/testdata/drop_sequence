@@ -117,7 +117,7 @@ StatementPhase stage 1 of 1 with 7 MutationType ops
     *scop.RemoveColumnDefaultExpression
       ColumnID: 2
       TableID: 105
-    *scop.UpdateBackReferencesInSequences
+    *scop.UpdateTableBackReferencesInSequences
       BackReferencedColumnID: 2
       BackReferencedTableID: 105
       SequenceIDs:
@@ -125,7 +125,7 @@ StatementPhase stage 1 of 1 with 7 MutationType ops
     *scop.RemoveColumnDefaultExpression
       ColumnID: 2
       TableID: 106
-    *scop.UpdateBackReferencesInSequences
+    *scop.UpdateTableBackReferencesInSequences
       BackReferencedColumnID: 2
       BackReferencedTableID: 106
       SequenceIDs:
@@ -168,7 +168,7 @@ PreCommitPhase stage 2 of 2 with 11 MutationType ops
     *scop.RemoveColumnDefaultExpression
       ColumnID: 2
       TableID: 105
-    *scop.UpdateBackReferencesInSequences
+    *scop.UpdateTableBackReferencesInSequences
       BackReferencedColumnID: 2
       BackReferencedTableID: 105
       SequenceIDs:
@@ -176,7 +176,7 @@ PreCommitPhase stage 2 of 2 with 11 MutationType ops
     *scop.RemoveColumnDefaultExpression
       ColumnID: 2
       TableID: 106
-    *scop.UpdateBackReferencesInSequences
+    *scop.UpdateTableBackReferencesInSequences
       BackReferencedColumnID: 2
       BackReferencedTableID: 106
       SequenceIDs:
@@ -241,6 +241,18 @@ PostCommitNonRevertiblePhase stage 1 of 1 with 5 MutationType ops
 deps
 DROP SEQUENCE defaultdb.SQ1 CASCADE
 ----
+- from: [Namespace:{DescID: 104, Name: sq1, ReferencedDescID: 100}, ABSENT]
+  to:   [Sequence:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
+- from: [ObjectParent:{DescID: 104, ReferencedDescID: 101}, ABSENT]
+  to:   [Sequence:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
+- from: [Owner:{DescID: 104}, ABSENT]
+  to:   [Sequence:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
 - from: [Sequence:{DescID: 104}, ABSENT]
   to:   [TableData:{DescID: 104, ReferencedDescID: 100}, DROPPED]
   kind: SameStagePrecedence
@@ -259,8 +271,8 @@ DROP SEQUENCE defaultdb.SQ1 CASCADE
   rule: descriptor dropped before dependent element removal
 - from: [Sequence:{DescID: 104}, DROPPED]
   to:   [ObjectParent:{DescID: 104, ReferencedDescID: 101}, ABSENT]
-  kind: Precedence
-  rule: descriptor dropped before dependent element removal
+  kind: SameStagePrecedence
+  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
 - from: [Sequence:{DescID: 104}, DROPPED]
   to:   [Owner:{DescID: 104}, ABSENT]
   kind: Precedence
@@ -277,3 +289,11 @@ DROP SEQUENCE defaultdb.SQ1 CASCADE
   to:   [UserPrivileges:{DescID: 104, Name: root}, ABSENT]
   kind: Precedence
   rule: descriptor dropped before dependent element removal
+- from: [UserPrivileges:{DescID: 104, Name: admin}, ABSENT]
+  to:   [Sequence:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
+- from: [UserPrivileges:{DescID: 104, Name: root}, ABSENT]
+  to:   [Sequence:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor

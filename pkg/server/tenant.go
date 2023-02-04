@@ -253,7 +253,7 @@ func NewTenantServer(
 	if !baseCfg.DisableSQLListener {
 		// Initialize the pgwire pre-server, which initializes connections,
 		// sets up TLS and reads client status parameters.
-		ps := pgwire.MakePreServeConnHandler(
+		pgPreServer = pgwire.NewPreServeConnHandler(
 			baseCfg.AmbientCtx,
 			baseCfg.Config,
 			args.Settings,
@@ -262,10 +262,9 @@ func NewTenantServer(
 			args.monitorAndMetrics.rootSQLMemoryMonitor,
 			false, /* acceptTenantName */
 		)
-		for _, m := range ps.Metrics() {
+		for _, m := range pgPreServer.Metrics() {
 			args.registry.AddMetricStruct(m)
 		}
-		pgPreServer = &ps
 	}
 
 	// Instantiate the SQL server proper.
@@ -386,6 +385,18 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 
 	// Start a context for the asynchronous network workers.
 	workersCtx := s.AnnotateCtx(context.Background())
+
+	if !s.sqlServer.cfg.Insecure {
+		cm, err := s.rpcContext.GetCertificateManager()
+		if err != nil {
+			return err
+		}
+		// Ensure that SIGHUP will make this cert manager reload its certs
+		// from disk.
+		if err := cm.RegisterSignalHandler(workersCtx, s.stopper); err != nil {
+			return err
+		}
+	}
 
 	// If DisableHTTPListener is set, we are relying on the HTTP request
 	// routing performed by the serverController.
@@ -569,16 +580,18 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		s.sqlServer.cfg.SQLAdvertiseAddr,
 	)
 
-	// Begin recording runtime statistics.
-	if err := startSampleEnvironment(workersCtx,
-		s.ClusterSettings(),
-		s.stopper,
-		s.sqlServer.cfg.GoroutineDumpDirName,
-		s.sqlServer.cfg.HeapProfileDirName,
-		s.runtime,
-		s.tenantStatus.sessionRegistry,
-	); err != nil {
-		return err
+	if !s.sqlServer.cfg.DisableRuntimeStatsMonitor {
+		// Begin recording runtime statistics.
+		if err := startSampleEnvironment(workersCtx,
+			s.ClusterSettings(),
+			s.stopper,
+			s.sqlServer.cfg.GoroutineDumpDirName,
+			s.sqlServer.cfg.HeapProfileDirName,
+			s.runtime,
+			s.tenantStatus.sessionRegistry,
+		); err != nil {
+			return err
+		}
 	}
 
 	// Export statistics to graphite, if enabled by configuration.
@@ -823,12 +836,37 @@ func makeTenantSQLServerArgs(
 		Settings:         st,
 		Knobs:            rpcTestingKnobs,
 	})
+
+	if !baseCfg.Insecure {
+		// This check mirrors that done in NewServer().
+		// Needed for receiving RPC connections until
+		// this issue is fixed:
+		// https://github.com/cockroachdb/cockroach/issues/92524
+		if _, err := rpcContext.GetServerTLSConfig(); err != nil {
+			return sqlServerArgs{}, err
+		}
+		// Needed for outgoing connections, until this issue
+		// is fixed:
+		// https://github.com/cockroachdb/cockroach/issues/96215
+		if _, err := rpcContext.GetTenantTLSConfig(); err != nil {
+			return sqlServerArgs{}, err
+		}
+		cm, err := rpcContext.GetCertificateManager()
+		if err != nil {
+			return sqlServerArgs{}, err
+		}
+		// Expose cert expirations in metrics.
+		registry.AddMetricStruct(cm.Metrics())
+	}
+
+	registry.AddMetricStruct(rpcContext.Metrics())
+	registry.AddMetricStruct(rpcContext.RemoteClocks.Metrics())
+
 	// If there is a local KV server, hook this SQLServer to it so that the
 	// SQLServer can perform some RPCs directly, without going through gRPC.
 	if lsi := sqlCfg.LocalKVServerInfo; lsi != nil {
 		rpcContext.SetLocalInternalServer(
 			lsi.InternalServer,
-			true, // tenant
 			lsi.ServerInterceptors,
 			rpcContext.ClientInterceptors())
 	}
@@ -949,7 +987,12 @@ func makeTenantSQLServerArgs(
 		parentRecorder.AddTenantRecorder(recorder)
 	}
 
-	runtime := status.NewRuntimeStatSampler(startupCtx, clock)
+	var runtime *status.RuntimeStatSampler
+	if baseCfg.RuntimeStatSampler != nil {
+		runtime = baseCfg.RuntimeStatSampler
+	} else {
+		runtime = status.NewRuntimeStatSampler(startupCtx, clock)
+	}
 	registry.AddMetricStruct(runtime)
 
 	// NB: The init method will be called in (*SQLServerWrapper).PreStart().
@@ -957,7 +1000,10 @@ func makeTenantSQLServerArgs(
 	externalStorage := esb.makeExternalStorage
 	externalStorageFromURI := esb.makeExternalStorageFromURI
 
-	grpcServer := newGRPCServer(rpcContext)
+	grpcServer, err := newGRPCServer(rpcContext)
+	if err != nil {
+		return sqlServerArgs{}, err
+	}
 
 	sessionRegistry := sql.NewSessionRegistry()
 

@@ -7,7 +7,7 @@ CREATE TABLE ab (
 statement error pq: unimplemented: user-defined functions with SETOF return types are not supported
 CREATE FUNCTION f(a int) RETURNS SETOF INT LANGUAGE SQL AS 'SELECT 1'
 
-statement error pq: cannot set leakproof on function with non-immutable volatility: STABLE
+statement error .*cannot set leakproof on function with non-immutable volatility: STABLE.*
 CREATE FUNCTION f(a int) RETURNS INT LEAKPROOF STABLE LANGUAGE SQL AS 'SELECT 1'
 
 statement error pq: return type mismatch in function declared to return int\nDETAIL: Actual return type is string
@@ -51,24 +51,6 @@ CREATE FUNCTION err(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT j'
 
 statement error pgcode 42703 column \"j\" does not exist
 CREATE FUNCTION err(i INT) RETURNS INT LANGUAGE SQL AS 'SELECT a FROM ab WHERE a = j'
-
-statement error pgcode 0A000 functions do not currently support \* expressions
-CREATE FUNCTION err(i INT) RETURNS ab LANGUAGE SQL AS 'SELECT * FROM ab'
-
-statement error pgcode 0A000 functions do not currently support \* expressions
-CREATE FUNCTION err(i INT) RETURNS ab LANGUAGE SQL AS 'SELECT ab.* FROM ab'
-
-statement error pgcode 0A000 functions do not currently support \* expressions
-CREATE FUNCTION err(i INT) RETURNS ab LANGUAGE SQL AS $$
-  SELECT 1;
-  SELECT * FROM ab;
-$$
-
-statement error pgcode 0A000 functions do not currently support \* expressions
-CREATE FUNCTION err(i INT) RETURNS INT LANGUAGE SQL AS $$
-  SELECT * FROM ab;
-  SELECT 1;
-$$
 
 statement ok
 CREATE FUNCTION d(i INT2) RETURNS INT4 LANGUAGE SQL AS 'SELECT i'
@@ -1788,6 +1770,9 @@ DELETE FROM system.eventlog;
 statement ok
 CREATE FUNCTION f_test_log() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 
+# TODO(chengxiong): remove this test condition when event logging is moved build
+# time in declarative schema changer.
+onlyif config local-legacy-schema-changer
 query TTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -1801,6 +1786,7 @@ create_function  203  "test.public.f_test_log"  "CREATE FUNCTION test.public.f_t
 statement ok
 CREATE OR REPLACE FUNCTION f_test_log() RETURNS INT LANGUAGE SQL AS $$ SELECT 2 $$;
 
+onlyif config local-legacy-schema-changer
 query TTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -1815,6 +1801,7 @@ create_function  203  "test.public.f_test_log"  "CREATE OR REPLACE FUNCTION test
 statement ok
 ALTER FUNCTION f_test_log RENAME TO f_test_log_new;
 
+onlyif config local-legacy-schema-changer
 query TTTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -1831,6 +1818,7 @@ ALTER FUNCTION f_test_log_new RENAME TO f_test_log;
 statement ok
 ALTER FUNCTION f_test_log OWNER TO u_test_event;
 
+onlyif config local-legacy-schema-changer
 query TTTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -1844,6 +1832,7 @@ alter_function_owner  203  "test.public.f_test_log"  "u_test_event"  "ALTER FUNC
 statement ok
 ALTER FUNCTION f_test_log SET SCHEMA sc_test_event;
 
+onlyif config local-legacy-schema-changer
 query TTTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -1859,6 +1848,7 @@ ALTER FUNCTION sc_test_event.f_test_log SET SCHEMA public;
 ALTER FUNCTION f_test_log IMMUTABLE;
 DROP FUNCTION f_test_log;
 
+onlyif config local-legacy-schema-changer
 query TTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -1869,6 +1859,7 @@ SELECT etype, info_json->'DescriptorID', info_json->'FunctionName', info_json->'
 ----
 alter_function_options  203  "test.public.f_test_log"  "ALTER FUNCTION \"\".\"\".f_test_log IMMUTABLE"
 
+onlyif config local-legacy-schema-changer
 query TTTT retry
 WITH tmp AS (
   SELECT "eventType" AS etype, info::JSONB AS info_json
@@ -2796,6 +2787,42 @@ SELECT a, sub_is_odd(a) FROM sub_all WHERE sub_is_odd(a) OR sub_is_odd(a) IS NUL
 5  true
 6  NULL
 
+# UDF with an uncorrelated EXISTS.
+statement ok
+CREATE FUNCTION sub_first() RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE EXISTS (SELECT a FROM sub_odd) ORDER BY a LIMIT 1
+$$
+
+query II rowsort
+SELECT sub_first(), a FROM sub_all
+----
+1  1
+1  2
+1  3
+1  4
+1  5
+1  6
+
+# UDF with a correlated EXISTS.
+statement ok
+CREATE FUNCTION sub_two() RETURNS INT LANGUAGE SQL AS $$
+  SELECT a FROM sub_all WHERE CASE
+    WHEN a > 1 THEN EXISTS (SELECT 0 FROM sub_odd WHERE sub_odd.a = sub_all.a+1)
+    ELSE false
+  END
+  ORDER BY a LIMIT 1
+$$
+
+query II rowsort
+SELECT a, sub_two() FROM sub_all
+----
+1  2
+2  2
+3  2
+4  2
+5  2
+6  2
+
 
 subtest variadic
 
@@ -2906,10 +2933,10 @@ SELECT oid, proname, pronamespace, proowner, prolang, proleakproof, proisstrict,
 FROM pg_catalog.pg_proc WHERE proname IN ('f_93314', 'f_93314_alias', 'f_93314_comp', 'f_93314_comp_t')
 ORDER BY oid;
 ----
-100264  f_93314         105  1546506610  14  false  false  false  v  0  100263  ·  {}  NULL  SELECT i, e FROM test.public.t_93314 ORDER BY i LIMIT 1;
-100266  f_93314_alias   105  1546506610  14  false  false  false  v  0  100265  ·  {}  NULL  SELECT i, e FROM test.public.t_93314_alias ORDER BY i LIMIT 1;
-100270  f_93314_comp    105  1546506610  14  false  false  false  v  0  100267  ·  {}  NULL  SELECT (1, 2);
-100271  f_93314_comp_t  105  1546506610  14  false  false  false  v  0  100269  ·  {}  NULL  SELECT a, c FROM test.public.t_93314_comp LIMIT 1;
+100266  f_93314         105  1546506610  14  false  false  false  v  0  100265  ·  {}  NULL  SELECT i, e FROM test.public.t_93314 ORDER BY i LIMIT 1;
+100268  f_93314_alias   105  1546506610  14  false  false  false  v  0  100267  ·  {}  NULL  SELECT i, e FROM test.public.t_93314_alias ORDER BY i LIMIT 1;
+100272  f_93314_comp    105  1546506610  14  false  false  false  v  0  100269  ·  {}  NULL  SELECT (1, 2);
+100273  f_93314_comp_t  105  1546506610  14  false  false  false  v  0  100271  ·  {}  NULL  SELECT a, c FROM test.public.t_93314_comp LIMIT 1;
 
 # Regression test for #95240. Strict UDFs that are inlined should result in NULL
 # when presented with NULL arguments.
@@ -2923,3 +2950,96 @@ SELECT f95240(a) FROM t95240
 ----
 33
 NULL
+
+onlyif config local
+query T
+EXPLAIN CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS 'SELECT 1'
+----
+distribution: local
+vectorized: true
+·
+• create function
+
+# Regression test for #96326. Strict UDFs with no arguments should not error
+# while being called.
+statement ok
+CREATE FUNCTION f96326() RETURNS INT LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT 1';
+
+query I
+SELECT f96326();
+----
+1
+
+subtest regression_95364
+
+statement ok
+CREATE FUNCTION f_95364() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $dropped_fn_id
+SELECT function_id FROM crdb_internal.create_function_statements WHERE function_name = 'f_95364';
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+1
+
+statement ok
+DROP FUNCTION f_95364;
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+0
+
+statement ok
+CREATE DATABASE db_95364;
+
+statement ok
+USE db_95364;
+
+statement ok
+CREATE FUNCTION f_95364_2() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $dropped_fn_id
+SELECT function_id FROM crdb_internal.create_function_statements WHERE function_name = 'f_95364_2';
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+1
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE db_95364 CASCADE;
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+0
+
+statement ok
+USE test;
+
+statement ok
+CREATE SCHEMA sc_95364;
+
+statement ok
+CREATE FUNCTION sc_95364.f_95364_3() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $dropped_fn_id
+SELECT function_id FROM crdb_internal.create_function_statements WHERE function_name = 'f_95364_3';
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+1
+
+statement ok
+DROP SCHEMA sc_95364 CASCADE;
+
+query I
+SELECT count(descriptor) FROM system.descriptor WHERE id = $dropped_fn_id;
+----
+0

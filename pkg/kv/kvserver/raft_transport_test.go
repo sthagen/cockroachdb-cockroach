@@ -97,11 +97,9 @@ func (s channelServer) HandleSnapshot(
 }
 
 func (s channelServer) HandleDelegatedSnapshot(
-	ctx context.Context,
-	req *kvserverpb.DelegateSnapshotRequest,
-	stream kvserver.DelegateSnapshotResponseStream,
-) error {
-	panic("unimplemented")
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
+	panic("unexpected HandleDelegatedSnapshot")
 }
 
 // raftTransportTestContext contains objects needed to test RaftTransport.
@@ -165,7 +163,8 @@ func (rttc *raftTransportTestContext) AddNode(nodeID roachpb.NodeID) *kvserver.R
 func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
 	nodeID roachpb.NodeID, addr net.Addr, stopper *stop.Stopper,
 ) (*kvserver.RaftTransport, net.Addr) {
-	grpcServer := rpc.NewServer(rttc.nodeRPCContext)
+	grpcServer, err := rpc.NewServer(rttc.nodeRPCContext)
+	require.NoError(rttc.t, err)
 	ctwWithTracer := log.MakeTestingAmbientCtxWithNewTracer()
 	transport := kvserver.NewRaftTransport(
 		ctwWithTracer,
@@ -177,9 +176,7 @@ func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
 	)
 	rttc.transports[nodeID] = transport
 	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, addr)
-	if err != nil {
-		rttc.t.Fatal(err)
-	}
+	require.NoError(rttc.t, err)
 	return transport, ln.Addr()
 }
 

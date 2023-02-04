@@ -2354,9 +2354,7 @@ https://www.postgresql.org/docs/9.6/view-pg-prepared-statements.html`,
 }
 
 func addPgProcBuiltinRow(name string, addRow func(...tree.Datum) error) error {
-	props, overloads := builtinsregistry.GetBuiltinProperties(name)
-	isAggregate := props.Class == tree.AggregateClass
-	isWindow := props.Class == tree.WindowClass
+	_, overloads := builtinsregistry.GetBuiltinProperties(name)
 	nspOid := tree.NewDOid(catconstants.PgCatalogID)
 	const crdbInternal = catconstants.CRDBInternalSchemaName + "."
 	if strings.HasPrefix(name, crdbInternal) {
@@ -2364,19 +2362,21 @@ func addPgProcBuiltinRow(name string, addRow func(...tree.Datum) error) error {
 		name = name[len(crdbInternal):]
 	}
 
-	var kind tree.Datum
-	switch {
-	case isAggregate:
-		kind = tree.NewDString("a")
-	case isWindow:
-		kind = tree.NewDString("w")
-	default:
-		kind = tree.NewDString("f")
-	}
-
 	for _, builtin := range overloads {
 		dName := tree.NewDName(name)
 		dSrc := tree.NewDString(name)
+
+		isAggregate := builtin.Class == tree.AggregateClass
+		isWindow := builtin.Class == tree.WindowClass
+		var kind tree.Datum
+		switch {
+		case isAggregate:
+			kind = tree.NewDString("a")
+		case isWindow:
+			kind = tree.NewDString("w")
+		default:
+			kind = tree.NewDString("f")
+		}
 
 		var retType tree.Datum
 		isRetSet := false
@@ -2590,8 +2590,8 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 		return forEachDatabaseDesc(ctx, p, dbContext, false, /* requiresPrivileges */
 			func(dbDesc catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, dbDesc, true /* requiresPrivileges */, func(scDesc catalog.SchemaDescriptor) error {
-					return scDesc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-						fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, overload.ID)
+					return scDesc.ForEachFunctionSignature(func(sig descpb.SchemaDescriptor_FunctionSignature) error {
+						fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, sig.ID)
 						if err != nil {
 							return err
 						}

@@ -14,7 +14,7 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
@@ -37,11 +37,11 @@ type EngineMetrics struct {
 	SQLOptPlanCacheHits   *metric.Counter
 	SQLOptPlanCacheMisses *metric.Counter
 
-	DistSQLExecLatency    *metric.Histogram
-	SQLExecLatency        *metric.Histogram
-	DistSQLServiceLatency *metric.Histogram
-	SQLServiceLatency     *metric.Histogram
-	SQLTxnLatency         *metric.Histogram
+	DistSQLExecLatency    metric.IHistogram
+	SQLExecLatency        metric.IHistogram
+	DistSQLServiceLatency metric.IHistogram
+	SQLServiceLatency     metric.IHistogram
+	SQLTxnLatency         metric.IHistogram
 	SQLTxnsOpen           *metric.Gauge
 	SQLActiveStatements   *metric.Gauge
 	SQLContendedTxns      *metric.Counter
@@ -70,20 +70,20 @@ func (EngineMetrics) MetricStruct() {}
 
 // StatsMetrics groups metrics related to SQL Stats collection.
 type StatsMetrics struct {
-	SQLStatsMemoryMaxBytesHist  *metric.Histogram
+	SQLStatsMemoryMaxBytesHist  metric.IHistogram
 	SQLStatsMemoryCurBytesCount *metric.Gauge
 
-	ReportedSQLStatsMemoryMaxBytesHist  *metric.Histogram
+	ReportedSQLStatsMemoryMaxBytesHist  metric.IHistogram
 	ReportedSQLStatsMemoryCurBytesCount *metric.Gauge
 
 	DiscardedStatsCount *metric.Counter
 
 	SQLStatsFlushStarted  *metric.Counter
 	SQLStatsFlushFailure  *metric.Counter
-	SQLStatsFlushDuration *metric.Histogram
+	SQLStatsFlushDuration metric.IHistogram
 	SQLStatsRemovedRows   *metric.Counter
 
-	SQLTxnStatsCollectionOverhead *metric.Histogram
+	SQLTxnStatsCollectionOverhead metric.IHistogram
 }
 
 // StatsMetrics is part of the metric.Struct interface.
@@ -121,7 +121,7 @@ func (ex *connExecutor) recordStatementSummary(
 	rowsAffected int,
 	stmtErr error,
 	stats topLevelQueryStats,
-) roachpb.StmtFingerprintID {
+) appstatspb.StmtFingerprintID {
 	phaseTimes := ex.statsCollector.PhaseTimes()
 
 	// Collect the statistics.
@@ -163,7 +163,7 @@ func (ex *connExecutor) recordStatementSummary(
 	}
 
 	fullScan := flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan)
-	recordedStmtStatsKey := roachpb.StatementStatisticsKey{
+	recordedStmtStatsKey := appstatspb.StatementStatisticsKey{
 		Query:        stmt.StmtNoConstants,
 		QuerySummary: stmt.StmtSummary,
 		DistSQL:      flags.IsDistributed(),
@@ -229,11 +229,17 @@ func (ex *connExecutor) recordStatementSummary(
 	if queryLevelStatsOk {
 		for _, ev := range queryLevelStats.ContentionEvents {
 			contentionEvent := contentionpb.ExtendedContentionEvent{
-				BlockingEvent: ev,
-				WaitingTxnID:  planner.txn.ID(),
+				BlockingEvent:            ev,
+				WaitingTxnID:             planner.txn.ID(),
+				WaitingStmtFingerprintID: stmtFingerprintID,
+				WaitingStmtID:            stmt.QueryID,
 			}
 
 			ex.server.cfg.ContentionRegistry.AddContentionEvent(contentionEvent)
+		}
+
+		if queryLevelStats.ContentionTime > 0 {
+			ex.planner.DistSQLPlanner().distSQLSrv.Metrics.ContendedQueriesCount.Inc(1)
 		}
 
 		err = ex.statsCollector.RecordStatementExecStats(recordedStmtStatsKey, *queryLevelStats)

@@ -77,9 +77,10 @@ ok
 
 dump-events stores=(1,2) remove=true
 ----
-Updated range r1, Key:/Min, Store:s1 ReplicaID:16
-Updated range r2, Key:/Table/1, Store:s1 ReplicaID:16
-Updated range r3, Key:/Table/5, Store:s2 ReplicaID:16
+Events:
+updated range r1, Key:/Min, Store:s1 ReplicaID:16
+updated range r2, Key:/Table/1, Store:s1 ReplicaID:16
+updated range r3, Key:/Table/5, Store:s2 ReplicaID:16
 
 # We now try to dump stores once again to verify that record
 # consumer cleans up events if it passed them on successfully.

@@ -99,9 +99,10 @@ func (w *walkCtx) walkRoot() {
 	})
 	for _, user := range privileges.Users {
 		w.ev(scpb.Status_PUBLIC, &scpb.UserPrivileges{
-			DescriptorID: w.desc.GetID(),
-			UserName:     user.User().Normalized(),
-			Privileges:   user.Privileges,
+			DescriptorID:    w.desc.GetID(),
+			UserName:        user.User().Normalized(),
+			Privileges:      user.Privileges,
+			WithGrantOption: user.WithGrantOption,
 		})
 	}
 	// Dispatch on type.
@@ -600,13 +601,20 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 func (w *walkCtx) walkUniqueWithoutIndexConstraint(
 	tbl catalog.TableDescriptor, c catalog.UniqueWithoutIndexConstraint,
 ) {
-	// TODO(postamar): proper handling of constraint status
-
-	w.ev(scpb.Status_PUBLIC, &scpb.UniqueWithoutIndexConstraint{
+	uwi := &scpb.UniqueWithoutIndexConstraint{
 		TableID:      tbl.GetID(),
 		ConstraintID: c.GetConstraintID(),
 		ColumnIDs:    c.CollectKeyColumnIDs().Ordered(),
-	})
+	}
+	if c.IsPartial() {
+		expr, err := w.newExpression(c.GetPredicate())
+		if err != nil {
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "unique without index constraint %q in table %q (%d)",
+				c.GetName(), tbl.GetName(), tbl.GetID()))
+		}
+		uwi.Predicate = expr
+	}
+	w.ev(scpb.Status_PUBLIC, uwi)
 	w.ev(scpb.Status_PUBLIC, &scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.GetID(),
 		ConstraintID: c.GetConstraintID(),
@@ -732,7 +740,7 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 		Body:        fnDesc.GetFunctionBody(),
 		Lang:        catpb.FunctionLanguage{Lang: fnDesc.GetLanguage()},
 		UsesTypeIDs: fnDesc.GetDependsOnTypes(),
-		// TODO(chengxiong): add UsesFunctionIDs
+		// TODO(chengxiong): add UsesFunctionIDs when UDF usage is allowed.
 	}
 	dedupeColIDs := func(colIDs []catid.ColumnID) []catid.ColumnID {
 		ret := catalog.MakeTableColSet()

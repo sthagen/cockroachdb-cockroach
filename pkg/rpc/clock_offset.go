@@ -29,7 +29,7 @@ import (
 type RemoteClockMetrics struct {
 	ClockOffsetMeanNanos   *metric.Gauge
 	ClockOffsetStdDevNanos *metric.Gauge
-	LatencyHistogramNanos  *metric.Histogram
+	LatencyHistogramNanos  metric.IHistogram
 }
 
 // avgLatencyMeasurementAge determines how to exponentially weight the
@@ -98,6 +98,7 @@ type RemoteClockMonitor struct {
 		syncutil.RWMutex
 		offsets      map[roachpb.NodeID]RemoteOffset
 		latencyInfos map[roachpb.NodeID]*latencyInfo
+		connCount    map[roachpb.NodeID]uint
 	}
 
 	metrics RemoteClockMetrics
@@ -128,15 +129,19 @@ func newRemoteClockMonitor(
 	}
 	r.mu.offsets = make(map[roachpb.NodeID]RemoteOffset)
 	r.mu.latencyInfos = make(map[roachpb.NodeID]*latencyInfo)
+	r.mu.connCount = make(map[roachpb.NodeID]uint)
 	if histogramWindowInterval == 0 {
 		histogramWindowInterval = time.Duration(math.MaxInt64)
 	}
 	r.metrics = RemoteClockMetrics{
 		ClockOffsetMeanNanos:   metric.NewGauge(metaClockOffsetMeanNanos),
 		ClockOffsetStdDevNanos: metric.NewGauge(metaClockOffsetStdDevNanos),
-		LatencyHistogramNanos: metric.NewHistogram(
-			metaLatencyHistogramNanos, histogramWindowInterval, metric.IOLatencyBuckets,
-		),
+		LatencyHistogramNanos: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaLatencyHistogramNanos,
+			Duration: histogramWindowInterval,
+			Buckets:  metric.IOLatencyBuckets,
+		}),
 	}
 	return &r
 }
@@ -170,6 +175,31 @@ func (r *RemoteClockMonitor) AllLatencies() map[roachpb.NodeID]time.Duration {
 		}
 	}
 	return result
+}
+
+// OnConnect tracks connections count per node.
+func (r *RemoteClockMonitor) OnConnect(ctx context.Context, nodeID roachpb.NodeID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := r.mu.connCount[nodeID]
+	count++
+	r.mu.connCount[nodeID] = count
+}
+
+// OnDisconnect removes all information associated with the provided node when there's no connections remain.
+func (r *RemoteClockMonitor) OnDisconnect(ctx context.Context, nodeID roachpb.NodeID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count, ok := r.mu.connCount[nodeID]
+	if ok && count > 0 {
+		count--
+		r.mu.connCount[nodeID] = count
+	}
+	if count == 0 {
+		delete(r.mu.offsets, nodeID)
+		delete(r.mu.latencyInfos, nodeID)
+		delete(r.mu.connCount, nodeID)
+	}
 }
 
 // UpdateOffset is a thread-safe way to update the remote clock and latency
@@ -206,6 +236,8 @@ func (r *RemoteClockMonitor) UpdateOffset(
 		if !emptyOffset {
 			r.mu.offsets[id] = offset
 		} else {
+			// Remove most recent offset because it is outdated and new received offset is empty
+			// so there's no reason to either keep previous value or update with new one.
 			delete(r.mu.offsets, id)
 		}
 	} else if offset.Uncertainty < oldOffset.Uncertainty {

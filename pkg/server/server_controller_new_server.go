@@ -53,7 +53,10 @@ type tenantServerCreator interface {
 	// can be checked with errors.Is.
 	//
 	// testArgs is used by tests to tweak the tenant server.
-	newTenantServer(ctx context.Context, tenantNameContainer *roachpb.TenantNameContainer, index int,
+	newTenantServer(ctx context.Context,
+		tenantNameContainer *roachpb.TenantNameContainer,
+		tenantStopper *stop.Stopper,
+		index int,
 		testArgs base.TestSharedProcessTenantArgs,
 	) (onDemandServer, error)
 }
@@ -64,6 +67,7 @@ var _ tenantServerCreator = &Server{}
 func (s *Server) newTenantServer(
 	ctx context.Context,
 	tenantNameContainer *roachpb.TenantNameContainer,
+	tenantStopper *stop.Stopper,
 	index int,
 	testArgs base.TestSharedProcessTenantArgs,
 ) (onDemandServer, error) {
@@ -71,7 +75,7 @@ func (s *Server) newTenantServer(
 	if err != nil {
 		return nil, err
 	}
-	tenantStopper, baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, index)
+	baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, index, tenantStopper)
 	if err != nil {
 		return nil, err
 	}
@@ -81,8 +85,6 @@ func (s *Server) newTenantServer(
 
 	tenantServer, err := s.startTenantServerInternal(ctx, baseCfg, sqlCfg, tenantStopper, tenantNameContainer)
 	if err != nil {
-		// Abandon any work done so far.
-		tenantStopper.Stop(ctx)
 		return nil, err
 	}
 
@@ -164,15 +166,8 @@ func (s *Server) startTenantServerInternal(
 }
 
 func (s *Server) makeSharedProcessTenantConfig(
-	ctx context.Context, tenantID roachpb.TenantID, index int,
-) (*stop.Stopper, BaseConfig, SQLConfig, error) {
-	stopper := stop.NewStopper()
-	defer func() {
-		if stopper != nil {
-			stopper.Stop(ctx)
-		}
-	}()
-
+	ctx context.Context, tenantID roachpb.TenantID, index int, stopper *stop.Stopper,
+) (BaseConfig, SQLConfig, error) {
 	// Create a configuration for the new tenant.
 	// TODO(knz): Maybe enforce the SQL Instance ID to be equal to the KV node ID?
 	// See: https://github.com/cockroachdb/cockroach/issues/84602
@@ -183,11 +178,10 @@ func (s *Server) makeSharedProcessTenantConfig(
 	}
 	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, index, parentCfg, localServerInfo, stopper)
 	if err != nil {
-		return nil, BaseConfig{}, SQLConfig{}, err
+		return BaseConfig{}, SQLConfig{}, err
 	}
-	st := stopper
-	stopper = nil // inhibit the deferred Stop()
-	return st, baseCfg, sqlCfg, nil
+
+	return baseCfg, sqlCfg, nil
 }
 
 func makeSharedProcessTenantServerConfig(
@@ -234,7 +228,7 @@ func makeSharedProcessTenantServerConfig(
 	storeSpec := candidateSpec
 	if !storeSpec.InMemory {
 		storeDir := filepath.Join(storeSpec.Path, "tenant-"+tenantID.String())
-		if err := os.MkdirAll(storeDir, 0700); err != nil {
+		if err := os.MkdirAll(storeDir, 0755); err != nil {
 			return baseCfg, sqlCfg, err
 		}
 		stopper.AddCloser(stop.CloserFn(func() {
@@ -283,26 +277,48 @@ func makeSharedProcessTenantServerConfig(
 	// The parent server will route SQL connections to us.
 	baseCfg.DisableSQLListener = true
 	baseCfg.SplitListenSQL = true
-	// Nevertheless, we like to know our own HTTP address.
+	// Nevertheless, we like to know our own addresses.
+	baseCfg.SocketFile = kvServerCfg.Config.SocketFile
 	baseCfg.SQLAddr = kvServerCfg.Config.SQLAddr
 	baseCfg.SQLAdvertiseAddr = kvServerCfg.Config.SQLAdvertiseAddr
 
-	// Define the unix socket intelligently.
-	// See: https://github.com/cockroachdb/cockroach/issues/84585
-	baseCfg.SocketFile = ""
-
-	// TODO(knz): Make the TLS config separate per tenant.
-	// See https://cockroachlabs.atlassian.net/browse/CRDB-14539.
+	// Secondary tenant servers need access to the certs
+	// directory for two purposes:
+	// - to authenticate incoming RPC connections, until
+	//   this issue is resolved: https://github.com/cockroachdb/cockroach/issues/92524
+	// - to load client certs to present to the remote peer
+	//   on outgoing node-node connections.
+	//
+	// Regarding the second point, we currently still need a client
+	// tenant cert to be manually created. Error out if it's not ready.
+	// This check can go away when the following issue is resolved:
+	// https://github.com/cockroachdb/cockroach/issues/96215
 	baseCfg.SSLCertsDir = kvServerCfg.BaseConfig.SSLCertsDir
 	baseCfg.SSLCAKey = kvServerCfg.BaseConfig.SSLCAKey
 
-	// TODO(knz): startSampleEnvironment() should not be part of startTenantInternal. For now,
-	// disable the mechanism manually.
-	// See: https://github.com/cockroachdb/cockroach/issues/84589
+	// Don't let this SQL server take its own background heap/goroutine/CPU profile dumps.
+	// The system tenant's SQL server is doing this job.
+	baseCfg.DisableRuntimeStatsMonitor = true
 	baseCfg.GoroutineDumpDirName = ""
 	baseCfg.HeapProfileDirName = ""
 	baseCfg.CPUProfileDirName = ""
-	baseCfg.InflightTraceDirName = ""
+
+	// Expose the process-wide runtime metrics to the tenant's metric
+	// collector. Since they are process-wide, all tenants can see them.
+	baseCfg.RuntimeStatSampler = kvServerCfg.BaseConfig.RuntimeStatSampler
+
+	// If job trace dumps were enabled for the top-level server, enable
+	// them for us too. However, in contrast to temporary files, we
+	// don't want them to be deleted when the tenant server shuts down.
+	// So we store them into a directory relative to the main trace dump
+	// directory.
+	if kvServerCfg.BaseConfig.InflightTraceDirName != "" {
+		traceDir := filepath.Join(kvServerCfg.BaseConfig.InflightTraceDirName, "tenant-"+tenantID.String())
+		if err := os.MkdirAll(traceDir, 0755); err != nil {
+			return baseCfg, sqlCfg, err
+		}
+		baseCfg.InflightTraceDirName = traceDir
+	}
 
 	// TODO(knz): Define a meaningful storage config for each tenant,
 	// see: https://github.com/cockroachdb/cockroach/issues/84588.

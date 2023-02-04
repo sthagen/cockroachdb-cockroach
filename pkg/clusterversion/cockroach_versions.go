@@ -408,6 +408,8 @@ const (
 	// columnar scans in the KV layer.
 	V23_1_KVDirectColumnarScans
 
+	V23_1_DeleteDroppedFunctionDescriptors
+
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -421,6 +423,9 @@ func (k Key) String() string {
 // TODOPreV22_1 is an alias for V22_1 for use in any version gate/check that
 // previously referenced a < 22.1 version until that check/gate can be removed.
 const TODOPreV22_1 = V22_1
+
+// Offset every version +1M major versions into the future if this is a dev branch.
+const DevOffset = 1000000
 
 // rawVersionsSingleton lists all historical versions here in chronological
 // order, with comments describing what backwards-incompatible features were
@@ -702,6 +707,10 @@ var rawVersionsSingleton = keyedVersions{
 		Key:     V23_1_KVDirectColumnarScans,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 34},
 	},
+	{
+		Key:     V23_1_DeleteDroppedFunctionDescriptors,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 36},
+	},
 
 	// *************************************************
 	// Step (2): Add new versions here.
@@ -750,7 +759,6 @@ var versionsSingleton = func() keyedVersions {
 		// which conceptually is actually back down to 2 -- then back to to 1000003,
 		// then on to 1000004, etc.
 		skipFirst := allowUpgradeToDev
-		const devOffset = 1000000
 		first := true
 		for i := range rawVersionsSingleton {
 			// VPrimordial versions are not offset; they don't matter for the logic
@@ -763,7 +771,7 @@ var versionsSingleton = func() keyedVersions {
 				first = false
 				continue
 			}
-			rawVersionsSingleton[i].Major += devOffset
+			rawVersionsSingleton[i].Major += DevOffset
 		}
 	}
 	return rawVersionsSingleton
@@ -777,6 +785,10 @@ var versionsSingleton = func() keyedVersions {
 // simply need to check is that the cluster has upgraded to 23.1.
 var V23_1 = versionsSingleton[len(versionsSingleton)-1].Key
 
+const (
+	BinaryMinSupportedVersionKey = V22_1
+)
+
 // TODO(irfansharif): clusterversion.binary{,MinimumSupported}Version
 // feels out of place. A "cluster version" and a "binary version" are two
 // separate concepts.
@@ -786,12 +798,13 @@ var (
 	// version than binaryMinSupportedVersion, then the binary will exit with
 	// an error. This typically trails the current release by one (see top-level
 	// comment).
-	binaryMinSupportedVersion = ByKey(V22_1)
+	binaryMinSupportedVersion = ByKey(BinaryMinSupportedVersionKey)
 
+	BinaryVersionKey = V23_1
 	// binaryVersion is the version of this binary.
 	//
 	// This is the version that a new cluster will use when created.
-	binaryVersion = versionsSingleton[len(versionsSingleton)-1].Version
+	binaryVersion = ByKey(BinaryVersionKey)
 )
 
 func init() {

@@ -46,12 +46,12 @@ require (
 	github.com/Azure/go-autorest/autorest/azure/cli v0.4.3 // indirect
 	github.com/Azure/go-autorest/autorest/to v0.4.0
 	github.com/aws/aws-sdk-go v1.40.37
-	github.com/aws/aws-sdk-go-v2 v1.16.2
+	github.com/aws/aws-sdk-go-v2 v1.17.3
 	github.com/aws/aws-sdk-go-v2/config v1.15.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.11.2 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.12.3 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.1.9 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.4.3 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.1.27 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.4.21 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/ini v1.3.10 // indirect
 	github.com/aws/aws-sdk-go-v2/service/databasemigrationservice v1.18.3
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.34.0
@@ -85,7 +85,7 @@ require (
 	github.com/MichaelTJones/walk v0.0.0-20161122175330-4748e29d5718
 	github.com/NYTimes/gziphandler v0.0.0-20170623195520-56545f4a5d46
 	github.com/PuerkitoBio/goquery v1.5.1
-	github.com/Shopify/sarama v1.29.0
+	github.com/Shopify/sarama v1.35.0
 	github.com/VividCortex/ewma v1.1.1
 	github.com/abourget/teamcity v0.0.0-00010101000000-000000000000
 	github.com/alessio/shellescape v1.4.1
@@ -93,6 +93,7 @@ require (
 	github.com/andygrunwald/go-jira v1.14.0
 	github.com/apache/arrow/go/arrow v0.0.0-20200923215132-ac86123a3f01
 	github.com/armon/circbuf v0.0.0-20150827004946-bbbad097214e
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.18.2
 	github.com/axiomhq/hyperloglog v0.0.0-20181223111420-4b99d0c2c99e
 	github.com/bazelbuild/rules_go v0.26.0
 	github.com/biogo/store v0.0.0-20160505134755-913427a1d5e8
@@ -111,7 +112,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20230124212821-4199154043c5
+	github.com/cockroachdb/pebble v0.0.0-20230202171745-e9d3bb388ad6
 	github.com/cockroachdb/redact v1.1.3
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -167,7 +168,7 @@ require (
 	github.com/leanovate/gopter v0.2.5-0.20190402064358-634a59d12406
 	github.com/lestrrat-go/jwx v1.2.25
 	github.com/lib/pq v1.10.7
-	github.com/linkedin/goavro/v2 v2.10.0
+	github.com/linkedin/goavro/v2 v2.12.0
 	github.com/lufia/iostat v1.2.1
 	github.com/maruel/panicparse/v2 v2.2.2
 	github.com/marusama/semaphore v0.0.0-20190110074507-6952cef993b2
@@ -183,12 +184,12 @@ require (
 	github.com/opencontainers/image-spec v1.0.2
 	github.com/otan/gopgkrb5 v1.0.3
 	github.com/petermattis/goid v0.0.0-20211229010228-4d14c490ee36
-	github.com/pierrec/lz4 v2.6.0+incompatible
+	github.com/pierrec/lz4/v4 v4.1.15
 	github.com/pierrre/geohash v1.0.0
 	github.com/pkg/browser v0.0.0-20210115035449-ce105d075bb4
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/pressly/goose/v3 v3.5.3
-	github.com/prometheus/client_golang v1.12.0
+	github.com/prometheus/client_golang v1.12.1
 	github.com/prometheus/client_model v0.2.1-0.20210607210712-147c58e9608a
 	github.com/prometheus/common v0.32.1
 	github.com/prometheus/prometheus v1.8.2-0.20210914090109-37468d88dce8
@@ -205,8 +206,8 @@ require (
 	github.com/twpayne/go-geom v1.4.2
 	github.com/wadey/gocovmerge v0.0.0-20160331181800-b5bfa59ec0ad
 	github.com/xdg-go/pbkdf2 v1.0.0
-	github.com/xdg-go/scram v1.0.2
-	github.com/xdg-go/stringprep v1.0.2
+	github.com/xdg-go/scram v1.1.1
+	github.com/xdg-go/stringprep v1.0.3
 	github.com/zabawaba99/go-gitignore v0.0.0-20200117185801-39e6bddfb292
 	go.etcd.io/raft/v3 v3.0.0-20221221215055-65a0bf3b6779
 	go.opentelemetry.io/otel v1.0.0-RC3
@@ -246,7 +247,7 @@ require (
 	github.com/apache/thrift v0.16.0 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20200907205600-7a23bdc65eef // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
-	github.com/aws/smithy-go v1.11.2 // indirect
+	github.com/aws/smithy-go v1.13.5 // indirect
 	github.com/aymanbagabas/go-osc52 v1.0.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bgentry/go-netrc v0.0.0-20140422174119-9fd32a8b3d3d // indirect
@@ -258,7 +259,7 @@ require (
 	github.com/dimchansky/utfbom v1.1.1 // indirect
 	github.com/djherbis/atime v1.1.0 // indirect
 	github.com/docker/go-units v0.4.0 // indirect
-	github.com/eapache/go-resiliency v1.2.0 // indirect
+	github.com/eapache/go-resiliency v1.3.0 // indirect
 	github.com/eapache/go-xerial-snappy v0.0.0-20180814174437-776d5712da21 // indirect
 	github.com/eapache/queue v1.1.0 // indirect
 	github.com/fatih/structs v1.1.0 // indirect
@@ -289,6 +290,8 @@ require (
 	github.com/gorilla/handlers v1.5.1 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
+	github.com/hashicorp/errwrap v1.0.0 // indirect
+	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/huandu/xstrings v1.3.0 // indirect

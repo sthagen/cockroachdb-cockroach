@@ -48,7 +48,7 @@ var PerChangefeedMemLimit = settings.RegisterByteSizeSetting(
 	settings.TenantWritable,
 	"changefeed.memory.per_changefeed_limit",
 	"controls amount of data that can be buffered per changefeed",
-	1<<27, // 128MiB
+	1<<29, // 512MiB
 )
 
 // SlowSpanLogThreshold controls when we will log slow spans.
@@ -224,7 +224,7 @@ var UseMuxRangeFeed = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"changefeed.mux_rangefeed.enabled",
 	"if true, changefeed uses multiplexing rangefeed RPC",
-	false,
+	util.ConstantWithMetamorphicTestBool("changefeed.mux_rangefeed.enabled", false),
 )
 
 // EventConsumerWorkers specifies the maximum number of workers to use when

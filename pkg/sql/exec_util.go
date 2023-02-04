@@ -55,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -1533,7 +1534,7 @@ type ExecutorTestingKnobs struct {
 	BeforeTxnStatsRecorded func(
 		sessionData *sessiondata.SessionData,
 		txnID uuid.UUID,
-		txnFingerprintID roachpb.TransactionFingerprintID,
+		txnFingerprintID appstatspb.TransactionFingerprintID,
 	)
 
 	// AfterBackupCheckpoint if set will be called after a BACKUP-CHECKPOINT
@@ -1680,6 +1681,9 @@ type StreamingTestingKnobs struct {
 	// OverrideRevertRangeBatchSize allows overriding the `MaxSpanRequestKeys`
 	// used when sending a RevertRange request.
 	OverrideRevertRangeBatchSize int64
+
+	// AfterCutoverStarted allows blocking after the cutover has started.
+	AfterCutoverStarted func()
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -2034,12 +2038,6 @@ type queryMeta struct {
 	database string
 }
 
-// cancel cancels the query associated with this queryMeta, by closing the
-// associated stmt context.
-func (q *queryMeta) cancel() {
-	q.cancelQuery()
-}
-
 // SessionDefaults mirrors fields in Session, for restoring default
 // configuration values in SET ... TO DEFAULT (or RESET ...) statements.
 type SessionDefaults map[string]string
@@ -2138,9 +2136,8 @@ func (r *SessionRegistry) deregister(
 }
 
 type RegistrySession interface {
-	user() username.SQLUsername
-	// BaseSessionUser returns the base session's username.
-	BaseSessionUser() username.SQLUsername
+	// SessionUser returns the session user's username.
+	SessionUser() username.SQLUsername
 	hasQuery(queryID clusterunique.ID) bool
 	// CancelQuery cancels the query specified by queryID if it exists.
 	CancelQuery(queryID clusterunique.ID) bool
@@ -3406,9 +3403,9 @@ func (m *sessionDataMutator) SetOptimizerUseLimitOrderingForStreamingGroupBy(val
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
-// roachpb.StatementStatistics is bucketed to the order of magnitude base 10s
+// appstatspb.StatementStatistics is bucketed to the order of magnitude base 10s
 // and recomputes the squared differences using the new Count value.
-func quantizeCounts(d *roachpb.StatementStatistics) {
+func quantizeCounts(d *appstatspb.StatementStatistics) {
 	oldCount := d.Count
 	newCount := telemetry.Bucket10(oldCount)
 	d.Count = newCount

@@ -226,6 +226,8 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 
 		{"richardc", "12345", "NOLOGIN", "", nil},
 		{"richardc2", "12345", "NOSQLLOGIN", "", nil},
+		{"has_global_nosqlogin", "12345", "", "", nil},
+		{"inherits_global_nosqlogin", "12345", "", "", nil},
 		{"before_epoch", "12345", "", "VALID UNTIL '1969-01-01'", nil},
 		{"epoch", "12345", "", "VALID UNTIL '1970-01-01'", nil},
 		{"cockroach", "12345", "", "VALID UNTIL '2100-01-01'", nil},
@@ -245,6 +247,12 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 			t.Fatalf("failed to create user: %s", err)
 		}
 	}
+
+	// Set up NOSQLLOGIN global privilege.
+	_, err = db.Exec("GRANT SYSTEM NOSQLLOGIN TO has_global_nosqlogin")
+	require.NoError(t, err)
+	_, err = db.Exec("GRANT has_global_nosqlogin TO inherits_global_nosqlogin")
+	require.NoError(t, err)
 
 	for _, tc := range []struct {
 		testName           string
@@ -267,8 +275,11 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 		{"username does not exist should fail", "doesntexist", "zxcvbn", false},
 
 		{"user with NOLOGIN role option should fail", "richardc", "12345", false},
-		// This is the one test case where SQL and DB Console login outcomes differ.
+		// The NOSQLLOGIN cases are the only cases where SQL and DB Console login outcomes differ.
 		{"user with NOSQLLOGIN role option should succeed", "richardc2", "12345", true},
+		{"user with NOSQLLOGIN global privilege should succeed", "has_global_nosqlogin", "12345", true},
+		{"user who inherits NOSQLLOGIN global privilege should succeed", "inherits_global_nosqlogin", "12345", true},
+
 		{"user with VALID UNTIL before the Unix epoch should fail", "before_epoch", "12345", false},
 		{"user with VALID UNTIL at Unix epoch should fail", "epoch", "12345", false},
 		{"user with VALID UNTIL future date should succeed", "cockroach", "12345", true},
@@ -833,7 +844,7 @@ func TestGRPCAuthentication(t *testing.T) {
 	for _, subsystem := range subsystems {
 		t.Run(fmt.Sprintf("bad-user/%s", subsystem.name), func(t *testing.T) {
 			err := subsystem.sendRPC(ctx, conn)
-			if exp := `client certificate CN=testuser,O=Cockroach cannot be used to perform RPC on tenant {1}`; !testutils.IsError(err, exp) {
+			if exp := `need root or node client cert to perform RPCs on this server`; !testutils.IsError(err, exp) {
 				t.Errorf("expected %q error, but got %v", exp, err)
 			}
 		})

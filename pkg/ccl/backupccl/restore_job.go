@@ -314,11 +314,11 @@ func restore(
 	}
 
 	targetSize := targetRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV)
-	importSpanCh := make(chan execinfrapb.RestoreSpanEntry, 1000)
-	genSpan := func(ctx context.Context) error {
-		defer close(importSpanCh)
+	countSpansCh := make(chan execinfrapb.RestoreSpanEntry, 1000)
+	genSpan := func(ctx context.Context, spanCh chan execinfrapb.RestoreSpanEntry) error {
+		defer close(spanCh)
 		return generateAndSendImportSpans(
-			restoreCtx,
+			ctx,
 			dataToRestore.getSpans(),
 			backupManifests,
 			layerToBackupManifestFileIterFactory,
@@ -326,7 +326,7 @@ func restore(
 			introducedSpanFrontier,
 			highWaterMark,
 			targetSize,
-			importSpanCh,
+			spanCh,
 			simpleImportSpans,
 		)
 	}
@@ -334,19 +334,21 @@ func restore(
 	// Count number of import spans.
 	var numImportSpans int
 	var countTasks []func(ctx context.Context) error
-	log.Infof(restoreCtx, "rh_debug: starting count task")
 	spanCountTask := func(ctx context.Context) error {
-		for range importSpanCh {
+		for range countSpansCh {
 			numImportSpans++
 		}
 		return nil
 	}
-	countTasks = append(countTasks, genSpan, spanCountTask)
+	countTasks = append(countTasks, spanCountTask)
+	countTasks = append(countTasks, func(ctx context.Context) error {
+		return genSpan(ctx, countSpansCh)
+	})
 	if err := ctxgroup.GoAndWait(restoreCtx, countTasks...); err != nil {
 		return emptyRowCount, errors.Wrapf(err, "counting number of import spans")
 	}
 
-	importSpanCh = make(chan execinfrapb.RestoreSpanEntry, 1000)
+	importSpanCh := make(chan execinfrapb.RestoreSpanEntry, 1000)
 	requestFinishedCh := make(chan struct{}, numImportSpans) // enough buffer to never block
 	// tasks are the concurrent tasks that are run during the restore.
 	var tasks []func(ctx context.Context) error
@@ -394,7 +396,12 @@ func restore(
 
 			if idx >= mu.ceiling {
 				for i := mu.ceiling; i <= idx; i++ {
-					importSpan := <-importSpanCh
+					importSpan, ok := <-importSpanCh
+					if !ok {
+						// The channel has been closed, there is nothing left to do.
+						log.Infof(ctx, "exiting restore checkpoint loop as the import span channel has been closed")
+						return nil
+					}
 					mu.inFlightImportSpans[i] = importSpan.Span
 				}
 				mu.ceiling = idx + 1
@@ -413,7 +420,6 @@ func restore(
 				for j := mu.highWaterMark + 1; j < mu.ceiling && mu.requestsCompleted[j]; j++ {
 					mu.highWaterMark = j
 				}
-
 				for j := prevHighWater; j < mu.highWaterMark; j++ {
 					delete(mu.requestsCompleted, j)
 					delete(mu.inFlightImportSpans, j)
@@ -427,7 +433,10 @@ func restore(
 		}
 		return nil
 	}
-	tasks = append(tasks, generativeCheckpointLoop, genSpan)
+	tasks = append(tasks, generativeCheckpointLoop)
+	tasks = append(tasks, func(ctx context.Context) error {
+		return genSpan(ctx, importSpanCh)
+	})
 
 	runRestore := func(ctx context.Context) error {
 		return distRestore(
@@ -1708,6 +1717,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 				return err
 			}
 		}
+		log.Infof(ctx, "finished restoring the pre-data bundle")
 	}
 
 	if !preValidateData.isEmpty() {
@@ -1728,6 +1738,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		}
 
 		resTotal.Add(res)
+		log.Infof(ctx, "finished restoring the validate data bundle")
 	}
 	{
 		// Restore the main data bundle. We notably only restore the system tables
@@ -1749,6 +1760,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 		}
 
 		resTotal.Add(res)
+		log.Infof(ctx, "finished restoring the main data bundle")
 	}
 
 	if err := insertStats(ctx, r.job, p.ExecCfg(), remappedStats); err != nil {

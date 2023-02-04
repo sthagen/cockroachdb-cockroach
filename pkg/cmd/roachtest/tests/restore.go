@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -664,6 +665,9 @@ func registerRestore(r registry.Registry) {
 		},
 	})
 
+	durationGauge := r.PromFactory().NewGaugeVec(prometheus.GaugeOpts{Namespace: registry.
+		PrometheusNameSpace, Subsystem: "restore", Name: "duration"}, []string{"test_name"})
+
 	for _, sp := range []restoreSpecs{
 		{
 			hardware: makeHardwareSpecs(hardwareSpecs{}),
@@ -692,7 +696,7 @@ func registerRestore(r registry.Registry) {
 				aost:     "'2023-01-12 03:00:00'",
 				workload: tpceRestore{customers: 2000000}}),
 			timeout: 24 * time.Hour,
-			tags:    []string{"weekly"},
+			tags:    []string{"weekly", "aws-weekly"},
 		},
 		// TODO(msbutler): add the following tests once roachperf/grafana is hooked up and old tests are
 		// removed:
@@ -738,9 +742,12 @@ func registerRestore(r registry.Registry) {
 					defer dul.Done()
 					defer hc.Done()
 					t.Status(`running restore`)
+					startTime := timeutil.Now()
 					if err := sp.run(ctx, c); err != nil {
 						return err
 					}
+					promLabel := registry.PromSub(strings.Replace(sp.computeName(false), "restore/", "", 1)) + "_seconds"
+					durationGauge.WithLabelValues(promLabel).Set(timeutil.Since(startTime).Seconds())
 					return nil
 				})
 				m.Wait()

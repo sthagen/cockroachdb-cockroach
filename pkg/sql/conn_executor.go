@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
@@ -452,21 +453,36 @@ func makeMetrics(internal bool) Metrics {
 			SQLOptPlanCacheHits:   metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheHits, internal)),
 			SQLOptPlanCacheMisses: metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheMisses, internal)),
 			// TODO(mrtracy): See HistogramWindowInterval in server/config.go for the 6x factor.
-			DistSQLExecLatency: metric.NewHistogram(
-				getMetricMeta(MetaDistSQLExecLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLExecLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLExecLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			DistSQLServiceLatency: metric.NewHistogram(
-				getMetricMeta(MetaDistSQLServiceLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLServiceLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLServiceLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLTxnLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLTxnLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			DistSQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaDistSQLExecLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLExecLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			DistSQLServiceLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaDistSQLServiceLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLServiceLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLServiceLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLTxnLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLTxnLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 			SQLTxnsOpen:         metric.NewGauge(getMetricMeta(MetaSQLTxnsOpen, internal)),
 			SQLActiveStatements: metric.NewGauge(getMetricMeta(MetaSQLActiveQueries, internal)),
 			SQLContendedTxns:    metric.NewCounter(getMetricMeta(MetaSQLTxnContended, internal)),
@@ -490,28 +506,38 @@ func makeMetrics(internal bool) Metrics {
 func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 	return ServerMetrics{
 		StatsMetrics: StatsMetrics{
-			SQLStatsMemoryMaxBytesHist: metric.NewHistogram(
-				MetaSQLStatsMemMaxBytes,
-				cfg.HistogramWindowInterval,
-				metric.MemoryUsage64MBBuckets,
-			),
+			SQLStatsMemoryMaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+				Metadata: MetaSQLStatsMemMaxBytes,
+				Duration: cfg.HistogramWindowInterval,
+				MaxVal:   log10int64times1000,
+				SigFigs:  3,
+				Buckets:  metric.MemoryUsage64MBBuckets,
+			}),
 			SQLStatsMemoryCurBytesCount: metric.NewGauge(MetaSQLStatsMemCurBytes),
-			ReportedSQLStatsMemoryMaxBytesHist: metric.NewHistogram(
-				MetaReportedSQLStatsMemMaxBytes,
-				cfg.HistogramWindowInterval,
-				metric.MemoryUsage64MBBuckets,
-			),
+			ReportedSQLStatsMemoryMaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+				Metadata: MetaReportedSQLStatsMemMaxBytes,
+				Duration: cfg.HistogramWindowInterval,
+				MaxVal:   log10int64times1000,
+				SigFigs:  3,
+				Buckets:  metric.MemoryUsage64MBBuckets,
+			}),
 			ReportedSQLStatsMemoryCurBytesCount: metric.NewGauge(MetaReportedSQLStatsMemCurBytes),
 			DiscardedStatsCount:                 metric.NewCounter(MetaDiscardedSQLStats),
 			SQLStatsFlushStarted:                metric.NewCounter(MetaSQLStatsFlushStarted),
 			SQLStatsFlushFailure:                metric.NewCounter(MetaSQLStatsFlushFailure),
-			SQLStatsFlushDuration: metric.NewHistogram(
-				MetaSQLStatsFlushDuration, 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			SQLStatsFlushDuration: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: MetaSQLStatsFlushDuration,
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 			SQLStatsRemovedRows: metric.NewCounter(MetaSQLStatsRemovedRows),
-			SQLTxnStatsCollectionOverhead: metric.NewHistogram(
-				MetaSQLTxnStatsCollectionOverhead, 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			SQLTxnStatsCollectionOverhead: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: MetaSQLTxnStatsCollectionOverhead,
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 		},
 		ContentionSubsystemMetrics: txnidcache.NewMetrics(),
 		InsightsMetrics:            insights.NewMetrics(),
@@ -585,7 +611,7 @@ func (s *Server) GetTxnIDCache() *txnidcache.Cache {
 // scrubbed will be omitted from the returned map.
 func (s *Server) GetScrubbedStmtStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	return s.getScrubbedStmtStats(ctx, s.sqlStats.GetLocalMemProvider())
 }
 
@@ -596,9 +622,9 @@ var _ = (*Server).GetScrubbedStmtStats
 // identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedStmtStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
-	var stmtStats []roachpb.CollectedStatementStatistics
-	stmtStatsVisitor := func(_ context.Context, stat *roachpb.CollectedStatementStatistics) error {
+) ([]appstatspb.CollectedStatementStatistics, error) {
+	var stmtStats []appstatspb.CollectedStatementStatistics
+	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		stmtStats = append(stmtStats, *stat)
 		return nil
 	}
@@ -616,9 +642,9 @@ func (s *Server) GetUnscrubbedStmtStats(
 // Identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedTxnStats(
 	ctx context.Context,
-) ([]roachpb.CollectedTransactionStatistics, error) {
-	var txnStats []roachpb.CollectedTransactionStatistics
-	txnStatsVisitor := func(_ context.Context, stat *roachpb.CollectedTransactionStatistics) error {
+) ([]appstatspb.CollectedTransactionStatistics, error) {
+	var txnStats []appstatspb.CollectedTransactionStatistics
+	txnStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedTransactionStatistics) error {
 		txnStats = append(txnStats, *stat)
 		return nil
 	}
@@ -636,17 +662,17 @@ func (s *Server) GetUnscrubbedTxnStats(
 // returns statistics from the reported stats pool.
 func (s *Server) GetScrubbedReportingStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	return s.getScrubbedStmtStats(ctx, s.reportedStats)
 }
 
 func (s *Server) getScrubbedStmtStats(
 	ctx context.Context, statsProvider sqlstats.Provider,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	salt := ClusterSecret.Get(&s.cfg.Settings.SV)
 
-	var scrubbedStats []roachpb.CollectedStatementStatistics
-	stmtStatsVisitor := func(_ context.Context, stat *roachpb.CollectedStatementStatistics) error {
+	var scrubbedStats []appstatspb.CollectedStatementStatistics
+	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		// Scrub the statement itself.
 		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query)
 
@@ -1372,7 +1398,7 @@ type connExecutor struct {
 		// transactionStatementFingerprintIDs tracks all statement IDs that make up the current
 		// transaction. It's length is bound by the TxnStatsNumStmtFingerprintIDsToRecord
 		// cluster setting.
-		transactionStatementFingerprintIDs []roachpb.StmtFingerprintID
+		transactionStatementFingerprintIDs []appstatspb.StmtFingerprintID
 
 		// transactionStatementsHash is the hashed accumulation of all statementFingerprintIDs
 		// that comprise the transaction. It is used to construct the key when
@@ -2489,7 +2515,7 @@ func (ex *connExecutor) execCopyIn(
 		// These fields are not available in COPY, so use the empty value.
 		f := tree.NewFmtCtx(tree.FmtHideConstants)
 		f.FormatNode(cmd.Stmt)
-		stmtFingerprintID := roachpb.ConstructStatementFingerprintID(
+		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
 			copyErr != nil,
 			ex.implicitTxn(),
@@ -3144,10 +3170,12 @@ func (ex *connExecutor) hasQuery(queryID clusterunique.ID) bool {
 
 // CancelQuery is part of the RegistrySession interface.
 func (ex *connExecutor) CancelQuery(queryID clusterunique.ID) bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
+	// RLock can be used because map deletion happens in
+	// connExecutor.removeActiveQuery.
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	if queryMeta, exists := ex.mu.ActiveQueries[queryID]; exists {
-		queryMeta.cancel()
+		queryMeta.cancelQuery()
 		return true
 	}
 	return false
@@ -3155,11 +3183,13 @@ func (ex *connExecutor) CancelQuery(queryID clusterunique.ID) bool {
 
 // CancelActiveQueries is part of the RegistrySession interface.
 func (ex *connExecutor) CancelActiveQueries() bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
+	// RLock can be used because map deletion happens in
+	// connExecutor.removeActiveQuery.
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	canceled := false
 	for _, queryMeta := range ex.mu.ActiveQueries {
-		queryMeta.cancel()
+		queryMeta.cancelQuery()
 		canceled = true
 	}
 	return canceled
@@ -3174,13 +3204,10 @@ func (ex *connExecutor) CancelSession() {
 	ex.onCancelSession()
 }
 
-// user is part of the RegistrySession interface.
-func (ex *connExecutor) user() username.SQLUsername {
-	return ex.sessionData().User()
-}
-
-// BaseSessionUser is part of the RegistrySession interface.
-func (ex *connExecutor) BaseSessionUser() username.SQLUsername {
+// SessionUser is part of the RegistrySession interface.
+func (ex *connExecutor) SessionUser() username.SQLUsername {
+	// SessionUser is the same for all elements in the stack so use Base()
+	// to avoid needing a lock and race conditions.
 	return ex.sessionDataStack.Base().SessionUser()
 }
 

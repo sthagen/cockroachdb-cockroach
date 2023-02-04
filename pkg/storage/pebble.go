@@ -636,9 +636,10 @@ func wrapFilesystemMiddleware(opts *pebble.Options) io.Closer {
 	// operations.
 	var closer io.Closer
 	opts.FS, closer = vfs.WithDiskHealthChecks(opts.FS, diskHealthCheckInterval,
-		func(name string, duration time.Duration) {
+		func(name string, opType vfs.OpType, duration time.Duration) {
 			opts.EventListener.DiskSlow(pebble.DiskSlowInfo{
 				Path:     name,
+				OpType:   opType,
 				Duration: duration,
 			})
 		})
@@ -1017,9 +1018,35 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	p.wrappedIntentWriter = wrapIntentWriter(p)
 
 	// Read the current store cluster version.
-	storeClusterVersion, err := getMinVersion(unencryptedFS, cfg.Dir)
+	storeClusterVersion, minVerFileExists, err := getMinVersion(unencryptedFS, cfg.Dir)
 	if err != nil {
 		return nil, err
+	}
+	if minVerFileExists {
+		// Avoid running a binary too new for this store. This is what you'd catch
+		// if, say, you restarted directly from v21.2 into v22.2 (bumping the min
+		// version) without going through v22.1 first.
+		//
+		// Note that "going through" above means that v22.1 successfully upgrades
+		// all existing stores. If v22.1 crashes half-way through the startup
+		// sequence (so now some stores have v21.2, but others v22.1) you are
+		// expected to run v22.1 again (hopefully without the crash this time) which
+		// would then rewrite all the stores.
+		//
+		// If the version file does not exist, we will fail a similar check later,
+		// when we set the min version on all the stores.
+		//
+		// TODO(radu): investigate always requiring the existence of the min version
+		// file (unless we are creating a new store). Note that checkpoints don't
+		// have the min version file and some tests expect to be able to open
+		// checkpoints.
+		if v := cfg.Settings.Version; storeClusterVersion.Less(v.BinaryMinSupportedVersion()) {
+			return nil, errors.Errorf(
+				"store last used with cockroach version v%s "+
+					"is too old for running version v%s (which requires data from v%s or later)",
+				storeClusterVersion, v.BinaryVersion(), v.BinaryMinSupportedVersion(),
+			)
+		}
 	}
 
 	if WorkloadCollectorEnabled {
@@ -1032,7 +1059,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	}
 	p.db = db
 
-	if storeClusterVersion != (roachpb.Version{}) {
+	if minVerFileExists {
 		// The storage engine performs its own internal migrations
 		// through the setting of the store cluster version. When
 		// storage's min version is set, SetMinVersion writes to disk to
@@ -1095,6 +1122,14 @@ func (p *Pebble) makeMetricEtcEventListener(ctx context.Context) pebble.EventLis
 				// pebble.EventListener on why it's important for this method to return
 				// quickly.
 				if fatalOnExceeded {
+					// The write stall may prevent the process from exiting. If
+					// the process won't exit, we can at least terminate all our
+					// RPC connections first.
+					//
+					// See pkg/cli.runStart for where this function is hooked
+					// up.
+					log.MakeProcessUnavailable()
+
 					log.Fatalf(ctx, "file write stall detected: %s", info)
 				} else {
 					go log.Errorf(ctx, "file write stall detected: %s", info)
@@ -1920,11 +1955,6 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 		}
 	}
 	return nil
-}
-
-// MinVersionIsAtLeastTargetVersion implements the Engine interface.
-func (p *Pebble) MinVersionIsAtLeastTargetVersion(target roachpb.Version) (bool, error) {
-	return MinVersionIsAtLeastTargetVersion(p.unencryptedFS, p.path, target)
 }
 
 // BufferedSize implements the Engine interface.

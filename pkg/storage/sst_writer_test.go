@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -78,6 +79,8 @@ func makePebbleSST(t testing.TB, kvs []MVCCKeyValue, ingestion bool) []byte {
 func TestMakeIngestionWriterOptions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	skip.WithIssue(t, 95530, "bump minBinary to 22.2. Skip 22.2 mixed-version tests for future cleanup")
+
 	testCases := []struct {
 		name string
 		st   *cluster.Settings
@@ -86,7 +89,7 @@ func TestMakeIngestionWriterOptions(t *testing.T) {
 		{
 			name: "before feature gate",
 			st: cluster.MakeTestingClusterSettingsWithVersions(
-				clusterversion.ByKey(clusterversion.V22_2EnablePebbleFormatVersionRangeKeys-1),
+				clusterversion.ByKey(clusterversion.TODODelete_V22_2EnablePebbleFormatVersionRangeKeys-1),
 				clusterversion.TestingBinaryMinSupportedVersion,
 				true,
 			),
@@ -95,7 +98,7 @@ func TestMakeIngestionWriterOptions(t *testing.T) {
 		{
 			name: "at feature gate",
 			st: cluster.MakeTestingClusterSettingsWithVersions(
-				clusterversion.ByKey(clusterversion.V22_2EnablePebbleFormatVersionRangeKeys),
+				clusterversion.ByKey(clusterversion.TODODelete_V22_2EnablePebbleFormatVersionRangeKeys),
 				clusterversion.TestingBinaryMinSupportedVersion,
 				true,
 			),
@@ -119,7 +122,7 @@ func TestSSTWriterRangeKeysUnsupported(t *testing.T) {
 	ctx := context.Background()
 
 	// Set up a version that doesn't support range keys.
-	version := clusterversion.ByKey(clusterversion.V22_2EnsurePebbleFormatVersionRangeKeys - 1)
+	version := clusterversion.ByKey(clusterversion.TODODelete_V22_2EnsurePebbleFormatVersionRangeKeys - 1)
 	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 
 	writers := map[string]SSTWriter{

@@ -994,6 +994,25 @@ only present for backward compatibility.
 `,
 	}
 
+	SharedStorage = FlagInfo{
+		Name: "experimental-shared-storage",
+		Description: fmt.Sprintf(`
+Shared storage URL (with a cloud scheme, eg. s3://, gcs://) to use for all stores
+on this cockroach node. Cockroach can take advantage of this storage for faster
+replication from node to node, as well as to grow beyond locally-available disk
+space. The format of this URL is the same as that specified for bulk operations,
+for more on that see:
+
+<PRE>
+%s
+</PRE>
+
+This is an experimental option, and must be specified on every start of this
+node starting from the very first call to start. Passing this flag on an existing
+initialized node is not supported.
+`, docs.URL("use-cloud-storage-for-bulk-operations")),
+	}
+
 	Size = FlagInfo{
 		Name:      "size",
 		Shorthand: "z",
@@ -1701,6 +1720,14 @@ commands, WARNING for client commands.`,
 	SQLAuditLogDirOverride = FlagInfo{
 		Name:        "sql-audit-dir",
 		Description: `--sql-audit-dir=XXX is an alias for --log='sinks: {file-groups: {sql-audit: {channels: SENSITIVE_ACCESS, dir: ...}}}'.`,
+	}
+
+	ObsServiceAddr = FlagInfo{
+		Name:   "obsservice-addr",
+		EnvVar: "",
+		Description: `Address of an OpenTelemetry OTLP sink such as the
+Observability Service or the OpenTelemetry Collector. If set, telemetry
+events are exported to this address.`,
 	}
 
 	BuildTag = FlagInfo{

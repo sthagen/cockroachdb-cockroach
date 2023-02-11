@@ -25,6 +25,7 @@ import (
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -245,7 +246,8 @@ func NewServerEx(
 		a := kvAuth{
 			sv: &rpcCtx.Settings.SV,
 			tenant: tenantAuthorizer{
-				tenantID: rpcCtx.tenID,
+				tenantID:               rpcCtx.tenID,
+				capabilitiesAuthorizer: rpcCtx.capabilitiesAuthorizer,
 			},
 		}
 
@@ -325,7 +327,7 @@ func (c *Connection) Connect(ctx context.Context) (*grpc.ClientConn, error) {
 	select {
 	case <-c.initialHeartbeatDone:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, errors.Wrap(ctx.Err(), "connect")
 	}
 
 	if err, _ := c.err.Load().(error); err != nil {
@@ -362,7 +364,7 @@ func (c *Connection) Health() error {
 // thing.
 type Context struct {
 	ContextOptions
-	SecurityContext
+	*SecurityContext
 
 	breakerClock breakerClock
 	RemoteClocks *RemoteClockMonitor
@@ -499,6 +501,17 @@ type ContextOptions struct {
 	// utility, not a server, and thus misses server configuration, a
 	// cluster version, a node ID, etc.
 	ClientOnly bool
+
+	// UseNodeAuth is only used when ClientOnly is not set.
+	// When set, it indicates that this rpc.Context is running inside
+	// the same process as a KV layer and thus should feel empowered
+	// to use its node cert to perform outgoing RPC dials.
+	UseNodeAuth bool
+
+	// TenantRPCAuthorizer provides a handle into the tenantcapabilities
+	// subsystem. It allows KV nodes to perform capability checks for incoming
+	// tenant requests.
+	TenantRPCAuthorizer tenantcapabilities.Authorizer
 }
 
 func (c ContextOptions) validate() error {
@@ -604,9 +617,17 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 
 	masterCtx, _ := opts.Stopper.WithCancelOnQuiesce(ctx)
 
+	secCtx := NewSecurityContext(
+		opts.Config,
+		security.ClusterTLSSettings(opts.Settings),
+		opts.TenantID,
+		opts.TenantRPCAuthorizer,
+	)
+	secCtx.useNodeAuth = opts.UseNodeAuth
+
 	rpcCtx := &Context{
 		ContextOptions:  opts,
-		SecurityContext: MakeSecurityContext(opts.Config, security.ClusterTLSSettings(opts.Settings), opts.TenantID),
+		SecurityContext: secCtx,
 		breakerClock: breakerClock{
 			clock: opts.Clock,
 		},
@@ -616,6 +637,14 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 		heartbeatInterval:   opts.Config.RPCHeartbeatInterval,
 		heartbeatTimeout:    opts.Config.RPCHeartbeatTimeout,
 		logClosingConnEvery: log.Every(time.Second),
+	}
+
+	if !opts.TenantID.IsSet() {
+		panic("tenant ID not set")
+	}
+
+	if opts.ClientOnly && opts.Config.User.Undefined() {
+		panic("client username not set")
 	}
 
 	if !opts.TenantID.IsSystem() {
@@ -1307,7 +1336,7 @@ func (s *pipe) send(ctx context.Context, m interface{}) error {
 	case s.respC <- m:
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Wrap(ctx.Err(), "send")
 	}
 }
 
@@ -1331,7 +1360,7 @@ func (s *pipe) recv(ctx context.Context) (interface{}, error) {
 			return nil, err
 		}
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, errors.Wrap(ctx.Err(), "recv")
 	}
 }
 
@@ -1484,7 +1513,7 @@ func (rpcCtx *Context) SetLocalInternalServer(
 ) {
 	clientTenantID := rpcCtx.TenantID
 	separateTracers := false
-	if rpcCtx.TenantID.IsSet() && !rpcCtx.TenantID.IsSystem() {
+	if !clientTenantID.IsSystem() {
 		// This is a secondary tenant server in the same process as the KV
 		// layer (shared-process multitenancy). In this case, the caller
 		// and the callee use separate tracers, so we can't mix and match
@@ -1589,6 +1618,42 @@ func (rpcCtx *Context) dialOptsLocal() ([]grpc.DialOption, error) {
 	return dialOpts, err
 }
 
+// GetClientTLSConfig decides which TLS client configuration (&
+// certificates) to use to reach the remote node.
+func (rpcCtx *Context) GetClientTLSConfig() (*tls.Config, error) {
+	if rpcCtx.config.Insecure {
+		return nil, nil
+	}
+
+	cm, err := rpcCtx.GetCertificateManager()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+
+	switch {
+	case rpcCtx.ClientOnly:
+		// A CLI command is performing a remote RPC.
+		tlsCfg, err := cm.GetClientTLSConfig(rpcCtx.config.User)
+		return tlsCfg, wrapError(err)
+
+	case rpcCtx.UseNodeAuth || rpcCtx.tenID.IsSystem():
+		tlsCfg, err := cm.GetNodeClientTLSConfig()
+		return tlsCfg, wrapError(err)
+
+	case !rpcCtx.tenID.IsSystem():
+		// A SQL server running in a standalone server doesn't have access
+		// to the node certs, and thus must use the standalone tenant
+		// client cert.
+		tlsCfg, err := cm.GetTenantTLSConfig()
+		return tlsCfg, wrapError(err)
+
+	default:
+		// We don't currently support any other way to use the rpc context.
+		// go away.
+		return nil, errors.AssertionFailedf("programming error: rpc context not initialized correctly")
+	}
+}
+
 // dialOptsNetworkCredentials computes options that determines how the
 // RPC client authenticates itself to the remote server.
 func (rpcCtx *Context) dialOptsNetworkCredentials() ([]grpc.DialOption, error) {
@@ -1596,13 +1661,7 @@ func (rpcCtx *Context) dialOptsNetworkCredentials() ([]grpc.DialOption, error) {
 	if rpcCtx.Config.Insecure {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		var tlsConfig *tls.Config
-		var err error
-		if rpcCtx.tenID == roachpb.SystemTenantID {
-			tlsConfig, err = rpcCtx.GetClientTLSConfig()
-		} else {
-			tlsConfig, err = rpcCtx.GetTenantTLSConfig()
-		}
+		tlsConfig, err := rpcCtx.GetClientTLSConfig()
 		if err != nil {
 			return nil, err
 		}
@@ -1798,7 +1857,8 @@ func init() {
 type onlyOnceDialer struct {
 	mu struct {
 		syncutil.Mutex
-		err error
+		err      error
+		redialed bool
 	}
 }
 
@@ -1815,13 +1875,13 @@ func (ood *onlyOnceDialer) dial(ctx context.Context, addr string) (net.Conn, err
 	defer ood.mu.Unlock()
 
 	if err := ood.mu.err; err != nil {
-		// Not first dial.
-		if !errors.Is(err, grpcutil.ErrConnectionInterrupted) {
-			// Hitting this path would indicate that gRPC retried even though it
-			// received an error not marked as retriable. At the time of writing, at
-			// least in simple experiments, as expected we don't see this error.
-			err = errors.Wrap(err, "previous dial failed")
+		if ood.mu.redialed {
+			// We set up onlyOnceDialer to avoid returning any errors that could look
+			// temporary to gRPC, and so we don't expect it to re-dial a connection
+			// twice (the first re-dial is supposed to surface the permanent error).
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err, "gRPC connection unexpectedly re-dialed")
 		}
+		ood.mu.redialed = true
 		return nil, err
 	}
 

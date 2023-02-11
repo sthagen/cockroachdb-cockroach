@@ -512,14 +512,6 @@ var experimentalUseNewSchemaChanger = settings.RegisterEnumSetting(
 	},
 ).WithPublic()
 
-var experimentalStreamReplicationEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"sql.defaults.experimental_stream_replication.enabled",
-	"default value for experimental_stream_replication session setting;"+
-		"enables the ability to setup a replication stream",
-	false,
-).WithPublic()
-
 var stubCatalogTablesEnabledClusterValue = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	`sql.defaults.stub_catalog_tables.enabled`,
@@ -1375,7 +1367,7 @@ type ExecutorConfig struct {
 	RangeStatsFetcher eval.RangeStatsFetcher
 
 	// EventsExporter is the client for the Observability Service.
-	EventsExporter obs.EventsExporter
+	EventsExporter obs.EventsExporterInterface
 
 	// NodeDescs stores {Store,Node}Descriptors in an in-memory cache.
 	NodeDescs kvcoord.NodeDescStore
@@ -1639,6 +1631,10 @@ type BackupRestoreTestingKnobs struct {
 	// resolved during backup planning, and will eventually be backed up during
 	// execution.
 	CaptureResolvedTableDescSpans func([]roachpb.Span)
+
+	// RunAfterSplitAndScatteringEntry allows blocking the RESTORE job after a
+	// single RestoreSpanEntry has been split and scattered.
+	RunAfterSplitAndScatteringEntry func(ctx context.Context)
 
 	// RunAfterProcessingRestoreSpanEntry allows blocking the RESTORE job after a
 	// single RestoreSpanEntry has been processed and added to the SSTBatcher.

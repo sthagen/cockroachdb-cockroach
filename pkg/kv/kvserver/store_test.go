@@ -546,7 +546,7 @@ func createReplica(s *Store, rangeID roachpb.RangeID, start, end roachpb.RKey) *
 	); err != nil {
 		panic(err)
 	}
-	r, err := newReplica(ctx, desc, s, replicaID)
+	r, err := loadInitializedReplicaForTesting(ctx, s, desc, replicaID)
 	if err != nil {
 		panic(err)
 	}
@@ -665,9 +665,9 @@ func TestReplicasByKey(t *testing.T) {
 		expectedErrorOnAdd string
 	}{
 		// [a,c) is contained in [KeyMin, e)
-		{nil, 2, roachpb.RKey("a"), roachpb.RKey("c"), ".*has overlapping range"},
+		{nil, 2, roachpb.RKey("a"), roachpb.RKey("c"), "overlaps with"},
 		// [c,f) partially overlaps with [KeyMin, e)
-		{nil, 3, roachpb.RKey("c"), roachpb.RKey("f"), ".*has overlapping range"},
+		{nil, 3, roachpb.RKey("c"), roachpb.RKey("f"), "overlaps with"},
 		// [e, f) is disjoint from [KeyMin, e)
 		{nil, 4, roachpb.RKey("e"), roachpb.RKey("f"), ""},
 	}
@@ -835,17 +835,12 @@ func TestMaybeMarkReplicaInitialized(t *testing.T) {
 	}
 
 	newRangeID := roachpb.RangeID(3)
-	desc := &roachpb.RangeDescriptor{
-		RangeID: newRangeID,
-	}
-
 	const replicaID = 1
 	require.NoError(t,
-		logstore.NewStateLoader(desc.RangeID).SetRaftReplicaID(ctx, store.engine, replicaID))
-	r, err := newReplica(ctx, desc, store, replicaID)
-	if err != nil {
-		t.Fatal(err)
-	}
+		logstore.NewStateLoader(newRangeID).SetRaftReplicaID(ctx, store.engine, replicaID))
+
+	r := newUninitializedReplica(store, newRangeID, replicaID)
+	require.NoError(t, err)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -861,7 +856,7 @@ func TestMaybeMarkReplicaInitialized(t *testing.T) {
 	}()
 
 	// Initialize the range with start and end keys.
-	desc = protoutil.Clone(desc).(*roachpb.RangeDescriptor)
+	desc := protoutil.Clone(r.Desc()).(*roachpb.RangeDescriptor)
 	desc.StartKey = roachpb.RKey("b")
 	desc.EndKey = roachpb.RKey("d")
 	desc.InternalReplicas = []roachpb.ReplicaDescriptor{{
@@ -880,8 +875,9 @@ func TestMaybeMarkReplicaInitialized(t *testing.T) {
 	}()
 
 	store.mu.uninitReplicas[newRangeID] = r
+	require.NoError(t, store.addToReplicasByRangeIDLocked(r))
 
-	expectedResult = ".*cannot initialize replica.*"
+	expectedResult = "overlaps with"
 	func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
@@ -3474,7 +3470,7 @@ func TestAllocatorCheckRange(t *testing.T) {
 	}{
 		{
 			name:   "overreplicated",
-			stores: multiRegionStores,
+			stores: multiRegionStores, // Nine stores
 			existingReplicas: []roachpb.ReplicaDescriptor{
 				{NodeID: 1, StoreID: 1, ReplicaID: 1},
 				{NodeID: 2, StoreID: 2, ReplicaID: 2},
@@ -3487,7 +3483,7 @@ func TestAllocatorCheckRange(t *testing.T) {
 		},
 		{
 			name:   "overreplicated but store dead",
-			stores: multiRegionStores,
+			stores: multiRegionStores, // Nine stores
 			existingReplicas: []roachpb.ReplicaDescriptor{
 				{NodeID: 1, StoreID: 1, ReplicaID: 1},
 				{NodeID: 2, StoreID: 2, ReplicaID: 2},
@@ -3502,7 +3498,7 @@ func TestAllocatorCheckRange(t *testing.T) {
 		},
 		{
 			name:   "decommissioning but underreplicated",
-			stores: multiRegionStores,
+			stores: multiRegionStores, // Nine stores
 			existingReplicas: []roachpb.ReplicaDescriptor{
 				{NodeID: 1, StoreID: 1, ReplicaID: 1},
 				{NodeID: 2, StoreID: 2, ReplicaID: 2},
@@ -3516,7 +3512,7 @@ func TestAllocatorCheckRange(t *testing.T) {
 		},
 		{
 			name:   "decommissioning with replacement",
-			stores: multiRegionStores,
+			stores: multiRegionStores, // Nine stores
 			existingReplicas: []roachpb.ReplicaDescriptor{
 				{NodeID: 1, StoreID: 1, ReplicaID: 1},
 				{NodeID: 2, StoreID: 2, ReplicaID: 2},
@@ -3546,7 +3542,7 @@ func TestAllocatorCheckRange(t *testing.T) {
 		},
 		{
 			name:   "five to four nodes at RF five",
-			stores: noLocalityStores,
+			stores: noLocalityStores, // Five stores
 			existingReplicas: []roachpb.ReplicaDescriptor{
 				{NodeID: 1, StoreID: 1, ReplicaID: 1},
 				{NodeID: 2, StoreID: 2, ReplicaID: 2},
@@ -3562,6 +3558,83 @@ func TestAllocatorCheckRange(t *testing.T) {
 			expectedAction:    allocatorimpl.AllocatorRemoveDecommissioningVoter,
 			expectErr:         false,
 			expectValidTarget: false,
+		},
+		{
+			name:   "five to two nodes at RF five replaces first",
+			stores: noLocalityStores, // Five stores
+			existingReplicas: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				{NodeID: 3, StoreID: 3, ReplicaID: 3},
+				{NodeID: 4, StoreID: 4, ReplicaID: 4},
+				{NodeID: 5, StoreID: 5, ReplicaID: 5},
+			},
+			zoneConfig: zonepb.DefaultSystemZoneConfigRef(),
+			livenessOverrides: map[roachpb.NodeID]livenesspb.NodeLivenessStatus{
+				3: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				4: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				5: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+			},
+			baselineExpNoop:    true,
+			expectedAction:     allocatorimpl.AllocatorReplaceDecommissioningVoter,
+			expectValidTarget:  false,
+			expectAllocatorErr: true,
+			expectedErrStr:     "likely not enough nodes in cluster",
+		},
+		{
+			name:   "replace first when lowering effective RF",
+			stores: multiRegionStores, // Nine stores
+			existingReplicas: []roachpb.ReplicaDescriptor{
+				// Region "a"
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				// Region "b"
+				{NodeID: 4, StoreID: 4, ReplicaID: 3},
+				{NodeID: 5, StoreID: 5, ReplicaID: 4},
+				// Region "c"
+				{NodeID: 7, StoreID: 7, ReplicaID: 5},
+			},
+			zoneConfig: zonepb.DefaultSystemZoneConfigRef(),
+			livenessOverrides: map[roachpb.NodeID]livenesspb.NodeLivenessStatus{
+				// Downsize to one node per region: 3,6,9.
+				1: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				2: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				4: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				5: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				7: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				8: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+			},
+			expectedAction:    allocatorimpl.AllocatorReplaceDecommissioningVoter,
+			expectErr:         false,
+			expectValidTarget: true,
+		},
+		{
+			name:   "replace dead first when lowering effective RF",
+			stores: multiRegionStores, // Nine stores
+			existingReplicas: []roachpb.ReplicaDescriptor{
+				// Region "a"
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				// Region "b"
+				{NodeID: 4, StoreID: 4, ReplicaID: 3},
+				{NodeID: 5, StoreID: 5, ReplicaID: 4},
+				// Region "c"
+				{NodeID: 7, StoreID: 7, ReplicaID: 5},
+			},
+			zoneConfig: zonepb.DefaultSystemZoneConfigRef(),
+			livenessOverrides: map[roachpb.NodeID]livenesspb.NodeLivenessStatus{
+				// Downsize to: 1,4,7,9 but 7 is dead.
+				// Replica on n7 should be replaced first.
+				2: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				3: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				5: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				6: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				7: livenesspb.NodeLivenessStatus_DEAD,
+				8: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+			},
+			expectedAction:    allocatorimpl.AllocatorReplaceDeadVoter,
+			expectErr:         false,
+			expectValidTarget: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3634,6 +3707,10 @@ func TestAllocatorCheckRange(t *testing.T) {
 				true /* collectTraces */, storePoolOverride,
 			)
 
+			require.Equalf(t, tc.expectedAction, action,
+				"expected action \"%s\", got action \"%s\"", tc.expectedAction, action,
+			)
+
 			// Validate expectations from test case.
 			if tc.expectErr || tc.expectAllocatorErr {
 				require.Error(t, err)
@@ -3651,10 +3728,6 @@ func TestAllocatorCheckRange(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-
-			require.Equalf(t, tc.expectedAction, action,
-				"expected action \"%s\", got action \"%s\"", tc.expectedAction, action,
-			)
 
 			if tc.expectValidTarget {
 				require.NotEqualf(t, roachpb.ReplicationTarget{}, target, "expected valid target")
@@ -3712,10 +3785,9 @@ func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
 		})
 	require.NoError(t, err)
 	require.True(t, created)
-	replicaID, found, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.Engine())
+	replicaID, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.Engine())
 	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
+	require.Equal(t, &roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

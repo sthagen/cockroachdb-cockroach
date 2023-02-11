@@ -1008,12 +1008,12 @@ func TestCreateCheckpoint(t *testing.T) {
 	dir = filepath.Join(dir, "checkpoint")
 
 	assert.NoError(t, err)
-	assert.NoError(t, db.CreateCheckpoint(dir))
+	assert.NoError(t, db.CreateCheckpoint(dir, nil))
 	assert.DirExists(t, dir)
 	m, err := filepath.Glob(dir + "/*")
 	assert.NoError(t, err)
 	assert.True(t, len(m) > 0)
-	if err := db.CreateCheckpoint(dir); !testutils.IsError(err, "exists") {
+	if err := db.CreateCheckpoint(dir, nil); !testutils.IsError(err, "exists") {
 		t.Fatal(err)
 	}
 }
@@ -2041,7 +2041,7 @@ func TestEngineRangeKeysUnsupported(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Set up an engine with a version that doesn't support range keys.
-	version := clusterversion.ByKey(clusterversion.V22_2EnsurePebbleFormatVersionRangeKeys - 1)
+	version := clusterversion.ByKey(clusterversion.TODODelete_V22_2EnsurePebbleFormatVersionRangeKeys - 1)
 	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 
 	eng, err := Open(context.Background(), InMemory(), st, MaxSize(1<<20))

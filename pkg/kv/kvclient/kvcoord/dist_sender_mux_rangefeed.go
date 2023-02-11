@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
 
@@ -345,10 +346,10 @@ func (m *rangefeedMuxer) receiveEventsFromNode(ctx context.Context, ms *muxClien
 			// Normally, when ctx is done, we would receive streamErr above.
 			// But it's possible that the context was canceled right after the last Recv(),
 			// and in that case we must exit.
-			return nil
+			return ctx.Err()
 		case <-m.demuxLoopDone:
 			// demuxLoop exited, and so should we (happens when main context group completes)
-			return nil
+			return errors.Wrapf(context.Canceled, "demux loop terminated")
 		case m.eventCh <- event:
 		}
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -110,6 +111,7 @@ func (s *Container) RecordStatement(
 	stats.mu.data.Count++
 	if key.Failed {
 		stats.mu.data.SensitiveInfo.LastErr = value.StatementError.Error()
+		stats.mu.data.LastErrorCode = pgerror.GetPGCode(value.StatementError).String()
 	}
 	// Only update MostRecentPlanDescription if we sampled a new PlanDescription.
 	if value.Plan != nil {
@@ -140,6 +142,18 @@ func (s *Container) RecordStatement(
 	stats.mu.data.IndexRecommendations = value.IndexRecommendations
 	stats.mu.data.Indexes = util.CombineUniqueString(stats.mu.data.Indexes, value.Indexes)
 
+	// Percentile latencies are only being sampled if the latency was above the
+	// AnomalyDetectionLatencyThreshold.
+	latencies := s.latencyInformation.GetPercentileValues(stmtFingerprintID)
+	latencyInfo := appstatspb.LatencyInfo{
+		Min: value.ServiceLatency,
+		Max: value.ServiceLatency,
+		P50: latencies.P50,
+		P90: latencies.P90,
+		P99: latencies.P99,
+	}
+	stats.mu.data.LatencyInfo.Add(latencyInfo)
+
 	// Note that some fields derived from tracing statements (such as
 	// BytesSentOverNetwork) are not updated here because they are collected
 	// on-demand.
@@ -155,7 +169,7 @@ func (s *Container) RecordStatement(
 		// stats size + stmtKey size + hash of the statementKey
 		estimatedMemoryAllocBytes := stats.sizeUnsafe() + statementKey.size() + 8
 
-		// We also accounts for the memory used for s.sampledPlanMetadataCache.
+		// We also account for the memory used for s.sampledPlanMetadataCache.
 		// timestamp size + key size + hash.
 		estimatedMemoryAllocBytes += timestampSize + statementKey.sampledPlanKey.size() + 8
 		s.mu.Lock()

@@ -504,8 +504,8 @@ func (desc *Mutable) SetParentSchemaID(id descpb.ID) {
 }
 
 // ToFuncObj converts the descriptor to a tree.FuncObj.
-func (desc *immutable) ToFuncObj() tree.FuncObj {
-	ret := tree.FuncObj{
+func (desc *immutable) ToFuncObj() *tree.FuncObj {
+	ret := &tree.FuncObj{
 		FuncName: tree.MakeFunctionNameFromPrefix(tree.ObjectNamePrefix{}, tree.Name(desc.Name)),
 		Params:   make(tree.FuncParams, len(desc.Params)),
 	}
@@ -635,7 +635,7 @@ func (desc *immutable) getCreateExprLang() tree.FunctionLanguage {
 	case catpb.Function_SQL:
 		return tree.FunctionLangSQL
 	}
-	return 0
+	return tree.FunctionLangUnknown
 }
 
 func (desc *immutable) getCreateExprVolatility() tree.FunctionVolatility {

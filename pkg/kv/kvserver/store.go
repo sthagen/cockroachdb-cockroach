@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnrecovery"
@@ -68,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
@@ -738,23 +740,25 @@ type Store struct {
 	raftLogQueue         *raftLogQueue      // Raft log truncation queue
 	// Carries out truncations proposed by the raft log queue, and "replicated"
 	// via raft, when they are safe. Created in Store.Start.
-	raftTruncator      *raftLogTruncator
-	raftSnapshotQueue  *raftSnapshotQueue          // Raft repair queue
-	tsMaintenanceQueue *timeSeriesMaintenanceQueue // Time series maintenance queue
-	scanner            *replicaScanner             // Replica scanner
-	consistencyQueue   *consistencyQueue           // Replica consistency check queue
-	consistencyLimiter *quotapool.RateLimiter      // Rate limits consistency checks
-	metrics            *StoreMetrics
-	intentResolver     *intentresolver.IntentResolver
-	recoveryMgr        txnrecovery.Manager
-	syncWaiter         *logstore.SyncWaiterLoop
-	raftEntryCache     *raftentry.Cache
-	limiters           batcheval.Limiters
-	txnWaitMetrics     *txnwait.Metrics
-	sstSnapshotStorage SSTSnapshotStorage
-	protectedtsReader  spanconfig.ProtectedTSReader
-	ctSender           *sidetransport.Sender
-	storeGossip        *StoreGossip
+	raftTruncator       *raftLogTruncator
+	raftSnapshotQueue   *raftSnapshotQueue          // Raft repair queue
+	tsMaintenanceQueue  *timeSeriesMaintenanceQueue // Time series maintenance queue
+	scanner             *replicaScanner             // Replica scanner
+	consistencyQueue    *consistencyQueue           // Replica consistency check queue
+	consistencyLimiter  *quotapool.RateLimiter      // Rate limits consistency checks
+	metrics             *StoreMetrics
+	intentResolver      *intentresolver.IntentResolver
+	recoveryMgr         txnrecovery.Manager
+	syncWaiter          *logstore.SyncWaiterLoop
+	raftEntryCache      *raftentry.Cache
+	limiters            batcheval.Limiters
+	txnWaitMetrics      *txnwait.Metrics
+	sstSnapshotStorage  SSTSnapshotStorage
+	protectedtsReader   spanconfig.ProtectedTSReader
+	ctSender            *sidetransport.Sender
+	storeGossip         *StoreGossip
+	rebalanceObjManager *RebalanceObjectiveManager
+	splitConfig         *replicaSplitConfig
 
 	coalescedMu struct {
 		syncutil.Mutex
@@ -1200,6 +1204,18 @@ func NewStore(
 		// store pool in those cases.
 		allocatorStorePool = cfg.StorePool
 		storePoolIsDeterministic = allocatorStorePool.IsDeterministic()
+
+		s.rebalanceObjManager = newRebalanceObjectiveManager(ctx, s.cfg.Settings,
+			func(ctx context.Context, obj LBRebalancingObjective) {
+				s.VisitReplicas(func(r *Replica) (wantMore bool) {
+					r.loadBasedSplitter.Reset(s.Clock().PhysicalTime())
+					return true
+				})
+			},
+			allocatorStorePool, /* storeDescProvider */
+			allocatorStorePool, /* capacityChangeNotifier */
+		)
+		s.splitConfig = newReplicaSplitConfig(s.cfg.Settings, s.rebalanceObjManager)
 	}
 	if cfg.RPCContext != nil {
 		s.allocator = allocatorimpl.MakeAllocator(
@@ -1223,7 +1239,6 @@ func NewStore(
 	}
 
 	s.replRankings = NewReplicaRankings()
-
 	s.replRankingsByTenant = NewReplicaRankingsMap()
 
 	s.raftRecvQueues.mon = mon.NewUnlimitedMonitor(
@@ -1850,14 +1865,23 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// TODO(peter): While we have to iterate to find the replica descriptors
 	// serially, we can perform the migrations and replica creation
 	// concurrently. Note that while we can perform this initialization
-	// concurrently, all of the initialization must be performed before we start
+	// concurrently, all initialization must be performed before we start
 	// listening for Raft messages and starting the process Raft loop.
-	engRepls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.engine)
+	repls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.engine)
 	if err != nil {
 		return err
 	}
-	for fullID, desc := range engRepls.Initialized {
-		rep, err := newReplica(ctx, desc, s, fullID.ReplicaID)
+	for _, repl := range repls {
+		if repl.Desc == nil {
+			// Uninitialized Replicas are not currently instantiated at store start.
+			continue
+		}
+		// TODO(pavelkalinnikov): integrate into kvstorage.LoadAndReconcileReplicas.
+		state, err := repl.Load(ctx, s.Engine(), s.StoreID())
+		if err != nil {
+			return err
+		}
+		rep, err := newInitializedReplica(s, state)
 		if err != nil {
 			return err
 		}
@@ -1869,7 +1893,11 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		// TODO(pavelkalinnikov): hide these in Store's replica create functions.
 		err = s.addToReplicasByRangeIDLocked(rep)
 		if err == nil {
-			err = s.addToReplicasByKeyLocked(rep)
+			// NB: no locking of the Replica is needed since it's being created, but
+			// it is asserted on in "Locked" methods.
+			rep.mu.RLock()
+			err = s.addToReplicasByKeyLockedReplicaRLocked(rep)
+			rep.mu.RUnlock()
 		}
 		s.mu.Unlock()
 		if err != nil {
@@ -1971,7 +1999,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 
 	if s.replicateQueue != nil {
 		s.storeRebalancer = NewStoreRebalancer(
-			s.cfg.AmbientCtx, s.cfg.Settings, s.replicateQueue, s.replRankings)
+			s.cfg.AmbientCtx, s.cfg.Settings, s.replicateQueue, s.replRankings, s.rebalanceObjManager)
 		s.storeRebalancer.Start(ctx, s.stopper)
 	}
 
@@ -2553,11 +2581,11 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	var l0SublevelsMax int64
 	var totalQueriesPerSecond float64
 	var totalWritesPerSecond float64
+	var totalStoreCPUTimePerSecond float64
 	replicaCount := s.metrics.ReplicaCount.Value()
 	bytesPerReplica := make([]float64, 0, replicaCount)
 	writesPerReplica := make([]float64, 0, replicaCount)
-	rankingsAccumulator := NewReplicaAccumulator(
-		LBRebalancingDimension(LoadBasedRebalancingDimension.Get(&s.ClusterSettings().SV)).ToDimension())
+	rankingsAccumulator := NewReplicaAccumulator(s.rebalanceObjManager.Objective().ToDimension())
 	rankingsByTenantAccumulator := NewTenantReplicaAccumulator()
 
 	// Query the current L0 sublevels and record the updated maximum to metrics.
@@ -2575,6 +2603,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		// starts? We can't easily have a countdown as its value changes like for
 		// leases/replicas.
 		// TODO(a-robinson): Calculate percentiles for qps? Get rid of other percentiles?
+		totalStoreCPUTimePerSecond += usage.RequestCPUNanosPerSecond + usage.RaftCPUNanosPerSecond
 		totalQueriesPerSecond += usage.QueriesPerSecond
 		totalWritesPerSecond += usage.WritesPerSecond
 		writesPerReplica = append(writesPerReplica, usage.WritesPerSecond)
@@ -2586,9 +2615,23 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		rankingsByTenantAccumulator.AddReplica(cr)
 		return true
 	})
+
+	// It is possible that the cputime utility isn't supported on this node's
+	// architecture. If that is the case, we publish the cpu per second as -1
+	// which is special cased on the receiving end and controls whether the cpu
+	// balancing objective is permitted. If this is not updated, the cpu per
+	// second will be zero and other stores will likely begin rebalancing
+	// towards this store as it will appear underfull.
+	if !grunning.Supported() {
+		totalStoreCPUTimePerSecond = -1
+	} else {
+		totalStoreCPUTimePerSecond = math.Max(totalStoreCPUTimePerSecond, 0)
+	}
+
 	capacity.RangeCount = rangeCount
 	capacity.LeaseCount = leaseCount
 	capacity.LogicalBytes = logicalBytes
+	capacity.CPUPerSecond = totalStoreCPUTimePerSecond
 	capacity.QueriesPerSecond = totalQueriesPerSecond
 	capacity.WritesPerSecond = totalWritesPerSecond
 	capacity.L0Sublevels = l0SublevelsMax
@@ -2875,18 +2918,77 @@ func (s *Store) checkpointsDir() string {
 	return filepath.Join(s.engine.GetAuxiliaryDir(), "checkpoints")
 }
 
-// checkpoint creates a RocksDB checkpoint in the auxiliary directory with the
-// provided tag used in the filepath. The filepath for the checkpoint directory
-// is returned.
-func (s *Store) checkpoint(ctx context.Context, tag string) (string, error) {
-	checkpointBase := s.checkpointsDir()
-	_ = s.engine.MkdirAll(checkpointBase)
-
-	checkpointDir := filepath.Join(checkpointBase, tag)
-	if err := s.engine.CreateCheckpoint(checkpointDir); err != nil {
-		return "", err
+// checkpointSpans returns key spans containing the given range. The spans may
+// be wider, and contain a few extra ranges that surround the given range. The
+// extension of the spans gives more information for debugging consistency or
+// storage issues, e.g. in situations when a recent reconfiguration like split
+// or merge occurred.
+func (s *Store) checkpointSpans(desc *roachpb.RangeDescriptor) []roachpb.Span {
+	// Find immediate left and right neighbours by range ID.
+	var prevID, nextID roachpb.RangeID
+	s.mu.replicasByRangeID.Range(func(r *Replica) {
+		if id, our := r.RangeID, desc.RangeID; id < our && id > prevID {
+			prevID = id
+		} else if id > our && (nextID == 0 || id < nextID) {
+			nextID = id
+		}
+	})
+	if prevID == 0 {
+		prevID = desc.RangeID
+	}
+	if nextID == 0 {
+		nextID = desc.RangeID
 	}
 
+	// Find immediate left and right neighbours by user key.
+	s.mu.RLock()
+	left := s.mu.replicasByKey.LookupPrecedingReplica(context.Background(), desc.StartKey)
+	right := s.mu.replicasByKey.LookupNextReplica(context.Background(), desc.EndKey)
+	s.mu.RUnlock()
+
+	// Cover all range IDs (prevID, desc.RangeID, nextID) using a continuous span.
+	spanRangeIDs := func(first, last roachpb.RangeID) roachpb.Span {
+		return roachpb.Span{
+			Key:    keys.MakeRangeIDPrefix(first),
+			EndKey: keys.MakeRangeIDPrefix(last).PrefixEnd(),
+		}
+	}
+	spans := []roachpb.Span{spanRangeIDs(prevID, nextID)}
+
+	userKeys := desc.RSpan()
+	// Include the rangeID-local data comprising ranges left, desc, and right.
+	if left != nil {
+		userKeys.Key = left.Desc().StartKey
+		// Skip this range ID if it was already covered by [prevID, nextID].
+		if id := left.RangeID; id < prevID || id > nextID {
+			spans = append(spans, spanRangeIDs(id, id))
+		}
+	}
+	if right != nil {
+		userKeys.EndKey = right.Desc().EndKey
+		// Skip this range ID if it was already covered by [prevID, nextID].
+		if id := right.RangeID; id < prevID || id > nextID {
+			spans = append(spans, spanRangeIDs(id, id))
+		}
+	}
+	// Include replicated user key span containing ranges left, desc, and right.
+	// TODO(tbg): rangeID is ignored here, make a rangeID-agnostic helper.
+	spans = append(spans, rditer.Select(0, rditer.SelectOpts{ReplicatedBySpan: userKeys})...)
+
+	return spans
+}
+
+// checkpoint creates a Pebble checkpoint in the auxiliary directory with the
+// provided tag used in the filepath. Returns the path to the created checkpoint
+// directory. The checkpoint includes only files that intersect with either of
+// the provided key spans. If spans is empty, it includes the entire store.
+func (s *Store) checkpoint(tag string, spans []roachpb.Span) (string, error) {
+	checkpointBase := s.checkpointsDir()
+	_ = s.engine.MkdirAll(checkpointBase)
+	checkpointDir := filepath.Join(checkpointBase, tag)
+	if err := s.engine.CreateCheckpoint(checkpointDir, spans); err != nil {
+		return "", err
+	}
 	return checkpointDir, nil
 }
 

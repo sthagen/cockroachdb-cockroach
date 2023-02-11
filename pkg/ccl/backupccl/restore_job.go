@@ -1917,8 +1917,8 @@ func revalidateIndexes(
 	// We don't actually need the 'historical' read the way the schema change does
 	// since our table is offline.
 	runner := descs.NewHistoricalInternalExecTxnRunner(hlc.Timestamp{}, func(ctx context.Context, fn descs.InternalExecFn) error {
-		return execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-			return fn(ctx, txn, descs.FromTxn(txn))
+		return execCfg.InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
+			return fn(ctx, txn)
 		})
 	})
 
@@ -2933,7 +2933,7 @@ VALUES ($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $1), (SEL
 				return err
 			}
 
-			roleOptionsHasIDColumn := r.execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2RoleOptionsTableHasIDColumn)
+			roleOptionsHasIDColumn := r.execCfg.Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2RoleOptionsTableHasIDColumn)
 			insertRoleOption := `INSERT INTO system.role_options ("username", "option", "value", "user_id") VALUES ($1, $2, $3, $4)`
 			if !roleOptionsHasIDColumn {
 				insertRoleOption = `INSERT INTO system.role_options ("username", "option", "value") VALUES ($1, $2, $3)`

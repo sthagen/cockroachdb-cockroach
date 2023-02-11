@@ -1337,6 +1337,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   first_attempt_count INT NOT NULL,
   max_retries         INT NOT NULL,
   last_error          STRING,
+  last_error_code     STRING,
   rows_avg            FLOAT NOT NULL,
   rows_var            FLOAT NOT NULL,
   idle_lat_avg        FLOAT NOT NULL,
@@ -1375,7 +1376,12 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   database_name       STRING NOT NULL,
   exec_node_ids       INT[] NOT NULL,
   txn_fingerprint_id  STRING,
-  index_recommendations STRING[] NOT NULL
+  index_recommendations STRING[] NOT NULL,
+  latency_seconds_min FLOAT,
+  latency_seconds_max FLOAT,
+  latency_seconds_p50 FLOAT,
+  latency_seconds_p90 FLOAT,
+  latency_seconds_p99 FLOAT
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		hasViewActivityOrViewActivityRedacted, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
@@ -1405,6 +1411,12 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			if stats.Stats.SensitiveInfo.LastErr != "" {
 				errString = tree.NewDString(stats.Stats.SensitiveInfo.LastErr)
 			}
+
+			errCode := tree.DNull
+			if stats.Stats.LastErrorCode != "" {
+				errCode = tree.NewDString(stats.Stats.LastErrorCode)
+			}
+
 			var flags string
 			if stats.Key.DistSQL {
 				flags = "+"
@@ -1446,6 +1458,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				tree.NewDInt(tree.DInt(stats.Stats.FirstAttemptCount)),    // first_attempt_count
 				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),           // max_retries
 				errString, // last_error
+				errCode,   // last_error_code
 				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                               // rows_avg
 				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),     // rows_var
 				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                               // idle_lat_avg
@@ -1485,6 +1498,11 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				execNodeIDs,                         // exec_node_ids
 				txnFingerprintID,                    // txn_fingerprint_id
 				indexRecommendations,                // index_recommendations
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.Min)), // latency_seconds_min
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.Max)), // latency_seconds_max
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P50)), // latency_seconds_p50
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P90)), // latency_seconds_p90
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P99)), // latency_seconds_p99
 			)
 			if err != nil {
 				return err
@@ -2753,9 +2771,13 @@ CREATE TABLE crdb_internal.builtin_functions (
 			props, overloads := builtinsregistry.GetBuiltinProperties(name)
 			schema := catconstants.PgCatalogName
 			const crdbInternal = catconstants.CRDBInternalSchemaName + "."
+			const infoSchema = catconstants.InformationSchemaName + "."
 			if strings.HasPrefix(name, crdbInternal) {
 				name = name[len(crdbInternal):]
 				schema = catconstants.CRDBInternalSchemaName
+			} else if strings.HasPrefix(name, infoSchema) {
+				name = name[len(infoSchema):]
+				schema = catconstants.InformationSchemaName
 			}
 			for _, f := range overloads {
 				if err := addRow(

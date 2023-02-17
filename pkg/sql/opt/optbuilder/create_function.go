@@ -34,9 +34,6 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 			panic(unimplemented.New("CREATE FUNCTION", "cross-db references not supported"))
 		}
 	}
-	if cf.ReturnType.IsSet {
-		panic(unimplemented.NewWithIssue(86391, "user-defined functions with SETOF return types are not supported"))
-	}
 
 	sch, resName := b.resolveSchemaForCreateFunction(&cf.FuncName)
 	schID := b.factory.Metadata().AddSchema(sch)
@@ -168,6 +165,8 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 
 		deps = append(deps, b.schemaDeps...)
 		typeDeps.UnionWith(b.schemaTypeDeps)
+		// Add statement ast into CreateFunction node for logging purpose.
+		cf.BodyStatements = append(cf.BodyStatements, stmt.AST)
 		// Reset the tracked dependencies for next statement.
 		b.schemaDeps = nil
 		b.schemaTypeDeps = intsets.Fast{}

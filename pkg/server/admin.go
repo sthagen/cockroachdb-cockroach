@@ -1335,7 +1335,7 @@ func (s *adminServer) statsForSpan(
 	}
 	type nodeResponse struct {
 		nodeID roachpb.NodeID
-		resp   *serverpb.SpanStatsResponse
+		resp   *roachpb.SpanStatsResponse
 		err    error
 	}
 
@@ -1351,13 +1351,13 @@ func (s *adminServer) statsForSpan(
 			},
 			func(ctx context.Context) {
 				// Set a generous timeout on the context for each individual query.
-				var spanResponse *serverpb.SpanStatsResponse
+				var spanResponse *roachpb.SpanStatsResponse
 				err := contextutil.RunWithTimeout(ctx, "request remote stats", 20*time.Second,
 					func(ctx context.Context) error {
 						conn, err := s.serverIterator.dialNode(ctx, serverID(nodeID))
 						if err == nil {
 							client := serverpb.NewStatusClient(conn)
-							req := serverpb.SpanStatsRequest{
+							req := roachpb.SpanStatsRequest{
 								StartKey: rSpan.Key,
 								EndKey:   rSpan.EndKey,
 								NodeID:   nodeID.String(),
@@ -2185,6 +2185,11 @@ func getLivenessResponse(
 	}, nil
 }
 
+// Liveness is implemented on the tenant-facing admin server
+// as a request through the tenant connector. Since at the
+// time of writing, the request contains no additional SQL
+// permission checks, the tenant capability gate is all
+// that is required. This is handled by the connector.
 func (s *adminServer) Liveness(
 	ctx context.Context, req *serverpb.LivenessRequest,
 ) (*serverpb.LivenessResponse, error) {

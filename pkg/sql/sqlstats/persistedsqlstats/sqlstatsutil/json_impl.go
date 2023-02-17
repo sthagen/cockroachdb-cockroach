@@ -124,50 +124,6 @@ func (s *aggregatedMetadata) jsonFields() jsonFields {
 	}
 }
 
-// ContentionEventWithNames is used to serialize into
-// cluster_execution_insights as a JSON array. This type
-// has the names instead of ids to avoid doing joins to get
-// the user-friendly names.
-type ContentionEventWithNames struct {
-	BlockingTransactionID string
-	SchemaName            string
-	DatabaseName          string
-	TableName             string
-	IndexName             string
-	DurationInMs          float64
-}
-
-type contentionEvents []ContentionEventWithNames
-
-func (s *contentionEvents) encodeJSON() (json.JSON, error) {
-	builder := json.NewArrayBuilder(len(*s))
-
-	for _, value := range *s {
-		jsVal := (*contentionEvent)(&value).jsonFields()
-		jsObj, err := jsVal.encodeJSON()
-		if err != nil {
-			return nil, err
-		}
-
-		builder.Add(jsObj)
-	}
-
-	return builder.Build(), nil
-}
-
-type contentionEvent ContentionEventWithNames
-
-func (s *contentionEvent) jsonFields() jsonFields {
-	return jsonFields{
-		{"blockingTxnID", (*jsonString)(&s.BlockingTransactionID)},
-		{"durationInMs", (*jsonFloat)(&s.DurationInMs)},
-		{"schemaName", (*jsonString)(&s.SchemaName)},
-		{"databaseName", (*jsonString)(&s.DatabaseName)},
-		{"tableName", (*jsonString)(&s.TableName)},
-		{"indexName", (*jsonString)(&s.IndexName)},
-	}
-}
-
 type int64Array []int64
 
 func (a *int64Array) decodeJSON(js json.JSON) error {
@@ -364,6 +320,7 @@ func (e *execStats) jsonFields() jsonFields {
 		{"networkMsgs", (*numericStats)(&e.NetworkMessages)},
 		{"maxDiskUsage", (*numericStats)(&e.MaxDiskUsage)},
 		{"cpuSQLNanos", (*numericStats)(&e.CPUSQLNanos)},
+		{"mvccIteratorStats", (*iteratorStats)(&e.MVCCIteratorStats)},
 	}
 }
 
@@ -372,6 +329,34 @@ func (e *execStats) decodeJSON(js json.JSON) error {
 }
 
 func (e *execStats) encodeJSON() (json.JSON, error) {
+	return e.jsonFields().encodeJSON()
+}
+
+type iteratorStats appstatspb.MVCCIteratorStats
+
+func (e *iteratorStats) jsonFields() jsonFields {
+	return jsonFields{
+		{"stepCount", (*numericStats)(&e.StepCount)},
+		{"stepCountInternal", (*numericStats)(&e.StepCountInternal)},
+		{"seekCount", (*numericStats)(&e.SeekCount)},
+		{"seekCountInternal", (*numericStats)(&e.SeekCountInternal)},
+		{"blockBytes", (*numericStats)(&e.BlockBytes)},
+		{"blockBytesInCache", (*numericStats)(&e.BlockBytesInCache)},
+		{"keyBytes", (*numericStats)(&e.KeyBytes)},
+		{"valueBytes", (*numericStats)(&e.ValueBytes)},
+		{"pointCount", (*numericStats)(&e.PointCount)},
+		{"pointsCoveredByRangeTombstones", (*numericStats)(&e.PointsCoveredByRangeTombstones)},
+		{"rangeKeyCount", (*numericStats)(&e.RangeKeyCount)},
+		{"rangeKeyContainedPoints", (*numericStats)(&e.RangeKeyContainedPoints)},
+		{"rangeKeySkippedPoints", (*numericStats)(&e.RangeKeySkippedPoints)},
+	}
+}
+
+func (e *iteratorStats) decodeJSON(js json.JSON) error {
+	return e.jsonFields().decodeJSON(js)
+}
+
+func (e *iteratorStats) encodeJSON() (json.JSON, error) {
 	return e.jsonFields().encodeJSON()
 }
 

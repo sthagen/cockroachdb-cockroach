@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -94,8 +93,7 @@ var MVCCRangeTombstonesEnabled = settings.RegisterBoolSetting(
 // It requires the MVCCRangeTombstones version gate to be active, and the
 // setting storage.mvcc.range_tombstones.enabled to be enabled.
 func CanUseMVCCRangeTombstones(ctx context.Context, st *cluster.Settings) bool {
-	return st.Version.IsActive(ctx, clusterversion.TODODelete_V22_2MVCCRangeTombstones) &&
-		MVCCRangeTombstonesEnabled.Get(&st.SV)
+	return MVCCRangeTombstonesEnabled.Get(&st.SV)
 }
 
 // MaxIntentsPerWriteIntentError sets maximum number of intents returned in
@@ -3629,19 +3627,22 @@ func recordIteratorStats(ctx context.Context, iter MVCCIterator) {
 	internalSteps := stats.ReverseStepCount[pebble.InternalIterCall] + stats.ForwardStepCount[pebble.InternalIterCall]
 	internalSeeks := stats.ReverseSeekCount[pebble.InternalIterCall] + stats.ForwardSeekCount[pebble.InternalIterCall]
 	sp.RecordStructured(&roachpb.ScanStats{
-		NumInterfaceSeeks:              uint64(seeks),
-		NumInternalSeeks:               uint64(internalSeeks),
-		NumInterfaceSteps:              uint64(steps),
-		NumInternalSteps:               uint64(internalSteps),
-		BlockBytes:                     stats.InternalStats.BlockBytes,
-		BlockBytesInCache:              stats.InternalStats.BlockBytesInCache,
-		KeyBytes:                       stats.InternalStats.KeyBytes,
-		ValueBytes:                     stats.InternalStats.ValueBytes,
-		PointCount:                     stats.InternalStats.PointCount,
-		PointsCoveredByRangeTombstones: stats.InternalStats.PointsCoveredByRangeTombstones,
-		RangeKeyCount:                  uint64(stats.RangeKeyStats.Count),
-		RangeKeyContainedPoints:        uint64(stats.RangeKeyStats.ContainedPoints),
-		RangeKeySkippedPoints:          uint64(stats.RangeKeyStats.SkippedPoints),
+		NumInterfaceSeeks:               uint64(seeks),
+		NumInternalSeeks:                uint64(internalSeeks),
+		NumInterfaceSteps:               uint64(steps),
+		NumInternalSteps:                uint64(internalSteps),
+		BlockBytes:                      stats.InternalStats.BlockBytes,
+		BlockBytesInCache:               stats.InternalStats.BlockBytesInCache,
+		KeyBytes:                        stats.InternalStats.KeyBytes,
+		ValueBytes:                      stats.InternalStats.ValueBytes,
+		PointCount:                      stats.InternalStats.PointCount,
+		PointsCoveredByRangeTombstones:  stats.InternalStats.PointsCoveredByRangeTombstones,
+		RangeKeyCount:                   uint64(stats.RangeKeyStats.Count),
+		RangeKeyContainedPoints:         uint64(stats.RangeKeyStats.ContainedPoints),
+		RangeKeySkippedPoints:           uint64(stats.RangeKeyStats.SkippedPoints),
+		SeparatedPointCount:             stats.InternalStats.SeparatedPointValue.Count,
+		SeparatedPointValueBytes:        stats.InternalStats.SeparatedPointValue.ValueBytes,
+		SeparatedPointValueBytesFetched: stats.InternalStats.SeparatedPointValue.ValueBytesFetched,
 	})
 }
 
@@ -4954,8 +4955,7 @@ func MVCCResolveWriteIntentRange(
 		mvccIter = rw.NewMVCCIterator(MVCCKeyIterKind, iterOpts)
 	} else {
 		// For correctness, we need mvccIter to be consistent with engineIter.
-		mvccIter = newPebbleIteratorByCloning(
-			engineIter.GetRawIter(), iterOpts, StandardDurability, rw.SupportsRangeKeys())
+		mvccIter = newPebbleIteratorByCloning(engineIter.GetRawIter(), iterOpts, StandardDurability)
 	}
 	iterAndBuf := GetBufUsingIter(mvccIter)
 	defer func() {

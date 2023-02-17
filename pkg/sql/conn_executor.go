@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -2130,6 +2131,19 @@ func (ex *connExecutor) execCmd() error {
 		if err != nil {
 			return err
 		}
+	case CopyOut:
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
+		res = ex.clientComm.CreateCopyInResult(pos)
+		ev, payload = ex.execCopyOut(ctx, tcmd)
+		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
+		// because:
+		// - stats use ex.statsCollector, not ex.phasetimes.
+		// - ex.statsCollector merely contains a copy of the times, that
+		//   was created when the statement started executing (via the
+		//   reset() method).
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
 	case DrainRequest:
 		// We received a drain request. We terminate immediately if we're not in a
 		// transaction. If we are in a transaction, we'll finish as soon as a Sync
@@ -2354,6 +2368,8 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 				canAdvance = true
 			case CopyIn:
 				// Can't advance.
+			case CopyOut:
+				// Can't advance.
 			case DrainRequest:
 				canAdvance = true
 			case Flush:
@@ -2419,6 +2435,92 @@ func isCopyToExternalStorage(cmd CopyIn) bool {
 	stmt := cmd.Stmt
 	return (stmt.Table.Table() == NodelocalFileUploadTable ||
 		stmt.Table.Table() == UserFileUploadTable) && stmt.Table.SchemaName == CrdbInternalName
+}
+
+func (ex *connExecutor) execCopyOut(
+	ctx context.Context, cmd CopyOut,
+) (fsm.Event, fsm.EventPayload) {
+	err := func() error {
+		ex.incrementStartedStmtCounter(cmd.Stmt)
+		var copyErr error
+		var numOutputRows int
+
+		// Log the query for sampling.
+		ex.setCopyLoggingFields(cmd.ParsedStmt)
+		defer func() {
+			// These fields are not available in COPY, so use the empty value.
+			f := tree.NewFmtCtx(tree.FmtHideConstants)
+			f.FormatNode(cmd.Stmt)
+			stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
+				f.CloseAndGetString(),
+				copyErr != nil,
+				ex.implicitTxn(),
+				ex.planner.CurrentDatabase(),
+			)
+			var stats topLevelQueryStats
+			ex.planner.maybeLogStatement(
+				ctx,
+				ex.executorType,
+				true, /* isCopy */
+				int(ex.state.mu.autoRetryCounter),
+				ex.extraTxnState.txnCounter,
+				numOutputRows,
+				0, /* bulkJobId */
+				copyErr,
+				ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
+				&ex.extraTxnState.hasAdminRoleCache,
+				ex.server.TelemetryLoggingMetrics,
+				stmtFingerprintID,
+				&stats,
+			)
+		}()
+
+		return ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
+			// Re-use the current transaction if available.
+			txn := ex.planner.Txn()
+			if txn == nil || !txn.IsOpen() {
+				// Setup an implicit transaction for COPY TO.
+				txn = ex.server.cfg.DB.NewTxn(ctx, cmd.Stmt.String())
+				defer func(txn *kv.Txn, ctx context.Context) {
+					err := txn.Rollback(ctx)
+					if err != nil {
+						log.SqlExec.Errorf(ctx, "error rolling black implicit txn in %s: %+v", cmd, err)
+					}
+				}(txn, ctx)
+			}
+
+			var err error
+			if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd); err != nil {
+				return err
+			}
+
+			// Finalize execution by sending the statement tag and number of rows read.
+			dummy := tree.CopyTo{}
+			tag := []byte(dummy.StatementTag())
+			tag = append(tag, ' ')
+			tag = strconv.AppendInt(tag, int64(numOutputRows), 10 /* base */)
+			return cmd.Conn.SendCommandComplete(tag)
+		})
+	}()
+	if err != nil {
+		log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, err)
+		return eventNonRetriableErr{IsCommit: fsm.False}, eventNonRetriableErrPayload{
+			err: err,
+		}
+	}
+	ex.incrementExecutedStmtCounter(cmd.Stmt)
+	return nil, nil
+}
+
+func (ex *connExecutor) setCopyLoggingFields(stmt parser.Statement) {
+	// These fields need to be set for logging purposes.
+	ex.planner.stmt = Statement{
+		Statement: stmt,
+	}
+	ann := tree.MakeAnnotations(0)
+	ex.planner.extendedEvalCtx.Context.Annotations = &ann
+	ex.planner.extendedEvalCtx.Context.Placeholders = &tree.PlaceholderInfo{}
+	ex.planner.curPlan.init(&ex.planner.stmt, &ex.planner.instrumentation)
 }
 
 // We handle the CopyFrom statement by creating a copyMachine and handing it
@@ -2497,14 +2599,7 @@ func (ex *connExecutor) execCopyIn(
 		ex.resetPlanner(ctx, p, txn, stmtTS)
 	}
 
-	// These fields need to be set for logging purposes.
-	ex.planner.stmt = Statement{
-		Statement: cmd.ParsedStmt,
-	}
-	ann := tree.MakeAnnotations(0)
-	ex.planner.extendedEvalCtx.Context.Annotations = &ann
-	ex.planner.extendedEvalCtx.Context.Placeholders = &tree.PlaceholderInfo{}
-	ex.planner.curPlan.init(&ex.planner.stmt, &ex.planner.instrumentation)
+	ex.setCopyLoggingFields(cmd.ParsedStmt)
 
 	var cm copyMachineInterface
 	var copyErr error
@@ -2524,20 +2619,7 @@ func (ex *connExecutor) execCopyIn(
 			ex.planner.CurrentDatabase(),
 		)
 		var stats topLevelQueryStats
-		ex.planner.maybeLogStatement(
-			ctx,
-			ex.executorType,
-			true, /* isCopy */
-			int(ex.state.mu.autoRetryCounter),
-			ex.extraTxnState.txnCounter,
-			numInsertedRows,
-			copyErr,
-			ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
-			&ex.extraTxnState.hasAdminRoleCache,
-			ex.server.TelemetryLoggingMetrics,
-			stmtFingerprintID,
-			&stats,
-		)
+		ex.planner.maybeLogStatement(ctx, ex.executorType, true, int(ex.state.mu.autoRetryCounter), ex.extraTxnState.txnCounter, numInsertedRows, 0 /* bulkJobId */, copyErr, ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived), &ex.extraTxnState.hasAdminRoleCache, ex.server.TelemetryLoggingMetrics, stmtFingerprintID, &stats)
 	}()
 
 	if isCopyToExternalStorage(cmd) {
@@ -2855,6 +2937,8 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 // return for statements executed with this evalCtx. Since generally each
 // statement is supposed to have a different timestamp, the evalCtx generally
 // shouldn't be reused across statements.
+//
+// Safe for concurrent use.
 func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, stmtTS time.Time) {
 	newTxn := txn == nil || evalCtx.Txn != txn
 	evalCtx.TxnState = ex.getTransactionState()
@@ -2878,22 +2962,12 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.SchemaChangerState = ex.extraTxnState.schemaChangerState
 	evalCtx.DescIDGenerator = ex.getDescIDGenerator()
 
-	// If we are retrying due to an unsatisfiable timestamp bound which is
-	// retriable, it means we were unable to serve the previous minimum timestamp
-	// as there was a schema update in between. When retrying, we want to keep the
-	// same minimum timestamp for the AOST read, but set the maximum timestamp
-	// to the point just before our failed read to ensure we don't try to read
-	// data which may be after the schema change when we retry.
+	// See resetPlanner for more context on setting the maximum timestamp for
+	// AOST read retries.
 	var minTSErr *roachpb.MinTimestampBoundUnsatisfiableError
 	if err := ex.state.mu.autoRetryReason; err != nil && errors.As(err, &minTSErr) {
-		nextMax := minTSErr.MinTimestampBound
-		ex.extraTxnState.descCollection.SetMaxTimestampBound(nextMax)
-		evalCtx.AsOfSystemTime.MaxTimestampBound = nextMax
+		evalCtx.AsOfSystemTime.MaxTimestampBound = ex.extraTxnState.descCollection.GetMaxTimestampBound()
 	} else if newTxn {
-		// Otherwise, only change the historical timestamps if this is a new txn.
-		// This is because resetPlanner can be called multiple times for the same
-		// txn during the extended protocol.
-		ex.extraTxnState.descCollection.ResetMaxTimestampBound()
 		evalCtx.AsOfSystemTime = nil
 	}
 }
@@ -2939,6 +3013,22 @@ func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
 	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData(), ex.state.mon)
+	// If we are retrying due to an unsatisfiable timestamp bound which is
+	// retriable, it means we were unable to serve the previous minimum timestamp
+	// as there was a schema update in between. When retrying, we want to keep the
+	// same minimum timestamp for the AOST read, but set the maximum timestamp
+	// to the point just before our failed read to ensure we don't try to read
+	// data which may be after the schema change when we retry.
+	var minTSErr *roachpb.MinTimestampBoundUnsatisfiableError
+	if err := ex.state.mu.autoRetryReason; err != nil && errors.As(err, &minTSErr) {
+		nextMax := minTSErr.MinTimestampBound
+		ex.extraTxnState.descCollection.SetMaxTimestampBound(nextMax)
+	} else if newTxn := txn == nil || p.extendedEvalCtx.Txn != txn; newTxn {
+		// Otherwise, only change the historical timestamps if this is a new txn.
+		// This is because resetPlanner can be called multiple times for the same
+		// txn during the extended protocol.
+		ex.extraTxnState.descCollection.ResetMaxTimestampBound()
+	}
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 }
 

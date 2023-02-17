@@ -64,7 +64,7 @@ func newState(settings *config.SimulationSettings) *state {
 		clock:      &ManualSimClock{nanos: settings.StartTime.UnixNano()},
 		ranges:     newRMap(),
 		usageInfo:  newClusterUsageInfo(),
-		settings:   config.DefaultSimulationSettings(),
+		settings:   settings,
 	}
 	s.load = map[RangeID]ReplicaLoad{FirstRangeID: NewReplicaLoadCounter(s.clock)}
 	return s
@@ -318,7 +318,7 @@ func (s *state) AddStore(nodeID NodeID) (Store, bool) {
 	node := s.nodes[nodeID]
 	s.storeSeqGen++
 	storeID := s.storeSeqGen
-	sp, st := NewStorePool(s.NodeCountFn(), s.NodeLivenessFn(), hlc.NewClock(s.clock, 0))
+	sp, st := NewStorePool(s.NodeCountFn(), s.NodeLivenessFn(), hlc.NewClockForTesting(s.clock))
 	store := &store{
 		storeID:   storeID,
 		nodeID:    nodeID,

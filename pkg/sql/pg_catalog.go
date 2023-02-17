@@ -2642,7 +2642,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 						return false, err
 					}
 
-					err = addPgProcBuiltinRow(name, addRow)
+					err = addPgProcBuiltinRow(name.Object(), addRow)
 					if err != nil {
 						return false, err
 					}
@@ -4379,10 +4379,7 @@ func typOid(typ *types.T) tree.Datum {
 }
 
 func typLen(typ *types.T) *tree.DInt {
-	if sz, variable := tree.DatumTypeSize(typ); !variable {
-		return tree.NewDInt(tree.DInt(sz))
-	}
-	return negOneVal
+	return tree.NewDInt(tree.DInt(tree.PGWireTypeSize(typ)))
 }
 
 func typByVal(typ *types.T) tree.Datum {

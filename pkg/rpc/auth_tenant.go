@@ -120,6 +120,9 @@ func (a tenantAuthorizer) authorize(
 	case "/cockroach.server.serverpb.Status/TransactionContentionEvents":
 		return a.authTenant(tenID)
 
+	case "/cockroach.server.serverpb.Status/SpanStats":
+		return a.authSpanStats(tenID, req.(*roachpb.SpanStatsRequest))
+
 	case "/cockroach.roachpb.Internal/GetSpanConfigs":
 		return a.authGetSpanConfigs(tenID, req.(*roachpb.GetSpanConfigsRequest))
 
@@ -138,14 +141,14 @@ func (a tenantAuthorizer) authorize(
 	case "/cockroach.server.serverpb.Status/HotRangesV2":
 		return a.authHotRangesV2(tenID)
 
-	case "/cockroach.server.serverpb.Status/NodesUI":
-		return a.authCapability(tenID)
+	case "/cockroach.server.serverpb.Status/Nodes":
+		return a.capabilitiesAuthorizer.HasNodeStatusCapability(ctx, tenID)
 
 	case "/cockroach.server.serverpb.Admin/Liveness":
-		return a.authCapability(tenID)
+		return a.capabilitiesAuthorizer.HasNodeStatusCapability(ctx, tenID)
 
 	case "/cockroach.ts.tspb.TimeSeries/Query":
-		return a.authCapability(tenID)
+		return a.capabilitiesAuthorizer.HasTSDBQueryCapability(ctx, tenID)
 
 	default:
 		return authErrorf("unknown method %q", fullMethod)
@@ -224,6 +227,15 @@ func (a tenantAuthorizer) authGetRangeDescriptors(
 	return validateSpan(tenID, args.Span)
 }
 
+func (a tenantAuthorizer) authSpanStats(
+	tenID roachpb.TenantID, args *roachpb.SpanStatsRequest,
+) error {
+	return validateSpan(tenID, roachpb.Span{
+		Key:    args.StartKey.AsRawKey(),
+		EndKey: args.EndKey.AsRawKey(),
+	})
+}
+
 // authRangeLookup authorizes the provided tenant to invoke the RangeLookup RPC
 // with the provided args.
 func (a tenantAuthorizer) authRangeLookup(
@@ -276,12 +288,6 @@ func (a tenantAuthorizer) authTenant(id roachpb.TenantID) error {
 	if a.tenantID != id {
 		return authErrorf("request from tenant %s not permitted on tenant %s", id, a.tenantID)
 	}
-	return nil
-}
-
-// authCapability checks if the current tenant has the requested capability.
-func (a tenantAuthorizer) authCapability(id roachpb.TenantID) error {
-	// TODO(davidh): add capability-specific checks here that correspond to specific requests.
 	return nil
 }
 

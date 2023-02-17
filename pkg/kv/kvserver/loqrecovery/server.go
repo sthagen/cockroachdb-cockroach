@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -26,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -65,6 +67,7 @@ type visitNodeStatusFn func(ctx context.Context, nodeID roachpb.NodeID, retryOpt
 type Server struct {
 	nodeIDContainer    *base.NodeIDContainer
 	clusterIDContainer *base.ClusterIDContainer
+	settings           *cluster.Settings
 	stores             *kvserver.Stores
 	visitAdminNodes    visitNodeAdminFn
 	visitStatusNode    visitNodeStatusFn
@@ -77,6 +80,7 @@ type Server struct {
 
 func NewServer(
 	nodeIDContainer *base.NodeIDContainer,
+	settings *cluster.Settings,
 	stores *kvserver.Stores,
 	planStore PlanStore,
 	g *gossip.Gossip,
@@ -99,6 +103,7 @@ func NewServer(
 	return &Server{
 		nodeIDContainer:      nodeIDContainer,
 		clusterIDContainer:   rpcCtx.StorageClusterID,
+		settings:             settings,
 		stores:               stores,
 		visitAdminNodes:      makeVisitAvailableNodes(g, loc, rpcCtx),
 		visitStatusNode:      makeVisitNode(g, loc, rpcCtx),
@@ -115,7 +120,7 @@ func (s Server) ServeLocalReplicas(
 	stream serverpb.Admin_RecoveryCollectLocalReplicaInfoServer,
 ) error {
 	return s.stores.VisitStores(func(s *kvserver.Store) error {
-		reader := s.Engine().NewSnapshot()
+		reader := s.TODOEngine().NewSnapshot()
 		defer reader.Close()
 		return visitStoreReplicas(ctx, reader, s.StoreID(), s.NodeID(),
 			func(info loqrecoverypb.ReplicaInfo) error {
@@ -130,6 +135,11 @@ func (s Server) ServeClusterReplicas(
 	outStream serverpb.Admin_RecoveryCollectReplicaInfoServer,
 	kvDB *kv.DB,
 ) (err error) {
+	// Block requests that require fan-out to other nodes until upgrade is finalized.
+	if !s.settings.Version.IsActive(ctx, clusterversion.V23_1) {
+		return errors.Newf("loss of quorum recovery service requires cluster upgraded to 23.1")
+	}
+
 	var (
 		descriptors, nodes, replicas int
 	)
@@ -234,6 +244,11 @@ func (s Server) ServeClusterReplicas(
 func (s Server) StagePlan(
 	ctx context.Context, req *serverpb.RecoveryStagePlanRequest,
 ) (*serverpb.RecoveryStagePlanResponse, error) {
+	// Block requests that require fan-out to other nodes until upgrade is finalized.
+	if !s.settings.Version.IsActive(ctx, clusterversion.V23_1) {
+		return nil, errors.Newf("loss of quorum recovery service requires cluster upgraded to 23.1")
+	}
+
 	if !req.ForcePlan && req.Plan == nil {
 		return nil, errors.New("stage plan request can't be used with empty plan without force flag")
 	}
@@ -287,6 +302,11 @@ func (s Server) StagePlan(
 		for _, u := range plan.Updates {
 			if !foundNodes[u.NodeID()] {
 				return nil, errors.Newf("node n%d has planned changed but is unreachable in the cluster", u.NodeID())
+			}
+		}
+		for _, n := range plan.StaleLeaseholderNodeIDs {
+			if !foundNodes[n] {
+				return nil, errors.Newf("node n%d has planned restart but is unreachable in the cluster", n)
 			}
 		}
 
@@ -357,12 +377,25 @@ func (s Server) StagePlan(
 		}
 	}
 
+	needsUpdate := false
 	for _, r := range plan.Updates {
 		if r.NodeID() == localNodeID {
-			if err := s.planStore.SavePlan(plan); err != nil {
-				return responseFromError(err)
-			}
+			needsUpdate = true
 			break
+		}
+	}
+	if !needsUpdate {
+		for _, n := range plan.StaleLeaseholderNodeIDs {
+			if n == localNodeID {
+				needsUpdate = true
+				break
+			}
+		}
+	}
+
+	if needsUpdate {
+		if err := s.planStore.SavePlan(plan); err != nil {
+			return responseFromError(err)
 		}
 	}
 
@@ -383,7 +416,7 @@ func (s Server) NodeStatus(
 		status.PendingPlanID = &plan.PlanID
 	}
 	err = s.stores.VisitStores(func(s *kvserver.Store) error {
-		r, ok, err := readNodeRecoveryStatusInfo(ctx, s.Engine())
+		r, ok, err := readNodeRecoveryStatusInfo(ctx, s.TODOEngine())
 		if err != nil {
 			return err
 		}
@@ -411,6 +444,11 @@ func (s Server) Verify(
 	liveNodes livenesspb.IsLiveMap,
 	db *kv.DB,
 ) (*serverpb.RecoveryVerifyResponse, error) {
+	// Block requests that require fan-out to other nodes until upgrade is finalized.
+	if !s.settings.Version.IsActive(ctx, clusterversion.V23_1) {
+		return nil, errors.Newf("loss of quorum recovery service requires cluster upgraded to 23.1")
+	}
+
 	var nss []loqrecoverypb.NodeRecoveryStatus
 	err := s.visitAdminNodes(ctx, fanOutConnectionRetryOptions,
 		notListed(req.DecommissionedNodeIDs),

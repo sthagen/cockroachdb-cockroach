@@ -8274,8 +8274,8 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 }
 
 // TestIncorrectAccessOfFilesInBackupMetadata ensures that an accidental use of
-// the `Files` field (instead of its dedicated SST) on the `BACKUP_METADATA`
-// results in an error on restore and show.
+// the `Descriptors` field (instead of its dedicated SST) on the
+// `BACKUP_METADATA` results in an error on restore and show.
 func TestIncorrectAccessOfFilesInBackupMetadata(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -8299,13 +8299,13 @@ func TestIncorrectAccessOfFilesInBackupMetadata(t *testing.T) {
 	var backupManifest backuppb.BackupManifest
 	require.NoError(t, protoutil.Unmarshal(manifestData, &backupManifest))
 
-	// The manifest should have `HasExternalFilesList` set to true.
-	require.True(t, backupManifest.HasExternalFilesList)
+	// The manifest should have `HasExternalManifestSSTs` set to true.
+	require.True(t, backupManifest.HasExternalManifestSSTs)
 
 	// Set it to false, so that any operation that resolves the metadata treats
 	// this manifest as a pre-23.1 BACKUP_MANIFEST, and directly accesses the
-	// `Files` field, instead of reading from the external SST.
-	backupManifest.HasExternalFilesList = false
+	// `Descriptors` field, instead of reading from the external SST.
+	backupManifest.HasExternalManifestSSTs = false
 	manifestData, err = protoutil.Marshal(&backupManifest)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(manifestPath, manifestData, 0644 /* perm */))
@@ -8315,7 +8315,7 @@ func TestIncorrectAccessOfFilesInBackupMetadata(t *testing.T) {
 	require.NoError(t, os.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
 
 	// Expect an error on restore.
-	sqlDB.ExpectErr(t, "assertion: this placeholder legacy Files entry should never be opened", `RESTORE DATABASE r1 FROM LATEST IN 'nodelocal://0/test' WITH new_db_name = 'r2'`)
+	sqlDB.ExpectErr(t, "assertion: this placeholder legacy Descriptor entry should never be used", `RESTORE DATABASE r1 FROM LATEST IN 'nodelocal://0/test' WITH new_db_name = 'r2'`)
 }
 
 func TestManifestTooNew(t *testing.T) {
@@ -8464,6 +8464,7 @@ func TestRestoreJobEventLogging(t *testing.T) {
 
 	sqlDB.Exec(t, `CREATE DATABASE r1`)
 	sqlDB.Exec(t, `CREATE TABLE r1.foo (id INT)`)
+	sqlDB.Exec(t, `INSERT INTO r1.foo VALUES (1), (2), (3)`)
 	sqlDB.Exec(t, `BACKUP DATABASE r1 TO 'nodelocal://0/eventlogging'`)
 	sqlDB.Exec(t, `DROP DATABASE r1`)
 
@@ -8476,8 +8477,12 @@ func TestRestoreJobEventLogging(t *testing.T) {
 		&unused)
 
 	expectedStatus := []string{string(jobs.StatusSucceeded), string(jobs.StatusRunning)}
-	jobstest.CheckEmittedEvents(t, expectedStatus, beforeRestore.UnixNano(), jobID, `"EventType":"restore"`,
-		"RESTORE")
+	expectedRecoveryEvent := eventpb.RecoveryEvent{
+		RecoveryType: restoreJobEventType,
+		NumRows:      int64(3),
+	}
+	jobstest.CheckEmittedEvents(t, expectedStatus, beforeRestore.UnixNano(), jobID, "restore",
+		"RESTORE", expectedRecoveryEvent)
 
 	sqlDB.Exec(t, `DROP DATABASE r1`)
 
@@ -8493,8 +8498,12 @@ func TestRestoreJobEventLogging(t *testing.T) {
 		string(jobs.StatusFailed), string(jobs.StatusReverting),
 		string(jobs.StatusRunning),
 	}
+	expectedRecoveryEvent = eventpb.RecoveryEvent{
+		RecoveryType: restoreJobEventType,
+		NumRows:      int64(0),
+	}
 	jobstest.CheckEmittedEvents(t, expectedStatus, beforeSecondRestore.UnixNano(), jobID,
-		`"EventType":"restore"`, "RESTORE")
+		"restore", "RESTORE", expectedRecoveryEvent)
 }
 
 func TestBackupOnlyPublicIndexes(t *testing.T) {
@@ -8523,7 +8532,7 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 	var chunkCount int32
 	// Disable running within a tenant because expected index span is not received.
 	// More investigation is necessary.
-	// https://github.com/cockroachdb/cockroach/issues/88633
+	// https://github.com/cockroachdb/cockroach/issues/88633F
 	serverArgs := base.TestServerArgs{DisableDefaultTestTenant: true}
 	serverArgs.Knobs = base.TestingKnobs{
 		// Configure knobs to block the index backfills.

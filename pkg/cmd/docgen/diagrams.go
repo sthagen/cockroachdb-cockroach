@@ -680,7 +680,7 @@ var specs = []stmtSpec{
 		match:  []*regexp.Regexp{regexp.MustCompile("'COMMIT'|'END'")},
 	},
 	{
-		name:    "copy_from_stmt",
+		name:    "copy_stmt",
 		inline:  []string{"opt_with_copy_options", "copy_options_list", "opt_with", "opt_where_clause", "where_clause"},
 		exclude: []*regexp.Regexp{regexp.MustCompile("'WHERE'")},
 	},
@@ -772,6 +772,17 @@ var specs = []stmtSpec{
 			"backup_targets":        "( | ( 'TABLE' | ) table_pattern ( ( ',' table_pattern ) )* | 'DATABASE' database_name ( ( ',' database_name ) )* )",
 			"kv_option_list":        "schedule_option"},
 		unlink: []string{"schedule_label", "collection_URI", "crontab", "schedule_option"},
+	},
+	{
+		name:   "create_schedule_for_changefeed_stmt",
+		inline: []string{"opt_with_schedule_options", "changefeed_targets", "table_pattern", "opt_where_clause", "changefeed_target_expr", "cron_expr"},
+		replace: map[string]string{
+			"schedule_label_spec":   "( 'IF NOT EXISTS' | )  schedule_label",
+			"changefeed_sink":       "( 'INTO' changefeed_sink )",
+			"sconst_or_placeholder": "crontab",
+			"kv_option_list":        "schedule_option",
+			"opt_with_options":      "( | 'WITH' changefeed_option ( ',' changefeed_option )* )"},
+		unlink: []string{"schedule_label", "schedule_option", "changefeed_sink", "changefeed_option", "crontab"},
 	},
 	{
 		name:    "create_schema_stmt",

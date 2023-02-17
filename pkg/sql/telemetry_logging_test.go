@@ -344,7 +344,7 @@ func TestTelemetryLogging(t *testing.T) {
 	}
 
 	for _, tc := range testData {
-		telemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, tc.stubMaxEventFrequency)
+		TelemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, tc.stubMaxEventFrequency)
 		if tc.enableInjectTxErrors {
 			_, err := db.DB.ExecContext(context.Background(), "SET inject_retry_errors_enabled = 'true'")
 			require.NoError(t, err)
@@ -623,7 +623,7 @@ func TestNoTelemetryLogOnTroubleshootMode(t *testing.T) {
 	db.Exec(t, "CREATE TABLE t();")
 
 	stubMaxEventFrequency := int64(1)
-	telemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, stubMaxEventFrequency)
+	TelemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, stubMaxEventFrequency)
 
 	/*
 		Testing Cases:
@@ -739,7 +739,7 @@ func TestTelemetryLogJoinTypesAndAlgorithms(t *testing.T) {
 		");")
 
 	stubMaxEventFrequency := int64(1000000)
-	telemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, stubMaxEventFrequency)
+	TelemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, stubMaxEventFrequency)
 
 	testData := []struct {
 		name                   string
@@ -1214,5 +1214,63 @@ cases:
 			}
 		}
 		t.Errorf("couldn't find log entry containing `%s`", tc.logStmt)
+	}
+}
+
+func TestFunctionBodyRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	cleanup := logtestutils.InstallTelemetryLogFileSink(sc, t)
+	defer cleanup()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	db := sqlutils.MakeSQLRunner(sqlDB)
+	defer s.Stopper().Stop(context.Background())
+
+	db.Exec(t, `SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true;`)
+	db.Exec(t, `CREATE TABLE kv (k STRING, v INT)`)
+	stubMaxEventFrequency := int64(1000000)
+	TelemetryMaxEventFrequency.Override(context.Background(), &s.ClusterSettings().SV, stubMaxEventFrequency)
+
+	stmt := `CREATE FUNCTION f() RETURNS INT 
+LANGUAGE SQL 
+AS $$ 
+SELECT k FROM kv WHERE v = 1;
+SELECT v FROM kv WHERE k = 'Foo';
+$$`
+
+	expectedLogStmt := `CREATE FUNCTION defaultdb.public.f()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT k FROM defaultdb.public.kv WHERE v = ‹1›; SELECT v FROM defaultdb.public.kv WHERE k = ‹'Foo'›;$$`
+
+	db.Exec(t, stmt)
+
+	log.Flush()
+
+	entries, err := log.FetchEntriesFromFiles(
+		0,
+		math.MaxInt64,
+		10000,
+		regexp.MustCompile(`"EventType":"sampled_query"`),
+		log.WithMarkedSensitiveData,
+	)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(entries) == 0 {
+		t.Fatal(errors.Newf("no entries found"))
+	}
+
+	numLogsFound := 0
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if strings.Contains(e.Message, expectedLogStmt) {
+			numLogsFound++
+		}
+	}
+	if numLogsFound != 1 {
+		t.Errorf("expected 1 log entries, found %d", numLogsFound)
 	}
 }

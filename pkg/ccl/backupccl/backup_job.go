@@ -51,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -150,21 +151,25 @@ func backup(
 	// TODO(benesch): verify these files, rather than accepting them as truth
 	// blindly.
 	// No concurrency yet, so these assignments are safe.
-	it, err := makeBackupManifestFileIterator(ctx, execCtx.ExecCfg().DistSQLSrv.ExternalStorage,
-		*backupManifest, encryption, &kmsEnv)
+	iterFactory := backupinfo.NewIterFactory(backupManifest, defaultStore, encryption, &kmsEnv)
+	it, err := iterFactory.NewFileIter(ctx)
 	if err != nil {
 		return roachpb.RowCount{}, err
 	}
-	defer it.close()
-	for f, hasNext := it.next(); hasNext; f, hasNext = it.next() {
+	defer it.Close()
+	for ; ; it.Next() {
+		if ok, err := it.Valid(); err != nil {
+			return roachpb.RowCount{}, err
+		} else if !ok {
+			break
+		}
+
+		f := it.Value()
 		if f.StartTime.IsEmpty() && !f.EndTime.IsEmpty() {
 			completedIntroducedSpans = append(completedIntroducedSpans, f.Span)
 		} else {
 			completedSpans = append(completedSpans, f.Span)
 		}
-	}
-	if it.err() != nil {
-		return roachpb.RowCount{}, it.err()
 	}
 
 	// Subtract out any completed spans.
@@ -348,7 +353,7 @@ func backup(
 	// TODO(adityamaru,rhu713): Once backup/restore switches from writing and
 	// reading backup manifests to `metadata.sst` we can stop writing the slim
 	// manifest.
-	if err := backupinfo.WriteFilesListMetadataWithSSTs(ctx, defaultStore, encryption,
+	if err := backupinfo.WriteMetadataWithExternalSSTs(ctx, defaultStore, encryption,
 		&kmsEnv, backupManifest); err != nil {
 		return roachpb.RowCount{}, err
 	}
@@ -714,7 +719,14 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			return errors.Wrap(err, "failed to run backup")
 		}
 
-		log.Warningf(ctx, `BACKUP job encountered retryable error: %+v`, err)
+		// If we are draining, it is unlikely we can start a
+		// new DistSQL flow. Exit with a retryable error so
+		// that another node can pick up the job.
+		if p.ExecCfg().JobRegistry.IsDraining() {
+			return jobs.MarkAsRetryJobError(errors.Wrapf(err, "job encountered retryable error on draining node"))
+		}
+
+		log.Warningf(ctx, "encountered retryable error: %+v", err)
 
 		// Reload the backup manifest to pick up any spans we may have completed on
 		// previous attempts.
@@ -821,7 +833,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			telemetry.CountBucketed("backup.speed-mbps.inc.total", mbps)
 			telemetry.CountBucketed("backup.speed-mbps.inc.per-node", mbps/int64(numClusterNodes))
 		}
-		logJobCompletion(ctx, b.getTelemetryEventType(), b.job.ID(), true, nil)
+		logutil.LogJobCompletion(ctx, b.getTelemetryEventType(), b.job.ID(), true, nil, res.Rows)
 	}
 
 	return b.maybeNotifyScheduledJobCompletion(
@@ -998,12 +1010,19 @@ func getBackupDetailAndManifest(
 		return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
 	}
 
+	layerToIterFactory, err := backupinfo.GetBackupManifestIterFactories(ctx, execCfg.DistSQLSrv.ExternalStorage, prevBackups, baseEncryptionOptions, &kmsEnv)
+	if err != nil {
+		return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
+	}
+
 	backupManifest, err := createBackupManifest(
 		ctx,
 		execCfg,
 		txn,
 		updatedDetails,
-		prevBackups)
+		prevBackups,
+		layerToIterFactory,
+	)
 	if err != nil {
 		return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
 	}
@@ -1108,7 +1127,7 @@ func (b *backupResumer) OnFailOrCancel(
 	telemetry.Count("backup.total.failed")
 	telemetry.CountBucketed("backup.duration-sec.failed",
 		int64(timeutil.Since(timeutil.FromUnixMicros(b.job.Payload().StartedMicros)).Seconds()))
-	logJobCompletion(ctx, b.getTelemetryEventType(), b.job.ID(), false, jobErr)
+	logutil.LogJobCompletion(ctx, b.getTelemetryEventType(), b.job.ID(), false, jobErr, b.backupStats.Rows)
 
 	p := execCtx.(sql.JobExecContext)
 	cfg := p.ExecCfg()

@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -1269,9 +1270,10 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 		// leaving the 2 voters.
 		startKey := tc.ScratchRange(t)
 		desc, err := tc.RemoveVoters(startKey, tc.Target(2))
-		require.NoError(t, err)
-		require.Len(t, desc.Replicas().VoterDescriptors(), 2)
-		require.Len(t, desc.Replicas().LearnerDescriptors(), 0)
+		// NB: don't fatal on this goroutine, as we can't recover cleanly.
+		assert.NoError(t, err)
+		assert.Len(t, desc.Replicas().VoterDescriptors(), 2)
+		assert.Len(t, desc.Replicas().LearnerDescriptors(), 0)
 		return false
 	}
 	tc = testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
@@ -1300,10 +1302,8 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if !strings.Contains(processErr.Error(), `descriptor changed`) {
-				// NB: errors.Wrapf(nil, ...) returns nil.
-				// nolint:errwrap
-				return errors.Errorf(`expected "descriptor changed" error got: %+v`, processErr)
+			if processErr == nil || !strings.Contains(processErr.Error(), `descriptor changed`) {
+				return errors.Wrap(processErr, `expected "descriptor changed" error got: %+v`)
 			}
 			formattedTrace := trace.String()
 			expectedMessages := []string{
@@ -1465,6 +1465,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 
 func TestLearnerOrJointConfigAdminRelocateRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 95500, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1972,7 +1973,7 @@ func getExpectedSnapshotSizeBytes(
 	}
 	defer snap.Close()
 
-	b := originStore.Engine().NewUnindexedBatch(true)
+	b := originStore.TODOEngine().NewUnindexedBatch(true)
 	defer b.Close()
 
 	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */

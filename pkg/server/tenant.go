@@ -70,6 +70,8 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	sentry "github.com/getsentry/sentry-go"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // SQLServerWrapper is a utility struct that encapsulates
@@ -149,18 +151,53 @@ func (s *SQLServerWrapper) Drain(
 	return s.drainServer.runDrain(ctx, verbose)
 }
 
-// NewTenantServer creates a tenant-specific, SQL-only server against a KV
-// backend.
+// NewSeparateProcessTenantServer creates a tenant-specific, SQL-only
+// server against a KV backend, with defaults appropriate for a
+// SQLServer that is not located in the same process as a KVServer.
 //
 // The caller is responsible for listening to the server's ShutdownRequested()
 // channel and stopping cfg.stopper when signaled.
-func NewTenantServer(
+func NewSeparateProcessTenantServer(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
 	parentRecorder *status.MetricsRecorder,
 	tenantNameContainer *roachpb.TenantNameContainer,
+) (*SQLServerWrapper, error) {
+	instanceIDContainer := baseCfg.IDContainer.SwitchToSQLIDContainerForStandaloneSQLInstance()
+	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer, instanceIDContainer)
+}
+
+// NewSeparateProcessTenantServer creates a tenant-specific, SQL-only
+// server against a KV backend, with defaults appropriate for a
+// SQLServer that is not located in the same process as a KVServer.
+//
+// The caller is responsible for listening to the server's ShutdownRequested()
+// channel and stopping cfg.stopper when signaled.
+func NewSharedProcessTenantServer(
+	ctx context.Context,
+	stopper *stop.Stopper,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	parentRecorder *status.MetricsRecorder,
+	tenantNameContainer *roachpb.TenantNameContainer,
+) (*SQLServerWrapper, error) {
+	if baseCfg.IDContainer.Get() == 0 {
+		return nil, errors.AssertionFailedf("programming error: NewSharedProcessTenantServer called before NodeID was assigned.")
+	}
+	instanceIDContainer := base.NewSQLIDContainerForNode(baseCfg.IDContainer)
+	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer, instanceIDContainer)
+}
+
+func newTenantServer(
+	ctx context.Context,
+	stopper *stop.Stopper,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	parentRecorder *status.MetricsRecorder,
+	tenantNameContainer *roachpb.TenantNameContainer,
+	instanceIDContainer *base.SQLIDContainer,
 ) (*SQLServerWrapper, error) {
 	// TODO(knz): Make the license application a per-server thing
 	// instead of a global thing.
@@ -172,8 +209,7 @@ func NewTenantServer(
 	// Inform the server identity provider that we're operating
 	// for a tenant server.
 	baseCfg.idProvider.SetTenant(sqlCfg.TenantID)
-
-	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer)
+	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer, instanceIDContainer)
 	if err != nil {
 		return nil, err
 	}
@@ -723,7 +759,15 @@ func (s *SQLServerWrapper) serveConn(
 	switch status.State {
 	case pgwire.PreServeCancel:
 		if err := pgServer.HandleCancel(ctx, status.CancelKey); err != nil {
-			log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
+			_, rateLimited := errors.If(err, func(err error) (interface{}, bool) {
+				if respStatus := grpcstatus.Convert(err); respStatus.Code() == codes.ResourceExhausted {
+					return nil, true
+				}
+				return nil, false
+			})
+			if rateLimited {
+				log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
+			}
 		}
 		return nil
 	case pgwire.PreServeReady:
@@ -839,15 +883,17 @@ func makeTenantSQLServerArgs(
 	sqlCfg SQLConfig,
 	parentRecorder *status.MetricsRecorder,
 	tenantNameContainer *roachpb.TenantNameContainer,
+	instanceIDContainer *base.SQLIDContainer,
 ) (sqlServerArgs, error) {
 	st := baseCfg.Settings
 
 	// We want all log messages issued on behalf of this SQL instance to report
 	// the instance ID (once known) as a tag.
-	instanceIDContainer := baseCfg.IDContainer.SwitchToSQLIDContainer()
 	startupCtx = baseCfg.AmbientCtx.AnnotateCtx(startupCtx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Duration(baseCfg.MaxOffset))
+	maxOffset := time.Duration(baseCfg.MaxOffset)
+	toleratedOffset := baseCfg.ToleratedOffset()
+	clock := hlc.NewClockWithSystemTimeSource(maxOffset, toleratedOffset)
 
 	registry := metric.NewRegistry()
 	ruleRegistry := metric.NewRuleRegistry()
@@ -866,7 +912,7 @@ func makeTenantSQLServerArgs(
 		StorageClusterID:    baseCfg.ClusterIDContainer,
 		Config:              baseCfg.Config,
 		Clock:               clock.WallClock(),
-		MaxOffset:           clock.MaxOffset(),
+		ToleratedOffset:     clock.ToleratedOffset(),
 		Stopper:             stopper,
 		Settings:            st,
 		Knobs:               rpcTestingKnobs,
@@ -1074,7 +1120,6 @@ func makeTenantSQLServerArgs(
 
 	// TODO(irfansharif): hook up NewGrantCoordinatorSQL.
 	var noopElasticCPUGrantCoord *admission.ElasticCPUGrantCoordinator = nil
-
 	return sqlServerArgs{
 		sqlServerOptionalKVArgs: sqlServerOptionalKVArgs{
 			nodesStatusServer: serverpb.MakeOptionalNodesStatusServer(nil),

@@ -39,6 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvisstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
@@ -499,6 +501,8 @@ type systemStatusServer struct {
 	stores             *kvserver.Stores
 	nodeLiveness       *liveness.NodeLiveness
 	spanConfigReporter spanconfig.Reporter
+	distSender         *kvcoord.DistSender
+	rangeStatsFetcher  *rangestats.Fetcher
 }
 
 // StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
@@ -606,6 +610,8 @@ func newSystemStatusServer(
 	serverIterator ServerIterator,
 	spanConfigReporter spanconfig.Reporter,
 	clock *hlc.Clock,
+	distSender *kvcoord.DistSender,
+	rangeStatsFetcher *rangestats.Fetcher,
 ) *systemStatusServer {
 	server := newStatusServer(
 		ambient,
@@ -631,6 +637,8 @@ func newSystemStatusServer(
 		stores:             stores,
 		nodeLiveness:       nodeLiveness,
 		spanConfigReporter: spanConfigReporter,
+		distSender:         distSender,
+		rangeStatsFetcher:  rangeStatsFetcher,
 	}
 }
 
@@ -737,7 +745,7 @@ func (s *systemStatusServer) EngineStats(
 		engineStatsInfo := serverpb.EngineStatsInfo{
 			StoreID:              store.Ident.StoreID,
 			TickersAndHistograms: nil,
-			EngineType:           store.Engine().Type(),
+			EngineType:           store.TODOEngine().Type(),
 		}
 
 		resp.Stats = append(resp.Stats, engineStatsInfo)
@@ -1566,13 +1574,40 @@ func (s *systemStatusServer) Nodes(
 	return resp, nil
 }
 
+// NodesUI on the tenant, delegates to the storage layer's endpoint after
+// checking local SQL permissions. The tenant connector will require
+// additional tenant capabilities in order to let the request through,
+// but the `NodesTenant` endpoint will do no additional permissioning on
+// the system-tenant side.
 func (s *statusServer) NodesUI(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponseExternal, error) {
-	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	return s.sqlServer.tenantConnect.NodesUI(ctx, req)
+	hasViewClusterMetadata := false
+	err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
+		if !grpcutil.IsAuthError(err) {
+			return nil, err
+		}
+	} else {
+		hasViewClusterMetadata = true
+	}
+
+	internalResp, err := s.sqlServer.tenantConnect.Nodes(ctx, req)
+	if err != nil {
+		return nil, serverError(ctx, err)
+	}
+
+	resp := &serverpb.NodesResponseExternal{
+		Nodes:            make([]serverpb.NodeResponse, len(internalResp.Nodes)),
+		LivenessByNodeID: internalResp.LivenessByNodeID,
+	}
+	for i, nodeStatus := range internalResp.Nodes {
+		resp.Nodes[i] = nodeStatusToResp(&nodeStatus, hasViewClusterMetadata)
+	}
+
+	return resp, nil
 }
 
 func (s *systemStatusServer) NodesUI(
@@ -3385,47 +3420,29 @@ func (s *statusServer) ListExecutionInsights(
 
 // SpanStats requests the total statistics stored on a node for a given key
 // span, which may include multiple ranges.
-func (s *systemStatusServer) SpanStats(
-	ctx context.Context, req *serverpb.SpanStatsRequest,
-) (*serverpb.SpanStatsResponse, error) {
-	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+func (s *statusServer) SpanStats(
+	ctx context.Context, req *roachpb.SpanStatsRequest,
+) (*roachpb.SpanStatsResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
-
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
+	return s.sqlServer.tenantConnect.SpanStats(ctx, req)
+}
 
-	nodeID, local, err := s.parseNodeID(req.NodeID)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+func (s *systemStatusServer) SpanStats(
+	ctx context.Context, req *roachpb.SpanStatsRequest,
+) (*roachpb.SpanStatsResponse, error) {
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+		// NB: not using serverError() here since the priv checker
+		// already returns a proper gRPC error status.
+		return nil, err
 	}
-
-	if !local {
-		status, err := s.dialNode(ctx, nodeID)
-		if err != nil {
-			return nil, serverError(ctx, err)
-		}
-		return status.SpanStats(ctx, req)
-	}
-
-	output := &serverpb.SpanStatsResponse{}
-	err = s.stores.VisitStores(func(store *kvserver.Store) error {
-		result, err := store.ComputeStatsForKeySpan(req.StartKey.Next(), req.EndKey)
-		if err != nil {
-			return err
-		}
-		output.TotalStats.Add(result.MVCC)
-		output.RangeCount += int32(result.ReplicaCount)
-		output.ApproximateDiskBytes += result.ApproximateDiskBytes
-		return nil
-	})
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-
-	return output, nil
+	return s.getSpanStatsInternal(ctx, req)
 }
 
 // Diagnostics returns an anonymized diagnostics report.
@@ -3482,7 +3499,7 @@ func (s *systemStatusServer) Stores(
 			StoreID: store.Ident.StoreID,
 		}
 
-		envStats, err := store.Engine().GetEnvStats()
+		envStats, err := store.TODOEngine().GetEnvStats()
 		if err != nil {
 			return err
 		}

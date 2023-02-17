@@ -65,6 +65,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -193,7 +194,14 @@ func restoreWithRetry(
 			return roachpb.RowCount{}, err
 		}
 
-		log.Warningf(restoreCtx, `encountered retryable error: %+v`, err)
+		// If we are draining, it is unlikely we can start a
+		// new DistSQL flow. Exit with a retryable error so
+		// that another node can pick up the job.
+		if execCtx.ExecCfg().JobRegistry.IsDraining() {
+			return roachpb.RowCount{}, jobs.MarkAsRetryJobError(errors.Wrapf(err, "job encountered retryable error on draining node"))
+		}
+
+		log.Warningf(restoreCtx, "encountered retryable error: %+v", err)
 	}
 
 	// We have exhausted retries, but we have not seen a "PermanentBulkJobError" so
@@ -284,10 +292,9 @@ func restore(
 	// which are grouped by keyrange.
 	highWaterMark := job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater
 
-	layerToBackupManifestFileIterFactory, err := getBackupManifestFileIters(restoreCtx, execCtx.ExecCfg(),
-		backupManifests, encryption, kmsEnv)
+	layerToIterFactory, err := backupinfo.GetBackupManifestIterFactories(restoreCtx, execCtx.ExecCfg().DistSQLSrv.ExternalStorage, backupManifests, encryption, kmsEnv)
 	if err != nil {
-		return emptyRowCount, err
+		return roachpb.RowCount{}, err
 	}
 
 	simpleImportSpans := useSimpleImportSpans.Get(&execCtx.ExecCfg().Settings.SV)
@@ -321,7 +328,7 @@ func restore(
 			ctx,
 			dataToRestore.getSpans(),
 			backupManifests,
-			layerToBackupManifestFileIterFactory,
+			layerToIterFactory,
 			backupLocalityMap,
 			introducedSpanFrontier,
 			highWaterMark,
@@ -496,7 +503,13 @@ func loadBackupSQLDescs(
 		return nil, backuppb.BackupManifest{}, nil, 0, err
 	}
 
-	allDescs, latestBackupManifest, err := backupinfo.LoadSQLDescsFromBackupsAtTime(backupManifests, details.EndTime)
+	layerToBackupManifestFileIterFactory, err := backupinfo.GetBackupManifestIterFactories(ctx, p.ExecCfg().DistSQLSrv.ExternalStorage,
+		backupManifests, encryption, kmsEnv)
+	if err != nil {
+		return nil, backuppb.BackupManifest{}, nil, 0, err
+	}
+
+	allDescs, latestBackupManifest, err := backupinfo.LoadSQLDescsFromBackupsAtTime(ctx, backupManifests, layerToBackupManifestFileIterFactory, details.EndTime)
 	if err != nil {
 		return nil, backuppb.BackupManifest{}, nil, 0, err
 	}
@@ -520,8 +533,8 @@ func loadBackupSQLDescs(
 			sqlDescs = append(sqlDescs, desc)
 		}
 	}
-
-	if err := maybeUpgradeDescriptors(sqlDescs, true /* skipFKsWithNoMatchingTable */); err != nil {
+	activeVersion := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
+	if err := maybeUpgradeDescriptors(activeVersion, sqlDescs, true /* skipFKsWithNoMatchingTable */); err != nil {
 		mem.Shrink(ctx, sz)
 		return nil, backuppb.BackupManifest{}, nil, 0, err
 	}
@@ -1860,7 +1873,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 			telemetry.CountBucketed("restore.speed-mbps.over10mb", mbps)
 			telemetry.CountBucketed("restore.speed-mbps.over10mb.per-node", mbps/int64(numNodes))
 		}
-		logJobCompletion(ctx, restoreJobEventType, r.job.ID(), true, nil)
+		logutil.LogJobCompletion(ctx, restoreJobEventType, r.job.ID(), true, nil, resTotal.Rows)
 	}
 	return nil
 }
@@ -2366,7 +2379,7 @@ func (r *restoreResumer) OnFailOrCancel(
 	}
 
 	details := r.job.Details().(jobspb.RestoreDetails)
-	logJobCompletion(ctx, restoreJobEventType, r.job.ID(), false, jobErr)
+	logutil.LogJobCompletion(ctx, restoreJobEventType, r.job.ID(), false, jobErr, r.restoreStats.Rows)
 
 	execCfg := execCtx.(sql.JobExecContext).ExecCfg()
 	if err := execCfg.InternalDB.Txn(ctx, func(

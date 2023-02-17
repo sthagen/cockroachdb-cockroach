@@ -16,12 +16,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -44,9 +44,12 @@ import (
 // The creation of the database is time consuming, so the caller can choose
 // whether to use a temporary or permanent location.
 func loadTestData(
-	dir string, numKeys, numBatches, batchTimeSpan, valueBytes int,
+	dirPrefix string, numKeys, numBatches, batchTimeSpan, valueBytes int,
 ) (storage.Engine, error) {
 	ctx := context.Background()
+
+	verStr := fmt.Sprintf("v%s", clusterversion.TestingBinaryVersion.String())
+	dir := fmt.Sprintf("%s_v%s_%d_%d_%d_%d", dirPrefix, verStr, numKeys, numBatches, batchTimeSpan, valueBytes)
 
 	exists := true
 	if _, err := os.Stat(dir); oserror.IsNotExist(err) {
@@ -61,12 +64,18 @@ func loadTestData(
 		return nil, err
 	}
 
+	absPath, err := filepath.Abs(dir)
+	if err != nil {
+		absPath = dir
+	}
+
 	if exists {
+		log.Infof(context.Background(), "using existing test data: %s", absPath)
 		testutils.ReadAllFiles(filepath.Join(dir, "*"))
 		return eng, nil
 	}
 
-	log.Infof(context.Background(), "creating test data: %s", dir)
+	log.Infof(context.Background(), "creating test data: %s", absPath)
 
 	// Generate the same data every time.
 	rng := rand.New(rand.NewSource(1449168817))
@@ -167,8 +176,6 @@ func runIterate(
 }
 
 func BenchmarkTimeBoundIterate(b *testing.B) {
-	skip.WithIssue(b, 95530, "bump minBinary to 22.2. Skip 22.2 mixed-version tests for future cleanup")
-
 	for _, loadFactor := range []float32{1.0, 0.5, 0.1, 0.05, 0.0} {
 		b.Run(fmt.Sprintf("LoadFactor=%.2f", loadFactor), func(b *testing.B) {
 			b.Run("NormalIterator", func(b *testing.B) {

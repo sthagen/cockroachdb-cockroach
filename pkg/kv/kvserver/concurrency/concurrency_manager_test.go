@@ -363,7 +363,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				}
 				var key string
 				d.ScanArgs(t, "key", &key)
-				strength := scanLockStrength(t, d)
+				strength := concurrency.ScanLockStrength(t, d)
 				if ok, txn := g.IsKeyLockedByConflictingTxn(roachpb.Key(key), strength); ok {
 					holder := "<nil>"
 					if txn != nil {
@@ -660,7 +660,7 @@ func newCluster() *cluster {
 		rangeDesc: &roachpb.RangeDescriptor{RangeID: 1},
 		st:        clustersettings.MakeTestingClusterSettings(),
 		manual:    manual,
-		clock:     hlc.NewClock(manual, time.Nanosecond /* maxOffset */),
+		clock:     hlc.NewClockForTesting(manual),
 
 		txnsByName:      make(map[string]*roachpb.Transaction),
 		requestsByName:  make(map[string]concurrency.Request),

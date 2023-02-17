@@ -21,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -329,6 +331,192 @@ func createIntentOnRangeDescriptor(
 	}
 }
 
+func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderDeadlock(t, "slow under deadlock")
+
+	ctx := context.Background()
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	c := NewCLITest(TestCLIParams{
+		NoServer: true,
+	})
+	defer c.Cleanup()
+
+	listenerReg := testutils.NewListenerRegistry()
+	defer listenerReg.Close()
+
+	storeReg := server.NewStickyInMemEnginesRegistry()
+	defer storeReg.CloseAllStickyInMemEngines()
+
+	// Test cluster contains 3 nodes that we would turn into a single node
+	// cluster using loss of quorum recovery. To do that, we will terminate
+	// two nodes and run recovery on remaining one. Restarting node should
+	// bring it back to healthy (but underreplicated) state.
+	// TODO(oleg): Make test run with 7 nodes to exercise cases where multiple
+	// replicas survive. Current startup and allocator behaviour would make
+	// this test flaky.
+	tc := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
+		ReusableListeners: true,
+		ServerArgs: base.TestServerArgs{
+			StoreSpecs: []base.StoreSpec{
+				{InMemory: true},
+			},
+		},
+		ServerArgsPerNode: map[int]base.TestServerArgs{
+			0: {
+				Knobs: base.TestingKnobs{
+					Server: &server.TestingKnobs{
+						StickyEngineRegistry: storeReg,
+					},
+				},
+				Listener: listenerReg.GetOrFail(t, 0),
+				StoreSpecs: []base.StoreSpec{
+					{InMemory: true, StickyInMemoryEngineID: "1"},
+				},
+			},
+		},
+	})
+	tc.Start(t)
+	s := sqlutils.MakeSQLRunner(tc.Conns[0])
+	s.Exec(t, "set cluster setting cluster.organization='remove dead replicas test'")
+	defer tc.Stopper().Stop(ctx)
+
+	// We use scratch range to test special case for pending update on the
+	// descriptor which has to be cleaned up before recovery could proceed.
+	// For that we'll ensure it is not empty and then put an intent. After
+	// recovery, we'll check that the range is still accessible for writes as
+	// normal.
+	sk := tc.ScratchRange(t)
+	require.NoError(t,
+		tc.Server(0).DB().Put(ctx, testutils.MakeKey(sk, []byte{1}), "value"),
+		"failed to write value to scratch range")
+
+	createIntentOnRangeDescriptor(ctx, t, tc, sk)
+
+	node1ID := tc.Servers[0].NodeID()
+
+	// Now that stores are prepared and replicated we can shut down cluster
+	// and perform store manipulations.
+	tc.StopServer(1)
+	tc.StopServer(2)
+
+	// Generate recovery plan and try to verify that plan file was generated and contains
+	// meaningful data. This is not strictly necessary for verifying end-to-end flow, but
+	// having assertions on generated data helps to identify which stage of pipeline broke
+	// if test fails.
+	planFile := dir + "/recovery-plan.json"
+	out, err := c.RunWithCaptureArgs(
+		[]string{
+			"debug",
+			"recover",
+			"make-plan",
+			"--confirm=y",
+			"--certs-dir=test_certs",
+			"--host=" + tc.Server(0).ServingRPCAddr(),
+			"--plan=" + planFile,
+		})
+	require.NoError(t, err, "failed to run make-plan")
+	require.Contains(t, out, fmt.Sprintf("- node n%d", node1ID),
+		"planner didn't provide correct apply instructions")
+	require.FileExists(t, planFile, "generated plan file")
+	planFileContent, err := os.ReadFile(planFile)
+	require.NoError(t, err, "test infra failed, can't open created plan file")
+	plan := loqrecoverypb.ReplicaUpdatePlan{}
+	jsonpb := protoutil.JSONPb{}
+	require.NoError(t, jsonpb.Unmarshal(planFileContent, &plan),
+		"failed to deserialize replica recovery plan")
+	require.NotEmpty(t, plan.Updates, "resulting plan contains no updates")
+
+	out, err = c.RunWithCaptureArgs(
+		[]string{
+			"debug", "recover", "apply-plan",
+			"--certs-dir=test_certs",
+			"--host=" + tc.Server(0).ServingRPCAddr(),
+			"--confirm=y", planFile,
+		})
+	require.NoError(t, err, "failed to run apply plan")
+	// Check that there were at least one mention of replica being promoted.
+	require.Contains(t, out, "updating replica", "no replica updates were recorded")
+	require.Contains(t, out, fmt.Sprintf("Plan staged. To complete recovery restart nodes n%d.", node1ID),
+		"apply plan failed to stage on expected nodes")
+
+	// Verify plan is staged on nodes
+	out, err = c.RunWithCaptureArgs(
+		[]string{
+			"debug", "recover", "verify",
+			"--certs-dir=test_certs",
+			"--host=" + tc.Server(0).ServingRPCAddr(),
+			planFile,
+		})
+	require.NoError(t, err, "failed to run verify plan")
+	require.Contains(t, out, "ERROR: loss of quorum recovery is not finished yet")
+
+	tc.StopServer(0)
+
+	// NB: If recovery is not performed, server will just hang on startup.
+	// This is caused by liveness range becoming unavailable and preventing any
+	// progress. So it is likely that test will timeout if basic workflow fails.
+	listenerReg.ReopenOrFail(t, 0)
+	require.NoError(t, tc.RestartServer(0), "restart failed")
+	s = sqlutils.MakeSQLRunner(tc.Conns[0])
+
+	// Verifying that post start cleanup performed node decommissioning that
+	// prevents old nodes from rejoining.
+	ac, err := tc.GetAdminClient(ctx, t, 0)
+	require.NoError(t, err, "failed to get admin client")
+	testutils.SucceedsSoon(t, func() error {
+		dr, err := ac.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{NodeIDs: []roachpb.NodeID{2, 3}})
+		if err != nil {
+			return err
+		}
+		for _, s := range dr.Status {
+			if s.Membership != livenesspb.MembershipStatus_DECOMMISSIONED {
+				return errors.Newf("expecting n%d to be decommissioned", s.NodeID)
+			}
+		}
+		return nil
+	})
+
+	// Validate that rangelog is updated by recovery records after cluster restarts.
+	testutils.SucceedsSoon(t, func() error {
+		r := s.QueryRow(t,
+			`select count(*) from system.rangelog where "eventType" = 'unsafe_quorum_recovery'`)
+		var recoveries int
+		r.Scan(&recoveries)
+		if recoveries != len(plan.Updates) {
+			return errors.Errorf("found %d recovery events while expecting %d", recoveries,
+				len(plan.Updates))
+		}
+		return nil
+	})
+
+	// Verify recovery complete.
+	out, err = c.RunWithCaptureArgs(
+		[]string{
+			"debug", "recover", "verify",
+			"--certs-dir=test_certs",
+			"--host=" + tc.Server(0).ServingRPCAddr(),
+			planFile,
+		})
+	require.NoError(t, err, "failed to run verify plan")
+	require.Contains(t, out, "Loss of quorum recovery is complete.")
+
+	// We were using scratch range to test cleanup of pending transaction on
+	// rangedescriptor key. We want to verify that after recovery, range is still
+	// writable e.g. recovery succeeded.
+	require.NoError(t,
+		tc.Server(0).DB().Put(ctx, testutils.MakeKey(sk, []byte{1}), "value2"),
+		"failed to write value to scratch range after recovery")
+
+	// Finally split scratch range to ensure metadata ranges are recovered.
+	_, _, err = tc.Server(0).SplitRange(testutils.MakeKey(sk, []byte{42}))
+	require.NoError(t, err, "failed to split range after recovery")
+}
+
 // TestJsonSerialization verifies that all fields serialized in JSON could be
 // read back. This specific test addresses issues where default naming scheme
 // may not work in combination with other tags correctly. e.g. repeated used
@@ -406,16 +594,18 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 	}
 
 	for _, d := range []struct {
-		name    string
-		nodes   []int
-		status  []loqrecoverypb.NodeRecoveryStatus
-		pending int
-		errors  int
-		report  []string
+		name         string
+		updatedNodes []int
+		staleLeases  []int
+		status       []loqrecoverypb.NodeRecoveryStatus
+		pending      int
+		errors       int
+		report       []string
 	}{
 		{
-			name:  "after staging",
-			nodes: []int{1, 2, 3},
+			name:         "after staging",
+			updatedNodes: []int{1, 2},
+			staleLeases:  []int{3},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, planID, empty, ""),
 				status(2, planID, empty, ""),
@@ -429,8 +619,8 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			},
 		},
 		{
-			name:  "partially applied",
-			nodes: []int{1, 2, 3},
+			name:         "partially applied",
+			updatedNodes: []int{1, 2, 3},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, planID, empty, ""),
 				status(2, empty, planID, ""),
@@ -444,8 +634,8 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			},
 		},
 		{
-			name:  "fully applied",
-			nodes: []int{1, 2, 3},
+			name:         "fully applied",
+			updatedNodes: []int{1, 2, 3},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, empty, planID, ""),
 				status(2, empty, planID, ""),
@@ -458,8 +648,8 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			},
 		},
 		{
-			name:  "staging lost no node",
-			nodes: []int{1, 2, 3},
+			name:         "staging lost no node",
+			updatedNodes: []int{1, 2, 3},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, planID, empty, ""),
 				status(3, planID, empty, ""),
@@ -473,8 +663,9 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			},
 		},
 		{
-			name:  "staging lost no plan",
-			nodes: []int{1, 2, 3},
+			name:         "staging lost no plan",
+			updatedNodes: []int{1, 2},
+			staleLeases:  []int{3},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, planID, empty, ""),
 				status(2, planID, empty, ""),
@@ -489,8 +680,8 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			},
 		},
 		{
-			name:  "partial failure",
-			nodes: []int{1, 2, 3},
+			name:         "partial failure",
+			updatedNodes: []int{1, 2, 3},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, planID, empty, ""),
 				status(2, empty, planID, "found stale replica"),
@@ -518,8 +709,8 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			},
 		},
 		{
-			name:  "wrong plan",
-			nodes: []int{1, 2},
+			name:         "wrong plan",
+			updatedNodes: []int{1, 2},
 			status: []loqrecoverypb.NodeRecoveryStatus{
 				status(1, planID, empty, ""),
 				status(2, otherPlanID, empty, ""),
@@ -540,7 +731,7 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 			}
 			// Plan will contain single replica update for each requested node.
 			rangeSeq := 1
-			for _, id := range d.nodes {
+			for _, id := range d.updatedNodes {
 				plan.Updates = append(plan.Updates, loqrecoverypb.ReplicaUpdate{
 					RangeID:      roachpb.RangeID(rangeSeq),
 					StartKey:     nil,
@@ -552,6 +743,9 @@ func TestUpdatePlanVsClusterDiff(t *testing.T) {
 					},
 					NextReplicaID: roachpb.ReplicaID(rangeSeq + 18),
 				})
+			}
+			for _, id := range d.staleLeases {
+				plan.StaleLeaseholderNodeIDs = append(plan.StaleLeaseholderNodeIDs, roachpb.NodeID(id))
 			}
 
 			diff := diffPlanWithNodeStatus(plan, d.status)

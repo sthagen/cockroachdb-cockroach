@@ -61,6 +61,8 @@ const (
 	Rows
 	// CopyIn indicates a COPY FROM statement.
 	CopyIn
+	// CopyOut indicates a COPY TO statement.
+	CopyOut
 	// Unknown indicates that the statement does not have a known
 	// return style at the time of parsing. This is not first in the
 	// enumeration because it is more convenient to have Ack as a zero
@@ -83,6 +85,12 @@ const (
 	TypeDCL
 	// TCL (Transaction Control Language) deals with a transaction within a database.
 	TypeTCL
+)
+
+const (
+	RestoreTag = "RESTORE"
+	BackupTag  = "BACKUP"
+	ImportTag  = "IMPORT"
 )
 
 // Statements represent a list of statements.
@@ -545,7 +553,7 @@ func (*Backup) StatementReturnType() StatementReturnType { return Rows }
 func (*Backup) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Backup) StatementTag() string { return "BACKUP" }
+func (*Backup) StatementTag() string { return BackupTag }
 
 func (*Backup) cclOnlyStatement() {}
 
@@ -737,6 +745,15 @@ func (*CopyFrom) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CopyFrom) StatementTag() string { return "COPY" }
+
+// StatementReturnType implements the Statement interface.
+func (*CopyTo) StatementReturnType() StatementReturnType { return CopyOut }
+
+// StatementType implements the Statement interface.
+func (*CopyTo) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CopyTo) StatementTag() string { return "COPY" }
 
 // StatementReturnType implements the Statement interface.
 func (*CreateChangefeed) StatementReturnType() StatementReturnType { return Rows }
@@ -1133,7 +1150,7 @@ func (*Import) StatementReturnType() StatementReturnType { return Rows }
 func (*Import) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Import) StatementTag() string { return "IMPORT" }
+func (*Import) StatementTag() string { return ImportTag }
 
 func (*Import) cclOnlyStatement() {}
 
@@ -1285,7 +1302,7 @@ func (*Restore) StatementReturnType() StatementReturnType { return Rows }
 func (*Restore) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Restore) StatementTag() string { return "RESTORE" }
+func (*Restore) StatementTag() string { return RestoreTag }
 
 func (*Restore) cclOnlyStatement() {}
 
@@ -2157,6 +2174,7 @@ func (n *CommentOnIndex) String() string                      { return AsString(
 func (n *CommentOnTable) String() string                      { return AsString(n) }
 func (n *CommitTransaction) String() string                   { return AsString(n) }
 func (n *CopyFrom) String() string                            { return AsString(n) }
+func (n *CopyTo) String() string                              { return AsString(n) }
 func (n *CreateChangefeed) String() string                    { return AsString(n) }
 func (n *CreateDatabase) String() string                      { return AsString(n) }
 func (n *CreateExtension) String() string                     { return AsString(n) }

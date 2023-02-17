@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -89,7 +90,8 @@ var ValueBlocksEnabled = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"storage.value_blocks.enabled",
 	"set to true to enable writing of value blocks in sstables",
-	false).WithPublic()
+	util.ConstantWithMetamorphicTestBool(
+		"storage.value_blocks.enabled", true)).WithPublic()
 
 // EngineKeyCompare compares cockroach keys, including the version (which
 // could be MVCC timestamps).
@@ -531,6 +533,12 @@ var PebbleBlockPropertyCollectors = []func() pebble.BlockPropertyCollector{
 	},
 }
 
+// MinimumSupportedFormatVersion is the version that provides features that the
+// Cockroach code relies on unconditionally (like range keys). New stores are by
+// default created with this version. It should correspond to the minimum
+// supported binary version.
+const MinimumSupportedFormatVersion = pebble.FormatPrePebblev1Marked
+
 // DefaultPebbleOptions returns the default pebble options.
 func DefaultPebbleOptions() *pebble.Options {
 	// In RocksDB, the concurrency setting corresponds to both flushes and
@@ -553,6 +561,8 @@ func DefaultPebbleOptions() *pebble.Options {
 		MemTableStopWritesThreshold: 4,
 		Merger:                      MVCCMerger,
 		BlockPropertyCollectors:     PebbleBlockPropertyCollectors,
+		// Minimum supported format.
+		FormatMajorVersion: MinimumSupportedFormatVersion,
 	}
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
@@ -741,12 +751,6 @@ type Pebble struct {
 	}
 	asyncDone sync.WaitGroup
 
-	// supportsRangeKeys is 1 if the database supports range keys. It must
-	// be accessed atomically.
-	//
-	// TODO(erikgrinaker): Remove this after 22.2 when all databases support it.
-	supportsRangeKeys int32
-
 	// closer is populated when the database is opened. The closer is associated
 	// with the filesyetem
 	closer io.Closer
@@ -871,6 +875,12 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	} else {
 		// Clone the given options so that we are free to modify them.
 		opts = cfg.Opts.Clone()
+	}
+	if opts.FormatMajorVersion < MinimumSupportedFormatVersion {
+		return nil, errors.AssertionFailedf(
+			"FormatMajorVersion is %d, should be at least %d",
+			opts.FormatMajorVersion, MinimumSupportedFormatVersion,
+		)
 	}
 
 	// pebble.Open also calls EnsureDefaults, but only after doing a clone. Call
@@ -1093,9 +1103,6 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 			return nil, err
 		}
 	}
-	if p.db.FormatMajorVersion() >= pebble.FormatRangeKeys {
-		atomic.StoreInt32(&p.supportsRangeKeys, 1)
-	}
 
 	return p, nil
 }
@@ -1262,23 +1269,18 @@ func (p *Pebble) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIt
 		return maybeWrapInUnsafeIter(iter)
 	}
 
-	iter := newPebbleIterator(p.db, opts, StandardDurability, p.SupportsRangeKeys())
+	iter := newPebbleIterator(p.db, opts, StandardDurability)
 	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Engine interface.
 func (p *Pebble) NewEngineIterator(opts IterOptions) EngineIterator {
-	return newPebbleIterator(p.db, opts, StandardDurability, p.SupportsRangeKeys())
+	return newPebbleIterator(p.db, opts, StandardDurability)
 }
 
 // ConsistentIterators implements the Engine interface.
 func (p *Pebble) ConsistentIterators() bool {
 	return false
-}
-
-// SupportsRangeKeys implements the Engine interface.
-func (p *Pebble) SupportsRangeKeys() bool {
-	return atomic.LoadInt32(&p.supportsRangeKeys) == 1
 }
 
 // PinEngineStateForIterators implements the Engine interface.
@@ -1355,7 +1357,7 @@ func (p *Pebble) ClearRawRange(start, end roachpb.Key, pointKeys, rangeKeys bool
 			return err
 		}
 	}
-	if rangeKeys && p.SupportsRangeKeys() {
+	if rangeKeys {
 		if err := p.db.RangeKeyDelete(startRaw, endRaw, pebble.Sync); err != nil {
 			return err
 		}
@@ -1475,20 +1477,12 @@ func (p *Pebble) put(key MVCCKey, value []byte) error {
 
 // PutEngineRangeKey implements the Engine interface.
 func (p *Pebble) PutEngineRangeKey(start, end roachpb.Key, suffix, value []byte) error {
-	if !p.SupportsRangeKeys() {
-		return errors.Errorf("range keys not supported by Pebble database version %s",
-			p.db.FormatMajorVersion())
-	}
 	return p.db.RangeKeySet(
 		EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix, value, pebble.Sync)
 }
 
 // ClearEngineRangeKey implements the Engine interface.
 func (p *Pebble) ClearEngineRangeKey(start, end roachpb.Key, suffix []byte) error {
-	if !p.SupportsRangeKeys() {
-		// These databases cannot contain range keys, so clearing is a noop.
-		return nil
-	}
 	return p.db.RangeKeyUnset(
 		EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix, pebble.Sync)
 }
@@ -1522,17 +1516,7 @@ var LocalTimestampsEnabled = settings.RegisterBoolSetting(
 )
 
 func shouldWriteLocalTimestamps(ctx context.Context, settings *cluster.Settings) bool {
-	if !LocalTimestampsEnabled.Get(&settings.SV) {
-		// Not enabled.
-		return false
-	}
-	ver := settings.Version.ActiveVersionOrEmpty(ctx)
-	if ver == (clusterversion.ClusterVersion{}) {
-		// Some tests fail to configure settings. In these cases, assume that it
-		// is safe to write local timestamps.
-		return true
-	}
-	return ver.IsActive(clusterversion.TODODelete_V22_2LocalTimestamps)
+	return LocalTimestampsEnabled.Get(&settings.SV)
 }
 
 // ShouldWriteLocalTimestamps implements the Writer interface.
@@ -1984,26 +1968,21 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	case !version.Less(clusterversion.ByKey(clusterversion.V23_1EnsurePebbleFormatSSTableValueBlocks)):
 		formatVers = pebble.FormatSSTableValueBlocks
 
-	case !version.Less(clusterversion.ByKey(clusterversion.TODODelete_V22_2PebbleFormatPrePebblev1Marked)):
+	case !version.Less(clusterversion.ByKey(clusterversion.V22_2)):
+		// This is the earliest supported format. The code assumes that the features
+		// provided by this format are always available.
 		formatVers = pebble.FormatPrePebblev1Marked
 
-	case !version.Less(clusterversion.ByKey(clusterversion.TODODelete_V22_2EnsurePebbleFormatVersionRangeKeys)):
-		formatVers = pebble.FormatRangeKeys
-
-	case !version.Less(clusterversion.ByKey(clusterversion.TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted)):
-		formatVers = pebble.FormatSplitUserKeysMarkedCompacted
-
 	default:
-		// Corresponds to TODODelete_V22_1.
-		formatVers = pebble.FormatSplitUserKeysMarked
+		// This should never happen in production. But we tolerate tests creating
+		// imaginary older versions; we must still use the earliest supported
+		// format.
+		formatVers = MinimumSupportedFormatVersion
 	}
 
 	if p.db.FormatMajorVersion() < formatVers {
 		if err := p.db.RatchetFormatMajorVersion(formatVers); err != nil {
 			return errors.Wrap(err, "ratcheting format major version")
-		}
-		if formatVers >= pebble.FormatRangeKeys {
-			atomic.StoreInt32(&p.supportsRangeKeys, 1)
 		}
 	}
 	return nil
@@ -2141,14 +2120,13 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		iter = &p.prefixIter
 	}
 	if iter.inuse {
-		return newPebbleIteratorByCloning(p.iter, opts, p.durability, p.SupportsRangeKeys())
+		return newPebbleIteratorByCloning(p.iter, opts, p.durability)
 	}
 
 	if iter.iter != nil {
 		iter.setOptions(opts, p.durability)
 	} else {
-		iter.initReuseOrCreate(
-			p.parent.db, p.iter, p.iterUsed, opts, p.durability, p.SupportsRangeKeys())
+		iter.initReuseOrCreate(p.parent.db, p.iter, p.iterUsed, opts, p.durability)
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
@@ -2172,14 +2150,13 @@ func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
 		iter = &p.prefixEngineIter
 	}
 	if iter.inuse {
-		return newPebbleIteratorByCloning(p.iter, opts, p.durability, p.SupportsRangeKeys())
+		return newPebbleIteratorByCloning(p.iter, opts, p.durability)
 	}
 
 	if iter.iter != nil {
 		iter.setOptions(opts, p.durability)
 	} else {
-		iter.initReuseOrCreate(
-			p.parent.db, p.iter, p.iterUsed, opts, p.durability, p.SupportsRangeKeys())
+		iter.initReuseOrCreate(p.parent.db, p.iter, p.iterUsed, opts, p.durability)
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
@@ -2195,11 +2172,6 @@ func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
 // ConsistentIterators implements the Engine interface.
 func (p *pebbleReadOnly) ConsistentIterators() bool {
 	return true
-}
-
-// SupportsRangeKeys implements the Engine interface.
-func (p *pebbleReadOnly) SupportsRangeKeys() bool {
-	return p.parent.SupportsRangeKeys()
 }
 
 // PinEngineStateForIterators implements the Engine interface.
@@ -2373,24 +2345,18 @@ func (p *pebbleSnapshot) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		return maybeWrapInUnsafeIter(iter)
 	}
 
-	iter := MVCCIterator(newPebbleIterator(
-		p.snapshot, opts, StandardDurability, p.SupportsRangeKeys()))
+	iter := MVCCIterator(newPebbleIterator(p.snapshot, opts, StandardDurability))
 	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Reader interface.
 func (p pebbleSnapshot) NewEngineIterator(opts IterOptions) EngineIterator {
-	return newPebbleIterator(p.snapshot, opts, StandardDurability, p.SupportsRangeKeys())
+	return newPebbleIterator(p.snapshot, opts, StandardDurability)
 }
 
 // ConsistentIterators implements the Reader interface.
 func (p pebbleSnapshot) ConsistentIterators() bool {
 	return true
-}
-
-// SupportsRangeKeys implements the Reader interface.
-func (p *pebbleSnapshot) SupportsRangeKeys() bool {
-	return p.parent.SupportsRangeKeys()
 }
 
 // PinEngineStateForIterators implements the Reader interface.

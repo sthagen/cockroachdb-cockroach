@@ -25,10 +25,7 @@ go_library(
 
 go_test(
     name = "kvflowcontroller_test",
-    srcs = [
-        "kvflowcontrol_token_adjustment_test.go",
-        "kvflowcontroller_simulation_test.go",
-    ],
+    srcs = ["kvflowcontrol_token_adjustment_test.go"],
     args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":kvflowcontroller"],
@@ -36,18 +33,13 @@ go_test(
         "//pkg/kv/kvserver/kvflowcontrol",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
-        "//pkg/testutils/datapathutils",
         "//pkg/util/admission/admissionpb",
-        "//pkg/util/asciitsdb",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/metric",
-        "//pkg/util/timeutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_dustin_go_humanize//:go-humanize",
-        "@com_github_guptarohit_asciigraph//:asciigraph",
-        "@com_github_mkungla_bexp_v3//:bexp",
         "@com_github_stretchr_testify//require",
     ],
 )

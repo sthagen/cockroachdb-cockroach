@@ -43,12 +43,14 @@ import {
   selectFilters,
   selectSortSetting,
   selectTransactionInsightsLoading,
+  selectTransactionInsightsMaxApiReached,
 } from "src/store/insights/transactionInsights";
 import { Dispatch } from "redux";
 import { TimeScale } from "../../timeScaleDropdown";
 import { StmtInsightsReq, TxnInsightsRequest } from "src/api";
 import { selectTimeScale } from "../../store/utils/selectors";
 import { actions as analyticsActions } from "../../store/analytics";
+import { selectIsTenant } from "../../store/uiConfig";
 
 const transactionMapStateToProps = (
   state: AppState,
@@ -63,6 +65,7 @@ const transactionMapStateToProps = (
   sortSetting: selectSortSetting(state),
   timeScale: selectTimeScale(state),
   isLoading: selectTransactionInsightsLoading(state),
+  maxSizeApiReached: selectTransactionInsightsMaxApiReached(state),
 });
 
 const statementMapStateToProps = (
@@ -80,6 +83,7 @@ const statementMapStateToProps = (
   timeScale: selectTimeScale(state),
   isLoading: selectStmtInsightsLoading(state),
   maxSizeApiReached: selectStmtInsightsMaxApiReached(state),
+  isTenant: selectIsTenant(state),
 });
 
 const TransactionDispatchProps = (

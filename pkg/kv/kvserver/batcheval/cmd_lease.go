@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/errors"
 )
 
 func newFailedLeaseTrigger(isTransfer bool) result.Result {
@@ -61,12 +63,16 @@ func evalNewLease(
 	// When returning an error from this method, must always return
 	// a newFailedLeaseTrigger() to satisfy stats.
 
+	if lease.ProposedTS == nil {
+		return newFailedLeaseTrigger(isTransfer), errors.AssertionFailedf("ProposedTS must be set")
+	}
+
 	// Ensure either an Epoch is set or Start < Expiration.
 	if (lease.Type() == roachpb.LeaseExpiration && lease.GetExpiration().LessEq(lease.Start.ToTimestamp())) ||
 		(lease.Type() == roachpb.LeaseEpoch && lease.Expiration != nil) {
 		// This amounts to a bug.
 		return newFailedLeaseTrigger(isTransfer),
-			&roachpb.LeaseRejectedError{
+			&kvpb.LeaseRejectedError{
 				Existing:  prevLease,
 				Requested: lease,
 				Message: fmt.Sprintf("illegal lease: epoch=%d, interval=[%s, %s)",
@@ -78,7 +84,7 @@ func evalNewLease(
 	desc := rec.Desc()
 	if _, ok := desc.GetReplicaDescriptor(lease.Replica.StoreID); !ok {
 		return newFailedLeaseTrigger(isTransfer),
-			&roachpb.LeaseRejectedError{
+			&kvpb.LeaseRejectedError{
 				Existing:  prevLease,
 				Requested: lease,
 				Message:   "replica not found",
@@ -90,7 +96,7 @@ func evalNewLease(
 	// succeeding.
 	if lease.Sequence != 0 {
 		return newFailedLeaseTrigger(isTransfer),
-			&roachpb.LeaseRejectedError{
+			&kvpb.LeaseRejectedError{
 				Existing:  prevLease,
 				Requested: lease,
 				Message:   "sequence number should not be set",

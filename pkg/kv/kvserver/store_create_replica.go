@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -24,7 +25,7 @@ import (
 var errRetry = errors.New("retry: orphaned replica")
 
 // getOrCreateReplica returns an existing or newly created replica with the
-// given replicaID for the given rangeID, or roachpb.RaftGroupDeletedError if
+// given replicaID for the given rangeID, or kvpb.RaftGroupDeletedError if
 // this replicaID has been deleted. A returned replica's Replica.raftMu is
 // locked, and the caller is responsible for unlocking it.
 //
@@ -47,7 +48,7 @@ var errRetry = errors.New("retry: orphaned replica")
 //   - The Replica is not being removed as seen by its Replica.mu.destroyStatus
 //   - The RangeTombstone in storage does not see this replica as removed
 //
-// If getOrCreateReplica returns roachpb.RaftGroupDeletedError, the guarantee is:
+// If getOrCreateReplica returns kvpb.RaftGroupDeletedError, the guarantee is:
 //
 //   - getOrCreateReplica will never return this replica
 //   - Store.GetReplica(rangeID) can now only return replicas with higher IDs
@@ -120,7 +121,7 @@ func (s *Store) tryGetReplica(
 	if fromReplicaIsTooOldRLocked(repl, creatingReplica) {
 		repl.mu.RUnlock()
 		repl.raftMu.Unlock()
-		return nil, roachpb.NewReplicaTooOldError(creatingReplica.ReplicaID)
+		return nil, kvpb.NewReplicaTooOldError(creatingReplica.ReplicaID)
 	}
 
 	// The current replica needs to be removed, remove it and go back around.
@@ -146,7 +147,7 @@ func (s *Store) tryGetReplica(
 		// We could silently drop this message but this way we'll inform the
 		// sender that they may no longer exist.
 		repl.raftMu.Unlock()
-		return nil, &roachpb.RaftGroupDeletedError{}
+		return nil, &kvpb.RaftGroupDeletedError{}
 	}
 	if repl.replicaID != replicaID {
 		// This case should have been caught by handleToReplicaTooOld.
@@ -251,12 +252,14 @@ func fromReplicaIsTooOldRLocked(toReplica *Replica, fromReplica *roachpb.Replica
 	return !found && fromReplica.ReplicaID < desc.NextReplicaID
 }
 
-// addToReplicasByKeyLockedReplicaRLocked adds the replica to the replicasByKey
-// btree. The replica must already be in replicasByRangeID. Returns an error if
-// a different replica with the same range ID, or an overlapping replica or
-// placeholder exists in this Store. Replica.mu must be at least read-locked.
-func (s *Store) addToReplicasByKeyLockedReplicaRLocked(repl *Replica) error {
-	desc := repl.descRLocked()
+// addToReplicasByKeyLocked adds the replica to the replicasByKey btree. The
+// replica must already be in replicasByRangeID. Returns an error if a different
+// replica with the same range ID, or an overlapping replica or placeholder
+// exists in this Store.
+//
+// The descriptor must match repl.Desc() and repl.descRLocked(). It is passed in
+// separately to allow callers both holding and not holding Replica.mu.
+func (s *Store) addToReplicasByKeyLocked(repl *Replica, desc *roachpb.RangeDescriptor) error {
 	if !desc.IsInitialized() {
 		return errors.Errorf("%s: attempted to add uninitialized replica %s", s, repl)
 	}
@@ -313,7 +316,12 @@ func (s *Store) markReplicaInitializedLockedReplLocked(ctx context.Context, r *R
 	}
 	delete(s.mu.uninitReplicas, r.RangeID)
 
-	if err := s.addToReplicasByKeyLockedReplicaRLocked(r); err != nil {
+	// NB: there is a risk that this func tries to lock an already locked r.mu
+	// while calling r.Desc() in getOverlappingKeyRangeLocked. This can only
+	// happen if r is already in replicasByKey, which must not be the case by the
+	// time we get here.
+	// TODO(pavelkalinnikov): make locking in replicasByKey less subtle.
+	if err := s.addToReplicasByKeyLocked(r, r.descRLocked()); err != nil {
 		return err
 	}
 

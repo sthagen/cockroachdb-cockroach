@@ -602,11 +602,14 @@ CREATE TABLE system.database_role_settings (
     database_id  OID NOT NULL,
     role_name    STRING NOT NULL,
     settings     STRING[] NOT NULL,
+    role_id      OID NULL,
     CONSTRAINT "primary" PRIMARY KEY (database_id, role_name),
+    UNIQUE INDEX (database_id, role_id) STORING (settings),
 		FAMILY "primary" (
 			database_id,
-      role_name,
-      settings
+			role_name,
+			settings,
+			role_id
 		)
 );`
 
@@ -744,6 +747,7 @@ CREATE TABLE system.privileges (
 	user_id OID,
 	CONSTRAINT "primary" PRIMARY KEY (username, path),
 	UNIQUE INDEX (path, user_id) STORING (privileges, grant_options),
+	UNIQUE INDEX (path, username) STORING (privileges, grant_options),
 	FAMILY "primary" (username, path, privileges, grant_options, user_id)
 );`
 
@@ -2659,14 +2663,14 @@ var (
 				{Name: "database_id", ID: 1, Type: types.Oid, Nullable: false},
 				{Name: "role_name", ID: 2, Type: types.String, Nullable: false},
 				{Name: "settings", ID: 3, Type: types.StringArray, Nullable: false},
+				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
-					Name:            "primary",
-					ID:              0,
-					ColumnNames:     []string{"database_id", "role_name", "settings"},
-					ColumnIDs:       []descpb.ColumnID{1, 2, 3},
-					DefaultColumnID: 3,
+					Name:        "primary",
+					ID:          0,
+					ColumnNames: []string{"database_id", "role_name", "settings", "role_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2678,6 +2682,18 @@ var (
 					catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
 				},
 				KeyColumnIDs: []descpb.ColumnID{1, 2},
+			},
+			descpb.IndexDescriptor{
+				Name:                "database_role_settings_database_id_role_id_key",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"database_id", "role_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{1, 4},
+				KeySuffixColumnIDs:  []descpb.ColumnID{2},
+				StoreColumnNames:    []string{"settings"},
+				StoreColumnIDs:      []descpb.ColumnID{3},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		))
 
@@ -2939,6 +2955,17 @@ var (
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{2, 5},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				StoreColumnNames:    []string{"privileges", "grant_options"},
+				StoreColumnIDs:      []descpb.ColumnID{3, 4},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:                "privileges_path_username_key",
+				ID:                  3,
+				Unique:              true,
+				KeyColumnNames:      []string{"path", "username"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{2, 1},
 				StoreColumnNames:    []string{"privileges", "grant_options"},
 				StoreColumnIDs:      []descpb.ColumnID{3, 4},
 				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,

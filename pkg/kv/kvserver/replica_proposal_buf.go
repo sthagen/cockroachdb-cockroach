@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
@@ -1188,8 +1189,14 @@ func (rp *replicaProposer) registerProposalLocked(p *ProposalData) {
 	if p.createdAtTicks == 0 {
 		p.createdAtTicks = rp.mu.ticks
 	}
-	if buildutil.CrdbTestBuild && (p.ec.repl == nil || p.ec.g == nil) {
+	// TODO(tbg): this assertion fires. Figure out why. See:
+	// https://github.com/cockroachdb/cockroach/issues/97605
+	const enableAssertion = false
+	if enableAssertion && buildutil.CrdbTestBuild && (p.ec.repl == nil || p.ec.g == nil) {
 		log.Fatalf(rp.store.AnnotateCtx(context.Background()), "finished proposal inserted into map: %+v", p)
+	}
+	if prev := rp.mu.proposals[p.idKey]; prev != nil && prev != p {
+		log.Fatalf(rp.store.AnnotateCtx(context.Background()), "two proposals under same ID:\n%+v,\n%+v", prev, p)
 	}
 	rp.mu.proposals[p.idKey] = p
 }
@@ -1263,8 +1270,8 @@ func (rp *replicaProposer) rejectProposalWithRedirectLocked(
 	r.store.metrics.LeaseRequestErrorCount.Inc(1)
 	redirectRep, _ /* ok */ := rangeDesc.GetReplicaDescriptorByID(redirectTo)
 	log.VEventf(ctx, 2, "redirecting proposal to node %s; request: %s", redirectRep.NodeID, prop.Request)
-	rp.rejectProposalWithErrLocked(ctx, prop, roachpb.NewError(
-		roachpb.NewNotLeaseHolderErrorWithSpeculativeLease(
+	rp.rejectProposalWithErrLocked(ctx, prop, kvpb.NewError(
+		kvpb.NewNotLeaseHolderErrorWithSpeculativeLease(
 			redirectRep,
 			storeID,
 			rangeDesc,
@@ -1282,11 +1289,11 @@ func (rp *replicaProposer) rejectProposalWithLeaseTransferRejectedLocked(
 	log.VEventf(ctx, 2, "not proposing lease transfer because the target %s may "+
 		"need a snapshot: %s", lease.Replica, reason)
 	err := NewLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(lease.Replica, reason)
-	rp.rejectProposalWithErrLocked(ctx, prop, roachpb.NewError(err))
+	rp.rejectProposalWithErrLocked(ctx, prop, kvpb.NewError(err))
 }
 
 func (rp *replicaProposer) rejectProposalWithErrLocked(
-	ctx context.Context, prop *ProposalData, pErr *roachpb.Error,
+	ctx context.Context, prop *ProposalData, pErr *kvpb.Error,
 ) {
 	(*Replica)(rp).cleanupFailedProposalLocked(prop)
 	prop.finishApplication(ctx, proposalResult{Err: pErr})

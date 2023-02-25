@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -239,7 +240,7 @@ CREATE TABLE t.test (k INT);
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
 	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-	cdd, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, evalCtx)
+	cdd, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, evalCtx, tree.ColumnDefaultExprInAddColumn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,10 +548,10 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(_ context.Context, req *roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 					if atomic.LoadInt64(&stallAtomic) == 1 {
 						if req.IsSingleRequest() {
-							scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
+							scan, ok := req.Requests[0].GetInner().(*kvpb.ScanRequest)
 							if ok && getTableSpan().ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
 								t.Logf("stalling on scan at %s and waiting for test to unblock...", scan.Key)
 								<-unblock
@@ -911,7 +912,38 @@ func TestTxnContentionEventsTable(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	conn := tc.ServerConn(0)
 	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	testTxnContentionEventsTableHelper(t, ctx, conn, sqlDB)
+}
 
+func TestTxnContentionEventsTableMultiTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				// Test is designed to run with explicit tenants. No need to
+				// implicitly create a tenant.
+				DisableDefaultTestTenant: true,
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+	_, tSQL := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
+		TenantID: roachpb.MustMakeTenantID(10),
+	})
+
+	conn, err := tSQL.Conn(ctx)
+	require.NoError(t, err)
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+	defer tSQL.Close()
+
+	testTxnContentionEventsTableHelper(t, ctx, tSQL, sqlDB)
+}
+
+func testTxnContentionEventsTableHelper(
+	t *testing.T, ctx context.Context, conn *gosql.DB, sqlDB *sqlutils.SQLRunner,
+) {
 	sqlDB.Exec(
 		t,
 		`SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = false;`)
@@ -976,8 +1008,8 @@ func TestTxnContentionEventsTable(t *testing.T) {
 	// This ensures the event is the one caused in the test and not by some other
 	// internal workflow.
 	testutils.SucceedsWithin(t, func() error {
-		rows, errVerify := conn.QueryContext(ctx, `SELECT 
-			blocking_txn_id, 
+		rows, errVerify := conn.QueryContext(ctx, `SELECT
+			blocking_txn_id,
 			waiting_txn_id,
 			waiting_stmt_id,
 			encode(
@@ -988,14 +1020,14 @@ func TestTxnContentionEventsTable(t *testing.T) {
 			schema_name,
 			table_name,
 			index_name
-			FROM crdb_internal.transaction_contention_events tce 
-			inner join ( 
+			FROM crdb_internal.transaction_contention_events tce
+			inner join (
 			select
       fingerprint_id,
-			transaction_fingerprint_id, 
-			metadata->'query' as query 
-			from crdb_internal.statement_statistics t 
-			where metadata->>'query' like 'UPDATE t SET %') stats 
+			transaction_fingerprint_id,
+			metadata->'query' as query
+			from crdb_internal.statement_statistics t
+			where metadata->>'query' like 'UPDATE t SET %') stats
 			on stats.transaction_fingerprint_id = tce.waiting_txn_fingerprint_id
 			  and stats.fingerprint_id = tce.waiting_stmt_fingerprint_id`)
 		if errVerify != nil {
@@ -1187,7 +1219,7 @@ func TestInternalSystemJobsTableMirrorsSystemJobsTable(t *testing.T) {
 	res := tdb.QueryStr(t, "SELECT * FROM system.jobs ORDER BY id")
 	tdb.CheckQueryResults(t, `SELECT * FROM crdb_internal.system_jobs ORDER BY id`, res)
 	tdb.CheckQueryResults(t, `
-			SELECT id, status, created, payload, progress, created_by_type, created_by_id, claim_session_id, 
+			SELECT id, status, created, payload, progress, created_by_type, created_by_id, claim_session_id,
              claim_instance_id, num_runs, last_run, job_type
 			FROM crdb_internal.system_jobs ORDER BY id`,
 		res,

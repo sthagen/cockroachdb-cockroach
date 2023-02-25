@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -25,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -182,7 +182,7 @@ func (sq *splitQueue) shouldQueue(
 		repl.GetMaxBytes(), repl.shouldBackpressureWrites(), confReader)
 
 	if !shouldQ && repl.SplitByLoadEnabled() {
-		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(ctx, timeutil.Now()); splitKey != nil {
+		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(ctx, repl.Clock().PhysicalTime()); splitKey != nil {
 			shouldQ, priority = true, 1.0 // default priority
 		}
 	}
@@ -204,7 +204,7 @@ func (sq *splitQueue) process(
 	ctx context.Context, r *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
 	processed, err = sq.processAttempt(ctx, r, confReader)
-	if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
+	if errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 		// ConditionFailedErrors are an expected outcome for range split
 		// attempts because splits can race with other descriptor modifications.
 		// On seeing a ConditionFailedError, don't return an error and enqueue
@@ -225,8 +225,8 @@ func (sq *splitQueue) processAttempt(
 	if splitKey := confReader.ComputeSplitKey(ctx, desc.StartKey, desc.EndKey); splitKey != nil {
 		if _, err := r.adminSplitWithDescriptor(
 			ctx,
-			roachpb.AdminSplitRequest{
-				RequestHeader: roachpb.RequestHeader{
+			kvpb.AdminSplitRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: splitKey.AsRawKey(),
 				},
 				SplitKey:       splitKey.AsRawKey(),
@@ -250,7 +250,7 @@ func (sq *splitQueue) processAttempt(
 	if maxBytes > 0 && size > maxBytes {
 		if _, err := r.adminSplitWithDescriptor(
 			ctx,
-			roachpb.AdminSplitRequest{},
+			kvpb.AdminSplitRequest{},
 			desc,
 			false, /* delayable */
 			fmt.Sprintf("%s above threshold size %s", humanizeutil.IBytes(size), humanizeutil.IBytes(maxBytes)),
@@ -261,19 +261,20 @@ func (sq *splitQueue) processAttempt(
 		return true, nil
 	}
 
-	now := timeutil.Now()
-	if splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(ctx, now); splitByLoadKey != nil {
+	now := r.Clock().PhysicalTime()
+	splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(ctx, now)
+	if splitByLoadKey != nil {
 		loadStats := r.loadStats.Stats()
 		batchHandledQPS := loadStats.QueriesPerSecond
 		raftAppliedQPS := loadStats.WriteKeysPerSecond
-		lastSplitStat := r.loadBasedSplitter.LastStat(ctx, now)
-		splitObj := sq.store.splitConfig.SplitObjective()
+		lbSplitSnap := r.loadBasedSplitter.Snapshot(ctx, now)
+		splitObj := lbSplitSnap.SplitObjective
 
 		reason := fmt.Sprintf(
 			"load at key %s (%s %s, %.2f batches/sec, %.2f raft mutations/sec)",
 			splitByLoadKey,
 			splitObj,
-			splitObj.Format(lastSplitStat),
+			splitObj.Format(lbSplitSnap.Last),
 			batchHandledQPS,
 			raftAppliedQPS,
 		)
@@ -291,8 +292,8 @@ func (sq *splitQueue) processAttempt(
 		}
 		if _, pErr := r.adminSplitWithDescriptor(
 			ctx,
-			roachpb.AdminSplitRequest{
-				RequestHeader: roachpb.RequestHeader{
+			kvpb.AdminSplitRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: splitByLoadKey,
 				},
 				SplitKey:       splitByLoadKey,
@@ -312,6 +313,7 @@ func (sq *splitQueue) processAttempt(
 		r.loadBasedSplitter.Reset(sq.store.Clock().PhysicalTime())
 		return true, nil
 	}
+
 	return false, nil
 }
 

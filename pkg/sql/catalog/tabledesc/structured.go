@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -363,6 +364,71 @@ func (desc *wrapper) GetAllReferencedTypeIDs(
 	}
 
 	return ids.Ordered(), referencedInColumns, nil
+}
+
+// GetAllReferencedFunctionIDs implements the TableDescriptor interface.
+func (desc *wrapper) GetAllReferencedFunctionIDs() (catalog.DescriptorIDSet, error) {
+	var ret catalog.DescriptorIDSet
+	for _, c := range desc.AllConstraints() {
+		ids, err := desc.GetAllReferencedFunctionIDsInConstraint(c.GetConstraintID())
+		if err != nil {
+			return catalog.DescriptorIDSet{}, err
+		}
+		ret = ret.Union(ids)
+	}
+	for _, c := range desc.AllColumns() {
+		for _, id := range c.ColumnDesc().UsesFunctionIds {
+			ret.Add(id)
+		}
+	}
+	// TODO(chengxiong): add logic to extract references from indexes when UDFs
+	// are allowed in them.
+	return ret.Union(catalog.MakeDescriptorIDSet(desc.DependsOnFunctions...)), nil
+}
+
+// GetAllReferencedFunctionIDsInConstraint implements the TableDescriptor
+// interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInConstraint(
+	cstID descpb.ConstraintID,
+) (fnIDs catalog.DescriptorIDSet, err error) {
+	c := catalog.FindConstraintByID(desc, cstID)
+	ck := c.AsCheck()
+	if ck == nil {
+		return catalog.DescriptorIDSet{}, nil
+	}
+	ret, err := schemaexpr.GetUDFIDsFromExprStr(ck.GetExpr())
+	if err != nil {
+		return catalog.DescriptorIDSet{}, err
+	}
+	return ret, nil
+}
+
+// GetAllReferencedFunctionIDsInColumnExprs implements the TableDescriptor
+// interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInColumnExprs(
+	colID descpb.ColumnID,
+) (fnIDs catalog.DescriptorIDSet, err error) {
+	col := catalog.FindColumnByID(desc, colID)
+	if col == nil {
+		return catalog.DescriptorIDSet{}, nil
+	}
+
+	var ret catalog.DescriptorIDSet
+	// TODO(chengxiong): add support for computed columns when UDFs are allowed in
+	// them.
+	if !col.IsComputed() {
+		if col.HasDefault() {
+			ids, err := schemaexpr.GetUDFIDsFromExprStr(col.GetDefaultExpr())
+			if err != nil {
+				return catalog.DescriptorIDSet{}, err
+			}
+			ret = ret.Union(ids)
+		}
+		// TODO(chengxiong): add support for ON UPDATE expressions when UDFs are
+		// allowed in them.
+	}
+
+	return ret, nil
 }
 
 // getAllReferencedTypesInTableColumns returns a map of all user defined
@@ -1177,7 +1243,9 @@ func (desc *Mutable) FindActiveOrNewColumnByName(name tree.Name) (catalog.Column
 // DropConstraint drops a constraint, either by removing it from the table
 // descriptor or by queuing a mutation for a schema change.
 func (desc *Mutable) DropConstraint(
-	constraint catalog.Constraint, removeFKBackRef func(catalog.ForeignKeyConstraint) error,
+	constraint catalog.Constraint,
+	removeFKBackRef func(catalog.ForeignKeyConstraint) error,
+	removeFnBackRef func(*descpb.TableDescriptor_CheckConstraint) error,
 ) error {
 	if u := constraint.AsUniqueWithIndex(); u != nil {
 		if u.Primary() {
@@ -1227,6 +1295,9 @@ func (desc *Mutable) DropConstraint(
 				// unless the cluster is fully upgraded to 19.2, for backward
 				// compatibility.
 				if ck.IsConstraintUnvalidated() {
+					if err := removeFnBackRef(c); err != nil {
+						return err
+					}
 					desc.Checks = append(desc.Checks[:i], desc.Checks[i+1:]...)
 					return nil
 				}

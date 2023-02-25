@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -117,7 +118,7 @@ func TestSSLEnforcement(t *testing.T) {
 	plainHTTPCfg.Insecure = true
 	insecureContext := newRPCContext(plainHTTPCfg)
 
-	kvGet := &roachpb.GetRequest{}
+	kvGet := &kvpb.GetRequest{}
 	kvGet.Key = roachpb.Key("/")
 
 	for _, tc := range []struct {
@@ -570,6 +571,31 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	}
 }
 
+func TestLogoutClearsCookies(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	ts := s.(*TestServer)
+
+	// Log in.
+	authHTTPClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName(), true)
+	require.NoError(t, err)
+
+	// Log out.
+	resp, err := authHTTPClient.Get(ts.AdminURL() + logoutPath)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	cookies := resp.Cookies()
+	cNames := make([]string, len(cookies))
+	for i, c := range cookies {
+		require.Equal(t, "", c.Value)
+		cNames[i] = c.Name
+	}
+	require.ElementsMatch(t, cNames, []string{SessionCookieName, MultitenantSessionCookieName, TenantSelectCookieName})
+}
+
 func TestLogout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -758,7 +784,7 @@ func TestGRPCAuthentication(t *testing.T) {
 			return err
 		}},
 		{"internal", func(ctx context.Context, conn *grpc.ClientConn) error {
-			_, err := roachpb.NewInternalClient(conn).Batch(ctx, &roachpb.BatchRequest{})
+			_, err := kvpb.NewInternalClient(conn).Batch(ctx, &kvpb.BatchRequest{})
 			return err
 		}},
 		{"perReplica", func(ctx context.Context, conn *grpc.ClientConn) error {

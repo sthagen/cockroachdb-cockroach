@@ -61,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
@@ -1344,7 +1345,7 @@ func checkInProgressBackupRestore(
 	knobs := base.TestingKnobs{
 		DistSQL: &execinfra.TestingKnobs{
 			BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
-				RunAfterExportingSpanEntry: func(_ context.Context, res *roachpb.ExportResponse) {
+				RunAfterExportingSpanEntry: func(_ context.Context, res *kvpb.ExportResponse) {
 					<-allowResponse
 					// If ResumeSpan is set to nil, it means that we have completed
 					// exporting a span and the job will update its fraction progressed.
@@ -3512,7 +3513,7 @@ func TestBackupTenantsWithRevisionHistory(t *testing.T) {
 	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TENANT 10 TO 'nodelocal://0/foo' WITH revision_history`)
 	require.Contains(t, fmt.Sprint(err), msg)
 
-	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TO 'nodelocal://0/bar' WITH revision_history`)
+	_, err = sqlDB.DB.ExecContext(ctx, `BACKUP TO 'nodelocal://0/bar' WITH revision_history, include_all_secondary_tenants`)
 	require.Contains(t, fmt.Sprint(err), msg)
 }
 
@@ -3887,9 +3888,9 @@ func TestRestoreAsOfSystemTimeGCBounds(t *testing.T) {
 	const dir = "nodelocal://0/"
 	preGC := eval.TimestampToDecimalDatum(tc.Server(0).Clock().Now()).String()
 
-	gcr := roachpb.GCRequest{
+	gcr := kvpb.GCRequest{
 		// Bogus span to make it a valid request.
-		RequestHeader: roachpb.RequestHeader{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    keys.SystemSQLCodec.TablePrefix(bootstrap.TestingUserDescID(0)),
 			EndKey: keys.MaxKey,
 		},
@@ -5311,7 +5312,7 @@ func TestBackupRestoreSequencesInViews(t *testing.T) {
 		sqlDB.CheckQueryResults(t, `SELECT * FROM d.v`, [][]string{{"2"}})
 		sqlDB.CheckQueryResults(t, `SHOW CREATE VIEW d.v`, [][]string{{
 			"d.public.v", "CREATE VIEW public.v (\n\tk\n) AS " +
-				"SELECT k FROM (SELECT nextval('public.s2'::REGCLASS) AS k)",
+				"SELECT k FROM (SELECT nextval('public.s2'::REGCLASS) AS k) AS \"?subquery1?\"",
 		}})
 
 		// Test that references are still tracked.
@@ -5337,7 +5338,7 @@ func TestBackupRestoreSequencesInViews(t *testing.T) {
 		sqlDB.Exec(t, `RESTORE TABLE s, v FROM 'nodelocal://0/test/'`)
 		sqlDB.CheckQueryResults(t, `SHOW CREATE VIEW d.v`, [][]string{{
 			"d.public.v", "CREATE VIEW public.v (\n\tk\n) AS " +
-				"(SELECT k FROM (SELECT nextval('public.s'::REGCLASS) AS k))",
+				"(SELECT k FROM (SELECT nextval('public.s'::REGCLASS) AS k) AS \"?subquery1?\")",
 		}})
 
 		// Check that v is not corrupted.
@@ -5347,7 +5348,7 @@ func TestBackupRestoreSequencesInViews(t *testing.T) {
 		sqlDB.Exec(t, `ALTER SEQUENCE s RENAME TO s2`)
 		sqlDB.CheckQueryResults(t, `SHOW CREATE VIEW d.v`, [][]string{{
 			"d.public.v", "CREATE VIEW public.v (\n\tk\n) AS " +
-				"(SELECT k FROM (SELECT nextval('public.s2'::REGCLASS) AS k))",
+				"(SELECT k FROM (SELECT nextval('public.s2'::REGCLASS) AS k) AS \"?subquery1?\")",
 		}})
 		sqlDB.CheckQueryResults(t, `SELECT * FROM v`, [][]string{{"2"}})
 
@@ -6249,7 +6250,7 @@ func TestRestoreErrorPropagates(t *testing.T) {
 	jobsTableKey := keys.SystemSQLCodec.TablePrefix(uint32(systemschema.JobsTable.GetID()))
 	var shouldFail, failures int64
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 			// Intercept Put and ConditionalPut requests to the jobs table
 			// and, if shouldFail is positive, increment failures and return an
 			// injected error.
@@ -6259,10 +6260,10 @@ func TestRestoreErrorPropagates(t *testing.T) {
 			for _, ru := range ba.Requests {
 				r := ru.GetInner()
 				switch r.(type) {
-				case *roachpb.ConditionalPutRequest, *roachpb.PutRequest:
+				case *kvpb.ConditionalPutRequest, *kvpb.PutRequest:
 					key := r.Header().Key
 					if bytes.HasPrefix(key, jobsTableKey) && atomic.LoadInt64(&shouldFail) > 0 {
-						return roachpb.NewError(errors.Errorf("boom %d", atomic.AddInt64(&failures, 1)))
+						return kvpb.NewError(errors.Errorf("boom %d", atomic.AddInt64(&failures, 1)))
 					}
 				}
 			}
@@ -6370,16 +6371,16 @@ func TestPaginatedBackupTenant(t *testing.T) {
 
 	// Check if export request is from a lease for a descriptor to avoid picking
 	// up on wrong export requests
-	isLeasingExportRequest := func(r *roachpb.ExportRequest) bool {
+	isLeasingExportRequest := func(r *kvpb.ExportRequest) bool {
 		_, tenantID, _ := keys.DecodeTenantPrefix(r.Key)
 		codec := keys.MakeSQLCodec(tenantID)
 		return bytes.HasPrefix(r.Key, codec.DescMetadataPrefix()) &&
 			r.EndKey.Equal(r.Key.PrefixEnd())
 	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, request *roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 			for _, ru := range request.Requests {
-				if exportRequest, ok := ru.GetInner().(*roachpb.ExportRequest); ok &&
+				if exportRequest, ok := ru.GetInner().(*kvpb.ExportRequest); ok &&
 					!isLeasingExportRequest(exportRequest) {
 
 					mu.Lock()
@@ -6395,11 +6396,11 @@ func TestPaginatedBackupTenant(t *testing.T) {
 			}
 			return nil
 		},
-		TestingResponseFilter: func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+		TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 			for i, ru := range br.Responses {
-				if exportRequest, ok := ba.Requests[i].GetInner().(*roachpb.ExportRequest); ok &&
+				if exportRequest, ok := ba.Requests[i].GetInner().(*kvpb.ExportRequest); ok &&
 					!isLeasingExportRequest(exportRequest) {
-					exportResponse := ru.GetInner().(*roachpb.ExportResponse)
+					exportResponse := ru.GetInner().(*kvpb.ExportResponse)
 					// Every ExportResponse should have a single SST when running backup
 					// within a tenant.
 					require.Equal(t, 1, len(exportResponse.Files))
@@ -6601,7 +6602,7 @@ func TestBackupRestoreInsideTenant(t *testing.T) {
 		httpAddr, httpServerCleanup := makeInsecureHTTPServer(t)
 		defer httpServerCleanup()
 
-		systemDB.Exec(t, `BACKUP TO $1`, httpAddr)
+		systemDB.Exec(t, `BACKUP TO $1 WITH include_all_secondary_tenants`, httpAddr)
 
 		tenant20C2, cleanupT20C2 := makeTenant(srv2, 20)
 		defer cleanupT20C2()
@@ -6611,7 +6612,7 @@ func TestBackupRestoreInsideTenant(t *testing.T) {
 				// This is disallowed because the cluster restore includes other
 				// tenants, which can't be restored inside a tenant.
 				tenant20C2.ExpectErr(t, `only the system tenant can restore other tenants`,
-					`RESTORE FROM $1`, httpAddr)
+					`RESTORE FROM $1 WITH include_all_secondary_tenants`, httpAddr)
 			})
 
 			t.Run("with-no-tenant", func(t *testing.T) {
@@ -6671,13 +6672,13 @@ func TestBackupRestoreTenantSettings(t *testing.T) {
 	systemDB.Exec(t, `BACKUP TO $1`, backup2HttpAddr)
 
 	t.Run("cluster-restore-into-tenant-with-tenant-settings-succeeds", func(t *testing.T) {
-		tenant2C2.Exec(t, `RESTORE FROM $1`, backup2HttpAddr)
+		tenant2C2.Exec(t, `RESTORE FROM $1 WITH include_all_secondary_tenants`, backup2HttpAddr)
 	})
 
 	_, systemDB2, cleanupDB2 := backupRestoreTestSetupEmpty(t, singleNode, dir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupDB2()
 	t.Run("cluster-restore-into-cluster-with-tenant-settings-succeeds", func(t *testing.T) {
-		systemDB2.Exec(t, `RESTORE FROM $1`, backup2HttpAddr)
+		systemDB2.Exec(t, `RESTORE FROM $1 WITH include_all_secondary_tenants`, backup2HttpAddr)
 		systemDB2.CheckQueryResults(t, `SELECT * FROM system.tenant_settings`, systemDB.QueryStr(t, `SELECT * FROM system.tenant_settings`))
 	})
 }
@@ -6780,7 +6781,7 @@ func TestBackupRestoreInsideMultiPodTenant(t *testing.T) {
 		httpAddr, httpServerCleanup := makeInsecureHTTPServer(t)
 		defer httpServerCleanup()
 
-		systemDB.Exec(t, `BACKUP TO $1`, httpAddr)
+		systemDB.Exec(t, `BACKUP TO $1 WITH include_all_secondary_tenants`, httpAddr)
 
 		tenant20C2, cleanupT20C2 := makeTenant(srv2, 20, false)
 		defer cleanupT20C2()
@@ -6790,7 +6791,7 @@ func TestBackupRestoreInsideMultiPodTenant(t *testing.T) {
 				// This is disallowed because the cluster restore includes other
 				// tenants, which can't be restored inside a tenant.
 				tenant20C2.ExpectErr(t, `only the system tenant can restore other tenants`,
-					`RESTORE FROM $1`, httpAddr)
+					`RESTORE FROM $1 WITH include_all_secondary_tenants`, httpAddr)
 			})
 
 			t.Run("with-no-tenant", func(t *testing.T) {
@@ -6885,12 +6886,12 @@ func TestBackupRestoreTenant(t *testing.T) {
 	// BACKUP tenant 10 at ts1, before they created bar2.
 	systemDB.Exec(t, `BACKUP TENANT 10 TO 'nodelocal://1/t10' AS OF SYSTEM TIME `+ts1)
 	// Also create a full cluster backup. It should contain the tenant.
-	systemDB.Exec(t, `BACKUP TO 'nodelocal://1/clusterwide' AS OF SYSTEM TIME `+ts1)
+	systemDB.Exec(t, fmt.Sprintf("BACKUP TO 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s WITH include_all_secondary_tenants", ts1))
 
 	// Incrementally backup tenant 10 again, capturing up to ts2.
 	systemDB.Exec(t, `BACKUP TENANT 10 TO 'nodelocal://1/t10' AS OF SYSTEM TIME `+ts2)
 	// Run full cluster backup incrementally to ts2 as well.
-	systemDB.Exec(t, `BACKUP TO 'nodelocal://1/clusterwide' AS OF SYSTEM TIME `+ts2)
+	systemDB.Exec(t, fmt.Sprintf("BACKUP TO 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s WITH include_all_secondary_tenants", ts2))
 
 	systemDB.Exec(t, `BACKUP TENANT 11 TO 'nodelocal://1/t11'`)
 	systemDB.Exec(t, `BACKUP TENANT 20 TO 'nodelocal://1/t20'`)
@@ -7151,7 +7152,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 					`{"capabilities": {}, "deprecatedId": "1"}`,
 				},
 			})
-		restoreDB.Exec(t, `RESTORE FROM 'nodelocal://1/clusterwide'`)
+		restoreDB.Exec(t, `RESTORE FROM 'nodelocal://1/clusterwide' WITH include_all_secondary_tenants`)
 		restoreDB.CheckQueryResults(t,
 			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
 			[][]string{
@@ -7325,10 +7326,10 @@ func TestClientDisconnect(t *testing.T) {
 					blockBackupOrRestore(ctx)
 				}}},
 				Store: &kvserver.StoreTestingKnobs{
-					TestingResponseFilter: func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+					TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 						for _, ru := range br.Responses {
 							switch ru.GetInner().(type) {
-							case *roachpb.ExportResponse:
+							case *kvpb.ExportResponse:
 								blockBackupOrRestore(ctx)
 							}
 						}
@@ -8834,8 +8835,8 @@ DROP INDEX idx_3;
 		// descriptor.
 		var b kv.Batch
 		descriptorTableSpan := makeTableSpan(codec, keys.DescriptorTableID)
-		b.AddRawRequest(&roachpb.RevertRangeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		b.AddRawRequest(&kvpb.RevertRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    descriptorTableSpan.Key,
 				EndKey: descriptorTableSpan.EndKey,
 			},
@@ -9544,7 +9545,7 @@ func TestProtectRestoreTargets(t *testing.T) {
 			MustMakeTenantID(10)})
 		require.NoError(t, err)
 	}
-	sqlDB.Exec(t, `BACKUP INTO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP INTO $1 WITH include_all_secondary_tenants`, localFoo)
 
 	for _, subtest := range []struct {
 		name        string

@@ -14,6 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/stretchr/testify/require"
@@ -102,20 +104,17 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	}
 
 	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All())
-	mvt.InMixedVersion("run backup", func(l *logger.Logger, db *gosql.DB) error {
+	mvt.InMixedVersion("run backup", func(l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
 		// Verify that backups can be created in various configurations. This is
 		// important to test because changes in system tables might cause backups to
 		// fail in mixed-version clusters.
 		dest := fmt.Sprintf("nodelocal://0/%d", timeutil.Now().UnixNano())
-		l.Printf("writing backup to %s", dest)
-		_, err := db.ExecContext(ctx, `BACKUP TO $1`, dest)
-		return err
+		return h.Exec(rng, `BACKUP TO $1`, dest)
 	})
-	mvt.InMixedVersion("test features", func(l *logger.Logger, db *gosql.DB) error {
+	mvt.InMixedVersion("test features", func(l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
 		for _, featureTest := range versionUpgradeTestFeatures {
 			l.Printf("running feature test %q", featureTest.name)
-			_, err := db.ExecContext(ctx, featureTest.statement)
-			if err != nil {
+			if err := h.Exec(rng, featureTest.statement); err != nil {
 				l.Printf("%q: ERROR (%s)", featureTest.name, err)
 				return err
 			}
@@ -124,7 +123,7 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 		return nil
 	})
-	mvt.AfterUpgradeFinalized("check if GC TTL is pinned", func(l *logger.Logger, db *gosql.DB) error {
+	mvt.AfterUpgradeFinalized("check if GC TTL is pinned", func(l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
 		// TODO(irfansharif): This can be removed when the predecessor version
 		// in this test is v23.1, where the default is 4h. This test was only to
 		// make sure that existing clusters that upgrade to 23.1 retained their
@@ -138,7 +137,7 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	WHERE target = 'RANGE default'
 	LIMIT 1
 `
-		if err := db.QueryRowContext(ctx, query).Scan(&ttlSeconds); err != nil {
+		if err := h.QueryRow(rng, query).Scan(&ttlSeconds); err != nil {
 			return fmt.Errorf("error querying GC TTL: %w", err)
 		}
 		expectedTTL := 24 * 60 * 60 // NB: 24h is what's used in the fixture
@@ -402,6 +401,8 @@ func makeVersionFixtureAndFatal(
 			// manually, it's necessary for roachprod created clusters. See
 			// #54761.
 			c.Run(ctx, c.Node(1), "cp", "{store-dir}/cluster-bootstrapped", "{store-dir}/"+name)
+			// Similar to the above - newer versions require the min version file to open a store.
+			c.Run(ctx, c.Node(1), "cp", fmt.Sprintf("{store-dir}/%s", storage.MinVersionFilename), "{store-dir}/"+name)
 			c.Run(ctx, c.All(), "tar", "-C", "{store-dir}/"+name, "-czf", "{log-dir}/"+name+".tgz", ".")
 			t.Fatalf(`successfully created checkpoints; failing test on purpose.
 

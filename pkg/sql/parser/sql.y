@@ -921,7 +921,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 
 %token <str> IDENTITY
 %token <str> IF IFERROR IFNULL IGNORE_FOREIGN_KEYS ILIKE IMMEDIATE IMMUTABLE IMPORT IN INCLUDE
-%token <str> INCLUDING INCREMENT INCREMENTAL INCREMENTAL_LOCATION
+%token <str> INCLUDING INCLUDE_ALL_SECONDARY_TENANTS INCREMENT INCREMENTAL INCREMENTAL_LOCATION
 %token <str> INET INET_CONTAINED_BY_OR_EQUALS
 %token <str> INET_CONTAINS_OR_EQUALS INDEX INDEXES INHERITS INJECT INITIALLY
 %token <str> INDEX_BEFORE_PAREN INDEX_BEFORE_NAME_THEN_PAREN INDEX_AFTER_ORDER_BY_BEFORE_AT
@@ -969,7 +969,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %token <str> SEARCH SECOND SECONDARY SECURITY SELECT SEQUENCE SEQUENCES
 %token <str> SERIALIZABLE SERVER SERVICE SESSION SESSIONS SESSION_USER SET SETOF SETS SETTING SETTINGS
 %token <str> SHARE SHARED SHOW SIMILAR SIMPLE SKIP SKIP_LOCALITIES_CHECK SKIP_MISSING_FOREIGN_KEYS
-%token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
+%token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SKIP_MISSING_UDFS SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
 %token <str> SQLLOGIN
 %token <str> STABLE START STATE STATISTICS STATUS STDIN STDOUT STOP STREAM STRICT STRING STORAGE STORE STORED STORING SUBSTRING SUPER
 %token <str> SUPPORT SURVIVE SURVIVAL SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION STATEMENTS
@@ -2070,7 +2070,7 @@ alter_database_primary_region_stmt:
   }
 
 alter_database_add_super_region:
-  ALTER DATABASE database_name ADD SUPER REGION name VALUES name_list
+  ALTER DATABASE database_name ADD SUPER REGION region_name VALUES region_name_list
   {
     $$.val = &tree.AlterDatabaseAddSuperRegion{
       DatabaseName: tree.Name($3),
@@ -2080,7 +2080,7 @@ alter_database_add_super_region:
   }
 
 alter_database_drop_super_region:
-  ALTER DATABASE database_name DROP SUPER REGION name
+  ALTER DATABASE database_name DROP SUPER REGION region_name
   {
     $$.val = &tree.AlterDatabaseDropSuperRegion{
       DatabaseName: tree.Name($3),
@@ -2089,7 +2089,7 @@ alter_database_drop_super_region:
   }
 
 alter_database_alter_super_region:
-  ALTER DATABASE database_name ALTER SUPER REGION name VALUES name_list
+  ALTER DATABASE database_name ALTER SUPER REGION region_name VALUES region_name_list
   {
     $$.val = &tree.AlterDatabaseAlterSuperRegion{
       DatabaseName: tree.Name($3),
@@ -3125,6 +3125,7 @@ opt_clear_data:
 //    kms="[kms_provider]://[kms_host]/[master_key_identifier]?[parameters]" : encrypt backups using KMS
 //    detached: execute backup job asynchronously, without waiting for its completion
 //    incremental_location: specify a different path to store the incremental backup
+//    include_all_secondary_tenants: enable backups of all secondary tenants during a cluster backup in the system tenant
 //
 // %SeeAlso: RESTORE, WEBDOCS/backup.html
 backup_stmt:
@@ -3249,6 +3250,14 @@ backup_options:
 | COORDINATOR_LOCALITY '=' string_or_placeholder
   {
     $$.val = &tree.BackupOptions{CoordinatorLocality: $3.expr()}
+  }
+| INCLUDE_ALL_SECONDARY_TENANTS
+  {
+    $$.val = &tree.BackupOptions{IncludeAllSecondaryTenants: tree.MakeDBool(true)}
+  }
+| INCLUDE_ALL_SECONDARY_TENANTS '=' a_expr
+  {
+    $$.val = &tree.BackupOptions{IncludeAllSecondaryTenants: $3.expr()}
   }
 
 // %Help: CREATE SCHEDULE FOR BACKUP - backup data periodically
@@ -3426,7 +3435,7 @@ alter_backup_schedule_cmd:
 sconst_or_placeholder:
   SCONST
   {
-    $$.val =  tree.NewStrVal($1)
+    $$.val = tree.NewStrVal($1)
   }
 | PLACEHOLDER
   {
@@ -3555,12 +3564,14 @@ drop_external_connection_stmt:
 //    skip_missing_sequences: ignore sequence dependencies
 //    skip_missing_views: skip restoring views because of dependencies that cannot be restored
 //    skip_missing_sequence_owners: remove sequence-table ownership dependencies before restoring
+//    skip_missing_udfs: skip restoring
 //    encryption_passphrase=passphrase: decrypt BACKUP with specified passphrase
 //    kms="[kms_provider]://[kms_host]/[master_key_identifier]?[parameters]" : decrypt backups using KMS
 //    detached: execute restore job asynchronously, without waiting for its completion
 //    skip_localities_check: ignore difference of zone configuration between restore cluster and backup cluster
 //    debug_pause_on: describes the events that the job should pause itself on for debugging purposes.
 //    new_db_name: renames the restored database. only applies to database restores
+//    include_all_secondary_tenants: enable backups of all secondary tenants during a cluster backup in the system tenant
 // %SeeAlso: BACKUP, WEBDOCS/restore.html
 restore_stmt:
   RESTORE FROM list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
@@ -3700,6 +3711,10 @@ restore_options:
   {
     $$.val = &tree.RestoreOptions{SkipMissingViews: true}
   }
+| SKIP_MISSING_UDFS
+  {
+    $$.val = &tree.RestoreOptions{SkipMissingUDFs: true}
+  }
 | DETACHED
   {
     $$.val = &tree.RestoreOptions{Detached: true}
@@ -3715,6 +3730,14 @@ restore_options:
 | NEW_DB_NAME '=' string_or_placeholder
   {
     $$.val = &tree.RestoreOptions{NewDBName: $3.expr()}
+  }
+| INCLUDE_ALL_SECONDARY_TENANTS
+  {
+    $$.val = &tree.RestoreOptions{IncludeAllSecondaryTenants: tree.MakeDBool(true)}
+  }
+| INCLUDE_ALL_SECONDARY_TENANTS '=' a_expr
+  {
+    $$.val = &tree.RestoreOptions{IncludeAllSecondaryTenants: $3.expr()}
   }
 | INCREMENTAL_LOCATION '=' string_or_placeholder_opt_list
 	{
@@ -7188,6 +7211,21 @@ show_backup_stmt:
   		  Details:  tree.BackupValidateDetails,
   			Path:    $4.expr(),
   			Options: *$5.showBackupOptions(),
+  		}
+  	}
+| SHOW BACKUP CONNECTION string_or_placeholder opt_with_show_backup_options
+  	{
+  		$$.val = &tree.ShowBackup{
+  		  Details:  tree.BackupConnectionTest,
+  			Path:    $4.expr(),
+  		}
+  	}
+| SHOW BACKUP CONNECTION string_or_placeholder WITH TRANSFER '=' string_or_placeholder
+  	{
+  		$$.val = &tree.ShowBackup{
+  		  Details:  tree.BackupConnectionTest,
+  			Path:    $4.expr(),
+        Options: tree.ShowBackupOptions{TransferSize: $8.expr()},
   		}
   	}
 | SHOW BACKUP error // SHOW HELP: SHOW BACKUP
@@ -11361,7 +11399,7 @@ opt_super_region_clause:
 }
 
 super_region_clause:
-SUPER REGION name VALUES region_name_list
+SUPER REGION region_name VALUES region_name_list
 {
   $$.val = tree.SuperRegion{Name: tree.Name($3), Regions: $5.nameList()}
 }
@@ -15695,11 +15733,18 @@ type_name:             db_object_name
 
 sequence_name:         db_object_name
 
-region_name:           name
+region_name:
+  name
+| SCONST
 
-region_name_list:      name_list
+region_name_list:
+  region_name
   {
-    $$.val = $1.nameList()
+    $$.val = tree.NameList{tree.Name($1)}
+  }
+| region_name_list ',' region_name
+  {
+    $$.val = append($1.nameList(), tree.Name($3))
   }
 
 schema_name:           name
@@ -16104,6 +16149,7 @@ unreserved_keyword:
 | IMPORT
 | INCLUDE
 | INCLUDING
+| INCLUDE_ALL_SECONDARY_TENANTS
 | INCREMENT
 | INCREMENTAL
 | INCREMENTAL_LOCATION
@@ -16315,6 +16361,7 @@ unreserved_keyword:
 | SKIP_MISSING_SEQUENCES
 | SKIP_MISSING_SEQUENCE_OWNERS
 | SKIP_MISSING_VIEWS
+| SKIP_MISSING_UDFS
 | SNAPSHOT
 | SPLIT
 | SQL
@@ -16426,6 +16473,7 @@ bare_label_keywords:
 | TRANSFORM
 | VOLATILE
 | SETOF
+| SKIP_MISSING_VIEWS
 
 // Column identifier --- keywords that can be column, table, etc names.
 //

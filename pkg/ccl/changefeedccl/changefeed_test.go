@@ -45,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -1714,7 +1715,7 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	// Rangefeed will skip some of the checkpoints to simulate lagging spans.
 	var laggingSpans roachpb.SpanGroup
 	numLagging := 0
-	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *roachpb.RangeFeedCheckpoint) bool {
+	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *kvpb.RangeFeedCheckpoint) bool {
 		// Skip spans that were skipped before; otherwise skip some spans.
 		seenBefore := laggingSpans.Encloses(checkpoint.Span)
 		if seenBefore || (numLagging < 5 && rnd.Int()%3 == 0) {
@@ -2289,23 +2290,23 @@ func fetchDescVersionModificationTime(
 	t testing.TB, s TestServerWithSystem, tableName string, version int,
 ) hlc.Timestamp {
 	tblKey := s.Codec.TablePrefix(keys.DescriptorTableID)
-	header := roachpb.RequestHeader{
+	header := kvpb.RequestHeader{
 		Key:    tblKey,
 		EndKey: tblKey.PrefixEnd(),
 	}
 	dropColTblID := sqlutils.QueryTableID(t, s.DB, `d`, "public", tableName)
-	req := &roachpb.ExportRequest{
+	req := &kvpb.ExportRequest{
 		RequestHeader: header,
-		MVCCFilter:    roachpb.MVCCFilter_All,
+		MVCCFilter:    kvpb.MVCCFilter_All,
 		StartTime:     hlc.Timestamp{},
 	}
-	hh := roachpb.Header{Timestamp: hlc.NewClockForTesting(nil).Now()}
+	hh := kvpb.Header{Timestamp: hlc.NewClockForTesting(nil).Now()}
 	res, pErr := kv.SendWrappedWith(context.Background(),
 		s.SystemServer.DB().NonTransactionalSender(), hh, req)
 	if pErr != nil {
 		t.Fatal(pErr.GoError())
 	}
-	for _, file := range res.(*roachpb.ExportResponse).Files {
+	for _, file := range res.(*kvpb.ExportResponse).Files {
 		it, err := storage.NewMemSSTIterator(file.SST, false /* verify */, storage.IterOptions{
 			KeyTypes:   storage.IterKeyTypePointsAndRanges,
 			LowerBound: keys.MinKey,
@@ -4165,6 +4166,49 @@ func TestChangefeedDataTTL(t *testing.T) {
 	cdcTestWithSystem(t, testFn, feedTestForceSink("sinkless"), feedTestNoTenants)
 }
 
+// TestChangefeedCanceledWhenPTSIsOld verifies paused changefeed job which holds PTS
+// record gets canceled if paused for too long.
+func TestChangefeedCanceledWhenPTSIsOld(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms';`)
+		// Create the data table; it will only contain a
+		// single row with multiple versions.
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b INT)`)
+
+		feed, err := f.Feed("CREATE CHANGEFEED FOR TABLE foo WITH protect_data_from_gc_on_pause, gc_protect_expires_after='24h'")
+		require.NoError(t, err)
+		defer func() {
+			closeFeed(t, feed)
+		}()
+
+		jobFeed := feed.(cdctest.EnterpriseTestFeed)
+		require.NoError(t, jobFeed.Pause())
+
+		// While the job is paused, take opportunity to test that alter changefeed
+		// works when setting gc_protect_expires_after option.
+
+		// Verify we can set it to 0 -- i.e. disable.
+		sqlDB.Exec(t, fmt.Sprintf("ALTER CHANGEFEED %d SET gc_protect_expires_after = '0s'", jobFeed.JobID()))
+		// Now, set it to something very small.
+		sqlDB.Exec(t, fmt.Sprintf("ALTER CHANGEFEED %d SET gc_protect_expires_after = '250ms'", jobFeed.JobID()))
+
+		// Stale PTS record should trigger job cancellation.
+		require.NoError(t, jobFeed.WaitForStatus(func(s jobs.Status) bool {
+			return s == jobs.StatusCanceled
+		}))
+	}
+
+	// Ensure metrics poller loop runs fast.
+	st := cluster.MakeTestingClusterSettings()
+	jobs.PollJobsMetricsInterval.Override(context.Background(), &st.SV, 100*time.Millisecond)
+	cdcTest(t, testFn, feedTestEnterpriseSinks, withSettings(st))
+}
+
 // TestChangefeedSchemaTTL ensures that changefeeds fail with an error in the case
 // where the feed has fallen behind the GC TTL of the table's schema.
 func TestChangefeedSchemaTTL(t *testing.T) {
@@ -5186,12 +5230,12 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 			}
 		}
 		requestFilter = kvserverbase.ReplicaRequestFilter(func(
-			ctx context.Context, ba *roachpb.BatchRequest,
-		) *roachpb.Error {
+			ctx context.Context, ba *kvpb.BatchRequest,
+		) *kvpb.Error {
 			if ba.Txn == nil || ba.Txn.Name != "changefeed backfill" {
 				return nil
 			}
-			scanReq, ok := ba.GetArg(roachpb.Scan)
+			scanReq, ok := ba.GetArg(kvpb.Scan)
 			if !ok {
 				return nil
 			}

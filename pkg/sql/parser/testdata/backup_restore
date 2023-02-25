@@ -153,6 +153,30 @@ SHOW BACKUP FILES '_' -- literals removed
 SHOW BACKUP FILES 'bar' -- identifiers removed
 
 parse
+SHOW BACKUP CONNECTION 'bar'
+----
+SHOW BACKUP CONNECTION 'bar'
+SHOW BACKUP CONNECTION ('bar') -- fully parenthesized
+SHOW BACKUP CONNECTION '_' -- literals removed
+SHOW BACKUP CONNECTION 'bar' -- identifiers removed
+
+parse
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = '1KiB'
+----
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = '1KiB'
+SHOW BACKUP CONNECTION ('bar') WITH TRANSFER = ('1KiB') -- fully parenthesized
+SHOW BACKUP CONNECTION '_' WITH TRANSFER = '_' -- literals removed
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = '1KiB' -- identifiers removed
+
+parse
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = $1
+----
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = $1
+SHOW BACKUP CONNECTION ('bar') WITH TRANSFER = ($1) -- fully parenthesized
+SHOW BACKUP CONNECTION '_' WITH TRANSFER = $1 -- literals removed
+SHOW BACKUP CONNECTION 'bar' WITH TRANSFER = $1 -- identifiers removed
+
+parse
 SHOW BACKUPS IN 'bar'
 ----
 SHOW BACKUPS IN 'bar'
@@ -701,23 +725,23 @@ RESTORE FROM 'a' WITH into_db = 'foo', skip_missing_foreign_keys, skip_localitie
 
 parse
 RESTORE foo FROM 'bar' WITH OPTIONS (encryption_passphrase='secret', into_db='baz', debug_pause_on='error',
-skip_missing_foreign_keys, skip_missing_sequences, skip_missing_sequence_owners, skip_missing_views, detached, skip_localities_check)
+skip_missing_foreign_keys, skip_missing_sequences, skip_missing_sequence_owners, skip_missing_views, skip_missing_udfs, detached, skip_localities_check)
 ----
-RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- normalized!
-RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = '*****', into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- fully parenthesized
-RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '*****', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- literals removed
-RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- identifiers removed
-RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, detached, skip_localities_check -- passwords exposed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- normalized!
+RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = '*****', into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- fully parenthesized
+RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '*****', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- literals removed
+RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- identifiers removed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, detached, skip_localities_check -- passwords exposed
 
 parse
 RESTORE foo FROM 'bar' WITH ENCRYPTION_PASSPHRASE = 'secret', INTO_DB=baz, DEBUG_PAUSE_ON='error',
-SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS, SKIP_MISSING_VIEWS, SKIP_LOCALITIES_CHECK
+SKIP_MISSING_FOREIGN_KEYS, SKIP_MISSING_SEQUENCES, SKIP_MISSING_SEQUENCE_OWNERS, SKIP_MISSING_VIEWS, SKIP_LOCALITIES_CHECK, SKIP_MISSING_UDFS
 ----
-RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- normalized!
-RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = '*****', into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- fully parenthesized
-RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '*****', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- literals removed
-RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- identifiers removed
-RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_localities_check -- passwords exposed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- normalized!
+RESTORE TABLE (foo) FROM ('bar') WITH encryption_passphrase = '*****', into_db = ('baz'), debug_pause_on = ('error'), skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- fully parenthesized
+RESTORE TABLE foo FROM '_' WITH encryption_passphrase = '*****', into_db = '_', debug_pause_on = '_', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- literals removed
+RESTORE TABLE _ FROM 'bar' WITH encryption_passphrase = '*****', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- identifiers removed
+RESTORE TABLE foo FROM 'bar' WITH encryption_passphrase = 'secret', into_db = 'baz', debug_pause_on = 'error', skip_missing_foreign_keys, skip_missing_sequence_owners, skip_missing_sequences, skip_missing_views, skip_missing_udfs, skip_localities_check -- passwords exposed
 
 parse
 RESTORE TENANT 36 FROM ($1, $2) AS OF SYSTEM TIME '1'
@@ -767,6 +791,38 @@ RESTORE TABLE (foo) FROM ('bar') WITH skip_missing_foreign_keys, skip_missing_se
 RESTORE TABLE foo FROM '_' WITH skip_missing_foreign_keys, skip_missing_sequences, detached -- literals removed
 RESTORE TABLE _ FROM 'bar' WITH skip_missing_foreign_keys, skip_missing_sequences, detached -- identifiers removed
 
+parse
+BACKUP INTO 'bar' WITH include_all_secondary_tenants = $1, detached
+----
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = $1 -- normalized!
+BACKUP INTO ('bar') WITH detached, include_all_secondary_tenants = ($1) -- fully parenthesized
+BACKUP INTO '_' WITH detached, include_all_secondary_tenants = $1 -- literals removed
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = $1 -- identifiers removed
+
+parse
+BACKUP INTO 'bar' WITH include_all_secondary_tenants, detached
+----
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = true -- normalized!
+BACKUP INTO ('bar') WITH detached, include_all_secondary_tenants = (true) -- fully parenthesized
+BACKUP INTO '_' WITH detached, include_all_secondary_tenants = _ -- literals removed
+BACKUP INTO 'bar' WITH detached, include_all_secondary_tenants = true -- identifiers removed
+
+parse
+RESTORE FROM LATEST IN 'bar' WITH include_all_secondary_tenants = $1, detached
+----
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = $1 -- normalized!
+RESTORE FROM ('latest') IN ('bar') WITH detached, include_all_secondary_tenants = ($1) -- fully parenthesized
+RESTORE FROM '_' IN '_' WITH detached, include_all_secondary_tenants = $1 -- literals removed
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = $1 -- identifiers removed
+
+parse
+RESTORE FROM LATEST IN 'bar' WITH include_all_secondary_tenants, detached
+----
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = true -- normalized!
+RESTORE FROM ('latest') IN ('bar') WITH detached, include_all_secondary_tenants = (true) -- fully parenthesized
+RESTORE FROM '_' IN '_' WITH detached, include_all_secondary_tenants = _ -- literals removed
+RESTORE FROM 'latest' IN 'bar' WITH detached, include_all_secondary_tenants = true -- identifiers removed
+
 error
 BACKUP foo TO 'bar' WITH key1, key2 = 'value'
 ----
@@ -809,6 +865,14 @@ BACKUP foo TO 'bar' WITH detached=true, revision_history, detached=true
                                                                    ^
 
 error
+BACKUP TO 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+----
+at or near "EOF": syntax error: include_all_secondary_tenants specified multiple times
+DETAIL: source SQL:
+BACKUP TO 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+                                                                                       ^
+
+error
 BACKUP foo TO 'bar' WITH detached=$1, revision_history
 ----
 at or near "1": syntax error
@@ -849,6 +913,22 @@ at or near "detached": syntax error: detached option specified multiple times
 DETAIL: source SQL:
 RESTORE foo FROM 'bar' WITH detached, skip_missing_views, detached
                                                           ^
+
+error
+RESTORE foo FROM 'bar' WITH skip_missing_udfs, skip_missing_views, skip_missing_udfs
+----
+at or near "skip_missing_udfs": syntax error: skip_missing_udfs specified multiple times
+DETAIL: source SQL:
+RESTORE foo FROM 'bar' WITH skip_missing_udfs, skip_missing_views, skip_missing_udfs
+                                                                   ^
+
+error
+RESTORE FROM 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+----
+at or near "EOF": syntax error: include_all_secondary_tenants specified multiple times
+DETAIL: source SQL:
+RESTORE FROM 'bar' WITH include_all_secondary_tenants=false, include_all_secondary_tenants
+                                                                                          ^
 
 error
 BACKUP ROLE foo, bar TO 'baz'

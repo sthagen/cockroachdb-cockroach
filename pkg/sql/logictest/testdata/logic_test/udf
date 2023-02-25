@@ -554,16 +554,10 @@ statement ok
 CREATE FUNCTION test_tbl_f() RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
-CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT DEFAULT (test_tbl_f() + 1));
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
 CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT ON UPDATE (test_tbl_f() + 1));
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
 CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT AS (test_tbl_f() + 1) STORED);
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
-CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT CHECK (test_tbl_f() > 0));
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
 CREATE TABLE test_tbl_t (a INT PRIMARY KEY, b INT, INDEX idx_b(test_tbl_f()));
@@ -578,12 +572,6 @@ statement error pq: unimplemented: usage of user-defined function from relations
 CREATE INDEX t_idx ON test_tbl_t(b) WHERE test_tbl_f() > 0;
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
-ALTER TABLE test_tbl_t ADD CONSTRAINT bgt CHECK (test_tbl_f() > 1);
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
-ALTER TABLE test_tbl_t ADD COLUMN c int CHECK (test_tbl_f() > 0);
-
-statement error pq: unimplemented: usage of user-defined function from relations not supported
 ALTER TABLE test_tbl_t ADD COLUMN c int AS (test_tbl_f()) stored;
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
@@ -591,6 +579,9 @@ ALTER TABLE test_tbl_t ADD COLUMN c int DEFAULT (test_tbl_f());
 
 statement error pq: unimplemented: usage of user-defined function from relations not supported
 ALTER TABLE test_tbl_t ADD COLUMN c int ON UPDATE (test_tbl_f());
+
+statement error pq: unimplemented: usage of user-defined function from relations not supported
+ALTER TABLE test_tbl_t ALTER COLUMN b SET ON UPDATE (test_tbl_f());
 
 subtest disallow_udf_in_views_and_udf
 
@@ -3089,6 +3080,19 @@ SELECT f_rtbl();
 ----
 (1,2)
 
+statement ok
+ALTER TABLE t_alter ADD COLUMN c INT;
+
+statement error pq: return type mismatch in function declared to return record
+CREATE OR REPLACE FUNCTION f_rtbl() RETURNS t_alter LANGUAGE SQL AS 'SELECT 1, 2;'
+
+statement ok
+CREATE OR REPLACE FUNCTION f_rtbl() RETURNS t_alter LANGUAGE SQL AS 'SELECT 1, 2, 3;'
+
+query T
+SELECT f_rtbl();
+----
+(1,2,3)
 
 subtest regression_94146
 

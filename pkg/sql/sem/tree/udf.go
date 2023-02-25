@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -337,7 +336,7 @@ func (node *FuncParam) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&node.Name)
 		ctx.WriteString(" ")
 	}
-	ctx.WriteString(node.Type.SQLString())
+	ctx.FormatTypeReference(node.Type)
 	if node.DefaultVal != nil {
 		ctx.WriteString(" DEFAULT ")
 		ctx.FormatNode(node.DefaultVal)
@@ -529,16 +528,34 @@ func (v *UDFDisallowanceVisitor) VisitPost(expr Expr) (newNode Expr) {
 	return expr
 }
 
-// MaybeFailOnUDFUsage returns an error if the given expression or any
-// sub-expression used a UDF.
-// TODO(chengxiong): remove this function when we start allowing UDF references.
-func MaybeFailOnUDFUsage(expr TypedExpr) error {
-	visitor := &UDFDisallowanceVisitor{}
-	WalkExpr(visitor, expr)
-	if visitor.FoundUDF {
-		return unimplemented.NewWithIssue(83234, "usage of user-defined function from relations not supported")
+// SchemaExprContext indicates in which schema change context an expression is being
+// used in. For example, DEFAULT VALUE of a column, CHECK CONSTRAINT's
+// expression, etc.
+type SchemaExprContext string
+
+const (
+	AlterColumnTypeUsingExpr        SchemaExprContext = "ALTER COLUMN TYPE USING EXPRESSION"
+	StoredComputedColumnExpr        SchemaExprContext = "STORED COMPUTED COLUMN"
+	VirtualComputedColumnExpr       SchemaExprContext = "VIRTUAL COMPUTED COLUMN"
+	ColumnOnUpdateExpr              SchemaExprContext = "ON UPDATE"
+	ColumnDefaultExprInAddColumn    SchemaExprContext = "DEFAULT (in ADD COLUMN)"
+	ColumnDefaultExprInNewTable     SchemaExprContext = "DEFAULT (in CREATE TABLE)"
+	ColumnDefaultExprInNewView      SchemaExprContext = "DEFAULT (in CREATE VIEW)"
+	ColumnDefaultExprInSetDefault   SchemaExprContext = "DEFAULT (in SET DEFAULT)"
+	CheckConstraintExpr             SchemaExprContext = "CHECK"
+	UniqueWithoutIndexPredicateExpr SchemaExprContext = "UNIQUE WITHOUT INDEX PREDICATE"
+	IndexPredicateExpr              SchemaExprContext = "INDEX PREDICATE"
+	ExpressionIndexElementExpr      SchemaExprContext = "EXPRESSION INDEX ELEMENT"
+	TTLExpirationExpr               SchemaExprContext = "TTL EXPIRATION EXPRESSION"
+	TTLDefaultExpr                  SchemaExprContext = "TTL DEFAULT"
+	TTLUpdateExpr                   SchemaExprContext = "TTL UPDATE"
+)
+
+func ComputedColumnExprContext(isVirtual bool) SchemaExprContext {
+	if isVirtual {
+		return VirtualComputedColumnExpr
 	}
-	return nil
+	return StoredComputedColumnExpr
 }
 
 // ValidateFuncOptions checks whether there are conflicting or redundant

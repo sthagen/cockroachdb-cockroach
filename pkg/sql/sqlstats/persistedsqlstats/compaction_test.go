@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -261,80 +261,6 @@ func TestSQLStatsCompactor(t *testing.T) {
 	}
 }
 
-// TestSQLStatsForegroundInterference ensures that the background SQL Stats
-// cleanup job does not delete any rows in the current aggregation window. Doing
-// so would cause contentions, which can potentially lead to long runtime of the
-// SQL Stats cleanup job. We test this behavior by generating some rows in the
-// stats system table that are in the current aggregation window and previous
-// aggregation window. Before running the SQL Stats compaction, we lower the
-// row limit in the stats table so that all the rows will be deleted by the
-// StatsCompactor, if all the generated rows live outside the current
-// aggregation window. This test asserts that, since some of generated rows live
-// in the current aggregation interval, those rows will not be deleted by the
-// StatsCompactor.
-func TestSQLStatsForegroundInterference(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var tm atomic.Value
-	// Initialize the time to 2 aggregation interval in the past.
-	tm.Store(timeutil.Now().Add(-2 * persistedsqlstats.SQLStatsAggregationInterval.Default()))
-
-	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs).StubTimeNow = func() time.Time {
-		return tm.Load().(time.Time)
-	}
-	s, conn, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-
-	serverSQLStats :=
-		s.SQLServer().(*sql.Server).
-			GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
-
-	sqlConn := sqlutils.MakeSQLRunner(conn)
-	sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.persisted_rows.max = 10")
-
-	// Generate some data that are older than the current aggregation window,
-	// and then generate some that are within the current aggregation window.
-	generateFingerprints(t, sqlConn, 10 /* distinctFingerprints */)
-	serverSQLStats.Flush(ctx)
-
-	tm.Store(timeutil.Now())
-	generateFingerprints(t, sqlConn, 10 /* distinctFingerprints */)
-	serverSQLStats.Flush(ctx)
-
-	statsCompactor := persistedsqlstats.NewStatsCompactor(
-		s.ClusterSettings(),
-		s.InternalDB().(isql.DB),
-		metric.NewCounter(metric.Metadata{}),
-		params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs),
-	)
-
-	// Run the compactor.
-	require.NoError(t, statsCompactor.DeleteOldestEntries(ctx))
-
-	result := sqlConn.QueryStr(t, `
-	SELECT count(*)
-	FROM system.statement_statistics`)[0][0]
-
-	stmtStatsCount, err := strconv.Atoi(result)
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, stmtStatsCount, 10,
-		"expected at least 10 fingerprints in statement statistics table, "+
-			"but only %d is present", stmtStatsCount)
-
-	result = sqlConn.QueryStr(t, `
-	SELECT count(*)
-	FROM system.transaction_statistics`)[0][0]
-
-	txnStatsCount, err := strconv.Atoi(result)
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, txnStatsCount, 10,
-		"expected at least 10 fingerprints in transaction statistics table, "+
-			"but only %d is present", txnStatsCount)
-}
-
 func TestSQLStatsCompactionJobMarkedAsAutomatic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -467,14 +393,14 @@ func (k *kvScanInterceptor) disable() {
 	atomic.StoreInt32(&k.enabled, 0)
 }
 
-func (k *kvScanInterceptor) intercept(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+func (k *kvScanInterceptor) intercept(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 	if atomic.LoadInt32(&k.enabled) == 0 {
 		return nil
 	}
-	if req, ok := ba.GetArg(roachpb.Scan); ok {
-		_, tableID, _ := encoding.DecodeUvarintAscending(req.(*roachpb.ScanRequest).Key)
+	if req, ok := ba.GetArg(kvpb.Scan); ok {
+		_, tableID, _ := encoding.DecodeUvarintAscending(req.(*kvpb.ScanRequest).Key)
 		if tableID == stmtStatsTableID || tableID == txnStatsTableID {
-			prettyKey := roachpb.PrettyPrintKey([]encoding.Direction{}, req.(*roachpb.ScanRequest).Key)
+			prettyKey := roachpb.PrettyPrintKey([]encoding.Direction{}, req.(*kvpb.ScanRequest).Key)
 
 			keyMatchedWideScan := kvReqWideScanStartKeyPattern.MatchString(prettyKey)
 

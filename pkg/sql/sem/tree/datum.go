@@ -1049,10 +1049,14 @@ func ParseDDecimal(s string) (*DDecimal, error) {
 // SetString sets d to s. Any non-standard NaN values are converted to a
 // normal NaN. Any negative zero is converted to positive.
 func (d *DDecimal) SetString(s string) error {
+	return setDecimalString(s, &d.Decimal)
+}
+
+func setDecimalString(s string, d *apd.Decimal) error {
 	// ExactCtx should be able to handle any decimal, but if there is any rounding
 	// or other inexact conversion, it will result in an error.
 	// _, res, err := HighPrecisionCtx.SetString(&d.Decimal, s)
-	_, res, err := ExactCtx.SetString(&d.Decimal, s)
+	_, res, err := ExactCtx.SetString(d, s)
 	if res != 0 || err != nil {
 		return MakeParseError(s, types.Decimal, err)
 	}
@@ -2606,6 +2610,9 @@ var DZeroTimestamp = &DTimestamp{}
 //
 // The dependsOnContext return value indicates if we had to consult the
 // ParseContext (either for the time or the local timezone).
+//
+// Parts of this function are inlined into ParseAndRequireStringHandler, if this
+// changes materially the timestamp case arms there may need to change too.
 func ParseDTimestamp(
 	ctx ParseContext, s string, precision time.Duration,
 ) (_ *DTimestamp, dependsOnContext bool, _ error) {
@@ -2854,13 +2861,20 @@ type DTimestampTZ struct {
 	time.Time
 }
 
-// MakeDTimestampTZ creates a DTimestampTZ with specified precision.
-func MakeDTimestampTZ(t time.Time, precision time.Duration) (*DTimestampTZ, error) {
+func checkTimeBounds(t time.Time, precision time.Duration) (time.Time, error) {
 	ret := t.Round(precision)
 	if ret.After(MaxSupportedTime) || ret.Before(MinSupportedTime) {
-		return nil, NewTimestampExceedsBoundsError(ret)
+		return time.Time{}, NewTimestampExceedsBoundsError(ret)
 	}
-	return &DTimestampTZ{Time: ret}, nil
+	return ret, nil
+}
+
+// MakeDTimestampTZ creates a DTimestampTZ with specified precision.
+func MakeDTimestampTZ(t time.Time, precision time.Duration) (_ *DTimestampTZ, err error) {
+	if t, err = checkTimeBounds(t, precision); err != nil {
+		return nil, err
+	}
+	return &DTimestampTZ{Time: t}, nil
 }
 
 // MustMakeDTimestampTZ wraps MakeDTimestampTZ but panics if there is an error.
@@ -2891,6 +2905,9 @@ func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) (*DTimestampTZ, erro
 //
 // The dependsOnContext return value indicates if we had to consult the
 // ParseContext (either for the time or the local timezone).
+//
+// Parts of this function are inlined into ParseAndRequireStringHandler, if this
+// changes materially the timestamp case arms there may need to change too.
 func ParseDTimestampTZ(
 	ctx ParseContext, s string, precision time.Duration,
 ) (_ *DTimestampTZ, dependsOnContext bool, _ error) {
@@ -6107,7 +6124,7 @@ func AdjustValueToType(typ *types.T, inVal Datum) (outVal Datum, err error) {
 // with a reasonable previous datum that is smaller than the given one.
 //
 // The return value is undefined if Datum.IsMin returns true or if the value is
-// NaN of an infinity (for floats and decimals).
+// NaN or an infinity (for floats and decimals).
 func DatumPrev(
 	datum Datum, cmpCtx CompareContext, collationEnv *CollationEnvironment,
 ) (Datum, bool) {
@@ -6144,16 +6161,6 @@ func DatumPrev(
 			return nil, false
 		}
 		return NewDString(prev), true
-	case *DCollatedString:
-		prev, ok := prevString(d.Contents)
-		if !ok {
-			return nil, false
-		}
-		c, err := NewDCollatedString(prev, d.Locale, collationEnv)
-		if err != nil {
-			return nil, false
-		}
-		return c, true
 	case *DBytes:
 		prev, ok := prevString(string(*d))
 		if !ok {
@@ -6166,8 +6173,8 @@ func DatumPrev(
 		return NewDInterval(prev, types.DefaultIntervalTypeMetadata), true
 	default:
 		// TODO(yuzefovich): consider adding support for other datums that don't
-		// have Datum.Prev implementation (DBitArray, DGeography, DGeometry,
-		// DBox2D, DJSON, DArray).
+		// have Datum.Prev implementation (DCollatedString, DBitArray,
+		// DGeography, DGeometry, DBox2D, DJSON, DArray).
 		return datum.Prev(cmpCtx)
 	}
 }
@@ -6178,7 +6185,7 @@ func DatumPrev(
 // with a reasonable next datum that is greater than the given one.
 //
 // The return value is undefined if Datum.IsMax returns true or if the value is
-// NaN of an infinity (for floats and decimals).
+// NaN or an infinity (for floats and decimals).
 func DatumNext(
 	datum Datum, cmpCtx CompareContext, collationEnv *CollationEnvironment,
 ) (Datum, bool) {
@@ -6196,24 +6203,13 @@ func DatumNext(
 			return nil, false
 		}
 		return &next, true
-	case *DCollatedString:
-		s := NewDString(d.Contents)
-		next, ok := s.Next(cmpCtx)
-		if !ok {
-			return nil, false
-		}
-		c, err := NewDCollatedString(string(*next.(*DString)), d.Locale, collationEnv)
-		if err != nil {
-			return nil, false
-		}
-		return c, true
 	case *DInterval:
 		next := d.Add(duration.MakeDuration(1000000 /* nanos */, 0 /* days */, 0 /* months */))
 		return NewDInterval(next, types.DefaultIntervalTypeMetadata), true
 	default:
 		// TODO(yuzefovich): consider adding support for other datums that don't
-		// have Datum.Next implementation (DGeography, DGeometry, DBox2D,
-		// DJSON).
+		// have Datum.Next implementation (DCollatedString, DGeography,
+		// DGeometry, DBox2D, DJSON).
 		return datum.Next(cmpCtx)
 	}
 }

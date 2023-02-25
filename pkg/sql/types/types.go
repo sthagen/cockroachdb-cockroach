@@ -247,24 +247,7 @@ func (u UserDefinedTypeName) Basename() string {
 
 // FQName returns the fully qualified name.
 func (u UserDefinedTypeName) FQName() string {
-	var sb strings.Builder
-	// Even though cross-database type references are disabled, we still format
-	// the qualified name with the catalog. Consider the case where the current
-	// database is db1, and a statement like
-	// `CREATE VIEW db2.sc.v AS SELECT 'a'::db2.sc.typ`
-	// is executed. When parsing the inner view query, it's important to include
-	// the explicit catalog name, so the correct (non-cross-database) type is
-	// resolved.
-	if u.Catalog != "" {
-		sb.WriteString(u.Catalog)
-		sb.WriteString(".")
-	}
-	if u.ExplicitSchema {
-		sb.WriteString(u.Schema)
-		sb.WriteString(".")
-	}
-	sb.WriteString(u.Name)
-	return sb.String()
+	return FormatTypeName(u)
 }
 
 // Convenience list of pre-constructed types. Caller code can use any of these
@@ -1940,6 +1923,14 @@ func (t *T) SQLString() string {
 	return strings.ToUpper(t.Name())
 }
 
+// FormatTypeName is an injected dependency from tree to properly format a
+// type name. The logic for proper formatting lives in the tree package.
+var FormatTypeName = fallbackFormatTypeName
+
+func fallbackFormatTypeName(UserDefinedTypeName) string {
+	return "formatting logic has not been injected from tree"
+}
+
 // Equivalent returns true if this type is "equivalent" to the given type.
 // Equivalent types are compatible with one another: they can be compared,
 // assigned, and unioned. Equivalent types must always have the same type family
@@ -2718,6 +2709,13 @@ func IsAdditiveType(t *T) bool {
 // wildcard type matches a tuple type having any number of fields (including 0).
 func IsWildcardTupleType(t *T) bool {
 	return len(t.TupleContents()) == 1 && t.TupleContents()[0].Family() == AnyFamily
+}
+
+// IsRecordType returns true if this is a RECORD type. This should only be used
+// when processing UDFs. A record differs from AnyTuple in that the tuple
+// contents may contain types other than Any.
+func IsRecordType(typ *T) bool {
+	return typ.Family() == TupleFamily && typ.Oid() == oid.T_record
 }
 
 // collatedStringTypeSQL returns the string representation of a COLLATEDSTRING

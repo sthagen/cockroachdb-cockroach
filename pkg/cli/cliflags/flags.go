@@ -793,9 +793,9 @@ Note: that --external-io-disable-http or --external-io-disable-implicit-credenti
 	TenantScope = FlagInfo{
 		Name: "tenant-scope",
 		Description: `Assign a tenant scope to the certificate.
-This will allow for the certificate to only be used specifically for a particular
-tenant. This flag is optional, when omitted, the certificate is scoped to the
-system tenant.`,
+This will restrict the certificate to only be valid for the specified tenants.
+This flag is optional. When omitted, the certificate is not scoped; i.e.
+it can be used with all tenants.`,
 	}
 
 	GeneratePKCS8Key = FlagInfo{
@@ -1743,7 +1743,8 @@ commands, WARNING for client commands.`,
 		EnvVar: "",
 		Description: `Address of an OpenTelemetry OTLP sink such as the
 Observability Service or the OpenTelemetry Collector. If set, telemetry
-events are exported to this address.`,
+events are exported to this address. The special value "embed" causes
+the Cockroach node to run the Observability Service internally.`,
 	}
 
 	BuildTag = FlagInfo{
@@ -1876,5 +1877,12 @@ n - assume no/abort to all prompts
 p - prompt interactively for a confirmation
 </PRE>
 `,
+	}
+
+	PrintKeyLength = FlagInfo{
+		Name: "print-key-max-length",
+		Description: `
+Maximum number of characters in printed keys and spans. If key representation
+exceeds this value, it is truncated. Set to 0 to disable truncation.`,
 	}
 )

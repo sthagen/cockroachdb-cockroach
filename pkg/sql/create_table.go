@@ -394,6 +394,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		if desc.Adding() {
 			// if this table and all its references are created in the same
 			// transaction it can be made PUBLIC.
+			// TODO(chengxiong): do we need to do something here? Like. add logic to find all references.
 			refs, err := desc.FindAllReferences()
 			if err != nil {
 				return err
@@ -410,6 +411,21 @@ func (n *createTableNode) startExec(params runParams) error {
 			if !foundExternalReference {
 				desc.State = descpb.DescriptorState_PUBLIC
 			}
+		}
+	}
+
+	// Replace all UDF names with OIDs in check constraints and update back
+	// references in functions used.
+	for _, ck := range desc.CheckConstraints() {
+		if err := params.p.updateFunctionReferencesForCheck(params.ctx, desc, ck.CheckDesc()); err != nil {
+			return err
+		}
+	}
+
+	// Update cross-references between functions and columns.
+	for i := range desc.Columns {
+		if err := params.p.maybeUpdateFunctionReferencesForColumn(params.ctx, desc, &desc.Columns[i]); err != nil {
+			return err
 		}
 	}
 
@@ -699,7 +715,7 @@ func addUniqueWithoutIndexTableDef(
 	if d.Predicate != nil {
 		var err error
 		predicate, err = schemaexpr.ValidateUniqueWithoutIndexPredicate(
-			ctx, tn, desc, d.Predicate, semaCtx,
+			ctx, tn, desc, d.Predicate, semaCtx, evalCtx.Settings.Version.ActiveVersionOrEmpty(ctx),
 		)
 		if err != nil {
 			return err
@@ -1285,6 +1301,8 @@ func NewTableDesc(
 	persistence tree.Persistence,
 	inOpts ...NewTableDescOption,
 ) (*tabledesc.Mutable, error) {
+
+	version := st.Version.ActiveVersionOrEmpty(ctx)
 	// Used to delay establishing Column/Sequence dependency until ColumnIDs have
 	// been populated.
 	cdd := make([]*tabledesc.ColumnDefDescs, len(n.Defs))
@@ -1569,7 +1587,7 @@ func NewTableDesc(
 				return nil, pgerror.Newf(pgcode.Syntax, "virtual columns cannot have family specifications")
 			}
 
-			cdd[i], err = tabledesc.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx)
+			cdd[i], err = tabledesc.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx, tree.ColumnDefaultExprInNewTable)
 			if err != nil {
 				return nil, err
 			}
@@ -1689,18 +1707,17 @@ func NewTableDesc(
 		if err != nil {
 			return nil, err
 		}
-
 		// If there is an equivalent check constraint from the CREATE TABLE (should
 		// be rare since we hide the constraint of shard column), we don't create a
 		// duplicate one.
 		ckBuilder := schemaexpr.MakeCheckConstraintBuilder(ctx, n.Table, &desc, semaCtx)
-		checkConstraintDesc, err := ckBuilder.Build(checkConstraint)
+		checkConstraintDesc, err := ckBuilder.Build(checkConstraint, version)
 		if err != nil {
 			return nil, err
 		}
 		for _, def := range n.Defs {
 			if inputCheckConstraint, ok := def.(*tree.CheckConstraintTableDef); ok {
-				inputCheckConstraintDesc, err := ckBuilder.Build(inputCheckConstraint)
+				inputCheckConstraintDesc, err := ckBuilder.Build(inputCheckConstraint, version)
 				if err != nil {
 					return nil, err
 				}
@@ -1723,7 +1740,7 @@ func NewTableDesc(
 		case *tree.ColumnTableDef:
 			if d.IsComputed() {
 				serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
-					ctx, &desc, d, &n.Table, "computed column", semaCtx,
+					ctx, &desc, d, &n.Table, tree.ComputedColumnExprContext(d.IsVirtual()), semaCtx, version,
 				)
 				if err != nil {
 					return nil, err
@@ -1762,6 +1779,7 @@ func NewTableDesc(
 				d.Inverted,
 				true, /* isNewTable */
 				semaCtx,
+				version,
 			); err != nil {
 				return nil, err
 			}
@@ -1831,7 +1849,7 @@ func NewTableDesc(
 
 			if d.Predicate != nil {
 				expr, err := schemaexpr.ValidatePartialIndexPredicate(
-					ctx, &desc, d.Predicate, &n.Table, semaCtx,
+					ctx, &desc, d.Predicate, &n.Table, semaCtx, version,
 				)
 				if err != nil {
 					return nil, err
@@ -1875,6 +1893,7 @@ func NewTableDesc(
 				false, /* isInverted */
 				true,  /* isNewTable */
 				semaCtx,
+				version,
 			); err != nil {
 				return nil, err
 			}
@@ -1946,7 +1965,7 @@ func NewTableDesc(
 			}
 			if d.Predicate != nil {
 				expr, err := schemaexpr.ValidatePartialIndexPredicate(
-					ctx, &desc, d.Predicate, &n.Table, semaCtx,
+					ctx, &desc, d.Predicate, &n.Table, semaCtx, version,
 				)
 				if err != nil {
 					return nil, err
@@ -1997,7 +2016,6 @@ func NewTableDesc(
 			})
 		}
 	}
-	version := st.Version.ActiveVersionOrEmpty(ctx)
 	if err := desc.AllocateIDs(ctx, version); err != nil {
 		return nil, err
 	}
@@ -2138,7 +2156,7 @@ func NewTableDesc(
 			// Pass, handled above.
 
 		case *tree.CheckConstraintTableDef:
-			ck, err := ckBuilder.Build(d)
+			ck, err := ckBuilder.Build(d, version)
 			if err != nil {
 				return nil, err
 			}
@@ -2335,7 +2353,9 @@ func newTableDesc(
 	// Row level TTL tables require a scheduled job to be created as well.
 	if ret.HasRowLevelTTL() {
 		ttl := ret.GetRowLevelTTL()
-		if err := schemaexpr.ValidateTTLExpirationExpression(params.ctx, ret, params.p.SemaCtx(), &n.Table, ttl); err != nil {
+		if err := schemaexpr.ValidateTTLExpirationExpression(
+			params.ctx, ret, params.p.SemaCtx(), &n.Table, ttl, params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx),
+		); err != nil {
 			return nil, err
 		}
 

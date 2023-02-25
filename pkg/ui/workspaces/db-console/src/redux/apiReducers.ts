@@ -524,7 +524,9 @@ export const refreshRawTrace = rawTraceReducerObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
-  events: CachedDataReducerState<clusterUiApi.EventsResponse>;
+  events: CachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.EventsResponse>
+  >;
   health: HealthState;
   nodes: CachedDataReducerState<INodeStatus[]>;
   raft: CachedDataReducerState<api.RaftDebugResponseMessage>;
@@ -566,7 +568,9 @@ export interface APIReducersState {
   txnInsights: CachedDataReducerState<
     clusterUiApi.SqlApiResponse<TxnInsightEvent[]>
   >;
-  schemaInsights: CachedDataReducerState<clusterUiApi.InsightRecommendation[]>;
+  schemaInsights: CachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.InsightRecommendation[]>
+  >;
   statementFingerprintInsights: KeyedCachedDataReducerState<
     clusterUiApi.SqlApiResponse<StmtInsightEvent[]>
   >;

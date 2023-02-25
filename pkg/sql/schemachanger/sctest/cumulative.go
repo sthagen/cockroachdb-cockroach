@@ -29,15 +29,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/corpus"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -1197,7 +1200,7 @@ func Backup(t *testing.T, path string, newCluster NewClusterFunc) {
 						fmt.Sprintf("CREATE DATABASE %q", dbName),
 						"SET use_declarative_schema_changer = 'off'",
 					},
-					restoreQuery: fmt.Sprintf("RESTORE TABLE %s FROM LATEST IN '%s' WITH skip_missing_sequences",
+					restoreQuery: fmt.Sprintf("RESTORE TABLE %s FROM LATEST IN '%s' WITH skip_missing_sequences, skip_missing_udfs",
 						strings.Join(tablesToRestore, ","), b.url),
 				})
 			}
@@ -1209,6 +1212,55 @@ func Backup(t *testing.T, path string, newCluster NewClusterFunc) {
 			// in this case, since it will no longer be simply `before`
 			// and `after`.
 
+			containsUDF := func(expr tree.Expr) (bool, error) {
+				var foundUDF bool
+				_, err := tree.SimpleVisit(expr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+					if fe, ok := expr.(*tree.FuncExpr); ok {
+						ref := fe.Func.FunctionReference.(*tree.UnresolvedName)
+						fn, err := ref.ToFunctionName()
+						require.NoError(t, err)
+						fd, err := tree.GetBuiltinFuncDefinition(fn, &sessiondata.DefaultSearchPath)
+						require.NoError(t, err)
+						if fd == nil {
+							foundUDF = true
+						}
+					}
+					return true, expr, nil
+				})
+				if err != nil {
+					return false, err
+				}
+				return foundUDF, nil
+			}
+
+			removeDefsDependOnUDFs := func(n *tree.CreateTable) {
+				var newDefs tree.TableDefs
+				for _, def := range n.Defs {
+					var usesUDF bool
+					switch d := def.(type) {
+					case *tree.CheckConstraintTableDef:
+						usesUDF, err = containsUDF(d.Expr)
+						require.NoError(t, err)
+						if usesUDF {
+							continue
+						}
+					case *tree.ColumnTableDef:
+						if d.DefaultExpr.Expr != nil {
+							usesUDF, err = containsUDF(d.DefaultExpr.Expr)
+							require.NoError(t, err)
+							if usesUDF {
+								d.DefaultExpr = struct {
+									Expr           tree.Expr
+									ConstraintName tree.Name
+								}{}
+							}
+						}
+					}
+					newDefs = append(newDefs, def)
+				}
+				n.Defs = newDefs
+			}
+
 			for _, flavor := range flavors {
 				t.Run(flavor.name, func(t *testing.T) {
 					maybeRandomlySkip(t)
@@ -1218,10 +1270,39 @@ func Backup(t *testing.T, path string, newCluster NewClusterFunc) {
 					tdb.Exec(t, fmt.Sprintf("USE %q", dbName))
 					waitForSchemaChangesToFinish(t, tdb)
 					afterRestore := tdb.QueryStr(t, fetchDescriptorStateQuery)
-					if b.isRollback {
-						require.Equal(t, before, afterRestore)
+
+					if flavor.name != "restore all tables in database" {
+						if b.isRollback {
+							require.Equal(t, before, afterRestore)
+						} else {
+							require.Equal(t, after, afterRestore)
+						}
 					} else {
-						require.Equal(t, after, afterRestore)
+						// If the flavor restore only tables, there can be missing UDF
+						// dependencies which cause check constraints or expressions
+						// dropped through RESTORE due to missing UDFs. We need to remove
+						// those kind of table elements from original AST.
+						var expected [][]string
+						if b.isRollback {
+							expected = before
+						} else {
+							expected = after
+						}
+						require.Equal(t, len(expected), len(afterRestore))
+						for i := range expected {
+							require.Equal(t, 1, len(expected[i]))
+							require.Equal(t, 1, len(afterRestore[i]))
+							afterNode, _ := parser.ParseOne(expected[i][0])
+							afterRestoreNode, _ := parser.ParseOne(afterRestore[i][0])
+							if _, ok := afterNode.AST.(*tree.CreateTable); !ok {
+								require.Equal(t, expected[i][0], afterRestore[i][0])
+							} else {
+								createTbl := afterNode.AST.(*tree.CreateTable)
+								removeDefsDependOnUDFs(createTbl)
+								createTblRestored := afterRestoreNode.AST.(*tree.CreateTable)
+								require.Equal(t, tree.AsString(createTbl), tree.AsString(createTblRestored))
+							}
+						}
 					}
 					// Hack to deal with corrupt userfiles tables due to #76764.
 					const validateQuery = `
@@ -1338,7 +1419,17 @@ func executeSchemaChangeTxn(
 	// declarative schema changer testing knobs don't get used.
 	tdb.Exec(t, "SET use_declarative_schema_changer = 'off'")
 	for _, stmt := range setup {
-		tdb.Exec(t, stmt.SQL)
+		_, err := db.Exec(stmt.SQL)
+		if err != nil {
+			// nolint:errcmp
+			switch errT := err.(type) {
+			case *pq.Error:
+				if string(errT.Code) == pgcode.FeatureNotSupported.String() {
+					skip.IgnoreLint(t, "skipping due to unimplemented feature in old cluster version.")
+				}
+			}
+			return err
+		}
 	}
 	waitForSchemaChangesToFinish(t, tdb)
 	if before != nil {
@@ -1482,7 +1573,7 @@ func ValidateMixedVersionElements(t *testing.T, path string, newCluster NewMixed
 								jobPauseResumeChannel <- p.JobID
 								<-waitForPause
 								pauseComplete = true
-								return roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "test")
+								return kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "test")
 							}
 							return nil
 						},

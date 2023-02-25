@@ -25,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -740,7 +742,7 @@ func (tc *TestCluster) changeReplicas(
 		}
 		var err error
 		desc, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, startKey.AsRawKey(), beforeDesc, roachpb.MakeReplicationChanges(changeType, targets...),
+			ctx, startKey.AsRawKey(), beforeDesc, kvpb.MakeReplicationChanges(changeType, targets...),
 		)
 		if kvserver.IsRetriableReplicationChangeError(err) {
 			tc.t.Logf("encountered retriable replication change error: %v", err)
@@ -962,7 +964,7 @@ func (tc *TestCluster) SwapVoterWithNonVoter(
 	); err != nil {
 		return nil, errors.Wrap(err, "range descriptor lookup error")
 	}
-	changes := []roachpb.ReplicationChange{
+	changes := []kvpb.ReplicationChange{
 		{ChangeType: roachpb.ADD_VOTER, Target: nonVoterTarget},
 		{ChangeType: roachpb.REMOVE_NON_VOTER, Target: nonVoterTarget},
 		{ChangeType: roachpb.ADD_NON_VOTER, Target: voterTarget},
@@ -1001,7 +1003,7 @@ func (tc *TestCluster) RebalanceVoter(
 	); err != nil {
 		return nil, errors.Wrap(err, "range descriptor lookup error")
 	}
-	changes := []roachpb.ReplicationChange{
+	changes := []kvpb.ReplicationChange{
 		{ChangeType: roachpb.REMOVE_VOTER, Target: src},
 		{ChangeType: roachpb.ADD_VOTER, Target: dest},
 	}
@@ -1152,7 +1154,7 @@ func (tc *TestCluster) MoveRangeLeaseNonCooperatively(
 		ls, err := r.TestingAcquireLease(ctx)
 		if err != nil {
 			log.Infof(ctx, "TestingAcquireLease failed: %s", err)
-			if lErr := (*roachpb.NotLeaseHolderError)(nil); errors.As(err, &lErr) && lErr.Lease != nil {
+			if lErr := (*kvpb.NotLeaseHolderError)(nil); errors.As(err, &lErr) && lErr.Lease != nil {
 				newLease = lErr.Lease
 			} else {
 				return err
@@ -1771,6 +1773,51 @@ func (tc *TestCluster) SplitTable(
 				t.Fatal(err)
 			}
 		}
+	}
+}
+
+// WaitForTenantCapabilities implements TestClusterInterface.
+func (tc *TestCluster) WaitForTenantCapabilities(
+	t *testing.T,
+	tenID roachpb.TenantID,
+	capabilityNames ...tenantcapabilitiespb.TenantCapabilityName,
+) {
+	for i, ts := range tc.Servers {
+		testutils.SucceedsSoon(t, func() error {
+			if tenID.IsSystem() {
+				return nil
+			}
+
+			if len(capabilityNames) > 0 {
+				missingCapabilityError := func(capabilityName tenantcapabilitiespb.TenantCapabilityName) error {
+					return errors.Newf("server=%d tenant %s does not have capability %q", i, tenID, capabilityName)
+				}
+				capabilities, found := ts.Server.TenantCapabilitiesReader().GetCapabilities(tenID)
+				if !found {
+					return missingCapabilityError(capabilityNames[0])
+				}
+
+				for _, capabilityName := range capabilityNames {
+					switch capabilityName {
+					case tenantcapabilitiespb.CanAdminSplit:
+						if !capabilities.CanAdminSplit {
+							return missingCapabilityError(capabilityName)
+						}
+					case tenantcapabilitiespb.CanViewNodeInfo:
+						if !capabilities.CanViewNodeInfo {
+							return missingCapabilityError(capabilityName)
+						}
+					case tenantcapabilitiespb.CanViewTSDBMetrics:
+						if !capabilities.CanViewTSDBMetrics {
+							return missingCapabilityError(capabilityName)
+						}
+					default:
+						t.Fatalf("unrecognized capability: %q", capabilityName)
+					}
+				}
+			}
+			return nil
+		})
 	}
 }
 

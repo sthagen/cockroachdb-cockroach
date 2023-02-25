@@ -292,6 +292,24 @@ var upgrades = []upgradebase.Upgrade{
 		upgrade.NoPrecondition,
 		waitForSchemaChangerElementMigration,
 	),
+	upgrade.NewTenantUpgrade(
+		"add secondary index on (path,username) to table system.privileges",
+		toCV(clusterversion.V23_1AlterSystemPrivilegesAddIndexOnPathAndUsername),
+		upgrade.NoPrecondition,
+		alterSystemPrivilegesAddSecondaryIndex,
+	),
+	upgrade.NewTenantUpgrade(
+		"add role_id column to system.database_role_settings table",
+		toCV(clusterversion.V23_1DatabaseRoleSettingsHasRoleIDColumn),
+		upgrade.NoPrecondition,
+		alterDatabaseRoleSettingsTableAddRoleIDColumn,
+	),
+	upgrade.NewTenantUpgrade(
+		"backfill role_id column in system.database_role_settings table",
+		toCV(clusterversion.V23_1DatabaseRoleSettingsRoleIDColumnBackfilled),
+		upgrade.NoPrecondition,
+		backfillDatabaseRoleSettingsTableRoleIDColumn,
+	),
 }
 
 func init() {

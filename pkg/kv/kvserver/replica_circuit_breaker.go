@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -35,8 +36,8 @@ import (
 type replicaInCircuitBreaker interface {
 	Clock() *hlc.Clock
 	Desc() *roachpb.RangeDescriptor
-	Send(context.Context, *roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error)
-	slowReplicationThreshold(ba *roachpb.BatchRequest) (time.Duration, bool)
+	Send(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error)
+	slowReplicationThreshold(ba *kvpb.BatchRequest) (time.Duration, bool)
 	replicaUnavailableError(err error) error
 	poisonInflightLatches(err error)
 }
@@ -144,6 +145,7 @@ func newReplicaCircuitBreaker(
 		Name:       "breaker", // log bridge has ctx tags
 		AsyncProbe: br.asyncProbe,
 		EventHandler: &replicaCircuitBreakerLogger{
+			ambientCtx: ambientCtx,
 			EventHandler: &circuit.EventLogger{
 				Log: func(buf redact.StringBuilder) {
 					log.Infof(ambientCtx.AnnotateCtx(context.Background()), "%s", buf)
@@ -159,15 +161,19 @@ func newReplicaCircuitBreaker(
 
 type replicaCircuitBreakerLogger struct {
 	circuit.EventHandler
-	onTrip  func()
-	onReset func()
+	ambientCtx log.AmbientContext
+	onTrip     func()
+	onReset    func()
 }
 
-func (r replicaCircuitBreakerLogger) OnTrip(br *circuit.Breaker, prev, cur error) {
+func (r replicaCircuitBreakerLogger) OnTrip(b *circuit.Breaker, prev, cur error) {
 	if prev == nil {
 		r.onTrip()
 	}
-	r.EventHandler.OnTrip(br, prev, cur)
+	// Log directly from this method via log.Errorf.
+	var buf redact.StringBuilder
+	circuit.EventFormatter{}.OnTrip(b, prev, cur, &buf)
+	log.Errorf(r.ambientCtx.AnnotateCtx(context.Background()), "%s", buf)
 }
 
 func (r replicaCircuitBreakerLogger) OnReset(br *circuit.Breaker) {
@@ -213,10 +219,10 @@ func sendProbe(ctx context.Context, r replicaInCircuitBreaker) error {
 	if !desc.IsInitialized() {
 		return nil
 	}
-	ba := &roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.Timestamp = r.Clock().Now()
 	ba.RangeID = r.Desc().RangeID
-	probeReq := &roachpb.ProbeRequest{}
+	probeReq := &kvpb.ProbeRequest{}
 	probeReq.Key = desc.StartKey.AsRawKey()
 	ba.Add(probeReq)
 	thresh, ok := r.slowReplicationThreshold(ba)
@@ -273,7 +279,7 @@ func replicaUnavailableError(
 		redact.Safe(rs), /* raft status contains no PII */
 	)
 
-	return roachpb.NewReplicaUnavailableError(errors.Wrapf(err, "%s", buf), desc, replDesc)
+	return kvpb.NewReplicaUnavailableError(errors.Wrapf(err, "%s", buf), desc, replDesc)
 }
 
 func (r *Replica) replicaUnavailableError(err error) error {

@@ -6,6 +6,7 @@ go_library(
     srcs = [
         "collection.go",
         "descriptor.go",
+        "dist_sql_function_resolver.go",
         "dist_sql_type_resolver.go",
         "errors.go",
         "factory.go",
@@ -91,8 +92,8 @@ go_test(
         "//pkg/base",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
-        "//pkg/roachpb",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",

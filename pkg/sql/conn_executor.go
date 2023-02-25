@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -63,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
@@ -956,6 +958,13 @@ func (s *Server) newConnExecutor(
 		memMetrics.SessionMaxBytesHist,
 		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
 	)
+	sessionPreparedMon := mon.NewMonitor(
+		"session prepared statements",
+		mon.MemoryResource,
+		memMetrics.SessionPreparedCurBytesCount,
+		memMetrics.SessionPreparedMaxBytesHist,
+		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
+	)
 	// The txn monitor is started in txnState.resetForNewSQLTxn().
 	txnMon := mon.NewMonitor(
 		"txn",
@@ -973,6 +982,7 @@ func (s *Server) newConnExecutor(
 		clientComm:          clientComm,
 		mon:                 sessionRootMon,
 		sessionMon:          sessionMon,
+		sessionPreparedMon:  sessionPreparedMon,
 		sessionDataStack:    sdMutIterator.sds,
 		dataMutatorIterator: sdMutIterator,
 		state: txnState{
@@ -1203,10 +1213,12 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 
 	if closeType != panicClose {
 		ex.state.mon.Stop(ctx)
+		ex.sessionPreparedMon.Stop(ctx)
 		ex.sessionMon.Stop(ctx)
 		ex.mon.Stop(ctx)
 	} else {
 		ex.state.mon.EmergencyStop(ctx)
+		ex.sessionPreparedMon.EmergencyStop(ctx)
 		ex.sessionMon.EmergencyStop(ctx)
 		ex.mon.EmergencyStop(ctx)
 	}
@@ -1252,6 +1264,9 @@ type connExecutor struct {
 	// statistics for result sets (which escape transactions).
 	mon        *mon.BytesMonitor
 	sessionMon *mon.BytesMonitor
+
+	// sessionPreparedMon tracks memory usage by prepared statements.
+	sessionPreparedMon *mon.BytesMonitor
 	// memMetrics contains the metrics that statements executed on this connection
 	// will contribute to.
 	memMetrics MemoryMetrics
@@ -1810,6 +1825,7 @@ func (ex *connExecutor) activate(
 	// single threaded, and the point of buffering is just to avoid contention.
 	ex.mon.Start(ctx, parentMon, reserved)
 	ex.sessionMon.StartNoReserved(ctx, ex.mon)
+	ex.sessionPreparedMon.StartNoReserved(ctx, ex.sessionMon)
 
 	// Enable the trace if configured.
 	if traceSessionEventLogEnabled.Get(&ex.server.cfg.Settings.SV) {
@@ -2135,8 +2151,19 @@ func (ex *connExecutor) execCmd() error {
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
-		res = ex.clientComm.CreateCopyInResult(pos)
-		ev, payload = ex.execCopyOut(ctx, tcmd)
+		res = ex.clientComm.CreateCopyOutResult(pos)
+
+		// Handle conn executor state transitions.
+		switch ex.machine.CurState().(type) {
+		case stateNoTxn:
+			ev, payload = ex.execStmtInNoTxnState(ctx, tcmd.Stmt, res.(CopyOutResult))
+		case stateOpen:
+			ev, payload = ex.execCopyOut(ctx, tcmd)
+		case stateAborted:
+			ev, payload = ex.execStmtInAbortedState(ctx, tcmd.Stmt, res.(CopyOutResult))
+		case stateCommitWait:
+			ev, payload = ex.execStmtInCommitWaitState(ctx, tcmd.Stmt, res.(CopyOutResult))
+		}
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
 		// because:
 		// - stats use ex.statsCollector, not ex.phasetimes.
@@ -2444,10 +2471,14 @@ func (ex *connExecutor) execCopyOut(
 		ex.incrementStartedStmtCounter(cmd.Stmt)
 		var copyErr error
 		var numOutputRows int
+		var cancelQuery context.CancelFunc
+		ctx, cancelQuery = contextutil.WithCancel(ctx)
+		queryID := ex.generateID()
 
 		// Log the query for sampling.
-		ex.setCopyLoggingFields(cmd.ParsedStmt)
 		defer func() {
+			ex.removeActiveQuery(queryID, cmd.Stmt)
+			cancelQuery()
 			// These fields are not available in COPY, so use the empty value.
 			f := tree.NewFmtCtx(tree.FmtHideConstants)
 			f.FormatNode(cmd.Stmt)
@@ -2475,19 +2506,15 @@ func (ex *connExecutor) execCopyOut(
 			)
 		}()
 
+		stmtTS := ex.server.cfg.Clock.PhysicalTime()
+		ex.resetPlanner(ctx, &ex.planner, ex.state.mu.txn, stmtTS)
+		ex.setCopyLoggingFields(cmd.ParsedStmt)
+
 		return ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
-			// Re-use the current transaction if available.
+			// We'll always have a txn on the planner since we called resetPlanner
+			// above.
 			txn := ex.planner.Txn()
-			if txn == nil || !txn.IsOpen() {
-				// Setup an implicit transaction for COPY TO.
-				txn = ex.server.cfg.DB.NewTxn(ctx, cmd.Stmt.String())
-				defer func(txn *kv.Txn, ctx context.Context) {
-					err := txn.Rollback(ctx)
-					if err != nil {
-						log.SqlExec.Errorf(ctx, "error rolling black implicit txn in %s: %+v", cmd, err)
-					}
-				}(txn, ctx)
-			}
+			ex.addActiveQuery(cmd.ParsedStmt, nil /* placeholders */, queryID, cancelQuery)
 
 			var err error
 			if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd); err != nil {
@@ -2722,7 +2749,7 @@ var retriableMinTimestampBoundUnsatisfiableError = errors.Newf(
 )
 
 func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) ||
+	return errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) ||
 		scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID ||
 		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
 		errors.Is(err, descidgen.ErrDescIDSequenceMigrationInProgress) ||
@@ -2737,7 +2764,7 @@ func (ex *connExecutor) makeErrEvent(err error, stmt tree.Statement) (fsm.Event,
 	// MaxTimestampBound set if our MinTimestampBound was bumped up from the
 	// original AS OF SYSTEM TIME timestamp set due to a schema bumping the
 	// timestamp to a higher value.
-	if minTSErr := (*roachpb.MinTimestampBoundUnsatisfiableError)(nil); errors.As(err, &minTSErr) {
+	if minTSErr := (*kvpb.MinTimestampBoundUnsatisfiableError)(nil); errors.As(err, &minTSErr) {
 		aost := ex.planner.EvalContext().AsOfSystemTime
 		if aost != nil && aost.BoundedStaleness {
 			if !aost.MaxTimestampBound.IsEmpty() && aost.MaxTimestampBound.LessEq(minTSErr.MinTimestampBound) {
@@ -2964,7 +2991,7 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 
 	// See resetPlanner for more context on setting the maximum timestamp for
 	// AOST read retries.
-	var minTSErr *roachpb.MinTimestampBoundUnsatisfiableError
+	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
 	if err := ex.state.mu.autoRetryReason; err != nil && errors.As(err, &minTSErr) {
 		evalCtx.AsOfSystemTime.MaxTimestampBound = ex.extraTxnState.descCollection.GetMaxTimestampBound()
 	} else if newTxn {
@@ -3019,7 +3046,7 @@ func (ex *connExecutor) resetPlanner(
 	// same minimum timestamp for the AOST read, but set the maximum timestamp
 	// to the point just before our failed read to ensure we don't try to read
 	// data which may be after the schema change when we retry.
-	var minTSErr *roachpb.MinTimestampBoundUnsatisfiableError
+	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
 	if err := ex.state.mu.autoRetryReason; err != nil && errors.As(err, &minTSErr) {
 		nextMax := minTSErr.MinTimestampBound
 		ex.extraTxnState.descCollection.SetMaxTimestampBound(nextMax)

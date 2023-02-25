@@ -578,6 +578,24 @@ type TableDescriptor interface {
 		databaseDesc DatabaseDescriptor, getType func(descpb.ID) (TypeDescriptor, error),
 	) (referencedAnywhere, referencedInColumns descpb.IDs, _ error)
 
+	// GetAllReferencedFunctionIDs returns descriptor IDs of all user defined
+	// functions referenced in this table.
+	GetAllReferencedFunctionIDs() (DescriptorIDSet, error)
+
+	// GetAllReferencedFunctionIDsInConstraint returns descriptor IDs of all user
+	// defined functions referenced in this check constraint.
+	GetAllReferencedFunctionIDsInConstraint(
+		cstID descpb.ConstraintID,
+	) (DescriptorIDSet, error)
+
+	// GetAllReferencedFunctionIDsInColumnExprs returns descriptor IDs of all user
+	// defined functions referenced by expressions in this column.
+	// Note: it extracts ids from expression strings, not from the UsesFunctionIDs
+	// field of column descriptors.
+	GetAllReferencedFunctionIDsInColumnExprs(
+		colID descpb.ColumnID,
+	) (DescriptorIDSet, error)
+
 	// ForeachDependedOnBy runs a function on all indexes, including those being
 	// added in the mutations.
 	ForeachDependedOnBy(f func(dep *descpb.TableDescriptor_Reference) error) error
@@ -589,6 +607,9 @@ type TableDescriptor interface {
 	// GetDependsOnTypes returns the IDs of all types that this view depends on.
 	// It's only non-nil if IsView is true.
 	GetDependsOnTypes() []descpb.ID
+	// GetDependsOnFunctions returns the IDs of all functions that this view
+	// depends on. It's only non-nil if IsView is true.
+	GetDependsOnFunctions() []descpb.ID
 
 	// AllConstraints returns all constraints in this table, regardless if
 	// they're enforced yet or not. The ordering of the constraints within this

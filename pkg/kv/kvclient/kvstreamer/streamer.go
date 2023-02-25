@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -76,7 +77,7 @@ type Result struct {
 	// that the response is no longer needed.
 	//
 	// GetResp is guaranteed to have nil IntentValue.
-	GetResp *roachpb.GetResponse
+	GetResp *kvpb.GetResponse
 	// ScanResp can contain a partial response to a ScanRequest (when
 	// scanComplete is false). In that case, there will be a further result with
 	// the continuation; that result will use the same Key. Notably, SQL rows
@@ -84,7 +85,7 @@ type Result struct {
 	//
 	// The response is always using BATCH_RESPONSE format (meaning that Rows
 	// field is always nil). IntentRows field is also nil.
-	ScanResp *roachpb.ScanResponse
+	ScanResp *kvpb.ScanResponse
 	// Position tracks the ordinal among all originally enqueued requests that
 	// this result satisfies. See singleRangeBatch.positions for more details.
 	// TODO(yuzefovich): this might need to be []int when non-unique requests
@@ -442,7 +443,7 @@ func (s *Streamer) Init(
 // Currently, enqueuing new requests while there are still requests in progress
 // from the previous invocation is prohibited.
 // TODO(yuzefovich): lift this restriction and introduce the pipelining.
-func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (retErr error) {
+func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retErr error) {
 	if !s.coordinatorStarted {
 		var coordinatorCtx context.Context
 		coordinatorCtx, s.coordinatorCtxCancel = s.stopper.WithCancelOnQuiesce(ctx)
@@ -537,7 +538,7 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (re
 			return ri.Error()
 		}
 		// Find all requests that touch the current range.
-		var singleRangeReqs []roachpb.RequestUnion
+		var singleRangeReqs []kvpb.RequestUnion
 		var positions []int
 		if allRequestsAreWithinSingleRange {
 			// All requests are within this range, so we can just use the
@@ -561,9 +562,11 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (re
 		}
 		var subRequestIdx []int32
 		var subRequestIdxOverhead int64
-		if !s.hints.SingleRowLookup {
-			for i, pos := range positions {
-				if _, isScan := reqs[pos].GetInner().(*roachpb.ScanRequest); isScan {
+		var numScansInReqs int64
+		for i, pos := range positions {
+			if _, isScan := reqs[pos].GetInner().(*kvpb.ScanRequest); isScan {
+				numScansInReqs++
+				if !s.hints.SingleRowLookup {
 					if firstScanRequest {
 						// We have some ScanRequests, and each might touch
 						// multiple ranges, so we have to set up
@@ -596,6 +599,7 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (re
 			}
 		}
 
+		numGetsInReqs := int64(len(singleRangeReqs)) - numScansInReqs
 		overheadAccountedFor := requestUnionSliceOverhead + requestUnionOverhead*int64(cap(singleRangeReqs)) + // reqs
 			intSliceOverhead + intSize*int64(cap(positions)) + // positions
 			subRequestIdxOverhead // subRequestIdx
@@ -603,6 +607,7 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []roachpb.RequestUnion) (re
 			reqs:                 singleRangeReqs,
 			positions:            positions,
 			subRequestIdx:        subRequestIdx,
+			numGetsInReqs:        numGetsInReqs,
 			reqsReservedBytes:    requestsMemUsage(singleRangeReqs),
 			overheadAccountedFor: overheadAccountedFor,
 		}
@@ -778,7 +783,7 @@ type workerCoordinator struct {
 	asyncSem *quotapool.IntPool
 
 	// For request and response admission control.
-	requestAdmissionHeader roachpb.AdmissionHeader
+	requestAdmissionHeader kvpb.AdmissionHeader
 	responseAdmissionQ     *admission.WorkQueue
 }
 
@@ -1000,14 +1005,32 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 	for !w.s.requestsToServe.emptyLocked() && maxNumRequestsToIssue > 0 && !budgetIsExhausted {
 		singleRangeReqs := w.s.requestsToServe.nextLocked()
 		availableBudget := w.s.budget.limitBytes - w.s.budget.mu.acc.Used()
-		// minAcceptableBudget is the minimum TargetBytes limit with which it
-		// makes sense to issue this request (if we issue the request with
-		// smaller limit, then it's very likely to come back with an empty
-		// response).
-		minAcceptableBudget := singleRangeReqs.minTargetBytes
-		if minAcceptableBudget == 0 {
-			minAcceptableBudget = avgResponseSize
+		// minTargetBytes is the minimum TargetBytes limit with which it makes
+		// sense to issue this single-range BatchRequest (if we issue the
+		// request with smaller limit, then it's very likely to result only in
+		// empty responses).
+		minTargetBytes := singleRangeReqs.minTargetBytes
+		if minTargetBytes == 0 {
+			minTargetBytes = avgResponseSize
 		}
+		// TargetBytes limit only accounts for the footprint of the responses,
+		// ignoring the overhead of GetResponse and ScanResponse structs. Thus,
+		// we need to account for that overhead separately from the TargetBytes
+		// limit.
+		//
+		// Regardless of the fact how many non-empty responses we'll receive,
+		// the BatchResponse will get a corresponding GetResponse or
+		// ScanResponse struct for each of the requests. Furthermore, the
+		// BatchResponse will get an extra ResponseUnion struct for each
+		// response.
+		responsesOverhead := getResponseOverhead*singleRangeReqs.numGetsInReqs +
+			scanResponseOverhead*(int64(len(singleRangeReqs.reqs))-singleRangeReqs.numGetsInReqs) +
+			int64(len(singleRangeReqs.reqs))*responseUnionOverhead
+		// minAcceptableBudget is an estimate on the lower bound of how much
+		// memory budget we must have available in order to issue this
+		// single-range BatchRequest so that we won't discard the corresponding
+		// BatchResponse.
+		minAcceptableBudget := minTargetBytes + responsesOverhead
 		if availableBudget < minAcceptableBudget {
 			if !headOfLine {
 				// We don't have enough budget available to serve this request,
@@ -1030,10 +1053,10 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 		// how much memory the response will need, and we reserve this
 		// estimation up front.
 		//
-		// Note that TargetBytes will be a strict limit on the response size
-		// (except in a degenerate case for head-of-the-line request that will
-		// get a very large single row in response which will exceed this
-		// limit).
+		// Note that TargetBytes will be a strict limit on the footprint of the
+		// responses (except in a degenerate case for head-of-the-line request
+		// that will get a very large single row in response which will exceed
+		// this limit).
 		targetBytes := int64(len(singleRangeReqs.reqs)) * avgResponseSize
 		// Make sure that targetBytes is sufficient to receive non-empty
 		// response. Our estimate might be an under-estimate when responses vary
@@ -1041,14 +1064,32 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 		if targetBytes < singleRangeReqs.minTargetBytes {
 			targetBytes = singleRangeReqs.minTargetBytes
 		}
-		if targetBytes > availableBudget {
-			// The estimate tells us that we don't have enough budget to receive
-			// the full response; however, in order to utilize the available
-			// budget fully, we can still issue this request with the truncated
-			// TargetBytes value hoping to receive a partial response.
-			targetBytes = availableBudget
+		if targetBytes+responsesOverhead > availableBudget {
+			// We don't have enough budget to account for both the TargetBytes
+			// limit and the overhead of the responses. We give higher
+			// precedence to the former (choosing the performance over the
+			// stability), so we always truncate the responses' overhead and
+			// might reduce the TargetBytes limit. This is ok since our
+			// estimates are on the best effort basis, and we'll do precise
+			// accounting when we receive the BatchResponse.
+			// TODO(yuzefovich): consider not including all of the requests from
+			// singleRangeReqs.reqs into the BatchRequest in cases when we're
+			// low on the available budget.
+			if targetBytes > availableBudget {
+				// The estimate tells us that we don't have enough budget to
+				// receive non-empty responses for all requests in the
+				// BatchRequest; however, in order to utilize the available
+				// budget fully, we can still issue this BatchRequest with the
+				// truncated TargetBytes value hoping to receive non-empty
+				// results at least for some requests.
+				targetBytes = availableBudget
+				responsesOverhead = 0
+			} else {
+				responsesOverhead = availableBudget - targetBytes
+			}
 		}
-		if err := w.s.budget.consumeLocked(ctx, targetBytes, headOfLine /* allowDebt */); err != nil {
+		toConsume := targetBytes + responsesOverhead
+		if err := w.s.budget.consumeLocked(ctx, toConsume, headOfLine /* allowDebt */); err != nil {
 			// This error cannot be because of the budget going into debt. If
 			// headOfLine is true, then we're allowing debt; otherwise, we have
 			// truncated targetBytes above to not exceed availableBudget, and
@@ -1083,7 +1124,7 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 			// any more responses at the moment.
 			return err
 		}
-		w.performRequestAsync(ctx, singleRangeReqs, targetBytes, headOfLine)
+		w.performRequestAsync(ctx, singleRangeReqs, targetBytes, responsesOverhead, headOfLine)
 		w.s.requestsToServe.removeNextLocked()
 		maxNumRequestsToIssue--
 		headOfLine = false
@@ -1138,13 +1179,15 @@ const AsyncRequestOp = "streamer-lookup-async"
 // w.asyncSem to spin up a new goroutine for this request.
 //
 // targetBytes specifies the memory budget that this single-range batch should
-// be issued with. targetBytes bytes have already been consumed from the budget,
-// and this amount of memory is owned by the goroutine that is spun up to
-// perform the request. Once the response is received, performRequestAsync
-// reconciles the budget so that the actual footprint of the response is
-// consumed. Each Result produced based on that response will track a part of
-// the memory reservation (according to the Result's footprint) that will be
-// returned back to the budget once Result.Release() is called.
+// be issued with. responsesOverhead specifies the estimate for the overhead of
+// the responses to the requests in this single-range batch. targetBytes and
+// responsesOverhead bytes have already been consumed from the budget, and this
+// amount of memory is owned by the goroutine that is spun up to perform the
+// request. Once the response is received, performRequestAsync reconciles the
+// budget so that the actual footprint of the response is consumed. Each Result
+// produced based on that response will track a part of the memory reservation
+// (according to the Result's footprint) that will be returned back to the
+// budget once Result.Release() is called.
 //
 // headOfLine indicates whether this request is the current head of the line and
 // there are no unreleased Results. Head-of-the-line requests are treated
@@ -1152,7 +1195,11 @@ const AsyncRequestOp = "streamer-lookup-async"
 // caller is responsible for ensuring that there is at most one asynchronous
 // request with headOfLine=true at all times.
 func (w *workerCoordinator) performRequestAsync(
-	ctx context.Context, req singleRangeBatch, targetBytes int64, headOfLine bool,
+	ctx context.Context,
+	req singleRangeBatch,
+	targetBytes int64,
+	responsesOverhead int64,
+	headOfLine bool,
 ) {
 	w.s.waitGroup.Add(1)
 	w.s.adjustNumRequestsInFlight(1 /* delta */)
@@ -1167,7 +1214,7 @@ func (w *workerCoordinator) performRequestAsync(
 		},
 		func(ctx context.Context) {
 			defer w.asyncRequestCleanup(false /* budgetMuAlreadyLocked */)
-			ba := &roachpb.BatchRequest{}
+			ba := &kvpb.BatchRequest{}
 			ba.Header.WaitPolicy = w.lockWaitPolicy
 			ba.Header.TargetBytes = targetBytes
 			ba.Header.AllowEmpty = !headOfLine
@@ -1219,7 +1266,7 @@ func (w *workerCoordinator) performRequestAsync(
 
 			// Now adjust the budget based on the actual memory footprint of
 			// non-empty responses as well as resume spans, if any.
-			respOverestimate := targetBytes - fp.memoryFootprintBytes
+			respOverestimate := targetBytes + responsesOverhead - fp.memoryFootprintBytes - fp.responsesOverhead
 			reqOveraccounted := req.reqsReservedBytes - fp.resumeReqsMemUsage
 			if fp.resumeReqsMemUsage == 0 {
 				// There will be no resume request, so we will lose the
@@ -1244,6 +1291,9 @@ func (w *workerCoordinator) performRequestAsync(
 				// but not enough for that large row).
 				toConsume := -overaccountedTotal
 				if err = w.s.budget.consume(ctx, toConsume, headOfLine /* allowDebt */); err != nil {
+					// TODO(yuzefovich): rather than dropping the response
+					// altogether, consider blocking to wait for the budget to
+					// open up, up to some limit.
 					atomic.AddInt64(&w.s.atomics.droppedBatchResponses, 1)
 					w.s.budget.release(ctx, targetBytes)
 					if !headOfLine {
@@ -1300,9 +1350,20 @@ func (w *workerCoordinator) performRequestAsync(
 // response to a singleRangeBatch.
 type singleRangeBatchResponseFootprint struct {
 	// memoryFootprintBytes tracks the total memory footprint of non-empty
-	// responses. This will be equal to the sum of memory tokens created for all
-	// Results.
+	// responses (excluding the overhead of the GetResponse and ScanResponse
+	// structs).
+	//
+	// In combination with responsesOverhead it will be equal to the sum of
+	// memory tokens created for all Results.
 	memoryFootprintBytes int64
+	// responsesOverhead tracks the overhead of the GetResponse and ScanResponse
+	// structs. Note that this doesn't need to track the overhead of
+	// ResponseUnion structs because we store GetResponses and ScanResponses
+	// directly in Result.
+	//
+	// In combination with memoryFootprintBytes it will be equal to the sum of
+	// memory tokens created for all Results.
+	responsesOverhead int64
 	// resumeReqsMemUsage tracks the memory usage of the requests for the
 	// ResumeSpans.
 	resumeReqsMemUsage int64
@@ -1323,13 +1384,13 @@ func (fp singleRangeBatchResponseFootprint) hasIncomplete() bool {
 // calculateFootprint calculates the memory footprint of the batch response as
 // well as of the requests that will have to be created for the ResumeSpans.
 func calculateFootprint(
-	req singleRangeBatch, br *roachpb.BatchResponse,
+	req singleRangeBatch, br *kvpb.BatchResponse,
 ) (fp singleRangeBatchResponseFootprint, _ error) {
 	for i, resp := range br.Responses {
 		reply := resp.GetInner()
 		switch req.reqs[i].GetInner().(type) {
-		case *roachpb.GetRequest:
-			get := reply.(*roachpb.GetResponse)
+		case *kvpb.GetRequest:
+			get := reply.(*kvpb.GetResponse)
 			if get.IntentValue != nil {
 				return fp, errors.AssertionFailedf(
 					"unexpectedly got an IntentValue back from a SQL GetRequest %v", *get.IntentValue,
@@ -1342,10 +1403,11 @@ func calculateFootprint(
 			} else {
 				// This Get was completed.
 				fp.memoryFootprintBytes += getResponseSize(get)
+				fp.responsesOverhead += getResponseOverhead
 				fp.numGetResults++
 			}
-		case *roachpb.ScanRequest:
-			scan := reply.(*roachpb.ScanResponse)
+		case *kvpb.ScanRequest:
+			scan := reply.(*kvpb.ScanResponse)
 			if len(scan.Rows) > 0 {
 				return fp, errors.AssertionFailedf(
 					"unexpectedly got a ScanResponse using KEY_VALUES response format",
@@ -1360,6 +1422,7 @@ func calculateFootprint(
 				fp.memoryFootprintBytes += scanResponseSize(scan)
 			}
 			if len(scan.BatchResponses) > 0 || scan.ResumeSpan == nil {
+				fp.responsesOverhead += scanResponseOverhead
 				fp.numScanResults++
 			}
 			if scan.ResumeSpan != nil {
@@ -1384,7 +1447,7 @@ func processSingleRangeResponse(
 	ctx context.Context,
 	s *Streamer,
 	req singleRangeBatch,
-	br *roachpb.BatchResponse,
+	br *kvpb.BatchResponse,
 	fp singleRangeBatchResponseFootprint,
 ) {
 	processSingleRangeResults(ctx, s, req, br, fp)
@@ -1402,7 +1465,7 @@ func processSingleRangeResults(
 	ctx context.Context,
 	s *Streamer,
 	req singleRangeBatch,
-	br *roachpb.BatchResponse,
+	br *kvpb.BatchResponse,
 	fp singleRangeBatchResponseFootprint,
 ) {
 	// If there are no results, this function has nothing to do.
@@ -1458,7 +1521,7 @@ func processSingleRangeResults(
 		}
 		reply := resp.GetInner()
 		switch response := reply.(type) {
-		case *roachpb.GetResponse:
+		case *kvpb.GetResponse:
 			get := response
 			if get.ResumeSpan != nil {
 				// This Get wasn't completed.
@@ -1472,7 +1535,7 @@ func processSingleRangeResults(
 				subRequestDone: true,
 			}
 			result.memoryTok.streamer = s
-			result.memoryTok.toRelease = getResponseSize(get)
+			result.memoryTok.toRelease = getResponseSize(get) + getResponseOverhead
 			memoryTokensBytes += result.memoryTok.toRelease
 			if buildutil.CrdbTestBuild {
 				if fp.numGetResults == 0 {
@@ -1483,7 +1546,7 @@ func processSingleRangeResults(
 			}
 			s.results.addLocked(result)
 
-		case *roachpb.ScanResponse:
+		case *kvpb.ScanResponse:
 			scan := response
 			if len(scan.BatchResponses) == 0 && scan.ResumeSpan != nil {
 				// Only the first part of the conditional is true whenever we
@@ -1502,7 +1565,7 @@ func processSingleRangeResults(
 				subRequestDone: scan.ResumeSpan == nil,
 			}
 			result.memoryTok.streamer = s
-			result.memoryTok.toRelease = scanResponseSize(scan)
+			result.memoryTok.toRelease = scanResponseSize(scan) + scanResponseOverhead
 			memoryTokensBytes += result.memoryTok.toRelease
 			result.ScanResp = scan
 			if s.hints.SingleRowLookup {
@@ -1534,10 +1597,12 @@ func processSingleRangeResults(
 	}
 
 	if buildutil.CrdbTestBuild {
-		if fp.memoryFootprintBytes != memoryTokensBytes {
+		if fp.memoryFootprintBytes+fp.responsesOverhead != memoryTokensBytes {
 			panic(errors.AssertionFailedf(
-				"different calculation of memory footprint\ncalculateFootprint: %d bytes\n"+
-					"processSingleRangeResults: %d bytes", fp.memoryFootprintBytes, memoryTokensBytes,
+				"different calculation of memory footprint\n"+
+					"calculateFootprint: memoryFootprintBytes = %d bytes, responsesOverhead = %d bytes\n"+
+					"processSingleRangeResults: %d bytes",
+				fp.memoryFootprintBytes, fp.responsesOverhead, memoryTokensBytes,
 			))
 		}
 	}
@@ -1551,10 +1616,7 @@ func processSingleRangeResults(
 // Note that it should only be called if the response has any incomplete
 // requests.
 func buildResumeSingleRangeBatch(
-	s *Streamer,
-	req singleRangeBatch,
-	br *roachpb.BatchResponse,
-	fp singleRangeBatchResponseFootprint,
+	s *Streamer, req singleRangeBatch, br *kvpb.BatchResponse, fp singleRangeBatchResponseFootprint,
 ) (resumeReq singleRangeBatch) {
 	numIncompleteRequests := fp.numIncompleteGets + fp.numIncompleteScans
 	// We have to allocate the new Get and Scan requests, but we can reuse the
@@ -1562,6 +1624,7 @@ func buildResumeSingleRangeBatch(
 	resumeReq.reqs = req.reqs[:numIncompleteRequests]
 	resumeReq.positions = req.positions[:0]
 	resumeReq.subRequestIdx = req.subRequestIdx[:0]
+	resumeReq.numGetsInReqs = int64(fp.numIncompleteGets)
 	// We've already reconciled the budget with the actual reservation for the
 	// requests with the ResumeSpans.
 	resumeReq.reqsReservedBytes = fp.resumeReqsMemUsage
@@ -1571,19 +1634,19 @@ func buildResumeSingleRangeBatch(
 	// requests are modified by txnSeqNumAllocator, even if they are not
 	// evaluated due to TargetBytes limit).
 	gets := make([]struct {
-		req   roachpb.GetRequest
-		union roachpb.RequestUnion_Get
+		req   kvpb.GetRequest
+		union kvpb.RequestUnion_Get
 	}, fp.numIncompleteGets)
 	scans := make([]struct {
-		req   roachpb.ScanRequest
-		union roachpb.RequestUnion_Scan
+		req   kvpb.ScanRequest
+		union kvpb.RequestUnion_Scan
 	}, fp.numIncompleteScans)
 	var resumeReqIdx int
 	for i, resp := range br.Responses {
 		position := req.positions[i]
 		reply := resp.GetInner()
 		switch response := reply.(type) {
-		case *roachpb.GetResponse:
+		case *kvpb.GetResponse:
 			get := response
 			if get.ResumeSpan == nil {
 				continue
@@ -1605,7 +1668,7 @@ func buildResumeSingleRangeBatch(
 			}
 			resumeReqIdx++
 
-		case *roachpb.ScanResponse:
+		case *kvpb.ScanResponse:
 			scan := response
 			if scan.ResumeSpan == nil {
 				continue
@@ -1615,7 +1678,7 @@ func buildResumeSingleRangeBatch(
 			newScan := scans[0]
 			scans = scans[1:]
 			newScan.req.SetSpan(*scan.ResumeSpan)
-			newScan.req.ScanFormat = roachpb.BATCH_RESPONSE
+			newScan.req.ScanFormat = kvpb.BATCH_RESPONSE
 			newScan.req.KeyLocking = s.keyLocking
 			newScan.union.Scan = &newScan.req
 			resumeReq.reqs[resumeReqIdx].Value = &newScan.union
@@ -1665,7 +1728,7 @@ func buildResumeSingleRangeBatch(
 	// request. We don't have to do this if there aren't any incomplete requests
 	// since req and resumeReq will be garbage collected on their own.
 	for i := numIncompleteRequests; i < len(req.reqs); i++ {
-		req.reqs[i] = roachpb.RequestUnion{}
+		req.reqs[i] = kvpb.RequestUnion{}
 	}
 	atomic.AddInt64(&s.atomics.resumeBatchRequests, 1)
 	atomic.AddInt64(&s.atomics.resumeSingleRangeRequests, int64(numIncompleteRequests))

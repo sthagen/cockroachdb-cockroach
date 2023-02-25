@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -1224,9 +1225,9 @@ func (r *DistSQLReceiver) setErrorWithoutStatusUpdate(err error, willDeferStatus
 	defer r.resultWriterMu.Unlock()
 	// Check if the error we just received should take precedence over a
 	// previous error (if any).
-	if roachpb.ErrPriority(err) > roachpb.ErrPriority(r.resultWriterMu.row.Err()) {
+	if kvpb.ErrPriority(err) > kvpb.ErrPriority(r.resultWriterMu.row.Err()) {
 		if r.txn != nil {
-			if retryErr := (*roachpb.UnhandledRetryableError)(nil); errors.As(err, &retryErr) {
+			if retryErr := (*kvpb.UnhandledRetryableError)(nil); errors.As(err, &retryErr) {
 				// Update the txn in response to remote errors. In the
 				// non-DistSQL world, the TxnCoordSender handles "unhandled"
 				// retryable errors, but this one is coming from a distributed
@@ -1852,10 +1853,6 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 		// We place a sequence point before every cascade, so
 		// that each subsequent cascade can observe the writes
 		// by the previous step.
-		// TODO(radu): the cascades themselves can have more cascades; if any of
-		// those fall back to legacy cascades code, it will disable stepping. So we
-		// have to reenable stepping each time.
-		_ = planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
 		if err := planner.Txn().Step(ctx); err != nil {
 			recv.SetError(err)
 			return false
@@ -1926,10 +1923,6 @@ func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 
 	// We place a sequence point before the checks, so that they observe the
 	// writes of the main query and/or any cascades.
-	// TODO(radu): the cascades themselves can have more cascades; if any of
-	// those fall back to legacy cascades code, it will disable stepping. So we
-	// have to reenable stepping each time.
-	_ = planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
 	if err := planner.Txn().Step(ctx); err != nil {
 		recv.SetError(err)
 		return false

@@ -73,6 +73,7 @@ const (
 	restoreOptIntoDB                    = "into_db"
 	restoreOptSkipMissingFKs            = "skip_missing_foreign_keys"
 	restoreOptSkipMissingSequences      = "skip_missing_sequences"
+	restoreOptSkipMissingUDFs           = "skip_missing_udfs"
 	restoreOptSkipMissingSequenceOwners = "skip_missing_sequence_owners"
 	restoreOptSkipMissingViews          = "skip_missing_views"
 	restoreOptSkipLocalitiesCheck       = "skip_localities_check"
@@ -187,6 +188,22 @@ func allocateDescriptorRewrites(
 					return nil, errors.Errorf(
 						"cannot restore table %q without referenced table %d (or %q option)",
 						table.Name, fk.ReferencedTableID, restoreOptSkipMissingFKs,
+					)
+				}
+			}
+		}
+
+		// Check that functions referenced in check constraints exist.
+		fnIDs, err := table.GetAllReferencedFunctionIDs()
+		if err != nil {
+			return nil, err
+		}
+		for _, fnID := range fnIDs.Ordered() {
+			if _, ok := functionsByID[fnID]; !ok {
+				if !opts.SkipMissingUDFs {
+					return nil, errors.Errorf(
+						"cannot restore table %q without referenced function %d (or %q option)",
+						table.Name, fnID, restoreOptSkipMissingUDFs,
 					)
 				}
 			}
@@ -869,6 +886,7 @@ func resolveOptionsForRestoreJobDescription(
 		SkipMissingSequences:      opts.SkipMissingSequences,
 		SkipMissingSequenceOwners: opts.SkipMissingSequenceOwners,
 		SkipMissingViews:          opts.SkipMissingViews,
+		SkipMissingUDFs:           opts.SkipMissingUDFs,
 		Detached:                  opts.Detached,
 		SchemaOnly:                opts.SchemaOnly,
 		VerifyData:                opts.VerifyData,
@@ -964,6 +982,9 @@ func restoreTypeCheck(
 			tree.Exprs(restoreStmt.Options.DecryptionKMSURI),
 			tree.Exprs(restoreStmt.Options.IncrementalStorage),
 		),
+		exprutil.Bools{
+			restoreStmt.Options.IncludeAllSecondaryTenants,
+		},
 		exprutil.Strings{
 			restoreStmt.Subdir,
 			restoreStmt.Options.EncryptionPassphrase,
@@ -1116,6 +1137,18 @@ func restorePlanHook(
 		}
 	}
 
+	var restoreAllTenants bool
+	if restoreStmt.Options.IncludeAllSecondaryTenants != nil {
+		if restoreStmt.DescriptorCoverage != tree.AllDescriptors {
+			return nil, nil, nil, false, errors.New("the include_all_secondary_tenants option is only supported for full cluster restores")
+		}
+		var err error
+		restoreAllTenants, err = exprEval.Bool(ctx, restoreStmt.Options.IncludeAllSecondaryTenants)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+	}
+
 	var newTenantID *roachpb.TenantID
 	var newTenantName *roachpb.TenantName
 	if restoreStmt.Options.AsTenant != nil || restoreStmt.Options.ForceTenantID != nil {
@@ -1202,7 +1235,7 @@ func restorePlanHook(
 		// locality aware.
 
 		return doRestorePlan(
-			ctx, restoreStmt, &exprEval, p, from, incStorage, pw, kms, intoDB,
+			ctx, restoreStmt, &exprEval, p, from, incStorage, pw, kms, restoreAllTenants, intoDB,
 			newDBName, newTenantID, newTenantName, endTime, resultsCh, subdir,
 		)
 	}
@@ -1393,6 +1426,7 @@ func doRestorePlan(
 	incFrom []string,
 	passphrase string,
 	kms []string,
+	restoreAllTenants bool,
 	intoDB string,
 	newDBName string,
 	newTenantID *roachpb.TenantID,
@@ -1639,7 +1673,7 @@ func doRestorePlan(
 	}
 
 	sqlDescs, restoreDBs, descsByTablePattern, tenants, err := selectTargets(
-		ctx, p, mainBackupManifests, layerToIterFactory, restoreStmt.Targets, restoreStmt.DescriptorCoverage, endTime,
+		ctx, p, mainBackupManifests, layerToIterFactory, restoreStmt.Targets, restoreStmt.DescriptorCoverage, endTime, restoreAllTenants,
 	)
 	if err != nil {
 		return errors.Wrap(err,

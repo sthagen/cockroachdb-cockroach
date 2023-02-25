@@ -253,6 +253,62 @@ func (i *immediateVisitor) UpdateTableBackReferencesInSequences(
 	return nil
 }
 
+func (i *immediateVisitor) AddTableConstraintBackReferencesInFunctions(
+	ctx context.Context, op scop.AddTableConstraintBackReferencesInFunctions,
+) error {
+	for _, fnID := range op.FunctionIDs {
+		fnDesc, err := i.checkOutFunction(ctx, fnID)
+		if err != nil {
+			return err
+		}
+		if err := fnDesc.AddConstraintReference(op.BackReferencedTableID, op.BackReferencedConstraintID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (i *immediateVisitor) RemoveTableConstraintBackReferencesFromFunctions(
+	ctx context.Context, op scop.RemoveTableConstraintBackReferencesFromFunctions,
+) error {
+	for _, fnID := range op.FunctionIDs {
+		fnDesc, err := i.checkOutFunction(ctx, fnID)
+		if err != nil {
+			return err
+		}
+		fnDesc.RemoveConstraintReference(op.BackReferencedTableID, op.BackReferencedConstraintID)
+	}
+	return nil
+}
+
+func (i *immediateVisitor) RemoveTableColumnBackReferencesInFunctions(
+	ctx context.Context, op scop.RemoveTableColumnBackReferencesInFunctions,
+) error {
+	tblDesc, err := i.checkOutTable(ctx, op.BackReferencedTableID)
+	if err != nil {
+		return err
+	}
+	var fnIDsInUse catalog.DescriptorIDSet
+	if !tblDesc.Dropped() {
+		// If table is dropped then there is no functions in use.
+		fnIDsInUse, err = tblDesc.GetAllReferencedFunctionIDsInColumnExprs(op.BackReferencedColumnID)
+		if err != nil {
+			return err
+		}
+	}
+	for _, id := range op.FunctionIDs {
+		if fnIDsInUse.Contains(id) {
+			continue
+		}
+		fnDesc, err := i.checkOutFunction(ctx, id)
+		if err != nil {
+			return err
+		}
+		fnDesc.RemoveColumnReference(op.BackReferencedTableID, op.BackReferencedColumnID)
+	}
+	return nil
+}
+
 // Look through `seqID`'s dependedOnBy slice, find the back-reference to `tblID`,
 // and update it to either
 //   - upsert `colID` to ColumnIDs field of that back-reference, if `forwardRefs` contains `seqID`; or

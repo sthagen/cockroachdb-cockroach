@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
@@ -1237,7 +1238,7 @@ func (r *Replica) getReplicaDescriptorRLocked() (roachpb.ReplicaDescriptor, erro
 	if ok {
 		return repDesc, nil
 	}
-	return roachpb.ReplicaDescriptor{}, roachpb.NewRangeNotFoundError(r.RangeID, r.store.StoreID())
+	return roachpb.ReplicaDescriptor{}, kvpb.NewRangeNotFoundError(r.RangeID, r.store.StoreID())
 }
 
 func (r *Replica) getMergeCompleteCh() chan struct{} {
@@ -1300,10 +1301,12 @@ func (r *Replica) SetMVCCStatsForTesting(stats *enginepb.MVCCStats) {
 //
 // Use LoadStats.QueriesPerSecond for all other purposes.
 func (r *Replica) GetMaxSplitQPS(ctx context.Context) (float64, bool) {
-	if r.store.splitConfig.SplitObjective() != SplitQPS {
+	snap := r.loadBasedSplitter.Snapshot(ctx, r.Clock().PhysicalTime())
+
+	if snap.SplitObjective != split.SplitQPS {
 		return 0, false
 	}
-	return r.loadBasedSplitter.MaxStat(ctx, r.Clock().PhysicalTime())
+	return snap.Max, snap.Ok
 }
 
 // GetMaxSplitCPU returns the Replica's maximum CPU/s rate over a configured
@@ -1316,10 +1319,12 @@ func (r *Replica) GetMaxSplitQPS(ctx context.Context) (float64, bool) {
 // Use LoadStats.RaftCPUNanosPerSecond and RequestCPUNanosPerSecond for current
 // CPU stats for all other purposes.
 func (r *Replica) GetMaxSplitCPU(ctx context.Context) (float64, bool) {
-	if r.store.splitConfig.SplitObjective() != SplitCPU {
+	snap := r.loadBasedSplitter.Snapshot(ctx, r.Clock().PhysicalTime())
+
+	if snap.SplitObjective != split.SplitCPU {
 		return 0, false
 	}
-	return r.loadBasedSplitter.MaxStat(ctx, r.Clock().PhysicalTime())
+	return snap.Max, snap.Ok
 }
 
 // ContainsKey returns whether this range contains the specified key.
@@ -1580,7 +1585,7 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 // might be ok with this if they know that they will end up checking for a
 // pending merge at some later time.
 func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
-	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard,
+	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard,
 ) (kvserverpb.LeaseStatus, error) {
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
@@ -1658,7 +1663,7 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 // iterator. An error indicates that the request's timestamp is below the
 // Replica's GC threshold.
 func (r *Replica) checkExecutionCanProceedAfterStorageSnapshot(
-	ctx context.Context, ba *roachpb.BatchRequest, st kvserverpb.LeaseStatus,
+	ctx context.Context, ba *kvpb.BatchRequest, st kvserverpb.LeaseStatus,
 ) error {
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
@@ -1697,7 +1702,7 @@ func (r *Replica) checkExecutionCanProceedAfterStorageSnapshot(
 // checkExecutionCanProceedRWOrAdmin returns an error if a batch request going
 // through the RW or admin paths cannot be executed by the Replica.
 func (r *Replica) checkExecutionCanProceedRWOrAdmin(
-	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard,
+	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard,
 ) (kvserverpb.LeaseStatus, error) {
 	st, err := r.checkExecutionCanProceedBeforeStorageSnapshot(ctx, ba, g)
 	if err != nil {
@@ -1716,7 +1721,7 @@ func (r *Replica) checkExecutionCanProceedRWOrAdmin(
 // returned bool indicates whether the lease should be extended (only on nil
 // error).
 func (r *Replica) checkLeaseRLocked(
-	ctx context.Context, ba *roachpb.BatchRequest,
+	ctx context.Context, ba *kvpb.BatchRequest,
 ) (kvserverpb.LeaseStatus, bool, error) {
 	now := r.Clock().NowAsClockTimestamp()
 	// If the request is a write or a consistent read, it requires the
@@ -1738,7 +1743,7 @@ func (r *Replica) checkLeaseRLocked(
 	//
 	// If the request is an INCONSISTENT request (and thus a read), it similarly
 	// doesn't check the lease.
-	if !ba.IsSingleSkipsLeaseCheckRequest() && ba.ReadConsistency != roachpb.INCONSISTENT {
+	if !ba.IsSingleSkipsLeaseCheckRequest() && ba.ReadConsistency != kvpb.INCONSISTENT {
 		// Check the lease.
 		var err error
 		shouldExtend, err = r.leaseGoodToGoForStatusRLocked(ctx, now, reqTS, st)
@@ -1791,7 +1796,7 @@ func (r *Replica) checkSpanInRangeRLocked(ctx context.Context, rspan roachpb.RSp
 	if desc.ContainsKeyRange(rspan.Key, rspan.EndKey) {
 		return nil
 	}
-	return roachpb.NewRangeKeyMismatchErrorWithCTPolicy(
+	return kvpb.NewRangeKeyMismatchErrorWithCTPolicy(
 		ctx, rspan.Key.AsRawKey(), rspan.EndKey.AsRawKey(), desc, r.mu.state.Lease, r.closedTimestampPolicyRLocked())
 }
 
@@ -1804,7 +1809,7 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 	if threshold.Less(ts) {
 		return nil
 	}
-	return &roachpb.BatchTimestampBeforeGCError{
+	return &kvpb.BatchTimestampBeforeGCError{
 		Timestamp:              ts,
 		Threshold:              threshold,
 		DataExcludedFromBackup: r.excludeReplicaFromBackupRLocked(),
@@ -1816,7 +1821,7 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 // If not, an error is returned to prevent the request from proceeding until the
 // merge completes.
 func (r *Replica) shouldWaitForPendingMergeRLocked(
-	ctx context.Context, ba *roachpb.BatchRequest,
+	ctx context.Context, ba *kvpb.BatchRequest,
 ) error {
 	if !r.mergeInProgressRLocked() {
 		log.Fatal(ctx, "programming error: shouldWaitForPendingMergeRLocked should"+
@@ -1916,7 +1921,7 @@ func (r *Replica) shouldWaitForPendingMergeRLocked(
 	// merge. Instead, we release the latches we acquired above and return a
 	// MergeInProgressError. The store will catch that error and resubmit the
 	// request after mergeCompleteCh closes. See #27442 for the full context.
-	return &roachpb.MergeInProgressError{}
+	return &kvpb.MergeInProgressError{}
 }
 
 // isNewerThanSplit is a helper used in split(Pre|Post)Apply to
@@ -2032,23 +2037,23 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 
 	taskCtx := r.AnnotateCtx(context.Background())
 	err = r.store.stopper.RunAsyncTask(taskCtx, "wait-for-merge", func(ctx context.Context) {
-		var pushTxnRes *roachpb.PushTxnResponse
+		var pushTxnRes *kvpb.PushTxnResponse
 		for retry := retry.Start(base.DefaultRetryOptions()); retry.Next(); {
 			// Wait for the merge transaction to complete by attempting to push it. We
 			// don't want to accidentally abort the merge transaction, so we use the
 			// minimum transaction priority. Note that a push type of
-			// roachpb.PUSH_TOUCH, though it might appear more semantically correct,
+			// kvpb.PUSH_TOUCH, though it might appear more semantically correct,
 			// returns immediately and causes us to spin hot, whereas
-			// roachpb.PUSH_ABORT efficiently blocks until the transaction completes.
+			// kvpb.PUSH_ABORT efficiently blocks until the transaction completes.
 			b := &kv.Batch{}
 			b.Header.Timestamp = r.Clock().Now()
-			b.AddRawRequest(&roachpb.PushTxnRequest{
-				RequestHeader: roachpb.RequestHeader{Key: intentRes.Intent.Txn.Key},
+			b.AddRawRequest(&kvpb.PushTxnRequest{
+				RequestHeader: kvpb.RequestHeader{Key: intentRes.Intent.Txn.Key},
 				PusherTxn: roachpb.Transaction{
 					TxnMeta: enginepb.TxnMeta{Priority: enginepb.MinTxnPriority},
 				},
 				PusheeTxn: intentRes.Intent.Txn,
-				PushType:  roachpb.PUSH_ABORT,
+				PushType:  kvpb.PUSH_ABORT,
 			})
 			if err := r.store.DB().Run(ctx, b); err != nil {
 				select {
@@ -2063,7 +2068,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 					continue
 				}
 			}
-			pushTxnRes = b.RawResponse().Responses[0].GetInner().(*roachpb.PushTxnResponse)
+			pushTxnRes = b.RawResponse().Responses[0].GetInner().(*kvpb.PushTxnResponse)
 			break
 		}
 
@@ -2082,17 +2087,17 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 			// transaction completed, resolved its intents, and GC'd its transaction
 			// record before our PushTxn arrived. To figure out what happened, we
 			// need to look in meta2.
-			var getRes *roachpb.GetResponse
+			var getRes *kvpb.GetResponse
 			for retry := retry.Start(base.DefaultRetryOptions()); retry.Next(); {
 				metaKey := keys.RangeMetaKey(desc.EndKey)
-				res, pErr := kv.SendWrappedWith(ctx, r.store.DB().NonTransactionalSender(), roachpb.Header{
+				res, pErr := kv.SendWrappedWith(ctx, r.store.DB().NonTransactionalSender(), kvpb.Header{
 					// Use READ_UNCOMMITTED to avoid trying to resolve intents, since
 					// resolving those intents might involve sending requests to this
 					// range, and that could deadlock. See the comment on
 					// TestStoreRangeMergeConcurrentSplit for details.
-					ReadConsistency: roachpb.READ_UNCOMMITTED,
-				}, &roachpb.GetRequest{
-					RequestHeader: roachpb.RequestHeader{Key: metaKey.AsRawKey()},
+					ReadConsistency: kvpb.READ_UNCOMMITTED,
+				}, &kvpb.GetRequest{
+					RequestHeader: kvpb.RequestHeader{Key: metaKey.AsRawKey()},
 				})
 				if pErr != nil {
 					select {
@@ -2107,7 +2112,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 						continue
 					}
 				}
-				getRes = res.(*roachpb.GetResponse)
+				getRes = res.(*kvpb.GetResponse)
 				break
 			}
 			if getRes.Value == nil {
@@ -2134,7 +2139,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 			// The merge committed but the left-hand replica on this store hasn't
 			// subsumed this replica yet. Mark this replica as destroyed so it
 			// doesn't serve requests when we close the mergeCompleteCh below.
-			r.mu.destroyStatus.Set(roachpb.NewRangeNotFoundError(r.RangeID, r.store.StoreID()), destroyReasonMergePending)
+			r.mu.destroyStatus.Set(kvpb.NewRangeNotFoundError(r.RangeID, r.store.StoreID()), destroyReasonMergePending)
 		}
 		// Unblock pending requests. If the merge committed, the requests will
 		// notice that the replica has been destroyed and return an appropriate
@@ -2211,11 +2216,11 @@ func (r *Replica) getReplicaDescriptorByIDRLocked(
 // transaction abort error.
 func checkIfTxnAborted(
 	ctx context.Context, rec batcheval.EvalContext, reader storage.Reader, txn roachpb.Transaction,
-) *roachpb.Error {
+) *kvpb.Error {
 	var entry roachpb.AbortSpanEntry
 	aborted, err := rec.AbortSpan().Get(ctx, reader, txn.ID, &entry)
 	if err != nil {
-		return roachpb.NewError(roachpb.NewReplicaCorruptionError(
+		return kvpb.NewError(kvpb.NewReplicaCorruptionError(
 			errors.Wrap(err, "could not read from AbortSpan")))
 	}
 	if aborted {
@@ -2227,8 +2232,8 @@ func checkIfTxnAborted(
 			newTxn.Priority = entry.Priority
 		}
 		newTxn.Status = roachpb.ABORTED
-		return roachpb.NewErrorWithTxn(
-			roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORT_SPAN), newTxn)
+		return kvpb.NewErrorWithTxn(
+			kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_ABORT_SPAN), newTxn)
 	}
 	return nil
 }

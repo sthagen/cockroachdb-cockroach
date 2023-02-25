@@ -72,7 +72,7 @@ func (p *planner) addColumnImpl(
 	}
 	d = newDef
 
-	cdd, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
+	cdd, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext(), tree.ColumnDefaultExprInAddColumn)
 	if err != nil {
 		return err
 	}
@@ -139,7 +139,8 @@ func (p *planner) addColumnImpl(
 
 	if d.IsComputed() {
 		serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
-			params.ctx, n.tableDesc, d, tn, "computed column", params.p.SemaCtx(),
+			params.ctx, n.tableDesc, d, tn, tree.ComputedColumnExprContext(d.IsVirtual()), params.p.SemaCtx(),
+			params.ExecCfg().Settings.Version.ActiveVersion(params.ctx),
 		)
 		if err != nil {
 			return err

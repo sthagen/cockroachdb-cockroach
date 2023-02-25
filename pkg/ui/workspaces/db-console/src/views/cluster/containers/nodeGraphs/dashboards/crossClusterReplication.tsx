@@ -23,12 +23,12 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Replication Lag"
       sources={storeSources}
-      tooltip={`The time between the wall clock and replicated time of the replication stream. 
+      tooltip={`The time between the wall clock and replicated time of the replication stream.
           This metric tracks how far behind the replication stream is relative to now.`}
     >
       <Axis units={AxisUnits.Duration} label="time">
         <Metric
-          name="cr.node.replication.frontier_lag_seconds"
+          name="cr.node.replication.frontier_lag_nanos"
           title="Replication Lag"
         />
       </Axis>
@@ -36,9 +36,9 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Logical Bytes"
       sources={storeSources}
-      tooltip={`Logical bytes (sum of keys + values) ingested by all replication jobs`}
+      tooltip={`Rate at which the logical bytes (sum of keys + values) are ingested by all replication jobs`}
     >
-      <Axis units={AxisUnits.Duration} label="time">
+      <Axis units={AxisUnits.Bytes} label="bytes">
         <Metric
           name="cr.node.replication.logical_bytes"
           title="Logical Bytes"
@@ -49,9 +49,9 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="SST Bytes"
       sources={storeSources}
-      tooltip={`SST bytes (compressed) sent to KV by all replication jobs`}
+      tooltip={`Rate at which the SST bytes (compressed) are sent to KV by all replication jobs`}
     >
-      <Axis units={AxisUnits.Duration} label="time">
+      <Axis units={AxisUnits.Bytes} label="bytes">
         <Metric
           name="cr.node.replication.sst_bytes"
           title="SST Bytes"

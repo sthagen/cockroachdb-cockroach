@@ -88,7 +88,6 @@ var (
 	// to make it global and operate on runCmd.Flags() directly.
 	overrideFlagset  *pflag.FlagSet
 	overrideNumNodes = -1
-	buildTag         string
 	clusterName      string
 	clusterWipe      bool
 	zonesF           string
@@ -98,6 +97,7 @@ var (
 
 const (
 	defaultEncryptionProbability = 1
+	defaultCockroachPath         = "./cockroach-default"
 )
 
 type errBinaryOrLibraryNotFound struct {
@@ -1156,7 +1156,7 @@ func (c *clusterImpl) FetchLogs(ctx context.Context, l *logger.Logger) error {
 			}
 		}
 
-		if err := c.RunE(ctx, c.All(), "mkdir -p logs/redacted && ./cockroach debug merge-logs --redact logs/*.log > logs/redacted/combined.log"); err != nil {
+		if err := c.RunE(ctx, c.All(), fmt.Sprintf("mkdir -p logs/redacted && %s debug merge-logs --redact logs/*.log > logs/redacted/combined.log", defaultCockroachPath)); err != nil {
 			l.Printf("failed to redact logs: %v", err)
 			if ctx.Err() != nil {
 				return err
@@ -1236,7 +1236,7 @@ func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger)
 			sec = fmt.Sprintf("--certs-dir=%s", certs)
 		}
 		if err := c.RunE(
-			ctx, c.Node(node), fmt.Sprintf("./cockroach debug tsdump %s --format=raw > tsdump.gob", sec),
+			ctx, c.Node(node), fmt.Sprintf("%s debug tsdump %s --format=raw > tsdump.gob", defaultCockroachPath, sec),
 		); err != nil {
 			return err
 		}
@@ -1302,17 +1302,17 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, l *logger.Logger) error
 		// assumption that a down node will refuse the connection, so it won't
 		// waste our time.
 		for i := 1; i <= c.spec.NodeCount; i++ {
-			// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
+			// `cockroach debug zip` is noisy. Suppress the output unless it fails.
 			//
 			// Ignore the files in the the log directory; we pull the logs separately anyway
 			// so this would only cause duplication.
 			excludeFiles := "*.log,*.txt,*.pprof"
 			cmd := fmt.Sprintf(
-				"./cockroach debug zip --exclude-files='%s' --url {pgurl:%d} %s",
-				excludeFiles, i, zipName,
+				"%s debug zip --exclude-files='%s' --url {pgurl:%d} %s",
+				defaultCockroachPath, excludeFiles, i, zipName,
 			)
 			if err := c.RunE(ctx, c.Node(i), cmd); err != nil {
-				l.Printf("./cockroach debug zip failed on node %d: %v", i, err)
+				l.Printf("%s debug zip failed on node %d: %v", defaultCockroachPath, i, err)
 				if i < c.spec.NodeCount {
 					continue
 				}
@@ -1655,6 +1655,18 @@ func (c *clusterImpl) PutE(
 	c.status("uploading file")
 	defer c.status("")
 	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
+}
+
+// PutDefaultCockroach uploads the cockroach binary passed in the
+// command line to `defaultCockroachPath` in every node in the
+// cluster. This binary is used by the test runner to collect failure
+// artifacts since tests are free to upload the cockroach binary they
+// use to any location they desire.
+func (c *clusterImpl) PutDefaultCockroach(
+	ctx context.Context, l *logger.Logger, cockroachPath string,
+) error {
+	c.status("uploading default cockroach binary to nodes")
+	return c.PutE(ctx, l, cockroachPath, defaultCockroachPath, c.All())
 }
 
 // PutLibraries inserts the specified libraries, by name, into all nodes on the cluster
@@ -2400,7 +2412,7 @@ func (c *clusterImpl) NewMonitor(ctx context.Context, opts ...option.Option) clu
 func (c *clusterImpl) StartGrafana(
 	ctx context.Context, l *logger.Logger, promCfg *prometheus.Config,
 ) error {
-	return roachprod.StartGrafana(ctx, l, c.name, "", promCfg)
+	return roachprod.StartGrafana(ctx, l, c.name, "", nil, promCfg)
 }
 
 func (c *clusterImpl) StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error {

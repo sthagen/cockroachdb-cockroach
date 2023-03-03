@@ -416,6 +416,16 @@ ORDER BY table_name
 			},
 		},
 		{
+			name:   "unescaped newline in quoted field",
+			create: `a string, b string`,
+			with:   `WITH fields_enclosed_by = '$'`,
+			typ:    "DELIMITED",
+			data:   "foo\t$foo\nbar$\nfoo\tbar",
+			query: map[string][][]string{
+				`SELECT * FROM t`: {{"foo", "foo\nbar"}, {"foo", "bar"}},
+			},
+		},
+		{
 			name:   "field enclosure in middle of unquoted field",
 			create: `a string, b string`,
 			with:   `WITH fields_enclosed_by = '$'`,
@@ -6262,7 +6272,7 @@ func TestImportPgDumpSchemas(t *testing.T) {
 	baseDir := datapathutils.TestDataPath(t, "pgdump")
 	mkArgs := func() base.TestServerArgs {
 		s := cluster.MakeTestingClusterSettings()
-		storage.MVCCRangeTombstonesEnabled.Override(ctx, &s.SV, true)
+		storage.MVCCRangeTombstonesEnabledInMixedClusters.Override(ctx, &s.SV, true)
 		return base.TestServerArgs{
 			Settings:      s,
 			ExternalIODir: baseDir,

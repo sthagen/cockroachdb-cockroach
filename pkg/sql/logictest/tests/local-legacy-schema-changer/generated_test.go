@@ -702,6 +702,13 @@ func TestLogic_errors(
 	runLogicTest(t, "errors")
 }
 
+func TestLogic_event_log_legacy(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "event_log_legacy")
+}
+
 func TestLogic_exclude_data_from_backup(
 	t *testing.T,
 ) {
@@ -1708,6 +1715,13 @@ func TestLogic_show_transfer_state(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "show_transfer_state")
+}
+
+func TestLogic_show_var(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_var")
 }
 
 func TestLogic_span_builtins(

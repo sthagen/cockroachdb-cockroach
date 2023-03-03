@@ -175,7 +175,7 @@ const HotRangesTable = ({
         cell: val => (
           <>
             {val.replica_node_ids.map((nodeId, idx, arr) => (
-              <Link to={`/node/${nodeId}`}>
+              <Link to={`/node/${nodeId}`} key={nodeId}>
                 {nodeId}
                 {idx < arr.length - 1 && ", "}
               </Link>
@@ -252,7 +252,12 @@ const HotRangesTable = ({
           val.table_name.startsWith("/") ? (
             val.table_name
           ) : (
-            <Link to={`/database/${val.database_name}/table/${val.table_name}`}>
+            <Link
+              to={util.EncodeDatabaseTableUri(
+                val.database_name,
+                val.table_name,
+              )}
+            >
               {val.table_name}
             </Link>
           ),

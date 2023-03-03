@@ -515,11 +515,17 @@ https://www.postgresql.org/docs/9.6/catalog-pg-cast.html`,
 			if ctxOrigin == cast.ContextOriginPgCast {
 				castCtx := cCtx.PGString()
 
+				castFunc := tree.DNull
+				if srcTyp, ok := types.OidToType[src]; ok {
+					if v, ok := builtins.CastBuiltinOIDs[tgt][srcTyp.Family()]; ok {
+						castFunc = tree.NewDOid(v)
+					}
+				}
 				_ = addRow(
 					h.CastOid(src, tgt),      // oid
 					tree.NewDOid(src),        // cast source
 					tree.NewDOid(tgt),        // casttarget
-					tree.DNull,               // castfunc
+					castFunc,                 // castfunc
 					tree.NewDString(castCtx), // castcontext
 					tree.DNull,               // castmethod
 				)
@@ -1142,9 +1148,26 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 					}
 					h := makeOidHasher()
 					scResolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
-					sc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, table.GetParentSchemaID())
-					if err != nil {
-						return false, err
+					var sc catalog.SchemaDescriptor
+					if table.IsTemporary() {
+						// Temp tables from other sessions should still be visible here.
+						// Ideally, the catalog API would be able to return the temporary
+						// schemas from other sessions, but it cannot right now. See
+						// https://github.com/cockroachdb/cockroach/issues/97822.
+						if err := forEachSchema(ctx, p, db, false /* requiresPrivileges*/, func(schema catalog.SchemaDescriptor) error {
+							if schema.GetID() == table.GetParentSchemaID() {
+								sc = schema
+							}
+							return nil
+						}); err != nil {
+							return false, err
+						}
+					}
+					if sc == nil {
+						sc, err = p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, table.GetParentSchemaID())
+						if err != nil {
+							return false, err
+						}
 					}
 					if err := populateFromTable(ctx, p, h, db, sc, table, scResolver,
 						addRow); err != nil {

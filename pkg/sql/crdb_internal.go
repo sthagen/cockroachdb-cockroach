@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -166,6 +167,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalLocalSessionsTableID:               crdbInternalLocalSessionsTable,
 		catconstants.CrdbInternalLocalMetricsTableID:                crdbInternalLocalMetricsTable,
 		catconstants.CrdbInternalNodeExecutionInsightsTableID:       crdbInternalNodeExecutionInsightsTable,
+		catconstants.CrdbInternalNodeMemoryMonitorsTableID:          crdbInternalNodeMemoryMonitors,
 		catconstants.CrdbInternalNodeStmtStatsTableID:               crdbInternalNodeStmtStatsTable,
 		catconstants.CrdbInternalNodeTxnExecutionInsightsTableID:    crdbInternalNodeTxnExecutionInsightsTable,
 		catconstants.CrdbInternalNodeTxnStatsTableID:                crdbInternalNodeTxnStatsTable,
@@ -196,6 +198,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalActiveRangeFeedsTable:              crdbInternalActiveRangeFeedsTable,
 		catconstants.CrdbInternalTenantUsageDetailsViewID:           crdbInternalTenantUsageDetailsView,
 		catconstants.CrdbInternalPgCatalogTableIsImplementedTableID: crdbInternalPgCatalogTableIsImplementedTable,
+		catconstants.CrdbInternalShowTenantCapabilitiesCacheTableID: crdbInternalShowTenantCapabilitiesCache,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -1417,8 +1420,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			return err
 		}
 		if !hasViewActivityOrViewActivityRedacted {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s or %s privilege", p.User(), roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		sqlStats, err := getSQLStats(p, "crdb_internal.node_statement_statistics")
@@ -1643,8 +1645,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			return err
 		}
 		if !hasViewActivityOrhasViewActivityRedacted {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s or %s privilege", p.User(), roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		sqlStats, err := getSQLStats(p, "crdb_internal.node_transaction_statistics")
@@ -6596,8 +6597,7 @@ CREATE TABLE crdb_internal.transaction_contention_events (
 			return nil, nil, err
 		}
 		if !hasPermission {
-			return nil, nil, errors.New("crdb_internal.transaction_contention_events " +
-				"requires VIEWACTIVITY or VIEWACTIVITYREDACTED role option")
+			return nil, nil, noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		// If a user has VIEWACTIVITYREDACTED role option but the user does not
@@ -6881,8 +6881,7 @@ func genClusterLocksGenerator(
 			return nil, nil, err
 		}
 		if !hasViewActivityOrViewActivityRedacted {
-			return nil, nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s or %s privilege", p.User(), roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+			return nil, nil, noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 		shouldRedactKeys := false
 		if !hasAdmin {
@@ -7167,7 +7166,8 @@ CREATE TABLE crdb_internal.%s (
   problems                   STRING[] NOT NULL,
   causes                     STRING[] NOT NULL,
   stmt_execution_ids         STRING[] NOT NULL,
-  cpu_sql_nanos              INT8
+  cpu_sql_nanos              INT8,
+  last_error_code            STRING
 )`
 
 var crdbInternalClusterTxnExecutionInsightsTable = virtualSchemaTable{
@@ -7197,13 +7197,7 @@ func populateTxnExecutionInsights(
 		return err
 	}
 	if !hasRoleOption {
-		return pgerror.Newf(
-			pgcode.InsufficientPrivilege,
-			"user %s does not have %s or %s privilege",
-			p.User(),
-			roleoption.VIEWACTIVITY,
-			roleoption.VIEWACTIVITYREDACTED,
-		)
+		return noViewActivityOrViewActivityRedactedRoleError(p.User())
 	}
 
 	response, err := p.extendedEvalCtx.SQLStatusServer.ListExecutionInsights(ctx, request)
@@ -7214,6 +7208,7 @@ func populateTxnExecutionInsights(
 	// We should truncate the query if it surpasses some absurd limit.
 	queryMax := 5000
 	for _, insight := range response.Insights {
+		var errorCode string
 		var queryBuilder strings.Builder
 		for i := range insight.Statements {
 			// Build query string.
@@ -7228,6 +7223,10 @@ func populateTxnExecutionInsights(
 				queryBuilder.WriteString(" ; ")
 			}
 			queryBuilder.WriteString(insight.Statements[i].Query)
+
+			if insight.Statements[i].ErrorCode != "" {
+				errorCode = insight.Statements[i].ErrorCode
+			}
 		}
 
 		problems := tree.NewDArray(types.String)
@@ -7296,6 +7295,7 @@ func populateTxnExecutionInsights(
 			causes,
 			stmtIDs,
 			tree.NewDInt(tree.DInt(insight.Transaction.CPUSQLNanos)),
+			tree.NewDString(errorCode),
 		))
 
 		if err != nil {
@@ -7334,7 +7334,8 @@ CREATE TABLE crdb_internal.%s (
 	contention                 INTERVAL,
 	index_recommendations      STRING[] NOT NULL,
 	implicit_txn               BOOL NOT NULL,
-	cpu_sql_nanos              INT8
+	cpu_sql_nanos              INT8,
+    error_code                 STRING
 )`
 
 var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
@@ -7353,6 +7354,16 @@ var crdbInternalNodeExecutionInsightsTable = virtualSchemaTable{
 	},
 }
 
+func noViewActivityOrViewActivityRedactedRoleError(user username.SQLUsername) error {
+	return pgerror.Newf(
+		pgcode.InsufficientPrivilege,
+		"user %s does not have %s or %s privilege",
+		user,
+		roleoption.VIEWACTIVITY,
+		roleoption.VIEWACTIVITYREDACTED,
+	)
+}
+
 func populateStmtInsights(
 	ctx context.Context,
 	p *planner,
@@ -7364,13 +7375,7 @@ func populateStmtInsights(
 		return err
 	}
 	if !hasRoleOption {
-		return pgerror.Newf(
-			pgcode.InsufficientPrivilege,
-			"user %s does not have %s or %s privilege",
-			p.User(),
-			roleoption.VIEWACTIVITY,
-			roleoption.VIEWACTIVITYREDACTED,
-		)
+		return noViewActivityOrViewActivityRedactedRoleError(p.User())
 	}
 
 	response, err := p.extendedEvalCtx.SQLStatusServer.ListExecutionInsights(ctx, request)
@@ -7453,6 +7458,7 @@ func populateStmtInsights(
 				indexRecommendations,
 				tree.MakeDBool(tree.DBool(insight.Transaction.ImplicitTxn)),
 				tree.NewDInt(tree.DInt(s.CPUSQLNanos)),
+				tree.NewDString(s.ErrorCode),
 			))
 		}
 	}
@@ -7476,28 +7482,139 @@ func getContentionEventInfo(
 	var tableDesc catalog.TableDescriptor
 	tableDesc, err = desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 	if err != nil {
-		return "", "", "", "", err
-	}
-
-	idxDesc, err := catalog.MustFindIndexByID(tableDesc, descpb.IndexID(indexID))
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	dbDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Database(ctx, tableDesc.GetParentID())
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	schemaDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, tableDesc.GetParentSchemaID())
-	if err != nil {
-		return "", "", "", "", err
+		return "", "", fmt.Sprintf("[dropped table id: %d]", tableID), "[dropped index]", nil //nolint:returnerrcheck
 	}
 
 	var idxName string
+	idxDesc, err := catalog.MustFindIndexByID(tableDesc, descpb.IndexID(indexID))
+	if err != nil {
+		idxName = fmt.Sprintf("[dropped index id: %d]", indexID)
+	}
 	if idxDesc != nil {
 		idxName = idxDesc.GetName()
 	}
 
-	return schemaDesc.GetName(), dbDesc.GetName(), tableDesc.GetName(), idxName, nil
+	var databaseName string
+	dbDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Database(ctx, tableDesc.GetParentID())
+	if err != nil {
+		databaseName = "[dropped database]"
+	}
+	if dbDesc != nil {
+		databaseName = dbDesc.GetName()
+	}
+
+	var schName string
+	schemaDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, tableDesc.GetParentSchemaID())
+	if err != nil {
+		schName = "[dropped schema]"
+	}
+	if dbDesc != nil {
+		schName = schemaDesc.GetName()
+	}
+
+	return schName, databaseName, tableDesc.GetName(), idxName, nil
+}
+
+var crdbInternalNodeMemoryMonitors = virtualSchemaTable{
+	comment: `node-level table listing all currently active memory monitors`,
+	schema: `
+CREATE TABLE crdb_internal.node_memory_monitors (
+  level             INT8,
+  name              STRING,
+  id                INT8,
+  parent_id         INT8,
+  used              INT8,
+  reserved_used     INT8,
+  reserved_reserved INT8
+);`,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		// The memory monitors' names can expose some information about the
+		// activity on the node, so we require VIEWACTIVITY or
+		// VIEWACTIVITYREDACTED permissions.
+		hasRoleOption, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
+			return err
+		}
+		if !hasRoleOption {
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
+		}
+
+		monitorStateCb := func(monitor mon.MonitorState) error {
+			return addRow(
+				tree.NewDInt(tree.DInt(monitor.Level)),
+				tree.NewDString(monitor.Name),
+				tree.NewDInt(tree.DInt(monitor.ID)),
+				tree.NewDInt(tree.DInt(monitor.ParentID)),
+				tree.NewDInt(tree.DInt(monitor.Used)),
+				tree.NewDInt(tree.DInt(monitor.ReservedUsed)),
+				tree.NewDInt(tree.DInt(monitor.ReservedReserved)),
+			)
+		}
+		return p.extendedEvalCtx.ExecCfg.RootMemoryMonitor.TraverseTree(monitorStateCb)
+	},
+}
+
+var crdbInternalShowTenantCapabilitiesCache = virtualSchemaTable{
+	comment: `eventually consistent in-memory tenant capability cache for this node`,
+	schema: `
+CREATE TABLE crdb_internal.node_tenant_capabilities_cache (
+  tenant_id        INT,
+  capability_name  STRING,
+  capability_value STRING
+);`,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+
+		const op = "node_tenant_capabilities_cache"
+		if err := p.RequireAdminRole(ctx, op); err != nil {
+			return err
+		}
+		tenantCapabilitiesReader, err := p.ExecCfg().TenantCapabilitiesReader.Get(op)
+		if err != nil {
+			return err
+		}
+		type tenantCapabilitiesEntry struct {
+			tenantID           roachpb.TenantID
+			tenantCapabilities tenantcapabilitiespb.TenantCapabilities
+		}
+		tenantCapabilitiesMap := tenantCapabilitiesReader.GetCapabilitiesMap()
+		tenantCapabilitiesEntries := make([]tenantCapabilitiesEntry, 0, len(tenantCapabilitiesMap))
+		for tenantID, tenantCapabilities := range tenantCapabilitiesMap {
+			tenantCapabilitiesEntries = append(
+				tenantCapabilitiesEntries,
+				tenantCapabilitiesEntry{
+					tenantID:           tenantID,
+					tenantCapabilities: tenantCapabilities,
+				},
+			)
+		}
+		// Sort by tenant ID.
+		sort.Slice(tenantCapabilitiesEntries, func(i, j int) bool {
+			return tenantCapabilitiesEntries[i].tenantID.ToUint64() < tenantCapabilitiesEntries[j].tenantID.ToUint64()
+		})
+		for _, tenantCapabilitiesEntry := range tenantCapabilitiesEntries {
+			tenantID := tree.NewDInt(tree.DInt(tenantCapabilitiesEntry.tenantID.ToUint64()))
+			if err := addRow(
+				tenantID,
+				tree.NewDString(tenantcapabilitiespb.CanAdminSplit.String()),
+				tree.NewDString(strconv.FormatBool(tenantCapabilitiesEntry.tenantCapabilities.CanAdminSplit)),
+			); err != nil {
+				return err
+			}
+			if err := addRow(
+				tenantID,
+				tree.NewDString(tenantcapabilitiespb.CanViewNodeInfo.String()),
+				tree.NewDString(strconv.FormatBool(tenantCapabilitiesEntry.tenantCapabilities.CanViewNodeInfo)),
+			); err != nil {
+				return err
+			}
+			if err := addRow(
+				tenantID,
+				tree.NewDString(tenantcapabilitiespb.CanViewTSDBMetrics.String()),
+				tree.NewDString(strconv.FormatBool(tenantCapabilitiesEntry.tenantCapabilities.CanViewTSDBMetrics)),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
 }

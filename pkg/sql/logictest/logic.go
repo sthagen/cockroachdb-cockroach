@@ -1347,13 +1347,8 @@ func (t *logicTest) newCluster(
 	// There isn't really a downside to doing so.
 	tempStorageDiskLimit := int64(512 << 20) /* 512 MiB */
 	// MVCC range tombstones are only available in 22.2 or newer.
-	supportsMVCCRangeTombstones := (t.cfg.BootstrapVersion.Equal(roachpb.Version{}) ||
-		!t.cfg.BootstrapVersion.Less(clusterversion.ByKey(clusterversion.TODODelete_V22_2SetSystemUsersUserIDColumnNotNull))) &&
-		(t.cfg.BinaryVersion.Equal(roachpb.Version{}) ||
-			!t.cfg.BinaryVersion.Less(clusterversion.ByKey(clusterversion.TODODelete_V22_2SetSystemUsersUserIDColumnNotNull)))
 	shouldUseMVCCRangeTombstonesForPointDeletes := useMVCCRangeTombstonesForPointDeletes && !serverArgs.DisableUseMVCCRangeTombstonesForPointDeletes
-	ignoreMVCCRangeTombstoneErrors := supportsMVCCRangeTombstones &&
-		(globalMVCCRangeTombstone || shouldUseMVCCRangeTombstonesForPointDeletes)
+	ignoreMVCCRangeTombstoneErrors := globalMVCCRangeTombstone || shouldUseMVCCRangeTombstonesForPointDeletes
 
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
@@ -1366,11 +1361,10 @@ func (t *logicTest) newCluster(
 				Store: &kvserver.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
 					DisableConsistencyQueue:  true,
-					GlobalMVCCRangeTombstone: supportsMVCCRangeTombstones && globalMVCCRangeTombstone,
+					GlobalMVCCRangeTombstone: globalMVCCRangeTombstone,
 					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-						DisableInitPutFailOnTombstones: ignoreMVCCRangeTombstoneErrors,
-						UseRangeTombstonesForPointDeletes: supportsMVCCRangeTombstones &&
-							shouldUseMVCCRangeTombstonesForPointDeletes,
+						DisableInitPutFailOnTombstones:    ignoreMVCCRangeTombstoneErrors,
+						UseRangeTombstonesForPointDeletes: shouldUseMVCCRangeTombstonesForPointDeletes,
 					},
 				},
 				SQLEvalContext: &eval.TestingKnobs{
@@ -1673,6 +1667,11 @@ func (t *logicTest) newCluster(
 		// See #37751 for details.
 		if _, err := conn.Exec(
 			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(
+			"SET CLUSTER SETTING sql.stats.system_tables_autostats.enabled = false",
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -4133,7 +4132,10 @@ func RunLogicTest(
 		}()
 	}
 
-	if *defaultWorkmem {
+	// Testing sql.distsql.temp_storage.workmem metamorphically isn't needed
+	// when rewriting logic test files, so we disable workmem randomization if
+	// the --rewrite flag is present.
+	if *defaultWorkmem || *rewriteResultsInTestfiles {
 		serverArgs.DisableWorkmemRandomization = true
 	}
 

@@ -895,6 +895,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		clock,
 		distSender,
 		rangestats.NewFetcher(db),
+		node,
 	)
 
 	keyVisualizerServer := &KeyVisualizerServer{
@@ -1030,6 +1031,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		eventsExporter:           eventsExporter,
 		admissionPacerFactory:    gcoords.Elastic,
 		rangeDescIteratorFactory: rangedesc.NewIteratorFactory(db),
+		tenantCapabilitiesReader: sql.MakeSystemTenantOnly[tenantcapabilities.Reader](tenantCapabilitiesWatcher),
 	})
 	if err != nil {
 		return nil, err
@@ -1737,6 +1739,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		s.stopper,
 		s.cfg.GoroutineDumpDirName,
 		s.cfg.HeapProfileDirName,
+		s.cfg.CPUProfileDirName,
 		s.runtime,
 		s.status.sessionRegistry,
 	); err != nil {

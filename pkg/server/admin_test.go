@@ -264,7 +264,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	}
 
 	// Authenticated as non-admin.
-	client, err = ts.GetAuthenticatedHTTPClient(false)
+	client, err = ts.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	}
 
 	// Authenticated as admin.
-	client, err = ts.GetAuthenticatedHTTPClient(true)
+	client, err = ts.GetAuthenticatedHTTPClient(true, serverutils.SingleTenantSession)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	// We have to create the non-admin user before calling
 	// "GRANT ... TO authenticatedUserNameNoAdmin".
 	// This is done in "GetAuthenticatedHTTPClient".
-	if _, err := ts.GetAuthenticatedHTTPClient(false); err != nil {
+	if _, err := ts.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1613,7 +1613,7 @@ func TestAdminAPIJobs(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "isAdmin", func(t *testing.T, isAdmin bool) {
 		// Creating this client causes a user to be created, which causes jobs
 		// to be created, so we do it up-front rather than inside the test.
-		_, err := s.GetAuthenticatedHTTPClient(isAdmin)
+		_, err := s.GetAuthenticatedHTTPClient(isAdmin, serverutils.SingleTenantSession)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1726,11 +1726,6 @@ func TestAdminAPIJobs(t *testing.T) {
 			[]int64{},
 		},
 		{
-			"jobs?status=retrying",
-			append(append([]int64{}, retryRunningIds...), retryRevertingIds...),
-			[]int64{},
-		},
-		{
 			"jobs?status=pending",
 			[]int64{},
 			[]int64{},
@@ -1806,11 +1801,6 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 	})
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
-
-	runningOnlyIds := []int64{1, 3, 5}
-	revertingOnlyIds := []int64{2, 4, 6}
-	retryRunningIds := []int64{7}
-	retryRevertingIds := []int64{8}
 
 	now := timeutil.Now()
 
@@ -1889,32 +1879,6 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 	var res serverpb.JobsResponse
 	if err := getAdminJSONProto(s, "jobs", &res); err != nil {
 		t.Fatal(err)
-	}
-
-	// test that the select statement correctly converts expected jobs to retry-____ statuses
-	expectedStatuses := []struct {
-		status string
-		ids    []int64
-	}{
-		{"running", runningOnlyIds},
-		{"reverting", revertingOnlyIds},
-		{"retry-running", retryRunningIds},
-		{"retry-reverting", retryRevertingIds},
-	}
-	for _, expected := range expectedStatuses {
-		var jobsWithStatus []serverpb.JobResponse
-		for _, job := range res.Jobs {
-			for _, expectedID := range expected.ids {
-				if job.ID == expectedID {
-					jobsWithStatus = append(jobsWithStatus, job)
-				}
-			}
-		}
-
-		require.Len(t, jobsWithStatus, len(expected.ids))
-		for _, job := range jobsWithStatus {
-			assert.Equal(t, expected.status, job.Status)
-		}
 	}
 
 	// Trim down our result set to the jobs we injected.

@@ -13,6 +13,7 @@ package scbuildstmt
 import (
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -212,25 +213,6 @@ func dropColumn(
 				Index: tree.UnrestrictedName(indexName.Name),
 			}
 			dropSecondaryIndex(b, &name, behavior, e)
-		case *scpb.UniqueWithoutIndexConstraint:
-			// TODO(ajwerner): Support dropping UNIQUE WITHOUT INDEX constraints.
-			panic(errors.Wrap(scerrors.NotImplementedError(n),
-				"dropping of UNIQUE WITHOUT INDEX constraints not supported"))
-		case *scpb.CheckConstraint:
-			// TODO(ajwerner): Support dropping CHECK constraints.
-			// We might need to extend and add check constraint to dep-rule
-			// "column constraint removed right before column reaches delete only"
-			// in addition to just `b.Drop(e)`. Read its comment for more details.
-			panic(errors.Wrap(scerrors.NotImplementedError(n),
-				"dropping of CHECK constraints not supported"))
-		case *scpb.ForeignKeyConstraint:
-			if e.TableID != col.TableID && behavior != tree.DropCascade {
-				panic(pgerror.Newf(pgcode.DependentObjectsStillExist,
-					"cannot drop column %s because other objects depend on it", cn.Name))
-			}
-			// TODO(ajwerner): Support dropping FOREIGN KEY constraints.
-			panic(errors.Wrap(scerrors.NotImplementedError(n),
-				"dropping of FOREIGN KEY constraints not supported"))
 		case *scpb.View:
 			if behavior != tree.DropCascade {
 				_, _, ns := scpb.FindNamespace(b.QueryByID(col.TableID))
@@ -273,6 +255,34 @@ func dropColumn(
 				)
 			}
 			dropCascadeDescriptor(b, e.FunctionID)
+		case *scpb.UniqueWithoutIndexConstraint:
+			// Until the appropriate version gate is hit, we still do not allow
+			// dropping unique without index constraints.
+			if !b.ClusterSettings().Version.IsActive(b, clusterversion.V23_1) {
+				panic(scerrors.NotImplementedErrorf(nil, "dropping without"+
+					"index constraints is not allowed."))
+			}
+			constraintElems := b.QueryByID(e.TableID).Filter(hasConstraintIDAttrFilter(e.ConstraintID))
+			_, _, constraintName := scpb.FindConstraintWithoutIndexName(constraintElems.Filter(publicTargetFilter))
+			alterTableDropConstraint(b, tn, tbl, &tree.AlterTableDropConstraint{
+				IfExists:     false,
+				Constraint:   tree.Name(constraintName.Name),
+				DropBehavior: behavior,
+			})
+		case *scpb.UniqueWithoutIndexConstraintUnvalidated:
+			// Until the appropriate version gate is hit, we still do not allow
+			// dropping unique without index constraints.
+			if !b.ClusterSettings().Version.IsActive(b, clusterversion.V23_1) {
+				panic(scerrors.NotImplementedErrorf(nil, "dropping without"+
+					"index constraints is not allowed."))
+			}
+			constraintElems := b.QueryByID(e.TableID).Filter(hasConstraintIDAttrFilter(e.ConstraintID))
+			_, _, constraintName := scpb.FindConstraintWithoutIndexName(constraintElems.Filter(publicTargetFilter))
+			alterTableDropConstraint(b, tn, tbl, &tree.AlterTableDropConstraint{
+				IfExists:     false,
+				Constraint:   tree.Name(constraintName.Name),
+				DropBehavior: behavior,
+			})
 		default:
 			b.Drop(e)
 		}
@@ -312,11 +322,10 @@ func walkDropColumnDependencies(b BuildCtx, col *scpb.Column, fn func(e scpb.Ele
 		Filter(referencesColumnIDFilter(col.ColumnID)).
 		ForEachElementStatus(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {
 			switch elt := e.(type) {
-			case *scpb.Column, *scpb.ColumnName, *scpb.ColumnComment, *scpb.ColumnNotNull:
-				fn(e)
-			case *scpb.ColumnDefaultExpression, *scpb.ColumnOnUpdateExpression:
-				fn(e)
-			case *scpb.UniqueWithoutIndexConstraint, *scpb.CheckConstraint:
+			case *scpb.Column, *scpb.ColumnName, *scpb.ColumnComment, *scpb.ColumnNotNull,
+				*scpb.ColumnDefaultExpression, *scpb.ColumnOnUpdateExpression,
+				*scpb.UniqueWithoutIndexConstraint, *scpb.CheckConstraint,
+				*scpb.UniqueWithoutIndexConstraintUnvalidated, *scpb.CheckConstraintUnvalidated:
 				fn(e)
 			case *scpb.ColumnType:
 				if elt.ColumnID == col.ColumnID {
@@ -341,6 +350,16 @@ func walkDropColumnDependencies(b BuildCtx, col *scpb.Column, fn func(e scpb.Ele
 					catalog.MakeTableColSet(elt.ReferencedColumnIDs...).Contains(col.ColumnID) {
 					fn(e)
 				}
+			case *scpb.ForeignKeyConstraintUnvalidated:
+				if elt.TableID == col.TableID &&
+					catalog.MakeTableColSet(elt.ColumnIDs...).Contains(col.ColumnID) {
+					fn(e)
+				} else if elt.ReferencedTableID == col.TableID &&
+					catalog.MakeTableColSet(elt.ReferencedColumnIDs...).Contains(col.ColumnID) {
+					fn(e)
+				}
+			default:
+				panic(errors.AssertionFailedf("unknown column-dependent element type %T", elt))
 			}
 		})
 	tblElts.ForEachElementStatus(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {

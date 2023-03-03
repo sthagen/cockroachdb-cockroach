@@ -148,6 +148,7 @@ const (
 	CrdbInternalLocalTransactionsTableID
 	CrdbInternalLocalSessionsTableID
 	CrdbInternalLocalMetricsTableID
+	CrdbInternalNodeMemoryMonitorsTableID
 	CrdbInternalNodeStmtStatsTableID
 	CrdbInternalNodeTxnStatsTableID
 	CrdbInternalPartitionsTableID
@@ -178,6 +179,7 @@ const (
 	CrdbInternalPgCatalogTableIsImplementedTableID
 	CrdbInternalSuperRegions
 	CrdbInternalDroppedRelationsViewID
+	CrdbInternalShowTenantCapabilitiesCacheTableID
 	InformationSchemaID
 	InformationSchemaAdministrableRoleAuthorizationsID
 	InformationSchemaApplicableRolesID

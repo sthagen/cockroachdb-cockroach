@@ -113,7 +113,7 @@ export function getFullFiltersAsStringRecord(
       filterKey in partialFilters &&
       partialFilters[filterKey] !== inactiveFiltersState[filterKey]
     ) {
-      filters[filterKey] = partialFilters[filterKey].toString();
+      filters[filterKey] = partialFilters[filterKey]?.toString();
       return;
     }
     filters[filterKey] = null;
@@ -481,7 +481,7 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
         }))
       : [];
     const databaseValue = databasesOptions.filter(option => {
-      return filters.database.split(",").includes(option.label);
+      return filters.database?.split(",").includes(option.label);
     });
     const dbFilter = (
       <div>

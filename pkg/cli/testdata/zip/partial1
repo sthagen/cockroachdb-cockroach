@@ -87,11 +87,13 @@ debug zip --concurrency=1 --cpu-profile-duration=0s /dev/null
 [node 1] retrieving SQL data for crdb_internal.node_distsql_flows... writing output: debug/nodes/1/crdb_internal.node_distsql_flows.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_execution_insights... writing output: debug/nodes/1/crdb_internal.node_execution_insights.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_inflight_trace_spans... writing output: debug/nodes/1/crdb_internal.node_inflight_trace_spans.txt... done
+[node 1] retrieving SQL data for crdb_internal.node_memory_monitors... writing output: debug/nodes/1/crdb_internal.node_memory_monitors.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_metrics... writing output: debug/nodes/1/crdb_internal.node_metrics.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_queries... writing output: debug/nodes/1/crdb_internal.node_queries.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_runtime_info... writing output: debug/nodes/1/crdb_internal.node_runtime_info.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_sessions... writing output: debug/nodes/1/crdb_internal.node_sessions.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_statement_statistics... writing output: debug/nodes/1/crdb_internal.node_statement_statistics.txt... done
+[node 1] retrieving SQL data for crdb_internal.node_tenant_capabilities_cache... writing output: debug/nodes/1/crdb_internal.node_tenant_capabilities_cache.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_transaction_statistics... writing output: debug/nodes/1/crdb_internal.node_transaction_statistics.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_transactions... writing output: debug/nodes/1/crdb_internal.node_transactions.txt... done
 [node 1] retrieving SQL data for crdb_internal.node_txn_execution_insights... writing output: debug/nodes/1/crdb_internal.node_txn_execution_insights.txt... done
@@ -206,6 +208,9 @@ debug zip --concurrency=1 --cpu-profile-duration=0s /dev/null
 [node 2] retrieving SQL data for crdb_internal.node_inflight_trace_spans... writing output: debug/nodes/2/crdb_internal.node_inflight_trace_spans.txt...
 [node 2] retrieving SQL data for crdb_internal.node_inflight_trace_spans: last request failed: dial tcp ...
 [node 2] retrieving SQL data for crdb_internal.node_inflight_trace_spans: creating error output: debug/nodes/2/crdb_internal.node_inflight_trace_spans.txt.err.txt... done
+[node 2] retrieving SQL data for crdb_internal.node_memory_monitors... writing output: debug/nodes/2/crdb_internal.node_memory_monitors.txt...
+[node 2] retrieving SQL data for crdb_internal.node_memory_monitors: last request failed: dial tcp ...
+[node 2] retrieving SQL data for crdb_internal.node_memory_monitors: creating error output: debug/nodes/2/crdb_internal.node_memory_monitors.txt.err.txt... done
 [node 2] retrieving SQL data for crdb_internal.node_metrics... writing output: debug/nodes/2/crdb_internal.node_metrics.txt...
 [node 2] retrieving SQL data for crdb_internal.node_metrics: last request failed: dial tcp ...
 [node 2] retrieving SQL data for crdb_internal.node_metrics: creating error output: debug/nodes/2/crdb_internal.node_metrics.txt.err.txt... done
@@ -221,6 +226,9 @@ debug zip --concurrency=1 --cpu-profile-duration=0s /dev/null
 [node 2] retrieving SQL data for crdb_internal.node_statement_statistics... writing output: debug/nodes/2/crdb_internal.node_statement_statistics.txt...
 [node 2] retrieving SQL data for crdb_internal.node_statement_statistics: last request failed: dial tcp ...
 [node 2] retrieving SQL data for crdb_internal.node_statement_statistics: creating error output: debug/nodes/2/crdb_internal.node_statement_statistics.txt.err.txt... done
+[node 2] retrieving SQL data for crdb_internal.node_tenant_capabilities_cache... writing output: debug/nodes/2/crdb_internal.node_tenant_capabilities_cache.txt...
+[node 2] retrieving SQL data for crdb_internal.node_tenant_capabilities_cache: last request failed: dial tcp ...
+[node 2] retrieving SQL data for crdb_internal.node_tenant_capabilities_cache: creating error output: debug/nodes/2/crdb_internal.node_tenant_capabilities_cache.txt.err.txt... done
 [node 2] retrieving SQL data for crdb_internal.node_transaction_statistics... writing output: debug/nodes/2/crdb_internal.node_transaction_statistics.txt...
 [node 2] retrieving SQL data for crdb_internal.node_transaction_statistics: last request failed: dial tcp ...
 [node 2] retrieving SQL data for crdb_internal.node_transaction_statistics: creating error output: debug/nodes/2/crdb_internal.node_transaction_statistics.txt.err.txt... done
@@ -276,11 +284,13 @@ debug zip --concurrency=1 --cpu-profile-duration=0s /dev/null
 [node 3] retrieving SQL data for crdb_internal.node_distsql_flows... writing output: debug/nodes/3/crdb_internal.node_distsql_flows.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_execution_insights... writing output: debug/nodes/3/crdb_internal.node_execution_insights.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_inflight_trace_spans... writing output: debug/nodes/3/crdb_internal.node_inflight_trace_spans.txt... done
+[node 3] retrieving SQL data for crdb_internal.node_memory_monitors... writing output: debug/nodes/3/crdb_internal.node_memory_monitors.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_metrics... writing output: debug/nodes/3/crdb_internal.node_metrics.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_queries... writing output: debug/nodes/3/crdb_internal.node_queries.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_runtime_info... writing output: debug/nodes/3/crdb_internal.node_runtime_info.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_sessions... writing output: debug/nodes/3/crdb_internal.node_sessions.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_statement_statistics... writing output: debug/nodes/3/crdb_internal.node_statement_statistics.txt... done
+[node 3] retrieving SQL data for crdb_internal.node_tenant_capabilities_cache... writing output: debug/nodes/3/crdb_internal.node_tenant_capabilities_cache.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_transaction_statistics... writing output: debug/nodes/3/crdb_internal.node_transaction_statistics.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_transactions... writing output: debug/nodes/3/crdb_internal.node_transactions.txt... done
 [node 3] retrieving SQL data for crdb_internal.node_txn_execution_insights... writing output: debug/nodes/3/crdb_internal.node_txn_execution_insights.txt... done

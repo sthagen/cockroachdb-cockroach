@@ -444,11 +444,13 @@ crdb_internal       node_contention_events
 crdb_internal       node_distsql_flows
 crdb_internal       node_execution_insights
 crdb_internal       node_inflight_trace_spans
+crdb_internal       node_memory_monitors
 crdb_internal       node_metrics
 crdb_internal       node_queries
 crdb_internal       node_runtime_info
 crdb_internal       node_sessions
 crdb_internal       node_statement_statistics
+crdb_internal       node_tenant_capabilities_cache
 crdb_internal       node_transaction_statistics
 crdb_internal       node_transactions
 crdb_internal       node_txn_execution_insights
@@ -779,11 +781,13 @@ node_contention_events
 node_distsql_flows
 node_execution_insights
 node_inflight_trace_spans
+node_memory_monitors
 node_metrics
 node_queries
 node_runtime_info
 node_sessions
 node_statement_statistics
+node_tenant_capabilities_cache
 node_transaction_statistics
 node_transactions
 node_txn_execution_insights
@@ -1154,11 +1158,13 @@ system         crdb_internal       node_contention_events                 SYSTEM
 system         crdb_internal       node_distsql_flows                     SYSTEM VIEW  NO                  1
 system         crdb_internal       node_execution_insights                SYSTEM VIEW  NO                  1
 system         crdb_internal       node_inflight_trace_spans              SYSTEM VIEW  NO                  1
+system         crdb_internal       node_memory_monitors                   SYSTEM VIEW  NO                  1
 system         crdb_internal       node_metrics                           SYSTEM VIEW  NO                  1
 system         crdb_internal       node_queries                           SYSTEM VIEW  NO                  1
 system         crdb_internal       node_runtime_info                      SYSTEM VIEW  NO                  1
 system         crdb_internal       node_sessions                          SYSTEM VIEW  NO                  1
 system         crdb_internal       node_statement_statistics              SYSTEM VIEW  NO                  1
+system         crdb_internal       node_tenant_capabilities_cache         SYSTEM VIEW  NO                  1
 system         crdb_internal       node_transaction_statistics            SYSTEM VIEW  NO                  1
 system         crdb_internal       node_transactions                      SYSTEM VIEW  NO                  1
 system         crdb_internal       node_txn_execution_insights            SYSTEM VIEW  NO                  1
@@ -1652,11 +1658,13 @@ system              public             primary                                  
 system              public             29_56_1_not_null                                                                                                system         public        span_stats_samples               CHECK            NO             NO
 system              public             29_56_2_not_null                                                                                                system         public        span_stats_samples               CHECK            NO             NO
 system              public             primary                                                                                                         system         public        span_stats_samples               PRIMARY KEY      NO             NO
+system              public             samples_sample_time_idx                                                                                         system         public        span_stats_samples               UNIQUE           NO             NO
 system              public             29_57_1_not_null                                                                                                system         public        span_stats_tenant_boundaries     CHECK            NO             NO
 system              public             29_57_2_not_null                                                                                                system         public        span_stats_tenant_boundaries     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        span_stats_tenant_boundaries     PRIMARY KEY      NO             NO
 system              public             29_54_1_not_null                                                                                                system         public        span_stats_unique_keys           CHECK            NO             NO
 system              public             primary                                                                                                         system         public        span_stats_unique_keys           PRIMARY KEY      NO             NO
+system              public             unique_keys_key_bytes_idx                                                                                       system         public        span_stats_unique_keys           UNIQUE           NO             NO
 system              public             29_46_1_not_null                                                                                                system         public        sql_instances                    CHECK            NO             NO
 system              public             primary                                                                                                         system         public        sql_instances                    PRIMARY KEY      NO             NO
 system              public             29_39_1_not_null                                                                                                system         public        sqlliveness                      CHECK            NO             NO
@@ -2014,8 +2022,10 @@ system         public        span_configurations              start_key         
 system         public        span_configurations              start_key                                                                                                 system              public             primary
 system         public        span_stats_buckets               id                                                                                                        system              public             primary
 system         public        span_stats_samples               id                                                                                                        system              public             primary
+system         public        span_stats_samples               sample_time                                                                                               system              public             samples_sample_time_idx
 system         public        span_stats_tenant_boundaries     tenant_id                                                                                                 system              public             primary
 system         public        span_stats_unique_keys           id                                                                                                        system              public             primary
+system         public        span_stats_unique_keys           key_bytes                                                                                                 system              public             unique_keys_key_bytes_idx
 system         public        sql_instances                    id                                                                                                        system              public             primary
 system         public        sqlliveness                      session_id                                                                                                system              public             primary
 system         public        statement_bundle_chunks          id                                                                                                        system              public             primary
@@ -2928,11 +2938,13 @@ NULL     public   system         crdb_internal       node_contention_events     
 NULL     public   system         crdb_internal       node_distsql_flows                     SELECT          NO            YES
 NULL     public   system         crdb_internal       node_execution_insights                SELECT          NO            YES
 NULL     public   system         crdb_internal       node_inflight_trace_spans              SELECT          NO            YES
+NULL     public   system         crdb_internal       node_memory_monitors                   SELECT          NO            YES
 NULL     public   system         crdb_internal       node_metrics                           SELECT          NO            YES
 NULL     public   system         crdb_internal       node_queries                           SELECT          NO            YES
 NULL     public   system         crdb_internal       node_runtime_info                      SELECT          NO            YES
 NULL     public   system         crdb_internal       node_sessions                          SELECT          NO            YES
 NULL     public   system         crdb_internal       node_statement_statistics              SELECT          NO            YES
+NULL     public   system         crdb_internal       node_tenant_capabilities_cache         SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transaction_statistics            SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transactions                      SELECT          NO            YES
 NULL     public   system         crdb_internal       node_txn_execution_insights            SELECT          NO            YES
@@ -3551,11 +3563,13 @@ NULL     public   system         crdb_internal       node_contention_events     
 NULL     public   system         crdb_internal       node_distsql_flows                     SELECT          NO            YES
 NULL     public   system         crdb_internal       node_execution_insights                SELECT          NO            YES
 NULL     public   system         crdb_internal       node_inflight_trace_spans              SELECT          NO            YES
+NULL     public   system         crdb_internal       node_memory_monitors                   SELECT          NO            YES
 NULL     public   system         crdb_internal       node_metrics                           SELECT          NO            YES
 NULL     public   system         crdb_internal       node_queries                           SELECT          NO            YES
 NULL     public   system         crdb_internal       node_runtime_info                      SELECT          NO            YES
 NULL     public   system         crdb_internal       node_sessions                          SELECT          NO            YES
 NULL     public   system         crdb_internal       node_statement_statistics              SELECT          NO            YES
+NULL     public   system         crdb_internal       node_tenant_capabilities_cache         SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transaction_statistics            SELECT          NO            YES
 NULL     public   system         crdb_internal       node_transactions                      SELECT          NO            YES
 NULL     public   system         crdb_internal       node_txn_execution_insights            SELECT          NO            YES
@@ -4975,6 +4989,7 @@ idle_session_timeout                                  0
 index_join_streamer_batch_size                        8.0 MiB
 index_recommendations_enabled                         off
 inject_retry_errors_enabled                           off
+inject_retry_errors_on_commit_enabled                 off
 integer_datetimes                                     on
 intervalstyle                                         postgres
 intervalstyle_enabled                                 on
@@ -5003,6 +5018,7 @@ optimizer                                             on
 optimizer_use_forecasts                               on
 optimizer_use_histograms                              on
 optimizer_use_improved_disjunction_stats              on
+optimizer_use_improved_split_disjunction_for_joins    on
 optimizer_use_limit_ordering_for_streaming_group_by   on
 optimizer_use_multicol_stats                          on
 optimizer_use_not_visible_indexes                     off

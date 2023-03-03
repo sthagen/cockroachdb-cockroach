@@ -910,8 +910,9 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 
 %token <str> FAILURE FALSE FAMILY FETCH FETCHVAL FETCHTEXT FETCHVAL_PATH FETCHTEXT_PATH
 %token <str> FILES FILTER
-%token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE FORCE_INDEX FORCE_ZIGZAG
-%token <str> FOREIGN FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
+%token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE FORCE_INDEX
+%token <str> FORCE_NOT_NULL FORCE_NULL FORCE_QUOTE FORCE_ZIGZAG
+%token <str> FOREIGN FORMAT FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
 
 %token <str> GENERATED GEOGRAPHY GEOMETRY GEOMETRYM GEOMETRYZ GEOMETRYZM
 %token <str> GEOMETRYCOLLECTION GEOMETRYCOLLECTIONM GEOMETRYCOLLECTIONZ GEOMETRYCOLLECTIONZM
@@ -947,7 +948,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %token <str> NOSQLLOGIN NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT
 %token <str> NOTHING NOTHING_AFTER_RETURNING
 %token <str> NOTNULL
-%token <str> NOVIEWACTIVITY NOVIEWACTIVITYREDACTED NOVIEWCLUSTERSETTING NOWAIT NULL NULLIF NULLS NUMERIC
+%token <str> NOVIEWACTIVITY NOVIEWACTIVITYREDACTED NOVIEWCLUSTERSETTING NOVIEWJOB NOWAIT NULL NULLIF NULLS NUMERIC
 
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR OLD_KMS ON ONLY OPT OPTION OPTIONS OR
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OWNER OPERATOR
@@ -984,7 +985,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %token <str> UPDATE UPSERT UNSET UNTIL USE USER USERS USING UUID
 
 %token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VERIFY_BACKUP_TABLE_DATA VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
-%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE INVISIBLE VOLATILE VOTERS
+%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIEWJOB VIRTUAL VISIBLE INVISIBLE VOLATILE VOTERS
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1313,7 +1314,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %type <*tree.TenantReplicationOptions> opt_with_tenant_replication_options tenant_replication_options tenant_replication_options_list
 %type <tree.ShowBackupDetails> show_backup_details
 %type <*tree.ShowBackupOptions> opt_with_show_backup_options show_backup_options show_backup_options_list
-%type <*tree.CopyOptions> opt_with_copy_options copy_options copy_options_list
+%type <*tree.CopyOptions> opt_with_copy_options copy_options copy_options_list copy_generic_options copy_generic_options_list
 %type <str> import_format
 %type <str> storage_parameter_key
 %type <tree.NameList> storage_parameter_key_list
@@ -3980,6 +3981,10 @@ opt_with_copy_options:
   {
     $$.val = $2.copyOptions()
   }
+| opt_with '(' copy_generic_options_list ')'
+  {
+    $$.val = $3.copyOptions()
+  }
 | /* EMPTY */
   {
     $$.val = &tree.CopyOptions{}
@@ -3997,6 +4002,18 @@ copy_options_list:
     }
   }
 
+copy_generic_options_list:
+  copy_generic_options
+  {
+    $$.val = $1.copyOptions()
+  }
+| copy_generic_options_list ',' copy_generic_options
+  {
+    if err := $1.copyOptions().CombineWith($3.copyOptions()); err != nil {
+      return setErr(sqllex, err)
+    }
+  }
+
 copy_options:
   DESTINATION '=' string_or_placeholder
   {
@@ -4004,11 +4021,11 @@ copy_options:
   }
 | BINARY
   {
-    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatBinary}
+    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatBinary, HasFormat: true}
   }
 | CSV
   {
-    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatCSV}
+    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatCSV, HasFormat: true}
   }
 | DELIMITER string_or_placeholder
   {
@@ -4028,27 +4045,112 @@ copy_options:
   }
 | HEADER
   {
-    $$.val = &tree.CopyOptions{Header: true}
+    $$.val = &tree.CopyOptions{Header: true, HasHeader: true}
   }
 | QUOTE SCONST
   {
     $$.val = &tree.CopyOptions{Quote: tree.NewStrVal($2)}
   }
-| ESCAPE SCONST error
+| ESCAPE SCONST
   {
     $$.val = &tree.CopyOptions{Escape: tree.NewStrVal($2)}
   }
 | FORCE QUOTE error
   {
-    return unimplementedWithIssueDetail(sqllex, 41608, "force quote")
+    return unimplementedWithIssueDetail(sqllex, 41608, "force_quote")
   }
 | FORCE NOT NULL error
   {
-    return unimplementedWithIssueDetail(sqllex, 41608, "force not null")
+    return unimplementedWithIssueDetail(sqllex, 41608, "force_not_null")
   }
 | FORCE NULL error
   {
-    return unimplementedWithIssueDetail(sqllex, 41608, "force null")
+    return unimplementedWithIssueDetail(sqllex, 41608, "force_null")
+  }
+| ENCODING SCONST error
+  {
+    return unimplementedWithIssueDetail(sqllex, 41608, "encoding")
+  }
+
+copy_generic_options:
+  DESTINATION string_or_placeholder
+  {
+    $$.val = &tree.CopyOptions{Destination: $2.expr()}
+  }
+| FORMAT BINARY
+  {
+    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatBinary, HasFormat: true}
+  }
+| FORMAT CSV
+  {
+    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatCSV, HasFormat: true}
+  }
+| FORMAT TEXT
+  {
+    $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatText, HasFormat: true}
+  }
+| FORMAT SCONST
+  {
+    format := $2
+    switch format {
+    case "csv":
+      $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatCSV, HasFormat: true}
+    case "binary":
+      $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatBinary, HasFormat: true}
+    case "text":
+      $$.val = &tree.CopyOptions{CopyFormat: tree.CopyFormatText, HasFormat: true}
+    default:
+      sqllex.Error("COPY format \"" + format + "\" not recognized")
+      return 1
+    }
+  }
+| DELIMITER string_or_placeholder
+  {
+    $$.val = &tree.CopyOptions{Delimiter: $2.expr()}
+  }
+| NULL string_or_placeholder
+  {
+    $$.val = &tree.CopyOptions{Null: $2.expr()}
+  }
+| OIDS error
+  {
+    return unimplementedWithIssueDetail(sqllex, 41608, "oids")
+  }
+| FREEZE error
+  {
+    return unimplementedWithIssueDetail(sqllex, 41608, "freeze")
+  }
+| HEADER
+  {
+    $$.val = &tree.CopyOptions{Header: true, HasHeader: true}
+  }
+| HEADER TRUE
+  {
+    $$.val = &tree.CopyOptions{Header: true, HasHeader: true}
+  }
+| HEADER FALSE
+  {
+    $$.val = &tree.CopyOptions{Header: false, HasHeader: true}
+  }
+| QUOTE SCONST
+  {
+    $$.val = &tree.CopyOptions{Quote: tree.NewStrVal($2)}
+  }
+| ESCAPE SCONST
+  {
+    $$.val = &tree.CopyOptions{Escape: tree.NewStrVal($2)}
+  }
+| FORCE_QUOTE error
+  {
+    return unimplementedWithIssueDetail(sqllex, 41608, "force_quote")
+  }
+| FORCE_NOT_NULL error
+  {
+    return unimplementedWithIssueDetail(sqllex, 41608, "force_not_null")
+  }
+| FORCE_NULL error
+  {
+    return unimplementedWithIssueDetail(sqllex, 41608, "force_null")
   }
 | ENCODING SCONST error
   {
@@ -6658,12 +6760,14 @@ var_value:
 //
 // In addition, for compatibility with CockroachDB we need to support
 // the reserved keyword ON (to go along OFF, which is a valid column name).
+// Similarly, NONE is specially allowed here.
 //
 // Finally, in PostgreSQL the CockroachDB-reserved words "index",
 // "nothing", etc. are not special and are valid in SET. These need to
 // be allowed here too.
 extra_var_value:
   ON
+| NONE
 | cockroachdb_extra_reserved_keyword
 
 var_list:
@@ -10216,6 +10320,14 @@ role_option:
   {
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
+| VIEWJOB
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
+| NOVIEWJOB
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
 | password_clause
 | valid_until_clause
 
@@ -11347,7 +11459,7 @@ create_database_stmt:
       SecondaryRegion: tree.Name($16),
     }
   }
-| CREATE DATABASE IF NOT EXISTS database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause opt_super_region_clause opt_secondary_region_clause
+| CREATE DATABASE IF NOT EXISTS database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause opt_owner_clause opt_super_region_clause opt_secondary_region_clause
   {
     $$.val = &tree.CreateDatabase{
       IfNotExists: true,
@@ -11361,8 +11473,9 @@ create_database_stmt:
       Regions: $14.nameList(),
       SurvivalGoal: $15.survivalGoal(),
       Placement: $16.dataPlacement(),
-      SuperRegion: $17.superRegion(),
-      SecondaryRegion: tree.Name($18),
+      Owner: $17.roleSpec(),
+      SuperRegion: $18.superRegion(),
+      SecondaryRegion: tree.Name($19),
     }
   }
 | CREATE DATABASE error // SHOW HELP: CREATE DATABASE
@@ -16118,7 +16231,11 @@ unreserved_keyword:
 | FILTER
 | FIRST
 | FOLLOWING
+| FORMAT
 | FORCE
+| FORCE_NOT_NULL
+| FORCE_NULL
+| FORCE_QUOTE
 | FORCE_INDEX
 | FORCE_ZIGZAG
 | FORWARD
@@ -16239,6 +16356,7 @@ unreserved_keyword:
 | NOVIEWACTIVITY
 | NOVIEWACTIVITYREDACTED
 | NOVIEWCLUSTERSETTING
+| NOVIEWJOB
 | NOWAIT
 | NULLS
 | IGNORE_FOREIGN_KEYS
@@ -16433,6 +16551,7 @@ unreserved_keyword:
 | VIEWCLUSTERMETADATA
 | VIEWCLUSTERSETTING
 | VIEWDEBUG
+| VIEWJOB
 | VISIBLE
 | VOLATILE
 | VOTERS
@@ -16444,36 +16563,572 @@ unreserved_keyword:
 
 // Column label --- keywords that can be column label that doesn't use "AS"
 // before it. This is to guarantee that any new keyword won't break user
-// query like "SELECT col label FROM table" where "label" is a new keyword.
+// query like "SELECT col label FROM tab" where "label" is a new keyword.
 // Any new keyword should be added to this list.
 bare_label_keywords:
-  AS_JSON
+  ABORT
+| ABSOLUTE
+| ACCESS
+| ACTION
+| ADD
+| ADMIN
+| AFTER
+| AGGREGATE
+| ALL
+| ALTER
+| ALWAYS
+| ANALYSE
+| ANALYZE
+| AND
+| ANNOTATE_TYPE
+| ANY
+| ASC
+| ASENSITIVE
+| ASYMMETRIC
+| AS_JSON
+| AT
 | ATOMIC
+| ATTRIBUTE
+| AUTHORIZATION
+| AUTOMATIC
+| AVAILABILITY
+| BACKUP
+| BACKUPS
+| BACKWARD
+| BEFORE
+| BEGIN
+| BETWEEN
+| BIGINT
+| BINARY
+| BIT
+| BOOLEAN
+| BOTH
+| BOX2D
+| BUCKET_COUNT
+| BUNDLE
+| BY
+| CACHE
 | CALLED
-| COORDINATOR_LOCALITY
-| COST
+| CANCEL
+| CANCELQUERY
+| CAPABILITIES
+| CAPABILITY
+| CASCADE
+| CASE
+| CAST
+| CHANGEFEED
+| CHARACTERISTICS
+| CHECK
 | CHECK_FILES
-| DEBUG_IDS
+| CLOSE
+| CLUSTER
+| COALESCE
+| COLLATION
+| COLUMN
+| COLUMNS
+| COMMENT
+| COMMENTS
+| COMMIT
+| COMMITTED
+| COMPACT
+| COMPLETE
+| COMPLETIONS
+| CONCURRENTLY
+| CONFIGURATION
+| CONFIGURATIONS
+| CONFIGURE
+| CONFLICT
+| CONNECTION
+| CONNECTIONS
+| CONSTRAINT
+| CONSTRAINTS
+| CONTROLCHANGEFEED
+| CONTROLJOB
+| CONVERSION
+| CONVERT
+| COORDINATOR_LOCALITY
+| COPY
+| COST
+| COVERING
+| CREATEDB
+| CREATELOGIN
+| CREATEROLE
+| CROSS
+| CSV
+| CUBE
+| CURRENT
+| CURRENT_CATALOG
+| CURRENT_DATE
+| CURRENT_ROLE
+| CURRENT_SCHEMA
+| CURRENT_TIME
+| CURRENT_TIMESTAMP
+| CURRENT_USER
+| CURSOR
+| CYCLE
+| DATA
+| DATABASE
+| DATABASES
+| DEALLOCATE
 | DEBUG_DUMP_METADATA_SST
+| DEBUG_IDS
+| DEBUG_PAUSE_ON
+| DEC
+| DECIMAL
+| DECLARE
+| DEFAULT
+| DEFAULTS
+| DEFERRABLE
+| DEFERRED
 | DEFINER
+| DELETE
+| DELIMITER
 | DEPENDS
+| DESC
+| DESTINATION
+| DETACHED
+| DETAILS
+| DISCARD
+| DISTINCT
+| DO
+| DOMAIN
+| DOUBLE
+| DROP
+| ELSE
+| ENCODING
+| ENCRYPTED
 | ENCRYPTION_INFO_DIR
+| ENCRYPTION_PASSPHRASE
+| END
+| ENUM
+| ENUMS
+| ESCAPE
+| EXCLUDE
+| EXCLUDING
+| EXECUTE
+| EXECUTION
+| EXISTS
+| EXPERIMENTAL
+| EXPERIMENTAL_AUDIT
+| EXPERIMENTAL_FINGERPRINTS
+| EXPERIMENTAL_RELOCATE
+| EXPERIMENTAL_REPLICA
+| EXPIRATION
+| EXPLAIN
+| EXPORT
+| EXTENSION
 | EXTERNAL
+| EXTRACT
+| EXTRACT_DURATION
+| EXTREMES
+| FAILURE
+| FALSE
+| FAMILY
+| FILES
+| FIRST
+| FLOAT
+| FOLLOWING
+| FORCE
+| FORCE_NOT_NULL
+| FORCE_NULL
+| FORCE_QUOTE
+| FORCE_INDEX
+| FORCE_ZIGZAG
+| FOREIGN
+| FORMAT
+| FORWARD
+| FREEZE
+| FULL
+| FUNCTION
+| FUNCTIONS
+| GENERATED
+| GEOGRAPHY
+| GEOMETRY
+| GEOMETRYCOLLECTION
+| GEOMETRYCOLLECTIONM
+| GEOMETRYCOLLECTIONZ
+| GEOMETRYCOLLECTIONZM
+| GEOMETRYM
+| GEOMETRYZ
+| GEOMETRYZM
+| GLOBAL
+| GOAL
+| GRANTS
+| GREATEST
+| GROUPING
+| GROUPS
+| HASH
+| HEADER
+| HIGH
+| HISTOGRAM
+| HOLD
+| IDENTITY
+| IF
+| IFERROR
+| IFNULL
+| IGNORE_FOREIGN_KEYS
+| ILIKE
+| IMMEDIATE
 | IMMUTABLE
+| IMPORT
+| IN
+| INCLUDE
+| INCLUDE_ALL_SECONDARY_TENANTS
+| INCLUDING
+| INCREMENT
+| INCREMENTAL
+| INCREMENTAL_LOCATION
+| INDEX
+| INDEXES
+| INDEX_AFTER_ORDER_BY_BEFORE_AT
+| INDEX_BEFORE_NAME_THEN_PAREN
+| INDEX_BEFORE_PAREN
+| INHERITS
+| INITIALLY
+| INJECT
+| INNER
+| INOUT
 | INPUT
+| INSENSITIVE
+| INSERT
+| INT
+| INTEGER
+| INTERVAL
+| INTO_DB
+| INVERTED
+| INVISIBLE
 | INVOKER
+| IS
+| ISERROR
+| ISOLATION
+| JOB
+| JOBS
+| JOIN
+| JSON
+| KEY
+| KEYS
+| KMS
+| KV
+| LABEL
+| LANGUAGE
+| LAST
+| LATERAL
+| LATEST
+| LC_COLLATE
+| LC_CTYPE
+| LEADING
 | LEAKPROOF
+| LEASE
+| LEAST
+| LEFT
+| LESS
+| LEVEL
+| LIKE
+| LINESTRING
+| LINESTRINGM
+| LINESTRINGZ
+| LINESTRINGZM
+| LIST
+| LOCAL
+| LOCALITY
+| LOCALTIME
+| LOCALTIMESTAMP
+| LOCKED
+| LOGIN
+| LOOKUP
+| LOW
+| MATCH
+| MATERIALIZED
+| MAXVALUE
+| MERGE
+| METHOD
+| MINVALUE
+| MODIFYCLUSTERSETTING
+| MOVE
+| MULTILINESTRING
+| MULTILINESTRINGM
+| MULTILINESTRINGZ
+| MULTILINESTRINGZM
+| MULTIPOINT
+| MULTIPOINTM
+| MULTIPOINTZ
+| MULTIPOINTZM
+| MULTIPOLYGON
+| MULTIPOLYGONM
+| MULTIPOLYGONZ
+| MULTIPOLYGONZM
+| NAMES
+| NAN
+| NATURAL
+| NEVER
+| NEW_DB_NAME
+| NEW_KMS
+| NEXT
+| NO
+| NOCANCELQUERY
+| NOCONTROLCHANGEFEED
+| NOCONTROLJOB
+| NOCREATEDB
+| NOCREATELOGIN
+| NOCREATEROLE
+| NOLOGIN
+| NOMODIFYCLUSTERSETTING
+| NONE
+| NONVOTERS
+| NORMAL
+| NOSQLLOGIN
+| NOT
+| NOTHING
+| NOTHING_AFTER_RETURNING
+| NOVIEWACTIVITY
+| NOVIEWACTIVITYREDACTED
+| NOVIEWCLUSTERSETTING
+| NOVIEWJOB
+| NOWAIT
+| NO_FULL_SCAN
+| NO_INDEX_JOIN
+| NO_ZIGZAG_JOIN
+| NULL
+| NULLIF
+| NULLS
+| NUMERIC
+| OF
+| OFF
+| OIDS
+| OLD_KMS
+| ONLY
+| OPERATOR
+| OPT
+| OPTION
+| OPTIONS
+| OR
+| ORDINALITY
+| OTHERS
+| OUT
+| OUTER
+| OVERLAY
+| OWNED
+| OWNER
 | PARALLEL
+| PARENT
+| PARTIAL
+| PARTITION
+| PARTITIONS
+| PASSWORD
+| PAUSE
+| PAUSED
+| PHYSICAL
+| PLACEMENT
+| PLACING
+| PLAN
+| PLANS
+| POINT
+| POINTM
+| POINTZ
+| POINTZM
+| POLYGON
+| POLYGONM
+| POLYGONZ
+| POLYGONZM
+| POSITION
+| PRECEDING
+| PREPARE
+| PRESERVE
+| PRIMARY
+| PRIOR
+| PRIORITY
+| PRIVILEGES
+| PUBLIC
+| PUBLICATION
+| QUERIES
 | QUERY
+| QUOTE
+| RANGE
+| RANGES
+| READ
+| REAL
+| REASON
+| REASSIGN
+| RECURRING
+| RECURSIVE
+| REF
+| REFERENCES
+| REFRESH
+| REGION
+| REGIONAL
+| REGIONS
+| REINDEX
+| RELATIVE
+| RELEASE
+| RELOCATE
+| RENAME
+| REPEATABLE
+| REPLACE
+| REPLICATION
+| RESET
+| RESTART
+| RESTORE
+| RESTRICT
+| RESTRICTED
+| RESUME
+| RETENTION
+| RETRY
 | RETURN
 | RETURNS
+| REVISION_HISTORY
+| REVOKE
+| RIGHT
+| ROLE
+| ROLES
+| ROLLBACK
+| ROLLUP
+| ROUTINES
+| ROW
+| ROWS
+| RULE
+| RUNNING
+| SAVEPOINT
+| SCANS
+| SCATTER
+| SCHEDULE
+| SCHEDULES
+| SCHEMA
+| SCHEMAS
+| SCHEMA_ONLY
+| SCROLL
+| SCRUB
+| SEARCH
+| SECONDARY
 | SECURITY
-| STABLE
-| SUPPORT
-| TRANSFORM
-| VOLATILE
+| SELECT
+| SEQUENCE
+| SEQUENCES
+| SERIALIZABLE
+| SERVER
+| SERVICE
+| SESSION
+| SESSIONS
+| SESSION_USER
+| SET
 | SETOF
+| SETS
+| SETTING
+| SETTINGS
+| SHARE
+| SHARED
+| SHOW
+| SIMILAR
+| SIMPLE
+| SKIP
+| SKIP_LOCALITIES_CHECK
+| SKIP_MISSING_FOREIGN_KEYS
+| SKIP_MISSING_SEQUENCES
+| SKIP_MISSING_SEQUENCE_OWNERS
+| SKIP_MISSING_UDFS
 | SKIP_MISSING_VIEWS
+| SMALLINT
+| SNAPSHOT
+| SOME
+| SPLIT
+| SQL
+| SQLLOGIN
+| STABLE
+| START
+| STATE
+| STATEMENTS
+| STATISTICS
+| STATUS
+| STDIN
+| STDOUT
+| STOP
+| STORAGE
+| STORE
+| STORED
+| STORING
+| STREAM
+| STRICT
+| STRING
+| SUBSCRIPTION
+| SUBSTRING
+| SUPER
+| SUPPORT
+| SURVIVAL
+| SURVIVE
+| SYMMETRIC
+| SYNTAX
+| SYSTEM
+| TABLE
+| TABLES
+| TABLESPACE
+| TEMP
+| TEMPLATE
+| TEMPORARY
+| TENANT
+| TENANTS
+| TENANT_NAME
+| TESTING_RELOCATE
+| TEXT
+| THEN
+| THROTTLING
+| TIES
+| TIME
+| TIMESTAMP
+| TIMESTAMPTZ
+| TIMETZ
+| TRACE
+| TRACING
+| TRAILING
+| TRANSACTION
+| TRANSACTIONS
+| TRANSFER
+| TRANSFORM
+| TREAT
+| TRIGGER
+| TRIM
+| TRUE
+| TRUNCATE
+| TRUSTED
+| TYPE
+| TYPES
+| UNBOUNDED
+| UNCOMMITTED
+| UNIQUE
+| UNKNOWN
+| UNLISTEN
+| UNLOGGED
+| UNSET
+| UNSPLIT
+| UNTIL
+| UPDATE
+| UPSERT
+| USE
+| USER
+| USERS
+| USING
+| VALID
+| VALIDATE
+| VALUE
+| VALUES
+| VARBIT
+| VARCHAR
+| VARIADIC
+| VERIFY_BACKUP_TABLE_DATA
+| VIEW
+| VIEWACTIVITY
+| VIEWACTIVITYREDACTED
+| VIEWCLUSTERMETADATA
+| VIEWCLUSTERSETTING
+| VIEWDEBUG
+| VIEWJOB
+| VIRTUAL
+| VISIBLE
+| VOLATILE
+| VOTERS
+| WHEN
+| WORK
+| WRITE
+| ZONE
+
 
 // Column identifier --- keywords that can be column, table, etc names.
 //

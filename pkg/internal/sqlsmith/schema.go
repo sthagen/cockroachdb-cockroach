@@ -495,6 +495,14 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 			// See #69213.
 			continue
 		}
+
+		if n := tree.Name(def.Name); n.String() != def.Name {
+			// sqlsmith doesn't know how to quote function names, e.g. for
+			// the numeric cast, we need to use `"numeric"(val)`, but sqlsmith
+			// makes it `numeric(val)` which is incorrect.
+			continue
+		}
+
 		skip := false
 		for _, substr := range []string{
 			// crdb_internal.complete_stream_ingestion_job is a stateful
@@ -513,9 +521,6 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 			"crdb_internal.revalidate_unique_constraint",
 			"crdb_internal.request_statement_bundle",
 			"crdb_internal.set_compaction_concurrency",
-			// TODO(96555): Temporarily disable crdb_internal.hide_sql_constants,
-			// which produces internal errors for some valid inputs.
-			"crdb_internal.hide_sql_constants",
 			// TODO(#97097): Temporarily disable crdb_internal.fingerprint
 			// which produces internal errors for some valid inputs.
 			"crdb_internal.fingerprint",

@@ -670,7 +670,7 @@ func (s *adminServer) getDatabaseTableSpans(
 		if err != nil {
 			return nil, err
 		}
-		tableSpans[tableName] = generateTableSpan(tableID)
+		tableSpans[tableName] = generateTableSpan(tableID, s.sqlServer.execCfg.Codec)
 	}
 	return tableSpans, nil
 }
@@ -1161,7 +1161,7 @@ func (s *adminServer) tableDetailsHelper(
 	// Get the number of ranges in the table. We get the key span for the table
 	// data. Then, we count the number of ranges that make up that key span.
 	{
-		tableSpan := generateTableSpan(tableID)
+		tableSpan := generateTableSpan(tableID, s.sqlServer.execCfg.Codec)
 		tableRSpan, err := keys.SpanAddr(tableSpan)
 		if err != nil {
 			return nil, err
@@ -1190,8 +1190,8 @@ func (s *adminServer) tableDetailsHelper(
 //
 // NOTE: this doesn't make sense for interleaved (children) table. As of
 // 03/2018, callers around here use it anyway.
-func generateTableSpan(tableID descpb.ID) roachpb.Span {
-	tableStartKey := keys.TODOSQLCodec.TablePrefix(uint32(tableID))
+func generateTableSpan(tableID descpb.ID, codec keys.SQLCodec) roachpb.Span {
+	tableStartKey := codec.TablePrefix(uint32(tableID))
 	tableEndKey := tableStartKey.PrefixEnd()
 	return roachpb.Span{Key: tableStartKey, EndKey: tableEndKey}
 }
@@ -1223,7 +1223,7 @@ func (s *adminServer) TableStats(
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
-	tableSpan := generateTableSpan(tableID)
+	tableSpan := generateTableSpan(tableID, s.sqlServer.execCfg.Codec)
 
 	r, err := s.statsForSpan(ctx, tableSpan)
 	if err != nil {
@@ -2245,40 +2245,49 @@ func jobsHelper(
 	cfg *BaseConfig,
 	sv *settings.Values,
 ) (_ *serverpb.JobsResponse, retErr error) {
-	retryRunningCondition := "status='running' AND next_run > now() AND num_runs > 1"
-	retryRevertingCondition := "status='reverting' AND next_run > now() AND num_runs > 1"
 
 	q := makeSQLQuery()
 	q.Append(`
-      SELECT job_id, job_type, description, statement, user_name, descriptor_ids,
-            case
-              when ` + retryRunningCondition + ` then 'retry-running' 
-              when ` + retryRevertingCondition + ` then 'retry-reverting' 
-              else status
-            end as status, running_status, created, started, finished, modified, fraction_completed,
-            high_water_timestamp, error, last_run, next_run, num_runs, execution_events::string, coordinator_id
-        FROM crdb_internal.jobs
-       WHERE true
-	`)
-	if req.Status == "retrying" {
-		q.Append(" AND ( ( " + retryRunningCondition + " ) OR ( " + retryRevertingCondition + " ) )")
-	} else if req.Status != "" {
+SELECT
+  job_id,
+  job_type,
+  description,
+  statement,
+  user_name,
+  descriptor_ids,
+  status,
+  running_status,
+  created,
+  started,
+  finished,
+  modified,
+  fraction_completed,
+  high_water_timestamp,
+  error,
+  last_run,
+  next_run,
+  num_runs,
+  execution_events::string,
+  coordinator_id
+FROM crdb_internal.jobs
+WHERE true`) // Simplifies filter construction below.
+	if req.Status != "" {
 		q.Append(" AND status = $", req.Status)
 	}
 	if req.Type != jobspb.TypeUnspecified {
 		q.Append(" AND job_type = $", req.Type.String())
 	} else {
 		// Don't show automatic jobs in the overview page.
-		q.Append(" AND (")
+		q.Append(" AND ( job_type NOT IN (")
 		for idx, jobType := range jobspb.AutomaticJobTypes {
-			q.Append("job_type != $", jobType.String())
-			if idx < len(jobspb.AutomaticJobTypes)-1 {
-				q.Append(" AND ")
+			if idx != 0 {
+				q.Append(", ")
 			}
+			q.Append("$", jobType.String())
 		}
-		q.Append(" OR job_type IS NULL)")
+		q.Append(" ) OR job_type IS NULL)")
 	}
-	q.Append("ORDER BY created DESC")
+	q.Append(" ORDER BY created DESC")
 	if req.Limit > 0 {
 		q.Append(" LIMIT $", tree.DInt(req.Limit))
 	}
@@ -2700,8 +2709,8 @@ func (s *systemAdminServer) DecommissionPreCheck(
 		}
 	}
 
-	// Evaluate readiness for each node to check based on how many ranges have
-	// replicas on the node that did not pass checks.
+	// Evaluate readiness by validating that there are no ranges with replicas on
+	// the given node(s) that did not pass checks.
 	for _, nID := range nodesToCheck {
 		numReplicas := len(results.replicasByNode[nID])
 		var readiness serverpb.DecommissionPreCheckResponse_NodeReadiness

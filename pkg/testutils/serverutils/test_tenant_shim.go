@@ -30,6 +30,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
+type SessionType int
+
+const (
+	UnknownSession SessionType = iota
+	SingleTenantSession
+	MultiTenantSession
+)
+
 // TestTenantInterface defines SQL-only tenant functionality that tests need; it
 // is implemented by server.Test{Tenant,Server}. Tests written against this
 // interface are effectively agnostic to the type of tenant (host or secondary)
@@ -99,6 +107,10 @@ type TestTenantInterface interface {
 	// this tenant.
 	ClusterSettings() *cluster.Settings
 
+	// SettingsWatcher returns the *settingswatcher.SettingsWatcher used by the
+	// tenant server.
+	SettingsWatcher() interface{}
+
 	// Stopper returns the stopper used by the tenant.
 	Stopper() *stop.Stopper
 
@@ -147,7 +159,7 @@ type TestTenantInterface interface {
 	GetAdminHTTPClient() (http.Client, error)
 	// GetAuthenticatedHTTPClient returns an http client which has been
 	// authenticated to access Admin API methods (via a cookie).
-	GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error)
+	GetAuthenticatedHTTPClient(isAdmin bool, sessionType SessionType) (http.Client, error)
 	// GetEncodedSession returns a byte array containing a valid auth
 	// session.
 	GetAuthSession(isAdmin bool) (*serverpb.SessionCookie, error)

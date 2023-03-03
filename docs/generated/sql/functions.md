@@ -883,6 +883,23 @@ available replica will error.</p>
 </span></td><td>Immutable</td></tr></tbody>
 </table>
 
+### Full Text Search functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
+<tbody>
+<tr><td><a name="phraseto_tsquery"></a><code>phraseto_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the specified or default configuration. The &lt;-&gt; operator is inserted between each token in the input.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="plainto_tsquery"></a><code>plainto_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the specified or default configuration. The &amp; operator is inserted between each token in the input.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="to_tsquery"></a><code>to_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts the input text into a tsquery by normalizing each word in the input according to the specified or default configuration. The input must already be formatted like a tsquery, in other words, subsequent tokens must be connected by a tsquery operator (&amp;, |, &lt;-&gt;, !).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="to_tsvector"></a><code>to_tsvector(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsvector</code></td><td><span class="funcdesc"><p>Converts text to a tsvector, normalizing words according to the specified or default configuration. Position information is included in the result.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="ts_parse"></a><code>ts_parse(parser_name: <a href="string.html">string</a>, document: <a href="string.html">string</a>) &rarr; tuple{int AS tokid, string AS token}</code></td><td><span class="funcdesc"><p>ts_parse parses the given document and returns a series of records, one for each token produced by parsing. Each record includes a tokid showing the assigned token type and a token which is the text of the token.</p>
+</span></td><td>Stable</td></tr></tbody>
+</table>
+
 ### Fuzzy String Matching functions
 
 <table>
@@ -963,8 +980,6 @@ available replica will error.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="set_masklen"></a><code>set_masklen(val: <a href="inet.html">inet</a>, prefixlen: <a href="int.html">int</a>) &rarr; <a href="inet.html">inet</a></code></td><td><span class="funcdesc"><p>Sets the prefix length of <code>val</code> to <code>prefixlen</code>.</p>
 <p>For example, <code>set_masklen('192.168.1.2', 16)</code> returns <code>'192.168.1.2/16'</code>.</p>
-</span></td><td>Immutable</td></tr>
-<tr><td><a name="text"></a><code>text(val: <a href="inet.html">inet</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts the IP address and prefix length to text.</p>
 </span></td><td>Immutable</td></tr></tbody>
 </table>
 
@@ -1263,6 +1278,12 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <tr><td><a name="crdb_internal.scan"></a><code>crdb_internal.scan(span: <a href="bytes.html">bytes</a>[]) &rarr; tuple{bytes AS key, bytes AS value, string AS ts}</code></td><td><span class="funcdesc"><p>Returns the raw keys and values from the specified span</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.scan"></a><code>crdb_internal.scan(start_key: <a href="bytes.html">bytes</a>, end_key: <a href="bytes.html">bytes</a>) &rarr; tuple{bytes AS key, bytes AS value, string AS ts}</code></td><td><span class="funcdesc"><p>Returns the raw keys and values with their timestamp from the specified span</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="crdb_internal.tenant_span_stats"></a><code>crdb_internal.tenant_span_stats() &rarr; tuple{int AS database_id, int AS table_id, int AS range_count, int AS approximate_disk_<a href="bytes.html">bytes</a>, int AS live_<a href="bytes.html">bytes</a>, int AS total_<a href="bytes.html">bytes</a>, float AS live_percentage}</code></td><td><span class="funcdesc"><p>Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for all of the tenant’s tables.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="crdb_internal.tenant_span_stats"></a><code>crdb_internal.tenant_span_stats(database_id: <a href="int.html">int</a>) &rarr; tuple{int AS database_id, int AS table_id, int AS range_count, int AS approximate_disk_<a href="bytes.html">bytes</a>, int AS live_<a href="bytes.html">bytes</a>, int AS total_<a href="bytes.html">bytes</a>, float AS live_percentage}</code></td><td><span class="funcdesc"><p>Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for tables of the provided database id.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="crdb_internal.tenant_span_stats"></a><code>crdb_internal.tenant_span_stats(database_id: <a href="int.html">int</a>, table_id: <a href="int.html">int</a>) &rarr; tuple{int AS database_id, int AS table_id, int AS range_count, int AS approximate_disk_<a href="bytes.html">bytes</a>, int AS live_<a href="bytes.html">bytes</a>, int AS total_<a href="bytes.html">bytes</a>, float AS live_percentage}</code></td><td><span class="funcdesc"><p>Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for the provided table id.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.testing_callback"></a><code>crdb_internal.testing_callback(name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>For internal CRDB testing only. The function calls a callback identified by <code>name</code> registered with the server by the test.</p>
 </span></td><td>Volatile</td></tr>
@@ -2767,8 +2788,6 @@ The output can be used to recreate a database.’</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="get_byte"></a><code>get_byte(byte_string: <a href="bytes.html">bytes</a>, index: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Extracts a byte at the given index in the byte array.</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="inet"></a><code>inet(val: <a href="string.html">string</a>) &rarr; <a href="inet.html">inet</a></code></td><td><span class="funcdesc"><p>If possible, converts input to that of type inet.</p>
-</span></td><td>Immutable</td></tr>
 <tr><td><a name="initcap"></a><code>initcap(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Capitalizes the first letter of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="left"></a><code>left(input: <a href="bytes.html">bytes</a>, return_set: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns the first <code>return_set</code> bytes from <code>input</code>.</p>
@@ -3091,7 +3110,7 @@ may increase either contention or retry errors, or both.</p>
 <tr><td><a name="crdb_internal.encode_key"></a><code>crdb_internal.encode_key(table_id: <a href="int.html">int</a>, index_id: <a href="int.html">int</a>, row_tuple: anyelement) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Generate the key for a row on a particular table and index.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.fingerprint"></a><code>crdb_internal.fingerprint(span: <a href="bytes.html">bytes</a>[], start_time: <a href="timestamp.html">timestamptz</a>, all_revisions: <a href="bool.html">bool</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
-</span></td><td>Immutable</td></tr>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.force_assertion_error"></a><code>crdb_internal.force_assertion_error(msg: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.force_error"></a><code>crdb_internal.force_error(errorCode: <a href="string.html">string</a>, msg: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
@@ -3520,8 +3539,6 @@ table. Returns an error if validation fails.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="obj_description"></a><code>obj_description(object_oid: oid, catalog_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a database object specified by its OID and the name of the containing system catalog. For example, obj_description(123456, ‘pg_class’) would retrieve the comment for the table with OID 123456.</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="oid"></a><code>oid(int: <a href="int.html">int</a>) &rarr; oid</code></td><td><span class="funcdesc"><p>Converts an integer to an OID.</p>
-</span></td><td>Immutable</td></tr>
 <tr><td><a name="pg_backend_pid"></a><code>pg_backend_pid() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns a numerical ID attached to this session. This ID is part of the query cancellation key used by the wire protocol. This function was only added for compatibility, and unlike in Postgres, the returned value does not correspond to a real process ID.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_collation_for"></a><code>pg_collation_for(str: anyelement) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the collation of the argument</p>

@@ -22,7 +22,7 @@ BEGIN
 END;
 $$ LANGUAGE made_up_language
 
-statement error .*cannot set leakproof on function with non-immutable volatility: STABLE.*
+statement error pgcode 42P13 leak proof function must be immutable, but got volatility: STABLE
 CREATE FUNCTION f(a int) RETURNS INT LEAKPROOF STABLE LANGUAGE SQL AS 'SELECT 1'
 
 statement error pq: return type mismatch in function declared to return int\nDETAIL: Actual return type is string
@@ -1069,7 +1069,7 @@ $$
 statement error pq: IMMUTABLE: conflicting or redundant options
 ALTER FUNCTION f_test_alter_opt IMMUTABLE IMMUTABLE
 
-statement error pq: cannot set leakproof on function with non-immutable volatility: STABLE
+statement error pgcode 42P13 leak proof function must be immutable, but got volatility: STABLE
 ALTER FUNCTION f_test_alter_opt STABLE LEAKPROOF
 
 statement ok
@@ -1419,7 +1419,7 @@ CREATE OR REPLACE FUNCTION f_test_cor(a INT, c INT) RETURNS INT IMMUTABLE LANGUA
 statement error pq: cannot change return type of existing function
 CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS STRING IMMUTABLE LANGUAGE SQL AS $$ SELECT 'hello' $$;
 
-statement error pq: cannot set leakproof on function with non-immutable volatility: VOLATILE
+statement error pgcode 42P13 leak proof function must be immutable, but got volatility: VOLATILE
 CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT LEAKPROOF LANGUAGE SQL AS $$ SELECT 1 $$;
 
 query T
@@ -3116,3 +3116,50 @@ query I
 SELECT f_94146(1::INT2)
 ----
 2
+
+subtest regression_97130
+
+statement ok
+CREATE FUNCTION f_97130() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+
+let $pre_search_path
+SHOW search_path
+
+statement ok
+SET search_path = public,public
+
+statement ok
+SELECT f_97130();
+
+statement ok
+SET search_path = $pre_search_path
+
+subtest regression_97400
+
+# Make sure that creating a UDF with builtin function name is ok.
+statement ok
+CREATE FUNCTION abs(val INT) RETURNS INT
+CALLED ON NULL INPUT
+LANGUAGE SQL
+AS $$ SELECT val+100 $$;
+
+query I
+SELECT abs(-1)
+----
+1
+
+query I
+SELECT public.abs(-1)
+----
+99
+
+subtest regression_97854
+
+# Regression test for #97854.
+statement ok
+CREATE FUNCTION f_97854 (i INT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'i' $$;
+CREATE FUNCTION f_97854 (f FLOAT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'f' $$;
+
+# TODO(#88318): In Postgres, the float overload is chosen.
+statement error pgcode 42725 ambiguous call: f_97854\(decimal\).*
+SELECT f_97854(1.0)

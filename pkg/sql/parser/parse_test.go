@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
@@ -412,8 +413,14 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`COPY t FROM STDIN FREEZE`, 41608, `freeze`, ``},
 		{`COPY t FROM STDIN ENCODING 'utf-8'`, 41608, `encoding`, ``},
 		{`COPY t FROM STDIN FORCE QUOTE *`, 41608, `quote`, ``},
-		{`COPY t FROM STDIN FORCE NULL *`, 41608, `force null`, ``},
-		{`COPY t FROM STDIN FORCE NOT NULL *`, 41608, `force not null`, ``},
+		{`COPY t FROM STDIN FORCE NULL *`, 41608, `force_null`, ``},
+		{`COPY t FROM STDIN FORCE NOT NULL *`, 41608, `force_not_null`, ``},
+		{`COPY t FROM STDIN WITH (OIDS)`, 41608, `oids`, ``},
+		{`COPY t FROM STDIN (FREEZE)`, 41608, `freeze`, ``},
+		{`COPY t FROM STDIN WITH (ESCAPE ',', ENCODING 'utf-8')`, 41608, `encoding`, ``},
+		{`COPY t FROM STDIN WITH (FORCE_QUOTE) *`, 41608, `quote`, ``},
+		{`COPY t FROM STDIN (FORCE_NULL) *`, 41608, `force_null`, ``},
+		{`COPY t FROM STDIN (HEADER, FORCE_NOT_NULL) *`, 41608, `force_not_null`, ``},
 		{`COPY x FROM STDIN WHERE a = b`, 54580, ``, ``},
 
 		{`ALTER AGGREGATE a`, 74775, `alter aggregate`, ``},
@@ -765,5 +772,71 @@ func TestGetTypeFromValidSQLSyntax(t *testing.T) {
 		// at the moment (like the width might only be set on the returned
 		// type), so we simply assert that the OIDs are the same.
 		require.Equal(t, orig.Oid(), actual.Oid())
+	}
+}
+
+// nonBareLabelKeywords contains all the keywords that cannot be used as
+// bare column labels in Postgres. Only add an entry to this map if the
+// following query cannot be parsed in Postgres:
+// `SELECT 1 <keyword>;`
+var nonBareLabelKeywords = map[string]struct{}{
+	"ARRAY":     {},
+	"AS":        {},
+	"CHAR":      {},
+	"CHARACTER": {},
+	"CREATE":    {},
+	"DAY":       {},
+	"EXCEPT":    {},
+	"FETCH":     {},
+	"FILTER":    {},
+	"FOR":       {},
+	"FROM":      {},
+	"GRANT":     {},
+	"GROUP":     {},
+	"HAVING":    {},
+	"HOUR":      {},
+	"INTERSECT": {},
+	"INTO":      {},
+	"LIMIT":     {},
+	"MINUTE":    {},
+	"MONTH":     {},
+	"OFFSET":    {},
+	"ON":        {},
+	"ORDER":     {},
+	"OVER":      {},
+	"OVERLAPS":  {},
+	"PRECISION": {},
+	"RETURNING": {},
+	"SECOND":    {},
+	"TO":        {},
+	"UNION":     {},
+	"VARYING":   {},
+	"WHERE":     {},
+	"WINDOW":    {},
+	"WITH":      {},
+	"WITHIN":    {},
+	"WITHOUT":   {},
+	"YEAR":      {},
+
+	// COLLATE actually is an allowed bare_label_keyword in Postgres, but fixing
+	// it in CRDB requires some pretty big grammar rewrites.
+	"COLLATE": {},
+}
+
+// TestColumnBareLabels checks all the keywords to see if they can be used as
+// a bare column label. If this test fails, then run `SELECT 1 <keyword>;` in
+// Postgres. Then:
+// - If it succeeds, add the keyword to bare_label_keywords in sql.y.
+// - If it fails, add the keyword to the nonBareLabelKeywords list above.
+func TestBareLabelKeywords(t *testing.T) {
+	for _, k := range lexbase.KeywordNames {
+		k = strings.ToUpper(k)
+		_, shouldFail := nonBareLabelKeywords[k]
+		_, err := parser.ParseOne(fmt.Sprintf("SELECT 1 %s", k))
+		if err != nil && !shouldFail {
+			require.NoErrorf(t, err, "expected %s to succeed parsing as a bare column label", k)
+		} else if err == nil && shouldFail {
+			require.Errorf(t, err, "expected %s to fail parsing as a bare column label", k)
+		}
 	}
 }

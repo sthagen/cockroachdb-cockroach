@@ -79,11 +79,13 @@ test           crdb_internal       node_contention_events                 public
 test           crdb_internal       node_distsql_flows                     public   SELECT          false
 test           crdb_internal       node_execution_insights                public   SELECT          false
 test           crdb_internal       node_inflight_trace_spans              public   SELECT          false
+test           crdb_internal       node_memory_monitors                   public   SELECT          false
 test           crdb_internal       node_metrics                           public   SELECT          false
 test           crdb_internal       node_queries                           public   SELECT          false
 test           crdb_internal       node_runtime_info                      public   SELECT          false
 test           crdb_internal       node_sessions                          public   SELECT          false
 test           crdb_internal       node_statement_statistics              public   SELECT          false
+test           crdb_internal       node_tenant_capabilities_cache         public   SELECT          false
 test           crdb_internal       node_transaction_statistics            public   SELECT          false
 test           crdb_internal       node_transactions                      public   SELECT          false
 test           crdb_internal       node_txn_execution_insights            public   SELECT          false

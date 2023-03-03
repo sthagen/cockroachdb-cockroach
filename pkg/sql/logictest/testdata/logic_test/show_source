@@ -84,6 +84,7 @@ idle_session_timeout                                  0
 index_join_streamer_batch_size                        8.0 MiB
 index_recommendations_enabled                         off
 inject_retry_errors_enabled                           off
+inject_retry_errors_on_commit_enabled                 off
 integer_datetimes                                     on
 intervalstyle                                         postgres
 is_superuser                                          on
@@ -110,6 +111,7 @@ opt_split_scan_limit                                  2048
 optimizer_use_forecasts                               on
 optimizer_use_histograms                              on
 optimizer_use_improved_disjunction_stats              on
+optimizer_use_improved_split_disjunction_for_joins    on
 optimizer_use_limit_ordering_for_streaming_group_by   on
 optimizer_use_multicol_stats                          on
 optimizer_use_not_visible_indexes                     off

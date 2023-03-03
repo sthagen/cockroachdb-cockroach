@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/semenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -229,6 +230,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 
 				if d.PrimaryKey {
+					if t.ValidationBehavior == tree.ValidationSkip {
+						return sqlerrors.NewUnsupportedUnvalidatedConstraintError(catconstants.ConstraintTypePK)
+					}
 					// Translate this operation into an ALTER PRIMARY KEY command.
 					alterPK := &tree.AlterTableAlterPrimaryKey{
 						Columns:       d.Columns,
@@ -245,6 +249,10 @@ func (n *alterTableNode) startExec(params runParams) error {
 						return err
 					}
 					continue
+				}
+
+				if t.ValidationBehavior == tree.ValidationSkip {
+					return sqlerrors.NewUnsupportedUnvalidatedConstraintError(catconstants.ConstraintTypeUnique)
 				}
 
 				if err := validateColumnsAreAccessible(n.tableDesc, d.Columns); err != nil {
@@ -507,6 +515,13 @@ func (n *alterTableNode) startExec(params runParams) error {
 					continue
 				}
 				return sqlerrors.NewUndefinedConstraintError(string(t.Constraint), n.tableDesc.Name)
+			}
+			if uwoi := c.AsUniqueWithoutIndex(); uwoi != nil {
+				if err := params.p.tryRemoveFKBackReferences(
+					params.ctx, n.tableDesc, uwoi, t.DropBehavior, true,
+				); err != nil {
+					return err
+				}
 			}
 			if err := n.tableDesc.DropConstraint(
 				c,
@@ -1608,6 +1623,7 @@ func dropColumnImpl(
 
 	// You can't drop a column depended on by a view unless CASCADE was
 	// specified.
+	var depsToDrop catalog.DescriptorIDSet
 	for _, ref := range tableDesc.DependedOnBy {
 		found := false
 		for _, colID := range ref.ColumnIDs {
@@ -1625,32 +1641,14 @@ func dropColumnImpl(
 		if err != nil {
 			return nil, err
 		}
-		depDesc, err := params.p.getDescForCascade(
-			params.ctx, "column", string(t.Column), tableDesc.ParentID, ref.ID, t.DropBehavior,
-		)
-		if err != nil {
-			return nil, err
-		}
-		switch t := depDesc.(type) {
-		case *tabledesc.Mutable:
-			jobDesc := fmt.Sprintf("removing view %q dependent on column %q which is being dropped",
-				t.Name, colToDrop.ColName())
-			cascadedViews, err := params.p.removeDependentView(params.ctx, tableDesc, t, jobDesc)
-			if err != nil {
-				return nil, err
-			}
-			qualifiedView, err := params.p.getQualifiedTableName(params.ctx, t)
-			if err != nil {
-				return nil, err
-			}
+		depsToDrop.Add(ref.ID)
+	}
 
-			droppedViews = append(droppedViews, cascadedViews...)
-			droppedViews = append(droppedViews, qualifiedView.FQString())
-		case *funcdesc.Mutable:
-			if err := params.p.removeDependentFunction(params.ctx, tableDesc, t); err != nil {
-				return nil, err
-			}
-		}
+	droppedViews, err = params.p.removeDependents(
+		params.ctx, tableDesc, depsToDrop, "column", colToDrop.GetName(), t.DropBehavior,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	// We cannot remove this column if there are computed columns or a TTL

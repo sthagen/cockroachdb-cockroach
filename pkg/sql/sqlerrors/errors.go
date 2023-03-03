@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -171,6 +172,11 @@ func NewSchemaAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", name)
 }
 
+func NewUnsupportedUnvalidatedConstraintError(constraintType catconstants.ConstraintType) error {
+	return pgerror.Newf(pgcode.FeatureNotSupported,
+		"%v constraints cannot be marked NOT VALID", constraintType)
+}
+
 // WrapErrorWhileConstructingObjectAlreadyExistsErr is used to wrap an error
 // when an error occurs while trying to get the colliding object for an
 // ObjectAlreadyExistsErr.
@@ -321,6 +327,12 @@ func NewWindowInAggError() error {
 // contained within another aggregate function.
 func NewAggInAggError() error {
 	return pgerror.New(pgcode.Grouping, "aggregate function calls cannot be nested")
+}
+
+// NewInvalidVolatilityError creates an error for the case when provided
+// volatility options are not valid through CREATE/REPLACE/ALTER FUNCTION.
+func NewInvalidVolatilityError(err error) error {
+	return pgerror.Wrap(err, pgcode.InvalidFunctionDefinition, "invalid volatility")
 }
 
 // QueryTimeoutError is an error representing a query timeout.

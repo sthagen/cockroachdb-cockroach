@@ -13,13 +13,14 @@ package scbuildstmt
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
@@ -31,8 +32,13 @@ func CreateFunction(b BuildCtx, n *tree.CreateFunction) {
 	dbElts, scElts := b.ResolvePrefix(n.FuncName.ObjectNamePrefix, privilege.CREATE)
 	_, _, sc := scpb.FindSchema(scElts)
 	_, _, db := scpb.FindDatabase(dbElts)
+	_, _, scName := scpb.FindNamespace(scElts)
+	_, _, dbname := scpb.FindNamespace(dbElts)
 
-	validateParameters(b, n, db.DatabaseID)
+	n.FuncName.SchemaName = tree.Name(scName.Name)
+	n.FuncName.CatalogName = tree.Name(dbname.Name)
+
+	validateParameters(n)
 
 	existingFn := b.ResolveUDF(
 		&tree.FuncObj{
@@ -65,7 +71,7 @@ func CreateFunction(b BuildCtx, n *tree.CreateFunction) {
 		if param.DefaultVal != nil {
 			panic(unimplemented.New("CREATE FUNCTION argument", "default value"))
 		}
-		paramCls, err := funcdesc.ParamClassToProto(param.Class)
+		paramCls, err := funcinfo.ParamClassToProto(param.Class)
 		if err != nil {
 			panic(err)
 		}
@@ -87,12 +93,13 @@ func CreateFunction(b BuildCtx, n *tree.CreateFunction) {
 		Name:       n.FuncName.Object(),
 	})
 
+	validateFunctionLeakProof(n.Options, funcinfo.MakeDefaultVolatilityProperties())
 	var lang catpb.Function_Language
 	var fnBodyStr string
 	for _, option := range n.Options {
 		switch t := option.(type) {
 		case tree.FunctionVolatility:
-			v, err := funcdesc.VolatilityToProto(t)
+			v, err := funcinfo.VolatilityToProto(t)
 			if err != nil {
 				panic(err)
 			}
@@ -106,7 +113,7 @@ func CreateFunction(b BuildCtx, n *tree.CreateFunction) {
 				LeakProof:  bool(t),
 			})
 		case tree.FunctionNullInputBehavior:
-			v, err := funcdesc.NullInputBehaviorToProto(t)
+			v, err := funcinfo.NullInputBehaviorToProto(t)
 			if err != nil {
 				panic(err)
 			}
@@ -115,7 +122,7 @@ func CreateFunction(b BuildCtx, n *tree.CreateFunction) {
 				NullInputBehavior: catpb.FunctionNullInputBehavior{NullInputBehavior: v},
 			})
 		case tree.FunctionLanguage:
-			v, err := funcdesc.FunctionLangToProto(t)
+			v, err := funcinfo.FunctionLangToProto(t)
 			if err != nil {
 				panic(err)
 			}
@@ -140,7 +147,7 @@ func CreateFunction(b BuildCtx, n *tree.CreateFunction) {
 	b.Add(b.WrapFunctionBody(fnID, fnBodyStr, lang, refProvider))
 }
 
-func validateParameters(b BuildCtx, n *tree.CreateFunction, parentDBID descpb.ID) {
+func validateParameters(n *tree.CreateFunction) {
 	seen := make(map[tree.Name]struct{})
 	for _, param := range n.Params {
 		if param.Name != "" {
@@ -173,5 +180,14 @@ func validateFunctionRelationReferences(
 				"the function cannot refer to other databases",
 				name.String()))
 		}
+	}
+}
+
+func validateFunctionLeakProof(options tree.FunctionOptions, vp funcinfo.VolatilityProperties) {
+	if err := vp.Apply(options); err != nil {
+		panic(err)
+	}
+	if err := vp.Validate(); err != nil {
+		panic(sqlerrors.NewInvalidVolatilityError(err))
 	}
 }

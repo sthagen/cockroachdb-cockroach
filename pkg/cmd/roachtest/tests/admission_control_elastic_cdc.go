@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
@@ -50,7 +51,7 @@ func registerElasticControlForCDC(r registry.Registry) {
 			promCfg.WithPrometheusNode(c.Node(workloadNode).InstallNodes()[0]).
 				WithNodeExporter(c.Range(1, c.Spec().NodeCount-1).InstallNodes()).
 				WithCluster(c.Range(1, c.Spec().NodeCount-1).InstallNodes()).
-				WithGrafanaDashboard("http://go.crdb.dev/p/changefeed-admission-control-grafana").
+				WithGrafanaDashboardJSON(grafana.ChangefeedAdmissionControlGrafana).
 				WithScrapeConfigs(
 					prometheus.MakeWorkloadScrapeConfig("workload", "/",
 						makeWorkloadScrapeNodes(
@@ -94,6 +95,13 @@ func registerElasticControlForCDC(r registry.Registry) {
 
 						// Changefeeds depend on rangefeeds being enabled.
 						if _, err := db.Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true"); err != nil {
+							return err
+						}
+						// By default, each changefeed can use up to 512MB of memory from root monitor.
+						// We will start 10 changefeeds, and potentially, we can reserve 5GB from main
+						// memory monitor.  That's a bit too much when running this test on smaller, 8G
+						// machines.  Lower the memory allowance.
+						if _, err := db.Exec("SET CLUSTER SETTING changefeed.memory.per_changefeed_limit = '128MB'"); err != nil {
 							return err
 						}
 					}

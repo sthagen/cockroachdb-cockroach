@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
@@ -145,7 +146,7 @@ func (s *Server) startTenantServerInternal(
 	log.Infof(startCtx, "starting tenant server")
 
 	// Now start the tenant proper.
-	tenantServer, err := NewSharedProcessTenantServer(startCtx, stopper, baseCfg, sqlCfg, s.recorder, tenantNameContainer)
+	tenantServer, err := NewSharedProcessTenantServer(startCtx, stopper, baseCfg, sqlCfg, tenantNameContainer)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +173,7 @@ func (s *Server) makeSharedProcessTenantConfig(
 		InternalServer:     s.node,
 		ServerInterceptors: s.grpc.serverInterceptorsInfo,
 	}
-	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, index, parentCfg, localServerInfo, stopper)
+	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, index, parentCfg, localServerInfo, stopper, s.recorder)
 	if err != nil {
 		return BaseConfig{}, SQLConfig{}, err
 	}
@@ -188,6 +189,7 @@ func makeSharedProcessTenantServerConfig(
 	kvServerCfg Config,
 	kvServerInfo LocalKVServerInfo,
 	stopper *stop.Stopper,
+	nodeMetricsRecorder *status.MetricsRecorder,
 ) (baseCfg BaseConfig, sqlCfg SQLConfig, err error) {
 	st := cluster.MakeClusterSettings()
 
@@ -200,7 +202,7 @@ func makeSharedProcessTenantServerConfig(
 	if err := clusterversion.Initialize(
 		ctx, st.Version.BinaryMinSupportedVersion(), &st.SV,
 	); err != nil {
-		return baseCfg, sqlCfg, err
+		return BaseConfig{}, SQLConfig{}, err
 	}
 
 	tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV))
@@ -226,7 +228,7 @@ func makeSharedProcessTenantServerConfig(
 	if !storeSpec.InMemory {
 		storeDir := filepath.Join(storeSpec.Path, "tenant-"+tenantID.String())
 		if err := os.MkdirAll(storeDir, 0755); err != nil {
-			return baseCfg, sqlCfg, err
+			return BaseConfig{}, SQLConfig{}, err
 		}
 		stopper.AddCloser(stop.CloserFn(func() {
 			if err := os.RemoveAll(storeDir); err != nil {
@@ -262,7 +264,7 @@ func makeSharedProcessTenantServerConfig(
 	baseCfg.Addr, err1 = rederivePort(index, kvServerCfg.Config.Addr, "", portOffset)
 	baseCfg.AdvertiseAddr, err2 = rederivePort(index, kvServerCfg.Config.AdvertiseAddr, baseCfg.Addr, portOffset)
 	if err := errors.CombineErrors(err1, err2); err != nil {
-		return baseCfg, sqlCfg, err
+		return BaseConfig{}, SQLConfig{}, err
 	}
 
 	// The parent server will route HTTP requests to us.
@@ -312,7 +314,7 @@ func makeSharedProcessTenantServerConfig(
 	if kvServerCfg.BaseConfig.InflightTraceDirName != "" {
 		traceDir := filepath.Join(kvServerCfg.BaseConfig.InflightTraceDirName, "tenant-"+tenantID.String())
 		if err := os.MkdirAll(traceDir, 0755); err != nil {
-			return baseCfg, sqlCfg, err
+			return BaseConfig{}, SQLConfig{}, err
 		}
 		baseCfg.InflightTraceDirName = traceDir
 	}
@@ -325,12 +327,12 @@ func makeSharedProcessTenantServerConfig(
 	// TODO(knz): Make tempDir configurable.
 	tempDir := useStore.Path
 	if tempStorageCfg.Path, err = fs.CreateTempDir(tempDir, TempDirPrefix, stopper); err != nil {
-		return baseCfg, sqlCfg, errors.Wrap(err, "could not create temporary directory for temp storage")
+		return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
 	}
 	if useStore.Path != "" {
 		recordPath := filepath.Join(useStore.Path, TempDirsRecordFilename)
 		if err := fs.RecordTempDir(recordPath, tempStorageCfg.Path); err != nil {
-			return baseCfg, sqlCfg, errors.Wrap(err, "could not record temp dir")
+			return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not record temp dir")
 		}
 	}
 
@@ -355,6 +357,8 @@ func makeSharedProcessTenantServerConfig(
 	// that it is inside the same process as the KV layer and how to
 	// reach this KV layer without going through the network.
 	sqlCfg.LocalKVServerInfo = &kvServerInfo
+
+	sqlCfg.NodeMetricsRecorder = nodeMetricsRecorder
 
 	return baseCfg, sqlCfg, nil
 }

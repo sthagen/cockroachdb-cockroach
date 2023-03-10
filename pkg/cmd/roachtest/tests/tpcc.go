@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -409,7 +408,7 @@ func runTPCCMixedHeadroom(
 		bankRows = 1000
 	}
 
-	history, err := clusterupgrade.PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
+	history, err := version.PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,6 +870,35 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehouses: 2000,
 		EstimatedMax:   900,
+	})
+
+	// Encryption-At-Rest benchmarks. These are duplicates of variants above,
+	// using encrypted stores.
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  4,
+
+		LoadWarehouses:    1000,
+		EstimatedMax:      gceOrAws(cloud, 750, 900),
+		EncryptionEnabled: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  16,
+
+		LoadWarehouses:    gceOrAws(cloud, 3500, 3900),
+		EstimatedMax:      gceOrAws(cloud, 2900, 3500),
+		EncryptionEnabled: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 12,
+		CPUs:  16,
+
+		LoadWarehouses:    gceOrAws(cloud, 11500, 11500),
+		EstimatedMax:      gceOrAws(cloud, 10000, 10000),
+		EncryptionEnabled: true,
+
+		Tags: []string{`weekly`},
 	})
 }
 
@@ -1507,34 +1535,6 @@ func registerTPCCBench(r registry.Registry) {
 
 			LoadWarehouses: 10000,
 			EstimatedMax:   8000,
-		},
-
-		// Encryption-At-Rest benchmarks. These are duplicates of variants above,
-		// using encrypted stores.
-		{
-			Nodes: 3,
-			CPUs:  4,
-
-			LoadWarehouses:    1000,
-			EstimatedMax:      325,
-			EncryptionEnabled: true,
-		},
-		{
-			Nodes: 3,
-			CPUs:  16,
-
-			LoadWarehouses:    2000,
-			EstimatedMax:      1300,
-			EncryptionEnabled: true,
-		},
-		{
-			Nodes: 12,
-			CPUs:  16,
-
-			LoadWarehouses:    10000,
-			EstimatedMax:      6000,
-			LoadConfig:        singlePartitionedLoadgen,
-			EncryptionEnabled: true,
 		},
 	}
 

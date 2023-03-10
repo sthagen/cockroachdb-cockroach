@@ -4692,17 +4692,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, errors.AssertionFailedf("expected string value, got %T", args[0])
 				}
 				name := strings.ToLower(string(s))
-				rawSetting, ok := settings.Lookup(
-					name, settings.LookupForLocalAccess, evalCtx.Codec.ForSystemTenant(),
-				)
+				setting, ok := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
 				if !ok {
 					return nil, errors.Newf("unknown cluster setting '%s'", name)
-				}
-				setting, ok := rawSetting.(settings.NonMaskedSetting)
-				if !ok {
-					// If we arrive here, this means Lookup() did not properly
-					// ignore the masked setting, which is a bug in Lookup().
-					return nil, errors.AssertionFailedf("setting '%s' is masked", name)
 				}
 
 				return tree.NewDString(setting.EncodedDefault()), nil
@@ -4730,17 +4722,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, errors.AssertionFailedf("expected string value, got %T", args[1])
 				}
 				name := strings.ToLower(string(s))
-				rawSetting, ok := settings.Lookup(
-					name, settings.LookupForLocalAccess, evalCtx.Codec.ForSystemTenant(),
-				)
+				setting, ok := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
 				if !ok {
 					return nil, errors.Newf("unknown cluster setting '%s'", name)
-				}
-				setting, ok := rawSetting.(settings.NonMaskedSetting)
-				if !ok {
-					// If we arrive here, this means Lookup() did not properly
-					// ignore the masked setting, which is a bug in Lookup().
-					return nil, errors.AssertionFailedf("setting '%s' is masked", name)
 				}
 				repr, err := setting.DecodeToString(string(encoded))
 				if err != nil {
@@ -7563,6 +7547,10 @@ expires until the statement bundle is collected`,
 					// specially in the future so as to allow the fingerprint to complete
 					// in the face of intents.
 					WaitPolicy: lock.WaitPolicy_Error,
+					// TODO(ssd): Setting this disables async sending in
+					// DistSender so it likely substantially impacts
+					// performance.
+					ReturnElasticCPUResumeSpans: true,
 				}
 				admissionHeader := kvpb.AdmissionHeader{
 					Priority:                 int32(admissionpb.BulkNormalPri),

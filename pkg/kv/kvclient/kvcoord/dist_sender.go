@@ -1082,7 +1082,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	copy(resps, br.Responses)
 	resps[swapIdx], resps[lastIdx] = resps[lastIdx], resps[swapIdx]
 	br.Responses = resps
-	if err := br.Combine(qiReply.reply, qiReply.positions); err != nil {
+	if err := br.Combine(ctx, qiReply.reply, qiReply.positions, ba); err != nil {
 		return nil, kvpb.NewError(err)
 	}
 	return br, nil
@@ -1340,7 +1340,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			// Combine the new response with the existing one (including updating
 			// the headers) if we haven't yet seen an error.
 			if pErr == nil {
-				if err := br.Combine(resp.reply, resp.positions); err != nil {
+				if err := br.Combine(ctx, resp.reply, resp.positions, ba); err != nil {
 					pErr = kvpb.NewError(err)
 				}
 			} else {
@@ -1357,7 +1357,8 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	}()
 
 	canParallelize := ba.Header.MaxSpanRequestKeys == 0 && ba.Header.TargetBytes == 0 &&
-		!ba.Header.ReturnOnRangeBoundary
+		!ba.Header.ReturnOnRangeBoundary &&
+		!ba.Header.ReturnElasticCPUResumeSpans
 	if ba.IsSingleCheckConsistencyRequest() {
 		// Don't parallelize full checksum requests as they have to touch the
 		// entirety of each replica of each range they touch.
@@ -1447,7 +1448,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				ba.UpdateTxn(resp.reply.Txn)
 			}
 
-			mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary
+			mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary || ba.ReturnElasticCPUResumeSpans
 			// Check whether we've received enough responses to exit query loop.
 			if mightStopEarly {
 				var replyKeys int64

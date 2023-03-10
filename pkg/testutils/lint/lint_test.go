@@ -480,6 +480,7 @@ func TestLint(t *testing.T) {
 					":!util/grpcutil",                     // GRPC_GO_* variables
 					":!roachprod",                         // roachprod requires AWS environment variables
 					":!cli/env.go",                        // The CLI needs the PGHOST variable.
+					":!cli/start.go",                      // The CLI needs the GOMEMLIMIT variable.
 					":!internal/codeowners/codeowners.go", // For BAZEL_TEST.
 					":!internal/team/team.go",             // For BAZEL_TEST.
 				},
@@ -1587,6 +1588,7 @@ func TestLint(t *testing.T) {
 			// Test that the settings package does not import CRDB dependencies.
 			if importingPkg == settingsPkgPrefix && strings.HasPrefix(importedPkg, cockroachDB) {
 				switch {
+				case strings.HasSuffix(s, "envutil"):
 				case strings.HasSuffix(s, "humanizeutil"):
 				case strings.HasSuffix(s, "protoutil"):
 				case strings.HasSuffix(s, "testutils"):

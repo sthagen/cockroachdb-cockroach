@@ -1,9 +1,7 @@
 query-sql-system
-SHOW TENANT [10] WITH CAPABILITIES
+SELECT * FROM [SHOW TENANT [10] WITH CAPABILITIES] WHERE capability_id = 'can_admin_split'
 ----
 10 tenant-10 ready none can_admin_split false
-10 tenant-10 ready none can_view_node_info false
-10 tenant-10 ready none can_view_tsdb_metrics false
 
 exec-sql-tenant
 CREATE TABLE t(a INT)
@@ -13,7 +11,7 @@ ok
 exec-privileged-op-tenant
 ALTER TABLE t SPLIT AT VALUES (0)
 ----
-pq: ba: AdminSplit [/Tenant/10/Table/104/1/0,/Min) RPC error: rpc error: code = Unauthenticated desc = tenant 10 does not have admin split capability
+pq: ba: AdminSplit [/Tenant/10/Table/104/1/0,/Min) RPC error: rpc error: code = Unauthenticated desc = client tenant does not have capability "can_admin_split" (*kvpb.AdminSplitRequest)
 
 update-capabilities
 ALTER TENANT [10] GRANT CAPABILITY can_admin_split=true
@@ -33,4 +31,4 @@ ok
 exec-privileged-op-tenant
 ALTER TABLE t SPLIT AT VALUES (0)
 ----
-pq: ba: AdminSplit [/Tenant/10/Table/104/1/0,/Min) RPC error: rpc error: code = Unauthenticated desc = tenant 10 does not have admin split capability
+pq: ba: AdminSplit [/Tenant/10/Table/104/1/0,/Min) RPC error: rpc error: code = Unauthenticated desc = client tenant does not have capability "can_admin_split" (*kvpb.AdminSplitRequest)

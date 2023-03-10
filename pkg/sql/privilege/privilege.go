@@ -59,6 +59,7 @@ const (
 	RESTORE                  Kind = 24
 	EXTERNALIOIMPLICITACCESS Kind = 25
 	CHANGEFEED               Kind = 26
+	VIEWJOB                  Kind = 27
 )
 
 // Privilege represents a privilege parsed from an Access Privilege Inquiry
@@ -112,7 +113,7 @@ var isDescriptorBacked = map[ObjectType]bool{
 
 // Predefined sets of privileges.
 var (
-	AllPrivileges         = List{ALL, CHANGEFEED, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE, BACKUP, RESTORE, EXTERNALIOIMPLICITACCESS}
+	AllPrivileges         = List{ALL, CHANGEFEED, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE, BACKUP, RESTORE, EXTERNALIOIMPLICITACCESS, VIEWJOB}
 	ReadData              = List{SELECT}
 	ReadWriteData         = List{SELECT, INSERT, DELETE, UPDATE}
 	ReadWriteSequenceData = List{SELECT, UPDATE, USAGE}
@@ -126,7 +127,7 @@ var (
 	// certain privileges unavailable after upgrade migration.
 	// Note that "CREATE, CHANGEFEED, INSERT, DELETE, ZONECONFIG" are no-op privileges on sequences.
 	SequencePrivileges           = List{ALL, USAGE, SELECT, UPDATE, CREATE, CHANGEFEED, DROP, INSERT, DELETE, ZONECONFIG}
-	GlobalPrivileges             = List{ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS}
+	GlobalPrivileges             = List{ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS, VIEWJOB}
 	VirtualTablePrivileges       = List{ALL, SELECT}
 	ExternalConnectionPrivileges = List{ALL, USAGE, DROP}
 )
@@ -168,6 +169,7 @@ var ByName = map[string]Kind{
 	"BACKUP":                   BACKUP,
 	"RESTORE":                  RESTORE,
 	"EXTERNALIOIMPLICITACCESS": EXTERNALIOIMPLICITACCESS,
+	"VIEWJOB":                  VIEWJOB,
 }
 
 // List is a list of privileges.
@@ -283,13 +285,16 @@ func PrivilegesFromBitFields(kindBits, grantOptionBits uint64, objectType Object
 
 // ListFromStrings takes a list of strings and attempts to build a list of Kind.
 // We convert each string to uppercase and search for it in the ByName map.
-// If an entry is not found in ByName, an error is returned.
+// If an entry is not found in ByName, it is ignored.
 func ListFromStrings(strs []string) (List, error) {
 	ret := make(List, len(strs))
 	for i, s := range strs {
 		k, ok := ByName[strings.ToUpper(s)]
 		if !ok {
-			return nil, errors.Errorf("not a valid privilege: %q", s)
+			// Ignore an unknown privilege name. This is so that it is possible to
+			// backport new privileges onto older release branches, without causing
+			// mixed-version compatibility issues.
+			continue
 		}
 		ret[i] = k
 	}

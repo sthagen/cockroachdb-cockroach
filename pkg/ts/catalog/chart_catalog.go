@@ -119,6 +119,7 @@ var charts = []sectionDescription{
 					"sys.cpu.sys.percent",
 					"sys.cpu.user.percent",
 					"sys.cpu.combined.percent-normalized",
+					"sys.cpu.host.combined.percent-normalized",
 				},
 			},
 			{
@@ -1581,6 +1582,12 @@ var charts = []sectionDescription{
 				Title: "Internal Retries",
 				Metrics: []string{
 					"changefeed.internal_retry_message_count",
+				},
+			},
+			{
+				Title: "Schema Registry Retries",
+				Metrics: []string{
+					"changefeed.schema_registry.retry_count",
 				},
 			},
 		},

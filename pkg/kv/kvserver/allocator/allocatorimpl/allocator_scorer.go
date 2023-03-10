@@ -18,7 +18,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
@@ -26,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -50,14 +50,15 @@ const (
 	// https://www.eecs.harvard.edu/~michaelm/postscripts/mythesis.pdf.
 	allocatorRandomCount = 2
 
-	// rebalanceToMaxFractionUsedThreshold: if the fraction used of a store
-	// descriptor capacity is greater than this value, it will never be used as a
-	// rebalance target. This is important for providing a buffer between fully
-	// healthy stores and full stores (as determined by
-	// allocator.MaxFractionUsedThreshold).  Without such a buffer, replicas could
-	// hypothetically ping pong back and forth between two nodes, making one full
-	// and then the other.
-	rebalanceToMaxFractionUsedThreshold = 0.925
+	// defaultMaxDiskUtilizationThreshold is the default maximum threshold for
+	// disk utilization. The value is used as the default in the cluster setting
+	// maxDiskUtilizationThreshold.
+	defaultMaxDiskUtilizationThreshold = 0.95
+
+	// defaultMaxDiskUtilizationThreshold is the default maximum threshold for a
+	// rebalance target disk utilization. The value is used as the default in the
+	// cluster setting defaultMaxDiskUtilizationThreshold.
+	defaultRebalanceToMaxDiskUtilizationThreshold = 0.925
 
 	// minRangeRebalanceThreshold is the number of replicas by which a store
 	// must deviate from the mean number of replicas to be considered overfull
@@ -71,13 +72,24 @@ const (
 	// away from the mean.
 	minRangeRebalanceThreshold = 2
 
-	// DefaultIOOverloadThreshold is used to avoid allocating to stores with an
+	// DefaultReplicaIOOverloadThreshold is used to avoid allocating to stores with an
 	// IO overload score greater than what's set. This is typically used in
 	// conjunction with IOOverloadMeanThreshold below.
-	DefaultIOOverloadThreshold = 0.8
+	DefaultReplicaIOOverloadThreshold = 0.8
+
+	// DefaultLeaseIOOverloadThreshold is used to shed leases from stores with an
+	// IO overload score greater than this threshold. This is typically used in
+	// conjunction with IOOverloadMeanThreshold below.
+	DefaultLeaseIOOverloadThreshold = 0.5
+
+	// DefaultLeaseIOOverloadShedThreshold is used to shed leases from stores
+	// with an IO overload score greater than the this threshold. This is
+	// typically used in conjunction with IOOverloadMeanThreshold below.
+	DefaultLeaseIOOverloadShedThreshold = 0.9
 
 	// IOOverloadMeanThreshold is the percentage above the mean after which a
-	// store could be conisdered unhealthy if also exceeding the threshold.
+	// store could be conisdered IO overload if also exceeding the absolute IO
+	// threshold.
 	IOOverloadMeanThreshold = 1.1
 
 	// L0SublevelTrackerRetention is the tracking period for statistics on the
@@ -86,29 +98,27 @@ const (
 	L0SublevelTrackerRetention = time.Minute * 10
 )
 
-// IOOverloadEnforcementLevel represents the level of action that may be taken or
-// excluded when a candidate disk is considered unhealthy.
+// IOOverloadEnforcementLevel represents a level of action that may be taken or
+// excluded when a store's disk is considered IO overloaded.
 type IOOverloadEnforcementLevel int64
 
 const (
-	// IOOverloadThresholdNoAction wil not exclude stores from being considered
-	// as targets for any action regardless of the store IO overload.
-	IOOverloadThresholdNoAction IOOverloadEnforcementLevel = iota
-	// IOOverloadThresholdLogOnly will not exclude stores from being considered
-	// as targets for any action regarldess of the store IO overload. When a
-	// store exceeds IOOverloadThreshold, an event is logged.
-	IOOverloadThresholdLogOnly
-	// IOOverloadThresholdBlockRebalanceTo excludes stores from being being
-	// considered as targets for rebalance actions if they exceed (a)
-	// kv.allocator.io_overload_threshold and (b) the mean IO overload among
-	// possible candidates. This does not affect upreplication.
-	IOOverloadThresholdBlockRebalanceTo
-	// IOOverloadThresholdBlockAll excludes stores from being considered as a
-	// target for allocation and rebalancing actions if they exceed (a)
-	// kv.allocator.io_overload_threshold and (b) the mean IO overload among
-	// possible candidates. In other words, the store will receive no new
-	// replicas.
+	// IOOverloadThresholdIgnore wil not exclude stores for any action regardless
+	// of the store IO overload.
+	IOOverloadThresholdIgnore IOOverloadEnforcementLevel = iota
+	// IOOverloadThresholdBlockTransfers excludes stores for rebalance or lease
+	// transfer actions if they are IO overloaded.
+	IOOverloadThresholdBlockTransfers
+	// IOOverloadThresholdBlockAll excludes stores for allocation, rebalancing
+	// and lease transfer actions if they are IO overloaded. In other words, the
+	// store will receive no new replicas or leases.
 	IOOverloadThresholdBlockAll
+	// IOOverloadThresholdShed has the same behavior as
+	// IOOverloadThresholdBlockAll, however existing stores will be removed. This
+	// currently is only used for lease transfers. The leaseholder store WILL BE
+	// excluded as a candidate for its current range leases i.e. The lease will
+	// always transfer to a valid, non-IO-overloaded store if one exists.
+	IOOverloadThresholdShed
 )
 
 // RangeRebalanceThreshold is the minimum ratio of a store's range count to
@@ -127,30 +137,31 @@ var RangeRebalanceThreshold = func() *settings.FloatSetting {
 	return s
 }()
 
-// IOOverloadThreshold is the maximum IO overload score of a candidate store
-// before being considered unhealthy. Once considered unhealthy, the action
-// taken will be dictated by IOOverloadThresholdEnforcement cluster setting
-// defined below.
-var IOOverloadThreshold = settings.RegisterFloatSetting(
+// ReplicaIOOverloadThreshold is the maximum IO overload score of a candidate
+// store before being excluded as a candidate for rebalancing replicas or
+// allocation. This is only acted upon if ReplicaIOOverloadThreshold is set to
+// `block_all` or `block_rebalance_to`.
+var ReplicaIOOverloadThreshold = settings.RegisterFloatSetting(
 	settings.SystemOnly,
-	"kv.allocator.io_overload_threshold",
+	"kv.allocator.replica_io_overload_threshold",
 	"the maximum store io overload before the enforcement defined by "+
 		"`kv.allocator.io_overload_threshold_enforce` is taken on a store "+
 		"for allocation decisions",
-	DefaultIOOverloadThreshold,
+	DefaultReplicaIOOverloadThreshold,
 )
 
-// IOOverloadThresholdEnforcement defines the level of enforcement when a candidate
+// ReplicaIOOverloadThresholdEnforcement defines the level of enforcement when a candidate
 // stores' IO overload exceeds the threshold defined in IOOverloadThresold. No
 // action is taken when block_none and block_none_log are set. Rebalancing
 // towards the candidate store is blocked when block_rebalance_to is set.
 // Allocating and rebalancing towards the candidate store is blocked when
 // block_all is set.
-// NB: No matter the value of this setting, IOOverload will never cause
-// rebalancing away from a store (shedding), only block the store from being a target.
-var IOOverloadThresholdEnforcement = settings.RegisterEnumSetting(
+// NB: No matter the value of this setting, IO overload will never cause
+// rebalancing away from a store (shedding), only block the store from
+// receiving new replicas.
+var ReplicaIOOverloadThresholdEnforcement = settings.RegisterEnumSetting(
 	settings.SystemOnly,
-	"kv.allocator.io_overload_threshold_enforcement",
+	"kv.allocator.replica_io_overload_threshold_enforcement",
 	"the level of enforcement when a candidate store has an io overload score  "+
 		"exceeding `kv.allocator.io_overload_threshold` and above the "+
 		"average of comparable allocation candidates:`block_none` will exclude "+
@@ -160,10 +171,111 @@ var IOOverloadThresholdEnforcement = settings.RegisterEnumSetting(
 		"from being targets of both allocation and rebalancing",
 	"block_rebalance_to",
 	map[int64]string{
-		int64(IOOverloadThresholdNoAction):         "block_none",
-		int64(IOOverloadThresholdLogOnly):          "block_none_log",
-		int64(IOOverloadThresholdBlockRebalanceTo): "block_rebalance_to",
-		int64(IOOverloadThresholdBlockAll):         "block_all",
+		int64(IOOverloadThresholdIgnore):         "ignore",
+		int64(IOOverloadThresholdBlockTransfers): "block_rebalance_to",
+		int64(IOOverloadThresholdBlockAll):       "block_all",
+	},
+)
+
+// LeaseIOOverloadThreshold is the maximum IO overload score a store may have
+// before being excluded as a candidate for lease transfers. This threshold is
+// only acted upon if LeaseIOOverloadThresholdEnforcement is set to 'shed' or
+// `block`.
+var LeaseIOOverloadThreshold = settings.RegisterFloatSetting(
+	settings.SystemOnly,
+	"kv.allocator.lease_io_overload_threshold",
+	"a store will not receive new leases when its IO overload score is above this "+
+		"value and `kv.allocator.io_overload_threshold_enforcement_leases` is "+
+		"`shed` or `block_transfer_to`",
+	DefaultLeaseIOOverloadThreshold,
+)
+
+// LeaseIOOverloadShedThreshold is the maximum IO overload score the current
+// leaseholder store for a range may have before shedding its leases and no
+// longer receiving new leases. This threhsold is acted upon only If
+// LeaseIOOverloadThresholdEnforcement is set to 'shed'.
+var LeaseIOOverloadShedThreshold = settings.RegisterFloatSetting(
+	settings.SystemOnly,
+	"kv.allocator.lease_shed_io_overload_threshold",
+	"a store will shed its leases and receive no new leases when its "+
+		"IO overload score is above this value and "+
+		"`kv.allocator.io_overload_threshold_enforcement_leases` is `shed`",
+	DefaultLeaseIOOverloadShedThreshold,
+)
+
+// LeaseIOOverloadThresholdEnforcement defines the level of enforcement for
+// lease transfers when a candidate stores' IO overload exceeds the threshold
+// defined in IOOverloadThreshold, and additionally
+// ShedIOOverloadThresholdBuffer when shed is set.
+var LeaseIOOverloadThresholdEnforcement = settings.RegisterEnumSetting(
+	settings.SystemOnly,
+	"kv.allocator.lease_io_overload_threshold_enforcement",
+	"the level of enforcement on lease transfers when a candidate store has an"+
+		"io overload score exceeding `kv.allocator.io_overload_threshold_lease` and above the "+
+		"average of comparable allocation candidates:`ignore` disable enforcement, "+
+		"`block_transfer_to` a store will receive no new leases but won't lose existing leases,"+
+		"`shed`: a store will receive no new leases and shed existing leases to "+
+		"non io-overloaded stores, this is a superset of block_transfer_to",
+	"block_transfer_to",
+	map[int64]string{
+		int64(IOOverloadThresholdIgnore):         "ingore",
+		int64(IOOverloadThresholdBlockTransfers): "block_transfer_to",
+		int64(IOOverloadThresholdShed):           "shed",
+	},
+)
+
+// maxDiskUtilizationThreshold controls the point at which the store cedes
+// having room for new replicas. If the fraction used of a store descriptor
+// capacity is greater than this value, it will never be used as a rebalance or
+// allocate target and we will actively try to move replicas off of it.
+var maxDiskUtilizationThreshold = settings.RegisterFloatSetting(
+	settings.SystemOnly,
+	"kv.allocator.max_disk_utilization_threshold",
+	"maximum disk utilization before a store will never be used as a rebalance "+
+		"or allocation target and will actively have replicas moved off of it; "+
+		"this should be set higher than "+
+		"`kv.allocator.rebalance_to_max_disk_utilization_threshold`",
+	defaultMaxDiskUtilizationThreshold,
+	func(f float64) error {
+		if f > 0.99 {
+			return errors.Errorf(
+				"Cannot set kv.allocator.max_disk_utilization_threshold " +
+					"greater than 0.99")
+		}
+		if f < 0.0 {
+			return errors.Errorf(
+				"Cannot set kv.allocator.max_disk_utilization_threshold less than 0")
+		}
+		return nil
+	},
+)
+
+// rebalanceToMaxDiskUtilizationThreshold: if the fraction used of a store
+// descriptor capacity is greater than this value, it will never be used as a
+// rebalance target. This is important for providing a buffer between fully
+// healthy stores and full stores (as determined by
+// allocator.MaxFractionUsedThreshold).  Without such a buffer, replicas could
+// hypothetically ping pong back and forth between two nodes, making one full
+// and then the other.
+var rebalanceToMaxDiskUtilizationThreshold = settings.RegisterFloatSetting(
+	settings.SystemOnly,
+	"kv.allocator.rebalance_to_max_disk_utilization_threshold",
+	"maximum disk utilization before a store will never be used as a rebalance "+
+		"target; this should be set lower than "+
+		"`kv.allocator.max_disk_utilization_threshold`",
+	defaultRebalanceToMaxDiskUtilizationThreshold,
+	func(f float64) error {
+		if f > 0.99 {
+			return errors.Errorf(
+				"Cannot set kv.allocator.rebalance_to_max_disk_utilization_threshold " +
+					"greater than 0.99")
+		}
+		if f < 0.0 {
+			return errors.Errorf(
+				"Cannot set kv.allocator.rebalance_to_max_disk_utilization_threshold " +
+					"less than 0")
+		}
+		return nil
 	},
 )
 
@@ -219,9 +331,11 @@ type ScorerOptions interface {
 	// with the same QPS) that would converge the range's existing stores' QPS the
 	// most.
 	removalMaximallyConvergesScore(removalCandStoreList storepool.StoreList, existing roachpb.StoreDescriptor) int
-	// getStoreHealthOptions returns the scorer options for store health. It is
-	// used to inform scoring based on the health of a store.
-	getStoreHealthOptions() StoreHealthOptions
+	// getIOOverloadOptions returns the scorer options for store IO overload. It
+	// is used to inform scoring based on the IO overload of a store.
+	getIOOverloadOptions() IOOverloadOptions
+	// getDiskOptions returns the scorer options for disk fullness.
+	getDiskOptions() DiskCapacityOptions
 }
 
 func jittered(val float64, jitter float64, rand allocatorRand) float64 {
@@ -246,8 +360,8 @@ type ScatterScorerOptions struct {
 
 var _ ScorerOptions = &ScatterScorerOptions{}
 
-func (o *ScatterScorerOptions) getStoreHealthOptions() StoreHealthOptions {
-	return o.RangeCountScorerOptions.StoreHealthOptions
+func (o *ScatterScorerOptions) getIOOverloadOptions() IOOverloadOptions {
+	return o.RangeCountScorerOptions.IOOverloadOptions
 }
 
 func (o *ScatterScorerOptions) maybeJitterStoreStats(
@@ -269,15 +383,20 @@ func (o *ScatterScorerOptions) maybeJitterStoreStats(
 // This means that the resulting rebalancing decisions will further the goal of
 // converging range counts across stores in the cluster.
 type RangeCountScorerOptions struct {
-	StoreHealthOptions
+	IOOverloadOptions
+	DiskCapacityOptions
 	deterministic           bool
 	rangeRebalanceThreshold float64
 }
 
 var _ ScorerOptions = &RangeCountScorerOptions{}
 
-func (o *RangeCountScorerOptions) getStoreHealthOptions() StoreHealthOptions {
-	return o.StoreHealthOptions
+func (o *RangeCountScorerOptions) getIOOverloadOptions() IOOverloadOptions {
+	return o.IOOverloadOptions
+}
+
+func (o *RangeCountScorerOptions) getDiskOptions() DiskCapacityOptions {
+	return o.DiskCapacityOptions
 }
 
 func (o *RangeCountScorerOptions) maybeJitterStoreStats(
@@ -390,9 +509,10 @@ func (o *RangeCountScorerOptions) removalMaximallyConvergesScore(
 // queries-per-second. This means that the resulting rebalancing decisions will
 // further the goal of converging QPS across stores in the cluster.
 type LoadScorerOptions struct {
-	StoreHealthOptions StoreHealthOptions
-	Deterministic      bool
-	LoadDims           []load.Dimension
+	IOOverloadOptions IOOverloadOptions
+	DiskOptions       DiskCapacityOptions
+	Deterministic     bool
+	LoadDims          []load.Dimension
 
 	// LoadThreshold and MinLoadThreshold track the threshold beyond which a
 	// store should be considered under/overfull and the minimum absolute
@@ -426,8 +546,12 @@ type LoadScorerOptions struct {
 	RebalanceImpact load.Load
 }
 
-func (o *LoadScorerOptions) getStoreHealthOptions() StoreHealthOptions {
-	return o.StoreHealthOptions
+func (o *LoadScorerOptions) getIOOverloadOptions() IOOverloadOptions {
+	return o.IOOverloadOptions
+}
+
+func (o *LoadScorerOptions) getDiskOptions() DiskCapacityOptions {
+	return o.DiskOptions
 }
 
 func (o *LoadScorerOptions) maybeJitterStoreStats(
@@ -555,6 +679,39 @@ func (o *LoadScorerOptions) removalMaximallyConvergesScore(
 		return -1
 	}
 	return 0
+}
+
+// DiskCapacityOptions is the scorer options for disk fullness. It is used to
+// inform scoring based on the disk utilization of a store.
+type DiskCapacityOptions struct {
+	RebalanceToThreshold     float64
+	ShedAndBlockAllThreshold float64
+}
+
+func makeDiskCapacityOptions(sv *settings.Values) DiskCapacityOptions {
+	return DiskCapacityOptions{
+		RebalanceToThreshold:     rebalanceToMaxDiskUtilizationThreshold.Get(sv),
+		ShedAndBlockAllThreshold: maxDiskUtilizationThreshold.Get(sv),
+	}
+}
+
+func defaultDiskCapacityOptions() DiskCapacityOptions {
+	return DiskCapacityOptions{
+		RebalanceToThreshold:     defaultRebalanceToMaxDiskUtilizationThreshold,
+		ShedAndBlockAllThreshold: defaultMaxDiskUtilizationThreshold,
+	}
+}
+
+// MaxCapacityCheck returns true if the store has room for a new replica.
+func (do DiskCapacityOptions) maxCapacityCheck(store roachpb.StoreDescriptor) bool {
+	return store.Capacity.FractionUsed() < do.ShedAndBlockAllThreshold
+}
+
+// RebalanceToMaxCapacityCheck returns true if the store has enough room to
+// accept a rebalance. The bar for this is stricter than for whether a store
+// has enough room to accept a necessary replica (i.e. via AllocateCandidates).
+func (do DiskCapacityOptions) rebalanceToMaxCapacityCheck(store roachpb.StoreDescriptor) bool {
+	return store.Capacity.FractionUsed() < do.RebalanceToThreshold
 }
 
 // candidate store for allocation. These are ordered by importance.
@@ -941,26 +1098,22 @@ func rankedCandidateListForAllocation(
 	var candidates candidateList
 	existingReplTargets := roachpb.MakeReplicaSet(existingReplicas).ReplicationTargets()
 	var nonVoterReplTargets []roachpb.ReplicationTarget
+
+	// Filter the list of candidateStores to only those which are valid. A valid
+	// store satisfies the constraints and does not have a full disk. It isn't
+	// fair to compare the stores which are invalid/full to the average range
+	// count of those which are valid/not-full.
+	validCandidateStores := []roachpb.StoreDescriptor{}
 	for _, s := range candidateStores.Stores {
-		// Disregard all the stores that already have replicas.
-		if StoreHasReplica(s.StoreID, existingReplTargets) {
-			continue
-		}
-		// Unless the caller specifically allows us to allocate multiple replicas on
-		// the same node, we disregard nodes with existing replicas.
-		if !allowMultipleReplsPerNode && nodeHasReplica(s.Node.NodeID, existingReplTargets) {
-			continue
-		}
-		if !isStoreValidForRoutineReplicaTransfer(ctx, s.StoreID) {
-			log.KvDistribution.VEventf(
+		if !options.getDiskOptions().maxCapacityCheck(s) ||
+			!options.getIOOverloadOptions().allocateReplicaToCheck(
 				ctx,
-				3,
-				"not considering store s%d as a potential rebalance candidate because it is on a non-live node n%d",
-				s.StoreID,
-				s.Node.NodeID,
-			)
+				s,
+				candidateStores.CandidateIOOverloadScores.Mean,
+			) {
 			continue
 		}
+
 		constraintsOK, necessary := constraintsCheck(s)
 		if !constraintsOK {
 			if necessary {
@@ -974,16 +1127,41 @@ func rankedCandidateListForAllocation(
 			}
 			continue
 		}
+		validCandidateStores = append(validCandidateStores, s)
+	}
 
-		if !allocator.MaxCapacityCheck(s) || !options.getStoreHealthOptions().storeIsHealthy(
-			ctx,
-			s,
-			candidateStores.CandidateIOOverloadScores.Mean,
-		) {
+	// Create a new store list, which will update the average for each stat to
+	// only be the average value of valid candidates.
+	validStoreList := storepool.MakeStoreList(validCandidateStores)
+
+	for _, s := range validStoreList.Stores {
+		// Disregard all the stores that already have replicas.
+		if StoreHasReplica(s.StoreID, existingReplTargets) {
 			continue
 		}
+		// Unless the caller specifically allows us to allocate multiple replicas on
+		// the same node, we disregard nodes with existing replicas.
+		if !allowMultipleReplsPerNode && nodeHasReplica(s.Node.NodeID, existingReplTargets) {
+			continue
+		}
+
+		// All invalid stores are filtered out above, before this loop, so
+		// constraintsOK should always be true.
+		constraintsOK, necessary := constraintsCheck(s)
+
+		if !isStoreValidForRoutineReplicaTransfer(ctx, s.StoreID) {
+			log.KvDistribution.VEventf(
+				ctx,
+				3,
+				"not considering store s%d as a potential rebalance candidate because it is on a non-live node n%d",
+				s.StoreID,
+				s.Node.NodeID,
+			)
+			continue
+		}
+
 		diversityScore := diversityAllocateScore(s, existingStoreLocalities)
-		balanceScore := options.balanceScore(candidateStores, s.Capacity)
+		balanceScore := options.balanceScore(validStoreList, s.Capacity)
 		var hasNonVoter bool
 		if targetType == VoterTarget {
 			if nonVoterReplTargets == nil {
@@ -993,8 +1171,8 @@ func rankedCandidateListForAllocation(
 		}
 		candidates = append(candidates, candidate{
 			store:          s,
-			valid:          constraintsOK,
 			necessary:      necessary,
+			valid:          constraintsOK,
 			diversityScore: diversityScore,
 			balanceScore:   balanceScore,
 			hasNonVoter:    hasNonVoter,
@@ -1044,7 +1222,7 @@ func candidateListForRemoval(
 			store:     s,
 			valid:     constraintsOK,
 			necessary: necessary,
-			fullDisk:  !allocator.MaxCapacityCheck(s),
+			fullDisk:  !options.getDiskOptions().maxCapacityCheck(s),
 			// When removing a replica from a store, we do not want to include
 			// IO overloaded in ranking stores. This would submit already
 			// overloaded amplification stores to additional load of moving a
@@ -1341,7 +1519,7 @@ func rankedCandidateListForRebalancing(
 				continue
 			}
 			valid, necessary := removalConstraintsChecker(store)
-			fullDisk := !allocator.MaxCapacityCheck(store)
+			fullDisk := !options.getDiskOptions().maxCapacityCheck(store)
 
 			if !valid {
 				if !needRebalanceFrom {
@@ -1460,7 +1638,7 @@ func rankedCandidateListForRebalancing(
 				store:          store,
 				valid:          constraintsOK,
 				necessary:      necessary,
-				fullDisk:       !allocator.MaxCapacityCheck(store),
+				fullDisk:       !options.getDiskOptions().maxCapacityCheck(store),
 				diversityScore: diversityScore,
 			}
 			if !cand.less(existing) {
@@ -1559,9 +1737,9 @@ func rankedCandidateListForRebalancing(
 			// rebalance candidates.
 			s := cand.store
 			candIOOverloadScore, _ := s.Capacity.IOThreshold.Score()
-			cand.fullDisk = !rebalanceToMaxCapacityCheck(s)
+			cand.fullDisk = !options.getDiskOptions().rebalanceToMaxCapacityCheck(s)
 			cand.ioOverloadScore = candIOOverloadScore
-			cand.ioOverloaded = !options.getStoreHealthOptions().rebalanceToStoreIsHealthy(
+			cand.ioOverloaded = !options.getIOOverloadOptions().rebalanceReplicaToCheck(
 				ctx,
 				s,
 				// We only wish to compare the IO overload to the
@@ -2174,82 +2352,119 @@ func convergesOnMean(oldVal, newVal, mean float64) bool {
 	return math.Abs(newVal-mean) < math.Abs(oldVal-mean)
 }
 
-// StoreHealthOptions is the scorer options for store health. It is
-// used to inform scoring based on the health of a store.
-type StoreHealthOptions struct {
-	EnforcementLevel    IOOverloadEnforcementLevel
-	IOOverloadThreshold float64
+// IOOverloadOptions is the scorer options for store IO overload. It is used to
+// inform scoring based on a store's IO overload score.
+type IOOverloadOptions struct {
+	ReplicaEnforcementLevel IOOverloadEnforcementLevel
+	LeaseEnforcementLevel   IOOverloadEnforcementLevel
+
+	ReplicaIOOverloadThreshold   float64
+	LeaseIOOverloadThreshold     float64
+	LeaseIOOverloadShedThreshold float64
 }
 
-// storeIsHealthy returns true if the store IO overload does not exceed
-// the cluster threshold and mean, or the enforcement level does not include
-// excluding candidates from being allocation targets.
-func (o StoreHealthOptions) storeIsHealthy(
+func ioOverloadCheck(
+	score, avg, absThreshold, meanThreshold float64,
+	enforcement IOOverloadEnforcementLevel,
+	disallowed ...IOOverloadEnforcementLevel,
+) (ok bool, reason string) {
+	absCheck := score < absThreshold
+	meanCheck := score < avg*meanThreshold
+
+	// The score needs to be no less than both the average threshold and the
+	// absolute threshold in order to be considered IO overloaded.
+	if absCheck || meanCheck {
+		return true, ""
+	}
+
+	for _, disallowedEnforcement := range disallowed {
+		if enforcement == disallowedEnforcement {
+			return false, fmt.Sprintf(
+				"io overload %.2f exceeds threshold %.2f, above average: %.2f, enforcement %d",
+				score, absThreshold, avg, enforcement)
+		}
+	}
+
+	return true, ""
+}
+
+// allocateReplicaToCheck returns true if the store IO overload does not exceed
+// the cluster threshold and mean, or the enforcement level does not prevent
+// replica allocation to IO overloaded stores.
+func (o IOOverloadOptions) allocateReplicaToCheck(
 	ctx context.Context, store roachpb.StoreDescriptor, avg float64,
 ) bool {
-	ioOverloadScore, _ := store.Capacity.IOThreshold.Score()
-	if o.EnforcementLevel == IOOverloadThresholdNoAction ||
-		ioOverloadScore < o.IOOverloadThreshold {
-		return true
+	score, _ := store.Capacity.IOThreshold.Score()
+
+	if ok, reason := ioOverloadCheck(score, avg,
+		o.ReplicaIOOverloadThreshold, IOOverloadMeanThreshold,
+		o.ReplicaEnforcementLevel,
+		IOOverloadThresholdBlockAll,
+	); !ok {
+		log.KvDistribution.VEventf(ctx, 3, "s%d: %s", store.StoreID, reason)
+		return false
 	}
 
-	// Still log an event when the IO overload score exceeds the threshold, however
-	// does not exceed the cluster average. This is enabled to avoid confusion
-	// where candidate stores are still targets, despite exeeding the
-	// threshold.
-	if ioOverloadScore < avg*IOOverloadMeanThreshold {
-		log.KvDistribution.VEventf(ctx, 5, "s%d, allocate check io overload %.2f exceeds threshold %.2f, but below average: %.2f, action enabled %d",
-			store.StoreID, ioOverloadScore,
-			o.IOOverloadThreshold, avg, o.EnforcementLevel)
-		return true
-	}
-
-	log.KvDistribution.VEventf(ctx, 5, "s%d, allocate check io overload %.2f exceeds threshold %.2f, above average: %.2f, action enabled %d",
-		store.StoreID, ioOverloadScore,
-		o.IOOverloadThreshold, avg, o.EnforcementLevel)
-
-	// The store is only considered unhealthy when the enforcement level is
-	// storeHealthBlockAll.
-	return o.EnforcementLevel < IOOverloadThresholdBlockAll
+	return true
 }
 
-// rebalanceToStoreIsHealthy returns true if the store IO overload does not
+// rebalanceReplicaToCheck returns true if the store IO overload does not
 // exceed the cluster threshold and mean, or the enforcement level does not
-// include excluding candidates from being rebalancing targets.
-func (o StoreHealthOptions) rebalanceToStoreIsHealthy(
+// prevent replica rebalancing to IO overloaded stores.
+func (o IOOverloadOptions) rebalanceReplicaToCheck(
 	ctx context.Context, store roachpb.StoreDescriptor, avg float64,
 ) bool {
-	ioOverloadScore, _ := store.Capacity.IOThreshold.Score()
-	if o.EnforcementLevel == IOOverloadThresholdNoAction ||
-		ioOverloadScore < o.IOOverloadThreshold {
-		return true
+	score, _ := store.Capacity.IOThreshold.Score()
+
+	if ok, reason := ioOverloadCheck(score, avg,
+		o.ReplicaIOOverloadThreshold, IOOverloadMeanThreshold,
+		o.ReplicaEnforcementLevel,
+		IOOverloadThresholdBlockTransfers, IOOverloadThresholdBlockAll,
+	); !ok {
+		log.KvDistribution.VEventf(ctx, 3, "s%d: %s", store.StoreID, reason)
+		return false
 	}
-
-	if ioOverloadScore < avg*IOOverloadMeanThreshold {
-		log.KvDistribution.VEventf(ctx, 5,
-			"s%d, allocate check io overload %.2f exceeds threshold %.2f, but "+
-				"below average watermark: %.2f, action enabled %d",
-			store.StoreID, ioOverloadScore, o.IOOverloadThreshold,
-			avg*IOOverloadMeanThreshold, o.EnforcementLevel)
-		return true
-	}
-
-	log.KvDistribution.VEventf(ctx, 5,
-		"s%d, allocate check io overload %.2f exceeds threshold %.2f, above average "+
-			"watermark: %.2f, action enabled %d",
-		store.StoreID, ioOverloadScore, o.IOOverloadThreshold,
-		avg*IOOverloadMeanThreshold, o.EnforcementLevel)
-
-	// The store is only considered unhealthy when the enforcement level is
-	// storeHealthBlockRebalanceTo or storeHealthBlockAll.
-	return o.EnforcementLevel < IOOverloadThresholdBlockRebalanceTo
+	return true
 }
 
-// rebalanceToMaxCapacityCheck returns true if the store has enough room to
-// accept a rebalance. The bar for this is stricter than for whether a store
-// has enough room to accept a necessary replica (i.e. via AllocateCandidates).
-func rebalanceToMaxCapacityCheck(store roachpb.StoreDescriptor) bool {
-	return store.Capacity.FractionUsed() < rebalanceToMaxFractionUsedThreshold
+// transferLeaseToCheck returns true if the store IO overload does not exceed
+// the cluster threshold and mean, or the enforcement level does not prevent
+// lease transfers to IO overloaded stores.
+func (o IOOverloadOptions) transferLeaseToCheck(
+	ctx context.Context, store roachpb.StoreDescriptor, avg float64,
+) bool {
+	score, _ := store.Capacity.IOThreshold.Score()
+
+	if ok, reason := ioOverloadCheck(score, avg,
+		o.LeaseIOOverloadThreshold, IOOverloadMeanThreshold,
+		o.LeaseEnforcementLevel,
+		IOOverloadThresholdBlockTransfers, IOOverloadThresholdShed,
+	); !ok {
+		log.KvDistribution.VEventf(ctx, 3, "s%d: %s", store.StoreID, reason)
+		return false
+	}
+
+	return true
+}
+
+// transferLeaseToCheck returns true if the store IO overload does not exceed
+// the cluster threshold and mean, or the enforcement level does not prevent
+// existing stores from holidng leases whilst being IO overloaded.
+func (o IOOverloadOptions) existingLeaseCheck(
+	ctx context.Context, store roachpb.StoreDescriptor, avg float64,
+) bool {
+	score, _ := store.Capacity.IOThreshold.Score()
+
+	if ok, reason := ioOverloadCheck(score, avg,
+		o.LeaseIOOverloadShedThreshold, IOOverloadMeanThreshold,
+		o.LeaseEnforcementLevel,
+		IOOverloadThresholdShed,
+	); !ok {
+		log.KvDistribution.VEventf(ctx, 3, "s%d: %s", store.StoreID, reason)
+		return false
+	}
+
+	return true
 }
 
 func scoresAlmostEqual(score1, score2 float64) bool {

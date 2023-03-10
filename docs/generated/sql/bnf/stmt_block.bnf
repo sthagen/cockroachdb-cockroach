@@ -781,8 +781,8 @@ show_backup_stmt ::=
 	| 'SHOW' 'BACKUP' 'FILES' string_or_placeholder opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' 'RANGES' string_or_placeholder opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' 'VALIDATE' string_or_placeholder opt_with_show_backup_options
-	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder opt_with_show_backup_options
-	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder 'WITH' 'TRANSFER' '=' string_or_placeholder
+	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder
+	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder 'WITH' show_backup_connection_options_list
 
 show_columns_stmt ::=
 	'SHOW' 'COLUMNS' 'FROM' table_name with_comment
@@ -1249,7 +1249,6 @@ unreserved_keyword ::=
 	| 'NOVIEWACTIVITY'
 	| 'NOVIEWACTIVITYREDACTED'
 	| 'NOVIEWCLUSTERSETTING'
-	| 'NOVIEWJOB'
 	| 'NOWAIT'
 	| 'NULLS'
 	| 'IGNORE_FOREIGN_KEYS'
@@ -1444,7 +1443,6 @@ unreserved_keyword ::=
 	| 'VIEWCLUSTERMETADATA'
 	| 'VIEWCLUSTERSETTING'
 	| 'VIEWDEBUG'
-	| 'VIEWJOB'
 	| 'VISIBLE'
 	| 'VOLATILE'
 	| 'VOTERS'
@@ -1928,6 +1926,9 @@ opt_with_show_backup_options ::=
 	'WITH' show_backup_options_list
 	| 'WITH' 'OPTIONS' '(' show_backup_options_list ')'
 	| 
+
+show_backup_connection_options_list ::=
+	( show_backup_connection_options ) ( ( ',' show_backup_connection_options ) )*
 
 with_comment ::=
 	'WITH' 'COMMENT'
@@ -2696,6 +2697,11 @@ extra_var_value ::=
 show_backup_options_list ::=
 	( show_backup_options ) ( ( ',' show_backup_options ) )*
 
+show_backup_connection_options ::=
+	'TRANSFER' '=' string_or_placeholder
+	| 'TIME' '=' string_or_placeholder
+	| 'CONCURRENTLY' '=' a_expr
+
 targets_roles ::=
 	'ROLE' role_spec_list
 	| 'SCHEMA' schema_name_list
@@ -2964,8 +2970,6 @@ role_option ::=
 	| 'NOSQLLOGIN'
 	| 'VIEWCLUSTERSETTING'
 	| 'NOVIEWCLUSTERSETTING'
-	| 'VIEWJOB'
-	| 'NOVIEWJOB'
 	| password_clause
 	| valid_until_clause
 
@@ -3767,7 +3771,6 @@ bare_label_keywords ::=
 	| 'NOVIEWACTIVITY'
 	| 'NOVIEWACTIVITYREDACTED'
 	| 'NOVIEWCLUSTERSETTING'
-	| 'NOVIEWJOB'
 	| 'NOWAIT'
 	| 'NO_FULL_SCAN'
 	| 'NO_INDEX_JOIN'
@@ -4003,7 +4006,6 @@ bare_label_keywords ::=
 	| 'VIEWCLUSTERMETADATA'
 	| 'VIEWCLUSTERSETTING'
 	| 'VIEWDEBUG'
-	| 'VIEWJOB'
 	| 'VIRTUAL'
 	| 'VISIBLE'
 	| 'VOLATILE'

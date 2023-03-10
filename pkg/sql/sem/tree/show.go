@@ -162,7 +162,10 @@ type ShowBackupOptions struct {
 	// the full backup dir.
 	EncryptionInfoDir Expr
 	DebugMetadataSST  bool
-	TransferSize      Expr
+
+	CheckConnectionTransferSize Expr
+	CheckConnectionDuration     Expr
+	CheckConnectionConcurrency  Expr
 }
 
 var _ NodeFormatter = &ShowBackupOptions{}
@@ -221,9 +224,21 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("debug_dump_metadata_sst")
 	}
 
-	if o.TransferSize != nil {
+	// The following are only used in connection-check SHOW.
+	if o.CheckConnectionTransferSize != nil {
+		maybeAddSep()
 		ctx.WriteString("TRANSFER = ")
-		ctx.FormatNode(o.TransferSize)
+		ctx.FormatNode(o.CheckConnectionTransferSize)
+	}
+	if o.CheckConnectionDuration != nil {
+		maybeAddSep()
+		ctx.WriteString("TIME = ")
+		ctx.FormatNode(o.CheckConnectionDuration)
+	}
+	if o.CheckConnectionConcurrency != nil {
+		maybeAddSep()
+		ctx.WriteString("CONCURRENTLY = ")
+		ctx.FormatNode(o.CheckConnectionConcurrency)
 	}
 }
 
@@ -238,7 +253,9 @@ func (o ShowBackupOptions) IsDefault() bool {
 		o.Privileges == options.Privileges &&
 		o.DebugMetadataSST == options.DebugMetadataSST &&
 		o.EncryptionInfoDir == options.EncryptionInfoDir &&
-		o.TransferSize == options.TransferSize
+		o.CheckConnectionTransferSize == options.CheckConnectionTransferSize &&
+		o.CheckConnectionDuration == options.CheckConnectionDuration &&
+		o.CheckConnectionConcurrency == options.CheckConnectionConcurrency
 }
 
 func combineBools(v1 bool, v2 bool, label string) (bool, error) {
@@ -313,7 +330,25 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 	if err != nil {
 		return err
 	}
-	// no need to combine TransferSize – it only is used standalone by CONNECTION.
+
+	o.CheckConnectionTransferSize, err = combineExpr(o.CheckConnectionTransferSize, other.CheckConnectionTransferSize,
+		"transfer")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionDuration, err = combineExpr(o.CheckConnectionDuration, other.CheckConnectionDuration,
+		"time")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionConcurrency, err = combineExpr(o.CheckConnectionConcurrency, other.CheckConnectionConcurrency,
+		"time")
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 

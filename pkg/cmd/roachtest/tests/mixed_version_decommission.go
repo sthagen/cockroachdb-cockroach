@@ -31,7 +31,7 @@ import (
 func runDecommissionMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := clusterupgrade.PredecessorVersion(buildVersion)
+	predecessorVersion, err := version.PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func fullyDecommissionStep(target, from int, binaryVersion string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		c := u.c
 		c.Run(ctx, c.Node(from), cockroachBinaryPath(binaryVersion), "node", "decommission",
-			"--wait=all", "--insecure", strconv.Itoa(target))
+			"--wait=all", "--checks=skip", "--insecure", strconv.Itoa(target))
 	}
 }
 

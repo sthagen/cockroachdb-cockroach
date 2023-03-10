@@ -480,7 +480,7 @@ func createChangefeedJobRecord(
 		}
 	}
 	if checkPrivs {
-		if err := authorizeUserToCreateChangefeed(ctx, p, sinkURI, hasSelectPrivOnAllTables, hasChangefeedPrivOnAllTables); err != nil {
+		if err := authorizeUserToCreateChangefeed(ctx, p, sinkURI, hasSelectPrivOnAllTables, hasChangefeedPrivOnAllTables, opts.GetConfluentSchemaRegistry()); err != nil {
 			return nil, err
 		}
 	}
@@ -562,11 +562,12 @@ func createChangefeedJobRecord(
 		return nil, err
 	}
 
+	// Validate the encoder. We can pass an empty slimetrics struct here since the encoder will not be used.
 	encodingOpts, err := opts.GetEncodingOptions()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := getEncoder(encodingOpts, AllTargets(details)); err != nil {
+	if _, err := getEncoder(encodingOpts, AllTargets(details), makeExternalConnectionProvider(ctx, p.ExecCfg().InternalDB), nil); err != nil {
 		return nil, err
 	}
 
@@ -590,7 +591,7 @@ func createChangefeedJobRecord(
 			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
 		); err != nil {
 			return nil, errors.Wrapf(err,
-				"use of %q option requires enterprise license.", changefeedbase.OptMetricsScope)
+				"use of %q option requires an enterprise license.", changefeedbase.OptMetricsScope)
 		}
 
 		if scope == defaultSLIScope {
@@ -613,6 +614,15 @@ func createChangefeedJobRecord(
 	}
 
 	if details.SinkURI == `` {
+
+		if details.Select != `` {
+			if err := utilccl.CheckEnterpriseEnabled(
+				p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
+			); err != nil {
+				return nil, errors.Wrap(err, "use of AS SELECT requires an enterprise license.")
+			}
+		}
+
 		details.Opts = opts.AsMap()
 		// Jobs should not be created for sinkless changefeeds. However, note that
 		// we create and return a job record for sinkless changefeeds below. This is

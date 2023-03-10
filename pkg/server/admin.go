@@ -1954,18 +1954,16 @@ func (s *adminServer) Settings(
 		return nil, serverError(ctx, err)
 	}
 
-	var lookupPurpose settings.LookupPurpose
+	redactValues := true
 	if isAdmin {
 		// Root accesses can customize the purpose.
 		// This is used by the UI to see all values (local access)
 		// and `cockroach zip` to redact the values (telemetry).
-		lookupPurpose = settings.LookupForReporting
 		if req.UnredactedValues {
-			lookupPurpose = settings.LookupForLocalAccess
+			redactValues = false
 		}
 	} else {
 		// Non-root access cannot see the values in any case.
-		lookupPurpose = settings.LookupForReporting
 		if err := s.adminPrivilegeChecker.requireViewClusterSettingOrModifyClusterSettingPermission(ctx); err != nil {
 			return nil, err
 		}
@@ -1998,7 +1996,13 @@ func (s *adminServer) Settings(
 
 	resp := serverpb.SettingsResponse{KeyValues: make(map[string]serverpb.SettingsResponse_Value)}
 	for _, k := range keys {
-		v, ok := settings.Lookup(k, lookupPurpose, settings.ForSystemTenant)
+		var v settings.Setting
+		var ok bool
+		if redactValues {
+			v, ok = settings.LookupForReporting(k, settings.ForSystemTenant)
+		} else {
+			v, ok = settings.LookupForLocalAccess(k, settings.ForSystemTenant)
+		}
 		if !ok {
 			continue
 		}
@@ -4091,13 +4095,24 @@ func (s *adminServer) ListTracingSnapshots(
 	}
 
 	snapshotInfo := s.sqlServer.cfg.Tracer.GetSnapshots()
-	snapshots := make([]*serverpb.SnapshotInfo, len(snapshotInfo))
+	autoSnapshotInfo := s.sqlServer.cfg.Tracer.GetAutomaticSnapshots()
+	snapshots := make([]*serverpb.SnapshotInfo, 0, len(snapshotInfo)+len(autoSnapshotInfo))
 	for i := range snapshotInfo {
 		si := snapshotInfo[i]
-		snapshots[i] = &serverpb.SnapshotInfo{
+		snapshots = append(snapshots, &serverpb.SnapshotInfo{
 			SnapshotID: int64(si.ID),
 			CapturedAt: &si.CapturedAt,
-		}
+		})
+	}
+	for i := range autoSnapshotInfo {
+		si := autoSnapshotInfo[i]
+		snapshots = append(snapshots, &serverpb.SnapshotInfo{
+			// Flip the IDs of automatic snapshots to negative so we can tell when the
+			// client asks for one of these that we should look for it in the auto
+			// snapshots not the regular ones.
+			SnapshotID: int64(si.ID * -1),
+			CapturedAt: &si.CapturedAt,
+		})
 	}
 	resp := &serverpb.ListTracingSnapshotsResponse{
 		Snapshots: snapshots,
@@ -4163,7 +4178,14 @@ func (s *adminServer) GetTracingSnapshot(
 
 	id := tracing.SnapshotID(req.SnapshotId)
 	tr := s.sqlServer.cfg.Tracer
-	snapshot, err := tr.GetSnapshot(id)
+	var snapshot tracing.SpansSnapshot
+	// If the ID is negative it indicates it is an automatic snapshot, so flip it
+	// back to positive and fetch it from the automatic API instead.
+	if id < 0 {
+		snapshot, err = tr.GetAutomaticSnapshot(id * -1)
+	} else {
+		snapshot, err = tr.GetSnapshot(id)
+	}
 	if err != nil {
 		return nil, err
 	}

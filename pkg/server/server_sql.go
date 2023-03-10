@@ -511,6 +511,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	blobspb.RegisterBlobServer(cfg.grpcServer, blobService)
 
+	if err := cfg.stopper.RunAsyncTask(ctx, "tracer-snapshots", func(context.Context) {
+		cfg.Tracer.PeriodicSnapshotsLoop(&cfg.Settings.SV, cfg.stopper.ShouldQuiesce())
+	}); err != nil {
+		return nil, err
+	}
+
 	// Create trace service for inter-node sharing of inflight trace spans.
 	tracingService := service.New(cfg.Tracer)
 	tracingservicepb.RegisterTracingServer(cfg.grpcServer, tracingService)
@@ -519,6 +525,19 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	// instance provider without initializing the instance, since this is not a
 	// SQL pod server.
 	_, isMixedSQLAndKVNode := cfg.nodeIDContainer.OptionalNodeID()
+
+	var settingsWatcher *settingswatcher.SettingsWatcher
+	if codec.ForSystemTenant() {
+		settingsWatcher = settingswatcher.New(
+			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.settingsStorage,
+		)
+	} else {
+		// Create the tenant settings watcher, using the tenant connector as the
+		// overrides monitor.
+		settingsWatcher = settingswatcher.NewWithOverrides(
+			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.tenantConnect, cfg.settingsStorage,
+		)
+	}
 
 	sqllivenessKnobs, _ := cfg.TestingKnobs.SQLLivenessKnobs.(*sqlliveness.TestingKnobs)
 	var sessionEventsConsumer slinstance.SessionEventListener
@@ -1297,19 +1316,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	vmoduleSetting.SetOnChange(&cfg.Settings.SV, fn)
 	fn(ctx)
 
-	var settingsWatcher *settingswatcher.SettingsWatcher
-	if codec.ForSystemTenant() {
-		settingsWatcher = settingswatcher.New(
-			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.settingsStorage,
-		)
-	} else {
-		// Create the tenant settings watcher, using the tenant connector as the
-		// overrides monitor.
-		settingsWatcher = settingswatcher.NewWithOverrides(
-			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.tenantConnect, cfg.settingsStorage,
-		)
-	}
-
 	return &SQLServer{
 		ambientCtx:                     cfg.BaseConfig.AmbientCtx,
 		stopper:                        cfg.stopper,
@@ -1363,6 +1369,13 @@ func (s *SQLServer) preStart(
 		if err := s.tenantConnect.Start(ctx); err != nil {
 			return err
 		}
+	}
+
+	// Initialize the settings watcher early in sql server startup. Settings
+	// values are meaningless before the watcher is initialized and most sub
+	// systems depend on system settings.
+	if err := s.settingsWatcher.Start(ctx); err != nil {
+		return errors.Wrap(err, "initializing settings")
 	}
 
 	// Load the multi-region enum by reading the system database's descriptor.
@@ -1499,11 +1512,8 @@ func (s *SQLServer) preStart(
 		bootstrapVersion = roachpb.Version{Major: 20, Minor: 1, Internal: 1}
 	}
 
-	if err := s.settingsWatcher.Start(ctx); err != nil {
-		return errors.Wrap(err, "initializing settings")
-	}
 	if err := s.systemConfigWatcher.Start(ctx, s.stopper); err != nil {
-		return errors.Wrap(err, "initializing settings")
+		return errors.Wrap(err, "initializing system config watcher")
 	}
 
 	clusterVersionMetrics := clusterversion.MakeMetricsAndRegisterOnVersionChangeCallback(&s.cfg.Settings.SV)

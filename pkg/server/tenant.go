@@ -71,8 +71,6 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	sentry "github.com/getsentry/sentry-go"
-	"google.golang.org/grpc/codes"
-	grpcstatus "google.golang.org/grpc/status"
 )
 
 // SQLServerWrapper is a utility struct that encapsulates
@@ -693,6 +691,10 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 			sqlServer:        s.sqlServer,
 			db:               s.db,
 		}), /* apiServer */
+		serverpb.FeatureFlags{
+			CanViewKvMetricDashboards:   s.rpcContext.TenantID.Equal(roachpb.SystemTenantID),
+			DisableKvLevelAdvancedDebug: true,
+		},
 	); err != nil {
 		return err
 	}
@@ -769,17 +771,7 @@ func (s *SQLServerWrapper) serveConn(
 	pgServer := s.PGServer()
 	switch status.State {
 	case pgwire.PreServeCancel:
-		if err := pgServer.HandleCancel(ctx, status.CancelKey); err != nil {
-			_, rateLimited := errors.If(err, func(err error) (interface{}, bool) {
-				if respStatus := grpcstatus.Convert(err); respStatus.Code() == codes.ResourceExhausted {
-					return nil, true
-				}
-				return nil, false
-			})
-			if rateLimited {
-				log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
-			}
-		}
+		pgServer.HandleCancel(ctx, status.CancelKey)
 		return nil
 	case pgwire.PreServeReady:
 		return pgServer.ServeConn(ctx, conn, status)
@@ -1080,7 +1072,7 @@ func makeTenantSQLServerArgs(
 	if baseCfg.RuntimeStatSampler != nil {
 		runtime = baseCfg.RuntimeStatSampler
 	} else {
-		runtime = status.NewRuntimeStatSampler(startupCtx, clock)
+		runtime = status.NewRuntimeStatSampler(startupCtx, clock.WallClock())
 	}
 	registry.AddMetricStruct(runtime)
 

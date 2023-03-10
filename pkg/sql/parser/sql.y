@@ -948,7 +948,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %token <str> NOSQLLOGIN NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT
 %token <str> NOTHING NOTHING_AFTER_RETURNING
 %token <str> NOTNULL
-%token <str> NOVIEWACTIVITY NOVIEWACTIVITYREDACTED NOVIEWCLUSTERSETTING NOVIEWJOB NOWAIT NULL NULLIF NULLS NUMERIC
+%token <str> NOVIEWACTIVITY NOVIEWACTIVITYREDACTED NOVIEWCLUSTERSETTING NOWAIT NULL NULLIF NULLS NUMERIC
 
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR OLD_KMS ON ONLY OPT OPTION OPTIONS OR
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OWNER OPERATOR
@@ -985,7 +985,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %token <str> UPDATE UPSERT UNSET UNTIL USE USER USERS USING UUID
 
 %token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VERIFY_BACKUP_TABLE_DATA VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
-%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIEWJOB VIRTUAL VISIBLE INVISIBLE VOLATILE VOTERS
+%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE INVISIBLE VOLATILE VOTERS
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1313,7 +1313,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %type <*tree.RestoreOptions> opt_with_restore_options restore_options restore_options_list
 %type <*tree.TenantReplicationOptions> opt_with_tenant_replication_options tenant_replication_options tenant_replication_options_list
 %type <tree.ShowBackupDetails> show_backup_details
-%type <*tree.ShowBackupOptions> opt_with_show_backup_options show_backup_options show_backup_options_list
+%type <*tree.ShowBackupOptions> opt_with_show_backup_options show_backup_options show_backup_options_list show_backup_connection_options show_backup_connection_options_list
 %type <*tree.CopyOptions> opt_with_copy_options copy_options copy_options_list copy_generic_options copy_generic_options_list
 %type <str> import_format
 %type <str> storage_parameter_key
@@ -7317,19 +7317,19 @@ show_backup_stmt:
   			Options: *$5.showBackupOptions(),
   		}
   	}
-| SHOW BACKUP CONNECTION string_or_placeholder opt_with_show_backup_options
+| SHOW BACKUP CONNECTION string_or_placeholder
   	{
   		$$.val = &tree.ShowBackup{
   		  Details:  tree.BackupConnectionTest,
   			Path:    $4.expr(),
   		}
   	}
-| SHOW BACKUP CONNECTION string_or_placeholder WITH TRANSFER '=' string_or_placeholder
+| SHOW BACKUP CONNECTION string_or_placeholder WITH show_backup_connection_options_list
   	{
   		$$.val = &tree.ShowBackup{
   		  Details:  tree.BackupConnectionTest,
   			Path:    $4.expr(),
-        Options: tree.ShowBackupOptions{TransferSize: $8.expr()},
+        Options: *$6.showBackupOptions(),
   		}
   	}
 | SHOW BACKUP error // SHOW HELP: SHOW BACKUP
@@ -7419,6 +7419,33 @@ show_backup_options:
  | DEBUG_DUMP_METADATA_SST
  {
  $$.val = &tree.ShowBackupOptions{DebugMetadataSST: true}
+ }
+
+show_backup_connection_options_list:
+  // Require at least one option
+  show_backup_connection_options
+  {
+    $$.val = $1.showBackupOptions()
+  }
+| show_backup_connection_options_list ',' show_backup_connection_options
+  {
+    if err := $1.showBackupOptions().CombineWith($3.showBackupOptions()); err != nil {
+      return setErr(sqllex, err)
+    }
+  }
+
+show_backup_connection_options:
+  TRANSFER '=' string_or_placeholder
+ {
+  $$.val = &tree.ShowBackupOptions{CheckConnectionTransferSize: $3.expr()}
+ }
+ | TIME '=' string_or_placeholder
+ {
+  $$.val = &tree.ShowBackupOptions{CheckConnectionDuration: $3.expr()}
+ }
+ | CONCURRENTLY '=' a_expr
+ {
+  $$.val = &tree.ShowBackupOptions{CheckConnectionConcurrency: $3.expr()}
  }
 
 // %Help: SHOW CLUSTER SETTING - display cluster settings
@@ -10317,14 +10344,6 @@ role_option:
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
 | NOVIEWCLUSTERSETTING
-  {
-    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
-  }
-| VIEWJOB
-  {
-    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
-  }
-| NOVIEWJOB
   {
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
@@ -16356,7 +16375,6 @@ unreserved_keyword:
 | NOVIEWACTIVITY
 | NOVIEWACTIVITYREDACTED
 | NOVIEWCLUSTERSETTING
-| NOVIEWJOB
 | NOWAIT
 | NULLS
 | IGNORE_FOREIGN_KEYS
@@ -16551,7 +16569,6 @@ unreserved_keyword:
 | VIEWCLUSTERMETADATA
 | VIEWCLUSTERSETTING
 | VIEWDEBUG
-| VIEWJOB
 | VISIBLE
 | VOLATILE
 | VOTERS
@@ -16883,7 +16900,6 @@ bare_label_keywords:
 | NOVIEWACTIVITY
 | NOVIEWACTIVITYREDACTED
 | NOVIEWCLUSTERSETTING
-| NOVIEWJOB
 | NOWAIT
 | NO_FULL_SCAN
 | NO_INDEX_JOIN
@@ -17119,7 +17135,6 @@ bare_label_keywords:
 | VIEWCLUSTERMETADATA
 | VIEWCLUSTERSETTING
 | VIEWDEBUG
-| VIEWJOB
 | VIRTUAL
 | VISIBLE
 | VOLATILE

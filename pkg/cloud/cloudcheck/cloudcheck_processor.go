@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -52,24 +53,53 @@ func checkURI(
 	opener cloud.ExternalStorageFromURIFactory,
 	location string,
 	username username.SQLUsername,
-	transferSize int64,
+	params Params,
 ) result {
+	ctxDone := ctx.Done()
+
+	transferSize := params.TransferSize
 	if transferSize == 0 {
 		transferSize = 32 << 20
 	}
 
-	var res result
-	store, err := opener(ctx, location, username)
-	if err != nil {
-		res.error = errors.Wrapf(err, "opening external storage").Error()
-		return res
+	var total result
+
+	start := timeutil.Now()
+	for {
+		select {
+		case <-ctxDone:
+			return total
+		default:
+		}
+
+		store, err := opener(ctx, location, username)
+		if err != nil {
+			total.error = errors.Wrapf(err, "opening external storage").Error()
+			return total
+		}
+		defer store.Close()
+
+		res, err := checkStorage(ctx, store, transferSize)
+		if err != nil {
+			res.error = err.Error()
+		}
+
+		total.wroteBytes += res.wroteBytes
+		total.wroteTime += res.wroteTime
+		total.readBytes += res.readBytes
+		total.readTime += res.readTime
+
+		// We break on !total.ok below so setting it here overwrites zero-value.
+		total.ok = res.ok
+		total.error = res.error
+		total.canDelete = res.canDelete
+
+		if !total.ok || timeutil.Since(start) > params.MinDuration {
+			break
+		}
 	}
-	defer store.Close()
-	res, err = checkStorage(ctx, store, transferSize)
-	if err != nil {
-		res.error = err.Error()
-	}
-	return res
+
+	return total
 }
 
 func checkStorage(
@@ -139,7 +169,8 @@ func checkStorage(
 
 type proc struct {
 	execinfra.ProcessorBase
-	spec execinfrapb.CloudStorageTestSpec
+	spec    execinfrapb.CloudStorageTestSpec
+	results chan result
 }
 
 func newCloudCheckProcessor(
@@ -160,6 +191,35 @@ func newCloudCheckProcessor(
 // Start is part of the RowSource interface.
 func (p *proc) Start(ctx context.Context) {
 	p.StartInternal(ctx, "cloudcheck.proc")
+
+	concurrency := int(p.spec.Params.Concurrency)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	p.results = make(chan result, concurrency)
+
+	if err := p.FlowCtx.Stopper().RunAsyncTask(p.Ctx(), "cloudcheck.proc", func(ctx context.Context) {
+		defer close(p.results)
+		if err := ctxgroup.GroupWorkers(ctx, concurrency, func(ctx context.Context, _ int) error {
+			select {
+			case p.results <- checkURI(
+				ctx,
+				p.FlowCtx.Cfg.ExternalStorageFromURI,
+				p.spec.Location,
+				p.FlowCtx.EvalCtx.SessionData().User(),
+				p.spec.Params,
+			):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}); err != nil {
+			p.MoveToDraining(err)
+		}
+	}); err != nil {
+		p.MoveToDraining(err)
+	}
 }
 
 // Next is part of the RowSource interface.
@@ -167,26 +227,29 @@ func (p *proc) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if p.State != execinfra.StateRunning {
 		return nil, p.DrainHelper()
 	}
-	p.MoveToDraining(nil)
-	res := checkURI(
-		p.Ctx(),
-		p.FlowCtx.Cfg.ExternalStorageFromURI,
-		p.spec.Location,
-		p.FlowCtx.EvalCtx.SessionData().User(),
-		p.spec.TransferSize,
-	)
-	return rowenc.EncDatumRow{
-		rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(p.EvalCtx.NodeID.SQLInstanceID()))),
-		rowenc.DatumToEncDatum(types.String, tree.NewDString(p.EvalCtx.Locality.String())),
-		rowenc.DatumToEncDatum(types.Bool, tree.MakeDBool(tree.DBool(res.ok))),
-		rowenc.DatumToEncDatum(types.String, tree.NewDString(res.error)),
-		rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.readBytes))),
-		rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.readTime))),
-		rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.wroteBytes))),
-		rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.wroteTime))),
-		rowenc.DatumToEncDatum(types.Bool, tree.MakeDBool(tree.DBool(res.canDelete))),
-	}, nil
+	select {
+	case <-p.Ctx().Done():
+		p.MoveToDraining(p.Ctx().Err())
+		return nil, p.DrainHelper()
+	case res, more := <-p.results:
+		if !more {
+			p.MoveToDraining(nil)
+			return nil, p.DrainHelper()
+		}
+		return rowenc.EncDatumRow{
+			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(p.EvalCtx.NodeID.SQLInstanceID()))),
+			rowenc.DatumToEncDatum(types.String, tree.NewDString(p.EvalCtx.Locality.String())),
+			rowenc.DatumToEncDatum(types.Bool, tree.MakeDBool(tree.DBool(res.ok))),
+			rowenc.DatumToEncDatum(types.String, tree.NewDString(res.error)),
+			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.readBytes))),
+			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.readTime))),
+			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.wroteBytes))),
+			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.wroteTime))),
+			rowenc.DatumToEncDatum(types.Bool, tree.MakeDBool(tree.DBool(res.canDelete))),
+		}, nil
+	}
 }
+
 func init() {
 	rowexec.NewCloudStorageTestProcessor = newCloudCheckProcessor
 }

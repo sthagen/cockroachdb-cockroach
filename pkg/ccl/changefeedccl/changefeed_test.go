@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -921,12 +922,15 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 			whereClausesChecked[where] = struct{}{}
 			query = "SELECT array_to_string(IFNULL(array_agg(distinct rowid),'{}'),'|') FROM seed WHERE " + where
 			t.Log(query)
-			rows := s.DB.QueryRow(query)
+			timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+			rows := s.DB.QueryRowContext(timeoutCtx, query)
 			var expectedRowIDsStr string
 			if err := rows.Scan(&expectedRowIDsStr); err != nil {
 				t.Logf("Skipping query %s because error %s", query, err)
+				cancel()
 				continue
 			}
+			cancel()
 			expectedRowIDs := strings.Split(expectedRowIDsStr, "|")
 			if expectedRowIDsStr == "" {
 				t.Logf("Skipping predicate %s because it returned no rows", where)
@@ -2937,6 +2941,33 @@ func TestChangefeedBareJSON(t *testing.T) {
 	cdcTest(t, testFn, feedTestForceSink("cloudstorage"))
 }
 
+func TestChangefeedExternalConnectionSchemaRegistry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO foo values (0, 'dog')`)
+
+		schemaReg := cdctest.StartTestSchemaRegistry()
+		defer schemaReg.Close()
+
+		name := fmt.Sprintf("schemareg%d", rand.Uint64())
+
+		sqlDB.Exec(t, fmt.Sprintf(`CREATE EXTERNAL CONNECTION "%s" AS '%s'`, name, schemaReg.URL()))
+
+		sql := fmt.Sprintf("CREATE CHANGEFEED WITH format=avro, confluent_schema_registry='external://%s' AS SELECT * FROM foo", name)
+
+		foo := feed(t, f, sql)
+		defer closeFeed(t, foo)
+		assertPayloads(t, foo, []string{`foo: {"a":{"long":0}}->{"record":{"foo":{"a":{"long":0},"b":{"string":"dog"}}}}`})
+	}
+	// Test helpers for avro assume Kafka
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
 func TestChangefeedAvroNotice(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -4370,6 +4401,10 @@ func TestChangefeedErrors(t *testing.T) {
 	sqlDB.ExpectErr(
 		t, `CHANGEFEED requires an enterprise license`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope`,
+	)
+	sqlDB.ExpectErr(
+		t, `use of AS SELECT requires an enterprise license`,
+		`CREATE CHANGEFEED AS SELECT * FROM foo`,
 	)
 	enableEnterprise()
 
@@ -5892,15 +5927,15 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 
 	skip.UnderRace(t, "Takes too long with race enabled")
 
-	shouldDrain := true
+	var shouldDrain int32
 	knobs := base.TestingKnobs{
 		DistSQL: &execinfra.TestingKnobs{
 			DrainFast:  true,
 			Changefeed: &TestingKnobs{},
 			Flowinfra: &flowinfra.TestingKnobs{
 				FlowRegistryDraining: func() bool {
-					if shouldDrain {
-						shouldDrain = false
+					if atomic.LoadInt32(&shouldDrain) > 0 {
+						atomic.StoreInt32(&shouldDrain, 0)
 						return true
 					}
 					return false
@@ -5948,6 +5983,7 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 	f, closeSink := makeFeedFactory(t, randomSinkType(feedTestEnterpriseSinks), tc.Server(1), tc.ServerConn(0))
 	defer closeSink()
 
+	atomic.StoreInt32(&shouldDrain, 1)
 	feed := feed(t, f, "CREATE CHANGEFEED FOR foo")
 	defer closeFeed(t, feed)
 
